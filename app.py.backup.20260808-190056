@@ -6541,54 +6541,6 @@ _SERIAL_LOCK = RLock()
 _SERIAL_MAX_LINES = 800
 
 
-# USB bridges that turn up on this class of board. Anything here is worth
-# pointing at; everything else is almost certainly a mouse or a hub.
-SERIAL_VIDS = {
-    "1a86": "CH340/CH34x bridge",
-    "10c4": "CP210x bridge",
-    "0403": "FTDI bridge",
-    "067b": "Prolific bridge",
-    "303a": "Espressif native USB",
-    "349e": "Bouffalo Lab native USB",
-    "2e8a": "Raspberry Pi RP2040",
-}
-
-
-def usb_devices() -> list[dict[str, Any]]:
-    """Every USB device the kernel sees, minus its own root hubs.
-
-    This is what separates "nothing is plugged in" from "something is plugged
-    in but no serial driver bound to it" — two problems with two fixes."""
-    found: list[dict[str, Any]] = []
-    try:
-        nodes = sorted(Path("/sys/bus/usb/devices").iterdir())
-    except OSError:
-        return found
-
-    for node in nodes:
-        if not (node / "idVendor").is_file():
-            continue
-
-        def field(name: str) -> str:
-            try:
-                return (node / name).read_text().strip()
-            except OSError:
-                return ""
-
-        vid, pid = field("idVendor"), field("idProduct")
-        if vid == "1d6b":                      # the kernel's own root hubs
-            continue
-        found.append({
-            "port": node.name,
-            "vid_pid": f"{vid}:{pid}",
-            "maker": field("manufacturer"),
-            "product": field("product"),
-            "serial_like": vid in SERIAL_VIDS,
-            "note": SERIAL_VIDS.get(vid, ""),
-        })
-    return found
-
-
 def serial_ports() -> list[dict[str, str]]:
     """Everything that looks like a serial device, with whatever the kernel
     knows about it — enough to tell a Pine Box from a mouse."""
@@ -8514,34 +8466,13 @@ async def serial_ports_api(
     """What is plugged into the server right now."""
     require_read_auth(authorization)
     ports = await asyncio.to_thread(serial_ports)
-    devices = await asyncio.to_thread(usb_devices)
-
-    usb_ports = [p for p in ports
-                 if "ttyUSB" in p["device"] or "ttyACM" in p["device"]]
-    candidates = [d for d in devices if d["serial_like"]]
-
-    if usb_ports:
-        state, hint = "ready", "The box is enumerated. Connect to it."
-    elif candidates:
-        state = "no-driver"
-        hint = ("A serial bridge is plugged in but the kernel bound no tty to "
-                "it. Check that the usbserial driver for it is present.")
-    else:
-        state = "absent"
-        hint = ("The server sees no serial device. If the cable is in, it is "
-                "almost certainly a charge-only cable, or it is in a port on "
-                "the box that carries power but not data. Try a different "
-                "cable — one you know moves files — and the box's other port.")
-
     return {
         "ports": ports,
-        "usb": devices,
-        "state": state,
-        "candidates": candidates,
         "open": bool(_SERIAL["link"]),
         "port": _SERIAL["port"],
         "baud": SERIAL_BAUD,
-        "hint": hint,
+        "hint": ("Plug the Pine Box into the server with a USB cable. Hold "
+                 "BOOT while connecting if you intend to re-flash it."),
     }
 
 
@@ -15587,8 +15518,6 @@ function usbLog(text, tone) {
   if (near) out.scrollTop = out.scrollHeight;
 }
 
-let usbSeen = "";
-
 async function usbPoll() {
   try {
     const data = await api("/api/serial/read?since=" + usbSince);
@@ -15602,56 +15531,11 @@ async function usbPoll() {
   } catch (error) { /* the window stays up */ }
 }
 
-// Watch for the box arriving. Until it enumerates there is nothing to open,
-// and the reason it has not is the thing worth saying out loud.
-async function usbWatch() {
-  let data;
-  try {
-    data = await api("/api/serial/ports");
-  } catch (error) { return; }
-
-  const signature = (data.ports || []).map((p) => p.device).join()
-    + "|" + (data.usb || []).map((d) => d.vid_pid).join();
-  if (signature === usbSeen) return;
-  const first = !usbSeen;
-  usbSeen = signature;
-
-  usbPorts(data);
-  const watch = document.getElementById("usbWatch");
-  if (watch) {
-    watch.textContent = data.hint || "";
-    watch.style.color = data.state === "ready" ? "#43d17c"
-      : data.state === "no-driver" ? "#ffd479" : "";
-  }
-  if (first) {
-    usbLog((data.usb || []).length + " USB devices attached to the server, "
-      + (data.candidates || []).length + " of them a serial bridge.", "#9ba6b7");
-    usbLog(data.hint, data.state === "ready" ? "#43d17c" : "#ffd479");
-    return;
-  }
-
-  // Something changed while you were standing there with the cable.
-  usbLog("— USB changed —", "#4bb3ff");
-  (data.candidates || []).forEach((d) => {
-    usbLog("  " + d.vid_pid + "  " + (d.product || d.maker || "") + "  ("
-      + d.note + ")", "#43d17c");
-  });
-  if (data.state === "ready") {
-    usbLog("Serial port available: "
-      + (data.ports || []).map((p) => p.device).join(", "), "#43d17c");
-    usbLog("Connecting…", "#43d17c");
-    usbOpen();
-  } else {
-    usbLog(data.hint, "#ffd479");
-  }
-}
-
-async function usbPorts(known) {
+async function usbPorts() {
   const select = document.getElementById("usbPort");
   if (!select) return;
   try {
-    const data = known || await api("/api/serial/ports");
-    const had = select.value;
+    const data = await api("/api/serial/ports");
     select.textContent = "";
     (data.ports || []).forEach((port) => {
       const option = document.createElement("option");
@@ -15666,7 +15550,6 @@ async function usbPorts(known) {
       option.textContent = "nothing plugged into the server";
       select.appendChild(option);
     }
-    if (had) select.value = had;          // do not fight your selection
   } catch (error) { /* leave it empty */ }
 }
 
@@ -15763,11 +15646,6 @@ function usbConsole() {
   [select, refresh, open, close, state].forEach((n) => bar.appendChild(n));
   card.appendChild(bar);
 
-  const watch = el("div", "muted", "Looking for the box…");
-  watch.id = "usbWatch";
-  watch.style.cssText = "font-size:12px;margin-top:8px;line-height:1.5";
-  card.appendChild(watch);
-
   const out = el("pre", "", "");
   out.id = "usbOut";
   out.style.cssText = "flex:1;min-height:240px;max-height:44vh;overflow-y:auto;"
@@ -15835,15 +15713,10 @@ function usbConsole() {
   shade.appendChild(card);
   document.body.appendChild(shade);
 
+  usbPorts();
   usbSince = 0;
-  usbSeen = "";
-  usbWatch();
   if (usbTimer) clearInterval(usbTimer);
-  let tick = 0;
-  usbTimer = setInterval(() => {
-    usbPoll();
-    if ((tick += 1) % 3 === 0) usbWatch();     // ~2s: fast enough to feel live
-  }, 700);
+  usbTimer = setInterval(usbPoll, 700);
 }
 
 /* ---- The Pine Box troubleshooter ---- */
