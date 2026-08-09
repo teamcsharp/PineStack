@@ -17077,19 +17077,12 @@ function djTalkPopup() {
   const title = el("b", "", "In the booth");
   title.style.cssText = "flex:1;font-size:13px";
   const mute = el("button", "", "🔇");
-  mute.title = "Stop showing this until the next session";
+  mute.title = "Stop showing this";
   mute.onclick = () => djTalkClose(true);
-  // Just put it away — it reappears the next time the two of them talk.
-  const shut = el("button", "", "✕");
-  shut.id = "djTalkShut";
-  shut.title = "Close";
-  shut.onclick = () => djTalkClose();
   head.appendChild(title);
   head.appendChild(mute);
-  head.appendChild(shut);
 
   head.addEventListener("pointerdown", (event) => {
-    if (event.target.closest("button")) return;    // the buttons are not a handle
     const from = {x: event.clientX, y: event.clientY,
                   left: box.offsetLeft, top: box.offsetTop};
     head.setPointerCapture(event.pointerId);

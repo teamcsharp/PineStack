@@ -4831,15 +4831,6 @@ def spoken_text(line: str) -> str:
     return re.sub(r"\s{2,}", " ", clean).strip()
 
 
-# Why the last line did not reach the box. A silent speaker and a working
-# one look the same from here otherwise.
-_SPEAK_LAST: dict[str, Any] = {"why": "", "at": 0.0}
-
-
-def speak_health() -> dict[str, Any]:
-    return dict(_SPEAK_LAST)
-
-
 async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    extra: str = "", line: str = "",
                    who: str = "dj", voice: str | None = None) -> str:
@@ -4856,21 +4847,9 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
 
     if voice_to in ("box", "both"):
         try:
-            result = await speak(spoken, event="default", voice=forced)
-            # home_assistant_say declines rather than raising when the
-            # satellite is not ready, so an empty return is not success.
-            why = str((result or {}).get("skipped") or "")
-            _SPEAK_LAST.update({"why": why, "at": time.time()})
-        except Exception as exc:
-            _SPEAK_LAST.update({
-                "why": f"{type(exc).__name__}: {exc}"[:200],
-                "at": time.time(),
-            })
-    else:
-        _SPEAK_LAST.update({
-            "why": f"voice output is routed to {voice_to!r}, not the box",
-            "at": time.time(),
-        })
+            await speak(spoken, event="default", voice=forced)
+        except Exception:
+            pass
 
     # Always synthesise: a browser listener has no other way to hear the DJ,
     # and there can be listeners even when the box is the primary output.
@@ -8824,14 +8803,7 @@ async def dj_banter_api(
 ) -> dict[str, Any]:
     """Make the pair talk right now (#133)."""
     require_auth(authorization)
-    lines = await dj_banter(_RADIO.get("now"))
-    health = speak_health()
-    return {
-        "lines": lines,
-        "spoke_on_box": bool(lines) and not health.get("why"),
-        "why_silent": health.get("why") or "",
-        "voice_to": _RADIO.get("voice_to") or "box",
-    }
+    return {"lines": await dj_banter(_RADIO.get("now"))}
 
 
 @app.post("/api/dj/replay")
@@ -17077,19 +17049,12 @@ function djTalkPopup() {
   const title = el("b", "", "In the booth");
   title.style.cssText = "flex:1;font-size:13px";
   const mute = el("button", "", "🔇");
-  mute.title = "Stop showing this until the next session";
+  mute.title = "Stop showing this";
   mute.onclick = () => djTalkClose(true);
-  // Just put it away — it reappears the next time the two of them talk.
-  const shut = el("button", "", "✕");
-  shut.id = "djTalkShut";
-  shut.title = "Close";
-  shut.onclick = () => djTalkClose();
   head.appendChild(title);
   head.appendChild(mute);
-  head.appendChild(shut);
 
   head.addEventListener("pointerdown", (event) => {
-    if (event.target.closest("button")) return;    // the buttons are not a handle
     const from = {x: event.clientX, y: event.clientY,
                   left: box.offsetLeft, top: box.offsetTop};
     head.setPointerCapture(event.pointerId);
@@ -18078,14 +18043,9 @@ async function djBanterNow() {
   status.textContent = "Getting them talking…";
   try {
     const result = await api("/api/dj/banter", {method: "POST"});
-    if (!(result.lines || []).length) {
-      status.textContent = "They had nothing to say — is banter switched on?";
-    } else if (result.why_silent) {
-      status.textContent = "Written but NOT played on the box ("
-        + result.why_silent + "): " + (result.lines || []).join("  //  ");
-    } else {
-      status.textContent = "🔊 " + (result.lines || []).join("  //  ");
-    }
+    status.textContent = (result.lines || []).length
+      ? (result.lines || []).join("  //  ")
+      : "They had nothing to say — is banter switched on?";
     pollDJ();
   } catch (error) {
     status.textContent = error.message;
