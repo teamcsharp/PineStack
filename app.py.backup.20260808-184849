@@ -8754,54 +8754,6 @@ async def dj_announce_api(
     return {"said": said, "mode": mode}
 
 
-@app.get("/api/music/albums")
-async def music_albums_api(
-    limit: int = 160,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """One cover per album — what drifts behind the cover flow (#162)."""
-    require_read_auth(authorization)
-
-    def collect() -> list[dict[str, Any]]:
-        try:
-            have = {p.stem for p in ART_DIR.iterdir() if p.suffix != ".nolocal"}
-        except OSError:
-            have = set()
-
-        albums: dict[tuple[str, str], dict[str, Any]] = {}
-        for track in music_index():
-            name = track["album"].strip()
-            if not name:
-                continue
-            key = (track["artist"].strip().lower(), name.lower())
-            entry = albums.get(key)
-            if entry is None:
-                entry = albums[key] = {
-                    "artist": track["artist"], "album": name,
-                    "id": track["id"], "count": 0, "cached": False,
-                }
-            entry["count"] += 1
-            # Prefer the track whose sleeve is already on disk: those albums
-            # appear the instant the swirl starts.
-            if not entry["cached"] and track["id"] in have:
-                entry["id"] = track["id"]
-                entry["cached"] = True
-
-        return sorted(albums.values(),
-                      key=lambda a: (not a["cached"], -a["count"]))
-
-    found = await asyncio.to_thread(collect)
-    keep = found[:max(1, min(limit, 400))]
-    return {
-        "count": len(found),
-        "cached": sum(1 for a in found if a["cached"]),
-        "albums": [
-            {**a, "art": f"/music/{a['id']}/art?t={media_sign(a['id'])}"}
-            for a in keep
-        ],
-    }
-
-
 @app.get("/api/music/album")
 async def music_album_api(
     artist: str = "",
@@ -10585,38 +10537,6 @@ button.danger {
     rgba(0,0,0,.55) 100%);
 }
 .cf.dragging { cursor: grabbing; }
-/* Albums drifting past behind the stage (#162). Kept dim and desaturated so
-   the album on the stage is unmistakably the one in focus. */
-.cf-swirl { position: absolute; inset: 0; overflow: hidden; z-index: 0; }
-.cf-swirl-tile {
-  position: absolute; top: 0; left: 0; border-radius: 3px; overflow: hidden;
-  will-change: transform, opacity; opacity: 0; cursor: pointer;
-  filter: saturate(.7) brightness(.75);
-  box-shadow: 0 10px 26px rgba(0,0,0,.55);
-  transition: filter .2s ease;
-}
-.cf-swirl-tile:hover { filter: none; }
-.cf-focus {
-  position: absolute; inset: 0; z-index: 220; display: flex; gap: 14px;
-  padding: 14px; background: rgba(3,6,12,.9); backdrop-filter: blur(7px);
-  cursor: default;
-}
-.cf-focus .sleeve {
-  width: min(38%, 220px); aspect-ratio: 1; flex: none; border-radius: 4px;
-  overflow: hidden; align-self: flex-start;
-  box-shadow: 0 20px 44px rgba(0,0,0,.7), 0 0 0 1px rgba(255,255,255,.09);
-}
-.cf-focus .list { flex: 1; min-width: 0; display: flex; flex-direction: column; }
-.cf-focus .tracks { overflow-y: auto; margin-top: 8px; padding-right: 4px; }
-.cf-focus .tracks div {
-  display: flex; gap: 8px; padding: 6px 8px; border-radius: 6px;
-  font-size: 13px; cursor: pointer; align-items: baseline;
-}
-.cf-focus .tracks div:hover { background: rgba(75,179,255,.14); }
-.cf-focus .tracks .n { color: var(--muted); font-size: 11px; min-width: 20px; }
-.cf-focus .tracks .t { flex: 1; min-width: 0;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.cf-focus .tracks .d { color: var(--muted); font-size: 11px; }
 .cf-stage { position: absolute; inset: 0; transform-style: preserve-3d; }
 .cf-item {
   position: absolute; top: 12px; left: 50%; transform-style: preserve-3d;
@@ -12235,9 +12155,7 @@ starts the DJ"
                      background:#04070c;border:1px solid var(--border)"></canvas>
 
       <!-- Just played · now · coming up, as Cover Flow. -->
-      <div id="djFlow" class="cf"
-           style="height:min(46vh,380px);margin:10px -18px 0;
-                  border-radius:0;border-left:0;border-right:0"></div>
+      <div id="djFlow" class="cf" style="height:280px;margin-top:10px"></div>
       <!-- The same thing flat, for when you want to read it as a list. -->
       <div id="musicDeck"
            style="display:none;gap:10px;overflow-x:auto;padding:10px 2px 4px;
@@ -16491,12 +16409,7 @@ async function stageSheet(track) {
 // Each cover is a DOM node so it stays clickable and the artwork stays sharp.
 function coverFlow(host, options) {
   options = options || {};
-  // The covers are sized from the container, so the flow always spans it.
-  function pickSize() {
-    const width = host.clientWidth || 620;
-    return Math.round(Math.max(112, Math.min(options.max || 250, width * 0.27)));
-  }
-  let size = options.size || pickSize();
+  const size = options.size || 150;
   const state = {tracks: [], index: 0, built: []};
 
   host.textContent = "";
@@ -16573,7 +16486,6 @@ function coverFlow(host, options) {
     }
     rail.style.display = "";
     rail.max = String(tracks.length - 1);
-    size = options.size || pickSize();
 
     tracks.forEach((track, i) => {
       const node = el("div", "cf-item", "");
@@ -16600,18 +16512,6 @@ function coverFlow(host, options) {
     });
 
     go(centre === undefined ? Math.floor(tracks.length / 2) : centre);
-  }
-
-  // Re-cut the sleeves when the column width changes enough to matter.
-  // Rebuilding restarts every image load, so only past a real threshold.
-  if (!options.size && window.ResizeObserver) {
-    new ResizeObserver(() => {
-      if (Math.abs(pickSize() - size) < size * 0.14) return;
-      const tracks = state.tracks;
-      const keep = state.index;
-      state.signature = null;
-      build(tracks, keep);
-    }).observe(host);
   }
 
   rail.oninput = () => go(Number(rail.value));
@@ -16647,165 +16547,6 @@ function coverFlow(host, options) {
   return {build, go, state};
 }
 
-/* ---- Albums drifting behind the stage (#162) ---- */
-
-const SWIRL = {albums: [], asked: false};
-
-async function swirlAlbums() {
-  if (SWIRL.asked) return SWIRL.albums;
-  SWIRL.asked = true;
-  try {
-    const data = await api("/api/music/albums?limit=160");
-    SWIRL.albums = data.albums || [];
-  } catch (error) { SWIRL.albums = []; }
-  return SWIRL.albums;
-}
-
-// A fixed pool of tiles, each recycled with a fresh album when it leaves the
-// frame — endless drift without endless allocation.
-function swirlStart(host) {
-  if (host.querySelector(".cf-swirl")) return;
-  const layer = el("div", "cf-swirl", "");
-  host.insertBefore(layer, host.firstChild);
-
-  const tiles = [];
-  let last = 0;
-
-  function dress(tile) {
-    if (!SWIRL.albums.length) return false;
-    const album = SWIRL.albums[(Math.random() * SWIRL.albums.length) | 0];
-    const box = host.getBoundingClientRect();
-    const size = Math.round(64 + Math.random() * Math.min(150, box.width * 0.2));
-    const fromLeft = Math.random() < 0.5;
-
-    tile.album = album;
-    tile.size = size;
-    tile.node.style.width = size + "px";
-    tile.node.style.height = size + "px";
-    sleeveInto(tile.node, {
-      artist: album.artist, album: album.album, title: album.album,
-      art: album.art,
-    }, size);
-
-    tile.x = fromLeft ? -size - Math.random() * 140
-                      : box.width + Math.random() * 140;
-    tile.y = Math.random() * Math.max(30, box.height - size * 0.6) - size * 0.2;
-    // Bigger sleeves read as nearer, so they cross faster.
-    tile.vx = (fromLeft ? 1 : -1) * (7 + size * 0.16 + Math.random() * 14);
-    tile.vy = (Math.random() - 0.5) * 11;
-    tile.spin = (Math.random() - 0.5) * 7;
-    tile.turn = (Math.random() - 0.5) * 34;
-    tile.peak = 0.20 + (size / 220) * 0.30;
-    tile.life = 0;
-    tile.ttl = (box.width + size * 2.6) / Math.abs(tile.vx);
-    return true;
-  }
-
-  function step(now) {
-    requestAnimationFrame(step);
-    const delta = Math.min(0.05, (now - last) / 1000 || 0);
-    last = now;
-    // Nothing to do while the tab is hidden or the panel is rolled up.
-    if (document.hidden || !host.offsetParent) return;
-    if (host.querySelector(".cf-focus")) return;
-
-    tiles.forEach((tile) => {
-      if (!tile.album && !dress(tile)) return;
-      tile.life += delta;
-      if (tile.life > tile.ttl) { dress(tile); return; }
-      tile.x += tile.vx * delta;
-      tile.y += tile.vy * delta;
-      tile.turn += tile.spin * delta;
-      const fade = Math.min(1, tile.life / (tile.ttl * 0.18),
-                            (tile.ttl - tile.life) / (tile.ttl * 0.24));
-      tile.node.style.opacity = String(tile.peak * fade);
-      tile.node.style.transform = "translate3d(" + Math.round(tile.x) + "px,"
-        + Math.round(tile.y) + "px,0) rotate(" + tile.turn.toFixed(1) + "deg)";
-    });
-  }
-
-  const width = host.clientWidth || 620;
-  const count = Math.max(5, Math.min(13, Math.round(width / 105)));
-  for (let i = 0; i < count; i += 1) {
-    const node = el("div", "cf-swirl-tile", "");
-    const tile = {node, album: null, life: 0, ttl: 1};
-    node.onclick = () => { if (tile.album) albumFocus(host, tile.album); };
-    layer.appendChild(node);
-    tiles.push(tile);
-    // Stagger the first entrances so they do not arrive as one wave.
-    tile.life = -Math.random() * 9;
-  }
-
-  swirlAlbums().then(() => { requestAnimationFrame(step); });
-}
-
-/* ---- One album, its tracks, and a way back out (#162) ---- */
-
-async function albumFocus(host, album) {
-  const open = host.querySelector(".cf-focus");
-  if (open) open.remove();
-
-  const shade = el("div", "cf-focus", "");
-  shade.onclick = (event) => { if (event.target === shade) shade.remove(); };
-
-  const sleeve = el("div", "sleeve", "");
-  sleeveInto(sleeve, {
-    artist: album.artist, album: album.album, title: album.album,
-    art: album.art,
-  }, 220);
-  shade.appendChild(sleeve);
-
-  const list = el("div", "list", "");
-  const head = el("div", "row", "");
-  head.style.cssText = "align-items:baseline;gap:8px";
-  const title = document.createElement("b");
-  title.textContent = album.album || "Unknown album";
-  title.style.cssText = "font-size:15px;flex:1;min-width:0";
-  const shut = el("button", "", "✕");
-  shut.title = "Back to the swirl";
-  shut.onclick = () => shade.remove();
-  head.appendChild(title);
-  head.appendChild(shut);
-  list.appendChild(head);
-
-  const who = el("div", "muted", album.artist || "");
-  who.style.cssText = "font-size:12px;margin-top:2px";
-  list.appendChild(who);
-
-  const tracks = el("div", "tracks", "");
-  tracks.appendChild(el("div", "muted", "Reading the album…"));
-  list.appendChild(tracks);
-  shade.appendChild(list);
-  host.appendChild(shade);
-
-  try {
-    const data = await api("/api/music/album?artist="
-      + encodeURIComponent(album.artist || "")
-      + "&album=" + encodeURIComponent(album.album || ""));
-    tracks.textContent = "";
-    who.textContent = [album.artist, data.count + " tracks",
-                       Math.round((data.seconds || 0) / 60) + " min"]
-      .filter(Boolean).join(" · ");
-
-    (data.tracks || []).forEach((track, i) => {
-      const row = el("div", "", "");
-      row.appendChild(el("span", "n", String(i + 1)));
-      row.appendChild(el("span", "t", track.title || ""));
-      row.appendChild(el("span", "d", Math.floor(track.seconds / 60) + ":"
-        + String(Math.round(track.seconds % 60)).padStart(2, "0")));
-      row.onclick = () => { shade.remove(); musicPlay(track.id, true); };
-      wireDownload(row, track);
-      tracks.appendChild(row);
-    });
-    if (!(data.tracks || []).length) {
-      tracks.appendChild(el("div", "muted", "Nothing indexed under this album."));
-    }
-  } catch (error) {
-    tracks.textContent = "";
-    tracks.appendChild(el("div", "muted", error.message));
-  }
-}
-
 let djFlow = null;
 let musicFlow = null;
 let musicFlowList = false;
@@ -16815,14 +16556,10 @@ function renderDJFlow(state) {
   if (!host) return;
   if (!djFlow) {
     djFlow = coverFlow(host, {
+      size: 148,
       empty: "Tune in — the last five and next five appear here.",
-      // Clicking the album on the stage opens it, same as clicking one of
-      // the sleeves drifting behind it.
-      onPick: (track) => albumFocus(host, {
-        artist: track.artist, album: track.album, art: track.art,
-      }),
+      onPick: (track) => trackCard(track.id),
     });
-    swirlStart(host);
   }
   // Oldest played first, then what is on air, then what is queued.
   const played = (state.played || []).slice(0, 5).reverse();
