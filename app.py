@@ -5449,6 +5449,42 @@ async def dj_take_request(text: str) -> dict[str, Any]:
             "started": started, "query": query}
 
 
+async def dj_played(track_id: str, source: str = "the panel") -> dict[str, Any]:
+    """Something was put on by hand. Tell the pair, and let it take the air.
+
+    Whatever you choose becomes the track on air, so the display, the queue
+    and the DJs are all describing the same song instead of three different
+    ones (#166, #167)."""
+    track = music_track(track_id)
+    if not track:
+        return {}
+
+    count = request_remember(track, source)
+    _RADIO["chat"].append({
+        "ts": int(time.time()), "who": "host", "kind": "played",
+        "text": f"Put on: {track['title']}"
+                + (f" by {track['artist']}" if track.get("artist") else "")
+                + (f" ({source})" if source else ""),
+    })
+
+    # If a show is running, hand it the track so the station follows you
+    # rather than talking over you.
+    if _RADIO["on"]:
+        _RADIO["requests"].insert(0, track)
+        dj_skip()
+    else:
+        _RADIO["now"] = track
+
+    brief = request_brief(count)
+    extra = (f"the host has just put this on himself, from {source}"
+             + (f". {brief}" if brief else ""))
+    line = await dj_speak("interject", track, extra=extra)
+    return {
+        "line": line, "times_asked": count, "on_air": bool(_RADIO["on"]),
+        **{k: v for k, v in track.items() if k not in ("path", "search")},
+    }
+
+
 async def dj_chat(message: str) -> dict[str, Any]:
     """Talk to the DJ mid-song; he answers about what is playing."""
     _RADIO["chat"].append(
@@ -6227,6 +6263,58 @@ def drop_bombshell() -> dict[str, Any]:
         [r for r in rows if int(r.get("used") or 0) == fewest])
     use_bombshell(chosen["id"])
     return chosen
+
+
+# --- Listening to a caller in the browser (#163) ----------------------------
+# The satellite has a microphone; so does the browser. Both end up in the
+# same place: text for the pair to react to.
+
+WHISPER_HOST = os.getenv("WHISPER_HOST", "127.0.0.1")
+WHISPER_PORT = int(os.getenv("WHISPER_PORT", "10300"))
+CALLIN_MAX_BYTES = 16000 * 2 * 60          # a minute of 16 kHz mono is plenty
+
+
+def _wyoming_send(sock: "socket.socket", event: dict[str, Any],
+                  payload: bytes = b"") -> None:
+    header = dict(event)
+    if payload:
+        header["payload_length"] = len(payload)
+    sock.sendall(json.dumps(header).encode() + b"\n")
+    if payload:
+        sock.sendall(payload)
+
+
+def wyoming_transcribe(pcm: bytes, rate: int = 16000) -> str:
+    """16-bit mono PCM in, text out. Blocking — call it in a thread."""
+    import socket
+
+    audio = {"rate": rate, "width": 2, "channels": 1}
+    with socket.create_connection((WHISPER_HOST, WHISPER_PORT),
+                                  timeout=120) as sock:
+        _wyoming_send(sock, {"type": "transcribe",
+                             "data": {"language": "en"}})
+        _wyoming_send(sock, {"type": "audio-start", "data": audio})
+        # 1024 samples per chunk is what the satellite sends; matching it
+        # keeps the service on a path it is already good at.
+        step = 2048
+        for at in range(0, len(pcm), step):
+            _wyoming_send(sock, {"type": "audio-chunk", "data": audio},
+                          pcm[at:at + step])
+        _wyoming_send(sock, {"type": "audio-stop"})
+
+        stream = sock.makefile("rb")
+        while True:
+            line = stream.readline()
+            if not line:
+                return ""
+            header = json.loads(line)
+            data = header.get("data") or {}
+            if header.get("data_length") and not data:
+                data = json.loads(stream.read(header["data_length"]))
+            if header.get("payload_length"):
+                stream.read(header["payload_length"])
+            if header.get("type") == "transcript":
+                return str(data.get("text") or "").strip()
 
 
 # --- Call-ins --------------------------------------------------------------
@@ -8939,6 +9027,24 @@ async def dj_heard_api(
                      "detail": "not a song request the library can fill"}
 
 
+@app.post("/api/dj/played")
+async def dj_played_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Anything you play by hand — a search result, a crystal, an album
+    track — goes through here so the DJs know about it (#166)."""
+    require_auth(authorization)
+    payload = await request.json()
+    track_id = str(payload.get("id") or "").strip()
+    if not track_id:
+        raise HTTPException(status_code=400, detail="Which track?")
+    result = await dj_played(track_id, str(payload.get("source") or "the panel"))
+    if not result:
+        raise HTTPException(status_code=404, detail="No such track")
+    return result
+
+
 @app.post("/api/dj/say")
 async def dj_say_api(
     request: Request,
@@ -9390,6 +9496,41 @@ async def dj_topics_drop(
                             angle=bombshell_angle(row["text"]))
     use_bombshell(topic_id)
     return {"lines": lines, "topic": row["text"]}
+
+
+@app.post("/api/dj/callin/voice")
+async def dj_callin_voice(
+    request: Request,
+    rate: int = 16000,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Raw 16-bit mono PCM recorded in the browser: transcribe it, then put
+    the caller on air (#163)."""
+    require_auth(authorization)
+    pcm = await request.body()
+    if len(pcm) < 3200:                    # under a tenth of a second
+        raise HTTPException(status_code=400, detail="That recording is empty")
+    pcm = pcm[:CALLIN_MAX_BYTES]
+
+    try:
+        heard = await asyncio.to_thread(wyoming_transcribe, pcm, rate)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Speech recognition is not answering: {exc}") from exc
+
+    if not heard:
+        return {"heard": "", "lines": [],
+                "detail": "Nothing came through — try again, a bit louder."}
+
+    # A caller can ask for a song as easily as raise a topic.
+    taken = await dj_take_request(heard)
+    if taken:
+        return {"heard": heard, "lines": [taken["reply"]],
+                "track": taken.get("track"), "kind": "request"}
+
+    result = await dj_callin(heard, caller="a caller on line one")
+    return {**result, "heard": heard, "kind": "callin"}
 
 
 @app.post("/api/dj/callin")
@@ -12787,6 +12928,9 @@ speaker and restart the agent."
                 title="Get the two of them talking">🎙🎙 Banter</button>
         <button onclick="djCallIn()"
                 title="Put a caller on air with a topic">☎ Call-in</button>
+        <button id="djMicBtn" onclick="djMicCall()"
+                title="Call in by voice — click to record, click again to send"
+                >🎤</button>
         <button onclick="djTopicsPanel()"
                 title="Things for one of them to spring on the other">💣 Topics</button>
       </div>
@@ -15100,6 +15244,11 @@ async function musicPlay(id, here) {
     musicNowArt(track);
     if (stage) stage.show(track);
     stageSheet(track);
+    djPinned = track.id;              // the display follows your choice
+    api("/api/dj/played", {
+      method: "POST",
+      body: JSON.stringify({id: track.id, source: "the library"}),
+    }).then(() => pollDJ()).catch(() => {});
     player.src = track.url;
     player.play().catch(() => {});    // autoplay may be blocked; controls stay
     musicRadioOn = false;             // a hand-picked track ends the station
@@ -15320,6 +15469,12 @@ async function crystalPlay(crystal, here, player) {
     player.play().catch(() => {});
     note.textContent = track.played_on
       ? "Playing on " + track.played_on : "Playing here.";
+    // Anything you put on gets talked about (#166).
+    djPinned = track.id;
+    api("/api/dj/played", {
+      method: "POST",
+      body: JSON.stringify({id: track.id, source: "a SongSight crystal"}),
+    }).then(() => pollDJ()).catch(() => {});
   } catch (error) {
     note.textContent = error.message + " — is the audio in the library?";
   }
@@ -17124,6 +17279,9 @@ function scopeLoop() {
 
 /* ---- The now-playing stage (#148) ---- */
 
+// The track you chose by hand, held until the station is playing it too.
+let djPinned = "";
+
 let stage = null;
 
 async function stageStart() {
@@ -18450,7 +18608,11 @@ function djRender(state) {
   renderDeck(state);
   renderDJFlow(state);
   renderNowTags(state);
+  // A track you picked by hand owns the display until the station catches
+  // up to it — otherwise the next poll would wipe it (#167).
   if (state.now && state.now.id) {
+    if (djPinned && djPinned !== state.now.id) return;
+    djPinned = "";
     if (stage) stage.show(state.now);
     stageSheet(state.now);
   }
@@ -18770,6 +18932,127 @@ async function djBanterNow() {
     pollDJ();
   } catch (error) {
     status.textContent = error.message;
+  }
+}
+
+/* ---- Calling in by voice from this page (#163) ---- */
+
+let djMic = null;
+
+// 16 kHz mono is what whisper wants. Capturing raw samples means the server
+// never has to transcode, which matters because the container has no ffmpeg.
+const MIC_RATE = 16000;
+
+function djMicSay(text) {
+  const status = document.getElementById("djStatus");
+  if (status) status.textContent = text;
+}
+
+async function djMicCall() {
+  const button = document.getElementById("djMicBtn");
+  if (djMic) { await djMicStop(); return; }
+
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    // Browsers only hand out a microphone on a secure origin, and this panel
+    // is plain HTTP over the LAN.
+    djMicSay("This browser will not open a microphone over plain HTTP. "
+      + "Either open the panel at http://localhost:8096 on the Spark itself, "
+      + "or in Firefox set media.devices.insecure.enabled and "
+      + "media.getusermedia.insecure.enabled to true in about:config.");
+    return;
+  }
+
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: {channelCount: 1, echoCancellation: true, noiseSuppression: true},
+    });
+  } catch (error) {
+    djMicSay("No microphone: " + error.message);
+    return;
+  }
+
+  const context = new (window.AudioContext || window.webkitAudioContext)(
+    {sampleRate: MIC_RATE});
+  const source = context.createMediaStreamSource(stream);
+  // ScriptProcessor is deprecated but is the one that works everywhere,
+  // Firefox included. An AudioWorklet needs a separate module file.
+  const node = context.createScriptProcessor(4096, 1, 1);
+  const chunks = [];
+  let samples = 0;
+
+  node.onaudioprocess = (event) => {
+    const input = event.inputBuffer.getChannelData(0);
+    const block = new Int16Array(input.length);
+    for (let i = 0; i < input.length; i += 1) {
+      const clamped = Math.max(-1, Math.min(1, input[i]));
+      block[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+    }
+    chunks.push(block);
+    samples += block.length;
+  };
+  source.connect(node);
+  node.connect(context.destination);
+
+  djMic = {stream, context, source, node, chunks,
+           rate: context.sampleRate, started: Date.now(),
+           count: () => samples};
+  if (button) {
+    button.textContent = "⏺";
+    button.style.background = "#ef6461";
+    button.style.color = "#0b0f14";
+  }
+  djMicSay("On air — recording. Click the microphone again to send it.");
+
+  // A caller who forgets to hang up should not record for ever.
+  djMic.limit = setTimeout(() => { if (djMic) djMicStop(); }, 60000);
+}
+
+async function djMicStop() {
+  const mic = djMic;
+  djMic = null;
+  if (!mic) return;
+  clearTimeout(mic.limit);
+
+  const button = document.getElementById("djMicBtn");
+  if (button) {
+    button.textContent = "🎤";
+    button.style.background = "";
+    button.style.color = "";
+  }
+
+  try { mic.node.disconnect(); mic.source.disconnect(); } catch (e) { /* going */ }
+  try { mic.stream.getTracks().forEach((t) => t.stop()); } catch (e) { /* going */ }
+  const rate = Math.round(mic.rate || MIC_RATE);
+  try { await mic.context.close(); } catch (e) { /* going */ }
+
+  const total = mic.count();
+  if (total < rate * 0.3) {
+    djMicSay("That was too short to make out.");
+    return;
+  }
+
+  const pcm = new Int16Array(total);
+  let at = 0;
+  mic.chunks.forEach((block) => { pcm.set(block, at); at += block.length; });
+
+  djMicSay("Putting you through… (" + (total / rate).toFixed(1) + "s)");
+  try {
+    const result = await api("/api/dj/callin/voice?rate=" + rate, {
+      method: "POST",
+      headers: {"Content-Type": "application/octet-stream"},
+      body: pcm.buffer,
+    });
+    if (!result.heard) {
+      djMicSay(result.detail || "Nothing came through.");
+      return;
+    }
+    const badge = result.kind === "request" ? "🎵" : "☎";
+    djMicSay(badge + " you: \u201c" + result.heard + "\u201d  //  "
+      + (result.lines || []).join("  //  "));
+    pollDJ();
+  } catch (error) {
+    djMicSay(error.message);
   }
 }
 
