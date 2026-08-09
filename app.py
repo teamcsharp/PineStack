@@ -5299,8 +5299,15 @@ async def dj_request(query: str, now: bool = False) -> dict[str, Any]:
 # costs nothing — if the library has no such song we fall through and the
 # model answers normally — so the pattern can afford to be generous where
 # DJ_REQUEST above is deliberately strict.
-DJ_ASKED = re.compile(
-    r"\b(play|put on|queue|spin|request|dedicate|hear)\b", re.I)
+# "hear" on its own is not a request — "can you hear me" is a question about
+# the microphone. It only counts inside a phrase that is actually asking for
+# something ("want to hear", "let's hear some").
+DJ_ASKED_STRICT = re.compile(
+    r"\b(?:play|put on|queue up|spin|dedicate)\b"
+    r"|\brequest\b(?!\s*(?:ed|s\b))"
+    r"|\b(?:want|wanna|like|love|let'?s|lets|let)\b[^.?!]{0,24}\bhear\b",
+    re.I)
+DJ_ASKED = DJ_ASKED_STRICT
 
 
 # Words that never name a song. Stripping them before the search is what
@@ -5315,6 +5322,9 @@ DJ_FILLER = {
     "artist", "album", "called", "named", "that", "this", "does", "do",
     "not", "exist", "here", "there", "want", "like", "would", "could",
     "can", "will", "let", "lets", "hear", "listen", "again",
+    # Asked constantly of a voice assistant, never the name of a track.
+    "able", "there", "okay", "hello", "sorry", "thanks", "again", "still",
+    "working", "online", "awake", "alive", "understand", "repeat",
 }
 
 
@@ -5323,6 +5333,13 @@ def dj_request_terms(text: str) -> list[str]:
     query = dj_request_query(text)
     return [word for word in re.findall(r"[a-z0-9']+", query.lower())
             if len(word) > 1 and word not in DJ_FILLER]
+
+
+def _whole_word(word: str, hay: str) -> bool:
+    """music_search matches substrings, so "able" finds "unstable". For
+    deciding whether a request is real, only whole words count."""
+    return re.search(rf"(?<![a-z0-9]){re.escape(word)}(?![a-z0-9])",
+                     hay) is not None
 
 
 def dj_request_match(terms: list[str]) -> dict[str, Any] | None:
@@ -5339,9 +5356,9 @@ def dj_request_match(terms: list[str]) -> dict[str, Any] | None:
     hay = hits[0]["search"]
     strong = [word for word in terms if len(word) >= 4]
     if strong:
-        return hits[0] if any(word in hay for word in strong) else None
+        return hits[0] if any(_whole_word(w, hay) for w in strong) else None
     # Nothing distinctive to go on, so every short word has to be there.
-    return hits[0] if all(word in hay for word in terms) else None
+    return hits[0] if all(_whole_word(w, hay) for w in terms) else None
 
 
 async def dj_take_request(text: str) -> dict[str, Any]:
