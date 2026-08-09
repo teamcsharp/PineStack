@@ -3298,6 +3298,43 @@ async def satellite_ready() -> bool:
     return bool(_SAT_ALIVE["ok"])
 
 
+# How recently the satellite's config entry was rebuilt. Reloading in a tight
+# loop would be worse than the fault it is fixing.
+_HEAL_LAST = [0.0]
+HEAL_COOLDOWN = 90.0
+
+
+async def satellite_selfheal() -> bool:
+    """Rebuild the satellite's connection.
+
+    A 500 from announce means Home Assistant's Wyoming client has no writer:
+    the socket died but the config entry still reads "loaded", so nothing
+    else notices. Reloading the entry is the one call that rebuilds it."""
+    now = time.time()
+    if now - _HEAL_LAST[0] < HEAL_COOLDOWN:
+        return False
+    _HEAL_LAST[0] = now
+
+    token, player = _ha_creds()
+    if not (token and player):
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=45) as client:
+            reply = await client.post(
+                f"{HA_URL}/api/services/homeassistant/reload_config_entry",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"entity_id": player},
+            )
+        healed = reply.status_code < 400
+    except Exception:
+        return False
+
+    if healed:
+        _SAT_ALIVE["checked"] = 0.0     # re-check rather than trust the cache
+        await asyncio.sleep(6)          # give it a moment to come back up
+    return healed
+
+
 async def home_assistant_say(
     text: str, event: str = "default", voice: str | None = None
 ) -> dict[str, Any]:
@@ -3369,6 +3406,11 @@ async def home_assistant_say(
             if attempt < 3 and "busy" in exc.response.text.lower():
                 await asyncio.sleep(4)
                 continue
+            # A 500 is what a dead Wyoming connection looks like from here.
+            # Rebuild it and try once more before giving up.
+            if attempt < 3 and exc.response.status_code >= 500:
+                if await satellite_selfheal():
+                    continue
             raise HTTPException(
                 status_code=502,
                 detail=(
@@ -3732,6 +3774,11 @@ async def _play_on_box(path: str, sig: str) -> str:
             # Swallowing this silently is what made the stall so hard to see.
             _ANNOUNCE_LAST["error"] = f"{type(exc).__name__}: {exc}"[:200]
             return ""
+
+
+def satellite_healed_at() -> float:
+    """When the connection was last rebuilt underneath you."""
+    return _HEAL_LAST[0]
 
 
 def announce_health() -> dict[str, Any]:
@@ -10938,12 +10985,15 @@ async def chat_completions(
                 "finish_reason": "stop",
             }
         ],
+        # Not every path through generate_answer talks to the model — a
+        # request taken by the station never does — so token counts are
+        # optional rather than guaranteed.
         "usage": {
-            "prompt_tokens": metadata["prompt_tokens"],
-            "completion_tokens": metadata["completion_tokens"],
+            "prompt_tokens": metadata.get("prompt_tokens", 0),
+            "completion_tokens": metadata.get("completion_tokens", 0),
             "total_tokens": (
-                metadata["prompt_tokens"]
-                + metadata["completion_tokens"]
+                metadata.get("prompt_tokens", 0)
+                + metadata.get("completion_tokens", 0)
             ),
         },
         "spark_agent": {
