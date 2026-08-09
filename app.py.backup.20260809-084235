@@ -10,7 +10,6 @@ import os
 import random
 import re
 import time
-import traceback
 import uuid
 import wave
 from html.parser import HTMLParser
@@ -5068,13 +5067,8 @@ async def _dj_loop() -> None:
             await _hold(length + 1.5)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        # Going off air silently is indistinguishable from never starting.
-        _RADIO["died"] = {
-            "at": int(time.time()),
-            "why": f"{type(exc).__name__}: {exc}"[:300],
-            "where": traceback.format_exc()[-1200:],
-        }
+    except Exception:
+        pass
     finally:
         if skip in _DJ_SKIP:
             _DJ_SKIP.remove(skip)
@@ -5220,89 +5214,6 @@ async def dj_request(query: str, now: bool = False) -> dict[str, Any]:
         "ok": True, "queued": not now, "line": line,
         **{k: v for k, v in track.items() if k not in ("path", "search")},
     }
-
-
-# Worth trying the station on anything that sounds like a request. A miss
-# costs nothing — if the library has no such song we fall through and the
-# model answers normally — so the pattern can afford to be generous where
-# DJ_REQUEST above is deliberately strict.
-DJ_ASKED = re.compile(
-    r"\b(play|put on|queue|spin|request|dedicate|hear)\b", re.I)
-
-
-# Words that never name a song. Stripping them before the search is what
-# stops "put on some Bassnectar" matching a track whose only claim is the
-# word "some".
-DJ_FILLER = {
-    "a", "an", "the", "some", "any", "me", "us", "my", "you", "please",
-    "song", "songs", "track", "tracks", "tune", "tunes", "music",
-    "something", "anything", "stuff", "by", "from", "for", "on", "off",
-    "in", "at", "to", "of", "and", "with", "radio", "station", "pine",
-    "box", "fm", "dj", "hey", "ok", "okay", "next", "now", "up", "band",
-    "artist", "album", "called", "named", "that", "this", "does", "do",
-    "not", "exist", "here", "there", "want", "like", "would", "could",
-    "can", "will", "let", "lets", "hear", "listen", "again",
-}
-
-
-def dj_request_terms(text: str) -> list[str]:
-    """The words in a spoken request that could plausibly name a song."""
-    query = dj_request_query(text)
-    return [word for word in re.findall(r"[a-z0-9']+", query.lower())
-            if len(word) > 1 and word not in DJ_FILLER]
-
-
-def dj_request_match(terms: list[str]) -> dict[str, Any] | None:
-    """The track someone actually asked for, or None.
-
-    music_search always answers with its best effort, so its top hit has to
-    be checked against the distinctive words before it can be trusted."""
-    if not terms:
-        return None
-    hits = music_search(" ".join(terms), limit=1)
-    if not hits:
-        return None
-
-    hay = hits[0]["search"]
-    strong = [word for word in terms if len(word) >= 4]
-    if strong:
-        return hits[0] if any(word in hay for word in strong) else None
-    # Nothing distinctive to go on, so every short word has to be there.
-    return hits[0] if all(word in hay for word in terms) else None
-
-
-async def dj_take_request(text: str) -> dict[str, Any]:
-    """A song asked for out loud. Returns {} when it was not one we can fill.
-
-    The station is started if it is off, because "play me a song" implies it,
-    and the track is cut to rather than queued — you asked for it now."""
-    if not DJ_ASKED.search(text or ""):
-        return {}
-
-    terms = dj_request_terms(text)
-    wanted = dj_request_match(terms)
-    if wanted is None:
-        return {}                       # not in the library — let the model talk
-    query = " ".join(terms)
-
-    started = False
-    if not _RADIO["on"]:
-        dj_start(dj_best_station(""))
-        started = True
-
-    result = await dj_request(query, now=True)
-    if not result.get("ok"):
-        return {}
-
-    # The DJ introduces it himself when the loop reaches the track, so this
-    # is only the "heard you" — kept short so it does not tread on him.
-    title = result.get("title") or query
-    artist = result.get("artist") or ""
-    station = dj_settings()["station_name"]
-    reply = (f"You got it. {title}" + (f" by {artist}" if artist else "")
-             + f", coming up on {station}.")
-    return {"reply": reply, "track": title, "artist": artist,
-            "started": started, "query": query}
 
 
 async def dj_chat(message: str) -> dict[str, Any]:
@@ -8440,15 +8351,6 @@ async def radio_page() -> str:
     return RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
 
 
-@app.get("/api/dj/state")
-async def dj_state_api(
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """What the station is doing, and why it stopped if it did."""
-    require_read_auth(authorization)
-    return {**dj_state(), "died": _RADIO.get("died") or {}}
-
-
 @app.post("/api/dj/start")
 async def dj_start_api(
     request: Request,
@@ -8513,23 +8415,6 @@ async def dj_request_api(
     if not result.get("ok"):
         raise HTTPException(status_code=404, detail=result["detail"])
     return result
-
-
-@app.post("/api/dj/heard")
-async def dj_heard_api(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """What the box would do with a spoken line — the request path, testable
-    without a microphone."""
-    require_auth(authorization)
-    payload = await request.json()
-    text = str(payload.get("text") or "").strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Say something")
-    taken = await dj_take_request(text)
-    return taken or {"reply": "", "heard": text,
-                     "detail": "not a song request the library can fill"}
 
 
 @app.post("/api/dj/say")
@@ -10463,30 +10348,6 @@ async def chat_completions(
             detail="messages must be an array",
         )
 
-    user_text = latest_user_text(incoming_messages)
-
-    # "Play Blue Monday on Pine Box FM", said out loud to the box. The
-    # station takes this one; the model never sees it.
-    taken = await dj_take_request(user_text)
-    if taken:
-        log_turn(user_text, taken["reply"],
-                 {"active_prompt": "Pine Box FM", "model": "station",
-                  "dj_request": taken["query"]})
-        return {
-            "id": f"chatcmpl-{uuid.uuid4().hex}",
-            "object": "chat.completion",
-            "created": int(time.time()),
-            "model": "pine-box-fm",
-            "choices": [{
-                "index": 0,
-                "message": {"role": "assistant", "content": taken["reply"]},
-                "finish_reason": "stop",
-            }],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
-                      "total_tokens": 0},
-            "spark_agent": {"dj_request": taken},
-        }
-
     answer, metadata = await generate_answer(
         incoming_messages,
         requested_model=incoming.get("model"),
@@ -10496,6 +10357,7 @@ async def chat_completions(
         ),
     )
 
+    user_text = latest_user_text(incoming_messages)
     log_turn(user_text, answer, metadata)
 
     if load_settings().get("openwebui_logging", True):

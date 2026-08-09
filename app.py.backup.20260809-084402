@@ -10,7 +10,6 @@ import os
 import random
 import re
 import time
-import traceback
 import uuid
 import wave
 from html.parser import HTMLParser
@@ -5068,13 +5067,8 @@ async def _dj_loop() -> None:
             await _hold(length + 1.5)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        # Going off air silently is indistinguishable from never starting.
-        _RADIO["died"] = {
-            "at": int(time.time()),
-            "why": f"{type(exc).__name__}: {exc}"[:300],
-            "where": traceback.format_exc()[-1200:],
-        }
+    except Exception:
+        pass
     finally:
         if skip in _DJ_SKIP:
             _DJ_SKIP.remove(skip)
@@ -5230,47 +5224,6 @@ DJ_ASKED = re.compile(
     r"\b(play|put on|queue|spin|request|dedicate|hear)\b", re.I)
 
 
-# Words that never name a song. Stripping them before the search is what
-# stops "put on some Bassnectar" matching a track whose only claim is the
-# word "some".
-DJ_FILLER = {
-    "a", "an", "the", "some", "any", "me", "us", "my", "you", "please",
-    "song", "songs", "track", "tracks", "tune", "tunes", "music",
-    "something", "anything", "stuff", "by", "from", "for", "on", "off",
-    "in", "at", "to", "of", "and", "with", "radio", "station", "pine",
-    "box", "fm", "dj", "hey", "ok", "okay", "next", "now", "up", "band",
-    "artist", "album", "called", "named", "that", "this", "does", "do",
-    "not", "exist", "here", "there", "want", "like", "would", "could",
-    "can", "will", "let", "lets", "hear", "listen", "again",
-}
-
-
-def dj_request_terms(text: str) -> list[str]:
-    """The words in a spoken request that could plausibly name a song."""
-    query = dj_request_query(text)
-    return [word for word in re.findall(r"[a-z0-9']+", query.lower())
-            if len(word) > 1 and word not in DJ_FILLER]
-
-
-def dj_request_match(terms: list[str]) -> dict[str, Any] | None:
-    """The track someone actually asked for, or None.
-
-    music_search always answers with its best effort, so its top hit has to
-    be checked against the distinctive words before it can be trusted."""
-    if not terms:
-        return None
-    hits = music_search(" ".join(terms), limit=1)
-    if not hits:
-        return None
-
-    hay = hits[0]["search"]
-    strong = [word for word in terms if len(word) >= 4]
-    if strong:
-        return hits[0] if any(word in hay for word in strong) else None
-    # Nothing distinctive to go on, so every short word has to be there.
-    return hits[0] if all(word in hay for word in terms) else None
-
-
 async def dj_take_request(text: str) -> dict[str, Any]:
     """A song asked for out loud. Returns {} when it was not one we can fill.
 
@@ -5279,11 +5232,11 @@ async def dj_take_request(text: str) -> dict[str, Any]:
     if not DJ_ASKED.search(text or ""):
         return {}
 
-    terms = dj_request_terms(text)
-    wanted = dj_request_match(terms)
-    if wanted is None:
+    query = dj_request_query(text)
+    if len(query) < 2:
+        return {}
+    if not music_search(query, limit=1):
         return {}                       # not in the library — let the model talk
-    query = " ".join(terms)
 
     started = False
     if not _RADIO["on"]:
@@ -8438,15 +8391,6 @@ async def radio_page() -> str:
     same session at the same point in the same track."""
     embedded = SPARK_AGENT_API_KEY if AUTOFILL_KEY else ""
     return RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
-
-
-@app.get("/api/dj/state")
-async def dj_state_api(
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """What the station is doing, and why it stopped if it did."""
-    require_read_auth(authorization)
-    return {**dj_state(), "died": _RADIO.get("died") or {}}
 
 
 @app.post("/api/dj/start")

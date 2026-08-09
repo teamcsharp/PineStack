@@ -10,7 +10,6 @@ import os
 import random
 import re
 import time
-import traceback
 import uuid
 import wave
 from html.parser import HTMLParser
@@ -5068,13 +5067,8 @@ async def _dj_loop() -> None:
             await _hold(length + 1.5)
     except asyncio.CancelledError:
         raise
-    except Exception as exc:
-        # Going off air silently is indistinguishable from never starting.
-        _RADIO["died"] = {
-            "at": int(time.time()),
-            "why": f"{type(exc).__name__}: {exc}"[:300],
-            "where": traceback.format_exc()[-1200:],
-        }
+    except Exception:
+        pass
     finally:
         if skip in _DJ_SKIP:
             _DJ_SKIP.remove(skip)
@@ -8438,15 +8432,6 @@ async def radio_page() -> str:
     same session at the same point in the same track."""
     embedded = SPARK_AGENT_API_KEY if AUTOFILL_KEY else ""
     return RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
-
-
-@app.get("/api/dj/state")
-async def dj_state_api(
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """What the station is doing, and why it stopped if it did."""
-    require_read_auth(authorization)
-    return {**dj_state(), "died": _RADIO.get("died") or {}}
 
 
 @app.post("/api/dj/start")
