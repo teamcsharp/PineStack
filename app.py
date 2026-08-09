@@ -6555,14 +6555,12 @@ def serial_ports() -> list[dict[str, str]]:
                 found.append({"device": str(node), "description": "",
                               "manufacturer": "", "vid_pid": "", "serial": ""})
 
-    # This board has 32 onboard UARTs. None of them is ever a USB device, and
-    # listing them buries the one port that matters.
-    usb = [p for p in found
-           if "ttyUSB" in p["device"] or "ttyACM" in p["device"]]
-    return usb or [
-        {**p, "description": p["description"] or "onboard serial port"}
-        for p in found
-    ]
+    # This board has 32 onboard UARTs and none of them can ever be the Pine
+    # Box, which arrives as a USB device. Offering them is worse than
+    # offering nothing: an empty list is the truthful answer to "what is
+    # plugged in", and the panel says so.
+    return [p for p in found
+            if "ttyUSB" in p["device"] or "ttyACM" in p["device"]]
 
 
 def _serial_pump() -> None:
