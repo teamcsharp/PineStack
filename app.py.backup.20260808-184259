@@ -11533,10 +11533,8 @@ speaker and restart the agent."
               onclick="voteNowPlaying(1)">👍</button>
       <button class="act-refresh" title="Never play this again"
               onclick="voteNowPlaying(-1)">👎</button>
-      <button class="act-refresh" title="Have the DJ say something"
-              onclick="djSayMenu(event)">🗣</button>
-      <button class="act-refresh" title="Play that last line again"
-              onclick="djReplay()">⟲</button>
+      <button class="act-refresh" title="Say something over the track"
+              onclick="djCall('interject')">🗣</button>
       <button class="act-refresh" title="Up next"
               onclick="djPanel('djQueue')">▤</button>
       <button class="act-refresh" title="Talk to the DJ"
@@ -12143,12 +12141,10 @@ starts the DJ"
         </label>
       </div>
       <div class="row" style="margin-top:10px;align-items:center">
-        <button onclick="djCall('prev')" title="Previous song">⏮</button>
         <audio id="musicPlayer" controls playsinline
                style="flex:1;min-width:0"></audio>
         <button id="musicDownload" onclick="downloadTrack()"
                 title="Download the track that is playing">⤓</button>
-        <button onclick="djCall('next')" title="Next song">⏭</button>
       </div>
       <canvas id="musicScope" height="74"
               style="width:100%;height:74px;margin-top:6px;border-radius:8px;
@@ -16704,183 +16700,6 @@ function djTalkRender(state) {
   if (atBottom) log.scrollTop = log.scrollHeight;
 }
 
-/* ---- One button, five things to say (#156) ---- */
-
-function djSayMenuClose() {
-  const open = document.getElementById("djSayMenu");
-  if (open) open.remove();
-  document.removeEventListener("click", djSayMenuAway, true);
-}
-
-function djSayMenuAway(event) {
-  const menu = document.getElementById("djSayMenu");
-  if (menu && !menu.contains(event.target)) djSayMenuClose();
-}
-
-// Each option is a different call, but from here it is one question: what do
-// you want him to talk about?
-const DJ_SAYS = [
-  ["🖼", "Product placement", "product",
-   "What is being placed? (a painting from your gallery, or anything)"],
-  ["📣", "Ad read", "ad", "What is the advert for?"],
-  ["👋", "Shout out", "shout", "Who or what is getting the shout out?"],
-  ["🎵", "Music request", "request", "Which song?"],
-  ["💬", "Specific message", "exact",
-   "The exact words you want said, verbatim"],
-  ["🗣", "Just say something", "riff", ""],
-];
-
-function djSayMenu(event) {
-  event.stopPropagation();
-  if (document.getElementById("djSayMenu")) { djSayMenuClose(); return; }
-
-  const anchor = event.currentTarget.getBoundingClientRect();
-  const menu = el("div", "panel", "");
-  menu.id = "djSayMenu";
-  menu.style.cssText = "position:fixed;z-index:150;min-width:260px;padding:8px;"
-    + "box-shadow:0 18px 44px rgba(0,0,0,.6);"
-    + "left:" + Math.max(8, Math.min(window.innerWidth - 280,
-        anchor.left - 120)) + "px;"
-    + "top:" + (anchor.bottom + 8) + "px";
-
-  DJ_SAYS.forEach(([icon, label, kind, ask]) => {
-    const row = el("div", "", "");
-    row.style.cssText = "display:flex;gap:9px;align-items:center;padding:7px 8px;"
-      + "border-radius:var(--radius-sm);cursor:pointer;font-size:13px";
-    row.onmouseenter = () => { row.style.background = "var(--panel2)"; };
-    row.onmouseleave = () => { row.style.background = ""; };
-    row.appendChild(el("span", "", icon));
-    row.appendChild(el("span", "", label));
-    row.onclick = () => { djSayMenuClose(); djSayDo(kind, ask); };
-    menu.appendChild(row);
-  });
-
-  document.body.appendChild(menu);
-  document.addEventListener("click", djSayMenuAway, true);
-}
-
-async function djSayDo(kind, ask) {
-  const status = document.getElementById("djStatus")
-    || document.getElementById("musicStatus");
-  const say = (text) => { if (status) status.textContent = text; };
-
-  let text = "";
-  if (ask) {
-    text = window.prompt(ask, "");
-    if (text === null) return;
-    text = text.trim();
-    if (!text) return;
-  }
-
-  say("Handing it to the DJ…");
-  try {
-    let result;
-    if (kind === "request") {
-      result = await api("/api/dj/request", {
-        method: "POST", body: JSON.stringify({q: text}),
-      });
-      say("Queued: " + result.title + (result.line ? " — " + result.line : ""));
-      pollDJ();
-      return;
-    }
-    if (kind === "ad" || kind === "product") {
-      result = await api("/api/dj/ad", {
-        method: "POST",
-        body: JSON.stringify({product: text, gallery: kind === "product" && !text}),
-      });
-      say("“" + result.ad + "”");
-      loadAds();
-      return;
-    }
-    if (kind === "shout") {
-      result = await api("/api/dj/announce", {
-        method: "POST",
-        body: JSON.stringify({
-          text: "give a warm shout out to: " + text, mode: "riff"}),
-      });
-    } else if (kind === "exact") {
-      result = await api("/api/dj/announce", {
-        method: "POST", body: JSON.stringify({text, mode: "exact"}),
-      });
-    } else {
-      result = await api("/api/dj/interject", {method: "POST"});
-      say("“" + (result.line || "") + "”");
-      return;
-    }
-    say("“" + (result.said || "") + "”");
-  } catch (error) {
-    say(error.message);
-  }
-}
-
-/* ---- Replay the last line (#159) ---- */
-
-async function djReplay() {
-  const status = document.getElementById("djStatus")
-    || document.getElementById("musicStatus");
-  try {
-    const result = await api("/api/dj/replay", {method: "POST"});
-    if (status) {
-      status.textContent = "↻ " + (result.name || "DJ") + ": "
-        + (result.replayed || "");
-    }
-  } catch (error) {
-    if (status) status.textContent = error.message;
-  }
-}
-
-/* ---- Move a panel between the columns (#161) ---- */
-
-// Each panel gets a dot in its corner. Clicking it sends the panel to the
-// other column; the choice is remembered by the panel's heading, which is
-// stable across reloads in a way that DOM order is not.
-function panelKey(panel) {
-  const head = panel.querySelector(":scope > h2");
-  return "col:" + ((head && head.textContent) || "").trim().slice(0, 40);
-}
-
-function panelPlace(panel, side) {
-  const left = document.querySelector("main > .col-left");
-  const main = document.querySelector("main");
-  if (!left || !main) return;
-  if (side === "left") left.appendChild(panel);
-  else main.appendChild(panel);
-  localStorage.setItem(panelKey(panel), side);
-}
-
-function initPanelDots() {
-  const left = document.querySelector("main > .col-left");
-  if (!left) return;
-  document.querySelectorAll("main section.panel").forEach((panel) => {
-    const head = panel.querySelector(":scope > h2");
-    if (!head || panel.querySelector(":scope > .col-dot")) return;
-
-    const inLeft = left.contains(panel);
-    const saved = localStorage.getItem(panelKey(panel));
-    if (saved && saved !== (inLeft ? "left" : "right")) {
-      panelPlace(panel, saved);
-    }
-
-    const dot = el("button", "col-dot", "");
-    dot.title = "Move this panel to the other column";
-    dot.style.cssText = "position:absolute;top:10px;right:10px;width:11px;"
-      + "height:11px;padding:0;border-radius:50%;border:1px solid var(--border);"
-      + "background:var(--panel2);cursor:pointer;opacity:.55";
-    dot.onmouseenter = () => { dot.style.opacity = "1"; };
-    dot.onmouseleave = () => { dot.style.opacity = ".55"; };
-    dot.onclick = (event) => {
-      event.stopPropagation();          // the heading toggles the collapse
-      const nowLeft = document.querySelector("main > .col-left")
-        .contains(panel);
-      panelPlace(panel, nowLeft ? "right" : "left");
-    };
-    if (getComputedStyle(panel).position === "static") {
-      panel.style.position = "relative";
-    }
-    panel.appendChild(dot);
-  });
-}
-
 /* ---- Levels (#153, #154) ---- */
 
 // An <audio> element's own `volume` is capped at 1.0, so anything above 100%
@@ -20308,7 +20127,6 @@ function startLiveActivity() {
   if (musicPlayer) musicPlayer.addEventListener("ended", radioNext);
 
   initThemes();
-  initPanelDots();
   initFontPicker();
   refreshActivityImages();
   pollActivityFeed();
