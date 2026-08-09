@@ -6178,88 +6178,42 @@ CALLIN_MOODS = [
 ]
 
 
-# Words common enough to appear in any manual, which makes them useless for
-# telling one apart from another.
-MANUAL_STOP = {
-    "what", "best", "good", "great", "well", "really", "actually", "even",
-    "just", "like", "want", "know", "make", "makes", "made", "time", "thing",
-    "things", "people", "still", "much", "more", "most", "have", "with",
-    "from", "that", "this", "your", "you're", "them", "they", "there",
-    "here", "when", "where", "which", "about", "into", "over", "some",
-    "any", "also", "very", "does", "doing", "using", "used", "use",
-}
-
-
-def callin_query(topic: str) -> str:
-    """A topic phrased as a question makes a poor search query."""
-    # Strip the whole run of question words, not just the first: "what is
-    # the best ..." has two of them stacked up.
-    query = re.sub(
-        r"^\s*(?:(?:is|are|was|were|do|does|did|can|could|should|would|will|"
-        r"what|why|how|when|where|who)\b\s+)+", "", topic.strip(), flags=re.I)
-    query = re.sub(r"\b(actually|really|even|just|please|the|a|an)\b", " ",
-                   query, flags=re.I)
-    return re.sub(r"\s{2,}", " ", query).strip(" ?.!,") or topic.strip()
-
-
 def manual_notes(topic: str, limit: int = 3) -> str:
-    """Anything the cached gear manuals know about the topic.
-
-    Model numbers are short — "ep", "133", "KO" — so a plain length filter
-    throws away the only tokens that identify a device. The device name is
-    matched against the whole topic with the punctuation stripped out of
-    both, which is what makes "EP-133" find ep-133."""
-    # Work from the cleaned query: the question words in the raw topic match
-    # every manual in the corpus and drown out the real subject.
-    low = callin_query(topic).lower()
-    flat = re.sub(r"[^a-z0-9]", "", topic.lower())
-    words = [w for w in re.findall(r"[a-z0-9]+", low)
-             if (len(w) > 3 or any(c.isdigit() for c in w))
-             and w not in MANUAL_STOP]
-    if not (words or flat):
+    """Anything the cached gear manuals know about the topic."""
+    words = [w for w in re.findall(r"[a-z0-9]+", topic.lower()) if len(w) > 3]
+    if not words:
         return ""
 
+    found: list[str] = []
     try:
         slugs = sorted(p.name for p in TE_DIR.iterdir() if p.is_dir())
     except OSError:
         return ""
 
-    scored: list[tuple[int, str, str]] = []
     for slug in slugs:
         doc = te_doc(slug)
         if not doc:
             continue
         name = str(doc.get("name") or slug)
-        key = re.sub(r"[^a-z0-9]", "", slug.lower())
-
-        # Naming the device outweighs any number of stray keyword hits.
-        named = bool(key) and len(key) > 2 and key in flat
-        best_text, best_hits = "", 0
-        for page in (doc.get("pages") or [])[:80]:
+        # The device itself being named is the strongest signal there is.
+        if any(word in slug.lower() or word in name.lower() for word in words):
+            found.append(f"- the {name} manual is on the station computer")
+        for page in (doc.get("pages") or [])[:60]:
             text = " ".join(str(page.get("text") or "").split())
-            if not text:
-                continue
-            hits = sum(1 for word in words if word in text.lower())
-            if hits > best_hits:
-                best_hits, best_text = hits, text[:240]
-
-        # One stray common word is not a citation. Either the device is
-        # named, or several topic words actually co-occur on a page.
-        score = (100 if named else 0) + best_hits
-        if named or best_hits >= 2:
-            note = (f"- from the {name} manual: {best_text}" if best_text
-                    else f"- the {name} manual is on the station computer")
-            scored.append((score, name, note))
-
-    scored.sort(key=lambda row: -row[0])
-    return "\n".join(note for _score, _name, note in scored[:limit])
+            low = text.lower()
+            if sum(1 for word in words if word in low) >= 2:
+                found.append(f"- from the {name} manual: {text[:220]}")
+                break
+        if len(found) >= limit:
+            break
+    return "\n".join(found[:limit])
 
 
 async def callin_brief(topic: str) -> dict[str, Any]:
     """What the pair get told before the caller goes to air."""
     web: list[dict[str, str]] = []
     try:
-        web = await search_searxng(callin_query(topic))
+        web = await search_searxng(topic)
     except Exception:
         web = []                        # off air beats no show
 

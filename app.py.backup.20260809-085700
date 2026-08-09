@@ -6158,159 +6158,8 @@ def drop_bombshell() -> dict[str, Any]:
     return chosen
 
 
-# --- Call-ins --------------------------------------------------------------
-# Somebody rings the station with a topic. Before it goes to air the pair get
-# briefed: what the web says right now, and anything the gear manuals on disk
-# have to say about it. Then they take it apart on air, each from a different
-# angle.
-
-# How each of them might be feeling about it. Picking two different ones is
-# what stops the exchange being two people nodding along.
-CALLIN_MOODS = [
-    "delighted, treating it as the best thing they have heard all week",
-    "deeply unimpressed, as though the caller has wasted everyone's time",
-    "genuinely unsettled by it, and trying not to show it on air",
-    "frustrated, because this is the third caller about this",
-    "fascinated, going far too deep for a music show",
-    "suspicious that the caller is winding them up",
-    "nostalgic, reminded of something from years ago",
-    "professionally neutral while very obviously having an opinion",
-]
-
-
-# Words common enough to appear in any manual, which makes them useless for
-# telling one apart from another.
-MANUAL_STOP = {
-    "what", "best", "good", "great", "well", "really", "actually", "even",
-    "just", "like", "want", "know", "make", "makes", "made", "time", "thing",
-    "things", "people", "still", "much", "more", "most", "have", "with",
-    "from", "that", "this", "your", "you're", "them", "they", "there",
-    "here", "when", "where", "which", "about", "into", "over", "some",
-    "any", "also", "very", "does", "doing", "using", "used", "use",
-}
-
-
-def callin_query(topic: str) -> str:
-    """A topic phrased as a question makes a poor search query."""
-    # Strip the whole run of question words, not just the first: "what is
-    # the best ..." has two of them stacked up.
-    query = re.sub(
-        r"^\s*(?:(?:is|are|was|were|do|does|did|can|could|should|would|will|"
-        r"what|why|how|when|where|who)\b\s+)+", "", topic.strip(), flags=re.I)
-    query = re.sub(r"\b(actually|really|even|just|please|the|a|an)\b", " ",
-                   query, flags=re.I)
-    return re.sub(r"\s{2,}", " ", query).strip(" ?.!,") or topic.strip()
-
-
-def manual_notes(topic: str, limit: int = 3) -> str:
-    """Anything the cached gear manuals know about the topic.
-
-    Model numbers are short — "ep", "133", "KO" — so a plain length filter
-    throws away the only tokens that identify a device. The device name is
-    matched against the whole topic with the punctuation stripped out of
-    both, which is what makes "EP-133" find ep-133."""
-    # Work from the cleaned query: the question words in the raw topic match
-    # every manual in the corpus and drown out the real subject.
-    low = callin_query(topic).lower()
-    flat = re.sub(r"[^a-z0-9]", "", topic.lower())
-    words = [w for w in re.findall(r"[a-z0-9]+", low)
-             if (len(w) > 3 or any(c.isdigit() for c in w))
-             and w not in MANUAL_STOP]
-    if not (words or flat):
-        return ""
-
-    try:
-        slugs = sorted(p.name for p in TE_DIR.iterdir() if p.is_dir())
-    except OSError:
-        return ""
-
-    scored: list[tuple[int, str, str]] = []
-    for slug in slugs:
-        doc = te_doc(slug)
-        if not doc:
-            continue
-        name = str(doc.get("name") or slug)
-        key = re.sub(r"[^a-z0-9]", "", slug.lower())
-
-        # Naming the device outweighs any number of stray keyword hits.
-        named = bool(key) and len(key) > 2 and key in flat
-        best_text, best_hits = "", 0
-        for page in (doc.get("pages") or [])[:80]:
-            text = " ".join(str(page.get("text") or "").split())
-            if not text:
-                continue
-            hits = sum(1 for word in words if word in text.lower())
-            if hits > best_hits:
-                best_hits, best_text = hits, text[:240]
-
-        # One stray common word is not a citation. Either the device is
-        # named, or several topic words actually co-occur on a page.
-        score = (100 if named else 0) + best_hits
-        if named or best_hits >= 2:
-            note = (f"- from the {name} manual: {best_text}" if best_text
-                    else f"- the {name} manual is on the station computer")
-            scored.append((score, name, note))
-
-    scored.sort(key=lambda row: -row[0])
-    return "\n".join(note for _score, _name, note in scored[:limit])
-
-
-async def callin_brief(topic: str) -> dict[str, Any]:
-    """What the pair get told before the caller goes to air."""
-    web: list[dict[str, str]] = []
-    try:
-        web = await search_searxng(callin_query(topic))
-    except Exception:
-        web = []                        # off air beats no show
-
-    lines = [
-        f"- {r['title']}: {r['snippet'][:240]}"
-        for r in web[:4] if r.get("title") or r.get("snippet")
-    ]
-    manuals = await asyncio.to_thread(manual_notes, topic)
-    return {
-        "web": "\n".join(lines),
-        "manuals": manuals,
-        "sources": [r.get("url", "") for r in web[:4] if r.get("url")],
-    }
-
-
-async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
-    """Put a caller on air and let the pair take the topic apart."""
-    brief = await callin_brief(topic)
-    moods = random.sample(CALLIN_MOODS, 2)
-    who = caller.strip() or random.choice(
-        ["a caller", "a listener", "someone on line one",
-         "a caller who would not give a name"])
-
-    angle = (
-        f"{who} has just rung the station about this, and it is now on air: "
-        f"\"{topic}\". Take the call seriously as a topic and actually "
-        f"discuss it — do not simply mock the caller. A is {moods[0]}. "
-        f"B is {moods[1]}. Let those two dispositions rub against each other. "
-        "Refer to real specifics from the briefing below rather than talking "
-        "in generalities."
-    )
-    if brief["web"]:
-        angle += f"\n\nWhat is being said about it right now:\n{brief['web']}"
-    if brief["manuals"]:
-        angle += (f"\n\nWhat the gear manuals on the station computer say:"
-                  f"\n{brief['manuals']}")
-
-    _RADIO["chat"].append({
-        "ts": int(time.time()), "who": "host", "kind": "callin",
-        "text": f"Call-in: {topic}",
-    })
-    lines = await dj_banter(_RADIO.get("now"), angle=angle, lines=5)
-    return {
-        "lines": lines, "topic": topic, "caller": who,
-        "researched": bool(brief["web"]), "from_manuals": bool(brief["manuals"]),
-        "sources": brief["sources"],
-    }
-
-
 async def dj_banter(track: dict[str, Any] | None = None,
-                    angle: str = "", lines: int = 4) -> list[str]:
+                    angle: str = "") -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
     `angle` overrides the usual random pick — that is how one particular
@@ -6351,8 +6200,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         script = await ask_model(
             f"{dj['persona']}\n\nYour co-host: {dj['cohost_persona']}\n\n"
             f"Write a SHORT exchange for {dj['station_name']} between the two "
-            f"of you — {max(2, lines - 1)} to {lines} lines total, "
-            f"strictly alternating. This time: "
+            f"of you — 2 to 4 lines total, strictly alternating. This time: "
             f"{angle}. Name the actual thing you are talking about. Play it "
             "straight and let the specifics be the joke — mock outrage, "
             "raised eyebrows, 'can you believe what he asked us for'. Keep "
@@ -6396,7 +6244,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # dj_speak now returns only once the line has actually been spoken,
         # so this is just a beat between turns rather than a guess at length.
         await asyncio.sleep(0.35)
-        if len(spoken) >= lines:
+        if len(spoken) >= 4:
             break
     return spoken
 
@@ -9319,21 +9167,6 @@ async def dj_topics_drop(
                             angle=bombshell_angle(row["text"]))
     use_bombshell(topic_id)
     return {"lines": lines, "topic": row["text"]}
-
-
-@app.post("/api/dj/callin")
-async def dj_callin_api(
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> dict[str, Any]:
-    """A caller rings in with a topic; the pair research it and take it on
-    air, each from a different disposition."""
-    require_auth(authorization)
-    payload = await request.json()
-    topic = str(payload.get("topic") or payload.get("text") or "").strip()
-    if not topic:
-        raise HTTPException(status_code=400, detail="What is the call about?")
-    return await dj_callin(topic, str(payload.get("caller") or ""))
 
 
 @app.post("/api/dj/banter")
@@ -12708,10 +12541,6 @@ speaker and restart the agent."
           🖼 Sell a painting</button>
         <button onclick="djBanterNow()"
                 title="Get the two of them talking">🎙🎙 Banter</button>
-        <button onclick="djCallIn()"
-                title="Put a caller on air with a topic">☎ Call-in</button>
-        <button onclick="djTopicsPanel()"
-                title="Things for one of them to spring on the other">💣 Topics</button>
       </div>
 
       <details class="pine-customize" style="margin-top:10px">
@@ -18670,145 +18499,6 @@ async function djBanterNow() {
   } catch (error) {
     status.textContent = error.message;
   }
-}
-
-/* ---- Call-ins and the topic bank ---- */
-
-async function djCallIn() {
-  const status = document.getElementById("djStatus");
-  const topic = window.prompt(
-    "What is the caller ringing about?\n\n"
-    + "They will look it up — online, and in the gear manuals on the "
-    + "station computer — before taking it on air.", "");
-  if (topic === null || !topic.trim()) return;
-
-  status.textContent = "Putting the call through…";
-  try {
-    const result = await api("/api/dj/callin", {
-      method: "POST", body: JSON.stringify({topic: topic.trim()}),
-    });
-    const badge = (result.researched ? "🌐" : "")
-      + (result.from_manuals ? "📘" : "");
-    status.textContent = "☎ " + badge + " "
-      + (result.lines || []).join("  //  ");
-    pollDJ();
-  } catch (error) {
-    status.textContent = error.message;
-  }
-}
-
-function djTopicsPanel() {
-  const open = document.getElementById("djTopicsModal");
-  if (open) { open.remove(); return; }
-
-  const shade = el("div", "", "");
-  shade.id = "djTopicsModal";
-  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;z-index:170;"
-    + "display:flex;align-items:center;justify-content:center";
-  shade.onclick = (event) => { if (event.target === shade) shade.remove(); };
-
-  const card = el("div", "panel", "");
-  card.style.cssText = "max-width:640px;width:94%;max-height:86vh;margin:0;"
-    + "display:flex;flex-direction:column";
-
-  const head = el("h2", "", "Things to spring on them");
-  head.style.margin = "0 0 4px";
-  card.appendChild(head);
-
-  const note = el("div", "muted", "One of them drops it cold, mid-show. The "
-    + "other has no warning and has to deal with it on air. Whatever is in "
-    + "here gets used in preference to their usual material.");
-  note.style.cssText = "font-size:12px;line-height:1.5;margin-bottom:10px";
-  card.appendChild(note);
-
-  const adder = el("div", "row", "");
-  const field = document.createElement("input");
-  field.placeholder = "e.g. he has started calling the co-host by the wrong name";
-  field.onkeydown = (event) => { if (event.key === "Enter") save(); };
-  const add = el("button", "primary", "Add");
-  add.onclick = () => save();
-  adder.appendChild(field);
-  adder.appendChild(add);
-  card.appendChild(adder);
-
-  const list = el("div", "", "");
-  list.style.cssText = "overflow-y:auto;margin-top:10px;flex:1";
-  card.appendChild(list);
-
-  async function save() {
-    const text = field.value.trim();
-    if (!text) return;
-    field.value = "";
-    try {
-      await api("/api/dj/topics", {
-        method: "POST", body: JSON.stringify({text}),
-      });
-      draw();
-    } catch (error) { field.value = text; }
-  }
-
-  async function draw() {
-    list.textContent = "";
-    let topics = [];
-    try {
-      topics = (await api("/api/dj/topics")).topics || [];
-    } catch (error) { /* empty is a fine answer */ }
-
-    if (!topics.length) {
-      list.appendChild(el("div", "muted", "Nothing yet. Whatever you put in "
-        + "here, one of them will spring on the other."));
-      return;
-    }
-    topics.forEach((topic) => {
-      const row = el("div", "", "");
-      row.style.cssText = "display:flex;gap:8px;align-items:flex-start;"
-        + "padding:8px;border-bottom:1px solid var(--border);font-size:13px";
-      const text = el("span", "", topic.text);
-      text.style.cssText = "flex:1;min-width:0;line-height:1.45";
-      const used = el("span", "muted", topic.used
-        ? "aired " + topic.used + "\u00d7" : "unaired");
-      used.style.cssText = "font-size:11px;white-space:nowrap;align-self:center";
-      const now = el("button", "tbtn", "▶");
-      now.title = "Spring this one on them right now";
-      now.onclick = async () => {
-        const status = document.getElementById("djStatus");
-        shade.remove();
-        if (status) status.textContent = "Dropping it on them…";
-        try {
-          const result = await api("/api/dj/topics/" + topic.id + "/drop",
-                                   {method: "POST"});
-          if (status) {
-            status.textContent = "💣 " + (result.lines || []).join("  //  ");
-          }
-          pollDJ();
-        } catch (error) {
-          if (status) status.textContent = error.message;
-        }
-      };
-      const drop = el("button", "tbtn", "✕");
-      drop.title = "Remove";
-      drop.onclick = async () => {
-        try {
-          await api("/api/dj/topics/" + topic.id, {method: "DELETE"});
-          draw();
-        } catch (error) { /* leave it on screen */ }
-      };
-      [text, used, now, drop].forEach((n) => row.appendChild(n));
-      list.appendChild(row);
-    });
-  }
-
-  const foot = el("div", "row", "");
-  foot.style.marginTop = "10px";
-  const shut = el("button", "", "Close");
-  shut.onclick = () => shade.remove();
-  foot.appendChild(shut);
-  card.appendChild(foot);
-
-  shade.appendChild(card);
-  document.body.appendChild(shade);
-  field.focus();
-  draw();
 }
 
 /* ---- DJ settings ---- */
