@@ -3293,6 +3293,13 @@ async def satellite_ready() -> bool:
                 headers={"Authorization": f"Bearer {token}"})
             state = (response.json() or {}).get("state", "")
         _SAT_ALIVE["ok"] = state not in ("unavailable", "unknown", "")
+        if not _SAT_ALIVE["ok"]:
+            # heal_on_unavailable: an entity that reads unavailable while its
+            # config entry still reads loaded is a dead Wyoming socket, and
+            # nothing else in Home Assistant will notice. Rebuild it now so
+            # the next thing anyone says gets through, rather than waiting
+            # for somebody to press recover.
+            fire_and_forget(satellite_selfheal())
     except Exception:
         _SAT_ALIVE["ok"] = True          # cannot tell; do not silence the box
     return bool(_SAT_ALIVE["ok"])
