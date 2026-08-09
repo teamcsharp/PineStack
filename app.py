@@ -9456,11 +9456,14 @@ async def dj_announce_api(
 
     mode = str(payload.get("mode") or "exact")
     kind = str(payload.get("kind") or "interject")
+    # Whose line it was decides whose voice says it again.
+    who = str(payload.get("who") or "dj")
+    who = who if who in ("dj", "cohost") else "dj"
     if mode == "exact":
-        said = await dj_speak(kind, _RADIO.get("now"), line=text)
+        said = await dj_speak(kind, _RADIO.get("now"), line=text, who=who)
     else:
-        said = await dj_speak(kind, _RADIO.get("now"), extra=text)
-    return {"said": said, "mode": mode}
+        said = await dj_speak(kind, _RADIO.get("now"), extra=text, who=who)
+    return {"said": said, "mode": mode, "who": who}
 
 
 @app.get("/api/music/albums")
@@ -17787,16 +17790,40 @@ function djTalkRender(state) {
   log.textContent = "";
   lines.slice(-80).forEach((line) => {
     const row = el("div", "", "");
-    row.style.padding = "3px 0";
+    row.style.cssText = "padding:3px 4px;border-radius:5px;cursor:pointer";
+    row.title = "Say this again out of the Pine Box";
     const who = el("b", "", (line.name || "DJ") + " ");
     who.style.color = line.who === "cohost" ? "#b48cff" : "#7fd1ff";
     row.appendChild(who);
     row.appendChild(document.createTextNode(line.text || ""));
+    row.onmouseenter = () => { row.style.background = "rgba(75,179,255,.13)"; };
+    row.onmouseleave = () => { row.style.background = ""; };
+    row.onclick = () => djTalkSpeak(line, row);
     log.appendChild(row);
   });
   // Only autoscroll if they were already at the bottom — otherwise reading
   // back through the history would be yanked away every poll.
   if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+// Click a line in the booth and it goes out of the box again, said by
+// whoever said it the first time (#165).
+async function djTalkSpeak(line, row) {
+  if (!line || !line.text) return;
+  const was = row ? row.style.background : "";
+  if (row) row.style.background = "rgba(255,212,121,.22)";
+  try {
+    await api("/api/dj/announce", {
+      method: "POST",
+      body: JSON.stringify({
+        text: line.text, mode: "exact", who: line.who || "dj",
+      }),
+    });
+  } catch (error) {
+    const status = document.getElementById("djStatus");
+    if (status) status.textContent = error.message;
+  }
+  if (row) setTimeout(() => { row.style.background = was; }, 900);
 }
 
 /* ---- One button, five things to say (#156) ---- */
