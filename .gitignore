@@ -1,0 +1,5 @@
+# Runtime data, not source: the music index alone is 15 MB and the gear
+# manual corpus is a few hundred.
+data/
+__pycache__/
+*.pyc
