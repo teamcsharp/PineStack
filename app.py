@@ -6564,6 +6564,66 @@ async def dj_banter(track: dict[str, Any] | None = None,
 # --- Getting the box unstuck (#134) ----------------------------------------
 
 
+async def pinebox_listen(prompt: str = "") -> dict[str, Any]:
+    """Open the box's microphone now, wake word or not.
+
+    start_conversation makes the satellite listen and run the pipeline just
+    as if it had heard its wake word — which is the only reliable way in when
+    the on-device detector will not fire."""
+    token, player = _ha_creds()
+    if not (token and player):
+        raise HTTPException(status_code=400, detail="No Home Assistant token")
+    if not player.startswith("assist_satellite."):
+        raise HTTPException(
+            status_code=400,
+            detail=f"{player} is not an assist satellite — nothing to listen with")
+
+    # supported_features bit 2 is START_CONVERSATION. This board only sets
+    # bit 1 (ANNOUNCE): it can be told to speak, never to listen.
+    ANNOUNCE_ONLY = 1
+    async with httpx.AsyncClient(timeout=20) as client:
+        state = await client.get(
+            f"{HA_URL}/api/states/{player}",
+            headers={"Authorization": f"Bearer {token}"})
+    features = int(((state.json() or {}).get("attributes") or {})
+                   .get("supported_features") or 0)
+    if not features & 2:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "This satellite's firmware cannot be told to listen — it "
+                f"reports supported_features={features} "
+                f"({'announce only' if features == ANNOUNCE_ONLY else 'no start_conversation'}). "
+                "Use the button on the box itself, its wake word, or the "
+                "microphone in this page."),
+        )
+
+    payload: dict[str, Any] = {"entity_id": player}
+    if prompt:
+        payload["start_message"] = prompt
+
+    async with httpx.AsyncClient(timeout=ANNOUNCE_TIMEOUT) as client:
+        reply = await client.post(
+            f"{HA_URL}/api/services/assist_satellite/start_conversation",
+            headers={"Authorization": f"Bearer {token}"},
+            json=payload,
+        )
+    if reply.status_code >= 500:
+        # Same dead-socket case announce hits; rebuild and try once more.
+        if await satellite_selfheal():
+            async with httpx.AsyncClient(timeout=ANNOUNCE_TIMEOUT) as client:
+                reply = await client.post(
+                    f"{HA_URL}/api/services/assist_satellite/start_conversation",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=payload,
+                )
+    if reply.status_code >= 400:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Home Assistant refused: {reply.text[:200]}")
+    return {"listening": True, "entity": player, "said": prompt}
+
+
 async def pinebox_recover(restart_agent: bool = True) -> dict[str, Any]:
     """Stop everything that could be holding the satellite, then reload it.
 
@@ -9392,6 +9452,20 @@ async def stack_reconnect_api(
     except Exception:
         payload = {}
     return await stack_reconnect(restart_agent=bool(payload.get("restart", True)))
+
+
+@app.post("/api/pinebox/listen")
+async def pinebox_listen_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Make the Pine Box listen right now, without waiting for a wake word."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    return await pinebox_listen(str(payload.get("prompt") or "").strip())
 
 
 @app.post("/api/pinebox/recover")
@@ -12931,6 +13005,7 @@ speaker and restart the agent."
         <button id="djMicBtn" onclick="djMicCall()"
                 title="Call in by voice — click to record, click again to send"
                 >🎤</button>
+
         <button onclick="djTopicsPanel()"
                 title="Things for one of them to spring on the other">💣 Topics</button>
       </div>
@@ -18932,6 +19007,23 @@ async function djBanterNow() {
     pollDJ();
   } catch (error) {
     status.textContent = error.message;
+  }
+}
+
+// When the on-device wake word will not fire, this opens the box's
+// microphone directly. Nothing to say first — just start talking.
+async function pineboxListen() {
+  const status = document.getElementById("djStatus");
+  const say = (text) => { if (status) status.textContent = text; };
+  say("Opening the Pine Box microphone…");
+  try {
+    await api("/api/pinebox/listen", {
+      method: "POST",
+      body: JSON.stringify({prompt: "Go ahead."}),
+    });
+    say("👂 The Pine Box is listening — talk now.");
+  } catch (error) {
+    say(error.message);
   }
 }
 
