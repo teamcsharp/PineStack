@@ -8558,11 +8558,12 @@ def dj_state() -> dict[str, Any]:
         "history": _RADIO["history"][-10:],
         "played": list(reversed(_RADIO["history"][-10:])),
         "last_said": dj_last_said(),
-        # Whether a voice is coming out RIGHT NOW, and which line it is
-        # (#641) — the booth marks that line so the window reads one to one
-        # with what the broadcast is doing rather than running ahead of it.
+        # Whether a voice is coming out RIGHT NOW (#641). Which LINE it is
+        # the page decides for itself, from the clip actually sounding —
+        # this side only ever knows when it handed one over (#651).
         "speaking": bool(_SPEAKING[0]),
-        "airing_ts": int((dj_last_said() or {}).get("ts") or 0),
+        # Which model is writing the lines, for the provenance card (#655).
+        "model": str(load_settings().get("model") or ""),
         # Eighty, not forty (#415): board hits were flooding the callers
         # out of the booth window before anyone scrolled to them.
         "chat": _RADIO["chat"][-80:],
@@ -29443,10 +29444,28 @@ button.danger {
   position: static; width: 100%; height: 100%; object-fit: contain;
   transform: none;
 }
-/* #641: the line currently going out, lit like a cue light. */
-.booth-onair {
-  background: linear-gradient(90deg, rgba(255,95,95,.16), transparent 70%);
-  box-shadow: inset 2px 0 0 #ff5f5f;
+/* #653: the line SOUNDING right now, pulsing so it can be found at a
+   glance and judged while it is still in the air. */
+.booth-live {
+  border-radius: 6px;
+  animation: boothPulse 1.5s ease-in-out infinite;
+}
+@keyframes boothPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 1px rgba(255,95,95,.55), 0 0 8px rgba(255,95,95,.18);
+    background: rgba(255,95,95,.07);
+  }
+  50% {
+    box-shadow: 0 0 0 2px rgba(255,95,95,.95), 0 0 18px rgba(255,95,95,.4);
+    background: rgba(255,95,95,.15);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .booth-live {
+    animation: none;
+    box-shadow: 0 0 0 2px rgba(255,95,95,.9);
+    background: rgba(255,95,95,.12);
+  }
 }
 /* #645: a sting in the booth arrives as a chip that pops, so the window
    reads the way the broadcast sounded rather than as a line of text. */
@@ -29741,6 +29760,16 @@ links and restart the agent."
       </h1>
       <small id="themeNow">PineVoice intelligence · Pine Box control</small>
     </div>
+    <!-- #652: broadcasting outward is a top-level thing, not something
+         buried in a toolbar. The dot shows whether a tailnet is carrying
+         it, so the state is readable without opening anything. -->
+    <button id="remoteBtn" class="pine-restart"
+            title="Broadcast this station beyond the house — Tailscale
+status, and a link you can hand to somebody so they can tune in"
+            onclick="remotePanel()"
+            style="font-size:15px;line-height:1;position:relative">🌐<span
+      id="remoteDot" style="position:absolute;right:3px;bottom:3px;width:7px;
+height:7px;border-radius:50%;background:#764"></span></button>
   </div>
   <div style="display:flex;align-items:center;gap:14px">
     <label class="slider" id="boxTalkWrap" title="Broadcast the station to
@@ -36573,15 +36602,11 @@ function djTalkRender(state) {
       q.style.cssText = "font-size:10px;opacity:.4";
       said.appendChild(q);
     }
-    // #641: the line the broadcast is ON right now wears the cue light, so
-    // the booth reads one to one with what is actually coming out.
-    if (state.speaking && line.ts && line.ts === state.airing_ts) {
-      row.classList.add("booth-onair");
-      const live = el("span", "", " ●");
-      live.title = "This is what is going out right now";
-      live.style.cssText = "font-size:10px;color:#ff5f5f";
-      said.appendChild(live);
-    }
+    // #651/#653: tag every spoken line with its words so the pulse can find
+    // the one that is actually sounding. The server logs a line when it
+    // hands it over; the page plays it later, so matching on the AUDIO is
+    // what makes this window one to one with the broadcast.
+    if (spoken && line.text) row.setAttribute("data-said", djTalkKey(line.text));
     said.onclick = () => djTalkSpeak(line, said);
     // Right-click any line to bury it forever (#444): it is dropped if it
     // ever comes round again.
@@ -36699,6 +36724,10 @@ function djTalkRender(state) {
   // Only autoscroll if they were already at the bottom — otherwise reading
   // back through the history would be yanked away every poll.
   if (atBottom) log.scrollTop = log.scrollHeight;
+  log._userScrolled = !atBottom;
+  // The window was just rebuilt, so put the pulse back on whatever is
+  // sounding (#651, #653).
+  djTalkMarkLive();
 }
 
 // Click a line in the booth and it goes out of the box again, said by
@@ -37950,6 +37979,29 @@ async function artFullscreen(name) {
   }
 }
 
+/* #652: the header dot — green when a tailnet is carrying the station,
+ * amber when it only reaches this network. Read at a glance, no clicking. */
+async function remoteDotPaint() {
+  const dot = document.getElementById("remoteDot");
+  if (!dot) return;
+  try {
+    const net = await api("/api/remote");
+    const up = !!(net.tailscale && net.tailscale.up);
+    const links = ((await api("/api/share")).links || []).length;
+    dot.style.background = up ? "#3fbf7f" : "#c9922f";
+    const btn = document.getElementById("remoteBtn");
+    if (btn) {
+      btn.title = (up
+        ? "On the tailnet as " + net.tailscale.ip
+          + (net.tailscale.magicdns ? " · " + net.tailscale.magicdns : "")
+        : "This network only — Tailscale is not running on the box yet")
+        + (links ? "\n" + links + " tune-in link"
+             + (links === 1 ? "" : "s") + " out" : "")
+        + "\nClick for links you can hand to somebody.";
+    }
+  } catch (e) { /* the button still opens the panel */ }
+}
+
 /* #632: where the station can be reached from, and links to hand out. */
 async function remotePanel() {
   const gone = document.getElementById("remoteModal");
@@ -38097,6 +38149,7 @@ async function remotePanel() {
                               hours: Number(span.value)})});
       label.value = "";
       await drawLinks();
+      remoteDotPaint();                       // #652
       try { await navigator.clipboard.writeText(got.url); } catch (e) {}
       setStatus(got.remote
         ? "link copied — it works from anywhere on your tailnet"
@@ -39828,6 +39881,35 @@ let djOverlapLead = 0.35;                // seconds the next line comes in early
 const djVoiceEls = [];
 let djVoiceSlot = 0;
 let djVoiceLive = 0;                     // clips actually sounding right now
+// What is coming out of the speakers THIS second (#651, #653).
+let djVoiceNow = null;
+
+/* Put the pulsing outline on the line that is sounding, and take it off
+ * everything else. Called when a clip starts and when one finishes, so the
+ * mark moves with the audio rather than with the transcript. */
+function djTalkMarkLive() {
+  const log = document.getElementById("djTalkLog");
+  if (!log) return;
+  const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
+  let found = null;
+  log.querySelectorAll("[data-said]").forEach((row) => {
+    const hit = want && row.getAttribute("data-said") === want;
+    row.classList.toggle("booth-live", !!hit);
+    if (hit) found = row;
+  });
+  // Keep it in view — the point is to be able to find and judge the line
+  // that is going out right now.
+  if (found && !log._userScrolled) {
+    try { found.scrollIntoView({block: "nearest"}); } catch (e) {}
+  }
+}
+
+// Lines are matched on their words, because the transcript keeps the
+// punctuation the voice never sees.
+function djTalkKey(text) {
+  return String(text || "").toLowerCase()
+    .replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+}
 
 function djVoiceEl(slot) {
   if (!djVoiceEls[slot]) {
@@ -39869,6 +39951,8 @@ function djVoiceNext() {
     if (!djVoiceLive && !djVoiceQueue.length) {
       djSpeaking = false;
       djApplyGain();
+      djVoiceNow = null;               // nothing is sounding (#651)
+      djTalkMarkLive();
     }
   };
   player.onended = done;
@@ -39886,6 +39970,14 @@ function djVoiceNext() {
   djVoiceLive += 1;
   djSpeaking = true;
   djApplyGain();
+  // #651: THIS is the moment a line is actually being heard. The server
+  // logs a line when it hands it over, and the page queue drains at its
+  // own pace — so the booth was showing text that had not been said yet.
+  // What is sounding out of this element is the only honest answer, and it
+  // is right here.
+  djVoiceNow = {text: String(clip.text || ""), ts: clip.ts || 0,
+                sting: !!clip.sting, at: Date.now()};
+  djTalkMarkLive();
   player.src = clip.url;
   player.play().catch((e) => {
     // Autoplay blocked (no user gesture yet) — surface a one-tap unlock so
@@ -40050,8 +40142,20 @@ function voteNowPlaying(vote) {
 async function djCall(what) {
   try {
     const result = await api("/api/dj/" + what, {method: "POST"});
+    djStateAt = Date.now();
     if (result.station_name !== undefined) djRender(result);
     else pollDJ();
+    // #654: do not wait for the next poll to hear it. The server cuts the
+    // record instantly; the page used to sit through up to a poll interval
+    // before noticing, which is the delay you feel. Chase the clock right
+    // away, and again a moment later for the server to put the next one on
+    // air, so pressing skip sounds like pressing skip.
+    if (what === "next" || what === "prev") {
+      radioClockPoll();
+      setTimeout(radioClockPoll, 400);
+      setTimeout(radioClockPoll, 1000);
+      setTimeout(radioClockPoll, 2000);
+    }
   } catch (error) {
     const status = document.getElementById("djStatus");
     if (status) status.textContent = error.message;
@@ -52169,6 +52273,7 @@ function startLiveActivity() {
   loadVotes();
   loadAds();
   djBanLoad();
+  remoteDotPaint();               // #652
   djLoadLevels();
   studioJobsResume();
   layoutRestore();
@@ -52435,7 +52540,7 @@ async function sparkShowInit() {
 // A little multiplex-meter in the corner whenever a line is being rendered
 // for the speakers; hover it for a pie of pipeline stages, a bar graph of
 // delivery ratios, and a heartbeat status table of the server task.
-const MPX = {state: null, active: false, raf: 0, phase: 0};
+const MPX = {state: null, active: false, raf: 0, phase: 0, rig: null};
 const MPX_STAGE_COLOR = {
   documents: "#7fe3d6", docs: "#7fe3d6", speakbox: "#7fe3d6",
   sifting: "#6cb8ff", sift: "#6cb8ff",
@@ -52517,11 +52622,53 @@ function mpxBuildTip() {
   const marquee = genNow
     ? (genNow.name || genNow.who) + ": " + genNow.text
     : "the desk is quiet";
+  // #655: the whole provenance of the line — the words themselves, who is
+  // saying them, which model wrote them, which document they came out of,
+  // how that document was found, and what the desk did to the sound. All of
+  // it already exists; it was just never gathered in one place.
+  const rig = MPX.rig || {};
+  const vec = (s.vector_access || [])[0] || null;
+  const perf = rig.perf || {};
+  const chain = [rig.engine || "",
+                 rig.voice ? "as " + rig.voice : "",
+                 rig.vocode && rig.vocode !== "plain"
+                   ? "vocode(" + rig.vocode + ")" : "",
+                 rig.phone ? "phone" : "",
+                 rig.pitch ? "pitch " + (rig.pitch > 0 ? "+" : "")
+                   + rig.pitch + "st" : "",
+                 rig.strip ? "strip(" + rig.strip + ")" : ""]
+    .filter(Boolean).join(" → ");
+  const shape = [perf.pace ? "pace ×" + Number(perf.pace).toFixed(2) : "",
+                 perf.pitch_st ? "pitch " + (perf.pitch_st > 0 ? "+" : "")
+                   + perf.pitch_st + "st" : "",
+                 perf.energy ? "energy " + (perf.energy > 0 ? "+" : "")
+                   + Number(perf.energy).toFixed(2) : "",
+                 perf.pause_scale
+                   ? "pauses ×" + Number(perf.pause_scale).toFixed(2) : ""]
+    .filter(Boolean).join(" · ");
   const table = [
     ["stage", (cur.stage || "idle") + (cur.detail ? " · " + cur.detail : "")],
-    ["system", sys],
+    ["saying", genNow
+      ? "“" + genNow.text.slice(0, 220) + "”" : "—"],
+    ["in the mouth of", genNow ? (genNow.name || genNow.who) : "—"],
+    ["written by", genNow && genNow.model ? genNow.model
+      : (s.model || "the writing model")],
+    ["out of", genNow && genNow.source
+      ? genNow.source + (genNow.source_text
+          ? " — “" + String(genNow.source_text).slice(0, 90) + "”" : "")
+      : "its own head (no document behind this one)"],
+    ["found by", vec
+      ? (vec.how || "the vector index") + " · " + (vec.file || "?")
+        + " (match " + vec.score + ", " + vec.searched + " swaths, "
+        + vec.ms + "ms)"
+      : "the weighted draw, not a meaning search"],
+    ["voiced by", chain || sys],
+    ["shaped", shape || "flat — no performance vector on this one"],
+    ["rendered", rig.ms
+      ? rig.ms + " ms · " + (rig.kb || "?") + " KB"
+        + (rig.secs ? " · " + rig.secs + "s of audio" : "") : "—"],
     ["previous", genPrev
-      ? (genPrev.name || genPrev.who) + ": " + genPrev.text.slice(0, 40) : "—"],
+      ? (genPrev.name || genPrev.who) + ": " + genPrev.text.slice(0, 60) : "—"],
     ["pending", pending + " held · " + queued + " queued"],
     ["delivery", at.avg_ratio != null
       ? Math.round(at.avg_ratio * 100) + "% of clips fully aired" : "—"],
@@ -52556,6 +52703,14 @@ async function mpxPoll() {
   try {
     const s = await api("/api/dj");
     MPX.state = s;
+    // #655: the engineering half of the story lives on the pipeline feed.
+    // Only fetched while the card is actually open, so the extra request
+    // costs nothing the rest of the time.
+    if (MPX.hovered || (document.getElementById("mpxTip")
+        && document.getElementById("mpxTip").style.display !== "none")) {
+      try { MPX.rig = (await api("/api/dj/pipeline")).rig || {}; }
+      catch (e) { /* the card still reads without it */ }
+    }
     const a = s.activity || {};
     const fresh = a.at && ((Date.now() / 1000) - a.at) < 6;
     const working = fresh && a.stage
