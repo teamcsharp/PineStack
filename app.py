@@ -285,8 +285,9 @@ DEFAULT_DJ = {
     "ad_every": 6,
     # A guaranteed ad on the CLOCK too (#515): at least one every N minutes,
     # whatever the track cadence is doing, so a produced spot lands reliably.
-    # 0 = leave it to ad_every alone.
-    "ad_minutes": 10,
+    # 0 = leave it to ad_every alone. Tightened for #643 — a commercial break
+    # two or three times an hour is what a station sounds like.
+    "ad_minutes": 7,
     # Render the whole phone call as ONE seamless stream — ring, turns back to
     # back, hang-up — instead of turn-by-turn announces (#530, #535). Falls
     # back to turn-by-turn automatically if the concat fails.
@@ -317,6 +318,11 @@ DEFAULT_DJ = {
     # writing prompt as flavour — colouring vocabulary at random whenever
     # anyone is talking, never the subject, never quoted straight.
     "speakbox_system": True,
+    # Other heads (#627): each is a named folder with its OWN shelf — used
+    # lines, gems and vector index all separate, so a football brain and the
+    # studio transcripts never bleed into one another. "main" is built in.
+    "speakbox_minds": [],
+    "speakbox_mind": "main",
     # The rolling episode recorder (#548): seal a compressed mp3 of the
     # broadcast every N minutes for offline replay. 0 = off.
     "episode_minutes": 15,
@@ -347,7 +353,9 @@ DEFAULT_DJ = {
     "banter_min_lines": 2,
     "banter_max_lines": 5,
     # How much of the talk comes out of the speakbox documents, 0 to 1.
-    "speakbox_rate": 0.62,
+    # Raised with the gallery governor (#646): the wall was eating the show,
+    # and the documents are what it is supposed to be made of.
+    "speakbox_rate": 0.82,
     # #609/#612 alternative format: how often a fresh verbatim speakbox swath is
     # APPENDED to the end of a round, and how often one is PRE-PENDED to the
     # front — both right before TTS, so the pair trade the operator's documents
@@ -749,6 +757,25 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "mx_ad_hours": max(0.0, min(24.0, float(
             raw_dj.get("mx_ad_hours", DEFAULT_DJ["mx_ad_hours"]) or 0))),
         "speakbox_system": bool(raw_dj.get("speakbox_system", True)),
+        # #627: the other heads. Validated shape-wise here, since a mind with
+        # no id would resolve to the studio and quietly write its shelf.
+        "speakbox_minds": [
+            {"id": re.sub(r"[^a-z0-9_-]", "",
+                          str(m.get("id") or "").lower())[:40],
+             "name": str(m.get("name") or "")[:60],
+             "dir": str(m.get("dir") or "")[:300],
+             "blurb": str(m.get("blurb") or "")[:400],
+             "weights": {str(k)[:120]: max(0, min(100, int(v)))
+                         for k, v in (m.get("weights") or {}).items()
+                         if str(v).lstrip("-").isdigit()}}
+            for m in (raw_dj.get("speakbox_minds") or [])
+            if isinstance(m, dict)
+            and re.sub(r"[^a-z0-9_-]", "", str(m.get("id") or "").lower())
+            not in ("", "main")
+        ][:12],
+        "speakbox_mind": re.sub(
+            r"[^a-z0-9_-]", "",
+            str(raw_dj.get("speakbox_mind") or "main").lower())[:40] or "main",
         "deep_convo": bool(raw_dj.get("deep_convo", True)),
         "deep_rate": max(0.0, min(1.0, float(
             raw_dj.get("deep_rate", DEFAULT_DJ["deep_rate"]) or 0))),
@@ -3783,14 +3810,21 @@ def _ha_creds() -> tuple[str, str]:
     return token, player
 
 
-def box_talk_ok() -> bool:
+def box_talk_ok(reply: bool = False) -> bool:
     """The master switch for the Pine Box (#638).
 
     Routing used to be decided at thirty separate call sites, and the roads
     that never asked — a chime, a probe, an ack, the hold shelf replaying
     something from an hour ago — went out the speaker anyway. Off means off:
     every outbound road asks this first, so there is nothing left to forget.
+
+    What the switch governs is the STATION. Answering YOU is a different
+    job (#647): with the show off the box, the box is still an assistant —
+    ask it for a render and it replies as it always did. That road passes
+    `reply=True` and is governed by the reply routing alone.
     """
+    if reply:
+        return (_RADIO.get("reply_to") or "box") != "off"
     return bool(_RADIO.get("box_talk", True))
 
 
@@ -4224,10 +4258,13 @@ async def home_assistant_say(
     text: str, event: str = "default", voice: str | None = None,
     plain: bool = False,
 ) -> dict[str, Any]:
-    if not box_talk_ok():
+    # home_assistant_say is only ever the ASSISTANT's voice (speak() routes
+    # here when the ha engine is armed) — so it answers you with the show
+    # switched off the box (#647), and only reply_to="off" mutes it.
+    if not box_talk_ok(reply=True):
         # Not an error — a decline. Callers already read `skipped` as
         # "never reached the room" and take the page road instead (#638).
-        return {"spoken": text, "skipped": "the Pine Box is switched off"}
+        return {"spoken": text, "skipped": "replies are switched off"}
     token, player = _ha_creds()
     if not token:
         raise HTTPException(
@@ -4648,6 +4685,179 @@ def voice_refund(chars: int) -> None:
 
 
 # --- Storage and serving ---------------------------------------------------
+
+
+# --- Remote access (#632) ---------------------------------------------------
+# Where this station can be reached from, and whether a tailnet is carrying
+# it. Everything here is read-only inspection of the host's own networking —
+# the container cannot install or start tailscale (no binary in the image,
+# and tailscaled's socket is not mounted), so when it is absent the honest
+# answer is the one host command that fixes it.
+STATION_PORT = int(os.getenv("SPARK_AGENT_PORT", "8096"))
+_NET_CACHE: dict[str, Any] = {"at": 0.0, "data": {}}
+
+
+def _route_source_ip(dest: str = "1.1.1.1") -> str:
+    """Which address this box would answer on. A UDP connect sends nothing;
+    it just asks the routing table."""
+    import socket
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.settimeout(0.4)
+            probe.connect((dest, 9))
+            return probe.getsockname()[0]
+    except Exception:
+        return ""
+
+
+def _tailnet_ips() -> tuple[str, str]:
+    """(v4, v6) on the tailnet, read out of /proc — no tailscale binary
+    needed, and no root."""
+    v4 = v6 = ""
+    try:
+        import socket
+        import struct
+        import fcntl
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            packed = struct.pack("256s", b"tailscale0")
+            got = fcntl.ioctl(sock.fileno(), 0x8915, packed)   # SIOCGIFADDR
+            v4 = socket.inet_ntoa(got[20:24])
+    except Exception:
+        v4 = ""
+    if not v4:
+        # A 100.64/10 address anywhere is the tailnet even if the interface
+        # is named something else.
+        found = _route_source_ip("100.100.100.100")
+        if found.startswith("100."):
+            v4 = found
+    try:
+        for line in Path("/proc/net/if_inet6").read_text().splitlines():
+            bits = line.split()
+            if len(bits) >= 6 and bits[-1] == "tailscale0":
+                raw = bits[0]
+                v6 = ":".join(raw[i:i + 4] for i in range(0, 32, 4))
+                break
+    except Exception:
+        pass
+    return v4, v6
+
+
+def _magicdns_name() -> str:
+    import socket
+    try:
+        host = socket.gethostname().split(".")[0]
+        for line in Path("/etc/resolv.conf").read_text().splitlines():
+            if line.startswith(("search ", "domain ")):
+                for part in line.split()[1:]:
+                    if part.endswith("ts.net"):
+                        return f"{host}.{part}"
+    except Exception:
+        pass
+    return ""
+
+
+def remote_access() -> dict[str, Any]:
+    """Every address this station answers on, and what is carrying them."""
+    if time.time() - float(_NET_CACHE.get("at") or 0) < 45:
+        return _NET_CACHE["data"]
+    import socket
+    lan = _route_source_ip()
+    v4, v6 = _tailnet_ips()
+    magic = _magicdns_name()
+    try:
+        host = socket.gethostname()
+    except Exception:
+        host = ""
+    urls = []
+    if lan:
+        urls.append({"label": "On this network", "kind": "lan",
+                     "url": f"http://{lan}:{STATION_PORT}"})
+    if host:
+        urls.append({"label": "By name", "kind": "host",
+                     "url": f"http://{host}.local:{STATION_PORT}"})
+    if v4:
+        urls.append({"label": "Tailnet", "kind": "tailscale",
+                     "url": f"http://{v4}:{STATION_PORT}"})
+    if magic:
+        urls.append({"label": "MagicDNS", "kind": "tailscale",
+                     "url": f"http://{magic}:{STATION_PORT}"})
+    data = {
+        "port": STATION_PORT,
+        "lan_ip": lan,
+        "hostname": host,
+        "tailscale": {"up": bool(v4), "ip": v4, "ip6": v6,
+                      "magicdns": magic},
+        "urls": urls,
+        "why": "" if v4 else
+               "No tailnet on this box yet. Tailscale has to be installed on "
+               "the HOST, not in this container — there is no binary in the "
+               "image and tailscaled's socket is not mounted.",
+        "install_cmd": "curl -fsSL https://tailscale.com/install.sh | sh "
+                       "&& sudo tailscale up",
+        "warning": "Everything on this box rides the same host network: "
+                   "Home Assistant, ComfyUI, the voice engines and the "
+                   "search box are all reachable to anyone you invite onto "
+                   "the tailnet. Share tune-in links, not tailnet access, "
+                   "unless you mean it.",
+    }
+    _NET_CACHE.update({"at": time.time(), "data": data})
+    return data
+
+
+# --- Share links (#632) -----------------------------------------------------
+# A tune-in link is a SIGNED token, never the API key: it expires, it can be
+# revoked, and it only opens the six routes a listener needs.
+SHARES_PATH = Path("/app/data/shares.json")
+_SHARES_LOCK = RLock()
+
+
+def read_shares() -> dict[str, Any]:
+    try:
+        rows = json.loads(SHARES_PATH.read_text())
+        return rows if isinstance(rows, dict) else {}
+    except Exception:
+        return {}
+
+
+def write_shares(rows: dict[str, Any]) -> None:
+    with _SHARES_LOCK:
+        try:
+            SHARES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SHARES_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows, indent=1))
+            tmp.replace(SHARES_PATH)
+        except OSError:
+            pass
+
+
+def share_epoch() -> int:
+    return int((read_shares().get("epoch") or 1))
+
+
+def listen_token(expires: int, tag: str) -> str:
+    if not SPARK_AGENT_API_KEY:
+        return ""
+    body = f"listen:{expires}:{tag}:{share_epoch()}"
+    sig = hmac.new(SPARK_AGENT_API_KEY.encode(), body.encode(),
+                   hashlib.sha256).hexdigest()[:24]
+    return f"{expires}.{tag}.{sig}"
+
+
+def listen_ok(token: str) -> bool:
+    try:
+        expires, tag, sig = str(token or "").split(".", 2)
+        if int(expires) < time.time():
+            return False
+        return hmac.compare_digest(listen_token(int(expires), tag), token)
+    except Exception:
+        return False
+
+
+def require_listen_auth(token: str, authorization: str | None) -> None:
+    """A guest with a live link, or the operator with the key."""
+    if listen_ok(token):
+        return
+    require_auth(authorization)
 
 
 def media_sign(key: str) -> str:
@@ -5266,10 +5476,10 @@ def _clip_seconds(path: str) -> float:
         return 0.0
 
 
-async def _play_on_box(path: str, sig: str) -> str:
+async def _play_on_box(path: str, sig: str, reply: bool = False) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
     still plays it even when Home Assistant is unreachable."""
-    if not box_talk_ok():
+    if not box_talk_ok(reply=reply):
         note_activity("held", "Pine Box switched off — kept for the page")
         return ""                    # the existing "box declined" contract
     token, player = _ha_creds()
@@ -5529,7 +5739,10 @@ async def speak(
         styled, voice if voice is not None else _event_voice(event), chosen,
         fx=fx)
     result["spoken"] = styled
-    result["played_on"] = await _play_on_box(result["path"], result["sig"])
+    # This is the box answering YOU, not the station broadcasting at you —
+    # it keeps working with the show switched off the speaker (#647).
+    result["played_on"] = await _play_on_box(result["path"], result["sig"],
+                                             reply=True)
     return result
 
 
@@ -6214,6 +6427,37 @@ def music_search(query: str, limit: int = 12) -> list[dict[str, Any]]:
     return [track for _score, _len, track in scored[:limit]]
 
 
+def music_artists(least: int = 1) -> list[dict[str, Any]]:
+    """Everyone in the library, biggest catalogue first (#629). One pass over
+    the in-memory index, no disk."""
+    rows: dict[str, dict[str, Any]] = {}
+    for track in music_index():
+        name = str(track.get("artist") or "").strip()
+        if not name:
+            continue
+        key = name.lower()
+        row = rows.setdefault(key, {"artist": name, "key": key, "tracks": 0,
+                                    "albums": set(), "seconds": 0.0})
+        row["tracks"] += 1
+        row["seconds"] += float(track.get("seconds") or 0)
+        if track.get("album"):
+            row["albums"].add(str(track["album"]))
+    out = [{**r, "albums": len(r["albums"]),
+            "seconds": round(r["seconds"])}
+           for r in rows.values() if r["tracks"] >= least]
+    return sorted(out, key=lambda r: -r["tracks"])
+
+
+def artist_tracks(artist: str) -> list[dict[str, Any]]:
+    want = str(artist or "").strip().lower()
+    if not want:
+        return []
+    found = [t for t in music_index()
+             if str(t.get("artist") or "").strip().lower() == want]
+    return sorted(found, key=lambda t: (str(t.get("album") or ""),
+                                        str(t.get("title") or "")))
+
+
 def music_stations() -> list[dict[str, Any]]:
     """One station per top folder, plus the whole library. Folders are how
     people already organise music, so that is the grouping worth having."""
@@ -6435,8 +6679,94 @@ def overdwelt_subjects(most: int = 4) -> list[str]:
     return hot
 
 
+# Words you have told them to drop (#642). The pair fall in love with a
+# vocabulary — vibrations, frequencies — and no amount of "talk about
+# something else" gets them off a WORD. This is the word itself, banned by
+# hand, with a clock on it so a ban is a mood and not a permanent edit.
+BANNED_WORDS_PATH = Path("/app/data/banned_words.json")
+_BANNED_LOCK = RLock()
+
+
+def banned_words(active: bool = True) -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(BANNED_WORDS_PATH.read_text())
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    now = time.time()
+    out = []
+    for row in rows:
+        try:
+            if active and float(row.get("until") or 0) < now:
+                continue
+            out.append(row)
+        except Exception:
+            continue
+    return out
+
+
+def ban_word(word: str, hours: float = 24.0) -> dict[str, Any]:
+    word = " ".join(str(word or "").split())[:40]
+    if not word:
+        raise ValueError("nothing to ban")
+    with _BANNED_LOCK:
+        rows = [r for r in banned_words(active=False)
+                if str(r.get("word", "")).lower() != word.lower()]
+        row = {"word": word, "at": time.time(),
+               "until": time.time() + max(0.25, min(720.0, hours)) * 3600}
+        rows.append(row)
+        try:
+            BANNED_WORDS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            BANNED_WORDS_PATH.write_text(json.dumps(rows[-60:]))
+        except Exception:
+            pass
+        return row
+
+
+def unban_word(word: str) -> None:
+    with _BANNED_LOCK:
+        rows = [r for r in banned_words(active=False)
+                if str(r.get("word", "")).lower() != str(word).lower()]
+        try:
+            BANNED_WORDS_PATH.write_text(json.dumps(rows))
+        except Exception:
+            pass
+
+
+def banned_words_clause() -> str:
+    words = [str(r.get("word") or "") for r in banned_words()]
+    words = [w for w in words if w]
+    if not words:
+        return ""
+    return ("\nBANNED WORDS — do NOT say, write, or allude to any of these, "
+            "not once, not as a joke, not in a different tense. Say what you "
+            "mean another way entirely, and do not comment on avoiding them: "
+            + ", ".join(f'"{w}"' for w in words[:20]) + ".")
+
+
+def strip_banned(text: str) -> str:
+    """Last line of defence (#642): a model that says it anyway gets edited.
+    The prompt does the work; this catches the leak."""
+    out = str(text or "")
+    for row in banned_words():
+        word = str(row.get("word") or "").strip()
+        if not word:
+            continue
+        try:
+            out = re.sub(rf"\b{re.escape(word)}\w*\b", "", out,
+                         flags=re.IGNORECASE)
+        except re.error:
+            continue
+    # Tidy the holes the removal leaves behind.
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.;:!?])", r"\1", out)
+    out = re.sub(r"([,;:]\s*){2,}", ", ", out)
+    return out.strip()
+
+
 def avoid_reruns() -> str:
-    out = ""
+    out = banned_words_clause()
     phrases = overused_phrases()
     if phrases:
         out += ("\nYou have been leaning on these exact phrasings lately — "
@@ -7036,8 +7366,6 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
         # the Pine Box, the ack must NOT also come out of the website, and if
         # they are set to the page it must NOT hit the box. "off" mutes it.
         reply_to = _RADIO.get("reply_to") or "box"
-        if not box_talk_ok() and reply_to in ("box", "both"):
-            reply_to = "here"          # the ack lands in the page feed (#638)
         if reply_to == "off":
             return
         # The ack is HEARD immediately (#406): a rendered clip goes to
@@ -7055,7 +7383,9 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
         # the hold shelf and plays the moment the box recovers, so the
         # spoken "got your request" is never simply lost (#436).
         if reply_to in ("box", "both"):
-            played = await _play_on_box(clip["path"], clip["sig"])
+            # An ack is the box answering you, so it survives the station
+            # being switched off the speaker (#647).
+            played = await _play_on_box(clip["path"], clip["sig"], reply=True)
             if not played:
                 box_hold(clip, line, "host")
         return
@@ -7306,9 +7636,10 @@ def show_memory() -> str:
 
 def art_sell_due() -> bool:
     """The art-hawking governor: the pair may pitch/sell paintings at most
-    once every ~15 minutes, so the show is mostly off-the-wall speakbox
-    discussion rather than a rolling gallery auction."""
-    return time.time() - float(_RADIO.get("art_sold_at") or 0) >= 15 * 60
+    once every ~40 minutes (#646 — fifteen still had them on the gallery
+    constantly), so the show is speakbox discussion with the wall as an
+    occasional event rather than a rolling auction."""
+    return time.time() - float(_RADIO.get("art_sold_at") or 0) >= 40 * 60
 
 
 def art_sell_mark() -> None:
@@ -7364,9 +7695,19 @@ async def speakbox_flavor() -> str:
         return ""
     if not (s and s.get("text")):
         return ""
-    return ("\nLOOSE IN YOUR MIND tonight, colouring word choice and imagery "
-            "AT RANDOM — never the subject, never quoted straight: "
-            f"\"{s['text']}\"\n")
+    # What KIND of head this is (#627): a mind's blurb — "sports facts and
+    # football history", "my own stories" — rides along with its documents,
+    # which is what makes a second folder a second brain rather than a
+    # second pile of paper.
+    row = mind_row(str(s.get("mind") or ""))
+    colour = ""
+    if row.get("blurb") and row["id"] != "main":
+        colour = (f"\nTONIGHT YOU ARE IN THE {row['name'].upper()} HEAD — "
+                  f"everything you know is {row['blurb']}. Live in it.\n")
+    return (colour
+            + "\nLOOSE IN YOUR MIND tonight, colouring word choice and "
+              "imagery AT RANDOM — never the subject, never quoted straight: "
+              f"\"{s['text']}\"\n")
 
 
 async def dj_line(kind: str, track: dict[str, Any] | None = None,
@@ -7588,6 +7929,9 @@ def spoken_text(line: str) -> str:
         if shorter == clean:
             break
         clean = shorter
+    # A word you have banned does not get to the speaker even if the model
+    # wrote it anyway (#642). The prompt does the real work; this is the mouth.
+    clean = strip_banned(clean)
     return re.sub(r"\s{2,}", " ", clean).strip()
 
 
@@ -8214,6 +8558,11 @@ def dj_state() -> dict[str, Any]:
         "history": _RADIO["history"][-10:],
         "played": list(reversed(_RADIO["history"][-10:])),
         "last_said": dj_last_said(),
+        # Whether a voice is coming out RIGHT NOW, and which line it is
+        # (#641) — the booth marks that line so the window reads one to one
+        # with what the broadcast is doing rather than running ahead of it.
+        "speaking": bool(_SPEAKING[0]),
+        "airing_ts": int((dj_last_said() or {}).get("ts") or 0),
         # Eighty, not forty (#415): board hits were flooding the callers
         # out of the booth window before anyone scrolled to them.
         "chat": _RADIO["chat"][-80:],
@@ -8330,6 +8679,7 @@ def dj_on_air(track: dict[str, Any]) -> None:
     _RADIO["started"] = time.time()
     _RADIO["coming"] = None
     remember_played(track)
+    _music_log_append(track)          # which record, when — for the mix (#633)
 
 
 async def _dj_loop() -> None:
@@ -9054,6 +9404,7 @@ def dj_stop() -> None:
     # satellite has no stop service.
     _RADIO["box_talk"] = False
     _routing_save()
+    _music_log_append(None, stop=True)   # the last record ends here (#633)
     try:
         asyncio.create_task(stop_speaking())
     except RuntimeError:
@@ -10593,6 +10944,84 @@ async def dj_police_outside(text: str) -> None:
 # transcript for focused replay, unpruned, in data/radio_cache/calls.
 RADIO_CACHE = Path("/app/data/radio_cache")
 
+# WHICH record was playing WHEN (#633). The recorder only ever caught talk
+# and stings — music is a URL the page or the box streams, so nothing here
+# ever heard a note of it. The full mix is rebuilt from this log, which is
+# why it has to exist separately: played.json de-dupes for the "recently
+# played" list (#203) and therefore cannot say when anything ran.
+MUSIC_LOG_PATH = RADIO_CACHE / "music_log.jsonl"
+_MUSIC_LOG_LOCK = RLock()
+
+
+def station_slug() -> str:
+    """The station's name, fit for a filename (#648)."""
+    try:
+        name = str(dj_settings().get("station_name") or "").strip()
+    except Exception:
+        name = ""
+    slug = re.sub(r"[^A-Za-z0-9]+", "-", name).strip("-").lower()
+    return slug[:48] or "episode"
+
+
+def _music_log_append(track: dict[str, Any] | None,
+                      stop: bool = False) -> None:
+    """One line per record going on air. Best effort, always."""
+    try:
+        with _MUSIC_LOG_LOCK:
+            RADIO_CACHE.mkdir(parents=True, exist_ok=True)
+            if stop:
+                row: dict[str, Any] = {"at": time.time(), "stop": True}
+            else:
+                if not track:
+                    return
+                row = {
+                    "at": time.time(),
+                    "id": str(track.get("id") or ""),
+                    "title": str(track.get("title") or "")[:120],
+                    "artist": str(track.get("artist") or "")[:80],
+                    "seconds": float(track.get("seconds") or 0),
+                    "path": str(track.get("path") or ""),
+                    "tape": bool(track.get("tape")),
+                    "to": _RADIO.get("music_to") or "here",
+                }
+            with MUSIC_LOG_PATH.open("a") as handle:
+                handle.write(json.dumps(row) + "\n")
+            if MUSIC_LOG_PATH.stat().st_size > 1_000_000:
+                keep = MUSIC_LOG_PATH.read_text().splitlines()[-4000:]
+                MUSIC_LOG_PATH.write_text("\n".join(keep) + "\n")
+    except Exception:
+        pass
+
+
+def _music_log_rows(lo: float, hi: float) -> list[dict[str, Any]]:
+    """Records overlapping the window, each with a real end: a track that
+    was skipped ends when the next one started, not when its tags say."""
+    try:
+        lines = MUSIC_LOG_PATH.read_text().splitlines()
+    except Exception:
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            rows.append(json.loads(line))
+        except Exception:
+            continue
+    rows.sort(key=lambda r: float(r.get("at") or 0))
+    out: list[dict[str, Any]] = []
+    for at, row in enumerate(rows):
+        if row.get("stop") or not row.get("id"):
+            continue
+        began = float(row.get("at") or 0)
+        ends = began + float(row.get("seconds") or 0)
+        for later in rows[at + 1:]:
+            when = float(later.get("at") or 0)
+            if when > began:
+                ends = min(ends, when)      # cut short by the next record
+                break
+        if ends > lo and began < hi and (row.get("to") or "here") != "off":
+            out.append({**row, "began": began, "ends": ends})
+    return out
+
 
 def _cache_call_recording(wav_bytes: bytes,
                           transcript: list[tuple[str, str]],
@@ -10686,7 +11115,10 @@ def _episode_finalize() -> None:
         eps = RADIO_CACHE / "episodes"
         eps.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d_%H%M%S")
-        base = eps / f"episode_{stamp}"
+        # Named after the station it came off (#648): rename the station and
+        # the next cut carries the new name, so a shelf of episodes reads as
+        # the eras it actually is.
+        base = eps / f"{station_slug()}_{stamp}"
         files = [it["file"] for it in items]
         exe = imageio_ffmpeg.get_ffmpeg_exe()
         ins: list[str] = []
@@ -10708,23 +11140,36 @@ def _episode_finalize() -> None:
         # line position.
         offset = 0.0
         stamped: list[str] = []
+        # The same walk also writes a machine-readable sidecar (#633): where
+        # each line sits inside this mp3 AND the wall-clock moment it aired,
+        # which is what lets the full mix line talk up against the records.
+        marks: list[dict[str, Any]] = []
         for it in items:
             _m, _s = divmod(int(offset), 60)
             _h, _m = divmod(_m, 60)
             tag = f"[{_h}:{_m:02d}:{_s:02d}]" if _h else f"[{_m}:{_s:02d}]"
             stamped.append(f"{tag} {it['text']}")
+            began = offset
             try:
                 import mutagen
                 _info = mutagen.File(str(it["file"]))
                 offset += float(getattr(_info.info, "length", 0) or 0)
             except Exception:
                 offset += 4.0           # a typical line keeps stamps sane
+            marks.append({"off": round(began, 2),
+                          "dur": round(offset - began, 2),
+                          "t": float(it.get("t") or 0),
+                          "text": it["text"][:200]})
         Path(str(base) + ".md").write_text(
             f"# Pine Box FM — episode {stamp}\n\n"
             + "\n\n".join(stamped), encoding="utf-8")
+        try:
+            Path(str(base) + ".json").write_text(json.dumps(marks))
+        except Exception:
+            pass
         keep = sorted(eps.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
         for old in keep[:-120]:
-            for ext in (".mp3", ".md"):
+            for ext in (".mp3", ".md", ".json"):
                 try:
                     old.with_suffix(ext).unlink()
                 except OSError:
@@ -10904,13 +11349,18 @@ async def dj_ad_break() -> str:
     dj = dj_settings()
     stored = ad_pick()
 
-    # Now and then the between-tracks ad is a SPECIAL one — the pitch over a
-    # swell of the station's own music (#463). Only when a fresh product is
-    # in hand (not a stored rerun) and there is music to bed it under.
-    music_ad = (_RADIO.get("on") and random.random() < 0.35
+    # The between-tracks ad over a swell of the station's own music (#463).
+    # Most of them now (#643): a spot bedded in music is the thing that
+    # actually sounds like a commercial break, and the shelf it fills is
+    # what lets one or two an hour rerun without repeating themselves.
+    music_ad = (_RADIO.get("on") and random.random() < 0.75
                 and _music_bed_track() is not None)
 
-    if stored and random.random() < 0.6:
+    # Rerun less often while the shelf of PRODUCED spots is still thin —
+    # a new bedded one is worth more than a fourth airing of a dry read.
+    produced = [r for r in ad_list() if r.get("audio")]
+    rerun = 0.6 if len(produced) >= 8 else 0.3
+    if stored and random.random() < rerun:
         ad_update(stored["id"], uses=stored.get("uses", 0) + 1)
         # A produced spot reruns its FINISHED audio verbatim (#618) — the
         # voice, bed, vocode and SFX exactly as they were built.
@@ -11453,24 +11903,35 @@ async def describe_gallery_image() -> tuple[str, str]:
                     "messages": [{
                         "role": "user",
                         "content": (
-                            "Describe this image in TWO vivid spoken "
-                            "sentences, as a radio host holding it up for "
-                            "listeners who cannot see it. Concrete and "
-                            "visual — what is IN it, what it feels like. "
-                            "No markdown, no preamble."),
+                            # #646: when they DO look, they look properly —
+                            # atomic detail, and visibly affected by it.
+                            "You are a radio host holding this picture up "
+                            "for listeners who cannot see it, and it has "
+                            "got under your skin. Describe it in FIVE or "
+                            "SIX spoken sentences, in lurid, atomic "
+                            "detail: the exact colours and where they sit, "
+                            "the light and what it is doing, every figure "
+                            "or object and its posture and expression, the "
+                            "texture of the paint or the grain of the "
+                            "photograph, what is happening in the corners "
+                            "and the background that a careless eye would "
+                            "miss. Then say plainly what it DOES to you — "
+                            "be unsettled, disturbed, moved, unable to "
+                            "leave it alone. Speak it aloud; no markdown, "
+                            "no preamble, no list."),
                         "images": [image_b64],
                     }],
                     "stream": False,
                     "think": False,
                     "keep_alive": "30m",
-                    "options": {"temperature": 0.7, "num_predict": 160},
+                    "options": {"temperature": 0.8, "num_predict": 460},
                 },
             )
             response.raise_for_status()
             said = ((response.json().get("message") or {})
                     .get("content") or "").strip()
         said = re.sub(r"<think>.*?</think>", " ", said, flags=re.S)
-        said = " ".join(said.split())[:400]
+        said = " ".join(said.split())[:1200]     # room for the detail (#646)
         if said:
             pipeline_log("model", f"looked at {picked.name} — "
                                   f"{len(said)} chars of description")
@@ -11581,20 +12042,113 @@ def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
 
 SPEAKBOX_DIR = Path("/app/data/speakbox")
 
+# --- Minds (#627): a mind is a NAMED FOLDER plus its own shelf ------------
+# A second folder of documents is not a second pile — it is a second head.
+# Football facts and personal stories should not share a used-lines ring, a
+# gem cache or a vector index with the studio transcripts, or one brain's
+# reading bleeds into the other. So every piece of shelf state is resolved
+# per mind, and the built-in "main" keeps the original paths untouched so
+# nothing has to migrate.
+MINDS_DIR = Path("/app/data/minds")
+
+
+def speakbox_minds() -> list[dict[str, Any]]:
+    rows = [{"id": "main", "name": "The studio", "dir": str(SPEAKBOX_DIR),
+             "blurb": "", "builtin": True}]
+    try:
+        for row in (dj_settings().get("speakbox_minds") or []):
+            rid = re.sub(r"[^a-z0-9_-]", "", str(row.get("id") or "").lower())
+            if not rid or rid == "main":
+                continue
+            rows.append({
+                "id": rid,
+                "name": str(row.get("name") or rid)[:60],
+                "dir": str(row.get("dir") or (MINDS_DIR / rid / "docs")),
+                "blurb": str(row.get("blurb") or "")[:400],
+                "weights": row.get("weights") or {},
+                "builtin": False,
+            })
+    except Exception:
+        pass
+    return rows
+
+
+def mind_id(rid: str = "") -> str:
+    """The mind in play: an explicit one, else the live switch, else the
+    saved default. An unknown id falls back to the studio rather than
+    silently reading an empty folder."""
+    want = (str(rid or "").strip()
+            or str(_RADIO.get("mind") or "")
+            or str(dj_settings().get("speakbox_mind") or "") or "main")
+    return want if any(m["id"] == want for m in speakbox_minds()) else "main"
+
+
+def mind_row(rid: str = "") -> dict[str, Any]:
+    want = mind_id(rid)
+    for row in speakbox_minds():
+        if row["id"] == want:
+            return row
+    return {"id": "main", "name": "The studio", "dir": str(SPEAKBOX_DIR),
+            "blurb": "", "builtin": True}
+
+
+def speakbox_dir(rid: str = "") -> Path:
+    # Looked up at CALL time, so the self-check can still swap the global.
+    row = mind_row(rid)
+    return SPEAKBOX_DIR if row["id"] == "main" else Path(row["dir"])
+
+
+def mind_state(rid: str, leaf: str) -> Path:
+    """Where this mind keeps its shelf. The studio keeps the original files
+    so existing data needs no migration."""
+    row = mind_row(rid)
+    if row["id"] == "main":
+        return {"heard": SPEAKBOX_HEARD, "gems": SPEAKBOX_GEMS,
+                "vectors": SPEAKBOX_VECTORS}[leaf]
+    return MINDS_DIR / row["id"] / f"{leaf}.json"
+
+
+def mind_weights(rid: str = "") -> dict[str, int]:
+    row = mind_row(rid)
+    if row["id"] == "main":
+        return dj_settings()["speakbox_weights"]
+    return {str(k): int(v) for k, v in (row.get("weights") or {}).items()}
+
+
+def mind_dir_ok(raw: str, rid: str) -> Path:
+    """A mind's folder has to live under /app/data — that is the only path
+    mounted into this container, so anything else is a folder the DJs would
+    never be able to read."""
+    text = str(raw or "").strip()
+    base = Path("/app/data")
+    path = Path(text).expanduser() if text else (MINDS_DIR / rid / "docs")
+    if not path.is_absolute():
+        path = base / text
+    path = path.resolve()
+    if base.resolve() not in path.parents and path != base.resolve():
+        raise ValueError(
+            "A mind's folder has to sit under data/ — that is what is "
+            "mounted into the container. Try a plain name like "
+            "'football' and it lands in data/football.")
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 # Transcripts are timestamped per paragraph — "[0:47] I can still feel …" —
 # and a timestamp read aloud is not a joke.
 _SPEAKBOX_STAMP = re.compile(r"^\s*[\[(]?\d{1,3}:\d{2}(?::\d{2})?[\])]?\s*")
 
 
-def speakbox_all() -> list[Path]:
+def speakbox_all(rid: str = "") -> list[Path]:
     """Every document in the folder, in play or not."""
     try:
-        return sorted(p for p in SPEAKBOX_DIR.glob("*.md") if p.is_file())
+        return sorted(p for p in speakbox_dir(rid).glob("*.md")
+                      if p.is_file())
     except OSError:
         return []
 
 
-def speakbox_files() -> list[Path]:
+def speakbox_files(rid: str = "") -> list[Path]:
     """Every document they are allowed to lift from.
 
     The folder is read each time, and what the settings hold is a weight per
@@ -11603,22 +12157,23 @@ def speakbox_files() -> list[Path]:
     box for it, which is the whole point of a drop folder (#221). Held the
     other way round, a new file arrived excluded and there was no way to see
     it, let alone tick it. A weight of zero is off."""
-    weights = dj_settings()["speakbox_weights"]
-    return [p for p in speakbox_all()
-            if speakbox_weight(p.name, weights) > 0]
+    weights = mind_weights(rid)
+    return [p for p in speakbox_all(rid)
+            if speakbox_weight(p.name, weights, rid) > 0]
 
 
-def speakbox_weight(name: str, weights: dict[str, int] | None = None) -> int:
+def speakbox_weight(name: str, weights: dict[str, int] | None = None,
+                    rid: str = "") -> int:
     """How hard this document is leaned on. Unnamed means ordinary. A
     document dropped in recently gets a propensity boost (#478) — the pair
     have an appetite for fresh material — decaying over about a week back to
     its base weight."""
     if weights is None:
-        weights = dj_settings()["speakbox_weights"]
+        weights = mind_weights(rid)
     value = weights.get(name)
     base = 50 if value is None else max(0, min(100, int(value)))
     try:
-        age = time.time() - (SPEAKBOX_DIR / name).stat().st_mtime
+        age = time.time() - (speakbox_dir(rid) / name).stat().st_mtime
         if age < 7 * 86400:
             # +100% at zero age, fading linearly to +0% at a week old.
             base = int(base * (1.0 + max(0.0, 1.0 - age / (7 * 86400))))
@@ -11667,9 +12222,9 @@ SPEAKBOX_HEARD_MAX = 2000
 _SPEAKBOX_LOCK = RLock()
 
 
-def speakbox_heard() -> list[dict[str, Any]]:
+def speakbox_heard(rid: str = "") -> list[dict[str, Any]]:
     try:
-        rows = json.loads(SPEAKBOX_HEARD.read_text())
+        rows = json.loads(mind_state(rid, "heard").read_text())
         return rows if isinstance(rows, list) else []
     except Exception:
         return []
@@ -11685,21 +12240,25 @@ def speakbox_remember(quote: dict[str, Any]) -> None:
     (#235)."""
     if not (quote and quote.get("text")):
         return
+    # Retired against the mind it CAME from (#627), even if the operator
+    # jumped brains mid-round.
+    rid = mind_id(str(quote.get("mind") or ""))
     heard = ([{"file": quote.get("file", ""), "text": line}
               for line in (quote.get("lines") or [])] or
              [{"file": quote.get("file", ""), "text": quote["text"]}])
     with _SPEAKBOX_LOCK:
-        rows = speakbox_heard()
+        rows = speakbox_heard(rid)
         for one in heard:
             was = next((r for r in rows if r.get("text") == one["text"]), {})
             rows = [r for r in rows if r.get("text") != one["text"]]
             rows.insert(0, {**one, "used": int(was.get("used") or 0) + 1,
                             "last": int(time.time())})
         try:
-            SPEAKBOX_HEARD.parent.mkdir(parents=True, exist_ok=True)
-            _tmp = SPEAKBOX_HEARD.with_suffix(".tmp")
+            store = mind_state(rid, "heard")
+            store.parent.mkdir(parents=True, exist_ok=True)
+            _tmp = store.with_suffix(".tmp")
             _tmp.write_text(json.dumps(rows[:SPEAKBOX_HEARD_MAX], indent=1))
-            _tmp.replace(SPEAKBOX_HEARD)
+            _tmp.replace(store)
         except OSError:
             pass                        # a forgetful show still goes out
 
@@ -11711,17 +12270,17 @@ SPEAKBOX_GEMS = Path("/app/data/speakbox_gems.json")
 SPEAKBOX_GEM_WINDOW = 1500         # characters of transcript read at a time
 
 
-def _gem_cache() -> dict[str, Any]:
+def _gem_cache(rid: str = "") -> dict[str, Any]:
     try:
-        data = json.loads(SPEAKBOX_GEMS.read_text())
+        data = json.loads(mind_state(rid, "gems").read_text())
         return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-def speakbox_gems(doc: Path) -> list[str]:
+def speakbox_gems(doc: Path, rid: str = "") -> list[str]:
     """The lines already found in this document, if it has not changed."""
-    row = _gem_cache().get(doc.name)
+    row = _gem_cache(rid).get(doc.name)
     row = row if isinstance(row, dict) else {}
     try:
         if row.get("at") != doc.stat().st_mtime_ns:
@@ -11745,7 +12304,7 @@ def speakbox_body(doc: Path) -> str:
     return " ".join(keep)
 
 
-async def speakbox_harvest(doc: Path) -> list[str]:
+async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
     """Read a passage of the document and pull the sayable lines out of it.
 
     A machine transcript has no punctuation and no sentence boundaries, so
@@ -11783,12 +12342,13 @@ async def speakbox_harvest(doc: Path) -> list[str]:
     gems = [gem for gem in speakbox_lines(found) if " " in gem][:12]
     if gems:
         with _SPEAKBOX_LOCK:
-            cache = _gem_cache()
+            cache = _gem_cache(rid)
             try:
                 cache[doc.name] = {"at": doc.stat().st_mtime_ns,
                                    "lines": gems[:12]}
-                SPEAKBOX_GEMS.parent.mkdir(parents=True, exist_ok=True)
-                SPEAKBOX_GEMS.write_text(json.dumps(cache, indent=1))
+                store = mind_state(rid, "gems")
+                store.parent.mkdir(parents=True, exist_ok=True)
+                store.write_text(json.dumps(cache, indent=1))
             except OSError:
                 pass                    # finding them again is cheap enough
     return gems
@@ -11830,40 +12390,49 @@ async def _embed_texts(texts: list[str]) -> list[list[float]]:
         return []
 
 
-def _load_vectors() -> dict[str, Any]:
+def _load_vectors(rid: str = "") -> dict[str, Any]:
+    """One warm store PER MIND (#627). A single shared cache meant the
+    reindex pass for one folder deleted the other folder's vectors, because
+    every chunk not present in the folder being scanned is pruned."""
     with _VEC_LOCK:
-        if _VEC_CACHE.get("loaded"):
-            return _VEC_CACHE
-        data = {"model": EMBED_MODEL, "mtimes": {}, "chunks": []}
+        key = mind_id(rid)
+        held = _VEC_CACHE.get(key)
+        if isinstance(held, dict) and held.get("loaded"):
+            return held
+        data: dict[str, Any] = {"model": EMBED_MODEL, "mtimes": {},
+                                "chunks": []}
         try:
-            if SPEAKBOX_VECTORS.is_file():
-                data = json.loads(SPEAKBOX_VECTORS.read_text())
+            store = mind_state(key, "vectors")
+            if store.is_file():
+                data = json.loads(store.read_text())
         except Exception:
             pass
-        _VEC_CACHE.clear()
-        _VEC_CACHE.update(data)
-        _VEC_CACHE["loaded"] = True
-        return _VEC_CACHE
+        data["loaded"] = True
+        _VEC_CACHE[key] = data
+        return data
 
 
-def _save_vectors() -> None:
+def _save_vectors(rid: str = "") -> None:
     with _VEC_LOCK:
-        payload = {k: _VEC_CACHE.get(k) for k in ("model", "mtimes", "chunks")}
+        key = mind_id(rid)
+        held = _VEC_CACHE.get(key) or {}
+        payload = {k: held.get(k) for k in ("model", "mtimes", "chunks")}
         try:
-            SPEAKBOX_VECTORS.parent.mkdir(parents=True, exist_ok=True)
-            tmp = SPEAKBOX_VECTORS.with_suffix(".tmp")
+            store = mind_state(key, "vectors")
+            store.parent.mkdir(parents=True, exist_ok=True)
+            tmp = store.with_suffix(".tmp")
             tmp.write_text(json.dumps(payload))
-            tmp.replace(SPEAKBOX_VECTORS)
+            tmp.replace(store)
         except Exception:
             pass
 
 
-def speakbox_vector_stats() -> dict[str, Any]:
+def speakbox_vector_stats(rid: str = "") -> dict[str, Any]:
     """What is in the index right now — for the status line and the #578 viz.
     Carries per-file USAGE (`uses`) and RECENCY (`last`) drawn from the said-
     memory, so the sphere can pull recently-used documents toward the core and
     scale them by how hard they are leaned on (#586)."""
-    store = _load_vectors()
+    store = _load_vectors(rid)
     chunks = store.get("chunks") or []
     per_file: dict[str, int] = {}
     for c in chunks:
@@ -11871,7 +12440,7 @@ def speakbox_vector_stats() -> dict[str, Any]:
     # Aggregate the said-memory to a per-document use count + last-used stamp.
     uses: dict[str, int] = {}
     last: dict[str, int] = {}
-    for r in speakbox_heard():
+    for r in speakbox_heard(rid):
         f = r.get("file", "")
         if not f:
             continue
@@ -11890,13 +12459,15 @@ def speakbox_vector_stats() -> dict[str, Any]:
     }
 
 
-async def speakbox_reindex(force: bool = False) -> dict[str, Any]:
+async def speakbox_reindex(force: bool = False,
+                           rid: str = "") -> dict[str, Any]:
     """Bring the vector index in step with the folder (#566): embed any new or
     changed markdown, drop vectors for deleted files. Auto-detected by mtime —
     a file dropped in the speakbox folder is in the DJs' heads on the next pass
-    with nobody clicking anything."""
-    store = _load_vectors()
-    present = {p.name: p for p in speakbox_all()}
+    with nobody clicking anything. Per mind (#627)."""
+    key = mind_id(rid)
+    store = _load_vectors(key)
+    present = {p.name: p for p in speakbox_all(key)}
     mtimes = dict(store.get("mtimes") or {})
     chunks = [c for c in (store.get("chunks") or [])
               if c.get("file") in present]          # forget deleted files
@@ -11909,7 +12480,7 @@ async def speakbox_reindex(force: bool = False) -> dict[str, Any]:
         if force or mtimes.get(name) != mt:
             changed.append((name, path, mt))
     if not changed and len(chunks) == len(store.get("chunks") or []):
-        return speakbox_vector_stats()                # already in step
+        return speakbox_vector_stats(key)             # already in step
     changed_names = {n for n, _p, _m in changed}
     chunks = [c for c in chunks if c.get("file") not in changed_names]
     for i, (name, path, mt) in enumerate(changed):
@@ -11931,28 +12502,31 @@ async def speakbox_reindex(force: bool = False) -> dict[str, Any]:
         # not lose the whole pass — the next run resumes from the saved mtimes.
         if i % 25 == 24:
             with _VEC_LOCK:
-                _VEC_CACHE["mtimes"] = {n: m for n, m in mtimes.items()
-                                        if n in present}
-                _VEC_CACHE["chunks"] = chunks
-                _VEC_CACHE["model"] = EMBED_MODEL
-            _save_vectors()
+                held = _VEC_CACHE.setdefault(key, {})
+                held["mtimes"] = {n: m for n, m in mtimes.items()
+                                  if n in present}
+                held["chunks"] = chunks
+                held["model"] = EMBED_MODEL
+                held["loaded"] = True
+            _save_vectors(key)
     if len(chunks) > SPEAKBOX_VEC_MAX:
         chunks = chunks[-SPEAKBOX_VEC_MAX:]
     with _VEC_LOCK:
-        _VEC_CACHE["mtimes"] = {n: mt for n, mt in mtimes.items()
-                                if n in present}
-        _VEC_CACHE["chunks"] = chunks
-        _VEC_CACHE["model"] = EMBED_MODEL
-    _save_vectors()
-    return speakbox_vector_stats()
+        held = _VEC_CACHE.setdefault(key, {})
+        held["mtimes"] = {n: mt for n, mt in mtimes.items() if n in present}
+        held["chunks"] = chunks
+        held["model"] = EMBED_MODEL
+        held["loaded"] = True
+    _save_vectors(key)
+    return speakbox_vector_stats(key)
 
 
-async def speakbox_search(query: str, k: int = 5,
-                          exclude: str = "") -> list[dict[str, Any]]:
+async def speakbox_search(query: str, k: int = 5, exclude: str = "",
+                          rid: str = "") -> list[dict[str, Any]]:
     """The k swaths most semantically similar to `query`, ONE per document for
     variety (#566). Empty when the index or the embedder is cold — the caller
     then falls back to the random-swath mining that has always worked."""
-    store = _load_vectors()
+    store = _load_vectors(rid)
     chunks = [c for c in (store.get("chunks") or [])
               if c.get("vec") and c.get("file") != exclude]
     if not chunks:
@@ -11984,10 +12558,11 @@ async def speakbox_search(query: str, k: int = 5,
 
 
 def _vector_access_log(query: str, hit: dict[str, Any], ms: int,
-                       n: int) -> None:
+                       n: int, who: str = "") -> None:
     """Record one booth vector-DB retrieval for the "how it reached the vector
     database" readout (#595): what section it pulled, the match strength, how
-    long it took, which system located it."""
+    long it took, which system located it. `who` is which presenter reached
+    for it, so the sim can draw each of them touching the data (#640)."""
     log = _RADIO.setdefault("vector_access", [])
     log.insert(0, {
         "ts": int(time.time()),
@@ -11996,26 +12571,38 @@ def _vector_access_log(query: str, hit: dict[str, Any], ms: int,
         "score": round(float(hit.get("score") or 0), 3),
         "ms": ms,
         "searched": n,
+        "who": who or "booth",
         "engine": EMBED_MODEL,
         "how": "embed → cosine over the swath index",
     })
     del log[24:]
+    # Per-presenter tallies, so a node can show how deep into the documents
+    # that particular DJ has been (#640).
+    if who:
+        pulls = _RADIO.setdefault("vector_pulls", {})
+        row = pulls.setdefault(who, {"pulls": 0, "last": 0, "file": ""})
+        row["pulls"] += 1
+        row["last"] = int(time.time())
+        row["file"] = hit.get("file", "")
 
 
-async def speakbox_semantic_seed(query: str,
-                                 exclude: str = "") -> dict[str, Any]:
+async def speakbox_semantic_seed(query: str, exclude: str = "",
+                                 who: str = "",
+                                 rid: str = "") -> dict[str, Any]:
     """A seed dict shaped like speakbox_quote's, but drawn by MEANING off the
     vector index (#566) — so a round can be steered toward what is being talked
     about instead of a blind random pull. {} when the index is cold. Logs the
-    retrieval telemetry for the booth read-out (#595)."""
+    retrieval telemetry for the booth read-out (#595) and which presenter
+    reached for it (#640)."""
+    key = mind_id(rid)
     t0 = time.time()
-    hits = await speakbox_search(query, k=1, exclude=exclude)
+    hits = await speakbox_search(query, k=1, exclude=exclude, rid=key)
     if not hits:
         return {}
     text = hits[0]["text"]
     _vector_access_log(query, hits[0], int((time.time() - t0) * 1000),
-                       len((_load_vectors().get("chunks") or [])))
-    return {"file": hits[0]["file"], "text": text,
+                       len((_load_vectors(key).get("chunks") or [])), who=who)
+    return {"file": hits[0]["file"], "text": text, "mind": key,
             "lines": speakbox_lines(text) or [text]}
 
 
@@ -12024,15 +12611,20 @@ async def speakbox_index_clock() -> None:
     markdown is picked up within a couple of minutes, no restart, no click."""
     await asyncio.sleep(5)
     while _RADIO.get("on"):
-        try:
-            await speakbox_reindex()
-        except Exception:
-            pass
+        # Every mind, not only the one in play (#627): jumping to the other
+        # brain should not mean waiting for it to be read. The mtime gate
+        # makes an unchanged folder a stat() per file, and each mind is
+        # wrapped on its own so a bad folder cannot stop the rest.
+        for row in speakbox_minds():
+            try:
+                await speakbox_reindex(rid=row["id"])
+            except Exception:
+                continue
         await asyncio.sleep(120)
 
 
-async def speakbox_quote(exclude: str = "",
-                         most: int = 9, cap: int = 0) -> dict[str, Any]:
+async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
+                         rid: str = "") -> dict[str, Any]:
     """A swath out of one document, both drawn at random.
 
     The directory is read every time, so anything dropped in the folder is in
@@ -12041,23 +12633,24 @@ async def speakbox_quote(exclude: str = "",
     again at a different point, so the material renews itself. `exclude`
     keeps a named document out of the draw — that is how the comeback comes
     from somewhere other than the drop (#233)."""
-    files = [p for p in speakbox_files() if p.name != exclude]
+    key = mind_id(rid)
+    files = [p for p in speakbox_files(key) if p.name != exclude]
     if not files:
-        files = speakbox_files()        # one document beats none
+        files = speakbox_files(key)     # one document beats none
     if not files:
         return {}
     # Drawn by weight, so the documents you have pushed up come round more
     # (#209) — but never the same one twice running while another is willing,
     # because plain weighted chance on three documents repeats a third of the
     # time and it stops sounding like a folder.
-    weights = dj_settings()["speakbox_weights"]
+    weights = mind_weights(key)
     first = unrepeated(
         random.choices([p.name for p in files],
-                       weights=[speakbox_weight(p.name, weights)
+                       weights=[speakbox_weight(p.name, weights, key)
                                 for p in files], k=len(files)),
         # Six documents wait their turn before one comes round again
         # (#360) — three still let a big folder sound like a small one.
-        "doc", keep=max(1, min(len(files) - 1, 6)))
+        f"doc:{key}", keep=max(1, min(len(files) - 1, 6)))
     # Now and then, dive into the ARCHIVE instead (#478): lead with one of
     # the oldest documents so the deepest, most-forgotten material gets mined
     # and mixed back in — the swath itself already starts at a random (often
@@ -12076,15 +12669,15 @@ async def speakbox_quote(exclude: str = "",
     order = ([p for p in files if p.name == first]
              + random.sample([p for p in files if p.name != first],
                              len(files) - 1))
-    said = {r.get("text") for r in speakbox_heard()}
+    said = {r.get("text") for r in speakbox_heard(key)}
     exhausted: tuple[str, list[str]] | None = None
     for doc in order[:3]:               # a doc of pure headings is not fatal
-        gems = speakbox_gems(doc)
+        gems = speakbox_gems(doc, key)
         fresh = [line for line in gems if line not in said]
         if not fresh:
             # Nothing left they have not used: read the document again at a
             # different point rather than repeat themselves.
-            gems = await speakbox_harvest(doc) or gems
+            gems = await speakbox_harvest(doc, key) or gems
             if not gems:                # the model is down; the show is not
                 gems = speakbox_lines(speakbox_body(doc))
             fresh = [line for line in gems if line not in said]
@@ -12101,7 +12694,7 @@ async def speakbox_quote(exclude: str = "",
                         "marked heard and will not repeat until the "
                         "shelf runs dry."))
             return {"file": doc.name, "text": " ".join(lines),
-                    "lines": lines}
+                    "lines": lines, "mind": key}
         if exhausted is None and gems:
             exhausted = (doc.name, gems)
     # Every document tried is used up (#268). The least recently aired
@@ -12113,11 +12706,12 @@ async def speakbox_quote(exclude: str = "",
     if exhausted:
         name, gems = exhausted
         last = {r.get("text"): int(r.get("last") or 0)
-                for r in speakbox_heard()}
+                for r in speakbox_heard(key)}
         pool = sorted(gems, key=lambda line: last.get(line, 0))
         lines = speakbox_swath_lines(pool[:max(most * 2, 12)],
                                      most=most, cap=cap)
-        return {"file": name, "text": " ".join(lines), "lines": lines}
+        return {"file": name, "text": " ".join(lines), "lines": lines,
+                "mind": key}
     return {}
 
 
@@ -13269,6 +13863,38 @@ def sfx_bans() -> set[str]:
         return set()
 
 
+# How often a given sample is allowed to come up (#645). A ban is a hard
+# no; this is the dial between "barely ever" and "lean on it" — 1.0 is the
+# weight every sample starts with.
+SFX_WEIGHTS_PATH = Path("/app/data/sfx_weights.json")
+_SFX_WEIGHTS_LOCK = RLock()
+
+
+def sfx_weights() -> dict[str, float]:
+    try:
+        rows = json.loads(SFX_WEIGHTS_PATH.read_text())
+        return {str(k): float(v) for k, v in rows.items()} \
+            if isinstance(rows, dict) else {}
+    except Exception:
+        return {}
+
+
+def sfx_set_weight(sid: str, weight: float) -> dict[str, float]:
+    with _SFX_WEIGHTS_LOCK:
+        rows = sfx_weights()
+        weight = max(0.0, min(4.0, float(weight)))
+        if abs(weight - 1.0) < 0.01:
+            rows.pop(sid, None)           # back to normal = no entry
+        else:
+            rows[sid] = round(weight, 2)
+        try:
+            SFX_WEIGHTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            SFX_WEIGHTS_PATH.write_text(json.dumps(rows, indent=1))
+        except OSError:
+            pass
+        return rows
+
+
 # The scoreboard behind the 📊 tables (#300): plays per sample, and which
 # presenter leaned on which button.
 SFX_PLAYS_PATH = Path("/app/data/sfx_plays.json")
@@ -13358,8 +13984,22 @@ def sting_due() -> Path | None:
             if sfx_short(p) and sfx_id(p) not in banned]
     if not pool:
         return None
-    names = unrepeated([str(p) for p in pool], "sting",
-                       keep=min(12, max(1, len(pool) - 1)))
+    # Your dial on each one (#645): a sample marked down comes up rarely, one
+    # marked up leans in. Applied as repeats in the draw so the unrepeated
+    # memory below still works exactly as it did.
+    weights = sfx_weights()
+    if weights:
+        weighted: list[str] = []
+        for path in pool:
+            want = weights.get(sfx_id(path), 1.0)
+            if want <= 0.05:
+                continue                    # marked all the way down
+            weighted += [str(path)] * max(1, int(round(want * 2)))
+        names_pool = weighted or [str(p) for p in pool]
+    else:
+        names_pool = [str(p) for p in pool]
+    names = unrepeated(names_pool, "sting",
+                       keep=min(12, max(1, len(set(names_pool)) - 1)))
     return Path(names) if names else None
 
 
@@ -15086,7 +15726,8 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # (Martha B) still says something genuinely different every single time
     # instead of her one statement. Remembered below so it rotates.
     diverse = await speakbox_semantic_seed(
-        f"{caller.get('persona', '')} {caller.get('goal', '')} {topic}")
+        f"{caller.get('persona', '')} {caller.get('goal', '')} {topic}",
+        who="caller")
     if diverse.get("text"):
         extras.append(
             "Fresh in the caller's mind THIS call, different from anything "
@@ -15312,7 +15953,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     point: dict[str, Any] = {}
     if random.random() < 0.4:
         try:
-            point = await speakbox_semantic_seed(topic) or {}
+            point = await speakbox_semantic_seed(topic, who="dj") or {}
         except Exception:
             point = {}
         if not point.get("text"):
@@ -15590,10 +16231,28 @@ async def ad_clock() -> None:
         _RADIO["last_ad"] = time.time()
         try:
             roll = random.random()
-            if roll < 0.15:
+            banked = len([r for r in ad_list() if r.get("audio")])
+            if roll < 0.10:
                 await dj_engineering_ad()
-            elif roll < 0.35:
+            elif roll < 0.22:
                 await dj_service_ad()
+            elif banked < 12 and _music_bed_track() is not None:
+                # Build the shelf (#643): a spot written for a product,
+                # rendered over a real record with a sting punched in, and
+                # KEPT — that is what a commercial break is made of, and
+                # what lets the station rerun itself without repeating.
+                dj = dj_settings()
+                product = ((random.choice(dj["sponsors"])
+                            if dj.get("sponsors") else "")
+                           or gallery_product()
+                           or "the Pine Box FM commemorative lighthouse plate")
+                made = await ad_produce(product, "", "", "", remember=True,
+                                        air=True)
+                if made.get("error"):
+                    await dj_ad_break()
+                else:
+                    pipeline_log("air", f"produced spot banked — {banked + 1} "
+                                        f"on the shelf (#643)")
             else:
                 await dj_ad_break()
         except Exception as exc:
@@ -16587,17 +17246,23 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # chance BEFORE the speakbox seed, so the pair describe MANY different
     # images from their pixels instead of the same handful. Each look draws
     # from the whole 1300-image ComfyUI wall with an unseen rotation.
-    # Art-hawking is GOVERNED now: at most one gallery pitch every ~15
-    # minutes, so the speakbox carries the show between sales.
-    if not angle and art_sell_due() and random.random() < 0.28:
+    # Art-hawking is GOVERNED now: at most one gallery pitch every ~40
+    # minutes, and even then only one round in twelve reaches for it (#646)
+    # — the speakbox carries the show, the wall is an event.
+    if not angle and art_sell_due() and random.random() < 0.08:
         _pic_name, _pic_desc = await describe_gallery_image()
         if _pic_desc:
             art_sell_mark()
             angle = (
                 "One of you pulls a picture from the station gallery and "
-                "holds it up, describing it to listeners who cannot see it: "
-                f"\"{_pic_desc}\" React to it, argue about what it means, "
-                "and offer it to the first caller who wants it.")
+                "holds it up to a listener who cannot see it. Do not "
+                "summarise it — take it APART on air, in the order your eye "
+                "moves: the colours and where they sit, the light, every "
+                "figure and what its face is doing, the texture of it, the "
+                "things in the corners nobody would notice. Here is what is "
+                f"actually in it: \"{_pic_desc}\" Be visibly affected — "
+                "unsettled, unable to look away, arguing about what it means "
+                "and what it did to you. Then offer it to the first caller.")
     # An hourly on-air tally of how the Pine Box transmitter is holding up
     # (#497) — the running "fires in the background" saga.
     if not angle and random.random() < 0.14:
@@ -16642,7 +17307,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # the two documents connect instead of colliding at random — else the
         # random cross-document pull that has always worked.
         comeback = (await speakbox_semantic_seed(seed.get("text", ""),
-                                                 exclude=seed.get("file", ""))
+                                                 exclude=seed.get("file", ""),
+                                                 who="cohost")
                     if random.random() < 0.6 else {}) \
             or await speakbox_quote(exclude=seed.get("file", ""),
                                     most=6, cap=600)
@@ -16660,7 +17326,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # The shorter shape: a drop and a cross-document answer (#233).
         if random.random() < 0.5:
             comeback = (await speakbox_semantic_seed(
-                seed.get("text", ""), exclude=seed.get("file", ""))
+                seed.get("text", ""), exclude=seed.get("file", ""),
+                who="cohost")
                 if random.random() < 0.6 else {}) \
                 or await speakbox_quote(exclude=seed.get("file", ""))
             if comeback.get("file") == seed.get("file"):
@@ -17137,12 +17804,64 @@ async def dj_fan_mail(text: str, doc: str = "") -> list[str]:
                "back, and give the sender a name if they did not."))
 
 
+# "It's so hot that…" — the comparative bank the callers reach for (#644).
+# A caller complaining about heat does not describe a temperature, they
+# escalate. These are the shape, not a script: the model is told to top them.
+HEAT_SO_HOT = [
+    "the birds are falling out of the sky",
+    "my kid came in already on fire",
+    "my husband evaporated in the hallway",
+    "all four tires popped in the driveway",
+    "my ex turned to dust on the porch",
+    "the gutters slid off the house",
+    "my own Pine Box melted into the shelf",
+    "the walls of the house are going soft",
+    "the furniture collapsed in on itself",
+    "the dog has started smoking",
+    "the paint came off the car in a sheet",
+    "the mailbox is leaning like a candle",
+    "my glasses fused to my face",
+    "the pool boiled and the neighbours made tea in it",
+    "the road is moving like it is breathing",
+    "the ice maker just sighed and quit",
+    "the cat has gone translucent",
+    "my phone rang and it was the phone screaming",
+]
+
+
+def heat_joke_bank(most: int = 6) -> str:
+    """A handful of comparatives, shuffled, plus whatever the model has
+    evolved for the current band (#644)."""
+    pool = list(HEAT_SO_HOT)
+    band, _c = heat_band()
+    if band:
+        pool += [line for line in _heat_read().get(band, []) if line]
+    random.shuffle(pool)
+    return "; ".join(pool[:most])
+
+
 async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     """A call gets through on the request line.
 
     What the caller wants is one of his own past requests, read back to him by
     a stranger — the joke only lands because it is really his. They take the
     call, react, and cut to the record (#179)."""
+    hot = booth_hot()
+    # When the building is genuinely cooking, some callers ring in about
+    # THAT instead, and they compete at it (#644).
+    if hot >= 62 and random.random() < 0.45:
+        return await dj_banter(track, lines=4, angle=(
+            "A listener has got through and they are calling about the HEAT. "
+            f"It is {hot:.0f} degrees Celsius, {hot * 9 / 5 + 32:.0f} "
+            "Fahrenheit, in the building. Give them a name and a voice. They "
+            "do not state the temperature — they ESCALATE, in the old "
+            "call-in tradition: \"it's so hot that…\" and then something "
+            "ruinous and specific from their own house. Invent FRESH ones in "
+            "this spirit, and top them; do not reuse these verbatim: "
+            + heat_joke_bank() + ". The hosts try to beat the caller with "
+            "their own, one of them brings it back to their own melting "
+            "Pine Box, and it becomes a competition nobody wins. Then cut "
+            "back to the record."))
     wants = [
         line.lstrip("- ").strip()
         for line in banter_material().splitlines()
@@ -17168,11 +17887,14 @@ async def pinebox_listen(prompt: str = "") -> dict[str, Any]:
     start_conversation makes the satellite listen and run the pipeline just
     as if it had heard its wake word — which is the only reliable way in when
     the on-device detector will not fire."""
-    if not box_talk_ok():
-        # Opening the box's mic is talking to the box (#638).
+    # Listening is how you ASK it something, so the mic stays open with the
+    # station switched off the speaker (#647) — that is the whole point of
+    # turning the show off it. Only muting replies closes this.
+    if not box_talk_ok(reply=True):
         raise HTTPException(
             status_code=409,
-            detail="The Pine Box is switched off at the top of the window.")
+            detail="Replies are switched off, so the box has no way to "
+                   "answer you. Set replies to the box or this page.")
     token, player = _ha_creds()
     if not (token and player):
         raise HTTPException(status_code=400, detail="No Home Assistant token")
@@ -20272,6 +20994,256 @@ async def voicelab_ingest(
     return {"job_id": job_id}
 
 
+# --- The lyric mines (#629) -------------------------------------------------
+# An artist's whole catalogue read for what it is ABOUT, written out as
+# markdown, and handed to the DJs as a mind of its own. The point is not the
+# transcripts — it is the digest: the recurring images, the place names, the
+# weather, what the songs are FOR, and the inclinations those imply for the
+# people living in that world.
+LYRICS_DIR = Path("/app/data/lyrics")
+_LYRIC_JOBS: dict[str, dict[str, Any]] = {}
+_LYRIC_LOCK = RLock()
+
+
+def _lyric_note(job: dict[str, Any], **fields: Any) -> None:
+    with _LYRIC_LOCK:
+        job.update(fields)
+
+
+# Whisper on an instrumental hallucinates the same handful of stock lines.
+_LYRIC_JUNK = re.compile(
+    r"thanks? for watching|subtitles? by|subscribe|amara\.org|"
+    r"^\W*$|^(?:\s*♪\s*)+$", re.I)
+
+
+def _lyric_usable(text: str) -> bool:
+    words = re.findall(r"[A-Za-z']+", text)
+    if len(words) < 25:
+        return False
+    if _LYRIC_JUNK.search(text.strip()[:200]):
+        return False
+    # A loop of the same phrase is the other way it fails.
+    runs: dict[str, int] = {}
+    for at in range(len(words) - 7):
+        key = " ".join(words[at:at + 8]).lower()
+        runs[key] = runs.get(key, 0) + 1
+    return max(runs.values(), default=0) <= 4
+
+
+async def _lyric_one(path: Path) -> str:
+    """One track through the lab, as words. Downmixed first — a 45 MB flac
+    becomes a couple of MB, the share is read once, and whisper gets a
+    cleaner band than the full mix gives it."""
+    import subprocess
+    import tempfile
+
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory(prefix="lyric-") as work:
+        small = Path(work) / "vocal.mp3"
+
+        def prep() -> bool:
+            try:
+                subprocess.run(
+                    [exe, "-nostdin", "-loglevel", "error", "-y",
+                     "-i", str(path), "-ac", "1", "-ar", "16000",
+                     # Not vocal isolation — there is no demucs here. A band
+                     # around the voice is the honest ceiling, and it helps.
+                     "-af", "highpass=f=180,lowpass=f=5200,dynaudnorm",
+                     "-b:a", "48k", str(small)],
+                    check=True, timeout=300)
+                return small.is_file()
+            except Exception:
+                return False
+
+        if not await asyncio.to_thread(prep):
+            return ""
+        blob = small.read_bytes()
+    try:
+        async with httpx.AsyncClient(timeout=600) as client:
+            got = await client.post(
+                f"{VOICE_LAB_URL}/ingest",
+                params={"filename": "vocal.mp3", "mode": "analyze"},
+                content=blob,
+                headers={"Content-Type": "application/octet-stream"})
+            got.raise_for_status()
+            job_id = str((got.json() or {}).get("job_id") or "")
+            if not job_id:
+                return ""
+            text = ""
+            for _ in range(300):                    # ~15 minutes
+                await asyncio.sleep(3)
+                status = (await client.get(
+                    f"{VOICE_LAB_URL}/jobs/{job_id}")).json() or {}
+                if status.get("stage") == "done":
+                    page = await client.get(
+                        f"{VOICE_LAB_URL}/jobs/{job_id}/files/transcript.md")
+                    text = page.text if page.status_code == 200 else ""
+                    break
+                if status.get("stage") == "error":
+                    break
+            try:
+                await client.delete(f"{VOICE_LAB_URL}/jobs/{job_id}")
+            except Exception:
+                pass
+            return text
+    except Exception:
+        return ""
+
+
+async def _lyric_digest(artist: str, songs: list[dict[str, Any]]) -> str:
+    """What the catalogue is ABOUT — the part the DJs actually read."""
+    corpus = "\n\n".join(
+        f"## {s['title']}\n{s['text'][:2500]}" for s in songs)[:24000]
+    head = (f"# {artist} — the world of the songs\n\n"
+            f"_Read from {len(songs)} recordings in the library._\n\n")
+    try:
+        found = await ask_model(
+            "Below are transcribed lyrics from one artist's catalogue. Write "
+            "a WORLDBUILDING brief for radio hosts who live in the world "
+            "these songs describe. Use these headings exactly, as markdown "
+            "H2:\n"
+            "## Recurring images\n## Places\n## People in the songs\n"
+            "## Weather and time of day\n## What the songs are FOR\n"
+            "## How the citizens lean\n\n"
+            "Under the last one give 6-10 short inclinations of the people "
+            "who live there — phrased as leanings and habits, not as quotes "
+            "from the songs. Everywhere else, be concrete and specific: name "
+            "the actual objects, streets and weather that keep coming back. "
+            "No preamble, no bullet-point summary of the task.\n\n" + corpus,
+            limit=2400, spice=0.2)
+        if found.strip():
+            return head + found.strip() + "\n"
+    except Exception:
+        pass
+    # The model being down must not lose the read: a statistical digest is
+    # still worth having, and still mineable.
+    words: dict[str, int] = {}
+    for song in songs:
+        for word in re.findall(r"[A-Za-z']{4,}", song["text"].lower()):
+            words[word] = words.get(word, 0) + 1
+    common = {"that", "this", "with", "have", "your", "they", "what", "when",
+              "just", "like", "know", "been", "were", "them", "from", "will",
+              "would", "could", "there", "their", "about", "gonna", "wanna"}
+    top = sorted(((n, w) for w, n in words.items() if w not in common),
+                 reverse=True)[:40]
+    return (head + "## Recurring words\n\n"
+            + ", ".join(f"{w} ({n})" for n, w in top) + "\n\n"
+            + "## The songs\n\n"
+            + "\n".join(f"- {s['title']}" for s in songs) + "\n")
+
+
+async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
+                     mind: str, force: bool) -> None:
+    job = _LYRIC_JOBS[job_id]
+    slug = safe_key(artist) or "artist"
+    folder = LYRICS_DIR / slug
+    folder.mkdir(parents=True, exist_ok=True)
+    songs: list[dict[str, Any]] = []
+    try:
+        for at, track in enumerate(tracks):
+            if job.get("stage") == "cancelled":
+                break
+            title = str(track.get("title") or f"track {at + 1}")
+            _lyric_note(job, current=title, done=at,
+                        progress=round(at / max(1, len(tracks)), 3))
+            page = folder / f"{at + 1:03d} - {safe_key(title) or 'track'}.md"
+            if page.is_file() and not force:
+                body = page.read_text(errors="replace")
+                songs.append({"title": title, "text": body})
+                continue
+            text = await _lyric_one(Path(str(track.get("path") or "")))
+            if not (text and _lyric_usable(text)):
+                job["instrumental"] = int(job.get("instrumental") or 0) + 1
+                pipeline_log("speakbox",
+                             f"{title} — nothing sung that could be read")
+                continue
+            page.write_text(
+                f"# {title}\n\n"
+                f"- {artist} · {track.get('album') or ''}\n"
+                f"- transcribed {time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                + text, encoding="utf-8")
+            songs.append({"title": title, "text": text})
+            pipeline_log("speakbox", f"read {title} — "
+                                     f"{len(text.split())} words")
+        _lyric_note(job, stage="digesting", progress=0.97)
+        if songs:
+            digest = await _lyric_digest(artist, songs)
+            (folder / "_artist.md").write_text(digest, encoding="utf-8")
+            # And into the mind, where the pair can actually mine it.
+            root = speakbox_dir(mind)
+            root.mkdir(parents=True, exist_ok=True)
+            clean = re.sub(r"[^A-Za-z0-9 ._-]", "", artist).strip() or "artist"
+            (root / f"{clean[:60]} - the world of the songs.md").write_text(
+                digest, encoding="utf-8")
+            fire_and_forget(speakbox_reindex(rid=mind))
+        _lyric_note(job, stage="done", progress=1.0, done=len(tracks),
+                    songs=len(songs), folder=str(folder))
+        pipeline_log("speakbox", f"{artist} — {len(songs)} songs read, "
+                                 f"the world written into {mind_row(mind)['name']}")
+    except Exception as exc:
+        _lyric_note(job, stage="error", error=f"{exc}"[:300])
+
+
+@app.get("/api/music/artists")
+async def music_artists_api(
+    q: str = "",
+    limit: int = 200,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Everyone in the library, biggest catalogue first (#629)."""
+    require_read_auth(authorization)
+    rows = music_artists()
+    want = str(q or "").strip().lower()
+    if want:
+        rows = [r for r in rows if want in r["artist"].lower()]
+    return {"artists": rows[:max(1, min(1000, limit))], "total": len(rows)}
+
+
+@app.post("/api/music/artist/read")
+async def music_artist_read(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Read an artist's whole catalogue for what it is about (#629), write it
+    out as markdown, and hand the digest to a mind the DJs can mine."""
+    require_auth(authorization)
+    payload = await request.json()
+    artist = str(payload.get("artist") or "").strip()
+    tracks = artist_tracks(artist)
+    if not tracks:
+        raise HTTPException(status_code=404,
+                            detail="Nobody by that name in the library")
+    limit = max(1, min(300, int(payload.get("limit") or 60)))
+    tracks = tracks[:limit]
+    mind = mind_id(str(payload.get("mind") or ""))
+    job_id = "ly_" + uuid.uuid4().hex[:8]
+    with _LYRIC_LOCK:
+        _LYRIC_JOBS[job_id] = {
+            "id": job_id, "artist": artist, "stage": "reading",
+            "total": len(tracks), "done": 0, "progress": 0.0,
+            "current": "", "instrumental": 0, "mind": mind,
+            "started": time.time(),
+        }
+    fire_and_forget(_lyric_run(job_id, artist, tracks, mind,
+                               bool(payload.get("force"))))
+    return {"job": job_id, "artist": artist, "tracks": len(tracks),
+            "mind": mind}
+
+
+@app.get("/api/music/artist/read/{job_id}")
+async def music_artist_read_status(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    with _LYRIC_LOCK:
+        job = dict(_LYRIC_JOBS.get(job_id) or {})
+    if not job:
+        raise HTTPException(status_code=404, detail="No such read")
+    return job
+
+
 @app.post("/api/voicelab/jobs/{job_id}/retry")
 async def voicelab_retry(
     job_id: str,
@@ -20988,10 +21960,11 @@ async def music_votes(
 @app.post("/api/music/vote")
 async def music_vote(
     request: Request,
+    t: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """1 = play it more, -1 = never again, 0 = forget I said anything."""
-    require_auth(authorization)
+    require_listen_auth(t, authorization)
     payload = await request.json()
 
     track_id = str(payload.get("id") or "")
@@ -21284,9 +22257,10 @@ async def dj_requested_api(
 @app.post("/api/dj/request")
 async def dj_request_api(
     request: Request,
+    t: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    require_auth(authorization)
+    require_listen_auth(t, authorization)
     payload = await request.json()
     query = str(payload.get("q") or "").strip()
     if not query:
@@ -21507,10 +22481,11 @@ async def music_notes(
 @app.post("/api/dj/join")
 async def dj_join_api(
     request: Request,
+    t: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Someone tuned in: the DJ welcomes them and explains the station (#127)."""
-    require_auth(authorization)
+    require_listen_auth(t, authorization)
     payload = await request.json()
     who = str(payload.get("name") or "").strip()[:40]
     listener = str(payload.get("listener") or "")[:64]
@@ -22765,7 +23740,7 @@ async def radio_cache_tail_api(
     stamp = time.strftime("%H%M%S")
     return FileResponse(
         path, media_type="audio/mpeg",
-        filename=f"pinebox-last-{seconds}s-{stamp}.mp3",
+        filename=f"{station_slug()}-last-{seconds}s-{stamp}.mp3",
         headers={"Cache-Control": "no-store"})
 
 
@@ -22940,9 +23915,420 @@ async def radio_cache_compile_api(
         raise HTTPException(status_code=404,
                             detail="Nothing recorded in that range yet")
     stamp = day or time.strftime("%Y-%m-%d")
-    fname = f"pinebox-{kind}-{span or scope}-{stamp}.mp3"
+    fname = f"{station_slug()}-{kind}-{span or scope}-{stamp}.mp3"
     return FileResponse(path, media_type="audio/mpeg", filename=fname,
                         headers={"Cache-Control": "no-store"})
+
+
+def _mix_window(scope: str, day: str = "", span: str = "") -> tuple[float,
+                                                                   float]:
+    """The wall-clock window a scope means, same reckoning the compile uses."""
+    now = time.time()
+    lt = time.localtime(now)
+    midnight = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+    if day:
+        try:
+            base = time.mktime(time.strptime(day, "%Y-%m-%d"))
+        except ValueError:
+            base = midnight
+        want = span if span in ("day", "week", "month") else "day"
+        if want == "day":
+            return base, base + 86400
+        if want == "week":
+            wd = time.localtime(base).tm_wday
+            return base - wd * 86400, base - wd * 86400 + 7 * 86400
+        return base, base + 31 * 86400
+    if scope == "yesterday":
+        return midnight - 86400, midnight
+    if scope == "week":
+        return midnight - 6 * 86400, now + 1.0
+    if scope == "month":
+        return midnight - 29 * 86400, now + 1.0
+    if scope == "all":
+        return now - 8 * 3600, now + 1.0     # capped; see _broadcast_mix
+    return midnight, now + 1.0
+
+
+def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
+                   voice: float) -> Path | None:
+    """The show as it SOUNDED, rebuilt (#633).
+
+    The recorder only ever caught talk and stings — a record is a URL the
+    page or the box streams, so nothing in this process has heard a note of
+    the music. So the mix is reconstructed from two logs: where each aired
+    line sits inside its sealed episode, and which record was playing when.
+    Talk is laid on a silent bed at its real offsets, the records are cut to
+    the moments they actually ran, and the music is ducked under the voices
+    by the same sidechain the ad mixer has used all along.
+
+    ponytail: the span cap is CPU, not policy — every second of it is
+    decoded and re-encoded.
+    """
+    import shutil as _shutil
+    import subprocess
+
+    import imageio_ffmpeg
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    work = RADIO_CACHE / "_bmix"
+    _shutil.rmtree(work, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    span = max(1.0, hi - lo)
+
+    def run(args: list[str], timeout: int = 900) -> bool:
+        try:
+            done = subprocess.run(args, capture_output=True, timeout=timeout)
+            return done.returncode == 0
+        except Exception:
+            return False
+
+    # A donor of silence, in exactly the episodes' shape, so the whole
+    # timeline can be built with the concat demuxer and stream copy.
+    silence = work / "silence.mp3"
+    if not run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i", "anullsrc=r=24000:cl=mono", "-t", "60",
+                "-codec:a", "libmp3lame", "-b:a", "96k", str(silence)], 120):
+        return None
+
+    def timeline(pieces: list[tuple[float, float, str, float]],
+                 out: Path) -> Path | None:
+        """pieces = (start, end, source, seek-into-source), in air order."""
+        if not pieces:
+            return None
+        listing = out.with_suffix(".txt")
+        rows: list[str] = []
+        at = lo
+        for begin, end, src, seek in pieces:
+            gap = begin - at
+            while gap > 0.05:
+                take = min(gap, 60.0)
+                rows.append(f"file '{silence}'\noutpoint {take:.3f}")
+                gap -= take
+            rows.append(f"file '{src}'\ninpoint {max(0.0, seek):.3f}\n"
+                        f"outpoint {max(0.0, seek) + (end - begin):.3f}")
+            at = end
+        tail = hi - at
+        while tail > 0.05:
+            take = min(tail, 60.0)
+            rows.append(f"file '{silence}'\noutpoint {take:.3f}")
+            tail -= take
+        listing.write_text("\n".join(rows) + "\n")
+        base = [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(listing)]
+        if not run(base + ["-c", "copy", str(out)]):
+            if not run(base + ["-c:a", "libmp3lame", "-b:a", "96k",
+                               "-ar", "24000", "-ac", "1", str(out)], 1800):
+                return None
+        return out if out.is_file() and out.stat().st_size > 1000 else None
+
+    # --- the talk, from the episode sidecars -----------------------------
+    said: list[tuple[float, float, str, float]] = []
+    for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json")):
+        source = mark_file.with_suffix(".mp3")
+        if not source.is_file():
+            continue
+        try:
+            marks = json.loads(mark_file.read_text())
+        except Exception:
+            continue
+        for mark in marks:
+            aired = float(mark.get("t") or 0)
+            dur = float(mark.get("dur") or 0)
+            if not aired or dur <= 0.05 or aired + dur <= lo or aired >= hi:
+                continue
+            begin, end = max(lo, aired), min(hi, aired + dur)
+            if end - begin <= 0.05:
+                continue
+            said.append((begin, end, str(source),
+                         float(mark.get("off") or 0) + (begin - aired)))
+    said.sort(key=lambda row: row[0])
+    tidy: list[tuple[float, float, str, float]] = []
+    for row in said:
+        if tidy and row[0] < tidy[-1][1]:
+            shift = tidy[-1][1] - row[0]      # a sting riding over a line
+            if row[1] - row[0] - shift <= 0.05:
+                continue
+            row = (tidy[-1][1], row[1], row[2], row[3] + shift)
+        tidy.append(row)
+    talk = timeline(tidy, work / "voice.mp3")
+
+    # --- the records, from the play log ----------------------------------
+    beds: list[tuple[float, float, str, float]] = []
+    for at, row in enumerate(_music_log_rows(lo, hi)):
+        source = row.get("path") or ""
+        if not source:
+            found = music_track(str(row.get("id") or "")) or {}
+            source = str(found.get("path") or "")
+        if not source or not Path(source).is_file():
+            continue
+        begin, end = max(lo, row["began"]), min(hi, row["ends"])
+        if end - begin <= 0.2:
+            continue
+        piece = work / f"bed{at:04d}.mp3"
+        if run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-ss", f"{begin - row['began']:.2f}",
+                "-t", f"{end - begin:.2f}", "-i", source,
+                "-af", f"volume={music:.3f}", "-ar", "24000", "-ac", "1",
+                "-codec:a", "libmp3lame", "-b:a", "96k", str(piece)], 600):
+            beds.append((begin, end, str(piece), 0.0))
+    bed = timeline(beds, work / "music.mp3")
+
+    out = RADIO_CACHE / "_broadcast.mp3"
+    out.unlink(missing_ok=True)
+    if talk and not bed:
+        talk.replace(out)             # nothing played; the talk IS the mix
+        return out if out.is_file() else None
+    if bed and not talk:
+        bed.replace(out)              # music only; nobody said anything
+        return out if out.is_file() else None
+    if not talk or not bed:
+        return None
+    # The records under the voices, the same sidechain the ad mixer runs.
+    ratio = max(1.5, 1.0 + duck * 16)
+    graph = (
+        f"[0:a]volume={voice:.3f},asplit=2[voxduck][voxmix];"
+        f"[1:a][voxduck]sidechaincompress=threshold=0.03:ratio={ratio:.1f}:"
+        "attack=15:release=350[duck];"
+        "[duck][voxmix]amix=inputs=2:duration=longest:normalize=0,"
+        "alimiter=limit=0.95[out]"
+    ) if duck > 0.02 else (
+        f"[0:a]volume={voice:.3f}[vox];"
+        "[1:a][vox]amix=inputs=2:duration=longest:normalize=0,"
+        "alimiter=limit=0.95[out]"
+    )
+    if not run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-i", str(talk), "-i", str(bed), "-filter_complex", graph,
+                "-map", "[out]", "-ac", "1", "-ar", "24000",
+                "-codec:a", "libmp3lame", "-b:a", "96k", str(out)], 1800):
+        return None
+    return out if out.is_file() and out.stat().st_size > 1000 else None
+
+
+@app.get("/api/radio-cache/broadcast")
+async def radio_cache_broadcast_api(
+    scope: str = "today",
+    day: str = "",
+    span: str = "",
+    music: float = 100.0,
+    duck: float = 70.0,
+    voice: float = 100.0,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The full mix (#633): the talk and the stings with the records they
+    played over, at the levels set in the browser."""
+    require_read_auth(authorization)
+    if scope not in ("today", "yesterday", "week", "month", "all"):
+        raise HTTPException(status_code=400, detail="bad scope")
+    lo, hi = _mix_window(scope, day, span)
+    hi = min(hi, time.time() + 1.0)
+    if hi - lo > 8 * 3600:
+        lo = hi - 8 * 3600           # every second is decoded; cap the work
+    # Reach up to this moment, the way the compile does.
+    if lo <= time.time() < hi:
+        try:
+            await asyncio.to_thread(_episode_finalize)
+        except Exception:
+            pass
+    path = await asyncio.to_thread(
+        _broadcast_mix, lo, hi,
+        max(0.0, min(2.0, music / 100)),
+        max(0.0, min(0.9, duck / 100)),
+        max(0.25, min(2.0, voice / 100)))
+    if not path:
+        raise HTTPException(
+            status_code=404,
+            detail="Nothing to mix in that span. The full mix needs the "
+                   "timing logs, which only start from this update — older "
+                   "stretches can still be pulled as talk.")
+    stamp = time.strftime("%Y-%m-%d")
+    return FileResponse(
+        path, media_type="audio/mpeg",
+        filename=f"{station_slug()}-broadcast-{span or scope}-{stamp}.mp3",
+        headers={"Cache-Control": "no-store"})
+
+
+@app.get("/api/remote")
+async def remote_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Where the station is reachable from (#632). Operator only — a guest
+    has no business seeing the topology."""
+    require_auth(authorization)
+    return await asyncio.to_thread(remote_access)
+
+
+@app.get("/api/share")
+async def share_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Live tune-in links, with what is left on each."""
+    require_auth(authorization)
+    rows = read_shares()
+    now = time.time()
+    out = []
+    for tag, row in (rows.get("links") or {}).items():
+        left = float(row.get("expires") or 0) - now
+        if left <= 0:
+            continue
+        out.append({"tag": tag, "label": row.get("label") or "",
+                    "expires": int(row.get("expires") or 0),
+                    "hours_left": round(left / 3600, 1),
+                    "url": row.get("url") or ""})
+    return {"links": sorted(out, key=lambda r: -r["expires"])}
+
+
+@app.post("/api/share")
+async def share_make(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Mint a tune-in link somebody else can open (#632). It carries a
+    signed, expiring token — never the API key — and opens only the handful
+    of routes a listener needs."""
+    require_auth(authorization)
+    if not SPARK_AGENT_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="No API key configured, so nothing can be signed.")
+    payload = await request.json()
+    hours = max(1.0, min(24 * 90, float(payload.get("hours") or 168)))
+    label = str(payload.get("label") or "a listener")[:60]
+    tag = uuid.uuid4().hex[:8]
+    expires = int(time.time() + hours * 3600)
+    token = listen_token(expires, tag)
+    net = await asyncio.to_thread(remote_access)
+    base = next((u["url"] for u in net["urls"] if u["kind"] == "tailscale"),
+                "") or next((u["url"] for u in net["urls"]), "")
+    url = f"{base}/tune/{token}"
+    rows = read_shares()
+    rows.setdefault("epoch", 1)
+    rows.setdefault("links", {})[tag] = {
+        "label": label, "expires": expires, "url": url,
+        "made": int(time.time())}
+    write_shares(rows)
+    return {"token": token, "url": url, "expires": expires, "label": label,
+            "remote": bool(net["tailscale"]["up"])}
+
+
+@app.post("/api/share/revoke")
+async def share_revoke(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Drop one link, or {"all": true} to kill every outstanding one at
+    once by turning the epoch over."""
+    require_auth(authorization)
+    payload = await request.json()
+    rows = read_shares()
+    if payload.get("all"):
+        rows["epoch"] = int(rows.get("epoch") or 1) + 1
+        rows["links"] = {}
+        write_shares(rows)
+        return {"revoked": "all"}
+    tag = str(payload.get("tag") or "")
+    (rows.setdefault("links", {})).pop(tag, None)
+    write_shares(rows)
+    return {"revoked": tag}
+
+
+@app.get("/tune/{token}")
+async def tune_page(token: str) -> HTMLResponse:
+    """The listener page, opened by a shared link. The page is handed the
+    TOKEN, never the key."""
+    if not listen_ok(token):
+        raise HTTPException(
+            status_code=403,
+            detail="That tune-in link has expired or been revoked.")
+    page = RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(token))
+    return HTMLResponse(page)
+
+
+@app.post("/api/dj/shout")
+async def dj_shout(
+    request: Request,
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """A listener says something to the booth (#632), or reacts to it. The
+    pair actually hear it: a shout lands in the chat and gets worked into
+    the next round, and reactions pile up as a mood the show can feel."""
+    require_listen_auth(t, authorization)
+    payload = await request.json()
+    who = " ".join(str(payload.get("who") or "a listener").split())[:32]
+    react = str(payload.get("react") or "")[:8]
+    text = " ".join(str(payload.get("text") or "").split())[:280]
+    if react:
+        reacts = _RADIO.setdefault("reacts", [])
+        reacts.append({"ts": int(time.time()), "who": who, "react": react})
+        del reacts[:-200]
+        return {"heard": react, "count": len(reacts)}
+    if len(text) < 2:
+        raise HTTPException(status_code=400, detail="Say something first")
+    _RADIO.setdefault("chat", []).append({
+        "ts": int(time.time()), "who": "host", "kind": "callin",
+        "text": f"📣 {who}: {text}"})
+    del _RADIO["chat"][:-120]
+    note_action(f"📣 {who} shouted at the booth")
+    # And the pair deal with it on air.
+    if _RADIO.get("on"):
+        asyncio.create_task(dj_banter(
+            _RADIO.get("now"), lines=3,
+            angle=(f"A listener called {who} has just said this to the "
+                   f"station, live: \"{text}\" Read it out, take it "
+                   "personally, and answer them by name on air.")))
+    return {"heard": text, "on_air": bool(_RADIO.get("on"))}
+
+
+@app.get("/api/dj/reacts")
+async def dj_reacts(
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the room is throwing at the show, last few minutes."""
+    require_listen_auth(t, authorization)
+    now = time.time()
+    live = [r for r in (_RADIO.get("reacts") or [])
+            if now - float(r.get("ts") or 0) < 300]
+    tally: dict[str, int] = {}
+    for row in live:
+        tally[row["react"]] = tally.get(row["react"], 0) + 1
+    return {"reacts": live[-40:], "tally": tally,
+            "listeners": _radio_listeners()}
+
+
+@app.get("/api/dj/banned")
+async def dj_banned_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Words the pair have been told to drop, and for how much longer."""
+    require_read_auth(authorization)
+    now = time.time()
+    return {"words": [
+        {"word": r.get("word"), "hours_left": round(
+            max(0.0, float(r.get("until") or 0) - now) / 3600, 1)}
+        for r in banned_words()]}
+
+
+@app.post("/api/dj/banned")
+async def dj_banned_add(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Ban a word for a day (#642), or lift one with {"lift": "word"}."""
+    require_auth(authorization)
+    payload = await request.json()
+    lift = str(payload.get("lift") or "").strip()
+    if lift:
+        unban_word(lift)
+        return {"lifted": lift, **await dj_banned_list(authorization)}
+    try:
+        row = ban_word(str(payload.get("word") or ""),
+                       float(payload.get("hours") or 24))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    note_action(f"🚫 banned the word “{row['word']}”")
+    pipeline_log("air", f"the word “{row['word']}” is off the table for "
+                        f"{round((row['until'] - row['at']) / 3600)}h (#642)")
+    return {"banned": row["word"], **await dj_banned_list(authorization)}
 
 
 @app.post("/api/radio-cache/seal")
@@ -23362,6 +24748,28 @@ async def dj_graph_api(
         "dj": {"station": dj["station_name"], "on": bool(_RADIO.get("on")),
                "now": ((_RADIO.get("now") or {}).get("title") or ""),
                "cohost": dj["cohost_name"]},
+        # Each presenter as their OWN node, with their own reach into the
+        # documents (#640): who has been pulling from the vector index, how
+        # often, how lately, and out of which file.
+        "people": [
+            {"id": "dj", "name": dj.get("host_name") or "the host",
+             "voice": voices.get("dj", ""),
+             **(_RADIO.get("vector_pulls", {}).get("dj")
+                or {"pulls": 0, "last": 0, "file": ""})},
+            {"id": "cohost", "name": dj["cohost_name"],
+             "voice": voices.get("cohost", ""),
+             **(_RADIO.get("vector_pulls", {}).get("cohost")
+                or {"pulls": 0, "last": 0, "file": ""})},
+            {"id": "caller", "name": "callers",
+             "voice": "",
+             **(_RADIO.get("vector_pulls", {}).get("caller")
+                or {"pulls": 0, "last": 0, "file": ""})},
+        ],
+        "vectors": {
+            "chunks": len((_load_vectors().get("chunks") or [])),
+            "model": EMBED_MODEL,
+            "recent": (_RADIO.get("vector_access") or [])[:8],
+        },
         "model": str(settings.get("model") or ""),
         "voices": {"dj": voices.get("dj", ""),
                    "cohost": voices.get("cohost", ""),
@@ -23453,18 +24861,124 @@ async def dj_saved_play(
 SPEAKBOX_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._-]{0,80}\.md$")
 
 
-def speakbox_path(name: str) -> Path:
+def speakbox_path(name: str, rid: str = "") -> Path:
     if not SPEAKBOX_NAME.match(name or ""):
         raise HTTPException(status_code=400,
                             detail="That is not a markdown file name")
-    path = SPEAKBOX_DIR / name
-    if path.resolve().parent != SPEAKBOX_DIR.resolve():
+    root = speakbox_dir(rid)
+    path = root / name
+    if path.resolve().parent != root.resolve():
         raise HTTPException(status_code=400, detail="Outside the speakbox")
     return path
 
 
+@app.get("/api/speakbox/minds")
+async def speakbox_minds_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every head the pair can be in, and what is on each one's shelf."""
+    require_read_auth(authorization)
+    active = mind_id()
+    out = []
+    for row in speakbox_minds():
+        docs = speakbox_all(row["id"])
+        heard = speakbox_heard(row["id"])
+        out.append({
+            **{k: v for k, v in row.items() if k != "weights"},
+            "docs": len(docs),
+            "chunks": len((_load_vectors(row["id"]).get("chunks") or [])),
+            "lines_used": len(heard),
+            "active": row["id"] == active,
+        })
+    return {"minds": out, "active": active}
+
+
+@app.post("/api/speakbox/minds")
+async def speakbox_mind_add(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Add another head (#627): a folder of documents with its own shelf."""
+    require_auth(authorization)
+    payload = await request.json()
+    name = str(payload.get("name") or "").strip()[:60]
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the mind a name")
+    rid = re.sub(r"[^a-z0-9_-]", "",
+                 str(payload.get("id") or name).lower().replace(" ", "-"))[:40]
+    if not rid or rid == "main":
+        raise HTTPException(status_code=400, detail="Pick a different name")
+    if any(m["id"] == rid for m in speakbox_minds()):
+        raise HTTPException(status_code=409, detail="That mind already exists")
+    try:
+        folder = mind_dir_ok(str(payload.get("dir") or ""), rid)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    minds = list(dj.get("speakbox_minds") or [])
+    minds.append({"id": rid, "name": name, "dir": str(folder),
+                  "blurb": str(payload.get("blurb") or "")[:400],
+                  "weights": {}})
+    dj["speakbox_minds"] = minds
+    save_settings({**settings, "dj": dj})
+    # Read it in the background so a big folder does not hold the request.
+    fire_and_forget(speakbox_reindex(rid=rid))
+    pipeline_log("speakbox", f"a second head opened — {name} ({rid})")
+    return {"added": rid, "dir": str(folder)}
+
+
+@app.post("/api/speakbox/minds/{rid}/activate")
+async def speakbox_mind_activate(
+    rid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Jump to another head, live (#627). A round already in flight finishes
+    where it started; the next mined swath comes from here."""
+    require_auth(authorization)
+    want = re.sub(r"[^a-z0-9_-]", "", str(rid or "").lower())[:40]
+    row = next((m for m in speakbox_minds() if m["id"] == want), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="No such mind")
+    _RADIO["mind"] = want                  # instant, no disk
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    dj["speakbox_mind"] = want
+    save_settings({**settings, "dj": dj})  # and it survives a restart
+    note_activity("mind", row["name"])
+    pipeline_log("speakbox", f"mind → {row['name']}")
+    return {"active": want, "name": row["name"]}
+
+
+@app.delete("/api/speakbox/minds/{rid}")
+async def speakbox_mind_forget(
+    rid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Forget a mind. The documents stay on disk — this only stops the pair
+    reading from it."""
+    require_auth(authorization)
+    want = re.sub(r"[^a-z0-9_-]", "", str(rid or "").lower())[:40]
+    if want in ("", "main"):
+        raise HTTPException(status_code=400,
+                            detail="The studio mind is built in")
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    dj["speakbox_minds"] = [m for m in (dj.get("speakbox_minds") or [])
+                            if str(m.get("id") or "") != want]
+    if dj.get("speakbox_mind") == want:
+        dj["speakbox_mind"] = "main"
+    save_settings({**settings, "dj": dj})
+    if _RADIO.get("mind") == want:
+        _RADIO["mind"] = "main"
+    with _VEC_LOCK:
+        _VEC_CACHE.pop(want, None)
+    return {"forgot": want}
+
+
 @app.get("/api/speakbox")
 async def speakbox_list_api(
+    mind: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """What is in the speakbox, and how hard each one is leaned on."""
@@ -23472,56 +24986,65 @@ async def speakbox_list_api(
     # Everything in the folder, weight and all. Listing only the ones in play
     # is what made a document you had switched off impossible to find again,
     # let alone switch back on (#221).
-    weights = dj_settings()["speakbox_weights"]
+    key = mind_id(mind)
+    weights = mind_weights(key)
     return {
         "files": [{"name": p.name, "bytes": p.stat().st_size,
-                   "weight": speakbox_weight(p.name, weights)}
-                  for p in speakbox_all()],
-        "folder": str(SPEAKBOX_DIR),
+                   "weight": speakbox_weight(p.name, weights, key)}
+                  for p in speakbox_all(key)],
+        "folder": str(speakbox_dir(key)),
+        "mind": key,
+        "mind_name": mind_row(key)["name"],
     }
 
 
 @app.get("/api/speakbox/vectors")
 async def speakbox_vectors_api(
+    mind: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """The state of the speakbox vector index (#566/#578): how many documents
     and swaths are embedded, which files, the model and dimension."""
     require_read_auth(authorization)
-    return speakbox_vector_stats()
+    return speakbox_vector_stats(mind)
 
 
 @app.post("/api/speakbox/reindex")
 async def speakbox_reindex_api(
     force: bool = False,
+    mind: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Bring the vector index in step with the folder now (#566). `force=1`
     re-embeds everything; otherwise only new/changed markdown is done."""
     require_auth(authorization)
-    return await speakbox_reindex(force=force)
+    return await speakbox_reindex(force=force, rid=mind)
 
 
 @app.get("/api/speakbox/search")
 async def speakbox_search_api(
     q: str,
     k: int = 6,
+    mind: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Semantic search over the speakbox swaths (#566/#570): the documents and
     passages closest in meaning to `q`."""
     require_read_auth(authorization)
-    return {"query": q, "hits": await speakbox_search(q, max(1, min(20, k)))}
+    return {"query": q, "mind": mind_id(mind),
+            "hits": await speakbox_search(q, max(1, min(20, k)),
+                                          rid=mind)}
 
 
 @app.get("/api/speakbox/{name}")
 async def speakbox_read_api(
     name: str,
+    mind: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """One document, as it stands on disk."""
     require_read_auth(authorization)
-    path = speakbox_path(name)
+    path = speakbox_path(name, mind)
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"No {name} in the speakbox")
     return {"name": name, "text": path.read_text(errors="replace")}
@@ -23531,12 +25054,13 @@ async def speakbox_read_api(
 async def speakbox_save_api(
     name: str,
     request: Request,
+    mind: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Write it back. What you save is what they say next."""
     require_auth(authorization)
     text = str((await request.json()).get("text") or "")
-    path = speakbox_path(name)
+    path = speakbox_path(name, mind)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return {"saved": name, "bytes": len(text.encode()),
@@ -23757,17 +25281,40 @@ async def sfx_info_api(
     by = row.get("by") or {}
     top = max(by, key=by.get) if by else ""
     return {
+        "id": sid,
         "name": sample.stem,
         "seconds": round(seconds, 2),
         "where": where,
         "plays": int(row.get("plays") or 0),
         "today": int((row.get("days") or {}).get(
             time.strftime("%Y-%m-%d")) or 0),
+        "last": int(row.get("last") or 0),
         "last_ms": int(row.get("last_ms") or 0),
         "top_dj": top,
         "top_dj_plays": int(by.get(top) or 0) if top else 0,
+        # Everyone who has reached for it, and your dial on it (#645).
+        "by": by,
+        "banned": sid in sfx_bans(),
+        "weight": sfx_weights().get(sid, 1.0),
+        "url": f"/sfx/{sid}?t={media_sign(sid)}",
         "spec_url": f"/api/sfx/spec/{sid}?t={media_sign(sid)}",
     }
+
+
+@app.post("/api/sfx/weight")
+async def sfx_weight_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """How often this one may come up (#645): 0 never, 1 normal, up to 4 for
+    one you want leaned on. A ban is still the separate hard no."""
+    require_auth(authorization)
+    payload = await request.json()
+    sid = str(payload.get("id") or "")
+    if sfx_by_id(sid) is None:
+        raise HTTPException(status_code=404, detail="No such sample")
+    rows = sfx_set_weight(sid, float(payload.get("weight") or 1.0))
+    return {"id": sid, "weight": rows.get(sid, 1.0)}
 
 
 @app.get("/api/sfx/spec/{sid}")
@@ -23968,14 +25515,22 @@ async def dj_crystal_api(
 KIT_DIR = Path("/app/data/export")
 
 KIT_COMPOSE = """\
+# One self-contained station (#628). The project name keeps every container,
+# network and volume under "pinebox-station-" so this can run on a machine
+# that is already running another copy without either one noticing.
+name: pinebox-station
+
 services:
   spark-agent:
-    container_name: spark-agent
+    container_name: pinebox-station-agent
     image: python:3.12-slim
     restart: unless-stopped
     working_dir: /app
     ports:
       - "8096:8096"
+    env_file:
+      # Written by the setup page — holds this station's own API key.
+      - ./station.env
     environment:
       TZ: America/Chicago
       OLLAMA_URL: http://host.docker.internal:11434
@@ -23990,6 +25545,13 @@ services:
       - ../app:/app
       - ../data:/app/data
       - ../music:/music:ro
+    healthcheck:
+      # python:3.12-slim has no curl, so python is the probe.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8096/healthz', timeout=5).status == 200 else 1)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 180s
     command:
       - sh
       - -c
@@ -23998,7 +25560,7 @@ services:
         uvicorn app:app --host 0.0.0.0 --port 8096
 
   wyoming-piper:
-    container_name: wyoming-piper
+    container_name: pinebox-station-piper
     image: rhasspy/wyoming-piper:latest
     restart: unless-stopped
     ports:
@@ -24016,7 +25578,7 @@ services:
       - /data
 
   wyoming-whisper:
-    container_name: wyoming-whisper
+    container_name: pinebox-station-whisper
     image: rhasspy/wyoming-whisper:latest
     restart: unless-stopped
     ports:
@@ -24038,11 +25600,245 @@ services:
 
 KIT_START = """\
 @echo off
-echo Starting the Pine Chat radio station...
+setlocal
+cd /d "%~dp0"
+title Pine Box FM station
+
+if not exist station.env (
+  echo First run: opening the setup guide.
+  start "" "%~dp0..\\setup\\setup.html"
+  echo.
+  echo The guide will walk you through it. Leave this window open.
+  echo When it tells you to, press a key here to start the station.
+  pause >nul
+)
+
+echo Starting the station. The first run downloads a few images and can
+echo take several minutes; after that it is seconds.
 docker compose up -d
-echo Waiting for services, then opening the station window...
-cd ..\\electron
-npm start
+if errorlevel 1 (
+  echo.
+  echo Docker did not start it. Is Docker Desktop running?
+  pause
+  exit /b 1
+)
+
+echo Waiting for the station to answer...
+set /a tries=0
+:wait
+set /a tries+=1
+timeout /t 3 /nobreak >nul
+curl -s -o nul http://127.0.0.1:8096/healthz 2>nul && goto ready
+if %tries% lss 100 goto wait
+echo It is taking longer than expected. Opening anyway.
+
+:ready
+start "" http://127.0.0.1:8096/
+echo.
+echo The station is at http://127.0.0.1:8096/
+echo Close it with stop.bat. This window can be closed.
+"""
+
+# The guided setup (#628): screen by screen, in the browser, with a three.js
+# plexus behind it so the first thing a new operator sees is the station
+# rather than a wall of instructions. No install, no Node — it is one file
+# that reads the vendored three.js already in the kit.
+KIT_SETUP = """\
+<!doctype html><html><head><meta charset="utf-8">
+<title>Pine Box FM — setting up</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#04060b; color:#dfe7f2; min-height:100vh;
+         font:15px/1.65 system-ui,-apple-system,Segoe UI,sans-serif; }
+  canvas#bg { position:fixed; inset:0; z-index:0; }
+  .wrap { position:relative; z-index:1; max-width:720px; margin:0 auto;
+          padding:40px 22px 80px; }
+  h1 { font-size:26px; margin:0 0 4px; }
+  .sub { color:#7f8ea3; font-size:13px; margin-bottom:26px; }
+  .card { background:#0b0f16e8; border:1px solid #22304a; border-radius:14px;
+          padding:22px 24px; margin-bottom:14px;
+          box-shadow:0 20px 60px rgba(0,0,0,.55); }
+  .card.done { border-color:#2f7d52; }
+  .card h2 { font-size:17px; margin:0 0 6px; display:flex; gap:9px;
+             align-items:center; }
+  .n { width:26px; height:26px; border-radius:50%; background:#16233a;
+       color:#7fd1ff; font-size:13px; display:flex; align-items:center;
+       justify-content:center; flex:0 0 auto; }
+  .card.done .n { background:#2f7d52; color:#dfe; }
+  p { margin:8px 0; color:#c2cede; }
+  code, pre { background:#050810; border:1px solid #22304a; border-radius:8px;
+              font:13px ui-monospace,Consolas,monospace; color:#9fd0ff; }
+  code { padding:2px 6px; } pre { padding:12px; overflow:auto; }
+  a { color:#7fd1ff; }
+  button { background:#123; color:#dfe7f2; border:1px solid #2b3a52;
+           border-radius:9px; padding:9px 16px; font-size:14px;
+           cursor:pointer; }
+  button.go { background:#1d6fa5; border-color:#2f8fd0; }
+  button:disabled { opacity:.5; cursor:default; }
+  .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+         margin-top:12px; }
+  .dot { width:9px; height:9px; border-radius:50%; background:#764;
+         display:inline-block; }
+  .dot.ok { background:#3fbf7f; } .dot.bad { background:#d9534f; }
+  .muted { color:#7f8ea3; font-size:12.5px; }
+</style></head><body>
+<canvas id="bg"></canvas>
+<div class="wrap">
+  <h1>Pine Box FM</h1>
+  <div class="sub">Five steps. Nothing here talks to the internet except
+    the downloads you approve.</div>
+
+  <div class="card" id="s1"><h2><span class="n">1</span> Docker Desktop</h2>
+    <p>The station runs as a handful of containers, so Docker has to be
+      installed and running. If the whale in your system tray is still
+      starting up, wait for it to settle.</p>
+    <p><a href="https://www.docker.com/products/docker-desktop/"
+      target="_blank" rel="noopener">Get Docker Desktop</a></p>
+    <div class="row"><button onclick="check(1)">I have it running</button>
+      <span class="muted" id="m1"></span></div></div>
+
+  <div class="card" id="s2"><h2><span class="n">2</span> A local model</h2>
+    <p>The DJs write every line with a model running on your own machine.
+      Install Ollama, then pull one:</p>
+    <pre>ollama pull qwen3:14b</pre>
+    <p class="muted">Smaller machine? <code>qwen3:8b</code> or
+      <code>llama3.2:3b</code> work, they are just less funny.</p>
+    <div class="row"><a href="https://ollama.com" target="_blank"
+      rel="noopener"><button>Get Ollama</button></a>
+      <button onclick="check(2)">Model pulled</button>
+      <span class="muted" id="m2"></span></div></div>
+
+  <div class="card" id="s3"><h2><span class="n">3</span> Your music</h2>
+    <p>Drop music into the <code>music</code> folder beside this kit — or
+      point the <code>../music</code> line in
+      <code>windows/docker-compose.yml</code> at a folder you already have.
+      Everything under it is found automatically.</p>
+    <p class="muted">The station works with no music at all; the pair simply
+      talk more.</p>
+    <div class="row"><button onclick="check(3)">Done</button>
+      <span class="muted" id="m3"></span></div></div>
+
+  <div class="card" id="s4"><h2><span class="n">4</span> This station's key</h2>
+    <p>One secret, generated here, kept on this machine. It is what stops
+      anyone else on your network driving your station.</p>
+    <pre id="key">generating…</pre>
+    <p>Save it as <code>windows/station.env</code>, exactly like this:</p>
+    <pre id="envline">SPARK_AGENT_API_KEY=…</pre>
+    <div class="row">
+      <button class="go" onclick="dl()">Download station.env</button>
+      <button onclick="copyKey()">Copy the line</button>
+      <span class="muted" id="m4"></span></div>
+    <p class="muted">Put the downloaded file in the <code>windows</code>
+      folder next to <code>docker-compose.yml</code>.</p></div>
+
+  <div class="card" id="s5"><h2><span class="n">5</span> Start it</h2>
+    <p>Double-click <code>windows\\start.bat</code>. The first run pulls a
+      few images and can take several minutes; after that it is seconds.</p>
+    <div class="row"><span class="dot" id="live"></span>
+      <span class="muted" id="m5">not answering yet</span>
+      <button onclick="open8096()">Open the station</button></div>
+    <p class="muted">Once it is up: turn Pine Box FM on, and the pair start
+      talking. Everything else — voices, the speakbox, the gallery — is in
+      the panel.</p></div>
+</div>
+<script src="../data/vendor/three.min.js"></script>
+<script>
+var key = "";
+(function mint() {
+  var raw = new Uint8Array(32);
+  (window.crypto || window.msCrypto).getRandomValues(raw);
+  key = Array.prototype.map.call(raw, function (b) {
+    return ("0" + b.toString(16)).slice(-2); }).join("");
+  document.getElementById("key").textContent = key;
+  document.getElementById("envline").textContent =
+    "SPARK_AGENT_API_KEY=" + key;
+})();
+function dl() {
+  var blob = new Blob(["SPARK_AGENT_API_KEY=" + key + "\\n"],
+                      {type: "text/plain"});
+  var a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "station.env";
+  document.body.appendChild(a); a.click(); a.remove();
+  document.getElementById("m4").textContent = "saved — move it into windows/";
+  document.getElementById("s4").classList.add("done");
+}
+function copyKey() {
+  navigator.clipboard.writeText("SPARK_AGENT_API_KEY=" + key).then(function () {
+    document.getElementById("m4").textContent = "copied";
+  });
+}
+function check(n) {
+  document.getElementById("s" + n).classList.add("done");
+  document.getElementById("m" + n).textContent = "✓";
+}
+function open8096() { window.open("http://127.0.0.1:8096/", "_blank"); }
+setInterval(function () {
+  fetch("http://127.0.0.1:8096/healthz", {mode: "no-cors"}).then(function () {
+    document.getElementById("live").className = "dot ok";
+    document.getElementById("m5").textContent = "the station is up";
+    document.getElementById("s5").classList.add("done");
+  }).catch(function () {});
+}, 3000);
+
+// The plexus behind it all — the same one the station wears.
+(function () {
+  if (!window.THREE) return;
+  var c = document.getElementById("bg");
+  var r = new THREE.WebGLRenderer({canvas: c, antialias: true});
+  r.setSize(innerWidth, innerHeight); r.setClearColor(0x04060b, 1);
+  var sc = new THREE.Scene();
+  var cam = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 1, 900);
+  cam.position.z = 300;
+  var N = 220, pos = new Float32Array(N * 3), vel = [];
+  for (var i = 0; i < N; i++) {
+    pos[i*3] = (Math.random()-.5)*620; pos[i*3+1] = (Math.random()-.5)*420;
+    pos[i*3+2] = (Math.random()-.5)*320;
+    vel.push([(Math.random()-.5)*.22,(Math.random()-.5)*.22,
+              (Math.random()-.5)*.22]);
+  }
+  var g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  sc.add(new THREE.Points(g, new THREE.PointsMaterial(
+    {color: 0x4bb3ff, size: 2.2, transparent: true, opacity: .75})));
+  var lg = new THREE.BufferGeometry();
+  var la = new Float32Array(N * 26 * 3);
+  lg.setAttribute("position", new THREE.BufferAttribute(la, 3));
+  sc.add(new THREE.LineSegments(lg, new THREE.LineBasicMaterial(
+    {color: 0x2f6f9f, transparent: true, opacity: .32})));
+  addEventListener("resize", function () {
+    r.setSize(innerWidth, innerHeight);
+    cam.aspect = innerWidth / innerHeight; cam.updateProjectionMatrix();
+  });
+  (function tick() {
+    requestAnimationFrame(tick);
+    for (var i = 0; i < N; i++) {
+      for (var a = 0; a < 3; a++) {
+        pos[i*3+a] += vel[i][a];
+        var lim = a === 0 ? 310 : a === 1 ? 210 : 160;
+        if (Math.abs(pos[i*3+a]) > lim) vel[i][a] *= -1;
+      }
+    }
+    var k = 0;
+    for (var i = 0; i < N && k < N*26; i++) {
+      for (var j = i+1; j < N && k < N*26; j++) {
+        var dx=pos[i*3]-pos[j*3], dy=pos[i*3+1]-pos[j*3+1],
+            dz=pos[i*3+2]-pos[j*3+2];
+        if (dx*dx+dy*dy+dz*dz < 5200) {
+          la.set([pos[i*3],pos[i*3+1],pos[i*3+2],
+                  pos[j*3],pos[j*3+1],pos[j*3+2]], k*6); k++;
+        }
+      }
+    }
+    lg.setDrawRange(0, k*2);
+    lg.attributes.position.needsUpdate = true;
+    g.attributes.position.needsUpdate = true;
+    sc.rotation.y += .0009;
+    r.render(sc, cam);
+  })();
+})();
+</script></body></html>
 """
 
 KIT_PKG = """\
@@ -24117,6 +25913,12 @@ A runnable copy of the Pine Box FM station: the DJs, the callers, the
 speakbox material, the voices and the control panel, exported from the
 original DGX Spark installation.
 
+## Start here
+
+**Double-click `SETUP.bat`.** It opens a guided page that walks you through
+the whole thing, screen by screen, and generates this station's own key for
+you. Nothing else in this file is required reading.
+
 ## What you need (Windows)
 
 1. **Docker Desktop** — https://www.docker.com/products/docker-desktop/
@@ -24124,17 +25926,31 @@ original DGX Spark installation.
    terminal: `ollama pull qwen3:14b` (this is exactly the model the kit is
    configured for; pull a bigger one and set it in the panel later if you
    have the RAM).
-3. **Node.js** — https://nodejs.org — then, inside the `electron` folder:
-   `npm install`
-4. Put some music (mp3/flac/m4a) in the `music` folder — the station
-   indexes it recursively.
+3. Put some music (mp3/flac/m4a) in the `music` folder — the station
+   indexes it recursively. It runs fine with none; the pair just talk more.
+
+That is the whole list. **No Node, no npm, no build step** — the setup page
+and the station are both plain pages your browser already knows how to open.
 
 ## Run it
 
-Double-click `windows/start.bat` (or run it from a terminal). A window
-opens with a live 3D view of the services booting; when the station is
-up it becomes the control panel. The radio page for other devices on
-your network: http://<this-computer>:8096/radio
+Double-click `windows/start.bat`. It brings the containers up, waits for the
+station to answer, and opens it. Stop it with `windows/stop.bat`.
+
+- The station: http://127.0.0.1:8096/
+- The listener page, for other devices on your network:
+  http://<this-computer>:8096/radio
+
+`electron/` is still in the box if you would rather have a desktop window
+than a browser tab — `npm install` in there and `npm start` — but nothing
+needs it.
+
+## Keeping it to yourself
+
+The setup page generates a key into `windows/station.env`. Everything that
+changes the station wants that key; the listener page does not. To let
+somebody else tune in, use the 🌐 Remote panel in the station and hand them
+a link — it carries a pass that expires and can be revoked, never your key.
 
 ## What is and is not in the box
 
@@ -24145,7 +25961,9 @@ your network: http://<this-computer>:8096/radio
   generation need an NVIDIA GPU stack and are switched off here — the
   engine list will show them "down", and every voice falls back to
   Piper automatically. The show runs fine without them.
-- No personal chat history and no API secrets travel with the kit.
+- No personal chat history and no API secrets travel with the kit. The
+  containers are named `pinebox-station-*` under their own compose project,
+  so this can run beside another copy without either noticing.
 """
 
 KIT_BOOT = """\
@@ -24273,7 +26091,16 @@ def _kit_build() -> Path:
                                  f"data/{name}/{sub.relative_to(path)}")
         zf.writestr("windows/docker-compose.yml", KIT_COMPOSE)
         zf.writestr("windows/start.bat", KIT_START)
-        zf.writestr("windows/stop.bat", "docker compose down\n")
+        zf.writestr("windows/stop.bat",
+                    '@echo off\r\ncd /d "%~dp0"\r\n'
+                    "docker compose down\r\n"
+                    "echo The station is off.\r\npause\r\n")
+        # The guided setup (#628): the first thing a new operator opens.
+        zf.writestr("setup/setup.html", KIT_SETUP)
+        zf.writestr("SETUP.bat",
+                    '@echo off\r\nstart "" "%~dp0setup\\setup.html"\r\n')
+        # The Electron shell stays, but it is now OPTIONAL — start.bat opens
+        # the browser instead, so the kit needs no Node at all (#628).
         zf.writestr("electron/package.json", KIT_PKG)
         zf.writestr("electron/main.js", KIT_MAIN)
         zf.writestr("electron/boot.html", KIT_BOOT)
@@ -27552,6 +29379,37 @@ button.danger {
   position: static; width: 100%; height: 100%; object-fit: contain;
   transform: none;
 }
+/* #641: the line currently going out, lit like a cue light. */
+.booth-onair {
+  background: linear-gradient(90deg, rgba(255,95,95,.16), transparent 70%);
+  box-shadow: inset 2px 0 0 #ff5f5f;
+}
+/* #645: a sting in the booth arrives as a chip that pops, so the window
+   reads the way the broadcast sounded rather than as a line of text. */
+.sfx-chip {
+  display: inline-flex; align-items: center; gap: 2px; cursor: pointer;
+  font-size: 11px; padding: 1px 8px 1px 5px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--panel2);
+  color: var(--muted); white-space: nowrap;
+  animation: sfxPop .45s cubic-bezier(.2, 1.6, .4, 1) both;
+}
+.sfx-chip:hover { color: var(--text); border-color: var(--accent); }
+.sfx-chip-em {
+  font-size: 13px; display: inline-block;
+  animation: sfxWobble 1.6s ease-in-out .45s 2;
+}
+@keyframes sfxPop {
+  from { transform: scale(.4) translateY(4px); opacity: 0; }
+  to { transform: scale(1) translateY(0); opacity: 1; }
+}
+@keyframes sfxWobble {
+  0%, 100% { transform: rotate(0); }
+  30% { transform: rotate(-12deg) scale(1.15); }
+  60% { transform: rotate(10deg) scale(1.1); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .sfx-chip, .sfx-chip-em { animation: none; }
+}
 .tf-textpage {
   position: absolute; inset: 0; padding: 24px 18px 12px; overflow: hidden;
   background: #f4f1ea; color: #20242b; font-family: Georgia, serif;
@@ -27821,9 +29679,11 @@ links and restart the agent."
     </div>
   </div>
   <div style="display:flex;align-items:center;gap:14px">
-    <label class="slider" id="boxTalkWrap" title="Talk to the Pine Box. Off
-and nothing here speaks to the satellite: no DJ voice, no music, no replies,
-no chimes, no microphone. It comes back on when the station does.">
+    <label class="slider" id="boxTalkWrap" title="Broadcast the station to
+the Pine Box. Off and nothing from the show reaches the speaker — no DJ
+voice, no music, no stings, no chimes. The box still ANSWERS you: ask it
+for a render or anything else and it replies as normal. It comes back on
+when the station does.">
       <input id="boxTalk" type="checkbox" checked onchange="boxTalkSet()">
       <span></span><em>📦 Pine Box</em>
     </label>
@@ -28828,6 +30688,12 @@ live and in 3D, with swappable themes">🧠 Mind</button>
         <button id="mindDockBtn" onclick="mindDockToggle()"
                 title="Dock the Dialogue Mind to the left as the main display
 whenever the station is playing (#472)">📺 Left</button>
+        <button onclick="artistReadPanel()"
+                title="Read an artist's whole catalogue for what it is about,
+and hand that world to the DJs as a mind of its own">📖 Lyrics</button>
+        <button onclick="remotePanel()"
+                title="Where the station can be reached from, and links you
+can hand to somebody else so they can tune in and talk back">🌐 Remote</button>
         <button onclick="djCallersPanel()"
                 title="The people who ring the station">👤 Callers</button>
         <button onclick="djGuestPanel()"
@@ -28910,6 +30776,18 @@ element on its own cannot go past 100%.">
       </div>
       <div id="djStatus" class="muted"
            style="font-size:12px;margin-top:6px"></div>
+
+      <!-- #642: a word they will not stop saying, taken away for a day. -->
+      <div class="row" style="margin-top:8px;gap:6px;align-items:center">
+        <input id="djBanWord" placeholder="a word they must drop…"
+               style="flex:1;min-width:0"
+               onkeydown="if(event.key==='Enter')djBanAdd()">
+        <button onclick="djBanAdd()"
+                title="They stop saying it for 24 hours — prompt and mouth
+both">🚫 Drop it</button>
+      </div>
+      <div id="djBanList" class="muted"
+           style="font-size:11px;margin-top:4px"></div>
 
       <details class="pine-customize" style="margin-top:10px">
         <summary class="muted" style="cursor:pointer">Customize the DJ</summary>
@@ -34537,13 +36415,20 @@ function djTalkRender(state) {
     // A sample dropped off the end of a phrase shows up between the lines
     // (#277), with the same votes the chat feed carries (#269).
     if (line.kind === "sfx") {
-      const mark = el("span", "muted", "🔊 " + line.text + " ");
-      mark.style.cssText = "font-size:11px;font-style:italic;opacity:.8";
-      row.appendChild(mark);
+      // #645: the sting arrives as a chip that POPS in ahead of the words,
+      // so the booth reads the way the broadcast sounded. Click it to open
+      // the sample itself.
+      const chip = el("span", "sfx-chip", "");
+      chip.appendChild(el("span", "sfx-chip-em", sfxEmojiFor(line.text)));
+      chip.appendChild(el("span", "", " " + (line.text || "sample")));
+      chip.title = "Open this sound effect";
+      chip.onclick = () => sfxInspect(line.sfx);
+      row.appendChild(chip);
       const small = "background:none;border:0;padding:0 3px;"
         + "cursor:pointer;font-size:10px;opacity:.7";
       const play = el("button", "", "▶");
       play.style.cssText = small;
+      play.title = "Hear it again";
       play.onclick = () => {
         if (line.url) new Audio(line.url).play().catch(() => {});
       };
@@ -34621,6 +36506,15 @@ function djTalkRender(state) {
         + "routing was not to the box)";
       q.style.cssText = "font-size:10px;opacity:.4";
       said.appendChild(q);
+    }
+    // #641: the line the broadcast is ON right now wears the cue light, so
+    // the booth reads one to one with what is actually coming out.
+    if (state.speaking && line.ts && line.ts === state.airing_ts) {
+      row.classList.add("booth-onair");
+      const live = el("span", "", " ●");
+      live.title = "This is what is going out right now";
+      live.style.cssText = "font-size:10px;color:#ff5f5f";
+      said.appendChild(live);
     }
     said.onclick = () => djTalkSpeak(line, said);
     // Right-click any line to bury it forever (#444): it is dropped if it
@@ -35756,6 +37650,473 @@ function sfxDotHover(dot, sfxId) {
 
 /* The whole SFX folder behind one played sample (#269): every file with a
    switch, so a pack can be pruned without leaving the panel. */
+/* #645: a sample's name suggests its face. Cheap, deterministic, and it
+ * makes a wall of stings scannable at a glance. */
+const SFX_FACES = [
+  [/laugh|giggle|chuckle|haha/i, "😂"],
+  [/applau|clap|cheer|crowd/i, "👏"],
+  [/boo|jeer|groan/i, "🙄"],
+  [/horn|airhorn|blast/i, "📯"],
+  [/siren|police|alarm|emergency/i, "🚨"],
+  [/bell|ding|chime|ping/i, "🔔"],
+  [/drum|snare|kick|beat|rimshot/i, "🥁"],
+  [/guitar|riff|chord|strum/i, "🎸"],
+  [/scratch|vinyl|record|turntable|dj/i, "💿"],
+  [/explos|boom|blast|bomb/i, "💥"],
+  [/glass|smash|break|crash/i, "🔨"],
+  [/gun|shot|blaster|laser/i, "🔫"],
+  [/phone|ring|dial|call/i, "☎️"],
+  [/whoosh|swish|swoosh|zoom|transition/i, "💨"],
+  [/water|splash|rain|drip|ocean/i, "💧"],
+  [/fire|burn|flame/i, "🔥"],
+  [/wind|storm|thunder/i, "🌩"],
+  [/cat|meow|dog|bark|animal|bird/i, "🐾"],
+  [/scream|yell|shout/i, "😱"],
+  [/spring|boing|bounce|cartoon/i, "🤸"],
+  [/error|fail|wrong|buzz/i, "❌"],
+  [/win|correct|success|yay|tada/i, "✨"],
+  [/robot|synth|beep|computer|glitch/i, "🤖"],
+  [/heart|love|kiss/i, "💗"],
+  [/ghost|spooky|horror|creep/i, "👻"],
+];
+
+function sfxEmojiFor(name) {
+  const text = String(name || "");
+  for (const [test, face] of SFX_FACES) if (test.test(text)) return face;
+  return "🔊";
+}
+
+/* The sound effect itself, opened up (#645): what it is, how often it has
+ * gone out, whose finger it is, and your dial on how often it may again. */
+async function sfxInspect(sfxId) {
+  const gone = document.getElementById("sfxInspectModal");
+  if (gone) gone.remove();
+  let info = null;
+  try {
+    info = await api("/api/sfx/info?id=" + encodeURIComponent(sfxId || ""));
+  } catch (error) { setStatus(error.message, true); return; }
+  const shade = el("div", "", "");
+  shade.id = "sfxInspectModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:186;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (event) => { if (event.target === shade) shade.remove(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(460px,94vw);max-height:86vh;overflow:auto;"
+    + "padding:16px;margin:0";
+
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:8px";
+  head.appendChild(el("h2", "", sfxEmojiFor(info.name) + " " + info.name));
+  head.firstChild.style.cssText = "margin:0;font-size:16px;flex:1";
+  const shut = el("span", "", "✕");
+  shut.style.cssText = "cursor:pointer;font-size:18px";
+  shut.onclick = () => shade.remove();
+  head.appendChild(shut);
+  card.appendChild(head);
+
+  if (info.spec_url) {
+    const spec = document.createElement("img");
+    spec.src = info.spec_url;
+    spec.style.cssText = "width:100%;border-radius:8px;margin:10px 0;"
+      + "background:var(--panel2)";
+    spec.onerror = () => spec.remove();
+    card.appendChild(spec);
+  }
+
+  const facts = el("div", "muted", "");
+  facts.style.cssText = "font-size:12px;line-height:1.7";
+  const ago = info.last
+    ? new Date(info.last * 1000).toLocaleString() : "never";
+  // textContent per line: a sample name is a filename off the share, and
+  // filenames are not to be trusted with innerHTML.
+  [["📁 ", info.where || ""],
+   ["⏱ ", (info.seconds || 0).toFixed(2) + " s"],
+   ["▶ ", "played " + (info.plays || 0) + " times · "
+          + (info.today || 0) + " today"],
+   ["🕐 ", "last out: " + ago],
+   ...(info.top_dj ? [["👤 ", "mostly " + info.top_dj
+                       + " (" + info.top_dj_plays + ")"]] : [])
+  ].forEach(([icon, text]) => {
+    facts.appendChild(el("div", "", icon + text));
+  });
+  card.appendChild(facts);
+
+  const who = info.by || {};
+  if (Object.keys(who).length) {
+    const list = el("div", "muted", "whose finger: "
+      + Object.keys(who).map((k) => k + " ×" + who[k]).join(" · "));
+    list.style.cssText = "font-size:11px;margin-top:4px";
+    card.appendChild(list);
+  }
+
+  const play = el("button", "primary", "▶ Hear it");
+  play.style.marginTop = "10px";
+  play.onclick = () => { if (info.url) new Audio(info.url).play()
+    .catch(() => {}); };
+  card.appendChild(play);
+
+  card.appendChild(el("div", "", "How often may it come up?"));
+  card.lastChild.style.cssText = "margin-top:14px;font-size:12px";
+  const dial = el("div", "row", "");
+  dial.style.cssText = "gap:5px;flex-wrap:wrap;margin-top:5px";
+  const note = el("div", "muted", "");
+  note.style.cssText = "font-size:11px;margin-top:6px";
+  const setWeight = async (want, label) => {
+    try {
+      const got = await api("/api/sfx/weight", {method: "POST",
+        body: JSON.stringify({id: info.id, weight: want})});
+      info.weight = got.weight;
+      note.textContent = label;
+      paintDial();
+    } catch (error) { note.textContent = error.message; }
+  };
+  const paintDial = () => {
+    dial.innerHTML = "";
+    [["🚫 never", 0], ["↓ rarely", 0.35], ["normal", 1],
+     ["↑ often", 2], ["★ lean on it", 4]].forEach(([label, want]) => {
+      const near = Math.abs((info.weight ?? 1) - want) < 0.06;
+      const b = el("button", near ? "primary" : "", label);
+      b.style.cssText = "font-size:11px;padding:2px 8px";
+      b.onclick = () => setWeight(want, "set to " + label);
+      dial.appendChild(b);
+    });
+  };
+  paintDial();
+  card.appendChild(dial);
+  card.appendChild(note);
+
+  const ban = el("button", "", info.banned
+    ? "↩ Let it play again" : "▼ Never play this again");
+  ban.style.cssText = "margin-top:10px;font-size:11px";
+  ban.onclick = async () => {
+    try {
+      await api("/api/sfx/ban", {method: "POST",
+        body: JSON.stringify({id: info.id, banned: !info.banned})});
+      info.banned = !info.banned;
+      ban.textContent = info.banned
+        ? "↩ Let it play again" : "▼ Never play this again";
+      note.textContent = info.banned ? "banned" : "back in the pool";
+    } catch (error) { note.textContent = error.message; }
+  };
+  card.appendChild(ban);
+
+  const folder = el("button", "", "● The whole folder");
+  folder.style.cssText = "margin:10px 0 0 6px;font-size:11px";
+  folder.onclick = () => { shade.remove(); sfxDirPopup(info.id); };
+  card.appendChild(folder);
+
+  shade.appendChild(card);
+  document.body.appendChild(shade);
+}
+
+/* #632: where the station can be reached from, and links to hand out. */
+async function remotePanel() {
+  const gone = document.getElementById("remoteModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "remoteModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:179;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(620px,95vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:8px";
+  head.appendChild(el("h2", "", "🌐 Remote access"));
+  head.firstChild.style.cssText = "margin:0;font-size:16px;flex:1";
+  const shut = el("span", "", "✕");
+  shut.style.cssText = "cursor:pointer;font-size:18px";
+  shut.onclick = () => shade.remove();
+  head.appendChild(shut);
+  card.appendChild(head);
+  const body = el("div", "muted", "Looking…");
+  body.style.cssText = "font-size:12px;margin-top:8px";
+  card.appendChild(body);
+  shade.appendChild(card);
+  document.body.appendChild(shade);
+
+  let net;
+  try { net = await api("/api/remote"); }
+  catch (e) { body.textContent = e.message; return; }
+  body.textContent = "";
+
+  const row = (label, value, copy) => {
+    const line = el("div", "studio-srow", "");
+    line.appendChild(el("label", "", label));
+    const box = el("input", "", "");
+    box.type = "text"; box.readOnly = true; box.value = value;
+    box.style.cssText = "flex:1;min-width:0;font-size:11px";
+    box.onclick = () => box.select();
+    line.appendChild(box);
+    if (copy) {
+      const btn = el("button", "", "copy");
+      btn.style.fontSize = "11px";
+      btn.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(value);
+          btn.textContent = "copied";
+          setTimeout(() => { btn.textContent = "copy"; }, 1400);
+        } catch (e) { box.select(); }
+      };
+      line.appendChild(btn);
+    }
+    body.appendChild(line);
+    return box;
+  };
+
+  body.appendChild(el("div", "", "Where it answers"));
+  body.lastChild.style.cssText = "font-weight:700;margin-bottom:4px";
+  (net.urls || []).forEach((u) => row(u.label, u.url, true));
+
+  body.appendChild(el("div", "", "Tailscale"));
+  body.lastChild.style.cssText = "font-weight:700;margin:12px 0 4px";
+  const ts = net.tailscale || {};
+  const state = el("div", "muted", ts.up
+    ? "✓ on the tailnet as " + ts.ip + (ts.magicdns ? " · " + ts.magicdns : "")
+    : "✗ " + (net.why || "not running"));
+  state.style.cssText = "font-size:11px;line-height:1.5";
+  body.appendChild(state);
+  if (!ts.up) {
+    body.appendChild(el("div", "muted",
+      "Run this ON THE BOX, not in the container:"));
+    body.lastChild.style.cssText = "font-size:11px;margin-top:6px";
+    row("install", net.install_cmd, true);
+  }
+
+  const warn = el("div", "muted", "⚠ " + (net.warning || ""));
+  warn.style.cssText = "font-size:11px;line-height:1.5;margin:10px 0;"
+    + "padding:8px;border:1px solid var(--border);border-radius:8px";
+  body.appendChild(warn);
+
+  body.appendChild(el("div", "", "Tune-in links"));
+  body.lastChild.style.cssText = "font-weight:700;margin:12px 0 4px";
+  body.appendChild(el("div", "muted",
+    "A link carries a signed pass that expires — never your key. Whoever "
+    + "opens it can listen, request a song, vote, and shout at the booth. "
+    + "Nothing else."));
+  body.lastChild.style.cssText = "font-size:11px;line-height:1.5;"
+    + "margin-bottom:6px";
+
+  const live = el("div", "", "");
+  body.appendChild(live);
+  const drawLinks = async () => {
+    live.textContent = "";
+    let got;
+    try { got = await api("/api/share"); } catch (e) { return; }
+    (got.links || []).forEach((l) => {
+      const line = el("div", "phrase-row", "");
+      line.style.cssText = "align-items:baseline;gap:8px";
+      const name = el("span", "", l.label + " · " + l.hours_left + "h left");
+      name.style.cssText = "flex:1;font-size:11px";
+      const copy = el("button", "", "copy");
+      copy.style.fontSize = "11px";
+      copy.onclick = async () => {
+        try { await navigator.clipboard.writeText(l.url); copy.textContent = "✓"; }
+        catch (e) { window.prompt("Copy this:", l.url); }
+      };
+      const kill = el("button", "", "✕");
+      kill.style.fontSize = "11px";
+      kill.title = "Revoke this link";
+      kill.onclick = async () => {
+        try {
+          await api("/api/share/revoke", {method: "POST",
+            body: JSON.stringify({tag: l.tag})});
+          drawLinks();
+        } catch (e) {}
+      };
+      line.appendChild(name); line.appendChild(copy); line.appendChild(kill);
+      live.appendChild(line);
+    });
+    if (!(got.links || []).length) {
+      live.appendChild(el("div", "muted", "No links out."));
+      live.lastChild.style.fontSize = "11px";
+    }
+  };
+  await drawLinks();
+
+  const make = el("div", "row", "");
+  make.style.marginTop = "8px";
+  const label = el("input", "", "");
+  label.placeholder = "who is this for?";
+  label.style.cssText = "flex:1;min-width:0";
+  const span = el("select", "", "");
+  [["1 hour", 1], ["a day", 24], ["a week", 168],
+   ["a month", 720]].forEach(([t, h]) => {
+    const o = el("option", "", t); o.value = String(h);
+    if (h === 168) o.selected = true;
+    span.appendChild(o);
+  });
+  const mint = el("button", "primary", "Make a link");
+  mint.onclick = async () => {
+    mint.disabled = true;
+    try {
+      const got = await api("/api/share", {method: "POST",
+        body: JSON.stringify({label: label.value.trim() || "a listener",
+                              hours: Number(span.value)})});
+      label.value = "";
+      await drawLinks();
+      try { await navigator.clipboard.writeText(got.url); } catch (e) {}
+      setStatus(got.remote
+        ? "link copied — it works from anywhere on your tailnet"
+        : "link copied — this one only works on your own network, "
+          + "since there is no tailnet yet");
+    } catch (e) { setStatus(e.message, true); }
+    mint.disabled = false;
+  };
+  make.appendChild(label); make.appendChild(span); make.appendChild(mint);
+  body.appendChild(make);
+
+  const nuke = el("button", "", "Revoke every link");
+  nuke.style.cssText = "margin-top:8px;font-size:11px";
+  nuke.onclick = async () => {
+    try {
+      await api("/api/share/revoke", {method: "POST",
+        body: JSON.stringify({all: true})});
+      drawLinks();
+      setStatus("every outstanding link is dead");
+    } catch (e) { setStatus(e.message, true); }
+  };
+  body.appendChild(nuke);
+}
+
+/* #629: read an artist's whole catalogue for what it is ABOUT — the images,
+ * the places, the weather, what the songs are for — and write that world
+ * into a mind the pair can mine. */
+async function artistReadPanel() {
+  const gone = document.getElementById("artistReadModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "artistReadModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:178;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(560px,95vw);max-height:86vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:8px";
+  head.appendChild(el("h2", "", "📖 Read an artist"));
+  head.firstChild.style.cssText = "margin:0;font-size:16px;flex:1";
+  const shut = el("span", "", "✕");
+  shut.style.cssText = "cursor:pointer;font-size:18px";
+  shut.onclick = () => shade.remove();
+  head.appendChild(shut);
+  card.appendChild(head);
+  card.appendChild(el("div", "muted",
+    "Every song they have in the library is transcribed, kept as markdown, "
+    + "and boiled down into a world: the images that keep coming back, the "
+    + "places, the weather, what the songs are FOR, and how the people who "
+    + "live there lean. That digest lands in a mind the DJs mine from."));
+  card.lastChild.style.cssText = "font-size:11px;line-height:1.55;margin:6px 0";
+
+  const findRow = el("div", "studio-srow", "");
+  findRow.appendChild(el("label", "", "who"));
+  const find = el("input", "", "");
+  find.type = "text"; find.placeholder = "start typing an artist…";
+  find.style.flex = "1";
+  findRow.appendChild(find);
+  card.appendChild(findRow);
+
+  const mindRow = el("div", "studio-srow", "");
+  mindRow.appendChild(el("label", "", "into which head"));
+  const mindSel = el("select", "", "");
+  mindRow.appendChild(mindSel);
+  card.appendChild(mindRow);
+  try {
+    const minds = await api("/api/speakbox/minds");
+    (minds.minds || []).forEach((m) => {
+      const o = el("option", "", m.name); o.value = m.id;
+      if (m.active) o.selected = true;
+      mindSel.appendChild(o);
+    });
+  } catch (e) { /* the studio mind is the default anyway */ }
+
+  const capRow = el("div", "studio-srow", "");
+  capRow.appendChild(el("label", "", "at most"));
+  const cap = el("input", "", "");
+  cap.type = "number"; cap.min = "1"; cap.max = "300"; cap.value = "40";
+  cap.style.width = "80px";
+  capRow.appendChild(cap);
+  capRow.appendChild(el("span", "muted", "songs — each one is transcribed, "
+    + "so a big catalogue takes a while"));
+  capRow.lastChild.style.fontSize = "11px";
+  card.appendChild(capRow);
+
+  const list = el("div", "", "");
+  list.style.cssText = "max-height:240px;overflow-y:auto;margin-top:8px";
+  card.appendChild(list);
+  const note = el("div", "muted", "");
+  note.style.cssText = "font-size:12px;margin-top:8px";
+  card.appendChild(note);
+
+  let watching = null;
+  const watch = async (jobId) => {
+    try {
+      const s = await api("/api/music/artist/read/" + jobId);
+      note.textContent = s.stage === "done"
+        ? "✓ " + s.artist + " — " + (s.songs || 0) + " songs read"
+          + (s.instrumental ? ", " + s.instrumental + " with nothing sung" : "")
+          + ". The world is in their heads now."
+        : s.stage === "error" ? "✗ " + (s.error || "it stopped")
+        : "◐ " + s.stage + " · " + (s.done || 0) + "/" + s.total
+          + (s.current ? " · " + s.current : "");
+      if (s.stage === "done" || s.stage === "error") {
+        clearInterval(watching); watching = null;
+      }
+    } catch (e) { clearInterval(watching); watching = null; }
+  };
+
+  const draw = async () => {
+    let got;
+    try {
+      got = await api("/api/music/artists?limit=40&q="
+                      + encodeURIComponent(find.value.trim()));
+    } catch (e) { list.textContent = e.message; return; }
+    list.textContent = "";
+    (got.artists || []).forEach((a) => {
+      const row = el("div", "phrase-row", "");
+      row.style.cssText = "align-items:baseline;gap:8px";
+      const name = el("b", "", a.artist);
+      name.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap";
+      const facts = el("span", "muted",
+        a.tracks + " songs · " + a.albums + " albums");
+      facts.style.fontSize = "11px";
+      const go = el("button", "primary", "Read");
+      go.onclick = async () => {
+        go.disabled = true;
+        note.textContent = "◐ starting…";
+        try {
+          const started = await api("/api/music/artist/read", {
+            method: "POST",
+            body: JSON.stringify({artist: a.artist, mind: mindSel.value,
+                                  limit: Number(cap.value) || 40}),
+          });
+          if (watching) clearInterval(watching);
+          watch(started.job);
+          watching = setInterval(() => watch(started.job), 4000);
+        } catch (e) { note.textContent = "✗ " + e.message; }
+        go.disabled = false;
+      };
+      row.appendChild(name); row.appendChild(facts); row.appendChild(go);
+      list.appendChild(row);
+    });
+    if (!(got.artists || []).length) {
+      list.appendChild(el("div", "muted", "Nobody by that name."));
+    }
+  };
+  let typing = null;
+  find.oninput = () => {
+    clearTimeout(typing);
+    typing = setTimeout(draw, 220);
+  };
+  draw();
+  shade.appendChild(card);
+  document.body.appendChild(shade);
+  find.focus();
+}
+
 async function sfxDirPopup(sfxId) {
   const open = document.getElementById("sfxDirModal");
   if (open) { open.remove(); return; }
@@ -37071,6 +39432,54 @@ function djVoiceMode() {
 const WHERE = {box: "the Pine Box", here: "this page", both: "both",
                off: "off"};
 
+/* #642: they fall in love with a word — vibrations, frequencies — and no
+ * amount of "talk about something else" gets them off it. This takes the
+ * word away for a day, from the prompt and from the mouth. */
+async function djBanAdd() {
+  const box = document.getElementById("djBanWord");
+  const word = (box.value || "").trim();
+  if (!word) return;
+  box.disabled = true;
+  try {
+    const got = await api("/api/dj/banned", {
+      method: "POST", body: JSON.stringify({word}),
+    });
+    box.value = "";
+    djBanPaint(got.words || []);
+    setStatus("“" + word + "” is off the table for a day");
+  } catch (error) { setStatus(error.message, true); }
+  box.disabled = false;
+  box.focus();
+}
+
+function djBanPaint(words) {
+  const host = document.getElementById("djBanList");
+  if (!host) return;
+  host.textContent = "";
+  if (!words.length) { host.textContent = "No words are banned."; return; }
+  host.appendChild(document.createTextNode("banned: "));
+  words.forEach((row, at) => {
+    if (at) host.appendChild(document.createTextNode(" · "));
+    const chip = el("span", "", row.word + " (" + row.hours_left + "h)");
+    chip.style.cssText = "cursor:pointer;text-decoration:underline dotted";
+    chip.title = "Let them say it again";
+    chip.onclick = async () => {
+      try {
+        const got = await api("/api/dj/banned", {
+          method: "POST", body: JSON.stringify({lift: row.word}),
+        });
+        djBanPaint(got.words || []);
+      } catch (error) { setStatus(error.message, true); }
+    };
+    host.appendChild(chip);
+  });
+}
+
+async function djBanLoad() {
+  try { djBanPaint((await api("/api/dj/banned")).words || []); }
+  catch (error) { /* the panel works without it */ }
+}
+
 // The master switch at the top of the window (#638). Off means the station
 // says nothing to the satellite at all — whatever the three routing pickers
 // happen to say — and the show carries on in the page.
@@ -37085,8 +39494,9 @@ async function boxTalkSet() {
     djRender(state);
     if (status) {
       status.textContent = box.checked
-        ? "The Pine Box is connected again."
-        : "The Pine Box is switched off — the show stays in this page. "
+        ? "The station is going to the Pine Box again."
+        : "The station is off the Pine Box — the show stays in this page. "
+          + "The box still answers you; ask it for a render as normal. "
           + "A line already announced plays itself out.";
     }
   } catch (error) {
@@ -39141,8 +41551,114 @@ async function callRecordings() {
     return row;
   };
 
+  // The full mix pane (#633): the show as it SOUNDED, records and all.
+  function renderMix() {
+    list.innerHTML = "";
+    const why = el("div", "muted",
+      "The recorder keeps talk and sound effects only — the records are "
+      + "streamed, so nothing here ever heard them. This rebuilds the "
+      + "broadcast from the timing logs and mixes the music back in at your "
+      + "levels, ducked under the voices. Stretches from before this update "
+      + "have no music timing and come out talk-only.");
+    why.style.cssText = "font-size:11px;line-height:1.55;margin-bottom:10px";
+    list.appendChild(why);
+
+    const levels = djLevels();
+    const pick = el("select", "", "");
+    [["today", "today"], ["yesterday", "yesterday"],
+     ["week", "this week"], ["month", "this month"]].forEach(([v, t]) => {
+      const o = el("option", "", t); o.value = v; pick.appendChild(o);
+    });
+    pick.value = localStorage.cacheMixScope || "today";
+    pick.onchange = () => { localStorage.cacheMixScope = pick.value; };
+    const scopeRow = el("div", "studio-srow", "");
+    scopeRow.appendChild(el("label", "", "span"));
+    scopeRow.appendChild(pick);
+    list.appendChild(scopeRow);
+
+    const slider = (label, value, min, max) => {
+      const row = el("div", "studio-srow", "");
+      row.appendChild(el("label", "", label));
+      const input = el("input", "", "");
+      input.type = "range"; input.min = String(min); input.max = String(max);
+      input.value = String(Math.round(value));
+      input.style.flex = "1";
+      const out = el("span", "muted", input.value + "%");
+      out.style.cssText = "font-size:11px;width:44px;text-align:right";
+      input.oninput = () => { out.textContent = input.value + "%"; };
+      row.appendChild(input); row.appendChild(out);
+      list.appendChild(row);
+      return input;
+    };
+    const musicIn = slider("music", levels.music * 100, 0, 200);
+    const duckIn = slider("duck under speech", levels.duck * 100, 0, 90);
+    const voiceIn = slider("DJ voice", levels.voice * 100, 25, 200);
+
+    const player = el("audio", "", "");
+    player.id = "cacheMixPlayer";
+    player.controls = true;
+    player.style.cssText = "width:100%;margin-top:10px;display:none";
+    if (typeof cacheAudioHook === "function") cacheAudioHook(player);
+
+    const query = () => "scope=" + encodeURIComponent(pick.value)
+      + "&music=" + musicIn.value + "&duck=" + duckIn.value
+      + "&voice=" + voiceIn.value;
+    const grab = async (btn, then) => {
+      const label = btn.textContent;
+      btn.textContent = "⏳ mixing…"; btn.disabled = true;
+      try {
+        const r = await fetch("/api/radio-cache/broadcast?" + query(),
+          {headers: {"Authorization": "Bearer " + key()}});
+        if (!r.ok) {
+          const d = await r.json().catch(() => ({}));
+          throw new Error(d.detail || ("HTTP " + r.status));
+        }
+        then(URL.createObjectURL(await r.blob()));
+      } catch (e) { setStatus("full mix failed: " + e.message, true); }
+      btn.textContent = label; btn.disabled = false;
+    };
+
+    const acts = el("div", "row", "");
+    acts.style.marginTop = "10px";
+    const save = el("button", "primary", "⬇ render & download");
+    save.onclick = () => grab(save, (url) => {
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "pinebox-broadcast-" + pick.value + ".mp3";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 20000);
+      setStatus("full mix downloaded · " + pick.value);
+    });
+    const hear = el("button", "", "▶ play here");
+    hear.onclick = () => grab(hear, (url) => {
+      player.src = url;
+      player.style.display = "block";
+      player.play().catch(() => {});
+    });
+    acts.appendChild(save); acts.appendChild(hear);
+    list.appendChild(acts);
+    list.appendChild(player);
+  }
+
+  // Two ways to take the show away (#633): what the recorder caught, or the
+  // whole broadcast with the records mixed back in.
+  const tabs = el("div", "row", "");
+  tabs.style.cssText = "gap:6px;margin-bottom:10px";
+  const mkTab = (label, key2) => {
+    const on = (localStorage.cacheTab || "talk") === key2;
+    const b = el("button", on ? "primary" : "", label);
+    b.style.cssText = "font-size:11px;padding:3px 10px";
+    b.onclick = () => { localStorage.cacheTab = key2; render(); };
+    return b;
+  };
+  box.insertBefore(tabs, list);
+
   async function render() {
     list.innerHTML = ""; list.className = "";
+    tabs.innerHTML = "";
+    tabs.appendChild(mkTab("🎙 Talk / SFX", "talk"));
+    tabs.appendChild(mkTab("🎚 Broadcast (full mix)", "mix"));
+    if ((localStorage.cacheTab || "talk") === "mix") { renderMix(); return; }
     let eps = {episodes: [], recording: {}}, calls = {calls: []};
     try { eps = await api("/api/radio-cache/episodes"); } catch (e) {}
     try { calls = await api("/api/radio-cache/calls"); } catch (e) {}
@@ -40354,6 +42870,31 @@ function djGraphPanel() {
 
   // The core and the systems that power it, in a ring.
   makeNode("dj", "dj", "THE DJ", 0x4bb3ff, 2.1, new THREE.Vector3(0, 0, 0));
+  // #640: the pair are not ONE node. Each presenter sits by the core with
+  // their own line into the vector store, and the line lights when THEY
+  // reach into the documents.
+  const PEOPLE = [
+    ["p_dj", "host", 0x4bb3ff, -4.6],
+    ["p_cohost", "co-host", 0xb48cff, 0],
+    ["p_caller", "callers", 0x9ee493, 4.6],
+  ];
+  PEOPLE.forEach(([id, name, color, x]) => {
+    makeNode(id, "person", name, color, 0.72,
+             new THREE.Vector3(x, 3.6, 0));
+  });
+  makeNode("vectors", "vectors", "vector store", 0xffd479, 1.25,
+           new THREE.Vector3(0, -5.4, 0));
+  // A line from each presenter DOWN to the store — the thing #640 wanted to
+  // see: three separate reaches into the same data, lighting independently.
+  const reaches = {};
+  PEOPLE.forEach(([id, _n, color, x]) => {
+    const geo = new THREE.BufferGeometry().setFromPoints(
+      [new THREE.Vector3(x, 3.6, 0), new THREE.Vector3(0, -5.4, 0)]);
+    const line = new THREE.Line(geo, new THREE.LineBasicMaterial(
+      {color, transparent: true, opacity: 0.12}));
+    group.add(line);
+    reaches[id] = {line, glow: 0};
+  });
   const SYSTEMS = [
     ["model", "model", 0xb48cff], ["voices", "voices", 0x7fd1ff],
     ["satellite", "pine box", 0x43d17c], ["speakbox", "speakbox", 0xffd479],
@@ -40406,6 +42947,7 @@ function djGraphPanel() {
 
   // --- data ---------------------------------------------------------------
   let seenTs = 0, seenDocs = {}, feedKeys = new Set(), lastGraph = null;
+  const seenPulls = {};        // per-presenter vector reach (#640)
 
   function nodeDetail(id) {
     const g = lastGraph;
@@ -40416,6 +42958,28 @@ function djGraphPanel() {
         + "\nNow: " + (g.dj.now || "—") + "\nCo-host: " + g.dj.cohost
         + "\n\nRejected lately:\n" + (g.dropped || []).slice(-6).map(
           (d) => "✗ " + d.text.slice(0, 60) + " — " + d.why).join("\n");
+    }
+    // #640: each presenter's own reach into the documents.
+    if (id.indexOf("p_") === 0) {
+      const who = (g.people || []).find((p) => "p_" + p.id === id) || {};
+      const when = who.last
+        ? new Date(who.last * 1000).toLocaleTimeString() : "not yet";
+      return (who.name || "").toUpperCase()
+        + (who.voice ? " · " + who.voice : "")
+        + "\n\nReaches into the vector store on their own: "
+        + (who.pulls || 0) + " pull" + ((who.pulls === 1) ? "" : "s")
+        + "\nLast: " + when
+        + (who.file ? "\nOut of: " + who.file : "")
+        + "\n\nEach of them searches the documents by MEANING for "
+        + "themselves — the line lights when this one does.";
+    }
+    if (id === "vectors") {
+      const v = g.vectors || {};
+      return "VECTOR STORE\n" + (v.chunks || 0) + " swaths indexed · "
+        + (v.model || "") + "\n\nWho reached in lately:\n"
+        + (v.recent || []).slice(0, 6).map(
+          (r) => "· " + (r.who || "booth") + " → " + (r.file || "?")
+            + " (" + r.score + ")").join("\n");
     }
     if (id === "model") {
       return "LANGUAGE MODEL\n" + g.model
@@ -40564,6 +43128,30 @@ function djGraphPanel() {
       seenTs = newest;
     }
     if (g.satellite.speaking && nodes.satellite) nodes.satellite.active = 1;
+    // #640: each presenter's own reach into the vector store. A fresh pull
+    // by that person lights THEIR line and their node, so you can watch the
+    // two of them touching the data independently.
+    (g.people || []).forEach((person) => {
+      const id = "p_" + person.id;
+      const node = nodes[id];
+      if (!node) return;
+      node.data = person;
+      if (node.tag) {
+        const want = person.name + (person.pulls ? " ·" + person.pulls : "");
+        if (node.tag.userData.text !== want) {
+          node.tag.userData.text = want;
+        }
+      }
+      if (person.last > (seenPulls[id] || 0)) {
+        if (seenPulls[id]) {
+          node.active = 1;
+          if (reaches[id]) reaches[id].glow = 1;
+          if (nodes.vectors) nodes.vectors.active = 1;
+        }
+        seenPulls[id] = person.last;
+      }
+    });
+    if (nodes.vectors && g.vectors) nodes.vectors.data = g.vectors;
     drawFeed(g);
     if (detail.dataset.id) detail.textContent = nodeDetail(detail.dataset.id);
   }
@@ -40652,6 +43240,14 @@ function djGraphPanel() {
       lineGeo.setDrawRange(0, cursor * 2);
       lineGeo.attributes.position.needsUpdate = true;
     }
+
+    // #640: each presenter's reach into the store glows on their OWN pull
+    // and fades on its own clock, so three separate hands are visible.
+    Object.keys(reaches).forEach((rid) => {
+      const reach = reaches[rid];
+      reach.glow = Math.max(0, reach.glow - dt * 0.55);
+      reach.line.material.opacity = 0.12 + reach.glow * 0.75;
+    });
 
     // Node life: halos decay, undulation around the core.
     const t = clock.elapsedTime;
@@ -41003,6 +43599,52 @@ function mindOpen(opts) {
     themeKey = themeSel.value; localStorage.mindTheme = themeKey; applyTheme();
   };
   bar.appendChild(themeSel);
+  // #627: which HEAD they are in. A mind is a folder plus its own shelf, so
+  // jumping here changes what the next round is made of — and the documents
+  // floating around the first station are rebuilt from the new one.
+  const mindSel = document.createElement("select");
+  mindSel.title = "Which head the pair are in — each is its own folder of "
+    + "documents with its own memory of what it has already used";
+  mindSel.style.cssText = themeSel.style.cssText;
+  async function mindsLoad() {
+    let got;
+    try { got = await api("/api/speakbox/minds"); } catch (e) { return; }
+    mindSel.textContent = "";
+    (got.minds || []).forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m.id;
+      o.textContent = "\u{1F9E0} " + m.name + " · " + m.docs;
+      if (m.active) o.selected = true;
+      mindSel.appendChild(o);
+    });
+    const add = document.createElement("option");
+    add.value = "__new"; add.textContent = "＋ another head…";
+    mindSel.appendChild(add);
+  }
+  async function mindNew() {
+    const name = window.prompt(
+      "Name this head — a parallel folder of documents with its own memory "
+      + "(e.g. Football, My own stories):", "");
+    if (!name) { mindsLoad(); return; }
+    const blurb = window.prompt(
+      "What does this head KNOW? One line; it colours everything they say "
+      + "while they are in it (e.g. sports facts and football history):", "");
+    try {
+      await api("/api/speakbox/minds", {method: "POST",
+        body: JSON.stringify({name, blurb: blurb || ""})});
+      await mindsLoad();
+    } catch (e) { window.alert(e.message); mindsLoad(); }
+  }
+  mindSel.onchange = async () => {
+    if (mindSel.value === "__new") { mindNew(); return; }
+    try {
+      await api("/api/speakbox/minds/" + encodeURIComponent(mindSel.value)
+                + "/activate", {method: "POST", body: "{}"});
+      if (typeof rebuildDocs === "function") rebuildDocs();
+    } catch (e) { /* the show carries on in the head it was in */ }
+  };
+  mindsLoad();
+  bar.appendChild(mindSel);
   const reelBtn = el("button", "", "\u{1F3A1} Reel");
   reelBtn.title = "Watch a line get picked off the dialogue reel";
   reelBtn.style.cssText = "pointer-events:auto;background:#0009;color:#dfe;"
@@ -41167,26 +43809,73 @@ function mindOpen(opts) {
     {color: MIND_THEMES[themeKey].a, transparent: true, opacity: 0.35}));
   world.add(rail);
 
+  // --- #634: the waveform, and what the desk does to it --------------------
+  // Two traces riding above the rail: the raw take coming out of VOICE, and
+  // the same wave after the ENGINEER station has bent it. The second one
+  // MORPHS toward whatever the last render actually did — compressed when
+  // the energy is up, ring-modulated when a vocoder is on, band-narrowed
+  // for the phone — so the transform is visible rather than described.
+  const WAVE_N = 96;
+  const rigIndex = MIND_STATIONS.findIndex((s) => s.key === "rig");
+  const waves = [];
+  [[rigIndex - 1, "raw"], [rigIndex, "bent"]].forEach(([seg, kind]) => {
+    if (seg < 0) return;
+    const geo = new T.BufferGeometry();
+    const pts = new Float32Array(WAVE_N * 3);
+    const xa = X0 + seg * DX, step = DX / (WAVE_N - 1);
+    for (let i = 0; i < WAVE_N; i++) {
+      pts[i * 3] = xa + i * step;
+      pts[i * 3 + 1] = 2.4;
+      pts[i * 3 + 2] = 0;
+    }
+    geo.setAttribute("position", new T.BufferAttribute(pts, 3));
+    const line = new T.Line(geo, new T.LineBasicMaterial({
+      color: kind === "raw" ? MIND_THEMES[themeKey].a
+                            : MIND_THEMES[themeKey].b,
+      transparent: true, opacity: 0.75,
+    }));
+    world.add(line);
+    waves.push({line, geo, kind, xa, step});
+  });
+  // What the wave is being bent BY, lerped so a new take morphs rather
+  // than snaps.
+  const bend = {drive: 0, ring: 0, narrow: 0, pace: 1, energy: 0, amp: 1};
+  const bendWant = {drive: 0, ring: 0, narrow: 0, pace: 1, energy: 0, amp: 1};
+  let lastRigAt = 0;
+
   // --- floating document cards around the first station (#472) -------------
   const docCards = [];
   const docGroup = new T.Group();
   docGroup.position.set(X0, 0, 0);
   world.add(docGroup);
-  api("/api/speakbox").then((d) => {
-    (d.files || []).slice(0, 16).forEach((f, i) => {
-      const card = new T.Mesh(
-        new T.BoxGeometry(1.5, 2.0, 0.08),
-        new T.MeshStandardMaterial({color: 0xcfd8e6, emissive: 0x223344,
-          emissiveIntensity: 0.3, roughness: 0.6}));
-      const ang = (i / 16) * Math.PI * 2;
-      const rad = 5.5 + (i % 3);
-      card.position.set(Math.cos(ang) * rad, Math.sin(ang * 1.7) * 3.5,
-                        Math.sin(ang) * rad - 2);
-      card.userData = {name: f.name, ang, rad, spin: 0.1 + Math.random() * 0.3};
-      docGroup.add(card);
-      docCards.push(card);
-    });
-  }).catch(() => {});
+  // Rebuilt when the head changes (#627) — the wall of documents IS the
+  // mind, so switching brains has to swap the paper too.
+  function rebuildDocs() {
+    while (docCards.length) {
+      const gone = docCards.pop();
+      docGroup.remove(gone);
+      if (gone.geometry) gone.geometry.dispose();
+      if (gone.material) gone.material.dispose();
+    }
+    api("/api/speakbox").then((d) => {
+      (d.files || []).slice(0, 16).forEach((f, i) => {
+        const card = new T.Mesh(
+          new T.BoxGeometry(1.5, 2.0, 0.08),
+          new T.MeshStandardMaterial({color: 0xcfd8e6, emissive: 0x223344,
+            emissiveIntensity: 0.3, roughness: 0.6}));
+        const ang = (i / 16) * Math.PI * 2;
+        const rad = 5.5 + (i % 3);
+        card.position.set(Math.cos(ang) * rad, Math.sin(ang * 1.7) * 3.5,
+                          Math.sin(ang) * rad - 2);
+        card.userData = {name: f.name, ang, rad,
+                         spin: 0.1 + Math.random() * 0.3};
+        docGroup.add(card);
+        docCards.push(card);
+      });
+      try { applyTheme(); } catch (e) {}
+    }).catch(() => {});
+  }
+  rebuildDocs();
 
   // --- held-message swarm (#541): lines that can't reach the box pile on
   // the hold shelf — show them as motes building up and undulating slowly
@@ -41388,6 +44077,33 @@ function mindOpen(opts) {
     cap.textContent = seen.join("\n");
     const act = (data.activity || {}).stage;
     if (act) phase.textContent = "● " + act;
+    // #634: what the desk did to the last take, as numbers the wave can be
+    // bent by. The waveform then MORPHS toward it in tick().
+    const rig = data.rig || {};
+    const perf = rig.perf || {};
+    bendWant.pace = Number(perf.pace) || 1;
+    bendWant.energy = Number(perf.energy) || 0;
+    bendWant.drive = Math.max(0, Math.min(1, (Number(perf.energy) || 0) * 3));
+    bendWant.ring = rig.vocode && rig.vocode !== "plain" ? 1 : 0;
+    bendWant.narrow = rig.phone ? 1 : 0;
+    bendWant.amp = 1 + (Number(perf.energy) || 0) * 0.6;
+    if (rig.at && rig.at !== lastRigAt) {
+      lastRigAt = rig.at;
+      if (rigIndex >= 0 && stations[rigIndex]) stations[rigIndex].active = 1;
+      // The engineering line, in the words the ticker already speaks.
+      const chain = [rig.engine || "voice",
+                     rig.vocode && rig.vocode !== "plain"
+                       ? "vocode(" + rig.vocode + ")" : "",
+                     rig.phone ? "phone" : "",
+                     rig.pitch ? "pitch " + (rig.pitch > 0 ? "+" : "")
+                       + rig.pitch + "st" : "",
+                     rig.strip ? "strip(" + rig.strip + ")" : "",
+                     rig.ms ? rig.ms + " ms" : "",
+                     rig.kb ? rig.kb + " KB" : ""].filter(Boolean);
+      seen.push("› rig · " + chain.join(" → "));
+      if (seen.length > 8) seen.splice(0, seen.length - 8);
+      cap.textContent = seen.join("\n");
+    }
   }
 
   // --- theme application: RADICALLY change the whole UI (#465, audit #5/#16)
@@ -41530,6 +44246,9 @@ function mindOpen(opts) {
     });
     buildField(th);                    // the ambient universe behind it all
     docCards.forEach((c) => c.material.emissive.setHex(th.fog));
+    // The two waveform traces take the theme too (#634).
+    waves.forEach((w) => w.line.material.color.setHex(
+      w.kind === "raw" ? th.a : th.b));
     packets.forEach((p) => {
       const col = p.kind === "drop" ? 0xff6a6a
         : p.kind === "air" ? th.b : th.a;
@@ -41543,7 +44262,7 @@ function mindOpen(opts) {
       card.style.boxShadow = "0 40px 120px rgba(0,0,0,.85), inset 0 0 90px "
         + aHex + "18";
     }
-    [themeSel, reelBtn, shut].forEach((b) => {
+    [themeSel, mindSel, reelBtn, shut].forEach((b) => {
       b.style.borderColor = aHex + "aa";
       b.style.color = th.lab;
       b.style.fontFamily = th.font;
@@ -41656,6 +44375,50 @@ function mindOpen(opts) {
     camera.position.set(Math.sin(yaw) * Math.cos(pitch) * dist,
       Math.sin(pitch) * dist + 3, Math.cos(yaw) * Math.cos(pitch) * dist);
     camera.lookAt(0, 0, 0);
+
+    // #634: the take, and the take after the desk got to it. The bend
+    // values lerp, so a fresh render MORPHS the second trace rather than
+    // snapping it — that is the transform made visible.
+    if (waves.length) {
+      for (const k of Object.keys(bend)) {
+        bend[k] += (bendWant[k] - bend[k]) * Math.min(1, dt * 3);
+      }
+      for (const wave of waves) {
+        const arr = wave.geo.attributes.position.array;
+        for (let i = 0; i < WAVE_N; i++) {
+          const u = i / (WAVE_N - 1);
+          let y = Math.sin(u * 15 * bend.pace + t * 3.2) * 0.9 * bend.amp;
+          y += Math.sin(u * 37 * bend.pace - t * 1.7) * 0.25;
+          if (wave.kind === "bent") {
+            // Compressed: the peaks flatten and the body comes up.
+            if (bend.drive > 0.01) {
+              const d = 1 + bend.drive * 2.4;
+              y = Math.tanh(y * d) * (0.72 + bend.drive * 0.18);
+            }
+            // A vocoder rings it — the carrier shows as a fast beat.
+            if (bend.ring > 0.01) {
+              y *= 1 - bend.ring * 0.4
+                + bend.ring * 0.4 * Math.sin(u * 90 + t * 6);
+            }
+            // The phone filter narrows the band: less body, more midrange.
+            if (bend.narrow > 0.01) {
+              y = y * (1 - bend.narrow * 0.45)
+                + Math.sin(u * 52 * bend.pace + t * 4) * bend.narrow * 0.3;
+            }
+            // Levelled at the end — the tail rides at a constant envelope.
+            if (u > 0.8) {
+              const flat = (u - 0.8) / 0.2;
+              y = y * (1 - flat) + Math.sign(y) * 0.42 * flat;
+            }
+          }
+          arr[i * 3 + 1] = 2.4 + y;
+        }
+        wave.geo.attributes.position.needsUpdate = true;
+        wave.line.material.opacity = 0.45
+          + (wave.kind === "bent" ? 0.35 : 0.2)
+          * (0.6 + 0.4 * Math.sin(t * 2));
+      }
+    }
 
     // Held messages build up and swirl slowly (#541) — ressynced ~1/s.
     if (t - heldSyncAt > 1) { heldSyncAt = t; heldSync(); }
@@ -49036,6 +51799,7 @@ function startLiveActivity() {
   // server's real routing and leaving fresh tabs silent, audit #2/#19).
   loadVotes();
   loadAds();
+  djBanLoad();
   djLoadLevels();
   studioJobsResume();
   layoutRestore();
@@ -49582,6 +52346,21 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     <button onclick="request()">Request</button>
   </div>
 
+  <!-- #632: shout at the booth, and react to it. -->
+  <div class="row" style="margin-top:8px">
+    <input id="say" placeholder="Say something to the DJs…"
+           onkeydown="if(event.key==='Enter')shout()">
+    <button onclick="shout()">Say it</button>
+  </div>
+  <div class="row" style="margin-top:6px;gap:4px">
+    <button onclick="shout('👏')" title="Applause">👏</button>
+    <button onclick="shout('🔥')" title="This one is hot">🔥</button>
+    <button onclick="shout('😂')" title="They are being funny">😂</button>
+    <button onclick="shout('😱')" title="What was that">😱</button>
+    <button onclick="shout('💀')" title="They have killed it">💀</button>
+    <button onclick="shout('❤️')" title="Love">❤️</button>
+  </div>
+
   <div class="patter" id="patter"></div>
   <div class="note" id="note"></div>
 </div>
@@ -49596,14 +52375,52 @@ const ME = sessionStorage.getItem("pbfm") ||
 let audio = null, voice = null, playing = false, trackId = "", voiceSeen = 0;
 let trackUrl = "";
 
+// A shared tune-in link hands this page a TOKEN, not the key (#632). It
+// looks like "<expiry>.<tag>.<signature>", so anything of that shape rides
+// as a ?t= query rather than an Authorization header — the handful of guest
+// routes accept it and nothing else will.
+const GUEST = /^\d+\.[a-f0-9]+\.[a-f0-9]+$/.test(String(KEY || ""));
+
 async function api(path, options = {}) {
-  options.headers = Object.assign({}, options.headers,
-    {"Authorization": "Bearer " + KEY});
-  if (options.body) options.headers["Content-Type"] = "application/json";
-  const response = await fetch(path, options);
+  let url = path;
+  if (GUEST) {
+    url += (path.indexOf("?") >= 0 ? "&" : "?")
+      + "t=" + encodeURIComponent(KEY);
+  } else {
+    options.headers = Object.assign({}, options.headers,
+      {"Authorization": "Bearer " + KEY});
+  }
+  if (options.body) {
+    options.headers = Object.assign({}, options.headers,
+      {"Content-Type": "application/json"});
+  }
+  const response = await fetch(url, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.detail || "Request failed");
   return data;
+}
+
+/* #632: the room can shout back. A reaction is a mood the show can feel; a
+ * line is read out on air and answered by name. */
+function shout(react) {
+  const who = (localStorage.pbfmName || "").trim() || "a listener";
+  const box = document.getElementById("say");
+  const text = react ? "" : ((box && box.value) || "").trim();
+  if (!react && !text) return;
+  api("/api/dj/shout", {method: "POST",
+    body: JSON.stringify({who, react: react || "", text})})
+    .then(() => {
+      if (box && !react) box.value = "";
+      const note = document.getElementById("note");
+      if (note) {
+        note.textContent = react
+          ? "sent" : "the booth has it — listen for your name";
+      }
+    })
+    .catch((e) => {
+      const note = document.getElementById("note");
+      if (note) note.textContent = e.message;
+    });
 }
 
 function clock(s) {
