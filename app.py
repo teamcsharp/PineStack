@@ -28031,6 +28031,70 @@ async def api_generate(
     return {"prompt_id": prompt_id, "model": model_name, "tags": prompt[:2000]}
 
 
+@app.get("/api/art/prompt")
+async def art_prompt_api(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The prompt behind a picture (#649).
+
+    If this station made it, the generation ledger still has the tags it was
+    ordered with. If it came from somewhere else, there is no prompt to
+    find — so the vision model LOOKS at it and writes one that would make
+    it again, which you can then edit and fire.
+    """
+    require_auth(authorization)
+    clean = re.sub(r"[^A-Za-z0-9._-]", "", str(name or ""))
+    path = COMFY_OUTPUT / clean
+    if not clean or not path.is_file():
+        # It may live in a subfolder of the output tree.
+        found = next((p for p in COMFY_OUTPUT.rglob(clean)
+                      if p.is_file()), None) if clean else None
+        if not found:
+            raise HTTPException(status_code=404, detail="No such picture")
+        path = found
+    for row in read_generations(400):
+        for made in (row.get("files") or []):
+            if str(made).rsplit("/", 1)[-1] == path.name:
+                tags = str(row.get("tags") or "").strip()
+                if tags:
+                    return {"name": path.name, "prompt": tags,
+                            "source": "the order it was made from",
+                            "request": str(row.get("request") or "")[:300]}
+    # Nothing on record — read it back off the pixels.
+    try:
+        blob = base64.b64encode(path.read_bytes()).decode()
+        async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
+            answer = await client.post(
+                f"{OLLAMA_URL}/api/chat",
+                json={"model": VISION_MODEL,
+                      "messages": [{
+                          "role": "user",
+                          "content": (
+                              "Write the image-generation prompt that would "
+                              "produce this picture. Comma-separated tags "
+                              "and short phrases only — subject, setting, "
+                              "lighting, colour, mood, style, composition. "
+                              "No sentences, no preamble, no explanation."),
+                          "images": [blob]}],
+                      "stream": False, "think": False, "keep_alive": "30m",
+                      "options": {"temperature": 0.4, "num_predict": 220}})
+            answer.raise_for_status()
+            said = ((answer.json().get("message") or {})
+                    .get("content") or "").strip()
+        said = re.sub(r"<think>.*?</think>", " ", said, flags=re.S)
+        said = " ".join(said.split())[:900]
+        if said:
+            return {"name": path.name, "prompt": said,
+                    "source": "read back off the picture itself"}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Nothing on record for it, and the vision model could "
+                   f"not look: {exc}") from exc
+    raise HTTPException(status_code=404, detail="No prompt could be found")
+
+
 @app.get("/api/pine-requests")
 async def pine_list(
     authorization: str | None = Header(default=None),
@@ -36402,8 +36466,10 @@ function djTalkRender(state) {
       im.src = "/api/generations/image/" + encodeURIComponent(n);
       im.title = n; im.loading = "lazy";
       im.style.cssText = "height:70px;border-radius:6px;flex:0 0 auto;"
-        + "border:1px solid var(--border);object-fit:cover";
+        + "border:1px solid var(--border);object-fit:cover;cursor:zoom-in";
       im.onerror = () => { im.style.display = "none"; };
+      im.title = n + " — open it";
+      im.onclick = () => artFullscreen(n);        // #649
       grow.appendChild(im);
     });
     log.appendChild(grow);
@@ -37809,6 +37875,81 @@ async function sfxInspect(sfxId) {
   document.body.appendChild(shade);
 }
 
+/* #649: a picture from the booth, full screen, with the prompt that made it
+ * — or, when nothing made it here, one read back off the pixels — editable
+ * and ready to fire again. */
+async function artFullscreen(name) {
+  const gone = document.getElementById("artFullOv");
+  if (gone) gone.remove();
+  const ov = el("div", "", "");
+  ov.id = "artFullOv";
+  ov.style.cssText = "position:fixed;inset:0;z-index:240;background:#000d;"
+    + "display:flex;flex-direction:column;align-items:center;"
+    + "justify-content:center;padding:18px;gap:10px";
+  ov.onclick = (e) => { if (e.target === ov) ov.remove(); };
+
+  const shot = document.createElement("img");
+  shot.src = "/api/generations/image/" + encodeURIComponent(name);
+  shot.style.cssText = "max-width:min(1200px,94vw);max-height:64vh;"
+    + "border-radius:10px;box-shadow:0 30px 90px rgba(0,0,0,.7)";
+  ov.appendChild(shot);
+
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(900px,94vw);margin:0;padding:12px 14px";
+  const top = el("div", "row", "");
+  top.style.cssText = "align-items:center;gap:8px";
+  const title = el("b", "", name);
+  title.style.cssText = "flex:1;min-width:0;overflow:hidden;font-size:12px;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  const shut = el("button", "", "✕");
+  shut.onclick = () => ov.remove();
+  top.appendChild(title); top.appendChild(shut);
+  card.appendChild(top);
+
+  const where = el("div", "muted", "looking for the prompt…");
+  where.style.cssText = "font-size:11px;margin:4px 0";
+  card.appendChild(where);
+  const prompt = el("textarea", "", "");
+  prompt.style.cssText = "width:100%;min-height:76px;font-size:12px";
+  prompt.placeholder = "the prompt…";
+  card.appendChild(prompt);
+
+  const acts = el("div", "row", "");
+  acts.style.marginTop = "8px";
+  const again = el("button", "primary", "🎨 Make it again");
+  const note = el("span", "muted", "");
+  note.style.cssText = "font-size:11px";
+  again.onclick = async () => {
+    const text = prompt.value.trim();
+    if (!text) { note.textContent = "Give it a prompt first."; return; }
+    again.disabled = true;
+    note.textContent = "◐ sent to the render machine…";
+    try {
+      const made = await api("/api/generate", {method: "POST",
+        body: JSON.stringify({prompt: text})});
+      note.textContent = "✓ rolling on " + (made.model || "the machine")
+        + " — it lands in the gallery";
+    } catch (e) { note.textContent = "✗ " + e.message; }
+    again.disabled = false;
+  };
+  acts.appendChild(again); acts.appendChild(note);
+  card.appendChild(acts);
+  ov.appendChild(card);
+  document.body.appendChild(ov);
+
+  try {
+    const got = await api("/api/art/prompt?name=" + encodeURIComponent(name));
+    prompt.value = got.prompt || "";
+    where.textContent = got.source === "the order it was made from"
+      ? "📋 the prompt it was made from"
+        + (got.request ? " · asked as: " + got.request : "")
+      : "👁 nothing on record for this one, so the vision model looked at it "
+        + "and wrote a prompt that would make it again";
+  } catch (e) {
+    where.textContent = "✗ " + e.message + " — write one yourself";
+  }
+}
+
 /* #632: where the station can be reached from, and links to hand out. */
 async function remotePanel() {
   const gone = document.getElementById("remoteModal");
@@ -38510,6 +38651,21 @@ async function djGuestRefresh() {
     + "style='width:100%;margin-bottom:5px'><textarea id='djGuestWhy' "
     + "placeholder='Why they are here' style='width:100%;height:52px;"
     + "margin-bottom:5px'></textarea><input type='hidden' id='djGuestId'>"
+    // #650: the guest's VOICE — one of the cloned ones, or a new one made
+    // right here from a link or a dropped file, named after the character.
+    + "<div style='font-size:12px;margin:8px 0 4px'>Their voice</div>"
+    + "<select id='djGuestVoice' style='width:100%;margin-bottom:5px'>"
+    + "<option value=''>— a voice picked for them —</option></select>"
+    + "<div class='muted' style='font-size:11px;margin-bottom:5px'>"
+    + "…or make one for them: paste a link to anything with their voice in "
+    + "it, or drop an audio file anywhere on this window. It gets named "
+    + "after the character.</div>"
+    + "<div style='display:flex;gap:5px;margin-bottom:5px'>"
+    + "<input id='djGuestUrl' placeholder='https://… their voice' "
+    + "style='flex:1;min-width:0'>"
+    + "<button onclick='djGuestVoiceFromUrl()'>Make it</button></div>"
+    + "<div id='djGuestVoiceNote' class='muted' style='font-size:11px;"
+    + "margin-bottom:5px'></div>"
     + "<button onclick='djGuestSave()'>Save guest</button></div>";
   if ((data.guests || []).length) {
     html += "<div style='margin-top:12px;font-size:13px'><b>Saved guests</b>"
@@ -38533,6 +38689,113 @@ async function djGuestRefresh() {
   body.classList.remove("muted");
   const on = document.getElementById("djGuestOn");
   if (on) on.onchange = () => djGuestToggle(on.checked);
+  // #650: fill the voice picker from the clone library, and let a file
+  // dropped anywhere on this window become the guest's voice.
+  djGuestVoicesFill();
+  const ov = document.getElementById("djGuestOv");
+  if (ov && typeof studioDropZone === "function" && !ov._guestDrop) {
+    ov._guestDrop = true;
+    ov.addEventListener("dragover", (e) => {
+      if (e.dataTransfer && Array.from(e.dataTransfer.types || [])
+          .includes("Files")) e.preventDefault();
+    });
+    ov.addEventListener("drop", (e) => {
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (!files || !files.length) return;
+      e.preventDefault(); e.stopPropagation();
+      djGuestVoiceFromFile(files[0]);
+    });
+  }
+}
+
+/* #650: the guest's voice. Either one you already have, or one made here
+ * out of a link or a dropped file — named after the character, because
+ * that is what you are actually creating. */
+async function djGuestVoicesFill(pick) {
+  const sel = document.getElementById("djGuestVoice");
+  if (!sel) return;
+  let voices = [];
+  try { voices = (await api("/api/voices")).voices || []; } catch (e) {}
+  const want = pick || sel.value || "";
+  sel.textContent = "";
+  const none = el("option", "", "— a voice picked for them —");
+  none.value = ""; sel.appendChild(none);
+  voices.filter((v) => v.has_reference).forEach((v) => {
+    const o = el("option", "", "🧬 " + v.name);
+    o.value = v.id;
+    if (v.id === want) o.selected = true;
+    sel.appendChild(o);
+  });
+}
+
+function djGuestVoiceName() {
+  const box = document.getElementById("djGuestName");
+  const name = ((box && box.value) || "").trim();
+  if (!name) {
+    setStatus("Name the character first — the voice is named after them",
+              true);
+    return "";
+  }
+  return name;
+}
+
+function djGuestVoiceWatch(jobId, name) {
+  const note = document.getElementById("djGuestVoiceNote");
+  const tick = setInterval(async () => {
+    let s;
+    try { s = await api("/api/voicelab/jobs/" + jobId); }
+    catch (e) { clearInterval(tick); return; }
+    const line = document.getElementById("djGuestVoiceNote") || note;
+    if (!line) { clearInterval(tick); return; }
+    if (s.harvested && s.voice_id) {
+      clearInterval(tick);
+      line.textContent = "✓ " + name + " has a voice now";
+      await djGuestVoicesFill(s.voice_id);
+      try { loadCloneVoices(); } catch (e) {}
+    } else if (s.stage === "error") {
+      clearInterval(tick);
+      line.textContent = "✗ " + (s.error || "it did not come through");
+    } else {
+      line.textContent = "◐ " + (s.stage || "working") + " · "
+        + Math.round((s.progress || 0) * 100) + "%"
+        + (s.note ? " — " + s.note : "");
+    }
+  }, 2500);
+}
+
+async function djGuestVoiceFromUrl() {
+  const name = djGuestVoiceName();
+  if (!name) return;
+  const box = document.getElementById("djGuestUrl");
+  const url = ((box && box.value) || "").trim();
+  const note = document.getElementById("djGuestVoiceNote");
+  if (!url) { if (note) note.textContent = "Paste a link first."; return; }
+  if (note) note.textContent = "◐ fetching their voice…";
+  try {
+    const got = await api("/api/voicelab/ingest", {method: "POST",
+      body: JSON.stringify({url, name, mode: "both"})});
+    if (box) box.value = "";
+    djGuestVoiceWatch(got.job_id, name);
+  } catch (e) { if (note) note.textContent = "✗ " + e.message; }
+}
+
+async function djGuestVoiceFromFile(file) {
+  const name = djGuestVoiceName();
+  if (!name || !file) return;
+  const note = document.getElementById("djGuestVoiceNote");
+  if (note) note.textContent = "◐ uploading " + file.name + "…";
+  try {
+    const got = await fetch("/api/voicelab/upload?mode=both&name="
+        + encodeURIComponent(name) + "&filename="
+        + encodeURIComponent(file.name), {
+      method: "POST",
+      headers: {"Authorization": "Bearer " + (key() || SERVER_KEY),
+                "Content-Type": "application/octet-stream"},
+      body: file,
+    });
+    if (!got.ok) throw new Error((await got.json()).detail || got.status);
+    djGuestVoiceWatch((await got.json()).job_id, name);
+  } catch (e) { if (note) note.textContent = "✗ " + e.message; }
 }
 
 async function djGuestToggle(on) {
@@ -38560,12 +38823,14 @@ function djGuestEdit(id) {
   document.getElementById("djGuestName").value = g.name || "";
   document.getElementById("djGuestWho").value = g.who || "";
   document.getElementById("djGuestWhy").value = g.why || "";
+  djGuestVoicesFill(g.voice || "");                  // #650
 }
 
 async function djGuestSave() {
   const g = (id) => (document.getElementById(id) || {}).value || "";
   const p = { id: g("djGuestId"), name: g("djGuestName"),
-              who: g("djGuestWho"), why: g("djGuestWhy") };
+              who: g("djGuestWho"), why: g("djGuestWhy"),
+              voice: g("djGuestVoice") };          // #650
   if (!p.name.trim()) { setStatus("A guest needs a name", true); return; }
   try {
     await api("/api/dj/guests",
