@@ -8106,7 +8106,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                                  if who == "third" else "DJ"),
                 "aired": "held",
             })
-            del _RADIO["chat"][:-120]
+            del _RADIO["chat"][:-240]
         else:
             note_drop(who, spoken, "the box was answering someone")
         return ""
@@ -8453,7 +8453,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # could say the same statement every call with nothing banning it.
     if who in ("dj", "cohost", "third", "caller") and not by_hand:
         said_remember(spoken)
-    del _RADIO["chat"][:-120]          # bounded — this runs for hours
+    del _RADIO["chat"][:-240]          # bounded — this runs for hours
     return spoken
 
 
@@ -8564,9 +8564,10 @@ def dj_state() -> dict[str, Any]:
         "speaking": bool(_SPEAKING[0]),
         # Which model is writing the lines, for the provenance card (#655).
         "model": str(load_settings().get("model") or ""),
-        # Eighty, not forty (#415): board hits were flooding the callers
-        # out of the booth window before anyone scrolled to them.
-        "chat": _RADIO["chat"][-80:],
+        # The booth keeps its own running history now (#656), but it can
+        # only keep what it is shown — so hand over a wide enough window
+        # that a chatty stretch between two polls cannot slip past it.
+        "chat": _RADIO["chat"][-160:],
         # How the booth reached the vector DB, most recent first (#595).
         "vector_access": (_RADIO.get("vector_access") or [])[:12],
         # The repair banner (#368, #369): fresh for three minutes after a
@@ -14115,7 +14116,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         "sfx_dir": sample.parent.name or "sfx",
         "url": f"/sfx/{key}?t={signature}",
     })
-    del _RADIO["chat"][:-120]
+    del _RADIO["chat"][:-240]
     note_activity("sting", sample.stem)
     # The stings are part of the broadcast, so the episode recording keeps them
     # too (#560) — staged from the SFX store, which lives outside /media.
@@ -24267,7 +24268,7 @@ async def dj_shout(
     _RADIO.setdefault("chat", []).append({
         "ts": int(time.time()), "who": "host", "kind": "callin",
         "text": f"📣 {who}: {text}"})
-    del _RADIO["chat"][:-120]
+    del _RADIO["chat"][:-240]
     note_action(f"📣 {who} shouted at the booth")
     # And the pair deal with it on air.
     if _RADIO.get("on"):
@@ -36381,6 +36382,12 @@ function djTalkPopup() {
   const grab = el("button", "", "⬇");
   grab.title = "Download the last stretch of the live broadcast";
   grab.onclick = (ev) => { ev.stopPropagation(); djTailPanel(head); };
+  // #656: the history is kept forever now, so there is a way to end it —
+  // and only this, never the window doing it on its own.
+  const wipe = el("button", "", "⌫");
+  wipe.title = "Clear the booth history — the only thing that empties this "
+    + "window";
+  wipe.onclick = (ev) => { ev.stopPropagation(); djTalkClear(); };
   const mute = el("button", "", "🔇");
   mute.title = "Stop showing this until the next session";
   mute.onclick = () => djTalkClose(true);
@@ -36393,6 +36400,7 @@ function djTalkPopup() {
   shut.onclick = () => djTalkClose(true);
   head.appendChild(title);
   head.appendChild(grab);
+  head.appendChild(wipe);
   head.appendChild(mute);
   head.appendChild(shut);
 
@@ -36427,15 +36435,48 @@ function djTalkPopup() {
   return box;
 }
 
+/* #656: the whole night, kept. The server only ever hands over the last
+ * eighty lines, so a busy show scrolled its own history off the end and the
+ * window looked like it was resetting itself. Everything that arrives is
+ * accumulated here instead, in order, and nothing is dropped until you
+ * press Clear. */
+let djTalkAll = [];
+const djTalkSeenIds = new Set();
+
+function djTalkAbsorb(lines) {
+  let added = 0;
+  lines.forEach((line) => {
+    // ts alone is not unique — two lines can land in the same second — so
+    // the key carries the speaker and the words as well.
+    const key = (line.ts || 0) + "|" + (line.who || "") + "|"
+      + (line.id || djTalkKey(line.text || "").slice(0, 40));
+    if (djTalkSeenIds.has(key)) return;
+    djTalkSeenIds.add(key);
+    djTalkAll.push(line);
+    added += 1;
+  });
+  return added;
+}
+
+function djTalkClear() {
+  djTalkAll = [];
+  djTalkSeenIds.clear();
+  const log = document.getElementById("djTalkLog");
+  if (log) log.textContent = "";
+  setStatus("Booth history cleared.");
+}
+
 function djTalkRender(state) {
   // The whole booth: the pair, the callers on the line, and the desk events
   // — a call landing, a news break, a tape arriving (#240).
-  const lines = (state.chat || []).filter(
+  const fresh_lines = (state.chat || []).filter(
     (line) => line.who === "dj" || line.who === "cohost"
       || line.who === "caller" || line.who === "third"
       || line.who === "drop" || line.kind === "sfx"
       || (line.who === "host"
           && /^(call|callin|news|request|played)$/.test(line.kind || "")));
+  djTalkAbsorb(fresh_lines);
+  const lines = djTalkAll;
   if (!lines.length) return;
 
   const newest = lines[lines.length - 1].ts || 0;
@@ -36460,6 +36501,13 @@ function djTalkRender(state) {
     const vEsc = (s) => String(s == null ? "" : s).replace(/[&<>]/g,
       (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
     const vwrap = el("details", "", "");
+    // #657: the window is rebuilt every poll, which was slamming this shut
+    // while you were still reading it. Whether it is open is YOUR decision,
+    // so it is remembered and put back.
+    vwrap.open = localStorage.djVectorOpen === "1";
+    vwrap.ontoggle = () => {
+      localStorage.djVectorOpen = vwrap.open ? "1" : "0";
+    };
     vwrap.style.cssText = "margin:0 0 6px;padding:4px 7px;border-radius:6px;"
       + "background:#0c1420;border:1px solid var(--border);font-size:11px";
     const sum = el("summary", "", "🧬 Vector access · " + va.length
@@ -36503,7 +36551,8 @@ function djTalkRender(state) {
     });
     log.appendChild(grow);
   }
-  lines.slice(-80).forEach((line) => {
+  // Everything, in perpetuity (#656) — no tail slice, nothing cut off.
+  lines.forEach((line) => {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
       + "padding:3px 4px;border-radius:5px";
