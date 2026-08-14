@@ -4756,9 +4756,176 @@ def _magicdns_name() -> str:
     return ""
 
 
-def remote_access() -> dict[str, Any]:
-    """Every address this station answers on, and what is carrying them."""
-    if time.time() - float(_NET_CACHE.get("at") or 0) < 45:
+def _iface_present(name: str = "tailscale0") -> bool:
+    """Is the interface there at all? Distinct from it having an address.
+
+    This is the difference between 'tailscale is not installed' and
+    'tailscale is installed and running but nobody has signed it in', which
+    from the outside look identical — both have no tailnet address. The
+    container shares the host's network namespace, so /proc/net/dev is the
+    HOST's interface list and tailscaled creates tailscale0 the moment the
+    daemon starts, before any login."""
+    try:
+        for line in Path("/proc/net/dev").read_text().splitlines()[2:]:
+            if line.split(":")[0].strip() == name:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _ssh_target() -> str:
+    """user@host to reach this box from somewhere else.
+
+    The username has to be handed in (SPARK_HOST_USER, set from ${USER} in
+    compose). The container can see the host user's uid on the bind mounts
+    but resolves names against its OWN /etc/passwd, where that account does
+    not exist — so a uid lookup here returns nothing useful. When it is
+    genuinely unknown the placeholder is left visible rather than quietly
+    dropped, because `ssh 10.0.0.1` silently tries the wrong account and
+    fails with a password prompt that explains nothing."""
+    import socket
+    user = os.getenv("SPARK_HOST_USER", "").strip()
+    host = _route_source_ip() or ""
+    try:
+        host = host or socket.gethostname()
+    except Exception:
+        pass
+    host = host or "the-box"
+    return f"{user}@{host}" if user else f"YOUR-USERNAME@{host}"
+
+
+def _pending_login_url() -> str:
+    """A tailscale login URL parked for us, if there is one.
+
+    `tailscale up` prints an approval link and then waits. When it is run
+    detached on the host, that link is the only useful thing it produces and
+    it scrolls away into a log nobody reads — so if it is dropped here the
+    panel turns it into a single click. Nothing writes this file
+    automatically; it exists so a login started from the host side can be
+    finished from the browser."""
+    try:
+        raw = Path("/app/data/tailscale_login.txt").read_text().strip()
+    except Exception:
+        return ""
+    for word in raw.split():
+        if word.startswith("https://login.tailscale.com/"):
+            return word
+    return ""
+
+
+def remote_stages() -> list[dict[str, Any]]:
+    """The road from 'only on this network' to 'reachable from anywhere', one
+    stage at a time, each one saying where it actually stands right now.
+
+    #659: the panel used to hand over a single install line and leave the
+    rest to the reader. It could not say which half was already done, so a
+    box that had tailscale installed and merely needed signing in was told to
+    install it again. Every stage here is *measured*, not assumed.
+
+    #659 again: the commands are Windows-PowerShell-safe. The reported
+    failure was `curl ... | sh && sudo tailscale up` pasted into PowerShell,
+    which has no `&&` — it is a parser error before anything runs. So each
+    stage carries exactly one command, and it is an ssh one-liner, because
+    the person reading this panel is at a browser on their laptop, not
+    sitting at the box's console."""
+    v4, v6 = _tailnet_ips()
+    magic = _magicdns_name()
+    daemon = _iface_present() or bool(v4)
+    tgt = _ssh_target()
+    return [
+        {
+            "key": "install",
+            "title": "Tailscale on the box",
+            "done": daemon,
+            "state": ("running" if daemon else "missing"),
+            "detail": (
+                "The daemon is up — tailscale0 exists on the host."
+                if daemon else
+                "No tailscale0 interface on the host, so the daemon is not "
+                "running. It installs on the BOX; this container has no "
+                "binary and cannot reach tailscaled's socket."),
+            "cmd": f'ssh {tgt} "curl -fsSL https://tailscale.com/install.sh | sh"',
+            "note": "Run this from PowerShell on your laptop. One command, "
+                    "no && — PowerShell 5 treats && as a parser error, which "
+                    "is what bit you last time.",
+            "link": "https://tailscale.com/kb/1031/install-linux",
+            "link_text": "Tailscale · installing on Linux",
+            "mine": False,
+        },
+        {
+            "key": "login",
+            "title": "Signed in to your tailnet",
+            "done": bool(v4),
+            "state": ("up" if v4 else ("logged-out" if daemon else "waiting")),
+            "detail": (
+                f"On the tailnet as {v4}." if v4 else
+                "Installed and running, but logged out — it has no tailnet "
+                "address until a person approves it."
+                if daemon else
+                "Nothing to sign in until the daemon is running."),
+            "cmd": f'ssh -t {tgt} "sudo tailscale up"',
+            "note": "It prints a login link — open it and approve the "
+                    "machine. This step authenticates as YOU against your "
+                    "own account, so it is the one thing here I will not do "
+                    "on your behalf. If ssh asks about a host key the first "
+                    "time, answer yes; if it asks for a password, that is "
+                    "your account on the box, not the tailnet.",
+            # If a login was started out of band and parked its URL here, the
+            # panel turns it into one click instead of a command to re-run.
+            "auth_url": ("" if v4 else _pending_login_url()),
+            "link": "https://login.tailscale.com/admin/machines",
+            "link_text": "Your tailnet · machines",
+            "mine": False,
+        },
+        {
+            "key": "name",
+            "title": "A name that follows it anywhere",
+            "done": bool(magic),
+            "state": ("on" if magic else "off"),
+            "detail": (
+                f"MagicDNS is on — this station answers to {magic}."
+                if magic else
+                "MagicDNS is off, so links have to use the raw tailnet "
+                "address. It works, it is just uglier and it moves if the "
+                "machine is re-added."),
+            "cmd": "",
+            "note": "Turn on MagicDNS once in the admin console and it "
+                    "applies to every machine on the tailnet.",
+            "link": "https://login.tailscale.com/admin/dns",
+            "link_text": "Your tailnet · DNS settings",
+            "mine": False,
+        },
+        {
+            "key": "share",
+            "title": "Links that reach from anywhere",
+            "done": bool(v4),
+            "state": ("ready" if v4 else "local-only"),
+            "detail": (
+                "Tune-in links are built on the tailnet address, so they "
+                "work from any device you have signed in — phone on mobile "
+                "data included."
+                if v4 else
+                "Tune-in links still work, but only for someone already on "
+                "this network. Off it, they resolve to nothing."),
+            "cmd": "",
+            "note": "This one is mine, and it is already wired: the moment "
+                    "the tailnet comes up, every new link uses it. Nothing "
+                    "to run.",
+            "link": "",
+            "link_text": "",
+            "mine": True,
+        },
+    ]
+
+
+def remote_access(fresh: bool = False) -> dict[str, Any]:
+    """Every address this station answers on, and what is carrying them.
+
+    #659: the cache is short and skippable. The panel polls this while the
+    reader is part-way through the setup, and a stage that stayed "not done"
+    for 45s after they finished it reads as the command having failed."""
+    if not fresh and time.time() - float(_NET_CACHE.get("at") or 0) < 8:
         return _NET_CACHE["data"]
     import socket
     lan = _route_source_ip()
@@ -4781,19 +4948,30 @@ def remote_access() -> dict[str, Any]:
     if magic:
         urls.append({"label": "MagicDNS", "kind": "tailscale",
                      "url": f"http://{magic}:{STATION_PORT}"})
+    stages = remote_stages()
+    daemon = _iface_present() or bool(v4)
+    left = [s for s in stages if not s["done"] and not s["mine"]]
     data = {
         "port": STATION_PORT,
         "lan_ip": lan,
         "hostname": host,
         "tailscale": {"up": bool(v4), "ip": v4, "ip6": v6,
-                      "magicdns": magic},
+                      "magicdns": magic, "daemon": daemon},
         "urls": urls,
-        "why": "" if v4 else
+        "stages": stages,
+        "ssh_target": _ssh_target(),
+        "next": (left[0] if left else None),
+        "done_count": sum(1 for s in stages if s["done"]),
+        "why": "" if v4 else (
+               "Tailscale is installed and running on the box, but it is "
+               "logged out — one command signs it in."
+               if daemon else
                "No tailnet on this box yet. Tailscale has to be installed on "
                "the HOST, not in this container — there is no binary in the "
-               "image and tailscaled's socket is not mounted.",
-        "install_cmd": "curl -fsSL https://tailscale.com/install.sh | sh "
-                       "&& sudo tailscale up",
+               "image and tailscaled's socket is not mounted."),
+        # #659: single command, no `&&`. PowerShell 5 cannot parse `&&` and
+        # fails before running anything, which is exactly what happened.
+        "install_cmd": (left[0]["cmd"] if left and left[0]["cmd"] else ""),
         "warning": "Everything on this box rides the same host network: "
                    "Home Assistant, ComfyUI, the voice engines and the "
                    "search box are all reachable to anyone you invite onto "
@@ -24150,12 +24328,16 @@ async def radio_cache_broadcast_api(
 
 @app.get("/api/remote")
 async def remote_api(
+    fresh: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """Where the station is reachable from (#632). Operator only — a guest
-    has no business seeing the topology."""
+    has no business seeing the topology.
+
+    #659: `fresh=1` skips the cache, so the panel watching someone work
+    through the setup sees a stage flip the moment it actually flips."""
     require_auth(authorization)
-    return await asyncio.to_thread(remote_access)
+    return await asyncio.to_thread(remote_access, bool(fresh))
 
 
 @app.get("/api/share")
@@ -38051,7 +38233,291 @@ async function remoteDotPaint() {
   } catch (e) { /* the button still opens the panel */ }
 }
 
-/* #632: where the station can be reached from, and links to hand out. */
+/* #660: one way to copy, and it is "click the thing". Any element can be
+ * made to carry a payload; clicking anywhere on it takes it, and the element
+ * says so itself rather than relying on a separate button lighting up. */
+function copyable(node, text, label) {
+  if (!node || !text) return node;
+  node.dataset.copy = text;
+  node.style.cursor = "copy";
+  node.title = "click to copy" + (label ? " — " + label : "");
+  node.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    let ok = true;
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch (e) {
+      // Clipboard is refused on insecure origins and in some embeddings.
+      // Selecting the text still lets ctrl-C finish the job.
+      ok = false;
+      if (node.tagName === "INPUT") { node.focus(); node.select(); }
+      else {
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const sel = window.getSelection();
+        sel.removeAllRanges(); sel.addRange(range);
+      }
+    }
+    copyBlip(node, ok ? "copied" : "select and press ctrl-C", ok);
+  });
+  return node;
+}
+
+/* A copy needs to be felt, not guessed at — the mark lands on the thing you
+ * actually clicked, so there is no hunting for which field took. */
+function copyBlip(node, words, ok) {
+  const spot = node.getBoundingClientRect();
+  const tag = document.createElement("div");
+  tag.textContent = (ok ? "✓ " : "⚠ ") + words;
+  tag.style.cssText = "position:fixed;z-index:400;pointer-events:none;"
+    + "font-size:11px;font-weight:700;padding:3px 8px;border-radius:7px;"
+    + "background:" + (ok ? "#0f2f1e" : "#3a2412") + ";color:"
+    + (ok ? "#5ce8a4" : "#ffc06a") + ";border:1px solid "
+    + (ok ? "#1d6b45" : "#7a4a1c") + ";box-shadow:0 6px 20px #0009;"
+    + "left:" + (spot.left + spot.width / 2) + "px;top:" + spot.top + "px;"
+    + "transform:translate(-50%,-118%);opacity:0;"
+    + "transition:opacity .12s ease,transform .34s ease";
+  document.body.appendChild(tag);
+  requestAnimationFrame(() => {
+    tag.style.opacity = "1";
+    tag.style.transform = "translate(-50%,-165%)";
+  });
+  const glow = node.style.boxShadow;
+  node.style.boxShadow = "0 0 0 2px " + (ok ? "#2ee08a88" : "#ffb45488");
+  setTimeout(() => { node.style.boxShadow = glow; }, 520);
+  setTimeout(() => {
+    tag.style.opacity = "0";
+    setTimeout(() => tag.remove(), 260);
+  }, 1150);
+}
+
+/* #660: the setup drawn as a plexus — a node per stage, wired together, the
+ * wire between two stages only carrying light once the earlier one is done.
+ * It is an infographic that reads at a glance: how far along the box is, and
+ * which node the work is sitting at right now. */
+function remotePlexus(host, stages) {
+  if (!window.THREE) { host.style.display = "none"; return {update() {}, stop() {}}; }
+  const W = () => host.clientWidth || 560;
+  const H = 200;
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x02050c, 0.021);
+  const camera = new THREE.PerspectiveCamera(45, W() / H, 0.1, 300);
+  camera.position.set(0, 0, 27);
+  let renderer;
+  try {
+    renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
+  } catch (e) { host.style.display = "none"; return {update() {}, stop() {}}; }
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  renderer.setSize(W(), H, false);
+  renderer.setClearColor(0x02050c, 1);
+  host.textContent = "";
+  host.appendChild(renderer.domElement);
+  renderer.domElement.style.cssText = "width:100%;height:" + H + "px;"
+    + "display:block;border-radius:10px";
+
+  const DONE = 0x2ee08a, NOW = 0xffb454, WAIT = 0x35486a, MINE = 0x6aa8ff;
+
+  // The drifting field the wires are drawn through.
+  const N = 110;
+  const seeds = [];
+  const cloud = new Float32Array(N * 3);
+  for (let i = 0; i < N; i++) {
+    seeds.push({
+      x: (Math.random() - 0.5) * 40, y: (Math.random() - 0.5) * 15,
+      z: (Math.random() - 0.5) * 13,
+      vx: (Math.random() - 0.5) * 0.017, vy: (Math.random() - 0.5) * 0.014,
+      vz: (Math.random() - 0.5) * 0.012,
+    });
+  }
+  const cg = new THREE.BufferGeometry();
+  cg.setAttribute("position", new THREE.BufferAttribute(cloud, 3));
+  scene.add(new THREE.Points(cg, new THREE.PointsMaterial({
+    color: 0x5f83b8, size: 0.20, transparent: true, opacity: 0.62,
+    sizeAttenuation: true,
+  })));
+
+  // Plexus threads between near neighbours — capped so a busy frame cannot
+  // run away with the frame budget.
+  const MAXL = 900;
+  const linkPos = new Float32Array(MAXL * 6);
+  const lg = new THREE.BufferGeometry();
+  lg.setAttribute("position", new THREE.BufferAttribute(linkPos, 3));
+  const links = new THREE.LineSegments(lg, new THREE.LineBasicMaterial({
+    color: 0x2f4f7d, transparent: true, opacity: 0.35,
+  }));
+  scene.add(links);
+
+  const label = (text, colour) => {
+    const c = document.createElement("canvas");
+    const ctx = c.getContext("2d");
+    const font = "600 34px system-ui, -apple-system, sans-serif";
+    ctx.font = font;
+    c.width = Math.ceil(ctx.measureText(text).width) + 26;
+    c.height = 52;
+    ctx.font = font;                   // a resize wipes the context state
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = colour;
+    ctx.shadowColor = colour; ctx.shadowBlur = 14;
+    ctx.fillText(text, 13, 27);
+    const tex = new THREE.CanvasTexture(c);
+    tex.minFilter = THREE.LinearFilter;
+    if (THREE.SRGBColorSpace) tex.colorSpace = THREE.SRGBColorSpace;
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: tex, transparent: true, depthWrite: false,
+    }));
+    sp.scale.set(2.6 * c.width / c.height, 2.6, 1);
+    return sp;
+  };
+
+  const nodes = [];
+  const span = 10.4;
+  const first = -((stages.length - 1) * span) / 2;
+  stages.forEach((st, i) => {
+    const g = new THREE.Group();
+    g.position.set(first + i * span, 1.4, 0);
+    const core = new THREE.Mesh(
+      new THREE.SphereGeometry(1.15, 26, 20),
+      new THREE.MeshBasicMaterial({color: WAIT}));
+    const halo = new THREE.Mesh(
+      new THREE.SphereGeometry(1.95, 22, 16),
+      new THREE.MeshBasicMaterial({
+        color: WAIT, transparent: true, opacity: 0.17,
+        side: THREE.BackSide,
+      }));
+    g.add(core); g.add(halo);
+    const cap = label(String(i + 1) + ". " + st.title, "#dce9ff");
+    cap.position.set(0, -3.4, 0);
+    g.add(cap);
+    scene.add(g);
+    nodes.push({group: g, core, halo, cap, stage: st});
+  });
+
+  // The track between stages: lit segment by segment as each one lands.
+  const wires = [];
+  for (let i = 0; i + 1 < nodes.length; i++) {
+    const a = nodes[i].group.position, b = nodes[i + 1].group.position;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(
+      new Float32Array([a.x, a.y, 0, b.x, b.y, 0]), 3));
+    const wire = new THREE.Line(geo, new THREE.LineBasicMaterial({
+      color: WAIT, transparent: true, opacity: 0.5,
+    }));
+    scene.add(wire);
+    wires.push(wire);
+  }
+
+  // A spark that runs the track as far as the work has actually got.
+  const sparkGeo = new THREE.BufferGeometry();
+  sparkGeo.setAttribute("position", new THREE.BufferAttribute(
+    new Float32Array(3), 3));
+  const spark = new THREE.Points(sparkGeo, new THREE.PointsMaterial({
+    color: NOW, size: 0.85, transparent: true, opacity: 0.95,
+  }));
+  scene.add(spark);
+
+  let state = stages.slice();
+  const apply = (next) => {
+    state = next;
+    nodes.forEach((n, i) => {
+      const st = next[i] || n.stage;
+      n.stage = st;
+      const colour = st.done ? (st.mine ? MINE : DONE)
+        : (next.findIndex((s) => !s.done && !s.mine) === i ? NOW : WAIT);
+      n.core.material.color.setHex(colour);
+      n.halo.material.color.setHex(colour);
+      n.halo.material.opacity = st.done ? 0.22 : 0.14;
+    });
+    wires.forEach((w, i) => {
+      const lit = (next[i] || {}).done;
+      w.material.color.setHex(lit ? DONE : WAIT);
+      w.material.opacity = lit ? 0.85 : 0.32;
+    });
+  };
+  apply(stages);
+
+  let alive = true, tick = 0;
+  const frame = () => {
+    if (!alive) return;
+    requestAnimationFrame(frame);
+    tick += 0.016;
+    for (let i = 0; i < N; i++) {
+      const p = seeds[i];
+      p.x += p.vx; p.y += p.vy; p.z += p.vz;
+      if (p.x < -20 || p.x > 20) p.vx *= -1;
+      if (p.y < -7.5 || p.y > 7.5) p.vy *= -1;
+      if (p.z < -6.5 || p.z > 6.5) p.vz *= -1;
+      cloud[i * 3] = p.x; cloud[i * 3 + 1] = p.y; cloud[i * 3 + 2] = p.z;
+    }
+    cg.attributes.position.needsUpdate = true;
+
+    let n = 0;
+    for (let i = 0; i < N && n < MAXL; i++) {
+      for (let j = i + 1; j < N && n < MAXL; j++) {
+        const dx = cloud[i * 3] - cloud[j * 3];
+        const dy = cloud[i * 3 + 1] - cloud[j * 3 + 1];
+        const dz = cloud[i * 3 + 2] - cloud[j * 3 + 2];
+        if (dx * dx + dy * dy + dz * dz > 12.5) continue;
+        linkPos[n * 6] = cloud[i * 3];
+        linkPos[n * 6 + 1] = cloud[i * 3 + 1];
+        linkPos[n * 6 + 2] = cloud[i * 3 + 2];
+        linkPos[n * 6 + 3] = cloud[j * 3];
+        linkPos[n * 6 + 4] = cloud[j * 3 + 1];
+        linkPos[n * 6 + 5] = cloud[j * 3 + 2];
+        n++;
+      }
+    }
+    lg.setDrawRange(0, n * 2);
+    lg.attributes.position.needsUpdate = true;
+
+    // The node being worked on breathes; the finished ones sit still.
+    const at = state.findIndex((s) => !s.done && !s.mine);
+    nodes.forEach((nd, i) => {
+      const beat = i === at ? 1 + Math.sin(tick * 3.1) * 0.13 : 1;
+      nd.core.scale.setScalar(beat);
+      nd.halo.scale.setScalar(i === at ? 1 + Math.sin(tick * 3.1) * 0.2 : 1);
+      nd.group.rotation.y = Math.sin(tick * 0.5 + i) * 0.16;
+    });
+
+    const reach = at < 0 ? nodes.length - 1 : at;
+    if (reach > 0) {
+      const run = (tick * 0.45) % 1;
+      const a = nodes[0].group.position, b = nodes[reach].group.position;
+      const arr = sparkGeo.attributes.position.array;
+      arr[0] = a.x + (b.x - a.x) * run;
+      arr[1] = a.y + (b.y - a.y) * run;
+      arr[2] = 0;
+      sparkGeo.attributes.position.needsUpdate = true;
+      spark.visible = true;
+    } else { spark.visible = false; }
+
+    camera.position.x = Math.sin(tick * 0.19) * 1.5;
+    camera.lookAt(0, 0.6, 0);
+    renderer.render(scene, camera);
+  };
+  frame();
+
+  const resize = () => {
+    if (!alive) return;
+    camera.aspect = W() / H;
+    camera.updateProjectionMatrix();
+    renderer.setSize(W(), H, false);
+  };
+  addEventListener("resize", resize);
+
+  return {
+    update: apply,
+    stop() {
+      alive = false;
+      removeEventListener("resize", resize);
+      try { renderer.dispose(); } catch (e) {}
+    },
+  };
+}
+
+/* #632: where the station can be reached from, and links to hand out.
+ * #659/#660: it now measures its own setup, says which step is outstanding,
+ * hands over a command that runs in the shell you are actually standing in,
+ * and copies anything you click. */
 async function remotePanel() {
   const gone = document.getElementById("remoteModal");
   if (gone) { gone.remove(); return; }
@@ -38083,27 +38549,23 @@ async function remotePanel() {
   catch (e) { body.textContent = e.message; return; }
   body.textContent = "";
 
-  const row = (label, value, copy) => {
+  /* #660: the whole row copies — the label, the field, the padding between
+   * them. The button stays because it names the gesture for anyone who does
+   * not think to try the field itself. */
+  const row = (label, value, copy, into) => {
     const line = el("div", "studio-srow", "");
     line.appendChild(el("label", "", label));
     const box = el("input", "", "");
     box.type = "text"; box.readOnly = true; box.value = value;
-    box.style.cssText = "flex:1;min-width:0;font-size:11px";
-    box.onclick = () => box.select();
+    box.style.cssText = "flex:1;min-width:0;font-size:11px;cursor:copy";
     line.appendChild(box);
     if (copy) {
       const btn = el("button", "", "copy");
-      btn.style.fontSize = "11px";
-      btn.onclick = async () => {
-        try {
-          await navigator.clipboard.writeText(value);
-          btn.textContent = "copied";
-          setTimeout(() => { btn.textContent = "copy"; }, 1400);
-        } catch (e) { box.select(); }
-      };
+      btn.style.cssText = "font-size:11px;pointer-events:none";
       line.appendChild(btn);
     }
-    body.appendChild(line);
+    copyable(line, value, label);
+    (into || body).appendChild(line);
     return box;
   };
 
@@ -38111,20 +38573,150 @@ async function remotePanel() {
   body.lastChild.style.cssText = "font-weight:700;margin-bottom:4px";
   (net.urls || []).forEach((u) => row(u.label, u.url, true));
 
-  body.appendChild(el("div", "", "Tailscale"));
-  body.lastChild.style.cssText = "font-weight:700;margin:12px 0 4px";
-  const ts = net.tailscale || {};
-  const state = el("div", "muted", ts.up
-    ? "✓ on the tailnet as " + ts.ip + (ts.magicdns ? " · " + ts.magicdns : "")
-    : "✗ " + (net.why || "not running"));
-  state.style.cssText = "font-size:11px;line-height:1.5";
-  body.appendChild(state);
-  if (!ts.up) {
-    body.appendChild(el("div", "muted",
-      "Run this ON THE BOX, not in the container:"));
-    body.lastChild.style.cssText = "font-size:11px;margin-top:6px";
-    row("install", net.install_cmd, true);
-  }
+  /* #659/#660: the setup, measured rather than assumed, over a plexus that
+   * shows how far along it is. */
+  body.appendChild(el("div", "", "Getting it out of this network"));
+  body.lastChild.style.cssText = "font-weight:700;margin:14px 0 6px";
+
+  const stageArt = el("div", "", "");
+  stageArt.style.cssText = "border:1px solid var(--border);border-radius:10px;"
+    + "overflow:hidden;background:#02050c";
+  body.appendChild(stageArt);
+  const art = remotePlexus(stageArt, net.stages || []);
+
+  const tally = el("div", "muted", "");
+  tally.style.cssText = "font-size:11px;margin:6px 0 4px;line-height:1.5";
+  body.appendChild(tally);
+
+  const recheck = el("button", "", "check again now");
+  recheck.style.cssText = "font-size:10.5px;margin:0 0 8px";
+  body.appendChild(recheck);
+
+  const stageWrap = el("div", "", "");
+  body.appendChild(stageWrap);
+
+  const pill = (text, tone) => {
+    const p = el("span", "", text);
+    const skin = {
+      done: ["#0f2f1e", "#5ce8a4", "#1d6b45"],
+      now: ["#3a2a12", "#ffc06a", "#7a5a1c"],
+      wait: ["#141b27", "#7f93ad", "#2a3548"],
+      mine: ["#0f1f36", "#7fb4ff", "#22436f"],
+    }[tone] || ["#141b27", "#7f93ad", "#2a3548"];
+    p.style.cssText = "font-size:10px;font-weight:700;padding:2px 7px;"
+      + "border-radius:999px;background:" + skin[0] + ";color:" + skin[1]
+      + ";border:1px solid " + skin[2] + ";white-space:nowrap";
+    return p;
+  };
+
+  const drawStages = (data) => {
+    const stages = data.stages || [];
+    stageWrap.textContent = "";
+    const at = stages.findIndex((s) => !s.done && !s.mine);
+    const left = stages.filter((s) => !s.done && !s.mine).length;
+    tally.textContent = left === 0
+      ? "✓ All " + stages.length + " stages are up. This station answers from "
+        + "anywhere you are signed in."
+      : (data.done_count || 0) + " of " + stages.length + " done · "
+        + left + " left, and step " + (at + 1) + " is the one in the way. "
+        + "Nothing below runs itself — each is one line you paste.";
+
+    stages.forEach((st, i) => {
+      const card = el("div", "", "");
+      const live = i === at;
+      card.style.cssText = "border:1px solid " + (live ? "#7a5a1c"
+        : (st.done ? "#1d6b45" : "var(--border)")) + ";border-radius:9px;"
+        + "padding:9px 10px;margin-bottom:7px;background:"
+        + (live ? "#170f04" : "transparent");
+
+      const top = el("div", "row", "");
+      top.style.cssText = "align-items:center;gap:7px;margin-bottom:4px";
+      const dot = el("span", "", st.done ? "✓" : (live ? "▶" : "○"));
+      dot.style.cssText = "font-size:13px;color:"
+        + (st.done ? "#5ce8a4" : (live ? "#ffc06a" : "#5c6b82"));
+      top.appendChild(dot);
+      const name = el("span", "", (i + 1) + ". " + st.title);
+      name.style.cssText = "flex:1;font-weight:700;font-size:12px";
+      top.appendChild(name);
+      top.appendChild(pill(st.state, st.done ? (st.mine ? "mine" : "done")
+        : (live ? "now" : "wait")));
+      card.appendChild(top);
+
+      const detail = el("div", "muted", st.detail || "");
+      detail.style.cssText = "font-size:11px;line-height:1.55";
+      card.appendChild(detail);
+
+      // A login already waiting on approval beats telling them to start one.
+      if (st.auth_url && !st.done) {
+        const go = el("a", "primary", "→ Approve this machine");
+        go.href = st.auth_url; go.target = "_blank"; go.rel = "noopener";
+        go.style.cssText = "display:block;text-align:center;margin:7px 0 4px;"
+          + "padding:7px;border-radius:8px;background:#1d4ed8;color:#fff;"
+          + "font-weight:700;font-size:12px;text-decoration:none";
+        card.appendChild(go);
+        const also = el("div", "muted",
+          "A login is already open and waiting on you — this link finishes "
+          + "it. No command to run.");
+        also.style.cssText = "font-size:10.5px;line-height:1.5";
+        card.appendChild(also);
+        row("or copy the link", st.auth_url, true, card);
+      } else if (st.cmd && !st.done) {
+        row("run", st.cmd, true, card);
+      }
+      if (st.note) {
+        const note = el("div", "muted", (st.mine ? "🔧 " : "↳ ") + st.note);
+        note.style.cssText = "font-size:10.5px;line-height:1.5;margin-top:5px;"
+          + "opacity:.85";
+        card.appendChild(note);
+      }
+      if (st.link) {
+        const a = el("a", "", st.link_text || st.link);
+        a.href = st.link; a.target = "_blank"; a.rel = "noopener";
+        a.style.cssText = "font-size:10.5px;display:inline-block;margin-top:5px";
+        card.appendChild(a);
+      }
+      stageWrap.appendChild(card);
+    });
+  };
+  drawStages(net);
+
+  /* #659: it watches. Run the command in another window and the stage flips
+   * here on its own — no reopening the panel to find out whether it took. */
+  const watch = setInterval(async () => {
+    if (!document.body.contains(shade)) {
+      clearInterval(watch); art.stop(); return;
+    }
+    try {
+      const now = await api("/api/remote?fresh=1");
+      const before = (net.stages || []).map((s) => s.done).join();
+      const after = (now.stages || []).map((s) => s.done).join();
+      net = now;
+      if (before !== after) {
+        drawStages(now);
+        art.update(now.stages || []);
+        remoteDotPaint();
+        setStatus("remote access moved on — " + (now.next
+          ? "next: " + now.next.title
+          : "everything is up, links reach from anywhere now"));
+      }
+    } catch (e) { /* a poll that misses is not worth a noise */ }
+  }, 4000);
+  shut.addEventListener("click", () => { clearInterval(watch); art.stop(); });
+
+  recheck.onclick = async () => {
+    recheck.disabled = true;
+    recheck.textContent = "looking…";
+    try {
+      net = await api("/api/remote?fresh=1");
+      drawStages(net);
+      art.update(net.stages || []);
+      remoteDotPaint();
+      setStatus(net.next ? "still waiting on: " + net.next.title
+        : "everything is up — links reach from anywhere");
+    } catch (e) { setStatus(e.message, true); }
+    recheck.disabled = false;
+    recheck.textContent = "check again now";
+  };
 
   const warn = el("div", "muted", "⚠ " + (net.warning || ""));
   warn.style.cssText = "font-size:11px;line-height:1.5;margin:10px 0;"
@@ -38151,12 +38743,10 @@ async function remotePanel() {
       line.style.cssText = "align-items:baseline;gap:8px";
       const name = el("span", "", l.label + " · " + l.hours_left + "h left");
       name.style.cssText = "flex:1;font-size:11px";
+      copyable(name, l.url, "the tune-in link");        // #660
       const copy = el("button", "", "copy");
       copy.style.fontSize = "11px";
-      copy.onclick = async () => {
-        try { await navigator.clipboard.writeText(l.url); copy.textContent = "✓"; }
-        catch (e) { window.prompt("Copy this:", l.url); }
-      };
+      copyable(copy, l.url, "the tune-in link");
       const kill = el("button", "", "✕");
       kill.style.fontSize = "11px";
       kill.title = "Revoke this link";

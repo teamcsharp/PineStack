@@ -1,5 +1,13 @@
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 httpx==0.28.1
-mutagen
-pyserial
+# Pinned to the versions verified running (audit: unpinned meant a
+# container RECREATE — the documented recovery path — silently pulled
+# whatever PyPI served, or hung if PyPI was down).
+mutagen==1.48.1
+pyserial==3.5
+# A static ffmpeg as a wheel, for levelling mp3 stingers (#220, #225). The
+# sample packs are mp3 and the stdlib cannot decode one, so without this a
+# meme sting lands several times louder than the DJ who set it up. No apt, no
+# root, no system package — it ships the binary and pip already runs here.
+imageio-ffmpeg==0.6.0
