@@ -47776,19 +47776,123 @@ async function studioCookies() {
   // from a signed-in browser (the "Get cookies.txt" extension), and it is
   // stored where the downloader reads it. A browser's cookies can't be
   // reached from inside the container, so pasting the export is the way.
-  const txt = prompt(
-    "Paste the contents of a cookies.txt exported from your signed-in "
-    + "browser (the 'Get cookies.txt LOCALLY' extension makes one).\n\n"
-    + "This unlocks age-gated and members-only videos for cloning. Leave "
-    + "blank and press OK to CLEAR the stored cookies.");
-  if (txt === null) return;
-  try {
-    const r = await api("/api/voicelab/cookies", {
-      method: "POST", body: JSON.stringify({cookies: txt})});
-    studioSay(r.cleared ? "Cookies cleared."
-      : "Cookies stored (" + r.lines + " lines) — age-gated downloads "
-        + "should work now.");
-  } catch (error) { studioSay(error.message, true); }
+  // A bare prompt() asking for "the contents of a cookies.txt" tells you
+  // nothing if you have never made one, so this is a panel: it says what
+  // the file is, where to get it, and takes the file itself (#651).
+  const gone = document.getElementById("cookieModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "cookieModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:200;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(560px,94vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:8px";
+  head.appendChild(el("h2", "", "🍪 A signed-in session"));
+  head.firstChild.style.cssText = "margin:0;font-size:16px;flex:1";
+  const shut = el("span", "", "✕");
+  shut.style.cssText = "cursor:pointer;font-size:18px";
+  shut.onclick = () => shade.remove();
+  head.appendChild(shut);
+  card.appendChild(head);
+
+  card.appendChild(el("div", "muted",
+    "YouTube asks some visitors to prove they are not a robot, and this box "
+    + "is one of them. Nothing gets past that except a session from a "
+    + "browser that is already signed in. What it needs is a cookies.txt — "
+    + "a small text file your browser can export."));
+  card.lastChild.style.cssText = "font-size:12px;line-height:1.6;margin:8px 0";
+
+  const how = el("div", "", "");
+  how.style.cssText = "font-size:12px;line-height:1.7;margin:8px 0;"
+    + "padding:10px 12px;border:1px solid var(--border);border-radius:8px";
+  [
+    "Install the “Get cookies.txt LOCALLY” extension in Firefox or Chrome.",
+    "Open a PRIVATE / incognito window and sign in to YouTube there.",
+    "In that same tab go to youtube.com/robots.txt — it should be the only "
+      + "private tab open.",
+    "Click the extension and export. Then CLOSE the private window, so the "
+      + "session is never rotated out from under the file.",
+    "Drop the file below.",
+  ].forEach((step, at) => {
+    const line = el("div", "", (at + 1) + ". " + step);
+    line.style.marginBottom = "3px";
+    how.appendChild(line);
+  });
+  card.appendChild(how);
+
+  const drop = el("div", "", "⬇ Drop cookies.txt here — or click to pick it");
+  drop.style.cssText = "margin:10px 0;padding:22px;text-align:center;"
+    + "border:2px dashed var(--border);border-radius:10px;cursor:pointer;"
+    + "font-size:13px;color:var(--muted)";
+  const note = el("div", "muted", "");
+  note.style.cssText = "font-size:12px;margin-top:6px";
+
+  const send = async (text, where) => {
+    note.textContent = "◐ storing…";
+    try {
+      const r = await api("/api/voicelab/cookies", {
+        method: "POST", body: JSON.stringify({cookies: text})});
+      note.textContent = r.cleared
+        ? "Cleared."
+        : "✓ stored from " + where + " — " + r.lines + " lines. Press "
+          + "“Try it again” on anything that was refused.";
+      studioSay("A signed-in session is loaded.");
+    } catch (error) { note.textContent = "✗ " + error.message; }
+  };
+  const take = (file) => {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => send(String(reader.result || ""), file.name);
+    reader.readAsText(file);
+  };
+  drop.onclick = () => {
+    const pick = document.createElement("input");
+    pick.type = "file";
+    pick.accept = ".txt,text/plain";
+    pick.onchange = () => take(pick.files && pick.files[0]);
+    pick.click();
+  };
+  drop.ondragover = (e) => {
+    e.preventDefault();
+    drop.style.borderColor = "var(--accent)";
+  };
+  drop.ondragleave = () => { drop.style.borderColor = ""; };
+  drop.ondrop = (e) => {
+    e.preventDefault();
+    drop.style.borderColor = "";
+    take(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0]);
+  };
+  card.appendChild(drop);
+  card.appendChild(note);
+
+  const paste = document.createElement("details");
+  const sum = document.createElement("summary");
+  sum.className = "muted";
+  sum.textContent = "…or paste it as text";
+  sum.style.cssText = "cursor:pointer;font-size:12px";
+  paste.appendChild(sum);
+  const area = el("textarea", "", "");
+  area.style.cssText = "width:100%;min-height:90px;margin-top:6px;"
+    + "font-size:11px";
+  area.placeholder = "# Netscape HTTP Cookie File …";
+  paste.appendChild(area);
+  const save = el("button", "primary", "Store it");
+  save.style.marginTop = "6px";
+  save.onclick = () => send(area.value, "the box above");
+  paste.appendChild(save);
+  card.appendChild(paste);
+
+  const wipe = el("button", "", "Clear the stored session");
+  wipe.style.cssText = "margin-top:12px;font-size:11px";
+  wipe.onclick = () => send("", "nothing");
+  card.appendChild(wipe);
+
+  shade.appendChild(card);
+  document.body.appendChild(shade);
 }
 
 /* Paste a link to anything and take the voice out of it (#640).
