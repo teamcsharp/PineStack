@@ -5095,6 +5095,22 @@ async def voice_generate(text: str, voice: str, engine: str,
                         f"stored as /media/{key}"
                         + (f"\neffects applied: "
                            + ", ".join(sorted(fx)) if fx else "")))
+    # The rig card (#634): what the last take was bent by, so the Mind can
+    # show the engineering as it happens rather than only the words.
+    _RADIO["rig"] = {
+        "at": int(time.time() * 1000),
+        "engine": engine,
+        "voice": (voice or "")[:40],
+        "ms": took,
+        "kb": len(audio) // 1024,
+        "secs": round(length or 0, 1),
+        "fx": sorted(fx) if fx else [],
+        "perf": (fx or {}).get("perf") or {},
+        "strip": str((fx or {}).get("strip") or ""),
+        "vocode": str((fx or {}).get("vocode") or ""),
+        "phone": bool((fx or {}).get("phone")),
+        "pitch": (fx or {}).get("pitch") or 0,
+    }
     return {
         "path": f"/media/{key}",
         "sig": media_sign(key),
@@ -24418,8 +24434,28 @@ async def dj_pipeline_api(
     require_read_auth(authorization)
     events = [e for e in (_RADIO.get("pipeline") or [])
               if int(e.get("ts") or 0) > since]
+    dj = dj_settings()
+    # The engineering half (#634): what made the last take sound the way it
+    # did, and the knobs that shape the next one. Rides this poll rather
+    # than its own — the Mind, the glass and the console all read it here.
+    # Health comes from the CACHES, never a probe: three consumers poll this.
+    rig = {
+        **(_RADIO.get("rig") or {}),
+        "engines": {
+            "xtts": {"ready": bool(_XTTS_HEALTH["ready"])},
+            "voxtral": {"ready": bool(_VOXTRAL_HEALTH["ready"])},
+            "piper": {"ready": True},
+        },
+        "knobs": {k: dj.get(k) for k in (
+            "fx_rate", "fx_min", "fx_max", "caller_fx", "caller_fx_depth",
+            "caller_static", "sfx_rate", "overlap", "chattiness",
+            "interject_rate")},
+        "level_rms": int(5200 * box_gain()),
+        "macros": dict(_RADIO.get("speaker_macro") or {}),
+    }
     return {"events": events[-120:],
-            "activity": _RADIO.get("activity") or {}}
+            "activity": _RADIO.get("activity") or {},
+            "rig": rig}
 
 
 @app.get("/api/dj/tape")
@@ -40746,8 +40782,10 @@ const MIND_THEMES = {
 
 // Pipeline event kind -> which station it lights, and a friendly stage word.
 const MIND_KIND_STATION = {
-  speakbox: 0, model: 2, perf: 2, voice: 3, air: 4, call: 0, drop: 4,
-  sfx: 4, repair: 4,
+  // Indexes into MIND_STATIONS below — ENGINEER was inserted at 4, so
+  // everything downstream of the voice moved up one (#634).
+  speakbox: 0, model: 2, perf: 4, voice: 3, air: 5, call: 0, drop: 5,
+  sfx: 5, repair: 5,
   // Something YOU did enters at the start and travels the whole machine, so
   // every action you take is seen being processed into a line (#527).
   action: 0,
@@ -40757,6 +40795,8 @@ const MIND_STATIONS = [
   {key: "sift", title: "\u{1F50D} SIFT", sub: "a section grabbed"},
   {key: "llm", title: "\u{1F9E0} LLM", sub: "words realigned"},
   {key: "voice", title: "\u{1F399} VOICE", sub: "given a voice"},
+  // Between having a voice and being on air, the waveform gets bent (#634).
+  {key: "rig", title: "\u{1F39A} ENGINEER", sub: "the waveform bent"},
   {key: "air", title: "\u{1F4FB} ON AIR", sub: "the final result"},
 ];
 
