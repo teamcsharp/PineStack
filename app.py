@@ -30814,6 +30814,32 @@ status, and a link you can hand to somebody so they can tune in"
       id="remoteDot" style="position:absolute;right:3px;bottom:3px;width:7px;
 height:7px;border-radius:50%;background:#764"></span></button>
   </div>
+
+  <!-- #689: the ON AIR light, where a studio would put it. Whether the
+       station is broadcasting is the single most important fact about this
+       page and it was only knowable by opening the music panel and
+       squinting at a checkbox. Three things in one chip: the state, the
+       switch, and the door out to the public station. -->
+  <div id="onAirChip" style="display:flex;align-items:center;gap:0;
+       border:1px solid var(--border);border-radius:9px;overflow:hidden;
+       background:var(--panel2,#0d1420)">
+    <button id="onAirBtn" onclick="onAirToggle()"
+            style="display:flex;align-items:center;gap:7px;border:0;
+                   background:none;padding:5px 10px;cursor:pointer;
+                   font-size:12px;color:inherit">
+      <span id="onAirLamp" style="width:9px;height:9px;border-radius:50%;
+            background:#5c6b82;flex:0 0 auto"></span>
+      <b id="onAirWord" style="letter-spacing:.06em;font-size:11px">OFF AIR</b>
+      <span id="onAirVitals" class="muted"
+            style="font-size:10px;opacity:.8;white-space:nowrap"></span>
+    </button>
+    <button id="onAirOut" onclick="onAirLaunch(event)"
+            title="Open the station the way a listener hears it — over the
+public link if it is up, so it plays anywhere"
+            style="border:0;border-left:1px solid var(--border);
+                   background:none;padding:5px 9px;cursor:pointer;
+                   font-size:13px;line-height:1;color:inherit">📻</button>
+  </div>
   <div style="display:flex;align-items:center;gap:14px">
     <label class="slider" id="boxTalkWrap" title="Broadcast the station to
 the Pine Box. Off and nothing from the show reaches the speaker — no DJ
@@ -39532,6 +39558,123 @@ function remotePlexus(host, stages) {
   };
 }
 
+/* #689: the ON AIR light in the header.
+ *
+ * Whether the station is broadcasting is the single most important fact
+ * about this page, and it used to be knowable only by opening the music
+ * panel and reading a checkbox. The lamp is red and breathing while it is
+ * live, grey when it is not, and amber when it is on but something is
+ * wrong — a dead box, an empty queue, nobody listening to a public link.
+ *
+ * Health, in the order it actually matters: is the audio reaching a
+ * speaker, is there anything queued to play, and who is out there. */
+function onAirPaint(dj) {
+  const lamp = document.getElementById("onAirLamp");
+  const word = document.getElementById("onAirWord");
+  const vitals = document.getElementById("onAirVitals");
+  if (!lamp || !word) return;
+  const live = !!(dj && dj.on);
+  const box = (dj && dj.box) || {};
+  const boxDown = !!box.down;
+  const queued = Number((dj && dj.queued) || 0);
+  const heads = Number((dj && dj.listeners) || 0);
+  // On air but not actually getting out is the state worth shouting about;
+  // it looks identical to healthy from every other indicator on the page.
+  const sick = live && (boxDown || queued === 0);
+  const tint = !live ? "#5c6b82" : (sick ? "#ffb454" : "#ff5f5f");
+  lamp.style.background = tint;
+  lamp.style.boxShadow = live ? "0 0 8px " + tint : "none";
+  lamp.style.animation = live && !sick
+    ? "boothPulse 2s ease-in-out infinite" : "";
+  word.textContent = !live ? "OFF AIR" : (sick ? "ON AIR ⚠" : "ON AIR");
+  word.style.color = live ? tint : "";
+  if (vitals) {
+    const bits = [];
+    if (live) {
+      bits.push(heads + (heads === 1 ? " ear" : " ears"));
+      bits.push(queued + " queued");
+      if (boxDown) bits.push("box down");
+    }
+    vitals.textContent = bits.length ? "· " + bits.join(" · ") : "";
+  }
+  const btn = document.getElementById("onAirBtn");
+  if (btn) {
+    btn.title = !live
+      ? "The station is off. Click to put it on air."
+      : (boxDown
+          ? "On air, but the Pine Box is not answering — the talk is being "
+            + "held rather than played. Click to take it off air."
+          : (queued === 0
+              ? "On air with nothing queued — it will run dry. Click to "
+                + "take it off air."
+              : "On air · " + heads + " listening · " + queued
+                + " queued. Click to take it off air."));
+  }
+}
+
+async function onAirToggle() {
+  const btn = document.getElementById("onAirBtn");
+  const done = pending(btn);                                   // #665
+  const word = document.getElementById("onAirWord");
+  const live = word && word.textContent.indexOf("ON AIR") === 0;
+  try {
+    if (live) {
+      djVoiceQueue.length = 0;
+      djVoiceEls.forEach((a) => { if (a) { a.pause(); a.src = ""; } });
+      djVoiceLive = 0; djVoiceBusy = false; djSpeaking = false;
+      musicRadioOn = false;
+      const player = document.getElementById("musicPlayer");
+      if (player) player.pause();
+      djRender(await api("/api/dj/stop", {method: "POST"}));
+      setStatus("off air — no station, no banter");
+    } else {
+      await djGo();
+      setStatus("on air");
+    }
+    // Keep the checkbox on the music desk honest about what just happened.
+    const box = document.getElementById("djPower");
+    if (box) box.checked = !live;
+  } catch (e) { setStatus(e.message, true); }
+  finally { done(); onAirRefresh(); }
+}
+
+/* Open the station the way a LISTENER hears it. Prefers the public link,
+ * so the tab you open is the same URL you would hand to somebody else —
+ * if it does not work here it does not work for them either, and you find
+ * that out now rather than from them. */
+async function onAirLaunch(ev) {
+  if (ev) ev.stopPropagation();
+  const out = document.getElementById("onAirOut");
+  const done = pending(out);
+  try {
+    let url = "";
+    const got = await api("/api/share");
+    const live = (got.links || []).filter((l) => l.scope !== "full");
+    // Reuse the longest-lived listener link rather than minting one every
+    // time this is pressed — otherwise the list fills with junk.
+    if (live.length) {
+      const best = live.sort((a, b) => b.hours_left - a.hours_left)[0];
+      const pub = (best.alts || []).find((a) => a.kind === "funnel");
+      url = (pub && pub.url) || best.url;
+    } else {
+      const made = await api("/api/share", {method: "POST",
+        body: JSON.stringify({label: "the radio", hours: 168,
+                              scope: "listen"})});
+      url = made.url;
+    }
+    window.open(url, "_blank", "noopener");
+    const took = await copyText(url, null);
+    setStatus(took
+      ? "the station is open in a new tab — the link is on your clipboard too"
+      : "the station is open in a new tab");
+  } catch (e) { setStatus(e.message, true); }
+  finally { done(); }
+}
+
+async function onAirRefresh() {
+  try { onAirPaint(await api("/api/dj")); } catch (e) {}
+}
+
 /* #680: what tonight's callers are ringing in about. */
 async function themeLoad() {
   const pick = document.getElementById("themePick");
@@ -41441,6 +41584,7 @@ async function rhetWordDetail(word) {
 
 function djRender(state) {
   djLastState = state;
+  onAirPaint(state);                  // #689 the header ON AIR light
   djRhetoricRender(state);            // #561 on-air rhetoric cloud
   const wasOn = djOn;
   djOn = !!state.on;
@@ -54571,6 +54715,7 @@ function startLiveActivity() {
   remoteDotPaint();               // #652
   docLockPaint();                 // #674
   themeLoad();                    // #680
+  onAirRefresh();                 // #689 — paint before the first dj poll
   // The lock expires on its own, so the button has to notice on its own too.
   setInterval(docLockPaint, 60000);
   djLoadLevels();
