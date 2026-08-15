@@ -39203,8 +39203,25 @@ function remotePlexus(host, stages) {
     const sp = new THREE.Sprite(new THREE.SpriteMaterial({
       map: tex, transparent: true, depthWrite: false,
     }));
-    sp.scale.set(2.6 * c.width / c.height, 2.6, 1);
+    sp.scale.set(2.0 * c.width / c.height, 2.0, 1);
     return sp;
+  };
+
+  /* #685: the labels were the full stage titles at full size, all sitting
+   * at the same height 10.4 units apart — and "1. Tailscale on the box" is
+   * about 20 units wide at that scale, so every one of them ran into its
+   * neighbours and the row became unreadable mush. The plexus only needs to
+   * say WHICH stage each node is; the full title, its state and its command
+   * are all in the card directly underneath. So: a short label, and
+   * alternating heights so even a long one cannot touch the next. */
+  const shortLabel = (title, i) => {
+    const words = String(title || "").split(/\s+/);
+    let out = words[0] || "";
+    for (let w = 1; w < words.length; w++) {
+      if ((out + " " + words[w]).length > 13) break;
+      out += " " + words[w];
+    }
+    return (i + 1) + ". " + out;
   };
 
   const nodes = [];
@@ -39223,8 +39240,10 @@ function remotePlexus(host, stages) {
         side: THREE.BackSide,
       }));
     g.add(core); g.add(halo);
-    const cap = label(String(i + 1) + ". " + st.title, "#dce9ff");
-    cap.position.set(0, -3.4, 0);
+    // #685: short text, and every other one dropped lower, so neighbours
+    // cannot collide even on the longest stage name.
+    const cap = label(shortLabel(st.title, i), "#dce9ff");
+    cap.position.set(0, i % 2 ? -4.9 : -3.0, 0);
     g.add(cap);
     scene.add(g);
     nodes.push({group: g, core, halo, cap, stage: st});
