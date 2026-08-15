@@ -41345,6 +41345,23 @@ function djTalkRender(state) {
     // The R button (#443, #452): INSIDE the message, trailing the text,
     // so it sits with the line it bans rather than floating in the corner.
     if (spoken && line.text) {
+      // #728: the down-vote has been reachable since #443 (right-click, and
+      // the R button); the UP-vote never had a handle in the booth even
+      // though the endpoint has taken vote:1 since #215. A kept line joins
+      // the approved bank and comes back on air in their own voices — and
+      // it is drawn against the speakbox seeds, so a good line resurfaces
+      // later, in another session, mixed in with the document material
+      // rather than merely repeated.
+      const keep = el("button", "", "\u25b2");
+      keep.title = "Keep this one — it joins the bank and comes back "
+        + "later, mixed in with the speakbox material";
+      keep.style.cssText = "background:none;border:1px solid var(--border);"
+        + "border-radius:5px;color:#8fe388;cursor:pointer;font-size:10px;"
+        + "font-weight:700;padding:0 5px;margin-left:6px;"
+        + "vertical-align:middle";
+      keep.onclick = (event) => { event.stopPropagation();
+                                  djKeepLine(line, keep); };
+      said.appendChild(keep);
       const ban = el("button", "", "R");
       ban.title = "This reply keeps coming round — bury it so it is never "
         + "said again";
@@ -41455,6 +41472,24 @@ function djTalkRender(state) {
 
 // Click a line in the booth and it goes out of the box again, said by
 // whoever said it the first time (#165).
+/* #728: keep a line worth coming back to. */
+async function djKeepLine(line, btn) {
+  try {
+    const got = await api("/api/dj/line/vote", {method: "POST",
+      body: JSON.stringify({text: line.text, who: line.who,
+                            vote: 1, source: line.source || ""})});
+    btn.textContent = "\u25b2";
+    btn.style.color = "#fff";
+    btn.style.background = "#1d6b45";
+    btn.style.borderColor = "#2f9c66";
+    btn.title = "Kept — this comes back on air later, drawn "
+      + "against the speakbox material";
+    btn.disabled = true;
+    setStatus("kept — it joins the bank and comes round again "
+              + "in their own voices");
+  } catch (e) { setStatus("could not keep it: " + e.message, true); }
+}
+
 async function djBanLine(line, row) {
   // Bury a line for good (#443, #444): down-vote it so it is dropped if it
   // ever comes round again and removed from the approved bank.
