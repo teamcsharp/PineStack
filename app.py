@@ -416,6 +416,11 @@ DEFAULT_DJ = {
     # cutting each other off). Shapes how the exchange is written and how soon
     # the next line comes in (#185).
     "overlap": 35,
+    # #725: how fast the pair actually talk. 1.0 is the engine default;
+    # the ask was "maybe 5% faster with a slider", so 1.05 is the nudge
+    # and the slider goes either way. Applied at synthesis, not by
+    # speeding up the finished clip, so nobody sounds like a chipmunk.
+    "speech_rate": 1.05,
     # Cover Art Archive, keyed on a MusicBrainz release — an actual API, so
     # what comes back is the record's own cover (#123, #130).
     "art_lookup": True,
@@ -898,6 +903,11 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "follow_prompt": bool(raw_dj.get("follow_prompt", False)),
         "overlap": max(0, min(100, int(
             raw_dj.get("overlap", DEFAULT_DJ["overlap"]) or 0))),
+        # #725: clamped hard. Past ~1.25 XTTS stops sounding hurried
+        # and starts sounding broken.
+        "speech_rate": max(0.75, min(1.25, float(
+            raw_dj.get("speech_rate", DEFAULT_DJ["speech_rate"])
+            or 1.0))),
         "art_lookup": bool(raw_dj.get("art_lookup", True)),
         "art_search": bool(raw_dj.get("art_search", False)),
         "sfx": bool(raw_dj.get("sfx", True)),
@@ -4676,11 +4686,21 @@ async def _xtts_synthesize(text: str, voice: str) -> bytes:
     ref = voice_ref_path(voice)
     if ref is None:
         raise RuntimeError(f"no reference recording for voice {voice!r}")
+    # #725: the pair were leaving obnoxious room between thoughts. `speed`
+    # is applied inside the model rather than by time-stretching the finished
+    # clip, so a faster read still sounds like the person and not a tape
+    # running fast. The server clamps it again at its end.
+    try:
+        rate = float(dj_settings().get("speech_rate") or 1.0)
+    except Exception:  # noqa: BLE001
+        rate = 1.0
     payload = {
         "text": _xtts_sanitize(text)[:XTTS_MAX_CHARS],
         "reference_audio": base64.b64encode(ref.read_bytes()).decode(),
         "language": "en",
     }
+    if abs(rate - 1.0) > 0.01:
+        payload["opts"] = {"speed": max(0.75, min(1.25, rate))}
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(f"{XTTS_URL}/synthesize", json=payload)
         resp.raise_for_status()
@@ -9147,6 +9167,11 @@ def dj_state() -> dict[str, Any]:
         # the page decides for itself, from the clip actually sounding —
         # this side only ever knows when it handed one over (#651).
         "speaking": bool(_SPEAKING[0]),
+        # #729: seconds until the pair are next due to say something,
+        # or None when they are already talking / the torrent is off.
+        "talk_next_in": (
+            max(0.0, round(float(_RADIO["talk_next_at"]) - time.time(), 1))
+            if _RADIO.get("talk_next_at") and not _SPEAKING[0] else None),
         # Which model is writing the lines, for the provenance card (#655).
         "model": str(load_settings().get("model") or ""),
         # The booth keeps its own running history now (#656), but it can
@@ -10106,7 +10131,14 @@ async def _torrent_talk() -> None:
             if not dj.get("talk_radio_mode"):
                 await asyncio.sleep(5)
                 continue
-            await asyncio.sleep(torrent_breath(dj))
+            # #729: publish WHEN the next round is due, so the booth can
+            # show a countdown instead of leaving you sitting in silence
+            # wondering whether the pair have died. Set before the sleep,
+            # cleared when the round starts.
+            _breath = torrent_breath(dj)
+            _RADIO["talk_next_at"] = time.time() + _breath
+            await asyncio.sleep(_breath)
+            _RADIO.pop("talk_next_at", None)
             if not _RADIO.get("on") or not dj_settings().get("talk_radio_mode"):
                 continue
             # Never two rounds at once: the per-record intro is its own
@@ -40438,6 +40470,20 @@ function boothGlass() {
     + "line-height:1.5";
   wrap.appendChild(room);
   // The sale, circulating.
+  // #729/#730: the countdown to the next round, in the corner. Sitting
+  // in silence wondering whether the pair have died is its own kind of
+  // dead air, and the torrent already knows exactly when it next
+  // speaks — it just never said so. #730: the seconds roll like a
+  // wheel rather than ticking, so it reads as counting DOWN to
+  // something instead of just being a number that changes.
+  const nextChip = el("div", "", "");
+  nextChip.id = "boothNext";
+  nextChip.style.cssText = "position:absolute;top:5px;right:6px;"
+    + "display:none;align-items:center;gap:4px;font-size:10.5px;"
+    + "padding:2px 7px;border-radius:9px;background:#0b1524cc;"
+    + "border:1px solid #22304a;color:#9fd0ff;pointer-events:none;"
+    + "overflow:hidden";
+  wrap.appendChild(nextChip);
   const sell = el("div", "", "");
   sell.id = "boothSell";
   sell.style.cssText = "display:none;gap:5px;align-items:center;padding:4px 5px;"
@@ -40657,6 +40703,70 @@ function boothGlassDraw() {
     ctx.globalAlpha = 1;
   }
 }
+
+/* #729/#730: the countdown to the next round, rolled like a wheel.
+ *
+ * The digits live in a strip that is translated upward, so a change slides
+ * the old number out and the new one in rather than swapping it. Driven off
+ * djLastState, which the 4s poll already refreshes; the wheel itself
+ * animates locally every 200ms so it does not look frozen between polls. */
+let boothNextShown = null;
+let boothNextDeadline = 0;
+function boothWheelDigit(host, value) {
+  let strip = host.firstChild;
+  if (!strip) {
+    strip = document.createElement("div");
+    strip.style.cssText = "transition:transform .28s cubic-bezier(.2,.9,.2,1)";
+    for (let i = 0; i < 10; i++) {
+      const d = document.createElement("div");
+      d.textContent = String(i);
+      d.style.cssText = "height:13px;line-height:13px;text-align:center";
+      strip.appendChild(d);
+    }
+    host.appendChild(strip);
+  }
+  strip.style.transform = "translateY(" + (-13 * value) + "px)";
+}
+function boothNextDraw() {
+  const chip = document.getElementById("boothNext");
+  if (!chip) return;
+  const st = (typeof djLastState !== "undefined" && djLastState) || {};
+  const secs = st.talk_next_in;
+  if (secs === null || secs === undefined || st.speaking) {
+    chip.style.display = "none";
+    boothNextShown = null;
+    return;
+  }
+  chip.style.display = "flex";
+  // Count down locally between polls so it moves every tick, not every 4s.
+  const left = Math.max(0, Math.round((boothNextDeadline - Date.now()) / 1000));
+  const show = Math.min(99, left);
+  if (boothNextShown === null) {
+    chip.textContent = "";
+    const label = document.createElement("span");
+    label.textContent = "next in";
+    label.style.opacity = ".8";
+    chip.appendChild(label);
+    ["t", "u"].forEach((k) => {
+      const win = document.createElement("div");
+      win.id = "boothNext_" + k;
+      win.style.cssText = "height:13px;overflow:hidden;width:8px;"
+        + "font-variant-numeric:tabular-nums;font-weight:700";
+      chip.appendChild(win);
+    });
+    const s = document.createElement("span");
+    s.textContent = "s";
+    s.style.opacity = ".8";
+    chip.appendChild(s);
+  }
+  boothNextShown = show;
+  const tens = document.getElementById("boothNext_t");
+  const units = document.getElementById("boothNext_u");
+  if (tens) boothWheelDigit(tens, Math.floor(show / 10));
+  if (units) boothWheelDigit(units, show % 10);
+  chip.style.borderColor = show <= 3 ? "#2f9c66" : "#22304a";
+}
+setInterval(boothNextDraw, 200);
 
 function boothGlassStart() {
   if (boothGlassRaf) return;
@@ -45665,6 +45775,11 @@ function djRender(state) {
       ? "up next · " + (coming.title || "…")
         + (coming.artist ? " · " + coming.artist : "")
       : (now.title || "…") + (now.artist ? " · " + now.artist : "");
+  // #729: re-anchor the local countdown whenever the server reports a
+  // fresh due-time, so the wheel stays honest between 4s polls.
+  if (state.talk_next_in !== null && state.talk_next_in !== undefined) {
+    boothNextDeadline = Date.now() + state.talk_next_in * 1000;
+  }
   djMiniRender(state);
   djRenderQueue(state);
   djRenderChat(state);
