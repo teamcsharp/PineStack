@@ -24941,8 +24941,88 @@ async def share_revoke(
     return {"revoked": tag}
 
 
+# --- The public listener door (#687) ----------------------------------------
+# Sharing the broadcast with people who are not on your tailnet means the
+# public internet, and port 8096 must NEVER be the thing that gets exposed:
+# it serves the control panel with the API key embedded in the page
+# (AUTOFILL_KEY), and read endpoints are open by default (LOCK_READS=false).
+# Anyone who found that URL would own the station.
+#
+# So there is a second door on its own port that can only ever do one thing:
+# let somebody holding a live tune-in token listen, request a song, vote and
+# shout. Every other path is 404 before it reaches a handler, the
+# Authorization header is stripped so a leaked key cannot elevate through
+# it, and a FULL-scope token is deliberately downgraded here — a
+# public-facing door does not open the studio no matter what it is shown.
+PUBLIC_PORT = int(os.getenv("SPARK_PUBLIC_PORT", "8097"))
+PUBLIC_ENABLED = os.getenv("SPARK_PUBLIC_LISTEN", "true").lower() in (
+    "1", "true", "yes", "on")
+
+# Exact paths, or prefixes ending in "/". Nothing is matched loosely: a
+# regex over a public surface is how an allowlist quietly grows a hole.
+_PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
+               "/api/radio/clock"}
+_PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/")
+_PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
+                "/api/music/vote"}
+
+
+def _public_allows(method: str, path: str) -> bool:
+    if method in ("GET", "HEAD"):
+        return path in _PUBLIC_GET or path.startswith(_PUBLIC_GET_PREFIX)
+    if method == "POST":
+        return path in _PUBLIC_POST
+    return False
+
+
+class PublicListenerGate:
+    """Wraps the whole app and lets almost nothing through.
+
+    Deny-by-default: the allowlist above is the entire public surface, and
+    anything outside it never reaches a route handler at all."""
+
+    def __init__(self, inner: Any) -> None:
+        self.inner = inner
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            return                          # no websockets on the public door
+        path = str(scope.get("path") or "")
+        if not _public_allows(str(scope.get("method") or ""), path):
+            await send({"type": "http.response.start", "status": 404,
+                        "headers": [(b"content-type", b"text/plain")]})
+            await send({"type": "http.response.body",
+                        "body": b"Not found on the listener door."})
+            return
+        # Strip Authorization, and mark the request so /tune can refuse to
+        # serve the control panel through here.
+        headers = [(k, v) for (k, v) in scope.get("headers") or []
+                   if k.lower() != b"authorization"]
+        headers.append((b"x-pinebox-public", b"1"))
+        await self.inner(dict(scope, headers=headers), receive, send)
+
+
+@app.on_event("startup")
+async def _startup_public_door() -> None:
+    """Bring up the listener door beside the main app, in this process."""
+    if not PUBLIC_ENABLED or PUBLIC_PORT == STATION_PORT:
+        return
+    try:
+        import uvicorn
+        config = uvicorn.Config(PublicListenerGate(app), host="0.0.0.0",
+                                port=PUBLIC_PORT, log_level="warning",
+                                access_log=False)
+        server = uvicorn.Server(config)
+        server.install_signal_handlers = lambda: None   # the main one owns these
+        asyncio.create_task(server.serve())
+        print(f"[public] listener door on :{PUBLIC_PORT} — tune-in only",
+              flush=True)
+    except Exception as exc:
+        print(f"[public] listener door did not start: {exc}", flush=True)
+
+
 @app.get("/tune/{token}")
-async def tune_page(token: str) -> HTMLResponse:
+async def tune_page(token: str, request: Request) -> HTMLResponse:
     """Opened by a shared link. The page is handed the TOKEN, never the key.
 
     A full-scope link gets the real control panel rather than the listener
@@ -24955,7 +25035,13 @@ async def tune_page(token: str) -> HTMLResponse:
         raise HTTPException(
             status_code=403,
             detail="That tune-in link has expired or been revoked.")
-    page = (CONTROL_PANEL_HTML if scope == "full" else RADIO_PAGE_HTML)
+    # #687: through the public listener door it is ALWAYS the radio page,
+    # whatever the token is worth. A full-scope pass is for a machine you
+    # trust on your own network; it is not a thing to honour from the open
+    # internet, where the link may have been forwarded to anyone.
+    public = request.headers.get("x-pinebox-public") == "1"
+    page = (CONTROL_PANEL_HTML if (scope == "full" and not public)
+            else RADIO_PAGE_HTML)
     return HTMLResponse(page.replace("__SERVER_KEY__", json.dumps(token)))
 
 
