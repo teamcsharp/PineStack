@@ -30782,9 +30782,26 @@ button.danger {
   border-bottom: 1px solid var(--border);
   padding: 12px 18px 14px;
 }
+/* #692: this row overlapped itself. It is a flex row with no wrap holding
+   the live dot, the title, eight utility buttons, the whole mini player and
+   the filmstrip size slider — and flex items shrink by default while their
+   CONTENT does not. Past a certain width every button squashed below its
+   own glyph and the labels printed on top of each other, which is exactly
+   what the shot shows: the size slider sitting across ⟲ ▤ 💬 🕘 ✕.
+   Wrapping is the honest answer for a bar with this much in it. */
 .act-head {
   display: flex; align-items: center; gap: 11px; margin-bottom: 10px;
+  flex-wrap: wrap; row-gap: 8px;
 }
+/* Nothing in the bar shrinks under its own content any more. */
+.act-head > .act-refresh,
+.act-head .act-count,
+#djBar .act-refresh { flex: 0 0 auto; }
+.act-head .act-title,
+.act-head .act-status { flex: 0 1 auto; min-width: 0; }
+/* The mini player is a row inside a row — it wraps too rather than letting
+   its transport spill out of the pill (#692). */
+#djBar { flex-wrap: wrap; row-gap: 6px; }
 .act-title { font-weight: 700; letter-spacing: .02em; font-size: 15px; }
 .live-dot {
   width: 9px; height: 9px; border-radius: 50%; background: #28d17c;
@@ -30917,8 +30934,13 @@ button.danger {
   display: flex; align-items: center; gap: 8px; margin-left: auto;
   color: var(--muted); font-size: 12px; white-space: nowrap;
 }
+/* #692: in the live bar this is one item among twenty, so it keeps its own
+   width instead of being crushed across its neighbours. The settings rows
+   that reuse the class set flex inline and still win. */
+.act-head > .film-size { flex: 0 0 auto; }
 .film-size input[type="range"] {
-  width: 130px; padding: 0; margin: 0; background: transparent;
+  width: 130px; min-width: 90px; padding: 0; margin: 0;
+  background: transparent;
   border: none; accent-color: var(--accent); cursor: pointer;
 }
 .film-size .val { min-width: 34px; text-align: right; color: var(--text); }
@@ -43588,10 +43610,13 @@ function djRepairBanner(repairing, log) {
   if (!bar) {
     bar = el("div", "", "");
     bar.id = "djRepairBar";
+    // #692: bounded. With no max-width this grew to most of the screen and
+    // laid itself across whatever floating window happened to be up there.
     bar.style.cssText = "position:fixed;top:12px;left:50%;"
       + "transform:translateX(-50%);z-index:220;padding:8px 18px;"
       + "border-radius:9px;background:#2a1f04f2;border:1px solid #e8b34a;"
       + "color:#ffd479;font-size:13px;cursor:pointer;"
+      + "max-width:min(560px,92vw);line-height:1.4;"
       + "box-shadow:0 12px 40px rgba(0,0,0,.6)";
     bar.title = "Click for the full repair ledger";
     bar.onclick = djRepairPopup;
