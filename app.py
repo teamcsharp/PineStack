@@ -5785,6 +5785,10 @@ _AIRTIME: list[dict[str, float]] = []
 
 
 _CUTSHORT_STREAK = [0]
+# Consecutive clips the box finished cleanly (#722). The tightening ratchet
+# below had no counterpart, so the slider could only ever fall — and it had
+# fallen to its floor and stayed there, silently truncating every reply.
+_CLEAN_STREAK = [0]
 # Consecutive lines the box SILENTLY accepted but never played out (#559): a
 # wedged device that never errors, so the breaker must be tripped by hand.
 _SILENT_HOLD_STREAK = [0]
@@ -5836,7 +5840,15 @@ def _airtime_note(expected: float, actual: float) -> None:
            "ratio": round(min(1.0, actual / expected), 2)}
     _AIRTIME.append(row)
     del _AIRTIME[:-60]
-    cut = expected > 6 and actual < expected * 0.6
+    # The stutter guard used to require `expected > 6` — and the tightening
+    # ratchet below had already driven the slider to its 4s floor, which
+    # makes every clip about 4.3s. So the recovery was switched off at
+    # exactly the clip length the ratchet had forced the box down to, and
+    # the device was left stutter-looping its last buffer until somebody
+    # unplugged it (#712). Nudge on any clip long enough to measure; leave
+    # the SLIDER ratchet on the old threshold, since tightening below 6s
+    # buys nothing and is how it reached the floor in the first place.
+    cut = expected > 1.5 and actual < expected * 0.6
     if cut:
         pipeline_log("air", f"clip cut short: {actual:.0f}s of "
                             f"{expected:.0f}s reached the room (#423)",
@@ -5853,7 +5865,7 @@ def _airtime_note(expected: float, actual: float) -> None:
         # sections the box CAN finish. It never auto-raises (the probe
         # does that); it only backs off to keep replies whole.
         _CUTSHORT_STREAK[0] += 1
-        if _CUTSHORT_STREAK[0] >= 3:
+        if expected > 6 and _CUTSHORT_STREAK[0] >= 3:
             _CUTSHORT_STREAK[0] = 0
             try:
                 cur = int(dj_settings()["say_max_seconds"])
@@ -5869,6 +5881,20 @@ def _airtime_note(expected: float, actual: float) -> None:
                 pass
     else:
         _CUTSHORT_STREAK[0] = 0
+        _CLEAN_STREAK[0] += 1
+        # DELIBERATELY no auto-raise here (#722). It is tempting: the ratchet
+        # only ever falls, and it had walked this station's slider down to its
+        # floor of 4s. But the ratchet is not the bug — it is the box telling
+        # us, correctly, that it cannot drain a long clip. Raising the slider
+        # again made the box stutter-loop its last buffer at the end of every
+        # message until it was physically unplugged.
+        #
+        # The truncation that made a long slider look necessary is fixed at
+        # the other end instead: say_max_chunks() budgets CHARACTERS, so a
+        # 4-second slider now carries a full ~2,500-character reply as many
+        # short pieces the box can actually finish, rather than ten of them
+        # and a dropped tail. Short clips and whole replies are not in
+        # tension any more, so nothing needs to climb.
 
 
 def airtime_summary() -> dict[str, Any]:
@@ -8745,7 +8771,9 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 # goes out in slider-sized pieces (#423): the box's buffer
                 # drains between announces instead of choking on one long
                 # stream, and the voice simply continues.
-                pieces = (sentence_chunks(spoken, cap=say_max_chars())
+                pieces = (sentence_chunks(
+                              spoken, cap=say_max_chars(),
+                              most=say_max_chunks(say_max_chars()))
                           if len(spoken) > say_max_chars() else [spoken])
                 why = ""
                 for at, piece in enumerate(pieces):
@@ -14984,7 +15012,13 @@ def _level_voice(raw: bytes) -> bytes:
     not only effected ones, so plain DJ speech is equalized like the rest.
     Ends on a beat of silence so the box's tail buffer never loops (#493)."""
     levelled = _level_rms(raw, target=int(5200 * box_gain()))
-    return _wav_tail_pad(levelled, int(os.getenv("BOX_TAIL_MS", "300")))
+    # 300 ms was not enough silence for this box to loop harmlessly — it was
+    # still stuttering audible speech at the end of a message until it was
+    # unplugged (#712). The buffer it repeats is longer than the pad was, so
+    # the pad has to be longer than the buffer. 900 ms costs a beat of quiet
+    # between lines and is the difference between a glitch you hear and one
+    # you do not. Override with BOX_TAIL_MS if a different box wants less.
+    return _wav_tail_pad(levelled, int(os.getenv("BOX_TAIL_MS", "900")))
 
 
 def _as_wav(path: Path) -> Path:
@@ -16574,6 +16608,102 @@ CALLER_TEMPERS = (
 )
 
 
+# #709: the town does not merely suffer the heat — it has WORKED OUT where
+# the heat comes from, and the answer is the machine this station runs on.
+# Callers arrive somewhere on a ladder from rattled to millenarian, and the
+# grievance is specific and physical rather than a general moan.
+DGX_DISTRESS_LEVELS = (
+    "RATTLED — they have noticed something is wrong and are talking "
+    "themselves out of it, badly",
+    "SHAKEN — they have accepted it and are frightened, telling the pair "
+    "things they have not said out loud before",
+    "FURIOUS — they hold the machine personally responsible and want "
+    "somebody to answer for it",
+    "MILLENARIAN — calm, certain, past fear, describing the end of things "
+    "the way other people read a weather report",
+)
+
+# Drawn two or three at a time and BLENDED, so no two callers arrive with the
+# same complaint in the same order.
+DGX_GRIEVANCES = (
+    "the Spark is destroying reality itself and they can feel it thinning",
+    "they blame one particular character on this station personally for "
+    "ending the world, and they name them",
+    "they are furious about the heat and they HATE the computer for it",
+    "they want to FIND the machine and destroy it, and they ask the hosts "
+    "where it is kept",
+    "they believe they were PROGRAMMED to interact with the Spark, and the "
+    "programming is now telling them to switch it off",
+    "they hate reality and how hot it is so much that they simply wish the "
+    "Spark would be turned off",
+    "they UNDERSTAND that switching the Spark off switches off their own "
+    "reality with it — and they do not care, they want it off anyway",
+    "their children went outside and literally EXPLODED, vaporised by the "
+    "heat, and they mention it far too casually",
+    "a beloved pet went outside and exploded from the heat",
+    "it is so hot they watched a man explode in the street yesterday",
+    "the heat is so bad their OVEN melted",
+    "they switched on a blow dryer and took a heatstroke on the spot",
+    "the neighbour, they explain, is experiencing the heat of an entirely "
+    "DIFFERENT PART of the machine, and they describe that part",
+    "it got so hot they saw a travelling evangelist explode mid-sermon",
+)
+
+# #713: who in the room has the opinion. Not always a host — the booth is
+# fuller than the pair, and the engineer having a view is funnier than the
+# presenter having one.
+TRACK_FEELERS = (
+    "ONE OF THE HOSTS suddenly",
+    "THE CO-HOST, out of nowhere,",
+    "THE GUEST in the studio, unprompted,",
+    "THE ENGINEER, who never says anything,",
+    "SOMEONE ELSE IN THE ROOM, off mic and then dragged onto it,",
+    "BOTH HOSTS AT ONCE, which never happens,",
+)
+
+# Love or hate, but never lukewarm — a tepid opinion is not worth airing.
+TRACK_FEELINGS = (
+    "ADORES this record — it stops them mid-sentence and they say so, "
+    "embarrassingly sincerely.",
+    "HATES this record with a passion that startles everyone, and cannot "
+    "articulate why, which makes it worse.",
+    "is moved almost to tears by it and is not entirely willing to admit "
+    "that is what is happening.",
+    "finds it physically unbearable and asks, seriously, how much longer "
+    "is left of it.",
+    "has a sudden vivid memory attached to this track and tells it badly, "
+    "getting the details wrong.",
+    "declares this the best thing the station has played all week and dares "
+    "anyone to disagree.",
+    "thinks this track is an insult to the listeners and says it out loud "
+    "before remembering the mic is open.",
+    "is delighted in a way that is slightly too much for the time of night.",
+    "goes very quiet, and when asked, says only that they had forgotten "
+    "this one existed.",
+    "cannot stop laughing at it, and cannot explain what is funny.",
+)
+
+# #720: not every call arrives the same way round. The shape decides WHEN the
+# heat lands — immediately, after a running start, or not as the point at all.
+CALLER_SHAPES = (
+    "OPEN on something rattling around their head from the dialog cloud — "
+    "they bring it up first, unprompted, as though continuing a "
+    "conversation the hosts were never part of — and only THEN slide into "
+    "the heat.",
+    "GO STRAIGHT INTO IT: no small talk, no preamble — the thing driving "
+    "them comes out in the first breath as a full diatribe, and the hosts "
+    "have to catch up.",
+    "START on something ordinary and unrelated for a few sentences — the "
+    "reason they say they called — and THEN change topic abruptly to the "
+    "heat, as though it had been underneath the whole time.",
+    "WEAVE the heat together with the news: they cannot separate the two, "
+    "and they compare how hot the news is to how hot their own life is.",
+    "TALK ABOUT THE NEWS FIRST and then turn it personal — the news is hot, "
+    "but where they are they are MELTING ALIVE, and they would like that "
+    "on the record.",
+)
+
+
 CALLER_OUTCOMES = (
     "the caller ends the call genuinely happy — the pair turned it around",
     "the caller ends the call furious and hangs up on them",
@@ -17629,6 +17759,35 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
             + ". Jovial and funny while genuinely lamenting how DISASTROUS "
             "it is, insisting a computer is NO PLACE TO LIVE. The hosts "
             "commiserate and top it.")
+        # #720: WHERE the heat lands in the call is drawn, so the shape of a
+        # call varies as much as its content — some open on the speakbox and
+        # slide into it, some lead with the diatribe, some run a few ordinary
+        # sentences and swerve.
+        extras.append(
+            "SHAPE OF THIS CALL — "
+            f"{random.choice(CALLER_SHAPES)} Whichever way round it goes, it "
+            "must feel like how this particular person would actually have "
+            "started talking, never like a segment being announced.")
+        # #709: and the grievance is specific. Two or three drawn and BLENDED
+        # at a drawn level of distress, so the town's theory of the heat
+        # arrives differently every time.
+        _grief = random.sample(list(DGX_GRIEVANCES),
+                               k=random.choice((2, 2, 3)))
+        extras.append(
+            "THIS CALLER HAS WORKED OUT WHERE THE HEAT COMES FROM: the "
+            "machine this station runs on. They are "
+            f"{random.choice(DGX_DISTRESS_LEVELS)}. Blend these into ONE "
+            "person's account, in their own words, mixing them together "
+            "rather than listing them — "
+            + "; ".join(_grief) + ". Bend the imagery with whatever dialog "
+            "is rattling around their head so it comes out off the wall and "
+            "COMEDIC even as they mean every word of it. They are describing "
+            "a catastrophe and it is funny because they are so matter-of-fact "
+            "about it. Never say the words 'DGX', 'GPU' or 'server' — to "
+            "them it is the machine, the computer, the thing under the "
+            "floor. The hosts do NOT correct them and do not break the "
+            "premise; they take it seriously and get funnier the more "
+            "seriously they take it.")
         # …and then the call goes somewhere: after the heat business the
         # caller PIVOTS to something genuinely creative found fresh in the
         # speakbox — a real chapter of the call, feeding the rhetoric cloud
@@ -18440,8 +18599,31 @@ def breath_for(seed: str) -> str:
 def say_max_chars() -> int:
     """The slider's seconds ceiling as characters (#423): spoken English
     runs ~14 characters a second, so the chunker can cap BEFORE synthesis
-    — the only place a ceiling can be enforced deterministically."""
-    return max(60, int(dj_settings()["say_max_seconds"]) * 14)
+    — the only place a ceiling can be enforced deterministically.
+
+    Clamped to VOICE_MAX_CHARS at the top (#722): the slider goes to 60,
+    60 * 14 = 840, and voice_generate refuses anything over 800 with a 413 —
+    so the very highest settings silenced the DJs entirely, which is the
+    opposite of what dragging it up asks for."""
+    return max(60, min(VOICE_MAX_CHARS,
+                       int(dj_settings()["say_max_seconds"]) * 14))
+
+
+# How much of one turn may go to air, in characters, regardless of how short
+# the slider has made the individual pieces (#710, #722).
+SAY_TURN_BUDGET = 2600
+
+
+def say_max_chunks(cap: int) -> int:
+    """How many chunks one turn may occupy.
+
+    `most` used to be a flat 10, which quietly made the real ceiling a CHUNK
+    COUNT rather than a length. With the slider ratcheted down to its floor a
+    chunk is 60 characters, so a turn was capped at ~600 — and the model's
+    1,900-character replies lost two thirds of themselves with nothing but a
+    line in the glass to show for it. Budget characters instead, so lowering
+    the slider makes the PIECES shorter without making the TURN shorter."""
+    return max(10, min(60, SAY_TURN_BUDGET // max(1, cap)))
 
 
 def sentence_chunks(text: str, cap: int = 300, most: int = 10) -> list[str]:
@@ -18549,7 +18731,8 @@ async def speak_turns(turns: list[tuple[str, str]],
         # announce the box can drain; the SAME voice takes a breath at
         # each seam and simply continues the thought.
         for at, chunk in enumerate(
-                sentence_chunks(text, cap=say_max_chars())):
+                sentence_chunks(text, cap=say_max_chars(),
+                                most=say_max_chunks(say_max_chars()))):
             if at:
                 chunk = breath_for(f"{who}{len(playlist)}") + chunk
             playlist.append({
@@ -18800,6 +18983,11 @@ async def speak_turns(turns: list[tuple[str, str]],
         # A cut only lands between turns (#520): re-arm after each item so
         # the next iteration's guard may fire, but only at a turn boundary.
         can_cut = bool(item["turn_end"])
+    # Is the box actually the destination right now? (#712) Recomputed here
+    # rather than reused: the coalesced path's `to_box` lives in a branch that
+    # returns, so it is not in scope on this one.
+    _vto = _RADIO.get("voice_to") or "box"
+    shelf_ok = box_talk_ok() and _vto in ("box", "both")
     for item, leftover in zip(playlist[consumed:], premade[consumed:]):
         # A cut round leaves clips rendered and unplayed. A FINISHED one —
         # usually the cohost's, the later speaker — goes to the hold shelf so
@@ -18810,10 +18998,20 @@ async def speak_turns(turns: list[tuple[str, str]],
             except Exception:
                 clip = None
             if clip:
-                box_hold(clip, item["chunk"], item["who"])
+                # …but only if the box is actually the destination (#712).
+                # Ungated, this shelved lines for a box the operator had
+                # deliberately switched off, and two shelved lines is all
+                # box_unstable() looks at — so a box that was merely OFF
+                # read internally as a box that was FLAPPING, and the pair
+                # lost their disfluencies to a fault that did not exist.
+                if shelf_ok:
+                    box_hold(clip, item["chunk"], item["who"])
+                    note_drop(item["who"], item["chunk"],
+                              "round cut mid-flight — held for replay")
+                    continue
                 note_drop(item["who"], item["chunk"],
-                          "round cut mid-flight — held for replay")
-                continue
+                          "round cut mid-flight — the box is not the "
+                          "destination, so nothing was shelved")
         leftover.cancel()
     return spoken
 
@@ -19181,6 +19379,18 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "mildly disagree about whether this track is any good, and be "
             "polite about it",
         ] if track else []
+        # #713: politeness is not the only setting. Somebody in the room —
+        # not necessarily a host — has a REAL feeling about this record, and
+        # it lands without warning. Drawn per round so the same track can be
+        # adored one night and despised the next.
+        if track and random.random() < 0.45:
+            about_track.append(
+                f"{random.choice(TRACK_FEELERS)} {random.choice(TRACK_FEELINGS)} "
+                "It arrives unprompted, mid-round, as a genuine reaction to "
+                "the record rather than a review — and whoever it is COMMITS "
+                "to it. The others in the booth respond honestly: agreeing, "
+                "defending the track, or enjoying the row. Nobody resolves it "
+                "tidily and the record plays regardless.")
         # Product placement: the sponsor worked into the conversation rather
         # than read out in a break, which is the half an ad slot cannot do
         # (#180). Only offered when there is a sponsor to place.
@@ -40495,12 +40705,14 @@ function djTalkClear() {
 function djTalkRender(state) {
   // The whole booth: the pair, the callers on the line, and the desk events
   // — a call landing, a news break, a tape arriving (#240).
+  // #710: this was an ALLOWLIST, and it had already drifted — the second
+  // person on a call is written to chat as "caller2", was spoken, was
+  // logged, and was then dropped here, so the booth showed half a
+  // conversation. A new speaker class must not need a UI edit to become
+  // visible, so the rule is now "show it unless it is bookkeeping".
   const fresh_lines = (state.chat || []).filter(
-    (line) => line.who === "dj" || line.who === "cohost"
-      || line.who === "caller" || line.who === "third"
-      || line.who === "drop" || line.kind === "sfx"
-      || (line.who === "host"
-          && /^(call|callin|news|request|played)$/.test(line.kind || "")));
+    (line) => line && line.text
+      && !/^(seen|tick|ping|heartbeat)$/.test(line.kind || ""));
   djTalkAbsorb(fresh_lines);
   const lines = djTalkAll;
   if (!lines.length) return;
@@ -40648,10 +40860,10 @@ function djTalkRender(state) {
       if (heard) {
         const play = el("button", "", "▶ hear it");
         play.style.cssText = "font-size:10.5px;padding:2px 8px";
-        play.title = "Play exactly what went out";
+        play.title = "Play exactly what went out — click again to stop";
         play.onclick = (ev) => {
           ev.stopPropagation();
-          new Audio(heard).play().catch(() => {});
+          clipToggle(heard, play, "▶ hear it");      // #706
         };
         acts.appendChild(play);
         const dl = el("a", "", "⬇ keep it");
@@ -40907,6 +41119,10 @@ function djTalkRender(state) {
     // what makes this window one to one with the broadcast.
     if (spoken && line.text) {
       row.setAttribute("data-said", djTalkKey(line.text));
+      // The chat entry already carries a stable 6-hex id from
+      // _ensure_chat_ids(); matching on a hash of the TEXT is what
+      // made the jump button unable to find a coalesced round (#721).
+      if (line.id) row.setAttribute("data-eid", line.id);
       // #668: and WHO said it, so the spectrogram over the booth can be
       // coloured by the voice that is actually going out.
       row.setAttribute("data-who", line.who || "");
@@ -42217,8 +42433,7 @@ async function sfxInspect(sfxId) {
 
   const play = el("button", "primary", "▶ Hear it");
   play.style.marginTop = "10px";
-  play.onclick = () => { if (info.url) new Audio(info.url).play()
-    .catch(() => {}); };
+  play.onclick = () => clipToggle(info.url, play, "▶ Hear it");   // #706
   card.appendChild(play);
 
   card.appendChild(el("div", "", "How often may it come up?"));
@@ -43873,7 +44088,7 @@ async function sfxDirPopup(sfxId) {
     const play = el("button", "", "▶");
     play.style.cssText = "background:none;border:0;padding:0;"
       + "cursor:pointer;font-size:12px";
-    play.onclick = () => new Audio(sample.url).play().catch(() => {});
+    play.onclick = () => clipToggle(sample.url, play, "▶");   // #706
     row.appendChild(play);
     row.appendChild(name);
     card.appendChild(row);
@@ -45448,9 +45663,19 @@ function djJumpLive() {
   // Scrolling back sets a flag that stops the auto-follow. Asking to be
   // taken to the live line is asking for that flag to be cleared.
   log._userScrolled = false;
+  // Prefer the id the server says is sounding (#721). The old path
+  // hashed djVoiceNow.text — but for a coalesced round that text is
+  // the LABEL, never a line of dialogue, so nothing could ever match
+  // and the button always fell through to "the last line said". In
+  // box mode djVoiceNow is null entirely, so the id is the ONLY
+  // signal there is.
+  const liveId = (window.djSpeakingEid || "");
   const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
   let row = null;
-  if (want) {
+  if (liveId) {
+    row = log.querySelector('[data-eid="' + CSS.escape(liveId) + '"]');
+  }
+  if (!row && want) {
     log.querySelectorAll("[data-said]").forEach((r) => {
       if (!row && r.getAttribute("data-said") === want) row = r;
     });
@@ -45479,9 +45704,11 @@ function djTalkMarkLive() {
   const log = document.getElementById("djTalkLog");
   if (!log) return;
   const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
+  const liveId = (window.djSpeakingEid || "");
   let found = null;
   log.querySelectorAll("[data-said]").forEach((row) => {
-    const hit = want && row.getAttribute("data-said") === want;
+    const hit = (liveId && row.getAttribute("data-eid") === liveId)
+      || (want && row.getAttribute("data-said") === want);
     row.classList.toggle("booth-live", !!hit);
     if (hit) found = row;
   });
@@ -52837,6 +53064,41 @@ function backlogClose() {
   }
 }
 
+/* #706: one clip at a time, and clicking the button again STOPS it.
+ * Every "hear it" button used to be a fire-and-forget `new Audio(url).play()`
+ * with no handle kept, so once a clip started there was no way to stop it
+ * short of leaving the page — and starting a second one played both at once.
+ * This keeps the single live clip, restores every button's label, and treats
+ * a second click on the SAME url as stop rather than restart. */
+let clipAudio = null;
+let clipBtn = null;
+function clipToggle(url, btn, label) {
+  const mark = label || (btn ? btn.textContent : "");
+  if (clipAudio) {
+    const was = clipAudio._src;
+    clipAudio.pause();
+    clipAudio = null;
+    if (clipBtn) { clipBtn.textContent = clipBtn._clipLabel || "▶"; }
+    clipBtn = null;
+    if (was === url) return;              // same clip → that click was "stop"
+  }
+  if (!url) return;
+  const audio = new Audio(url);
+  audio._src = url;
+  clipAudio = audio;
+  clipBtn = btn || null;
+  if (btn) { btn._clipLabel = mark; btn.textContent = "⏹ stop"; }
+  const restore = () => {
+    if (clipAudio !== audio) return;
+    clipAudio = null;
+    if (clipBtn) { clipBtn.textContent = clipBtn._clipLabel || "▶"; }
+    clipBtn = null;
+  };
+  audio.onended = restore;
+  audio.onerror = restore;
+  audio.play().catch(restore);
+}
+
 async function backlogPlay(url, canvas, btn) {
   if (backlogAudio) {
     const wasSrc = backlogAudio._src;
@@ -53433,7 +53695,7 @@ async function sfxStatsOpen() {
     row.appendChild(by);
     const play = el("button", "", "▶");
     play.style.cssText = "background:none;border:0;cursor:pointer";
-    play.onclick = () => new Audio(sample.url).play().catch(() => {});
+    play.onclick = () => clipToggle(sample.url, play, "▶");   // #706
     row.appendChild(play);
     const ban = el("button", "", sample.banned ? "↩" : "▼");
     ban.title = sample.banned ? "Let it play again"
