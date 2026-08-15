@@ -3872,6 +3872,33 @@ def box_talk_ok(reply: bool = False) -> bool:
     return bool(_RADIO.get("box_talk", True))
 
 
+def box_worth_healing() -> bool:
+    """Is the STATION routed to the speaker right now (#690)?
+
+    The repair machinery ran on its own clocks — a hold-shelf pass that
+    knocked every twenty seconds, a wedge check that rebuilt the Wyoming
+    entry, a dead-air strike that restarted Home Assistant — and none of
+    them asked whether anybody was actually trying to use the box. With the
+    Pine Box switch off they kept going: the show plays on the page exactly
+    as designed, the speaker is deliberately idle, and the station spends
+    the night reconnecting to a device it has been told not to talk to,
+    blinking "The DJs are on it" on every open panel over a fault that is
+    not one. A switched-off box is not a broken box.
+
+    This governs the BACKGROUND repairs only, which is why the reply road
+    is not in it. Answering YOU is on demand: it needs a working link at
+    the moment you ask the box something, and that road repairs itself
+    where it fails (home_assistant_say's retry plan, satellite_ready's
+    probe). What it does not need is a clock rebuilding the socket all
+    night while nobody is talking to it — and reply_to defaults to "box",
+    so counting it here would have left the switch doing nothing at all.
+    """
+    if not box_talk_ok():
+        return False
+    return ((_RADIO.get("voice_to") or "box") in ("box", "both")
+            or (_RADIO.get("music_to") or "here") in ("box", "both"))
+
+
 PIPER_VOICES = [
     "en_US-lessac-medium", "en_US-joe-medium", "en_US-amy-low",
     "en_US-hfc_female-medium", "en_US-kusal-medium",
@@ -3947,9 +3974,13 @@ _SAT_ALIVE: dict[str, Any] = {"ok": True, "checked": 0.0}
 _SAT_RECHECK = 60.0
 
 
-async def satellite_ready() -> bool:
+async def satellite_ready(heal: bool = True) -> bool:
     """Cheap, cached liveness for the speaker. Pessimistic by design: if we
-    cannot tell, we assume it is there and let the call fail once."""
+    cannot tell, we assume it is there and let the call fail once.
+
+    `heal=False` asks the question without acting on the answer (#690) —
+    for a status readout, which wants to know whether the box is up and has
+    no business rebuilding its link as a side effect of being looked at."""
     now = time.time()
     if now - _SAT_ALIVE["checked"] < _SAT_RECHECK:
         return bool(_SAT_ALIVE["ok"])
@@ -3972,7 +4003,15 @@ async def satellite_ready() -> bool:
             # nothing else in Home Assistant will notice. Rebuild it now so
             # the next thing anyone says gets through, rather than waiting
             # for somebody to press recover.
-            fire_and_forget(satellite_selfheal())
+            #
+            # #690: only when somebody is genuinely trying to reach the box
+            # through this probe. The two roads that use it — a reply, and
+            # music to the box — each refuse at their own door when their
+            # routing is off, so reaching here means the box IS wanted. A
+            # status readout asks with heal=False: reading a dashboard is
+            # not a reason to restart a speaker link.
+            if heal:
+                fire_and_forget(satellite_selfheal())
     except Exception:
         _SAT_ALIVE["ok"] = True          # cannot tell; do not silence the box
     return bool(_SAT_ALIVE["ok"])
@@ -4066,9 +4105,11 @@ async def satellite_busy() -> bool:
                   and now - _SAT_SAW_TURN_AT[0] > 30.0)
         if wedged:
             _SAT_BUSY["responding_since"] = now
-            pipeline_log("air", "satellite lingering in 'responding' with "
-                                "no live turn — checking the link")
-            asyncio.create_task(satellite_selfheal())
+            # #690: only chase a wedge on a link something is using.
+            if box_worth_healing():
+                pipeline_log("air", "satellite lingering in 'responding' "
+                                    "with no live turn — checking the link")
+                asyncio.create_task(satellite_selfheal())
             return False
     else:
         _SAT_BUSY.pop("responding_since", None)
@@ -8913,9 +8954,16 @@ def dj_state() -> dict[str, Any]:
             # successfully 164 seconds earlier and the satellite was idle
             # and online. A pile-up now only counts as down if the box has
             # ALSO gone quiet for longer than a drain cycle.
-            "down": time.time() < float(_BOX_DOWN.get("until") or 0)
-                    or (len(_BOX_HOLD) >= 2
-                        and time.time() - _BOX_LAST_OK[0] > 120),
+            # #690: a box that has been SWITCHED OFF is not down. Nothing is
+            # being sent to it, so it cannot be failing to receive anything
+            # — and reporting it down lit the repair banner, the booth
+            # warning and the "the box is back" prompt over a state the
+            # operator chose on purpose.
+            "off": not box_talk_ok(),
+            "down": box_talk_ok() and (
+                time.time() < float(_BOX_DOWN.get("until") or 0)
+                or (len(_BOX_HOLD) >= 2
+                    and time.time() - _BOX_LAST_OK[0] > 120)),
             "held": len(_BOX_HOLD),
             "silent_for": round(time.time() - _BOX_LAST_OK[0]),
             "last_ratio": _LAST_PLAYOUT.get("ratio"),
@@ -9584,6 +9632,13 @@ async def box_hold_watch() -> None:
                                     "box plays fresh, never an old backlog")
             if not _BOX_HOLD:
                 continue
+            # #690: with the Pine Box switched off, the shelf WAITS. It used
+            # to knock every twenty seconds — a satellite state poll (which
+            # can itself trigger a rebuild) and an announce that _play_on_box
+            # declines at the door anyway. Nothing is lost: the switch coming
+            # back on is exactly when this drains.
+            if not box_talk_ok():
+                continue
             if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
                 continue
             if await satellite_busy():
@@ -9771,9 +9826,11 @@ async def dead_air_watch() -> None:
                         "kicking the show forward")
             _TALK_CUT[0] += 1
             dj_skip()
-            if strikes == 2:
+            if strikes == 2 and box_worth_healing():
                 # Second strike: assume the speaker link, not the show —
-                # rebuild it while the kick works its way through.
+                # rebuild it while the kick works its way through. #690: not
+                # when the show is deliberately on the page; a satellite
+                # rebuild cannot fix silence on a road nobody is using.
                 asyncio.create_task(satellite_selfheal())
             if strikes >= 3:
                 repair_note("dead air held through two kicks — "
@@ -9853,10 +9910,12 @@ async def resume_radio() -> None:
     try:
         # A restart mid-announce leaves the satellite stuck "responding"
         # (#391): heal BEFORE the show opens its mouth, not two minutes
-        # into talking at a wedged box.
-        await satellite_busy()
-        if str(_SAT_BUSY.get("state")) == "responding":
-            await satellite_selfheal()
+        # into talking at a wedged box. #690: only when the show is
+        # actually going to use the box.
+        if box_worth_healing():
+            await satellite_busy()
+            if str(_SAT_BUSY.get("state")) == "responding":
+                await satellite_selfheal()
     except Exception:
         pass
     try:
@@ -15298,8 +15357,12 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
     """Put a caller on air and let the pair take the topic apart."""
     brief = await callin_brief(topic)
     moods = random.sample(CALLIN_MOODS, 2)
+    # One line number for the whole call (#691): drawn once, so the hang-up
+    # cannot report them leaving a different line from the one they came in
+    # on.
+    line_say = call_line_say(call_line_no())
     who = caller.strip() or random.choice(
-        ["a caller", "a listener", f"someone on {call_line_say(call_line_no())}",
+        ["a caller", "a listener", f"someone on {line_say}",
          "a caller who would not give a name"])          # #673
 
     angle = (
@@ -15315,12 +15378,19 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
     if brief["manuals"]:
         angle += (f"\n\nWhat the gear manuals on the station computer say:"
                   f"\n{brief['manuals']}")
+    # #691: this call ends the way the shelf says calls end, same as any
+    # other — drawn by weight, played by the pair, written to the ledger.
+    rule = hangup_pick()
+    if rule.get("text"):
+        angle += f"\n\nBy the end of the call, {rule['text']}."
 
+    started = time.time()
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "callin",
         "text": f"Call-in: {topic}",
     })
     lines = await dj_banter(_RADIO.get("now"), angle=angle, lines=5)
+    call_ended(who, line_say, started, rule, len(lines or []))
     return {
         "lines": lines, "topic": topic, "caller": who,
         "researched": bool(brief["web"]), "from_manuals": bool(brief["manuals"]),
@@ -16054,6 +16124,186 @@ def call_line_say(number: int) -> str:
     return f"line {number:,}"
 
 
+# --- How calls END, and the ledger of how they did (#691) -------------------
+# Every call already finished on one of a fixed tuple of outcomes, drawn at
+# random and dropped into the prompt — a good house style with no door into
+# it. You could not add a way for a call to end, weight the ones you liked,
+# retire the one that had worn out, or see afterwards which ending a given
+# call actually took.
+#
+# The tuple becomes the SEED of an editable shelf instead. Rules are drawn by
+# weight, never the same one twice running, and every termination is written
+# down: which rule, for whom, how long the call ran, at what moment. The
+# booth shows the hang-up as its own line and the reason is a chip you click
+# to open the shelf.
+HANGUPS_PATH = Path("/app/data/hangup_rules.json")
+CALL_LOG_PATH = Path("/app/data/call_log.json")
+_HANGUP_LOCK = RLock()
+CALL_LOG_KEPT = 120
+
+
+def _hangup_seed() -> list[dict[str, Any]]:
+    return [{"id": uuid.uuid4().hex[:8], "text": text, "weight": 1.0,
+             "enabled": True, "uses": 0, "last": 0, "added": int(time.time())}
+            for text in CALLER_OUTCOMES]
+
+
+def hangup_rules() -> list[dict[str, Any]]:
+    """The shelf, seeded from the built-in outcomes the first time it is
+    asked for — so the house style is what you start editing, not an empty
+    box you have to refill before a call can end."""
+    with _HANGUP_LOCK:
+        try:
+            rows = json.loads(HANGUPS_PATH.read_text())
+            if isinstance(rows, list) and rows:
+                return [r for r in rows if isinstance(r, dict) and r.get("text")]
+        except Exception:
+            pass
+        rows = _hangup_seed()
+        _hangup_write(rows)
+        return rows
+
+
+def _hangup_write(rows: list[dict[str, Any]]) -> None:
+    try:
+        HANGUPS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HANGUPS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows[:200], indent=1) + "\n")
+        tmp.replace(HANGUPS_PATH)
+    except OSError:
+        pass
+
+
+def hangup_add(text: str, weight: float = 1.0) -> dict[str, Any]:
+    with _HANGUP_LOCK:
+        rows = hangup_rules()
+        entry = {"id": uuid.uuid4().hex[:8], "text": str(text)[:600],
+                 "weight": max(0.0, min(10.0, float(weight))),
+                 "enabled": True, "uses": 0, "last": 0,
+                 "added": int(time.time())}
+        rows.append(entry)
+        _hangup_write(rows)
+        return entry
+
+
+def hangup_update(rule_id: str, **fields: Any) -> dict[str, Any] | None:
+    with _HANGUP_LOCK:
+        rows = hangup_rules()
+        for row in rows:
+            if row.get("id") != rule_id:
+                continue
+            if "text" in fields:
+                row["text"] = str(fields["text"])[:600]
+            if "weight" in fields:
+                try:
+                    row["weight"] = max(0.0, min(10.0, float(fields["weight"])))
+                except (TypeError, ValueError):
+                    pass
+            if "enabled" in fields:
+                row["enabled"] = bool(fields["enabled"])
+            _hangup_write(rows)
+            return row
+    return None
+
+
+def hangup_delete(rule_id: str) -> bool:
+    with _HANGUP_LOCK:
+        rows = hangup_rules()
+        keep = [r for r in rows if r.get("id") != rule_id]
+        if len(keep) == len(rows):
+            return False
+        # Never empty the shelf: a call has to be able to end somehow, and
+        # an empty file re-seeds itself on the next read anyway, which would
+        # silently resurrect everything you just deleted.
+        if not keep:
+            return False
+        _hangup_write(keep)
+        return True
+
+
+def hangup_pick() -> dict[str, Any]:
+    """One ending, drawn by weight, avoiding the one used last. Falls back
+    to the built-in tuple only if the shelf has somehow been emptied."""
+    with _HANGUP_LOCK:
+        rows = [r for r in hangup_rules() if r.get("enabled", True)
+                and float(r.get("weight") or 0) > 0]
+        if not rows:
+            return {"id": "", "text": random.choice(CALLER_OUTCOMES)}
+        last = str(_RADIO.get("last_hangup_rule") or "")
+        pool = [r for r in rows if r.get("id") != last] or rows
+        weights = [float(r.get("weight") or 1) for r in pool]
+        pick = random.choices(pool, weights=weights, k=1)[0]
+        _RADIO["last_hangup_rule"] = pick.get("id") or ""
+        # Bump the tally on the stored copy, not the filtered snapshot.
+        stored = hangup_rules()
+        for row in stored:
+            if row.get("id") == pick.get("id"):
+                row["uses"] = int(row.get("uses") or 0) + 1
+                row["last"] = int(time.time())
+        _hangup_write(stored)
+        return pick
+
+
+def call_log_read() -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(CALL_LOG_PATH.read_text())
+        return rows if isinstance(rows, list) else []
+    except Exception:
+        return []
+
+
+def call_log_add(entry: dict[str, Any]) -> None:
+    """One finished call, written down: who, how long, and which rule ended
+    it. Kept on disk so the ledger survives a restart."""
+    with _HANGUP_LOCK:
+        rows = call_log_read()
+        rows.append(entry)
+        try:
+            CALL_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CALL_LOG_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows[-CALL_LOG_KEPT:], indent=1) + "\n")
+            tmp.replace(CALL_LOG_PATH)
+        except OSError:
+            pass
+    ring = _RADIO.setdefault("call_log", [])
+    ring.append(entry)
+    del ring[:-40]
+
+
+def call_ended(name: str, line_say: str, started: float,
+               rule: dict[str, Any], turns: int, state: str = "") -> None:
+    """The end of a call, marked in the booth and written to the ledger
+    (#691). Every call road goes through here, so a call is never just
+    something that stops scrolling: it ends at a stated time, after a
+    stated length, for a stated reason you can click."""
+    ended = time.time()
+    ran = max(0.0, ended - started)
+    outcome = str(rule.get("text") or "")
+    short = " ".join(outcome.split())
+    if len(short) > 110:
+        short = short[:107].rstrip(" ,.;—-") + "…"
+    _RADIO["chat"].append({
+        "ts": int(ended), "who": "drop", "kind": "hangup", "name": name,
+        # WHEN, plainly: the booth rows carry no clock of their own, and
+        # "they hung up" without a time is half the answer.
+        "text": (f"☎ {name} hung up on {line_say} at "
+                 f"{time.strftime('%H:%M:%S', time.localtime(ended))} — "
+                 f"{int(ran // 60)}m {int(ran % 60):02d}s on air"),
+        "reason": short or "no reason on file",
+        "rule": outcome,
+        "rule_id": str(rule.get("id") or ""),
+        "seconds": round(ran, 1),
+    })
+    del _RADIO["chat"][:-160]
+    call_log_add({
+        "ts": int(ended), "name": name, "line": line_say,
+        "seconds": round(ran, 1), "turns": int(turns),
+        "rule_id": str(rule.get("id") or ""), "rule": outcome,
+        "state": state,
+    })
+    pipeline_log("call", f"{name} hung up after {int(ran)}s — {short}")
+
+
 def read_callers() -> list[dict[str, Any]]:
     try:
         rows = json.loads(CALLERS_PATH.read_text())
@@ -16585,7 +16835,11 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         if character:
             caller = {**caller, "name": character}
     state = unrepeated(list(CALLER_STATES), "caller-state")
-    outcome = unrepeated(list(CALLER_OUTCOMES), "caller-outcome")
+    # #691: how this call ENDS, drawn off the editable shelf by weight
+    # rather than out of a frozen tuple. The rule travels with the call so
+    # the booth can name it afterwards and the ledger can count it.
+    hangup_rule = hangup_pick()
+    outcome = str(hangup_rule.get("text") or "")
     # The prose state seeds the caller's emotion vector, so "furious" is
     # not just a stage direction — it bends the pace, the pauses and the
     # stumbles of every line they say tonight (§30, §107).
@@ -16970,6 +17224,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         f"Format the caller's lines as 'C: ...' — C is {caller['name']}, "
         "who speaks in full sentences and gives as good as they get."
     )
+    call_started = time.time()
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "call",
         "text": f"On {line_say}: {caller['name']}",
@@ -17016,8 +17271,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         speakbox_remember(point)        # the caller's raised point rotates
     if lines and heat_pivot:
         speakbox_remember(heat_pivot)   # the post-heat creative pivot rotates
+
+    # #691: the call is over — say so in the booth, and say WHY. A call used
+    # to simply stop scrolling: the last caller line and then banter, with
+    # nothing marking the end, no duration, and no way to know which of the
+    # endings had been drawn. The line carries the rule that ended it, so
+    # the reason is clickable straight into the shelf it came from.
+    call_ended(caller["name"], line_say, call_started, hangup_rule,
+               len(lines or []), state)
+
     return {"caller": caller["name"], "lines": lines, "state": state,
-            "voice": mangle}
+            "voice": mangle, "hangup": str(outcome),
+            "rule_id": str(hangup_rule.get("id") or ""),
+            "seconds": round(ran, 1)}
 
 
 _TAPE_WARMED = [False]
@@ -18788,8 +19054,26 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     hot = booth_hot()
     # When the building is genuinely cooking, some callers ring in about
     # THAT instead, and they compete at it (#644).
-    if hot >= 62 and random.random() < 0.45:
-        return await dj_banter(track, lines=4, angle=(
+    heat_call = hot >= 62 and random.random() < 0.45
+    wants = [] if heat_call else [
+        line.lstrip("- ").strip()
+        for line in banter_material().splitlines()
+        if len(line.strip()) > 6
+    ]
+    if not heat_call and not wants:
+        return []                      # nothing of his to call in about yet
+    # #691: the request line ends its calls off the same shelf as every
+    # other road, so the rules you write govern ALL the calls and not just
+    # the long generated ones. Drawn only once the call is certain to
+    # happen — a pick bumps the rule's tally, and a call that never rang
+    # must not count toward it.
+    rule = hangup_pick()
+    tail = (f" By the end of the call, {rule['text']}."
+            if rule.get("text") else "")
+    started = time.time()
+    line_say = call_line_say(call_line_no())
+    if heat_call:
+        heat_lines = await dj_banter(track, lines=4, angle=(
             "A listener has got through and they are calling about the HEAT. "
             f"It is {hot:.0f} degrees Celsius, {hot * 9 / 5 + 32:.0f} "
             "Fahrenheit, in the building. Give them a name and a voice. They "
@@ -18800,21 +19084,20 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
             + heat_joke_bank() + ". The hosts try to beat the caller with "
             "their own, one of them brings it back to their own melting "
             "Pine Box, and it becomes a competition nobody wins. Then cut "
-            "back to the record."))
-    wants = [
-        line.lstrip("- ").strip()
-        for line in banter_material().splitlines()
-        if len(line.strip()) > 6
-    ]
-    if not wants:
-        return []                      # nothing of his to call in about yet
+            "back to the record." + tail))
+        call_ended("the caller about the heat", line_say, started, rule,
+                   len(heat_lines or []))
+        return heat_lines
     want = random.choice(wants)[:160]
-    return await dj_banter(track, lines=4, also_name=want, angle=(
+    lines = await dj_banter(track, lines=4, also_name=want, angle=(
         "a caller has got through on the request line. Give them a name, and "
         "between the two of you relay what they are asking for, which is "
         f"this: \"{want}\". Take the call with unmistakable "
-        f"{random.choice(CALLER_MOODS)}, then cut back to the record."
+        f"{random.choice(CALLER_MOODS)}, then cut back to the record." + tail
     ))
+    call_ended("the caller on the request line", line_say, started, rule,
+               len(lines or []))
+    return lines
 
 
 # --- Getting the box unstuck (#134) ----------------------------------------
@@ -20898,7 +21181,7 @@ async def voice_engine_list(
     # ha/ha_file readiness is a live probe now, not token-presence (audit:
     # both claimed "ready" with HA down). The satellite must exist AND not
     # be unavailable for the box path to actually work.
-    ha_ready = bool(token) and await satellite_ready()
+    ha_ready = bool(token) and await satellite_ready(heal=False)   # #690
     ledger = _voice_ledger()
     xtts = await xtts_health()
     voxtral = await voxtral_health()
@@ -23254,6 +23537,16 @@ async def dj_output_api(
         _RADIO["box_talk"] = bool(talk)
         if not _RADIO["box_talk"]:
             _BOX_HOLD.clear()     # nothing shelved gets replayed at it later
+            # #690: switching the box off ends any repair in progress. The
+            # breaker, the failure count and the "The DJs are on it" banner
+            # all describe a speaker the station is no longer calling —
+            # leaving them up meant flipping the switch off and then
+            # watching a repair run for another three minutes.
+            _BOX_DOWN["until"] = 0.0
+            _BOX_DOWN["fails"] = 0
+            _RADIO.pop("repairing", None)
+            pipeline_log("air", "Pine Box switched off — the station stops "
+                                "calling it, and stops repairing it (#690)")
     _routing_save()
     return dj_state()
 
@@ -23428,6 +23721,80 @@ async def dj_force_api(
         f"slammed a record onto the player — {title} — and it is "
         "starting right now"))
     return {"forced": track.get("id"), "title": title, **dj_state()}
+
+
+@app.get("/api/dj/hangups")
+async def dj_hangups_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """How calls are allowed to end, and how the last hundred actually did
+    (#691). The rules are drawn by weight and never twice running; the
+    ledger says which one ended which call, for whom, and how long they had
+    been on air."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(hangup_rules)
+    log = list(reversed(await asyncio.to_thread(call_log_read)))[:40]
+    live = [r for r in rows if r.get("enabled", True)
+            and float(r.get("weight") or 0) > 0]
+    total = sum(float(r.get("weight") or 0) for r in live) or 1.0
+    return {
+        "rules": [
+            {**r,
+             # What share of calls this one takes, so the weights read as
+             # the odds they are rather than as bare numbers.
+             "share": (round(float(r.get("weight") or 0) / total * 100, 1)
+                       if (r.get("enabled", True)
+                           and float(r.get("weight") or 0) > 0) else 0.0)}
+            for r in rows],
+        "calls": log,
+        "seeded": len(CALLER_OUTCOMES),
+    }
+
+
+@app.post("/api/dj/hangups")
+async def dj_hangups_save(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Add a way for a call to end, or change one. With `id` it edits;
+    without, it adds."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    rule_id = str(payload.get("id") or "")
+    if rule_id:
+        fields = {k: payload[k] for k in ("text", "weight", "enabled")
+                  if k in payload}
+        row = await asyncio.to_thread(hangup_update, rule_id, **fields)
+        if not row:
+            raise HTTPException(status_code=404, detail="No such rule")
+        return {"rule": row}
+    text = " ".join(str(payload.get("text") or "").split())
+    if len(text) < 8:
+        raise HTTPException(
+            status_code=400,
+            detail="Write the ending as a direction to the pair — "
+                   "\"the caller …\" — long enough to act on.")
+    try:
+        weight = float(payload.get("weight", 1.0))
+    except (TypeError, ValueError):
+        weight = 1.0
+    return {"rule": await asyncio.to_thread(hangup_add, text, weight)}
+
+
+@app.delete("/api/dj/hangups/{rule_id}")
+async def dj_hangups_delete(
+    rule_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Retire one ending. The last one standing cannot be removed — a call
+    has to be able to finish somehow."""
+    require_auth(authorization)
+    if not await asyncio.to_thread(hangup_delete, rule_id):
+        raise HTTPException(
+            status_code=400,
+            detail="No such rule, or it is the last one left — a call has "
+                   "to be able to end somehow.")
+    return {"deleted": rule_id}
 
 
 @app.post("/api/dj/queue/move")
@@ -38311,6 +38678,12 @@ function djTalkPopup() {
   grab.title = "Download the last stretch of the live broadcast — music, "
     + "ads and talk, mixed at the levels you are listening at (#679)";
   grab.onclick = (ev) => { ev.stopPropagation(); djTailPanel(head); };
+  // #691: how calls end, and how the last hundred did. Also reachable by
+  // clicking the reason on any hang-up line in the log.
+  const hang = el("button", "", "☎");
+  hang.title = "How calls end — the randomized termination rules, their "
+    + "odds, and the ledger of which ending each call took";
+  hang.onclick = (ev) => { ev.stopPropagation(); hangupRules(""); };
   // #656: the history is kept forever now, so there is a way to end it —
   // and only this, never the window doing it on its own.
   const wipe = el("button", "", "⌫");
@@ -38330,6 +38703,7 @@ function djTalkPopup() {
   head.appendChild(title);
   head.appendChild(dot);                                        // #678
   head.appendChild(grab);
+  head.appendChild(hang);                                       // #691
   head.appendChild(wipe);
   head.appendChild(mute);
   head.appendChild(shut);
@@ -38636,6 +39010,200 @@ function boothGlassStop() {
   boothGlassRaf = 0;
 }
 
+/* ---- How calls END (#691) ---------------------------------------------
+ * Every call finished on one of a frozen tuple of directions, drawn at
+ * random and dropped into the prompt. You could not add one, weight the
+ * ones that landed, retire the one that had worn out, or find out
+ * afterwards which ending a given call had actually taken.
+ *
+ * This is the door into it: the shelf of endings with their odds, and the
+ * ledger of which one ended which call. Opened by clicking the reason on a
+ * hang-up line in the booth.
+ */
+async function hangupRules(focusId) {
+  const open = document.getElementById("hangupModal");
+  if (open) open.remove();
+  const shade = el("div", "", "");
+  shade.id = "hangupModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:186;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(680px,94vw);max-height:84vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:4px";
+  head.appendChild(el("h2", "", "☎ How calls end"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  const why = el("div", "muted",
+    "One of these is drawn for every call — by weight, never the same one "
+    + "twice running — and handed to the pair as the direction they play "
+    + "the ending on. Weight is the odds; zero or unticked takes it out of "
+    + "the draw without deleting it. Everything here steers future calls.");
+  why.style.cssText = "font-size:11.5px;line-height:1.55;margin-bottom:10px";
+  box.appendChild(why);
+  const body = el("div", "", "");
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  async function draw() {
+    body.textContent = "Loading…";
+    let data = {rules: [], calls: []};
+    try { data = await api("/api/dj/hangups"); }
+    catch (e) { body.textContent = e.message; return; }
+    body.textContent = "";
+
+    // --- add a new one ------------------------------------------------
+    const add = el("div", "", "");
+    add.style.cssText = "display:flex;gap:6px;margin-bottom:12px";
+    const text = el("input", "", "");
+    text.type = "text";
+    text.placeholder = "the caller … (a direction to the pair, in prose)";
+    text.style.cssText = "flex:1;min-width:0;font-size:12px";
+    const go = el("button", "primary", "+ Add");
+    const submit = async () => {
+      const value = text.value.trim();
+      if (value.length < 8) {
+        setStatus("write it as a direction the pair can act on", true);
+        return;
+      }
+      const done = pending(go, "…");
+      try {
+        await api("/api/dj/hangups", {method: "POST",
+          body: JSON.stringify({text: value, weight: 1})});
+        text.value = "";
+        await draw();
+      } catch (e) { setStatus(e.message, true); }
+      finally { done(); }
+    };
+    go.onclick = submit;
+    text.onkeydown = (e) => { if (e.key === "Enter") submit(); };
+    add.appendChild(text); add.appendChild(go);
+    body.appendChild(add);
+
+    // --- the shelf ------------------------------------------------------
+    (data.rules || []).forEach((rule) => {
+      const row = el("div", "", "");
+      const lit = rule.id && rule.id === focusId;
+      row.style.cssText = "border-top:1px solid var(--border);padding:7px 6px;"
+        + "display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap"
+        + (lit ? ";background:#1a0f14;border-radius:7px;"
+               + "box-shadow:inset 3px 0 0 #ff9db1" : "");
+      const on = el("input", "", "");
+      on.type = "checkbox";
+      on.checked = rule.enabled !== false;
+      on.title = "In the draw";
+      on.style.cssText = "flex:0 0 auto;margin-top:3px";
+      on.onchange = async () => {
+        try {
+          await api("/api/dj/hangups", {method: "POST",
+            body: JSON.stringify({id: rule.id, enabled: on.checked})});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      row.appendChild(on);
+      const body2 = el("div", "", "");
+      body2.style.cssText = "flex:1;min-width:180px";
+      const words = el("div", "", rule.text);
+      words.style.cssText = "font-size:12px;line-height:1.45;cursor:text;"
+        + (rule.enabled === false ? "opacity:.5;" : "");
+      words.title = "Click to rewrite this ending";
+      words.onclick = () => {
+        const edit = document.createElement("textarea");
+        edit.value = rule.text;
+        edit.style.cssText = "width:100%;min-height:64px;font:inherit;"
+          + "font-size:12px";
+        const save = async (commit) => {
+          const value = edit.value.trim();
+          if (commit && value.length >= 8 && value !== rule.text) {
+            try {
+              await api("/api/dj/hangups", {method: "POST",
+                body: JSON.stringify({id: rule.id, text: value})});
+              await draw();
+              return;
+            } catch (e) { setStatus(e.message, true); }
+          }
+          edit.replaceWith(words);
+        };
+        edit.onblur = () => save(true);
+        edit.onkeydown = (e) => { if (e.key === "Escape") save(false); };
+        words.replaceWith(edit);
+        edit.focus();
+      };
+      body2.appendChild(words);
+      const stat = el("div", "muted", "used " + (rule.uses || 0) + "×"
+        + (rule.last ? " · last "
+           + new Date(rule.last * 1000).toLocaleString() : " · never yet")
+        + (rule.share ? " · " + rule.share + "% of calls" : ""));
+      stat.style.cssText = "font-size:10.5px;margin-top:3px";
+      body2.appendChild(stat);
+      row.appendChild(body2);
+      const w = el("input", "", "");
+      w.type = "range"; w.min = "0"; w.max = "5"; w.step = "0.5";
+      w.value = String(rule.weight != null ? rule.weight : 1);
+      w.title = "How often this ending comes up";
+      w.style.cssText = "flex:0 0 110px";
+      const wv = el("span", "muted", "×" + w.value);
+      wv.style.cssText = "font-size:11px;width:30px;text-align:right";
+      w.oninput = () => { wv.textContent = "×" + w.value; };
+      w.onchange = async () => {
+        try {
+          await api("/api/dj/hangups", {method: "POST",
+            body: JSON.stringify({id: rule.id, weight: Number(w.value)})});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      row.appendChild(w); row.appendChild(wv);
+      const kill = el("button", "danger", "✕");
+      kill.title = "Retire this ending";
+      kill.style.cssText = "flex:0 0 auto;padding:2px 8px;font-size:11px";
+      kill.onclick = async () => {
+        if (!confirm("Retire this ending?")) return;
+        try {
+          await api("/api/dj/hangups/" + rule.id, {method: "DELETE"});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      row.appendChild(kill);
+      body.appendChild(row);
+    });
+
+    // --- what actually happened ----------------------------------------
+    const h = el("div", "", "📓 The last calls, and how each one ended");
+    h.style.cssText = "font-weight:700;margin:16px 0 4px;font-size:13px";
+    body.appendChild(h);
+    if (!(data.calls || []).length) {
+      const none = el("div", "muted",
+        "No calls logged yet — the ledger fills as the phone rings.");
+      none.style.cssText = "font-size:11.5px";
+      body.appendChild(none);
+    }
+    (data.calls || []).forEach((c) => {
+      const row = el("div", "", "");
+      row.style.cssText = "border-top:1px solid var(--border);padding:5px 4px;"
+        + "font-size:11.5px;line-height:1.45";
+      const when = c.ts ? new Date(c.ts * 1000).toLocaleTimeString() : "";
+      const secs = Math.round(c.seconds || 0);
+      const head2 = el("div", "", "☎ " + (c.name || "a caller") + " · "
+        + Math.floor(secs / 60) + "m " + String(secs % 60).padStart(2, "0")
+        + "s · " + (c.turns || 0) + " turns · " + when);
+      head2.style.color = "#ff9db1";
+      row.appendChild(head2);
+      const said = el("div", "muted", c.rule || "");
+      said.style.cssText = "font-size:11px;margin-top:2px";
+      row.appendChild(said);
+      body.appendChild(row);
+    });
+  }
+  draw();
+}
+
 /* #656: the whole night, kept. The server only ever hands over the last
  * eighty lines, so a busy show scrolled its own history off the end and the
  * window looked like it was resetting itself. Everything that arrives is
@@ -38773,6 +39341,31 @@ function djTalkRender(state) {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
       + "padding:3px 4px;border-radius:5px";
+    // #691: the call ended. A call used to just stop scrolling — no mark,
+    // no length, no reason. This is the end of it, said plainly, with the
+    // WHY as a chip that opens the shelf of endings it was drawn from.
+    if (line.kind === "hangup") {
+      row.style.cssText += ";background:#1a0f14;border:1px solid #4a2230;"
+        + "flex-direction:column;gap:3px;margin:4px 0";
+      const head = el("div", "", line.text || "the call ended");
+      head.style.cssText = "font-size:11.5px;color:#ff9db1;font-weight:600";
+      row.appendChild(head);
+      const why = el("button", "", "⛓ " + (line.reason || "no reason on file"));
+      why.title = (line.rule || "")
+        + "\n\nClick to open how call terminations are handled — the rules "
+        + "are randomized per call and steer every future one.";
+      why.style.cssText = "background:#2a1620;border:1px solid #63304a;"
+        + "color:#ffc2d1;border-radius:8px;padding:2px 8px;font-size:11px;"
+        + "cursor:pointer;text-align:left;line-height:1.4;max-width:100%;"
+        + "white-space:normal";
+      why.onclick = (ev) => {
+        ev.stopPropagation();
+        hangupRules(line.rule_id || "");
+      };
+      row.appendChild(why);
+      log.appendChild(row);
+      return;
+    }
     // A sample dropped off the end of a phrase shows up between the lines
     // (#277), with the same votes the chat feed carries (#269).
     if (line.kind === "sfx") {
