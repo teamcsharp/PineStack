@@ -4063,6 +4063,14 @@ _SAT_BUSY_FRESH = 1.5
 # these the show reads its own voice as a stranger and gags itself.
 _SPEAKING = [0]                    # depth, not a flag: announces can nest
 _SPOKE_AT = [0.0]
+# WHICH line is going out right now (#742). `speaking` was a bare boolean and
+# the entry was only written to chat once the line had FINISHED airing — so
+# for the whole minute a line was actually sounding it did not exist in the
+# booth at all, and "jump to what is being said" had nothing to jump to. This
+# is that line, published from the moment it is handed over, carrying the id
+# the finished entry will land under so the two are one row and not two.
+_SPEAKING_NOW: dict[str, Any] = {}
+_SPEAKING_NOW_MAX = 300.0          # a stuck announce ages out rather than lying
 # When we last saw a REAL human turn (the box in listening/processing).
 # This box is announce-only so it stays 0 — which is the point: a
 # "responding" state with no recent real turn is a wedge, not a person.
@@ -8802,6 +8810,12 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # shelf is. Either way the page carries everything when the box can't (#536).
     box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                 or len(_BOX_HOLD) >= 6)
+    # #742: the line exists in the booth from HERE — the moment it is handed
+    # to a speaker — not fifty seconds later when the announce returns. It
+    # carries the id the finished entry lands under, so the provisional row
+    # and the real one are the same row.
+    line_id = uuid.uuid4().hex[:6]
+    _speaking_now_set(line_id, who, kind, spoken, name, forced or "", engine)
     paged = False
     if voice_to in ("here", "both") or (to_box and box_down):
         if clip:
@@ -8997,8 +9011,11 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             why = ""
         else:
             note_drop(who, spoken, f"never aired (no voice) — {why}"[:200])
+            _speaking_now_clear(line_id)
             return ""
+    _speaking_now_clear(line_id)
     entry = {
+        "id": line_id,                                            # #742
         "ts": int(time.time()), "who": who, "kind": kind, "text": spoken,
         "name": name or (dj_settings()["cohost_name"] if who == "cohost"
                          else dj_settings()["third_name"]
@@ -9117,6 +9134,52 @@ def dj_last_said() -> dict[str, Any]:
     return _RADIO.get("last_said") or {}
 
 
+def _speaking_now_set(line_id: str, who: str, kind: str, text: str,
+                      name: str = "", voice: str = "",
+                      engine: str = "") -> None:
+    """Publish the line that is going out RIGHT NOW (#742).
+
+    The booth could only ever show lines that had already FINISHED airing,
+    because that is when the chat entry is written. In box mode the page
+    also has no audio element to match against, so "jump to what is being
+    said" had nothing to find and always fell through to "the last line
+    said" — which is the line BEFORE the one you can hear."""
+    _SPEAKING_NOW.clear()
+    _SPEAKING_NOW.update({
+        "id": line_id,
+        "ts": int(time.time()),
+        "at": time.time(),
+        "who": who,
+        "kind": kind,
+        "text": text,
+        "name": name or (dj_settings()["cohost_name"] if who == "cohost"
+                         else dj_settings()["third_name"] if who == "third"
+                         else "DJ"),
+        "voice": voice,
+        "engine": engine,
+        "aired": "airing",
+    })
+
+
+def _speaking_now_clear(line_id: str = "") -> None:
+    """Take it down again — but only if it is still OUR line. A nested
+    announce (a sting, an ad off the end of a turn) must not blank the
+    entry of the line it decorated."""
+    if not line_id or _SPEAKING_NOW.get("id") == line_id:
+        _SPEAKING_NOW.clear()
+
+
+def speaking_now() -> dict[str, Any] | None:
+    """What the booth should show as live, or None. Ages out on its own so a
+    wedged announce leaves a stale 'going out now' row up forever (#742)."""
+    if not _SPEAKING_NOW:
+        return None
+    if time.time() - float(_SPEAKING_NOW.get("at") or 0) > _SPEAKING_NOW_MAX:
+        _SPEAKING_NOW.clear()
+        return None
+    return {k: v for k, v in _SPEAKING_NOW.items() if k != "at"}
+
+
 def _ensure_chat_ids() -> None:
     """Every message carries a short stable code the operator can copy to
     point us back at that exact line (#469), or right-click to delete from a
@@ -9233,6 +9296,11 @@ def dj_state() -> dict[str, Any]:
         # the page decides for itself, from the clip actually sounding —
         # this side only ever knows when it handed one over (#651).
         "speaking": bool(_SPEAKING[0]),
+        # …and WHICH line it is (#742). The page can only match audio it is
+        # playing itself; when the box carries the show there is no element
+        # to match, so the id has to come from here or the live line is
+        # simply unfindable.
+        "speaking_now": speaking_now(),
         # #729: seconds until the pair are next due to say something,
         # or None when they are already talking / the torrent is off.
         "talk_next_in": (
@@ -11272,6 +11340,42 @@ _ADS_LOCK = RLock()
 PRODUCED_ADS_DIR = Path("/app/data/ads_audio")
 AD_AUDIO_SHAPE = re.compile(r"^[a-f0-9]{6,32}\.mp3\Z")
 
+# When each spot actually WENT OUT (#743). The ad rows carry when they were
+# written and a `uses` tally, which cannot answer "the ads from the last
+# three hours" — the question the ads desk is built around. One line per
+# airing, on disk, so a restart does not lose the run of the day.
+AD_AIRINGS_PATH = Path("/app/data/ad_airings.json")
+_AD_AIRINGS_KEPT = 4000
+
+
+def ad_airings() -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(AD_AIRINGS_PATH.read_text())
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+def ad_aired(entry: dict[str, Any], where: str = "") -> None:
+    """Write down that this spot just went out."""
+    with _ADS_LOCK:
+        rows = ad_airings()
+        rows.append({
+            "ts": int(time.time()),
+            "id": str(entry.get("id") or ""),
+            "product": str(entry.get("product") or "")[:160],
+            "audio": str(entry.get("audio") or ""),
+            "words": len(str(entry.get("text") or "").split()),
+            "where": where,
+        })
+        try:
+            AD_AIRINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = AD_AIRINGS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows[-_AD_AIRINGS_KEPT:]) + "\n")
+            tmp.replace(AD_AIRINGS_PATH)
+        except OSError:
+            pass
+
 
 def ad_list() -> list[dict[str, Any]]:
     try:
@@ -11944,6 +12048,10 @@ async def dj_ad(product: str, remember: bool = True,
              if (remember and line) else None)
     if entry:
         ad_line_mark(entry.get("id", ""), product)
+        ad_aired(entry, _RADIO.get("voice_to") or "box")             # #743
+    elif line:
+        ad_aired({"product": product, "text": line},
+                 _RADIO.get("voice_to") or "box")
     back = ""
     if _RADIO["on"] and _RADIO.get("now"):
         back = await dj_speak(
@@ -12570,7 +12678,8 @@ def _ad_bed_share() -> float:
 def _music_ad_mix_blocking(voice_path: Path, music_path: str,
                            voice_seconds: float, start: float,
                            sfx_path: str | None = None,
-                           bed_pct: float | None = None) -> bytes | None:
+                           bed_pct: float | None = None,
+                           bed_len: float | None = None) -> bytes | None:
     """Mix an ad voice over a bed of real music (#463): the music swells in
     alone, ducks under the read (sidechained to the voice) and swells back
     out — one clip, 24k mono. When `sfx_path` is given, a sound effect is
@@ -12598,6 +12707,11 @@ def _music_ad_mix_blocking(voice_path: Path, music_path: str,
                               else _ad_bed_share()))
     graph = (
         f"[1:a]atrim=0:{total:.2f},asetpts=PTS-STARTPTS,"
+        # #734: a hand-set cue OUT can make the bed shorter than the read.
+        # amix takes its length from the first input, which is the ducked
+        # BED — so without this the ad itself was cut off at the cue point.
+        # Pad the bed out to the full length and the read always finishes.
+        f"apad=whole_dur={total:.2f},"
         # Same reference as the read (below), so "30%" is 30% OF THE
         # VOICE and not of some other yardstick.
         "loudnorm=I=-16:LRA=11:TP=-2.0,"
@@ -12615,8 +12729,13 @@ def _music_ad_mix_blocking(voice_path: Path, music_path: str,
         "[bed][voxduck]sidechaincompress=threshold=0.03:ratio=12:attack=15:"
         "release=350[duck];"
     )
+    # #734: the cue window the studio set on the bed, if it set one. Never
+    # longer than the spot needs — apad above covers a window that is shorter.
+    grab = total + 2
+    if bed_len and bed_len > 0.5:
+        grab = min(grab, float(bed_len))
     ins = ["-i", str(voice_path),
-           "-ss", f"{max(0.0, start):.2f}", "-t", f"{total + 2:.2f}",
+           "-ss", f"{max(0.0, start):.2f}", "-t", f"{grab:.2f}",
            "-i", music_path]
     if sfx_path:
         # The sting rides the intro swell (input 2), a touch under the bed.
@@ -12823,6 +12942,11 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
         return
     path, sig = f"/ads-audio/{name}", media_sign(name)
     label = "📣 " + (entry.get("product") or "a produced spot")
+    # #731: what is being SOLD right now, so the booth can light the tile of
+    # the spot actually on air. A stored rerun never set this, which is why a
+    # produced spot played silently past its own entry in the log.
+    _RADIO["ad_now"] = {"product": str(entry.get("product") or "")[:160],
+                        "at": time.time()}
     ad_to = _RADIO.get("voice_to") or "box"
     box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                 or len(_BOX_HOLD) >= 6)
@@ -12848,12 +12972,16 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
         "aired": "box" if ad_to in ("box", "both") else "page",
     })
     del _RADIO["chat"][:-160]
+    ad_aired(entry, "box" if ad_to in ("box", "both") else "page")   # #743
 
 
 async def ad_produce(product: str, script: str, voice: str,
                      track_id: str, remember: bool = True,
                      air: bool = True,
-                     bed_pct: float | None = None) -> dict[str, Any]:
+                     bed_pct: float | None = None,
+                     bed_in: float | None = None,
+                     bed_out: float | None = None,
+                     ad_id: str = "") -> dict[str, Any]:
     """Build one ad by hand (#618): a chosen (or written) read, in a chosen
     voice, vocoded and mixed over a chosen song with a sound effect punched in,
     saved with its finished audio so the DJs can rerun it between tracks, after
@@ -12898,7 +13026,15 @@ async def ad_produce(product: str, script: str, voice: str,
         bed_title = str(track.get("title") or "a track")
         secs = float(track.get("seconds") or 0)
         loved = loved_moment(str(track.get("id") or ""))     # #683
-        if loved is not None:
+        # #734: a cue point set by hand in the studio outranks both the
+        # "loved moment" and the random drop-in — you picked the bar the
+        # read should sit over, so that is the bar it sits over.
+        bed_len: float | None = None
+        if bed_in is not None and bed_in >= 0:
+            start = float(bed_in)
+            if bed_out is not None and bed_out > bed_in:
+                bed_len = float(bed_out) - float(bed_in)
+        elif loved is not None:
             start = max(0.0, loved - 4.0)
             if secs > 10:
                 start = min(start, max(0.0, secs - 12.0))
@@ -12910,7 +13046,7 @@ async def ad_produce(product: str, script: str, voice: str,
         wav = await asyncio.to_thread(
             _music_ad_mix_blocking, VOICE_MEDIA_DIR / voice_key,
             str(track["path"]), _clip_seconds(clip["path"]) or 8.0, start,
-            str(sfx) if sfx else None, bed_pct)
+            str(sfx) if sfx else None, bed_pct, bed_len)
     if not wav:
         # No bed (or the mix failed): keep the dry vocoded read as the ad —
         # and say so honestly rather than naming a bed that is not in it.
@@ -12922,10 +13058,23 @@ async def ad_produce(product: str, script: str, voice: str,
             wav = None
     if not wav:
         return {"error": "Could not render the ad audio."}
-    entry = ad_save(product or line[:40], line, kind="produced")
+    # #743: re-cutting a spot you have EDITED keeps it the same spot — same
+    # id, same place in the book, its audio replaced. Making a second entry
+    # every time you fixed a word was how the book filled with near-copies.
+    existing = (next((r for r in ad_list() if r.get("id") == ad_id), None)
+                if ad_id else None)
+    if existing:
+        ad_update(existing["id"], product=product or existing.get("product")
+                  or line[:40], text=line)
+        entry = dict(existing)
+        entry["text"] = line
+        entry["product"] = product or existing.get("product") or line[:40]
+    else:
+        entry = ad_save(product or line[:40], line, kind="produced")
     name = await asyncio.to_thread(_produced_ad_write, wav, entry["id"])
     if not name:
-        ad_delete(entry["id"])
+        if not existing:
+            ad_delete(entry["id"])
         return {"error": "Could not store the ad audio."}
     ad_update(entry["id"], audio=name, voice=v, bed=bed_title)
     entry.update({"audio": name, "voice": v, "bed": bed_title})
@@ -13272,22 +13421,31 @@ def gallery_sample(limit: int = 8) -> list[str]:
     return out
 
 
-async def describe_gallery_image() -> tuple[str, str]:
-    """A random picture off the render machine, actually LOOKED AT (#341):
-    the resident model is multimodal, so the description comes from the
-    pixels, not from the prompt that made them. Returns (filename,
-    description) or ("", "")."""
+async def describe_gallery_image(want: str = "") -> tuple[str, str]:
+    """A picture off the render machine, actually LOOKED AT (#341): the
+    resident model is multimodal, so the description comes from the pixels,
+    not from the prompt that made them. `want` names ONE picture — that is
+    how a piece you chose off the wall gets hawked (#719/#723) rather than
+    whatever the draw came up with. Returns (filename, description) or
+    ("", "")."""
     try:
         pool = [p for p in COMFY_OUTPUT.rglob("*")
                 if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
                 and p.stat().st_size < 24_000_000]
         if not pool:
             return "", ""
-        # Fresh walls (#343): pictures already shown wait until the rest
-        # of the gallery has had its turn.
+        picked = None
+        if want:
+            picked = next((p for p in pool if p.name == want), None)
+            if picked is None:
+                return "", ""
+        if picked is None:
+            # Fresh walls (#343): pictures already shown wait until the rest
+            # of the gallery has had its turn.
+            unseen = [p for p in pool
+                      if p.name not in _RADIO.setdefault("gallery_shown", [])]
+            picked = random.choice(unseen or pool)
         shown = _RADIO.setdefault("gallery_shown", [])
-        unseen = [p for p in pool if p.name not in shown]
-        picked = random.choice(unseen or pool)
         shown.append(picked.name)
         del shown[:-60]
         image_b64 = base64.b64encode(picked.read_bytes()).decode()
@@ -13385,6 +13543,132 @@ async def dj_gallery_round() -> list[str]:
     gallery_line_mark([n for n, _ in pieces], began)
     if lines and seed:
         speakbox_remember(seed)
+    return lines
+
+
+# --- Hawking the art (#719, #723) -------------------------------------------
+#
+# The gallery round picked its own paintings and talked ABOUT them. This is
+# the sales floor: pictures YOU chose, pitched at a named disposition, to a
+# person on the line who either buys or refuses — and what does not sell is
+# put aside, out loud, and the show carries on.
+HAWK_MOODS = {
+    "curious": "genuinely interested and full of questions about it",
+    "impressed": "openly impressed, and says so more than once",
+    "disgusted": "revolted by it and not hiding it",
+    "appalled": "morally appalled that this is being sold at all",
+    "angry": "angry — at the price, at the picture, at being asked",
+    "emotional": "unexpectedly moved, close to tears about it",
+    "effect": "affected by it in a way they cannot explain",
+    "drunk": "several drinks in and not tracking the pitch",
+    "inattentive": "not really listening, answering a beat late",
+    "distracted": "distracted by something on their end all through it",
+    "not understanding": "not understanding what is being described at all",
+    "too expensive": "sure it is far too expensive and haggling hard",
+}
+# How long a hawk segment is 'on' for — callers who land inside it get asked.
+HAWK_WINDOW = 420.0
+
+
+def hawking_now() -> dict[str, Any] | None:
+    """The sale in progress, or None once it has run its course."""
+    hawk = _RADIO.get("hawking")
+    if not hawk or time.time() - float(hawk.get("at") or 0) > HAWK_WINDOW:
+        return None
+    return hawk
+
+
+def hawk_unsold() -> list[dict[str, Any]]:
+    """The pile by the desk: what was hawked and did not go."""
+    return list(_RADIO.get("hawk_unsold") or [])
+
+
+async def dj_hawk_round(names: list[str], moods: list[str],
+                        price: int = 0) -> list[str]:
+    """The pair take pictures off the wall and try to SELL them, on air.
+
+    They describe what they can actually see (the vision model looks), pitch
+    it, work the person on the other end at whatever disposition was asked
+    for — and that person buys it or refuses it outright. Anything unsold is
+    put aside, said out loud, and they get back to work."""
+    pieces: list[tuple[str, str]] = []
+    for name in [n for n in names if n][:3]:
+        got, desc = await describe_gallery_image(name)
+        if desc:
+            pieces.append((got or name, desc))
+    if not pieces:
+        # Nothing could be looked at — fall back to the wall's own draw so
+        # pressing the thing never does nothing.
+        got, desc = await describe_gallery_image()
+        if desc:
+            pieces.append((got, desc))
+    if not pieces:
+        return []
+    dj = dj_settings()
+    ask = price or random.randint(dj["ad_price_low"], dj["ad_price_high"])
+    _RADIO["gallery_now"] = {
+        "at": time.time(),
+        "images": [{"name": n, "desc": d} for n, d in pieces],
+    }
+    _RADIO["hawking"] = {
+        "at": time.time(),
+        "images": [n for n, _ in pieces],
+        "moods": [m for m in moods if m in HAWK_MOODS],
+        "price": ask,
+    }
+    chosen = [m for m in moods if m in HAWK_MOODS]
+    if not chosen:
+        chosen = random.sample(list(HAWK_MOODS), k=random.choice((1, 2)))
+    mood_text = "; ".join(HAWK_MOODS[m] for m in chosen[:4])
+    listing = " ".join(
+        f"PIECE {i + 1}: \"{desc}\"" for i, (_, desc) in enumerate(pieces))
+    seed = await speakbox_quote(most=4, cap=380)
+    angle = (
+        "THE PAIR ARE SELLING ART, LIVE ON AIR. They have taken "
+        f"{len(pieces)} piece(s) off the station wall and they are hawking "
+        f"them to whoever is on the line. {listing} "
+        "Describe what you are LOOKING AT in your own words — colours, "
+        "figures, what it does to you — then SELL it: hard, funny, "
+        f"shameless, asking {ask} dollars. "
+        "The person on the other end is a real presence in this: they "
+        f"answer back, and they are {mood_text}. Work them. They either BUY "
+        "it — and you make far too much of that — or they REFUSE it "
+        "outright, saying plainly it is not for them, and you take that on "
+        "the chin. Push the limit of what a sales pitch can be: strange "
+        "comparisons, invented provenance, escalating claims, unique every "
+        "time. "
+        "ANYTHING THAT DOES NOT SELL you PUT ASIDE out loud — 'right, that "
+        "one goes back against the wall' — and you get straight back to "
+        "work, which is the radio show."
+        + (f" Somewhere in it one of you drops this, word for word, as "
+           f"though it explains the art: \"{seed['text']}\"" if seed else ""))
+    began = time.time()
+    lines = await dj_banter(None, angle=angle, lines=12,
+                            source=(seed or {}).get("file", ""))
+    gallery_line_mark([n for n, _ in pieces], began)
+    if lines and seed:
+        speakbox_remember(seed)
+    # What the round said about each piece decides nothing on its own — the
+    # honest record is that it was offered. Anything offered goes on the
+    # pile unless a later round sells it, and the pile is what the pair get
+    # asked about when the phone next rings (#719).
+    # Whole words and whole phrases only: "deal" alone matches "a great deal"
+    # and "ideal", and "sold" matches "consoled" — a loose test here would
+    # quietly mark everything sold and the pile would never fill.
+    sold_words = re.compile(
+        r"\b(sold|sold it|i(?:'| wi)?ll take it|it'?s yours|you'?ve got "
+        r"(?:a |your )?deal|wrapped (?:it|that) up)\b")
+    said = " ".join(lines or []).lower()
+    pile = _RADIO.setdefault("hawk_unsold", [])
+    went = bool(sold_words.search(said))
+    for name, desc in pieces:
+        if went:
+            continue
+        if any(str(p.get("name")) == name for p in pile):
+            continue
+        pile.append({"name": name, "at": int(time.time()),
+                     "price": ask, "desc": desc[:200]})
+    del pile[:-24]
     return lines
 
 
@@ -17067,9 +17351,32 @@ def hangup_delete(rule_id: str) -> bool:
         return True
 
 
-def hangup_pick() -> dict[str, Any]:
-    """One ending, drawn by weight, avoiding the one used last. Falls back
-    to the built-in tuple only if the shelf has somehow been emptied."""
+def caller_hangup_pin(name: str) -> str:
+    """The ending pinned to one caller, if any (#715). A regular who always
+    gets the phone taken off them by their spouse should get that every
+    time, not one call in nine."""
+    if not name:
+        return ""
+    row = next((r for r in read_callers()
+                if str(r.get("name") or "").lower() == name.lower()), {})
+    return str(row.get("hangup_id") or "")
+
+
+def hangup_pick(name: str = "") -> dict[str, Any]:
+    """One ending, drawn by weight, avoiding the one used last. A caller with
+    an ending PINNED to them (#715) takes that one instead of a draw. Falls
+    back to the built-in tuple only if the shelf has somehow been emptied."""
+    pinned = caller_hangup_pin(name)
+    if pinned:
+        with _HANGUP_LOCK:
+            stored = hangup_rules()
+            for row in stored:
+                if row.get("id") == pinned:
+                    row["uses"] = int(row.get("uses") or 0) + 1
+                    row["last"] = int(time.time())
+                    _hangup_write(stored)
+                    _RADIO["last_hangup_rule"] = pinned
+                    return dict(row)
     with _HANGUP_LOCK:
         rows = [r for r in hangup_rules() if r.get("enabled", True)
                 and float(r.get("weight") or 0) > 0]
@@ -17797,7 +18104,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # #691: how this call ENDS, drawn off the editable shelf by weight
     # rather than out of a frozen tuple. The rule travels with the call so
     # the booth can name it afterwards and the ledger can count it.
-    hangup_rule = hangup_pick()
+    hangup_rule = hangup_pick(str(caller.get("name") or ""))    # #715
     outcome = str(hangup_rule.get("text") or "")
     # The prose state seeds the caller's emotion vector, so "furious" is
     # not just a stage direction — it bends the pace, the pauses and the
@@ -18021,6 +18328,28 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         "reactive to the caller: whatever they say, take it up, follow "
         "it, change topic to chase it — nothing the caller says goes "
         "unacknowledged (#374).")
+    # #719: there is art against the wall that did not sell, and the pair
+    # have not forgotten it. Anyone who rings during the segment gets asked
+    # — quickly, comically, out of nowhere — whether they want a painting.
+    _hawk = hawking_now()
+    _pile = hawk_unsold()
+    if _hawk or _pile:
+        _piece = str(_pile[-1].get("desc") or "") if _pile else ""
+        _ask = int((_hawk or {}).get("price")
+                   or (_pile[-1].get("price") if _pile else 0) or 0)
+        extras.append(
+            "THE PAIR ARE STILL TRYING TO SHIFT A PAINTING. At some point "
+            "mid-call one of them cuts in and asks the caller, fast and "
+            "funny and completely out of nowhere, whether they want a "
+            "painting — 'you want a painting?' — because it is STILL "
+            "leaning against the desk and it has to go."
+            + (f" The one they are pushing looks like this: \"{_piece[:200]}\""
+               if _piece else "")
+            + (f" They want {_ask} dollars for it." if _ask else "")
+            + " The caller answers entirely in character — buys it, refuses "
+            "it, or ignores the question — and the hosts take that, put the "
+            "thing back against the wall if it is a no, and carry on with "
+            "the call. One quick beat; never the whole call.")
     # #567: now and then a caller rings in CURIOUS about the games the hosts
     # keep talking about — half-remembering a cheat and wanting the rest.
     if random.random() < 0.14:
@@ -18280,6 +18609,67 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
             "seconds": round(ran, 1)}
 
 
+async def dj_call_scripted(name: str, script: list[str]) -> dict[str, Any]:
+    """The same caller back on the line, saying exactly what you wrote (#716).
+
+    Everything else about a call is unchanged — their voice off the book, the
+    phone rack, the ring, the ending off the shelf, the ledger. Only the
+    caller's WORDS are pinned; the hosts still have to take the call, which
+    is what keeps it a broadcast and not a playback."""
+    caller = next((r for r in read_callers()
+                   if str(r.get("name") or "").lower() == name.lower()),
+                  None) or {"name": name}
+    voices = await session_voices()
+    try:
+        catalogue = set(await voice_allowlist())
+    except Exception:
+        catalogue = None
+    clone_pool = (caller_clone_pool()
+                  if (await xtts_health())["ready"] else [])
+    third = str(caller.get("voice_id") or "") or caller_voice_for(
+        name, {voices.get("dj", ""), voices.get("cohost", "")}, catalogue,
+        gender=str(caller.get("gender") or ""), clones=clone_pool)
+    mangle = caller_mangle({**caller, "name": name})
+    caller_fx = {"vocode": mangle["character"], "pitch": mangle["pitch"]}
+    for _k, _fk in (("reverb", "room"), ("delay", "delay"), ("echo", "echo")):
+        if mangle.get(_k) is not None:
+            caller_fx[_fk] = mangle[_k]
+    rule = hangup_pick(name)                                     # #715
+    line_no = call_line_no()
+    line_say = call_line_say(line_no)
+    pinned = "\n".join(f"  {i + 1}. \"{text}\""
+                       for i, text in enumerate(script))
+    angle = (
+        f"The request line rings and {name} is back on {line_say}. "
+        "It OPENS with the phone RINGING and one of you reacting to it out "
+        f"loud, naming the line — {line_say} — then answering it. "
+        f"{name}'s lines are ALREADY WRITTEN and are said WORD FOR WORD, in "
+        "this exact order, one per turn, nothing added to them and nothing "
+        f"left out:\n{pinned}\n"
+        "Between those lines the hosts take the call properly — they react "
+        "to what was actually said, ask about it, argue with it, riff on it "
+        f"— so the call breathes. Never put words in {name}'s mouth beyond "
+        "the ones above, and never reorder them. "
+        + (f"By the end, {rule['text']}. " if rule.get("text") else "")
+        + "Then back to the music. "
+        f"Format the caller's lines as 'C: ...' — C is {name}.")
+    started = time.time()
+    _RADIO["chat"].append({
+        "ts": int(time.time()), "who": "host", "kind": "call",
+        "text": f"On {line_say}: {name}",
+    })
+    pipeline_log("call", f"{name} back on {line_say} — {len(script)} lines "
+                         "you wrote for them (#716)")
+    await play_phone_ring()
+    lines = await dj_banter(
+        _RADIO.get("now"), angle=angle, lines=max(6, len(script) * 2),
+        caller_name=name, caller_voice=third, caller_fx=caller_fx,
+        render_stream=bool(dj_settings().get("call_stream", True)))
+    call_ended(name, line_say, started, rule, len(lines or []), "scripted")
+    return {"caller": name, "lines": lines,
+            "seconds": round(max(0.0, time.time() - started), 1)}
+
+
 _TAPE_WARMED = [False]
 
 
@@ -18483,30 +18873,105 @@ async def caller_clock() -> None:
                     pass
 
 
-def make_phone_ring() -> Path | None:
-    """A phone bell: two bursts of the dual ring tone with a fast tremble.
-    Made here like the scratches, so there is no sample to go missing."""
+# --- The station bell (#714) ------------------------------------------------
+#
+# The ring was a frozen function: two bursts of 440+480 Hz with a 22 Hz
+# tremble, no way to hear it on its own, keep a copy of it, or change it. It
+# is the sound the station makes most often after the voices. This is the
+# preset it is built from — its own file, because the settings validator is
+# an allowlist and a bell does not belong in it.
+RING_PATH = Path("/app/data/phone_ring.json")
+RING_DEFAULT = {
+    "low": 440.0,        # the two tones of the dual bell
+    "high": 480.0,
+    "tremble": 22.0,     # the fast warble that makes it a BELL
+    "depth": 0.45,       # how deep that warble cuts
+    "ring": 0.85,        # seconds of bell per burst
+    "gap": 0.25,         # seconds of silence between bursts
+    "bursts": 2,
+    "level": 0.5,        # before the box-volume slider
+    "pitch": 1.0,        # a whole-bell transpose, for a bigger/smaller phone
+}
+
+
+def ring_preset() -> dict[str, float]:
+    """The bell the station is currently ringing."""
+    out = dict(RING_DEFAULT)
+    try:
+        raw = json.loads(RING_PATH.read_text())
+    except Exception:
+        return out
+    if not isinstance(raw, dict):
+        return out
+    for key, value in raw.items():
+        if key not in RING_DEFAULT:
+            continue
+        try:
+            out[key] = float(value)
+        except (TypeError, ValueError):
+            continue
+    return ring_clamp(out)
+
+
+def ring_clamp(raw: dict[str, Any]) -> dict[str, float]:
+    """Inside the stops, so a slider can never make a bell that is 40
+    seconds long or inaudible."""
+    def one(key: str, low: float, high: float) -> float:
+        try:
+            return max(low, min(high, float(raw.get(key,
+                                                    RING_DEFAULT[key]))))
+        except (TypeError, ValueError):
+            return float(RING_DEFAULT[key])
+    return {
+        "low": one("low", 80.0, 2000.0),
+        "high": one("high", 80.0, 2000.0),
+        "tremble": one("tremble", 0.0, 60.0),
+        "depth": one("depth", 0.0, 1.0),
+        "ring": one("ring", 0.1, 4.0),
+        "gap": one("gap", 0.0, 3.0),
+        "bursts": float(int(one("bursts", 1, 6))),
+        "level": one("level", 0.05, 1.0),
+        "pitch": one("pitch", 0.4, 2.5),
+    }
+
+
+def ring_save(raw: dict[str, Any]) -> dict[str, float]:
+    preset = ring_clamp(raw)
+    try:
+        RING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = RING_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(preset, indent=1) + "\n")
+        tmp.replace(RING_PATH)
+    except OSError:
+        pass
+    return preset
+
+
+def ring_render(preset: dict[str, float], out: Path,
+                gain: float = 1.0) -> Path | None:
+    """Write one bell to a wav from a preset."""
     import math
     import struct
     import wave
 
-    g = box_gain()                  # ride the box-volume slider too (#573):
-    # the call stream splices this bell RAW (no re-levelling), so bake the gain
-    # in. The standalone bell goes through sfx_levelled, which re-normalises and
-    # ignores it — so both paths land at the slider's level, none at full blast.
+    p = ring_clamp(preset)
+    cycle = p["ring"] + p["gap"]
+    total = cycle * p["bursts"]
     frames = []
-    for at in range(int(SFX_MADE_RATE * 2.2)):
+    for at in range(int(SFX_MADE_RATE * total)):
         t = at / SFX_MADE_RATE
-        inside = (t % 1.1) < 0.85       # ring... gap... ring
-        if not inside:
+        if (t % cycle) >= p["ring"]:            # ring… gap… ring
             frames.append(0)
             continue
-        tone = (math.sin(2 * math.pi * 440 * t)
-                + math.sin(2 * math.pi * 480 * t)) / 2
-        tremble = 0.55 + 0.45 * math.sin(2 * math.pi * 22 * t)
-        frames.append(int(tone * tremble * 0.5 * g * 32767))
-    SFX_MADE_DIR.mkdir(parents=True, exist_ok=True)
-    out = SFX_MADE_DIR / "phone-ring.wav"
+        tone = (math.sin(2 * math.pi * p["low"] * p["pitch"] * t)
+                + math.sin(2 * math.pi * p["high"] * p["pitch"] * t)) / 2
+        warble = (1.0 - p["depth"]) + p["depth"] * math.sin(
+            2 * math.pi * p["tremble"] * t)
+        value = tone * warble * p["level"] * gain
+        frames.append(int(max(-1.0, min(1.0, value)) * 32767))
+    if not frames:
+        return None
+    out.parent.mkdir(parents=True, exist_ok=True)
     try:
         with wave.open(str(out), "wb") as handle:
             handle.setnchannels(1)
@@ -18516,6 +18981,18 @@ def make_phone_ring() -> Path | None:
     except OSError:
         return None
     return out
+
+
+def make_phone_ring() -> Path | None:
+    """A phone bell, built from the station's own preset (#714). Made here
+    like the scratches, so there is no sample to go missing.
+
+    The gain rides the box-volume slider (#573): the call stream splices this
+    bell RAW (no re-levelling), so it is baked in. The standalone bell goes
+    through sfx_levelled, which re-normalises and ignores it — so both paths
+    land at the slider's level, none at full blast."""
+    return ring_render(ring_preset(), SFX_MADE_DIR / "phone-ring.wav",
+                       box_gain())
 
 
 def make_hangup() -> Path | None:
@@ -24753,7 +25230,18 @@ async def dj_output_api(
     if music:
         _RADIO["music_to"] = music
     if voice:
+        was = str(_RADIO.get("voice_to") or "box")
         _RADIO["voice_to"] = voice
+        # #741: "I switched over to the Pine Box and it didn't move the audio
+        # over." Routing was only ever read when the NEXT line was written, so
+        # the page kept playing everything already rendered — sometimes a
+        # minute of it — while the box sat silent. Taking the show off the
+        # page means taking it off the page NOW: the browser feed is emptied
+        # so no client can pick another clip out of it, and the page hands
+        # back whatever it had not played yet (see /api/dj/handoff) for the
+        # box to carry instead.
+        if voice in ("box", "off") and was != voice:
+            _RADIO["voice_clips"].clear()
     if reply:
         _RADIO["reply_to"] = reply
     # The master switch rides the same endpoint and the same save (#638).
@@ -24775,6 +25263,63 @@ async def dj_output_api(
                                 "calling it, and stops repairing it (#690)")
     _routing_save()
     return dj_state()
+
+
+@app.post("/api/dj/handoff")
+async def dj_handoff_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Move the narrative that was playing in the page onto the box (#741).
+
+    Only the browser knows which of the clips it was handed have actually
+    come out of its speakers yet, so it hands the rest back here when the
+    routing changes to the Pine Box. They go on the hold shelf in order and
+    drain straight into the box — so switching over picks the conversation
+    up where the page left it instead of starting at the next line."""
+    require_auth(authorization)
+    payload = await request.json()
+    moved = 0
+    for clip in (payload.get("clips") or [])[:12]:
+        if not isinstance(clip, dict):
+            continue
+        url = str(clip.get("url") or "")
+        path, _, query = url.partition("?")
+        sig = ""
+        for bit in query.split("&"):
+            if bit.startswith("t="):
+                sig = bit[2:]
+        # Only the station's own media doors — never an arbitrary path.
+        if not path.startswith(("/media/", "/ads-audio/", "/sfx/")):
+            continue
+        key = path.rsplit("/", 1)[-1]
+        if not sig or not hmac.compare_digest(sig, media_sign(key)):
+            continue
+        _BOX_HOLD.append({
+            "path": path, "sig": sig,
+            "text": str(clip.get("text") or "")[:400],
+            "who": str(clip.get("who") or "dj"),
+            "ts": int(time.time()), "bytes": 0,
+        })
+        moved += 1
+    if not moved:
+        return {"moved": 0, "held": len(_BOX_HOLD)}
+    _hold_trim()
+    _box_hold_save()
+    pipeline_log("air", f"routing moved to the Pine Box — {moved} line(s) the "
+                        "page had not played yet handed over to it (#741)")
+
+    async def _carry() -> None:
+        n = 0
+        while _BOX_HOLD and n < 12:
+            if not await _replay_held(_BOX_HOLD[0]):
+                break
+            _BOX_HOLD.pop(0)
+            _box_hold_save()
+            n += 1
+
+    asyncio.create_task(_carry())
+    return {"moved": moved, "held": len(_BOX_HOLD)}
 
 
 @app.post("/api/dj/drain")
@@ -25080,6 +25625,114 @@ async def dj_caller_card(
     }
 
 
+@app.get("/api/dj/caller/transcript")
+async def dj_caller_transcript(
+    name: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The whole of one caller's last call, both sides (#716).
+
+    The licence showed three things they said. A call is a conversation —
+    what the hosts asked is half of it, and without it there is nothing to
+    edit and nothing to send back out."""
+    require_read_auth(authorization)
+    name = name.strip()[:80]
+    if not name:
+        raise HTTPException(status_code=400, detail="Which caller?")
+    chat = list(_RADIO.get("chat") or [])
+    # The call starts at the "On line N: Name" banner and runs to the hang-up
+    # (or to the end of what we still hold). Walk back to the LAST banner for
+    # this caller so an edit is of THIS call, not of every call they made.
+    start = 0
+    for at in range(len(chat) - 1, -1, -1):
+        entry = chat[at]
+        if entry.get("kind") == "call" and name in str(entry.get("text") or ""):
+            start = at
+            break
+    turns: list[dict[str, Any]] = []
+    ended = None
+    for entry in chat[start:]:
+        who = str(entry.get("who") or "")
+        if entry.get("kind") == "hangup" and str(entry.get("name") or "") == name:
+            ended = {"text": str(entry.get("text") or ""),
+                     "reason": str(entry.get("reason") or ""),
+                     "rule_id": str(entry.get("rule_id") or "")}
+            break
+        if who not in ("dj", "cohost", "third", "caller", "caller2"):
+            continue
+        turns.append({
+            "ts": int(entry.get("ts") or 0),
+            "who": who,
+            "name": str(entry.get("name") or ""),
+            "text": str(entry.get("text") or ""),
+            "mine": who in ("caller", "caller2"),
+        })
+    row = next((r for r in read_callers()
+                if str(r.get("name") or "").lower() == name.lower()), {})
+    return {
+        "name": name,
+        "turns": turns,
+        "ended": ended,
+        "hangup_id": str(row.get("hangup_id") or ""),
+        # The caller's own lines, ready to be edited and sent back out.
+        "script": "\n".join(t["text"] for t in turns if t["mine"]),
+    }
+
+
+@app.post("/api/dj/callers/hangup")
+async def dj_callers_hangup(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Pin how ONE caller ends their calls (#715), or unpin them back to the
+    weighted draw. The caller has to exist on the shelf to carry a pin, so a
+    stranger is written down as a regular the moment you give them one."""
+    require_auth(authorization)
+    payload = await request.json()
+    name = str(payload.get("name") or "").strip()[:80]
+    rule_id = str(payload.get("rule_id") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Which caller?")
+    if rule_id and not any(r.get("id") == rule_id for r in hangup_rules()):
+        raise HTTPException(status_code=404, detail="No such ending")
+    with _CALLERS_LOCK:
+        rows = read_callers()
+        row = next((r for r in rows
+                    if str(r.get("name") or "").lower() == name.lower()), None)
+        if row is None:
+            row = {"id": uuid.uuid4().hex[:12], "name": name,
+                   "added": int(time.time()), "calls": 0, "last": 0}
+            rows.append(row)
+        row["hangup_id"] = rule_id
+        write_callers(rows)
+    return {"name": name, "hangup_id": rule_id}
+
+
+@app.post("/api/dj/callers/rerun")
+async def dj_callers_rerun(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put the caller back on the line saying the words you edited (#716).
+
+    Their lines are pinned verbatim and in order; the hosts play the call
+    around them, so it is a real call with a real ending rather than a list
+    of clips read out."""
+    require_auth(authorization)
+    payload = await request.json()
+    name = str(payload.get("name") or "").strip()[:80]
+    script = str(payload.get("script") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Which caller?")
+    lines = [ln.strip() for ln in script.splitlines() if ln.strip()][:14]
+    if not lines:
+        raise HTTPException(status_code=400,
+                            detail="Write what they say — one line each")
+    note_action(f"☎ you sent {name} back on air with an edited script")
+    asyncio.create_task(dj_call_scripted(name, lines))
+    return {"rolling": True, "name": name, "lines": len(lines)}
+
+
 @app.post("/api/dj/queue/move")
 async def dj_queue_move(
     request: Request,
@@ -25267,6 +25920,91 @@ async def dj_ad_api(
                        custom=True)
 
 
+@app.get("/api/dj/hawk")
+async def dj_hawk_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The sales floor (#719): the dispositions you can put the buyer in,
+    what is on the block right now, and what is stacked against the wall
+    unsold."""
+    require_read_auth(authorization)
+    return {
+        "moods": [{"key": k, "says": v} for k, v in HAWK_MOODS.items()],
+        "now": hawking_now(),
+        "unsold": hawk_unsold(),
+    }
+
+
+@app.post("/api/dj/hawk")
+async def dj_hawk_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Send pictures up to the DJs to hawk (#719, #723).
+
+    Names are gallery filenames — from the slideshow queue, from a
+    right-click on the wall, or from the booth strip. The round runs behind
+    the answer because LOOKING at a picture takes the vision model a while;
+    the booth carries it as it airs."""
+    require_auth(authorization)
+    payload = await request.json()
+    raw = payload.get("images") or payload.get("names") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    names = [str(n).strip() for n in raw if str(n or "").strip()][:3]
+    moods = [str(m).strip().lower()
+             for m in (payload.get("moods") or []) if str(m or "").strip()]
+    unknown = [m for m in moods if m not in HAWK_MOODS]
+    if unknown:
+        raise HTTPException(status_code=400,
+                            detail=f"no such disposition: {unknown[0]}")
+    try:
+        price = int(payload.get("price") or 0)
+    except (TypeError, ValueError):
+        price = 0
+    note_action("🖼 you sent " + (f"{len(names)} piece(s)" if names
+                                 else "the wall") + " up to be hawked")
+
+    async def _sell() -> None:
+        try:
+            await dj_hawk_round(names, moods, price)
+        except Exception as exc:              # noqa: BLE001
+            pipeline_log("drop", f"the hawk round died: {exc}"[:200])
+
+    asyncio.create_task(_sell())
+    return {"hawking": True, "images": names, "moods": moods,
+            "price": price}
+
+
+@app.get("/api/dj/gallery/queue")
+async def dj_gallery_queue(
+    limit: int = 12,
+    after: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The next pictures the wall is about to show (#723).
+
+    The slideshow walks the render machine's output newest-first; this is
+    the same list, so 'the next twelve' in the panel really is the next
+    twelve on screen. `after` names where the show currently is."""
+    require_read_auth(authorization)
+    limit = max(1, min(48, int(limit or 12)))
+    try:
+        files = sorted(
+            (p for p in COMFY_OUTPUT.rglob("*")
+             if p.is_file() and p.suffix.lower()
+             in (".png", ".jpg", ".jpeg", ".webp")),
+            key=lambda p: p.stat().st_mtime, reverse=True)[:400]
+    except OSError:
+        files = []
+    names = [p.name for p in files]
+    at = names.index(after) if after in names else -1
+    upcoming = names[at + 1: at + 1 + limit]
+    if len(upcoming) < limit:                 # the show wraps; so does this
+        upcoming += names[:limit - len(upcoming)]
+    return {"images": upcoming, "at": after, "total": len(names)}
+
+
 @app.get("/api/dj/ads")
 async def dj_ads_list(
     authorization: str | None = Header(default=None),
@@ -25352,7 +26090,14 @@ async def dj_ads_produce(
         air=bool(payload.get("air", True)),
         # #704: the bed level for THIS spot, set on the studio's own slider.
         bed_pct=(float(payload["bed_pct"])
-                 if payload.get("bed_pct") is not None else None))
+                 if payload.get("bed_pct") is not None else None),
+        # #734: the cue points set on the bed's own player.
+        bed_in=(float(payload["bed_in"])
+                if payload.get("bed_in") is not None else None),
+        bed_out=(float(payload["bed_out"])
+                 if payload.get("bed_out") is not None else None),
+        # #743: re-cut this spot in place rather than making a new one.
+        ad_id=str(payload.get("id") or "").strip())
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
@@ -26807,6 +27552,178 @@ async def radio_cache_tail_api(
         path, media_type="audio/mpeg",
         filename=f"{station_slug()}-last-{seconds}s-{stamp}.mp3",
         headers={"Cache-Control": "no-store"})
+
+
+# --- The cut tray (#727) ----------------------------------------------------
+#
+# Cutting a clip used to be: press, wait with the button spinning, get a file
+# in Downloads, and if you wanted a second one you waited for the first. The
+# cut runs behind you now and lands HERE — named, playable, one link away —
+# so you can queue several and take them all at once.
+CUTS_DIR = RADIO_CACHE / "cuts"
+CUTS_KEEP = 40
+# job id -> {state, name, error, at, label}
+_CUT_JOBS: dict[str, dict[str, Any]] = {}
+# One at a time, genuinely queued: _cache_tail sweeps its own stale output at
+# the start of every run, so two cuts in flight would eat each other's file.
+_CUT_LOCK = asyncio.Lock()
+
+
+def _cuts_trim() -> None:
+    try:
+        made = sorted(CUTS_DIR.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
+    except OSError:
+        return
+    for old in made[:-CUTS_KEEP]:
+        old.unlink(missing_ok=True)
+
+
+def _cut_list() -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    try:
+        made = sorted(CUTS_DIR.glob("*.mp3"),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    except OSError:
+        made = []
+    for p in made:
+        secs = 0.0
+        try:
+            from mutagen.mp3 import MP3
+            secs = float(MP3(str(p)).info.length or 0)
+        except Exception:
+            pass
+        out.append({"name": p.name, "stem": p.stem,
+                    "size": p.stat().st_size, "seconds": round(secs, 1),
+                    "when": int(p.stat().st_mtime),
+                    "sig": media_sign(p.name)})
+    return out
+
+
+async def _cut_run(job: str, kind: str, seconds: int,
+                   levels: dict[str, float], label: str) -> None:
+    """One cut, off the request thread, into the tray."""
+    async with _CUT_LOCK:
+        await _cut_do(job, kind, seconds, levels, label)
+
+
+async def _cut_do(job: str, kind: str, seconds: int,
+                  levels: dict[str, float], label: str) -> None:
+    _CUT_JOBS[job] = {"state": "cutting", "at": time.time(), "name": "",
+                      "label": label, "error": ""}
+    try:
+        if kind == "mix":
+            lo = time.time() - seconds
+            built = await asyncio.to_thread(
+                _broadcast_mix, lo, time.time() + 1.0,
+                max(0.0, min(2.0, levels["music"] / 100)),
+                max(0.0, min(0.9, levels["duck"] / 100)),
+                max(0.25, min(2.0, levels["voice"] / 100)),
+                f"_cut{job}")
+        else:
+            built = await asyncio.to_thread(_cache_tail, float(seconds))
+        if not built:
+            _CUT_JOBS[job].update(
+                {"state": "empty",
+                 "error": "Nothing aired in that window yet"})
+            return
+        CUTS_DIR.mkdir(parents=True, exist_ok=True)
+        name = (f"{station_slug()}-{'broadcast' if kind == 'mix' else 'talk'}"
+                f"-{seconds}s-{time.strftime('%H%M%S')}-{job}.mp3")
+        target = CUTS_DIR / name
+        try:
+            built.replace(target)
+        except OSError:
+            target.write_bytes(built.read_bytes())
+        _cuts_trim()
+        _CUT_JOBS[job].update({"state": "ready", "name": name})
+    except Exception as exc:                  # noqa: BLE001
+        _CUT_JOBS[job].update({"state": "failed", "error": str(exc)[:200]})
+
+
+@app.post("/api/radio-cache/cut")
+async def radio_cache_cut_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Queue a cut and come straight back (#727).
+
+    The cut itself runs behind you, so you can line several up and take them
+    together instead of standing over each one."""
+    require_auth(authorization)
+    payload = await request.json()
+    kind = "mix" if str(payload.get("kind") or "mix") == "mix" else "talk"
+    seconds = max(10, min(3600, int(payload.get("seconds") or 30)))
+
+    def lvl(key: str, dflt: float) -> float:
+        try:
+            return float(payload.get(key, dflt))
+        except (TypeError, ValueError):
+            return dflt
+
+    levels = {"music": lvl("music", 100), "duck": lvl("duck", 70),
+              "voice": lvl("voice", 160)}
+    job = uuid.uuid4().hex[:8]
+    label = (f"the last {seconds}s — "
+             + ("the whole broadcast" if kind == "mix" else "just the talk"))
+    _CUT_JOBS[job] = {"state": "queued", "at": time.time(), "name": "",
+                      "label": label, "error": ""}
+    for old, row in list(_CUT_JOBS.items()):          # bounded
+        if time.time() - float(row.get("at") or 0) > 3600:
+            _CUT_JOBS.pop(old, None)
+    asyncio.create_task(_cut_run(job, kind, seconds, levels, label))
+    return {"job": job, "state": "queued", "label": label}
+
+
+@app.get("/api/radio-cache/cuts")
+async def radio_cache_cuts_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The tray: the cuts that are ready, and the ones still running."""
+    require_read_auth(authorization)
+    return {
+        "cuts": await asyncio.to_thread(_cut_list),
+        "jobs": [{"job": j, **{k: v for k, v in row.items() if k != "at"}}
+                 for j, row in sorted(_CUT_JOBS.items(),
+                                      key=lambda kv: -float(kv[1].get("at") or 0))
+                 if row.get("state") in ("queued", "cutting", "failed",
+                                         "empty")][:8],
+        "folder": str(CUTS_DIR),
+    }
+
+
+@app.get("/api/radio-cache/cuts/{name}")
+async def radio_cache_cut_file(
+    name: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Serve one cut. Signed ?t= like every other cache file, so the link
+    can be pasted into a message and opened anywhere on the network."""
+    _sig = str(request.query_params.get("t") or "")
+    _want = media_sign(name)
+    if not (_want and hmac.compare_digest(_sig, _want)):
+        require_read_auth(authorization)
+    if "/" in name or ".." in name or not re.fullmatch(
+            r"[\w.\- ]{1,120}", name):
+        raise HTTPException(status_code=400, detail="Bad name")
+    path = CUTS_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Not in the tray")
+    return FileResponse(path, media_type="audio/mpeg",
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
+@app.delete("/api/radio-cache/cuts/{name}")
+async def radio_cache_cut_delete(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    if "/" in name or ".." in name or not re.fullmatch(
+            r"[\w.\- ]{1,120}", name):
+        raise HTTPException(status_code=400, detail="Bad name")
+    (CUTS_DIR / name).unlink(missing_ok=True)
+    return {"deleted": name, "cuts": len(await asyncio.to_thread(_cut_list))}
 
 
 def _cache_meta_read(kind: str, name: str) -> dict[str, Any] | None:
@@ -28388,6 +29305,13 @@ async def ads_archive(
     produced audio is still on disk."""
     require_read_auth(authorization)
     rows = await asyncio.to_thread(ad_list)
+    # #743: when each one last actually went out, so the desk can sort and
+    # scope by air time rather than by when the words were written.
+    last_air: dict[str, int] = {}
+    for a in await asyncio.to_thread(ad_airings):
+        rid_ = str(a.get("id") or "")
+        if rid_:
+            last_air[rid_] = max(last_air.get(rid_, 0), int(a.get("ts") or 0))
     out = []
     for row in rows:
         rid = str(row.get("id") or "")
@@ -28404,11 +29328,199 @@ async def ads_archive(
             "ts": int(row.get("ts") or 0),
             "uses": int(row.get("uses") or 0),
             "audio": audio,
+            "voice": str(row.get("voice") or ""),
+            "bed": str(row.get("bed") or ""),
+            "last_aired": last_air.get(rid, 0),
             "words": len(str(row.get("text") or "").split()),
         })
     out.sort(key=lambda r: -r["ts"])
     return {"ads": out, "count": len(out),
             "with_audio": sum(1 for r in out if r["audio"])}
+
+
+AD_SPANS = {
+    "hour": 3600.0, "3h": 3 * 3600.0, "6h": 6 * 3600.0,
+    "today": 0.0, "yesterday": 0.0,
+    "week": 7 * 86400.0, "month": 30 * 86400.0, "all": 0.0,
+}
+
+
+def _ad_window(scope: str) -> tuple[float, float]:
+    """The wall-clock window a scope means, reckoned the way the radio
+    cache reckons its own (#743)."""
+    now = time.time()
+    lt = time.localtime(now)
+    midnight = now - (lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec)
+    if scope == "today":
+        return midnight, now + 1.0
+    if scope == "yesterday":
+        return midnight - 86400, midnight
+    if scope == "all":
+        return 0.0, now + 1.0
+    span = AD_SPANS.get(scope)
+    if not span:
+        return midnight, now + 1.0
+    return now - span, now + 1.0
+
+
+def _ads_in_window(lo: float, hi: float) -> list[dict[str, Any]]:
+    """Every produced spot in a window, in air order, with its audio (#743).
+
+    The airing ledger is the truth where it has one. It only starts the day
+    it was added, though, so a spot that ran fifty times last week has no
+    entry at all — and reading the ledger alone would make "everything" mean
+    "everything since Tuesday". Anything the ledger has never heard of falls
+    back to when it was WRITTEN, which is the only date that spot has."""
+    rows = {str(r.get("id") or ""): r for r in ad_list()}
+    logged: set[str] = set()
+    out: list[dict[str, Any]] = []
+
+    def keep(ts: float, rid: str, row: dict[str, Any],
+             audio: str) -> None:
+        if not audio or not (PRODUCED_ADS_DIR / audio).is_file():
+            return
+        out.append({"ts": int(ts), "id": rid,
+                    "product": str(row.get("product") or ""),
+                    "text": str(row.get("text") or ""),
+                    "audio": audio})
+
+    for a in ad_airings():
+        rid = str(a.get("id") or "")
+        if rid:
+            logged.add(rid)
+        ts = float(a.get("ts") or 0)
+        if not (lo <= ts < hi):
+            continue
+        row = rows.get(rid) or {}
+        keep(ts, rid, {**a, **row},
+             str(row.get("audio") or a.get("audio") or ""))
+    for rid, row in rows.items():
+        if rid in logged:
+            continue                 # the ledger already speaks for this one
+        ts = float(row.get("ts") or 0)
+        if lo <= ts < hi:
+            keep(ts, rid, row, str(row.get("audio") or ""))
+    out.sort(key=lambda r: r["ts"])
+    return out
+
+
+def _ads_concat(picks: list[dict[str, Any]], tag: str) -> Path | None:
+    """Every one of those spots cut together into one mp3, back to back."""
+    import subprocess
+
+    import imageio_ffmpeg
+    files = [PRODUCED_ADS_DIR / p["audio"] for p in picks]
+    files = [f for f in files if f.is_file()]
+    if not files:
+        return None
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    RADIO_CACHE.mkdir(parents=True, exist_ok=True)
+    listing = RADIO_CACHE / f"_ads_{tag}.txt"
+    listing.write_text("\n".join(
+        "file '" + f.as_posix().replace("'", "'\\''") + "'" for f in files))
+    out = RADIO_CACHE / f"_ads_{tag}.mp3"
+    base = [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "concat", "-safe", "0", "-i", str(listing)]
+    try:
+        done = subprocess.run(base + ["-c", "copy", str(out)],
+                              capture_output=True, timeout=900)
+        if done.returncode != 0:
+            subprocess.run(base + ["-c:a", "libmp3lame", "-b:a", "128k",
+                                   "-ar", "24000", "-ac", "1", str(out)],
+                           capture_output=True, timeout=1800)
+    except Exception:
+        return None
+    finally:
+        listing.unlink(missing_ok=True)
+    return out if out.is_file() and out.stat().st_size > 1000 else None
+
+
+@app.get("/api/ads/aired")
+async def ads_aired_api(
+    scope: str = "today",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the ads desk can cut together for a span (#743) — how many spots
+    aired in it and roughly how long the reel would run."""
+    require_read_auth(authorization)
+    if scope not in AD_SPANS:
+        raise HTTPException(status_code=400,
+                            detail="hour|3h|6h|today|yesterday|week|month|all")
+    lo, hi = _ad_window(scope)
+    picks = _ads_in_window(lo, hi)
+    size = 0
+    for p in picks:
+        try:
+            size += (PRODUCED_ADS_DIR / p["audio"]).stat().st_size
+        except OSError:
+            pass
+    return {"scope": scope, "count": len(picks), "bytes": size,
+            "spots": [{"ts": p["ts"], "id": p["id"], "product": p["product"]}
+                      for p in picks]}
+
+
+@app.get("/api/ads/compile")
+async def ads_compile_api(
+    scope: str = "today",
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The whole run of ads for a span, cut together as ONE mp3 (#743) — the
+    last hour, three hours, the day, the week, the month, or every spot the
+    station has ever produced. Only spots with produced AUDIO can be cut
+    together; a written read the DJs simply spoke lives in the ad book and
+    in the broadcast mix, not on this reel."""
+    require_read_auth(authorization)
+    if scope not in AD_SPANS:
+        raise HTTPException(status_code=400,
+                            detail="hour|3h|6h|today|yesterday|week|month|all")
+    lo, hi = _ad_window(scope)
+    picks = _ads_in_window(lo, hi)
+    if not picks:
+        raise HTTPException(
+            status_code=404,
+            detail="No produced spots aired in that span yet")
+    path = await asyncio.to_thread(_ads_concat, picks, scope)
+    if not path:
+        raise HTTPException(status_code=500, detail="The reel came out empty")
+    stamp = time.strftime("%Y-%m-%d")
+    return FileResponse(
+        path, media_type="audio/mpeg",
+        filename=f"{station_slug()}-ads-{scope}-{stamp}.mp3",
+        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/dj/ads/{ad_id}/recut")
+async def dj_ads_recut(
+    ad_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Re-render a stored spot from its (edited) words (#743) — same entry,
+    same place in the book, new audio. Optionally air it as it lands."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    match = next((r for r in ad_list() if r.get("id") == ad_id), None)
+    if not match:
+        raise HTTPException(status_code=404, detail="No such ad read")
+    script = str(payload.get("text") or match.get("text") or "").strip()
+    if not script:
+        raise HTTPException(status_code=400, detail="An ad read needs words")
+    result = await ad_produce(
+        product=str(payload.get("product") or match.get("product") or ""),
+        script=script,
+        voice=str(payload.get("voice") or match.get("voice") or ""),
+        track_id=str(payload.get("track_id") or ""),
+        air=bool(payload.get("air", False)),
+        bed_pct=(float(payload["bed_pct"])
+                 if payload.get("bed_pct") is not None else None),
+        bed_in=(float(payload["bed_in"])
+                if payload.get("bed_in") is not None else None),
+        bed_out=(float(payload["bed_out"])
+                 if payload.get("bed_out") is not None else None),
+        ad_id=ad_id)
+    if result.get("error"):
+        raise HTTPException(status_code=400, detail=result["error"])
+    return result
 
 
 @app.get("/api/ads/archive.md", response_class=PlainTextResponse)
@@ -28870,6 +29982,55 @@ async def sfx_spec_api(
             return Response(status_code=404)
     return Response(out.read_bytes(), media_type="image/png",
                     headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/api/sfx/ring")
+async def sfx_ring_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The station's phone bell, as numbers you can move (#714)."""
+    require_read_auth(authorization)
+    return {"preset": ring_preset(), "default": dict(RING_DEFAULT)}
+
+
+@app.post("/api/sfx/ring")
+async def sfx_ring_set(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Make this the bell the station actually rings (#714). The next call
+    rings on it — make_phone_ring rebuilds from the preset every time."""
+    require_auth(authorization)
+    payload = await request.json()
+    if payload.get("reset"):
+        preset = ring_save(dict(RING_DEFAULT))
+    else:
+        preset = ring_save(payload.get("preset") or payload)
+    # Rebuild the file now so the change is audible on the very next ring
+    # rather than on the one after it.
+    await asyncio.to_thread(make_phone_ring)
+    note_action("☎ you re-tuned the station's phone bell")
+    return {"preset": preset}
+
+
+@app.get("/api/sfx/ring/preview")
+async def sfx_ring_preview(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Render a bell from query parameters and hand it back as a wav (#714)
+    — the sound of the sliders where they are RIGHT NOW, without committing
+    it to the station or ringing it at anybody."""
+    require_read_auth(authorization)
+    want = {k: v for k, v in request.query_params.items() if k in RING_DEFAULT}
+    preset = ring_clamp({**ring_preset(), **want})
+    out = SFX_MADE_DIR / "phone-ring-preview.wav"
+    made = await asyncio.to_thread(ring_render, preset, out, 1.0)
+    if not made:
+        raise HTTPException(status_code=500, detail="The bell came out empty")
+    return FileResponse(made, media_type="audio/wav",
+                        filename="pinebox-phone-ring.wav",
+                        headers={"Cache-Control": "no-store"})
 
 
 @app.get("/api/sfx/dir")
@@ -33097,6 +34258,12 @@ button.danger {
   from { transform: translateX(0); }
   to { transform: translateX(-50%); }
 }
+/* #731: the read scrolling past on a spot while it is on air, so the tile
+   shows you what is being said rather than only that something is. */
+@keyframes adMarquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
 @keyframes boothPulse {
   0%, 100% {
     box-shadow: 0 0 0 1px rgba(255,95,95,.55), 0 0 8px rgba(255,95,95,.18);
@@ -33948,7 +35115,10 @@ and levels, properly labelled (#405)"
                 title="Fullscreen (or double-click the frame)"
                 style="font-size:12px">⛶ Full</button>
       </div>
+      <!-- #719: right-click a picture on the wall and the pair take it off
+           and try to SELL it, live on air. -->
       <div id="sparkShowStage" ondblclick="sparkShowFull()"
+           oncontextmenu="return artHawkMenu(event, sparkShowCurrent())"
            style="position:relative;width:100%;height:min(88vh,1000px);
                   border-radius:10px;overflow:hidden;background:#04060b;
                   border:1px solid var(--border);cursor:pointer">
@@ -33960,10 +35130,14 @@ and levels, properly labelled (#405)"
              style="position:absolute;inset:0;background-size:contain;
                     background-position:center;background-repeat:no-repeat;
                     opacity:0;transition:opacity .7s ease,transform .7s ease"></div>
-        <div id="sparkShowCaption"
+        <!-- #723: the counter is the door into the QUEUE — the next twelve
+             pictures the wall is about to show, any of which can be sent up
+             to the DJs to hawk at a disposition you choose. -->
+        <div id="sparkShowCaption" onclick="sparkQueuePopup(event)"
+             title="What is coming up — pick one and send it up to the DJs"
              style="position:absolute;top:6px;left:8px;font-size:10px;color:#9bd;
                     background:#0008;padding:2px 6px;border-radius:5px;
-                    pointer-events:none"></div>
+                    cursor:pointer"></div>
         <!-- The screensaver's own dashboard, retrofitted over the show
              (#531): per-service status + Ollama/ComfyUI live numbers. -->
         <div id="sparkShowOverlay"
@@ -34019,19 +35193,37 @@ and levels, properly labelled (#405)"
          fight the one-context rule (Mind/Sim/Crystal). -->
     <section class="panel" id="djRhetoricPanel" style="display:none">
       <style>
+        /* #736: the cloud has DEPTH. A word said right now arrives at the
+           FRONT — big, sharp, bright — and every round it is not said again
+           it slides further back, shrinking and softening, until it is a
+           faint mark behind the live talk. The scale lives in a CSS
+           variable so the pop animation and the depth can share one
+           transform without fighting over it. */
         @keyframes rhetPulse {
-          0%   { transform: translate(-50%,-50%) scale(1);    }
-          40%  { transform: translate(-50%,-50%) scale(1.32); }
-          100% { transform: translate(-50%,-50%) scale(1);    }
+          0%   { transform: translate(-50%,-50%) scale(calc(var(--z,1) * 1)); }
+          40%  { transform: translate(-50%,-50%)
+                            scale(calc(var(--z,1) * 1.32)); }
+          100% { transform: translate(-50%,-50%) scale(calc(var(--z,1) * 1)); }
+        }
+        @keyframes rhetArrive {
+          0%   { transform: translate(-50%,-50%) scale(calc(var(--z,1) * 1.9));
+                 opacity: 0; filter: blur(3px); }
+          55%  { opacity: 1; filter: blur(0); }
+          100% { transform: translate(-50%,-50%) scale(calc(var(--z,1) * 1));
+                 filter: blur(0); }
         }
         .rhet-word {
-          position:absolute; transform:translate(-50%,-50%);
+          position:absolute;
+          transform:translate(-50%,-50%) scale(var(--z,1));
           white-space:nowrap; font-weight:700; pointer-events:auto;
           cursor:pointer;
           text-shadow:0 0 7px currentColor; will-change:transform,opacity;
-          transition:opacity .6s ease, color .6s ease, font-size .5s ease;
+          transition:opacity .9s ease, color .6s ease, font-size .5s ease,
+                     transform 1.1s cubic-bezier(.22,.68,.28,1),
+                     filter .9s ease, left 1.1s ease, top 1.1s ease;
         }
         .rhet-word.rhet-pulse { animation:rhetPulse .7s ease-out; }
+        .rhet-word.rhet-arrive { animation:rhetArrive .8s ease-out; }
       </style>
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <h2 style="margin:0;cursor:pointer" onclick="rhetVecToggle()"
@@ -40602,8 +41794,17 @@ let boothSellSeen = "";
 function boothGlass() {
   const wrap = el("div", "", "");
   wrap.id = "boothGlass";
+  // #740: flex:0 0 auto, and it matters. The window is a column flex box
+  // with a max-height, and the log below it is flex:1 — so once the night's
+  // transcript is long enough its content-based minimum wins the layout and
+  // the ONLY shrinkable thing left is the glass. It was being squeezed from
+  // 119px to thirteen: a sliver you could see moving and not read, which is
+  // exactly what "the spectrogram shrunk" describes. Measured in a headless
+  // browser with 200 rows in the log — 13px before, 119px after. The glass
+  // is a fixed fitting now; the log is the part that gives.
   wrap.style.cssText = "position:relative;margin:0 0 6px;border-radius:7px;"
-    + "border:1px solid var(--border);background:#060b14;overflow:hidden";
+    + "border:1px solid var(--border);background:#060b14;overflow:hidden;"
+    + "flex:0 0 auto";
   const canvas = document.createElement("canvas");
   canvas.id = "boothSpec";
   // #705: 54px of spectrogram inside a panel this narrow left a sliver you
@@ -40666,6 +41867,17 @@ function boothLiveWho() {
   if (typeof djVoiceNow !== "undefined" && djVoiceNow && djVoiceNow.sting) {
     return {who: "sfx", name: ""};
   }
+  // #742: in box mode nothing plays in this page at all, so there is no
+  // element to read — the station's own "who is speaking" is the only
+  // signal, and without it the glass sat grey through the whole show.
+  if (window.djSpeakingWho) {
+    const row = log && window.djSpeakingEid
+      ? log.querySelector('[data-eid="' + CSS.escape(window.djSpeakingEid)
+                          + '"]')
+      : null;
+    return {who: window.djSpeakingWho,
+            name: (row && row.getAttribute("data-name")) || ""};
+  }
   return null;
 }
 
@@ -40724,6 +41936,7 @@ function boothSellPaint(state) {
         + "flex:0 0 auto";
       im.onerror = () => { im.style.display = "none"; };
       im.onclick = () => artFullscreen(n);
+      im.oncontextmenu = (ev) => artHawkMenu(ev, n);          // #719
       lane.appendChild(im);
     });
   }
@@ -40939,6 +42152,305 @@ function boothGlassStop() {
   boothGlassRaf = 0;
 }
 
+/* ---- The caller's file (#715, #716) ------------------------------------
+ *
+ * Hovering a caller gave you a licence you could read and not touch. Two
+ * things you actually want from a person on the line are to change how they
+ * get off the phone, and to send them back on with different words. Both
+ * existed as machinery and neither had a door. Clicking a caller opens this:
+ * the licence, the transcript of their call — editable, exportable, and
+ * re-airable — and the ending that gets used on them.
+ */
+let callerDossierTab = "transcript";
+
+function callerDossierEsc(s) {
+  return String(s == null ? "" : s).replace(/[&<>"]/g,
+    (c) => ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+}
+
+async function callerDossier(name, tab) {
+  if (!name) return;
+  callerCardHide();
+  const gone = document.getElementById("callerDossier");
+  if (gone) gone.remove();
+  if (tab) callerDossierTab = tab;
+  const shade = el("div", "", "");
+  shade.id = "callerDossier";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:190;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(720px,95vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:6px";
+  head.appendChild(el("h2", "", "☎ " + name));
+  head.lastChild.style.cssText = "margin:0;font-size:17px;color:#ffd479";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+
+  const tabs = el("div", "row", "");
+  tabs.style.cssText = "gap:6px;margin-bottom:10px;flex-wrap:wrap";
+  const body = el("div", "muted", "reading the switchboard…");
+  box.appendChild(tabs);
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  const mkTab = (label, keyName) => {
+    const b = el("button", callerDossierTab === keyName ? "primary" : "",
+                 label);
+    b.style.cssText = "font-size:11px;padding:3px 10px";
+    b.onclick = () => { callerDossierTab = keyName; draw(); };
+    return b;
+  };
+
+  async function draw() {
+    tabs.innerHTML = "";
+    tabs.appendChild(mkTab("📄 The transcript", "transcript"));
+    tabs.appendChild(mkTab("☎ How they hang up", "hangup"));
+    tabs.appendChild(mkTab("🪪 Their licence", "licence"));
+    body.innerHTML = "";
+    body.className = "";
+    if (callerDossierTab === "transcript") return drawTranscript();
+    if (callerDossierTab === "hangup") return drawHangup();
+    return drawLicence();
+  }
+
+  /* --- the call, as words you can change (#716) ------------------------- */
+  async function drawTranscript() {
+    body.textContent = "reading the call…";
+    let d = {turns: [], script: ""};
+    try {
+      d = await api("/api/dj/caller/transcript?name="
+                    + encodeURIComponent(name));
+    } catch (e) { body.textContent = e.message; return; }
+    body.textContent = "";
+    const why = el("div", "muted",
+      "Their last call, both sides. What THEY said is below and editable — "
+      + "one line per turn. Send it back out and they ring in again saying "
+      + "exactly that, with the pair taking the call around it.");
+    why.style.cssText = "font-size:11.5px;line-height:1.55;margin-bottom:8px";
+    body.appendChild(why);
+
+    const roll = el("div", "", "");
+    roll.style.cssText = "max-height:210px;overflow-y:auto;font-size:11.5px;"
+      + "line-height:1.5;border:1px solid var(--border);border-radius:8px;"
+      + "padding:8px 10px;background:#0a1018;margin-bottom:10px";
+    if (!(d.turns || []).length) {
+      roll.appendChild(el("div", "muted",
+        "Nothing of this call is still in the booth's memory."));
+    }
+    (d.turns || []).forEach((t) => {
+      const line = el("div", "", "");
+      line.style.cssText = "padding:2px 0"
+        + (t.mine ? ";color:#9ee493" : ";opacity:.78");
+      line.innerHTML = "<b>" + callerDossierEsc(t.name || (t.mine ? name
+        : "the desk")) + "</b> " + callerDossierEsc(t.text);
+      roll.appendChild(line);
+    });
+    if (d.ended) {
+      const end = el("div", "", "— " + (d.ended.reason || "the call ended"));
+      end.style.cssText = "margin-top:5px;color:#ff9db1;font-size:11px";
+      roll.appendChild(end);
+    }
+    body.appendChild(roll);
+
+    body.appendChild(el("label", "", "What they say when they call back"));
+    const script = el("textarea", "", "");
+    script.value = d.script || "";
+    script.placeholder = "One line per turn — exactly what they say.";
+    script.style.cssText = "width:100%;min-height:120px;font-size:12px";
+    body.appendChild(script);
+
+    const acts = el("div", "row", "");
+    acts.style.cssText = "gap:6px;margin-top:8px;flex-wrap:wrap";
+    const note = el("div", "muted", "");
+    note.style.cssText = "font-size:11px;margin-top:6px";
+
+    const again = el("button", "primary", "☎ Call again with this script");
+    again.title = "They ring back in and say these lines, word for word, "
+      + "in this order — the hosts take the call around them";
+    again.onclick = async () => {
+      const done = pending(again, "☎ ringing…");
+      try {
+        const got = await api("/api/dj/callers/rerun", {method: "POST",
+          body: JSON.stringify({name, script: script.value})});
+        note.textContent = "on the line — " + got.lines
+          + " line(s) of theirs are pinned; watch the booth.";
+      } catch (e) { note.textContent = e.message; }
+      finally { done(); }
+    };
+    const out = el("button", "", "⬇ Export the call");
+    out.title = "Save the whole call, both sides, as a markdown file";
+    out.onclick = () => {
+      const md = ["# " + name + " — the call", ""].concat(
+        (d.turns || []).map((t) => "**" + (t.name || (t.mine ? name
+          : "the desk")) + ":** " + t.text),
+        d.ended ? ["", "*" + (d.ended.reason || "the call ended") + "*"] : []
+      ).join("\n");
+      const url = URL.createObjectURL(
+        new Blob([md], {type: "text/markdown"}));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = name.replace(/[^\w -]+/g, "").trim().replace(/\s+/g, "-")
+        + "-call.md";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 15000);
+      note.textContent = "exported ✓";
+    };
+    const copy = el("button", "", "📋 Copy their lines");
+    copy.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(script.value);
+        note.textContent = "copied ✓";
+      } catch (e) { note.textContent = "the browser would not let go of it"; }
+    };
+    acts.appendChild(again); acts.appendChild(out); acts.appendChild(copy);
+    body.appendChild(acts);
+    body.appendChild(note);
+  }
+
+  /* --- how THIS person gets off the phone (#715) ------------------------ */
+  async function drawHangup() {
+    body.textContent = "reading the shelf…";
+    let data = {rules: []}, mine = "";
+    try {
+      data = await api("/api/dj/hangups");
+      const t = await api("/api/dj/caller/transcript?name="
+                          + encodeURIComponent(name));
+      mine = String(t.hangup_id || "");
+    } catch (e) { body.textContent = e.message; return; }
+    body.textContent = "";
+    const why = el("div", "muted",
+      "Pick the ending " + name + " always takes, or leave them on the "
+      + "draw and they get a different one every call. Anything you add "
+      + "here joins the shelf every other caller draws from too.");
+    why.style.cssText = "font-size:11.5px;line-height:1.55;margin-bottom:8px";
+    body.appendChild(why);
+
+    const add = el("div", "row", "");
+    add.style.cssText = "gap:6px;margin-bottom:10px";
+    const text = el("input", "", "");
+    text.type = "text";
+    text.placeholder = "the caller … (a direction to the pair, in prose)";
+    text.style.cssText = "flex:1;min-width:0;font-size:12px";
+    const go = el("button", "primary", "+ Add an ending");
+    const submit = async () => {
+      const value = text.value.trim();
+      if (value.length < 8) {
+        setStatus("write it as a direction the pair can act on", true);
+        return;
+      }
+      const done = pending(go, "…");
+      try {
+        await api("/api/dj/hangups", {method: "POST",
+          body: JSON.stringify({text: value, weight: 1})});
+        text.value = "";
+        await drawHangup();
+      } catch (e) { setStatus(e.message, true); }
+      finally { done(); }
+    };
+    go.onclick = submit;
+    text.onkeydown = (e) => { if (e.key === "Enter") submit(); };
+    add.appendChild(text); add.appendChild(go);
+    body.appendChild(add);
+
+    const pick = async (id) => {
+      try {
+        await api("/api/dj/callers/hangup", {method: "POST",
+          body: JSON.stringify({name, rule_id: id})});
+        setStatus(id ? name + " now always ends their calls that way"
+                     : name + " is back on the draw");
+        await drawHangup();
+      } catch (e) { setStatus(e.message, true); }
+    };
+
+    const rowFor = (id, label, sub, on) => {
+      const row = el("div", "", "");
+      row.style.cssText = "display:flex;gap:9px;align-items:flex-start;"
+        + "border-top:1px solid var(--border);padding:7px 6px;cursor:pointer"
+        + (on ? ";background:#0f2418;box-shadow:inset 3px 0 0 #43d17c" : "");
+      row.onclick = () => pick(id);
+      const dot = el("span", "", on ? "◉" : "○");
+      dot.style.cssText = "flex:0 0 auto;color:" + (on ? "#43d17c" : "#5c6b82");
+      const wrap = el("div", "", "");
+      wrap.style.cssText = "flex:1;min-width:0";
+      const words = el("div", "", label);
+      words.style.cssText = "font-size:12px;line-height:1.45";
+      wrap.appendChild(words);
+      if (sub) {
+        const s = el("div", "muted", sub);
+        s.style.cssText = "font-size:10.5px;margin-top:2px";
+        wrap.appendChild(s);
+      }
+      row.appendChild(dot); row.appendChild(wrap);
+      return row;
+    };
+
+    body.appendChild(rowFor("", "Whatever the draw gives them",
+      "the weighted shelf, a different ending each call", !mine));
+    (data.rules || []).forEach((rule) => {
+      body.appendChild(rowFor(rule.id, rule.text,
+        "used " + (rule.uses || 0) + "×"
+        + (rule.enabled === false ? " · off the draw" : "")
+        + (rule.weight != null ? " · weight ×" + rule.weight : ""),
+        rule.id === mine));
+    });
+    const all = el("button", "", "☎ The whole shelf, with its odds");
+    all.style.cssText = "font-size:11px;padding:3px 10px;margin-top:10px";
+    all.onclick = () => hangupRules("");
+    body.appendChild(all);
+  }
+
+  /* --- the licence, as a page rather than a hover ----------------------- */
+  async function drawLicence() {
+    body.textContent = "reading the switchboard…";
+    let d = null;
+    try { d = await api("/api/dj/caller?name=" + encodeURIComponent(name)); }
+    catch (e) { body.textContent = e.message; return; }
+    body.textContent = "";
+    if (!d) { body.textContent = "nothing on file for them"; return; }
+    const wrap = el("div", "", "");
+    wrap.style.cssText = "display:flex;gap:12px;font-size:11.5px;"
+      + "line-height:1.55";
+    if (d.face) {
+      const im = document.createElement("img");
+      im.src = "/api/generations/image/" + encodeURIComponent(d.face);
+      im.style.cssText = "width:120px;height:146px;object-fit:cover;"
+        + "border-radius:6px;border:1px solid #6d7f9c;flex:0 0 auto";
+      im.onerror = () => { im.style.display = "none"; };
+      wrap.appendChild(im);
+    }
+    const facts = el("div", "", "");
+    facts.style.cssText = "flex:1;min-width:0";
+    facts.innerHTML = callerCardField("line", (d.line || "").replace(/^On /, ""))
+      + callerCardField("calling about", d.goal || d.persona)
+      + callerCardField("voice", (d.voice || {}).name
+          || (d.voice || {}).id || "—")
+      + callerCardField("calls", String(d.calls || 0)
+          + (d.known ? " · a regular" : " · one-off"))
+      + callerCardField("last ended", (d.last_call || {}).rule || "—");
+    wrap.appendChild(facts);
+    body.appendChild(wrap);
+    const said = el("div", "", "");
+    said.style.cssText = "margin-top:10px;font-size:11.5px;line-height:1.5";
+    (d.said || []).slice(-6).forEach((s) => {
+      const line = el("div", "", "“" + s.text + "”");
+      line.style.cssText = "padding:3px 0;border-top:1px solid #24344a;"
+        + "opacity:.9";
+      said.appendChild(line);
+    });
+    body.appendChild(said);
+  }
+
+  draw();
+}
+
 /* ---- How calls END (#691) ---------------------------------------------
  * Every call finished on one of a frozen tuple of directions, drawn at
  * random and dropped into the prompt. You could not add one, weight the
@@ -41127,11 +42639,272 @@ async function hangupRules(focusId) {
       const said = el("div", "muted", c.rule || "");
       said.style.cssText = "font-size:11px;margin-top:2px";
       row.appendChild(said);
-    if (artStrip) row.appendChild(artStrip);   // #707: to the right
+      // #715: this line used to read `if (artStrip)` — a variable that only
+      // exists inside the BOOTH's row builder, several hundred lines away.
+      // Reading it here threw a ReferenceError on the first call in the
+      // ledger, which killed the loop: "the last calls, and how each one
+      // ended" printed its heading and then nothing, every time.
+      head2.style.cursor = "pointer";
+      head2.title = "Open " + (c.name || "this caller") + "'s file";
+      head2.onclick = () => callerDossier(c.name || "", "hangup");
       body.appendChild(row);
     });
   }
   draw();
+}
+
+/* ---- The ads desk (#731, #743) ----------------------------------------
+ *
+ * An ad that airs is the station's own work, and it was the least reachable
+ * thing on the panel: a tile in the log, gone as soon as the night scrolled
+ * past it. These are the parts a spot needs to be a THING — is it on air,
+ * what does it sound like while it is, and where is everything that came
+ * before it.
+ */
+function adClipUrl(line) {
+  if (line.media && line.sig) {
+    return "/media/" + encodeURIComponent(line.media)
+      + "?t=" + encodeURIComponent(line.sig);
+  }
+  if (line.ad_audio) {
+    return "/ads-audio/" + encodeURIComponent(line.ad_audio)
+      + (line.ad_sig ? "?t=" + encodeURIComponent(line.ad_sig) : "");
+  }
+  return "";
+}
+
+/* Is THIS the spot going out right now? Two independent signals, because
+ * the box and the page tell you different things: the station's own "what
+ * is being sold" (which the box path sets), and — when the page carries the
+ * show — the clip actually sounding in this browser. */
+function adIsOnAir(line) {
+  const st = (typeof djLastState !== "undefined" && djLastState) || {};
+  const now = st.ad_now || null;
+  if (now && line.product && now.product
+      && String(now.product) === String(line.product)) return true;
+  const url = adClipUrl(line);
+  if (!url) return false;
+  const bare = url.split("?")[0];
+  if (typeof clipAudio !== "undefined" && clipAudio && clipAudio._src
+      && String(clipAudio._src).split("?")[0] === bare
+      && !clipAudio.paused) return true;
+  return (djVoiceEls || []).some((a) => a && !a.paused && !a.ended
+    && a.src && a.src.indexOf(bare) >= 0);
+}
+
+/* Draw the trace for a tile's own audio, but only while that audio is
+ * playing — and stop the moment the tile leaves the document, so an
+ * evening of ads does not leave sixty animation loops running. */
+const adTraces = new Set();
+function adTraceWatch(canvas) {
+  adTraces.add(canvas);
+  if (adTraces.size === 1) adTraceDraw();
+}
+function adTraceFor(canvas) {
+  const bare = String(canvas.dataset.src || "").split("?")[0];
+  if (!bare) return null;
+  if (typeof clipAudio !== "undefined" && clipAudio && clipAudio._src
+      && String(clipAudio._src).split("?")[0] === bare
+      && !clipAudio.paused) return clipAudio;
+  return (djVoiceEls || []).find((a) => a && !a.paused && !a.ended
+    && a.src && a.src.indexOf(bare) >= 0) || null;
+}
+function adTraceDraw() {
+  if (!adTraces.size) return;
+  requestAnimationFrame(adTraceDraw);
+  if (document.hidden) return;
+  adTraces.forEach((canvas) => {
+    if (!canvas.isConnected) { adTraces.delete(canvas); return; }
+    if (!canvas.offsetParent) return;
+    const ratio = window.devicePixelRatio || 1;
+    const wantW = Math.max(1, Math.round(canvas.clientWidth * ratio));
+    const wantH = Math.max(1, Math.round(26 * ratio));
+    if (canvas.width !== wantW) canvas.width = wantW;
+    if (canvas.height !== wantH) canvas.height = wantH;
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+    const player = adTraceFor(canvas);
+    const live = player && window.pineAudioCtx
+      && window.pineAudioCtx.state === "running";
+    const scope = live ? audioScope(player) : null;
+    if (scope) scope.analyser.getByteFrequencyData(scope.bins);
+    const bars = 40;
+    const step = scope ? Math.max(1, Math.floor(scope.bins.length / bars)) : 1;
+    const bw = w / bars;
+    const t = performance.now() / 1000;
+    for (let i = 0; i < bars; i += 1) {
+      let level;
+      if (scope) {
+        let sum = 0;
+        for (let j = 0; j < step; j += 1) sum += scope.bins[i * step + j] || 0;
+        level = (sum / step) / 255;
+      } else {
+        level = 0.05 + 0.03 * (1 + Math.sin(t * 0.9 + i * 0.35));
+      }
+      const bh = Math.max(1, level * h * 0.94);
+      ctx.fillStyle = "#ffd479";
+      ctx.globalAlpha = scope ? 0.32 + level * 0.68 : 0.16;
+      ctx.fillRect(i * bw + ratio, h - bh, Math.max(1, bw - ratio * 2), bh);
+    }
+    ctx.globalAlpha = 1;
+  });
+}
+
+/* The whole ad shelf in one window: the spot you clicked at the top with a
+ * player and its read, and every spot before it underneath — scroll, play,
+ * download any of them (#731). */
+async function adArchivePopup(focusId) {
+  const gone = document.getElementById("adArchiveModal");
+  if (gone) gone.remove();
+  const shade = el("div", "", "");
+  shade.id = "adArchiveModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:192;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(700px,95vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:6px";
+  head.appendChild(el("h2", "", "📣 The spots"));
+  head.lastChild.style.cssText = "margin:0;color:#ffd479";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  const body = el("div", "muted", "reading the ad book…");
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  let data = {ads: []};
+  try { data = await api("/api/ads/archive"); }
+  catch (e) { body.textContent = e.message; return; }
+  body.textContent = "";
+  body.className = "";
+  const ads = (data.ads || []);
+  if (!ads.length) {
+    body.appendChild(el("div", "muted", "No spots written yet."));
+    return;
+  }
+  const lead = ads.find((a) => a.id === focusId) || ads[0];
+
+  // --- the one you clicked, in full -------------------------------------
+  const top = el("div", "", "");
+  top.style.cssText = "border:1px solid #4a3c14;background:#1a1508;"
+    + "border-radius:9px;padding:10px 12px;margin-bottom:12px";
+  const name = el("div", "", "📣 " + (lead.product || "an ad read"));
+  name.style.cssText = "font-weight:700;color:#ffd479;font-size:13px";
+  top.appendChild(name);
+  const when = el("div", "muted", (lead.ts
+    ? new Date(lead.ts * 1000).toLocaleString() : "")
+    + " · aired " + (lead.uses || 0) + "×"
+    + (lead.bed ? " · bed: " + lead.bed : ""));
+  when.style.cssText = "font-size:10.5px;margin:2px 0 6px";
+  top.appendChild(when);
+  if (lead.audio) {
+    const player = document.createElement("audio");
+    player.controls = true; player.preload = "metadata";
+    player.src = lead.audio;
+    player.style.cssText = "width:100%;height:34px;margin-bottom:6px";
+    top.appendChild(player);
+  } else {
+    const dry = el("div", "muted",
+      "This one was spoken live rather than produced — its words are the "
+      + "artefact; the audio lives in the broadcast recording.");
+    dry.style.cssText = "font-size:11px;margin-bottom:6px";
+    top.appendChild(dry);
+  }
+  const read = el("div", "", lead.text || "");
+  read.style.cssText = "font-size:11.5px;line-height:1.55;white-space:"
+    + "pre-wrap;max-height:150px;overflow:auto";
+  top.appendChild(read);
+  const topActs = el("div", "row", "");
+  topActs.style.cssText = "gap:6px;margin-top:8px;flex-wrap:wrap";
+  if (lead.audio) {
+    const dl = el("a", "", "⬇ keep it");
+    dl.href = lead.audio;
+    dl.download = ((lead.product || "ad").replace(/[^\w -]+/g, "")
+      .slice(0, 48) || "ad") + ".mp3";
+    dl.style.cssText = "font-size:11px;padding:3px 9px;color:#ffd479;"
+      + "border:1px solid var(--border);border-radius:7px;"
+      + "text-decoration:none";
+    topActs.appendChild(dl);
+  }
+  const air = el("button", "", "📻 Run it now");
+  air.style.cssText = "font-size:11px;padding:3px 9px";
+  air.onclick = async () => {
+    const done = pending(air, "…");
+    try {
+      await api("/api/dj/ads/" + lead.id + "/play", {method: "POST"});
+      setStatus("the spot is going out");
+    } catch (e) { setStatus(e.message, true); }
+    finally { done(); }
+  };
+  topActs.appendChild(air);
+  const desk = el("button", "", "🗂 The whole ads desk");
+  desk.style.cssText = "font-size:11px;padding:3px 9px";
+  desk.title = "Edit, re-cut, and download whole runs of them";
+  desk.onclick = () => {
+    shade.remove();
+    localStorage.cacheTab = "ads";
+    callRecordings();
+  };
+  topActs.appendChild(desk);
+  top.appendChild(topActs);
+  body.appendChild(top);
+
+  // --- and everything before it -----------------------------------------
+  const h = el("div", "", "Every spot before it — newest first");
+  h.style.cssText = "font-weight:700;font-size:12px;margin-bottom:4px";
+  body.appendChild(h);
+  const scroll = el("div", "", "");
+  scroll.style.cssText = "max-height:38vh;overflow-y:auto;"
+    + "border:1px solid var(--border);border-radius:8px";
+  ads.filter((a) => a.id !== lead.id).forEach((a) => {
+    const row = el("div", "", "");
+    row.style.cssText = "display:flex;gap:8px;align-items:center;"
+      + "padding:6px 9px;border-bottom:1px solid var(--border)";
+    const label = el("div", "", "");
+    label.style.cssText = "flex:1;min-width:0;font-size:11.5px";
+    label.innerHTML = "<b>" + callerDossierEsc(a.product || "an ad read")
+      + "</b><br><span class='muted' style='font-size:10px'>"
+      + (a.ts ? new Date(a.ts * 1000).toLocaleString() : "")
+      + " · " + (a.words || 0) + " words · aired " + (a.uses || 0)
+      + "×</span>";
+    label.title = a.text || "";
+    row.appendChild(label);
+    if (a.audio) {
+      const play = el("button", "", "▶");
+      play.style.cssText = "font-size:11px;padding:2px 7px";
+      play.title = "Hear it — click again to stop";
+      play.onclick = () => clipToggle(a.audio, play, "▶");
+      row.appendChild(play);
+      const dl = el("a", "", "⬇");
+      dl.href = a.audio;
+      dl.download = ((a.product || "ad").replace(/[^\w -]+/g, "")
+        .slice(0, 48) || "ad") + ".mp3";
+      dl.title = "Download this spot";
+      dl.style.cssText = "font-size:12px;color:#ffd479;text-decoration:none;"
+        + "padding:0 4px";
+      row.appendChild(dl);
+    } else {
+      const dry = el("span", "muted", "written");
+      dry.style.cssText = "font-size:10px";
+      dry.title = "Spoken live — no produced file of its own";
+      row.appendChild(dry);
+    }
+    const open = el("button", "", "↑");
+    open.style.cssText = "font-size:11px;padding:2px 7px";
+    open.title = "Bring this one to the top";
+    open.onclick = () => adArchivePopup(a.id);
+    row.appendChild(open);
+    scroll.appendChild(row);
+  });
+  body.appendChild(scroll);
 }
 
 /* #656: the whole night, kept. The server only ever hands over the last
@@ -41141,6 +42914,11 @@ async function hangupRules(focusId) {
  * press Clear. */
 let djTalkAll = [];
 const djTalkSeenIds = new Set();
+// #742: where each line with an id sits in djTalkAll. A line now arrives
+// TWICE — once the moment it starts going out, and again, fuller, when it
+// has aired — and both are the same line, so the second one has to land on
+// top of the first rather than beside it.
+const djTalkById = new Map();
 // Stings already popped as bubbles over the glass (#668), so a redraw does
 // not re-pop the whole night's samples.
 const boothStungIds = new Set();
@@ -41148,12 +42926,28 @@ const boothStungIds = new Set();
 function djTalkAbsorb(lines) {
   let added = 0;
   lines.forEach((line) => {
+    // #742: an id is the line's identity for its whole life. The provisional
+    // "going out now" row and the finished entry share one, so the second
+    // MERGES onto the first — same row, in the place it already holds, now
+    // carrying its provenance, its media key and its delivery mark.
+    const eid = String(line.id || "");
+    if (eid && djTalkById.has(eid)) {
+      const at = djTalkById.get(eid);
+      const was = djTalkAll[at] || {};
+      // Never let the thin live copy overwrite the full one: once a line
+      // has landed for real, a late poll of speaking_now must not undo it.
+      if (!(line.aired === "airing" && was.aired !== "airing")) {
+        djTalkAll[at] = Object.assign({}, was, line);
+      }
+      return;
+    }
     // ts alone is not unique — two lines can land in the same second — so
     // the key carries the speaker and the words as well.
     const key = (line.ts || 0) + "|" + (line.who || "") + "|"
-      + (line.id || djTalkKey(line.text || "").slice(0, 40));
+      + (eid || djTalkKey(line.text || "").slice(0, 40));
     if (djTalkSeenIds.has(key)) return;
     djTalkSeenIds.add(key);
+    if (eid) djTalkById.set(eid, djTalkAll.length);
     djTalkAll.push(line);
     added += 1;
   });
@@ -41163,6 +42957,7 @@ function djTalkAbsorb(lines) {
 function djTalkClear() {
   djTalkAll = [];
   djTalkSeenIds.clear();
+  djTalkById.clear();
   const log = document.getElementById("djTalkLog");
   if (log) log.textContent = "";
   setStatus("Booth history cleared.");
@@ -41180,6 +42975,18 @@ function djTalkRender(state) {
     (line) => line && line.text
       && !/^(seen|tick|ping|heartbeat)$/.test(line.kind || ""));
   djTalkAbsorb(fresh_lines);
+  /* #742: "whatever message is being spoken must always be in the list."
+   * It never was. A line is written to chat when the announce RETURNS, so
+   * for the whole time you can actually hear it, it does not exist here —
+   * and the jump button, having nothing to find, kept landing on the line
+   * before it and saying "nothing is going out". The station now publishes
+   * the line it is speaking the moment it hands it over, under the id the
+   * finished entry will land on, so it is in the list from the first
+   * syllable and the same row simply fills in when it is done. */
+  const live = state.speaking_now || null;
+  window.djSpeakingEid = live ? String(live.id || "") : "";
+  window.djSpeakingWho = live ? String(live.who || "") : "";
+  if (live && live.text) djTalkAbsorb([live]);
   const lines = djTalkAll;
   if (!lines.length) return;
 
@@ -41262,8 +43069,10 @@ function djTalkRender(state) {
       im.style.cssText = "height:70px;border-radius:6px;flex:0 0 auto;"
         + "border:1px solid var(--border);object-fit:cover;cursor:zoom-in";
       im.onerror = () => { im.style.display = "none"; };
-      im.title = n + " — open it";
+      im.title = n + " — click to open it, right-click to put it on the "
+        + "block again";
       im.onclick = () => artFullscreen(n);        // #649
+      im.oncontextmenu = (ev) => artHawkMenu(ev, n);          // #719
       grow.appendChild(im);
     });
     log.appendChild(grow);
@@ -41303,11 +43112,28 @@ function djTalkRender(state) {
     // find it in the Ad Studio, keep it, or throw it away — from here.
     if (line.kind === "ad") {
       row.style.cssText += ";background:#1a1508;border:1px solid #4a3c14;"
-        + "flex-direction:column;gap:4px;margin:4px 0;padding:6px 8px";
-      const head = el("div", "", "📣 " + (line.product || line.text
-        || "an ad read"));
+        + "flex-direction:column;gap:4px;margin:4px 0;padding:6px 8px;"
+        + "cursor:pointer";
+      // #731: the spot that is ON AIR is unmistakable — lit border, a
+      // spectrogram running off its own audio, and the read scrolling past
+      // as a marquee, so the tile behaves like a thing that is playing
+      // rather than a line that happens to be about an ad.
+      const onAir = adIsOnAir(line);
+      if (onAir) {
+        row.style.borderColor = "#ffd479";
+        row.style.boxShadow = "0 0 14px #ffd47955";
+        row.style.background = "#241c09";
+      }
+      const head = el("div", "", (onAir ? "🔴 " : "📣 ")
+        + (line.product || line.text || "an ad read"));
       head.style.cssText = "font-size:11.5px;color:#ffd479;font-weight:600;"
         + "flex:1;min-width:0";
+      row.title = "Click to open the ads desk at this spot — the player, "
+        + "the read, and every spot before it";
+      row.onclick = (ev) => {
+        if (ev.target.closest("button,a,audio")) return;
+        adArchivePopup(line.ad_id || "");
+      };
       row.appendChild(head);
       // #732: play and download ON the tile, beside the name, rather
       // than only in the action row underneath. The heading now shares
@@ -41343,9 +43169,35 @@ function djTalkRender(state) {
         save.onclick = (ev) => ev.stopPropagation();
         row.appendChild(save);
       })();
+      // The trace, drawn off whichever element is playing this spot (#731).
+      // Only while it is actually sounding — a still canvas on every ad in
+      // the night's log would be sixty dead rectangles.
+      const heardUrl = adClipUrl(line);
+      if (heardUrl) {
+        const trace = document.createElement("canvas");
+        trace.className = "ad-trace";
+        trace.dataset.src = heardUrl;
+        trace.style.cssText = "display:block;width:100%;height:26px;"
+          + "border-radius:4px;background:#0b0904";
+        row.appendChild(trace);
+        adTraceWatch(trace);
+      }
       if (line.product && line.text && line.text !== line.product) {
-        const said = el("div", "muted", line.text);
-        said.style.cssText = "font-size:11px;line-height:1.45;width:100%";
+        // #731: the read scrolls past like a lyric while the spot is on
+        // air, so you can follow what is being said in the tile itself.
+        // Once it is over it settles into plain text you can read at rest.
+        const said = el("div", "muted", "");
+        said.style.cssText = "font-size:11px;line-height:1.45;width:100%;"
+          + (onAir ? "overflow:hidden;white-space:nowrap" : "");
+        if (onAir) {
+          const run = el("span", "", line.text + "     •     " + line.text);
+          run.style.cssText = "display:inline-block;padding-left:100%;"
+            + "animation:adMarquee " + Math.max(14, Math.min(90,
+              String(line.text).length / 7)).toFixed(0) + "s linear infinite";
+          said.appendChild(run);
+        } else {
+          said.textContent = line.text;
+        }
         row.appendChild(said);
       }
       const acts = el("div", "row", "");
@@ -41423,8 +43275,15 @@ function djTalkRender(state) {
       const chip = el("span", "sfx-chip", "");
       chip.appendChild(el("span", "sfx-chip-em", sfxEmojiFor(line.text)));
       chip.appendChild(el("span", "", " " + (line.text || "sample")));
-      chip.title = "Open this sound effect";
-      chip.onclick = () => sfxInspect(line.sfx);
+      // #714: the bell is not a sample off the shelf — it is MADE, so
+      // sfxInspect had nothing to open and the chip did nothing. It has a
+      // workshop of its own now: hear it, take a copy, bend it, keep it.
+      const isBell = !line.sfx
+        && /ring|bell|receiver|dial tone/i.test(String(line.text || ""));
+      chip.title = isBell
+        ? "Open the station's phone bell — hear it, tune it, keep a copy"
+        : "Open this sound effect";
+      chip.onclick = () => (isBell ? phoneRingStudio() : sfxInspect(line.sfx));
       row.appendChild(chip);
       const small = "background:none;border:0;padding:0 3px;"
         + "cursor:pointer;font-size:10px;opacity:.7";
@@ -41432,7 +43291,11 @@ function djTalkRender(state) {
       play.style.cssText = small;
       play.title = "Hear it again";
       play.onclick = () => {
-        if (line.url) new Audio(line.url).play().catch(() => {});
+        if (line.url) { new Audio(line.url).play().catch(() => {}); return; }
+        // #714: a desk sound carries no url — the bell is GENERATED, and
+        // rendering it needs a bearer header a bare <audio> cannot send.
+        // Its own window fetches it properly, so that is where ▶ goes.
+        if (isBell) phoneRingStudio();
       };
       row.appendChild(play);
       // #703: up as well as down. Favouring a sample raises how often it
@@ -41511,10 +43374,14 @@ function djTalkRender(state) {
       if (line.kind === "call") {
         const who = String(line.text || "").split(":").slice(1).join(":").trim();
         if (who) {
-          mark.style.cursor = "help";
+          mark.style.cursor = "pointer";
+          mark.title = "Hover for their licence · click for their file — "
+            + "the transcript, and how they hang up";
           mark.onmouseenter = (ev) =>
             callerCardShow(who, ev.currentTarget);
           mark.onmouseleave = callerCardHide;
+          // #715/#716: the hover card is a thing to read; this is the door.
+          mark.onclick = (ev) => { ev.stopPropagation(); callerDossier(who); };
         }
       }
       row.appendChild(mark);
@@ -41551,16 +43418,24 @@ function djTalkRender(state) {
     // whose voice, what drove it, how it was intonated, what it looked
     // like, and which datapoint out of the vector map it grew from. All of
     // it already travels with the line; nothing showed it.
-    who.style.cursor = "help";
+    const isCaller = (line.who === "caller" || line.who === "caller2");
+    who.style.cursor = isCaller ? "pointer" : "help";
     who.onmouseenter = (ev) => {
       // #699: a caller gets a LICENCE, not the generic provenance card.
-      if (line.who === "caller" || line.who === "caller2") {
+      if (isCaller) {
         callerCardShow(line.name || "", ev.currentTarget);
       } else {
         lineCardShow(line, ev.currentTarget, tint);
       }
     };
     who.onmouseleave = () => { lineCardHide(); callerCardHide(); };
+    // #715/#716: clicking the customer opens their file — the transcript to
+    // edit and send back out, and the ending their calls take.
+    if (isCaller && line.name) {
+      who.title = "Open " + line.name + "'s file — the transcript, and how "
+        + "they hang up";
+      who.onclick = (ev) => { ev.stopPropagation(); callerDossier(line.name); };
+    }
     said.appendChild(who);
     said.appendChild(document.createTextNode(line.text || ""));
     // Every spoken line wears its delivery status (#430): out of the
@@ -41570,7 +43445,15 @@ function djTalkRender(state) {
     // happened to the announce, never from a guess about routing.
     // 🕐 held for replay · 📵 page-only · 📻 handed to the box (HA
     // accepted it) · ✧ browser/unconfirmed.
-    if (line.aired === "held") {
+    if (line.aired === "airing") {
+      // #742: it is coming out of a speaker RIGHT NOW. The row exists from
+      // this moment so there is something to jump to and follow.
+      const on = el("span", "", " 🔴");
+      on.title = "Going out right now";
+      on.style.cssText = "font-size:10px";
+      said.appendChild(on);
+      row.style.background = "rgba(255,95,95,.08)";
+    } else if (line.aired === "held") {
       const off = el("span", "", " 🕐");
       off.title = "Held on the shelf — it replays the moment the box "
         + "reconnects (stored so the dialogue is never lost)";
@@ -41618,7 +43501,10 @@ function djTalkRender(state) {
         im.style.cssText = "height:40px;width:40px;object-fit:cover;"
           + "border-radius:5px;border:1px solid var(--border);cursor:zoom-in";
         im.onerror = () => { im.style.display = "none"; };
+        im.title = n + " — click to open it, right-click to have the DJs "
+          + "hawk it";
         im.onclick = (ev) => { ev.stopPropagation(); artFullscreen(n); };
+        im.oncontextmenu = (ev) => artHawkMenu(ev, n);        // #719
         artStrip.appendChild(im);
       });
     }
@@ -43115,6 +45001,287 @@ async function artFullscreen(name) {
   } catch (e) {
     where.textContent = "✗ " + e.message + " — write one yourself";
   }
+}
+
+/* ---- Hawking the art (#719, #723) -------------------------------------
+ *
+ * The gallery decided for itself what to talk about. These are the two
+ * doors into making it a SALE of a picture you chose: a right-click on the
+ * wall, and the queue of what is coming up next. The disposition of the
+ * person being sold to is picked here too — the same picture pitched at
+ * somebody appalled and somebody drunk is not the same segment.
+ */
+function sparkShowCurrent() {
+  return (sparkShow.imgs || [])[sparkShow.i] || "";
+}
+
+function artHawkClose() {
+  const gone = document.getElementById("artHawkMenu");
+  if (gone) gone.remove();
+}
+
+/* The little right-click menu. Returns false so the browser's own menu
+ * stays out of the way. */
+function artHawkMenu(event, name) {
+  if (!name) return true;
+  event.preventDefault();
+  artHawkClose();
+  const menu = el("div", "panel", "");
+  menu.id = "artHawkMenu";
+  menu.style.cssText = "position:fixed;z-index:250;width:250px;padding:5px;"
+    + "margin:0;font-size:12px;"
+    + "left:" + Math.min(window.innerWidth - 260, event.clientX) + "px;"
+    + "top:" + Math.min(window.innerHeight - 170, event.clientY) + "px";
+  menu.onclick = (e) => e.stopPropagation();
+  const item = (label, title, fn) => {
+    const b = el("button", "", label);
+    b.style.cssText = "display:block;width:100%;text-align:left;"
+      + "font-size:11.5px;padding:5px 8px;margin:1px 0;background:none;"
+      + "border:0;cursor:pointer";
+    b.title = title || "";
+    b.onmouseenter = () => { b.style.background = "#16202e"; };
+    b.onmouseleave = () => { b.style.background = "none"; };
+    b.onclick = () => { artHawkClose(); fn(); };
+    menu.appendChild(b);
+    return b;
+  };
+  const title = el("div", "muted", name);
+  title.style.cssText = "font-size:10px;padding:3px 8px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  menu.appendChild(title);
+  item("🗣 Have the DJs hawk it", "They take it off the wall, describe what "
+    + "they can see, and try to sell it to whoever is on the line",
+    () => artHawkPanel([name]));
+  item("⚡ Hawk it right now", "Straight on air, with whatever mood the "
+    + "dice give the buyer", async () => {
+      try {
+        await api("/api/dj/hawk", {method: "POST",
+          body: JSON.stringify({images: [name], moods: []})});
+        setStatus("it is going on the block — watch the booth");
+      } catch (e) { setStatus(e.message, true); }
+    });
+  item("🔍 Open it", "See it full size and read the prompt behind it",
+       () => artFullscreen(name));
+  document.body.appendChild(menu);
+  const away = () => { artHawkClose(); document.removeEventListener(
+    "click", away, true); };
+  setTimeout(() => document.addEventListener("click", away, true), 0);
+  return false;
+}
+
+/* The sale bench: the pieces going up, and the state of mind of the person
+ * they are being sold to. */
+async function artHawkPanel(names) {
+  const gone = document.getElementById("artHawkModal");
+  if (gone) gone.remove();
+  const shade = el("div", "", "");
+  shade.id = "artHawkModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:196;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(640px,95vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:4px";
+  head.appendChild(el("h2", "", "🗣 On the block"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  box.appendChild(el("div", "muted",
+    "The pair take these off the wall, describe what they can actually see, "
+    + "and hawk them to whoever is on the line — who buys or refuses. "
+    + "Whatever does not sell goes back against the wall, out loud, and "
+    + "anyone who rings during the segment gets asked whether they want a "
+    + "painting."));
+  box.lastChild.style.cssText = "font-size:11.5px;line-height:1.55;"
+    + "margin-bottom:10px";
+
+  const strip = el("div", "", "");
+  strip.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:10px";
+  (names || []).slice(0, 3).forEach((n) => {
+    const im = document.createElement("img");
+    im.src = "/api/generations/image/" + encodeURIComponent(n);
+    im.title = n;
+    im.style.cssText = "height:96px;border-radius:7px;border:1px solid "
+      + "var(--border);object-fit:cover";
+    im.onerror = () => { im.style.display = "none"; };
+    strip.appendChild(im);
+  });
+  box.appendChild(strip);
+
+  box.appendChild(el("label", "", "How the buyer takes it"));
+  const moodBox = el("div", "", "");
+  moodBox.style.cssText = "display:flex;gap:5px;flex-wrap:wrap;margin:4px 0";
+  box.appendChild(moodBox);
+  const picked = new Set();
+  let moods = [];
+  try { moods = (await api("/api/dj/hawk")).moods || []; }
+  catch (e) { moods = []; }
+  moods.forEach((m) => {
+    const chip = el("button", "", m.key);
+    chip.title = "They are " + m.says;
+    chip.style.cssText = "font-size:11px;padding:3px 9px;border-radius:11px";
+    const paint = () => {
+      chip.style.background = picked.has(m.key) ? "#1d3557" : "";
+      chip.style.borderColor = picked.has(m.key) ? "#4bb3ff" : "";
+      chip.style.color = picked.has(m.key) ? "#cfe" : "";
+    };
+    chip.onclick = () => {
+      if (picked.has(m.key)) picked.delete(m.key); else picked.add(m.key);
+      paint();
+    };
+    paint();
+    moodBox.appendChild(chip);
+  });
+  const hint = el("div", "muted",
+    "Pick as many as you like and they get MIXED into one person — "
+    + "'drunk' and 'too expensive' together is a different call from either. "
+    + "Pick none and the dice choose.");
+  hint.style.cssText = "font-size:11px;line-height:1.5;margin-bottom:8px";
+  box.appendChild(hint);
+
+  box.appendChild(el("label", "", "What they are asking for it"));
+  const price = el("input", "", "");
+  price.type = "number"; price.min = "0"; price.placeholder =
+    "leave empty and the station picks an absurd number";
+  box.appendChild(price);
+
+  const note = el("div", "muted", "");
+  note.style.cssText = "font-size:11.5px;margin:8px 0";
+  const go = el("button", "primary", "📣 Send it up to the DJs");
+  go.onclick = async () => {
+    const done = pending(go, "◐ they are looking at it…");
+    note.textContent = "the vision model is looking at it — the round lands "
+      + "in the booth as it airs";
+    try {
+      await api("/api/dj/hawk", {method: "POST", body: JSON.stringify({
+        images: names, moods: [...picked],
+        price: Number(price.value) || 0})});
+      note.textContent = "on the block — watch the booth";
+    } catch (e) { note.textContent = e.message; }
+    finally { done(); }
+  };
+  box.appendChild(go);
+  box.appendChild(note);
+
+  // What is already leaning against the wall unsold.
+  try {
+    const st = await api("/api/dj/hawk");
+    if ((st.unsold || []).length) {
+      const h = el("div", "", "🖼 Against the wall, unsold");
+      h.style.cssText = "font-weight:700;font-size:12px;margin:12px 0 4px";
+      box.appendChild(h);
+      const pile = el("div", "", "");
+      pile.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
+      st.unsold.slice(-8).reverse().forEach((p) => {
+        const im = document.createElement("img");
+        im.src = "/api/generations/image/" + encodeURIComponent(p.name);
+        im.title = (p.desc || p.name) + "\n\nClick to put it back on the block";
+        im.style.cssText = "height:58px;border-radius:6px;opacity:.72;"
+          + "border:1px solid var(--border);cursor:pointer;object-fit:cover";
+        im.onerror = () => { im.style.display = "none"; };
+        im.onclick = () => { shade.remove(); artHawkPanel([p.name]); };
+        pile.appendChild(im);
+      });
+      box.appendChild(pile);
+    }
+  } catch (e) { /* the bench works without the pile */ }
+
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+}
+
+/* #723: the next twelve pictures the wall is about to show — pick one (or a
+ * few) and send them up. */
+async function sparkQueuePopup(event) {
+  if (event) event.stopPropagation();
+  const gone = document.getElementById("sparkQueueModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "sparkQueueModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:194;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(760px,95vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:4px";
+  head.appendChild(el("h2", "", "🖼 Coming up on the wall"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  box.appendChild(el("div", "muted",
+    "The next twelve the slideshow will show. Tick any of them and send "
+    + "them up — the pair take them off the wall and hawk them to whoever "
+    + "is on the line, at whatever state of mind you choose."));
+  box.lastChild.style.cssText = "font-size:11.5px;line-height:1.55;"
+    + "margin-bottom:10px";
+  const grid = el("div", "muted", "reading the wall…");
+  box.appendChild(grid);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  let d = {images: []};
+  try {
+    d = await api("/api/dj/gallery/queue?limit=12&after="
+                  + encodeURIComponent(sparkShowCurrent()));
+  } catch (e) { grid.textContent = e.message; return; }
+  grid.textContent = "";
+  grid.className = "";
+  grid.style.cssText = "display:grid;gap:8px;"
+    + "grid-template-columns:repeat(auto-fill,minmax(120px,1fr))";
+  const picked = new Set();
+  (d.images || []).forEach((n, at) => {
+    const cell = el("div", "", "");
+    cell.style.cssText = "position:relative;border-radius:8px;"
+      + "overflow:hidden;border:2px solid transparent;cursor:pointer";
+    const im = document.createElement("img");
+    im.src = "/api/generations/image/" + encodeURIComponent(n);
+    im.loading = "lazy";
+    im.style.cssText = "display:block;width:100%;height:100px;"
+      + "object-fit:cover";
+    im.onerror = () => { cell.style.display = "none"; };
+    cell.appendChild(im);
+    const tag = el("div", "", (at + 1) + " · " + n.slice(0, 22));
+    tag.style.cssText = "position:absolute;left:0;right:0;bottom:0;"
+      + "font-size:9px;background:#000b;padding:2px 4px;overflow:hidden;"
+      + "text-overflow:ellipsis;white-space:nowrap";
+    cell.appendChild(tag);
+    cell.onclick = () => {
+      if (picked.has(n)) picked.delete(n); else picked.add(n);
+      cell.style.borderColor = picked.has(n) ? "#4bb3ff" : "transparent";
+      count.textContent = picked.size
+        ? picked.size + " picked" : "nothing picked yet";
+    };
+    cell.oncontextmenu = (ev) => artHawkMenu(ev, n);
+    grid.appendChild(cell);
+  });
+  if (!(d.images || []).length) {
+    grid.appendChild(el("div", "muted", "The wall is empty."));
+  }
+  const acts = el("div", "row", "");
+  acts.style.cssText = "gap:8px;margin-top:12px;align-items:center;"
+    + "flex-wrap:wrap";
+  const count = el("span", "muted", "nothing picked yet");
+  count.style.fontSize = "11px";
+  const send = el("button", "primary", "🗣 Send them up to be hawked");
+  send.onclick = () => {
+    if (!picked.size) { count.textContent = "tick one first"; return; }
+    shade.remove();
+    artHawkPanel([...picked].slice(0, 3));
+  };
+  acts.appendChild(send); acts.appendChild(count);
+  box.appendChild(acts);
 }
 
 /* #652: the header dot — green when a tailnet is carrying the station,
@@ -44995,6 +47162,7 @@ function djRhetoricRender(state) {
     let dom="dj", best=-1;
     for (const k in ww) if (ww[k] > best) { best = ww[k]; dom = k; }
     let rec = rhetWords.get(word);
+    let born = false;
     if (!rec) {
       const el = document.createElement("span");
       el.className = "rhet-word";
@@ -45008,13 +47176,37 @@ function djRhetoricRender(state) {
       el.style.left = x + "%"; el.style.top = y + "%";
       el.style.opacity = "0";
       cloud.appendChild(el);
-      rec = { el, count: 0 };
+      // #736: remember where it belongs at rest, so a word that has fallen
+      // to the back can drift back out of the middle as it recedes.
+      rec = { el, count: 0, depth: 0, x, y };
       rhetWords.set(word, rec);
+      born = true;
     }
     rec.el.style.fontSize = (12 + Math.round(26*(n-1)/Math.max(1,maxN-1))) + "px";
     rec.el.style.color = RHET_COLORS[dom] || "#9fb";
-    rec.el.style.opacity = String(0.42 + 0.58 * (n / maxN));
-    if (n > rec.count) {                     // said again this tick → pulse
+    const said = n > rec.count;
+    // #736: said this tick → it comes to the FRONT. Otherwise it slides one
+    // step further back, shrinking and blurring, and drifts outward toward
+    // where the crowd stands — so the live talk is always the near layer and
+    // the words behind it are visibly OLD talk rather than merely smaller.
+    rec.depth = said ? 0 : Math.min(1, (rec.depth || 0) + 0.14);
+    const z = 1.34 - rec.depth * 0.72;          // 1.34 at the front → .62 back
+    const away = rec.depth * 0.55;              // pushed back out of centre
+    rec.el.style.setProperty("--z", z.toFixed(3));
+    rec.el.style.transform = "translate(-50%,-50%) scale(" + z.toFixed(3) + ")";
+    rec.el.style.filter = rec.depth > 0.05
+      ? "blur(" + (rec.depth * 1.7).toFixed(2) + "px)" : "none";
+    rec.el.style.zIndex = String(100 - Math.round(rec.depth * 90));
+    rec.el.style.left = (rec.x + (rec.x - 50) * away).toFixed(2) + "%";
+    rec.el.style.top = (rec.y + (rec.y - 50) * away * 0.6).toFixed(2) + "%";
+    rec.el.style.opacity = String(
+      Math.max(0.12, (0.42 + 0.58 * (n / maxN)) * (1 - rec.depth * 0.72)));
+    if (born) {
+      // A word POPS in at the front, out of the blur, the moment it is said
+      // for the first time.
+      rec.el.classList.add("rhet-arrive");
+      setTimeout(() => rec.el.classList.remove("rhet-arrive"), 900);
+    } else if (said) {                       // said again this tick → pulse
       rec.el.classList.remove("rhet-pulse");
       void rec.el.offsetWidth;               // reflow to restart the animation
       rec.el.classList.add("rhet-pulse");
@@ -46264,6 +48456,35 @@ async function boxTalkSet() {
   }
 }
 
+/* #741: taking the narrative off this page means taking it off NOW.
+ *
+ * Routing was only consulted when the NEXT line was written, and everything
+ * already rendered was sitting in this page's queue — so switching to the
+ * Pine Box left the browser talking for another minute while the box stayed
+ * silent, which reads exactly as "it didn't move the audio over". This stops
+ * the page mid-word and hands back what it had not played yet, so the box
+ * picks the conversation up where the page dropped it. */
+function djVoiceHandOff() {
+  const pending = [];
+  const carry = (clip) => {
+    if (clip && clip.url) pending.push({url: clip.url, text: clip.text || ""});
+  };
+  // Whatever is sounding this second goes over too — you switched over
+  // BECAUSE you want to hear this, not the line after it.
+  carry(typeof djVoiceNow !== "undefined" ? djVoiceNow : null);
+  djVoiceQueue.forEach(carry);
+  djVoiceQueue.length = 0;
+  djVoiceBusy = false;
+  djVoiceLive = 0;
+  djVoiceNow = null;
+  (djVoiceEls || []).forEach((a) => {
+    if (!a) return;
+    try { a.pause(); a.currentTime = 0; a.removeAttribute("src"); a.load(); }
+    catch (e) { /* an element that will not stop is still muted below */ }
+  });
+  return pending;
+}
+
 async function djSetOutput(immediate) {
   const music = document.getElementById("djOutput").value;
   const voice = document.getElementById("djVoiceOut").value;
@@ -46273,10 +48494,23 @@ async function djSetOutput(immediate) {
   localStorage.setItem("djVoiceOut", voice);
   if (reply) localStorage.setItem("djReplyOut", reply);
   const status = document.getElementById("musicStatus");
+  // Stop the page BEFORE the round trip, so the switch is instant to the ear
+  // rather than a request away.
+  const handOff = (voice === "box" || voice === "off") ? djVoiceHandOff() : [];
   try {
     const state = await api("/api/dj/output", {
       method: "POST", body: JSON.stringify({music, voice, reply}),
     });
+    if (voice === "box" && handOff.length) {
+      try {
+        const moved = await api("/api/dj/handoff", {
+          method: "POST", body: JSON.stringify({clips: handOff})});
+        if (moved.moved) {
+          setStatus("moved to the Pine Box — " + moved.moved
+            + " line(s) the page had not played yet are going out of the box");
+        }
+      } catch (e) { /* the switch still took; only the carry-over missed */ }
+    }
     // Act on what is playing right now rather than waiting for the next
     // track (#174). The satellite has no stop service, so a track already
     // announced on the box plays itself out — everything else is immediate.
@@ -46860,23 +49094,117 @@ async function adStudioOpen() {
   card.appendChild(el("label", "", "1 · The song (the bed)"));
   const songRow = el("div", "row", "");
   const songSearch = el("input", "", "");
-  songSearch.placeholder = "Search the library…";
+  songSearch.placeholder = "Start typing — the library answers as you go…";
   songSearch.style.flex = "1";
+  songSearch.autocomplete = "off";
   const songBtn = el("button", "", "Find");
   songRow.appendChild(songSearch); songRow.appendChild(songBtn);
   card.appendChild(songRow);
   const songResults = el("div", "", "");
-  songResults.style.cssText = "max-height:150px;overflow-y:auto;margin:6px 0";
+  songResults.style.cssText = "max-height:190px;overflow-y:auto;margin:6px 0;"
+    + "border-radius:8px";
   card.appendChild(songResults);
   const chosenLbl = el("div", "muted",
     "No bed chosen — a random track will be used.");
   chosenLbl.style.fontSize = "12px";
   card.appendChild(chosenLbl);
+
+  /* #734: the bed you actually want, found and CUT.
+   *
+   * The box was a blind search: type, press Find, get a list of names, pick
+   * one and hope. You could not hear a candidate, and you could not say
+   * which part of it to use — so the read landed over a random 20-70
+   * seconds in, and if that was the wrong bar there was nothing to do about
+   * it but produce the spot again. This is the player, and the two cue
+   * points that decide which stretch goes under the voice. */
+  const cueWrap = el("div", "", "");
+  cueWrap.style.cssText = "display:none;margin:6px 0 2px;padding:8px 10px;"
+    + "border:1px solid var(--border);border-radius:8px;background:#0a1018";
+  const cuePlayer = document.createElement("audio");
+  cuePlayer.controls = true; cuePlayer.preload = "metadata";
+  cuePlayer.style.cssText = "width:100%;height:34px";
+  cueWrap.appendChild(cuePlayer);
+  const cueRow = el("div", "row", "");
+  cueRow.style.cssText = "gap:5px;margin-top:6px;flex-wrap:wrap;"
+    + "align-items:center;font-size:11px";
+  const cueState = {in: null, out: null};
+  const cueLbl = el("span", "muted", "no cue set — the studio picks a spot");
+  cueLbl.style.cssText = "flex:1;min-width:130px;font-size:11px";
+  const sayCue = () => {
+    const fmt = (s) => Math.floor(s / 60) + ":"
+      + String(Math.floor(s % 60)).padStart(2, "0");
+    if (cueState.in == null && cueState.out == null) {
+      cueLbl.textContent = "no cue set — the studio picks a spot";
+      return;
+    }
+    cueLbl.textContent = "bed runs from "
+      + (cueState.in != null ? fmt(cueState.in) : "the top")
+      + (cueState.out != null ? " to " + fmt(cueState.out) : " on");
+  };
+  const markIn = el("button", "", "⟦ cue in");
+  markIn.title = "The bed starts here — where the player is now";
+  markIn.style.cssText = "font-size:11px;padding:2px 8px";
+  markIn.onclick = () => {
+    cueState.in = cuePlayer.currentTime || 0;
+    if (cueState.out != null && cueState.out <= cueState.in) cueState.out = null;
+    sayCue();
+  };
+  const markOut = el("button", "", "cue out ⟧");
+  markOut.title = "The bed ends here — anything shorter than the read is "
+    + "padded with silence rather than cutting the spot off";
+  markOut.style.cssText = "font-size:11px;padding:2px 8px";
+  markOut.onclick = () => {
+    const at = cuePlayer.currentTime || 0;
+    if (cueState.in != null && at <= cueState.in) {
+      cueLbl.textContent = "the out point has to come after the in point";
+      return;
+    }
+    cueState.out = at;
+    sayCue();
+  };
+  const cueGo = el("button", "", "▶ from the cue");
+  cueGo.title = "Hear the bed from the in point";
+  cueGo.style.cssText = "font-size:11px;padding:2px 8px";
+  cueGo.onclick = () => {
+    cuePlayer.currentTime = cueState.in || 0;
+    cuePlayer.play().catch(() => {});
+  };
+  const cueClear = el("button", "", "✕ cues");
+  cueClear.style.cssText = "font-size:11px;padding:2px 8px";
+  cueClear.onclick = () => { cueState.in = cueState.out = null; sayCue(); };
+  cueRow.appendChild(markIn); cueRow.appendChild(markOut);
+  cueRow.appendChild(cueGo); cueRow.appendChild(cueClear);
+  cueRow.appendChild(cueLbl);
+  cueWrap.appendChild(cueRow);
+  card.appendChild(cueWrap);
+
+  function chooseTrack(t) {
+    chosen = t;
+    cueState.in = cueState.out = null;
+    sayCue();
+    chosenLbl.textContent = "Bed: " + (t.title || "?")
+      + (t.artist ? " — " + t.artist : "");
+    if (t.id && t.id !== "mx") {
+      cueWrap.style.display = "";
+      // The library's own player door, signed the way /media is — a bare
+      // <audio> cannot send a bearer header.
+      api("/api/music/track/" + encodeURIComponent(t.id)).then((full) => {
+        cuePlayer.src = full.url || ("/music/" + encodeURIComponent(t.id));
+      }).catch(() => {
+        cuePlayer.src = "/music/" + encodeURIComponent(t.id);
+      });
+    } else {
+      cueWrap.style.display = "none";
+    }
+  }
   const mxBtn = el("button", "", "🎞 Use a random MX tape as the bed");
   mxBtn.style.cssText = "font-size:11px;margin-top:4px";
   mxBtn.title = "Bed the read on one of the MX mixtapes — permission pending";
   mxBtn.onclick = () => {
     chosen = {id: "mx"};
+    cueState.in = cueState.out = null;
+    cueWrap.style.display = "none";           // #734: nothing to cue into
+    sayCue();
     chosenLbl.textContent =
       "Bed: a random MX mixtape (fades in and out under the read)";
   };
@@ -46920,31 +49248,98 @@ async function adStudioOpen() {
     const pct = st && st.dj && st.dj.ad_bed_pct;
     if (pct) { bedIn.value = String(pct); bedIn.oninput(); }
   }).catch(() => {});
+  // #734: suggestions AS YOU TYPE, and each one auditionable before you
+  // commit to it. Debounced so a fast typist does not fire ten searches,
+  // and answers are dropped if a later keystroke has already overtaken them.
+  let songSeq = 0;
+  let songTimer = 0;
+  let songMarked = -1;
+  let songRows = [];
   async function runSongSearch() {
     const q = songSearch.value.trim();
-    if (!q) { songResults.innerHTML = ""; return; }
+    if (!q) { songResults.innerHTML = ""; songRows = []; return; }
+    const mine = ++songSeq;
     try {
-      const got = await api("/api/music/search?limit=10&q="
+      const got = await api("/api/music/search?limit=14&q="
                             + encodeURIComponent(q));
+      if (mine !== songSeq) return;             // a later keystroke won
       songResults.innerHTML = "";
+      songRows = [];
+      songMarked = -1;
       (got.results || []).forEach((t) => {
-        const b = el("button", "", (t.title || "?")
-                     + (t.artist ? " — " + t.artist : ""));
-        b.style.cssText = "display:block;width:100%;text-align:left;"
-          + "margin:2px 0;font-size:12px";
-        b.onclick = () => {
-          chosen = t;
-          chosenLbl.textContent = "Bed: " + (t.title || "?")
-            + (t.artist ? " — " + t.artist : "");
+        const row = el("div", "", "");
+        row.style.cssText = "display:flex;gap:6px;align-items:center;"
+          + "padding:3px 5px;border-radius:6px;cursor:pointer";
+        const label = el("div", "", "");
+        label.style.cssText = "flex:1;min-width:0;font-size:12px;"
+          + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        label.innerHTML = "<b>" + callerDossierEsc(t.title || "?") + "</b>"
+          + (t.artist ? " <span class='muted' style='font-size:11px'>— "
+             + callerDossierEsc(t.artist) + "</span>" : "")
+          + (t.album ? " <span class='muted' style='font-size:10px'>· "
+             + callerDossierEsc(t.album) + "</span>" : "");
+        label.title = [t.title, t.artist, t.album].filter(Boolean).join(" · ");
+        row.appendChild(label);
+        // Audition it without choosing it — the whole point of a list you
+        // are exploring rather than picking blind from.
+        const hear = el("button", "", "▶");
+        hear.title = "Hear it — click again to stop";
+        hear.style.cssText = "font-size:11px;padding:1px 7px;flex:0 0 auto";
+        hear.onclick = async (ev) => {
+          ev.stopPropagation();
+          try {
+            const full = await api("/api/music/track/"
+                                   + encodeURIComponent(t.id));
+            clipToggle(full.url, hear, "▶");
+          } catch (e) { setStatus(e.message, true); }
         };
-        songResults.appendChild(b);
+        row.appendChild(hear);
+        const take = el("button", "", "use it");
+        take.style.cssText = "font-size:11px;padding:1px 8px;flex:0 0 auto";
+        take.onclick = (ev) => { ev.stopPropagation(); chooseTrack(t); };
+        row.appendChild(take);
+        row.onclick = () => chooseTrack(t);
+        row.onmouseenter = () => { row.style.background = "#16202e"; };
+        row.onmouseleave = () => {
+          row.style.background = songRows.indexOf(row) === songMarked
+            ? "#16202e" : "";
+        };
+        songRows.push(row);
+        songResults.appendChild(row);
       });
       if (!(got.results || []).length) {
         songResults.appendChild(el("div", "muted", "Nothing found."));
       }
     } catch (e) { songResults.textContent = e.message; }
   }
-  songSearch.onkeydown = (e) => { if (e.key === "Enter") runSongSearch(); };
+  songSearch.oninput = () => {
+    clearTimeout(songTimer);
+    songTimer = setTimeout(runSongSearch, 220);
+  };
+  // Arrows walk the list, Enter takes the marked one — exploring with the
+  // hands still on the keyboard.
+  songSearch.onkeydown = (e) => {
+    if (e.key === "ArrowDown" || e.key === "ArrowUp") {
+      if (!songRows.length) return;
+      e.preventDefault();
+      const was = songRows[songMarked];
+      if (was) was.style.background = "";
+      songMarked = (songMarked + (e.key === "ArrowDown" ? 1 : -1)
+                    + songRows.length + 1) % (songRows.length + 1);
+      if (songMarked === songRows.length) songMarked = 0;
+      const now = songRows[songMarked];
+      if (now) {
+        now.style.background = "#16202e";
+        try { now.scrollIntoView({block: "nearest"}); } catch (err) {}
+      }
+      return;
+    }
+    if (e.key === "Enter") {
+      e.preventDefault();
+      const now = songRows[songMarked];
+      if (now) now.click(); else runSongSearch();
+    }
+  };
   songBtn.onclick = runSongSearch;
 
   card.appendChild(el("label", "", "2 · What to pitch (the DJ writes from it)"));
@@ -46993,6 +49388,8 @@ async function adStudioOpen() {
           product: prod.value.trim(), script: script.value,
           voice: voiceSel.value, track_id: chosen ? chosen.id : "",
           bed_pct: Number(bedIn.value),          // #704
+          // #734: the stretch of the bed you cued, if you cued one.
+          bed_in: cueState.in, bed_out: cueState.out,
           air: !!air}),
       });
       status.textContent = "Saved ✓ “" + (r.text || "").slice(0, 80) + "”";
@@ -47075,6 +49472,191 @@ async function adStudioOpen() {
   document.body.appendChild(shade);
 }
 
+/* ---- The station bell (#714) ------------------------------------------
+ * "when i click the phone ringing button show a popup of the sound and let
+ * me review it or download it and make pitch modulations and configure the
+ * file prior to download adjusting the preset dynamically."
+ *
+ * The ring is generated, not sampled — two tones, a warble, a burst pattern
+ * — so there was nothing to click and nothing to keep. Every number that
+ * makes it is a slider here: move one and the bell you hear is the bell
+ * those numbers make, right then. Take a copy, or make it the bell the
+ * station actually rings.
+ */
+const RING_DIALS = [
+  ["low", "low tone", 80, 2000, 1, "Hz"],
+  ["high", "high tone", 80, 2000, 1, "Hz"],
+  ["pitch", "pitch", 0.4, 2.5, 0.01, "×"],
+  ["tremble", "warble speed", 0, 60, 0.5, "Hz"],
+  ["depth", "warble depth", 0, 1, 0.01, ""],
+  ["ring", "bell length", 0.1, 4, 0.05, "s"],
+  ["gap", "gap between", 0, 3, 0.05, "s"],
+  ["bursts", "how many rings", 1, 6, 1, ""],
+  ["level", "level", 0.05, 1, 0.01, ""],
+];
+
+function ringPreviewUrl(vals) {
+  const q = Object.keys(vals || {})
+    .map((k) => k + "=" + encodeURIComponent(vals[k])).join("&");
+  // A cache-buster, because the sliders change the sound at the same URL.
+  return "/api/sfx/ring/preview?" + q + (q ? "&" : "") + "n=" + Date.now();
+}
+
+async function phoneRingStudio() {
+  const gone = document.getElementById("ringModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "ringModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:188;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(560px,94vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:4px";
+  head.appendChild(el("h2", "", "☎ The station bell"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  box.appendChild(el("div", "muted",
+    "The ring is made, not sampled — so every part of it is a number you "
+    + "can move. Two tones, a warble over them, and a burst pattern. Play "
+    + "it as you go; keep a copy of the exact bell you built; or make it "
+    + "the one the station rings from the next call on."));
+  box.lastChild.style.cssText = "font-size:11.5px;line-height:1.55;"
+    + "margin-bottom:10px";
+  const body = el("div", "muted", "reading the bell…");
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  let preset = {}, dflt = {};
+  try {
+    const got = await api("/api/sfx/ring");
+    preset = Object.assign({}, got.preset || {});
+    dflt = got.default || {};
+  } catch (e) { body.textContent = e.message; return; }
+  body.textContent = "";
+  body.className = "";
+
+  const player = document.createElement("audio");
+  player.controls = true; player.preload = "none";
+  player.style.cssText = "width:100%;height:34px;margin:8px 0";
+  const note = el("div", "muted", "");
+  note.style.cssText = "font-size:11px;min-height:15px";
+
+  const rows = {};
+  RING_DIALS.forEach(([k, label, lo, hi, step, unit]) => {
+    const row = el("div", "", "");
+    row.style.cssText = "display:flex;align-items:center;gap:9px;"
+      + "margin:5px 0;font-size:11.5px";
+    const name = el("span", "muted", label);
+    name.style.cssText = "flex:0 0 96px";
+    const slide = el("input", "", "");
+    slide.type = "range"; slide.min = String(lo); slide.max = String(hi);
+    slide.step = String(step);
+    slide.value = String(preset[k] != null ? preset[k] : dflt[k]);
+    slide.style.cssText = "flex:1;min-width:90px";
+    const out = el("span", "", "");
+    out.style.cssText = "flex:0 0 62px;text-align:right;font-size:11px;"
+      + "color:var(--accent)";
+    const paint = () => {
+      out.textContent = Number(slide.value).toFixed(step < 1 ? 2 : 0) + unit;
+    };
+    paint();
+    slide.oninput = () => { paint(); preset[k] = Number(slide.value); };
+    // Moving a slider re-renders and plays it — "adjusting the preset
+    // dynamically" means hearing it move, not pressing a button after.
+    slide.onchange = () => { preset[k] = Number(slide.value); hear(); };
+    row.appendChild(name); row.appendChild(slide); row.appendChild(out);
+    rows[k] = {slide, paint};
+    body.appendChild(row);
+  });
+
+  // Fetched as a blob rather than pointed at directly: a bare <audio> sends
+  // no bearer header, and from another machine on the network that is a
+  // silent 401 and a 0:00 player — the same trap the cache modal hit.
+  let heardUrl = "";
+  let hearing = 0;
+  async function hear() {
+    const mine = ++hearing;
+    note.textContent = "◐ ringing it…";
+    try {
+      const r = await fetch(ringPreviewUrl(preset),
+        {headers: {"Authorization": "Bearer " + key()}});
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const blob = await r.blob();
+      if (mine !== hearing) return;        // a later drag already won
+      if (heardUrl) URL.revokeObjectURL(heardUrl);
+      heardUrl = URL.createObjectURL(blob);
+      player.src = heardUrl;
+      player.play().then(() => { note.textContent = ""; })
+        .catch(() => { note.textContent = "press play — the browser wants a "
+                       + "click before it makes noise"; });
+    } catch (e) { note.textContent = e.message; }
+  }
+
+  body.appendChild(player);
+  const acts = el("div", "row", "");
+  acts.style.cssText = "gap:6px;flex-wrap:wrap;margin-top:8px";
+  const hearBtn = el("button", "", "▶ Hear it");
+  hearBtn.onclick = hear;
+  const grab = el("button", "", "⬇ Keep this bell");
+  grab.title = "Download exactly the bell these sliders make, as a wav";
+  grab.onclick = async () => {
+    const done = pending(grab, "⏳ cutting…");
+    try {
+      const r = await fetch(ringPreviewUrl(preset),
+        {headers: {"Authorization": "Bearer " + key()}});
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const url = URL.createObjectURL(await r.blob());
+      const a = document.createElement("a");
+      a.href = url; a.download = "pinebox-phone-ring.wav";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 15000);
+      note.textContent = "saved ✓";
+    } catch (e) { note.textContent = e.message; }
+    finally { done(); }
+  };
+  const keep = el("button", "primary", "☎ Make it the station's ring");
+  keep.title = "Every call from the next one on rings on this bell";
+  keep.onclick = async () => {
+    const done = pending(keep, "…");
+    try {
+      await api("/api/sfx/ring", {method: "POST",
+        body: JSON.stringify({preset})});
+      note.textContent = "the station rings on this now";
+      setStatus("the phone bell is re-tuned");
+    } catch (e) { note.textContent = e.message; }
+    finally { done(); }
+  };
+  const reset = el("button", "", "↺ Back to stock");
+  reset.onclick = async () => {
+    try {
+      const got = await api("/api/sfx/ring", {method: "POST",
+        body: JSON.stringify({reset: true})});
+      preset = Object.assign({}, got.preset || {});
+      RING_DIALS.forEach(([k]) => {
+        if (rows[k] && preset[k] != null) {
+          rows[k].slide.value = String(preset[k]);
+          rows[k].paint();
+        }
+      });
+      note.textContent = "back to the stock bell";
+      hear();
+    } catch (e) { note.textContent = e.message; }
+  };
+  acts.appendChild(hearBtn); acts.appendChild(grab);
+  acts.appendChild(keep); acts.appendChild(reset);
+  body.appendChild(acts);
+  body.appendChild(note);
+}
+
 /* ⬇ The tail cutter: a little popover with a slider — grab the last 30
  * seconds (default) up to an hour of the broadcast as one mp3. Past the
  * seal it keeps reaching, onto the episode shelf (#630). */
@@ -47088,12 +49670,12 @@ function djTailPanel(anchor) {
   const pop = el("div", "panel", "");
   pop.id = "djTailPanel";
   const at = anchor.getBoundingClientRect();
-  pop.style.cssText = "position:fixed;z-index:220;width:min(300px,90vw);"
-    + "padding:10px 12px;margin:0;"
-    + "left:" + Math.max(8, Math.min(window.innerWidth - 310, at.left - 120))
+  pop.style.cssText = "position:fixed;z-index:220;width:min(360px,92vw);"
+    + "padding:10px 12px;margin:0;max-height:76vh;overflow:auto;"
+    + "left:" + Math.max(8, Math.min(window.innerWidth - 370, at.left - 150))
     + "px;top:" + (at.bottom + 6) + "px";
   pop.onclick = (e) => e.stopPropagation();
-  pop.appendChild(el("div", "", "⬇ the last stretch of the broadcast"));
+  pop.appendChild(el("div", "", "✂ cut the broadcast — the last stretch"));
   pop.lastChild.style.cssText = "font-weight:700;font-size:12px";
   const lab = el("div", "", "30 s");
   lab.style.cssText = "font-size:12px;color:var(--accent);margin:4px 0";
@@ -47133,50 +49715,127 @@ function djTailPanel(anchor) {
   kind.onchange = sayLevels;
   sayLevels();
 
+  /* #727: "when i cut these clips make sure they are queued up to be taken
+   * quickly. I need to be able to extract and send these quickly."
+   *
+   * The cut used to hold the button — and you — for as long as ffmpeg took,
+   * then drop one file into Downloads. Cutting three meant standing over
+   * three of them in a row. The cut is a JOB now: press and it goes on the
+   * queue behind you, the panel stays open so you can line the next one up,
+   * and everything that lands sits in the tray below with a player, a save,
+   * and a link you can paste into a message from any machine on the
+   * network. */
   const row = el("div", "row", ""); row.style.marginTop = "6px";
-  const go = el("button", "primary", "⬇ Save it");
+  const go = el("button", "primary", "✂ Cut it");
+  go.title = "Queue this cut — it runs behind you and lands in the tray";
+  const tray = el("div", "", "");
+  tray.style.cssText = "margin-top:8px;border-top:1px solid var(--border);"
+    + "padding-top:6px;max-height:34vh;overflow-y:auto";
+
+  let trayTimer = 0;
+  async function paintTray() {
+    if (!pop.isConnected) { clearTimeout(trayTimer); return; }
+    let d = {cuts: [], jobs: []};
+    try { d = await api("/api/radio-cache/cuts"); }
+    catch (e) { tray.textContent = e.message; return; }
+    tray.innerHTML = "";
+    const running = (d.jobs || []).filter(
+      (j) => j.state === "queued" || j.state === "cutting");
+    (d.jobs || []).forEach((j) => {
+      const r = el("div", "muted", "");
+      r.style.cssText = "font-size:10.5px;padding:2px 0";
+      r.textContent = ({queued: "⏳ queued — ", cutting: "✂ cutting — ",
+                        failed: "✗ ", empty: "— nothing there: "}[j.state]
+                       || "") + (j.label || "")
+        + (j.error ? " (" + j.error + ")" : "");
+      tray.appendChild(r);
+    });
+    if (!(d.cuts || []).length && !running.length) {
+      const none = el("div", "muted", "Nothing cut yet.");
+      none.style.cssText = "font-size:10.5px;padding:2px 0";
+      tray.appendChild(none);
+    }
+    (d.cuts || []).forEach((c) => {
+      const r = el("div", "", "");
+      r.style.cssText = "display:flex;gap:5px;align-items:center;"
+        + "padding:3px 0;font-size:10.5px";
+      const url = "/api/radio-cache/cuts/" + encodeURIComponent(c.name)
+        + "?t=" + c.sig;
+      const label = el("span", "", "");
+      label.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap";
+      const mins = Math.floor((c.seconds || 0) / 60);
+      label.textContent = (mins ? mins + "m " : "")
+        + Math.round((c.seconds || 0) % 60) + "s · "
+        + Math.round((c.size || 0) / 1024) + " KB";
+      label.title = c.name;
+      r.appendChild(label);
+      const play = el("button", "", "▶");
+      play.style.cssText = "font-size:10.5px;padding:1px 6px";
+      play.title = "Hear it — click again to stop";
+      play.onclick = () => clipToggle(url, play, "▶");
+      r.appendChild(play);
+      const save = el("a", "", "⬇");
+      save.href = url; save.download = c.name;
+      save.title = "Save it";
+      save.style.cssText = "font-size:12px;color:var(--accent);"
+        + "text-decoration:none;padding:0 3px";
+      r.appendChild(save);
+      const link = el("button", "", "🔗");
+      link.style.cssText = "font-size:10.5px;padding:1px 6px";
+      link.title = "Copy a link to it — signed, so it opens anywhere on the "
+        + "network without a key";
+      link.onclick = async () => {
+        const full = location.origin + url;
+        try {
+          await navigator.clipboard.writeText(full);
+          link.textContent = "✓";
+          setTimeout(() => { link.textContent = "🔗"; }, 1200);
+        } catch (e) { prompt("Copy this link", full); }
+      };
+      r.appendChild(link);
+      const bin = el("button", "", "✕");
+      bin.style.cssText = "font-size:10.5px;padding:1px 6px";
+      bin.title = "Throw this cut away";
+      bin.onclick = async () => {
+        try {
+          await api("/api/radio-cache/cuts/" + encodeURIComponent(c.name),
+                    {method: "DELETE"});
+          paintTray();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      r.appendChild(bin);
+      tray.appendChild(r);
+    });
+    // Keep looking only while something is actually cooking.
+    clearTimeout(trayTimer);
+    if (running.length) trayTimer = setTimeout(paintTray, 2500);
+  }
+
   go.onclick = async () => {
-    const label = go.textContent;
-    go.textContent = "⏳ cutting…"; go.disabled = true;
+    const done = pending(go, "✂ queueing…");
     try {
       // Levels are read HERE, not when the panel opened — you may well have
       // reached for the desk in between.
       const lv = djLevels();
-      const url_ = kind.value === "mix"
-        ? "/api/radio-cache/broadcast?tail=" + slide.value
-          + "&music=" + Math.round(lv.music * 100)
-          + "&duck=" + Math.round(lv.duck * 100)
-          + "&voice=" + Math.round(lv.voice * 100)
-        : "/api/radio-cache/tail?seconds=" + slide.value;
-      const r = await fetch(url_,
-        { headers: { "Authorization": "Bearer " + key() } });
-      if (!r.ok) {
-        const d = await r.json().catch(() => ({}));
-        throw new Error(d.detail || ("HTTP " + r.status));
-      }
-      const blob = await r.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = "pinebox-" + (kind.value === "mix" ? "broadcast" : "talk")
-        + "-last-" + slide.value + "s.mp3";
-      document.body.appendChild(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 15000);
-      setStatus(kind.value === "mix"
-        ? "the broadcast is saved — music, ads and talk, at your levels"
-        : "the talk is saved");
-      pop.remove();
-    } catch (e) {
-      go.textContent = label; go.disabled = false;
-      lab.textContent = e.message;
-    }
+      await api("/api/radio-cache/cut", {method: "POST", body: JSON.stringify({
+        kind: kind.value, seconds: Number(slide.value),
+        music: Math.round(lv.music * 100),
+        duck: Math.round(lv.duck * 100),
+        voice: Math.round(lv.voice * 100)})});
+      lab.textContent = djTailLabel(Number(slide.value)) + " — on the queue";
+      paintTray();
+    } catch (e) { lab.textContent = e.message; }
+    finally { done(); }
   };
   const close = el("button", "", "✕");
-  close.onclick = () => pop.remove();
+  close.onclick = () => { clearTimeout(trayTimer); pop.remove(); };
   row.appendChild(go); row.appendChild(close);
   pop.appendChild(lab); pop.appendChild(slide);
   pop.appendChild(kindRow); pop.appendChild(levelNote); pop.appendChild(row);
+  pop.appendChild(tray);
   document.body.appendChild(pop);
+  paintTray();
 }
 
 /* The plotline desk (📖): write a storyline in acts; activate it and the
@@ -48782,11 +51441,234 @@ async function callRecordings() {
   };
   box.insertBefore(tabs, list);
 
+  /* ---- The ads (#743) --------------------------------------------------
+   *
+   * "a tab for ads made for the station where I can download ads and listen
+   * to them and view their transcripts and even modify and queue them up for
+   * re-rendering and re-airing and even download the entire series of ads as
+   * one batch file or the hour 3 hours day week or month or entirety."
+   *
+   * Everything here already existed somewhere — the ad book behind a
+   * settings box, the produced audio behind a signed URL, the studio behind
+   * its own modal — and none of it was one place you could work in. */
+  async function renderAds() {
+    list.innerHTML = "";
+    const why = el("div", "muted",
+      "Every spot the station has written. A PRODUCED one has its own audio "
+      + "— play it, keep it, re-cut it from words you have changed, or send "
+      + "it out now. A WRITTEN one was spoken live: its read is the artefact "
+      + "and its sound lives in the broadcast recording. The reels below cut "
+      + "produced spots together in the order they actually aired.");
+    why.style.cssText = "font-size:11px;line-height:1.55;margin-bottom:10px";
+    list.appendChild(why);
+
+    // --- the reels ------------------------------------------------------
+    const reel = el("div", "", "");
+    reel.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+      + "padding:8px 10px;margin-bottom:12px";
+    const rl = el("div", "", "📼 The run of ads, cut together as one mp3");
+    rl.style.cssText = "font-weight:700;font-size:12px;margin-bottom:5px";
+    reel.appendChild(rl);
+    const rrow = el("div", "row", "");
+    rrow.style.cssText = "gap:5px;flex-wrap:wrap;align-items:center";
+    const rnote = el("div", "muted", "");
+    rnote.style.cssText = "font-size:11px;margin-top:5px;min-height:15px";
+    [["hour", "the last hour"], ["3h", "3 hours"], ["6h", "6 hours"],
+     ["today", "today"], ["yesterday", "yesterday"], ["week", "this week"],
+     ["month", "this month"], ["all", "everything"]].forEach(([sc, text]) => {
+      const b = el("button", sc === "all" ? "primary" : "", "⬇ " + text);
+      b.style.cssText = "font-size:11px;padding:3px 9px";
+      b.title = "Download every produced spot that aired in " + text
+        + " as one continuous mp3";
+      b.onclick = async () => {
+        const done = pending(b, "⏳ cutting…");
+        rnote.textContent = "cutting the reel…";
+        try {
+          const r = await fetch("/api/ads/compile?scope=" + sc,
+            {headers: {"Authorization": "Bearer " + key()}});
+          if (!r.ok) {
+            const d = await r.json().catch(() => ({}));
+            throw new Error(d.detail || ("HTTP " + r.status));
+          }
+          const url = URL.createObjectURL(await r.blob());
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = "pinebox-ads-" + sc + ".mp3";
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 20000);
+          rnote.textContent = "saved ✓ — " + text;
+        } catch (e) { rnote.textContent = e.message; }
+        finally { done(); }
+      };
+      rrow.appendChild(b);
+    });
+    reel.appendChild(rrow);
+    // Fetched rather than linked: a plain <a> sends no bearer header, and
+    // from another machine that is a silent 401.
+    const book = el("button", "", "📄 the whole ad book as one markdown file");
+    book.style.cssText = "font-size:11px;padding:3px 9px;margin-top:6px";
+    book.onclick = async () => {
+      const done = pending(book, "…");
+      try {
+        const r = await fetch("/api/ads/archive.md",
+          {headers: {"Authorization": "Bearer " + key()}});
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const url = URL.createObjectURL(await r.blob());
+        const a = document.createElement("a");
+        a.href = url; a.download = "pinebox-ad-book.md";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 15000);
+        rnote.textContent = "the ad book is saved";
+      } catch (e) { rnote.textContent = e.message; }
+      finally { done(); }
+    };
+    reel.appendChild(book);
+    reel.appendChild(rnote);
+    list.appendChild(reel);
+
+    // --- the shelf ------------------------------------------------------
+    let data = {ads: []};
+    try { data = await api("/api/ads/archive"); }
+    catch (e) { list.appendChild(el("div", "muted", e.message)); return; }
+    const ads = data.ads || [];
+    const h = el("div", "", "📣 The spots — " + ads.length + " written, "
+      + (data.with_audio || 0) + " with audio");
+    h.style.cssText = "font-weight:700;margin:4px 0 6px";
+    list.appendChild(h);
+    if (!ads.length) {
+      const m = el("div", "muted", "Nothing written yet — spots land here as "
+        + "the pair invent them, and as you produce them in the Ad studio.");
+      m.style.cssText = "font-size:11px";
+      list.appendChild(m);
+      return;
+    }
+    ads.forEach((a) => {
+      const row = el("div", "", "");
+      row.style.cssText = "padding:8px 0;border-top:1px solid var(--border)";
+      const title = el("div", "", "");
+      title.innerHTML = "<b>" + callerDossierEsc(a.product || "an ad read")
+        + "</b> <span class='muted' style='font-size:11px'>· "
+        + (a.ts ? new Date(a.ts * 1000).toLocaleString() : "")
+        + " · " + (a.words || 0) + " words · aired " + (a.uses || 0) + "×"
+        + (a.last_aired ? " · last "
+           + new Date(a.last_aired * 1000).toLocaleString() : "")
+        + (a.bed ? " · bed: " + callerDossierEsc(a.bed) : "")
+        + "</span>";
+      row.appendChild(title);
+      if (a.audio) {
+        const audio = document.createElement("audio");
+        audio.controls = true; audio.preload = "metadata";
+        audio.volume = 1.0; audio.muted = false;
+        audio.src = a.audio;
+        audio.style.cssText = "width:100%;height:34px;margin-top:5px";
+        cacheAudioHook(audio);
+        row.appendChild(audio);
+      }
+      // The transcript, editable in place — this IS the re-render input.
+      const script = el("textarea", "", "");
+      script.value = a.text || "";
+      script.style.cssText = "width:100%;min-height:62px;font-size:11.5px;"
+        + "margin-top:5px";
+      script.title = "The read. Change it and re-cut the spot from it.";
+      row.appendChild(script);
+      const acts = el("div", "row", "");
+      acts.style.cssText = "gap:5px;margin-top:5px;flex-wrap:wrap;"
+        + "align-items:center";
+      const note = el("span", "muted", "");
+      note.style.cssText = "font-size:10.5px";
+
+      const save = el("button", "", "💾 Save the words");
+      save.style.cssText = "font-size:11px;padding:2px 8px";
+      save.title = "Keep the edit without re-cutting the audio";
+      save.onclick = async () => {
+        const done = pending(save, "…");
+        try {
+          await api("/api/dj/ads", {method: "POST", body: JSON.stringify(
+            {id: a.id, product: a.product || "", text: script.value})});
+          note.textContent = "saved ✓ (the audio is still the old cut)";
+        } catch (e) { note.textContent = e.message; }
+        finally { done(); }
+      };
+      acts.appendChild(save);
+
+      const recut = el("button", "primary", "🎚 Re-cut it");
+      recut.style.cssText = "font-size:11px;padding:2px 8px";
+      recut.title = "Render this spot again from the words above — same "
+        + "entry, new audio";
+      recut.onclick = async () => {
+        const done = pending(recut, "⏳ producing…");
+        note.textContent = "voice, bed, vocode, sting…";
+        try {
+          await api("/api/dj/ads/" + a.id + "/recut", {method: "POST",
+            body: JSON.stringify({text: script.value, air: false})});
+          note.textContent = "re-cut ✓";
+          setTimeout(render, 400);
+        } catch (e) { note.textContent = e.message; }
+        finally { done(); }
+      };
+      acts.appendChild(recut);
+
+      const airNow = el("button", "", "📻 Queue it on air");
+      airNow.style.cssText = "font-size:11px;padding:2px 8px";
+      airNow.title = "Run this spot out of the station now";
+      airNow.onclick = async () => {
+        const done = pending(airNow, "…");
+        try {
+          await api("/api/dj/ads/" + a.id + "/play", {method: "POST"});
+          note.textContent = "going out";
+        } catch (e) { note.textContent = e.message; }
+        finally { done(); }
+      };
+      acts.appendChild(airNow);
+
+      const both = el("button", "", "🎚📻 Re-cut and air it");
+      both.style.cssText = "font-size:11px;padding:2px 8px";
+      both.onclick = async () => {
+        const done = pending(both, "⏳…");
+        note.textContent = "producing, then straight out…";
+        try {
+          await api("/api/dj/ads/" + a.id + "/recut", {method: "POST",
+            body: JSON.stringify({text: script.value, air: true})});
+          note.textContent = "re-cut and airing";
+          setTimeout(render, 400);
+        } catch (e) { note.textContent = e.message; }
+        finally { done(); }
+      };
+      acts.appendChild(both);
+
+      if (a.audio) {
+        const dl = el("a", "", "⬇ mp3");
+        dl.href = a.audio;
+        dl.download = ((a.product || "ad").replace(/[^\w -]+/g, "")
+          .slice(0, 48) || "ad") + ".mp3";
+        dl.style.cssText = "font-size:11px;color:var(--accent)";
+        acts.appendChild(dl);
+      }
+      const bin = el("button", "danger", "🗑");
+      bin.style.cssText = "font-size:11px;padding:2px 8px";
+      bin.title = "Delete this spot for good";
+      bin.onclick = async () => {
+        if (!confirm("Delete this ad for good?")) return;
+        try {
+          await api("/api/dj/ads/" + a.id, {method: "DELETE"});
+          row.style.opacity = ".35";
+          row.style.textDecoration = "line-through";
+        } catch (e) { note.textContent = e.message; }
+      };
+      acts.appendChild(bin);
+      acts.appendChild(note);
+      row.appendChild(acts);
+      list.appendChild(row);
+    });
+  }
+
   async function render() {
     list.innerHTML = ""; list.className = "";
     tabs.innerHTML = "";
     tabs.appendChild(mkTab("🎙 Talk / SFX", "talk"));
     tabs.appendChild(mkTab("🎚 Broadcast (full mix)", "mix"));
+    tabs.appendChild(mkTab("📣 Ads", "ads"));
+    if ((localStorage.cacheTab || "talk") === "ads") { renderAds(); return; }
     if ((localStorage.cacheTab || "talk") === "mix") { renderMix(); return; }
     let eps = {episodes: [], recording: {}}, calls = {calls: []};
     try { eps = await api("/api/radio-cache/episodes"); } catch (e) {}
