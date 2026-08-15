@@ -279,6 +279,16 @@ DEFAULT_DJ = {
         "This one is a favourite of the host.",
         "Turn this one up.",
     ],
+    # #684: what the OTHER one says while somebody is mid-diatribe. Not
+    # replies — reactions, forced in edgewise by someone trying to get a word
+    # in while the roll carries on over them. Two people talking is what
+    # separates a double act from a monologue with a witness.
+    "diatribe_interjections": [
+        "wow", "word", "you serious?", "i can barely believe that",
+        "you didn't just go there mate", "what the...",
+        "fucking hell mate", "holy lord son", "preach son preach",
+        "sigh", "here we go again",
+    ],
     "sponsors": [],
     # An ad read every N tracks (0 = never). Stored reads are reused, so the
     # station develops its own running jokes.
@@ -462,6 +472,17 @@ DEFAULT_DJ = {
     # the moment the next sentence starts.
     "emotion_persistence": 0.65,
     "emotion_sensitivity": 0.5,
+    # #676: the dice. A persona is a fixed disposition, so a long night
+    # settles into one register and the pair start answering everything the
+    # same way. With the dice on, the emotional knobs are re-rolled every
+    # round and the pair are told what they are feeling THIS time — angry,
+    # appalled, delighted, wounded — so the same prompt lands differently
+    # each time it comes round. Off by default: it is a shake-up, not the
+    # house style.
+    "dice_hosts": False,
+    # The same for the phone line: each caller draws their own intensity
+    # rather than every caller arriving at the same temperature.
+    "dice_callers": False,
     # Broadcast channel strips per role — a named chain out of STRIP_CHAINS,
     # "" is dry. Applied LAST, after the voice and its room: the channel
     # colours the performance, never replaces it (§38). The caller's phone
@@ -745,6 +766,7 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "station_ids": dj_lines("station_ids"),
         "request_phrases": dj_lines("request_phrases"),
         "interject_phrases": dj_lines("interject_phrases"),
+        "diatribe_interjections": dj_lines("diatribe_interjections"),  # #684
         "sponsors": [
             str(s or "").strip()[:200]
             for s in (raw_dj.get("sponsors") or []) if str(s or "").strip()
@@ -917,6 +939,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "third_persona": str(raw_dj.get("third_persona") or "")[:2000],
         "third_voice": str(raw_dj.get("third_voice") or "")[:100],
         "guest_mode": bool(raw_dj.get("guest_mode")),
+        "dice_hosts": bool(raw_dj.get("dice_hosts")),          # #676
+        "dice_callers": bool(raw_dj.get("dice_callers")),      # #676
         "guest_id": str(raw_dj.get("guest_id") or "")[:40],
         "drop_voice": str(raw_dj.get("drop_voice") or "")[:100],
         "talk_radio": max(0, min(100, int(
@@ -15559,6 +15583,38 @@ CALLER_STATES = (
 # How a call can end (#237). Drawn per call, so the phone line has good
 # nights and bad ones: winners babbling thanks, casualties swearing off the
 # station, and some who leave in tears they did not arrive with.
+# #676: the temperaments the dice draw from. Deliberately not all negative —
+# a shake-up that only ever makes people angry is just a mood, not a shuffle.
+HOST_TEMPERS = (
+    "angry and short-fused, snapping at things that would normally slide",
+    "openly sad tonight, and it keeps leaking into the jokes",
+    "appalled — genuinely scandalised by what they are hearing",
+    "giddy and overcaffeinated, talking too fast and laughing too easily",
+    "deadly serious, refusing to let the other one turn it into a bit",
+    "bored to the back teeth and barely hiding it",
+    "wounded and a bit defensive, taking things personally",
+    "smug, insufferably pleased with themselves",
+    "conspiratorial, dropping to a mutter like the mic is off",
+    "tender and unusually gentle, which the other finds suspicious",
+    "punchy and combative, spoiling for an argument about anything",
+    "distracted, half-somewhere-else, coming back mid-sentence",
+)
+
+# #676: how a caller arrives when the caller dice are on.
+CALLER_TEMPERS = (
+    "antsy and jittery, rushing their words, cannot sit still",
+    "desperate, close to begging, this call matters far too much to them",
+    "furious before the line even connected, spoiling for it",
+    "eerily calm in a way that unsettles the pair",
+    "half-cut and far too familiar",
+    "nervous, apologising for calling, needs coaxing to say anything",
+    "manic and delighted to be on the radio, will not stop talking",
+    "wounded and quietly upset, on the edge of tears",
+    "imperious, treating the pair like staff",
+    "conspiratorial, convinced they are telling you something forbidden",
+)
+
+
 CALLER_OUTCOMES = (
     "the caller ends the call genuinely happy — the pair turned it around",
     "the caller ends the call furious and hangs up on them",
@@ -16474,9 +16530,22 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # #673: drawn per call, and the pair say it out loud.
     line_no = call_line_no()
     line_say = call_line_say(line_no)
+    # #676: the caller dice — this one arrives at their own temperature
+    # rather than every caller landing in the same register.
+    temper_bit = ""
+    if dj_settings().get("dice_callers"):
+        temper = random.choice(CALLER_TEMPERS)
+        temper_bit = (f" TONIGHT THIS CALLER IS {temper.upper()} — it is in "
+                      "their pacing, their word choice and how they take "
+                      "being interrupted. Perform it; never name it.")
+        # The performance follows the temper into the voice itself, so an
+        # antsy caller SOUNDS antsy rather than merely reading as one.
+        mangle = dict(mangle)
+        mangle["pitch"] = float(mangle.get("pitch") or 1.0) * random.uniform(
+            0.94, 1.08)
     angle = (
         f"The request line rings and {caller['name']} is on {line_say}, "
-        f"{state}."
+        f"{state}.{temper_bit}"
         f"{persona_bit}{goal_bit} {topic} "
         # #544: the pair HEAR the phone ring and react to it before they pick
         # it up — the ring is a beat they play off of, not a silent cut.
@@ -17998,6 +18067,34 @@ async def dj_banter(track: dict[str, Any] | None = None,
                if random.random() < 0.3 else
                "Do not lean on the station's name this round — the station "
                "IDs handle that (#355). ")
+            # #676: the dice. Re-rolled every round, so the same persona
+            # arrives in a different temper each time instead of settling
+            # into one register for the whole night.
+            + (("THE DICE ARE ON THIS ROUND. A is "
+                + random.choice(HOST_TEMPERS) + "; B is "
+                + random.choice(HOST_TEMPERS) + ". Play those temperaments "
+                "HARD — they colour the phrasing, the pacing and what each "
+                "of them chooses to react to. They are still themselves, "
+                "just caught in this mood tonight. Do not name the mood out "
+                "loud; perform it. ")
+               if dj.get("dice_hosts") else "")
+            # #684: a long turn is a monologue with a witness unless the
+            # other one is audibly still in the room. These are NOT replies
+            # and they do not take the floor — they are forced in edgewise,
+            # and the roll carries on straight over them.
+            + (f"WHEN ONE OF THEM GOES ON A ROLL — any turn that runs long, "
+               f"a rant, a diatribe, a story with a head of steam — the "
+               f"OTHER one forces short reactions in edgewise BETWEEN the "
+               f"phrases, trying to participate while the roll carries on "
+               f"over the top of them. Give those interruptions their own "
+               f"lines, two to four of them across the diatribe, each one "
+               f"only a word or a handful: "
+               f"{', '.join(repr(p) for p in dj['diatribe_interjections'][:11])}"
+               f" — or anything in that spirit, in their own voice. They are "
+               f"reactions, NOT replies: the one on the roll does not stop, "
+               f"does not answer them, and keeps going. Vary them; never use "
+               f"the same one twice in a round. "
+               if dj.get("diatribe_interjections") else "")
             + "No markdown, no emoji, no URLs, no "
             "stage directions, no asterisks. "
             # No fabricated tallies (#485): the pair kept inventing "you have
@@ -31688,6 +31785,21 @@ both">🚫 Drop it</button>
           <input id="djBanter" type="checkbox">
           Let the two of them talk about what I keep asking for
         </label>
+        <!-- #676: the dice. A persona is a fixed disposition, so a long
+             night settles into one register — these re-roll it. -->
+        <label class="toggle" title="Re-roll the pair's temperament every
+round — angry, appalled, giddy, wounded, bored, smug. They stay themselves,
+they just arrive in a different mood each time, so the same prompt does not
+keep landing the same way.">
+          <input id="djDiceHosts" type="checkbox">
+          🎲 Shake up the hosts' mood every round
+        </label>
+        <label class="toggle" title="Each caller draws their own temperature
+— antsy, desperate, furious, nervous, manic, imperious — and it follows
+through into how their voice is pitched, not just what they say.">
+          <input id="djDiceCallers" type="checkbox">
+          🎲 Every caller rings in at their own temperature
+        </label>
         <!-- How often and how long now live behind 🎛 Banter (#202). -->
         <input id="djBanterEvery" type="hidden" value="0">
 
@@ -37414,11 +37526,29 @@ function djTalkRender(state) {
     const said = el("div", "", "");
     said.style.cssText = "flex:1;min-width:0;cursor:pointer";
     said.title = "Say this again out of the Pine Box";
-    const who = el("b", "", (line.name || "DJ") + " ");
-    who.style.color = line.who === "cohost" ? "#b48cff"
-      : line.who === "caller" ? "#9ee493"
-      : line.who === "third" ? "#f2a65a"
-      : line.who === "drop" ? "#8fe388" : "#7fd1ff";
+    /* #677: this said "DJ" for anybody whose name had not come through —
+     * including callers, which is how a customer on the phone ended up
+     * labelled as the host. The fallback now follows WHO actually spoke, so
+     * a missing name degrades to the right role instead of to the host. */
+    const ROLE = {dj: "Host", cohost: "Co-host", caller: "Caller",
+                  third: "Guest", drop: "Sting"};
+    const TINT = {dj: "#7fd1ff", cohost: "#b48cff", caller: "#9ee493",
+                  third: "#f2a65a", drop: "#8fe388"};
+    const tint = TINT[line.who] || "#7fd1ff";
+    const who = el("b", "", (line.name || ROLE[line.who] || "Booth") + " ");
+    who.style.color = tint;
+    // …and it is outlined, so at a glance you can see the phone line is a
+    // different person from the pair without reading the name.
+    said.style.borderLeft = "3px solid " + tint;
+    said.style.paddingLeft = "6px";
+    said.style.borderRadius = "3px";
+    // The role is always legible even when a name IS set — "Martha B" does
+    // not tell you she is on the phone rather than in the studio.
+    if (line.name && ROLE[line.who]) {
+      const role = el("span", "", "(" + ROLE[line.who].toLowerCase() + ") ");
+      role.style.cssText = "font-size:9.5px;opacity:.6;color:" + tint;
+      who.appendChild(role);
+    }
     said.appendChild(who);
     said.appendChild(document.createTextNode(line.text || ""));
     // Every spoken line wears its delivery status (#430): out of the
@@ -42851,6 +42981,8 @@ async function djLoadSettings() {
     document.getElementById("djCallerEvery").value = dj.caller_every ?? 5;
     document.getElementById("djManagerEvery").value = dj.manager_every ?? 7;
     document.getElementById("djFollowPrompt").checked = !!dj.follow_prompt;
+    document.getElementById("djDiceHosts").checked = !!dj.dice_hosts;      // #676
+    document.getElementById("djDiceCallers").checked = !!dj.dice_callers;  // #676
     document.getElementById("djArtLookup").checked = dj.art_lookup !== false;
     document.getElementById("djArtSearch").checked = dj.art_search === true;
     document.getElementById("djPriceLow").value = dj.ad_price_low ?? 40;
@@ -47271,6 +47403,8 @@ async function djSaveSettings() {
       caller_every: Number(document.getElementById("djCallerEvery").value),
       manager_every: Number(document.getElementById("djManagerEvery").value),
       follow_prompt: document.getElementById("djFollowPrompt").checked,
+      dice_hosts: document.getElementById("djDiceHosts").checked,      // #676
+      dice_callers: document.getElementById("djDiceCallers").checked,  // #676
       overlap: Number(document.getElementById("djOverlap").value),
       art_lookup: document.getElementById("djArtLookup").checked,
       art_search: document.getElementById("djArtSearch").checked,
