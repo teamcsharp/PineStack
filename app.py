@@ -9227,6 +9227,21 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
                   "something that is about to start."
                   if spin_first else ""))
     await asyncio.sleep(1.0)
+    # #700: an ad the loop held over from the last record, played over this
+    # one rather than in a silent gap between them.
+    if _RADIO.pop("ad_due_next", False):
+        try:
+            roll = random.random()
+            if roll < 0.15:
+                await dj_engineering_ad()
+            elif roll < 0.35:
+                await dj_service_ad()
+            else:
+                await dj_ad_break()
+            await asyncio.sleep(1.0)
+        except Exception:
+            pass
+
     if intro_only:
         # The talk-show torrent owns everything after the intro (#618): it
         # runs its own rounds through the record on its own clock. Spawning
@@ -9371,7 +9386,10 @@ async def _dj_loop() -> None:
             # its own opening the way a real presenter does, and every
             # segment after it plays out with the record turning
             # underneath.
-            spin_first = bool(dj.get("records_first", True)) and not tape_slot
+            # #700: tapes too. "Sacred" means played WHOLE — it never
+            # meant introduced into silence, and a tape slot was the
+            # last place a 96-second gap could still open up.
+            spin_first = bool(dj.get("records_first", True))
             if spin_first:
                 if skip.is_set():
                     skip.clear()
@@ -9491,33 +9509,18 @@ async def _dj_loop() -> None:
             # callers folded in on their usual cadence. Generation time is the
             # natural gap: the record carries the room while the next round
             # renders. Tapes are sacred and skip the torrent.
-            if dj.get("talk_radio_mode") and not tape_slot:
-                skip.clear()
-                remaining = length + 1.5
-                while remaining > 0 and _RADIO["on"]:
-                    breath = min(remaining, random.uniform(18.0, 35.0))
-                    if await _hold(breath):
-                        break                    # skipped — next record
-                    remaining -= breath
-                    if remaining <= 0:
-                        break
-                    try:
-                        if dj["caller_every"] and random.random() < 1.0 / max(
-                                1, dj["caller_every"]):
-                            await dj_caller(track)
-                        else:
-                            deep = (dj.get("deep_convo", True)
-                                    and random.random() < float(
-                                        dj.get("deep_rate") or 0.25))
-                            if not (deep and await dj_deep_round(track)):
-                                await dj_banter(track, render_stream=bool(
-                                    dj.get("stream_show", True)))
-                    except Exception:
-                        pass
-                continue                         # not a tape — straight on
+            # #700: the torrent no longer lives in here. It ran a countdown
+            # that only ever decremented by the BREATH and never by the round
+            # itself, so any round longer than its breath pushed the whole
+            # thing past the end of the record and the pair carried on over
+            # silence. The record and the talk were sharing one clock and
+            # should never have been. _torrent_talk() is its own task now;
+            # this loop's only job is keeping records turning underneath it.
 
-            # Maybe say something in the middle, then wait out the rest.
-            if length > 25 and random.random() < dj["interject_rate"]:
+            # Maybe say something in the middle, then wait out the rest. The
+            # torrent supplies its own interruptions, so this stays out of
+            # its way.
+            if not dj.get("talk_radio_mode")                     and length > 25 and random.random() < dj["interject_rate"]:
                 cut = length * random.uniform(0.3, 0.7)
                 skip.clear()
                 if await _hold(cut):
@@ -9534,12 +9537,14 @@ async def _dj_loop() -> None:
             if track.get("tape"):
                 _RADIO["tape_outro_due"] = True
                 _RADIO["tape_last"] = track
-            # The ad break, in the gap where a break belongs (#689): the
-            # record has finished, the next one has not started, and a
-            # bedded spot brings its own music with it.
-            if ad_due and spin_first and not (
-                    _SEGMENT_TASK and not _SEGMENT_TASK[0].done()):
-                await _run_ad()
+            # #700: the ad break used to run HERE, between the records, and
+            # it was the last thing left on the record's critical path —
+            # writing a bedded spot is an LLM call, a synthesis and an
+            # ffmpeg mix, measured at 84 seconds of silence between two
+            # records. It rides the next record's talk now, like everything
+            # else the pair do.
+            if ad_due:
+                _RADIO["ad_due_next"] = True
     finally:
         if skip in _DJ_SKIP:
             _DJ_SKIP.remove(skip)
@@ -9918,6 +9923,56 @@ def now_really_playing(slack: float = 20.0) -> bool:
     return time.time() < started + length + slack
 
 
+def torrent_breath(dj: dict[str, Any]) -> float:
+    """How long a breath of music between rounds (#700). The music↔talk dial
+    sets it: at 100 the pair barely draw breath, at 50 you get a good stretch
+    of record between them."""
+    talk = max(0, min(100, int(dj.get("talk_radio") or 0)))
+    middle = 6.0 + (100 - talk) * 0.38
+    return max(4.0, random.uniform(middle * 0.6, middle * 1.4))
+
+
+async def _torrent_talk() -> None:
+    """Talk radio where the banter never stops (#618, rebuilt for #700).
+
+    The pair talk on their OWN clock — a breath of music, a round, again,
+    for as long as the mode is on — while the show loop keeps records
+    turning underneath. Callers fold in on their usual cadence, so a call
+    can land in the middle of a conversation the way it does on a real
+    phone-in.
+
+    Its own task, because the whole fault it replaces was talk and records
+    sharing a countdown."""
+    while _RADIO.get("on"):
+        try:
+            dj = dj_settings()
+            if not dj.get("talk_radio_mode"):
+                await asyncio.sleep(5)
+                continue
+            await asyncio.sleep(torrent_breath(dj))
+            if not _RADIO.get("on") or not dj_settings().get("talk_radio_mode"):
+                continue
+            # Never two rounds at once: the per-record intro is its own task
+            # and this must not talk over it.
+            if _SEGMENT_TASK and not _SEGMENT_TASK[0].done():
+                continue
+            track = _RADIO.get("now")
+            if dj["caller_every"] and random.random() < 1.0 / max(
+                    1, dj["caller_every"]):
+                await dj_caller(track)
+            else:
+                deep = (dj.get("deep_convo", True)
+                        and random.random() < float(dj.get("deep_rate")
+                                                    or 0.25))
+                if not (deep and await dj_deep_round(track)):
+                    await dj_banter(track, render_stream=bool(
+                        dj.get("stream_show", True)))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            await asyncio.sleep(3)     # the talk never takes the show down
+
+
 async def needle_watch() -> None:
     """Keep a record turning (#689 follow-up — the fault it introduced).
 
@@ -10081,6 +10136,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(mx_ad_clock()))
     _RADIO_TASK.append(asyncio.create_task(dead_air_watch()))
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
+    _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
     _RADIO_TASK.append(asyncio.create_task(tape_watch()))
     tape_warmer()                      # the shelf normalizes itself (#242)
@@ -11582,6 +11638,8 @@ async def dj_ad(product: str, remember: bool = True,
             pass
     entry = (ad_save(product, line, kind="custom" if custom else "sponsor")
              if (remember and line) else None)
+    if entry:
+        ad_line_mark(entry.get("id", ""), product)
     back = ""
     if _RADIO["on"] and _RADIO.get("now"):
         back = await dj_speak(
@@ -11589,6 +11647,26 @@ async def dj_ad(product: str, remember: bool = True,
             line=_dj_fill("And now, back to the music on {station}."))
     return {"ad": line, "back": back, "product": product,
             "id": (entry or {}).get("id", "")}
+
+
+def ad_line_mark(ad_id: str, product: str, audio: str = "") -> None:
+    """Stamp the ad that just aired onto its own line in the booth (#701).
+
+    An ad went out as an ordinary DJ line — same shape, same colour, no way
+    to tell it from banter and nothing to click. Everything needed to make
+    it an entry exists by the time ad_save() returns; it just was not put
+    anywhere. The line is found by walking back for the most recent ad line
+    that has not been claimed, which is the one we have just spoken."""
+    for entry in reversed(_RADIO.get("chat") or []):
+        if entry.get("kind") == "ad" and not entry.get("ad_id"):
+            entry["ad_id"] = str(ad_id or "")
+            entry["product"] = str(product or "")[:160]
+            if audio:
+                entry["ad_audio"] = str(audio)
+            return
+        # Only look back over the handful of lines an ad can span.
+        if entry.get("kind") not in ("ad", "sfx"):
+            return
 
 
 def _store_media(audio: bytes, ext: str = "wav") -> dict[str, Any]:
@@ -12287,6 +12365,8 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
             "text": line, "engine": engine, "voice": forced or ""})
         del _RADIO["voice_clips"][:-40]
     entry = ad_save(product, line, kind="music") if remember else None
+    if entry:
+        ad_line_mark(entry.get("id", ""), product)
     return {"ad": line, "product": product, "id": (entry or {}).get("id", "")}
 
 
@@ -12406,6 +12486,18 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
     if ad_to in ("box", "both"):
         await _play_on_box(path, sig)
     _episode_stage(f"{path}?t={sig}", label)
+    # #701: a stored spot never went through dj_speak, so it made a noise and
+    # left no trace in the booth. It gets its own entry like any other ad.
+    _RADIO["chat"].append({
+        "ts": int(time.time()), "who": "dj", "kind": "ad",
+        "name": "the desk", "text": label,
+        "ad_id": str(entry.get("id") or ""),
+        "product": str(entry.get("product") or "")[:160],
+        "ad_audio": name,
+        "voice": str(entry.get("voice") or ""),
+        "aired": "box" if ad_to in ("box", "both") else "page",
+    })
+    del _RADIO["chat"][:-160]
 
 
 async def ad_produce(product: str, script: str, voice: str,
@@ -16639,6 +16731,51 @@ def conjure_caller() -> dict[str, Any]:
 
 CALLER_VOICES_PATH = Path("/app/data/caller_voices.json")
 _CALLER_VOICE_LOCK = RLock()
+
+# The face on the licence (#699). Drawn from the gallery once and REMEMBERED
+# — the same trap the voice rotation was in was waiting here: picking with
+# hash(name) % len(gallery) would hand a caller a different face every time
+# you rendered another image.
+CALLER_FACES_PATH = Path("/app/data/caller_faces.json")
+_CALLER_FACE_LOCK = RLock()
+
+
+def caller_face(name: str) -> str:
+    """A gallery image for this caller — the same one every time they ring."""
+    if not name:
+        return ""
+    with _CALLER_FACE_LOCK:
+        try:
+            book = json.loads(CALLER_FACES_PATH.read_text())
+            book = book if isinstance(book, dict) else {}
+        except Exception:
+            book = {}
+        held = str(book.get(name) or "")
+        if held:
+            return held
+        try:
+            found = [q.name for q in COMFY_OUTPUT.rglob("*")
+                     if q.is_file() and q.suffix.lower() in
+                     (".png", ".jpg", ".jpeg", ".webp")]
+        except OSError:
+            found = []
+        if not found:
+            return ""
+        # One nobody else on the switchboard is already wearing.
+        spoken_for = set(book.values())
+        free = [f for f in found if f not in spoken_for] or found
+        pick = random.choice(free)
+        book[name[:80]] = pick
+        if len(book) > 400:
+            book = dict(list(book.items())[-300:])
+        try:
+            CALLER_FACES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CALLER_FACES_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(book, indent=1))
+            tmp.replace(CALLER_FACES_PATH)
+        except OSError:
+            pass
+        return pick
 
 
 def _caller_voice_book() -> dict[str, str]:
@@ -24144,6 +24281,63 @@ async def dj_hangups_delete(
             detail="No such rule, or it is the last one left — a call has "
                    "to be able to end somehow.")
     return {"deleted": rule_id}
+
+
+@app.get("/api/dj/caller")
+async def dj_caller_card(
+    name: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Everything the station knows about one caller (#699) — the licence.
+
+    A name in the booth was the whole of it: no face, no history, no idea
+    what they were ringing about or which voice they were coming in on. All
+    of it exists already, in four different places; this gathers it."""
+    require_read_auth(authorization)
+    name = name.strip()[:80]
+    if not name:
+        raise HTTPException(status_code=400, detail="Which caller?")
+    row = next((r for r in read_callers()
+                if str(r.get("name") or "").lower() == name.lower()), {})
+    # Their voice: the one pinned to the row, else the one the rotation
+    # remembered for them (#699).
+    vid = str(row.get("voice_id") or _caller_voice_book().get(name) or "")
+    vmeta = voice_meta(vid) or {}
+    air = (voice_airtime().get(vid) or {}) if vid else {}
+    said = [c for c in (_RADIO.get("chat") or [])
+            if c.get("who") in ("caller", "caller2")
+            and str(c.get("name") or "") == name and c.get("text")]
+    line = ""
+    for c in reversed(_RADIO.get("chat") or []):
+        if c.get("kind") == "call" and name in str(c.get("text") or ""):
+            line = str(c.get("text") or "")
+            break
+    ended = next((c for c in reversed(call_log_read())
+                  if str(c.get("name") or "") == name), {})
+    return {
+        "name": name,
+        "known": bool(row),
+        "persona": str(row.get("persona") or ""),
+        "goal": str(row.get("goal") or ""),
+        "calls": int(row.get("calls") or 0),
+        "last": int(row.get("last") or 0),
+        "since": int(row.get("added") or 0),
+        "line": line,
+        "face": caller_face(name),
+        "voice": {"id": vid, "name": str(vmeta.get("name") or ""),
+                  "engine": str(vmeta.get("engine") or ""),
+                  "kind": str(vmeta.get("kind") or ""),
+                  "airings": int(air.get("airings") or 0)},
+        "said": [{"ts": c.get("ts"), "text": str(c.get("text") or "")[:240],
+                  "media": c.get("media", ""), "sig": c.get("sig", "")}
+                 for c in said[-8:]],
+        "last_call": ({"seconds": ended.get("seconds"),
+                       "turns": ended.get("turns"),
+                       "rule": str(ended.get("rule") or ""),
+                       "ts": ended.get("ts")} if ended else None),
+        "on_air_now": bool(said and time.time() - float(
+            said[-1].get("ts") or 0) < 90),
+    }
 
 
 @app.post("/api/dj/queue/move")
@@ -39205,6 +39399,185 @@ const ENGINE_SERVICE = {
   browser: "the browser's own speech engine",
 };
 
+/* ---- The caller's licence (#699) --------------------------------------
+ * Hover a caller's name — on their lines, or on the "On line N: Name"
+ * banner — and the station produces a driver's licence for them: the face
+ * it drew for them out of the gallery, what they are ringing about, the
+ * voice they came in on, what they have said, and a spectrograph that runs
+ * live while they are the one speaking.
+ *
+ * Every one of those facts already existed, in four different places. The
+ * booth showed a name.
+ */
+let callerCardFor = "";
+let callerCardRaf = 0;
+
+function callerCardHide() {
+  callerCardFor = "";
+  if (callerCardRaf) { cancelAnimationFrame(callerCardRaf); callerCardRaf = 0; }
+  const box = document.getElementById("callerCard");
+  if (box) box.remove();
+}
+
+function callerCardField(k, v) {
+  if (!v) return "";
+  const esc = (t) => String(t == null ? "" : t)
+    .replace(/[<>&]/g, (c) => ({"<": "&lt;", ">": "&gt;", "&": "&amp;"}[c]));
+  return '<div style="display:flex;gap:7px;padding:1px 0">'
+    + '<span style="flex:0 0 76px;color:#8aa;font-size:9.5px;'
+    + 'text-transform:uppercase;letter-spacing:.06em">' + k + '</span>'
+    + '<span style="flex:1;min-width:0;overflow-wrap:anywhere">'
+    + esc(v) + '</span></div>';
+}
+
+async function callerCardShow(name, anchor) {
+  if (!name) return;
+  callerCardHide();
+  callerCardFor = name;
+  const at = anchor.getBoundingClientRect();
+  const wide = 390;
+  const box = el("div", "panel", "");
+  box.id = "callerCard";
+  box.style.cssText = "position:fixed;z-index:201;width:" + wide + "px;"
+    + "left:" + Math.max(8, Math.min(window.innerWidth - wide - 12, at.left))
+    + "px;top:" + Math.max(8, Math.min(window.innerHeight - 340, at.bottom + 8))
+    + "px;padding:0;margin:0;overflow:hidden;pointer-events:none;"
+    + "border:1px solid #6d7f9c;box-shadow:0 22px 60px rgba(0,0,0,.75)";
+  box.innerHTML = '<div style="padding:12px;font-size:11px">'
+    + 'reading the switchboard…</div>';
+  document.body.appendChild(box);
+
+  let d = null;
+  try { d = await api("/api/dj/caller?name=" + encodeURIComponent(name)); }
+  catch (e) { d = null; }
+  if (callerCardFor !== name || !document.getElementById("callerCard")) return;
+  if (!d) {
+    box.innerHTML = '<div style="padding:12px;font-size:11px">'
+      + 'nothing on file for them</div>';
+    return;
+  }
+
+  const esc = (t) => String(t == null ? "" : t)
+    .replace(/[<>&]/g, (c) => ({"<": "&lt;", ">": "&gt;", "&": "&amp;"}[c]));
+  const when = (t) => {
+    if (!t) return "—";
+    const secs = Math.max(0, Math.round(Date.now() / 1000) - t);
+    if (secs < 90) return "just now";
+    if (secs < 5400) return Math.round(secs / 60) + "m ago";
+    if (secs < 172800) return Math.round(secs / 3600) + "h ago";
+    return Math.round(secs / 86400) + "d ago";
+  };
+  const face = d.face
+    ? '<img src="/api/generations/image/' + encodeURIComponent(d.face)
+      + '" style="width:92px;height:112px;object-fit:cover;border-radius:5px;'
+      + 'border:1px solid #6d7f9c;background:#0a1119">'
+    : '<div style="width:92px;height:112px;border-radius:5px;'
+      + 'border:1px dashed #44556f;display:flex;align-items:center;'
+      + 'justify-content:center;font-size:26px;opacity:.5">&#9742;</div>';
+  const said = (d.said || []).slice(-3).map((x) =>
+    '<div style="padding:2px 0;border-top:1px solid #24344a;opacity:.9">'
+    + '&ldquo;' + esc(x.text) + '&rdquo;</div>').join("");
+  const F = callerCardField;
+
+  box.innerHTML =
+    '<div style="background:linear-gradient(180deg,#1d3557,#16283f);'
+    + 'padding:6px 12px;border-bottom:1px solid #6d7f9c;display:flex;'
+    + 'align-items:center;gap:8px">'
+    + '<b style="font-size:10.5px;letter-spacing:.14em;color:#cfe">'
+    + 'PINE COUNTY &middot; CALLER LICENCE</b>'
+    + '<span style="margin-left:auto;font-size:9.5px;color:#9fbcd8">'
+    + (d.known ? "REGULAR" : "ONE-OFF") + '</span></div>'
+    + '<div style="display:flex;gap:11px;padding:11px 12px">'
+    + '<div>' + face
+    + '<div style="font-size:9px;color:#8aa;text-align:center;margin-top:3px">'
+    + (d.on_air_now ? "&#9679; ON THE LINE" : "on file") + '</div></div>'
+    + '<div style="flex:1;min-width:0;font-size:11px;line-height:1.5">'
+    + '<div style="font-size:15px;font-weight:700;color:#ffd479;'
+    + 'margin-bottom:3px">' + esc(d.name) + '</div>'
+    + F("line", (d.line || "").replace(/^On /, ""))
+    + F("calling about", d.goal || d.persona)
+    + F("voice", (d.voice.name || d.voice.id || "the stock bank")
+        + (d.voice.engine ? " · " + d.voice.engine : ""))
+    + F("heard", d.voice.airings
+        ? d.voice.airings + " time(s) on air" : "")
+    + F("calls", d.calls
+        ? d.calls + " · last " + when(d.last) : "first time")
+    + (d.last_call && d.last_call.rule
+        ? F("last ended", d.last_call.rule.slice(0, 90)) : "")
+    + '</div></div>'
+    + (said
+        ? '<div style="padding:0 12px 8px;font-size:10.5px;color:#bcd">'
+          + '<div style="font-size:9px;color:#8aa;letter-spacing:.06em;'
+          + 'text-transform:uppercase;margin-bottom:2px">what they said</div>'
+          + said + '</div>'
+        : "")
+    + '<div style="padding:0 12px 11px">'
+    + '<div style="font-size:9px;color:#8aa;letter-spacing:.06em;'
+    + 'text-transform:uppercase;margin-bottom:3px">voice print</div>'
+    + '<canvas id="callerCardScope" style="width:100%;height:46px;'
+    + 'display:block;border-radius:5px;background:#070c14;'
+    + 'border:1px solid #24344a"></canvas></div>';
+
+  // The spectrograph: live off whatever is sounding while they hold the
+  // line, and the real one off their last aired clip when they do not.
+  const canvas = document.getElementById("callerCardScope");
+  if (!canvas) return;
+  const paint = () => {
+    if (callerCardFor !== name || !canvas.isConnected) return;
+    callerCardRaf = requestAnimationFrame(paint);
+    const ctx = canvas.getContext("2d");
+    const ratio = window.devicePixelRatio || 1;
+    const w = canvas.width = Math.max(1, canvas.clientWidth * ratio);
+    const h = canvas.height = Math.max(1, canvas.clientHeight * ratio);
+    ctx.clearRect(0, 0, w, h);
+    const ctxLive = window.pineAudioCtx
+      && window.pineAudioCtx.state === "running";
+    const live = (ctxLive && d.on_air_now
+      && typeof boothLivePlayer === "function") ? boothLivePlayer() : null;
+    const scope = live ? audioScope(live) : null;
+    if (scope) scope.analyser.getByteFrequencyData(scope.bins);
+    const bars = 52;
+    const step = scope
+      ? Math.max(1, Math.floor(scope.bins.length / bars)) : 1;
+    const t = performance.now() / 1000;
+    for (let i = 0; i < bars; i += 1) {
+      let level;
+      if (scope) {
+        let sum = 0;
+        for (let j = 0; j < step; j += 1) sum += scope.bins[i * step + j] || 0;
+        level = (sum / step) / 255;
+      } else {
+        level = 0.06 + 0.04 * (1 + Math.sin(t * 1.1 + i * 0.3));
+      }
+      const bh = Math.max(1, level * h * 0.9);
+      ctx.fillStyle = "#ff6ec7";
+      ctx.globalAlpha = scope ? 0.35 + level * 0.65 : 0.26;
+      ctx.fillRect(i * (w / bars) + ratio, h - bh,
+                   Math.max(1, w / bars - ratio * 2), bh);
+    }
+    ctx.globalAlpha = 1;
+  };
+  paint();
+  const last = (d.said || []).slice().reverse()
+    .find((x) => x.media && x.sig);
+  if (last && !d.on_air_now) {
+    const img = new Image();
+    img.onload = () => {
+      if (callerCardFor !== name || !canvas.isConnected) return;
+      if (callerCardRaf) {
+        cancelAnimationFrame(callerCardRaf);
+        callerCardRaf = 0;
+      }
+      const ctx = canvas.getContext("2d");
+      canvas.width = canvas.clientWidth * (window.devicePixelRatio || 1);
+      canvas.height = canvas.clientHeight * (window.devicePixelRatio || 1);
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    };
+    img.src = "/media/" + encodeURIComponent(last.media) + "/spec?t="
+      + encodeURIComponent(last.sig);
+  }
+}
+
 function lineCardHide() {
   const box = document.getElementById("lineCard");
   if (box) box.remove();
@@ -39924,6 +40297,86 @@ function djTalkRender(state) {
       log.appendChild(row);
       return;
     }
+    // #701: an ad that aired is its OWN entry, not a DJ line wearing the
+    // same clothes as banter. Play what actually went out (bed and all),
+    // find it in the Ad Studio, keep it, or throw it away — from here.
+    if (line.kind === "ad") {
+      row.style.cssText += ";background:#1a1508;border:1px solid #4a3c14;"
+        + "flex-direction:column;gap:4px;margin:4px 0;padding:6px 8px";
+      const head = el("div", "", "📣 " + (line.product || line.text
+        || "an ad read"));
+      head.style.cssText = "font-size:11.5px;color:#ffd479;font-weight:600;"
+        + "width:100%";
+      row.appendChild(head);
+      if (line.product && line.text && line.text !== line.product) {
+        const said = el("div", "muted", line.text);
+        said.style.cssText = "font-size:11px;line-height:1.45;width:100%";
+        row.appendChild(said);
+      }
+      const acts = el("div", "row", "");
+      acts.style.cssText = "gap:5px;flex-wrap:wrap;width:100%";
+      // What ACTUALLY aired — the mixed clip, music bed and all — is the
+      // media key #696 already puts on every line.
+      const heard = line.media && line.sig
+        ? "/media/" + encodeURIComponent(line.media) + "?t="
+          + encodeURIComponent(line.sig)
+        : (line.ad_audio
+            ? "/ads-audio/" + encodeURIComponent(line.ad_audio) : "");
+      if (heard) {
+        const play = el("button", "", "▶ hear it");
+        play.style.cssText = "font-size:10.5px;padding:2px 8px";
+        play.title = "Play exactly what went out";
+        play.onclick = (ev) => {
+          ev.stopPropagation();
+          new Audio(heard).play().catch(() => {});
+        };
+        acts.appendChild(play);
+        const dl = el("a", "", "⬇ keep it");
+        dl.href = heard;
+        dl.download = ((line.product || "ad").replace(/[^\w -]+/g, "")
+          .slice(0, 48) || "ad") + (line.media && line.media.endsWith(".mp3")
+            ? ".mp3" : ".wav");
+        dl.title = "Download this spot";
+        dl.style.cssText = "font-size:10.5px;padding:2px 8px;color:#ffd479;"
+          + "border:1px solid var(--border);border-radius:7px;"
+          + "text-decoration:none";
+        dl.onclick = (ev) => ev.stopPropagation();
+        acts.appendChild(dl);
+      }
+      if (line.ad_id) {
+        const find = el("button", "", "🔎 locate");
+        find.style.cssText = "font-size:10.5px;padding:2px 8px";
+        find.title = "Open the Ad Studio and highlight this one";
+        find.onclick = (ev) => {
+          ev.stopPropagation();
+          window.adStudioFocus = line.ad_id;
+          try { adStudioOpen(); } catch (e) {}
+        };
+        acts.appendChild(find);
+        const kill = el("button", "danger", "✕ bin it");
+        kill.style.cssText = "font-size:10.5px;padding:2px 8px";
+        kill.title = "Delete this ad — it never runs again";
+        kill.onclick = async (ev) => {
+          ev.stopPropagation();
+          if (!confirm("Delete this ad for good?")) return;
+          kill.disabled = true;
+          try {
+            await api("/api/dj/ads/" + line.ad_id, {method: "DELETE"});
+            head.style.textDecoration = "line-through";
+            head.style.opacity = ".5";
+            kill.textContent = "binned";
+            if (typeof loadAds === "function") loadAds();
+          } catch (e) {
+            setStatus(e.message, true);
+            kill.disabled = false;
+          }
+        };
+        acts.appendChild(kill);
+      }
+      row.appendChild(acts);
+      log.appendChild(row);
+      return;
+    }
     // A sample dropped off the end of a phrase shows up between the lines
     // (#277), with the same votes the chat feed carries (#269).
     if (line.kind === "sfx") {
@@ -39973,6 +40426,17 @@ function djTalkRender(state) {
           request: "🎵 ", played: "🎵 "}[line.kind] || "· ") + line.text);
       mark.style.cssText = "flex:1;font-size:11px;font-style:italic;"
         + "opacity:.75;padding:1px 0";
+      // #699: the "On line N: Name" banner is where you look when somebody
+      // rings in, so it is the other handle on their licence.
+      if (line.kind === "call") {
+        const who = String(line.text || "").split(":").slice(1).join(":").trim();
+        if (who) {
+          mark.style.cursor = "help";
+          mark.onmouseenter = (ev) =>
+            callerCardShow(who, ev.currentTarget);
+          mark.onmouseleave = callerCardHide;
+        }
+      }
       row.appendChild(mark);
       log.appendChild(row);
       return;
@@ -40008,8 +40472,15 @@ function djTalkRender(state) {
     // like, and which datapoint out of the vector map it grew from. All of
     // it already travels with the line; nothing showed it.
     who.style.cursor = "help";
-    who.onmouseenter = (ev) => lineCardShow(line, ev.currentTarget, tint);
-    who.onmouseleave = lineCardHide;
+    who.onmouseenter = (ev) => {
+      // #699: a caller gets a LICENCE, not the generic provenance card.
+      if (line.who === "caller" || line.who === "caller2") {
+        callerCardShow(line.name || "", ev.currentTarget);
+      } else {
+        lineCardShow(line, ev.currentTarget, tint);
+      }
+    };
+    who.onmouseleave = () => { lineCardHide(); callerCardHide(); };
     said.appendChild(who);
     said.appendChild(document.createTextNode(line.text || ""));
     // Every spoken line wears its delivery status (#430): out of the
@@ -45215,7 +45686,16 @@ async function adStudioOpen() {
       }
       produced.forEach((a) => {
         const row = el("div", "row", "");
-        row.style.cssText = "align-items:center;gap:6px;margin:3px 0";
+        row.style.cssText = "align-items:center;gap:6px;margin:3px 0"
+          // #701: arrived here from "locate" in the booth — say which one.
+          + (window.adStudioFocus && a.id === window.adStudioFocus
+             ? ";background:#1a1508;border:1px solid #ffd479;"
+               + "border-radius:7px;padding:3px 5px" : "");
+        if (window.adStudioFocus && a.id === window.adStudioFocus) {
+          setTimeout(() => {
+            try { row.scrollIntoView({block: "center"}); } catch (e) {}
+          }, 60);
+        }
         const label = el("span", "",
           (a.product || a.text || "spot").slice(0, 46)
           + (a.bed ? "  ·  " + a.bed : ""));
