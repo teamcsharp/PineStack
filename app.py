@@ -12328,7 +12328,8 @@ def _ad_bed_share() -> float:
 
 def _music_ad_mix_blocking(voice_path: Path, music_path: str,
                            voice_seconds: float, start: float,
-                           sfx_path: str | None = None) -> bytes | None:
+                           sfx_path: str | None = None,
+                           bed_pct: float | None = None) -> bytes | None:
     """Mix an ad voice over a bed of real music (#463): the music swells in
     alone, ducks under the read (sidechained to the voice) and swells back
     out — one clip, 24k mono. When `sfx_path` is given, a sound effect is
@@ -12351,7 +12352,9 @@ def _music_ad_mix_blocking(voice_path: Path, music_path: str,
     # and a share nobody could set. loudnorm gives both tracks a known
     # loudness, and the bed then sits at ad_bed_pct of the read (30% by
     # default) BEFORE the sidechain ducks it further under the words.
-    bed_share = max(0.02, min(1.0, _ad_bed_share()))
+    bed_share = max(0.02, min(1.0,
+                              (bed_pct / 100.0) if bed_pct is not None
+                              else _ad_bed_share()))
     graph = (
         f"[1:a]atrim=0:{total:.2f},asetpts=PTS-STARTPTS,"
         # Same reference as the read (below), so "30%" is 30% OF THE
@@ -12607,7 +12610,8 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
 
 async def ad_produce(product: str, script: str, voice: str,
                      track_id: str, remember: bool = True,
-                     air: bool = True) -> dict[str, Any]:
+                     air: bool = True,
+                     bed_pct: float | None = None) -> dict[str, Any]:
     """Build one ad by hand (#618): a chosen (or written) read, in a chosen
     voice, vocoded and mixed over a chosen song with a sound effect punched in,
     saved with its finished audio so the DJs can rerun it between tracks, after
@@ -12664,7 +12668,7 @@ async def ad_produce(product: str, script: str, voice: str,
         wav = await asyncio.to_thread(
             _music_ad_mix_blocking, VOICE_MEDIA_DIR / voice_key,
             str(track["path"]), _clip_seconds(clip["path"]) or 8.0, start,
-            str(sfx) if sfx else None)
+            str(sfx) if sfx else None, bed_pct)
     if not wav:
         # No bed (or the mix failed): keep the dry vocoded read as the ad —
         # and say so honestly rather than naming a bed that is not in it.
@@ -24714,7 +24718,10 @@ async def dj_ads_produce(
         voice=str(payload.get("voice") or "").strip(),
         track_id=str(payload.get("track_id") or "").strip(),
         remember=bool(payload.get("remember", True)),
-        air=bool(payload.get("air", True)))
+        air=bool(payload.get("air", True)),
+        # #704: the bed level for THIS spot, set on the studio's own slider.
+        bed_pct=(float(payload["bed_pct"])
+                 if payload.get("bed_pct") is not None else None))
     if result.get("error"):
         raise HTTPException(status_code=400, detail=result["error"])
     return result
@@ -45761,6 +45768,45 @@ async function adStudioOpen() {
       "Bed: a random MX mixtape (fades in and out under the read)";
   };
   card.appendChild(mxBtn);
+  // #704: how loud the bed sits under THIS read, right beside the bed you
+  // are choosing. 30% of the vocal by default — the level that stopped the
+  // ads blasting (#700) — and moving it also becomes the default the DJs
+  // use for the spots they write themselves.
+  const bedRow = el("div", "", "");
+  bedRow.style.cssText = "display:flex;align-items:center;gap:9px;"
+    + "margin-top:8px;font-size:12px";
+  bedRow.appendChild(el("span", "muted", "🎚 music under the read"));
+  bedRow.lastChild.style.cssText = "flex:0 0 auto;font-size:11.5px";
+  const bedIn = el("input", "", "");
+  bedIn.type = "range"; bedIn.min = "2"; bedIn.max = "100"; bedIn.step = "1";
+  bedIn.value = "30";
+  bedIn.style.cssText = "flex:1;min-width:110px";
+  bedIn.title = "How loud the music sits under the voice, as a share of the "
+    + "vocal. Both are levelled to the same reference first, so this really "
+    + "is a share of the read and not of whatever the record was mastered at.";
+  const bedOut = el("span", "", "30% of the vocal");
+  bedOut.style.cssText = "flex:0 0 auto;font-size:11px;width:104px;"
+    + "text-align:right;color:var(--accent)";
+  bedIn.oninput = () => {
+    bedOut.textContent = bedIn.value + "% of the vocal";
+  };
+  bedIn.onchange = async () => {
+    try {
+      const settings = await api("/api/settings");
+      if (settings.voice_out) delete settings.voice_out.ha_token;
+      settings.dj = Object.assign({}, settings.dj,
+        {ad_bed_pct: Number(bedIn.value)});
+      await api("/api/settings", {method: "PUT",
+                                  body: JSON.stringify(settings)});
+    } catch (e) { /* the slider still applies to this spot */ }
+  };
+  bedRow.appendChild(bedIn); bedRow.appendChild(bedOut);
+  card.appendChild(bedRow);
+  // Start it where the station currently sits.
+  api("/api/settings").then((st) => {
+    const pct = st && st.dj && st.dj.ad_bed_pct;
+    if (pct) { bedIn.value = String(pct); bedIn.oninput(); }
+  }).catch(() => {});
   async function runSongSearch() {
     const q = songSearch.value.trim();
     if (!q) { songResults.innerHTML = ""; return; }
@@ -45833,6 +45879,7 @@ async function adStudioOpen() {
         body: JSON.stringify({
           product: prod.value.trim(), script: script.value,
           voice: voiceSel.value, track_id: chosen ? chosen.id : "",
+          bed_pct: Number(bedIn.value),          // #704
           air: !!air}),
       });
       status.textContent = "Saved ✓ “" + (r.text || "").slice(0, 80) + "”";
