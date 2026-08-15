@@ -15672,17 +15672,39 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     own_tail = (_SPEAKING[0] == 0
                 and time.time() - _SPOKE_AT[0] <= _OUR_VOICE_FOR
                 and time.time() - _SAT_SAW_TURN_AT[0] >= 30.0)
+    played_anywhere = not to_box        # the page copy above counts
     if to_box and (own_tail or not await satellite_busy()):
         _SPEAKING[0] += 1
         try:
             await _play_on_box(f"/sfx/{key}", signature)
+            played_anywhere = True
         except Exception:
             pass                        # a missing sting is not a dead show
         finally:
             _SPEAKING[0] = max(0, _SPEAKING[0] - 1)
             _SPOKE_AT[0] = time.time()
-    sfx_note_play(key, sample.stem, who,
-                  ms=int((time.monotonic() - _sting_started) * 1000))
+    elif to_box:
+        # #738: the satellite was busy and this was not the own-tail
+        # window, so the sting was dropped on the floor — and yet
+        # sfx_note_play below still recorded it as played, which is
+        # exactly "it was queued and it never sounded". Send it to the
+        # page instead: heard in the wrong room beats not heard, and
+        # say so rather than logging a play that never happened.
+        _RADIO["voice_clips"].append({
+            "ts": int(time.time() * 1000),
+            "url": f"/sfx/{key}?t={signature}",
+            "text": "", "sting": sample.stem,
+        })
+        del _RADIO["voice_clips"][:-40]
+        played_anywhere = True
+        pipeline_log("air", f"sting {sample.stem} could not go to the "
+                            "box (satellite busy) — sent to the page "
+                            "instead (#738)")
+    if played_anywhere:
+        sfx_note_play(key, sample.stem, who,
+                      ms=int((time.monotonic() - _sting_started) * 1000))
+    else:
+        pipeline_log("drop", f"sting {sample.stem} never sounded (#738)")
     # Sometimes the other presenter has FEELINGS about the sample (#292).
     if who in ("dj", "cohost", "third") and random.random() < 0.3:
         other = "cohost" if who != "cohost" else "dj"
@@ -37491,7 +37513,7 @@ function crystalPlayHere(crystal) {
   }
   const player = document.getElementById("musicPlayer");
   player.src = track.url;
-  player.play().catch(() => {});      // autoplay may be blocked; controls stay
+  playOrPrompt(player);               // #735: surface the block
   rememberSig(track.url);
   musicLastId = track.id;
   musicLastTrack = track;
@@ -46019,11 +46041,11 @@ function djResync(clock) {
     player.src = clock.url;
     player.currentTime = Math.max(0, target);
     player.playbackRate = 1;
-    player.play().catch(() => {});      // a gesture may still be owed
+    playOrPrompt(player);               // #735: say so if it is blocked
     return;
   }
   radioFollowing = true;
-  if (player.paused && !player.ended) player.play().catch(() => {});
+  if (player.paused && !player.ended) playOrPrompt(player);   // #735
   const drift = player.currentTime - target;
   if (Math.abs(drift) > 3.5) {
     player.currentTime = Math.max(0, target);
@@ -53724,6 +53746,47 @@ function backlogClose() {
  * a second click on the SAME url as stop rather than restart. */
 let clipAudio = null;
 let clipBtn = null;
+/* #735: a browser that has not been clicked yet REFUSES to play audio,
+ * and every play() in this panel swallowed that with .catch(() => {}).
+ * So switching the routing to 'this page' and hearing nothing looked
+ * exactly like the routing not working — there was no way to tell a
+ * blocked autoplay from a silent server. Now the block is visible and
+ * one click clears it for everything at once. */
+let audioBlocked = false;
+function audioUnlockBar() {
+  if (document.getElementById("audioUnlock")) return;
+  const bar = document.createElement("div");
+  bar.id = "audioUnlock";
+  bar.textContent = "\u{1f50a}  This browser is blocking sound \u2014 click to let the station play here";
+  bar.style.cssText = "position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:90;cursor:pointer;padding:9px 16px;border-radius:20px;font-size:12.5px;font-weight:600;background:#1d6b45;color:#fff;border:1px solid #2f9c66;box-shadow:0 6px 22px rgba(0,0,0,.45)";
+  bar.onclick = async () => {
+    try {
+      if (window.pineAudioCtx && window.pineAudioCtx.resume) {
+        await window.pineAudioCtx.resume();
+      }
+    } catch (e) { /* the elements below are what matter */ }
+    ["musicPlayer", "djVoicePlayer", "cacheDayPlayer"].forEach((id) => {
+      const a = document.getElementById(id);
+      if (a && a.src && a.paused) a.play().catch(() => {});
+    });
+    audioBlocked = false;
+    bar.remove();
+    if (typeof setStatus === "function") setStatus("sound enabled");
+  };
+  document.body.appendChild(bar);
+}
+function playOrPrompt(el) {
+  if (!el) return;
+  const p = el.play();
+  if (!p || !p.catch) return;
+  p.catch((err) => {
+    if (err && err.name === "NotAllowedError") {
+      audioBlocked = true;
+      audioUnlockBar();
+    }
+  });
+}
+
 function clipToggle(url, btn, label) {
   const mark = label || (btn ? btn.textContent : "");
   if (clipAudio) {
