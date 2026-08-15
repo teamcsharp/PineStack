@@ -12904,6 +12904,53 @@ async def speakbox_index_clock() -> None:
         await asyncio.sleep(120)
 
 
+# --- The document lock (#674) ------------------------------------------------
+# Everything the pair say is seeded from a swath of one document drawn at
+# random out of the folder. That is right for a night of radio and wrong for
+# an hour of study: when you want them ON something — one manual, one
+# transcript, one book — the draw keeps wandering off it. The lock pins the
+# draw to a single document and expires by itself, because a lock nobody
+# remembers setting is worse than no lock.
+DOC_LOCK_PATH = Path("/app/data/doc_lock.json")
+_DOC_LOCK_MEM: dict[str, Any] = {}
+
+
+def doc_lock_read() -> dict[str, Any]:
+    """The live lock, or {} — an expired lock is not a lock."""
+    row = _DOC_LOCK_MEM
+    if not row:
+        try:
+            row = json.loads(DOC_LOCK_PATH.read_text())
+        except Exception:
+            row = {}
+        _DOC_LOCK_MEM.update(row or {})
+    if not row.get("doc"):
+        return {}
+    if float(row.get("until") or 0) <= time.time():
+        return {}
+    return dict(row)
+
+
+def doc_lock_set(doc: str, hours: float = 1.0,
+                 mind: str = "") -> dict[str, Any]:
+    """Pin the draw to one document, or pass an empty name to let go."""
+    _DOC_LOCK_MEM.clear()
+    row: dict[str, Any] = {}
+    if doc:
+        row = {"doc": doc, "mind": mind,
+               "until": time.time() + max(0.05, min(24.0, hours)) * 3600,
+               "since": time.time()}
+    _DOC_LOCK_MEM.update(row)
+    try:
+        DOC_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = DOC_LOCK_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(row, indent=1))
+        tmp.replace(DOC_LOCK_PATH)
+    except OSError:
+        pass
+    return row
+
+
 async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                          rid: str = "") -> dict[str, Any]:
     """A swath out of one document, both drawn at random.
@@ -12920,6 +12967,15 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
         files = speakbox_files(key)     # one document beats none
     if not files:
         return {}
+    # #674: while a lock is on, every seed comes from that one document —
+    # including the `exclude` case, because the point of the lock is that
+    # they stay ON it and a comeback from somewhere else breaks exactly the
+    # thing you turned it on for.
+    lock = doc_lock_read()
+    if lock.get("doc"):
+        pinned = [p for p in speakbox_files(key) if p.name == lock["doc"]]
+        if pinned:
+            files = pinned
     # Drawn by weight, so the documents you have pushed up come round more
     # (#209) — but never the same one twice running while another is willing,
     # because plain weighted chance on three documents repeats a third of the
@@ -20672,6 +20728,91 @@ async def voices_retarget(
     return {"job_id": job_id, "voice_id": vid, "speaker": speaker}
 
 
+@app.post("/api/voices/{vid}/split")
+async def voices_split(
+    vid: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every person in the recording, as their own voice (#663, #666).
+
+    Retarget re-aims ONE voice at ONE speaker and overwrites it, which is
+    the wrong shape when a recording holds a roomful — you had to run it
+    once per person and lose the previous result each time. This keeps the
+    original untouched and mints a NEW voice per speaker the diarizer
+    found, named "<original> · <speaker>", each one a full clone with its
+    own reference, transcript and signature. They are ordinary voices from
+    that point on, so they are immediately usable as callers, guests or
+    hosts.
+
+    The audio is sent once per speaker because the lab's speaker selection
+    happens during the run; there is no cheaper way to get a per-person
+    reference out of a single pass."""
+    require_auth(authorization)
+    meta = voice_meta(vid)
+    if not meta:
+        raise HTTPException(status_code=404, detail="No such voice")
+    audio = VOICES_DIR / vid / "audio.mp3"
+    if not audio.exists():
+        raise HTTPException(
+            status_code=400,
+            detail="This voice kept no dissection audio, so there is "
+                   "nothing to split. Re-internalize it once and every "
+                   "speaker becomes reachable.")
+    payload = await request.json() if await request.body() else {}
+    speakers = [str(s).strip() for s in (payload.get("speakers") or [])
+                if str(s).strip()]
+    if not speakers:
+        speakers = [str(s).strip() for s in (meta.get("speakers") or [])
+                    if str(s).strip()]
+    if not speakers:
+        raise HTTPException(
+            status_code=400,
+            detail="No speakers were detected in this recording. "
+                   "Diarization needs HF_TOKEN set on voice-lab — without "
+                   "it every recording looks like one person.")
+    # A roomful is the point; a crowd is a mistake. Twelve is generous and
+    # still finishes.
+    if len(speakers) > 12:
+        speakers = speakers[:12]
+    base = str(meta.get("name") or "voice").strip() or "voice"
+    blob = audio.read_bytes()
+    started: list[dict[str, str]] = []
+    async with httpx.AsyncClient(timeout=300) as client:
+        for speaker in speakers:
+            name = f"{base} · {speaker}"
+            try:
+                got = await client.post(
+                    f"{VOICE_LAB_URL}/ingest",
+                    params={"filename": "audio.mp3", "mode": "both",
+                            "speaker": speaker},
+                    content=blob,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+                got.raise_for_status()
+            except Exception as exc:
+                started.append({"speaker": speaker, "job_id": "",
+                                "name": name, "error": str(exc)[:120]})
+                continue
+            job_id = str((got.json() or {}).get("job_id") or "")
+            if not job_id:
+                continue
+            with _VOICE_JOBS_LOCK:
+                # No update_voice: each one lands as a NEW voice, and the
+                # original is left exactly as it was.
+                _VOICE_JOBS[job_id] = {"name": name, "caller_id": "",
+                                       "range": "", "started": time.time()}
+            started.append({"speaker": speaker, "job_id": job_id,
+                            "name": name})
+    if not any(row.get("job_id") for row in started):
+        raise HTTPException(
+            status_code=503,
+            detail="voice-lab took none of them — is the container running? "
+                   "(docker compose up -d voice-lab)")
+    return {"from": vid, "base": base, "count": len(started),
+            "jobs": started}
+
+
 @app.post("/api/voices/{vid}/reclone")
 async def voices_reclone(
     vid: str,
@@ -25334,6 +25475,55 @@ async def speakbox_list_api(
         "mind": key,
         "mind_name": mind_row(key)["name"],
     }
+
+
+@app.get("/api/speakbox/lock")
+async def speakbox_lock_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Which document the pair are pinned to, if any (#674)."""
+    require_read_auth(authorization)
+    lock = doc_lock_read()
+    if not lock:
+        return {"on": False}
+    left = max(0.0, float(lock.get("until") or 0) - time.time())
+    return {"on": True, "doc": lock.get("doc"), "mind": lock.get("mind") or "",
+            "until": int(lock.get("until") or 0),
+            "minutes_left": int(left // 60),
+            "seconds_left": int(left)}
+
+
+@app.post("/api/speakbox/lock")
+async def speakbox_lock_set(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Pin every seed to one document for a while, or let go (#674).
+
+    {"doc": "manual.md", "hours": 1} locks; {"doc": ""} releases. It expires
+    on its own — the whole point is that you can turn it on for a stretch of
+    study and forget about it, and the station goes back to roaming."""
+    require_auth(authorization)
+    payload = await request.json()
+    doc = str(payload.get("doc") or "").strip()
+    hours = float(payload.get("hours") or 1)
+    mind = str(payload.get("mind") or "").strip()
+    if doc:
+        key = mind_id(mind)
+        known = {p.name for p in speakbox_all(key)}
+        if doc not in known:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No document called {doc} in this mind.")
+    row = doc_lock_set(doc, hours, mind)
+    if doc:
+        pipeline_log("doc-lock", f"pinned to {doc} for {hours:g}h")
+    else:
+        pipeline_log("doc-lock", "released — back to the whole folder")
+    return {"on": bool(row), "doc": row.get("doc", ""),
+            "until": int(row.get("until") or 0),
+            "minutes_left": int(max(0.0, float(row.get("until") or 0)
+                                    - time.time()) // 60)}
 
 
 @app.get("/api/speakbox/vectors")
@@ -30637,6 +30827,10 @@ and levels, properly labelled (#405)"
       <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
         <h2 style="margin:0">🧠 The Dialogue Mind</h2>
         <span style="flex:1"></span>
+        <!-- #674: pin the pair to ONE document for a stretch. -->
+        <button id="docLockBtn" onclick="docLockPanel()"
+                title="Lock the DJs onto a single document for a while"
+                style="font-size:12px">🔓 Lock a doc</button>
         <button onclick="mindOpen()" title="Open it full-screen"
                 style="font-size:12px">⤢ Full</button>
         <button id="mindInlineToggle" onclick="mindInlineToggle()"
@@ -38835,6 +39029,149 @@ function remotePlexus(host, stages) {
   };
 }
 
+/* #674: pin the whole DJ universe to one document.
+ *
+ * Every line the pair say is seeded from a swath of a document drawn at
+ * random out of the folder, which is right for a night of radio and wrong
+ * for an hour of study. While this is on, every seed — banter, calls, ad
+ * reads, the lot — comes out of the one document you picked. It expires by
+ * itself, because a lock nobody remembers setting is worse than no lock. */
+async function docLockPanel() {
+  const gone = document.getElementById("docLockModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "docLockModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:181;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(560px,95vw);max-height:86vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:8px";
+  head.appendChild(el("h2", "", "🔒 Lock onto a document"));
+  head.firstChild.style.cssText = "margin:0;font-size:16px;flex:1";
+  const shut = el("span", "", "✕");
+  shut.style.cssText = "cursor:pointer;font-size:18px";
+  shut.onclick = () => shade.remove();
+  head.appendChild(shut);
+  card.appendChild(head);
+  const body = el("div", "muted", "Reading the folder…");
+  body.style.cssText = "font-size:12px;margin-top:8px";
+  card.appendChild(body);
+  shade.appendChild(card);
+  document.body.appendChild(shade);
+
+  let docs = {files: []}, lock = {on: false};
+  try {
+    docs = await api("/api/speakbox");
+    lock = await api("/api/speakbox/lock");
+  } catch (e) { body.textContent = e.message; return; }
+  body.textContent = "";
+
+  const state = el("div", "", "");
+  state.style.cssText = "padding:8px 10px;border-radius:8px;margin-bottom:9px;"
+    + "font-size:11.5px;line-height:1.55;border:1px solid "
+    + (lock.on ? "#7a5a1c" : "var(--border)")
+    + ";background:" + (lock.on ? "#170f04" : "transparent");
+  state.innerHTML = lock.on
+    ? "<b style='color:#ffc06a'>🔒 Locked onto " + lock.doc + "</b><br>"
+      + "Everything they say is being seeded from this one document. "
+      + (lock.minutes_left >= 1
+          ? lock.minutes_left + " minute" + (lock.minutes_left === 1 ? "" : "s")
+            + " left, then it lets go on its own."
+          : "It expires in under a minute.")
+    : "<b>🔓 Roaming</b><br>Seeds are drawn from the whole folder — weighted, "
+      + "so the documents you have pushed up come round more often.";
+  body.appendChild(state);
+
+  body.appendChild(el("div", "muted",
+    "Pick a document and how long they should stay on it. While it is on, "
+    + "every seed comes from that one file — banter, calls, ad reads, all of "
+    + "it — so they will read it, chew it over and keep coming back to it "
+    + "instead of wandering."));
+  body.lastChild.style.cssText = "font-size:11px;line-height:1.55;"
+    + "margin-bottom:8px";
+
+  const row = el("div", "row", "");
+  row.style.cssText = "gap:7px;flex-wrap:wrap;align-items:center";
+  const pick = el("select", "", "");
+  pick.style.cssText = "flex:1;min-width:200px";
+  const none = el("option", "", "— pick a document —");
+  none.value = "";
+  pick.appendChild(none);
+  (docs.files || []).slice()
+    .sort((a, b) => a.name.localeCompare(b.name))
+    .forEach((f) => {
+      const o = el("option", "",
+        f.name + "  (" + Math.max(1, Math.round(f.bytes / 1024)) + " KB)");
+      o.value = f.name;
+      if (lock.on && f.name === lock.doc) o.selected = true;
+      pick.appendChild(o);
+    });
+  row.appendChild(pick);
+  const span = el("select", "", "");
+  [["1 hour", 1], ["30 minutes", 0.5], ["2 hours", 2], ["4 hours", 4],
+   ["all day", 12]].forEach(([t, h]) => {
+    const o = el("option", "", t); o.value = String(h);
+    span.appendChild(o);
+  });
+  row.appendChild(span);
+  body.appendChild(row);
+
+  const buttons = el("div", "row", "");
+  buttons.style.cssText = "gap:7px;margin-top:9px";
+  const on = el("button", "primary", lock.on ? "Move the lock" : "Lock it on");
+  on.onclick = async () => {
+    if (!pick.value) { setStatus("pick a document first", true); return; }
+    const done = pending(on, "…");                               // #665
+    try {
+      const got = await api("/api/speakbox/lock", {method: "POST",
+        body: JSON.stringify({doc: pick.value, hours: Number(span.value)})});
+      setStatus("locked onto " + got.doc + " for "
+        + got.minutes_left + " minutes — everything they say comes out of it "
+        + "now");
+      shade.remove();
+      docLockPaint();
+    } catch (e) { setStatus(e.message, true); }
+    finally { done(); }
+  };
+  buttons.appendChild(on);
+  if (lock.on) {
+    const off = el("button", "", "🔓 Let go");
+    off.onclick = async () => {
+      const done = pending(off, "…");
+      try {
+        await api("/api/speakbox/lock",
+          {method: "POST", body: JSON.stringify({doc: ""})});
+        setStatus("lock released — back to the whole folder");
+        shade.remove();
+        docLockPaint();
+      } catch (e) { setStatus(e.message, true); }
+      finally { done(); }
+    };
+    buttons.appendChild(off);
+  }
+  body.appendChild(buttons);
+}
+
+/* The button says whether the lock is on without opening anything. */
+async function docLockPaint() {
+  const btn = document.getElementById("docLockBtn");
+  if (!btn) return;
+  let lock = {on: false};
+  try { lock = await api("/api/speakbox/lock"); } catch (e) { return; }
+  btn.textContent = lock.on
+    ? "🔒 " + String(lock.doc).slice(0, 18)
+      + (lock.minutes_left >= 1 ? " · " + lock.minutes_left + "m" : "")
+    : "🔓 Lock a doc";
+  btn.style.color = lock.on ? "#ffc06a" : "";
+  btn.title = lock.on
+    ? "Locked onto " + lock.doc + " — every line is seeded from it. "
+      + "Click to move or release the lock."
+    : "Lock the DJs onto a single document for a while";
+}
+
 /* #632: where the station can be reached from, and links to hand out.
  * #659/#660: it now measures its own setup, says which step is outstanding,
  * hands over a command that runs in the shell you are actually standing in,
@@ -39681,6 +40018,9 @@ async function djGuestRefresh() {
   let data = { guests: [], on: false, active: "" };
   try { data = await api("/api/dj/guests"); } catch (e) {}
   window._djGuests = data.guests || [];
+  // #662: who is actually seated, so the per-guest button knows whether
+  // pressing it seats or empties the chair.
+  window._djGuestState = {on: !!data.on, active: data.active || ""};
   const opts = ["<option value=''>— pick a guest —</option>"].concat(
     (data.guests || []).map((g) => "<option value='" + djGuestEsc(g.id) + "'"
       + (g.id === data.active ? " selected" : "") + ">"
@@ -39719,18 +40059,30 @@ async function djGuestRefresh() {
     html += "<div style='margin-top:12px;font-size:13px'><b>Saved guests</b>"
       + "</div>";
     for (const g of data.guests) {
+      // #662: the button says what pressing it will DO, and a seated guest
+      // is unmistakable from across the room.
+      const seated = g.id === data.active && data.on;
+      const seatedElse = data.on && data.active && data.active !== g.id;
+      const btn = seated ? "leave" : (seatedElse ? "swap in" : "send in");
       html += "<div style='display:flex;align-items:center;gap:6px;margin-top:"
-        + "5px;padding:5px 7px;background:var(--panel2,#0d1420);border-radius:"
-        + "7px'><div style='flex:1'><b>" + djGuestEsc(g.name) + "</b>"
+        + "5px;padding:5px 7px;background:" + (seated ? "#0f2f1e" : "var(--panel2,#0d1420)")
+        + ";border:1px solid " + (seated ? "#1d6b45" : "transparent")
+        + ";border-radius:7px'><div style='flex:1'><b>" + djGuestEsc(g.name)
+        + "</b>"
         + (g.who ? " <span class='muted' style='font-size:11px'>· "
           + djGuestEsc(g.who) + "</span>" : "")
-        + (g.id === data.active && data.on
-           ? " <span style='color:#7cff9b;font-size:11px'>● on air</span>" : "")
+        + (seated
+           ? " <span style='color:#7cff9b;font-size:11px'>● in the studio</span>"
+           : "")
         + "</div><button onclick=\"djGuestEdit('" + djGuestEsc(g.id)
         + "')\" style='font-size:12px'>edit</button><button onclick=\""
-        + "djGuestActivate('" + djGuestEsc(g.id) + "')\" style='font-size:12px'>"
-        + "on air</button><button onclick=\"djGuestDelete('" + djGuestEsc(g.id)
-        + "')\" style='font-size:12px'>✕</button></div>";
+        + "djGuestActivate('" + djGuestEsc(g.id) + "')\" style='font-size:12px"
+        + (seated ? ";color:#ffb4b4;border-color:#7a3a3a" : "") + "' title=\""
+        + (seated ? "Take them out of the studio"
+                  : (seatedElse ? "Put them in instead of whoever is in there"
+                                : "Put them in the third chair"))
+        + "\">" + btn + "</button><button onclick=\"djGuestDelete('"
+        + djGuestEsc(g.id) + "')\" style='font-size:12px'>✕</button></div>";
     }
   }
   body.innerHTML = html;
@@ -39856,10 +40208,25 @@ async function djGuestToggle(on) {
   await djGuestRefresh();
 }
 
+/* #662: the button is a toggle, not a one-way door.
+ *
+ * It used to only ever seat somebody — to get them out again you had to
+ * find the checkbox at the top of the panel, which is a different control
+ * in a different place doing what looks like the same job. Now the button
+ * beside a guest walks all three states from one spot: seat this guest,
+ * seat this one INSTEAD of whoever is in the chair, or empty the chair. */
 async function djGuestActivate(id) {
+  const data = window._djGuestState || {};
+  const seated = !!data.on && data.active === id;
+  const want = !seated;                    // sitting → stand up, else sit down
   try {
     await api("/api/dj/guest/activate",
-              { method: "POST", body: JSON.stringify({ on: true, id }) });
+              { method: "POST", body: JSON.stringify({ on: want, id }) });
+    const who = ((window._djGuests || []).find((g) => g.id === id) || {}).name
+      || "the guest";
+    setStatus(want ? who + " is in the third chair — the hosts will bring "
+                     + "them in and interview them"
+                   : who + " has left the studio");
   } catch (e) { setStatus("could not seat guest: " + e.message, true); }
   await djGuestRefresh();
 }
@@ -49829,6 +50196,13 @@ function studioLabTab(host) {
     + "dissection (#288)";
   aim.onclick = studioRetarget;
   actions.appendChild(aim);
+  // #663/#666: everyone at once, as separate voices, original untouched.
+  const everyone = el("button", "", "👥 a voice for everyone");
+  everyone.title = "Clone EVERY speaker in this recording into its own new "
+    + "voice — the original is left alone, and each one is usable as a "
+    + "caller, a guest or a host";
+  everyone.onclick = studioSplitSpeakers;
+  actions.appendChild(everyone);
   for (const [label, handler] of [
       ["Extract style", () => studioLabAgain("analyze")],
       ["Make voice (clone)", () => studioLabAgain("clone")],
@@ -50212,6 +50586,49 @@ async function studioRetarget() {
     studioSay("re-aiming the voice at " + speaker
       + " — a couple of minutes");
   } catch (error) { studioSay(error.message, true); }
+}
+
+/* #663/#666: one recording of a roomful becomes a voice per person.
+ *
+ * Retarget could only ever aim ONE voice at ONE speaker, overwriting it —
+ * so getting five people out of a podcast meant running it five times and
+ * losing four of the results. This mints a new voice for each speaker the
+ * diarizer found and leaves the original exactly as it was. They come out
+ * as ordinary voices, which means they are immediately pickable as callers,
+ * guests, hosts, anything. */
+async function studioSplitSpeakers(ev) {
+  const lab = studioState.lab;
+  if (!lab.voiceId) {
+    studioSay("open a saved voice's 📈 first — this works on the kept "
+      + "dissection", true);
+    return;
+  }
+  const speakers = (lab.speakers || []).slice();
+  if (speakers.length < 2) {
+    studioSay(speakers.length === 1
+      ? "only one person was detected in this recording — there is nobody "
+        + "to split out"
+      : "no speakers detected — diarization needs HF_TOKEN set on "
+        + "voice-lab, without it every recording looks like one person",
+      true);
+    return;
+  }
+  const done = pending(ev && ev.target, "…");                   // #665
+  try {
+    const got = await api("/api/voices/" + lab.voiceId + "/split",
+      {method: "POST", body: JSON.stringify({speakers: speakers})});
+    (got.jobs || []).forEach((row) => {
+      if (row.job_id) {
+        studioJobAdd(row.job_id, {kind: "lab", name: row.name});
+      }
+    });
+    const ok = (got.jobs || []).filter((r) => r.job_id).length;
+    studioSay(ok + " voice" + (ok === 1 ? "" : "s") + " being cloned — "
+      + (got.jobs || []).filter((r) => r.job_id)
+          .map((r) => r.speaker).join(", ")
+      + ". They land in the library as they finish; watch the console.");
+  } catch (error) { studioSay(error.message, true); }
+  finally { done(); }
 }
 
 async function studioSignatureOpen(voiceId) {
@@ -53447,6 +53864,9 @@ function startLiveActivity() {
   loadAds();
   djBanLoad();
   remoteDotPaint();               // #652
+  docLockPaint();                 // #674
+  // The lock expires on its own, so the button has to notice on its own too.
+  setInterval(docLockPaint, 60000);
   djLoadLevels();
   studioJobsResume();
   layoutRestore();
