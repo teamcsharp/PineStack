@@ -24732,17 +24732,28 @@ async def radio_cache_broadcast_api(
     scope: str = "today",
     day: str = "",
     span: str = "",
+    tail: float = 0.0,
     music: float = 100.0,
     duck: float = 70.0,
     voice: float = 100.0,
     authorization: str | None = Header(default=None),
 ) -> Response:
     """The full mix (#633): the talk and the stings with the records they
-    played over, at the levels set in the browser."""
+    played over, at the levels set in the browser.
+
+    #679: `tail` (seconds) asks for the last stretch instead of a named
+    scope — that is what the ⬇ in the booth wants. It used to hand back the
+    talk alone, which is not the broadcast: the records and the ad reads
+    ARE the show, and a rebroadcast without them is a pile of voice clips.
+    """
     require_read_auth(authorization)
-    if scope not in ("today", "yesterday", "week", "month", "all"):
-        raise HTTPException(status_code=400, detail="bad scope")
-    lo, hi = _mix_window(scope, day, span)
+    if tail > 0:
+        hi = time.time() + 1.0
+        lo = hi - max(15.0, min(8 * 3600.0, tail))
+    else:
+        if scope not in ("today", "yesterday", "week", "month", "all"):
+            raise HTTPException(status_code=400, detail="bad scope")
+        lo, hi = _mix_window(scope, day, span)
     hi = min(hi, time.time() + 1.0)
     if hi - lo > 8 * 3600:
         lo = hi - 8 * 3600           # every second is decoded; cap the work
@@ -24763,10 +24774,18 @@ async def radio_cache_broadcast_api(
             detail="Nothing to mix in that span. The full mix needs the "
                    "timing logs, which only start from this update — older "
                    "stretches can still be pulled as talk.")
-    stamp = time.strftime("%Y-%m-%d")
+    # #679: a tail cut is not "today" — these get collected, so the name has
+    # to say which stretch it is, down to the minute, or a folder of them is
+    # unsortable.
+    if tail > 0:
+        stamp = time.strftime("%Y-%m-%d-%H%M")
+        window = f"last-{int(round(hi - lo))}s"
+    else:
+        stamp = time.strftime("%Y-%m-%d")
+        window = span or scope
     return FileResponse(
         path, media_type="audio/mpeg",
-        filename=f"{station_slug()}-broadcast-{span or scope}-{stamp}.mp3",
+        filename=f"{station_slug()}-broadcast-{window}-{stamp}.mp3",
         headers={"Cache-Control": "no-store"})
 
 
@@ -37293,7 +37312,8 @@ function djTalkPopup() {
   // ⬇ the last stretch of the LIVE broadcast, cut on demand: a slider from
   // 30 seconds back to 15 minutes, then one mp3 straight to disk.
   const grab = el("button", "", "⬇");
-  grab.title = "Download the last stretch of the live broadcast";
+  grab.title = "Download the last stretch of the live broadcast — music, "
+    + "ads and talk, mixed at the levels you are listening at (#679)";
   grab.onclick = (ev) => { ev.stopPropagation(); djTailPanel(head); };
   // #656: the history is kept forever now, so there is a way to end it —
   // and only this, never the window doing it on its own.
@@ -42298,12 +42318,53 @@ function djTailPanel(anchor) {
   slide.step = "10"; slide.value = "30";
   slide.style.width = "100%";
   slide.oninput = () => { lab.textContent = djTailLabel(Number(slide.value)); };
+  /* #679: what "the broadcast" means. Talk-only was the old behaviour and
+   * it is not the show — the records and the ad reads ARE the show, and a
+   * rebroadcast without them is a pile of voice clips. The full mix is the
+   * default now, cut at the levels this page is playing at, because that
+   * is what you are actually listening to. */
+  const kindRow = el("div", "row", "");
+  kindRow.style.cssText = "gap:6px;margin:6px 0 2px";
+  const kind = el("select", "", "");
+  [["the whole broadcast — music, ads and talk", "mix"],
+   ["just the talk", "talk"]].forEach(([t, v]) => {
+    const o = el("option", "", t); o.value = v; kind.appendChild(o);
+  });
+  kind.style.cssText = "flex:1;min-width:0;font-size:11px";
+  kindRow.appendChild(kind);
+  const levelNote = el("div", "muted", "");
+  levelNote.style.cssText = "font-size:10px;line-height:1.45;margin-top:3px";
+  const sayLevels = () => {
+    if (kind.value !== "mix") {
+      levelNote.textContent = "Voices only — no records underneath.";
+      return;
+    }
+    const lv = djLevels();
+    levelNote.textContent = "Mixed at the levels you are listening at: "
+      + "music " + Math.round(lv.music * 100) + "%, ducked "
+      + Math.round(lv.duck * 100) + "% under speech, voices "
+      + Math.round(lv.voice * 100) + "%. Change the sliders on the desk and "
+      + "this follows.";
+  };
+  kind.onchange = sayLevels;
+  sayLevels();
+
   const row = el("div", "row", ""); row.style.marginTop = "6px";
   const go = el("button", "primary", "⬇ Save it");
   go.onclick = async () => {
+    const label = go.textContent;
     go.textContent = "⏳ cutting…"; go.disabled = true;
     try {
-      const r = await fetch("/api/radio-cache/tail?seconds=" + slide.value,
+      // Levels are read HERE, not when the panel opened — you may well have
+      // reached for the desk in between.
+      const lv = djLevels();
+      const url_ = kind.value === "mix"
+        ? "/api/radio-cache/broadcast?tail=" + slide.value
+          + "&music=" + Math.round(lv.music * 100)
+          + "&duck=" + Math.round(lv.duck * 100)
+          + "&voice=" + Math.round(lv.voice * 100)
+        : "/api/radio-cache/tail?seconds=" + slide.value;
+      const r = await fetch(url_,
         { headers: { "Authorization": "Bearer " + key() } });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
@@ -42313,19 +42374,24 @@ function djTailPanel(anchor) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      a.download = "pinebox-last-" + slide.value + "s.mp3";
+      a.download = "pinebox-" + (kind.value === "mix" ? "broadcast" : "talk")
+        + "-last-" + slide.value + "s.mp3";
       document.body.appendChild(a); a.click(); a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 15000);
+      setStatus(kind.value === "mix"
+        ? "the broadcast is saved — music, ads and talk, at your levels"
+        : "the talk is saved");
       pop.remove();
     } catch (e) {
-      go.textContent = "⬇ Save it"; go.disabled = false;
+      go.textContent = label; go.disabled = false;
       lab.textContent = e.message;
     }
   };
   const close = el("button", "", "✕");
   close.onclick = () => pop.remove();
   row.appendChild(go); row.appendChild(close);
-  pop.appendChild(lab); pop.appendChild(slide); pop.appendChild(row);
+  pop.appendChild(lab); pop.appendChild(slide);
+  pop.appendChild(kindRow); pop.appendChild(levelNote); pop.appendChild(row);
   document.body.appendChild(pop);
 }
 
