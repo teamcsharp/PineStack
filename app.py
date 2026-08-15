@@ -9190,7 +9190,7 @@ def dj_on_air(track: dict[str, Any]) -> None:
 
 async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
                        played: int, tape_slot: bool,
-                       spin_first: bool) -> None:
+                       spin_first: bool, intro_only: bool = False) -> None:
     """Everything the pair do for one record (#689, second cut).
 
     Split out of the show loop so it can run BESIDE the record rather
@@ -9227,6 +9227,11 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
                   "something that is about to start."
                   if spin_first else ""))
     await asyncio.sleep(1.0)
+    if intro_only:
+        # The talk-show torrent owns everything after the intro (#618): it
+        # runs its own rounds through the record on its own clock. Spawning
+        # a second round here would have the pair talking over themselves.
+        return
 
     # A memo from upstairs and a call are each their own segment, so
     # they replace the small talk on the tracks they land on rather
@@ -9422,10 +9427,14 @@ async def _dj_loop() -> None:
             # One round at a time: an overrun carries on over the NEXT
             # record instead of stacking a second one on top of it.
             if spin_first:
+                # In torrent mode the intro is all this does — the torrent
+                # below owns the rest of the talk for this record, and two
+                # owners means the pair talking over themselves.
+                torrent = bool(dj.get("talk_radio_mode")) and not tape_slot
                 if not (_SEGMENT_TASK and not _SEGMENT_TASK[0].done()):
                     _SEGMENT_TASK[:] = [asyncio.create_task(
                         _record_talk(track, dj, played, tape_slot,
-                                     spin_first))]
+                                     spin_first, intro_only=torrent))]
                 else:
                     pipeline_log("air", "the pair are still on the last "
                                         "round — this record just plays "
