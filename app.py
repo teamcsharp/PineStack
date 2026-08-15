@@ -26878,10 +26878,29 @@ async def speakbox_list_api(
     # let alone switch back on (#221).
     key = mind_id(mind)
     weights = mind_weights(key)
+    # #694: how hard each one is ACTUALLY leaned on, not just how hard it is
+    # allowed to be. The said-memory knows how many times a document has
+    # seeded a line and when it last did; the list was sorted alphabetically,
+    # which buries the file the show has been living in all night under
+    # whatever happens to start with a digit.
+    uses: dict[str, int] = {}
+    last: dict[str, int] = {}
+    try:
+        for row in speakbox_heard(key):
+            name = row.get("file", "")
+            if not name:
+                continue
+            uses[name] = uses.get(name, 0) + int(row.get("used") or 1)
+            last[name] = max(last.get(name, 0), int(row.get("last") or 0))
+    except Exception:
+        pass
     return {
         "files": [{"name": p.name, "bytes": p.stat().st_size,
-                   "weight": speakbox_weight(p.name, weights, key)}
+                   "weight": speakbox_weight(p.name, weights, key),
+                   "uses": uses.get(p.name, 0),
+                   "last": last.get(p.name, 0)}
                   for p in speakbox_all(key)],
+        "now": int(time.time()),
         "folder": str(speakbox_dir(key)),
         "mind": key,
         "mind_name": mind_row(key)["name"],
@@ -27093,13 +27112,25 @@ async def speakbox_search_api(
 async def speakbox_read_api(
     name: str,
     mind: str = "",
+    preview: int = 0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """One document, as it stands on disk."""
+    """One document, as it stands on disk.
+
+    `preview=N` returns only the first N characters (#694). The shelf holds
+    files up to 675 KB and a hover preview must not drag one of those across
+    the network to show the reader four hundred words of it."""
     require_read_auth(authorization)
     path = speakbox_path(name, mind)
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"No {name} in the speakbox")
+    if preview > 0:
+        want = max(200, min(20000, int(preview)))
+        with path.open("r", errors="replace") as handle:
+            head = handle.read(want)
+        return {"name": name, "text": head, "preview": True,
+                "bytes": path.stat().st_size,
+                "more": path.stat().st_size > len(head.encode("utf-8"))}
     return {"name": name, "text": path.read_text(errors="replace")}
 
 
@@ -31873,6 +31904,19 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   padding: 8px 10px; margin-bottom: 10px; border-radius: 8px;
   border: 1px solid var(--accent); background: var(--panel2);
   font-size: 12px;
+}
+/* #694: the document lock list — a real list, ordered by what the show is
+   living in, each row hoverable into a preview of what is inside it. */
+.doclock-row {
+  display: flex; align-items: center; gap: 8px; cursor: pointer;
+  padding: 6px 9px; font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.doclock-row:last-child { border-bottom: 0; }
+.doclock-row:hover { background: var(--panel2); }
+.doclock-row.on {
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
 }
 .stage-row {
   display: flex; gap: 8px; align-items: center; font-size: 12px;
@@ -41609,14 +41653,122 @@ async function themeDrop() {
  * for an hour of study. While this is on, every seed — banter, calls, ad
  * reads, the lot — comes out of the one document you picked. It expires by
  * itself, because a lock nobody remembers setting is worse than no lock. */
+/* ---- The two-second read (#694) ---------------------------------------
+ * Hovering a document in the lock list for two seconds opens it beside the
+ * list and scrolls slowly through what is actually in it. The list told you
+ * a name and a size, which is no help at all in deciding which file the
+ * pair should spend the next hour inside.
+ *
+ * Only a preview is fetched — the shelf holds files up to 675 KB and this
+ * fires on a mouse movement.
+ */
+let docPreviewTimer = null;
+let docPreviewScroll = null;
+let docPreviewFor = "";
+
+function docPreviewHide() {
+  if (docPreviewTimer) { clearTimeout(docPreviewTimer); docPreviewTimer = null; }
+  if (docPreviewScroll) {
+    cancelAnimationFrame(docPreviewScroll);
+    docPreviewScroll = null;
+  }
+  docPreviewFor = "";
+  const box = document.getElementById("docPreview");
+  if (box) box.remove();
+}
+
+function docPreviewDisarm() {
+  if (docPreviewTimer) { clearTimeout(docPreviewTimer); docPreviewTimer = null; }
+}
+
+function docPreviewArm(name, anchor) {
+  docPreviewDisarm();
+  if (docPreviewFor === name) return;      // already showing this one
+  docPreviewTimer = setTimeout(() => docPreviewShow(name, anchor), 2000);
+}
+
+async function docPreviewShow(name, anchor) {
+  docPreviewHide();
+  docPreviewFor = name;
+  const box = el("div", "panel", "");
+  box.id = "docPreview";
+  const at = anchor.getBoundingClientRect();
+  // Beside the list when there is room, otherwise flipped to its left.
+  const wide = 380;
+  const left = (at.right + 14 + wide < window.innerWidth)
+    ? at.right + 14 : Math.max(8, at.left - wide - 14);
+  box.style.cssText = "position:fixed;z-index:190;width:" + wide + "px;"
+    + "left:" + left + "px;top:"
+    + Math.max(8, Math.min(window.innerHeight - 300, at.top - 40)) + "px;"
+    + "padding:10px 12px;margin:0;pointer-events:none;"
+    + "box-shadow:0 22px 60px rgba(0,0,0,.7)";
+  const head = el("div", "", "📄 " + name);
+  head.style.cssText = "font-weight:700;font-size:12px;margin-bottom:5px";
+  box.appendChild(head);
+  const view = el("div", "", "reading…");
+  view.id = "docPreviewText";
+  view.style.cssText = "height:230px;overflow:hidden;font-size:11px;"
+    + "line-height:1.6;white-space:pre-wrap;color:#cfe;position:relative;"
+    + "-webkit-mask-image:linear-gradient(180deg,transparent,#000 12%,"
+    + "#000 86%,transparent);"
+    + "mask-image:linear-gradient(180deg,transparent,#000 12%,#000 86%,"
+    + "transparent)";
+  const run = el("div", "", "");
+  run.id = "docPreviewRun";
+  view.appendChild(run);
+  box.appendChild(view);
+  const foot = el("div", "muted", "");
+  foot.id = "docPreviewFoot";
+  foot.style.cssText = "font-size:10px;margin-top:4px";
+  box.appendChild(foot);
+  document.body.appendChild(box);
+
+  let data = {text: ""};
+  try {
+    data = await api("/api/speakbox/" + encodeURIComponent(name)
+      + "?preview=6000");
+  } catch (e) { data = {text: "(could not read it: " + e.message + ")"}; }
+  if (docPreviewFor !== name) return;           // moved on while it loaded
+  const runNode = document.getElementById("docPreviewRun");
+  const footNode = document.getElementById("docPreviewFoot");
+  if (!runNode) return;
+  runNode.textContent = (data.text || "(empty)").trim();
+  if (footNode) {
+    footNode.textContent = data.bytes
+      ? Math.max(1, Math.round(data.bytes / 1024)) + " KB"
+        + (data.more ? " — showing the opening" : "")
+      : "";
+  }
+  // Scroll it slowly, then hold at the end. Not an animation on a fixed
+  // duration: a short file would race and a long one would crawl.
+  const viewNode = document.getElementById("docPreviewText");
+  let y = 0, lastAt = 0;
+  const step = (t) => {
+    if (docPreviewFor !== name || !viewNode.isConnected) return;
+    if (!lastAt) lastAt = t;
+    const dt = Math.min(0.05, (t - lastAt) / 1000);
+    lastAt = t;
+    const reach = runNode.scrollHeight - viewNode.clientHeight;
+    if (reach > 0) {
+      y = Math.min(reach, y + dt * 26);          // ~26px a second, readable
+      runNode.style.transform = "translateY(" + (-y) + "px)";
+    }
+    docPreviewScroll = requestAnimationFrame(step);
+  };
+  docPreviewScroll = requestAnimationFrame(step);
+}
+
 async function docLockPanel() {
   const gone = document.getElementById("docLockModal");
-  if (gone) { gone.remove(); return; }
+  if (gone) { docPreviewHide(); gone.remove(); return; }
   const shade = el("div", "", "");
   shade.id = "docLockModal";
   shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
     + "z-index:181;display:flex;align-items:center;justify-content:center";
-  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  // #694: the preview is a body-level popup, so closing the modal has to
+  // take it with it.
+  const close = () => { docPreviewHide(); shade.remove(); };
+  shade.onclick = (e) => { if (e.target === shade) close(); };
   const card = el("div", "panel", "");
   card.style.cssText = "width:min(560px,95vw);max-height:86vh;overflow:auto;"
     + "padding:16px;margin:0";
@@ -41626,7 +41778,7 @@ async function docLockPanel() {
   head.firstChild.style.cssText = "margin:0;font-size:16px;flex:1";
   const shut = el("span", "", "✕");
   shut.style.cssText = "cursor:pointer;font-size:18px";
-  shut.onclick = () => shade.remove();
+  shut.onclick = close;
   head.appendChild(shut);
   card.appendChild(head);
   const body = el("div", "muted", "Reading the folder…");
@@ -41666,29 +41818,101 @@ async function docLockPanel() {
   body.lastChild.style.cssText = "font-size:11px;line-height:1.55;"
     + "margin-bottom:8px";
 
+  // #694: a real list, not a native <select>. Ordered by what the show is
+  // actually living in — a document the pair have seeded thirty lines from
+  // tonight belongs at the top, not buried under whatever starts with a
+  // digit — and a native dropdown can carry neither that reading nor a
+  // preview of what is inside.
+  const files = (docs.files || []).slice().sort((a, b) => {
+    const ua = a.uses || 0, ub = b.uses || 0;
+    if (ua !== ub) return ub - ua;                 // most leaned on first
+    const la = a.last || 0, lb = b.last || 0;
+    if (la !== lb) return lb - la;                 // then most recent
+    const wa = a.weight != null ? a.weight : 1;
+    const wb = b.weight != null ? b.weight : 1;
+    if (wa !== wb) return wb - wa;                 // then how hard it may be
+    return a.name.localeCompare(b.name);
+  });
+  const now = docs.now || Math.round(Date.now() / 1000);
+  const ago = (t) => {
+    if (!t) return "";
+    const s = Math.max(0, now - t);
+    if (s < 90) return "just now";
+    if (s < 5400) return Math.round(s / 60) + "m ago";
+    if (s < 172800) return Math.round(s / 3600) + "h ago";
+    return Math.round(s / 86400) + "d ago";
+  };
+
+  let chosen = lock.on ? lock.doc : "";
+  const list = el("div", "", "");
+  list.style.cssText = "max-height:230px;overflow-y:auto;margin-bottom:8px;"
+    + "border:1px solid var(--border);border-radius:8px";
+  const rowFor = (f) => {
+    const r = el("div", "doclock-row", "");
+    r.dataset.doc = f.name;
+    if (f.name === chosen) r.classList.add("on");
+    const nm = el("span", "", f.name);
+    nm.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+      + "text-overflow:ellipsis;white-space:nowrap";
+    r.appendChild(nm);
+    if (f.uses) {
+      const hit = el("span", "", "▮ " + f.uses);
+      hit.title = "Seeded " + f.uses + " line" + (f.uses === 1 ? "" : "s")
+        + (f.last ? " · last " + ago(f.last) : "");
+      hit.style.cssText = "flex:0 0 auto;font-size:10.5px;color:#8fe388";
+      r.appendChild(hit);
+      if (f.last) {
+        const wh = el("span", "muted", ago(f.last));
+        wh.style.cssText = "flex:0 0 auto;font-size:10.5px";
+        r.appendChild(wh);
+      }
+    } else {
+      const cold = el("span", "muted", "unread");
+      cold.title = "Nothing on air has come out of this one yet";
+      cold.style.cssText = "flex:0 0 auto;font-size:10.5px;opacity:.6";
+      r.appendChild(cold);
+    }
+    const kb = el("span", "muted", Math.max(1, Math.round(f.bytes / 1024))
+      + " KB");
+    kb.style.cssText = "flex:0 0 auto;font-size:10.5px;width:56px;"
+      + "text-align:right";
+    r.appendChild(kb);
+    r.onclick = () => {
+      chosen = f.name;
+      list.querySelectorAll(".doclock-row").forEach((n) =>
+        n.classList.toggle("on", n.dataset.doc === chosen));
+      docPreviewHide();
+    };
+    // Hover for two seconds and the document opens itself beside the list,
+    // scrolling slowly through what is actually in it.
+    r.onmouseenter = () => docPreviewArm(f.name, r);
+    r.onmouseleave = () => docPreviewDisarm();
+    return r;
+  };
+  files.forEach((f) => list.appendChild(rowFor(f)));
+  if (!files.length) {
+    list.appendChild(el("div", "muted", "The folder is empty."));
+    list.lastChild.style.cssText = "padding:10px;font-size:11.5px";
+  }
+  const hint = el("div", "muted",
+    "Ordered by what the show is actually living in. Hover a row for two "
+    + "seconds to read it.");
+  hint.style.cssText = "font-size:10.5px;margin-bottom:5px";
+  body.appendChild(hint);
+  body.appendChild(list);
+
   const row = el("div", "row", "");
   row.style.cssText = "gap:7px;flex-wrap:wrap;align-items:center";
-  const pick = el("select", "", "");
-  pick.style.cssText = "flex:1;min-width:200px";
-  const none = el("option", "", "— pick a document —");
-  none.value = "";
-  pick.appendChild(none);
-  (docs.files || []).slice()
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .forEach((f) => {
-      const o = el("option", "",
-        f.name + "  (" + Math.max(1, Math.round(f.bytes / 1024)) + " KB)");
-      o.value = f.name;
-      if (lock.on && f.name === lock.doc) o.selected = true;
-      pick.appendChild(o);
-    });
-  row.appendChild(pick);
+  const pick = {get value() { return chosen; }};
+  row.appendChild(el("span", "muted", "hold it for"));
+  row.lastChild.style.cssText = "font-size:11.5px";
   const span = el("select", "", "");
   [["1 hour", 1], ["30 minutes", 0.5], ["2 hours", 2], ["4 hours", 4],
    ["all day", 12]].forEach(([t, h]) => {
     const o = el("option", "", t); o.value = String(h);
     span.appendChild(o);
   });
+  span.style.cssText = "flex:0 1 160px";
   row.appendChild(span);
   body.appendChild(row);
 
@@ -41704,7 +41928,7 @@ async function docLockPanel() {
       setStatus("locked onto " + got.doc + " for "
         + got.minutes_left + " minutes — everything they say comes out of it "
         + "now");
-      shade.remove();
+      close();
       docLockPaint();
     } catch (e) { setStatus(e.message, true); }
     finally { done(); }
@@ -41718,7 +41942,7 @@ async function docLockPanel() {
         await api("/api/speakbox/lock",
           {method: "POST", body: JSON.stringify({doc: ""})});
         setStatus("lock released — back to the whole folder");
-        shade.remove();
+        close();
         docLockPaint();
       } catch (e) { setStatus(e.message, true); }
       finally { done(); }
