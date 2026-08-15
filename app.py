@@ -9883,9 +9883,16 @@ def dj_start(station: str) -> dict[str, Any]:
         "show_started": time.time(),
         "session_stats": {"calls": 0, "rounds": 0},
         "last_call": "",
-        # Putting the station on air reconnects the box (#638) — off and on
-        # is how you get it back after sending the DJ home.
-        "box_talk": True,
+        # #697: the box switch is NOT touched here any more.
+        #
+        # Starting the station used to force it back on. That made the switch
+        # unkeepable: the show restarts on every deploy through resume_radio,
+        # and the dead-air watchdog restarts it on a third strike — so a box
+        # deliberately switched off came back on by itself, was saved in that
+        # state, and the pair went straight back to dispatching repairs at a
+        # speaker you had told them to leave alone. "Off and on is how you get
+        # it back" was never worth that: the switch is right there, and it is
+        # yours.
     })
     _routing_save()
     _larder_load()                     # yesterday's shelf still feeds today
@@ -9967,10 +9974,12 @@ def dj_stop() -> None:
     for axis, value in _OUTPUT_BEFORE.items():
         _RADIO[axis] = value
     _OUTPUT_BEFORE.clear()
-    # Sending the DJ home hangs up on the box too (#638) — it comes back
-    # when the station does. An announce already in flight finishes; the
-    # satellite has no stop service.
-    _RADIO["box_talk"] = False
+    # #697: and it is not turned OFF here either. With the station off,
+    # nothing of the show reaches the box regardless — box_talk only ever
+    # governed station audio — so flipping it here changed nothing except
+    # the operator's own setting, which then came back wrong when the show
+    # restarted. The box stays whatever you left it: an assistant that
+    # answers you, with or without a station behind it.
     _routing_save()
     _music_log_append(None, stop=True)   # the last record ends here (#633)
     try:
@@ -49600,7 +49609,13 @@ function mindOpen(opts) {
   applyTheme();
 
   // --- orbit (drag) + click a document to read & push (#482) ---------------
-  let yaw = 0.15, pitch = 0.18, dist = 40, dragging = false, lx = 0, ly = 0;
+  // #698: the side view IS the framing — the pipeline runs along one axis
+  // and only reads square-on. These are where it settles back to.
+  const MIND_YAW = 0.15, MIND_PITCH = 0.18, MIND_DIST = 40;
+  const MIND_SETTLE = 2.0;              // seconds of stillness before it eases
+  let idleFor = 0;
+  let yaw = MIND_YAW, pitch = MIND_PITCH, dist = MIND_DIST;
+  let dragging = false, lx = 0, ly = 0;
   let downX = 0, downY = 0, moved = 0;
   const ray = new T.Raycaster(), ndc = new T.Vector2();
   renderer.domElement.addEventListener("pointerdown", (e) => {
@@ -49726,7 +49741,29 @@ function mindOpen(opts) {
     raf = requestAnimationFrame(tick);
     const dt = Math.min(0.05, clock.getDelta());
     const t = clock.elapsedTime;
-    if (!dragging) yaw += dt * 0.04;
+    // #698: it does not turn on its own any more. The machine is a row of
+    // stations along one axis and it READS from the side — the slow drift
+    // was carrying that row edge-on, so the thing you were watching spent
+    // half its time hidden behind itself. Drag it wherever you like; when
+    // you let go and leave it alone, it eases back to the side view and
+    // stays there.
+    if (!dragging) {
+      idleFor += dt;
+      if (idleFor > MIND_SETTLE) {
+        // Shortest way round, so it never takes the long way home.
+        let d = (MIND_YAW - yaw) % (Math.PI * 2);
+        if (d > Math.PI) d -= Math.PI * 2;
+        if (d < -Math.PI) d += Math.PI * 2;
+        const ease = Math.min(1, dt * 1.6);
+        yaw += d * ease;
+        pitch += (MIND_PITCH - pitch) * ease;
+        // Distance is left alone on purpose: a zoom is a deliberate choice
+        // about how close you want to be, not part of the framing that
+        // wandered off.
+      }
+    } else {
+      idleFor = 0;
+    }
     camera.position.set(Math.sin(yaw) * Math.cos(pitch) * dist,
       Math.sin(pitch) * dist + 3, Math.cos(yaw) * Math.cos(pitch) * dist);
     camera.lookAt(0, 0, 0);
