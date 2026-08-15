@@ -24825,21 +24825,34 @@ async def remote_api(
 async def share_list(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """Live tune-in links, with what is left on each."""
+    """Live tune-in links, with what is left on each, and every address each
+    one can be handed out on (#687)."""
     require_auth(authorization)
     rows = read_shares()
+    net = await asyncio.to_thread(remote_access)
     now = time.time()
     out = []
     for tag, row in (rows.get("links") or {}).items():
         left = float(row.get("expires") or 0) - now
         if left <= 0:
             continue
+        url = row.get("url") or ""
+        # The token is not tied to a host — only the prefix differs — so the
+        # same pass can be handed out on whichever address the person you
+        # are sending it to can actually reach. A link minted on the tailnet
+        # is useless to somebody on your wifi, and vice versa; this stops
+        # that being a dead end (#687).
+        token = url.rsplit("/tune/", 1)[-1] if "/tune/" in url else ""
         out.append({"tag": tag, "label": row.get("label") or "",
                     "expires": int(row.get("expires") or 0),
                     "hours_left": round(left / 3600, 1),
                     # Links minted before scopes existed are listener links.
                     "scope": row.get("scope") or "listen",
-                    "url": row.get("url") or ""})
+                    "url": url,
+                    "alts": ([{"label": u["label"], "kind": u["kind"],
+                               "url": f"{u['url']}/tune/{token}"}
+                              for u in (net.get("urls") or [])]
+                             if token else [])})
     return {"links": sorted(out, key=lambda r: -r["expires"])}
 
 
@@ -24871,8 +24884,31 @@ async def share_make(
     expires = int(time.time() + hours * 3600)
     token = listen_token(expires, tag, scope)
     net = await asyncio.to_thread(remote_access)
-    base = next((u["url"] for u in net["urls"] if u["kind"] == "tailscale"),
-                "") or next((u["url"] for u in net["urls"]), "")
+    # Which address to build the link on.
+    #
+    # This used to always prefer the tailnet, which is wrong whenever the
+    # tailnet has nobody else on it: a 100.x address is reachable only by
+    # machines signed into that tailnet, so the moment the daemon came up
+    # every new link started pointing somewhere NOBODY could reach — worse
+    # than the LAN address it replaced.
+    #
+    # The reliable default is the address you are looking at this panel
+    # through right now. It is the one host we have proof works from a real
+    # device, because your request arrived on it. `base` overrides it when
+    # you know better than we do.
+    want = str(payload.get("base") or "").strip().lower()
+    chosen = ""
+    if want:
+        chosen = next((u["url"] for u in net["urls"]
+                       if u["kind"] == want or u["label"].lower() == want), "")
+    if not chosen:
+        host_hdr = (request.headers.get("host") or "").strip()
+        if host_hdr:
+            scheme = request.headers.get("x-forwarded-proto") or "http"
+            chosen = f"{scheme}://{host_hdr}"
+    if not chosen:
+        chosen = next((u["url"] for u in net["urls"]), "")
+    base = chosen
     url = f"{base}/tune/{token}"
     rows = read_shares()
     rows.setdefault("epoch", 1)
@@ -39827,6 +39863,32 @@ async function remotePanel() {
       const copy = el("button", "", "copy");
       copy.style.fontSize = "11px";
       copyable(copy, l.url, "the tune-in link");
+      /* #687: hand the SAME pass out on whichever address the person can
+       * actually reach. A tailnet link is useless to somebody on your wifi
+       * and a LAN link is useless from the car — the token does not care,
+       * only the prefix differs. */
+      if ((l.alts || []).length > 1) {
+        const via = el("select", "", "");
+        via.style.cssText = "font-size:10px;max-width:118px";
+        via.title = "Which address to hand this out on";
+        l.alts.forEach((a) => {
+          const o = el("option", "", a.label);
+          o.value = a.url;
+          if (a.url === l.url) o.selected = true;
+          via.appendChild(o);
+        });
+        via.onclick = (ev) => ev.stopPropagation();
+        via.onchange = async (ev) => {
+          ev.stopPropagation();
+          const took = await copyText(via.value, null);
+          setStatus(took
+            ? "copied the " + via.selectedOptions[0].textContent
+              + " version of that link"
+            : "could not reach the clipboard — the link is " + via.value);
+        };
+        line.appendChild(via);
+        copyable(name, via.value, "the tune-in link");
+      }
       const kill = el("button", "", "✕");
       kill.style.fontSize = "11px";
       kill.title = "Revoke this link";
