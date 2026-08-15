@@ -9231,8 +9231,25 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
                   "something that is about to start."
                   if spin_first else ""))
     await asyncio.sleep(1.0)
-    # #700: an ad the loop held over from the last record, played over this
-    # one rather than in a silent gap between them.
+    # #700: the tape just gone, seen off over the record now turning.
+    gone = _RADIO.pop("tape_outro_next", None)
+    if gone is not None:
+        try:
+            await dj_mixtape_outro(gone)
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass
+
+    # …and the station ID, over the top rather than in a hole.
+    if _RADIO.pop("station_id_next", False):
+        try:
+            await dj_speak("station_id")
+            await asyncio.sleep(1.0)
+        except Exception:
+            pass
+
+    # An ad the loop held over from the last record, played over this one
+    # rather than in a silent gap between them.
     if _RADIO.pop("ad_due_next", False):
         try:
             roll = random.random()
@@ -9250,6 +9267,8 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
         # The talk-show torrent owns everything after the intro (#618): it
         # runs its own rounds through the record on its own clock. Spawning
         # a second round here would have the pair talking over themselves.
+        # The outro, the ID and the ad above are NOT rounds — they are the
+        # desk's own business and happen either way.
         return
 
     # A memo from upstairs and a call are each their own segment, so
@@ -9355,14 +9374,14 @@ async def _dj_loop() -> None:
                     _RADIO["tape_last"] = track
                 continue
 
-            # The tape that just finished gets seen off with glowing praise
-            # before anything else happens (#239).
+            # #700: the tape outro is HELD OVER. Seeing a tape off is a
+            # written, synthesized round, and it used to run here — before
+            # the needle — so every tape was followed by however long that
+            # took, in silence. Measured at 131 seconds. It plays over the
+            # next record instead, which is where a presenter would say it
+            # anyway.
             if _RADIO.pop("tape_outro_due", False):
-                try:
-                    await dj_mixtape_outro(_RADIO.get("tape_last"))
-                    await asyncio.sleep(0.8)
-                except Exception:
-                    pass
+                _RADIO["tape_outro_next"] = _RADIO.get("tape_last")
 
             tape_slot = bool(track.get("tape"))
             # The ID is on a CLOCK now (#355): twice an hour by default,
@@ -9375,8 +9394,9 @@ async def _dj_loop() -> None:
                     id_due is None or time.time() >= id_due):
                 _RADIO["station_id_due"] = time.time() + 3600.0 / per_hour
                 if id_due is not None:
-                    await dj_speak("station_id")
-                    await asyncio.sleep(1.0)
+                    # #700: held over too — a station ID belongs over the
+                    # top of a record, not in a hole before one.
+                    _RADIO["station_id_next"] = True
 
             # #689: THE NEEDLE GOES DOWN FIRST.
             #
