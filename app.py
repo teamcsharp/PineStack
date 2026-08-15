@@ -545,6 +545,8 @@ DEFAULT_DJ = {
     # introduce it over its own opening the way real radio does, and every
     # other segment runs while it spins.
     "records_first": True,
+    # #704: no sample of this length or longer ever goes out.
+    "sfx_max_seconds": 5.0,
     # #699: what share of callers ring in on a voice from YOUR library
     # rather than the stock Piper bank. Was a hardcoded 45.
     "clone_caller_pct": 70,
@@ -960,6 +962,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("talk_radio", DEFAULT_DJ["talk_radio"]) or 0))),
         "talk_radio_mode": bool(raw_dj.get("talk_radio_mode", False)),
         "records_first": bool(raw_dj.get("records_first", True)),   # #689
+        "sfx_max_seconds": max(0.5, min(30.0, float(                # #704
+            raw_dj.get("sfx_max_seconds", 5.0) or 5.0))),
         "clone_caller_pct": max(0, min(100, int(                    # #699
             raw_dj.get("clone_caller_pct", 70) or 0))),
         "ad_bed_pct": max(2, min(100, int(                          # #700
@@ -9473,7 +9477,21 @@ async def _dj_loop() -> None:
                 # below owns the rest of the talk for this record, and two
                 # owners means the pair talking over themselves.
                 torrent = bool(dj.get("talk_radio_mode")) and not tape_slot
-                if not (_SEGMENT_TASK and not _SEGMENT_TASK[0].done()):
+                stale = _SEGMENT_TASK and not _SEGMENT_TASK[0].done()
+                if stale:
+                    # It belongs to a record that has already finished. Give
+                    # it a moment to land on its own, then take it down —
+                    # a wedged announce would otherwise hold it for ever
+                    # (#705), and the torrent skips while it is running.
+                    age = time.time() - float(_RADIO.get("segment_at") or 0)
+                    if age > 45:
+                        _SEGMENT_TASK[0].cancel()
+                        pipeline_log("air", "the last record's talk was still "
+                                            "going and its record is over — "
+                                            "cut it and move on (#705)")
+                        stale = False
+                if not stale:
+                    _RADIO["segment_at"] = time.time()
                     _SEGMENT_TASK[:] = [asyncio.create_task(
                         _record_talk(track, dj, played, tape_slot,
                                      spin_first, intro_only=torrent))]
@@ -9979,9 +9997,17 @@ async def _torrent_talk() -> None:
             await asyncio.sleep(torrent_breath(dj))
             if not _RADIO.get("on") or not dj_settings().get("talk_radio_mode"):
                 continue
-            # Never two rounds at once: the per-record intro is its own task
-            # and this must not talk over it.
-            if _SEGMENT_TASK and not _SEGMENT_TASK[0].done():
+            # Never two rounds at once: the per-record intro is its own
+            # task and this must not talk over it. But it does NOT wait
+            # for ever (#705) — an intro whose announce is stuck behind a
+            # box that is not answering would otherwise starve the torrent
+            # silently, which is exactly what it did. Past a minute the
+            # rounds go ahead; the announce lock serialises the audio.
+            busy = _SEGMENT_TASK and not _SEGMENT_TASK[0].done()
+            if busy and (time.time()
+                         - float(_RADIO.get("segment_at") or 0)) < 60:
+                pipeline_log("air", "torrent waiting — the intro for this "
+                                    "record is still rendering")
                 continue
             track = _RADIO.get("now")
             # #702: ROTATE THE KIND OF ROUND.
@@ -13136,11 +13162,30 @@ async def dj_gallery_round() -> list[str]:
         + (f" Somewhere in the middle one of you drops this, word for "
            f"word, as though it explains the art: \"{seed['text']}\""
            if seed else ""))
+    began = time.time()
     lines = await dj_banter(None, angle=angle, lines=12,
                             source=(seed or {}).get("file", ""))
+    # #702: the paintings ride the lines that are about them.
+    gallery_line_mark([n for n, _ in pieces], began)
     if lines and seed:
         speakbox_remember(seed)
     return lines
+
+
+def gallery_line_mark(names: list[str], since: float) -> None:
+    """Hang the paintings on the lines that discuss them (#702).
+
+    The booth already held them up in a strip beside the dialogue, which
+    tells you WHAT is being sold but not WHICH line is about which picture.
+    Every line aired since the round began gets the round's images, so the
+    thumbnail sits with the words describing it."""
+    if not names:
+        return
+    for entry in reversed(_RADIO.get("chat") or []):
+        if float(entry.get("ts") or 0) < since:
+            break
+        if entry.get("who") in ("dj", "cohost", "third", "caller"):
+            entry["images"] = names[:3]
 
 
 def banter_pictures(limit: int = 6) -> str:
@@ -14323,22 +14368,71 @@ def sfx_list(folder: Path) -> list[Path]:
     return sorted(found)[:SFX_MAX_FILES]
 
 
+def sfx_cap_seconds() -> float:
+    """The longest a sample may be and still go out (#704)."""
+    try:
+        return max(0.5, min(30.0, float(dj_settings().get(
+            "sfx_max_seconds", SFX_MAX_SECONDS))))
+    except Exception:
+        return SFX_MAX_SECONDS
+
+
+_SFX_LEN_CACHE: dict[str, float] = {}
+
+
+def sfx_seconds(path: Path) -> float:
+    """How long a sample actually runs. 0.0 means we could not tell.
+
+    Cached on path+mtime: this is asked on every draw and the folder is
+    hundreds of files."""
+    try:
+        key = f"{path}:{path.stat().st_mtime_ns}"
+    except OSError:
+        return 0.0
+    held = _SFX_LEN_CACHE.get(key)
+    if held is not None:
+        return held
+    secs = 0.0
+    if path.suffix.lower() == ".wav":
+        import wave
+        try:
+            with wave.open(str(path), "rb") as handle:
+                secs = handle.getnframes() / float(handle.getframerate() or 1)
+        except Exception:
+            secs = 0.0
+    if secs <= 0:
+        try:
+            import mutagen
+            info = mutagen.File(str(path))
+            secs = float(getattr(getattr(info, "info", None), "length", 0) or 0)
+        except Exception:
+            secs = 0.0
+    if len(_SFX_LEN_CACHE) > 4000:
+        _SFX_LEN_CACHE.clear()
+    _SFX_LEN_CACHE[key] = secs
+    return secs
+
+
 def sfx_short(path: Path) -> bool:
     """Whether this is a sting or a pad.
 
     Half the shipped pack runs six to twelve seconds — they are atmospheres,
-    not punctuation, and an announce cannot be stopped once it starts. A wav
-    says its length in its header; anything else is taken on trust, because
-    the record scratches are mp3s and all of them are short."""
-    if path.suffix.lower() != ".wav":
-        return True
-    import wave
+    not punctuation, and an announce cannot be stopped once it starts.
+
+    #704: it used to read a wav header and take EVERYTHING ELSE on trust,
+    on the reasoning that the record scratches are short mp3s. That is how
+    long samples kept getting on air: an mp3 or a flac pad sailed straight
+    through the check. Every format is measured now, and a sample we cannot
+    measure at all is refused rather than risked — except the scratches this
+    station makes itself, which are known short by construction."""
+    cap = sfx_cap_seconds()
+    secs = sfx_seconds(path)
+    if secs > 0:
+        return secs <= cap
     try:
-        with wave.open(str(path), "rb") as handle:
-            rate = handle.getframerate() or 1
-            return handle.getnframes() / rate <= SFX_MAX_SECONDS
+        return SFX_MADE_DIR in path.parents
     except Exception:
-        return True                     # unreadable header: let it play
+        return False
 
 
 def sfx_all() -> list[Path]:
@@ -15324,6 +15418,9 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         "ts": int(time.time()), "who": "board", "kind": "sfx",
         "text": sample.stem, "sfx": key,
         "sfx_dir": sample.parent.name or "sfx",
+        # #704: how long it ran, on the entry — the point of seeing them
+        # listed is being able to weed the ones that do not fit.
+        "seconds": round(sfx_seconds(sample), 2),
         "url": f"/sfx/{key}?t={signature}",
     })
     del _RADIO["chat"][:-240]
@@ -18149,11 +18246,24 @@ def _call_concat_blocking(paths: list[str],
     return blob if len(blob) > 4000 else None
 
 
+def _desk_sound(label: str, seconds: float = 0.0) -> None:
+    """A noise the desk made that is not a sample off the shelf (#703) — the
+    phone ringing, a receiver going down. They were audible and invisible,
+    and "everything happening in the booth" has to mean everything."""
+    _RADIO["chat"].append({
+        "ts": int(time.time()), "who": "board", "kind": "sfx",
+        "text": label, "sfx": "", "sfx_dir": "the desk",
+        "seconds": round(seconds, 2),
+    })
+    del _RADIO["chat"][:-240]
+
+
 async def play_phone_ring() -> None:
     """Ring both outputs, ahead of the call."""
     ring = await asyncio.to_thread(make_phone_ring)
     if ring is None:
         return
+    _desk_sound("\u260e the phone ringing", sfx_seconds(ring))   # #703
     key = sfx_id(ring)
     signature = media_sign(key)
     _ring_box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
@@ -18590,6 +18700,9 @@ async def speak_turns(turns: list[tuple[str, str]],
             hang = await asyncio.to_thread(make_hangup)
             if hang:
                 seg.append(str(hang))
+                # #703: audible, so it belongs in the list.
+                _desk_sound("\u260e the receiver going down",
+                            sfx_seconds(hang))
         mixed = (await asyncio.to_thread(
                     _call_concat_blocking, seg,
                     bool(dj_settings().get("stream_texture")))
@@ -28021,6 +28134,33 @@ async def sfx_ban_api(
         raise HTTPException(status_code=400, detail="No such sample")
     bans = sfx_ban_set(sid, bool(payload.get("banned", True)))
     return {"id": sid, "banned": sid in bans, "total": len(bans)}
+
+
+@app.post("/api/sfx/delete")
+async def sfx_delete_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Take a sample off the shelf for good (#703).
+
+    Banning keeps the file and stops it playing; this removes it. Wanted for
+    the ones that simply do not belong in the pack — a ban list hundreds
+    long is its own mess."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    sid = str(payload.get("id") or "")
+    path = sfx_by_id(sid)
+    if not path or not path.is_file():
+        raise HTTPException(status_code=404, detail="No such sample")
+    name = path.name
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(status_code=500,
+                            detail=f"Could not delete it: {exc}")
+    sfx_ban_set(sid, True)          # so nothing re-picks it this session
+    pipeline_log("air", f"sample deleted from the shelf — {name} (#703)")
+    return {"deleted": sid, "name": name}
 
 
 @app.get("/api/sfx/stats")
@@ -40581,17 +40721,60 @@ function djTalkRender(state) {
         if (line.url) new Audio(line.url).play().catch(() => {});
       };
       row.appendChild(play);
+      // #703: up as well as down. Favouring a sample raises how often it
+      // comes round; the bin takes it off the shelf entirely.
+      const up = el("button", "", "▲");
+      up.title = "More of this one — raise how often it comes up";
+      up.style.cssText = small;
+      up.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!line.sfx) return;
+        try {
+          const got = await api("/api/sfx/weight", {method: "POST",
+            body: JSON.stringify({id: line.sfx, weight: 2.0})});
+          up.style.color = "#43d17c";
+          up.title = "Favoured" + (got.weight != null
+            ? " — weight " + got.weight : "");
+        } catch (error) { setStatus(error.message, true); }
+      };
+      row.appendChild(up);
       const down = el("button", "", "▼");
       down.title = "Never play this sample again";
       down.style.cssText = small;
-      down.onclick = async () => {
+      down.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!line.sfx) return;
         try {
           await api("/api/sfx/ban", {method: "POST",
             body: JSON.stringify({id: line.sfx, banned: true})});
           row.style.opacity = ".4";
+          down.style.color = "#ef6461";
         } catch (error) {}
       };
       row.appendChild(down);
+      const bin = el("button", "", "🗑");
+      bin.title = "Delete this sample from the shelf for good";
+      bin.style.cssText = small;
+      bin.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!line.sfx) return;
+        if (!confirm("Delete this sample from disk?")) return;
+        try {
+          await api("/api/sfx/delete", {method: "POST",
+            body: JSON.stringify({id: line.sfx})});
+          row.style.opacity = ".3";
+          row.style.textDecoration = "line-through";
+          bin.textContent = "gone";
+        } catch (error) { setStatus(error.message, true); }
+      };
+      row.appendChild(bin);
+      if (line.seconds) {
+        const len = el("span", "muted", Number(line.seconds).toFixed(1) + "s");
+        len.style.cssText = "font-size:9.5px;opacity:.65;margin-left:2px";
+        len.title = "How long it ran. Anything at or over the cap never "
+          + "goes out.";
+        row.appendChild(len);
+      }
       const dot = el("button", "", "●");
       dot.title = "The whole folder — toggle its samples";
       dot.style.cssText = small;
@@ -40698,6 +40881,26 @@ function djTalkRender(state) {
       q.style.cssText = "font-size:10px;opacity:.4";
       said.appendChild(q);
     }
+    // #702: the paintings this line is actually about, hung on it. The
+    // strip at the top says WHAT is being sold; this says which line is
+    // about which picture.
+    if (line.images && line.images.length) {
+      const strip = el("div", "", "");
+      strip.style.cssText = "display:flex;gap:4px;margin-top:3px;"
+        + "flex-wrap:wrap";
+      line.images.slice(0, 3).forEach((n) => {
+        const im = document.createElement("img");
+        im.src = "/api/generations/image/" + encodeURIComponent(n);
+        im.loading = "lazy";
+        im.title = n + " — open it";
+        im.style.cssText = "height:44px;width:44px;object-fit:cover;"
+          + "border-radius:5px;border:1px solid var(--border);cursor:zoom-in";
+        im.onerror = () => { im.style.display = "none"; };
+        im.onclick = (ev) => { ev.stopPropagation(); artFullscreen(n); };
+        strip.appendChild(im);
+      });
+      said.appendChild(strip);
+    }
     // #651/#653: tag every spoken line with its words so the pulse can find
     // the one that is actually sounding. The server logs a line when it
     // hands it over; the page plays it later, so matching on the AUDIO is
@@ -40717,8 +40920,8 @@ function djTalkRender(state) {
         event.preventDefault();
         djBanLine(line, said);
       };
-      said.title = "Click to say again · right-click to bury this line "
-        + "forever";
+      said.title = "Click to say again · right-click to mark it a REPEAT "
+        + "— buried, and never said again";
     }
     row.appendChild(said);
     // The R button (#443, #452): INSIDE the message, trailing the text,
@@ -40837,14 +41040,23 @@ function djTalkRender(state) {
 async function djBanLine(line, row) {
   // Bury a line for good (#443, #444): down-vote it so it is dropped if it
   // ever comes round again and removed from the approved bank.
+  //
+  // #704: the same machinery is what "mark it a repeat" wants — the point
+  // of saying a line is a repeat is that it must not come round again — so
+  // the gesture says so plainly rather than leaving you to infer it.
   try {
     await api("/api/dj/line/vote", {method: "POST", body: JSON.stringify(
       {text: line.text, who: line.who, vote: -1,
        source: line.source || ""})});
     row.style.textDecoration = "line-through";
     row.style.opacity = ".4";
-    row.title = "Buried — never said again";
-  } catch (error) { /* the panel keeps working */ }
+    row.title = "Marked a repeat — buried, and never said again";
+    const mark = el("span", "", " ♺");
+    mark.title = "You marked this a repeat — the pair move on from it";
+    mark.style.cssText = "font-size:10px;color:#ffd479;opacity:.9";
+    row.appendChild(mark);
+    setStatus("marked a repeat — they will not say it again");
+  } catch (error) { setStatus(error.message, true); }
 }
 
 async function djTalkSpeak(line, row) {
