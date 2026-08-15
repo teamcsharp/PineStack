@@ -15980,14 +15980,32 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
     theme = active_theme()
     if theme and random.random() < max(0, min(100, int(
             themes_read().get("strength") or 70))) / 100:
-        swath = await speakbox_quote(most=3, cap=300)
+        # #686: the theme call is not a polite enquiry. Pull real material
+        # out of the shelf and make them RIFF on it — a caller who only
+        # states their topic is a survey response, not radio.
+        swath = await speakbox_quote(most=4, cap=420)
+        mined = ""
+        if swath and swath.get("text"):
+            mined = (
+                "\n\nMATERIAL FROM THE STATION'S OWN SHELF — the caller has "
+                "read this, or heard it, or half-remembers it, and they "
+                "WEAVE IT IN: they quote a phrase of it back, mangle "
+                "another, build a joke on top of it, or cite it as evidence "
+                f"for whatever they are arguing:\n{swath['text']}")
         return (
             f"The caller is ringing in about {theme['text']}. That is what "
             "is on their mind and they have come to the station about it "
             "specifically — they have an opinion, a story, a grievance or a "
             "question, and it is THEIRS, particular and concrete, not a "
-            "general observation. The pair take it seriously as a subject "
-            "and dig into it with them.",
+            "general observation. "
+            # #686: push it. A theme call should be the funniest thing in
+            # the hour, not the most on-message.
+            "They PUSH THE LIMITS with it — they are funny about it, they "
+            "take it somewhere further than anyone expected, they make the "
+            "joke nobody else would make about it and commit to it "
+            "completely. The pair egg them on, top the joke, and take the "
+            "subject seriously even while it gets ridiculous."
+            + mined,
             swath or {})
     roll = random.random()
     # The mixtape haters (#453): they ring DEMANDING no more MX tapes, and
@@ -39046,24 +39064,41 @@ function copyable(node, text, label) {
   node.title = "click to copy" + (label ? " — " + label : "");
   node.addEventListener("click", async (ev) => {
     ev.stopPropagation();
-    let ok = true;
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch (e) {
-      // Clipboard is refused on insecure origins and in some embeddings.
-      // Selecting the text still lets ctrl-C finish the job.
-      ok = false;
-      if (node.tagName === "INPUT") { node.focus(); node.select(); }
-      else {
-        const range = document.createRange();
-        range.selectNodeContents(node);
-        const sel = window.getSelection();
-        sel.removeAllRanges(); sel.addRange(range);
-      }
-    }
+    const ok = await copyText(text, node);
     copyBlip(node, ok ? "copied" : "select and press ctrl-C", ok);
   });
   return node;
+}
+
+/* #687: copying that actually works on this station.
+ *
+ * navigator.clipboard only exists in a SECURE context — https, or
+ * localhost. This panel is served over plain http on a LAN address, so on
+ * every machine except the box itself that API is simply absent, and every
+ * copy was failing silently. That is why the share link would not share.
+ *
+ * So: try the modern API when it is really there, and otherwise fall back
+ * to the old execCommand path, which has no such restriction. The textarea
+ * is positioned off-screen rather than hidden, because a display:none or
+ * zero-size element cannot be selected and the copy silently does nothing.
+ * Selection is only the last resort now. */
+async function copyText(text, node) {
+  // pineCopy already knows both routes and is used by the chat chips; this
+  // adds the verdict and the in-place selection of last resort.
+  try {
+    await pineCopy(text);
+    return true;
+  } catch (e) { /* fall through to selecting it in place */ }
+  try {
+    if (node && node.tagName === "INPUT") { node.focus(); node.select(); }
+    else if (node) {
+      const range = document.createRange();
+      range.selectNodeContents(node);
+      const sel = window.getSelection();
+      sel.removeAllRanges(); sel.addRange(range);
+    }
+  } catch (e) {}
+  return false;
 }
 
 /* A copy needs to be felt, not guessed at — the mark lands on the thing you
@@ -39841,13 +39876,16 @@ async function remotePanel() {
       label.value = "";
       await drawLinks();
       remoteDotPaint();                       // #652
-      try { await navigator.clipboard.writeText(got.url); } catch (e) {}
+      // #687: goes through copyText, which works on a plain-http origin
+      // where navigator.clipboard does not exist at all.
+      const took = await copyText(got.url, null);
       const reach = got.remote
         ? "it works from anywhere on your tailnet"
         : "this one only works on your own network, since there is no "
           + "tailnet yet";
-      setStatus((got.scope === "full"
-        ? "FULL-ACCESS link copied — " : "link copied — ") + reach);
+      setStatus((got.scope === "full" ? "FULL-ACCESS link " : "link ")
+        + (took ? "copied — " : "made (copy it from the list below) — ")
+        + reach);
     } catch (e) { setStatus(e.message, true); }
     mint.disabled = false;
   };
