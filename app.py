@@ -31009,7 +31009,12 @@ button.danger {
   55%  { transform: scaleX(.86); opacity: 1; }
   100% { transform: scaleX(1);   opacity: .35; }
 }
-.mq-clip { overflow: hidden; white-space: nowrap; position: relative; }
+/* #693: max-width:100% + min-width:0 so a marquee never reports its full
+   text length as an intrinsic width and drags its container open. */
+.mq-clip {
+  overflow: hidden; white-space: nowrap; position: relative;
+  max-width: 100%; min-width: 0;
+}
 .mq-run  { display: inline-block; animation: mqLoop linear infinite; }
 .mq-run > span { padding-right: 2.5em; }
 .mq-clip:hover .mq-run { animation-play-state: paused; }
@@ -57744,10 +57749,19 @@ function mpxBuildTip() {
     + '<div>' + mpxSvgBars(rows)
     + '<div class="muted" style="font-size:9px;margin-top:2px">recent delivery (green=full)</div></div>'
     + '</div>'
-    + '<table style="width:100%;border-collapse:collapse;font-size:11px">'
+    // #693: table-layout:fixed is what actually holds the card together —
+    // the columns are then sized by the table, not by the longest string in
+    // them, so a marquee row clips instead of stretching. The value column
+    // breaks anywhere so an unbroken token (a file name, a voice id) wraps
+    // rather than pushing the edge out.
+    + '<table style="width:100%;table-layout:fixed;border-collapse:collapse;'
+    + 'font-size:11px">'
+    + '<colgroup><col style="width:88px"><col></colgroup>'
     + table.map(([k, v]) =>
-        '<tr><td style="color:#8aa;padding:2px 6px 2px 0;white-space:nowrap;vertical-align:top">'
-        + k + '</td><td style="padding:2px 0">' + v + '</td></tr>').join('')
+        '<tr><td style="color:#8aa;padding:2px 6px 2px 0;white-space:nowrap;'
+        + 'vertical-align:top">'
+        + k + '</td><td style="padding:2px 0;overflow-wrap:anywhere;'
+        + 'min-width:0">' + v + '</td></tr>').join('')
     + '</table>';
 }
 async function mpxPoll() {
@@ -57804,8 +57818,17 @@ function mpxInit() {
   lab.id = "mpxLabel"; lab.textContent = "processing…";
   const tip = document.createElement("div");
   tip.id = "mpxTip";
+  // #693: the card is a fixed 320px box, but its table sized itself off its
+  // CONTENT — a scrolling marquee is nowrap, and nowrap inside an auto-layout
+  // table contributes its full max-content width no matter how much overflow
+  // hidden is on it. So "saying", "out of" and "previous" each stretched the
+  // table to the length of a whole spoken line and the card grew out past its
+  // own border. box-sizing so the 12px padding is inside the width, overflow
+  // hidden so nothing can escape the rounded corner, and a viewport cap so it
+  // still fits on a narrow screen.
   tip.style.cssText = "display:none;position:absolute;bottom:calc(100% + 10px);"
-    + "right:0;width:320px;padding:12px;border-radius:12px;"
+    + "right:0;width:min(340px,92vw);max-width:92vw;box-sizing:border-box;"
+    + "overflow:hidden;padding:12px;border-radius:12px;"
     + "background:#0b0f18f5;border:1px solid var(--border);"
     + "box-shadow:0 24px 70px rgba(0,0,0,.7);color:#cfe;font-size:11px;"
     + "line-height:1.5";
