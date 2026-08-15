@@ -15861,10 +15861,78 @@ def swath_intrigue(text: str) -> float:
             + (0.2 if "?" in text else 0.0))
 
 
+# --- What the callers ring in ABOUT (#680) ----------------------------------
+# The topic mix is a fixed set of rolls — mixtape haters, the unhinged, the
+# news, your planted bombshells. That is a good house style and a bad leash:
+# there was no way to say "tonight they are all ringing about X". A theme is
+# that lever. It does not replace the mix, it BIASES it, because a station
+# where every single caller is on message stops sounding like a phone line
+# and starts sounding like a broadcast.
+THEMES_PATH = Path("/app/data/caller_themes.json")
+_THEMES_MEM: dict[str, Any] = {}
+# The one it has always effectively had, named so it can be chosen again.
+DEFAULT_THEME = {
+    "name": "heat / DGX Spark",
+    "text": "the heat coming off the DGX Spark, the machine this station "
+            "runs on, and the strange things it does when it gets hot",
+}
+
+
+def themes_read() -> dict[str, Any]:
+    global _THEMES_MEM
+    if not _THEMES_MEM:
+        try:
+            _THEMES_MEM = json.loads(THEMES_PATH.read_text()) or {}
+        except Exception:
+            _THEMES_MEM = {}
+    _THEMES_MEM.setdefault("themes", [dict(DEFAULT_THEME)])
+    _THEMES_MEM.setdefault("active", DEFAULT_THEME["name"])
+    _THEMES_MEM.setdefault("strength", 70)
+    return _THEMES_MEM
+
+
+def themes_write(rows: dict[str, Any]) -> None:
+    global _THEMES_MEM
+    _THEMES_MEM = rows
+    try:
+        THEMES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = THEMES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, indent=1))
+        tmp.replace(THEMES_PATH)
+    except OSError:
+        pass
+
+
+def active_theme() -> dict[str, Any]:
+    """The theme in force, or {} when the callers are left to roam."""
+    rows = themes_read()
+    want = str(rows.get("active") or "")
+    if not want or want == "—":
+        return {}
+    for row in rows.get("themes") or []:
+        if row.get("name") == want:
+            return dict(row)
+    return {}
+
+
 async def caller_topic() -> tuple[str, dict[str, Any]]:
     """What tonight's caller is on about: a diatribe out of the speakbox,
     something completely unhinged (#358), a news story, or one of your
-    planted topics."""
+    planted topics — biased toward tonight's theme when one is set (#680)."""
+    # #680: the theme wins its share of the calls and leaves the rest to the
+    # usual mix, so the phone line still sounds like a phone line.
+    theme = active_theme()
+    if theme and random.random() < max(0, min(100, int(
+            themes_read().get("strength") or 70))) / 100:
+        swath = await speakbox_quote(most=3, cap=300)
+        return (
+            f"The caller is ringing in about {theme['text']}. That is what "
+            "is on their mind and they have come to the station about it "
+            "specifically — they have an opinion, a story, a grievance or a "
+            "question, and it is THEIRS, particular and concrete, not a "
+            "general observation. The pair take it seriously as a subject "
+            "and dig into it with them.",
+            swath or {})
     roll = random.random()
     # The mixtape haters (#453): they ring DEMANDING no more MX tapes, and
     # the pair fight back — refuse outright, read a random speakbox line AT
@@ -25477,6 +25545,57 @@ async def speakbox_list_api(
     }
 
 
+@app.get("/api/dj/themes")
+async def dj_themes_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the callers are ringing in about tonight (#680)."""
+    require_read_auth(authorization)
+    rows = themes_read()
+    return {"themes": rows.get("themes") or [],
+            "active": rows.get("active") or "",
+            "strength": int(rows.get("strength") or 70)}
+
+
+@app.post("/api/dj/themes")
+async def dj_themes_set(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Add, remove, or switch the caller theme (#680).
+
+    {"add": {"name": ..., "text": ...}} keeps a new one; {"remove": name}
+    drops it; {"active": name} switches (use "" or "—" to let the callers
+    roam); {"strength": 0-100} sets what share of calls the theme takes."""
+    require_auth(authorization)
+    payload = await request.json()
+    rows = themes_read()
+    themes = list(rows.get("themes") or [])
+    add = payload.get("add") or {}
+    if add.get("text"):
+        name = str(add.get("name") or add["text"])[:60].strip()
+        themes = [t for t in themes if t.get("name") != name]
+        themes.append({"name": name, "text": str(add["text"])[:600].strip()})
+        rows["active"] = name              # adding one means wanting it on
+    drop = str(payload.get("remove") or "")
+    if drop:
+        themes = [t for t in themes if t.get("name") != drop]
+        if rows.get("active") == drop:
+            rows["active"] = ""
+    if "active" in payload:
+        want = str(payload.get("active") or "")
+        if want and want not in {t.get("name") for t in themes} and want != "—":
+            raise HTTPException(status_code=404, detail="No such theme")
+        rows["active"] = want
+    if "strength" in payload:
+        rows["strength"] = max(0, min(100, int(payload.get("strength") or 0)))
+    rows["themes"] = themes
+    themes_write(rows)
+    pipeline_log("theme", f"callers → {rows.get('active') or 'roaming'}")
+    return {"themes": themes, "active": rows.get("active") or "",
+            "strength": int(rows.get("strength") or 70)}
+
+
 @app.get("/api/speakbox/lock")
 async def speakbox_lock_get(
     authorization: str | None = Header(default=None),
@@ -31472,6 +31591,41 @@ Glass</button>
         <div id="adsOutput" style="margin-top:10px;max-height:300px;
              overflow-y:auto"></div>
       </details>
+
+      <!-- #680: what the callers ring in ABOUT. -->
+      <details class="pine-customize" style="margin-top:10px">
+        <summary class="muted" style="cursor:pointer">
+          What the callers are calling about
+        </summary>
+        <div class="muted" style="font-size:11px;line-height:1.55;
+             margin:8px 0 6px">
+          A theme biases the phone line without taking it over — the rest of
+          the calls stay on the usual mix of unhinged, news and your planted
+          bombshells, because a station where every caller is on message
+          stops sounding like a phone line.
+        </div>
+        <div class="row" style="margin-top:6px;flex-wrap:wrap">
+          <select id="themePick" onchange="themeActivate()"
+                  style="flex:1;min-width:200px"></select>
+          <label class="film-size" style="min-width:190px"
+                 title="What share of calls come in on the theme">
+            share
+            <input id="themeStrength" type="range" min="0" max="100"
+                   value="70" onchange="themeStrength()">
+            <span id="themeStrengthVal" class="val">70%</span>
+          </label>
+          <button onclick="themeDrop()" title="Forget the selected theme"
+                  style="font-size:12px">✕</button>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <input id="themeName" placeholder="Call it something…"
+                 style="max-width:34%">
+          <input id="themeText"
+                 placeholder="What they are ringing in about…"
+                 onkeydown="if(event.key==='Enter')themeAdd()">
+          <button class="primary" onclick="themeAdd()">Add</button>
+        </div>
+      </details>
       <div class="row" style="margin-top:10px;flex-wrap:wrap">
         <label class="film-size" style="flex:1;min-width:220px"
                title="Music level. Above 100% is a real gain stage — an audio
@@ -37014,33 +37168,16 @@ function djTalkPopup() {
    * there is no way home. Clicking the title is that way home — it goes to
    * whatever is sounding right now and marks it. */
   title.title = "Jump to the line going out right now";
-  title.onclick = (ev) => {
-    ev.stopPropagation();
-    const log = document.getElementById("djTalkLog");
-    if (!log) return;
-    // Scrolling back sets a flag that stops the auto-follow; asking to be
-    // taken to the live line is asking for that flag to be cleared.
-    log._userScrolled = false;
-    const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
-    let row = want
-      ? log.querySelector('[data-said="' + window.CSS.escape(want) + '"]')
-      : null;
-    if (!row) row = log.querySelector(".booth-live");
-    if (!row) {
-      // Nothing is sounding — the honest answer is the newest line, and
-      // saying so beats a click that appears to do nothing.
-      const all = log.querySelectorAll("[data-said]");
-      row = all.length ? all[all.length - 1] : null;
-      setStatus(row ? "nothing is going out — this is the last line said"
-                    : "the booth has not said anything yet");
-    }
-    if (!row) return;
-    try { row.scrollIntoView({block: "center", behavior: "smooth"}); }
-    catch (e) { row.scrollIntoView(); }
-    // A flash, so the eye lands on it even in a wall of identical rows.
-    row.classList.add("booth-found");
-    setTimeout(() => row.classList.remove("booth-found"), 1800);
-  };
+  title.onclick = (ev) => { ev.stopPropagation(); djJumpLive(); };
+  // #678: the same jump as its own control, a dot that pulses red while
+  // something is actually sounding — so there is an obvious thing to press
+  // rather than having to guess the title is clickable.
+  const dot = el("button", "", "●");
+  dot.id = "djLiveDot";
+  dot.title = "Jump to the line being said right now";
+  dot.style.cssText = "font-size:13px;line-height:1;padding:2px 7px;"
+    + "color:#5c6b82";
+  dot.onclick = (ev) => { ev.stopPropagation(); djJumpLive(); };
   // ⬇ the last stretch of the LIVE broadcast, cut on demand: a slider from
   // 30 seconds back to 15 minutes, then one mp3 straight to disk.
   const grab = el("button", "", "⬇");
@@ -37063,6 +37200,7 @@ function djTalkPopup() {
   shut.title = "Close — stays closed until you start a new session";
   shut.onclick = () => djTalkClose(true);
   head.appendChild(title);
+  head.appendChild(dot);                                        // #678
   head.appendChild(grab);
   head.appendChild(wipe);
   head.appendChild(mute);
@@ -39027,6 +39165,81 @@ function remotePlexus(host, stages) {
       try { renderer.dispose(); } catch (e) {}
     },
   };
+}
+
+/* #680: what tonight's callers are ringing in about. */
+async function themeLoad() {
+  const pick = document.getElementById("themePick");
+  if (!pick) return;
+  let got;
+  try { got = await api("/api/dj/themes"); } catch (e) { return; }
+  window._themes = got;
+  pick.textContent = "";
+  const roam = el("option", "", "— let them roam —");
+  roam.value = "";
+  if (!got.active) roam.selected = true;
+  pick.appendChild(roam);
+  (got.themes || []).forEach((t) => {
+    const o = el("option", "", t.name);
+    o.value = t.name;
+    o.title = t.text || "";
+    if (t.name === got.active) o.selected = true;
+    pick.appendChild(o);
+  });
+  const slider = document.getElementById("themeStrength");
+  const shown = document.getElementById("themeStrengthVal");
+  if (slider) slider.value = String(got.strength);
+  if (shown) shown.textContent = got.strength + "%";
+}
+
+async function themeActivate() {
+  const pick = document.getElementById("themePick");
+  try {
+    const got = await api("/api/dj/themes", {method: "POST",
+      body: JSON.stringify({active: pick.value})});
+    setStatus(got.active
+      ? "callers are ringing in about " + got.active
+        + " — about " + got.strength + "% of them"
+      : "callers are back to roaming");
+  } catch (e) { setStatus(e.message, true); }
+}
+
+async function themeStrength() {
+  const slider = document.getElementById("themeStrength");
+  const shown = document.getElementById("themeStrengthVal");
+  if (shown) shown.textContent = slider.value + "%";
+  try {
+    await api("/api/dj/themes", {method: "POST",
+      body: JSON.stringify({strength: Number(slider.value)})});
+  } catch (e) { setStatus(e.message, true); }
+}
+
+async function themeAdd() {
+  const text = (document.getElementById("themeText") || {}).value || "";
+  const name = (document.getElementById("themeName") || {}).value || "";
+  if (!text.trim()) {
+    setStatus("say what they are ringing in about", true);
+    return;
+  }
+  try {
+    await api("/api/dj/themes", {method: "POST",
+      body: JSON.stringify({add: {name: name.trim(), text: text.trim()}})});
+    document.getElementById("themeText").value = "";
+    document.getElementById("themeName").value = "";
+    await themeLoad();
+    setStatus("that is what they are calling about now");
+  } catch (e) { setStatus(e.message, true); }
+}
+
+async function themeDrop() {
+  const pick = document.getElementById("themePick");
+  if (!pick || !pick.value) { setStatus("nothing selected to forget"); return; }
+  try {
+    await api("/api/dj/themes", {method: "POST",
+      body: JSON.stringify({remove: pick.value})});
+    await themeLoad();
+    setStatus("forgotten — the callers roam again unless you pick another");
+  } catch (e) { setStatus(e.message, true); }
 }
 
 /* #674: pin the whole DJ universe to one document.
@@ -41246,6 +41459,42 @@ let djVoiceLive = 0;                     // clips actually sounding right now
 // What is coming out of the speakers THIS second (#651, #653).
 let djVoiceNow = null;
 
+/* #670/#678: go to the line that is going out RIGHT NOW and mark it.
+ *
+ * Shared by the "In the booth" title and the ● dot beside it. The live line
+ * already carries a pulsing outline, but once you have scrolled back
+ * through the night it is somewhere off-screen with no way home; this is
+ * the way home. */
+function djJumpLive() {
+  const log = document.getElementById("djTalkLog");
+  if (!log) return;
+  // Scrolling back sets a flag that stops the auto-follow. Asking to be
+  // taken to the live line is asking for that flag to be cleared.
+  log._userScrolled = false;
+  const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
+  let row = null;
+  if (want) {
+    log.querySelectorAll("[data-said]").forEach((r) => {
+      if (!row && r.getAttribute("data-said") === want) row = r;
+    });
+  }
+  if (!row) row = log.querySelector(".booth-live");
+  if (!row) {
+    // Nothing is sounding — the honest answer is the newest line, and
+    // saying so beats a click that appears to do nothing.
+    const all = log.querySelectorAll("[data-said]");
+    row = all.length ? all[all.length - 1] : null;
+    setStatus(row ? "nothing is going out — this is the last line said"
+                  : "the booth has not said anything yet");
+  }
+  if (!row) return;
+  try { row.scrollIntoView({block: "center", behavior: "smooth"}); }
+  catch (e) { row.scrollIntoView(); }
+  // A flash, so the eye lands on it even in a wall of identical rows.
+  row.classList.add("booth-found");
+  setTimeout(() => row.classList.remove("booth-found"), 1800);
+}
+
 /* Put the pulsing outline on the line that is sounding, and take it off
  * everything else. Called when a clip starts and when one finishes, so the
  * mark moves with the audio rather than with the transcript. */
@@ -41263,6 +41512,18 @@ function djTalkMarkLive() {
   // that is going out right now.
   if (found && !log._userScrolled) {
     try { found.scrollIntoView({block: "nearest"}); } catch (e) {}
+  }
+  // #678: the dot carries the same state as the outline — red and pulsing
+  // while something is genuinely sounding, grey when the booth is quiet —
+  // so it reads as a live indicator, not just a button.
+  const dot = document.getElementById("djLiveDot");
+  if (dot) {
+    const live = !!found;
+    dot.style.color = live ? "#ff5f5f" : "#5c6b82";
+    dot.style.animation = live ? "boothPulse 1.5s ease-in-out infinite" : "";
+    dot.title = live
+      ? "Jump to the line being said right now"
+      : "Nothing is going out — jump to the last line said";
   }
 }
 
@@ -53865,6 +54126,7 @@ function startLiveActivity() {
   djBanLoad();
   remoteDotPaint();               // #652
   docLockPaint();                 // #674
+  themeLoad();                    // #680
   // The lock expires on its own, so the button has to notice on its own too.
   setInterval(docLockPaint, 60000);
   djLoadLevels();
