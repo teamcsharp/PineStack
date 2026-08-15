@@ -5799,8 +5799,17 @@ _SILENCE_CLIP: dict[str, str] = {}
 
 
 def _silence_clip() -> dict[str, str]:
+    # Cached by PATH, and _media_prune cycles VOICE_MEDIA_DIR by file count
+    # and bytes without knowing this one is special — so the file could be
+    # deleted while this dict still pointed at it. Home Assistant then fed
+    # ffmpeg a missing file and logged "invalid start code [0][0][0][0] in
+    # RIFF header", the announce raised, and the line went to the hold
+    # shelf instead of the box. Verify it is still there; rebuild if not.
     if _SILENCE_CLIP:
-        return _SILENCE_CLIP
+        _key = str(_SILENCE_CLIP.get("path") or "").rsplit("/", 1)[-1]
+        if _key and (VOICE_MEDIA_DIR / _key).is_file():
+            return _SILENCE_CLIP
+        _SILENCE_CLIP.clear()
     import struct
     import wave
     key = uuid.uuid4().hex + ".wav"
@@ -5840,15 +5849,15 @@ def _airtime_note(expected: float, actual: float) -> None:
            "ratio": round(min(1.0, actual / expected), 2)}
     _AIRTIME.append(row)
     del _AIRTIME[:-60]
-    # The stutter guard used to require `expected > 6` — and the tightening
-    # ratchet below had already driven the slider to its 4s floor, which
-    # makes every clip about 4.3s. So the recovery was switched off at
-    # exactly the clip length the ratchet had forced the box down to, and
-    # the device was left stutter-looping its last buffer until somebody
-    # unplugged it (#712). Nudge on any clip long enough to measure; leave
-    # the SLIDER ratchet on the old threshold, since tightening below 6s
-    # buys nothing and is how it reached the floor in the first place.
-    cut = expected > 1.5 and actual < expected * 0.6
+    # This threshold stays at 6s, and the reason is worth writing down.
+    # Lowering it to 1.5s looked right — the ratchet had driven clips to
+    # ~4.3s, so the stutter recovery never fired at the length the box
+    # actually ran at. But the nudge is itself an ANNOUNCE, and the box
+    # plays one at a time: firing one after every short line doubled the
+    # announce traffic and helped bury the device (#712). The short-clip
+    # stutter is handled by the 900ms of tail silence in _level_voice
+    # instead, which costs no extra announce at all.
+    cut = expected > 6 and actual < expected * 0.6
     if cut:
         pipeline_log("air", f"clip cut short: {actual:.0f}s of "
                             f"{expected:.0f}s reached the room (#423)",
@@ -5865,7 +5874,7 @@ def _airtime_note(expected: float, actual: float) -> None:
         # sections the box CAN finish. It never auto-raises (the probe
         # does that); it only backs off to keep replies whole.
         _CUTSHORT_STREAK[0] += 1
-        if expected > 6 and _CUTSHORT_STREAK[0] >= 3:
+        if _CUTSHORT_STREAK[0] >= 3:
             _CUTSHORT_STREAK[0] = 0
             try:
                 cur = int(dj_settings()["say_max_seconds"])
@@ -9828,6 +9837,41 @@ async def box_hold_watch() -> None:
     while True:
         await asyncio.sleep(20)
         try:
+            # #712: the breaker LATCHES, and nothing ever closed it. Anything
+            # that makes announces fail for a couple of minutes — Home
+            # Assistant restarting, a flooded satellite, a silence clip the
+            # media pruner deleted — fills the shelf, and six held lines is
+            # all `box_down` reads. The box then came back healthy while the
+            # station went on mirroring to the browser, silent, until somebody
+            # toggled the switch by hand. That happened four times in one
+            # evening before anyone worked out what it was.
+            #
+            # So: if the box is switched on and its Home Assistant entity is
+            # available again, the fault is over. Close the breaker and clear
+            # the backlog it was being measured from — the stale sweep below
+            # is what decides whether anything held is still worth playing.
+            if box_talk_ok() and (
+                    float(_BOX_DOWN.get("until") or 0) > time.time()
+                    or len(_BOX_HOLD) >= 6):
+                try:
+                    link = await satellite_status()
+                except Exception:  # noqa: BLE001
+                    link = {"online": False}
+                if link.get("online"):
+                    was_held = len(_BOX_HOLD)
+                    _BOX_DOWN["until"] = 0.0
+                    _BOX_DOWN["fails"] = 0
+                    _RADIO.pop("repairing", None)
+                    if was_held >= 6:
+                        _BOX_HOLD.clear()
+                        _box_hold_save()
+                    pipeline_log(
+                        "air", "the box is answering again — breaker closed "
+                               "(#712)",
+                        extra=(f"{was_held} line(s) were held and the station "
+                               "had written the box off; its Home Assistant "
+                               "entity is available again, so it is back in "
+                               "the rotation without anyone toggling it."))
             if not _BOX_HOLD:
                 continue
             # #690: throwing away dialogue that is too old to air needs no
@@ -18402,7 +18446,17 @@ def _call_concat_blocking(paths: list[str],
             os.unlink(tmp)
         except OSError:
             pass
-    return blob if len(blob) > 4000 else None
+    if len(blob) <= 4000:
+        return None
+    # …and end it on silence, like every other clip (#493, #712). This path
+    # returns its blob straight to the caller without going through
+    # _level_voice, so the coalesced stream — which is the DEFAULT for
+    # banter and calls, and therefore most of what the box ever plays —
+    # was the one clip that arrived with no tail padding at all. It stopped
+    # dead on the last syllable, and the box looped that syllable until it
+    # was unplugged. The loudness pass and limiter above already did the
+    # levelling; this only adds the beat of quiet for the buffer to repeat.
+    return _wav_tail_pad(blob, int(os.getenv("BOX_TAIL_MS", "900")))
 
 
 def _desk_sound(label: str, seconds: float = 0.0) -> None:
@@ -18613,6 +18667,14 @@ def say_max_chars() -> int:
 # the slider has made the individual pieces (#710, #722).
 SAY_TURN_BUDGET = 2600
 
+# …but a chunk is an ANNOUNCE, and the box can only play one at a time.
+# Budgeting characters alone took a turn at the 4s slider from ten announces
+# to forty-three, and Home Assistant answered with a wall of
+# SatelliteBusyError while the box wedged and its Wyoming port went dark
+# (#712). Whatever the arithmetic says, one turn may not queue more than
+# this many separate announces at the device.
+SAY_MAX_ANNOUNCES = 16
+
 
 def say_max_chunks(cap: int) -> int:
     """How many chunks one turn may occupy.
@@ -18622,8 +18684,12 @@ def say_max_chunks(cap: int) -> int:
     chunk is 60 characters, so a turn was capped at ~600 — and the model's
     1,900-character replies lost two thirds of themselves with nothing but a
     line in the glass to show for it. Budget characters instead, so lowering
-    the slider makes the PIECES shorter without making the TURN shorter."""
-    return max(10, min(60, SAY_TURN_BUDGET // max(1, cap)))
+    the slider makes the PIECES shorter without making the TURN shorter.
+
+    Bounded by SAY_MAX_ANNOUNCES, because each chunk is a separate announce
+    at the box and it plays them one at a time. Trading truncation for a
+    flooded device is not a trade worth making."""
+    return max(10, min(SAY_MAX_ANNOUNCES, SAY_TURN_BUDGET // max(1, cap)))
 
 
 def sentence_chunks(text: str, cap: int = 300, most: int = 10) -> list[str]:
@@ -27404,6 +27470,66 @@ async def dj_guest_activate(
     dj = dj_settings()
     return {"ok": True, "on": bool(dj.get("guest_mode")),
             "active": dj.get("guest_id") or ""}
+
+
+GUEST_EXITS = (
+    "they gather their things loudly and knock something over on the way out",
+    "they linger in the doorway with one more thought nobody asked for",
+    "they leave briskly, as though they have somewhere far better to be",
+    "they hug both hosts, which surprises everyone including them",
+    "they promise to come back, and everyone knows they will not",
+    "they walk out mid-sentence, still talking, fading down the corridor",
+)
+
+
+@app.post("/api/dj/guest/send-home")
+async def dj_guest_send_home(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """See the guest out properly (#718).
+
+    Clearing the third seat was already possible, but it happened in silence —
+    the guest simply stopped existing mid-show. This plays the leaving: the
+    guest says goodbye in their own words, the pair see them off, and then the
+    two of them talk about the interview that just happened before picking the
+    show back up. The seat clears only once that round has actually finished,
+    so the guest is still in the room while they are saying goodbye."""
+    require_auth(authorization)
+    guest = active_guest()
+    if not guest:
+        raise HTTPException(status_code=400,
+                            detail="Nobody is in the studio to send home.")
+    name = str(guest.get("name") or "the guest")
+    angle = (
+        f"THE INTERVIEW IS OVER and {name} is leaving the studio. Play it out "
+        "in this order and do not rush it. FIRST the pair wind the "
+        f"conversation up and thank {name} — warmly, awkwardly, or with "
+        "obvious relief, whichever is true of how it actually went. THEN "
+        f"{name} says goodbye in their OWN words, in character, with one last "
+        "remark that is unmistakably theirs. THEN they go — "
+        f"{random.choice(GUEST_EXITS)} — and the pair react to the empty "
+        f"chair. FINALLY the two of them talk ABOUT {name} now that they are "
+        "gone: what they made of them, what was said that they are still "
+        "chewing on, whether they would have them back. Be honest and funny "
+        "about it, disagree with each other if you do, and do not tidy it "
+        "into a verdict. Then get straight back to work — the show carries "
+        "on.")
+
+    async def _farewell() -> None:
+        try:
+            await dj_banter(_RADIO.get("now"), angle=angle,
+                            lines=random.randint(8, 13))
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"guest farewell died: {exc}"[:200])
+        finally:
+            # Only now is the chair actually empty (#718).
+            set_guest(None)
+            note_action(f"{name} left the studio")
+
+    fire_and_forget(_farewell())
+    return {"ok": True, "leaving": name,
+            "note": f"{name} is saying goodbye — the seat clears when the "
+                    "round finishes"}
 
 
 @app.post("/api/dj/callers/{caller_id}/to-guest")
@@ -40235,13 +40361,18 @@ function boothGlass() {
     + "border:1px solid var(--border);background:#060b14;overflow:hidden";
   const canvas = document.createElement("canvas");
   canvas.id = "boothSpec";
-  canvas.style.cssText = "display:block;width:100%;height:54px";
+  // #705: 54px of spectrogram inside a panel this narrow left a sliver you
+  // could see moving but not read. The trace needs vertical room for its
+  // frequency axis to mean anything, and the room strip under it was being
+  // squeezed to a single wrapped line of 10px text.
+  canvas.style.cssText = "display:block;width:100%;height:104px";
   wrap.appendChild(canvas);
   // Who is in the room, and which of them has the mic.
   const room = el("div", "", "");
   room.id = "boothRoom";
-  room.style.cssText = "display:flex;gap:4px;align-items:center;flex-wrap:wrap;"
-    + "padding:3px 5px;border-top:1px solid var(--border);font-size:10px";
+  room.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;"
+    + "padding:6px 7px;border-top:1px solid var(--border);font-size:11.5px;"
+    + "line-height:1.5";
   wrap.appendChild(room);
   // The sale, circulating.
   const sell = el("div", "", "");
@@ -41710,7 +41841,15 @@ function sleeveInto(frame, track, size) {
   if (!track.art) return;
   const image = document.createElement("img");
   image.alt = "";
-  image.loading = "lazy";
+  // #711: EAGER, deliberately. These sleeves sit in a horizontally scrolling,
+  // CSS-3D-transformed deck, and a transformed ancestor is enough for the
+  // browser to decide a lazy image is not "in the viewport" — so the real
+  // artwork never downloaded and every record sat there as generated
+  // initials, even though the art was embedded in the file and the endpoint
+  // was serving it. The deck is about a dozen tiles; fetching them outright
+  // costs far less than the sleeves being wrong.
+  image.loading = "eager";
+  image.decoding = "async";
   image.style.cssText = "position:absolute;inset:0;width:100%;height:100%;"
     + "object-fit:cover";
   // Only replace the generated sleeve once a real one has actually decoded.
@@ -43418,6 +43557,52 @@ async function docLockPanel() {
     return Math.round(s / 86400) + "d ago";
   };
 
+  // #708: find the document instead of scrolling for it. Typing filters by
+  // NAME instantly (no round trip); three characters or more also runs the
+  // semantic search over the swath index, so a phrase you half-remember
+  // finds the file that contains it even when the filename says nothing.
+  // The clock button replays earlier searches - these names are three
+  // letters and a digit, and nobody remembers which one had it in it.
+  let docHits = null;
+  const findRow = el("div", "", "");
+  findRow.style.cssText = "display:flex;gap:6px;align-items:center;"
+    + "margin-bottom:6px";
+  const find = document.createElement("input");
+  find.type = "search";
+  find.placeholder = "Search the folder \u2014 a name, or words inside a document";
+  find.style.cssText = "flex:1;min-width:0;font-size:12px;padding:5px 8px";
+  findRow.appendChild(find);
+  const recentBtn = el("button", "", "\u{1f553}");
+  recentBtn.title = "Recent searches";
+  recentBtn.style.cssText = "flex:0 0 auto;font-size:13px;padding:4px 8px";
+  findRow.appendChild(recentBtn);
+  const found = el("div", "muted", "");
+  found.style.cssText = "font-size:10.5px;margin:-2px 0 6px;min-height:13px";
+  body.appendChild(findRow);
+  body.appendChild(found);
+  const recentGet = () => {
+    try { return JSON.parse(localStorage.docFindRecent || "[]"); }
+    catch (e) { return []; }
+  };
+  const recentAdd = (q) => {
+    if (!q) return;
+    const rows = recentGet().filter((x) => x !== q);
+    rows.unshift(q);
+    try { localStorage.docFindRecent = JSON.stringify(rows.slice(0, 12)); }
+    catch (e) { /* private mode - the search still works */ }
+  };
+  recentBtn.onclick = () => {
+    const rows = recentGet();
+    if (!rows.length) { found.textContent = "nothing searched yet"; return; }
+    found.textContent = "";
+    rows.forEach((q) => {
+      const chip = el("button", "", q);
+      chip.style.cssText = "font-size:10.5px;padding:1px 7px;margin:0 4px 4px 0";
+      chip.onclick = () => { find.value = q; applyFind(); };
+      found.appendChild(chip);
+    });
+  };
+
   let chosen = lock.on ? lock.doc : "";
   const list = el("div", "", "");
   list.style.cssText = "max-height:230px;overflow-y:auto;margin-bottom:8px;"
@@ -43469,6 +43654,55 @@ async function docLockPanel() {
     list.appendChild(el("div", "muted", "The folder is empty."));
     list.lastChild.style.cssText = "padding:10px;font-size:11.5px";
   }
+
+  // #708: the name filter is instant; the content search is debounced so it
+  // does not fire an embedding lookup on every keystroke.
+  function applyFind() {
+    const q = find.value.trim().toLowerCase();
+    let shown = 0;
+    list.querySelectorAll(".doclock-row").forEach((r) => {
+      const name = (r.dataset.doc || "").toLowerCase();
+      const hit = !q || name.indexOf(q) !== -1
+        || (docHits && docHits[r.dataset.doc]);
+      r.style.display = hit ? "" : "none";
+      if (hit) shown++;
+      const was = r.querySelector(".doc-hit");
+      if (was) was.remove();
+      const passage = docHits && docHits[r.dataset.doc];
+      if (hit && passage) {
+        const pv = el("div", "doc-hit muted", "\u201c" + passage + "\u201d");
+        pv.style.cssText = "flex:1 0 100%;font-size:10px;opacity:.75;"
+          + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+        r.appendChild(pv);
+      }
+    });
+    if (!q) { found.textContent = ""; return; }
+    found.textContent = shown + (shown === 1 ? " document" : " documents")
+      + (docHits ? " \u00b7 including matches on what is inside them" : "");
+  }
+  let findTimer = 0;
+  find.oninput = () => {
+    docHits = null;
+    applyFind();
+    clearTimeout(findTimer);
+    const q = find.value.trim();
+    if (q.length < 3) return;
+    findTimer = setTimeout(async () => {
+      try {
+        const got = await api("/api/speakbox/search?k=12&q="
+                              + encodeURIComponent(q));
+        if (find.value.trim() !== q) return;
+        docHits = {};
+        (got.hits || []).forEach((h) => {
+          if (h.file && !docHits[h.file]) {
+            docHits[h.file] = String(h.text || "").slice(0, 120);
+          }
+        });
+        recentAdd(q);
+        applyFind();
+      } catch (e) { /* name filtering still works without the index */ }
+    }, 420);
+  };
   const hint = el("div", "muted",
     "Ordered by what the show is actually living in. Hover a row for two "
     + "seconds to read it.");
@@ -44482,7 +44716,18 @@ async function djGuestRefresh() {
         + (seated ? "Take them out of the studio"
                   : (seatedElse ? "Put them in instead of whoever is in there"
                                 : "Put them in the third chair"))
-        + "\">" + btn + "</button><button onclick=\"djGuestDelete('"
+        + "\">" + btn + "</button>"
+        // #718: seeing them OUT is a different act from clearing the
+        // chair — the goodbye, the door, and the pair talking about
+        // the interview once it is just the two of them again. Only
+        // offered for whoever is actually sitting there.
+        + (seated
+           ? "<button onclick=\"djGuestSendHome()\" style='font-size:12px' "
+             + "title=\"They say goodbye, the hosts see them off, and "
+             + "the pair talk about the interview before getting back "
+             + "to work\">🚪 send home</button>"
+           : "")
+        + "<button onclick=\"djGuestDelete('"
         + djGuestEsc(g.id) + "')\" style='font-size:12px'>✕</button></div>";
     }
   }
@@ -44616,6 +44861,17 @@ async function djGuestToggle(on) {
  * in a different place doing what looks like the same job. Now the button
  * beside a guest walks all three states from one spot: seat this guest,
  * seat this one INSTEAD of whoever is in the chair, or empty the chair. */
+/* #718: play the guest out instead of deleting them from the room. */
+async function djGuestSendHome() {
+  try {
+    const got = await api("/api/dj/guest/send-home",
+                          { method: "POST", body: "{}" });
+    setStatus((got.leaving || "the guest") + " is saying goodbye "
+              + "— the chair clears when the round finishes");
+  } catch (e) { setStatus("could not send them home: " + e.message, true); }
+  await djGuestRefresh();
+}
+
 async function djGuestActivate(id) {
   const data = window._djGuestState || {};
   const seated = !!data.on && data.active === id;
