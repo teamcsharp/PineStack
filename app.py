@@ -57265,6 +57265,21 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     border: 1px solid #24344a; background: #0a1119; color: #e6edf5;
   }
   .row { display: flex; gap: 8px; }
+  /* The two levels, at the very top: this page had none, so a listener on a
+     phone could only turn the whole broadcast up or down together. */
+  .levels {
+    display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+    border: 1px solid #1b2735; border-radius: 14px; background: #070b12;
+    padding: 10px 14px; margin-bottom: 14px;
+  }
+  .lev { display: flex; align-items: center; gap: 8px; flex: 1 1 200px; }
+  .lev label { color: #8fa3ba; font-size: 12px; flex: 0 0 auto; }
+  .lev .val { color: #7f8ea3; font-size: 12px; width: 38px;
+              text-align: right; flex: 0 0 auto; }
+  input[type=range] {
+    flex: 1; min-width: 90px; padding: 0; border: 0; background: none;
+    accent-color: #4bb3ff; height: 22px;
+  }
   .patter {
     margin-top: 14px; max-height: 210px; overflow-y: auto; font-size: 13px;
   }
@@ -57278,6 +57293,25 @@ RADIO_PAGE_HTML = r"""<!doctype html>
 <div class="set">
   <h1>Pine Box FM</h1>
   <div class="sub" id="sub">Tune in to hear what everyone else is hearing.</div>
+
+  <!-- The mix, at the top where you can reach it. Music sits at half by
+       default and the DJs at full: the records are the bed, the talk is the
+       thing you tuned in for, and on a phone speaker a record at full level
+       buries them. -->
+  <div class="levels">
+    <div class="lev">
+      <label for="lvMusic">🎵 music</label>
+      <input id="lvMusic" type="range" min="0" max="100" value="50"
+             oninput="setLevels()">
+      <span class="val" id="lvMusicVal">50%</span>
+    </div>
+    <div class="lev">
+      <label for="lvVoice">🎙 DJs</label>
+      <input id="lvVoice" type="range" min="0" max="100" value="100"
+             oninput="setLevels()">
+      <span class="val" id="lvVoiceVal">100%</span>
+    </div>
+  </div>
 
   <div class="dial">
     <div class="on"><span class="dot" id="dot"></span>
@@ -57331,6 +57365,49 @@ const ME = sessionStorage.getItem("pbfm") ||
 
 let audio = null, voice = null, playing = false, trackId = "", voiceSeen = 0;
 let trackUrl = "";
+
+/* ---- The two levels ----------------------------------------------------
+ * The records and the talk are separate elements on this page, so they can
+ * be set separately — which is the whole reason the sliders can exist. The
+ * defaults are music at half and the DJs at full. Ducking is applied ON TOP
+ * of the music level rather than by overwriting it, so a slider moved while
+ * a DJ is mid-sentence does the right thing and the music comes back to
+ * where you left it, not to where the duck found it. */
+let musicLevel = 0.5, voiceLevel = 1, ducking = false;
+
+function applyLevels() {
+  if (audio) {
+    // A duck to 30% of wherever the slider is, so the control stays
+    // meaningful at every position instead of flattening to one floor.
+    audio.volume = Math.max(0, Math.min(1,
+      musicLevel * (ducking ? 0.3 : 1)));
+  }
+  if (voice) voice.volume = Math.max(0, Math.min(1, voiceLevel));
+}
+
+function setLevels(save) {
+  const m = document.getElementById("lvMusic");
+  const v = document.getElementById("lvVoice");
+  musicLevel = Number(m.value) / 100;
+  voiceLevel = Number(v.value) / 100;
+  document.getElementById("lvMusicVal").textContent = m.value + "%";
+  document.getElementById("lvVoiceVal").textContent = v.value + "%";
+  try {
+    localStorage.pbfmMusic = m.value;
+    localStorage.pbfmVoice = v.value;
+  } catch (e) { /* private browsing — the levels just do not persist */ }
+  applyLevels();
+}
+
+function initLevels() {
+  const m = document.getElementById("lvMusic");
+  const v = document.getElementById("lvVoice");
+  let saved = {};
+  try { saved = localStorage; } catch (e) { saved = {}; }
+  if (saved.pbfmMusic != null) m.value = saved.pbfmMusic;
+  if (saved.pbfmVoice != null) v.value = saved.pbfmVoice;
+  setLevels();
+}
 
 // A shared tune-in link hands this page a TOKEN, not the key (#632). It
 // looks like "<expiry>.<tag>.<signature>", so anything of that shape rides
@@ -57499,22 +57576,22 @@ async function poll() {
 // last one. They queue and take their turn (#175, #208).
 const voiceQueue = [];
 let voiceBusy = false;
-let duckedFrom = 0;
 
 function voiceNext() {
   if (voiceBusy || !voiceQueue.length) return;
   const clip = voiceQueue.shift();
   voiceBusy = true;
   // Duck the music under the DJ, exactly like a real one talking over it.
-  // The level is captured once, before the first clip of the run: taken per
-  // clip it would capture the already-ducked value and never come back up.
-  if (!duckedFrom) duckedFrom = audio.volume || 1;
-  audio.volume = Math.min(duckedFrom, 0.22);
+  // A flag, not a captured level: the old version read audio.volume before
+  // the first clip of a run and wrote it back after, which meant a slider
+  // moved mid-round was undone the moment the DJ stopped talking.
+  ducking = true;
+  applyLevels();
   const done = () => {
     voiceBusy = false;
     if (voiceQueue.length) { voiceNext(); return; }
-    audio.volume = duckedFrom;
-    duckedFrom = 0;
+    ducking = false;
+    applyLevels();
   };
   voice.onended = done;
   voice.onerror = done;
@@ -57528,6 +57605,7 @@ function tune() {
   if (!audio) {
     audio = new Audio(); audio.preload = "auto";
     voice = new Audio(); voice.preload = "auto";
+    applyLevels();          // the sliders were set before either existed
   }
   playing = !playing;
   document.getElementById("tune").textContent = playing ? "Stop" : "Tune in";
@@ -57631,6 +57709,7 @@ async function request() {
   }
 }
 
+initLevels();
 poll();
 setInterval(poll, 3000);
 setInterval(clockPoll, 1500);   // the cheap one, often — stays on cue (#631)
