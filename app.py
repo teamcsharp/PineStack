@@ -548,6 +548,8 @@ DEFAULT_DJ = {
     # #699: what share of callers ring in on a voice from YOUR library
     # rather than the stock Piper bank. Was a hardcoded 45.
     "clone_caller_pct": 70,
+    # #700: the music bed under an ad, as a share of the read.
+    "ad_bed_pct": 30,
 }
 
 
@@ -960,6 +962,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "records_first": bool(raw_dj.get("records_first", True)),   # #689
         "clone_caller_pct": max(0, min(100, int(                    # #699
             raw_dj.get("clone_caller_pct", 70) or 0))),
+        "ad_bed_pct": max(2, min(100, int(                          # #700
+            raw_dj.get("ad_bed_pct", 30) or 30))),
     }
     # The default personas hard-code the station name ("…on Pine Box FM…"), so a
     # renamed station left the DJs still saying the OLD name from the persona
@@ -12236,6 +12240,17 @@ def _music_bed_track() -> dict[str, Any] | None:
     return random.choice(pool)
 
 
+def _ad_bed_share() -> float:
+    """How loud the music sits under an ad read (#700), as a share of the
+    voice. A flat 0.85 of the record's own master was the fault: a hot master
+    came out over the top of the read. Settable, because "how loud is the
+    bed" is a taste."""
+    try:
+        return max(2, min(100, int(dj_settings().get("ad_bed_pct", 30)))) / 100
+    except Exception:
+        return 0.30
+
+
 def _music_ad_mix_blocking(voice_path: Path, music_path: str,
                            voice_seconds: float, start: float,
                            sfx_path: str | None = None) -> bytes | None:
@@ -12253,16 +12268,30 @@ def _music_ad_mix_blocking(voice_path: Path, music_path: str,
     lead, tail = 2.3, 3.0
     total = lead + max(1.0, voice_seconds) + tail
     lead_ms = int(lead * 1000)
-    # THE BUG THAT KEPT EVERY AD DRY: a filter_complex pad may be consumed
-    # exactly ONCE, and [vox] was fed to BOTH the sidechain and the final
-    # amix — ffmpeg rejected the whole graph, the mixer returned nothing,
-    # and the ad silently fell back to the dry read. Split the voice first.
+    # #700: the bed is NORMALIZED and then held at a fixed share of the read.
+    #
+    # It used to be a flat volume=0.85 on whatever the record's own master
+    # happened to be — so a loud master came out louder than the voice and
+    # the ad blasted. Two different faults in one number: no reference level,
+    # and a share nobody could set. loudnorm gives both tracks a known
+    # loudness, and the bed then sits at ad_bed_pct of the read (30% by
+    # default) BEFORE the sidechain ducks it further under the words.
+    bed_share = max(0.02, min(1.0, _ad_bed_share()))
     graph = (
         f"[1:a]atrim=0:{total:.2f},asetpts=PTS-STARTPTS,"
+        # Same reference as the read (below), so "30%" is 30% OF THE
+        # VOICE and not of some other yardstick.
+        "loudnorm=I=-16:LRA=11:TP=-2.0,"
         f"afade=t=in:st=0:d={lead:.2f},"
         f"afade=t=out:st={total - tail:.2f}:d={tail:.2f},"
-        "volume=0.85[bed];"
-        f"[0:a]adelay={lead_ms}|{lead_ms},apad=pad_dur={tail:.2f},"
+        f"volume={bed_share:.3f}[bed];"
+        # THE BUG THAT KEPT EVERY AD DRY: a filter_complex pad may be
+        # consumed exactly ONCE, and [vox] was fed to BOTH the sidechain and
+        # the final amix — ffmpeg rejected the whole graph, the mixer
+        # returned nothing, and the ad silently fell back to the dry read.
+        # Split the voice first.
+        f"[0:a]loudnorm=I=-16:LRA=11:TP=-1.5,"
+        f"adelay={lead_ms}|{lead_ms},apad=pad_dur={tail:.2f},"
         "asplit=2[voxduck][voxmix];"
         "[bed][voxduck]sidechaincompress=threshold=0.03:ratio=12:attack=15:"
         "release=350[duck];"
@@ -12275,7 +12304,8 @@ def _music_ad_mix_blocking(voice_path: Path, music_path: str,
         ins += ["-i", sfx_path]
         graph += (
             "[2:a]aresample=24000,aformat=sample_fmts=s16:channel_layouts=mono,"
-            "atrim=0:2.2,volume=0.7[stg];"
+            "atrim=0:2.2,loudnorm=I=-20:LRA=11:TP=-2.0,"
+            f"volume={bed_share * 0.9:.3f}[stg];"
             "[duck][voxmix]amix=inputs=2:duration=first:normalize=0[body];"
             "[body][stg]amix=inputs=2:duration=first:normalize=0,"
             "alimiter=limit=0.95[out]"
