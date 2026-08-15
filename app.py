@@ -538,6 +538,13 @@ DEFAULT_DJ = {
     # the record with callers folded in, instead of one round between tracks.
     # The 0-100 dial only shortens records; this changes the shape of the show.
     "talk_radio_mode": False,
+    # #689: the needle goes down FIRST. The pair used to research a track,
+    # write an intro, run an ad, a caller and a banter round — all of it
+    # into silence — and only then start the record. That is minutes of a
+    # music station with no music on it. On, the record starts, they
+    # introduce it over its own opening the way real radio does, and every
+    # other segment runs while it spins.
+    "records_first": True,
 }
 
 
@@ -947,6 +954,7 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "talk_radio": max(0, min(100, int(
             raw_dj.get("talk_radio", DEFAULT_DJ["talk_radio"]) or 0))),
         "talk_radio_mode": bool(raw_dj.get("talk_radio_mode", False)),
+        "records_first": bool(raw_dj.get("records_first", True)),   # #689
     }
     # The default personas hard-code the station name ("…on Pine Box FM…"), so a
     # renamed station left the DJs still saying the OLD name from the persona
@@ -8287,7 +8295,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    fx: dict[str, float] | None = None,
                    name: str = "", source_text: str = "",
                    clip: dict[str, Any] | None = None,
-                   sting: bool = True) -> str:
+                   sting: bool = True, note: str = "") -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
     told apart by ear, not only by the transcript. `source` is the speakbox
@@ -8333,8 +8341,11 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # `extra` it would BECOME the task for kinds where extra is the
         # task (interject, open), leaving the model an instruction about
         # delivery and nothing to deliver.
+        # `note` rides the same channel (#689): a standing instruction about
+        # the SITUATION — "the record is already turning under you" — which
+        # belongs with the delivery directive, not with the task.
         spoken = spoken_text(await dj_line(
-            kind, track, extra, seed, direct=perf_directive(vec)))
+            kind, track, extra, seed, direct=perf_directive(vec) + note))
         if not by_hand:
             spoken = inject_disfluencies(spoken, vec, seed=who)
     # A line with no letters in it is not a line. An interruption written as
@@ -8852,6 +8863,15 @@ def dj_state() -> dict[str, Any]:
                    if upnext else None),
         "on": bool(_RADIO["on"]),
         "station_name": dj_settings()["station_name"],
+        # Who is in the studio (#668): the booth glass shows the room and
+        # lights whoever currently has the mic. The names were only ever
+        # reachable through /api/settings, which the booth does not read.
+        "dj_names": {
+            "host": dj_settings().get("host_name") or "the host",
+            "cohost": dj_settings().get("cohost_name") or "the cohost",
+            "third": dj_settings().get("third_name") or "",
+            "guest": str((active_guest() or {}).get("name") or ""),
+        },
         "remaining": max(0.0, round(float(track.get("seconds") or 0) - elapsed, 1)),
         "upcoming": [
             {**{k: v for k, v in t.items() if k not in ("path", "search")},
@@ -8871,6 +8891,13 @@ def dj_state() -> dict[str, Any]:
                         (_RADIO["gallery_now"].get("images") or [])]}
             if (_RADIO.get("gallery_now")
                 and time.time() - _RADIO["gallery_now"]["at"] < 360)
+            else None),
+        # And what is being SOLD right now (#668) — the product in the ad
+        # currently on air, so the booth window can hold that up too.
+        "ad_now": (
+            {"product": _RADIO["ad_now"]["product"]}
+            if (_RADIO.get("ad_now")
+                and time.time() - _RADIO["ad_now"]["at"] < 180)
             else None),
         # Whether the box is actually carrying audio, so the booth/header can
         # show "not reaching the box" and a "the box is back" prompt (#490,
@@ -9088,6 +9115,30 @@ async def _dj_loop() -> None:
                     await dj_speak("station_id")
                     await asyncio.sleep(1.0)
 
+            # #689: THE NEEDLE GOES DOWN FIRST.
+            #
+            # Everything below this used to run into silence: a web lookup
+            # for what people make of the track, an intro written and
+            # synthesized, an ad, a memo, a caller, a whole banter round —
+            # and only then did the record start. Minutes of a music
+            # station with no music on it, every single track, which is
+            # exactly the complaint. Nothing about that work needs the air
+            # to be empty. So the record starts NOW, they introduce it over
+            # its own opening the way a real presenter does, and every
+            # segment after it plays out with the record turning
+            # underneath.
+            spin_first = bool(dj.get("records_first", True)) and not tape_slot
+            if spin_first:
+                if skip.is_set():
+                    skip.clear()
+                dj_on_air(track)
+                if (_RADIO.get("music_to") or "here") in ("box", "both"):
+                    await music_play_on_box(track)
+                pipeline_log(
+                    "air", "needle down first — "
+                    f"{track.get('title') or 'the record'} is turning while "
+                    "the pair work up the intro (#689)")
+
             # What people make of it, if we can find out (#121). A tape
             # from MX is not in any database worth asking.
             notes = ""
@@ -9111,13 +9162,25 @@ async def _dj_loop() -> None:
             else:
                 await dj_speak(
                     "request" if track.get("requested") else "intro",
-                    track, extra=notes)
+                    track, extra=notes,
+                    note=(" The record is ALREADY turning underneath you — "
+                          "you are talking over its opening, so name it and "
+                          "get out of the way rather than announcing "
+                          "something that is about to start."
+                          if spin_first else ""))
             await asyncio.sleep(1.0)
 
-            if (dj["ad_every"] and not tape_slot
-                    and played % dj["ad_every"] == 0
-                    # Don't stack on top of an ad the clock just ran (#515).
-                    and time.time() - float(_RADIO.get("last_ad") or 0) > 240):
+            # The ad slot. With the needle already down an ad belongs
+            # BETWEEN the records, not stacked on top of one — a bedded
+            # spot carries its own music — so it is held to the end of the
+            # track and run there (#689).
+            ad_due = bool(
+                dj["ad_every"] and not tape_slot
+                and played % dj["ad_every"] == 0
+                # Don't stack on top of an ad the clock just ran (#515).
+                and time.time() - float(_RADIO.get("last_ad") or 0) > 240)
+
+            async def _run_ad() -> None:
                 try:
                     # A third of the ad slots belong to the house (#354,
                     # #362): the engineering report with the machine's
@@ -9133,6 +9196,9 @@ async def _dj_loop() -> None:
                     await asyncio.sleep(1.0)
                 except Exception:
                     pass
+
+            if ad_due and not spin_first:
+                await _run_ad()
 
             # A memo from upstairs and a call are each their own segment, so
             # they replace the small talk on the tracks they land on rather
@@ -9194,12 +9260,15 @@ async def _dj_loop() -> None:
                 skip.clear()
                 continue
 
-            dj_on_air(track)
-            if (_RADIO.get("music_to") or "here") in ("box", "both"):
-                await music_play_on_box(track)
+            if not spin_first:
+                dj_on_air(track)
+                if (_RADIO.get("music_to") or "here") in ("box", "both"):
+                    await music_play_on_box(track)
 
             async def _hold(seconds: float) -> bool:
                 """Wait out the track. True means someone skipped."""
+                if seconds <= 0:
+                    return skip.is_set()
                 try:
                     await asyncio.wait_for(skip.wait(), timeout=seconds)
                     skip.clear()
@@ -9216,6 +9285,14 @@ async def _dj_loop() -> None:
             if talk > 50 and not tape_slot:
                 ceiling = 300.0 - (talk - 50) * 5.0      # 300s → 50s at 100
                 length = min(length, max(50.0, ceiling))
+            # #689: the record has been turning through all of that talk, so
+            # what is left to wait out is what is left of the record — not
+            # its whole length again. Talk that outran the track leaves zero,
+            # which is the loop's way of saying "next one, now".
+            if spin_first:
+                spent = max(0.0, time.time()
+                            - float(_RADIO.get("started") or time.time()))
+                length = max(0.0, length - spent)
 
             # Talk-show TORRENT (#618, reworked): records still spin, but the
             # pair never stop — banter/deep rounds run back to back THROUGH
@@ -9249,7 +9326,7 @@ async def _dj_loop() -> None:
                 continue                         # not a tape — straight on
 
             # Maybe say something in the middle, then wait out the rest.
-            if random.random() < dj["interject_rate"]:
+            if length > 25 and random.random() < dj["interject_rate"]:
                 cut = length * random.uniform(0.3, 0.7)
                 skip.clear()
                 if await _hold(cut):
@@ -9266,6 +9343,11 @@ async def _dj_loop() -> None:
             if track.get("tape"):
                 _RADIO["tape_outro_due"] = True
                 _RADIO["tape_last"] = track
+            # The ad break, in the gap where a break belongs (#689): the
+            # record has finished, the next one has not started, and a
+            # bedded spot brings its own music with it.
+            if ad_due and spin_first:
+                await _run_ad()
     finally:
         if skip in _DJ_SKIP:
             _DJ_SKIP.remove(skip)
@@ -10117,22 +10199,60 @@ def write_votes(votes: dict[str, dict[str, Any]]) -> None:
         temporary.replace(VOTES_PATH)
 
 
-def set_vote(track_id: str, vote: int, track: dict[str, Any] | None = None
-             ) -> dict[str, Any]:
+def set_vote(track_id: str, vote: int, track: dict[str, Any] | None = None,
+             at: float | None = None) -> dict[str, Any]:
+    """`at` is WHERE IN THE RECORD the thumb landed (#683) — seconds from
+    the top of the track, not the wall clock. A thumbs up is nearly always
+    pressed at a moment: the part that just made you reach for the button.
+    That moment is the hook, and the hook is what an ad wants under it."""
     with _VOTES_LOCK:
         votes = read_votes()
         if vote == 0:
             votes.pop(track_id, None)
         else:
             known = track or music_track(track_id) or {}
-            votes[track_id] = {
+            previous = votes.get(track_id) or {}
+            row = {
                 "vote": 1 if vote > 0 else -1,
                 "title": known.get("title", ""),
                 "artist": known.get("artist", ""),
                 "ts": int(time.time()),
             }
+            length = float(known.get("seconds") or 0)
+            marks = [float(m) for m in (previous.get("marks") or [])
+                     if isinstance(m, (int, float))]
+            if at is not None and float(at) >= 0:
+                spot = float(at)
+                if length > 1:
+                    spot = min(spot, max(0.0, length - 1.0))
+                # A song can have three good parts, so every marked moment
+                # is kept — not just the last one.
+                if all(abs(m - spot) > 5.0 for m in marks):
+                    marks.append(round(spot, 1))
+                row["at"] = round(spot, 1)
+            elif isinstance(previous.get("at"), (int, float)):
+                row["at"] = previous["at"]          # keep what we already knew
+            if marks:
+                row["marks"] = sorted(marks)[-8:]
+            votes[track_id] = row
         write_votes(votes)
         return votes.get(track_id, {"vote": 0})
+
+
+def loved_moment(track_id: str) -> float | None:
+    """The spot in a track he thumbed up (#683), or None if the like
+    predates the stamp. Several marks means several good parts — draw one
+    of them, so a run of ads bedded on the same song is not the same
+    fifteen seconds every time."""
+    row = read_votes().get(track_id) or {}
+    if (row.get("vote") or 0) <= 0:
+        return None
+    marks = [float(m) for m in (row.get("marks") or [])
+             if isinstance(m, (int, float))]
+    if marks:
+        return random.choice(marks)
+    spot = row.get("at")
+    return float(spot) if isinstance(spot, (int, float)) else None
 
 
 def banned_ids() -> set[str]:
@@ -11181,6 +11301,9 @@ async def dj_ad(product: str, remember: bool = True,
                 custom: bool = False) -> dict[str, Any]:
     """Write, speak and keep an ad read. A CUSTOM ad (one the DJs make on
     demand) always gets a sound effect mixed in and is kept a week (#464)."""
+    # What is being SOLD right now (#668), so the booth can hold it up the
+    # way it already holds up the paintings.
+    _RADIO["ad_now"] = {"product": str(product)[:160], "at": time.time()}
     line = await dj_speak("ad", _RADIO.get("now"), extra=product,
                           sting=not custom)
     # Custom ads always punch in an SFX (#464) — forced past the rate gate,
@@ -11351,6 +11474,59 @@ RADIO_CACHE = Path("/app/data/radio_cache")
 MUSIC_LOG_PATH = RADIO_CACHE / "music_log.jsonl"
 _MUSIC_LOG_LOCK = RLock()
 
+# THE FULL-MIX SHELF (#667). The talk/sfx shelf collects itself as the show
+# runs; the full mix — the broadcast as it SOUNDED, records mixed back in and
+# ducked — was a button you had to press, which is the one thing that never
+# gets pressed at the moment worth keeping. So every sealed episode gets a
+# mixed twin rendered behind it and shelved here, and the tab that lists them
+# is the same tab as the talk one: a player, an mp3, a transcript, per row.
+BROADCASTS_DIR = RADIO_CACHE / "broadcasts"
+MIX_LEVELS_PATH = RADIO_CACHE / "mix_levels.json"
+BROADCASTS_KEPT = 120
+# Only one full mix at a time: every second of the span is decoded and
+# re-encoded, and two of them racing would fight over ffmpeg and the disk.
+_MIX_GATE: list[Any] = []
+
+
+def _cache_folder(kind: str) -> Path:
+    """Which shelf a kind names. Three of them now (#667)."""
+    if kind == "calls":
+        return RADIO_CACHE / "calls"
+    if kind == "broadcasts":
+        return BROADCASTS_DIR
+    return RADIO_CACHE / "episodes"
+
+
+def mix_levels() -> dict[str, float]:
+    """The levels the collected mixes are rendered at (#667) — the same
+    three the browser's own mixer offers, kept server-side because the
+    collector runs whether or not a browser is open."""
+    out = {"music": 100.0, "duck": 70.0, "voice": 100.0}
+    try:
+        saved = json.loads(MIX_LEVELS_PATH.read_text())
+        for key in out:
+            if isinstance(saved.get(key), (int, float)):
+                out[key] = float(saved[key])
+    except Exception:
+        pass
+    out["music"] = max(0.0, min(200.0, out["music"]))
+    out["duck"] = max(0.0, min(90.0, out["duck"]))
+    out["voice"] = max(25.0, min(200.0, out["voice"]))
+    return out
+
+
+def mix_levels_save(music: float, duck: float, voice: float) -> dict[str,
+                                                                    float]:
+    levels = {"music": max(0.0, min(200.0, float(music))),
+              "duck": max(0.0, min(90.0, float(duck))),
+              "voice": max(25.0, min(200.0, float(voice)))}
+    try:
+        RADIO_CACHE.mkdir(parents=True, exist_ok=True)
+        MIX_LEVELS_PATH.write_text(json.dumps(levels))
+    except OSError:
+        pass
+    return levels
+
 
 def station_slug() -> str:
     """The station's name, fit for a filename (#648)."""
@@ -11493,9 +11669,13 @@ def _episode_stage(media_path: str, text: str,
         pass
 
 
-def _episode_finalize() -> None:
+def _episode_finalize() -> dict[str, Any] | None:
     """Concat the staged clips into ONE compressed mp3 episode + a transcript,
-    then clear the staging and start a fresh episode (#548)."""
+    then clear the staging and start a fresh episode (#548).
+
+    Returns what it sealed — the base path and the wall-clock window it
+    covers — so the full-mix collector can render the mixed twin of exactly
+    that stretch (#667). None means nothing was sealed."""
     ep = _RADIO.get("episode") or {}
     items = [it for it in (ep.get("items") or [])
              if Path(it.get("file", "")).is_file()]
@@ -11506,7 +11686,8 @@ def _episode_finalize() -> None:
                 Path(it["file"]).unlink()
             except OSError:
                 pass
-        return
+        return None
+    sealed: dict[str, Any] | None = None
     try:
         import subprocess
 
@@ -11573,6 +11754,14 @@ def _episode_finalize() -> None:
                     old.with_suffix(ext).unlink()
                 except OSError:
                     pass
+        # The window this episode covers, in wall-clock: from the first clip
+        # aired (or the moment the episode opened, whichever is earlier) to
+        # the end of the last one. That is what the full mix is cut to.
+        firsts = [float(it.get("t") or 0) for it in items if it.get("t")]
+        lo = min([float(ep.get("started") or 0) or min(firsts)] + firsts) \
+            if firsts else float(ep.get("started") or time.time())
+        sealed = {"base": str(base), "stem": base.name,
+                  "lo": lo, "hi": time.time()}
     except Exception:
         pass
     finally:
@@ -11581,6 +11770,72 @@ def _episode_finalize() -> None:
                 Path(it["file"]).unlink()      # drop the staging hardlinks
             except OSError:
                 pass
+    return sealed
+
+
+def _broadcast_collect(sealed: dict[str, Any]) -> Path | None:
+    """Render the mixed twin of a just-sealed episode and shelve it (#667).
+
+    The talk shelf collects itself; the full mix used to be a button. A
+    broadcast you have to remember to render is a broadcast you do not
+    have, and this is the one people replay — the records ARE the show.
+    So every seal gets its mix rendered behind it at the saved levels and
+    filed beside the transcript it came with. Best effort throughout: a
+    failed mix must never cost the episode it was made from."""
+    try:
+        base = Path(str(sealed.get("base") or ""))
+        lo = float(sealed.get("lo") or 0)
+        hi = float(sealed.get("hi") or 0)
+        if not base.name or hi - lo < 20:
+            return None
+        levels = mix_levels()
+        mixed = _broadcast_mix(
+            lo, hi,
+            max(0.0, min(2.0, levels["music"] / 100)),
+            max(0.0, min(0.9, levels["duck"] / 100)),
+            max(0.25, min(2.0, levels["voice"] / 100)),
+            tag="_collect")
+        if not mixed:
+            return None
+        BROADCASTS_DIR.mkdir(parents=True, exist_ok=True)
+        out = BROADCASTS_DIR / f"{base.name}_fullmix.mp3"
+        mixed.replace(out)
+        # The transcript comes across too, so a mixed row reads the same as
+        # a talk row — same player, same ⬇, same 📄.
+        src_md = Path(str(base) + ".md")
+        if src_md.is_file():
+            try:
+                out.with_suffix(".md").write_text(
+                    src_md.read_text(encoding="utf-8", errors="replace"),
+                    encoding="utf-8")
+            except OSError:
+                pass
+        keep = sorted(BROADCASTS_DIR.glob("*.mp3"),
+                      key=lambda p: p.stat().st_mtime)
+        for old in keep[:-BROADCASTS_KEPT]:
+            for ext in (".mp3", ".md"):
+                try:
+                    old.with_suffix(ext).unlink()
+                except OSError:
+                    pass
+        pipeline_log("air", f"full mix collected — {out.name} "
+                            f"({int(hi - lo)}s, records mixed back in) (#667)")
+        return out
+    except Exception:
+        return None
+
+
+async def broadcast_collect(sealed: dict[str, Any] | None) -> None:
+    """One full mix at a time, off the show's own thread (#667)."""
+    if not sealed or _MIX_GATE:
+        return
+    _MIX_GATE.append(1)
+    try:
+        await asyncio.to_thread(_broadcast_collect, sealed)
+    except Exception:
+        pass
+    finally:
+        _MIX_GATE.clear()
 
 
 async def episode_clock() -> None:
@@ -11598,7 +11853,10 @@ async def episode_clock() -> None:
         items = ep.get("items") or []
         elapsed = time.time() - float(ep.get("started") or time.time())
         if items and (elapsed >= mins * 60 or len(items) >= 220):
-            await asyncio.to_thread(_episode_finalize)
+            sealed = await asyncio.to_thread(_episode_finalize)
+            # #667: the mixed twin, collected as the show runs rather than
+            # rendered on demand hours later.
+            asyncio.create_task(broadcast_collect(sealed))
 
 
 def _music_bed_track() -> dict[str, Any] | None:
@@ -11618,6 +11876,16 @@ def _music_bed_track() -> dict[str, Any] | None:
         faves = [t for t in pool if str(t.get("id")) in loved]
     except Exception:
         faves = []
+    # #683: of the favourites, the ones whose thumbs-up remembers WHERE it
+    # was pressed come first — those are the beds that can open on the hook
+    # instead of twenty seconds in from the top.
+    try:
+        marked = [t for t in faves
+                  if loved_moment(str(t.get("id") or "")) is not None]
+    except Exception:
+        marked = []
+    if marked and random.random() < 0.85:
+        return random.choice(marked)
     if faves and random.random() < 0.8:
         return random.choice(faves)
     return random.choice(pool)
@@ -11689,6 +11957,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     station's own music — swelling in, ducking for the read, swelling out.
     Renders the voice, mixes it with a random track, plays the one mixed
     clip. Any failure falls back to a plain read so an ad always airs."""
+    _RADIO["ad_now"] = {"product": str(product)[:160], "at": time.time()}
     line = spoken_text(await dj_line("ad", _RADIO.get("now"), extra=product))
     if not line:
         return {"ad": "", "product": product, "id": ""}
@@ -11710,8 +11979,22 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     track = _music_bed_track()
     if track:
         secs = float(track.get("seconds") or 0)
-        start = random.uniform(20.0, max(21.0, min(70.0, secs - 25.0))) \
-            if secs > 50 else 15.0
+        # #683: bed the ad on the MOMENT he liked, not a random 20 seconds
+        # in. The thumbs-up carries where in the record it was pressed, and
+        # that spot is the hook — start the swell a few seconds ahead of it
+        # so the read lands on the part he reached for the button for.
+        loved = loved_moment(str(track.get("id") or ""))
+        if loved is not None:
+            start = max(0.0, loved - 4.0)
+            if secs > 10:
+                start = min(start, max(0.0, secs - 12.0))
+            pipeline_log(
+                "air", "ad bedded on the moment he liked — "
+                f"{int(loved // 60)}:{int(loved % 60):02d} into "
+                f"{track.get('title') or 'a track'} (#683)")
+        else:
+            start = random.uniform(20.0, max(21.0, min(70.0, secs - 25.0))) \
+                if secs > 50 else 15.0
         voice_key = clip["path"].rsplit("/", 1)[-1]
         # A sound effect punched into the opening swell (#618) — mixed IN, not
         # announced after. Best effort: no sample to hand → the ad airs without.
@@ -11904,8 +12187,14 @@ async def ad_produce(product: str, script: str, voice: str,
     if track and track.get("path"):
         bed_title = str(track.get("title") or "a track")
         secs = float(track.get("seconds") or 0)
-        start = (random.uniform(20.0, max(21.0, min(70.0, secs - 25.0)))
-                 if secs > 50 else 15.0)
+        loved = loved_moment(str(track.get("id") or ""))     # #683
+        if loved is not None:
+            start = max(0.0, loved - 4.0)
+            if secs > 10:
+                start = min(start, max(0.0, secs - 12.0))
+        else:
+            start = (random.uniform(20.0, max(21.0, min(70.0, secs - 25.0)))
+                     if secs > 50 else 15.0)
         voice_key = clip["path"].rsplit("/", 1)[-1]
         sfx = await asyncio.to_thread(_sfx_any)
         wav = await asyncio.to_thread(
@@ -21090,6 +21379,162 @@ async def voices_split(
             "jobs": started}
 
 
+def _merge_signatures(sigs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The mean of several signatures (#682). A signature is a shallow tree
+    of numeric leaves, so averaging it is well defined: the unified shard
+    performs like the middle of the people it was made from. Keys only some
+    of them carry are averaged over the ones that have them."""
+    sigs = [s for s in sigs if isinstance(s, dict)]
+    if not sigs:
+        return None
+
+    def walk(nodes: list[Any]) -> Any:
+        numbers = [n for n in nodes if isinstance(n, (int, float))
+                   and not isinstance(n, bool)]
+        if numbers and len(numbers) == len(nodes):
+            return round(sum(numbers) / len(numbers), 6)
+        dicts = [n for n in nodes if isinstance(n, dict)]
+        if dicts:
+            out: dict[str, Any] = {}
+            for key in dict.fromkeys(k for d in dicts for k in d):
+                out[key] = walk([d[key] for d in dicts if key in d])
+            return out
+        return nodes[0]
+
+    merged = walk(sigs)
+    return merged if isinstance(merged, dict) else None
+
+
+def _concat_references(paths: list[Path]) -> bytes | None:
+    """Join several reference recordings end to end into one (#682).
+
+    Everything is resampled to 24k mono first: the references come out of
+    the lab at whatever the source was, and the concat DEMUXER refuses a
+    set that does not agree on format. The filter graph agrees for us."""
+    if not paths:
+        return None
+    if len(paths) == 1:
+        try:
+            return paths[0].read_bytes()
+        except OSError:
+            return None
+    try:
+        import subprocess
+
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        ins: list[str] = []
+        for path in paths:
+            ins += ["-i", str(path)]
+        pre = "".join(
+            f"[{i}:a]aresample=24000,aformat=sample_fmts=s16:"
+            f"channel_layouts=mono[a{i}];" for i in range(len(paths)))
+        chain = "".join(f"[a{i}]" for i in range(len(paths)))
+        graph = f"{pre}{chain}concat=n={len(paths)}:v=0:a=1[out]"
+        done = subprocess.run(
+            [exe, "-nostdin", "-hide_banner", "-loglevel", "error",
+             *ins, "-filter_complex", graph, "-map", "[out]",
+             "-ac", "1", "-ar", "24000", "-sample_fmt", "s16",
+             "-f", "wav", "pipe:1"],
+            capture_output=True, timeout=300)
+        blob = done.stdout
+        return blob if len(blob) > 2000 else None
+    except Exception:
+        return None
+
+
+@app.post("/api/voices/merge")
+async def voices_merge(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Several library voices combined into ONE shard (#682).
+
+    Splitting a recording by speaker (#663) is the right move when the room
+    holds different people, and the wrong one when the diarizer heard the
+    same person from four angles and filed them as Speaker 2, 3, 7 and 10.
+    There was no way back from that: the only tools were delete and rename,
+    and neither of them puts the reference audio back together.
+
+    This does. The chosen voices' references are joined end to end into a
+    single reference — more conditioning material for the clone, not less —
+    their signatures are averaged into one, and the result is an ordinary
+    library voice from that point on. The sources are left alone unless you
+    ask for them to be swept up."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    ids = [str(i).strip() for i in (payload.get("ids") or []) if str(i).strip()]
+    ids = list(dict.fromkeys(ids))                      # keep the click order
+    if len(ids) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail="Pick at least two voices to combine.")
+    if len(ids) > 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Twelve at a time is the ceiling — a reference longer "
+                   "than that is trimmed away again anyway.")
+    metas: list[dict[str, Any]] = []
+    refs: list[Path] = []
+    for vid in ids:
+        meta = voice_meta(vid)
+        if not meta:
+            raise HTTPException(status_code=404, detail=f"No such voice: {vid}")
+        ref = voice_ref_path(vid)
+        if not ref:
+            raise HTTPException(
+                status_code=400,
+                detail=f"\"{meta.get('name') or vid}\" has no reference "
+                       "recording, so there is nothing of it to combine.")
+        metas.append(meta)
+        refs.append(ref)
+
+    joined = await asyncio.to_thread(_concat_references, refs)
+    if not joined:
+        raise HTTPException(
+            status_code=500,
+            detail="The references would not join — ffmpeg refused them.")
+    joined = await asyncio.to_thread(_trim_wav_seconds, joined, 120.0)
+
+    # A name of your own, or the common stem of the parts: four voices all
+    # called "ATate · Speaker N" unify as "ATate".
+    name = str(payload.get("name") or "").strip()[:80]
+    if not name:
+        stems = [str(m.get("name") or "").split("·")[0].strip() for m in metas]
+        stems = [s for s in stems if s]
+        if stems and len(set(stems)) == 1:
+            name = stems[0]
+        else:
+            name = " + ".join(str(m.get("name") or "voice")
+                              for m in metas)[:76]
+    signature = _merge_signatures(
+        [voice_signature(v) or {} for v in ids])
+
+    saved = await asyncio.to_thread(
+        voice_save,
+        {"name": name,
+         "kind": "clone",
+         "engine": metas[0].get("engine") or "xtts",
+         "internalized": any(m.get("internalized") for m in metas),
+         "source": {"type": "merged", "of": ids},
+         "provenance": {"merged_from": [
+             {"id": str(m.get("id")), "name": str(m.get("name") or "")}
+             for m in metas],
+             "merged_at": int(time.time())}},
+        joined, signature)
+
+    # Sweeping the parts up is opt-in: unifying four fragments usually
+    # means the fragments were the mistake, but that is your call to make.
+    swept: list[str] = []
+    if payload.get("delete_sources"):
+        for vid in ids:
+            if await asyncio.to_thread(voice_delete, vid):
+                swept.append(vid)
+    _CLONE_POOL_CACHE.update({"at": 0.0, "ids": []})    # the pool changed
+    return {"id": saved["id"], "name": saved["name"], "of": ids,
+            "deleted": swept, "has_signature": bool(signature)}
+
+
 @app.post("/api/voices/{vid}/reclone")
 async def voices_reclone(
     vid: str,
@@ -22715,7 +23160,19 @@ async def music_vote(
         vote = int(payload.get("vote", 0))
     except (TypeError, ValueError):
         vote = 0
-    result = set_vote(track_id, vote, track)
+    # WHERE in the record the thumb landed (#683). The page sends its own
+    # player position when it has one; when the like comes from somewhere
+    # with no player — the chat row, a phone, the tune-in page — the record
+    # on air knows its own elapsed, and that is the same moment.
+    try:
+        at: float | None = float(payload["at"])
+    except (KeyError, TypeError, ValueError):
+        at = None
+    if at is None and (_RADIO.get("now") or {}).get("id") == track_id:
+        elapsed = radio_state().get("elapsed") or 0.0
+        if elapsed > 0:
+            at = float(elapsed)
+    result = set_vote(track_id, vote, track, at=at)
 
     # Banning what is playing means it should stop playing.
     if vote < 0:
@@ -22971,6 +23428,54 @@ async def dj_force_api(
         f"slammed a record onto the player — {title} — and it is "
         "starting right now"))
     return {"forced": track.get("id"), "title": title, **dj_state()}
+
+
+@app.post("/api/dj/queue/move")
+async def dj_queue_move(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Reorder what is coming up, without cutting the record playing (#671).
+
+    The queue was readable from everywhere and writable from nowhere: the
+    only controls were skip, and force — which slams a record on NOW. There
+    was no way to say "that one next" or "not that one yet" while looking at
+    the sleeves. `to` is "front" (up next), "back" (last in line) or an index
+    to drop it at."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    track_id = str(payload.get("id") or "")
+    if not track_id:
+        raise HTTPException(status_code=400, detail="Which track?")
+    # One list, in the order the panel shows it, so an index means what it
+    # looks like it means.
+    line = list(_RADIO["requests"]) + list(_RADIO["queue"])
+    moving = next((t for t in line if str(t.get("id")) == track_id), None)
+    if moving is None:
+        raise HTTPException(status_code=404, detail="Not in the queue")
+    line = [t for t in line if str(t.get("id")) != track_id]
+    where = payload.get("to", "front")
+    if where == "back":
+        line.append(moving)
+        at = len(line) - 1
+    elif where == "front":
+        line.insert(0, moving)
+        at = 0
+    else:
+        try:
+            at = max(0, min(len(line), int(where)))
+        except (TypeError, ValueError):
+            at = 0
+        line.insert(at, moving)
+    # Requests keep their standing at the head of the line: everything ahead
+    # of the last request stays a request, so the request line still jumps
+    # the queue after a reshuffle.
+    keep = min(len(_RADIO["requests"]), len(line))
+    _RADIO["requests"] = line[:keep]
+    _RADIO["queue"] = line[keep:]
+    return {"moved": track_id, "at": at,
+            "title": str(moving.get("title") or ""),
+            "upcoming": [str(t.get("id")) for t in line[:20]]}
 
 
 @app.get("/api/dj/requested")
@@ -24116,6 +24621,115 @@ async def radio_cache_episodes(
     return {"episodes": out, "recording": recording, "folder": str(eps)}
 
 
+@app.get("/api/radio-cache/broadcasts")
+async def radio_cache_broadcasts(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The collected FULL MIXES, newest first (#667) — the broadcast as it
+    sounded, records mixed back in and ducked under the voices, one per
+    sealed episode. Same shape as the talk shelf so the tab that lists them
+    can be the same tab."""
+    require_read_auth(authorization)
+    out: list[dict[str, Any]] = []
+    if BROADCASTS_DIR.exists():
+        for p in sorted(BROADCASTS_DIR.glob("*.mp3"),
+                        key=lambda q: q.stat().st_mtime, reverse=True)[:120]:
+            _secs = 0.0
+            try:
+                from mutagen.mp3 import MP3
+                _secs = float(MP3(str(p)).info.length or 0)
+            except Exception:
+                pass
+            out.append({"name": p.name, "stem": p.stem,
+                        "size": p.stat().st_size,
+                        "seconds": round(_secs, 1),
+                        "when": int(p.stat().st_mtime),
+                        "sig": media_sign(p.name),
+                        "md_sig": media_sign(p.stem + ".md"),
+                        "has_transcript": p.with_suffix(".md").exists()})
+    ep = _RADIO.get("episode") or {}
+    return {
+        "broadcasts": out,
+        "levels": mix_levels(),
+        "folder": str(BROADCASTS_DIR),
+        # What the next collected mix will be cut from, so the tab can say
+        # "gathering" the way the talk tab says "recording".
+        "gathering": {
+            "clips": len(ep.get("items") or []),
+            "seconds": round(time.time()
+                             - float(ep.get("started") or time.time()))
+            if ep.get("items") else 0,
+            "mixing": bool(_MIX_GATE),
+            "on": bool(_RADIO.get("on")),
+        },
+    }
+
+
+@app.post("/api/radio-cache/broadcasts/levels")
+async def radio_cache_mix_levels(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The levels every COLLECTED mix is rendered at (#667). The browser's
+    own three sliders, kept server-side — the collector runs whether or not
+    a browser is open, so it cannot read them off a page."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    current = mix_levels()
+
+    def pick(key: str) -> float:
+        try:
+            return float(payload[key])
+        except (KeyError, TypeError, ValueError):
+            return current[key]
+
+    return {"levels": mix_levels_save(pick("music"), pick("duck"),
+                                      pick("voice"))}
+
+
+@app.post("/api/radio-cache/broadcasts/collect")
+async def radio_cache_collect_now(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Seal what is on the shelf right now and collect its full mix (#667)
+    — the "keep this stretch" button, for when the last twenty minutes were
+    worth keeping and you would rather not wait for the clock."""
+    require_auth(authorization)
+    if _MIX_GATE:
+        return {"collecting": True, "already": True}
+    sealed = await asyncio.to_thread(_episode_finalize)
+    if not sealed:
+        raise HTTPException(
+            status_code=404,
+            detail="Nothing on the shelf to seal — the pair have to have "
+                   "aired something since the last cut.")
+    asyncio.create_task(broadcast_collect(sealed))
+    return {"collecting": True, "stem": sealed.get("stem", "")}
+
+
+@app.get("/api/radio-cache/broadcasts/{name}")
+async def radio_cache_broadcast_file(
+    name: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Serve a collected full mix or its transcript (#667). Signed ?t= like
+    every other cache file — a bare <audio> cannot send a bearer header."""
+    _sig = str(request.query_params.get("t") or "")
+    _want = media_sign(name)
+    if not (_want and hmac.compare_digest(_sig, _want)):
+        require_read_auth(authorization)
+    if "/" in name or ".." in name or not re.fullmatch(
+            r"[\w.\- ]{1,120}", name):
+        raise HTTPException(status_code=400, detail="Bad name")
+    path = BROADCASTS_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Not in the cache")
+    media = "audio/mpeg" if name.endswith(".mp3") else "text/markdown"
+    return FileResponse(path, media_type=media,
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
 @app.get("/api/radio-cache/episodes/{name}")
 async def radio_cache_episode_file(
     name: str,
@@ -24162,7 +24776,7 @@ def _cache_compile(kind: str, scope: str,
                 files += list(d.glob("*.mp3"))
         files.sort(key=lambda p: p.stat().st_mtime)
     else:
-        folder = RADIO_CACHE / ("calls" if kind == "calls" else "episodes")
+        folder = _cache_folder(kind)
         if not folder.exists():
             return None
         files = sorted(folder.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
@@ -24224,7 +24838,7 @@ def _cache_export(kind: str, scope: str, max_mb: float,
     work.mkdir(parents=True, exist_ok=True)
     parts: list[Path] = []
     if hourly:
-        folder = RADIO_CACHE / ("calls" if kind == "calls" else "episodes")
+        folder = _cache_folder(kind)
         if not folder.exists():
             return None
         files = sorted(folder.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
@@ -24318,7 +24932,7 @@ async def radio_cache_export_api(
     continuous parts capped at max_mb (100 MB albums, 3 MB clips), or one
     clip per wall-clock hour."""
     require_read_auth(authorization)
-    if kind not in ("episodes", "calls"):
+    if kind not in ("episodes", "calls", "broadcasts"):
         raise HTTPException(status_code=400, detail="kind must be episodes|calls")
     if scope not in ("today", "yesterday", "week", "month", "all"):
         raise HTTPException(status_code=400, detail="bad scope")
@@ -24485,7 +25099,7 @@ def _cache_meta_read(kind: str, name: str) -> dict[str, Any] | None:
     location, length, size, who was present, how many phone calls, and any
     ads/product placement — best-effort, parsed from the mp3 header and the
     transcript beside it."""
-    folder = RADIO_CACHE / ("calls" if kind == "calls" else "episodes")
+    folder = _cache_folder(kind)
     path = folder / name
     if not path.is_file():
         return None
@@ -24536,7 +25150,8 @@ async def radio_cache_meta_api(
     """The calendar hover-card: one recording's location, length, size,
     members present, phone-call count and ad mentions."""
     require_read_auth(authorization)
-    if kind not in ("episodes", "calls") or "/" in name or ".." in name \
+    if kind not in ("episodes", "calls", "broadcasts") \
+            or "/" in name or ".." in name \
             or not re.fullmatch(r"[\w.\- ]{1,120}", name):
         raise HTTPException(status_code=400, detail="bad kind or name")
     meta = await asyncio.to_thread(_cache_meta_read, kind, name)
@@ -24558,7 +25173,8 @@ async def radio_cache_spec(
     _want = media_sign(name)
     if not (_want and hmac.compare_digest(_sig, _want)):
         require_read_auth(authorization)
-    if kind not in ("episodes", "calls") or "/" in name or ".." in name \
+    if kind not in ("episodes", "calls", "broadcasts") \
+            or "/" in name or ".." in name \
             or not re.fullmatch(r"[\w.\- ]{1,120}", name):
         raise HTTPException(status_code=400, detail="bad kind or name")
     src = RADIO_CACHE / kind / name
@@ -24610,7 +25226,7 @@ async def radio_cache_compile_api(
     `day=YYYY-MM-DD` + `span=day|week|month` window, so the calendar can pull
     any day/week/month in history as one unified file."""
     require_read_auth(authorization)
-    if kind not in ("episodes", "calls", "all"):
+    if kind not in ("episodes", "calls", "broadcasts", "all"):
         raise HTTPException(status_code=400,
                             detail="kind must be episodes|calls|all")
     if scope not in ("today", "yesterday", "week", "month", "all"):
@@ -24686,7 +25302,7 @@ def _mix_window(scope: str, day: str = "", span: str = "") -> tuple[float,
 
 
 def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
-                   voice: float) -> Path | None:
+                   voice: float, tag: str = "") -> Path | None:
     """The show as it SOUNDED, rebuilt (#633).
 
     The recorder only ever caught talk and stings — a record is a URL the
@@ -24705,7 +25321,10 @@ def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
 
     import imageio_ffmpeg
     exe = imageio_ffmpeg.get_ffmpeg_exe()
-    work = RADIO_CACHE / "_bmix"
+    # #667: the collector renders on its own clock while somebody may be
+    # pressing "render & download" — so the scratch space and the output are
+    # per-caller, not one shared pair of paths both would write at once.
+    work = RADIO_CACHE / f"_bmix{tag}"
     _shutil.rmtree(work, ignore_errors=True)
     work.mkdir(parents=True, exist_ok=True)
     span = max(1.0, hi - lo)
@@ -24808,7 +25427,7 @@ def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
             beds.append((begin, end, str(piece), 0.0))
     bed = timeline(beds, work / "music.mp3")
 
-    out = RADIO_CACHE / "_broadcast.mp3"
+    out = RADIO_CACHE / f"_broadcast{tag}.mp3"
     out.unlink(missing_ok=True)
     if talk and not bed:
         talk.replace(out)             # nothing played; the talk IS the mix
@@ -30604,6 +31223,11 @@ button.danger {
   border-radius: 6px;
   animation: boothPulse 1.5s ease-in-out infinite;
 }
+/* #668: whatever is being sold circulates under the booth glass. */
+@keyframes boothSell {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
 @keyframes boothPulse {
   0%, 100% {
     box-shadow: 0 0 0 1px rgba(255,95,95,.55), 0 0 8px rgba(255,95,95,.18);
@@ -30841,6 +31465,21 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
 }
 .voice-row .name { flex: 1; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
+/* #682: shift-selectable rows, so a roomful split into fragments can be
+   picked out and put back together as one shard. */
+.voice-row.picked {
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+.voice-row .grip { flex: 0 0 auto; cursor: pointer; opacity: .45;
+  font-size: 11px; user-select: none; }
+.voice-row.picked .grip { opacity: 1; color: var(--accent); }
+.merge-bar {
+  display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+  padding: 8px 10px; margin-bottom: 10px; border-radius: 8px;
+  border: 1px solid var(--accent); background: var(--panel2);
+  font-size: 12px;
+}
 .stage-row {
   display: flex; gap: 8px; align-items: center; font-size: 12px;
   padding: 3px 0; color: var(--muted);
@@ -31831,6 +32470,15 @@ shortens records; this changes the shape of the show.">
           <input id="djTalkRadioMode" type="checkbox"
                  onchange="djSetTalkRadioMode()">
           📻🎙 Talk-show torrent (records spin, the pair never stop)
+        </label>
+        <label class="toggle" style="flex:1;min-width:280px"
+               title="#689 — the needle goes down FIRST. The track starts,
+the pair introduce it over its own opening, and the research, the memos, the
+callers and the banter all run with the record turning underneath. Off, they
+do all of that into silence and start the record afterwards.">
+          <input id="djRecordsFirst" type="checkbox"
+                 onchange="djSetRecordsFirst()">
+          💿 Records first (never sit with nothing playing)
         </label>
       </div>
       <div class="row" style="flex-wrap:wrap;margin-bottom:8px">
@@ -37620,6 +38268,7 @@ let djTalkPinned = false;
 function djTalkClose(manual) {
   const box = document.getElementById("djTalkPopup");
   if (box) box.remove();
+  boothGlassStop();                    // #668: nothing to draw on
   if (manual) djTalkPinned = true;     // do not reopen until the next session
 }
 
@@ -37711,9 +38360,280 @@ function djTalkPopup() {
   log.style.cssText = "flex:1;overflow-y:auto;font-size:12px;line-height:1.5";
 
   box.appendChild(head);
+  box.appendChild(boothGlass());          // #668
   box.appendChild(log);
   document.body.appendChild(box);
+  boothGlassStart();
   return box;
+}
+
+/* ---- The glass over the booth (#668) ----------------------------------
+ * A live spectrogram of the voice actually going out, coloured by WHO is
+ * saying it, with the rest of the room shown beside it as idle meters so
+ * you can see who is in the studio and who has the mic. Stings pop out of
+ * it as bubbles, and whatever is being SOLD right now — the paintings on
+ * the block, the product in the ad — circulates underneath as thumbnails.
+ *
+ * The booth used to be a transcript with a dot on it. Every one of these
+ * facts was already on the wire; none of them were visible.
+ */
+const BOOTH_WHO = {
+  dj: {color: "#4bb3ff", tag: "host"},
+  cohost: {color: "#8fe388", tag: "cohost"},
+  third: {color: "#ffb347", tag: "third chair"},
+  caller: {color: "#ff6ec7", tag: "caller"},
+  guest: {color: "#c58cff", tag: "guest"},
+  drop: {color: "#ef6461", tag: "drop"},
+  sfx: {color: "#ffd479", tag: "sfx"},
+};
+let boothGlassRaf = 0;
+const boothBubbles = [];
+let boothSellSeen = "";
+
+function boothGlass() {
+  const wrap = el("div", "", "");
+  wrap.id = "boothGlass";
+  wrap.style.cssText = "position:relative;margin:0 0 6px;border-radius:7px;"
+    + "border:1px solid var(--border);background:#060b14;overflow:hidden";
+  const canvas = document.createElement("canvas");
+  canvas.id = "boothSpec";
+  canvas.style.cssText = "display:block;width:100%;height:54px";
+  wrap.appendChild(canvas);
+  // Who is in the room, and which of them has the mic.
+  const room = el("div", "", "");
+  room.id = "boothRoom";
+  room.style.cssText = "display:flex;gap:4px;align-items:center;flex-wrap:wrap;"
+    + "padding:3px 5px;border-top:1px solid var(--border);font-size:10px";
+  wrap.appendChild(room);
+  // The sale, circulating.
+  const sell = el("div", "", "");
+  sell.id = "boothSell";
+  sell.style.cssText = "display:none;gap:5px;align-items:center;padding:4px 5px;"
+    + "border-top:1px solid var(--border);overflow:hidden;white-space:nowrap";
+  wrap.appendChild(sell);
+  return wrap;
+}
+
+/* Which voice element is sounding right now, and who it belongs to. */
+function boothLivePlayer() {
+  if (typeof djVoiceEls === "undefined") return null;
+  for (const a of djVoiceEls) {
+    if (a && !a.paused && !a.ended && a.currentTime > 0) return a;
+  }
+  return null;
+}
+
+function boothLiveWho() {
+  const log = document.getElementById("djTalkLog");
+  const want = (typeof djVoiceNow !== "undefined" && djVoiceNow)
+    ? djTalkKey(djVoiceNow.text) : "";
+  if (log && want) {
+    const row = log.querySelector('[data-said="' + CSS.escape(want) + '"]');
+    if (row) {
+      return {who: row.getAttribute("data-who") || "dj",
+              name: row.getAttribute("data-name") || ""};
+    }
+  }
+  if (typeof djVoiceNow !== "undefined" && djVoiceNow && djVoiceNow.sting) {
+    return {who: "sfx", name: ""};
+  }
+  return null;
+}
+
+/* A sting pops as a bubble over the glass. Called from the booth feed when
+ * a sample lands, so the sound effects are SEEN as well as heard. */
+function boothBubble(text, kind) {
+  boothBubbles.push({
+    text: String(text || "").slice(0, 22),
+    kind: kind || "sfx",
+    born: performance.now(),
+    x: 0.12 + Math.random() * 0.7,
+    drift: (Math.random() - 0.5) * 0.14,
+  });
+  if (boothBubbles.length > 8) boothBubbles.splice(0, boothBubbles.length - 8);
+}
+
+/* The paintings on the block and the product in the ad, circulating under
+ * the glass — a marquee that only exists while something is being sold. */
+function boothSellPaint(state) {
+  const strip = document.getElementById("boothSell");
+  if (!strip) return;
+  const names = ((state.gallery_now && state.gallery_now.images) || [])
+    .filter(Boolean).slice(0, 6);
+  const pitch = (state.ad_now && state.ad_now.product) || "";
+  const key = names.join("|") + "@" + pitch;
+  if (key === boothSellSeen) return;              // nothing changed
+  boothSellSeen = key;
+  strip.innerHTML = "";
+  if (!names.length && !pitch) { strip.style.display = "none"; return; }
+  strip.style.display = "flex";
+  if (pitch) {
+    // The ad on air right now, named. Most of them are a painting off the
+    // wall, and those arrive with pictures below; the rest at least say
+    // what is being sold.
+    const chip = el("span", "", "📣 " + pitch);
+    chip.style.cssText = "font-size:10px;color:#ffd479;border:1px solid "
+      + "#ffd47955;border-radius:9px;padding:1px 7px;flex:0 0 auto;"
+      + "max-width:60%;overflow:hidden;text-overflow:ellipsis;"
+      + "white-space:nowrap";
+    chip.title = "On air right now: " + pitch;
+    strip.appendChild(chip);
+  }
+  if (!names.length) return;
+  const lane = el("div", "", "");
+  lane.style.cssText = "display:flex;gap:5px;align-items:center;"
+    + "animation:boothSell 22s linear infinite";
+  // Twice round, so the loop has no seam.
+  for (let pass = 0; pass < 2; pass += 1) {
+    names.forEach((n) => {
+      const im = document.createElement("img");
+      im.src = "/api/generations/image/" + encodeURIComponent(n);
+      im.loading = "lazy";
+      im.title = n + " — on the block right now, click to open";
+      im.style.cssText = "height:34px;width:34px;object-fit:cover;"
+        + "border-radius:5px;border:1px solid var(--border);cursor:zoom-in;"
+        + "flex:0 0 auto";
+      im.onerror = () => { im.style.display = "none"; };
+      im.onclick = () => artFullscreen(n);
+      lane.appendChild(im);
+    });
+  }
+  const tag = el("span", "muted", "🖼 on the block");
+  tag.style.cssText = "font-size:10px;flex:0 0 auto;margin-right:4px";
+  strip.appendChild(tag);
+  const clip = el("div", "", "");
+  clip.style.cssText = "overflow:hidden;flex:1";
+  clip.appendChild(lane);
+  strip.appendChild(clip);
+}
+
+/* Everybody in the studio, with the one holding the mic lit. */
+function boothRoomPaint(state, live) {
+  const room = document.getElementById("boothRoom");
+  if (!room) return;
+  const dj = (state && state.dj_names) || {};
+  const cast = [
+    {who: "dj", name: dj.host || "host"},
+    {who: "cohost", name: dj.cohost || "cohost"},
+  ];
+  if (dj.third) cast.push({who: "third", name: dj.third});
+  if (dj.guest) cast.push({who: "guest", name: dj.guest});
+  // A caller only exists while one is on the line.
+  const recent = (state.chat || []).slice(-14)
+    .filter((l) => l.who === "caller").pop();
+  if (recent) cast.push({who: "caller", name: recent.name || "on line one"});
+  cast.push({who: "sfx", name: "samples"});
+  const key = cast.map((c) => c.who + c.name).join("|")
+    + "@" + ((live && live.who) || "");
+  if (room.dataset.key === key) return;
+  room.dataset.key = key;
+  room.innerHTML = "";
+  cast.forEach((c) => {
+    const on = live && live.who === c.who;
+    const chip = el("span", "", "");
+    const col = (BOOTH_WHO[c.who] || BOOTH_WHO.dj).color;
+    chip.style.cssText = "display:inline-flex;align-items:center;gap:4px;"
+      + "padding:1px 6px;border-radius:9px;border:1px solid "
+      + (on ? col : "var(--border)")
+      + ";color:" + (on ? col : "var(--muted)")
+      + (on ? ";box-shadow:0 0 9px " + col + "66" : "");
+    const dot = el("span", "", on ? "●" : "○");
+    dot.style.cssText = "font-size:8px";
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(c.name));
+    chip.title = (BOOTH_WHO[c.who] || {}).tag || c.who;
+    room.appendChild(chip);
+  });
+}
+
+function boothGlassDraw() {
+  boothGlassRaf = requestAnimationFrame(boothGlassDraw);
+  const canvas = document.getElementById("boothSpec");
+  if (!canvas || !canvas.offsetParent || document.hidden) return;
+  const ctx = canvas.getContext("2d");
+  const ratio = window.devicePixelRatio || 1;
+  const width = canvas.width = Math.max(1, canvas.clientWidth * ratio);
+  const height = canvas.height = Math.max(1, canvas.clientHeight * ratio);
+  ctx.clearRect(0, 0, width, height);
+
+  const live = boothLiveWho();
+  const col = (BOOTH_WHO[(live && live.who) || "dj"] || BOOTH_WHO.dj).color;
+  // Only tap a voice element once the shared context is RUNNING. Creating a
+  // MediaElementSource re-routes the element through the graph, and routing
+  // it through a suspended context would silence the DJs outright — a
+  // decoration must never be able to take the show off the air.
+  const ctxLive = window.pineAudioCtx && window.pineAudioCtx.state === "running";
+  const player = ctxLive ? boothLivePlayer() : null;
+  const scope = player ? audioScope(player) : null;
+
+  const bars = 56;
+  const step = scope ? Math.max(1, Math.floor(scope.bins.length / bars)) : 1;
+  if (scope) scope.analyser.getByteFrequencyData(scope.bins);
+  const now = performance.now() / 1000;
+  const barWidth = width / bars;
+  for (let i = 0; i < bars; i += 1) {
+    let level;
+    if (scope) {
+      let sum = 0;
+      for (let j = 0; j < step; j += 1) sum += scope.bins[i * step + j] || 0;
+      level = (sum / step) / 255;
+    } else {
+      // Nothing sounding: a slow idle breath rather than a dead rectangle,
+      // so the glass reads as "quiet booth" and not "broken panel".
+      level = 0.05 + 0.035 * (1 + Math.sin(now * 1.2 + i * 0.22));
+    }
+    const barHeight = Math.max(1, level * height * 0.92);
+    const grad = ctx.createLinearGradient(0, height, 0, height - barHeight);
+    grad.addColorStop(0, col);
+    grad.addColorStop(1, "rgba(255,255,255,.9)");
+    ctx.fillStyle = grad;
+    ctx.globalAlpha = scope ? 0.35 + level * 0.65 : 0.22;
+    ctx.fillRect(i * barWidth + ratio, height - barHeight,
+                 Math.max(1, barWidth - ratio * 2), barHeight);
+  }
+  ctx.globalAlpha = 1;
+
+  // Who has the mic, written on the glass.
+  if (live) {
+    ctx.font = (11 * ratio) + "px system-ui, sans-serif";
+    ctx.fillStyle = col;
+    ctx.globalAlpha = 0.9;
+    ctx.fillText(live.name
+      || ((BOOTH_WHO[live.who] || {}).tag || live.who), 6 * ratio, 14 * ratio);
+    ctx.globalAlpha = 1;
+  }
+
+  // Sting bubbles rising off the glass.
+  for (let k = boothBubbles.length - 1; k >= 0; k -= 1) {
+    const b = boothBubbles[k];
+    const age = (performance.now() - b.born) / 2600;
+    if (age >= 1) { boothBubbles.splice(k, 1); continue; }
+    const bx = (b.x + b.drift * age) * width;
+    const by = height * (1 - age * 0.86) - 6 * ratio;
+    const r = (9 + 7 * Math.sin(age * Math.PI)) * ratio;
+    ctx.globalAlpha = Math.max(0, 1 - age) * 0.85;
+    ctx.beginPath();
+    ctx.arc(bx, by, r, 0, Math.PI * 2);
+    ctx.fillStyle = BOOTH_WHO.sfx.color + "33";
+    ctx.fill();
+    ctx.strokeStyle = BOOTH_WHO.sfx.color;
+    ctx.lineWidth = ratio;
+    ctx.stroke();
+    ctx.fillStyle = BOOTH_WHO.sfx.color;
+    ctx.font = (9 * ratio) + "px system-ui, sans-serif";
+    ctx.fillText(b.text, bx + r + 3 * ratio, by + 3 * ratio);
+    ctx.globalAlpha = 1;
+  }
+}
+
+function boothGlassStart() {
+  if (boothGlassRaf) return;
+  boothGlassDraw();
+}
+
+function boothGlassStop() {
+  if (boothGlassRaf) cancelAnimationFrame(boothGlassRaf);
+  boothGlassRaf = 0;
 }
 
 /* #656: the whole night, kept. The server only ever hands over the last
@@ -37723,6 +38643,9 @@ function djTalkPopup() {
  * press Clear. */
 let djTalkAll = [];
 const djTalkSeenIds = new Set();
+// Stings already popped as bubbles over the glass (#668), so a redraw does
+// not re-pop the whole night's samples.
+const boothStungIds = new Set();
 
 function djTalkAbsorb(lines) {
   let added = 0;
@@ -37772,6 +38695,19 @@ function djTalkRender(state) {
 
   const log = document.getElementById("djTalkLog");
   if (!log) return;
+  // #668: the glass over the booth — who is in the room, who has the mic,
+  // and what is being sold right now.
+  boothRoomPaint(state, boothLiveWho());
+  boothSellPaint(state);
+  // A sting that has just landed pops as a bubble off the spectrogram.
+  fresh_lines.forEach((line) => {
+    if (line.kind !== "sfx") return;
+    const seen = (line.ts || 0) + "|" + (line.text || "");
+    if (boothStungIds.has(seen)) return;
+    boothStungIds.add(seen);
+    if (boothStungIds.size > 200) boothStungIds.clear();
+    boothBubble(line.text, "sfx");
+  });
   const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
   log.textContent = "";
   // #595: a section showing HOW the booth is reaching the vector database —
@@ -37954,7 +38890,13 @@ function djTalkRender(state) {
     // the one that is actually sounding. The server logs a line when it
     // hands it over; the page plays it later, so matching on the AUDIO is
     // what makes this window one to one with the broadcast.
-    if (spoken && line.text) row.setAttribute("data-said", djTalkKey(line.text));
+    if (spoken && line.text) {
+      row.setAttribute("data-said", djTalkKey(line.text));
+      // #668: and WHO said it, so the spectrogram over the booth can be
+      // coloured by the voice that is actually going out.
+      row.setAttribute("data-who", line.who || "");
+      if (line.name) row.setAttribute("data-name", line.name);
+    }
     said.onclick = () => djTalkSpeak(line, said);
     // Right-click any line to bury it forever (#444): it is dropped if it
     // ever comes round again.
@@ -38657,17 +39599,39 @@ function voteBurst(anchor, vote) {
 
 /* ---- Track votes (#116) ---- */
 
+/* #683: WHERE in the record the thumb landed. A like is pressed at a
+ * moment — the part that made you reach for the button — and that moment is
+ * the hook the DJs bed their ads on. The page player knows it exactly when
+ * it is the thing playing; otherwise the server reads it off the station
+ * clock, which is the same moment. */
+function voteMomentFor(id) {
+  const player = document.getElementById("musicPlayer");
+  if (player && id && musicLastId === id && isFinite(player.currentTime)
+      && player.currentTime > 0.5 && !player.paused) {
+    return Number(player.currentTime.toFixed(1));
+  }
+  return null;
+}
+
 async function voteTrack(id, vote, query, anchor) {
   const status = document.getElementById("musicStatus");
   voteBurst(anchor || (window.event && window.event.currentTarget), vote);
   try {
+    const at = vote > 0 ? voteMomentFor(id) : null;
+    const body = {id: id || "", q: query || "", vote};
+    if (at != null) body.at = at;
     const result = await api("/api/music/vote", {
       method: "POST",
-      body: JSON.stringify({id: id || "", q: query || "", vote}),
+      body: JSON.stringify(body),
     });
     if (status) {
+      const spot = result.at != null
+        ? " @ " + Math.floor(result.at / 60) + ":"
+          + String(Math.round(result.at % 60)).padStart(2, "0")
+        : "";
       status.textContent = (result.title || "track") + " · "
-        + (vote > 0 ? "👍 more of this"
+        + (vote > 0 ? "👍 more of this" + spot + " — the DJs will bed an ad "
+                      + "on that moment"
            : vote < 0 ? "👎 never again" : "vote cleared");
     }
     loadVotes();
@@ -38713,6 +39677,19 @@ async function loadVotes() {
       const who = el("span", "muted", row.artist || "");
       who.style.cssText = "font-size:12px;max-width:34%;overflow:hidden;"
         + "text-overflow:ellipsis;white-space:nowrap";
+      // #683: the moment(s) the thumb landed on — what the DJs open an
+      // ad bed on when this record comes up under a read.
+      const marks = (row.marks && row.marks.length)
+        ? row.marks : (row.at != null ? [row.at] : []);
+      let at = null;
+      if (marks.length) {
+        at = el("span", "muted", "⏱ " + marks.map((m) =>
+          Math.floor(m / 60) + ":"
+          + String(Math.round(m % 60)).padStart(2, "0")).join(" · "));
+        at.style.cssText = "font-size:11px;color:#8fd9ff;flex:0 0 auto";
+        at.title = "Where in the record you liked it — the DJs swell an ad "
+          + "bed from here (#683)";
+      }
       const flip = el("button", "", row.vote > 0 ? "👎" : "👍");
       flip.title = "Switch this vote";
       flip.onclick = () => voteTrack(
@@ -38720,7 +39697,8 @@ async function loadVotes() {
       const drop = el("button", "danger", "✕");
       drop.title = "Remove from the list";
       drop.onclick = () => voteTrack(row.id, 0);
-      [mark, name, who, flip, drop].forEach((n) => line.appendChild(n));
+      [mark, name, who, at, flip, drop].filter(Boolean)
+        .forEach((n) => line.appendChild(n));
       host.appendChild(line);
     });
   } catch (error) {
@@ -42317,6 +43295,13 @@ function djTalkMarkLive() {
       ? "Jump to the line being said right now"
       : "Nothing is going out — jump to the last line said";
   }
+  // #668: the room chips follow the mic, and the mic moves faster than the
+  // state poll — so relight them the moment a clip starts or stops.
+  try {
+    boothRoomPaint(
+      (typeof djLastState !== "undefined" && djLastState) || {},
+      boothLiveWho());
+  } catch (error) { /* the glass is decoration; never let it break the log */ }
 }
 
 // Lines are matched on their words, because the transcript keeps the
@@ -43723,6 +44708,8 @@ async function djLoadSettings() {
       String(dj.talk_radio ?? 35);
     djTalkRadioShow();
     document.getElementById("djTalkRadioMode").checked = !!dj.talk_radio_mode;
+    document.getElementById("djRecordsFirst").checked =
+      dj.records_first !== false;                              // #689
     document.getElementById("djAccentPin").value =
       String(Math.round((dj.accent_pin ?? 0.8) * 100));
     document.getElementById("djPersonality").value =
@@ -43988,6 +44975,23 @@ async function djSetTalkRadioMode() {
   } catch (error) { status.textContent = error.message; }
 }
 
+/* Records first (#689): the needle goes down before a word is written, and
+   every segment plays out over the record instead of into silence. */
+async function djSetRecordsFirst() {
+  const status = document.getElementById("djVoiceStatus");
+  const on = document.getElementById("djRecordsFirst").checked;
+  try {
+    const settings = await api("/api/settings");
+    if (settings.voice_out) delete settings.voice_out.ha_token;
+    settings.dj = Object.assign({}, settings.dj, {records_first: on});
+    await api("/api/settings", {method: "PUT",
+                                body: JSON.stringify(settings)});
+    status.textContent = on
+      ? "💿 needle first — they introduce the record over its own opening"
+      : "back to talking first, starting the record after";
+  } catch (error) { status.textContent = error.message; }
+}
+
 /* The one slider that lives out on the panel: how often the pair start a
    round from something in the speakbox (#204). Saves as you let go. */
 async function djSetSpeakboxRate() {
@@ -44082,7 +45086,10 @@ function dlBar(kind) {
   bar.style.cssText = "display:flex;flex-wrap:wrap;gap:5px;align-items:center;"
     + "margin:2px 0 8px";
   const lab = el("span", "muted", kind === "calls"
-    ? "⬇ all calls as one mp3: " : "⬇ whole broadcast as one mp3: ");
+    ? "⬇ all calls as one mp3: "
+    : kind === "broadcasts"
+      ? "⬇ a whole set of full mixes as one mp3: "
+      : "⬇ whole broadcast as one mp3: ");
   lab.style.cssText = "font-size:11px";
   bar.appendChild(lab);
   [["today", "today"], ["yesterday", "yesterday"], ["week", "this week"],
@@ -44383,19 +45390,91 @@ async function callRecordings() {
     return row;
   };
 
-  // The full mix pane (#633): the show as it SOUNDED, records and all.
-  function renderMix() {
+  // The full mix pane (#633, rebuilt for #667): the show as it SOUNDED,
+  // records and all — and a SHELF of them, collected as the show runs,
+  // laid out exactly like the talk/sfx tab because that is the tab that
+  // works. A rendered mix you have to remember to ask for is a mix you do
+  // not have; these are the ones that get replayed.
+  async function renderMix() {
     list.innerHTML = "";
+    let mixes = {broadcasts: [], gathering: {}, levels: {}};
+    try { mixes = await api("/api/radio-cache/broadcasts"); } catch (e) {}
     const why = el("div", "muted",
       "The recorder keeps talk and sound effects only — the records are "
-      + "streamed, so nothing here ever heard them. This rebuilds the "
-      + "broadcast from the timing logs and mixes the music back in at your "
-      + "levels, ducked under the voices. Stretches from before this update "
-      + "have no music timing and come out talk-only.");
+      + "streamed, so nothing here ever heard them. A full mix rebuilds the "
+      + "broadcast from the timing logs and puts the music back in at your "
+      + "levels, ducked under the voices. One is collected automatically "
+      + "every time a section seals, so the sets below build themselves as "
+      + "the station runs.");
     why.style.cssText = "font-size:11px;line-height:1.55;margin-bottom:10px";
     list.appendChild(why);
 
-    const levels = djLevels();
+    // --- the live collector, the way the talk tab shows the recorder -----
+    const g = mixes.gathering || {};
+    const live = el("div", "", "");
+    live.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+      + "padding:8px 10px;margin-bottom:12px";
+    const lrow = el("div", "row", "");
+    lrow.style.cssText = "align-items:center;gap:8px;flex-wrap:wrap";
+    const state = el("span", "", g.mixing
+      ? "🎚 mixing a set right now…"
+      : g.clips
+        ? "🔴 gathering — " + g.clips + " clips · "
+          + Math.floor((g.seconds || 0) / 60) + "m of the next set"
+        : (g.on ? "on air — the next set starts with the next line"
+                : "⚫ off air — nothing is being gathered"));
+    state.style.cssText = "font-weight:700;font-size:12px;flex:1";
+    lrow.appendChild(state);
+    const keep = el("button", "primary", "⭐ Keep this stretch");
+    keep.style.cssText = "font-size:11px;padding:3px 10px";
+    keep.title = "Seal what is on the shelf now and mix it with the records "
+      + "— for when the last stretch was worth keeping and you would rather "
+      + "not wait for the clock";
+    keep.onclick = async () => {
+      keep.textContent = "⏳ mixing…"; keep.disabled = true;
+      try {
+        await api("/api/radio-cache/broadcasts/collect", {method: "POST"});
+        setStatus("collecting the full mix — it lands on the shelf when the "
+          + "render finishes");
+      } catch (e) { setStatus(e.message, true); }
+      keep.textContent = "⭐ Keep this stretch"; keep.disabled = false;
+      setTimeout(render, 1500);
+    };
+    if (g.on || g.clips) lrow.appendChild(keep);
+    live.appendChild(lrow);
+    list.appendChild(live);
+
+    // --- the collected sets ---------------------------------------------
+    const h1 = el("div", "", "🎚 Sets — the broadcast with the records in");
+    h1.style.cssText = "font-weight:700;margin:4px 0 6px";
+    list.appendChild(h1);
+    list.appendChild(dlBar("broadcasts"));
+    (mixes.broadcasts || []).forEach((r) =>
+      list.appendChild(recRow("/api/radio-cache/broadcasts", r)));
+    if (!(mixes.broadcasts || []).length) {
+      const m = el("div", "muted", "No sets collected yet — one is mixed "
+        + "every time a section seals (~15 minutes on air), or press "
+        + "“Keep this stretch” to make one now.");
+      m.style.cssText = "font-size:11px;padding:4px 0"; list.appendChild(m);
+    }
+
+    // --- render one to order, at whatever levels you like ----------------
+    const h2 = el("div", "", "🎛 Render a span to order");
+    h2.style.cssText = "font-weight:700;margin:16px 0 6px";
+    list.appendChild(h2);
+    const note = el("div", "muted",
+      "These levels are also what the collector renders the sets above at.");
+    note.style.cssText = "font-size:11px;margin-bottom:6px";
+    list.appendChild(note);
+
+    const levels = {
+      music: (mixes.levels && mixes.levels.music != null)
+        ? mixes.levels.music / 100 : djLevels().music,
+      duck: (mixes.levels && mixes.levels.duck != null)
+        ? mixes.levels.duck / 100 : djLevels().duck,
+      voice: (mixes.levels && mixes.levels.voice != null)
+        ? mixes.levels.voice / 100 : djLevels().voice,
+    };
     const pick = el("select", "", "");
     [["today", "today"], ["yesterday", "yesterday"],
      ["week", "this week"], ["month", "this month"]].forEach(([v, t]) => {
@@ -44425,6 +45504,19 @@ async function callRecordings() {
     const musicIn = slider("music", levels.music * 100, 0, 200);
     const duckIn = slider("duck under speech", levels.duck * 100, 0, 90);
     const voiceIn = slider("DJ voice", levels.voice * 100, 25, 200);
+    // #667: the collector has no browser to read sliders off, so moving one
+    // saves it. Every set collected from here on is mixed at these levels.
+    const saveLevels = async () => {
+      try {
+        await api("/api/radio-cache/broadcasts/levels", {
+          method: "POST",
+          body: JSON.stringify({music: Number(musicIn.value),
+                                duck: Number(duckIn.value),
+                                voice: Number(voiceIn.value)}),
+        });
+      } catch (e) { /* the render still uses what is on screen */ }
+    };
+    [musicIn, duckIn, voiceIn].forEach((s) => { s.onchange = saveLevels; });
 
     const player = el("audio", "", "");
     player.id = "cacheMixPlayer";
@@ -46709,6 +47801,300 @@ function mindOpen(opts) {
   }
   rebuildDocs();
 
+  // --- #671: THE VECTOR DATABASE, being fed --------------------------------
+  // The documents were floating around the first station with nothing to
+  // show WHY they matter: every one of them is embedded, indexed and pulled
+  // from by cosine search, and none of that was visible. So the index sits
+  // under the documents as a core, each document is wired into it by a feed
+  // line whose brightness is how hard that document is leaned on, and every
+  // pull the booth makes fires a bead down the wire from the document that
+  // answered — the data-driven part of "data driven".
+  const vecGroup = new T.Group();
+  vecGroup.position.set(X0, -6.5, -1);
+  world.add(vecGroup);
+  const vecCore = new T.Mesh(
+    new T.IcosahedronGeometry(1.7, 1),
+    new T.MeshStandardMaterial({
+      color: MIND_THEMES[themeKey].b, emissive: MIND_THEMES[themeKey].b,
+      emissiveIntensity: 0.6, wireframe: true, transparent: true,
+      opacity: 0.85}));
+  vecGroup.add(vecCore);
+  const vecShell = new T.Mesh(
+    new T.SphereGeometry(2.5, 20, 14),
+    new T.MeshBasicMaterial({color: MIND_THEMES[themeKey].a,
+      transparent: true, opacity: 0.07, side: T.BackSide}));
+  vecGroup.add(vecShell);
+  const vecTag = makeLabel("\u{1F9EC} VECTOR INDEX");
+  vecTag.position.set(0, -3.0, 0);
+  vecTag.scale.multiplyScalar(0.6);
+  vecGroup.add(vecTag);
+  const vecStat = makeLabel("indexing…");
+  vecStat.position.set(0, -4.0, 0);
+  vecStat.scale.multiplyScalar(0.44);
+  vecGroup.add(vecStat);
+  // One feed wire per document card. Rebuilt whenever the paper is.
+  let feeds = [];
+  const feedGeo = new T.BufferGeometry();
+  const feedLines = new T.LineSegments(feedGeo, new T.LineBasicMaterial(
+    {color: MIND_THEMES[themeKey].a, transparent: true, opacity: 0.3}));
+  world.add(feedLines);
+  const beads = [];              // pulls travelling document → core
+  let vecStats = null;
+  const vecSeen = new Set();
+  function vecSync() {
+    api("/api/speakbox/vectors").then((d) => {
+      vecStats = d;
+      const uses = {};
+      (d.files || []).forEach((f) => { uses[f.file] = f.uses || 0; });
+      const most = Math.max(1, ...Object.values(uses).map(Number));
+      feeds = docCards.map((c) => ({
+        card: c,
+        weight: Math.min(1, (uses[c.userData.name] || 0) / most),
+      }));
+      vecStat.userData.text = (d.documents || 0) + " docs · "
+        + (d.chunks || 0) + " swaths · " + (d.dim || 0) + "d";
+      retexLabel(vecStat);
+    }).catch(() => {});
+  }
+  vecSync();
+  // A pull fires a bead from the document that answered into the core, then
+  // a return beam from the core to SIFT: the shape of a retrieval.
+  function vecPull(fileName, score) {
+    const from = docCards.find((c) => c.userData.name === fileName);
+    const start = from
+      ? from.getWorldPosition(new T.Vector3())
+      : new T.Vector3(X0 + (Math.random() - 0.5) * 8, 4, 0);
+    const mesh = new T.Mesh(
+      new T.SphereGeometry(0.22 + 0.22 * Math.max(0, Math.min(1, score || 0)),
+                           10, 8),
+      new T.MeshStandardMaterial({
+        color: MIND_THEMES[themeKey].b, emissive: MIND_THEMES[themeKey].b,
+        emissiveIntensity: 1.4}));
+    mesh.position.copy(start);
+    world.add(mesh);
+    beads.push({mesh, start,
+                mid: vecGroup.position.clone(),
+                end: new T.Vector3(stations[1] ? stations[1].x : X0, 0, 0),
+                t: 0});
+    if (beads.length > 24) {
+      const gone = beads.shift();
+      world.remove(gone.mesh);
+      gone.mesh.geometry.dispose();
+      gone.mesh.material.dispose();
+    }
+  }
+
+  // --- #671: the people in the broadcast -----------------------------------
+  // Host, cohost, the third chair, the sample desk, whatever guest is in —
+  // each one a unit standing at the ON AIR end, lit while they have the mic.
+  // The transcript already said who was talking; the machine never showed a
+  // single body.
+  const CAST_DEF = [
+    {who: "dj", label: "HOST", color: 0x4bb3ff},
+    {who: "cohost", label: "COHOST", color: 0x8fe388},
+    {who: "third", label: "THIRD", color: 0xffb347},
+    {who: "sfx", label: "SAMPLES", color: 0xffd479},
+    {who: "guest", label: "GUEST", color: 0xc58cff},
+    {who: "caller", label: "CALLER", color: 0xff6ec7},
+  ];
+  const castGroup = new T.Group();
+  castGroup.position.set(X0 + SPAN, -5.5, 4);
+  world.add(castGroup);
+  const cast = CAST_DEF.map((def, i) => {
+    const g = new T.Group();
+    const wide = (CAST_DEF.length - 1) / 2;
+    g.position.set((i - wide) * 2.4, 0, 0);
+    const body = new T.Mesh(
+      new T.CylinderGeometry(0.42, 0.62, 1.7, 10),
+      new T.MeshStandardMaterial({color: def.color, emissive: def.color,
+        emissiveIntensity: 0.18, roughness: 0.5, metalness: 0.3}));
+    body.position.y = 0.85;
+    g.add(body);
+    const head = new T.Mesh(
+      new T.IcosahedronGeometry(0.42, 0),
+      new T.MeshStandardMaterial({color: def.color, emissive: def.color,
+        emissiveIntensity: 0.3, flatShading: true}));
+    head.position.y = 2.05;
+    g.add(head);
+    const ring = new T.Mesh(
+      new T.TorusGeometry(0.85, 0.05, 8, 26),
+      new T.MeshBasicMaterial({color: def.color, transparent: true,
+        opacity: 0.25}));
+    ring.rotation.x = Math.PI / 2;
+    g.add(ring);
+    const tag = makeLabel(def.label,
+      "#" + def.color.toString(16).padStart(6, "0"));
+    tag.position.set(0, 2.9, 0);
+    tag.scale.multiplyScalar(0.42);
+    g.add(tag);
+    castGroup.add(g);
+    return {def, group: g, body, head, ring, tag, live: 0, here: true};
+  });
+  let castSeenTs = 0;
+  function castSync() {
+    const st = (typeof djLastState !== "undefined" && djLastState) || {};
+    const names = st.dj_names || {};
+    const label = {dj: names.host, cohost: names.cohost, third: names.third,
+                   guest: names.guest};
+    cast.forEach((c) => {
+      // Somebody who is not in the building is not drawn.
+      const named = label[c.def.who];
+      const optional = ["third", "guest", "caller"].includes(c.def.who);
+      const on = c.def.who === "caller"
+        ? (st.chat || []).slice(-12).some((l) => l.who === "caller")
+        : (optional ? !!named : true);
+      c.here = on;
+      c.group.visible = on;
+      const want = String(named || c.def.label);
+      if (on && c.tag.userData.text !== want) {
+        c.tag.userData.text = want;
+        retexLabel(c.tag);
+      }
+    });
+    // Who just spoke: the newest line in the booth feed wins the light.
+    const lines = (st.chat || []);
+    const last = lines[lines.length - 1];
+    if (last && (last.ts || 0) > castSeenTs) {
+      castSeenTs = last.ts || 0;
+      const hit = cast.find((c) => c.def.who
+        === (last.kind === "sfx" ? "sfx" : last.who));
+      if (hit) hit.live = 1;
+    }
+  }
+
+  // --- #671: the sleeve in the air, and the queue swirling round it --------
+  // The record on air as a floating sleeve, with the next tracks orbiting it
+  // as smaller ones. Click a small one to put it up next; shift-click to
+  // send it to the back. The queue was visible in a list nobody looks at
+  // while the machine is on screen.
+  const sleeveGroup = new T.Group();
+  sleeveGroup.position.set(X0 + SPAN, 5.5, 0);
+  world.add(sleeveGroup);
+  const sleeveTex = new T.TextureLoader();
+  const nowSleeve = new T.Mesh(
+    new T.PlaneGeometry(4.4, 4.4),
+    new T.MeshBasicMaterial({color: 0x203040, transparent: true,
+      opacity: 0.95, side: T.DoubleSide}));
+  sleeveGroup.add(nowSleeve);
+  const queueSleeves = [];
+  let sleeveKey = "";
+  let hoverSleeve = null;
+  function sleeveArt(mesh, url) {
+    if (!url || mesh.userData.art === url) return;
+    mesh.userData.art = url;
+    sleeveTex.load(url, (tex) => {
+      if (!mesh.parent) { tex.dispose(); return; }
+      if (mesh.material.map) mesh.material.map.dispose();
+      mesh.material.map = tex;
+      mesh.material.color.setHex(0xffffff);
+      mesh.material.needsUpdate = true;
+    }, undefined, () => {});
+  }
+  function sleeveSync() {
+    const st = (typeof djLastState !== "undefined" && djLastState) || {};
+    if (st.now && st.now.art) sleeveArt(nowSleeve, st.now.art);
+    const up = (st.upcoming || []).slice(0, 9);
+    const key = up.map((t) => t.id).join("|");
+    if (key === sleeveKey) return;
+    sleeveKey = key;
+    while (queueSleeves.length) {
+      const gone = queueSleeves.pop();
+      sleeveGroup.remove(gone);
+      if (gone === hoverSleeve) hoverSleeve = null;
+      gone.geometry.dispose();
+      if (gone.material.map) gone.material.map.dispose();
+      gone.material.dispose();
+    }
+    up.forEach((t, i) => {
+      const m = new T.Mesh(
+        new T.PlaneGeometry(1.5, 1.5),
+        new T.MeshBasicMaterial({color: 0x2a3a4d, transparent: true,
+          opacity: 0.92, side: T.DoubleSide}));
+      m.userData = {id: t.id, title: t.title || "", artist: t.artist || "",
+                    ang: (i / Math.max(1, up.length)) * Math.PI * 2,
+                    rad: 5.4 + (i % 3) * 0.8, at: i, art: ""};
+      sleeveArt(m, t.art);
+      sleeveGroup.add(m);
+      queueSleeves.push(m);
+    });
+  }
+  async function sleeveClick(mesh, toBack) {
+    try {
+      const got = await api("/api/dj/queue/move", {
+        method: "POST",
+        body: JSON.stringify({id: mesh.userData.id,
+                              to: toBack ? "back" : "front"}),
+      });
+      setStatus((got.title || "that one") + (toBack
+        ? " → back of the queue" : " → up next"));
+      sleeveKey = "";                        // force a redraw on the next tick
+      if (typeof pollDJ === "function") pollDJ();
+    } catch (e) { setStatus(e.message, true); }
+  }
+
+  // --- #675: the plexus atmosphere ----------------------------------------
+  // Not wallpaper: a point per swath in the vector index, threaded to its
+  // neighbours, breathing on a noise field. It brightens where the machine
+  // is working, flares on every activation, and now and then a random
+  // handful takes an excursion — thrown outward and drawn back — so the
+  // field reads as something alive and sampled rather than a fixed lattice.
+  const PLEX_N = 300, PLEX_LINKS = 900;
+  const plexPos = new Float32Array(PLEX_N * 3);
+  const plexHome = [];
+  const plexPhase = new Float32Array(PLEX_N);
+  const plexHeat = new Float32Array(PLEX_N);
+  const plexKick = new Float32Array(PLEX_N * 3);
+  for (let i = 0; i < PLEX_N; i += 1) {
+    // A shell around the whole machine, denser toward the middle of the rail.
+    const a = Math.random() * Math.PI * 2;
+    const u = Math.random() * 2 - 1;
+    const r = 22 + Math.random() * 20;
+    const home = new T.Vector3(
+      (Math.random() - 0.5) * (SPAN + 26),
+      u * r * 0.42,
+      Math.sqrt(Math.max(0, 1 - u * u)) * Math.sin(a) * r * 0.55 - 4);
+    plexHome.push(home);
+    plexPhase[i] = Math.random() * Math.PI * 2;
+    plexPos[i * 3] = home.x;
+    plexPos[i * 3 + 1] = home.y;
+    plexPos[i * 3 + 2] = home.z;
+  }
+  const plexGeo = new T.BufferGeometry();
+  plexGeo.setAttribute("position", new T.BufferAttribute(plexPos, 3));
+  const plexPoints = new T.Points(plexGeo, new T.PointsMaterial(
+    {color: MIND_THEMES[themeKey].a, size: 0.34, transparent: true,
+     opacity: 0.55, depthWrite: false}));
+  world.add(plexPoints);
+  const plexLinkGeo = new T.BufferGeometry();
+  plexLinkGeo.setAttribute("position",
+    new T.BufferAttribute(new Float32Array(PLEX_LINKS * 6), 3));
+  const plexLines = new T.LineSegments(plexLinkGeo, new T.LineBasicMaterial(
+    {color: MIND_THEMES[themeKey].a, transparent: true, opacity: 0.13,
+     depthWrite: false}));
+  world.add(plexLines);
+  let plexExcursion = 0;
+  // An activation lights the nearest points and shoves them: the field
+  // reacts to the machine rather than ignoring it.
+  function plexFlare(x, strength) {
+    for (let i = 0; i < PLEX_N; i += 1) {
+      const d = Math.abs(plexHome[i].x - x);
+      if (d > 12) continue;
+      const near = 1 - d / 12;
+      plexHeat[i] = Math.min(1.6, plexHeat[i] + near * (strength || 1));
+    }
+  }
+  function plexExcurse() {
+    // The randomization excursion: a handful thrown off their homes.
+    const many = 8 + Math.floor(Math.random() * 22);
+    for (let k = 0; k < many; k += 1) {
+      const i = Math.floor(Math.random() * PLEX_N);
+      plexKick[i * 3] = (Math.random() - 0.5) * 26;
+      plexKick[i * 3 + 1] = (Math.random() - 0.5) * 20;
+      plexKick[i * 3 + 2] = (Math.random() - 0.5) * 26;
+      plexHeat[i] = 1.4;
+    }
+  }
+
   // --- held-message swarm (#541): lines that can't reach the box pile on
   // the hold shelf — show them as motes building up and undulating slowly
   // inside the mind, so the backlog is visibly ALIVE, not just a number.
@@ -46902,8 +48288,27 @@ function mindOpen(opts) {
       if (ev.ts) since = Math.max(since, ev.ts);
       spawnPacket(ev.kind, ev.text || "");
       if (ev.kind === "model" && ev.text) wordRealign(ev.text);
+      // #675: the atmosphere lights up where the machine is working, not on
+      // a timer — every event flares the field at its own station.
+      const at = MIND_KIND_STATION[ev.kind];
+      plexFlare(stations[at != null ? at : 0].x, 1);
       seen.push("› " + (ev.kind || "?") + " · "
         + String(ev.text || "").slice(0, 90));
+    });
+    // #671: every pull the booth made out of the vector index, as a bead
+    // travelling from the document that answered, through the core, into
+    // SIFT. djLastState carries them; they were only ever a list of rows.
+    const va = ((typeof djLastState !== "undefined" && djLastState)
+                || {}).vector_access || [];
+    va.slice().reverse().forEach((v) => {
+      // The stamp is whole seconds and two pulls can share one, so the key
+      // carries the document as well.
+      const key = (v.ts || 0) + "|" + (v.file || "") + "|" + (v.score || "");
+      if (!v.ts || vecSeen.has(key)) return;
+      vecSeen.add(key);
+      if (vecSeen.size > 120) vecSeen.clear();
+      vecPull(v.file || "", Number(v.score) || 0.5);
+      plexFlare(X0, 1.3);
     });
     if (seen.length > 8) seen.splice(0, seen.length - 8);
     cap.textContent = seen.join("\n");
@@ -47078,6 +48483,17 @@ function mindOpen(opts) {
     });
     buildField(th);                    // the ambient universe behind it all
     docCards.forEach((c) => c.material.emissive.setHex(th.fog));
+    // #671/#675: the index, its wiring and the atmosphere wear the theme
+    // too — a palette switch that leaves half the scene behind is not a
+    // palette switch.
+    vecCore.material.color.setHex(th.b);
+    vecCore.material.emissive.setHex(th.b);
+    vecShell.material.color.setHex(th.a);
+    feedLines.material.color.setHex(th.a);
+    plexPoints.material.color.setHex(th.a);
+    plexLines.material.color.setHex(th.a);
+    retexLabel(vecTag, th.lab);
+    retexLabel(vecStat, th.lab);
     // The two waveform traces take the theme too (#634).
     waves.forEach((w) => w.line.material.color.setHex(
       w.kind === "raw" ? th.a : th.b));
@@ -47118,20 +48534,51 @@ function mindOpen(opts) {
   });
   // Named + removed on close (audit #1/#4/#9): an anonymous window listener
   // leaked the whole scene closure on every open/close cycle.
+  const castNdc = (e) => {
+    const r = renderer.domElement.getBoundingClientRect();
+    ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
+    ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
+    ray.setFromCamera(ndc, camera);
+  };
   const onUp = (e) => {
-    if (dragging && moved < 6 && docCards.length) {
-      const r = renderer.domElement.getBoundingClientRect();
-      ndc.x = ((e.clientX - r.left) / r.width) * 2 - 1;
-      ndc.y = -((e.clientY - r.top) / r.height) * 2 + 1;
-      ray.setFromCamera(ndc, camera);
-      const hit = ray.intersectObjects(docCards, false)[0];
-      if (hit && hit.object.userData.name) mindReader(hit.object.userData.name);
+    if (dragging && moved < 6) {
+      castNdc(e);
+      // #671: a sleeve in the swirl is reordered where it floats — click to
+      // put it up next, shift-click to send it to the back. The queue used
+      // to be readable everywhere and writable nowhere.
+      const sleeve = queueSleeves.length
+        ? ray.intersectObjects(queueSleeves, false)[0] : null;
+      if (sleeve) {
+        sleeveClick(sleeve.object, !!e.shiftKey);
+        dragging = false;
+        return;
+      }
+      if (docCards.length) {
+        const hit = ray.intersectObjects(docCards, false)[0];
+        if (hit && hit.object.userData.name) {
+          mindReader(hit.object.userData.name);
+        }
+      }
     }
     dragging = false;
   };
   window.addEventListener("pointerup", onUp);
   renderer.domElement.addEventListener("pointermove", (e) => {
-    if (!dragging) return;
+    if (!dragging) {
+      // Hover a sleeve: it grows, and the canvas says what it is.
+      if (!queueSleeves.length) { hoverSleeve = null; return; }
+      castNdc(e);
+      const hit = ray.intersectObjects(queueSleeves, false)[0];
+      hoverSleeve = hit ? hit.object : null;
+      renderer.domElement.style.cursor = hoverSleeve ? "pointer" : "";
+      renderer.domElement.title = hoverSleeve
+        ? (hoverSleeve.userData.title || "a record")
+          + (hoverSleeve.userData.artist
+             ? " — " + hoverSleeve.userData.artist : "")
+          + "\nclick: up next · shift-click: to the back of the queue"
+        : "";
+      return;
+    }
     moved += Math.abs(e.clientX - lx) + Math.abs(e.clientY - ly);
     yaw += (e.clientX - lx) * 0.005; pitch += (e.clientY - ly) * 0.005;
     pitch = Math.max(-0.9, Math.min(0.9, pitch));
@@ -47197,6 +48644,7 @@ function mindOpen(opts) {
 
   // --- loop ----------------------------------------------------------------
   let raf = 0, alive = true;
+  let vecSyncAt = -99, castSyncAt = -99;
   const clock = new T.Clock();
   function tick() {
     if (!alive) return;
@@ -47251,6 +48699,148 @@ function mindOpen(opts) {
           * (0.6 + 0.4 * Math.sin(t * 2));
       }
     }
+
+    // --- #675: the plexus atmosphere ------------------------------------
+    // Every point breathes on its own phase, drifts on a slow field, and
+    // carries a heat that decays — so the whole cloud shifts and undulates
+    // instead of sitting still, and the parts the machine just touched are
+    // the bright ones.
+    {
+      const arr = plexGeo.attributes.position.array;
+      for (let i = 0; i < PLEX_N; i += 1) {
+        const home = plexHome[i];
+        const ph = plexPhase[i];
+        // The kick decays back to zero, which is what makes an excursion a
+        // journey out and home rather than a teleport.
+        plexKick[i * 3] *= 1 - Math.min(1, dt * 1.1);
+        plexKick[i * 3 + 1] *= 1 - Math.min(1, dt * 1.1);
+        plexKick[i * 3 + 2] *= 1 - Math.min(1, dt * 1.1);
+        plexHeat[i] = Math.max(0, plexHeat[i] - dt * 0.55);
+        const swell = 1 + plexHeat[i] * 0.22;
+        arr[i * 3] = home.x * swell
+          + Math.sin(t * 0.32 + ph) * 1.5 + plexKick[i * 3];
+        arr[i * 3 + 1] = home.y * swell
+          + Math.sin(t * 0.47 + ph * 1.7) * 1.7 + plexKick[i * 3 + 1];
+        arr[i * 3 + 2] = home.z * swell
+          + Math.cos(t * 0.29 + ph * 0.8) * 1.5 + plexKick[i * 3 + 2];
+      }
+      plexGeo.attributes.position.needsUpdate = true;
+      // Thread the near neighbours. Sampled rather than exhaustive: the
+      // full O(n²) at 300 points is 45k distance tests every frame.
+      const la = plexLinkGeo.attributes.position.array;
+      let cur = 0;
+      for (let i = 0; i < PLEX_N && cur < PLEX_LINKS; i += 1) {
+        for (let k = 1; k <= 6 && cur < PLEX_LINKS; k += 1) {
+          const j = (i + k * 7) % PLEX_N;
+          const dx = arr[i * 3] - arr[j * 3];
+          const dy = arr[i * 3 + 1] - arr[j * 3 + 1];
+          const dz = arr[i * 3 + 2] - arr[j * 3 + 2];
+          if (dx * dx + dy * dy + dz * dz < 46) {
+            la.set([arr[i * 3], arr[i * 3 + 1], arr[i * 3 + 2],
+                    arr[j * 3], arr[j * 3 + 1], arr[j * 3 + 2]], cur * 6);
+            cur += 1;
+          }
+        }
+      }
+      plexLinkGeo.setDrawRange(0, cur * 2);
+      plexLinkGeo.attributes.position.needsUpdate = true;
+      let hot = 0;
+      for (let i = 0; i < PLEX_N; i += 1) hot += plexHeat[i];
+      hot = Math.min(1, hot / (PLEX_N * 0.25));
+      plexLines.material.opacity = 0.09 + hot * 0.3;
+      plexPoints.material.opacity = 0.45 + hot * 0.45;
+      plexPoints.material.size = 0.3 + hot * 0.3;
+      // The randomization excursion, on its own irregular clock.
+      plexExcursion -= dt;
+      if (plexExcursion <= 0) {
+        plexExcursion = 4 + Math.random() * 9;
+        plexExcurse();
+      }
+    }
+
+    // --- #671: the vector index, fed and pulled from ---------------------
+    vecCore.rotation.y += dt * 0.35;
+    vecCore.rotation.x += dt * 0.12;
+    vecShell.scale.setScalar(1 + Math.sin(t * 0.9) * 0.05);
+    if (t - vecSyncAt > 12) { vecSyncAt = t; vecSync(); castSync(); sleeveSync(); }
+    else if (t - castSyncAt > 0.9) {
+      castSyncAt = t; castSync(); sleeveSync();
+    }
+    {
+      // The feed wires, redrawn each frame because the paper is orbiting.
+      const need = feeds.length * 2;
+      if (!feedGeo.attributes.position
+          || feedGeo.attributes.position.count < need) {
+        feedGeo.setAttribute("position", new T.BufferAttribute(
+          new Float32Array(Math.max(2, need) * 3), 3));
+      }
+      const fa = feedGeo.attributes.position.array;
+      const core = vecGroup.position;
+      let n = 0;
+      feeds.forEach((f) => {
+        if (!f.card.parent) return;
+        const p = f.card.getWorldPosition(new T.Vector3());
+        fa.set([p.x, p.y, p.z, core.x, core.y, core.z], n * 6);
+        n += 1;
+      });
+      feedGeo.setDrawRange(0, n * 2);
+      feedGeo.attributes.position.needsUpdate = true;
+      feedLines.material.opacity = 0.16 + 0.14 * (0.5 + 0.5 * Math.sin(t * 1.6));
+    }
+    for (let k = beads.length - 1; k >= 0; k -= 1) {
+      const b = beads[k];
+      b.t += dt * 0.55;
+      // Document → core → SIFT: a retrieval has two legs, and the bend at
+      // the core is the point.
+      if (b.t < 0.5) {
+        b.mesh.position.lerpVectors(b.start, b.mid, b.t * 2);
+      } else {
+        b.mesh.position.lerpVectors(b.mid, b.end, (b.t - 0.5) * 2);
+        vecCore.material.emissiveIntensity = 1.6;
+      }
+      b.mesh.material.emissiveIntensity = 1.2 + Math.sin(t * 9) * 0.4;
+      if (b.t >= 1) {
+        world.remove(b.mesh);
+        b.mesh.geometry.dispose();
+        b.mesh.material.dispose();
+        beads.splice(k, 1);
+        if (stations[1]) stations[1].active = 1;
+      }
+    }
+    vecCore.material.emissiveIntensity +=
+      (0.6 - vecCore.material.emissiveIntensity) * Math.min(1, dt * 2);
+
+    // --- #671: the cast, lit by whoever has the mic ----------------------
+    cast.forEach((c, i) => {
+      if (!c.here) return;
+      c.live = Math.max(0, c.live - dt * 0.45);
+      const lift = c.live * 0.55 + Math.sin(t * 1.1 + i) * 0.06;
+      c.group.position.y = lift;
+      c.head.rotation.y += dt * (0.5 + c.live * 3);
+      c.body.material.emissiveIntensity = 0.18 + c.live * 1.5;
+      c.head.material.emissiveIntensity = 0.3 + c.live * 1.7;
+      c.ring.material.opacity = 0.2 + c.live * 0.7;
+      c.ring.scale.setScalar(1 + c.live * 0.45);
+      const s = c.tag.userData.base;
+      const grow = 1 + c.live * 0.35;
+      c.tag.scale.set(s.x * grow, s.y * grow, 1);
+    });
+
+    // --- #671: the sleeve in the air, the queue swirling round it --------
+    nowSleeve.lookAt(camera.position);
+    nowSleeve.scale.setScalar(1 + Math.sin(t * 0.8) * 0.03);
+    queueSleeves.forEach((m, i) => {
+      const u = m.userData;
+      u.ang += dt * (0.16 + (i % 3) * 0.03);
+      // Nearer the front of the queue = nearer the sleeve, and bigger.
+      const rank = 1 - u.at / Math.max(1, queueSleeves.length);
+      m.position.set(Math.cos(u.ang) * u.rad,
+                     Math.sin(u.ang * 1.6) * 1.5,
+                     Math.sin(u.ang) * u.rad);
+      const size = 0.72 + rank * 0.5 + (m === hoverSleeve ? 0.25 : 0);
+      m.scale.setScalar(size);
+      m.lookAt(camera.position);
+    });
 
     // Held messages build up and swirl slowly (#541) — ressynced ~1/s.
     if (t - heldSyncAt > 1) { heldSyncAt = t; heldSync(); }
@@ -50380,9 +51970,113 @@ function studioVoicesTab(host) {
     bar.appendChild(button);
   }
   host.appendChild(bar);
+  // #682: the combine bar lives above the list and only appears when there
+  // is something to combine.
+  const merge = el("div", "", "");
+  merge.id = "studioMergeBar";
+  host.appendChild(merge);
   const list = el("div", "", "");
   list.id = "studioVoiceList";
   host.appendChild(list);
+  studioVoicesDraw();
+}
+
+/* ---- Combining split speakers back into one shard (#682) ---- */
+// Which rows are picked, and where the last plain click landed so shift can
+// take the range between them.
+const studioPicked = new Set();
+let studioPickAnchor = "";
+
+function studioMergeBar() {
+  const host = document.getElementById("studioMergeBar");
+  if (!host) return;
+  host.innerHTML = "";
+  const ids = studioState.voices.map((v) => v.id)
+    .filter((id) => studioPicked.has(id));
+  if (!ids.length) return;
+  const picked = studioState.voices.filter((v) => studioPicked.has(v.id));
+  const bar = el("div", "merge-bar", "");
+  const what = el("span", "", "🧬 " + ids.length + " picked");
+  what.style.fontWeight = "700";
+  bar.appendChild(what);
+  const who = el("span", "muted", picked.map((v) => v.name).join(" · "));
+  who.style.cssText = "flex:1;min-width:120px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  who.title = picked.map((v) => v.name).join("\n");
+  bar.appendChild(who);
+  const clear = el("button", "", "clear");
+  clear.onclick = () => {
+    studioPicked.clear(); studioPickAnchor = ""; studioVoicesDraw();
+  };
+  bar.appendChild(clear);
+  if (ids.length < 2) {
+    const hint = el("span", "muted",
+      "shift-click another row to take the range");
+    hint.style.fontSize = "11px";
+    bar.appendChild(hint);
+    host.appendChild(bar);
+    return;
+  }
+  // The unified name: the common stem when the parts share one, which is
+  // the usual case straight out of a speaker split.
+  const stems = picked.map((v) => String(v.name).split("·")[0].trim());
+  const name = el("input", "", "");
+  name.type = "text";
+  name.placeholder = "name for the unified shard";
+  name.value = (stems.every((s) => s === stems[0]) && stems[0]) ? stems[0] : "";
+  name.style.cssText = "flex:0 1 190px;min-width:120px;font-size:12px";
+  bar.appendChild(name);
+  const sweepLbl = el("label", "", "");
+  sweepLbl.style.cssText = "display:flex;align-items:center;gap:5px;"
+    + "cursor:pointer;font-size:11px";
+  const sweep = el("input", "", "");
+  sweep.type = "checkbox";
+  sweep.checked = true;
+  sweepLbl.appendChild(sweep);
+  sweepLbl.appendChild(document.createTextNode("delete the parts"));
+  sweepLbl.title = "The fragments were the mistake — sweep them up once the "
+    + "unified shard exists. Off, they are left in the library.";
+  bar.appendChild(sweepLbl);
+  const go = el("button", "primary", "⇥ Combine into one shard");
+  go.title = "Join these references end to end into one voice, average "
+    + "their signatures, and keep the result as an ordinary library voice";
+  go.onclick = async () => {
+    const done = pending(go, "…");
+    try {
+      const got = await api("/api/voices/merge", {
+        method: "POST",
+        body: JSON.stringify({ids: ids, name: name.value.trim(),
+                              delete_sources: sweep.checked}),
+      });
+      studioPicked.clear(); studioPickAnchor = "";
+      await loadCloneVoices();
+      await studioLoad();
+      studioVoicesDraw();
+      studioSay("combined " + ids.length + " into “" + got.name
+        + "” ✓" + (got.deleted.length
+          ? " · " + got.deleted.length + " parts swept up" : ""));
+    } catch (error) { studioSay(error.message, true); }
+    finally { done(); }
+  };
+  bar.appendChild(go);
+  host.appendChild(bar);
+}
+
+function studioPickRow(voice, event) {
+  const order = studioState.voices.map((v) => v.id);
+  if (event && event.shiftKey && studioPickAnchor
+      && order.includes(studioPickAnchor)) {
+    const a = order.indexOf(studioPickAnchor);
+    const b = order.indexOf(voice.id);
+    order.slice(Math.min(a, b), Math.max(a, b) + 1)
+      .forEach((id) => studioPicked.add(id));
+  } else {
+    if (studioPicked.has(voice.id)) studioPicked.delete(voice.id);
+    else studioPicked.add(voice.id);
+    studioPickAnchor = voice.id;
+  }
+  // A shift-drag leaves the browser's own text selection behind it.
+  try { window.getSelection().removeAllRanges(); } catch (e) {}
   studioVoicesDraw();
 }
 
@@ -50390,13 +52084,32 @@ function studioVoicesDraw() {
   const list = document.getElementById("studioVoiceList");
   if (!list) return;
   list.innerHTML = "";
+  // Rows that no longer exist cannot stay picked.
+  const live = new Set(studioState.voices.map((v) => v.id));
+  [...studioPicked].forEach((id) => { if (!live.has(id)) studioPicked.delete(id); });
+  studioMergeBar();
   if (!studioState.voices.length) {
     list.appendChild(el("div", "muted",
       "No voices yet. Import the reachy voices, paste a YouTube URL, "
       + "or record one on the mic."));
   }
   for (const voice of studioState.voices) {
-    const row = el("div", "voice-row", "");
+    const row = el("div", "voice-row"
+      + (studioPicked.has(voice.id) ? " picked" : ""), "");
+    // #682: pick rows to combine. Click toggles one, shift-click takes the
+    // range from the last one you touched — the same gesture as a file
+    // manager, because that is what this list is.
+    const grip = el("span", "grip",
+      studioPicked.has(voice.id) ? "☑" : "☐");
+    grip.title = "Pick this voice — shift-click another to take the range, "
+      + "then combine them into one shard";
+    row.appendChild(grip);
+    row.onclick = (event) => {
+      // The name is the rename handle — a click there must not redraw the
+      // list out from under the double-click that opens the editor.
+      if (event.target.closest("button, input, select, a, .name")) return;
+      studioPickRow(voice, event);
+    };
     row.appendChild(el("span", voice.internalized ? "vglow" : "",
                        voice.internalized ? "🧬" : "🎙"));
     const name = el("span", "name", voice.name);
