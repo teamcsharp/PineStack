@@ -5013,6 +5013,29 @@ def remote_stages() -> list[dict[str, Any]]:
     ]
 
 
+_FUNNEL_SEEN: dict[str, Any] = {"at": 0.0, "up": False}
+
+
+def _funnel_live(magic: str) -> bool:
+    """Is Funnel actually carrying the listener door right now?
+
+    Asked by connecting to our own public name on 443 — the honest test,
+    since Funnel terminates TLS out at Tailscale's edge and there is
+    nothing local to inspect without the control socket. Cached, because
+    this runs on a panel poll and a TCP connect to the edge is not free."""
+    if time.time() - float(_FUNNEL_SEEN.get("at") or 0) < 120:
+        return bool(_FUNNEL_SEEN.get("up"))
+    up = False
+    try:
+        import socket
+        with socket.create_connection((magic, 443), timeout=2.5):
+            up = True
+    except Exception:
+        up = False
+    _FUNNEL_SEEN.update({"at": time.time(), "up": up})
+    return up
+
+
 def remote_access(fresh: bool = False) -> dict[str, Any]:
     """Every address this station answers on, and what is carrying them.
 
@@ -5042,6 +5065,15 @@ def remote_access(fresh: bool = False) -> dict[str, Any]:
     if magic:
         urls.append({"label": "MagicDNS", "kind": "tailscale",
                      "url": f"http://{magic}:{STATION_PORT}"})
+        # #687: the public door, if Funnel is carrying it. Tailscale
+        # terminates TLS on 443 and proxies to the listener port, so this
+        # is the address for someone with no Tailscale, no account and no
+        # invitation — a link you can hand to anybody. Listed last and
+        # only when Funnel is actually up, because an address that does
+        # not answer is worse than one that is missing.
+        if PUBLIC_ENABLED and _funnel_live(magic):
+            urls.append({"label": "Public link", "kind": "funnel",
+                         "url": f"https://{magic}"})
     stages = remote_stages()
     daemon = _iface_present() or bool(v4)
     left = [s for s in stages if not s["done"] and not s["mine"]]
@@ -24901,6 +24933,13 @@ async def share_make(
     if want:
         chosen = next((u["url"] for u in net["urls"]
                        if u["kind"] == want or u["label"].lower() == want), "")
+    # #687: when the public door is up, that is the address to hand out —
+    # it is the only one that works for somebody with no Tailscale, no
+    # account and no invitation, which is the whole point of a share link.
+    # A listener token is all it opens, so this is safe to default to.
+    if not chosen:
+        chosen = next((u["url"] for u in net["urls"]
+                       if u["kind"] == "funnel"), "")
     if not chosen:
         host_hdr = (request.headers.get("host") or "").strip()
         if host_hdr:
