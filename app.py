@@ -27856,6 +27856,48 @@ async def health_details(
         except Exception:
             pass
 
+        # #672: "HTTP 200" answers the wrong question. A port that answers is
+        # not the same as a service the pair can actually use, and three of
+        # these had nothing beside them but the status code — so a working
+        # stack read as a half-dead one. Each line now says what the service
+        # DOES for the station, and falls back to the status code only when
+        # there is genuinely nothing better to say.
+        def can(name: str, line: str) -> None:
+            if services.get(name, {}).get("ok") and line:
+                services[name]["detail"] = line
+
+        try:
+            loaded = services.get("ollama", {}).get("loaded") or []
+            can("ollama", (f"{len(loaded)} model(s) resident — the pair are "
+                           f"writing with these" if loaded
+                           else "ready, loads on first line written"))
+        except Exception:
+            pass
+        try:
+            hits = [f for f in services.get("searxng", {}).get("facts") or []
+                    if "results" in f]
+            can("searxng", (hits[0].replace("agent engines ", "search via ")
+                            if hits else "search ready"))
+        except Exception:
+            pass
+        try:
+            player = _ha_creds()[1] or ""
+            can("home-assistant", (f"speaking through {player}" if player
+                                   else "connected, no voice-out picked yet"))
+        except Exception:
+            pass
+        try:
+            can("open-webui", ("connected, key set" if OPENWEBUI_API_KEY
+                               else "connected, no API key"))
+        except Exception:
+            pass
+        try:
+            qf = [f for f in services.get("comfyui", {}).get("facts") or []
+                  if f.startswith("queue:")]
+            can("comfyui", (("painting — " + qf[0]) if qf else "ready to paint"))
+        except Exception:
+            pass
+
     gens = _read_all_generations()
     services["spark-agent"] = {
         "ok": True,
