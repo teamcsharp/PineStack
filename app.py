@@ -11967,6 +11967,11 @@ def ad_line_mark(ad_id: str, product: str, audio: str = "") -> None:
             entry["product"] = str(product or "")[:160]
             if audio:
                 entry["ad_audio"] = str(audio)
+                # #733: /ads-audio is signed exactly like /media, and
+                # a plain <a download> cannot send a bearer header. The
+                # signature never rode along on the booth line, so the
+                # "keep it" link on every ad answered 401.
+                entry["ad_sig"] = media_sign(str(audio))
             return
         # Only look back over the handful of lines an ad can span.
         if entry.get("kind") not in ("ad", "sfx"):
@@ -12838,6 +12843,7 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
         "ad_id": str(entry.get("id") or ""),
         "product": str(entry.get("product") or "")[:160],
         "ad_audio": name,
+        "ad_sig": media_sign(name),          # #733
         "voice": str(entry.get("voice") or ""),
         "aired": "box" if ad_to in ("box", "both") else "page",
     })
@@ -22994,6 +23000,59 @@ async def voices_preview(
     )
     return {"url": f"{made['path']}?t={made['sig']}", "ms": made["ms"],
             "engine": made["engine"]}
+
+
+@app.post("/api/voices/{vid}/compare")
+async def voices_compare(
+    vid: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The same line, the same voice, through every cloning engine that
+    is up — so you can hear the difference instead of reading about it.
+
+    Measured across 59 paired voices, F5 is +0.12 identity on
+    normal-length copy and worse on one-word interjections, and it is
+    roughly five times faster. Those are averages; this is the voice you
+    actually care about, so listen rather than trust the mean."""
+    require_auth(authorization)
+    if not voice_meta(vid):
+        raise HTTPException(status_code=404, detail="No such voice")
+    if voice_ref_path(vid) is None:
+        raise HTTPException(status_code=400,
+                            detail="That voice has no reference to clone")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    text = str(payload.get("text") or "").strip() or (
+        "This is the same line, in the same voice, rendered by a "
+        "different engine.")
+    text = text[:VOICE_MAX_CHARS]
+    want = payload.get("engines")
+    engines = [e for e in (want if isinstance(want, list)
+                           else ["xtts", "f5"])
+               if e in ("xtts", "f5")] or ["xtts", "f5"]
+
+    rows: list[dict[str, Any]] = []
+    for engine in engines:
+        started = time.time()
+        try:
+            made = await voice_generate(text, vid, engine)
+            rows.append({
+                "engine": engine,
+                "url": f"{made['path']}?t={made['sig']}",
+                "ms": made["ms"], "bytes": made["bytes"],
+            })
+        except HTTPException as exc:
+            rows.append({"engine": engine,
+                         "error": str(exc.detail)[:200],
+                         "ms": int((time.time() - started) * 1000)})
+        except Exception as exc:  # noqa: BLE001
+            rows.append({"engine": engine,
+                         "error": f"{type(exc).__name__}: {exc}"[:200],
+                         "ms": int((time.time() - started) * 1000)})
+    return {"voice": vid, "text": text, "takes": rows}
 
 
 @app.post("/api/voices/simulacrum")
@@ -40511,6 +40570,9 @@ const BOOTH_WHO = {
   drop: {color: "#ef6461", tag: "drop"},
   sfx: {color: "#ffd479", tag: "sfx"},
 };
+// #705/#737: one number for how tall the trace is, used by BOTH the CSS
+// and the backing store, so they can never disagree and drift.
+const BOOTH_SPEC_H = 104;
 let boothGlassRaf = 0;
 const boothBubbles = [];
 let boothSellSeen = "";
@@ -40526,7 +40588,8 @@ function boothGlass() {
   // could see moving but not read. The trace needs vertical room for its
   // frequency axis to mean anything, and the room strip under it was being
   // squeezed to a single wrapped line of 10px text.
-  canvas.style.cssText = "display:block;width:100%;height:104px";
+  canvas.style.cssText = "display:block;width:100%;height:"
+    + BOOTH_SPEC_H + "px";
   wrap.appendChild(canvas);
   // Who is in the room, and which of them has the mic.
   const room = el("div", "", "");
@@ -40696,8 +40759,18 @@ function boothGlassDraw() {
   if (!canvas || !canvas.offsetParent || document.hidden) return;
   const ctx = canvas.getContext("2d");
   const ratio = window.devicePixelRatio || 1;
-  const width = canvas.width = Math.max(1, canvas.clientWidth * ratio);
-  const height = canvas.height = Math.max(1, canvas.clientHeight * ratio);
+  // #737: the backing store used to be reassigned EVERY FRAME from
+  // clientWidth/clientHeight. Writing canvas.width resets the whole
+  // context sixty times a second, and measuring a percentage-width
+  // canvas from inside its own draw — while the panel is being
+  // scrolled and the flex parent is relaying out — lets a rounding
+  // error feed back on itself until the thing is a sliver. Measure,
+  // and only resize when the size has ACTUALLY changed.
+  const wantW = Math.max(1, Math.round(canvas.clientWidth * ratio));
+  const wantH = Math.max(1, Math.round(BOOTH_SPEC_H * ratio));
+  if (canvas.width !== wantW) canvas.width = wantW;
+  if (canvas.height !== wantH) canvas.height = wantH;
+  const width = canvas.width, height = canvas.height;
   ctx.clearRect(0, 0, width, height);
 
   const live = boothLiveWho();
@@ -41212,8 +41285,42 @@ function djTalkRender(state) {
       const head = el("div", "", "📣 " + (line.product || line.text
         || "an ad read"));
       head.style.cssText = "font-size:11.5px;color:#ffd479;font-weight:600;"
-        + "width:100%";
+        + "flex:1;min-width:0";
       row.appendChild(head);
+      // #732: play and download ON the tile, beside the name, rather
+      // than only in the action row underneath. The heading now shares
+      // its line with two icons so the spot is one click from being
+      // heard or kept, wherever you are in the list.
+      (function () {
+        const url = line.media && line.sig
+          ? "/media/" + encodeURIComponent(line.media)
+            + "?t=" + encodeURIComponent(line.sig)
+          : (line.ad_audio
+              ? "/ads-audio/" + encodeURIComponent(line.ad_audio)
+                + (line.ad_sig
+                   ? "?t=" + encodeURIComponent(line.ad_sig) : "")
+              : "");
+        if (!url) return;
+        const go = el("button", "", "\u25b6");
+        go.title = "Play this spot — click again to stop";
+        go.style.cssText = "flex:0 0 auto;background:none;border:0;"
+          + "cursor:pointer;font-size:12px;color:#ffd479;padding:0 3px";
+        go.onclick = (ev) => {
+          ev.stopPropagation();
+          clipToggle(url, go, "\u25b6");
+        };
+        row.appendChild(go);
+        const save = el("a", "", "\u2b07");
+        save.href = url;
+        save.download = ((line.product || "ad")
+          .replace(/[^\w -]+/g, "").slice(0, 48) || "ad")
+          + (line.media && line.media.endsWith(".mp3") ? ".mp3" : ".wav");
+        save.title = "Download this spot";
+        save.style.cssText = "flex:0 0 auto;font-size:12px;"
+          + "color:#ffd479;text-decoration:none;padding:0 3px";
+        save.onclick = (ev) => ev.stopPropagation();
+        row.appendChild(save);
+      })();
       if (line.product && line.text && line.text !== line.product) {
         const said = el("div", "muted", line.text);
         said.style.cssText = "font-size:11px;line-height:1.45;width:100%";
@@ -41227,7 +41334,9 @@ function djTalkRender(state) {
         ? "/media/" + encodeURIComponent(line.media) + "?t="
           + encodeURIComponent(line.sig)
         : (line.ad_audio
-            ? "/ads-audio/" + encodeURIComponent(line.ad_audio) : "");
+            ? "/ads-audio/" + encodeURIComponent(line.ad_audio)
+              + (line.ad_sig ? "?t=" + encodeURIComponent(line.ad_sig) : "")
+            : "");
       if (heard) {
         const play = el("button", "", "▶ hear it");
         play.style.cssText = "font-size:10.5px;padding:2px 8px";
@@ -54673,6 +54782,94 @@ async function studioEngines() {
   return got;
 }
 
+/* The engine A/B: play each take in turn with its render time beside
+ * it, and switch the whole library between cloning engines on the fly. */
+async function studioEngineAB(name, got) {
+  const takes = (got.takes || []);
+  const box = el("div", "panel", "");
+  box.style.cssText = "position:fixed;left:50%;top:12%;transform:"
+    + "translateX(-50%);z-index:60;max-width:520px;width:92vw;"
+    + "padding:14px 16px;max-height:76vh;overflow:auto";
+  const h = el("h3", "", name + " \u2014 same line, both engines");
+  h.style.cssText = "margin:0 0 4px;font-size:14px";
+  box.appendChild(h);
+  const said = el("div", "muted",
+                  "\u201c" + (got.text || "") + "\u201d");
+  said.style.cssText = "font-size:11px;margin-bottom:10px";
+  box.appendChild(said);
+  takes.forEach((t) => {
+    const row = el("div", "", "");
+    row.style.cssText = "display:flex;gap:8px;align-items:center;"
+      + "padding:6px 0;border-top:1px solid var(--border)";
+    const who = el("b", "", String(t.engine || "").toUpperCase());
+    who.style.cssText = "flex:0 0 54px;font-size:12px";
+    row.appendChild(who);
+    if (t.error) {
+      const err = el("span", "muted", t.error);
+      err.style.cssText = "flex:1;font-size:11px;color:#e06a6a";
+      row.appendChild(err);
+    } else {
+      const play = el("button", "", "\u25b6 hear it");
+      play.style.cssText = "font-size:11px;padding:2px 9px";
+      play.onclick = () => clipToggle(t.url, play, "\u25b6 hear it");
+      row.appendChild(play);
+      const ms = el("span", "muted", (t.ms || 0) + " ms to render");
+      ms.style.cssText = "flex:1;font-size:10.5px";
+      row.appendChild(ms);
+    }
+    box.appendChild(row);
+  });
+  const ok = takes.filter((t) => !t.error);
+  if (ok.length > 1) {
+    const fast = ok.slice().sort((a, b) => (a.ms || 0) - (b.ms || 0))[0];
+    const note = el("div", "muted",
+      String(fast.engine || "").toUpperCase() + " rendered fastest here. "
+      + "Across 59 voices F5 was +0.12 identity on normal copy, worse on "
+      + "one-word replies, and worse on read-back accuracy.");
+    note.style.cssText = "font-size:10.5px;margin-top:8px;line-height:1.5";
+    box.appendChild(note);
+  }
+  const sw = el("div", "", "");
+  sw.style.cssText = "display:flex;gap:6px;align-items:center;"
+    + "margin-top:12px;padding-top:10px;border-top:1px solid var(--border)";
+  const lbl = el("span", "muted", "run the station on");
+  lbl.style.fontSize = "11px";
+  sw.appendChild(lbl);
+  const pick = document.createElement("select");
+  pick.style.cssText = "font-size:11px";
+  [["", "each voice\u2019s own setting"], ["xtts", "XTTS v2"],
+   ["f5", "F5-TTS v1"]].forEach((row) => {
+    const o = document.createElement("option");
+    o.value = row[0]; o.textContent = row[1];
+    pick.appendChild(o);
+  });
+  try {
+    const st = await api("/api/settings");
+    pick.value = (st.dj && st.dj.clone_engine) || "";
+  } catch (e) { /* leave it on the default */ }
+  pick.onchange = async () => {
+    try {
+      const st = await api("/api/settings");
+      st.dj.clone_engine = pick.value;
+      await api("/api/settings", {method: "PUT",
+                                  body: JSON.stringify(st)});
+      studioSay(pick.value
+        ? "the whole library now clones with " + pick.value.toUpperCase()
+        : "each voice is back on its own engine");
+    } catch (e) { studioSay(e.message, true); }
+  };
+  sw.appendChild(pick);
+  box.appendChild(sw);
+  const shut = el("button", "", "close");
+  shut.style.cssText = "font-size:11px;margin-top:10px";
+  shut.onclick = () => {
+    if (clipAudio) clipToggle("", null);
+    box.remove();
+  };
+  box.appendChild(shut);
+  document.body.appendChild(box);
+}
+
 async function studioLoad() {
   try {
     await studioEngines();
@@ -55440,6 +55637,24 @@ function studioVoicesDraw() {
         finally { done(); }
       };
       row.appendChild(redo);
+      // The engine A/B: the same line, the same voice, both cloning
+      // engines, played back to back. The library averages say F5 is
+      // +0.12 identity on normal copy and worse on one-word replies --
+      // but this is the voice you care about, so listen to it rather
+      // than to the mean.
+      const ab = el("button", "", "\u2696");
+      ab.title = "Hear this voice on BOTH engines \u2014 same line, back to back";
+      ab.onclick = async (event) => {
+        event.stopPropagation();
+        const done = pending(ab, "\u2026");
+        try {
+          const got = await api("/api/voices/" + voice.id + "/compare",
+            {method: "POST", body: "{}"});
+          studioEngineAB(voice.name || voice.id, got);
+        } catch (error) { studioSay(error.message, true); }
+        finally { done(); }
+      };
+      row.appendChild(ab);
     }
     const kill = el("button", "", "✕");
     kill.title = "Delete this voice";
