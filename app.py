@@ -9952,8 +9952,11 @@ def torrent_breath(dj: dict[str, Any]) -> float:
     sets it: at 100 the pair barely draw breath, at 50 you get a good stretch
     of record between them."""
     talk = max(0, min(100, int(dj.get("talk_radio") or 0)))
-    middle = 6.0 + (100 - talk) * 0.38
-    return max(4.0, random.uniform(middle * 0.6, middle * 1.4))
+    # #702: the floor was 4 seconds, which at a high dial meant rounds
+    # landing on top of each other on the same warm context — and that
+    # reads as repetition no matter how well the speakbox is seeding.
+    middle = 14.0 + (100 - talk) * 0.42
+    return max(10.0, random.uniform(middle * 0.65, middle * 1.45))
 
 
 async def _torrent_talk() -> None:
@@ -9981,16 +9984,57 @@ async def _torrent_talk() -> None:
             if _SEGMENT_TASK and not _SEGMENT_TASK[0].done():
                 continue
             track = _RADIO.get("now")
-            if dj["caller_every"] and random.random() < 1.0 / max(
-                    1, dj["caller_every"]):
-                await dj_caller(track)
-            else:
-                deep = (dj.get("deep_convo", True)
-                        and random.random() < float(dj.get("deep_rate")
-                                                    or 0.25))
-                if not (deep and await dj_deep_round(track)):
+            # #702: ROTATE THE KIND OF ROUND.
+            #
+            # The torrent only ever ran plain banter (with a caller now and
+            # then), and at a short breath that is the same generic prompt
+            # firing back to back — which reads as the pair repeating
+            # themselves however well the speakbox is seeding underneath.
+            # The station has half a dozen kinds of segment and the torrent
+            # was using one. Drawn without immediate repeats so no two
+            # neighbouring rounds are the same shape.
+            kinds = ["banter", "banter", "deep", "caller", "gallery",
+                     "news", "manager", "bombshell"]
+            if not dj.get("deep_convo", True):
+                kinds = [k for k in kinds if k != "deep"]
+            if not dj.get("caller_every"):
+                kinds = [k for k in kinds if k != "caller"]
+            last = str(_RADIO.get("last_round_kind") or "")
+            choices = [k for k in kinds if k != last] or kinds
+            kind = random.choice(choices)
+            _RADIO["last_round_kind"] = kind
+            try:
+                if kind == "caller":
+                    await dj_caller(track)
+                elif kind == "deep":
+                    if not await dj_deep_round(track):
+                        await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True)))
+                elif kind == "gallery":
+                    if not await dj_gallery_round():
+                        await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True)))
+                elif kind == "news":
+                    if not await dj_news():
+                        await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True)))
+                elif kind == "manager":
+                    if not await dj_manager_note(track):
+                        await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True)))
+                elif kind == "bombshell":
+                    shell = drop_bombshell()
+                    angle = (bombshell_angle(shell["text"])
+                             if shell and shell.get("text") else "")
+                    await dj_banter(track, angle=angle or None,
+                                    render_stream=bool(
+                                        dj.get("stream_show", True)))
+                else:
                     await dj_banter(track, render_stream=bool(
                         dj.get("stream_show", True)))
+            except Exception:
+                pass
+            pipeline_log("air", f"torrent round · {kind}")
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -11870,7 +11914,10 @@ def mix_levels() -> dict[str, float]:
     """The levels the collected mixes are rendered at (#667) — the same
     three the browser's own mixer offers, kept server-side because the
     collector runs whether or not a browser is open."""
-    out = {"music": 100.0, "duck": 70.0, "voice": 100.0}
+    # #701: music at 30% of the dialogue by default — it was 100% of
+    # whatever the record was mastered at, which is overbearing by
+    # construction.
+    out = {"music": 30.0, "duck": 70.0, "voice": 100.0}
     try:
         saved = json.loads(MIX_LEVELS_PATH.read_text())
         for key in out:
@@ -12179,10 +12226,18 @@ def _broadcast_collect(sealed: dict[str, Any]) -> Path | None:
                     encoding="utf-8")
             except OSError:
                 pass
+        # #701: the window it covers, kept beside it, so the set can be
+        # rebuilt at different levels later without guessing which stretch
+        # of the night it was.
+        try:
+            out.with_suffix(".json").write_text(json.dumps(
+                {"lo": lo, "hi": hi, "levels": levels}))
+        except OSError:
+            pass
         keep = sorted(BROADCASTS_DIR.glob("*.mp3"),
                       key=lambda p: p.stat().st_mtime)
         for old in keep[:-BROADCASTS_KEPT]:
-            for ext in (".mp3", ".md"):
+            for ext in (".mp3", ".md", ".json"):
                 try:
                     old.with_suffix(ext).unlink()
                 except OSError:
@@ -25667,6 +25722,68 @@ async def radio_cache_collect_now(
     return {"collecting": True, "stem": sealed.get("stem", "")}
 
 
+@app.post("/api/radio-cache/broadcasts/remix")
+async def radio_cache_remix(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Rebuild one collected set at different levels (#701).
+
+    The sets are rendered when they are collected, so changing the sliders
+    afterwards could not reach them — you had to wait for the next one. This
+    re-cuts the same stretch of the night at whatever the sliders say now,
+    in place, so playback and the download both follow."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    name = str(payload.get("name") or "")
+    if "/" in name or ".." in name or not re.fullmatch(
+            r"[\w.\- ]{1,120}", name):
+        raise HTTPException(status_code=400, detail="Bad name")
+    target = BROADCASTS_DIR / name
+    side = target.with_suffix(".json")
+    if not target.is_file() or not side.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail="That set has no timing sidecar — only sets collected "
+                   "from this update on can be re-cut.")
+    try:
+        window = json.loads(side.read_text())
+        lo, hi = float(window["lo"]), float(window["hi"])
+    except Exception:
+        raise HTTPException(status_code=400, detail="Unreadable sidecar")
+    levels = mix_levels()
+    for key in ("music", "duck", "voice"):
+        if key in payload:
+            try:
+                levels[key] = float(payload[key])
+            except (TypeError, ValueError):
+                pass
+    mix_levels_save(levels["music"], levels["duck"], levels["voice"])
+    if _MIX_GATE:
+        raise HTTPException(status_code=409,
+                            detail="A mix is already rendering — one at a time.")
+    _MIX_GATE.append(1)
+    try:
+        built = await asyncio.to_thread(
+            _broadcast_mix, lo, hi,
+            max(0.0, min(2.0, levels["music"] / 100)),
+            max(0.0, min(0.9, levels["duck"] / 100)),
+            max(0.25, min(2.0, levels["voice"] / 100)),
+            "_remix")
+    finally:
+        _MIX_GATE.clear()
+    if not built:
+        raise HTTPException(status_code=500, detail="The re-cut came out empty")
+    built.replace(target)
+    try:
+        side.write_text(json.dumps({"lo": lo, "hi": hi, "levels": levels}))
+    except OSError:
+        pass
+    return {"remixed": name, "levels": levels,
+            "seconds": round(hi - lo, 1),
+            "sig": media_sign(name)}
+
+
 @app.get("/api/radio-cache/broadcasts/{name}")
 async def radio_cache_broadcast_file(
     name: str,
@@ -26382,7 +26499,10 @@ def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
         if run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                 "-ss", f"{begin - row['began']:.2f}",
                 "-t", f"{end - begin:.2f}", "-i", source,
-                "-af", f"volume={music:.3f}", "-ar", "24000", "-ac", "1",
+                # #701: no gain here — the level is set in the final graph,
+                # against the dialogue. Applying it twice was part of why the
+                # music sat so far over the top.
+                "-ar", "24000", "-ac", "1",
                 "-codec:a", "libmp3lame", "-b:a", "96k", str(piece)], 600):
             beds.append((begin, end, str(piece), 0.0))
     bed = timeline(beds, work / "music.mp3")
@@ -26397,17 +26517,23 @@ def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
         return out if out.is_file() else None
     if not talk or not bed:
         return None
-    # The records under the voices, the same sidechain the ad mixer runs.
+    # The records under the voices (#701). Both halves are loudnorm'd to the
+    # SAME reference first, so `music` is a share OF THE DIALOGUE rather than
+    # a raw gain on whatever the records happened to be mastered at — which
+    # is why the music came out over the top of the talk. The sidechain then
+    # ducks it further under the words, as before.
     ratio = max(1.5, 1.0 + duck * 16)
+    vox_n = f"[0:a]loudnorm=I=-16:LRA=11:TP=-1.5,volume={voice:.3f}"
+    bed_n = f"[1:a]loudnorm=I=-16:LRA=11:TP=-2.0,volume={music:.3f}[bed];"
     graph = (
-        f"[0:a]volume={voice:.3f},asplit=2[voxduck][voxmix];"
-        f"[1:a][voxduck]sidechaincompress=threshold=0.03:ratio={ratio:.1f}:"
+        bed_n + vox_n + ",asplit=2[voxduck][voxmix];"
+        f"[bed][voxduck]sidechaincompress=threshold=0.03:ratio={ratio:.1f}:"
         "attack=15:release=350[duck];"
         "[duck][voxmix]amix=inputs=2:duration=longest:normalize=0,"
         "alimiter=limit=0.95[out]"
     ) if duck > 0.02 else (
-        f"[0:a]volume={voice:.3f}[vox];"
-        "[1:a][vox]amix=inputs=2:duration=longest:normalize=0,"
+        bed_n + vox_n + "[vox];"
+        "[bed][vox]amix=inputs=2:duration=longest:normalize=0,"
         "alimiter=limit=0.95[out]"
     )
     if not run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
@@ -47268,6 +47394,8 @@ async function callRecordings() {
   // not have; these are the ones that get replayed.
   async function renderMix() {
     list.innerHTML = "";
+    // Declared up here so the per-set re-cut buttons above can read them.
+    let musicIn, duckIn, voiceIn;
     let mixes = {broadcasts: [], gathering: {}, levels: {}};
     try { mixes = await api("/api/radio-cache/broadcasts"); } catch (e) {}
     const why = el("div", "muted",
@@ -47320,8 +47448,54 @@ async function callRecordings() {
     h1.style.cssText = "font-weight:700;margin:4px 0 6px";
     list.appendChild(h1);
     list.appendChild(dlBar("broadcasts"));
-    (mixes.broadcasts || []).forEach((r) =>
-      list.appendChild(recRow("/api/radio-cache/broadcasts", r)));
+    (mixes.broadcasts || []).forEach((r) => {
+      const node = recRow("/api/radio-cache/broadcasts", r);
+      // #701: re-cut THIS set at whatever the sliders below say now. The
+      // sets are rendered when they are collected, so without this the
+      // levels could only ever reach the next one.
+      const acts = node.querySelector(".row");
+      if (acts) {
+        const again = el("a", "", "· ⟳ re-cut at these levels");
+        again.href = "javascript:void 0";
+        again.title = "Rebuild this set from the timing logs at the levels "
+          + "set below — the player and the download both follow";
+        again.style.cssText = "font-size:11px;color:var(--accent);"
+          + "margin-left:8px";
+        again.onclick = async () => {
+          again.textContent = "· ⏳ re-cutting…";
+          try {
+            const got = await api("/api/radio-cache/broadcasts/remix", {
+              method: "POST",
+              body: JSON.stringify({
+                name: r.name,
+                music: Number(musicIn.value), duck: Number(duckIn.value),
+                voice: Number(voiceIn.value),
+              }),
+            });
+            const player = node.querySelector("audio");
+            if (player) {
+              player.src = "/api/radio-cache/broadcasts/"
+                + encodeURIComponent(r.name) + "?t=" + got.sig
+                + "&v=" + Date.now();
+              player.load();
+            }
+            const dl = node.querySelector("a[download]");
+            if (dl) {
+              dl.href = "/api/radio-cache/broadcasts/"
+                + encodeURIComponent(r.name) + "?t=" + got.sig;
+            }
+            again.textContent = "· ✓ re-cut at " + got.levels.music + "% music";
+            setStatus("re-cut " + r.name + " — music at "
+              + got.levels.music + "% of the dialogue");
+          } catch (e) {
+            again.textContent = "· ⟳ re-cut at these levels";
+            setStatus(e.message, true);
+          }
+        };
+        acts.appendChild(again);
+      }
+      list.appendChild(node);
+    });
     if (!(mixes.broadcasts || []).length) {
       const m = el("div", "muted", "No sets collected yet — one is mixed "
         + "every time a section seals (~15 minutes on air), or press "
@@ -47372,9 +47546,9 @@ async function callRecordings() {
       list.appendChild(row);
       return input;
     };
-    const musicIn = slider("music", levels.music * 100, 0, 200);
-    const duckIn = slider("duck under speech", levels.duck * 100, 0, 90);
-    const voiceIn = slider("DJ voice", levels.voice * 100, 25, 200);
+    musicIn = slider("music (% of the dialogue)", levels.music * 100, 0, 200);
+    duckIn = slider("duck under speech", levels.duck * 100, 0, 90);
+    voiceIn = slider("DJ voice", levels.voice * 100, 25, 200);
     // #667: the collector has no browser to read sliders off, so moving one
     // saves it. Every set collected from here on is mixed at these levels.
     const saveLevels = async () => {
