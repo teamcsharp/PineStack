@@ -17314,6 +17314,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # nothing marking the end, no duration, and no way to know which of the
     # endings had been drawn. The line carries the rule that ended it, so
     # the reason is clickable straight into the shelf it came from.
+    ran = max(0.0, time.time() - call_started)
     call_ended(caller["name"], line_say, call_started, hangup_rule,
                len(lines or []), state)
 
