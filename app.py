@@ -545,6 +545,9 @@ DEFAULT_DJ = {
     # introduce it over its own opening the way real radio does, and every
     # other segment runs while it spins.
     "records_first": True,
+    # #699: what share of callers ring in on a voice from YOUR library
+    # rather than the stock Piper bank. Was a hardcoded 45.
+    "clone_caller_pct": 70,
 }
 
 
@@ -955,6 +958,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("talk_radio", DEFAULT_DJ["talk_radio"]) or 0))),
         "talk_radio_mode": bool(raw_dj.get("talk_radio_mode", False)),
         "records_first": bool(raw_dj.get("records_first", True)),   # #689
+        "clone_caller_pct": max(0, min(100, int(                    # #699
+            raw_dj.get("clone_caller_pct", 70) or 0))),
     }
     # The default personas hard-code the station name ("…on Pine Box FM…"), so a
     # renamed station left the DJs still saying the OLD name from the persona
@@ -5374,6 +5379,45 @@ def caller_clone_pool() -> list[str]:
     return ids
 
 
+# Which library voices have actually been ON AIR, and when (#699). The
+# rotation used to be a hash of the caller's name modulo the pool, which has
+# two faults you only notice once the library is big: a voice is heard only
+# if some caller's digest happens to land on its index, so a newly imported
+# one can sit unused indefinitely — and because the index is
+# `digest % len(pool)`, ADDING a voice re-points every existing caller at a
+# different one, so "the same person sounds the same" quietly broke every
+# time you imported anything.
+VOICE_AIRTIME_PATH = Path("/app/data/voice_airtime.json")
+_AIRTIME_LOCK = RLock()
+
+
+def voice_airtime() -> dict[str, Any]:
+    try:
+        rows = json.loads(VOICE_AIRTIME_PATH.read_text())
+        return rows if isinstance(rows, dict) else {}
+    except Exception:
+        return {}
+
+
+def voice_aired(vid: str, who: str = "a caller") -> None:
+    """One outing for a library voice, written down (#699)."""
+    if not VOICE_ID_SHAPE.match(vid or ""):
+        return
+    with _AIRTIME_LOCK:
+        rows = voice_airtime()
+        row = rows.setdefault(vid, {"airings": 0, "first": int(time.time())})
+        row["airings"] = int(row.get("airings") or 0) + 1
+        row["last"] = int(time.time())
+        row["as"] = str(who)[:60]
+        try:
+            VOICE_AIRTIME_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = VOICE_AIRTIME_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows, indent=1) + "\n")
+            tmp.replace(VOICE_AIRTIME_PATH)
+        except OSError:
+            pass
+
+
 def voice_meta(vid: str) -> dict[str, Any] | None:
     if not VOICE_ID_SHAPE.match(vid or ""):
         return None
@@ -7616,6 +7660,12 @@ def radio_stop() -> None:
         if not task.done():
             task.cancel()
     _RADIO_TASK.clear()
+    # The record's talk runs beside the loop now (#689), so it has to come
+    # down with it — otherwise a round keeps rendering into a stopped show.
+    for task in _SEGMENT_TASK:
+        if not task.done():
+            task.cancel()
+    _SEGMENT_TASK.clear()
 
 
 def radio_tune(station: str, dj: bool = True) -> dict[str, Any]:
@@ -9038,6 +9088,10 @@ def dj_state() -> dict[str, Any]:
 # turns instead of playing out all nine lines first.
 _TALK_CUT = [0]
 
+# The talk for the record currently turning (#689). Held so an overrun
+# can be seen — one round at a time — and cancelled when the show stops.
+_SEGMENT_TASK: list[Any] = []
+
 
 def dj_skip() -> None:
     for event in _DJ_SKIP:
@@ -9134,6 +9188,115 @@ def dj_on_air(track: dict[str, Any]) -> None:
     _music_log_append(track)          # which record, when — for the mix (#633)
 
 
+async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
+                       played: int, tape_slot: bool,
+                       spin_first: bool) -> None:
+    """Everything the pair do for one record (#689, second cut).
+
+    Split out of the show loop so it can run BESIDE the record rather
+    than in front of the wait for it. Nothing in here is allowed to
+    decide when the next record starts — that is the loop's job, and
+    the whole fault was that this work sat on its critical path."""
+    # What people make of it, if we can find out (#121). A tape
+    # from MX is not in any database worth asking.
+    notes = ""
+    if (dj["research"] and settings_web_search()
+            and not track.get("tape")):
+        try:
+            notes = await track_notes(track)
+        except Exception:
+            notes = ""
+    # Hear the words (#451): whisper the song in the background so
+    # a banter round this track can quote what it is actually
+    # singing. Fire-and-forget — the cache is ready by the round.
+    if dj["lyrics_talk"] and not track.get("tape"):
+        fire_and_forget(track_lyrics(track))
+
+    if track.get("tape"):
+        try:
+            await dj_mixtape_intro(track)
+        except Exception:
+            pass
+    else:
+        await dj_speak(
+            "request" if track.get("requested") else "intro",
+            track, extra=notes,
+            note=(" The record is ALREADY turning underneath you — "
+                  "you are talking over its opening, so name it and "
+                  "get out of the way rather than announcing "
+                  "something that is about to start."
+                  if spin_first else ""))
+    await asyncio.sleep(1.0)
+
+    # A memo from upstairs and a call are each their own segment, so
+    # they replace the small talk on the tracks they land on rather
+    # than stacking on top of it (#179, #189).
+    # #689: how much record is left to talk over. Under records-first
+    # a segment started with nothing left runs on into silence — the
+    # needle_watch backstop cuts it, but not starting one that cannot
+    # fit is better than cutting one that should not have begun. Off
+    # records-first this is unbounded: the talk comes first by design.
+    def _room() -> float:
+        if not spin_first:
+            return 1e9
+        return max(0.0, float(track.get("seconds") or 0)
+                   - (time.time()
+                      - float(_RADIO.get("started") or time.time())))
+
+    segment = tape_slot        # the tape IS the segment (#242)
+    if dj["manager_every"] and not segment and _room() > 45 \
+            and played % dj["manager_every"] == 0:
+        try:
+            segment = bool(await dj_manager_note(track))
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass
+
+    if (not segment and dj["caller_every"] and _room() > 90
+            and played % dj["caller_every"] == 0):
+        try:
+            segment = bool(await dj_caller(track))
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass
+
+    # A moment for the news between records, organic and funny and
+    # then back to work (#228). The on-the-hour bulletin is its own
+    # clock, not a track count.
+    if (not segment and dj["news_every"] and _room() > 60
+            and played % dj["news_every"] == 0):
+        try:
+            segment = bool(await dj_news())
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass
+
+    # On the clock rather than on the track count: every three to five
+    # minutes by default, drawn fresh each time, and as long as the
+    # settings say it should run (#202).
+    if not segment and _room() > 60 and banter_due(dj, played):
+        try:
+            # Now and then a round runs through the SECONDARY engine
+            # (#496): expanded context, both co-workers simulated in
+            # full, rendered as one seamless stream. Otherwise the
+            # quick banter. Deep rounds fall back to nothing, so the
+            # normal one still runs behind them if they come up empty.
+            deep = (dj.get("deep_convo", True)
+                    and random.random() < float(dj.get("deep_rate")
+                                                or 0.25))
+            if not (deep and await dj_deep_round(track)):
+                # #616/#625: coalesce the round into one seamless clip
+                # so the box plays a continuous segment instead of
+                # stuttering between separate files.
+                await dj_banter(
+                    track,
+                    render_stream=bool(dj.get("stream_show", True)))
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass
+
+
+
 async def _dj_loop() -> None:
     """The show. Talk, play, sometimes talk over it, repeat."""
     skip = asyncio.Event()
@@ -9215,41 +9378,25 @@ async def _dj_loop() -> None:
                     f"{track.get('title') or 'the record'} is turning while "
                     "the pair work up the intro (#689)")
 
-            # What people make of it, if we can find out (#121). A tape
-            # from MX is not in any database worth asking.
-            notes = ""
-            if (dj["research"] and settings_web_search()
-                    and not track.get("tape")):
-                try:
-                    notes = await track_notes(track)
-                except Exception:
-                    notes = ""
-            # Hear the words (#451): whisper the song in the background so
-            # a banter round this track can quote what it is actually
-            # singing. Fire-and-forget — the cache is ready by the round.
-            if dj["lyrics_talk"] and not track.get("tape"):
-                fire_and_forget(track_lyrics(track))
-
-            if track.get("tape"):
-                try:
-                    await dj_mixtape_intro(track)
-                except Exception:
-                    pass
-            else:
-                await dj_speak(
-                    "request" if track.get("requested") else "intro",
-                    track, extra=notes,
-                    note=(" The record is ALREADY turning underneath you — "
-                          "you are talking over its opening, so name it and "
-                          "get out of the way rather than announcing "
-                          "something that is about to start."
-                          if spin_first else ""))
-            await asyncio.sleep(1.0)
-
-            # The ad slot. With the needle already down an ad belongs
-            # BETWEEN the records, not stacked on top of one — a bedded
-            # spot carries its own music — so it is held to the end of the
-            # track and run there (#689).
+            # --- the talk for this record ---------------------------------
+            # #689, second cut. Putting the needle down first was right; what
+            # was wrong was leaving the talk ON the record's critical path.
+            # The loop aired the record, then ran the intro and the segments
+            # inline, and only then waited out what was left — so a talk
+            # block slower than the record left the station silent until it
+            # finished, and nothing could stop it: a coalesced round (#616)
+            # renders every turn into one clip with no turn boundary for a
+            # cut to land on. Measured: 124 seconds past the end of a record,
+            # activity reading `voicing` the whole way.
+            #
+            # So the talk runs BESIDE the record now. The loop's only job is
+            # to keep a record turning; the pair talk over it and, if they
+            # overrun, they carry on over the next one — which is what a
+            # presenter running long actually does. One round at a time, so
+            # an overrun never stacks.
+            # The ad slot stays with the LOOP, because an ad belongs in the
+            # gap BETWEEN records — a bedded spot brings its own music — and
+            # the loop is the only thing that knows when the record ends.
             ad_due = bool(
                 dj["ad_every"] and not tape_slot
                 and played % dj["ad_every"] == 0
@@ -9259,9 +9406,8 @@ async def _dj_loop() -> None:
             async def _run_ad() -> None:
                 try:
                     # A third of the ad slots belong to the house (#354,
-                    # #362): the engineering report with the machine's
-                    # own numbers, or one of the running services
-                    # introduced as tonight's sponsor.
+                    # #362): the engineering report with the machine's own
+                    # numbers, or a running service as tonight's sponsor.
                     ad_roll = random.random()
                     if ad_roll < 0.15:
                         await dj_engineering_ad()
@@ -9273,62 +9419,21 @@ async def _dj_loop() -> None:
                 except Exception:
                     pass
 
-            if ad_due and not spin_first:
-                await _run_ad()
-
-            # A memo from upstairs and a call are each their own segment, so
-            # they replace the small talk on the tracks they land on rather
-            # than stacking on top of it (#179, #189).
-            segment = tape_slot        # the tape IS the segment (#242)
-            if dj["manager_every"] and not segment and played % dj["manager_every"] == 0:
-                try:
-                    segment = bool(await dj_manager_note(track))
-                    await asyncio.sleep(0.8)
-                except Exception:
-                    pass
-
-            if (not segment and dj["caller_every"]
-                    and played % dj["caller_every"] == 0):
-                try:
-                    segment = bool(await dj_caller(track))
-                    await asyncio.sleep(0.8)
-                except Exception:
-                    pass
-
-            # A moment for the news between records, organic and funny and
-            # then back to work (#228). The on-the-hour bulletin is its own
-            # clock, not a track count.
-            if (not segment and dj["news_every"]
-                    and played % dj["news_every"] == 0):
-                try:
-                    segment = bool(await dj_news())
-                    await asyncio.sleep(0.8)
-                except Exception:
-                    pass
-
-            # On the clock rather than on the track count: every three to five
-            # minutes by default, drawn fresh each time, and as long as the
-            # settings say it should run (#202).
-            if not segment and banter_due(dj, played):
-                try:
-                    # Now and then a round runs through the SECONDARY engine
-                    # (#496): expanded context, both co-workers simulated in
-                    # full, rendered as one seamless stream. Otherwise the
-                    # quick banter. Deep rounds fall back to nothing, so the
-                    # normal one still runs behind them if they come up empty.
-                    deep = (dj.get("deep_convo", True)
-                            and random.random() < float(dj.get("deep_rate")
-                                                        or 0.25))
-                    if not (deep and await dj_deep_round(track)):
-                        # #616/#625: coalesce the round into one seamless clip
-                        # so the box plays a continuous segment instead of
-                        # stuttering between separate files.
-                        await dj_banter(
-                            track,
-                            render_stream=bool(dj.get("stream_show", True)))
-                    await asyncio.sleep(0.8)
-                except Exception:
-                    pass
+            # One round at a time: an overrun carries on over the NEXT
+            # record instead of stacking a second one on top of it.
+            if spin_first:
+                if not (_SEGMENT_TASK and not _SEGMENT_TASK[0].done()):
+                    _SEGMENT_TASK[:] = [asyncio.create_task(
+                        _record_talk(track, dj, played, tape_slot,
+                                     spin_first))]
+                else:
+                    pipeline_log("air", "the pair are still on the last "
+                                        "round — this record just plays "
+                                        "(#689)")
+            else:
+                await _record_talk(track, dj, played, tape_slot, spin_first)
+                if ad_due:
+                    await _run_ad()
 
             # A skip pressed while the DJ was still talking must not be
             # thrown away by the clear() below — honour it before playing.
@@ -9361,10 +9466,11 @@ async def _dj_loop() -> None:
             if talk > 50 and not tape_slot:
                 ceiling = 300.0 - (talk - 50) * 5.0      # 300s → 50s at 100
                 length = min(length, max(50.0, ceiling))
-            # #689: the record has been turning through all of that talk, so
-            # what is left to wait out is what is left of the record — not
-            # its whole length again. Talk that outran the track leaves zero,
-            # which is the loop's way of saying "next one, now".
+            # #689: the needle went down at the top of the iteration, so the
+            # wait is for what is LEFT of the record. With the talk running
+            # beside it this is now only the handful of milliseconds it took
+            # to spawn — but the subtraction is what keeps it honest if
+            # anything ever blocks here again.
             if spin_first:
                 spent = max(0.0, time.time()
                             - float(_RADIO.get("started") or time.time()))
@@ -9422,7 +9528,8 @@ async def _dj_loop() -> None:
             # The ad break, in the gap where a break belongs (#689): the
             # record has finished, the next one has not started, and a
             # bedded spot brings its own music with it.
-            if ad_due and spin_first:
+            if ad_due and spin_first and not (
+                    _SEGMENT_TASK and not _SEGMENT_TASK[0].done()):
                 await _run_ad()
     finally:
         if skip in _DJ_SKIP:
@@ -9802,6 +9909,60 @@ def now_really_playing(slack: float = 20.0) -> bool:
     return time.time() < started + length + slack
 
 
+async def needle_watch() -> None:
+    """Keep a record turning (#689 follow-up — the fault it introduced).
+
+    Records-first puts the needle down BEFORE the talk, which is right. What
+    it also does is let a talk block outlast the record: the intro, a caller
+    and a banter round all render over the top, and if the desk is slow —
+    a stalling box, xtts under load — the record ends while they are still
+    being written. Nothing noticed, for two reasons that only combine under
+    records-first:
+
+      * the show loop is blocked INSIDE the segment, not in its own wait, so
+        dj_skip() has nothing to interrupt; and
+      * dead_air_watch counts "the desk is rendering" as "not silent", which
+        is precisely the case that fails here.
+
+    Measured live: a 350-second record with 453 seconds elapsed, activity
+    reading `voicing`, and the station silent for a minute and a half.
+
+    So this watches THE RECORD rather than the silence, and it does not take
+    the needle itself — it cuts the round short, which is the machinery the
+    loop already understands. The talk that did not fit happens over the next
+    record instead of over nothing.
+    """
+    while _RADIO.get("on"):
+        await asyncio.sleep(4)
+        try:
+            if not _RADIO.get("on") or not _RADIO.get("now"):
+                continue
+            if now_really_playing(slack=2.0):
+                continue
+            if _RADIO.get("coming"):
+                continue          # being introduced, not stranded
+            if not (_RADIO.get("queue") or _RADIO.get("requests")):
+                continue
+            started = float(_RADIO.get("started") or 0)
+            if started <= 0:
+                continue
+            length = float((_RADIO.get("now") or {}).get("seconds") or 0)
+            over = time.time() - (started + length)
+            # A few seconds of grace: the loop's own wait normally lands
+            # here first, and cutting a round it was about to end anyway
+            # would just be noise.
+            if length <= 0 or over < 6.0:
+                continue
+            pipeline_log(
+                "air", f"the record ran out {int(over)}s ago and the desk is "
+                       "still talking — cutting the round short so the next "
+                       "one can start (#689)")
+            _TALK_CUT[0] += 1
+            dj_skip()
+        except Exception:
+            pass                  # a watchdog never takes the show down
+
+
 async def dead_air_watch() -> None:
     """The silence ceiling (#338, #340). Nothing playing and nobody
     talking for longer than the slider allows → kick the show forward.
@@ -9910,6 +10071,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(heat_clock()))
     _RADIO_TASK.append(asyncio.create_task(mx_ad_clock()))
     _RADIO_TASK.append(asyncio.create_task(dead_air_watch()))
+    _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
     _RADIO_TASK.append(asyncio.create_task(tape_watch()))
     tape_warmer()                      # the shelf normalizes itself (#242)
@@ -16466,6 +16628,48 @@ def conjure_caller() -> dict[str, Any]:
             "persona": "", "goal": "", "calls": 0}
 
 
+CALLER_VOICES_PATH = Path("/app/data/caller_voices.json")
+_CALLER_VOICE_LOCK = RLock()
+
+
+def _caller_voice_book() -> dict[str, str]:
+    """Who sounds like whom (#699) — remembered, so the same person really
+    does keep the same voice even when the library grows underneath them."""
+    try:
+        rows = json.loads(CALLER_VOICES_PATH.read_text())
+        return {str(k): str(v) for k, v in rows.items()} \
+            if isinstance(rows, dict) else {}
+    except Exception:
+        return {}
+
+
+def _caller_voice_remember(name: str, vid: str) -> None:
+    with _CALLER_VOICE_LOCK:
+        book = _caller_voice_book()
+        book[str(name)[:80]] = vid
+        # Bounded: the conjured strangers are endless, the regulars are not.
+        if len(book) > 400:
+            book = dict(list(book.items())[-300:])
+        try:
+            CALLER_VOICES_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = CALLER_VOICES_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(book, indent=1) + "\n")
+            tmp.replace(CALLER_VOICES_PATH)
+        except OSError:
+            pass
+
+
+def clone_caller_pct() -> int:
+    """What share of callers ring in on a library voice (#699). Was a
+    constant at 45; it is a dial now, because "use the voices I add" is a
+    thing you should be able to turn up."""
+    try:
+        return max(0, min(100, int(dj_settings().get("clone_caller_pct",
+                                                     CLONE_CALLER_PCT))))
+    except Exception:
+        return CLONE_CALLER_PCT
+
+
 def caller_voice_for(name: str, taken: set[str],
                      catalogue: set[str] | None = None,
                      gender: str = "",
@@ -16480,8 +16684,34 @@ def caller_voice_for(name: str, taken: set[str],
     all the generated voices get on air (#457) — stable per name."""
     digest = int(hashlib.sha1(name.encode()).hexdigest(), 16)
     usable = [c for c in (clones or []) if c not in taken]
-    if usable and (digest % 100) < CLONE_CALLER_PCT:
-        return usable[digest % len(usable)]
+    if usable and (digest % 100) < clone_caller_pct():
+        # #699: the assignment is REMEMBERED, and an unheard voice goes first.
+        #
+        # It used to be usable[digest % len(usable)] — a pure function of the
+        # name and the pool SIZE. Two things fell out of that. A voice was
+        # only ever heard if some caller's digest happened to land on its
+        # index, so importing a voice into a library this size could mean
+        # never hearing it. And because the size is in the modulus, adding
+        # one re-pointed every existing caller at a different voice, which is
+        # the opposite of the stability the hash was chosen for.
+        #
+        # Now: whoever we have heard before keeps the voice they had, and a
+        # caller we have not heard before takes the least-aired voice in the
+        # library — so a voice you added five minutes ago is the very next
+        # one out of the phone.
+        book = _caller_voice_book()
+        held = book.get(name)
+        if held and held in usable:
+            return held
+        air = voice_airtime()
+        fresh = sorted(
+            usable,
+            key=lambda v: (int((air.get(v) or {}).get("airings") or 0),
+                           int((air.get(v) or {}).get("last") or 0),
+                           v))
+        pick = fresh[0]
+        _caller_voice_remember(name, pick)
+        return pick
     banks = ([BANTER_VOICES[gender]] if gender in BANTER_VOICES
              else BANTER_VOICES.values())
     pool = sorted(n for names in banks for n in names
@@ -17175,6 +17405,11 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # timbre into mush, and so it is labelled as a cloned call.
     if VOICE_ID_SHAPE.match(third or "") and not caller.get("voice_id"):
         caller["voice_id"] = third
+    # #699: one outing, written down. That ledger is what makes the next
+    # UNHEARD voice the next one out of the phone, and it is what the Voice
+    # Studio shows so you can watch a voice you just added go to air.
+    if VOICE_ID_SHAPE.match(third or ""):
+        voice_aired(third, caller.get("name") or "a caller")
     # The SECOND person on the line gets their own voice, distinct from the
     # hosts and the first caller, so the handover is audible.
     duo_voice = ""
@@ -21334,7 +21569,19 @@ async def voices_list(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
-    return {"voices": read_voices()}
+    # #699: with each voice's airtime on it, so the studio can show which
+    # ones have actually been used and which are still waiting their turn.
+    air = voice_airtime()
+    rows = []
+    for meta in read_voices():
+        seen = air.get(str(meta.get("id"))) or {}
+        rows.append({**meta,
+                     "airings": int(seen.get("airings") or 0),
+                     "last_aired": int(seen.get("last") or 0),
+                     "last_as": str(seen.get("as") or "")})
+    return {"voices": rows, "now": int(time.time()),
+            "clone_caller_pct": clone_caller_pct(),
+            "in_rotation": len(caller_clone_pool())}
 
 
 @app.post("/api/voices/import/reachy")
@@ -52654,6 +52901,9 @@ async function studioLoad() {
     await studioEngines();
     const voices = await api("/api/voices");
     studioState.voices = voices.voices || [];
+    studioState.now = voices.now || 0;                     // #699
+    studioState.clonePct = voices.clone_caller_pct;
+    studioState.inRotation = voices.in_rotation || 0;
   } catch (error) {
     studioSay(error.message, true);
   }
@@ -53083,6 +53333,17 @@ function studioVoicesTab(host) {
     bar.appendChild(button);
   }
   host.appendChild(bar);
+  // #699: how hard the library is actually leaned on, and the dial for it.
+  // Every voice here is in the caller rotation the moment it has a
+  // reference — the unheard ones go out FIRST — and this says how often a
+  // caller reaches for the library at all instead of the stock bank.
+  const rot = el("div", "", "");
+  rot.id = "studioRotation";
+  rot.style.cssText = "display:flex;gap:9px;align-items:center;flex-wrap:wrap;"
+    + "padding:7px 10px;margin-bottom:10px;border-radius:8px;"
+    + "border:1px solid var(--border);background:var(--panel2);font-size:11.5px";
+  host.appendChild(rot);
+  studioRotationDraw();
   // #682: the combine bar lives above the list and only appears when there
   // is something to combine.
   const merge = el("div", "", "");
@@ -53092,6 +53353,56 @@ function studioVoicesTab(host) {
   list.id = "studioVoiceList";
   host.appendChild(list);
   studioVoicesDraw();
+}
+
+/* ---- The caller rotation (#699) ----------------------------------------
+ * Every library voice with a reference is in the rotation. The unheard ones
+ * go out FIRST, so a voice imported a minute ago is the next one out of the
+ * phone — and once a caller has a voice they keep it, remembered, instead of
+ * being re-pointed every time the library grows.
+ */
+function studioRotationDraw() {
+  const host = document.getElementById("studioRotation");
+  if (!host) return;
+  host.innerHTML = "";
+  const withRef = studioState.voices.filter((v) => v.has_reference);
+  const unheard = withRef.filter((v) => !(v.airings || 0));
+  const tag = el("span", "", "🎙 caller rotation");
+  tag.style.cssText = "font-weight:700;flex:0 0 auto";
+  host.appendChild(tag);
+  const sum = el("span", "muted", withRef.length + " in rotation · "
+    + unheard.length + " still unheard"
+    + (unheard.length ? " — they go out first" : ""));
+  sum.style.cssText = "flex:1;min-width:140px";
+  host.appendChild(sum);
+  const lab = el("span", "muted", "callers using them");
+  lab.style.cssText = "flex:0 0 auto;font-size:10.5px";
+  host.appendChild(lab);
+  const dial = el("input", "", "");
+  dial.type = "range"; dial.min = "0"; dial.max = "100"; dial.step = "5";
+  dial.value = String(studioState.clonePct != null
+    ? studioState.clonePct : 70);
+  dial.style.cssText = "flex:0 0 130px";
+  dial.title = "What share of callers ring in on a voice from your library "
+    + "rather than the stock Piper bank";
+  const out = el("span", "", dial.value + "%");
+  out.style.cssText = "flex:0 0 38px;text-align:right;font-size:11px";
+  dial.oninput = () => { out.textContent = dial.value + "%"; };
+  dial.onchange = async () => {
+    try {
+      const settings = await api("/api/settings");
+      if (settings.voice_out) delete settings.voice_out.ha_token;
+      settings.dj = Object.assign({}, settings.dj,
+        {clone_caller_pct: Number(dial.value)});
+      await api("/api/settings", {method: "PUT",
+                                  body: JSON.stringify(settings)});
+      studioState.clonePct = Number(dial.value);
+      studioSay("callers reach for your library " + dial.value + "% of the "
+        + "time ✓");
+    } catch (e) { studioSay(e.message, true); }
+  };
+  host.appendChild(dial);
+  host.appendChild(out);
 }
 
 /* ---- Combining split speakers back into one shard (#682) ---- */
@@ -53201,6 +53512,7 @@ function studioVoicesDraw() {
   const live = new Set(studioState.voices.map((v) => v.id));
   [...studioPicked].forEach((id) => { if (!live.has(id)) studioPicked.delete(id); });
   studioMergeBar();
+  studioRotationDraw();                                   // #699
   if (!studioState.voices.length) {
     list.appendChild(el("div", "muted",
       "No voices yet. Import the reachy voices, paste a YouTube URL, "
@@ -53264,6 +53576,29 @@ function studioVoicesDraw() {
     };
     row.appendChild(name);
     row.appendChild(el("span", "vkind vkind-" + voice.kind, voice.kind));
+    // #699: whether this voice has actually been ON AIR, and how long ago.
+    // A voice you imported and never heard used to be indistinguishable
+    // from one carrying half the callers.
+    if (voice.has_reference) {
+      const n = voice.airings || 0;
+      const air = el("span", "", n ? "📻 " + n : "◦ unheard");
+      const secs = voice.last_aired
+        ? Math.max(0, (studioState.now || Math.round(Date.now() / 1000))
+                      - voice.last_aired) : 0;
+      const ago = !voice.last_aired ? ""
+        : secs < 90 ? "just now"
+        : secs < 5400 ? Math.round(secs / 60) + "m ago"
+        : secs < 172800 ? Math.round(secs / 3600) + "h ago"
+        : Math.round(secs / 86400) + "d ago";
+      air.title = n
+        ? "On air " + n + " time" + (n === 1 ? "" : "s")
+          + (ago ? " · last " + ago : "")
+          + (voice.last_as ? " · as " + voice.last_as : "")
+        : "Never been on air — it is next in line for a caller";
+      air.style.cssText = "flex:0 0 auto;font-size:10.5px;color:"
+        + (n ? "#8fe388" : "#ffd479");
+      row.appendChild(air);
+    }
     if (voice.has_signature) {
       const sig = el("button", "", "📈");
       sig.title = "Open this voice's signature in the lab";
