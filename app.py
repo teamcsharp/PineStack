@@ -4154,6 +4154,18 @@ _HEAL_STREAK = [0]
 _HA_RESTART_LAST = [0.0]
 HA_RESTART_COOLDOWN = 900.0
 
+# #712: OFF by default now, and the reason is worth keeping. Restarting Home
+# Assistant to clear a wedged speaker fired 51 times through the socket proxy
+# and restarted HA 49 times — every 20 to 60 minutes overnight — and each
+# restart severed the Wyoming stream mid-clip so the box never received its
+# AudioStop and looped the fragment it was holding. The cure was the disease.
+# The cooldown that was supposed to bound it did not: spark-agent's own
+# watchdog restarts the container on three failed 8-second health probes,
+# and every restart zeroes _HA_RESTART_LAST and _BOX_LAST_OK, disarming both
+# guards. Set HA_RESTART_ESCALATION=1 to put the ladder back.
+HA_RESTART_ESCALATION = os.getenv(
+    "HA_RESTART_ESCALATION", "0").lower() in ("1", "true", "yes", "on")
+
 
 async def ha_restart_container() -> bool:
     """Order Docker to restart the homeassistant container — the full
@@ -4242,11 +4254,30 @@ async def satellite_selfheal() -> bool:
         # restart itself is guarded (15-min cooldown, needs the box to
         # have spoken since the last one), so this cannot loop.
         stalled_for = time.time() - _BOX_LAST_OK[0]
-        if _HEAL_MISS[0] >= 2 and stalled_for > 130 and _RADIO.get("on"):
+        if _HEAL_MISS[0] >= 2 and stalled_for > 130 and _RADIO.get("on") \
+                and HA_RESTART_ESCALATION:
             pipeline_log("air", "box reachable but has not spoken in "
                                 f"{int(stalled_for)}s — escalating to a "
                                 "Home Assistant restart to clear the wedge")
             asyncio.create_task(ha_restart_container())
+        elif _HEAL_MISS[0] >= 2 and stalled_for > 130 and _RADIO.get("on"):
+            # #712: this ladder was the cause, not the cure. It fired 51
+            # times through the socket proxy and restarted Home Assistant 49
+            # times — every 20 to 60 minutes overnight. And each restart
+            # tears down HA's Wyoming client MID-ANNOUNCE: wyoming/
+            # assist_satellite.py writes the audio chunk on a dead writer,
+            # raises, and its `finally` then tries to send AudioStop through
+            # the SAME dead client and raises again. So the terminator never
+            # reaches the box, which is left holding a partial buffer with
+            # no stop — and repeats it until somebody pulls the plug. That
+            # is the stutter. Restarting the whole home-automation brain to
+            # unstick one speaker was always a heavy hammer; it turned out
+            # to be the hammer breaking the thing it was aimed at.
+            pipeline_log("air", "box reachable but silent for "
+                                f"{int(stalled_for)}s — NOT restarting Home "
+                                "Assistant (#712): the restart severs the "
+                                "audio stream mid-clip and is what makes it "
+                                "stutter. The page carries the show.")
         else:
             pipeline_log("air", "satellite is reachable but stalling — NOT "
                                 "rebuilding a live link; the show runs on "
@@ -5844,9 +5875,18 @@ async def _box_nudge() -> None:
 def _airtime_note(expected: float, actual: float) -> None:
     if expected <= 0.5:
         return
+    # #712: the ratio used to be min(1.0, actual/expected), which meant every
+    # overrun read as exactly 1.00 — so a wedged box that never acknowledged
+    # its clip was indistinguishable from one that played it cleanly. It cost
+    # a whole night's diagnosis: "ratio 1.00 on every clip" was taken as proof
+    # the box finished everything, when Home Assistant's announce simply waits
+    # audio_seconds + 0.5 for a Played event the box may never send — which is
+    # exactly why `actual` sits about half a second over `expected`. Keep the
+    # true value; `over` is the honest flag for a clip that ran long.
     row = {"at": round(time.time()), "expected": round(expected, 1),
            "actual": round(actual, 1),
-           "ratio": round(min(1.0, actual / expected), 2)}
+           "ratio": round(actual / expected, 2),
+           "over": bool(actual > expected + 0.75)}
     _AIRTIME.append(row)
     del _AIRTIME[:-60]
     # This threshold stays at 6s, and the reason is worth writing down.
@@ -20305,17 +20345,40 @@ async def ha_reload_entry(entry_id: str) -> str:
 
 
 async def satellite_reachable(host: str = "", port: int = 0) -> bool:
-    """A TCP probe of the satellite itself — the ground truth."""
+    """Does the satellite actually ANSWER — not merely accept a socket?
+
+    This used to be a bare connect-and-close, described as ground truth. It
+    is not (#712): a WEDGED box still accepts the TCP connection while
+    servicing no Wyoming session at all. Measured on the real device
+    mid-wedge — the connection succeeded and the box returned zero bytes in
+    six seconds. So every wedge reported as "reachable but stalling", which
+    is exactly the branch that escalates to restarting Home Assistant, which
+    severs the audio stream, which wedges the box. The false signal was the
+    first link in that loop.
+
+    Now it speaks Wyoming: send `describe` and require a reply. A box that
+    answers is up; a box that takes the socket and says nothing is wedged,
+    and is finally reported as such."""
     host = host or SATELLITE_HOST
     if not host:
         return False
+    writer = None
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port or SATELLITE_PORT), 3)
-        writer.close()
-        return True
+        # Wyoming framing: one JSON header per line, payload optional.
+        writer.write((json.dumps({"type": "describe"}) + "\n").encode())
+        await asyncio.wait_for(writer.drain(), 2)
+        line = await asyncio.wait_for(reader.readline(), 4)
+        return bool(line and line.strip())
     except Exception:
         return False
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
 
 
 async def satellite_status() -> dict[str, Any]:
