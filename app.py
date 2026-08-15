@@ -8789,6 +8789,34 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         "engine": engine,
         "model": str(load_settings().get("model") or ""),
     }
+    # #696: the rest of the provenance, on the line rather than scattered
+    # across three feeds that only ever describe the LAST render. Hovering
+    # a speaker's name should answer, for THAT line: whose voice, driven by
+    # what, shaped by which intonation, what it looked like, and which
+    # datapoint out of the vector map it grew from.
+    if vec:
+        entry["perf"] = {
+            k: round(float(v), 3) for k, v in vec.items()
+            if not k.startswith("_") and isinstance(v, (int, float))
+        }
+        if vec.get("_macro"):
+            entry["macro"] = str(vec["_macro"])
+    if fx:
+        entry["fx"] = {k: str(v) for k, v in fx.items() if k != "perf"}
+    if clip and clip.get("path"):
+        # The media key, so the booth can draw this line's own waveform.
+        entry["media"] = clip["path"].rsplit("/", 1)[-1].split("?")[0]
+        entry["sig"] = clip.get("sig", "")
+    # Which swath the vector index handed over for this line, if it was a
+    # meaning search that found it rather than the weighted draw.
+    _hit = (_RADIO.get("vector_access") or [{}])[0]
+    if seed and _hit and _hit.get("file") \
+            and _hit["file"] == (seed.get("file") or ""):
+        entry["vec"] = {
+            "file": _hit.get("file", ""), "score": _hit.get("score"),
+            "ms": _hit.get("ms"), "searched": _hit.get("searched"),
+            "engine": _hit.get("engine", ""), "how": _hit.get("how", ""),
+        }
     if diverted:
         # Honest transcript (#344, #391): the page carried it live and
         # the hold shelf queues it for the box — 🕐, not lost.
@@ -22996,6 +23024,61 @@ async def ads_audio(
         return Response(blob[start:end + 1], status_code=206,
                         headers=headers, media_type="audio/mpeg")
     return Response(blob, headers=headers, media_type="audio/mpeg")
+
+
+@app.get("/media/{key}/spec")
+async def media_spectrogram(
+    key: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """A little spectrogram of ONE aired line (#696).
+
+    The booth hover card wants to show what a line LOOKED like, not just
+    what it said. Rendered once per clip and cached beside the strips the
+    radio-cache tooltips already use — the same signed ?t= as the audio
+    itself, because an <img> can no more send a bearer header than an
+    <audio> can."""
+    if not MEDIA_KEY_SHAPE.match(key):
+        return Response(status_code=404)
+    signature = str(request.query_params.get("t") or "")
+    expected = media_sign(key)
+    if not (expected and hmac.compare_digest(signature, expected)):
+        require_read_auth(authorization)
+    src = VOICE_MEDIA_DIR / key
+    if not src.is_file():
+        return Response(status_code=404)
+    spec_dir = RADIO_CACHE / "_spec"
+    out = spec_dir / f"line_{key}.png"
+
+    def render() -> bool:
+        if out.is_file():
+            return True
+        try:
+            import subprocess
+
+            import imageio_ffmpeg
+            spec_dir.mkdir(parents=True, exist_ok=True)
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.run(
+                [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(src),
+                 "-lavfi", "showspectrumpic=s=340x90:legend=0:color=intensity:"
+                           "scale=log:gain=3",
+                 "-frames:v", "1", str(out)],
+                capture_output=True, timeout=60)
+            keep = sorted(spec_dir.glob("line_*.png"),
+                          key=lambda p: p.stat().st_mtime)
+            for old in keep[:-400]:
+                old.unlink(missing_ok=True)
+            return out.is_file()
+        except Exception:
+            return False
+
+    if not await asyncio.to_thread(render):
+        return Response(status_code=404)
+    return FileResponse(out, media_type="image/png",
+                        headers={"Cache-Control": "private, max-age=86400"})
 
 
 @app.get("/media/{key}")
@@ -37999,6 +38082,31 @@ function initThemes() {
   applyTheme(localStorage.getItem("pineTheme") || "");
 }
 
+/* #695: the music player's own volume, kept.
+ *
+ * The transport is a native <audio controls>, and a browser does not persist
+ * that slider — every reload came back at full and you set it again. The
+ * levels in Pine Media are separate (they drive a GainNode); this is the
+ * knob actually on the player, which is the one you reach for.
+ *
+ * Written on change, restored before the first track loads. The mute state
+ * rides with it: pulling the slider to zero and reloading should not come
+ * back loud. */
+function musicVolumeRemember() {
+  const player = document.getElementById("musicPlayer");
+  if (!player || player.dataset.volBound) return;
+  player.dataset.volBound = "1";
+  const saved = Number(localStorage.getItem("pineMusicVolume"));
+  if (isFinite(saved) && saved >= 0 && saved <= 1) player.volume = saved;
+  if (localStorage.getItem("pineMusicMuted") === "1") player.muted = true;
+  player.addEventListener("volumechange", () => {
+    try {
+      localStorage.setItem("pineMusicVolume", String(player.volume));
+      localStorage.setItem("pineMusicMuted", player.muted ? "1" : "0");
+    } catch (e) { /* private browsing — it just does not persist */ }
+  });
+}
+
 /* ---- Spectrogram (#143) ---- */
 
 // One analyser per media element. Creating a MediaElementSource re-routes the
@@ -38812,6 +38920,119 @@ function djTalkPopup() {
   return box;
 }
 
+/* ---- What made this line (#696) ---------------------------------------
+ * Hovering a speaker's name in the booth opens the whole provenance of that
+ * one line: whose voice said it, what service drove that voice, which
+ * intonation system shaped it, a spectrogram of the audio that actually
+ * aired, and the datapoint out of the vector map the dialogue grew from.
+ *
+ * Every one of these facts already travelled with the line. None of them
+ * were reachable — the transcript showed a name, a voice id chip and a
+ * model, and the rest lived in feeds that only ever describe the LAST
+ * render, which is the wrong line by the time you look.
+ */
+const ENGINE_SERVICE = {
+  xtts: "XTTS server (voice cloning · :8770)",
+  piper: "Piper, over the Wyoming satellite link",
+  voxtral: "Voxtral (experimental)",
+  ha: "Home Assistant TTS",
+  browser: "the browser's own speech engine",
+};
+
+function lineCardHide() {
+  const box = document.getElementById("lineCard");
+  if (box) box.remove();
+}
+
+function lineCardShow(line, anchor, tint) {
+  lineCardHide();
+  const box = el("div", "panel", "");
+  box.id = "lineCard";
+  const at = anchor.getBoundingClientRect();
+  const wide = 360;
+  const left = (at.left + wide + 16 < window.innerWidth)
+    ? at.left : Math.max(8, window.innerWidth - wide - 12);
+  box.style.cssText = "position:fixed;z-index:200;width:" + wide + "px;"
+    + "left:" + left + "px;top:" + Math.min(window.innerHeight - 320,
+      at.bottom + 8) + "px;padding:10px 12px;margin:0;font-size:11px;"
+    + "line-height:1.55;pointer-events:none;border-color:" + tint + "66;"
+    + "box-shadow:0 20px 56px rgba(0,0,0,.72)";
+
+  const row = (label, value, colour) => {
+    if (!value) return;
+    const r = el("div", "", "");
+    r.style.cssText = "display:flex;gap:8px;padding:1px 0";
+    const k = el("span", "muted", label);
+    k.style.cssText = "flex:0 0 96px;font-size:10.5px";
+    const v = el("span", "", value);
+    v.style.cssText = "flex:1;min-width:0;overflow-wrap:anywhere"
+      + (colour ? ";color:" + colour : "");
+    r.appendChild(k); r.appendChild(v);
+    box.appendChild(r);
+  };
+
+  const head = el("div", "", (line.name || line.who || "the booth"));
+  head.style.cssText = "font-weight:700;color:" + tint + ";margin-bottom:5px";
+  box.appendChild(head);
+
+  // 1. the voice speaking it — the library name, not just the id.
+  let voiceName = line.voice || "";
+  const known = window.pineCloneVoices || [];
+  if (line.voice) {
+    const hit = known.find((v) => v.id === line.voice);
+    if (hit) voiceName = hit.name + "  ·  " + line.voice;
+  }
+  row("voice", voiceName || "the engine default");
+
+  // 2. what service drove it.
+  row("driven by", ENGINE_SERVICE[line.engine] || line.engine || "—");
+  row("written by", line.model || "");
+
+  // 3. the intonation system.
+  const perf = line.perf || {};
+  const shape = Object.keys(perf).map((k) =>
+    k + " " + (perf[k] > 0 ? "+" : "") + perf[k]).join(" · ");
+  row("intonation", line.macro
+    ? "performance vector · macro: " + line.macro + (shape ? " — " + shape : "")
+    : (shape ? "performance vector — " + shape
+             : "flat — no vector on this one"));
+  if (line.fx) {
+    row("desk", Object.keys(line.fx)
+      .map((k) => k + "(" + line.fx[k] + ")").join(" → "));
+  }
+
+  // 5. the datapoint out of the vector map.
+  if (line.vec) {
+    row("vector map", line.vec.file
+      + (line.vec.score != null ? "  match " + line.vec.score : "")
+      + (line.vec.searched ? "  · " + line.vec.searched + " swaths" : "")
+      + (line.vec.ms ? " in " + line.vec.ms + "ms" : ""), "#9fe6ff");
+    row("found by", (line.vec.how || "") + (line.vec.engine
+      ? " · " + line.vec.engine : ""));
+  } else if (line.source) {
+    row("out of", line.source + " (weighted draw, not a meaning search)");
+  } else {
+    row("out of", "its own head — no document behind this one");
+  }
+  row("delivery", {box: "📻 out of the Pine Box", held: "🕐 held for the box",
+                   page: "📵 this page only"}[line.aired] || "—");
+
+  // 4. the spectrogram of what actually aired.
+  if (line.media && line.sig) {
+    const cap = el("div", "muted", "spectrogram of this line");
+    cap.style.cssText = "font-size:10px;margin-top:6px";
+    box.appendChild(cap);
+    const img = document.createElement("img");
+    img.src = "/media/" + encodeURIComponent(line.media) + "/spec?t="
+      + encodeURIComponent(line.sig);
+    img.style.cssText = "width:100%;border-radius:6px;margin-top:3px;"
+      + "border:1px solid var(--border);background:#05070b";
+    img.onerror = () => { img.remove(); cap.remove(); };
+    box.appendChild(img);
+  }
+  document.body.appendChild(box);
+}
+
 /* ---- The glass over the booth (#668) ----------------------------------
  * A live spectrogram of the voice actually going out, coloured by WHO is
  * saying it, with the rest of the room shown beside it as idle meters so
@@ -39516,6 +39737,13 @@ function djTalkRender(state) {
       role.style.cssText = "font-size:9.5px;opacity:.6;color:" + tint;
       who.appendChild(role);
     }
+    // #696: the NAME is the handle on the whole provenance of the line —
+    // whose voice, what drove it, how it was intonated, what it looked
+    // like, and which datapoint out of the vector map it grew from. All of
+    // it already travels with the line; nothing showed it.
+    who.style.cursor = "help";
+    who.onmouseenter = (ev) => lineCardShow(line, ev.currentTarget, tint);
+    who.onmouseleave = lineCardHide;
     said.appendChild(who);
     said.appendChild(document.createTextNode(line.text || ""));
     // Every spoken line wears its delivery status (#430): out of the
@@ -58074,6 +58302,7 @@ checkHealth();
 initGutter();
 sparkShowInit();
 mpxInit();
+musicVolumeRemember();               // #695
 // Reads are open, so the panel + live dashboard populate on any computer,
 // with or without a key. The key is only needed to CHANGE things.
 connect();
