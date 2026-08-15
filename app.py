@@ -602,8 +602,19 @@ def require_auth(authorization: str | None) -> None:
 
     expected = f"Bearer {SPARK_AGENT_API_KEY}"
 
-    if authorization != expected:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    if hmac.compare_digest(authorization or "", expected):
+        return
+
+    # A full-access share link stands in for the key everywhere the key
+    # works — that is the whole point of it. It differs in the ways that
+    # matter: it expires on its own, and revoking it (or turning the epoch
+    # over) cuts it off without touching the real key. Defined further down
+    # the file; resolved at call time, never at import.
+    if str(authorization or "").startswith("Bearer ") \
+            and full_ok(authorization[7:]):
+        return
+
+    raise HTTPException(status_code=401, detail="Unauthorized")
 
 
 # Read-only/informational endpoints are OPEN by default so the live dashboard
@@ -4742,8 +4753,67 @@ def _tailnet_ips() -> tuple[str, str]:
     return v4, v6
 
 
-def _magicdns_name() -> str:
+def _ptr_lookup(ip: str, server: str = "100.100.100.100",
+                timeout: float = 2.0) -> str:
+    """Ask a nameserver what it calls this address.
+
+    Aimed at MagicDNS (100.100.100.100), which knows every machine on the
+    tailnet by name. Hand-rolled because the box runs `tailscale up
+    --accept-dns=false` — the resolver is deliberately NOT in
+    /etc/resolv.conf, so getnameinfo() would never ask it — and because
+    reading the answer out of tailscaled would mean mounting its control
+    socket, which is a far bigger grant than one PTR query deserves."""
     import socket
+    import struct
+    name = ".".join(reversed(ip.split("."))) + ".in-addr.arpa"
+    query = struct.pack(">HHHHHH", 0x5150, 0x0100, 1, 0, 0, 0)
+    for label in name.split("."):
+        query += bytes([len(label)]) + label.encode()
+    query += b"\x00" + struct.pack(">HH", 12, 1)          # QTYPE=PTR QCLASS=IN
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(query, (server, 53))
+            data, _ = sock.recvfrom(2048)
+    except Exception:
+        return ""
+    if len(data) < 12 or struct.unpack(">H", data[6:8])[0] < 1:
+        return ""                                          # no answer records
+
+    def read(off: int) -> tuple[str, int]:
+        parts: list[str] = []
+        while True:
+            size = data[off]
+            if size == 0:
+                off += 1
+                break
+            if size & 0xC0 == 0xC0:                        # compression pointer
+                where = struct.unpack(">H", data[off:off + 2])[0] & 0x3FFF
+                parts.append(read(where)[0])
+                off += 2
+                break
+            parts.append(data[off + 1:off + 1 + size].decode("utf-8", "replace"))
+            off += 1 + size
+        return ".".join(p for p in parts if p), off
+
+    try:
+        _, off = read(12)                                  # skip the question
+        off += 4
+        _, off = read(off)                                 # answer's own name
+        off += 8                                           # type/class/ttl
+        got = read(off + 2)[0]                             # past rdlength
+    except Exception:
+        return ""
+    return got.rstrip(".")
+
+
+def _magicdns_name(tailnet_ip: str = "") -> str:
+    import socket
+    # The tailnet's own resolver is authoritative and current; ask it first.
+    if tailnet_ip:
+        got = _ptr_lookup(tailnet_ip)
+        if got.endswith(".ts.net"):
+            return got
     try:
         host = socket.gethostname().split(".")[0]
         for line in Path("/etc/resolv.conf").read_text().splitlines():
@@ -4830,7 +4900,7 @@ def remote_stages() -> list[dict[str, Any]]:
     the person reading this panel is at a browser on their laptop, not
     sitting at the box's console."""
     v4, v6 = _tailnet_ips()
-    magic = _magicdns_name()
+    magic = _magicdns_name(v4)
     daemon = _iface_present() or bool(v4)
     tgt = _ssh_target()
     return [
@@ -4930,7 +5000,7 @@ def remote_access(fresh: bool = False) -> dict[str, Any]:
     import socket
     lan = _route_source_ip()
     v4, v6 = _tailnet_ips()
-    magic = _magicdns_name()
+    magic = _magicdns_name(v4)
     try:
         host = socket.gethostname()
     except Exception:
@@ -5012,23 +5082,54 @@ def share_epoch() -> int:
     return int((read_shares().get("epoch") or 1))
 
 
-def listen_token(expires: int, tag: str) -> str:
+# A link is one of two things, and the difference is signed into it so it
+# cannot be edited into the other. "listen" opens the handful of routes a
+# guest needs. "full" hands over the whole station — the control panel and
+# every route behind it — for people who ARE you on another machine.
+SHARE_SCOPES = ("listen", "full")
+
+
+def listen_token(expires: int, tag: str, scope: str = "listen") -> str:
     if not SPARK_AGENT_API_KEY:
         return ""
-    body = f"listen:{expires}:{tag}:{share_epoch()}"
+    if scope not in SHARE_SCOPES:
+        scope = "listen"
+    body = f"{scope}:{expires}:{tag}:{share_epoch()}"
     sig = hmac.new(SPARK_AGENT_API_KEY.encode(), body.encode(),
                    hashlib.sha256).hexdigest()[:24]
-    return f"{expires}.{tag}.{sig}"
+    # The suffix is cosmetic — the scope is inside the signature, so moving
+    # or removing it just makes the token fail to verify.
+    return (f"{expires}.{tag}.{sig}.full" if scope == "full"
+            else f"{expires}.{tag}.{sig}")
+
+
+def token_scope(token: str) -> str:
+    """What this token is allowed to be, or "" if it is not a token at all.
+
+    Expiry and the revocation epoch are both checked here, so there is one
+    place where a link stops working."""
+    raw = str(token or "")
+    scope = "listen"
+    if raw.endswith(".full"):
+        scope, raw = "full", raw[:-5]
+    try:
+        expires, tag, _sig = raw.split(".", 2)
+        if int(expires) < time.time():
+            return ""
+        if hmac.compare_digest(listen_token(int(expires), tag, scope), token):
+            return scope
+    except Exception:
+        pass
+    return ""
 
 
 def listen_ok(token: str) -> bool:
-    try:
-        expires, tag, sig = str(token or "").split(".", 2)
-        if int(expires) < time.time():
-            return False
-        return hmac.compare_digest(listen_token(int(expires), tag), token)
-    except Exception:
-        return False
+    """Any live link at all — a full one can obviously listen too."""
+    return bool(token_scope(token))
+
+
+def full_ok(token: str) -> bool:
+    return token_scope(token) == "full"
 
 
 def require_listen_auth(token: str, authorization: str | None) -> None:
@@ -14735,8 +14836,8 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
     brief = await callin_brief(topic)
     moods = random.sample(CALLIN_MOODS, 2)
     who = caller.strip() or random.choice(
-        ["a caller", "a listener", "someone on line one",
-         "a caller who would not give a name"])
+        ["a caller", "a listener", f"someone on {call_line_say(call_line_no())}",
+         "a caller who would not give a name"])          # #673
 
     angle = (
         f"{who} has just rung the station about this, and it is now on air: "
@@ -15424,7 +15525,38 @@ CALLER_OUTCOMES = (
     "a put-upon 'manager' voice for a beat, half-solves it, and the call ends",
     "the caller only gets ruder and more insulting the longer it goes, until "
     "the pair cheerfully and politely HANG UP on them mid-insult",
+    # #673: the caller drops the line themselves, mid-word, and the pair are
+    # left holding a dead handset. The point is the REACTION — a call that
+    # simply stops reads as the writer running out of road, but a call that
+    # stops and gets remarked on reads as a thing that happened.
+    "the caller HANGS UP ABRUPTLY, mid-sentence, without warning — cut them "
+    "off mid-word. The pair are left with dead air and a dial tone, and they "
+    "SAY SO out loud: 'they hung up', 'did they just... they did', 'we lost "
+    "them'. One of them takes it personally and the other finds it funny",
+    "the caller goes silent mid-answer, the line clicks, and they are gone. "
+    "The pair keep talking to nobody for a beat before realising, then call "
+    "it: 'hello? ...they're gone.' They spend a moment wondering aloud what "
+    "they said to deserve it",
+    "the caller snaps 'forget it' and SLAMS the phone down mid-question. The "
+    "pair react to the bang, then to the silence, and one of them defends "
+    "themselves to an empty line",
 )
+
+# #673: the switchboard is enormous and the line a caller comes in on is
+# drawn fresh every time. "Line one" every single call made the station feel
+# like it had exactly one phone; a number pulled from a switchboard this big
+# makes it feel like a place people are queuing to get into.
+CALL_LINES = 98837
+
+
+def call_line_no() -> int:
+    """Which line this caller came in on. 1 to 98,837, uniformly."""
+    return random.randint(1, CALL_LINES)
+
+
+def call_line_say(number: int) -> str:
+    """How a person would say that number out loud on air."""
+    return f"line {number:,}"
 
 
 def read_callers() -> list[dict[str, Any]]:
@@ -16215,15 +16347,20 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     if caller.get("style_card"):
         persona_bit += f" How {caller['name']} talks: {caller['style_card']}"
 
+    # #673: drawn per call, and the pair say it out loud.
+    line_no = call_line_no()
+    line_say = call_line_say(line_no)
     angle = (
-        f"The request line rings and {caller['name']} is on it, {state}."
+        f"The request line rings and {caller['name']} is on {line_say}, "
+        f"{state}."
         f"{persona_bit}{goal_bit} {topic} "
         # #544: the pair HEAR the phone ring and react to it before they pick
         # it up — the ring is a beat they play off of, not a silent cut.
         "It OPENS with the phone RINGING and the pair HEARING it: one of them "
         "reacts to the ring out loud first — 'oh — there's the phone', 'we've "
-        "got a caller coming in!', 'line one's lighting up' — a genuine "
-        "reaction to the ring. THEN one of you answers the request line "
+        f"got a caller coming in!', '{line_say} is lighting up' — a genuine "
+        f"reaction to the ring, and they NAME THE LINE: {line_say}. "
+        "THEN one of you answers the request line "
         f"— 'you're on {dj_settings()['station_name']}, who have we "
         f"got?' — and {caller['name']}'s FIRST line is introducing "
         "themselves by name, in their own words, before anything else. "
@@ -16241,9 +16378,9 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     )
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "call",
-        "text": f"On line one: {caller['name']}",
+        "text": f"On {line_say}: {caller['name']}",
     })
-    pipeline_log("call", f"{caller['name']} on line one — {state}"
+    pipeline_log("call", f"{caller['name']} on {line_say} — {state}"
                          + (" · cloned voice" if caller.get("voice_id")
                             else ""))
     # A phone rings before anyone speaks (#237).
@@ -23055,7 +23192,8 @@ async def dj_callin_voice(
         return {"heard": heard, "lines": [taken["reply"]],
                 "track": taken.get("track"), "kind": "request"}
 
-    result = await dj_callin(heard, caller="a caller on line one")
+    result = await dj_callin(
+        heard, caller=f"a caller on {call_line_say(call_line_no())}")  # #673
     return {**result, "heard": heard, "kind": "callin"}
 
 
@@ -24356,6 +24494,8 @@ async def share_list(
         out.append({"tag": tag, "label": row.get("label") or "",
                     "expires": int(row.get("expires") or 0),
                     "hours_left": round(left / 3600, 1),
+                    # Links minted before scopes existed are listener links.
+                    "scope": row.get("scope") or "listen",
                     "url": row.get("url") or ""})
     return {"links": sorted(out, key=lambda r: -r["expires"])}
 
@@ -24365,9 +24505,14 @@ async def share_make(
     request: Request,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
-    """Mint a tune-in link somebody else can open (#632). It carries a
-    signed, expiring token — never the API key — and opens only the handful
-    of routes a listener needs."""
+    """Mint a link somebody else can open (#632). It carries a signed,
+    expiring token — never the API key.
+
+    Two scopes. "listen" opens the handful of routes a guest needs.
+    "full" opens the whole station: the same control panel you are looking
+    at, and every route behind it, for when the person on the other end is
+    you on another machine. Full links are never the default — they have to
+    be asked for."""
     require_auth(authorization)
     if not SPARK_AGENT_API_KEY:
         raise HTTPException(
@@ -24376,9 +24521,12 @@ async def share_make(
     payload = await request.json()
     hours = max(1.0, min(24 * 90, float(payload.get("hours") or 168)))
     label = str(payload.get("label") or "a listener")[:60]
+    scope = str(payload.get("scope") or "listen").lower()
+    if scope not in SHARE_SCOPES:
+        scope = "listen"
     tag = uuid.uuid4().hex[:8]
     expires = int(time.time() + hours * 3600)
-    token = listen_token(expires, tag)
+    token = listen_token(expires, tag, scope)
     net = await asyncio.to_thread(remote_access)
     base = next((u["url"] for u in net["urls"] if u["kind"] == "tailscale"),
                 "") or next((u["url"] for u in net["urls"]), "")
@@ -24386,11 +24534,11 @@ async def share_make(
     rows = read_shares()
     rows.setdefault("epoch", 1)
     rows.setdefault("links", {})[tag] = {
-        "label": label, "expires": expires, "url": url,
+        "label": label, "expires": expires, "url": url, "scope": scope,
         "made": int(time.time())}
     write_shares(rows)
     return {"token": token, "url": url, "expires": expires, "label": label,
-            "remote": bool(net["tailscale"]["up"])}
+            "scope": scope, "remote": bool(net["tailscale"]["up"])}
 
 
 @app.post("/api/share/revoke")
@@ -24416,14 +24564,20 @@ async def share_revoke(
 
 @app.get("/tune/{token}")
 async def tune_page(token: str) -> HTMLResponse:
-    """The listener page, opened by a shared link. The page is handed the
-    TOKEN, never the key."""
-    if not listen_ok(token):
+    """Opened by a shared link. The page is handed the TOKEN, never the key.
+
+    A full-scope link gets the real control panel rather than the listener
+    page, so everything this station can do is available over it — the
+    studio, the booth, the vector search, the voice work, all of it. It
+    still runs on the token, so revoking the link locks that machine out
+    without disturbing the key or anybody else's link."""
+    scope = token_scope(token)
+    if not scope:
         raise HTTPException(
             status_code=403,
             detail="That tune-in link has expired or been revoked.")
-    page = RADIO_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(token))
-    return HTMLResponse(page)
+    page = (CONTROL_PANEL_HTML if scope == "full" else RADIO_PAGE_HTML)
+    return HTMLResponse(page.replace("__SERVER_KEY__", json.dumps(token)))
 
 
 @app.post("/api/dj/shout")
@@ -29038,6 +29192,52 @@ button.danger {
   from { transform: translateX(0); }
   to   { transform: translateX(-100%); }
 }
+/* #664: a line too long for its cell used to be cut off with a slice, which
+ * is the one thing you cannot do to text somebody is trying to READ. It
+ * scrolls instead, and it loops forever. Two copies of the text sit side by
+ * side and the pair slides exactly one copy's width, so the moment the
+ * first runs out the second is already in its place — no gap, no jump, no
+ * wait for it to come back around. */
+/* #665: a button that has been pressed and is waiting on the server must
+ * LOOK like it. The first synthesis for a voice takes the better part of a
+ * minute, and a button that just sits there is indistinguishable from one
+ * that did not register the click — so people click it again, which queues
+ * a second render and makes the wait worse. A sweep of light crossing the
+ * button says "heard you, still going" without needing any idea how long
+ * it will take, which is the honest position: nothing here can predict a
+ * cold model load. */
+.pending {
+  position: relative; overflow: hidden;
+  cursor: progress !important; opacity: .92;
+}
+.pending::after {
+  content: ""; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(100deg, transparent 20%,
+    var(--accent, #4f8cff) 48%, transparent 76%);
+  opacity: .38; animation: pendSweep 1.15s linear infinite;
+}
+.pending::before {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--accent, #4f8cff); transform-origin: left center;
+  animation: pendBar 1.9s ease-in-out infinite;
+}
+@keyframes pendSweep {
+  from { transform: translateX(-105%); }
+  to   { transform: translateX(105%); }
+}
+@keyframes pendBar {
+  0%   { transform: scaleX(0);   opacity: .35; }
+  55%  { transform: scaleX(.86); opacity: 1; }
+  100% { transform: scaleX(1);   opacity: .35; }
+}
+.mq-clip { overflow: hidden; white-space: nowrap; position: relative; }
+.mq-run  { display: inline-block; animation: mqLoop linear infinite; }
+.mq-run > span { padding-right: 2.5em; }
+.mq-clip:hover .mq-run { animation-play-state: paused; }
+@keyframes mqLoop {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
 .film-item {
   position: relative; height: calc(90px * var(--film-scale));
   aspect-ratio: 1; flex: 0 0 auto;
@@ -29649,6 +29849,20 @@ button.danger {
     box-shadow: 0 0 0 2px rgba(255,95,95,.9);
     background: rgba(255,95,95,.12);
   }
+}
+/* #670: the landing flash after jumping to the live line. Distinct from
+   .booth-live on purpose — that one says "this is airing", this one says
+   "this is the one you just asked for", and they show up together. */
+.booth-found {
+  animation: boothFound 1.8s ease-out 1;
+  border-radius: 6px;
+}
+@keyframes boothFound {
+  0%   { box-shadow: 0 0 0 3px rgba(120,190,255,.95), 0 0 26px rgba(120,190,255,.55); }
+  100% { box-shadow: 0 0 0 0 rgba(120,190,255,0), 0 0 0 rgba(120,190,255,0); }
+}
+@media (prefers-reduced-motion: reduce) {
+  .booth-found { animation: none; box-shadow: 0 0 0 3px rgba(120,190,255,.9); }
 }
 /* #645: a sting in the booth arrives as a chip that pops, so the window
    reads the way the broadcast sounded rather than as a line of text. */
@@ -36558,7 +36772,39 @@ function djTalkPopup() {
   head.style.cssText = "display:flex;align-items:center;gap:8px;"
     + "margin-bottom:6px;cursor:grab";
   const title = el("b", "", "In the booth");
-  title.style.cssText = "flex:1;font-size:13px";
+  title.style.cssText = "flex:1;font-size:13px;cursor:pointer";
+  /* #670: the live line already carries a pulsing outline, but once you
+   * have scrolled back through the night it is somewhere off-screen and
+   * there is no way home. Clicking the title is that way home — it goes to
+   * whatever is sounding right now and marks it. */
+  title.title = "Jump to the line going out right now";
+  title.onclick = (ev) => {
+    ev.stopPropagation();
+    const log = document.getElementById("djTalkLog");
+    if (!log) return;
+    // Scrolling back sets a flag that stops the auto-follow; asking to be
+    // taken to the live line is asking for that flag to be cleared.
+    log._userScrolled = false;
+    const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
+    let row = want
+      ? log.querySelector('[data-said="' + window.CSS.escape(want) + '"]')
+      : null;
+    if (!row) row = log.querySelector(".booth-live");
+    if (!row) {
+      // Nothing is sounding — the honest answer is the newest line, and
+      // saying so beats a click that appears to do nothing.
+      const all = log.querySelectorAll("[data-said]");
+      row = all.length ? all[all.length - 1] : null;
+      setStatus(row ? "nothing is going out — this is the last line said"
+                    : "the booth has not said anything yet");
+    }
+    if (!row) return;
+    try { row.scrollIntoView({block: "center", behavior: "smooth"}); }
+    catch (e) { row.scrollIntoView(); }
+    // A flash, so the eye lands on it even in a wall of identical rows.
+    row.classList.add("booth-found");
+    setTimeout(() => row.classList.remove("booth-found"), 1800);
+  };
   // ⬇ the last stretch of the LIVE broadcast, cut on demand: a slider from
   // 30 seconds back to 15 minutes, then one mp3 straight to disk.
   const grab = el("button", "", "⬇");
@@ -38233,6 +38479,39 @@ async function remoteDotPaint() {
   } catch (e) { /* the button still opens the panel */ }
 }
 
+/* #665: mark a control as waiting on the server, and hand back the one call
+ * that clears it. Wrap the whole action in it — including the failure path,
+ * which is the one people forget, leaving a button sweeping forever after
+ * an error.
+ *
+ *   const done = pending(btn);
+ *   try { await work(); } finally { done(); }
+ *
+ * It also blocks a second click for the duration: the wait is long enough
+ * that people press again, and a second press means a second render queued
+ * behind the first, so the impatient click is self-punishing. */
+function pending(node, waitingLabel) {
+  if (!node) return () => {};
+  if (node.dataset.pendingOn === "1") return () => {};
+  const wasTitle = node.title || "";
+  const wasText = node.textContent;
+  node.dataset.pendingOn = "1";
+  node.classList.add("pending");
+  node.title = waitingLabel || "working — this can take a while the first time";
+  if (node.tagName === "BUTTON") node.disabled = true;
+  if (waitingLabel && node.tagName === "BUTTON") node.textContent = waitingLabel;
+  let over = false;
+  return () => {
+    if (over) return;
+    over = true;
+    node.classList.remove("pending");
+    node.title = wasTitle;
+    node.textContent = wasText;
+    if (node.tagName === "BUTTON") node.disabled = false;
+    delete node.dataset.pendingOn;
+  };
+}
+
 /* #660: one way to copy, and it is "click the thing". Any element can be
  * made to carry a payload; clicking anywhere on it takes it, and the element
  * says so itself rather than relying on a separate button lighting up. */
@@ -38741,9 +39020,14 @@ async function remotePanel() {
     (got.links || []).forEach((l) => {
       const line = el("div", "phrase-row", "");
       line.style.cssText = "align-items:baseline;gap:8px";
-      const name = el("span", "", l.label + " · " + l.hours_left + "h left");
-      name.style.cssText = "flex:1;font-size:11px";
-      copyable(name, l.url, "the tune-in link");        // #660
+      const full = l.scope === "full";
+      const name = el("span", "",
+        (full ? "🔑 " : "🎧 ") + l.label + " · " + l.hours_left + "h left"
+        + (full ? " · full access" : ""));
+      name.style.cssText = "flex:1;font-size:11px"
+        + (full ? ";color:#ffc06a;font-weight:700" : "");
+      copyable(name, l.url, full ? "the full-access link"
+                                 : "the tune-in link");   // #660
       const copy = el("button", "", "copy");
       copy.style.fontSize = "11px";
       copyable(copy, l.url, "the tune-in link");
@@ -38779,26 +39063,56 @@ async function remotePanel() {
     if (h === 168) o.selected = true;
     span.appendChild(o);
   });
+  // What the link opens. Listener is the default on purpose — a full link
+  // is the whole station, so it has to be chosen deliberately.
+  const kind = el("select", "", "");
+  [["🎧 listen only", "listen"],
+   ["🔑 full access", "full"]].forEach(([t, v]) => {
+    const o = el("option", "", t); o.value = v;
+    kind.appendChild(o);
+  });
   const mint = el("button", "primary", "Make a link");
+  const scopeWhy = el("div", "muted", "");
+  scopeWhy.style.cssText = "font-size:10.5px;line-height:1.5;margin-top:5px";
+  const sayScope = () => {
+    const full = kind.value === "full";
+    scopeWhy.textContent = full
+      ? "🔑 Full access opens the whole control panel on their machine — the "
+        + "studio, the booth, the voice work, the vector search, the "
+        + "services, everything you can reach from here. Hand it out like "
+        + "you would hand out the key, because that is what it is. It still "
+        + "expires on its own and revoking it cuts that machine off without "
+        + "disturbing your key or anyone else's link."
+      : "🎧 Listen only opens the tune-in page: they can listen, request a "
+        + "song, vote, and shout at the booth. Nothing else is reachable.";
+    scopeWhy.style.color = full ? "#ffc06a" : "";
+  };
+  kind.onchange = sayScope;
+  sayScope();
   mint.onclick = async () => {
     mint.disabled = true;
     try {
       const got = await api("/api/share", {method: "POST",
         body: JSON.stringify({label: label.value.trim() || "a listener",
-                              hours: Number(span.value)})});
+                              hours: Number(span.value),
+                              scope: kind.value})});
       label.value = "";
       await drawLinks();
       remoteDotPaint();                       // #652
       try { await navigator.clipboard.writeText(got.url); } catch (e) {}
-      setStatus(got.remote
-        ? "link copied — it works from anywhere on your tailnet"
-        : "link copied — this one only works on your own network, "
-          + "since there is no tailnet yet");
+      const reach = got.remote
+        ? "it works from anywhere on your tailnet"
+        : "this one only works on your own network, since there is no "
+          + "tailnet yet";
+      setStatus((got.scope === "full"
+        ? "FULL-ACCESS link copied — " : "link copied — ") + reach);
     } catch (e) { setStatus(e.message, true); }
     mint.disabled = false;
   };
-  make.appendChild(label); make.appendChild(span); make.appendChild(mint);
+  make.appendChild(label); make.appendChild(span);
+  make.appendChild(kind); make.appendChild(mint);
   body.appendChild(make);
+  body.appendChild(scopeWhy);
 
   const nuke = el("button", "", "Revoke every link");
   nuke.style.cssText = "margin-top:8px;font-size:11px";
@@ -48005,6 +48319,11 @@ function studioSay(message, isError) {
     bar.textContent = message || "";
     bar.style.color = isError ? "var(--danger)" : "var(--muted)";
   }
+  // #669: the status line holds one message and the next one overwrites it.
+  // Anything worth saying is worth keeping, so it goes to the console too.
+  if (message && typeof studioLogAdd === "function") {
+    studioLogAdd(String(message), isError ? "bad" : "");
+  }
 }
 
 function studioProgress(fraction) {
@@ -48172,6 +48491,25 @@ function studioOpen() {
   win.appendChild(main);
   const status = el("div", "studio-status", "");
   status.id = "studioStatus";
+  // #669: the console lives above the one-line status, folded away until
+  // asked for. Everything below is a summary; this is the actual work.
+  const consoleWrap = el("details", "", "");
+  consoleWrap.id = "studioConsole";
+  consoleWrap.style.cssText = "margin-bottom:5px";
+  const consoleTop = el("summary", "", "▸ what is running");
+  consoleTop.style.cssText = "cursor:pointer;font-size:10.5px;opacity:.8;"
+    + "list-style:none;user-select:none";
+  consoleWrap.appendChild(consoleTop);
+  const consoleBody = el("div", "", "");
+  consoleBody.id = "studioConsoleBody";
+  consoleBody.style.cssText = "margin-top:5px";
+  consoleWrap.appendChild(consoleBody);
+  // Whether it is open is the operator's call, and it survives repaints.
+  consoleWrap.open = localStorage.studioConsoleOpen === "1";
+  consoleWrap.addEventListener("toggle", () => {
+    localStorage.studioConsoleOpen = consoleWrap.open ? "1" : "0";
+  });
+  status.appendChild(consoleWrap);
   const statusText = el("span", "", "");
   statusText.id = "studioStatusText";
   status.appendChild(statusText);
@@ -48243,6 +48581,131 @@ function studioNav(tab) {
 
 /* -- job watcher: 1.5s while anything runs, resumes across reloads -- */
 
+/* #669: the console behind the studio's one-line status.
+ *
+ * The status bar can only ever say one thing, and when three jobs are in
+ * flight it says whichever spoke last — so a long clone looks stalled while
+ * a short preview chatters over the top of it. This keeps the whole picture:
+ * every job that is running, what stage each one is on, how long it has sat
+ * there, a rolling log of what actually happened, and a graph of progress
+ * over time so a stall is visible as a flat line rather than inferred from
+ * a number that stopped moving. */
+const STUDIO_LOG = [];              // newest last, capped
+const STUDIO_PERF = {};             // jobId -> [{t, p}] progress samples
+
+function studioLogAdd(line, tone) {
+  STUDIO_LOG.push({t: Date.now(), line: line, tone: tone || ""});
+  // Deep enough to cover a whole clone, bounded so a long night cannot
+  // grow it without limit.
+  if (STUDIO_LOG.length > 300) STUDIO_LOG.splice(0, STUDIO_LOG.length - 300);
+}
+
+/* Progress against time for one job, as an SVG sparkline. A rising line is
+ * work; a flat one is a stall, and the point is that you can SEE which. */
+function studioPerfSvg(samples, width, height) {
+  const w = width || 210, h = height || 34;
+  if (!samples || samples.length < 2) {
+    return '<svg width="' + w + '" height="' + h + '"></svg>';
+  }
+  const t0 = samples[0].t;
+  const span = Math.max(1, samples[samples.length - 1].t - t0);
+  const pt = (s) => [
+    (s.t - t0) / span * (w - 2) + 1,
+    h - 2 - Math.max(0, Math.min(1, s.p)) * (h - 4),
+  ];
+  const line = samples.map((s) => pt(s).map((n) => n.toFixed(1)).join(","))
+    .join(" ");
+  const last = samples[samples.length - 1];
+  const head = pt(last);
+  // Flat for a while means stuck, and it should look wrong.
+  const recent = samples.slice(-6);
+  const moved = recent.length > 1
+    && (recent[recent.length - 1].p - recent[0].p) > 0.001;
+  const hue = moved ? "#2ee08a" : "#ffb454";
+  return '<svg width="' + w + '" height="' + h + '" style="display:block">'
+    + '<polyline points="' + line + '" fill="none" stroke="' + hue
+    + '" stroke-width="1.6" stroke-linejoin="round"/>'
+    + '<circle cx="' + head[0].toFixed(1) + '" cy="' + head[1].toFixed(1)
+    + '" r="2.4" fill="' + hue + '"/>'
+    + '</svg>';
+}
+
+function studioConsolePaint(live) {
+  const body = document.getElementById("studioConsoleBody");
+  const top = document.querySelector("#studioConsole summary");
+  if (!body) return;
+  const rows = live || [];
+  if (top) {
+    top.textContent = (rows.length
+      ? "▸ " + rows.length + " running"
+        + (rows.length > 1 ? " in parallel" : "")
+      : "▸ what is running") + " · console";
+  }
+  if (!document.getElementById("studioConsole").open) return;
+
+  const esc = (t) => String(t == null ? "" : t).replace(/[<>&]/g,
+    (c) => ({"<": "&lt;", ">": "&gt;", "&": "&amp;"}[c]));
+  const secs = (ms) => (ms / 1000).toFixed(ms < 10000 ? 1 : 0) + "s";
+
+  let html = "";
+  if (rows.length) {
+    html += '<div style="display:flex;flex-direction:column;gap:6px;'
+      + 'margin-bottom:7px">';
+    rows.forEach((r) => {
+      const pct = Math.round((r.progress || 0) * 100);
+      const stuck = Date.now() - (r.lastChange || Date.now());
+      html += '<div style="border:1px solid var(--border);border-radius:7px;'
+        + 'padding:6px 7px;background:#0a1220">'
+        + '<div style="display:flex;gap:7px;align-items:baseline">'
+        + '<span style="font-weight:700;font-size:10.5px">'
+        + esc(r.name || r.id) + '</span>'
+        + '<span style="font-size:10px;color:#8aa;flex:1">'
+        + esc(r.stage || "…")
+        + (stuck > 12000 ? " · " + secs(stuck) + " on this stage" : "")
+        + '</span>'
+        + '<span style="font-size:10px;color:#9fe">' + pct + '%</span>'
+        + '</div>'
+        // How much is left, drawn rather than described.
+        + '<div style="height:3px;border-radius:2px;background:#16202f;'
+        + 'overflow:hidden;margin:4px 0 3px">'
+        + '<div style="height:100%;width:' + pct + '%;background:'
+        + (stuck > 25000 ? "#ffb454" : "var(--accent)")
+        + ';transition:width .5s ease"></div></div>'
+        + '<div style="display:flex;gap:6px;align-items:center">'
+        + studioPerfSvg(STUDIO_PERF[r.id], 190, 30)
+        + '<div style="font-size:9px;color:#6a7c93;line-height:1.35">'
+        + 'running ' + secs(Date.now() - (r.started || Date.now())) + '<br>'
+        + esc((r.done || []).length) + ' stages done</div>'
+        + '</div>'
+        + (r.done && r.done.length
+            ? '<div style="font-size:9px;color:#5d7189;margin-top:3px">'
+              + esc(r.done.join(" › ")) + '</div>' : '')
+        + '</div>';
+    });
+    html += '</div>';
+  }
+
+  html += '<div style="font-family:ui-monospace,Menlo,Consolas,monospace;'
+    + 'font-size:9.5px;line-height:1.5;max-height:132px;overflow:auto;'
+    + 'background:#05090f;border:1px solid var(--border);border-radius:7px;'
+    + 'padding:5px 7px">';
+  if (!STUDIO_LOG.length) {
+    html += '<span style="color:#5d7189">nothing has run yet this session'
+      + '</span>';
+  }
+  html += STUDIO_LOG.slice(-60).map((e) => {
+    const when = new Date(e.t).toLocaleTimeString([], {hour12: false});
+    const colour = e.tone === "bad" ? "#ff8a8a"
+      : (e.tone === "good" ? "#5ce8a4" : "#8fa6c2");
+    return '<div><span style="color:#465a74">' + when + '</span> '
+      + '<span style="color:' + colour + '">' + esc(e.line) + '</span></div>';
+  }).join("");
+  html += '</div>';
+  body.innerHTML = html;
+  const log = body.lastChild;
+  if (log) log.scrollTop = log.scrollHeight;
+}
+
 function studioJobAdd(jobId, meta) {
   studioJobs[jobId] = Object.assign(
     {started: Date.now(), lastStage: "", lastChange: Date.now()},
@@ -48273,9 +48736,11 @@ async function studioJobWatch() {
   if (!ids.length) {
     clearInterval(studioJobTimer); studioJobTimer = null;
     studioProgress(null);
+    studioConsolePaint([]);                                    // #669
     return;
   }
   let best = null;
+  const live = [];                                             // #669
   for (const jobId of ids) {
     let status = null;
     try {
@@ -48293,7 +48758,26 @@ async function studioJobWatch() {
     }
     const meta = studioJobs[jobId];
     if (status.stage !== meta.lastStage) {
+      // #669: every stage change is a line in the console, so the shape of
+      // the run is readable after the fact and not only while staring.
+      studioLogAdd((meta.name || jobId) + " → " + status.stage,
+        status.stage === "error" ? "bad"
+          : (status.stage === "done" ? "good" : ""));
       meta.lastStage = status.stage; meta.lastChange = Date.now();
+    }
+    // #669: one sample per poll, thinned so a long job cannot grow this
+    // without bound — the graph only needs the shape, not every reading.
+    if (status.stage !== "done" && status.stage !== "error") {
+      const seq = STUDIO_PERF[jobId] || (STUDIO_PERF[jobId] = []);
+      seq.push({t: Date.now(), p: status.progress || 0});
+      if (seq.length > 240) seq.splice(0, seq.length - 240);
+      live.push({
+        id: jobId, name: meta.name || jobId, stage: status.stage,
+        progress: status.progress || 0, started: meta.started,
+        lastChange: meta.lastChange, done: status.stages_done || [],
+      });
+    } else {
+      delete STUDIO_PERF[jobId];
     }
     if (meta.kind === "lab") studioLabPaint(status);
     if (meta.kind === "quick") studioQuickBadge(status, jobId);
@@ -48347,6 +48831,7 @@ async function studioJobWatch() {
     }
   }
   studioProgress(best);
+  studioConsolePaint(live);                                    // #669
 }
 
 function studioCallerBadge(callerId, status) {
@@ -48473,6 +48958,10 @@ function studioVoicesDraw() {
       const hear = el("button", "", "🔊");
       hear.title = "Hear the clone say a line";
       hear.onclick = async () => {
+        // #665: the slow one. Cold, this is a model load plus a full
+        // synthesis, and it used to give back nothing at all until it
+        // finished.
+        const done = pending(hear, "…");
         studioSay("cloning a line — first time per voice is the slow one…");
         try {
           const made = await api("/api/voices/" + voice.id + "/preview",
@@ -48480,6 +48969,7 @@ function studioVoicesDraw() {
           new Audio(made.url).play();
           studioSay(voice.name + " · " + made.ms + " ms");
         } catch (error) { studioSay(error.message, true); }
+        finally { done(); }
       };
       row.appendChild(hear);
     }
@@ -48488,6 +48978,7 @@ function studioVoicesDraw() {
       redo.title = "Re-clone under today's extraction and cadence rules "
         + "— older voices come out sounding like themselves again (#333)";
       redo.onclick = async () => {
+        const done = pending(redo, "…");                       // #665
         try {
           const got = await api("/api/voices/" + voice.id + "/reclone",
             {method: "POST", body: "{}"});
@@ -48496,6 +48987,7 @@ function studioVoicesDraw() {
           studioSay("re-cloning " + voice.name + " via " + got.via
             + " — a couple of minutes");
         } catch (error) { studioSay(error.message, true); }
+        finally { done(); }
       };
       row.appendChild(redo);
     }
@@ -53285,16 +53777,31 @@ function mpxBuildTip() {
                  perf.pause_scale
                    ? "pauses ×" + Number(perf.pause_scale).toFixed(2) : ""]
     .filter(Boolean).join(" · ");
+  const esc0 = (t) => String(t == null ? "" : t).replace(/[<>&]/g,
+    (c) => ({"<": "&lt;", ">": "&gt;", "&": "&amp;"}[c]));
+  /* #664: anything that does not fit scrolls, and keeps scrolling. The
+   * speed is set from the length so a long line does not whip past — it
+   * always reads at about eleven characters a second, whatever its size.
+   * Hovering it stops the scroll so you can sit on a word. */
+  const scroll = (text, fits) => {
+    const t = String(text == null ? "" : text);
+    if (t.length <= (fits || 46)) return esc0(t);
+    const secs = Math.max(8, Math.round(t.length / 11) * 2);
+    return '<div class="mq-clip" title="' + esc0(t) + '">'
+      + '<div class="mq-run" style="animation-duration:' + secs + 's">'
+      + '<span>' + esc0(t) + '</span><span>' + esc0(t) + '</span>'
+      + '</div></div>';
+  };
   const table = [
     ["stage", (cur.stage || "idle") + (cur.detail ? " · " + cur.detail : "")],
-    ["saying", genNow
-      ? "“" + genNow.text.slice(0, 220) + "”" : "—"],
+    // #664: the whole line now, scrolling — not the first 220 characters.
+    ["saying", genNow ? scroll("“" + genNow.text + "”") : "—"],
     ["in the mouth of", genNow ? (genNow.name || genNow.who) : "—"],
     ["written by", genNow && genNow.model ? genNow.model
       : (s.model || "the writing model")],
     ["out of", genNow && genNow.source
-      ? genNow.source + (genNow.source_text
-          ? " — “" + String(genNow.source_text).slice(0, 90) + "”" : "")
+      ? scroll(genNow.source + (genNow.source_text
+          ? " — “" + String(genNow.source_text) + "”" : ""))
       : "its own head (no document behind this one)"],
     ["found by", vec
       ? (vec.how || "the vector index") + " · " + (vec.file || "?")
@@ -53306,8 +53813,10 @@ function mpxBuildTip() {
     ["rendered", rig.ms
       ? rig.ms + " ms · " + (rig.kb || "?") + " KB"
         + (rig.secs ? " · " + rig.secs + "s of audio" : "") : "—"],
+    // #664: this was the row that prompted it — cut at 60 characters, so
+    // every line ended mid-sentence.
     ["previous", genPrev
-      ? (genPrev.name || genPrev.who) + ": " + genPrev.text.slice(0, 60) : "—"],
+      ? scroll((genPrev.name || genPrev.who) + ": " + genPrev.text) : "—"],
     ["pending", pending + " held · " + queued + " queued"],
     ["delivery", at.avg_ratio != null
       ? Math.round(at.avg_ratio * 100) + "% of clips fully aired" : "—"],
@@ -53319,13 +53828,18 @@ function mpxBuildTip() {
   tip.innerHTML =
     '<div style="font-weight:700;margin-bottom:6px;letter-spacing:.05em">'
     + '⧉ SERVER TASK · what is processing</div>'
-    // The generating marquee (#534): the live text scrolling by.
-    + '<div style="overflow:hidden;white-space:nowrap;margin-bottom:8px;'
-    + 'border-radius:6px;background:#0a1220;border:1px solid #24344c;'
-    + 'padding:3px 0">'
-    + '<div style="display:inline-block;padding-left:100%;'
-    + 'animation:mpxMarq 14s linear infinite;font-size:10.5px;color:#9fe">'
-    + '⟳ generating — ' + esc(marquee) + '</div></div>'
+    // The generating marquee (#534). #664: it used to scroll in from the
+    // right off a 100% left pad, so most of every cycle was empty box
+    // waiting for the text to come back. Now it is doubled and loops with
+    // no gap at all.
+    + '<div class="mq-clip" style="margin-bottom:8px;border-radius:6px;'
+    + 'background:#0a1220;border:1px solid #24344c;padding:3px 6px;'
+    + 'font-size:10.5px;color:#9fe">'
+    + '<div class="mq-run" style="animation-duration:'
+    + Math.max(10, Math.round(String(marquee).length / 11) * 2) + 's">'
+    + '<span>⟳ generating — ' + esc(marquee) + '</span>'
+    + '<span>⟳ generating — ' + esc(marquee) + '</span>'
+    + '</div></div>'
     + '<div style="display:flex;gap:12px;align-items:center;margin-bottom:10px">'
     + '<div style="text-align:center">' + mpxSvgPie(counts)
     + '<div class="muted" style="font-size:9px;margin-top:2px">pipeline mix</div></div>'
