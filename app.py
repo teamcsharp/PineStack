@@ -39180,7 +39180,28 @@ async function sfxInspect(sfxId) {
    ...(info.top_dj ? [["👤 ", "mostly " + info.top_dj
                        + " (" + info.top_dj_plays + ")"]] : [])
   ].forEach(([icon, text]) => {
-    facts.appendChild(el("div", "", icon + text));
+    const line = el("div", "", icon + text);
+    /* #681: a page cannot open Explorer — browsers block file:// links
+     * from an http origin, and there is no API for "reveal in folder".
+     * What it CAN do is hand over a path Explorer takes. The samples live
+     * under /home/ehm_eckx/music on the box, and that same directory is
+     * the ehm_eckx SMB share, so the file has a real Windows address.
+     * Clicking the path copies it; paste into Explorer's bar or Win+R. */
+    if (icon === "📁 " && text) {
+      // "samples/..." lives under the share's own samples folder; "made
+      // scratches/..." is the station's own, inside the stack directory.
+      const rel = String(text).replace(/^\/+/, "");
+      const win = rel.indexOf("made scratches/") === 0
+        ? "pinevoice-stack\\spark-agent\\data\\sfx\\"
+          + rel.slice("made scratches/".length).replace(/\//g, "\\")
+        : rel.replace(/\//g, "\\");
+      const unc = "\\\\10.89.1.246\\ehm_eckx\\" + win;
+      copyable(line, unc, "the Windows path — paste it into Explorer");
+      line.title = "Click to copy the Windows path:\n" + unc
+        + "\n\nPaste it into Explorer's address bar, or Win+R. "
+        + "(A web page is not allowed to open Explorer itself.)";
+    }
+    facts.appendChild(line);
   });
   card.appendChild(facts);
 
