@@ -8875,8 +8875,19 @@ def dj_state() -> dict[str, Any]:
         # show "not reaching the box" and a "the box is back" prompt (#490,
         # #498, #500, #507). down = breaker open OR lines piling up unplayed.
         "box": {
+            # #690: "down" used to mean "the breaker is open OR two things
+            # are on the shelf", and shelf depth alone is not evidence of
+            # anything. A box that played a line ninety seconds ago is NOT
+            # down, however much old audio is stacked behind it — and since
+            # the shelf keeps stale clips until a drain pass clears them,
+            # that reading latched on and never came back. Measured: 220
+            # held, oldest 16.8 hours old, while the box had played
+            # successfully 164 seconds earlier and the satellite was idle
+            # and online. A pile-up now only counts as down if the box has
+            # ALSO gone quiet for longer than a drain cycle.
             "down": time.time() < float(_BOX_DOWN.get("until") or 0)
-                    or len(_BOX_HOLD) >= 2,
+                    or (len(_BOX_HOLD) >= 2
+                        and time.time() - _BOX_LAST_OK[0] > 120),
             "held": len(_BOX_HOLD),
             "silent_for": round(time.time() - _BOX_LAST_OK[0]),
             "last_ratio": _LAST_PLAYOUT.get("ratio"),
@@ -9469,15 +9480,15 @@ async def box_hold_watch() -> None:
         try:
             if not _BOX_HOLD:
                 continue
-            if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
-                continue
-            if await satellite_busy():
-                continue
-            if _ANNOUNCE_LOCK.locked():
-                continue                # the live show has the floor
-            # Never re-air STALE dialogue (#594): drop every held head older than
-            # HOLD_REPLAY_STALE before replaying, so the box plays fresh recent
-            # lines, not a backlog from an hour ago while the mix sounds good.
+            # #690: throwing away dialogue that is too old to air needs no
+            # device, no free satellite and no floor — it is bookkeeping.
+            # It used to sit BELOW the three guards below, so while the show
+            # was busy (which is most of the time it matters) the stale
+            # backlog was never cleared, and since a full shelf was ALSO
+            # what "the box is down" was read from, the station reported a
+            # dead box indefinitely over audio nobody would ever hear.
+            # Measured before this fix: 217 of 220 held lines were stale,
+            # the oldest by nearly seventeen hours.
             now = time.time()
             stale = 0
             while _BOX_HOLD and now - int(_BOX_HOLD[0].get("ts") or 0) \
@@ -9490,6 +9501,12 @@ async def box_hold_watch() -> None:
                                     "box plays fresh, never an old backlog")
             if not _BOX_HOLD:
                 continue
+            if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
+                continue
+            if await satellite_busy():
+                continue
+            if _ANNOUNCE_LOCK.locked():
+                continue                # the live show has the floor
             first = _BOX_HOLD[0]
             if not await _replay_held(first):
                 # Still down, or it only half-played — keep it and knock
