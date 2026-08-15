@@ -40793,6 +40793,7 @@ async function hangupRules(focusId) {
       const said = el("div", "muted", c.rule || "");
       said.style.cssText = "font-size:11px;margin-top:2px";
       row.appendChild(said);
+    if (artStrip) row.appendChild(artStrip);   // #707: to the right
       body.appendChild(row);
     });
   }
@@ -41227,22 +41228,29 @@ function djTalkRender(state) {
     // #702: the paintings this line is actually about, hung on it. The
     // strip at the top says WHAT is being sold; this says which line is
     // about which picture.
+    // #707: the pictures ride on the RIGHT of the entry rather than under
+    // the text. Beneath it they pushed every following line down and broke
+    // the column you read the conversation in; beside it the thumbnail is a
+    // margin note — you can see at a glance which lines are about a picture
+    // without the transcript losing its shape. Built here, hung on the row
+    // below, after the text has claimed its flex space.
+    let artStrip = null;
     if (line.images && line.images.length) {
-      const strip = el("div", "", "");
-      strip.style.cssText = "display:flex;gap:4px;margin-top:3px;"
-        + "flex-wrap:wrap";
+      artStrip = el("div", "", "");
+      artStrip.style.cssText = "display:flex;flex-direction:column;gap:3px;"
+        + "flex:0 0 auto;align-self:flex-start;margin-left:2px";
       line.images.slice(0, 3).forEach((n) => {
         const im = document.createElement("img");
         im.src = "/api/generations/image/" + encodeURIComponent(n);
-        im.loading = "lazy";
+        im.loading = "eager";
+        im.decoding = "async";
         im.title = n + " — open it";
-        im.style.cssText = "height:44px;width:44px;object-fit:cover;"
+        im.style.cssText = "height:40px;width:40px;object-fit:cover;"
           + "border-radius:5px;border:1px solid var(--border);cursor:zoom-in";
         im.onerror = () => { im.style.display = "none"; };
         im.onclick = (ev) => { ev.stopPropagation(); artFullscreen(n); };
-        strip.appendChild(im);
+        artStrip.appendChild(im);
       });
-      said.appendChild(strip);
     }
     // #651/#653: tag every spoken line with its words so the pulse can find
     // the one that is actually sounding. The server logs a line when it
