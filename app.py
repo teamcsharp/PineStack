@@ -22,7 +22,8 @@ from urllib.parse import quote, urlparse
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
-from fastapi.responses import FileResponse, HTMLResponse, Response
+from fastapi.responses import (FileResponse, HTMLResponse,
+                               PlainTextResponse, Response)
 
 app = FastAPI(
     title="PineBoxAgent",
@@ -25952,6 +25953,69 @@ async def dj_themes_set(
             "strength": int(rows.get("strength") or 70)}
 
 
+@app.get("/api/ads/archive")
+async def ads_archive(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every ad the station has ever written, newest first (#688).
+
+    The read is the artefact — these are the spots the pair invented, and
+    they were only ever visible as a line in a settings box you had to
+    scroll. Each row carries its full text, what it is selling, when it
+    was written, how many times it has aired, and a download when the
+    produced audio is still on disk."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(ad_list)
+    out = []
+    for row in rows:
+        rid = str(row.get("id") or "")
+        audio = ""
+        # The produced audio is already served by /ads-audio/{name}, signed
+        # over the file name — reuse it rather than minting a second door.
+        if rid and (PRODUCED_ADS_DIR / f"{rid}.mp3").is_file():
+            audio = f"/ads-audio/{rid}.mp3?t={media_sign(rid + '.mp3')}"
+        out.append({
+            "id": rid,
+            "product": str(row.get("product") or ""),
+            "text": str(row.get("text") or ""),
+            "kind": str(row.get("kind") or "read"),
+            "ts": int(row.get("ts") or 0),
+            "uses": int(row.get("uses") or 0),
+            "audio": audio,
+            "words": len(str(row.get("text") or "").split()),
+        })
+    out.sort(key=lambda r: -r["ts"])
+    return {"ads": out, "count": len(out),
+            "with_audio": sum(1 for r in out if r["audio"])}
+
+
+@app.get("/api/ads/archive.md", response_class=PlainTextResponse)
+async def ads_archive_md(
+    authorization: str | None = Header(default=None),
+) -> PlainTextResponse:
+    """The whole ad book as one readable file (#688) — every transcript,
+    in order, so the station's writing can be read away from the panel."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(ad_list)
+    rows = sorted(rows, key=lambda r: -int(r.get("ts") or 0))
+    lines = [f"# {dj_settings()['station_name']} — the ad book",
+             f"", f"{len(rows)} spots, newest first.", ""]
+    for row in rows:
+        when = time.strftime("%Y-%m-%d %H:%M",
+                             time.localtime(float(row.get("ts") or 0)))
+        lines.append(f"## {row.get('product') or 'an unnamed spot'}")
+        lines.append(f"*{when} · aired {int(row.get('uses') or 0)}×*")
+        lines.append("")
+        lines.append(str(row.get("text") or "").strip())
+        lines.append("")
+    body = "\n".join(lines)
+    stamp = time.strftime("%Y-%m-%d")
+    return PlainTextResponse(
+        body, media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{station_slug()}-ads-{stamp}.md"'})
+
+
 @app.get("/api/speakbox/lock")
 async def speakbox_lock_get(
     authorization: str | None = Header(default=None),
@@ -31971,6 +32035,23 @@ Glass</button>
           <button onclick="loadAds()" title="Refresh">↻</button>
         </div>
         <div id="adsOutput" style="margin-top:10px;max-height:300px;
+             overflow-y:auto"></div>
+      </details>
+
+      <!-- #688: every spot the station has ever written. -->
+      <details class="pine-customize" style="margin-top:10px"
+               ontoggle="if(this.open)adBookLoad()">
+        <summary class="muted" style="cursor:pointer">
+          The ad book — every spot they have written
+        </summary>
+        <div class="row" style="margin-top:8px;flex-wrap:wrap">
+          <button onclick="adBookLoad()" style="font-size:12px">↻ Refresh</button>
+          <button onclick="adBookAll()" style="font-size:12px"
+                  title="Every transcript in one markdown file">⬇ The whole book</button>
+          <span id="adBookCount" class="muted"
+                style="font-size:11px;align-self:center"></span>
+        </div>
+        <div id="adBookList" style="margin-top:9px;max-height:340px;
              overflow-y:auto"></div>
       </details>
 
@@ -39734,6 +39815,97 @@ async function onAirLaunch(ev) {
 
 async function onAirRefresh() {
   try { onAirPaint(await api("/api/dj")); } catch (e) {}
+}
+
+/* #688: the ad book. The reads ARE the artefact — these are the spots the
+ * pair invented — and they were only ever visible as a line in a settings
+ * box you had to scroll. Each one opens to its full transcript, plays if
+ * the produced audio survived, and the whole book downloads as one file. */
+async function adBookLoad() {
+  const list = document.getElementById("adBookList");
+  const tally = document.getElementById("adBookCount");
+  if (!list) return;
+  list.textContent = "Reading the book…";
+  let got;
+  try { got = await api("/api/ads/archive"); }
+  catch (e) { list.textContent = e.message; return; }
+  list.textContent = "";
+  if (tally) {
+    tally.textContent = got.count + " spot" + (got.count === 1 ? "" : "s")
+      + (got.with_audio ? " · " + got.with_audio + " still have their audio"
+                        : "");
+  }
+  if (!got.ads.length) {
+    list.appendChild(el("div", "muted", "Nothing written yet."));
+    return;
+  }
+  got.ads.forEach((ad) => {
+    const card = el("details", "", "");
+    card.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+      + "padding:6px 9px;margin-bottom:6px;background:var(--panel2,#0d1420)";
+    const head = el("summary", "", "");
+    head.style.cssText = "cursor:pointer;font-size:11.5px;list-style:none";
+    const when = ad.ts
+      ? new Date(ad.ts * 1000).toLocaleString([], {month: "short",
+          day: "numeric", hour: "2-digit", minute: "2-digit"})
+      : "";
+    head.appendChild(el("b", "", (ad.product || "an unnamed spot").slice(0, 64)));
+    const meta = el("span", "muted", "  " + when
+      + (ad.uses ? " · aired " + ad.uses + "×" : " · never aired")
+      + " · " + ad.words + " words" + (ad.audio ? " · 🔊" : ""));
+    meta.style.cssText = "font-size:10px;opacity:.75";
+    head.appendChild(meta);
+    card.appendChild(head);
+
+    const body = el("div", "", "");
+    body.style.cssText = "margin-top:6px";
+    const text = el("div", "", ad.text || "");
+    text.style.cssText = "font-size:11.5px;line-height:1.6;white-space:"
+      + "pre-wrap;padding:7px 8px;border-radius:6px;background:#05090f;"
+      + "border:1px solid var(--border)";
+    copyable(text, ad.text || "", "this read");            // #660
+    body.appendChild(text);
+
+    const acts = el("div", "row", "");
+    acts.style.cssText = "gap:6px;margin-top:6px";
+    if (ad.audio) {
+      const player = el("audio", "", "");
+      player.controls = true; player.preload = "none";
+      player.src = ad.audio;
+      player.style.cssText = "width:100%;height:32px";
+      body.appendChild(player);
+      const dl = el("a", "", "⬇ the audio");
+      dl.href = ad.audio;
+      dl.download = "ad-" + (ad.product || ad.id).replace(/[^\w-]+/g, "-")
+        .slice(0, 40) + ".mp3";
+      dl.style.cssText = "font-size:11px";
+      acts.appendChild(dl);
+    } else {
+      const none = el("span", "muted", "audio not kept for this one");
+      none.style.cssText = "font-size:10px";
+      acts.appendChild(none);
+    }
+    body.appendChild(acts);
+    card.appendChild(body);
+    list.appendChild(card);
+  });
+}
+
+/* The whole book as one markdown file — the writing, readable away from
+ * the panel. Goes through fetch rather than a bare link because the
+ * download needs the key on the request. */
+async function adBookAll() {
+  try {
+    const r = await fetch("/api/ads/archive.md",
+      {headers: {"Authorization": "Bearer " + key()}});
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const url = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = url; a.download = "pinebox-ads.md";
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 15000);
+    setStatus("the ad book is saved");
+  } catch (e) { setStatus(e.message, true); }
 }
 
 /* #680: what tonight's callers are ringing in about. */
