@@ -171,9 +171,10 @@ WEATHER_DEFAULT_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "")
 #   voxtral   Voxtral 4B TTS via vLLM-omni (:8000, OpenAI /v1/audio/speech,
 #             preset voices). Experimental — listed down until the host
 #             actually serves it; nothing depends on it being up.
-VOICE_ENGINES = ("ha", "piper", "ha_file", "browser", "xtts", "voxtral")
+VOICE_ENGINES = ("ha", "piper", "ha_file", "browser", "xtts", "f5",
+                 "voxtral")
 # Only these can hand back bytes; the others just make sound.
-VOICE_FILE_ENGINES = ("piper", "ha_file", "xtts", "voxtral")
+VOICE_FILE_ENGINES = ("piper", "ha_file", "xtts", "f5", "voxtral")
 
 # Speech IN is a separate wyoming service; the popup names it so the whole
 # voice path is visible in one place.
@@ -210,6 +211,11 @@ VOICE_KEEP_BYTES = int(os.getenv("VOICE_KEEP_BYTES", str(3 * 1024 ** 3)))
 # it can only notice it is gone and say so. Relaunch lives on the host:
 #   cd ~/reachy-gateway && scripts/tts.sh launch
 XTTS_URL = os.getenv("XTTS_URL", "http://127.0.0.1:8770").rstrip("/")
+# #726: the second cloning engine, same contract, its own port. Measured
+# 2.6x faster than XTTS on this box in a 59-voice paired test, and +0.12
+# identity on normal-length copy — which is what makes a continuous
+# stream possible at all, since XTTS renders slower than it plays.
+F5_URL = os.getenv("F5_URL", "http://127.0.0.1:8772").rstrip("/")
 # XTTS hard-caps text at 1000 chars. sentence_chunks (300) and
 # VOICE_MAX_CHARS (800) sit in front, so this belt should never hold weight.
 XTTS_MAX_CHARS = 950
@@ -421,6 +427,10 @@ DEFAULT_DJ = {
     # and the slider goes either way. Applied at synthesis, not by
     # speeding up the finished clip, so nobody sounds like a chipmunk.
     "speech_rate": 1.05,
+    # #726: "" leaves every clone on whatever its own meta says;
+    # "xtts" or "f5" forces the whole library onto one engine so the
+    # two can be compared on the same voices, same night.
+    "clone_engine": "",
     # Cover Art Archive, keyed on a MusicBrainz release — an actual API, so
     # what comes back is the record's own cover (#123, #130).
     "art_lookup": True,
@@ -908,6 +918,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "speech_rate": max(0.75, min(1.25, float(
             raw_dj.get("speech_rate", DEFAULT_DJ["speech_rate"])
             or 1.0))),
+        "clone_engine": (str(raw_dj.get("clone_engine") or "")
+                         if str(raw_dj.get("clone_engine") or "")
+                         in ("xtts", "f5") else ""),
         "art_lookup": bool(raw_dj.get("art_lookup", True)),
         "art_search": bool(raw_dj.get("art_search", False)),
         "sfx": bool(raw_dj.get("sfx", True)),
@@ -4771,6 +4784,45 @@ async def _voxtral_synthesize(text: str, voice: str) -> tuple[bytes, str]:
         raise RuntimeError(f"Voxtral returned no audio: {resp.text[:200]}")
 
 
+async def _f5_synthesize(text: str, voice: str) -> bytes:
+    """Zero-shot clone via the host's F5-TTS server (#726).
+
+    Same contract as XTTS — reference audio rides along base64 — so this
+    is the same function with a different port. The server owns the part
+    that differs: F5 clips a reference to twelve seconds and derives the
+    output length from the reference transcript, so it keeps a
+    sha1(reference) -> (clip, matching text) cache and never needs the
+    caller to know. Sending the wrong transcript with a reference is how
+    you get a line rendered at four times the speed it should be."""
+    ref = voice_ref_path(voice)
+    if ref is None:
+        raise RuntimeError(f"no reference recording for voice {voice!r}")
+    try:
+        rate = float(dj_settings().get("speech_rate") or 1.0)
+    except Exception:  # noqa: BLE001
+        rate = 1.0
+    payload: dict[str, Any] = {
+        "text": _xtts_sanitize(text)[:XTTS_MAX_CHARS],
+        "reference_audio": base64.b64encode(ref.read_bytes()).decode(),
+        "language": "en",
+        # nfe=16 costs 0.004 identity for 1.7x the speed — measured.
+        "opts": {"nfe_step": 16, "speed": max(0.75, min(1.25, rate))},
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(f"{F5_URL}/synthesize", json=payload)
+        resp.raise_for_status()
+        # Same trap as XTTS: failures come back as HTTP 200 with a JSON
+        # body, so the content-type is the truth, not the status code.
+        if not resp.headers.get("content-type", "").startswith("audio/"):
+            try:
+                detail = str((resp.json() or {}).get("error")
+                             or resp.json())[:200]
+            except Exception:  # noqa: BLE001
+                detail = resp.text[:200]
+            raise RuntimeError(f"F5 refused: {detail}")
+        return resp.content              # 24 kHz mono s16 WAV
+
+
 async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
     """THE seam. Add an engine here and the rest of the system inherits it."""
     if engine == "piper":
@@ -4779,6 +4831,8 @@ async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
         return await asyncio.wait_for(_ha_file_synthesize(text, voice), 60)
     if engine == "xtts":
         return await asyncio.wait_for(_xtts_synthesize(text, voice), 150), "wav"
+    if engine == "f5":
+        return await asyncio.wait_for(_f5_synthesize(text, voice), 150), "wav"
     if engine == "voxtral":
         return await asyncio.wait_for(_voxtral_synthesize(text, voice), 120)
     raise RuntimeError(f"the {engine} engine produces no audio file")
@@ -5594,6 +5648,14 @@ def voice_engine_for(voice: str) -> str:
     if VOICE_ID_SHAPE.match(voice):
         meta = voice_meta(voice)
         engine = str((meta or {}).get("engine") or "xtts")
+        # #726: one switch for the whole library, so both cloning
+        # engines can be tried against the same voices without editing
+        # sixty meta files. A voice that names a NON-cloning engine
+        # keeps it — the override only moves clones between clone
+        # engines. Per-voice meta still wins when clone_engine is off.
+        pick = str(dj_settings().get("clone_engine") or "")
+        if pick in ("xtts", "f5") and engine in ("xtts", "f5"):
+            engine = pick
         return engine if engine in VOICE_FILE_ENGINES else "xtts"
     if voice in VOXTRAL_PRESETS:
         return "voxtral"
@@ -5704,7 +5766,11 @@ async def voice_generate(text: str, voice: str, engine: str,
     # The gate is per-engine: Piper voices against the live catalog, clones
     # against the library, Voxtral against its preset list. Same doctrine
     # throughout — the server-side check is the real check.
-    if engine == "xtts":
+    # #726: both cloning engines take a library reference, so they share
+    # this gate. Leaving f5 out of it sent every f5 voice down the
+    # allowlist branch below, which only knows Piper names — so a
+    # perfectly good clone was rejected as "No such voice".
+    if engine in ("xtts", "f5"):
         if voice_ref_path(voice) is None:
             raise HTTPException(
                 status_code=400, detail=f"No such library voice: {voice}"
