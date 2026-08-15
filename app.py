@@ -9608,6 +9608,34 @@ async def larder_keeper() -> None:
             pass                       # the shelf refills next pass
 
 
+def now_really_playing(slack: float = 20.0) -> bool:
+    """Is a record actually turning, or is `now` just a stale pin?
+
+    #689: the dead-air watchdog treated any non-empty _RADIO["now"] as
+    proof that a record was on. But `now` stays pinned after a track ends
+    — playback is driven from the browser, so when the tab that was
+    driving it goes away the record simply stops and the pin remains. The
+    one thing built to catch silence was therefore blind to exactly the
+    silence that happens most. Measured: "Escape" pinned as now-playing
+    with remaining 0.0 on a 213-second track, nothing audible for
+    minutes, and the watchdog resetting its strike count every pass.
+
+    A pin only counts while the clock says the record could still be
+    running."""
+    track = _RADIO.get("now")
+    if not track:
+        return False
+    started = float(_RADIO.get("started") or 0)
+    if started <= 0:
+        return False                     # pinned but never actually started
+    length = float(track.get("seconds") or 0)
+    if length <= 0:
+        # Unknown length: give it a generous window rather than calling a
+        # long track dead half way through.
+        return time.time() - started < 900.0
+    return time.time() < started + length + slack
+
+
 async def dead_air_watch() -> None:
     """The silence ceiling (#338, #340). Nothing playing and nobody
     talking for longer than the slider allows → kick the show forward.
@@ -9628,11 +9656,27 @@ async def dead_air_watch() -> None:
             if not limit or not _RADIO.get("on"):
                 strikes = 0
                 continue
-            if _RADIO.get("now") or _SPEAKING[0] \
+            # #689: now_really_playing, not "is `now` set" — a finished
+            # record left pinned is silence, not a record.
+            if now_really_playing() or _SPEAKING[0] \
                     or time.time() - _LAST_SYNTH[0] < 45.0:
                 strikes = 0
                 heard = time.time()
                 continue                # airing, speaking, or rendering
+            # #689: a record that has run out is the ordinary case, not a
+            # fault — put the next one on and let the pair introduce it,
+            # rather than counting it as a strike toward restarting the
+            # whole show. Only genuine silence with nothing to play
+            # escalates.
+            if _RADIO.get("now") and (_RADIO.get("queue")
+                                      or _RADIO.get("requests")):
+                pipeline_log("air", "the record ran out — dropping the needle "
+                                    "on the next one")
+                _RADIO["now"] = None      # unpin, so the kick starts clean
+                dj_skip()
+                heard = time.time()
+                strikes = 0
+                continue
             quiet = time.time() - max(_SPOKE_AT[0], heard)
             if quiet <= limit:
                 continue
