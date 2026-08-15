@@ -410,6 +410,15 @@ DEFAULT_DJ = {
     # the default: a real line's texture, never a wall of noise — loud,
     # clear, still unmistakably a phone.
     "caller_static": 5,
+    # #750: how often a call turns on the pair — the sympathy taken as pity,
+    # the outburst, the co-host trying to defuse it and being rounded on,
+    # and then everyone friends again. 0 keeps the phone civil.
+    "hostile_rate": 0.14,
+    # #751: how often one of them stops the call to admire the caller's name.
+    "name_remark_rate": 0.3,
+    # #749: pages from the manager upstairs, per hour. 0 = the intercom
+    # stays quiet.
+    "upstairs_per_hour": 3.0,
     # A tape from the mysterious Ehm Eckx after every Nth song (#239).
     # 0 = the mail has stopped. The folder is named relative to the share.
     "mixtape_every": 3,
@@ -904,6 +913,18 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "caller_static": max(0, min(100, int(
             raw_dj.get("caller_static",
                        DEFAULT_DJ["caller_static"]) or 0))),
+        # #750/#751/#749. This dict is a WHOLESALE REBUILD — a key that is
+        # not written here is silently dropped on every save, which is
+        # exactly why manager_name and host_name have been dead keys. A
+        # slider whose value never survives is worse than no slider.
+        "hostile_rate": max(0.0, min(1.0, float(
+            raw_dj.get("hostile_rate", DEFAULT_DJ["hostile_rate"]) or 0))),
+        "name_remark_rate": max(0.0, min(1.0, float(
+            raw_dj.get("name_remark_rate",
+                       DEFAULT_DJ["name_remark_rate"]) or 0))),
+        "upstairs_per_hour": max(0.0, min(12.0, float(
+            raw_dj.get("upstairs_per_hour",
+                       DEFAULT_DJ["upstairs_per_hour"]) or 0))),
         "mixtape_every": max(0, min(10, int(
             raw_dj.get("mixtape_every",
                        DEFAULT_DJ["mixtape_every"]) or 0))),
@@ -4071,6 +4092,10 @@ _SPOKE_AT = [0.0]
 # the finished entry will land under so the two are one row and not two.
 _SPEAKING_NOW: dict[str, Any] = {}
 _SPEAKING_NOW_MAX = 300.0          # a stuck announce ages out rather than lying
+# #748: the timeline of a COALESCED round — one clip, many turns. The
+# stream is how most of the show actually goes out, and it never touched
+# _SPEAKING_NOW at all, so the booth could not follow it.
+_STREAM_NOW: dict[str, Any] = {}
 # When we last saw a REAL human turn (the box in listening/processing).
 # This box is announce-only so it stays 0 — which is the point: a
 # "responding" state with no recent real turn is a wedge, not a person.
@@ -4792,6 +4817,48 @@ async def _voxtral_synthesize(text: str, voice: str) -> tuple[bytes, str]:
         raise RuntimeError(f"Voxtral returned no audio: {resp.text[:200]}")
 
 
+_F5_HEALTH: dict[str, Any] = {"at": 0.0, "ready": False, "detail": ""}
+
+
+async def f5_health(force: bool = False) -> dict[str, Any]:
+    """Is the second cloning engine up? (#746)
+
+    There was no way to ask. Every readiness guard in the file probes XTTS
+    and falls back to Piper; an F5 voice with :8772 down had nothing to fall
+    back through, and a picker that groups by engine has to be able to say
+    which of the two is actually answering."""
+    if not force and time.time() - float(_F5_HEALTH["at"]) < 30:
+        return dict(_F5_HEALTH)
+    _F5_HEALTH["at"] = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            reply = await client.get(f"{F5_URL}/health")
+        if reply.status_code >= 400:
+            _F5_HEALTH.update({"ready": False,
+                               "detail": f"HTTP {reply.status_code}"})
+        else:
+            data = reply.json() if reply.content else {}
+            _F5_HEALTH.update({
+                "ready": bool(data.get("ready", True)),
+                "detail": str(data.get("detail") or "answering")})
+    except Exception as exc:               # noqa: BLE001
+        _F5_HEALTH.update({"ready": False,
+                           "detail": f"unreachable — {exc}"[:120]})
+    return dict(_F5_HEALTH)
+
+
+async def clone_engine_ready(engine: str) -> bool:
+    """Whichever cloning engine this voice actually renders on (#746).
+
+    Seven call sites wrote `engine == "xtts" and not xtts_health()` — which
+    silently means an F5 voice is never checked and never falls back."""
+    if engine == "xtts":
+        return bool((await xtts_health())["ready"])
+    if engine == "f5":
+        return bool((await f5_health())["ready"])
+    return True
+
+
 async def _f5_synthesize(text: str, voice: str) -> bytes:
     """Zero-shot clone via the host's F5-TTS server (#726).
 
@@ -5469,6 +5536,12 @@ def read_voices() -> list[dict[str, Any]]:
                     meta["has_signature"] = (folder / "signature.json").exists()
                     meta["has_style"] = (folder / "style.json").exists()
                     meta["has_reference"] = (folder / "reference.wav").exists()
+                    # #746: what will ACTUALLY render this voice tonight.
+                    # The stored `engine` is a preference; dj.clone_engine
+                    # can move the whole library onto one engine, and a
+                    # picker grouped on the stored field would then be
+                    # lying in both directions at once.
+                    meta["engine_now"] = _engine_now(meta)
                     voices.append(meta)
             except Exception:
                 continue
@@ -5486,6 +5559,19 @@ CLONE_CALLER_PCT = 45
 _CLONE_POOL_CACHE: dict[str, Any] = {"at": 0.0, "ids": []}
 
 
+def _engine_now(meta: dict[str, Any]) -> str:
+    """The engine that will really render this voice (#746).
+
+    Per-voice meta says what it prefers; the station-wide clone_engine
+    switch overrides it, but only ever BETWEEN the two cloning engines — a
+    Piper or Voxtral voice keeps what it has."""
+    engine = str(meta.get("engine") or "xtts")
+    if engine not in ("xtts", "f5"):
+        return engine
+    pick = str(dj_settings().get("clone_engine") or "")
+    return pick if pick in ("xtts", "f5") else engine
+
+
 def caller_clone_pool() -> list[str]:
     """Every cloned voice a random caller can borrow (#457): the vl_* library
     entries that actually have a reference to synthesize from. Cached briefly
@@ -5493,9 +5579,12 @@ def caller_clone_pool() -> list[str]:
     now = time.time()
     if _CLONE_POOL_CACHE["ids"] and now - _CLONE_POOL_CACHE["at"] < 20:
         return _CLONE_POOL_CACHE["ids"]
+    # #746: BOTH cloning engines. This filtered on "xtts" alone, so the
+    # moment a voice could be marked F5 it would have quietly left the
+    # caller rotation — marking a voice must not retire it from the phones.
     ids = sorted(str(m["id"]) for m in read_voices()
                  if m.get("has_reference")
-                 and str(m.get("engine") or "xtts") == "xtts")
+                 and _engine_now(m) in ("xtts", "f5"))
     _CLONE_POOL_CACHE.update({"at": now, "ids": ids})
     return ids
 
@@ -7444,7 +7533,18 @@ MACRO_STATES: dict[str, dict[str, float]] = {
                   "energy": 0.15, "cutoff": 0.12, "pause_scale": 1.15},
     "petulant":  {"pace": 0.90, "pitch_var": 1.25, "energy": -0.05,
                   "filler": 0.12, "pause_scale": 1.30, "restart": 0.10},
+    # #750: past shouting. "angry" is a caller who is cross; this is one who
+    # has stopped being a caller — clipped, hot, over the top of the answer,
+    # with no gaps left to be polite in.
+    "furious":   {"pace": 1.22, "pitch_st": 1.0, "pitch_var": 1.32,
+                  "energy": 0.42, "pause_scale": 0.68, "cutoff": 0.20},
 }
+
+# #750: the weather a caller can arrive in. "furious" is deliberately NOT
+# in here — it is where an argument ARRIVES, not a mood somebody rings in
+# with, and MACRO_STATES is drawn from wholesale elsewhere.
+CALLER_WEATHER = ("flustered", "confused", "angry", "exhausted", "nervous",
+                  "bratty", "petulant")
 _MACRO_MULT = ("pace", "pitch_var", "pause_scale")
 
 _PERF_IDENTITY = {"pace": 1.0, "pitch_st": 0.0, "pitch_var": 1.0,
@@ -7486,6 +7586,16 @@ _STATE_WORDS = (
     ("crack", "nervousness", 0.7), ("excit", "excitement", 0.8),
     ("thrill", "excitement", 0.7), ("giggl", "amusement", 0.8),
     ("laugh", "amusement", 0.6), ("stun", "confusion", 0.6),
+    # #750: the arc's own vocabulary, so a call that turns gets hotter as it
+    # goes instead of arriving at one temperature and staying there. The
+    # placation words cool it; the laughter words end it.
+    ("shut up", "irritation", 0.95), ("how dare", "irritation", 0.9),
+    ("hate", "irritation", 0.8), ("liar", "irritation", 0.8),
+    ("shouting", "irritation", 0.8), ("screaming", "irritation", 0.85),
+    ("calm down", "nervousness", 0.7), ("hey hey", "nervousness", 0.7),
+    ("take it easy", "nervousness", 0.6), ("settle down", "nervousness", 0.6),
+    ("cackl", "amusement", 0.9), ("howling", "amusement", 0.85),
+    ("wheez", "amusement", 0.8), ("crying laughing", "amusement", 0.9),
 )
 
 
@@ -7496,6 +7606,31 @@ def state_from_text(text: str) -> dict[str, float]:
         if needle in lowered:
             seen[dim] = max(seen.get(dim, 0.0), amount)
     return seen
+
+
+def escalation_feel(text: str) -> tuple[dict[str, float], str]:
+    """What this line does to the room (#750).
+
+    The performance vector is computed once per turn, before a word is
+    spoken, and nothing has ever moved it BETWEEN turns — so a call could
+    be written as an escalating argument and still be delivered at one flat
+    temperature from the first line to the last. This reads each line as it
+    goes and returns the emotional event plus the macro it implies, so the
+    voices actually get hotter, then wary, then helpless with laughter.
+
+    The macro is "" when the line is a laugh — landing back at ordinary is
+    the point of the arc, and leaving somebody stuck on furious would carry
+    into the next call."""
+    event = state_from_text(text)
+    lowered = (text or "").lower()
+    if any(w in lowered for w in ("cackl", "howling", "wheez", "laugh",
+                                  "giggl")):
+        return event, ""
+    if event.get("irritation", 0) >= 0.8:
+        return event, "furious"
+    if event.get("nervousness", 0) >= 0.6:
+        return event, "nervous"
+    return event, None
 
 
 def _compose_signature(sig: dict[str, Any],
@@ -7582,6 +7717,12 @@ def performance_vector(who: str, voice: str = "") -> dict[str, float]:
                       + 0.2 * state["irritation"] - 0.2 * state["fatigue"])
     vec["pause_scale"] *= 1 + 0.25 * state["fatigue"] \
         - 0.1 * state["irritation"]
+    # #750: amusement has been in EMOTION_DIMS since the director was
+    # written and read by NOTHING, so a room that ends up laughing
+    # sounded exactly like a room that did not. The arc lands on
+    # everyone being friends again; that has to be hearable.
+    vec["pitch_var"] *= 1 + 0.22 * state["amusement"]
+    vec["energy"] += 0.16 * state["amusement"]
     macro = str((_RADIO.get("speaker_macro") or {}).get(who) or "")
     for key, amount in (MACRO_STATES.get(macro) or {}).items():
         if key in _MACRO_MULT:
@@ -9169,15 +9310,57 @@ def _speaking_now_clear(line_id: str = "") -> None:
         _SPEAKING_NOW.clear()
 
 
+def _stream_now_set(rows: list[dict[str, Any]], length: float) -> None:
+    """A coalesced round is playing: remember its per-turn timeline (#748).
+
+    dj_speak is the only thing that publishes a live line, and the coalesced
+    stream never calls it — it renders a whole round or call into one clip
+    and writes every transcript row in a batch. So for the majority of the
+    broadcast the booth knew that a round was airing and nothing about WHERE
+    in it. These are the windows; speaking_now() reads the clock against
+    them."""
+    _STREAM_NOW.clear()
+    if not rows:
+        return
+    _STREAM_NOW.update({"at": time.time(), "rows": rows,
+                        "length": max(0.5, float(length or 0))})
+
+
+def _stream_now_clear() -> None:
+    _STREAM_NOW.clear()
+
+
 def speaking_now() -> dict[str, Any] | None:
     """What the booth should show as live, or None. Ages out on its own so a
     wedged announce leaves a stale 'going out now' row up forever (#742)."""
-    if not _SPEAKING_NOW:
-        return None
-    if time.time() - float(_SPEAKING_NOW.get("at") or 0) > _SPEAKING_NOW_MAX:
+    if _SPEAKING_NOW:
+        if time.time() - float(
+                _SPEAKING_NOW.get("at") or 0) <= _SPEAKING_NOW_MAX:
+            return {k: v for k, v in _SPEAKING_NOW.items() if k != "at"}
         _SPEAKING_NOW.clear()
-        return None
-    return {k: v for k, v in _SPEAKING_NOW.items() if k != "at"}
+    # #748: nothing single-line is airing — but a coalesced round might be,
+    # and that is most of the show. Read the clock against its windows.
+    if _STREAM_NOW:
+        off = time.time() - float(_STREAM_NOW.get("at") or 0)
+        # A grace beat past the measured length, then it is over — which is
+        # what stops a failed stream leaving a phantom live row up.
+        if off > float(_STREAM_NOW.get("length") or 0) + 4.0:
+            _STREAM_NOW.clear()
+            return None
+        for row in _STREAM_NOW.get("rows") or []:
+            if float(row.get("from") or 0) <= off < float(
+                    row.get("until") or 0):
+                return {
+                    "id": str(row.get("id") or ""),
+                    "ts": int(time.time()),
+                    "who": str(row.get("who") or "dj"),
+                    "kind": str(row.get("kind") or "call"),
+                    "text": str(row.get("text") or ""),
+                    "name": str(row.get("name") or ""),
+                    "voice": "", "engine": "",
+                    "aired": "airing",
+                }
+    return None
 
 
 def _ensure_chat_ids() -> None:
@@ -10500,6 +10683,7 @@ def dj_start(station: str) -> dict[str, Any]:
     # everything in _RADIO_TASK (#229).
     _RADIO_TASK.append(asyncio.create_task(news_clock()))
     _RADIO_TASK.append(asyncio.create_task(caller_clock()))
+    _RADIO_TASK.append(asyncio.create_task(upstairs_clock()))   # #749
     _RADIO_TASK.append(asyncio.create_task(ad_clock()))
     _RADIO["episode"] = {"started": time.time(), "items": []}
     _RADIO_TASK.append(asyncio.create_task(episode_clock()))
@@ -12222,6 +12406,341 @@ async def dj_police_outside(text: str) -> None:
                f"make it out, was: \"{text}\". React live — look out of the "
                "window, describe what you can see, decide whether to keep "
                "broadcasting.")))
+
+
+# --- The manager upstairs (#749) --------------------------------------------
+#
+# There has always been a manager — dj_manager_note reads the system prompt
+# out as a memo, dj_manager_call puts him on the booth phone — but he was
+# never a VOICE you hear. He was the pair describing having heard something.
+#
+# This is the intercom: a page written against whatever is actually
+# happening on air, spoken by one of the station's own cloned voices with a
+# vocoder over it, PLAYED as its own clip, and then dealt with live. Roughly
+# three an hour, on its own clock, and it is allowed to land in the middle
+# of a phone call because that is the whole comedy of it.
+#
+# Every page is kept, because the operator asked to proofread them: they are
+# a book like the ad book, editable and downloadable from the same modal.
+UPSTAIRS_PATH = Path("/app/data/upstairs_pages.json")
+_UPSTAIRS_LOCK = RLock()
+UPSTAIRS_AUDIO_DIR = Path("/app/data/upstairs_audio")
+UPSTAIRS_AUDIO_SHAPE = re.compile(r"^[a-f0-9]{6,32}\.mp3\Z")
+UPSTAIRS_KEEP = 300
+
+# The register, not the script. The model is told to top these, the way
+# HEAT_SO_HOT is used — a fixed list of gripes read out verbatim would be
+# the repetition #752 is about.
+UPSTAIRS_GRIPES = (
+    "spin more records and talk less",
+    "get back to work — the request line is not answering itself",
+    "the lunch breaks are out of hand and everybody upstairs knows it",
+    "neither of you is worth what this station is paying",
+    "the callers are being handled far too slowly",
+    "who set the studio on fire, and why did nobody file anything",
+    "the turntable is being sold and people are coming for it this week",
+    "the equipment budget is gone and it is going to be somebody's fault",
+    "there have been complaints, and they are not going to be shared",
+    "somebody has been in the building after hours and it will come out",
+    "the coffee order has been cancelled, permanently, as a lesson",
+    "a consultant is coming in and neither of you will enjoy it",
+)
+
+
+def upstairs_list() -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(UPSTAIRS_PATH.read_text())
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+def _upstairs_write(rows: list[dict[str, Any]]) -> None:
+    with _UPSTAIRS_LOCK:
+        try:
+            UPSTAIRS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = UPSTAIRS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows[-UPSTAIRS_KEEP:], indent=1)
+                           + chr(10))
+            tmp.replace(UPSTAIRS_PATH)
+        except OSError:
+            pass
+
+
+def upstairs_save(text: str, gripe: str, context: str) -> dict[str, Any]:
+    with _UPSTAIRS_LOCK:
+        rows = upstairs_list()
+        entry = {"id": uuid.uuid4().hex[:12], "ts": int(time.time()),
+                 "text": str(text)[:2000], "gripe": str(gripe)[:200],
+                 "context": str(context)[:400], "voice": "", "vocode": "",
+                 "audio": "", "uses": 0, "last": 0}
+        rows.append(entry)
+        _upstairs_write(rows)
+        return entry
+
+
+def upstairs_update(page_id: str, **fields: Any) -> dict[str, Any] | None:
+    with _UPSTAIRS_LOCK:
+        rows = upstairs_list()
+        for row in rows:
+            if row.get("id") != page_id:
+                continue
+            for key, value in fields.items():
+                if key in ("text", "gripe", "context", "voice", "vocode",
+                           "audio"):
+                    row[key] = str(value)[:2000]
+                elif key in ("uses", "last"):
+                    row[key] = int(value)
+            _upstairs_write(rows)
+            return row
+    return None
+
+
+def upstairs_delete(page_id: str) -> None:
+    with _UPSTAIRS_LOCK:
+        rows = upstairs_list()
+        gone = next((r for r in rows if r.get("id") == page_id), None)
+        if gone and gone.get("audio"):
+            try:
+                (UPSTAIRS_AUDIO_DIR / str(gone["audio"])).unlink(
+                    missing_ok=True)
+            except OSError:
+                pass
+        _upstairs_write([r for r in rows if r.get("id") != page_id])
+
+
+def upstairs_context() -> str:
+    """What is happening on air RIGHT NOW, in one line.
+
+    The manager complains about whatever is actually going on — that is the
+    difference between an intercom and a random insult generator. Every
+    source here already exists; none of it is new telemetry."""
+    bits: list[str] = []
+    now = _RADIO.get("now") or {}
+    if now.get("title"):
+        bits.append(f"the record playing is {now['title']}"
+                    + (f" by {now['artist']}" if now.get("artist") else ""))
+    said = [str(c.get("text") or "") for c in (_RADIO.get("chat") or [])
+            if c.get("who") in ("dj", "cohost", "third", "caller")
+            and c.get("text")][-3:]
+    if said:
+        bits.append("what they have been saying: "
+                    + " / ".join(s[:160] for s in said))
+    ad = _RADIO.get("ad_now") or {}
+    if ad.get("product") and time.time() - float(ad.get("at") or 0) < 240:
+        bits.append(f"they are in the middle of selling {ad['product']}")
+    try:
+        heat = booth_hot()
+        if heat and heat >= 55:
+            bits.append(f"the machine under the floor is at {heat:.0f}C and "
+                        "the whole building knows it")
+    except Exception:
+        pass
+    stats = _RADIO.get("session_stats") or {}
+    if stats.get("calls"):
+        bits.append(f"{int(stats['calls'])} calls have been taken tonight")
+    return "; ".join(bits)[:600]
+
+
+async def dj_upstairs_write() -> dict[str, Any]:
+    """Write one page from upstairs, steered by the speakbox and by what is
+    actually on air."""
+    context = upstairs_context()
+    gripe = unrepeated(list(UPSTAIRS_GRIPES), "upstairs-gripe")
+    seed: dict[str, Any] = {}
+    try:
+        seed = await speakbox_semantic_seed(context or gripe,
+                                            who="manager") or {}
+        if not seed.get("text"):
+            seed = await speakbox_quote(most=4, cap=420) or {}
+    except Exception:
+        seed = {}
+    prompt = (
+        "You are the STATION MANAGER, upstairs, paging the booth over the "
+        "intercom. You are not on the air and you do not care that they "
+        "are. You speak in ONE voice — no speaker labels, no dialogue, no "
+        "stage directions — straight at the two of them, and you do not "
+        "wait for an answer.\n\n"
+        f"What you are on about this time: {gripe}.\n"
+        + (f"What is happening down there right now: {context}.\n"
+           if context else "")
+        + (f"Work THIS material in — bend it into your own grievance, do "
+           f"not quote it as a passage: \"{str(seed.get('text'))[:420]}\"\n"
+           if seed.get("text") else "")
+        + "\nBe specific, petty, and completely certain you are right. "
+        "Reference the actual thing happening downstairs. Escalate to some "
+        "threat that is out of all proportion — equipment being removed, "
+        "somebody being replaced, a policy nobody has heard of. Four to "
+        "seven sentences. No markdown, no emoji, no lists.")
+    try:
+        text = spoken_text(await ask_model(prompt, limit=700))
+    except Exception:
+        text = ""
+    if not text:
+        return {}
+    row = upstairs_save(text, gripe, context)
+    if seed:
+        speakbox_remember(seed)
+    return row
+
+
+async def dj_upstairs_render(row: dict[str, Any]) -> dict[str, Any] | None:
+    """The manager's actual voice: one of the station's own cloned voices
+    with a vocoder over it and the tannoy colour on top, kept as a durable
+    mp3 so the page can be replayed and downloaded."""
+    text = str(row.get("text") or "")
+    if not text:
+        return None
+    voices = await session_voices()
+    names = [c for c in sorted(VOCODER_CHARACTERS)
+             if c not in ("plain", "autotune", "choir")]
+    character = str(row.get("vocode") or "") or (
+        unrepeated(names, "upstairs-vocode") if names else "megaphone")
+    try:
+        voice = caller_voice_for(
+            "the manager upstairs",
+            {voices.get("dj", ""), voices.get("cohost", "")},
+            await voice_allowlist(),
+            clones=caller_clone_pool()) or ""
+    except Exception:
+        voice = ""
+    engine = voice_engine_for(voice)
+    if engine in ("xtts", "f5") and not await clone_engine_ready(engine):
+        engine, voice = "piper", _event_voice("default")
+    try:
+        clip = await voice_generate(
+            text, voice, engine,
+            fx={"vocode": character,
+                "pitch": VOCODER_DEFAULT_PITCH.get(character, -2),
+                "strip": "am_radio"})
+    except Exception:
+        clip = None
+    if not clip:
+        return None
+    key = clip["path"].rsplit("/", 1)[-1].split("?")[0]
+    try:
+        wav = (VOICE_MEDIA_DIR / key).read_bytes()
+    except OSError:
+        return None
+    name = await asyncio.to_thread(_upstairs_audio_write, wav, row["id"])
+    if not name:
+        return None
+    upstairs_update(row["id"], audio=name, voice=voice, vocode=character)
+    return {**row, "audio": name, "voice": voice, "vocode": character}
+
+
+def _upstairs_audio_write(wav_bytes: bytes, page_id: str) -> str | None:
+    """The page kept as a durable mp3 — /media is pruned, and the operator
+    asked to be able to download these."""
+    try:
+        import subprocess
+
+        import imageio_ffmpeg
+        UPSTAIRS_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
+        name = f"{page_id}.mp3"
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        subprocess.run(
+            [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "wav", "-i", "pipe:0",
+             "-codec:a", "libmp3lame", "-b:a", "128k",
+             str(UPSTAIRS_AUDIO_DIR / name)],
+            input=wav_bytes, capture_output=True, timeout=120)
+        return name if (UPSTAIRS_AUDIO_DIR / name).is_file() else None
+    except Exception:
+        return None
+
+
+async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
+    """The whole beat: the pair notice the intercom, it PLAYS, they deal
+    with it."""
+    made = row or await dj_upstairs_write()
+    if not made:
+        return False
+    if not made.get("audio"):
+        made = await dj_upstairs_render(made) or {}
+    name = str(made.get("audio") or "")
+    if not name or not (UPSTAIRS_AUDIO_DIR / name).is_file():
+        return False
+    path, sig = f"/upstairs-audio/{name}", media_sign(name)
+    label = "📟 a page from upstairs"
+    # (a) the pair hear the intercom light up and say so — through banter so
+    # the near-duplicate drop in dj_speak cannot eat a fixed phrase.
+    try:
+        await dj_banter(_RADIO.get("now"), lines=2, angle=(
+            "The INTERCOM from upstairs has just lit up in the booth. One of "
+            "you notices it out loud — 'hold on, that is upstairs', 'the "
+            "manager is paging us again', 'oh, here we go' — and the other "
+            "reacts to being paged, briefly. TWO lines, no more: the message "
+            "itself is about to play and you must not talk over it."))
+    except Exception:
+        pass
+    # (b) it is a noise the desk made, so it belongs in the booth list.
+    _desk_sound(label, _clip_seconds(path) or 0.0)
+    _RADIO["chat"].append({
+        "ts": int(time.time()), "who": "board", "kind": "upstairs",
+        "name": "upstairs", "text": str(made.get("text") or ""),
+        "gripe": str(made.get("gripe") or ""),
+        "page_id": str(made.get("id") or ""),
+        "page_audio": name, "page_sig": sig,
+    })
+    del _RADIO["chat"][:-160]
+    # (c) PLAY IT — the point of the whole request is that you hear him.
+    to = _RADIO.get("voice_to") or "box"
+    if to in ("box", "both"):
+        await _play_on_box(path, sig)
+    if to in ("here", "both") or not box_talk_ok():
+        _RADIO["voice_clips"].append({
+            "ts": int(time.time() * 1000),
+            "url": f"{path}?t={sig}", "text": label,
+            "voice": str(made.get("voice") or "")})
+        del _RADIO["voice_clips"][:-40]
+    _episode_stage(f"{path}?t={sig}", label)
+    upstairs_update(str(made.get("id") or ""),
+                    uses=int(made.get("uses") or 0) + 1,
+                    last=int(time.time()))
+    pipeline_log("air", "a page from upstairs went out — "
+                        f"{made.get('vocode') or 'vocoded'} (#749)")
+    # (d) and they have to process it, on air.
+    try:
+        await dj_banter(_RADIO.get("now"), lines=4, angle=(
+            "You have both just been made to listen to a page from the "
+            "MANAGER UPSTAIRS over the studio intercom. What he said, word "
+            f"for word, was: \"{str(made.get('text') or '')[:900]}\" "
+            "Deal with it, live, in front of everybody: one of you takes it "
+            "personally and the other one finds it funny, or you both go "
+            "quiet and then start arguing about which of you he meant. Do "
+            "NOT repeat his message back — react to it. He cannot hear you, "
+            "which does not stop either of you answering him."))
+    except Exception:
+        pass
+    return True
+
+
+async def upstairs_clock() -> None:
+    """Roughly N pages an hour, on their own clock, jittered — and quite
+    deliberately not checking whether a call is in progress, because "it can
+    land mid-phone-call" is the ask."""
+    first = True
+    while _RADIO.get("on"):
+        rate = float(dj_settings().get("upstairs_per_hour") or 0)
+        if rate <= 0:
+            await asyncio.sleep(300)
+            continue
+        gap = max(120.0, 3600.0 / rate)
+        # The first page of a fresh show comes early, so the feature is
+        # visible without waiting twenty minutes for it.
+        wait = random.uniform(90.0, 200.0) if first else \
+            random.uniform(gap * 0.6, gap * 1.4)
+        first = False
+        await asyncio.sleep(wait)
+        if not _RADIO.get("on"):
+            return
+        if float(dj_settings().get("upstairs_per_hour") or 0) <= 0:
+            continue
+        try:
+            await dj_upstairs_page()
+        except Exception as exc:            # noqa: BLE001
+            pipeline_log("drop", f"a page from upstairs died: {exc}"[:200])
 
 
 # --- The radio cache (#548): finished phone calls kept as compressed mp3 +
@@ -16050,8 +16569,12 @@ def draw_saved_banter() -> dict[str, Any]:
     aired inside the last half hour. One kept row with no cooldown owned
     seventy percent of the show, forty-three airings in a day."""
     now = time.time()
+    # #752: a ladder, not a flat half hour. A kept line waits an hour before
+    # its first return, three before its second, and five from then on — the
+    # rotation the request asks for, driven off the row's own airing count.
     rows = [r for r in read_saved_banter()
-            if now - float(r.get("last") or 0) > 1800]
+            if now - float(r.get("last") or 0)
+            > TIER_GATES[min(int(r.get("used") or 0), 2)]]
     if not rows:
         return {}
     fewest = min(int(r.get("used") or 0) for r in rows)
@@ -16064,6 +16587,16 @@ def draw_saved_banter() -> dict[str, Any]:
                 row["used"] = int(row.get("used") or 0) + 1
                 row["last"] = int(time.time())
         write_saved_banter(rows)
+    # #752: "cycled out when they're not working". A kept line that keeps
+    # colliding with fresher material has stopped earning its place, and the
+    # print ledger is the only thing that knows. Retired through bin_line so
+    # it inherits the never-say-this-again path rather than a second one.
+    hits = next((r for r in line_prints()
+                 if r.get("key") == _bin_key(chosen.get("text", ""))), {})
+    if int(hits.get("blocked") or 0) >= 3:
+        bin_line(str(chosen.get("text") or ""))
+        pipeline_log("model", "a kept line stopped working and was cycled "
+                              "out of the bank (#752)")
     return chosen
 
 
@@ -16108,6 +16641,269 @@ def bin_line(text: str) -> None:
 
 def is_binned(text: str) -> bool:
     return _bin_key(text) in set(read_binned())
+
+
+# --- The unique-dialogue engine (#752) --------------------------------------
+#
+# "I'm hearing a lot of people call in and say the same thing over and over."
+# They were, and here is why: the only anti-repeat gate at air time lived in
+# dj_speak, and dj_speak is not the road most of the show takes. With
+# stream_show and call_stream on — both default — banter, deep rounds and
+# calls all go down the COALESCED branch of speak_turns, which renders a
+# whole round into one clip and never calls dj_speak at all. The check ran on
+# the minority of lines and the majority sailed past it.
+#
+# This is that gate, moved to the one place every conversational path
+# genuinely funnels through, plus the memory it needs to be more than a
+# ten-line goldfish: a print ledger on disk with timestamps, so "never twice"
+# can mean never, and so a line that WORKED can come back on a real rotation
+# instead of at random.
+LINE_PRINTS_PATH = Path("/app/data/line_prints.json")
+_PRINTS_LOCK = RLock()
+PRINTS_MAX = 1400
+# How long a KEPT line waits before it may air again: an hour the first time,
+# three the second, five thereafter — the rotation #752 asks for.
+TIER_GATES = (3600.0, 10800.0, 18000.0)
+# Past this share of recent candidates blocked, the gate stands down. An
+# anti-repeat engine that can silence the station is worse than repetition.
+BLOCK_RATE_CAP = 0.35
+_BLOCK_RECENT: list[int] = []
+
+
+def _shingles(text: str) -> set[str]:
+    """The 4-word runs of a line. Two lines sharing most of their runs are
+    the same line wearing different punctuation."""
+    words = _bin_key(text).split()
+    if len(words) < 4:
+        return {" ".join(words)} if words else set()
+    return {" ".join(words[i:i + 4]) for i in range(len(words) - 3)}
+
+
+def line_prints() -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(LINE_PRINTS_PATH.read_text())
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:
+        return []
+
+
+def _prints_write(rows: list[dict[str, Any]]) -> None:
+    try:
+        LINE_PRINTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = LINE_PRINTS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows[-PRINTS_MAX:]))
+        tmp.replace(LINE_PRINTS_PATH)
+    except OSError:
+        pass
+
+
+def print_remember(text: str, who: str = "", kind: str = "") -> None:
+    """Write down that this line went out. Upserted on the key, so the
+    turn-by-turn path and the coalesced path cannot double-count it."""
+    key = _bin_key(text)
+    if len(key) < 12:
+        return                        # "yeah", "okay" — a noise, not a line
+    with _PRINTS_LOCK:
+        rows = line_prints()
+        now = int(time.time())
+        for row in rows:
+            if row.get("key") == key:
+                row["said"] = int(row.get("said") or 0) + 1
+                row["last"] = now
+                _prints_write(rows)
+                return
+        rows.append({"key": key, "who": who, "kind": kind,
+                     "first": now, "last": now, "said": 1, "blocked": 0,
+                     "shingles": sorted(_shingles(text))[:60]})
+        _prints_write(rows)
+
+
+def print_penalise(key: str) -> None:
+    """The PENALTY #752 asks for: a line that keeps trying to come back
+    carries a count, and the bank retires whatever keeps colliding."""
+    if not key:
+        return
+    with _PRINTS_LOCK:
+        rows = line_prints()
+        for row in rows:
+            if row.get("key") == key:
+                row["blocked"] = int(row.get("blocked") or 0) + 1
+                _prints_write(rows)
+                return
+
+
+def _block_rate() -> float:
+    if len(_BLOCK_RECENT) < 12:
+        return 0.0
+    return sum(_BLOCK_RECENT) / float(len(_BLOCK_RECENT))
+
+
+def rerun_note(blocked: bool) -> None:
+    _BLOCK_RECENT.append(1 if blocked else 0)
+    del _BLOCK_RECENT[:-40]
+
+
+def rerun_check(text: str, who: str = "", kind: str = "",
+                allow_repeat: bool = False) -> dict[str, Any]:
+    """Has this been said before? Two legs, cheapest first.
+
+    An exact key, then a Jaccard overlap of 4-word runs — which catches the
+    same thought re-punctuated, the thing the old substring test missed in
+    both directions. Deliberately NOT applied to a station ID, an ad read, a
+    direct reply, or a deliberate replay off the bank: those are supposed to
+    repeat, and blocking them is how an anti-repeat engine takes a station
+    off the air.
+
+    Bounded by a rolling block rate: if the gate is eating more than a third
+    of recent candidates it stands down until the rate falls. Repetition is
+    a bad show; silence is no show."""
+    verdict = {"block": False, "why": "", "key": _bin_key(text)}
+    if allow_repeat or kind in ("station_id", "ad", "reply"):
+        return verdict
+    key = verdict["key"]
+    if len(key) < 24:
+        return verdict                # too short to be a repeat worth blocking
+    if _block_rate() > BLOCK_RATE_CAP:
+        return verdict                # the breaker is open
+    rows = line_prints()
+    for row in rows:
+        if row.get("key") == key:
+            verdict.update({"block": True,
+                            "why": "said before, word for word"})
+            return verdict
+    mine = _shingles(text)
+    if len(mine) >= 3:
+        for row in rows:
+            theirs = set(row.get("shingles") or [])
+            if not theirs:
+                continue
+            overlap = len(mine & theirs)
+            if not overlap:
+                continue
+            union = len(mine | theirs)
+            if union and overlap / union >= 0.62:
+                verdict.update({"block": True,
+                                "why": "near-identical to a line already said",
+                                "hit": str(row.get("key") or "")})
+                return verdict
+    return verdict
+
+
+# --- The approach wheel (#752) ---------------------------------------------
+#
+# "a roulette wheel of varied types of approaches to dialogue that interacts
+# with their system prompt". The station already had roulettes — the angle
+# stock, the suspense formats, the host tempers — but every one of them
+# governs WHAT is talked about. This one governs HOW it is treated, which is
+# what makes the same subject come out differently twice and makes the other
+# speakers react to it differently.
+APPROACHES_PATH = Path("/app/data/approaches.json")
+_APPROACH_LOCK = RLock()
+DIALOGUE_APPROACHES = (
+    "INTERROGATE it — every claim gets a question, nothing is allowed to "
+    "stand unexamined.",
+    "REFUSE THE PREMISE — one of you does not accept the thing everybody is "
+    "assuming, and says so.",
+    "AGREE FAR TOO HARD — enthusiasm past the point of comfort, until "
+    "agreeing becomes its own kind of argument.",
+    "RETELL IT AS GOSSIP — lowered voices, as though the subject might be "
+    "listening.",
+    "TAKE IT COMPLETELY LITERALLY — no metaphor survives contact with you.",
+    "DEFEND THE INDEFENSIBLE — somebody argues the side nobody should, and "
+    "argues it well.",
+    "TREAT IT AS EVIDENCE of something much larger that you are only now "
+    "piecing together.",
+    "GET BORED OF IT MID-SENTENCE and go somewhere else entirely, then come "
+    "back to it later as though nothing had happened.",
+    "MAKE IT PERSONAL — it stops being a subject and becomes something one "
+    "of you has clearly lived through.",
+    "ESCALATE THE STAKES with every exchange until it is absurd, and never "
+    "acknowledge that it got absurd.",
+    "TALK ABOUT IT AS IF IT WERE A CRIME SCENE — evidence, timeline, motive.",
+    "SELL IT — whatever it is, one of you is now trying to sell it to the "
+    "other one.",
+    "REMEMBER IT WRONG — you both remember it, differently, and neither will "
+    "give way on the detail.",
+    "EXPLAIN IT TO A CHILD, badly, and get corrected by the other one.",
+    "TREAT IT AS BENEATH YOU and be unable to stop talking about it.",
+    "FIND IT UNBEARABLY MOVING for reasons neither of you can articulate.",
+)
+
+
+def _approach_seed() -> list[dict[str, Any]]:
+    return [{"id": uuid.uuid4().hex[:8], "text": t, "weight": 1.0,
+             "enabled": True, "uses": 0, "last": 0,
+             "added": int(time.time())}
+            for t in DIALOGUE_APPROACHES]
+
+
+def _approach_write(rows: list[dict[str, Any]]) -> None:
+    try:
+        APPROACHES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = APPROACHES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, indent=1) + chr(10))
+        tmp.replace(APPROACHES_PATH)
+    except OSError:
+        pass
+
+
+def approach_rules() -> list[dict[str, Any]]:
+    with _APPROACH_LOCK:
+        try:
+            rows = json.loads(APPROACHES_PATH.read_text())
+        except Exception:
+            rows = None
+        if not isinstance(rows, list) or not rows:
+            rows = _approach_seed()
+            _approach_write(rows)
+        return [r for r in rows if isinstance(r, dict)]
+
+
+def approach_pick() -> dict[str, Any]:
+    """One approach, drawn by weight, off its own cooldown ladder.
+
+    The same three gates the kept lines use — an approach that just ran is
+    off the wheel for an hour, a well-worn one for up to five — so the FRAME
+    rotates as well as the material does. Falls back through ungated to the
+    built-in tuple, because the wheel must never come back empty."""
+    rows = [r for r in approach_rules() if r.get("enabled", True)
+            and float(r.get("weight") or 0) > 0]
+    if not rows:
+        return {"id": "", "text": random.choice(DIALOGUE_APPROACHES)}
+    now = time.time()
+    last = str(_RADIO.get("last_approach") or "")
+
+    def gate(row: dict[str, Any]) -> float:
+        return TIER_GATES[min(int(row.get("uses") or 0), 2)]
+
+    pool = [r for r in rows if r.get("id") != last
+            and now - float(r.get("last") or 0) > gate(r)]
+    pool = pool or [r for r in rows if r.get("id") != last] or rows
+    pick = random.choices(pool,
+                          weights=[float(r.get("weight") or 1) for r in pool],
+                          k=1)[0]
+    _RADIO["last_approach"] = pick.get("id") or ""
+    with _APPROACH_LOCK:
+        stored = approach_rules()
+        for row in stored:
+            if row.get("id") == pick.get("id"):
+                row["uses"] = int(row.get("uses") or 0) + 1
+                row["last"] = int(time.time())
+        _approach_write(stored)
+    return pick
+
+
+def approach_clause(rule: dict[str, Any]) -> str:
+    """The drawn approach as a directive. It is the FRAME, never the subject
+    — a round that announces its own frame is a round about itself."""
+    text = str((rule or {}).get("text") or "").strip()
+    if not text:
+        return ""
+    return ("\n\nHOW YOU TREAT IT THIS ROUND: " + text
+            + " That is the FRAME and never the subject — do not name it, do "
+              "not describe what you are doing, just do it. The other one "
+              "reacts to the frame as much as to the words, so the same "
+              "material lands somewhere new every time.")
 
 
 def banter_due(dj: dict[str, Any], played: int) -> bool:
@@ -17179,6 +17975,44 @@ TRACK_FEELINGS = (
 
 # #720: not every call arrives the same way round. The shape decides WHEN the
 # heat lands — immediately, after a running start, or not as the point at all.
+# --- When a call turns (#750) ----------------------------------------------
+#
+# The pair reach for rapport and the caller takes it as condescension. What
+# follows is an ARC, not a mood: offence, an outburst that leaves the
+# character behind, the co-host stepping in to calm it, the co-host being
+# rounded on by BOTH of them, and then — because this is a radio station and
+# not a tribunal — the whole room laughing about it and going straight back
+# to arguing. These tuples are the WHAT-SET-IT-OFF and the HOW-IT-TURNS;
+# the beats themselves are written into the angle.
+CALLER_OFFENCES = (
+    "one of the hosts is SYMPATHETIC at them — 'oh, you poor thing' — and "
+    "it lands as pity",
+    "a host finishes their story for them, wrongly, and sounds pleased "
+    "about it",
+    "a host gives them a matey little nickname they did not ask for",
+    "a host tells them to calm down before they were anything like worked "
+    "up",
+    "a host laughs a half-beat too early, as though the sad part were the "
+    "joke",
+    "a host says 'we ALL feel that way' and flattens the thing they were "
+    "actually saying",
+    "a host tries to relate by telling a much better version of their own "
+    "story instead",
+    "a host thanks them for being 'such a good sport' about something they "
+    "were not being a sport about",
+)
+HOSTILE_TURNS = (
+    "they accuse the peacemaker of taking the other one's side the whole "
+    "time",
+    "they turn on the peacemaker for being FAKE — the calm voice is the "
+    "most insulting thing in the room",
+    "they decide the peacemaker is the actual problem and always has been",
+    "they demand to know who the peacemaker thinks they are, exactly",
+    "they tell the peacemaker to stay out of it in language the station "
+    "will have to answer for",
+)
+
+
 CALLER_SHAPES = (
     "OPEN on something rattling around their head from the dialog cloud — "
     "they bring it up first, unprompted, as though continuing a "
@@ -17575,11 +18409,207 @@ def add_caller(name: str, persona: str = "", goal: str = "") -> dict[str, Any]:
         return row
 
 
+def _name_book_seed() -> dict[str, Any]:
+    """The book as it ships. The regulars pool takes whatever the operator
+    has grown in the flat dictionary, so nothing they typed is lost."""
+    return {"pools": {
+        "regulars": {"label": NAME_POOL_LABELS["regulars"], "weight": 1.0,
+                     "enabled": True, "names": list(caller_names())},
+        "famous": {"label": NAME_POOL_LABELS["famous"], "weight": 1.3,
+                   "enabled": True, "names": list(FAMOUS_NAME_SEED)},
+        "us_cities": {"label": NAME_POOL_LABELS["us_cities"], "weight": 1.0,
+                      "enabled": True, "names": list(US_CITY_NAME_SEED)},
+        "world_cities": {"label": NAME_POOL_LABELS["world_cities"],
+                         "weight": 1.0, "enabled": True,
+                         "names": list(WORLD_CITY_NAME_SEED)},
+    }}
+
+
+def _name_book_write(data: dict[str, Any]) -> None:
+    try:
+        CALLER_NAME_BOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CALLER_NAME_BOOK_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=1) + chr(10))
+        tmp.replace(CALLER_NAME_BOOK_PATH)
+    except OSError:
+        pass
+
+
+def name_book() -> dict[str, Any]:
+    """Seeded on first read, the way the hang-up shelf is."""
+    with _NAME_BOOK_LOCK:
+        try:
+            data = json.loads(CALLER_NAME_BOOK_PATH.read_text())
+        except Exception:
+            data = None
+        if not isinstance(data, dict) or not isinstance(data.get("pools"),
+                                                        dict):
+            data = _name_book_seed()
+            _name_book_write(data)
+        return data
+
+
+def name_draw() -> tuple[str, str]:
+    """One name, and which pool it came from (#751).
+
+    Three guards the old random.choice had none of: a name already used THIS
+    SESSION never comes back; a name belonging to a regular on the roster is
+    never handed to a stranger (that would give them somebody else's face,
+    voice and history); and the pool itself is drawn by weight, so the mix
+    of dead film stars and cities is steerable. When the book runs dry the
+    session memory is cleared rather than the draw failing — an exhausted
+    book must never be able to stop the phone ringing."""
+    book = name_book()
+    pools = [(pid, p) for pid, p in (book.get("pools") or {}).items()
+             if isinstance(p, dict) and p.get("enabled", True)
+             and float(p.get("weight") or 0) > 0 and p.get("names")]
+    if not pools:
+        return random.choice(caller_names()), ""
+    taken = {str(n).lower() for n in (_RADIO.get("names_used") or [])}
+    taken |= {str(r.get("name") or "").lower() for r in read_callers()}
+    live = list(pools)
+    for _ in range(3):
+        if not live:
+            break
+        weights = [float(p.get("weight") or 1) for _, p in live]
+        pid, pool = random.choices(live, weights=weights, k=1)[0]
+        free = [n for n in pool["names"] if str(n).lower() not in taken]
+        if free:
+            return unrepeated(free, f"caller-name-{pid}",
+                              keep=min(24, max(0, len(free) - 1))), pid
+        live = [(q, p) for q, p in live if q != pid]
+    # Everything is spent: forget the night rather than refuse to ring.
+    _RADIO["names_used"] = []
+    pid, pool = pools[0]
+    return random.choice(pool["names"]), pid
+
+
+def name_used(name: str) -> None:
+    """Remember a name the moment it is actually SPOKEN — which is not the
+    moment it is drawn, because a seeded stranger can have their name
+    replaced by a character mined out of a document."""
+    if not name:
+        return
+    used = _RADIO.setdefault("names_used", [])
+    used.append(str(name).lower())
+    del used[:-800]
+
+
 def conjure_caller() -> dict[str, Any]:
-    """A one-off from the dictionary: a name, and whatever the dice say they
-    are like tonight. Not saved — strangers stay strangers."""
-    return {"id": "", "name": random.choice(caller_names()),
+    """A one-off out of the book: a name, and whatever the dice say they are
+    like tonight. Not saved — strangers stay strangers."""
+    name, pool = name_draw()
+    return {"id": "", "name": name, "name_pool": pool,
             "persona": "", "goal": "", "calls": 0}
+
+
+# --- The name book (#751) --------------------------------------------------
+#
+# A stranger's name used to be `random.choice` over a flat list of 25, with
+# no guard of any kind: the same person could ring twice in ten minutes, and
+# a conjured stranger could steal a regular's name and with it their face,
+# their voice and their history. This is a book of POOLS instead — and the
+# pool a name came from is remembered, because "wow, that is a great name"
+# lands differently for a dead film star than for a city in Ohio.
+CALLER_NAME_BOOK_PATH = Path("/app/data/caller_name_book.json")
+_NAME_BOOK_LOCK = RLock()
+
+# People the culture still half-remembers — the "someone who once was
+# great" remark writes itself.
+FAMOUS_NAME_SEED = (
+        "Marlon", "Ava", "Rita", "Duke", "Bogart", "Garbo", "Dietrich",
+        "Cagney", "Bacall", "Sinatra", "Nat", "Ella", "Sarah Vaughan",
+        "Lena", "Hedy", "Orson", "Buster", "Chaplin", "Harold Lloyd",
+        "Fatty", "Mabel", "Clara Bow", "Valentino", "Barrymore", "Gish",
+        "Fairbanks", "Pickford", "Errol", "Basil", "Vivien", "Olivier",
+        "Gielgud", "Redgrave", "Peter Lorre", "Karloff", "Lugosi",
+        "Chaney", "Veronica Lake", "Gene Tierney", "Ida Lupino",
+        "Barbara Stanwyck", "Joan Blondell", "Myrna", "William Powell",
+        "Cary", "Rosalind", "Claudette", "Carole Lombard", "Jean Harlow",
+        "Mae West", "Fields", "Groucho", "Harpo", "Chico", "Zeppo",
+        "Durante", "Jolson", "Cantor", "Sophie Tucker", "Bert Williams",
+        "Bessie", "Ma Rainey", "Jelly Roll", "Satchmo", "Bix", "Django",
+        "Fats", "Count", "Cab", "Lester", "Prez", "Bird", "Dizzy", "Monk",
+        "Mingus", "Coltrane", "Miles", "Nina", "Dinah", "Etta",
+        "Ruth Brown", "Big Mama", "Screamin' Jay", "Howlin' Wolf", "Muddy",
+        "Sonny Boy", "Leadbelly", "Blind Lemon", "Robert Johnson",
+        "Sister Rosetta", "Mahalia", "Sam Cooke", "Jackie Wilson", "Otis",
+        "Wilson Pickett", "Solomon Burke", "Bobby Bland",
+        "Esther Phillips", "Baby Washington", "Tammi", "Florence",
+        "Mary Wells", "Kim Weston", "Brenda Holloway", "Barbara Lewis",
+        "Betty Everett", "Fontella", "Barbara Acklin", "Jackie Moore",
+        "Ann Peebles", "Denise LaSalle", "Millie Jackson", "Candi",
+        "Bettye", "Doris Duke", "Loleatta", "Linda Jones", "Judy Clay",
+        "Maxine Brown", "Dee Dee Warwick", "Chuck Jackson", "Garnet Mimms",
+        "Arthur Conley", "Eddie Floyd", "William Bell", "Johnnie Taylor",
+)
+
+# American cities that already work as a first name.
+US_CITY_NAME_SEED = (
+        "Austin", "Dallas", "Houston", "Memphis", "Nashville", "Denver",
+        "Phoenix", "Reno", "Tulsa", "Wichita", "Cheyenne", "Laramie",
+        "Boise", "Eugene", "Salem", "Tacoma", "Everett", "Aurora",
+        "Savannah", "Charleston", "Augusta", "Macon", "Selma", "Mobile",
+        "Biloxi", "Natchez", "Vicksburg", "Shreveport", "Monroe",
+        "Abilene", "Amarillo", "Odessa", "Laredo", "Waco", "Tyler",
+        "Denton", "Bryan", "Killeen", "Temple", "Marshall", "Paris",
+        "Cleveland", "Toledo", "Akron", "Dayton", "Canton", "Lima",
+        "Elyria", "Sandusky", "Marion", "Ashland", "Newark", "Camden",
+        "Trenton", "Passaic", "Bayonne", "Hoboken", "Brooklyn", "Queens",
+        "Bronx", "Harlem", "Utica", "Troy", "Ithaca", "Elmira", "Corning",
+        "Olean", "Jamestown", "Dunkirk", "Batavia", "Auburn", "Geneva",
+        "Oswego", "Watertown", "Plattsburgh", "Kingston", "Poughkeepsie",
+        "Yonkers", "Peekskill", "Ossining", "Nyack", "Lexington",
+        "Louisville", "Owensboro", "Paducah", "Bowling Green", "Frankfort",
+        "Covington", "Ashville", "Raleigh", "Durham", "Greensboro",
+        "Winston", "Asheville", "Wilmington", "Fayetteville", "Concord",
+        "Salisbury", "Statesville", "Hickory", "Gastonia", "Sumter",
+        "Florence", "Anderson", "Greenville", "Spartanburg", "Rock Hill",
+        "Aiken", "Beaufort", "Georgetown", "Orangeburg", "Dalton", "Rome",
+        "Athens", "Valdosta", "Albany", "Columbus", "Warner Robins",
+        "Milledgeville", "Griffin", "Carrollton", "Douglas", "Waycross",
+        "Brunswick", "Vidalia", "Statesboro",
+)
+
+# …and everywhere else, which carries the same trick.
+WORLD_CITY_NAME_SEED = (
+        "Vienna", "Verona", "Siena", "Milan", "Torino", "Genova",
+        "Ravenna", "Modena", "Parma", "Trento", "Como", "Cairo",
+        "Alexandria", "Tangier", "Casablanca", "Marrakesh", "Fez", "Tunis",
+        "Tripoli", "Khartoum", "Nairobi", "Kampala", "Lagos", "Accra",
+        "Dakar", "Bamako", "Kano", "Ibadan", "Luanda", "Maputo", "Harare",
+        "Lusaka", "Windhoek", "Pretoria", "Durban", "Lisbon", "Porto",
+        "Braga", "Coimbra", "Sintra", "Sevilla", "Granada", "Cordoba",
+        "Valencia", "Malaga", "Toledo", "Segovia", "Bilbao", "Girona",
+        "Lyon", "Nantes", "Rennes", "Dijon", "Reims", "Nancy", "Amiens",
+        "Nimes", "Avignon", "Cannes", "Antibes", "Menton", "Bruges",
+        "Ghent", "Leuven", "Namur", "Utrecht", "Leiden", "Haarlem",
+        "Arnhem", "Breda", "Zurich", "Geneva", "Lucerne", "Basel",
+        "Lugano", "Bern", "Salzburg", "Graz", "Linz", "Innsbruck",
+        "Prague", "Brno", "Krakow", "Gdansk", "Lodz", "Poznan", "Sofia",
+        "Varna", "Plovdiv", "Bucharest", "Cluj", "Sibiu", "Belgrade",
+        "Zagreb", "Split", "Sarajevo", "Skopje", "Tirana", "Athens",
+        "Corinth", "Delphi", "Rhodes", "Patras", "Larissa", "Izmir",
+        "Bursa", "Konya", "Adana", "Antalya", "Beirut", "Amman", "Petra",
+        "Aleppo", "Basra", "Shiraz", "Isfahan", "Tabriz", "Samarkand",
+        "Bukhara", "Almaty", "Osaka", "Kyoto", "Nagoya", "Sapporo",
+        "Sendai", "Nagasaki", "Kobe", "Seoul", "Busan", "Macau", "Kolkata",
+        "Chennai", "Mysore", "Pune", "Jaipur", "Lahore", "Karachi",
+        "Dhaka", "Colombo", "Hanoi", "Saigon", "Bangkok", "Manila",
+        "Jakarta", "Bandung", "Perth", "Adelaide", "Hobart", "Cairns",
+        "Darwin", "Geelong", "Ballarat", "Dunedin", "Rotorua", "Havana",
+        "Trinidad", "Merida", "Oaxaca", "Puebla", "Durango", "Sonora",
+        "Chihuahua", "Bogota", "Medellin", "Cali", "Quito", "Cusco",
+        "Arequipa", "Valparaiso", "Mendoza", "Rosario", "Salta",
+        "Montevideo", "Asuncion", "Recife", "Bahia", "Belem",
+)
+
+NAME_POOL_LABELS = {
+    "regulars": "the switchboard regulars",
+    "famous": "somebody who once was great",
+    "us_cities": "an American city",
+    "world_cities": "a city from somewhere else",
+}
 
 
 CALLER_VOICES_PATH = Path("/app/data/caller_voices.json")
@@ -18099,7 +19129,13 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         # speaking its rhetoric (#260).
         character = speakbox_character(seed.get("file", ""))
         if character:
-            caller = {**caller, "name": character}
+            # #751: the name changed, so the pool it came from no longer
+            # describes it — a character mined out of a transcript must not
+            # be complimented as "a great American city".
+            caller = {**caller, "name": character, "name_pool": ""}
+    # #751: remember the name that will actually be SPOKEN, here rather than
+    # at the draw, so the guard covers the override above.
+    name_used(str(caller.get("name") or ""))
     state = unrepeated(list(CALLER_STATES), "caller-state")
     # #691: how this call ENDS, drawn off the editable shelf by weight
     # rather than out of a frozen tuple. The rule travels with the call so
@@ -18130,8 +19166,11 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         # (#298) — flustered, exhausted, nervous — so every caller arrives
         # in SOME weather, audible in their pace and stumbles, not just in
         # the writing.
+        # #750: drawn from CALLER_WEATHER, not from MACRO_STATES wholesale —
+        # adding a macro must not silently enlarge this pool, and "furious"
+        # is somewhere an argument gets to, not a mood you ring in with.
         _RADIO.setdefault("speaker_macro", {})["caller"] = (
-            random.choice(list(MACRO_STATES))
+            random.choice(list(CALLER_WEATHER))
             if random.random() < 0.5 else "")
     extras = []
     # #584: steer THIS call off a FRESH swath drawn by meaning from the vector
@@ -18282,7 +19321,8 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         # sentences and swerve.
         extras.append(
             "SHAPE OF THIS CALL — "
-            f"{random.choice(CALLER_SHAPES)} Whichever way round it goes, it "
+            f"{unrepeated(list(CALLER_SHAPES), 'caller-shape')} "
+            "Whichever way round it goes, it "
             "must feel like how this particular person would actually have "
             "started talking, never like a segment being announced.")
         # #709: and the grievance is specific. Two or three drawn and BLENDED
@@ -18435,6 +19475,86 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
                 "agree or argue — a real beat of the call spent on the "
                 "caller's point before anything else moves.")
 
+    # #751: the name is a THING. A caller called Verona or Buster or
+    # Chihuahua walks into a booth run by two people who talk for a living,
+    # and the name going unremarked is a missed beat every single time.
+    _pool = str(caller.get("name_pool") or "")
+    if random.random() < float(dj.get("name_remark_rate", 0.3) or 0):
+        _admire = {
+            "famous": (
+                "One of them stops on the name: that is the name of "
+                "somebody who ONCE WAS GREAT. They cannot place them, it "
+                "nags at them, and they keep almost getting it back through "
+                "the rest of the call."),
+            "us_cities": (
+                "One of them realises the caller is named after a whole "
+                "AMERICAN CITY and makes far too much of it — is that where "
+                "they are from, were they born there, do they have to live "
+                "up to it."),
+            "world_cities": (
+                "One of them is delighted the caller is named after a city "
+                "on the other side of the world, pronounces it about three "
+                "different ways, and asks whether they have ever been."),
+        }.get(_pool, "")
+        extras.append(
+            "EARLY ON, one of the hosts is genuinely STRUCK BY THE NAME — "
+            f"'{caller['name']}. Now that is a GREAT name' — and says "
+            "exactly what they like about it: the sound of it, what it "
+            "reminds them of, what kind of person it belongs to. The other "
+            "one either agrees far too readily or thinks it is ridiculous, "
+            f"and {caller['name']} reacts in character: proud, "
+            "embarrassed, sick of hearing it, or hearing it for the first "
+            "time. "
+            + _admire
+            + " One quick beat, warm and specific, then the call carries "
+            "on — never a whole segment about a name.")
+
+    # #750: the call TURNS. Suppressed when there is already a second
+    # person on the line — two structures at once is noise, not drama.
+    hostile = (random.random() < float(dj.get("hostile_rate", 0.14) or 0)
+               and not duo_name)
+    defuse: dict[str, Any] = {}
+    if hostile:
+        offence = unrepeated(list(CALLER_OFFENCES), "hostile-offence")
+        turned = unrepeated(list(HOSTILE_TURNS), "hostile-turn")
+        try:
+            defuse = await speakbox_quote(most=4, cap=320) or {}
+        except Exception:
+            defuse = {}
+        extras.append(
+            "THIS CALL GOES WRONG, and it goes wrong in this order. "
+            f"(1) The pair are trying to build rapport with "
+            f"{caller['name']} — and {offence}. "
+            f"(2) {caller['name']} TAKES OFFENCE and says so, sharply. "
+            "The host doubles down instead of backing off, because they "
+            "genuinely think they were being nice. "
+            f"(3) It escalates until {caller['name']} LOSES THE THREAD "
+            "ENTIRELY — they stop being a caller with a topic and become a "
+            "furious person on a phone, talking over the answer, swearing, "
+            "going personal, saying the thing you cannot take back. Let it "
+            "be genuinely uncomfortable. "
+            "(4) THE OTHER HOST STEPS IN to calm it down — 'hey. hey. hey. "
+            "let's all calm down, this is getting out of hand' — and tries "
+            "to break the tension by dropping something completely off the "
+            "wall into the middle of it"
+            + (f", word for word, as though it explained anything: "
+               f"\"{str(defuse['text'])[:320]}\"" if defuse.get("text")
+               else ", some strange unrelated speech, as though it "
+                    "explained anything")
+            + ". IT DOES NOT WORK. "
+            "(5) BOTH of them — the caller AND the host who started it — "
+            "round on the PEACEMAKER instead: "
+            f"{turned}. For a moment the two people who were at each "
+            "other's throats are a united front against the one who tried "
+            "to help. "
+            "(6) And then it BREAKS — somebody laughs, and it goes round "
+            "the room, and they are all somehow friends, genuinely, having "
+            "meant every word of it. They say so out loud. "
+            "(7) Then they go straight back to arguing about the original "
+            "thing, cheerfully, as though none of it happened. "
+            "Play all seven beats. Nobody narrates the arc or names what is "
+            "happening; they are IN it.")
+
     voices = await session_voices()
     try:
         catalogue = set(await voice_allowlist())
@@ -18532,8 +19652,14 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         f"reaction to the ring, and they NAME THE LINE: {line_say}. "
         "THEN one of you answers the request line "
         f"— 'you're on {dj_settings()['station_name']}, who have we "
-        f"got?' — and {caller['name']}'s FIRST line is introducing "
-        "themselves by name, in their own words, before anything else. "
+        f"got?' — and {caller['name']}'s VERY FIRST line is an "
+        "INTRODUCTION and nothing else (#753): they SAY THEIR OWN NAME "
+        f"out loud — the word \"{caller['name']}\" has to be in that "
+        "line — and say a word about who they are or where they are "
+        "ringing from, in their own voice, before they get to what they "
+        "called about. Never let them open on their topic; a caller who "
+        "has not said their name yet has not been introduced. "
+        "One of the hosts then greets them BY NAME. "
         "Then take the call properly: ask what is going on, dig for "
         "more — the pair drive the call, inquiring, riffing, making jokes "
         f"without losing the person. {caller['name']} has REAL RESOLVE "
@@ -18545,6 +19671,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         f"{outcome}. Then back to the music. "
         f"Format the caller's lines as 'C: ...' — C is {caller['name']}, "
         "who speaks in full sentences and gives as good as they get."
+        + approach_clause(approach_pick())                     # #752
     )
     call_started = time.time()
     _RADIO["chat"].append({
@@ -18563,11 +19690,17 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     for _k, _fk in (("reverb", "room"), ("delay", "delay"), ("echo", "echo")):
         if mangle.get(_k) is not None:      # #617 the sculpted rack, on air
             caller_fx[_fk] = mangle[_k]
-    lines = await dj_banter(_RADIO.get("now"), angle=angle, lines=9,
+    # #750: a seven-beat arc needs room. Nine turns is a call; a call that
+    # goes wrong, gets talked down, turns on the peacemaker and ends in
+    # laughter is a longer thing, and cramming it into nine is how you get
+    # an arc that is announced rather than played.
+    lines = await dj_banter(_RADIO.get("now"), angle=angle,
+                            lines=14 if hostile else 9,
                             caller_name=caller["name"], caller_voice=third,
                             caller_fx=caller_fx,
                             caller2_name=duo_name, caller2_voice=duo_voice,
-                            render_stream=bool(dj.get("call_stream", True)))
+                            render_stream=bool(dj.get("call_stream", True)),
+                            feel=hostile)                          # #750
     if caller.get("id"):
         with _CALLERS_LOCK:
             for row in rows:
@@ -18601,7 +19734,9 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # the reason is clickable straight into the shelf it came from.
     ran = max(0.0, time.time() - call_started)
     call_ended(caller["name"], line_say, call_started, hangup_rule,
-               len(lines or []), state)
+               len(lines or []), state + (" · it turned" if hostile else ""))
+    if lines and defuse:
+        speakbox_remember(defuse)       # #750: the peacemaker's swath rotates
 
     return {"caller": caller["name"], "lines": lines, "state": state,
             "voice": mangle, "hangup": str(outcome),
@@ -19371,6 +20506,43 @@ def sentence_chunks(text: str, cap: int = 300, most: int = 10) -> list[str]:
     return chunks[:most]
 
 
+# #753: a caller who never says their name has not introduced themselves.
+CALLER_HELLOS = (
+    "Hi, this is {name}.",
+    "Yeah, hi — {name} here.",
+    "Hello? Hi. It is {name}.",
+    "Hey. {name}. Long-time listener.",
+    "Hi there — my name is {name}.",
+    "Yeah, {name} calling in.",
+    "Hi, {name} here, first time calling.",
+    "Hello — this is {name}, thanks for taking me.",
+)
+
+
+def _caller_introduces(turns: list[tuple[str, str]],
+                       caller_name: str) -> list[tuple[str, str]]:
+    """Guarantee the caller says their own name in their first breath.
+
+    The angle asks for it and the writer usually obliges, but "usually" is
+    the difference between a station where people introduce themselves and
+    one where they sometimes do. This checks the caller's FIRST turn for
+    their name and, when it is missing, puts a plain hello in front of it
+    as a turn of its own — same marker, same voice, same phone rack."""
+    if not caller_name or not turns:
+        return turns
+    first = str(caller_name).split()[0].lower()
+    for at, (marker, said) in enumerate(turns):
+        if marker != "C":
+            continue
+        words = re.sub(r"[^a-z0-9 ]+", " ", str(said).lower())
+        if first and first in words.split():
+            return turns                       # they already did
+        hello = unrepeated(list(CALLER_HELLOS), "caller-hello").format(
+            name=caller_name)
+        return list(turns[:at]) + [("C", hello)] + list(turns[at:])
+    return turns
+
+
 async def speak_turns(turns: list[tuple[str, str]],
                       track: dict[str, Any] | None, limit: int,
                       vouched: list[str] | None = None,
@@ -19381,7 +20553,9 @@ async def speak_turns(turns: list[tuple[str, str]],
                       source_text: str = "",
                       caller2_name: str = "",
                       caller2_voice: str = "",
-                      render_stream: bool = False) -> list[str]:
+                      render_stream: bool = False,
+                      feel: bool = False,
+                      allow_repeat: bool = False) -> list[str]:
     """Put an exchange on air, turn by turn, in the two session voices.
 
     Shared by the written exchange and the generated one, so an approved bit
@@ -19408,6 +20582,12 @@ async def speak_turns(turns: list[tuple[str, str]],
     # hides that inside the previous announce instead of leaving dead air
     # between turns. The guards run here, same order, same stop-at-first-
     # failure — a turn that lies about a record still ends the round (#247).
+    # #753: "make sure that when people call in, they say their names and
+    # introduce themselves." The prompt asks for it, and the model mostly
+    # complies — mostly is not a feature. If the caller's first turn does
+    # not contain their own name, one is put in front of it, in their
+    # voice, so the introduction is a guarantee rather than a hope.
+    turns = _caller_introduces(turns, caller_name)
     playlist: list[dict[str, Any]] = []
     for marker, said in turns:
         who = ("caller" if marker == "C"
@@ -19423,6 +20603,18 @@ async def speak_turns(turns: list[tuple[str, str]],
         if is_binned(text):
             note_drop(who, text, "you buried this line")
             continue                    # skip THIS line, not the whole round
+        # #752: THE anti-repeat gate, here rather than in dj_speak — this is
+        # the one place banter, deep rounds, calls and bank replays all pass
+        # through, and the coalesced stream (the default) never reaches
+        # dj_speak at all. Skip THIS line, never break the round: a repeat is
+        # one turn to drop, not a reason to take the station off the air.
+        _rerun = rerun_check(text, who, kind="call" if caller_name else "",
+                             allow_repeat=allow_repeat)
+        rerun_note(bool(_rerun["block"]))
+        if _rerun["block"]:
+            note_drop(who, text, "dropped — " + _rerun["why"] + " (#752)")
+            print_penalise(_rerun.get("hit") or _rerun["key"])
+            continue
         if not minutes_only(text, (track or {}).get("seconds")):
             note_drop(who, text, "made up a running time")
             continue                    # one bad turn shouldn't drop the rest (#520)
@@ -19431,6 +20623,18 @@ async def speak_turns(turns: list[tuple[str, str]],
         # used to live here mangled exactly the turns that complied.
         # Disfluencies land HERE, where the text becomes final — so the
         # pre-rendered clip, the spoken line and the transcript all agree.
+        # #750: let the LINE move the room before the line is rendered, so
+        # an argument that escalates on the page escalates in the voices too.
+        if feel:
+            event, macro = escalation_feel(text)
+            if event:
+                state_bump(who, event)
+            if macro is not None:
+                _RADIO.setdefault("speaker_macro", {})[who] = macro
+                # Mark it auto so dj_banter's cool-off can clear it — a
+                # hand-set macro is never cleared, and a co-host left
+                # nervous for the rest of the night is a real bug.
+                _RADIO.setdefault("macro_auto", {})[who] = True
         vec = performance_vector(
             who, (caller_voice if who == "caller"
                   else caller2_voice if who == "caller2"
@@ -19586,7 +20790,11 @@ async def speak_turns(turns: list[tuple[str, str]],
             if clip and clip.get("path"):
                 key = clip["path"].rsplit("/", 1)[-1]
                 seg.append(str(VOICE_MEDIA_DIR / key))
-                transcript.append((item["who"], item["chunk"]))
+                # #748: how long THIS turn runs, so the booth can follow the
+                # coalesced clip turn by turn instead of knowing only that
+                # "a round" is playing.
+                transcript.append((item["who"], item["chunk"],
+                                   _clip_seconds(clip["path"])))
                 _plan_turns[idx]["rendered"] = True    # checkpoint hit (#556)
         if caller_name:
             hang = await asyncio.to_thread(make_hangup)
@@ -19618,16 +20826,51 @@ async def speak_turns(turns: list[tuple[str, str]],
                            if caller_name else "🎙 the booth — a full round")
             # The transcript still shows every turn in the booth/Mind, even
             # though the audio is one clip.
-            for who, chunk in transcript:
+            # #748: THE fix for "the booth is not synced with the active
+            # broadcast". Every conversational path — banter, deep rounds,
+            # calls — funnels through here when stream_show/call_stream are
+            # on, which is the default, and this branch renders the whole
+            # round into ONE clip and appends every row in a single batch
+            # after the audio was built. So the booth had no idea which line
+            # of a two-minute stream was sounding: dj_speak, which is the
+            # only thing that publishes "speaking_now", is never called.
+            # The clip's own timeline is the answer — each turn's measured
+            # length becomes a window, and the panel reads off the clock.
+            rows = []
+            offset = 0.0
+            for who, chunk, secs in transcript:
                 spoken.append(f"{who}: {chunk}")
-                _RADIO["chat"].append({
+                # #752: the coalesced path never went near dj_speak, so
+                # nothing it aired was ever written down — which is why the
+                # overused-phrase and do-not-repeat clauses were reading a
+                # fraction of the show.
+                print_remember(chunk, who, "stream")
+                said_remember(chunk)
+                rid = uuid.uuid4().hex[:6]
+                entry = {
+                    "id": rid,
                     "ts": int(time.time()), "who": who, "kind": "call",
                     "text": chunk, "aired": "stream",
                     "voice": (caller_voice if who == "caller"
                               else caller2_voice if who == "caller2"
                               else voices.get(who, "")) or "",
-                })
+                }
+                _RADIO["chat"].append(entry)
+                rows.append({"id": rid, "who": who, "kind": "call",
+                             "text": chunk,
+                             "name": (caller_name if who == "caller" else ""),
+                             "from": offset, "until": offset + max(0.4, secs)})
+                offset += max(0.4, secs)
             del _RADIO["chat"][:-160]
+            # The turns were measured BEFORE the concat, which loudness-
+            # normalises and can lay texture under the join, so the sum
+            # drifts from the finished clip. Scale to what was actually
+            # produced — the real length is already measured above.
+            if rows and offset > 0.5 and length > 0.5:
+                scale = length / offset
+                for r in rows:
+                    r["from"] *= scale
+                    r["until"] *= scale
             # Deliver the ONE clip on the routing the DJ voice is set to,
             # mirroring to the page when the box is down (#536).
             vto = _RADIO.get("voice_to") or "box"
@@ -19646,9 +20889,15 @@ async def speak_turns(turns: list[tuple[str, str]],
                     "voice": caller_voice or "",
                 })
                 del _RADIO["voice_clips"][:-40]
+            # #748: start the clock at the moment the audio is handed over,
+            # so "which line is sounding" is a lookup rather than a guess.
+            _stream_now_set(rows, length)
             if to_box:
                 played = await _play_on_box(one["path"], one["sig"])
                 if not played:
+                    # It never went out — the booth must not go on confidently
+                    # following a call nobody can hear.
+                    _stream_now_clear()
                     box_hold(one, stream_label,
                              "caller" if caller_name else "dj")
             return spoken
@@ -19679,6 +20928,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             sting=bool(item["turn_end"]))
         if out:
             spoken.append(f"{who}: {out}")
+            print_remember(out, who, "turn")           # #752
         if item["turn_end"]:
             if item.get("big") and out:
                 # The stunned beat (#320): a whole monologue just landed
@@ -19776,7 +21026,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     bank: bool = False,
                     caller2_name: str = "",
                     caller2_voice: str = "",
-                    render_stream: bool = False) -> list[str]:
+                    render_stream: bool = False,
+                    feel: bool = False) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
     `angle` overrides the usual random pick — that is how one particular
@@ -19811,6 +21062,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
                      f"you notes the changing of the guard — {_intro} — welcomes "
                      "them in BY NAME, and the show carries straight on. Do not "
                      "dwell on it or bring it up again.")
+    # #752: the roulette of APPROACHES, drawn once per round. It frames
+    # how the pair treat whatever they end up talking about, and it
+    # steers which swath the speakbox hands over — so the same subject
+    # genuinely arrives somewhere different, and the other speaker
+    # reacts differently to it, which is the whole of the request.
+    _approach = approach_pick()
     if lines <= 0:
         lines = random.randint(dj["banter_min_lines"], dj["banter_max_lines"])
         # Lines run twice as long since #361 and renders slowed under
@@ -19865,7 +21122,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             and random.random() < dj["saved_rate"]:
         keep = draw_saved_banter()
         if keep:
+            # #752: allow_repeat — the bank exists to bring a line BACK,
+            # and without this the gate would eat exactly the lines that
+            # earned their way onto it.
             return await speak_turns(banter_turns(keep["text"]), track, lines,
+                                     allow_repeat=True,
                                      source=keep.get("source", ""))
 
     material = banter_material()
@@ -20297,9 +21558,14 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # #676: the dice. Re-rolled every round, so the same persona
             # arrives in a different temper each time instead of settling
             # into one register for the whole night.
+            # #752: unrepeated, not random.choice — these ARE roulettes
+            # of approach, with no memory, so the same temperament
+            # pairing came round inside a few rounds and read as the
+            # repetition the request is about.
             + (("THE DICE ARE ON THIS ROUND. A is "
-                + random.choice(HOST_TEMPERS) + "; B is "
-                + random.choice(HOST_TEMPERS) + ". Play those temperaments "
+                + unrepeated(list(HOST_TEMPERS), "temper-a") + "; B is "
+                + unrepeated(list(HOST_TEMPERS), "temper-b")
+                + ". Play those temperaments "
                 "HARD — they colour the phrasing, the pacing and what each "
                 "of them chooses to react to. They are still themselves, "
                 "just caught in this mood tonight. Do not name the mood out "
@@ -20337,7 +21603,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
             + f".{playing}{only_song}{aside}{show_memory()}"
-            f"{avoid_reruns()}\n\n"
+            f"{avoid_reruns()}{approach_clause(_approach)}\n\n"
             "The two lists below are prompts he typed and pictures we made "
             "for him. They are not songs and must never be announced as "
             "songs.\n"
@@ -20363,8 +21629,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
     _sb = dj_settings()
 
     async def _fresh_swath() -> dict[str, Any]:
+        # #752: seeded with the drawn approach as well as the script, so
+        # the material the vector index hands back rhymes with the FRAME
+        # rather than with the last 400 characters of what was said.
         return (await speakbox_semantic_seed(
-                    (script[-400:] or angle or ""), exclude=seed.get("file", ""))
+                    (str(_approach.get("text") or "") + " "
+                     + (script[-400:] or angle or "")),
+                    exclude=seed.get("file", ""))
                 or await speakbox_quote(exclude=seed.get("file", ""),
                                         most=3, cap=280))
     # #609/#612: PRE-PEND a fresh verbatim swath to the FRONT of the round (an
@@ -20394,6 +21665,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "caller_fx": caller_fx, "at": time.time(),
         "caller2_name": caller2_name, "caller2_voice": caller2_voice,
         "render_stream": render_stream,
+        "feel": feel,                                          # #750
     }
     if bank:
         _LARDER.append(entry)
@@ -20421,7 +21693,9 @@ async def _banter_air(entry: dict[str, Any],
                                source_text=entry.get("seed_text", ""),
                                caller2_name=entry.get("caller2_name", ""),
                                caller2_voice=entry.get("caller2_voice", ""),
-                               render_stream=entry.get("render_stream", False))
+                               render_stream=entry.get("render_stream",
+                                                       False),
+                               feel=entry.get("feel", False))       # #750
     if entry.get("seek_verdict") and spoken:
         asyncio.create_task(_sfx_verdict(spoken[-1]))
     if spoken:
@@ -23042,9 +24316,19 @@ async def voices_update(
     payload = await request.json()
     if payload.get("name"):
         meta["name"] = str(payload["name"])[:80]
+    # #746: which cloning engine this voice belongs to. NOTHING could
+    # write this before — every creation path hardcodes "xtts" — so
+    # an F5 section in the pickers would have been permanently empty
+    # however it was grouped. Only ever between the two clone
+    # engines: this is not a door for turning a clone into a preset.
+    want = str(payload.get("engine") or "").strip().lower()
+    if want in ("xtts", "f5"):
+        meta["engine"] = want
     style = payload.get("style") if isinstance(payload.get("style"), dict) \
         else None
-    return voice_save(meta, style=style)
+    saved = voice_save(meta, style=style)
+    _CLONE_POOL_CACHE.update({"at": 0.0, "ids": []})   # the pool moved
+    return saved
 
 
 @app.delete("/api/voices/{vid}")
@@ -24611,6 +25895,27 @@ async def dj_caller_internalize(
     return {"job_id": job_id, "caller": caller.get("name")}
 
 
+@app.get("/upstairs-audio/{name}")
+async def upstairs_audio(
+    name: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """Serve a stored page from upstairs (#749). Signed ?t= like every other
+    durable clip, so a bare <audio> and the box can both fetch it."""
+    if not UPSTAIRS_AUDIO_SHAPE.match(name):
+        raise HTTPException(status_code=404, detail="No such page")
+    sig = str(request.query_params.get("t") or "")
+    want = media_sign(name)
+    if not (want and hmac.compare_digest(sig, want)):
+        require_read_auth(authorization)
+    path = UPSTAIRS_AUDIO_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="No such page")
+    return FileResponse(path, media_type="audio/mpeg",
+                        headers={"Cache-Control": "private, max-age=3600"})
+
+
 @app.get("/ads-audio/{name}")
 async def ads_audio(
     name: str,
@@ -25492,6 +26797,115 @@ async def dj_force_api(
         f"slammed a record onto the player — {title} — and it is "
         "starting right now"))
     return {"forced": track.get("id"), "title": title, **dj_state()}
+
+
+@app.get("/api/dj/approaches")
+async def dj_approaches_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The roulette of dialogue approaches (#752) — how the pair TREAT a
+    subject, as opposed to what the subject is."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(approach_rules)
+    total = sum(int(r.get("uses") or 0) for r in rows) or 1
+    now = time.time()
+    out = []
+    for r in rows:
+        gate = TIER_GATES[min(int(r.get("uses") or 0), 2)]
+        rest = max(0.0, gate - (now - float(r.get("last") or 0)))
+        out.append({**r, "share": round(100.0 * int(r.get("uses") or 0)
+                                        / total),
+                    "resting_for": int(rest)})
+    return {"approaches": out, "tiers": list(TIER_GATES),
+            "drawn": str(_RADIO.get("last_approach") or "")}
+
+
+@app.post("/api/dj/approaches")
+async def dj_approaches_save(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Add an approach, reword one, weight it, or take it off the wheel."""
+    require_auth(authorization)
+    payload = await request.json()
+    text = str(payload.get("text") or "").strip()
+    rid = str(payload.get("id") or "")
+    with _APPROACH_LOCK:
+        rows = approach_rules()
+        if not rid:
+            if len(text) < 8:
+                raise HTTPException(
+                    status_code=400,
+                    detail="write it as a direction the pair can act on")
+            entry = {"id": uuid.uuid4().hex[:8], "text": text[:600],
+                     "weight": max(0.0, min(10.0,
+                                            float(payload.get("weight") or 1))),
+                     "enabled": True, "uses": 0, "last": 0,
+                     "added": int(time.time())}
+            rows.append(entry)
+            _approach_write(rows)
+            return entry
+        for row in rows:
+            if row.get("id") != rid:
+                continue
+            if text:
+                row["text"] = text[:600]
+            if "weight" in payload:
+                try:
+                    row["weight"] = max(0.0, min(10.0,
+                                                 float(payload["weight"])))
+                except (TypeError, ValueError):
+                    pass
+            if "enabled" in payload:
+                row["enabled"] = bool(payload["enabled"])
+            _approach_write(rows)
+            return row
+    raise HTTPException(status_code=404, detail="No such approach")
+
+
+@app.delete("/api/dj/approaches/{rid}")
+async def dj_approaches_delete(
+    rid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    with _APPROACH_LOCK:
+        rows = approach_rules()
+        keep = [r for r in rows if r.get("id") != rid]
+        # Never empty the wheel: a round has to be framed somehow, and an
+        # empty file re-seeds itself on the next read anyway, which would
+        # silently resurrect everything just deleted.
+        if not keep or len(keep) == len(rows):
+            raise HTTPException(status_code=400,
+                                detail="the wheel needs at least one approach")
+        _approach_write(keep)
+    return {"deleted": rid, "left": len(keep)}
+
+
+@app.get("/api/dj/prints")
+async def dj_prints_api(
+    limit: int = 40,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the station has actually said, and what keeps trying to come
+    back (#752). This is how you tell an engine that is working from one
+    that is quietly blocking everything."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(line_prints)
+    hot = sorted(rows, key=lambda r: (-int(r.get("blocked") or 0),
+                                      -int(r.get("said") or 0)))[:max(1, min(
+                                          200, int(limit or 40)))]
+    return {
+        "kept": len(rows),
+        "block_rate": round(_block_rate(), 3),
+        "standing_down": _block_rate() > BLOCK_RATE_CAP,
+        "cap": BLOCK_RATE_CAP,
+        "lines": [{"key": r.get("key", "")[:120], "who": r.get("who", ""),
+                   "said": int(r.get("said") or 0),
+                   "blocked": int(r.get("blocked") or 0),
+                   "first": int(r.get("first") or 0),
+                   "last": int(r.get("last") or 0)} for r in hot],
+    }
 
 
 @app.get("/api/dj/hangups")
@@ -29433,6 +30847,137 @@ def _ads_concat(picks: list[dict[str, Any]], tag: str) -> Path | None:
     finally:
         listing.unlink(missing_ok=True)
     return out if out.is_file() and out.stat().st_size > 1000 else None
+
+
+@app.get("/api/upstairs")
+async def upstairs_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every page the manager has sent down (#749), newest first — with the
+    on-air context it was written against, so proofreading has the reason as
+    well as the words."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(upstairs_list)
+    out = []
+    for row in rows:
+        name = str(row.get("audio") or "")
+        audio = ""
+        if name and (UPSTAIRS_AUDIO_DIR / name).is_file():
+            audio = f"/upstairs-audio/{name}?t={media_sign(name)}"
+        out.append({**row, "audio_url": audio,
+                    "words": len(str(row.get("text") or "").split())})
+    out.sort(key=lambda r: -int(r.get("ts") or 0))
+    return {"pages": out, "count": len(out),
+            "per_hour": dj_settings().get("upstairs_per_hour")}
+
+
+@app.get("/api/upstairs/archive.md", response_class=PlainTextResponse)
+async def upstairs_archive_md(
+    authorization: str | None = Header(default=None),
+) -> PlainTextResponse:
+    """The whole book of pages as one readable file (#749) — download it,
+    proofread it, and feed the good ones back."""
+    require_read_auth(authorization)
+    rows = sorted(await asyncio.to_thread(upstairs_list),
+                  key=lambda r: -int(r.get("ts") or 0))
+    lines = [f"# {dj_settings()['station_name']} — pages from upstairs", "",
+             f"{len(rows)} pages, newest first.", ""]
+    for row in rows:
+        when = time.strftime("%Y-%m-%d %H:%M",
+                             time.localtime(float(row.get("ts") or 0)))
+        lines.append(f"## {row.get('gripe') or 'a page from upstairs'}")
+        lines.append(f"*{when} · played {int(row.get('uses') or 0)}x*")
+        lines.append("")
+        lines.append(str(row.get("text") or "").strip())
+        if row.get("context"):
+            lines.append("")
+            lines.append(f"> written against: {row['context']}")
+        lines.append("")
+    stamp = time.strftime("%Y-%m-%d")
+    return PlainTextResponse(
+        "\n".join(lines), media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{station_slug()}-upstairs-'
+                 f'{stamp}.md"'})
+
+
+@app.post("/api/dj/upstairs")
+async def dj_upstairs_new(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Write a page now, or save an edit to one."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    page_id = str(payload.get("id") or "")
+    if page_id:
+        row = upstairs_update(page_id,
+                              text=str(payload.get("text") or ""),
+                              gripe=str(payload.get("gripe") or ""))
+        if not row:
+            raise HTTPException(status_code=404, detail="No such page")
+        return row
+    row = await dj_upstairs_write()
+    if not row:
+        raise HTTPException(status_code=502,
+                            detail="the manager had nothing to say")
+    if payload.get("air"):
+        asyncio.create_task(dj_upstairs_page(row))
+    return row
+
+
+@app.post("/api/dj/upstairs/{page_id}/recut")
+async def dj_upstairs_recut(
+    page_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Re-render a page from words you have changed — same entry, new
+    audio."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    row = next((r for r in upstairs_list() if r.get("id") == page_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="No such page")
+    if payload.get("text"):
+        row = upstairs_update(page_id, text=str(payload["text"])) or row
+    row = dict(row)
+    row["audio"] = ""
+    row["vocode"] = str(payload.get("vocode") or "")
+    made = await dj_upstairs_render(row)
+    if not made:
+        raise HTTPException(status_code=502,
+                            detail="the intercom would not render")
+    if payload.get("air"):
+        asyncio.create_task(dj_upstairs_page(made))
+    name = str(made.get("audio") or "")
+    return {**made,
+            "audio_url": f"/upstairs-audio/{name}?t={media_sign(name)}"}
+
+
+@app.post("/api/dj/upstairs/{page_id}/play")
+async def dj_upstairs_play(
+    page_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Send it down now."""
+    require_auth(authorization)
+    row = next((r for r in upstairs_list() if r.get("id") == page_id), None)
+    if not row:
+        raise HTTPException(status_code=404, detail="No such page")
+    note_action("📟 you paged the booth from upstairs")
+    asyncio.create_task(dj_upstairs_page(row))
+    return {"paging": True, "id": page_id}
+
+
+@app.delete("/api/dj/upstairs/{page_id}")
+async def dj_upstairs_delete(
+    page_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    upstairs_delete(page_id)
+    return {"deleted": page_id, "left": len(upstairs_list())}
 
 
 @app.get("/api/ads/aired")
@@ -34495,6 +36040,9 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
 }
 .vkind-clone { color: var(--accent); border-color: var(--accent); }
 .vkind-simulacrum { color: #b98cff; border-color: #b98cff; }
+/* #746: which of the two cloning engines renders this one. */
+.vkind-xtts { color: #6fd3ff; border-color: #6fd3ff; }
+.vkind-f5 { color: #7ce0b0; border-color: #7ce0b0; }
 .voice-row {
   display: flex; align-items: center; gap: 9px; padding: 7px 6px;
   border-bottom: 1px solid var(--border); font-size: 13px;
@@ -38805,6 +40353,33 @@ function toggleFavouriteVoice(name) {
   return stars;
 }
 
+/* #746: one place that decides how cloned voices are sectioned, used by
+ * every picker in the panel — the DJ chairs, the ad studio, the guest
+ * editor, the voice studio. Four lists building their own headings is how
+ * they drift apart, and the request is for a SECTION, not a relabelling. */
+const CLONE_ENGINE_LABEL = {
+  xtts: "🧬 cloned voices · XTTS",
+  f5: "🌊 cloned voices · F5-TTS",
+};
+const CLONE_MARK = {xtts: "🧬 ", f5: "🌊 "};
+
+function cloneGroups(rows) {
+  const buckets = new Map();
+  (rows || []).forEach((v) => {
+    const engine = String(v.engine || "xtts");
+    if (!buckets.has(engine)) buckets.set(engine, []);
+    buckets.get(engine).push(v);
+  });
+  // XTTS first, then F5, then anything unexpected — a stable order so the
+  // list does not reshuffle itself between renders.
+  const order = ["xtts", "f5"].concat(
+    [...buckets.keys()].filter((k) => k !== "xtts" && k !== "f5"));
+  return order
+    .filter((k) => (buckets.get(k) || []).length)
+    .map((k) => [CLONE_ENGINE_LABEL[k] || ("🧬 cloned voices · " + k),
+                 buckets.get(k)]);
+}
+
 function fillVoiceSelect(select, voices, current, includeBrowser) {
   select.textContent = "";
   const fallback = document.createElement("option");
@@ -38848,20 +40423,23 @@ function fillVoiceSelect(select, voices, current, includeBrowser) {
   // The cloned voices ride in every picker (#272): choose one anywhere a
   // Piper name goes and the clone engine renders that role — the voice
   // NAME is the router, no other setting needed.
-  const clones = window.pineCloneVoices || [];
-  if (clones.length) {
+  // #746: …and they are grouped by WHICH clone engine renders them. The
+  // heading used to be the constant "XTTS", so a library running on F5 —
+  // or a single voice marked F5 — still read as XTTS.
+  cloneGroups(window.pineCloneVoices || []).forEach(([label, rows]) => {
     const group = document.createElement("optgroup");
-    group.label = "🧬 cloned voices · XTTS";
-    clones.forEach((voice) => {
+    group.label = label;
+    rows.forEach((voice) => {
       const option = document.createElement("option");
       option.value = voice.id;
-      option.textContent = "🧬 " + voice.name;
-      option.title = voice.id;
+      option.textContent = CLONE_MARK[voice.engine] || "🧬 ";
+      option.textContent += voice.name;
+      option.title = voice.id + " · " + (voice.engine || "xtts");
       if (voice.id === current) option.selected = true;
       group.appendChild(option);
     });
     select.appendChild(group);
-  }
+  });
 
   if (includeBrowser && "speechSynthesis" in window) {
     const local = speechSynthesis.getVoices() || [];
@@ -40688,34 +42266,64 @@ function audioScope(player) {
   }
 }
 
+/* #745: the accent colour, read ONCE rather than sixty times a second.
+ * getComputedStyle on the root element from inside an animation frame is a
+ * style recalculation the whole page pays for. Refreshed when the theme
+ * actually changes. */
+let scopeAccent = "";
+function scopeAccentNow() {
+  if (!scopeAccent) {
+    scopeAccent = getComputedStyle(document.documentElement)
+      .getPropertyValue("--accent").trim() || "#4bb3ff";
+  }
+  return scopeAccent;
+}
+function scopeAccentForget() { scopeAccent = ""; }
+
 function drawScope(canvas, player) {
   if (!canvas || !player) return;
+  // #745: costs nothing while it cannot be seen. The booth dock's scope
+  // kept drawing at 60fps with the dock stowed.
+  if (!canvas.offsetParent) return;
   const scope = audioScope(player);
   const ctx = canvas.getContext("2d");
-  const width = canvas.width = canvas.clientWidth * (window.devicePixelRatio || 1);
-  const height = canvas.height = canvas.clientHeight * (window.devicePixelRatio || 1);
+  // #745: this was `canvas.width = canvas.clientWidth * dpr` EVERY FRAME —
+  // the exact fault #737 fixed for the booth glass and never fixed here.
+  // Reading clientWidth forces a synchronous layout of the whole document,
+  // and writing canvas.width resets the entire 2D context; both, sixty
+  // times a second, on two canvases, while the booth log was growing all
+  // night. That is the compounding cost that made typing stutter. Measure,
+  // compare, and only resize when it has really changed.
+  const ratio = window.devicePixelRatio || 1;
+  const wantW = Math.max(1, Math.round(canvas.clientWidth * ratio));
+  const wantH = Math.max(1, Math.round(canvas.clientHeight * ratio));
+  if (canvas.width !== wantW) canvas.width = wantW;
+  if (canvas.height !== wantH) canvas.height = wantH;
+  const width = canvas.width, height = canvas.height;
   ctx.clearRect(0, 0, width, height);
   if (!scope) return;
   if (scope.context.state === "suspended" && !player.paused) {
     scope.context.resume().catch(() => {});
   }
+  // Nothing playing, nothing to draw — the cleared canvas is the answer.
+  if (player.paused || player.ended) return;
 
   scope.analyser.getByteFrequencyData(scope.bins);
   const bars = 64;
   const step = Math.floor(scope.bins.length / bars);
   const barWidth = width / bars;
-  const accent = getComputedStyle(document.documentElement)
-    .getPropertyValue("--accent").trim() || "#4bb3ff";
+  const accent = scopeAccentNow();
+  // #745: ONE gradient for the frame instead of 64 of them.
+  const gradient = ctx.createLinearGradient(0, height, 0, 0);
+  gradient.addColorStop(0, accent);
+  gradient.addColorStop(1, "rgba(255,255,255,.85)");
+  ctx.fillStyle = gradient;
 
   for (let i = 0; i < bars; i++) {
     let sum = 0;
     for (let j = 0; j < step; j++) sum += scope.bins[i * step + j];
     const level = (sum / step) / 255;
     const barHeight = Math.max(1, level * height * 0.94);
-    const gradient = ctx.createLinearGradient(0, height, 0, height - barHeight);
-    gradient.addColorStop(0, accent);
-    gradient.addColorStop(1, "rgba(255,255,255,.85)");
-    ctx.fillStyle = gradient;
     ctx.globalAlpha = 0.35 + level * 0.65;
     ctx.fillRect(i * barWidth + 1, height - barHeight,
                  Math.max(1, barWidth - 2), barHeight);
@@ -40724,11 +42332,15 @@ function drawScope(canvas, player) {
 }
 
 function scopeLoop() {
+  // #745: reschedule FIRST, then bail — so a hidden tab costs nothing and
+  // the loop still resumes when it comes back. Same shape boothGlassDraw
+  // already uses.
+  requestAnimationFrame(scopeLoop);
+  if (document.hidden) return;
   drawScope(document.getElementById("musicScope"),
             document.getElementById("musicPlayer"));
   drawScope(document.getElementById("boothScope"),
             document.getElementById("musicPlayer"));
-  requestAnimationFrame(scopeLoop);
 }
 
 /* ---- The now-playing stage (#148) ---- */
@@ -40838,6 +42450,11 @@ async function stageStart() {
 
   function tick(now) {
     frame = requestAnimationFrame(tick);
+    // #745: a WebGL scene that nobody can see still costs a full render
+    // every frame. The cover flow already bails like this; the stage and
+    // the Mind never did, and the Mind is opened inline for the whole time
+    // the station is on air.
+    if (document.hidden || !renderer.domElement.offsetParent) return;
 
     if (phase === "idle") {
       // Breathing, and a slow drift so it never looks frozen.
@@ -41418,6 +43035,20 @@ function djTalkPopup() {
   hang.onclick = (ev) => { ev.stopPropagation(); hangupRules(""); };
   // #656: the history is kept forever now, so there is a way to end it —
   // and only this, never the window doing it on its own.
+  // #745: only the newest rows are kept in the document — the night itself
+  // is all still held, and this puts it all back on screen when you want to
+  // read back through it.
+  const all = el("button", "", "⇡");
+  all.id = "djTalkAllBtn";
+  all.title = "Show the WHOLE night in this window. Only the newest "
+    + String(DJ_TALK_DOM_MAX) + " lines are drawn by default — nothing is "
+    + "lost, it just keeps the panel quick to type in.";
+  all.onclick = (ev) => {
+    ev.stopPropagation();
+    djTalkShowAll = !djTalkShowAll;
+    all.style.color = djTalkShowAll ? "#43d17c" : "";
+    djTalkRepaint();
+  };
   const wipe = el("button", "", "⌫");
   wipe.title = "Clear the booth history — the only thing that empties this "
     + "window";
@@ -41436,6 +43067,7 @@ function djTalkPopup() {
   head.appendChild(dot);                                        // #678
   head.appendChild(grab);
   head.appendChild(hang);                                       // #691
+  head.appendChild(all);                                        // #745
   head.appendChild(wipe);
   head.appendChild(mute);
   head.appendChild(shut);
@@ -41454,8 +43086,15 @@ function djTalkPopup() {
     const drop = () => {
       head.removeEventListener("pointermove", move);
       head.removeEventListener("pointerup", drop);
-      localStorage.setItem("djTalkBox", JSON.stringify(
-        {left: box.offsetLeft, top: box.offsetTop}));
+      // #747: MERGE. This used to write a fresh object, which would have
+      // thrown away the remembered glass height every time the window was
+      // nudged — the setting would have looked like it did not stick.
+      let saved = {};
+      try { saved = JSON.parse(localStorage.getItem("djTalkBox") || "{}") || {}; }
+      catch (err) { saved = {}; }
+      saved.left = box.offsetLeft;
+      saved.top = box.offsetTop;
+      localStorage.setItem("djTalkBox", JSON.stringify(saved));
     };
     head.addEventListener("pointermove", move);
     head.addEventListener("pointerup", drop);
@@ -41463,7 +43102,27 @@ function djTalkPopup() {
 
   const log = el("div", "", "");
   log.id = "djTalkLog";
-  log.style.cssText = "flex:1;overflow-y:auto;font-size:12px;line-height:1.5";
+  /* #747: `flex:1` is `flex:1 1 0%` — a PERCENTAGE basis. This box has no
+   * height of its own (only max-height), so an indefinite main size makes
+   * that percentage resolve to `content`: the log's flex base size became
+   * the whole night's transcript, thousands of pixels of it, and the
+   * negative free space that produced is what squeezed the glass above it
+   * down to a sliver — worse with every line the pair said, which is
+   * literally "scaling itself out of existence". `0` is a LENGTH, so the
+   * basis is definite whatever the container does, and min-height:0 lets
+   * the log absorb the rest. #740 armoured the glass; this removes the
+   * force that was pushing on it. */
+  log.style.cssText = "flex:1 1 0;min-height:0;overflow-y:auto;"
+    + "font-size:12px;line-height:1.5";
+  /* #748: whether you have scrolled back is decided by YOU scrolling, not
+   * recomputed from the viewport on every four-second render. It used to be
+   * reassigned every poll, which quietly undid the flag djJumpLive clears
+   * to re-enable the follow — so asking to be taken to the live line worked
+   * for one frame and then stopped following it again. */
+  log.addEventListener("scroll", () => {
+    log._userScrolled =
+      (log.scrollHeight - log.scrollTop - log.clientHeight) > 60;
+  }, {passive: true});
 
   box.appendChild(head);
   box.appendChild(boothGlass());          // #668
@@ -41786,10 +43445,37 @@ const BOOTH_WHO = {
 };
 // #705/#737: one number for how tall the trace is, used by BOTH the CSS
 // and the backing store, so they can never disagree and drift.
+// #747: it is the DEFAULT now rather than the law — the glass can be
+// dragged taller and remembers it — and BOOTH_SPEC_MIN is the floor below
+// which the trace stops being readable and must never be squeezed.
 const BOOTH_SPEC_H = 104;
+const BOOTH_SPEC_MIN = 56;
 let boothGlassRaf = 0;
 const boothBubbles = [];
 let boothSellSeen = "";
+
+/* #747: the glass height you last dragged it to. Kept in the same
+ * localStorage object as the popup's position so the booth has one memory,
+ * and clamped on read so a stale value from another screen cannot bring
+ * back a two-pixel spectrogram. */
+function boothGlassHeight() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("djTalkBox") || "{}") || {}; }
+  catch (e) { saved = {}; }
+  const want = Number(saved.glassH);
+  if (!isFinite(want) || want <= 0) return BOOTH_SPEC_H + 34;
+  return Math.max(BOOTH_SPEC_MIN + 2,
+                  Math.min(Math.round(window.innerHeight * 0.46), want));
+}
+
+function boothGlassRemember(px) {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem("djTalkBox") || "{}") || {}; }
+  catch (e) { saved = {}; }
+  saved.glassH = Math.round(px);
+  try { localStorage.setItem("djTalkBox", JSON.stringify(saved)); }
+  catch (e) { /* a full quota does not break the booth */ }
+}
 
 function boothGlass() {
   const wrap = el("div", "", "");
@@ -41802,24 +43488,42 @@ function boothGlass() {
   // exactly what "the spectrogram shrunk" describes. Measured in a headless
   // browser with 200 rows in the log — 13px before, 119px after. The glass
   // is a fixed fitting now; the log is the part that gives.
+  // #747: a FLOOR as well. overflow:hidden gives this wrapper an automatic
+  // minimum size of zero, so flex-shrink:0 was the single thing standing
+  // between the trace and nothing — and a single point of failure on the
+  // control the user has now reported squashed three times. min-height is
+  // honoured on every path, at every basis resolution, so the trace cannot
+  // be clipped below its own height whatever the layout does.
+  // …and resize:vertical, so if it is ever wrong again it is DRAGGABLE
+  // rather than something to file a request about. The height is remembered.
+  const glassH = boothGlassHeight();
   wrap.style.cssText = "position:relative;margin:0 0 6px;border-radius:7px;"
     + "border:1px solid var(--border);background:#060b14;overflow:hidden;"
-    + "flex:0 0 auto";
+    + "flex:0 0 auto;display:flex;flex-direction:column;"
+    + "min-height:" + (BOOTH_SPEC_MIN + 2) + "px;"
+    + "height:" + glassH + "px;max-height:46vh;resize:vertical";
   const canvas = document.createElement("canvas");
   canvas.id = "boothSpec";
   // #705: 54px of spectrogram inside a panel this narrow left a sliver you
   // could see moving but not read. The trace needs vertical room for its
   // frequency axis to mean anything, and the room strip under it was being
   // squeezed to a single wrapped line of 10px text.
-  canvas.style.cssText = "display:block;width:100%;height:"
-    + BOOTH_SPEC_H + "px";
+  // #747: the canvas FILLS whatever height the wrapper has instead of being
+  // a fixed 104px block that gets cropped. Paired with boothGlassDraw
+  // cutting its bitmap from clientHeight, the trace re-cuts itself to the
+  // box rather than being stretched or clipped by it.
+  canvas.style.cssText = "display:block;width:100%;flex:1 1 auto;"
+    + "min-height:" + BOOTH_SPEC_MIN + "px";
   wrap.appendChild(canvas);
   // Who is in the room, and which of them has the mic.
   const room = el("div", "", "");
   room.id = "boothRoom";
+  // #747: 0 0 auto — the chip strip is chrome, not slack. With the wrapper
+  // now a flex column, leaving these shrinkable would just move the old
+  // squeeze one level down and eat the room strip instead of the trace.
   room.style.cssText = "display:flex;gap:6px;align-items:center;flex-wrap:wrap;"
     + "padding:6px 7px;border-top:1px solid var(--border);font-size:11.5px;"
-    + "line-height:1.5";
+    + "line-height:1.5;flex:0 0 auto";
   wrap.appendChild(room);
   // The sale, circulating.
   // #729/#730: the countdown to the next round, in the corner. Sitting
@@ -41839,8 +43543,21 @@ function boothGlass() {
   const sell = el("div", "", "");
   sell.id = "boothSell";
   sell.style.cssText = "display:none;gap:5px;align-items:center;padding:4px 5px;"
-    + "border-top:1px solid var(--border);overflow:hidden;white-space:nowrap";
+    + "border-top:1px solid var(--border);overflow:hidden;white-space:nowrap;"
+    + "flex:0 0 auto";
   wrap.appendChild(sell);
+  // #747: remember a drag of the resize grip, so a height you set once is
+  // the height you keep. Same shape as the rhetoric cloud's rhetCloudH.
+  try {
+    let settle = 0;
+    new ResizeObserver(() => {
+      clearTimeout(settle);
+      settle = setTimeout(() => {
+        const h = wrap.getBoundingClientRect().height;
+        if (h > 0) boothGlassRemember(h);
+      }, 400);
+    }).observe(wrap);
+  } catch (e) { /* the glass works without a memory */ }
   return wrap;
 }
 
@@ -41853,7 +43570,25 @@ function boothLivePlayer() {
   return null;
 }
 
+/* #745: memoised. This is called from boothGlassDraw on EVERY animation
+ * frame, and it runs querySelector over the booth log — which since #656
+ * holds the whole night. Sixty document-wide selector scans a second, over
+ * a growing DOM, for an answer that only changes when the speaker does.
+ * The three inputs below are the whole of that answer's dependency. */
+let boothLiveKey = "";
+let boothLiveVal = null;
+
 function boothLiveWho() {
+  const key = ((typeof djVoiceNow !== "undefined" && djVoiceNow)
+                ? (djVoiceNow.text || "") + "|" + (djVoiceNow.sting || "") : "")
+    + "|" + (window.djSpeakingEid || "") + "|" + (window.djSpeakingWho || "");
+  if (key === boothLiveKey) return boothLiveVal;
+  boothLiveKey = key;
+  boothLiveVal = boothLiveWhoScan();
+  return boothLiveVal;
+}
+
+function boothLiveWhoScan() {
   const log = document.getElementById("djTalkLog");
   const want = (typeof djVoiceNow !== "undefined" && djVoiceNow)
     ? djTalkKey(djVoiceNow.text) : "";
@@ -42002,7 +43737,12 @@ function boothGlassDraw() {
   // error feed back on itself until the thing is a sliver. Measure,
   // and only resize when the size has ACTUALLY changed.
   const wantW = Math.max(1, Math.round(canvas.clientWidth * ratio));
-  const wantH = Math.max(1, Math.round(BOOTH_SPEC_H * ratio));
+  // #747: cut the bitmap from the ELEMENT, the way the width already is.
+  // Sizing height from the constant while the box could be any height is
+  // how a 104px trace ended up stretched into, or cropped by, whatever the
+  // layout had actually left it.
+  const wantH = Math.max(1, Math.round(
+    (canvas.clientHeight || BOOTH_SPEC_H) * ratio));
   if (canvas.width !== wantW) canvas.width = wantW;
   if (canvas.height !== wantH) canvas.height = wantH;
   const width = canvas.width, height = canvas.height;
@@ -42018,6 +43758,10 @@ function boothGlassDraw() {
   const player = ctxLive ? boothLivePlayer() : null;
   const scope = player ? audioScope(player) : null;
 
+  // #747: is the station speaking somewhere this page cannot hear? In box
+  // mode there is never an element to analyse, so without this the trace
+  // sits flat through the entire broadcast.
+  const boxTalking = !scope && !!window.djSpeakingWho;
   const bars = 56;
   const step = scope ? Math.max(1, Math.floor(scope.bins.length / bars)) : 1;
   if (scope) scope.analyser.getByteFrequencyData(scope.bins);
@@ -42029,6 +43773,16 @@ function boothGlassDraw() {
       let sum = 0;
       for (let j = 0; j < step; j += 1) sum += scope.bins[i * step + j] || 0;
       level = (sum / step) / 255;
+    } else if (boxTalking) {
+      // #747: the box is carrying the show, so this page has no element to
+      // read levels from — #742 gave the glass the speaker's COLOUR in box
+      // mode but left it flatlining, which reads as a broken trace rather
+      // than as somebody talking somewhere else. A voice-shaped wave, said
+      // honestly: it is the station speaking, not measured audio.
+      level = 0.30 + 0.26 * Math.sin(now * 5.5 + i * 0.5)
+        * Math.sin(now * 1.7 + i * 0.13)
+        + 0.10 * Math.sin(now * 11.0 + i * 1.1);
+      level = Math.max(0.06, level);
     } else {
       // Nothing sounding: a slow idle breath rather than a dead rectangle,
       // so the glass reads as "quiet booth" and not "broken panel".
@@ -42039,7 +43793,8 @@ function boothGlassDraw() {
     grad.addColorStop(0, col);
     grad.addColorStop(1, "rgba(255,255,255,.9)");
     ctx.fillStyle = grad;
-    ctx.globalAlpha = scope ? 0.35 + level * 0.65 : 0.22;
+    ctx.globalAlpha = scope ? 0.35 + level * 0.65
+      : (boxTalking ? 0.30 + level * 0.45 : 0.22);
     ctx.fillRect(i * barWidth + ratio, height - barHeight,
                  Math.max(1, barWidth - ratio * 2), barHeight);
   }
@@ -42685,12 +44440,76 @@ function adIsOnAir(line) {
   const url = adClipUrl(line);
   if (!url) return false;
   const bare = url.split("?")[0];
+  // #744: a local PREVIEW is not the spot going out. Counting it would
+  // light the tile red, start the marquee and tell the operator something
+  // is on air that is only in their headphones.
   if (typeof clipAudio !== "undefined" && clipAudio && clipAudio._src
+      && !clipAudio._preview
       && String(clipAudio._src).split("?")[0] === bare
       && !clipAudio.paused) return true;
   return (djVoiceEls || []).some((a) => a && !a.paused && !a.ended
     && a.src && a.src.indexOf(bare) >= 0);
 }
+
+/* #744: preview a spot with the station ducked under it.
+ *
+ * NOT musicPlayer.volume — musicVolumeRemember persists every volumechange
+ * to localStorage, so ducking that way would come back as a permanently
+ * quiet station after a reload. The GainNode is the safe lever, and it is
+ * the same one the DJs' own ducking uses, so the depth is whatever the
+ * operator set on the duck slider. */
+let adPreviewUrl = "";
+let adPreviewAudio = null;
+let adPreviewCap = 0;
+
+function adPreviewStop() {
+  if (adPreviewCap) { clearTimeout(adPreviewCap); adPreviewCap = 0; }
+  const was = adPreviewAudio;
+  adPreviewAudio = null;
+  adPreviewUrl = "";
+  if (was) { try { was.pause(); } catch (e) {} }
+  // Hand the hold back through the shared release, so a cache recording
+  // that is still playing keeps its own hold rather than being cut short.
+  try { cacheHoldEnd(); } catch (e) {}
+  try { djApplyGain(); } catch (e) {}
+  document.querySelectorAll("[data-adprev]").forEach((b) => {
+    b.textContent = b.dataset.adprev;
+  });
+}
+
+function adPreviewPlay(url, btn) {
+  if (!url) return;
+  if (adPreviewUrl === url) { adPreviewStop(); return; }   // the stop button
+  adPreviewStop();
+  try { clipToggle("", null); } catch (e) {}   // silence an ordinary listen
+  const audio = new Audio(url);
+  audio._preview = true;
+  adPreviewAudio = audio;
+  adPreviewUrl = url;
+  // The music ducks (djApplyGain reads adPreviewUrl) and the talk is held
+  // in its queue — nothing is dropped, it drains when the preview ends.
+  try { cacheHoldStart("duck"); } catch (e) {}
+  try { djApplyGain(); } catch (e) {}
+  audio.onended = adPreviewStop;
+  audio.onerror = adPreviewStop;
+  audio.onpause = adPreviewStop;
+  audio.onloadedmetadata = () => {
+    // A belt: a clip whose "ended" never fires still releases the station.
+    const ms = (isFinite(audio.duration) && audio.duration > 0
+                ? audio.duration * 1000 : 180000) + 4000;
+    adPreviewCap = setTimeout(adPreviewStop, ms);
+  };
+  if (btn) { btn.dataset.adprev = btn.textContent; btn.textContent = "⏹ stop"; }
+  audio.play().catch(() => adPreviewStop());
+  const st = (typeof djLastState !== "undefined" && djLastState) || {};
+  if ((st.music_to || "here") === "box" || (st.music_to || "") === "both") {
+    setStatus("previewing — but the Pine Box is carrying the music, and the "
+              + "box has no volume control, so only this page ducks");
+  }
+}
+
+// …and a brace: closing the window releases the station.
+window.addEventListener("pagehide", adPreviewStop);
 
 /* Draw the trace for a tile's own audio, but only while that audio is
  * playing — and stop the moment the tile leaves the document, so an
@@ -42919,6 +44738,23 @@ const djTalkSeenIds = new Set();
 // has aired — and both are the same line, so the second one has to land on
 // top of the first rather than beside it.
 const djTalkById = new Map();
+/* #745: which rows the last absorb actually TOUCHED.
+ *
+ * djTalkRender used to wipe the log and rebuild every row of the night on
+ * every four-second poll. Measured in a headless browser: 232ms of blocking
+ * main-thread work and 11,000 elements destroyed and re-created at a
+ * thousand lines — several times a minute, growing all night, which is
+ * exactly "the webpage gets slow whenever I'm typing into it". These two
+ * sets are what make the rebuild incremental: what is new, and what
+ * changed. */
+const djTalkDirty = new Set();
+let djTalkFresh = 0;
+// index in djTalkAll -> the row element painted for it
+const djTalkRows = new Map();
+let djTalkPainted = 0;
+// #745: the DOM is capped to the newest rows; djTalkAll still holds the
+// whole night. This says "show me all of it anyway".
+let djTalkShowAll = false;
 // Stings already popped as bubbles over the glass (#668), so a redraw does
 // not re-pop the whole night's samples.
 const boothStungIds = new Set();
@@ -42937,7 +44773,17 @@ function djTalkAbsorb(lines) {
       // Never let the thin live copy overwrite the full one: once a line
       // has landed for real, a late poll of speaking_now must not undo it.
       if (!(line.aired === "airing" && was.aired !== "airing")) {
-        djTalkAll[at] = Object.assign({}, was, line);
+        const merged = Object.assign({}, was, line);
+        // #748: the finished entry can arrive with NO `aired` key at all
+        // (page-only routing where the clip failed, and the hold-shelf
+        // drain which pops the key rather than reassigning it). A plain
+        // merge would leave the provisional "airing" standing and the row
+        // would pulse red for the rest of the night.
+        if (was.aired === "airing" && !("aired" in line)) delete merged.aired;
+        if (JSON.stringify(merged) !== JSON.stringify(was)) {
+          djTalkAll[at] = merged;
+          djTalkDirty.add(eid);
+        }
       }
       return;
     }
@@ -42951,6 +44797,7 @@ function djTalkAbsorb(lines) {
     djTalkAll.push(line);
     added += 1;
   });
+  djTalkFresh += added;
   return added;
 }
 
@@ -42958,6 +44805,10 @@ function djTalkClear() {
   djTalkAll = [];
   djTalkSeenIds.clear();
   djTalkById.clear();
+  djTalkDirty.clear();
+  djTalkRows.clear();
+  djTalkFresh = 0;
+  djTalkPainted = 0;
   const log = document.getElementById("djTalkLog");
   if (log) log.textContent = "";
   setStatus("Booth history cleared.");
@@ -43016,12 +44867,30 @@ function djTalkRender(state) {
     boothBubble(line.text, "sfx");
   });
   const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 40;
-  log.textContent = "";
+  // #748: remember WHERE, not just whether. The log used to be wiped every
+  // poll and only restored when you were already at the bottom, so a jump
+  // that landed mid-history was thrown to the top of the night within four
+  // seconds — which is most of what "not synced when I try to sync with it"
+  // felt like.
+  const keepTop = log.scrollTop;
+  /* #745: the header blocks are PERSISTENT nodes now, rebuilt only when
+   * their content actually changes — the boothSellSeen/room.dataset.key
+   * pattern this file already uses. They used to be torn down and rebuilt
+   * every four seconds along with everything else. */
+  const vhost = djTalkHeader(log, "djTalkVector", 0);
+  const ghost = djTalkHeader(log, "djTalkGallery", 1);
   // #595: a section showing HOW the booth is reaching the vector database —
   // which document section each pull located, the match strength, how long it
   // took, how many swaths were scanned, and by what system.
   const va = state.vector_access || [];
-  if (va.length) {
+  const vkey = va.length ? va.map((v) => (v.file || "") + (v.ms || 0)).join("|")
+    : "";
+  if (vhost.dataset.key !== vkey) {
+    vhost.dataset.key = vkey;
+    vhost.textContent = "";
+    vhost.style.display = va.length ? "" : "none";
+  }
+  if (va.length && !vhost.firstChild) {
     const vEsc = (s) => String(s == null ? "" : s).replace(/[&<>]/g,
       (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
     const vwrap = el("details", "", "");
@@ -43048,13 +44917,19 @@ function djTalkRender(state) {
                      + "&rdquo;</span>" : "");
       vwrap.appendChild(r);
     });
-    log.appendChild(vwrap);
+    vhost.appendChild(vwrap);
   }
   // The painting(s) being hawked right now, held up beside the dialogue (#596)
   // so you can see what they are talking about.
   const gnames = ((state.gallery_now && state.gallery_now.images) || [])
     .filter(Boolean);
-  if (gnames.length) {
+  const gkey = gnames.join("|");
+  if (ghost.dataset.key !== gkey) {
+    ghost.dataset.key = gkey;
+    ghost.textContent = "";
+    ghost.style.display = gnames.length ? "" : "none";
+  }
+  if (gnames.length && !ghost.firstChild) {
     const grow = el("div", "", "");
     grow.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;align-items:center;"
       + "margin:0 0 6px;padding:5px 7px;border-radius:6px;background:#0c1420;"
@@ -43075,13 +44950,130 @@ function djTalkRender(state) {
       im.oncontextmenu = (ev) => artHawkMenu(ev, n);          // #719
       grow.appendChild(im);
     });
-    log.appendChild(grow);
+    ghost.appendChild(grow);
   }
-  // Everything, in perpetuity (#656) — no tail slice, nothing cut off.
-  lines.forEach((line) => {
+  /* #745: everything, in perpetuity (#656) — but PAINTED ONCE.
+   *
+   * Only lines that have never been drawn get a row built, and only rows
+   * whose data actually changed get replaced. In the steady state that is
+   * nought to three rows per poll instead of every line of the night. */
+  for (let at = djTalkPainted; at < lines.length; at += 1) {
+    const built = djTalkRow(lines[at]);
+    if (!built) continue;
+    djTalkRows.set(at, built);
+    log.appendChild(built);
+  }
+  djTalkPainted = lines.length;
+  // …and the handful that CHANGED — the #742 airing→aired promotion, which
+  // is normally exactly one row.
+  if (djTalkDirty.size) {
+    djTalkDirty.forEach((eid) => {
+      const at = djTalkById.get(eid);
+      if (at == null) return;
+      const old = djTalkRows.get(at);
+      const built = djTalkRow(lines[at]);
+      if (!built) return;
+      if (old && old.isConnected) old.replaceWith(built);
+      else log.appendChild(built);
+      djTalkRows.set(at, built);
+    });
+    djTalkDirty.clear();
+  }
+  djTalkTrim(log);
+  djTalkScroll(log, atBottom, keepTop);
+  djTalkMarkLive();
+}
+
+/* #745: draw the log again from scratch — the one place that is allowed to.
+ * Used when the cap is lifted, and after a trim has thrown rows away. */
+function djTalkRepaint() {
+  const log = document.getElementById("djTalkLog");
+  if (!log) return;
+  const keep = [document.getElementById("djTalkVector"),
+                document.getElementById("djTalkGallery")].filter(Boolean);
+  log.textContent = "";
+  keep.forEach((n) => log.appendChild(n));
+  djTalkRows.clear();
+  djTalkPainted = 0;
+  const lines = djTalkAll;
+  const from = djTalkShowAll ? 0
+    : Math.max(0, lines.length - DJ_TALK_DOM_MAX);
+  for (let at = from; at < lines.length; at += 1) {
+    const built = djTalkRow(lines[at]);
+    if (!built) continue;
+    djTalkRows.set(at, built);
+    log.appendChild(built);
+  }
+  djTalkPainted = lines.length;
+  log.scrollTop = log.scrollHeight;
+  djTalkMarkLive();
+}
+
+/* #745: the header blocks live above the rows and survive every poll. */
+function djTalkHeader(log, id, order) {
+  let host = document.getElementById(id);
+  if (!host) {
+    host = el("div", "", "");
+    host.id = id;
+    host.dataset.key = "never-painted";
+    const before = log.children[order] || null;
+    log.insertBefore(host, before);
+  }
+  return host;
+}
+
+/* #745: keep the DOM bounded without breaking #656's promise that nothing
+ * is dropped until you press Clear — djTalkAll still holds the whole night,
+ * so "the whole night" reopens it. Only the ATTACHED rows are capped. */
+const DJ_TALK_DOM_MAX = 500;
+function djTalkTrim(log) {
+  if (djTalkShowAll) return;
+  const rows = log.children.length - 2;              // the two header hosts
+  if (rows <= DJ_TALK_DOM_MAX) return;
+  let drop = rows - DJ_TALK_DOM_MAX;
+  while (drop > 0 && log.children.length > 2) {
+    const node = log.children[2];
+    if (!node) break;
+    node.remove();
+    drop -= 1;
+  }
+  // The map still points at detached nodes for the trimmed head; that is
+  // harmless (isConnected is checked before replaceWith) and they are
+  // rebuilt if the whole night is asked for.
+}
+
+/* #748: put the reader back where they were, not at the top of the night. */
+function djTalkScroll(log, atBottom, keepTop) {
+  if (log._jumpTo) {
+    const want = log.querySelector('[data-eid="' + CSS.escape(log._jumpTo)
+                                   + '"]');
+    if (want) {
+      try { want.scrollIntoView({block: "center"}); } catch (e) {}
+      want.classList.add("booth-found");
+      setTimeout(() => want.classList.remove("booth-found"), 1800);
+      log._jumpTo = "";
+      return;
+    }
+  }
+  log.scrollTop = atBottom ? log.scrollHeight : keepTop;
+}
+
+/* #745: the per-line row builder, lifted out of djTalkRender so it can be
+ * called for ONE line instead of all of them. Returns the row; the caller
+ * decides where it goes. */
+function djTalkRow(line) {
+  {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
       + "padding:3px 4px;border-radius:5px";
+    /* #748: identity FIRST, above every early return. The ad, sting,
+     * hang-up and desk-marker branches all return before the old stamping
+     * site, so a line the station was genuinely speaking — an ad read goes
+     * through dj_speak and publishes a live id — had no row carrying that
+     * id, and the jump fell through to "nothing is going out". */
+    if (line.id) row.setAttribute("data-eid", line.id);
+    row.setAttribute("data-who", line.who || "");
+    if (line.name) row.setAttribute("data-name", line.name);
     // #691: the call ended. A call used to just stop scrolling — no mark,
     // no length, no reason. This is the end of it, said plainly, with the
     // WHY as a chip that opens the shelf of endings it was drawn from.
@@ -43104,8 +45096,55 @@ function djTalkRender(state) {
         hangupRules(line.rule_id || "");
       };
       row.appendChild(why);
-      log.appendChild(row);
-      return;
+      return row;
+    }
+    // #749: a page from upstairs is its own kind of entry — a cold slate
+    // tile with the intercom's words in it, the clip on it, and a door
+    // into the book.
+    if (line.kind === "upstairs") {
+      row.style.cssText += ";background:#0e1620;border:1px solid #37506b;"
+        + "flex-direction:column;gap:4px;margin:4px 0;padding:6px 8px;"
+        + "cursor:pointer";
+      const head = el("div", "", "📟 UPSTAIRS — "
+        + (line.gripe || "a page for the booth"));
+      head.style.cssText = "font-size:11.5px;color:#9fd0ff;font-weight:600";
+      row.appendChild(head);
+      const url = line.page_audio
+        ? "/upstairs-audio/" + encodeURIComponent(line.page_audio)
+          + (line.page_sig ? "?t=" + encodeURIComponent(line.page_sig) : "")
+        : "";
+      const said = el("div", "muted", line.text || "");
+      said.style.cssText = "font-size:11px;line-height:1.45;width:100%";
+      row.appendChild(said);
+      const pacts = el("div", "row", "");
+      pacts.style.cssText = "gap:5px;flex-wrap:wrap;width:100%";
+      if (url) {
+        const hear = el("button", "", "▶ hear it");
+        hear.style.cssText = "font-size:10.5px;padding:2px 8px";
+        hear.onclick = (ev) => {
+          ev.stopPropagation(); clipToggle(url, hear, "▶ hear it");
+        };
+        pacts.appendChild(hear);
+        const dl = el("a", "", "⬇ keep it");
+        dl.href = url;
+        dl.download = ((line.gripe || "page").replace(/[^\w -]+/g, "")
+          .slice(0, 48) || "page") + ".mp3";
+        dl.style.cssText = "font-size:10.5px;padding:2px 8px;color:#9fd0ff;"
+          + "border:1px solid var(--border);border-radius:7px;"
+          + "text-decoration:none";
+        dl.onclick = (ev) => ev.stopPropagation();
+        pacts.appendChild(dl);
+      }
+      const book = el("button", "", "🗂 the book of pages");
+      book.style.cssText = "font-size:10.5px;padding:2px 8px";
+      book.onclick = (ev) => {
+        ev.stopPropagation();
+        localStorage.cacheTab = "upstairs";
+        callRecordings();
+      };
+      pacts.appendChild(book);
+      row.appendChild(pacts);
+      return row;
     }
     // #701: an ad that aired is its OWN entry, not a DJ line wearing the
     // same clothes as banter. Play what actually went out (bed and all),
@@ -43220,11 +45259,29 @@ function djTalkRender(state) {
           clipToggle(heard, play, "▶ hear it");      // #706
         };
         acts.appendChild(play);
+        // #744: the same spot, with the station ducked under it — the
+        // music drops to your duck depth and the pair hold their queue,
+        // so you can actually judge the read over a live show.
+        const prev = el("button", "", "▶ preview (station ducked)");
+        prev.style.cssText = "font-size:10.5px;padding:2px 8px";
+        prev.title = "Play it with the music ducked and the DJs held. The "
+          + "queue is not dropped — the talk resumes when the preview ends.";
+        // The label is derived at RENDER time, never stored on the button:
+        // this log is rebuilt beneath us and a stored label would be lost.
+        if (adPreviewUrl === heard) prev.textContent = "⏹ stop preview";
+        prev.onclick = (ev) => {
+          ev.stopPropagation();
+          adPreviewPlay(heard, prev);
+        };
+        acts.appendChild(prev);
         const dl = el("a", "", "⬇ keep it");
         dl.href = heard;
+        // #744: the extension comes from the URL actually being saved. A
+        // produced spot carries only ad_audio (always .mp3), so the old
+        // test on line.media saved real mp3s as .wav.
         dl.download = ((line.product || "ad").replace(/[^\w -]+/g, "")
-          .slice(0, 48) || "ad") + (line.media && line.media.endsWith(".mp3")
-            ? ".mp3" : ".wav");
+          .slice(0, 48) || "ad")
+          + (/\.mp3(\?|$)/.test(heard) ? ".mp3" : ".wav");
         dl.title = "Download this spot";
         dl.style.cssText = "font-size:10.5px;padding:2px 8px;color:#ffd479;"
           + "border:1px solid var(--border);border-radius:7px;"
@@ -43263,8 +45320,7 @@ function djTalkRender(state) {
         acts.appendChild(kill);
       }
       row.appendChild(acts);
-      log.appendChild(row);
-      return;
+      return row;
     }
     // A sample dropped off the end of a phrase shows up between the lines
     // (#277), with the same votes the chat feed carries (#269).
@@ -43358,8 +45414,7 @@ function djTalkRender(state) {
       dot.onclick = () => sfxDirPopup(line.sfx);
       sfxDotHover(dot, line.sfx);
       row.appendChild(dot);
-      log.appendChild(row);
-      return;
+      return row;
     }
     // A desk event — a call landing, a news break, a tape in the mail — is a
     // marker between the spoken lines, not a line anyone said (#240).
@@ -43385,8 +45440,7 @@ function djTalkRender(state) {
         }
       }
       row.appendChild(mark);
-      log.appendChild(row);
-      return;
+      return row;
     }
     const said = el("div", "", "");
     said.style.cssText = "flex:1;min-width:0;cursor:pointer";
@@ -43440,7 +45494,12 @@ function djTalkRender(state) {
     said.appendChild(document.createTextNode(line.text || ""));
     // Every spoken line wears its delivery status (#430): out of the
     // speaker, queued, or page-only.
-    const spoken = ["dj", "cohost", "third", "caller"].indexOf(line.who) >= 0;
+    // #748: caller2 and drop were missing. The second person on a call is
+    // handled as a speaker eight lines above, and "drop" is a real dj_speak
+    // role that publishes a live id — both rendered as dialogue with no
+    // delivery mark and no handle to jump to.
+    const spoken = ["dj", "cohost", "third", "caller", "caller2",
+                    "drop"].indexOf(line.who) >= 0;
     // Accurate delivery status (#445): the mark comes from what actually
     // happened to the announce, never from a guess about routing.
     // 🕐 held for replay · 📵 page-only · 📻 handed to the box (HA
@@ -43513,15 +45572,10 @@ function djTalkRender(state) {
     // hands it over; the page plays it later, so matching on the AUDIO is
     // what makes this window one to one with the broadcast.
     if (spoken && line.text) {
+      // #748: data-said is a hash of the WORDS, so it genuinely only
+      // belongs on dialogue — the id and the speaker are stamped above,
+      // where no early return can skip them.
       row.setAttribute("data-said", djTalkKey(line.text));
-      // The chat entry already carries a stable 6-hex id from
-      // _ensure_chat_ids(); matching on a hash of the TEXT is what
-      // made the jump button unable to find a coalesced round (#721).
-      if (line.id) row.setAttribute("data-eid", line.id);
-      // #668: and WHO said it, so the spectrogram over the booth can be
-      // coloured by the voice that is actually going out.
-      row.setAttribute("data-who", line.who || "");
-      if (line.name) row.setAttribute("data-name", line.name);
     }
     said.onclick = () => djTalkSpeak(line, said);
     // Right-click any line to bury it forever (#444): it is dropped if it
@@ -43652,15 +45706,8 @@ function djTalkRender(state) {
     });
     row.onmouseenter = () => { row.style.background = "rgba(75,179,255,.13)"; };
     row.onmouseleave = () => { row.style.background = ""; };
-    log.appendChild(row);
-  });
-  // Only autoscroll if they were already at the bottom — otherwise reading
-  // back through the history would be yanked away every poll.
-  if (atBottom) log.scrollTop = log.scrollHeight;
-  log._userScrolled = !atBottom;
-  // The window was just rebuilt, so put the pulse back on whatever is
-  // sounding (#651, #653).
-  djTalkMarkLive();
+    return row;
+  }
 }
 
 // Click a line in the booth and it goes out of the box again, said by
@@ -43960,7 +46007,10 @@ function djApplyGain() {
   const music = gainFor(document.getElementById("musicPlayer"), "music");
   // Ramp rather than jump: a step change in gain is an audible click.
   if (music) {
-    const target = level.music * (djSpeaking ? (1 - level.duck) : 1);
+    // #744: an ad preview ducks the music exactly the way the DJs do,
+    // at the operator's own duck depth and with the same click-free ramp.
+    const target = level.music
+      * ((djSpeaking || adPreviewUrl) ? (1 - level.duck) : 1);
     music.node.gain.setTargetAtTime(target, music.context.currentTime, 0.12);
   }
   // The DJ-voice <audio> elements play directly (not through the mixer), so
@@ -47371,12 +49421,22 @@ async function djGuestVoicesFill(pick) {
   sel.textContent = "";
   const none = el("option", "", "— a voice picked for them —");
   none.value = ""; sel.appendChild(none);
-  voices.filter((v) => v.has_reference).forEach((v) => {
-    const o = el("option", "", "🧬 " + v.name);
-    o.value = v.id;
-    if (v.id === want) o.selected = true;
-    sel.appendChild(o);
-  });
+  // #746: sectioned by engine, through the shared helper, so the guest
+  // editor cannot drift away from the DJ chairs.
+  cloneGroups(voices.filter((v) => v.has_reference)
+    .map((v) => ({id: v.id, name: v.name,
+                  engine: v.engine_now || v.engine || "xtts"})))
+    .forEach(([label, rows]) => {
+      const grp = document.createElement("optgroup");
+      grp.label = label;
+      rows.forEach((v) => {
+        const o = el("option", "", (CLONE_MARK[v.engine] || "🧬 ") + v.name);
+        o.value = v.id;
+        if (v.id === want) o.selected = true;
+        grp.appendChild(o);
+      });
+      sel.appendChild(grp);
+    });
 }
 
 function djGuestVoiceName() {
@@ -47714,6 +49774,7 @@ async function rhetSphereBuild(host) {
 
   function tick() {
     frame = requestAnimationFrame(tick);
+    if (document.hidden || !renderer.domElement.offsetParent) return;  // #745
     tsec += 0.016;
     if (!dragging) { spinY += (0.003 - spinY) * 0.02;
                      spinX += (0.0006 - spinX) * 0.02; }
@@ -47932,6 +49993,7 @@ async function rhetVecBuild(host) {
   let pulse = 0;
   function tick() {
     frame = requestAnimationFrame(tick);
+    if (document.hidden || !renderer.domElement.offsetParent) return;  // #745
     if (!dragging) { spinY += (0.0018 - spinY) * 0.02;
                      spinX += (0.0004 - spinX) * 0.02; }
     group.rotation.y += spinY; group.rotation.x += spinX;
@@ -48583,12 +50645,24 @@ function djJumpLive() {
   if (liveId) {
     row = log.querySelector('[data-eid="' + CSS.escape(liveId) + '"]');
   }
-  if (!row && want) {
-    log.querySelectorAll("[data-said]").forEach((r) => {
-      if (!row && r.getAttribute("data-said") === want) row = r;
-    });
+  // #748: the row may not be DRAWN — the log keeps the newest 500 attached
+  // and the night can be longer than that. If the id is in the history but
+  // not on screen, put the whole night back and look again.
+  if (!row && liveId && djTalkById.has(liveId) && !djTalkShowAll) {
+    djTalkShowAll = true;
+    const btn = document.getElementById("djTalkAllBtn");
+    if (btn) btn.style.color = "#43d17c";
+    djTalkRepaint();
+    row = log.querySelector('[data-eid="' + CSS.escape(liveId) + '"]');
   }
   if (!row) row = log.querySelector(".booth-live");
+  if (!row && want) {
+    // #748: the LAST match, not the first — djTalkMarkLive takes the last,
+    // and the two disagreeing by hours on a repeated liner is exactly what
+    // "it doesn't jump to the message" looked like.
+    const all = log.querySelectorAll('[data-said="' + CSS.escape(want) + '"]');
+    row = all.length ? all[all.length - 1] : null;
+  }
   if (!row) {
     // Nothing is sounding — the honest answer is the newest line, and
     // saying so beats a click that appears to do nothing.
@@ -48598,8 +50672,14 @@ function djJumpLive() {
                   : "the booth has not said anything yet");
   }
   if (!row) return;
-  try { row.scrollIntoView({block: "center", behavior: "smooth"}); }
+  // #748: "auto", not "smooth". A smooth scroll runs for ~400ms, and a
+  // poll landing inside it used to detach the target mid-animation and
+  // leave the flash decorating a node no longer in the document.
+  try { row.scrollIntoView({block: "center"}); }
   catch (e) { row.scrollIntoView(); }
+  // …and ask the next render to put us back here, so a rebuild between now
+  // and then does not throw the view away again.
+  log._jumpTo = row.getAttribute("data-eid") || "";
   // A flash, so the eye lands on it even in a wall of identical rows.
   row.classList.add("booth-found");
   setTimeout(() => row.classList.remove("booth-found"), 1800);
@@ -48608,18 +50688,32 @@ function djJumpLive() {
 /* Put the pulsing outline on the line that is sounding, and take it off
  * everything else. Called when a clip starts and when one finishes, so the
  * mark moves with the audio rather than with the transcript. */
+let djTalkLiveRow = null;
 function djTalkMarkLive() {
   const log = document.getElementById("djTalkLog");
   if (!log) return;
   const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
   const liveId = (window.djSpeakingEid || "");
+  /* #745: this used to walk EVERY row of the night and write a class on
+   * each one, after every rebuild and on every clip start and stop. Only
+   * one row can be live, so only two rows ever need touching: the one that
+   * was marked, and the one that should be. */
   let found = null;
-  log.querySelectorAll("[data-said]").forEach((row) => {
-    const hit = (liveId && row.getAttribute("data-eid") === liveId)
-      || (want && row.getAttribute("data-said") === want);
-    row.classList.toggle("booth-live", !!hit);
-    if (hit) found = row;
-  });
+  if (liveId) {
+    found = log.querySelector('[data-eid="' + CSS.escape(liveId) + '"]');
+  }
+  if (!found && want) {
+    // #748: the LAST match, not the first. djJumpLive took the first and
+    // this took the last, so on a repeated liner the jump and the pulse
+    // pointed at rows hours apart.
+    const all = log.querySelectorAll('[data-said="' + CSS.escape(want) + '"]');
+    found = all.length ? all[all.length - 1] : null;
+  }
+  if (djTalkLiveRow && djTalkLiveRow !== found) {
+    djTalkLiveRow.classList.remove("booth-live");
+  }
+  djTalkLiveRow = found;
+  if (found) found.classList.add("booth-live");
   // Keep it in view — the point is to be able to find and judge the line
   // that is going out right now.
   if (found && !log._userScrolled) {
@@ -49358,10 +51452,21 @@ async function adStudioOpen() {
   voiceSel.appendChild(dfl);
   try {
     const got = await api("/api/voices");
-    (got.voices || []).filter((v) => v.has_reference).forEach((v) => {
-      const o = el("option", "", "🧬 " + v.name); o.value = v.id;
-      voiceSel.appendChild(o);
-    });
+    // #746: the ad studio gets the same two sections.
+    cloneGroups((got.voices || []).filter((v) => v.has_reference)
+      .map((v) => ({id: v.id, name: v.name,
+                    engine: v.engine_now || v.engine || "xtts"})))
+      .forEach(([label, rows]) => {
+        const grp = document.createElement("optgroup");
+        grp.label = label;
+        rows.forEach((v) => {
+          const o = el("option", "",
+                       (CLONE_MARK[v.engine] || "🧬 ") + v.name);
+          o.value = v.id;
+          grp.appendChild(o);
+        });
+        voiceSel.appendChild(grp);
+      });
   } catch (e) { /* the default voice still works */ }
   card.appendChild(voiceSel);
 
@@ -49445,6 +51550,24 @@ async function adStudioOpen() {
         const play = el("button", "", "▶");
         play.title = "Play it here in the studio";
         play.onclick = hear;
+        // #744: the download that was missing here. /api/dj/ads already
+        // mints the signed URL and a produced spot is always {id}.mp3.
+        if (a.url) {
+          const save = el("a", "", "⬇");
+          save.href = a.url;
+          save.download = ((a.product || "ad").replace(/[^\w -]+/g, "")
+            .slice(0, 48) || "ad") + ".mp3";
+          save.title = "Download this spot as an mp3";
+          save.style.cssText = "font-size:12px;color:#ffd479;"
+            + "text-decoration:none;padding:0 4px";
+          row.appendChild(save);
+          const duck = el("button", "", "🎧");
+          duck.title = "Preview it with the station ducked underneath";
+          duck.onclick = (ev) => {
+            ev.stopPropagation(); adPreviewPlay(a.url, duck);
+          };
+          row.appendChild(duck);
+        }
         const air = el("button", "", "📻");
         air.title = "Run it on air now";
         air.onclick = async () => {
@@ -50923,12 +53046,23 @@ function dlBar(kind) {
  * plays (and the mute switch is on), the live show in this page is HELD — the
  * music pauses, the talking pauses, new lines queue instead of playing — and
  * everything resumes the moment the recording stops. */
-function cacheHoldStart() {
+let cacheHoldMode = "pause";
+function cacheHoldStart(mode) {
   try { if (typeof voice !== "undefined" && voice) voice.pause(); } catch (e) {}
-  if (localStorage.cacheMuteLive === "0") return;
+  // #744: "duck" holds the TALK but leaves the record turning, quieter —
+  // which is what previewing an ad over a live show should sound like.
+  // Pressing the preview button is the consent, so it does not consult the
+  // cache modal's mute switch the way a recording playback does.
+  if (mode === "duck") {
+    cacheHoldMode = "duck";
+  } else if (localStorage.cacheMuteLive === "0") {
+    return;
+  }
   window.cacheHold = true;
   const mp = document.getElementById("musicPlayer");
-  if (mp && !mp.paused) { mp.pause(); window.cacheResume = true; }
+  if (cacheHoldMode !== "duck" && mp && !mp.paused) {
+    mp.pause(); window.cacheResume = true;
+  }
   djVoiceEls.forEach((a) => {
     if (a && a.src && !a.paused) { a.pause(); a.dataset.held = "1"; }
   });
@@ -50939,8 +53073,12 @@ function cacheHoldEnd() {
     return m && Array.from(m.querySelectorAll("audio"))
       .some((a) => !a.paused && !a.ended);
   });
+  // #744: an ad preview is a hold too. Without this, pausing a recording in
+  // the cache modal would release the preview's hold mid-preview.
+  if (adPreviewAudio && !adPreviewAudio.paused) return;
   if (busy || !window.cacheHold) return;
   window.cacheHold = false;
+  cacheHoldMode = "pause";
   djVoiceEls.forEach((a) => {
     if (a && a.dataset.held) {
       delete a.dataset.held;
@@ -51561,7 +53699,12 @@ async function callRecordings() {
         audio.volume = 1.0; audio.muted = false;
         audio.src = a.audio;
         audio.style.cssText = "width:100%;height:34px;margin-top:5px";
-        cacheAudioHook(audio);
+        // #744: the desk player DUCKS the live show now instead of stopping
+        // it — you are auditioning a spot against the station, which is the
+        // thing you actually need to hear.
+        audio.onplay = () => { cacheHoldStart("duck"); djApplyGain(); };
+        audio.onpause = () => setTimeout(cacheHoldEnd, 150);
+        audio.onended = () => setTimeout(cacheHoldEnd, 150);
         row.appendChild(audio);
       }
       // The transcript, editable in place — this IS the re-render input.
@@ -51662,13 +53805,220 @@ async function callRecordings() {
     });
   }
 
+  /* ---- Pages from upstairs (#749) -------------------------------------
+   *
+   * "Every upstair message that's sent down to the DJs I want stored so
+   * that I'm able to basically download these and proofread them and modify
+   * them and give insights on them in order to make the system better
+   * through the same panel where I download the cache of transmissions."
+   * This is that panel. */
+  async function renderUpstairs() {
+    list.innerHTML = "";
+    const why = el("div", "muted",
+      "The manager upstairs pages the booth on his own clock — one of the "
+      + "station's own cloned voices with a vocoder over it, played on air, "
+      + "and then the pair have to deal with it live. Every page is kept "
+      + "here with the thing that was happening downstairs when it was "
+      + "written, so you can read WHY he said it. Change the words and "
+      + "re-cut it, send one down now, or take the whole book away.");
+    why.style.cssText = "font-size:11px;line-height:1.55;margin-bottom:10px";
+    list.appendChild(why);
+
+    let d = {pages: [], per_hour: 3};
+    try { d = await api("/api/upstairs"); }
+    catch (e) { list.appendChild(el("div", "muted", e.message)); return; }
+
+    const bar = el("div", "", "");
+    bar.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+      + "padding:8px 10px;margin-bottom:12px";
+    const rate = el("div", "", "");
+    rate.style.cssText = "display:flex;align-items:center;gap:9px;"
+      + "font-size:11.5px;flex-wrap:wrap";
+    rate.appendChild(el("span", "muted", "📟 how often he pages"));
+    const slide = el("input", "", "");
+    slide.type = "range"; slide.min = "0"; slide.max = "12"; slide.step = "0.5";
+    slide.value = String(d.per_hour != null ? d.per_hour : 3);
+    slide.style.cssText = "flex:1;min-width:130px";
+    const out = el("span", "", "");
+    out.style.cssText = "font-size:11px;color:var(--accent);min-width:120px";
+    const say = () => {
+      const v = Number(slide.value);
+      out.textContent = v ? "about " + v + " an hour"
+                          : "the intercom stays quiet";
+    };
+    say();
+    slide.oninput = say;
+    slide.onchange = async () => {
+      try {
+        const st = await api("/api/settings");
+        if (st.voice_out) delete st.voice_out.ha_token;
+        st.dj = Object.assign({}, st.dj,
+                              {upstairs_per_hour: Number(slide.value)});
+        await api("/api/settings", {method: "PUT",
+                                    body: JSON.stringify(st)});
+        setStatus("upstairs pages the booth " + out.textContent);
+      } catch (e) { setStatus(e.message, true); }
+    };
+    rate.appendChild(slide); rate.appendChild(out);
+    bar.appendChild(rate);
+    const acts = el("div", "row", "");
+    acts.style.cssText = "gap:6px;margin-top:8px;flex-wrap:wrap";
+    const note = el("div", "muted", "");
+    note.style.cssText = "font-size:11px;margin-top:6px;min-height:15px";
+    const now = el("button", "primary", "📟 Page them now");
+    now.onclick = async () => {
+      const done = pending(now, "◐ writing…");
+      note.textContent = "he is writing one against what is on air…";
+      try {
+        const row = await api("/api/dj/upstairs", {method: "POST",
+          body: JSON.stringify({air: true})});
+        note.textContent = "going down: " + (row.gripe || "");
+        setTimeout(render, 1200);
+      } catch (e) { note.textContent = e.message; }
+      finally { done(); }
+    };
+    acts.appendChild(now);
+    const book = el("button", "", "📄 the whole book of pages");
+    book.onclick = async () => {
+      const done = pending(book, "…");
+      try {
+        const r = await fetch("/api/upstairs/archive.md",
+          {headers: {"Authorization": "Bearer " + key()}});
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const url = URL.createObjectURL(await r.blob());
+        const a = document.createElement("a");
+        a.href = url; a.download = "pinebox-upstairs.md";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 15000);
+        note.textContent = "the book is saved";
+      } catch (e) { note.textContent = e.message; }
+      finally { done(); }
+    };
+    acts.appendChild(book);
+    bar.appendChild(acts); bar.appendChild(note);
+    list.appendChild(bar);
+
+    const h = el("div", "", "📟 The pages — " + (d.pages || []).length);
+    h.style.cssText = "font-weight:700;margin:4px 0 6px";
+    list.appendChild(h);
+    if (!(d.pages || []).length) {
+      const m = el("div", "muted", "Nothing yet — he pages on his own clock "
+        + "once the station is on air, or press the button above.");
+      m.style.cssText = "font-size:11px";
+      list.appendChild(m);
+      return;
+    }
+    (d.pages || []).forEach((row) => {
+      const item = el("div", "", "");
+      item.style.cssText = "padding:8px 0;border-top:1px solid var(--border)";
+      const title = el("div", "", "");
+      title.innerHTML = "<b>" + callerDossierEsc(row.gripe || "a page")
+        + "</b> <span class='muted' style='font-size:11px'>· "
+        + (row.ts ? new Date(row.ts * 1000).toLocaleString() : "")
+        + " · " + (row.words || 0) + " words · played "
+        + (row.uses || 0) + "×"
+        + (row.vocode ? " · " + callerDossierEsc(row.vocode) : "")
+        + "</span>";
+      item.appendChild(title);
+      if (row.context) {
+        const ctx = el("div", "muted", "written against: " + row.context);
+        ctx.style.cssText = "font-size:10.5px;margin:2px 0 4px;opacity:.8";
+        item.appendChild(ctx);
+      }
+      if (row.audio_url) {
+        const audio = document.createElement("audio");
+        audio.controls = true; audio.preload = "metadata";
+        audio.src = row.audio_url;
+        audio.style.cssText = "width:100%;height:34px;margin-top:4px";
+        audio.onplay = () => { cacheHoldStart("duck"); djApplyGain(); };
+        audio.onpause = () => setTimeout(cacheHoldEnd, 150);
+        audio.onended = () => setTimeout(cacheHoldEnd, 150);
+        item.appendChild(audio);
+      }
+      const words = el("textarea", "", "");
+      words.value = row.text || "";
+      words.style.cssText = "width:100%;min-height:72px;font-size:11.5px;"
+        + "margin-top:5px";
+      words.title = "What he said. Change it and re-cut the page from it.";
+      item.appendChild(words);
+      const ia = el("div", "row", "");
+      ia.style.cssText = "gap:5px;margin-top:5px;flex-wrap:wrap;"
+        + "align-items:center";
+      const inote = el("span", "muted", "");
+      inote.style.cssText = "font-size:10.5px";
+      const save = el("button", "", "💾 Save the words");
+      save.style.cssText = "font-size:11px;padding:2px 8px";
+      save.onclick = async () => {
+        const done = pending(save, "…");
+        try {
+          await api("/api/dj/upstairs", {method: "POST", body: JSON.stringify(
+            {id: row.id, text: words.value, gripe: row.gripe || ""})});
+          inote.textContent = "saved ✓ (the audio is still the old cut)";
+        } catch (e) { inote.textContent = e.message; }
+        finally { done(); }
+      };
+      ia.appendChild(save);
+      const recut = el("button", "primary", "🎚 Re-cut it");
+      recut.style.cssText = "font-size:11px;padding:2px 8px";
+      recut.onclick = async () => {
+        const done = pending(recut, "⏳…");
+        inote.textContent = "voice, vocoder, tannoy…";
+        try {
+          await api("/api/dj/upstairs/" + row.id + "/recut", {method: "POST",
+            body: JSON.stringify({text: words.value})});
+          inote.textContent = "re-cut ✓";
+          setTimeout(render, 500);
+        } catch (e) { inote.textContent = e.message; }
+        finally { done(); }
+      };
+      ia.appendChild(recut);
+      const send = el("button", "", "📟 Send it down now");
+      send.style.cssText = "font-size:11px;padding:2px 8px";
+      send.onclick = async () => {
+        const done = pending(send, "…");
+        try {
+          await api("/api/dj/upstairs/" + row.id + "/play", {method: "POST"});
+          inote.textContent = "paging the booth";
+        } catch (e) { inote.textContent = e.message; }
+        finally { done(); }
+      };
+      ia.appendChild(send);
+      if (row.audio_url) {
+        const dl = el("a", "", "⬇ mp3");
+        dl.href = row.audio_url;
+        dl.download = ((row.gripe || "page").replace(/[^\w -]+/g, "")
+          .slice(0, 48) || "page") + ".mp3";
+        dl.style.cssText = "font-size:11px;color:var(--accent)";
+        ia.appendChild(dl);
+      }
+      const bin = el("button", "danger", "🗑");
+      bin.style.cssText = "font-size:11px;padding:2px 8px";
+      bin.onclick = async () => {
+        if (!confirm("Delete this page for good?")) return;
+        try {
+          await api("/api/dj/upstairs/" + row.id, {method: "DELETE"});
+          item.style.opacity = ".35";
+          item.style.textDecoration = "line-through";
+        } catch (e) { inote.textContent = e.message; }
+      };
+      ia.appendChild(bin);
+      ia.appendChild(inote);
+      item.appendChild(ia);
+      list.appendChild(item);
+    });
+  }
+
   async function render() {
     list.innerHTML = ""; list.className = "";
     tabs.innerHTML = "";
     tabs.appendChild(mkTab("🎙 Talk / SFX", "talk"));
     tabs.appendChild(mkTab("🎚 Broadcast (full mix)", "mix"));
     tabs.appendChild(mkTab("📣 Ads", "ads"));
+    tabs.appendChild(mkTab("📟 Upstairs", "upstairs"));
     if ((localStorage.cacheTab || "talk") === "ads") { renderAds(); return; }
+    if ((localStorage.cacheTab || "talk") === "upstairs") {
+      renderUpstairs(); return;
+    }
     if ((localStorage.cacheTab || "talk") === "mix") { renderMix(); return; }
     let eps = {episodes: [], recording: {}}, calls = {calls: []};
     try { eps = await api("/api/radio-cache/episodes"); } catch (e) {}
@@ -53210,6 +55560,12 @@ function djGraphPanel() {
   function tick() {
     if (!alive) return;
     raf = requestAnimationFrame(tick);
+    // #745: costs nothing while it cannot be seen.
+    if (document.hidden || !renderer.domElement.offsetParent) return;
+    // #745: the Mind is opened inline whenever the station is on air, so
+    // this WebGL scene was rendering all night whether or not it was on
+    // screen. Reschedule, then bail — it picks straight back up.
+    if (document.hidden || !renderer.domElement.offsetParent) return;
     const dt = Math.min(0.05, clock.getDelta());
     frame += 1;
     if (!dragging) yaw += dt * 0.05;      // a slow drift when left alone
@@ -56209,9 +58565,13 @@ function layoutHandles() {
 async function loadCloneVoices() {
   try {
     const got = await api("/api/voices");
+    // #746: keep the ENGINE. This map threw it away, which is the whole
+    // reason every picker could only print one hardcoded heading — the
+    // page literally did not know which engine a clone belonged to.
     window.pineCloneVoices = (got.voices || [])
       .filter((voice) => voice.has_reference)
-      .map((voice) => ({id: voice.id, name: voice.name}));
+      .map((voice) => ({id: voice.id, name: voice.name,
+                        engine: voice.engine_now || voice.engine || "xtts"}));
   } catch (error) {
     window.pineCloneVoices = window.pineCloneVoices || [];
   }
@@ -58495,6 +60855,39 @@ function studioVoicesDraw() {
     };
     row.appendChild(name);
     row.appendChild(el("span", "vkind vkind-" + voice.kind, voice.kind));
+    // #746: the engine, as a badge you can click to move the voice between
+    // the two cloning engines. This is the control that actually fills the
+    // F5 section — every voice in the library was created hardcoded to
+    // XTTS, so without a way to say otherwise the section is a promise
+    // with nothing behind it.
+    if (voice.has_reference) {
+      const eng = String(voice.engine_now || voice.engine || "xtts");
+      const chip = el("span", "vkind vkind-" + eng, eng.toUpperCase());
+      chip.style.cursor = "pointer";
+      chip.title = "Rendered on " + eng.toUpperCase()
+        + (String(voice.engine || "xtts") !== eng
+           ? " — the station is forced onto " + eng.toUpperCase()
+             + " tonight, so this overrides the voice's own setting"
+           : "") + ". Click to move it to the other cloning engine.";
+      chip.onclick = async (ev) => {
+        ev.stopPropagation();
+        const next = eng === "f5" ? "xtts" : "f5";
+        chip.textContent = "…";
+        try {
+          await api("/api/voices/" + encodeURIComponent(voice.id),
+                    {method: "PUT", body: JSON.stringify({engine: next})});
+          await loadCloneVoices();
+          await studioLoad();
+          studioVoicesDraw();
+          setStatus(voice.name + " renders on " + next.toUpperCase()
+                    + " from now on");
+        } catch (e) {
+          chip.textContent = eng.toUpperCase();
+          setStatus(e.message, true);
+        }
+      };
+      row.appendChild(chip);
+    }
     // #699: whether this voice has actually been ON AIR, and how long ago.
     // A voice you imported and never heard used to be indistinguishable
     // from one carrying half the callers.
