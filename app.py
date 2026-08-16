@@ -410,6 +410,12 @@ DEFAULT_DJ = {
     # the default: a real line's texture, never a wall of noise — loud,
     # clear, still unmistakably a phone.
     "caller_static": 5,
+    # #756: the whole station's delivery speed, as a multiplier. A clone
+    # renders at whatever tempo its reference had, and several of them came
+    # out noticeably slower than the source; 1.2 is the "20% faster" the
+    # request asks for, and it is a dial rather than a constant because the
+    # right answer differs per library.
+    "voice_speed": 1.0,
     # #750: how often a call turns on the pair — the sympathy taken as pity,
     # the outburst, the co-host trying to defuse it and being rounded on,
     # and then everyone friends again. 0 keeps the phone civil.
@@ -917,6 +923,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         # not written here is silently dropped on every save, which is
         # exactly why manager_name and host_name have been dead keys. A
         # slider whose value never survives is worse than no slider.
+        "voice_speed": max(0.6, min(1.6, float(
+            raw_dj.get("voice_speed", DEFAULT_DJ["voice_speed"]) or 1.0))),
         "hostile_rate": max(0.0, min(1.0, float(
             raw_dj.get("hostile_rate", DEFAULT_DJ["hostile_rate"]) or 0))),
         "name_remark_rate": max(0.0, min(1.0, float(
@@ -5677,6 +5685,12 @@ def voice_save(meta: dict[str, Any], reference: bytes | None = None,
                     ("clone", "simulacrum", "preset") else "clone",
             "engine": meta.get("engine") if meta.get("engine") in
                       VOICE_ENGINES else "xtts",
+            # #756: this voice's own speed and pitch trim. A clone inherits
+            # the tempo of the reference it was cut from, so "too slow
+            # compared to the source" is a per-VOICE fact and belongs on
+            # the voice, not on a station-wide dial.
+            "speed": max(0.6, min(1.6, float(meta.get("speed") or 1.0))),
+            "pitch": max(-6.0, min(6.0, float(meta.get("pitch") or 0.0))),
             "source": meta.get("source") or {"type": "imported"},
             "internalized": bool(meta.get("internalized")),
             "created": int(meta.get("created") or time.time()),
@@ -7677,9 +7691,23 @@ def performance_vector(who: str, voice: str = "") -> dict[str, float]:
     Identity (or near it) comes back as {} so the plain path stays exactly
     the plain path — most lines cost one dict compare."""
     dj = dj_settings()
+    # #756: the speed and pitch trims are NOT part of the performance layer
+    # and must survive it being switched off — "this clone renders slower
+    # than its source" is a correction, not a performance. Computed first
+    # and returned even from the plain path.
+    trim: dict[str, float] = {}
+    speed = float(dj.get("voice_speed") or 1.0)
+    if voice:
+        vmeta = voice_meta(voice) or {}
+        speed *= float(vmeta.get("speed") or 1.0)
+        if float(vmeta.get("pitch") or 0):
+            trim["pitch_trim"] = float(vmeta["pitch"])
+    if abs(speed - 1.0) > 0.01:
+        trim["speed_trim"] = speed
     if not dj["perf"] or dj["perf_strength"] <= 0.01:
-        return {}
+        return dict(_PERF_IDENTITY, **trim) if trim else {}
     vec = dict(_PERF_IDENTITY)
+    vec.update(trim)
     sig = voice_signature(voice) if voice else None
     if sig:
         sig = _compose_signature(sig, voice_style(voice) or {})
@@ -7738,10 +7766,14 @@ def performance_vector(who: str, voice: str = "") -> dict[str, float]:
     for key in ("filler", "restart", "repeat", "cutoff"):
         vec[key] = max(0.0, min(0.9,
                                 vec[key] * dj["disfluency_rate"] / 0.3))
-    if not macro and all(abs(vec[key] - _PERF_IDENTITY[key]) < 0.03
-                         for key in _PERF_IDENTITY):
+    if not macro and not trim             and all(abs(vec[key] - _PERF_IDENTITY[key]) < 0.03
+                    for key in _PERF_IDENTITY):
         return {}
     out = {key: round(vec[key], 3) for key in _PERF_IDENTITY}
+    # #756: the trims ride OUT as well as in. They are not part of the
+    # performance and the identity rebuild above would otherwise drop them
+    # on the floor, which is the whole feature quietly doing nothing.
+    out.update({k: round(v, 3) for k, v in trim.items()})
     if macro:
         out["_macro"] = macro           # the directive names the mood
     return out
@@ -15740,12 +15772,20 @@ STRIP_CHAINS: dict[str, str] = {
 def perf_dsp_chain(vec: dict[str, Any], rate: int) -> str:
     """The performance vector as one -af chain: atempo for pace, the
     existing pitch trick for pitch, volume + a compressor for energy.
-    Identity comes back "" — most lines never touch ffmpeg for this."""
+    Identity comes back "" — most lines never touch ffmpeg for this.
+
+    #756: the pace here is the performance's, multiplied by the station's
+    own speed dial and by this voice's own trim, so a clone that renders
+    slower than its source can be brought back in line without dragging
+    every other voice with it. The ceiling is raised to 1.6 because 1.3 was
+    below where a 20% station-wide lift plus an emphatic delivery lands."""
     parts: list[str] = []
-    pace = max(0.8, min(1.3, float(vec.get("pace") or 1.0)))
+    pace = max(0.6, min(1.6, float(vec.get("pace") or 1.0)
+                        * float(vec.get("speed_trim") or 1.0)))
     if abs(pace - 1.0) > 0.02:
         parts.append(f"atempo={pace:.3f}")
-    st = int(round(float(vec.get("pitch_st") or 0)))
+    st = int(round(float(vec.get("pitch_st") or 0)
+                   + float(vec.get("pitch_trim") or 0)))     # #756
     if st:
         parts.append(_pitch_chain(st, rate))
     energy = float(vec.get("energy") or 0.0)
@@ -19201,6 +19241,41 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
             f"they have won two tickets to see {act} live at the Pine Box "
             "Arena on the edge of town, and the pair make far too much of "
             "it. The caller reacts entirely in character.")
+    # #754: what they WIN, and how they take it. The paintings that did not
+    # sell (#719) are stacked against the desk and the station would dearly
+    # like them gone, so half the time the prize is one of those — and
+    # whether the caller is thrilled or crushed is a coin, not a mood that
+    # follows from the prize being good.
+    if random.random() < 0.22:
+        _pile = hawk_unsold()
+        _piece = _pile[-1] if _pile else None
+        _prize = ("one of the PAINTINGS off the station wall — the one "
+                  "nobody bought"
+                  + (f", which looks like this: \"{str(_piece.get('desc'))[:180]}\""
+                     if _piece and _piece.get("desc") else "")
+                  ) if (_piece and random.random() < 0.6) else random.choice((
+            "the station's second-best microphone",
+            "a year of the station's coffee, which has been cancelled",
+            "a tour of the building, conducted by whoever is free",
+            "the pick of whatever is in the prize cupboard, sight unseen",
+            "a signed photograph of the two of them, unsigned as yet"))
+        _joy = random.random() < 0.5
+        extras.append(
+            f"MID-CALL {caller['name']} WINS SOMETHING: {_prize}. The pair "
+            "announce it with far too much ceremony. "
+            + ("The caller is OVER THE MOON — genuinely, disproportionately "
+               "delighted, they cannot believe it, they get emotional about "
+               "it, they want to know when they can collect it and whether "
+               "they can bring somebody. The hosts are moved and slightly "
+               "embarrassed by how much it means."
+               if _joy else
+               "The caller is MAJORLY DISAPPOINTED — they were hoping for "
+               "something else entirely and they say so, flatly, without "
+               "softening it. They ask whether they can swap it, or decline "
+               "it outright. The pair defend the prize far past the point of "
+               "dignity and take the rejection personally.")
+            + " Play it out properly; the prize is not the joke, the "
+            "reaction is.")
     # Callers read the news too (#317): now and then one arrives with a
     # headline and makes the hosts deal with it.
     if random.random() < 0.3:
@@ -24324,6 +24399,13 @@ async def voices_update(
     want = str(payload.get("engine") or "").strip().lower()
     if want in ("xtts", "f5"):
         meta["engine"] = want
+    # #756: this voice's own speed and pitch trim.
+    for key, lo, hi in (("speed", 0.6, 1.6), ("pitch", -6.0, 6.0)):
+        if payload.get(key) is not None:
+            try:
+                meta[key] = max(lo, min(hi, float(payload[key])))
+            except (TypeError, ValueError):
+                pass
     style = payload.get("style") if isinstance(payload.get("style"), dict) \
         else None
     saved = voice_save(meta, style=style)
@@ -44873,6 +44955,21 @@ function djTalkRender(state) {
   // seconds — which is most of what "not synced when I try to sync with it"
   // felt like.
   const keepTop = log.scrollTop;
+  /* #755: THE LOG ELEMENT CAN BE REPLACED UNDER US.
+   *
+   * djTalkClose removes the whole popup, and the next line of talk builds a
+   * fresh one — with a brand new, empty log. The painted cursor is module
+   * state, so it still said "everything up to line 900 is already drawn"
+   * and the append loop had nothing to do: the booth came back showing its
+   * glass, its room chips and no dialogue at all. The cursor belongs to the
+   * ELEMENT, so a new element starts over with it. The second test is a
+   * self-heal for anything else that empties the log without telling us. */
+  const rowCount = Math.max(0, log.children.length - 2);
+  if (!log._painted || (lines.length && !rowCount && djTalkPainted)) {
+    log._painted = true;
+    djTalkRows.clear();
+    djTalkPainted = 0;
+  }
   /* #745: the header blocks are PERSISTENT nodes now, rebuilt only when
    * their content actually changes — the boothSellSeen/room.dataset.key
    * pattern this file already uses. They used to be torn down and rebuilt
@@ -60887,6 +60984,50 @@ function studioVoicesDraw() {
         }
       };
       row.appendChild(chip);
+      // #756: this voice's own speed and pitch, because "too slow compared
+      // to the source" is a fact about ONE clone — it inherits the tempo of
+      // whatever reference it was cut from — and dragging the whole station
+      // to fix one voice makes every other voice wrong.
+      const trims = el("span", "", "");
+      trims.style.cssText = "display:inline-flex;gap:6px;align-items:center;"
+        + "margin-left:6px";
+      [["speed", "\u23e9", 0.6, 1.6, 0.05, Number(voice.speed || 1),
+        "speed \u2014 1.0 is the clone as rendered"],
+       ["pitch", "\u266a", -6, 6, 1, Number(voice.pitch || 0),
+        "pitch, in semitones"]].forEach(([field, mark, lo, hi, step, val,
+                                          tip]) => {
+        const box = el("span", "muted", "");
+        box.style.cssText = "font-size:10px;display:inline-flex;gap:3px;"
+          + "align-items:center";
+        const inp = el("input", "", "");
+        inp.type = "range";
+        inp.min = String(lo); inp.max = String(hi); inp.step = String(step);
+        inp.value = String(val);
+        inp.title = tip;
+        inp.style.cssText = "width:66px";
+        const out = el("span", "", "");
+        out.style.cssText = "min-width:30px;text-align:right";
+        const paint = () => {
+          out.textContent = field === "pitch"
+            ? (Number(inp.value) > 0 ? "+" : "") + Number(inp.value)
+            : Number(inp.value).toFixed(2) + "x";
+        };
+        paint();
+        inp.oninput = paint;
+        inp.onchange = async () => {
+          try {
+            const body = {};
+            body[field] = Number(inp.value);
+            await api("/api/voices/" + encodeURIComponent(voice.id),
+                      {method: "PUT", body: JSON.stringify(body)});
+            setStatus(voice.name + " " + field + " " + out.textContent);
+          } catch (e) { setStatus(e.message, true); }
+        };
+        box.appendChild(el("span", "", mark));
+        box.appendChild(inp); box.appendChild(out);
+        trims.appendChild(box);
+      });
+      row.appendChild(trims);
     }
     // #699: whether this voice has actually been ON AIR, and how long ago.
     // A voice you imported and never heard used to be indistinguishable
