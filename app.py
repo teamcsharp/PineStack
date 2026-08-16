@@ -517,6 +517,21 @@ DEFAULT_DJ = {
     # The same for the phone line: each caller draws their own intensity
     # rather than every caller arriving at the same temperature.
     "dice_callers": False,
+    # #no-repeats: the hour. How long a run of words is off the air after it is
+    # said — station-wide, and then longer for the SPEAKER who said it, which
+    # is the per-character cooldown. 0 on both switches the engine off.
+    "phrase_cooldown_minutes": 60,
+    "phrase_cooldown_self_minutes": 120,
+    # How long a run has to be before it counts as a phrasing rather than a
+    # coincidence. Five words is the measured tell.
+    "phrase_ngram": 5,
+    # How many times a repeating round is sent back to the model to be said
+    # another way before its lines are replaced from the documents.
+    "phrase_retries": 1,
+    # What happens when a line is held back: swapped for a passage off the
+    # speakbox shelf, or simply dropped. Swapping is the point — a gate that
+    # only drops pays for repetition in dead air.
+    "phrase_swap_from_speakbox": True,
     # Broadcast channel strips per role — a named chain out of STRIP_CHAINS,
     # "" is dry. Applied LAST, after the voice and its room: the channel
     # colours the performance, never replaces it (§38). The caller's phone
@@ -740,6 +755,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
             {
                 "name": name[:100],
                 "prompt": prompt[:20000],
+                # #780: "group / ungroup". A shelf of forty prompts with no
+                # shelves in it is a list you scroll. An empty group is
+                # ungrouped, which is what every existing prompt reads as.
+                "group": str(item.get("group") or "").strip()[:60],
             }
         )
 
@@ -1025,6 +1044,22 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("clone_caller_pct", 70) or 0))),
         "ad_bed_pct": max(2, min(100, int(                          # #700
             raw_dj.get("ad_bed_pct", 30) or 30))),
+        # #no-repeats: the phrase cooldown. This dict is a WHOLESALE REBUILD — a key
+        # that is not written here is silently dropped on the next save — so
+        # every knob the engine reads has to be listed.
+        "phrase_cooldown_minutes": max(0, min(1440, int(
+            raw_dj.get("phrase_cooldown_minutes",
+                       DEFAULT_DJ["phrase_cooldown_minutes"]) or 0))),
+        "phrase_cooldown_self_minutes": max(0, min(2880, int(
+            raw_dj.get("phrase_cooldown_self_minutes",
+                       DEFAULT_DJ["phrase_cooldown_self_minutes"]) or 0))),
+        "phrase_ngram": max(3, min(8, int(
+            raw_dj.get("phrase_ngram", DEFAULT_DJ["phrase_ngram"]) or 5))),
+        "phrase_retries": max(0, min(3, int(
+            raw_dj.get("phrase_retries",
+                       DEFAULT_DJ["phrase_retries"]) or 0))),
+        "phrase_swap_from_speakbox": bool(
+            raw_dj.get("phrase_swap_from_speakbox", True)),
     }
     # The default personas hard-code the station name ("…on Pine Box FM…"), so a
     # renamed station left the DJs still saying the OLD name from the persona
@@ -7371,14 +7406,62 @@ _DWELL_CACHE: dict[str, Any] = {"at": 0.0, "subjects": []}
 _RECENT_SPOKEN: list[str] = []
 
 
+def said_rows() -> list[dict[str, Any]]:
+    """The ring, whatever shape it is on disk.
+
+    #no-repeats: rows carry the moment they were said now, because "not repeated for
+    an hour" cannot be answered by a ring of bare strings. Older files hold
+    plain strings and are read as timestamp 0 — undated, never inside any
+    window, still perfectly good for phrase mining."""
+    try:
+        rows = json.loads(SAID_LINES_PATH.read_text())
+    except Exception:
+        return []
+    if not isinstance(rows, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        if isinstance(row, dict) and row.get("t"):
+            out.append({"t": str(row["t"])[:300], "at": int(row.get("at") or 0)})
+        elif isinstance(row, str) and row:
+            out.append({"t": row[:300], "at": 0})
+    return out
+
+
+def said_texts(most: int = 400) -> list[str]:
+    return [r["t"] for r in said_rows()[-max(1, most):]]
+
+
+def said_recent(window: float = 3600.0, most: int = 36,
+                chars: int = 90) -> list[str]:
+    """What has actually been said on air inside the window, newest first.
+
+    #no-repeats: this is the operator's request stated plainly — the model was never
+    shown the sentences it had just said, only detached word-runs and eight
+    truncated chat rows, so it had no way to avoid repeating a whole line
+    from twenty minutes ago."""
+    now = time.time()
+    out: list[str] = []
+    seen: set[str] = set()
+    for row in reversed(said_rows()):
+        at = int(row.get("at") or 0)
+        if not at or now - at > window:
+            continue
+        text = " ".join(str(row.get("t") or "").split())[:chars]
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        out.append(text)
+        if len(out) >= most:
+            break
+    return out
+
+
 def said_remember(text: str) -> None:
     with _SAID_LOCK:
-        try:
-            rows = json.loads(SAID_LINES_PATH.read_text())
-            rows = rows if isinstance(rows, list) else []
-        except Exception:
-            rows = []
-        rows.append(str(text)[:300])
+        rows = said_rows()
+        rows.append({"t": str(text)[:300], "at": int(time.time())})
         try:
             SAID_LINES_PATH.parent.mkdir(parents=True, exist_ok=True)
             SAID_LINES_PATH.write_text(json.dumps(rows[-400:], indent=0))
@@ -7391,13 +7474,8 @@ def said_forget(text: str) -> None:
     really said, so it must not seed the do-not-repeat list either."""
     key = str(text)[:300]
     with _SAID_LOCK:
-        try:
-            rows = json.loads(SAID_LINES_PATH.read_text())
-        except Exception:
-            return
-        if not isinstance(rows, list):
-            return
-        kept = [r for r in rows if r != key]
+        rows = said_rows()
+        kept = [r for r in rows if r["t"] != key]
         if len(kept) != len(rows):
             try:
                 SAID_LINES_PATH.write_text(json.dumps(kept[-400:], indent=0))
@@ -7413,11 +7491,7 @@ def overused_phrases(most: int = 16) -> list[str]:
     if time.time() - _PHRASE_CACHE["at"] < 60:
         return _PHRASE_CACHE["phrases"]
     counts: dict[str, int] = {}
-    try:
-        rows = json.loads(SAID_LINES_PATH.read_text())
-    except Exception:
-        rows = []
-    for line in rows[-300:] if isinstance(rows, list) else []:
+    for line in said_texts(300):
         words = re.findall(r"[a-z']+", str(line).lower())
         for span in (4, 3):             # longer runs first — the real tells
             for i in range(len(words) - span + 1):
@@ -7425,10 +7499,24 @@ def overused_phrases(most: int = 16) -> list[str]:
                 counts[shingle] = counts.get(shingle, 0) + 1
     boring = {"a", "the", "and", "to", "of", "in", "is", "it", "you",
               "that", "this", "on", "for", "i", "we"}
-    phrases = [p for p, n in sorted(counts.items(),
-                                    key=lambda kv: (-len(kv[0].split()),
-                                                    -kv[1]))
-               if n >= 2 and not all(w in boring for w in p.split())][:most]
+    # #no-repeats: by COUNT first. Sorting by LENGTH first spent all sixteen slots on
+    # four-word runs before frequency was ever consulted, so a three-word tic
+    # used thirty times could not reach the prompt while a four-gram seen
+    # twice always did.
+    mined = [p for p, n in sorted(counts.items(),
+                                  key=lambda kv: (-kv[1],
+                                                  -len(kv[0].split())))
+             if n >= 2 and not all(w in boring for w in p.split())]
+    # #no-repeats: led by the runs the air-time cooldown is actually holding, so the
+    # prompt's do-not-use list and the gate that enforces it are one set of
+    # words rather than two that disagree.
+    phrases = phrase_hot(max(4, most // 2))
+    for one in mined:
+        if len(phrases) >= most:
+            break
+        if one not in phrases:
+            phrases.append(one)
+    phrases = phrases[:most]
     _PHRASE_CACHE.update({"at": time.time(), "phrases": phrases})
     return phrases
 
@@ -7441,11 +7529,7 @@ def overdwelt_subjects(most: int = 4) -> list[str]:
     ranty line does not flag its own words. Cached a minute."""
     if time.time() - _DWELL_CACHE["at"] < 25:
         return _DWELL_CACHE["subjects"]
-    try:
-        rows = json.loads(SAID_LINES_PATH.read_text())
-    except Exception:
-        rows = []
-    rows = rows[-30:] if isinstance(rows, list) else []
+    rows = said_texts(30)
     # The pair's own names and the station recur by nature — never flag them.
     dj = dj_settings()
     exempt = {w.lower() for field in ("station_name", "cohost_name",
@@ -7574,6 +7658,27 @@ def avoid_reruns() -> str:
         out += ("\nYou have been leaning on these exact phrasings lately — "
                 "NEVER use any of them again, find fresh ways to say it: "
                 + "; ".join(f'"{p}"' for p in phrases))
+    # #no-repeats: THE missing half. Everything above hands the model detached
+    # word-runs and capitalised subjects; nothing ever handed it the
+    # SENTENCES it just said, so a whole line from twenty minutes ago was
+    # invisible to it in every form and it repeated it in good faith. The
+    # gate at air time then dropped that line and the round got thinner.
+    # Show it the hour, and there is nothing to drop.
+    recent = said_recent(float(phrase_setup()["station"] or 3600))
+    if recent:
+        out += ("\nALREADY SAID ON AIR IN THE LAST HOUR — you may not say "
+                "any of these again, and you may not restate them in other "
+                "words. Say something new instead:\n- "
+                + "\n- ".join(recent[:36]))
+        opens: list[str] = []
+        for line in recent[:24]:
+            head = " ".join(line.split()[:5]).lower()
+            if head and head not in opens:
+                opens.append(head)
+        if opens:
+            out += ("\nAnd do not OPEN a line with any of these — every one "
+                    "of them has already been used tonight: "
+                    + "; ".join(f'"{o}"' for o in opens[:12]))
     subjects = overdwelt_subjects()
     if subjects:
         # Topic fatigue, not just phrase fatigue (#474): the pair KNOW they
@@ -9102,6 +9207,14 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # and the real one are the same row.
     line_id = uuid.uuid4().hex[:6]
     _speaking_now_set(line_id, who, kind, spoken, name, forced or "", engine)
+    # #778: and kept HERE, in a local. _SPEAKING_NOW is one global slot that
+    # _speaking_now_set clears unconditionally, so an ad read, a bulletin or
+    # any second dj_speak starting while this line is still out replaces it —
+    # and the id test below then fails and air_at silently falls back to the
+    # moment the announce RETURNED, i.e. the end of the line. A forty-second
+    # line sorted forty seconds late, which is the out-of-order cue. A local
+    # cannot be clobbered by another task.
+    _line_started = time.time()
     paged = False
     if voice_to in ("here", "both") or (to_box and box_down):
         if clip:
@@ -9281,7 +9394,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # (#467, #470): it goes on the hold shelf and plays the moment the
         # box returns — no matter the routing. 'box' mode also diverts it
         # to the page so it is heard now; 'both' already carried it there.
-        box_hold(clip, spoken, who)
+        box_hold(clip, spoken, who, line_id)                    # #778
         diverted = True
         if voice_to == "box" and not paged:
             note_drop(who, spoken,
@@ -9307,7 +9420,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             except Exception:
                 clip = None
         if clip:
-            box_hold(clip, spoken, who)
+            box_hold(clip, spoken, who, line_id)                # #778
             note_drop(who, spoken,
                       f"never aired — rendered and held for the box: {why}"
                       [:200])
@@ -9322,8 +9435,10 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # is the end of it, and a line that took forty seconds sorted forty
     # seconds late against everything logged while it played. _SPEAKING_NOW
     # has held the true start all along and threw it away on clear.
-    _air_at = float(_SPEAKING_NOW.get("at") or 0) \
-        if _SPEAKING_NOW.get("id") == line_id else 0.0
+    # #778: the local first — see above. The global is only a fallback for
+    # the case where this line is still the one on the slot.
+    _air_at = _line_started or (float(_SPEAKING_NOW.get("at") or 0)
+                                if _SPEAKING_NOW.get("id") == line_id else 0.0)
     _speaking_now_clear(line_id)
     entry = {
         "id": line_id,                                            # #742
@@ -9387,7 +9502,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             entry["aired"] = "box"
             _SILENT_HOLD_STREAK[0] = 0
         elif clip:
-            box_hold(clip, spoken, who)
+            box_hold(clip, spoken, who, line_id)                # #778
             entry["aired"] = "held"
             # A box that keeps silently ACCEPTING but playing 0% is WEDGED
             # (#559): the announce never errors, so the breaker never opens
@@ -10409,9 +10524,17 @@ def _hold_trim() -> None:
                             "held line(s) out to stay under the budget (#473)")
 
 
-def box_hold(clip: dict[str, Any], spoken: str, who: str) -> None:
+def box_hold(clip: dict[str, Any], spoken: str, who: str,
+             line_id: str = "") -> None:
+    # #778: the line's id travels with it onto the shelf. The drain used to
+    # find the row to re-stamp by matching its TEXT, which is the one place
+    # in the whole chain that throws the identity away — on a station ID, a
+    # liner or any repeated phrase it re-stamped the WRONG row and pulled it
+    # to the bottom of the feed. An identity swap and a reorder in one move,
+    # which is both halves of what the booth was getting wrong.
     _BOX_HOLD.append({"path": clip["path"], "sig": clip["sig"],
                       "text": spoken, "who": who, "ts": int(time.time()),
+                      "id": line_id,
                       "bytes": int(clip.get("bytes") or 0)})
     _hold_trim()
     _box_hold_save()
@@ -10545,7 +10668,11 @@ async def box_hold_watch() -> None:
                 # (#344, #391): the line aired now, through the box —
                 # late, but whole.
                 for line in reversed(_RADIO.get("chat") or []):
-                    if line.get("text") == held["text"] \
+                    # #778: by ID where the shelf has one. Matching on text
+                    # re-stamped whichever row happened to hold the same
+                    # words — the wrong line, moved to the wrong place.
+                    if (line.get("id") == held["id"] if held.get("id")
+                        else line.get("text") == held["text"]) \
                             and line.get("aired") in ("page", "held"):
                         line.pop("aired", None)
                         # #770: it is being heard NOW, minutes after it was
@@ -14847,13 +14974,25 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
 
     # "Here is the repaired text:" is not one of the gems.
     found = re.sub(r"^[^.!?\n]{0,120}:\s*", "", found.strip())
-    gems = [gem for gem in speakbox_lines(found) if " " in gem][:12]
+    # #no-repeats: was [:12], and the cache line below REPLACED the shelf rather than
+    # adding to it. A round takes four to nine consecutive lines, so twelve is
+    # one or two rounds and then the document is exhausted — the live glass was
+    # reading "1 unused lines on the shelf" — and an exhausted document is
+    # served from its oldest lines again, verbatim, upstream of every gate.
+    # Forty deep and ACCUMULATED means a document keeps giving.
+    gems = [gem for gem in speakbox_lines(found) if " " in gem][:40]
     if gems:
         with _SPEAKBOX_LOCK:
             cache = _gem_cache(rid)
             try:
-                cache[doc.name] = {"at": doc.stat().st_mtime_ns,
-                                   "lines": gems[:12]}
+                held = cache.get(doc.name) or {}
+                stamp = doc.stat().st_mtime_ns
+                # Editing the document still throws its shelf away — that is
+                # what keyed the cache on mtime in the first place.
+                older = (list(held.get("lines") or [])
+                         if held.get("at") == stamp else [])
+                merged = older + [g for g in gems if g not in older]
+                cache[doc.name] = {"at": stamp, "lines": merged[-400:]}
                 store = mind_state(rid, "gems")
                 store.parent.mkdir(parents=True, exist_ok=True)
                 store.write_text(json.dumps(cache, indent=1))
@@ -15282,6 +15421,14 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
         last = {r.get("text"): int(r.get("last") or 0)
                 for r in speakbox_heard(key)}
         pool = sorted(gems, key=lambda line: last.get(line, 0))
+        # #no-repeats: this branch deliberately serves lines they HAVE used, which is
+        # a verbatim repeat injected upstream of every gate — the swath goes
+        # into the script as "A: ..." and is read out word for word. The
+        # cooldown gets the last word here too: anything said inside the hour
+        # is not eligible, however old it is relative to the rest.
+        cooled = [line for line in pool
+                  if not phrase_check(line).get("block")]
+        pool = cooled or pool
         lines = speakbox_swath_lines(pool[:max(most * 2, 12)],
                                      most=most, cap=cap)
         return {"file": name, "text": " ".join(lines), "lines": lines,
@@ -17022,15 +17169,24 @@ def print_remember(text: str, who: str = "", kind: str = "") -> None:
     with _PRINTS_LOCK:
         rows = line_prints()
         now = int(time.time())
-        for row in rows:
+        for at, row in enumerate(rows):
             if row.get("key") == key:
                 row["said"] = int(row.get("said") or 0) + 1
                 row["last"] = now
+                # #no-repeats: and it moves to the END. _prints_write keeps the last
+                # PRINTS_MAX rows BY POSITION, so an upsert that left the row
+                # where it was first appended let a line said seven times over
+                # an hour age off the front of the ledger while it was still
+                # actively recurring — after which it read as brand new.
+                rows.append(rows.pop(at))
                 _prints_write(rows)
                 return
         rows.append({"key": key, "who": who, "kind": kind,
                      "first": now, "last": now, "said": 1, "blocked": 0,
-                     "shingles": sorted(_shingles(text))[:60]})
+                     # #no-repeats: 60 was a SORTED prefix, so the kept 60 were an
+                     # arbitrary alphabetical slice and a long line compared
+                     # against a clipped version of itself.
+                     "shingles": sorted(_shingles(text))[:400]})
         _prints_write(rows)
 
 
@@ -17077,16 +17233,33 @@ def rerun_check(text: str, who: str = "", kind: str = "",
     if allow_repeat or kind in ("station_id", "ad", "reply"):
         return verdict
     key = verdict["key"]
-    if len(key) < 24:
-        return verdict                # too short to be a repeat worth blocking
-    if _block_rate() > BLOCK_RATE_CAP:
-        return verdict                # the breaker is open
+    # #no-repeats: the old floor was 24 characters, and a catchphrase is precisely a
+    # line shorter than that — "holy lord son" went out SIXTEEN times with
+    # blocked=0 because the gate never looked at it once. Short lines are
+    # checked now; what saves them from being barred forever is the clock.
+    if len(key) < 12 or len(key.split()) < 3:
+        return verdict                # "yeah", "okay" — a noise, not a line
     rows = line_prints()
+    now = time.time()
+    # A catchphrase MAY come back — once the hour the operator asked for has
+    # gone by. Only the short ones get that grace; a whole sentence repeated
+    # word for word is a rerun at any distance.
+    window = float(phrase_setup()["station"] or 3600) if len(key) < 24 else 0.0
+    # #no-repeats: the exact leg runs UNCONDITIONALLY. It used to sit behind the
+    # breaker below — an anti-repeat engine that switches itself off exactly
+    # when repetition is worst, which is the one thing it must never do.
     for row in rows:
         if row.get("key") == key:
+            if window and now - float(row.get("last") or 0) >= window:
+                return verdict          # said, but long enough ago
             verdict.update({"block": True,
-                            "why": "said before, word for word"})
+                            "why": ("said word for word inside the hour"
+                                    if window else
+                                    "said before, word for word")})
             return verdict
+    if _block_rate() > BLOCK_RATE_CAP:
+        return verdict                # the breaker is open — over the FUZZY
+                                      # leg only, never the word-for-word one
     mine = _shingles(text)
     if len(mine) >= 3:
         for row in rows:
@@ -17102,7 +17275,295 @@ def rerun_check(text: str, who: str = "", kind: str = "",
                                 "why": "near-identical to a line already said",
                                 "hit": str(row.get("key") or "")})
                 return verdict
+            # #no-repeats: CONTAINMENT as well as symmetry. Every row written before
+            # today holds a CHUNK of a turn rather than the turn, so a whole
+            # turn can contain an aired fragment entire and still score barely
+            # half on a symmetric Jaccard. A line that contains a line already
+            # said is a line already said.
+            small = min(len(mine), len(theirs))
+            if small >= 6 and overlap / small >= 0.85:
+                verdict.update({"block": True,
+                                "why": "contains a line already said, whole",
+                                "hit": str(row.get("key") or "")})
+                return verdict
     return verdict
+
+
+# --- The hour-long phrase cooldown (#no-repeats) -----------------------------------
+#
+# "Make sure that the system detects words and phrases said and ensures they
+# are not repeated for an hour. I want the rhetoric unique and never
+# repeating."
+#
+# Measured on the live station before this existed: across 166 spoken rows one
+# line had aired SEVEN times byte-identical and a three-word catchphrase
+# SIXTEEN times — both with blocked=0, the gate above never contesting either,
+# and the breaker CLOSED (block_rate 0.05) the whole time. Three reasons, all
+# fixed:
+#
+#   1. the ledger wrote CHUNKS — post-chunking, post-disfluency — while the
+#      gate tested whole TURNS, so any turn longer than say_max_chars() could
+#      never match its own row. Fixed at both write sites in speak_turns.
+#   2. nothing under 24 characters was checked at all, which is the exact
+#      shape of a catchphrase. Now checked, against a clock.
+#   3. every anti-repeat window in the file was counted in LINES. The ledger
+#      carried timestamps and nothing ever read them, so "for an hour" was
+#      not implemented anywhere in this station. This is that hour.
+#
+# The ledger below is normalised n-grams, each carrying the moment it last
+# aired and the moment each SPEAKER last used it — the per-character cooldown
+# — trimmed by AGE and never by count, so the window is a real hour rather
+# than however many lines happen to fit in a file. And on a hit a line is not
+# dropped: dropping is what the old gate paid for repetition with, and it pays
+# in dead air. It is rewritten, and failing that swapped for material off the
+# speakbox shelf.
+PHRASE_PRINTS_PATH = Path("/app/data/phrase_prints.json")
+PHRASE_PRINTS_MAX = 20000          # a disk bound, not a window
+_PHRASE_PRESSURE: list[int] = []
+_PHRASE_ROWS: dict[str, Any] = {"at": -1, "rows": {}}
+# FUNCTION words only — the grammar of English, which every sentence is made
+# of and nobody is "leaning on". A run needs two words from outside this set
+# before it counts as somebody's turn of phrase.
+#
+# Kept deliberately tight. A first cut also held thing/know/way/really and
+# demanded three content words, and it threw away "the only thing keeping me"
+# — which is a run out of the very line the operator caught airing seven
+# times. A filter that cannot see the reported bug is the wrong filter.
+PHRASE_BORING = {
+    "a", "an", "the", "and", "or", "but", "so", "to", "of", "in", "on", "at",
+    "by", "for", "from", "with", "into", "over", "about", "as", "if", "than",
+    "then", "that", "this", "these", "those", "it", "its", "i", "me", "my",
+    "we", "us", "our", "you", "your", "he", "him", "his", "she", "her",
+    "they", "them", "their", "is", "are", "was", "were", "be", "been",
+    "being", "am", "do", "does", "did", "don", "have", "has", "had", "will",
+    "would", "shall", "should", "can", "could", "may", "might", "must",
+    "not", "no", "s", "t", "re", "ve", "ll", "m", "up", "out", "what",
+    "when", "who", "how", "why", "which", "all", "any", "some", "more",
+    "most", "very", "just", "like", "now", "well", "yeah", "ok", "okay",
+    "too", "also", "again", "there", "here",
+}
+
+
+def phrase_setup() -> dict[str, Any]:
+    """The cooldown as the operator set it — two clocks and a run length."""
+    dj = dj_settings()
+    return {
+        "n": max(3, min(8, int(dj.get("phrase_ngram") or 5))),
+        "station": max(0, min(1440, int(
+            dj.get("phrase_cooldown_minutes") or 0))) * 60,
+        "self": max(0, min(2880, int(
+            dj.get("phrase_cooldown_self_minutes") or 0))) * 60,
+        "retries": max(0, min(3, int(dj.get("phrase_retries") or 0))),
+        "swap": bool(dj.get("phrase_swap_from_speakbox", True)),
+    }
+
+
+def phrase_grams(text: str, n: int = 5) -> list[str]:
+    """Every run of n words in a line, minus the ones that are only grammar.
+
+    Normalised through _bin_key, so punctuation and capitals drifting between
+    one telling and the next cannot hide a rerun."""
+    words = _bin_key(text).split()
+    if len(words) < n:
+        return []
+    out: list[str] = []
+    for at in range(len(words) - n + 1):
+        run = words[at:at + n]
+        if sum(1 for w in run if w not in PHRASE_BORING) < 2:
+            continue
+        out.append(" ".join(run))
+    return out
+
+
+def phrase_prints() -> dict[str, dict[str, Any]]:
+    """The ledger, cached against the file's own mtime — it is read once per
+    candidate line and runs to megabytes on a long night."""
+    try:
+        stamp = PHRASE_PRINTS_PATH.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    if stamp and _PHRASE_ROWS["at"] == stamp:
+        return _PHRASE_ROWS["rows"]
+    try:
+        rows = json.loads(PHRASE_PRINTS_PATH.read_text())
+        rows = rows if isinstance(rows, dict) else {}
+    except Exception:
+        rows = {}
+    _PHRASE_ROWS.update({"at": stamp, "rows": rows})
+    return rows
+
+
+def _phrase_write(rows: dict[str, dict[str, Any]], horizon: float) -> None:
+    """Trimmed by AGE, which is the whole point of the ledger. The count cap
+    beneath it is a disk bound and it drops the OLDEST — never the busiest,
+    which is the mistake the line ledger's positional trim makes."""
+    now = time.time()
+    keep = {k: v for k, v in rows.items()
+            if now - float(v.get("at") or 0) <= horizon}
+    if len(keep) > PHRASE_PRINTS_MAX:
+        keep = dict(sorted(keep.items(),
+                           key=lambda kv: -float(kv[1].get("at") or 0)
+                           )[:PHRASE_PRINTS_MAX])
+    try:
+        PHRASE_PRINTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PHRASE_PRINTS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(keep))
+        tmp.replace(PHRASE_PRINTS_PATH)
+    except OSError:
+        pass                            # a forgetful show still goes out
+
+
+def phrase_remember(text: str, who: str = "") -> None:
+    """Only what actually went out on air lands here."""
+    cfg = phrase_setup()
+    grams = phrase_grams(text, cfg["n"])
+    if not grams:
+        return
+    now = int(time.time())
+    horizon = max(cfg["station"], cfg["self"], 3600) * 2
+    with _PRINTS_LOCK:
+        rows = phrase_prints()
+        for gram in grams:
+            row = rows.get(gram)
+            row = row if isinstance(row, dict) else {"at": 0, "n": 0, "by": {}}
+            row["at"] = now
+            row["n"] = int(row.get("n") or 0) + 1
+            if who:
+                by = row.get("by")
+                row["by"] = by if isinstance(by, dict) else {}
+                row["by"][who] = now
+            rows[gram] = row
+        _phrase_write(rows, horizon)
+
+
+def phrase_check(text: str, who: str = "",
+                 also: set[str] | None = None) -> dict[str, Any]:
+    """Has any run of these words been on air inside the window?
+
+    `also` is the runs said EARLIER IN THIS ROUND, which are not in the ledger
+    yet — a round is written whole and only recorded once its audio is built,
+    so without this the two hosts can echo each other inside one exchange and
+    the gate cannot see it. Caught live within a minute of switching this on:
+    the co-host said "my career it has happened many many times since" and the
+    host said it back fourteen seconds later, both aired, both invisible.
+
+    Deliberately NOT bounded by a block rate. The gate above stands down when
+    it fires too often; this one answers pressure with fresh material instead
+    — see phrase_pressure. An engine that switches off under load is off
+    exactly when it is needed."""
+    verdict: dict[str, Any] = {"block": False, "phrase": "", "age": 0.0,
+                               "why": ""}
+    cfg = phrase_setup()
+    if not (cfg["station"] or cfg["self"]):
+        return verdict                  # both clocks at zero — engine off
+    grams = phrase_grams(text, cfg["n"])
+    if not grams:
+        return verdict
+    rows = phrase_prints()
+    now = time.time()
+    for gram in grams:
+        if also and gram in also:
+            verdict.update({"block": True, "phrase": gram, "age": 0.0,
+                            "why": f'"{gram}" was already said earlier in '
+                                   "this very round"})
+            return verdict
+        row = rows.get(gram)
+        if not isinstance(row, dict):
+            continue
+        age = now - float(row.get("at") or 0)
+        if cfg["station"] and age < cfg["station"]:
+            verdict.update({"block": True, "phrase": gram, "age": age,
+                            "why": f'"{gram}" went out '
+                                   f"{int(age / 60)} min ago"})
+            return verdict
+        mine = float((row.get("by") or {}).get(who) or 0) if who else 0.0
+        if cfg["self"] and mine and now - mine < cfg["self"]:
+            verdict.update({"block": True, "phrase": gram, "age": now - mine,
+                            "why": f'{who} used "{gram}" '
+                                   f"{int((now - mine) / 60)} min ago"})
+            return verdict
+    return verdict
+
+
+def phrase_note(blocked: bool) -> None:
+    _PHRASE_PRESSURE.append(1 if blocked else 0)
+    del _PHRASE_PRESSURE[:-40]
+
+
+def phrase_pressure() -> float:
+    """How hard the cooldown is having to work.
+
+    Never a reason to stand the gate down. It BUYS MATERIAL — it lifts the
+    speakbox draw, so a station repeating itself gets FRESHER rather than
+    thinner, which is the trade the old breaker had backwards."""
+    if len(_PHRASE_PRESSURE) < 8:
+        return 0.0
+    return sum(_PHRASE_PRESSURE) / float(len(_PHRASE_PRESSURE))
+
+
+def phrase_hot(most: int = 16) -> list[str]:
+    """The runs still inside the cooldown, busiest first — so the DO-NOT-USE
+    list in the prompt and the gate at air time read one truth."""
+    cfg = phrase_setup()
+    window = max(cfg["station"], cfg["self"])
+    if not window:
+        return []
+    now = time.time()
+    live = [(k, v) for k, v in phrase_prints().items()
+            if isinstance(v, dict) and int(v.get("n") or 0) >= 2
+            and now - float(v.get("at") or 0) < window]
+    live.sort(key=lambda kv: (-int(kv[1].get("n") or 0),
+                              -float(kv[1].get("at") or 0)))
+    return [k for k, _ in live[:max(1, most)]]
+
+
+# Material waiting in the wings. A line held back by the cooldown is SWAPPED
+# for one of these rather than dropped — "prompt them to say more from the
+# speakerbox database" (#no-repeats) — and because the shelf is stocked off-air the
+# swap itself never waits on a mine or a model call.
+_FRESH_POOL: list[dict[str, str]] = []
+_FRESH_FILLING: list[bool] = [False]
+
+
+async def fresh_pool_fill(want: int = 8) -> None:
+    if _FRESH_FILLING[0] or len(_FRESH_POOL) >= want:
+        return
+    _FRESH_FILLING[0] = True
+    try:
+        quote = await speakbox_quote(most=4, cap=300)
+        for line in (quote.get("lines") or []):
+            if len(str(line or "")) < 30:
+                continue
+            if phrase_check(str(line)).get("block"):
+                continue
+            _FRESH_POOL.append({"text": str(line),
+                                "file": str(quote.get("file") or ""),
+                                "mind": str(quote.get("mind") or "")})
+        del _FRESH_POOL[:-24]
+    except Exception:
+        pass                            # the shelf is a luxury, not the show
+    finally:
+        _FRESH_FILLING[0] = False
+
+
+def fresh_pool_top(want: int = 8) -> None:
+    """Ask for a refill without waiting on one."""
+    if len(_FRESH_POOL) < want and not _FRESH_FILLING[0]:
+        try:
+            asyncio.get_running_loop().create_task(fresh_pool_fill(want))
+        except RuntimeError:
+            pass                        # no loop — a test, or the CLI
+
+
+def fresh_pool_take() -> dict[str, str]:
+    """One line nobody has said this hour, or nothing at all."""
+    while _FRESH_POOL:
+        one = _FRESH_POOL.pop(0)
+        if not phrase_check(one.get("text", "")).get("block"):
+            fresh_pool_top()
+            return one
+    fresh_pool_top()
+    return {}
 
 
 # --- The approach wheel (#752) ---------------------------------------------
@@ -19418,7 +19879,13 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
         "anything edgy. ENGLISH ONLY — every word of every line in English, "
         "never any other language or script, whatever the material quotes. "
         "No markdown, no emoji, no stage directions. Format "
-        "each line as 'A: ...' and 'B: ...'.")
+        "each line as 'A: ...' and 'B: ...'."
+        # #no-repeats: the deep round is one of the two main conversation engines and
+        # it was the only one that never saw the do-not-repeat clauses — no
+        # overused phrases, no overdwelt subjects, no lines-already-said. It
+        # was writing with no memory of the show at all beyond fourteen chat
+        # rows, which on the coalesced road is three or four turns.
+        + avoid_reruns() + approach_clause(approach_pick()))
     try:
         script = await ask_model(prompt, limit=2400, spice=0.5, num_ctx=16384)
     except Exception:
@@ -20595,8 +21062,29 @@ def make_hangup() -> Path | None:
     return out
 
 
+# #778: the three numbers that decide how long a turn is INSIDE the coalesced
+# clip, named once so the mixer and the booth's timeline cannot disagree about
+# them. They did: the booth measured each clip on disk, tail and all.
+CONCAT_TAIL = 0.9                     # the welded tail every clip carries in
+CONCAT_KEEP = 0.06                    # what survives the trim
+CONCAT_BEAT = (0.14, 0.33)            # the varied beat glued on instead
+
+
+def concat_beats(count: int) -> list[float]:
+    """The beats a coalesced round will have between its turns."""
+    return [round(random.uniform(*CONCAT_BEAT), 3)
+            for _ in range(max(0, count - 1))] + [0.0]
+
+
+def concat_real_seconds(measured: float, beat: float) -> float:
+    """How long a clip measuring `measured` on disk actually runs once it has
+    been trimmed and beaten into the coalesced stream."""
+    return max(0.25, measured - CONCAT_TAIL + CONCAT_KEEP + max(0.0, beat))
+
+
 def _call_concat_blocking(paths: list[str],
-                          crackle: bool = False) -> bytes | None:
+                          crackle: bool = False,
+                          beats: list[float] | None = None) -> bytes | None:
     """Coalesce a whole call or booth round — every clip back to back — into
     ONE continuous 24k mono stream (#530/#535/#616). Everything is resampled
     to a common format first so a 22 kHz ring and 24 kHz voices splice
@@ -20629,7 +21117,7 @@ def _call_concat_blocking(paths: list[str],
     # instead. The last clip gets no beat — _wav_tail_pad below owns that end.
     # Failure is safe: a broken graph yields a short blob, we return None, and
     # the caller drops to the turn-by-turn path.
-    _keep = 0.06                      # a sliver of the original tail survives
+    _keep = CONCAT_KEEP               # a sliver of the original tail survives
     _pre: list[str] = []
     for i in range(len(files)):
         _leg = (f"[{i}:a]aresample=24000,"
@@ -20638,7 +21126,16 @@ def _call_concat_blocking(paths: list[str],
                 f"start_silence={_keep}:start_threshold=-50dB,areverse")
         if i < len(files) - 1:
             # 140–330 ms, never the same twice — a room, not a metronome.
-            _leg += f",apad=pad_dur={round(random.uniform(0.14, 0.33), 3)}"
+            # #778: drawn by the CALLER when it passes `beats`, because the
+            # booth's per-turn windows have to be built out of the same
+            # numbers this graph uses. They were not: the caller measured each
+            # clip as it sat on disk — 900 ms of welded tail included — while
+            # this trims that tail to 60 ms and glues on one of these instead,
+            # so every window was ~0.7 s too long and the marker walked off
+            # the line inside a round.
+            _beat = (beats[i] if beats is not None and i < len(beats)
+                     else round(random.uniform(*CONCAT_BEAT), 3))
+            _leg += f",apad=pad_dur={_beat}"
         _pre.append(f"{_leg}[a{i}];")
     pre = "".join(_pre)
     chain = "".join(f"[a{i}]" for i in range(len(files)))
@@ -20693,14 +21190,24 @@ def _call_concat_blocking(paths: list[str],
     return _wav_tail_pad(blob, int(os.getenv("BOX_TAIL_MS", "900")))
 
 
-def _desk_sound(label: str, seconds: float = 0.0) -> None:
+def _desk_sound(label: str, seconds: float = 0.0,
+                air_at: float = 0.0) -> None:
     """A noise the desk made that is not a sample off the shelf (#703) — the
     phone ringing, a receiver going down. They were audible and invisible,
-    and "everything happening in the booth" has to mean everything."""
+    and "everything happening in the booth" has to mean everything.
+
+    #778: with an `air_at`, because the booth is sorted on it. This wrote
+    only `ts`, taken when the row was APPENDED, while every turn of a
+    coalesced burst is stamped with the future moment it becomes audible —
+    so the hang-up, which is logged while the last burst is still being
+    built, sorted above the whole burst it comes after. The cue was out of
+    order and the station wrote the cue itself."""
+    now = time.time()
     _RADIO["chat"].append({
-        "ts": int(time.time()), "who": "board", "kind": "sfx",
+        "ts": int(now), "who": "board", "kind": "sfx",
         "text": label, "sfx": "", "sfx_dir": "the desk",
         "seconds": round(seconds, 2),
+        "air_at": float(air_at or now),
     })
     del _RADIO["chat"][:-240]
 
@@ -21019,6 +21526,7 @@ async def speak_turns(turns: list[tuple[str, str]],
     dj = dj_settings()
     voices = await session_voices()
     spoken: list[str] = []
+    fresh_pool_top()                    # #no-repeats: stock the shelf off-air
     cut_at = _TALK_CUT[0]
     # The caller's phone line is drawn once per call, so the static does
     # not jump level between their sentences (#237) — and their vocoded
@@ -21045,11 +21553,25 @@ async def speak_turns(turns: list[tuple[str, str]],
     # voice, so the introduction is a guarantee rather than a hope.
     turns = _caller_introduces(turns, caller_name)
     playlist: list[dict[str, Any]] = []
+    # #no-repeats: the runs already spoken in THIS round. The ledger is only written
+    # once the round's audio is built, so without this the pair can echo each
+    # other inside one exchange with the gate none the wiser.
+    _round_grams: set[str] = set()
+
+    def _who_of(marker: str) -> str:
+        """Which seat a script marker belongs to.
+
+        #778: this was inline, and the #777 fallback below did `for who, said
+        in turns` — binding the raw MARKER as the speaker. Those turns aired
+        in the default voice and were labelled "A:" in the booth, which is
+        one of the ways the booth showed a speaker the stream was not."""
+        return ("caller" if marker == "C"
+                else "caller2" if marker == "E"     # second person on the line
+                else "dj" if marker == "A"
+                else "third" if marker == "D" else "cohost")
+
     for marker, said in turns:
-        who = ("caller" if marker == "C"
-               else "caller2" if marker == "E"      # second person on the line
-               else "dj" if marker == "A"
-               else "third" if marker == "D" else "cohost")
+        who = _who_of(marker)
         text = spoken_text(said)
         if not text:
             continue
@@ -21080,6 +21602,33 @@ async def speak_turns(turns: list[tuple[str, str]],
             note_drop(who, text, "dropped — " + _rerun["why"] + " (#752)")
             print_penalise(_rerun.get("hit") or _rerun["key"])
             continue
+        # #no-repeats: the PHRASE cooldown, at the same choke point. The gate above
+        # asks "has this LINE been said"; this asks "has any run of these
+        # words been on air this hour", which is what the operator asked for
+        # and what a line rebuilt out of the same five-word pieces defeats.
+        # A hit is not a drop: the line is swapped for material off the
+        # speakbox shelf, so holding a repeat back makes the show fresher
+        # rather than shorter. Never for a caller — a caller is a guest, not
+        # a repeat offender — and never on a deliberate replay.
+        if not allow_repeat and who in ("dj", "cohost", "third"):
+            _phrase = phrase_check(text, who, _round_grams)
+            phrase_note(bool(_phrase["block"]))
+            if _phrase["block"]:
+                _swap = (fresh_pool_take() if phrase_setup()["swap"] else {})
+                _new = spoken_text(str(_swap.get("text") or ""))
+                if _new and names_only(_new, vouched or []) \
+                        and not is_binned(_new):
+                    note_drop(who, text, "swapped for fresh material — "
+                                         + _phrase["why"] + " (#no-repeats)")
+                    speakbox_remember({"file": _swap.get("file", ""),
+                                       "text": _swap["text"],
+                                       "lines": [_swap["text"]],
+                                       "mind": _swap.get("mind", "")})
+                    text = _new
+                else:
+                    note_drop(who, text,
+                              "dropped — " + _phrase["why"] + " (#no-repeats)")
+                    continue
         if not minutes_only(text, (track or {}).get("seconds")):
             note_drop(who, text, "made up a running time")
             continue                    # one bad turn shouldn't drop the rest (#520)
@@ -21120,6 +21669,15 @@ async def speak_turns(turns: list[tuple[str, str]],
                 "vec": vec, "turn_end": False, "big": False,
             })
         if len(playlist) > first_at:
+            # #no-repeats: whatever was admitted is now "already said this round".
+            _round_grams.update(phrase_grams(text, phrase_setup()["n"]))
+            # #no-repeats: THE turn, carried alongside its chunks. The ledger used to
+            # be written from item["chunk"] — post-chunking, post-disfluency —
+            # while the gate above tests this whole clean `text`, so a turn
+            # longer than say_max_chars() could never match its own row and
+            # aired again and again with blocked=0. Recorded once, on the
+            # first chunk, in the form the gate will look for.
+            playlist[first_at]["turn_text"] = text
             playlist[-1]["turn_end"] = True
             # Three chunks and up is a monologue (#320): it earns the
             # room's silence when it lands.
@@ -21141,11 +21699,34 @@ async def speak_turns(turns: list[tuple[str, str]],
     # are not entitled to leave the station with nothing. If they emptied the
     # round, put the raw turns back and say so.
     if turns and not playlist:
-        pipeline_log("drop", f"every one of the {len(turns)} turns was gated "
-                             "away - airing the round anyway rather than "
-                             "leaving the radio silent (#777)")
-        for who, said in turns:
-            text = spoken_text(said)
+        # #no-repeats: the promise of #777 is that the radio never goes silent. It is
+        # NOT a promise to air the exact lines every gate just rejected, which
+        # is what this did — the strictest outcome degrading into no gate at
+        # all, and the worst round of the night getting the free pass. Keep
+        # the promise with material off the speakbox shelf: words nobody has
+        # said this hour, in the pair's own voices. Only if the shelf is bare
+        # too do the raw turns go out, and then it is said plainly.
+        fresh: list[dict[str, str]] = []
+        for _ in range(4):
+            one = fresh_pool_take()
+            if not one.get("text"):
+                break
+            fresh.append(one)
+        if fresh:
+            pipeline_log("speakbox",
+                         f"every one of the {len(turns)} turns was gated away "
+                         f"- airing {len(fresh)} line(s) of fresh material off "
+                         "the shelf instead of the repeats (#no-repeats)")
+        else:
+            pipeline_log("drop", f"every one of the {len(turns)} turns was "
+                                 "gated away and the shelf is bare - airing "
+                                 "the round anyway rather than leaving the "
+                                 "radio silent (#777)")
+        _raw: list[tuple[str, str]] = [
+            (("dj" if at % 2 == 0 else "cohost"), one["text"])
+            for at, one in enumerate(fresh)] or [
+            (_who_of(marker), spoken_text(said)) for marker, said in turns]
+        for at, (who, text) in enumerate(_raw):
             if not text:
                 continue
             vec = performance_vector(
@@ -21153,9 +21734,13 @@ async def speak_turns(turns: list[tuple[str, str]],
                       else caller2_voice if who == "caller2"
                       else voices.get(who)) or "")
             playlist.append({
-                "who": who, "chunk": text, "vec": vec,
+                "who": who, "chunk": text, "vec": vec, "turn_text": text,
                 "turn_end": True, "big": False,
             })
+            if fresh and at < len(fresh):
+                speakbox_remember({"file": fresh[at].get("file", ""),
+                                   "text": text, "lines": [text],
+                                   "mind": fresh[at].get("mind", "")})
 
     speakers = {it["who"] for it in playlist}
     if (len(playlist) >= 2 and not source_text and not by_hand
@@ -21262,11 +21847,21 @@ async def speak_turns(turns: list[tuple[str, str]],
             # Only a real CALL opens with a ring and closes with a hang-up; a
             # coalesced booth round (#616/#625) is just the turns, joined
             # clean. The ring belongs to the first burst only.
+            ring_secs = 0.0
             if caller_name and first_batch:
                 ring = await asyncio.to_thread(make_phone_ring)
                 if ring:
                     seg.append(str(ring))
+                    # #778: the ring is IN the clip and was never in the
+                    # timeline, so every turn of a call was claimed to start
+                    # a ring-length early.
+                    ring_secs = sfx_seconds(ring) or 0.0
             transcript: list[tuple[str, str]] = []
+            # #no-repeats: the playlist item behind each transcript row, kept in step
+            # with it, so the ledger below can be written from the item's
+            # turn_text — the whole clean turn the gate tested — instead of
+            # from the disfluency-injected chunk it was writing before.
+            aired_items: list[dict[str, Any]] = []
         # The conversation PRE-PLAN (#556): every planned turn laid out with
         # its checkpoints — written already (the script exists), intonation
         # attached (the performance vector), rendered flipped true as each clip
@@ -21328,19 +21923,31 @@ async def speak_turns(turns: list[tuple[str, str]],
                     # "a round" is playing.
                     transcript.append((item["who"], item["chunk"],
                                        _clip_seconds(clip["path"])))
+                    aired_items.append(item)                          # #no-repeats
                     _plan_turns[idx]["rendered"] = True    # checkpoint hit (#556)
+            hang_secs = 0.0
             if caller_name and last_batch:
                 hang = await asyncio.to_thread(make_hangup)
                 if hang:
                     seg.append(str(hang))
                     # #703: audible, so it belongs in the list.
-                    _desk_sound("\u260e the receiver going down",
-                                sfx_seconds(hang))
+                    # #778: but NOT logged here. This is minutes before the
+                    # burst it closes is audible, and the booth sorts on
+                    # air_at \u2014 so logging it now put the receiver going down
+                    # above the whole final burst of the call. It is logged
+                    # after the timeline exists, stamped with the moment it
+                    # is actually heard.
+                    hang_secs = sfx_seconds(hang)
             # One segment cannot be concatenated with itself; a single-turn
             # burst is already one clip and goes out as it is.
+            # #778: the beats are drawn HERE and handed to the mixer, so the
+            # booth's per-turn windows below are built from the very numbers
+            # the audio was built with instead of from the clips as they sat
+            # on disk.
+            beats = concat_beats(len(seg))
             mixed = (await asyncio.to_thread(
                         _call_concat_blocking, seg,
-                        bool(dj_settings().get("stream_texture")))
+                        bool(dj_settings().get("stream_texture")), beats)
                      if len(seg) >= 2 else None)
             if not mixed and len(seg) == 1 and transcript:
                 try:
@@ -21377,15 +21984,35 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # The clip's own timeline is the answer — each turn's measured
                 # length becomes a window, and the panel reads off the clock.
                 rows = []
-                offset = 0.0
-                for who, chunk, secs in transcript:
+                # #778: the turns do not start at zero when a ring opens the
+                # clip, and each one runs for its TRIMMED length plus the beat
+                # that was actually glued after it — not for the length of the
+                # file on disk, which still had its 900 ms box tail on it.
+                # `seg` is [ring?] + one entry per aired turn + [hang-up?], so
+                # a turn's index in `beats` is its row plus the ring.
+                offset = ring_secs
+                lead = 1 if ring_secs else 0
+                for _row, (who, chunk, secs) in enumerate(transcript):
                     spoken.append(f"{who}: {chunk}")
                     # #752: the coalesced path never went near dj_speak, so
                     # nothing it aired was ever written down — which is why the
                     # overused-phrase and do-not-repeat clauses were reading a
                     # fraction of the show.
-                    print_remember(chunk, who, "stream")
-                    said_remember(chunk)
+                    # #no-repeats: written from the TURN, once, not from every chunk.
+                    # The ledger was recording `chunk` — a sentence-capped
+                    # slice with disfluencies injected into it — while
+                    # rerun_check tests the whole clean turn, so the key stored
+                    # was never the key later looked up and a long line could
+                    # air any number of times untouched. turn_text rides on the
+                    # first chunk of each turn; continuation chunks add
+                    # nothing, which is also what stops one turn being counted
+                    # three times.
+                    _turn = str((aired_items[_row].get("turn_text") or "")
+                                if _row < len(aired_items) else "")
+                    if _turn:
+                        print_remember(_turn, who, "stream")
+                        said_remember(_turn)
+                        phrase_remember(_turn, who)
                     rid = uuid.uuid4().hex[:6]
                     entry = {
                         "id": rid,
@@ -21408,11 +22035,17 @@ async def speak_turns(turns: list[tuple[str, str]],
                                   else voices.get(who, "")) or "",
                     }
                     _RADIO["chat"].append(entry)
+                    # #778: the length this turn actually runs for INSIDE the
+                    # coalesced clip.
+                    _real = (concat_real_seconds(
+                                 secs, beats[_row + lead]
+                                 if _row + lead < len(beats) else 0.0)
+                             if mixed else max(0.4, secs))
                     rows.append({"id": rid, "who": who, "kind": "call",
                                  "text": chunk,
                                  "name": (caller_name if who == "caller" else ""),
-                                 "from": offset, "until": offset + max(0.4, secs)})
-                    offset += max(0.4, secs)
+                                 "from": offset, "until": offset + _real})
+                    offset += _real
                 # #770: 160 here against 240 everywhere else meant a busy
                 # round amputated up to eighty entries the panel had never
                 # been shown — "conversation moments not showing" outright.
@@ -21421,11 +22054,21 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # normalises and can lay texture under the join, so the sum
                 # drifts from the finished clip. Scale to what was actually
                 # produced — the real length is already measured above.
-                if rows and offset > 0.5 and length > 0.5:
-                    scale = length / offset
+                # #778: over the TURNS only. The ring at the head and the
+                # hang-up at the tail are in `length` and are not turns, so
+                # scaling the whole span by length/offset stretched every
+                # window to swallow them and pushed the marker later and later
+                # through a call. The residual this now corrects is the
+                # loudness pass, which is what the correction was always for.
+                _hang_real = (concat_real_seconds(hang_secs, 0.0)
+                              if hang_secs else 0.0)
+                _made = length - ring_secs - _hang_real
+                _ours = offset - ring_secs
+                if rows and _ours > 0.5 and _made > 0.5:
+                    scale = _made / _ours
                     for r in rows:
-                        r["from"] *= scale
-                        r["until"] *= scale
+                        r["from"] = ring_secs + (r["from"] - ring_secs) * scale
+                        r["until"] = ring_secs + (r["until"] - ring_secs) * scale
                 # Deliver the ONE clip on the routing the DJ voice is set to,
                 # mirroring to the page when the box is down (#536).
                 vto = _RADIO.get("voice_to") or "box"
@@ -21447,6 +22090,13 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # #748: start the clock at the moment the audio is handed over,
                 # so "which line is sounding" is a lookup rather than a guess.
                 _stream_now_set(rows, length)
+                # #778: NOW the receiver going down can be placed — at the end
+                # of the clip it is at the end of, rather than at the moment
+                # the mix was assembled.
+                if hang_secs:
+                    _desk_sound("☎ the receiver going down", hang_secs,
+                                air_at=time.time() + max(0.0, length
+                                                         - hang_secs))
                 # #776: deliberately NOT waiting for the burst here. Pacing
                 # the page road against playback removed the backlog and put
                 # dead air in its place, which is the worse of the two on a
@@ -21516,7 +22166,13 @@ async def speak_turns(turns: list[tuple[str, str]],
             sting=bool(item["turn_end"]))
         if out:
             spoken.append(f"{who}: {out}")
-            print_remember(out, who, "turn")           # #752
+            # #no-repeats: the TURN, once, not each chunk — the same fix as the
+            # coalesced road above, so one gate reads one ledger whichever
+            # way the round went out.
+            _turn = str(item.get("turn_text") or "")
+            if _turn:
+                print_remember(_turn, who, "turn")     # #752
+                phrase_remember(_turn, who)            # #no-repeats
         if item["turn_end"]:
             if item.get("big") and out:
                 # The stunned beat (#320): a whole monologue just landed
@@ -22198,7 +22854,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
                f"over the top of them. Give those interruptions their own "
                f"lines, two to four of them across the diatribe, each one "
                f"only a word or a handful: "
-               f"{', '.join(repr(p) for p in dj['diatribe_interjections'][:11])}"
+               # #no-repeats: SAMPLED, not the first eleven. A fixed slice of a list
+               # the operator may have written thirty of is a fixed paragraph
+               # in a prompt that is already mostly fixed.
+               f"{', '.join(repr(p) for p in random.sample(list(dj['diatribe_interjections']), min(11, len(dj['diatribe_interjections']))))}"
                f" — or anything in that spirit, in their own voice. They are "
                f"reactions, NOT replies: the one on the roll does not stop, "
                f"does not answer them, and keeps going. Vary them; never use "
@@ -22258,14 +22917,25 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # extra opening quote, on top of any seed) and APPEND one to the END, each
     # on its own slider so the pair trade the operator's documents verbatim more
     # or less (#602/#604/#613: outlandish, straight out of the speakbox).
-    if random.random() < float(_sb.get("speakbox_prepend_rate") or 0):
+    # #no-repeats: pressure buys MATERIAL. The old breaker answered a gate that was
+    # firing a lot by switching the gate off; this answers it by reaching
+    # further into the documents, so a station that keeps repeating itself
+    # gets more of the operator's own words rather than fewer of its own.
+    _lift = phrase_pressure()
+    if _lift >= 0.25:
+        pipeline_log("speakbox", f"the cooldown is holding back "
+                                 f"{_lift * 100:.0f}% of recent lines — "
+                                 "leaning harder on the documents (#no-repeats)")
+    if random.random() < min(1.0, float(
+            _sb.get("speakbox_prepend_rate") or 0) + _lift):
         head = await _fresh_swath()
         if head.get("text"):
             script = f"A: {head['text']}\n" + script.lstrip()
             lines += 1
             speakbox_remember(head)
     tail: dict[str, Any] = {}
-    if random.random() < float(_sb.get("speakbox_append_rate") or 0):
+    if random.random() < min(1.0, float(
+            _sb.get("speakbox_append_rate") or 0) + _lift):
         tail = await _fresh_swath()
         if tail.get("text"):
             script = script.rstrip() + f"\nA: {tail['text']}"
@@ -22293,10 +22963,106 @@ async def dj_banter(track: dict[str, Any] | None = None,
     return await _banter_air(entry, track)
 
 
+async def freshen_script(script: str, caller_name: str = "",
+                         caller2_name: str = "") -> str:
+    """Rewrite a round that is about to repeat itself, before it airs (#no-repeats).
+
+    The old engine's only answer to a repeat was to DROP the line at the door,
+    which is how an anti-repeat gate makes a thin show and then a silent one —
+    and it is why the #777 fallback had to exist at all. This is the answer
+    the operator actually asked for: ask for the line again, naming the phrase
+    it may not use, and when the model will not let go of it, replace the line
+    with material off the speakbox shelf.
+
+    Runs on the larder road as well as the fresh one, which is where it earns
+    the most: banked rounds are written six to twelve deep against a shelf
+    nothing updates until one airs, so several of them can carry the same
+    passage and then go out one after another."""
+    cfg = phrase_setup()
+    if not (cfg["station"] or cfg["self"]):
+        return script
+
+    def _collisions(text: str) -> list[tuple[str, dict[str, Any]]]:
+        out: list[tuple[str, dict[str, Any]]] = []
+        seen: set[str] = set()          # and the round against itself (#no-repeats)
+        for marker, said in banter_turns(text, caller_name, caller2_name):
+            if marker in ("C", "E"):    # a caller is a guest, not a rerun
+                continue
+            who = ("dj" if marker == "A"
+                   else "third" if marker == "D" else "cohost")
+            body = spoken_text(said)
+            verdict = phrase_check(body, who, seen)
+            if verdict["block"]:
+                out.append((said, verdict))
+            else:
+                seen.update(phrase_grams(body, cfg["n"]))
+        return out
+
+    hits = _collisions(script)
+    for _ in range(cfg["retries"]):
+        if not hits:
+            return script
+        banned = "; ".join(f'"{v["phrase"]}"' for _s, v in hits[:8])
+        pipeline_log("model", f"{len(hits)} line(s) reuse a phrase already on "
+                              "air this hour — asking for them again (#no-repeats)",
+                     extra="BANNED THIS ROUND:\n" + banned)
+        rewritten = await ask_model(
+            "Below is a radio script that is about to go out. Some of its "
+            "lines reuse wording the station has ALREADY broadcast tonight, "
+            "so they cannot air as written.\n\n"
+            f"BANNED — not one of these may appear, in any form, however "
+            f"reworded: {banned}\n\n"
+            "Rewrite the WHOLE script. Keep every speaker label exactly as it "
+            "is, keep the same number of lines, keep the meaning and the "
+            "energy — and say the offending parts a COMPLETELY different way: "
+            "different words, different images, a different angle on it, not "
+            "a synonym swap. No markdown, no stage directions, no commentary "
+            "about the rewrite.\n\n" + script,
+            limit=max(700, len(script) + 500), spice=0.6)
+        if not rewritten or ":" not in rewritten:
+            break                       # the model is down; the show is not
+        script = rewritten
+        hits = _collisions(script)
+    if not hits:
+        return script
+    # It would not let go. Give those lines to the documents instead — this
+    # is "prompt them to say more from the speakerbox database", and it is
+    # also what makes holding a line back safe: the round keeps its length.
+    if not cfg["swap"]:
+        return script
+    stuck = {said for said, _v in hits}
+    out: list[str] = []
+    swapped = 0
+    for line in script.splitlines():
+        body = re.sub(r"^\s*[A-E]\s*:\s*", "", line)
+        if body == line or body not in stuck:
+            out.append(line)
+            continue
+        fresh = fresh_pool_take()
+        if not fresh.get("text"):
+            out.append(line)
+            continue
+        out.append(line[:len(line) - len(body)] + fresh["text"])
+        speakbox_remember({"file": fresh.get("file", ""),
+                           "text": fresh["text"], "lines": [fresh["text"]],
+                           "mind": fresh.get("mind", "")})
+        swapped += 1
+    if swapped:
+        pipeline_log("speakbox", f"{swapped} line(s) the model would not let "
+                                 "go of were replaced with fresh material off "
+                                 "the shelf (#no-repeats)")
+    return "\n".join(out)
+
+
 async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
+    # #no-repeats: the last chance to be fresh rather than short. Anything still
+    # repeating after this meets the gate in speak_turns, which swaps it.
+    entry["script"] = await freshen_script(entry["script"],
+                                           entry.get("caller_name", ""),
+                                           entry.get("caller2_name", ""))
     spoken = await speak_turns(banter_turns(entry["script"],
                                             entry.get("caller_name", ""),
                                             entry.get("caller2_name", "")),
@@ -22855,6 +23621,71 @@ async def ha_reload_entry(entry_id: str) -> str:
         return f"failed: {exc}"
 
 
+async def satellite_probe(host: str = "", port: int = 0) -> dict[str, str]:
+    """WHY the satellite is or is not answering, not merely whether.
+
+    #777: "voices arent coming out of the pine box. I had to switch back to
+    the browser." Measured while that was true: the box answered ICMP and had
+    a live ARP entry — it was powered and sitting on the network — while
+    :10700 was closed, so nothing was listening for the show. The old
+    reachable() flattened that to a bare False, the diagnosis then blamed the
+    ROUTING, and the advice was to point the show at a box that could not
+    receive it. That is the loop the operator was stuck in.
+
+    A REFUSED connection is a live host with a dead service; a TIMEOUT is a
+    host that is not there at all; a connection that opens and then says
+    nothing is the #712 wedge. Three different faults, three different
+    things to do about them, and they must not read the same."""
+    host = host or SATELLITE_HOST
+    if not host:
+        return {"state": "unset", "detail": "no satellite address is set"}
+    writer = None
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port or SATELLITE_PORT), 3)
+    except ConnectionRefusedError:
+        return {"state": "refused",
+                "detail": "the box REFUSED the connection — it is powered up "
+                          "and on the network, but its satellite service is "
+                          "not running"}
+    except (asyncio.TimeoutError, TimeoutError):
+        # A dropped SYN and an absent device look identical at this layer.
+        # The neighbour table can tell them apart, and the two faults have
+        # nothing to do with each other: one is a service to restart, the
+        # other is a device to go and find.
+        near = (await asyncio.to_thread(_arp_table)).get(host) or ""
+        if near:
+            return {"state": "refused",
+                    "detail": f"the box is ON the network ({near}) but the "
+                              f"satellite port {port or SATELLITE_PORT} did "
+                              "not answer — it is powered up and its "
+                              "satellite service is not listening"}
+        return {"state": "timeout",
+                "detail": "no answer at all, and nothing at the link layer "
+                          "either — off, asleep, or on another network"}
+    except OSError as exc:
+        return {"state": "down", "detail": str(exc)[:120] or "no route"}
+    try:
+        # Wyoming framing: one JSON header per line, payload optional.
+        writer.write((json.dumps({"type": "describe"}) + "\n").encode())
+        await asyncio.wait_for(writer.drain(), 2)
+        line = await asyncio.wait_for(reader.readline(), 4)
+        if line and line.strip():
+            return {"state": "ok", "detail": "answering"}
+        return {"state": "wedged",
+                "detail": "it took the connection and then said nothing — "
+                          "wedged (#712)"}
+    except Exception as exc:                                    # noqa: BLE001
+        return {"state": "wedged",
+                "detail": str(exc)[:120] or "no reply to describe"}
+    finally:
+        if writer is not None:
+            try:
+                writer.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def satellite_reachable(host: str = "", port: int = 0) -> bool:
     """Does the satellite actually ANSWER — not merely accept a socket?
 
@@ -22867,29 +23698,9 @@ async def satellite_reachable(host: str = "", port: int = 0) -> bool:
     severs the audio stream, which wedges the box. The false signal was the
     first link in that loop.
 
-    Now it speaks Wyoming: send `describe` and require a reply. A box that
-    answers is up; a box that takes the socket and says nothing is wedged,
-    and is finally reported as such."""
-    host = host or SATELLITE_HOST
-    if not host:
-        return False
-    writer = None
-    try:
-        reader, writer = await asyncio.wait_for(
-            asyncio.open_connection(host, port or SATELLITE_PORT), 3)
-        # Wyoming framing: one JSON header per line, payload optional.
-        writer.write((json.dumps({"type": "describe"}) + "\n").encode())
-        await asyncio.wait_for(writer.drain(), 2)
-        line = await asyncio.wait_for(reader.readline(), 4)
-        return bool(line and line.strip())
-    except Exception:
-        return False
-    finally:
-        if writer is not None:
-            try:
-                writer.close()
-            except Exception:  # noqa: BLE001
-                pass
+    Now one line over satellite_probe, so the watchdog and the diagnosis
+    cannot disagree about what the box is doing."""
+    return (await satellite_probe(host, port))["state"] == "ok"
 
 
 async def satellite_status() -> dict[str, Any]:
@@ -23129,9 +23940,38 @@ SATELLITE_SSID = os.getenv("SATELLITE_SSID", "")
 GUIDE_PDF = Path("/app/data/pinebox-recovery.pdf")
 
 
+def _arp_table() -> dict[str, str]:
+    """The kernel's neighbour table, read from /proc.
+
+    #777: this used to shell out to `ip neigh`, and `ip` is not in a
+    python:3.12-slim image — so the check reported "not checkable from inside
+    the container" every single time and could never contribute anything. It
+    was the one check that could have told the operator their box was ON the
+    network with a dead service rather than off, which is the difference
+    between "power-cycle it" and "go and find it". /proc/net/arp needs no
+    binary and no capability."""
+    out: dict[str, str] = {}
+    try:
+        for line in Path("/proc/net/arp").read_text().splitlines()[1:]:
+            cols = line.split()
+            if len(cols) >= 4 and cols[0]:
+                # IP address, HW type, Flags, HW address, Mask, Device
+                out[cols[0]] = f"{cols[3]} on {cols[-1]}" \
+                    if cols[3] != "00:00:00:00:00:00" else ""
+    except OSError:
+        pass
+    return out
+
+
 async def _arp_state(host: str) -> str:
-    """What the kernel's neighbour table thinks. FAILED/incomplete means the
-    device is not answering at the link layer at all — it is not on the LAN."""
+    """What the kernel's neighbour table thinks. An empty or absent entry
+    means the device is not answering at the link layer at all."""
+    seen = await asyncio.to_thread(_arp_table)
+    if host in seen:
+        return seen[host] or "INCOMPLETE — no reply at the link layer"
+    # Not in the table is not proof of absence: entries expire when nothing
+    # has spoken to the device recently. A connect attempt has just been made
+    # by the caller, which is what puts one there.
     try:
         proc = await asyncio.create_subprocess_exec(
             "ip", "neigh", "show", host,
@@ -23140,7 +23980,7 @@ async def _arp_state(host: str) -> str:
         line = out.decode().strip()
         return line or "no entry"
     except Exception:
-        return "unknown"
+        return "no entry"
 
 
 async def pinebox_diagnose() -> dict[str, Any]:
@@ -23170,9 +24010,10 @@ async def pinebox_diagnose() -> dict[str, Any]:
         f"{link['entity']} is {link['entity_state']}"
         + (f" · entry {entry.get('state')}" if entry else ""))
 
-    reachable = await satellite_reachable()
+    probe = await satellite_probe()
+    reachable = probe["state"] == "ok"
     add(f"Pine Box on the network ({SATELLITE_HOST}:{SATELLITE_PORT})",
-        reachable, "answering" if reachable else "no answer on the satellite port")
+        reachable, probe["detail"])
 
     # `ip` is not in this image, so ARP is informational only — it must not
     # decide the diagnosis, or an unknown reads as "everything is fine".
@@ -23207,7 +24048,56 @@ async def pinebox_diagnose() -> dict[str, Any]:
     # failing check printed two lines above it. Anything false here is a
     # reason, and the first reason wins.
     failed = [c for c in checks if c["ok"] is False]
-    if not box_talk_ok():
+    # #777: THE ORDER. A switch or a picker is only the cause when putting it
+    # right would actually make the box talk. This ladder tested the routing
+    # FIRST, so with the satellite port shut it said "the DJ voice is not
+    # routed to the Pine Box" and told the operator to point the show at a box
+    # that could not receive it — they do, hear nothing, switch back to the
+    # browser, ask again, and are told the same thing. Measured live: the box
+    # answering ping and ARP with :10700 refusing, and this function calling
+    # it a routing problem. A box that cannot receive audio outranks every
+    # preference about where to send it.
+    _fixable_here = probe["state"] in ("ok", "unset")
+    if not _fixable_here and elsewhere:
+        # DHCP moved it — a real address problem, and more useful than
+        # "it is not answering where we are looking".
+        cause = (f"The Pine Box is alive at {elsewhere[0]}, but Home "
+                 f"Assistant is looking for it at {SATELLITE_HOST}. DHCP "
+                 "moved it.")
+        steps = [
+            f"Give it a fixed address: on the router, reserve "
+            f"{SATELLITE_HOST} for MAC {SATELLITE_MAC}.",
+            "Reboot the Pine Box so it takes the reserved lease.",
+            "Press 🛠 in the panel to reload the link.",
+            "Only if a reservation is impossible: POST /api/satellite/repoint "
+            "with confirm=true — it renames every entity, which is why it is "
+            "not automatic.",
+        ]
+    elif not _fixable_here:
+        _off = "; ".join([
+            "the master switch is off" if not box_talk_ok() else "",
+            "the DJ voice is routed elsewhere" if not routed else "",
+        ]).strip("; ")
+        cause = ("The Pine Box is not accepting audio: " + probe["detail"]
+                 + ". Nothing you change in the panel will be heard until "
+                 "that is fixed"
+                 + (f" (and {_off})" if _off else "") + ".")
+        steps = ([
+            "Power-cycle the Pine Box — it is on the network but the "
+            "satellite service on it is not listening.",
+        ] if probe["state"] == "refused" else [
+            "Check the Pine Box has power and is on the same network.",
+        ] if probe["state"] == "timeout" else [
+            "Power-cycle the Pine Box — it answers but has stopped "
+            "servicing sessions (#712).",
+        ]) + [
+            "Meanwhile the show keeps playing in the browser — every line "
+            "rendered for the box is held on the shelf and goes out the "
+            "moment it comes back.",
+            "Once it answers, set the DJ voice picker to Pine Box and press "
+            "Initialize the Pine Box.",
+        ]
+    elif not box_talk_ok():
         cause = ("The Pine Box master switch is OFF, so the station is not "
                  "calling it — whatever the DJ voice picker says.")
         steps = [
@@ -23236,19 +24126,9 @@ async def pinebox_diagnose() -> dict[str, Any]:
             "If the box speaks after that, the failing check above is the "
             "one to distrust, not the box.",
         ]
-    elif elsewhere:
-        cause = (f"The Pine Box is alive at {elsewhere[0]}, but Home "
-                 f"Assistant is looking for it at {SATELLITE_HOST}. DHCP "
-                 "moved it.")
-        steps = [
-            f"Give it a fixed address: on the router, reserve "
-            f"{SATELLITE_HOST} for MAC {SATELLITE_MAC}.",
-            "Reboot the Pine Box so it takes the reserved lease.",
-            "Press 🛠 in the panel to reload the link.",
-            "Only if a reservation is impossible: POST /api/satellite/repoint "
-            "with confirm=true — it renames every entity, which is why it is "
-            "not automatic.",
-        ]
+    # (#777: the "DHCP moved it" case is handled at the top of the ladder now,
+    # with the rest of the box-cannot-hear-you faults, rather than three
+    # branches below two panel settings that cannot fix it.)
     elif reachable and not link["online"]:
         cause = ("The Pine Box is answering, but Home Assistant has not "
                  "picked it up.")
@@ -23772,7 +24652,16 @@ async def ask_model(prompt: str, limit: int = 300,
         messages=[{"role": "user", "content": prompt}],
         temperature=temperature,
         max_tokens=max_tokens,
-        top_p=settings["top_p"],
+        # #no-repeats: jittered with the temperature, for the same reason. A fixed
+        # top_p against a prompt whose fixed frame is most of its length is
+        # not enough entropy to move the decode off its favourite sentence.
+        top_p=(min(0.99, max(0.5, settings["top_p"]
+                             + random.uniform(-0.05, 0.06)))
+               if spice else settings["top_p"]),
+        # #no-repeats: a fresh seed every call, so two identical prompts do not
+        # decode identically, and a penalty on the model's own repeats.
+        seed=random.randint(1, 2_000_000_000),
+        repeat_penalty=1.12,
         # A caller may ask for an EXPANDED window (#496): a deep round hands
         # the model far more foundation and needs room to hold it.
         num_ctx=max(2048, min(32768, num_ctx or settings["num_ctx"])),
@@ -23805,7 +24694,23 @@ async def call_ollama(
     max_tokens: int,
     top_p: float = 0.9,
     num_ctx: int = 8192,
+    seed: int | None = None,
+    repeat_penalty: float = 0.0,
 ) -> dict[str, Any]:
+    # #no-repeats: the options here carried temperature, top_p, num_predict and
+    # num_ctx and nothing else — no seed and no repeat penalty anywhere in the
+    # file — so the same prompt reliably reproduced the same phrasing and the
+    # model had no push at all against repeating itself inside one answer.
+    options: dict[str, Any] = {
+        "temperature": temperature,
+        "top_p": top_p,
+        "num_predict": max_tokens,
+        "num_ctx": num_ctx,
+    }
+    if seed is not None:
+        options["seed"] = int(seed)
+    if repeat_penalty and repeat_penalty > 0:
+        options["repeat_penalty"] = float(repeat_penalty)
     # ponytail: two in flight, ollama 0.30.6's chat queue wedged solid when
     # the show's clocks stacked unbounded 300s calls on top of each other.
     async with _OLLAMA_GATE, httpx.AsyncClient(timeout=180) as client:
@@ -23817,12 +24722,7 @@ async def call_ollama(
                 "stream": False,
                 "think": False,
                 "keep_alive": "30m",
-                "options": {
-                    "temperature": temperature,
-                    "top_p": top_p,
-                    "num_predict": max_tokens,
-                    "num_ctx": num_ctx,
-                },
+                "options": options,
             },
         )
         response.raise_for_status()
@@ -27586,6 +28486,14 @@ async def dj_prints_api(
     hot = sorted(rows, key=lambda r: (-int(r.get("blocked") or 0),
                                       -int(r.get("said") or 0)))[:max(1, min(
                                           200, int(limit or 40)))]
+    # #no-repeats: and the phrase cooldown beside it, because "said=7 blocked=0" was
+    # the whole diagnosis and it took a live read of this endpoint to see it.
+    cfg = phrase_setup()
+    grams = await asyncio.to_thread(phrase_prints)
+    now = time.time()
+    live = [v for v in grams.values() if isinstance(v, dict)
+            and now - float(v.get("at") or 0) < max(cfg["station"],
+                                                    cfg["self"], 1)]
     return {
         "kept": len(rows),
         "block_rate": round(_block_rate(), 3),
@@ -27596,6 +28504,17 @@ async def dj_prints_api(
                    "blocked": int(r.get("blocked") or 0),
                    "first": int(r.get("first") or 0),
                    "last": int(r.get("last") or 0)} for r in hot],
+        "phrases": {
+            "on": bool(cfg["station"] or cfg["self"]),
+            "window_minutes": int(cfg["station"] / 60),
+            "self_minutes": int(cfg["self"] / 60),
+            "ngram": cfg["n"],
+            "kept": len(grams),
+            "in_window": len(live),
+            "pressure": round(phrase_pressure(), 3),
+            "shelf": len(_FRESH_POOL),
+            "hot": phrase_hot(12),
+        },
     }
 
 
@@ -29507,6 +30426,155 @@ async def tape_spectrogram(
         "Cache-Control": "private, max-age=86400",
         "X-Content-Type-Options": "nosniff",
     })
+
+
+def _bundle_name(text: str, fallback: str, at: int = 0) -> str:
+    """A file name a human can read in a folder listing."""
+    stem = re.sub(r"[^\w -]+", "", str(text or "")).strip()[:60] or fallback
+    when = time.strftime("%Y%m%d-%H%M", time.localtime(float(at))) if at else ""
+    return (f"{when}-{stem}" if when else stem).strip("-") or fallback
+
+
+def _bundle_build(tab: str) -> tuple[Path, int]:
+    """#781: "allow me to download each and every entry listed in the cache."
+
+    Every tab of the radio cache, written out as one zip: the audio where a
+    thing has audio, and the WORDS where it does not — which is most of the
+    ad book, and was the real gap. A written spot only ever existed inside a
+    textarea in a modal; there was no way to take it off the station at all.
+    Names are the product and the date rather than the id hash, so the folder
+    reads as a shelf."""
+    import zipfile
+    KIT_DIR.mkdir(parents=True, exist_ok=True)
+    out = KIT_DIR / f"pinebox-cache-{tab}.zip"
+    tmp = out.with_suffix(".part")
+    want = ("talk", "mix", "ads", "upstairs") if tab == "all" else (tab,)
+    seen: set[str] = set()
+    count = 0
+
+    def _put(zf: Any, arc: str, data: bytes | None = None,
+             path: Path | None = None) -> None:
+        nonlocal count
+        stem, dot, ext = arc.rpartition(".")
+        at = 2
+        while arc in seen:              # two spots for the same product
+            arc = f"{stem}-{at}{dot}{ext}"
+            at += 1
+        seen.add(arc)
+        try:
+            if path is not None:
+                zf.write(path, arc)
+            else:
+                zf.writestr(arc, data or b"")
+            count += 1
+        except OSError:
+            pass                        # a file that vanished mid-zip
+
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        if "talk" in want:
+            for kind in ("episodes", "calls"):
+                here = RADIO_CACHE / kind
+                for p in (sorted(here.glob("*.mp3"))
+                          if here.is_dir() else []):
+                    _put(zf, f"{kind}/{p.name}", path=p)
+                    md = p.with_suffix(".md")
+                    if md.is_file():
+                        _put(zf, f"{kind}/{md.name}", path=md)
+        if "mix" in want and (RADIO_CACHE / "broadcasts").is_dir():
+            for p in sorted((RADIO_CACHE / "broadcasts").glob("*.mp3")):
+                _put(zf, f"broadcasts/{p.name}", path=p)
+        if "ads" in want:
+            for row in ad_list():
+                rid = str(row.get("id") or "")
+                stem = _bundle_name(row.get("product") or "", "ad",
+                                    int(row.get("ts") or 0))
+                body = (f"# {row.get('product') or 'an ad read'}\n\n"
+                        f"*written {time.strftime('%Y-%m-%d %H:%M', time.localtime(float(row.get('ts') or 0)))}"
+                        f" · aired {int(row.get('uses') or 0)}x"
+                        f"{' · bed: ' + str(row.get('bed')) if row.get('bed') else ''}*\n\n"
+                        + str(row.get("text") or "").strip() + "\n")
+                _put(zf, f"ads/{stem}.md", body.encode("utf-8"))
+                mp3 = PRODUCED_ADS_DIR / f"{rid}.mp3"
+                if rid and mp3.is_file():
+                    _put(zf, f"ads/{stem}.mp3", path=mp3)
+        if "upstairs" in want:
+            for row in upstairs_list():
+                stem = _bundle_name(row.get("gripe") or "", "page",
+                                    int(row.get("ts") or 0))
+                body = (f"# {row.get('gripe') or 'a page from upstairs'}\n\n"
+                        f"*{time.strftime('%Y-%m-%d %H:%M', time.localtime(float(row.get('ts') or 0)))}"
+                        f" · played {int(row.get('uses') or 0)}x*\n\n"
+                        + (f"Written against: {row.get('context')}\n\n"
+                           if row.get("context") else "")
+                        + str(row.get("text") or "").strip() + "\n")
+                _put(zf, f"upstairs/{stem}.md", body.encode("utf-8"))
+                name = str(row.get("audio") or "")
+                if name and (UPSTAIRS_AUDIO_DIR / name).is_file():
+                    _put(zf, f"upstairs/{stem}.mp3",
+                         path=UPSTAIRS_AUDIO_DIR / name)
+    tmp.replace(out)
+    return out, count
+
+
+@app.get("/api/radio-cache/bundle/{tab}")
+async def radio_cache_bundle(
+    tab: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The whole tab as one zip (#781). Signed like /media so the browser's
+    own download can fetch it without a bearer header."""
+    if tab not in ("talk", "mix", "ads", "upstairs", "all"):
+        raise HTTPException(status_code=400, detail="No such shelf")
+    _sig = str(request.query_params.get("t") or "")
+    _want = media_sign(f"cache-bundle-{tab}")
+    if not (_want and hmac.compare_digest(_sig, _want)):
+        require_read_auth(authorization)
+    path, count = await asyncio.to_thread(_bundle_build, tab)
+    if not count:
+        raise HTTPException(status_code=404, detail="nothing on that shelf yet")
+    return FileResponse(path, media_type="application/zip",
+                        filename=path.name)
+
+
+@app.get("/api/prompts/archive.md", response_class=PlainTextResponse)
+async def prompts_archive_md(
+    authorization: str | None = Header(default=None),
+) -> PlainTextResponse:
+    """Every stored system prompt as one markdown file (#780) — grouped, with
+    the armed one marked, so the library can be read and edited outside the
+    panel and kept anywhere you keep writing."""
+    require_read_auth(authorization)
+    settings = load_settings()
+    rows = list(settings.get("prompts") or [])
+    live = int(settings.get("active_prompt") or 0) % max(1, len(rows))
+    groups: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for at, row in enumerate(rows):
+        groups.setdefault(str(row.get("group") or ""), []).append((at, row))
+    out = [f"# {dj_settings()['station_name']} — system prompts", "",
+           f"{len(rows)} stored. The armed one is marked ★.", ""]
+    for name in sorted(groups, key=lambda g: (g == "", g.lower())):
+        out.append(f"## {name or 'Ungrouped'}")
+        out.append("")
+        for at, row in groups[name]:
+            out.append(f"### {'★ ' if at == live else ''}{row.get('name')}")
+            out.append("")
+            out.append(str(row.get("prompt") or "").strip())
+            out.append("")
+    return PlainTextResponse("\n".join(out),
+                             headers={"Content-Disposition":
+                                      'attachment; filename="pinebox-'
+                                      'system-prompts.md"'})
+
+
+@app.get("/api/radio-cache/bundle-sig")
+async def radio_cache_bundle_sig(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The signatures for the download links above."""
+    require_read_auth(authorization)
+    return {tab: media_sign(f"cache-bundle-{tab}")
+            for tab in ("talk", "mix", "ads", "upstairs", "all")}
 
 
 @app.get("/api/radio-cache/calls")
@@ -33197,12 +34265,7 @@ async def dj_crystal_api(
     plexus window to grow its point cloud from."""
     require_read_auth(authorization)
     _ensure_chat_ids()
-    try:
-        rows = json.loads(SAID_LINES_PATH.read_text())
-    except Exception:
-        rows = []
-    said = [str(r)[:300] for r in rows[-400:]] if isinstance(rows, list) \
-        else []
+    said = said_texts(400)
     fresh = [{"who": line.get("who"), "text": line.get("text"),
               "id": line.get("id")}
              for line in (_RADIO.get("chat") or [])
@@ -38567,6 +39630,28 @@ background:var(--panel2)"></canvas>
         </label>
         <span id="djVoiceStatus" class="muted" style="font-size:12px"></span>
       </div>
+      <!-- #780: the system prompt over the hosts, where the hosts are.
+           It was only ever reachable from the assistant panel, and the one
+           switch that decides whether it touches the show at all was buried
+           at the bottom of "Customize the DJ". Off, on, which one, and the
+           whole library — from here. -->
+      <div class="row" id="djPromptBar"
+           style="flex-wrap:wrap;margin-bottom:8px;align-items:center;gap:6px">
+        <label class="toggle" style="margin:0"
+               title="Whether the standing system prompt colours the pair at
+all. Off and they are purely their own personas.">
+          <input id="djPromptOn" type="checkbox" onchange="djPromptToggle()">
+          🧠 System prompt
+        </label>
+        <select id="djPromptPick" onchange="djPromptPickSet()"
+                style="flex:1;min-width:180px"
+                title="Which stored system prompt is standing over the show
+right now."></select>
+        <button onclick="djPromptManage()"
+                title="Store, group, edit, delete and export system prompts">
+          ✎ manage</button>
+        <span id="djPromptNote" class="muted" style="font-size:11px"></span>
+      </div>
       <!-- How much of the talk starts from the speakbox documents, out in the
            open where you can reach it mid-show (#204). -->
       <div class="row" style="flex-wrap:wrap;margin-bottom:8px">
@@ -38997,6 +40082,44 @@ through into how their voice is pitched, not just what they say.">
           <input id="djDiceCallers" type="checkbox">
           🎲 Every caller rings in at their own temperature
         </label>
+
+        <!-- #no-repeats: the hour. Every anti-repeat window in the station used to
+             be counted in LINES; these two are the only clocks over what
+             gets said, and they are what "not repeated for an hour" means. -->
+        <div style="border:1px solid #2a2f3a;border-radius:8px;padding:8px;
+                    margin:10px 0">
+          <div style="font-weight:600;margin-bottom:2px">
+            🔁 Never say it twice</div>
+          <div class="muted" style="font-size:11px;margin-bottom:6px">
+            A run of words that has been on air is off the air for this long.
+            Held-back lines are not dropped — they are rewritten, or swapped
+            for a passage out of the speakbox.</div>
+          <label title="How long any run of words is off the air after
+anybody says it. 0 switches the whole cooldown off.">Nobody repeats a
+            phrase for (minutes, 0 = off)</label>
+          <input id="djPhraseCooldown" type="number" min="0" max="1440">
+          <label title="The per-character cooldown: the host who actually
+said it waits longer than the station does before they may use it again.">And
+            the one who SAID it waits (minutes)</label>
+          <input id="djPhraseCooldownSelf" type="number" min="0" max="2880">
+          <label title="How many words in a row count as a phrase. Five is
+the measured tell; three is very strict and will hold back ordinary
+speech.">Words in a row that count as a phrase</label>
+          <input id="djPhraseNgram" type="number" min="3" max="8">
+          <label title="When a round comes back repeating itself, it is sent
+back to the model this many times to say it another way before its lines are
+replaced from the documents.">Ask for it again this many times first</label>
+          <input id="djPhraseRetries" type="number" min="0" max="3">
+          <label class="toggle" title="What happens to a line the cooldown
+holds back. On: it is replaced with a passage out of your documents, so the
+round keeps its length. Off: the line is simply dropped and the show gets
+shorter.">
+            <input id="djPhraseSwap" type="checkbox">
+            📄 Replace a held-back line from the speakbox
+          </label>
+          <div id="djPhraseState" class="muted"
+               style="font-size:11px;margin-top:6px"></div>
+        </div>
         <!-- How often and how long now live behind 🎛 Banter (#202). -->
         <input id="djBanterEvery" type="hidden" value="0">
 
@@ -49410,6 +50533,252 @@ async function remoteDotPaint() {
  * It also blocks a second click for the duration: the wait is long enough
  * that people press again, and a second press means a second render queued
  * behind the first, so the impatient click is self-punishing. */
+/* ---- Pending operations, and the way back to the popup (#779) ---------
+ *
+ * "if i have a pending operation from closing a popup like right here, show
+ * a bubble for that operation in the left corner of the screen that I can
+ * click to reload the progress bar and have a steam style interface for
+ * managing pending operations and be able to go back to the root popups."
+ *
+ * Every long job in this panel already announces itself the same way — it
+ * calls pending() on the button that started it and calls the returned
+ * done() when it finishes. So the tray does not need a single call site
+ * changed: it hooks that one helper, notes which popup the button was
+ * sitting in, and keeps the job on a shelf whether or not the popup that
+ * started it is still on screen. Closing a modal stops hiding the work.
+ *
+ * Which popup a job belongs to is read off the modal element it lives in,
+ * and every modal in this panel is a fixed shade with an id ending "Modal".
+ * The map below pairs those ids with the function that opens them, which is
+ * what makes "go back to the root popup" a button rather than a memory. */
+const PINE_REOPEN = {
+  adArchiveModal: "adArchivePopup", adStudioModal: "adStudioOpen",
+  artistReadModal: "artistReadPanel", boothModal: "boothOpen",
+  calModal: "calOpen", callRecModal: "callRecordings",
+  cookieModal: "studioCookies", djBanterModal: "djBanterPanel",
+  djCallersModal: "djCallersPanel", djGraphModal: "djGraphPanel",
+  djMindModal: "mindOpen", djPromptModal: "djPromptManage",
+  djRepairModal: "djRepairPopup", djStationModal: "djStationPanel",
+  djTopicsModal: "djTopicsPanel", docLockModal: "docLockPanel",
+  hangupModal: "hangupRules", mixtapeModal: "mixtapeLibrary",
+  pineInitModal: "pineboxInitialize", pineStatusModal: "pineboxStatus",
+  plotModal: "plotOpen", remoteModal: "remotePanel",
+  ringModal: "phoneRingStudio", sfxStatsModal: "sfxStatsOpen",
+  themeDocModal: "themeDocPick", voiceDeskModal: "voiceDeskOpen",
+  voiceTestModal: "voiceTestOpen",
+};
+const PINE_MODAL_NAME = {
+  adArchiveModal: "the ad book", adStudioModal: "the Ad studio",
+  boothModal: "the booth", callRecModal: "the Radio cache",
+  djBanterModal: "the banter settings", djPromptModal: "system prompts",
+  djStationModal: "the station", mixtapeModal: "the mixtape library",
+  pineInitModal: "Initialize the Pine Box", voiceDeskModal: "the voice desk",
+  voiceTestModal: "the voice test", djMindModal: "the Mind",
+};
+const PINE_OPS = new Map();
+let PINE_OP_SEQ = 0;
+
+function opsModalOf(node) {
+  let at = node;
+  while (at && at !== document.body) {
+    if (at.id && /Modal$/.test(at.id)) return at.id;
+    at = at.parentElement;
+  }
+  return "";
+}
+
+function opsRegister(label, modalId, detail) {
+  const id = "op" + (++PINE_OP_SEQ);
+  PINE_OPS.set(id, {
+    label: String(label || "working").slice(0, 60),
+    modal: modalId || "",
+    detail: String(detail || ""),
+    started: Date.now(),
+    frac: null,
+  });
+  opsPaint();
+  return id;
+}
+
+function opsFinish(id) {
+  if (PINE_OPS.delete(id)) opsPaint();
+}
+
+/* For any job that knows how far along it is. */
+function opsProgress(id, frac, detail) {
+  const op = PINE_OPS.get(id);
+  if (!op) return;
+  if (frac != null) op.frac = Math.max(0, Math.min(1, Number(frac)));
+  if (detail != null) op.detail = String(detail);
+  opsPaint();
+}
+
+function opsStyle() {
+  if (document.getElementById("pineOpsCss")) return;
+  const s = document.createElement("style");
+  s.id = "pineOpsCss";
+  s.textContent =
+    "@keyframes pineOpsSlide{0%{left:-40%}100%{left:100%}}"
+    + "@keyframes pineOpsNudge{0%,100%{transform:translateY(0)}"
+    + "50%{transform:translateY(-3px)}}"
+    + "#pineOpsBubble{animation:pineOpsNudge 2.4s ease-in-out infinite}"
+    + ".pine-ops-bar{position:relative;height:5px;border-radius:3px;"
+    + "background:#1b2130;overflow:hidden}"
+    + ".pine-ops-bar>i{position:absolute;top:0;height:100%;border-radius:3px;"
+    + "background:var(--accent,#4f8cff)}"
+    + ".pine-ops-bar>i.spin{width:40%;animation:pineOpsSlide 1.25s linear "
+    + "infinite}";
+  document.head.appendChild(s);
+}
+
+function opsElapsed(op) {
+  const s = Math.max(0, Math.round((Date.now() - op.started) / 1000));
+  return s < 60 ? s + "s" : Math.floor(s / 60) + "m " + (s % 60) + "s";
+}
+
+function opsPaint() {
+  opsStyle();
+  let bubble = document.getElementById("pineOpsBubble");
+  if (!PINE_OPS.size) {
+    if (bubble) bubble.remove();
+    const tray = document.getElementById("pineOpsTray");
+    if (tray) tray.remove();
+    return;
+  }
+  if (!bubble) {
+    bubble = document.createElement("div");
+    bubble.id = "pineOpsBubble";
+    bubble.style.cssText = "position:fixed;left:14px;bottom:14px;z-index:400;"
+      + "background:#0e1420;border:1px solid var(--border,#2a2f3a);"
+      + "border-radius:999px;padding:7px 13px;cursor:pointer;font-size:12px;"
+      + "box-shadow:0 6px 20px #0009;display:flex;align-items:center;gap:8px";
+    bubble.title = "Operations still running — click to manage them and go "
+      + "back to the popup that started them";
+    bubble.onclick = opsTray;
+    document.body.appendChild(bubble);
+  }
+  const n = PINE_OPS.size;
+  bubble.innerHTML = "<span style='font-size:14px'>⏳</span><b>" + n
+    + "</b> <span style='opacity:.8'>"
+    + (n === 1 ? "operation running" : "operations running") + "</span>";
+  const tray = document.getElementById("pineOpsTray");
+  if (tray) opsTrayFill(tray.querySelector(".pine-ops-list"));
+}
+
+function opsTray() {
+  const old = document.getElementById("pineOpsTray");
+  if (old) { old.remove(); return; }
+  opsStyle();
+  const box = document.createElement("div");
+  box.id = "pineOpsTray";
+  box.style.cssText = "position:fixed;left:14px;bottom:58px;z-index:401;"
+    + "width:min(400px,92vw);max-height:60vh;overflow:auto;background:#0b1018;"
+    + "border:1px solid var(--border,#2a2f3a);border-radius:12px;"
+    + "padding:12px;box-shadow:0 10px 34px #000b";
+  const head = document.createElement("div");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "margin-bottom:8px";
+  head.innerHTML = "<b style='font-size:13px'>⏳ Operations</b>";
+  const x = document.createElement("span");
+  x.textContent = "✕";
+  x.style.cssText = "margin-left:auto;cursor:pointer;opacity:.7";
+  x.onclick = () => box.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  const why = document.createElement("div");
+  why.className = "muted";
+  why.style.cssText = "font-size:10.5px;line-height:1.5;margin-bottom:8px";
+  why.textContent = "Everything still running, whether or not the popup that "
+    + "started it is open. Go back to a popup and the job is still there.";
+  box.appendChild(why);
+  const list = document.createElement("div");
+  list.className = "pine-ops-list";
+  box.appendChild(list);
+  document.body.appendChild(box);
+  opsTrayFill(list);
+}
+
+function opsTrayFill(list) {
+  if (!list) return;
+  list.innerHTML = "";
+  if (!PINE_OPS.size) {
+    const done = document.createElement("div");
+    done.className = "muted";
+    done.style.cssText = "font-size:11px";
+    done.textContent = "nothing running";
+    list.appendChild(done);
+    return;
+  }
+  PINE_OPS.forEach((op, id) => {
+    const row = document.createElement("div");
+    row.style.cssText = "border-top:1px solid var(--border,#2a2f3a);"
+      + "padding:7px 0";
+    const top = document.createElement("div");
+    top.style.cssText = "display:flex;align-items:center;gap:8px;"
+      + "font-size:11.5px";
+    const where = PINE_MODAL_NAME[op.modal]
+      || (op.modal ? op.modal.replace(/Modal$/, "") : "");
+    // callerDossierEsc, not a local esc(): every esc in this file is a
+    // function-local const, and reaching for one from here is a
+    // ReferenceError the moment the tray opens.
+    top.innerHTML = "<b>" + callerDossierEsc(op.label) + "</b>"
+      + (where ? "<span class='muted' style='font-size:10.5px'>· "
+         + callerDossierEsc(where) + "</span>" : "");
+    const clock = document.createElement("span");
+    clock.className = "muted";
+    clock.style.cssText = "margin-left:auto;font-size:10.5px";
+    clock.textContent = opsElapsed(op);
+    top.appendChild(clock);
+    row.appendChild(top);
+    const bar = document.createElement("div");
+    bar.className = "pine-ops-bar";
+    bar.style.marginTop = "5px";
+    const fill = document.createElement("i");
+    if (op.frac == null) {
+      fill.className = "spin";
+    } else {
+      fill.style.left = "0";
+      fill.style.width = Math.round(op.frac * 100) + "%";
+    }
+    bar.appendChild(fill);
+    row.appendChild(bar);
+    if (op.detail) {
+      const d = document.createElement("div");
+      d.className = "muted";
+      d.style.cssText = "font-size:10.5px;margin-top:3px";
+      d.textContent = op.detail;
+      row.appendChild(d);
+    }
+    const opener = PINE_REOPEN[op.modal];
+    if (opener) {
+      const back = document.createElement("button");
+      back.textContent = "↩ back to " + (where || "the popup");
+      back.style.cssText = "font-size:10.5px;padding:2px 8px;margin-top:5px";
+      back.title = "Reopen the popup this job was started from";
+      back.onclick = () => {
+        const open = document.getElementById(op.modal);
+        if (open) {                     // already there — just show it
+          open.style.outline = "2px solid var(--accent,#4f8cff)";
+          setTimeout(() => { open.style.outline = ""; }, 900);
+          return;
+        }
+        try {
+          const fn = window[opener];
+          if (typeof fn === "function") fn();
+        } catch (e) { /* a popup that will not reopen is not a crash */ }
+      };
+      row.appendChild(back);
+    }
+    list.appendChild(row);
+  });
+}
+
+setInterval(() => {
+  if (PINE_OPS.size && document.getElementById("pineOpsTray")) {
+    opsTrayFill(document.querySelector("#pineOpsTray .pine-ops-list"));
+  }
+}, 1000);
+
 function pending(node, waitingLabel) {
   if (!node) return () => {};
   if (node.dataset.pendingOn === "1") return () => {};
@@ -49420,15 +50789,21 @@ function pending(node, waitingLabel) {
   node.title = waitingLabel || "working — this can take a while the first time";
   if (node.tagName === "BUTTON") node.disabled = true;
   if (waitingLabel && node.tagName === "BUTTON") node.textContent = waitingLabel;
+  // #779: the same job, on the shelf, so closing the popup does not lose it.
+  const opId = opsRegister(wasText || waitingLabel || "working",
+                           opsModalOf(node), waitingLabel || "");
+  node.dataset.pendingOp = opId;
   let over = false;
   return () => {
     if (over) return;
     over = true;
+    opsFinish(opId);
     node.classList.remove("pending");
     node.title = wasTitle;
     node.textContent = wasText;
     if (node.tagName === "BUTTON") node.disabled = false;
     delete node.dataset.pendingOn;
+    delete node.dataset.pendingOp;
   };
 }
 
@@ -52861,8 +54236,17 @@ function djTalkMarkLive() {
     // #748: the LAST match, not the first. djJumpLive took the first and
     // this took the last, so on a repeated liner the jump and the pulse
     // pointed at rows hours apart.
+    // #778: and only when that match is the NEWEST row in the log. "The most
+    // recent row with these words anywhere in the night" is how a station ID
+    // or a catchphrase lit a row from an hour ago and called it the line on
+    // air. The server publishes an id for everything it is airing; when no
+    // id matches, nothing is known to be live, and lighting a guess is worse
+    // than lighting nothing.
     const all = log.querySelectorAll('[data-said="' + CSS.escape(want) + '"]');
-    found = all.length ? all[all.length - 1] : null;
+    const last = all.length ? all[all.length - 1] : null;
+    const rows = log.querySelectorAll("[data-eid]");
+    found = (last && rows.length && rows[rows.length - 1] === last)
+      ? last : null;
   }
   if (djTalkLiveRow && djTalkLiveRow !== found) {
     djTalkLiveRow.classList.remove("booth-live");
@@ -54789,11 +56173,317 @@ function djTopicsPanel() {
   draw();
 }
 
+/* ---- The system prompt over the hosts (#780) -------------------------
+ *
+ * "offer a box for toggling and adjusting the system prompt affecting the
+ * hosts of the show in the area shown here. I want to be able to turn it
+ * off and make sure that I set a specific system prompt and have system
+ * prompts i store, add to, toggle between, delete, export as md and
+ * group / ungroup."
+ *
+ * The store already existed — settings.prompts, with active_prompt as the
+ * armed one — but it lived in the assistant panel, and the switch deciding
+ * whether it touched the show at all (follow_prompt) was at the bottom of a
+ * collapsed section under the DJ. All of it is up beside the hosts now. */
+let djPromptCache = {prompts: [], active: 0};
+
+async function djPromptLoad() {
+  const bar = document.getElementById("djPromptPick");
+  if (!bar) return;
+  try {
+    const s = await api("/api/settings");
+    djPromptCache = {
+      prompts: s.prompts || [],
+      active: s.active_prompt || 0,
+      follow: !!(s.dj || {}).follow_prompt,
+    };
+  } catch (e) { return; }
+  const on = document.getElementById("djPromptOn");
+  if (on) on.checked = !!djPromptCache.follow;
+  djPromptFillPicker(bar);
+  djPromptNote();
+}
+
+/* Grouped with <optgroup>, so "group / ungroup" is visible where you pick. */
+function djPromptFillPicker(sel) {
+  sel.innerHTML = "";
+  const groups = new Map();
+  (djPromptCache.prompts || []).forEach((p, i) => {
+    const g = (p.group || "").trim();
+    if (!groups.has(g)) groups.set(g, []);
+    groups.get(g).push([i, p]);
+  });
+  const names = [...groups.keys()].sort((a, b) =>
+    (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b)));
+  names.forEach((g) => {
+    const parent = g
+      ? document.createElement("optgroup") : sel;
+    if (g) { parent.label = g; sel.appendChild(parent); }
+    groups.get(g).forEach(([i, p]) => {
+      const o = document.createElement("option");
+      o.value = String(i);
+      o.textContent = p.name || "(unnamed)";
+      parent.appendChild(o);
+    });
+  });
+  sel.value = String(djPromptCache.active || 0);
+}
+
+function djPromptNote() {
+  const note = document.getElementById("djPromptNote");
+  if (!note) return;
+  const p = (djPromptCache.prompts || [])[djPromptCache.active] || {};
+  note.textContent = djPromptCache.follow
+    ? "colouring the pair" + (p.group ? " · " + p.group : "")
+    : "off — the pair are purely their personas";
+}
+
+/* The whole settings object goes back on a PUT, so read-modify-write. */
+async function djPromptSave(mutate, note) {
+  const status = document.getElementById("djPromptNote");
+  try {
+    const s = await api("/api/settings");
+    mutate(s);
+    await api("/api/settings", {method: "PUT", body: JSON.stringify(s)});
+    await djPromptLoad();
+    if (status && note) status.textContent = note;
+    return true;
+  } catch (e) {
+    if (status) status.textContent = e.message;
+    return false;
+  }
+}
+
+async function djPromptToggle() {
+  const on = document.getElementById("djPromptOn").checked;
+  await djPromptSave((s) => { (s.dj = s.dj || {}).follow_prompt = on; },
+    on ? "on — it colours the pair from their next line"
+       : "off — the pair are purely their personas");
+  const box = document.getElementById("djFollowPrompt");
+  if (box) box.checked = on;            // the old switch, kept in step
+}
+
+async function djPromptPickSet() {
+  const at = Number(document.getElementById("djPromptPick").value || 0);
+  await djPromptSave((s) => { s.active_prompt = at; }, "armed");
+}
+
+/* Store, add to, delete, group / ungroup, export. */
+function djPromptManage() {
+  const old = document.getElementById("djPromptModal");
+  if (old) { old.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "djPromptModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:181;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(720px,95vw);max-height:86vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:6px";
+  head.appendChild(el("h2", "", "🧠 System prompts"));
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  card.appendChild(head);
+  const why = el("div", "muted",
+    "The standing instructions over the whole station. The armed one is "
+    + "★ — it colours both hosts when the switch beside the voices is on, "
+    + "and it is the assistant's system prompt either way. Give two prompts "
+    + "the same group name to shelve them together; clear the group to "
+    + "ungroup.");
+  why.style.cssText = "font-size:11px;line-height:1.55;margin-bottom:10px";
+  card.appendChild(why);
+  const body = el("div", "", "");
+  card.appendChild(body);
+  shade.appendChild(card);
+  document.body.appendChild(shade);
+
+  const draw = () => {
+    body.innerHTML = "";
+    const rows = djPromptCache.prompts || [];
+    const groups = new Map();
+    rows.forEach((p, i) => {
+      const g = (p.group || "").trim();
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push([i, p]);
+    });
+    const names = [...groups.keys()].sort((a, b) =>
+      (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b)));
+    names.forEach((g) => {
+      const gh = el("div", "", g || "Ungrouped");
+      gh.style.cssText = "font-weight:700;margin:10px 0 4px;font-size:12px;"
+        + "color:var(--accent)";
+      body.appendChild(gh);
+      groups.get(g).forEach(([i, p]) => {
+        const row = el("div", "", "");
+        row.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+          + "padding:8px;margin-bottom:8px";
+        const top = el("div", "row", "");
+        top.style.cssText = "gap:6px;align-items:center;flex-wrap:wrap";
+        const arm = el("button", i === djPromptCache.active ? "primary" : "",
+          i === djPromptCache.active ? "★ armed" : "☆ arm");
+        arm.style.cssText = "font-size:11px;padding:2px 8px";
+        arm.title = "Make this the standing system prompt";
+        arm.onclick = async () => {
+          await djPromptSave((s) => { s.active_prompt = i; }, "armed");
+          draw();
+        };
+        top.appendChild(arm);
+        const nm = el("input", "", "");
+        nm.value = p.name || "";
+        nm.placeholder = "name";
+        nm.style.cssText = "flex:1;min-width:150px;font-size:11.5px";
+        top.appendChild(nm);
+        const gp = el("input", "", "");
+        gp.value = p.group || "";
+        gp.placeholder = "group (blank = ungrouped)";
+        gp.style.cssText = "width:190px;font-size:11.5px";
+        gp.title = "Type the same group name on two prompts to shelve them "
+          + "together. Clear it to ungroup this one.";
+        top.appendChild(gp);
+        row.appendChild(top);
+        const ta = el("textarea", "", "");
+        ta.value = p.prompt || "";
+        ta.style.cssText = "width:100%;min-height:80px;font-size:11.5px;"
+          + "margin-top:6px";
+        row.appendChild(ta);
+        const acts = el("div", "row", "");
+        acts.style.cssText = "gap:5px;margin-top:5px;align-items:center;"
+          + "flex-wrap:wrap";
+        const note = el("span", "muted", "");
+        note.style.cssText = "font-size:10.5px";
+        const save = el("button", "", "💾 Save");
+        save.style.cssText = "font-size:11px;padding:2px 8px";
+        save.onclick = async () => {
+          const done = pending(save, "…");
+          const ok = await djPromptSave((s) => {
+            s.prompts[i] = {name: nm.value.trim() || ("prompt " + (i + 1)),
+                            prompt: ta.value, group: gp.value.trim()};
+          }, "saved");
+          note.textContent = ok ? "saved ✓" : "";
+          done();
+          if (ok) draw();
+        };
+        acts.appendChild(save);
+        const dup = el("button", "", "⧉ Duplicate");
+        dup.style.cssText = "font-size:11px;padding:2px 8px";
+        dup.onclick = async () => {
+          const done = pending(dup, "…");
+          await djPromptSave((s) => {
+            s.prompts.splice(i + 1, 0, {
+              name: (nm.value.trim() || "prompt") + " copy",
+              prompt: ta.value, group: gp.value.trim()});
+          }, "duplicated");
+          done(); draw();
+        };
+        acts.appendChild(dup);
+        const md = el("a", "", "⬇ md");
+        md.href = "javascript:void 0";
+        md.title = "Save this one prompt as markdown";
+        md.style.cssText = "font-size:11px;color:var(--accent)";
+        md.onclick = () => cacheSaveWords(nm.value || "system-prompt",
+          "# " + (nm.value || "system prompt")
+          + (gp.value ? "\n\n*group: " + gp.value + "*" : "")
+          + "\n\n" + ta.value);
+        acts.appendChild(md);
+        const bin = el("button", "danger", "🗑");
+        bin.style.cssText = "font-size:11px;padding:2px 8px";
+        bin.title = rows.length > 1 ? "Delete this prompt"
+          : "The last prompt cannot be deleted — the station needs one";
+        bin.disabled = rows.length < 2;
+        bin.onclick = async () => {
+          if (!confirm("Delete the system prompt \"" + (p.name || "") + "\"?"))
+            return;
+          const done = pending(bin, "…");
+          await djPromptSave((s) => {
+            s.prompts.splice(i, 1);
+            if (s.active_prompt >= s.prompts.length) s.active_prompt = 0;
+          }, "deleted");
+          done(); draw();
+        };
+        acts.appendChild(bin);
+        acts.appendChild(note);
+        row.appendChild(acts);
+        body.appendChild(row);
+      });
+    });
+
+    const foot = el("div", "row", "");
+    foot.style.cssText = "gap:6px;margin-top:12px;flex-wrap:wrap;"
+      + "align-items:center";
+    const add = el("button", "primary", "＋ New system prompt");
+    add.style.cssText = "font-size:11px;padding:3px 10px";
+    add.onclick = async () => {
+      const done = pending(add, "…");
+      await djPromptSave((s) => {
+        let n = 1;
+        const taken = new Set((s.prompts || []).map((p) => p.name));
+        while (taken.has("New prompt " + n)) n += 1;
+        s.prompts.push({name: "New prompt " + n, group: "",
+                        prompt: "You are the standing instruction over the "
+                          + "station tonight."});
+      }, "added");
+      done(); draw();
+    };
+    foot.appendChild(add);
+    const exp = el("button", "", "📄 Export all as markdown");
+    exp.style.cssText = "font-size:11px;padding:3px 10px";
+    exp.onclick = async () => {
+      const done = pending(exp, "…");
+      try {
+        const r = await fetch("/api/prompts/archive.md",
+          {headers: {"Authorization": "Bearer " + key()}});
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const url = URL.createObjectURL(await r.blob());
+        const a = document.createElement("a");
+        a.href = url; a.download = "pinebox-system-prompts.md";
+        document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 15000);
+      } catch (e) { alert(e.message); }
+      finally { done(); }
+    };
+    foot.appendChild(exp);
+    body.appendChild(foot);
+  };
+  djPromptLoad().then(draw);
+}
+
 /* ---- DJ settings ---- */
 
 function djLines(id) {
   return document.getElementById(id).value
     .split("\n").map((s) => s.trim()).filter(Boolean);
+}
+
+/* #no-repeats: what the cooldown is actually doing right now. "said=7 blocked=0" was
+   the whole diagnosis of the old engine and it took a hand-read of the API to
+   see it — so the working state is on the panel this time. */
+async function paintPhraseState() {
+  const box = document.getElementById("djPhraseState");
+  if (!box) return;
+  try {
+    const data = await api("/api/dj/prints?limit=1");
+    const p = data.phrases || {};
+    if (!p.on) {
+      box.textContent = "off — nothing is stopping a phrase coming round again";
+      return;
+    }
+    const bits = [
+      p.in_window + " phrases inside the window",
+      "shelf " + (p.shelf || 0),
+    ];
+    if (p.pressure > 0) {
+      bits.push(Math.round(p.pressure * 100) + "% of recent lines held back");
+    }
+    box.textContent = bits.join(" · ")
+      + ((p.hot || []).length ? " · leaning on: "
+         + p.hot.slice(0, 4).map((h) => '"' + h + '"').join(", ") : "");
+  } catch (error) {
+    box.textContent = "";
+  }
 }
 
 async function djLoadSettings() {
@@ -54835,6 +56525,17 @@ async function djLoadSettings() {
     document.getElementById("djFollowPrompt").checked = !!dj.follow_prompt;
     document.getElementById("djDiceHosts").checked = !!dj.dice_hosts;      // #676
     document.getElementById("djDiceCallers").checked = !!dj.dice_callers;  // #676
+    // #no-repeats: the phrase cooldown.
+    document.getElementById("djPhraseCooldown").value =
+      dj.phrase_cooldown_minutes ?? 60;
+    document.getElementById("djPhraseCooldownSelf").value =
+      dj.phrase_cooldown_self_minutes ?? 120;
+    document.getElementById("djPhraseNgram").value = dj.phrase_ngram ?? 5;
+    document.getElementById("djPhraseRetries").value = dj.phrase_retries ?? 1;
+    document.getElementById("djPhraseSwap").checked =
+      dj.phrase_swap_from_speakbox !== false;
+    paintPhraseState();
+    djPromptLoad();                                                   // #780
     document.getElementById("djArtLookup").checked = dj.art_lookup !== false;
     document.getElementById("djArtSearch").checked = dj.art_search === true;
     document.getElementById("djPriceLow").value = dj.ad_price_low ?? 40;
@@ -55658,6 +57359,53 @@ async function stagingDesk() {
   await load();
 }
 
+/* #781: "allow me to download each and every entry listed in the cache."
+   Two halves. This one takes ONE entry away: its audio if it has audio, and
+   its words if it does not — which was most of the ad book, 182 of 200 spots
+   that existed only inside a textarea in a modal. */
+function cacheSaveWords(name, text) {
+  const blob = new Blob([String(text || "")], {type: "text/markdown"});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = (String(name || "entry").replace(/[^\w -]+/g, "").trim()
+    .slice(0, 60) || "entry") + ".md";
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 15000);
+}
+
+/* A "⬇ words" link for a row, styled like the "⬇ mp3" beside it. */
+function cacheWordsLink(name, getText) {
+  const dl = el("a", "", "⬇ words");
+  dl.href = "javascript:void 0";
+  dl.title = "Save this entry's words to a file";
+  dl.onclick = () => cacheSaveWords(name, getText());
+  dl.style.cssText = "font-size:11px;color:var(--accent)";
+  return dl;
+}
+
+/* And the other half: the whole shelf as one zip, built server-side. */
+function cacheBundleButton(tab, label) {
+  const b = el("button", "", label);
+  b.style.cssText = "font-size:11px;padding:3px 9px";
+  b.title = "Download every entry on this shelf — audio where there is "
+    + "audio, the words where there is not";
+  b.onclick = async () => {
+    const done = pending(b, "⏳ zipping…");
+    try {
+      const sigs = await api("/api/radio-cache/bundle-sig");
+      const a = document.createElement("a");
+      a.href = "/api/radio-cache/bundle/" + tab + "?t="
+        + encodeURIComponent(sigs[tab] || "");
+      a.download = "pinebox-cache-" + tab + ".zip";
+      document.body.appendChild(a); a.click(); a.remove();
+    } catch (e) {
+      alert(e.message);
+    } finally { done(); }
+  };
+  return b;
+}
+
 async function callRecordings() {
   const open = document.getElementById("callRecModal");
   if (open) { open.remove(); return; }
@@ -55784,8 +57532,12 @@ async function callRecordings() {
     list.appendChild(live);
 
     // --- the collected sets ---------------------------------------------
-    const h1 = el("div", "", "🎚 Sets — the broadcast with the records in");
-    h1.style.cssText = "font-weight:700;margin:4px 0 6px";
+    const h1 = el("div", "row", "");
+    h1.style.cssText = "font-weight:700;margin:4px 0 6px;align-items:center;"
+      + "gap:8px;flex-wrap:wrap";
+    h1.appendChild(el("span", "", "🎚 Sets — the broadcast with the records "
+      + "in"));
+    h1.appendChild(cacheBundleButton("mix", "⬇ every set"));      // #781
     list.appendChild(h1);
     list.appendChild(dlBar("broadcasts"));
     (mixes.broadcasts || []).forEach((r) => {
@@ -56044,6 +57796,9 @@ async function callRecordings() {
       finally { done(); }
     };
     reel.appendChild(book);
+    // #781: the book is the words only, and the reel is the produced ones
+    // only. This is every spot — its words, and its audio where it has any.
+    reel.appendChild(cacheBundleButton("ads", "⬇ every spot + audio"));
     reel.appendChild(rnote);
     list.appendChild(reel);
 
@@ -56170,6 +57925,13 @@ async function callRecordings() {
         dl.style.cssText = "font-size:11px;color:var(--accent)";
         acts.appendChild(dl);
       }
+      // #781: every entry, not only the produced ones. A spot with no audio
+      // had no way off the station at all.
+      acts.appendChild(cacheWordsLink(a.product || "ad",
+        () => "# " + (a.product || "an ad read") + "\n\n"
+          + (a.ts ? "*" + new Date(a.ts * 1000).toLocaleString()
+             + " · aired " + (a.uses || 0) + "×*\n\n" : "")
+          + script.value));
       const bin = el("button", "danger", "🗑");
       bin.style.cssText = "font-size:11px;padding:2px 8px";
       bin.title = "Delete this spot for good";
@@ -56278,6 +58040,8 @@ async function callRecordings() {
       finally { done(); }
     };
     acts.appendChild(book);
+    // #781: the words AND the audio, every page, as one zip.
+    acts.appendChild(cacheBundleButton("upstairs", "⬇ every page + audio"));
     bar.appendChild(acts); bar.appendChild(note);
     list.appendChild(bar);
 
@@ -56374,6 +58138,12 @@ async function callRecordings() {
         dl.style.cssText = "font-size:11px;color:var(--accent)";
         ia.appendChild(dl);
       }
+      ia.appendChild(cacheWordsLink(row.gripe || "page",           // #781
+        () => "# " + (row.gripe || "a page from upstairs") + "\n\n"
+          + (row.ts ? "*" + new Date(row.ts * 1000).toLocaleString()
+             + " · played " + (row.uses || 0) + "×*\n\n" : "")
+          + (row.context ? "Written against: " + row.context + "\n\n" : "")
+          + words.value));
       const bin = el("button", "danger", "🗑");
       bin.style.cssText = "font-size:11px;padding:2px 8px";
       bin.onclick = async () => {
@@ -56477,8 +58247,13 @@ async function callRecordings() {
     list.appendChild(live);
 
     // --- Episodes (offline broadcasts) + the live recording status ---------
-    const h1 = el("div", "", "📼 Episodes — replay the broadcast offline");
-    h1.style.cssText = "font-weight:700;margin:4px 0 6px";
+    const h1 = el("div", "row", "");
+    h1.style.cssText = "font-weight:700;margin:4px 0 6px;align-items:center;"
+      + "gap:8px;flex-wrap:wrap";
+    h1.appendChild(el("span", "", "📼 Episodes — replay the broadcast "
+      + "offline"));
+    // #781: every episode and every call, with their transcripts, in one go.
+    h1.appendChild(cacheBundleButton("talk", "⬇ every entry + transcripts"));
     list.appendChild(h1);
     const rec = eps.recording || {};
     const status = el("div", "muted", "");
@@ -60557,6 +62332,15 @@ async function djSaveSettings() {
       follow_prompt: document.getElementById("djFollowPrompt").checked,
       dice_hosts: document.getElementById("djDiceHosts").checked,      // #676
       dice_callers: document.getElementById("djDiceCallers").checked,  // #676
+      // #no-repeats: the hour.
+      phrase_cooldown_minutes:
+        Number(document.getElementById("djPhraseCooldown").value),
+      phrase_cooldown_self_minutes:
+        Number(document.getElementById("djPhraseCooldownSelf").value),
+      phrase_ngram: Number(document.getElementById("djPhraseNgram").value),
+      phrase_retries: Number(document.getElementById("djPhraseRetries").value),
+      phrase_swap_from_speakbox:
+        document.getElementById("djPhraseSwap").checked,
       overlap: Number(document.getElementById("djOverlap").value),
       art_lookup: document.getElementById("djArtLookup").checked,
       art_search: document.getElementById("djArtSearch").checked,
