@@ -8930,7 +8930,11 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # the truth now; whatever fx it wanted is already baked in.
         engine = str(clip.get("engine") or engine)
     else:
-        if engine == "xtts" and not (await xtts_health())["ready"]:
+        # #746: BOTH cloning engines. This probed XTTS only, so an
+        # F5 voice with :8772 down raised out of voice_generate
+        # instead of falling back to Piper like everything else.
+        if engine in ("xtts", "f5") \
+                and not await clone_engine_ready(engine):
             note_drop(who, "", "xtts down — spoke on piper instead")
             # Keep this speaker DISTINCT on the fallback (#516): the cohost's
             # own piper voice, not the generic default, so an XTTS wobble
@@ -12398,7 +12402,11 @@ async def dj_police_outside(text: str) -> None:
     except Exception:
         voice = ""
     engine = voice_engine_for(voice)
-    if engine == "xtts" and not (await xtts_health())["ready"]:
+    # #746: BOTH cloning engines. This probed XTTS only, so an
+    # F5 voice with :8772 down raised out of voice_generate
+    # instead of falling back to Piper like everything else.
+    if engine in ("xtts", "f5") \
+            and not await clone_engine_ready(engine):
         engine, voice = "piper", _event_voice("default")
     try:
         clip = await voice_generate(
@@ -13327,7 +13335,11 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
         return {"ad": "", "product": product, "id": ""}
     forced = (await session_voices()).get("dj") or None
     engine = voice_engine_for(forced or "")
-    if engine == "xtts" and not (await xtts_health())["ready"]:
+    # #746: BOTH cloning engines. This probed XTTS only, so an
+    # F5 voice with :8772 down raised out of voice_generate
+    # instead of falling back to Piper like everything else.
+    if engine in ("xtts", "f5") \
+            and not await clone_engine_ready(engine):
         engine, forced = "piper", _event_voice("default")
     # A produced spot is VOCODED (#618): the read gets the classic half-dry,
     # phase-locked autotune sheen so the voice sits on the bed like a real
@@ -13544,7 +13556,11 @@ async def ad_produce(product: str, script: str, voice: str,
         return {"error": "Nothing to say — give a prompt or a script."}
     v = voice or (await session_voices()).get("dj") or ""
     engine = voice_engine_for(v)
-    if engine == "xtts" and not (await xtts_health())["ready"]:
+    # #746: BOTH cloning engines. This probed XTTS only, so an
+    # F5 voice with :8772 down raised out of voice_generate
+    # instead of falling back to Piper like everything else.
+    if engine in ("xtts", "f5") \
+            and not await clone_engine_ready(engine):
         engine, v = "piper", _event_voice("default")
     try:
         clip = await voice_generate(line, v, engine, fx={"vocode": "autotune"})
@@ -20788,7 +20804,11 @@ async def speak_turns(turns: list[tuple[str, str]],
         try:
             v = _turn_voice(item) or ""
             engine = voice_engine_for(v)
-            if engine == "xtts" and not (await xtts_health())["ready"]:
+            # #746: BOTH cloning engines. This probed XTTS only, so an
+            # F5 voice with :8772 down raised out of voice_generate
+            # instead of falling back to Piper like everything else.
+            if engine in ("xtts", "f5") \
+                    and not await clone_engine_ready(engine):
                 return None
             if engine == "voxtral" and not (await voxtral_health())["ready"]:
                 return None
@@ -43235,6 +43255,7 @@ function djTalkPopup() {
  */
 const ENGINE_SERVICE = {
   xtts: "XTTS server (voice cloning · :8770)",
+  f5: "F5-TTS server (voice cloning · :8772)",        // #746
   piper: "Piper, over the Wyoming satellite link",
   voxtral: "Voxtral (experimental)",
   ha: "Home Assistant TTS",
@@ -45694,6 +45715,13 @@ function djTalkRow(line) {
         + "— buried, and never said again";
     }
     row.appendChild(said);
+    // #707/#745: …and the pictures this line is about, in the margin beside
+    // it. The strip has been BUILT for a long time — up to three <img> with
+    // real src assignments, on every line — and never appended to anything,
+    // so the feature has never once appeared and the loads were pure waste.
+    // It goes on the row here, after the text has claimed its flex space,
+    // which is where the #707 comment always said it belonged.
+    if (artStrip) row.appendChild(artStrip);
     // The R button (#443, #452): INSIDE the message, trailing the text,
     // so it sits with the line it bans rather than floating in the corner.
     if (spoken && line.text) {
