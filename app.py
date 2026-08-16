@@ -9157,6 +9157,16 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         finally:
             _SPEAKING[0] = max(0, _SPEAKING[0] - 1)
             _SPOKE_AT[0] = time.time()
+    elif not box_talk_ok() and (
+            (_RADIO.get("reply_to") if kind == "reply"
+             else _RADIO.get("voice_to")) or "box") in ("box", "both"):
+        # #757: say the CAUSE, not the consequence. This branch used to
+        # format the post-override local and produce "voice output is routed
+        # to 'here', not the box" — which is the override describing its own
+        # handiwork as though it were the operator's setting, and it
+        # overwrote the honest note written where the rewrite happens.
+        why = ("the Pine Box master switch is OFF — the show was sent to "
+               "the page instead")
     else:
         why = f"voice output is routed to {voice_to!r}, not the box"
 
@@ -20879,166 +20889,215 @@ async def speak_turns(turns: list[tuple[str, str]],
     # failure falls straight through to the turn-by-turn path below, so the
     # call is never lost (dry beats broken).
     if render_stream and playlist:
-        try:
-            rendered = await asyncio.gather(*premade)
-        except Exception:
-            rendered = [None] * len(playlist)
-        seg: list[str] = []
-        # Only a real CALL opens with a ring and closes with a hang-up; a
-        # coalesced booth round (#616/#625) is just the turns, joined clean.
-        if caller_name:
-            ring = await asyncio.to_thread(make_phone_ring)
-            if ring:
-                seg.append(str(ring))
-        transcript: list[tuple[str, str]] = []
+        # #760: NOT here. This used to be `await asyncio.gather(*premade)`,
+        # which waits for every turn in the round before a single one can be
+        # played — forty-three of them, at seven to nine seconds each, is
+        # the five minutes of dead air. Each batch now awaits only its own
+        # turns; the rest keep rendering in the background, which is what
+        # the pre-render was always for.
+        played_any = False
+        # #760: the batch ladder. The first burst is small so the room hears
+        # something almost at once; later ones widen so the joins stay rare.
+        # 43 turns used to mean 43 renders before a single word.
+        def _batches(total: int) -> list[tuple[int, int]]:
+            out: list[tuple[int, int]] = []
+            at, width = 0, 2
+            while at < total:
+                out.append((at, min(total, at + width)))
+                at += width
+                width = min(8, width * 2)
+            return out
+
+        spans = _batches(len(playlist))
+        for _bi, (_lo, _hi) in enumerate(spans):
+            first_batch = _bi == 0
+            last_batch = _bi == len(spans) - 1
+            seg: list[str] = []
+            # Only a real CALL opens with a ring and closes with a hang-up; a
+            # coalesced booth round (#616/#625) is just the turns, joined
+            # clean. The ring belongs to the first burst only.
+            if caller_name and first_batch:
+                ring = await asyncio.to_thread(make_phone_ring)
+                if ring:
+                    seg.append(str(ring))
+            transcript: list[tuple[str, str]] = []
         # The conversation PRE-PLAN (#556): every planned turn laid out with
         # its checkpoints — written already (the script exists), intonation
         # attached (the performance vector), rendered flipped true as each clip
         # lands. The Mind flow-chart and /api/dj/plan read this, so the whole
         # conversation can be watched lining up before it airs.
-        _RADIO["plan"] = {
-            "kind": "call" if caller_name else "deep",
-            "at": int(time.time()), "who": caller_name or "the booth",
-            "turns": [{"who": it["who"],
-                       "text": spoken_text(it["chunk"])[:70],
-                       "rendered": False} for it in playlist],
-        }
-        _plan_turns = _RADIO["plan"]["turns"]
-        for idx, (item, clip) in enumerate(zip(playlist, rendered)):
-            if not clip:                        # premake missed — render now
-                v = _turn_voice(item) or ""
-                try:
-                    clip = await voice_generate(
-                        spoken_text(item["chunk"]), v,
-                        voice_engine_for(v), fx=_turn_fx(item))
-                except Exception:
-                    clip = None
-                # A clone that fails must NOT drop the turn from the call —
-                # that is exactly "a caller says one thing then disappears"
-                # (#545). Fall back to piper so EVERY turn makes the stream.
-                if not clip and voice_engine_for(v) != "piper":
+            if first_batch:
+                _RADIO["plan"] = {
+                    "kind": "call" if caller_name else "deep",
+                    "at": int(time.time()),
+                    "who": caller_name or "the booth",
+                    "turns": [{"who": it["who"],
+                               "text": spoken_text(it["chunk"])[:70],
+                               "rendered": False} for it in playlist],
+                }
+            _plan_turns = _RADIO["plan"]["turns"]
+            # Only this burst's turns. return_exceptions so one bad render
+            # cannot take the round down — the per-turn fallback below
+            # already knows how to re-render a missing clip.
+            batch = await asyncio.gather(*premade[_lo:_hi],
+                                         return_exceptions=True)
+            batch = [None if isinstance(c, BaseException) else c
+                     for c in batch]
+            for idx, (item, clip) in enumerate(
+                    zip(playlist[_lo:_hi], batch), start=_lo):
+                if not clip:                        # premake missed — render now
+                    v = _turn_voice(item) or ""
                     try:
                         clip = await voice_generate(
-                            spoken_text(item["chunk"]),
-                            _event_voice(item["who"])
-                            or _event_voice("default"),
-                            "piper", fx=_turn_fx(item))
+                            spoken_text(item["chunk"]), v,
+                            voice_engine_for(v), fx=_turn_fx(item))
                     except Exception:
                         clip = None
-            if clip and clip.get("path"):
-                key = clip["path"].rsplit("/", 1)[-1]
-                seg.append(str(VOICE_MEDIA_DIR / key))
-                # #748: how long THIS turn runs, so the booth can follow the
-                # coalesced clip turn by turn instead of knowing only that
-                # "a round" is playing.
-                transcript.append((item["who"], item["chunk"],
-                                   _clip_seconds(clip["path"])))
-                _plan_turns[idx]["rendered"] = True    # checkpoint hit (#556)
-        if caller_name:
-            hang = await asyncio.to_thread(make_hangup)
-            if hang:
-                seg.append(str(hang))
-                # #703: audible, so it belongs in the list.
-                _desk_sound("\u260e the receiver going down",
-                            sfx_seconds(hang))
-        mixed = (await asyncio.to_thread(
-                    _call_concat_blocking, seg,
-                    bool(dj_settings().get("stream_texture")))
-                 if len(transcript) >= 1 else None)
-        if mixed:
-            one = _store_media(mixed, "wav")
-            length = _clip_seconds(one["path"]) or 0.0
-            pipeline_log("voice", "call coalesced into one stream — "
-                                  f"{len(transcript)} turns · {length:.0f}s "
-                                  "(#535)")
-            # Keep the whole call as a compressed mp3 + transcript for focused
-            # replay in the radio cache (#548) — only when it IS a call.
-            if caller_name:
-                asyncio.create_task(asyncio.to_thread(
-                    _cache_call_recording, mixed, list(transcript),
-                    caller_name))
-            # The call belongs in the rolling episode too (its per-turn chat
-            # entries bypass dj_speak's capture) (#548).
-            _episode_stage(one["path"],
-                           ("☎ " + caller_name + " — the full call")
-                           if caller_name else "🎙 the booth — a full round")
-            # The transcript still shows every turn in the booth/Mind, even
-            # though the audio is one clip.
-            # #748: THE fix for "the booth is not synced with the active
-            # broadcast". Every conversational path — banter, deep rounds,
-            # calls — funnels through here when stream_show/call_stream are
-            # on, which is the default, and this branch renders the whole
-            # round into ONE clip and appends every row in a single batch
-            # after the audio was built. So the booth had no idea which line
-            # of a two-minute stream was sounding: dj_speak, which is the
-            # only thing that publishes "speaking_now", is never called.
-            # The clip's own timeline is the answer — each turn's measured
-            # length becomes a window, and the panel reads off the clock.
-            rows = []
-            offset = 0.0
-            for who, chunk, secs in transcript:
-                spoken.append(f"{who}: {chunk}")
-                # #752: the coalesced path never went near dj_speak, so
-                # nothing it aired was ever written down — which is why the
-                # overused-phrase and do-not-repeat clauses were reading a
-                # fraction of the show.
-                print_remember(chunk, who, "stream")
-                said_remember(chunk)
-                rid = uuid.uuid4().hex[:6]
-                entry = {
-                    "id": rid,
-                    "ts": int(time.time()), "who": who, "kind": "call",
-                    "text": chunk, "aired": "stream",
-                    "voice": (caller_voice if who == "caller"
-                              else caller2_voice if who == "caller2"
-                              else voices.get(who, "")) or "",
-                }
-                _RADIO["chat"].append(entry)
-                rows.append({"id": rid, "who": who, "kind": "call",
-                             "text": chunk,
-                             "name": (caller_name if who == "caller" else ""),
-                             "from": offset, "until": offset + max(0.4, secs)})
-                offset += max(0.4, secs)
-            del _RADIO["chat"][:-160]
-            # The turns were measured BEFORE the concat, which loudness-
-            # normalises and can lay texture under the join, so the sum
-            # drifts from the finished clip. Scale to what was actually
-            # produced — the real length is already measured above.
-            if rows and offset > 0.5 and length > 0.5:
-                scale = length / offset
-                for r in rows:
-                    r["from"] *= scale
-                    r["until"] *= scale
-            # Deliver the ONE clip on the routing the DJ voice is set to,
-            # mirroring to the page when the box is down (#536).
-            vto = _RADIO.get("voice_to") or "box"
-            if not box_talk_ok() and vto in ("box", "both"):
-                vto = "here"                       # the switch is off (#638)
-            to_box = vto in ("box", "both")
-            box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
-                        or len(_BOX_HOLD) >= 6)
-            stream_label = ("☎ " + caller_name if caller_name
-                            else "🎙 a conversation")
-            if vto in ("here", "both") or (to_box and box_down):
-                _RADIO["voice_clips"].append({
-                    "ts": int(time.time() * 1000),
-                    "url": f"{one['path']}?t={one['sig']}",
-                    "text": stream_label,
-                    "voice": caller_voice or "",
-                })
-                del _RADIO["voice_clips"][:-40]
-            # #748: start the clock at the moment the audio is handed over,
-            # so "which line is sounding" is a lookup rather than a guess.
-            _stream_now_set(rows, length)
-            if to_box:
-                played = await _play_on_box(one["path"], one["sig"])
-                if not played:
-                    # It never went out — the booth must not go on confidently
-                    # following a call nobody can hear.
-                    _stream_now_clear()
-                    box_hold(one, stream_label,
-                             "caller" if caller_name else "dj")
-            return spoken
+                    # A clone that fails must NOT drop the turn from the call —
+                    # that is exactly "a caller says one thing then disappears"
+                    # (#545). Fall back to piper so EVERY turn makes the stream.
+                    if not clip and voice_engine_for(v) != "piper":
+                        try:
+                            clip = await voice_generate(
+                                spoken_text(item["chunk"]),
+                                _event_voice(item["who"])
+                                or _event_voice("default"),
+                                "piper", fx=_turn_fx(item))
+                        except Exception:
+                            clip = None
+                if clip and clip.get("path"):
+                    key = clip["path"].rsplit("/", 1)[-1]
+                    seg.append(str(VOICE_MEDIA_DIR / key))
+                    # #748: how long THIS turn runs, so the booth can follow the
+                    # coalesced clip turn by turn instead of knowing only that
+                    # "a round" is playing.
+                    transcript.append((item["who"], item["chunk"],
+                                       _clip_seconds(clip["path"])))
+                    _plan_turns[idx]["rendered"] = True    # checkpoint hit (#556)
+            if caller_name and last_batch:
+                hang = await asyncio.to_thread(make_hangup)
+                if hang:
+                    seg.append(str(hang))
+                    # #703: audible, so it belongs in the list.
+                    _desk_sound("\u260e the receiver going down",
+                                sfx_seconds(hang))
+            # One segment cannot be concatenated with itself; a single-turn
+            # burst is already one clip and goes out as it is.
+            mixed = (await asyncio.to_thread(
+                        _call_concat_blocking, seg,
+                        bool(dj_settings().get("stream_texture")))
+                     if len(seg) >= 2 else None)
+            if not mixed and len(seg) == 1 and transcript:
+                try:
+                    mixed = Path(seg[0]).read_bytes()
+                except OSError:
+                    mixed = None
+            if mixed:
+                one = _store_media(mixed, "wav")
+                length = _clip_seconds(one["path"]) or 0.0
+                pipeline_log("voice", "call coalesced into one stream — "
+                                      f"{len(transcript)} turns · {length:.0f}s "
+                                      "(#535)")
+                # Keep the whole call as a compressed mp3 + transcript for focused
+                # replay in the radio cache (#548) — only when it IS a call.
+                if caller_name:
+                    asyncio.create_task(asyncio.to_thread(
+                        _cache_call_recording, mixed, list(transcript),
+                        caller_name))
+                # The call belongs in the rolling episode too (its per-turn chat
+                # entries bypass dj_speak's capture) (#548).
+                _episode_stage(one["path"],
+                               ("☎ " + caller_name + " — the full call")
+                               if caller_name else "🎙 the booth — a full round")
+                # The transcript still shows every turn in the booth/Mind, even
+                # though the audio is one clip.
+                # #748: THE fix for "the booth is not synced with the active
+                # broadcast". Every conversational path — banter, deep rounds,
+                # calls — funnels through here when stream_show/call_stream are
+                # on, which is the default, and this branch renders the whole
+                # round into ONE clip and appends every row in a single batch
+                # after the audio was built. So the booth had no idea which line
+                # of a two-minute stream was sounding: dj_speak, which is the
+                # only thing that publishes "speaking_now", is never called.
+                # The clip's own timeline is the answer — each turn's measured
+                # length becomes a window, and the panel reads off the clock.
+                rows = []
+                offset = 0.0
+                for who, chunk, secs in transcript:
+                    spoken.append(f"{who}: {chunk}")
+                    # #752: the coalesced path never went near dj_speak, so
+                    # nothing it aired was ever written down — which is why the
+                    # overused-phrase and do-not-repeat clauses were reading a
+                    # fraction of the show.
+                    print_remember(chunk, who, "stream")
+                    said_remember(chunk)
+                    rid = uuid.uuid4().hex[:6]
+                    entry = {
+                        "id": rid,
+                        "ts": int(time.time()), "who": who, "kind": "call",
+                        "text": chunk, "aired": "stream",
+                        "voice": (caller_voice if who == "caller"
+                                  else caller2_voice if who == "caller2"
+                                  else voices.get(who, "")) or "",
+                    }
+                    _RADIO["chat"].append(entry)
+                    rows.append({"id": rid, "who": who, "kind": "call",
+                                 "text": chunk,
+                                 "name": (caller_name if who == "caller" else ""),
+                                 "from": offset, "until": offset + max(0.4, secs)})
+                    offset += max(0.4, secs)
+                del _RADIO["chat"][:-160]
+                # The turns were measured BEFORE the concat, which loudness-
+                # normalises and can lay texture under the join, so the sum
+                # drifts from the finished clip. Scale to what was actually
+                # produced — the real length is already measured above.
+                if rows and offset > 0.5 and length > 0.5:
+                    scale = length / offset
+                    for r in rows:
+                        r["from"] *= scale
+                        r["until"] *= scale
+                # Deliver the ONE clip on the routing the DJ voice is set to,
+                # mirroring to the page when the box is down (#536).
+                vto = _RADIO.get("voice_to") or "box"
+                if not box_talk_ok() and vto in ("box", "both"):
+                    vto = "here"                       # the switch is off (#638)
+                to_box = vto in ("box", "both")
+                box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
+                            or len(_BOX_HOLD) >= 6)
+                stream_label = ("☎ " + caller_name if caller_name
+                                else "🎙 a conversation")
+                if vto in ("here", "both") or (to_box and box_down):
+                    _RADIO["voice_clips"].append({
+                        "ts": int(time.time() * 1000),
+                        "url": f"{one['path']}?t={one['sig']}",
+                        "text": stream_label,
+                        "voice": caller_voice or "",
+                    })
+                    del _RADIO["voice_clips"][:-40]
+                # #748: start the clock at the moment the audio is handed over,
+                # so "which line is sounding" is a lookup rather than a guess.
+                _stream_now_set(rows, length)
+                if to_box:
+                    played = await _play_on_box(one["path"], one["sig"])
+                    if not played:
+                        # It never went out — the booth must not go on confidently
+                        # following a call nobody can hear.
+                        _stream_now_clear()
+                        box_hold(one, stream_label,
+                                 "caller" if caller_name else "dj")
+                # #760: the burst is done, not the round. Returning here
+                # is what made the whole conversation one clip.
+                played_any = True
+                if last_batch:
+                    return spoken
+                continue
+            # This burst could not be built. If earlier ones already went
+            # out, the round is part-aired and must NOT be replayed whole by
+            # the turn-by-turn path below.
+            if played_any:
+                continue
+        if played_any:
+            return spoken                # part of it aired; do not repeat it
         # concat failed — fall through to the turn-by-turn path.
 
     consumed = 0
@@ -51417,7 +51476,16 @@ async function djVoicePoll(immediate) {
   // website carries the whole conversation and the backend mirrors every
   // line here (#536).
   const boxDown = !!(djLastState && djLastState.box && djLastState.box.down);
-  if (vt === "box" && !boxDown) return;
+  // #758: …and UNLESS the station has quietly rerouted the show here
+  // because the Pine Box master switch is off. The server mirrors every
+  // clip into the page feed when that happens, but this poll was reading
+  // the RAW routing — still "box" — and box.down is deliberately false for
+  // a box that is merely switched OFF (#690). So the server handed the
+  // audio to a page that had decided not to listen, and the result was not
+  // "coming out of the wrong speaker", it was silence everywhere.
+  const rerouted = !!(djLastState && djLastState.box
+                      && djLastState.box.overridden);
+  if (vt === "box" && !boxDown && !rerouted) return;
   try {
     const data = await api("/api/dj/voice?since=" + djVoiceSeen);
     const clips = data.clips || [];
