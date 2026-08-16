@@ -46088,6 +46088,30 @@ function djTalkRow(line) {
         row.appendChild(trace);
         adTraceWatch(trace);
       }
+      // #765: the picture being hawked, beside the words hawking it. The
+      // read names the painting out loud — "this masterpiece from the Pine
+      // Box gallery" — and there was nothing to look at. Spoken lines have
+      // had their pictures in the margin since #707; this tile returns
+      // before that code and never got them.
+      if (line.images && line.images.length) {
+        const shelf = el("div", "row", "");
+        shelf.style.cssText = "gap:5px;flex-wrap:wrap;width:100%;"
+          + "align-items:flex-start";
+        line.images.slice(0, 3).forEach((n) => {
+          const im = document.createElement("img");
+          im.src = "/api/generations/image/" + encodeURIComponent(n);
+          im.loading = "lazy";
+          im.title = n + " — click to open it, right-click to put it back "
+            + "on the block";
+          im.style.cssText = "height:64px;border-radius:6px;flex:0 0 auto;"
+            + "border:1px solid #4a3c14;object-fit:cover;cursor:zoom-in";
+          im.onerror = () => { im.style.display = "none"; };
+          im.onclick = (ev) => { ev.stopPropagation(); artFullscreen(n); };
+          im.oncontextmenu = (ev) => artHawkMenu(ev, n);
+          shelf.appendChild(im);
+        });
+        row.appendChild(shelf);
+      }
       if (line.product && line.text && line.text !== line.product) {
         // #731: the read scrolls past like a lyric while the spot is on
         // air, so you can follow what is being said in the tile itself.
@@ -51693,6 +51717,12 @@ async function djSetOutput(immediate) {
         }
       } catch (e) { /* the switch still took; only the carry-over missed */ }
     }
+    // #763: the panel shows the new routing AT ONCE. djRender only ran on
+    // one branch of this, so switching TO the box left every reading on
+    // screen — the pickers, the master switch, the box banner — describing
+    // the arrangement you had just moved away from until the next poll.
+    djLastState = state;
+    try { djRender(state); } catch (e) { /* the switch still took */ }
     // Act on what is playing right now rather than waiting for the next
     // track (#174). The satellite has no stop service, so a track already
     // announced on the box plays itself out — everything else is immediate.
