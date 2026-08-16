@@ -4152,6 +4152,23 @@ def clone_fallback_voice(who: str = "") -> str:
     return ""
 
 
+def _model_call_for(text: str) -> dict[str, Any]:
+    """Which model call produced this line, matched on its words (#782).
+
+    A line is written inside a ROUND and spoken one turn at a time, so there
+    is no id tying the two together. Matching on a distinctive run of the
+    line against the last few answers is imperfect and honest: when it finds
+    nothing the dossier simply says the writing time is unknown rather than
+    attaching whichever call happened to be last."""
+    probe = " ".join(str(text or "").split())[:60].lower()
+    if len(probe) < 20:
+        return {}
+    for call in reversed(_MODEL_CALLS):
+        if probe in " ".join(str(call.get("text") or "").split()).lower():
+            return {k: v for k, v in call.items() if k != "text"}
+    return {}
+
+
 async def voice_render_any(text: str, voice: str, engine: str = "",
                            fx: dict[str, float] | None = None,
                            who: str = "") -> dict[str, Any] | None:
@@ -4279,7 +4296,13 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                          f"{type(exc).__name__} {str(detail)[:120]}")
             clip = None
         if clip and clip.get("path"):
+            # #782: the road this line actually took, carried on the clip so
+            # the dossier can show every engine that refused before one
+            # spoke — that is most of the interesting story of a bad night.
+            if tried:
+                clip["tried"] = list(tried)
             if why:
+                clip["fallback"] = why
                 pipeline_log("voice", why,
                              extra=f"{who or 'line'}: {text[:180]}")
                 note_drop(who, text, why[:200])
@@ -6124,6 +6147,10 @@ def _trim_wav_seconds(raw: bytes, most: float = 120.0) -> bytes:
 # synthesis per second of audio. Under 1.0 means it renders faster than it
 # plays; over 1.0 means the station is losing ground and the air will go
 # quiet no matter what every other dial says.
+# #782: the last few model calls, so a spoken line can report how long it
+# took to be WRITTEN as well as how long it took to be said.
+_MODEL_CALLS: list[dict[str, Any]] = []
+
 _RENDER_COST: list[float] = []
 RENDER_COST_SLOW = 1.6          # sustained ratio at which we borrow Piper
 RENDER_COST_OK = 1.1            # ...and the ratio at which the clones return
@@ -6426,6 +6453,11 @@ async def voice_generate(text: str, voice: str, engine: str,
         "ms": int((time.monotonic() - started) * 1000),
         "engine": engine,
         "voice": voice,
+        # #782: how long the finished audio actually RUNS, and what made it.
+        # The dossier needs the ratio of synthesis time to audio time to be
+        # able to say "this took three times longer to make than to play".
+        "seconds": round(float(length or 0.0), 2),
+        "service": service,
     }
 
 
@@ -9783,6 +9815,26 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # The media key, so the booth can draw this line's own waveform.
         entry["media"] = clip["path"].rsplit("/", 1)[-1].split("?")[0]
         entry["sig"] = clip.get("sig", "")
+    # #782: THE DOSSIER — "how it came to be, how long it took to render,
+    # what it was looking like in the pipeline". Everything the booth needs
+    # to answer that for THIS line, on the line itself, because every feed
+    # that held these facts before only ever described the LAST render.
+    _made = _model_call_for(spoken)
+    entry["trace"] = {
+        "queued_at": _line_started,
+        "render": ({"engine": clip.get("engine") or engine,
+                    "voice": clip.get("voice") or forced or "",
+                    "ms": int(clip.get("ms") or 0),
+                    "kb": int((clip.get("bytes") or 0) / 1024),
+                    "seconds": float(clip.get("seconds") or 0),
+                    "service": str(clip.get("service") or ""),
+                    "tried": list(clip.get("tried") or []),
+                    "fallback": str(clip.get("fallback") or "")}
+                   if clip else {}),
+        "written": (_made or {}),
+        "chars": len(spoken),
+        "kind": kind,
+    }
     # Which swath the vector index handed over for this line, if it was a
     # meaning search that found it rather than the weighted draw.
     _hit = (_RADIO.get("vector_access") or [{}])[0]
@@ -12987,6 +13039,16 @@ def ad_line_mark(ad_id: str, product: str, audio: str = "") -> None:
         if entry.get("kind") == "ad" and not entry.get("ad_id"):
             entry["ad_id"] = str(ad_id or "")
             entry["product"] = str(product or "")[:160]
+            # #783: "for every listed entry that is part of an ad ... I want
+            # an option to be able to download that entry". A spot read live
+            # arrives here with no `audio` because nothing was produced for
+            # it as a file — but the produced cut often exists already under
+            # its id, and without this the tile drew no play and no download
+            # at all. Look before giving up.
+            if not audio and ad_id:
+                _made = PRODUCED_ADS_DIR / f"{ad_id}.mp3"
+                if _made.is_file():
+                    audio = f"{ad_id}.mp3"
             if audio:
                 entry["ad_audio"] = str(audio)
                 # #733: /ads-audio is signed exactly like /media, and
@@ -22317,6 +22379,18 @@ async def speak_turns(turns: list[tuple[str, str]],
                     transcript.append((item["who"], item["chunk"],
                                        _clip_seconds(clip["path"])))
                     aired_items.append(item)                          # #no-repeats
+                    # #782: what it cost to make this turn, kept on the item
+                    # so the dossier can show it beside what it cost to say.
+                    item["render"] = {
+                        "engine": clip.get("engine") or "",
+                        "voice": clip.get("voice") or "",
+                        "ms": int(clip.get("ms") or 0),
+                        "kb": int((clip.get("bytes") or 0) / 1024),
+                        "seconds": float(clip.get("seconds") or 0),
+                        "service": str(clip.get("service") or ""),
+                        "tried": list(clip.get("tried") or []),
+                        "fallback": str(clip.get("fallback") or ""),
+                    }
                     _plan_turns[idx]["rendered"] = True    # checkpoint hit (#556)
             hang_secs = 0.0
             if caller_name and last_batch:
@@ -22426,6 +22500,17 @@ async def speak_turns(turns: list[tuple[str, str]],
                         "voice": (caller_voice if who == "caller"
                                   else caller2_voice if who == "caller2"
                                   else voices.get(who, "")) or "",
+                        # #782: the dossier, on the coalesced road too —
+                        # which is where most of the show comes from.
+                        "trace": {
+                            "queued_at": time.time(),
+                            "render": (aired_items[_row].get("render") or {})
+                            if _row < len(aired_items) else {},
+                            "written": _model_call_for(chunk),
+                            "chars": len(chunk),
+                            "kind": "burst",
+                            "burst": len(transcript),
+                        },
                     }
                     _RADIO["chat"].append(entry)
                     # #778: the length this turn actually runs for INSIDE the
@@ -25099,6 +25184,14 @@ async def ask_model(prompt: str, limit: int = 300,
     pipeline_log("model", f"{settings['model']} answered · {took} ms · "
                           f"{len(kept)} chars",
                  extra=f"RESULT:\n{kept}")
+    # #782: the writing half of a line's story. A spoken line knows which
+    # model made it but never how long it waited to be written, and "why was
+    # there a gap there" is usually answered here rather than in the render.
+    _MODEL_CALLS.append({"at": time.time(), "model": settings["model"],
+                         "ms": took, "chars": len(kept),
+                         "temp": round(temperature, 2),
+                         "budget": limit, "text": kept[:400]})
+    del _MODEL_CALLS[:-40]
     return kept
 
 
@@ -48318,6 +48411,244 @@ function djTalkScroll(log, atBottom, keepTop) {
 /* #745: the per-line row builder, lifted out of djTalkRender so it can be
  * called for ONE line instead of all of them. Returns the row; the caller
  * decides where it goes. */
+/* ---- The line dossier (#782) -----------------------------------------
+ *
+ * "When I hover over an entry for longer than three seconds, I want you to
+ * show a pop-up that gives me detailed information about the status of that
+ * message, how it came to be, how long it took to render, what it was
+ * looking like in the pipeline... And also I want it to have a loading bar
+ * if it's going through any sort of transitional process."
+ *
+ * Everything here rides on the row itself — the server attaches a `trace` to
+ * every line as it is written, rendered and aired — so this card is a read
+ * of one object rather than of four feeds that each only ever described the
+ * LAST render.
+ */
+let djDossierTimer = null;
+let djDossierFor = "";
+
+function djDossierClose() {
+  if (djDossierTimer) { clearTimeout(djDossierTimer); djDossierTimer = null; }
+  const old = document.getElementById("djDossier");
+  if (old) old.remove();
+  djDossierFor = "";
+}
+
+function djDossierAudio(line) {
+  if (line.media && line.sig) {
+    return "/media/" + encodeURIComponent(line.media)
+      + "?t=" + encodeURIComponent(line.sig);
+  }
+  if (line.ad_audio) {
+    return "/ads-audio/" + encodeURIComponent(line.ad_audio)
+      + (line.ad_sig ? "?t=" + encodeURIComponent(line.ad_sig) : "");
+  }
+  return "";
+}
+
+/* #783: "For every listed entry that is part of an ad or a management
+ * message from upstairs or anything that is produced, I want an option to be
+ * able to download that entry." Anything with audio offers the clip; every
+ * entry at all offers its words. */
+function djDossierDownloads(line, into) {
+  const bar = el("div", "row", "");
+  bar.style.cssText = "gap:6px;margin-top:8px;flex-wrap:wrap;"
+    + "align-items:center";
+  const url = djDossierAudio(line);
+  if (url) {
+    const play = el("button", "", "▶ play");
+    play.style.cssText = "font-size:10.5px;padding:2px 8px";
+    play.onclick = (ev) => {
+      ev.stopPropagation();
+      clipToggle(url, play, "▶ play");
+    };
+    bar.appendChild(play);
+    const dl = el("a", "", "⬇ audio");
+    dl.href = url;
+    dl.download = ((line.product || line.name || line.who || "line")
+      .replace(/[^\w -]+/g, "").slice(0, 40) || "line")
+      + (String(line.media || "").endsWith(".mp3") ? ".mp3" : ".wav");
+    dl.style.cssText = "font-size:10.5px;color:var(--accent)";
+    dl.onclick = (ev) => ev.stopPropagation();
+    bar.appendChild(dl);
+  }
+  const words = el("a", "", "⬇ words");
+  words.href = "javascript:void 0";
+  words.style.cssText = "font-size:10.5px;color:var(--accent)";
+  words.onclick = (ev) => {
+    ev.stopPropagation();
+    const t = line.trace || {};
+    const r = t.render || {};
+    const w = t.written || {};
+    cacheSaveWords((line.product || line.name || line.who || "line"),
+      "# " + (line.product || line.name || line.who || "a line") + "\n\n"
+      + "*" + (line.ts ? new Date(line.ts * 1000).toLocaleString() : "")
+      + (line.kind ? " · " + line.kind : "") + "*\n\n"
+      + (line.text || "") + "\n\n---\n\n"
+      + "voice: " + (line.voice || "-") + "\n"
+      + "engine: " + (r.engine || line.engine || "-") + "\n"
+      + "model: " + (w.model || line.model || "-") + "\n"
+      + (r.ms ? "render: " + r.ms + " ms\n" : "")
+      + (w.ms ? "written: " + w.ms + " ms\n" : ""));
+  };
+  bar.appendChild(words);
+  into.appendChild(bar);
+}
+
+/* What, if anything, this line is still waiting on. */
+function djDossierStage(line) {
+  const t = line.trace || {};
+  const r = t.render || {};
+  if (line.aired === "held") {
+    return {label: "held — it airs the moment an engine answers",
+            frac: null};
+  }
+  if (!r.ms && !line.media) {
+    return {label: "still being rendered…", frac: null};
+  }
+  const air = djTalkAirAt(line);
+  if (air && air > djStreamAt() + 0.3) {
+    const t0 = line.ts || air;
+    const span = Math.max(0.5, air - t0);
+    const done = Math.max(0, Math.min(1, (djStreamAt() - t0) / span));
+    return {label: "queued — waiting its turn on air", frac: done};
+  }
+  return null;
+}
+
+function djDossierShow(line, anchorEl) {
+  djDossierClose();
+  djDossierFor = line.id || "";
+  const t = line.trace || {};
+  const r = t.render || {};
+  const w = t.written || {};
+  const card = el("div", "panel", "");
+  card.id = "djDossier";
+  card.style.cssText = "position:fixed;z-index:420;width:min(370px,92vw);"
+    + "max-height:70vh;overflow:auto;padding:11px 13px;margin:0;"
+    + "font-size:11px;box-shadow:0 12px 34px #000c;line-height:1.5";
+  const rect = anchorEl.getBoundingClientRect();
+  card.style.left = Math.min(window.innerWidth - 380,
+                             Math.max(8, rect.right + 10)) + "px";
+  card.style.top = Math.max(8, Math.min(window.innerHeight - 320,
+                                        rect.top)) + "px";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "margin-bottom:6px";
+  head.innerHTML = "<b style='font-size:12px'>"
+    + callerDossierEsc(line.name || line.who || "a line") + "</b>"
+    + "<span class='muted' style='font-size:10px'>"
+    + callerDossierEsc(line.kind || "") + "</span>";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;opacity:.6";
+  x.onclick = djDossierClose;
+  head.appendChild(x);
+  card.appendChild(head);
+
+  const body = String(line.text || "");
+  const said = el("div", "muted", "“" + body.slice(0, 190)
+    + (body.length > 190 ? "…" : "") + "”");
+  said.style.cssText = "font-size:10.5px;font-style:italic;"
+    + "margin-bottom:8px;opacity:.75";
+  card.appendChild(said);
+
+  /* The loading bar, only when the line is genuinely still in flight. */
+  const stage = djDossierStage(line);
+  if (stage) {
+    const box = el("div", "", "");
+    box.style.cssText = "margin-bottom:9px";
+    const lab = el("div", "", stage.label);
+    lab.style.cssText = "font-size:10.5px;color:var(--accent);"
+      + "margin-bottom:3px";
+    box.appendChild(lab);
+    opsStyle();                       /* the bar's keyframes live there */
+    const bar = el("div", "pine-ops-bar", "");
+    const fill = document.createElement("i");
+    if (stage.frac == null) {
+      fill.className = "spin";
+    } else {
+      fill.style.left = "0";
+      fill.style.width = Math.round(stage.frac * 100) + "%";
+    }
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    card.appendChild(box);
+  }
+
+  const when = (v) => v ? new Date(v * 1000).toLocaleTimeString() : "—";
+  const rows = [];
+  rows.push(["Written by", (w.model || line.model || "—")
+    + (w.ms ? " · " + w.ms + " ms" : "")
+    + (w.temp != null ? " · temp " + w.temp : "")]);
+  if (w.budget) {
+    rows.push(["Asked for", w.budget + " chars, got " + (w.chars || "—")]);
+  }
+  if (line.source) rows.push(["From the document", line.source]);
+  if (line.macro) rows.push(["Mood it was given", line.macro]);
+  if (line.perf && Object.keys(line.perf).length) {
+    rows.push(["Intonation", Object.entries(line.perf).slice(0, 4)
+      .map((kv) => kv[0] + " " + kv[1]).join(", ")]);
+  }
+  if (line.fx && Object.keys(line.fx).length) {
+    rows.push(["Treated with", Object.entries(line.fx)
+      .map((kv) => kv[0] + " " + kv[1]).join(", ")]);
+  }
+  rows.push(["Voice", (r.voice || line.voice || "—")]);
+  rows.push(["Rendered by", (r.engine || line.engine || "—")
+    + (r.service ? " — " + r.service : "")]);
+  if (r.ms) {
+    const ratio = (r.seconds > 0) ? (r.ms / 1000 / r.seconds) : 0;
+    rows.push(["Synthesis took", r.ms + " ms"
+      + (r.seconds ? " for " + r.seconds + "s of audio" : "")
+      + (ratio ? " (" + ratio.toFixed(1) + "× real time)" : "")
+      + (r.kb ? " · " + r.kb + " KB" : "")]);
+  }
+  if (t.burst) rows.push(["Aired in a burst of", t.burst + " turns"]);
+  if (r.fallback) rows.push(["Had to fall back", r.fallback]);
+  if (r.tried && r.tried.length) {
+    rows.push(["Engines that refused", r.tried.join(" · ")]);
+  }
+  const air = djTalkAirAt(line);
+  rows.push(["Scheduled for", when(air)]);
+  rows.push(["Written down at", when(line.ts)]);
+  rows.push(["Where it went", {
+    box: "the Pine Box", page: "this page only",
+    stream: "a coalesced round",
+    held: "held — waiting for an engine or the box",
+  }[line.aired || ""] || (line.aired || "on air")]);
+
+  const table = el("div", "", "");
+  rows.forEach((kv) => {
+    const rowEl = el("div", "", "");
+    rowEl.style.cssText = "display:flex;gap:8px;padding:2px 0;"
+      + "border-top:1px solid var(--border)";
+    const kk = el("div", "muted", kv[0]);
+    kk.style.cssText = "flex:0 0 118px;font-size:10.5px";
+    const vv = el("div", "", String(kv[1] == null ? "—" : kv[1]));
+    vv.style.cssText = "flex:1;min-width:0;font-size:10.5px;"
+      + "word-break:break-word";
+    rowEl.appendChild(kk);
+    rowEl.appendChild(vv);
+    table.appendChild(rowEl);
+  });
+  card.appendChild(table);
+  djDossierDownloads(line, card);
+  document.body.appendChild(card);
+}
+
+/* Three seconds of hover, as asked. Cancelled the moment the pointer
+ * leaves, so it never fires on a pointer that is only passing through. */
+function djDossierWatch(row, line) {
+  row.addEventListener("mouseenter", () => {
+    if (djDossierTimer) clearTimeout(djDossierTimer);
+    djDossierTimer = setTimeout(() => djDossierShow(line, row), 3000);
+  });
+  row.addEventListener("mouseleave", () => {
+    if (djDossierTimer) { clearTimeout(djDossierTimer); djDossierTimer = null; }
+  });
+}
+
 function djTalkRow(line) {
   {
     const row = el("div", "", "");
@@ -48330,6 +48661,12 @@ function djTalkRow(line) {
      * id, and the jump fell through to "nothing is going out". */
     if (line.id) row.setAttribute("data-eid", line.id);
     row.setAttribute("data-who", line.who || "");
+    /* #782: three seconds on any row and it tells you its whole life —
+     * who wrote it and how long that took, what shaped it, which engine
+     * said it and how far behind real time that ran, when it was due and
+     * where it went. Attached HERE, above every early return, so the ad,
+     * sting, hang-up and desk rows get it too. */
+    djDossierWatch(row, line);
     /* #770/#772: this row's place on the broadcast clock, and whether it has
      * got here yet. A staged burst is written before it is audible, so the
      * bottom of the feed can legitimately hold lines nobody has heard — they
