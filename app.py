@@ -4047,6 +4047,312 @@ def _event_voice(event: str) -> str:
     ).strip()
 
 
+# --- The ladder: no written line goes unheard (#784) ------------------------
+#
+# "i need these voices to broadcast first and foremost. no matter the
+# settings... There should never be dialogue not being played."
+#
+# Measured live: 29 of 165 booth rows carried aired="never" — written, given a
+# voice, and never heard. Every one belonged to the HOST (vl_1a04bb8c) or the
+# drop guy (vl_31d384e6), the two speakers whose voices are CLONES. The
+# co-host, on a real Piper voice, did not appear in that list once. That is
+# the whole diagnosis in a line.
+#
+# The clone road already fell back to Piper when an engine wobbled:
+#     engine, forced = "piper", _event_voice(who) or _event_voice("default")
+# but _event_voice reads voice_out.event_voices and voice_out.voice, and on
+# this station both are EMPTY — so `forced` came out "", voice_generate was
+# handed a blank voice, the Piper allowlist rejected it, and the "fallback"
+# raised exactly like the thing it was catching. A ladder whose bottom rung is
+# a setting nobody filled in is a ladder into a hole.
+#
+# The bottom rung is the live Piper catalog now, which cannot be empty while
+# Piper is up, and every render goes through one helper.
+# Lines that could not be rendered at all, kept until an engine answers. The
+# station used to mark these aired="never" and move on, which is precisely
+# the "dialogue not being played" the operator will not accept (#784).
+_RENDER_BACKLOG: list[dict[str, Any]] = []
+
+_PIPER_CATALOG: dict[str, Any] = {"at": 0.0, "voices": []}
+
+
+async def piper_catalog() -> list[str]:
+    """Piper's own list of what it can speak, cached five minutes."""
+    if _PIPER_CATALOG["voices"] and time.time() - _PIPER_CATALOG["at"] < 300:
+        return _PIPER_CATALOG["voices"]
+    try:
+        names = await piper_voices()
+    except Exception:
+        names = []
+    if names:
+        _PIPER_CATALOG.update({"at": time.time(), "voices": names})
+    return _PIPER_CATALOG["voices"]
+
+
+async def piper_fallback_voice(who: str = "") -> str:
+    """A Piper voice that DEFINITELY exists, for when a clone cannot render.
+
+    Walked in order of how much it still sounds like the show: this speaker's
+    own configured voice, then the station's other Piper voices, then whatever
+    Piper actually has installed. Only an unreachable Piper returns ""."""
+    dj = dj_settings()
+    seats = {"dj": "voice", "cohost": "cohost_voice",
+             "third": "third_voice", "drop": "drop_voice"}
+    mine = str(dj.get(seats.get(who, "voice")) or "").strip()
+    # This speaker's OWN voice first, when it happens to be a Piper one, then
+    # anything the operator set explicitly for this event.
+    for name in (mine, _event_voice(who)):
+        name = (name or "").strip()
+        if name and not VOICE_ID_SHAPE.match(name):
+            return name
+    catalog = await piper_catalog()
+    if catalog:
+        # #516, and the reason this does NOT simply borrow the co-host's
+        # voice: an engine wobble must never collapse the pair into one
+        # person. Voices already spoken for by another seat are off the
+        # table, and the pick is stable per speaker so a stand-in does not
+        # change voice line to line.
+        taken = {str(dj.get(field) or "").strip()
+                 for seat, field in seats.items() if seat != who}
+        free = [v for v in catalog if v not in taken]
+        pool = [v for v in free if v.startswith(("en_", "en-"))] or free             or catalog
+        # By SEAT, not by hash: with as many voices free as there are seats
+        # this is distinct by construction, where a hash only usually is.
+        order = ["dj", "cohost", "third", "drop"]
+        seat = order.index(who) if who in order else len(order)
+        return pool[seat % len(pool)]
+    # Piper is unreachable: nothing here can help, and the caller says so.
+    return _event_voice("default") or ""
+
+
+def clone_fallback_voice(who: str = "") -> str:
+    """A library (clone) voice that exists, for when PIPER is the dead one.
+
+    #784: the first cut of this ladder could only ever cross one way — a
+    clone falling back to Piper. Then wyoming-piper wedged: its port stayed
+    open, its voice list came back empty, and every Piper rung failed with
+    "No such voice" while XTTS was rendering perfectly. The co-host, whose
+    voice is a Piper one, could not speak a word. Any voice beats silence
+    means BOTH directions."""
+    dj = dj_settings()
+    seats = {"dj": "voice", "cohost": "cohost_voice",
+             "third": "third_voice", "drop": "drop_voice"}
+    tries = [str(dj.get(seats.get(who, "voice")) or "")]
+    tries += [str(dj.get(f) or "") for f in seats.values()]
+    for name in tries:
+        name = name.strip()
+        if name and VOICE_ID_SHAPE.match(name) and voice_ref_path(name):
+            return name
+    try:
+        for meta in sorted(VOICES_DIR.glob("vl_*")):
+            if voice_ref_path(meta.name):
+                return meta.name
+    except OSError:
+        pass
+    return ""
+
+
+async def voice_render_any(text: str, voice: str, engine: str = "",
+                           fx: dict[str, float] | None = None,
+                           who: str = "") -> dict[str, Any] | None:
+    """Render this line with whatever works, and do not come back empty.
+
+    THE contract for #784: while any engine on this box is alive, a written
+    line gets audio. The rungs, in order —
+      1. the voice and engine asked for;
+      2. the OTHER cloning engine when the voice is a library clone — both
+         XTTS and F5 take the same reference, so a clone is never stranded
+         because one of the two is down;
+      3. Piper, in a voice guaranteed to exist (above);
+      4. and that is the floor: while Piper answers, something is spoken.
+    Every fallback is logged and put on the drop log, because a line that went
+    out in a stand-in voice is something the operator must be able to SEE
+    rather than discover by ear."""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    engine = engine or voice_engine_for(voice)
+    # #784: LENGTH is the other way a written line could not be rendered. The
+    # box road cuts a long line into slider-sized pieces; the page road never
+    # did, so anything over VOICE_MAX_CHARS came back 413 and both "retries"
+    # resent exactly the same oversized text. An intro runs past it easily,
+    # which is why intros and ad reads are over-represented in the silent
+    # rows. Cut it here, speak the pieces, and join them so every caller
+    # still gets one clip back.
+    if len(text) > VOICE_MAX_CHARS:
+        cap = max(200, VOICE_MAX_CHARS - 80)
+        pieces = sentence_chunks(text, cap=cap, most=24)
+        # sentence_chunks cuts at sentence boundaries, so a long line with no
+        # full stops in it comes back as ONE oversized piece — and then every
+        # rung below 413s identically and the line is lost. That is not a
+        # theory: the model writes to a 1000-character reply budget against a
+        # VOICE_MAX_CHARS of 800, so the host's long monologues land here
+        # constantly. Guarantee the pieces fit, by force if the text will not
+        # cooperate.
+        forced_pieces: list[str] = []
+        for piece in (pieces or [text]):
+            while len(piece) > VOICE_MAX_CHARS:
+                cut = piece.rfind(" ", 0, VOICE_MAX_CHARS - 1)
+                if cut < 40:
+                    cut = VOICE_MAX_CHARS - 1
+                forced_pieces.append(piece[:cut].strip())
+                piece = piece[cut:].strip()
+            if piece:
+                forced_pieces.append(piece)
+        pieces = [p for p in forced_pieces if p]
+        if len(pieces) > 1:
+            made: list[str] = []
+            for piece in pieces:
+                part = await voice_render_any(piece, voice, engine,
+                                              fx=fx, who=who)
+                if part and part.get("path"):
+                    made.append(part["path"])
+            if made:
+                pipeline_log("voice", f"a {len(text)}-character line was too "
+                                      "long to render in one piece - spoken "
+                                      f"in {len(made)} and joined (#784)")
+                if len(made) > 1:
+                    joined = await asyncio.to_thread(
+                        _call_concat_blocking, made, False)
+                    if joined:
+                        return _store_media(joined, "wav")
+                try:                # the join failed; the opening still airs
+                    return _store_media(Path(made[0]).read_bytes(), "wav")
+                except OSError:
+                    return None
+    is_clone = bool(VOICE_ID_SHAPE.match(voice or ""))
+    stand_in = await piper_fallback_voice(who)
+    rungs: list[tuple[str, str, str]] = []
+    if is_clone and engine not in ("xtts", "f5"):
+        # THE bug behind the 29 silent lines. Under render relief
+        # voice_engine_for returns "piper" for a clone — a deliberate "borrow
+        # the fast engine" decision — but it does NOT swap the voice, so the
+        # caller carries a vl_ id into Piper's allowlist, which rejects it as
+        # "No such voice". The rescue gates then ask `engine != "piper"`,
+        # which is False, and skip the fallback exactly when it is needed. A
+        # clone id is not a Piper voice: honour the intent by taking Piper
+        # with a Piper VOICE, and keep the clone as the rung below.
+        if stand_in:
+            rungs.append((stand_in, "piper", ""))
+        clone_engine = str((voice_meta(voice) or {}).get("engine") or "xtts")
+        rungs.append((voice, clone_engine,
+                      "Piper would not take it either — back to the clone"))
+    else:
+        rungs.append((voice, engine, ""))
+        if is_clone:
+            other = "f5" if engine == "xtts" else "xtts"
+            rungs.append((voice, other, f"{engine} would not render it — the "
+                                        f"same clone through {other} (#784)"))
+        if stand_in and stand_in != voice:
+            rungs.append((stand_in, "piper",
+                          "the clone road is down — a stand-in Piper voice "
+                          "so the line still goes out (#784)"))
+    # #784: and the crossing the other way. When PIPER is the sick one — its
+    # port open, its voice list empty, every name rejected — a Piper-voiced
+    # speaker had no road at all. A library voice is not their timbre, but it
+    # is a voice, and the rule is that the line is heard.
+    if not is_clone:
+        borrowed = clone_fallback_voice(who)
+        if borrowed:
+            rungs.append((borrowed, "xtts",
+                          "Piper is not answering — the line goes out in a "
+                          "borrowed cloned voice (#784)"))
+            rungs.append((borrowed, "f5",
+                          "Piper is not answering — the line goes out in a "
+                          "borrowed cloned voice (#784)"))
+    # The floor: Piper's own default, no voice named, no effects. The
+    # allowlist cannot reject a voice that was never named, so while Piper
+    # answers at all, this rung speaks.
+    rungs.append(("", "piper", "every named voice refused — the line goes "
+                               "out plain rather than not at all (#784)"))
+    tried: list[str] = []
+    for name, eng, why in rungs:
+        try:
+            clip = await voice_generate(text, name, eng,
+                                        fx=None if not name else fx)
+        except Exception as exc:
+            # #784: WHY, not just that. "every engine refused" with no reason
+            # attached is not a diagnosis, and this is the last line of
+            # defence in the whole station.
+            detail = getattr(exc, "detail", None) or str(exc)
+            tried.append(f"{eng}/{name or '(default)'}: "
+                         f"{type(exc).__name__} {str(detail)[:120]}")
+            clip = None
+        if clip and clip.get("path"):
+            if why:
+                pipeline_log("voice", why,
+                             extra=f"{who or 'line'}: {text[:180]}")
+                note_drop(who, text, why[:200])
+            return clip
+    # Piper itself is unreachable or has nothing installed. Say so loudly:
+    # this is the only remaining way a line can fail, and it is a station
+    # fault rather than a line fault.
+    pipeline_log("drop", "NOTHING could render this line — every engine "
+                         "refused it, Piper included (#784)",
+                 extra=(f"{who or 'line'} - {len(text)} chars: "
+                        f"{text[:300]}\n\n"
+                        + "\n".join(tried)))
+    return None
+
+
+_BACKLOG_BUSY = [False]
+
+
+async def render_backlog_drain() -> None:
+    """Air the lines that could not be rendered when they were written.
+
+    #784: the operator's rule is that a written line is heard, and a station
+    fault is a delay rather than a deletion. Anything the ladder could not
+    speak waits here and is tried again whenever the show next opens its
+    mouth; the moment an engine answers it goes out on the page feed and its
+    booth row stops saying it is waiting."""
+    if _BACKLOG_BUSY[0] or not _RENDER_BACKLOG:
+        return
+    _BACKLOG_BUSY[0] = True
+    try:
+        for _ in range(len(_RENDER_BACKLOG)):
+            if not _RENDER_BACKLOG:
+                break
+            held = _RENDER_BACKLOG[0]
+            # Older than twenty minutes and it is no longer this show.
+            if time.time() - float(held.get("at") or 0) > 1200:
+                _RENDER_BACKLOG.pop(0)
+                continue
+            clip = await voice_render_any(str(held.get("text") or ""),
+                                          str(held.get("voice") or ""),
+                                          who=str(held.get("who") or ""))
+            if not (clip and clip.get("path")):
+                break                   # still nothing; try again next time
+            _RENDER_BACKLOG.pop(0)
+            _RADIO["voice_clips"].append({
+                "ts": int(time.time() * 1000),
+                "url": f"{clip['path']}?t={clip['sig']}",
+                "text": held.get("text", ""), "voice": held.get("voice", ""),
+            })
+            del _RADIO["voice_clips"][:-140]
+            for row in reversed(_RADIO.get("chat") or []):
+                if row.get("id") == held.get("id"):
+                    row["aired"] = "page"
+                    row["air_at"] = time.time()
+                    break
+            pipeline_log("air", "a line that could not be rendered earlier "
+                                "has just gone out (#784)",
+                         extra=str(held.get("text") or "")[:300])
+    except Exception:
+        pass                            # the backlog is a rescue, not a risk
+    finally:
+        _BACKLOG_BUSY[0] = False
+
+
+def render_backlog_top() -> None:
+    """Ask for a drain without waiting on one."""
+    if _RENDER_BACKLOG and not _BACKLOG_BUSY[0]:
+        try:
+            asyncio.get_running_loop().create_task(render_backlog_drain())
+        except RuntimeError:
+            pass
+
+
 def _voice_style(text: str) -> str:
     """Personality: how a spoken line is dressed before it is synthesised."""
     voice = load_settings().get("voice_out") or {}
@@ -5822,6 +6128,7 @@ _RENDER_COST: list[float] = []
 RENDER_COST_SLOW = 1.6          # sustained ratio at which we borrow Piper
 RENDER_COST_OK = 1.1            # ...and the ratio at which the clones return
 _RENDER_RELIEF = [False]
+_RENDER_RELIEF_AT = [0.0]        # when it latched on (#784)
 
 
 def render_cost_note(engine: str, ms: float, seconds: float) -> None:
@@ -5835,6 +6142,7 @@ def render_cost_note(engine: str, ms: float, seconds: float) -> None:
     mean = sum(_RENDER_COST) / len(_RENDER_COST)
     if not _RENDER_RELIEF[0] and mean >= RENDER_COST_SLOW:
         _RENDER_RELIEF[0] = True
+        _RENDER_RELIEF_AT[0] = time.time()                        # #784
         pipeline_log("voice", f"the clone engine is running {mean:.1f}x "
                               "slower than real time — borrowing Piper so "
                               "the stream keeps moving")
@@ -5846,9 +6154,22 @@ def render_cost_note(engine: str, ms: float, seconds: float) -> None:
 
 def render_relief() -> bool:
     """Is the station currently borrowing the fast engine? Off unless the
-    operator has left the relief enabled (#stream)."""
+    operator has left the relief enabled (#stream).
+
+    #784: with a TIME LIMIT, because the latch could not clear itself.
+    render_cost_note only samples xtts/f5 renders, and while relief is on
+    every line is routed to Piper — so no new samples arrive, the mean never
+    falls back under RENDER_COST_OK, and "borrowing Piper" became permanent
+    from the first slow patch of the night. Relief lapses on its own now, the
+    next clone render re-measures, and it latches straight back on if the
+    engine really is still behind."""
     if not dj_settings().get("render_relief", True):
         return False
+    if _RENDER_RELIEF[0] and time.time() - _RENDER_RELIEF_AT[0] > 120:
+        _RENDER_RELIEF[0] = False
+        _RENDER_COST.clear()            # measure it afresh, not from memory
+        pipeline_log("voice", "the Piper stand-in has had its two minutes — "
+                              "trying the cloned voices again (#784)")
     return _RENDER_RELIEF[0]
 
 
@@ -9143,18 +9464,17 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # the truth now; whatever fx it wanted is already baked in.
         engine = str(clip.get("engine") or engine)
     else:
-        # #746: BOTH cloning engines. This probed XTTS only, so an
-        # F5 voice with :8772 down raised out of voice_generate
-        # instead of falling back to Piper like everything else.
-        if engine in ("xtts", "f5") \
-                and not await clone_engine_ready(engine):
-            note_drop(who, "", "xtts down — spoke on piper instead")
-            # Keep this speaker DISTINCT on the fallback (#516): the cohost's
-            # own piper voice, not the generic default, so an XTTS wobble
-            # never collapses the two hosts into one voice.
-            engine, forced = "piper", _event_voice(who) or _event_voice("default")
-        elif engine == "voxtral" and not (await voxtral_health())["ready"]:
-            engine, forced = "piper", _event_voice("default")
+        # #784: this used to pre-emptively throw the CLONE VOICE away -
+        #     engine, forced = "piper", _event_voice(who) or ...
+        # - on nothing better than a thirty-second-stale health cache, and
+        # on this station _event_voice is empty, so `forced` became "" and
+        # the host lost their own voice before a single render was tried.
+        # The ladder makes that call now, per attempt and on the OUTCOME:
+        # it keeps the cloned voice while either clone engine can still
+        # speak it, and only then reaches for a stand-in. A cold cache
+        # costs the host nothing.
+        if engine == "voxtral" and not (await voxtral_health())["ready"]:
+            engine = ""                 # let the ladder route it
         # Render the clip ourselves so the line is leveled to the same
         # loudness as every other voice (#518) and carries the anti-stutter
         # tail pad (#493). The box used to speak plain piper through HA's own
@@ -9167,21 +9487,16 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         want_clip = (fx or voice_to != "box" or engine != "piper"
                      or len(spoken) <= say_max_chars())
         if want_clip:
-            try:
-                clip = await voice_generate(
-                    spoken, forced or _event_voice("default"), engine, fx=fx)
-            except Exception:
-                clip = None
-            if clip is None and engine != "piper":
-                # The clone road failed mid-line. Fall back to Piper — the
-                # show does not stop to admire the error — but keep this
-                # speaker's own voice so the cohost stays distinct (#516).
-                engine, forced = "piper", _event_voice(who) or _event_voice("default")
-                try:
-                    clip = await voice_generate(spoken, forced, "piper",
-                                                fx=fx)
-                except Exception:
-                    clip = None
+            # #784: ONE ladder, and it tests the OUTCOME rather than the
+            # engine's name. This was two attempts gated on `engine !=
+            # "piper"`, which is False under render relief — the exact
+            # condition that makes a clone fail — so the rescue was skipped
+            # precisely when it was needed and the line was lost.
+            # voice_render_any cannot come back empty while any engine on
+            # this box answers.
+            clip = await voice_render_any(spoken,
+                                          forced or _event_voice("default"),
+                                          engine, fx=fx, who=who)
 
     # The page hears it the MOMENT it is rendered (#502, #505), never gated on
     # the box: in here/both mode the browser feed gets the clip now, in
@@ -9413,12 +9728,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # A line that never aired must NOT just vanish (#483): render it now
         # if there is a voice for it, hold it for the box and show it in the
         # backlog. Only a line with no voice at all is logged as a pure drop.
-        if forced:
-            try:
-                clip = await voice_generate(spoken, forced,
-                                            voice_engine_for(forced), fx=fx)
-            except Exception:
-                clip = None
+        if True:                                                   # #784
+            clip = await voice_render_any(spoken, forced, fx=fx, who=who)
         if clip:
             box_hold(clip, spoken, who, line_id)                # #778
             note_drop(who, spoken,
@@ -9526,12 +9837,12 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         # in the drop log. That is the row in the screenshot. Try once more
         # to give it a voice; if there is genuinely none, say so on the line
         # itself rather than letting it pass for something that was said.
-        if forced and not clip:
-            try:
-                clip = await voice_generate(spoken, forced,
-                                            voice_engine_for(forced), fx=fx)
-            except Exception:
-                clip = None
+        if not clip:
+            # #784: was voice_engine_for(forced) — recomputing the very
+            # routing that had just failed, so it could not rescue an
+            # engine-down or a clone-id-into-Piper failure, which is every
+            # one of them. The ladder ends at Piper's own default voice.
+            clip = await voice_render_any(spoken, forced, fx=fx, who=who)
         if clip and clip.get("path"):
             _RADIO["voice_clips"].append({
                 "ts": int(time.time() * 1000),
@@ -9541,10 +9852,20 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             del _RADIO["voice_clips"][:-140]
             entry["aired"] = "page"
         else:
-            entry["aired"] = "never"
+            # #784: "There should never be dialogue not being played." If
+            # even the ladder came back empty then every engine on the box
+            # is refusing at once - a station fault, not a line fault - so
+            # the line is SHELVED, not written off. It goes out the moment
+            # something can speak it again, which is what the hold shelf
+            # has always been for. There is no "never" in this file now.
+            entry["aired"] = "held"
+            _RENDER_BACKLOG.append({"text": spoken, "who": who,
+                                    "kind": kind, "voice": forced or "",
+                                    "id": line_id, "at": time.time()})
+            del _RENDER_BACKLOG[:-40]
             note_drop(who, spoken,
-                      "never aired — nothing rendered and the box was not "
-                      "the destination (#767)")
+                      "nothing could render it yet - held, and it airs the "
+                      "moment an engine answers (#784)")
     if source:
         entry["source"] = source
         if source_text:
@@ -10870,8 +11191,14 @@ async def _torrent_talk() -> None:
             busy = _SEGMENT_TASK and not _SEGMENT_TASK[0].done()
             if busy and (time.time()
                          - float(_RADIO.get("segment_at") or 0)) < 60:
-                pipeline_log("air", "torrent waiting — the intro for this "
-                                    "record is still rendering")
+                # #784: and while it renders, the room does not sit in
+                # silence. Somebody else in the booth says something real
+                # off the shelf, which is what a studio actually does when
+                # one presenter is not ready.
+                if not await cover_the_gap("dj", "the intro is still being "
+                                                 "made"):
+                    pipeline_log("air", "torrent waiting — the intro for "
+                                        "this record is still rendering")
                 continue
             track = _RADIO.get("now")
             # #702: ROTATE THE KIND OF ROUND.
@@ -17555,6 +17882,63 @@ def fresh_pool_top(want: int = 8) -> None:
             pass                        # no loop — a test, or the CLI
 
 
+_COVER_AT = [0.0]
+
+
+def cover_speaker(blocked: str = "") -> tuple[str, str]:
+    """Who can talk RIGHT NOW while somebody else's line is still rendering.
+
+    Whoever is NOT the one we are waiting on, preferring a seat whose voice
+    is a Piper one — those render in a second or two, where a clone can take
+    the better part of a minute, and the whole point is to fill a gap rather
+    than to open a second one."""
+    dj = dj_settings()
+    seats = [("cohost", dj.get("cohost_voice")), ("third", dj.get("third_voice")),
+             ("dj", dj.get("voice")), ("drop", dj.get("drop_voice"))]
+    live = [(who, str(v or "")) for who, v in seats
+            if who != blocked and str(v or "").strip()]
+    fast = [(w, v) for w, v in live if not VOICE_ID_SHAPE.match(v)]
+    return (fast or live or [("cohost", "")])[0]
+
+
+async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
+    """Keep the air alive while a slow line is still being made (#784).
+
+    The operator's note: "if someone needs more time because their system is
+    generating their lines then have the other people in the studio and the
+    caller cover for them. this is a radio station. We should seamlessly be
+    able to make it look seamless while processing various levels of tasks
+    that are time consuming."
+
+    So the gap is covered the way a real booth covers one — somebody else in
+    the room says something real. The material comes off the speakbox shelf,
+    which is already stocked, already cooled down against the hour, and needs
+    no model call, so this can never itself become the thing being waited on.
+    Returns whether anything went out."""
+    if time.time() - _COVER_AT[0] < 20:
+        return False                    # a cover, not a filibuster
+    if _SPEAKING[0]:
+        return False                    # somebody already has the floor
+    line = fresh_pool_take()
+    text = str(line.get("text") or "").strip()
+    if len(text) < 30:
+        return False
+    who, voice = cover_speaker(blocked)
+    _COVER_AT[0] = time.time()
+    pipeline_log("air", f"{who} covers while {blocked}'s line is still "
+                        f"rendering{(' - ' + why) if why else ''} (#784)",
+                 extra=text[:300])
+    try:
+        out = await dj_speak("interject", _RADIO.get("now"), line=text,
+                             who=who, voice=voice or None)
+    except Exception:
+        return False
+    if out and line.get("file"):
+        speakbox_remember({"file": line.get("file", ""), "text": text,
+                           "lines": [text], "mind": line.get("mind", "")})
+    return bool(out)
+
+
 def fresh_pool_take() -> dict[str, str]:
     """One line nobody has said this hour, or nothing at all."""
     while _FRESH_POOL:
@@ -21527,6 +21911,7 @@ async def speak_turns(turns: list[tuple[str, str]],
     voices = await session_voices()
     spoken: list[str] = []
     fresh_pool_top()                    # #no-repeats: stock the shelf off-air
+    render_backlog_top()                # #784: anything still owed the air
     cut_at = _TALK_CUT[0]
     # The caller's phone line is drawn once per call, so the static does
     # not jump level between their sentences (#237) — and their vocoded
@@ -21787,20 +22172,28 @@ async def speak_turns(turns: list[tuple[str, str]],
         try:
             v = _turn_voice(item) or ""
             engine = voice_engine_for(v)
-            # #746: BOTH cloning engines. This probed XTTS only, so an
-            # F5 voice with :8772 down raised out of voice_generate
-            # instead of falling back to Piper like everything else.
-            if engine in ("xtts", "f5") \
-                    and not await clone_engine_ready(engine):
-                return None
-            if engine == "voxtral" and not (await voxtral_health())["ready"]:
-                return None
             text = spoken_text(item["chunk"])
             if not text or not re.search(r"[^\W_]", text):
                 return None
-            pipeline_log("lookahead", f"pre-rendering the next line · "
-                                      f"{engine} · {item['who']}")
-            return await voice_generate(text, v, engine, fx=_turn_fx(item))
+            # #746: BOTH cloning engines. This probed XTTS only, so an
+            # F5 voice with :8772 down raised out of voice_generate
+            # instead of falling back to Piper like everything else.
+            # #784: and a not-ready clone is no longer a reason to come
+            # back with nothing. That was a thirty-second-stale health
+            # cache quietly costing the round a turn - twice over, since
+            # the burst re-render asks the same question again. The ladder
+            # takes the other clone engine or a Piper stand-in, so the
+            # pre-render makes audio whenever audio is possible at all.
+            cold = ((engine in ("xtts", "f5")
+                     and not await clone_engine_ready(engine))
+                    or (engine == "voxtral"
+                        and not (await voxtral_health())["ready"]))
+            if not cold:
+                pipeline_log("lookahead", "pre-rendering the next line - "
+                             f"{engine} - {item['who']}")
+            return await voice_render_any(text, v, "" if cold else engine,
+                                          fx=_turn_fx(item),
+                                          who=item["who"])
         except Exception:
             return None                 # dj_speak will render it itself
 
@@ -21897,15 +22290,15 @@ async def speak_turns(turns: list[tuple[str, str]],
                     # A clone that fails must NOT drop the turn from the call —
                     # that is exactly "a caller says one thing then disappears"
                     # (#545). Fall back to piper so EVERY turn makes the stream.
-                    if not clip and voice_engine_for(v) != "piper":
-                        try:
-                            clip = await voice_generate(
-                                spoken_text(item["chunk"]),
-                                _event_voice(item["who"])
-                                or _event_voice("default"),
-                                "piper", fx=_turn_fx(item))
-                        except Exception:
-                            clip = None
+                    # #784: on the OUTCOME, not on the engine's name. The old
+                    # guard `voice_engine_for(v) != "piper"` is False under
+                    # render relief, which is precisely when a clone voice
+                    # cannot render — so the rescue stood down exactly when
+                    # the turn needed it and the turn went to `missed`.
+                    if not clip:
+                        clip = await voice_render_any(
+                            spoken_text(item["chunk"]), v, fx=_turn_fx(item),
+                            who=item["who"])
                 if not (clip and clip.get("path")):
                     # #767: premake missed, the re-render raised and piper
                     # raised too. This had no else — the turn vanished out of
@@ -24025,7 +24418,14 @@ async def pinebox_diagnose() -> dict[str, Any]:
 
     elsewhere = []
     if not reachable:
-        elsewhere = await satellite_discover()
+        # #784: NEVER the address it is already configured for. discover()
+        # scans the subnet and happily reports the box at 10.89.1.205 while
+        # the station is looking for it at 10.89.1.205, which came out as
+        # "DHCP moved it" naming one address twice and sent the operator to
+        # the router to fix nothing. A box answering AT its own address is
+        # not a box that moved; it is a box that is wedged.
+        elsewhere = [a for a in await satellite_discover()
+                     if a and a != SATELLITE_HOST]
     add("Found at another address", None,
         ", ".join(elsewhere) if elsewhere else "no")
 
