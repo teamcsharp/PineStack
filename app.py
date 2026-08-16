@@ -24405,8 +24405,24 @@ async def pinebox_diagnose() -> dict[str, Any]:
 
     probe = await satellite_probe()
     reachable = probe["state"] == "ok"
-    add(f"Pine Box on the network ({SATELLITE_HOST}:{SATELLITE_PORT})",
-        reachable, probe["detail"])
+    # #784: a satellite that is BUSY SERVING Home Assistant can refuse our
+    # own describe on the same port while playing the show perfectly — the
+    # session belongs to HA, not to us. So a recent, full-length playout is
+    # harder evidence than a probe, and it must not be shouted down. Without
+    # this the #777 ladder cries "the Pine Box is not accepting audio" over a
+    # box that is audibly working, which is the same fault as before wearing
+    # the opposite face.
+    played_recently = (time.time() - _BOX_LAST_OK[0]) < 300
+    if not reachable and played_recently:
+        add(f"Pine Box on the network ({SATELLITE_HOST}:{SATELLITE_PORT})",
+            True, f"{probe['detail']} — but it played a clip in full "
+                  f"{int(time.time() - _BOX_LAST_OK[0])}s ago, so it is "
+                  "serving Home Assistant and simply will not take a second "
+                  "session")
+        reachable = True
+    else:
+        add(f"Pine Box on the network ({SATELLITE_HOST}:{SATELLITE_PORT})",
+            reachable, probe["detail"])
 
     # `ip` is not in this image, so ARP is informational only — it must not
     # decide the diagnosis, or an unknown reads as "everything is fine".
@@ -24457,7 +24473,7 @@ async def pinebox_diagnose() -> dict[str, Any]:
     # answering ping and ARP with :10700 refusing, and this function calling
     # it a routing problem. A box that cannot receive audio outranks every
     # preference about where to send it.
-    _fixable_here = probe["state"] in ("ok", "unset")
+    _fixable_here = probe["state"] in ("ok", "unset") or played_recently
     if not _fixable_here and elsewhere:
         # DHCP moved it — a real address problem, and more useful than
         # "it is not answering where we are looking".
