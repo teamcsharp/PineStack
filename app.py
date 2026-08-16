@@ -3937,6 +3937,30 @@ def box_talk_ok(reply: bool = False) -> bool:
     return bool(_RADIO.get("box_talk", True))
 
 
+def box_overridden() -> dict[str, Any] | None:
+    """Is the station ignoring the routing the operator chose, and why?
+
+    #757. Derived from the state rather than recorded when a line is spoken:
+    hanging it on dj_speak meant you sat looking at a silent box until the
+    next line happened to be written, which on a quiet stretch is a minute
+    or more of precisely the confusion this exists to prevent. The condition
+    is knowable the moment the picker moves, so it is known then.
+
+    There is exactly one way this happens today — the master switch off
+    while the DJ voice is pointed at the box — and it was invisible."""
+    wanted = _RADIO.get("voice_to") or "box"
+    if wanted not in ("box", "both") or box_talk_ok():
+        return None
+    return {
+        "wanted": wanted,
+        "actually": "here",
+        "fix": "box_talk",
+        "why": "The DJ voice is routed to the Pine Box, but the Pine Box "
+               "master switch is OFF — so the show is coming out of this "
+               "page instead. Turn the switch on and it goes to the box.",
+    }
+
+
 def box_worth_healing() -> bool:
     """Is the STATION routed to the speaker right now (#690)?
 
@@ -8829,8 +8853,23 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # With the box switched off, "box" means the page — otherwise every line
     # would sit out the 90-second knock loop waiting on a speaker nobody is
     # allowed to call, and the show would look hung (#638).
+    #
+    # #757: but it must SAY SO. This is a silent rewrite of a choice the
+    # operator just made — they set the output to the Pine Box and a
+    # different switch cancelled it — and the only field that could have
+    # explained it, state.box.why, was being written further down with the
+    # POST-override routing, so it read "routed to 'here', not the box" and
+    # confirmed the very thing that was wrong. Measured on the live station:
+    # box_talk off, voice_to box, nothing audible, no explanation anywhere.
     if not box_talk_ok() and voice_to in ("box", "both"):
         voice_to = "here"
+        # The panel learns this from box_overridden(), which reads the same
+        # two settings directly — one source of truth, and it can warn
+        # before a single line has been written rather than after.
+        _SPEAK_LAST.update({
+            "why": "the Pine Box master switch is OFF — this went to the "
+                   "page instead (#757)",
+            "at": time.time()})
     # "off" mutes this type entirely (#501): render nothing, deliver nothing.
     if voice_to == "off":
         _SPEAK_LAST.update({"why": "output muted", "at": time.time()})
@@ -9499,6 +9538,10 @@ def dj_state() -> dict[str, Any]:
             "silent_for": round(time.time() - _BOX_LAST_OK[0]),
             "last_ratio": _LAST_PLAYOUT.get("ratio"),
             "why": (_SPEAK_LAST.get("why") or ""),
+            # #757: the routing you asked for versus what is actually
+            # happening. The panel needs the DIFFERENCE, not the outcome —
+            # "routed to here" is true and useless when you just chose box.
+            "overridden": box_overridden(),
             "healed_at": satellite_healed_at(),
         },
         # The desk's pulse (#305): current stage plus the recent trail the
@@ -41453,7 +41496,32 @@ async function boothRefresh() {
     const banner = document.getElementById("boothBox");
     if (banner) {
       const boxRouted = (state.voice_to === "box" || state.voice_to === "both");
-      if (boxRouted && box.down) {
+      // #757: THE case that bit — you set the output to the Pine Box and the
+      // master switch is off, so the station quietly sends the show back to
+      // this page instead. It went entirely unannounced: no banner, and the
+      // one field that could have explained it reported the routing AFTER
+      // the override, which is how "it isn't speaking" had no visible cause.
+      // This is the loudest state the booth can be in, and the fix is on it.
+      if (boxRouted && box.overridden) {
+        banner.style.display = "";
+        banner.style.background = "#3a1620";
+        banner.style.color = "#ffc2d1";
+        banner.style.cursor = "pointer";
+        banner.textContent = "🔇 The DJ voice is set to the Pine Box, but the "
+          + "Pine Box switch is OFF — the show is coming out of this page. "
+          + "Click to switch the box on.";
+        banner.onclick = async () => {
+          banner.textContent = "◐ switching the Pine Box on…";
+          try {
+            const st = await api("/api/dj/output", {method: "POST",
+              body: JSON.stringify({box_talk: true})});
+            const cb = document.getElementById("boxTalk");
+            if (cb) cb.checked = true;
+            djRender(st);
+            setStatus("the Pine Box is on — the show is going to it now");
+          } catch (e) { setStatus(e.message, true); }
+        };
+      } else if (boxRouted && box.down) {
         banner.style.display = "";
         banner.style.background = "#3a2411";
         banner.style.color = "#ffbf6b";
