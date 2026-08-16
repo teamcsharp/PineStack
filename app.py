@@ -10511,12 +10511,28 @@ def now_really_playing(slack: float = 20.0) -> bool:
 def torrent_breath(dj: dict[str, Any]) -> float:
     """How long a breath of music between rounds (#700). The music↔talk dial
     sets it: at 100 the pair barely draw breath, at 50 you get a good stretch
-    of record between them."""
+    of record between them.
+
+    #763: "the pine box plays the dialogue so infrequently that i had to go
+    back to the website". A breath is a breath in the BROWSER, where the
+    record is playing underneath it — on the Pine Box, with the voice routed
+    there and the music left here, the same breath is total silence. So when
+    the box is carrying the talk on its own, the pause is cut right back:
+    there is nothing for it to be a breath between."""
     talk = max(0, min(100, int(dj.get("talk_radio") or 0)))
+    voice_to = _RADIO.get("voice_to") or "box"
+    music_to = _RADIO.get("music_to") or "here"
+    box_alone = (box_talk_ok() and voice_to in ("box", "both")
+                 and music_to not in ("box", "both"))
     # #702: the floor was 4 seconds, which at a high dial meant rounds
     # landing on top of each other on the same warm context — and that
     # reads as repetition no matter how well the speakbox is seeding.
     middle = 14.0 + (100 - talk) * 0.42
+    if box_alone:
+        # Silence on a speaker with nothing under it. Keep a beat so the
+        # pair do not trample their own tails, and no more.
+        middle = min(middle, 7.0)
+        return max(3.0, random.uniform(middle * 0.6, middle * 1.2))
     return max(10.0, random.uniform(middle * 0.65, middle * 1.45))
 
 
@@ -28259,12 +28275,12 @@ async def station_repair_now() -> str:
     if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
         _RADIO["voice_to"] = "box"
         fixed.append("pointed the DJs at it")
-    # #759: the ladder never touched the music, and the measured station had
-    # it playing in the browser — so a perfectly initialised box still had
-    # silence between every round.
-    if (_RADIO.get("music_to") or "here") not in ("box", "both"):
-        _RADIO["music_to"] = "both"
-        fixed.append("put the music through it too")
+    # #764: NOT the music. Routing the records to the box as well seemed
+    # like the answer to silence between rounds and is actively wrong: the
+    # box has one audio channel and an announce preempts whatever is
+    # playing, so a track and a line cut each other off — which is exactly
+    # what "the pine box broke into stuttering" was. The gap between rounds
+    # is fixed by talking more often (#763), not by putting music under it.
     if time.time() < float(_BOX_DOWN.get("until") or 0):
         _BOX_DOWN["until"] = 0.0
         _BOX_DOWN["fails"] = 0
