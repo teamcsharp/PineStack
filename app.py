@@ -21054,8 +21054,17 @@ async def speak_turns(turns: list[tuple[str, str]],
         if not text:
             continue
         if not names_only(text, vouched or []):
-            note_drop(who, text, "named a record that is not on air")
-            break                       # what follows answers a ghost (#247)
+            # #777: this used to BREAK - one line naming the wrong record threw
+            # away every remaining turn of a round that took the model half a
+            # minute to write, and the operator tuned in to nothing. Seen live:
+            # "cohost: named a record that is not on air" with the whole round
+            # gone behind it. The reasoning was "what follows answers a ghost"
+            # (#247), which is true of the NEXT line and not of the six after
+            # it. Drop the offending line and keep the show, exactly as the
+            # buried-line gate immediately below already does.
+            note_drop(who, text, "named a record that is not on air — dropped "
+                                 "this line, kept the round (#777)")
+            continue
         if is_binned(text):
             note_drop(who, text, "you buried this line")
             continue                    # skip THIS line, not the whole round
@@ -21124,6 +21133,30 @@ async def speak_turns(turns: list[tuple[str, str]],
     # to the other session voice so BOTH DJs carry it. Voice and transcript
     # label both derive from item["who"], so this rebalances the coalesce path
     # and the turn-by-turn path alike.
+    # #777: "tuning into the radio and getting no djs is mad frustrating."
+    # Every gate above drops lines for a good reason - a record that is not on
+    # air, a near-repeat, a buried line - and between them they can take an
+    # ENTIRE round, which is a written, paid-for round that the listener hears
+    # as silence. The gates are right to be strict about WHICH lines air; they
+    # are not entitled to leave the station with nothing. If they emptied the
+    # round, put the raw turns back and say so.
+    if turns and not playlist:
+        pipeline_log("drop", f"every one of the {len(turns)} turns was gated "
+                             "away - airing the round anyway rather than "
+                             "leaving the radio silent (#777)")
+        for who, said in turns:
+            text = spoken_text(said)
+            if not text:
+                continue
+            vec = performance_vector(
+                who, (caller_voice if who == "caller"
+                      else caller2_voice if who == "caller2"
+                      else voices.get(who)) or "")
+            playlist.append({
+                "who": who, "chunk": text, "vec": vec,
+                "turn_end": True, "big": False,
+            })
+
     speakers = {it["who"] for it in playlist}
     if (len(playlist) >= 2 and not source_text and not by_hand
             and speakers in ({"dj"}, {"cohost"})):
