@@ -43184,17 +43184,25 @@ function djTalkPopup() {
 
   const log = el("div", "", "");
   log.id = "djTalkLog";
-  /* #747: `flex:1` is `flex:1 1 0%` — a PERCENTAGE basis. This box has no
-   * height of its own (only max-height), so an indefinite main size makes
-   * that percentage resolve to `content`: the log's flex base size became
-   * the whole night's transcript, thousands of pixels of it, and the
-   * negative free space that produced is what squeezed the glass above it
-   * down to a sliver — worse with every line the pair said, which is
-   * literally "scaling itself out of existence". `0` is a LENGTH, so the
-   * basis is definite whatever the container does, and min-height:0 lets
-   * the log absorb the rest. #740 armoured the glass; this removes the
-   * force that was pushing on it. */
-  log.style.cssText = "flex:1 1 0;min-height:0;overflow-y:auto;"
+  /* #747/#755: `flex:1 1 auto` with `min-height:0`, and both halves matter.
+   *
+   * The original was `flex:1`, i.e. basis 0%. This box has no height of its
+   * own, only a max-height, so that percentage resolved to `content` — the
+   * log's flex base size became the whole night's transcript — and the
+   * negative free space that produced is what squeezed the glass above it.
+   *
+   * The first attempt made the basis a definite `0`. That did stop the
+   * squeeze, and it also stopped the log ever having a height: in an
+   * AUTO-height container there is no free space to grow into, so a 0 basis
+   * asks for nothing and gets nothing. Measured: log = 0px with 8163px of
+   * dialogue inside it. Every line was there and none of it was visible.
+   *
+   * `auto` keeps the content-sized basis, and `min-height:0` is what makes
+   * it safe: the container over-constrains, the shrink phase runs, and
+   * because the glass is `flex:0 0 auto` the log is the only item that CAN
+   * give — so it absorbs all of it and the glass keeps its size. Short
+   * night, the window still shrinks to fit. */
+  log.style.cssText = "flex:1 1 auto;min-height:0;overflow-y:auto;"
     + "font-size:12px;line-height:1.5";
   /* #748: whether you have scrolled back is decided by YOU scrolling, not
    * recomputed from the viewport on every four-second render. It used to be
