@@ -22692,10 +22692,54 @@ async def pinebox_diagnose() -> dict[str, Any]:
     add("Found at another address", None,
         ", ".join(elsewhere) if elsewhere else "no")
 
+    # #757: THE ROUTING, first, because it is the one thing here that was
+    # actually wrong and nothing in this function was looking at it. A box
+    # in perfect health says nothing at all when the master switch is off,
+    # and every check above passes while it does.
+    routed = (_RADIO.get("voice_to") or "box") in ("box", "both")
+    add("The show is pointed at the Pine Box", routed,
+        f"DJ voice is routed to {_RADIO.get('voice_to') or 'box'}"
+        + ("" if routed else " — not to the box"))
+    add("Pine Box master switch", box_talk_ok(),
+        "on" if box_talk_ok() else "OFF — the station is not calling the box")
+
     # One diagnosis, and the steps that follow from it.
-    if link["online"]:
+    #
+    # #757: the healthy verdict has to EARN itself. It used to read one
+    # field — the Home Assistant entity state — and never look at the
+    # checks it had just built, so it announced "Nothing is wrong" with a
+    # failing check printed two lines above it. Anything false here is a
+    # reason, and the first reason wins.
+    failed = [c for c in checks if c["ok"] is False]
+    if not box_talk_ok():
+        cause = ("The Pine Box master switch is OFF, so the station is not "
+                 "calling it — whatever the DJ voice picker says.")
+        steps = [
+            "Turn the Pine Box switch on at the top of the DJ panel.",
+            "Check the DJ voice picker says Pine Box.",
+            "Press Initialize the Pine Box to prove it end to end.",
+        ]
+    elif not routed:
+        cause = ("The DJ voice is not routed to the Pine Box, so the show is "
+                 "playing in the browser instead.")
+        steps = ["Set the DJ voice picker to Pine Box.",
+                 "Press Initialize the Pine Box to prove it end to end."]
+    elif link["online"] and not failed:
         cause = "Nothing is wrong — the Pine Box is connected."
         steps = ["Say something to it, or start Pine Box FM."]
+    elif link["online"] and failed:
+        # It is talking to Home Assistant and something else is unhappy.
+        # Name the unhappy thing rather than declaring victory over it.
+        cause = ("Home Assistant has the Pine Box, but "
+                 + "; ".join(c["name"].lower() + " — " + c["detail"]
+                             for c in failed)
+                 + ".")
+        steps = [
+            "Press Initialize the Pine Box — it works down this list and "
+            "ends by making the box actually say something.",
+            "If the box speaks after that, the failing check above is the "
+            "one to distrust, not the box.",
+        ]
     elif elsewhere:
         cause = (f"The Pine Box is alive at {elsewhere[0]}, but Home "
                  f"Assistant is looking for it at {SATELLITE_HOST}. DHCP "
@@ -22741,6 +22785,12 @@ async def pinebox_diagnose() -> dict[str, Any]:
 
     return {
         "online": link["online"],
+        # #757: "online" is one entity's state string and was being read as
+        # "working". This is the honest one: nothing failed, and the show is
+        # actually pointed at the box.
+        "healthy": bool(link["online"] and not failed and routed
+                        and box_talk_ok()),
+        "failing": [c["name"] for c in failed],
         "checks": checks,
         "cause": cause,
         "steps": steps,
@@ -27795,6 +27845,209 @@ async def serial_write_api(
     written = await asyncio.to_thread(
         serial_write, text, bool(payload.get("newline", True)))
     return {"written": written}
+
+
+# --- Bringing the Pine Box up (#757) ----------------------------------------
+#
+# "the ability to initialize it functional with a fallback troubleshooting
+# tree to ensure it always happens."
+#
+# The pieces existed and none of them were a sequence: diagnose reports,
+# selfheal reloads, reconnect reloads differently, drain empties the shelf,
+# recover restarts the whole process. Nothing put them in an order, nothing
+# confirmed the result, and the one thing that would prove it — making a
+# noise and checking the noise came out — was never the last step.
+#
+# So: an ordered ladder. Every rung says what it checked, what it did about
+# it, and whether that worked. It ends by SPEAKING and reading the playout
+# meter, because "Home Assistant accepted the announce" is not the same as
+# "the room heard it" (#559), and that difference is most of the history of
+# this file.
+#
+# What it deliberately does NOT do: call pinebox_recover. That restarts this
+# process (os._exit) and would kill the ladder mid-run, taking the report
+# with it. It is offered as a human step instead.
+PINEBOX_TEST_PHRASE = ("Pine Box check. If you can hear this, the station "
+                       "has the room.")
+
+
+async def _rung(steps: list[dict[str, Any]], name: str, ok: bool | None,
+                detail: str, fixed: str = "") -> bool:
+    """One rung of the ladder, recorded as it happens."""
+    steps.append({"name": name, "ok": ok, "detail": detail, "fixed": fixed})
+    pipeline_log("air", f"pine box init — {name}: "
+                        f"{'ok' if ok else 'no' if ok is False else '—'}"
+                        + (f" · {fixed}" if fixed else ""))
+    return bool(ok)
+
+
+async def pinebox_initialize(speak_test: bool = True) -> dict[str, Any]:
+    """Bring the Pine Box up and PROVE it, or say exactly what is in the way.
+
+    Idempotent: every rung is a check first and an action only if the check
+    fails, so running it on a healthy station changes nothing and still
+    ends with a noise you can hear."""
+    steps: list[dict[str, Any]] = []
+    note_action("🛠 you asked the station to bring the Pine Box up")
+
+    # 1. The master switch. This is the one that actually bit (#757): the
+    #    show routed to the box, the switch off, and nothing saying so.
+    if not box_talk_ok():
+        _RADIO["box_talk"] = True
+        _routing_save()
+        await _rung(steps, "Pine Box master switch", True,
+                    "it was off — the station was not calling the box at all",
+                    "switched it on")
+    else:
+        await _rung(steps, "Pine Box master switch", True, "already on")
+
+    # 2. Point the show at it. Without this the switch is academic.
+    if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
+        _RADIO["voice_to"] = "box"
+        _routing_save()
+        await _rung(steps, "The show is pointed at the Pine Box", True,
+                    "the DJ voice was going to the page",
+                    "routed it to the box")
+    else:
+        await _rung(steps, "The show is pointed at the Pine Box", True,
+                    "already routed to the box")
+
+    # 3. Credentials. A missing token is unfixable from here and everything
+    #    below it is meaningless, so this is a hard stop.
+    token, player = _ha_creds()
+    if not token or not player:
+        await _rung(steps, "Home Assistant credentials", False,
+                    "no token" if not token else "no satellite entity set")
+        return _init_verdict(steps, False,
+                             "Home Assistant is not wired up yet.",
+                             ["Set the Home Assistant token and the Pine Box "
+                              "entity in the Speak panel.",
+                              "Then run this again."])
+    await _rung(steps, "Home Assistant credentials", True,
+                f"token set · {player}")
+
+    # 4. Does Home Assistant have the box, and is the entry loaded?
+    link = await satellite_status()
+    entries = {e["title"]: e for e in link.get("entries") or []}
+    entry = entries.get("PineVoice") or {}
+    if not link.get("online"):
+        # Reload the integration entry and look again — this is what the
+        # selfheal is for, and it is the only automatic fix at this rung.
+        await _rung(steps, "Home Assistant has the Pine Box", False,
+                    f"{link.get('entity')} is "
+                    f"{link.get('entity_state') or 'unknown'}",
+                    "reloading the Wyoming entry…")
+        try:
+            await satellite_selfheal()
+        except Exception:
+            pass
+        await asyncio.sleep(6)
+        link = await satellite_status()
+        if not link.get("online"):
+            return _init_verdict(
+                steps, False,
+                "Home Assistant cannot see the Pine Box.",
+                ["Press 🛠 to reload the link, or restart Home Assistant.",
+                 "If the box says \"Wi-Fi is disconnected\" when you press "
+                 "its button, it is alive but not on the network — check it "
+                 f"is provisioned for {SATELLITE_SSID} (2.4 GHz).",
+                 "Power-cycle it: unplug 10 seconds, back in, wait 60."])
+        await _rung(steps, "Home Assistant has the Pine Box", True,
+                    f"{link.get('entity')} is {link.get('entity_state')}",
+                    "the reload took")
+    else:
+        await _rung(steps, "Home Assistant has the Pine Box", True,
+                    f"{link.get('entity')} is {link.get('entity_state')}"
+                    + (f" · entry {entry.get('state')}" if entry else ""))
+
+    # 5. The breaker. If it latched during an outage the box is fine and the
+    #    station is still refusing to call it (#712).
+    if time.time() < float(_BOX_DOWN.get("until") or 0):
+        _BOX_DOWN["until"] = 0.0
+        _BOX_DOWN["fails"] = 0
+        await _rung(steps, "The station is willing to call the box", True,
+                    "the breaker had latched open",
+                    "closed it")
+    else:
+        await _rung(steps, "The station is willing to call the box", True,
+                    "breaker closed")
+
+    # 6. THE PROOF. Everything above is paperwork; this is the part that
+    #    makes a noise. The playout meter is the only honest confirmation —
+    #    Home Assistant accepting an announce is not the room hearing it.
+    if not speak_test:
+        return _init_verdict(steps, True,
+                             "The Pine Box is set up and the station is "
+                             "pointed at it.", [])
+    said = False
+    ratio = None
+    try:
+        clip = await voice_generate(PINEBOX_TEST_PHRASE,
+                                    _event_voice("default"), "piper")
+        if clip:
+            played = await _play_on_box(clip["path"], clip["sig"])
+            await asyncio.sleep(1.2)
+            lp = _LAST_PLAYOUT
+            if lp.get("key") == _played_out_key(clip["path"]):
+                ratio = lp.get("ratio")
+                said = bool(lp.get("ok"))
+            else:
+                said = bool(played)          # unmeasured, but it was accepted
+    except Exception as exc:                 # noqa: BLE001
+        await _rung(steps, "The Pine Box makes a noise", False,
+                    f"{type(exc).__name__}: {exc}"[:140])
+        return _init_verdict(steps, False,
+                             "The test announce could not be rendered.",
+                             ["Check wyoming-piper is answering on :10200.",
+                              "Then run this again."])
+    if said:
+        await _rung(steps, "The Pine Box makes a noise", True,
+                    "it played out"
+                    + (f" · {round(float(ratio) * 100)}% of the clip"
+                       if ratio is not None else " · length unmeasured"))
+        return _init_verdict(steps, True,
+                             "The Pine Box is up — you should have just "
+                             "heard it.", [])
+    await _rung(steps, "The Pine Box makes a noise", False,
+                "Home Assistant took the announce but the box played "
+                + (f"{round(float(ratio) * 100)}% of it" if ratio is not None
+                   else "nothing back"))
+    return _init_verdict(
+        steps, False,
+        "Home Assistant accepts the announce and the box stays silent — it "
+        "is wedged rather than absent.",
+        ["Power-cycle the Pine Box: unplug 10 seconds, back in, wait 60.",
+         "Then run this again.",
+         "If it keeps happening, POST /api/pinebox/recover — that restarts "
+         "the station process, which is why this does not do it for you."])
+
+
+def _init_verdict(steps: list[dict[str, Any]], ok: bool, cause: str,
+                  human: list[str]) -> dict[str, Any]:
+    """#757: the verdict is computed FROM the rungs, never alongside them —
+    the bug in pinebox_diagnose was a verdict that ignored its own
+    evidence."""
+    failed = [s["name"] for s in steps if s["ok"] is False]
+    return {
+        "ok": bool(ok and not failed),
+        "cause": cause,
+        "steps": steps,
+        "failing": failed,
+        "human": human,
+        "guide": "/guide/pinebox",
+    }
+
+
+@app.post("/api/pinebox/initialize")
+async def pinebox_initialize_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Bring the Pine Box up and prove it (#757)."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    return await pinebox_initialize(
+        speak_test=bool(payload.get("speak", True)))
 
 
 @app.get("/api/pinebox/diagnose")
@@ -36355,6 +36608,14 @@ when the station does.">
       <input id="boxTalk" type="checkbox" checked onchange="boxTalkSet()">
       <span></span><em>📦 Pine Box</em>
     </label>
+    <!-- #757: beside the switch that caused the trouble. Works down the
+         chain, fixes what it can, and ends by making the box speak. -->
+    <button id="pineInitBtn" class="pine-restart"
+            title="Bring the Pine Box up: switch it on, point the show at
+it, reload the link if Home Assistant has lost it, close the breaker — then
+make it say something and confirm it actually came out."
+            onclick="pineboxInitialize()"
+            style="font-size:15px;line-height:1">🛠</button>
     <button id="voiceTestBtn" class="pine-restart"
             title="Test the current speech settings"
             onclick="voiceTestOpen()"
@@ -47533,6 +47794,107 @@ async function sparkQueuePopup(event) {
   };
   acts.appendChild(send); acts.appendChild(count);
   box.appendChild(acts);
+}
+
+/* #757: bring the Pine Box up, and SHOW the ladder doing it.
+ *
+ * The operator set the output to the Pine Box and got silence with no
+ * explanation anywhere. This is the answer to that: every rung says what it
+ * checked, what it did, and whether it worked — and the last rung makes a
+ * noise and confirms from the playout meter that the room actually got it,
+ * because Home Assistant accepting an announce has never been the same
+ * thing (#559).
+ */
+async function pineboxInitialize() {
+  const gone = document.getElementById("pineInitModal");
+  if (gone) gone.remove();
+  const shade = el("div", "", "");
+  shade.id = "pineInitModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:198;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(620px,94vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:4px";
+  head.appendChild(el("h2", "", "🛠 Bringing the Pine Box up"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  const note = el("div", "muted",
+    "Working down the chain — the switch, the routing, the link to Home "
+    + "Assistant, the breaker — fixing what can be fixed, and finishing by "
+    + "making the box actually say something.");
+  note.style.cssText = "font-size:11.5px;line-height:1.55;margin-bottom:10px";
+  box.appendChild(note);
+  const body = el("div", "", "◐ working…");
+  body.style.cssText = "font-size:12px;line-height:1.6";
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  let r = null;
+  try {
+    r = await api("/api/pinebox/initialize", {method: "POST",
+                                              body: JSON.stringify({})});
+  } catch (e) {
+    body.textContent = "";
+    body.appendChild(el("div", "", "✗ " + e.message));
+    return;
+  }
+  body.textContent = "";
+  (r.steps || []).forEach((st) => {
+    const row = el("div", "", "");
+    row.style.cssText = "display:flex;gap:8px;align-items:flex-start;"
+      + "padding:4px 0;border-top:1px solid var(--border)";
+    const mark = el("span", "",
+      st.ok === true ? "✓" : st.ok === false ? "✗" : "—");
+    mark.style.cssText = "flex:0 0 14px;font-weight:700;color:"
+      + (st.ok === true ? "#43d17c" : st.ok === false ? "#ef6461" : "#8aa");
+    const txt = el("div", "", "");
+    txt.style.cssText = "flex:1;min-width:0";
+    txt.appendChild(el("div", "", st.name));
+    const d = el("div", "muted", st.detail
+      + (st.fixed ? "  →  " + st.fixed : ""));
+    d.style.cssText = "font-size:11px";
+    txt.appendChild(d);
+    row.appendChild(mark); row.appendChild(txt);
+    body.appendChild(row);
+  });
+  const verdict = el("div", "", (r.ok ? "✓ " : "✗ ") + (r.cause || ""));
+  verdict.style.cssText = "margin-top:12px;padding:8px 10px;border-radius:8px;"
+    + "font-size:12px;line-height:1.5;"
+    + (r.ok ? "background:#0f2418;color:#8fe388;border:1px solid #1d6b45"
+            : "background:#3a1620;color:#ffc2d1;border:1px solid #63304a");
+  body.appendChild(verdict);
+  if ((r.human || []).length) {
+    const h = el("div", "", "What to do:");
+    h.style.cssText = "font-weight:700;margin:10px 0 4px;font-size:12px";
+    body.appendChild(h);
+    r.human.forEach((line) => {
+      const li = el("div", "muted", "· " + line);
+      li.style.cssText = "font-size:11.5px;line-height:1.5;padding:2px 0";
+      body.appendChild(li);
+    });
+    const g = el("a", "", "📘 the Pine Box guide");
+    g.href = r.guide || "/guide/pinebox";
+    g.target = "_blank";
+    g.style.cssText = "font-size:11.5px;color:var(--accent);display:"
+      + "inline-block;margin-top:8px";
+    body.appendChild(g);
+  }
+  // The switch may have just moved under the panel's feet.
+  try {
+    const st = await api("/api/dj/state");
+    const cb = document.getElementById("boxTalk");
+    if (cb) cb.checked = !!st.box_talk;
+    djRender(st);
+  } catch (e) { /* the report is the point */ }
 }
 
 /* #652: the header dot — green when a tailnet is carrying the station,
