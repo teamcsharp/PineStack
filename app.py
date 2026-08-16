@@ -9239,10 +9239,18 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             note_drop(who, spoken, f"never aired (no voice) — {why}"[:200])
             _speaking_now_clear(line_id)
             return ""
+    # #770: the moment this line STARTED sounding. dj_speak writes its entry
+    # when the announce returns — i.e. when the line has FINISHED — so `ts`
+    # is the end of it, and a line that took forty seconds sorted forty
+    # seconds late against everything logged while it played. _SPEAKING_NOW
+    # has held the true start all along and threw it away on clear.
+    _air_at = float(_SPEAKING_NOW.get("at") or 0) \
+        if _SPEAKING_NOW.get("id") == line_id else 0.0
     _speaking_now_clear(line_id)
     entry = {
         "id": line_id,                                            # #742
         "ts": int(time.time()), "who": who, "kind": kind, "text": spoken,
+        "air_at": _air_at or time.time(),                          # #770
         "name": name or (dj_settings()["cohost_name"] if who == "cohost"
                          else dj_settings()["third_name"]
                          if who == "third" else "DJ"),
@@ -9318,6 +9326,32 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     elif paged and not to_box:
         # Page-only routing: it reached the browser, never the box (audit #9).
         entry["aired"] = "page"
+    elif not to_box:
+        # #767: the page road had no rescue and no mark. A line whose render
+        # failed while the show was routed HERE fell past every branch above
+        # and was appended to the booth bare — no audio, no status, nothing
+        # in the drop log. That is the row in the screenshot. Try once more
+        # to give it a voice; if there is genuinely none, say so on the line
+        # itself rather than letting it pass for something that was said.
+        if forced and not clip:
+            try:
+                clip = await voice_generate(spoken, forced,
+                                            voice_engine_for(forced), fx=fx)
+            except Exception:
+                clip = None
+        if clip and clip.get("path"):
+            _RADIO["voice_clips"].append({
+                "ts": int(time.time() * 1000),
+                "url": f"{clip['path']}?t={clip['sig']}",
+                "text": spoken, "engine": engine, "voice": forced or "",
+            })
+            del _RADIO["voice_clips"][:-40]
+            entry["aired"] = "page"
+        else:
+            entry["aired"] = "never"
+            note_drop(who, spoken,
+                      "never aired — nothing rendered and the box was not "
+                      "the destination (#767)")
     if source:
         entry["source"] = source
         if source_text:
@@ -9407,8 +9441,20 @@ def _stream_now_set(rows: list[dict[str, Any]], length: float) -> None:
     _STREAM_NOW.clear()
     if not rows:
         return
-    _STREAM_NOW.update({"at": time.time(), "rows": rows,
+    started = time.time()
+    _STREAM_NOW.update({"at": started, "rows": rows,
                         "length": max(0.5, float(length or 0))})
+    # #770: the exact moment each turn of this round becomes audible, written
+    # back onto the booth entries that were staged a beat ago. This is the
+    # only place the true air time is ever known, and it used to be used for
+    # nothing but "what is sounding right now" and then discarded.
+    when = {str(r.get("id") or ""): started + float(r.get("from") or 0)
+            for r in rows if r.get("id")}
+    if when:
+        for _m in _RADIO.get("chat") or []:
+            _at = when.get(str(_m.get("id") or ""))
+            if _at is not None:
+                _m["air_at"] = _at
 
 
 def _stream_now_clear() -> None:
@@ -9583,7 +9629,28 @@ def dj_state() -> dict[str, Any]:
         # The booth keeps its own running history now (#656), but it can
         # only keep what it is shown — so hand over a wide enough window
         # that a chatty stretch between two polls cannot slip past it.
-        "chat": _RADIO["chat"][-160:],
+        # #770: in the order the room HEARD it. The store is an append-log
+        # written by a dozen concurrent tasks and the coalesced road stages a
+        # whole burst before any of it is audible, so insertion order is not
+        # broadcast order and never was. Stable, so anything sharing a moment
+        # keeps the order it was written in.
+        "chat": sorted(_RADIO["chat"][-240:],
+                       key=lambda m: float(m.get("air_at")
+                                           or m.get("ts") or 0)),
+        # #772: the whole per-turn timeline of the round that is playing, so
+        # the panel can follow the clip continuously instead of finding out
+        # where it has got to on a four-second poll. On an eight-second turn
+        # that poll lands the marker on the wrong line about half the time,
+        # which is "the speaker is saying an area that is highlighting an
+        # inaccurate section".
+        "stream_now": ({
+            "at": float(_STREAM_NOW.get("at") or 0),
+            "length": float(_STREAM_NOW.get("length") or 0),
+            "rows": [{"id": str(r.get("id") or ""),
+                      "from": float(r.get("from") or 0),
+                      "until": float(r.get("until") or 0)}
+                     for r in (_STREAM_NOW.get("rows") or [])],
+        } if _STREAM_NOW else None),
         # How the booth reached the vector DB, most recent first (#595).
         "vector_access": (_RADIO.get("vector_access") or [])[:12],
         # The repair banner (#368, #369): fresh for three minutes after a
@@ -10403,6 +10470,10 @@ async def box_hold_watch() -> None:
                     if line.get("text") == held["text"] \
                             and line.get("aired") in ("page", "held"):
                         line.pop("aired", None)
+                        # #770: it is being heard NOW, minutes after it was
+                        # written. It sat that far back in the feed while
+                        # claiming to have just played.
+                        line["air_at"] = time.time()
                         break
             pipeline_log("air", f"the box is back — replayed "
                                 f"{len(replayed)} held lines in order")
@@ -10414,7 +10485,13 @@ async def box_hold_watch() -> None:
 # desk is quiet, spoken the moment one is wanted — the station is always
 # holding words it has not said yet.
 _LARDER: list[dict[str, Any]] = []
-_LARDER_CAP = 3
+# #769: measured on the live station, the long silences are not the breath
+# between rounds — they are the model WRITING the next one, and #767 makes
+# rounds longer (the operator asks for nine to fifteen turns, and that is
+# now honoured rather than clipped to six). A deeper shelf is what absorbs
+# that: a round written ahead goes out the instant it is wanted, so the
+# writing happens under the previous round instead of under silence.
+_LARDER_CAP = 6
 _LARDER_MAX = 14                       # the deep-backlog ceiling (#445)
 _LARDER_FRESH = 1200.0                 # twenty minutes, then it reads stale
 # The shelf survives restarts (#383): every deploy was costing the show
@@ -10527,13 +10604,26 @@ def torrent_breath(dj: dict[str, Any]) -> float:
     # #702: the floor was 4 seconds, which at a high dial meant rounds
     # landing on top of each other on the same warm context — and that
     # reads as repetition no matter how well the speakbox is seeding.
-    middle = 14.0 + (100 - talk) * 0.42
+    # #769: measured on the live station at this dial's setting of 70, the
+    # breath between rounds was running 18 to 39 seconds — and the box
+    # ticked on this desk is "Talk-show torrent (records spin, the pair
+    # never stop)". Thirty-nine seconds of nobody talking is not a pair who
+    # never stop. The curve is pulled in so the top of the dial means what
+    # it says and the middle of it is a breath rather than a gap; the
+    # records still play underneath the whole time.
+    #   dial 100 →  6.0- 10.2s      dial 70 → 10.4- 23.2s
+    #   dial  50 → 14.3- 31.9s      dial  0 → 24.1- 53.7s
+    middle = 7.0 + (100 - talk) * 0.30
     if box_alone:
         # Silence on a speaker with nothing under it. Keep a beat so the
         # pair do not trample their own tails, and no more.
         middle = min(middle, 7.0)
         return max(3.0, random.uniform(middle * 0.6, middle * 1.2))
-    return max(10.0, random.uniform(middle * 0.65, middle * 1.45))
+    # #769: the floor was 10.0, which swallowed the whole top of the dial —
+    # at 100 the curve asks for 4.6-10.2s and every one of those answers was
+    # clamped back to a flat ten. Six, so "the pair never stop" can actually
+    # be dialled in.
+    return max(6.0, random.uniform(middle * 0.65, middle * 1.45))
 
 
 async def _torrent_talk() -> None:
@@ -15008,7 +15098,7 @@ def doc_lock_set(doc: str, hours: float = 1.0,
 
 
 async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
-                         rid: str = "") -> dict[str, Any]:
+                         rid: str = "", only: str = "") -> dict[str, Any]:
     """A swath out of one document, both drawn at random.
 
     The directory is read every time, so anything dropped in the folder is in
@@ -15032,6 +15122,16 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
         pinned = [p for p in speakbox_files(key) if p.name == lock["doc"]]
         if pinned:
             files = pinned
+    # #766: this ONE report, because a caller was told to ring in citing it.
+    # Deliberately AFTER the station-wide lock and therefore ahead of it: the
+    # lock is a standing instruction about where material comes from, and
+    # this is a specific one about what a particular caller has read. The
+    # narrower, more recent instruction wins, and only for that caller —
+    # every other seed in the show still obeys the lock.
+    if only:
+        want = [p for p in speakbox_all(key) if p.name == only]
+        if want:
+            files = want
     # Drawn by weight, so the documents you have pushed up come round more
     # (#209) — but never the same one twice running while another is willing,
     # because plain weighted chance on three documents repeats a third of the
@@ -15402,8 +15502,14 @@ def banter_pace(overlap: int) -> str:
 
 def banter_gap(overlap: int) -> float:
     """Seconds between spoken turns. The box plays one clip at a time, so
-    this is as close to overlapping as the speaker itself can get."""
-    return round(0.7 * (1.0 - max(0, min(100, overlap)) / 100.0), 3)
+    this is as close to overlapping as the speaker itself can get.
+
+    #769: the ceiling was 0.7 s and the answer was exact — the same 602 ms
+    after every turn at the station's overlap of 14, on top of the silence
+    already baked into the clip. Halved, and jittered, so two people trading
+    lines sound like two people and not a metronome."""
+    base = 0.34 * (1.0 - max(0, min(100, overlap)) / 100.0)
+    return round(max(0.0, base * random.uniform(0.65, 1.35)), 3)
 
 
 NEW_VOICE_NAMES = ("Marlowe", "Cass", "Dex", "Rue", "Sal", "Vinny", "Jo",
@@ -18998,6 +19104,7 @@ def themes_read() -> dict[str, Any]:
     _THEMES_MEM.setdefault("themes", [dict(DEFAULT_THEME)])
     _THEMES_MEM.setdefault("active", DEFAULT_THEME["name"])
     _THEMES_MEM.setdefault("strength", 70)
+    _THEMES_MEM.setdefault("doc", "")          # #766: the report they cite
     return _THEMES_MEM
 
 
@@ -19037,15 +19144,29 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
         # #686: the theme call is not a polite enquiry. Pull real material
         # out of the shelf and make them RIFF on it — a caller who only
         # states their topic is a survey response, not radio.
-        swath = await speakbox_quote(most=4, cap=420)
+        # #766: a named report, when one has been chosen for them, rather
+        # than whatever the shelf happened to hand over.
+        _report = str(themes_read().get("doc") or "")
+        swath = await speakbox_quote(most=4, cap=420, only=_report)
         mined = ""
         if swath and swath.get("text"):
-            mined = (
-                "\n\nMATERIAL FROM THE STATION'S OWN SHELF — the caller has "
-                "read this, or heard it, or half-remembers it, and they "
-                "WEAVE IT IN: they quote a phrase of it back, mangle "
-                "another, build a joke on top of it, or cite it as evidence "
-                f"for whatever they are arguing:\n{swath['text']}")
+            if _report and swath.get("file") == _report:
+                mined = (
+                    "\n\nTHE REPORT THEY ARE RINGING ABOUT — the caller has "
+                    f"read \"{_report}\" and has it in front of them. They "
+                    "CITE IT: they quote a phrase of it back, get another "
+                    "half-wrong, build a joke on top of it, wave it as "
+                    "evidence, and they say where it came from. The pair "
+                    "have read it too and argue about what it actually "
+                    f"says:\n{swath['text']}")
+            else:
+                mined = (
+                    "\n\nMATERIAL FROM THE STATION'S OWN SHELF — the caller "
+                    "has read this, or heard it, or half-remembers it, and "
+                    "they WEAVE IT IN: they quote a phrase of it back, mangle "
+                    "another, build a joke on top of it, or cite it as "
+                    f"evidence for whatever they are arguing:\n"
+                    f"{swath['text']}")
         return (
             f"The caller is ringing in about {theme['text']}. That is what "
             "is on their mind and they have come to the station about it "
@@ -19197,6 +19318,25 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
                              render_stream=bool(dj.get("call_stream", True)))
 
 
+# #771: when the last change-of-subject caller was put on the line. A theme
+# change rings one immediately; a flurry of theme changes must still ring one.
+_THEME_RING = [0.0]
+THEME_RING_GAP = 240.0          # about the length of a call, plus the ring
+
+
+async def _theme_ring_now() -> None:
+    """#771: one caller, on the new subject, right now — and never a queue of
+    them. A failure here must not take the theme change down with it: the
+    setting is saved and honoured either way, this is only the demonstration
+    of it."""
+    try:
+        await dj_call_generated()
+    except Exception as exc:
+        _THEME_RING[0] = 0.0
+        pipeline_log("theme", "the change-of-subject call did not go out: "
+                              f"{type(exc).__name__}: {exc}"[:180])
+
+
 async def dj_call_generated(caller: dict[str, Any] | None = None,
                             force: bool = False) -> dict[str, Any]:
     """A generated person rings the station and the pair take the call.
@@ -19236,10 +19376,16 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # A caller must not ring in about the SAME thing that just came up (#557):
     # if the topic matches a recent one, roll again once for something fresh.
     _recent_t = _RADIO.setdefault("recent_topics", [])
-    _tkey = " ".join((topic or "").split())[:60].lower()
+    # #771: this used to key on the first 60 characters. Every theme call
+    # opens with the same sentence, so the second one in a row always
+    # collided with the first and re-rolled — and the re-roll is another
+    # dice throw that, at any share under 100%, can land outside the theme.
+    # The share slider was quietly diluted by its own freshness guard. Key
+    # on the whole topic, which is what "the same thing" was meant to mean.
+    _tkey = " ".join((topic or "").split()).lower()
     if _tkey and _tkey in _recent_t:
         topic, seed = await caller_topic()
-        _tkey = " ".join((topic or "").split())[:60].lower()
+        _tkey = " ".join((topic or "").split()).lower()
     if _tkey:
         _recent_t.append(_tkey)
         del _recent_t[:-8]
@@ -20327,14 +20473,22 @@ def make_hangup() -> Path | None:
 def _call_concat_blocking(paths: list[str],
                           crackle: bool = False) -> bytes | None:
     """Coalesce a whole call or booth round — every clip back to back — into
-    ONE continuous 24k mono stream (#530/#535/#616). The clips already carry a
-    300 ms tail-pad (#493), so joined end to end they have natural beats
-    between speakers. Everything is resampled to a common format first so a
-    22 kHz ring and 24 kHz voices splice cleanly, then the whole thing is
-    loudness-normalised so levels match across turns like a real station
-    (#616); `crackle` lays a light vinyl texture under it. Returns None on any
-    failure so the caller falls back to the turn-by-turn path (dry beats
-    broken)."""
+    ONE continuous 24k mono stream (#530/#535/#616). Everything is resampled
+    to a common format first so a 22 kHz ring and 24 kHz voices splice
+    cleanly, then the whole thing is loudness-normalised so levels match
+    across turns like a real station (#616); `crackle` lays a light vinyl
+    texture under it. Returns None on any failure so the caller falls back to
+    the turn-by-turn path (dry beats broken).
+
+    #769: this used to say "the clips already carry a 300 ms tail-pad, so
+    joined end to end they have natural beats between speakers". They carry
+    BOX_TAIL_MS, which is 900 — the pad exists so the box has something
+    harmless to loop on at the END of a clip, and welding it between every
+    speaker gave a dead 0.9 s after every utterance, identical to the
+    millisecond, including between two halves of one speaker's own sentence.
+    So each clip is trimmed back to a hair of silence on the way in and given
+    a short VARIED beat instead. The 900 goes back on once, at the end, where
+    the box actually needs it."""
     import subprocess
 
     import imageio_ffmpeg
@@ -20345,9 +20499,23 @@ def _call_concat_blocking(paths: list[str],
     ins: list[str] = []
     for p in files:
         ins += ["-i", p]
-    pre = "".join(
-        f"[{i}:a]aresample=24000,aformat=sample_fmts=s16:channel_layouts=mono"
-        f"[a{i}];" for i in range(len(files)))
+    # #769: strip each clip's welded-on tail (areverse → drop the silence,
+    # keeping a sliver → areverse back) and lay a short, varied beat after it
+    # instead. The last clip gets no beat — _wav_tail_pad below owns that end.
+    # Failure is safe: a broken graph yields a short blob, we return None, and
+    # the caller drops to the turn-by-turn path.
+    _keep = 0.06                      # a sliver of the original tail survives
+    _pre: list[str] = []
+    for i in range(len(files)):
+        _leg = (f"[{i}:a]aresample=24000,"
+                "aformat=sample_fmts=s16:channel_layouts=mono,"
+                "areverse,silenceremove=start_periods=1:"
+                f"start_silence={_keep}:start_threshold=-50dB,areverse")
+        if i < len(files) - 1:
+            # 140–330 ms, never the same twice — a room, not a metronome.
+            _leg += f",apad=pad_dur={round(random.uniform(0.14, 0.33), 3)}"
+        _pre.append(f"{_leg}[a{i}];")
+    pre = "".join(_pre)
     chain = "".join(f"[a{i}]" for i in range(len(files)))
     # Radio glue (#616): join the turns, match levels across them with one
     # loudness pass, optionally lay a low vinyl crackle underneath, then a
@@ -20912,6 +21080,7 @@ async def speak_turns(turns: list[tuple[str, str]],
         # turns; the rest keep rendering in the background, which is what
         # the pre-render was always for.
         played_any = False
+        missed: list[int] = []          # #767: scheduled, never aired
         # #760: the batch ladder. The first burst is small so the room hears
         # something almost at once; later ones widen so the joins stay rare.
         # 43 turns used to mean 43 renders before a single word.
@@ -20981,6 +21150,15 @@ async def speak_turns(turns: list[tuple[str, str]],
                                 "piper", fx=_turn_fx(item))
                         except Exception:
                             clip = None
+                if not (clip and clip.get("path")):
+                    # #767: premake missed, the re-render raised and piper
+                    # raised too. This had no else — the turn vanished out of
+                    # seg and transcript with nothing logged anywhere. Say so,
+                    # and put it on the list to be aired on its own below.
+                    missed.append(idx)
+                    note_drop(item["who"], item["chunk"],
+                              "would not render for the burst — airing it on "
+                              "its own (#767)")
                 if clip and clip.get("path"):
                     key = clip["path"].rsplit("/", 1)[-1]
                     seg.append(str(VOICE_MEDIA_DIR / key))
@@ -21052,6 +21230,18 @@ async def speak_turns(turns: list[tuple[str, str]],
                         "id": rid,
                         "ts": int(time.time()), "who": who, "kind": "call",
                         "text": chunk, "aired": "stream",
+                        # #770: when this turn will actually be AUDIBLE, not
+                        # when the batch was written. Every turn of a burst
+                        # shares one `ts`; they do not share one moment. This
+                        # is an estimate — playback starts a beat after this
+                        # loop — and _stream_now_set corrects it below with
+                        # the real handover time.
+                        "air_at": time.time() + offset,
+                        # #766: which document seeded it. dj_speak has carried
+                        # this since #226 and the coalesced road never did —
+                        # which is most of the show, and all of every call. It
+                        # is how you see the report a caller is citing.
+                        **({"source": source} if source else {}),
                         "voice": (caller_voice if who == "caller"
                                   else caller2_voice if who == "caller2"
                                   else voices.get(who, "")) or "",
@@ -21062,7 +21252,10 @@ async def speak_turns(turns: list[tuple[str, str]],
                                  "name": (caller_name if who == "caller" else ""),
                                  "from": offset, "until": offset + max(0.4, secs)})
                     offset += max(0.4, secs)
-                del _RADIO["chat"][:-160]
+                # #770: 160 here against 240 everywhere else meant a busy
+                # round amputated up to eighty entries the panel had never
+                # been shown — "conversation moments not showing" outright.
+                del _RADIO["chat"][:-240]
                 # The turns were measured BEFORE the concat, which loudness-
                 # normalises and can lay texture under the join, so the sum
                 # drifts from the finished clip. Scale to what was actually
@@ -21108,17 +21301,34 @@ async def speak_turns(turns: list[tuple[str, str]],
                     return spoken
                 continue
             # This burst could not be built. If earlier ones already went
-            # out, the round is part-aired and must NOT be replayed whole by
+            # out, the round is part-aired and must NOT be replayed WHOLE by
             # the turn-by-turn path below.
+            # #767: it must not be abandoned either. `continue` here dropped
+            # every turn of this burst on the floor — no audio, no booth row,
+            # no drop note. Hand exactly these turns to the turn-by-turn path
+            # instead, so the round still says everything it was given.
             if played_any:
+                missed.extend(range(_lo, _hi))
                 continue
-        if played_any:
-            return spoken                # part of it aired; do not repeat it
+        if played_any and not missed:
+            return spoken                # all of it aired; do not repeat it
         # concat failed — fall through to the turn-by-turn path.
 
+    # #767: normally this path airs the whole round. When the coalesced
+    # path already put SOME of it out, it airs only the turns that never
+    # made a burst — every scheduled line lands exactly once.
+    order = list(range(len(playlist)))
+    recovering = bool(played_any and missed)
+    if recovering:
+        order = sorted({i for i in missed if 0 <= i < len(playlist)})
+        pipeline_log("drop", f"{len(order)} scheduled turn(s) never made it "
+                             "into a burst — airing them one by one (#767)")
+    reached: set[int] = set()
     consumed = 0
     can_cut = True                      # a cut is honored only between turns
-    for at, item in enumerate(playlist):
+    for at in order:
+        item = playlist[at]
+        reached.add(at)
         if _TALK_CUT[0] != cut_at and can_cut:
             break                       # something urgent took the floor — but
                                         # let the current turn FINISH first, so
@@ -21146,7 +21356,9 @@ async def speak_turns(turns: list[tuple[str, str]],
             if item.get("big") and out:
                 # The stunned beat (#320): a whole monologue just landed
                 # and the room sits with it before anyone dares follow.
-                await asyncio.sleep(2.8)
+                # #769: 2.8 s flat was long enough to read as a fault. Still
+                # a beat, no longer a hole, and never the same twice.
+                await asyncio.sleep(random.uniform(1.05, 1.7))
             # dj_speak returns only once the line has actually been spoken,
             # so this is just a beat between turns, not a guess at length.
             await asyncio.sleep(banter_gap(dj["overlap"]))
@@ -21160,6 +21372,13 @@ async def speak_turns(turns: list[tuple[str, str]],
     # returns, so it is not in scope on this one.
     _vto = _RADIO.get("voice_to") or "box"
     shelf_ok = box_talk_ok() and _vto in ("box", "both")
+    if recovering:
+        # #767: only the recovered turns were in play here; everything else
+        # already aired in a burst and must not be shelved a second time.
+        for _i in order:
+            if _i not in reached and not premade[_i].done():
+                premade[_i].cancel()
+        return spoken
     for item, leftover in zip(playlist[consumed:], premade[consumed:]):
         # A cut round leaves clips rendered and unplayed. A FINISHED one —
         # usually the cohost's, the later speaker — goes to the hold shelf so
@@ -21284,10 +21503,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
     if lines <= 0:
         lines = random.randint(dj["banter_min_lines"], dj["banter_max_lines"])
         # Lines run twice as long since #361 and renders slowed under
-        # GPU load — a drawn round stays bounded at six turns so records
-        # ever reach the floor (#394). The 45-second banter clock keeps
-        # the talk constant (#345): shorter rounds, more of them.
-        lines = min(lines, 6)
+        # GPU load — a drawn round stays bounded so records ever reach the
+        # floor (#394). The 45-second banter clock keeps the talk constant
+        # (#345): shorter rounds, more of them.
+        # #767: the bound was a flat six, which quietly overrode the
+        # operator's own dial — this station asks for 9 to 15 and was
+        # written 6. "Every scheduled line" begins with scheduling the
+        # number that was actually asked for; six remains the floor of the
+        # ceiling so an unset station behaves as it always did.
+        lines = min(lines, max(6, int(dj.get("banter_max_lines") or 6)))
     # A round off the larder shelf (#349, #351): written minutes ago while
     # the desk was quiet, on air the instant it is wanted. Only the plain
     # random rounds shop here — anything with its own subject (an angle, a
@@ -21340,7 +21564,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # earned their way onto it.
             return await speak_turns(banter_turns(keep["text"]), track, lines,
                                      allow_repeat=True,
-                                     source=keep.get("source", ""))
+                                     source=keep.get("source", ""),
+                                     # #769: a replay is a round like any
+                                     # other — it streams if the show streams.
+                                     render_stream=bool(
+                                         dj_settings().get("stream_show")))
 
     material = banter_material()
     pictures = banter_pictures()
@@ -21906,8 +22134,17 @@ async def _banter_air(entry: dict[str, Any],
                                source_text=entry.get("seed_text", ""),
                                caller2_name=entry.get("caller2_name", ""),
                                caller2_voice=entry.get("caller2_voice", ""),
-                               render_stream=entry.get("render_stream",
-                                                       False),
+                               # #769: the round decides how it AIRS at the
+                               # moment it airs. Larder rounds are banked by
+                               # dj_banter(bank=True), which takes the default
+                               # False, so every round off the shelf aired
+                               # turn-by-turn — a separate announce and a
+                               # 900 ms tail per chunk — while fresh rounds
+                               # streamed. Two engines, alternating, which is
+                               # exactly what "sounding inorganic" was.
+                               render_stream=bool(
+                                   entry.get("render_stream")
+                                   or dj_settings().get("stream_show")),
                                feel=entry.get("feel", False))       # #750
     if entry.get("seek_verdict") and spoken:
         asyncio.create_task(_sfx_verdict(spoken[-1]))
@@ -29775,6 +30012,16 @@ async def _cut_do(job: str, kind: str, seconds: int,
                       "label": label, "error": ""}
     try:
         if kind == "mix":
+            # #774: seal the running episode FIRST. The mix is rebuilt from
+            # the episode sidecars, and everything said in the last few
+            # minutes — which is the entire point of "cut the last stretch"
+            # — is still staged with no sidecar to read. Without this the
+            # records came through and the pair and the ads did not. The
+            # compile road has done this since #624 for the same reason.
+            try:
+                await asyncio.to_thread(_episode_finalize)
+            except Exception:
+                pass                    # a cut of the shelf beats no cut
             lo = time.time() - seconds
             built = await asyncio.to_thread(
                 _broadcast_mix, lo, time.time() + 1.0,
@@ -30171,6 +30418,14 @@ def _broadcast_mix(lo: float, hi: float, music: float, duck: float,
         return out if out.is_file() and out.stat().st_size > 1000 else None
 
     # --- the talk, from the episode sidecars -----------------------------
+    # #774: anything still staged has no sidecar and is therefore invisible
+    # here. Callers are expected to seal first; if one has not, say so rather
+    # than handing back a broadcast with nobody talking on it.
+    _open = len((_RADIO.get("episode") or {}).get("items") or [])
+    if _open:
+        pipeline_log("air", f"broadcast mix: {_open} aired clip(s) are still "
+                            "in the open episode and will not be in this cut "
+                            "— seal it first (#774)")
     said: list[tuple[float, float, str, float]] = []
     for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json")):
         source = mark_file.with_suffix(".mp3")
@@ -31413,6 +31668,7 @@ async def dj_themes_get(
     rows = themes_read()
     return {"themes": rows.get("themes") or [],
             "active": rows.get("active") or "",
+            "doc": str(rows.get("doc") or ""),              # #766
             "strength": int(rows.get("strength") or 70)}
 
 
@@ -31448,10 +31704,46 @@ async def dj_themes_set(
         rows["active"] = want
     if "strength" in payload:
         rows["strength"] = max(0, min(100, int(payload.get("strength") or 0)))
+    if "doc" in payload:
+        # #766: the report they ring in about. "" lets them roam the shelf.
+        want_doc = str(payload.get("doc") or "").strip()
+        if want_doc:
+            known = {p.name for p in speakbox_all(mind_id(""))}
+            if want_doc not in known:
+                raise HTTPException(status_code=404,
+                                    detail="No such report on the shelf")
+        rows["doc"] = want_doc
     rows["themes"] = themes
     themes_write(rows)
-    pipeline_log("theme", f"callers → {rows.get('active') or 'roaming'}")
+    pipeline_log("theme", f"callers → {rows.get('active') or 'roaming'}"
+                          + (f" · citing {rows['doc']}" if rows.get("doc")
+                             else ""))
+    # #771: "have them change topic and be talking about the topics
+    # IMMEDIATELY". The subject of a call is picked when the call starts, so
+    # the change was always going to land — on whichever caller the phone
+    # clock got round to next, which is a minute or several away, and longer
+    # still with a skip cooldown sitting on the line. Ring one now.
+    switched = bool(add.get("text") or drop or "active" in payload
+                    or "doc" in payload)
+    rang = False
+    if switched:
+        # The freshness guard remembers the last eight subjects. Under a new
+        # theme those memories are about the old one and can only suppress it.
+        (_RADIO.get("recent_topics") or []).clear()
+        _RADIO["call_cooldown"] = 0
+        if _RADIO.get("on") and rows.get("active") \
+                and time.time() - _THEME_RING[0] > THEME_RING_GAP:
+            # One caller per change of subject. Picking a theme, dragging the
+            # share and choosing a report are three POSTs in as many seconds,
+            # and three callers talking over each other is not what "change
+            # topic immediately" asked for.
+            _THEME_RING[0] = time.time()
+            asyncio.create_task(_theme_ring_now())
+            rang = True
+            pipeline_log("theme", "ringing a caller on the new subject now "
+                                  "(#771)")
     return {"themes": themes, "active": rows.get("active") or "",
+            "doc": str(rows.get("doc") or ""), "rang": rang,
             "strength": int(rows.get("strength") or 70)}
 
 
@@ -36816,6 +37108,8 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   font-size: 10px; padding: 1px 8px; border-radius: 999px;
   border: 1px solid var(--border); color: var(--muted);
   text-transform: uppercase; letter-spacing: .05em;
+  /* #768: a pill is a pill — it never grows and never breaks in half. */
+  flex: 0 0 auto; white-space: nowrap;
 }
 .vkind-clone { color: var(--accent); border-color: var(--accent); }
 .vkind-simulacrum { color: #b98cff; border-color: #b98cff; }
@@ -36825,9 +37119,20 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
 .voice-row {
   display: flex; align-items: center; gap: 9px; padding: 7px 6px;
   border-bottom: 1px solid var(--border); font-size: 13px;
+  /* #768: when the controls will not fit, they drop to a second line
+     instead of taking the width out of the name. The row was `nowrap`,
+     so the only give in it was the one item that could shrink. */
+  flex-wrap: wrap; row-gap: 6px;
 }
-.voice-row .name { flex: 1; min-width: 0; overflow: hidden;
-  text-overflow: ellipsis; white-space: nowrap; }
+/* #768: `flex: 1` is `flex: 1 1 0%` — a basis of ZERO, so the name was
+   handed only leftover space and there was none. It now ASKS for 210px,
+   refuses to go under 150px, and wraps rather than ellipsing to nothing. */
+.voice-row .name { flex: 1 1 210px; min-width: 150px; overflow: hidden;
+  white-space: normal; overflow-wrap: anywhere; font-weight: 600; }
+/* #768: these six wore the global button slab (10px 14px) — 276px of a
+   row that only had 810px to give. Scoped, so no other panel moves. */
+.voice-row button { padding: 5px 8px; font-size: 12px; line-height: 1.15; }
+.voice-row input[type=range] { min-width: 0; }
 /* #682: shift-selectable rows, so a roomful split into fragments can be
    picked out and put back together as one shard. */
 .voice-row.picked {
@@ -38141,6 +38446,16 @@ Glass</button>
           </label>
           <button onclick="themeDrop()" title="Forget the selected theme"
                   style="font-size:12px">✕</button>
+        </div>
+        <!-- #766: ring in about ONE report off the shelf, chosen and read
+             before you commit to it. -->
+        <div class="row" style="margin-top:6px">
+          <button id="themeDocBtn" onclick="themeDocPick()"
+                  title="Have them ring in citing one particular report — pick
+it from the shelf and read it first"
+                  style="font-size:12px;flex:1;text-align:left">
+            📄 any report off the shelf
+          </button>
         </div>
         <div class="row" style="margin-top:8px">
           <input id="themeName" placeholder="Call it something…"
@@ -45575,6 +45890,59 @@ const djTalkById = new Map();
  * changed. */
 const djTalkDirty = new Set();
 let djTalkFresh = 0;
+/* #770: the booth is a chronological view of the broadcast, so the order is
+ * the order the room HEARD it — `air_at` — and not the order the station
+ * happened to write the rows in. A coalesced burst stages up to eight turns
+ * before a syllable of it is audible, so those two orders are genuinely
+ * different and the second one is the wrong one. */
+let djTalkMaxAir = 0;
+let djTalkNeedsSort = false;
+let djTalkOrderDirty = false;
+function djTalkAirAt(line) {
+  if (!line) return 0;
+  return Number(line.air_at || line.ts || 0);
+}
+/* #772: the round that is playing, its per-turn windows, and how far this
+ * machine's clock is from the station's. */
+let djStreamNow = null;
+let djStreamSkew = 0;
+let djStreamLiveId = "";
+function djStreamAt() {
+  return (Date.now() + djStreamSkew) / 1000;
+}
+function djStreamCurrentId() {
+  if (!djStreamNow || !djStreamNow.at) return "";
+  const off = djStreamAt() - djStreamNow.at;
+  if (off < 0 || off > Number(djStreamNow.length || 0) + 4) return "";
+  const rows = djStreamNow.rows || [];
+  for (let i = 0; i < rows.length; i += 1) {
+    if (off >= Number(rows[i].from) && off < Number(rows[i].until)) {
+      return String(rows[i].id || "");
+    }
+  }
+  return "";
+}
+/* #772: run the round's own clock rather than waiting to be told. Also
+ * releases rows from "coming up" as they come up. */
+function djBoothTick() {
+  const log = document.getElementById("djTalkLog");
+  if (log) {
+    const now = djStreamAt();
+    log.querySelectorAll("[data-coming]").forEach((r) => {
+      if (Number(r.getAttribute("data-airat") || 0) <= now) {
+        r.removeAttribute("data-coming");
+        r.style.opacity = "";
+        const tag = r.querySelector("[data-comingtag]");
+        if (tag) tag.remove();
+      }
+    });
+  }
+  const id = djStreamCurrentId();
+  if (!id || id === djStreamLiveId) return;
+  djStreamLiveId = id;
+  window.djSpeakingEid = id;
+  djTalkMarkLive();
+}
 // index in djTalkAll -> the row element painted for it
 const djTalkRows = new Map();
 let djTalkPainted = 0;
@@ -45600,6 +45968,10 @@ function djTalkAbsorb(lines) {
       // has landed for real, a late poll of speaking_now must not undo it.
       if (!(line.aired === "airing" && was.aired !== "airing")) {
         const merged = Object.assign({}, was, line);
+        // #770: an air time that MOVED can reorder the feed — the estimate
+        // written when a burst was staged is corrected the moment the clip
+        // is actually handed over.
+        if (djTalkAirAt(merged) !== djTalkAirAt(was)) djTalkNeedsSort = true;
         // #748: the finished entry can arrive with NO `aired` key at all
         // (page-only routing where the clip failed, and the hold-shelf
         // drain which pops the key rather than reassigning it). A plain
@@ -45621,10 +45993,42 @@ function djTalkAbsorb(lines) {
     djTalkSeenIds.add(key);
     if (eid) djTalkById.set(eid, djTalkAll.length);
     djTalkAll.push(line);
+    // #770: does this one belong before something already here?
+    const when = djTalkAirAt(line);
+    if (when < djTalkMaxAir - 0.001) djTalkNeedsSort = true;
+    if (when > djTalkMaxAir) djTalkMaxAir = when;
     added += 1;
   });
   djTalkFresh += added;
+  if (djTalkNeedsSort) djTalkSort();
   return added;
+}
+
+/* #770: put the night back into the order it was HEARD in.
+ *
+ * Only runs when something genuinely arrived out of order, which in the
+ * steady state is never — the cost of the check is one comparison per new
+ * line. Stable: lines sharing a moment keep the order they were written in.
+ * If nothing actually moved, the incremental paint is left alone. */
+function djTalkSort() {
+  djTalkNeedsSort = false;
+  const was = djTalkAll;
+  const ix = was.map((unused, i) => i);
+  ix.sort((a, b) => (djTalkAirAt(was[a]) - djTalkAirAt(was[b])) || (a - b));
+  let moved = false;
+  for (let i = 0; i < ix.length; i += 1) {
+    if (ix[i] !== i) { moved = true; break; }
+  }
+  if (!moved) return;
+  djTalkAll = ix.map((i) => was[i]);
+  djTalkById.clear();
+  djTalkAll.forEach((line, i) => {
+    const eid = String(line.id || "");
+    if (eid) djTalkById.set(eid, i);
+  });
+  // Rows are keyed by index and are never moved in the DOM, so the only
+  // honest answer to a reorder is to draw it again.
+  djTalkOrderDirty = true;
 }
 
 function djTalkClear() {
@@ -45635,6 +46039,9 @@ function djTalkClear() {
   djTalkRows.clear();
   djTalkFresh = 0;
   djTalkPainted = 0;
+  djTalkMaxAir = 0;                                              // #770
+  djTalkNeedsSort = false;
+  djTalkOrderDirty = false;
   const log = document.getElementById("djTalkLog");
   if (log) log.textContent = "";
   setStatus("Booth history cleared.");
@@ -45660,8 +46067,15 @@ function djTalkRender(state) {
    * the line it is speaking the moment it hands it over, under the id the
    * finished entry will land on, so it is in the list from the first
    * syllable and the same row simply fills in when it is done. */
+  // #772: follow the round on its own clock. `server_ms` is the station's
+  // idea of now, so the two machines agree on where in the clip we are
+  // rather than on when this browser last polled.
+  djStreamNow = state.stream_now || null;
+  if (state.server_ms) djStreamSkew = Number(state.server_ms) - Date.now();
+  const localId = djStreamCurrentId();
   const live = state.speaking_now || null;
-  window.djSpeakingEid = live ? String(live.id || "") : "";
+  window.djSpeakingEid = localId || (live ? String(live.id || "") : "");
+  if (localId) djStreamLiveId = localId;
   window.djSpeakingWho = live ? String(live.who || "") : "";
   if (live && live.text) djTalkAbsorb([live]);
   const lines = djTalkAll;
@@ -45798,6 +46212,15 @@ function djTalkRender(state) {
    * Only lines that have never been drawn get a row built, and only rows
    * whose data actually changed get replaced. In the steady state that is
    * nought to three rows per poll instead of every line of the night. */
+  // #770: the feed was reordered under us — the incremental cursor cannot
+  // express that, so draw it again. Rare by construction.
+  if (djTalkOrderDirty) {
+    djTalkOrderDirty = false;
+    djTalkDirty.clear();
+    djTalkRepaint();
+    djTalkScroll(log, atBottom, keepTop);
+    return;
+  }
   for (let at = djTalkPainted; at < lines.length; at += 1) {
     const built = djTalkRow(lines[at]);
     if (!built) continue;
@@ -45914,6 +46337,17 @@ function djTalkRow(line) {
      * id, and the jump fell through to "nothing is going out". */
     if (line.id) row.setAttribute("data-eid", line.id);
     row.setAttribute("data-who", line.who || "");
+    /* #770/#772: this row's place on the broadcast clock, and whether it has
+     * got here yet. A staged burst is written before it is audible, so the
+     * bottom of the feed can legitimately hold lines nobody has heard — they
+     * are shown as what they are rather than pretending to have happened.
+     * djBoothTick releases them as they come up. */
+    const _air = djTalkAirAt(line);
+    if (_air) row.setAttribute("data-airat", String(_air));
+    if (_air && _air > djStreamAt() + 0.6) {
+      row.setAttribute("data-coming", "1");
+      row.style.opacity = ".45";
+    }
     if (line.name) row.setAttribute("data-name", line.name);
     // #691: the call ended. A call used to just stop scrolling — no mark,
     // no length, no reason. This is the end of it, said plainly, with the
@@ -46414,6 +46848,16 @@ function djTalkRow(line) {
       off.title = "Page feed only — the box declined this line";
       off.style.cssText = "font-size:10px;opacity:.6";
       said.appendChild(off); said.style.opacity = ".72";
+    } else if (line.aired === "never") {
+      // #767: a scheduled line that produced no audio at all. It used to
+      // render bare, indistinguishable from one that was spoken.
+      const no = el("span", "", " \u26a0 never aired");
+      no.title = "This line was written and scheduled but nothing was ever "
+        + "rendered for it — you did not hear this. See the drop log.";
+      no.style.cssText = "font-size:10px;color:#ff9b6a";
+      said.appendChild(no);
+      said.style.opacity = ".6";
+      row.style.background = "rgba(255,120,60,.07)";
     } else if (line.aired === "box") {
       const ok = el("span", "", " 📻");
       ok.title = "Handed to the Pine Box — Home Assistant accepted it. "
@@ -49082,6 +49526,113 @@ async function themeLoad() {
   const shown = document.getElementById("themeStrengthVal");
   if (slider) slider.value = String(got.strength);
   if (shown) shown.textContent = got.strength + "%";
+  themeDocPaint(got.doc || "");                                  // #766
+}
+
+/* #766: what the callers are citing, on the button itself. */
+function themeDocPaint(name) {
+  const btn = document.getElementById("themeDocBtn");
+  if (!btn) return;
+  window._themeDoc = name || "";
+  btn.textContent = name ? "📄 citing " + name : "📄 any report off the shelf";
+  btn.style.color = name ? "var(--accent)" : "";
+}
+
+/* #766: the shelf, with the document under the cursor open beside it.
+ * docPreviewShow is the same reader the document lock uses (#694) — it
+ * fetches the first several thousand characters and scrolls them slowly, so
+ * you can see what you are putting in a caller's mouth before you do it. */
+async function themeDocPick() {
+  const shade = el("div", "", "");
+  shade.id = "themeDocModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:181;display:flex;align-items:center;justify-content:center";
+  const close = () => { docPreviewDisarm(); docPreviewHide(); shade.remove(); };
+  shade.onclick = (e) => { if (e.target === shade) close(); };
+  const card = el("div", "panel", "");
+  card.style.cssText = "width:min(560px,92vw);max-height:82vh;overflow:auto;"
+    + "padding:14px 16px;display:flex;flex-direction:column;gap:8px";
+  const head = el("div", "", "What the callers are citing");
+  head.style.cssText = "font-weight:700;font-size:14px";
+  card.appendChild(head);
+  const sub = el("div", "muted", "Pick a report and the theme callers ring in "
+    + "quoting it, getting it half-wrong, and waving it as evidence. Hover a "
+    + "row to read it first.");
+  sub.style.cssText = "font-size:11px;line-height:1.5";
+  card.appendChild(sub);
+  const find = el("input", "", "");
+  find.placeholder = "Filter the shelf…";
+  find.style.cssText = "font-size:12px";
+  card.appendChild(find);
+  const list = el("div", "", "Reading the shelf…");
+  list.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+    + "max-height:46vh;overflow-y:auto";
+  card.appendChild(list);
+  shade.appendChild(card);
+  document.body.appendChild(shade);
+
+  let docs;
+  try { docs = await api("/api/speakbox"); }
+  catch (e) { list.textContent = e.message; return; }
+  const files = (docs.files || []).slice()
+    .sort((a, b) => (b.uses || 0) - (a.uses || 0)
+      || String(a.name).localeCompare(String(b.name)));
+
+  const choose = async (name) => {
+    try {
+      const got = await api("/api/dj/themes", {method: "POST",
+        body: JSON.stringify({doc: name})});
+      themeDocPaint(got.doc || "");
+      setStatus(got.doc
+        ? "callers are ringing in citing " + got.doc
+          + (got.rang ? " — one is on the line now" : "")
+        : "callers are back to any report on the shelf");
+      close();
+    } catch (e) { setStatus(e.message, true); }
+  };
+
+  const rowFor = (f) => {
+    const r = el("div", "", "");
+    const on = f.name === (window._themeDoc || "");
+    r.style.cssText = "display:flex;gap:8px;align-items:center;padding:7px 9px;"
+      + "border-bottom:1px solid var(--border);cursor:pointer;font-size:12px"
+      + (on ? ";background:color-mix(in srgb,var(--accent) 16%,transparent)"
+            : "");
+    const nm = el("div", "", f.name);
+    nm.style.cssText = "flex:1;min-width:0;overflow-wrap:anywhere"
+      + (on ? ";color:var(--accent);font-weight:600" : "");
+    r.appendChild(nm);
+    const meta = el("span", "muted", Math.round((f.bytes || 0) / 1024) + " KB"
+      + (f.uses ? " · leaned on " + f.uses + "×" : " · unread"));
+    meta.style.cssText = "font-size:10px;flex:0 0 auto";
+    r.appendChild(meta);
+    r.onmouseenter = () => docPreviewArm(f.name, r);
+    r.onmouseleave = () => docPreviewDisarm();
+    r.onclick = () => choose(f.name);
+    return r;
+  };
+
+  const paint = () => {
+    const want = find.value.trim().toLowerCase();
+    list.textContent = "";
+    const any = el("div", "", "— any report off the shelf —");
+    any.style.cssText = "padding:7px 9px;border-bottom:1px solid var(--border);"
+      + "cursor:pointer;font-size:12px;color:var(--muted)";
+    any.onclick = () => choose("");
+    list.appendChild(any);
+    const hits = files.filter((f) => !want
+      || String(f.name).toLowerCase().indexOf(want) >= 0);
+    if (!hits.length) {
+      const none = el("div", "muted", "Nothing on the shelf matches that.");
+      none.style.cssText = "padding:9px";
+      list.appendChild(none);
+      return;
+    }
+    hits.forEach((f) => list.appendChild(rowFor(f)));
+  };
+  find.oninput = paint;
+  paint();
+  find.focus();
 }
 
 async function themeActivate() {
@@ -61983,7 +62534,7 @@ function studioVoicesDraw() {
       const input = document.createElement("input");
       input.type = "text";
       input.value = voice.name;
-      input.style.cssText = "flex:1;min-width:0;font-size:13px";
+      input.style.cssText = "flex:1 1 210px;min-width:150px;font-size:13px";
       const done = async (commit) => {
         const wanted = input.value.trim();
         if (commit && wanted && wanted !== voice.name) {
@@ -62051,8 +62602,11 @@ function studioVoicesDraw() {
       // whatever reference it was cut from — and dragging the whole station
       // to fix one voice makes every other voice wrong.
       const trims = el("span", "", "");
+      // #768: `min-width:0` so this block can be compressed. Without it a
+      // flex item is floored at its min-content and the pair of sliders
+      // were an immovable ~240px taken straight out of the name.
       trims.style.cssText = "display:inline-flex;gap:6px;align-items:center;"
-        + "margin-left:6px";
+        + "margin-left:6px;min-width:0;flex:0 1 auto";
       [["speed", "\u23e9", 0.6, 1.6, 0.05, Number(voice.speed || 1),
         "speed \u2014 1.0 is the clone as rendered"],
        ["pitch", "\u266a", -6, 6, 1, Number(voice.pitch || 0),
@@ -62066,9 +62620,10 @@ function studioVoicesDraw() {
         inp.min = String(lo); inp.max = String(hi); inp.step = String(step);
         inp.value = String(val);
         inp.title = tip;
-        inp.style.cssText = "width:66px";
+        inp.style.cssText = "width:54px;min-width:0";     // #768
         const out = el("span", "", "");
-        out.style.cssText = "min-width:30px;text-align:right";
+        out.style.cssText = "min-width:28px;text-align:right;"
+          + "white-space:nowrap";
         const paint = () => {
           out.textContent = field === "pitch"
             ? (Number(inp.value) > 0 ? "+" : "") + Number(inp.value)
@@ -66641,6 +67196,10 @@ function startLiveActivity() {
   djLoadSettings();
   pollDJ();
   djTimer = setInterval(pollDJ, 4000);
+  // #772: the booth marker runs on the round's clock, not the poll's. A turn
+  // is about eight seconds and the state poll is four, so waiting to be told
+  // put the highlight on the neighbouring line about half the time.
+  setInterval(djBoothTick, 250);
   // The clock alone, often — this is what keeps two machines on the same
   // second while the heavy state poll stays on its slow round (#631).
   setInterval(radioClockPoll, 1500);
