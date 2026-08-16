@@ -469,6 +469,9 @@ DEFAULT_DJ = {
     "sfx_make": True,
     # 0 = never, 1 = after every line. A fifth is enough to be a habit
     # without becoming a tic.
+    # When the cloning engine cannot keep up, borrow Piper rather than go
+    # silent. Off means "always the cloned voice, even if that means gaps".
+    "render_relief": True,
     "sfx_rate": 0.2,
     # Echo and reverb on a line, now and then (#222). Rate is how often; the
     # two depths are the range it is drawn between, so it is never the same
@@ -962,6 +965,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             for name in (raw_dj.get("sfx_folders") or [])
             if str(name or "").strip()
         ][:20],
+        "render_relief": bool(raw_dj.get(
+            "render_relief", DEFAULT_DJ["render_relief"])),
         "sfx_rate": max(0.0, min(1.0, float(
             raw_dj.get("sfx_rate", DEFAULT_DJ["sfx_rate"]) or 0))),
         "fx_rate": max(0.0, min(1.0, float(
@@ -5774,6 +5779,44 @@ def _trim_wav_seconds(raw: bytes, most: float = 120.0) -> bytes:
         return raw
 
 
+# How the cloning engine has ACTUALLY been performing, in seconds of
+# synthesis per second of audio. Under 1.0 means it renders faster than it
+# plays; over 1.0 means the station is losing ground and the air will go
+# quiet no matter what every other dial says.
+_RENDER_COST: list[float] = []
+RENDER_COST_SLOW = 1.6          # sustained ratio at which we borrow Piper
+RENDER_COST_OK = 1.1            # ...and the ratio at which the clones return
+_RENDER_RELIEF = [False]
+
+
+def render_cost_note(engine: str, ms: float, seconds: float) -> None:
+    """Record what a render cost, so the show can tell when it is losing."""
+    if engine not in ("xtts", "f5") or seconds <= 0.2 or ms <= 0:
+        return
+    _RENDER_COST.append(max(0.01, (float(ms) / 1000.0) / float(seconds)))
+    del _RENDER_COST[:-8]
+    if len(_RENDER_COST) < 4:
+        return
+    mean = sum(_RENDER_COST) / len(_RENDER_COST)
+    if not _RENDER_RELIEF[0] and mean >= RENDER_COST_SLOW:
+        _RENDER_RELIEF[0] = True
+        pipeline_log("voice", f"the clone engine is running {mean:.1f}x "
+                              "slower than real time — borrowing Piper so "
+                              "the stream keeps moving")
+    elif _RENDER_RELIEF[0] and mean <= RENDER_COST_OK:
+        _RENDER_RELIEF[0] = False
+        pipeline_log("voice", f"synthesis caught up ({mean:.1f}x) — the "
+                              "cloned voices are back")
+
+
+def render_relief() -> bool:
+    """Is the station currently borrowing the fast engine? Off unless the
+    operator has left the relief enabled (#stream)."""
+    if not dj_settings().get("render_relief", True):
+        return False
+    return _RENDER_RELIEF[0]
+
+
 def voice_engine_for(voice: str) -> str:
     """The voice NAME is the engine router. vl_* ids belong to the library
     (usually xtts), Voxtral preset names to voxtral, everything else is a
@@ -5791,6 +5834,13 @@ def voice_engine_for(voice: str) -> str:
         pick = str(dj_settings().get("clone_engine") or "")
         if pick in ("xtts", "f5") and engine in ("xtts", "f5"):
             engine = pick
+        # Measured on this box: 34 seconds of synthesis, on average, for
+        # eleven seconds of audio. A station that cannot render as fast as it
+        # speaks goes quiet, and quiet is the one thing a stream cannot be.
+        # When the clone engine is demonstrably behind, borrow the fast one
+        # and hand the clones back the moment it recovers.
+        if engine in ("xtts", "f5") and render_relief():
+            return "piper"
         return engine if engine in VOICE_FILE_ENGINES else "xtts"
     if voice in VOXTRAL_PRESETS:
         return "voxtral"
@@ -5981,6 +6031,9 @@ async def voice_generate(text: str, voice: str, engine: str,
                "piper": "wyoming-piper container, Wyoming TCP port 10200",
                "voxtral": f"Voxtral 4B via vLLM-omni at {VOXTRAL_URL}",
                }.get(engine, engine)
+    # How this render compares to real time, so the show can tell when the
+    # clone engine is losing ground and borrow the fast one (#stream).
+    render_cost_note(engine, took, length or 0.0)
     # The glass expands these now (#389): everything about the render on
     # the row itself — what was said, what rendered it, and its weight.
     pipeline_log("voice", f"{engine} done · {took} ms "
@@ -7400,6 +7453,22 @@ def overdwelt_subjects(most: int = 4) -> list[str]:
               for w in str(dj.get(field) or "").split()}
     exempt |= {"pine", "box", "boxes", "the", "and", "you", "well", "look",
                "yeah", "okay", "right", "listen", "folks", "tonight"}
+    # #775: never order them off the subject the OPERATOR set. Two aired
+    # lines containing "Crochet" were enough for this to start appending
+    # "you are DONE with that subject, do not bring it up again" to the very
+    # prompt that was asking for crochet. And because the pattern below only
+    # matches Capitalised words, lowercase "heat" could never be flagged -
+    # so this guard fought an operator's theme and was structurally unable
+    # to fight the station's default one. That asymmetry is why the answer
+    # was NO crochet rather than a little crochet.
+    try:
+        _theme = active_theme()
+        if _theme:
+            exempt |= {w.lower().strip(".,!?\"'")
+                       for w in (str(_theme.get("name") or "") + " "
+                                 + str(_theme.get("text") or "")).split()}
+    except Exception:
+        pass
     line_hits: dict[str, int] = {}
     for line in rows:
         seen = {w for w in re.findall(r"\b[A-Z][a-z]{3,}\b", str(line))
@@ -8187,7 +8256,7 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": line,
             })
-            del _RADIO["voice_clips"][:-40]
+            del _RADIO["voice_clips"][:-140]
         # And onto the box — if it is stalling right now, the ack waits on
         # the hold shelf and plays the moment the box recovers, so the
         # spoken "got your request" is never simply lost (#436).
@@ -8923,7 +8992,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                     "text": spoken, "engine": voice_engine_for(forced or ""),
                     "voice": forced or "",
                 })
-                del _RADIO["voice_clips"][:-40]
+                del _RADIO["voice_clips"][:-140]
             _RADIO["chat"].append({
                 "ts": int(time.time()), "who": who, "kind": kind,
                 "text": spoken, "voice": forced or "",
@@ -9026,6 +9095,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # shelf is. Either way the page carries everything when the box can't (#536).
     box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                 or len(_BOX_HOLD) >= 6)
+
     # #742: the line exists in the booth from HERE — the moment it is handed
     # to a speaker — not fifty seconds later when the announce returns. It
     # carries the id the finished entry lands under, so the provisional row
@@ -9040,13 +9110,21 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-40]
+            del _RADIO["voice_clips"][:-140]
             paged = True
         elif voice_to in ("here", "both"):
             # A line that rendered to nothing must show the gap, not vanish
             # silently while SFX keep playing (audit #4/#13).
             note_drop(who, spoken,
                       "DJ voice rendered to nothing for the page feed")
+
+    # #776: this used to sleep for the length of the clip so the browser
+    # could not fall behind. It did that, and it cost far more than it was
+    # worth: every render and every model call behind it became audible dead
+    # air, because the whole show was serialised behind playback. A stream
+    # wants the pair coming back at once. The lines are kept safe instead by
+    # the deep feed window and by the page no longer discarding its backlog,
+    # which is where that problem actually lived.
 
     # The box's own verdict on THIS clip, captured the instant it plays and
     # before any sting/nudge can overwrite the shared _LAST_PLAYOUT slot (#520
@@ -9179,7 +9257,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             "url": f"{clip['path']}?t={clip['sig']}",
             "text": spoken, "engine": engine, "voice": forced or "",
         })
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
         paged = True
 
     # A sting off the end of it, now and then (#208). After the line, never
@@ -9213,7 +9291,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-40]
+            del _RADIO["voice_clips"][:-140]
         else:
             note_drop(who, spoken,
                       f"box declined — held for the box: {why}"[:200])
@@ -9345,7 +9423,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-40]
+            del _RADIO["voice_clips"][:-140]
             entry["aired"] = "page"
         else:
             entry["aired"] = "never"
@@ -10613,17 +10691,20 @@ def torrent_breath(dj: dict[str, Any]) -> float:
     # records still play underneath the whole time.
     #   dial 100 →  6.0- 10.2s      dial 70 → 10.4- 23.2s
     #   dial  50 → 14.3- 31.9s      dial  0 → 24.1- 53.7s
-    middle = 7.0 + (100 - talk) * 0.30
+    # #776/stream: closed up again. At the operator's dial of 70 this was
+    # still leaving ten to twenty-three seconds of nothing between rounds,
+    # and the ask is a stream where the pair come straight back.
+    #   dial 100 -> 2.0- 3.6s      dial 70 -> 3.6- 8.0s
+    #   dial  50 -> 5.0-11.1s      dial  0 -> 8.4-18.8s
+    middle = 2.5 + (100 - talk) * 0.10
     if box_alone:
         # Silence on a speaker with nothing under it. Keep a beat so the
         # pair do not trample their own tails, and no more.
         middle = min(middle, 7.0)
         return max(3.0, random.uniform(middle * 0.6, middle * 1.2))
-    # #769: the floor was 10.0, which swallowed the whole top of the dial —
-    # at 100 the curve asks for 4.6-10.2s and every one of those answers was
-    # clamped back to a flat ten. Six, so "the pair never stop" can actually
-    # be dialled in.
-    return max(6.0, random.uniform(middle * 0.65, middle * 1.45))
+    # #769: the floor was 10.0, which swallowed the whole top of the dial.
+    # Now 2.0 — on a stream the gap between rounds should be a beat.
+    return max(2.0, random.uniform(middle * 0.65, middle * 1.45))
 
 
 async def _torrent_talk() -> None:
@@ -12592,7 +12673,7 @@ async def dj_police_outside(text: str) -> None:
             "ts": int(time.time() * 1000),
             "url": f"{play['path']}?t={play['sig']}",
             "text": label, "voice": voice})
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
     _episode_stage(f"{play['path']}?t={play['sig']}", label)
     pipeline_log("air", f"megaphone outside — {character} vocode, "
                         f"sirens behind (#636)")
@@ -12892,7 +12973,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
             "ts": int(time.time() * 1000),
             "url": f"{path}?t={sig}", "text": label,
             "voice": str(made.get("voice") or "")})
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
     _episode_stage(f"{path}?t={sig}", label)
     upstairs_update(str(made.get("id") or ""),
                     uses=int(made.get("uses") or 0) + 1,
@@ -13553,7 +13634,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
             "ts": int(time.time() * 1000),
             "url": f"{play['path']}?t={play['sig']}",
             "text": line, "engine": engine, "voice": forced or ""})
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
     entry = ad_save(product, line, kind="music") if remember else None
     if entry:
         ad_line_mark(entry.get("id", ""), product)
@@ -13677,7 +13758,7 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
             "ts": int(time.time() * 1000),
             "url": f"{path}?t={sig}", "text": label,
             "voice": entry.get("voice") or ""})
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
     if ad_to in ("box", "both"):
         await _play_on_box(path, sig)
     _episode_stage(f"{path}?t={sig}", label)
@@ -16537,7 +16618,11 @@ def sting_due() -> Path | None:
     # A hard 45-second floor under the configured gap (#414): a six-turn
     # round rolls the dice six times, and back-to-back hits sounded like
     # the soundboard had a stuck key.
-    if time.time() - _STING_AT[0] < max(45.0, float(dj["sfx_gap"])):
+    # The dial is the dial. This read max(45.0, sfx_gap), so the "never twice
+    # inside" slider did NOTHING below forty-five seconds and the desk's own
+    # default of 12 was unreachable — which is why the show sounded bare.
+    # A floor of three keeps one sting from landing on top of the last.
+    if time.time() - _STING_AT[0] < max(3.0, float(dj["sfx_gap"])):
         return None
     if random.random() >= dj["sfx_rate"]:
         return None
@@ -16698,7 +16783,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
         })
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
     # A sting is MEANT to land over the DJ's own line it punctuates, so the
     # show's own just-finished announce tail must not block it (#559: "the
     # sound effects aren't coming through"). Same own-tail carve-out as the
@@ -16729,7 +16814,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
         })
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
         played_anywhere = True
         pipeline_log("air", f"sting {sample.stem} could not go to the "
                             "box (satellite busy) — sent to the page "
@@ -19120,6 +19205,34 @@ def themes_write(rows: dict[str, Any]) -> None:
         pass
 
 
+def theme_owns_air() -> dict[str, Any]:
+    """#775: the subject the OPERATOR has chosen, when they have chosen one
+    that is not the station's own default.
+
+    The default theme is "heat / DGX Spark" - the subject this station talks
+    about when nobody has told it otherwise, and the one every hard-coded
+    heat road is already an expression of. So when the default is active,
+    those roads ARE the theme and nothing needs suppressing. The moment the
+    operator picks something else, that choice outranks the built-in
+    material: it is the whole meaning of setting it.
+
+    Returns {} when the callers are roaming or the default is in force."""
+    row = active_theme()
+    if not row or row.get("name") == DEFAULT_THEME["name"]:
+        return {}
+    return row
+
+
+def theme_air_clause(theme: dict[str, Any]) -> str:
+    """The line that tells a round what tonight is about (#775)."""
+    if not theme:
+        return ""
+    return (" TONIGHT'S SUBJECT, which the station has been told to stay on: "
+            f"{theme.get('text') or theme.get('name')}. Bring the conversation "
+            "round to it in your own way - argue about it, joke about it, "
+            "take it somewhere - rather than announcing it.")
+
+
 def active_theme() -> dict[str, Any]:
     """The theme in force, or {} when the callers are left to roam."""
     rows = themes_read()
@@ -19596,7 +19709,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # and varied call after call.
     _heat = booth_hot()
     heat_pivot: dict[str, Any] = {}
-    if _heat >= 55:
+    # #775: an operator-set subject outranks the built-in heat material. This
+    # block is four imperative instructions - the lament with its exact
+    # Fahrenheit, the SHAPE of the call, the grievances and the pivot - and
+    # it landed on EVERY call, because its >= 55 gate is permanently open on
+    # a DGX (the station's own bands call 50-62C merely "warm"; this box runs
+    # ~82C). Measured: a caller opened on crochet, word for word, and was
+    # pulled into "the real temperature where I live is 166 degrees" by these
+    # very lines. When the operator has named a subject, it is theirs.
+    _themed = theme_owns_air()
+    if _themed:
+        pipeline_log("theme", "heat material held back - the callers are on "
+                              f"{_themed.get('name')} (#775)")
+    if _heat >= 55 and not _themed:
         _real_f = _heat * 9 / 5 + 32
         _feels_f = _real_f + 20.0
         _heat_fuel = ""
@@ -20521,8 +20646,11 @@ def _call_concat_blocking(paths: list[str],
     # loudness pass, optionally lay a low vinyl crackle underneath, then a
     # limiter catches any peak — "normalise it, work the levels, make it sound
     # like a station", applied to the whole show.
+    # Louder: "them being so quiet". -15 LUFS is a polite podcast level; a
+    # station should sit forward. LRA tightened too, so the quiet lines come
+    # up rather than the loud ones being shaved.
     joined = (f"{pre}{chain}concat=n={len(files)}:v=0:a=1,"
-              "loudnorm=I=-15:TP=-1.5:LRA=11")
+              "loudnorm=I=-11:TP=-1.0:LRA=7")
     if crackle:
         graph = (f"{joined}[dry];"
                  "anoisesrc=color=brown:amplitude=0.04,highpass=f=1500,"
@@ -20593,7 +20721,7 @@ async def play_phone_ring() -> None:
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": "phone-ring",
         })
-        del _RADIO["voice_clips"][:-40]
+        del _RADIO["voice_clips"][:-140]
     if (_RADIO.get("voice_to") or "box") in ("box", "both") and (
             not await satellite_busy()):
         try:
@@ -21282,10 +21410,14 @@ async def speak_turns(turns: list[tuple[str, str]],
                         "text": stream_label,
                         "voice": caller_voice or "",
                     })
-                    del _RADIO["voice_clips"][:-40]
+                    del _RADIO["voice_clips"][:-140]
                 # #748: start the clock at the moment the audio is handed over,
                 # so "which line is sounding" is a lookup rather than a guess.
                 _stream_now_set(rows, length)
+                # #776: deliberately NOT waiting for the burst here. Pacing
+                # the page road against playback removed the backlog and put
+                # dead air in its place, which is the worse of the two on a
+                # stream.
                 if to_box:
                     played = await _play_on_box(one["path"], one["sig"])
                     if not played:
@@ -21938,7 +22070,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # tonight, drawn from the evolving database keyed to the ACTUAL heat band
     # and shuffled so it never repeats. A single glancing aside, never the
     # topic; whoever the model hands it to is the one who lets it slip.
-    if not caller_name and random.random() < dj.get("heat_rate", 0.3):
+    # #775: the theme reached the phone line and nothing else. active_theme()
+    # had ONE call site in the whole file, so the pair themselves never heard
+    # about it - and their stock material leans hard on the machine and the
+    # heat, which is what the operator kept hearing instead of their subject.
+    _air_theme = theme_owns_air()
+    if _air_theme and not caller_name:
+        angle += theme_air_clause(_air_theme)
+    # The glancing heat aside is part of that stock material, so it stands
+    # down for the same reason the call-side block does.
+    if not caller_name and not _air_theme \
+            and random.random() < dj.get("heat_rate", 0.3):
         _hot = heat_reference()
         if _hot:
             angle += (" BURIED, IN PASSING: somewhere mid-conversation one of "
@@ -22338,7 +22480,13 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     hot = booth_hot()
     # When the building is genuinely cooking, some callers ring in about
     # THAT instead, and they compete at it (#644).
-    heat_call = hot >= 62 and random.random() < 0.45
+    # #775: ...unless the operator has named a subject. This road never
+    # consulted the theme at all, and it rings off the TRACK counter
+    # (caller_every) while the theme-aware road rings off callin_per_hour -
+    # so the road that could not hear the theme was ringing more often than
+    # the road that could.
+    _themed = theme_owns_air()
+    heat_call = hot >= 62 and random.random() < 0.45 and not _themed
     wants = [] if heat_call else [
         line.lstrip("- ").strip()
         for line in banter_material().splitlines()
@@ -22376,7 +22524,10 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     lines = await dj_banter(track, lines=4, also_name=want, angle=(
         "a caller has got through on the request line. Give them a name, and "
         "between the two of you relay what they are asking for, which is "
-        f"this: \"{want}\". Take the call with unmistakable "
+        f"this: \"{want}\"."
+        # #775: and this road knows what tonight is about now.
+        + theme_air_clause(_themed)
+        + " Take the call with unmistakable "
         f"{random.choice(CALLER_MOODS)}, then cut back to the record." + tail
     ))
     call_ended("the caller on the request line", line_say, started, rule,
@@ -30136,6 +30287,272 @@ async def radio_cache_cut_delete(
     return {"deleted": name, "cuts": len(await asyncio.to_thread(_cut_list))}
 
 
+# --- the staging desk -------------------------------------------------------
+# The staging folder had no door: nothing listed it, nothing swept it, and the
+# only code that deletes from it walks an in-memory list that does not survive
+# a restart. Review it, take it away, empty it.
+
+STAGE_CLEAR_FLOOR = 90.0        # seconds; do not touch anything younger
+
+
+def _staging_live() -> set[str]:
+    """Absolute paths belonging to the episode currently on air. These are
+    written as str(dst) from the same _EPISODE_STAGE constant, so plain
+    string equality is exact - resolve() would be wrong here, not safer,
+    because a bind mount can resolve differently."""
+    return {str(it.get("file") or "")
+            for it in ((_RADIO.get("episode") or {}).get("items") or [])
+            if it.get("file")}
+
+
+def _staging_rows() -> dict[str, Any]:
+    """What is in the staging folder, and what clearing it would really
+    free."""
+    live = _staging_live()
+    rows: list[dict[str, Any]] = []
+    total = free = 0
+    now = time.time()
+    try:
+        entries = sorted(_EPISODE_STAGE.iterdir())
+    except OSError:
+        entries = []
+    for path in entries:
+        try:
+            if not path.is_file():
+                continue
+            info = path.stat()
+        except OSError:
+            continue
+        # <5-digit air index>_<key>. A sting is 16 hex with no extension and
+        # its sample name is recoverable; a voice clip is a 32-hex uuid the
+        # server minted, whose words lived only in memory.
+        stem = path.name.split("_", 1)[-1]
+        sting = "." not in stem
+        label = ""
+        if sting:
+            try:
+                found = sfx_by_id(stem)
+                label = f"[sfx] {found.stem}" if found else "[sfx]"
+            except Exception:
+                label = "[sfx]"
+        # A hardlink shares its bytes with /media: deleting it frees nothing
+        # until the original goes too. st_nlink == 1 means this IS the last
+        # copy, and those bytes are the honest saving.
+        alone = getattr(info, "st_nlink", 1) <= 1
+        total += info.st_size
+        if alone:
+            free += info.st_size
+        rows.append({
+            "name": path.name,
+            "bytes": info.st_size,
+            "when": int(getattr(info, "st_ctime", info.st_mtime)),
+            "kind": "sting" if sting else "voice",
+            "label": label,
+            "live": str(path) in live,
+            "only_copy": alone,
+            "sig": media_sign(path.name),
+        })
+    rows.sort(key=lambda r: r["name"])
+    ep = _RADIO.get("episode") or {}
+    return {
+        "rows": rows[-400:],                 # the desk shows the tail
+        "count": len(rows),
+        "shown": min(len(rows), 400),
+        "bytes": total,
+        "frees": free,
+        "live": sum(1 for r in rows if r["live"]),
+        "folder": str(_EPISODE_STAGE),
+        "now": int(now),
+        "recording": {
+            "clips": len(ep.get("items") or []),
+            "since": int(float(ep.get("started") or now)),
+        },
+    }
+
+
+@app.get("/api/radio-cache/staging")
+async def radio_cache_staging_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Review the staging folder (#774 follow-up)."""
+    require_read_auth(authorization)
+    return await asyncio.to_thread(_staging_rows)
+
+
+@app.get("/api/radio-cache/staging/{name}")
+async def radio_cache_staging_file(
+    name: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> FileResponse:
+    """One staged clip, so it can be listened to before it is thrown away."""
+    sig = str(request.query_params.get("t") or "")
+    want = media_sign(name)
+    if not (want and hmac.compare_digest(sig, want)):
+        require_read_auth(authorization)
+    if "/" in name or ".." in name or not re.fullmatch(
+            r"[\w.\- ]{1,140}", name):
+        raise HTTPException(status_code=400, detail="Bad name")
+    path = _EPISODE_STAGE / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Not in staging")
+    kind = "audio/mpeg" if name.endswith(".mp3") else "audio/wav"
+    return FileResponse(path, media_type=kind,
+                        headers={"Cache-Control": "private, max-age=600"})
+
+
+def _staging_zip(scope: str, max_mb: float) -> dict[str, Any]:
+    """Batch the staging folder into one zip, newest first, under a budget.
+
+    ZIP_STORED like the cache export: the payload is already-compressed
+    audio and the box has ffmpeg to run. Written to .part and renamed, so a
+    half-built archive is never served."""
+    import zipfile
+    live = _staging_live()
+    picks: list[Path] = []
+    took = 0
+    budget = max(1.0, float(max_mb)) * 1024 * 1024
+    try:
+        entries = sorted(_EPISODE_STAGE.iterdir(), reverse=True)
+    except OSError:
+        entries = []
+    for path in entries:
+        try:
+            if not path.is_file():
+                continue
+            if scope == "orphans" and str(path) in live:
+                continue
+            size = path.stat().st_size
+        except OSError:
+            continue
+        if took + size > budget and picks:
+            break
+        picks.append(path)
+        took += size
+    if not picks:
+        return {"files": 0, "bytes": 0, "url": "", "left": 0}
+    out = RADIO_CACHE / "_staging_batch.zip"
+    tmp = out.with_suffix(".part")
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as zf:
+            for path in picks:
+                try:
+                    zf.write(path, path.name)
+                except OSError:
+                    continue
+            zf.writestr(
+                "MANIFEST.txt",
+                f"Pine Box FM - staging batch\n"
+                f"taken {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                f"scope {scope}\n{len(picks)} clips\n")
+        tmp.replace(out)
+    except Exception as exc:               # noqa: BLE001
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(status_code=500,
+                            detail=f"Could not build it: {exc}"[:200]) from exc
+    return {"files": len(picks), "bytes": out.stat().st_size,
+            "url": f"/export/staging.zip?t={media_sign('staging.zip')}",
+            "left": max(0, len([e for e in entries if e.is_file()])
+                        - len(picks))}
+
+
+@app.post("/api/radio-cache/staging/export")
+async def radio_cache_staging_export(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Build the batch and hand back a signed link (the kit pattern) rather
+    than a blob - this folder runs to gigabytes and a tab cannot hold it."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    scope = "all" if str(payload.get("scope") or "") == "all" else "orphans"
+    max_mb = max(1.0, min(4096.0, float(payload.get("max_mb") or 750)))
+    got = await asyncio.to_thread(_staging_zip, scope, max_mb)
+    if not got["files"]:
+        raise HTTPException(status_code=404, detail="Nothing to take away")
+    pipeline_log("air", f"staging batched - {got['files']} clips, "
+                        f"{got['bytes'] // 1048576} MB")
+    return got
+
+
+@app.get("/export/staging.zip")
+async def radio_cache_staging_zip(request: Request) -> FileResponse:
+    sig = str(request.query_params.get("t") or "")
+    if not hmac.compare_digest(sig, media_sign("staging.zip")):
+        raise HTTPException(status_code=403, detail="Bad signature")
+    path = RADIO_CACHE / "_staging_batch.zip"
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Build it first")
+    return FileResponse(
+        path, media_type="application/zip",
+        filename=f"pinebox-staging-{time.strftime('%Y%m%d-%H%M%S')}.zip",
+        headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/radio-cache/staging/clear")
+async def radio_cache_staging_clear(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Empty the staging folder - never the episode that is on air.
+
+    Two guards, both necessary. The live set is what the open episode is
+    holding; deleting one of those would tear the audio out from under the
+    next seal. The age floor closes the window in which _episode_finalize
+    has already published its empty item list but is still running ffmpeg
+    over the files it is about to unlink itself."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not payload.get("confirm"):
+        raise HTTPException(
+            status_code=400,
+            detail="This deletes staged audio. Pass confirm=true to do it.")
+    keep_live = str(payload.get("scope") or "") != "all"
+
+    def _sweep() -> dict[str, Any]:
+        live = _staging_live()
+        now = time.time()
+        gone = freed = held = 0
+        try:
+            entries = list(_EPISODE_STAGE.iterdir())
+        except OSError:
+            entries = []
+        for path in entries:
+            try:
+                if not path.is_file():
+                    continue
+                info = path.stat()
+                if keep_live and str(path) in live:
+                    held += 1
+                    continue
+                if now - float(getattr(info, "st_ctime",
+                                       info.st_mtime)) < STAGE_CLEAR_FLOOR:
+                    held += 1
+                    continue
+                alone = getattr(info, "st_nlink", 1) <= 1
+                size = info.st_size
+                path.unlink()
+                gone += 1
+                if alone:
+                    freed += size
+            except OSError:
+                continue
+        return {"deleted": gone, "freed": freed, "held": held}
+
+    got = await asyncio.to_thread(_sweep)
+    pipeline_log("air", f"staging cleared - {got['deleted']} clips gone, "
+                        f"{got['freed'] // 1048576} MB freed, "
+                        f"{got['held']} left alone")
+    note_action(f"cleared {got['deleted']} clips out of staging")
+    return {**got, **(await asyncio.to_thread(_staging_rows))}
+
+
 def _cache_meta_read(kind: str, name: str) -> dict[str, Any] | None:
     """Everything the calendar tooltip wants to know about one recording:
     location, length, size, who was present, how many phone calls, and any
@@ -34137,7 +34554,7 @@ async def dj_sfx_play(
         "ts": int(time.time() * 1000), "url": f"/sfx/{key}?t={signature}",
         "text": "", "sting": path.stem,
     })
-    del _RADIO["voice_clips"][:-40]
+    del _RADIO["voice_clips"][:-140]
     played = ""
     if (_RADIO.get("voice_to") or "box") in ("box", "both"):
         played = await _play_on_box(f"/sfx/{key}", signature)
@@ -38322,6 +38739,10 @@ mail, and it goes on next">📼 Mixtape</button>
         <button onclick="callRecordings()"
                 title="The radio cache — replay past 15-min episodes offline,
 plus every captured phone call, with download + transcripts">📻 Cache</button>
+        <button onclick="stagingDesk()"
+                title="The staging folder — every clip aired since the last
+seal, waiting to be sealed into an episode. Review it, take it away as one
+zip, or empty it.">🗂 Staging</button>
         <button onclick="calOpen()"
                 title="A calendar at a glance — every recorded section by hour,
 day, week and month; play them in the browser and stack playlists">🗓 Calendar</button>
@@ -52476,9 +52897,14 @@ function djVoiceNext() {
   djVoiceBusy = true;
 
   let handed = false;
+  let started = false;
+  let startGuard = 0;
+  let stallGuard = 0;
   const hand = () => {                   // let the next line start
     if (handed) return;
     handed = true;
+    if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
+    if (stallGuard) { clearTimeout(stallGuard); stallGuard = 0; }
     djVoiceBusy = false;
     djVoiceNext();
   };
@@ -52494,6 +52920,26 @@ function djVoiceNext() {
   };
   player.onended = done;
   player.onerror = done;
+  /* #776: two watchdogs, because djVoiceBusy had none and the metadata timer
+   * below is skipped in three ordinary cases (overlap at zero, a sting next,
+   * a non-finite duration). A single stalled element used to leave the flag
+   * true forever and every later line piled up unheard - which is exactly
+   * "the broadcast stops talking at certain points" and never resumes. */
+  player.onplaying = () => {
+    started = true;
+    if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
+    if (stallGuard) clearTimeout(stallGuard);
+    // Generous: the longest coalesced burst plus slack. This is a safety
+    // net, never a pacer — `ended` normally fires long before it.
+    const span = isFinite(player.duration) && player.duration > 0
+      ? (player.duration + 20) * 1000 : 330000;
+    stallGuard = setTimeout(() => {
+      if (!handed) done();
+    }, Math.min(span, 360000));
+  };
+  startGuard = setTimeout(() => {
+    if (!handed && !started) done();     // it never began — move the show on
+  }, 25000);
   player.onloadedmetadata = () => {
     // Two presenters tread on each other; a sting does not tread on the line
     // it is punctuating. If the next clip up is a sample, wait for the end
@@ -52519,7 +52965,22 @@ function djVoiceNext() {
   player.play().catch((e) => {
     // Autoplay blocked (no user gesture yet) — surface a one-tap unlock so
     // the DJs are never silently mute on the page (#499/#505).
-    if (e && e.name === "NotAllowedError") pineAudioPrompt(player);
+    if (e && e.name === "NotAllowedError") {
+      /* #776: put it BACK and stop draining. Calling done() here advanced to
+       * the next clip, which was blocked for the very same reason, and the
+       * entire backlog drained in one synchronous cascade with nothing
+       * audible — one missing tap cost every line the station had queued.
+       * The queue now waits, intact, for the unlock. */
+      djVoiceQueue.unshift(clip);
+      djVoiceLive = Math.max(0, djVoiceLive - 1);
+      djVoiceNow = null;
+      if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
+      if (stallGuard) { clearTimeout(stallGuard); stallGuard = 0; }
+      handed = true;                    // nothing else may hand over for us
+      djVoiceBusy = false;
+      pineAudioPrompt(player);
+      return;
+    }
     done();
   });
 }
@@ -52539,8 +53000,17 @@ function pineAudioPrompt(retryPlayer) {
       const ctx = window.__pineAudioCtx;
       if (ctx && ctx.resume) ctx.resume();
     } catch (e) {}
-    if (retryPlayer) retryPlayer.play().catch(() => {});
+    // #776: resume the QUEUE, not one stale element. The clip that was
+    // blocked was pushed back onto the front of it, so the night carries on
+    // from where it stopped instead of from whatever this element's src
+    // happens to be now.
     b.remove();
+    try {
+      djVoiceBusy = false;
+      djVoiceNext();
+    } catch (err) {
+      if (retryPlayer) retryPlayer.play().catch(() => {});
+    }
   };
   document.body.appendChild(b);
 }
@@ -52579,10 +53049,17 @@ async function djVoicePoll(immediate) {
       if (last && last.url) djVoicePlay(last);
       return;
     }
-    // The server keeps the last twenty lines. On the first poll of a tab that
-    // is a backlog, not news — catch up to it silently rather than replaying
-    // everything the pair said before this page existed.
-    if (!djVoicePrimed) { djVoicePrimed = true; return; }
+    // The server keeps a deep window of lines. On the first poll of a tab that
+    // is a backlog, not news — so play only the tail of it rather than the
+    // whole night, but do NOT throw it away: #776 is "I want to hear each
+    // and every message", and the seen-marker above has already been
+    // advanced past these, so anything dropped here can never be asked for
+    // again (the server filter is strictly-greater).
+    if (!djVoicePrimed) {
+      djVoicePrimed = true;
+      clips.slice(-3).forEach((clip) => { if (clip.url) djVoicePlay(clip); });
+      return;
+    }
     clips.forEach((clip) => { if (clip.url) djVoicePlay(clip); });
   } catch (error) { /* the show goes on */ }
 }
@@ -54983,6 +55460,169 @@ async function cacheTranscript(base, r) {
   box.appendChild(scroll);
   shade.appendChild(box);
   document.body.appendChild(shade);
+}
+
+/* The staging desk. Every aired clip is hardlinked in here and recorded in
+ * a list that lives in MEMORY, and the only thing that deletes from staging
+ * walks that list — so a restart abandons whatever was staged and nothing
+ * has ever swept it. 4,018 clips and 2.28 GB when this was written.
+ *
+ * The byte figure is reported honestly: these are hardlinks, so a staged
+ * clip whose original is still in /media costs nothing extra, and only the
+ * ones that are the LAST copy would really free space. */
+async function stagingDesk() {
+  const gone = document.getElementById("stagingShade");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "stagingShade";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:176;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(680px,94vw);max-height:84vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;margin-bottom:4px";
+  const h = el("div", "", "🗂 The staging folder");
+  h.style.cssText = "font-weight:700;font-size:15px";
+  head.appendChild(h);
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;opacity:.7";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+
+  const sub = el("div", "muted", "Every clip that has aired since the last "
+    + "episode was sealed waits here. They are hardlinks, so most of them "
+    + "share their bytes with the media store and cost nothing extra — the "
+    + "figure below is what emptying it would REALLY free.");
+  sub.style.cssText = "font-size:11px;line-height:1.55;margin-bottom:8px";
+  box.appendChild(sub);
+
+  const tally = el("div", "", "Counting…");
+  tally.style.cssText = "font-size:12px;margin-bottom:8px";
+  box.appendChild(tally);
+
+  const acts = el("div", "row", "");
+  acts.style.cssText = "gap:6px;flex-wrap:wrap;margin-bottom:8px";
+  box.appendChild(acts);
+
+  const list = el("div", "", "");
+  list.style.cssText = "margin-top:4px;border-top:1px solid var(--border);"
+    + "padding-top:6px;max-height:44vh;overflow-y:auto";
+  box.appendChild(list);
+
+  const kb = (n) => (n > 1048576
+    ? (n / 1048576).toFixed(1) + " MB" : Math.round(n / 1024) + " KB");
+
+  const paint = (got) => {
+    tally.innerHTML = "<b>" + got.count + "</b> clips · " + kb(got.bytes)
+      + " on the shelf · <b>" + kb(got.frees) + "</b> would actually be freed"
+      + (got.live ? " · <span style='color:var(--accent)'>" + got.live
+        + " belong to the episode on air and are never touched</span>" : "");
+    list.textContent = "";
+    if (!got.rows.length) {
+      const none = el("div", "muted", "Nothing staged.");
+      none.style.cssText = "padding:8px;font-size:12px";
+      list.appendChild(none);
+      return;
+    }
+    if (got.count > got.shown) {
+      const more = el("div", "muted", "Showing the newest " + got.shown
+        + " of " + got.count + ".");
+      more.style.cssText = "font-size:10.5px;padding:2px 0 6px";
+      list.appendChild(more);
+    }
+    got.rows.slice().reverse().forEach((r) => {
+      const row = el("div", "row", "");
+      row.style.cssText = "gap:8px;align-items:center;font-size:10.5px;"
+        + "padding:4px 2px;border-bottom:1px solid var(--border)";
+      const label = el("div", "", (r.live ? "🔴 " : "")
+        + (r.label || r.name));
+      label.title = r.name + (r.live
+        ? " — part of the episode on air" : "")
+        + (r.only_copy ? " — the last copy of this audio" : " — shared with "
+          + "the media store, deleting it frees nothing");
+      label.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap"
+        + (r.live ? ";color:var(--accent)" : "");
+      row.appendChild(label);
+      const meta = el("span", "muted", kb(r.bytes)
+        + (r.only_copy ? " ·only copy" : ""));
+      meta.style.cssText = "flex:0 0 auto;font-size:10px";
+      row.appendChild(meta);
+      const url = "/api/radio-cache/staging/"
+        + encodeURIComponent(r.name) + "?t=" + encodeURIComponent(r.sig);
+      const play = el("button", "", "▶");
+      play.style.cssText = "font-size:10px;padding:2px 7px";
+      play.title = "Hear it";
+      play.onclick = () => clipToggle(url, play, "▶");
+      row.appendChild(play);
+      const dl = el("a", "", "⬇");
+      dl.href = url;
+      dl.download = r.name;
+      dl.title = "Download this one";
+      dl.style.cssText = "font-size:12px;color:#ffd479;text-decoration:none";
+      row.appendChild(dl);
+      list.appendChild(row);
+    });
+  };
+
+  const load = async () => {
+    try { paint(await api("/api/radio-cache/staging")); }
+    catch (e) { tally.textContent = e.message; }
+  };
+
+  const batch = el("button", "", "⬇ Take it away as one zip");
+  batch.style.cssText = "font-size:11px;padding:4px 10px";
+  batch.title = "Build a single archive of everything not currently on air "
+    + "and hand back a link";
+  batch.onclick = async () => {
+    const done = pending(batch, "⏳ building…");
+    try {
+      const got = await api("/api/radio-cache/staging/export",
+        {method: "POST", body: JSON.stringify({scope: "orphans",
+                                               max_mb: 750})});
+      setStatus(got.files + " clips packed"
+        + (got.left ? " — " + got.left + " left over the size budget" : ""));
+      window.open(got.url, "_blank");
+    } catch (e) { setStatus(e.message, true); }
+    finally { done(); }
+  };
+  acts.appendChild(batch);
+
+  const wipe = el("button", "", "🗑 Empty it");
+  wipe.style.cssText = "font-size:11px;padding:4px 10px";
+  wipe.title = "Delete everything that is not part of the episode currently "
+    + "on air";
+  wipe.onclick = async () => {
+    if (!confirm("Delete the staged clips that are not on air?\n\nThe "
+                 + "episode currently recording is left alone. Anything "
+                 + "sharing its audio with the media store frees no space; "
+                 + "the rest is gone for good.")) return;
+    const done = pending(wipe, "…");
+    try {
+      const got = await api("/api/radio-cache/staging/clear",
+        {method: "POST", body: JSON.stringify({confirm: true})});
+      setStatus(got.deleted + " clips gone · "
+        + Math.round(got.freed / 1048576) + " MB freed"
+        + (got.held ? " · " + got.held + " left alone" : ""));
+      paint(got);
+    } catch (e) { setStatus(e.message, true); }
+    finally { done(); }
+  };
+  acts.appendChild(wipe);
+
+  const again = el("button", "", "↻");
+  again.style.cssText = "font-size:11px;padding:4px 10px";
+  again.title = "Look again";
+  again.onclick = load;
+  acts.appendChild(again);
+
+  await load();
 }
 
 async function callRecordings() {
