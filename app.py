@@ -28097,6 +28097,230 @@ def _init_verdict(steps: list[dict[str, Any]], ok: bool, cause: str,
     }
 
 
+# --- Asking the box about the station (#759, #761, #762) --------------------
+#
+# The box can be TOLD to speak and never told to listen — the board reports
+# ANNOUNCE and not START_CONVERSATION — so anything the operator says to it
+# arrives the same way a song request does: the satellite's own wake word,
+# Home Assistant's pipeline, whisper, and then a POST to this app's
+# /v1/chat/completions. The answer the box speaks is the STRING that endpoint
+# returns; Home Assistant synthesises it. That matters more than it looks:
+# calling speak() here as well would say it twice AND cut itself off, because
+# an announce preempts whatever is playing.
+#
+# Three things the operator asked to be able to say:
+#   "why isn't the station playing"      -> say why, then make it play (#759)
+#   "I can't hear the station"           -> troubleshoot and fix it (#761)
+#   "how is the pine box doing"          -> status, out loud (#762)
+#
+# Two hazards shaped this. The wake phrase is IN the text — "hey pine box,
+# can you play Helena" is a real measured utterance — so "pine box" is a
+# useless subject token on its own and the prefix is stripped first, the way
+# dj_request_query already strips it out of song titles (#187). And the
+# spoken answer has to be computed from memory with NO network: diagnose
+# makes four round trips and would time the conversation turn out. The slow
+# ladder runs afterwards, in the background, and its own test phrase becomes
+# the audible proof.
+STATION_WAKE = re.compile(
+    r"^\s*(hey|ok|okay|hi|hello|yo)?\s*(pine\s?box|pinebox|box)?[\s,]*",
+    re.I)
+
+# A subject (the station or the box) and a verb, in the same breath.
+STATION_SUBJECT = r"(station|pine\s?box\s?fm|pine\s?fm|radio|broadcast|show|dj|djs|music)"
+_SUBJ = r"(station|pine\s?box\s?fm|pine\s?fm|radio|broadcast|show|djs?|music)"
+_NEAR = r".{0,28}"
+# The station by name — no bare "music", which belongs to song requests.
+_NAMED = r"(station|pine\s?box\s?fm|pine\s?fm|radio|broadcast|the\s+show)"
+INTENT_PATTERNS: tuple[tuple[str, str], ...] = (
+    # #761 — "I can't hear the station", and the ways people say it.
+    ("cant_hear", "|".join((
+        r"\b(can'?t|cannot|can not)\s+hear\b" + _NEAR + _SUBJ,
+        _SUBJ + r"\b" + _NEAR + r"\b(silent|quiet|dead|muted)\b",
+        r"\bno\s+(sound|audio|noise)\b" + _NEAR + _SUBJ,
+        r"\bnothing\s+(is\s+)?(coming|playing|happening)\b",
+        r"\b(silence|dead\s+air)\b" + _NEAR + _SUBJ,
+    ))),
+    # #759 — "why isn't the dj station playing".
+    ("why_silent", "|".join((
+        # subject then negation: "why is the station not playing"
+        r"\bwhy\b" + _NEAR + _SUBJ + _NEAR
+        + r"\b(not|isn'?t|ain'?t|stopped|off)\b",
+        # …and negation then subject: "why isn't the dj station playing".
+        # Every alternative assumed one order; English uses both.
+        r"\bwhy\b.{0,20}\b(isn'?t|is\s+not|aren'?t|ain'?t|won'?t)\b"
+        + _NEAR + _SUBJ,
+        r"\bwhy\b" + _NEAR + r"\b(not|isn'?t)\s+"
+        + r"(playing|on|working|broadcasting)\b",
+        r"\bwhat'?s\s+wrong\b" + _NEAR + _SUBJ,
+    ))),
+    # #762 — the status question.
+    ("status", "|".join((
+        r"\b(status|state)\b" + _NEAR + _SUBJ,
+        _SUBJ + r"\b" + _NEAR + r"\bstatus\b",
+        r"\bhow('?s| is| are)\b" + _NEAR + _SUBJ,
+        r"\bis\s+the\s+" + _SUBJ + r"\s+(on|up|running|working|ok|okay)\b",
+    ))),
+    # "start the station", "put the station back on".
+    # You turn the STATION on; "put on some music" is a song request and
+    # must not land here, so this intent uses the narrow subject.
+    ("start", "|".join((
+        r"\b(start|turn\s+on|put\s+on|fire\s+up|bring\s+up|kick\s+off)\b"
+        + _NEAR + _NAMED,
+        _NAMED + r"\b.{0,16}\bback\s+on\b",
+    ))),
+)
+
+
+def station_intent(text: str) -> str:
+    """Which station question this is, or "".
+
+    Deliberately narrow. A bare mention of the station is not a question
+    about it, and a fillable song request must win — "play something on the
+    station" is a request, not a fault report — so the caller checks
+    dj_take_request first."""
+    said = " ".join(str(text or "").split())
+    if not said:
+        return ""
+    said = STATION_WAKE.sub("", said, count=1).strip()
+    if len(said) < 6:
+        return ""
+    low = said.lower()
+    for name, pattern in INTENT_PATTERNS:
+        if re.search(pattern, low, re.I):
+            return name
+    return ""
+
+
+def station_health_words() -> tuple[bool, str]:
+    """Why the station is or is not audible, from MEMORY ONLY.
+
+    Every fact here is already in the process. Nothing on this path may make
+    a network call: the box is waiting on the other end of a conversation
+    turn, and diagnose's four round trips would time it out."""
+    on = bool(_RADIO.get("on"))
+    voice_to = _RADIO.get("voice_to") or "box"
+    music_to = _RADIO.get("music_to") or "here"
+    switch = box_talk_ok()
+    held = len(_BOX_HOLD)
+    breaker = time.time() < float(_BOX_DOWN.get("until") or 0)
+    silent = int(time.time() - _BOX_LAST_OK[0]) if _BOX_LAST_OK[0] else None
+
+    if not on:
+        return False, "The station is off. I can start it."
+    if not switch:
+        return False, ("The Pine Box switch is off, so the station is not "
+                       "calling this speaker. I can turn it on.")
+    if voice_to not in ("box", "both"):
+        return False, (f"The DJ voice is going to the {voice_to} instead of "
+                       "the box. I can point it here.")
+    if breaker:
+        return False, ("I stopped calling the box because it was not "
+                       "answering. I can try it again now.")
+    if held >= 3:
+        return False, (f"There are {held} lines waiting because the box was "
+                       "not answering. I can send them through.")
+    if silent is not None and silent > 240:
+        return False, (f"Nothing has come out of the box for "
+                       f"{silent // 60} minutes. Let me look at it.")
+    extra = ""
+    if music_to not in ("box", "both"):
+        extra = (" The talk is here but the music is playing in the browser, "
+                 "so between the DJs it will be quiet.")
+    return True, ("The station is on and pointed at this box." + extra)
+
+
+def station_status_words() -> str:
+    """#762 — the status, out loud, short enough to be listened to."""
+    ok, why = station_health_words()
+    bits = [why]
+    now = _RADIO.get("now") or {}
+    if now.get("title"):
+        bits.append(f"Playing {now['title']}"
+                    + (f" by {now['artist']}" if now.get("artist") else "")
+                    + ".")
+    air = airtime_summary() or {}
+    if air.get("avg_ratio"):
+        pct = round(float(air["avg_ratio"]) * 100)
+        bits.append(f"The last few lines played out at {pct} percent.")
+    stats = _RADIO.get("session_stats") or {}
+    if stats.get("calls"):
+        bits.append(f"{int(stats['calls'])} calls tonight.")
+    return " ".join(bits)
+
+
+async def station_repair_now() -> str:
+    """The cheap, state-only repairs — the ones that are safe to do inside a
+    conversation turn because they touch nothing but this process's own
+    settings. The slow ladder runs afterwards, in the background."""
+    fixed: list[str] = []
+    if not box_talk_ok():
+        _RADIO["box_talk"] = True
+        fixed.append("switched the box on")
+    if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
+        _RADIO["voice_to"] = "box"
+        fixed.append("pointed the DJs at it")
+    # #759: the ladder never touched the music, and the measured station had
+    # it playing in the browser — so a perfectly initialised box still had
+    # silence between every round.
+    if (_RADIO.get("music_to") or "here") not in ("box", "both"):
+        _RADIO["music_to"] = "both"
+        fixed.append("put the music through it too")
+    if time.time() < float(_BOX_DOWN.get("until") or 0):
+        _BOX_DOWN["until"] = 0.0
+        _BOX_DOWN["fails"] = 0
+        fixed.append("started calling it again")
+    if fixed:
+        _routing_save()
+    if not _RADIO.get("on"):
+        try:
+            await dj_start(dj_best_station(""))
+            fixed.append("started the station")
+        except Exception:
+            pass
+    return ", ".join(fixed)
+
+
+async def station_intent_reply(intent: str, said: str) -> str:
+    """Answer the operator out loud, then go and fix it behind them.
+
+    The string returned here IS what the box says — Home Assistant
+    synthesises it — so it has to be short, plain and true. The repair that
+    takes time (reloading the Wyoming entry, proving it with a test
+    announce) is deferred so the conversation turn is not held open, and its
+    own test phrase is the audible confirmation that it worked."""
+    if intent == "status":
+        return station_status_words()
+
+    ok, why = station_health_words()
+    if intent in ("cant_hear", "why_silent", "start"):
+        if ok and intent != "start":
+            # Nothing in memory is wrong, so the fault is at the far end.
+            _fire_and_forget_init()
+            return (why + " I will check the speaker itself and say "
+                    "something when I have.")
+        did = await station_repair_now()
+        _fire_and_forget_init()
+        if did:
+            return (why + " I have " + did
+                    + ". Listen for the test in a moment.")
+        return (why + " Let me work through it and I will say something "
+                "when it is fixed.")
+    return ""
+
+
+def _fire_and_forget_init() -> None:
+    """Run the full ladder behind the answer. Never inside the turn: it can
+    take a minute, and it ends by SPEAKING, which would collide with the
+    reply the box is about to make."""
+    async def _later() -> None:
+        await asyncio.sleep(6)          # let the spoken answer finish first
+        try:
+            await pinebox_initialize(speak_test=True)
+        except Exception as exc:        # noqa: BLE001
+            pipeline_log("drop", f"spoken repair failed: {exc}"[:180])
+    asyncio.create_task(_later())
+
+
 @app.post("/api/pinebox/initialize")
 async def pinebox_initialize_api(
     request: Request,
@@ -28107,6 +28331,58 @@ async def pinebox_initialize_api(
     payload = await request.json() if await request.body() else {}
     return await pinebox_initialize(
         speak_test=bool(payload.get("speak", True)))
+
+
+@app.get("/api/pinebox/status")
+async def pinebox_status_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Everything known about the Pine Box in one object (#762).
+
+    Aggregates rather than re-measures: every number here already exists
+    somewhere in the process. The one network round trip is the diagnosis,
+    and if it throws, that is REPORTED rather than smoothed over — a status
+    window that goes green when its own probe failed is the bug this whole
+    run has been about."""
+    require_read_auth(authorization)
+    diag: dict[str, Any] = {}
+    diag_error = ""
+    try:
+        diag = await asyncio.wait_for(pinebox_diagnose(), 25)
+    except Exception as exc:                # noqa: BLE001
+        diag_error = f"{type(exc).__name__}: {exc}"[:140]
+    ok, spoken = station_health_words()
+    now = _RADIO.get("now") or {}
+    return {
+        "healthy": bool(diag.get("healthy")) if diag else None,
+        "spoken": spoken,
+        "sounds_right": ok,
+        "diag_error": diag_error,
+        "cause": diag.get("cause", ""),
+        "steps": diag.get("steps", []),
+        "checks": diag.get("checks", []),
+        "failing": diag.get("failing", []),
+        "routing": {
+            "on": bool(_RADIO.get("on")),
+            "voice_to": _RADIO.get("voice_to") or "box",
+            "music_to": _RADIO.get("music_to") or "here",
+            "reply_to": _RADIO.get("reply_to") or "box",
+            "box_talk": box_talk_ok(),
+            "overridden": box_overridden(),
+        },
+        "delivery": {
+            "held": len(_BOX_HOLD),
+            "silent_for": (int(time.time() - _BOX_LAST_OK[0])
+                           if _BOX_LAST_OK[0] else None),
+            "last_ratio": _LAST_PLAYOUT.get("ratio"),
+            "breaker_open": time.time() < float(_BOX_DOWN.get("until") or 0),
+            "airtime": airtime_summary(),
+        },
+        "now_playing": ({"title": now.get("title"),
+                         "artist": now.get("artist")} if now else None),
+        "host": SATELLITE_HOST,
+        "entity": diag.get("checks") and None,
+    }
 
 
 @app.get("/api/pinebox/diagnose")
@@ -35026,6 +35302,36 @@ async def chat_completions(
     # "Play Blue Monday on Pine Box FM", said out loud to the box. The
     # station takes this one; the model never sees it.
     taken = await dj_take_request(user_text)
+    # #759/#761/#762: …and questions ABOUT the station, said to the box.
+    # After the request path, because "play something on the station" is a
+    # request and not a fault report; before the model, because the model
+    # cannot switch the box on. The string returned here is what the box
+    # SAYS — Home Assistant synthesises it — so nothing on this path may
+    # speak for itself or it would talk over its own answer.
+    if not taken:
+        _intent = station_intent(user_text)
+        if _intent:
+            _reply = await station_intent_reply(_intent, user_text)
+            if _reply:
+                note_action(f"📻 you asked the box: {user_text[:60]}")
+                log_turn(user_text, _reply,
+                         {"active_prompt": "Pine Box FM",
+                          "model": "station", "station_intent": _intent})
+                return {
+                    "id": f"chatcmpl-{uuid.uuid4().hex}",
+                    "object": "chat.completion",
+                    "created": int(time.time()),
+                    "model": "pine-box-fm",
+                    "choices": [{
+                        "index": 0,
+                        "message": {"role": "assistant",
+                                    "content": _reply},
+                        "finish_reason": "stop",
+                    }],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                              "total_tokens": 0},
+                    "spark_agent": {"station_intent": _intent},
+                }
     if taken:
         log_turn(user_text, taken["reply"],
                  {"active_prompt": "Pine Box FM", "model": "station",
@@ -36675,6 +36981,11 @@ it, reload the link if Home Assistant has lost it, close the breaker — then
 make it say something and confirm it actually came out."
             onclick="pineboxInitialize()"
             style="font-size:15px;line-height:1">🛠</button>
+    <button id="pineStatusBtn" class="pine-restart"
+            title="How the Pine Box is doing — the connection, what it has
+actually played, and anything in the way"
+            onclick="pineboxStatus()"
+            style="font-size:15px;line-height:1">📦</button>
     <button id="voiceTestBtn" class="pine-restart"
             title="Test the current speech settings"
             onclick="voiceTestOpen()"
@@ -45619,14 +45930,40 @@ function djTalkRow(line) {
       row.style.cssText += ";background:#0e1620;border:1px solid #37506b;"
         + "flex-direction:column;gap:4px;margin:4px 0;padding:6px 8px;"
         + "cursor:pointer";
-      const head = el("div", "", "📟 UPSTAIRS — "
+      // #757: the heading carries the controls, the way the ad tile's has
+      // since #732 — a page is one click from being heard or kept wherever
+      // you are in the night, not only from the row of buttons underneath.
+      const head = el("div", "row", "");
+      head.style.cssText = "align-items:flex-start;gap:6px;width:100%";
+      const title = el("div", "", "📟 UPSTAIRS — "
         + (line.gripe || "a page for the booth"));
-      head.style.cssText = "font-size:11.5px;color:#9fd0ff;font-weight:600";
+      title.style.cssText = "font-size:11.5px;color:#9fd0ff;font-weight:600;"
+        + "flex:1;min-width:0";
+      head.appendChild(title);
       row.appendChild(head);
       const url = line.page_audio
         ? "/upstairs-audio/" + encodeURIComponent(line.page_audio)
           + (line.page_sig ? "?t=" + encodeURIComponent(line.page_sig) : "")
         : "";
+      if (url) {
+        const go = el("button", "", "\u25b6");
+        go.title = "Play this page — click again to stop";
+        go.style.cssText = "flex:0 0 auto;background:none;border:0;"
+          + "cursor:pointer;font-size:12px;color:#9fd0ff;padding:0 3px";
+        go.onclick = (ev) => {
+          ev.stopPropagation(); clipToggle(url, go, "\u25b6");
+        };
+        head.appendChild(go);
+        const keep = el("a", "", "\u2b07");
+        keep.href = url;
+        keep.download = ((line.gripe || "page").replace(/[^\w -]+/g, "")
+          .slice(0, 48) || "page") + ".mp3";
+        keep.title = "Download this page";
+        keep.style.cssText = "flex:0 0 auto;font-size:12px;color:#9fd0ff;"
+          + "text-decoration:none;padding:0 3px";
+        keep.onclick = (ev) => ev.stopPropagation();
+        head.appendChild(keep);
+      }
       const said = el("div", "muted", line.text || "");
       said.style.cssText = "font-size:11px;line-height:1.45;width:100%";
       row.appendChild(said);
@@ -46130,6 +46467,26 @@ function djTalkRow(line) {
       keep.onclick = (event) => { event.stopPropagation();
                                   djKeepLine(line, keep); };
       said.appendChild(keep);
+      // #757: the line's OWN audio — exactly what went out for it, which
+      // every spoken row has carried as media+sig since #696 and which has
+      // never had a handle on it. Only when there is really a file; a
+      // button that 404s is worse than no button.
+      if (line.media && line.sig) {
+        const keep = el("a", "", "\u2b07");
+        keep.href = "/media/" + encodeURIComponent(line.media)
+          + "?t=" + encodeURIComponent(line.sig);
+        keep.download = ((line.name || line.who || "line")
+          .replace(/[^\w -]+/g, "").slice(0, 24) || "line") + "-"
+          + String(line.id || line.ts || "").slice(0, 8)
+          + (line.media.endsWith(".mp3") ? ".mp3" : ".wav");
+        keep.title = "Download what actually went out for this line";
+        keep.style.cssText = "color:#8aa;text-decoration:none;font-size:10px;"
+          + "margin-left:6px;vertical-align:middle;opacity:.65";
+        keep.onmouseenter = () => { keep.style.opacity = "1"; };
+        keep.onmouseleave = () => { keep.style.opacity = ".65"; };
+        keep.onclick = (event) => event.stopPropagation();
+        said.appendChild(keep);
+      }
       const ban = el("button", "", "R");
       ban.title = "This reply keeps coming round — bury it so it is never "
         + "said again";
@@ -47853,6 +48210,131 @@ async function sparkQueuePopup(event) {
   };
   acts.appendChild(send); acts.appendChild(count);
   box.appendChild(acts);
+}
+
+/* #762: how the Pine Box is doing, in one window. Everything here is
+ * already known somewhere; this is the one place it is all together. If the
+ * diagnosis itself fails, that is shown — a status panel that reports green
+ * because its own probe threw is the exact failure this run started with. */
+async function pineboxStatus() {
+  const gone = document.getElementById("pineStatusModal");
+  if (gone) { gone.remove(); return; }
+  const shade = el("div", "", "");
+  shade.id = "pineStatusModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:198;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(640px,95vw);max-height:88vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  box.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:8px";
+  head.appendChild(el("h2", "", "📦 The Pine Box"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  const body = el("div", "muted", "◐ asking…");
+  body.style.cssText = "font-size:12px;line-height:1.6";
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  let d = null;
+  try { d = await api("/api/pinebox/status"); }
+  catch (e) { body.textContent = "✗ " + e.message; return; }
+  body.textContent = "";
+  body.className = "";
+
+  const verdict = el("div", "", "");
+  const good = d.healthy === true;
+  verdict.textContent = (good ? "✓ " : d.healthy === null ? "… " : "✗ ")
+    + (d.spoken || d.cause || "");
+  verdict.style.cssText = "padding:9px 11px;border-radius:8px;font-size:12.5px;"
+    + "line-height:1.5;margin-bottom:10px;"
+    + (good ? "background:#0f2418;color:#8fe388;border:1px solid #1d6b45"
+            : "background:#3a1620;color:#ffc2d1;border:1px solid #63304a");
+  body.appendChild(verdict);
+  if (d.diag_error) {
+    const warn = el("div", "", "⚠ the check itself failed: " + d.diag_error
+      + " — treat everything below as stale.");
+    warn.style.cssText = "font-size:11px;color:#ffbf6b;margin-bottom:8px";
+    body.appendChild(warn);
+  }
+
+  const line = (k, v, tint) => {
+    const r = el("div", "", "");
+    r.style.cssText = "display:flex;gap:8px;padding:3px 0;border-top:"
+      + "1px solid var(--border);font-size:11.5px";
+    const a = el("span", "muted", k);
+    a.style.cssText = "flex:0 0 148px";
+    const b = el("span", "", String(v));
+    b.style.cssText = "flex:1;min-width:0" + (tint ? ";color:" + tint : "");
+    r.appendChild(a); r.appendChild(b);
+    body.appendChild(r);
+  };
+  const R = d.routing || {}, D = d.delivery || {};
+  const h = (t) => {
+    const e2 = el("div", "", t);
+    e2.style.cssText = "font-weight:700;font-size:12px;margin:12px 0 2px";
+    body.appendChild(e2);
+  };
+  h("Where the show is going");
+  line("station", R.on ? "on air" : "off", R.on ? "#8fe388" : "#ffbf6b");
+  line("Pine Box switch", R.box_talk ? "on" : "OFF",
+       R.box_talk ? "#8fe388" : "#ef6461");
+  line("DJ voice", R.voice_to);
+  line("music", R.music_to,
+       (R.music_to === "box" || R.music_to === "both") ? "" : "#ffbf6b");
+  line("replies", R.reply_to);
+  if (R.overridden) line("⚠ overridden", R.overridden.why, "#ef6461");
+
+  h("What the box has actually done");
+  line("last clip played out",
+       D.last_ratio == null ? "—" : Math.round(D.last_ratio * 100) + "%",
+       D.last_ratio >= 0.9 ? "#8fe388" : D.last_ratio ? "#ffbf6b" : "");
+  line("silent for", D.silent_for == null ? "—" : D.silent_for + "s",
+       (D.silent_for || 0) > 240 ? "#ffbf6b" : "");
+  line("waiting on the shelf", D.held,
+       (D.held || 0) > 2 ? "#ffbf6b" : "");
+  line("still calling it", D.breaker_open ? "no — breaker open" : "yes",
+       D.breaker_open ? "#ef6461" : "");
+  if (D.airtime && D.airtime.avg_ratio) {
+    line("recent delivery",
+         Math.round(D.airtime.avg_ratio * 100) + "% of what was sent");
+  }
+  if (d.now_playing && d.now_playing.title) {
+    line("playing", d.now_playing.title
+      + (d.now_playing.artist ? " — " + d.now_playing.artist : ""));
+  }
+
+  h("The chain");
+  (d.checks || []).forEach((c) => {
+    line(c.name, (c.ok === true ? "✓ " : c.ok === false ? "✗ " : "— ")
+      + c.detail,
+      c.ok === true ? "#8fe388" : c.ok === false ? "#ef6461" : "");
+  });
+
+  if ((d.steps || []).length && !good) {
+    h("What to do");
+    d.steps.forEach((t) => {
+      const li = el("div", "muted", "· " + t);
+      li.style.cssText = "font-size:11.5px;line-height:1.5;padding:2px 0";
+      body.appendChild(li);
+    });
+  }
+  const acts = el("div", "row", "");
+  acts.style.cssText = "gap:6px;margin-top:12px;flex-wrap:wrap";
+  const fix = el("button", "primary", "🛠 Bring it up");
+  fix.onclick = () => { shade.remove(); pineboxInitialize(); };
+  acts.appendChild(fix);
+  const again = el("button", "", "↻ Check again");
+  again.onclick = () => { shade.remove(); pineboxStatus(); };
+  acts.appendChild(again);
+  body.appendChild(acts);
 }
 
 /* #757: bring the Pine Box up, and SHOW the ladder doing it.
