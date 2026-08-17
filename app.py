@@ -5026,6 +5026,167 @@ async def ha_restart_container() -> bool:
     return ok
 
 
+# #793: the dead-link ladder — the exact rungs a human climbed on
+# 2026-08-17 when the Nabu vanished from Home Assistant while the hardware
+# sat on the network answering. A config-entry reload could not rebuild
+# the dead ESPHome session; restarting Home Assistant could; recover then
+# released the held backlog. The DJs climb it themselves now. This is
+# DISTINCT from the stall path (#712): there the link is ALIVE and a
+# restart severs a live stream mid-clip — here the entity is unavailable,
+# nothing is streaming, and a restart severs nothing.
+NABU_PROBE_HOST = os.getenv("NABU_PROBE_HOST", "10.89.1.205")
+NABU_LINK_ESCALATION = os.getenv(
+    "NABU_LINK_ESCALATION", "1").lower() in ("1", "true", "yes", "on")
+REPAIR_STAMPS_PATH = data_path("repair_stamps.json")
+
+
+def _repair_stamps() -> dict[str, Any]:
+    try:
+        return json.loads(REPAIR_STAMPS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def _repair_stamp(kind: str) -> None:
+    stamps = _repair_stamps()
+    row = [t for t in (stamps.get(kind) or []) if time.time() - t < 86400]
+    row.append(time.time())
+    stamps[kind] = row[-10:]
+    try:
+        REPAIR_STAMPS_PATH.write_text(json.dumps(stamps))
+    except Exception:
+        pass
+
+
+def _repair_allowed(kind: str, cooldown: float, per_day: int) -> bool:
+    """Restart budgets survive agent restarts. The in-memory guards do not
+    — an agent that restarts ITSELF as a repair step forgets it just
+    fired, and a wedge that persists would loop the heavy hammer."""
+    row = [t for t in (_repair_stamps().get(kind) or [])
+           if time.time() - t < 86400]
+    if len(row) >= per_day:
+        return False
+    return not row or time.time() - row[-1] >= cooldown
+
+
+async def nabu_device_alive() -> bool:
+    """Is the hardware present on the network at all? No ping binary and
+    no raw sockets in this container — but TCP already tells the truth: a
+    connect OR an active refusal (RST) both prove a live IP stack at that
+    address; only silence (timeout / no route) means absent. This is the
+    switch that separates "session wedged, escalate" from "the operator
+    turned the box off, stand down"."""
+    def probe() -> bool:
+        import socket as _socket
+        for port in (6053, 80, 3232):
+            try:
+                s = _socket.create_connection((NABU_PROBE_HOST, port), 3)
+                s.close()
+                return True
+            except ConnectionRefusedError:
+                return True
+            except OSError:
+                continue
+        return False
+    try:
+        return await asyncio.to_thread(probe)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_NABU_LADDER_RUNNING = [False]
+
+
+async def nabu_link_ladder(reason: str = "") -> dict[str, Any]:
+    """Climb: verify the reload → restart Home Assistant → wait for the
+    entity to walk back in → release the held backlog. Every rung lands
+    in the repair ledger; every guard has a persistent budget."""
+    if _NABU_LADDER_RUNNING[0]:
+        return {"ran": False, "why": "already climbing"}
+    _NABU_LADDER_RUNNING[0] = True
+    try:
+        return await _nabu_link_ladder(reason)
+    finally:
+        _NABU_LADDER_RUNNING[0] = False
+
+
+async def _nabu_link_ladder(reason: str) -> dict[str, Any]:
+    rungs: list[str] = []
+    # Rung 0 — give the config-entry reload a fair chance, then verify it
+    # actually worked instead of assuming (the 2026-08-17 outage: the
+    # reload "succeeded" and the entity stayed unavailable for hours).
+    await asyncio.sleep(20)
+    _SAT_ALIVE["checked"] = 0.0
+    if bool((await satellite_status()).get("online")):
+        repair_note("Nabu link ladder: the reload alone brought the "
+                    "satellite back — no escalation needed")
+        return {"ran": True, "rungs": ["reload verified"], "fixed": True}
+    if not await nabu_device_alive():
+        repair_note("Nabu is off the network entirely — that is a power "
+                    "switch, not a software wedge; not restarting anything")
+        return {"ran": True, "rungs": ["device absent — stood down"],
+                "fixed": False}
+    rungs.append("entity still unavailable · hardware answers the network")
+    # Rung 1 — restart Home Assistant, on a persistent budget.
+    if not _repair_allowed("ha_restart", 1800, 4):
+        repair_note("Nabu link is wedged but the Home Assistant restart "
+                    "budget is spent — a human needs to look at this one")
+        return {"ran": True, "rungs": rungs + ["budget spent"],
+                "fixed": False}
+    _repair_stamp("ha_restart")
+    repair_note("Nabu link ladder: dead ESPHome session with live "
+                "hardware — restarting Home Assistant"
+                + (f" ({reason})" if reason else ""))
+    try:
+        async with httpx.AsyncClient(timeout=90) as client:
+            reply = await client.post(
+                "http://127.0.0.1:2375/containers/homeassistant"
+                "/restart?t=10")
+        if reply.status_code not in (204, 304):
+            repair_note(f"Home Assistant restart was refused (HTTP "
+                        f"{reply.status_code}) — check the "
+                        "docker-socket-proxy")
+            return {"ran": True, "rungs": rungs + ["restart refused"],
+                    "fixed": False}
+    except Exception as exc:  # noqa: BLE001
+        repair_note(f"could not reach the docker socket to restart Home "
+                    f"Assistant: {exc}"[:160])
+        return {"ran": True, "rungs": rungs + ["socket unreachable"],
+                "fixed": False}
+    rungs.append("restarted Home Assistant")
+    # Rung 2 — wait for the entity. HA boot plus the ESPHome reconnect
+    # can take a couple of minutes; poll rather than hope.
+    deadline = time.time() + 240
+    back = False
+    while time.time() < deadline:
+        await asyncio.sleep(10)
+        _SAT_ALIVE["checked"] = 0.0
+        if bool((await satellite_status()).get("online")):
+            back = True
+            break
+    if not back:
+        repair_note("Home Assistant restarted but the satellite did not "
+                    "come back — the device likely needs a power cycle")
+        return {"ran": True, "rungs": rungs + ["entity did not return"],
+                "fixed": False}
+    rungs.append("satellite entity is back")
+    repair_note("FULL self-repair: rebuilt the Nabu link by restarting "
+                "Home Assistant — releasing the held backlog")
+    if _RADIO.get("on"):
+        asyncio.create_task(dj_banter(None, lines=3, angle=(
+            "Break the fourth wall as your own engineers (#368/#793): the "
+            "Nabu vanished from the building's brain while the hardware "
+            "sat there blinking. You diagnosed a dead session, restarted "
+            "the ENTIRE Home Assistant yourselves, watched the satellite "
+            "walk back in, and the backlog is airing now. Surgeons out of "
+            "theatre — drained, triumphant, a little too proud of it.")))
+    # Rung 3 — the held clips: recover preserves them and restarts the
+    # agent, which re-establishes delivery cleanly (proven 2026-08-17).
+    result = await pinebox_recover(restart_agent=True)
+    rungs.append("recover: " + "; ".join(result.get("steps") or [])[:120])
+    return {"ran": True, "rungs": rungs, "fixed": True}
+
+
 async def satellite_selfheal() -> bool:
     """Rebuild the satellite's connection.
 
@@ -5123,7 +5284,22 @@ async def satellite_selfheal() -> bool:
         _HEAL_STREAK[0] += 1
         if _HEAL_STREAK[0] >= 3 and HA_RESTART_ESCALATION:
             asyncio.create_task(ha_restart_container())
+        # #793: for the Nabu, a broken HA API is the ladder's business too
+        # — it verifies, distinguishes wedge from powered-off, and climbs
+        # on its own persistent budget.
+        if device == "nabu" and NABU_LINK_ESCALATION:
+            asyncio.create_task(
+                nabu_link_ladder("HA API failed during selfheal"))
         return False
+
+    # #793: the reload above "succeeding" proves nothing (2026-08-17: it
+    # returned 200 for hours while the entity stayed unavailable). For the
+    # Nabu the ladder now VERIFIES the outcome and climbs when the reload
+    # didn't take: dead session + live hardware → restart Home Assistant →
+    # wait for the entity → release the held backlog. The stall path
+    # above never reaches this line, so #712 stays honored.
+    if device == "nabu" and NABU_LINK_ESCALATION:
+        asyncio.create_task(nabu_link_ladder("dead link after reload"))
 
     if healed:
         _HEALED_AT[0] = time.time()     # a rebuild that actually happened
@@ -32708,6 +32884,37 @@ async def pinebox_recover_api(
     return await pinebox_recover(restart_agent=bool(payload.get("restart", True)))
 
 
+@app.post("/api/repair/nabu-ladder")
+async def repair_nabu_ladder_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The dead-link ladder (#793), on demand — the same rungs the
+    machinery climbs by itself. {"dry_run": true} reports every guard's
+    verdict without touching anything."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if payload.get("dry_run"):
+        _SAT_ALIVE["checked"] = 0.0
+        online = bool((await satellite_status()).get("online"))
+        return {
+            "dry_run": True,
+            "escalation_on": NABU_LINK_ESCALATION,
+            "entity_online": online,
+            "device_alive": await nabu_device_alive(),
+            "ha_restart_allowed": _repair_allowed("ha_restart", 1800, 4),
+            "restarts_last_24h": len([
+                t for t in (_repair_stamps().get("ha_restart") or [])
+                if time.time() - t < 86400]),
+            "would_climb": not online,
+        }
+    note_action("🪜 repair ladder run by hand")
+    return await nabu_link_ladder("manual run")
+
+
 @app.post("/api/dj/media")
 async def dj_media_api(
     request: Request,
@@ -41356,6 +41563,17 @@ button.danger {
 .pb-collapsible.collapsed > *:not(.sec-title):not(.cx-marquee):not(.mini-marquee) {
   display: none !important;
 }
+/* #790: …and controls that live INSIDE the title (Music's routing row)
+   fold with the section too — a collapsed header is a header, not a
+   control strip. The FM power switch stays: on/off belongs on the face. */
+.pb-collapsible.collapsed > .sec-title .film-size {
+  display: none !important;
+}
+/* #790: title-row selects stay their natural width. The picker-growth
+   rule (#786) is for body rows where the select is the main event; in a
+   heading it made a wrapped select stretch the full panel width and read
+   as a detached control floating under the collapsed header. */
+h2 .film-size select { flex: 0 1 auto; min-width: 0; }
 
 .mini-marquee {
   overflow: hidden; white-space: nowrap; border: 1px solid var(--border);
