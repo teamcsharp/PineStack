@@ -1078,15 +1078,56 @@ function initStationDrawer() {
       const sel = $("sparkModel");
       sel.innerHTML = "";
       const current = (await api.get("/api/settings")).model || "";
-      (models.models || []).forEach((m) => {
+      // Rank by fitness for THIS station's needs — a fast, reliable round
+      // writer first, with badges for what each model brings:
+      // 🎙 quick banter · 🧠 deep rounds · 👁 sees images · 🛠 tool calls · ⚡ tiny
+      const sized = (name) => {
+        const m = name.match(/(\d+(?:\.\d+)?)b/i);
+        return m ? parseFloat(m[1]) : (/nano|mini|tiny/i.test(name) ? 3 : 8);
+      };
+      const judge = (name) => {
+        const n = name.toLowerCase();
+        const b = sized(n);
+        const badges = [];
+        let score = 0;
+        if (b <= 9) { badges.push("🎙"); score += 30; }        // round writer
+        if (b >= 12) { badges.push("🧠"); score += 18; }       // deep engine
+        if (b <= 4) { badges.push("⚡"); score += 6; }
+        if (/llava|vision|moondream|-vl|vl-|gemma[34]|qwen.*vl/.test(n)) {
+          badges.push("👁"); score += 14;                      // gallery eyes
+        }
+        if (/qwen|llama3\.[1-9]|llama4|mistral|nemotron|hermes|command/.test(n)) {
+          badges.push("🛠"); score += 10;                      // tool calls
+        }
+        if (/gemma/.test(n)) score += 22;      // the family this show runs on
+        if (/qwen/.test(n)) score += 16;
+        if (/nemotron|llama/.test(n)) score += 12;
+        if (/embed|whisper|clip|bge|nomic/.test(n)) score -= 80;  // not writers
+        if (b > 30) score -= 20;               // too slow for live radio
+        return { score, badges };
+      };
+      const rows = (models.models || []).map((m) => {
         const name = typeof m === "string" ? m : m.name || m.model;
+        return { name, ...judge(name) };
+      }).sort((a, b) => b.score - a.score);
+      rows.forEach((r) => {
         const o = document.createElement("option");
-        o.value = name; o.textContent = name;
-        if (name === current) o.selected = true;
+        o.value = r.name;
+        o.textContent = (r.badges.join("") || "·") + " " + r.name;
+        if (r.name === current) o.selected = true;
         sel.appendChild(o);
       });
+      sel.title = "ranked for the station — 🎙 quick banter · 🧠 deep rounds"
+        + " · 👁 sees images · 🛠 tool calls · ⚡ tiny";
       sel.onchange = async () => {
-        try { await api.post("/api/model", { model: sel.value }); } catch (e) {}
+        // Immediate: the server switches the live model on this call.
+        const stats = $("sparkStats");
+        if (stats) stats.textContent = "switching to " + sel.value + "…";
+        try {
+          await api.post("/api/model", { model: sel.value });
+          if (stats) stats.textContent = "model switched: " + sel.value;
+          setTimeout(loadSpark, 1200);
+        } catch (e) { if (stats) stats.textContent = e.message; }
       };
     } catch (e) {}
   }
@@ -1114,7 +1155,7 @@ function initStationDrawer() {
         : `${done}/${stages.length || "?"} stages ready`);
       $("pubStages").textContent = stages.filter((s) => !s.done)
         .map((s) => s.name || s.label || "").filter(Boolean).join(" · ");
-    } catch (e) { setText("pubStatus", e.message); }
+    } catch (e) { { const _n = $("pubStatus"); if (_n) _n.textContent = e.message; } }
     try {
       const shares = await api.get("/api/share");
       const live = (shares.links || [])[0];
@@ -1135,7 +1176,7 @@ function initStationDrawer() {
       bind("stCalls", dj.callin_per_hour ?? 4, "stCallsV");
       bind("stDeep", Math.round((dj.deep_rate ?? 0.25) * 100), "stDeepV");
       bind("stVol", Math.round((dj.box_volume ?? 1) * 100), "stVolV");
-    } catch (e) { setText("stSaved", e.message); }
+    } catch (e) { { const _n = $("stSaved"); if (_n) _n.textContent = e.message; } }
   }
 
   async function saveStation() {
@@ -1150,20 +1191,23 @@ function initStationDrawer() {
         box_volume: Number($("stVol").value) / 100,
       };
       await api.put("/api/settings", s);
-      setText("stSaved", "saved — every session on the network follows");
-      setTimeout(() => setText("stSaved", ""), 2500);
-    } catch (e) { setText("stSaved", e.message); }
+      { const _n = $("stSaved"); if (_n) _n.textContent = "saved — every session on the network follows"; }
+      setTimeout(() => {
+        const _n = $("stSaved");
+        if (_n) _n.textContent = "";
+      }, 2500);
+    } catch (e) { { const _n = $("stSaved"); if (_n) _n.textContent = e.message; } }
   }
 
   $("pubStart").addEventListener("click", async () => {
-    setText("pubStatus", "minting the public link…");
+    { const _n = $("pubStatus"); if (_n) _n.textContent = "minting the public link…"; }
     try {
       if (!djConfirmedOn()) await api.post("/api/dj/start", {});
       const made = await api.post("/api/share",
         { hours: 168, label: "shared from the desktop", scope: "listen" });
       if (made && made.url) $("pubLink").value = made.url;
-      setText("pubStatus", "on the air — hand the link to anybody");
-    } catch (e) { setText("pubStatus", e.message); }
+      { const _n = $("pubStatus"); if (_n) _n.textContent = "on the air — hand the link to anybody"; }
+    } catch (e) { { const _n = $("pubStatus"); if (_n) _n.textContent = e.message; } }
   });
   function djConfirmedOn() {
     const lamp = document.body.classList.contains("fm-on");
@@ -1180,32 +1224,32 @@ function initStationDrawer() {
     if (v) api.openExternal(v);
   });
   $("pubRecheck").addEventListener("click", async () => {
-    setText("pubStatus", "re-checking…");
+    { const _n = $("pubStatus"); if (_n) _n.textContent = "re-checking…"; }
     try { await api.get("/api/remote?fresh=1"); } catch (e) {}
     loadStation();
   });
   $("stInit").addEventListener("click", async () => {
-    setText("stDiagOut", "initializing — ends with an audible test…");
+    { const _n = $("stDiagOut"); if (_n) _n.textContent = "initializing — ends with an audible test…"; }
     try {
       const r = await api.post("/api/pinebox/initialize", {});
       $("stDiagOut").textContent = (r.steps || [])
         .map((s) => (s.ok ? "✓ " : "✗ ") + s.name + " — " + s.detail).join("\n");
-    } catch (e) { setText("stDiagOut", e.message); }
+    } catch (e) { { const _n = $("stDiagOut"); if (_n) _n.textContent = e.message; } }
   });
   $("stRecover").addEventListener("click", async () => {
-    setText("stDiagOut", "recovering — reloads the speaker link…");
+    { const _n = $("stDiagOut"); if (_n) _n.textContent = "recovering — reloads the speaker link…"; }
     try {
       const r = await api.post("/api/pinebox/recover", { restart: false });
       $("stDiagOut").textContent = (r.steps || []).join("\n");
-    } catch (e) { setText("stDiagOut", e.message); }
+    } catch (e) { { const _n = $("stDiagOut"); if (_n) _n.textContent = e.message; } }
   });
   $("stDiag").addEventListener("click", async () => {
-    setText("stDiagOut", "diagnosing…");
+    { const _n = $("stDiagOut"); if (_n) _n.textContent = "diagnosing…"; }
     try {
       const d = await api.get("/api/pinebox/diagnose");
       $("stDiagOut").textContent = (d.cause || "") + "\n"
         + (d.checks || []).map((c) => (c.ok ? "✓ " : "✗ ") + c.name).join("\n");
-    } catch (e) { setText("stDiagOut", e.message); }
+    } catch (e) { { const _n = $("stDiagOut"); if (_n) _n.textContent = e.message; } }
   });
 }
 initStationDrawer();
