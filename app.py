@@ -39067,7 +39067,10 @@ header {
   display: flex;
   flex-wrap: wrap;
   gap: 10px 14px;
-  justify-content: space-between;
+  /* flex-start + dissolved clusters (display:contents on the two wrapper
+     divs): controls PACK each row instead of two rigid blocks spreading
+     apart and stranding a void between the title and the ON AIR chip. */
+  justify-content: flex-start;
   align-items: center;
 }
 header > * { min-width: 0; }
@@ -39290,6 +39293,10 @@ button.danger {
 
 /* ---- Live activity bar (top): scrolling gallery + status ---- */
 #activity {
+  /* NOTE: the skeleton's inline position:relative overrides this sticky —
+     the live bar rides in flow. Keep top at 0: on a relative box any other
+     top value SHIFTS it, which is how a 61px hole opened under the HUD when
+     a deck-height offset was tried here (#responsive). */
   position: sticky; top: 0; z-index: 30;
   background: linear-gradient(180deg, #0c1017, #0a0c10);
   border-bottom: 1px solid var(--border);
@@ -39308,13 +39315,51 @@ button.danger {
 }
 /* Nothing in the bar shrinks under its own content any more. */
 .act-head > .act-refresh,
-.act-head .act-count,
-#djBar .act-refresh { flex: 0 0 auto; }
+.act-head .act-count { flex: 0 0 auto; }
 .act-head .act-title,
 .act-head .act-status { flex: 0 1 auto; min-width: 0; }
-/* The mini player is a row inside a row — it wraps too rather than letting
-   its transport spill out of the pill (#692). */
-#djBar { flex-wrap: wrap; row-gap: 6px; }
+
+/* ---- The deck (#responsive): the media player is ALWAYS a media player.
+   It used to be a pill crammed into the live bar's wrap-flow, and a squeezed
+   row deformed it into a one-control-per-line sliver. Now it is a dedicated
+   iTunes-style strip pinned to the top of the window: transport, art and
+   the LCD are rigid GROUPS that wrap as whole units, so no window shape can
+   take the player apart. Theme-driven throughout (var(--panel/border/accent)),
+   glassy over whatever scrolls beneath it. */
+.dj-deck {
+  position: sticky; top: 0; z-index: 60;
+  display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
+  padding: 8px clamp(12px, 2vw, 24px);
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  background: color-mix(in srgb, var(--panel) 84%, transparent);
+  -webkit-backdrop-filter: blur(14px); backdrop-filter: blur(14px);
+  box-shadow: 0 8px 26px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.06);
+}
+.dj-deck .act-refresh { flex: 0 0 auto; }
+.deck-group {
+  display: flex; align-items: center; gap: 6px; flex: 0 0 auto;
+}
+.deck-actions { margin-left: auto; }
+#djMiniArt {
+  flex: 0 0 44px; width: 44px; height: 44px; border-radius: 9px;
+  overflow: hidden; display: flex; align-items: center;
+  justify-content: center; cursor: pointer;
+  box-shadow: 0 2px 8px rgba(0,0,0,.4);
+}
+.deck-lcd {
+  flex: 1 1 240px; min-width: 160px;
+  display: flex; flex-direction: column; gap: 3px;
+}
+.deck-lcd #djNow {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 12px; font-weight: 600;
+}
+.deck-scrub { display: flex; align-items: center; gap: 8px; }
+.deck-scrub #djSeek { flex: 1; }
+.deck-scrub #djClock {
+  font-size: 11px; font-variant-numeric: tabular-nums;
+}
 .act-title { font-weight: 700; letter-spacing: .02em; font-size: 15px; }
 .live-dot {
   width: 9px; height: 9px; border-radius: 50%; background: #28d17c;
@@ -40589,9 +40634,54 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
 </head>
 <body>
 <div id="toasts"></div>
+
+<!-- The deck (#129, #responsive): the media player, always a media player —
+     an iTunes-style strip pinned to the top of the window while the show is
+     on. Transport, sleeve, LCD and the action rack are rigid groups that
+     wrap as UNITS, so the player keeps its shape at any window size. -->
+<div id="djBar" class="dj-deck" style="display:none">
+  <span class="deck-group deck-transport">
+    <button class="act-refresh" title="Previous track"
+            onclick="djCall('prev')">⏮</button>
+    <button class="act-refresh" id="djMiniPlay" title="Pause"
+            onclick="djMiniPlayPause()">⏸</button>
+    <button class="act-refresh" title="Next track"
+            onclick="djCall('next')">⏭</button>
+    <button class="act-refresh" title="Playback settings — output routing
+and levels, properly labelled (#405)"
+            onclick="pineMediaSettings()">⚙</button>
+  </span>
+  <span id="djMiniArt" title="Everything about this track"></span>
+  <span class="deck-lcd">
+    <span id="djNow">—</span>
+    <span class="deck-scrub">
+      <input id="djSeek" type="range" min="0" max="1000" value="0"
+             class="dj-seek" oninput="djSeekTo()">
+      <span id="djClock" class="muted"></span>
+    </span>
+  </span>
+  <span class="deck-group deck-actions">
+    <button class="act-refresh" title="More like this"
+            onclick="voteNowPlaying(1)">👍</button>
+    <button class="act-refresh" title="Never play this again"
+            onclick="voteNowPlaying(-1)">👎</button>
+    <button class="act-refresh" title="Have the DJ say something"
+            onclick="djSayMenu(event)">🗣</button>
+    <button class="act-refresh" title="Play that last line again"
+            onclick="djReplay()">⟲</button>
+    <button class="act-refresh" title="Up next"
+            onclick="djPanel('djQueue')">▤</button>
+    <button class="act-refresh" title="Talk to the DJ"
+            onclick="djPanel('djChat')">💬</button>
+    <button class="act-refresh" title="What has been on — play it again"
+            onclick="djPanel('djPlayed')">🕘</button>
+    <button class="act-refresh" title="Send the DJ home"
+            onclick="djToggleSession()">✕</button>
+  </span>
+</div>
+
 <header>
-  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;
-       row-gap:8px;min-width:0">
+  <div style="display:contents">
     <button id="pineDoctor" class="pine-restart"
             title="Pine Box not answering? Diagnose it and open the guide."
             onclick="pineDoctor()"
@@ -40631,6 +40721,7 @@ height:7px;border-radius:50%;background:#764"></span></button>
        squinting at a checkbox. Three things in one chip: the state, the
        switch, and the door out to the public station. -->
   <div id="onAirChip" style="display:flex;align-items:center;gap:0;
+       margin-left:auto;
        border:1px solid var(--border);border-radius:9px;overflow:hidden;
        background:var(--panel2,#0d1420)">
     <button id="onAirBtn" onclick="onAirToggle()"
@@ -40651,8 +40742,7 @@ public link if it is up, so it plays anywhere"
                    background:none;padding:5px 9px;cursor:pointer;
                    font-size:13px;line-height:1;color:inherit">📻</button>
   </div>
-  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;
-       row-gap:8px;min-width:0">
+  <div style="display:contents">
     <label class="slider" id="boxTalkWrap" title="Broadcast the station to
 the Pine Box. Off and nothing from the show reaches the speaker — no DJ
 voice, no music, no stings, no chimes. The box still ANSWERS you: ask it
@@ -40816,57 +40906,6 @@ speaker and restart the agent."
     <button id="djIcon" class="act-refresh"
             title="Start a Pine Box FM session"
             onclick="djToggleSession()">🎧</button>
-    <!-- iTunes-style mini transport: only visible while the show is on. -->
-    <!-- MiniPlayer: sleeve, transport, scrubber, remaining time (#129). -->
-    <span id="djBar" style="display:none;align-items:center;gap:10px;flex:1;
-          min-width:0;max-width:720px;padding:7px 13px;
-          border:1px solid rgba(255,255,255,.12);border-radius:16px;
-          background:rgba(22,30,46,.55);
-          -webkit-backdrop-filter:blur(12px);backdrop-filter:blur(12px);
-          box-shadow:0 8px 26px rgba(0,0,0,.42),
-                     inset 0 1px 0 rgba(255,255,255,.09)">
-      <span id="djMiniArt" style="flex:0 0 48px;width:48px;height:48px;
-            border-radius:10px;overflow:hidden;display:flex;
-            align-items:center;justify-content:center;cursor:pointer;
-            box-shadow:0 2px 8px rgba(0,0,0,.4)"
-            title="Everything about this track"></span>
-      <button class="act-refresh" title="Previous track"
-              onclick="djCall('prev')">⏮</button>
-      <button class="act-refresh" id="djMiniPlay" title="Pause"
-              onclick="djMiniPlayPause()">⏸</button>
-      <button class="act-refresh" title="Next track"
-              onclick="djCall('next')">⏭</button>
-      <button class="act-refresh" title="Playback settings — output routing
-and levels, properly labelled (#405)"
-              onclick="pineMediaSettings()">⚙</button>
-      <span style="flex:1;min-width:150px;display:flex;flex-direction:column;
-                   gap:3px">
-        <span id="djNow" style="overflow:hidden;text-overflow:ellipsis;
-              white-space:nowrap;font-size:12px;font-weight:600">—</span>
-        <span style="display:flex;align-items:center;gap:8px">
-          <input id="djSeek" type="range" min="0" max="1000" value="0"
-                 class="dj-seek" style="flex:1" oninput="djSeekTo()">
-          <span id="djClock" class="muted"
-                style="font-size:11px;font-variant-numeric:tabular-nums"></span>
-        </span>
-      </span>
-      <button class="act-refresh" title="More like this"
-              onclick="voteNowPlaying(1)">👍</button>
-      <button class="act-refresh" title="Never play this again"
-              onclick="voteNowPlaying(-1)">👎</button>
-      <button class="act-refresh" title="Have the DJ say something"
-              onclick="djSayMenu(event)">🗣</button>
-      <button class="act-refresh" title="Play that last line again"
-              onclick="djReplay()">⟲</button>
-      <button class="act-refresh" title="Up next"
-              onclick="djPanel('djQueue')">▤</button>
-      <button class="act-refresh" title="Talk to the DJ"
-              onclick="djPanel('djChat')">💬</button>
-      <button class="act-refresh" title="What has been on — play it again"
-              onclick="djPanel('djPlayed')">🕘</button>
-      <button class="act-refresh" title="Send the DJ home"
-              onclick="djToggleSession()">✕</button>
-    </span>
     <label class="film-size">Size
       <input id="filmScale" type="range" min="1" max="6" step="0.25">
       <span id="filmScaleVal" class="val"></span>
@@ -42438,6 +42477,7 @@ function clampBoxToViewport(box, minVisible = 120) {
                               window.innerHeight - 64)),
   };
 }
+
 
 function key() {
   return document.getElementById("apiKey").value.trim() || SERVER_KEY;

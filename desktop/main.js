@@ -224,11 +224,22 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
     `set "PINE_AGENT_ROOT=${cmdEscape(sourceRoot)}"`,
     "set \"PINE_DESKTOP_BASE_URL=%BASE_URL%\"",
     "set \"PINE_DESKTOP_MODE=%MODE%\"",
-    "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" cmd /d /s /c \"npm run desktop\"",
+    // Launch electron.exe directly: the runner's node_modules/.bin shims
+    // are not reliable (hand-repaired electron package), and a shell
+    // spawned from Electron may carry ELECTRON_RUN_AS_NODE.
+    "set \"ELECTRON_RUN_AS_NODE=\"",
+    "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
     "exit /b 0",
     ":fail",
-    ">> \"%LOG%\" echo [rebuild] failed with %errorlevel%",
-    "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" cmd /d /s /c \"npm run desktop\"",
+    ">> \"%LOG%\" echo [rebuild] failed with %errorlevel% — relaunching anyway",
+    "set \"ELECTRON_RUN_AS_NODE=\"",
+    "if exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" (",
+    "  start \"Pine Box Desktop\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
+    ") else (",
+    // The runner is gutted and cannot come back on its own: open a VISIBLE
+    // console saying so, rather than vanishing with only a log nobody sees.
+    "  start \"Pine Box Desktop rebuild failed\" cmd /d /k \"echo [rebuild] failed and the Electron runtime is missing. & echo Run the desktop launcher .cmd to reinstall, or read: & echo %LOG%\"",
+    ")",
     "exit /b 1",
     ""
   ];
@@ -237,7 +248,11 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
 }
 
 function launchDetachedScript(scriptPath) {
-  const child = spawn("cmd.exe", ["/d", "/s", "/c", `"${scriptPath}"`], {
+  // No manual quotes: node quotes args with spaces itself, and pre-quoting
+  // made it escape the embedded quotes — cmd then choked on the space in
+  // the profile path and died silently, which is how the rebuild collapsed
+  // the app and never brought it back.
+  const child = spawn("cmd.exe", ["/d", "/c", scriptPath], {
     detached: true,
     stdio: "ignore",
     windowsHide: true
