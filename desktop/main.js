@@ -30,9 +30,12 @@ for (const stream of [process.stdout, process.stderr]) {
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
 const defaults = {
-  baseUrl: process.env.PINE_DESKTOP_BASE_URL || "http://127.0.0.1:8096",
+  // The portable pine_box exe lands on ANY machine on the network and taps
+  // the live broadcast out of the box: attach to the master DGX agent by
+  // default. Launch-local stays one Settings click away.
+  baseUrl: process.env.PINE_DESKTOP_BASE_URL || "http://10.89.1.246:8096",
   port: 8096,
-  mode: process.env.PINE_DESKTOP_MODE || "launch",
+  mode: process.env.PINE_DESKTOP_MODE || "attach",
   apiKey: "",
   dataDir: "",
   python: ""

@@ -401,14 +401,14 @@ DEFAULT_DJ = {
     # How often they get talking, in minutes, drawn fresh between the two so
     # the show does not run to a metronome (#202).
     "banter_min_minutes": 0.75,        # 45s: they barely stop (#352)
-    "banter_max_minutes": 5,
+    "banter_max_minutes": 2.5,         # #786: was 5 — rounds come sooner
     # And how long it runs when they do — an exchange being one line each.
     "banter_min_lines": 8,
     "banter_max_lines": 11,
     # Keep a written continuity reserve so model work happens underneath
     # records and adverts rather than in the silence after them.
     "dialogue_prefill": True,
-    "dialogue_reserve_target": 4,
+    "dialogue_reserve_target": 6,   # #786: was 4 — deeper written lookahead
     # How much of the talk comes out of the speakbox documents, 0 to 1.
     # Raised with the gallery governor (#646): the wall was eating the show,
     # and the documents are what it is supposed to be made of.
@@ -445,7 +445,7 @@ DEFAULT_DJ = {
     "news_every": 8,
     "news_hourly": True,
     # Generated call-ins an hour (#236). 0 keeps the phone quiet.
-    "callin_per_hour": 1,
+    "callin_per_hour": 4,           # #786: was 1 — the scarcest talk source
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
@@ -4506,13 +4506,21 @@ async def stop_speaking() -> dict[str, Any]:
     token, player = _ha_creds()
     _reply_token, reply_player = _ha_creds(reply=True)
     stopped_player = False
-    if token and player and not player.startswith("assist_satellite."):
+    # #786: Nabu's clips actually play through its companion MEDIA PLAYER,
+    # which HAS a stop service — the "no stop service" rule is a pine-only
+    # fact. The core device must be the one speaker the stop button stops.
+    stop_target = ""
+    if player == NABU_SATELLITE and NABU_MEDIA_PLAYER:
+        stop_target = NABU_MEDIA_PLAYER
+    elif player and not player.startswith("assist_satellite."):
+        stop_target = player
+    if token and stop_target:
         try:
             async with httpx.AsyncClient(timeout=10) as client:
                 response = await client.post(
                     f"{HA_URL}/api/services/media_player/media_stop",
                     headers={"Authorization": f"Bearer {token}"},
-                    json={"entity_id": player},
+                    json={"entity_id": stop_target},
                 )
                 stopped_player = response.status_code < 400
         except Exception:
@@ -4522,7 +4530,9 @@ async def stop_speaking() -> dict[str, Any]:
         "stopped_player": stopped_player,
         "satellite_note": (
             "the satellite has no stop service, so a line already playing "
-            "finishes" if player.startswith("assist_satellite.") else ""
+            "finishes"
+            if player.startswith("assist_satellite.") and not stop_target
+            else ""
         ),
     }
 
@@ -4803,7 +4813,21 @@ async def satellite_selfheal() -> bool:
         return False
     _HEAL_LAST[0] = now                 # the cooldown, not a success
 
-    if await satellite_reachable():
+    # #786: the rules follow the SELECTED speaker. With the broadcast on
+    # Nabu, this used to probe the PINE BOX's Wyoming socket to decide
+    # whether to rebuild NABU's link — the wrong device answering for the
+    # right one. Nabu is an ESPHome satellite with no Wyoming socket at
+    # all: its liveliness signal is the HA entity itself, and a valid
+    # entity state means the link is alive — ride the stall ladder, do
+    # not tear a working link down.
+    device = _RADIO.get("voice_device") or "nabu"
+    speaker = "Nabu" if device == "nabu" else "pine box"
+    if device == "nabu":
+        link_alive = bool((await satellite_status()).get("online"))
+    else:
+        link_alive = await satellite_reachable()
+
+    if link_alive:
         # Socket is up; the stall is the device, not the connection.
         # Don't tear down a working link — back off harder each time the
         # box keeps stalling, and let the page/hold-shelf carry the show.
@@ -4875,7 +4899,7 @@ async def satellite_selfheal() -> bool:
         # The repair is ANNOUNCED (#368, #369): the panel shows a banner,
         # and the pair break the fourth wall about having just run the
         # scripts — self-aware, convinced, mildly shaken.
-        repair_note("rebuilt the pine box speaker link (reloaded the "
+        repair_note(f"rebuilt the {speaker} speaker link (reloaded the "
                     "satellite's config entry)")
         # Three rebuilds without a single successful announce between
         # them means the wedge is deeper than the link (#413): escalate
@@ -4892,7 +4916,7 @@ async def satellite_selfheal() -> bool:
         if _RADIO.get("on"):
             asyncio.create_task(dj_banter(None, lines=3, angle=(
                 "Break the fourth wall as your own engineers (#368): the "
-                "pine box speaker went quiet on you, you NOTICED, and you "
+                f"{speaker} speaker went quiet on you, you NOTICED, and you "
                 "just ran the repair scripts on the back end and rebuilt "
                 "the speaker link yourselves. Announce it with full "
                 "conviction and mild self-loathing — whatever dialogue "
@@ -10075,32 +10099,21 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # making the station randomly fall silent — the clip goes out on the
     # page feed instead, with the reason on the drop log.
     diverted = False
-    # Nabu is the station's alternate broadcast receiver. When its ESPHome
-    # link is unavailable, the signed web stream is the delivery path: once
-    # the clip is published there, it is no longer owed to Nabu as duplicate
-    # device debt. PineVoice retains its strict hardware replay ledger.
-    web_delivered = False
+    # #786: Nabu is the CORE broadcast device now, not the alternate — the
+    # full hardware replay ledger applies to it. A declined clip goes on
+    # the hold shelf and plays the moment the satellite returns, exactly
+    # as the pine box always had it; the page still carries it live so
+    # nothing waits unheard. (The old rule published nabu clips to the
+    # stream and forgave the device its "duplicate debt" — which quietly
+    # meant the backlog system never served the primary speaker.)
     if to_box and why and clip:
         # A line rendered for the box that did NOT play is NEVER dropped
         # (#467, #470): it goes on the hold shelf and plays the moment the
         # box returns — no matter the routing. 'box' mode also diverts it
         # to the page so it is heard now; 'both' already carried it there.
-        if _RADIO.get("voice_device") == "nabu":
-            if not paged:
-                _RADIO["voice_clips"].append({
-                    "ts": int(time.time() * 1000),
-                    "url": f"{clip['path']}?t={clip['sig']}",
-                    "text": spoken, "engine": engine, "voice": forced or "",
-                })
-                del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
-                paged = True
-            note_drop(who, spoken,
-                      f"Nabu unavailable — delivered by station stream: {why}"[:200])
-            web_delivered = True
-        else:
-            box_hold(clip, spoken, who, line_id)                # #778
-            diverted = True
-        if not web_delivered and voice_to == "box" and not paged:
+        box_hold(clip, spoken, who, line_id)                # #778
+        diverted = True
+        if voice_to == "box" and not paged:
             note_drop(who, spoken,
                       f"box declined — page + held for the box: {why}"[:200])
             _RADIO["voice_clips"].append({
@@ -10109,7 +10122,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
             del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
-        elif not web_delivered:
+        else:
             note_drop(who, spoken,
                       f"box declined — held for the box: {why}"[:200])
         why = ""
@@ -10200,9 +10213,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             "ms": _hit.get("ms"), "searched": _hit.get("searched"),
             "engine": _hit.get("engine", ""), "how": _hit.get("how", ""),
         }
-    if web_delivered:
-        entry["aired"] = "page"
-    elif diverted:
+    if diverted:
         # Honest transcript (#344, #391): the page carried it live and
         # the hold shelf queues it for the box — 🕐, not lost.
         entry["aired"] = "held"
@@ -10495,7 +10506,7 @@ def dj_state() -> dict[str, Any]:
         "requests": len(_RADIO["requests"]),
         "music_to": _RADIO.get("music_to") or "here",
         "voice_to": _RADIO.get("voice_to") or "box",
-        "voice_device": _RADIO.get("voice_device") or "pine",
+        "voice_device": _RADIO.get("voice_device") or "nabu",  # #786: core
         "reply_to": _RADIO.get("reply_to") or "box",
         "box_talk": bool(_RADIO.get("box_talk", True)),
         # The painting(s) the pair are currently hawking, so the booth can
@@ -10736,7 +10747,9 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
     if (dj["research"] and settings_web_search()
             and not track.get("tape")):
         try:
-            notes = await track_notes(track)
+            # #786: bounded — an unbounded web lookup was burning the front
+            # of the record before a single word had been written.
+            notes = await asyncio.wait_for(track_notes(track), 20)
         except Exception:
             notes = ""
     if notes:
@@ -11010,8 +11023,28 @@ async def _dj_loop() -> None:
                     # it a moment to land on its own, then take it down —
                     # a wedged announce would otherwise hold it for ever
                     # (#705), and the torrent skips while it is running.
+                    #
+                    # #786: but "still going" is not "wedged". With a slow
+                    # engine nearly EVERY round is older than 45s by the
+                    # next needle drop, so the reaper was beheading healthy
+                    # rounds mid-render and mid-announce — that, measured,
+                    # was most of why the dialogue ran scant. A segment that
+                    # is speaking right now, or whose engine started a
+                    # render recently, is the show working; only one with
+                    # no signs of life is a wedge. Five minutes is the hard
+                    # ceiling either way — a round spanning three records
+                    # stopped being a round.
                     age = time.time() - float(_RADIO.get("segment_at") or 0)
-                    if age > 45:
+                    # #786: measure the grace from the RECORD'S END, not the
+                    # round's start — segment_at is stamped at the previous
+                    # needle-drop, so "age > 45" was ≈ the record length and
+                    # granted zero real grace.
+                    over = time.time() - float(
+                        _RADIO.get("record_over_at") or time.time())
+                    lively = (_SPEAKING[0] > 0
+                              or time.time() - _LAST_SYNTH[0] < 120
+                              or time.time() - _SPOKE_AT[0] < 25)
+                    if age > 300 or (over > 45 and not lively):
                         _SEGMENT_TASK[0].cancel()
                         pipeline_log("air", "the last record's talk was still "
                                             "going and its record is over — "
@@ -11026,6 +11059,37 @@ async def _dj_loop() -> None:
                     pipeline_log("air", "the pair are still on the last "
                                         "round — this record just plays "
                                         "(#689)")
+                    # #786: a record with no talk was the complaint, not a
+                    # policy. The moment the pair land the old round, they
+                    # pick THIS record up mid-spin — if it is still the one
+                    # turning and enough of it is left to be worth a round.
+                    def _late_round(_done, track=track, dj=dj,
+                                    played=played, tape_slot=tape_slot,
+                                    torrent=torrent):
+                        try:
+                            if not _RADIO.get("on"):
+                                return
+                            now_row = _RADIO.get("now") or {}
+                            if now_row.get("id") != track.get("id"):
+                                return
+                            remain = (float(track.get("seconds") or 0)
+                                      - (time.time()
+                                         - float(_RADIO.get("started")
+                                                 or time.time())))
+                            if remain < 45:
+                                return
+                            if _SEGMENT_TASK and not _SEGMENT_TASK[0].done():
+                                return
+                            _RADIO["segment_at"] = time.time()
+                            _SEGMENT_TASK[:] = [asyncio.create_task(
+                                _record_talk(track, dj, played, tape_slot,
+                                             True, intro_only=torrent))]
+                            pipeline_log(
+                                "air", "the pair caught up — picking this "
+                                       "record up mid-spin (#786)")
+                        except Exception:
+                            pass
+                    _SEGMENT_TASK[0].add_done_callback(_late_round)
             else:
                 await _record_talk(track, dj, played, tape_slot, spin_first)
                 if ad_due:
@@ -11103,6 +11167,9 @@ async def _dj_loop() -> None:
                 skip.clear()
 
             await _hold(length + 1.5)
+            # #786: the reaper's grace window anchors here — the moment this
+            # record actually ran out, not the moment its round began.
+            _RADIO["record_over_at"] = time.time()
             if track.get("tape"):
                 _RADIO["tape_outro_due"] = True
                 _RADIO["tape_last"] = track
@@ -16352,7 +16419,30 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
     reached for it (#640)."""
     key = mind_id(rid)
     t0 = time.time()
-    hits = await speakbox_search(query, k=1, exclude=exclude, rid=key)
+    # #786: Mind Topology gives the operator two levers over this draw — a
+    # PIN (this person speaks from THAT document) that outranks the meaning
+    # search, and BLOCKS (documents deleted from the memory) that never come
+    # back off the index.
+    pins = _RADIO.get("seed_pins") or {}
+    blocks = set(_RADIO.get("seed_blocks") or [])
+    pin = str(pins.get(who) or "")
+    k = 8 if (pin or blocks) else 1
+    hits = await speakbox_search(query, k=k, exclude=exclude, rid=key)
+    if blocks:
+        hits = [h for h in hits if h.get("file") not in blocks]
+    if pin:
+        pinned = [h for h in hits if h.get("file") == pin]
+        if pinned:
+            hits = pinned
+        else:
+            # Nothing in the pinned document matched the query — draw a
+            # swath from it directly, because the pin is the point.
+            chunks = [c for c in (_load_vectors(key).get("chunks") or [])
+                      if c.get("file") == pin and c.get("text")]
+            if chunks:
+                drawn = random.choice(chunks)
+                hits = [{"file": pin, "text": str(drawn.get("text") or ""),
+                         "score": 1.0}]
     if not hits:
         return {}
     text = hits[0]["text"]
@@ -21139,7 +21229,9 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
     try:
         script = await ask_model(
             prompt,
-            limit=min(int(dj.get("reply_max_chars") or 6000), 5200),
+            # #786: 5200 truncated every deep round's tail — the prompt asks
+            # for 12-16 turns of 60-100 words, which is 7-10k characters.
+            limit=min(int(dj.get("reply_max_chars") or 6000), 9000),
             spice=0.5,
             num_ctx=16384,
         )
@@ -21578,7 +21670,8 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     duo_name, duo_grab = "", {}
     if random.random() < 0.28:
         duo_name = random.choice(
-            [n for n in NEW_VOICE_NAMES if n != caller.get("name")])
+            [n for n in NEW_VOICE_NAMES if n != caller.get("name")]
+            or list(NEW_VOICE_NAMES))
         try:
             duo_grab = await speakbox_quote(most=3, cap=260) or {}
         except Exception:
@@ -22151,8 +22244,12 @@ async def caller_clock() -> None:
             except Exception as exc:
                 # The next call comes round regardless — but a phone that
                 # keeps failing must say so behind the glass (#365), not
-                # ring silently into a void.
-                pipeline_log("drop", f"call-in failed: {exc}"[:180])
+                # ring silently into a void. WITH the traceback (#786):
+                # "list index out of range" alone cost a whole caller
+                # segment and said nothing about which of the forty picks
+                # in that road threw it.
+                pipeline_log("drop", f"call-in failed: {exc}"[:180],
+                             extra=traceback.format_exc()[-1800:])
             # At flood rates it IS a call-in show (#352), and between
             # calls the pair are heard cracking under it — proud of the
             # numbers, begging the town to stop, hearing rings that are
@@ -22785,7 +22882,12 @@ def _caller_introduces(turns: list[tuple[str, str]],
     as a turn of its own — same marker, same voice, same phone rack."""
     if not caller_name or not turns:
         return turns
-    first = str(caller_name).split()[0].lower()
+    # #786: a whitespace-only name is truthy but splits to nothing — this
+    # bare [0] was the "list index out of range" that deleted whole calls.
+    _parts = str(caller_name).split()
+    if not _parts:
+        return turns
+    first = _parts[0].lower()
     for at, (marker, said) in enumerate(turns):
         if marker != "C":
             continue
@@ -23447,22 +23549,14 @@ async def speak_turns(turns: list[tuple[str, str]],
                         # must not confidently follow a call nobody can hear.
                         _stream_now_clear()
                         ids = {str(r.get("id") or "") for r in rows}
-                        if _RADIO.get("voice_device") == "nabu":
-                            if not stream_paged:
-                                _RADIO["voice_clips"].append({
-                                    "ts": int(time.time() * 1000),
-                                    "url": f"{one['path']}?t={one['sig']}",
-                                    "text": stream_label,
-                                    "voice": caller_voice or "",
-                                    "stream": {"length": length, "rows": rows},
-                                })
-                                del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
-                            for line in _RADIO.get("chat") or []:
-                                if str(line.get("id") or "") in ids:
-                                    line["aired"] = "page"
-                            pipeline_log("air", "Nabu unavailable — conversation "
-                                         "delivered by station stream")
-                            continue
+                        # #786: Nabu is the CORE device — a burst it did not
+                        # carry goes on the hold shelf and REPLAYS when the
+                        # satellite returns, exactly as the pine box always
+                        # had it. (The old rule paged nabu conversations to
+                        # the stream and forgave the replay debt — most of
+                        # the show's dialogue rides this road, so the core
+                        # speaker never got its backlog.) The page mirror
+                        # still carries it live via stream_paged/'both'.
                         for line in _RADIO.get("chat") or []:
                             if str(line.get("id") or "") in ids:
                                 line["aired"] = "held"
@@ -23717,7 +23811,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 and _larder_current(entry)):
             pipeline_log("model", "round served off the larder shelf "
                                   f"({len(_LARDER)} left)")
-            return await _banter_air(entry, track)
+            # #786: the render road was UNWRAPPED — any exception past the
+            # write escaped dj_banter entirely, the torrent logged only
+            # "fallback banter failed", and the slot aired nothing.
+            try:
+                return await _banter_air(entry, track)
+            except Exception as exc:
+                pipeline_log("drop", f"round render failed: "
+                                     f"{type(exc).__name__}: {exc}"[:180],
+                             extra=traceback.format_exc()[-1200:])
+                return []
         # A stale or differently-configured round falls to the floor; write
         # fresh below rather than replaying the short style it was born with.
     # The pair have weather of their own now (#321): a mood rolls in at
@@ -24299,7 +24402,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # like (#168).
             limit=min(
                 int(dj.get("reply_max_chars") or 6000),
-                max(3600, 440 * lines + len(seed.get("text", ""))
+                max(3600, 560 * lines + len(seed.get("text", ""))
                     + len(aside) + len((comeback or {}).get("text", ""))
                     + len(angle)),
             ),
@@ -24401,7 +24504,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
             _sb.get("speakbox_append_rate") or 0) + _lift):
         tail = await _fresh_swath()
         if tail.get("text"):
-            script = script.rstrip() + f"\nA: {tail['text']}"
+            # #786: terminal punctuation, or the #168 truncation gate reads
+            # a verbatim un-punctuated swath as token exhaustion and deletes
+            # the operator's own material off the end of the round.
+            _tail_text = str(tail["text"]).rstrip()
+            if not re.search(r"[.!?…—»\"')\]]$", _tail_text):
+                _tail_text += "."
+            script = script.rstrip() + f"\nA: {_tail_text}"
             lines += 1                       # room for the appended quote
             speakbox_remember(tail)
     entry = {
@@ -24424,7 +24533,14 @@ async def dj_banter(track: dict[str, Any] | None = None,
         pipeline_log("model", f"round banked for later "
                               f"({len(_LARDER)} on the shelf)")
         return []
-    return await _banter_air(entry, track)
+    try:
+        return await _banter_air(entry, track)
+    except Exception as exc:
+        # #786: see the larder-serve wrap above — same road, same honesty.
+        pipeline_log("drop", f"round render failed: "
+                             f"{type(exc).__name__}: {exc}"[:180],
+                     extra=traceback.format_exc()[-1200:])
+        return []
 
 
 async def freshen_script(script: str, caller_name: str = "",
@@ -25539,6 +25655,11 @@ async def pinebox_diagnose() -> dict[str, Any]:
 
     # `ip` is not in this image, so ARP is informational only — it must not
     # decide the diagnosis, or an unknown reads as "everything is fine".
+    # #786: bound BEFORE the branch — the not-reachable verdict below reads
+    # them, and an offline nabu (ha_satellite) used to hit a NameError here
+    # and 500 the whole diagnosis exactly when it was needed.
+    known = False
+    on_lan = False
     if not ha_satellite:
         arp = await _arp_state(SATELLITE_HOST) if SATELLITE_HOST else ""
         known = arp not in ("", "unknown", "no entry")
@@ -25905,6 +26026,14 @@ def play_search_sound() -> None:
     delays the actual search."""
     token, player = _ha_creds()
     if not (token and player and SEARCH_SOUND_URL and box_talk_ok()):
+        return
+    # #786: a media_player service refuses an assist_satellite entity id —
+    # with a voice device selected this call was a guaranteed silent no-op.
+    # Nabu's clips ride its companion media player; pine has no media
+    # player, so the chime simply stays off there.
+    if player == NABU_SATELLITE and NABU_MEDIA_PLAYER:
+        player = NABU_MEDIA_PLAYER
+    elif player.startswith("assist_satellite."):
         return
 
     async def _play() -> None:
@@ -26911,7 +27040,12 @@ def mind_topology_state() -> dict[str, Any]:
     names = {"dj": dj.get("host_name") or "Host", "cohost": dj.get("cohost_name") or "Co-host", "third": dj.get("third_name") or "Third seat", "manager": dj.get("manager_name") or "Manager", "caller": "Current caller", "customer": "Listeners"}
     personas = {"dj": dj.get("persona") or "", "cohost": dj.get("cohost_persona") or "", "third": dj.get("third_persona") or ""}
     chat = list(_RADIO.get("chat") or [])[-80:]
-    return {"at": int(time.time() * 1000), "people": [{"id": role, "name": names[role], "persona": personas.get(role, ""), "state": speaker_state(role), "adjustments": (dj.get("mind_adjustments") or {}).get(role, []), "latest": next((str(row.get("text") or "") for row in reversed(chat) if row.get("who") == role), "")} for role in ("dj", "cohost", "third", "manager", "caller", "customer") if role != "third" or dj.get("third_name")], "vectors": list(_RADIO.get("vector_access") or [])[:12], "sections": list(_RADIO.get("sections") or [])[-12:], "now": _RADIO.get("now") or {}, "repair": _RADIO.get("repairing") or {}}
+    return {"at": int(time.time() * 1000), "people": [{"id": role, "name": names[role], "persona": personas.get(role, ""), "state": speaker_state(role), "adjustments": (dj.get("mind_adjustments") or {}).get(role, []), "latest": next((str(row.get("text") or "") for row in reversed(chat) if row.get("who") == role), "")} for role in ("dj", "cohost", "third", "manager", "caller", "customer") if role != "third" or dj.get("third_name")], "vectors": list(_RADIO.get("vector_access") or [])[:12], "sections": list(_RADIO.get("sections") or [])[-12:], "now": _RADIO.get("now") or {}, "repair": _RADIO.get("repairing") or {},
+            # #786: the operator's levers over the seed draw, plus the shelf
+            # so the topology can offer a picker.
+            "seed_pins": dict(_RADIO.get("seed_pins") or {}),
+            "seed_blocks": list(_RADIO.get("seed_blocks") or []),
+            "seed_files": sorted({p.name for p in speakbox_files()})[:120]}
 
 
 @app.get("/api/mind/topology")
@@ -26936,6 +27070,49 @@ async def mind_topology_adjust(request: Request, authorization: str | None = Hea
         if found: found["text"] = note
         else: rows.append({"id": uuid.uuid4().hex[:8], "text": note, "source": "Mind Topology"})
     bucket[role] = rows[:24]; save_settings(settings)
+    return mind_topology_state()
+
+
+@app.post("/api/mind/topology/seed")
+async def mind_topology_seed(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """#786: the seeds in play are the operator's to manage. `drop` deletes a
+    document from the memory — out of the recent-hits list and blocked from
+    coming back off the index; `set` pins a person to a document so their
+    next seeds draw from it; `unset` releases the pin."""
+    require_auth(authorization)
+    payload = await request.json()
+    action = str(payload.get("action") or "").strip()
+    file = str(payload.get("file") or "").strip()
+    role = str(payload.get("role") or "").strip()
+    if action == "drop":
+        if not file:
+            raise HTTPException(status_code=400, detail="Which file?")
+        _RADIO["vector_access"] = [
+            r for r in (_RADIO.get("vector_access") or [])
+            if r.get("file") != file]
+        blocks = set(_RADIO.get("seed_blocks") or [])
+        blocks.add(file)
+        _RADIO["seed_blocks"] = sorted(blocks)[:64]
+        pins = _RADIO.get("seed_pins") or {}
+        _RADIO["seed_pins"] = {k: v for k, v in pins.items() if v != file}
+        pipeline_log("air", f"seed dropped from the memory: {file} (#786)")
+    elif action == "set":
+        if role not in ("dj", "cohost", "third", "caller", "manager",
+                        "customer"):
+            raise HTTPException(status_code=400, detail="Unknown cast role")
+        if not file:
+            raise HTTPException(status_code=400, detail="Which file?")
+        _RADIO.setdefault("seed_pins", {})[role] = file
+        blocks = set(_RADIO.get("seed_blocks") or [])
+        blocks.discard(file)
+        _RADIO["seed_blocks"] = sorted(blocks)
+        pipeline_log("air", f"{role} pinned to {file} — their seeds draw "
+                            "from it now (#786)")
+    elif action == "unset":
+        (_RADIO.get("seed_pins") or {}).pop(role, None)
+        pipeline_log("air", f"{role} unpinned — seeds roam the shelf again")
+    else:
+        raise HTTPException(status_code=400, detail="drop, set or unset")
     return mind_topology_state()
 
 
@@ -29669,6 +29846,7 @@ ROUTING_PATH = data_path("routing.json")
 def _routing_voice_device_set(device: str) -> None:
     if device not in ("pine", "nabu"):
         return
+    changed = (_RADIO.get("voice_device") or "") != device
     settings = load_settings()
     voice_out = dict(settings.get("voice_out") or {})
     voice_out["media_player"] = (
@@ -29679,6 +29857,17 @@ def _routing_voice_device_set(device: str) -> None:
     _RADIO["voice_device"] = device
     _SAT_ALIVE.update({"checked": 0.0, "entity": ""})
     _SAT_BUSY.update({"at": 0.0, "entity": ""})
+    if changed:
+        # #786: the breaker, the silent-hold streak and the last-heard clock
+        # are ONE global slot shared by both devices — switching speakers
+        # used to inherit the OTHER device's open breaker and stale silence,
+        # so a healthy Nabu opened to 90 seconds of instant declines and a
+        # nervous DJ. A fresh device starts with a clean slate, and the
+        # hold shelf wakes for it.
+        _BOX_DOWN.update({"fails": 0, "until": 0.0})
+        _SILENT_HOLD_STREAK[0] = 0
+        _BOX_LAST_OK[0] = time.time()
+        fire_and_forget(box_route_wake())
 
 
 def _routing_save() -> None:
@@ -36619,6 +36808,15 @@ async def _pinebox_probe() -> None:
     sample = ("This is a Pine Box range test. The station is measuring "
               "how long a single statement can run before the speaker "
               "loses the thread. Counting onward through the test now. ")
+    if _RADIO.get("voice_device") == "nabu":
+        # #786: the delivery meter is a Wyoming wall-clock instrument; Nabu
+        # acks instantly and every row reads a fabricated 1.00, so the probe
+        # "passes" all six rungs by arithmetic and mints a ceiling nothing
+        # measured. An honest refusal beats a confident fiction.
+        repair_note("range probe skipped — Nabu's transport acks before "
+                    "playback, so this meter cannot measure it; the "
+                    "max-statement slider was left as set")
+        return
     best = 0
     results: list[str] = []
     for seconds in (8, 12, 16, 22, 30, 40):
@@ -40620,6 +40818,19 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   }
 }
 
+/* #786: the rhetoric cloud is a living thing — every survivor undulates on
+   its own clock, and a forgotten word dissolves instead of blinking out. */
+@keyframes rhetFloat {
+  from { transform: translateY(-5px) rotate(-1deg); }
+  to   { transform: translateY(6px) rotate(1.2deg); }
+}
+.rhet-word.rhet-die {
+  transition: opacity .85s ease, filter .85s ease;
+  opacity: 0 !important;
+  filter: blur(4px) !important;
+  pointer-events: none;
+}
+
 /* The Voice Studio is an independently resizable window, so its internals
    answer to the WINDOW's width (container query), never the viewport's. */
 @container (max-width: 600px) {
@@ -42476,6 +42687,118 @@ function clampBoxToViewport(box, minVisible = 120) {
     top: Math.max(0, Math.min(Number(b.top) || 0,
                               window.innerHeight - 64)),
   };
+}
+
+// ---- The 3JS gallery (#786): every three.js experience on the page, one
+// registry, jumpable from anywhere (the desktop rail drives this over the
+// webview bridge). Jumping first runs the all-off sweep — the one-context
+// rule made each opener close only SOME siblings, and the auto-reopeners
+// (inline Mind on air, cloud dock at boot) fight a bare close.
+const PINE_3JS = [
+  {key: "mind",     label: "🧠 Dialogue Mind",   open: () => mindOpen()},
+  {key: "topology", label: "🪐 Mind Topology",   open: () => mindTopologyOpen()},
+  {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
+  {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
+  {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
+  {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
+  {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
+  {key: "vectors",  label: "🌳 Vector Tree",     open: () => rhetVecToggle()},
+  {key: "stage",    label: "💿 Album Stage",     open: () => stageStart()},
+  {key: "remote",   label: "🌐 Remote Plexus",   open: () => remotePanel()},
+  {key: "skin",     label: "📼 Device Skin",
+   open: () => deviceSkin(["tp7", "op1", "ko2", "pocketoperator"]
+     .includes(localStorage.getItem("pineTheme"))
+     ? localStorage.getItem("pineTheme") : "tp7")},
+  {key: "off",      label: "⬛ All off",         open: () => {}},
+];
+
+// #786: the word cloud in the gallery opens as a FORMAL window like its
+// siblings — the standard frame with a title bar and a close — rather than
+// the ragged half-gallery overlay dock.
+async function pineCloudWin() {
+  const w = Math.min(1100, window.innerWidth * 0.9);
+  const h = Math.min(760, window.innerHeight * 0.86);
+  const box = el("div", "panel", "");
+  box.id = "cloudWin";
+  box.style.cssText = "position:fixed;z-index:150;display:flex;"
+    + "flex-direction:column;padding:0;overflow:hidden;"
+    + "left:" + Math.max(8, (window.innerWidth - w) / 2) + "px;"
+    + "top:" + Math.max(8, (window.innerHeight - h) / 2) + "px;"
+    + "width:" + w + "px;height:" + h + "px;"
+    + "box-shadow:0 24px 70px rgba(0,0,0,.6)";
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "padding:9px 12px;border-bottom:1px solid var(--border);"
+    + "font-weight:700;font-size:13px";
+  head.appendChild(el("b", "", "☁ Word Cloud"));
+  const shut = el("button", "", "✕");
+  shut.style.marginLeft = "auto";
+  shut.onclick = () => { try { destroyCloud(); } catch (e) {} box.remove(); };
+  head.appendChild(shut);
+  box.appendChild(head);
+  const host = el("div", "", "");
+  host.style.cssText = "flex:1;min-height:0";
+  box.appendChild(host);
+  document.body.appendChild(box);
+  await cloudMount(host);
+}
+
+function pine3JSAllOff() {
+  const cloudWin = document.getElementById("cloudWin");
+  if (cloudWin) cloudWin.remove();
+  // Disarm the auto-reopeners FIRST (the on-air poll re-opens the inline
+  // Mind within seconds otherwise), and stop the studio spiral BEFORE the
+  // stage (its stop restarts the stage it displaced).
+  localStorage.mindInline = "0";
+  localStorage.mindDock = "0";
+  localStorage.setItem("cloudDock", "off");
+  try { if (typeof crystal !== "undefined" && crystal) crystalClose(); } catch (e) {}
+  try { if (typeof djGraph !== "undefined" && djGraph) djGraphClose(); } catch (e) {}
+  try { if (typeof djMind !== "undefined" && djMind) mindClose(); } catch (e) {}
+  try { if (typeof mindTopology !== "undefined" && mindTopology) mindTopology.close(); } catch (e) {}
+  try { if (typeof booth !== "undefined" && booth) boothClose(); } catch (e) {}
+  try { if (typeof studioSpiral !== "undefined" && studioSpiral) studioSpiralStop(); } catch (e) {}
+  try { if (typeof stage !== "undefined" && stage) { stage.stop(); stage = null; } } catch (e) {}
+  try { if (typeof cloud !== "undefined" && cloud) destroyCloud(); } catch (e) {}
+  try { if (window.rhetSphere) rhetSphereStop(); } catch (e) {}
+  try { if (window.rhetVec) rhetVecStop(); } catch (e) {}
+  try { skinStop(); } catch (e) {}
+  const rm = document.getElementById("remoteModal");
+  if (rm) rm.remove();
+  const dock = document.getElementById("cloudDock");
+  if (dock) dock.style.display = "none";
+}
+
+async function pineShow3JS(key) {
+  const hit = PINE_3JS.find((x) => x.key === key);
+  if (!hit) return "unknown: " + key;
+  pine3JSAllOff();
+  if (key === "off") return "off";
+  await new Promise((r) => setTimeout(r, 120));   // let disposals settle
+  try { await hit.open(); } catch (e) { return String(e && e.message || e); }
+  // One consistent working size for every gallery jump: the floating
+  // windows land centred in the same standard frame instead of wherever
+  // they were last dragged, and host-embedded scenes scroll into view.
+  await new Promise((r) => setTimeout(r, 350));
+  const w = Math.min(1100, window.innerWidth * 0.9);
+  const h = Math.min(760, window.innerHeight * 0.86);
+  ["crystalBox", "boothModal"].forEach((id) => {
+    const box = document.getElementById(id);
+    if (!box) return;
+    box.style.width = w + "px";
+    box.style.height = h + "px";
+    box.style.left = Math.max(8, (window.innerWidth - w) / 2) + "px";
+    box.style.top = Math.max(8, (window.innerHeight - h) / 2) + "px";
+  });
+  const hosts = {cloud: "cloudDock", sphere: "djRhetoricCloud",
+                 vectors: "djRhetoricCloud", stage: "nowStage"};
+  if (hosts[key]) {
+    const hostEl = document.getElementById(hosts[key]);
+    if (hostEl && hostEl.scrollIntoView) {
+      hostEl.scrollIntoView({behavior: "smooth", block: "center"});
+    }
+  }
+  return key;
 }
 
 
@@ -55281,7 +55604,8 @@ function djRhetoricRender(state) {
       ww[w] = (ww[w]||0)+1; who.set(word, ww);
     }
   }
-  const top = [...counts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,70);
+  // #786: denser — the cloud is meant to CROWD, culled only by forgetting.
+  const top = [...counts.entries()].sort((a,b)=>b[1]-a[1]).slice(0,110);
   const maxN = top.length ? top[0][1] : 1;
   const seen = new Set();
   top.forEach(([word, n], i) => {
@@ -55294,7 +55618,16 @@ function djRhetoricRender(state) {
     if (!rec) {
       const el = document.createElement("span");
       el.className = "rhet-word";
-      el.textContent = word;
+      // #786: the word itself rides an inner span with its OWN slow
+      // undulation, so every survivor breathes in space independently of
+      // the outer positioning transform the tick rewrites.
+      const inner = document.createElement("i");
+      inner.textContent = word;
+      inner.style.cssText = "display:inline-block;font-style:normal;"
+        + "animation:rhetFloat " + (4 + (rhetHash(word) >>> 4) % 50 / 10)
+        + "s ease-in-out " + ((rhetHash(word) >>> 9) % 30 / 10)
+        + "s infinite alternate";
+      el.appendChild(inner);
       el.title = "Where “" + word + "” comes from — click";
       el.onclick = () => rhetWordDetail(word);       // #570
       const h = rhetHash(word);
@@ -55342,7 +55675,14 @@ function djRhetoricRender(state) {
     rec.count = n;
   });
   for (const [word, rec] of rhetWords)
-    if (!seen.has(word)) { rec.el.remove(); rhetWords.delete(word); }
+    if (!seen.has(word)) {
+      // #786: a forgotten word DIES VISIBLY — it lets go, shrinks and
+      // dissolves — rather than blinking out between two frames.
+      rhetWords.delete(word);
+      const dying = rec.el;
+      dying.classList.add("rhet-die");
+      setTimeout(() => dying.remove(), 900);
+    }
   const label = document.getElementById("djRhetoricCount");
   if (label) label.textContent = top.length
       ? (counts.size + " words · biggest “" + top[0][0] + "” ("
@@ -56238,6 +56578,13 @@ function djRender(state) {
   djLastState = state;
   onAirPaint(state);                  // #689 the header ON AIR light
   djRhetoricRender(state);            // #561 on-air rhetoric cloud
+  // #786: pine-hardware controls have no business on a Nabu console —
+  // the speaker repair and the USB serial console are that box's tools.
+  const pineTools = (state.voice_device || "nabu") !== "nabu";
+  ["livePineRepair", "livePineConsole"].forEach((id) => {
+    const b = document.getElementById(id);
+    if (b) b.style.display = pineTools ? "" : "none";
+  });
   const wasOn = djOn;
   djOn = !!state.on;
   // Keep the output selectors + localStorage in step with the SERVER routing
@@ -56642,8 +56989,12 @@ async function djSetOutput(immediate) {
   const musicRoute = music === "nabu" ? "box" : music;
   const voiceRoute = voice === "nabu" ? "box" : voice;
   const replyRoute = reply === "nabu" ? "box" : reply;
-  const voiceDevice = wantsNabu ? "nabu"
-    : (music === "box" || voice === "box" || reply === "box" ? "pine" : "");
+  // #786: NEVER infer "pine" from a bare 'box' route — that inference was
+  // the one live path that flipped the device pine-ward behind the user's
+  // back (a stale tab whose selects read 'box' rewrote the core device).
+  // Nabu is the core: an explicit nabu pick names it, anything else leaves
+  // the device exactly as the operator set it ("" = no change).
+  const voiceDevice = wantsNabu ? "nabu" : "";
   localStorage.setItem("djOutput", music);
   localStorage.setItem("djVoiceOut", voice);
   if (reply) localStorage.setItem("djReplyOut", reply);
@@ -62791,13 +63142,45 @@ async function mindTopologyOpen() {
   const stars=new THREE.Points(new THREE.BufferGeometry(),new THREE.PointsMaterial({color:0x4f98a8,size:.11,transparent:true,opacity:.7})); const sp=[]; for(let i=0;i<420;i++)sp.push((Math.random()-.5)*70,(Math.random()-.5)*45,(Math.random()-.5)*40); stars.geometry.setAttribute("position",new THREE.Float32BufferAttribute(sp,3)); scene.add(stars);
   const ray=new THREE.Raycaster(), pointer=new THREE.Vector2(); let nodes=[], state={}, selected=null, yaw=0, pitch=.12, drag=null, alive=true, timer=0;
   function label(text,color){const c=document.createElement("canvas"),x=c.getContext("2d");x.font="600 32px system-ui";c.width=Math.ceil(x.measureText(text).width)+22;c.height=48;x.font="600 32px system-ui";x.fillStyle=color;x.fillText(text,11,34);const t=new THREE.CanvasTexture(c),s=new THREE.Sprite(new THREE.SpriteMaterial({map:t,transparent:true,depthWrite:false}));s.scale.set(c.width*.024,c.height*.024,1);return s;}
-  function renderSide(item){selected=item||selected; const p=item&&item.data; const vector=(state.vectors||[]).slice(0,6); side.innerHTML=""; side.appendChild(el("h3","",p?p.name:"Live Inputs")); if(p){side.appendChild(el("div","muted",p.persona||"Live role shaped by station context.")); const mood=el("div","",Object.entries(p.state||{}).map(([k,v])=>k+" "+Number(v||0).toFixed(2)).join(" · ")); mood.style.margin="10px 0";side.appendChild(mood); const latest=el("div","",p.latest||"No current utterance.");latest.style.cssText="padding:8px;border-left:2px solid #46c6df;line-height:1.45";side.appendChild(latest); const h=el("h4","","Live directives");side.appendChild(h); (p.adjustments||[]).forEach(a=>{const row=el("div","","");row.style.cssText="padding:7px 0;border-top:1px solid #244";row.appendChild(el("span","",a.text)); const edit=el("button","","Edit");edit.onclick=()=>adjust(p.id,a);const del=el("button","","x");del.onclick=()=>adjust(p.id,a,true);row.appendChild(edit);row.appendChild(del);side.appendChild(row);}); } const vh=el("h4","","Vector seeds in play");side.appendChild(vh); vector.forEach(v=>{const row=el("div","",String(v.file||"source")+" · match "+Number(v.score||0).toFixed(2));row.style.cssText="padding:6px 0;border-top:1px solid #244;color:#b8d9aa";side.appendChild(row);});}
+  // #786: the seeds are the operator's to MANAGE, not just observe — a row
+  // opens the document full screen, its ✕ deletes it from the memory, and
+  // the person's title drops into a picker that pins their seed source.
+  async function seedApi(body){try{state=await api("/api/mind/topology/seed",{method:"POST",body:JSON.stringify(body)});rebuild();}catch(e){side.appendChild(el("div","muted",e.message));}}
+  async function seedDoc(file){const wrap=el("div","","");wrap.style.cssText="position:absolute;inset:0;z-index:8;background:#050b12f6;display:flex;flex-direction:column;padding:0";const head=el("div","","");head.style.cssText="display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid #24536a";head.appendChild(el("b","","📄 "+file));const shut=el("button","","✕ close");shut.style.cssText="margin-left:auto";shut.onclick=()=>wrap.remove();head.appendChild(shut);wrap.appendChild(head);const body=el("pre","","reading…");body.style.cssText="flex:1;overflow:auto;margin:0;padding:16px 20px;white-space:pre-wrap;font-size:13px;line-height:1.7;color:#d6e9f4;font-family:inherit";wrap.appendChild(body);card.appendChild(wrap);try{const d=await api("/api/speakbox/"+encodeURIComponent(file)+"?preview=24000");body.textContent=(d.text||"(empty)").trim();}catch(e){body.textContent="could not read it: "+e.message;}}
+  function renderSide(item){selected=item||selected; const p=item&&item.data; const vector=(state.vectors||[]).slice(0,8); side.innerHTML="";
+    const h3=el("h3","",p?p.name:"Live Inputs");
+    if(p){h3.title="Click to choose which document seeds "+p.name;h3.style.cssText="cursor:pointer";h3.onclick=()=>{const old=side.querySelector("#seedPick");if(old){old.remove();return;}const pick=el("div","","");pick.id="seedPick";pick.style.cssText="margin:6px 0 10px";const sel=document.createElement("select");sel.style.cssText="width:100%;padding:6px;background:#0a1420;color:#d6e9f4;border:1px solid #24536a;border-radius:7px";const pin=(state.seed_pins||{})[p.id]||"";const none=document.createElement("option");none.value="";none.textContent=pin?"— release the pin (roam the shelf) —":"— pick a document to seed them —";sel.appendChild(none);(state.seed_files||[]).forEach(f=>{const o=document.createElement("option");o.value=f;o.textContent=f+((state.seed_blocks||[]).includes(f)?"  (blocked)":"");o.selected=f===pin;sel.appendChild(o);});sel.onchange=()=>{if(sel.value)seedApi({action:"set",role:p.id,file:sel.value});else seedApi({action:"unset",role:p.id});};pick.appendChild(sel);h3.after(pick);};}
+    side.appendChild(h3);
+    if(p){const pin=(state.seed_pins||{})[p.id];if(pin){const pinRow=el("div","","📌 seeded from "+pin);pinRow.style.cssText="font-size:11px;color:#ffd166;margin:2px 0 6px";side.appendChild(pinRow);}
+      side.appendChild(el("div","muted",p.persona||"Live role shaped by station context.")); const mood=el("div","",Object.entries(p.state||{}).map(([k,v])=>k+" "+Number(v||0).toFixed(2)).join(" · ")); mood.style.margin="10px 0";side.appendChild(mood); const latest=el("div","",p.latest||"No current utterance.");latest.style.cssText="padding:8px;border-left:2px solid #46c6df;line-height:1.45";side.appendChild(latest); const h=el("h4","","Live directives");side.appendChild(h); (p.adjustments||[]).forEach(a=>{const row=el("div","","");row.style.cssText="padding:7px 0;border-top:1px solid #244";row.appendChild(el("span","",a.text)); const edit=el("button","","Edit");edit.onclick=()=>adjust(p.id,a);const del=el("button","","x");del.onclick=()=>adjust(p.id,a,true);row.appendChild(edit);row.appendChild(del);side.appendChild(row);}); }
+    const vh=el("h4","","Vector seeds in play");side.appendChild(vh);
+    vector.forEach(v=>{const row=el("div","","");row.style.cssText="display:flex;align-items:center;gap:8px;padding:6px 0;border-top:1px solid #244";const name=el("span","",String(v.file||"source")+" · match "+Number(v.score||0).toFixed(2));name.style.cssText="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;color:#b8d9aa;cursor:pointer";name.title="Read the whole document";name.onclick=()=>seedDoc(String(v.file||""));row.appendChild(name);const kill=el("button","","✕");kill.title="Delete this seed from the memory — it will not come back";kill.style.cssText="flex:0 0 auto;padding:2px 8px;font-size:11px";kill.onclick=()=>seedApi({action:"drop",file:String(v.file||"")});row.appendChild(kill);side.appendChild(row);});
+    if(!vector.length)side.appendChild(el("div","muted","Nothing drawn yet — seeds land here as the pair reach for the shelf."));}
   async function adjust(role,item,remove){if(!role)return; if(remove){await api("/api/mind/topology/adjust",{method:"POST",body:JSON.stringify({role,id:item.id,action:"delete"})});return refresh();} const text=prompt(item?"Update live directive":"Add live directive",item?item.text:""); if(text===null)return; await api("/api/mind/topology/adjust",{method:"POST",body:JSON.stringify({role,id:item&&item.id||"",text,action:item?"update":"add"})});refresh();}
   add.onclick=()=>adjust(selected&&selected.data.id||"dj");
   function rebuild(){while(world.children.length)world.remove(world.children[0]);nodes=[]; const people=state.people||[]; const colors={dj:0x51b5f4,cohost:0x9cf08b,third:0xffd166,manager:0xff7285,caller:0xff8ad1,customer:0xa88cff}; people.forEach((p,i)=>{const a=i/Math.max(1,people.length)*Math.PI*2, r=8;const g=new THREE.Group();g.position.set(Math.cos(a)*r,Math.sin(a*2)*1.8,Math.sin(a)*r);const col=colors[p.id]||0x7aa9bc;const core=new THREE.Mesh(new THREE.IcosahedronGeometry(1.15,2),new THREE.MeshStandardMaterial({color:col,emissive:col,emissiveIntensity:.45,roughness:.3}));core.userData={person:true,data:p};g.add(core);const ring=new THREE.Mesh(new THREE.TorusGeometry(1.7,.045,10,38),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:.65}));ring.rotation.x=Math.PI/2;g.add(ring);const tag=label(p.name,"#dff8ff");tag.position.y=2;g.add(tag);world.add(g);nodes.push(core); const inputs=[...(p.adjustments||[]).map(a=>({kind:"directive",text:a.text,item:a})),...Object.entries(p.state||{}).filter(([,v])=>Math.abs(v)>.03).map(([k,v])=>({kind:"state",text:k+" "+Number(v).toFixed(2)}))];inputs.slice(0,9).forEach((n,j)=>{const q=j/Math.max(1,inputs.length)*Math.PI*2;const orb=new THREE.Mesh(new THREE.SphereGeometry(.24+(n.kind==="directive"?.12:0),12,10),new THREE.MeshBasicMaterial({color:n.kind==="directive"?0xffd166:col}));orb.userData={person:true,data:p,detail:n};orb.position.set(Math.cos(q)*2.6,.35*Math.sin(q*2),Math.sin(q)*2.6);g.add(orb);nodes.push(orb);});}); const vec=state.vectors||[];vec.slice(0,10).forEach((v,i)=>{const a=i/Math.max(1,vec.length)*Math.PI*2+.3;const m=new THREE.Mesh(new THREE.OctahedronGeometry(.32,0),new THREE.MeshBasicMaterial({color:0x9ce7c4}));m.position.set(Math.cos(a)*13,-3+Math.sin(a*3)*3,Math.sin(a)*13);m.userData={vector:true,data:v};world.add(m);nodes.push(m);}); renderSide(selected);}
   async function refresh(){try{state=await api("/api/mind/topology"); rebuild();}catch(e){side.textContent=e.message;}}
   renderer.domElement.onpointerdown=e=>drag={x:e.clientX,y:e.clientY}; renderer.domElement.onpointermove=e=>{if(drag){yaw+=(e.clientX-drag.x)*.006;pitch=Math.max(-.7,Math.min(.7,pitch+(e.clientY-drag.y)*.004));drag={x:e.clientX,y:e.clientY};}};renderer.domElement.onpointerup=e=>{if(!drag)return;const r=renderer.domElement.getBoundingClientRect();pointer.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(pointer,camera);const hit=ray.intersectObjects(nodes,false)[0];if(hit){if(hit.object.userData.vector){side.innerHTML="<h3>Vector source</h3><pre>"+String(hit.object.userData.data.file||"")+"\n"+JSON.stringify(hit.object.userData.data,null,2)+"</pre>";}else renderSide({data:hit.object.userData.data});}drag=null;};
-  function tick(){if(!alive)return;requestAnimationFrame(tick);const w=stage.clientWidth,h=stage.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();world.rotation.set(pitch,yaw,0);world.children.forEach((g,i)=>{if(g.children&&g.children[1])g.children[1].rotation.z=performance.now()*.001*(i%2?1:-1);});renderer.render(scene,camera);} function close(){if(!alive)return;alive=false;clearInterval(timer);renderer.dispose();shade.remove();mindTopology=null;} mindTopology={close}; refresh();timer=setInterval(refresh,2200);tick();
+  let _tw=0,_th=0;
+  function tick(){if(!alive)return;requestAnimationFrame(tick);const w=stage.clientWidth,h=stage.clientHeight;
+    // #786: setSize ran UNCONDITIONALLY here — a drawing-buffer realloc
+    // every frame, which dragged the whole page and froze the scene solid
+    // (the #737 bug class). Only when the stage actually changed.
+    if(w!==_tw||h!==_th){_tw=w;_th=h;renderer.setSize(w,h,false);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();}
+    const t=performance.now()*.001;
+    // The topology BREATHES now: a slow idle spin the drag overrides, each
+    // world bobbing on its own phase, orbs orbiting their person.
+    world.rotation.set(pitch,yaw+(drag?0:t*.045),0);
+    world.children.forEach((g,i)=>{
+      if(g.userData&&g.userData.person!==undefined||g.children&&g.children.length){
+        if(g.userData._baseY===undefined)g.userData._baseY=g.position.y;
+        g.position.y=g.userData._baseY+Math.sin(t*.9+i*1.7)*.3;
+        g.rotation.y=t*(.12+i*.015);
+        if(g.children&&g.children[1])g.children[1].rotation.z=t*(i%2?1:-1);
+      }});
+    stars.rotation.y=t*.008;
+    renderer.render(scene,camera);}
+  function close(){if(!alive)return;alive=false;clearInterval(timer);renderer.dispose();shade.remove();mindTopology=null;} mindTopology={close}; refresh();timer=setInterval(refresh,2200);tick();
 }
 
 function mindOpen(opts) {
@@ -72475,9 +72858,42 @@ function startLiveActivity() {
   // The clock alone, often — this is what keeps two machines on the same
   // second while the heavy state poll stays on its slow round (#631).
   setInterval(radioClockPoll, 1500);
-  cloudDockStart();
-  stageStart().catch(() => {});
+  // #786: the heavy 3D mounts stagger in AFTER first paint — booting up to
+  // four WebGL contexts inside the same tick as the 1.2MB script parse was
+  // the sluggish, unresponsive page load.
+  setTimeout(() => cloudDockStart(), 2600);
+  setTimeout(() => stageStart().catch(() => {}), 1400);
   scopeLoop();
+  // #786: the station comes FIRST in the stack — Pine Box FM · the DJ at
+  // the top, Music right after it. The ▲▼⇄ handles still re-order freely;
+  // this is the default order, applied before any saved layout lands.
+  try {
+    const heads = [...document.querySelectorAll("main section h2")];
+    const fm = (heads.find((h) => /Pine Box FM/.test(h.textContent)) || {})
+      .closest ? heads.find((h) => /Pine Box FM/.test(h.textContent))
+      .closest("section") : null;
+    const music = (heads.find((h) => /^\s*Music\b/.test(h.textContent)) || {})
+      .closest ? heads.find((h) => /^\s*Music\b/.test(h.textContent))
+      .closest("section") : null;
+    const colLeft = document.querySelector("main .col-left");
+    if (fm && colLeft) colLeft.prepend(fm);
+    if (fm && music) fm.after(music);
+  } catch (e) {}
+  // #786: EVERY section header folds. The bespoke collapsibles keep their
+  // wiring; every other panel with a heading gets the same treatment.
+  try {
+    document.querySelectorAll("main section.panel").forEach((sec, i) => {
+      if (sec.classList.contains("pb-collapsible")) return;
+      const head = sec.querySelector("h2, h3, summary, .pine-summary");
+      if (!head || head.closest("details")) return;
+      const rest = [...sec.children].filter(
+        (c) => c !== head && !c.classList.contains("sec-move")
+               && !c.contains(head));
+      if (!rest.length) return;
+      makeCollapsible(sec, head,
+        rest, "fold:" + (head.textContent || String(i)).trim().slice(0, 40));
+    });
+  } catch (e) {}
   setInterval(djVoicePoll, 4000);
   setInterval(() => { if (djOn) djMiniRender({now: djNowTrack || {}}); }, 500);
   const savedOutput = document.getElementById("djOutput");

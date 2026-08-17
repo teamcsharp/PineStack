@@ -238,6 +238,109 @@ body.resizing-rail .rail-resizer::before {
 
 .rail-actions { margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 
+/* The 3JS gallery: an accordion under its tab listing every three.js
+   experience in the panel; picking one jumps the webview to it. */
+.threejs-list { display: grid; gap: 4px; padding: 4px 0 4px 10px; }
+.threejs-list button {
+  height: 30px;
+  padding: 0 8px;
+  font-size: 12px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.threejs-list button b { font-weight: 400; }
+body.rail-compact .threejs-list { padding-left: 0; }
+body.rail-compact .threejs-list button { text-align: center; padding: 0 2px; }
+/* Compact rail: the gallery entries become their icons; the rich tooltip
+   carries the name and the story. */
+body.rail-compact .threejs-list button span { display: none; }
+
+/* The expansive gallery tooltip: name, what it is, provenance, systems,
+   and the description — formatted, not a bare title string. */
+.threejs-tip {
+  position: fixed;
+  z-index: 300;
+  display: none;
+  width: min(320px, calc(100vw - 24px));
+  background: var(--panel);
+  border: 1px solid var(--cyan);
+  border-radius: 10px;
+  padding: 12px 14px;
+  box-shadow: 0 18px 50px rgba(0,0,0,.6);
+  pointer-events: none;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.threejs-tip h4 { margin: 0 0 2px; font-size: 14px; }
+.threejs-tip .tip-what {
+  margin: 0 0 8px;
+  color: var(--cyan);
+  font-style: italic;
+}
+.threejs-tip .tip-meta {
+  margin: 0 0 8px;
+  padding: 6px 8px;
+  background: var(--panel-2);
+  border-radius: 7px;
+  color: var(--muted);
+  font-size: 11px;
+}
+.threejs-tip .tip-meta b { color: var(--text); }
+.threejs-tip p { margin: 0; color: var(--text); }
+
+/* The Station drawer: slides out beside the rail. */
+.station-drawer {
+  position: fixed;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  z-index: 60;
+  width: min(340px, 92vw);
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-right: 1px solid var(--line);
+  box-shadow: 24px 0 60px rgba(0,0,0,.45);
+  transform: translateX(-105%);
+  transition: transform .28s cubic-bezier(.2,.9,.25,1);
+}
+.station-drawer.open { transform: translateX(0); }
+.station-drawer[hidden] { display: flex; visibility: hidden; }
+.station-drawer.open[hidden] { visibility: visible; }
+.drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.drawer-head button { margin-left: auto; width: 34px; padding: 0; }
+.drawer-body { flex: 1; overflow-y: auto; padding: 14px 16px; }
+.drawer-body section { margin-bottom: 22px; }
+.drawer-body h3 { margin: 0 0 8px; font-size: 14px; }
+.drawer-body .muted { color: var(--muted); font-size: 12px; }
+.drawer-row { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+.drawer-row .wide { flex: 1; }
+.drawer-row input { flex: 1; min-width: 0; }
+.drawer-row button { flex: 0 0 auto; }
+.drawer-body label {
+  display: block;
+  margin: 10px 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.drawer-body label output { color: var(--text); font-weight: 700; }
+.drawer-body input[type="range"] { width: 100%; accent-color: var(--cyan); }
+#stDiagOut {
+  white-space: pre-wrap;
+  font: 11px/1.5 Consolas, ui-monospace, monospace;
+  max-height: 180px;
+  overflow-y: auto;
+  margin: 8px 0 0;
+}
+
 /* Compact rail: shrink to variants, never amputate. Launch/Attach have no
    other entry point, the FM toggle is the master switch, and hidden audio
    would keep playing with nothing to control it — all stay reachable. */

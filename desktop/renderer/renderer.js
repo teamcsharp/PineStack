@@ -24,14 +24,17 @@ const ROUTES = {
   box: { label: "Pine Box", music: "box", voice: "box", reply: "box", voice_device: "pine", box_talk: true },
   web: { label: "Web page", music: "here", voice: "here", reply: "here", voice_device: "pine", box_talk: false },
   app: { label: "Application", music: "off", voice: "here", reply: "here", voice_device: "pine", box_talk: false },
-  nabu: { label: "Nabu", music: "off", voice: "box", reply: "box", voice_device: "nabu", box_talk: true }
+  // #786: Nabu is the CORE broadcast device — broadcasting to it means the
+  // WHOLE station: music and the DJ voice both. music "off" here was why
+  // the speaker sat silent between rounds.
+  nabu: { label: "Nabu", music: "box", voice: "box", reply: "box", voice_device: "nabu", box_talk: true }
 };
 
 const EMBEDDED_ROUTES = {
   box: { djOutput: "box", djVoiceOut: "box", djReplyOut: "box" },
   web: { djOutput: "here", djVoiceOut: "here", djReplyOut: "here" },
   app: { djOutput: "off", djVoiceOut: "here", djReplyOut: "here" },
-  nabu: { djOutput: "off", djVoiceOut: "nabu", djReplyOut: "nabu" }
+  nabu: { djOutput: "nabu", djVoiceOut: "nabu", djReplyOut: "nabu" }
 };
 
 function setText(id, text) {
@@ -816,7 +819,298 @@ async function setFm(on) {
   }
 }
 
+// ---- The 3JS gallery: jump the panel between its three.js experiences.
+// Keys mirror the panel's PINE_3JS registry; the click rides the webview
+// bridge (pineShow3JS closes whatever scene is up first).
+const THREEJS_VIEWS = [
+  { key: "mind", icon: "🧠", name: "Dialogue Mind", since: "#472 · #465 · #508",
+    systems: "three.min.js · /api/dj/pipeline · /api/speakbox/minds",
+    what: "How a line of banter is MADE, live",
+    desc: "Six stations — documents, sift, LLM, voice, engineer, on air — with travelling packets animated off the real pipeline feed, a dialogue reel, and eight swappable visual themes." },
+  { key: "topology", icon: "🪐", name: "Mind Topology", since: "#786 seeds era",
+    systems: "three.module.js · /api/mind/topology",
+    what: "The cast as a solar system you can steer",
+    desc: "Every DJ, caller and manager as a ringed planet with mood orbs and live directives. Click a seed to read its document, ✕ deletes it from the memory, and a person's title pins them to a source." },
+  { key: "graph", icon: "⚙", name: "DJ Plexus", since: "#234",
+    systems: "three.min.js · /api/dj/graph",
+    what: "The machine behind the pair",
+    desc: "The DJ as the central node with every powering system in orbit; documents light up and fire pulses down their edges each time one drives a line. Lines are votable and replayable from the rail." },
+  { key: "crystal", icon: "💠", name: "Data Crystal", since: "#350 · #484",
+    systems: "three.module.js · /api/dj/crystal",
+    what: "Everything they have ever said, crystallised",
+    desc: "The whole spoken history as a growing point cloud, one cluster per speaker, placed by phrase embedding so reruns crystallise together. Hover reads a phrase; right-click deletes it from the DJ's memory." },
+  { key: "booth", icon: "🎛", name: "DJ Booth", since: "#132",
+    systems: "three.module.js · DJ state endpoints",
+    what: "The studio itself, as a room",
+    desc: "A 3D booth — turntable with platter and tonearm, generated record sleeves in a cover arc — with live transcript, spectrogram scope, transport and a chat line straight to the DJ." },
+  { key: "cloud", icon: "☁", name: "Word Cloud", since: "#83 · #97 · #117",
+    systems: "three.module.js · /api/wordcloud",
+    what: "Every word ever said to the Pine Box",
+    desc: "Glowing text sprites on a Fibonacci sphere — size is frequency, colour blends frequency with recency, and the whole thing throbs when something new lands." },
+  { key: "sphere", icon: "🔮", name: "Rhetoric Sphere", since: "#610",
+    systems: "three.module.js · live chat feed",
+    what: "What is being said on air right now, in 3D",
+    desc: "The on-air words riding an undulating wireframe icosphere, coloured by which speaker owns each word. Drag to spin, wheel to zoom; rebuilt from the live chat every few seconds." },
+  { key: "vectors", icon: "🌳", name: "Vector Tree", since: "#578 · #586",
+    systems: "three.module.js · /api/speakbox/vectors",
+    what: "The document memory as a living tree",
+    desc: "The vector index as a glowing core fed by document nodes — distance is recency, size is swaths and uses, and particle streams assimilate from busy documents into the centre." },
+  { key: "stage", icon: "💿", name: "Album Stage", since: "#148 · #170",
+    systems: "three.module.js · now-playing state",
+    what: "The record that is turning, on a stage",
+    desc: "The playing album breathing and drifting on a raked stage with a sweeping sheen; on a track change the old sleeve lies down and rolls out while the next flips up." },
+  { key: "remote", icon: "🌐", name: "Remote Plexus", since: "#659 · #660",
+    systems: "three.min.js · /api/remote",
+    what: "The road out of the house, drawn",
+    desc: "The public-broadcast setup stages as glowing sphere nodes over a drifting particle field — the wire between stages lights up as each one lands." },
+  { key: "skin", icon: "📼", name: "Device Skin", since: "#144–#147",
+    systems: "three.module.js · theme system",
+    what: "The hardware behind the page",
+    desc: "A full-viewport, audio-reactive render of the themed device — reel-to-reel, keyboard, pad slab — living behind the UI as ambience. Reels spin with the music." },
+  { key: "off", icon: "⬛", name: "All off", since: "the sweep",
+    systems: "every scene above",
+    what: "Take every 3D scene down",
+    desc: "Closes every experience in the right order, disarms the auto-reopeners, and leaves the page flat and quiet." },
+];
+
+function threejsTip(item, anchor) {
+  let tip = $("threejsTip");
+  if (!tip) {
+    tip = document.createElement("div");
+    tip.id = "threejsTip";
+    tip.className = "threejs-tip";
+    document.body.appendChild(tip);
+  }
+  tip.innerHTML = "";
+  const h = document.createElement("h4");
+  h.textContent = item.icon + " " + item.name;
+  const meta = document.createElement("div");
+  meta.className = "tip-meta";
+  meta.innerHTML =
+    "<b>born</b> " + item.since + "<br><b>runs on</b> " + item.systems;
+  const what = document.createElement("p");
+  what.className = "tip-what";
+  what.textContent = item.what;
+  const desc = document.createElement("p");
+  desc.textContent = item.desc;
+  tip.appendChild(h); tip.appendChild(what); tip.appendChild(meta);
+  tip.appendChild(desc);
+  const at = anchor.getBoundingClientRect();
+  tip.style.display = "block";
+  tip.style.left = Math.min(at.right + 12, window.innerWidth - 340) + "px";
+  tip.style.top = Math.max(8, Math.min(at.top - 10,
+    window.innerHeight - tip.offsetHeight - 12)) + "px";
+}
+
+function threejsTipHide() {
+  const tip = $("threejsTip");
+  if (tip) tip.style.display = "none";
+}
+
+function initThreejsRail() {
+  const btn = $("threejsBtn");
+  const list = $("threejsList");
+  if (!btn || !list) return;
+  THREEJS_VIEWS.forEach((entry) => {
+    const key = entry.key;
+    const item = document.createElement("button");
+    const icon = document.createElement("b");
+    icon.textContent = entry.icon;
+    const text = document.createElement("span");
+    text.textContent = " " + entry.name;
+    item.appendChild(icon); item.appendChild(text);
+    item.addEventListener("mouseenter", () => threejsTip(entry, item));
+    item.addEventListener("mouseleave", threejsTipHide);
+    item.addEventListener("click", () => {
+      selectView("control");
+      const frame = $("controlFrame");
+      if (frame && frame.executeJavaScript) {
+        frame.executeJavaScript(
+          `typeof pineShow3JS === "function" && pineShow3JS(${JSON.stringify(key)})`
+        ).catch(() => {});
+      }
+    });
+    list.appendChild(item);
+  });
+  btn.addEventListener("click", () => {
+    const open = list.style.display !== "none";
+    list.style.display = open ? "none" : "grid";
+    btn.classList.toggle("active", !open);
+  });
+}
+initThreejsRail();
+
+// ---- The Station drawer: public broadcast, DJ handling and repair at the
+// application level. Every value round-trips through the agent, so any
+// install on the network reads and writes the same master configuration.
+function initStationDrawer() {
+  const drawer = $("stationDrawer");
+  const btn = $("stationBtn");
+  if (!drawer || !btn) return;
+  drawer.hidden = false;
+  const open = () => { drawer.classList.add("open"); loadStation(); };
+  const close = () => drawer.classList.remove("open");
+  btn.addEventListener("click", () =>
+    drawer.classList.contains("open") ? close() : open());
+  $("stationClose").addEventListener("click", close);
+
+  async function loadSpark() {
+    // The machine itself: live stats + the services on it, configurable.
+    try {
+      const [perf, health] = await Promise.all([
+        api.get("/api/perf"), fetch(`${config.baseUrl}/health`).then((r) => r.json()),
+      ]);
+      const lines = [];
+      if (perf) {
+        if (perf.cpu != null) lines.push(`cpu ${perf.cpu}% · load ${perf.load ?? "—"}`);
+        if (perf.ram_used != null) lines.push(`ram ${perf.ram_used}/${perf.ram_total} GB`);
+        if (perf.gpu != null) lines.push(`gpu ${perf.gpu}% · vram ${perf.vram_used ?? "—"} GB`);
+        if (perf.temp_c != null) lines.push(`temp ${perf.temp_c}°C`);
+      }
+      Object.entries((health && health.services) || {}).forEach(([k, v]) =>
+        lines.push(`${k}: ${v}`));
+      if (health && health.model) lines.push(`model: ${health.model}`);
+      $("sparkStats").textContent = lines.join("\n") || "no readings";
+    } catch (e) { $("sparkStats").textContent = e.message; }
+    try {
+      const models = await api.get("/api/ollama-models");
+      const sel = $("sparkModel");
+      sel.innerHTML = "";
+      const current = (await api.get("/api/settings")).model || "";
+      (models.models || []).forEach((m) => {
+        const name = typeof m === "string" ? m : m.name || m.model;
+        const o = document.createElement("option");
+        o.value = name; o.textContent = name;
+        if (name === current) o.selected = true;
+        sel.appendChild(o);
+      });
+      sel.onchange = async () => {
+        try { await api.post("/api/model", { model: sel.value }); } catch (e) {}
+      };
+    } catch (e) {}
+  }
+  $("sparkRestart").addEventListener("click", async () => {
+    $("sparkStats").textContent = "restarting spark-agent…";
+    try { await api.post("/api/service/restart", { name: "spark-agent" }); } catch (e) {}
+    setTimeout(loadSpark, 8000);
+  });
+  $("sparkRefresh").addEventListener("click", () => loadSpark());
+  // The Agent status cell is the door to the machine panel.
+  const agentCell = $("agentState") && $("agentState").parentElement;
+  if (agentCell) {
+    agentCell.style.cursor = "pointer";
+    agentCell.title = "DGX Spark — statistics and services";
+    agentCell.addEventListener("click", () => { open(); loadSpark(); });
+  }
+
+  async function loadStation() {
+    loadSpark();
+    try {
+      const net = await api.get("/api/remote?fresh=0");
+      const stages = (net.stages || []);
+      const done = stages.filter((s) => s.done).length;
+      setText("pubStatus", net.public ? "broadcasting beyond the house"
+        : `${done}/${stages.length || "?"} stages ready`);
+      $("pubStages").textContent = stages.filter((s) => !s.done)
+        .map((s) => s.name || s.label || "").filter(Boolean).join(" · ");
+    } catch (e) { setText("pubStatus", e.message); }
+    try {
+      const shares = await api.get("/api/share");
+      const live = (shares.links || [])[0];
+      if (live) $("pubLink").value = live.url || "";
+    } catch (e) {}
+    try {
+      const s = await api.get("/api/settings");
+      const dj = s.dj || {};
+      const bind = (id, val, out, fmt) => {
+        const el = $(id);
+        el.value = val;
+        $(out).textContent = fmt ? fmt(val) : val;
+        el.oninput = () => { $(out).textContent = fmt ? fmt(el.value) : el.value; };
+        el.onchange = () => saveStation();
+      };
+      bind("stTalk", dj.talk_radio ?? 35, "stTalkV");
+      bind("stGap", dj.banter_max_minutes ?? 2.5, "stGapV");
+      bind("stCalls", dj.callin_per_hour ?? 4, "stCallsV");
+      bind("stDeep", Math.round((dj.deep_rate ?? 0.25) * 100), "stDeepV");
+      bind("stVol", Math.round((dj.box_volume ?? 1) * 100), "stVolV");
+    } catch (e) { setText("stSaved", e.message); }
+  }
+
+  async function saveStation() {
+    try {
+      const s = await api.get("/api/settings");
+      s.dj = {
+        ...(s.dj || {}),
+        talk_radio: Number($("stTalk").value),
+        banter_max_minutes: Number($("stGap").value),
+        callin_per_hour: Number($("stCalls").value),
+        deep_rate: Number($("stDeep").value) / 100,
+        box_volume: Number($("stVol").value) / 100,
+      };
+      await api.put("/api/settings", s);
+      setText("stSaved", "saved — every session on the network follows");
+      setTimeout(() => setText("stSaved", ""), 2500);
+    } catch (e) { setText("stSaved", e.message); }
+  }
+
+  $("pubStart").addEventListener("click", async () => {
+    setText("pubStatus", "minting the public link…");
+    try {
+      if (!djConfirmedOn()) await api.post("/api/dj/start", {});
+      const made = await api.post("/api/share",
+        { hours: 168, label: "shared from the desktop", scope: "listen" });
+      if (made && made.url) $("pubLink").value = made.url;
+      setText("pubStatus", "on the air — hand the link to anybody");
+    } catch (e) { setText("pubStatus", e.message); }
+  });
+  function djConfirmedOn() {
+    const lamp = document.body.classList.contains("fm-on");
+    return lamp;
+  }
+  $("pubCopy").addEventListener("click", () => {
+    const v = $("pubLink").value;
+    if (v) navigator.clipboard.writeText(v).then(
+      () => setText("pubStatus", "link copied — paste it anywhere"),
+      () => {});
+  });
+  $("pubOpen").addEventListener("click", () => {
+    const v = $("pubLink").value;
+    if (v) api.openExternal(v);
+  });
+  $("pubRecheck").addEventListener("click", async () => {
+    setText("pubStatus", "re-checking…");
+    try { await api.get("/api/remote?fresh=1"); } catch (e) {}
+    loadStation();
+  });
+  $("stInit").addEventListener("click", async () => {
+    setText("stDiagOut", "initializing — ends with an audible test…");
+    try {
+      const r = await api.post("/api/pinebox/initialize", {});
+      $("stDiagOut").textContent = (r.steps || [])
+        .map((s) => (s.ok ? "✓ " : "✗ ") + s.name + " — " + s.detail).join("\n");
+    } catch (e) { setText("stDiagOut", e.message); }
+  });
+  $("stRecover").addEventListener("click", async () => {
+    setText("stDiagOut", "recovering — reloads the speaker link…");
+    try {
+      const r = await api.post("/api/pinebox/recover", { restart: false });
+      $("stDiagOut").textContent = (r.steps || []).join("\n");
+    } catch (e) { setText("stDiagOut", e.message); }
+  });
+  $("stDiag").addEventListener("click", async () => {
+    setText("stDiagOut", "diagnosing…");
+    try {
+      const d = await api.get("/api/pinebox/diagnose");
+      $("stDiagOut").textContent = (d.cause || "") + "\n"
+        + (d.checks || []).map((c) => (c.ok ? "✓ " : "✗ ") + c.name).join("\n");
+    } catch (e) { setText("stDiagOut", e.message); }
+  });
+}
+initStationDrawer();
+
 document.querySelectorAll(".tab").forEach((button) => {
+  if (button.id === "threejsBtn" || button.id === "stationBtn") return;
   button.addEventListener("click", () => selectView(button.dataset.view));
 });
 

@@ -50,6 +50,11 @@
       <button class="tab" data-view="guide" title="Recovery guide">+<span>Recover</span></button>
       <button class="tab" data-view="logs" title="Agent logs">~<span>Logs</span></button>
       <button class="tab" data-view="settings" title="Desktop settings">*<span>Settings</span></button>
+      <button class="tab" id="threejsBtn"
+              title="Every 3JS experience on the page — jump between them">◆<span>3js</span></button>
+      <div id="threejsList" class="threejs-list" style="display:none"></div>
+      <button class="tab" id="stationBtn"
+              title="The station — public broadcast, the DJs, troubleshooting">○<span>Station</span></button>
     </nav>
     <div class="rail-actions">
       <button id="launchBtn">Launch</button>
@@ -168,6 +173,70 @@
       </section>
     </section>
   </main>
+  <!-- The Station drawer: public broadcast, DJ handling and troubleshooting
+       at the APPLICATION level — every value lives on the agent, so all
+       installs on the network share one master configuration. -->
+  <aside id="stationDrawer" class="station-drawer" hidden>
+    <div class="drawer-head">
+      <b>○ The Station</b>
+      <button id="stationClose" title="Close">✕</button>
+    </div>
+    <div class="drawer-body">
+      <section id="sparkSection">
+        <h3>⚡ DGX Spark</h3>
+        <pre id="sparkStats" class="muted">reading the machine…</pre>
+        <div class="drawer-row">
+          <label style="flex:1;margin:0">model
+            <select id="sparkModel" style="width:100%"></select>
+          </label>
+        </div>
+        <div class="drawer-row">
+          <button id="sparkRestart">🌲 Restart agent</button>
+          <button id="sparkRefresh">↻</button>
+        </div>
+      </section>
+      <section>
+        <h3>Public broadcast</h3>
+        <p id="pubStatus" class="muted">checking…</p>
+        <div class="drawer-row">
+          <button id="pubStart" class="wide">📡 Broadcast the public station</button>
+        </div>
+        <div class="drawer-row">
+          <input id="pubLink" readonly placeholder="the shareable link lands here">
+          <button id="pubCopy" title="Copy the link">⧉</button>
+          <button id="pubOpen" title="Open in browser">↗</button>
+        </div>
+        <div class="drawer-row">
+          <button id="pubRecheck">↻ Re-check</button>
+          <span id="pubStages" class="muted"></span>
+        </div>
+      </section>
+      <section>
+        <h3>The DJs</h3>
+        <label>talkativeness <output id="stTalkV"></output>
+          <input id="stTalk" type="range" min="0" max="100" step="5"></label>
+        <label>rounds at most every <output id="stGapV"></output> min
+          <input id="stGap" type="range" min="0.5" max="10" step="0.5"></label>
+        <label>calls per hour <output id="stCallsV"></output>
+          <input id="stCalls" type="range" min="0" max="20" step="1"></label>
+        <label>deep conversations <output id="stDeepV"></output>%
+          <input id="stDeep" type="range" min="0" max="100" step="5"></label>
+        <label>box volume <output id="stVolV"></output>%
+          <input id="stVol" type="range" min="30" max="160" step="5"></label>
+        <p id="stSaved" class="muted"></p>
+      </section>
+      <section>
+        <h3>Troubleshooting</h3>
+        <div class="drawer-row">
+          <button id="stInit">🛠 Initialize</button>
+          <button id="stRecover">🔄 Recover</button>
+          <button id="stDiag">🩺 Diagnose</button>
+        </div>
+        <pre id="stDiagOut" class="muted"></pre>
+      </section>
+    </div>
+  </aside>
+
   <section id="rebuildOverlay" class="rebuild-overlay" aria-live="polite">
     <canvas id="rebuildCanvas"></canvas>
     <div class="rebuild-console">
