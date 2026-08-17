@@ -150,6 +150,39 @@ OPENWEBUI_URL = os.getenv(
 ).rstrip("/")
 OPENWEBUI_API_KEY = os.getenv("OPENWEBUI_API_KEY", "")
 
+# #786: THE SHELL LEDGER — every terminal command this process runs, seen.
+# subprocess.run is called from a dozen roads (ffmpeg, probes, tools); one
+# shim at the source records them all for the repair ledger's terminal view.
+# (The call sites import subprocess lazily inside functions; they all get
+# this same patched module object.)
+import subprocess
+
+_SHELL_LEDGER: list[dict[str, Any]] = []
+_real_subprocess_run = subprocess.run
+
+
+def _ledgered_subprocess_run(*args: Any, **kwargs: Any) -> Any:
+    cmd = args[0] if args else kwargs.get("args")
+    pretty = (" ".join(str(c) for c in cmd)
+              if isinstance(cmd, (list, tuple)) else str(cmd))[:240]
+    t0 = time.time()
+    entry: dict[str, Any] = {"ts": int(t0 * 1000), "cmd": pretty,
+                             "ms": None, "rc": None}
+    _SHELL_LEDGER.insert(0, entry)
+    del _SHELL_LEDGER[80:]
+    try:
+        out = _real_subprocess_run(*args, **kwargs)
+        entry["rc"] = getattr(out, "returncode", None)
+        return out
+    except Exception as exc:                                    # noqa: BLE001
+        entry["rc"] = type(exc).__name__
+        raise
+    finally:
+        entry["ms"] = int((time.time() - t0) * 1000)
+
+
+subprocess.run = _ledgered_subprocess_run
+
 HA_URL = os.getenv("HA_URL", "http://127.0.0.1:8123").rstrip("/")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 HA_TTS_ENTITY = os.getenv("HA_TTS_ENTITY", "tts.piper")
@@ -38008,6 +38041,9 @@ async def perf(
     total = mem.get("MemTotal", 0)
     avail = mem.get("MemAvailable", 0)
     out: dict[str, Any] = {
+        # #786: the shell ledger — every terminal command this process ran,
+        # newest first, for the repair ledger's live terminal.
+        "shell": _SHELL_LEDGER[:30],
         "ram_pct": round(100 * (total - avail) / total, 1) if total else 0,
         "ram_used_gb": round((total - avail) / 1048576, 1),
         "ram_total_gb": round(total / 1048576, 1),
@@ -40817,6 +40853,11 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
     border-left: 0; border-top: 1px solid var(--border);
   }
 }
+
+/* #786: the two columns start LEVEL — whatever section lands first in
+   either column, its top margin is the same zero. */
+main > .col-left > section:first-child,
+main > aside > section:first-child { margin-top: 0 !important; }
 
 /* #786: the rhetoric cloud is a living thing — every survivor undulates on
    its own clock, and a forgotten word dissolves instead of blinking out. */
@@ -56790,36 +56831,182 @@ function djRepairBanner(repairing, log) {
 }
 
 function djRepairPopup() {
+  // #786: mission control. The ledger keeps its history, and beside it:
+  // a live terminal tailing every command the Spark runs (click a line for
+  // the full operation), loading bars for work in flight, the MPX marquee,
+  // and pie + bar readouts of the machine and its services — in parallel.
   const open = document.getElementById("djRepairModal");
   if (open) { open.remove(); return; }
   const shade = el("div", "", "");
   shade.id = "djRepairModal";
   shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
     + "z-index:230;display:flex;align-items:center;justify-content:center";
-  shade.onclick = (event) => { if (event.target === shade) shade.remove(); };
+  let timer = 0;
+  const closeAll = () => { clearInterval(timer); shade.remove(); };
+  shade.onclick = (event) => { if (event.target === shade) closeAll(); };
   const card = el("div", "panel", "");
-  card.style.cssText = "max-width:560px;width:92%;max-height:78vh;margin:0;"
+  card.style.cssText = "width:min(940px,96vw);max-height:88vh;margin:0;"
     + "overflow-y:auto;padding:14px 18px";
-  card.appendChild(el("h2", "", "🛠 The repair ledger"));
-  card.lastChild.style.margin = "0 0 4px";
-  const sub = el("div", "muted",
-    "Everything the machinery did to keep itself on air, newest first.");
-  sub.style.cssText = "font-size:12px;margin-bottom:10px";
-  card.appendChild(sub);
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:10px";
+  head.appendChild(el("h2", "", "🛠 The repair ledger"));
+  head.firstChild.style.margin = "0";
+  const mpx = el("div", "", "");
+  mpx.style.cssText = "flex:1;overflow:hidden;white-space:nowrap;"
+    + "-webkit-mask-image:linear-gradient(90deg,transparent,#000 8%,#000 92%,"
+    + "transparent);mask-image:linear-gradient(90deg,transparent,#000 8%,"
+    + "#000 92%,transparent)";
+  const mpxRun = el("span", "", "· MPX · PILOT 19kHz · L+R · L−R · RDS · "
+    + "THE MACHINERY IS ON ITS OWN SIDE · MPX · PILOT 19kHz · L+R · L−R · "
+    + "RDS · THE MACHINERY IS ON ITS OWN SIDE ");
+  mpxRun.style.cssText = "display:inline-block;font-size:10px;"
+    + "letter-spacing:.18em;color:var(--accent);opacity:.7;"
+    + "animation:mpxMarq 24s linear infinite";
+  mpx.appendChild(mpxRun);
+  head.appendChild(mpx);
+  const shut = el("button", "", "✕");
+  shut.onclick = closeAll;
+  head.appendChild(shut);
+  card.appendChild(head);
+  const grid = el("div", "", "");
+  grid.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,"
+    + "minmax(min(380px,100%),1fr));gap:16px;margin-top:10px";
+  card.appendChild(grid);
+
+  // ---- left: the ledger + the live terminal -----------------------------
+  const left = el("div", "", "");
+  left.appendChild(el("h4", "", "What the machinery did"));
+  const ledger = el("div", "", "");
   if (!djRepairLog.length) {
-    card.appendChild(el("div", "muted", "No repairs on record — clean shift."));
+    ledger.appendChild(el("div", "muted", "No repairs on record — clean shift."));
   }
   djRepairLog.slice().reverse().forEach((row) => {
     const line = el("div", "", "");
     line.style.cssText = "padding:5px 0;border-bottom:1px solid var(--border);"
-      + "font-size:13px;line-height:1.45";
+      + "font-size:12.5px;line-height:1.45";
     const when = el("span", "muted",
       new Date((row.at || 0) * 1000).toLocaleTimeString() + " — ");
     when.style.fontSize = "11px";
     line.appendChild(when);
     line.appendChild(document.createTextNode(row.what || ""));
-    card.appendChild(line);
+    ledger.appendChild(line);
   });
+  left.appendChild(ledger);
+  left.appendChild(el("h4", "", "The terminal — every command, live"));
+  const term = el("div", "", "");
+  term.style.cssText = "background:#03070c;border:1px solid var(--border);"
+    + "border-radius:8px;padding:8px 10px;font:11px/1.7 ui-monospace,Consolas,"
+    + "monospace;min-height:104px";
+  left.appendChild(term);
+  const termNote = el("div", "muted",
+    "click a line for the whole operation");
+  termNote.style.cssText = "font-size:10px;margin-top:4px";
+  left.appendChild(termNote);
+  grid.appendChild(left);
+
+  // ---- right: the machine, in parallel ----------------------------------
+  const right = el("div", "", "");
+  right.appendChild(el("h4", "", "The Spark, right now"));
+  const pieRow = el("div", "", "");
+  pieRow.style.cssText = "display:flex;gap:14px;align-items:center;"
+    + "margin-bottom:10px";
+  const pie = el("div", "", "");
+  pie.style.cssText = "flex:0 0 74px;width:74px;height:74px;border-radius:50%;"
+    + "border:1px solid var(--border);transition:background .6s ease";
+  const pieLbl = el("div", "muted", "cpu —");
+  pieRow.appendChild(pie); pieRow.appendChild(pieLbl);
+  right.appendChild(pieRow);
+  const bars = el("div", "", "");
+  right.appendChild(bars);
+  right.appendChild(el("h4", "", "Servers & services"));
+  const svc = el("div", "", "");
+  svc.style.cssText = "font-size:12px;line-height:1.8";
+  right.appendChild(svc);
+  grid.appendChild(right);
+
+  const barRow = (label, pct, text, hot) =>
+    "<div style='display:flex;align-items:center;gap:8px;margin:4px 0;"
+    + "font-size:11px'><span style='flex:0 0 44px;color:var(--muted)'>"
+    + label + "</span><div style='flex:1;height:9px;border-radius:5px;"
+    + "background:#10141c;border:1px solid var(--border);overflow:hidden'>"
+    + "<div style='height:100%;width:" + Math.max(0, Math.min(100, pct))
+    + "%;background:" + (hot ? "var(--danger)" : "var(--accent)")
+    + ";transition:width .6s ease'></div></div><b style='flex:0 0 86px;"
+    + "font-size:11px'>" + text + "</b></div>";
+
+  async function paint() {
+    try {
+      const d = await api("/api/perf");
+      const cpu = Number(d.cpu_pct ?? d.cpu ?? 0);
+      pie.style.background = "conic-gradient(var(--accent) 0 " + cpu
+        + "%, #1d2330 " + cpu + "% 100%)";
+      pieLbl.textContent = "cpu " + cpu + "% · load " + (d.load1 ?? d.load ?? "—");
+      let h = "";
+      h += barRow("ram", d.ram_pct || 0,
+        (d.ram_used_gb ?? "—") + "/" + (d.ram_total_gb ?? "—") + " GB");
+      if (d.vram_pct != null || d.vram_used_gb != null) {
+        h += barRow("vram", d.vram_pct || 0,
+          (d.vram_used_gb ?? "—") + "/" + (d.vram_total_gb ?? "—") + " GB");
+      }
+      if (d.temp_c != null) {
+        h += barRow("temp", Math.min(100, d.temp_c), d.temp_c + "°C",
+          d.temp_c > 85);
+      }
+      if (d.disk_pct != null) {
+        h += barRow("disk", d.disk_pct, d.disk_pct + "%", d.disk_pct > 92);
+      }
+      bars.innerHTML = h;
+      term.innerHTML = "";
+      (d.shell || []).slice(0, 5).forEach((row) => {
+        const line = el("div", "", "");
+        line.style.cssText = "cursor:pointer;overflow:hidden;"
+          + "text-overflow:ellipsis;white-space:nowrap;color:"
+          + (row.rc === 0 || row.rc === null ? "#9fd0ff"
+             : row.rc ? "#ef6461" : "#9fd0ff");
+        line.textContent = "$ " + row.cmd;
+        if (row.ms === null) {
+          // Work IN FLIGHT gets a loading bar under the line.
+          const load = el("div", "", "");
+          load.style.cssText = "height:2px;border-radius:2px;margin:1px 0 3px;"
+            + "background:linear-gradient(90deg,transparent,var(--accent),"
+            + "transparent);background-size:200% 100%;"
+            + "animation:mpxMarq 1.1s linear infinite";
+          line.after && line.appendChild(load);
+        }
+        line.onclick = () => {
+          const pop = el("div", "panel", "");
+          pop.style.cssText = "position:fixed;z-index:260;left:50%;top:50%;"
+            + "transform:translate(-50%,-50%);width:min(640px,92vw);"
+            + "max-height:60vh;overflow:auto;padding:14px 16px;"
+            + "box-shadow:0 24px 70px rgba(0,0,0,.7)";
+          pop.innerHTML = "<h4 style='margin:0 0 8px'>the operation</h4>"
+            + "<pre style='white-space:pre-wrap;font-size:12px;margin:0'>"
+            + "when: " + new Date(row.ts).toLocaleTimeString() + "\n"
+            + "took: " + (row.ms === null ? "still running…" : row.ms + " ms")
+            + "\nexit: " + (row.rc === null ? "—" : row.rc) + "\n\n"
+            + String(row.cmd).replace(/[<>&]/g, (c) =>
+                ({"<": "&lt;", ">": "&gt;", "&": "&amp;"}[c])) + "</pre>";
+          const x = el("button", "", "✕");
+          x.style.cssText = "position:absolute;top:8px;right:10px";
+          x.onclick = () => pop.remove();
+          pop.appendChild(x);
+          document.body.appendChild(pop);
+        };
+        term.appendChild(line);
+      });
+      if (!(d.shell || []).length) {
+        term.textContent = "$ quiet — no commands in the last stretch";
+      }
+    } catch (e) {}
+    try {
+      const h = await api("/health");
+      svc.innerHTML = Object.entries(h.services || {}).map(([k, v]) =>
+        "<div>" + (v === "ok" ? "🟢" : "🔴") + " " + k + " — " + v + "</div>")
+        .join("") + "<div>🟢 model — " + (h.model || "?") + "</div>";
+    } catch (e) {}
+  }
+  paint();
+  timer = setInterval(paint, 2500);
   shade.appendChild(card);
   document.body.appendChild(shade);
 }

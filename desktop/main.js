@@ -518,11 +518,16 @@ function createWindow() {
     callback(["media", "microphone", "camera", "fullscreen", "display-capture"].includes(permission));
   });
 
+  // #786: the window comes back EXACTLY as it was left — size and place —
+  // and the minimums match the responsive chrome (it genuinely works small).
+  const savedBounds = (readConfig().bounds || null);
   win = new BrowserWindow({
-    width: 1480,
-    height: 940,
-    minWidth: 1100,
-    minHeight: 720,
+    width: savedBounds ? savedBounds.width : 1480,
+    height: savedBounds ? savedBounds.height : 940,
+    ...(savedBounds && Number.isFinite(savedBounds.x)
+      ? { x: savedBounds.x, y: savedBounds.y } : {}),
+    minWidth: 520,
+    minHeight: 420,
     title: "Pine Box Desktop",
     backgroundColor: "#101419",
     webPreferences: {
@@ -533,6 +538,18 @@ function createWindow() {
       sandbox: false
     }
   });
+  let boundsTimer = null;
+  const rememberBounds = () => {
+    clearTimeout(boundsTimer);
+    boundsTimer = setTimeout(() => {
+      try {
+        if (!win || win.isDestroyed() || win.isMinimized()) return;
+        writeConfig({ ...readConfig(), bounds: win.getBounds() });
+      } catch (error) {}
+    }, 600);
+  };
+  win.on("resize", rememberBounds);
+  win.on("move", rememberBounds);
   win.loadFile(path.join(__dirname, "renderer", "index.html"));
 }
 
