@@ -218,9 +218,11 @@ WEATHER_DEFAULT_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "")
 #             preset voices). Experimental — listed down until the host
 #             actually serves it; nothing depends on it being up.
 VOICE_ENGINES = ("ha", "piper", "ha_file", "browser", "xtts", "f5",
-                 "voxtral")
+                 "voxtral", "cosyvoice", "indextts", "voxcpm", "kokoro",
+                 "qwen_tts")
 # Only these can hand back bytes; the others just make sound.
-VOICE_FILE_ENGINES = ("piper", "ha_file", "xtts", "f5", "voxtral")
+VOICE_FILE_ENGINES = ("piper", "ha_file", "xtts", "f5", "voxtral",
+                      "cosyvoice", "indextts", "voxcpm", "kokoro", "qwen_tts")
 
 # Speech IN is a separate wyoming service; the popup names it so the whole
 # voice path is visible in one place.
@@ -270,6 +272,54 @@ XTTS_MAX_CHARS = 950
 #   ~/reachy-gateway/scripts/voxtral_up.sh
 VOXTRAL_URL = os.getenv("VOXTRAL_URL", "http://127.0.0.1:8000").rstrip("/")
 VOXTRAL_MODEL = os.getenv("VOXTRAL_MODEL", "mistralai/Voxtral-4B-TTS-2603")
+
+# #786: the engine bench. Five more neural voices the operator can cycle
+# between on the fly, assign to roles (host/cohost/caller/…), and — for the
+# fast small ones — use as STAND-INS that speak instantly while a slower,
+# higher-fidelity engine renders the take that matters. Each is an adapter
+# that lights up the moment its server answers (the Voxtral precedent); the
+# host stands the servers up, the station notices. Two contract families:
+#   clone   — base64 reference audio → 24kHz WAV, errors-as-200 (XTTS/F5)
+#   openai  — POST /v1/audio/speech {model,input,voice} → audio (Kokoro etc.)
+# `speed` is the stand-in ranking: lower renders faster, so a lower number
+# is a better instant stand-in while a heavier engine works.
+COSYVOICE_URL = os.getenv("COSYVOICE_URL", "http://127.0.0.1:8773").rstrip("/")
+INDEXTTS_URL = os.getenv("INDEXTTS_URL", "http://127.0.0.1:8774").rstrip("/")
+VOXCPM_URL = os.getenv("VOXCPM_URL", "http://127.0.0.1:8775").rstrip("/")
+KOKORO_URL = os.getenv("KOKORO_URL", "http://127.0.0.1:8776").rstrip("/")
+QWEN_TTS_URL = os.getenv("QWEN_TTS_URL", "http://127.0.0.1:8777").rstrip("/")
+
+# name -> everything the rest of the system needs to inherit it. `clone`
+# engines route library vl_* voices (they take a reference); `preset`
+# engines carry their own built-in voices (fast, no reference — the ideal
+# stand-ins). `standin` marks the ones fast enough to cover a slow take.
+ENGINE_REGISTRY: dict[str, dict[str, Any]] = {
+    "xtts":      {"url": XTTS_URL, "family": "clone", "label": "XTTS v2",
+                  "speed": 34, "standin": False, "default_voice": ""},
+    "f5":        {"url": F5_URL, "family": "clone", "label": "F5-TTS",
+                  "speed": 13, "standin": False, "default_voice": ""},
+    "cosyvoice": {"url": COSYVOICE_URL, "family": "clone",
+                  "label": "FunCosyVoice 3 0.5B", "speed": 8,
+                  "standin": True, "default_voice": ""},
+    "indextts":  {"url": INDEXTTS_URL, "family": "clone",
+                  "label": "IndexTTS 2.5", "speed": 12,
+                  "standin": False, "default_voice": ""},
+    "voxcpm":    {"url": VOXCPM_URL, "family": "clone", "label": "VoxCPM2",
+                  "speed": 9, "standin": True, "default_voice": ""},
+    "kokoro":    {"url": KOKORO_URL, "family": "openai", "label": "Kokoro",
+                  "speed": 2, "standin": True, "default_voice": "af_heart",
+                  "model": os.getenv("KOKORO_MODEL", "kokoro")},
+    "qwen_tts":  {"url": QWEN_TTS_URL, "family": "openai",
+                  "label": "Qwen3-TTS 0.6B", "speed": 4, "standin": True,
+                  "default_voice": "cherry",
+                  "model": os.getenv("QWEN_TTS_MODEL", "qwen3-tts-0.6b")},
+}
+# Health cache per engine, same shape as _XTTS_HEALTH.
+_ENGINE_HEALTH: dict[str, dict[str, Any]] = {
+    name: {"at": 0.0, "ready": False, "detail": ""} for name in ENGINE_REGISTRY
+}
+# Roles the operator can pin an engine to; "" on any of them means "auto".
+VOICE_ROLES = ("dj", "cohost", "third", "caller", "drop", "guest")
 # voice-lab sidecar: YouTube/file ingest, transcripts, diarization, vocal
 # signatures. A separate container because its dependency stack (torch,
 # whisper, pyannote) must never ride along on spark-agent's boot pip.
@@ -529,6 +579,14 @@ DEFAULT_DJ = {
     # "xtts" or "f5" forces the whole library onto one engine so the
     # two can be compared on the same voices, same night.
     "clone_engine": "",
+    # #786: the engine bench. Pin an engine to a role (a preset engine like
+    # Kokoro makes that role render instantly in its own voice; a clone
+    # engine renders that role's clone voice through it); "" = auto. And the
+    # STAND-IN engine — the fast preset voice that speaks ordinary lines the
+    # moment the clones fall behind, so the show never waits on a slow render
+    # for a throwaway line while the heavy engine is saved for what matters.
+    "role_engine": {},
+    "standin_engine": "",
     # Cover Art Archive, keyed on a MusicBrainz release — an actual API, so
     # what comes back is the record's own cover (#123, #130).
     "art_lookup": True,
@@ -1106,6 +1164,14 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "clone_engine": (str(raw_dj.get("clone_engine") or "")
                          if str(raw_dj.get("clone_engine") or "")
                          in ("xtts", "f5") else ""),
+        "role_engine": {
+            role: str((raw_dj.get("role_engine") or {}).get(role) or "")
+            for role in VOICE_ROLES
+            if str((raw_dj.get("role_engine") or {}).get(role) or "")
+            in ENGINE_REGISTRY},
+        "standin_engine": (str(raw_dj.get("standin_engine") or "")
+                           if str(raw_dj.get("standin_engine") or "")
+                           in ENGINE_REGISTRY else ""),
         "art_lookup": bool(raw_dj.get("art_lookup", True)),
         "art_search": bool(raw_dj.get("art_search", False)),
         "sfx": bool(raw_dj.get("sfx", True)),
@@ -5468,6 +5534,110 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
         return resp.content              # 24 kHz mono s16 WAV
 
 
+# --- The engine bench (#786): generalized clone + preset adapters ----------
+
+
+async def _clone_synthesize(engine: str, text: str, voice: str) -> bytes:
+    """One adapter for every zero-shot CLONE engine on the bench — CosyVoice,
+    IndexTTS, VoxCPM — the exact XTTS/F5 contract (base64 reference audio in,
+    24kHz WAV out, failures-as-200 so content-type is the truth) against the
+    engine's own port. New clone servers built to this contract need no code."""
+    url = str(ENGINE_REGISTRY[engine]["url"])
+    ref = voice_ref_path(voice)
+    if ref is None:
+        raise RuntimeError(f"no reference recording for voice {voice!r}")
+    try:
+        rate = float(dj_settings().get("speech_rate") or 1.0)
+    except Exception:  # noqa: BLE001
+        rate = 1.0
+    payload = {
+        "text": _xtts_sanitize(text)[:XTTS_MAX_CHARS],
+        "reference_audio": base64.b64encode(ref.read_bytes()).decode(),
+        "language": "en",
+        "opts": {"speed": max(0.75, min(1.25, rate))},
+    }
+    async with httpx.AsyncClient(timeout=120) as client:
+        resp = await client.post(f"{url}/synthesize", json=payload)
+        resp.raise_for_status()
+        if not resp.headers.get("content-type", "").startswith("audio/"):
+            try:
+                detail = str((resp.json() or {}).get("error")
+                             or resp.json())[:200]
+            except Exception:  # noqa: BLE001
+                detail = resp.text[:200]
+            raise RuntimeError(f"{engine} refused: {detail}")
+        _ENGINE_HEALTH[engine].update(
+            {"at": time.time(), "ready": True, "detail": ""})
+        return resp.content
+
+
+async def _openai_speech(engine: str, text: str, voice: str) -> tuple[bytes, str]:
+    """One adapter for every PRESET engine served OpenAI-compatibly — Kokoro,
+    Qwen3-TTS (and Voxtral shares the shape). POST /v1/audio/speech with a
+    built-in voice name; these are the fast, no-reference engines that make
+    the best instant stand-ins."""
+    spec = ENGINE_REGISTRY[engine]
+    url = str(spec["url"])
+    # A preset engine has no idea what a vl_* library clone id is — a role
+    # pinned to it, or a stand-in borrow, means "speak in YOUR own voice".
+    v = (voice or "").strip()
+    if not v or VOICE_ID_SHAPE.match(v):
+        v = str(spec.get("default_voice") or "")
+    payload = {
+        "model": str(spec.get("model") or engine),
+        "input": text[:2000],
+        "voice": v,
+        "response_format": "wav",
+    }
+    async with httpx.AsyncClient(timeout=90) as client:
+        resp = await client.post(f"{url}/v1/audio/speech", json=payload)
+        resp.raise_for_status()
+        if resp.headers.get("content-type", "").startswith("audio/"):
+            _ENGINE_HEALTH[engine].update(
+                {"at": time.time(), "ready": True, "detail": ""})
+            return resp.content, "wav"
+        try:
+            body = resp.json() or {}
+            b64 = str(body.get("audio_b64") or body.get("audio") or "")
+            if b64:
+                _ENGINE_HEALTH[engine].update(
+                    {"at": time.time(), "ready": True, "detail": ""})
+                return base64.b64decode(b64), "wav"
+        except Exception:  # noqa: BLE001
+            pass
+        raise RuntimeError(f"{engine} returned no audio: {resp.text[:200]}")
+
+
+async def engine_health(engine: str, force: bool = False) -> dict[str, Any]:
+    """Is a bench engine up? Registry-driven; caches 30s like its siblings."""
+    if engine == "xtts":
+        return await xtts_health(force=force)
+    if engine == "f5":
+        return await f5_health(force=force)
+    if engine == "voxtral":
+        return await voxtral_health(force=force)
+    if engine not in ENGINE_REGISTRY:
+        return {"at": time.time(), "ready": engine in ("piper", "ha", "ha_file",
+                "browser"), "detail": ""}
+    slot = _ENGINE_HEALTH[engine]
+    if not force and time.time() - float(slot["at"]) < 30:
+        return dict(slot)
+    slot["at"] = time.time()
+    url = str(ENGINE_REGISTRY[engine]["url"])
+    try:
+        async with httpx.AsyncClient(timeout=4) as client:
+            reply = await client.get(f"{url}/health")
+        if reply.status_code >= 400:
+            slot.update({"ready": False, "detail": f"HTTP {reply.status_code}"})
+        else:
+            data = reply.json() if reply.content else {}
+            slot.update({"ready": bool(data.get("ready", True)),
+                         "detail": str(data.get("detail") or "answering")})
+    except Exception as exc:  # noqa: BLE001
+        slot.update({"ready": False, "detail": f"unreachable — {exc}"[:120]})
+    return dict(slot)
+
+
 async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
     """THE seam. Add an engine here and the rest of the system inherits it."""
     if engine == "piper":
@@ -5480,6 +5650,14 @@ async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
         return await asyncio.wait_for(_f5_synthesize(text, voice), 150), "wav"
     if engine == "voxtral":
         return await asyncio.wait_for(_voxtral_synthesize(text, voice), 120)
+    # #786: the bench. Clone engines share the base64-reference contract;
+    # preset engines share the OpenAI speech contract.
+    spec = ENGINE_REGISTRY.get(engine)
+    if spec and spec["family"] == "clone":
+        return await asyncio.wait_for(
+            _clone_synthesize(engine, text, voice), 150), "wav"
+    if spec and spec["family"] == "openai":
+        return await asyncio.wait_for(_openai_speech(engine, text, voice), 90)
     raise RuntimeError(f"the {engine} engine produces no audio file")
 
 
@@ -6369,12 +6547,49 @@ def render_relief() -> bool:
     return _RENDER_RELIEF[0]
 
 
-def voice_engine_for(voice: str) -> str:
+def _ready_standin_engine() -> str:
+    """#786: the fast preset engine that stands in for a slow clone render —
+    the operator's pick if it is up, else the fastest bench stand-in that is
+    ready right now, else Piper. Reads the cached healths (sync, a hint)."""
+    pick = str(dj_settings().get("standin_engine") or "")
+    if pick and pick in ENGINE_REGISTRY and _ENGINE_HEALTH.get(
+            pick, {}).get("ready"):
+        return pick
+    ready = [(spec["speed"], name) for name, spec in ENGINE_REGISTRY.items()
+             if spec.get("standin") and _ENGINE_HEALTH.get(
+                 name, {}).get("ready")]
+    if ready:
+        return min(ready)[1]
+    return "piper"
+
+
+def role_engine_for(who: str) -> str:
+    """The engine an operator pinned to a role, if any and if it is on the
+    bench. '' means auto — the voice name routes as before."""
+    role = {"host": "dj"}.get(who, who)
+    pinned = str((dj_settings().get("role_engine") or {}).get(role) or "")
+    return pinned if pinned in ENGINE_REGISTRY else ""
+
+
+def voice_engine_for(voice: str, who: str = "") -> str:
     """The voice NAME is the engine router. vl_* ids belong to the library
     (usually xtts), Voxtral preset names to voxtral, everything else is a
     Piper voice. This is what lets a cloned cohost be pure configuration —
-    no engine parameter threads through six call sites."""
+    no engine parameter threads through six call sites.
+
+    #786: a role PINNED to a bench engine outranks the voice's own routing —
+    a clone engine renders this role's clone voice, a preset engine renders
+    the role in its own fast built-in voice (the preset adapter ignores the
+    clone id)."""
     voice = (voice or "").strip()
+    pinned = role_engine_for(who) if who else ""
+    if pinned:
+        spec = ENGINE_REGISTRY[pinned]
+        # A preset engine can carry any role instantly; a clone engine only
+        # helps a role whose voice is actually a clone.
+        if spec["family"] == "openai" or (
+                spec["family"] == "clone" and VOICE_ID_SHAPE.match(voice)):
+            return pinned
     if VOICE_ID_SHAPE.match(voice):
         meta = voice_meta(voice)
         engine = str((meta or {}).get("engine") or "xtts")
@@ -6384,19 +6599,25 @@ def voice_engine_for(voice: str) -> str:
         # keeps it — the override only moves clones between clone
         # engines. Per-voice meta still wins when clone_engine is off.
         pick = str(dj_settings().get("clone_engine") or "")
-        if pick in ("xtts", "f5") and engine in ("xtts", "f5"):
+        if pick in ENGINE_REGISTRY and ENGINE_REGISTRY[pick]["family"] \
+                == "clone" and engine in ENGINE_REGISTRY \
+                and ENGINE_REGISTRY[engine]["family"] == "clone":
             engine = pick
         # Measured on this box: 34 seconds of synthesis, on average, for
         # eleven seconds of audio. A station that cannot render as fast as it
         # speaks goes quiet, and quiet is the one thing a stream cannot be.
-        # When the clone engine is demonstrably behind, borrow the fast one
-        # and hand the clones back the moment it recovers.
+        # When the clone engine is demonstrably behind, borrow a FAST engine
+        # and hand the clones back the moment it recovers. #786: the borrow
+        # is the operator's stand-in engine (Kokoro, CosyVoice…) — far better
+        # than Piper — falling to Piper only if none is up.
         # The configured booth cast is exempt from relief. A DJ actor cannot
-        # become Piper simply because the clone engine is momentarily busy.
+        # become a stand-in simply because the clone engine is momentarily busy.
         cast = {str(dj_settings().get(key) or "").strip()
                 for key in ("voice", "cohost_voice", "third_voice", "drop_voice")}
-        if engine in ("xtts", "f5") and render_relief() and voice not in cast:
-            return "piper"
+        clone_family = engine in ENGINE_REGISTRY and \
+            ENGINE_REGISTRY[engine]["family"] == "clone"
+        if clone_family and render_relief() and voice not in cast:
+            return _ready_standin_engine()
         return engine if engine in VOICE_FILE_ENGINES else "xtts"
     if voice in VOXTRAL_PRESETS:
         return "voxtral"
@@ -27414,6 +27635,480 @@ async def say(
     )
 
 
+# === THE VOICE DIRECTOR (#786) =============================================
+# A standalone service surface for the whole engine bench, on the Spark, that
+# any other system or application can use — not just this radio station. It
+# owns: which engines exist and are up, which engine each ROLE renders on,
+# the fast STAND-IN engine, and a single synthesize-to-file entry point that
+# takes arbitrary (text, engine, voice) and hands back a playable clip. The
+# station consumes it through the same functions; an external app consumes it
+# over these HTTP endpoints with the API key.
+
+
+async def voice_director_state() -> dict[str, Any]:
+    """Everything the Voice Director knows, in one object — the bench with
+    live health, the role assignments, the stand-in, and the capabilities so
+    a foreign caller can choose an engine without knowing this codebase."""
+    dj = dj_settings()
+    healths = await asyncio.gather(
+        *[engine_health(name) for name in ENGINE_REGISTRY],
+        return_exceptions=True)
+    bench = []
+    for (name, spec), h in zip(ENGINE_REGISTRY.items(), healths):
+        h = h if isinstance(h, dict) else {"ready": False, "detail": str(h)}
+        bench.append({
+            "id": name,
+            "label": spec["label"],
+            "family": spec["family"],          # clone | openai(preset)
+            "clones_voices": spec["family"] == "clone",
+            "own_voices": spec["family"] == "openai",
+            "good_standin": bool(spec.get("standin")),
+            "relative_speed": spec["speed"],    # lower renders faster
+            "default_voice": spec.get("default_voice") or "",
+            "url": spec["url"],
+            "ready": bool(h.get("ready")),
+            "detail": h.get("detail") or "",
+        })
+    bench.sort(key=lambda e: (not e["ready"], e["relative_speed"]))
+    return {
+        "roles": list(VOICE_ROLES),
+        "role_engine": {r: (dj.get("role_engine") or {}).get(r, "")
+                        for r in VOICE_ROLES},
+        "standin_engine": dj.get("standin_engine") or "",
+        "standin_resolved": _ready_standin_engine(),
+        "clone_engine": dj.get("clone_engine") or "",
+        "engines": bench,
+        "capabilities": {
+            "assign_roles": True, "cycle_on_the_fly": True,
+            "fast_standins": True, "arbitrary_synthesis": True,
+        },
+    }
+
+
+# --- Character profiles (#786) ---------------------------------------------
+# A character is a persistent identity the Director maintains: its voice
+# (reference audio / library clone / preset), and PERSONALITY TRAITS that
+# outlive any single line — baseline pitch, cadence, emotional range,
+# speaking rate, filler-word frequency, breathiness, interruption behavior.
+# The conversational LLM does not re-describe the voice each line; it tells
+# the Director how the character FEELS right now (the emotion vector), and
+# the Director combines stored traits + current feeling into the performance
+# of the next line. The voice stays the person; only the weather changes.
+
+CHARACTER_DIR = data_path("voice_characters")
+CHARACTER_TRAITS = ("baseline_pitch", "cadence", "emotional_range",
+                    "speaking_rate", "filler_frequency", "breathiness",
+                    "interruption")
+_TRAIT_DEFAULT = {"baseline_pitch": 0.5, "cadence": 0.5,
+                  "emotional_range": 0.5, "speaking_rate": 0.5,
+                  "filler_frequency": 0.3, "breathiness": 0.3,
+                  "interruption": 0.3}
+
+
+def _character_path(cid: str) -> Path:
+    safe = re.sub(r"[^a-z0-9_-]", "", (cid or "").lower())[:48]
+    return CHARACTER_DIR / f"{safe}.json"
+
+
+def read_character(cid: str) -> dict[str, Any] | None:
+    try:
+        data = json.loads(_character_path(cid).read_text())
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def list_characters() -> list[dict[str, Any]]:
+    out = []
+    try:
+        for p in sorted(CHARACTER_DIR.glob("*.json")):
+            try:
+                out.append(json.loads(p.read_text()))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return out
+
+
+def save_character(data: dict[str, Any]) -> dict[str, Any]:
+    cid = re.sub(r"[^a-z0-9_-]", "",
+                 str(data.get("id") or "").lower())[:48]
+    if not cid:
+        raise ValueError("character id required")
+    traits = {t: max(0.0, min(1.0, float(
+        (data.get("traits") or {}).get(t, _TRAIT_DEFAULT[t]))))
+        for t in CHARACTER_TRAITS}
+    rec = {
+        "id": cid,
+        "name": str(data.get("name") or cid)[:80],
+        "voice": str(data.get("voice") or "").strip(),
+        "engine": (str(data.get("engine") or "").strip()
+                   if str(data.get("engine") or "") in VOICE_ENGINES else ""),
+        "traits": traits,
+        "base_emotion": {d: max(0.0, min(1.0, float(
+            (data.get("base_emotion") or {}).get(d, 0.0))))
+            for d in EMOTION_DIMS},
+        "notes": str(data.get("notes") or "")[:400],
+    }
+    CHARACTER_DIR.mkdir(parents=True, exist_ok=True)
+    _character_path(cid).write_text(json.dumps(rec, indent=2))
+    return rec
+
+
+def character_key(cid: str) -> str:
+    """The speaker_state key a character's live feeling lives under, so the
+    existing inertia/decay machinery carries it between lines (#786)."""
+    return f"char:{cid}"
+
+
+def character_perf(cid: str) -> dict[str, Any]:
+    """Stored traits + the character's CURRENT feeling → the synthesis knobs
+    for the next line, WITHOUT recreating the voice. Traits set the baseline;
+    the live emotion vector (set by the LLM via /feel) bends it, scaled by
+    the character's own emotional_range so a flat character stays flat and an
+    expressive one swings."""
+    rec = read_character(cid) or {}
+    traits = {**_TRAIT_DEFAULT, **(rec.get("traits") or {})}
+    feel = speaker_state(character_key(cid))       # live, with inertia
+    rng = traits["emotional_range"]
+    # speaking_rate 0..1 → 0.8..1.2 speed; range widens under excitement.
+    rate = 0.8 + traits["speaking_rate"] * 0.4
+    rate += (feel.get("excitement", 0) - feel.get("fatigue", 0)) * 0.12 * rng
+    return {
+        "voice": rec.get("voice") or "",
+        "engine": rec.get("engine") or "",
+        "speed": round(max(0.7, min(1.3, rate)), 3),
+        "perf": {
+            "pace": round(0.9 + traits["cadence"] * 0.2
+                          + feel.get("excitement", 0) * 0.15 * rng, 3),
+            "pitch_st": round((traits["baseline_pitch"] - 0.5) * 4
+                              + feel.get("nervousness", 0) * 2 * rng, 2),
+            "pitch_var": round(0.8 + traits["emotional_range"] * 0.5
+                               + feel.get("amusement", 0) * 0.3 * rng, 3),
+            "energy": round((feel.get("excitement", 0)
+                             - feel.get("fatigue", 0)) * 0.4 * rng, 3),
+            "filler": round(traits["filler_frequency"]
+                            + feel.get("confusion", 0) * 0.2 * rng, 3),
+            "breath": round(traits["breathiness"], 3),
+            "cutoff": round(traits["interruption"]
+                            + feel.get("irritation", 0) * 0.2 * rng, 3),
+        },
+        "feel": {d: round(feel.get(d, 0.0), 3) for d in EMOTION_DIMS},
+        "traits": traits,
+    }
+
+
+@app.get("/api/voice/director")
+async def voice_director_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The Voice Director's whole state — engines, health, role assignments,
+    and the character roster."""
+    require_read_auth(authorization)
+    state = await voice_director_state()
+    state["characters"] = [
+        {"id": c.get("id"), "name": c.get("name"), "voice": c.get("voice"),
+         "engine": c.get("engine"), "traits": c.get("traits")}
+        for c in list_characters()]
+    return state
+
+
+@app.get("/api/voice/director/character/{cid}")
+async def voice_character_get(
+    cid: str, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    rec = read_character(cid)
+    if not rec:
+        raise HTTPException(status_code=404, detail="No such character")
+    rec["live"] = character_perf(cid)
+    return rec
+
+
+@app.put("/api/voice/director/character/{cid}")
+async def voice_character_put(
+    cid: str, request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Create or update a character — its voice and its lasting traits."""
+    require_auth(authorization)
+    payload = await request.json()
+    payload["id"] = cid
+    try:
+        return save_character(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/voice/director/feel")
+async def voice_character_feel(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """THE LLM INTERFACE. The conversational model tells the Director how a
+    character feels right now — it does NOT recreate the voice. Body:
+      {"character": "skip",
+       "emotion": {"amusement": 0.6, "irritation": 0.2, ...},   # 0..1 dims
+       "macro": "flustered",    # optional named mood over the vector
+       "note": "just heard the news"}                            # optional
+    The feeling carries forward with inertia (§30) and cools between lines;
+    the very next /say for this character delivers it against the stored
+    traits. Returns the resolved performance the next line will use."""
+    require_auth(authorization)
+    payload = await request.json()
+    cid = str(payload.get("character") or "").strip()
+    if not cid or not read_character(cid):
+        raise HTTPException(status_code=404, detail="No such character")
+    key = character_key(cid)
+    emotion = payload.get("emotion") or {}
+    event = {d: max(0.0, min(1.0, float(emotion.get(d) or 0.0)))
+             for d in EMOTION_DIMS if d in emotion}
+    # A free-text note also seeds the vector, so the LLM can just say how it
+    # feels in words if it prefers numbers it does not have.
+    note = str(payload.get("note") or "")
+    if note:
+        for d, v in state_from_text(note).items():
+            event[d] = max(event.get(d, 0.0), v)
+    if event:
+        state_bump(key, event)
+    macro = str(payload.get("macro") or "").strip()
+    if macro in MACRO_STATES:
+        _RADIO.setdefault("speaker_macro", {})[key] = macro
+    elif macro == "":
+        (_RADIO.get("speaker_macro") or {}).pop(key, None)
+    return {"character": cid, "live": character_perf(cid)}
+
+
+@app.post("/api/voice/director/assign")
+async def voice_director_assign(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Cycle engines and pin them to roles ON THE FLY. Body accepts any of:
+      {"role": "caller", "engine": "kokoro"}   pin a role (|"" to release)
+      {"standin_engine": "cosyvoice"}          the fast stand-in
+      {"clone_engine": "f5"}                    force the clone library engine
+    Takes effect on the very next line — nothing to restart."""
+    require_auth(authorization)
+    payload = await request.json()
+    settings = load_settings()
+    dj = settings.setdefault("dj", {})
+    role = str(payload.get("role") or "").strip()
+    if role:
+        if role not in VOICE_ROLES:
+            raise HTTPException(status_code=400, detail="Unknown role")
+        engine = str(payload.get("engine") or "").strip()
+        if engine and engine not in ENGINE_REGISTRY:
+            raise HTTPException(status_code=400, detail="Unknown engine")
+        bucket = dict(dj.get("role_engine") or {})
+        if engine:
+            bucket[role] = engine
+        else:
+            bucket.pop(role, None)
+        dj["role_engine"] = bucket
+    if "standin_engine" in payload:
+        se = str(payload.get("standin_engine") or "").strip()
+        dj["standin_engine"] = se if se in ENGINE_REGISTRY else ""
+    if "clone_engine" in payload:
+        ce = str(payload.get("clone_engine") or "").strip()
+        dj["clone_engine"] = ce if ce in ("xtts", "f5") else ""
+    save_settings(settings)
+    pipeline_log("voice", f"voice director: {role or 'engine'} assignment "
+                          "updated (#786)")
+    return await voice_director_state()
+
+
+@app.post("/api/voice/director/say")
+async def voice_director_say(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The app-agnostic synthesis entry point: hand it text and an engine (or
+    a role, or a library voice) and it returns a playable clip URL. This is
+    what lets ENTIRELY OTHER systems on the network use the Spark's voice
+    bench — a notifier, a game, another assistant — without touching the radio.
+      {"text": "...", "engine": "kokoro", "voice": "af_heart"}
+      {"text": "...", "role": "caller"}       # uses that role's assigned engine
+      {"text": "...", "voice": "vl_ab12cd"}   # a library clone, auto-routed
+    Returns {url, engine, voice, seconds, ms}."""
+    require_auth(authorization)
+    payload = await request.json()
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Nothing to say")
+    who = str(payload.get("role") or "").strip()
+    voice = str(payload.get("voice") or "").strip()
+    engine = str(payload.get("engine") or "").strip()
+    fx: dict[str, Any] | None = None
+    # A character resolves to its voice + its trait-and-feeling performance,
+    # so the caller need only name WHO is speaking; the voice stays the person.
+    cid = str(payload.get("character") or "").strip()
+    if cid:
+        rec = read_character(cid)
+        if not rec:
+            raise HTTPException(status_code=404, detail="No such character")
+        live = character_perf(cid)
+        voice = voice or live["voice"]
+        engine = engine or live["engine"]
+        who = who or character_key(cid)
+        fx = {"perf": live["perf"]}
+    if engine and engine not in VOICE_ENGINES:
+        raise HTTPException(status_code=400, detail="Unknown engine")
+    if not engine:
+        engine = voice_engine_for(voice, who)
+    if not voice and engine in ENGINE_REGISTRY:
+        voice = str(ENGINE_REGISTRY[engine].get("default_voice") or "")
+    t0 = time.time()
+    clip = await voice_render_any(text, voice, engine, fx=fx, who=who)
+    if not (clip and clip.get("path")):
+        raise HTTPException(status_code=502,
+                            detail=f"the {engine} engine produced no audio")
+    return {
+        "url": f"{clip['path']}?t={clip['sig']}",
+        "engine": clip.get("engine") or engine,
+        "voice": clip.get("voice") or voice,
+        "character": cid or None,
+        "seconds": clip.get("seconds"),
+        "ms": int((time.time() - t0) * 1000),
+    }
+
+
+# Task-representative sample lines: what a caller / ad / manager / alert / sfx
+# actually sounds like, so a benchmark measures each engine on the REAL job.
+BENCH_TASKS: dict[str, str] = {
+    "caller": "Yeah, hi, longtime listener, first time calling — look, I "
+              "gotta say, that last track absolutely floored me, okay?",
+    "ad": "Pine Box Hardware — when the night is long and the solder is hot, "
+          "we are open till the last light in the valley goes dark.",
+    "manager": "Team, quick note from upstairs: the numbers are up, the "
+               "phones are lit, keep it tight through the top of the hour.",
+    "police_alert": "Attention: this is a Pine County broadcast alert. A "
+                    "situation is developing on the north ridge road. Stand by.",
+    "sfx": "Ka-chunk. Whirr. The tape deck coughs, spins up, and settles into "
+           "a low warm hum.",
+    "voice_sfx": "Static crackles — then a voice, thin and far away, breaks "
+                 "through the phone line for just a moment.",
+}
+
+
+@app.post("/api/voice/director/benchmark")
+async def voice_director_benchmark(
+    request: Request, authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Bench every ready engine on ONE task's representative line and time it,
+    so the operator can hear each and pick the best per job. Body:
+      {"task": "caller"|"ad"|"manager"|"police_alert"|"sfx"|"voice_sfx",
+       "engines": ["kokoro","f5",...],   # optional; default = all ready
+       "voice": "vl_ab12cd"}             # optional ref for the clone engines
+    Returns per engine {ms, seconds, chars_per_sec, url, ok} — lower ms and
+    higher chars_per_sec is a faster engine; listen to the url for quality."""
+    require_auth(authorization)
+    payload = await request.json()
+    task = str(payload.get("task") or "caller").strip()
+    line = BENCH_TASKS.get(task) or str(payload.get("text") or "").strip()
+    if not line:
+        raise HTTPException(status_code=400, detail="Unknown task")
+    ref_voice = str(payload.get("voice") or "").strip()
+    want = payload.get("engines") or []
+    candidates = [e for e in (want or list(ENGINE_REGISTRY))
+                  if e in ENGINE_REGISTRY]
+
+    async def _bench_one(engine: str) -> dict[str, Any]:
+        spec = ENGINE_REGISTRY[engine]
+        if not (await engine_health(engine)).get("ready"):
+            return {"engine": engine, "ok": False, "why": "not up"}
+        v = ref_voice if spec["family"] == "clone" else str(
+            spec.get("default_voice") or "")
+        t0 = time.time()
+        try:
+            clip = await voice_render_any(line, v, engine)
+        except Exception as exc:                                # noqa: BLE001
+            return {"engine": engine, "ok": False, "why": str(exc)[:120]}
+        ms = int((time.time() - t0) * 1000)
+        if not (clip and clip.get("path")):
+            return {"engine": engine, "ok": False, "why": "no audio"}
+        secs = float(clip.get("seconds") or 0)
+        return {"engine": engine, "label": spec["label"], "ok": True,
+                "ms": ms, "seconds": round(secs, 2),
+                "chars_per_sec": round(len(line) / (ms / 1000), 1) if ms else 0,
+                "realtime_x": round(secs / (ms / 1000), 2) if ms else 0,
+                "url": f"{clip['path']}?t={clip['sig']}"}
+
+    results = await asyncio.gather(*[_bench_one(e) for e in candidates])
+    ok = [r for r in results if r.get("ok")]
+    ok.sort(key=lambda r: r["ms"])
+    _RADIO.setdefault("bench", {})[task] = {"at": int(time.time()),
+                                            "results": results}
+    return {"task": task, "line": line,
+            "fastest": ok[0]["engine"] if ok else None, "results": results}
+
+
+@app.get("/api/voice/director/benchmark")
+async def voice_director_benchmark_last(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return {"tasks": list(BENCH_TASKS), "last": _RADIO.get("bench") or {}}
+
+
+@app.post("/v1/audio/speech")
+async def openai_speech(
+    request: Request, authorization: str | None = Header(default=None),
+) -> Response:
+    """OpenAI-compatible TTS, so OpenWebUI, Hermes and any tool that speaks
+    the /v1/audio/speech contract can use the Spark's whole voice bench as a
+    drop-in service. `voice` accepts a Director CHARACTER id, a library clone
+    id, an engine's own voice, or `engine:voice` (e.g. `kokoro:af_heart`).
+    Returns audio bytes (wav/mp3/opus) — not JSON — as the contract requires."""
+    require_auth(authorization)
+    payload = await request.json()
+    text = str(payload.get("input") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="input required")
+    want = str(payload.get("voice") or "").strip()
+    fmt = str(payload.get("response_format") or "wav").lower()
+    engine = ""
+    voice = want
+    who = ""
+    fx: dict[str, Any] | None = None
+    if want and read_character(want):
+        live = character_perf(want)
+        voice, engine, who = live["voice"], live["engine"], character_key(want)
+        fx = {"perf": live["perf"]}
+    elif ":" in want and want.split(":", 1)[0] in VOICE_ENGINES:
+        engine, voice = want.split(":", 1)
+    engine = engine or voice_engine_for(voice)
+    if engine in ENGINE_REGISTRY and not voice:
+        voice = str(ENGINE_REGISTRY[engine].get("default_voice") or "")
+    clip = await voice_render_any(text, voice, engine, fx=fx, who=who)
+    if not (clip and clip.get("path")):
+        raise HTTPException(status_code=502, detail="no audio produced")
+    key = Path(clip["path"]).name          # /media/<uuid>.wav → <uuid>.wav
+    src = VOICE_MEDIA_DIR / key
+    data = src.read_bytes() if src.exists() else b""
+    if not data:
+        raise HTTPException(status_code=502, detail="audio vanished")
+    # wav satisfies OpenWebUI/Hermes; transcode to mp3/opus when ffmpeg and
+    # the requested format differ, best-effort.
+    media_type = "audio/wav"
+    if fmt in ("mp3", "opus"):
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            proc = await asyncio.create_subprocess_exec(
+                exe, "-nostdin", "-loglevel", "error", "-i", "pipe:0",
+                "-f", "mp3" if fmt == "mp3" else "opus", "pipe:1",
+                stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL)
+            conv, _ = await proc.communicate(data)
+            if conv:
+                data = conv
+                media_type = "audio/mpeg" if fmt == "mp3" else "audio/opus"
+        except Exception:  # noqa: BLE001
+            pass
+    return Response(content=data, media_type=media_type)
+
+
 @app.get("/api/voice/engines")
 async def voice_engine_list(
     authorization: str | None = Header(default=None),
@@ -43505,14 +44200,15 @@ async function loadModels() {
   const select = document.getElementById("modelSelect");
   try {
     const data = await api("/api/ollama-models");
-    select.innerHTML = '<option value="">— installed models —</option>';
-    (data.models || []).forEach(name => {
-      const opt = document.createElement("option");
-      opt.value = name;
-      opt.textContent = name;
-      if (settings && name === settings.model) opt.selected = true;
-      select.appendChild(opt);
-    });
+    // #786: same ranked + badged list as the header picker (fillModelSelect
+    // is defined later in this script; call time is long after parse).
+    fillModelSelect(select, data.models || [],
+                    settings ? settings.model : "");
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "— installed models, best for the show first —";
+    select.prepend(placeholder);
+    if (!(settings && settings.model)) placeholder.selected = true;
   } catch (error) {
     // Leave the placeholder; the text field still works.
   }
@@ -72018,20 +72714,61 @@ async function switchModel(model) {
   }
 }
 
+// #786: every model picker RANKS the list for this station's needs and
+// badges what each model brings. The switch itself was always immediate
+// (/api/model applies live) — the ORDER is the guidance:
+// 🎙 quick banter writer · 🧠 deep rounds · 👁 sees images · 🛠 tool calls
+// · ⚡ tiny/instant. Embedders and whisper-class models sink to the bottom.
+function judgeModel(name) {
+  const n = String(name).toLowerCase();
+  const sized = n.match(/(\d+(?:\.\d+)?)b/);
+  const b = sized ? parseFloat(sized[1]) : (/nano|mini|tiny/.test(n) ? 3 : 8);
+  const badges = [];
+  let score = 0;
+  if (b <= 9) { badges.push("🎙"); score += 30; }
+  if (b >= 12) { badges.push("🧠"); score += 18; }
+  if (b <= 4) { badges.push("⚡"); score += 6; }
+  if (/llava|vision|moondream|-vl|vl-|gemma[34]|qwen.*vl/.test(n)) {
+    badges.push("👁"); score += 14;
+  }
+  if (/qwen|llama3\.[1-9]|llama4|mistral|nemotron|hermes|command/.test(n)) {
+    badges.push("🛠"); score += 10;
+  }
+  if (/gemma/.test(n)) score += 22;        // the family this show runs on
+  if (/qwen/.test(n)) score += 16;
+  if (/nemotron|llama/.test(n)) score += 12;
+  if (/embed|whisper|clip|bge|nomic/.test(n)) score -= 80;
+  if (b > 30) score -= 20;                 // too slow for live radio
+  return { score, badges };
+}
+
+const MODEL_LEGEND = "ranked for the station — 🎙 quick banter · 🧠 deep "
+  + "rounds · 👁 sees images · 🛠 tool calls · ⚡ tiny — switches immediately";
+
+function fillModelSelect(sel, models, current) {
+  sel.textContent = "";
+  models
+    .map((m) => {
+      const name = typeof m === "string" ? m : m.name || m.model;
+      return { name, ...judgeModel(name) };
+    })
+    .sort((a, b) => b.score - a.score)
+    .forEach((r) => {
+      const opt = document.createElement("option");
+      opt.value = r.name;
+      opt.textContent = (r.badges.join("") || "·") + " " + r.name;
+      if (r.name === current) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  sel.title = MODEL_LEGEND;
+}
+
 async function populateHeaderModel() {
   const sel = document.getElementById("headerModel");
   try {
     const models = (await api("/api/ollama-models")).models || [];
     const current = (await api("/api/settings")).model || "";
-    sel.textContent = "";
-    models.forEach((m) => {
-      const name = m.name || m;
-      const opt = document.createElement("option");
-      opt.value = name;
-      opt.textContent = name;
-      if (name === current) opt.selected = true;
-      sel.appendChild(opt);
-    });
+    fillModelSelect(sel, models, current);
   } catch (error) { /* panel works without it */ }
 }
 
