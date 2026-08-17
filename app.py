@@ -4577,7 +4577,15 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                     return _store_media(Path(made[0]).read_bytes(), "wav")
                 except OSError:
                     return None
-    is_clone = bool(VOICE_ID_SHAPE.match(voice or ""))
+    # #794: "any voice listed is usable." An engine-prefixed pick
+    # (voxcpm:vl_x, cosyvoice:vl_x…) is still a library CLONE — the raw
+    # string just doesn't look like one, so the clone road never built its
+    # rungs, and a cast actor on a dead bench engine went to the retry
+    # shelf forever: the silence the operator heard. The reference IS the
+    # identity, so falling through to the same clone on xtts/f5 keeps the
+    # casting decision while the bench engine is down or out of memory.
+    _rung_pfx, _rung_bare = split_engine_voice(voice)
+    is_clone = bool(VOICE_ID_SHAPE.match((_rung_bare or voice) or ""))
     seats = {"dj": "voice", "host": "voice", "cohost": "cohost_voice",
              "third": "third_voice", "drop": "drop_voice"}
     selected = str(dj_settings().get(seats.get(who, "")) or "").strip()
@@ -4587,15 +4595,27 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
     stand_in = await piper_fallback_voice(who) if not actor_locked else ""
     rungs: list[tuple[str, str, str]] = []
     if is_clone:
-        clone_engine = engine if engine in ("xtts", "f5") else str(
-            (voice_meta(voice) or {}).get("engine") or "xtts")
-        pick = str(dj_settings().get("clone_engine") or "")
-        if pick in ("xtts", "f5"):
-            clone_engine = pick
-        rungs.append((voice, clone_engine, ""))
-        other = "f5" if clone_engine == "xtts" else "xtts"
-        rungs.append((voice, other, f"{clone_engine} would not render it — the "
-                                    f"same clone through {other} (#784)"))
+        bare = _rung_bare or voice
+        if _rung_pfx and _rung_pfx not in ("xtts", "f5"):
+            rungs.append((voice, _rung_pfx, ""))
+            rungs.append((bare, "xtts",
+                          f"{_rung_pfx} would not render it — the same "
+                          "clone through xtts, identity kept (#794)"))
+            rungs.append((bare, "f5",
+                          f"{_rung_pfx} would not render it — the same "
+                          "clone through f5, identity kept (#794)"))
+        else:
+            clone_engine = _rung_pfx if _rung_pfx in ("xtts", "f5") else (
+                engine if engine in ("xtts", "f5") else str(
+                    (voice_meta(bare) or {}).get("engine") or "xtts"))
+            pick = str(dj_settings().get("clone_engine") or "")
+            if pick in ("xtts", "f5") and not _rung_pfx:
+                clone_engine = pick
+            rungs.append((bare, clone_engine, ""))
+            other = "f5" if clone_engine == "xtts" else "xtts"
+            rungs.append((bare, other,
+                          f"{clone_engine} would not render it — the "
+                          f"same clone through {other} (#784)"))
         if stand_in and stand_in != voice:
             rungs.append((stand_in, "piper", "the clone road is down — a "
                           "stand-in Piper voice so the line still goes out (#784)"))
@@ -5034,7 +5054,10 @@ async def ha_restart_container() -> bool:
 # DISTINCT from the stall path (#712): there the link is ALIVE and a
 # restart severs a live stream mid-clip — here the entity is unavailable,
 # nothing is streaming, and a restart severs nothing.
-NABU_PROBE_HOST = os.getenv("NABU_PROBE_HOST", "10.89.1.205")
+# The Voice PE's real address — HA's esphome config entry says 10.89.1.161
+# (verified 2026-08-17; .205 is a DIFFERENT device that also pings, which
+# would have made the ladder call a dead Nabu "alive").
+NABU_PROBE_HOST = os.getenv("NABU_PROBE_HOST", "10.89.1.161")
 NABU_LINK_ESCALATION = os.getenv(
     "NABU_LINK_ESCALATION", "1").lower() in ("1", "true", "yes", "on")
 REPAIR_STAMPS_PATH = data_path("repair_stamps.json")
@@ -12196,6 +12219,21 @@ async def box_hold_watch() -> None:
             if _ANNOUNCE_LOCK.locked():
                 continue                # the live show has the floor
             first = _BOX_HOLD[0]
+            # #795: HOLD_REPLAY_STALE, ENFORCED. The constant and its
+            # comment existed; the watcher never applied it — so a shelf
+            # that fell behind stayed permanently full (measured 49→55 and
+            # growing), every fresh line queued behind ~40 minutes of old
+            # conversation, and the audible show was all gaps. Past the
+            # stale line the transcript keeps the words; the speaker moves
+            # on to what the show is saying NOW.
+            if time.time() - float(first.get("ts") or 0) > HOLD_REPLAY_STALE:
+                stale = _BOX_HOLD.pop(0)
+                _box_hold_save()
+                pipeline_log("air", "a held clip aged past the replay "
+                             f"window ({int(HOLD_REPLAY_STALE)}s) — kept "
+                             "for the page, not re-aired (#594/#795)",
+                             extra=str(stale.get("text") or "")[:160])
+                continue
             if not await _replay_held(first):
                 # Still down, or it only half-played — keep it and knock
                 # again next pass (#467). Nothing is dropped until it airs.
@@ -20959,6 +20997,29 @@ def call_ended(name: str, line_say: str, started: float,
     short = " ".join(outcome.split())
     if len(short) > 110:
         short = short[:107].rstrip(" ,.;—-") + "…"
+    # #795: a call that produced ZERO aired turns did not happen on air —
+    # writing "hung up after 4m" for it is the ledger lying (measured:
+    # callers ringing, never airing, silently marked resolved). Say what
+    # actually happened, and don't count it among completed calls; the
+    # caller's topic goes back into circulation via the drop row.
+    if int(turns) <= 0:
+        _RADIO["chat"].append({
+            "ts": int(ended), "who": "drop", "kind": "drop", "name": name,
+            "text": (f"☎ {name} on {line_say} NEVER MADE AIR — every turn "
+                     "of the call was lost before the speaker "
+                     f"({int(ran // 60)}m {int(ran % 60):02d}s of trying)"),
+            "reason": "call produced no aired turns (#795)",
+            "rule": outcome, "rule_id": str(rule.get("id") or ""),
+            "seconds": round(ran, 1),
+        })
+        del _RADIO["chat"][:-160]
+        call_log_add({
+            "ts": int(ended), "name": name, "line": line_say,
+            "seconds": round(ran, 1), "turns": 0,
+            "rule_id": str(rule.get("id") or ""), "rule": outcome,
+            "state": "never_aired",
+        })
+        return
     _RADIO["chat"].append({
         "ts": int(ended), "who": "drop", "kind": "hangup", "name": name,
         # WHEN, plainly: the booth rows carry no clock of their own, and
@@ -23607,7 +23668,14 @@ async def speak_turns(turns: list[tuple[str, str]],
         # speakbox shelf, so holding a repeat back makes the show fresher
         # rather than shorter. Never for a caller — a caller is a guest, not
         # a repeat offender — and never on a deliberate replay.
-        if not allow_repeat and who in ("dj", "cohost", "third"):
+        # #795: and never DURING a call. A call's greeting/answer/goodbye
+        # are stock moves by nature — the cooldown was eating the hosts'
+        # halves of live calls, which is how callers rang, were "answered"
+        # by nobody, and hung up having aired zero turns. A swapped line
+        # mid-call answers the caller with unrelated shelf material, which
+        # is worse than a familiar phrase.
+        if not allow_repeat and not caller_name \
+                and who in ("dj", "cohost", "third"):
             _phrase = phrase_check(text, who, _round_grams)
             phrase_note(bool(_phrase["block"]))
             if _phrase["block"]:
@@ -23881,7 +23949,18 @@ async def speak_turns(turns: list[tuple[str, str]],
                                "text": spoken_text(it["chunk"])[:70],
                                "rendered": False} for it in playlist],
                 }
-            _plan_turns = _RADIO["plan"]["turns"]
+                # #795: bind OUR round's plan object once. Rounds run
+                # concurrently (torrent + record intro + larder recast all
+                # live at once), and re-reading the GLOBAL on every batch
+                # meant another round could swap in a SHORTER turn list —
+                # the checkpoint write below then IndexError'd and took the
+                # whole round down mid-air. Observed killing a live round.
+                _round_plan = _RADIO["plan"]
+            try:
+                _plan_turns = _round_plan["turns"]
+            except NameError:            # a path that skipped batch zero
+                _round_plan = _RADIO["plan"]
+                _plan_turns = _round_plan["turns"]
             # Only this burst's turns. return_exceptions so one bad render
             # cannot take the round down — the per-turn fallback below
             # already knows how to re-render a missing clip.
@@ -23941,7 +24020,8 @@ async def speak_turns(turns: list[tuple[str, str]],
                         "tried": list(clip.get("tried") or []),
                         "fallback": str(clip.get("fallback") or ""),
                     }
-                    _plan_turns[idx]["rendered"] = True    # checkpoint hit (#556)
+                    if idx < len(_plan_turns):             # checkpoint hit (#556)
+                        _plan_turns[idx]["rendered"] = True
             hang_secs = 0.0
             if caller_name and last_batch:
                 hang = await asyncio.to_thread(make_hangup)
@@ -29860,10 +29940,20 @@ async def voicelab_ingest(
     survives the job — extracted, converted to data, deleted."""
     require_auth(authorization)
     payload = await request.json()
+    # #795: "range": "0:10-0:25" was a silent no-op — only the panel UI
+    # split it client-side, so any API caller sending range got the WHOLE
+    # video downloaded and processed (measured: a 15s ask became a 213s
+    # job). Unknown keys must not change the outcome without a word.
+    _start, _end = payload.get("start"), payload.get("end")
+    _rng = str(payload.get("range") or "").strip()
+    if _rng and not (_start or _end):
+        halves = _rng.replace("—", "-").split("-", 1)
+        _start = halves[0].strip() or None
+        _end = (halves[1].strip() or None) if len(halves) > 1 else None
     body = {
         "url": str(payload.get("url") or "").strip(),
-        "start": payload.get("start") or None,
-        "end": payload.get("end") or None,
+        "start": _start or None,
+        "end": _end or None,
         "speaker": str(payload.get("speaker") or ""),
         "mode": payload.get("mode")
         if payload.get("mode") in ("analyze", "clone", "both") else "both",
