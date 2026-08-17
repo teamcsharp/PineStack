@@ -219,10 +219,11 @@ WEATHER_DEFAULT_LOCATION = os.getenv("WEATHER_DEFAULT_LOCATION", "")
 #             actually serves it; nothing depends on it being up.
 VOICE_ENGINES = ("ha", "piper", "ha_file", "browser", "xtts", "f5",
                  "voxtral", "cosyvoice", "indextts", "voxcpm", "kokoro",
-                 "qwen_tts")
+                 "qwen_tts", "vibevoice")
 # Only these can hand back bytes; the others just make sound.
 VOICE_FILE_ENGINES = ("piper", "ha_file", "xtts", "f5", "voxtral",
-                      "cosyvoice", "indextts", "voxcpm", "kokoro", "qwen_tts")
+                      "cosyvoice", "indextts", "voxcpm", "kokoro", "qwen_tts",
+                      "vibevoice")
 
 # Speech IN is a separate wyoming service; the popup names it so the whole
 # voice path is visible in one place.
@@ -288,6 +289,9 @@ INDEXTTS_URL = os.getenv("INDEXTTS_URL", "http://127.0.0.1:8774").rstrip("/")
 VOXCPM_URL = os.getenv("VOXCPM_URL", "http://127.0.0.1:8775").rstrip("/")
 KOKORO_URL = os.getenv("KOKORO_URL", "http://127.0.0.1:8776").rstrip("/")
 QWEN_TTS_URL = os.getenv("QWEN_TTS_URL", "http://127.0.0.1:8777").rstrip("/")
+# Qwen3-TTS runs via the Spark-specific Docker (handles arm64 + CUDA + the
+# Blackwell sm121 combination); it serves the OpenAI speech contract.
+VIBEVOICE_URL = os.getenv("VIBEVOICE_URL", "http://127.0.0.1:8778").rstrip("/")
 
 # name -> everything the rest of the system needs to inherit it. `clone`
 # engines route library vl_* voices (they take a reference); `preset`
@@ -313,6 +317,9 @@ ENGINE_REGISTRY: dict[str, dict[str, Any]] = {
                   "label": "Qwen3-TTS 0.6B", "speed": 4, "standin": True,
                   "default_voice": "cherry",
                   "model": os.getenv("QWEN_TTS_MODEL", "qwen3-tts-0.6b")},
+    "vibevoice": {"url": VIBEVOICE_URL, "family": "clone",
+                  "label": "VibeVoice-Realtime 0.5B", "speed": 3,
+                  "standin": True, "default_voice": ""},
 }
 # Health cache per engine, same shape as _XTTS_HEALTH.
 _ENGINE_HEALTH: dict[str, dict[str, Any]] = {
@@ -6732,7 +6739,11 @@ async def voice_generate(text: str, voice: str, engine: str,
     # this gate. Leaving f5 out of it sent every f5 voice down the
     # allowlist branch below, which only knows Piper names — so a
     # perfectly good clone was rejected as "No such voice".
-    if engine in ("xtts", "f5"):
+    _spec = ENGINE_REGISTRY.get(engine)
+    if engine in ("xtts", "f5") or (_spec and _spec["family"] == "clone"):
+        # #786: every CLONE engine (xtts, f5, cosyvoice, indextts, voxcpm,
+        # vibevoice) takes a library reference — gate on the reference, not
+        # the Piper catalog. A clone engine cannot render without one.
         if voice_ref_path(voice) is None:
             raise HTTPException(
                 status_code=400, detail=f"No such library voice: {voice}"
@@ -6742,6 +6753,10 @@ async def voice_generate(text: str, voice: str, engine: str,
             raise HTTPException(
                 status_code=400, detail=f"No such Voxtral preset: {voice}"
             )
+    elif _spec and _spec["family"] == "openai":
+        # #786: a PRESET engine (kokoro, qwen_tts) owns its OWN voice
+        # namespace — the server validates the voice, not the Piper catalog.
+        pass
     elif voice and voice not in await voice_allowlist():
         raise HTTPException(status_code=400, detail=f"No such voice: {voice}")
     if len(text) > VOICE_MAX_CHARS:
@@ -42283,7 +42298,7 @@ speaker and restart the agent."
 
   <div id="gutter" title="Drag to resize"></div>
 
-  <aside>
+  <aside class="col-right">
     <section class="panel pine-panel">
       <details id="pineChat" open>
         <summary class="pine-summary">Pine Chat
