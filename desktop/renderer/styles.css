@@ -236,7 +236,72 @@ body.resizing-rail .rail-resizer::before {
 }
 .tab span { overflow: hidden; text-overflow: ellipsis; }
 
-.rail-actions { margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.rail-actions { margin-top: auto; display: grid; grid-template-columns: auto 1fr 1fr; gap: 8px; }
+/* #788: wake words — the 🗣 icon by Launch/Attach and its popup. */
+.wake-btn { width: 38px; padding: 0; font-size: 16px; }
+.wake-popup {
+  position: absolute; left: 10px; bottom: 56px; z-index: 60;
+  width: min(320px, calc(100vw - 40px));
+  background: var(--panel, #141b24); border: 1px solid var(--border, #2a3644);
+  border-radius: 10px; padding: 10px; box-shadow: 0 8px 30px rgba(0,0,0,.5);
+  display: grid; gap: 6px; font-size: 12.5px;
+}
+.wake-head { display: flex; gap: 6px; align-items: center; }
+.wake-row {
+  display: flex; gap: 6px; align-items: center; min-width: 0;
+  padding: 4px 0; border-top: 1px solid var(--border, #2a3644);
+}
+.wake-row.off .wake-phrase { opacity: .45; text-decoration: line-through; }
+.wake-phrase { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wake-route { color: var(--muted, #8fa0ad); flex: 0 0 auto; }
+.wake-x {
+  flex: 0 0 auto; width: 22px; height: 22px; padding: 0; line-height: 1;
+  background: transparent; border: none; color: var(--muted, #8fa0ad); cursor: pointer;
+}
+.wake-x:hover { color: #e46b6b; }
+.wake-add { display: flex; gap: 6px; }
+.wake-add input { flex: 1; min-width: 0; }
+.wake-add select, .wake-add button { flex: 0 0 auto; }
+
+/* #790: the speaking indicator lives IN the Route cell — animated EQ bars
+   while something is sounding on the broadcast device; the cell opens the
+   notification history. */
+.route-cell { cursor: pointer; position: relative; }
+.route-speak { display: inline-flex; align-items: flex-end; gap: 2px; margin-left: 8px; height: 14px; }
+.route-speak i {
+  width: 3px; background: var(--accent, #65c7da); border-radius: 1px;
+  animation: routeEq 0.9s ease-in-out infinite;
+  height: 30%;
+}
+.route-speak i:nth-child(2) { animation-delay: 0.15s; }
+.route-speak i:nth-child(3) { animation-delay: 0.3s; }
+.route-speak i:nth-child(4) { animation-delay: 0.45s; }
+@keyframes routeEq {
+  0%, 100% { height: 25%; }
+  50% { height: 100%; }
+}
+.route-speak em {
+  font-style: normal; font-size: 10px; color: var(--muted, #8fa0ad);
+  margin-left: 5px; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; max-width: 140px;
+}
+.route-history {
+  position: fixed; top: 64px; right: 16px; z-index: 80;
+  width: min(400px, calc(100vw - 32px)); max-height: min(60vh, 480px);
+  overflow: auto; background: var(--panel, #141b24);
+  border: 1px solid var(--border, #2a3644); border-radius: 10px;
+  padding: 10px; box-shadow: 0 10px 36px rgba(0,0,0,.55); font-size: 12.5px;
+}
+.route-history h4 { margin: 0 0 6px; font-size: 13px; }
+.rh-row { border-top: 1px solid var(--border, #2a3644); padding: 6px 2px; cursor: pointer; }
+.rh-row:hover { background: rgba(255,255,255,.03); }
+.rh-line { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+.rh-when { color: var(--muted, #8fa0ad); font-size: 10.5px; flex: 0 0 auto; }
+.rh-stage { font-weight: 600; flex: 0 0 auto; }
+.rh-snip { color: var(--muted, #8fa0ad); flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rh-detail { display: none; margin-top: 5px; padding: 7px 9px; background: rgba(0,0,0,.3); border-radius: 7px; white-space: pre-wrap; word-break: break-word; }
+.rh-row.open .rh-detail { display: block; }
+.rh-row.open .rh-snip { display: none; }
 
 /* The 3JS gallery: an accordion under its tab listing every three.js
    experience in the panel; picking one jumps the webview to it. */

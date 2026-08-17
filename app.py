@@ -288,7 +288,9 @@ COSYVOICE_URL = os.getenv("COSYVOICE_URL", "http://127.0.0.1:8773").rstrip("/")
 INDEXTTS_URL = os.getenv("INDEXTTS_URL", "http://127.0.0.1:8774").rstrip("/")
 VOXCPM_URL = os.getenv("VOXCPM_URL", "http://127.0.0.1:8775").rstrip("/")
 KOKORO_URL = os.getenv("KOKORO_URL", "http://127.0.0.1:8776").rstrip("/")
-QWEN_TTS_URL = os.getenv("QWEN_TTS_URL", "http://127.0.0.1:8777").rstrip("/")
+# The Spark-specific Qwen3-TTS Docker (martinb78/faster-qwen3-tts-dgx-spark)
+# maps host :8020 → container :8000.
+QWEN_TTS_URL = os.getenv("QWEN_TTS_URL", "http://127.0.0.1:8020").rstrip("/")
 # Qwen3-TTS runs via the Spark-specific Docker (handles arm64 + CUDA + the
 # Blackwell sm121 combination); it serves the OpenAI speech contract.
 VIBEVOICE_URL = os.getenv("VIBEVOICE_URL", "http://127.0.0.1:8778").rstrip("/")
@@ -795,6 +797,23 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "conversation_memory": True,
     "long_term_memory": True,
     "openwebui_logging": True,
+    # #788: the wake words the box listens for after the button, each
+    # routing somewhere — "webui" (the LLM with its tools) or "dj" (the
+    # booth: requests + phone-in topics). Manageable from the panel: turn
+    # off, add, remove. Builtins keep their generous STT-mangled matchers.
+    "wake": {
+        "enabled": True,
+        "words": [
+            {"id": "hey-llm", "phrase": "hey LLM", "route": "webui",
+             "on": True, "builtin": True},
+            {"id": "ask-webui", "phrase": "ask web UI", "route": "webui",
+             "on": True, "builtin": True},
+            {"id": "open-webui", "phrase": "open web UI", "route": "webui",
+             "on": True, "builtin": True},
+            {"id": "hey-dj", "phrase": "hey DJ", "route": "dj",
+             "on": True, "builtin": True},
+        ],
+    },
     "num_ctx": 8192,
     # Spoken when an image render completes; one is picked at random.
     "render_replies": [
@@ -1322,6 +1341,7 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "conversation_memory": bool(data.get("conversation_memory", True)),
         "long_term_memory": bool(data.get("long_term_memory", True)),
         "openwebui_logging": bool(data.get("openwebui_logging", True)),
+        "wake": validate_wake(data.get("wake")),
         "num_ctx": max(2048, min(32768, num_ctx)),
         "render_replies": render_replies,
         "voice_out": voice_out,
@@ -3950,19 +3970,98 @@ async def comfyui_generate(
 # --- Open WebUI passthrough ------------------------------------------------
 
 
+# #787/#788: the wake phrases that hand a spoken line somewhere — said to
+# the box after the button press. "hey LLM …" (and friends) route to Open
+# WebUI, tools and all; "hey DJ …" routes to the booth. The list lives in
+# settings["wake"] so words can be turned off, added and removed from the
+# panel; the BUILTIN ids keep generous matchers because STT mangles "LLM"
+# freely (l l m / lm / alum / el el em) and "DJ" almost as much.
+_BUILTIN_WAKE = {
+    "hey-llm": re.compile(
+        r"^\s*(?:hey|hay|ok(?:ay)?)[\s,]+(?:the\s+)?"
+        r"(?:l\.?\s?l\.?\s?m\.?|llm|lm|alum|el+\s+el+\s+em+)"
+        r"\b[\s,.:!?—-]*", re.IGNORECASE),
+    "ask-webui": re.compile(
+        r"^\s*ask[\s,]+(?:the\s+)?(?:open\s*)?"
+        r"(?:web\s?u\.?i\.?|webui|l\.?\s?l\.?\s?m\.?|llm)\b[\s,.:!?—-]*",
+        re.IGNORECASE),
+    "open-webui": re.compile(
+        r"^\s*(please\s+)?(ask|use|send to|query|on)?\s*open ?web ?ui\b"
+        r"[:,]?\s*(to\s+|and\s+|for\s+)?", re.IGNORECASE),
+    "hey-dj": re.compile(
+        r"^\s*(?:hey|hay|yo|ok(?:ay)?)[\s,]+(?:the\s+)?"
+        r"(?:d\.?\s?j\.?s?|deejays?|dee\s+jays?)\b[\s,.:!?—-]*",
+        re.IGNORECASE),
+}
+_WAKE_ROUTES = ("webui", "dj")
+
+
+def validate_wake(raw: Any) -> dict[str, Any]:
+    base = DEFAULT_SETTINGS["wake"]
+    if not isinstance(raw, dict):
+        return json.loads(json.dumps(base))
+    words = []
+    for w in (raw.get("words") if isinstance(raw.get("words"), list)
+              else base["words"]):
+        if not isinstance(w, dict):
+            continue
+        phrase = str(w.get("phrase") or "").strip()[:60]
+        if not phrase:
+            continue
+        wid = str(w.get("id") or re.sub(r"[^a-z0-9]+", "-",
+                                        phrase.lower())).strip("-")[:40]
+        words.append({
+            "id": wid, "phrase": phrase,
+            "route": w.get("route") if w.get("route") in _WAKE_ROUTES
+            else "webui",
+            "on": bool(w.get("on", True)),
+            "builtin": wid in _BUILTIN_WAKE,
+        })
+    return {"enabled": bool(raw.get("enabled", True)), "words": words}
+
+
+def _wake_norm(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", (text or "").lower()).strip()
+
+
+def wake_route(text: str, settings: dict[str, Any] | None = None) \
+        -> tuple[str, str] | None:
+    """(route, question) when the line starts with an enabled wake word."""
+    cfg = (settings or load_settings()).get("wake") or {}
+    if not cfg.get("enabled", True):
+        return None
+    for w in cfg.get("words") or []:
+        if not w.get("on", True):
+            continue
+        rx = _BUILTIN_WAKE.get(w.get("id") or "")
+        if rx:
+            m = rx.match(text or "")
+            if m:
+                return (w["route"], (text or "")[m.end():].strip())
+            continue
+        # Custom words match on normalized token prefix.
+        want = _wake_norm(w.get("phrase") or "")
+        if not want:
+            continue
+        got = _wake_norm(text)
+        if got == want or got.startswith(want + " "):
+            toks = (text or "").split()
+            return (w["route"], " ".join(toks[len(want.split()):]).strip())
+    return None
+
+
 def is_openwebui_request(text: str) -> bool:
-    return bool(re.search(r"\bopen ?web ?ui\b", text, re.IGNORECASE))
+    hit = wake_route(text)
+    if hit:
+        return hit[0] == "webui"
+    return False
 
 
 def strip_openwebui_prefix(text: str) -> str:
-    cleaned = re.sub(
-        r"^\s*(please\s+)?(ask|use|send to|query|on)?\s*open ?web ?ui\b"
-        r"[:,]?\s*(to\s+|and\s+|for\s+)?",
-        "",
-        text,
-        flags=re.IGNORECASE,
-    )
-    return cleaned.strip() or text.strip()
+    hit = wake_route(text)
+    if hit and hit[0] == "webui":
+        return hit[1] or (text or "").strip()
+    return (text or "").strip()
 
 
 async def ask_openwebui(text: str, model: str) -> str:
@@ -3970,17 +4069,44 @@ async def ask_openwebui(text: str, model: str) -> str:
     headers = {"Content-Type": "application/json"}
     if OPENWEBUI_API_KEY:
         headers["Authorization"] = f"Bearer {OPENWEBUI_API_KEY}"
+    # #788: the agent's own model is an ollama name Open WebUI may not
+    # serve. Prefer the configured ask-model; when a model 400s, fall back
+    # to the first real model Open WebUI lists and try once more.
+    preferred = os.getenv("OPENWEBUI_ASK_MODEL", "").strip() or model
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            response = await client.post(
-                f"{OPENWEBUI_URL}/api/chat/completions",
-                headers=headers,
-                json={
-                    "model": model,
-                    "messages": [{"role": "user", "content": query}],
-                    "stream": False,
-                },
-            )
+        async with httpx.AsyncClient(timeout=180) as client:
+            async def _try(m: str) -> httpx.Response:
+                return await client.post(
+                    f"{OPENWEBUI_URL}/api/chat/completions",
+                    headers=headers,
+                    json={"model": m,
+                          "messages": [{"role": "user", "content": query}],
+                          "stream": False})
+            response = await _try(preferred)
+            if response.status_code == 400:
+                listing = await client.get(f"{OPENWEBUI_URL}/api/models",
+                                           headers=headers)
+                ids = [m.get("id") for m in
+                       (listing.json().get("data") or [])
+                       if m.get("id") and m["id"] != "arena-model"]
+                if ids and preferred not in ids:
+                    preferred = ids[0]
+                    response = await _try(preferred)
+            if response.status_code == 400:
+                # This Open WebUI's process_chat pipeline is refusing
+                # everything ('NoneType' startswith). The ollama proxy
+                # behind it still answers — the model minus the tool
+                # pipeline beats an apology.
+                response = await client.post(
+                    f"{OPENWEBUI_URL}/ollama/api/chat", headers=headers,
+                    json={"model": preferred,
+                          "messages": [{"role": "user", "content": query}],
+                          "stream": False})
+                response.raise_for_status()
+                answer = (response.json().get("message") or {}).get(
+                    "content") or ""
+                return str(answer).strip() or \
+                    "Open WebUI returned an empty response."
             response.raise_for_status()
             data = response.json()
         answer = data["choices"][0]["message"]["content"]
@@ -5563,6 +5689,13 @@ async def _clone_synthesize(engine: str, text: str, voice: str) -> bytes:
         "language": "en",
         "opts": {"speed": max(0.75, min(1.25, rate))},
     }
+    # #792: engines like VoxCPM clone only with the reference's TRANSCRIPT
+    # alongside the audio. The library stores it as reference.txt beside
+    # reference.wav; engines that don't need it ignore the field.
+    _ref_txt = ref.with_name("reference.txt")
+    if _ref_txt.is_file():
+        payload["reference_text"] = _ref_txt.read_text(
+            errors="replace").strip()[:500]
     async with httpx.AsyncClient(timeout=120) as client:
         resp = await client.post(f"{url}/synthesize", json=payload)
         resp.raise_for_status()
@@ -8246,7 +8379,10 @@ def note_activity(stage: str, detail: str = "") -> None:
     _RADIO["activity"] = {"stage": stage, "detail": str(detail)[:80],
                           "at": time.time()}
     log = _RADIO.setdefault("activity_log", [])
-    log.append({"stage": stage, "at": int(time.time())})
+    # #790: the detail rides in the log too, so the Route cell's history can
+    # expand each notification to what was actually said/done.
+    log.append({"stage": stage, "detail": str(detail)[:200],
+                "at": int(time.time())})
     del log[:-120]
 
 
@@ -31500,6 +31636,29 @@ async def dj_requests_api(
     return request_history()
 
 
+# #787: "hey DJ …" said to the box — the booth's own wake. A request if
+# the library can fill it, otherwise a conversation topic the pair take to
+# the phones, and callers ring in about it. STT spells DJ many ways.
+_DJ_WAKE = re.compile(
+    r"^\s*(?:hey|hay|yo|ok(?:ay)?)[\s,]+(?:the\s+)?"
+    r"(?:d\.?\s?j\.?s?|deejays?|dee\s+jays?|djs?)\b[\s,.:!?—-]*",
+    re.IGNORECASE)
+
+
+async def dj_wake_handle(text: str) -> str:
+    """What "hey DJ" hands the booth: request first, topic otherwise."""
+    if not text:
+        return ("Booth's open — ask for a song, or hand the pair a topic "
+                "and the phones will light up.")
+    taken = await dj_take_request(text)
+    if taken:
+        return taken["reply"]
+    note_action(f"🎙 topic for the pair: {text[:60]}")
+    asyncio.create_task(dj_callin(text, "a listener on the box"))
+    return ("Handing that to the booth — the pair are taking it up and "
+            "callers are dialing in about it now.")
+
+
 @app.post("/api/dj/heard")
 async def dj_heard_api(
     request: Request,
@@ -39837,6 +39996,29 @@ async def chat_completions(
 
     user_text = latest_user_text(incoming_messages)
 
+    # #787: "hey DJ …" — straight to the booth: a request if the library
+    # can fill it, a phone-in topic otherwise. The model never sees it.
+    _dj_woke = _DJ_WAKE.match(user_text or "")
+    if _dj_woke:
+        _reply = await dj_wake_handle(user_text[_dj_woke.end():].strip())
+        note_action(f"🎙 you woke the booth: {user_text[:60]}")
+        log_turn(user_text, _reply, {"active_prompt": "Pine Box FM",
+                                     "model": "station", "dj_wake": True})
+        return {
+            "id": f"chatcmpl-{uuid.uuid4().hex}",
+            "object": "chat.completion",
+            "created": int(time.time()),
+            "model": "pine-box-fm",
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": _reply},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                      "total_tokens": 0},
+            "spark_agent": {"dj_wake": True},
+        }
+
     # "Play Blue Monday on Pine Box FM", said out loud to the box. The
     # station takes this one; the model never sees it.
     taken = await dj_take_request(user_text)
@@ -41167,6 +41349,13 @@ button.danger {
   font-size: 12px; color: #9fd0ff;
 }
 .pb-collapsible:not(.collapsed) > .cx-marquee { display: none; }
+/* #790: collapsing a section folds EVERYTHING in it — including rows that
+   were appended to the section after makeCollapsible wrapped the body
+   (the Music pickers leaked under the folded header this way). Only the
+   title and the collapsed-state marquees stay. */
+.pb-collapsible.collapsed > *:not(.sec-title):not(.cx-marquee):not(.mini-marquee) {
+  display: none !important;
+}
 
 .mini-marquee {
   overflow: hidden; white-space: nowrap; border: 1px solid var(--border);
@@ -43349,7 +43538,7 @@ searched for, newest first — click one to run it again">🕘</button>
               title="What is playing"></span>
         <button class="tbtn" onclick="djCall('prev')"
                 title="Previous song">⏮</button>
-        <audio id="musicPlayer" controls playsinline></audio>
+        <audio id="musicPlayer" data-pine-live="1" controls playsinline></audio>
         <button class="tbtn" id="musicDownload" onclick="downloadTrack()"
                 title="Download the track that is playing">⤓</button>
         <button class="tbtn" onclick="djCall('next')"
@@ -46462,19 +46651,30 @@ function fillVoiceSelect(select, voices, current, includeBrowser) {
     select.appendChild(group);
   });
 
-  // #786: every bench engine's OWN built-in voices, each under its model's
-  // heading, value `engine:voice` so it routes to that engine. This is what
-  // lets Kokoro, Qwen3-TTS and the rest be picked, tested and used per role.
+  // #786: EVERY bench engine gets its own section. Preset engines (Kokoro,
+  // Qwen3-TTS…) list their OWN built-in voices; clone engines (XTTS, F5,
+  // VoxCPM, IndexTTS, CosyVoice, VibeVoice…) list the LIBRARY voices
+  // rendered THROUGH that engine — so any voice can be tried on any engine
+  // we have access to. Value is always `engine:voice` and routes straight
+  // to that engine.
+  const libRows = window.pineCloneVoices || [];
   (window.pineEngineVoices || []).forEach((eng) => {
+    const rows = (eng.voices || []).length
+      ? eng.voices.map((v) => ({value: eng.engine + ":" + v, name: v,
+                                mark: "🎧 "}))
+      : (eng.clones && eng.ready
+         ? libRows.map((voice) => ({value: eng.engine + ":" + voice.id,
+                                    name: voice.name, mark: "🧬 "}))
+         : []);
+    if (!rows.length) return;
     const group = document.createElement("optgroup");
     group.label = eng.label + (eng.ready ? "" : " · offline");
-    eng.voices.forEach((v) => {
-      const value = eng.engine + ":" + v;
+    rows.forEach((row) => {
       const option = document.createElement("option");
-      option.value = value;
-      option.textContent = "🎧 " + v;
-      option.title = eng.label + " · " + v;
-      if (value === current) option.selected = true;
+      option.value = row.value;
+      option.textContent = row.mark + row.name;
+      option.title = eng.label + " · " + row.name;
+      if (row.value === current) option.selected = true;
       group.appendChild(option);
     });
     select.appendChild(group);
@@ -51535,16 +51735,44 @@ function djDossierShow(line, anchorEl) {
 }
 
 /* Three seconds of hover, as asked. Cancelled the moment the pointer
- * leaves, so it never fires on a pointer that is only passing through. */
+ * leaves, so it never fires on a pointer that is only passing through.
+ * #791: leaving the ROW no longer slams the card shut — you get a grace
+ * window to travel INTO the card (play / download live there), and the
+ * card keeps itself open while the pointer is over it. */
+let djDossierGrace = null;
+function djDossierArmCard() {
+  const card = document.getElementById("djDossier");
+  if (!card || card._armed) return;
+  card._armed = true;
+  card.addEventListener("mouseenter", () => {
+    if (djDossierGrace) { clearTimeout(djDossierGrace); djDossierGrace = null; }
+  });
+  card.addEventListener("mouseleave", () => {
+    if (djDossierGrace) clearTimeout(djDossierGrace);
+    djDossierGrace = setTimeout(() => djDossierClose(), 350);
+  });
+}
 function djDossierWatch(row, line) {
   row.addEventListener("mouseenter", () => {
     if (djDossierTimer) clearTimeout(djDossierTimer);
-    djDossierTimer = setTimeout(() => djDossierShow(line, row), 3000);
+    if (djDossierGrace) { clearTimeout(djDossierGrace); djDossierGrace = null; }
+    djDossierTimer = setTimeout(() => {
+      djDossierShow(line, row);
+      djDossierArmCard();
+    }, 3000);
   });
   row.addEventListener("mouseleave", () => {
     if (djDossierTimer) { clearTimeout(djDossierTimer); djDossierTimer = null; }
-    // A dossier belongs to the row under the pointer, not to the screen.
-    if (djDossierFor === (line.id || "")) djDossierClose();
+    // A dossier belongs to its row — but it closes on a DELAY so the
+    // pointer can cross the gap into the card and click things.
+    if (djDossierFor === (line.id || "")) {
+      if (djDossierGrace) clearTimeout(djDossierGrace);
+      djDossierGrace = setTimeout(() => {
+        const card = document.getElementById("djDossier");
+        if (card && card.matches(":hover")) return;   // made it — stay open
+        djDossierClose();
+      }, 400);
+    }
   });
 }
 
@@ -58219,6 +58447,10 @@ function djVoiceEl(slot) {
     const a = document.createElement("audio");
     a.id = "djVoiceAudio" + slot;
     a.playsInline = true;
+    // #789: the desktop's booth-monitor switch mutes LIVE broadcast audio
+    // only — everything tagged pine-live. Tapes, benchmarks and any player
+    // you deliberately press play on stay audible in the app.
+    a.dataset.pineLive = "1";
     document.body.appendChild(a);
     djVoiceEls[slot] = a;
   }
@@ -66911,9 +67143,10 @@ async function loadEngineVoices() {
   try {
     const d = await api("/api/voice/director");
     window.pineEngineVoices = (d.engines || [])
-      .filter((e) => e.own_voices && (e.voices || []).length)
       .map((e) => ({engine: e.id, label: e.label, ready: e.ready,
-                    voices: e.voices}));
+                    clones: !!e.clones_voices,
+                    voices: e.own_voices ? (e.voices || []) : []}))
+      .filter((e) => e.voices.length || (e.clones && e.ready));
   } catch (error) {
     window.pineEngineVoices = window.pineEngineVoices || [];
   }

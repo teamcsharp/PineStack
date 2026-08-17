@@ -141,9 +141,15 @@ function appVolumeScript(audible = true) {
         localStorage.setItem("pineMusicMuted", audible && volume > 0 ? "0" : "1");
       } catch (error) {}
       document.querySelectorAll("audio,video").forEach((node) => {
-        const nextVolume = audible ? volume : 0;
+        // #789: the booth-monitor switch governs LIVE broadcast audio only
+        // (elements tagged data-pine-live: the music player + booth voice
+        // lines). Tapes from the cache and anything you deliberately press
+        // play on stay audible at app volume, always.
+        const live = !!(node.dataset && node.dataset.pineLive);
+        const nodeAudible = live ? audible : true;
+        const nextVolume = nodeAudible ? volume : 0;
         if (Math.abs(node.volume - nextVolume) > 0.001) node.volume = nextVolume;
-        const muted = !audible || volume <= 0;
+        const muted = !nodeAudible || volume <= 0;
         if (node.muted !== muted) node.muted = muted;
       });
     };
@@ -178,7 +184,9 @@ function audibleFrame() {
 function applyAppVolumeToFrame(frame, audible = frame === audibleFrame()) {
   if (!frame || !frame.src || typeof frame.executeJavaScript !== "function") return;
   try {
-    if (typeof frame.setAudioMuted === "function") frame.setAudioMuted(!audible || appVolume <= 0);
+    // #789: never hard-mute the whole webview for the monitor switch — that
+    // silenced tape playback too. Only a zero app volume mutes everything.
+    if (typeof frame.setAudioMuted === "function") frame.setAudioMuted(appVolume <= 0);
     frame.executeJavaScript(appVolumeScript(audible)).catch(() => {});
   } catch {
     /* The webview may still be navigating. dom-ready will apply it. */
@@ -798,13 +806,18 @@ async function setBroadcastTarget(key) {
 async function applyDefaultBroadcast() {
   if (defaultBroadcastApplied) return;
   defaultBroadcastApplied = true;
-  setDesiredBroadcast(desiredBroadcast || "nabu");
+  // #791: the desktop no longer forces its saved preset over the box on
+  // boot — the routing YOU set on the page is saved in the agent's settings
+  // and survives restarts, so the app ADOPTS what the server says instead
+  // of overwriting it. The preset writes only when you change the
+  // Broadcast dropdown yourself (setBroadcastTarget).
   try {
-    await api.post("/api/dj/output", ROUTES[desiredBroadcast]);
-    syncEmbeddedBroadcast(desiredBroadcast);
-    noteRouteOk(`${ROUTES[desiredBroadcast].label} active`);
+    const status = await api.get("/api/pinebox/status");
+    const key = routeKeyFromState(status);
+    if (ROUTES[key]) setDesiredBroadcast(key);
+    noteRouteOk(`${(ROUTES[key] || ROUTES[desiredBroadcast] || ROUTES.nabu).label} — as the box has it`);
   } catch (err) {
-    noteRouteError(err.message);
+    /* server quiet — keep showing the saved selection, write nothing */
   }
 }
 
@@ -1253,6 +1266,156 @@ function initStationDrawer() {
   });
 }
 initStationDrawer();
+
+/* #788: the wake words the box answers to — turn off, add, remove, from the
+ * rail. The list lives in the agent's settings so every session shares it. */
+function initWakeWords() {
+  const btn = $("wakeBtn");
+  const pop = $("wakePopup");
+  if (!btn || !pop) return;
+
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;"}[c]));
+
+  async function readWake() {
+    const s = await api.get("/api/settings");
+    if (s.voice_out) delete s.voice_out.ha_token;
+    return s;
+  }
+
+  async function draw() {
+    pop.innerHTML = "<div class='muted'>loading…</div>";
+    let s;
+    try { s = await readWake(); } catch (e) {
+      pop.innerHTML = "<div class='muted'>" + esc(e.message) + "</div>";
+      return;
+    }
+    const wake = s.wake || {enabled: true, words: []};
+    pop.innerHTML = "";
+
+    const head = document.createElement("label");
+    head.className = "wake-head";
+    head.innerHTML = "<input type='checkbox' " + (wake.enabled ? "checked" : "")
+      + "> <b>Wake words</b> <span class='muted'>the box listens for</span>";
+    head.querySelector("input").addEventListener("change", async (ev) => {
+      wake.enabled = ev.target.checked;
+      s.wake = wake; await api.put("/api/settings", s); draw();
+    });
+    pop.appendChild(head);
+
+    (wake.words || []).forEach((w, i) => {
+      const row = document.createElement("div");
+      row.className = "wake-row" + (w.on ? "" : " off");
+      row.innerHTML = "<input type='checkbox' " + (w.on ? "checked" : "")
+        + " title='hear this wake word or not'>"
+        + "<span class='wake-phrase'>“" + esc(w.phrase) + "”</span>"
+        + "<span class='wake-route'>→ " + (w.route === "dj" ? "the DJs" : "the LLM")
+        + "</span>"
+        + "<button class='wake-x' title='remove this wake word'>✕</button>";
+      row.querySelector("input").addEventListener("change", async (ev) => {
+        wake.words[i].on = ev.target.checked;
+        s.wake = wake; await api.put("/api/settings", s); draw();
+      });
+      row.querySelector(".wake-x").addEventListener("click", async () => {
+        wake.words.splice(i, 1);
+        s.wake = wake; await api.put("/api/settings", s); draw();
+      });
+      pop.appendChild(row);
+    });
+
+    const add = document.createElement("div");
+    add.className = "wake-add";
+    add.innerHTML = "<input type='text' placeholder='new wake phrase…'>"
+      + "<select><option value='webui'>→ the LLM</option>"
+      + "<option value='dj'>→ the DJs</option></select>"
+      + "<button>+ add</button>";
+    add.querySelector("button").addEventListener("click", async () => {
+      const phrase = add.querySelector("input").value.trim();
+      if (!phrase) return;
+      wake.words.push({phrase, route: add.querySelector("select").value,
+                       on: true});
+      s.wake = wake; await api.put("/api/settings", s); draw();
+    });
+    pop.appendChild(add);
+  }
+
+  btn.addEventListener("click", () => {
+    const open = pop.style.display !== "none";
+    pop.style.display = open ? "none" : "block";
+    if (!open) draw();
+  });
+  document.addEventListener("click", (ev) => {
+    if (!pop.contains(ev.target) && ev.target !== btn) {
+      pop.style.display = "none";
+    }
+  });
+}
+initWakeWords();
+
+/* #790: the speaking indicator in the Route cell — animated while a line is
+ * actually sounding on the broadcast device, click for the notification
+ * history, each entry expandable to its full detail. */
+function initRouteSpeak() {
+  const cell = $("routeCell");
+  const speak = $("routeSpeak");
+  const label = $("routeSpeakLabel");
+  const pop = $("routeHistory");
+  if (!cell || !speak || !pop) return;
+  let log = [];
+
+  async function poll() {
+    try {
+      const s = await api.get("/api/radio");
+      log = s.activity_log || [];
+      const a = s.activity || {};
+      const fresh = a.at && (Date.now() / 1000 - a.at) < 6;
+      const working = fresh && a.stage && !/idle|off/i.test(a.stage);
+      speak.style.display = working ? "inline-flex" : "none";
+      if (working && label) {
+        label.textContent = a.stage
+          + (a.detail ? " · " + String(a.detail).slice(0, 26) : "");
+      }
+    } catch { speak.style.display = "none"; }
+    setTimeout(poll, 3000);
+  }
+
+  function draw() {
+    pop.innerHTML = "<h4>What went out — the notification history</h4>";
+    if (!log.length) {
+      pop.innerHTML += "<div class='rh-snip'>nothing noted yet</div>";
+      return;
+    }
+    log.slice().reverse().forEach((e) => {
+      const row = document.createElement("div");
+      row.className = "rh-row";
+      const when = e.at ? new Date(e.at * 1000).toLocaleTimeString() : "";
+      const detail = e.detail || "";
+      row.innerHTML = "<div class='rh-line'>"
+        + "<span class='rh-when'>" + when + "</span>"
+        + "<span class='rh-stage'>" + (e.stage || "") + "</span>"
+        + "<span class='rh-snip'>" + detail.replace(/</g, "&lt;") + "</span>"
+        + "</div>"
+        + "<div class='rh-detail'>" + (detail || "(no detail recorded)")
+          .replace(/</g, "&lt;")
+        + "\n\n" + (e.stage || "") + " · " + when + "</div>";
+      row.addEventListener("click", () => row.classList.toggle("open"));
+      pop.appendChild(row);
+    });
+  }
+
+  cell.addEventListener("click", () => {
+    const open = pop.style.display !== "none";
+    pop.style.display = open ? "none" : "block";
+    if (!open) draw();
+  });
+  document.addEventListener("click", (ev) => {
+    if (!pop.contains(ev.target) && !cell.contains(ev.target)) {
+      pop.style.display = "none";
+    }
+  });
+  poll();
+}
+initRouteSpeak();
 
 document.querySelectorAll(".tab").forEach((button) => {
   if (button.id === "threejsBtn" || button.id === "stationBtn") return;

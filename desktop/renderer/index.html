@@ -57,9 +57,13 @@
               title="The station — public broadcast, the DJs, troubleshooting">○<span>Station</span></button>
     </nav>
     <div class="rail-actions">
+      <button id="wakeBtn" class="wake-btn"
+              title="Wake words — what the box listens for after the button: turn them off, add new ones, remove them">🗣</button>
       <button id="launchBtn">Launch</button>
       <button id="attachBtn">Attach</button>
     </div>
+    <div id="wakePopup" class="wake-popup" style="display:none"></div>
+    <div id="routeHistory" class="route-history" style="display:none"></div>
   </aside>
   <div id="railResizer" class="rail-resizer" title="Resize sidebar"></div>
 
@@ -72,7 +76,13 @@
           <canvas id="boxPulse"></canvas>
           <em id="boxTasks"></em>
         </div>
-        <div><span>Route</span><b id="routeState">unknown</b></div>
+        <div id="routeCell" class="route-cell"
+             title="What is sounding on the broadcast device — click for the notification history">
+          <span>Route</span><b id="routeState">unknown</b>
+          <span id="routeSpeak" class="route-speak" style="display:none">
+            <i></i><i></i><i></i><i></i><em id="routeSpeakLabel"></em>
+          </span>
+        </div>
         <div><span>Now</span><b id="nowState">quiet</b></div>
       </div>
       <div class="top-actions">
