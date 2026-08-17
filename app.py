@@ -6578,16 +6578,32 @@ def role_engine_for(who: str) -> str:
     return pinned if pinned in ENGINE_REGISTRY else ""
 
 
+def split_engine_voice(voice: str) -> tuple[str, str]:
+    """#786: an `engine:voice` value (e.g. `kokoro:af_heart`) names both the
+    engine and the voice explicitly — the form the sectionized picker emits
+    for a bench engine's own built-in voices. Returns (engine, bare_voice);
+    ("", voice) when there is no engine prefix."""
+    v = (voice or "").strip()
+    if ":" in v:
+        head, tail = v.split(":", 1)
+        if head in VOICE_ENGINES:
+            return head, tail
+    return "", v
+
+
 def voice_engine_for(voice: str, who: str = "") -> str:
     """The voice NAME is the engine router. vl_* ids belong to the library
     (usually xtts), Voxtral preset names to voxtral, everything else is a
     Piper voice. This is what lets a cloned cohost be pure configuration —
     no engine parameter threads through six call sites.
 
-    #786: a role PINNED to a bench engine outranks the voice's own routing —
-    a clone engine renders this role's clone voice, a preset engine renders
-    the role in its own fast built-in voice (the preset adapter ignores the
-    clone id)."""
+    #786: an explicit `engine:voice` prefix wins outright; a role PINNED to a
+    bench engine outranks the voice's own routing — a clone engine renders
+    this role's clone voice, a preset engine renders the role in its own fast
+    built-in voice (the preset adapter ignores the clone id)."""
+    prefix, bare = split_engine_voice(voice)
+    if prefix:
+        return prefix
     voice = (voice or "").strip()
     pinned = role_engine_for(who) if who else ""
     if pinned:
@@ -6720,6 +6736,11 @@ async def voice_generate(text: str, voice: str, engine: str,
     synthesis succeeds. `fx` wets the line — echo and a room — for the callers
     that want the pair to sound like they are in a booth rather than a
     cupboard (#222)."""
+    # #786: an `engine:voice` value carries its own engine — honor it and
+    # hand the adapter the bare voice name.
+    _pfx, _bare = split_engine_voice(voice)
+    if _pfx:
+        engine, voice = _pfx, _bare
     if engine not in VOICE_FILE_ENGINES:
         raise HTTPException(
             status_code=503,
@@ -27660,6 +27681,52 @@ async def say(
 # over these HTTP endpoints with the API key.
 
 
+async def preset_engine_voices(engine: str) -> list[str]:
+    """A preset engine's own built-in voice names — for the sectionized
+    picker. Reads /health voices (kokoro), else /v1/models or /speakers
+    (OpenAI backends like the Qwen3-TTS Spark image). Cached 60s."""
+    spec = ENGINE_REGISTRY.get(engine)
+    if not spec or spec["family"] != "openai":
+        return []
+    cache = _ENGINE_HEALTH.setdefault(engine, {})
+    if cache.get("voices") and time.time() - float(
+            cache.get("voices_at") or 0) < 60:
+        return list(cache["voices"])
+    url = str(spec["url"])
+    voices: list[str] = []
+    async with httpx.AsyncClient(timeout=5) as client:
+        for path, key in (("/health", "voices"), ("/speakers", None),
+                          ("/v1/models", "data"), ("/v1/audio/voices", None)):
+            try:
+                r = await client.get(f"{url}{path}")
+                if r.status_code >= 400:
+                    continue
+                body = r.json()
+            except Exception:  # noqa: BLE001
+                continue
+            if isinstance(body, dict) and key and body.get(key):
+                items = body[key]
+            elif isinstance(body, list):
+                items = body
+            elif isinstance(body, dict) and isinstance(body.get("voices"),
+                                                       list):
+                items = body["voices"]
+            else:
+                items = []
+            for it in items:
+                v = it.get("id") or it.get("name") if isinstance(it, dict) \
+                    else str(it)
+                if v:
+                    voices.append(str(v))
+            if voices:
+                break
+    if not voices and spec.get("default_voice"):
+        voices = [str(spec["default_voice"])]
+    cache["voices"] = voices
+    cache["voices_at"] = time.time()
+    return voices
+
+
 async def voice_director_state() -> dict[str, Any]:
     """Everything the Voice Director knows, in one object — the bench with
     live health, the role assignments, the stand-in, and the capabilities so
@@ -27668,8 +27735,12 @@ async def voice_director_state() -> dict[str, Any]:
     healths = await asyncio.gather(
         *[engine_health(name) for name in ENGINE_REGISTRY],
         return_exceptions=True)
+    voice_lists = await asyncio.gather(
+        *[preset_engine_voices(name) for name in ENGINE_REGISTRY],
+        return_exceptions=True)
     bench = []
-    for (name, spec), h in zip(ENGINE_REGISTRY.items(), healths):
+    for (name, spec), h, vl in zip(ENGINE_REGISTRY.items(), healths,
+                                   voice_lists):
         h = h if isinstance(h, dict) else {"ready": False, "detail": str(h)}
         bench.append({
             "id": name,
@@ -27680,6 +27751,9 @@ async def voice_director_state() -> dict[str, Any]:
             "good_standin": bool(spec.get("standin")),
             "relative_speed": spec["speed"],    # lower renders faster
             "default_voice": spec.get("default_voice") or "",
+            # The engine's own built-in voices (preset engines), so the
+            # picker can list every option sectionized by model (#786).
+            "voices": vl if isinstance(vl, list) else [],
             "url": spec["url"],
             "ready": bool(h.get("ready")),
             "detail": h.get("detail") or "",
@@ -40440,6 +40514,17 @@ button.danger {
    width instead of being crushed across its neighbours. The settings rows
    that reuse the class set flex inline and still win. */
 .act-head > .film-size { flex: 0 0 auto; }
+/* #786: a picker inside a .film-size label must GROW to show its selected
+   name, not truncate it — with a readable floor, and when the row runs out
+   the whole label wraps to its own line (flex-wrap on the row) rather than
+   crushing the name into "Shap…". The ▶/☆ actions stay square so they never
+   eat the select's width. */
+.film-size select {
+  flex: 1 1 auto; width: auto; min-width: 132px; max-width: 100%;
+  text-overflow: ellipsis;
+}
+.film-size > button { flex: 0 0 auto; }
+.film-size { min-width: 0; }
 .film-size input[type="range"] {
   width: 130px; min-width: 90px; padding: 0; margin: 0;
   background: transparent;
@@ -46372,6 +46457,24 @@ function fillVoiceSelect(select, voices, current, includeBrowser) {
       option.textContent += voice.name;
       option.title = voice.id + " · " + (voice.engine || "xtts");
       if (voice.id === current) option.selected = true;
+      group.appendChild(option);
+    });
+    select.appendChild(group);
+  });
+
+  // #786: every bench engine's OWN built-in voices, each under its model's
+  // heading, value `engine:voice` so it routes to that engine. This is what
+  // lets Kokoro, Qwen3-TTS and the rest be picked, tested and used per role.
+  (window.pineEngineVoices || []).forEach((eng) => {
+    const group = document.createElement("optgroup");
+    group.label = eng.label + (eng.ready ? "" : " · offline");
+    eng.voices.forEach((v) => {
+      const value = eng.engine + ":" + v;
+      const option = document.createElement("option");
+      option.value = value;
+      option.textContent = "🎧 " + v;
+      option.title = eng.label + " · " + v;
+      if (value === current) option.selected = true;
       group.appendChild(option);
     });
     select.appendChild(group);
@@ -66801,6 +66904,22 @@ async function loadCloneVoices() {
   return window.pineCloneVoices;
 }
 
+// #786: every bench engine's OWN built-in voices, per engine, so the voice
+// picker can list them all sectionized by model — pick one and its `engine:
+// voice` value routes straight to that engine.
+async function loadEngineVoices() {
+  try {
+    const d = await api("/api/voice/director");
+    window.pineEngineVoices = (d.engines || [])
+      .filter((e) => e.own_voices && (e.voices || []).length)
+      .map((e) => ({engine: e.id, label: e.label, ready: e.ready,
+                    voices: e.voices}));
+  } catch (error) {
+    window.pineEngineVoices = window.pineEngineVoices || [];
+  }
+  return window.pineEngineVoices;
+}
+
 /* ---- The voice desk (#273): every assignment, one popup ---- */
 
 async function voiceDeskOpen() {
@@ -73856,6 +73975,7 @@ function startLiveActivity() {
   studioJobsResume();
   layoutRestore();
   layoutHandles();
+  loadEngineVoices();       // #786: bench engines' own voices in the pickers
   loadCloneVoices();
   pollPerf();
   setInterval(pollPerf, 5000);
