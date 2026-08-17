@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Pine Box Desktop</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<!-- agent-down until the first health check proves otherwise: the compact
+     rail's mark ring is the only state indicator, and it must not open green
+     while the backend is still being reached. -->
+<body class="agent-down">
+  <aside class="rail">
+    <div class="brand">
+      <button id="panicBtn" class="mark" title="Collapse, rebuild, restore, and relaunch Pine Box Desktop">PB</button>
+      <div>
+        <h1>Pine Box</h1>
+        <p id="connLine">checking agent...</p>
+      </div>
+    </div>
+    <section class="route-panel">
+      <label class="fm-row" for="fmSwitch">
+        <span>FM</span>
+        <input id="fmSwitch" type="checkbox">
+        <i></i>
+      </label>
+      <label for="broadcastTarget">Broadcast</label>
+      <select id="broadcastTarget">
+        <option value="nabu" selected>Nabu</option>
+        <option value="box">Pine Box</option>
+        <option value="web">Web page</option>
+        <option value="app">Application</option>
+      </select>
+      <p id="routeNote">routing unknown</p>
+      <label class="volume-row" for="appVolume">
+        <span>App volume</span>
+        <b id="appVolumeValue">35%</b>
+      </label>
+      <input id="appVolume" type="range" min="0" max="100" step="1" value="35">
+      <label class="monitor-row" for="boothMonitor">
+        <input id="boothMonitor" type="checkbox">
+        <span>Tune booth audio</span>
+      </label>
+      <audio id="desktopRadioPlayer" class="desktop-radio" controls preload="auto"></audio>
+    </section>
+    <nav class="tabs" aria-label="Desktop views">
+      <button class="tab active" data-view="control" title="Full Pine Box Agent">#<span>Agent</span></button>
+      <button class="tab" data-view="radio" title="Radio player">&gt;<span>Radio</span></button>
+      <button class="tab" data-view="overview" title="Desktop command deck">=<span>Deck</span></button>
+      <button class="tab" data-view="guide" title="Recovery guide">+<span>Recover</span></button>
+      <button class="tab" data-view="logs" title="Agent logs">~<span>Logs</span></button>
+      <button class="tab" data-view="settings" title="Desktop settings">*<span>Settings</span></button>
+    </nav>
+    <div class="rail-actions">
+      <button id="launchBtn">Launch</button>
+      <button id="attachBtn">Attach</button>
+    </div>
+  </aside>
+  <div id="railResizer" class="rail-resizer" title="Resize sidebar"></div>
+
+  <main>
+    <header class="top">
+      <div class="status-strip">
+        <div><span>Agent</span><b id="agentState">unknown</b></div>
+        <div><span>Box</span><b id="boxState">unknown</b></div>
+        <div><span>Route</span><b id="routeState">unknown</b></div>
+        <div><span>Now</span><b id="nowState">quiet</b></div>
+      </div>
+      <div class="top-actions">
+        <button id="reloadFrameBtn" title="Reload current panel">R</button>
+        <button id="fullscreenBtn" title="Hide desktop chrome">[]</button>
+        <button id="openBrowserBtn" title="Open in browser">^</button>
+        <button id="refreshBtn" title="Refresh status">!</button>
+      </div>
+    </header>
+
+    <section id="control" class="view frame-view active">
+      <webview id="controlFrame" allowpopups></webview>
+    </section>
+
+    <section id="radio" class="view frame-view">
+      <webview id="radioFrame" allowpopups></webview>
+    </section>
+
+    <section id="overview" class="view">
+      <div class="grid">
+        <section class="panel box-panel">
+          <div class="panel-head">
+            <h2>Pine Box</h2>
+            <span id="spokenLine">waiting for status</span>
+          </div>
+          <div id="checks" class="checks"></div>
+          <div class="button-row">
+            <button id="probeBtn">Probe</button>
+            <button id="initBtn">Initialize</button>
+            <button id="recoverBtn">Recover</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Speak</h2>
+            <span>send a line through the agent</span>
+          </div>
+          <textarea id="sayText" rows="5" placeholder="Type what Pine should say or answer..."></textarea>
+          <div class="button-row">
+            <button id="sayBtn">Say</button>
+            <button id="listenBtn">Listen</button>
+          </div>
+          <p id="sayResult" class="muted"></p>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Station</h2>
+            <span id="stationSub">radio state</span>
+          </div>
+          <div class="button-row">
+            <button id="startRadioBtn">Start</button>
+            <button id="stopRadioBtn">Stop</button>
+            <button id="nextRadioBtn">Next</button>
+          </div>
+          <div id="pipeline" class="pipeline"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Deep Interface</h2>
+            <span>full surfaces inside the app</span>
+          </div>
+          <div class="launch-grid">
+            <button data-view-target="control">Studio</button>
+            <button data-view-target="radio">Player</button>
+            <button data-view-target="guide">Guide</button>
+            <button data-route="/api/radio-cache/export">Export</button>
+          </div>
+        </section>
+      </div>
+    </section>
+
+    <section id="guide" class="view frame-view">
+      <webview id="guideFrame" allowpopups></webview>
+    </section>
+
+    <section id="logs" class="view">
+      <pre id="logBox" class="log"></pre>
+    </section>
+
+    <section id="settings" class="view">
+      <section class="panel settings-panel">
+        <div class="panel-head">
+          <h2>Desktop Settings</h2>
+          <span>launch locally or attach to another agent</span>
+        </div>
+        <label>Agent URL<input id="baseUrlInput" spellcheck="false"></label>
+        <label>API key<input id="apiKeyInput" type="password" spellcheck="false"></label>
+        <label>Python command<input id="pythonInput" placeholder="python or python3" spellcheck="false"></label>
+        <label>Data directory<input id="dataDirInput" spellcheck="false"></label>
+        <div class="segmented">
+          <button id="modeLaunch">Launch local</button>
+          <button id="modeAttach">Attach only</button>
+        </div>
+        <div class="button-row">
+          <button id="saveSettingsBtn">Save</button>
+          <button id="setupBtn">Install Python Deps</button>
+          <button id="stopBtn">Stop Agent</button>
+        </div>
+      </section>
+    </section>
+  </main>
+  <section id="rebuildOverlay" class="rebuild-overlay" aria-live="polite">
+    <canvas id="rebuildCanvas"></canvas>
+    <div class="rebuild-console">
+      <div class="rebuild-head">
+        <span class="rebuild-mark">PB</span>
+        <div>
+          <h2>Collapsing And Rebuilding Pine Box</h2>
+          <p id="rebuildStage">standing by</p>
+        </div>
+        <b id="rebuildPct">0%</b>
+      </div>
+      <div class="rebuild-bars">
+        <label><span>source</span><i><em id="barSource"></em></i></label>
+        <label><span>npx</span><i><em id="barNpx"></em></i></label>
+        <label><span>backend</span><i><em id="barBackend"></em></i></label>
+        <label><span>route</span><i><em id="barRoute"></em></i></label>
+      </div>
+      <div id="rebuildProcesses" class="rebuild-processes"></div>
+      <pre id="rebuildLog" class="rebuild-log"></pre>
+    </div>
+  </section>
+
+  <script src="./renderer.js"></script>
+</body>
+</html>

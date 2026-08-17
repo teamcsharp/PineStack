@@ -1,0 +1,617 @@
+:root {
+  color-scheme: dark;
+  --bg: #101419;
+  --rail: #151b22;
+  --panel: #1c242c;
+  --panel-2: #222b35;
+  --text: #edf3f5;
+  --muted: #8fa0ad;
+  --line: #35414c;
+  --green: #54d18b;
+  --amber: #e3be63;
+  --red: #e46b6b;
+  --cyan: #65c7da;
+}
+
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; }
+body {
+  display: grid;
+  /* The rail may never starve the main area: cap it against the viewport. */
+  grid-template-columns: min(var(--rail-width, 260px), 35vw) 6px 1fr;
+  background: var(--bg);
+  color: var(--text);
+  font-family: Inter, Segoe UI, system-ui, sans-serif;
+  overflow: hidden;
+}
+
+button, input, textarea {
+  font: inherit;
+}
+
+button {
+  border: 1px solid var(--line);
+  background: #25303a;
+  color: var(--text);
+  height: 36px;
+  border-radius: 7px;
+  padding: 0 12px;
+  cursor: pointer;
+}
+
+button:hover { border-color: var(--cyan); }
+button.active { background: #2d4650; border-color: var(--cyan); }
+
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 18px 14px;
+  background: var(--rail);
+  border-right: 1px solid var(--line);
+}
+
+.rail-resizer {
+  position: relative;
+  cursor: col-resize;
+  background: var(--rail);
+  border-right: 1px solid var(--line);
+}
+
+.rail-resizer::before {
+  content: "";
+  position: absolute;
+  inset: 8px 2px;
+  border-radius: 999px;
+  background: transparent;
+}
+
+.rail-resizer:hover::before,
+body.resizing-rail .rail-resizer::before {
+  background: var(--cyan);
+}
+
+.brand { display: flex; gap: 12px; align-items: center; margin-bottom: 22px; }
+.brand > div { min-width: 0; }
+.mark {
+  width: 42px;
+  height: 42px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: #d6f2de;
+  color: #112318;
+  font-weight: 800;
+  border: 2px solid transparent;
+  padding: 0;
+}
+.mark:hover { border-color: var(--cyan); }
+.mark:disabled { opacity: .75; cursor: wait; }
+.brand h1 { margin: 0; font-size: 20px; letter-spacing: 0; }
+.brand p {
+  margin: 2px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.route-panel {
+  display: grid;
+  gap: 6px;
+  margin: -8px 0 16px;
+}
+
+.route-panel label {
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.fm-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 4px;
+}
+
+.fm-row input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.fm-row i {
+  width: 40px;
+  height: 22px;
+  border-radius: 999px;
+  background: #202935;
+  border: 1px solid var(--line);
+  position: relative;
+  cursor: pointer;
+}
+
+.fm-row i::after {
+  content: "";
+  position: absolute;
+  width: 16px;
+  height: 16px;
+  left: 2px;
+  top: 2px;
+  border-radius: 50%;
+  background: var(--muted);
+  transition: transform .16s ease, background .16s ease;
+}
+
+.fm-row input:checked + i {
+  background: #17475a;
+  border-color: var(--cyan);
+}
+
+.fm-row input:checked + i::after {
+  transform: translateX(18px);
+  background: var(--cyan);
+}
+
+.route-panel select {
+  width: 100%;
+  height: 36px;
+  color: var(--text);
+  background: #11171d;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 0 10px;
+}
+
+.route-panel p {
+  min-height: 15px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.volume-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 4px 0 -2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.volume-row b {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.route-panel input[type="range"] {
+  width: 100%;
+  height: 20px;
+  padding: 0;
+  accent-color: var(--cyan);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+}
+
+.monitor-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.monitor-row input {
+  width: auto;
+  accent-color: var(--cyan);
+}
+
+.desktop-radio {
+  width: 100%;
+  height: 34px;
+  margin-top: 4px;
+}
+
+/* The tab list gives way on short windows — it scrolls while Launch/Attach
+   stay pinned at the rail's foot, so no window height hides an action. The
+   92px floor keeps two tab rows visible, so the scroll is discoverable
+   rather than the whole list collapsing to an invisible sliver. */
+.tabs { display: grid; gap: 8px; overflow-y: auto; min-height: 92px; }
+.tab {
+  display: grid;
+  grid-template-columns: 28px 1fr;
+  align-items: center;
+  text-align: left;
+  height: 42px;
+}
+.tab span { overflow: hidden; text-overflow: ellipsis; }
+
+.rail-actions { margin-top: auto; display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+
+/* Compact rail: shrink to variants, never amputate. Launch/Attach have no
+   other entry point, the FM toggle is the master switch, and hidden audio
+   would keep playing with nothing to control it — all stay reachable. */
+body.rail-compact .rail {
+  padding-inline: 10px;
+}
+
+body.rail-compact .brand {
+  justify-content: center;
+}
+
+body.rail-compact .brand > div,
+body.rail-compact .route-panel > label:not(.fm-row),
+body.rail-compact .route-panel p,
+body.rail-compact .volume-row,
+body.rail-compact .monitor-row,
+body.rail-compact .tab span {
+  display: none;
+}
+
+/* The broadcast target stays choosable at any width: the closed select is
+   only a sliver, but its popup renders full-size on click. */
+body.rail-compact .route-panel select {
+  padding: 0 4px;
+  font-size: 11px;
+}
+
+/* A routing FAILURE overrides the compact hiding — silence here meant a
+   flipped switch that quietly reverted with no explanation. */
+body.rail-compact .route-panel p.err {
+  display: block;
+  color: var(--red);
+  white-space: normal;
+}
+
+body.rail-compact .fm-row {
+  grid-template-columns: auto;
+  justify-content: center;
+}
+
+body.rail-compact .fm-row span {
+  display: none;
+}
+
+body.rail-compact .tab {
+  grid-template-columns: 1fr;
+  text-align: center;
+  padding: 0;
+}
+
+body.rail-compact .rail-actions {
+  grid-template-columns: 1fr;
+}
+
+body.rail-compact .rail-actions button {
+  padding: 0 4px;
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* #connLine is hidden when compact — the mark's ring says whether the agent
+   is up (set by renderer.js on every refresh). */
+body.rail-compact .mark { box-shadow: 0 0 0 2px var(--green); }
+body.rail-compact.agent-down .mark { box-shadow: 0 0 0 2px var(--red); }
+
+/* Below ~220px the native audio element's controls degenerate into an
+   unusable nub; the app-volume slider still governs loudness. */
+body.rail-narrow .desktop-radio { display: none; }
+
+/* auto, not 70px: when the header wraps on a narrow window, a fixed row
+   painted its second line under the webview — invisible, not scrollable. */
+main { display: grid; grid-template-rows: auto 1fr; min-width: 0; min-height: 0; }
+.top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--line);
+}
+.status-strip {
+  display: grid;
+  /* auto-fit reflows 4 → 2 → 1 columns continuously with the width. */
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+.status-strip div {
+  min-width: 0;
+  border: 1px solid var(--line);
+  background: #151c23;
+  border-radius: 7px;
+  padding: 8px 10px;
+}
+.status-strip span { display: block; color: var(--muted); font-size: 11px; }
+.status-strip b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.top-actions { display: flex; gap: 8px; }
+.top-actions button { width: 38px; padding: 0; }
+
+.view { display: none; min-height: 0; overflow: auto; }
+.view.active { display: block; }
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(320px, 100%), 1fr));
+  gap: 14px;
+  padding: 18px;
+}
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px;
+  min-width: 0;
+}
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  align-items: baseline;
+  margin-bottom: 12px;
+}
+.panel h2 { margin: 0; font-size: 17px; letter-spacing: 0; }
+.panel-head span, .muted { color: var(--muted); font-size: 12px; }
+.panel-head span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.checks { display: grid; gap: 8px; }
+.check {
+  display: grid;
+  grid-template-columns: 18px minmax(90px, 170px) 1fr;
+  gap: 8px;
+  align-items: start;
+  padding: 8px;
+  background: var(--panel-2);
+  border-radius: 7px;
+  font-size: 12px;
+}
+.check > * { min-width: 0; overflow-wrap: anywhere; }
+.check .ok { color: var(--green); }
+.check .bad { color: var(--red); }
+.check .skip { color: var(--amber); }
+
+textarea, input {
+  width: 100%;
+  color: var(--text);
+  background: #11171d;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 10px;
+  outline: none;
+}
+textarea:focus, input:focus { border-color: var(--cyan); }
+textarea { resize: vertical; min-height: 112px; }
+label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+
+.button-row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+.launch-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+.pipeline { display: grid; gap: 8px; margin-top: 12px; color: var(--muted); font-size: 12px; }
+.frame-view.active { display: block; height: 100%; overflow: hidden; }
+webview { width: 100%; height: 100%; border: 0; background: #111; }
+.log {
+  margin: 0;
+  padding: 16px;
+  min-height: 100%;
+  white-space: pre-wrap;
+  font: 12px/1.45 Consolas, ui-monospace, monospace;
+  color: #d9e1e5;
+}
+.settings-panel { max-width: 760px; margin: 18px; }
+.segmented { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 6px 0 12px; }
+
+/* Below 980px the rail hard-collapses to an icon strip. The compact STYLING
+   lives on body.rail-compact alone (renderer.js mirrors this media query into
+   that class), so drag-collapse and window-collapse cannot diverge. */
+@media (max-width: 980px) {
+  body { grid-template-columns: 84px 6px 1fr; }
+  .rail-resizer { pointer-events: none; cursor: default; }
+  .rail-resizer:hover::before { background: transparent; }
+}
+
+@media (max-width: 720px) {
+  .top { align-items: stretch; padding: 10px; gap: 10px; }
+  .top-actions { width: 100%; }
+  .top-actions button { flex: 1; }
+}
+
+body.immersive {
+  grid-template-columns: 0 0 1fr;
+}
+
+body.immersive .rail,
+body.immersive .rail-resizer,
+body.immersive .top {
+  display: none;
+}
+
+body.immersive main {
+  grid-template-rows: 1fr;
+}
+
+.rebuild-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: none;
+  place-items: center;
+  background: #05080df2;
+  overflow: hidden;
+}
+
+.rebuild-overlay.active {
+  display: grid;
+}
+
+#rebuildCanvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.rebuild-console {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  width: min(780px, calc(100vw - 48px));
+  max-height: min(720px, calc(100vh - 48px));
+  overflow-y: auto;
+  border: 1px solid #345565;
+  background: #0b1119e8;
+  box-shadow: 0 24px 90px rgba(0,0,0,.62), 0 0 70px rgba(101,199,218,.12);
+  border-radius: 8px;
+  padding: 18px;
+  backdrop-filter: blur(8px);
+}
+
+.rebuild-head {
+  display: grid;
+  grid-template-columns: 50px 1fr auto;
+  gap: 14px;
+  align-items: center;
+}
+
+.rebuild-head > div { min-width: 0; }
+
+.rebuild-head p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rebuild-mark {
+  width: 50px;
+  height: 50px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  color: #102118;
+  background: #d6f2de;
+  font-weight: 900;
+  animation: rebuildPulse 1.4s ease-in-out infinite;
+}
+
+.rebuild-head h2 {
+  margin: 0;
+  font-size: 22px;
+}
+
+.rebuild-head p {
+  margin: 3px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+#rebuildPct {
+  font-size: 28px;
+  color: var(--cyan);
+}
+
+.rebuild-bars {
+  display: grid;
+  gap: 9px;
+  margin: 18px 0;
+}
+
+.rebuild-bars label {
+  display: grid;
+  grid-template-columns: 84px 1fr;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+}
+
+.rebuild-bars span {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+}
+
+.rebuild-bars i {
+  height: 9px;
+  border-radius: 999px;
+  overflow: hidden;
+  background: #111a24;
+  border: 1px solid #263747;
+}
+
+.rebuild-bars em {
+  display: block;
+  width: 0%;
+  height: 100%;
+  background: linear-gradient(90deg, #65c7da, #54d18b);
+  box-shadow: 0 0 14px rgba(101,199,218,.48);
+  transition: width .35s ease;
+}
+
+.rebuild-log {
+  flex: 1;
+  min-height: 0;
+  max-height: 310px;
+  overflow: auto;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #263747;
+  border-radius: 7px;
+  background: #03070c;
+  color: #cfe8ef;
+  font: 12px/1.55 Consolas, ui-monospace, monospace;
+  white-space: pre-wrap;
+}
+
+.rebuild-processes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+
+.rebuild-processes span {
+  padding: 5px 9px;
+  border: 1px solid #263747;
+  border-radius: 999px;
+  color: #9fb2c1;
+  background: #0c1620;
+  font-size: 11px;
+}
+
+.rebuild-processes span.on {
+  color: #dffcff;
+  border-color: #65c7da;
+  box-shadow: 0 0 18px rgba(101,199,218,.2);
+  animation: processPop 1.8s ease-in-out infinite;
+}
+
+.rebuild-processes span.done {
+  color: #d8ffe5;
+  border-color: #54d18b;
+  background: #102219;
+}
+
+@keyframes rebuildPulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(101,199,218,.3); }
+  50% { box-shadow: 0 0 0 10px rgba(101,199,218,0); }
+}
+
+@keyframes processPop {
+  0%, 100% { transform: translateY(0) scale(1); opacity: .92; }
+  50% { transform: translateY(-2px) scale(1.04); opacity: 1; }
+}

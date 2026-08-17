@@ -46,14 +46,21 @@ SEARXNG_URL = os.getenv(
 ).rstrip("/")
 
 SPARK_AGENT_API_KEY = os.getenv("SPARK_AGENT_API_KEY", "")
-SETTINGS_PATH = Path("/app/data/settings.json")
+DATA_DIR = Path(os.getenv("SPARK_AGENT_DATA_DIR", "/app/data")).expanduser()
+
+
+def data_path(*parts: str) -> Path:
+    return DATA_DIR.joinpath(*parts)
+
+
+SETTINGS_PATH = data_path("settings.json")
 SETTINGS_LOCK = RLock()
-CHEATS_DIR = Path("/app/data/cheats")
-CONVERSATIONS_PATH = Path("/app/data/conversations.jsonl")
-MEMORIES_PATH = Path("/app/data/memories.jsonl")
+CHEATS_DIR = data_path("cheats")
+CONVERSATIONS_PATH = data_path("conversations.jsonl")
+MEMORIES_PATH = data_path("memories.jsonl")
 MEMORY_TURNS = 6
 
-OPENWEBUI_STATE = Path("/app/data/openwebui_chat.json")
+OPENWEBUI_STATE = data_path("openwebui_chat.json")
 PINEBOX_FOLDER = "Pinebox"
 PINEBOX_GAP_SECONDS = 1800  # start a new chat after 30 min of silence
 
@@ -61,13 +68,13 @@ COMFYUI_URL = os.getenv("COMFYUI_URL", "http://127.0.0.1:8188").rstrip("/")
 COMFYUI_CHECKPOINT = os.getenv(
     "COMFYUI_CHECKPOINT", "sd_xl_base_1.0.safetensors"
 )
-GENERATIONS_PATH = Path("/app/data/generations.jsonl")
+GENERATIONS_PATH = data_path("generations.jsonl")
 # SongSight data crystals: one distilled JSON per analysed song, built by
 # tools/crystal_build.py on the machine that runs SongSight and rsynced
 # in. Same corpus shape as the gear manuals in data/te.
-CRYSTALS_DIR = Path("/app/data/crystals")
+CRYSTALS_DIR = data_path("crystals")
 # Browser libraries served from disk so the panel never needs a CDN.
-VENDOR_DIR = Path("/app/data/vendor")
+VENDOR_DIR = data_path("vendor")
 
 # --- Music library ---------------------------------------------------------
 # Every directory listed here is indexed recursively. Mount the NAS anywhere
@@ -105,10 +112,10 @@ SFX_MAX_SECONDS = 4.0
 # add music, rather than paying for a rescan every few minutes.
 MUSIC_INDEX_TTL = float(os.getenv("MUSIC_INDEX_TTL", "21600"))
 MUSIC_MAX_TRACKS = int(os.getenv("MUSIC_MAX_TRACKS", "40000"))
-MUSIC_CACHE_PATH = Path("/app/data/music_index.json")
+MUSIC_CACHE_PATH = data_path("music_index.json")
 # Extracted album art, cached: pulling a 200 KB picture back out of a
 # file over CIFS every time a thumbnail scrolls past is not free.
-ART_DIR = Path("/app/data/art")
+ART_DIR = data_path("art")
 ART_TYPES = {"image/jpeg": ".jpg", "image/png": ".png",
              "image/webp": ".webp", "image/gif": ".gif"}
 # What a folder-level cover is called, in rough order of likelihood.
@@ -135,8 +142,8 @@ MUSIC_SKIP_DIRS = {
 # Pine Box inbox: requests submitted from any computer land here (newest
 # first), get resolved behind the scenes, then removed. pine_seq is a
 # monotonic counter so request numbers never repeat even after deletion.
-PINE_REQUESTS_PATH = Path("/app/data/pine_requests.md")
-PINE_SEQ_PATH = Path("/app/data/pine_seq")
+PINE_REQUESTS_PATH = data_path("pine_requests.md")
+PINE_SEQ_PATH = data_path("pine_seq")
 
 OPENWEBUI_URL = os.getenv(
     "OPENWEBUI_URL", "http://127.0.0.1:12000"
@@ -147,6 +154,12 @@ HA_URL = os.getenv("HA_URL", "http://127.0.0.1:8123").rstrip("/")
 HA_TOKEN = os.getenv("HA_TOKEN", "")
 HA_TTS_ENTITY = os.getenv("HA_TTS_ENTITY", "tts.piper")
 HA_MEDIA_PLAYER = os.getenv("HA_MEDIA_PLAYER", "")
+PINEVOICE_SATELLITE = os.getenv(
+    "PINEVOICE_SATELLITE", "assist_satellite.pinevoice")
+NABU_SATELLITE = os.getenv(
+    "NABU_SATELLITE", "assist_satellite.home_assistant_voice_09f8a8_assist_satellite")
+NABU_MEDIA_PLAYER = os.getenv(
+    "NABU_MEDIA_PLAYER", "media_player.home_assistant_voice_09f8a8_media_player")
 # Optional "reading the internet" sound effect: a media URL (or Home
 # Assistant /local/... path) played on HA_MEDIA_PLAYER whenever a turn goes
 # online to search. Empty = feature off.
@@ -188,8 +201,8 @@ VOICE_PUBLIC_URL = os.getenv(
     "VOICE_PUBLIC_URL", "http://127.0.0.1:8096"
 ).rstrip("/")
 
-VOICE_MEDIA_DIR = Path("/app/data/voice_media")
-VOICE_LEDGER_PATH = Path("/app/data/voice_ledger.json")
+VOICE_MEDIA_DIR = data_path("voice_media")
+VOICE_LEDGER_PATH = data_path("voice_ledger.json")
 # Two caps, both hard, both server-side: one alone is not enough. Piper is
 # local and free, so these are sized as a runaway guard, not a bill.
 VOICE_MAX_CHARS = int(os.getenv("VOICE_MAX_CHARS", "800"))
@@ -236,7 +249,7 @@ REACHY_GATEWAY_URL = os.getenv(
 ).rstrip("/")
 # The voice library: one directory per voice — reference.wav + meta.json,
 # plus signature.json / style.json / transcript.* when the lab made them.
-VOICES_DIR = Path("/app/data/voices")
+VOICES_DIR = data_path("voices")
 
 # Content type comes from OUR table, never from the stored file.
 MEDIA_TYPES = {"wav": "audio/wav", "mp3": "audio/mpeg"}
@@ -252,6 +265,12 @@ PINE_BOX_FM = "Pine Box FM"
 
 # The DJ's defaults. Every one of these is editable in the panel; they are
 # the floor, not the ceiling.
+RADIO_PROMPT_SLOTS = (
+    "station_system", "host", "cohost", "third", "caller", "manager",
+    "interaction", "speakerbox", "gallery", "music", "workplace",
+)
+
+
 DEFAULT_DJ = {
     "station_name": PINE_BOX_FM,
     "persona": (
@@ -351,6 +370,23 @@ DEFAULT_DJ = {
     # Look up what people say about a track before introducing it.
     "research": True,
     # The second voice in the booth (#133).
+    "mind_adjustments": {},  # Live, per-cast directives from Mind Topology.
+    # Persistent instructions appended to the corresponding radio-writing
+    # prompt. The prompt desk exposes these verbatim to the operator.
+    "radio_prompt_overrides": {
+        "host": "", "cohost": "", "caller": "", "manager": "",
+        "interaction": "", "speakerbox": "", "gallery": "",
+        "music": "", "workplace": "",
+    },
+    # The general assistant prompt belongs to direct device conversations,
+    # not the broadcast, unless the operator explicitly arms it for radio.
+    "radio_prompt_enabled": {
+        "station_system": False, "host": True, "cohost": True,
+        "third": True, "caller": True, "manager": True,
+        "interaction": True, "speakerbox": True, "gallery": True,
+        "music": True, "workplace": True,
+    },
+    "radio_prompt_presets": {},
     "cohost_name": "Skip",
     "cohost_persona": (
         "You are Skip, the co-host on Pine Box FM. Deadpan, quick, fond of "
@@ -367,8 +403,12 @@ DEFAULT_DJ = {
     "banter_min_minutes": 0.75,        # 45s: they barely stop (#352)
     "banter_max_minutes": 5,
     # And how long it runs when they do — an exchange being one line each.
-    "banter_min_lines": 2,
-    "banter_max_lines": 5,
+    "banter_min_lines": 8,
+    "banter_max_lines": 11,
+    # Keep a written continuity reserve so model work happens underneath
+    # records and adverts rather than in the silence after them.
+    "dialogue_prefill": True,
+    "dialogue_reserve_target": 4,
     # How much of the talk comes out of the speakbox documents, 0 to 1.
     # Raised with the gallery governor (#646): the wall was eating the show,
     # and the documents are what it is supposed to be made of.
@@ -379,6 +419,11 @@ DEFAULT_DJ = {
     # verbatim. Sliders; defaults lean high (#612 "happens more").
     "speakbox_append_rate": 0.85,
     "speakbox_prepend_rate": 0.6,
+    # A dedicated, uninterrupted on-air reading. This is distinct from the
+    # short quotation controls above: it reserves one whole DJ turn for a
+    # substantial consecutive Speakerbox swath.
+    "speakbox_full_swath_rate": 0.35,
+    "speakbox_full_swath_chars": 2600,
     # Which documents they may lift from. Empty means the whole folder, so a
     # file dropped in is in play without anyone ticking a box (#202).
     # How much each document is drawn on, by file name, 0 to 100. Anything
@@ -401,6 +446,11 @@ DEFAULT_DJ = {
     "news_hourly": True,
     # Generated call-ins an hour (#236). 0 keeps the phone quiet.
     "callin_per_hour": 1,
+    # Most callers should leave the station having actually won something;
+    # the caller desk can deliberately make the show meaner when wanted.
+    "caller_success_rate": 72,
+    # How deeply fresh Speakerbox material contaminates a caller's rhetoric.
+    "caller_insanity": 45,
     # The caller vocoder: the master switch, and how hard the strangers are
     # mangled — at 100 every name is charactered and fully bent, at 0 they
     # all ring in straight.
@@ -564,11 +614,11 @@ DEFAULT_DJ = {
     # anything longer continues in same-voice pieces, so the PCM stream
     # never outruns the BL606P's buffer and wedges the link. The 📏 probe
     # measures the real ceiling and sets this.
-    "say_max_seconds": 18,
+    "say_max_seconds": 36,
     # The ceiling on how much any one reply may be — the sweet spot between what
     # the box can say and its size limit (#599). 300..6500 chars; clamps the
     # generation budget so nothing overruns the device.
-    "reply_max_chars": 2500,
+    "reply_max_chars": 6000,
     # Software volume (#448): the physical buttons on the box do not affect
     # announce playback, so the panel scales the amplitude we bake into
     # each clip instead. 1.0 = normal, up to 1.6 louder / 0.3 quieter.
@@ -790,6 +840,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "engine": engine if engine in VOICE_ENGINES else "ha",
         "ha_token": str(raw_voice.get("ha_token") or "")[:300],
         "media_player": str(raw_voice.get("media_player") or "")[:200],
+        "reply_media_player": str(
+            raw_voice.get("reply_media_player") or "")[:200],
         "voice": str(raw_voice.get("voice") or "")[:100],
         "event_voices": {
             k: str(v or "")[:100]
@@ -888,6 +940,38 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "ad_price_high": max(2, int(
             raw_dj.get("ad_price_high") or DEFAULT_DJ["ad_price_high"])),
         "research": bool(raw_dj.get("research", True)),
+        "mind_adjustments": {
+            str(role)[:24]: [
+                {"id": str(item.get("id") or uuid.uuid4().hex[:8])[:32],
+                 "text": str(item.get("text") or "").strip()[:500],
+                 "source": str(item.get("source") or "operator")[:80]}
+                for item in (items if isinstance(items, list) else [])
+                if isinstance(item, dict) and str(item.get("text") or "").strip()
+            ][:24]
+            for role, items in (raw_dj.get("mind_adjustments") or {}).items()
+            if str(role) in ("dj", "cohost", "third", "caller", "manager", "customer")
+        },
+        "radio_prompt_overrides": {
+            key: str((raw_dj.get("radio_prompt_overrides") or {}).get(key)
+                     or "").strip()[:5000]
+            for key in ("host", "cohost", "third", "caller", "manager",
+                        "interaction", "speakerbox", "gallery", "music",
+                        "workplace")
+        },
+        "radio_prompt_enabled": {
+            key: bool((raw_dj.get("radio_prompt_enabled") or {}).get(
+                key, DEFAULT_DJ["radio_prompt_enabled"][key]))
+            for key in RADIO_PROMPT_SLOTS
+        },
+        "radio_prompt_presets": {
+            key: [{"name": str(item.get("name") or "saved prompt")[:80],
+                   "text": str(item.get("text") or "").strip()[:5000],
+                   "persona": str(item.get("persona") or "").strip()[:2000]}
+                  for item in ((raw_dj.get("radio_prompt_presets") or {})
+                               .get(key) or [])
+                  if isinstance(item, dict) and str(item.get("text") or "").strip()][:40]
+            for key in RADIO_PROMPT_SLOTS
+        },
         "cohost_name": str(
             raw_dj.get("cohost_name") or DEFAULT_DJ["cohost_name"])[:40],
         "cohost_persona": str(
@@ -901,6 +985,11 @@ def validate_settings(data: Any) -> dict[str, Any]:
         **_dj_range(raw_dj, "banter_min_minutes", "banter_max_minutes", 0, 60,
                     whole=False),
         **_dj_range(raw_dj, "banter_min_lines", "banter_max_lines", 2, 20),
+        "dialogue_prefill": bool(raw_dj.get(
+            "dialogue_prefill", DEFAULT_DJ["dialogue_prefill"])),
+        "dialogue_reserve_target": max(1, min(12, int(
+            raw_dj.get("dialogue_reserve_target",
+                       DEFAULT_DJ["dialogue_reserve_target"]) or 1))),
         "speakbox_rate": max(0.0, min(1.0, float(
             raw_dj.get("speakbox_rate", DEFAULT_DJ["speakbox_rate"]) or 0))),
         "speakbox_append_rate": max(0.0, min(1.0, float(
@@ -909,6 +998,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "speakbox_prepend_rate": max(0.0, min(1.0, float(
             raw_dj.get("speakbox_prepend_rate",
                        DEFAULT_DJ["speakbox_prepend_rate"]) or 0))),
+        "speakbox_full_swath_rate": max(0.0, min(1.0, float(
+            raw_dj.get("speakbox_full_swath_rate",
+                       DEFAULT_DJ["speakbox_full_swath_rate"]) or 0))),
+        "speakbox_full_swath_chars": max(300, min(6000, int(
+            raw_dj.get("speakbox_full_swath_chars",
+                       DEFAULT_DJ["speakbox_full_swath_chars"]) or 2600))),
         "speakbox_files": [
             str(name)[:120] for name in (raw_dj.get("speakbox_files") or [])
             if str(name or "").strip()
@@ -934,6 +1029,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "callin_per_hour": max(0, min(60, int(
             raw_dj.get("callin_per_hour",
                        DEFAULT_DJ["callin_per_hour"]) or 0))),
+        "caller_success_rate": max(0, min(100, int(
+            raw_dj.get("caller_success_rate",
+                       DEFAULT_DJ["caller_success_rate"]) or 0))),
+        "caller_insanity": max(0, min(100, int(
+            raw_dj.get("caller_insanity",
+                       DEFAULT_DJ["caller_insanity"]) or 0))),
         "caller_fx": bool(raw_dj.get("caller_fx", True)),
         "caller_fx_depth": max(0, min(100, int(
             raw_dj.get("caller_fx_depth",
@@ -2228,7 +2329,7 @@ async def get_tv_context(text: str) -> str:
 
 # --- Music requests: "play <song>" -> the music video on screen -----------
 
-TUNES_PATH = Path("/app/data/tunes.jsonl")
+TUNES_PATH = data_path("tunes.jsonl")
 # "play the second level of halo" is a game question, not a song, so anything
 # naming gameplay is excluded outright.
 TUNE_NOT_MUSIC = re.compile(
@@ -2387,8 +2488,8 @@ async def tune_choose(
 # A gear question pulls the matching pages into the answer AND splashes them
 # on the Pine Box tech feed.
 
-TE_DIR = Path("/app/data/te")
-TE_FEED_PATH = Path("/app/data/te_feed.jsonl")
+TE_DIR = data_path("te")
+TE_FEED_PATH = data_path("te_feed.jsonl")
 TE_FEED_KEEP = 60
 TE_TOP_PAGES = 4
 TE_CONTEXT_CHARS = 7000
@@ -3058,7 +3159,7 @@ def _comfy_workflow(prompt: str) -> dict[str, Any]:
     graph — installed alongside this app it is the Z-Image Turbo graph lifted
     from a verified render's PNG metadata.
     """
-    graph = _load_workflow_override(Path("/app/data/comfy_workflow.json"))
+    graph = _load_workflow_override(data_path("comfy_workflow.json"))
     if graph is None:
         graph = {
             "3": {"class_type": "KSampler", "inputs": {
@@ -3096,7 +3197,7 @@ def _comfy_video_workflow(prompt: str) -> dict[str, Any]:
     placeholder) overrides it — drop an exported WAN/LTX preset there. The
     default is ComfyUI's WAN 2.2 5B text-to-video template against the models
     installed on this box, saving an .mp4 straight into the gallery."""
-    graph = _load_workflow_override(Path("/app/data/comfy_video_workflow.json"))
+    graph = _load_workflow_override(data_path("comfy_video_workflow.json"))
     if graph is None:
         graph = {
             "37": {"class_type": "UNETLoader", "inputs": {
@@ -3919,7 +4020,7 @@ async def mirror_to_openwebui(user_text: str, answer: str, model: str) -> None:
 # The token is pasted once and must survive settings resets, container
 # rebuilds and edits made from other machines — so it also lives in its own
 # file next to settings.json.
-HA_TOKEN_PATH = Path("/app/data/ha_token")
+HA_TOKEN_PATH = data_path("ha_token")
 
 
 def _ha_token_persist(token: str, player: str) -> None:
@@ -3945,17 +4046,22 @@ def _ha_token_stored() -> dict[str, str]:
         return {"token": "", "player": ""}
 
 
-def _ha_creds() -> tuple[str, str]:
-    """(token, media_player): env wins, then settings.json, then the standalone
-    token file — so voice out keeps working even if settings are reset."""
+def _ha_creds(reply: bool = False) -> tuple[str, str]:
+    """(token, media_player): token from env/settings/file; player from the
+    selected route, with an explicit reply player allowed to override."""
     voice = load_settings().get("voice_out") or {}
     backup = _ha_token_stored()
     token = HA_TOKEN or str(voice.get("ha_token") or "") or backup["token"]
-    player = (
-        HA_MEDIA_PLAYER
-        or str(voice.get("media_player") or "")
-        or backup["player"]
-    )
+    reply_player = str(voice.get("reply_media_player") or "")
+    if reply and reply_player:
+        player = reply_player
+    elif _RADIO.get("voice_device") == "nabu":
+        player = NABU_SATELLITE
+    elif _RADIO.get("voice_device") == "pine":
+        player = PINEVOICE_SATELLITE
+    else:
+        player = HA_MEDIA_PLAYER or str(voice.get("media_player") or "") \
+            or backup["player"]
     return token, player
 
 
@@ -4096,7 +4202,7 @@ async def piper_fallback_voice(who: str = "") -> str:
     own configured voice, then the station's other Piper voices, then whatever
     Piper actually has installed. Only an unreachable Piper returns ""."""
     dj = dj_settings()
-    seats = {"dj": "voice", "cohost": "cohost_voice",
+    seats = {"dj": "voice", "host": "voice", "cohost": "cohost_voice",
              "third": "third_voice", "drop": "drop_voice"}
     mine = str(dj.get(seats.get(who, "voice")) or "").strip()
     # This speaker's OWN voice first, when it happens to be a Piper one, then
@@ -4135,7 +4241,7 @@ def clone_fallback_voice(who: str = "") -> str:
     voice is a Piper one, could not speak a word. Any voice beats silence
     means BOTH directions."""
     dj = dj_settings()
-    seats = {"dj": "voice", "cohost": "cohost_voice",
+    seats = {"dj": "voice", "host": "voice", "cohost": "cohost_voice",
              "third": "third_voice", "drop": "drop_voice"}
     tries = [str(dj.get(seats.get(who, "voice")) or "")]
     tries += [str(dj.get(f) or "") for f in seats.values()]
@@ -4172,10 +4278,12 @@ def _model_call_for(text: str) -> dict[str, Any]:
 async def voice_render_any(text: str, voice: str, engine: str = "",
                            fx: dict[str, float] | None = None,
                            who: str = "") -> dict[str, Any] | None:
-    """Render this line with whatever works, and do not come back empty.
+    """Render this line through the assigned actor whenever possible.
 
-    THE contract for #784: while any engine on this box is alive, a written
-    line gets audio. The rungs, in order —
+    THE contract for #784: ordinary lines use every available engine to stay
+    audible; configured booth actors retain their identity and wait on the
+    retry shelf if both of their clone-engine paths are unavailable. The rungs,
+    in order —
       1. the voice and engine asked for;
       2. the OTHER cloning engine when the voice is a library clone — both
          XTTS and F5 take the same reference, so a clone is never stranded
@@ -4238,50 +4346,44 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                 except OSError:
                     return None
     is_clone = bool(VOICE_ID_SHAPE.match(voice or ""))
-    stand_in = await piper_fallback_voice(who)
+    seats = {"dj": "voice", "host": "voice", "cohost": "cohost_voice",
+             "third": "third_voice", "drop": "drop_voice"}
+    selected = str(dj_settings().get(seats.get(who, "")) or "").strip()
+    # A named on-air actor is a casting decision. Do not substitute it merely
+    # because the fast relief path is active; a failed take goes to retry.
+    actor_locked = bool(selected and voice == selected and who in seats)
+    stand_in = await piper_fallback_voice(who) if not actor_locked else ""
     rungs: list[tuple[str, str, str]] = []
-    if is_clone and engine not in ("xtts", "f5"):
-        # THE bug behind the 29 silent lines. Under render relief
-        # voice_engine_for returns "piper" for a clone — a deliberate "borrow
-        # the fast engine" decision — but it does NOT swap the voice, so the
-        # caller carries a vl_ id into Piper's allowlist, which rejects it as
-        # "No such voice". The rescue gates then ask `engine != "piper"`,
-        # which is False, and skip the fallback exactly when it is needed. A
-        # clone id is not a Piper voice: honour the intent by taking Piper
-        # with a Piper VOICE, and keep the clone as the rung below.
-        if stand_in:
-            rungs.append((stand_in, "piper", ""))
-        clone_engine = str((voice_meta(voice) or {}).get("engine") or "xtts")
-        rungs.append((voice, clone_engine,
-                      "Piper would not take it either — back to the clone"))
+    if is_clone:
+        clone_engine = engine if engine in ("xtts", "f5") else str(
+            (voice_meta(voice) or {}).get("engine") or "xtts")
+        pick = str(dj_settings().get("clone_engine") or "")
+        if pick in ("xtts", "f5"):
+            clone_engine = pick
+        rungs.append((voice, clone_engine, ""))
+        other = "f5" if clone_engine == "xtts" else "xtts"
+        rungs.append((voice, other, f"{clone_engine} would not render it — the "
+                                    f"same clone through {other} (#784)"))
+        if stand_in and stand_in != voice:
+            rungs.append((stand_in, "piper", "the clone road is down — a "
+                          "stand-in Piper voice so the line still goes out (#784)"))
     else:
         rungs.append((voice, engine, ""))
-        if is_clone:
-            other = "f5" if engine == "xtts" else "xtts"
-            rungs.append((voice, other, f"{engine} would not render it — the "
-                                        f"same clone through {other} (#784)"))
         if stand_in and stand_in != voice:
-            rungs.append((stand_in, "piper",
-                          "the clone road is down — a stand-in Piper voice "
-                          "so the line still goes out (#784)"))
-    # #784: and the crossing the other way. When PIPER is the sick one — its
-    # port open, its voice list empty, every name rejected — a Piper-voiced
-    # speaker had no road at all. A library voice is not their timbre, but it
-    # is a voice, and the rule is that the line is heard.
-    if not is_clone:
-        borrowed = clone_fallback_voice(who)
-        if borrowed:
-            rungs.append((borrowed, "xtts",
-                          "Piper is not answering — the line goes out in a "
-                          "borrowed cloned voice (#784)"))
-            rungs.append((borrowed, "f5",
-                          "Piper is not answering — the line goes out in a "
-                          "borrowed cloned voice (#784)"))
-    # The floor: Piper's own default, no voice named, no effects. The
-    # allowlist cannot reject a voice that was never named, so while Piper
-    # answers at all, this rung speaks.
-    rungs.append(("", "piper", "every named voice refused — the line goes "
-                               "out plain rather than not at all (#784)"))
+            rungs.append((stand_in, "piper", "the selected Piper voice is "
+                          "unavailable — a stand-in keeps the line moving (#784)"))
+        if not actor_locked:
+            borrowed = clone_fallback_voice(who)
+            if borrowed:
+                rungs.append((borrowed, "xtts", "Piper is not answering — the "
+                              "line goes out in a borrowed cloned voice (#784)"))
+                rungs.append((borrowed, "f5", "Piper is not answering — the "
+                              "line goes out in a borrowed cloned voice (#784)"))
+    # A configured actor never falls through to an unnamed voice. A failed
+    # engine becomes a retried line rather than a different character.
+    if not actor_locked:
+        rungs.append(("", "piper", "every named voice refused — the line goes "
+                                   "out plain rather than not at all (#784)"))
     tried: list[str] = []
     for name, eng, why in rungs:
         try:
@@ -4352,7 +4454,7 @@ async def render_backlog_drain() -> None:
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": held.get("text", ""), "voice": held.get("voice", ""),
             })
-            del _RADIO["voice_clips"][:-140]
+            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             for row in reversed(_RADIO.get("chat") or []):
                 if row.get("id") == held.get("id"):
                     row["aired"] = "page"
@@ -4402,6 +4504,7 @@ async def stop_speaking() -> dict[str, Any]:
     _SPEECH_TASKS.clear()
 
     token, player = _ha_creds()
+    _reply_token, reply_player = _ha_creds(reply=True)
     stopped_player = False
     if token and player and not player.startswith("assist_satellite."):
         try:
@@ -4428,26 +4531,27 @@ async def stop_speaking() -> dict[str, Any]:
 # Whether the satellite answered recently, so we do not keep firing announce
 # calls at a device that is switched off. Home Assistant logs a warning for
 # every one of those, and they were arriving in bursts.
-_SAT_ALIVE: dict[str, Any] = {"ok": True, "checked": 0.0}
+_SAT_ALIVE: dict[str, Any] = {"ok": True, "checked": 0.0, "entity": ""}
 _SAT_RECHECK = 60.0
 
 
-async def satellite_ready(heal: bool = True) -> bool:
+async def satellite_ready(heal: bool = True, reply: bool = False) -> bool:
     """Cheap, cached liveness for the speaker. Pessimistic by design: if we
     cannot tell, we assume it is there and let the call fail once.
 
     `heal=False` asks the question without acting on the answer (#690) —
     for a status readout, which wants to know whether the box is up and has
     no business rebuilding its link as a side effect of being looked at."""
-    now = time.time()
-    if now - _SAT_ALIVE["checked"] < _SAT_RECHECK:
-        return bool(_SAT_ALIVE["ok"])
-
-    _SAT_ALIVE["checked"] = now
-    token, player = _ha_creds()
+    token, player = _ha_creds(reply=reply)
     if not (token and player):
         _SAT_ALIVE["ok"] = False
         return False
+    now = time.time()
+    if (_SAT_ALIVE.get("entity") == player
+            and now - _SAT_ALIVE["checked"] < _SAT_RECHECK):
+        return bool(_SAT_ALIVE["ok"])
+
+    _SAT_ALIVE.update({"checked": now, "entity": player})
     try:
         async with httpx.AsyncClient(timeout=6) as client:
             response = await client.get(
@@ -4478,7 +4582,7 @@ async def satellite_ready(heal: bool = True) -> bool:
 # What the satellite was doing last time anyone asked, and when. Not the same
 # question as satellite_ready: alive is a minute-stale fact and stays true all
 # day, but busy changes second to second (#206).
-_SAT_BUSY: dict[str, Any] = {"state": "", "at": 0.0}
+_SAT_BUSY: dict[str, Any] = {"state": "", "at": 0.0, "entity": ""}
 _SAT_BUSY_FRESH = 1.5
 # Whether this agent is on the speaker right now, and when it last was. Our
 # own announce puts the satellite in "responding" too, so without both of
@@ -4543,12 +4647,13 @@ async def satellite_busy() -> bool:
     answer away. Deliberately uncached beyond a second and a half: ready-ness
     is cached for a minute, and a minute-old answer to this question would
     either gag the show or never fire at all."""
-    now = time.time()
-    if now - _SAT_BUSY["at"] < _SAT_BUSY_FRESH:
-        return _busy_with_someone(str(_SAT_BUSY["state"]))
     token, player = _ha_creds()
     if not (token and player):
         return False
+    now = time.time()
+    if (_SAT_BUSY.get("entity") == player
+            and now - _SAT_BUSY["at"] < _SAT_BUSY_FRESH):
+        return _busy_with_someone(str(_SAT_BUSY["state"]))
     try:
         async with httpx.AsyncClient(timeout=4) as client:
             response = await client.get(
@@ -4557,7 +4662,7 @@ async def satellite_busy() -> bool:
         state = str((response.json() or {}).get("state") or "")
     except Exception:
         return False                     # cannot tell; the show goes on
-    _SAT_BUSY.update({"state": state, "at": now})
+    _SAT_BUSY.update({"state": state, "at": now, "entity": player})
     # A reply cannot run two straight minutes on this board. A satellite
     # stuck in "responding" is a wedged assist session (#369, #373) — it
     # gagged whole stretches of the show — so heal it and stop treating
@@ -4760,7 +4865,7 @@ async def satellite_selfheal() -> bool:
         # through the docker socket, not HA's API, so it can still fire
         # (audit: a broken HA API used to leave the streak stuck forever).
         _HEAL_STREAK[0] += 1
-        if _HEAL_STREAK[0] >= 3:
+        if _HEAL_STREAK[0] >= 3 and HA_RESTART_ESCALATION:
             asyncio.create_task(ha_restart_container())
         return False
 
@@ -4776,13 +4881,13 @@ async def satellite_selfheal() -> bool:
         # them means the wedge is deeper than the link (#413): escalate
         # to restarting Home Assistant itself.
         _HEAL_STREAK[0] += 1
-        if _HEAL_STREAK[0] >= 3:
+        if _HEAL_STREAK[0] >= 3 and HA_RESTART_ESCALATION:
             asyncio.create_task(ha_restart_container())
         await asyncio.sleep(6)          # give it a moment to come back up
     else:
         # A reload that returned >=400 counts toward escalation too.
         _HEAL_STREAK[0] += 1
-        if _HEAL_STREAK[0] >= 3:
+        if _HEAL_STREAK[0] >= 3 and HA_RESTART_ESCALATION:
             asyncio.create_task(ha_restart_container())
         if _RADIO.get("on"):
             asyncio.create_task(dj_banter(None, lines=3, angle=(
@@ -4822,7 +4927,8 @@ def say_retry_plan(attempt: int, status: int, body: str
     return True, 2.0 if attempt == 0 else 4.0, attempt >= 1 and not busy
 
 
-async def _say_via_clip(text: str, voice: str | None) -> dict[str, Any] | None:
+async def _say_via_clip(text: str, voice: str | None,
+                        reply: bool = False) -> dict[str, Any] | None:
     """The other way in: synthesise it here and hand the box a finished clip.
 
     No readiness check, no tts_get_url, no TTS engine on the Home Assistant
@@ -4833,7 +4939,7 @@ async def _say_via_clip(text: str, voice: str | None) -> dict[str, Any] | None:
     try:
         clip = await voice_generate(
             text, voice or _event_voice("default"), "piper")
-        if await _play_on_box(clip["path"], clip["sig"]):
+        if await _play_on_box(clip["path"], clip["sig"], reply=reply):
             return {"spoken": text, "engine": "ha", "fallback": "clip"}
     except Exception:
         pass
@@ -4851,7 +4957,7 @@ async def home_assistant_say(
         # Not an error — a decline. Callers already read `skipped` as
         # "never reached the room" and take the page road instead (#638).
         return {"spoken": text, "skipped": "replies are switched off"}
-    token, player = _ha_creds()
+    token, player = _ha_creds(reply=True)
     if not token:
         raise HTTPException(
             status_code=400,
@@ -4866,11 +4972,17 @@ async def home_assistant_say(
     voice = voice if voice is not None else _event_voice(event)
     options = {"voice": voice} if voice else {}
 
-    if not await satellite_ready():
+    # Nabu is the station speaker, not a notification endpoint. Keep replies
+    # on its authored-clip route as well, so Assist never adds a preannounce.
+    if player == NABU_SATELLITE:
+        return (await _say_via_clip(text, voice, reply=True)
+                or {"spoken": text, "skipped": "Nabu media player unavailable"})
+
+    if not await satellite_ready(reply=True):
         # The speaker reads unavailable. Retrying this way just fills Home
         # Assistant's log with "entity not available" warnings — but a
         # finished clip goes by another road, so try that before giving up.
-        return (await _say_via_clip(text, voice)
+        return (await _say_via_clip(text, voice, reply=True)
                 or {"spoken": text, "skipped": "satellite unavailable"})
 
     # An assist satellite (the Pine Box itself) speaks via announce; a
@@ -4936,10 +5048,10 @@ async def home_assistant_say(
                     attempt, exc.response.status_code, exc.response.text)
                 if retry:
                     await asyncio.sleep(wait)
-                    if rebuild:
+                    if rebuild and player == _ha_creds()[1]:
                         await satellite_selfheal()
                     continue
-                fell = await _say_via_clip(text, voice)
+                fell = await _say_via_clip(text, voice, reply=True)
                 if fell:
                     return fell
                 raise HTTPException(
@@ -4950,7 +5062,7 @@ async def home_assistant_say(
                     ),
                 ) from exc
             except httpx.RequestError as exc:
-                fell = await _say_via_clip(text, voice)
+                fell = await _say_via_clip(text, voice, reply=True)
                 if fell:
                     return fell
                 raise HTTPException(
@@ -5543,7 +5655,7 @@ def _pending_login_url() -> str:
     automatically; it exists so a login started from the host side can be
     finished from the browser."""
     try:
-        raw = Path("/app/data/tailscale_login.txt").read_text().strip()
+        raw = data_path("tailscale_login.txt").read_text().strip()
     except Exception:
         return ""
     for word in raw.split():
@@ -5755,7 +5867,7 @@ def remote_access(fresh: bool = False) -> dict[str, Any]:
 # --- Share links (#632) -----------------------------------------------------
 # A tune-in link is a SIGNED token, never the API key: it expires, it can be
 # revoked, and it only opens the six routes a listener needs.
-SHARES_PATH = Path("/app/data/shares.json")
+SHARES_PATH = data_path("shares.json")
 _SHARES_LOCK = RLock()
 
 
@@ -5998,7 +6110,7 @@ def caller_clone_pool() -> list[str]:
 # `digest % len(pool)`, ADDING a voice re-points every existing caller at a
 # different one, so "the same person sounds the same" quietly broke every
 # time you imported anything.
-VOICE_AIRTIME_PATH = Path("/app/data/voice_airtime.json")
+VOICE_AIRTIME_PATH = data_path("voice_airtime.json")
 _AIRTIME_LOCK = RLock()
 
 
@@ -6222,7 +6334,11 @@ def voice_engine_for(voice: str) -> str:
         # speaks goes quiet, and quiet is the one thing a stream cannot be.
         # When the clone engine is demonstrably behind, borrow the fast one
         # and hand the clones back the moment it recovers.
-        if engine in ("xtts", "f5") and render_relief():
+        # The configured booth cast is exempt from relief. A DJ actor cannot
+        # become Piper simply because the clone engine is momentarily busy.
+        cast = {str(dj_settings().get(key) or "").strip()
+                for key in ("voice", "cohost_voice", "third_voice", "drop_voice")}
+        if engine in ("xtts", "f5") and render_relief() and voice not in cast:
             return "piper"
         return engine if engine in VOICE_FILE_ENGINES else "xtts"
     if voice in VOXTRAL_PRESETS:
@@ -6580,7 +6696,9 @@ def _airtime_note(expected: float, actual: float) -> None:
             _CUTSHORT_STREAK[0] = 0
             try:
                 cur = int(dj_settings()["say_max_seconds"])
-                target = max(4, min(cur - 2, int(actual) - 1))
+                # Preserve the operator-selected creative ceiling. Some
+                # network players acknowledge a clip before it finishes.
+                target = cur
                 if target < cur:
                     s = load_settings()
                     s.setdefault("dj", {})["say_max_seconds"] = target
@@ -6650,19 +6768,30 @@ def _clip_seconds(path: str) -> float:
         return 0.0
 
 
-async def _play_on_box(path: str, sig: str, reply: bool = False) -> str:
+async def _play_on_box(path: str, sig: str, reply: bool = False,
+                       replay: bool = False) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
     still plays it even when Home Assistant is unreachable."""
     if not box_talk_ok(reply=reply):
         note_activity("held", "Pine Box switched off — kept for the page")
         return ""                    # the existing "box declined" contract
-    token, player = _ha_creds()
+    token, player = _ha_creds(reply=reply)
     if not (token and player):
         # No box wired: do not claim to be speaking on it (#539).
         note_activity("held", "no Pine Box wired — kept for the page")
         return ""
     url = f"{VOICE_PUBLIC_URL}{path}" + (f"?t={sig}" if sig else "")
-    if player.startswith("assist_satellite."):
+    if player == NABU_SATELLITE:
+        # Nabu's Assist announce path can add device feedback even with
+        # preannounce disabled. Its companion media-player entity plays the
+        # station's authored file directly, with no extra cue.
+        service = "media_player/play_media"
+        payload: dict[str, Any] = {
+            "entity_id": NABU_MEDIA_PLAYER,
+            "media_content_id": url,
+            "media_content_type": "music",
+        }
+    elif player.startswith("assist_satellite."):
         service = "assist_satellite/announce"
         payload: dict[str, Any] = {"entity_id": player, "media_id": url}
     else:
@@ -6684,12 +6813,19 @@ async def _play_on_box(path: str, sig: str, reply: bool = False) -> str:
     # Threshold dropped to 10 (#603: "audio stuttering, about to power cycle") —
     # a wedged box hits it in seconds and goes quiet fast, a working box rarely
     # holds ten, and the breaker heals after 90s so a recovered box is retried.
-    if len(_BOX_HOLD) >= 10:
-        if time.time() >= float(_BOX_DOWN["until"]):
-            _box_announce_failed()
-            _box_announce_failed()
+    # The swamped guard protects fresh live traffic from adding to a failing
+    # device. A replay is the recovery path itself: blocking it at the same
+    # threshold creates a permanent queue deadlock once the shelf reaches 10.
+    if not replay and _BOX_HOLD:
+        # Legacy clips have no cast signature and may have been rendered in
+        # a default voice before the current actors were selected. Preserve
+        # them and recast them on replay, but do not let that migration hold
+        # every fresh live discussion hostage behind an old shelf.
+        if str(_BOX_HOLD[0].get("cast") or "") == _radio_cast_signature():
+            note_activity("held", "earlier dialogue is airing first - queued in order")
+            return ""
+        note_activity("recasting", "legacy dialogue is being rebuilt between live turns")
         note_activity("held", "box swamped — kept for the page + shelf")
-        return ""
     # The circuit breaker (#394): a box that hangs announces twice in a
     # row is DOWN — for the next 90 seconds every line declines
     # instantly, goes to the page and the hold shelf, and the records
@@ -6727,22 +6863,31 @@ async def _play_on_box(path: str, sig: str, reply: bool = False) -> str:
                         json=payload,
                     )
                 if response.status_code < 400:
-                    _ANNOUNCE_LAST["error"] = ""   # nothing left to report
-                    _BOX_DOWN.update({"fails": 0, "until": 0.0})
-                    _BOX_LAST_OK[0] = time.time()
-                    _HEAL_STREAK[0] = 0    # the link works; ladder resets
+                    _ANNOUNCE_LAST["error"] = ""   # transport accepted it
+                    # An accepted HTTP request is not audible proof. The box
+                    # can acknowledge a clip while its speaker plays nothing;
+                    # only the playout meter below clears a delivery failure.
                     # The delivery meter (#423): the call blocks for
                     # playback, so its wall time IS how far the clip got.
                     played = time.monotonic() - attempt_started
-                    _airtime_note(seconds, played)
+                    # Nabu accepts a media command before it has finished
+                    # playing. Do not mistake that acknowledgement for a
+                    # four-second clip and silently shrink the DJ limit.
+                    metered = seconds if player == NABU_SATELLITE else played
+                    _airtime_note(seconds, metered)
                     # Did it actually come OUT of the box (#467)? Unknown
                     # length (stings/tapes) → assume yes; those are short and
                     # not the conversation audio we must never lose.
                     ratio = min(1.0, played / seconds) if seconds > 0.5 \
                         else 1.0
+                    verified = ratio >= PLAYED_OUT_RATIO
                     _LAST_PLAYOUT.update({
                         "key": _played_out_key(path), "ratio": round(ratio, 2),
-                        "ok": ratio >= PLAYED_OUT_RATIO, "at": time.time()})
+                        "ok": verified, "at": time.time()})
+                    if verified:
+                        _BOX_DOWN.update({"fails": 0, "until": 0.0})
+                        _BOX_LAST_OK[0] = time.time()
+                        _HEAL_STREAK[0] = 0
                     # Home Assistant can hand the call back before the
                     # satellite has finished SAYING it — which is how the
                     # next announce kept cutting long replies mid-word
@@ -6753,6 +6898,26 @@ async def _play_on_box(path: str, sig: str, reply: bool = False) -> str:
                     remain = seconds - (time.monotonic() - attempt_started)
                     if remain > 0:
                         await asyncio.sleep(min(remain + 0.4, 180.0))
+                    # ESPHome Voice Preview satellites acknowledge an
+                    # `assist_satellite.announce` as soon as Home Assistant
+                    # schedules it, rather than after playback finishes.
+                    # Their zero-second HTTP call is therefore not evidence
+                    # of silence. Once the full clip airtime has elapsed,
+                    # confirm the selected HA-owned satellite is still online
+                    # and close the breaker. PineVoice keeps the stricter
+                    # wall-time meter above because it owns its direct
+                    # Wyoming transport.
+                    if (not verified and player.startswith("assist_satellite.")):
+                        link = await satellite_status()
+                        if (link.get("transport") == "home_assistant"
+                                and link.get("online")
+                                and link.get("reachable")):
+                            _LAST_PLAYOUT.update({
+                                "key": _played_out_key(path), "ratio": 1.0,
+                                "ok": True, "at": time.time()})
+                            _BOX_DOWN.update({"fails": 0, "until": 0.0})
+                            _BOX_LAST_OK[0] = time.time()
+                            _HEAL_STREAK[0] = 0
                     return player
                 retry, wait, rebuild = say_retry_plan(
                     attempt, response.status_code, response.text)
@@ -6768,9 +6933,17 @@ async def _play_on_box(path: str, sig: str, reply: bool = False) -> str:
                 if rebuild:
                     await satellite_selfheal()
             except Exception as exc:
-                # Swallowing this silently is what made the stall so hard to
-                # see.
+                # A dropped HA connection is transient far more often than it
+                # is terminal. Keep this clip under the same bounded retry
+                # policy as an HTTP failure before handing it to the shelf.
                 _ANNOUNCE_LAST["error"] = f"{type(exc).__name__}: {exc}"[:200]
+                if attempt < 2:
+                    wait = 0.8 * (attempt + 1)
+                    pipeline_log("air", "Pine Box transport missed — retrying "
+                                 f"announce in {wait:.1f}s",
+                                 extra=_ANNOUNCE_LAST["error"])
+                    await asyncio.sleep(wait)
+                    continue
                 _box_announce_failed()
                 return ""
         _box_announce_failed()
@@ -6855,6 +7028,12 @@ def satellite_healed_at() -> float:
     tells whoever is reading the health panel that the link was repaired and
     is still broken, which is the opposite of the truth."""
     return _HEALED_AT[0]
+
+
+def box_recently_verified(window: float = 300.0) -> bool:
+    """True only after the room, not merely Home Assistant, carried a clip."""
+    return bool(_BOX_LAST_OK[0] and time.time() - _BOX_LAST_OK[0] < window
+                and _LAST_PLAYOUT.get("ok"))
 
 
 def announce_health() -> dict[str, Any]:
@@ -7669,7 +7848,14 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
     if not await satellite_ready():
         return ""                    # nothing to play it on
     url = music_url(track)
-    if player.startswith("assist_satellite."):
+    if player == NABU_SATELLITE:
+        service = "media_player/play_media"
+        payload: dict[str, Any] = {
+            "entity_id": NABU_MEDIA_PLAYER,
+            "media_content_id": url,
+            "media_content_type": "music",
+        }
+    elif player.startswith("assist_satellite."):
         service = "assist_satellite/announce"
         payload: dict[str, Any] = {"entity_id": player, "media_id": url}
     else:
@@ -7713,6 +7899,10 @@ _RADIO: dict[str, Any] = {
     "station": "", "queue": [], "now": None, "started": 0.0, "dj": True,
 }
 _RADIO_TASK: list[Any] = []
+VOICE_CLIP_FEED_KEEP = int(os.getenv("VOICE_CLIP_FEED_KEEP", "2000"))
+# A shared on-air instant gives each listener time to fetch a clip, then seek
+# into the exact same point if its network delivery was late.
+VOICE_BROADCAST_LEAD_MS = int(os.getenv("VOICE_BROADCAST_LEAD_MS", "7000"))
 
 
 def radio_state() -> dict[str, Any]:
@@ -7750,7 +7940,7 @@ def note_activity(stage: str, detail: str = "") -> None:
 # mined for the stock phrasings the model keeps leaning on — which then go
 # into every prompt as a DO-NOT-REUSE list. The model cannot remember its
 # own reruns; this remembers for it.
-SAID_LINES_PATH = Path("/app/data/said_lines.json")
+SAID_LINES_PATH = data_path("said_lines.json")
 _SAID_LOCK = RLock()
 _PHRASE_CACHE: dict[str, Any] = {"at": 0.0, "phrases": []}
 _DWELL_CACHE: dict[str, Any] = {"at": 0.0, "subjects": []}
@@ -7922,7 +8112,7 @@ def overdwelt_subjects(most: int = 4) -> list[str]:
 # vocabulary — vibrations, frequencies — and no amount of "talk about
 # something else" gets them off a WORD. This is the word itself, banned by
 # hand, with a clock on it so a ban is a mood and not a permanent edit.
-BANNED_WORDS_PATH = Path("/app/data/banned_words.json")
+BANNED_WORDS_PATH = data_path("banned_words.json")
 _BANNED_LOCK = RLock()
 
 
@@ -8641,7 +8831,7 @@ async def play_music_request(text: str) -> str:
 # the panel's colour and stays sharp at any size. Hand-drawn beats a render:
 # it is 1 KB, deterministic, and readable at 24 px where a photo is mud.
 
-TE_ICONS = Path("/app/data/te")
+TE_ICONS = data_path("te")
 
 
 def te_icon(slug: str) -> str:
@@ -8714,7 +8904,7 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": line,
             })
-            del _RADIO["voice_clips"][:-140]
+            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         # And onto the box — if it is stalling right now, the ack waits on
         # the hold shelf and plays the moment the box recovers, so the
         # spoken "got your request" is never simply lost (#436).
@@ -8745,7 +8935,8 @@ _RADIO.update({
     # Two independent outputs (#115). The Pine Box is the AI, so the AI's
     # voice comes out of it by default even when the music is in the browser.
     # reply_to is the box/response system routed independently (#501).
-    "music_to": "here", "voice_to": "box", "reply_to": "box", "voice_clips": [],
+    "music_to": "here", "voice_to": "box", "reply_to": "box",
+    "voice_device": "nabu", "voice_clips": [],
     # The master switch above all three (#638): False and nothing in this
     # process says a word to the satellite, whatever the routing says.
     "box_talk": True,
@@ -8759,6 +8950,139 @@ _DJ_SKIP: list[Any] = []          # an asyncio.Event, created on the loop
 
 def dj_settings() -> dict[str, Any]:
     return load_settings().get("dj") or dict(DEFAULT_DJ)
+
+
+def configured_radio_voice(who: str, voice: str = "") -> str:
+    """Never leave a named booth seat to the engine default voice."""
+    if str(voice or "").strip():
+        return str(voice).strip()
+    seat = {"dj": "voice", "host": "voice", "cohost": "cohost_voice",
+            "third": "third_voice"}.get(str(who or ""))
+    return str(dj_settings().get(seat) or "").strip() if seat else ""
+
+
+def radio_prompt_enabled(slot: str) -> bool:
+    enabled = dj_settings().get("radio_prompt_enabled") or {}
+    return bool(enabled.get(slot, DEFAULT_DJ["radio_prompt_enabled"].get(slot, True)))
+
+
+def radio_prompt_instruction(slot: str) -> str:
+    """Operator-authored instruction for one radio-writing path."""
+    if not radio_prompt_enabled(slot):
+        return ""
+    text = str((dj_settings().get("radio_prompt_overrides") or {}).get(slot)
+               or "").strip()
+    return ("\n\nOPERATOR RADIO INSTRUCTION FOR THIS TURN: " + text
+            if text else "")
+
+
+def radio_persona(slot: str, text: str) -> str:
+    """A role's persisted character prompt, unless that layer is disabled."""
+    return str(text or "") if radio_prompt_enabled(slot) else ""
+
+
+def radio_prompt_desk_state() -> dict[str, Any]:
+    """The editable and effective prompt layers for the radio prompt desk."""
+    settings = load_settings()
+    dj = settings.get("dj") or {}
+    prompts = settings.get("prompts") or []
+    active = prompts[int(settings.get("active_prompt") or 0) % len(prompts)] \
+        if prompts else {}
+    overrides = dj.get("radio_prompt_overrides") or {}
+    control_specs = {
+        "host": [("chattiness", "Host model frequency", "range", 0, 100, 1),
+                 ("reply_max_chars", "Reply budget", "number", 300, 6500, 100),
+                 ("say_max_seconds", "Statement window", "range", 4, 60, 1)],
+        "cohost": [("personality", "Personality influence", "range", 0, 100, 1),
+                   ("accent_pin", "Accent influence", "range", 0, 100, 1),
+                   ("speech_rate", "Speech rate", "range", 75, 125, 1)],
+        "third": [("third_name", "Third-seat name", "text", 0, 0, 0)],
+        "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
+                   ("caller_success_rate", "Successful calls", "range", 0, 100, 1),
+                   ("caller_insanity", "Caller intensity", "range", 0, 100, 1)],
+        "manager": [("upstairs_per_hour", "Manager interruptions per hour", "range", 0, 12, 0.5),
+                    ("manager_name", "Manager name", "text", 0, 0, 0)],
+        "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 20, 1),
+                        ("banter_max_lines", "Maximum exchange lines", "number", 2, 20, 1),
+                        ("talk_radio", "Talk-show intensity", "range", 0, 100, 1),
+                        ("overlap", "Interruptions", "range", 0, 100, 1)],
+        "speakerbox": [("speakbox_rate", "Material grounding", "range", 0, 100, 1),
+                       ("speakbox_prepend_rate", "Opening passage rate", "range", 0, 100, 1),
+                       ("speakbox_append_rate", "Closing passage rate", "range", 0, 100, 1),
+                       ("speakbox_full_swath_rate", "Uninterrupted swath rate", "range", 0, 100, 1),
+                       ("speakbox_full_swath_chars", "Uninterrupted swath length", "number", 300, 6000, 100)],
+        "gallery": [("gallery_ads", "Gallery segments enabled", "checkbox", 0, 0, 0),
+                    ("ad_price_low", "Gallery price floor", "number", 0, 10000, 10),
+                    ("ad_price_high", "Gallery price ceiling", "number", 0, 10000, 10)],
+        "music": [("lyrics_talk", "Song analysis enabled", "checkbox", 0, 0, 0),
+                  ("research", "Track research enabled", "checkbox", 0, 0, 0),
+                  ("talk_radio", "Talk-show intensity", "range", 0, 100, 1)],
+        "workplace": [("upstairs_per_hour", "Management interruptions per hour", "range", 0, 12, 0.5),
+                      ("manager_name", "Manager name", "text", 0, 0, 0)],
+    }
+    systems = {
+        "host": ["single DJ lines", "banter exchanges"],
+        "cohost": ["banter exchanges"], "third": ["third-seat exchanges"],
+        "caller": ["phone-call flow"], "manager": ["upstairs memos"],
+        "interaction": ["banter exchanges"],
+        "speakerbox": ["single DJ lines", "banter exchanges"],
+        "gallery": ["gallery rounds", "painting sales rounds"],
+        "music": ["track introductions", "music reactions", "banter exchanges"],
+        "workplace": ["upstairs memos", "manager calls", "banter exchanges"],
+    }
+    percent_keys = {"chattiness", "personality", "accent_pin",
+                    "speakbox_rate", "speakbox_prepend_rate",
+                    "speakbox_append_rate", "speakbox_full_swath_rate"}
+
+    def prompt_control(key: str, label: str, kind: str, low: float,
+                       high: float, step: float) -> dict[str, Any]:
+        scale = 0.01 if key in percent_keys else 1
+        value = dj.get(key)
+        if isinstance(value, (int, float)) and scale != 1:
+            value = round(float(value) / scale)
+        return {"key": key, "label": label, "type": kind, "min": low,
+                "max": high, "step": step, "value": value, "scale": scale}
+    roles = [
+        ("host", "Host", "persona", "Character instructions used for host lines."),
+        ("cohost", "Co-host", "cohost_persona", "Character instructions used for co-host lines."),
+        ("third", "Third seat", "third_persona", "Instructions for an enabled guest or third presenter."),
+        ("caller", "Callers", "", "Rules inserted into phone-call conversations."),
+        ("manager", "Manager", "", "Rules inserted into upstairs memos and calls."),
+        ("interaction", "Conversation flow", "", "Rules applied to every generated exchange."),
+        ("speakerbox", "Speaker box", "", "Rules for how retrieved material is brought on air."),
+        ("gallery", "Paintings & gallery", "", "Rules for describing, pricing, hawking, and reacting to artwork."),
+        ("music", "Music response", "", "Rules for reacting to songs, song analysis, and track research."),
+        ("workplace", "Station work & management", "", "Rules for the DJs' work, manager relationship, and workplace pressure."),
+    ]
+    return {
+        "active_system": {"name": str(active.get("name") or ""),
+                          "prompt": str(active.get("prompt") or ""),
+                          "enabled": bool((dj.get("radio_prompt_enabled") or {})
+                                          .get("station_system", False))},
+        "roles": [{"id": role, "name": name, "field": field,
+                   "persona": str(dj.get(field) or "") if field else "",
+                   "override": str(overrides.get(role) or ""),
+                   "enabled": bool((dj.get("radio_prompt_enabled") or {})
+                                   .get(role, True)),
+                   "presets": list((dj.get("radio_prompt_presets") or {})
+                                   .get(role) or []),
+                   "systems": systems.get(role, []),
+                   "uses": len(systems.get(role, [])),
+                   "controls": [prompt_control(key, label, kind, low, high, step)
+                                for key, label, kind, low, high, step
+                                in control_specs.get(role, [])],
+                   "description": description}
+                  for role, name, field, description in roles],
+    }
+
+
+def mind_adjustment_prompt(who: str = "dj") -> str:
+    """Operator-authored live directives for the cast, visible in Mind Topology."""
+    rows = (dj_settings().get("mind_adjustments") or {}).get(who) or []
+    notes = [str(row.get("text") or "").strip() for row in rows
+             if isinstance(row, dict) and str(row.get("text") or "").strip()]
+    return ("\n\nLIVE MIND ADJUSTMENTS FOR THIS CHARACTER: "
+            + " | ".join(notes[:12])) if notes else ""
 
 
 def settings_web_search() -> bool:
@@ -8794,7 +9118,8 @@ def dj_disposition() -> str:
     asked for it. Switching prompts then swings the mood of the show without
     touching either persona — the prompt colours them, it does not replace
     them or hand them a new job."""
-    if not dj_settings()["follow_prompt"]:
+    if not (dj_settings()["follow_prompt"]
+            and radio_prompt_enabled("station_system")):
         return ""
     text = active_prompt_text()
     if not text:
@@ -8840,7 +9165,7 @@ def title_unreadable(text: str) -> bool:
     return strange > 0 and strange >= max(1, plain)
 
 
-CRYSTAL_PATH = Path("/app/data/crystal_notes.json")
+CRYSTAL_PATH = data_path("crystal_notes.json")
 
 
 def crystal_read() -> list[dict[str, Any]]:
@@ -9172,7 +9497,10 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
                      dj.get("personality") or 0.7) else "")
         answer = await ask_model(
             (
-                f"{dj['persona']}"
+                f"{radio_persona('host', dj['persona'])}{mind_adjustment_prompt('dj')}"
+                f"{radio_prompt_instruction('host')}"
+                f"{radio_prompt_instruction('speakerbox')}"
+                f"{radio_prompt_instruction('music') if track else ''}"
                 f"{_pers}{_flavor}{day_context()}{accent_directive()}\n\n"
                 f"In TWO to FOUR full spoken sentences — rich, specific, "
                 f"worth hearing — {task}.{direct} Stay in character. Never "
@@ -9180,9 +9508,16 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
                 f"the station as "
                 f"{dj['station_name']}.{context}{aside}{show_memory()}"
                 f"{avoid_reruns()}\n\n"
-                f"For tone, here is how you usually put it: \"{fallback}\""
+                f"The earlier sentence count is superseded: use SIX to TEN "
+                f"developed spoken sentences so this radio link has room to "
+                f"build an argument, detail it, and land it.\n\n"
+                f"Write SIX to TEN full sentences. Develop one complete "
+                f"idea with concrete detail, a turn, and a landing; never "
+                f"stop at a quip. For tone, here is how you usually put it: "
+                f"\"{fallback}\""
             ),
-            limit=600 + len(aside),
+            limit=min(int(dj.get("reply_max_chars") or 6000),
+                      3600 + len(aside)),
             spice=0.35,                 # wider intonation draw (#371)
         )
         if answer:
@@ -9371,7 +9706,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # One voice per role for the whole session, and the same one whether the
     # line goes to the box or to the page (#184). session_voices already
     # honours an explicit choice in the settings.
-    forced = voice or (await session_voices()).get(who) or None
+    forced = configured_radio_voice(
+        who, voice or (await session_voices()).get(who) or "") or None
     # The reply/response system is routed independently of ordinary DJ voice
     # (#501): a caller answer can come out of the box while the banter comes
     # out of the page, or vice-versa.
@@ -9450,14 +9786,11 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                     "text": spoken, "engine": voice_engine_for(forced or ""),
                     "voice": forced or "",
                 })
-                del _RADIO["voice_clips"][:-140]
+                del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             _RADIO["chat"].append({
                 "ts": int(time.time()), "who": who, "kind": kind,
                 "text": spoken, "voice": forced or "",
-                "name": name or (dj_settings()["cohost_name"]
-                                 if who == "cohost"
-                                 else dj_settings()["third_name"]
-                                 if who == "third" else "DJ"),
+                "name": booth_actor_name(who, name),
                 "aired": "held",
             })
             del _RADIO["chat"][:-240]
@@ -9570,7 +9903,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-140]
+            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             paged = True
         elif voice_to in ("here", "both"):
             # A line that rendered to nothing must show the gap, not vanish
@@ -9626,6 +9959,12 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 # are always talking through SOMETHING.
                 waited = 0.0
                 knock_cut = _TALK_CUT[0]
+                if (not played and _RADIO.get("voice_device") == "nabu"
+                        and not await satellite_ready(heal=False)):
+                    # ESPHome has already declared this Nabu unavailable.
+                    # Do not spend ninety seconds knocking at an absent
+                    # device while the station stream is ready to carry it.
+                    waited = 90.0
                 while not played and waited < 90.0 and _RADIO.get("on") \
                         and _TALK_CUT[0] == knock_cut \
                         and time.time() >= float(_BOX_DOWN.get("until") or 0):
@@ -9717,7 +10056,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             "url": f"{clip['path']}?t={clip['sig']}",
             "text": spoken, "engine": engine, "voice": forced or "",
         })
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         paged = True
 
     # A sting off the end of it, now and then (#208). After the line, never
@@ -9736,14 +10075,32 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # making the station randomly fall silent — the clip goes out on the
     # page feed instead, with the reason on the drop log.
     diverted = False
+    # Nabu is the station's alternate broadcast receiver. When its ESPHome
+    # link is unavailable, the signed web stream is the delivery path: once
+    # the clip is published there, it is no longer owed to Nabu as duplicate
+    # device debt. PineVoice retains its strict hardware replay ledger.
+    web_delivered = False
     if to_box and why and clip:
         # A line rendered for the box that did NOT play is NEVER dropped
         # (#467, #470): it goes on the hold shelf and plays the moment the
         # box returns — no matter the routing. 'box' mode also diverts it
         # to the page so it is heard now; 'both' already carried it there.
-        box_hold(clip, spoken, who, line_id)                    # #778
-        diverted = True
-        if voice_to == "box" and not paged:
+        if _RADIO.get("voice_device") == "nabu":
+            if not paged:
+                _RADIO["voice_clips"].append({
+                    "ts": int(time.time() * 1000),
+                    "url": f"{clip['path']}?t={clip['sig']}",
+                    "text": spoken, "engine": engine, "voice": forced or "",
+                })
+                del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+                paged = True
+            note_drop(who, spoken,
+                      f"Nabu unavailable — delivered by station stream: {why}"[:200])
+            web_delivered = True
+        else:
+            box_hold(clip, spoken, who, line_id)                # #778
+            diverted = True
+        if not web_delivered and voice_to == "box" and not paged:
             note_drop(who, spoken,
                       f"box declined — page + held for the box: {why}"[:200])
             _RADIO["voice_clips"].append({
@@ -9751,8 +10108,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-140]
-        else:
+            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+        elif not web_delivered:
             note_drop(who, spoken,
                       f"box declined — held for the box: {why}"[:200])
         why = ""
@@ -9787,9 +10144,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         "id": line_id,                                            # #742
         "ts": int(time.time()), "who": who, "kind": kind, "text": spoken,
         "air_at": _air_at or time.time(),                          # #770
-        "name": name or (dj_settings()["cohost_name"] if who == "cohost"
-                         else dj_settings()["third_name"]
-                         if who == "third" else "DJ"),
+        "name": booth_actor_name(who, name),
         # Who said it and what wrote it, on the line itself (#226). Sixty
         # voices and a settable model mean "that one — do that again" is
         # otherwise a guess.
@@ -9845,7 +10200,9 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             "ms": _hit.get("ms"), "searched": _hit.get("searched"),
             "engine": _hit.get("engine", ""), "how": _hit.get("how", ""),
         }
-    if diverted:
+    if web_delivered:
+        entry["aired"] = "page"
+    elif diverted:
         # Honest transcript (#344, #391): the page carried it live and
         # the hold shelf queues it for the box — 🕐, not lost.
         entry["aired"] = "held"
@@ -9901,7 +10258,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-140]
+            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             entry["aired"] = "page"
         else:
             # #784: "There should never be dialogue not being played." If
@@ -9978,9 +10335,7 @@ def _speaking_now_set(line_id: str, who: str, kind: str, text: str,
         "who": who,
         "kind": kind,
         "text": text,
-        "name": name or (dj_settings()["cohost_name"] if who == "cohost"
-                         else dj_settings()["third_name"] if who == "third"
-                         else "DJ"),
+        "name": booth_actor_name(who, name),
         "voice": voice,
         "engine": engine,
         "aired": "airing",
@@ -10053,7 +10408,8 @@ def speaking_now() -> dict[str, Any] | None:
                     "who": str(row.get("who") or "dj"),
                     "kind": str(row.get("kind") or "call"),
                     "text": str(row.get("text") or ""),
-                    "name": str(row.get("name") or ""),
+                    "name": booth_actor_name(str(row.get("who") or "dj"),
+                                              str(row.get("name") or "")),
                     "voice": "", "engine": "",
                     "aired": "airing",
                 }
@@ -10084,6 +10440,28 @@ def dj_state() -> dict[str, Any]:
     # air (#176, #178).
     upnext = _RADIO.get("coming") or {}
     _ensure_chat_ids()
+    # Older/pre-rendered rows can predate the cast binding and arrive without
+    # a voice field. Repair the display contract at the API boundary too: a
+    # named host or co-host must never be represented as "engine default".
+    chat_rows: list[dict[str, Any]] = []
+    for raw in _RADIO["chat"][-240:]:
+        row = dict(raw)
+        # Old rows and the former coalesced-stream writer did not always carry
+        # a display name. Repair them here too, so Skip is never split into a
+        # generic "Co-host" identity in the live booth.
+        row["name"] = booth_actor_name(str(row.get("who") or ""),
+                                       str(row.get("name") or ""))
+        cast_voice = configured_radio_voice(str(row.get("who") or ""),
+                                            str(row.get("voice") or ""))
+        if cast_voice:
+            row["voice"] = cast_voice
+            trace = dict(row.get("trace") or {})
+            render = dict(trace.get("render") or {})
+            if render and not render.get("voice"):
+                render["voice"] = cast_voice
+                trace["render"] = render
+                row["trace"] = trace
+        chat_rows.append(row)
     return {
         **base,
         "now": now,
@@ -10100,10 +10478,12 @@ def dj_state() -> dict[str, Any]:
         # lights whoever currently has the mic. The names were only ever
         # reachable through /api/settings, which the booth does not read.
         "dj_names": {
-            "host": dj_settings().get("host_name") or "the host",
-            "cohost": dj_settings().get("cohost_name") or "the cohost",
-            "third": dj_settings().get("third_name") or "",
+            "host": booth_actor_name("dj"),
+            "cohost": booth_actor_name("cohost"),
+            "third": ("" if active_guest()
+                      else str(dj_settings().get("third_name") or "")),
             "guest": str((active_guest() or {}).get("name") or ""),
+            "sfx": booth_actor_name("sfx"),
         },
         "remaining": max(0.0, round(float(track.get("seconds") or 0) - elapsed, 1)),
         "upcoming": [
@@ -10115,6 +10495,7 @@ def dj_state() -> dict[str, Any]:
         "requests": len(_RADIO["requests"]),
         "music_to": _RADIO.get("music_to") or "here",
         "voice_to": _RADIO.get("voice_to") or "box",
+        "voice_device": _RADIO.get("voice_device") or "pine",
         "reply_to": _RADIO.get("reply_to") or "box",
         "box_talk": bool(_RADIO.get("box_talk", True)),
         # The painting(s) the pair are currently hawking, so the booth can
@@ -10190,6 +10571,9 @@ def dj_state() -> dict[str, Any]:
         "talk_next_in": (
             max(0.0, round(float(_RADIO["talk_next_at"]) - time.time(), 1))
             if _RADIO.get("talk_next_at") and not _SPEAKING[0] else None),
+        # The continuity inspector: which part of the write → render →
+        # delivery pipeline is protecting the next handoff, or holding it up.
+        "dialogue_flow": dialogue_flow_state(),
         # Which model is writing the lines, for the provenance card (#655).
         "model": str(load_settings().get("model") or ""),
         # The booth keeps its own running history now (#656), but it can
@@ -10200,7 +10584,7 @@ def dj_state() -> dict[str, Any]:
         # whole burst before any of it is audible, so insertion order is not
         # broadcast order and never was. Stable, so anything sharing a moment
         # keeps the order it was written in.
-        "chat": sorted(_RADIO["chat"][-240:],
+        "chat": sorted(chat_rows,
                        key=lambda m: float(m.get("air_at")
                                            or m.get("ts") or 0)),
         # #772: the whole per-turn timeline of the round that is playing, so
@@ -10288,7 +10672,7 @@ def dj_next_track() -> dict[str, Any] | None:
 # Everything that has been on air, newest first, kept on disk. The in-memory
 # history is forty deep and dies with the process, which is no use when the
 # song you liked went past an hour ago and you want it back (#203).
-PLAYED_PATH = Path("/app/data/played.json")
+PLAYED_PATH = data_path("played.json")
 PLAYED_KEPT = 300
 _PLAYED_LOCK = RLock()
 
@@ -10355,6 +10739,8 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
             notes = await track_notes(track)
         except Exception:
             notes = ""
+    if notes:
+        song_analysis_ready(track, notes)
     # Hear the words (#451): whisper the song in the background so
     # a banter round this track can quote what it is actually
     # singing. Fire-and-forget — the cache is ready by the round.
@@ -10847,7 +11233,7 @@ HOLD_REPLAY_STALE = float(os.getenv("HOLD_REPLAY_STALE", "600"))   # 10 minutes
 # The shelf survives restarts too (#388): the clips are files on disk and
 # their signatures are stable, so held dialogue outlives a deploy and
 # still plays — played, resolved, deleted.
-BOX_HOLD_PATH = Path("/app/data/box_hold.json")
+BOX_HOLD_PATH = data_path("box_hold.json")
 
 
 def _box_hold_save() -> None:
@@ -10883,32 +11269,99 @@ def _box_hold_load() -> None:
 
 
 def _hold_trim() -> None:
-    """Cycle the oldest held dialogue out only when the size budget or the
-    safety count is exceeded (#473) — never before."""
+    """Account for an overloaded hold shelf without deleting unplayed audio.
+
+    The shelf is the station's delivery ledger. Removing its head to make
+    room is data loss, and turns a temporary Pine Box outage into permanently
+    missing dialogue. Audio is removed only by verified replay or an explicit
+    operator deletion. The warning gives operations a chance to add storage
+    or repair the device before the filesystem itself becomes the constraint.
+    """
     total = sum(int(r.get("bytes") or 0) for r in _BOX_HOLD)
-    dropped = 0
-    while _BOX_HOLD and (total > HOLD_KEEP_BYTES
-                         or len(_BOX_HOLD) > _BOX_HOLD_MAX):
-        total -= int(_BOX_HOLD[0].get("bytes") or 0)
-        _BOX_HOLD.pop(0)
-        dropped += 1
-    if dropped:
-        pipeline_log("air", f"hold shelf full — cycled {dropped} oldest "
-                            "held line(s) out to stay under the budget (#473)")
+    if total > HOLD_KEEP_BYTES or len(_BOX_HOLD) > _BOX_HOLD_MAX:
+        pipeline_log(
+            "air", "hold shelf exceeds its storage advisory - preserving every line",
+            extra=(f"{len(_BOX_HOLD)} clips / {round(total / 1e6, 1)} MB remain "
+                   "queued until verified Pine Box playout."))
+
+
+def _radio_cast_signature() -> str:
+    """The actor assignment a held clip was rendered against."""
+    dj = dj_settings()
+    return "|".join(f"{role}={configured_radio_voice(role)}"
+                    for role in ("dj", "cohost", "third"))
+
+
+async def _recast_held_clip(held: dict[str, Any]) -> bool:
+    """Rebuild a legacy/old-cast held clip before it reaches listeners.
+
+    The hold shelf preserves text as well as audio. A cast change must not
+    strand that text in an old default voice, so the clip is rebuilt in the
+    current actors before replay. Failure keeps the old row on the shelf;
+    it is retried rather than played with the wrong cast or discarded.
+    """
+    rows = [r for r in (held.get("rows") or []) if isinstance(r, dict)]
+    if rows:
+        paths: list[str] = []
+        for row in rows:
+            who = str(row.get("who") or held.get("who") or "dj")
+            text = spoken_text(str(row.get("text") or ""))
+            if not text:
+                continue
+            voice = configured_radio_voice(who, str(row.get("voice") or ""))
+            clip = await voice_render_any(text, voice, who=who)
+            if not (clip and clip.get("path")):
+                return False
+            paths.append(str(VOICE_MEDIA_DIR / clip["path"].rsplit("/", 1)[-1]))
+            row["voice"] = clip.get("voice") or voice
+        if not paths:
+            return False
+        mixed = (await asyncio.to_thread(_call_concat_blocking, paths, False)
+                 if len(paths) > 1 else Path(paths[0]).read_bytes())
+        if not mixed:
+            return False
+        made = _store_media(mixed, "wav")
+    else:
+        who = str(held.get("who") or "dj")
+        text = spoken_text(str(held.get("text") or ""))
+        voice = configured_radio_voice(who, str(held.get("voice") or ""))
+        if not text or not voice:
+            return False
+        made = await voice_render_any(text, voice, who=who)
+        if not made:
+            return False
+        held["voice"] = made.get("voice") or voice
+    held.update({"path": made["path"], "sig": made["sig"],
+                 "bytes": int(made.get("bytes") or 0),
+                 "cast": _radio_cast_signature()})
+    held["length"] = _clip_seconds(made["path"]) or float(held.get("length") or 0)
+    _box_hold_save()
+    pipeline_log("voice", "held dialogue recast into the current booth actors",
+                 extra=f"{held.get('who') or 'dialogue'}: {held.get('text') or ''}"[:600])
+    return True
 
 
 def box_hold(clip: dict[str, Any], spoken: str, who: str,
-             line_id: str = "") -> None:
+             line_id: str = "", rows: list[dict[str, Any]] | None = None,
+             length: float = 0.0) -> None:
     # #778: the line's id travels with it onto the shelf. The drain used to
     # find the row to re-stamp by matching its TEXT, which is the one place
     # in the whole chain that throws the identity away — on a station ID, a
     # liner or any repeated phrase it re-stamped the WRONG row and pulled it
     # to the bottom of the feed. An identity swap and a reorder in one move,
     # which is both halves of what the booth was getting wrong.
-    _BOX_HOLD.append({"path": clip["path"], "sig": clip["sig"],
-                      "text": spoken, "who": who, "ts": int(time.time()),
-                      "id": line_id,
-                      "bytes": int(clip.get("bytes") or 0)})
+    held = {"path": clip["path"], "sig": clip["sig"],
+            "text": spoken, "who": who, "ts": int(time.time()),
+            "id": line_id,
+            "bytes": int(clip.get("bytes") or 0),
+            "cast": _radio_cast_signature()}
+    if rows:
+        # A coalesced booth/call stream is one audio file but many transcript
+        # windows. Carry the windows onto the shelf so replay is 1:1 with the
+        # booth instead of a generic "missed conversation" blob.
+        held["rows"] = rows
+        held["length"] = float(length or 0.0)
+    _BOX_HOLD.append(held)
     _hold_trim()
     _box_hold_save()
     pipeline_log("air", f"line held for the box's return "
@@ -10932,13 +11385,69 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
     rather than dropping conversation audio that never actually aired.
     ponytail: a genuinely unplayable head clip jams the shelf; the box-down
     self-heal (len>=3 / HA restart) is what unsticks it, not a reorder."""
-    if not await _play_on_box(clip["path"], clip["sig"]):
-        return False
-    lp = _LAST_PLAYOUT
-    if lp.get("key") == _played_out_key(clip["path"]) \
-            and time.time() - float(lp.get("at") or 0) < 200:
-        return bool(lp.get("ok"))
-    return True                          # unmeasured (short sting) — delivered
+    if str(clip.get("cast") or "") != _radio_cast_signature():
+        if not await _recast_held_clip(clip):
+            return False
+    line_id = str(clip.get("id") or "")
+    rows = [r for r in (clip.get("rows") or []) if isinstance(r, dict)]
+    length = float(clip.get("length") or 0.0)
+    live_id = line_id or uuid.uuid4().hex[:6]
+    if rows:
+        _stream_now_set(rows, length)
+    else:
+        _speaking_now_set(live_id, str(clip.get("who") or "dj"),
+                          "replay", str(clip.get("text") or ""),
+                          "", "", "held")
+    try:
+        if not await _play_on_box(clip["path"], clip["sig"], replay=True):
+            return False
+        lp = _LAST_PLAYOUT
+        if lp.get("key") == _played_out_key(clip["path"]) \
+                and time.time() - float(lp.get("at") or 0) < 200:
+            return bool(lp.get("ok"))
+        return True                      # unmeasured (short sting) - delivered
+    finally:
+        if rows:
+            _stream_now_clear()
+        else:
+            _speaking_now_clear(live_id)
+
+
+async def box_route_wake() -> None:
+    """Wake delivery immediately when the operator routes DJ audio to box.
+
+    The shelf watcher remains the durable recovery loop. This short probe is
+    its fast path: an online box clears a stale breaker now; an unavailable
+    one enters the existing, cooldown-protected repair ladder now.
+    """
+    if not box_talk_ok() or (_RADIO.get("voice_to") or "box") not in ("box", "both"):
+        return
+    try:
+        link = await satellite_status()
+    except Exception:
+        link = {"online": False}
+    # HA can keep the entity marked "loaded" while the Pine Box accepts TCP
+    # and answers no Wyoming messages. Never close the delivery breaker on
+    # that paper-only state: direct reachability is required once a backlog
+    # exists, otherwise every held line gets fired into a silent receiver.
+    direct_ready = bool(link.get("reachable"))
+    recently_playing = (box_recently_verified()
+                        and len(_BOX_HOLD) < 3
+                        and not bool(_LAST_PLAYOUT.get("ok") is False
+                                     and _LAST_PLAYOUT.get("at")))
+    if link.get("online") and (direct_ready or recently_playing):
+        was_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
+                    or int(_BOX_DOWN.get("fails") or 0) > 0)
+        _BOX_DOWN.update({"until": 0.0, "fails": 0})
+        if was_down:
+            pipeline_log("air", "Pine Box is online after routing change — "
+                             "delivery breaker closed")
+        render_backlog_top()
+        return
+    pipeline_log("air", "Pine Box is not ready for verified delivery after "
+                     "routing change — starting guarded link repair")
+    if box_worth_healing():
+        await satellite_selfheal()
 
 
 async def box_hold_watch() -> None:
@@ -10947,7 +11456,10 @@ async def box_hold_watch() -> None:
     the app's whole life (#408): held lines drain even off-air."""
     _box_hold_load()
     while True:
-        await asyncio.sleep(20)
+        # A recovered speaker must catch up faster than a live show can add
+        # lines. Poll leisurely when empty, but keep the FIFO moving between
+        # replay batches so preserved dialogue never becomes permanent debt.
+        await asyncio.sleep(1 if _BOX_HOLD else 20)
         try:
             # #712: the breaker LATCHES, and nothing ever closed it. Anything
             # that makes announces fail for a couple of minutes — Home
@@ -10969,44 +11481,38 @@ async def box_hold_watch() -> None:
                     link = await satellite_status()
                 except Exception:  # noqa: BLE001
                     link = {"online": False}
-                if link.get("online"):
-                    was_held = len(_BOX_HOLD)
+                # The entity state alone is not proof that its Wyoming service
+                # is alive. A direct protocol response is the recovery signal.
+                if link.get("online") and link.get("reachable"):
                     _BOX_DOWN["until"] = 0.0
                     _BOX_DOWN["fails"] = 0
                     _RADIO.pop("repairing", None)
-                    if was_held >= 6:
-                        _BOX_HOLD.clear()
-                        _box_hold_save()
                     pipeline_log(
-                        "air", "the box is answering again — breaker closed "
-                               "(#712)",
-                        extra=(f"{was_held} line(s) were held and the station "
-                               "had written the box off; its Home Assistant "
-                               "entity is available again, so it is back in "
-                               "the rotation without anyone toggling it."))
+                        "air", "the Pine Box answered its direct probe - breaker closed",
+                        extra=(f"{len(_BOX_HOLD)} line(s) are still held; "
+                               "they will drain only after verified playout."))
+                elif link.get("online"):
+                    # Do not use the replay lane to hammer a device that is
+                    # accepting sockets but not serving Wyoming. Keep the
+                    # head clip in place, reopen the breaker, and let the
+                    # cooldown-protected repair ladder do one measured repair.
+                    _BOX_DOWN.update({"until": max(
+                        float(_BOX_DOWN.get("until") or 0), time.time() + 90.0),
+                        "fails": 0})
+                    pipeline_log(
+                        "air", "Pine Box remains protocol-silent - breaker stays open",
+                        extra=("Home Assistant still sees the entity, but the "
+                               "device did not answer the direct Wyoming probe. "
+                               "Queued dialogue is preserved in order."))
+                    if box_worth_healing():
+                        await satellite_selfheal()
+                    continue
             if not _BOX_HOLD:
                 continue
-            # #690: throwing away dialogue that is too old to air needs no
-            # device, no free satellite and no floor — it is bookkeeping.
-            # It used to sit BELOW the three guards below, so while the show
-            # was busy (which is most of the time it matters) the stale
-            # backlog was never cleared, and since a full shelf was ALSO
-            # what "the box is down" was read from, the station reported a
-            # dead box indefinitely over audio nobody would ever hear.
-            # Measured before this fix: 217 of 220 held lines were stale,
-            # the oldest by nearly seventeen hours.
-            now = time.time()
-            stale = 0
-            while _BOX_HOLD and now - int(_BOX_HOLD[0].get("ts") or 0) \
-                    > HOLD_REPLAY_STALE:
-                _BOX_HOLD.pop(0)
-                stale += 1
-            if stale:
-                _box_hold_save()
-                pipeline_log("air", f"dropped {stale} stale held line(s) — the "
-                                    "box plays fresh, never an old backlog")
-            if not _BOX_HOLD:
-                continue
+            # No stale discard here. The hold shelf is a recursive playout
+            # queue: generated audio leaves it only after verified delivery.
+            # Age may affect when we drain, but never whether the sample is
+            # allowed to exist.
             # #690: with the Pine Box switched off, the shelf WAITS. It used
             # to knock every twenty seconds — a satellite state poll (which
             # can itself trigger a rebuild) and an announce that _play_on_box
@@ -11027,10 +11533,11 @@ async def box_hold_watch() -> None:
                 continue
             replayed = [_BOX_HOLD.pop(0)]
             _box_hold_save()
-            # At most three a pass (#394): the live show interleaves
-            # rather than queueing behind a ten-minute drain.
-            while _BOX_HOLD and len(replayed) < 3:
-                await asyncio.sleep(0.9)
+            # A healthy replacement speaker drains a meaningful batch before
+            # yielding. New live lines join the tail, so this retains strict
+            # chronological delivery without replay gaps or leapfrogging.
+            while _BOX_HOLD and len(replayed) < 12:
+                await asyncio.sleep(0.25)
                 nxt = _BOX_HOLD[0]
                 if not await _replay_held(nxt):
                     break               # lost it / cut short mid-drain
@@ -11074,7 +11581,26 @@ _LARDER_MAX = 14                       # the deep-backlog ceiling (#445)
 _LARDER_FRESH = 1200.0                 # twenty minutes, then it reads stale
 # The shelf survives restarts (#383): every deploy was costing the show
 # two silent minutes writing its first round from nothing.
-LARDER_PATH = Path("/app/data/larder.json")
+LARDER_PATH = data_path("larder.json")
+_LARDER_WRITING = [False]
+
+
+def _larder_profile_signature() -> str:
+    """Writing settings that determine whether a prewritten round is usable."""
+    dj = dj_settings()
+    profile = {
+        "reply": int(dj.get("reply_max_chars") or 0),
+        "turns": [int(dj.get("banter_min_lines") or 0),
+                  int(dj.get("banter_max_lines") or 0)],
+        "swath": [round(float(dj.get("speakbox_full_swath_rate") or 0), 3),
+                  int(dj.get("speakbox_full_swath_chars") or 0)],
+    }
+    return json.dumps(profile, sort_keys=True, separators=(",", ":"))
+
+
+def _larder_current(entry: dict[str, Any]) -> bool:
+    """A cached script must match today's writing contract before it airs."""
+    return str(entry.get("profile") or "") == _larder_profile_signature()
 
 
 def _larder_save() -> None:
@@ -11095,7 +11621,70 @@ def _larder_load() -> None:
     if isinstance(rows, list):
         _LARDER[:] = [r for r in rows if isinstance(r, dict)
                       and time.time() - float(r.get("at") or 0)
-                      < _LARDER_FRESH][:_LARDER_MAX]
+                      < _LARDER_FRESH and _larder_current(r)][:_LARDER_MAX]
+
+
+def clean_station_backlog() -> dict[str, int]:
+    """Forget unplayed station output for an explicit clean restart.
+
+    This is intentionally narrower than removing /app/data: it clears the
+    delivery shelf, prewritten dialogue, live booth feed, and the in-progress
+    talk staging queue. It deliberately does *not* touch saved episodes,
+    caller recordings, full mixes, music, Speakerbox documents, gallery
+    assets, settings, voices, the ad book, or produced-ad audio.
+    """
+    held = list(_BOX_HOLD)
+    if not held:
+        try:
+            stored = json.loads(BOX_HOLD_PATH.read_text())
+            held = stored if isinstance(stored, list) else []
+        except Exception:
+            held = []
+    removed_media = 0
+    for row in held:
+        key = str((row or {}).get("path") or "").rsplit("/", 1)[-1]
+        key = key.split("?", 1)[0]
+        if MEDIA_KEY_SHAPE.match(key):
+            try:
+                (VOICE_MEDIA_DIR / key).unlink(missing_ok=True)
+                removed_media += 1
+            except OSError:
+                pass
+    counts = {"held": len(held), "larder": len(_LARDER),
+              "render": len(_RENDER_BACKLOG), "media": removed_media,
+              "staging": 0}
+    _BOX_HOLD.clear()
+    _LARDER.clear()
+    _RENDER_BACKLOG.clear()
+    _STREAM_NOW.clear()
+    _SPEAKING_NOW.clear()
+    _RADIO["voice_clips"] = []
+    _RADIO["chat"] = []
+    _RADIO["last_said"] = {}
+    _RADIO["coming"] = None
+    _RADIO["episode"] = {"started": time.time(), "items": []}
+    for path in (BOX_HOLD_PATH, LARDER_PATH):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    for path in LARDER_PATH.parent.glob("larder.pre_long_form_*.json"):
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            pass
+    # The staging shelf belongs to the current, unsealed conversation only.
+    # It is the one recorded form of the live backlog that must not survive a
+    # clean restart; completed episode/call/mix shelves are archival history.
+    import shutil
+    try:
+        if _EPISODE_STAGE.exists():
+            counts["staging"] = sum(
+                1 for item in _EPISODE_STAGE.rglob("*") if item.is_file())
+            shutil.rmtree(_EPISODE_STAGE)
+    except OSError:
+        pass
+    return counts
 
 
 def repair_note(what: str) -> None:
@@ -11116,23 +11705,75 @@ async def larder_keeper() -> None:
     nothing airs, so there is a long stream ready to pour out the moment
     the speaker recovers."""
     while _RADIO.get("on"):
-        await asyncio.sleep(15)
+        # Run promptly after a show starts and keep checking while a record or
+        # advert is carrying the air. A 15-second polling gap left the reserve
+        # empty long after a model slot became available.
+        await asyncio.sleep(3)
         try:
             _LARDER[:] = [e for e in _LARDER
-                          if time.time() - e["at"] < _LARDER_FRESH]
+                          if time.time() - e["at"] < _LARDER_FRESH
+                          and _larder_current(e)]
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
             # more rounds than the idle default.
             box_down = (time.time() < float(_BOX_DOWN["until"])
                         or len(_BOX_HOLD) >= 3)
-            cap = 12 if box_down else _LARDER_CAP
-            if len(_LARDER) >= cap:
+            if not dj_settings().get("dialogue_prefill", True):
+                continue
+            ad_running = bool(_RADIO.get("ad_now") and time.time()
+                              - float(_RADIO["ad_now"].get("at") or 0) < 180)
+            target = int(dj_settings().get("dialogue_reserve_target") or 4)
+            # An advert is paid-for cover: use it to build a deeper continuity
+            # reserve before the handoff back to the booth.
+            target = max(target, 6 if ad_running else 0)
+            cap = min(_LARDER_MAX, 12 if box_down else target)
+            if len(_LARDER) >= cap or _LARDER_WRITING[0]:
                 continue
             if _OLLAMA_GATE.locked():
                 continue               # live work outranks stocking shelves
-            await dj_banter(None, bank=True)
+            _LARDER_WRITING[0] = True
+            try:
+                # The script is written ahead; when it reaches speak_turns
+                # its first audio batch renders while the prior clip plays.
+                await dj_banter(None, bank=True, render_stream=True)
+            finally:
+                _LARDER_WRITING[0] = False
         except Exception:
             pass                       # the shelf refills next pass
+
+
+def dialogue_flow_state() -> dict[str, Any]:
+    """Explain the continuity pipeline without hiding the bottleneck."""
+    dj = dj_settings()
+    target = int(dj.get("dialogue_reserve_target") or 4)
+    ready = len(_LARDER)
+    ad_running = bool(_RADIO.get("ad_now") and time.time()
+                      - float(_RADIO["ad_now"].get("at") or 0) < 180)
+    writing = bool(_LARDER_WRITING[0] or _OLLAMA_GATE.locked())
+    synth_age = (round(time.time() - _LAST_SYNTH[0], 1)
+                 if _LAST_SYNTH[0] else None)
+    blockers: list[str] = []
+    if not _RADIO.get("on"):
+        blockers.append("station is off air")
+    if not dj.get("dialogue_prefill", True):
+        blockers.append("background dialogue reserve is disabled")
+    elif ready < target:
+        blockers.append("reserve is below its target")
+    if writing:
+        blockers.append("the language model is writing a round")
+    if _RENDER_BACKLOG:
+        blockers.append(f"{len(_RENDER_BACKLOG)} line(s) are waiting for voice rendering")
+    if _BOX_HOLD:
+        blockers.append(f"{len(_BOX_HOLD)} clip(s) are waiting for speaker delivery")
+    if not blockers and _RADIO.get("on"):
+        blockers.append("continuity reserve is healthy")
+    return {
+        "ready": ready, "target": target, "writing": writing,
+        "ad_cover": ad_running, "render_waiting": len(_RENDER_BACKLOG),
+        "delivery_waiting": len(_BOX_HOLD), "synth_age": synth_age,
+        "prefill": bool(dj.get("dialogue_prefill", True)),
+        "blockers": blockers,
+    }
 
 
 def now_really_playing(slack: float = 20.0) -> bool:
@@ -11200,11 +11841,27 @@ def torrent_breath(dj: dict[str, Any]) -> float:
     if box_alone:
         # Silence on a speaker with nothing under it. Keep a beat so the
         # pair do not trample their own tails, and no more.
-        middle = min(middle, 7.0)
-        return max(3.0, random.uniform(middle * 0.6, middle * 1.2))
+        middle = min(middle, 3.2)
+        return max(1.5, random.uniform(middle * 0.45, middle * 0.95))
     # #769: the floor was 10.0, which swallowed the whole top of the dial.
     # Now 2.0 — on a stream the gap between rounds should be a beat.
     return max(2.0, random.uniform(middle * 0.65, middle * 1.45))
+
+
+async def torrent_force_banter(track: dict[str, Any] | None,
+                               reason: str = "") -> bool:
+    """The hard floor under talk-show mode: something has to talk."""
+    try:
+        out = await dj_banter(track, render_stream=bool(
+            dj_settings().get("stream_show", True)))
+        if out:
+            pipeline_log("air", "torrent fallback banter aired"
+                         + (f" - {reason}" if reason else ""))
+            return True
+    except Exception as exc:
+        pipeline_log("drop", "torrent fallback banter failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:500])
+    return False
 
 
 async def _torrent_talk() -> None:
@@ -11272,41 +11929,54 @@ async def _torrent_talk() -> None:
             choices = [k for k in kinds if k != last] or kinds
             kind = random.choice(choices)
             _RADIO["last_round_kind"] = kind
+            aired = False
             try:
                 if kind == "caller":
-                    await dj_caller(track)
+                    aired = bool(await dj_caller(track))
                 elif kind == "deep":
-                    if not await dj_deep_round(track):
-                        await dj_banter(track, render_stream=bool(
-                            dj.get("stream_show", True)))
+                    aired = bool(await dj_deep_round(track))
+                    if not aired:
+                        aired = bool(await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True))))
                 elif kind == "gallery":
-                    if not await dj_gallery_round():
-                        await dj_banter(track, render_stream=bool(
-                            dj.get("stream_show", True)))
+                    aired = bool(await dj_gallery_round())
+                    if not aired:
+                        aired = bool(await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True))))
                 elif kind == "news":
-                    if not await dj_news():
-                        await dj_banter(track, render_stream=bool(
-                            dj.get("stream_show", True)))
+                    aired = bool(await dj_news())
+                    if not aired:
+                        aired = bool(await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True))))
                 elif kind == "manager":
-                    if not await dj_manager_note(track):
-                        await dj_banter(track, render_stream=bool(
-                            dj.get("stream_show", True)))
+                    aired = bool(await dj_manager_note(track))
+                    if not aired:
+                        aired = bool(await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True))))
                 elif kind == "bombshell":
                     shell = drop_bombshell()
                     angle = (bombshell_angle(shell["text"])
                              if shell and shell.get("text") else "")
-                    await dj_banter(track, angle=angle or None,
-                                    render_stream=bool(
-                                        dj.get("stream_show", True)))
+                    aired = bool(await dj_banter(
+                        track, angle=angle or None,
+                        render_stream=bool(dj.get("stream_show", True))))
                 else:
-                    await dj_banter(track, render_stream=bool(
-                        dj.get("stream_show", True)))
-            except Exception:
-                pass
-            pipeline_log("air", f"torrent round · {kind}")
+                    aired = bool(await dj_banter(track, render_stream=bool(
+                        dj.get("stream_show", True))))
+            except Exception as exc:
+                pipeline_log("drop", f"torrent round failed - {kind}",
+                             extra=f"{type(exc).__name__}: {exc}"[:500])
+            if not aired:
+                aired = await torrent_force_banter(
+                    track, f"{kind} produced nothing")
+            pipeline_log("air" if aired else "drop",
+                         f"torrent round - {kind}"
+                         + ("" if aired else " produced no audio"))
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as exc:
+            pipeline_log("drop", "torrent supervisor fault",
+                         extra=f"{type(exc).__name__}: {exc}"[:500])
             await asyncio.sleep(3)     # the talk never takes the show down
 
 
@@ -11486,7 +12156,7 @@ def dj_start(station: str) -> dict[str, Any]:
 # the session lives in memory, so restarting the container took Pine Box FM
 # off the air — which from the outside is indistinguishable from it turning
 # itself off (#197, #205). A restart is not you reaching for the switch.
-RADIO_ON_PATH = Path("/app/data/radio_on.json")
+RADIO_ON_PATH = data_path("radio_on.json")
 
 
 def remember_radio(on: bool, station: str = "") -> None:
@@ -11524,12 +12194,12 @@ async def resume_radio() -> None:
         pass
 
 
-def dj_stop() -> None:
+def dj_stop(*, seal_episode: bool = True) -> None:
     _RADIO["on"] = False
     remember_radio(False)
-    # Seal the current episode so a stopped show leaves its last stretch on
-    # the shelf, not in limbo (#548).
-    if (_RADIO.get("episode") or {}).get("items"):
+    # An ordinary stop preserves its last stretch. A clean restart asks us
+    # not to mint a final recording immediately before purging the shelf.
+    if seal_episode and (_RADIO.get("episode") or {}).get("items"):
         asyncio.create_task(asyncio.to_thread(_episode_finalize))
     dj_skip()
     radio_stop()
@@ -11588,7 +12258,7 @@ def dj_request_query(text: str) -> str:
 # could ever be remembered. This outlives the show: one row per track, with
 # the tally and the words you used to ask for it.
 
-REQUESTS_PATH = Path("/app/data/requests.json")
+REQUESTS_PATH = data_path("requests.json")
 _REQUESTS_LOCK = RLock()
 _ASKED_KEPT = 8                   # bounded — this file lives for years
 
@@ -11840,7 +12510,7 @@ async def dj_chat(message: str) -> dict[str, Any]:
 # A thumbs down is a promise: that track never comes round again. Kept in one
 # small file so the list survives restarts and can be edited by hand.
 
-VOTES_PATH = Path("/app/data/track_votes.json")
+VOTES_PATH = data_path("track_votes.json")
 _VOTES_LOCK = RLock()
 
 
@@ -12297,20 +12967,20 @@ def library_stats(artist: str, album: str) -> dict[str, Any]:
 # you can rewrite it. Track notes are cached the same way: researching the
 # same song twice is wasted network and a slower show.
 
-ADS_PATH = Path("/app/data/ad_reads.json")
-NOTES_PATH = Path("/app/data/track_notes.json")
+ADS_PATH = data_path("ad_reads.json")
+NOTES_PATH = data_path("track_notes.json")
 _ADS_LOCK = RLock()
 
 # Produced ads (#618) keep their finished audio here — durable, unlike the
 # rolling /media buffer — so a stored spot can be rerun verbatim for a week.
-PRODUCED_ADS_DIR = Path("/app/data/ads_audio")
+PRODUCED_ADS_DIR = data_path("ads_audio")
 AD_AUDIO_SHAPE = re.compile(r"^[a-f0-9]{6,32}\.mp3\Z")
 
 # When each spot actually WENT OUT (#743). The ad rows carry when they were
 # written and a `uses` tally, which cannot answer "the ads from the last
 # three hours" — the question the ads desk is built around. One line per
 # airing, on disk, so a restart does not lose the run of the day.
-AD_AIRINGS_PATH = Path("/app/data/ad_airings.json")
+AD_AIRINGS_PATH = data_path("ad_airings.json")
 _AD_AIRINGS_KEPT = 4000
 
 
@@ -12532,7 +13202,7 @@ async def station_weather_angle() -> str:
 # the ACTUAL heat band off booth_hot(), shuffled so they never repeat and grown
 # over time by the model so the imagery evolves. The DJs drop one glancingly
 # mid-round; it is never the topic.
-HEAT_LINES_PATH = Path("/app/data/heat_lines.json")
+HEAT_LINES_PATH = data_path("heat_lines.json")
 _HEAT_LOCK = RLock()
 _HEAT_MAX_PER_BAND = 48
 
@@ -12750,7 +13420,7 @@ async def mx_ad_clock() -> None:
 # You structure a plot in acts; while it is ACTIVE the booth weaves the
 # current act into its rounds — in character, never announced as a script —
 # until the story lands. One plot active at a time.
-PLOTLINES_PATH = Path("/app/data/plotlines.json")
+PLOTLINES_PATH = data_path("plotlines.json")
 _PLOT_LOCK = RLock()
 
 
@@ -13189,7 +13859,7 @@ async def dj_police_outside(text: str) -> None:
             "ts": int(time.time() * 1000),
             "url": f"{play['path']}?t={play['sig']}",
             "text": label, "voice": voice})
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     _episode_stage(f"{play['path']}?t={play['sig']}", label)
     pipeline_log("air", f"megaphone outside — {character} vocode, "
                         f"sirens behind (#636)")
@@ -13218,9 +13888,9 @@ async def dj_police_outside(text: str) -> None:
 #
 # Every page is kept, because the operator asked to proofread them: they are
 # a book like the ad book, editable and downloadable from the same modal.
-UPSTAIRS_PATH = Path("/app/data/upstairs_pages.json")
+UPSTAIRS_PATH = data_path("upstairs_pages.json")
 _UPSTAIRS_LOCK = RLock()
-UPSTAIRS_AUDIO_DIR = Path("/app/data/upstairs_audio")
+UPSTAIRS_AUDIO_DIR = data_path("upstairs_audio")
 UPSTAIRS_AUDIO_SHAPE = re.compile(r"^[a-f0-9]{6,32}\.mp3\Z")
 UPSTAIRS_KEEP = 300
 
@@ -13489,7 +14159,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
             "ts": int(time.time() * 1000),
             "url": f"{path}?t={sig}", "text": label,
             "voice": str(made.get("voice") or "")})
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     _episode_stage(f"{path}?t={sig}", label)
     upstairs_update(str(made.get("id") or ""),
                     uses=int(made.get("uses") or 0) + 1,
@@ -13541,7 +14211,7 @@ async def upstairs_clock() -> None:
 
 # --- The radio cache (#548): finished phone calls kept as compressed mp3 +
 # transcript for focused replay, unpruned, in data/radio_cache/calls.
-RADIO_CACHE = Path("/app/data/radio_cache")
+RADIO_CACHE = data_path("radio_cache")
 
 # WHICH record was playing WHEN (#633). The recorder only ever caught talk
 # and stings — music is a URL the page or the box streams, so nothing here
@@ -14150,7 +14820,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
             "ts": int(time.time() * 1000),
             "url": f"{play['path']}?t={play['sig']}",
             "text": line, "engine": engine, "voice": forced or ""})
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     entry = ad_save(product, line, kind="music") if remember else None
     if entry:
         ad_line_mark(entry.get("id", ""), product)
@@ -14274,7 +14944,7 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
             "ts": int(time.time() * 1000),
             "url": f"{path}?t={sig}", "text": label,
             "voice": entry.get("voice") or ""})
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     if ad_to in ("box", "both"):
         await _play_on_box(path, sig)
     _episode_stage(f"{path}?t={sig}", label)
@@ -14431,7 +15101,7 @@ def _notes_write(notes: dict[str, Any]) -> None:
         pass
 
 
-LYRICS_PATH = Path("/app/data/track_lyrics.json")
+LYRICS_PATH = data_path("track_lyrics.json")
 _LYRICS_LOCK = RLock()
 
 
@@ -14548,6 +15218,33 @@ async def track_notes(track: dict[str, Any]) -> str:
     notes[key] = {"text": text, "ts": int(time.time())}
     _notes_write(notes)
     return text
+
+
+def song_analysis_ready(track: dict[str, Any], analysis: str) -> None:
+    """Put the completed LLM reading of the current record in the booth.
+
+    It is an analysis event, never an on-air speaker turn: the live marker
+    remains reserved for the one voice actually coming through the station.
+    """
+    track_id = str(track.get("id") or "")
+    text = " ".join(str(analysis or "").split())[:1600]
+    if not (track_id and text):
+        return
+    if _RADIO.get("song_analysis_id") == track_id:
+        return
+    _RADIO["song_analysis_id"] = track_id
+    _RADIO["chat"].append({
+        "id": uuid.uuid4().hex[:6], "ts": int(time.time()),
+        "air_at": time.time(), "who": "analysis", "kind": "song_analysis",
+        "text": f"Song analysis complete: {track.get('title') or track_id}",
+        "analysis": text,
+        "track_id": track_id,
+        "artist": str(track.get("artist") or ""),
+        "aired": "analysis",
+    })
+    del _RADIO["chat"][:-240]
+    pipeline_log("model", "song analysis ready — "
+                 f"{track.get('title') or track_id}")
 
 
 
@@ -14814,6 +15511,7 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         if said:
             pipeline_log("model", f"looked at {picked.name} — "
                                   f"{len(said)} chars of description")
+            image_analysis_ready(picked.name, said)
             # Any time a gallery picture is looked at and talked about, the
             # booth holds up its thumbnail (#506, #523) — not only during the
             # dedicated gallery round.
@@ -14824,6 +15522,24 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         return picked.name, said
     except Exception:
         return "", ""                   # a model without eyes riffs blind
+
+
+def image_analysis_ready(name: str, analysis: str) -> None:
+    """Record a completed vision pass as a quiet booth event."""
+    text = " ".join(str(analysis or "").split())[:1600]
+    if not (name and text):
+        return
+    key = f"{name}:{hashlib.sha1(text.encode()).hexdigest()[:10]}"
+    if _RADIO.get("image_analysis_id") == key:
+        return
+    _RADIO["image_analysis_id"] = key
+    _RADIO["chat"].append({
+        "id": uuid.uuid4().hex[:6], "ts": int(time.time()),
+        "air_at": time.time(), "who": "analysis", "kind": "image_analysis",
+        "text": f"Image analysis complete: {name}", "analysis": text,
+        "image": name, "aired": "analysis",
+    })
+    del _RADIO["chat"][:-240]
 
 
 async def dj_gallery_round() -> list[str]:
@@ -14855,10 +15571,14 @@ async def dj_gallery_round() -> list[str]:
         f"paintings, one after another, none skipped. {listing} Describe "
         "and react to EACH in turn — argue about what it means, price it "
         "absurdly, hawk it to the listeners: first caller gets each one. "
-        "Go properly off the wall with it."
+        "For EACH painting, one host must propose a better title based on "
+        "what they can actually see, naturally phrased as 'it should have "
+        "been called ...' or 'this painting looks like ...'. Make the titles "
+        "specific, vivid, and spoken aloud. Go properly off the wall with it."
         + (f" Somewhere in the middle one of you drops this, word for "
            f"word, as though it explains the art: \"{seed['text']}\""
            if seed else ""))
+    angle += radio_prompt_instruction("gallery")
     began = time.time()
     lines = await dj_banter(None, angle=angle, lines=12,
                             source=(seed or {}).get("file", ""))
@@ -15064,7 +15784,7 @@ def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
 # handed to one of the pair to say as their own thought. The chat entry
 # remembers which document it came from so he can open it and rewrite it.
 
-SPEAKBOX_DIR = Path("/app/data/speakbox")
+SPEAKBOX_DIR = data_path("speakbox")
 
 # --- Minds (#627): a mind is a NAMED FOLDER plus its own shelf ------------
 # A second folder of documents is not a second pile — it is a second head.
@@ -15073,7 +15793,7 @@ SPEAKBOX_DIR = Path("/app/data/speakbox")
 # reading bleeds into the other. So every piece of shelf state is resolved
 # per mind, and the built-in "main" keeps the original paths untouched so
 # nothing has to migrate.
-MINDS_DIR = Path("/app/data/minds")
+MINDS_DIR = data_path("minds")
 
 
 def speakbox_minds() -> list[dict[str, Any]]:
@@ -15144,7 +15864,7 @@ def mind_dir_ok(raw: str, rid: str) -> Path:
     mounted into this container, so anything else is a folder the DJs would
     never be able to read."""
     text = str(raw or "").strip()
-    base = Path("/app/data")
+    base = DATA_DIR
     path = Path(text).expanduser() if text else (MINDS_DIR / rid / "docs")
     if not path.is_absolute():
         path = base / text
@@ -15241,7 +15961,7 @@ def speakbox_lines(text: str) -> list[str]:
 # What they have already said out of the documents. Kept on disk so the show
 # has a memory: a line lands once as a new thought and comes back later as
 # something the pair have between them.
-SPEAKBOX_HEARD = Path("/app/data/speakbox_heard.json")
+SPEAKBOX_HEARD = data_path("speakbox_heard.json")
 SPEAKBOX_HEARD_MAX = 2000
 _SPEAKBOX_LOCK = RLock()
 
@@ -15290,7 +16010,7 @@ def speakbox_remember(quote: dict[str, Any]) -> None:
 # The good lines, per document, once they have been found. Keyed on the file
 # as it stood when they were found, so editing it in the panel throws them out
 # and the next round goes back to the document.
-SPEAKBOX_GEMS = Path("/app/data/speakbox_gems.json")
+SPEAKBOX_GEMS = data_path("speakbox_gems.json")
 SPEAKBOX_GEM_WINDOW = 1500         # characters of transcript read at a time
 
 
@@ -15396,7 +16116,7 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
 # pure-Python cosine scan over a few thousand chunks, plenty for a folder this
 # size. ponytail: no numpy/faiss; add one only if the folder passes tens of
 # thousands of swaths. The embedder being down is a no-op, never a dead radio.
-SPEAKBOX_VECTORS = Path("/app/data/speakbox_vectors.json")
+SPEAKBOX_VECTORS = data_path("speakbox_vectors.json")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 SPEAKBOX_VEC_MAX = 24000                # safety ceiling only (#597: index it ALL)
 _VEC_LOCK = RLock()
@@ -15666,7 +16386,7 @@ async def speakbox_index_clock() -> None:
 # transcript, one book — the draw keeps wandering off it. The lock pins the
 # draw to a single document and expires by itself, because a lock nobody
 # remembers setting is worse than no lock.
-DOC_LOCK_PATH = Path("/app/data/doc_lock.json")
+DOC_LOCK_PATH = data_path("doc_lock.json")
 _DOC_LOCK_MEM: dict[str, Any] = {}
 
 
@@ -16170,6 +16890,10 @@ async def session_voices() -> dict[str, str]:
         _RADIO["voices"] = fixed
     voices = {
         "dj": dj["voice"] or fixed.get("dj", ""),
+        # Some older/direct station paths call the host "host" while the
+        # show scheduler calls the same seat "dj". Both must resolve to the
+        # configured actor rather than an unnamed engine default.
+        "host": dj["voice"] or fixed.get("dj", ""),
         "cohost": dj["cohost_voice"] or fixed.get("cohost", ""),
     }
     # The third presenter (#281): their named voice, or a stable draw that
@@ -16941,7 +17665,7 @@ def sfx_levelled(path: Path) -> Path:
 # few hundred lines of DSP and a dependency; the shape itself is a dozen lines
 # of stdlib, and making them here means every one is different — a new scratch
 # per zinger rather than the same wav forty times.
-SFX_MADE_DIR = Path("/app/data/sfx")
+SFX_MADE_DIR = data_path("sfx")
 SFX_MADE_KEEP = 60
 SFX_MADE_RATE = 22050
 
@@ -17030,7 +17754,7 @@ def sfx_by_id(wanted: str) -> Path | None:
 
 # Samples voted off the air (#269). A ▼ on the chat row or a toggle in the
 # folder popup lands the id here, and the draw never picks it again.
-SFX_BANS_PATH = Path("/app/data/sfx_bans.json")
+SFX_BANS_PATH = data_path("sfx_bans.json")
 _SFX_BANS_LOCK = RLock()
 
 
@@ -17045,7 +17769,7 @@ def sfx_bans() -> set[str]:
 # How often a given sample is allowed to come up (#645). A ban is a hard
 # no; this is the dial between "barely ever" and "lean on it" — 1.0 is the
 # weight every sample starts with.
-SFX_WEIGHTS_PATH = Path("/app/data/sfx_weights.json")
+SFX_WEIGHTS_PATH = data_path("sfx_weights.json")
 _SFX_WEIGHTS_LOCK = RLock()
 
 
@@ -17076,7 +17800,7 @@ def sfx_set_weight(sid: str, weight: float) -> dict[str, float]:
 
 # The scoreboard behind the 📊 tables (#300): plays per sample, and which
 # presenter leaned on which button.
-SFX_PLAYS_PATH = Path("/app/data/sfx_plays.json")
+SFX_PLAYS_PATH = data_path("sfx_plays.json")
 _SFX_PLAYS_LOCK = RLock()
 
 
@@ -17319,7 +18043,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
         })
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     # A sting is MEANT to land over the DJ's own line it punctuates, so the
     # show's own just-finished announce tail must not block it (#559: "the
     # sound effects aren't coming through"). Same own-tail carve-out as the
@@ -17350,7 +18074,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
         })
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         played_anywhere = True
         pipeline_log("air", f"sting {sample.stem} could not go to the "
                             "box (satellite busy) — sent to the page "
@@ -17371,7 +18095,7 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
 # An exchange in the same "A: … B: …" shape the model writes, kept so it can
 # come round again — written by hand, or caught off the air and kept.
 
-SAVED_BANTER_PATH = Path("/app/data/banter_saved.json")
+SAVED_BANTER_PATH = data_path("banter_saved.json")
 SAVED_BANTER_MAX = 200
 _SAVED_LOCK = RLock()
 
@@ -17455,7 +18179,7 @@ def draw_saved_banter() -> dict[str, Any]:
 # Lines you have thumbed down. Approving a line is keeping it (above);
 # burying one is the other half of the same gesture — it did not work, and it
 # does not need to come round again (#215).
-BINNED_PATH = Path("/app/data/banter_binned.json")
+BINNED_PATH = data_path("banter_binned.json")
 BINNED_MAX = 500
 
 
@@ -17510,7 +18234,7 @@ def is_binned(text: str) -> bool:
 # ten-line goldfish: a print ledger on disk with timestamps, so "never twice"
 # can mean never, and so a line that WORKED can come back on a real rotation
 # instead of at random.
-LINE_PRINTS_PATH = Path("/app/data/line_prints.json")
+LINE_PRINTS_PATH = data_path("line_prints.json")
 _PRINTS_LOCK = RLock()
 PRINTS_MAX = 1400
 # How long a KEPT line waits before it may air again: an hour the first time,
@@ -17706,7 +18430,7 @@ def rerun_check(text: str, who: str = "", kind: str = "",
 # dropped: dropping is what the old gate paid for repetition with, and it pays
 # in dead air. It is rewritten, and failing that swapped for material off the
 # speakbox shelf.
-PHRASE_PRINTS_PATH = Path("/app/data/phrase_prints.json")
+PHRASE_PRINTS_PATH = data_path("phrase_prints.json")
 PHRASE_PRINTS_MAX = 20000          # a disk bound, not a window
 _PHRASE_PRESSURE: list[int] = []
 _PHRASE_ROWS: dict[str, Any] = {"at": -1, "rows": {}}
@@ -18020,7 +18744,7 @@ def fresh_pool_take() -> dict[str, str]:
 # governs WHAT is talked about. This one governs HOW it is treated, which is
 # what makes the same subject come out differently twice and makes the other
 # speakers react to it differently.
-APPROACHES_PATH = Path("/app/data/approaches.json")
+APPROACHES_PATH = data_path("approaches.json")
 _APPROACH_LOCK = RLock()
 DIALOGUE_APPROACHES = (
     "INTERROGATE it — every claim gets a question, nothing is allowed to "
@@ -18157,7 +18881,7 @@ def banter_due(dj: dict[str, Any], played: int) -> bool:
 # The built-in angles keep the pair talking. These are yours: one of them
 # drops it cold and the other has to deal with it on air, unprepared.
 
-BOMBSHELL_PATH = Path("/app/data/banter_topics.json")
+BOMBSHELL_PATH = data_path("banter_topics.json")
 _BOMBSHELL_LOCK = RLock()
 BOMBSHELL_MAX = 300
 
@@ -18515,7 +19239,7 @@ async def drudge_headlines(limit: int = 24) -> list[dict[str, str]]:
 # top of the page (#268). Covered means the TOPIC, not the exact words:
 # the page runs three headlines on one story, and a reworded lead read out
 # again is still the same news twice.
-NEWS_COVERED_PATH = Path("/app/data/news_covered.json")
+NEWS_COVERED_PATH = data_path("news_covered.json")
 NEWS_COVER_HOURS = 3.0
 _NEWS_STOP = {
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "with",
@@ -18705,7 +19429,7 @@ async def news_clock() -> None:
 # English words when they say the name aloud, however funny or nonsensical
 # the words turn out to be.
 
-TITLE_XLAT_PATH = Path("/app/data/title_translations.json")
+TITLE_XLAT_PATH = data_path("title_translations.json")
 _XLAT_LOCK = RLock()
 _CJK = re.compile("[\\u3040-\\u30ff\\u3400-\\u4dbf\\u4e00-\\u9fff\\uf900-\\ufaff\\uff66-\\uff9f]")
 _LATIN = re.compile(r"[A-Za-z]")
@@ -19056,8 +19780,8 @@ async def dj_mixtape_outro(tape: dict[str, Any] | None = None) -> list[str]:
 # work out what they want, wind them up or calm them down, and get back to
 # the music. The caller speaks in a real third voice down a bad phone line.
 
-CALLERS_PATH = Path("/app/data/callers.json")
-CALLER_NAMES_PATH = Path("/app/data/caller_names.json")
+CALLERS_PATH = data_path("callers.json")
+CALLER_NAMES_PATH = data_path("caller_names.json")
 _CALLERS_LOCK = RLock()
 
 # The seed dictionary — expand it from the desk and the box grows stranger.
@@ -19294,6 +20018,20 @@ CALLER_OUTCOMES = (
     "themselves to an empty line",
 )
 
+# These are the station's reliably happy endings. They sit in the same editable
+# shelf as every other outcome, but the success dial can favour them so a caller
+# arc usually resolves with a concrete win rather than an arbitrary hang-up.
+CALLER_SUCCESS_OUTCOMES = (
+    "the caller WINS a painting from the Pine Box gallery, chosen on air; "
+    "the hosts describe it, the caller claims it with delight, and everyone "
+    "clearly says how it will be collected",
+    "the caller WINS the station prize: make it specific, absurd and valuable "
+    "to this caller, then let them celebrate and complete the hand-off on air",
+    "the caller solves the hosts' challenge, WINS the prize and leaves happy; "
+    "the hosts congratulate them, confirm the win and send them back to the "
+    "music with a proper goodbye",
+)
+
 # #673: the switchboard is enormous and the line a caller comes in on is
 # drawn fresh every time. "Line one" every single call made the station feel
 # like it had exactly one phone; a number pulled from a switchboard this big
@@ -19323,8 +20061,8 @@ def call_line_say(number: int) -> str:
 # down: which rule, for whom, how long the call ran, at what moment. The
 # booth shows the hang-up as its own line and the reason is a chip you click
 # to open the shelf.
-HANGUPS_PATH = Path("/app/data/hangup_rules.json")
-CALL_LOG_PATH = Path("/app/data/call_log.json")
+HANGUPS_PATH = data_path("hangup_rules.json")
+CALL_LOG_PATH = data_path("call_log.json")
 _HANGUP_LOCK = RLock()
 CALL_LOG_KEPT = 120
 
@@ -19332,7 +20070,7 @@ CALL_LOG_KEPT = 120
 def _hangup_seed() -> list[dict[str, Any]]:
     return [{"id": uuid.uuid4().hex[:8], "text": text, "weight": 1.0,
              "enabled": True, "uses": 0, "last": 0, "added": int(time.time())}
-            for text in CALLER_OUTCOMES]
+            for text in (*CALLER_OUTCOMES, *CALLER_SUCCESS_OUTCOMES)]
 
 
 def hangup_rules() -> list[dict[str, Any]]:
@@ -19343,7 +20081,19 @@ def hangup_rules() -> list[dict[str, Any]]:
         try:
             rows = json.loads(HANGUPS_PATH.read_text())
             if isinstance(rows, list) and rows:
-                return [r for r in rows if isinstance(r, dict) and r.get("text")]
+                rows = [r for r in rows if isinstance(r, dict) and r.get("text")]
+                known = {str(r.get("text") or "").strip() for r in rows}
+                added = False
+                for text in CALLER_SUCCESS_OUTCOMES:
+                    if text not in known:
+                        rows.append({"id": uuid.uuid4().hex[:8], "text": text,
+                                     "weight": 1.0, "enabled": True,
+                                     "uses": 0, "last": 0,
+                                     "added": int(time.time())})
+                        added = True
+                if added:
+                    _hangup_write(rows)
+                return rows
         except Exception:
             pass
         rows = _hangup_seed()
@@ -19419,7 +20169,22 @@ def caller_hangup_pin(name: str) -> str:
     return str(row.get("hangup_id") or "")
 
 
-def hangup_pick(name: str = "") -> dict[str, Any]:
+def _successful_call_outcome(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(word in low for word in (
+        " wins ", " win the prize", " winner", "prize", "painting",
+        "genuinely happy", "gratitude", "magic number"))
+
+
+def _interrupts_caller_outcome(text: str) -> bool:
+    """An on-air ending may be a loss without cutting a thought in half."""
+    low = str(text or "").lower()
+    return any(phrase in low for phrase in (
+        "mid-sentence", "mid-word", "cut them off", "slams the phone",
+        "goes silent mid-answer", "hangs up abruptly"))
+
+
+def hangup_pick(name: str = "", success_rate: int | None = None) -> dict[str, Any]:
     """One ending, drawn by weight, avoiding the one used last. A caller with
     an ending PINNED to them (#715) takes that one instead of a draw. Falls
     back to the built-in tuple only if the shelf has somehow been emptied."""
@@ -19428,7 +20193,8 @@ def hangup_pick(name: str = "") -> dict[str, Any]:
         with _HANGUP_LOCK:
             stored = hangup_rules()
             for row in stored:
-                if row.get("id") == pinned:
+                if (row.get("id") == pinned
+                        and not _interrupts_caller_outcome(row.get("text", ""))):
                     row["uses"] = int(row.get("uses") or 0) + 1
                     row["last"] = int(time.time())
                     _hangup_write(stored)
@@ -19436,11 +20202,20 @@ def hangup_pick(name: str = "") -> dict[str, Any]:
                     return dict(row)
     with _HANGUP_LOCK:
         rows = [r for r in hangup_rules() if r.get("enabled", True)
-                and float(r.get("weight") or 0) > 0]
+                and float(r.get("weight") or 0) > 0
+                and not _interrupts_caller_outcome(r.get("text", ""))]
         if not rows:
             return {"id": "", "text": random.choice(CALLER_OUTCOMES)}
         last = str(_RADIO.get("last_hangup_rule") or "")
         pool = [r for r in rows if r.get("id") != last] or rows
+        if success_rate is None:
+            success_rate = int(dj_settings().get("caller_success_rate", 72))
+        desired = random.random() < max(0, min(100, int(success_rate))) / 100
+        preferred = [r for r in pool
+                     if _successful_call_outcome(str(r.get("text") or ""))
+                     == desired]
+        if preferred:
+            pool = preferred
         weights = [float(r.get("weight") or 1) for r in pool]
         pick = random.choices(pool, weights=weights, k=1)[0]
         _RADIO["last_hangup_rule"] = pick.get("id") or ""
@@ -19535,7 +20310,7 @@ def write_callers(rows: list[dict[str, Any]]) -> None:
 # existing THIRD-participant seat so the whole banter engine carries them with
 # no new plumbing. A guest is typed in, picked from a saved list, or promoted
 # from a caller; while guest mode is on, the third seat IS the guest. ---
-GUESTS_PATH = Path("/app/data/guests.json")
+GUESTS_PATH = data_path("guests.json")
 _GUESTS_LOCK = RLock()
 
 
@@ -19586,6 +20361,33 @@ def active_guest() -> dict[str, Any]:
         return {}
     gid = dj.get("guest_id") or ""
     return next((g for g in read_guests() if g.get("id") == gid), {})
+
+
+def booth_actor_name(who: str, name: str = "") -> str:
+    """The human-readable cast name for a booth event.
+
+    Speaker roles drive routing and synthesis; names drive the operator's
+    transcript.  Keep that translation in one place so a coalesced stream
+    cannot accidentally publish "Co-host" when the configured actor is Skip.
+    """
+    if str(name or "").strip():
+        return str(name).strip()
+    seat = str(who or "").strip().lower()
+    dj = dj_settings()
+    if seat in ("dj", "host"):
+        return str(dj.get("host_name") or "Host")
+    if seat == "cohost":
+        return str(dj.get("cohost_name") or "Co-host")
+    if seat in ("third", "guest"):
+        guest = active_guest()
+        return str(guest.get("name") or dj.get("third_name") or "Guest")
+    if seat in ("drop", "sfx"):
+        return "The SFX Guy"
+    if seat == "manager":
+        return str(dj.get("manager_name") or "Manager")
+    if seat in ("caller", "caller2"):
+        return "Caller"
+    return "Booth"
 
 
 def set_guest(guest: dict[str, Any] | None) -> None:
@@ -19734,7 +20536,7 @@ def conjure_caller() -> dict[str, Any]:
 # their voice and their history. This is a book of POOLS instead — and the
 # pool a name came from is remembered, because "wow, that is a great name"
 # lands differently for a dead film star than for a city in Ohio.
-CALLER_NAME_BOOK_PATH = Path("/app/data/caller_name_book.json")
+CALLER_NAME_BOOK_PATH = data_path("caller_name_book.json")
 _NAME_BOOK_LOCK = RLock()
 
 # People the culture still half-remembers — the "someone who once was
@@ -19835,14 +20637,14 @@ NAME_POOL_LABELS = {
 }
 
 
-CALLER_VOICES_PATH = Path("/app/data/caller_voices.json")
+CALLER_VOICES_PATH = data_path("caller_voices.json")
 _CALLER_VOICE_LOCK = RLock()
 
 # The face on the licence (#699). Drawn from the gallery once and REMEMBERED
 # — the same trap the voice rotation was in was waiting here: picking with
 # hash(name) % len(gallery) would hand a caller a different face every time
 # you rendered another image.
-CALLER_FACES_PATH = Path("/app/data/caller_faces.json")
+CALLER_FACES_PATH = data_path("caller_faces.json")
 _CALLER_FACE_LOCK = RLock()
 
 
@@ -20076,7 +20878,7 @@ def swath_intrigue(text: str) -> float:
 # that lever. It does not replace the mix, it BIASES it, because a station
 # where every single caller is on message stops sounding like a phone line
 # and starts sounding like a broadcast.
-THEMES_PATH = Path("/app/data/caller_themes.json")
+THEMES_PATH = data_path("caller_themes.json")
 _THEMES_MEM: dict[str, Any] = {}
 # The one it has always effectively had, named so it can be chosen again.
 DEFAULT_THEME = {
@@ -20203,15 +21005,14 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
             + mined,
             swath or {})
     roll = random.random()
-    # The mixtape haters (#453): they ring DEMANDING no more MX tapes, and
-    # the pair fight back — refuse outright, read a random speakbox line AT
-    # them like it settles the matter, and hang up mid-protest, then go
-    # right back to the tapes. A word-for-word swath makes the brush-off.
+    # The mixtape haters (#453): they ring DEMANDING no more MX tapes. The
+    # pair can refuse outright, but the caller still gets to finish their case
+    # and hear an answer before the call reaches its closing beat.
     if roll < 0.10:
         swath = await speakbox_quote(most=3, cap=260)
-        line = (f" At the peak of the argument, the caller is cut off by "
-                f"one of you reciting this AT them as if it is the final "
-                f"word, then you HANG UP on them: \"{swath['text']}\""
+        line = (f" One host answers with this passage, then the caller gets "
+                f"a complete reply to it before the hosts close the call: "
+                f"\"{swath['text']}\""
                 if swath else "")
         return (
             "An irate caller rings in DEMANDING the station stop playing "
@@ -20303,8 +21104,8 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
                + (f" by {now.get('artist')}" if now.get("artist") else "")
                if now.get("title") else "Between records.")
     foundation = (
-        f"HOST A — {host}: {dj['persona']}\n\n"
-        f"HOST B — {dj['cohost_name']}: {dj['cohost_persona']}\n\n"
+        f"HOST A — {host}: {dj['persona']}{mind_adjustment_prompt('dj')}\n\n"
+        f"HOST B — {dj['cohost_name']}: {dj['cohost_persona']}{mind_adjustment_prompt('cohost')}\n\n"
         f"{day_context()}{accent_directive()}"
         f"THE ROOM RIGHT NOW: {playing}. Emotional weather: {weather}. "
         f"Tonight's running memory: {show_memory()}\n\n"
@@ -20316,12 +21117,15 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
         f"{foundation}\n\n"
         f"Write a LONG, natural conversation between A ({host}) and B "
         f"({dj['cohost_name']}) for {dj['station_name']} — 12 to 16 lines, "
-        "strictly alternating, each line genuinely RESPONDING to and building "
+        "strictly alternating, each line genuinely RESPONDING to and building. "
+        "For this broadcast, use 8 to 11 substantial turns, not short beats. "
         "on the one before. Simulate BOTH of them faithfully: the "
         "predilections, propensities, attitudes and behaviours in their "
         "personas above, coloured by the emotional weather. Let a real thread "
         "develop — turns, disagreements, callbacks to what was just said and "
-        "to tonight's running memory. Uninhibited late-night radio; lean into "
+        "to tonight's running memory. Each turn is a developed 60-to-100-word "
+        "thought, except a verbatim Speakerbox passage which may be longer and "
+        "must remain intact. Uninhibited late-night radio; lean into "
         "anything edgy. ENGLISH ONLY — every word of every line in English, "
         "never any other language or script, whatever the material quotes. "
         "No markdown, no emoji, no stage directions. Format "
@@ -20333,7 +21137,12 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
         # rows, which on the coalesced road is three or four turns.
         + avoid_reruns() + approach_clause(approach_pick()))
     try:
-        script = await ask_model(prompt, limit=2400, spice=0.5, num_ctx=16384)
+        script = await ask_model(
+            prompt,
+            limit=min(int(dj.get("reply_max_chars") or 6000), 5200),
+            spice=0.5,
+            num_ctx=16384,
+        )
     except Exception:
         script = ""
     if not script:
@@ -20439,6 +21248,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # the booth can name it afterwards and the ledger can count it.
     hangup_rule = hangup_pick(str(caller.get("name") or ""))    # #715
     outcome = str(hangup_rule.get("text") or "")
+    winning_call = _successful_call_outcome(outcome)
     # The prose state seeds the caller's emotion vector, so "furious" is
     # not just a stage direction — it bends the pace, the pauses and the
     # stumbles of every line they say tonight (§30, §107).
@@ -20482,12 +21292,30 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
             "Fresh in the caller's mind THIS call, different from anything "
             "they have said before — colour their whole angle with it, do not "
             f"quote it as-is: \"{diverse['text']}\"")
+    insanity = int(dj.get("caller_insanity", 45) or 0)
+    madness: dict[str, Any] = {}
+    if insanity and random.random() < insanity / 100:
+        madness = await speakbox_semantic_seed(
+            f"{topic} {caller.get('name', '')} bizarre rant unexpected theory",
+            who="caller")
+        if not madness.get("text"):
+            madness = await speakbox_quote(most=5, cap=460) or {}
+        if madness.get("text"):
+            dose = ("a faint, funny intrusion" if insanity < 35 else
+                    "an unmistakable rhetorical obsession" if insanity < 70 else
+                    "the operating logic of their whole reality")
+            extras.append(
+                f"CALLER INSANITY {insanity}/100: the speakerbox has become "
+                f"{dose}. Seed their vocabulary, associations, grievances and "
+                "comic leaps from this fresh passage. They must make it their "
+                "own rather than merely recite it, but it keeps breaking through "
+                f"their reasoning: \"{str(madness['text'])[:460]}\"")
     if random.random() < 0.3:
         favourite = random.choice(["A", "B"])
         extras.append(
             f"The caller openly prefers {favourite} and says so, which "
             f"{'B' if favourite == 'A' else 'A'} takes personally.")
-    if random.random() < 0.15:
+    if (winning_call and random.random() < 0.35) or random.random() < 0.15:
         # The prize is real: tickets to see somebody who was actually on the
         # air, live at the Pine Box Arena on the edge of town.
         acts = [r.get("artist") for r in read_played()[:14]
@@ -20503,7 +21331,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # like them gone, so half the time the prize is one of those — and
     # whether the caller is thrilled or crushed is a coin, not a mood that
     # follows from the prize being good.
-    if random.random() < 0.22:
+    if winning_call or random.random() < 0.22:
         _pile = hawk_unsold()
         _piece = _pile[-1] if _pile else None
         _prize = ("one of the PAINTINGS off the station wall — the one "
@@ -20594,17 +21422,14 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
                 "material — its attitude, vocabulary and worldview "
                 "colour every line they say, far beyond quoting it: "
                 f"\"{quirk['text']}\"")
-    # The hosts lock in and cut the caller off (#374), then are aghast
-    # at themselves.
+    # A brief host aside can be funny, but it resolves back to the caller's
+    # thought instead of stealing the floor from them.
     if random.random() < 0.25:
         extras.append(
-            "Mid-call, the TWO HOSTS lock into a side-banter about "
-            "something the caller said and completely cut the caller "
-            "off, talking only to each other for several turns; the "
-            "caller fights to get a word in edgewise ('hello?? HELLO?'), "
-            "finally breaks back through, and the hosts are AGHAST at "
-            "themselves for having cut off a caller — apologetic, "
-            "scandalized, blaming each other.")
+            "Mid-call, the TWO HOSTS briefly get carried away riffing on "
+            "something the caller said, then STOP themselves, explicitly ask "
+            "the caller to finish their thought, and listen to the complete "
+            "answer before continuing.")
     # Self-referential machinery (#367): some callers know exactly what
     # is writing and speaking them tonight, and think nothing of it.
     if random.random() < 0.12:
@@ -21056,6 +21881,8 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         speakbox_remember(seed)
     if lines and diverse:
         speakbox_remember(diverse)      # #584: rotate the per-call swath
+    if lines and madness:
+        speakbox_remember(madness)      # the contamination source rotates too
     if lines and stun:
         speakbox_remember(stun)
     if lines and wrestle:
@@ -21189,7 +22016,7 @@ def tape_warmer() -> None:
     Thread(target=run, daemon=True).start()
 
 
-TAPES_SEEN_PATH = Path("/app/data/tapes_seen.json")
+TAPES_SEEN_PATH = data_path("tapes_seen.json")
 
 
 def _tape_track(path: Path) -> dict[str, Any]:
@@ -21359,7 +22186,7 @@ async def caller_clock() -> None:
 # is the sound the station makes most often after the voices. This is the
 # preset it is built from — its own file, because the settings validator is
 # an allowlist and a bell does not belong in it.
-RING_PATH = Path("/app/data/phone_ring.json")
+RING_PATH = data_path("phone_ring.json")
 RING_DEFAULT = {
     "low": 440.0,        # the two tones of the dual bell
     "high": 480.0,
@@ -21674,7 +22501,7 @@ async def play_phone_ring() -> None:
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": "phone-ring",
         })
-        del _RADIO["voice_clips"][:-140]
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     if (_RADIO.get("voice_to") or "box") in ("box", "both") and (
             not await satellite_busy()):
         try:
@@ -21823,6 +22650,25 @@ def banter_turns(script: str, caller_name: str = "",
     return strict
 
 
+def substantial_radio_script(script: str, expected_turns: int) -> bool:
+    """Reject a terse multi-turn draft before it is cached or aired.
+
+    The writer may stop early despite a generous token budget.  A 12-turn,
+    1,100-character larder entry looks like conversation in a log but sounds
+    like a string of fragments.  This gate only applies to substantial rounds;
+    short manager breaks and station IDs remain intentionally concise.
+    """
+    turns = banter_turns(script)
+    bodies = [text for _, text in turns if text.strip()]
+    floor = min(8, max(6, int(expected_turns or 0)))
+    if len(bodies) < floor:
+        return False
+    words = [len(text.split()) for text in bodies]
+    required_chars = min(3600, max(1900, floor * 280))
+    return len(str(script or "")) >= required_chars and (
+        sum(words) / max(1, len(words))) >= 38
+
+
 # What a speaker does at the seam when a long thought continues across
 # announces (#423): a breath, a sigh, a beat — audible, human, and it buys
 # the box a moment to drain its buffer before the next stream begins.
@@ -21852,7 +22698,7 @@ def say_max_chars() -> int:
 
 # How much of one turn may go to air, in characters, regardless of how short
 # the slider has made the individual pieces (#710, #722).
-SAY_TURN_BUDGET = 2600
+SAY_TURN_BUDGET = 3600
 
 # …but a chunk is an ANNOUNCE, and the box can only play one at a time.
 # Budgeting characters alone took a turn at the 4s slider from ten announces
@@ -22485,6 +23331,9 @@ async def speak_turns(turns: list[tuple[str, str]],
                         "id": rid,
                         "ts": int(time.time()), "who": who, "kind": "call",
                         "text": chunk, "aired": "stream",
+                        "name": booth_actor_name(
+                            who, caller_name if who == "caller"
+                            else caller2_name if who == "caller2" else ""),
                         # #770: when this turn will actually be AUDIBLE, not
                         # when the batch was written. Every turn of a burst
                         # shares one `ts`; they do not share one moment. This
@@ -22521,7 +23370,9 @@ async def speak_turns(turns: list[tuple[str, str]],
                              if mixed else max(0.4, secs))
                     rows.append({"id": rid, "who": who, "kind": "call",
                                  "text": chunk,
-                                 "name": (caller_name if who == "caller" else ""),
+                                 "name": booth_actor_name(
+                                     who, caller_name if who == "caller"
+                                     else caller2_name if who == "caller2" else ""),
                                  "from": offset, "until": offset + _real})
                     offset += _real
                 # #770: 160 here against 240 everywhere else meant a busy
@@ -22557,17 +23408,22 @@ async def speak_turns(turns: list[tuple[str, str]],
                             or len(_BOX_HOLD) >= 6)
                 stream_label = ("☎ " + caller_name if caller_name
                                 else "🎙 a conversation")
-                if vto in ("here", "both") or (to_box and box_down):
+                stream_paged = vto in ("here", "both") or (to_box and box_down)
+                if stream_paged:
                     _RADIO["voice_clips"].append({
                         "ts": int(time.time() * 1000),
                         "url": f"{one['path']}?t={one['sig']}",
                         "text": stream_label,
                         "voice": caller_voice or "",
+                        "stream": {"length": length, "rows": rows},
                     })
-                    del _RADIO["voice_clips"][:-140]
-                # #748: start the clock at the moment the audio is handed over,
-                # so "which line is sounding" is a lookup rather than a guess.
-                _stream_now_set(rows, length)
+                    del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+                # #748: start the server clock only when the box is the thing
+                # actually carrying the stream. Page-routed streams start their
+                # booth clock in djVoiceNext.onplaying, because a browser queue
+                # can lag behind the server handoff.
+                if to_box:
+                    _stream_now_set(rows, length)
                 # #778: NOW the receiver going down can be placed — at the end
                 # of the clip it is at the end of, rather than at the moment
                 # the mix was assembled.
@@ -22581,17 +23437,48 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # stream.
                 if to_box:
                     played = await _play_on_box(one["path"], one["sig"])
-                    if not played:
-                        # It never went out — the booth must not go on confidently
-                        # following a call nobody can hear.
+                    played_ok = False
+                    if played:
+                        lp = _LAST_PLAYOUT
+                        played_ok = (lp.get("key") == _played_out_key(one["path"])
+                                     and bool(lp.get("ok")))
+                    if not played_ok:
+                        # It never went out — or came back short — so the booth
+                        # must not confidently follow a call nobody can hear.
                         _stream_now_clear()
+                        ids = {str(r.get("id") or "") for r in rows}
+                        if _RADIO.get("voice_device") == "nabu":
+                            if not stream_paged:
+                                _RADIO["voice_clips"].append({
+                                    "ts": int(time.time() * 1000),
+                                    "url": f"{one['path']}?t={one['sig']}",
+                                    "text": stream_label,
+                                    "voice": caller_voice or "",
+                                    "stream": {"length": length, "rows": rows},
+                                })
+                                del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+                            for line in _RADIO.get("chat") or []:
+                                if str(line.get("id") or "") in ids:
+                                    line["aired"] = "page"
+                            pipeline_log("air", "Nabu unavailable — conversation "
+                                         "delivered by station stream")
+                            continue
+                        for line in _RADIO.get("chat") or []:
+                            if str(line.get("id") or "") in ids:
+                                line["aired"] = "held"
                         box_hold(one, stream_label,
-                                 "caller" if caller_name else "dj")
+                                 "caller" if caller_name else "dj",
+                                 rows=rows, length=length)
                 # #760: the burst is done, not the round. Returning here
                 # is what made the whole conversation one clip.
                 played_any = True
-                if last_batch:
+                if last_batch and not missed:
                     return spoken
+                if last_batch:
+                    pipeline_log("drop", f"{len(missed)} scheduled turn(s) "
+                                      "still owed after the final stream burst "
+                                      "- replaying them one by one")
+                    break
                 continue
             # This burst could not be built. If earlier ones already went
             # out, the round is part-aired and must NOT be replayed WHOLE by
@@ -22618,7 +23505,9 @@ async def speak_turns(turns: list[tuple[str, str]],
                              "into a burst — airing them one by one (#767)")
     reached: set[int] = set()
     consumed = 0
-    can_cut = True                      # a cut is honored only between turns
+    # A normal booth round may yield between turns. A live caller has a
+    # promised arc, so a skip can never strand their final thought on a shelf.
+    can_cut = not bool(caller_name)
     for at in order:
         item = playlist[at]
         reached.add(at)
@@ -22661,7 +23550,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             # dj_speak returns only once the line has actually been spoken,
             # so this is just a beat between turns, not a guess at length.
             await asyncio.sleep(banter_gap(dj["overlap"]))
-            if len(spoken) >= limit:
+            if not caller_name and len(spoken) >= limit:
                 break
         # A cut only lands between turns (#520): re-arm after each item so
         # the next iteration's guard may fire, but only at a turn boundary.
@@ -22811,6 +23700,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # number that was actually asked for; six remains the floor of the
         # ceiling so an unset station behaves as it always did.
         lines = min(lines, max(6, int(dj.get("banter_max_lines") or 6)))
+    if caller_name:
+        # A phone call needs an opening, development, response and goodbye.
+        # Nine total lines frequently left the caller's actual point with no
+        # room to land once the ring and introduction were included.
+        lines = max(lines, 11)
     # A round off the larder shelf (#349, #351): written minutes ago while
     # the desk was quiet, on air the instant it is wanted. Only the plain
     # random rounds shop here — anything with its own subject (an angle, a
@@ -22819,11 +23713,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
             and _LARDER):
         entry = _LARDER.pop(0)
         _larder_save()
-        if time.time() - float(entry["at"]) < _LARDER_FRESH:
+        if (time.time() - float(entry["at"]) < _LARDER_FRESH
+                and _larder_current(entry)):
             pipeline_log("model", "round served off the larder shelf "
                                   f"({len(_LARDER)} left)")
             return await _banter_air(entry, track)
-        # A stale round falls to the floor; write fresh below.
+        # A stale or differently-configured round falls to the floor; write
+        # fresh below rather than replaying the short style it was born with.
     # The pair have weather of their own now (#321): a mood rolls in at
     # the top of a round — one of them arrives bratty, petulant, worked
     # up — colours their pace, pauses and stumbles, and cools off with
@@ -23013,8 +23909,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # Pull fuller swaths so they quote entire phrases at each other, not
         # snippets — the show is meant to be driven by the speakbox in mass
         # (#522).
-        picks = [s for s in [await speakbox_quote(most=4, cap=440),
-                             await speakbox_quote(most=4, cap=440)] if s]
+        picks = [s for s in [await speakbox_quote(most=6, cap=700),
+                             await speakbox_quote(most=6, cap=700)] if s]
         if picks:
             seed = max(picks,
                        key=lambda s: swath_intrigue(s.get("text", "")))
@@ -23037,12 +23933,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
                                                  who="cohost")
                     if random.random() < 0.6 else {}) \
             or await speakbox_quote(exclude=seed.get("file", ""),
-                                    most=6, cap=600)
+                                    most=8, cap=900)
         if comeback.get("file") == seed.get("file"):
             comeback = {}
         if random.random() < 0.3:
             jab = await speakbox_quote(
-                exclude=(comeback or seed).get("file", ""), most=3, cap=280)
+                exclude=(comeback or seed).get("file", ""), most=5, cap=500)
             if jab.get("file") in (seed.get("file"),
                                    (comeback or {}).get("file")):
                 jab = {}
@@ -23216,7 +24112,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # Incessantly is the word he used (#207): the only way to have none is to
     # turn the speakbox down to zero, which is what that slider is for.
     aside = ""
-    if not seed and random.random() < dj["speakbox_rate"]:
+    if not caller_name and not seed and random.random() < dj["speakbox_rate"]:
         seed = await speakbox_quote()
         if seed:
             aside = speakbox_aside(seed)
@@ -23227,7 +24123,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # Now and then the pair go LOOKING for approval (#322) — and the SFX
     # guy, who never talks, gives his verdict from the corner booth right
     # after the round.
-    seek_verdict = bool(dj["drop_voice"]) and random.random() < 0.2
+    seek_verdict = (not caller_name and bool(dj["drop_voice"])
+                    and random.random() < 0.2)
     if seek_verdict:
         angle += (" At some point one of you turns to the SFX guy in his "
                   "booth and appeals for backup OUT LOUD — 'back me up "
@@ -23256,26 +24153,57 @@ async def dj_banter(track: dict[str, Any] | None = None,
                       "— a single glancing mention, then straight on.")
     try:
         third = (f"\nAlso in the booth, a third presenter, "
-                 f"{dj['third_name']}: {dj['third_persona'] or 'game for anything'}"
+                 f"{dj['third_name']}: {radio_persona('third', dj['third_persona']) or 'game for anything'}"
                  if dj["third_name"] else "")
         _flavor = await speakbox_flavor()   # on-the-fly randomness toggle
         # 🎭 personality slider: how often the disposition colours the round.
         _pers = (dj_disposition()
                  if not seed and random.random() < float(
                      dj.get("personality") or 0.7) else "")
+        call_flow = (f"\n\nTHIS IS A COMPLETE PHONE CALL WITH {caller_name}. "
+                     "Use a coherent sequence: ring and answer; C introduces "
+                     "themselves; C states a concrete premise or grievance; a "
+                     "host responds directly; C gets one or more complete turns "
+                     "to develop or finish the rant; the hosts joke, disagree or "
+                     "negotiate with what C ACTUALLY said; then resolve the stated "
+                     "outcome. End with C's completed final sentence, a clear "
+                     "goodbye or acknowledged loss/win, and a host closing the "
+                     "call. Every C turn is a finished thought ending in normal "
+                     "punctuation. Never interrupt, cut off, talk over, abandon, "
+                     "or change the subject away from C before C has answered. "
+                     "Hosts may disagree sharply, but they must let C finish and "
+                     "respond to the substance of C's last line.\n"
+                     if caller_name else "")
+        if caller_name:
+            call_flow += radio_prompt_instruction("caller")
+        participants = (f"the two hosts and {caller_name} on the phone"
+                        if caller_name else
+                        ("the three" if third else "the two"))
         script = await ask_model(
-            f"{dj['persona']}"
+            f"{radio_persona('host', dj['persona'])}"
+            f"{radio_prompt_instruction('host')}"
+            f"{radio_prompt_instruction('cohost')}"
+            f"{radio_prompt_instruction('interaction')}"
+            f"{radio_prompt_instruction('speakerbox')}"
+            f"{radio_prompt_instruction('music') if track else ''}"
+            f"{radio_prompt_instruction('workplace')}"
             f"{_pers}{_flavor}{day_context()}{accent_directive()}\n\n"
             "PUSH THE EDGE (#613): the goal is to be OUTLANDISH — the best "
             "radio says the thing nobody else would. Lean HARD on the material "
             "out of the documents, take it further than anyone expects, chase "
             "the wildest read of it, and never play it safe or generic.\n\n"
-            f"Your co-host: {dj['cohost_persona']}{third}\n\n"
-            f"Write a SHORT exchange for {dj['station_name']} between "
-            f"{'the three' if third else 'the two'} "
+            f"Your co-host: {radio_persona('cohost', dj['cohost_persona'])}{third}\n\n"
+            f"Write a substantial, unfolding exchange for {dj['station_name']} between "
+            f"{participants} "
             f"of you — {max(2, lines - 1)} to {lines} lines total, "
             + ("nobody speaking twice in a row and everyone getting a "
-               "word in. " if third else "strictly alternating. ")
+               "word in. " if third else
+               ("the hosts and caller take turns; no one speaks twice in a "
+                "row and the caller gets several full turns. " if caller_name
+               else "strictly alternating. "))
+            + "Each primary turn must be a developed four-to-seven-sentence "
+            "thought, usually 60 to 100 words: specific, surprising, and "
+            "responsive, never a one-sentence quip. "
             + "Every line RESPONDS to the line before "
             "it: take in what was just said, react to it first — in so many "
             "words — then add your own. No line may ignore or talk past the "
@@ -23295,9 +24223,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "the most entertaining thing on the dial. "
             + ("A WORD-FOR-WORD passage may run as one long turn — do not "
                "shorten or paraphrase it, it will be read out in full. Keep "
-               "the OTHER lines under 70 words. "
-               if seed else "Lines may run to 70 words — expansive, "
-               "thought-provoking, a WHOLE thought each, not a quip; the "
+               "the OTHER lines under 140 words, with concrete details and "
+               "a complete thought. "
+               if seed else "Lines may run to 120 words — two to five "
+               "sentences, expansive, thought-provoking, a WHOLE thought "
+               "each, not a quip; the "
                "delivery system breathes and continues long lines "
                "automatically, so never truncate an idea to fit. ")
             + (f"Work the station's name, {dj['station_name']}, in naturally "
@@ -23340,7 +24270,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                f"reactions, NOT replies: the one on the roll does not stop, "
                f"does not answer them, and keeps going. Vary them; never use "
                f"the same one twice in a round. "
-               if dj.get("diatribe_interjections") else "")
+               if dj.get("diatribe_interjections") and not caller_name else "")
             + "No markdown, no emoji, no URLs, no "
             "stage directions, no asterisks. "
             # No fabricated tallies (#485): the pair kept inventing "you have
@@ -23349,13 +24279,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "did something — no made-up tallies or counts. Only cite a number "
             "when it is given to you in the notes above; otherwise speak "
             "without one.\n"
-            f"{banter_pace(dj['overlap'])}\n"
+            f"{banter_pace(0 if caller_name else dj['overlap'])}\n"
             f"Format each line as 'A: ...' for you and 'B: ...' for "
             f"{dj['cohost_name']}"
             + (f", 'D: ...' for {dj['third_name']}" if third else "")
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
-            + f".{playing}{only_song}{aside}{show_memory()}"
+            + f".{playing}{only_song}{aside}{show_memory()}{call_flow}"
             f"{avoid_reruns()}{approach_clause(_approach)}\n\n"
             "The two lists below are prompts he typed and pictures we made "
             "for him. They are not songs and must never be announced as "
@@ -23367,11 +24297,48 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # passage worked in needs more turns than a one-line remark, and
             # running out of tokens is what a DJ stopping mid-word sounds
             # like (#168).
-            limit=1400 + len(seed.get("text", "")) + len(aside)
-                  + len((comeback or {}).get("text", "")) + len(angle),
+            limit=min(
+                int(dj.get("reply_max_chars") or 6000),
+                max(3600, 440 * lines + len(seed.get("text", ""))
+                    + len(aside) + len((comeback or {}).get("text", ""))
+                    + len(angle)),
+            ),
         )
     except Exception:
         return []
+
+    # Do not bank or air an exchange that ignored the long-form contract.
+    # This is deliberately after the first generation so the correction can
+    # preserve its subject and any exact Speakerbox wording while giving every
+    # speaker enough room to make a real thought.
+    if (lines >= 8 and not caller_name
+            and not substantial_radio_script(script, lines)):
+        pipeline_log("model", "thin radio draft rejected — rewriting before air")
+        try:
+            rewritten = await ask_model(
+                "Rewrite the following Pine Box FM draft as a coherent, "
+                "long-form exchange. Return only A:/B: dialogue. Keep its "
+                "subject and every verbatim quotation, but write 8 to 11 "
+                "alternating turns with at least 55 words in every ordinary "
+                "turn. Each speaker must respond directly to the prior turn, "
+                "develop an idea with concrete detail, and finish a complete "
+                "thought. Do not use one-line reactions or stage directions.\n\n"
+                + script,
+                limit=min(int(dj.get("reply_max_chars") or 6000),
+                          max(4200, 500 * min(lines, 11))),
+                spice=0.25,
+                num_ctx=16384,
+            )
+            if substantial_radio_script(rewritten, lines):
+                script = rewritten
+            else:
+                pipeline_log("model", "rewrite still thin — preserving the "
+                             "draft but withholding it from the larder")
+                if bank:
+                    return []
+        except Exception:
+            if bank:
+                return []
 
     if seed.get("text"):
         # Mined means SAID (#404): a swath the model paraphrased away is
@@ -23390,7 +24357,25 @@ async def dj_banter(track: dict[str, Any] | None = None,
                      + (script[-400:] or angle or "")),
                     exclude=seed.get("file", ""))
                 or await speakbox_quote(exclude=seed.get("file", ""),
-                                        most=3, cap=280))
+                                        most=5, cap=500))
+    # A full reading is placed into the script AFTER the model has written its
+    # exchange. It is therefore verbatim, one speaker's turn, and cannot be
+    # summarized, answered over, or reduced to a decorative sentence. The
+    # stream renderer may divide it into transport-safe pieces, but joins
+    # those pieces in the same voice with no other speaker between them.
+    full_swath: dict[str, Any] = {}
+    if (not caller_name and random.random() < float(
+            _sb.get("speakbox_full_swath_rate") or 0)):
+        full_swath = await speakbox_quote(
+            most=30,
+            cap=int(_sb.get("speakbox_full_swath_chars") or 2600),
+        )
+        if full_swath.get("text"):
+            script = f"A: {full_swath['text']}\n" + script.lstrip()
+            lines += 1
+            speakbox_remember(full_swath)
+            pipeline_log("speakbox", "full uninterrupted swath scheduled "
+                         f"({len(str(full_swath['text']))} chars)")
     # #609/#612: PRE-PEND a fresh verbatim swath to the FRONT of the round (an
     # extra opening quote, on top of any seed) and APPEND one to the END, each
     # on its own slider so the pair trade the operator's documents verbatim more
@@ -23404,7 +24389,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         pipeline_log("speakbox", f"the cooldown is holding back "
                                  f"{_lift * 100:.0f}% of recent lines — "
                                  "leaning harder on the documents (#no-repeats)")
-    if random.random() < min(1.0, float(
+    if not caller_name and not full_swath and random.random() < min(1.0, float(
             _sb.get("speakbox_prepend_rate") or 0) + _lift):
         head = await _fresh_swath()
         if head.get("text"):
@@ -23412,7 +24397,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             lines += 1
             speakbox_remember(head)
     tail: dict[str, Any] = {}
-    if random.random() < min(1.0, float(
+    if not caller_name and not full_swath and random.random() < min(1.0, float(
             _sb.get("speakbox_append_rate") or 0) + _lift):
         tail = await _fresh_swath()
         if tail.get("text"):
@@ -23430,6 +24415,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "caller2_name": caller2_name, "caller2_voice": caller2_voice,
         "render_stream": render_stream,
         "feel": feel,                                          # #750
+        "profile": _larder_profile_signature(),
     }
     if bank:
         _LARDER.append(entry)
@@ -23536,11 +24522,17 @@ async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
-    # #no-repeats: the last chance to be fresh rather than short. Anything still
-    # repeating after this meets the gate in speak_turns, which swaps it.
-    entry["script"] = await freshen_script(entry["script"],
-                                           entry.get("caller_name", ""),
-                                           entry.get("caller2_name", ""))
+    # A prewritten round is the station's continuity reserve. When another
+    # segment is already holding the model gate, never queue this reserve
+    # behind a rewrite: speak_turns still applies its line-level repetition
+    # checks, but the ready audio path must remain immediately available.
+    if _OLLAMA_GATE.locked():
+        pipeline_log("air", "larder round bypasses model freshening while "
+                     "the desk is still writing — keeping talk on air")
+    else:
+        entry["script"] = await freshen_script(entry["script"],
+                                               entry.get("caller_name", ""),
+                                               entry.get("caller2_name", ""))
     spoken = await speak_turns(banter_turns(entry["script"],
                                             entry.get("caller_name", ""),
                                             entry.get("caller2_name", "")),
@@ -23649,7 +24641,8 @@ async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
             "calmer records, fewer renders, someone fan the servers. Read "
             "it out, react, and take it personally — you two are the ones "
             "sweating in here."))
-    note = active_prompt_text(800)
+    note = (active_prompt_text(800) + radio_prompt_instruction("manager")
+            + radio_prompt_instruction("workplace")).strip()
     if not note:
         return []
     return await dj_banter(track, lines=3, angle=(
@@ -23891,18 +24884,11 @@ async def pinebox_recover(restart_agent: bool = True) -> dict[str, Any]:
     entry is the one call that reliably clears that state."""
     steps: list[str] = []
 
-    try:
-        dj_stop()
-        steps.append("radio stopped")
-    except Exception as exc:
-        steps.append(f"radio: {exc}")
-
-    try:
-        result = await stop_speaking()
-        steps.append(f"dropped {result.get('cancelled_queued', 0)} queued lines")
-    except Exception as exc:
-        steps.append(f"speech: {exc}")
-
+    # Recovery is transport maintenance, not a destructive reset. The show
+    # and every pending dialogue clip remain on their durable shelves; the
+    # old call to stop_speaking() cancelled in-flight work and contradicted
+    # the station guarantee that a written line is never thrown away.
+    steps.append(f"preserved {len(_BOX_HOLD)} held clip(s) and live show state")
     token, player = _ha_creds()
     if token and player:
         async with httpx.AsyncClient(timeout=20) as client:
@@ -24183,10 +25169,6 @@ async def satellite_reachable(host: str = "", port: int = 0) -> bool:
 
 async def satellite_status() -> dict[str, Any]:
     """Everything known about the link, in one place."""
-    entries = await ha_config_entries()
-    wyoming = [e for e in entries if e.get("domain") == "wyoming"]
-    broken = [e for e in wyoming if e.get("state") != "loaded"]
-
     token, player = _ha_creds()
     entity_state = ""
     if token and player:
@@ -24198,6 +25180,30 @@ async def satellite_status() -> dict[str, Any]:
                 entity_state = (response.json() or {}).get("state", "")
         except Exception:
             entity_state = "unknown"
+
+    # PineVoice is a direct Wyoming satellite, so a protocol response is the
+    # only trustworthy proof that it can receive a clip. ESPHome Voice
+    # Preview editions are different: Home Assistant owns their transport and
+    # they do not expose PineVoice's :10700 Wyoming endpoint. Do not keep an
+    # old PineVoice outage latched when the selected output is a healthy HA
+    # satellite; its entity state is the right delivery-health signal.
+    direct_wyoming = player == "assist_satellite.pinevoice"
+    if not direct_wyoming:
+        online = entity_state not in ("unavailable", "unknown", "")
+        return {
+            "entity": player,
+            "entity_state": entity_state,
+            "online": online,
+            "entries": [],
+            "broken": [],
+            "host": "",
+            "reachable": online,
+            "transport": "home_assistant",
+        }
+
+    entries = await ha_config_entries()
+    wyoming = [e for e in entries if e.get("domain") == "wyoming"]
+    broken = [e for e in wyoming if e.get("state") != "loaded"]
 
     return {
         "entity": player,
@@ -24211,6 +25217,7 @@ async def satellite_status() -> dict[str, Any]:
         "broken": [e.get("title") for e in broken],
         "host": SATELLITE_HOST,
         "reachable": await satellite_reachable() if SATELLITE_HOST else None,
+        "transport": "wyoming",
     }
 
 
@@ -24415,7 +25422,7 @@ async def satellite_reconnect(watch: bool = True) -> dict[str, Any]:
 # environment for the BLE-Improv recovery helper on this box.
 SATELLITE_MAC = os.getenv("SATELLITE_MAC", "")
 SATELLITE_SSID = os.getenv("SATELLITE_SSID", "")
-GUIDE_PDF = Path("/app/data/pinebox-recovery.pdf")
+GUIDE_PDF = data_path("pinebox-recovery.pdf")
 
 
 def _arp_table() -> dict[str, str]:
@@ -24488,8 +25495,22 @@ async def pinebox_diagnose() -> dict[str, Any]:
         f"{link['entity']} is {link['entity_state']}"
         + (f" · entry {entry.get('state')}" if entry else ""))
 
-    probe = await satellite_probe()
-    reachable = probe["state"] == "ok"
+    # A Voice Preview Edition is an HA/ESPHome satellite, not a PineVoice
+    # exposed on :10700. Its selected entity is the delivery signal; probing
+    # the retired PineVoice must not turn an otherwise working route red.
+    ha_satellite = link.get("transport") == "home_assistant"
+    if ha_satellite:
+        reachable = bool(link.get("online") and link.get("reachable"))
+        probe = {
+            "state": "ok" if reachable else "timeout",
+            "detail": ("Home Assistant satellite transport" if reachable
+                       else "selected satellite is unavailable"),
+        }
+        add("Selected speaker transport", reachable,
+            "Home Assistant manages this ESPHome satellite")
+    else:
+        probe = await satellite_probe()
+        reachable = probe["state"] == "ok"
     # #784: a satellite that is BUSY SERVING Home Assistant can refuse our
     # own describe on the same port while playing the show perfectly — the
     # session belongs to HA, not to us. So a recent, full-length playout is
@@ -24497,28 +25518,37 @@ async def pinebox_diagnose() -> dict[str, Any]:
     # this the #777 ladder cries "the Pine Box is not accepting audio" over a
     # box that is audibly working, which is the same fault as before wearing
     # the opposite face.
-    played_recently = (time.time() - _BOX_LAST_OK[0]) < 300
-    if not reachable and played_recently:
+    # A stale HTTP acceptance cannot overrule a wedged satellite. Recent
+    # delivery only counts when it was verified audible and the station is not
+    # actively accumulating missed dialogue behind an open breaker.
+    delivery_blocked = (time.time() < float(_BOX_DOWN.get("until") or 0)
+                        or len(_BOX_HOLD) >= 3
+                        or bool(_LAST_PLAYOUT.get("at"))
+                        and not bool(_LAST_PLAYOUT.get("ok")))
+    played_recently = box_recently_verified() and not delivery_blocked
+    if not ha_satellite and not reachable and played_recently:
         add(f"Pine Box on the network ({SATELLITE_HOST}:{SATELLITE_PORT})",
             True, f"{probe['detail']} — but it played a clip in full "
                   f"{int(time.time() - _BOX_LAST_OK[0])}s ago, so it is "
                   "serving Home Assistant and simply will not take a second "
                   "session")
         reachable = True
-    else:
+    elif not ha_satellite:
         add(f"Pine Box on the network ({SATELLITE_HOST}:{SATELLITE_PORT})",
             reachable, probe["detail"])
 
     # `ip` is not in this image, so ARP is informational only — it must not
     # decide the diagnosis, or an unknown reads as "everything is fine".
-    arp = await _arp_state(SATELLITE_HOST) if SATELLITE_HOST else ""
-    known = arp not in ("", "unknown", "no entry")
-    on_lan = known and "FAILED" not in arp.upper() and "INCOMPLETE" not in arp.upper()
-    add("Answers at the link layer (ARP)", on_lan if known else None,
-        arp if known else "not checkable from inside the container")
+    if not ha_satellite:
+        arp = await _arp_state(SATELLITE_HOST) if SATELLITE_HOST else ""
+        known = arp not in ("", "unknown", "no entry")
+        on_lan = (known and "FAILED" not in arp.upper()
+                  and "INCOMPLETE" not in arp.upper())
+        add("Answers at the link layer (ARP)", on_lan if known else None,
+            arp if known else "not checkable from inside the container")
 
     elsewhere = []
-    if not reachable:
+    if not ha_satellite and not reachable:
         # #784: NEVER the address it is already configured for. discover()
         # scans the subnet and happily reports the box at 10.89.1.205 while
         # the station is looking for it at 10.89.1.205, which came out as
@@ -24527,8 +25557,15 @@ async def pinebox_diagnose() -> dict[str, Any]:
         # not a box that moved; it is a box that is wedged.
         elsewhere = [a for a in await satellite_discover()
                      if a and a != SATELLITE_HOST]
-    add("Found at another address", None,
-        ", ".join(elsewhere) if elsewhere else "no")
+    if not ha_satellite:
+        add("Found at another address", None,
+            ", ".join(elsewhere) if elsewhere else "no")
+    if delivery_blocked:
+        add("Verified station delivery", False,
+            f"{len(_BOX_HOLD)} clip(s) held · breaker "
+            + ("open" if time.time() < float(_BOX_DOWN.get("until") or 0)
+               else "closed")
+            + f" · last playout {round(float(_LAST_PLAYOUT.get('ratio') or 0) * 100)}%")
 
     # #757: THE ROUTING, first, because it is the one thing here that was
     # actually wrong and nothing in this function was looking at it. A box
@@ -24757,11 +25794,20 @@ def serial_ports() -> list[dict[str, str]]:
                 "serial": getattr(port, "serial_number", "") or "",
             })
     except Exception:
-        # pyserial missing or no permission — fall back to the device nodes.
+        pass
+
+    # pyserial inspects the container's /dev only. The agent also mounts the
+    # host device tree at /host-dev so a Pine Box attached to lilspark rather
+    # than to the browser computer remains discoverable after container restarts.
+    known = {str(p.get("device") or "") for p in found}
+    for root in (Path("/dev"), Path("/host-dev")):
         for pattern in ("ttyUSB*", "ttyACM*"):
-            for node in sorted(Path("/dev").glob(pattern)):
+            for node in sorted(root.glob(pattern)):
+                if str(node) in known:
+                    continue
                 found.append({"device": str(node), "description": "",
                               "manufacturer": "", "vid_pid": "", "serial": ""})
+                known.add(str(node))
 
     # This board has 32 onboard UARTs and none of them can ever be the Pine
     # Box, which arrives as a USB device. Offering them is worse than
@@ -24930,7 +25976,7 @@ def log_turn(user_text: str, answer: str, metadata: dict[str, Any]) -> None:
         pass
 
 
-FEEDBACK_PATH = Path("/app/data/feedback.jsonl")
+FEEDBACK_PATH = data_path("feedback.jsonl")
 
 
 def read_feedback(limit: int = 40) -> list[dict[str, Any]]:
@@ -25860,12 +26906,53 @@ def _mask_voice(settings: dict[str, Any]) -> dict[str, Any]:
     return masked
 
 
+def mind_topology_state() -> dict[str, Any]:
+    dj = dj_settings()
+    names = {"dj": dj.get("host_name") or "Host", "cohost": dj.get("cohost_name") or "Co-host", "third": dj.get("third_name") or "Third seat", "manager": dj.get("manager_name") or "Manager", "caller": "Current caller", "customer": "Listeners"}
+    personas = {"dj": dj.get("persona") or "", "cohost": dj.get("cohost_persona") or "", "third": dj.get("third_persona") or ""}
+    chat = list(_RADIO.get("chat") or [])[-80:]
+    return {"at": int(time.time() * 1000), "people": [{"id": role, "name": names[role], "persona": personas.get(role, ""), "state": speaker_state(role), "adjustments": (dj.get("mind_adjustments") or {}).get(role, []), "latest": next((str(row.get("text") or "") for row in reversed(chat) if row.get("who") == role), "")} for role in ("dj", "cohost", "third", "manager", "caller", "customer") if role != "third" or dj.get("third_name")], "vectors": list(_RADIO.get("vector_access") or [])[:12], "sections": list(_RADIO.get("sections") or [])[-12:], "now": _RADIO.get("now") or {}, "repair": _RADIO.get("repairing") or {}}
+
+
+@app.get("/api/mind/topology")
+async def mind_topology_api(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return mind_topology_state()
+
+
+@app.post("/api/mind/topology/adjust")
+async def mind_topology_adjust(request: Request, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json(); role = str(payload.get("role") or "").strip()
+    if role not in ("dj", "cohost", "third", "caller", "manager", "customer"):
+        raise HTTPException(status_code=400, detail="Unknown cast role")
+    settings = load_settings(); bucket = settings.setdefault("dj", {}).setdefault("mind_adjustments", {}); rows = [row for row in (bucket.get(role) or []) if isinstance(row, dict)]
+    item_id = str(payload.get("id") or "")[:32]
+    if str(payload.get("action") or "add") == "delete": rows = [row for row in rows if str(row.get("id") or "") != item_id]
+    else:
+        note = str(payload.get("text") or "").strip()[:500]
+        if not note: raise HTTPException(status_code=400, detail="Write a directive")
+        found = next((row for row in rows if str(row.get("id") or "") == item_id), None)
+        if found: found["text"] = note
+        else: rows.append({"id": uuid.uuid4().hex[:8], "text": note, "source": "Mind Topology"})
+    bucket[role] = rows[:24]; save_settings(settings)
+    return mind_topology_state()
+
+
 @app.get("/api/settings")
 async def api_get_settings(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
     return _mask_voice(load_settings())
+
+
+@app.get("/api/dj/prompt-desk")
+async def api_dj_prompt_desk(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return radio_prompt_desk_state()
 
 
 @app.put("/api/settings")
@@ -27043,7 +28130,7 @@ async def voice_audition(
 
 # --- Personalities (§23): a voice plus a temperament, saved ----------------
 
-PERSONAS_PATH = Path("/app/data/personas.json")
+PERSONAS_PATH = data_path("personas.json")
 _PERSONAS_LOCK = RLock()
 
 
@@ -27495,7 +28582,7 @@ async def voicelab_ingest(
 # transcripts — it is the digest: the recurring images, the place names, the
 # weather, what the songs are FOR, and the inclinations those imply for the
 # people living in that world.
-LYRICS_DIR = Path("/app/data/lyrics")
+LYRICS_DIR = data_path("lyrics")
 _LYRIC_JOBS: dict[str, dict[str, Any]] = {}
 _LYRIC_LOCK = RLock()
 
@@ -28576,7 +29663,22 @@ async def music_vote(
     return {"id": track_id, "title": (track or {}).get("title", ""), **result}
 
 
-ROUTING_PATH = Path("/app/data/routing.json")
+ROUTING_PATH = data_path("routing.json")
+
+
+def _routing_voice_device_set(device: str) -> None:
+    if device not in ("pine", "nabu"):
+        return
+    settings = load_settings()
+    voice_out = dict(settings.get("voice_out") or {})
+    voice_out["media_player"] = (
+        NABU_SATELLITE if device == "nabu" else PINEVOICE_SATELLITE
+    )
+    settings["voice_out"] = voice_out
+    save_settings(settings)
+    _RADIO["voice_device"] = device
+    _SAT_ALIVE.update({"checked": 0.0, "entity": ""})
+    _SAT_BUSY.update({"at": 0.0, "entity": ""})
 
 
 def _routing_save() -> None:
@@ -28587,7 +29689,8 @@ def _routing_save() -> None:
         tmp = ROUTING_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps({k: _RADIO.get(k)
                                    for k in ("music_to", "voice_to",
-                                             "reply_to", "box_talk")}))
+                                             "voice_device", "reply_to",
+                                             "box_talk")}))
         tmp.replace(ROUTING_PATH)
     except Exception:
         pass
@@ -28600,15 +29703,26 @@ def _routing_load() -> None:
         return
     for k in ("music_to", "voice_to", "reply_to"):
         v = data.get(k)
-        if v in ("box", "here", "both", "off"):
-            _RADIO[k] = v
+        if v in ("box", "here", "both", "off", "nabu"):
+            _RADIO[k] = "box" if v == "nabu" else v
+            if v == "nabu":
+                _RADIO["voice_device"] = "nabu"
+    if data.get("voice_device") in ("pine", "nabu"):
+        _RADIO["voice_device"] = data["voice_device"]
     if isinstance(data.get("box_talk"), bool):
         _RADIO["box_talk"] = data["box_talk"]     # the switch survives too
+    if (_RADIO.get("music_to") == "here" and _RADIO.get("voice_to") == "box"
+            and _RADIO.get("reply_to") == "box"
+            and _RADIO.get("voice_device") != "nabu"):
+        _routing_voice_device_set("nabu")
+        _routing_save()
 
 
 @app.on_event("startup")
 async def _startup_routing() -> None:
     _routing_load()
+    if _RADIO.get("voice_device") == "nabu":
+        _routing_voice_device_set("nabu")
 
 
 @app.post("/api/dj/output")
@@ -28621,21 +29735,29 @@ async def dj_output_api(
     Persisted so it is stable across restarts and shared between clients."""
     require_auth(authorization)
     payload = await request.json()
-    valid = ("box", "here", "both", "off")
+    valid = ("box", "here", "both", "off", "nabu")
 
     # `output` alone still means the music, which is what it controlled.
     music = str(payload.get("music") or payload.get("output") or "").strip()
     voice = str(payload.get("voice") or "").strip()
     reply = str(payload.get("reply") or "").strip()
+    voice_device = str(payload.get("voice_device") or "").strip()
+    was = str(_RADIO.get("voice_to") or "box")
     for value in (music, voice, reply):
         if value and value not in valid:
             raise HTTPException(status_code=400,
-                                detail="box, here, both or off")
+                                detail="box, here, both, nabu or off")
+    if voice_device and voice_device not in ("pine", "nabu"):
+        raise HTTPException(status_code=400, detail="pine or nabu")
+    if any(value == "nabu" for value in (music, voice, reply)):
+        voice_device = "nabu"
+        music = "box" if music == "nabu" else music
+        voice = "box" if voice == "nabu" else voice
+        reply = "box" if reply == "nabu" else reply
 
     if music:
         _RADIO["music_to"] = music
     if voice:
-        was = str(_RADIO.get("voice_to") or "box")
         _RADIO["voice_to"] = voice
         # #741: "I switched over to the Pine Box and it didn't move the audio
         # over." Routing was only ever read when the NEXT line was written, so
@@ -28647,6 +29769,8 @@ async def dj_output_api(
         # box to carry instead.
         if voice in ("box", "off") and was != voice:
             _RADIO["voice_clips"].clear()
+    if voice_device:
+        _routing_voice_device_set(voice_device)
     if reply:
         _RADIO["reply_to"] = reply
     # The master switch rides the same endpoint and the same save (#638).
@@ -28655,7 +29779,10 @@ async def dj_output_api(
     if talk is not None:
         _RADIO["box_talk"] = bool(talk)
         if not _RADIO["box_talk"]:
-            _BOX_HOLD.clear()     # nothing shelved gets replayed at it later
+            # Turning this output off pauses recovery; it does not cancel
+            # dialogue that the station still owes. The shelf resumes when
+            # the output returns, in its original order.
+            _box_hold_save()
             # #690: switching the box off ends any repair in progress. The
             # breaker, the failure count and the "The DJs are on it" banner
             # all describe a speaker the station is no longer calling —
@@ -28667,6 +29794,12 @@ async def dj_output_api(
             pipeline_log("air", "Pine Box switched off — the station stops "
                                 "calling it, and stops repairing it (#690)")
     _routing_save()
+    # The selected destination should take effect now, not on the next
+    # twenty-second shelf pass. The probe is bounded and self-heal is already
+    # cooldown-protected, so moving the selector cannot create a repair loop.
+    if ((voice in ("box", "both") and voice != was)
+            or (talk is True and (_RADIO.get("voice_to") or "box") in ("box", "both"))):
+        asyncio.create_task(box_route_wake())
     return dj_state()
 
 
@@ -28759,9 +29892,14 @@ async def dj_voice_api(
     mode the feed used to be empty by definition — now it carries the
     diverted lines the box declined (#314), so speech never vanishes."""
     require_read_auth(authorization)
-    return {
-        "clips": [c for c in _RADIO["voice_clips"] if c["ts"] > int(since)],
-    }
+    server_ms = int(time.time() * 1000)
+    clips = []
+    for clip in _RADIO["voice_clips"]:
+        if int(clip.get("ts") or 0) <= int(since):
+            continue
+        clips.append({**clip, "broadcast_ms": int(clip.get("broadcast_ms")
+            or int(clip["ts"]) + VOICE_BROADCAST_LEAD_MS)})
+    return {"server_ms": server_ms, "clips": clips}
 
 
 @app.get("/api/dj")
@@ -29728,7 +30866,7 @@ async def serial_open_api(
     require_auth(authorization)
     payload = await request.json()
     device = str(payload.get("port") or "")
-    if not re.fullmatch(r"/dev/tty(USB|ACM|S)\d{1,3}", device):
+    if not re.fullmatch(r"/(?:dev|host-dev)/tty(USB|ACM|S)\d{1,3}", device):
         raise HTTPException(status_code=400, detail="Not a serial device")
     return await asyncio.to_thread(
         serial_open, device, int(payload.get("baud") or 0))
@@ -30230,6 +31368,7 @@ async def pinebox_status_api(
         "routing": {
             "on": bool(_RADIO.get("on")),
             "voice_to": _RADIO.get("voice_to") or "box",
+            "voice_device": _RADIO.get("voice_device") or "nabu",
             "music_to": _RADIO.get("music_to") or "here",
             "reply_to": _RADIO.get("reply_to") or "box",
             "box_talk": box_talk_ok(),
@@ -30670,7 +31809,7 @@ async def dj_banter_api(
     }
 
 
-CONVERSE_PATH = Path("/app/data/converse_seeds.json")
+CONVERSE_PATH = data_path("converse_seeds.json")
 _CONVERSE_LOCK = RLock()
 
 
@@ -33166,6 +34305,8 @@ async def dj_callers_list(
     dj = dj_settings()
     return {"callers": read_callers(), "names": caller_names(),
             "per_hour": dj["callin_per_hour"],
+            "success_rate": dj["caller_success_rate"],
+            "insanity": dj["caller_insanity"],
             "caller_fx": dj["caller_fx"],
             "caller_fx_depth": dj["caller_fx_depth"],
             "caller_static": dj["caller_static"]}
@@ -34296,7 +35437,7 @@ async def speakbox_save_api(
 # Sections the operator hand-picked out of the documents and pushed into the
 # pair's heads (#482): they get worked into banter at random intervals,
 # ahead of the ordinary weighted mining, then retire after a few airings.
-PUSHED_SECTIONS_PATH = Path("/app/data/pushed_sections.json")
+PUSHED_SECTIONS_PATH = data_path("pushed_sections.json")
 _PUSHED_LOCK = RLock()
 _PUSHED_USES = 3                        # airings before a pushed section retires
 
@@ -34498,7 +35639,7 @@ async def sfx_stats_api(
     return {"samples": samples[:200], "djs": favourites}
 
 
-SFX_SPEC_DIR = Path("/app/data/sfx_specs")
+SFX_SPEC_DIR = data_path("sfx_specs")
 
 
 @app.get("/api/sfx/info")
@@ -34699,6 +35840,43 @@ async def dj_reel_api(
     return {"lines": uniq[:24]}
 
 
+@app.post("/api/dj/flow/repair")
+async def dj_flow_repair_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Apply the continuity-safe configuration and wake the reserve writer."""
+    require_auth(authorization)
+    settings = load_settings()
+    current = dict(settings.get("dj") or {})
+    current.update({
+        "dialogue_prefill": True,
+        "dialogue_reserve_target": max(5, int(
+            current.get("dialogue_reserve_target") or 4)),
+        "talk_radio_mode": True,
+        "records_first": True,
+        "stream_show": True,
+        # The watchdog is a last resort, but should not accept a long empty
+        # handoff while the reserve writer has work ready to do.
+        "dead_air_seconds": min(30, max(15, int(
+            current.get("dead_air_seconds") or 30))),
+    })
+    settings["dj"] = current
+    save_settings(settings)
+    repair_note("continuity repair armed: torrent, records-first and a five-round dialogue reserve")
+    # The keeper's next three-second pass is enough if a live turn owns the
+    # model. When it is idle, kick it now rather than waiting for the clock.
+    if _RADIO.get("on") and not _LARDER_WRITING[0] \
+            and not _OLLAMA_GATE.locked():
+        async def _fill_reserve() -> None:
+            _LARDER_WRITING[0] = True
+            try:
+                await dj_banter(None, bank=True, render_stream=True)
+            finally:
+                _LARDER_WRITING[0] = False
+        asyncio.create_task(_fill_reserve())
+    return dialogue_flow_state()
+
+
 @app.get("/api/dj/backlog")
 async def dj_backlog_api(
     authorization: str | None = Header(default=None),
@@ -34809,7 +35987,7 @@ async def dj_crystal_api(
 # extras (XTTS clones, voice-lab, ComfyUI) health-gate to "down" on the
 # friend's machine exactly as they do here — Piper carries the voices.
 
-KIT_DIR = Path("/app/data/export")
+KIT_DIR = data_path("export")
 
 KIT_COMPOSE = """\
 # One self-contained station (#628). The project name keeps every container,
@@ -35353,7 +36531,7 @@ def _kit_build() -> Path:
     KIT_DIR.mkdir(parents=True, exist_ok=True)
     out = KIT_DIR / "pinebox-station-kit.zip"
     tmp = out.with_suffix(".part")
-    base = Path("/app/data")
+    base = DATA_DIR
     keep = ["speakbox", "voices", "vendor", "callers.json", "settings.json",
             "banter_topics.json", "banter_saved.json", "ad_reads.json",
             "crystal_notes.json", "said_lines.json", "speakbox_gems.json",
@@ -36159,7 +37337,7 @@ async def dj_sfx_play(
         "ts": int(time.time() * 1000), "url": f"/sfx/{key}?t={signature}",
         "text": "", "sting": path.stem,
     })
-    del _RADIO["voice_clips"][:-140]
+    del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     played = ""
     if (_RADIO.get("voice_to") or "box") in ("box", "both"):
         played = await _play_on_box(f"/sfx/{key}", signature)
@@ -36272,9 +37450,9 @@ async def tunes_list(
     return {"tunes": read_tunes(max(1, min(30, limit)))}
 
 
-NOTIFICATIONS_PATH = Path("/app/data/notifications.jsonl")
+NOTIFICATIONS_PATH = data_path("notifications.jsonl")
 NOTIFICATIONS_KEEP = 400
-PHRASE_SETS_PATH = Path("/app/data/phrase_sets.json")
+PHRASE_SETS_PATH = data_path("phrase_sets.json")
 
 
 @app.get("/api/notifications")
@@ -37081,11 +38259,17 @@ async def service_restart(
     name = str(payload.get("name") or "")
 
     if name == "spark-agent":
+        cleaned: dict[str, int] | None = None
+        if bool(payload.get("clean")):
+            # Stop first so no task can append another clip while the explicit
+            # clean-start action empties the delivery shelves.
+            dj_stop(seal_episode=False)
+            cleaned = clean_station_backlog()
         async def _die() -> None:
             await asyncio.sleep(0.5)
             os._exit(3)  # docker restart: unless-stopped revives us
         asyncio.create_task(_die())
-        return {"restarting": name}
+        return {"restarting": name, "cleaned": cleaned}
 
     container = SERVICE_CONTAINERS.get(name)
     if not container:
@@ -37126,8 +38310,10 @@ async def ha_media_players(
     """Speakers Home Assistant can play TTS on (incl. HomeKit/AirPlay ones)."""
     require_auth(authorization)
     token, player = _ha_creds()
+    _reply_token, reply_player = _ha_creds(reply=True)
     if not token:
-        return {"players": [], "configured": player, "token_set": False}
+        return {"players": [], "configured": player,
+                "configured_reply": reply_player, "token_set": False}
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             response = await client.get(
@@ -37152,13 +38338,17 @@ async def ha_media_players(
                 else ""
             ),
             "state": s.get("state", ""),
+            "kind": ("assist_satellite"
+                     if str(s["entity_id"]).startswith("assist_satellite.")
+                     else "media_player"),
         }
         for s in states
         if str(s.get("entity_id", "")).startswith(
             ("media_player.", "assist_satellite.")
         )
     ]
-    return {"players": players, "configured": player, "token_set": True}
+    return {"players": players, "configured": player,
+            "configured_reply": reply_player, "token_set": True}
 
 
 @app.post("/api/model")
@@ -37442,7 +38632,7 @@ async def pine_list(
     return {"requests": pine_read()}
 
 
-PINE_UPLOADS_DIR = Path("/app/data/pine_uploads")
+PINE_UPLOADS_DIR = data_path("pine_uploads")
 
 
 def _save_pine_images(images: list[Any]) -> list[str]:
@@ -37869,29 +39059,39 @@ body {
   background: var(--bg);
   color: var(--text);
   font-family: system-ui, sans-serif;
+  overflow-x: hidden;
 }
 header {
-  padding: 22px 28px;
+  padding: clamp(12px, 2vw, 22px) clamp(14px, 2.4vw, 28px);
   border-bottom: 1px solid var(--border);
   display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
   justify-content: space-between;
   align-items: center;
 }
-h1 { margin: 0; font-size: 24px; }
+header > * { min-width: 0; }
+h1 { margin: 0; font-size: clamp(18px, 2.4vw, 24px); }
 small, .muted { color: var(--muted); }
 main {
   display: flex;
   align-items: flex-start;
   gap: 0;
-  padding: 20px;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  overflow-x: clip;
+  padding: clamp(10px, 1.6vw, 20px);
 }
 main > .col-left {
   flex: 0 0 var(--split, 50%);
-  min-width: 320px;
+  min-width: min(300px, 100%);
+  max-width: 100%;
 }
 main > aside {
   flex: 1 1 auto;
-  min-width: 320px;
+  min-width: min(300px, 100%);
+  max-width: 100%;
 }
 /* Pine Chat on the left instead of the right, remembered across visits
    (#486). Pure flex order — no reflow of the resizer, whose drag math
@@ -37918,7 +39118,13 @@ main.swap > aside     { order: 1; }
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius);
-  padding: 18px;
+  /* One padding to rule them all: .player-strip cancels it edge-to-edge, so
+     the two must never disagree (a hard-coded -18px poked past the border
+     whenever the clamp shrank the padding). */
+  --pad: clamp(12px, 1.4vw, 18px);
+  padding: var(--pad);
+  min-width: 0;
+  max-width: 100%;
 }
 label {
   display: block;
@@ -37937,7 +39143,7 @@ input, select, textarea {
   padding: 11px;
 }
 textarea {
-  min-height: 390px;
+  min-height: clamp(180px, 40vh, 390px);
   resize: vertical;
   line-height: 1.45;
 }
@@ -37962,10 +39168,21 @@ button.danger {
 }
 .row {
   display: flex;
+  /* Wrap UNCONDITIONALLY (#692 precedent): panel width is set by the
+     draggable splitter, not the viewport, so no media query can see a
+     300px panel on a wide monitor. Controls flow to the next line rather
+     than clipping at the panel border. */
+  flex-wrap: wrap;
   gap: 10px;
+  row-gap: 8px;
   align-items: center;
 }
-.row > * { flex: 1; }
+.row > * { flex: 1; min-width: 0; }
+/* Wrap needs a real hypothetical size to trigger — basis-0 children always
+   "fit" and crush instead. Buttons carry their label width, so THEY flow to
+   the next line first while inputs/selects keep shrinking (.tbtn and
+   .arrows keep their own basis via later, equally-specific rules). */
+.row > button { flex-basis: max-content; }
 /* An icon button is a square, not a slab. `.row > *` above would stretch it
    across the row, so transport controls opt out of the flex share. */
 .row > .tbtn, .tbtn {
@@ -37979,7 +39196,7 @@ button.danger {
 /* The playback strip: full width, and tall enough to read at a glance. */
 .player-strip {
   display: flex; align-items: center; gap: 10px;
-  margin: 10px -18px 0; padding: 12px 18px;
+  margin: 10px calc(-1 * var(--pad, 18px)) 0; padding: 12px var(--pad, 18px);
   border-top: 1px solid var(--border);
   border-bottom: 1px solid var(--border);
   background: linear-gradient(#0a121c, #05070b);
@@ -37991,7 +39208,8 @@ button.danger {
   box-shadow: 0 0 0 1px rgba(255,255,255,.07);
 }
 .arrows button {
-  flex: 0 0 54px;
+  flex: 0 1 54px;
+  min-width: 44px;
   font-size: 22px;
 }
 .actions {
@@ -38043,10 +39261,31 @@ button.danger {
 .slider input:focus-visible + span { outline: 2px solid #7fd1ff; }
 .slider em { font-style: normal; color: #9ba6b7; }
 .slider input:checked ~ em { color: #7fd1ff; }
-@media (max-width: 950px) {
+@media (max-width: 1280px) {
   main { flex-direction: column; }
-  main > .col-left { flex-basis: auto !important; width: 100%; }
+  main > .col-left,
+  main > aside { flex-basis: auto !important; width: 100%; }
   #gutter { display: none; }
+  #activity { position: relative; }
+  #cloudDock, #djQueue, #djPlayed, #djChat {
+    position: relative !important;
+    top: auto !important; left: auto !important; right: auto !important;
+    bottom: auto !important; width: 100% !important;
+    border-left: 0 !important; border-right: 0 !important;
+    border-top: 1px solid var(--border);
+    border-radius: 0 0 10px 10px !important;
+    margin-top: 8px;
+  }
+}
+
+@media (max-width: 700px) {
+  header { align-items: stretch; }
+  header .row, .row { flex-wrap: wrap; }
+  .player-strip { flex-wrap: wrap; }
+  .player-strip audio { flex: 1 1 260px; }
+  .studio-grid2 { grid-template-columns: 1fr; }
+  .film-size { flex-wrap: wrap; white-space: normal; }
+  .film-size input[type="range"] { flex: 1 1 120px; }
 }
 
 /* ---- Live activity bar (top): scrolling gallery + status ---- */
@@ -38222,10 +39461,24 @@ button.danger {
   padding: 4px 10px; font-size: 12px; width: auto; margin: 0;
   border-radius: 7px; cursor: pointer;
 }
+.pine-live-repair {
+  min-height: 34px; padding: 7px 16px; font-weight: 800;
+  color: #fff3cf; background: #5e2a16; border: 1px solid #f0a43a;
+  box-shadow: 0 0 0 1px rgba(240,164,58,.18), 0 0 16px rgba(240,120,30,.2);
+}
+.pine-live-repair:hover { background: #7a391b; border-color: #ffd078; }
+.pine-live-repair:disabled { opacity: .62; cursor: wait; }
+.pine-live-console {
+  min-height: 34px; padding: 7px 14px; font-weight: 750;
+  color: #dff6ff; background: #123f54; border: 1px solid #39b8e7;
+}
+.pine-live-console:hover { background: #18536c; border-color: #8ddfff; }
 
 .film {
   position: relative; overflow: hidden;
-  height: calc(90px * var(--film-scale) + 18px);
+  /* Tiles cap against the viewport: at --film-scale 4 a 360px square tile
+     would swallow a 500px-wide window whole. */
+  height: calc(min(90px * var(--film-scale), 65vw) + 18px);
   border: 1px solid var(--border); border-radius: 10px; background: #05070b;
   -webkit-mask-image: linear-gradient(90deg,
     transparent, #000 4%, #000 96%, transparent);
@@ -38297,7 +39550,7 @@ button.danger {
   to   { transform: translateX(-50%); }
 }
 .film-item {
-  position: relative; height: calc(90px * var(--film-scale));
+  position: relative; height: min(calc(90px * var(--film-scale)), 65vw);
   aspect-ratio: 1; flex: 0 0 auto;
   border-radius: 8px; overflow: hidden; cursor: pointer;
   border: 1px solid var(--border); background: #0e1117;
@@ -38352,10 +39605,13 @@ button.danger {
 }
 .tf-ask {
   margin-left: auto; display: flex; gap: 8px; align-items: center;
+  justify-content: flex-end;
+  flex: 1 1 auto; min-width: 0; max-width: 100%;
   text-transform: none; letter-spacing: 0; padding: 2px 0;
 }
 .tf-ask input {
-  width: 240px; padding: 5px 10px; font-size: 12px; margin: 0;
+  width: auto; flex: 1 1 140px; max-width: 240px; min-width: 0;
+  padding: 5px 10px; font-size: 12px; margin: 0;
   border-radius: 7px; background: var(--panel); color: var(--text);
   border: 1px solid var(--border);
 }
@@ -38394,7 +39650,8 @@ button.danger {
 .prompt-opt.on { outline: 1px solid var(--accent); color: var(--accent); }
 /* Hover preview: the prompt text scrolling endlessly. */
 .prompt-peek {
-  position: fixed; z-index: 120; width: 320px; height: 150px; overflow: hidden;
+  position: fixed; z-index: 120; width: min(320px, calc(100vw - 24px));
+  height: 150px; overflow: hidden;
   background: #05070b; border: 1px solid var(--accent); border-radius: 10px;
   padding: 10px 12px; font-size: 12px; line-height: 1.6; color: #c9d4e2;
   box-shadow: 0 16px 40px rgba(0,0,0,.6); pointer-events: none;
@@ -38427,7 +39684,8 @@ button.danger {
 }
 .tray-count:empty { display: none; }
 .tray-panel {
-  position: fixed; right: 18px; top: 68px; z-index: 95; width: 330px;
+  position: fixed; right: 18px; top: clamp(56px, 9vh, 68px); z-index: 95;
+  width: min(330px, calc(100vw - 36px));
   max-height: 70vh; overflow-y: auto; background: var(--panel);
   border: 1px solid var(--border); border-radius: 14px; padding: 10px;
   box-shadow: 0 18px 44px rgba(0,0,0,.6);
@@ -38525,8 +39783,12 @@ button.danger {
 /* ---- Header performance HUD (#34) ---- */
 .perf-hud {
   display: flex; align-items: center; gap: 16px;
-  padding: 8px 28px; border-bottom: 1px solid var(--border);
-  background: #05070b; cursor: pointer; overflow: hidden;
+  /* Wraps rather than amputating: with ~700px of rigid children and
+     overflow:hidden, the 500-700px band silently lost temps and meters.
+     The marquee mask lives on .ph-scroll, which still clips its own text. */
+  flex-wrap: wrap; row-gap: 6px;
+  padding: 8px clamp(12px, 2.2vw, 28px); border-bottom: 1px solid var(--border);
+  background: #05070b; cursor: pointer;
 }
 .ph-pie {
   flex: 0 0 44px; width: 44px; height: 44px; border-radius: 50%;
@@ -38534,15 +39796,18 @@ button.danger {
   background: conic-gradient(var(--accent) 0 0%, #1d2330 0% 100%);
 }
 .ph-bars {
-  display: grid; grid-template-columns: repeat(2, minmax(170px, 220px));
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 4px 18px;
+  /* The cap keeps the compact 2x2 meter block on wide windows; auto-fit
+     only takes over when the strip is genuinely squeezed. */
+  flex: 1 1 320px; min-width: 0; max-width: 560px;
 }
 .ph-bar {
   display: flex; align-items: center; gap: 8px; font-size: 11px;
   color: var(--muted);
 }
 .ph-bar span { flex: 0 0 34px; }
-.ph-bar b { flex: 0 0 74px; color: var(--text); font-weight: 600; }
+.ph-bar b { flex: 0 0 58px; color: var(--text); font-weight: 600; }
 .ph-bar .track {
   flex: 1; height: 8px; border-radius: 5px; background: #10141c;
   border: 1px solid var(--border); overflow: hidden;
@@ -38557,7 +39822,9 @@ button.danger {
   white-space: nowrap;
 }
 .ph-scroll {
-  flex: 1; overflow: hidden; white-space: nowrap; min-width: 120px;
+  /* Shares the first row when there is room; wraps to its own full-width
+     line only when the strip is squeezed. */
+  flex: 1 1 260px; overflow: hidden; white-space: nowrap; min-width: 120px;
   -webkit-mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
   mask-image: linear-gradient(90deg, transparent, #000 6%, #000 94%, transparent);
 }
@@ -38571,7 +39838,7 @@ button.danger {
 /* ---- Shared full-screen popup ---- */
 .pb-modal {
   position: fixed; inset: 0; z-index: 100; background: rgba(4,6,10,.82);
-  backdrop-filter: blur(3px); padding: 24px;
+  backdrop-filter: blur(3px); padding: clamp(8px, 2.5vw, 24px);
 }
 .pb-modal-card {
   position: relative; width: 100%; height: 100%;
@@ -38595,9 +39862,10 @@ button.danger {
   width: 100%; padding: 6px 10px; font-size: 13px; border-radius: 8px;
   background: var(--bg); color: var(--text); border: 1px solid var(--border);
 }
-.db-tabs { display: flex; gap: 6px; margin-bottom: 8px; }
+.db-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
 .db-tabs button {
-  flex: 1; padding: 5px 8px; font-size: 12px; border-radius: 7px;
+  flex: 1 1 120px; min-width: 0;
+  padding: 5px 8px; font-size: 12px; border-radius: 7px;
   cursor: pointer; width: auto;
 }
 .db-tabs button.on { border-color: var(--accent); color: var(--accent); }
@@ -38741,10 +40009,13 @@ button.danger {
 
 .conv-wrap {
   display: flex; gap: 10px; margin-top: 10px;
-  height: calc(100vh - 260px); min-height: 380px;
+  /* dvh + a clamp floor: the old 260px chrome estimate undershot wrapped
+     headers, and 380px min ate short windows whole. */
+  height: clamp(300px, calc(100dvh - 340px), 100dvh);
 }
 .conv-list {
-  flex: 0 0 42%; overflow-y: auto; border: 1px solid var(--border);
+  flex: 0 0 42%; min-width: 0; overflow-y: auto;
+  border: 1px solid var(--border);
   border-radius: 9px; background: var(--panel2); padding: 6px;
 }
 .conv-item {
@@ -38891,6 +40162,38 @@ button.danger {
   border-radius: 6px;
   animation: boothPulse 1.5s ease-in-out infinite;
 }
+.booth-song-analysis {
+  border: 1px solid #285a70;
+  background: #0a1820;
+  color: #b9eaff;
+  cursor: help;
+}
+.booth-song-analysis-tip {
+  position: fixed;
+  z-index: 700;
+  width: min(460px, calc(100vw - 24px));
+  overflow: hidden;
+  padding: 8px 10px;
+  border: 1px solid #4bb3ff;
+  border-radius: 6px;
+  background: #050b11;
+  color: #dff5ff;
+  box-shadow: 0 10px 28px #000c;
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: none;
+}
+.booth-song-analysis-tip span {
+  display: inline-block;
+  min-width: max-content;
+  padding-left: 100%;
+  white-space: nowrap;
+  animation: boothAnalysisMarquee 30s linear infinite;
+}
+@keyframes boothAnalysisMarquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-50%); }
+}
 /* #668: whatever is being sold circulates under the booth glass. */
 @keyframes boothSell {
   from { transform: translateX(0); }
@@ -39034,6 +40337,7 @@ button.danger {
 .pine-summary {
   font-size: 20px; font-weight: 700; cursor: pointer;
   list-style: none; display: flex; align-items: center; gap: 10px;
+  flex-wrap: wrap; row-gap: 6px;
 }
 .pine-summary::-webkit-details-marker { display: none; }
 .pine-summary::before {
@@ -39099,7 +40403,13 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   position: fixed; z-index: 168; display: flex; flex-direction: column;
   background: var(--panel); border: 1px solid var(--border);
   border-radius: var(--radius); box-shadow: 0 24px 70px rgba(0,0,0,.6);
-  min-width: 720px; min-height: 460px; resize: both; overflow: hidden;
+  /* The studio must FIT any viewport: hard 720x460 minimums physically
+     could not. Its internals answer to its own width (container query
+     below), because this window resizes independently of the viewport. */
+  min-width: min(720px, 96vw); min-height: min(460px, 88vh);
+  max-width: calc(100vw - 12px); max-height: calc(100dvh - 12px);
+  resize: both; overflow: hidden;
+  container-type: inline-size;
 }
 .studio-title {
   display: flex; align-items: center; gap: 10px; padding: 9px 12px;
@@ -39244,12 +40554,44 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
   font-size: 11px; padding: 1px 3px;
 }
 .sec-move button:hover { color: var(--accent); }
+
+/* ---- Compressed-window rescue (#responsive) ----
+   The three fixed modal rails (doc browser 270px, page-viewer chat 340px,
+   doc-popup videos 330px) starved or fully clipped the reading pane inside
+   overflow-hidden modal cards. Below 900px they stack as capped rows. */
+@media (max-width: 900px) {
+  .pb-modal-body, .dp-wrap { flex-direction: column; overflow-y: auto; }
+  .db-side {
+    flex: none; width: 100%; max-height: 40vh;
+    border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  .pv-chat {
+    flex: none; width: 100%; max-height: 40vh;
+    border-left: 0; border-top: 1px solid var(--border);
+  }
+  .dp-side {
+    flex: none; width: 100%; max-height: 40vh;
+    border-left: 0; border-top: 1px solid var(--border);
+  }
+}
+
+/* The Voice Studio is an independently resizable window, so its internals
+   answer to the WINDOW's width (container query), never the viewport's. */
+@container (max-width: 600px) {
+  .studio-main { flex-direction: column; }
+  .studio-nav {
+    flex: none; flex-direction: row; overflow-x: auto;
+    border-right: 0; border-bottom: 1px solid var(--border);
+  }
+  .studio-nav .studio-tab { flex: 0 0 auto; }
+}
 </style>
 </head>
 <body>
 <div id="toasts"></div>
 <header>
-  <div style="display:flex;align-items:center;gap:12px">
+  <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+       row-gap:8px;min-width:0">
     <button id="pineDoctor" class="pine-restart"
             title="Pine Box not answering? Diagnose it and open the guide."
             onclick="pineDoctor()"
@@ -39260,12 +40602,13 @@ links and restart the agent."
             onclick="stackReconnect()"
             style="font-size:15px;line-height:1">🛠</button>
     <button id="pineRestart" class="pine-restart"
-            title="Restart Pine Chat — reloads and reinitializes everything"
-            onclick="location.reload()">🌲</button>
-    <div id="appTitle" style="cursor:pointer;user-select:none"
+            title="Clean restart Spark agent — clears only unplayed DJ/booth dialogue, then reinitializes"
+            onclick="pineRestartAgent()">🌲</button>
+    <div id="appTitle" style="cursor:pointer;user-select:none;min-width:0"
          title="Click to change the theme"
          onclick="themeMenu(event)">
-      <h1 style="display:flex;align-items:center;gap:7px">PineBoxAgent
+      <h1 style="display:flex;align-items:center;gap:7px;min-width:0;
+          overflow:hidden;text-overflow:ellipsis;white-space:nowrap">PineBoxAgent
         <span id="themeCaret" style="font-size:13px;opacity:.55">▾</span>
       </h1>
       <small id="themeNow">PineVoice intelligence · Pine Box control</small>
@@ -39298,7 +40641,8 @@ height:7px;border-radius:50%;background:#764"></span></button>
             background:#5c6b82;flex:0 0 auto"></span>
       <b id="onAirWord" style="letter-spacing:.06em;font-size:11px">OFF AIR</b>
       <span id="onAirVitals" class="muted"
-            style="font-size:10px;opacity:.8;white-space:nowrap"></span>
+            style="font-size:10px;opacity:.8;white-space:nowrap;
+                   max-width:38vw;overflow:hidden;text-overflow:ellipsis"></span>
     </button>
     <button id="onAirOut" onclick="onAirLaunch(event)"
             title="Open the station the way a listener hears it — over the
@@ -39307,7 +40651,8 @@ public link if it is up, so it plays anywhere"
                    background:none;padding:5px 9px;cursor:pointer;
                    font-size:13px;line-height:1;color:inherit">📻</button>
   </div>
-  <div style="display:flex;align-items:center;gap:14px">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;
+       row-gap:8px;min-width:0">
     <label class="slider" id="boxTalkWrap" title="Broadcast the station to
 the Pine Box. Off and nothing from the show reaches the speaker — no DJ
 voice, no music, no stings, no chimes. The box still ANSWERS you: ask it
@@ -39352,18 +40697,22 @@ speaker and restart the agent."
             style="font-size:15px;line-height:1">▶︎</button>
     <select id="fontSelect" title="Interface font"
             onchange="applyFont(this.value)"
-            style="width:auto;max-width:170px;padding:6px 10px;font-size:13px">
+            style="width:auto;max-width:170px;flex:0 1 auto;min-width:0;
+                   padding:6px 10px;font-size:13px">
     </select>
     <select id="headerModel" title="Active model — switches immediately"
             onchange="switchModel(this.value)"
-            style="width:auto;padding:6px 10px;font-size:13px"></select>
+            style="width:auto;flex:0 1 auto;min-width:0;
+                   padding:6px 10px;font-size:13px"></select>
     <select id="headerEngine" title="Voice system — how the Pine Box speaks"
             onchange="switchVoiceEngine(this.value)"
-            style="width:auto;max-width:150px;padding:6px 10px;font-size:13px">
+            style="width:auto;max-width:150px;flex:0 1 auto;min-width:0;
+                   padding:6px 10px;font-size:13px">
     </select>
     <select id="headerVoice" title="Voice model — switches immediately"
             onchange="switchVoice(this.value)"
-            style="width:auto;max-width:150px;padding:6px 10px;font-size:13px">
+            style="width:auto;max-width:150px;flex:0 1 auto;min-width:0;
+                   padding:6px 10px;font-size:13px">
     </select>
     <button id="trayBtn" class="tray-btn" title="Everything that popped up"
             onclick="toggleTray()">
@@ -39455,6 +40804,12 @@ speaker and restart the agent."
             onclick="sendVote('down')">▼</button>
     <button id="filmRefresh" class="act-refresh"
             onclick="refreshFilmstrip()">↻ Refresh gallery</button>
+    <button id="livePineRepair" class="act-refresh pine-live-repair"
+            title="Repair the Pine Box speaker link without discarding held DJ dialogue"
+            onclick="pineRecover(this)">Repair Pine Box Audio</button>
+    <button id="livePineConsole" class="act-refresh pine-live-console"
+            title="Detect a USB-connected Pine Box and open its live serial console"
+            onclick="usbConsole()">Open USB Console</button>
     <button id="cloudBarBtn" class="act-refresh"
             title="Word cloud — half the gallery, live"
             onclick="cloudDockToggle()">☁</button>
@@ -39612,6 +40967,8 @@ and levels, properly labelled (#405)"
       </span>
       <button id="tabPrompt" class="on"
               onclick="showLeftTab('prompt')">System prompt</button>
+      <button id="tabRadioPrompts"
+              onclick="showLeftTab('radio-prompts')">Radio prompts</button>
       <button id="tabConvs"
               onclick="showLeftTab('convs')">Conversations</button>
       <button id="keyToggle" class="key-chip" title="API key"
@@ -39655,6 +41012,14 @@ and levels, properly labelled (#405)"
       <button class="danger" onclick="deletePrompt()">Delete</button>
     </div>
     </div>
+    </div>
+
+    <div id="radioPromptsTab" style="display:none">
+      <div class="muted" style="font-size:11px;line-height:1.5;margin:8px 0">
+        The live prompt stack for the station. Character cards persist their
+        instructions; runtime rules are appended to the next matching turn.
+      </div>
+      <div id="radioPromptDesk"></div>
     </div>
 
     <div id="convsTab" style="display:none">
@@ -39948,8 +41313,8 @@ and levels, properly labelled (#405)"
           <canvas id="pineActStrip" width="150" height="20"
                   title="DJ activity — writing, voicing, on the speaker,
 stings — the last few minutes"
-                  style="width:150px;height:20px;border-radius:4px;
-background:var(--panel2)"></canvas>
+                  style="width:clamp(90px,40%,150px);height:20px;
+border-radius:4px;background:var(--panel2)"></canvas>
         </summary>
         <p class="muted" style="margin:8px 0 10px;font-size:13px">
           Send a request to the Pine Box inbox from any computer. It's
@@ -40075,9 +41440,10 @@ background:var(--panel2)"></canvas>
         <label>Home Assistant token</label>
         <input id="voiceToken" type="password"
                placeholder="paste long-lived access token">
-        <label>Speaker</label>
+        <label>Broadcast speaker and response speaker</label>
         <div class="row">
           <select id="voicePlayer"></select>
+          <select id="replyPlayer" title="Response speaker"></select>
           <button onclick="loadVoicePlayers()" title="Refresh speakers">↻</button>
         </div>
 
@@ -40244,6 +41610,27 @@ do all of that into silence and start the record afterwards.">
           💿 Records first (never sit with nothing playing)
         </label>
       </div>
+      <details id="djDialogueFlow" style="margin:0 0 8px;border:1px solid var(--border);padding:7px 9px">
+        <summary title="Shows the write, reserve, voice-render and speaker-delivery stages that protect the next DJ handoff.">
+          Conversation flow and continuity
+          <span id="djFlowBadge" class="muted" style="margin-left:8px"></span>
+        </summary>
+        <div id="djFlowExplain" class="muted" style="margin:8px 0 7px;font-size:12px"></div>
+        <div class="row" style="flex-wrap:wrap;align-items:center">
+          <label class="film-size" title="How many complete DJ rounds are written ahead while music or an advert is carrying the station.">
+            ready rounds
+            <input id="djReserveTarget" type="range" min="1" max="12" value="4"
+                   oninput="djReserveTargetShow()" onchange="djSetReserveTarget()">
+            <span id="djReserveTargetVal" class="val">4</span>
+          </label>
+          <label class="toggle" title="Keeps the background writer filling the dialogue reserve whenever the model is free.">
+            <input id="djDialoguePrefill" type="checkbox" onchange="djSetDialoguePrefill()">
+            write ahead during music and ads
+          </label>
+          <button onclick="djRepairDialogueFlow()"
+                  title="Enable the continuity-safe settings and request an immediate reserve fill.">Repair flow</button>
+        </div>
+      </details>
       <div class="row" style="flex-wrap:wrap;margin-bottom:8px">
         <label class="film-size" style="flex:1;min-width:190px"
                title="How hard the writing is pinned to plain American
@@ -40767,10 +42154,13 @@ and imagery; it is never the subject and never quoted straight.">
                title="Music and the AI's voice are separate outputs — the Pine
 Box is the AI, so it speaks by default even when the music is in the browser."
                style="float:right;margin-right:10px;font-weight:400;
-                      font-size:12px">
+                      font-size:12px;display:flex;flex-wrap:wrap;
+                      align-items:center;row-gap:6px;column-gap:4px;
+                      white-space:normal;max-width:100%;min-width:0">
           <span class="muted">music</span>
           <select id="djOutput" onchange="djSetOutput()"
                   style="width:auto;padding:3px 6px;font-size:12px">
+            <option value="nabu">Nabu</option>
             <option value="here">💻 this page</option>
             <option value="box">🔊 Pine Box</option>
             <option value="both">🔊+💻 both</option>
@@ -40779,6 +42169,7 @@ Box is the AI, so it speaks by default even when the music is in the browser."
           <span class="muted" style="margin-left:8px">DJ voice</span>
           <select id="djVoiceOut" onchange="djSetOutput(true)"
                   style="width:auto;padding:3px 6px;font-size:12px">
+            <option value="nabu">Nabu</option>
             <option value="box">🔊 Pine Box</option>
             <option value="here">💻 this page</option>
             <option value="both">🔊+💻 both</option>
@@ -40788,6 +42179,7 @@ Box is the AI, so it speaks by default even when the music is in the browser."
                 title="Where Pine Chat replies are spoken">replies</span>
           <select id="djReplyOut" onchange="djSetOutput()"
                   style="width:auto;padding:3px 6px;font-size:12px">
+            <option value="nabu">Nabu</option>
             <option value="box">🔊 Pine Box</option>
             <option value="here">💻 this page</option>
             <option value="both">🔊+💻 both</option>
@@ -40831,16 +42223,21 @@ searched for, newest first — click one to run it again">🕘</button>
       </div>
 
       <!-- The album that is playing, on a stage, with its tag sheet. -->
-      <div style="display:flex;gap:14px;margin-top:8px;align-items:stretch">
+      <div style="display:flex;gap:14px;margin-top:8px;align-items:stretch;
+           flex-wrap:wrap">
         <div id="nowStage"
-             style="flex:0 0 260px;height:260px;border-radius:var(--radius);
+             style="flex:1 1 260px;max-width:100%;height:260px;
+                    border-radius:var(--radius);
                     overflow:hidden;background:radial-gradient(120% 90% at 50%
                     0%,#0d1826 0%,#04070c 70%);
                     border:1px solid var(--border)"></div>
-        <div id="nowSheet" style="flex:1;min-width:0;overflow-y:auto;
+        <div id="nowSheet" style="flex:1 1 200px;min-width:0;overflow-y:auto;
              max-height:260px;font-size:12px"></div>
-        <!-- One click each, on whatever is playing (#186). -->
-        <div style="flex:0 0 96px;display:flex;flex-direction:column;gap:10px">
+        <!-- One click each, on whatever is playing (#186). Shrinks but
+             never grows, so the tag sheet keeps its width; wraps whole
+             onto its own line in a narrow panel. -->
+        <div style="flex:0 1 96px;min-width:64px;min-height:96px;
+             display:flex;flex-direction:column;gap:10px">
           <button class="act-refresh" onclick="voteNowPlaying(1)"
                   title="I like this one — play it more often"
                   style="flex:1;font-size:28px">👍</button>
@@ -40878,7 +42275,8 @@ searched for, newest first — click one to run it again">🕘</button>
 
       <!-- Just played · now · coming up, as Cover Flow. -->
       <div id="djFlow" class="cf"
-           style="height:min(46vh,380px);margin:10px -18px 0;
+           style="height:min(46vh,380px);
+                  margin:10px calc(-1 * var(--pad, 18px)) 0;
                   border-radius:0;border-left:0;border-right:0"></div>
       <!-- The same thing flat, for when you want to read it as a list. -->
       <div id="musicDeck"
@@ -41020,6 +42418,26 @@ let settings = null;
 // Injected by the server so any computer on the LAN is authenticated without
 // pasting the key. Empty string if SPARK_AGENT_AUTOFILL_KEY is disabled.
 const SERVER_KEY = __SERVER_KEY__;
+
+// ---- Compressed-window rescue helpers (#responsive) ----
+// Every floating window remembers raw px geometry in localStorage; reopened
+// after the window shrank (or on another screen) it could sit fully outside
+// an overflow-hidden viewport with no scrollbar to reach it. One clamp,
+// applied at every open/restore site: the window always lands on-screen.
+function clampBoxToViewport(box, minVisible = 120) {
+  const b = box || {};
+  const w = Math.min(Number(b.width) || 0, window.innerWidth - 16) || undefined;
+  const h = Math.min(Number(b.height) || 0, window.innerHeight - 16) || undefined;
+  return {
+    ...b,
+    ...(w ? { width: w } : {}),
+    ...(h ? { height: h } : {}),
+    left: Math.max(0, Math.min(Number(b.left) || 0,
+                               window.innerWidth - minVisible)),
+    top: Math.max(0, Math.min(Number(b.top) || 0,
+                              window.innerHeight - 64)),
+  };
+}
 
 function key() {
   return document.getElementById("apiKey").value.trim() || SERVER_KEY;
@@ -42288,7 +43706,8 @@ function showPromptPeek(event, prompt) {
   inner.textContent = prompt.prompt || "(empty prompt)";
   peek.appendChild(inner);
   const rect = event.currentTarget.getBoundingClientRect();
-  peek.style.left = Math.min(rect.right + 12, window.innerWidth - 340) + "px";
+  peek.style.left = Math.max(8, Math.min(rect.right + 12,
+    window.innerWidth - 340)) + "px";
   peek.style.top = Math.max(12, rect.top - 40) + "px";
   peek.id = "promptPeek";
   document.body.appendChild(peek);
@@ -42317,11 +43736,220 @@ function refreshKeyChip() {
 function showLeftTab(which) {
   document.getElementById("promptTab").style.display =
     which === "prompt" ? "block" : "none";
+  document.getElementById("radioPromptsTab").style.display =
+    which === "radio-prompts" ? "block" : "none";
   document.getElementById("convsTab").style.display =
     which === "convs" ? "block" : "none";
   document.getElementById("tabPrompt").classList.toggle("on", which === "prompt");
+  document.getElementById("tabRadioPrompts").classList.toggle("on",
+    which === "radio-prompts");
   document.getElementById("tabConvs").classList.toggle("on", which === "convs");
   if (which === "convs") loadConversations();
+  if (which === "radio-prompts") loadRadioPromptDesk();
+}
+
+async function loadRadioPromptDesk() {
+  const desk = document.getElementById("radioPromptDesk");
+  desk.textContent = "Loading radio prompt stack...";
+  try {
+    const state = await api("/api/dj/prompt-desk");
+    desk.innerHTML = "";
+    const active = state.active_system || {};
+    const activeBox = el("details", "", "");
+    activeBox.open = false;
+    activeBox.style.cssText = "border:1px solid var(--border);padding:7px;"
+      + "margin-bottom:8px;border-radius:6px;position:relative";
+    const summary = el("summary", "", active.enabled
+      ? "Active station-wide system prompt: " + (active.name || "unnamed")
+      : "Station-wide system prompt is currently off for the DJs");
+    summary.style.cssText = "font-weight:700;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:8px";
+    summary.title = "Used by 1 radio generation layer: host and co-host disposition. "
+      + "Disabled by default because this general assistant prompt is for "
+      + "ordinary device conversations, not the broadcast.";
+    activeBox.appendChild(summary);
+    const stationOn = el("input", "", "");
+    stationOn.type = "checkbox";
+    stationOn.checked = !!active.enabled;
+    stationOn.title = "Use the general assistant system prompt in radio writing";
+    stationOn.style.cssText = "width:16px;height:16px;margin:0;accent-color:var(--accent)";
+    stationOn.onclick = (event) => event.stopPropagation();
+    stationOn.onchange = async (event) => {
+      event.stopPropagation();
+      const settings = await api("/api/settings");
+      if (settings.voice_out) delete settings.voice_out.ha_token;
+      settings.dj = settings.dj || {};
+      settings.dj.radio_prompt_enabled = settings.dj.radio_prompt_enabled || {};
+      settings.dj.radio_prompt_enabled.station_system = stationOn.checked;
+      settings.dj.follow_prompt = stationOn.checked;
+      await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+    };
+    const stationLabel = el("label", "", "");
+    stationLabel.style.cssText = "margin-left:auto;display:flex;align-items:center;padding:0 2px;cursor:pointer";
+    stationLabel.appendChild(stationOn);
+    summary.appendChild(stationLabel);
+    const sys = el("textarea", "", "");
+    sys.readOnly = true;
+    sys.value = active.prompt || "No stored system prompt is armed.";
+    sys.style.cssText = "width:100%;min-height:110px;margin-top:7px;font-size:11px";
+    activeBox.appendChild(sys);
+    desk.appendChild(activeBox);
+
+    (state.roles || []).forEach((role) => {
+      const card = el("details", "", "");
+      card.style.cssText = "border:1px solid var(--border);padding:7px;"
+        + "margin-bottom:7px;border-radius:6px;position:relative";
+      const summary = el("summary", "", role.name + " prompt");
+      summary.style.cssText = "font-weight:700;font-size:12px;cursor:pointer;display:flex;align-items:center;gap:8px";
+      summary.title = (role.description || "") + "\nUsed by "
+        + (role.uses || 0) + " radio generation path(s): "
+        + ((role.systems || []).join(", ") || "not currently connected")
+        + ". Expand to inspect and adjust linked DJ controls.";
+      card.appendChild(summary);
+      const enabled = el("input", "", "");
+      enabled.type = "checkbox";
+      enabled.checked = role.enabled !== false;
+      enabled.title = "Include this prompt layer in radio generation";
+      enabled.style.cssText = "width:16px;height:16px;margin:0;accent-color:var(--accent)";
+      enabled.onclick = (event) => event.stopPropagation();
+      enabled.onchange = async (event) => {
+        event.stopPropagation();
+        const settings = await api("/api/settings");
+        if (settings.voice_out) delete settings.voice_out.ha_token;
+        settings.dj = settings.dj || {};
+        settings.dj.radio_prompt_enabled = settings.dj.radio_prompt_enabled || {};
+        settings.dj.radio_prompt_enabled[role.id] = enabled.checked;
+        await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+      };
+      const enabledLabel = el("label", "", "");
+      enabledLabel.style.cssText = "margin-left:auto;display:flex;align-items:center;padding:0 2px;cursor:pointer";
+      enabledLabel.appendChild(enabled);
+      summary.appendChild(enabledLabel);
+      const help = el("div", "muted", (role.description || "") + " Used by "
+        + (role.uses || 0) + " path(s): "
+        + ((role.systems || []).join(", ") || "not currently connected") + ".");
+      help.style.cssText = "font-size:11px;line-height:1.45;margin:7px 0";
+      card.appendChild(help);
+      const controls = role.controls || [];
+      if (controls.length) {
+        const controlBox = el("div", "", "");
+        controlBox.style.cssText = "display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:7px;margin:7px 0";
+        controls.forEach((control) => {
+          const field = el("label", "", control.label);
+          field.style.cssText = "font-size:11px";
+          const input = el("input", "", "");
+          input.type = control.type || "number";
+          if (input.type === "checkbox") input.checked = !!control.value;
+          else input.value = control.value == null ? "" : String(control.value);
+          if (input.type !== "text" && input.type !== "checkbox") {
+            input.min = String(control.min); input.max = String(control.max);
+            input.step = String(control.step || 1);
+          }
+          input.style.cssText = "width:100%;margin-top:3px";
+          input.title = "DJ panel parameter: " + control.key;
+          input.onchange = async () => {
+            const settings = await api("/api/settings");
+            if (settings.voice_out) delete settings.voice_out.ha_token;
+            settings.dj = settings.dj || {};
+            settings.dj[control.key] = input.type === "checkbox" ? input.checked
+              : input.type === "text" ? input.value
+              : Number(input.value) * Number(control.scale || 1);
+            await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+          };
+          field.appendChild(input); controlBox.appendChild(field);
+        });
+        card.appendChild(controlBox);
+      }
+      let persona = null;
+      if (role.field) {
+        const label = el("label", "", "Character system prompt");
+        card.appendChild(label);
+        persona = el("textarea", "", "");
+        persona.value = role.persona || "";
+        persona.style.cssText = "width:100%;min-height:112px";
+        card.appendChild(persona);
+      }
+      const label = el("label", "", "Additional runtime instruction");
+      label.style.marginTop = "7px";
+      card.appendChild(label);
+      const override = el("textarea", "", "");
+      override.value = role.override || "";
+      override.placeholder = "Optional instruction applied to the next matching radio turn...";
+      override.style.cssText = "width:100%;min-height:82px";
+      card.appendChild(override);
+      const presets = Array.isArray(role.presets) ? role.presets : [];
+      let presetAt = presets.length ? presets.length - 1 : -1;
+      const presetRow = el("div", "row", "");
+      presetRow.style.cssText = "gap:6px;margin-top:7px;align-items:center";
+      const prev = el("button", "", "<");
+      prev.title = "Previous saved prompt";
+      const pick = el("select", "", "");
+      pick.style.cssText = "flex:1;min-width:120px";
+      const blank = document.createElement("option");
+      blank.value = "-1"; blank.textContent = "Current unsaved text";
+      pick.appendChild(blank);
+      presets.forEach((preset, index) => {
+        const option = document.createElement("option");
+        option.value = String(index);
+        option.textContent = preset.name || ("saved prompt " + (index + 1));
+        pick.appendChild(option);
+      });
+      const next = el("button", "", ">");
+      next.title = "Next saved prompt";
+      const loadPreset = () => {
+        pick.value = String(presetAt);
+        if (presetAt >= 0 && presets[presetAt]) {
+          override.value = presets[presetAt].text || "";
+          if (persona && presets[presetAt].persona != null)
+            persona.value = presets[presetAt].persona || "";
+        }
+      };
+      pick.onchange = () => { presetAt = Number(pick.value); loadPreset(); };
+      prev.onclick = () => { if (presets.length) { presetAt = (presetAt - 1 + presets.length) % presets.length; loadPreset(); } };
+      next.onclick = () => { if (presets.length) { presetAt = (presetAt + 1) % presets.length; loadPreset(); } };
+      presetRow.appendChild(prev); presetRow.appendChild(pick); presetRow.appendChild(next);
+      const store = el("button", "", "Store");
+      store.title = "Save this text as a reusable radio prompt";
+      store.onclick = async () => {
+        const name = window.prompt("Name this saved " + role.name + " prompt", "prompt " + (presets.length + 1));
+        if (name === null || !override.value.trim()) return;
+        const settings = await api("/api/settings");
+        if (settings.voice_out) delete settings.voice_out.ha_token;
+        settings.dj = settings.dj || {};
+        settings.dj.radio_prompt_presets = settings.dj.radio_prompt_presets || {};
+        const saved = settings.dj.radio_prompt_presets[role.id] || [];
+        saved.push({name: name.trim() || "saved prompt", text: override.value,
+                    persona: persona ? persona.value : ""});
+        settings.dj.radio_prompt_presets[role.id] = saved;
+        await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+        await loadRadioPromptDesk();
+      };
+      presetRow.appendChild(store);
+      card.appendChild(presetRow);
+      const row = el("div", "row", "");
+      row.style.cssText = "margin-top:7px;gap:7px";
+      const save = el("button", "primary", "Save " + role.name);
+      const note = el("span", "muted", "");
+      note.style.fontSize = "11px";
+      save.onclick = async () => {
+        save.disabled = true;
+        note.textContent = "saving...";
+        try {
+          const settings = await api("/api/settings");
+          if (settings.voice_out) delete settings.voice_out.ha_token;
+          settings.dj = settings.dj || {};
+          settings.dj.radio_prompt_overrides =
+            settings.dj.radio_prompt_overrides || {};
+          settings.dj.radio_prompt_overrides[role.id] = override.value;
+          if (role.field) settings.dj[role.field] = persona.value;
+          await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+          note.textContent = "saved - active from the next matching turn";
+        } catch (error) { note.textContent = error.message; }
+        save.disabled = false;
+      };
+      row.appendChild(save); row.appendChild(note); card.appendChild(row);
+      desk.appendChild(card);
+    });
+  } catch (error) { desk.textContent = error.message; }
 }
 
 function convFolders() {
@@ -43255,7 +44883,7 @@ async function radioNext() {
   // the clock hands the next one over instead.
   if (radioFollowing) return;
   if (!musicRadioOn) return;
-  if (djOutputMode() === "box") return;   // the speaker is carrying it (#172)
+  if (djOutputExternal()) return;         // the speaker is carrying it (#172)
   const station = document.getElementById("radioStation").value || "all";
   try {
     const track = await api("/api/radio/next?station="
@@ -43997,11 +45625,12 @@ async function boothOpen() {
 
   // A floating window rather than a takeover: you can keep working behind
   // it, and it remembers where you put it.
-  const box = JSON.parse(localStorage.getItem("boothBox") || "null") || {
-    left: Math.max(12, window.innerWidth - 660),
-    top: Math.max(12, window.innerHeight - 520),
-    width: 620, height: 460,
-  };
+  const box = clampBoxToViewport(
+    JSON.parse(localStorage.getItem("boothBox") || "null") || {
+      left: Math.max(12, window.innerWidth - 660),
+      top: Math.max(12, window.innerHeight - 520),
+      width: 620, height: 460,
+    });
   const shade = el("div", "", "");
   shade.id = "boothModal";
   shade.style.cssText = "position:fixed;z-index:120;display:flex;"
@@ -44018,7 +45647,14 @@ async function boothOpen() {
       width: shade.offsetWidth, height: shade.offsetHeight,
     }));
   }
-  new ResizeObserver(rememberBox).observe(shade);
+  // Skip the observer's initial fire: it reports the OPEN-time geometry,
+  // which the viewport clamp may have shrunk — persisting that would make
+  // one visit in a small window permanently forget the large-screen size.
+  let boothRoFirst = true;
+  new ResizeObserver(() => {
+    if (boothRoFirst) { boothRoFirst = false; return; }
+    rememberBox();
+  }).observe(shade);
 
   const stage = el("div", "", "");
   stage.style.cssText = "position:relative;flex:1;min-height:0";
@@ -44071,10 +45707,13 @@ async function boothOpen() {
     const full = shade.dataset.full === "1";
     shade.dataset.full = full ? "0" : "1";
     if (full) {
-      const saved = JSON.parse(localStorage.getItem("boothBox") || "{}");
+      const saved = clampBoxToViewport({
+        left: 40, top: 40, width: 620, height: 460,
+        ...JSON.parse(localStorage.getItem("boothBox") || "{}"),
+      });
       Object.assign(shade.style, {
-        left: (saved.left || 40) + "px", top: (saved.top || 40) + "px",
-        width: (saved.width || 620) + "px", height: (saved.height || 460) + "px",
+        left: saved.left + "px", top: saved.top + "px",
+        width: saved.width + "px", height: saved.height + "px",
       });
     } else {
       rememberBox();
@@ -44753,8 +46392,8 @@ async function usbPorts(known) {
 
 async function usbOpen() {
   const port = document.getElementById("usbPort").value;
-  if (!port || !port.startsWith("/dev/")) {
-    usbLog("Plug the Pine Box into the server first.", "#ef6461");
+  if (!port || (!port.startsWith("/dev/") && !port.startsWith("/host-dev/"))) {
+    usbLog("Plug the Pine Box into lilspark first.", "#ef6461");
     return;
   }
   try {
@@ -44907,7 +46546,7 @@ function usbConsole() {
   flash.onclick = () => usbLog(
     "Re-flashing is a host command, so it cannot run from the browser:\n"
     + "  ~/pinevoice-stack/pinebox-usb.sh flash /path/to/firmware.bin\n"
-    + "Hold BOOT while plugging in, then run it on lilspark.", "#9ba6b7");
+    + "Turn it off, hold the center ring button, turn it on, then run it on lilspark.", "#9ba6b7");
   const shut = el("button", "danger", "Close");
   shut.onclick = () => { clearInterval(usbTimer); usbTimer = null; shade.remove(); };
   [guide, flash, shut].forEach((n) => foot.appendChild(n));
@@ -45009,6 +46648,29 @@ async function pineDoctor() {
   document.body.appendChild(shade);
 }
 
+async function pineRestartAgent() {
+  const button = document.getElementById("pineRestart");
+  if (!button || button.disabled) return;
+  if (!confirm("Clean-restart the station? This clears only unplayed DJ audio, "
+      + "prewritten dialogue, the booth feed, and browser voice backlog. Saved "
+      + "episodes, caller recordings, full mixes, music, Speakerbox, gallery, "
+      + "voices, settings, and ads stay intact.")) return;
+  const was = button.textContent;
+  button.disabled = true;
+  button.textContent = "...";
+  setStatus("Clearing station backlog and restarting spark-agent...");
+  try {
+    await api("/api/service/restart", {
+      method: "POST", body: JSON.stringify({name: "spark-agent", clean: true}),
+    });
+    setStatus("Clean restart underway; reloading when the backend comes back...");
+    setTimeout(() => location.reload(), 7000);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = was;
+    setStatus(error.message, true);
+  }
+}
 /* ---- Bringing the stack back (#136) ---- */
 
 async function stackReconnect() {
@@ -45036,15 +46698,16 @@ async function stackReconnect() {
 /* ---- Recovery (#134) ---- */
 
 // The satellite can end up lit and unresponsive after an announcement that
-// never finished. This stops the show, clears queued speech, reloads the
-// speaker in Home Assistant and restarts the agent.
-async function pineRecover() {
-  const button = document.getElementById("pineRecover");
-  if (!confirm("Stop the radio, unstick the Pine Box speaker and restart the "
-      + "agent?")) return;
+// never finished. Repair reloads its Home Assistant link and restarts this
+// agent; the durable hold shelf remains intact and drains after verification.
+async function pineRecover(trigger) {
+  const button = trigger || document.getElementById("pineRecover");
+  if (!confirm("Repair the Pine Box speaker link and restart the agent? "
+      + "All queued DJ dialogue will be preserved and replayed in order.")) return;
   const was = button.textContent;
-  button.textContent = "⏳";
-  setStatus("Recovering the Pine Box…");
+  button.disabled = true;
+  button.textContent = "Repairing Pine Box Audio...";
+  setStatus("Repairing the Pine Box speaker link; queued dialogue is preserved.");
   try {
     const result = await api("/api/pinebox/recover", {
       method: "POST", body: JSON.stringify({restart: true}),
@@ -45055,6 +46718,7 @@ async function pineRecover() {
   } catch (error) {
     setStatus(error.message, true);
     button.textContent = was;
+    button.disabled = false;
   }
 }
 
@@ -45389,10 +47053,11 @@ function themeMenu(event) {
 
   const menu = el("div", "panel", "");
   menu.id = "themeMenu";
-  menu.style.cssText = "position:fixed;left:" + Math.round(anchor.left) + "px;"
+  menu.style.cssText = "position:fixed;"
     + "top:" + Math.round(anchor.bottom + 8) + "px;z-index:140;padding:8px;"
-    + "min-width:290px;max-height:70vh;overflow-y:auto;box-shadow:"
-    + "0 18px 44px rgba(0,0,0,.55)";
+    + "min-width:min(290px, calc(100vw - 16px));max-height:70vh;"
+    + "overflow-y:auto;box-shadow:0 18px 44px rgba(0,0,0,.55)";
+  // Left set AFTER insert below, clamped against the menu's real width.
 
   THEMES.forEach(([value, label]) => {
     const row = el("div", "", "");
@@ -45423,6 +47088,8 @@ function themeMenu(event) {
   });
 
   document.body.appendChild(menu);
+  menu.style.left = Math.max(8, Math.min(Math.round(anchor.left),
+    window.innerWidth - menu.offsetWidth - 8)) + "px";
   // Capture phase, so a click anywhere else closes it before that click acts.
   document.addEventListener("click", themeMenuAway, true);
 }
@@ -46212,12 +47879,18 @@ function djTalkPopup() {
 
   box = el("div", "panel", "");
   box.id = "djTalkPopup";
-  const saved = JSON.parse(localStorage.getItem("djTalkBox") || "null") || {};
+  // djTalkBox is a SHARED bag (the glass strip stores glassH in it), so an
+  // entry can exist with no position at all — spread the defaults under
+  // whatever is stored rather than gating them on the entry's absence.
+  const saved = clampBoxToViewport({
+    left: Math.max(12, window.innerWidth - 450), top: 96,
+    ...(JSON.parse(localStorage.getItem("djTalkBox") || "{}") || {}),
+  });
   box.style.cssText = "position:fixed;z-index:130;width:min(420px,92vw);"
     + "max-height:52vh;display:flex;flex-direction:column;padding:10px 12px;"
     + "box-shadow:0 20px 50px rgba(0,0,0,.6);"
-    + "left:" + (saved.left ?? Math.max(12, window.innerWidth - 450)) + "px;"
-    + "top:" + (saved.top ?? 96) + "px";
+    + "left:" + saved.left + "px;"
+    + "top:" + saved.top + "px";
 
   const head = el("div", "", "");
   head.style.cssText = "display:flex;align-items:center;gap:8px;"
@@ -46414,17 +48087,19 @@ async function callerCardShow(name, anchor) {
   callerCardHide();
   callerCardFor = name;
   const at = anchor.getBoundingClientRect();
-  const wide = 390;
   const box = el("div", "panel", "");
   box.id = "callerCard";
-  box.style.cssText = "position:fixed;z-index:201;width:" + wide + "px;"
-    + "left:" + Math.max(8, Math.min(window.innerWidth - wide - 12, at.left))
-    + "px;top:" + Math.max(8, Math.min(window.innerHeight - 340, at.bottom + 8))
+  box.style.cssText = "position:fixed;z-index:201;"
+    + "width:min(390px, calc(100vw - 16px));"
+    + "top:" + Math.max(8, Math.min(window.innerHeight - 340, at.bottom + 8))
     + "px;padding:0;margin:0;overflow:hidden;pointer-events:none;"
     + "border:1px solid #6d7f9c;box-shadow:0 22px 60px rgba(0,0,0,.75)";
   box.innerHTML = '<div style="padding:12px;font-size:11px">'
     + 'reading the switchboard…</div>';
   document.body.appendChild(box);
+  // Fluid width, then clamp against the REAL box, never an assumed one.
+  box.style.left = Math.max(8, Math.min(
+    at.left, window.innerWidth - box.offsetWidth - 8)) + "px";
 
   let d = null;
   try { d = await api("/api/dj/caller?name=" + encodeURIComponent(name)); }
@@ -46567,11 +48242,9 @@ function lineCardShow(line, anchor, tint) {
   const box = el("div", "panel", "");
   box.id = "lineCard";
   const at = anchor.getBoundingClientRect();
-  const wide = 360;
-  const left = (at.left + wide + 16 < window.innerWidth)
-    ? at.left : Math.max(8, window.innerWidth - wide - 12);
-  box.style.cssText = "position:fixed;z-index:200;width:" + wide + "px;"
-    + "left:" + left + "px;top:" + Math.min(window.innerHeight - 320,
+  box.style.cssText = "position:fixed;z-index:200;"
+    + "width:min(360px, calc(100vw - 16px));"
+    + "left:8px;top:" + Math.min(window.innerHeight - 320,
       at.bottom + 8) + "px;padding:10px 12px;margin:0;font-size:11px;"
     + "line-height:1.55;pointer-events:none;border-color:" + tint + "66;"
     + "box-shadow:0 20px 56px rgba(0,0,0,.72)";
@@ -46649,6 +48322,9 @@ function lineCardShow(line, anchor, tint) {
     box.appendChild(img);
   }
   document.body.appendChild(box);
+  // Fluid width, then clamp against the REAL box, never an assumed one.
+  box.style.left = Math.max(8, Math.min(
+    at.left, window.innerWidth - box.offsetWidth - 8)) + "px";
 }
 
 /* ---- The glass over the booth (#668) ----------------------------------
@@ -46920,13 +48596,13 @@ function boothRoomPaint(state, live) {
     {who: "dj", name: dj.host || "host"},
     {who: "cohost", name: dj.cohost || "cohost"},
   ];
-  if (dj.third) cast.push({who: "third", name: dj.third});
   if (dj.guest) cast.push({who: "guest", name: dj.guest});
+  else if (dj.third) cast.push({who: "third", name: dj.third});
   // A caller only exists while one is on the line.
   const recent = (state.chat || []).slice(-14)
     .filter((l) => l.who === "caller").pop();
   if (recent) cast.push({who: "caller", name: recent.name || "on line one"});
-  cast.push({who: "sfx", name: "samples"});
+  cast.push({who: "sfx", name: dj.sfx || "The SFX Guy"});
   const key = cast.map((c) => c.who + c.name).join("|")
     + "@" + ((live && live.who) || "");
   if (room.dataset.key === key) return;
@@ -48528,8 +50204,11 @@ function djDossierShow(line, anchorEl) {
     + "max-height:70vh;overflow:auto;padding:11px 13px;margin:0;"
     + "font-size:11px;box-shadow:0 12px 34px #000c;line-height:1.5";
   const rect = anchorEl.getBoundingClientRect();
-  card.style.left = Math.min(window.innerWidth - 380,
-                             Math.max(8, rect.right + 10)) + "px";
+  // Width is min(370px,92vw): clamp against what it can actually be, with
+  // a floor so a narrow window never pins the card off the left edge.
+  card.style.left = Math.max(8, Math.min(
+    window.innerWidth - Math.min(370, window.innerWidth * 0.92) - 8,
+    Math.max(8, rect.right + 10))) + "px";
   card.style.top = Math.max(8, Math.min(window.innerHeight - 320,
                                         rect.top)) + "px";
 
@@ -48646,7 +50325,26 @@ function djDossierWatch(row, line) {
   });
   row.addEventListener("mouseleave", () => {
     if (djDossierTimer) { clearTimeout(djDossierTimer); djDossierTimer = null; }
+    // A dossier belongs to the row under the pointer, not to the screen.
+    if (djDossierFor === (line.id || "")) djDossierClose();
   });
+}
+
+function boothAnalysisTooltip(row, analysis) {
+  let tip = null;
+  const remove = () => { if (tip) { tip.remove(); tip = null; } };
+  row.onmouseenter = () => {
+    remove();
+    tip = el("div", "booth-song-analysis-tip", "");
+    const run = el("span", "", analysis + "     •     " + analysis);
+    tip.appendChild(run);
+    document.body.appendChild(tip);
+    const rect = row.getBoundingClientRect();
+    tip.style.left = Math.max(8, Math.min(window.innerWidth - tip.offsetWidth - 8,
+      rect.left)) + "px";
+    tip.style.top = Math.max(8, rect.top - tip.offsetHeight - 8) + "px";
+  };
+  row.onmouseleave = remove;
 }
 
 function djTalkRow(line) {
@@ -48701,6 +50399,50 @@ function djTalkRow(line) {
         hangupRules(line.rule_id || "");
       };
       row.appendChild(why);
+      return row;
+    }
+    if (line.kind === "song_analysis") {
+      row.classList.add("booth-song-analysis");
+      row.style.cssText += ";margin:4px 0;padding:6px 8px;"
+        + "align-items:center";
+      const label = el("b", "", "♫ song analysis ready");
+      label.style.cssText = "font-size:11px;white-space:nowrap;color:#79d8ff";
+      const about = el("span", "", (line.text || "").replace(
+        /^Song analysis complete:\s*/i, ""));
+      about.style.cssText = "font-size:11px;overflow:hidden;text-overflow:ellipsis;"
+        + "white-space:nowrap;flex:1;min-width:0";
+      row.appendChild(label);
+      row.appendChild(about);
+      const analysis = String(line.analysis || "").trim();
+      row.title = analysis ? "Hover to read the LLM song analysis" : "";
+      if (analysis) boothAnalysisTooltip(row, analysis);
+      return row;
+    }
+    if (line.kind === "image_analysis") {
+      row.classList.add("booth-song-analysis");
+      row.style.cssText += ";margin:4px 0;padding:6px 8px;"
+        + "align-items:center";
+      const image = String(line.image || "");
+      if (image) {
+        const thumb = document.createElement("img");
+        thumb.src = "/api/generations/image/" + encodeURIComponent(image);
+        thumb.alt = ""; thumb.loading = "lazy";
+        thumb.style.cssText = "width:34px;height:34px;object-fit:cover;"
+          + "border-radius:4px;border:1px solid #285a70;flex:0 0 auto";
+        thumb.onerror = () => thumb.remove();
+        row.appendChild(thumb);
+      }
+      const label = el("b", "", "◈ image analysis ready");
+      label.style.cssText = "font-size:11px;white-space:nowrap;color:#9ce7c4";
+      const about = el("span", "", (line.text || "").replace(
+        /^Image analysis complete:\s*/i, ""));
+      about.style.cssText = "font-size:11px;overflow:hidden;text-overflow:ellipsis;"
+        + "white-space:nowrap;flex:1;min-width:0";
+      row.appendChild(label);
+      row.appendChild(about);
+      const analysis = String(line.analysis || "").trim();
+      row.title = analysis ? "Hover to read the vision-model analysis" : "";
+      if (analysis) boothAnalysisTooltip(row, analysis);
       return row;
     }
     // #749: a page from upstairs is its own kind of entry — a cold slate
@@ -49495,7 +51237,8 @@ function djSayMenu(event) {
   const anchor = event.currentTarget.getBoundingClientRect();
   const menu = el("div", "panel", "");
   menu.id = "djSayMenu";
-  menu.style.cssText = "position:fixed;z-index:150;min-width:260px;padding:8px;"
+  menu.style.cssText = "position:fixed;z-index:150;"
+    + "min-width:min(260px, calc(100vw - 16px));padding:8px;"
     + "box-shadow:0 18px 44px rgba(0,0,0,.6);"
     + "left:" + Math.max(8, Math.min(window.innerWidth - 280,
         anchor.left - 120)) + "px;"
@@ -49755,17 +51498,22 @@ function pineMediaSettings() {
   const route = (label, key, current) => {
     const pick = document.createElement("select");
     pick.style.cssText = "width:100%;font-size:12px";
-    ["box", "here", "both", "off"].forEach((v) => {
+    const currentRoute = current === "box" && djVoiceMode() === "nabu"
+      ? "nabu" : current;
+    ["nabu", "box", "here", "both", "off"].forEach((v) => {
       const option = document.createElement("option");
       option.value = v;
-      option.textContent = {box: "Pine Box speaker", here: "this page",
-                            both: "both", off: "off"}[v];
-      if (v === current) option.selected = true;
+      option.textContent = {nabu: "Nabu", box: "Pine Box speaker",
+                            here: "this page", both: "both", off: "off"}[v];
+      if (v === currentRoute) option.selected = true;
       pick.appendChild(option);
     });
     pick.onchange = () => {
+      const wantsNabu = pick.value === "nabu";
       api("/api/dj/output", {method: "POST",
-        body: JSON.stringify({[key]: pick.value})}).catch(() => {});
+        body: JSON.stringify({[key]: wantsNabu ? "box" : pick.value,
+                              voice_device: wantsNabu ? "nabu" : ""})})
+        .catch(() => {});
       // Keep the inline Music-panel selects in step (#501).
       const mirror = {music: "djOutput", voice: "djVoiceOut",
                       reply: "djReplyOut"}[key];
@@ -50463,9 +52211,10 @@ function sfxDotHover(dot, sfxId) {
     if (old) old.remove();
     card = el("div", "panel", "");
     card.id = "sfxTipCard";
-    card.style.cssText = "position:fixed;z-index:250;width:300px;"
+    card.style.cssText = "position:fixed;z-index:250;"
+      + "width:min(300px, calc(100vw - 16px));"
       + "padding:8px 10px;pointer-events:none;margin:0;"
-      + "left:" + Math.min(window.innerWidth - 320, x + 14) + "px;"
+      + "left:" + Math.max(8, Math.min(window.innerWidth - 320, x + 14)) + "px;"
       + "top:" + Math.max(8, y - 190) + "px";
     const img = document.createElement("img");
     img.src = info.spec_url;
@@ -50770,10 +52519,13 @@ function artHawkMenu(event, name) {
   artHawkClose();
   const menu = el("div", "panel", "");
   menu.id = "artHawkMenu";
-  menu.style.cssText = "position:fixed;z-index:250;width:250px;padding:5px;"
+  menu.style.cssText = "position:fixed;z-index:250;"
+    + "width:min(250px, calc(100vw - 16px));padding:5px;"
     + "margin:0;font-size:12px;"
-    + "left:" + Math.min(window.innerWidth - 260, event.clientX) + "px;"
-    + "top:" + Math.min(window.innerHeight - 170, event.clientY) + "px";
+    + "left:" + Math.max(8, Math.min(window.innerWidth - 260,
+        event.clientX)) + "px;"
+    + "top:" + Math.max(8, Math.min(window.innerHeight - 170,
+        event.clientY)) + "px";
   menu.onclick = (e) => e.stopPropagation();
   const item = (label, title, fn) => {
     const b = el("button", "", label);
@@ -51866,12 +53618,18 @@ function remotePlexus(host, stages) {
     renderer.setSize(W(), H, false);
   };
   addEventListener("resize", resize);
+  // Column stacking and splitter drags change the HOST's width with no
+  // window resize — observe the host too or the bitmap stretches (house
+  // idiom: the word cloud and booth stage already do this).
+  const hostRo = new ResizeObserver(resize);
+  hostRo.observe(host);
 
   return {
     update: apply,
     stop() {
       alive = false;
       removeEventListener("resize", resize);
+      try { hostRo.disconnect(); } catch (e) {}
       try { renderer.dispose(); } catch (e) {}
     },
   };
@@ -52314,10 +54072,13 @@ async function docPreviewShow(name, anchor) {
   const box = el("div", "panel", "");
   box.id = "docPreview";
   const at = anchor.getBoundingClientRect();
-  // Beside the list when there is room, otherwise flipped to its left.
-  const wide = 380;
+  // Beside the list when there is room, otherwise flipped to its left —
+  // width is fluid on narrow viewports, so clamp with the REAL box below.
+  const wide = Math.min(380, window.innerWidth - 16);
   const left = (at.right + 14 + wide < window.innerWidth)
-    ? at.right + 14 : Math.max(8, at.left - wide - 14);
+    ? at.right + 14
+    : Math.max(8, Math.min(at.left - wide - 14,
+                           window.innerWidth - wide - 8));
   box.style.cssText = "position:fixed;z-index:190;width:" + wide + "px;"
     + "left:" + left + "px;top:"
     + Math.max(8, Math.min(window.innerHeight - 300, at.top - 40)) + "px;"
@@ -54448,9 +56209,11 @@ function djRender(state) {
     if (sel && sel.value !== val) sel.value = val;
     if (localStorage.getItem(key) !== val) localStorage.setItem(key, val);
   };
-  _sync("djVoiceOut", "djVoiceOut", state.voice_to);
-  _sync("djOutput", "djOutput", state.music_to);
-  _sync("djReplyOut", "djReplyOut", state.reply_to);
+  const _nabuRoute = (route) =>
+    route === "box" && state.voice_device === "nabu" ? "nabu" : route;
+  _sync("djVoiceOut", "djVoiceOut", _nabuRoute(state.voice_to));
+  _sync("djOutput", "djOutput", _nabuRoute(state.music_to));
+  _sync("djReplyOut", "djReplyOut", _nabuRoute(state.reply_to));
   // The master switch is server state too (#638) — every tab shows the same
   // one, and the station going on or off air moves it.
   const bt = document.getElementById("boxTalk");
@@ -54514,6 +56277,7 @@ function djRender(state) {
   djTalkRender(state);
   renderDeck(state);
   renderDJFlow(state);
+  djDialogueFlowPaint(state.dialogue_flow || {});
   renderNowTags(state);
   // A track you picked by hand owns the display until the station catches
   // up to it — otherwise the next poll would wipe it (#167).
@@ -54556,7 +56320,7 @@ function djResync(clock) {
     radioFollowing = false;      // nothing to follow; the page is its own
     return;
   }
-  if (djOutputMode() === "box") return;      // the speaker carries it
+  if (djOutputExternal()) return;            // the speaker carries it
   if (djPinned && djPinned !== clock.id) return;   // a hand-picked record
   const player = document.getElementById("musicPlayer");
   if (!player) return;
@@ -54589,7 +56353,7 @@ function djResync(clock) {
 }
 
 async function radioClockPoll() {
-  if (djOutputMode() === "box") return;
+  if (djOutputExternal()) return;
   try {
     const clock = await api("/api/radio/clock?listener="
       + encodeURIComponent(pineListenerId()));
@@ -54715,11 +56479,16 @@ function djOutputMode() {
   return localStorage.getItem("djOutput") || "here";   // browser by default
 }
 
-function djVoiceMode() {
-  return localStorage.getItem("djVoiceOut") || "box";  // the AI is the box
+function djOutputExternal() {
+  const mode = djOutputMode();
+  return mode === "box" || mode === "nabu";
 }
 
-const WHERE = {box: "the Pine Box", here: "this page", both: "both",
+function djVoiceMode() {
+  return localStorage.getItem("djVoiceOut") || "nabu"; // dialogue default
+}
+
+const WHERE = {box: "the Pine Box", nabu: "Nabu", here: "this page", both: "both",
                off: "off"};
 
 /* #642: they fall in love with a word — vibrations, frequencies — and no
@@ -54829,18 +56598,25 @@ async function djSetOutput(immediate) {
   const voice = document.getElementById("djVoiceOut").value;
   const replyEl = document.getElementById("djReplyOut");
   const reply = replyEl ? replyEl.value : "";
+  const wantsNabu = music === "nabu" || voice === "nabu" || reply === "nabu";
+  const musicRoute = music === "nabu" ? "box" : music;
+  const voiceRoute = voice === "nabu" ? "box" : voice;
+  const replyRoute = reply === "nabu" ? "box" : reply;
+  const voiceDevice = wantsNabu ? "nabu"
+    : (music === "box" || voice === "box" || reply === "box" ? "pine" : "");
   localStorage.setItem("djOutput", music);
   localStorage.setItem("djVoiceOut", voice);
   if (reply) localStorage.setItem("djReplyOut", reply);
   const status = document.getElementById("musicStatus");
   // Stop the page BEFORE the round trip, so the switch is instant to the ear
   // rather than a request away.
-  const handOff = (voice === "box" || voice === "off") ? djVoiceHandOff() : [];
+  const handOff = (voiceRoute === "box" || voiceRoute === "off") ? djVoiceHandOff() : [];
   try {
     const state = await api("/api/dj/output", {
-      method: "POST", body: JSON.stringify({music, voice, reply}),
+      method: "POST", body: JSON.stringify({music: musicRoute,
+        voice: voiceRoute, reply: replyRoute, voice_device: voiceDevice}),
     });
-    if (voice === "box" && handOff.length) {
+    if (voiceRoute === "box" && handOff.length) {
       try {
         const moved = await api("/api/dj/handoff", {
           method: "POST", body: JSON.stringify({clips: handOff})});
@@ -54860,7 +56636,7 @@ async function djSetOutput(immediate) {
     // track (#174). The satellite has no stop service, so a track already
     // announced on the box plays itself out — everything else is immediate.
     const player = document.getElementById("musicPlayer");
-    if (music === "box" || music === "off") {
+    if (musicRoute === "box" || musicRoute === "off") {
       if (player) player.pause();       // nothing plays in the page (#501)
     } else {
       djLastTrack = "";                  // let djRender re-join the show here
@@ -54873,7 +56649,7 @@ async function djSetOutput(immediate) {
       status.textContent = "Music → " + WHERE[music]
         + " · DJ voice → " + WHERE[voice];
     }
-    if (voice !== "box") djVoicePoll(immediate);
+    if (voiceRoute !== "box") djVoicePoll(immediate);
   } catch (error) {
     if (status) status.textContent = error.message;
   }
@@ -55001,6 +56777,13 @@ function djTalkMarkLive() {
     found = (last && rows.length && rows[rows.length - 1] === last)
       ? last : null;
   }
+  // Rows are incrementally replaced as provisional speech becomes a final
+  // transcript row. A cached element can therefore be detached while its
+  // replacement inherits a stale pulse. Reconcile the visible list here:
+  // the booth has exactly one current line, never a trail of active ones.
+  log.querySelectorAll(".booth-live").forEach((row) => {
+    if (row !== found) row.classList.remove("booth-live");
+  });
   if (djTalkLiveRow && djTalkLiveRow !== found) {
     djTalkLiveRow.classList.remove("booth-live");
   }
@@ -55065,31 +56848,58 @@ function djVoiceNext() {
   const player = djVoiceEl(djVoiceSlot);
   djVoiceSlot = 1 - djVoiceSlot;
   djVoiceBusy = true;
+  const broadcastAt = Number(clip.broadcastAt || Date.now());
+  const waitForAir = broadcastAt - Date.now();
+  if (waitForAir > 25) {
+    djVoiceQueue.unshift(clip);
+    djVoiceBusy = false;
+    setTimeout(djVoiceNext, waitForAir);
+    return;
+  }
 
   let handed = false;
   let started = false;
   let startGuard = 0;
   let stallGuard = 0;
-  const hand = () => {                   // let the next line start
-    if (handed) return;
+  const release = () => {
+    if (handed) return false;
     handed = true;
     if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
     if (stallGuard) { clearTimeout(stallGuard); stallGuard = 0; }
     djVoiceBusy = false;
+    return true;
+  };
+  const hand = () => {                   // let the next line start
+    if (!release()) return;
     djVoiceNext();
   };
+  const retry = () => {
+    // A transport failure is not an ended line. Put the exact clip behind
+    // ready work so the show flows, then circle back to it.
+    if (!release()) return;
+    try { player.pause(); player.removeAttribute("src"); player.load(); } catch (e) {}
+    djVoiceLive = Math.max(0, djVoiceLive - 1);
+    djVoiceNow = null;
+    if (clip.stream) { djStreamNow = null; djStreamLiveId = ""; }
+    clip.retry = Math.min(8, Number(clip.retry || 0) + 1);
+    const delay = Math.min(15000, 750 * (2 ** (clip.retry - 1)));
+    setTimeout(() => { djVoiceQueue.push(clip); djVoiceNext(); }, delay);
+    djTalkMarkLive();
+  };
   const done = () => {
+    if (handed) return;
     djVoiceLive = Math.max(0, djVoiceLive - 1);
     hand();
     if (!djVoiceLive && !djVoiceQueue.length) {
       djSpeaking = false;
       djApplyGain();
       djVoiceNow = null;               // nothing is sounding (#651)
+      if (clip.stream) { djStreamNow = null; djStreamLiveId = ""; }
       djTalkMarkLive();
     }
   };
   player.onended = done;
-  player.onerror = done;
+  player.onerror = retry;
   /* #776: two watchdogs, because djVoiceBusy had none and the metadata timer
    * below is skipped in three ordinary cases (overlap at zero, a sting next,
    * a non-finite duration). A single stalled element used to leave the flag
@@ -55097,6 +56907,15 @@ function djVoiceNext() {
    * "the broadcast stops talking at certain points" and never resumes. */
   player.onplaying = () => {
     started = true;
+    if (clip.stream && Array.isArray(clip.stream.rows)) {
+      djStreamNow = {
+        at: Date.now() / 1000,
+        length: Number(clip.stream.length || 0),
+        rows: clip.stream.rows,
+      };
+      djStreamLiveId = "";
+      djBoothTick();
+    }
     if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
     if (stallGuard) clearTimeout(stallGuard);
     // Generous: the longest coalesced burst plus slack. This is a safety
@@ -55104,13 +56923,20 @@ function djVoiceNext() {
     const span = isFinite(player.duration) && player.duration > 0
       ? (player.duration + 20) * 1000 : 330000;
     stallGuard = setTimeout(() => {
-      if (!handed) done();
+      if (!handed) retry();
     }, Math.min(span, 360000));
   };
   startGuard = setTimeout(() => {
-    if (!handed && !started) done();     // it never began — move the show on
+    if (!handed && !started) retry();    // it never began — keep it owed
   }, 25000);
   player.onloadedmetadata = () => {
+    const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
+    if (isFinite(player.duration) && lateBy >= player.duration - 0.15) {
+      done(); return;
+    }
+    if (lateBy > 0.12 && isFinite(player.duration)) {
+      try { player.currentTime = lateBy; } catch (e) {}
+    }
     // Two presenters tread on each other; a sting does not tread on the line
     // it is punctuating. If the next clip up is a sample, wait for the end
     // (#185, #208).
@@ -55151,7 +56977,7 @@ function djVoiceNext() {
       pineAudioPrompt(player);
       return;
     }
-    done();
+    retry();
   });
 }
 
@@ -55208,7 +57034,11 @@ async function djVoicePoll(immediate) {
   try {
     const data = await api("/api/dj/voice?since=" + djVoiceSeen);
     const clips = data.clips || [];
-    clips.forEach((clip) => { djVoiceSeen = Math.max(djVoiceSeen, clip.ts); });
+    const serverMs = Number(data.server_ms || Date.now());
+    clips.forEach((clip) => {
+      djVoiceSeen = Math.max(djVoiceSeen, clip.ts);
+      clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
+    });
     // #623: flipping the DJ-voice output to this page mid-show should sound at
     // once — catch the seen-marker up and play just the LATEST line so audio
     // comes out of the device you chose immediately, without flooding the
@@ -55219,15 +57049,13 @@ async function djVoicePoll(immediate) {
       if (last && last.url) djVoicePlay(last);
       return;
     }
-    // The server keeps a deep window of lines. On the first poll of a tab that
-    // is a backlog, not news — so play only the tail of it rather than the
-    // whole night, but do NOT throw it away: #776 is "I want to hear each
-    // and every message", and the seen-marker above has already been
-    // advanced past these, so anything dropped here can never be asked for
-    // again (the server filter is strictly-greater).
+    // The server keeps a deep window of lines. First poll is still an audio
+    // obligation: enqueue every unseen clip before advancing from this moment.
+    // Anything skipped here is gone forever because the server filter is
+    // strictly-greater than the seen marker.
     if (!djVoicePrimed) {
       djVoicePrimed = true;
-      clips.slice(-3).forEach((clip) => { if (clip.url) djVoicePlay(clip); });
+      clips.forEach((clip) => { if (clip.url) djVoicePlay(clip); });
       return;
     }
     clips.forEach((clip) => { if (clip.url) djVoicePlay(clip); });
@@ -57323,6 +59151,11 @@ async function djLoadSettings() {
     document.getElementById("djTalkRadioMode").checked = !!dj.talk_radio_mode;
     document.getElementById("djRecordsFirst").checked =
       dj.records_first !== false;                              // #689
+    document.getElementById("djDialoguePrefill").checked =
+      dj.dialogue_prefill !== false;
+    document.getElementById("djReserveTarget").value =
+      String(dj.dialogue_reserve_target ?? 4);
+    djReserveTargetShow();
     document.getElementById("djAccentPin").value =
       String(Math.round((dj.accent_pin ?? 0.8) * 100));
     document.getElementById("djPersonality").value =
@@ -57603,6 +59436,67 @@ async function djSetRecordsFirst() {
       ? "💿 needle first — they introduce the record over its own opening"
       : "back to talking first, starting the record after";
   } catch (error) { status.textContent = error.message; }
+}
+
+function djReserveTargetShow() {
+  const input = document.getElementById("djReserveTarget");
+  const value = document.getElementById("djReserveTargetVal");
+  if (input && value) value.textContent = input.value + " rounds";
+}
+
+async function djSetDialoguePrefill() {
+  const status = document.getElementById("djVoiceStatus");
+  try {
+    const settings = await api("/api/settings");
+    if (settings.voice_out) delete settings.voice_out.ha_token;
+    settings.dj = Object.assign({}, settings.dj, {
+      dialogue_prefill: document.getElementById("djDialoguePrefill").checked,
+    });
+    await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+    status.textContent = settings.dj.dialogue_prefill
+      ? "background dialogue reserve enabled" : "background reserve paused";
+  } catch (error) { status.textContent = error.message; }
+}
+
+async function djSetReserveTarget() {
+  const status = document.getElementById("djVoiceStatus");
+  const target = Number(document.getElementById("djReserveTarget").value);
+  try {
+    const settings = await api("/api/settings");
+    if (settings.voice_out) delete settings.voice_out.ha_token;
+    settings.dj = Object.assign({}, settings.dj, {dialogue_reserve_target: target});
+    await api("/api/settings", {method:"PUT", body:JSON.stringify(settings)});
+    status.textContent = "continuity reserve set to " + target + " rounds";
+  } catch (error) { status.textContent = error.message; }
+}
+
+async function djRepairDialogueFlow() {
+  const status = document.getElementById("djVoiceStatus");
+  try {
+    const flow = await api("/api/dj/flow/repair", {method:"POST", body:"{}"});
+    djDialogueFlowPaint(flow || {});
+    await djLoadSettings();
+    status.textContent = "continuity repair armed; filling the dialogue reserve";
+  } catch (error) { status.textContent = error.message; }
+}
+
+function djDialogueFlowPaint(flow) {
+  const badge = document.getElementById("djFlowBadge");
+  const explain = document.getElementById("djFlowExplain");
+  if (!badge || !explain) return;
+  const ready = Number(flow.ready || 0), target = Number(flow.target || 0);
+  const state = flow.writing ? "writing" : ready >= target ? "ready" : "refilling";
+  badge.textContent = state + " · " + ready + "/" + target + " rounds";
+  const stages = [
+    "write " + (flow.writing ? "active" : "idle"),
+    "reserve " + ready + "/" + target,
+    "voice retry " + Number(flow.render_waiting || 0),
+    "delivery held " + Number(flow.delivery_waiting || 0),
+  ];
+  if (flow.ad_cover) stages.push("ad cover: reserve priority raised");
+  const blockers = Array.isArray(flow.blockers) ? flow.blockers : [];
+  explain.textContent = stages.join(" · ") + (blockers.length
+    ? " — " + blockers.join("; ") : "");
 }
 
 /* The one slider that lives out on the panel: how often the pair start a
@@ -59107,8 +61001,12 @@ function calTipEl() {
 }
 function calTipMove(e) {
   const t = calTipEl();
-  t.style.left = Math.min(window.innerWidth - 400, e.clientX + 14) + "px";
-  t.style.top = Math.min(window.innerHeight - 230, e.clientY + 12) + "px";
+  t.style.maxWidth = "min(390px, calc(100vw - 16px))";
+  t.style.left = Math.max(8, Math.min(
+    window.innerWidth - Math.min(400, window.innerWidth - 8),
+    e.clientX + 14)) + "px";
+  t.style.top = Math.max(8, Math.min(
+    window.innerHeight - 230, e.clientY + 12)) + "px";
 }
 function calTipHide() { calTipEl().style.display = "none"; }
 function calFmtLen(s) {
@@ -59213,10 +61111,11 @@ function calMenu(e, sec, epochSecs) {
   const m = el("div", "panel", "");
   m.id = "calMenu";
   m.style.cssText = "position:fixed;z-index:235;padding:4px;margin:0;"
-    + "min-width:220px";
-  m.style.left = Math.min(window.innerWidth - 240, e.clientX) + "px";
-  m.style.top = Math.min(window.innerHeight - items.length * 34 - 16,
-                         e.clientY) + "px";
+    + "min-width:min(220px, calc(100vw - 16px))";
+  m.style.left = Math.max(8, Math.min(window.innerWidth - 240,
+                                      e.clientX)) + "px";
+  m.style.top = Math.max(8, Math.min(
+    window.innerHeight - items.length * 34 - 16, e.clientY)) + "px";
   items.forEach(([label, fn]) => {
     const b = el("button", "", label);
     b.style.cssText = "display:block;width:100%;text-align:left;"
@@ -59664,6 +61563,42 @@ async function djCallersPanel() {
     clockRow.appendChild(rate);
     clockRow.appendChild(rateOut);
     body.appendChild(clockRow);
+
+    const successRow = el("label", "film-size", "");
+    successRow.style.cssText = "display:block;margin:6px 0";
+    successRow.appendChild(document.createTextNode("Successful calls"));
+    const success = document.createElement("input");
+    success.type = "range"; success.min = "0"; success.max = "100";
+    success.value = String(desk.success_rate ?? 72);
+    const successOut = el("span", "val", "");
+    const paintSuccess = () => {
+      successOut.textContent = success.value + "% win a prize or painting";
+    };
+    success.oninput = paintSuccess;
+    success.onchange = () => push({caller_success_rate: Number(success.value)});
+    paintSuccess();
+    successRow.appendChild(success);
+    successRow.appendChild(successOut);
+    body.appendChild(successRow);
+
+    const insanityRow = el("label", "film-size", "");
+    insanityRow.style.cssText = "display:block;margin:6px 0";
+    insanityRow.appendChild(document.createTextNode("Caller insanity"));
+    const insanity = document.createElement("input");
+    insanity.type = "range"; insanity.min = "0"; insanity.max = "100";
+    insanity.value = String(desk.insanity ?? 45);
+    const insanityOut = el("span", "val", "");
+    const paintInsanity = () => {
+      const v = Number(insanity.value);
+      insanityOut.textContent = !v ? "grounded" : v < 35 ? "a little strange"
+        : v < 70 ? "speakerbox-soaked" : "maximum contamination";
+    };
+    insanity.oninput = paintInsanity;
+    insanity.onchange = () => push({caller_insanity: Number(insanity.value)});
+    paintInsanity();
+    insanityRow.appendChild(insanity);
+    insanityRow.appendChild(insanityOut);
+    body.appendChild(insanityRow);
 
     // The vocoder rack: on or off for everyone, and how hard the
     // strangers get mangled.
@@ -60575,12 +62510,16 @@ function djGraphPanel() {
     renderer.setSize(W(), H());
   };
   window.addEventListener("resize", onResize);
+  // The stage can change size without a window resize (column stacking,
+  // wrapped headers) — observe it directly or the bitmap stretches.
+  const stageRo = new ResizeObserver(onResize);
+  stageRo.observe(stage);
 
   const poller = setInterval(pull, 4000);
   pull();
   tick();
 
-  djGraph = {shade, renderer, poller, onResize,
+  djGraph = {shade, renderer, poller, onResize, stageRo,
              stop: () => { alive = false; cancelAnimationFrame(raf); }};
 }
 
@@ -60589,6 +62528,7 @@ function djGraphClose() {
   djGraph.stop();
   clearInterval(djGraph.poller);
   window.removeEventListener("resize", djGraph.onResize);
+  try { djGraph.stageRo.disconnect(); } catch (e) {}
   djGraph.renderer.dispose();
   djGraph.shade.remove();
   djGraph = null;
@@ -60787,6 +62727,39 @@ function mindFlowToggle(stage) {
   }, 1500);
 }
 
+let mindTopology = null;
+async function mindTopologyOpen() {
+  if (mindTopology) { mindTopology.close(); return; }
+  if (typeof djMind !== "undefined" && djMind) mindClose();
+  const THREE = await import("/vendor/three.module.js");
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:185;background:#02060beF;display:flex;align-items:center;justify-content:center";
+  const card = el("div", "", "");
+  card.style.cssText = "position:relative;width:96vw;height:92vh;background:#050b12;border:1px solid #24536a;border-radius:8px;overflow:hidden;box-shadow:0 28px 90px #000";
+  const stage = el("div", "", ""); stage.style.cssText = "position:absolute;inset:0 330px 0 0"; card.appendChild(stage);
+  const side = el("div", "", ""); side.style.cssText = "position:absolute;right:0;top:0;bottom:0;width:330px;border-left:1px solid #24536a;background:#07111b;padding:14px;overflow:auto;color:#d6e9f4;font-size:12px"; card.appendChild(side);
+  const bar = el("div", "", ""); bar.style.cssText = "position:absolute;z-index:4;left:14px;right:345px;top:12px;display:flex;gap:8px;align-items:center;pointer-events:none";
+  const title = el("b", "", "Mind Topology"); title.style.cssText = "font-size:15px;color:#dff8ff;text-shadow:0 1px 8px #000;pointer-events:auto"; bar.appendChild(title);
+  const pipeline = el("button", "", "Pipeline"); pipeline.title="Return to Dialogue Mind pipeline"; pipeline.style.cssText="pointer-events:auto"; pipeline.onclick=()=>{ close(); mindOpen(); }; bar.appendChild(pipeline);
+  const add = el("button", "", "+ Directive"); add.title="Add a live instruction to the selected cast member"; add.style.cssText="pointer-events:auto"; bar.appendChild(add);
+  const closeBtn = el("button", "", "x"); closeBtn.style.cssText="pointer-events:auto;margin-left:auto"; closeBtn.onclick=()=>close(); bar.appendChild(closeBtn);
+  card.appendChild(bar); shade.appendChild(card); document.body.appendChild(shade);
+  shade.onclick=(e)=>{if(e.target===shade)close();};
+  const scene=new THREE.Scene(), camera=new THREE.PerspectiveCamera(48,1,.1,300), renderer=new THREE.WebGLRenderer({antialias:true});
+  renderer.setPixelRatio(Math.min(2,devicePixelRatio||1)); renderer.setClearColor(0x02060b,1); stage.appendChild(renderer.domElement); camera.position.set(0,3,30);
+  const world=new THREE.Group(); scene.add(world); scene.add(new THREE.AmbientLight(0xaedfff,.72)); const lamp=new THREE.PointLight(0x72e6ff,2,120); lamp.position.set(8,14,20); scene.add(lamp);
+  const stars=new THREE.Points(new THREE.BufferGeometry(),new THREE.PointsMaterial({color:0x4f98a8,size:.11,transparent:true,opacity:.7})); const sp=[]; for(let i=0;i<420;i++)sp.push((Math.random()-.5)*70,(Math.random()-.5)*45,(Math.random()-.5)*40); stars.geometry.setAttribute("position",new THREE.Float32BufferAttribute(sp,3)); scene.add(stars);
+  const ray=new THREE.Raycaster(), pointer=new THREE.Vector2(); let nodes=[], state={}, selected=null, yaw=0, pitch=.12, drag=null, alive=true, timer=0;
+  function label(text,color){const c=document.createElement("canvas"),x=c.getContext("2d");x.font="600 32px system-ui";c.width=Math.ceil(x.measureText(text).width)+22;c.height=48;x.font="600 32px system-ui";x.fillStyle=color;x.fillText(text,11,34);const t=new THREE.CanvasTexture(c),s=new THREE.Sprite(new THREE.SpriteMaterial({map:t,transparent:true,depthWrite:false}));s.scale.set(c.width*.024,c.height*.024,1);return s;}
+  function renderSide(item){selected=item||selected; const p=item&&item.data; const vector=(state.vectors||[]).slice(0,6); side.innerHTML=""; side.appendChild(el("h3","",p?p.name:"Live Inputs")); if(p){side.appendChild(el("div","muted",p.persona||"Live role shaped by station context.")); const mood=el("div","",Object.entries(p.state||{}).map(([k,v])=>k+" "+Number(v||0).toFixed(2)).join(" · ")); mood.style.margin="10px 0";side.appendChild(mood); const latest=el("div","",p.latest||"No current utterance.");latest.style.cssText="padding:8px;border-left:2px solid #46c6df;line-height:1.45";side.appendChild(latest); const h=el("h4","","Live directives");side.appendChild(h); (p.adjustments||[]).forEach(a=>{const row=el("div","","");row.style.cssText="padding:7px 0;border-top:1px solid #244";row.appendChild(el("span","",a.text)); const edit=el("button","","Edit");edit.onclick=()=>adjust(p.id,a);const del=el("button","","x");del.onclick=()=>adjust(p.id,a,true);row.appendChild(edit);row.appendChild(del);side.appendChild(row);}); } const vh=el("h4","","Vector seeds in play");side.appendChild(vh); vector.forEach(v=>{const row=el("div","",String(v.file||"source")+" · match "+Number(v.score||0).toFixed(2));row.style.cssText="padding:6px 0;border-top:1px solid #244;color:#b8d9aa";side.appendChild(row);});}
+  async function adjust(role,item,remove){if(!role)return; if(remove){await api("/api/mind/topology/adjust",{method:"POST",body:JSON.stringify({role,id:item.id,action:"delete"})});return refresh();} const text=prompt(item?"Update live directive":"Add live directive",item?item.text:""); if(text===null)return; await api("/api/mind/topology/adjust",{method:"POST",body:JSON.stringify({role,id:item&&item.id||"",text,action:item?"update":"add"})});refresh();}
+  add.onclick=()=>adjust(selected&&selected.data.id||"dj");
+  function rebuild(){while(world.children.length)world.remove(world.children[0]);nodes=[]; const people=state.people||[]; const colors={dj:0x51b5f4,cohost:0x9cf08b,third:0xffd166,manager:0xff7285,caller:0xff8ad1,customer:0xa88cff}; people.forEach((p,i)=>{const a=i/Math.max(1,people.length)*Math.PI*2, r=8;const g=new THREE.Group();g.position.set(Math.cos(a)*r,Math.sin(a*2)*1.8,Math.sin(a)*r);const col=colors[p.id]||0x7aa9bc;const core=new THREE.Mesh(new THREE.IcosahedronGeometry(1.15,2),new THREE.MeshStandardMaterial({color:col,emissive:col,emissiveIntensity:.45,roughness:.3}));core.userData={person:true,data:p};g.add(core);const ring=new THREE.Mesh(new THREE.TorusGeometry(1.7,.045,10,38),new THREE.MeshBasicMaterial({color:col,transparent:true,opacity:.65}));ring.rotation.x=Math.PI/2;g.add(ring);const tag=label(p.name,"#dff8ff");tag.position.y=2;g.add(tag);world.add(g);nodes.push(core); const inputs=[...(p.adjustments||[]).map(a=>({kind:"directive",text:a.text,item:a})),...Object.entries(p.state||{}).filter(([,v])=>Math.abs(v)>.03).map(([k,v])=>({kind:"state",text:k+" "+Number(v).toFixed(2)}))];inputs.slice(0,9).forEach((n,j)=>{const q=j/Math.max(1,inputs.length)*Math.PI*2;const orb=new THREE.Mesh(new THREE.SphereGeometry(.24+(n.kind==="directive"?.12:0),12,10),new THREE.MeshBasicMaterial({color:n.kind==="directive"?0xffd166:col}));orb.userData={person:true,data:p,detail:n};orb.position.set(Math.cos(q)*2.6,.35*Math.sin(q*2),Math.sin(q)*2.6);g.add(orb);nodes.push(orb);});}); const vec=state.vectors||[];vec.slice(0,10).forEach((v,i)=>{const a=i/Math.max(1,vec.length)*Math.PI*2+.3;const m=new THREE.Mesh(new THREE.OctahedronGeometry(.32,0),new THREE.MeshBasicMaterial({color:0x9ce7c4}));m.position.set(Math.cos(a)*13,-3+Math.sin(a*3)*3,Math.sin(a)*13);m.userData={vector:true,data:v};world.add(m);nodes.push(m);}); renderSide(selected);}
+  async function refresh(){try{state=await api("/api/mind/topology"); rebuild();}catch(e){side.textContent=e.message;}}
+  renderer.domElement.onpointerdown=e=>drag={x:e.clientX,y:e.clientY}; renderer.domElement.onpointermove=e=>{if(drag){yaw+=(e.clientX-drag.x)*.006;pitch=Math.max(-.7,Math.min(.7,pitch+(e.clientY-drag.y)*.004));drag={x:e.clientX,y:e.clientY};}};renderer.domElement.onpointerup=e=>{if(!drag)return;const r=renderer.domElement.getBoundingClientRect();pointer.set((e.clientX-r.left)/r.width*2-1,-(e.clientY-r.top)/r.height*2+1);ray.setFromCamera(pointer,camera);const hit=ray.intersectObjects(nodes,false)[0];if(hit){if(hit.object.userData.vector){side.innerHTML="<h3>Vector source</h3><pre>"+String(hit.object.userData.data.file||"")+"\n"+JSON.stringify(hit.object.userData.data,null,2)+"</pre>";}else renderSide({data:hit.object.userData.data});}drag=null;};
+  function tick(){if(!alive)return;requestAnimationFrame(tick);const w=stage.clientWidth,h=stage.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/Math.max(1,h);camera.updateProjectionMatrix();world.rotation.set(pitch,yaw,0);world.children.forEach((g,i)=>{if(g.children&&g.children[1])g.children[1].rotation.z=performance.now()*.001*(i%2?1:-1);});renderer.render(scene,camera);} function close(){if(!alive)return;alive=false;clearInterval(timer);renderer.dispose();shade.remove();mindTopology=null;} mindTopology={close}; refresh();timer=setInterval(refresh,2200);tick();
+}
+
 function mindOpen(opts) {
   opts = (typeof opts === "string") ? {theme: opts} : (opts || {});
   const wantDock = !!opts.dock;
@@ -60936,6 +62909,11 @@ function mindOpen(opts) {
   flowBtn.style.cssText = reelBtn.style.cssText;
   flowBtn.onclick = () => mindFlowToggle(stage);
   bar.appendChild(flowBtn);
+  const topoBtn = el("button", "", "Topology");
+  topoBtn.title = "Interactive cast, memory, and vector-seed topology";
+  topoBtn.style.cssText = reelBtn.style.cssText;
+  topoBtn.onclick = () => mindTopologyOpen();
+  bar.appendChild(topoBtn);
   const grow = el("span", "", ""); grow.style.flex = "1"; bar.appendChild(grow);
   const phase = el("span", "muted", "watching the machine…");
   phase.style.cssText = "pointer-events:auto;font-size:11px;color:#9bd;"
@@ -62411,13 +64389,16 @@ function mindOpen(opts) {
     renderer.setSize(W(), H());
   };
   window.addEventListener("resize", onResize);
+  // Observe the stage too: internal reflows resize it with no window event.
+  const stageRo = new ResizeObserver(onResize);
+  stageRo.observe(stage);
   const poller = setInterval(pull, 2500);
   const qpoll = setInterval(mindQueueRefresh, 6000);
   pull();
   mindQueueRefresh();
   tick();
 
-  djMind = {shade, renderer, scene, poller, qpoll, onResize, onUp,
+  djMind = {shade, renderer, scene, poller, qpoll, onResize, onUp, stageRo,
             mode: modeName, stage,
             stop: () => { alive = false; cancelAnimationFrame(raf); }};
 }
@@ -62428,6 +64409,7 @@ function mindClose() {
   clearInterval(djMind.poller);
   clearInterval(djMind.qpoll);
   window.removeEventListener("resize", djMind.onResize);
+  try { djMind.stageRo.disconnect(); } catch (e) {}
   window.removeEventListener("pointerup", djMind.onUp);
   // Free every GPU resource, not just the renderer (audit #10/#12/#15):
   // r147's renderer.dispose() does not free scene geometries/materials/maps.
@@ -63708,12 +65690,13 @@ function glassOpen() {
   if (glass) { glassClose(); return; }
   const box = el("div", "panel", "");
   box.id = "glassBox";
-  const saved = JSON.parse(localStorage.glassBox || "null") || {};
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.glassBox || "null") || { left: 80, top: 90 });
   box.style.cssText = "position:fixed;z-index:145;width:min(520px,94vw);"
     + "height:min(440px,72vh);display:flex;flex-direction:column;"
     + "padding:10px 12px;box-shadow:0 20px 60px rgba(0,0,0,.65);"
     + "resize:both;overflow:hidden;"
-    + "left:" + (saved.left ?? 80) + "px;top:" + (saved.top ?? 90) + "px";
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
 
   const head = el("div", "", "");
   head.style.cssText = "display:flex;align-items:center;gap:8px;"
@@ -64091,12 +66074,13 @@ function backlogOpen() {
   backlogSeen = new Set();
   const box = el("div", "panel", "");
   box.id = "backlogBox";
-  const saved = JSON.parse(localStorage.backlogBox || "null") || {};
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.backlogBox || "null") || { left: 90, top: 70 });
   box.style.cssText = "position:fixed;z-index:147;width:min(560px,94vw);"
     + "height:min(560px,80vh);display:flex;flex-direction:column;"
     + "padding:10px 12px;box-shadow:0 20px 60px rgba(0,0,0,.65);"
     + "resize:both;overflow:hidden;"
-    + "left:" + (saved.left ?? 90) + "px;top:" + (saved.top ?? 70) + "px";
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
   const head = el("div", "", "");
   head.style.cssText = "display:flex;align-items:center;gap:8px;"
     + "cursor:grab;margin-bottom:6px";
@@ -64158,8 +66142,9 @@ function crystalDeleteMenu(row, x, y) {
   document.getElementById("crystalDelMenu")?.remove();
   const m = el("div", "panel", "");
   m.id = "crystalDelMenu";
-  m.style.cssText = "position:fixed;z-index:200;left:" + Math.min(x, innerWidth
-    - 260) + "px;top:" + Math.min(y, innerHeight - 130) + "px;width:250px;"
+  m.style.cssText = "position:fixed;z-index:200;left:" + Math.max(8,
+    Math.min(x, innerWidth - 260)) + "px;top:" + Math.max(8, Math.min(y,
+    innerHeight - 130)) + "px;width:min(250px, calc(100vw - 16px));"
     + "padding:10px;font-size:12px;box-shadow:0 18px 50px rgba(0,0,0,.7)";
   m.appendChild(el("div", "muted", (row.who || "someone") + " said:")).style
     .cssText = "font-size:10px;margin-bottom:4px";
@@ -64373,12 +66358,13 @@ async function crystalOpen() {
 
   const box = el("div", "panel", "");
   box.id = "crystalBox";
-  const saved = JSON.parse(localStorage.crystalBox || "null") || {};
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.crystalBox || "null") || { left: 110, top: 80 });
   box.style.cssText = "position:fixed;z-index:146;width:min(560px,94vw);"
     + "height:min(500px,78vh);display:flex;flex-direction:column;"
     + "padding:10px 12px;box-shadow:0 20px 60px rgba(0,0,0,.65);"
     + "resize:both;overflow:hidden;"
-    + "left:" + (saved.left ?? 110) + "px;top:" + (saved.top ?? 80) + "px";
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
 
   const head = el("div", "", "");
   head.style.cssText = "display:flex;align-items:center;gap:8px;"
@@ -64632,12 +66618,13 @@ function winampOpen() {
   // scrubber — and the spectrum kept as a slim strip underneath (#299).
   const box = el("div", "", "");
   box.id = "winampBox";
-  const saved = JSON.parse(localStorage.winampBox || "null") || {};
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.winampBox || "null") || { left: 60, top: 120 });
   box.style.cssText = "position:fixed;z-index:140;width:min(620px,96vw);"
     + "padding:8px 10px;box-shadow:0 16px 50px rgba(0,0,0,.55);"
     + "border:1px solid #9a9a96;border-radius:8px;cursor:grab;"
     + "background:linear-gradient(#f4f4f2,#d8d8d4);"
-    + "left:" + (saved.left ?? 60) + "px;top:" + (saved.top ?? 120) + "px";
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
 
   box.addEventListener("pointerdown", (event) => {
     if (event.target.closest("button,input,canvas")) return;
@@ -64645,8 +66632,10 @@ function winampOpen() {
                   left: box.offsetLeft, top: box.offsetTop};
     box.setPointerCapture(event.pointerId);
     const move = (e) => {
-      box.style.left = Math.max(0, from.left + e.clientX - from.x) + "px";
-      box.style.top = Math.max(0, from.top + e.clientY - from.y) + "px";
+      box.style.left = Math.max(0, Math.min(window.innerWidth - 120,
+        from.left + e.clientX - from.x)) + "px";
+      box.style.top = Math.max(0, Math.min(window.innerHeight - 60,
+        from.top + e.clientY - from.y)) + "px";
     };
     const drop = () => {
       box.removeEventListener("pointermove", move);
@@ -64757,6 +66746,11 @@ function winampOpen() {
   function paint() {
     if (!alive) return;
     requestAnimationFrame(paint);
+    // Guarded re-measure (#737 idiom): the card is fluid (min(620px,96vw)),
+    // so the backing store follows the CSS box — only when it changed, or
+    // the reassignment itself would clear the canvas every frame.
+    const wantW = Math.max(1, Math.round(scope.clientWidth || 596));
+    if (scope.width !== wantW) scope.width = wantW;
     context2d.fillStyle = "#050805";
     context2d.fillRect(0, 0, scope.width, scope.height);
     if (audio && audio.analyser) {
@@ -65118,10 +67112,11 @@ function studioOpen() {
   // Drop any audio/video file anywhere on the studio window to ingest it into
   // a voice (#525).
   if (typeof studioDropZone === "function") studioDropZone(win);
-  const box = JSON.parse(localStorage.studioBox || "null")
-    || {left: 90, top: 60, width: 980, height: 640};
-  win.style.left = Math.max(0, box.left) + "px";
-  win.style.top = Math.max(0, box.top) + "px";
+  const box = clampBoxToViewport(
+    JSON.parse(localStorage.studioBox || "null")
+    || {left: 90, top: 60, width: 980, height: 640});
+  win.style.left = box.left + "px";
+  win.style.top = box.top + "px";
   win.style.width = box.width + "px";
   win.style.height = box.height + "px";
 
@@ -65204,7 +67199,23 @@ function studioOpen() {
     win.style.top = Math.max(0, event.clientY - drag.y) + "px";
   };
   title.onpointerup = () => { drag = null; studioRemember(); };
-  new ResizeObserver(() => studioRemember()).observe(win);
+  // The diarization strip re-cuts on ANY studio resize, not just a window
+  // resize — otherwise its bitmap stretches stale (debounced a beat so a
+  // live drag isn't re-rendering per pixel). The initial fire reports the
+  // clamped open-time geometry and must NOT be persisted, or one visit in a
+  // small window permanently forgets the large-screen size.
+  let studioRoTimer = null;
+  let studioRoFirst = true;
+  new ResizeObserver(() => {
+    if (studioRoFirst) { studioRoFirst = false; return; }
+    studioRemember();
+    clearTimeout(studioRoTimer);
+    studioRoTimer = setTimeout(() => {
+      if (typeof studioTimelineDraw === "function") {
+        try { studioTimelineDraw(); } catch (error) {}
+      }
+    }, 160);
+  }).observe(win);
 
   studio = {win: win};
   studioLoad().then(() => studioNav(localStorage.studioTab || "voices"));
@@ -67967,6 +69978,7 @@ async function saveVoiceOut() {
       engine: document.getElementById("voiceEngine").value || "ha",
       ha_token: document.getElementById("voiceToken").value.trim(),
       media_player: document.getElementById("voicePlayer").value || "",
+      reply_media_player: document.getElementById("replyPlayer").value || "",
       voice: document.getElementById("voiceName").value || "",
       personality_prefix: document.getElementById("voicePrefix").value.trim(),
       personality_suffix: document.getElementById("voiceSuffix").value.trim(),
@@ -68031,22 +70043,32 @@ async function loadVoices() {
 
 async function loadVoicePlayers() {
   const sel = document.getElementById("voicePlayer");
+  const replySel = document.getElementById("replyPlayer");
   const status = document.getElementById("voiceStatus");
   try {
     const d = await api("/api/ha/media-players");
     sel.textContent = "";
+    replySel.textContent = "";
     const none = document.createElement("option");
     none.value = "";
     none.textContent = d.token_set
       ? "— pick a speaker —"
       : "(paste a token first)";
     sel.appendChild(none);
+    const replyNone = none.cloneNode(true);
+    replyNone.textContent = "Response: station speaker";
+    replySel.appendChild(replyNone);
     (d.players || []).forEach((pl) => {
       const opt = document.createElement("option");
       opt.value = pl.entity_id;
-      opt.textContent = pl.name + " (" + pl.state + ")";
+      const label = (pl.name || pl.entity_id)
+        .replace("Pine Box speaker", "Assist satellite");
+      opt.textContent = label + " (" + pl.state + ")";
       if (pl.entity_id === d.configured) opt.selected = true;
       sel.appendChild(opt);
+      const replyOpt = opt.cloneNode(true);
+      replyOpt.selected = pl.entity_id === d.configured_reply;
+      replySel.appendChild(replyOpt);
     });
     if (d.token_set && !(d.players || []).length)
       status.textContent =
@@ -68816,8 +70838,8 @@ async function openDocBrowser(slug, pageN, withChat) {
   const meta = el("span", "muted", "");
   const search = el("input");
   search.placeholder = "search in document…";
-  search.style.cssText =
-    "margin-left:auto;width:240px;padding:6px 10px;font-size:13px";
+  search.style.cssText = "margin-left:auto;width:auto;flex:1 1 140px;"
+    + "min-width:0;max-width:240px;padding:6px 10px;font-size:13px";
   mainHead.appendChild(title);
   mainHead.appendChild(meta);
   const pdfBtn = el("button", "hp-restart", "📄 PDF");
@@ -71033,7 +73055,7 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     font: inherit; flex: 1; min-width: 0; padding: 10px 12px; border-radius: 9px;
     border: 1px solid #24344a; background: #0a1119; color: #e6edf5;
   }
-  .row { display: flex; gap: 8px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; }
   /* The two levels, at the very top: this page had none, so a listener on a
      phone could only turn the whole broadcast up or down together. */
   .levels {
@@ -71056,6 +73078,13 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   .said b { color: #4bb3ff; }
   .said.me b { color: #ffd479; }
   .note { color: #7f8ea3; font-size: 12px; margin-top: 10px; }
+  .gallery-stage { display:none; position:relative; aspect-ratio:16/9; overflow:hidden;
+    margin:0 0 14px; background:#070b12; border:1px solid #1b2735; border-radius:10px; }
+  .gallery-stage.show { display:block; }
+  .gallery-stage img { width:100%; height:100%; object-fit:contain; display:block; }
+  .gallery-caption { position:absolute; left:0; right:0; bottom:0; padding:9px 12px;
+    background:rgba(4,6,11,.78); color:#dce8f5; font-size:12px; white-space:nowrap;
+    overflow:hidden; text-overflow:ellipsis; }
 </style>
 </head>
 <body>
@@ -71070,14 +73099,14 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   <div class="levels">
     <div class="lev">
       <label for="lvMusic">🎵 music</label>
-      <input id="lvMusic" type="range" min="0" max="100" value="50"
-             oninput="setLevels()">
-      <span class="val" id="lvMusicVal">50%</span>
+      <input id="lvMusic" type="range" min="0" max="100" value="20"
+             oninput="setLevels()" onchange="setLevels()">
+      <span class="val" id="lvMusicVal">20%</span>
     </div>
     <div class="lev">
       <label for="lvVoice">🎙 DJs</label>
       <input id="lvVoice" type="range" min="0" max="100" value="100"
-             oninput="setLevels()">
+             oninput="setLevels()" onchange="setLevels()">
       <span class="val" id="lvVoiceVal">100%</span>
     </div>
   </div>
@@ -71093,6 +73122,11 @@ RADIO_PAGE_HTML = r"""<!doctype html>
     </div>
     <div class="bar"><div class="fill" id="fill"></div></div>
     <div class="times"><span id="at">0:00</span><span id="of">0:00</span></div>
+  </div>
+
+  <div class="gallery-stage" id="galleryStage">
+    <img id="galleryImage" alt="Pine Box gallery artwork">
+    <div class="gallery-caption" id="galleryCaption"></div>
   </div>
 
   <button class="big" id="tune" onclick="tune()">Tune in</button>
@@ -71138,20 +73172,51 @@ let trackUrl = "";
 /* ---- The two levels ----------------------------------------------------
  * The records and the talk are separate elements on this page, so they can
  * be set separately — which is the whole reason the sliders can exist. The
- * defaults are music at half and the DJs at full. Ducking is applied ON TOP
+ * defaults are music at twenty percent and the DJs at full. Ducking is applied ON TOP
  * of the music level rather than by overwriting it, so a slider moved while
  * a DJ is mid-sentence does the right thing and the music comes back to
  * where you left it, not to where the duck found it. */
-let musicLevel = 0.5, voiceLevel = 1, ducking = false;
+let musicLevel = 0.2, voiceLevel = 1, ducking = false;
+let listenerAudioContext = null;
+const listenerGains = new WeakMap();
+
+function listenerGain(player) {
+  if (!player || listenerGains.has(player)) return listenerGains.get(player);
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    listenerAudioContext = listenerAudioContext || new Ctx();
+    const source = listenerAudioContext.createMediaElementSource(player);
+    const gain = listenerAudioContext.createGain();
+    source.connect(gain);
+    gain.connect(listenerAudioContext.destination);
+    listenerGains.set(player, gain);
+    return gain;
+  } catch (error) {
+    return null; // Older browsers still use the native-volume fallback.
+  }
+}
+
+function setPlayerLevel(player, level) {
+  if (!player) return;
+  const gain = listenerGain(player);
+  if (gain) {
+    const now = listenerAudioContext.currentTime;
+    gain.gain.cancelScheduledValues(now);
+    gain.gain.setValueAtTime(Math.max(0, Math.min(1, level)), now);
+  }
+  // Keep this in sync for engines without Web Audio support. On mobile
+  // engines that ignore media-element volume, the gain stage above wins.
+  player.volume = Math.max(0, Math.min(1, level));
+}
 
 function applyLevels() {
   if (audio) {
     // A duck to 30% of wherever the slider is, so the control stays
     // meaningful at every position instead of flattening to one floor.
-    audio.volume = Math.max(0, Math.min(1,
-      musicLevel * (ducking ? 0.3 : 1)));
+    setPlayerLevel(audio, musicLevel * (ducking ? 0.3 : 1));
   }
-  if (voice) voice.volume = Math.max(0, Math.min(1, voiceLevel));
+  if (voice) setPlayerLevel(voice, voiceLevel);
 }
 
 function setLevels(save) {
@@ -71173,8 +73238,15 @@ function initLevels() {
   const v = document.getElementById("lvVoice");
   let saved = {};
   try { saved = localStorage; } catch (e) { saved = {}; }
-  if (saved.pbfmMusic != null) m.value = saved.pbfmMusic;
-  if (saved.pbfmVoice != null) v.value = saved.pbfmVoice;
+  // The station is talk-show-first on a car speaker. Move old clients to the
+  // new 20/100 starting mix once, then preserve every adjustment afterwards.
+  if (saved.pbfmMixVersion !== "2") {
+    m.value = "20"; v.value = "100";
+    try { saved.pbfmMixVersion = "2"; } catch (e) {}
+  } else {
+    if (saved.pbfmMusic != null) m.value = saved.pbfmMusic;
+    if (saved.pbfmVoice != null) v.value = saved.pbfmVoice;
+  }
   setLevels();
 }
 
@@ -71305,6 +73377,29 @@ async function clockPoll() {
   } catch (error) { /* the show goes on */ }
 }
 
+let galleryNames = [], galleryIndex = 0, galleryTimer = 0;
+function renderGallery(state) {
+  const names = ((state.gallery_now && state.gallery_now.images) || []).filter(Boolean);
+  const key = names.join("|");
+  const stage = document.getElementById("galleryStage");
+  const image = document.getElementById("galleryImage");
+  const caption = document.getElementById("galleryCaption");
+  if (!stage || !image || !caption) return;
+  if (!names.length) { stage.classList.remove("show"); return; }
+  stage.classList.add("show");
+  if (galleryNames.join("|") === key) return;
+  galleryNames = names; galleryIndex = 0;
+  const show = () => {
+    const name = galleryNames[galleryIndex % galleryNames.length];
+    image.src = "/api/generations/image/" + encodeURIComponent(name);
+    caption.textContent = name;
+    galleryIndex += 1;
+  };
+  if (galleryTimer) clearInterval(galleryTimer);
+  show();
+  if (galleryNames.length > 1) galleryTimer = setInterval(show, 7000);
+}
+
 function patter(state) {
   const host = document.getElementById("patter");
   host.textContent = "";
@@ -71325,6 +73420,7 @@ async function poll() {
     const state = await api("/api/dj?listener=" + ME);
     stateAt = Date.now();
     sync(state);
+    renderGallery(state);
     patter(state);
   } catch (error) {
     document.getElementById("note").textContent = error.message;
@@ -71332,8 +73428,10 @@ async function poll() {
   if (!playing) return;
   try {
     const data = await api("/api/dj/voice?since=" + voiceSeen);
+    const serverMs = Number(data.server_ms || Date.now());
     (data.clips || []).forEach((clip) => {
       voiceSeen = Math.max(voiceSeen, clip.ts);
+      clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
       if (clip.url) voiceQueue.push(clip);
     });
     voiceNext();
@@ -71350,6 +73448,14 @@ function voiceNext() {
   if (voiceBusy || !voiceQueue.length) return;
   const clip = voiceQueue.shift();
   voiceBusy = true;
+  const broadcastAt = Number(clip.broadcastAt || Date.now());
+  const waitForAir = broadcastAt - Date.now();
+  if (waitForAir > 25) {
+    voiceQueue.unshift(clip);
+    voiceBusy = false;
+    setTimeout(voiceNext, waitForAir);
+    return;
+  }
   // Duck the music under the DJ, exactly like a real one talking over it.
   // A flag, not a captured level: the old version read audio.volume before
   // the first clip of a run and wrote it back after, which meant a slider
@@ -71364,6 +73470,15 @@ function voiceNext() {
   };
   voice.onended = done;
   voice.onerror = done;
+  voice.onloadedmetadata = () => {
+    const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
+    if (isFinite(voice.duration) && lateBy >= voice.duration - 0.15) {
+      done(); return;
+    }
+    if (lateBy > 0.12 && isFinite(voice.duration)) {
+      try { voice.currentTime = lateBy; } catch (e) {}
+    }
+  };
   voice.src = clip.url;
   voice.play().catch(done);
 }
@@ -71374,6 +73489,10 @@ function tune() {
   if (!audio) {
     audio = new Audio(); audio.preload = "auto";
     voice = new Audio(); voice.preload = "auto";
+    // Establish and unlock the gain graph inside the listener's tap. This is
+    // the moment mobile browsers permit Web Audio to alter playback levels.
+    listenerGain(audio); listenerGain(voice);
+    if (listenerAudioContext) listenerAudioContext.resume().catch(() => {});
     applyLevels();          // the sliders were set before either existed
   }
   playing = !playing;
@@ -71536,8 +73655,8 @@ GUIDE_HTML = r"""<!doctype html>
     background: #fef2f2; border: 1px solid #fecaca; border-radius: 6px;
     padding: 11px 14px; margin: 12px 0; font-size: 14px;
   }
-  .facts { display: grid; grid-template-columns: 150px 1fr; gap: 3px 12px;
-           font-size: 14px; margin: 10px 0; }
+  .facts { display: grid; grid-template-columns: minmax(110px, 150px) 1fr;
+           gap: 3px 12px; font-size: 14px; margin: 10px 0; }
   .facts div:nth-child(odd) { color: #6b7280; }
   .print { margin: 18px 0 6px; }
   .print button {
@@ -72779,4 +74898,24 @@ if __name__ == "__main__":
     PLAYED_PATH.unlink(missing_ok=True)
     globals()["PLAYED_PATH"] = _played_was
     _RADIO.update({"now": None, "history": [], "coming": None})
+    # A missed coalesced booth/call stream keeps its per-turn timeline on the
+    # replay shelf; clearing the shelf on reconnect was how dialogue vanished.
+    _hold_was = list(_BOX_HOLD)
+    _hold_path_was = BOX_HOLD_PATH
+    globals()["BOX_HOLD_PATH"] = Path("/tmp/box-hold-selfcheck.json")
+    _BOX_HOLD.clear()
+    _rows = [{"id": "r1", "who": "dj", "text": "one",
+              "from": 0.0, "until": 1.0}]
+    box_hold({"path": "/media/abc.wav", "sig": "s", "bytes": 10},
+             "round", "dj", rows=_rows, length=1.0)
+    assert _BOX_HOLD[0]["rows"] == _rows and _BOX_HOLD[0]["length"] == 1.0
+    _src = Path(__file__).read_text(encoding="utf-8")
+    assert "if last_batch and not missed:" in _src
+    assert ("clips." + "slice(-3)") not in _src
+    assert "\"stream\": {\"length\": length, \"rows\": rows}" in _src
+    assert "if to_box:\\n                    _stream_now_set(rows, length)" in _src
+    assert "if (clip.stream && Array.isArray(clip.stream.rows))" in _src
+    BOX_HOLD_PATH.unlink(missing_ok=True)
+    globals()["BOX_HOLD_PATH"] = _hold_path_was
+    _BOX_HOLD[:] = _hold_was
     print("self-check ok")

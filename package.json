@@ -1,0 +1,68 @@
+{
+  "name": "pinebox-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop controller for PineBoxAgent and Pine Box FM.",
+  "main": "desktop/main.js",
+  "scripts": {
+    "desktop": "electron .",
+    "desktop:setup": "npm install",
+    "desktop:pack": "electron-builder --dir",
+    "desktop:dist": "electron-builder",
+    "desktop:dist:win": "electron-builder --win nsis portable",
+    "desktop:dist:linux": "electron-builder --linux AppImage deb tar.gz"
+  },
+  "devDependencies": {
+    "electron": "^37.3.1",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "local.lilspark.pinebox-desktop",
+    "productName": "Pine Box Desktop",
+    "directories": {
+      "output": "dist-desktop"
+    },
+    "files": [
+      "desktop/**/*",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": "app.py",
+        "to": "agent/app.py"
+      },
+      {
+        "from": "requirements.txt",
+        "to": "agent/requirements.txt"
+      },
+      {
+        "from": "tools",
+        "to": "agent/tools",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "data/vendor",
+        "to": "agent/data/vendor",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "deb",
+        "tar.gz"
+      ],
+      "category": "AudioVideo"
+    }
+  }
+}

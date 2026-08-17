@@ -1,0 +1,563 @@
+const { app, BrowserWindow, ipcMain, session, shell } = require("electron");
+const { spawn } = require("node:child_process");
+const fs = require("node:fs");
+const path = require("node:path");
+
+let win;
+let backend = null;
+let backendLog = [];
+let reconstituting = false;
+
+// A dead stdout must never take the app down. Launched from a wrapper shell
+// whose pipe has closed (or a terminal that went away), any console.* write
+// throws EPIPE — and Electron's default uncaught-exception dialog turned a
+// harmless log line into a crash popup. Swallow only that; rethrow the rest.
+process.on("uncaughtException", (error) => {
+  if (error && (error.code === "EPIPE" || error.code === "ERR_STREAM_DESTROYED")) return;
+  try {
+    const { dialog } = require("electron");
+    dialog.showErrorBox(
+      "A JavaScript error occurred in the main process",
+      (error && (error.stack || error.message)) || String(error));
+  } catch {}
+});
+for (const stream of [process.stdout, process.stderr]) {
+  if (stream && typeof stream.on === "function") {
+    stream.on("error", () => {});
+  }
+}
+
+app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
+
+const defaults = {
+  baseUrl: process.env.PINE_DESKTOP_BASE_URL || "http://127.0.0.1:8096",
+  port: 8096,
+  mode: process.env.PINE_DESKTOP_MODE || "launch",
+  apiKey: "",
+  dataDir: "",
+  python: ""
+};
+
+function configPath() {
+  return path.join(app.getPath("userData"), "pinebox-desktop.json");
+}
+
+function readConfig() {
+  try {
+    const saved = JSON.parse(fs.readFileSync(configPath(), "utf8"));
+    return {
+      ...defaults,
+      ...saved,
+      ...(process.env.PINE_DESKTOP_BASE_URL ? { baseUrl: process.env.PINE_DESKTOP_BASE_URL } : {}),
+      ...(process.env.PINE_DESKTOP_MODE ? { mode: process.env.PINE_DESKTOP_MODE } : {})
+    };
+  } catch {
+    return { ...defaults };
+  }
+}
+
+function writeConfig(next) {
+  const cfg = { ...readConfig(), ...next };
+  fs.mkdirSync(path.dirname(configPath()), { recursive: true });
+  fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2));
+  return cfg;
+}
+
+function agentRoot() {
+  if (process.env.PINE_AGENT_ROOT) return process.env.PINE_AGENT_ROOT;
+  if (app.isPackaged) return path.join(process.resourcesPath, "agent");
+  return path.resolve(__dirname, "..");
+}
+
+function defaultDataDir(root) {
+  const localData = path.join(root, "data");
+  if (!app.isPackaged && fs.existsSync(localData)) return localData;
+  return path.join(app.getPath("userData"), "agent-data");
+}
+
+function venvDir() {
+  if (app.isPackaged) return path.join(app.getPath("userData"), "agent-venv");
+  return path.join(agentRoot(), ".venv");
+}
+
+function copyDirIfMissing(source, target) {
+  if (!fs.existsSync(source) || fs.existsSync(target)) return;
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.cpSync(source, target, { recursive: true });
+}
+
+function copyFileIfPresent(source, target) {
+  if (!fs.existsSync(source)) return false;
+  fs.mkdirSync(path.dirname(target), { recursive: true });
+  fs.copyFileSync(source, target);
+  return true;
+}
+
+function rememberLog(line) {
+  backendLog.push(line);
+  backendLog = backendLog.slice(-500);
+  if (win && !win.isDestroyed()) win.webContents.send("backend-log", line);
+}
+
+function supportProgress(stage, pct, detail = "") {
+  const event = { stage, pct, detail, at: Date.now() };
+  rememberLog(`[support] ${stage}${detail ? ` - ${detail}` : ""}\n`);
+  if (win && !win.isDestroyed()) win.webContents.send("support-progress", event);
+}
+
+function npmCommand() {
+  if (process.platform !== "win32") return "npm";
+  const dirs = String(process.env.PATH || "").split(path.delimiter);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, "npm.cmd");
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return "npm.cmd";
+}
+
+function spawnCommand(cmd, args, options = {}) {
+  if (process.platform !== "win32") {
+    return spawn(cmd, args, {
+      cwd: options.cwd || agentRoot(),
+      env: { ...process.env, ...(options.env || {}) },
+      windowsHide: true
+    });
+  }
+  const quoted = [cmd, ...args].map((part) => {
+    const text = String(part);
+    return /\s|&|\(|\)|\^|%|!|"/.test(text)
+      ? `"${text.replace(/"/g, '""')}"`
+      : text;
+  }).join(" ");
+  return spawn("cmd.exe", ["/d", "/s", "/c", quoted], {
+    cwd: options.cwd || agentRoot(),
+    env: { ...process.env, ...(options.env || {}) },
+    windowsHide: true
+  });
+}
+
+function runLogged(cmd, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (options.stage) supportProgress(options.stage, options.pct || 0, `${cmd} ${args.join(" ")}`);
+    rememberLog(`[support] ${cmd} ${args.join(" ")}\n`);
+    const child = spawnCommand(cmd, args, options);
+    child.stdout.on("data", (buf) => rememberLog(buf.toString()));
+    child.stderr.on("data", (buf) => rememberLog(buf.toString()));
+    child.on("error", (err) => {
+      supportProgress(options.stage || "command", options.pct || 0,
+        `${cmd} failed to spawn: ${err.message}`);
+      reject(err);
+    });
+    child.on("exit", (code) => {
+      if (code === 0) resolve({ ok: true });
+      else reject(new Error(`${cmd} ${args.join(" ")} exited ${code}`));
+    });
+  });
+}
+
+function syncDesktopSource() {
+  const source = process.env.PINE_AGENT_ROOT || agentRoot();
+  const target = path.resolve(__dirname, "..");
+  const copied = [];
+  if (path.resolve(source).toLowerCase() === path.resolve(target).toLowerCase()) {
+    return { source, target, copied, skipped: "already running from source" };
+  }
+  for (const file of ["package.json", "package-lock.json"]) {
+    if (copyFileIfPresent(path.join(source, file), path.join(target, file))) {
+      copied.push(file);
+    }
+  }
+  const sourceDesktop = path.join(source, "desktop");
+  const targetDesktop = path.join(target, "desktop");
+  if (fs.existsSync(sourceDesktop)) {
+    fs.rmSync(targetDesktop, { recursive: true, force: true });
+    fs.cpSync(sourceDesktop, targetDesktop, { recursive: true });
+    copied.push("desktop/");
+  }
+  return { source, target, copied };
+}
+
+function removeInside(root, names) {
+  const base = path.resolve(root);
+  for (const name of names) {
+    const target = path.resolve(base, name);
+    if (!target.toLowerCase().startsWith(base.toLowerCase() + path.sep)) {
+      throw new Error(`Refusing to remove outside runner: ${target}`);
+    }
+    if (fs.existsSync(target)) {
+      fs.rmSync(target, { recursive: true, force: true });
+      supportProgress("collapse", 10, `removed ${name}`);
+    }
+  }
+}
+
+function cmdEscape(value) {
+  return String(value).replace(/"/g, '""');
+}
+
+function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
+  const scriptPath = path.join(app.getPath("userData"), "pinebox-rebuild.cmd");
+  const logPath = path.join(app.getPath("userData"), "pinebox-rebuild.log");
+  const lines = [
+    "@echo off",
+    "setlocal EnableExtensions",
+    `set "RUN_DIR=${cmdEscape(runnerRoot)}"`,
+    `set "SOURCE_DIR=${cmdEscape(sourceRoot)}"`,
+    `set "BASE_URL=${cmdEscape(cfg.baseUrl)}"`,
+    `set "MODE=${cmdEscape(cfg.mode)}"`,
+    `set "LOG=${cmdEscape(logPath)}"`,
+    "> \"%LOG%\" echo [rebuild] waiting for Electron to release its runtime DLLs",
+    "timeout /t 4 /nobreak >nul",
+    "cd /d \"%RUN_DIR%\" || goto fail",
+    ">> \"%LOG%\" echo [rebuild] collapsing local runner",
+    "for %%D in (node_modules dist-desktop .vite .electron .cache) do if exist \"%%D\" rmdir /s /q \"%%D\" >> \"%LOG%\" 2>&1",
+    ">> \"%LOG%\" echo [rebuild] copying latest source",
+    "copy /Y \"%SOURCE_DIR%\\package.json\" \"%RUN_DIR%\\package.json\" >> \"%LOG%\" 2>&1",
+    "if exist \"%SOURCE_DIR%\\package-lock.json\" copy /Y \"%SOURCE_DIR%\\package-lock.json\" \"%RUN_DIR%\\package-lock.json\" >> \"%LOG%\" 2>&1",
+    "robocopy \"%SOURCE_DIR%\\desktop\" \"%RUN_DIR%\\desktop\" /MIR /NFL /NDL /NJH /NJS /NP >> \"%LOG%\" 2>&1",
+    "if errorlevel 8 goto fail",
+    ">> \"%LOG%\" echo [rebuild] npm install",
+    "call npm install >> \"%LOG%\" 2>&1 || goto fail",
+    ">> \"%LOG%\" echo [rebuild] electron pack",
+    "call npm run desktop:pack >> \"%LOG%\" 2>&1",
+    ">> \"%LOG%\" echo [rebuild] relaunching Pine Box Desktop",
+    `set "PINE_AGENT_ROOT=${cmdEscape(sourceRoot)}"`,
+    "set \"PINE_DESKTOP_BASE_URL=%BASE_URL%\"",
+    "set \"PINE_DESKTOP_MODE=%MODE%\"",
+    "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" cmd /d /s /c \"npm run desktop\"",
+    "exit /b 0",
+    ":fail",
+    ">> \"%LOG%\" echo [rebuild] failed with %errorlevel%",
+    "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" cmd /d /s /c \"npm run desktop\"",
+    "exit /b 1",
+    ""
+  ];
+  fs.writeFileSync(scriptPath, lines.join("\r\n"));
+  return { scriptPath, logPath };
+}
+
+function launchDetachedScript(scriptPath) {
+  const child = spawn("cmd.exe", ["/d", "/s", "/c", `"${scriptPath}"`], {
+    detached: true,
+    stdio: "ignore",
+    windowsHide: true
+  });
+  child.unref();
+}
+
+function authHeaders(cfg = readConfig()) {
+  return cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {};
+}
+
+async function fetchJson(url, options = {}) {
+  const cfg = readConfig();
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...authHeaders(cfg),
+      ...(options.headers || {})
+    }
+  });
+  const text = await response.text();
+  let body = null;
+  try { body = text ? JSON.parse(text) : {}; } catch { body = { text }; }
+  if (!response.ok) {
+    const detail = body && (body.detail || body.error || body.text);
+    throw new Error(detail || `${response.status} ${response.statusText}`);
+  }
+  return body;
+}
+
+async function discoverAgentKey() {
+  const cfg = readConfig();
+  const response = await fetch(`${cfg.baseUrl}/`);
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}`);
+  }
+  const html = await response.text();
+  const match = html.match(/const\s+SERVER_KEY\s*=\s*("(?:\\.|[^"\\])*")\s*;/);
+  if (!match) return { ok: false, saved: false };
+  const key = JSON.parse(match[1]);
+  if (!key) return { ok: false, saved: false };
+  writeConfig({ apiKey: key });
+  return { ok: true, saved: true };
+}
+
+async function waitForHealth(baseUrl, ms = 20000) {
+  const stop = Date.now() + ms;
+  while (Date.now() < stop) {
+    try {
+      const r = await fetch(`${baseUrl}/healthz`);
+      if (r.ok) return true;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
+function pythonCommand(cfg) {
+  if (cfg.python) return cfg.python;
+  if (process.platform === "win32") return "python";
+  return "python3";
+}
+
+function venvPython(root) {
+  const dir = venvDir();
+  return process.platform === "win32"
+    ? path.join(dir, "Scripts", "python.exe")
+    : path.join(dir, "bin", "python");
+}
+
+function startBackend() {
+  const cfg = readConfig();
+  if (backend && backend.exitCode === null) return { running: true, pid: backend.pid };
+
+  const root = agentRoot();
+  if (!fs.existsSync(path.join(root, "app.py"))) {
+    throw new Error(`Cannot find app.py in ${root}`);
+  }
+
+  const py = fs.existsSync(venvPython(root)) ? venvPython(root) : pythonCommand(cfg);
+  const dataDir = cfg.dataDir || defaultDataDir(root);
+  fs.mkdirSync(dataDir, { recursive: true });
+  copyDirIfMissing(path.join(root, "data", "vendor"), path.join(dataDir, "vendor"));
+
+  backend = spawn(py, ["-m", "uvicorn", "app:app", "--host", "127.0.0.1", "--port", String(cfg.port)], {
+    cwd: root,
+    env: {
+      ...process.env,
+      SPARK_AGENT_PORT: String(cfg.port),
+      SPARK_AGENT_DATA_DIR: dataDir,
+      SPARK_PUBLIC_LISTEN: process.env.SPARK_PUBLIC_LISTEN || "false"
+    },
+    windowsHide: true
+  });
+
+  rememberLog(`[desktop] launched agent pid ${backend.pid} in ${root}`);
+  backend.stdout.on("data", (buf) => rememberLog(buf.toString()));
+  backend.stderr.on("data", (buf) => rememberLog(buf.toString()));
+  backend.on("exit", (code, signal) => {
+    rememberLog(`[desktop] agent exited code=${code} signal=${signal || ""}`);
+    backend = null;
+  });
+  return { running: true, pid: backend.pid };
+}
+
+async function createVenvAndInstall() {
+  const cfg = readConfig();
+  const root = agentRoot();
+  const py = pythonCommand(cfg);
+  const venv = venvDir();
+  const steps = [
+    { cmd: py, args: ["-m", "venv", venv] },
+    { cmd: venvPython(root), args: ["-m", "pip", "install", "--upgrade", "pip"] },
+    { cmd: venvPython(root), args: ["-m", "pip", "install", "-r", path.join(root, "requirements.txt")] }
+  ];
+
+  for (const step of steps) {
+    await new Promise((resolve, reject) => {
+      rememberLog(`[setup] ${step.cmd} ${step.args.join(" ")}`);
+      const child = spawnCommand(step.cmd, step.args, { cwd: root });
+      child.stdout.on("data", (buf) => rememberLog(buf.toString()));
+      child.stderr.on("data", (buf) => rememberLog(buf.toString()));
+      child.on("exit", (code) => code === 0 ? resolve() : reject(new Error(`setup failed with exit ${code}`)));
+    });
+  }
+  return { ok: true, python: venvPython(root) };
+}
+
+async function reconstituteDesktop() {
+  if (reconstituting) return { ok: false, running: true };
+  reconstituting = true;
+  const cfg = readConfig();
+  const runnerRoot = path.resolve(__dirname, "..");
+  try {
+    supportProgress("ignition", 3, "reconstituting Pine Box Desktop");
+    if (process.platform === "win32") {
+      const sourceRoot = process.env.PINE_AGENT_ROOT || agentRoot();
+      supportProgress("collapse", 8, "arming post-exit rebuild script");
+      const { scriptPath, logPath } = writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg);
+      const runway = [
+        [18, "source sync", "mapping latest desktop source"],
+        [22, "npm install", "queueing a clean dependency install"],
+        [26, "npx/electron pack", "preparing the Electron pack step"],
+        [30, "routing", "restoring Nabu/app station routing"],
+        [34, "visualizer", "holding simulation while processes map in"],
+        [38, "handoff", `external rebuild log ${logPath}`]
+      ];
+      for (const [pct, stage, detail] of runway) {
+        supportProgress(stage, pct, detail);
+        await new Promise((resolve) => setTimeout(resolve, 2500));
+      }
+      launchDetachedScript(scriptPath);
+      supportProgress("exit", 42, "closing Electron so runtime DLLs unlock");
+      setTimeout(() => app.exit(0), 700);
+      return { ok: true, relaunching: true, external: true, logPath };
+    }
+    supportProgress("collapse", 6, "clearing local Electron runner");
+    removeInside(runnerRoot, [
+      "node_modules",
+      "dist-desktop",
+      ".vite",
+      ".electron",
+      ".cache"
+    ]);
+    const sync = syncDesktopSource();
+    supportProgress("source sync", 12, `source ${sync.source}`);
+    supportProgress("runner sync", 20, `runner ${sync.target}`);
+    if (sync.copied && sync.copied.length) {
+      supportProgress("desktop source", 28, `copied ${sync.copied.join(", ")}`);
+    } else if (sync.skipped) {
+      supportProgress("desktop source", 28, sync.skipped);
+    }
+
+    await runLogged(npmCommand(), ["install"], {
+      cwd: runnerRoot,
+      stage: "npm install",
+      pct: 38
+    });
+
+    try {
+      await runLogged(npmCommand(), ["run", "desktop:pack"], {
+        cwd: runnerRoot,
+        stage: "npx/electron pack",
+        pct: 52
+      });
+    } catch (err) {
+      supportProgress("npx/electron pack", 58, `skipped/failed: ${err.message}`);
+    }
+
+    if (fs.existsSync(path.join(agentRoot(), "requirements.txt"))) {
+      try {
+        supportProgress("python deps", 65, "refreshing backend requirements");
+        await createVenvAndInstall();
+      } catch (err) {
+        supportProgress("python deps", 68, `failed: ${err.message}`);
+      }
+    }
+
+    if (backend && backend.exitCode === null) {
+      supportProgress("backend", 72, "stopping local backend");
+      backend.kill();
+      backend = null;
+      await new Promise((resolve) => setTimeout(resolve, 900));
+    }
+    if (cfg.mode === "launch") {
+      supportProgress("backend", 78, "starting local backend");
+      startBackend();
+      await waitForHealth(readConfig().baseUrl, 30000);
+    }
+
+    try {
+      supportProgress("routing", 84, "restoring Nabu/app broadcast route");
+      await fetchJson(`${readConfig().baseUrl}/api/dj/output`, {
+        method: "POST",
+        body: JSON.stringify({
+          music: "off",
+          voice: "box",
+          reply: "box",
+          voice_device: "nabu",
+          box_talk: true
+        })
+      });
+    } catch (err) {
+      supportProgress("routing", 86, `failed: ${err.message}`);
+    }
+
+    let repairPct = 88;
+    for (const [route, body] of [
+      ["/api/pinebox/initialize", { speak: false }],
+      ["/api/pinebox/recover", { restart: false }],
+      ["/api/pinebox/initialize", { speak: false }]
+    ]) {
+      try {
+        supportProgress("pine support", repairPct, route);
+        await fetchJson(`${readConfig().baseUrl}${route}`, {
+          method: "POST",
+          body: JSON.stringify(body)
+        });
+      } catch (err) {
+        supportProgress("pine support", repairPct, `${route} failed: ${err.message}`);
+      }
+      repairPct += 3;
+    }
+
+    supportProgress("relaunch", 100, "reconstitution complete");
+    app.relaunch({
+      args: process.argv.slice(1),
+      execPath: process.execPath
+    });
+    setTimeout(() => app.exit(0), 500);
+    return { ok: true, relaunching: true };
+  } finally {
+    reconstituting = false;
+  }
+}
+
+function createWindow() {
+  session.defaultSession.setPermissionRequestHandler((_webContents, permission, callback) => {
+    callback(["media", "microphone", "camera", "fullscreen", "display-capture"].includes(permission));
+  });
+
+  win = new BrowserWindow({
+    width: 1480,
+    height: 940,
+    minWidth: 1100,
+    minHeight: 720,
+    title: "Pine Box Desktop",
+    backgroundColor: "#101419",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+      webviewTag: true,
+      sandbox: false
+    }
+  });
+  win.loadFile(path.join(__dirname, "renderer", "index.html"));
+}
+
+ipcMain.handle("config:read", () => readConfig());
+ipcMain.handle("config:write", (_event, cfg) => writeConfig(cfg));
+ipcMain.handle("backend:start", async () => {
+  const started = startBackend();
+  const ok = await waitForHealth(readConfig().baseUrl);
+  return { ...started, ready: ok };
+});
+ipcMain.handle("backend:stop", () => {
+  if (backend) backend.kill();
+  return { ok: true };
+});
+ipcMain.handle("backend:setup", () => createVenvAndInstall());
+ipcMain.handle("desktop:reconstitute", () => reconstituteDesktop());
+ipcMain.handle("backend:log", () => backendLog);
+ipcMain.handle("agent:discover-key", () => discoverAgentKey());
+ipcMain.handle("agent:get", (_event, route) => fetchJson(`${readConfig().baseUrl}${route}`));
+ipcMain.handle("agent:post", (_event, route, body) => fetchJson(`${readConfig().baseUrl}${route}`, {
+  method: "POST",
+  body: JSON.stringify(body || {})
+}));
+ipcMain.handle("agent:put", (_event, route, body) => fetchJson(`${readConfig().baseUrl}${route}`, {
+  method: "PUT",
+  body: JSON.stringify(body || {})
+}));
+ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
+
+app.whenReady().then(async () => {
+  createWindow();
+  const cfg = readConfig();
+  if (cfg.mode === "launch") {
+    try {
+      startBackend();
+      await waitForHealth(cfg.baseUrl, 12000);
+    } catch (err) {
+      rememberLog(`[desktop] launch failed: ${err.message}`);
+    }
+  }
+});
+
+app.on("window-all-closed", () => {
+  if (backend) backend.kill();
+  if (process.platform !== "darwin") app.quit();
+});
