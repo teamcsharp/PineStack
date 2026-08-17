@@ -450,6 +450,7 @@ async function refresh() {
   try {
     const status = await api.get("/api/pinebox/status");
     setText("boxState", status.healthy === true ? "healthy" : status.healthy === false ? "needs attention" : "checking");
+    pulse.held = ((status.delivery || {}).held ?? pulse.held) || 0;
     setText("routeState", routeLabelFromState(status.routing));
     setText("nowState", status.now_playing ? `${status.now_playing.artist || ""} ${status.now_playing.title || ""}`.trim() : "quiet");
     setText("spokenLine", status.spoken || status.cause || status.diag_error || "status loaded");
@@ -939,6 +940,106 @@ function initThreejsRail() {
   });
 }
 initThreejsRail();
+
+// ---- The heartbeat (Box cell): the DJs' rhetoric reaching the server as
+// EKG spikes on a scrolling trace — writing blue, voicing violet, on-air
+// green, drops red — with the Spark's CPU breathing in the baseline, heat
+// reddening the line, and the task counters growing in real time below.
+const pulse = { events: [], cpu: 0, temp: 0, running: 0, held: 0,
+                queuedRenders: 0, lastTs: 0 };
+const PULSE_COLORS = { model: "#7fd1ff", synth: "#b48cff", air: "#54d18b",
+                       drop: "#e46b6b", mining: "#e3be63" };
+
+function initBoxPulse() {
+  const canvas = $("boxPulse");
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  async function feed() {
+    try {
+      const p = await api.get("/api/dj/pipeline?since=" + pulse.lastTs);
+      (p.events || []).forEach((e) => {
+        pulse.lastTs = Math.max(pulse.lastTs, e.ts || 0);
+        pulse.events.push({ t: performance.now() / 1000,
+                            kind: String(e.kind || "air") });
+      });
+      if (pulse.events.length > 240) {
+        pulse.events.splice(0, pulse.events.length - 240);
+      }
+      const act = (p.activity || {});
+      pulse.queuedRenders = /voicing|writing/.test(act.stage || "") ? 1 : 0;
+    } catch (e) {}
+    try {
+      const d = await api.get("/api/perf");
+      pulse.cpu = Number(d.cpu_pct ?? d.cpu ?? 0);
+      pulse.temp = Number(d.temp_c ?? 0);
+      pulse.running = (d.shell || []).filter((r) => r.ms === null).length;
+    } catch (e) {}
+    const tasks = $("boxTasks");
+    if (tasks) {
+      tasks.textContent =
+        "⚙ " + pulse.running + " running · ⏳ "
+        + (pulse.queuedRenders ? "rendering" : "idle")
+        + " · 🗂 " + pulse.held + " held · "
+        + Math.round(pulse.cpu) + "% cpu";
+    }
+  }
+  feed();
+  setInterval(feed, 3000);
+
+  const spike = (d, height) => {
+    // A narrow EKG lobe: sharp up, sharp down, small rebound.
+    const x = d * 9;                      // seconds → lobe-space
+    if (x < -1 || x > 1.6) return 0;
+    if (x < 0) return height * (1 + x);                  // rising edge
+    if (x < 0.5) return height * (1 - x * 2.6);          // overshoot down
+    return height * -0.3 * (1.6 - x);                    // rebound tail
+  };
+
+  function draw() {
+    requestAnimationFrame(draw);
+    const w = canvas.clientWidth, h = canvas.clientHeight;
+    if (!w || !h) return;
+    const dpr = devicePixelRatio || 1;
+    if (canvas.width !== Math.round(w * dpr)) {
+      canvas.width = Math.round(w * dpr);
+      canvas.height = Math.round(h * dpr);
+    }
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.clearRect(0, 0, w, h);
+    const now = performance.now() / 1000;
+    const speed = 22;                     // px per second of history
+    const mid = h * 0.58;
+    const hot = pulse.temp > 85;
+    ctx.beginPath();
+    for (let x = 0; x <= w; x += 1) {
+      const at = now - (w - x) / speed;
+      let y = mid
+        + Math.sin(at * 2.2 + Math.sin(at * 0.7)) * (0.8 + pulse.cpu / 30);
+      for (const ev of pulse.events) {
+        const s = spike(at - ev.t, h * 0.42);
+        if (s) y -= s;
+      }
+      x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = hot ? "#e46b6b" : "#65c7da";
+    ctx.lineWidth = 1.2;
+    ctx.shadowColor = hot ? "#e46b6b" : "#65c7da";
+    ctx.shadowBlur = 4;
+    ctx.stroke();
+    ctx.shadowBlur = 0;
+    // Colored footprints under each event, so the KIND reads at a glance.
+    for (const ev of pulse.events) {
+      const x = w - (now - ev.t) * speed;
+      if (x < 0 || x > w) continue;
+      ctx.fillStyle = PULSE_COLORS[ev.kind] || "#9fb0bd";
+      ctx.globalAlpha = 0.85;
+      ctx.fillRect(x - 1, h - 3, 2.5, 3);
+      ctx.globalAlpha = 1;
+    }
+  }
+  draw();
+}
+initBoxPulse();
 
 // ---- The Station drawer: public broadcast, DJ handling and repair at the
 // application level. Every value round-trips through the agent, so any

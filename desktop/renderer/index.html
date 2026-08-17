@@ -67,7 +67,11 @@
     <header class="top">
       <div class="status-strip">
         <div><span>Agent</span><b id="agentState">unknown</b></div>
-        <div><span>Box</span><b id="boxState">unknown</b></div>
+        <div id="boxCell" class="pulse-cell">
+          <span>Box</span><b id="boxState">unknown</b>
+          <canvas id="boxPulse"></canvas>
+          <em id="boxTasks"></em>
+        </div>
         <div><span>Route</span><b id="routeState">unknown</b></div>
         <div><span>Now</span><b id="nowState">quiet</b></div>
       </div>
