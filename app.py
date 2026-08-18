@@ -5254,6 +5254,77 @@ async def nabu_device_alive() -> bool:
 _NABU_LADDER_RUNNING = [False]
 
 
+NABU_RESTART_BUTTON = os.getenv(
+    "NABU_RESTART_BUTTON", "button.home_assistant_voice_09f8a8_restart")
+_NABU_REBOOT_AT = [0.0]
+
+
+async def nabu_device_restart(reason: str = "") -> bool:
+    """#810: the rung between session-rebuild and paging a human — press
+    the device's own restart button (the cure for the idle-but-deaf
+    wedge that no software repair touches). 30-minute cooldown; the
+    device drops ~20s and rejoins."""
+    if time.time() - _NABU_REBOOT_AT[0] < 1800:
+        return False
+    token, _player = _ha_creds()
+    if not token:
+        return False
+    _NABU_REBOOT_AT[0] = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.post(
+                f"{HA_URL}/api/services/button/press",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"entity_id": NABU_RESTART_BUTTON})
+        ok = r.status_code < 300
+        pipeline_log("repair", "the watchdog pressed the Pine Box's own "
+                     f"restart button ({'ok' if ok else r.status_code})"
+                     + (f" — {reason}" if reason else "") + " (#810)")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("repair",
+                     f"device restart press failed: {exc} (#810)")
+        return False
+
+
+async def onair_watchdog() -> None:
+    """#810: FM ON means AUDIBLE. When the switch says broadcasting but
+    nothing verified has come out of the speaker for ten minutes, the
+    station investigates itself — selfheal, then the link ladder, then
+    the device's own restart button — and says so in the ledger, so the
+    operator never discovers dead air before the machinery does."""
+    while True:
+        await asyncio.sleep(120)
+        try:
+            if not (_RADIO.get("on") and box_talk_ok()
+                    and (_RADIO.get("voice_to") or "box") in ("box",
+                                                              "both")):
+                continue
+            quiet = time.time() - _BOX_LAST_OK[0]
+            if quiet < 600:
+                continue
+            pipeline_log("repair", "on-air watchdog: FM is ON but "
+                         f"nothing verified has aired in "
+                         f"{int(quiet / 60)} min — the station "
+                         "investigates itself (#810)")
+            await satellite_selfheal()
+            await asyncio.sleep(90)
+            if time.time() - _BOX_LAST_OK[0] < 120:
+                continue                 # selfheal brought it back
+            await nabu_link_ladder("on-air watchdog (#810)")
+            await asyncio.sleep(120)
+            if time.time() - _BOX_LAST_OK[0] < 150:
+                continue                 # the ladder brought it back
+            await nabu_device_restart("still silent after the ladder")
+        except Exception:  # noqa: BLE001
+            pass                         # the watchdog never dies
+
+
+@app.on_event("startup")
+async def _startup_onair_watchdog() -> None:
+    fire_and_forget(onair_watchdog())
+
+
 async def nabu_link_ladder(reason: str = "") -> dict[str, Any]:
     """Climb: verify the reload → restart Home Assistant → wait for the
     entity to walk back in → release the held backlog. Every rung lands
@@ -13247,9 +13318,28 @@ async def resume_radio() -> None:
         pass
 
 
+async def _fm_off_offload() -> None:
+    """#810: OFF means OFF — the writer model is released from memory at
+    once (keep_alive 0); the TTS engines' own idle clocks and the
+    pressure valve take everything else down as it goes quiet."""
+    try:
+        model = str(load_settings().get("model") or "")
+        if model:
+            async with httpx.AsyncClient(timeout=30) as client:
+                await client.post(f"{OLLAMA_URL}/api/generate",
+                                  json={"model": model, "prompt": "",
+                                        "keep_alive": 0})
+            pipeline_log("repair", f"FM off — {model} released from "
+                         "memory; idle clocks will shed the engines "
+                         "(#810)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def dj_stop(*, seal_episode: bool = True) -> None:
     _RADIO["on"] = False
     remember_radio(False)
+    fire_and_forget(_fm_off_offload())
     # An ordinary stop preserves its last stretch. A clean restart asks us
     # not to mint a final recording immediately before purging the shelf.
     if seal_episode and (_RADIO.get("episode") or {}).get("items"):
