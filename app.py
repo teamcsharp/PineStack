@@ -25614,7 +25614,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "did something — no made-up tallies or counts. Only cite a number "
             "when it is given to you in the notes above; otherwise speak "
             "without one.\n"
-            f"{banter_pace(0 if caller_name else dj['overlap'])}\n"
+            # #828: a conversation, not interleaved monologues — the
+            # operator hears the pair talking PAST each other.
+            + "EVERY TURN RESPONDS TO THE ONE BEFORE IT: pick up a "
+            "SPECIFIC word, image or claim the other speaker just said — "
+            "repeat it back, challenge it, laugh at it, mishear it, build "
+            "on it — BEFORE adding anything new. A turn that could be "
+            "moved three turns away without anyone noticing is a failed "
+            "turn. React first, then advance. "
+            + f"{banter_pace(0 if caller_name else dj['overlap'])}\n"
             f"Format each line as 'A: ...' for you and 'B: ...' for "
             f"{dj['cohost_name']}"
             + (f", 'D: ...' for {dj['third_name']}" if third else "")
@@ -41607,6 +41615,18 @@ CONTROL_PANEL_HTML = r"""
   position: fixed; inset: 0; z-index: -1; pointer-events: none;
   opacity: .85;
 }
+/* #827: the gallery opens the machine IN FRONT — a full-screen look at
+   the device instead of a ghost behind the panels. */
+#deviceSkin.skin-window {
+  z-index: 205; pointer-events: auto; opacity: 1;
+  background: rgba(4, 8, 14, .88);
+}
+#skinWindowClose {
+  position: fixed; top: 18px; right: 22px; z-index: 206;
+  font-size: 22px; color: #cfe6ff; cursor: pointer;
+  background: rgba(10, 16, 26, .8); border: 1px solid var(--border);
+  border-radius: 9px; padding: 4px 12px;
+}
 /* With a machine behind them the panels need to read as panels. */
 :root[data-skin] .panel {
   background: color-mix(in srgb, var(--panel) 88%, transparent);
@@ -45140,7 +45160,7 @@ const PINE_3JS = [
   {key: "stage",    label: "💿 Album Stage",     open: () => stageStart()},
   {key: "remote",   label: "🌐 Remote Plexus",   open: () => remotePanel()},
   {key: "skin",     label: "📼 Device Skin",
-   open: () => deviceSkin(["tp7", "op1", "ko2", "pocketoperator"]
+   open: () => deviceSkinWindow(["tp7", "op1", "ko2", "pocketoperator"]
      .includes(localStorage.getItem("pineTheme"))
      ? localStorage.getItem("pineTheme") : "tp7")},
   {key: "off",      label: "⬛ All off",         open: () => {}},
@@ -49647,6 +49667,28 @@ function skinStop() {
   document.documentElement.removeAttribute("data-skin");
   const canvas = document.getElementById("deviceSkin");
   if (canvas) canvas.remove();
+}
+
+/* #827: the gallery road — the same machine, rendered IN FRONT of the
+ * UI at full screen with a close button, instead of the background-skin
+ * mode (which stays for themes: translucent panels over the device). */
+async function deviceSkinWindow(theme) {
+  await deviceSkin(theme);
+  const host = document.getElementById("deviceSkin");
+  if (!host) return;
+  host.classList.add("skin-window");
+  let x = document.getElementById("skinWindowClose");
+  if (!x) {
+    x = document.createElement("div");
+    x.id = "skinWindowClose";
+    x.textContent = "\u2715 close the machine";
+    x.onclick = () => {
+      x.remove();
+      skinStop();
+      document.documentElement.removeAttribute("data-skin");
+    };
+    document.body.appendChild(x);
+  }
 }
 
 async function deviceSkin(theme) {
