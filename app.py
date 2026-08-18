@@ -544,7 +544,8 @@ DEFAULT_DJ = {
     "callin_per_hour": 4,           # #786: was 1 — the scarcest talk source
     # #798: the caller behaviour deck — relative weights, drawn per call.
     "caller_prize": 15, "caller_mad": 15, "caller_agree": 15,
-    "caller_disagree": 20, "caller_offwall": 15, "caller_plain": 20,
+    "caller_disagree": 20, "caller_offwall": 15, "caller_plain": 15,
+    "caller_carefree": 12,
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
@@ -1157,7 +1158,7 @@ def validate_settings(data: Any) -> dict[str, Any]:
         **{f"caller_{k}": max(0, min(100, int(
             raw_dj.get(f"caller_{k}", DEFAULT_DJ[f"caller_{k}"]) or 0)))
            for k in ("prize", "mad", "agree", "disagree", "offwall",
-                     "plain")},
+                     "plain", "carefree")},
         "caller_success_rate": max(0, min(100, int(
             raw_dj.get("caller_success_rate",
                        DEFAULT_DJ["caller_success_rate"]) or 0))),
@@ -9789,7 +9790,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("caller_agree", "Deck · fervent agreement", "range", 0, 100, 1),
                    ("caller_disagree", "Deck · argue everything", "range", 0, 100, 1),
                    ("caller_offwall", "Deck · out of this world", "range", 0, 100, 1),
-                   ("caller_plain", "Deck · ordinary folk", "range", 0, 100, 1)],
+                   ("caller_plain", "Deck · ordinary folk", "range", 0, 100, 1),
+                   ("caller_carefree", "Deck · could not care less", "range", 0, 100, 1)],
         "manager": [("upstairs_per_hour", "Manager interruptions per hour", "range", 0, 12, 0.5),
                     ("manager_name", "Manager name", "text", 0, 0, 0)],
         "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 20, 1),
@@ -20852,6 +20854,19 @@ CALLER_BEHAVIORS = {
         "off-the-wall claim or confession delivered as if it were the "
         "most normal thing anyone ever said; the pair have to decide "
         "live whether to believe it."),
+    # #819: the card the operator asked for — a caller who simply does
+    # not care. They rang for their own reasons and the show is
+    # incidental: half-distracted, wrong-number energy, mid-task, a TV
+    # on in the background. The pair have to EARN their attention or
+    # let the call be gloriously nothing.
+    "carefree": (
+        " THIS CALLER DOES NOT PARTICULARLY CARE ABOUT THE SHOW: they "
+        "called for their own reasons — to settle a bet, because the "
+        "phone was in their hand, because someone told them to — and "
+        "they are half-distracted throughout (a TV on, a task "
+        "mid-hand). They answer briefly, drift, mishear, and are not "
+        "impressed by the hosts. The pair either win their attention "
+        "or let it be a strange, flat, wonderful nothing of a call."),
     "plain": "",
 }
 
@@ -20880,7 +20895,7 @@ def caller_behavior_draw() -> tuple[str, str]:
     dj = dj_settings()
     deck = [(key, max(0, int(dj.get(f"caller_{key}", 15) or 0)))
             for key in ("prize", "mad", "agree", "disagree", "offwall",
-                        "plain")]
+                        "plain", "carefree")]
     total = sum(w for _, w in deck)
     if total <= 0:
         return "plain", ""
@@ -28212,7 +28227,23 @@ async def api_put_settings(
                 payload.setdefault("voice_out", {})["media_player"] = (
                     stored.get("media_player") or backup["player"]
                 )
+        # #820: a CAST CHANGE takes the air NOW. The old flow saved the new
+        # voice and let the previous cast's pre-rendered backlog play out —
+        # minutes of the wrong host. Detect the change here, cut the
+        # current round at the next turn boundary (a live CALL still
+        # finishes — #805), and the hold shelf's cast-signature recast
+        # re-voices anything banked. The next line out is the new host.
+        _old_dj = load_settings().get("dj") or {}
         settings = save_settings(payload)
+        _new_dj = settings.get("dj") or {}
+        _cast_keys = ("voice", "cohost_voice", "third_voice", "drop_voice")
+        if any(str(_old_dj.get(k) or "") != str(_new_dj.get(k) or "")
+               for k in _cast_keys):
+            _TALK_CUT[0] += 1
+            note_action("🎙 cast change — cutting to the new voices now")
+            pipeline_log("voice", "cast changed in settings — current round "
+                         "cut at the turn boundary; banked clips recast "
+                         "through the hold shelf (#820)")
         voice = settings.get("voice_out") or {}
         if voice.get("ha_token"):
             _ha_token_persist(voice["ha_token"], voice.get("media_player", ""))
