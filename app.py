@@ -20134,6 +20134,37 @@ DROP_LINES = (
 )
 
 
+_SFX_POOL_CACHE: list[Path] = []
+_SFX_POOL_AT = [0.0]
+_SFX_POOL_FILLING = [False]
+
+
+async def _sfx_pool_refresh() -> None:
+    """#826: the pool scan walks a CIFS share of thousands of files and
+    probes uncached durations — done SYNCHRONOUSLY inside sting_due it
+    stalled the whole event loop on every other line (healthz itself
+    was timing out). The walk lives in a worker thread now; picks read
+    the cache."""
+    if _SFX_POOL_FILLING[0]:
+        return
+    _SFX_POOL_FILLING[0] = True
+    try:
+        def scan() -> list[Path]:
+            return [p for p in sfx_all() if sfx_short(p)]
+        pool = await asyncio.to_thread(scan)
+        _SFX_POOL_CACHE[:] = pool
+        _SFX_POOL_AT[0] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _SFX_POOL_FILLING[0] = False
+
+
+@app.on_event("startup")
+async def _startup_sfx_pool() -> None:
+    fire_and_forget(_sfx_pool_refresh())
+
+
 def sting_due() -> Path | None:
     """Whether to drop one now, and which. Spontaneous means unpredictable,
     not constant: a roll of the dice, and never twice inside the gap."""
@@ -20152,8 +20183,12 @@ def sting_due() -> Path | None:
     if random.random() >= dj["sfx_rate"]:
         return None
     banned = sfx_bans()
-    pool = [p for p in sfx_all()
-            if sfx_short(p) and sfx_id(p) not in banned]
+    # #826: never walk the share here — the cache refreshes off-loop
+    # once a minute, and a newly dropped file is in the draw on the
+    # next refresh rather than at the price of a frozen event loop.
+    if time.time() - _SFX_POOL_AT[0] > 60:
+        fire_and_forget(_sfx_pool_refresh())
+    pool = [p for p in _SFX_POOL_CACHE if sfx_id(p) not in banned]
     if not pool:
         return None
     # Your dial on each one (#645): a sample marked down comes up rarely, one
