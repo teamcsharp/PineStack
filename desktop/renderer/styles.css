@@ -326,6 +326,44 @@ body { padding-bottom: 28px; }
   background: #4b1d5e; animation: sbPulse 1.8s ease-in-out infinite;
 }
 
+/* #836: the crystal cabinet — the 🔮 opens a draggable, resizable
+   popup for choosing and tuning what tints the universe. */
+#crystalPopup {
+  position: fixed; left: 50%; top: 16%; transform: translate(-50%, 0);
+  z-index: 97; width: min(560px, calc(100vw - 32px));
+  min-width: 340px; min-height: 140px; max-height: 80vh;
+  resize: both; overflow: auto;
+  background: var(--panel, #141b24); border: 1px solid #4b2a5e;
+  border-radius: 10px; padding: 12px;
+  box-shadow: 0 12px 48px rgba(20, 0, 40, .8);
+  display: flex; flex-direction: column; gap: 10px; font-size: 12.5px;
+}
+#crystalPopup .cp-head { display: flex; gap: 8px; align-items: baseline;
+  cursor: grab; user-select: none; }
+#crystalPopup .cp-head .cp-x { margin-left: auto; }
+#crystalPopup .cp-card { border: 1px solid var(--border, #2a3644);
+  border-radius: 8px; padding: 8px 10px; display: flex;
+  flex-direction: column; gap: 6px; }
+#crystalPopup .cp-card.on { border-color: #c98fe0;
+  background: rgba(75, 29, 94, .25); }
+#crystalPopup .cp-row { display: flex; gap: 8px; align-items: center; }
+#crystalPopup .cp-row input[type=range] { flex: 1; }
+#crystalPopup .cp-spacer { flex: 1; }
+#crystalPopup .cp-name { color: #f2dcff; }
+#crystalPopup .cp-pct { font: 11.5px ui-monospace, Consolas, monospace;
+  color: #c98fe0; min-width: 4ch; text-align: right; }
+#crystalPopup .cp-on { min-width: 64px; }
+#crystalPopup .cp-card.on .cp-on { border-color: #c98fe0; color: #f2dcff;
+  background: #4b1d5e; }
+#crystalPopup .cp-minds { display: flex; flex-wrap: wrap; gap: 4px 6px; }
+#crystalPopup .cp-mind { display: inline-flex; gap: 4px;
+  align-items: center; border: 1px solid var(--border, #2a3644);
+  border-radius: 20px; padding: 2px 8px; cursor: pointer; color: #8ba0b5; }
+#crystalPopup .cp-mind.in { border-color: #c98fe0; color: #f2dcff; }
+#crystalPopup .cp-mind i { font-style: normal; color: #5d6d7e;
+  font: 10.5px ui-monospace, Consolas, monospace; }
+#crystalPopup .cp-tint { width: 100%; }
+
 /* #808: the sample button matches the bar it lives in — it was the
    one unstyled control and rendered at default size, towering out
    of the 26px status bar. */

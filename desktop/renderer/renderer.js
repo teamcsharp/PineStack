@@ -1988,47 +1988,209 @@ function initSamplePopup() {
 }
 initSamplePopup();
 
-/* #831: the crystal switch — one click lets the crystal take the
- * universe; one click lifts it. Lit while any crystal is ON. */
+/* #836: the crystal CABINET — the 🔮 opens a draggable, resizable
+ * popup: pick which crystal rides the airwaves, set how hard it
+ * presses (strength), choose which album-minds it draws from, retint
+ * its flavor line, or shatter it. The button stays lit while any
+ * crystal is tinting the universe. */
 function initCrystalBtn() {
   const btn = $("crystalBtn");
-  if (!btn) return;
-  let known = [];
-  async function paint() {
+  const pop = $("crystalPopup");
+  if (!btn || !pop) return;
+  let cache = { crystals: [], extractions: {} };
+  let mindsAll = [];
+
+  async function pull() {
     try {
       const d = await api.get("/api/crystals");
-      known = d.crystals || [];
-      const on = known.filter((c) => c.on);
-      btn.classList.toggle("on", on.length > 0);
-      btn.title = on.length
-        ? "The universe is tinted: " + on.map((c) => c.name).join(", ")
-          + " — click to lift it"
-        : (known.length
-           ? "Click to let " + known[known.length - 1].name
-             + " tint the universe of Pine Box FM"
-           : "No crystals forged yet — extract one from an artist first");
+      cache = { crystals: d.crystals || [],
+                extractions: d.extractions || {} };
+      const m = await api.get("/api/speakbox/minds");
+      mindsAll = (m.minds || []).filter((x) => x.id !== "main");
     } catch { /* agent quiet */ }
   }
-  btn.addEventListener("click", async () => {
-    if (!known.length) return;
-    const anyOn = known.some((c) => c.on);
-    btn.textContent = "…";
+
+  function paintBtn() {
+    const on = cache.crystals.filter((c) => c.on);
+    btn.classList.toggle("on", on.length > 0);
+    btn.title = on.length
+      ? "The universe is tinted: " + on.map((c) => c.name).join(", ")
+        + " — click to open the crystal cabinet"
+      : "Crystals — open the cabinet, choose what tints the universe";
+  }
+
+  function esc(s) {
+    return String(s || "").replace(/[&<>"']/g, (ch) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;",
+      '"': "&quot;", "'": "&#39;",
+    }[ch]));
+  }
+
+  function chunkSum(c) {
+    return Object.values(c.chunks || {})
+      .reduce((acc, v) => acc + (v | 0), 0);
+  }
+
+  async function save(cid, body) {
     try {
-      for (const c of known) {
-        if (anyOn && c.on) {
-          await api.post("/api/crystals/" + c.id + "/toggle", {on: false});
-        }
+      await api.post("/api/crystals", Object.assign({ id: cid }, body));
+    } catch (err) { console.warn("crystal save", err); }
+    await pull(); paintBtn(); draw();
+  }
+
+  function dragBy(handle) {
+    handle.addEventListener("mousedown", (ev) => {
+      if (ev.target.closest("button,input")) return;
+      const r = pop.getBoundingClientRect();
+      const dx = ev.clientX - r.left, dy = ev.clientY - r.top;
+      pop.style.transform = "none";
+      function move(e) {
+        pop.style.left = Math.max(0, e.clientX - dx) + "px";
+        pop.style.top = Math.max(0, e.clientY - dy) + "px";
       }
-      if (!anyOn) {
-        const pick = known[known.length - 1];
-        await api.post("/api/crystals/" + pick.id + "/toggle", {on: true});
+      function up() {
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
       }
-    } catch (err) { btn.title = err.message; }
-    btn.textContent = "\ud83d\udd2e";
-    paint();
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    });
+  }
+
+  function draw() {
+    pop.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "cp-head";
+    head.innerHTML = "<b>🔮 The crystal cabinet</b>"
+      + "<span class='muted'>drag me · corner resizes</span>"
+      + "<button class='cp-x'>✕</button>";
+    pop.appendChild(head);
+    dragBy(head);
+    head.querySelector(".cp-x").onclick = () => {
+      pop.style.display = "none";
+    };
+
+    if (!cache.crystals.length) {
+      const empty = document.createElement("div");
+      empty.className = "muted";
+      empty.textContent = "No crystals forged yet — extract one from an "
+        + "artist's lyrics first.";
+      pop.appendChild(empty);
+    }
+
+    for (const c of cache.crystals) {
+      const card = document.createElement("div");
+      card.className = "cp-card" + (c.on ? " on" : "");
+
+      const r1 = document.createElement("div");
+      r1.className = "cp-row";
+      r1.innerHTML = "<b class='cp-name'>" + esc(c.name) + "</b>"
+        + "<span class='muted'>" + chunkSum(c).toLocaleString()
+        + " chunks</span><span class='cp-spacer'></span>"
+        + "<button class='cp-on'>" + (c.on ? "ON AIR" : "off")
+        + "</button><button class='cp-del' title='shatter this crystal "
+        + "(the minds survive)'>💥</button>";
+      r1.querySelector(".cp-on").onclick = async () => {
+        try {
+          await api.post("/api/crystals/" + c.id + "/toggle",
+                         { on: !c.on });
+        } catch { /* quiet */ }
+        await pull(); paintBtn(); draw();
+      };
+      r1.querySelector(".cp-del").onclick = async () => {
+        if (!confirm("Shatter \u201c" + c.name
+                     + "\u201d? Its album-minds survive.")) return;
+        try { await api.del("/api/crystals/" + c.id); } catch { }
+        await pull(); paintBtn(); draw();
+      };
+      card.appendChild(r1);
+
+      const r2 = document.createElement("div");
+      r2.className = "cp-row";
+      r2.innerHTML = "<label title='how hard the crystal presses on the "
+        + "universe: the share of banter swaths and prompt flavor drawn "
+        + "from its minds'>strength</label>"
+        + "<input type='range' min='5' max='100' step='5' value='"
+        + (c.strength || 50) + "'>"
+        + "<span class='cp-pct'>" + (c.strength || 50) + "%</span>";
+      const slider = r2.querySelector("input");
+      slider.oninput = () => {
+        r2.querySelector(".cp-pct").textContent = slider.value + "%";
+      };
+      slider.onchange = () =>
+        save(c.id, { strength: parseInt(slider.value, 10) });
+      card.appendChild(r2);
+
+      const r3 = document.createElement("div");
+      r3.className = "cp-minds";
+      const have = new Set(c.minds || []);
+      const rows = mindsAll.length ? mindsAll
+        : (c.minds || []).map((id) => ({
+            id, name: id, chunks: (c.chunks || {})[id] }));
+      for (const m of rows) {
+        const lab = document.createElement("label");
+        lab.className = "cp-mind" + (have.has(m.id) ? " in" : "");
+        lab.title = m.blurb || m.id;
+        lab.innerHTML = "<input type='checkbox'"
+          + (have.has(m.id) ? " checked" : "") + "><span>"
+          + esc(m.name || m.id) + "</span><i>"
+          + (m.chunks | 0).toLocaleString() + "</i>";
+        lab.querySelector("input").onchange = (ev) => {
+          const next = new Set(have);
+          if (ev.target.checked) next.add(m.id);
+          else next.delete(m.id);
+          save(c.id, { minds: Array.from(next) });
+        };
+        r3.appendChild(lab);
+      }
+      card.appendChild(r3);
+
+      const r4 = document.createElement("div");
+      r4.className = "cp-row";
+      const tint = document.createElement("input");
+      tint.type = "text";
+      tint.className = "cp-tint";
+      tint.placeholder = "tint — a line of flavor whispered into the "
+        + "studio (optional)";
+      tint.value = c.tint || "";
+      tint.onchange = () => save(c.id, { tint: tint.value.slice(0, 500) });
+      r4.appendChild(tint);
+      card.appendChild(r4);
+      pop.appendChild(card);
+    }
+
+    const jobs = Object.values(cache.extractions || {})
+      .filter((j) => j.stage && j.stage !== "done");
+    if (jobs.length) {
+      const jd = document.createElement("div");
+      jd.className = "muted";
+      jd.textContent = "\u26cf forging: " + jobs.map((j) =>
+        j.artist + " " + Math.round((j.progress || 0) * 100) + "%")
+        .join(" \u00b7 ");
+      pop.appendChild(jd);
+    }
+  }
+
+  btn.addEventListener("click", async () => {
+    const open = pop.style.display !== "none";
+    if (open) { pop.style.display = "none"; return; }
+    pop.style.display = "flex";
+    await pull(); paintBtn(); draw();
   });
-  paint();
-  setInterval(paint, 30000);
+  document.addEventListener("click", (ev) => {
+    if (pop.style.display !== "none" && !pop.contains(ev.target)
+        && ev.target !== btn && !btn.contains(ev.target)) {
+      pop.style.display = "none";
+    }
+  });
+  pull().then(paintBtn);
+  setInterval(async () => {
+    await pull(); paintBtn();
+    // never repaint under the user's cursor mid-edit
+    if (pop.style.display !== "none"
+        && !(pop.contains(document.activeElement)
+             && document.activeElement.tagName === "INPUT")) draw();
+  }, 30000);
 }
 initCrystalBtn();
 

@@ -546,6 +546,8 @@ DEFAULT_DJ = {
     "caller_prize": 15, "caller_mad": 15, "caller_agree": 15,
     "caller_disagree": 20, "caller_offwall": 15, "caller_plain": 15,
     "caller_carefree": 12,
+    # #835: how often the SFX Guy pipes up, per host statement (0-100).
+    "sfxguy_rate": 40,
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
@@ -1155,6 +1157,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("callin_per_hour",
                        DEFAULT_DJ["callin_per_hour"]) or 0))),
         # #798: the behaviour deck weights ride the same clamp.
+        "sfxguy_rate": max(0, min(100, int(
+            raw_dj.get("sfxguy_rate",
+                       DEFAULT_DJ["sfxguy_rate"]) or 0))),
         **{f"caller_{k}": max(0, min(100, int(
             raw_dj.get(f"caller_{k}", DEFAULT_DJ[f"caller_{k}"]) or 0)))
            for k in ("prize", "mad", "agree", "disagree", "offwall",
@@ -9899,7 +9904,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
         "cohost": [("personality", "Personality influence", "range", 0, 100, 1),
                    ("accent_pin", "Accent influence", "range", 0, 100, 1),
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
-        "third": [("third_name", "Third-seat name", "text", 0, 0, 0)],
+        "third": [("third_name", "Third-seat name", "text", 0, 0, 0),
+                  ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
                    ("caller_success_rate", "Successful calls", "range", 0, 100, 1),
                    ("caller_insanity", "Caller intensity", "range", 0, 100, 1),
@@ -18062,6 +18068,129 @@ async def session_voices() -> dict[str, str]:
     return voices
 
 
+# --- The SFX Guy's mouth (#835) ---------------------------------------------
+# A database of backcountry interjections said WHOLE CLOTH between
+# statements — expandable from the API, drawn unrepeated, rendered in the
+# drop seat's voice (the #821 replay cache makes every repeat free). He is
+# a faded-NASCAR-shirt, penny-loafer, dusty-jeans country boy: Dale
+# Earnhardt devotion, left turns, and a one-upper streak a mile wide.
+SFXGUY_QUIPS_DIR = data_path("sfxguy_quips")
+SFXGUY_SEED_QUIPS = [
+    "That boy ain't right.",
+    "What in tarnation…",
+    "Hotter'n hell in here.",
+    "That's why they call it fishin' and not catchin'.",
+    "Lord have mercy.",
+    "Well butter my butt and call me a biscuit.",
+    "That dog won't hunt.",
+    "Slicker'n a greased pig.",
+    "I've seen better moves at a demolition derby.",
+    "Dale woulda taken that turn flat out.",
+    "Number three, forever, amen.",
+    "Left turns is all a man really needs.",
+    "You can't polish a possum.",
+    "Madder'n a wet hen.",
+    "That's finer'n frog hair split four ways.",
+    "Somebody call the fire department, 'cause that take was smokin'.",
+    "I had one of them once. Traded it for a carburetor.",
+    "Twenty-five years ago I did that exact thing in a lunar lander for NASA.",
+    "Done that twice before breakfast. Backwards.",
+    "My cousin Earl seen one of them. Ain't been right since.",
+    "Y'all ever eaten duck l'orange? … Well DUCK DOWN AND GET YA SOME.",
+    "Shoot, I won a bet like that at Talladega in '98.",
+    "That's about as useful as a screen door on a submarine.",
+    "Hold my sweet tea.",
+    "He's all hat and no cattle.",
+    "Couldn't hit water if he fell out the boat.",
+    "I've been struck by lightning twice and it improved my hearing.",
+    "Faster'n a scalded cat.",
+    "If it ain't got a V8 in it, I ain't interested.",
+    "This one's for Dale.",
+]
+
+
+def _sfxguy_voice(voice: str = "") -> str:
+    """The database KEY: every assigned voice keeps its own quip shelf,
+    so swapping the SFX guy's voice swaps his whole vocabulary — and
+    each shelf can be sharpened separately over time."""
+    v = re.sub(r"[^A-Za-z0-9_-]", "", str(voice or "").strip())
+    if not v:
+        v = re.sub(r"[^A-Za-z0-9_-]", "",
+                   str(dj_settings().get("drop_voice") or ""))
+    return (v or "default")[:40]
+
+
+def sfxguy_quips(voice: str = "") -> list[str]:
+    v = _sfxguy_voice(voice)
+    for path in (SFXGUY_QUIPS_DIR / f"{v}.json",
+                 SFXGUY_QUIPS_DIR.with_suffix(".json")):  # pre-#835b file
+        try:
+            rows = json.loads(path.read_text())
+            if isinstance(rows, list) and rows:
+                return [str(r)[:200] for r in rows]
+        except Exception:
+            pass
+    return list(SFXGUY_SEED_QUIPS)
+
+
+def sfxguy_quips_save(rows: list[str], voice: str = "") -> None:
+    v = _sfxguy_voice(voice)
+    SFXGUY_QUIPS_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SFXGUY_QUIPS_DIR / f"{v}.json.tmp"
+    tmp.write_text(json.dumps(rows[:500], indent=1))
+    tmp.replace(SFXGUY_QUIPS_DIR / f"{v}.json")
+
+
+@app.get("/api/sfxguy/quips")
+async def sfxguy_quips_get(
+    voice: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """?voice=vl_… reads that voice's shelf; default is the current
+    drop voice. `databases` lists every shelf saved so far."""
+    require_read_auth(authorization)
+    v = _sfxguy_voice(voice)
+    dbs = (sorted(f.stem for f in SFXGUY_QUIPS_DIR.glob("*.json"))
+           if SFXGUY_QUIPS_DIR.exists() else [])
+    return {"voice": v, "quips": sfxguy_quips(v), "databases": dbs}
+
+
+@app.post("/api/sfxguy/quips")
+async def sfxguy_quips_add(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Grow a shelf: {"text": "..."} or {"texts": [...]}, optional
+    "voice" (default: the current drop voice's own database)."""
+    require_auth(authorization)
+    payload = await request.json()
+    v = _sfxguy_voice(str(payload.get("voice") or ""))
+    adds = [str(t).strip()[:200] for t in
+            (payload.get("texts") or [payload.get("text") or ""]) if
+            str(t).strip()]
+    if not adds:
+        raise HTTPException(status_code=400, detail="say something")
+    rows = sfxguy_quips(v)
+    rows.extend(a for a in adds if a not in rows)
+    sfxguy_quips_save(rows, v)
+    note_action(f"🤠 the SFX guy ({v}) learned {len(adds)} new line(s)")
+    return {"voice": v, "quips": rows}
+
+
+@app.delete("/api/sfxguy/quips")
+async def sfxguy_quips_del(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    v = _sfxguy_voice(str(payload.get("voice") or ""))
+    kill = str(payload.get("text") or "").strip()
+    rows = [r for r in sfxguy_quips(v) if r != kill]
+    sfxguy_quips_save(rows, v)
+    return {"voice": v, "quips": rows}
+
+
 # --- Stingers (#208) --------------------------------------------------------
 # A sample off the end of a line: a record scratch, a laser, a drop. The
 # folders are yours — anything under the sample share — and the pack this was
@@ -24583,6 +24712,31 @@ async def speak_turns(turns: list[tuple[str, str]],
                         _STING_AT[0] = time.time()
                         pipeline_log("air", f"sting: {_sting.stem} "
                                      "dropped between lines (#833)")
+                    # #835: the SFX Guy's MOUTH — at the slider's rate a
+                    # backcountry quip lands whole cloth between
+                    # statements, in his own voice (the replay cache
+                    # makes every repeat free). Never during a call's
+                    # caller turn — he heckles the hosts, not the guests.
+                    _gq_rate = int(dj_settings().get("sfxguy_rate") or 0)
+                    if (_gq_rate and dj_settings().get("drop_voice")
+                            and item["who"] in ("dj", "cohost", "third")
+                            and random.random() < _gq_rate / 100.0):
+                        _gv = str(dj_settings()["drop_voice"])
+                        _quip = unrepeated(sfxguy_quips(_gv),
+                                           f"sfxguy-quip-{_gv}")
+                        try:
+                            _qc = await voice_render_any(
+                                _quip, _gv, who="drop")
+                        except Exception:  # noqa: BLE001
+                            _qc = None
+                        if _qc and _qc.get("path"):
+                            _qk = _qc["path"].rsplit("/", 1)[-1]
+                            seg.append(str(VOICE_MEDIA_DIR / _qk))
+                            transcript.append(
+                                ("drop", _quip,
+                                 _clip_seconds(_qc["path"])))
+                            pipeline_log("air", "the SFX guy pipes up: "
+                                         f"{_quip[:60]} (#835)")
                     # #748: how long THIS turn runs, so the booth can follow the
                     # coalesced clip turn by turn instead of knowing only that
                     # "a round" is playing.
@@ -25493,11 +25647,28 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # guy, who never talks, gives his verdict from the corner booth right
     # after the round.
     seek_verdict = (not caller_name and bool(dj["drop_voice"])
-                    and random.random() < 0.2)
+                    and random.random() < 0.35)
+    if dj["drop_voice"]:
+        # #835: the SFX Guy is a CHARACTER the room lives with — faded
+        # NASCAR t-shirt, beat-up penny loafers, dusty blue jeans, thick
+        # country accent, a deep love of NASCAR, left turns and Dale
+        # Earnhardt. He interjects backcountry one-liners from his booth
+        # between your statements (you hear them; the audience hears
+        # them), and he is a ONE-UPPER: anything anybody did, he did it
+        # better, bigger, or twenty-five years earlier for NASA. React
+        # to his heckles now and then — laugh, groan, wave him off —
+        # and occasionally set him up on purpose the way a straight man
+        # feeds a punchline.
+        angle += (" The SFX guy in the corner booth is a faded-NASCAR-"
+                  "shirt country boy who heckles between your lines and "
+                  "one-ups every story anybody tells. Now and then REACT "
+                  "to something he just hollered — laugh, groan, tell "
+                  "him nobody flew a lunar lander in 1999 — without "
+                  "writing his lines for him.")
     if seek_verdict:
         angle += (" At some point one of you turns to the SFX guy in his "
                   "booth and appeals for backup OUT LOUD — 'back me up "
-                  "here' — even though he almost never speaks. Do not "
+                  "here' — even though he mostly talks in heckles. Do not "
                   "write his reply; he answers for himself.")
     # #626: buried in passing — a reference to how hot the machine is running
     # tonight, drawn from the evolving database keyed to the ACTUAL heat band

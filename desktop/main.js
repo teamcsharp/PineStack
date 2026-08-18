@@ -577,6 +577,10 @@ ipcMain.handle("agent:put", (_event, route, body) => fetchJson(`${readConfig().b
   method: "PUT",
   body: JSON.stringify(body || {})
 }));
+ipcMain.handle("agent:del", (_event, route, body) => fetchJson(`${readConfig().baseUrl}${route}`, {
+  method: "DELETE",
+  body: JSON.stringify(body || {})
+}));
 ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
 
 // #809: F5 pressed while focus is INSIDE a panel webview never

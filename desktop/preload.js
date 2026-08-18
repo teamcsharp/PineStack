@@ -14,5 +14,6 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   get: (route) => ipcRenderer.invoke("agent:get", route),
   post: (route, body) => ipcRenderer.invoke("agent:post", route, body),
   put: (route, body) => ipcRenderer.invoke("agent:put", route, body),
+  del: (route, body) => ipcRenderer.invoke("agent:del", route, body),
   openExternal: (url) => ipcRenderer.invoke("open:external", url)
 });
