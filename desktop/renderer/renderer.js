@@ -1519,7 +1519,7 @@ function initStatusBar() {
     // #826: while the reader is scrolled up, the popup is FROZEN — no
     // redraw, no motion of any kind. New entries wait in the ring and a
     // pill counts them; scrolling back to the bottom resumes the flow.
-    if (open && stickBottom) {
+    if (open && stickBottom && !reading) {
       frozenAt = ring.length;
       drawPop();
     } else if (open) {
@@ -1556,7 +1556,7 @@ function initStatusBar() {
   const otherTags = new Set(JSON.parse(
     localStorage.getItem("sbOtherTags") || "[]"));
   const sig = (e) => (e.kind || "") + "|" + (e.text || "").slice(0, 80);
-  let scroller = null, stickBottom = true, frozenAt = 0;
+  let scroller = null, stickBottom = true, frozenAt = 0, reading = false;
 
   function drawPop() {
     const openedKeys = new Set(Array.from(
@@ -1767,6 +1767,14 @@ function initStatusBar() {
   pop._grip = grip;
   pop.appendChild(grip);
 
+  // #791: the pointer over the popup means the operator is READING —
+  // nothing may move, even at the tail. New entries wait in the ring
+  // (the pill counts them); leaving the popup lets the flow resume.
+  pop.addEventListener("mouseenter", () => { reading = true; });
+  pop.addEventListener("mouseleave", () => {
+    reading = false;
+    if (open && stickBottom) { frozenAt = ring.length; drawPop(); }
+  });
   line.addEventListener("click", () => {
     open = pop.style.display === "none";
     pop.style.display = open ? "flex" : "none";
@@ -1991,14 +1999,125 @@ initSamplePopup();
 /* #836: the crystal CABINET — the 🔮 opens a draggable, resizable
  * popup: pick which crystal rides the airwaves, set how hard it
  * presses (strength), choose which album-minds it draws from, retint
- * its flavor line, or shatter it. The button stays lit while any
- * crystal is tinting the universe. */
+ * its flavor line, or shatter it. #794: 📜 opens a chunk reader.
+ * #797: the reader lists every SOURCE, each expandable to its captured
+ * data, beside a rotating three.js tower of hexagons — one hex per
+ * chunk — that lights up wherever the data point you are exploring
+ * lives. #795: any document opens in full from the sources list. */
 function initCrystalBtn() {
   const btn = $("crystalBtn");
   const pop = $("crystalPopup");
   if (!btn || !pop) return;
   let cache = { crystals: [], extractions: {} };
   let mindsAll = [];
+  let mode = "cards";
+  let threeP = null;
+  let tower = null;
+
+  function loadThree() {
+    if (window.THREE) return Promise.resolve();
+    if (threeP) return threeP;
+    threeP = new Promise((res, rej) => {
+      const s = document.createElement("script");
+      s.src = ((config && config.baseUrl) || "http://127.0.0.1:8096")
+        + "/vendor/three.min.js";
+      s.onload = () => res();
+      s.onerror = () => { threeP = null; rej(new Error("no three.js")); };
+      document.head.appendChild(s);
+    });
+    return threeP;
+  }
+
+  function towerStop() {
+    if (!tower) return;
+    cancelAnimationFrame(tower.raf);
+    try { tower.renderer.dispose(); } catch { /* gone */ }
+    tower = null;
+  }
+
+  /* #797: the tower — chunks stacked as hexagons climbing a cylinder,
+   * turning slowly; big minds bucket several chunks per hex. */
+  async function towerStart(canvas, N) {
+    towerStop();
+    try { await loadThree(); } catch { return; }
+    const T = window.THREE;
+    const PER = 14, CAP = 4200, R = 26, CH = 3.2;
+    const scale = Math.max(1, Math.ceil((N || 1) / CAP));
+    const cells = Math.max(1, Math.ceil((N || 1) / scale));
+    const rings = Math.ceil(cells / PER);
+    const w = 190, h = Math.max(300, canvas.parentElement
+      ? canvas.parentElement.clientHeight - 2 : 420);
+    const renderer = new T.WebGLRenderer(
+      { canvas, antialias: true, alpha: true });
+    renderer.setSize(w, h, false);
+    const scene = new T.Scene();
+    const camera = new T.PerspectiveCamera(50, w / h, 0.1, 6000);
+    scene.add(new T.AmbientLight(0xffffff, 0.55));
+    const sun = new T.DirectionalLight(0xc9a0ff, 1.1);
+    sun.position.set(60, 120, 80);
+    scene.add(sun);
+    const geo = new T.CylinderGeometry(2.6, 2.6, 2.2, 6);
+    const mat = new T.MeshStandardMaterial(
+      { metalness: 0.35, roughness: 0.45 });
+    const mesh = new T.InstancedMesh(geo, mat, cells);
+    const dummy = new T.Object3D();
+    const dim = new T.Color(0x4b2a6e);
+    for (let i = 0; i < cells; i++) {
+      const ring = Math.floor(i / PER);
+      const ang = (i % PER) / PER * Math.PI * 2
+        + (ring % 2 ? Math.PI / PER : 0);
+      dummy.position.set(Math.cos(ang) * R, ring * CH,
+        Math.sin(ang) * R);
+      dummy.rotation.y = -ang;
+      dummy.updateMatrix();
+      mesh.setMatrixAt(i, dummy.matrix);
+      mesh.setColorAt(i, dim);
+    }
+    if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true;
+    const group = new T.Group();
+    group.add(mesh);
+    scene.add(group);
+    const height = rings * CH;
+    tower = { renderer, scene, camera, mesh, group, raf: 0, scale,
+              cells, PER, CH, height, camY: height * 0.35,
+              targetY: height * 0.35 };
+    camera.position.set(0, height * 0.35, R * 3.4);
+    (function spin() {
+      if (!tower) return;
+      tower.raf = requestAnimationFrame(spin);
+      group.rotation.y += 0.004;
+      tower.camY += (tower.targetY - tower.camY) * 0.06;
+      camera.position.y = tower.camY + tower.height * 0.06;
+      camera.lookAt(0, tower.camY, 0);
+      renderer.render(scene, camera);
+    })();
+  }
+
+  /* Light the hexes of the data being explored; `focus` is the ONE
+   * point in hand — the camera rides up or down the tower to it. */
+  function towerPaint(indices, focus) {
+    if (!tower || !window.THREE) return;
+    const T = window.THREE;
+    const dim = new T.Color(0x4b2a6e);
+    const lit = new T.Color(0xc98fe0);
+    const hot = new T.Color(0xffffff);
+    for (let i = 0; i < tower.cells; i++) {
+      tower.mesh.setColorAt(i, dim);
+    }
+    (indices || []).forEach((gi) => {
+      tower.mesh.setColorAt(Math.min(tower.cells - 1,
+        Math.floor(gi / tower.scale)), lit);
+    });
+    if (focus != null) {
+      const c = Math.min(tower.cells - 1,
+        Math.floor(focus / tower.scale));
+      tower.mesh.setColorAt(c, hot);
+      tower.targetY = Math.floor(c / tower.PER) * tower.CH;
+    }
+    if (tower.mesh.instanceColor) {
+      tower.mesh.instanceColor.needsUpdate = true;
+    }
+  }
 
   async function pull() {
     try {
@@ -2040,7 +2159,7 @@ function initCrystalBtn() {
 
   function dragBy(handle) {
     handle.addEventListener("mousedown", (ev) => {
-      if (ev.target.closest("button,input")) return;
+      if (ev.target.closest("button,input,select")) return;
       const r = pop.getBoundingClientRect();
       const dx = ev.clientX - r.left, dy = ev.clientY - r.top;
       pop.style.transform = "none";
@@ -2057,7 +2176,174 @@ function initCrystalBtn() {
     });
   }
 
+  /* #794/#795/#797: the reader — sources first, each expandable into
+   * its chunks or the whole document, the tower riding alongside. */
+  function openMind(minds, title) {
+    minds = (minds || []).filter(Boolean);
+    if (!minds.length) return;
+    mode = "viewer";
+    let rid = minds[0];
+    pop.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "cp-head";
+    head.innerHTML = "<button class='cp-back'>‹ back</button><b>📜 "
+      + esc(title) + "</b><span class='muted cp-count'></span>"
+      + "<button class='cp-x'>✕</button>";
+    pop.appendChild(head);
+    dragBy(head);
+    head.querySelector(".cp-back").onclick = () => draw();
+    head.querySelector(".cp-x").onclick = () => {
+      pop.style.display = "none"; towerStop(); mode = "cards";
+    };
+    if (minds.length > 1) {
+      const sel = document.createElement("select");
+      minds.forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m;
+        const row = mindsAll.find((x) => x.id === m);
+        o.textContent = (row && row.name) || m;
+        sel.appendChild(o);
+      });
+      sel.onchange = () => { rid = sel.value; sources(); };
+      head.insertBefore(sel, head.querySelector(".cp-x"));
+    }
+    const body = document.createElement("div");
+    body.className = "cp-body";
+    const left = document.createElement("div");
+    left.className = "cp-left";
+    const canvas = document.createElement("canvas");
+    canvas.id = "cpTower";
+    canvas.title = "the mind as a tower — every hexagon is a data "
+      + "point; the white one is the point you are exploring";
+    body.appendChild(left);
+    body.appendChild(canvas);
+    pop.appendChild(body);
+
+    async function sources() {
+      left.innerHTML = "<span class='muted'>reading the sources…</span>";
+      try {
+        const d = await api.get("/api/speakbox/minds/"
+          + encodeURIComponent(rid) + "/sources");
+        head.querySelector(".cp-count").textContent =
+          (d.name || rid) + " · " + (d.all || 0).toLocaleString()
+          + " chunks";
+        towerStart(canvas, d.all || 0);
+        left.innerHTML = "";
+        if (!(d.sources || []).length) {
+          left.innerHTML = "<span class='muted'>this mind is empty — "
+            + "nothing has been embedded into it yet</span>";
+        }
+        (d.sources || []).forEach((s) => {
+          const row = document.createElement("div");
+          row.className = "cp-source";
+          row.innerHTML = "<span class='cp-src-name'>" + esc(s.file)
+            + "</span><i>" + s.chunks.toLocaleString() + "</i>"
+            + "<button class='cp-src-doc' title='open the whole "
+            + "document'>📄</button>"
+            + "<button class='cp-src-ch' title='scroll its captured "
+            + "chunks'>📜</button>";
+          const range = [];
+          for (let k = 0; k < Math.min(s.chunks, 600); k++) {
+            range.push(s.first + k);
+          }
+          row.addEventListener("mouseenter",
+            () => towerPaint(range, s.first));
+          row.querySelector(".cp-src-doc").onclick =
+            () => doc(s.file);
+          row.querySelector(".cp-src-ch").onclick =
+            () => chunks(s.file);
+          left.appendChild(row);
+        });
+      } catch (err) { left.textContent = err.message; }
+    }
+
+    async function chunks(file) {
+      let offset = 0, filter = "";
+      left.innerHTML = "";
+      const bar = document.createElement("div");
+      bar.className = "cp-row";
+      bar.innerHTML = "<button class='cp-up'>‹ sources</button>"
+        + "<input type='text' placeholder='filter…' style='flex:1'>";
+      bar.querySelector(".cp-up").onclick = () => sources();
+      const q = bar.querySelector("input");
+      q.onchange = () => { filter = q.value.trim(); offset = 0;
+        load(true); };
+      left.appendChild(bar);
+      const list = document.createElement("div");
+      list.className = "cp-chunks";
+      left.appendChild(list);
+      const more = document.createElement("button");
+      more.textContent = "more ↓";
+      more.style.display = "none";
+      more.onclick = () => { offset += 200; load(false); };
+      left.appendChild(more);
+      async function load(reset) {
+        if (reset) list.innerHTML = "<span class='muted'>reading…</span>";
+        more.disabled = true;
+        try {
+          const d = await api.get("/api/speakbox/minds/"
+            + encodeURIComponent(rid) + "/chunks?offset=" + offset
+            + "&limit=200&file=" + encodeURIComponent(file || "")
+            + (filter ? "&q=" + encodeURIComponent(filter) : ""));
+          if (reset) list.innerHTML = "";
+          const page = d.chunks || [];
+          page.forEach((c) => {
+            const row = document.createElement("div");
+            row.className = "cp-chunk";
+            row.innerHTML = "<span class='cp-file'>#" + c.i + " · "
+              + esc(c.file) + "</span>" + esc(c.text);
+            row.onclick = () => {
+              towerPaint(page.map((x) => x.i), c.i);
+              list.querySelectorAll(".cp-chunk.hot").forEach(
+                (r) => r.classList.remove("hot"));
+              row.classList.add("hot");
+            };
+            list.appendChild(row);
+          });
+          if (page.length && reset) {
+            towerPaint(page.map((x) => x.i), page[0].i);
+          }
+          if (!d.total) {
+            list.innerHTML =
+              "<span class='muted'>nothing captured here yet</span>";
+          }
+          more.style.display =
+            (offset + 200 < d.total) ? "inline-block" : "none";
+        } catch (err) { list.textContent = err.message; }
+        more.disabled = false;
+      }
+      load(true);
+    }
+
+    /* #795: the WHOLE document, wherever it lives. */
+    async function doc(file) {
+      left.innerHTML = "<span class='muted'>opening " + esc(file)
+        + "…</span>";
+      try {
+        const d = await api.get("/api/speakbox/"
+          + encodeURIComponent(file) + "?mind="
+          + encodeURIComponent(rid));
+        left.innerHTML = "";
+        const bar = document.createElement("div");
+        bar.className = "cp-row";
+        bar.innerHTML = "<button class='cp-up'>‹ sources</button>"
+          + "<b>📄 " + esc(file) + "</b><span class='muted'>"
+          + (d.mind ? "lives in " + esc(d.mind) : "") + "</span>";
+        bar.querySelector(".cp-up").onclick = () => sources();
+        left.appendChild(bar);
+        const txt = document.createElement("div");
+        txt.className = "cp-doc";
+        txt.textContent = d.text || "(empty)";
+        left.appendChild(txt);
+      } catch (err) { left.textContent = err.message; }
+    }
+
+    sources();
+  }
+
   function draw() {
+    mode = "cards";
+    towerStop();
     pop.innerHTML = "";
     const head = document.createElement("div");
     head.className = "cp-head";
@@ -2087,9 +2373,13 @@ function initCrystalBtn() {
       r1.innerHTML = "<b class='cp-name'>" + esc(c.name) + "</b>"
         + "<span class='muted'>" + chunkSum(c).toLocaleString()
         + " chunks</span><span class='cp-spacer'></span>"
+        + "<button class='cp-read' title='read this crystal — sources, "
+        + "chunks, and the tower'>📜</button>"
         + "<button class='cp-on'>" + (c.on ? "ON AIR" : "off")
         + "</button><button class='cp-del' title='shatter this crystal "
         + "(the minds survive)'>💥</button>";
+      r1.querySelector(".cp-read").onclick = () =>
+        openMind(c.minds || [], c.name);
       r1.querySelector(".cp-on").onclick = async () => {
         try {
           await api.post("/api/crystals/" + c.id + "/toggle",
@@ -2130,16 +2420,22 @@ function initCrystalBtn() {
       for (const m of rows) {
         const lab = document.createElement("label");
         lab.className = "cp-mind" + (have.has(m.id) ? " in" : "");
-        lab.title = m.blurb || m.id;
+        lab.title = (m.blurb || m.id) + " — click the count to read it";
         lab.innerHTML = "<input type='checkbox'"
           + (have.has(m.id) ? " checked" : "") + "><span>"
-          + esc(m.name || m.id) + "</span><i>"
-          + (m.chunks | 0).toLocaleString() + "</i>";
+          + esc(m.name || m.id) + "</span><i title='read these chunks'>"
+          + (m.chunks | 0).toLocaleString() + " 📜</i>";
         lab.querySelector("input").onchange = (ev) => {
           const next = new Set(have);
           if (ev.target.checked) next.add(m.id);
           else next.delete(m.id);
           save(c.id, { minds: Array.from(next) });
+        };
+        // #794: the count is a DOOR — it opens that mind's pages.
+        lab.querySelector("i").onclick = (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          openMind([m.id], m.name || m.id);
         };
         r3.appendChild(lab);
       }
@@ -2173,7 +2469,9 @@ function initCrystalBtn() {
 
   btn.addEventListener("click", async () => {
     const open = pop.style.display !== "none";
-    if (open) { pop.style.display = "none"; return; }
+    if (open) {
+      pop.style.display = "none"; towerStop(); mode = "cards"; return;
+    }
     pop.style.display = "flex";
     await pull(); paintBtn(); draw();
   });
@@ -2181,13 +2479,15 @@ function initCrystalBtn() {
     if (pop.style.display !== "none" && !pop.contains(ev.target)
         && ev.target !== btn && !btn.contains(ev.target)) {
       pop.style.display = "none";
+      towerStop();
+      mode = "cards";
     }
   });
   pull().then(paintBtn);
   setInterval(async () => {
     await pull(); paintBtn();
-    // never repaint under the user's cursor mid-edit
-    if (pop.style.display !== "none"
+    // never repaint the viewer, or under the user's cursor mid-edit
+    if (pop.style.display !== "none" && mode === "cards"
         && !(pop.contains(document.activeElement)
              && document.activeElement.tagName === "INPUT")) draw();
   }, 30000);

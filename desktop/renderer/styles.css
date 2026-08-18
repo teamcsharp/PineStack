@@ -363,6 +363,38 @@ body { padding-bottom: 28px; }
 #crystalPopup .cp-mind i { font-style: normal; color: #5d6d7e;
   font: 10.5px ui-monospace, Consolas, monospace; }
 #crystalPopup .cp-tint { width: 100%; }
+#crystalPopup .cp-chunks { overflow: auto; min-height: 120px; flex: 1;
+  border: 1px solid var(--border, #2a3644); border-radius: 8px;
+  padding: 6px 8px; display: flex; flex-direction: column; gap: 6px; }
+#crystalPopup .cp-chunk { border-bottom: 1px solid #1c2735;
+  padding-bottom: 5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#crystalPopup .cp-file { color: #5d7189; display: block;
+  font: 10.5px ui-monospace, Consolas, monospace; }
+#crystalPopup .cp-mind i { cursor: pointer; }
+#crystalPopup .cp-mind i:hover { color: #f2dcff; }
+#crystalPopup .cp-back { margin-right: 2px; }
+#crystalPopup .cp-body { display: flex; gap: 8px; flex: 1;
+  min-height: 320px; }
+#crystalPopup .cp-left { flex: 1; overflow: auto; display: flex;
+  flex-direction: column; gap: 6px; min-width: 0; }
+#cpTower { width: 190px; flex: none; border-radius: 8px;
+  border: 1px solid #4b2a5e;
+  background: radial-gradient(ellipse at 50% 20%, #1b1030, #05070f); }
+#crystalPopup .cp-source { display: flex; gap: 6px;
+  align-items: center; border: 1px solid var(--border, #2a3644);
+  border-radius: 7px; padding: 4px 8px; }
+#crystalPopup .cp-source:hover { border-color: #c98fe0; }
+#crystalPopup .cp-src-name { flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+#crystalPopup .cp-source i { font-style: normal; color: #5d6d7e;
+  font: 10.5px ui-monospace, Consolas, monospace; }
+#crystalPopup .cp-chunk.hot { border-left: 2px solid #f2dcff;
+  padding-left: 6px; background: rgba(75, 29, 94, .3); }
+#crystalPopup .cp-chunk { cursor: pointer; }
+#crystalPopup .cp-doc { overflow: auto; white-space: pre-wrap;
+  overflow-wrap: anywhere; border: 1px solid var(--border, #2a3644);
+  border-radius: 8px; padding: 8px 10px; flex: 1;
+  font-size: 12px; line-height: 1.55; }
 
 /* #808: the sample button matches the bar it lives in — it was the
    one unstyled control and rendered at default size, towering out

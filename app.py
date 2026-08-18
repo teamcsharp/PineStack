@@ -548,6 +548,8 @@ DEFAULT_DJ = {
     "caller_carefree": 12,
     # #835: how often the SFX Guy pipes up, per host statement (0-100).
     "sfxguy_rate": 40,
+    # #799: how often what he says is a freshly WARPED invention (0-100).
+    "sfxguy_warp": 35,
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
@@ -1160,6 +1162,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "sfxguy_rate": max(0, min(100, int(
             raw_dj.get("sfxguy_rate",
                        DEFAULT_DJ["sfxguy_rate"]) or 0))),
+        "sfxguy_warp": max(0, min(100, int(
+            raw_dj.get("sfxguy_warp",
+                       DEFAULT_DJ["sfxguy_warp"]) or 0))),
         **{f"caller_{k}": max(0, min(100, int(
             raw_dj.get(f"caller_{k}", DEFAULT_DJ[f"caller_{k}"]) or 0)))
            for k in ("prize", "mad", "agree", "disagree", "offwall",
@@ -9905,7 +9910,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("accent_pin", "Accent influence", "range", 0, 100, 1),
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
         "third": [("third_name", "Third-seat name", "text", 0, 0, 0),
-                  ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1)],
+                  ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1),
+                  ("sfxguy_warp", "SFX Guy invention", "range", 0, 100, 1)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
                    ("caller_success_rate", "Successful calls", "range", 0, 100, 1),
                    ("caller_insanity", "Caller intensity", "range", 0, 100, 1),
@@ -16790,6 +16796,54 @@ def banter_pictures(limit: int = 6) -> str:
     return "\n".join(lines[:limit])
 
 
+def looks_english(text: str) -> bool:
+    """#792: the station broadcasts in ENGLISH. A Portuguese lyric swath
+    rode a whole turn on air verbatim, so lines are checked: heavy
+    diacritics, foreign function words outweighing English ones, or a
+    long line with almost no English function words at all reads as
+    foreign. Short lines pass — interjections and names carry no signal
+    worth blocking on."""
+    t = str(text or "")
+    words = [w.lower() for w in re.findall(r"[A-Za-z\u00c0-\u00ff']+", t)]
+    if len(words) < 8:
+        return True
+    letters = [c for c in t if c.isalpha()]
+    if letters:
+        _dia = sum(c in "\u00e1\u00e0\u00e2\u00e3\u00e4\u00e5\u00e6"
+                        "\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed"
+                        "\u00ee\u00ef\u00f1\u00f2\u00f3\u00f4\u00f5"
+                        "\u00f6\u00f8\u00f9\u00fa\u00fb\u00fc\u00fd"
+                        "\u00ff\u00c1\u00c0\u00c2\u00c3\u00c4\u00c5"
+                        "\u00c6\u00c7\u00c8\u00c9\u00ca\u00cb\u00cc"
+                        "\u00cd\u00ce\u00cf\u00d1\u00d2\u00d3\u00d4"
+                        "\u00d5\u00d6\u00d8\u00d9\u00da\u00db\u00dc"
+                        "\u00dd\u00df" for c in letters)
+        if _dia / len(letters) > 0.04:
+            return False
+    _en = {"the", "a", "an", "and", "or", "but", "of", "to", "in", "on",
+           "at", "is", "are", "was", "were", "be", "been", "it", "that",
+           "this", "i", "you", "he", "she", "we", "they", "my", "your",
+           "his", "her", "our", "their", "not", "no", "do", "did", "does",
+           "have", "has", "had", "with", "for", "as", "so", "if", "what",
+           "who", "how", "why", "when", "where", "there", "here", "just",
+           "like", "up", "down", "out", "all", "one", "me", "him", "them",
+           "us", "its", "get", "got", "can", "will", "would", "about",
+           "into", "than", "then", "now", "some", "don't", "it's", "i'm",
+           "you're", "ain't", "gonna", "gotta", "y'all", "man", "know"}
+    _foreign = {"que", "n\u00e3o", "nao", "\u00e9", "eu", "voc\u00ea",
+                "voce", "c\u00eas", "el", "la", "los", "las", "les",
+                "une", "un", "una", "je", "tu", "il", "elle", "nous",
+                "vous", "der", "die", "das", "und", "nicht", "ist",
+                "ich", "du", "os", "\u00e0s", "de", "em", "com", "seu",
+                "sua", "meu", "minha", "por", "para", "pero", "m\u00e1s",
+                "mais", "est\u00e1", "esta", "yo", "mi", "t\u00fa"}
+    en = sum(1 for w in words if w in _en)
+    fr = sum(1 for w in words if w in _foreign)
+    if fr >= 3 and fr > en:
+        return False
+    return en / len(words) >= 0.05 or len(words) < 14
+
+
 def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
     """Draw from a pool without landing on what has just been used.
 
@@ -17574,6 +17628,34 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     again at a different point, so the material renews itself. `exclude`
     keeps a named document out of the draw — that is how the comeback comes
     from somewhere other than the drop (#233)."""
+    # #788: when the OPERATOR has set a theme, the theme's chosen report
+    # outranks everything else for its share of swaths — the clause
+    # (#775) tells the pair the subject, but the SEED material is what a
+    # small model actually follows, and it kept arriving from elsewhere.
+    if not rid and not only:
+        _thm = theme_owns_air()
+        if _thm:
+            _trows = themes_read()
+            _tdoc = str(_trows.get("doc") or "")
+            _tp = max(0, min(100, int(_trows.get("strength")
+                                      or 70))) / 100.0
+            _troll = random.random() < _tp
+            if _troll and not _tdoc:
+                # No report chosen: the shelf document most ABOUT the
+                # theme stands in, so the theme owns its material
+                # either way.
+                try:
+                    _hits = await speakbox_search(
+                        str(_thm.get("text") or _thm.get("name") or ""),
+                        k=1)
+                    _tdoc = str((_hits or [{}])[0].get("file") or "")
+                except Exception:  # noqa: BLE001
+                    _tdoc = ""
+            if _tdoc and _troll:
+                only = _tdoc
+                pipeline_log("speakbox", "the swath is tonight's SUBJECT "
+                             f"\u2014 {_thm.get('name')} via {_tdoc} "
+                             "(#788)")
     # #834: a crystal that is ON tints the SOURCE, not just the prompt —
     # at the dial's strength the swath is drawn from the crystal's own
     # minds, so DOOM (or whoever) enters the pair's mouths as material,
@@ -17649,14 +17731,16 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     exhausted: tuple[str, list[str]] | None = None
     for doc in order[:3]:               # a doc of pure headings is not fatal
         gems = speakbox_gems(doc, key)
-        fresh = [line for line in gems if line not in said]
+        fresh = [line for line in gems
+                     if line not in said and looks_english(line)]
         if not fresh:
             # Nothing left they have not used: read the document again at a
             # different point rather than repeat themselves.
             gems = await speakbox_harvest(doc, key) or gems
             if not gems:                # the model is down; the show is not
                 gems = speakbox_lines(speakbox_body(doc))
-            fresh = [line for line in gems if line not in said]
+            fresh = [line for line in gems
+                     if line not in said and looks_english(line)]
         if fresh:
             lines = speakbox_swath_lines(fresh, most=most, cap=cap)
             pipeline_log("speakbox",
@@ -18106,6 +18190,138 @@ SFXGUY_SEED_QUIPS = [
     "Faster'n a scalded cat.",
     "If it ain't got a V8 in it, I ain't interested.",
     "This one's for Dale.",
+    "Madder than a wet hen.",
+    "Meaner than a wet panther.",
+    "Busier than a one-legged man in a butt-kickin' contest.",
+    "Busier than a cat coverin' crap on a marble floor.",
+    "Busier than a long-tailed cat in a room full of rockin' chairs.",
+    "Busier than a moth in a mitten.",
+    "Happier than a tornado in a trailer park.",
+    "Slicker than snot on a doorknob.",
+    "Useless as a trap door on a canoe.",
+    "Useless as a screen door on a submarine.",
+    "So stuck up she'd drown in a rainstorm.",
+    "If you ain't cheatin', you ain't tryin'.",
+    "Didn't mean to turn him around — meant to rattle his cage, though.",
+    "The winner ain't the one with the fastest car, it's the one who "
+    "refuses to lose.",
+    "SLIDE JOB! SLIIIIDE JOB!",
+    "That's a pit-road penalty if I ever heard one.",
+    "Boy's runnin' on restrictor plates upstairs.",
+    "Rubbin' is racin', son.",
+    "He drew the caution flag on that one.",
+    "Checkered flag, baby. Checkered flag.",
+    "Three wide into turn one — hold my sweet tea.",
+    "That take needed a splash of fuel and two tires.",
+    "You're loose off the corner, buddy. Real loose.",
+    "Colder than a cast-iron commode in the Klondike.",
+    "Hotter than a two-dollar pistol.",
+    "Hotter than blue blazes.",
+    "Sweatin' like a sinner in church.",
+    "Nervous as a cat in a room full of rockin' chairs.",
+    "Grinnin' like a possum eatin' a sweet tater.",
+    "Happy as a dead pig in the sunshine.",
+    "Drunker than Cooter Brown.",
+    "Crooked as a dog's hind leg.",
+    "Skinny as a bean pole.",
+    "Tighter than bark on a tree.",
+    "Dumber than a box of rocks.",
+    "Sharp as a mashed potato, that one.",
+    "He ain't got the sense God gave a goose.",
+    "Couldn't pour water out of a boot with instructions on the heel.",
+    "Couldn't organize a two-car parade.",
+    "All vine and no taters.",
+    "Big hat, no cattle.",
+    "That's about as handy as a back pocket on a shirt.",
+    "Like puttin' lipstick on a pig.",
+    "Like tryin' to herd cats.",
+    "Like nailin' Jell-O to a tree.",
+    "Well I'll be a monkey's uncle.",
+    "Well slap my head and call me silly.",
+    "Heavens to Betsy.",
+    "Good gravy.",
+    "Dadgummit.",
+    "I do declare.",
+    "Bless your heart. And I don't mean that nice.",
+    "If that don't beat all.",
+    "That's a hoot and a half.",
+    "You can't make a silk purse out of a sow's ear.",
+    "Don't count your chickens before they hatch, and don't count "
+    "mine neither.",
+    "Even a blind hog finds an acorn now and then.",
+    "It's rainin' harder than a cow peein' on a flat rock.",
+    "Fine as frog hair and twice as smooth.",
+    "Rode hard and put up wet.",
+    "He's got a burr in his saddle.",
+    "Quit beatin' around the bush.",
+    "That dog'll hunt. That one right there'll hunt.",
+    "Katie bar the door.",
+    "Over yonder, past the second holler.",
+    "Y'all come back now.",
+    "Gooder'n grits.",
+    "Finer than a frog's hair split three ways and sanded.",
+    "I'm fuller than a tick on a hound dog.",
+    "It's so dry the trees are bribin' the dogs.",
+    "So windy it blew the feathers off the chickens.",
+    "Cold enough to freeze the balls off a pool table.",
+    "Scarcer than hen's teeth.",
+    "Handier than a pocket on a shirt.",
+    "He could talk the legs off a chair.",
+    "She could start an argument in an empty house.",
+    "Runs like a scalded dog.",
+    "Takes off like a cut cat.",
+    "Slow as molasses in January.",
+    "Slower than Christmas.",
+    "That boy's cornbread ain't done in the middle.",
+    "The porch light's on but ain't nobody home.",
+    "One fry short of a Happy Meal.",
+    "About a half bubble off plumb.",
+    "Lord willin' and the creek don't rise.",
+    "You can put your boots in the oven but that don't make 'em "
+    "biscuits.",
+    "Don't squat with your spurs on.",
+    "Never miss a good chance to shut up.",
+    "The biggest troublemaker you'll ever meet watches you shave.",
+    "Don't wrestle a pig. You both get dirty and the pig likes it.",
+    "Every trail's got some puddles.",
+    "A bumblebee is faster than a John Deere tractor.",
+    "Church ain't over till the fat lady sings, and she's still "
+    "warmin' up.",
+    "I been to two county fairs and a goat ropin' and I never "
+    "seen nothin' like that.",
+    "You look like ten miles of bad road.",
+    "He looks like death eatin' a cracker.",
+    "Ugly as homemade soap.",
+    "Ugly as a mud fence.",
+    "I wouldn't trust him any farther than I could throw a bull "
+    "by the tail.",
+    "That smells worse than a wet dog in a hot car.",
+    "Whatever cranks your tractor.",
+    "Whatever butters your biscuit.",
+    "Tell your mama an' them I said hey.",
+    "GET ER IN THERE! GET ER IN THERE NOW!",
+    "Woooo! Talk to me, goose.",
+    "That's what I'm TALKIN' about.",
+    "Somebody ring the dinner bell, 'cause that was SERVED.",
+    "Put that one on the fridge.",
+    "My PawPaw could do that with a mule and a rope.",
+    "I did that in '87. Twice. Uphill.",
+    "Shoot, I taught the man who taught him.",
+    "I got a trophy at home says otherwise.",
+    "Back in my day we called that Tuesday.",
+    "I once drove from Talladega to Darlington on fumes and a "
+    "prayer and a bag of pork rinds.",
+    "I seen Dale do that with his eyes closed and one hand on "
+    "the radio dial.",
+    "Y'all ever herd cattle in a hailstorm? Then hush.",
+    "That ain't nothin — I got struck by the same lightning "
+    "TWICE and it apologized.",
+    "Hold on now, hold on — somebody check that boy's "
+    "carburetor.",
+    "Run that back one more time for the folks in the cheap "
+    "seats.",
+    "Buddy, you couldn't hit sand fallin' off a camel.",
+    "That's why they call it fishin' and not catchin', son.",
 ]
 
 
@@ -18139,6 +18355,103 @@ def sfxguy_quips_save(rows: list[str], voice: str = "") -> None:
     tmp = SFXGUY_QUIPS_DIR / f"{v}.json.tmp"
     tmp.write_text(json.dumps(rows[:500], indent=1))
     tmp.replace(SFXGUY_QUIPS_DIR / f"{v}.json")
+
+
+SFXGUY_SAID_PATH = data_path("sfxguy_said.json")
+_SFXGUY_WARPED: list[str] = []
+_SFXGUY_FILLING = [False]
+
+
+def _sfxguy_key(line: str) -> str:
+    return hashlib.sha1(line.strip().lower().encode()).hexdigest()[:12]
+
+
+def _sfxguy_said() -> dict[str, float]:
+    try:
+        d = json.loads(SFXGUY_SAID_PATH.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _sfxguy_stamp(line: str) -> None:
+    """#798: every line carries a COOLDOWN — nothing repeats inside an
+    hour, and the ledger survives restarts."""
+    try:
+        now = time.time()
+        d = {k: v for k, v in _sfxguy_said().items()
+             if now - float(v or 0) < 86400}
+        d[_sfxguy_key(line)] = now
+        SFXGUY_SAID_PATH.write_text(json.dumps(d))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _sfxguy_warp_fill(voice: str) -> None:
+    """#799: the invention shed — warped, demented, proudly INCORRECT
+    versions of the shelf sayings, brewed in the background so the air
+    path never waits on the model. Tinted by the active crystal."""
+    if _SFXGUY_FILLING[0] or len(_SFXGUY_WARPED) >= 8:
+        return
+    _SFXGUY_FILLING[0] = True
+    try:
+        rows = sfxguy_quips(voice)
+        picks = random.sample(rows, k=min(2, len(rows)))
+        recipe = random.choice((
+            "say it confidently but get it WRONG in a way that makes "
+            "no sense",
+            "mash the two sayings into one glorious wreck",
+            "twist it into NASCAR terms — left turns, restrictor "
+            "plates, pit road",
+            "make it about Dale Earnhardt somehow",
+            "swap the animals and objects for much stranger ones",
+            "start it normal and let it fall apart halfway through",
+            "turn it into a proud boast that one-ups everybody "
+            "listening",
+        ))
+        _tinted = ""
+        _crs = crystal_active()
+        if _crs:
+            _cr = random.choice(_crs)
+            _tinted = (" Let a little of this flavor bleed in: "
+                       f"{str(_cr.get('tint') or _cr.get('name'))[:120]}.")
+        out = await ask_model(
+            "You are a thick-accented country boy in a radio booth. "
+            f"Take these sayings: {' / '.join(picks)} — and {recipe}."
+            f"{_tinted} Answer with the ONE new saying only, under 25 "
+            "words, no quotes, no explanation.", limit=160, spice=0.9)
+        line = str(out or "").strip().strip('"').strip()
+        if 12 <= len(line) <= 200 and looks_english(line)                 and "\n" not in line:
+            _SFXGUY_WARPED.append(line)
+            pipeline_log("air",
+                         f"the SFX guy invents: {line[:70]} (#799)")
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _SFXGUY_FILLING[0] = False
+
+
+def sfxguy_line(voice: str) -> str:
+    """#798/#799: what comes out of his mouth — at the invention dial's
+    rate a warped never-before-said line off the shed, otherwise a shelf
+    saying that has not aired inside the hour."""
+    warp = max(0, min(100, int(dj_settings().get("sfxguy_warp") or 0)))
+    line = ""
+    if _SFXGUY_WARPED and random.random() < warp / 100.0:
+        line = _SFXGUY_WARPED.pop(random.randrange(len(_SFXGUY_WARPED)))
+    else:
+        rows = sfxguy_quips(voice)
+        said = _sfxguy_said()
+        now = time.time()
+        pool = [r for r in rows
+                if now - float(said.get(_sfxguy_key(r)) or 0) > 3600]
+        line = (random.choice(pool) if pool else
+                min(rows, key=lambda r:
+                    float(said.get(_sfxguy_key(r)) or 0)))
+    _sfxguy_stamp(line)
+    if len(_SFXGUY_WARPED) < 8:
+        fire_and_forget(_sfxguy_warp_fill(voice))
+    return line
 
 
 @app.get("/api/sfxguy/quips")
@@ -24330,6 +24643,13 @@ async def speak_turns(turns: list[tuple[str, str]],
         if is_binned(text):
             note_drop(who, text, "you buried this line")
             continue                    # skip THIS line, not the whole round
+        # #792: the show is in ENGLISH. A lyric swath in Portuguese rode
+        # a whole turn on air verbatim — any line that reads foreign is
+        # dropped here, at the one choke point everything passes through.
+        if not looks_english(text):
+            note_drop(who, text, "reads as another language — the show "
+                                 "is in English (#792)")
+            continue
         # #752: THE anti-repeat gate, here rather than in dj_speak — this is
         # the one place banter, deep rounds, calls and bank replays all pass
         # through, and the coalesced stream (the default) never reaches
@@ -24722,8 +25042,7 @@ async def speak_turns(turns: list[tuple[str, str]],
                             and item["who"] in ("dj", "cohost", "third")
                             and random.random() < _gq_rate / 100.0):
                         _gv = str(dj_settings()["drop_voice"])
-                        _quip = unrepeated(sfxguy_quips(_gv),
-                                           f"sfxguy-quip-{_gv}")
+                        _quip = sfxguy_line(_gv)
                         try:
                             _qc = await voice_render_any(
                                 _quip, _gv, who="drop")
@@ -31083,26 +31402,58 @@ def _lyric_from_tags(path: Path) -> str:
     UNSYNCEDLYRICS (FLAC/Vorbis), \u00a9lyr (MP4). When the file ships its
     own words, use them verbatim and skip the rip entirely: faster, and
     the text is the artist's, not whisper's guess."""
+    texts: list[str] = []
     try:
         import mutagen
         m = mutagen.File(str(path))
         tags = getattr(m, "tags", None)
-        if not tags:
-            return ""
-        texts: list[str] = []
-        for k in list(tags.keys()):
+        for k in list(tags.keys()) if tags else []:
             ks = str(k).upper()
-            if ks.startswith("USLT") or ks in (
-                    "LYRICS", "UNSYNCEDLYRICS", "LYRICS:", "\u00a9LYR"):
-                v = tags[k]
-                t = getattr(v, "text", v)
-                if isinstance(t, (list, tuple)):
-                    t = "\n".join(str(x) for x in t)
-                if t:
-                    texts.append(str(t))
-        return max(texts, key=len).strip() if texts else ""
+            # #793: EVERY shape lyrics ship in — USLT and SYLT frames,
+            # TXXX:LYRICS, Vorbis/APE LYRICS keys, MP4 \u00a9lyr. LYRICIST
+            # is a name, not lyrics.
+            if not (ks.startswith("USLT") or ks.startswith("SYLT")
+                    or ks == "\u00a9LYR"
+                    or ("LYRIC" in ks and "LYRICIST" not in ks)):
+                continue
+            v = tags[k]
+            t = getattr(v, "text", v)
+            if isinstance(t, (list, tuple)):
+                # SYLT carries (text, stamp) pairs; strings ride plain.
+                t = "\n".join(str(x[0]) if isinstance(x, (list, tuple))
+                              and x else str(x) for x in t)
+            if t:
+                texts.append(str(t))
     except Exception:  # noqa: BLE001
-        return ""
+        pass
+    # #793: sidecar files — an .lrc or .txt of the same name beside the
+    # audio is lyrics by convention; LRC timestamps are stripped.
+    try:
+        for side in (path.with_suffix(".lrc"), path.with_suffix(".txt")):
+            if side.is_file() and side.stat().st_size < 200_000:
+                raw = side.read_text(errors="replace")
+                raw = re.sub(r"\[\d{1,2}:\d{2}(?:\.\d{1,3})?\]", "", raw)
+                if raw.strip():
+                    texts.append(raw.strip())
+    except Exception:  # noqa: BLE001
+        pass
+    return max(texts, key=len).strip() if texts else ""
+
+
+def _mind_song(mind: str, title: str, body: str) -> int:
+    """#793: the LYRICS go into the mind song by song, as they are won —
+    not one digest at the end of a job a restart can erase. Returns 1
+    when a new document lands so the caller can pace reindexing."""
+    try:
+        root = speakbox_dir(mind)
+        root.mkdir(parents=True, exist_ok=True)
+        doc = root / f"{safe_key(title) or 'track'} - lyrics.md"
+        if doc.is_file():
+            return 0
+        doc.write_text(body, encoding="utf-8")
+        return 1
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
@@ -31112,6 +31463,7 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
     folder = LYRICS_DIR / slug
     folder.mkdir(parents=True, exist_ok=True)
     songs: list[dict[str, Any]] = []
+    _fresh = 0
     try:
         for at, track in enumerate(tracks):
             if job.get("stage") == "cancelled":
@@ -31119,14 +31471,30 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
             title = str(track.get("title") or f"track {at + 1}")
             _lyric_note(job, current=title, done=at,
                         progress=round(at / max(1, len(tracks)), 3))
-            _alb_dir = folder / (safe_key(
-                str(track.get("album") or "singles")) or "singles")
+            _alb_raw = str(track.get("album") or "singles")
+            _alb_dir = folder / (safe_key(_alb_raw) or "singles")
             _alb_dir.mkdir(parents=True, exist_ok=True)
-            page = _alb_dir / (
-                f"{at + 1:03d} - {safe_key(title) or 'track'}.md")
+            # #793: the page is found by TITLE, never by position — the
+            # index-prefixed names broke resume whenever the track list
+            # shifted, and pre-#832 cased folders were invisible, so
+            # finished work was ripped all over again.
+            _t = safe_key(title) or "track"
+            page = _alb_dir / f"{_t}.md"
+            if not page.is_file():
+                _legacy = folder / (re.sub(r"[^A-Za-z0-9 _-]", "",
+                                           _alb_raw).strip()[:60] or "-")
+                _cands = sorted(_alb_dir.glob(f"* - {_t}.md"))
+                if _legacy.is_dir() and _legacy != _alb_dir:
+                    _cands += sorted(_legacy.glob(f"*{_t}.md"))
+                _cands += sorted(folder.glob(f"* - {_t}.md"))
+                if _cands:
+                    page = _cands[0]
             if page.is_file() and not force:
                 body = page.read_text(errors="replace")
                 songs.append({"title": title, "text": body})
+                _fresh += _mind_song(mind, title, body)
+                if _fresh and _fresh % 8 == 0:
+                    fire_and_forget(speakbox_reindex(rid=mind))
                 continue
             _src_note = "transcribed"
             text = _lyric_from_tags(Path(str(track.get("path") or "")))
@@ -31148,6 +31516,9 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
                 f"- {_src_note} {time.strftime('%Y-%m-%d %H:%M')}\n\n"
                 + text, encoding="utf-8")
             songs.append({"title": title, "text": text})
+            _fresh += _mind_song(mind, title, f"# {title}\n\n{text}")
+            if _fresh and _fresh % 8 == 0:
+                fire_and_forget(speakbox_reindex(rid=mind))
             pipeline_log("speakbox", f"read {title} — "
                                      f"{len(text.split())} words")
         _lyric_note(job, stage="digesting", progress=0.97)
@@ -31391,6 +31762,65 @@ def _mind_ensure(rid: str, name: str) -> str:
     return rid
 
 
+LYRIC_SPECS_PATH = data_path("lyric_jobs.json")
+
+
+def _lyric_specs_read() -> dict[str, Any]:
+    try:
+        d = json.loads(LYRIC_SPECS_PATH.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _lyric_spec_note(job_id: str, payload: dict[str, Any]) -> None:
+    """#793: extraction jobs survive the agent restarting — the ask is
+    written down before the work starts, wiped only when it finishes."""
+    try:
+        specs = _lyric_specs_read()
+        specs[job_id] = {"payload": {k: payload.get(k) for k in
+                                     ("artist", "albums", "crystal_name",
+                                      "tint")},
+                         "at": int(time.time())}
+        LYRIC_SPECS_PATH.write_text(json.dumps(specs, indent=1))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _lyric_spec_done(job_id: str) -> None:
+    try:
+        specs = _lyric_specs_read()
+        if specs.pop(job_id, None) is not None:
+            LYRIC_SPECS_PATH.write_text(json.dumps(specs, indent=1))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.on_event("startup")
+async def _startup_lyric_resume() -> None:
+    """#793: an extraction interrupted by a restart continues on its
+    own. Pages already written are found by title and skipped, so a
+    resume costs seconds per finished song, not another rip."""
+    async def run() -> None:
+        await asyncio.sleep(90)
+        for jid, spec in list(_lyric_specs_read().items()):
+            with _LYRIC_LOCK:
+                if jid in _LYRIC_JOBS:  # launched THIS boot — already live
+                    continue
+            _lyric_spec_done(jid)       # the relaunch writes its own
+            _who = str((spec.get("payload") or {}).get("artist") or "?")
+            try:
+                out = await _crystal_extract_launch(
+                    dict(spec.get("payload") or {}))
+                pipeline_log("speakbox", "extraction resumed after the "
+                             f"restart \u2014 {_who} \u2192 job "
+                             f"{out.get('job')} (#793)")
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("speakbox", "extraction resume failed for "
+                             f"{_who}: {exc} (#793)")
+    fire_and_forget(run())
+
+
 @app.post("/api/crystals/extract")
 async def crystals_extract(
     request: Request,
@@ -31401,6 +31831,12 @@ async def crystals_extract(
     crystal_name?, tint?}. Returns the lyric job id; poll /api/crystals."""
     require_auth(authorization)
     payload = await request.json()
+    return await _crystal_extract_launch(payload)
+
+
+async def _crystal_extract_launch(payload: dict[str, Any]) -> dict[str, Any]:
+    """#793: the launch itself, callable without a Request — the startup
+    resume relaunches interrupted extractions through here."""
     artist = str(payload.get("artist") or "").strip()
     albums = {str(a).strip().lower()
               for a in (payload.get("albums") or []) if str(a).strip()}
@@ -31415,7 +31851,7 @@ async def crystals_extract(
     # the albums it names, and combining albums is editing crystal.minds.
     _slug = re.sub(r"[^a-z0-9]", "", artist.lower())[:20] or "artist"
     groups: dict[str, list[dict[str, Any]]] = {}
-    for t in tracks[:300]:
+    for t in tracks:
         alb = re.sub(r"[^a-z0-9]", "",
                      str(t.get("album") or "single").lower())[:24] or "single"
         groups.setdefault(alb, []).append(t)
@@ -31453,11 +31889,13 @@ async def crystals_extract(
                     current=f"finished {alb}")
         with _LYRIC_LOCK:
             _LYRIC_JOBS[job_id].update(stage="done", progress=1.0)
+        _lyric_spec_done(job_id)
+    _lyric_spec_note(job_id, payload)
     fire_and_forget(_run_albums())
     cname = str(payload.get("crystal_name") or artist)[:60]
     data = crystals_read()
     cid = re.sub(r"[^a-z0-9_-]", "",
-                 cname.lower().replace(" ", "-"))[:40] or rid
+                 cname.lower().replace(" ", "-"))[:40] or _slug
     data[cid] = {**(data.get(cid) or {}), "name": cname,
                  "minds": sorted({*((data.get(cid) or {}).get("minds")
                                     or []), *minds}),
@@ -31469,6 +31907,60 @@ async def crystals_extract(
     crystals_save(data)
     return {"job": job_id, "crystal": cid, "minds": minds,
             "albums": len(groups), "tracks": len(tracks)}
+
+
+@app.get("/api/speakbox/minds/{rid}/chunks")
+async def speakbox_mind_chunks(
+    rid: str,
+    offset: int = 0,
+    limit: int = 200,
+    q: str = "",
+    file: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#794: a mind's contents, readable and scrollable — every chunk the
+    vectors hold, paged, with an optional text filter."""
+    require_read_auth(authorization)
+    key = mind_id(rid)
+    rows = _load_vectors(key).get("chunks") or []
+    picked = list(enumerate(rows))
+    if file:
+        picked = [(i, c) for i, c in picked
+                  if str(c.get("file") or "") == file]
+    want = str(q or "").strip().lower()
+    if want:
+        picked = [(i, c) for i, c in picked
+                  if want in str(c.get("text") or "").lower()
+                  or want in str(c.get("file") or "").lower()]
+    total = len(picked)
+    offset = max(0, int(offset))
+    limit = max(1, min(500, int(limit)))
+    return {"mind": key, "name": mind_row(key)["name"], "total": total,
+            "offset": offset, "all": len(rows),
+            "chunks": [{"i": i, "file": str(c.get("file") or ""),
+                        "text": str(c.get("text") or "")}
+                       for i, c in picked[offset:offset + limit]]}
+
+
+@app.get("/api/speakbox/minds/{rid}/sources")
+async def speakbox_mind_sources(
+    rid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#797: every SOURCE captured into a mind — one row per document,
+    with how many chunks it holds and where its run starts in the
+    tower's index space."""
+    require_read_auth(authorization)
+    key = mind_id(rid)
+    rows = _load_vectors(key).get("chunks") or []
+    seen: dict[str, dict[str, int]] = {}
+    for i, c in enumerate(rows):
+        f = str(c.get("file") or "")
+        if f not in seen:
+            seen[f] = {"chunks": 0, "first": i}
+        seen[f]["chunks"] += 1
+    return {"mind": key, "name": mind_row(key)["name"], "all": len(rows),
+            "sources": [{"file": f, **v} for f, v in seen.items()]}
 
 
 @app.get("/api/crystals/{cid}/seed")
@@ -38206,6 +38698,16 @@ async def speakbox_read_api(
     the network to show the reader four hundred words of it."""
     require_read_auth(authorization)
     path = speakbox_path(name, mind)
+    used = mind_id(mind)
+    if not path.is_file():
+        # #795: the chip names a DOCUMENT, not a mind — a doc living in
+        # an album or crystal mind opened as an empty ghost. Find it
+        # wherever it lives.
+        for _row in speakbox_minds():
+            _cand = speakbox_path(name, _row["id"])
+            if _cand.is_file():
+                path, used = _cand, _row["id"]
+                break
     if not path.is_file():
         raise HTTPException(status_code=404, detail=f"No {name} in the speakbox")
     if preview > 0:
@@ -38213,9 +38715,10 @@ async def speakbox_read_api(
         with path.open("r", errors="replace") as handle:
             head = handle.read(want)
         return {"name": name, "text": head, "preview": True,
-                "bytes": path.stat().st_size,
+                "mind": used, "bytes": path.stat().st_size,
                 "more": path.stat().st_size > len(head.encode("utf-8"))}
-    return {"name": name, "text": path.read_text(errors="replace")}
+    return {"name": name, "mind": used,
+            "text": path.read_text(errors="replace")}
 
 
 @app.post("/api/speakbox/{name}")
@@ -38229,6 +38732,14 @@ async def speakbox_save_api(
     require_auth(authorization)
     text = str((await request.json()).get("text") or "")
     path = speakbox_path(name, mind)
+    if not path.is_file():
+        # #795: edits land on the REAL file, wherever it lives — not on
+        # an empty doppelganger in the main folder.
+        for _row in speakbox_minds():
+            _cand = speakbox_path(name, _row["id"])
+            if _cand.is_file():
+                path = _cand
+                break
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text)
     return {"saved": name, "bytes": len(text.encode()),
