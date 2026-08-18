@@ -4398,7 +4398,17 @@ def _ha_creds(reply: bool = False) -> tuple[str, str]:
     backup = _ha_token_stored()
     token = HA_TOKEN or str(voice.get("ha_token") or "") or backup["token"]
     reply_player = str(voice.get("reply_media_player") or "")
-    if reply and reply_player:
+    # #814: a reply player left pointing at the OTHER satellite is a stale
+    # remnant of a device switch, not a choice — 640 replies played out of
+    # the retired PineVoice in 18h while every route said Nabu. A reply
+    # override only counts when it names something that is not the
+    # unselected satellite.
+    _stale_reply = (
+        (reply_player == PINEVOICE_SATELLITE
+         and _RADIO.get("voice_device") == "nabu")
+        or (reply_player == NABU_SATELLITE
+            and _RADIO.get("voice_device") == "pine"))
+    if reply and reply_player and not _stale_reply:
         player = reply_player
     elif _RADIO.get("voice_device") == "nabu":
         player = NABU_SATELLITE
@@ -7604,7 +7614,9 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
         note_activity("held", "box is quiet — kept for the page + shelf")
         return ""
     # Only now do we actually hand it to the box.
-    note_activity("speaking", "on the Pine Box")
+    note_activity("speaking", "on the "
+                  + ("Nabu" if _RADIO.get("voice_device") == "nabu"
+                     else "Pine Box"))
     seconds = _clip_seconds(path)
     # The API call returns when the audio finishes, so its budget is the
     # CLIP's length plus grace — not a flat three minutes. A dying box
@@ -31513,6 +31525,12 @@ def _routing_voice_device_set(device: str) -> None:
     voice_out["media_player"] = (
         NABU_SATELLITE if device == "nabu" else PINEVOICE_SATELLITE
     )
+    # #814: the reply player is part of the same switch. Leaving it aimed
+    # at the previous device split the station across two speakers —
+    # station audio on the Nabu, every reply on the pine.
+    if voice_out.get("reply_media_player") in (NABU_SATELLITE,
+                                               PINEVOICE_SATELLITE):
+        voice_out["reply_media_player"] = ""
     settings["voice_out"] = voice_out
     save_settings(settings)
     _RADIO["voice_device"] = device
@@ -50603,7 +50621,7 @@ function lineCardShow(line, anchor, tint) {
   } else {
     row("out of", "its own head — no document behind this one");
   }
-  row("delivery", {box: "📻 out of the Pine Box", held: "🕐 held for the box",
+  row("delivery", {box: "📻 out of the " + ((window.djLastState || {}).voice_device === "nabu" ? "Nabu" : "Pine Box"), held: "🕐 held for the box",
                    page: "📵 this page only"}[line.aired] || "—");
 
   // 4. the spectrogram of what actually aired.
@@ -75628,7 +75646,7 @@ async function mpxPoll() {
         let detail = a.detail || "";
         // Don't claim "on the Pine Box" while the box is actually down and
         // stone quiet — it's really held for the page (#539).
-        if (s.box && s.box.down && /pine box|on the box/i.test(detail))
+        if (s.box && s.box.down && /pine box|nabu|on the box/i.test(detail))
           detail = "held — box quiet, playing on the page";
         lab.textContent = (a.stage || "processing")
           + (detail ? " · " + detail.slice(0, 30) : "");

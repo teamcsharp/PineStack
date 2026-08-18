@@ -22,8 +22,11 @@ const $ = (id) => document.getElementById(id);
 
 const ROUTES = {
   box: { label: "Pine Box", music: "box", voice: "box", reply: "box", voice_device: "pine", box_talk: true },
-  web: { label: "Web page", music: "here", voice: "here", reply: "here", voice_device: "pine", box_talk: false },
-  app: { label: "Application", music: "off", voice: "here", reply: "here", voice_device: "pine", box_talk: false },
+  // #814: web/app route audio to the PAGE — they must not silently
+  // re-point the core DEVICE at the retired pine satellite. They
+  // leave voice_device alone; only box/nabu name a device.
+  web: { label: "Web page", music: "here", voice: "here", reply: "here", box_talk: false },
+  app: { label: "Application", music: "off", voice: "here", reply: "here", box_talk: false },
   // #786: Nabu is the CORE broadcast device — broadcasting to it means the
   // WHOLE station: music and the DJ voice both. music "off" here was why
   // the speaker sat silent between rounds.
