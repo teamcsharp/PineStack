@@ -12348,6 +12348,13 @@ async def box_hold_watch() -> None:
             if _ANNOUNCE_LOCK.locked():
                 continue                # the live show has the floor
             first = _BOX_HOLD[0]
+            # #805: a drain against an UNAVAILABLE satellite is a hammer,
+            # not a delivery — 237 play attempts hit a missing player in
+            # one day, flooding the link exactly when it was weakest. The
+            # entity has to exist before the shelf knocks.
+            if (_RADIO.get("voice_device") == "nabu"
+                    and not await satellite_ready(heal=False)):
+                continue
             # #795: HOLD_REPLAY_STALE, ENFORCED. The constant and its
             # comment existed; the watcher never applied it — so a shelf
             # that fell behind stayed permanently full (measured 49→55 and
@@ -12355,7 +12362,14 @@ async def box_hold_watch() -> None:
             # conversation, and the audible show was all gaps. Past the
             # stale line the transcript keeps the words; the speaker moves
             # on to what the show is saying NOW.
-            if time.time() - float(first.get("ts") or 0) > HOLD_REPLAY_STALE:
+            # #805: a CALL stream gets three windows — a Wi-Fi flap was
+            # erasing whole completed calls from the core speaker while
+            # the ledger counted them aired.
+            _stale_cap = HOLD_REPLAY_STALE * (
+                3 if ("☎" in str(first.get("text") or "")
+                      or str(first.get("who") or "") in ("caller", "caller2"))
+                else 1)
+            if time.time() - float(first.get("ts") or 0) > _stale_cap:
                 stale = _BOX_HOLD.pop(0)
                 _box_hold_save()
                 pipeline_log("air", "a held clip aged past the replay "
@@ -12530,6 +12544,28 @@ def repair_note(what: str) -> None:
     log.append({"at": int(time.time()), "what": str(what)[:200]})
     del log[:-30]
     _RADIO["repairing"] = {"at": int(time.time()), "what": str(what)[:160]}
+    # #806: "the ladder gave up" was a log line nobody was paged about.
+    # Terminal states — spent budgets, a device that did not come back —
+    # now raise a Home Assistant notification so a human finds out from
+    # their phone, not from the silence.
+    if any(key in what for key in ("budget is spent", "did not come back",
+                                   "needs a human", "human needs",
+                                   "needs attention")):
+        async def _page(msg: str) -> None:
+            token, _player = _ha_creds()
+            if not token:
+                return
+            try:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(
+                        f"{HA_URL}/api/services/"
+                        "persistent_notification/create",
+                        headers={"Authorization": f"Bearer {token}"},
+                        json={"title": "Pine Box FM needs a human",
+                              "message": msg})
+            except Exception:  # noqa: BLE001
+                pass
+        fire_and_forget(_page(str(what)[:200]))
     pipeline_log("air", f"repair mode: {what}"[:190])
 
 
@@ -19202,7 +19238,12 @@ def rerun_check(text: str, who: str = "", kind: str = "",
     of recent candidates it stands down until the rate falls. Repetition is
     a bad show; silence is no show."""
     verdict = {"block": False, "why": "", "key": _bin_key(text)}
-    if allow_repeat or kind in ("station_id", "ad", "reply"):
+    # #805: "call" joined the fast-exempt list for the CALLER'S OWN seats —
+    # the fuzzy Jaccard leg was eating regulars' near-identical call turns
+    # ("Hello — this is Big Ron" is near-identical EVERY call, by design),
+    # which is how a rung phone aired one turn and died. Host seats keep
+    # the exact word-for-word leg via the caller check in speak_turns.
+    if allow_repeat or kind in ("station_id", "ad", "reply", "call"):
         return verdict
     key = verdict["key"]
     # #no-repeats: the old floor was 24 characters, and a catchphrase is precisely a
@@ -20736,6 +20777,25 @@ CALLER_BEHAVIORS = {
         "live whether to believe it."),
     "plain": "",
 }
+
+
+def _fallback_call_script(caller_name: str, topic: str = "") -> str:
+    """#805: the guarantee behind every rung phone — when the model's call
+    write dies (exception or fragment-bin), this minimal script airs
+    instead of silence. Short, honest, and it completes: intro, the point,
+    the wrap."""
+    about = " ".join(str(topic or "").split())[:160]
+    return (
+        f"A: Phones are lit — {caller_name}, you're on Pine Box FM.\n"
+        f"C: Hey — it's {caller_name}. Longtime listener."
+        + (f" I'm calling about {about}" if about else
+           " I had to call about what you were just playing.") + "\n"
+        "A: Then say your piece — the air is yours.\n"
+        "C: I'll keep it short. This station got me through a week I "
+        "didn't think I'd get through. That's the call. That's all of it.\n"
+        f"B: That's the whole reason the lights are on in here.\n"
+        f"A: Thank you, {caller_name} — stay with us; this next one's "
+        "yours.")
 
 
 def caller_behavior_draw() -> tuple[str, str]:
@@ -22791,8 +22851,14 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     pipeline_log("call", f"{caller['name']} on {line_say} — {state}"
                          + (" · cloned voice" if caller.get("voice_id")
                             else ""))
-    # A phone rings before anyone speaks (#237).
-    await play_phone_ring()
+    # A phone rings before anyone speaks (#237) — but NOT before the script
+    # exists (#805). The ring aired, then the write died silently, and the
+    # listener heard ring-then-nothing 52 times in 12 hours. On the
+    # coalesced road the burst splices its own ring anyway; the write
+    # failure now falls back to a built-in script, so the ring below can
+    # never be an orphan — it moved AFTER dj_banter returns.
+    if not bool(dj.get("call_stream", True)):
+        await play_phone_ring()
     # A real call needs room to develop — banter, rapport, gags, THEN the
     # outcome (prize / caller number / manager / hang-up), or it just stops
     # mid-conversation (#495, #503). Nine turns, not six.
@@ -24515,7 +24581,10 @@ async def speak_turns(turns: list[tuple[str, str]],
                 break
         # A cut only lands between turns (#520): re-arm after each item so
         # the next iteration's guard may fire, but only at a turn boundary.
-        can_cut = bool(item["turn_end"])
+        # #805: …and NEVER during a live call — this re-arm was quietly
+        # discarding the caller protection from the second turn onward, so
+        # a talk-cut could strand a caller mid-arc on the per-turn road.
+        can_cut = bool(item["turn_end"]) and not caller_name
     # Is the box actually the destination right now? (#712) Recomputed here
     # rather than reused: the coalesced path's `to_box` lives in a branch that
     # returns, so it is not in scope on this one.
@@ -25274,32 +25343,73 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     + len(angle)),
             ),
         )
-    except Exception:
-        return []
+    except Exception as exc:
+        # #805: this `except` was SILENT, and the ledger showed what
+        # silence costs — 52 of 99 calls in 12h aired zero turns, most
+        # dying right here after the phone had already rung on air. Say
+        # it, and for a CALL fall back to a minimal built-in script: a
+        # phone that rang always airs a short call rather than nothing.
+        pipeline_log("drop", f"the round's script write failed: "
+                     f"{type(exc).__name__} {str(exc)[:140]}"
+                     + (f" — fallback call script for {caller_name}"
+                        if caller_name else ""))
+        if not caller_name:
+            return []
+        script = _fallback_call_script(caller_name, str(angle)[:220])
+
+    # #805: ask_model returns "" when the reply fragment-binned — not an
+    # exception, and previously not a call either. Same guarantee.
+    if caller_name and not spoken_text(script or ""):
+        pipeline_log("call", f"fragment-binned call write — built-in "
+                     f"fallback script carries {caller_name} (#805)")
+        script = _fallback_call_script(caller_name, str(angle)[:220])
 
     # Do not bank or air an exchange that ignored the long-form contract.
     # This is deliberately after the first generation so the correction can
     # preserve its subject and any exact Speakerbox wording while giving every
     # speaker enough room to make a real thought.
-    if (lines >= 8 and not caller_name
-            and not substantial_radio_script(script, lines)):
+    # #805: calls were EXEMPT from this rescue — the one that works — which
+    # is how 11-turn calls aired as one or two turns. A call's bar is its
+    # own: the CALLER must be on it (three C: turns) and it must be a
+    # conversation (six turns), not an essay.
+    _needs_rewrite = False
+    if lines >= 8 and not caller_name:
+        _needs_rewrite = not substantial_radio_script(script, lines)
+    elif caller_name and lines >= 6:
+        _c_turns = len(re.findall(r"(?m)^\s*C\s*:", script or ""))
+        _all_turns = len(re.findall(r"(?m)^\s*[A-E]\s*:", script or ""))
+        _needs_rewrite = _c_turns < 3 or _all_turns < 6
+    if _needs_rewrite:
         pipeline_log("model", "thin radio draft rejected — rewriting before air")
         try:
             rewritten = await ask_model(
                 "Rewrite the following Pine Box FM draft as a coherent, "
-                "long-form exchange. Return only A:/B: dialogue. Keep its "
+                "long-form exchange. Return only A:/B"
+                + ("/C" if caller_name else "") + ": dialogue. Keep its "
                 "subject and every verbatim quotation, but write 8 to 11 "
                 "alternating turns with at least 55 words in every ordinary "
                 "turn. Each speaker must respond directly to the prior turn, "
                 "develop an idea with concrete detail, and finish a complete "
-                "thought. Do not use one-line reactions or stage directions.\n\n"
+                "thought. Do not use one-line reactions or stage directions."
+                + (f"\nThis is a LIVE PHONE CALL: 'C:' is {caller_name} on "
+                   "the line — keep them on at least a third of the turns, "
+                   "keep their name and what they called about, and end "
+                   "with the host wrapping the call."
+                   if caller_name else "") + "\n\n"
                 + script,
                 limit=min(int(dj.get("reply_max_chars") or 6000),
                           max(4200, 500 * min(lines, 11))),
                 spice=0.25,
                 num_ctx=16384,
             )
-            if substantial_radio_script(rewritten, lines):
+            if caller_name:
+                _rw_ok = (len(re.findall(r"(?m)^\s*C\s*:",
+                                         rewritten or "")) >= 3
+                          and len(re.findall(r"(?m)^\s*[A-E]\s*:",
+                                             rewritten or "")) >= 6)
+            else:
+                _rw_ok = substantial_radio_script(rewritten, lines)
+            if _rw_ok:
                 script = rewritten
             else:
                 pipeline_log("model", "rewrite still thin — preserving the "
