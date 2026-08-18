@@ -5394,6 +5394,22 @@ async def _box_vigil() -> None:
                     await satellite_selfheal()
                 except Exception:  # noqa: BLE001
                     pass
+                # #818: the failover was TEMPORARY — the operator's
+                # remembered routing comes back with the box.
+                ledger = _operator_routing_read()
+                if ledger:
+                    try:
+                        _api_key = os.getenv("SPARK_AGENT_API_KEY", "")
+                        async with httpx.AsyncClient(timeout=10) as client:
+                            await client.post(
+                                "http://127.0.0.1:8096/api/dj/output",
+                                headers={"Authorization":
+                                         f"Bearer {_api_key}"},
+                                json={**ledger, "system": True})
+                        pipeline_log("repair", "vigil: operator routing "
+                                     f"restored — {ledger} (#818)")
+                    except Exception:  # noqa: BLE001
+                        pass
                 if _RADIO.get("on"):
                     fire_and_forget(dj_banter(None, lines=3, angle=(
                         "NEWS FROM THE BACK ROOM, mid-show: the box "
@@ -5492,7 +5508,8 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
                     await client.post(
                         "http://127.0.0.1:8096/api/dj/output",
                         headers={"Authorization": f"Bearer {_api_key}"},
-                        json={"music": "both", "voice": "both"})
+                        json={"music": "both", "voice": "both",
+                              "system": True})
             except Exception:  # noqa: BLE001
                 pass
             fire_and_forget(_box_vigil())
@@ -33471,6 +33488,46 @@ async def _startup_routing() -> None:
         _routing_voice_device_set("nabu")
 
 
+ROUTING_OPERATOR_PATH = data_path("routing_operator.json")
+
+
+def _operator_routing_read() -> dict[str, Any]:
+    """#818: what the OPERATOR chose, as distinct from what a repair
+    temporarily forced. This is the default everything returns to."""
+    try:
+        d = json.loads(ROUTING_OPERATOR_PATH.read_text())
+        return d if isinstance(d, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _operator_routing_stamp(fields: dict[str, Any]) -> None:
+    try:
+        d = _operator_routing_read()
+        d.update({k: v for k, v in fields.items() if v})
+        ROUTING_OPERATOR_PATH.write_text(json.dumps(d, indent=1))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def music_box_stop_now() -> None:
+    """#818: switching music OFF the box silences the box NOW — not at
+    whatever moment the current record happens to end."""
+    token, _pl = _ha_creds()
+    if not token:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                f"{HA_URL}/api/services/media_player/media_stop",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"entity_id": NABU_MEDIA_PLAYER})
+        pipeline_log("air", "music routed off the box — box media "
+                     "stopped immediately (#818)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 @app.post("/api/dj/output")
 async def dj_output_api(
     request: Request,
@@ -33501,6 +33558,7 @@ async def dj_output_api(
         voice = "box" if voice == "nabu" else voice
         reply = "box" if reply == "nabu" else reply
 
+    _was_music = str(_RADIO.get("music_to") or "here")
     if music:
         _RADIO["music_to"] = music
     if voice:
@@ -33546,6 +33604,27 @@ async def dj_output_api(
     if ((voice in ("box", "both") and voice != was)
             or (talk is True and (_RADIO.get("voice_to") or "box") in ("box", "both"))):
         asyncio.create_task(box_route_wake())
+    # #818: what YOU set here is the remembered default. Repair roads
+    # pass "system": true and never touch the ledger — and when the
+    # box returns, the vigil restores exactly this.
+    if not payload.get("system"):
+        _operator_routing_stamp({"music": music, "voice": voice,
+                                 "reply": reply,
+                                 "voice_device": voice_device})
+    # #818: the MUSIC switch is immediate too. Onto the box: the record
+    # now playing starts there at once (the next track realigns both
+    # outputs). Off the box: its media stops mid-note.
+    if music and music != _was_music:
+        if music in ("box", "both") \
+                and _was_music not in ("box", "both") \
+                and _RADIO.get("on") and _RADIO.get("now"):
+            fire_and_forget(
+                music_play_on_box(dict(_RADIO.get("now") or {})))
+            pipeline_log("air", "music routed onto the box — the "
+                         "current record starts there NOW (#818)")
+        if _was_music in ("box", "both") \
+                and music not in ("box", "both"):
+            fire_and_forget(music_box_stop_now())
     return dj_state()
 
 
