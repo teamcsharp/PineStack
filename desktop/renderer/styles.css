@@ -335,14 +335,48 @@ body { padding-bottom: 28px; }
 }
 #sbMarquee:hover #sbMarqueeInner { animation-play-state: paused; }
 @keyframes sbScroll { to { transform: translateX(-100%); } }
+/* #801: the terminal, grown up — centered, resizable (persisted), tabbed,
+   scrollable through 300+ grouped entries. */
 #sbTermPopup {
-  position: fixed; left: 8px; bottom: 32px; z-index: 95;
-  width: min(920px, calc(100vw - 16px));
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 95; width: min(920px, calc(100vw - 32px)); height: 300px;
+  min-width: 420px; min-height: 160px; resize: both; overflow: hidden;
+  display: flex; flex-direction: column;
   background: #03070c; border: 1px solid var(--border, #2a3644);
-  border-radius: 8px; padding: 8px 10px;
+  border-radius: 8px; padding: 6px 10px 8px;
   font: 11.5px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
-  color: #9fd8b5; box-shadow: 0 -8px 32px rgba(0, 0, 0, .65);
+  color: #9fd8b5; box-shadow: 0 10px 44px rgba(0, 0, 0, .7);
 }
+#sbTermPopup .sb-tabs { display: flex; gap: 4px; flex: 0 0 auto;
+  border-bottom: 1px solid var(--border, #2a3644); padding-bottom: 4px; }
+#sbTermPopup .sb-tabs button {
+  background: transparent; border: 1px solid transparent; color: #8fa0ad;
+  border-radius: 5px 5px 0 0; padding: 2px 8px; font: inherit;
+  font-size: 10.5px; cursor: pointer;
+}
+#sbTermPopup .sb-tabs button.on { color: #c8f5da;
+  border-color: var(--border, #2a3644); background: #0a1118; }
+#sbTermPopup .sb-scroll { flex: 1 1 auto; overflow-y: auto; min-height: 0;
+  padding-top: 3px; }
+#sbTermPopup .sb-count { color: #d9c46a; }
+#samplePopup {
+  position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
+  z-index: 96; width: min(680px, calc(100vw - 32px));
+  background: var(--panel, #141b24); border: 1px solid var(--border, #2a3644);
+  border-radius: 10px; padding: 14px; box-shadow: 0 12px 48px rgba(0,0,0,.7);
+  display: flex; flex-direction: column; gap: 8px; font-size: 12.5px;
+}
+#samplePopup audio { width: 100%; }
+#samplePopup .sp-row { display: flex; gap: 6px; align-items: center;
+  flex-wrap: wrap; }
+#samplePopup .sp-row input[type=text] { flex: 1; min-width: 0; }
+#samplePopup .sp-range { display: flex; gap: 6px; align-items: center;
+  font: 11.5px ui-monospace, Consolas, monospace; color: #9fd8b5; }
+#samplePopup .sp-bar { position: relative; height: 14px; background: #0a1118;
+  border: 1px solid var(--border, #2a3644); border-radius: 4px;
+  cursor: pointer; }
+#samplePopup .sp-bar i { position: absolute; top: 0; bottom: 0;
+  background: rgba(101, 199, 218, .4); border-radius: 3px; }
 #sbTermPopup .sb-row {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   cursor: pointer;

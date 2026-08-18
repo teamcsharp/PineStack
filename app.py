@@ -30157,6 +30157,153 @@ async def voicelab_ingest(
     return {"job_id": job_id}
 
 
+# #800: the sample extractor — paste a link, hear it, cut the moments, and
+# the cuts join the DJs' sample rotation (they land in an SFX folder that
+# sfx_all() draws from like any pack).
+SAMPLE_CACHE_DIR = data_path("sample_cache")
+
+
+def samples_dir() -> Path:
+    name = str(dj_settings().get("samples_dir") or "Samples").strip("/. ")
+    p = SFX_ROOT / (name or "Samples")
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+@app.post("/api/samples/fetch")
+async def samples_fetch(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Start a fetch-only voice-lab job: download + convert, no analysis."""
+    require_auth(authorization)
+    payload = await request.json()
+    async with httpx.AsyncClient(timeout=30) as client:
+        reply = await client.post(f"{VOICE_LAB_URL}/ingest", json={
+            "url": str(payload.get("url") or ""), "mode": "fetch"})
+    if reply.status_code >= 400:
+        raise HTTPException(status_code=reply.status_code,
+                            detail=reply.text[:200])
+    return reply.json()
+
+
+@app.get("/api/samples/job/{job_id}")
+async def samples_job(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    async with httpx.AsyncClient(timeout=15) as client:
+        reply = await client.get(f"{VOICE_LAB_URL}/jobs/{job_id}")
+    out = reply.json() if reply.status_code < 400 else {"stage": "error"}
+    if out.get("stage") == "done":
+        out["audio"] = (f"/api/samples/audio/{job_id}"
+                        f"?t={media_sign(job_id)}")
+    return out
+
+
+@app.get("/api/samples/audio/{job_id}")
+async def samples_audio(job_id: str, t: str = "") -> Response:
+    """The fetched media, cached locally and served with Range support so
+    a bare <audio> can seek. Signed query, no bearer needed."""
+    if not hmac.compare_digest(media_sign(job_id), str(t or "")):
+        raise HTTPException(status_code=403, detail="bad signature")
+    SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = SAMPLE_CACHE_DIR / f"{re.sub(r'[^a-z0-9_]', '', job_id)}.mp3"
+    if not cache.is_file():
+        async with httpx.AsyncClient(timeout=120) as client:
+            reply = await client.get(
+                f"{VOICE_LAB_URL}/jobs/{job_id}/files/audio.mp3")
+            if reply.status_code >= 400:
+                raise HTTPException(status_code=404, detail="no audio yet")
+            cache.write_bytes(reply.content)
+    return FileResponse(cache, media_type="audio/mpeg")
+
+
+@app.post("/api/samples/extract")
+async def samples_extract(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Cut N ranges out of a fetched clip INTO ROTATION — every range its
+    own file, all cut concurrently. {job_id, ranges: [{a, b, name?}]}"""
+    require_auth(authorization)
+    payload = await request.json()
+    job_id = re.sub(r"[^a-z0-9_]", "", str(payload.get("job_id") or ""))
+    ranges = [r for r in (payload.get("ranges") or [])
+              if isinstance(r, dict)][:12]
+    SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = SAMPLE_CACHE_DIR / f"{job_id}.mp3"
+    if job_id and not cache.is_file():
+        # Self-prime: the API caller may cut without ever having played it.
+        async with httpx.AsyncClient(timeout=120) as client:
+            reply = await client.get(
+                f"{VOICE_LAB_URL}/jobs/{job_id}/files/audio.mp3")
+            if reply.status_code < 400:
+                cache.write_bytes(reply.content)
+    if not (job_id and cache.is_file() and ranges):
+        raise HTTPException(status_code=400,
+                            detail="fetch the clip first, then cut ranges")
+    try:
+        import imageio_ffmpeg
+        ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        ffmpeg = "ffmpeg"
+    out_dir = samples_dir()
+
+    def cut(rng: dict[str, Any], n: int) -> str:
+        a = max(0.0, float(rng.get("a") or 0))
+        b = max(a + 0.2, float(rng.get("b") or 0))
+        base = re.sub(r"[^A-Za-z0-9 _-]", "",
+                      str(rng.get("name") or f"sample_{job_id}_{n}"))[:60]
+        path = out_dir / f"{base.strip() or 'sample'}_{int(a)}s.mp3"
+        got = _real_subprocess_run(
+            [ffmpeg, "-nostdin", "-y", "-ss", f"{a:.2f}", "-to", f"{b:.2f}",
+             "-i", str(cache), "-codec:a", "libmp3lame", "-q:a", "3",
+             str(path)], capture_output=True, timeout=120)
+        return str(path.name) if path.is_file() and got.returncode == 0 \
+            else ""
+    made = await asyncio.gather(*[
+        asyncio.to_thread(cut, rng, n) for n, rng in enumerate(ranges)])
+    made = [m for m in made if m]
+    # The folder joins the rotation the moment it holds a cut.
+    folder_name = out_dir.name
+    dj = dict(dj_settings())
+    if made and folder_name not in (dj.get("sfx_folders") or []):
+        settings = load_settings()
+        settings["dj"]["sfx_folders"] = \
+            list(dj.get("sfx_folders") or []) + [folder_name]
+        save_settings(validate_settings(settings))
+    note_action(f"🎬 cut {len(made)} sample(s) into rotation")
+    return {"made": made, "folder": str(out_dir),
+            "in_rotation": bool(made)}
+
+
+# #801: voices marked from the terminal — broadcast issues, audio noise.
+VOICE_FLAGS_PATH = data_path("voice_flags.json")
+
+
+@app.post("/api/voices/flag")
+async def voices_flag(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    vid = re.sub(r"[^a-z0-9_]", "", str(payload.get("id") or ""))
+    if not vid:
+        raise HTTPException(status_code=400, detail="which voice?")
+    try:
+        flags = json.loads(VOICE_FLAGS_PATH.read_text())
+    except Exception:
+        flags = {}
+    flags[vid] = {"why": str(payload.get("why") or "flagged from the "
+                             "terminal")[:120], "at": int(time.time())}
+    VOICE_FLAGS_PATH.write_text(json.dumps(flags, indent=1))
+    note_action(f"🗑 voice {vid} marked for deletion review")
+    return {"flagged": sorted(flags)}
+
+
 # --- The lyric mines (#629) -------------------------------------------------
 # An artist's whole catalogue read for what it is ABOUT, written out as
 # markdown, and handed to the DJs as a mind of its own. The point is not the

@@ -1430,6 +1430,7 @@ function initStatusBar() {
   if (!line || !pop) return;
 
   const ring = [];              // {ts, kind, text, extra} — newest last
+  const feedSeen = new Set();   // #801: dedupe across the merged feeds
   let lastPipe = 0, lastShell = 0, counts = {}, open = false;
 
   const esc = (s) => String(s).replace(/[&<>]/g, (c) =>
@@ -1463,6 +1464,32 @@ function initStatusBar() {
               extra: ""});
       });
     } catch { /* same */ }
+    // #801: the WHOLE station, not just the glass — booth lines as they
+    // air, the repair ledger, the activity trail. Deduped by signature so
+    // the merged feeds never double-report one event.
+    try {
+      const r = await api.get("/api/radio");
+      const seenAdd = (ts, kind, text, extra) => {
+        const key = kind + "|" + ts + "|" + (text || "").slice(0, 60);
+        if (feedSeen.has(key)) return;
+        feedSeen.add(key);
+        if (feedSeen.size > 1200) {
+          feedSeen.clear();               // cheap reset; dupes age out
+        }
+        push({ts, kind, text, extra: extra || ""});
+      };
+      (r.chat || []).slice(-15).forEach((c) => {
+        seenAdd((c.ts || 0) * 1000, c.kind === "hangup" ? "call" : "booth",
+          (c.who || "") + ": " + (c.text || ""), c.reason || "");
+      });
+      (r.repair_log || []).slice(-8).forEach((c) => {
+        seenAdd((c.at || 0) * 1000, "repair", c.what || "", "");
+      });
+      (r.activity_log || []).slice(-12).forEach((c) => {
+        seenAdd((c.at || 0) * 1000, "activity",
+          (c.stage || "") + (c.detail ? " · " + c.detail : ""), "");
+      });
+    } catch { /* the bar keeps what it has */ }
     const last = ring[ring.length - 1];
     if (last) {
       line.textContent = when(last.ts) + "  [" + last.kind + "]  " + last.text;
@@ -1471,36 +1498,124 @@ function initStatusBar() {
     setTimeout(pollFeed, 2500);
   }
 
+  // #801: the terminal grown up — tabs, ×N grouping of duplicates,
+  // 300-deep scrollback, right-click → "other", resizable + remembered,
+  // and a 🗑 on any row naming a voice to mark it for deletion review.
+  const TABS = {All: null, Voice: ["voice", "gpu", "voicing"],
+                Talk: ["call", "air", "drop", "banter", "booth"],
+                Station: ["repair", "activity"],
+    Shell: ["shell"], Other: "other"};
+  let tab = localStorage.getItem("sbTermTab") || "All";
+  const otherTags = new Set(JSON.parse(
+    localStorage.getItem("sbOtherTags") || "[]"));
+  const sig = (e) => (e.kind || "") + "|" + (e.text || "").slice(0, 80);
+  let scroller = null, stickBottom = true;
+
   function drawPop() {
-    const opened = new Set(Array.from(pop.querySelectorAll(".sb-row.open"))
-      .map((r) => r.dataset.ts));
+    const openedKeys = new Set(Array.from(
+      pop.querySelectorAll(".sb-row.open")).map((r) => r.dataset.key));
     pop.innerHTML = "";
-    ring.slice(-8).forEach((e) => {
+    const tabs = document.createElement("div");
+    tabs.className = "sb-tabs";
+    Object.keys(TABS).forEach((name) => {
+      const b = document.createElement("button");
+      b.textContent = name;
+      b.className = name === tab ? "on" : "";
+      b.onclick = (ev) => { ev.stopPropagation(); tab = name;
+        localStorage.setItem("sbTermTab", name); drawPop(); };
+      tabs.appendChild(b);
+    });
+    pop.appendChild(tabs);
+    scroller = document.createElement("div");
+    scroller.className = "sb-scroll";
+    scroller.addEventListener("scroll", () => {
+      stickBottom = scroller.scrollTop + scroller.clientHeight
+        >= scroller.scrollHeight - 20;
+    });
+    pop.appendChild(scroller);
+
+    const want = TABS[tab];
+    const shown = ring.filter((e) => {
+      const tagged = otherTags.has(sig(e));
+      if (want === "other") return tagged;
+      if (tagged) return false;
+      return !want || want.includes(e.kind);
+    }).slice(-300);
+    // Consecutive duplicates fold into one row with a live ×N.
+    const grouped = [];
+    shown.forEach((e) => {
+      const last = grouped[grouped.length - 1];
+      if (last && sig(last.e) === sig(e)) { last.n += 1; last.e = e; }
+      else grouped.push({e, n: 1});
+    });
+    grouped.forEach(({e, n}) => {
       const row = document.createElement("div");
       row.className = "sb-row sb-kind-" + (e.kind || "x");
-      row.dataset.ts = String(e.ts);
+      row.dataset.key = sig(e) + e.ts;
+      const vid = ((e.text || "") + " " + (e.extra || ""))
+        .match(/vl_[0-9a-f]{6,}/);
       row.innerHTML = "<span class='sb-when'>" + when(e.ts) + "</span> "
         + "<span class='sb-kind'>[" + esc(e.kind) + "]</span> "
         + esc(e.text)
-        + (e.extra ? "\n" + esc(e.extra) : "");
-      if (opened.has(row.dataset.ts)) row.classList.add("open");
-      row.title = e.extra ? "click for the full detail" : e.text;
+        + (n > 1 ? " <span class='sb-count'>(×" + n + ")</span>" : "")
+        + (e.extra ? "\n——— detail ———\n" + esc(e.extra) : "");
+      if (openedKeys.has(row.dataset.key)) row.classList.add("open");
+      row.title = (e.extra ? "click for the full detail · " : "")
+        + "right-click to move to Other";
       row.addEventListener("click", () => row.classList.toggle("open"));
-      pop.appendChild(row);
+      row.addEventListener("contextmenu", (ev) => {
+        ev.preventDefault();
+        if (otherTags.has(sig(e))) otherTags.delete(sig(e));
+        else otherTags.add(sig(e));
+        localStorage.setItem("sbOtherTags",
+          JSON.stringify(Array.from(otherTags)));
+        drawPop();
+      });
+      if (vid) {
+        const bin = document.createElement("button");
+        bin.textContent = "🗑";
+        bin.title = "Mark voice " + vid[0] + " for deletion review — "
+          + "broadcast issues / audio noise";
+        bin.style.cssText = "margin-left:6px;background:none;border:none;"
+          + "cursor:pointer;font-size:11px";
+        bin.onclick = async (ev) => {
+          ev.stopPropagation();
+          try {
+            await api.post("/api/voices/flag",
+              {id: vid[0], why: e.text.slice(0, 110)});
+            bin.textContent = "✓";
+          } catch (err) { bin.title = err.message; }
+        };
+        row.appendChild(bin);
+      }
+      scroller.appendChild(row);
     });
     const freq = Object.entries(counts).sort((a, b) => b[1] - a[1])
       .slice(0, 7).map(([k, n]) => k + "×" + n).join(" · ");
     const foot = document.createElement("div");
     foot.className = "sb-foot";
-    foot.textContent = "this session: " + (freq || "quiet")
-      + " · " + ring.length + " events kept";
-    pop.appendChild(foot);
+    foot.textContent = "this session: " + (freq || "quiet") + " · "
+      + ring.length + " events kept · right-click a row to file it "
+      + "under Other";
+    scroller.appendChild(foot);
+    if (stickBottom) scroller.scrollTop = scroller.scrollHeight;
   }
+
+  function restoreSize() {
+    const saved = JSON.parse(
+      localStorage.getItem("sbTermSize") || "null");
+    if (saved) { pop.style.width = saved.w + "px";
+      pop.style.height = saved.h + "px"; }
+  }
+  pop.addEventListener("mouseup", () => {
+    localStorage.setItem("sbTermSize", JSON.stringify(
+      {w: pop.offsetWidth, h: pop.offsetHeight}));
+  });
 
   line.addEventListener("click", () => {
     open = pop.style.display === "none";
-    pop.style.display = open ? "block" : "none";
-    if (open) drawPop();
+    pop.style.display = open ? "flex" : "none";
+    if (open) { restoreSize(); stickBottom = true; drawPop(); }
   });
   document.addEventListener("click", (ev) => {
     if (open && !pop.contains(ev.target) && ev.target !== line) {
@@ -1559,6 +1674,154 @@ function initStatusBar() {
   pollMarquee();
 }
 initStatusBar();
+
+/* #800: the sample extractor — paste a link (Ctrl+V over the 🎬 works),
+ * hear the clip, set IN/OUT ranges off the playhead, stack as many ranges
+ * as wanted, extract them all at once into the DJs' rotation. */
+function initSamplePopup() {
+  const btn = $("sampleBtn");
+  const pop = $("samplePopup");
+  if (!btn || !pop) return;
+  let job = "", audioUrl = "", dur = 0, ranges = [], hoverBtn = false;
+
+  const fmt = (s) => Math.floor(s / 60) + ":" +
+    String(Math.floor(s % 60)).padStart(2, "0");
+
+  function draw(stage, note) {
+    pop.innerHTML = "<b>🎬 Add a sample</b>";
+    const urlRow = document.createElement("div");
+    urlRow.className = "sp-row";
+    urlRow.innerHTML = "<input type='text' id='spUrl' placeholder='paste a "
+      + "YouTube / any video link…'><button id='spFetch'>Fetch</button>"
+      + "<button id='spClose'>✕</button>";
+    pop.appendChild(urlRow);
+    if (note) {
+      const st = document.createElement("div");
+      st.className = "muted";
+      st.textContent = note;
+      pop.appendChild(st);
+    }
+    if (stage === "ready") {
+      const player = document.createElement("audio");
+      player.controls = true;
+      player.src = audioUrl;
+      player.addEventListener("loadedmetadata", () => {
+        dur = player.duration || 0; paint();
+      });
+      pop.appendChild(player);
+      const bar = document.createElement("div");
+      bar.className = "sp-bar";
+      bar.onclick = (ev) => {
+        const r = bar.getBoundingClientRect();
+        player.currentTime = dur * (ev.clientX - r.left) / r.width;
+      };
+      pop.appendChild(bar);
+      const tools = document.createElement("div");
+      tools.className = "sp-row";
+      tools.innerHTML = "<button id='spIn'>⟦ IN at playhead</button>"
+        + "<button id='spOut'>OUT at playhead ⟧</button>"
+        + "<button id='spPrev'>▶ preview range</button>"
+        + "<button id='spAdd'>+ keep range, start another</button>"
+        + "<button id='spCut' class='primary'>✂ Extract all</button>";
+      pop.appendChild(tools);
+      const list = document.createElement("div");
+      list.id = "spList";
+      pop.appendChild(list);
+      let a = 0, b = 0, stopAt = 0;
+      function paint() {
+        bar.innerHTML = "";
+        ranges.concat(b > a ? [{a, b}] : []).forEach((r) => {
+          const i = document.createElement("i");
+          i.style.left = (100 * r.a / (dur || 1)) + "%";
+          i.style.width = (100 * (r.b - r.a) / (dur || 1)) + "%";
+          bar.appendChild(i);
+        });
+        list.innerHTML = ranges.map((r, n) =>
+          "<div class='sp-range'>" + (n + 1) + ". " + fmt(r.a) + " → "
+          + fmt(r.b) + " <input type='text' placeholder='name it…' "
+          + "data-n='" + n + "' value='" + (r.name || "") + "'>"
+          + "<button data-x='" + n + "'>✕</button></div>").join("")
+          + (b > a ? "<div class='sp-range muted'>working range: "
+             + fmt(a) + " → " + fmt(b) + "</div>" : "");
+        list.querySelectorAll("input").forEach((inp) => {
+          inp.oninput = () => { ranges[+inp.dataset.n].name = inp.value; };
+        });
+        list.querySelectorAll("button[data-x]").forEach((x) => {
+          x.onclick = () => { ranges.splice(+x.dataset.x, 1); paint(); };
+        });
+      }
+      player.addEventListener("timeupdate", () => {
+        if (stopAt && player.currentTime >= stopAt) {
+          player.pause(); stopAt = 0;
+        }
+      });
+      $("spIn").onclick = () => { a = player.currentTime; paint(); };
+      $("spOut").onclick = () => { b = player.currentTime; paint(); };
+      $("spPrev").onclick = () => {
+        if (b > a) { player.currentTime = a; stopAt = b; player.play(); }
+      };
+      $("spAdd").onclick = () => {
+        if (b > a) { ranges.push({a, b}); a = b = 0; paint(); }
+      };
+      $("spCut").onclick = async () => {
+        if (b > a) { ranges.push({a, b}); a = b = 0; }
+        if (!ranges.length) return;
+        $("spCut").textContent = "cutting…";
+        try {
+          const got = await api.post("/api/samples/extract",
+            {job_id: job, ranges});
+          draw("done", "✓ " + got.made.length + " sample(s) cut into "
+            + got.folder + " — the DJs have them in rotation now: "
+            + got.made.join(", "));
+          ranges = [];
+        } catch (err) { draw("ready", err.message); }
+      };
+      paint();
+    }
+    $("spClose").onclick = () => { pop.style.display = "none"; };
+    $("spFetch").onclick = () => fetchUrl($("spUrl").value.trim());
+    if (stage === "idle") $("spUrl").focus();
+  }
+
+  async function fetchUrl(url) {
+    if (!url) return;
+    pop.style.display = "flex";
+    draw("fetching", "fetching the media — fast path, no analysis…");
+    $("spUrl").value = url;
+    try {
+      job = (await api.post("/api/samples/fetch", {url})).job_id;
+      const t0 = Date.now();
+      while (Date.now() - t0 < 600000) {
+        await new Promise((r) => setTimeout(r, 4000));
+        const st = await api.get("/api/samples/job/" + job);
+        if (st.stage === "done" && st.audio) {
+          audioUrl = st.audio; ranges = [];
+          draw("ready", (st.title || "ready") + " — set IN/OUT off the "
+            + "playhead, stack ranges, extract them all at once.");
+          return;
+        }
+        if (st.stage === "error") {
+          draw("idle", st.error || "that link would not fetch"); return;
+        }
+        draw("fetching", (st.stage || "working") + "… "
+          + (st.note || ""));
+      }
+    } catch (err) { draw("idle", err.message); }
+  }
+
+  btn.addEventListener("mouseenter", () => { hoverBtn = true; });
+  btn.addEventListener("mouseleave", () => { hoverBtn = false; });
+  btn.addEventListener("click", () => {
+    pop.style.display = "flex";
+    draw("idle", "paste a link — or Ctrl+V one anywhere over the 🎬");
+  });
+  document.addEventListener("paste", (ev) => {
+    const text = (ev.clipboardData || {}).getData
+      ? ev.clipboardData.getData("text") : "";
+    if (hoverBtn && /https?:\/\/|youtu/i.test(text)) fetchUrl(text.trim());
+  });
+}
+initSamplePopup();
 
 document.querySelectorAll(".tab").forEach((button) => {
   if (button.id === "threejsBtn" || button.id === "stationBtn") return;
