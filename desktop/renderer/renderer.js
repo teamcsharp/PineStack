@@ -3039,108 +3039,109 @@ function initCrystalBtn() {
         save(c.id, { strength: parseInt(slider.value, 10) });
       card.appendChild(r2);
 
-      // #815: a TABLE, not a pill wall — one mind per row, aligned
-      // columns, sticky header, scrollable past twelve rows.
+      // #814: a DRILL-DOWN TREE — every mind in view again (members
+      // pinned first and highlighted), each expanding to its songs,
+      // each song expanding to its lyrics, everything collapsible.
       const r3 = document.createElement("div");
       r3.className = "cp-mindtable";
       const hd = document.createElement("div");
       hd.className = "cp-mindrow cp-mindhead";
       hd.innerHTML = "<span>in</span><span>mind</span>"
-        + "<span class='cp-md-n'>chunks</span><span></span>";
+        + "<span class='cp-md-n'>chunks</span><span class='cp-md-all'>"
+        + "<button class='cp-exall' title='expand every mind'>⊞</button>"
+        + "<button class='cp-coall' title='collapse everything'>⊟"
+        + "</button></span>";
       r3.appendChild(hd);
+      hd.querySelector(".cp-exall").onclick = () =>
+        r3.querySelectorAll("details.cp-mindnode").forEach(
+          (d) => { d.open = true; });
+      hd.querySelector(".cp-coall").onclick = () =>
+        r3.querySelectorAll("details").forEach(
+          (d) => { d.open = false; });
       const have = new Set(c.minds || []);
       const allRows = (mindsAll.length ? mindsAll
         : (c.minds || []).map((id) => ({
             id, name: id, chunks: (c.chunks || {})[id] })))
-        .slice().sort((a, b) => String(a.name || a.id)
-          .localeCompare(String(b.name || b.id)));
-      // #821: THIS crystal's data under THIS crystal — only member
-      // minds in the table; the rest of the registry waits behind the
-      // 'add minds' expander below.
-      const rows = allRows.filter((m) => have.has(m.id));
-      for (const m of rows) {
-        const lab = document.createElement("label");
-        lab.className = "cp-mindrow" + (have.has(m.id) ? " in" : "");
-        lab.title = m.blurb || m.id;
-        lab.innerHTML = "<input type='checkbox'"
+        .slice().sort((a, b) =>
+          (have.has(b.id) - have.has(a.id))
+          || String(a.name || a.id).localeCompare(String(b.name || b.id)));
+      const loadLyrics = async (box, rid, file) => {
+        if (box.dataset.done) return;
+        box.dataset.done = "1";
+        box.textContent = "reading…";
+        try {
+          const d = await api.get("/api/speakbox/"
+            + encodeURIComponent(file) + "?mind="
+            + encodeURIComponent(rid));
+          box.textContent = d.text || "(empty)";
+        } catch (err) { box.textContent = err.message; }
+      };
+      const loadSongs = async (box, rid) => {
+        if (box.dataset.done) return;
+        box.dataset.done = "1";
+        box.innerHTML = "<span class='muted'>reading the songs…</span>";
+        try {
+          const d = await api.get("/api/speakbox/minds/"
+            + encodeURIComponent(rid) + "/sources");
+          box.innerHTML = "";
+          const srcs = (d.sources || []).slice().sort((x, y) =>
+            String(x.file).localeCompare(String(y.file)));
+          if (!srcs.length) {
+            box.innerHTML = "<span class='muted'>nothing embedded in "
+              + "this mind yet</span>";
+          }
+          srcs.forEach((s) => {
+            const song = document.createElement("details");
+            song.className = "cp-songnode";
+            const cap = document.createElement("summary");
+            cap.innerHTML = "<span class='cp-md-name'>" + esc(s.file)
+              + "</span><span class='cp-md-n'>"
+              + (s.chunks | 0).toLocaleString() + "</span>";
+            song.appendChild(cap);
+            const ly = document.createElement("div");
+            ly.className = "cp-lyrics";
+            song.appendChild(ly);
+            song.ontoggle = () => {
+              if (song.open) loadLyrics(ly, rid, s.file);
+            };
+            box.appendChild(song);
+          });
+        } catch (err) { box.textContent = err.message; }
+      };
+      for (const m of allRows) {
+        const node = document.createElement("details");
+        node.className = "cp-mindnode";
+        const cap = document.createElement("summary");
+        cap.className = "cp-mindrow" + (have.has(m.id) ? " in" : "");
+        cap.title = (m.blurb || m.id) + " — click to expand its songs";
+        cap.innerHTML = "<input type='checkbox'"
           + (have.has(m.id) ? " checked" : "")
-          + "><span class='cp-md-name'>" + esc(m.name || m.id)
+          + "><span class='cp-md-name'>▸ " + esc(m.name || m.id)
           + "</span><span class='cp-md-n'>"
           + (m.chunks | 0).toLocaleString()
-          + "</span><button class='cp-md-read' title='read this "
-          + "mind'>📜</button>";
-        lab.querySelector("input").onchange = (ev) => {
+          + "</span><button class='cp-md-read' title='read this mind "
+          + "in the big reader'>📜</button>";
+        const check = cap.querySelector("input");
+        check.onclick = (ev) => ev.stopPropagation();
+        check.onchange = (ev) => {
           const next = new Set(have);
           if (ev.target.checked) next.add(m.id);
           else next.delete(m.id);
           save(c.id, { minds: Array.from(next) });
         };
-        lab.querySelector(".cp-md-read").onclick = (ev) => {
+        cap.querySelector(".cp-md-read").onclick = (ev) => {
           ev.preventDefault();
           ev.stopPropagation();
           openMind([m.id], m.name || m.id);
         };
-        r3.appendChild(lab);
-      }
-      if (!rows.length) {
-        const none = document.createElement("div");
-        none.className = "cp-mindrow";
-        none.style.cursor = "default";
-        none.innerHTML = "<span></span><span class='muted'>no minds in "
-          + "this crystal yet — add some below</span><span></span>"
-          + "<span></span>";
-        r3.appendChild(none);
+        node.appendChild(cap);
+        const songs = document.createElement("div");
+        songs.className = "cp-songs";
+        node.appendChild(songs);
+        node.ontoggle = () => { if (node.open) loadSongs(songs, m.id); };
+        r3.appendChild(node);
       }
       card.appendChild(r3);
-      // #821: the registry's OTHER minds, behind a door with a filter.
-      const others = allRows.filter((m) => !have.has(m.id));
-      if (others.length) {
-        const adder = document.createElement("details");
-        adder.className = "cp-addminds";
-        const cap = document.createElement("summary");
-        cap.textContent = "＋ add minds (" + others.length
-          + " available)";
-        adder.appendChild(cap);
-        const flt = document.createElement("input");
-        flt.type = "text";
-        flt.placeholder = "filter…";
-        flt.style.cssText = "width:100%;margin:4px 0";
-        adder.appendChild(flt);
-        const box = document.createElement("div");
-        box.className = "cp-mindtable";
-        adder.appendChild(box);
-        const paintOthers = () => {
-          const want = flt.value.trim().toLowerCase();
-          box.innerHTML = "";
-          others.filter((m) => !want
-            || String(m.name || m.id).toLowerCase().includes(want))
-            .slice(0, 200).forEach((m) => {
-              const lab = document.createElement("label");
-              lab.className = "cp-mindrow";
-              lab.title = m.blurb || m.id;
-              lab.innerHTML = "<input type='checkbox'><span "
-                + "class='cp-md-name'>" + esc(m.name || m.id)
-                + "</span><span class='cp-md-n'>"
-                + (m.chunks | 0).toLocaleString()
-                + "</span><button class='cp-md-read' title='read this "
-                + "mind'>📜</button>";
-              lab.querySelector("input").onchange = () => {
-                const next = new Set(have);
-                next.add(m.id);
-                save(c.id, { minds: Array.from(next) });
-              };
-              lab.querySelector(".cp-md-read").onclick = (ev) => {
-                ev.preventDefault();
-                ev.stopPropagation();
-                openMind([m.id], m.name || m.id);
-              };
-              box.appendChild(lab);
-            });
-        };
-        flt.oninput = paintOthers;
-        paintOthers();
-        card.appendChild(adder);
-      }
 
       const r4 = document.createElement("div");
       r4.className = "cp-row";
