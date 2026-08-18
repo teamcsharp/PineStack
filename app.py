@@ -18985,7 +18985,14 @@ def sfx_list(folder: Path) -> list[Path]:
                  if p.is_file() and p.suffix.lower() in MUSIC_TYPES]
     except OSError:
         return []                       # the share went away; carry on
-    return sorted(found)[:SFX_MAX_FILES]
+    if len(found) <= SFX_MAX_FILES:
+        return sorted(found)
+    # #817: a folder past the cap ROTATES instead of freezing on the
+    # first four hundred names — the operator dropped 3,447 grabs into
+    # one folder and five-sixths of them could never have aired. The
+    # glob runs per pick, so a fresh sample each draw puts the WHOLE
+    # library in play while the downstream cost stays bounded.
+    return random.sample(found, SFX_MAX_FILES)
 
 
 def sfx_cap_seconds() -> float:
