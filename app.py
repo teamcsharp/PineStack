@@ -7821,22 +7821,30 @@ async def _nabu_played_since(t0: float) -> bool:
     token, _player = _ha_creds()
     if not token:
         return False
+    # #830: VOICE goes out as an assist_satellite ANNOUNCE, which flips
+    # the SATELLITE entity to 'responding' — the media player only moves
+    # for play_media (music). The first cut of this proof watched only
+    # the media player, scored every real DJ line as a miss, tripped the
+    # breaker and silenced the whole station. Either entity's motion
+    # since t0 is audible proof.
     try:
         async with httpx.AsyncClient(timeout=8) as client:
-            state = (await client.get(
-                f"{HA_URL}/api/states/{NABU_MEDIA_PLAYER}",
-                headers={"Authorization": f"Bearer {token}"})).json() or {}
-        if str(state.get("state")) == "playing":
-            return True
-        changed = str(state.get("last_changed") or "")
-        if changed:
-            import datetime as _dt
-            when = _dt.datetime.fromisoformat(
-                changed.replace("Z", "+00:00")).timestamp()
-            # It played and already finished: the transition happened
-            # after our announce began.
-            if when >= t0 - 2.0:
-                return True
+            for entity, live_states in (
+                    (NABU_MEDIA_PLAYER, ("playing",)),
+                    (NABU_SATELLITE, ("responding",))):
+                state = (await client.get(
+                    f"{HA_URL}/api/states/{entity}",
+                    headers={"Authorization": f"Bearer {token}"}
+                )).json() or {}
+                if str(state.get("state")) in live_states:
+                    return True
+                changed = str(state.get("last_changed") or "")
+                if changed:
+                    import datetime as _dt
+                    when = _dt.datetime.fromisoformat(
+                        changed.replace("Z", "+00:00")).timestamp()
+                    if when >= t0 - 2.0:
+                        return True
     except Exception:  # noqa: BLE001
         pass
     return False
@@ -24549,6 +24557,16 @@ async def speak_turns(turns: list[tuple[str, str]],
                 if clip and clip.get("path"):
                     key = clip["path"].rsplit("/", 1)[-1]
                     seg.append(str(VOICE_MEDIA_DIR / key))
+                    # #833: sting_due() existed, had a dial, had TESTS —
+                    # and no live path ever called it. The samples now
+                    # punch into the stream between lines, at the dial's
+                    # rate, never twice inside the gap.
+                    _sting = sting_due()
+                    if _sting:
+                        seg.append(str(_sting))
+                        _STING_AT[0] = time.time()
+                        pipeline_log("air", f"sting: {_sting.stem} "
+                                     "dropped between lines (#833)")
                     # #748: how long THIS turn runs, so the booth can follow the
                     # coalesced clip turn by turn instead of knowing only that
                     # "a round" is playing.
@@ -30873,6 +30891,33 @@ async def _lyric_digest(artist: str, songs: list[dict[str, Any]]) -> str:
             + "\n".join(f"- {s['title']}" for s in songs) + "\n")
 
 
+def _lyric_from_tags(path: Path) -> str:
+    """#832: many songs CARRY their lyrics — USLT (mp3), LYRICS /
+    UNSYNCEDLYRICS (FLAC/Vorbis), \u00a9lyr (MP4). When the file ships its
+    own words, use them verbatim and skip the rip entirely: faster, and
+    the text is the artist's, not whisper's guess."""
+    try:
+        import mutagen
+        m = mutagen.File(str(path))
+        tags = getattr(m, "tags", None)
+        if not tags:
+            return ""
+        texts: list[str] = []
+        for k in list(tags.keys()):
+            ks = str(k).upper()
+            if ks.startswith("USLT") or ks in (
+                    "LYRICS", "UNSYNCEDLYRICS", "LYRICS:", "\u00a9LYR"):
+                v = tags[k]
+                t = getattr(v, "text", v)
+                if isinstance(t, (list, tuple)):
+                    t = "\n".join(str(x) for x in t)
+                if t:
+                    texts.append(str(t))
+        return max(texts, key=len).strip() if texts else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
                      mind: str, force: bool) -> None:
     job = _LYRIC_JOBS[job_id]
@@ -30887,12 +30932,24 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
             title = str(track.get("title") or f"track {at + 1}")
             _lyric_note(job, current=title, done=at,
                         progress=round(at / max(1, len(tracks)), 3))
-            page = folder / f"{at + 1:03d} - {safe_key(title) or 'track'}.md"
+            _alb_dir = folder / (safe_key(
+                str(track.get("album") or "singles")) or "singles")
+            _alb_dir.mkdir(parents=True, exist_ok=True)
+            page = _alb_dir / (
+                f"{at + 1:03d} - {safe_key(title) or 'track'}.md")
             if page.is_file() and not force:
                 body = page.read_text(errors="replace")
                 songs.append({"title": title, "text": body})
                 continue
-            text = await _lyric_one(Path(str(track.get("path") or "")))
+            _src_note = "transcribed"
+            text = _lyric_from_tags(Path(str(track.get("path") or "")))
+            if text and len(text) > 200:
+                _src_note = "lyrics from the file's own tags"
+                pipeline_log("speakbox", f"{title} \u2014 lyrics shipped in "
+                             "the tags; no rip needed (#832)")
+            else:
+                text = await _lyric_one(
+                    Path(str(track.get("path") or "")))
             if not (text and _lyric_usable(text)):
                 job["instrumental"] = int(job.get("instrumental") or 0) + 1
                 pipeline_log("speakbox",
@@ -30901,7 +30958,7 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
             page.write_text(
                 f"# {title}\n\n"
                 f"- {artist} · {track.get('album') or ''}\n"
-                f"- transcribed {time.strftime('%Y-%m-%d %H:%M')}\n\n"
+                f"- {_src_note} {time.strftime('%Y-%m-%d %H:%M')}\n\n"
                 + text, encoding="utf-8")
             songs.append({"title": title, "text": text})
             pipeline_log("speakbox", f"read {title} — "
@@ -31125,6 +31182,28 @@ async def crystals_delete(
     return {"removed": cid}
 
 
+def _mind_ensure(rid: str, name: str) -> str:
+    """#832: register a mind if it does not exist — mind_id() is a
+    VALIDATOR that silently falls back to 'main' for unknown ids, which
+    routed thirteen album extractions into the studio's own head."""
+    rid = re.sub(r"[^a-z0-9_-]", "", str(rid).lower())[:40]
+    if not rid or rid == "main":
+        return "main"
+    if any(m["id"] == rid for m in speakbox_minds()):
+        return rid
+    folder = mind_dir_ok("", rid)
+    settings = load_settings()
+    dj = dict(settings.get("dj") or {})
+    rows = list(dj.get("speakbox_minds") or [])
+    rows.append({"id": rid, "name": str(name)[:60], "dir": str(folder),
+                 "blurb": "album mind (crystal extraction #832)",
+                 "weights": {}})
+    dj["speakbox_minds"] = rows
+    save_settings({**settings, "dj": dj})
+    pipeline_log("speakbox", f"album mind opened — {name} ({rid})")
+    return rid
+
+
 @app.post("/api/crystals/extract")
 async def crystals_extract(
     request: Request,
@@ -31145,33 +31224,64 @@ async def crystals_extract(
     if not tracks:
         raise HTTPException(status_code=404,
                             detail="no tracks match that artist/albums")
-    rid = mind_id(re.sub(r"[^a-z0-9]", "", artist.lower())[:24]
-                  or "crystal")
+    # #832: one MIND PER ALBUM, always — so a crystal can summon exactly
+    # the albums it names, and combining albums is editing crystal.minds.
+    _slug = re.sub(r"[^a-z0-9]", "", artist.lower())[:20] or "artist"
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for t in tracks[:300]:
+        alb = re.sub(r"[^a-z0-9]", "",
+                     str(t.get("album") or "single").lower())[:24] or "single"
+        groups.setdefault(alb, []).append(t)
+    alb_minds = {alb: _mind_ensure(f"{_slug}-{alb}",
+                                   f"{artist} — {alb}")
+                 for alb in groups}
+    minds = list(alb_minds.values())
     job_id = "ly_" + uuid.uuid4().hex[:8]
     with _LYRIC_LOCK:
         _LYRIC_JOBS[job_id] = {
             "id": job_id, "artist": artist, "stage": "reading",
             "total": len(tracks), "done": 0, "progress": 0.0,
-            "current": "", "instrumental": 0, "mind": rid,
-            "started": time.time(),
+            "current": f"{len(groups)} album(s) queued", "instrumental": 0,
+            "mind": ", ".join(minds)[:120], "started": time.time(),
         }
-    fire_and_forget(_lyric_run(job_id, artist, tracks[:300], rid,
-                               bool(payload.get("force"))))
+
+    async def _run_albums() -> None:
+        done = 0
+        for alb, rows in groups.items():
+            sub = "ly_" + uuid.uuid4().hex[:8]
+            rid_a = alb_minds[alb]
+            with _LYRIC_LOCK:
+                _LYRIC_JOBS[sub] = {
+                    "id": sub, "artist": f"{artist} \u2014 {alb}",
+                    "stage": "reading", "total": len(rows), "done": 0,
+                    "progress": 0.0, "current": "", "instrumental": 0,
+                    "mind": rid_a, "started": time.time()}
+            await _lyric_run(sub, artist, rows, rid_a,
+                             bool(payload.get("force")))
+            done += len(rows)
+            with _LYRIC_LOCK:
+                _LYRIC_JOBS[job_id].update(
+                    done=done,
+                    progress=round(done / max(1, len(tracks)), 3),
+                    current=f"finished {alb}")
+        with _LYRIC_LOCK:
+            _LYRIC_JOBS[job_id].update(stage="done", progress=1.0)
+    fire_and_forget(_run_albums())
     cname = str(payload.get("crystal_name") or artist)[:60]
     data = crystals_read()
     cid = re.sub(r"[^a-z0-9_-]", "",
                  cname.lower().replace(" ", "-"))[:40] or rid
     data[cid] = {**(data.get(cid) or {}), "name": cname,
                  "minds": sorted({*((data.get(cid) or {}).get("minds")
-                                    or []), rid}),
+                                    or []), *minds}),
                  "tint": str(payload.get("tint")
                              or (data.get(cid) or {}).get("tint") or ""),
                  "strength": (data.get(cid) or {}).get("strength", 50),
                  "on": (data.get(cid) or {}).get("on", False),
                  "built": int(time.time()), "extracting": job_id}
     crystals_save(data)
-    return {"job": job_id, "crystal": cid, "mind": rid,
-            "tracks": len(tracks)}
+    return {"job": job_id, "crystal": cid, "minds": minds,
+            "albums": len(groups), "tracks": len(tracks)}
 
 
 @app.get("/api/crystals/{cid}/seed")
