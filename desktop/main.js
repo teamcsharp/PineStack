@@ -199,6 +199,13 @@ function cmdEscape(value) {
 }
 
 function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
+  // #827: the old script COLLAPSED node_modules and prayed npm was
+  // installed and the network was kind — when npm failed it tried to
+  // relaunch the electron.exe it had just deleted, and the operator
+  // was stranded outside the app. This is the pine_box.exe recipe:
+  // refresh the source, unpack the PREBUILT runtime from the share
+  // only if it is missing, and relaunch directly. No npm, no network
+  // beyond the share, nothing deleted that the relaunch needs.
   const scriptPath = path.join(app.getPath("userData"), "pinebox-rebuild.cmd");
   const logPath = path.join(app.getPath("userData"), "pinebox-rebuild.log");
   const lines = [
@@ -209,39 +216,41 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
     `set "BASE_URL=${cmdEscape(cfg.baseUrl)}"`,
     `set "MODE=${cmdEscape(cfg.mode)}"`,
     `set "LOG=${cmdEscape(logPath)}"`,
-    "> \"%LOG%\" echo [rebuild] waiting for Electron to release its runtime DLLs",
-    "timeout /t 4 /nobreak >nul",
+    "> \"%LOG%\" echo [rebuild] waiting for Electron to exit",
+    "timeout /t 3 /nobreak >nul",
+    "if not exist \"%SOURCE_DIR%\\package.json\" (",
+    ">> \"%LOG%\" echo [rebuild] cannot reach %SOURCE_DIR%",
+    "  goto fail",
+    ")",
+    "if not exist \"%RUN_DIR%\" mkdir \"%RUN_DIR%\"",
     "cd /d \"%RUN_DIR%\" || goto fail",
-    ">> \"%LOG%\" echo [rebuild] collapsing local runner",
-    "for %%D in (node_modules dist-desktop .vite .electron .cache) do if exist \"%%D\" rmdir /s /q \"%%D\" >> \"%LOG%\" 2>&1",
-    ">> \"%LOG%\" echo [rebuild] copying latest source",
+    ">> \"%LOG%\" echo [rebuild] refreshing the app from the share",
     "copy /Y \"%SOURCE_DIR%\\package.json\" \"%RUN_DIR%\\package.json\" >> \"%LOG%\" 2>&1",
     "if exist \"%SOURCE_DIR%\\package-lock.json\" copy /Y \"%SOURCE_DIR%\\package-lock.json\" \"%RUN_DIR%\\package-lock.json\" >> \"%LOG%\" 2>&1",
     "robocopy \"%SOURCE_DIR%\\desktop\" \"%RUN_DIR%\\desktop\" /MIR /NFL /NDL /NJH /NJS /NP >> \"%LOG%\" 2>&1",
     "if errorlevel 8 goto fail",
-    ">> \"%LOG%\" echo [rebuild] npm install",
-    "call npm install >> \"%LOG%\" 2>&1 || goto fail",
-    ">> \"%LOG%\" echo [rebuild] electron pack",
-    "call npm run desktop:pack >> \"%LOG%\" 2>&1",
+    "if not exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" (",
+    ">> \"%LOG%\" echo [rebuild] unpacking the prebuilt Electron runtime from the share",
+    "  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -Force '%SOURCE_DIR%\\..\\desktop-runtime\\electron-win64.zip' '%RUN_DIR%\\node_modules\\electron'\" >> \"%LOG%\" 2>&1",
+    ")",
+    "if not exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" goto fail",
+    "> \"%RUN_DIR%\\node_modules\\electron\\path.txt\" echo electron.exe",
     ">> \"%LOG%\" echo [rebuild] relaunching Pine Box Desktop",
     `set "PINE_AGENT_ROOT=${cmdEscape(sourceRoot)}"`,
     "set \"PINE_DESKTOP_BASE_URL=%BASE_URL%\"",
     "set \"PINE_DESKTOP_MODE=%MODE%\"",
-    // Launch electron.exe directly: the runner's node_modules/.bin shims
-    // are not reliable (hand-repaired electron package), and a shell
-    // spawned from Electron may carry ELECTRON_RUN_AS_NODE.
+    // A shell spawned from Electron may carry ELECTRON_RUN_AS_NODE,
+    // which turns electron.exe into plain Node. Always clear it.
     "set \"ELECTRON_RUN_AS_NODE=\"",
     "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
     "exit /b 0",
     ":fail",
-    ">> \"%LOG%\" echo [rebuild] failed with %errorlevel% — relaunching anyway",
+    ">> \"%LOG%\" echo [rebuild] FAILED — see above",
     "set \"ELECTRON_RUN_AS_NODE=\"",
     "if exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" (",
     "  start \"Pine Box Desktop\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
     ") else (",
-    // The runner is gutted and cannot come back on its own: open a VISIBLE
-    // console saying so, rather than vanishing with only a log nobody sees.
-    "  start \"Pine Box Desktop rebuild failed\" cmd /d /k \"echo [rebuild] failed and the Electron runtime is missing. & echo Run the desktop launcher .cmd to reinstall, or read: & echo %LOG%\"",
+    "  start \"Pine Box Desktop rebuild failed\" cmd /d /k \"echo [rebuild] The Electron runtime is missing and the share bundle could not be unpacked. & echo Double-click \\\\10.89.1.246\\ehm_eckx\\pinevoice-stack\\pine_box.exe to rebuild from scratch, or read: & echo %LOG%\"",
     ")",
     "exit /b 1",
     ""
@@ -398,8 +407,8 @@ async function reconstituteDesktop() {
       const { scriptPath, logPath } = writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg);
       const runway = [
         [18, "source sync", "mapping latest desktop source"],
-        [22, "npm install", "queueing a clean dependency install"],
-        [26, "npx/electron pack", "preparing the Electron pack step"],
+        [22, "runtime", "verifying the prebuilt Electron runtime"],
+        [26, "no npm needed", "the runtime ships prebuilt on the share"],
         [30, "routing", "restoring Nabu/app station routing"],
         [34, "visualizer", "holding simulation while processes map in"],
         [38, "handoff", `external rebuild log ${logPath}`]
