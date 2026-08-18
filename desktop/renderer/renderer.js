@@ -1566,6 +1566,30 @@ function initStatusBar() {
       };
       tabs.appendChild(db);
     }
+    // #804: size to the number of entries you want to READ. Presets set
+    // the height to fit that many rows exactly; the grip and edges still
+    // drag anywhere in between, and every size is remembered.
+    const sizer = document.createElement("span");
+    sizer.style.cssText = "margin-left:auto;display:flex;gap:3px";
+    [["8", 8], ["20", 20], ["40", 40], ["Max", 0]].forEach(([lbl, rows]) => {
+      const b = document.createElement("button");
+      b.textContent = lbl;
+      b.title = rows ? "show ~" + rows + " entries" : "fill the window";
+      b.onclick = (ev) => {
+        ev.stopPropagation();
+        if (rows) {
+          pop.style.height = (rows * 18 + 72) + "px";
+        } else {
+          pop.style.height = "94vh";
+          pop.style.width = "98vw";
+        }
+        localStorage.setItem("sbTermSize", JSON.stringify(
+          {w: pop.offsetWidth, h: pop.offsetHeight}));
+        drawPop();
+      };
+      sizer.appendChild(b);
+    });
+    tabs.appendChild(sizer);
     pop.appendChild(tabs);
     // #802: rebuilding the list must never yank the view — remember where
     // the reader was and put them back there unless they were riding the
@@ -1645,6 +1669,7 @@ function initStatusBar() {
     scroller.appendChild(foot);
     if (stickBottom) scroller.scrollTop = scroller.scrollHeight;
     else scroller.scrollTop = oldTop;      // stay where the reader was
+    if (pop._grip) pop.appendChild(pop._grip);  // survives the rebuild
   }
 
   function restoreSize() {
@@ -1657,6 +1682,34 @@ function initStatusBar() {
     localStorage.setItem("sbTermSize", JSON.stringify(
       {w: pop.offsetWidth, h: pop.offsetHeight}));
   });
+  // #804: an explicit drag grip — native resize handles can be shy; this
+  // one is 16px of unmissable corner, dragging as far as the window goes.
+  const grip = document.createElement("div");
+  grip.textContent = "◢";
+  grip.style.cssText = "position:absolute;right:1px;bottom:1px;width:16px;"
+    + "height:16px;cursor:nwse-resize;color:#5d6d7e;font-size:11px;"
+    + "line-height:16px;text-align:center;user-select:none;z-index:2";
+  grip.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+    const sw = pop.offsetWidth, sh = pop.offsetHeight;
+    const sx = ev.clientX, sy = ev.clientY;
+    const move = (m) => {
+      pop.style.width = Math.min(window.innerWidth * 0.98,
+        Math.max(420, sw + (m.clientX - sx) * 2)) + "px";
+      pop.style.height = Math.min(window.innerHeight * 0.94,
+        Math.max(160, sh + (m.clientY - sy) * 2)) + "px";
+    };
+    const stop = () => {
+      document.removeEventListener("mousemove", move);
+      document.removeEventListener("mouseup", stop);
+      localStorage.setItem("sbTermSize", JSON.stringify(
+        {w: pop.offsetWidth, h: pop.offsetHeight}));
+    };
+    document.addEventListener("mousemove", move);
+    document.addEventListener("mouseup", stop);
+  });
+  pop._grip = grip;
+  pop.appendChild(grip);
 
   line.addEventListener("click", () => {
     open = pop.style.display === "none";
