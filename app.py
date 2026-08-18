@@ -13108,8 +13108,15 @@ async def larder_keeper() -> None:
             cap = min(_LARDER_MAX, 12 if box_down else target)
             if len(_LARDER) >= cap or _LARDER_WRITING[0]:
                 continue
-            if _OLLAMA_GATE.locked():
-                continue               # live work outranks stocking shelves
+            # #823: "live work outranks stocking shelves" became
+            # STARVATION once the desk stopped being idle — the gate is
+            # locked all show long, the shelf never refills, and every
+            # round airs only after its own minute-long write. A BARE
+            # shelf queues its write anyway: it runs the moment the
+            # live write finishes, which is the back-to-back cadence
+            # the operator expects.
+            if _OLLAMA_GATE.locked() and len(_LARDER) >= 2:
+                continue
             _LARDER_WRITING[0] = True
             try:
                 # The script is written ahead; when it reaches speak_turns
@@ -18019,6 +18026,40 @@ def doc_lock_set(doc: str, hours: float = 1.0,
     return row
 
 
+def _crystal_influence_note(mind: str, file: str, text: str,
+                            kind: str = "round") -> None:
+    """#822: the observatory's feed. Every time crystal material lands
+    in somebody's mouth, one row records which crystal, which mind,
+    which document, the words themselves, and who the material was
+    staged for — the live wiring the 🌆 view draws as trajectories."""
+    try:
+        cr = None
+        for c in crystal_active():
+            if mind in (c.get("minds") or []):
+                cr = c
+                break
+        if cr is None:
+            return
+        plan = _RADIO.get("plan") or {}
+        if kind == "sfxguy":
+            targets = ["sfxguy"]
+        elif (str(plan.get("kind")) == "call"
+              and time.time() - float(plan.get("at") or 0) < 300):
+            targets = ["caller", "host", "cohost"]
+        else:
+            targets = ["host", "cohost"]
+        ring = _RADIO.setdefault("crystal_influence", [])
+        ring.append({"ts": int(time.time()),
+                     "crystal": str(cr.get("name") or ""),
+                     "strength": int(cr.get("strength") or 50),
+                     "mind": mind, "file": str(file or ""),
+                     "text": str(text or "")[:240], "kind": kind,
+                     "targets": targets})
+        del ring[:-80]
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                          rid: str = "", only: str = "") -> dict[str, Any]:
     """A swath out of one document, both drawn at random.
@@ -18154,6 +18195,7 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                         "thought stays whole. Once aired these are "
                         "marked heard and will not repeat until the "
                         "shelf runs dry."))
+            _crystal_influence_note(key, doc.name, " ".join(lines))
             return {"file": doc.name, "text": " ".join(lines),
                     "lines": lines, "mind": key}
         if exhausted is None and gems:
@@ -18802,11 +18844,17 @@ async def _sfxguy_news_fill() -> None:
         picks = news_selection(await drudge_headlines(24), False)
         if picks:
             story = picks[0]
+            _ntint = ""
+            _ncrs = crystal_active()
+            if _ncrs:
+                _ncr = random.choice(_ncrs)
+                _ntint = (" Let a little of this flavor bleed in: "
+                          f"{str(_ncr.get('tint') or _ncr.get('name'))[:120]}.")
             take = await ask_model(
                 "You are a thick-accented, NASCAR-loving country boy in "
                 f"a radio booth. Headline: {story.get('title')}. Give ONE "
                 "spicy, funny one-line take on it, under 22 words, no "
-                "quotes, no explanation.", limit=140, spice=0.85)
+                f"quotes, no explanation.{_ntint}", limit=140, spice=0.85)
             take = str(take or "").strip().strip('"').strip()[:180]
             if take and looks_english(take):
                 _SFXGUY_NEWS.append({
@@ -18830,6 +18878,30 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
     try:
         rows = sfxguy_quips(voice)
         picks = random.sample(rows, k=min(2, len(rows)))
+        # #820: the tint rides EVERY brew — reactions, warps, the lot —
+        # with a shard of the crystal's own material folded in, because
+        # material beats instruction on a small model.
+        _tinted = ""
+        _shard = ""
+        _crs0 = crystal_active()
+        if _crs0:
+            _cr0 = random.choice(_crs0)
+            _tinted = (" Let a little of this flavor bleed in: "
+                       f"{str(_cr0.get('tint') or _cr0.get('name'))[:120]}.")
+            _minds0 = [m for m in (_cr0.get("minds") or [])
+                       if any(x["id"] == m for x in speakbox_minds())]
+            if _minds0:
+                try:
+                    _rid0 = random.choice(_minds0)
+                    _sw0 = await speakbox_quote(most=1, cap=90, rid=_rid0)
+                    if _sw0 and _sw0.get("text"):
+                        _shard = (" Fold a shard of this line into it: "
+                                  f"\"{str(_sw0['text'])[:90]}\".")
+                        _crystal_influence_note(
+                            _rid0, _sw0.get("file", ""),
+                            _sw0["text"], "sfxguy")
+                except Exception:  # noqa: BLE001
+                    _shard = ""
         # #804: when a line just aired, half his inventions REACT to it —
         # engaged with the conversation, not shouted past it.
         if context and random.random() < 0.5:
@@ -18838,7 +18910,8 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                 f"Someone on air just said: \"{context}\". Fire back ONE "
                 "short reaction that actually engages with what was said "
                 "— heckle it, one-up it, or agree way too hard — in your "
-                "backcountry voice. Under 22 words, no quotes.",
+                f"backcountry voice.{_tinted}{_shard} Under 22 words, "
+                "no quotes.",
                 limit=150, spice=0.85)
             line = str(out or "").strip().strip('"').strip()
             if 8 <= len(line) <= 200 and looks_english(line) \
@@ -18859,17 +18932,12 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             "turn it into a proud boast that one-ups everybody "
             "listening",
         ))
-        _tinted = ""
-        _crs = crystal_active()
-        if _crs:
-            _cr = random.choice(_crs)
-            _tinted = (" Let a little of this flavor bleed in: "
-                       f"{str(_cr.get('tint') or _cr.get('name'))[:120]}.")
         out = await ask_model(
             "You are a thick-accented country boy in a radio booth. "
             f"Take these sayings: {' / '.join(picks)} — and {recipe}."
-            f"{_tinted} Answer with the ONE new saying only, under 25 "
-            "words, no quotes, no explanation.", limit=160, spice=0.9)
+            f"{_tinted}{_shard} Answer with the ONE new saying only, "
+            "under 25 words, no quotes, no explanation.",
+            limit=160, spice=0.9)
         line = str(out or "").strip().strip('"').strip()
         if 12 <= len(line) <= 200 and looks_english(line)                 and "\n" not in line:
             _SFXGUY_WARPED.append(line)
@@ -18888,6 +18956,13 @@ def sfxguy_line(voice: str, context: str = "") -> str:
     a NEWS story with a spicy take, and the hosts take it up as the
     topic."""
     warp = max(0, min(100, int(dj_settings().get("sfxguy_warp") or 0)))
+    _wcrs = crystal_active()
+    if _wcrs:
+        # #820: the crystal takes the SFX guy too. His brewed lines are
+        # the ones carrying the tint, so while a crystal is on they
+        # outdraw the stock shelf at the crystal's own strength.
+        _wstr = max(int(c.get("strength") or 50) for c in _wcrs)
+        warp = max(warp, min(95, _wstr))
     line = ""
     if (_SFXGUY_NEWS and random.random() < 0.15
             and time.time() - _SFXGUY_NEWS_AT[0] > 600):
@@ -32485,6 +32560,26 @@ async def speakbox_mind_sources(
         seen[f]["chunks"] += 1
     return {"mind": key, "name": mind_row(key)["name"], "all": len(rows),
             "sources": [{"file": f, **v} for f, v in seen.items()]}
+
+
+@app.get("/api/crystals/influence")
+async def crystals_influence_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#822: the observatory's window — recent crystal-material draws
+    with their targets, plus the cast and the active crystals."""
+    require_read_auth(authorization)
+    dj = dj_settings()
+    return {
+        "rows": list(_RADIO.get("crystal_influence") or [])[-60:],
+        "active": [{"id": cid, **{k: c.get(k) for k in
+                                  ("name", "strength", "minds", "on")}}
+                   for cid, c in crystals_read().items()],
+        "cast": {"host": dj.get("dj_name") or "Host",
+                 "cohost": dj.get("cohost_name") or "Skip",
+                 "sfxguy": dj.get("sfx_name") or "The SFX Guy",
+                 "caller": "the phone line"},
+    }
 
 
 @app.get("/api/crystals/{cid}/seed")

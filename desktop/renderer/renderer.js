@@ -2632,17 +2632,311 @@ function initCrystalBtn() {
     ensureGrips();
   }
 
+  let obs = null;
+  function obsStop() {
+    if (!obs) return;
+    cancelAnimationFrame(obs.raf || 0);
+    clearInterval(obs.poll || 0);
+    try { obs.renderer.dispose(); } catch { /* gone */ }
+    obs = null;
+  }
+
+  /* #822: THE INFLUENCE OBSERVATORY. The active crystal's minds rise
+   * as a hex city — a slowly turning, gently undulating topography —
+   * and every time crystal material is staged into somebody's mouth a
+   * trajectory arcs from that mind's tower to the character it is
+   * seeding. Click a connection (or its console row) to read the exact
+   * chunk and how it is being used. */
+  async function openObservatory() {
+    mode = "obs";
+    towerStop();
+    pop.innerHTML = "";
+    const head = document.createElement("div");
+    head.className = "cp-head";
+    head.innerHTML = "<button class='cp-back'>‹ cabinet</button>"
+      + "<b>🌆 the influence observatory</b>"
+      + "<span class='muted cp-count'></span>"
+      + "<button class='cp-x'>✕</button>";
+    pop.appendChild(head);
+    dragBy(head);
+    head.querySelector(".cp-back").onclick = () => { obsStop(); draw(); };
+    head.querySelector(".cp-x").onclick = () => {
+      obsStop(); pop.style.display = "none"; mode = "cards";
+    };
+    const sel = document.createElement("select");
+    (cache.crystals || []).forEach((c) => {
+      const o = document.createElement("option");
+      o.value = c.id;
+      o.textContent = (c.on ? "◉ " : "○ ") + c.name;
+      if (c.on) o.selected = true;
+      sel.appendChild(o);
+    });
+    sel.title = "which crystal the city shows — choosing also puts it "
+      + "ON AIR";
+    sel.onchange = async () => {
+      try {
+        for (const c of cache.crystals) {
+          await api.post("/api/crystals/" + c.id + "/toggle",
+                         { on: c.id === sel.value });
+        }
+      } catch { /* quiet */ }
+      await pull();
+      obsStop();
+      openObservatory();
+    };
+    head.insertBefore(sel, head.querySelector(".cp-x"));
+
+    const body = document.createElement("div");
+    body.className = "cp-body";
+    const stage = document.createElement("div");
+    stage.style.cssText = "flex:1;min-width:0;position:relative";
+    const canvas = document.createElement("canvas");
+    canvas.style.cssText = "width:100%;height:100%;display:block;"
+      + "border-radius:8px;background:radial-gradient(ellipse at 50% "
+      + "30%, #150b26, #04060d)";
+    stage.appendChild(canvas);
+    const side = document.createElement("div");
+    side.className = "cp-left";
+    side.style.cssText = "flex:0 0 230px;max-width:230px";
+    body.appendChild(stage);
+    body.appendChild(side);
+    pop.appendChild(body);
+    const consoleEl = document.createElement("div");
+    consoleEl.className = "cp-obsconsole";
+    pop.appendChild(consoleEl);
+    ensureGrips();
+
+    const say = (line) => {
+      const row = document.createElement("div");
+      row.textContent = line;
+      consoleEl.appendChild(row);
+      while (consoleEl.childElementCount > 40) {
+        consoleEl.removeChild(consoleEl.firstChild);
+      }
+      consoleEl.scrollTop = consoleEl.scrollHeight;
+    };
+
+    try { await loadThree(); } catch (err) {
+      stage.textContent = "the observatory could not open: " + err.message;
+      return;
+    }
+    const T = window.THREE;
+    const crystal = (cache.crystals || []).find((c) => c.id === sel.value)
+      || (cache.crystals || [])[0];
+    if (!crystal) { stage.textContent = "no crystals forged yet"; return; }
+    head.querySelector(".cp-count").textContent =
+      crystal.name + " · " + (crystal.strength || 50) + "%";
+
+    const W = Math.max(420, stage.clientWidth || 560);
+    const H = Math.max(300, stage.clientHeight || 380);
+    canvas.width = W; canvas.height = H;
+    const renderer = new T.WebGLRenderer({ canvas, antialias: true,
+                                           alpha: true });
+    renderer.setSize(W, H, false);
+    const scene = new T.Scene();
+    scene.fog = new T.Fog(0x04060d, 90, 320);
+    const camera = new T.PerspectiveCamera(52, W / H, 0.1, 900);
+    camera.position.set(0, 74, 128);
+    camera.lookAt(0, 12, 0);
+    scene.add(new T.AmbientLight(0xffffff, 0.5));
+    const sun = new T.DirectionalLight(0xc9a0ff, 1.2);
+    sun.position.set(60, 140, 60);
+    scene.add(sun);
+    const world = new T.Group();
+    scene.add(world);
+    const grid = new T.GridHelper(240, 24, 0x2a1a44, 0x140d24);
+    world.add(grid);
+
+    // the CITY: one tower per mind, height from its chunks
+    const minds = (crystal.minds || []);
+    const towers = new Map();
+    const hexGeo = new T.CylinderGeometry(3.2, 3.2, 3.0, 6);
+    minds.forEach((mid, i) => {
+      const chunks = ((crystal.chunks || {})[mid]) | 0;
+      const floors = Math.max(2, Math.min(26,
+        Math.round(Math.log2(chunks + 2) * 3)));
+      const angle = i * 2.39996;               // golden spiral city blocks
+      const radius = 8 + Math.sqrt(i) * 13;
+      const x = Math.cos(angle) * radius, z = Math.sin(angle) * radius;
+      const tw = new T.Group();
+      for (let f = 0; f < floors; f++) {
+        const mat = new T.MeshStandardMaterial({
+          color: 0x4b2a6e, metalness: 0.4, roughness: 0.45,
+          emissive: 0x1b0b30 });
+        const hex = new T.Mesh(hexGeo, mat);
+        hex.position.y = 1.5 + f * 3.05;
+        tw.add(hex);
+      }
+      tw.position.set(x, 0, z);
+      tw.userData = { mind: mid, chunks, phase: Math.random() * 6.28 };
+      world.add(tw);
+      towers.set(mid, tw);
+    });
+
+    // the CAST: labeled pillars in a wide ring
+    function label(text, color) {
+      const cv = document.createElement("canvas");
+      cv.width = 256; cv.height = 64;
+      const g = cv.getContext("2d");
+      g.font = "bold 30px system-ui";
+      g.fillStyle = color;
+      g.textAlign = "center";
+      g.fillText(text.slice(0, 16), 128, 42);
+      const tex = new T.CanvasTexture(cv);
+      const sp = new T.Sprite(new T.SpriteMaterial({ map: tex,
+        transparent: true }));
+      sp.scale.set(30, 7.5, 1);
+      return sp;
+    }
+    let castNames = { host: "Host", cohost: "Skip",
+                      sfxguy: "The SFX Guy", caller: "the phone line" };
+    const castPos = { host: [-96, 0, -34], cohost: [96, 0, -34],
+                      sfxguy: [-96, 0, 58], caller: [96, 0, 58] };
+    const pillars = {};
+    Object.keys(castPos).forEach((who) => {
+      const [x, , z] = castPos[who];
+      const mat = new T.MeshStandardMaterial({ color: 0x1d3a56,
+        emissive: 0x0c2033, metalness: 0.3, roughness: 0.5 });
+      const pil = new T.Mesh(
+        new T.CylinderGeometry(4.4, 5.2, 16, 8), mat);
+      pil.position.set(x, 8, z);
+      world.add(pil);
+      const sp = label(castNames[who], "#9fd8ff");
+      sp.position.set(x, 24, z);
+      world.add(sp);
+      pillars[who] = pil;
+    });
+
+    // the CONNECTIONS
+    const arcs = [];
+    const seen = new Set();
+    const KINDS = {
+      round: "seeded VERBATIM into the next round's script — the pair "
+        + "must weave these exact words",
+      sfxguy: "folded into one of the SFX guy's invented interjections",
+      theme: "forced as tonight's subject material",
+    };
+    function arcTo(row, who) {
+      const tw = towers.get(row.mind);
+      const pil = pillars[who];
+      if (!tw || !pil) return;
+      const from = new T.Vector3(tw.position.x,
+        tw.children.length * 3.05 + 2, tw.position.z);
+      const to = new T.Vector3(pil.position.x, 18, pil.position.z);
+      const mid = from.clone().add(to).multiplyScalar(0.5);
+      mid.y += 36;
+      const curve = new T.QuadraticBezierCurve3(from, mid, to);
+      const geo = new T.TubeGeometry(curve, 32, 0.5, 6, false);
+      const mat = new T.MeshBasicMaterial({ color: 0xc98fe0,
+        transparent: true, opacity: 0.85 });
+      const tube = new T.Mesh(geo, mat);
+      tube.userData = { row, who, born: Date.now(), curve };
+      world.add(tube);
+      const pulse = new T.Mesh(
+        new T.SphereGeometry(1.4, 8, 8),
+        new T.MeshBasicMaterial({ color: 0xffffff }));
+      tube.userData.pulse = pulse;
+      world.add(pulse);
+      arcs.push(tube);
+    }
+    function detail(row) {
+      side.innerHTML = "";
+      const b = document.createElement("b");
+      b.textContent = row.crystal + " · " + row.mind;
+      side.appendChild(b);
+      const meta = document.createElement("div");
+      meta.className = "muted";
+      meta.style.fontSize = "10.5px";
+      meta.textContent = (row.file || "(unnamed doc)") + " → "
+        + (row.targets || []).map((t) => castNames[t] || t).join(" + ");
+      side.appendChild(meta);
+      const how = document.createElement("div");
+      how.style.cssText = "font-size:11px;color:#9fd8b5;margin:4px 0";
+      how.textContent = KINDS[row.kind] || row.kind;
+      side.appendChild(how);
+      const txt = document.createElement("div");
+      txt.className = "cp-doc";
+      txt.style.flex = "1";
+      txt.textContent = row.text || "(the words were not kept)";
+      side.appendChild(txt);
+    }
+    canvas.addEventListener("click", (ev) => {
+      const r = canvas.getBoundingClientRect();
+      const pt = new T.Vector2(
+        ((ev.clientX - r.left) / r.width) * 2 - 1,
+        -((ev.clientY - r.top) / r.height) * 2 + 1);
+      const ray = new T.Raycaster();
+      ray.setFromCamera(pt, camera);
+      const hit = ray.intersectObjects(arcs, false)[0];
+      if (hit) detail(hit.object.userData.row);
+    });
+
+    async function poll() {
+      try {
+        const d = await api.get("/api/crystals/influence");
+        if (d.cast) castNames = Object.assign(castNames, d.cast);
+        (d.rows || []).forEach((row) => {
+          const key = row.ts + "|" + row.mind + "|" + row.file
+            + "|" + (row.text || "").slice(0, 24);
+          if (seen.has(key)) return;
+          seen.add(key);
+          if (row.crystal !== crystal.name) return;
+          (row.targets || []).forEach((who) => arcTo(row, who));
+          const when = new Date(row.ts * 1000)
+            .toLocaleTimeString([], { hour12: false });
+          say("[" + when + "] " + row.mind + "/" + (row.file || "?")
+            + " → " + (row.targets || []).join("+") + " · "
+            + (KINDS[row.kind] || row.kind) + " · “"
+            + (row.text || "").slice(0, 70) + "…”");
+          detail(row);
+        });
+      } catch { /* agent quiet */ }
+    }
+    obs = { renderer, raf: 0, poll: setInterval(poll, 4000) };
+    say("observatory open — " + crystal.name + " at "
+      + (crystal.strength || 50) + "% is seeding the cast; every arc "
+      + "is material leaving the tower for somebody's mouth");
+    poll();
+    (function frame() {
+      if (!obs) return;
+      obs.raf = requestAnimationFrame(frame);
+      const t = Date.now() / 1000;
+      world.rotation.y = t * 0.05;                       // the slow turn
+      towers.forEach((tw) => {                           // the undulation
+        tw.position.y = Math.sin(t * 0.8 + tw.userData.phase) * 1.6;
+      });
+      const now = Date.now();
+      for (let i = arcs.length - 1; i >= 0; i--) {
+        const a = arcs[i];
+        const age = (now - a.userData.born) / 1000;
+        a.material.opacity = Math.max(0, 0.85 - age / 90);
+        const at = (t * 0.35 + i * 0.17) % 1;
+        a.userData.pulse.position.copy(a.userData.curve.getPoint(at));
+        a.userData.pulse.material.opacity = a.material.opacity;
+        if (age > 95) {
+          world.remove(a); world.remove(a.userData.pulse);
+          arcs.splice(i, 1);
+        }
+      }
+      renderer.render(scene, camera);
+    })();
+  }
+
   function draw() {
     mode = "cards";
     towerStop();
+    obsStop();
     pop.innerHTML = "";
     const head = document.createElement("div");
     head.className = "cp-head";
     head.innerHTML = "<b>🔮 The crystal cabinet</b>"
       + "<span class='muted'>drag me · corner resizes</span>"
+      + "<button class='cp-obs' title='the influence observatory — "
+      + "watch the active crystal seed the cast (#822)'>🌆</button>"
       + "<button class='cp-x'>✕</button>";
     pop.appendChild(head);
     dragBy(head);
+    head.querySelector(".cp-obs").onclick = () => openObservatory();
     head.querySelector(".cp-x").onclick = () => {
       pop.style.display = "none";
     };
@@ -2712,11 +3006,15 @@ function initCrystalBtn() {
         + "<span class='cp-md-n'>chunks</span><span></span>";
       r3.appendChild(hd);
       const have = new Set(c.minds || []);
-      const rows = (mindsAll.length ? mindsAll
+      const allRows = (mindsAll.length ? mindsAll
         : (c.minds || []).map((id) => ({
             id, name: id, chunks: (c.chunks || {})[id] })))
         .slice().sort((a, b) => String(a.name || a.id)
           .localeCompare(String(b.name || b.id)));
+      // #821: THIS crystal's data under THIS crystal — only member
+      // minds in the table; the rest of the registry waits behind the
+      // 'add minds' expander below.
+      const rows = allRows.filter((m) => have.has(m.id));
       for (const m of rows) {
         const lab = document.createElement("label");
         lab.className = "cp-mindrow" + (have.has(m.id) ? " in" : "");
@@ -2741,7 +3039,65 @@ function initCrystalBtn() {
         };
         r3.appendChild(lab);
       }
+      if (!rows.length) {
+        const none = document.createElement("div");
+        none.className = "cp-mindrow";
+        none.style.cursor = "default";
+        none.innerHTML = "<span></span><span class='muted'>no minds in "
+          + "this crystal yet — add some below</span><span></span>"
+          + "<span></span>";
+        r3.appendChild(none);
+      }
       card.appendChild(r3);
+      // #821: the registry's OTHER minds, behind a door with a filter.
+      const others = allRows.filter((m) => !have.has(m.id));
+      if (others.length) {
+        const adder = document.createElement("details");
+        adder.className = "cp-addminds";
+        const cap = document.createElement("summary");
+        cap.textContent = "＋ add minds (" + others.length
+          + " available)";
+        adder.appendChild(cap);
+        const flt = document.createElement("input");
+        flt.type = "text";
+        flt.placeholder = "filter…";
+        flt.style.cssText = "width:100%;margin:4px 0";
+        adder.appendChild(flt);
+        const box = document.createElement("div");
+        box.className = "cp-mindtable";
+        adder.appendChild(box);
+        const paintOthers = () => {
+          const want = flt.value.trim().toLowerCase();
+          box.innerHTML = "";
+          others.filter((m) => !want
+            || String(m.name || m.id).toLowerCase().includes(want))
+            .slice(0, 200).forEach((m) => {
+              const lab = document.createElement("label");
+              lab.className = "cp-mindrow";
+              lab.title = m.blurb || m.id;
+              lab.innerHTML = "<input type='checkbox'><span "
+                + "class='cp-md-name'>" + esc(m.name || m.id)
+                + "</span><span class='cp-md-n'>"
+                + (m.chunks | 0).toLocaleString()
+                + "</span><button class='cp-md-read' title='read this "
+                + "mind'>📜</button>";
+              lab.querySelector("input").onchange = () => {
+                const next = new Set(have);
+                next.add(m.id);
+                save(c.id, { minds: Array.from(next) });
+              };
+              lab.querySelector(".cp-md-read").onclick = (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                openMind([m.id], m.name || m.id);
+              };
+              box.appendChild(lab);
+            });
+        };
+        flt.oninput = paintOthers;
+        paintOthers();
+        card.appendChild(adder);
+      }
 
       const r4 = document.createElement("div");
       r4.className = "cp-row";
