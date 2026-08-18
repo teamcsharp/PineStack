@@ -1158,6 +1158,11 @@ function initStationDrawer() {
   // #823: a model pulled in ollama appears here on its own — the list
   // repolls itself instead of loading once at boot and going stale.
   setInterval(() => loadSpark(), 45000);
+  // #825: and opening the picker refetches IMMEDIATELY.
+  const _sm = $("sparkModel");
+  if (_sm) _sm.addEventListener("mousedown", () => {
+    if (document.activeElement !== _sm) loadSpark();
+  });
   // The Agent status cell is the door to the machine panel.
   const agentCell = $("agentState") && $("agentState").parentElement;
   if (agentCell) {

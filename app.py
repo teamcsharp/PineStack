@@ -8902,7 +8902,7 @@ def said_remember(text: str) -> None:
         rows.append({"t": str(text)[:300], "at": int(time.time())})
         try:
             SAID_LINES_PATH.parent.mkdir(parents=True, exist_ok=True)
-            SAID_LINES_PATH.write_text(json.dumps(rows[-400:], indent=0))
+            SAID_LINES_PATH.write_text(json.dumps(rows[-6000:], indent=0))
         except OSError:
             pass
 
@@ -13187,6 +13187,14 @@ async def resume_radio() -> None:
     if not (isinstance(want, dict) and want.get("on")):
         return
     await asyncio.sleep(5)            # let the music index load first
+    # #824: a respin never opens with silence — an off-the-shelf line airs
+    # NOW, before the first model write or long render.
+    async def _instant_open() -> None:
+        try:
+            await cover_the_gap("dj", "the station is respinning (#824)")
+        except Exception:
+            pass
+    fire_and_forget(_instant_open())
     try:
         # A restart mid-announce leaves the satellite stuck "responding"
         # (#391): heal BEFORE the show opens its mouth, not two minutes
@@ -16972,7 +16980,7 @@ def speakbox_lines(text: str) -> list[str]:
 # has a memory: a line lands once as a new thought and comes back later as
 # something the pair have between them.
 SPEAKBOX_HEARD = data_path("speakbox_heard.json")
-SPEAKBOX_HEARD_MAX = 2000
+SPEAKBOX_HEARD_MAX = 12000   # #824: ~30h at measured churn
 _SPEAKBOX_LOCK = RLock()
 
 
@@ -17421,7 +17429,7 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
     pins = _RADIO.get("seed_pins") or {}
     blocks = set(_RADIO.get("seed_blocks") or [])
     pin = str(pins.get(who) or "")
-    k = 8 if (pin or blocks) else 1
+    k = 8                       # #824: always fetch a shelf to sample from
     hits = await speakbox_search(query, k=k, exclude=exclude, rid=key)
     # #815: crystals that are ON compete in the draw — their minds' best
     # chunk enters weighted by strength, so a switched-on crystal really
@@ -17453,6 +17461,24 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
                          "score": 1.0}]
     if not hits:
         return {}
+    # #824: argmax was DETERMINISTIC — the same winner every round until
+    # the index changed. Sample the top hits by softmax(score/T) instead,
+    # skipping anything the pair already said in the last day, so the
+    # scour genuinely wanders the shelf.
+    if len(hits) > 1 and not pin:
+        _heard_day = {r.get("text") for r in speakbox_heard(key)[:4000]
+                      if time.time() - int(r.get("last") or 0) < 86400}
+        _cands = [h for h in hits[:8]
+                  if h.get("text") not in _heard_day] or hits[:8]
+        try:
+            _t = 0.15
+            _mx = max(float(h.get("score") or 0) for h in _cands)
+            _ws = [pow(2.718281828,
+                       (float(h.get("score") or 0) - _mx) / _t)
+                   for h in _cands]
+            hits = [random.choices(_cands, weights=_ws, k=1)[0]]
+        except Exception:
+            hits = [_cands[0]]
     text = hits[0]["text"]
     _vector_access_log(query, hits[0], int((time.time() - t0) * 1000),
                        len((_load_vectors(key).get("chunks") or [])), who=who)
@@ -19334,10 +19360,10 @@ def is_binned(text: str) -> bool:
 # instead of at random.
 LINE_PRINTS_PATH = data_path("line_prints.json")
 _PRINTS_LOCK = RLock()
-PRINTS_MAX = 1400
+PRINTS_MAX = 8000     # #824: a disk bound — the WINDOW is 24h by age
 # How long a KEPT line waits before it may air again: an hour the first time,
 # three the second, five thereafter — the rotation #752 asks for.
-TIER_GATES = (3600.0, 10800.0, 18000.0)
+TIER_GATES = (86400.0, 172800.0, 259200.0)  # #824: day-scale rotation
 # Past this share of recent candidates blocked, the gate stands down. An
 # anti-repeat engine that can silence the station is worse than repetition.
 BLOCK_RATE_CAP = 0.35
@@ -19365,7 +19391,10 @@ def _prints_write(rows: list[dict[str, Any]]) -> None:
     try:
         LINE_PRINTS_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = LINE_PRINTS_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rows[-PRINTS_MAX:]))
+        _now = time.time()
+        _kept = [r for r in rows
+                 if _now - float(r.get("last") or r.get("at") or 0) < 86400]
+        tmp.write_text(json.dumps(_kept[-PRINTS_MAX:]))
         tmp.replace(LINE_PRINTS_PATH)
     except OSError:
         pass
@@ -19460,7 +19489,8 @@ def rerun_check(text: str, who: str = "", kind: str = "",
     # A catchphrase MAY come back — once the hour the operator asked for has
     # gone by. Only the short ones get that grace; a whole sentence repeated
     # word for word is a rerun at any distance.
-    window = float(phrase_setup()["station"] or 3600) if len(key) < 24 else 0.0
+    window = (max(float(phrase_setup()["station"] or 3600), 86400.0)
+              if len(key) < 24 else 0.0)   # #824: 24h, as demanded
     # #no-repeats: the exact leg runs UNCONDITIONALLY. It used to sit behind the
     # breaker below — an anti-repeat engine that switches itself off exactly
     # when repetition is worst, which is the one thing it must never do.
@@ -21001,17 +21031,49 @@ def _fallback_call_script(caller_name: str, topic: str = "") -> str:
     instead of silence. Short, honest, and it completes: intro, the point,
     the wrap."""
     about = " ".join(str(topic or "").split())[:160]
+    # #824: this script aired BYTE-IDENTICAL 13 times in 8.5 hours — the
+    # worst offender on the whole repetition ledger. Four voicings now,
+    # rotated by caller and quarter-day, so even the safety net performs.
+    _v = int(hashlib.sha1((str(caller_name)
+                           + str(int(time.time()) // 21600)).encode()
+                          ).hexdigest(), 16) % 4
+    _opens = [
+        f"A: Phones are lit — {caller_name}, you're on Pine Box FM.",
+        f"A: Line's blinking. {caller_name}, talk to the town.",
+        f"A: We've got {caller_name} on the line — go ahead, you're on.",
+        f"A: Caller — {caller_name}, right? The air is yours."]
+    _mids = [
+        "A: Then say your piece — the air is yours.",
+        "B: Don't dress it up. Just tell us.",
+        "A: We're listening. All of us.",
+        "B: Say it plain — that's what this line is for."]
+    _bodies = [
+        "C: I'll keep it short. This station got me through a week I "
+        "didn't think I'd get through. That's the call. That's all of it.",
+        "C: I just wanted to say it out loud where somebody could hear "
+        "it: this station is the only thing in this town that answers.",
+        "C: No question, no request. I wanted the room to know somebody "
+        "out here is listening, every night, all the way through.",
+        "C: You played something last week that fixed a thing in me I "
+        "didn't know was broken. That's the whole call."]
+    _closes = [
+        f"B: That's the whole reason the lights are on in here.\n"
+        f"A: Thank you, {caller_name} — stay with us; this next one's "
+        "yours.",
+        f"B: That's the realest thing anyone's said all hour.\n"
+        f"A: {caller_name}, don't be a stranger. Stay tuned.",
+        f"A: The town heard you, {caller_name}. That's what the tower "
+        "is for.",
+        f"B: And THAT is why the phones exist.\n"
+        f"A: Thank you, {caller_name}. This one goes out to you."]
     return (
-        f"A: Phones are lit — {caller_name}, you're on Pine Box FM.\n"
+        _opens[_v] + "\n"
         f"C: Hey — it's {caller_name}. Longtime listener."
         + (f" I'm calling about {about}" if about else
            " I had to call about what you were just playing.") + "\n"
-        "A: Then say your piece — the air is yours.\n"
-        "C: I'll keep it short. This station got me through a week I "
-        "didn't think I'd get through. That's the call. That's all of it.\n"
-        f"B: That's the whole reason the lights are on in here.\n"
-        f"A: Thank you, {caller_name} — stay with us; this next one's "
-        "yours.")
+        + _mids[_v] + "\n"
+        + _bodies[_v] + "\n"
+        + _closes[_v])
 
 
 def caller_behavior_draw() -> tuple[str, str]:
@@ -24120,13 +24182,31 @@ async def speak_turns(turns: list[tuple[str, str]],
         # through, and the coalesced stream (the default) never reaches
         # dj_speak at all. Skip THIS line, never break the round: a repeat is
         # one turn to drop, not a reason to take the station off the air.
-        _rerun = rerun_check(text, who, kind="call" if caller_name else "",
+        _rerun = rerun_check(text, who,
+                             kind="call" if caller_name
+                             and who in ("caller", "caller2") else "",
                              allow_repeat=allow_repeat)
         rerun_note(bool(_rerun["block"]))
         if _rerun["block"]:
-            note_drop(who, text, "dropped — " + _rerun["why"] + " (#752)")
-            print_penalise(_rerun.get("hit") or _rerun["key"])
-            continue
+            # #824: a repeat trades for MATERIAL first, silence last —
+            # the same swap the phrase gate below already performs.
+            _swp = (fresh_pool_take() if phrase_setup()["swap"] else {})
+            _new = spoken_text(str(_swp.get("text") or ""))
+            if _new and who in ("dj", "cohost", "third") \
+                    and names_only(_new, vouched or []) \
+                    and not is_binned(_new):
+                note_drop(who, text, "swapped for fresh material — "
+                                     + _rerun["why"] + " (#824)")
+                speakbox_remember({"file": _swp.get("file", ""),
+                                   "text": _swp["text"],
+                                   "lines": [_swp["text"]],
+                                   "mind": _swp.get("mind", "")})
+                text = _new
+            else:
+                note_drop(who, text,
+                          "dropped — " + _rerun["why"] + " (#752)")
+                print_penalise(_rerun.get("hit") or _rerun["key"])
+                continue
         # #no-repeats: the PHRASE cooldown, at the same choke point. The gate above
         # asks "has this LINE been said"; this asks "has any run of these
         # words been on air this hour", which is what the operator asked for
@@ -45816,6 +45896,17 @@ async function testPrompt() {
 
 async function loadModels() {
   const select = document.getElementById("modelSelect");
+  // #825: a model pulled in ollama shows up the moment you open the list
+  // — every mousedown refetches before the options drop. ollama answers
+  // /api/tags in ~30ms, so the picker is always current, no polling.
+  if (!select._freshHook) {
+    select._freshHook = true;
+    select.addEventListener("mousedown", () => {
+      if (select._freshBusy) return;
+      select._freshBusy = true;
+      loadModels().finally(() => { select._freshBusy = false; });
+    });
+  }
   try {
     const data = await api("/api/ollama-models");
     // #786: same ranked + badged list as the header picker (fillModelSelect
