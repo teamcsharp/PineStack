@@ -1940,6 +1940,17 @@ document.querySelectorAll(".tab").forEach((button) => {
 
 $("refreshBtn").onclick = refresh;
 $("openBrowserBtn").onclick = () => api.openExternal(config.baseUrl);
+// #809: F5 reloads the page, like a browser — same action as the R
+// button. (Keys pressed INSIDE the webview are caught in main.js;
+// this covers focus anywhere in the chrome.)
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "F5") {
+    ev.preventDefault();
+    const r = $("reloadFrameBtn");
+    if (r) r.click();
+  }
+});
+
 $("reloadFrameBtn").onclick = () => {
   const frame = activeFrame();
   if (frame) frame.reload();

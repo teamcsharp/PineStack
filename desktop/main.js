@@ -579,6 +579,19 @@ ipcMain.handle("agent:put", (_event, route, body) => fetchJson(`${readConfig().b
 }));
 ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
 
+// #809: F5 pressed while focus is INSIDE a panel webview never
+// reaches the chrome's keydown handler — the webview swallows it.
+// Catch it at the source and reload that webview directly.
+app.on("web-contents-created", (event, contents) => {
+  if (contents.getType() !== "webview") return;
+  contents.on("before-input-event", (ev, input) => {
+    if (input.type === "keyDown" && input.key === "F5") {
+      ev.preventDefault();
+      contents.reload();
+    }
+  });
+});
+
 app.whenReady().then(async () => {
   createWindow();
   const cfg = readConfig();
