@@ -318,6 +318,10 @@ body { padding-bottom: 28px; }
 #sbTermLine:hover { color: #c8f5da; }
 #sbRight { display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
   max-width: 46%; }
+/* #808: the sample button matches the bar it lives in — it was the
+   one unstyled control and rendered at default size, towering out
+   of the 26px status bar. */
+#sampleBtn,
 #sbLiveBtn {
   height: 20px; padding: 0 8px; font-size: 12px; background: #141b24;
   color: var(--text, #e7eef4); border: 1px solid var(--border, #2a3644);

@@ -1908,6 +1908,16 @@ function initSamplePopup() {
     } catch (err) { draw("idle", err.message); }
   }
 
+  // #808: the sidebar tab opens the same popup as the corner icon.
+  const railTab = $("sampleTabBtn");
+  if (railTab) {
+    railTab.addEventListener("click", () => {
+      pop.style.display = "flex";
+      draw("idle", "paste a link — or Ctrl+V one over the 🎬");
+    });
+    railTab.addEventListener("mouseenter", () => { hoverBtn = true; });
+    railTab.addEventListener("mouseleave", () => { hoverBtn = false; });
+  }
   btn.addEventListener("mouseenter", () => { hoverBtn = true; });
   btn.addEventListener("mouseleave", () => { hoverBtn = false; });
   btn.addEventListener("click", () => {
@@ -1923,7 +1933,8 @@ function initSamplePopup() {
 initSamplePopup();
 
 document.querySelectorAll(".tab").forEach((button) => {
-  if (button.id === "threejsBtn" || button.id === "stationBtn") return;
+  if (button.id === "threejsBtn" || button.id === "stationBtn"
+      || button.id === "sampleTabBtn") return;
   button.addEventListener("click", () => selectView(button.dataset.view));
 });
 
