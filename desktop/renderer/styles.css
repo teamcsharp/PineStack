@@ -341,6 +341,7 @@ body { padding-bottom: 28px; }
   position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%);
   z-index: 95; width: min(920px, calc(100vw - 32px)); height: 300px;
   min-width: 420px; min-height: 160px; resize: both; overflow: hidden;
+  max-width: 98vw; max-height: 94vh;     /* #802: stretch as big as needed */
   display: flex; flex-direction: column;
   background: #03070c; border: 1px solid var(--border, #2a3644);
   border-radius: 8px; padding: 6px 10px 8px;

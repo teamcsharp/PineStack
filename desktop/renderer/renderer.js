@@ -1479,8 +1479,17 @@ function initStatusBar() {
         push({ts, kind, text, extra: extra || ""});
       };
       (r.chat || []).slice(-15).forEach((c) => {
+        // #803: the line's WHOLE LIFE rides in the expandable detail —
+        // who wrote it, what fed it (speakbox seed, system prompt), what
+        // modified it, what voiced it. Every field the server tracks on
+        // the row (#782), minus the text itself.
+        const prov = {};
+        Object.keys(c).forEach((k) => {
+          if (k !== "text" && c[k] != null && c[k] !== "") prov[k] = c[k];
+        });
         seenAdd((c.ts || 0) * 1000, c.kind === "hangup" ? "call" : "booth",
-          (c.who || "") + ": " + (c.text || ""), c.reason || "");
+          (c.who || "") + ": " + (c.text || ""),
+          "— provenance —\n" + JSON.stringify(prov, null, 1).slice(0, 1800));
       });
       (r.repair_log || []).slice(-8).forEach((c) => {
         seenAdd((c.at || 0) * 1000, "repair", c.what || "", "");
@@ -1501,9 +1510,19 @@ function initStatusBar() {
   // #801: the terminal grown up — tabs, ×N grouping of duplicates,
   // 300-deep scrollback, right-click → "other", resizable + remembered,
   // and a 🗑 on any row naming a voice to mark it for deletion review.
-  const TABS = {All: null, Voice: ["voice", "gpu", "voicing"],
-                Talk: ["call", "air", "drop", "banter", "booth"],
-                Station: ["repair", "activity"],
+  // #802: tabs matched to the pipeline's REAL kinds. Talk carries the
+  // whole conversation machine — the model calls WITH their prompts (the
+  // expandable detail is the actual system prompt and the actual reply),
+  // the rounds, the air. Speakbox is everything vector: mining, seeds,
+  // themes, who called it and what received the assignment — plus the
+  // full database on demand. Voice is every render, refinement and
+  // engine event.
+  const TABS = {All: null,
+    Voice: ["voice", "voicing", "gpu", "render", "synth", "perf"],
+    Talk: ["call", "air", "banter", "booth", "model", "plan", "write",
+           "lookahead", "action", "drop"],
+    Speakbox: ["speakbox", "theme", "mine", "seed", "embed"],
+    Station: ["repair", "activity"],
     Shell: ["shell"], Other: "other"};
   let tab = localStorage.getItem("sbTermTab") || "All";
   const otherTags = new Set(JSON.parse(
@@ -1525,7 +1544,33 @@ function initStatusBar() {
         localStorage.setItem("sbTermTab", name); drawPop(); };
       tabs.appendChild(b);
     });
+    // #802: the Speakbox tab can open the whole vector database.
+    if (tab === "Speakbox") {
+      const db = document.createElement("button");
+      db.textContent = "📚 full database";
+      db.onclick = async (ev) => {
+        ev.stopPropagation();
+        try {
+          const got = await api.get("/api/speakbox");
+          const rows = (got.docs || got.entries || got.list
+            || got.swaths || []);
+          push({ts: Date.now(), kind: "speakbox",
+            text: "— the database: " + rows.length + " entrie(s) —",
+            extra: JSON.stringify(got, null, 1).slice(0, 1900)});
+          drawPop();
+        } catch (err) {
+          push({ts: Date.now(), kind: "speakbox", text: err.message,
+                extra: ""});
+          drawPop();
+        }
+      };
+      tabs.appendChild(db);
+    }
     pop.appendChild(tabs);
+    // #802: rebuilding the list must never yank the view — remember where
+    // the reader was and put them back there unless they were riding the
+    // tail on purpose.
+    const oldTop = scroller ? scroller.scrollTop : 0;
     scroller = document.createElement("div");
     scroller.className = "sb-scroll";
     scroller.addEventListener("scroll", () => {
@@ -1599,6 +1644,7 @@ function initStatusBar() {
       + "under Other";
     scroller.appendChild(foot);
     if (stickBottom) scroller.scrollTop = scroller.scrollHeight;
+    else scroller.scrollTop = oldTop;      // stay where the reader was
   }
 
   function restoreSize() {
