@@ -5489,11 +5489,16 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
         if fix and ha_ok:
             fire_and_forget(nabu_link_ladder("triage (#814)"))
     elif wire == "alive":
-        note("the device", "alive and linked — if it is still silent "
-             "this is the idle-but-deaf wedge",
-             "pressing its restart button" if fix else "")
-        if fix:
-            await nabu_device_restart("triage — idle-but-deaf (#814)")
+        _quiet = time.time() - _BOX_LAST_OK[0]
+        if _quiet > 600:
+            note("the device", "alive and linked but NOTHING verified in "
+                 f"{int(_quiet / 60)} min — the idle-but-deaf wedge",
+                 "pressing its restart button" if fix else "")
+            if fix:
+                await nabu_device_restart("triage — idle-but-deaf (#814)")
+        else:
+            note("the device", "alive, linked, and audibly delivering "
+                 f"(verified {int(_quiet)}s ago)")
     else:
         note("the device", "DARK — nothing answers on any port. Power "
              "or Wi-Fi; no software can reach it",
@@ -5513,6 +5518,29 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
             except Exception:  # noqa: BLE001
                 pass
             fire_and_forget(_box_vigil())
+
+    # 5. the RENDER CHAIN — a healthy device is worthless if no engine
+    # can make audio. The tree once declared "everything healthy" in
+    # the middle of an all-engines-refused outage (#824).
+    _xtts_ok = bool((await xtts_health()).get("ready"))
+    _f5_ok = bool((await f5_health()).get("ready"))
+    note("the voice engines",
+         f"xtts {'up' if _xtts_ok else 'DOWN'} · f5 "
+         f"{'up' if _f5_ok else 'DOWN'}"
+         + ("" if (_xtts_ok or _f5_ok) else
+            " — NOTHING can render but Piper"),
+         "" if (_xtts_ok and _f5_ok) else
+         ("redeploying the dead engine(s)" if fix else ""))
+    if fix and not (_xtts_ok and _f5_ok):
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                for _eng, _ok in (("xtts", _xtts_ok), ("f5", _f5_ok)):
+                    if not _ok:
+                        await client.post(
+                            f"{VOICE_DIRECTOR_URL}/director/engine/"
+                            f"{_eng}/deploy")
+        except Exception:  # noqa: BLE001
+            pass
 
     verdict = ("the station is ON AIR — " + (
         "everything is healthy" if wire == "alive" and ha_ok
