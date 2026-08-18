@@ -273,6 +273,20 @@
     </div>
   </section>
 
+  <!-- #799: the status bar — left, the newest line of everything the
+       server is doing (click for the live terminal); right, the go-live
+       switch and a marquee of the Spark's vitals and heaviest tenants. -->
+  <footer id="statusBar">
+    <div id="sbTermLine"
+         title="Everything the Spark is running — click for the live terminal">booting…</div>
+    <div id="sbRight">
+      <button id="sbLiveBtn"
+              title="Go LIVE — mint a public listen link for the station">📡</button>
+      <div id="sbMarquee"><span id="sbMarqueeInner"></span></div>
+    </div>
+  </footer>
+  <div id="sbTermPopup" style="display:none"></div>
+
   <script src="./renderer.js"></script>
 </body>
 </html>

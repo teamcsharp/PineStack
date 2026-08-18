@@ -1417,6 +1417,149 @@ function initRouteSpeak() {
 }
 initRouteSpeak();
 
+/* #799: the status bar — the machine's own ticker tape. Left: the newest
+ * line of EVERYTHING the server is doing (pipeline feed + every shell
+ * command the agent runs), click for the live 8-line terminal with
+ * click-to-expand detail. Right: the go-live switch and a marquee of the
+ * Spark's vitals and heaviest tenants. */
+function initStatusBar() {
+  const line = $("sbTermLine");
+  const pop = $("sbTermPopup");
+  const marq = $("sbMarqueeInner");
+  const liveBtn = $("sbLiveBtn");
+  if (!line || !pop) return;
+
+  const ring = [];              // {ts, kind, text, extra} — newest last
+  let lastPipe = 0, lastShell = 0, counts = {}, open = false;
+
+  const esc = (s) => String(s).replace(/[&<>]/g, (c) =>
+    ({"&": "&amp;", "<": "&lt;", ">": "&gt;"}[c]));
+  const when = (ts) => new Date(ts).toLocaleTimeString();
+
+  function push(e) {
+    ring.push(e);
+    if (ring.length > 500) ring.splice(0, ring.length - 500);
+    counts[e.kind] = (counts[e.kind] || 0) + 1;
+  }
+
+  async function pollFeed() {
+    try {
+      const p = await api.get("/api/dj/pipeline?since=" + lastPipe);
+      (p.events || []).forEach((e) => {
+        lastPipe = Math.max(lastPipe, e.ts || 0);
+        push({ts: e.ts, kind: e.kind || "…", text: e.text || "",
+              extra: e.extra || ""});
+      });
+    } catch { /* agent quiet — the bar keeps its last words */ }
+    try {
+      const perf = await api.get("/api/perf");
+      (perf.shell || []).slice().reverse().forEach((s) => {
+        if ((s.ts || 0) <= lastShell) return;
+        lastShell = Math.max(lastShell, s.ts || 0);
+        push({ts: s.ts, kind: "shell",
+              text: "$ " + (s.cmd || "") + (s.rc != null
+                ? " → rc " + s.rc + (s.ms != null ? " · " + s.ms + "ms" : "")
+                : " (running)"),
+              extra: ""});
+      });
+    } catch { /* same */ }
+    const last = ring[ring.length - 1];
+    if (last) {
+      line.textContent = when(last.ts) + "  [" + last.kind + "]  " + last.text;
+    }
+    if (open) drawPop();
+    setTimeout(pollFeed, 2500);
+  }
+
+  function drawPop() {
+    const opened = new Set(Array.from(pop.querySelectorAll(".sb-row.open"))
+      .map((r) => r.dataset.ts));
+    pop.innerHTML = "";
+    ring.slice(-8).forEach((e) => {
+      const row = document.createElement("div");
+      row.className = "sb-row sb-kind-" + (e.kind || "x");
+      row.dataset.ts = String(e.ts);
+      row.innerHTML = "<span class='sb-when'>" + when(e.ts) + "</span> "
+        + "<span class='sb-kind'>[" + esc(e.kind) + "]</span> "
+        + esc(e.text)
+        + (e.extra ? "\n" + esc(e.extra) : "");
+      if (opened.has(row.dataset.ts)) row.classList.add("open");
+      row.title = e.extra ? "click for the full detail" : e.text;
+      row.addEventListener("click", () => row.classList.toggle("open"));
+      pop.appendChild(row);
+    });
+    const freq = Object.entries(counts).sort((a, b) => b[1] - a[1])
+      .slice(0, 7).map(([k, n]) => k + "×" + n).join(" · ");
+    const foot = document.createElement("div");
+    foot.className = "sb-foot";
+    foot.textContent = "this session: " + (freq || "quiet")
+      + " · " + ring.length + " events kept";
+    pop.appendChild(foot);
+  }
+
+  line.addEventListener("click", () => {
+    open = pop.style.display === "none";
+    pop.style.display = open ? "block" : "none";
+    if (open) drawPop();
+  });
+  document.addEventListener("click", (ev) => {
+    if (open && !pop.contains(ev.target) && ev.target !== line) {
+      open = false;
+      pop.style.display = "none";
+    }
+  });
+
+  async function pollMarquee() {
+    try {
+      const got = await api.get("/api/models/loaded");
+      const heavy = (got.procs || []).slice(0, 6)
+        .map((p) => p.label + " " + p.rss_gb + "G"
+          + (p.gpu_gb ? "+" + p.gpu_gb + "Ggpu" : "")).join("  ·  ");
+      const perf = await api.get("/api/perf");
+      marq.textContent =
+        "DGX SPARK  ·  RAM " + (perf.ram_used_gb || "?") + "/"
+        + (perf.ram_total_gb || "?") + "G (" + (perf.ram_pct || "?")
+        + "%)  ·  heaviest: " + (heavy || "nothing notable")
+        + (got.mem ? "  ·  " + got.mem : "");
+    } catch { marq.textContent = "Spark stats unavailable — agent quiet"; }
+    setTimeout(pollMarquee, 12000);
+  }
+
+  async function refreshLive() {
+    const url = localStorage.getItem("pineLiveShareUrl") || "";
+    liveBtn.classList.toggle("live", !!url);
+    liveBtn.textContent = url ? "🔴 LIVE" : "📡";
+    liveBtn.title = url
+      ? "The station is LIVE — link copied on click · click to end it\n" + url
+      : "Go LIVE — mint a public listen link for the station";
+  }
+  liveBtn.addEventListener("click", async () => {
+    const url = localStorage.getItem("pineLiveShareUrl") || "";
+    try {
+      if (url) {
+        if (!confirm("End the public broadcast? Every outstanding listen "
+            + "link stops working.")) return;
+        await api.post("/api/share/revoke", {all: true});
+        localStorage.removeItem("pineLiveShareUrl");
+      } else {
+        const made = await api.post("/api/share", {scope: "listen"});
+        const link = made.url || (made.urls && made.urls[0]
+          && made.urls[0].url) || "";
+        if (link) {
+          localStorage.setItem("pineLiveShareUrl", link);
+          try { await navigator.clipboard.writeText(link); } catch {}
+        }
+      }
+    } catch (err) { liveBtn.title = err.message; }
+    refreshLive();
+  });
+
+  refreshLive();
+  pollFeed();
+  pollMarquee();
+}
+initStatusBar();
+
 document.querySelectorAll(".tab").forEach((button) => {
   if (button.id === "threejsBtn" || button.id === "stationBtn") return;
   button.addEventListener("click", () => selectView(button.dataset.view));

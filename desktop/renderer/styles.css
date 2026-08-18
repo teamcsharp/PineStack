@@ -303,6 +303,59 @@ body.resizing-rail .rail-resizer::before {
 .rh-row.open .rh-detail { display: block; }
 .rh-row.open .rh-snip { display: none; }
 
+/* #799: the status bar — the machine's own ticker tape. */
+#statusBar {
+  position: fixed; left: 0; right: 0; bottom: 0; height: 26px; z-index: 90;
+  display: flex; align-items: center; gap: 10px; padding: 0 10px;
+  background: #0a0f16; border-top: 1px solid var(--border, #2a3644);
+  font: 11px/1.2 ui-monospace, Consolas, "Cascadia Mono", monospace;
+}
+body { padding-bottom: 28px; }
+#sbTermLine {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; white-space: nowrap;
+  text-overflow: ellipsis; color: #9fd8b5; cursor: pointer;
+}
+#sbTermLine:hover { color: #c8f5da; }
+#sbRight { display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
+  max-width: 46%; }
+#sbLiveBtn {
+  height: 20px; padding: 0 8px; font-size: 12px; background: #141b24;
+  color: var(--text, #e7eef4); border: 1px solid var(--border, #2a3644);
+  border-radius: 5px; cursor: pointer;
+}
+#sbLiveBtn.live {
+  background: #7c1d1d; border-color: #e46b6b; color: #ffd7d7;
+  animation: sbPulse 1.6s ease-in-out infinite;
+}
+@keyframes sbPulse { 50% { box-shadow: 0 0 9px rgba(228, 107, 107, .8); } }
+#sbMarquee { overflow: hidden; width: clamp(160px, 30vw, 420px); }
+#sbMarqueeInner {
+  display: inline-block; white-space: nowrap; padding-left: 100%;
+  animation: sbScroll 30s linear infinite; color: #8fa0ad;
+}
+#sbMarquee:hover #sbMarqueeInner { animation-play-state: paused; }
+@keyframes sbScroll { to { transform: translateX(-100%); } }
+#sbTermPopup {
+  position: fixed; left: 8px; bottom: 32px; z-index: 95;
+  width: min(920px, calc(100vw - 16px));
+  background: #03070c; border: 1px solid var(--border, #2a3644);
+  border-radius: 8px; padding: 8px 10px;
+  font: 11.5px/1.55 ui-monospace, Consolas, "Cascadia Mono", monospace;
+  color: #9fd8b5; box-shadow: 0 -8px 32px rgba(0, 0, 0, .65);
+}
+#sbTermPopup .sb-row {
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  cursor: pointer;
+}
+#sbTermPopup .sb-row.open { white-space: pre-wrap; overflow: visible;
+  text-overflow: clip; }
+#sbTermPopup .sb-when { color: #5d6d7e; }
+#sbTermPopup .sb-kind { color: #6db3d1; }
+#sbTermPopup .sb-kind-shell { color: #d9c46a; }
+#sbTermPopup .sb-kind-drop { color: #e46b6b; }
+#sbTermPopup .sb-kind-gpu { color: #c98fe0; }
+#sbTermPopup .sb-foot { color: #5d6d7e; margin-top: 4px; font-size: 10.5px; }
+
 /* The 3JS gallery: an accordion under its tab listing every three.js
    experience in the panel; picking one jumps the webview to it. */
 .threejs-list { display: grid; gap: 4px; padding: 4px 0 4px 10px; }
