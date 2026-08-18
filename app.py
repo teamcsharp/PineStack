@@ -3697,6 +3697,52 @@ async def _startup_radio() -> None:
     fire_and_forget(resume_radio())
 
 
+# #796: ComfyUI caches every model it has ever loaded until told otherwise
+# — on the GB10 that cache lives in the SAME unified memory the TTS
+# engines and ollama need, and it is what starved VoxCPM into CUDA OOM.
+# One model in active use does not need six warm ones behind it.
+_COMFY_LAST_USED = [0.0]
+COMFY_IDLE_UNLOAD = float(os.getenv("COMFY_IDLE_UNLOAD", "900"))  # 15 min
+
+
+async def comfy_idle_clock() -> None:
+    """Unload ComfyUI's model cache after a quiet spell. The next render
+    pays a one-time reload of its checkpoint; every other service on the
+    box gets the memory back the rest of the time."""
+    freed = False
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if COMFY_IDLE_UNLOAD <= 0:
+                continue
+            idle = time.time() - (_COMFY_LAST_USED[0] or 0)
+            if _COMFY_LAST_USED[0] and idle < COMFY_IDLE_UNLOAD:
+                freed = False
+                continue
+            if freed:                    # already emptied this quiet spell
+                continue
+            async with httpx.AsyncClient(timeout=30) as client:
+                q = (await client.get(f"{COMFYUI_URL}/queue")).json() or {}
+                busy = bool(q.get("queue_running") or q.get("queue_pending"))
+                if busy:
+                    continue
+                await client.post(f"{COMFYUI_URL}/free",
+                                  json={"unload_models": True,
+                                        "free_memory": True})
+            freed = True
+            pipeline_log("gpu", "ComfyUI sat idle past "
+                         f"{int(COMFY_IDLE_UNLOAD // 60)} minutes — its "
+                         "model cache was unloaded so the voice engines "
+                         "get the memory back (#796)")
+        except Exception:  # noqa: BLE001
+            pass                          # comfy down = nothing to free
+
+
+@app.on_event("startup")
+async def _startup_comfy_idle() -> None:
+    fire_and_forget(comfy_idle_clock())
+
+
 @app.on_event("startup")
 async def _startup_hold_watch() -> None:
     """The hold shelf drains for the LIFE of the app (#408, #409) — one
@@ -3860,6 +3906,7 @@ async def _submit_generation(
         )
         response.raise_for_status()
         prompt_id = str((response.json() or {}).get("prompt_id") or "")
+    _COMFY_LAST_USED[0] = time.time()      # #796: the idle-unload clock
     started_at = time.time()
     append_generation({
         "ts": int(started_at),
@@ -39660,9 +39707,17 @@ async def models_loaded(
             free = dev.get("vram_free") or 0
             used = total - free
             if total:
+                # #796: on the GB10, ComfyUI's "VRAM" IS the unified system
+                # memory — total minus free counts EVERYTHING on the box
+                # (ollama, the voice engines, page cache), not ComfyUI's
+                # checkpoints. The old label "ComfyUI resident models ·
+                # 122.6 GB" was the whole machine wearing ComfyUI's name.
+                # Say what it is; the eject still calls ComfyUI /free,
+                # which drops ITS share of that number.
                 out.append({
                     "host": "comfyui",
-                    "name": "ComfyUI resident models",
+                    "name": "GB10 unified memory in use — all processes "
+                            "(eject frees ComfyUI's model cache)",
                     "gb": round(used / 1e9, 1),
                     "expires": "",
                     "unloadable": True,
