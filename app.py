@@ -3782,7 +3782,25 @@ def _xtts_revive_maybe() -> None:
 
     async def _up() -> None:
         try:
-            async with httpx.AsyncClient(timeout=30) as client:
+            async with httpx.AsyncClient(timeout=45) as client:
+                # #812: make ROOM first. XTTS needs ~23G; under pressure
+                # the deploy silently failed and F5 carried the whole
+                # cast for hours — those were the underwater voices. The
+                # small standin engines reload in seconds when wanted;
+                # the primary voice engine outranks them.
+                try:
+                    press = (await client.get(
+                        f"{VOICE_DIRECTOR_URL}/host/pressure")).json()
+                    if float(press.get("avail_gb") or 0) < 26:
+                        for spare in ("qwen_tts", "vibevoice", "cosyvoice",
+                                      "voxcpm"):
+                            await client.post(
+                                f"{VOICE_DIRECTOR_URL}/director/engine/"
+                                f"{spare}/terminate")
+                        pipeline_log("gpu", "cleared the standin engines "
+                                     "to make room for XTTS (#812)")
+                except Exception:  # noqa: BLE001
+                    pass
                 await client.post(
                     f"{VOICE_DIRECTOR_URL}/director/engine/xtts/deploy")
             pipeline_log("gpu", "XTTS was offloaded and is wanted again — "
@@ -16384,23 +16402,28 @@ async def track_notes(track: dict[str, Any]) -> str:
             lines.append(f"- {title}: {body[:400]}")
 
     text = ""
+    # #808: the PROCESS is part of the result — the prompt, the model and
+    # the clock ride with the note so the booth chip can open a dossier.
+    _prompt = (
+        "From these search results, say in ONE or TWO sentences how "
+        "people actually receive this song — loved, divisive, a "
+        "sleeper, whatever the sources support. Attribute it as what "
+        "listeners say. If the results are clearly about a different "
+        "song, reply with exactly: NONE\n\n"
+        f"Song: {track['title']}{who}\n\n" + "\n".join(lines))
+    _t0 = time.monotonic()
     if lines:
         try:
-            text = await ask_model(
-                "From these search results, say in ONE or TWO sentences how "
-                "people actually receive this song — loved, divisive, a "
-                "sleeper, whatever the sources support. Attribute it as what "
-                "listeners say. If the results are clearly about a different "
-                "song, reply with exactly: NONE\n\n"
-                f"Song: {track['title']}{who}\n\n" + "\n".join(lines),
-                limit=320,
-            )
+            text = await ask_model(_prompt, limit=320)
         except Exception:
             text = ""
     if text.strip().upper().startswith("NONE"):
         text = ""
 
-    notes[key] = {"text": text, "ts": int(time.time())}
+    notes[key] = {"text": text, "ts": int(time.time()),
+                  "model": str(load_settings().get("model") or ""),
+                  "ms": int((time.monotonic() - _t0) * 1000),
+                  "prompt": _prompt[:2400], "query": query}
     _notes_write(notes)
     return text
 
@@ -16418,6 +16441,7 @@ def song_analysis_ready(track: dict[str, Any], analysis: str) -> None:
     if _RADIO.get("song_analysis_id") == track_id:
         return
     _RADIO["song_analysis_id"] = track_id
+    _proc = _notes_read().get(track_id) or {}
     _RADIO["chat"].append({
         "id": uuid.uuid4().hex[:6], "ts": int(time.time()),
         "air_at": time.time(), "who": "analysis", "kind": "song_analysis",
@@ -16425,6 +16449,10 @@ def song_analysis_ready(track: dict[str, Any], analysis: str) -> None:
         "analysis": text,
         "track_id": track_id,
         "artist": str(track.get("artist") or ""),
+        "model": str(_proc.get("model") or ""),
+        "ms": int(_proc.get("ms") or 0),
+        "prompt": str(_proc.get("prompt") or ""),
+        "query": str(_proc.get("query") or ""),
         "aired": "analysis",
     })
     del _RADIO["chat"][:-240]
@@ -16655,6 +16683,7 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         del shown[:-60]
         image_b64 = base64.b64encode(picked.read_bytes()).decode()
         settings = load_settings()
+        _vt0 = time.monotonic()
         async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
                 f"{OLLAMA_URL}/api/chat",
@@ -16696,7 +16725,14 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         if said:
             pipeline_log("model", f"looked at {picked.name} — "
                                   f"{len(said)} chars of description")
-            image_analysis_ready(picked.name, said)
+            image_analysis_ready(
+                picked.name, said, model=VISION_MODEL,
+                ms=int((time.monotonic() - _vt0) * 1000),
+                prompt="You are a radio host holding this picture up for "
+                       "listeners who cannot see it… (the #646 atomic-"
+                       "detail contract: colours and where they sit, the "
+                       "light, every figure and its posture, the corners "
+                       "— then what it DOES to you.)")
             # Any time a gallery picture is looked at and talked about, the
             # booth holds up its thumbnail (#506, #523) — not only during the
             # dedicated gallery round.
@@ -16709,7 +16745,8 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         return "", ""                   # a model without eyes riffs blind
 
 
-def image_analysis_ready(name: str, analysis: str) -> None:
+def image_analysis_ready(name: str, analysis: str, model: str = "",
+                         ms: int = 0, prompt: str = "") -> None:
     """Record a completed vision pass as a quiet booth event."""
     text = " ".join(str(analysis or "").split())[:1600]
     if not (name and text):
@@ -16722,7 +16759,8 @@ def image_analysis_ready(name: str, analysis: str) -> None:
         "id": uuid.uuid4().hex[:6], "ts": int(time.time()),
         "air_at": time.time(), "who": "analysis", "kind": "image_analysis",
         "text": f"Image analysis complete: {name}", "analysis": text,
-        "image": name, "aired": "analysis",
+        "image": name, "model": model, "ms": int(ms or 0),
+        "prompt": str(prompt or ""), "aired": "analysis",
     })
     del _RADIO["chat"][:-240]
 
@@ -54504,18 +54542,116 @@ function djDossierWatch(row, line) {
 function boothAnalysisTooltip(row, analysis) {
   let tip = null;
   const remove = () => { if (tip) { tip.remove(); tip = null; } };
+  /* #809: the crawl speed is YOURS — roll the wheel over the row while
+   * the tooltip is up: up is faster, down is slower, remembered. */
+  const tipSecs = () => Math.max(6, Math.min(120,
+    Number(localStorage.getItem("boothTipSecs")) || 26));
+  const tipApply = () => {
+    if (tip && tip.firstChild) {
+      tip.firstChild.style.animationDuration = tipSecs() + "s";
+    }
+  };
+  row.addEventListener("wheel", (ev) => {
+    if (!tip) return;
+    ev.preventDefault();
+    ev.stopPropagation();
+    const next = tipSecs() + (ev.deltaY > 0 ? 5 : -5);
+    localStorage.setItem("boothTipSecs",
+      String(Math.max(6, Math.min(120, next))));
+    tipApply();
+    const badge = tip.querySelector(".tip-speed");
+    if (badge) badge.textContent = "↕ " + tipSecs() + "s crawl";
+  }, {passive: false});
   row.onmouseenter = () => {
     remove();
     tip = el("div", "booth-song-analysis-tip", "");
     const run = el("span", "", analysis + "     •     " + analysis);
     tip.appendChild(run);
+    const badge = el("i", "tip-speed", "↕ " + tipSecs() + "s crawl");
+    badge.style.cssText = "position:absolute;right:6px;top:2px;"
+      + "font-size:9px;color:#5d7189;font-style:normal";
+    tip.appendChild(badge);
     document.body.appendChild(tip);
+    tipApply();
     const rect = row.getBoundingClientRect();
     tip.style.left = Math.max(8, Math.min(window.innerWidth - tip.offsetWidth - 8,
       rect.left)) + "px";
     tip.style.top = Math.max(8, rect.top - tip.offsetHeight - 8) + "px";
   };
   row.onmouseleave = remove;
+}
+
+/* #808: click an analysis chip and the whole PROCESS opens — subject,
+ * model, clock, the exact prompt, and the result, word for word. */
+function boothAnalysisDossier(line) {
+  const gone = document.getElementById("analysisDossier");
+  if (gone) gone.remove();
+  const pop = el("div", "panel", "");
+  pop.id = "analysisDossier";
+  pop.style.cssText = "position:fixed;z-index:240;left:50%;top:50%;"
+    + "transform:translate(-50%,-50%);width:min(580px,94vw);"
+    + "max-height:82vh;overflow:auto;padding:12px 14px;display:flex;"
+    + "flex-direction:column;gap:8px;box-shadow:0 20px 60px rgba(0,0,0,.7)";
+  pop.onclick = (e) => e.stopPropagation();
+  const head = el("div", "row", "");
+  head.style.cssText = "gap:8px;align-items:baseline";
+  const t = el("b", "", (line.kind === "song_analysis" ? "♫ " : "◈ ")
+    + "the analysis, in full");
+  t.style.cssText = "flex:1;font-size:13px";
+  const x = el("button", "", "✕");
+  x.onclick = () => pop.remove();
+  head.appendChild(t); head.appendChild(x);
+  pop.appendChild(head);
+  const meta = el("div", "", "");
+  meta.style.cssText = "font-size:11px;line-height:1.8;color:#9db2c8";
+  const addMeta = (k, v) => {
+    const b = el("b", "", k + "  ");
+    b.style.color = "#6db3d1";
+    meta.appendChild(b);
+    meta.appendChild(document.createTextNode(v || "—"));
+    meta.appendChild(document.createElement("br"));
+  };
+  addMeta("subject", (line.text || "").replace(
+    /^(Song|Image) analysis complete:\s*/i, ""));
+  addMeta("model", line.model
+    || "— (this analysis predates the provenance ledger)");
+  addMeta("took", line.ms ? (line.ms / 1000).toFixed(1) + " s" : "—");
+  if (line.query) addMeta("web search first", line.query);
+  addMeta("at", new Date((line.ts || 0) * 1000).toLocaleString());
+  pop.appendChild(meta);
+  if (line.image) {
+    const img = document.createElement("img");
+    img.src = "/api/generations/image/" + encodeURIComponent(line.image);
+    img.style.cssText = "max-width:100%;max-height:220px;object-fit:"
+      + "contain;border-radius:8px;border:1px solid var(--border)";
+    img.onerror = () => img.remove();
+    pop.appendChild(img);
+  }
+  const cap1 = el("b", "", "THE RESULT — what came back");
+  cap1.style.cssText = "font-size:10.5px;color:#79d8ff";
+  pop.appendChild(cap1);
+  const res = el("div", "", "");
+  res.style.cssText = "font-size:12px;line-height:1.6;white-space:pre-wrap;"
+    + "border:1px solid var(--border);border-radius:8px;padding:8px 10px;"
+    + "background:#0a1118";
+  res.textContent = line.analysis || "(no result kept)";
+  pop.appendChild(res);
+  const cap2 = el("b", "", "THE PROMPT — exactly what was asked");
+  cap2.style.cssText = "font-size:10.5px;color:#c9a0e0";
+  pop.appendChild(cap2);
+  const pr = el("div", "", "");
+  pr.style.cssText = res.style.cssText + ";color:#8fa6c2";
+  pr.textContent = line.prompt
+    || "(recorded for analyses from here on — this one is older)";
+  pop.appendChild(pr);
+  document.body.appendChild(pop);
+  const off = (ev) => {
+    if (!pop.contains(ev.target)) {
+      pop.remove();
+      document.removeEventListener("click", off, true);
+    }
+  };
+  setTimeout(() => document.addEventListener("click", off, true), 0);
 }
 
 function djTalkRow(line) {
@@ -54585,7 +54721,13 @@ function djTalkRow(line) {
       row.appendChild(label);
       row.appendChild(about);
       const analysis = String(line.analysis || "").trim();
-      row.title = analysis ? "Hover to read the LLM song analysis" : "";
+      row.title = (analysis ? "Hover to read the LLM song analysis · " : "")
+        + "Click for the dossier — prompt, model, timing (#808)";
+      row.style.cursor = "pointer";
+      row.onclick = (ev) => {
+        ev.stopPropagation();
+        boothAnalysisDossier(line);
+      };
       if (analysis) boothAnalysisTooltip(row, analysis);
       return row;
     }
@@ -54612,7 +54754,13 @@ function djTalkRow(line) {
       row.appendChild(label);
       row.appendChild(about);
       const analysis = String(line.analysis || "").trim();
-      row.title = analysis ? "Hover to read the vision-model analysis" : "";
+      row.title = (analysis ? "Hover to read the vision-model analysis · "
+        : "") + "Click for the dossier — prompt, model, timing (#808)";
+      row.style.cursor = "pointer";
+      row.onclick = (ev) => {
+        ev.stopPropagation();
+        boothAnalysisDossier(line);
+      };
       if (analysis) boothAnalysisTooltip(row, analysis);
       return row;
     }
@@ -62321,6 +62469,104 @@ function djTailLabel(s) {
   return s < 60 ? s + " s"
     : Math.floor(s / 60) + " min" + (s % 60 ? " " + (s % 60) + " s" : "");
 }
+/* #805: while a cut runs, the tray becomes an OUTPUT WINDOW — the
+ * operations spelled out, an npm-style spinner and loading bar, and a
+ * live ASCII icosphere assembling itself as the cut comes together. */
+function djCutTheater(tray, running) {
+  let th = document.getElementById("djCutTheater");
+  if (!running.length) {
+    if (th) { cancelAnimationFrame(th._raf || 0); th.remove(); }
+    return;
+  }
+  if (!th) {
+    th = el("div", "", "");
+    th.id = "djCutTheater";
+    th.style.cssText = "margin-top:8px;background:#04070d;"
+      + "border:1px solid #1d3a2a;border-radius:8px;padding:8px 10px;"
+      + "font:10.5px ui-monospace,Consolas,monospace;color:#7ce8a9;"
+      + "line-height:1.5";
+    const ico = el("pre", "", "");
+    ico.style.cssText = "margin:0 0 6px;color:#3fd68f;font-size:9px;"
+      + "line-height:1.05;text-align:center;overflow:hidden";
+    const bar = el("div", "", "");
+    const log = el("div", "", "");
+    log.style.cssText = "white-space:pre-wrap;margin-top:4px";
+    th._ico = ico; th._bar = bar; th._log = log;
+    th._t0 = Date.now();
+    th.appendChild(ico); th.appendChild(bar); th.appendChild(log);
+    tray.parentElement.insertBefore(th, tray);
+    const PHI = (1 + Math.sqrt(5)) / 2;
+    const V = [[-1, PHI, 0], [1, PHI, 0], [-1, -PHI, 0], [1, -PHI, 0],
+               [0, -1, PHI], [0, 1, PHI], [0, -1, -PHI], [0, 1, -PHI],
+               [PHI, 0, -1], [PHI, 0, 1], [-PHI, 0, -1], [-PHI, 0, 1]];
+    const E = [];
+    for (let i = 0; i < 12; i++) {
+      for (let j = i + 1; j < 12; j++) {
+        const dx = V[i][0] - V[j][0], dy = V[i][1] - V[j][1],
+          dz = V[i][2] - V[j][2];
+        if (Math.abs(Math.hypot(dx, dy, dz) - 2) < 0.01) E.push([i, j]);
+      }
+    }
+    const W = 44, H = 15, SHADE = ".:-=+*#%";
+    const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+    (function spin() {
+      if (!th.isConnected) return;
+      th._raf = requestAnimationFrame(spin);
+      const t = (Date.now() - th._t0) / 1000;
+      const g = [];
+      for (let y = 0; y < H; y++) g.push(Array(W).fill(" "));
+      const ca = Math.cos(t * 0.9), sa = Math.sin(t * 0.9);
+      const cb = Math.cos(t * 0.63), sb = Math.sin(t * 0.63);
+      const P = V.map(([x, y, z]) => {
+        const x1 = x * ca + z * sa, z1 = -x * sa + z * ca;
+        const y1 = y * cb - z1 * sb, z2 = y * sb + z1 * cb;
+        const s = 8 / (5 + z2);
+        return [Math.round(W / 2 + x1 * s * 2.1),
+                Math.round(H / 2 + y1 * s), z2];
+      });
+      E.forEach(([a, b]) => {
+        const steps = Math.max(Math.abs(P[b][0] - P[a][0]),
+                               Math.abs(P[b][1] - P[a][1])) || 1;
+        for (let k = 0; k <= steps; k++) {
+          const x = Math.round(P[a][0] + (P[b][0] - P[a][0]) * k / steps);
+          const y = Math.round(P[a][1] + (P[b][1] - P[a][1]) * k / steps);
+          if (x >= 0 && x < W && y >= 0 && y < H) {
+            const z = P[a][2] + (P[b][2] - P[a][2]) * k / steps;
+            g[y][x] = SHADE[Math.min(7, Math.max(0,
+              Math.round((z + 2.6) / 5.2 * 7)))];
+          }
+        }
+      });
+      P.forEach(([x, y]) => {
+        if (x >= 0 && x < W && y >= 0 && y < H) g[y][x] = "@";
+      });
+      th._ico.textContent = g.map((r) => r.join("")).join("\n");
+      const pct = Math.min(96, Math.round(100 * (1 - Math.exp(-t / 25))));
+      const cells = Math.round(pct / 4);
+      th._bar.textContent = SPIN[Math.floor(t * 10) % SPIN.length]
+        + " [" + "█".repeat(cells) + "░".repeat(25 - cells) + "] "
+        + pct + "% · " + Math.round(t) + "s";
+    })();
+  }
+  const lv = djLevels();
+  const ops = [];
+  running.forEach((j) => {
+    ops.push("$ pinebox cut --window \"" + (j.label || "the last stretch")
+      + "\"");
+    if (j.state === "queued") {
+      ops.push("  ⏳ queued behind the mixer…");
+    } else {
+      ops.push("  ✂ slicing the broadcast ring buffer");
+      ops.push("  ♫ laying the records at " + Math.round(lv.music * 100)
+        + "%, ducked " + Math.round(lv.duck * 100) + "% under speech");
+      ops.push("  🎙 voices at " + Math.round(lv.voice * 100)
+        + "% — the levels this page plays at");
+      ops.push("  ⛓ welding segments · normalizing · writing the mp3");
+    }
+  });
+  th._log.textContent = ops.join("\n");
+}
+
 function djTailPanel(anchor) {
   const gone = document.getElementById("djTailPanel");
   if (gone) { gone.remove(); return; }
@@ -62398,7 +62644,10 @@ function djTailPanel(anchor) {
     tray.innerHTML = "";
     const running = (d.jobs || []).filter(
       (j) => j.state === "queued" || j.state === "cutting");
-    (d.jobs || []).forEach((j) => {
+    // #805: while something is cutting, the tray IS the output window —
+    // the finished entries stand aside until the operation lands.
+    djCutTheater(tray, running);
+    if (!running.length) (d.jobs || []).forEach((j) => {
       const r = el("div", "muted", "");
       r.style.cssText = "font-size:10.5px;padding:2px 0";
       r.textContent = ({queued: "⏳ queued — ", cutting: "✂ cutting — ",
@@ -62412,7 +62661,7 @@ function djTailPanel(anchor) {
       none.style.cssText = "font-size:10.5px;padding:2px 0";
       tray.appendChild(none);
     }
-    (d.cuts || []).forEach((c) => {
+    if (!running.length) (d.cuts || []).forEach((c) => {
       const r = el("div", "", "");
       r.style.cssText = "display:flex;gap:5px;align-items:center;"
         + "padding:3px 0;font-size:10.5px";

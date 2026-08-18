@@ -2054,7 +2054,21 @@ function initCrystalBtn() {
    * turning slowly; big minds bucket several chunks per hex. */
   async function towerStart(canvas, N) {
     towerStop();
-    try { await loadThree(); } catch { return; }
+    try {
+      await loadThree();
+    } catch (err) {
+      // #806: "I'm not seeing any of that" — a silent three.js failure
+      // looked like the tower did not exist. Now the canvas says why.
+      const note = document.createElement("div");
+      note.className = "muted";
+      note.style.cssText = "width:190px;flex:none;padding:10px;"
+        + "font-size:11px";
+      note.textContent = "the tower could not rise: " + err.message
+        + " — is the agent reachable? It serves three.js at "
+        + "/vendor/three.min.js.";
+      canvas.replaceWith(note);
+      return;
+    }
     const T = window.THREE;
     const PER = 14, CAP = 4200, R = 26, CH = 3.2;
     const scale = Math.max(1, Math.ceil((N || 1) / CAP));
@@ -2172,6 +2186,33 @@ function initCrystalBtn() {
     await pull(); paintBtn(); draw();
   }
 
+  function popRemember() {
+    try {
+      localStorage.setItem("crystalPopBox", JSON.stringify({
+        left: pop.offsetLeft, top: pop.offsetTop,
+        w: pop.offsetWidth, h: pop.offsetHeight }));
+    } catch { /* full quota keeps the cabinet */ }
+  }
+
+  function popRestore() {
+    let bag = {};
+    try {
+      bag = JSON.parse(localStorage.getItem("crystalPopBox") || "{}")
+        || {};
+    } catch { bag = {}; }
+    if (Number(bag.w) > 0) {
+      pop.style.transform = "none";
+      pop.style.width = Math.min(bag.w, window.innerWidth - 16) + "px";
+      pop.style.height = Math.max(220, Math.min(bag.h || 480,
+        window.innerHeight - 16)) + "px";
+      pop.style.maxHeight = "none";
+      pop.style.left = Math.max(0, Math.min(bag.left || 40,
+        window.innerWidth - 80)) + "px";
+      pop.style.top = Math.max(0, Math.min(bag.top || 40,
+        window.innerHeight - 80)) + "px";
+    }
+  }
+
   function dragBy(handle) {
     handle.addEventListener("mousedown", (ev) => {
       if (ev.target.closest("button,input,select")) return;
@@ -2185,10 +2226,69 @@ function initCrystalBtn() {
       function up() {
         document.removeEventListener("mousemove", move);
         document.removeEventListener("mouseup", up);
+        popRemember();
       }
       document.addEventListener("mousemove", move);
       document.addEventListener("mouseup", up);
     });
+  }
+
+  /* #807: RESIZE FROM ANY EDGE OR CORNER — eight pointer grips that
+   * survive every repaint (draw/openMind wipe innerHTML; the grips are
+   * re-appended after each rebuild). Reactive: the box follows the
+   * pointer directly, no native-resize fights. */
+  function ensureGrips() {
+    if (!pop._grips) {
+      pop._grips = [
+        ["n", "top:-3px;left:14px;right:14px;height:9px;cursor:ns-resize"],
+        ["s", "bottom:-3px;left:14px;right:14px;height:9px;cursor:ns-resize"],
+        ["w", "left:-3px;top:14px;bottom:14px;width:9px;cursor:ew-resize"],
+        ["e", "right:-3px;top:14px;bottom:14px;width:9px;cursor:ew-resize"],
+        ["nw", "top:-4px;left:-4px;width:16px;height:16px;cursor:nwse-resize"],
+        ["ne", "top:-4px;right:-4px;width:16px;height:16px;cursor:nesw-resize"],
+        ["sw", "bottom:-4px;left:-4px;width:16px;height:16px;cursor:nesw-resize"],
+        ["se", "bottom:-4px;right:-4px;width:16px;height:16px;cursor:nwse-resize"],
+      ].map(([dir, css]) => {
+        const grip = document.createElement("div");
+        grip.style.cssText = "position:absolute;z-index:9;" + css;
+        grip.addEventListener("pointerdown", (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          const r = pop.getBoundingClientRect();
+          const sx = ev.clientX, sy = ev.clientY;
+          const move = (e) => {
+            const dx = e.clientX - sx, dy = e.clientY - sy;
+            let left = r.left, top = r.top;
+            let width = r.width, height = r.height;
+            if (dir.indexOf("e") >= 0) width = r.width + dx;
+            if (dir.indexOf("s") >= 0) height = r.height + dy;
+            if (dir.indexOf("w") >= 0) width = r.width - dx;
+            if (dir.indexOf("n") >= 0) height = r.height - dy;
+            width = Math.max(340, Math.min(width,
+              window.innerWidth - 12));
+            height = Math.max(220, Math.min(height,
+              window.innerHeight - 12));
+            if (dir.indexOf("w") >= 0) left = r.right - width;
+            if (dir.indexOf("n") >= 0) top = r.bottom - height;
+            pop.style.transform = "none";
+            pop.style.width = width + "px";
+            pop.style.height = height + "px";
+            pop.style.maxHeight = "none";
+            pop.style.left = Math.max(0, left) + "px";
+            pop.style.top = Math.max(0, top) + "px";
+          };
+          const up = () => {
+            document.removeEventListener("pointermove", move);
+            document.removeEventListener("pointerup", up);
+            popRemember();
+          };
+          document.addEventListener("pointermove", move);
+          document.addEventListener("pointerup", up);
+        });
+        return grip;
+      });
+    }
+    pop._grips.forEach((g) => pop.appendChild(g));
   }
 
   /* #794/#795/#797: the reader — sources first, each expandable into
@@ -2248,26 +2348,49 @@ function initCrystalBtn() {
           left.innerHTML = "<span class='muted'>this mind is empty — "
             + "nothing has been embedded into it yet</span>";
         }
+        // #806: grouped by WHO the capture came from — the leading name
+        // of the file — instead of one flat 800-row wall.
+        const groups = new Map();
         (d.sources || []).forEach((s) => {
-          const row = document.createElement("div");
-          row.className = "cp-source";
-          row.innerHTML = "<span class='cp-src-name'>" + esc(s.file)
-            + "</span><i>" + s.chunks.toLocaleString() + "</i>"
-            + "<button class='cp-src-doc' title='open the whole "
-            + "document'>📄</button>"
-            + "<button class='cp-src-ch' title='scroll its captured "
-            + "chunks'>📜</button>";
-          const range = [];
-          for (let k = 0; k < Math.min(s.chunks, 600); k++) {
-            range.push(s.first + k);
-          }
-          row.addEventListener("mouseenter",
-            () => towerPaint(range, s.first));
-          row.querySelector(".cp-src-doc").onclick =
-            () => doc(s.file);
-          row.querySelector(".cp-src-ch").onclick =
-            () => chunks(s.file);
-          left.appendChild(row);
+          const m = String(s.file || "").match(/^[A-Za-z]+/);
+          const who = (m ? m[0] : "other").toLowerCase();
+          if (!groups.has(who)) groups.set(who, []);
+          groups.get(who).push(s);
+        });
+        Array.from(groups.keys()).sort().forEach((who) => {
+          const rows = groups.get(who);
+          const box = document.createElement("details");
+          box.className = "cp-srcgroup";
+          box.open = groups.size <= 2;
+          const cap = document.createElement("summary");
+          const total = rows.reduce((a, s) => a + (s.chunks | 0), 0);
+          cap.textContent = who + " \u00b7 " + rows.length
+            + " source(s) \u00b7 " + total.toLocaleString() + " chunks";
+          box.appendChild(cap);
+          rows.sort((a, b) => String(a.file).localeCompare(
+            String(b.file)));
+          rows.forEach((s) => {
+            const row = document.createElement("div");
+            row.className = "cp-source";
+            row.innerHTML = "<span class='cp-src-name'>" + esc(s.file)
+              + "</span><i>" + s.chunks.toLocaleString() + "</i>"
+              + "<button class='cp-src-doc' title='open the whole "
+              + "document'>📄</button>"
+              + "<button class='cp-src-ch' title='scroll its captured "
+              + "chunks'>📜</button>";
+            const range = [];
+            for (let k = 0; k < Math.min(s.chunks, 600); k++) {
+              range.push(s.first + k);
+            }
+            row.addEventListener("mouseenter",
+              () => towerPaint(range, s.first));
+            row.querySelector(".cp-src-doc").onclick =
+              () => doc(s.file);
+            row.querySelector(".cp-src-ch").onclick =
+              () => chunks(s.file);
+            box.appendChild(row);
+          });
+          left.appendChild(box);
         });
       } catch (err) { left.textContent = err.message; }
     }
@@ -2354,6 +2477,7 @@ function initCrystalBtn() {
     }
 
     sources();
+    ensureGrips();
   }
 
   function draw() {
@@ -2429,9 +2553,11 @@ function initCrystalBtn() {
       const r3 = document.createElement("div");
       r3.className = "cp-minds";
       const have = new Set(c.minds || []);
-      const rows = mindsAll.length ? mindsAll
+      const rows = (mindsAll.length ? mindsAll
         : (c.minds || []).map((id) => ({
-            id, name: id, chunks: (c.chunks || {})[id] }));
+            id, name: id, chunks: (c.chunks || {})[id] })))
+        .slice().sort((a, b) => String(a.name || a.id)
+          .localeCompare(String(b.name || b.id)));
       for (const m of rows) {
         const lab = document.createElement("label");
         lab.className = "cp-mind" + (have.has(m.id) ? " in" : "");
@@ -2480,6 +2606,7 @@ function initCrystalBtn() {
         .join(" \u00b7 ");
       pop.appendChild(jd);
     }
+    ensureGrips();
   }
 
   btn.addEventListener("click", async () => {
@@ -2488,6 +2615,7 @@ function initCrystalBtn() {
       pop.style.display = "none"; towerStop(); mode = "cards"; return;
     }
     pop.style.display = "flex";
+    popRestore();
     await pull(); paintBtn(); draw();
   });
   document.addEventListener("click", (ev) => {
