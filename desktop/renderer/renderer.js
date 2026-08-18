@@ -2233,6 +2233,156 @@ function initCrystalBtn() {
     });
   }
 
+  /* #813: a floating DATA WINDOW — its own draggable, resizable
+   * frame over everything, so several sources can be open side by
+   * side for analysis. */
+  let dataWinAt = 0;
+  function winGrips(el) {
+    [["n", "top:-3px;left:14px;right:14px;height:9px;cursor:ns-resize"],
+     ["s", "bottom:-3px;left:14px;right:14px;height:9px;cursor:ns-resize"],
+     ["w", "left:-3px;top:14px;bottom:14px;width:9px;cursor:ew-resize"],
+     ["e", "right:-3px;top:14px;bottom:14px;width:9px;cursor:ew-resize"],
+     ["nw", "top:-4px;left:-4px;width:16px;height:16px;cursor:nwse-resize"],
+     ["ne", "top:-4px;right:-4px;width:16px;height:16px;cursor:nesw-resize"],
+     ["sw", "bottom:-4px;left:-4px;width:16px;height:16px;cursor:nesw-resize"],
+     ["se", "bottom:-4px;right:-4px;width:16px;height:16px;cursor:nwse-resize"],
+    ].forEach(([dir, css]) => {
+      const grip = document.createElement("div");
+      grip.style.cssText = "position:absolute;z-index:9;" + css;
+      grip.addEventListener("pointerdown", (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const r = el.getBoundingClientRect();
+        const sx = ev.clientX, sy = ev.clientY;
+        const move = (e) => {
+          const dx = e.clientX - sx, dy = e.clientY - sy;
+          let left = r.left, top = r.top;
+          let width = r.width, height = r.height;
+          if (dir.indexOf("e") >= 0) width = r.width + dx;
+          if (dir.indexOf("s") >= 0) height = r.height + dy;
+          if (dir.indexOf("w") >= 0) width = r.width - dx;
+          if (dir.indexOf("n") >= 0) height = r.height - dy;
+          width = Math.max(320, Math.min(width, window.innerWidth - 12));
+          height = Math.max(200, Math.min(height,
+            window.innerHeight - 12));
+          if (dir.indexOf("w") >= 0) left = r.right - width;
+          if (dir.indexOf("n") >= 0) top = r.bottom - height;
+          el.style.width = width + "px";
+          el.style.height = height + "px";
+          el.style.left = Math.max(0, left) + "px";
+          el.style.top = Math.max(0, top) + "px";
+        };
+        const up = () => {
+          document.removeEventListener("pointermove", move);
+          document.removeEventListener("pointerup", up);
+        };
+        document.addEventListener("pointermove", move);
+        document.addEventListener("pointerup", up);
+      });
+      el.appendChild(grip);
+    });
+  }
+
+  function dataWin(rid, file, kind) {
+    const win = document.createElement("div");
+    win.className = "cp-datawin";
+    dataWinAt = (dataWinAt + 1) % 8;
+    win.style.left = (110 + dataWinAt * 30) + "px";
+    win.style.top = (80 + dataWinAt * 26) + "px";
+    const head = document.createElement("div");
+    head.className = "cp-head";
+    head.innerHTML = "<b>" + (kind === "doc" ? "📄 " : "📜 ")
+      + esc(file) + "</b><span class='muted cp-count'></span>"
+      + "<button class='cp-x'>✕</button>";
+    win.appendChild(head);
+    head.addEventListener("mousedown", (ev) => {
+      if (ev.target.closest("button,input")) return;
+      const r = win.getBoundingClientRect();
+      const dx = ev.clientX - r.left, dy = ev.clientY - r.top;
+      const move = (e) => {
+        win.style.left = Math.max(0, e.clientX - dx) + "px";
+        win.style.top = Math.max(0, e.clientY - dy) + "px";
+      };
+      const up = () => {
+        document.removeEventListener("mousemove", move);
+        document.removeEventListener("mouseup", up);
+      };
+      document.addEventListener("mousemove", move);
+      document.addEventListener("mouseup", up);
+    });
+    const body = document.createElement("div");
+    body.className = "cp-left";
+    body.style.flex = "1";
+    win.appendChild(body);
+    document.body.appendChild(win);
+    winGrips(win);
+    head.querySelector(".cp-x").onclick = () => win.remove();
+
+    if (kind === "doc") {
+      body.innerHTML = "<span class='muted'>opening…</span>";
+      api.get("/api/speakbox/" + encodeURIComponent(file) + "?mind="
+        + encodeURIComponent(rid)).then((d) => {
+        body.innerHTML = "";
+        head.querySelector(".cp-count").textContent =
+          (d.mind ? "lives in " + d.mind + " · " : "")
+          + (d.text || "").length.toLocaleString() + " chars";
+        const txt = document.createElement("div");
+        txt.className = "cp-doc";
+        txt.textContent = d.text || "(empty)";
+        body.appendChild(txt);
+      }).catch((err) => { body.textContent = err.message; });
+      return;
+    }
+    let offset = 0, filter = "";
+    const bar = document.createElement("div");
+    bar.className = "cp-row";
+    bar.innerHTML = "<input type='text' placeholder='filter the "
+      + "chunks…' style='flex:1'>";
+    const q = bar.querySelector("input");
+    q.onchange = () => { filter = q.value.trim(); offset = 0;
+      load(true); };
+    body.appendChild(bar);
+    const list = document.createElement("div");
+    list.className = "cp-chunks";
+    body.appendChild(list);
+    const more = document.createElement("button");
+    more.textContent = "more ↓";
+    more.style.display = "none";
+    more.onclick = () => { offset += 200; load(false); };
+    body.appendChild(more);
+    async function load(reset) {
+      if (reset) list.innerHTML = "<span class='muted'>reading…</span>";
+      more.disabled = true;
+      try {
+        const d = await api.get("/api/speakbox/minds/"
+          + encodeURIComponent(rid) + "/chunks?offset=" + offset
+          + "&limit=200&file=" + encodeURIComponent(file)
+          + (filter ? "&q=" + encodeURIComponent(filter) : ""));
+        if (reset) list.innerHTML = "";
+        const page = d.chunks || [];
+        head.querySelector(".cp-count").textContent =
+          (d.total || 0).toLocaleString() + " chunks";
+        page.forEach((c) => {
+          const row = document.createElement("div");
+          row.className = "cp-chunk";
+          row.innerHTML = "<span class='cp-file'>#" + c.i + "</span>"
+            + esc(c.text);
+          // the tower in the reader lights up where this point lives
+          row.onclick = () => towerPaint(page.map((x) => x.i), c.i);
+          list.appendChild(row);
+        });
+        if (!d.total) {
+          list.innerHTML =
+            "<span class='muted'>nothing captured here yet</span>";
+        }
+        more.style.display =
+          (offset + 200 < d.total) ? "inline-block" : "none";
+      } catch (err) { list.textContent = err.message; }
+      more.disabled = false;
+    }
+    load(true);
+  }
+
   /* #807: RESIZE FROM ANY EDGE OR CORNER — eight pointer grips that
    * survive every repaint (draw/openMind wipe innerHTML; the grips are
    * re-appended after each rebuild). Reactive: the box follows the
@@ -2384,10 +2534,12 @@ function initCrystalBtn() {
             }
             row.addEventListener("mouseenter",
               () => towerPaint(range, s.first));
+            // #813: each opens its own floating window — several
+            // sources side by side, the reader stays put.
             row.querySelector(".cp-src-doc").onclick =
-              () => doc(s.file);
+              () => dataWin(rid, s.file, "doc");
             row.querySelector(".cp-src-ch").onclick =
-              () => chunks(s.file);
+              () => dataWin(rid, s.file, "chunks");
             box.appendChild(row);
           });
           left.appendChild(box);
@@ -2550,8 +2702,15 @@ function initCrystalBtn() {
         save(c.id, { strength: parseInt(slider.value, 10) });
       card.appendChild(r2);
 
+      // #815: a TABLE, not a pill wall — one mind per row, aligned
+      // columns, sticky header, scrollable past twelve rows.
       const r3 = document.createElement("div");
-      r3.className = "cp-minds";
+      r3.className = "cp-mindtable";
+      const hd = document.createElement("div");
+      hd.className = "cp-mindrow cp-mindhead";
+      hd.innerHTML = "<span>in</span><span>mind</span>"
+        + "<span class='cp-md-n'>chunks</span><span></span>";
+      r3.appendChild(hd);
       const have = new Set(c.minds || []);
       const rows = (mindsAll.length ? mindsAll
         : (c.minds || []).map((id) => ({
@@ -2560,20 +2719,22 @@ function initCrystalBtn() {
           .localeCompare(String(b.name || b.id)));
       for (const m of rows) {
         const lab = document.createElement("label");
-        lab.className = "cp-mind" + (have.has(m.id) ? " in" : "");
-        lab.title = (m.blurb || m.id) + " — click the count to read it";
+        lab.className = "cp-mindrow" + (have.has(m.id) ? " in" : "");
+        lab.title = m.blurb || m.id;
         lab.innerHTML = "<input type='checkbox'"
-          + (have.has(m.id) ? " checked" : "") + "><span>"
-          + esc(m.name || m.id) + "</span><i title='read these chunks'>"
-          + (m.chunks | 0).toLocaleString() + " 📜</i>";
+          + (have.has(m.id) ? " checked" : "")
+          + "><span class='cp-md-name'>" + esc(m.name || m.id)
+          + "</span><span class='cp-md-n'>"
+          + (m.chunks | 0).toLocaleString()
+          + "</span><button class='cp-md-read' title='read this "
+          + "mind'>📜</button>";
         lab.querySelector("input").onchange = (ev) => {
           const next = new Set(have);
           if (ev.target.checked) next.add(m.id);
           else next.delete(m.id);
           save(c.id, { minds: Array.from(next) });
         };
-        // #794: the count is a DOOR — it opens that mind's pages.
-        lab.querySelector("i").onclick = (ev) => {
+        lab.querySelector(".cp-md-read").onclick = (ev) => {
           ev.preventDefault();
           ev.stopPropagation();
           openMind([m.id], m.name || m.id);

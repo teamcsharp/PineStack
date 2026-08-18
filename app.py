@@ -5334,6 +5334,12 @@ async def onair_watchdog() -> None:
             if time.time() - _BOX_LAST_OK[0] < 150:
                 continue                 # the ladder brought it back
             await nabu_device_restart("still silent after the ladder")
+            await asyncio.sleep(120)
+            if time.time() - _BOX_LAST_OK[0] < 150:
+                continue
+            # #814: every rung failed — the full tree classifies it,
+            # routes the show around a dark device, and stands vigil.
+            await box_triage()
         except Exception:  # noqa: BLE001
             pass                         # the watchdog never dies
 
@@ -5341,6 +5347,189 @@ async def onair_watchdog() -> None:
 @app.on_event("startup")
 async def _startup_onair_watchdog() -> None:
     fire_and_forget(onair_watchdog())
+
+
+async def _wire_probe(host: str) -> str:
+    """What the DEVICE ITSELF says on the wire: 'alive' (a port answered
+    or refused — something is home), or 'dark' (nothing at all — power
+    or Wi-Fi, and no software can reach it)."""
+    def probe() -> str:
+        import socket as _socket
+        for port in (6053, 80, 3232):
+            try:
+                s = _socket.create_connection((host, port), 3)
+                s.close()
+                return "alive"
+            except ConnectionRefusedError:
+                return "alive"
+            except OSError:
+                continue
+        return "dark"
+    try:
+        return await asyncio.to_thread(probe)
+    except Exception:  # noqa: BLE001
+        return "dark"
+
+
+_BOX_VIGIL_ON = [False]
+
+
+async def _box_vigil() -> None:
+    """#814: the tree's last rung — while the device is off the network,
+    watch the wire once a minute; the moment ANYTHING answers, run the
+    recovery and tell the room. The show rides the page/app meanwhile."""
+    if _BOX_VIGIL_ON[0]:
+        return
+    _BOX_VIGIL_ON[0] = True
+    pipeline_log("repair", "vigil: watching the wire for the Pine Box "
+                 "to rejoin — the show rides the page/app until it "
+                 "does (#814)")
+    try:
+        while True:
+            await asyncio.sleep(60)
+            if await _wire_probe(NABU_PROBE_HOST) == "alive":
+                pipeline_log("repair", "vigil: the Pine Box ANSWERED the "
+                             "wire — running recovery (#814)")
+                try:
+                    await satellite_selfheal()
+                except Exception:  # noqa: BLE001
+                    pass
+                if _RADIO.get("on"):
+                    fire_and_forget(dj_banter(None, lines=3, angle=(
+                        "NEWS FROM THE BACK ROOM, mid-show: the box "
+                        "speaker just rejoined the network after being "
+                        "dark — welcome it back on air, in character, "
+                        "and carry on.")))
+                return
+    finally:
+        _BOX_VIGIL_ON[0] = False
+
+
+async def box_triage(fix: bool = True) -> dict[str, Any]:
+    """#814: the DJs' troubleshooting TREE. Walks the whole chain — the
+    show, Home Assistant, the entity, the device on the wire — writes
+    every finding to the repair ledger, ACTS on every branch when `fix`
+    is on, and ends with a station somebody can hear no matter which
+    piece is dead: a dark device means the show routes to the page/app
+    and a vigil watches for its return."""
+    steps: list[dict[str, str]] = []
+
+    def note(name: str, finding: str, did: str = "") -> None:
+        steps.append({"name": name, "finding": finding, "did": did})
+        pipeline_log("repair", f"triage: {name} — {finding}"
+                               + (f" → {did}" if did else "") + " (#814)")
+
+    # 1. the show itself
+    _want_on = False
+    try:
+        _want_on = bool(json.loads(RADIO_ON_PATH.read_text()).get("on"))
+    except Exception:  # noqa: BLE001
+        _want_on = False
+    if _RADIO.get("on"):
+        note("the show", "FM is on and the desk is running")
+    elif _want_on:
+        note("the show", "FM was left ON but the desk is stopped",
+             "resuming it" if fix else "would resume")
+        if fix:
+            try:
+                await resume_radio()
+            except Exception:  # noqa: BLE001
+                pass
+    else:
+        note("the show", "the operator's FM switch is OFF — that choice "
+             "stands; nothing below will be audible until it is on")
+
+    # 2. Home Assistant
+    token, _pl = _ha_creds()
+    ha_ok = False
+    if token:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                ha_ok = (await client.get(
+                    f"{HA_URL}/api/",
+                    headers={"Authorization": f"Bearer {token}"}
+                )).status_code < 300
+        except Exception:  # noqa: BLE001
+            ha_ok = False
+    note("Home Assistant", "answering" if ha_ok else
+         "NOT answering — the whole voice road is down",
+         "" if ha_ok else ("the link ladder restarts it" if fix else ""))
+
+    # 3. the entity
+    link: dict[str, Any] = {}
+    try:
+        link = await satellite_status()
+    except Exception:  # noqa: BLE001
+        link = {}
+    ent = ("available" if link.get("online") else "unavailable")
+    note("the satellite entity", ent)
+
+    # 4. the device, on the wire — the truth no entity can fake
+    wire = await _wire_probe(NABU_PROBE_HOST)
+    if wire == "alive" and not link.get("online"):
+        note("the device", "alive on the wire but the entity is dead — "
+             "a session wedge, not hardware",
+             "climbing the link ladder" if fix else "")
+        if fix and ha_ok:
+            fire_and_forget(nabu_link_ladder("triage (#814)"))
+    elif wire == "alive":
+        note("the device", "alive and linked — if it is still silent "
+             "this is the idle-but-deaf wedge",
+             "pressing its restart button" if fix else "")
+        if fix:
+            await nabu_device_restart("triage — idle-but-deaf (#814)")
+    else:
+        note("the device", "DARK — nothing answers on any port. Power "
+             "or Wi-Fi; no software can reach it",
+             "routing the show around it + standing vigil"
+             if fix else "")
+        if fix:
+            # Route AROUND: the page/app carry everything live; the
+            # box shelf still holds its copy for the return.
+            try:
+                _api_key = os.getenv("SPARK_AGENT_API_KEY", "")
+                async with httpx.AsyncClient(timeout=10) as client:
+                    await client.post(
+                        "http://127.0.0.1:8096/api/dj/output",
+                        headers={"Authorization": f"Bearer {_api_key}"},
+                        json={"music": "both", "voice": "both"})
+            except Exception:  # noqa: BLE001
+                pass
+            fire_and_forget(_box_vigil())
+
+    verdict = ("the station is ON AIR — " + (
+        "everything is healthy" if wire == "alive" and ha_ok
+        and link.get("online")
+        else "riding the page/app while the box is dark"
+        if wire == "dark" else "repairs are climbing"))         if _RADIO.get("on") else "the FM switch is off"
+    pipeline_log("repair", f"triage verdict: {verdict} (#814)")
+
+    # 5. the booth is BRIEFED — the pair report the diagnosis on air,
+    # in character, with the real findings in their mouths.
+    if fix and _RADIO.get("on"):
+        _report = "; ".join(f"{s['name']}: {s['finding']}"
+                            for s in steps)
+        fire_and_forget(dj_banter(None, lines=4, angle=(
+            "STATION TRIAGE, LIVE: you two just ran the full "
+            f"troubleshooting tree. The findings, verbatim: {_report}. "
+            f"The verdict: {verdict}. Report it to the room honestly "
+            "and in character — what was checked, what was found, what "
+            "was done — like engineers who also happen to be on air. "
+            "Do not invent findings that are not listed.")))
+    return {"steps": steps, "verdict": verdict, "wire": wire,
+            "ha": ha_ok, "entity": ent}
+
+
+@app.post("/api/pinebox/triage")
+async def pinebox_triage_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#814: run the DJs' troubleshooting tree now. {"fix": false} walks
+    it read-only."""
+    require_auth(authorization)
+    payload = await request.json()
+    return await box_triage(fix=bool(payload.get("fix", True)))
 
 
 async def nabu_link_ladder(reason: str = "") -> dict[str, Any]:
