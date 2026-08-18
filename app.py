@@ -6032,6 +6032,30 @@ async def clone_engine_ready(engine: str) -> bool:
     return True
 
 
+def _wav_stitch(parts: list[bytes], gap_ms: int = 120) -> bytes:
+    """#811: same-format WAV pieces joined end to end with a short
+    breath between them — the seams land on sentence boundaries, where
+    a beat of silence reads as pacing, not as a cut."""
+    import io
+    import wave
+    frames = b""
+    params = None
+    for part in parts:
+        with wave.open(io.BytesIO(part), "rb") as srcw:
+            if params is None:
+                params = srcw.getparams()
+            chunk = srcw.readframes(srcw.getnframes())
+        if frames and gap_ms:
+            frames += (b"\x00" * (int(params.framerate * gap_ms / 1000.0)
+                                  * params.sampwidth * params.nchannels))
+        frames += chunk
+    out = io.BytesIO()
+    with wave.open(out, "wb") as dst:
+        dst.setparams(params)
+        dst.writeframes(frames)
+    return out.getvalue()
+
+
 async def _f5_synthesize(text: str, voice: str) -> bytes:
     """Zero-shot clone via the host's F5-TTS server (#726).
 
@@ -6049,26 +6073,44 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
         rate = float(dj_settings().get("speech_rate") or 1.0)
     except Exception:  # noqa: BLE001
         rate = 1.0
-    payload: dict[str, Any] = {
-        "text": _xtts_sanitize(text)[:XTTS_MAX_CHARS],
-        "reference_audio": base64.b64encode(ref.read_bytes()).decode(),
-        "language": "en",
-        # nfe=16 costs 0.004 identity for 1.7x the speed — measured.
-        "opts": {"nfe_step": 16, "speed": max(0.75, min(1.25, rate))},
-    }
+    # #811: F5 derives DURATION from its twelve-second reference — past
+    # roughly 300 characters the alignment slides and the clip's TAIL
+    # garbles into underwater mush (the operator's ear was right: the
+    # measured bad calls were 548-688 chars in one piece, while every
+    # splitter upstream waits for 800). Sentence-bounded pieces, one
+    # call each, stitched with a breath: every tail stays clean.
+    clean = _xtts_sanitize(text)
+    pieces = (sentence_chunks(clean, cap=280, most=24)
+              if len(clean) > 300 else [clean])
+    ref_b64 = base64.b64encode(ref.read_bytes()).decode()
+    outs: list[bytes] = []
     async with httpx.AsyncClient(timeout=120) as client:
-        resp = await client.post(f"{F5_URL}/synthesize", json=payload)
-        resp.raise_for_status()
-        # Same trap as XTTS: failures come back as HTTP 200 with a JSON
-        # body, so the content-type is the truth, not the status code.
-        if not resp.headers.get("content-type", "").startswith("audio/"):
-            try:
-                detail = str((resp.json() or {}).get("error")
-                             or resp.json())[:200]
-            except Exception:  # noqa: BLE001
-                detail = resp.text[:200]
-            raise RuntimeError(f"F5 refused: {detail}")
-        return resp.content              # 24 kHz mono s16 WAV
+        for piece in (pieces or [clean]):
+            payload: dict[str, Any] = {
+                "text": str(piece)[:XTTS_MAX_CHARS],
+                "reference_audio": ref_b64,
+                "language": "en",
+                # nfe=16 costs 0.004 identity for 1.7x the speed — measured.
+                "opts": {"nfe_step": 16,
+                         "speed": max(0.75, min(1.25, rate))},
+            }
+            resp = await client.post(f"{F5_URL}/synthesize", json=payload)
+            resp.raise_for_status()
+            # Same trap as XTTS: failures come back as HTTP 200 with a
+            # JSON body — the content-type is the truth, not the status.
+            if not resp.headers.get("content-type",
+                                    "").startswith("audio/"):
+                try:
+                    detail = str((resp.json() or {}).get("error")
+                                 or resp.json())[:200]
+                except Exception:  # noqa: BLE001
+                    detail = resp.text[:200]
+                raise RuntimeError(f"F5 refused: {detail}")
+            outs.append(resp.content)    # 24 kHz mono s16 WAV
+    if len(outs) > 1:
+        pipeline_log("voice", f"f5 stitched {len(outs)} sentence pieces "
+                     "— no long-call tail garble (#811)")
+    return outs[0] if len(outs) == 1 else _wav_stitch(outs)
 
 
 # --- The engine bench (#786): generalized clone + preset adapters ----------
