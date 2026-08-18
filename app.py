@@ -42140,7 +42140,12 @@ button.danger {
    were appended to the section after makeCollapsible wrapped the body
    (the Music pickers leaked under the folded header this way). Only the
    title and the collapsed-state marquees stay. */
-.pb-collapsible.collapsed > *:not(.sec-title):not(.cx-marquee):not(.mini-marquee) {
+/* #810: …but a section whose TITLE is nested in a wrapper row (the
+   gallery's .act-head, the console's .cx-title bar, the techfeed) must
+   keep that wrapper — hiding it took the header with it and the whole
+   section vanished with no way to reopen it. Spare any direct child
+   that CONTAINS the promoted title or a collapsed-state marquee. */
+.pb-collapsible.collapsed > *:not(.sec-title):not(.cx-marquee):not(.mini-marquee):not(:has(.sec-title)):not(:has(.cx-marquee)):not(:has(.mini-marquee)) {
   display: none !important;
 }
 /* #790: …and controls that live INSIDE the title (Music's routing row)
