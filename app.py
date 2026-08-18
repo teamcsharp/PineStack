@@ -7195,6 +7195,49 @@ def _wav_is_silent(raw: bytes, floor: int = 64) -> bool:
         return False
 
 
+# #821: the replay cache. A stock line said again — the SFX Guy's sting,
+# a station id, a recurring drop — REPLAYS its stored clip instead of
+# re-rendering: instant, and the engine never has to be resident for it.
+RENDER_REPLAY_PATH = data_path("render_replay.json")
+_RENDER_REPLAY: dict[str, Any] = {}
+_RENDER_REPLAY_LOADED = [False]
+REPLAY_CACHE_MAX_CHARS = 240
+REPLAY_CACHE_MAX_ROWS = 600
+
+
+def _replay_cache() -> dict[str, Any]:
+    if not _RENDER_REPLAY_LOADED[0]:
+        _RENDER_REPLAY_LOADED[0] = True
+        try:
+            _RENDER_REPLAY.update(
+                json.loads(RENDER_REPLAY_PATH.read_text()))
+        except Exception:
+            pass
+    return _RENDER_REPLAY
+
+
+def _replay_key(engine: str, voice: str, text: str,
+                fx: dict[str, float] | None) -> str:
+    return hashlib.sha1(
+        (f"{engine}|{voice}|{' '.join(str(text).split())}|"
+         + json.dumps(fx or {}, sort_keys=True, default=str)).encode()
+    ).hexdigest()[:20]
+
+
+def _replay_save() -> None:
+    cache = _replay_cache()
+    if len(cache) > REPLAY_CACHE_MAX_ROWS:
+        for k in sorted(cache, key=lambda k: cache[k].get("at", 0))[
+                :len(cache) - REPLAY_CACHE_MAX_ROWS]:
+            cache.pop(k, None)
+    try:
+        tmp = RENDER_REPLAY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache))
+        tmp.replace(RENDER_REPLAY_PATH)
+    except Exception:
+        pass
+
+
 async def voice_generate(text: str, voice: str, engine: str,
                          fx: dict[str, float] | None = None) -> dict[str, Any]:
     """text + voice in, a stored audio path out. Nothing is created unless
@@ -7211,6 +7254,24 @@ async def voice_generate(text: str, voice: str, engine: str,
             status_code=503,
             detail=f"The {engine} engine produces no audio file.",
         )
+    # #821: an exact repeat of a short line replays its stored clip — no
+    # engine touched, no wait. (Only sting-length lines cache, so real
+    # dialogue is always a fresh performance.)
+    _rk = ""
+    if text and len(text) <= REPLAY_CACHE_MAX_CHARS:
+        _rk = _replay_key(engine, voice, text, fx)
+        _hit = _replay_cache().get(_rk)
+        if _hit and (VOICE_MEDIA_DIR
+                     / str(_hit.get("path", "")).rsplit("/", 1)[-1]
+                     ).is_file():
+            _hit["at"] = int(time.time())
+            _hit["uses"] = int(_hit.get("uses") or 0) + 1
+            pipeline_log("voice", "replayed from the sting cache — "
+                         f"0 ms, {engine} untouched (#821)",
+                         extra=f"WHAT WAS SAID:\n{text}")
+            return {**{k: v for k, v in _hit.items()
+                       if k not in ("at", "uses")}, "ms": 0,
+                    "cached": True}
     if not text:
         raise HTTPException(status_code=400, detail="Nothing to say")
     # A line ending on a dangling dash is an interruption in the
@@ -7341,7 +7402,7 @@ async def voice_generate(text: str, voice: str, engine: str,
         "phone": bool((fx or {}).get("phone")),
         "pitch": (fx or {}).get("pitch") or 0,
     }
-    return {
+    _clip_out = {
         "path": f"/media/{key}",
         "sig": media_sign(key),
         "bytes": len(audio),
@@ -7354,6 +7415,11 @@ async def voice_generate(text: str, voice: str, engine: str,
         "seconds": round(float(length or 0.0), 2),
         "service": service,
     }
+    if _rk:
+        _replay_cache()[_rk] = {**_clip_out, "at": int(time.time()),
+                                "uses": 1}
+        _replay_save()
+    return _clip_out
 
 
 # An announcement holds the satellite until it has finished speaking, and
@@ -7637,6 +7703,7 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
         for attempt in range(3):
             try:
                 attempt_started = time.monotonic()
+                attempt_wall = time.time()          # #822 proof window
                 async with httpx.AsyncClient(timeout=call_budget) as client:
                     response = await client.post(
                         f"{HA_URL}/api/services/{service}",
@@ -7654,8 +7721,10 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                     # Nabu accepts a media command before it has finished
                     # playing. Do not mistake that acknowledgement for a
                     # four-second clip and silently shrink the DJ limit.
-                    metered = seconds if player == NABU_SATELLITE else played
-                    _airtime_note(seconds, metered)
+                    # #822: no fabricated airtime. The Nabu's real note is
+                    # written only after audible proof, in the branch below.
+                    if player != NABU_SATELLITE:
+                        _airtime_note(seconds, played)
                     # Did it actually come OUT of the box (#467)? Unknown
                     # length (stings/tapes) → assume yes; those are short and
                     # not the conversation audio we must never lose.
@@ -7689,16 +7758,30 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                     # wall-time meter above because it owns its direct
                     # Wyoming transport.
                     if (not verified and player.startswith("assist_satellite.")):
-                        link = await satellite_status()
-                        if (link.get("transport") == "home_assistant"
-                                and link.get("online")
-                                and link.get("reachable")):
+                        # #822: PROOF, not presence. The device's media
+                        # player must have entered 'playing' since this
+                        # announce began; a mere online entity certified
+                        # 111 of 163 measured silent minutes as perfect.
+                        if await _nabu_played_since(attempt_wall):
+                            _airtime_note(seconds, seconds)
                             _LAST_PLAYOUT.update({
                                 "key": _played_out_key(path), "ratio": 1.0,
                                 "ok": True, "at": time.time()})
                             _BOX_DOWN.update({"fails": 0, "until": 0.0})
                             _BOX_LAST_OK[0] = time.time()
                             _HEAL_STREAK[0] = 0
+                        else:
+                            _airtime_note(seconds, 0.0)
+                            _ANNOUNCE_LAST["error"] = (
+                                "announce accepted but the media player "
+                                "never entered 'playing' — a dead send "
+                                "counted as a miss (#822)")
+                            pipeline_log("air", "paper acceptance rejected "
+                                         "— no audible playout on the box "
+                                         "(#822)", extra=path)
+                            _box_announce_failed()
+                            fire_and_forget(satellite_selfheal())
+                            return ""
                     return player
                 retry, wait, rebuild = say_retry_plan(
                     attempt, response.status_code, response.text)
@@ -7729,6 +7812,34 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                 return ""
         _box_announce_failed()
         return ""
+
+
+async def _nabu_played_since(t0: float) -> bool:
+    """#822: audible proof. The Nabu's MEDIA PLAYER must have entered
+    'playing' since this announce began — the entity being merely online
+    certified 64% silence over a four-hour measured window at ratio 1.0."""
+    token, _player = _ha_creds()
+    if not token:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            state = (await client.get(
+                f"{HA_URL}/api/states/{NABU_MEDIA_PLAYER}",
+                headers={"Authorization": f"Bearer {token}"})).json() or {}
+        if str(state.get("state")) == "playing":
+            return True
+        changed = str(state.get("last_changed") or "")
+        if changed:
+            import datetime as _dt
+            when = _dt.datetime.fromisoformat(
+                changed.replace("Z", "+00:00")).timestamp()
+            # It played and already finished: the transition happened
+            # after our announce began.
+            if when >= t0 - 2.0:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 def _box_announce_failed() -> None:
@@ -12942,11 +13053,24 @@ async def dead_air_watch() -> None:
                 continue
             # #689: now_really_playing, not "is `now` set" — a finished
             # record left pinned is silence, not a record.
-            if now_really_playing() or _SPEAKING[0] \
-                    or time.time() - _LAST_SYNTH[0] < 45.0:
+            # #822: a record streaming to the PAGE does not sound in the
+            # room — while voice goes to the box but music does not, the
+            # record clock must not pacify the room watchdog.
+            _room_gets_music = (_RADIO.get("music_to") or "here") in (
+                "box", "both")
+            _voice_boxed = (_RADIO.get("voice_to") or "box") in (
+                "box", "both")
+            if ((now_really_playing() and (_room_gets_music
+                                           or not _voice_boxed))
+                    or _SPEAKING[0]
+                    or time.time() - _LAST_SYNTH[0] < 45.0):
                 strikes = 0
                 heard = time.time()
                 continue                # airing, speaking, or rendering
+            if _voice_boxed and _BOX_LAST_OK[0] > 0:
+                # The VERIFIED stamp is the room's truth (#822): sound
+                # proven out of the device counts as heard.
+                heard = max(heard, _BOX_LAST_OK[0])
             # #689: a record that has run out is the ordinary case, not a
             # fault — put the next one on and let the pair introduce it,
             # rather than counting it as a strike toward restarting the

@@ -1092,6 +1092,8 @@ function initStationDrawer() {
     try {
       const models = await api.get("/api/ollama-models");
       const sel = $("sparkModel");
+      // #823: never clobber a dropdown the user has open.
+      if (document.activeElement === sel) throw new Error("picker in use");
       sel.innerHTML = "";
       const current = (await api.get("/api/settings")).model || "";
       // Rank by fitness for THIS station's needs — a fast, reliable round
@@ -1153,6 +1155,9 @@ function initStationDrawer() {
     setTimeout(loadSpark, 8000);
   });
   $("sparkRefresh").addEventListener("click", () => loadSpark());
+  // #823: a model pulled in ollama appears here on its own — the list
+  // repolls itself instead of loading once at boot and going stale.
+  setInterval(() => loadSpark(), 45000);
   // The Agent status cell is the door to the machine panel.
   const agentCell = $("agentState") && $("agentState").parentElement;
   if (agentCell) {
