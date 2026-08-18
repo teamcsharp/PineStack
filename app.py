@@ -12526,8 +12526,20 @@ async def box_hold_watch() -> None:
                              extra=str(stale.get("text") or "")[:160])
                 continue
             if not await _replay_held(first):
-                # Still down, or it only half-played — keep it and knock
-                # again next pass (#467). Nothing is dropped until it airs.
+                # #809: BOUNDED retries. A clip that part-plays repeats
+                # its OPENING on every knock — the room heard the same
+                # sentence again and again. Three strikes, then the page
+                # keeps it (#467's promise held the words, not the loop).
+                first["tries"] = int(first.get("tries") or 0) + 1
+                if first["tries"] >= 3:
+                    _BOX_HOLD.pop(0)
+                    _box_hold_save()
+                    pipeline_log("air", "a held clip struck out — three "
+                                 "part-plays; kept for the page, not "
+                                 "re-aired (#809)",
+                                 extra=str(first.get("text") or "")[:160])
+                else:
+                    _box_hold_save()
                 continue
             replayed = [_BOX_HOLD.pop(0)]
             _box_hold_save()
@@ -24731,6 +24743,17 @@ async def speak_turns(turns: list[tuple[str, str]],
             # the same swap the phrase gate below already performs.
             _swp = (fresh_pool_take() if phrase_setup()["swap"] else {})
             _new = spoken_text(str(_swp.get("text") or ""))
+            if not _new and phrase_setup()["swap"]:
+                # #809: the pool ran dry exactly when a looping storyline
+                # needed swapping — six turns dropped to dead air in one
+                # round. A LIVE swath is always there to take the slot.
+                try:
+                    _liveq = await speakbox_quote(most=3, cap=300) or {}
+                except Exception:  # noqa: BLE001
+                    _liveq = {}
+                if _liveq.get("text"):
+                    _swp = _liveq
+                    _new = spoken_text(str(_liveq.get("text") or ""))
             if _new and who in ("dj", "cohost", "third") \
                     and names_only(_new, vouched or []) \
                     and not is_binned(_new):
@@ -24767,6 +24790,15 @@ async def speak_turns(turns: list[tuple[str, str]],
             if _phrase["block"]:
                 _swap = (fresh_pool_take() if phrase_setup()["swap"] else {})
                 _new = spoken_text(str(_swap.get("text") or ""))
+                if not _new and phrase_setup()["swap"]:
+                    try:
+                        _liveq2 = await speakbox_quote(most=3,
+                                                       cap=300) or {}
+                    except Exception:  # noqa: BLE001
+                        _liveq2 = {}
+                    if _liveq2.get("text"):
+                        _swap = _liveq2
+                        _new = spoken_text(str(_liveq2.get("text") or ""))
                 if _new and names_only(_new, vouched or []) \
                         and not is_binned(_new):
                     note_drop(who, text, "swapped for fresh material — "
@@ -31734,6 +31766,14 @@ def crystal_clause() -> str:
             "Topics bend toward its subject matter. The higher the "
             "percentage, the deeper the town has fallen into it; never "
             "NAME the crystal on air (#803).")
+        if strength >= 75:
+            parts.append(
+                "AT THIS DEPTH THE TINT IS TOTAL: diction itself warps — "
+                "internal rhyme and slant imagery surface mid-sentence, "
+                "the crystal's stock phrases fall out of ordinary "
+                "mouths, segues and station business get reframed "
+                "through its world, and even the complaints sound like "
+                "its verses (#809).")
     return "\n" + " ".join(parts) + "\n"
 
 
