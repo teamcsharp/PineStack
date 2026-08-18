@@ -46384,6 +46384,7 @@ async function cloudWords() {
 }
 
 function cloudFill(words) {
+  if (!cloud) return;                    // #813: closed under our feet
   const {THREE, group} = cloud;
   const before = {};
   group.children.forEach((sprite) => {
@@ -46566,7 +46567,17 @@ async function buildCloud(hostArg) {
     },
   };
 
+  // #813: the word fetch awaits the network — closing the cloud DURING
+  // it nulls the global, and the resuming build then destructured null
+  // ("Cannot destructure property 'THREE' of 'cloud'"). If the cloud we
+  // built is no longer the live one, we were closed mid-load: tear our
+  // renderer down quietly and stand down.
+  const built = cloud;
   const words = await cloudWords();
+  if (cloud !== built) {
+    try { built.stop(); } catch (error) { /* already gone */ }
+    return;
+  }
   cloudFill(words);
   cloudStatus(words);
   tick();
@@ -46574,7 +46585,7 @@ async function buildCloud(hostArg) {
 
 function cloudStatus(words) {
   const host = document.getElementById("cloudStatus");
-  if (!host) return;
+  if (!host || !words.length) return;    // #813: empty cloud, quiet status
   const top = words[0] || {};
   host.textContent = words.length + " words · biggest is \u201c" + top.word
     + "\u201d (" + top.count + "\u00d7)";
