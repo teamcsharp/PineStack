@@ -46591,9 +46591,60 @@ async function refreshCloud() {
   }
 }
 
+/* #812: the cloud opens in its own WINDOW, centered — not inline where
+ * it landed mid-column. The host div MOVES into a modal for the show and
+ * moves home on close, so every bit of the WebGL machinery is untouched. */
+let cloudModalHome = null;
+
+function cloudPopupOpen() {
+  const host = document.getElementById("cloudHost");
+  if (!host || document.getElementById("cloudShade")) return;
+  cloudModalHome = {parent: host.parentElement, next: host.nextSibling};
+  const shade = el("div", "", "");
+  shade.id = "cloudShade";
+  shade.style.cssText = "position:fixed;inset:0;z-index:210;" +
+    "background:rgba(4,8,14,.72);display:flex;align-items:center;" +
+    "justify-content:center";
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(1100px,94vw);height:min(720px,88vh);" +
+    "background:var(--panel);border:1px solid var(--border);" +
+    "border-radius:12px;padding:12px;display:flex;flex-direction:column;" +
+    "gap:8px;box-shadow:0 18px 60px rgba(0,0,0,.65)";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center";
+  head.appendChild(el("b", "", "On-air rhetoric — the word cloud"));
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => toggleCloud();
+  head.appendChild(x);
+  box.appendChild(head);
+  const wrap = el("div", "", "");
+  wrap.style.cssText = "flex:1;min-height:0";
+  host.style.width = "100%";
+  host.style.height = "100%";
+  wrap.appendChild(host);
+  box.appendChild(wrap);
+  shade.appendChild(box);
+  shade.onclick = (ev) => { if (ev.target === shade) toggleCloud(); };
+  document.body.appendChild(shade);
+}
+
+function cloudPopupClose() {
+  const shade = document.getElementById("cloudShade");
+  const host = document.getElementById("cloudHost");
+  if (shade && host && cloudModalHome && cloudModalHome.parent) {
+    cloudModalHome.parent.insertBefore(host, cloudModalHome.next);
+    host.style.width = "";
+    host.style.height = "";
+  }
+  if (shade) shade.remove();
+  cloudModalHome = null;
+}
+
 function destroyCloud() {
   if (cloudTimer) { clearInterval(cloudTimer); cloudTimer = null; }
   if (cloud) { cloud.stop(); cloud = null; }
+  cloudPopupClose();
   document.getElementById("cloudHost").style.display = "none";
   document.getElementById("cloudStatus").textContent = "";
 }
@@ -46604,6 +46655,7 @@ async function toggleCloud() {
   if (typeof crystal !== "undefined" && crystal) crystalClose();
 
   document.getElementById("cloudHost").style.display = "block";
+  cloudPopupOpen();          // #812: centered window BEFORE sizing runs
   document.getElementById("cloudStatus").textContent = "Loading…";
   button.textContent = "Hide cloud";
   try {
