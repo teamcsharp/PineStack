@@ -69723,6 +69723,10 @@ async function djBanterPanel() {
     fx.appendChild(fxRate.wrap);
     fx.appendChild(slider("and never twice inside", "sfx_gap", 0, 300,
       dj.sfx_gap ?? 40, (v) => v + " s").wrap);
+    /* #819: the ceiling on a clip's length — dial it down when the
+     * grabs run long, up when the long bits are the point. */
+    fx.appendChild(slider("longest clip allowed", "sfx_max_seconds", 2, 30,
+      Math.round(dj.sfx_max_seconds ?? 4), (v) => v + " s").wrap);
 
     const madeOn = el("label", "toggle", "");
     madeOn.style.cssText = "display:flex;gap:8px;align-items:center;"
