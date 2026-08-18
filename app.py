@@ -273,6 +273,10 @@ XTTS_MAX_CHARS = 950
 #   ~/reachy-gateway/scripts/voxtral_up.sh
 VOXTRAL_URL = os.getenv("VOXTRAL_URL", "http://127.0.0.1:8000").rstrip("/")
 VOXTRAL_MODEL = os.getenv("VOXTRAL_MODEL", "mistralai/Voxtral-4B-TTS-2603")
+# The standalone Voice Director (#797): the host-side service that sees and
+# signals what this container cannot — host processes, engine lifecycles.
+VOICE_DIRECTOR_URL = os.getenv(
+    "VOICE_DIRECTOR_URL", "http://127.0.0.1:8090").rstrip("/")
 
 # #786: the engine bench. Five more neural voices the operator can cycle
 # between on the fly, assign to roles (host/cohost/caller/…), and — for the
@@ -538,6 +542,9 @@ DEFAULT_DJ = {
     "news_hourly": True,
     # Generated call-ins an hour (#236). 0 keeps the phone quiet.
     "callin_per_hour": 4,           # #786: was 1 — the scarcest talk source
+    # #798: the caller behaviour deck — relative weights, drawn per call.
+    "caller_prize": 15, "caller_mad": 15, "caller_agree": 15,
+    "caller_disagree": 20, "caller_offwall": 15, "caller_plain": 20,
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
@@ -1146,6 +1153,11 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "callin_per_hour": max(0, min(60, int(
             raw_dj.get("callin_per_hour",
                        DEFAULT_DJ["callin_per_hour"]) or 0))),
+        # #798: the behaviour deck weights ride the same clamp.
+        **{f"caller_{k}": max(0, min(100, int(
+            raw_dj.get(f"caller_{k}", DEFAULT_DJ[f"caller_{k}"]) or 0)))
+           for k in ("prize", "mad", "agree", "disagree", "offwall",
+                     "plain")},
         "caller_success_rate": max(0, min(100, int(
             raw_dj.get("caller_success_rate",
                        DEFAULT_DJ["caller_success_rate"]) or 0))),
@@ -3743,6 +3755,60 @@ async def _startup_comfy_idle() -> None:
     fire_and_forget(comfy_idle_clock())
 
 
+# #797: XTTS is the box's single biggest tenant (~23G of unified memory).
+# When nothing has asked it to render for a while, offload it — the #794
+# ladder means every clone voice still airs (same reference through F5),
+# and the first render that WANTS XTTS wakes it back up in the background.
+_XTTS_LAST_USED = [time.time()]
+_XTTS_REVIVE_AT = [0.0]
+XTTS_IDLE_UNLOAD = float(os.getenv("XTTS_IDLE_UNLOAD", "1800"))  # 30 min
+
+
+def _xtts_revive_maybe() -> None:
+    if time.time() - _XTTS_REVIVE_AT[0] < 600:
+        return
+    _XTTS_REVIVE_AT[0] = time.time()
+
+    async def _up() -> None:
+        try:
+            async with httpx.AsyncClient(timeout=30) as client:
+                await client.post(
+                    f"{VOICE_DIRECTOR_URL}/director/engine/xtts/deploy")
+            pipeline_log("gpu", "XTTS was offloaded and is wanted again — "
+                                "reloading it now; F5 carries the clones "
+                                "until it answers (#797)")
+        except Exception:  # noqa: BLE001
+            pass
+    fire_and_forget(_up())
+
+
+async def xtts_idle_clock() -> None:
+    while True:
+        await asyncio.sleep(300)
+        try:
+            if XTTS_IDLE_UNLOAD <= 0:
+                continue
+            if time.time() - _XTTS_LAST_USED[0] < XTTS_IDLE_UNLOAD:
+                continue
+            health = await engine_health("xtts")
+            if not health.get("ready"):
+                continue                 # already down or offloaded
+            async with httpx.AsyncClient(timeout=30) as client:
+                await client.post(
+                    f"{VOICE_DIRECTOR_URL}/director/engine/xtts/terminate")
+            pipeline_log("gpu", "nothing has asked XTTS to render in "
+                         f"{int(XTTS_IDLE_UNLOAD // 60)} minutes — "
+                         "offloaded (~23G back to the box); it reloads "
+                         "the moment a render wants it (#797)")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.on_event("startup")
+async def _startup_xtts_idle() -> None:
+    fire_and_forget(xtts_idle_clock())
+
+
 @app.on_event("startup")
 async def _startup_hold_watch() -> None:
     """The hold shelf drains for the LIFE of the app (#408, #409) — one
@@ -6031,7 +6097,16 @@ async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
     if engine == "ha_file":
         return await asyncio.wait_for(_ha_file_synthesize(text, voice), 60)
     if engine == "xtts":
-        return await asyncio.wait_for(_xtts_synthesize(text, voice), 150), "wav"
+        try:
+            _out = await asyncio.wait_for(_xtts_synthesize(text, voice), 150)
+        except (httpx.TransportError, asyncio.TimeoutError):
+            # #797: XTTS may be idle-offloaded (23G reclaimed). A wanted
+            # render wakes it in the background; the #794 ladder carries
+            # this line on F5 with the same reference meanwhile.
+            _xtts_revive_maybe()
+            raise
+        _XTTS_LAST_USED[0] = time.time()
+        return _out, "wav"
     if engine == "f5":
         return await asyncio.wait_for(_f5_synthesize(text, voice), 150), "wav"
     if engine == "voxtral":
@@ -9695,7 +9770,14 @@ def radio_prompt_desk_state() -> dict[str, Any]:
         "third": [("third_name", "Third-seat name", "text", 0, 0, 0)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
                    ("caller_success_rate", "Successful calls", "range", 0, 100, 1),
-                   ("caller_insanity", "Caller intensity", "range", 0, 100, 1)],
+                   ("caller_insanity", "Caller intensity", "range", 0, 100, 1),
+                   # #798: the behaviour deck, exposed — relative weights.
+                   ("caller_prize", "Deck · prize hunters", "range", 0, 100, 1),
+                   ("caller_mad", "Deck · turn on the hosts", "range", 0, 100, 1),
+                   ("caller_agree", "Deck · fervent agreement", "range", 0, 100, 1),
+                   ("caller_disagree", "Deck · argue everything", "range", 0, 100, 1),
+                   ("caller_offwall", "Deck · out of this world", "range", 0, 100, 1),
+                   ("caller_plain", "Deck · ordinary folk", "range", 0, 100, 1)],
         "manager": [("upstairs_per_hour", "Manager interruptions per hour", "range", 0, 12, 0.5),
                     ("manager_name", "Manager name", "text", 0, 0, 0)],
         "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 20, 1),
@@ -20621,6 +20703,57 @@ CALLER_TEMPERS = (
     "conspiratorial, convinced they are telling you something forbidden",
 )
 
+# #798: the caller behaviour DECK — what this call is FOR, drawn by the
+# operator's own weights (the six sliders in the callers popup) rather
+# than buried dice. States/tempers above are HOW a caller sounds; the deck
+# is what they do to the show: chase a prize, turn on the hosts, agree
+# too hard, argue everything, or say something from another planet.
+CALLER_BEHAVIORS = {
+    "prize": (
+        " THIS IS A PRIZE CALL: the caller is here to WIN — they say so, "
+        "they angle for it, and before the hangup the pair must resolve it "
+        "on air: a win (name the prize — a painting, an absurd invention "
+        "of the station's) or a loss the caller takes badly or "
+        "beautifully. The outcome is SPOKEN, never left hanging."),
+    "mad": (
+        " AT SOME POINT THIS CALLER TURNS ON THE HOSTS: something the pair "
+        "says sets them off mid-call and they boil over — personal, "
+        "specific, escalating until the hangup deals with it."),
+    "agree": (
+        " THIS CALLER AGREES WITH EVERYTHING — fervently, dangerously: "
+        "they take whatever the hosts say and push it three steps further "
+        "than the hosts ever meant, until the pair have to walk their own "
+        "point back."),
+    "disagree": (
+        " THIS CALLER CAME TO ARGUE: they dispute the hosts point by "
+        "point, unmovable, certain, bringing their own wrong evidence — "
+        "and they do not fold; the pair have to end it unresolved or "
+        "concede something."),
+    "offwall": (
+        " THIS CALLER SAYS SOMETHING GENUINELY OUT OF THIS WORLD — an "
+        "off-the-wall claim or confession delivered as if it were the "
+        "most normal thing anyone ever said; the pair have to decide "
+        "live whether to believe it."),
+    "plain": "",
+}
+
+
+def caller_behavior_draw() -> tuple[str, str]:
+    """One card off the deck, by the operator's weights."""
+    dj = dj_settings()
+    deck = [(key, max(0, int(dj.get(f"caller_{key}", 15) or 0)))
+            for key in ("prize", "mad", "agree", "disagree", "offwall",
+                        "plain")]
+    total = sum(w for _, w in deck)
+    if total <= 0:
+        return "plain", ""
+    roll = random.uniform(0, total)
+    for key, weight in deck:
+        roll -= weight
+        if roll <= 0:
+            return key, CALLER_BEHAVIORS[key]
+    return "plain", ""
+
 
 # #709: the town does not merely suffer the heat — it has WORKED OUT where
 # the heat comes from, and the answer is the machine this station runs on.
@@ -22612,9 +22745,14 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         mangle = dict(mangle)
         mangle["pitch"] = float(mangle.get("pitch") or 1.0) * random.uniform(
             0.94, 1.08)
+    # #798: one card off the behaviour deck rides into the script AND onto
+    # the ledger, so the operator can see which card each call drew.
+    behavior_key, behavior_bit = caller_behavior_draw()
+    if behavior_key != "plain":
+        state = f"{state} [deck: {behavior_key}]"
     angle = (
         f"The request line rings and {caller['name']} is on {line_say}, "
-        f"{state}.{temper_bit}"
+        f"{state}.{temper_bit}{behavior_bit}"
         f"{persona_bit}{goal_bit} {topic} "
         # #544: the pair HEAR the phone ring and react to it before they pick
         # it up — the ring is a beat they play off of, not a silent cut.
@@ -39724,7 +39862,47 @@ async def models_loaded(
                 })
         except Exception:
             pass
-    return {"models": out}
+    # #797: the REAL memory map — every heavy host process from the
+    # director's observatory (it runs on the host; this container cannot
+    # see host processes itself). The stats window lists these with kill
+    # switches, so XTTS getting out of control is a button, not an ssh.
+    procs: list[dict[str, Any]] = []
+    mem_line = ""
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            hp = (await client.get(
+                f"{VOICE_DIRECTOR_URL}/host/procs")).json() or {}
+        procs = hp.get("procs") or []
+        if hp.get("mem_total_gb"):
+            mem_line = (f"{hp['mem_total_gb'] - hp['mem_avail_gb']:.0f}G "
+                        f"used / {hp['mem_total_gb']}G unified")
+    except Exception:
+        pass
+    return {"models": out, "procs": procs, "mem": mem_line}
+
+
+@app.post("/api/host/kill")
+async def host_kill_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Drop a runaway host process, through the director's observatory
+    (#797). The director enforces the guardrails: cmd signature must match
+    the live pid, protected and containerized processes are refused."""
+    require_auth(authorization)
+    payload = await request.json()
+    async with httpx.AsyncClient(timeout=20) as client:
+        reply = await client.post(f"{VOICE_DIRECTOR_URL}/host/kill",
+                                  json=payload)
+    if reply.status_code >= 400:
+        try:
+            detail = str((reply.json() or {}).get("detail") or reply.text)
+        except Exception:
+            detail = reply.text
+        raise HTTPException(status_code=reply.status_code,
+                            detail=detail[:200])
+    note_action(f"⛔ dropped host pid {payload.get('pid')}")
+    return reply.json()
 
 
 @app.post("/api/models/unload")
@@ -73348,10 +73526,15 @@ async function openHealthPopup() {
 
   async function refreshLoaded() {
     memList.textContent = "";
-    let loaded = [];
-    try { loaded = (await api("/api/models/loaded")).models || []; }
+    let loaded = [], procs = [], memLine = "";
+    try {
+      const got = await api("/api/models/loaded");
+      loaded = got.models || [];
+      procs = got.procs || [];
+      memLine = got.mem || "";
+    }
     catch (error) { memList.appendChild(el("div", "muted", error.message)); return; }
-    if (!loaded.length) {
+    if (!loaded.length && !procs.length) {
       memList.appendChild(el("div", "muted", "Nothing resident right now."));
       return;
     }
@@ -73379,6 +73562,62 @@ async function openHealthPopup() {
       row.appendChild(eject);
       memList.appendChild(row);
     });
+
+    // #797: the REAL memory map — every heavy host process, watchable and
+    // droppable. Click a row for its whole story; ✕ sends SIGTERM, and a
+    // second ✕ on a survivor sends SIGKILL. The director enforces the
+    // guardrails (protected + containerized processes refuse politely).
+    if (procs.length) {
+      const head = el("div", "muted",
+        "Host processes" + (memLine ? " · " + memLine : ""));
+      head.style.cssText = "margin-top:12px;font-size:11px;letter-spacing:.4px";
+      memList.appendChild(head);
+      procs.forEach((p) => {
+        const row = el("div");
+        row.style.cssText = "display:flex;align-items:center;gap:8px;" +
+          "margin-top:6px;font-size:12px";
+        const gpu = p.gpu_gb ? " +" + p.gpu_gb + "G gpu" : "";
+        const label = el("span", "",
+          p.label + " · " + p.rss_gb + "G" + gpu +
+          " · " + Math.round(p.cpu_pct) + "% cpu");
+        label.style.cssText = "flex:1;color:#c3cfdd;overflow:hidden;" +
+          "text-overflow:ellipsis;white-space:nowrap;cursor:help";
+        label.title = "pid " + p.pid + " · up " + p.up_min + " min"
+          + (p.port ? " · :" + p.port : "")
+          + (p.docker ? " · in a container" : "") + "\n" + p.cmd;
+        const kill = el("button", "hp-restart", "✕");
+        if (!p.killable) {
+          kill.disabled = true;
+          kill.title = p.why_not || "not killable from here";
+        } else {
+          kill.title = "Stop " + p.label + " (pid " + p.pid + ")";
+          kill.onclick = async () => {
+            const force = kill.dataset.armed === "1";
+            if (!force && !confirm("Stop " + p.label + " (pid " + p.pid
+                + ")? The show falls back where it can.")) return;
+            kill.textContent = "…";
+            try {
+              await api("/api/host/kill", {
+                method: "POST",
+                body: JSON.stringify({pid: p.pid,
+                                      cmd_sig: p.cmd.slice(0, 60),
+                                      force}),
+              });
+              kill.dataset.armed = "1";   // still here next refresh → KILL
+              kill.textContent = "💀";
+              kill.title = "It survived SIGTERM — click again to SIGKILL";
+            } catch (error) {
+              kill.textContent = "✕";
+              kill.title = error.message;
+            }
+            setTimeout(refreshLoaded, 2500);
+          };
+        }
+        row.appendChild(label);
+        row.appendChild(kill);
+        memList.appendChild(row);
+      });
+    }
   }
   refreshLoaded();
 
