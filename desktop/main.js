@@ -69,7 +69,51 @@ function writeConfig(next) {
 function agentRoot() {
   if (process.env.PINE_AGENT_ROOT) return process.env.PINE_AGENT_ROOT;
   if (app.isPackaged) return path.join(process.resourcesPath, "agent");
-  return path.resolve(__dirname, "..");
+  const local = path.resolve(__dirname, "..");
+  // #828: a bare electron.exe shortcut carries no env, and the local
+  // runner's parent is NOT the agent — it has package.json but no
+  // app.py. When the guess is wrong, the share is the truth.
+  try {
+    if (!fs.existsSync(path.join(local, "app.py"))) {
+      const share =
+        "\\\\10.89.1.246\\ehm_eckx\\pinevoice-stack\\spark-agent";
+      if (fs.existsSync(path.join(share, "package.json"))) return share;
+    }
+  } catch { /* offline — keep the local guess */ }
+  return local;
+}
+
+function selfSyncFromShare() {
+  // #828: EVERY launch refreshes the app from the share, no matter how
+  // it was started — the operator's bare electron.exe shortcut kept
+  // them on stale code through a whole day of fixes. Renderer files
+  // land before the window loads, so this very boot runs them; a new
+  // main.js takes over on the next boot.
+  if (process.platform !== "win32"
+      || process.env.PINE_NO_SELFSYNC === "1") return;
+  try {
+    const source = agentRoot();
+    const runner = path.resolve(__dirname, "..");
+    if (path.resolve(source).toLowerCase() === runner.toLowerCase()) {
+      return;                          // running from the share itself
+    }
+    const srcDesk = path.join(source, "desktop");
+    if (!fs.existsSync(path.join(srcDesk, "main.js"))) return;
+    const { spawnSync } = require("node:child_process");
+    const r = spawnSync("robocopy", [srcDesk,
+      path.join(runner, "desktop"),
+      "/MIR", "/NFL", "/NDL", "/NJH", "/NJS", "/NP"],
+      { timeout: 25000 });
+    try {
+      fs.copyFileSync(path.join(source, "package.json"),
+        path.join(runner, "package.json"));
+    } catch { /* the old one keeps working */ }
+    rememberLog(`[desktop] self-synced from ${srcDesk} rc=${r.status}`);
+  } catch (err) {
+    try {
+      rememberLog(`[desktop] self-sync skipped: ${err.message}`);
+    } catch { /* logging never blocks a launch */ }
+  }
 }
 
 function defaultDataDir(root) {
@@ -634,6 +678,7 @@ app.on("web-contents-created", (event, contents) => {
 });
 
 app.whenReady().then(async () => {
+  selfSyncFromShare();
   createWindow();
   const cfg = readConfig();
   if (cfg.mode === "launch") {
