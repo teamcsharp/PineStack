@@ -3775,6 +3775,74 @@ _XTTS_REVIVE_AT = [0.0]
 XTTS_IDLE_UNLOAD = float(os.getenv("XTTS_IDLE_UNLOAD", "1800"))  # 30 min
 
 
+LIFEBOAT_URL = os.getenv("LIFEBOAT_URL", "http://127.0.0.1:8099")
+_XTTS_FAILS: list[float] = []
+_XTTS_BOUNCE_AT = [0.0]
+
+
+async def _lifeboat_restart(service: str) -> bool:
+    """#825: the hand OUTSIDE the water — when the voice-director itself
+    is the casualty, the lifeboat (systemd, outside docker) restarts it
+    so every engine handle comes back."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            r = await client.post(
+                f"{LIFEBOAT_URL}/restart/{service}",
+                headers={"X-Lifeboat-Key":
+                         os.getenv("SPARK_AGENT_API_KEY", "")})
+        ok = r.status_code < 300
+        pipeline_log("repair", f"lifeboat restart {service}: "
+                     + ("ok" if ok else str(r.status_code)) + " (#825)")
+        return ok
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("repair", f"lifeboat unreachable: {exc} (#825)")
+        return False
+
+
+async def _director_post(path: str) -> bool:
+    """#825: a director call that HEALS the director — if :8090 does not
+    answer, the lifeboat restarts it and the call retries once. The DJs
+    never lose their engine handles to a dead middleman."""
+    for attempt in (0, 1):
+        try:
+            async with httpx.AsyncClient(timeout=45) as client:
+                await client.post(f"{VOICE_DIRECTOR_URL}{path}")
+            return True
+        except Exception:  # noqa: BLE001
+            if attempt:
+                return False
+            if not await _lifeboat_restart("voice-director"):
+                return False
+            await asyncio.sleep(6)
+    return False
+
+
+async def _xtts_bounce_maybe() -> None:
+    """#825: an XTTS that answers /health but fails renders is WEDGED —
+    three failures inside ten minutes gets it terminated and redeployed
+    (15-minute cooldown), because a wedge never fixes itself."""
+    now = time.time()
+    _XTTS_FAILS.append(now)
+    del _XTTS_FAILS[:-8]
+    recent = [t for t in _XTTS_FAILS if now - t < 600]
+    if len(recent) < 3 or now - _XTTS_BOUNCE_AT[0] < 900:
+        return
+    try:
+        healthy = bool((await xtts_health()).get("ready"))
+    except Exception:  # noqa: BLE001
+        healthy = False
+    if not healthy:
+        return                          # dead, not wedged — revive owns it
+    _XTTS_BOUNCE_AT[0] = now
+    _XTTS_FAILS.clear()
+    pipeline_log("repair", "XTTS answers health but failed 3 renders in "
+                 "10 min — WEDGED; bouncing it through the director "
+                 "(#825)")
+    await _director_post("/director/engine/xtts/terminate")
+    await asyncio.sleep(3)
+    await _director_post("/director/engine/xtts/deploy")
+
+
 def _xtts_revive_maybe() -> None:
     if time.time() - _XTTS_REVIVE_AT[0] < 600:
         return
@@ -3799,6 +3867,27 @@ def _xtts_revive_maybe() -> None:
                                 f"{spare}/terminate")
                         pipeline_log("gpu", "cleared the standin engines "
                                      "to make room for XTTS (#812)")
+                    # #825: still cramped? The writer model steps out —
+                    # it reloads on the next round write, and one slow
+                    # round beats a cast with no voice.
+                    try:
+                        press2 = (await client.get(
+                            f"{VOICE_DIRECTOR_URL}/host/pressure")).json()
+                        if float(press2.get("avail_gb") or 0) < 30:
+                            ps = (await client.get(
+                                "http://127.0.0.1:11434/api/ps")
+                            ).json() or {}
+                            for m in ps.get("models", []):
+                                await client.post(
+                                    "http://127.0.0.1:11434/api/generate",
+                                    json={"model": m.get("name"),
+                                          "keep_alive": 0})
+                            if ps.get("models"):
+                                pipeline_log("gpu", "evicted the writer "
+                                             "to fit XTTS — it reloads "
+                                             "on the next round (#825)")
+                    except Exception:  # noqa: BLE001
+                        pass
                 except Exception:  # noqa: BLE001
                     pass
                 await client.post(
@@ -5519,6 +5608,21 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
                 pass
             fire_and_forget(_box_vigil())
 
+    # 4b. the DIRECTOR — every engine handle routes through it
+    _dir_ok = False
+    try:
+        async with httpx.AsyncClient(timeout=8) as client:
+            _dir_ok = (await client.get(
+                f"{VOICE_DIRECTOR_URL}/host/pressure")).status_code < 300
+    except Exception:  # noqa: BLE001
+        _dir_ok = False
+    note("the voice director", "answering" if _dir_ok else
+         "NOT answering — no engine can be managed",
+         "" if _dir_ok else ("lifeboat restarts it" if fix else ""))
+    if fix and not _dir_ok:
+        await _lifeboat_restart("voice-director")
+        await asyncio.sleep(6)
+
     # 5. the RENDER CHAIN — a healthy device is worthless if no engine
     # can make audio. The tree once declared "everything healthy" in
     # the middle of an all-engines-refused outage (#824).
@@ -5532,15 +5636,9 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
          "" if (_xtts_ok and _f5_ok) else
          ("redeploying the dead engine(s)" if fix else ""))
     if fix and not (_xtts_ok and _f5_ok):
-        try:
-            async with httpx.AsyncClient(timeout=45) as client:
-                for _eng, _ok in (("xtts", _xtts_ok), ("f5", _f5_ok)):
-                    if not _ok:
-                        await client.post(
-                            f"{VOICE_DIRECTOR_URL}/director/engine/"
-                            f"{_eng}/deploy")
-        except Exception:  # noqa: BLE001
-            pass
+        for _eng, _ok in (("xtts", _xtts_ok), ("f5", _f5_ok)):
+            if not _ok:
+                await _director_post(f"/director/engine/{_eng}/deploy")
 
     verdict = ("the station is ON AIR — " + (
         "everything is healthy" if wire == "alive" and ha_ok
@@ -6499,7 +6597,10 @@ async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
             # #797: XTTS may be idle-offloaded (23G reclaimed). A wanted
             # render wakes it in the background; the #794 ladder carries
             # this line on F5 with the same reference meanwhile.
+            # #825: and a wedge — healthy on paper, failing in practice —
+            # gets counted, and bounced on the third strike.
             _xtts_revive_maybe()
+            fire_and_forget(_xtts_bounce_maybe())
             raise
         _XTTS_LAST_USED[0] = time.time()
         return _out, "wav"
