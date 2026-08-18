@@ -582,6 +582,20 @@ ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
 // #809: F5 pressed while focus is INSIDE a panel webview never
 // reaches the chrome's keydown handler — the webview swallows it.
 // Catch it at the source and reload that webview directly.
+// #817: anything saved out of the app (radio cache mp3s, exports)
+// reveals itself — when the download lands, File Explorer opens on
+// the file so it is in hand, not lost in a Downloads pile.
+app.on("session-created", (sess) => {
+  sess.on("will-download", (ev, item) => {
+    item.once("done", (e2, state) => {
+      if (state === "completed") {
+        try { shell.showItemInFolder(item.getSavePath()); }
+        catch { /* explorer said no; the file still saved */ }
+      }
+    });
+  });
+});
+
 app.on("web-contents-created", (event, contents) => {
   if (contents.getType() !== "webview") return;
   contents.on("before-input-event", (ev, input) => {
