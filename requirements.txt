@@ -11,3 +11,4 @@ pyserial==3.5
 # meme sting lands several times louder than the DJ who set it up. No apt, no
 # root, no system package — it ships the binary and pip already runs here.
 imageio-ffmpeg==0.6.0
+numpy

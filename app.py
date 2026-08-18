@@ -17002,7 +17002,9 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
 # thousands of swaths. The embedder being down is a no-op, never a dead radio.
 SPEAKBOX_VECTORS = data_path("speakbox_vectors.json")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
-SPEAKBOX_VEC_MAX = 24000                # safety ceiling only (#597: index it ALL)
+SPEAKBOX_VEC_MAX = 40000                # #816: 24000 was REACHED — the
+                                        # positional cut silently erased
+                                        # 14 whole documents
 _VEC_LOCK = RLock()
 _VEC_CACHE: dict[str, Any] = {}         # the store, kept warm in memory
 
@@ -17053,18 +17055,21 @@ def _load_vectors(rid: str = "") -> dict[str, Any]:
 
 
 def _save_vectors(rid: str = "") -> None:
+    # #816: snapshot under the lock, SERIALIZE outside it. The 410MB
+    # json.dumps measured 4.8s and ran lock-held on the event loop —
+    # freezing playout pacing and call pickup on every speakbox edit.
     with _VEC_LOCK:
         key = mind_id(rid)
         held = _VEC_CACHE.get(key) or {}
         payload = {k: held.get(k) for k in ("model", "mtimes", "chunks")}
-        try:
-            store = mind_state(key, "vectors")
-            store.parent.mkdir(parents=True, exist_ok=True)
-            tmp = store.with_suffix(".tmp")
-            tmp.write_text(json.dumps(payload))
-            tmp.replace(store)
-        except Exception:
-            pass
+    try:
+        store = mind_state(key, "vectors")
+        store.parent.mkdir(parents=True, exist_ok=True)
+        tmp = store.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload))
+        tmp.replace(store)
+    except Exception:
+        pass
 
 
 def speakbox_vector_stats(rid: str = "") -> dict[str, Any]:
@@ -17148,8 +17153,15 @@ async def speakbox_reindex(force: bool = False,
                 held["chunks"] = chunks
                 held["model"] = EMBED_MODEL
                 held["loaded"] = True
-            _save_vectors(key)
+            await asyncio.to_thread(_save_vectors, key)
     if len(chunks) > SPEAKBOX_VEC_MAX:
+        # #816: when the cut drops a file to ZERO chunks, forget its mtime
+        # too — otherwise the gate says "indexed" forever and the document
+        # is erased from search with no road back (measured: 14 files).
+        _before_files = {c.get("file") for c in chunks}
+        _kept_files = {c.get("file") for c in chunks[-SPEAKBOX_VEC_MAX:]}
+        for _lost in _before_files - _kept_files:
+            mtimes.pop(_lost, None)
         chunks = chunks[-SPEAKBOX_VEC_MAX:]
     with _VEC_LOCK:
         held = _VEC_CACHE.setdefault(key, {})
@@ -17157,7 +17169,7 @@ async def speakbox_reindex(force: bool = False,
         held["chunks"] = chunks
         held["model"] = EMBED_MODEL
         held["loaded"] = True
-    _save_vectors(key)
+    await asyncio.to_thread(_save_vectors, key)
     return speakbox_vector_stats(key)
 
 
@@ -17178,12 +17190,52 @@ async def speakbox_search(query: str, k: int = 5, exclude: str = "",
     # Rank in a thread (#597): the index now holds ALL of every document, so the
     # cosine scan is bigger — run it off the event loop so a search never stalls
     # the show.
+    _votes = votes_read()
+
     def _rank() -> list[dict[str, Any]]:
-        return sorted(
-            ({"file": c["file"], "text": c["text"],
-              "score": sum(a * b for a, b in zip(q, c["vec"]))}
-             for c in chunks),
-            key=lambda r: -r["score"])
+        # #816: the pure-Python cosine over 24000x768 measured ~0.9s per
+        # draw, GIL-bound, in the caller-response path. numpy does the
+        # same matrix-vector product in milliseconds; the matrix is cached
+        # on the store and rebuilt only when the chunk list changes.
+        try:
+            import numpy as _np
+            _mat = store.get("_np")
+            if not _mat or _mat[0] is not store.get("chunks"):
+                _arr = _np.asarray([c["vec"] for c in chunks],
+                                   dtype=_np.float32)
+                _mat = (store.get("chunks"), _arr)
+                store["_np"] = _mat
+            _scores = _mat[1] @ _np.asarray(q, dtype=_np.float32)
+            rows = []
+            for i, c in enumerate(chunks):
+                score = float(_scores[i])
+                v = _votes.get(chunk_key(c["file"], c["text"]))
+                if v:
+                    net = int(v.get("up") or 0) - int(v.get("down") or 0)
+                    if net <= -3:
+                        continue
+                    score *= 1.0 + max(-0.4, min(0.4, net * 0.08))
+                rows.append({"file": c["file"], "text": c["text"],
+                             "score": score})
+            rows.sort(key=lambda r: -r["score"])
+            return rows
+        except ImportError:
+            pass
+        rows = []
+        for c in chunks:
+            score = sum(a * b for a, b in zip(q, c["vec"]))
+            # #815: operator votes bend the draw — capped, and a heavily
+            # buried chunk stops surfacing entirely.
+            v = _votes.get(chunk_key(c["file"], c["text"]))
+            if v:
+                net = int(v.get("up") or 0) - int(v.get("down") or 0)
+                if net <= -3:
+                    continue
+                score *= 1.0 + max(-0.4, min(0.4, net * 0.08))
+            rows.append({"file": c["file"], "text": c["text"],
+                         "score": score})
+        rows.sort(key=lambda r: -r["score"])
+        return rows
     scored = await asyncio.to_thread(_rank)
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -17245,6 +17297,19 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
     pin = str(pins.get(who) or "")
     k = 8 if (pin or blocks) else 1
     hits = await speakbox_search(query, k=k, exclude=exclude, rid=key)
+    # #815: crystals that are ON compete in the draw — their minds' best
+    # chunk enters weighted by strength, so a switched-on crystal really
+    # bends what the pair reach for.
+    for _cr in crystal_active():
+        _w = max(5, min(100, int(_cr.get("strength") or 50))) / 100.0
+        for _rid in (_cr.get("minds") or []):
+            if mind_id(_rid) == key:
+                continue
+            for _h in await speakbox_search(query, k=1, exclude=exclude,
+                                            rid=_rid):
+                hits.append({**_h,
+                             "score": float(_h.get("score") or 0) * _w})
+    hits.sort(key=lambda h: -float(h.get("score") or 0))
     if blocks:
         hits = [h for h in hits if h.get("file") not in blocks]
     if pin:
@@ -25337,7 +25402,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
             + f".{playing}{only_song}{aside}{show_memory()}{call_flow}"
-            f"{avoid_reruns()}{approach_clause(_approach)}\n\n"
+            f"{crystal_clause()}{avoid_reruns()}{approach_clause(_approach)}\n\n"
             "The two lists below are prompts he typed and pictures we made "
             "for him. They are not songs and must never be announced as "
             "songs.\n"
@@ -30674,6 +30739,280 @@ async def music_artist_read_status(
     if not job:
         raise HTTPException(status_code=404, detail="No such read")
     return job
+
+
+# ==== CRYSTALS (#815) ======================================================
+# A crystal is a PORTABLE vector database distilled from a catalogue — one
+# or more minds fused under a name, with a TINT: while it is switched on,
+# the whole world of the show leans into its subject matter. Crystals
+# stack (several on at once), combine (one crystal, many minds), and are
+# reusable by any other system through /api/crystals/{id}/seed, /dump and
+# /export (the single-file form the operator asked for).
+CRYSTALS_PATH = data_path("crystals.json")
+SPEAKBOX_VOTES_PATH = data_path("speakbox_votes.json")
+
+
+def crystals_read() -> dict[str, Any]:
+    try:
+        return json.loads(CRYSTALS_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def crystals_save(data: dict[str, Any]) -> None:
+    tmp = CRYSTALS_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=1))
+    tmp.replace(CRYSTALS_PATH)
+
+
+def crystal_active() -> list[dict[str, Any]]:
+    return [c for c in crystals_read().values() if c.get("on")]
+
+
+def crystal_clause() -> str:
+    """The world-tint. Every crystal switched ON leans the show's writing
+    toward its subject matter — hosts, callers, ads, the town itself."""
+    ons = crystal_active()
+    if not ons:
+        return ""
+    parts = []
+    for c in ons:
+        strength = max(5, min(100, int(c.get("strength") or 50)))
+        tint = str(c.get("tint") or c.get("name") or "").strip()
+        parts.append(
+            f"THE {str(c.get('name') or 'UNNAMED').upper()} CRYSTAL IS ON "
+            f"({strength}%): tint the world with it — {tint}. Its imagery, "
+            "slang, obsessions and logic bleed into the hosts, the callers "
+            "and the ads. The higher the percentage, the deeper the town "
+            "has fallen into it; never NAME the crystal on air.")
+    return "\n" + " ".join(parts) + "\n"
+
+
+def votes_read() -> dict[str, Any]:
+    try:
+        return json.loads(SPEAKBOX_VOTES_PATH.read_text())
+    except Exception:
+        return {}
+
+
+def chunk_key(file: str, text: str) -> str:
+    return hashlib.sha1((str(file) + "|" + str(text)[:120]).encode()
+                        ).hexdigest()[:16]
+
+
+@app.get("/api/crystals")
+async def crystals_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    out = []
+    jobs = {}
+    with _LYRIC_LOCK:
+        for jid, j in _LYRIC_JOBS.items():
+            jobs[jid] = {k: j.get(k) for k in
+                         ("id", "artist", "stage", "total", "done",
+                          "progress", "current", "mind")}
+    for cid, c in crystals_read().items():
+        counts = {}
+        for rid in c.get("minds") or []:
+            counts[rid] = len(_load_vectors(mind_id(rid)).get("chunks") or [])
+        out.append({**c, "id": cid, "chunks": counts})
+    return {"crystals": out, "extractions": jobs}
+
+
+@app.post("/api/crystals")
+async def crystals_upsert(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Create or update a crystal: {id?, name, minds: [rid...], tint?,
+    strength?, on?}. Combining crystals = one crystal, several minds."""
+    require_auth(authorization)
+    payload = await request.json()
+    data = crystals_read()
+    cid = re.sub(r"[^a-z0-9_-]", "",
+                 str(payload.get("id") or payload.get("name") or "")
+                 .lower().replace(" ", "-"))[:40]
+    if not cid:
+        raise HTTPException(status_code=400, detail="name the crystal")
+    prev = data.get(cid) or {}
+    minds = [mind_id(m) for m in (payload.get("minds")
+             or prev.get("minds") or []) if str(m).strip()]
+    data[cid] = {
+        "name": str(payload.get("name") or prev.get("name") or cid)[:60],
+        "minds": minds,
+        "tint": str(payload.get("tint") or prev.get("tint") or "")[:500],
+        "strength": max(0, min(100, int(payload.get(
+            "strength", prev.get("strength", 50)) or 0))),
+        "on": bool(payload.get("on", prev.get("on", False))),
+        "built": prev.get("built") or int(time.time()),
+    }
+    crystals_save(data)
+    note_action(f"🔮 crystal {cid}: " + ("ON" if data[cid]["on"] else "off"))
+    return {**data[cid], "id": cid}
+
+
+@app.post("/api/crystals/{cid}/toggle")
+async def crystals_toggle(
+    cid: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    payload = await request.json()
+    data = crystals_read()
+    if cid not in data:
+        raise HTTPException(status_code=404, detail="no such crystal")
+    data[cid]["on"] = bool(payload.get("on", not data[cid].get("on")))
+    crystals_save(data)
+    note_action(f"🔮 crystal {cid} "
+                + ("ON — the world tilts" if data[cid]["on"] else "off"))
+    return {**data[cid], "id": cid}
+
+
+@app.delete("/api/crystals/{cid}")
+async def crystals_delete(
+    cid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    data = crystals_read()
+    data.pop(cid, None)
+    crystals_save(data)
+    return {"removed": cid}
+
+
+@app.post("/api/crystals/extract")
+async def crystals_extract(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The workshop road (#815): artist + chosen albums → lyric extraction
+    into ONE mind → a crystal over it. {artist, albums: [..]|empty=all,
+    crystal_name?, tint?}. Returns the lyric job id; poll /api/crystals."""
+    require_auth(authorization)
+    payload = await request.json()
+    artist = str(payload.get("artist") or "").strip()
+    albums = {str(a).strip().lower()
+              for a in (payload.get("albums") or []) if str(a).strip()}
+    tracks = artist_tracks(artist)
+    if albums:
+        tracks = [t for t in tracks
+                  if str(t.get("album") or "").strip().lower() in albums]
+    if not tracks:
+        raise HTTPException(status_code=404,
+                            detail="no tracks match that artist/albums")
+    rid = mind_id(re.sub(r"[^a-z0-9]", "", artist.lower())[:24]
+                  or "crystal")
+    job_id = "ly_" + uuid.uuid4().hex[:8]
+    with _LYRIC_LOCK:
+        _LYRIC_JOBS[job_id] = {
+            "id": job_id, "artist": artist, "stage": "reading",
+            "total": len(tracks), "done": 0, "progress": 0.0,
+            "current": "", "instrumental": 0, "mind": rid,
+            "started": time.time(),
+        }
+    fire_and_forget(_lyric_run(job_id, artist, tracks[:300], rid,
+                               bool(payload.get("force"))))
+    cname = str(payload.get("crystal_name") or artist)[:60]
+    data = crystals_read()
+    cid = re.sub(r"[^a-z0-9_-]", "",
+                 cname.lower().replace(" ", "-"))[:40] or rid
+    data[cid] = {**(data.get(cid) or {}), "name": cname,
+                 "minds": sorted({*((data.get(cid) or {}).get("minds")
+                                    or []), rid}),
+                 "tint": str(payload.get("tint")
+                             or (data.get(cid) or {}).get("tint") or ""),
+                 "strength": (data.get(cid) or {}).get("strength", 50),
+                 "on": (data.get(cid) or {}).get("on", False),
+                 "built": int(time.time()), "extracting": job_id}
+    crystals_save(data)
+    return {"job": job_id, "crystal": cid, "mind": rid,
+            "tracks": len(tracks)}
+
+
+@app.get("/api/crystals/{cid}/seed")
+async def crystals_seed(
+    cid: str,
+    q: str = "",
+    k: int = 6,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """THE reusable surface (#815): any other system asks a crystal for
+    discussion seeds — best chunks across its minds, ready for any LLM."""
+    require_read_auth(authorization)
+    c = crystals_read().get(cid)
+    if not c:
+        raise HTTPException(status_code=404, detail="no such crystal")
+    out: list[dict[str, Any]] = []
+    for rid in c.get("minds") or []:
+        for h in await speakbox_search(q or c.get("tint") or c.get("name"),
+                                       k=max(1, min(12, k)), rid=rid):
+            out.append({**h, "mind": rid})
+    out.sort(key=lambda r: -float(r.get("score") or 0))
+    return {"crystal": cid, "name": c.get("name"), "tint": c.get("tint"),
+            "seeds": out[:k]}
+
+
+@app.get("/api/crystals/{cid}/export")
+async def crystals_export(
+    cid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The SINGLE FILE (#815): the whole crystal — every chunk, its vector,
+    its votes, the tint — one JSON any project can carry away and search
+    with plain cosine. This is the portable database."""
+    require_read_auth(authorization)
+    c = crystals_read().get(cid)
+    if not c:
+        raise HTTPException(status_code=404, detail="no such crystal")
+    votes = votes_read()
+    chunks = []
+    for rid in c.get("minds") or []:
+        store = _load_vectors(mind_id(rid))
+        for ch in (store.get("chunks") or []):
+            chunks.append({
+                "mind": rid, "file": ch.get("file"),
+                "text": ch.get("text"), "vec": ch.get("vec"),
+                "votes": votes.get(chunk_key(ch.get("file"),
+                                             ch.get("text"))) or {}})
+    return {"crystal": cid, "name": c.get("name"), "tint": c.get("tint"),
+            "embed_model": EMBED_MODEL, "exported": int(time.time()),
+            "chunks": chunks}
+
+
+@app.post("/api/speakbox/vote")
+async def speakbox_vote(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """👍/👎/⬆ on a chunk (#815): votes bias every future draw, and
+    'surface' hands the chunk straight to the pair for the next rounds."""
+    require_auth(authorization)
+    payload = await request.json()
+    file = str(payload.get("file") or "")
+    text = str(payload.get("text") or "")
+    action = str(payload.get("action") or "")
+    if action not in ("up", "down", "surface") or not text:
+        raise HTTPException(status_code=400,
+                            detail="action up|down|surface + text")
+    votes = votes_read()
+    key = chunk_key(file, text)
+    row = votes.get(key) or {"up": 0, "down": 0, "file": file}
+    if action == "up":
+        row["up"] = int(row.get("up") or 0) + 1
+    elif action == "down":
+        row["down"] = int(row.get("down") or 0) + 1
+    else:
+        row["surfaced_at"] = int(time.time())
+        speakbox_remember({"file": file, "text": text, "lines": [text],
+                           "mind": str(payload.get("mind") or "")})
+        note_action("⬆ a chunk was sent to the surface")
+    votes[key] = row
+    tmp = SPEAKBOX_VOTES_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(votes))
+    tmp.replace(SPEAKBOX_VOTES_PATH)
+    return {"key": key, **row}
 
 
 @app.post("/api/voicelab/jobs/{job_id}/retry")
