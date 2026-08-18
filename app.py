@@ -12195,7 +12195,10 @@ HOLD_MAX_AGE = float(os.getenv("HOLD_MAX_AGE", str(24 * 3600)))
 # this the live show has long moved on, so airing it means the box repeats an
 # old conversation (old caller, old station name) while the mix sounds fresh.
 # Kept for the page/transcript, but never re-aired out the speaker.
-HOLD_REPLAY_STALE = float(os.getenv("HOLD_REPLAY_STALE", "600"))   # 10 minutes
+# #801: the operator wants EVERY generated line spoken out the radio —
+# a busy hour was aging lines past ten minutes and diverting them to the
+# page unheard. An hour of replay window means late, but aired.
+HOLD_REPLAY_STALE = float(os.getenv("HOLD_REPLAY_STALE", "3600"))  # 1 hour
 # The shelf survives restarts too (#388): the clips are files on disk and
 # their signatures are stable, so held dialogue outlives a deploy and
 # still plays — played, resolved, deleted.
@@ -18387,7 +18390,42 @@ def _sfxguy_stamp(line: str) -> None:
         pass
 
 
-async def _sfxguy_warp_fill(voice: str) -> None:
+_SFXGUY_NEWS: list[dict[str, str]] = []
+_SFXGUY_NEWS_FILLING = [False]
+_SFXGUY_NEWS_AT = [0.0]
+
+
+async def _sfxguy_news_fill() -> None:
+    """#804: now and then the SFX guy is the one who BREAKS a story —
+    a real headline off the wire with a spicy one-line take, brewed in
+    the background, aired whole in his voice. The hosts pick it up as
+    the topic (dj_banter reads the note he leaves)."""
+    if _SFXGUY_NEWS_FILLING[0] or _SFXGUY_NEWS:
+        return
+    _SFXGUY_NEWS_FILLING[0] = True
+    try:
+        picks = news_selection(await drudge_headlines(24), False)
+        if picks:
+            story = picks[0]
+            take = await ask_model(
+                "You are a thick-accented, NASCAR-loving country boy in "
+                f"a radio booth. Headline: {story.get('title')}. Give ONE "
+                "spicy, funny one-line take on it, under 22 words, no "
+                "quotes, no explanation.", limit=140, spice=0.85)
+            take = str(take or "").strip().strip('"').strip()[:180]
+            if take and looks_english(take):
+                _SFXGUY_NEWS.append({
+                    "title": str(story.get("title") or "")[:140],
+                    "take": take,
+                    "line": (f"Y'all hear this one? "
+                             f"{story.get('title')}. {take}")})
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _SFXGUY_NEWS_FILLING[0] = False
+
+
+async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
     """#799: the invention shed — warped, demented, proudly INCORRECT
     versions of the shelf sayings, brewed in the background so the air
     path never waits on the model. Tinted by the active crystal."""
@@ -18397,6 +18435,23 @@ async def _sfxguy_warp_fill(voice: str) -> None:
     try:
         rows = sfxguy_quips(voice)
         picks = random.sample(rows, k=min(2, len(rows)))
+        # #804: when a line just aired, half his inventions REACT to it —
+        # engaged with the conversation, not shouted past it.
+        if context and random.random() < 0.5:
+            out = await ask_model(
+                "You are a thick-accented country boy in a radio booth. "
+                f"Someone on air just said: \"{context}\". Fire back ONE "
+                "short reaction that actually engages with what was said "
+                "— heckle it, one-up it, or agree way too hard — in your "
+                "backcountry voice. Under 22 words, no quotes.",
+                limit=150, spice=0.85)
+            line = str(out or "").strip().strip('"').strip()
+            if 8 <= len(line) <= 200 and looks_english(line) \
+                    and "\n" not in line:
+                _SFXGUY_WARPED.append(line)
+                pipeline_log("air", "the SFX guy engages: "
+                             f"{line[:70]} (#804)")
+            return
         recipe = random.choice((
             "say it confidently but get it WRONG in a way that makes "
             "no sense",
@@ -18431,12 +18486,24 @@ async def _sfxguy_warp_fill(voice: str) -> None:
         _SFXGUY_FILLING[0] = False
 
 
-def sfxguy_line(voice: str) -> str:
+def sfxguy_line(voice: str, context: str = "") -> str:
     """#798/#799: what comes out of his mouth — at the invention dial's
     rate a warped never-before-said line off the shed, otherwise a shelf
-    saying that has not aired inside the hour."""
+    saying that has not aired inside the hour. #804: sometimes he breaks
+    a NEWS story with a spicy take, and the hosts take it up as the
+    topic."""
     warp = max(0, min(100, int(dj_settings().get("sfxguy_warp") or 0)))
     line = ""
+    if (_SFXGUY_NEWS and random.random() < 0.15
+            and time.time() - _SFXGUY_NEWS_AT[0] > 600):
+        story = _SFXGUY_NEWS.pop(0)
+        _SFXGUY_NEWS_AT[0] = time.time()
+        _RADIO["sfxguy_news"] = {**story, "at": time.time()}
+        _sfxguy_stamp(story["line"])
+        pipeline_log("air", "the SFX guy breaks a story: "
+                     f"{story['title'][:70]} (#804)")
+        fire_and_forget(_sfxguy_news_fill())
+        return story["line"]
     if _SFXGUY_WARPED and random.random() < warp / 100.0:
         line = _SFXGUY_WARPED.pop(random.randrange(len(_SFXGUY_WARPED)))
     else:
@@ -18450,7 +18517,9 @@ def sfxguy_line(voice: str) -> str:
                     float(said.get(_sfxguy_key(r)) or 0)))
     _sfxguy_stamp(line)
     if len(_SFXGUY_WARPED) < 8:
-        fire_and_forget(_sfxguy_warp_fill(voice))
+        fire_and_forget(_sfxguy_warp_fill(voice, context))
+    if not _SFXGUY_NEWS:
+        fire_and_forget(_sfxguy_news_fill())
     return line
 
 
@@ -25042,7 +25111,8 @@ async def speak_turns(turns: list[tuple[str, str]],
                             and item["who"] in ("dj", "cohost", "third")
                             and random.random() < _gq_rate / 100.0):
                         _gv = str(dj_settings()["drop_voice"])
-                        _quip = sfxguy_line(_gv)
+                        _quip = sfxguy_line(
+                            _gv, spoken_text(item["chunk"])[:200])
                         try:
                             _qc = await voice_render_any(
                                 _quip, _gv, who="drop")
@@ -25984,6 +26054,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
                   "to something he just hollered — laugh, groan, tell "
                   "him nobody flew a lunar lander in 1999 — without "
                   "writing his lines for him.")
+        _gnews = _RADIO.get("sfxguy_news") or {}
+        if _gnews and time.time() - float(_gnews.get("at") or 0) < 600 \
+                and not caller_name:
+            angle += (" The SFX guy just slapped the desk and broke a "
+                      f"news story on air: \"{_gnews.get('title')}\" — "
+                      f"with the take: \"{_gnews.get('take')}\". Make "
+                      "THAT the topic now: run with it, argue with his "
+                      "take, credit him for bringing it (#804).")
+            _RADIO.pop("sfxguy_news", None)
     if seek_verdict:
         angle += (" At some point one of you turns to the SFX guy in his "
                   "booth and appeals for backup OUT LOUD — 'back me up "
@@ -31639,10 +31718,13 @@ def crystal_clause() -> str:
         tint = str(c.get("tint") or c.get("name") or "").strip()
         parts.append(
             f"THE {str(c.get('name') or 'UNNAMED').upper()} CRYSTAL IS ON "
-            f"({strength}%): tint the world with it — {tint}. Its imagery, "
-            "slang, obsessions and logic bleed into the hosts, the callers "
-            "and the ads. The higher the percentage, the deeper the town "
-            "has fallen into it; never NAME the crystal on air.")
+            f"({strength}%): tint the world with it — {tint}. EVERYONE ON "
+            "AIR — hosts, callers, ads, the manager, the town itself — "
+            "adopts its way of speaking: its vocabulary, cadence, imagery, "
+            "disposition and rhetorical style, the way its own lyrics talk. "
+            "Topics bend toward its subject matter. The higher the "
+            "percentage, the deeper the town has fallen into it; never "
+            "NAME the crystal on air (#803).")
     return "\n" + " ".join(parts) + "\n"
 
 
@@ -51640,8 +51722,36 @@ function djTalkPopup() {
   box.style.cssText = "position:fixed;z-index:130;width:min(420px,92vw);"
     + "max-height:52vh;display:flex;flex-direction:column;padding:10px 12px;"
     + "box-shadow:0 20px 50px rgba(0,0,0,.6);"
+    + "resize:both;overflow:hidden;min-width:300px;min-height:220px;"
     + "left:" + saved.left + "px;"
     + "top:" + saved.top + "px";
+  // #800: the booth stretches — drag the corner — and remembers the
+  // size you left it at, merged into the same bag as position (#747).
+  if (Number(saved.w) > 0) box.style.width = saved.w + "px";
+  if (Number(saved.h) > 0) {
+    box.style.height = saved.h + "px";
+    box.style.maxHeight = "none";
+  }
+  try {
+    let sizeT = 0;
+    new ResizeObserver(() => {
+      clearTimeout(sizeT);
+      sizeT = setTimeout(() => {
+        if (!document.getElementById("djTalkPopup")) return;
+        let bag = {};
+        try {
+          bag = JSON.parse(localStorage.getItem("djTalkBox") || "{}")
+            || {};
+        } catch (e) { bag = {}; }
+        if (Math.abs((bag.w || 0) - box.offsetWidth) < 4
+            && Math.abs((bag.h || 0) - box.offsetHeight) < 4) return;
+        bag.w = box.offsetWidth;
+        bag.h = box.offsetHeight;
+        box.style.maxHeight = "none";
+        localStorage.setItem("djTalkBox", JSON.stringify(bag));
+      }, 300);
+    }).observe(box);
+  } catch (e) { /* an old webview keeps the fixed size */ }
 
   const head = el("div", "", "");
   head.style.cssText = "display:flex;align-items:center;gap:8px;"

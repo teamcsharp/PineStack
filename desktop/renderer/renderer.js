@@ -7,6 +7,8 @@ let defaultBroadcastApplied = false;
 let appVolume = 0.35;
 let desiredBroadcast = "nabu";
 let broadcastChanging = false;
+let pendingPlayGesture = false;
+let mutedNoteAt = 0;
 let boothMonitor = localStorage.getItem("pineDesktopBoothMonitor") === "1";
 const desktopListenerId = `desktop-${Math.random().toString(36).slice(2, 10)}`;
 let desktopTrackId = "";
@@ -380,10 +382,23 @@ function syncDesktopRadio(clock) {
     player.src = nextUrl;
     player.currentTime = Math.max(0, target);
     player.playbackRate = 1;
-    player.play().catch(() => noteRouteError("Click FM or the player once to allow app audio"));
+    player.play().then(() => { pendingPlayGesture = false; })
+      .catch(() => {
+        pendingPlayGesture = true;
+        noteRouteError("Click anywhere once to allow app audio");
+      });
     return;
   }
-  if (player.paused && !player.ended) player.play().catch(() => {});
+  if (player.paused && !player.ended) {
+    player.play().then(() => { pendingPlayGesture = false; })
+      .catch(() => { pendingPlayGesture = true; });
+  }
+  // #802: a track playing into a zero volume is silence the user asked
+  // to hear — say so, once a minute at most, instead of playing mute.
+  if (appVolume <= 0 && Date.now() - mutedNoteAt > 60000) {
+    mutedNoteAt = Date.now();
+    noteRouteError("App volume is at 0 — slide it up to hear the music");
+  }
   const drift = player.currentTime - target;
   if (Math.abs(drift) > 3.5) {
     player.currentTime = Math.max(0, target);
@@ -2587,4 +2602,13 @@ if (typeof api.onSupportProgress === "function") {
   await pollDesktopRadio();
   setInterval(refresh, 6000);
   setInterval(pollDesktopRadio, 1500);
+  // #802: the first real click is the autoplay permission — use it.
+  document.addEventListener("click", () => {
+    if (!pendingPlayGesture) return;
+    const player = $("desktopRadioPlayer");
+    if (player && player.paused) {
+      player.play().then(() => { pendingPlayGesture = false; })
+        .catch(() => {});
+    }
+  }, true);
 })();
