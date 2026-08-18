@@ -1516,7 +1516,22 @@ function initStatusBar() {
     if (last) {
       line.textContent = when(last.ts) + "  [" + last.kind + "]  " + last.text;
     }
-    if (open) drawPop();
+    // #826: while the reader is scrolled up, the popup is FROZEN — no
+    // redraw, no motion of any kind. New entries wait in the ring and a
+    // pill counts them; scrolling back to the bottom resumes the flow.
+    if (open && stickBottom) {
+      frozenAt = ring.length;
+      drawPop();
+    } else if (open) {
+      const pill = pop.querySelector(".sb-pill");
+      const fresh = ring.length - frozenAt;
+      if (pill) {
+        pill.textContent = fresh > 0
+          ? "\u2193 " + fresh + " new below \u2014 scroll to bottom to resume"
+          : "paused \u2014 reading";
+        pill.style.display = "block";
+      }
+    }
     setTimeout(pollFeed, 2500);
   }
 
@@ -1541,7 +1556,7 @@ function initStatusBar() {
   const otherTags = new Set(JSON.parse(
     localStorage.getItem("sbOtherTags") || "[]"));
   const sig = (e) => (e.kind || "") + "|" + (e.text || "").slice(0, 80);
-  let scroller = null, stickBottom = true;
+  let scroller = null, stickBottom = true, frozenAt = 0;
 
   function drawPop() {
     const openedKeys = new Set(Array.from(
@@ -1611,10 +1626,38 @@ function initStatusBar() {
     scroller = document.createElement("div");
     scroller.className = "sb-scroll";
     scroller.addEventListener("scroll", () => {
+      const was = stickBottom;
       stickBottom = scroller.scrollTop + scroller.clientHeight
         >= scroller.scrollHeight - 20;
+      // #826: returning to the tail thaws the frozen view at once.
+      if (stickBottom && !was) {
+        const pill = pop.querySelector(".sb-pill");
+        if (pill) pill.style.display = "none";
+        frozenAt = ring.length;
+        drawPop();
+      }
+      if (!stickBottom) {
+        const pill = pop.querySelector(".sb-pill");
+        if (pill) pill.style.display = "block";
+      }
     });
     pop.appendChild(scroller);
+    if (!pop.querySelector(".sb-pill")) {
+      const pill = document.createElement("div");
+      pill.className = "sb-pill";
+      pill.style.cssText = "position:absolute;left:50%;bottom:8px;" +
+        "transform:translateX(-50%);z-index:3;display:none;" +
+        "background:#17475a;color:#c8f5da;border:1px solid #65c7da;" +
+        "border-radius:99px;padding:2px 12px;font-size:10.5px;" +
+        "cursor:pointer;white-space:nowrap";
+      pill.onclick = () => {
+        stickBottom = true;
+        pill.style.display = "none";
+        frozenAt = ring.length;
+        drawPop();
+      };
+      pop.appendChild(pill);
+    }
 
     const want = TABS[tab];
     const shown = ring.filter((e) => {
