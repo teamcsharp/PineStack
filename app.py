@@ -6276,6 +6276,16 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
     ref = voice_ref_path(voice)
     if ref is None:
         raise RuntimeError(f"no reference recording for voice {voice!r}")
+    # #816: an F5-SAFE reference outranks the library one when present.
+    # F5 renders by CONTINUING its reference, and when alignment slips
+    # the reference's own words bleed onto the air — the cohost's clone
+    # sample is a real-estate pitch, which is how the station kept
+    # offering a three-bedroom house. A voice can carry a neutral
+    # reference_f5.wav cut for exactly this road; XTTS keeps using the
+    # richer original.
+    _f5_ref = ref.with_name("reference_f5.wav")
+    if _f5_ref.is_file():
+        ref = _f5_ref
     try:
         rate = float(dj_settings().get("speech_rate") or 1.0)
     except Exception:  # noqa: BLE001
