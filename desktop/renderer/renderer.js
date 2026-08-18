@@ -2484,6 +2484,46 @@ function initCrystalBtn() {
     body.appendChild(canvas);
     pop.appendChild(body);
 
+    const WHO_ICON = { host: "🎙", cohost: "🎤", sfxguy: "🤠",
+                       caller: "☎" };
+    async function siphons() {
+      // #813: the influence ring says who is siphoning which document
+      // RIGHT NOW — badge the rows, and keep badging as they jump.
+      try {
+        const d = await api.get("/api/crystals/influence");
+        const cutoff = Date.now() / 1000 - 360;
+        const byFile = new Map();
+        (d.rows || []).forEach((r) => {
+          if (r.ts < cutoff) return;
+          const set = byFile.get(r.file) || new Set();
+          (r.targets || []).forEach((t) => set.add(t));
+          byFile.set(r.file, set);
+        });
+        left.querySelectorAll(".cp-source").forEach((row) => {
+          const f = row.dataset.file || "";
+          let badge = row.querySelector(".cp-siphon");
+          const set = byFile.get(f);
+          if (set && set.size) {
+            if (!badge) {
+              badge = document.createElement("span");
+              badge.className = "cp-siphon";
+              badge.title = "being siphoned RIGHT NOW by: "
+                + Array.from(set).join(", ");
+              row.insertBefore(badge, row.firstChild);
+            }
+            badge.textContent = Array.from(set)
+              .map((t) => WHO_ICON[t] || "•").join("");
+          } else if (badge) {
+            badge.remove();
+          }
+        });
+      } catch { /* agent quiet */ }
+    }
+    if (!pop._siphonTimer) {
+      pop._siphonTimer = setInterval(() => {
+        if (mode === "viewer" && pop.style.display !== "none") siphons();
+      }, 5000);
+    }
     async function sources() {
       left.innerHTML = "<span class='muted'>reading the sources…</span>";
       try {
@@ -2522,6 +2562,7 @@ function initCrystalBtn() {
           rows.forEach((s) => {
             const row = document.createElement("div");
             row.className = "cp-source";
+            row.dataset.file = s.file;
             row.innerHTML = "<span class='cp-src-name'>" + esc(s.file)
               + "</span><i>" + s.chunks.toLocaleString() + "</i>"
               + "<button class='cp-src-doc' title='open the whole "
@@ -2650,6 +2691,7 @@ function initCrystalBtn() {
   async function openObservatory() {
     mode = "obs";
     towerStop();
+    pop.style.overflow = "hidden";     // #810: nothing escapes the frame
     pop.innerHTML = "";
     const head = document.createElement("div");
     head.className = "cp-head";
@@ -2926,6 +2968,7 @@ function initCrystalBtn() {
     mode = "cards";
     towerStop();
     obsStop();
+    pop.style.overflow = "auto";       // the card list scrolls again
     pop.innerHTML = "";
     const head = document.createElement("div");
     head.className = "cp-head";
@@ -3136,10 +3179,14 @@ function initCrystalBtn() {
     await pull(); paintBtn(); draw();
   });
   document.addEventListener("click", (ev) => {
+    // A button that a redraw consumed mid-click is not an OUTSIDE
+    // click — that was the 🌆 toggle making the cabinet vanish.
+    if (!ev.target.isConnected) return;
     if (pop.style.display !== "none" && !pop.contains(ev.target)
         && ev.target !== btn && !btn.contains(ev.target)) {
       pop.style.display = "none";
       towerStop();
+      obsStop();
       mode = "cards";
     }
   });

@@ -54074,6 +54074,26 @@ async function adArchivePopup(focusId) {
     return;
   }
   const lead = ads.find((a) => a.id === focusId) || ads[0];
+  // #811: the download in the TOP RIGHT corner, where the hand expects
+  // it — beside the close, for whichever spot is open in full.
+  if (lead.audio) {
+    const cornerDl = el("a", "", "⬇");
+    cornerDl.href = lead.audio;
+    cornerDl.download = ((lead.product || "ad").replace(/[^\w -]+/g, "")
+      .slice(0, 48) || "ad") + ".mp3";
+    cornerDl.title = "Download this spot";
+    cornerDl.style.cssText = "margin-left:auto;margin-right:10px;"
+      + "font-size:17px;color:#ffd479;text-decoration:none;cursor:pointer";
+    x.style.marginLeft = "0";
+    head.insertBefore(cornerDl, x);
+  }
+  /* #812: the painting being hawked, admired — the product names its
+   * file, so the picture can hang beside the pitch. */
+  const adPainting = (a) => {
+    const m = /painting\s+["\u201c]?([\w. \-]+?\.(?:png|jpe?g|webp))/i
+      .exec(String(a.product || "") + " " + String(a.text || ""));
+    return m ? m[1] : "";
+  };
 
   // --- the one you clicked, in full -------------------------------------
   const top = el("div", "", "");
@@ -54088,6 +54108,20 @@ async function adArchivePopup(focusId) {
     + (lead.bed ? " · bed: " + lead.bed : ""));
   when.style.cssText = "font-size:10.5px;margin:2px 0 6px";
   top.appendChild(when);
+  const leadArt = adPainting(lead);
+  if (leadArt) {
+    const im = document.createElement("img");
+    im.src = "/api/generations/image/" + encodeURIComponent(leadArt);
+    im.loading = "lazy";
+    im.title = leadArt + " — the piece this spot is hawking; click to "
+      + "open it full";
+    im.style.cssText = "max-width:100%;max-height:220px;object-fit:"
+      + "contain;border-radius:8px;border:1px solid #4a3c14;"
+      + "margin-bottom:6px;cursor:zoom-in;display:block";
+    im.onerror = () => im.remove();
+    im.onclick = () => artFullscreen(leadArt);
+    top.appendChild(im);
+  }
   if (lead.audio) {
     const player = document.createElement("audio");
     player.controls = true; player.preload = "metadata";
@@ -54151,6 +54185,19 @@ async function adArchivePopup(focusId) {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:8px;align-items:center;"
       + "padding:6px 9px;border-bottom:1px solid var(--border)";
+    const rowArt = adPainting(a);
+    if (rowArt) {
+      const th = document.createElement("img");
+      th.src = "/api/generations/image/" + encodeURIComponent(rowArt);
+      th.loading = "lazy";
+      th.title = rowArt;
+      th.style.cssText = "width:40px;height:40px;object-fit:cover;"
+        + "border-radius:5px;border:1px solid #4a3c14;flex:0 0 auto;"
+        + "cursor:zoom-in";
+      th.onerror = () => th.remove();
+      th.onclick = (ev) => { ev.stopPropagation(); artFullscreen(rowArt); };
+      row.appendChild(th);
+    }
     const label = el("div", "", "");
     label.style.cssText = "flex:1;min-width:0;font-size:11.5px";
     label.innerHTML = "<b>" + callerDossierEsc(a.product || "an ad read")
@@ -54977,19 +55024,28 @@ function boothAnalysisDossier(line) {
   head.style.cssText = "gap:8px;align-items:baseline";
   const t = el("b", "", (line.kind === "song_analysis" ? "♫ " : "◈ ")
     + "the analysis, in full");
-  t.style.cssText = "flex:1;font-size:13px";
+  t.style.cssText = "flex:1;font-size:14px;background:linear-gradient("
+    + "90deg,#79d8ff,#c9a0e0);-webkit-background-clip:text;"
+    + "-webkit-text-fill-color:transparent";
   const x = el("button", "", "✕");
   x.onclick = () => pop.remove();
   head.appendChild(t); head.appendChild(x);
   pop.appendChild(head);
   const meta = el("div", "", "");
-  meta.style.cssText = "font-size:11px;line-height:1.8;color:#9db2c8";
+  meta.style.cssText = "display:flex;flex-wrap:wrap;gap:6px;"
+    + "font-size:11px";
   const addMeta = (k, v) => {
-    const b = el("b", "", k + "  ");
-    b.style.color = "#6db3d1";
-    meta.appendChild(b);
-    meta.appendChild(document.createTextNode(v || "—"));
-    meta.appendChild(document.createElement("br"));
+    const chip = el("span", "", "");
+    chip.style.cssText = "background:#0e1826;border:1px solid #24435f;"
+      + "border-radius:14px;padding:3px 10px;color:#c8dcef;"
+      + "max-width:100%;overflow:hidden;text-overflow:ellipsis;"
+      + "white-space:nowrap";
+    const b = el("b", "", k + " ");
+    b.style.cssText = "color:#6db3d1;font-weight:600";
+    chip.appendChild(b);
+    chip.appendChild(document.createTextNode(v || "—"));
+    chip.title = k + ": " + (v || "—");
+    meta.appendChild(chip);
   };
   addMeta("subject", (line.text || "").replace(
     /^(Song|Image) analysis complete:\s*/i, ""));

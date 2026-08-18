@@ -384,6 +384,8 @@ body { padding-bottom: 28px; }
   background: #04070d; color: #7ce8a9; white-space: pre-wrap;
   font: 10px ui-monospace, Consolas, monospace; line-height: 1.5; }
 #crystalPopup .cp-obs { filter: grayscale(.4); }
+#crystalPopup .cp-siphon { flex: 0 0 auto; font-size: 12px;
+  animation: sbPulse 1.6s ease-in-out infinite; }
 #crystalPopup .cp-mind { display: inline-flex; gap: 4px;
   align-items: center; border: 1px solid var(--border, #2a3644);
   border-radius: 20px; padding: 2px 8px; cursor: pointer; color: #8ba0b5; }
