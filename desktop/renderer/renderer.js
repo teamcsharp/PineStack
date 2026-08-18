@@ -1988,6 +1988,50 @@ function initSamplePopup() {
 }
 initSamplePopup();
 
+/* #831: the crystal switch — one click lets the crystal take the
+ * universe; one click lifts it. Lit while any crystal is ON. */
+function initCrystalBtn() {
+  const btn = $("crystalBtn");
+  if (!btn) return;
+  let known = [];
+  async function paint() {
+    try {
+      const d = await api.get("/api/crystals");
+      known = d.crystals || [];
+      const on = known.filter((c) => c.on);
+      btn.classList.toggle("on", on.length > 0);
+      btn.title = on.length
+        ? "The universe is tinted: " + on.map((c) => c.name).join(", ")
+          + " — click to lift it"
+        : (known.length
+           ? "Click to let " + known[known.length - 1].name
+             + " tint the universe of Pine Box FM"
+           : "No crystals forged yet — extract one from an artist first");
+    } catch { /* agent quiet */ }
+  }
+  btn.addEventListener("click", async () => {
+    if (!known.length) return;
+    const anyOn = known.some((c) => c.on);
+    btn.textContent = "…";
+    try {
+      for (const c of known) {
+        if (anyOn && c.on) {
+          await api.post("/api/crystals/" + c.id + "/toggle", {on: false});
+        }
+      }
+      if (!anyOn) {
+        const pick = known[known.length - 1];
+        await api.post("/api/crystals/" + pick.id + "/toggle", {on: true});
+      }
+    } catch (err) { btn.title = err.message; }
+    btn.textContent = "\ud83d\udd2e";
+    paint();
+  });
+  paint();
+  setInterval(paint, 30000);
+}
+initCrystalBtn();
+
 document.querySelectorAll(".tab").forEach((button) => {
   if (button.id === "threejsBtn" || button.id === "stationBtn"
       || button.id === "sampleTabBtn") return;

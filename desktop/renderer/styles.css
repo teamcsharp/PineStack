@@ -318,9 +318,18 @@ body { padding-bottom: 28px; }
 #sbTermLine:hover { color: #c8f5da; }
 #sbRight { display: flex; align-items: center; gap: 8px; flex: 0 0 auto;
   max-width: 46%; }
+/* #831: the crystal switch — dark when the universe is plain, alight
+   and pulsing violet while a crystal tints the world. */
+#crystalBtn { filter: grayscale(1) brightness(.8); }
+#crystalBtn.on {
+  filter: none; border-color: #c98fe0; color: #f2dcff;
+  background: #4b1d5e; animation: sbPulse 1.8s ease-in-out infinite;
+}
+
 /* #808: the sample button matches the bar it lives in — it was the
    one unstyled control and rendered at default size, towering out
    of the 26px status bar. */
+#crystalBtn,
 #sampleBtn,
 #sbLiveBtn {
   height: 20px; padding: 0 8px; font-size: 12px; background: #141b24;
