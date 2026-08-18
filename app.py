@@ -17568,6 +17568,22 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     again at a different point, so the material renews itself. `exclude`
     keeps a named document out of the draw — that is how the comeback comes
     from somewhere other than the drop (#233)."""
+    # #834: a crystal that is ON tints the SOURCE, not just the prompt —
+    # at the dial's strength the swath is drawn from the crystal's own
+    # minds, so DOOM (or whoever) enters the pair's mouths as material,
+    # which a small model obeys far harder than an instruction.
+    if not rid and not only:
+        _crs = crystal_active()
+        if _crs:
+            _cr = random.choice(_crs)
+            _p = max(5, min(100, int(_cr.get("strength") or 50))) / 100.0
+            _minds = [m for m in (_cr.get("minds") or [])
+                      if any(x["id"] == m for x in speakbox_minds())]
+            if _minds and random.random() < _p:
+                rid = random.choice(_minds)
+                pipeline_log("speakbox", "the swath comes from the "
+                             f"{_cr.get('name')} crystal ({rid}) — the "
+                             "universe is tinted (#834)")
     key = mind_id(rid)
     files = [p for p in speakbox_files(key) if p.name != exclude]
     if not files:
