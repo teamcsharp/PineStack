@@ -42148,6 +42148,20 @@ button.danger {
 .pb-collapsible.collapsed > *:not(.sec-title):not(.cx-marquee):not(.mini-marquee):not(:has(.sec-title)):not(:has(.cx-marquee)):not(:has(.mini-marquee)) {
   display: none !important;
 }
+/* #811: a collapsed section is a STRIP, whatever it was when open. The
+   gallery's inline min-height:300px kept it a big empty box after the
+   fold (stylesheet !important outranks inline), and the surviving header
+   rows kept every button and meter. Collapsed = the dot, the title, the
+   marquee — one line tall. */
+.pb-collapsible.collapsed { min-height: 0 !important; }
+.pb-collapsible.collapsed > .act-head > *:not(.sec-title):not(.live-dot),
+.pb-collapsible.collapsed > .tf-head > *:not(.sec-title) {
+  display: none !important;
+}
+.pb-collapsible.collapsed > .act-head,
+.pb-collapsible.collapsed > .tf-head {
+  margin: 0; min-height: 0;
+}
 /* #790: …and controls that live INSIDE the title (Music's routing row)
    fold with the section too — a collapsed header is a header, not a
    control strip. The FM power switch stays: on/off belongs on the face. */
