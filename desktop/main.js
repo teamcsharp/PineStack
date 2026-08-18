@@ -591,8 +591,22 @@ ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
 // the file so it is in hand, not lost in a Downloads pile.
 app.on("session-created", (sess) => {
   sess.on("will-download", (ev, item) => {
+    // #808: the save dialog OPENS in the folder you last saved to —
+    // exports, broadcast grabs, clips all land where the last one went.
+    try {
+      const last = readConfig().saveDir;
+      if (last && fs.existsSync(last)) {
+        item.setSaveDialogOptions({
+          defaultPath: path.join(last, item.getFilename()),
+        });
+      }
+    } catch { /* the dialog falls back to Downloads */ }
     item.once("done", (e2, state) => {
       if (state === "completed") {
+        // …and every completed save re-remembers its folder.
+        try {
+          writeConfig({ saveDir: path.dirname(item.getSavePath()) });
+        } catch { /* remember next time */ }
         try { shell.showItemInFolder(item.getSavePath()); }
         catch { /* explorer said no; the file still saved */ }
       }

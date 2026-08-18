@@ -18193,7 +18193,6 @@ SFXGUY_SEED_QUIPS = [
     "Faster'n a scalded cat.",
     "If it ain't got a V8 in it, I ain't interested.",
     "This one's for Dale.",
-    "Madder than a wet hen.",
     "Meaner than a wet panther.",
     "Busier than a one-legged man in a butt-kickin' contest.",
     "Busier than a cat coverin' crap on a marble floor.",
@@ -18202,7 +18201,6 @@ SFXGUY_SEED_QUIPS = [
     "Happier than a tornado in a trailer park.",
     "Slicker than snot on a doorknob.",
     "Useless as a trap door on a canoe.",
-    "Useless as a screen door on a submarine.",
     "So stuck up she'd drown in a rainstorm.",
     "If you ain't cheatin', you ain't tryin'.",
     "Didn't mean to turn him around — meant to rattle his cage, though.",
@@ -18324,7 +18322,6 @@ SFXGUY_SEED_QUIPS = [
     "Run that back one more time for the folks in the cheap "
     "seats.",
     "Buddy, you couldn't hit sand fallin' off a camel.",
-    "That's why they call it fishin' and not catchin', son.",
 ]
 
 
@@ -25345,11 +25342,23 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # stream.
                 if to_box:
                     played = await _play_on_box(one["path"], one["sig"])
+                    # #807: _LAST_PLAYOUT is a SHARED meter — during a
+                    # minutes-long burst, any concurrent ack or sting
+                    # stamps it with ITS key, so the burst's verdict read
+                    # someone else's meter, scored itself a miss, and the
+                    # whole ALREADY-AIRED conversation went on the shelf
+                    # to replay later. That was the repeated dialogue.
+                    # _play_on_box returns "" on every failure path and
+                    # verifies #822 inside itself, so a non-empty return
+                    # IS the verdict; the meter only overrules when it
+                    # still holds OUR key and says the play came short.
                     played_ok = False
                     if played:
                         lp = _LAST_PLAYOUT
-                        played_ok = (lp.get("key") == _played_out_key(one["path"])
-                                     and bool(lp.get("ok")))
+                        if lp.get("key") == _played_out_key(one["path"]):
+                            played_ok = bool(lp.get("ok"))
+                        else:
+                            played_ok = True
                     if not played_ok:
                         # It never went out — or came back short — so the booth
                         # must not confidently follow a call nobody can hear.
@@ -39271,6 +39280,33 @@ async def dj_flow_repair_api(
     return dialogue_flow_state()
 
 
+@app.post("/api/dj/hold/clear")
+async def dj_hold_clear(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#807: empty the hold shelf without airing it — for a backlog that
+    was held by mistake and would replay as repeats. {"older_than": s}
+    keeps entries younger than s seconds (default 0 = clear all). The
+    transcript keeps every line; only the pending re-air is cancelled."""
+    require_auth(authorization)
+    payload = await request.json()
+    keep_after = time.time() - float(payload.get("older_than") or 0)
+    before = len(_BOX_HOLD)
+    kept = [h for h in _BOX_HOLD
+            if float(h.get("ts") or 0) > keep_after]
+    if float(payload.get("older_than") or 0) <= 0:
+        kept = []
+    cleared = before - len(kept)
+    _BOX_HOLD[:] = kept
+    _box_hold_save()
+    note_action(f"🧹 hold shelf cleared — {cleared} pending replay(s) "
+                "cancelled (transcript keeps the words)")
+    pipeline_log("air", f"hold shelf purged: {cleared} cancelled, "
+                        f"{len(kept)} kept (#807)")
+    return {"cleared": cleared, "kept": len(kept)}
+
+
 @app.get("/api/dj/backlog")
 async def dj_backlog_api(
     authorization: str | None = Header(default=None),
@@ -51725,13 +51761,87 @@ function djTalkPopup() {
     + "resize:both;overflow:hidden;min-width:300px;min-height:220px;"
     + "left:" + saved.left + "px;"
     + "top:" + saved.top + "px";
-  // #800: the booth stretches — drag the corner — and remembers the
-  // size you left it at, merged into the same bag as position (#747).
-  if (Number(saved.w) > 0) box.style.width = saved.w + "px";
+  // #800: the booth stretches and remembers the size you left it at,
+  // merged into the same bag as position (#747). #806: a remembered
+  // size is CLAMPED to the viewport on open — a bottom edge lost below
+  // the screen cannot be grabbed to fix itself.
+  if (Number(saved.w) > 0) {
+    box.style.width = Math.min(Number(saved.w),
+      window.innerWidth - 24) + "px";
+  }
   if (Number(saved.h) > 0) {
-    box.style.height = saved.h + "px";
+    box.style.height = Math.max(220, Math.min(Number(saved.h),
+      window.innerHeight - 16)) + "px";
     box.style.maxHeight = "none";
   }
+  // …and if the saved position leaves the bottom off screen, pull the
+  // window up until the whole thing is reachable again.
+  requestAnimationFrame(() => {
+    const r = box.getBoundingClientRect();
+    if (r.bottom > window.innerHeight - 4) {
+      box.style.top = Math.max(8,
+        window.innerHeight - r.height - 8) + "px";
+    }
+    if (r.right > window.innerWidth - 4) {
+      box.style.left = Math.max(8,
+        window.innerWidth - r.width - 8) + "px";
+    }
+  });
+  // #806: grab ANY edge or corner to resize — not just the bottom-right
+  // grip. Eight invisible handles ride the borders.
+  [["n", "top:-3px;left:12px;right:12px;height:8px;cursor:ns-resize"],
+   ["s", "bottom:-3px;left:12px;right:12px;height:8px;cursor:ns-resize"],
+   ["w", "left:-3px;top:12px;bottom:12px;width:8px;cursor:ew-resize"],
+   ["e", "right:-3px;top:12px;bottom:12px;width:8px;cursor:ew-resize"],
+   ["nw", "top:-4px;left:-4px;width:14px;height:14px;cursor:nwse-resize"],
+   ["ne", "top:-4px;right:-4px;width:14px;height:14px;cursor:nesw-resize"],
+   ["sw", "bottom:-4px;left:-4px;width:14px;height:14px;cursor:nesw-resize"],
+   ["se", "bottom:-4px;right:-4px;width:14px;height:14px;cursor:nwse-resize"],
+  ].forEach(([dir, css]) => {
+    const grip = document.createElement("div");
+    grip.style.cssText = "position:absolute;z-index:6;" + css;
+    grip.addEventListener("pointerdown", (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      const r = box.getBoundingClientRect();
+      const sx = ev.clientX, sy = ev.clientY;
+      const move = (e) => {
+        const dx = e.clientX - sx, dy = e.clientY - sy;
+        let left = r.left, top = r.top;
+        let width = r.width, height = r.height;
+        if (dir.indexOf("e") >= 0) width = r.width + dx;
+        if (dir.indexOf("s") >= 0) height = r.height + dy;
+        if (dir.indexOf("w") >= 0) { width = r.width - dx; }
+        if (dir.indexOf("n") >= 0) { height = r.height - dy; }
+        width = Math.max(300, Math.min(width, window.innerWidth - 12));
+        height = Math.max(220, Math.min(height, window.innerHeight - 12));
+        if (dir.indexOf("w") >= 0) left = r.right - width;
+        if (dir.indexOf("n") >= 0) top = r.bottom - height;
+        box.style.width = width + "px";
+        box.style.height = height + "px";
+        box.style.maxHeight = "none";
+        box.style.left = Math.max(0, left) + "px";
+        box.style.top = Math.max(0, top) + "px";
+      };
+      const up = () => {
+        document.removeEventListener("pointermove", move);
+        document.removeEventListener("pointerup", up);
+        let bag = {};
+        try {
+          bag = JSON.parse(localStorage.getItem("djTalkBox") || "{}")
+            || {};
+        } catch (e) { bag = {}; }
+        bag.left = box.offsetLeft;
+        bag.top = box.offsetTop;
+        bag.w = box.offsetWidth;
+        bag.h = box.offsetHeight;
+        localStorage.setItem("djTalkBox", JSON.stringify(bag));
+      };
+      document.addEventListener("pointermove", move);
+      document.addEventListener("pointerup", up);
+    });
+    box.appendChild(grip);
+  });
   try {
     let sizeT = 0;
     new ResizeObserver(() => {
