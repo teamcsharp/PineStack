@@ -11966,6 +11966,33 @@ def station_name_scrub(text: str) -> str:
     return re.sub(r"\s{2,}", " ", text).strip()
 
 
+# #870: every line that reaches a voice passes through spoken_text.
+# Gating each writer separately is how non-English kept coming back —
+# there was always another road (the Nymphaea RP model wrote the
+# Spanish that aired today, and nothing gated it). One door, one rule.
+_ENGLISH_REFUSED = [0]
+
+
+def english_only(line: str) -> str:
+    """Return the line if it is English, else nothing.
+
+    Deliberately permissive about SHORT text — a sting label, a name, a
+    number or a shout has too few words to judge, and looks_english is
+    built for sentences. Anything long enough to carry a language, and
+    not in English, does not reach a voice."""
+    text = str(line or "")
+    if len(text.strip()) < 25:
+        return text
+    if looks_english(text):
+        return text
+    _ENGLISH_REFUSED[0] += 1
+    pipeline_log("drop", "a line came back in another language and was "
+                         "REFUSED at the door — the station is English "
+                         f"({_ENGLISH_REFUSED[0]} today) (#870)",
+                 extra=text[:220])
+    return ""
+
+
 def spoken_text(line: str) -> str:
     """Everything here is read aloud, and a model that is told not to use
     markdown still does. Asterisks become audible pauses and bracketed stage
@@ -11973,6 +12000,9 @@ def spoken_text(line: str) -> str:
 
     A model that gets stuck in a loop is the other thing that reaches the
     speaker as a fault: "—what —what —what" eighteen times went out on air.
+
+    #870: and it is where the ENGLISH rule lives, because it is the one
+    place every spoken line passes through no matter who wrote it.
     Two of anything stays, as emphasis; the rest is dropped."""
     clean = SPOKEN_NOISE.sub(" ", str(line or ""))
     clean = re.sub(r"https?://\S+", "", clean)
@@ -12002,7 +12032,9 @@ def spoken_text(line: str) -> str:
     # A word you have banned does not get to the speaker even if the model
     # wrote it anyway (#642). The prompt does the real work; this is the mouth.
     clean = strip_banned(clean)
-    return re.sub(r"\s{2,}", " ", clean).strip()
+    clean = re.sub(r"\s{2,}", " ", clean).strip()
+    # #870: the English rule, at the one door every spoken line uses.
+    return english_only(clean)
 
 
 # Why the last line did not reach the box. A silent speaker and a working
@@ -18517,10 +18549,41 @@ def looks_english(text: str) -> bool:
                 "vous", "der", "die", "das", "und", "nicht", "ist",
                 "ich", "du", "os", "\u00e0s", "de", "em", "com", "seu",
                 "sua", "meu", "minha", "por", "para", "pero", "m\u00e1s",
-                "mais", "est\u00e1", "esta", "yo", "mi", "t\u00fa"}
+                "mais", "est\u00e1", "esta", "yo", "mi", "t\u00fa",
+                # #871: the everyday glue that carried the Spanish
+                # straight past the old list.
+                "y", "o", "si", "en", "como", "del", "al", "se", "lo",
+                "ya", "muy", "cuando", "donde", "porque", "todo",
+                "nada", "bien", "hasta", "sobre", "entre", "cada",
+                "soy", "eres", "somos", "estoy", "est\u00e1s", "tiene",
+                "tengo", "hacer", "puede", "vamos", "cueste", "canto",
+                "aqu\u00ed", "all\u00ed", "tambi\u00e9n", "siempre",
+                "nunca", "ahora", "despu\u00e9s", "antes", "gracias",
+                "se\u00f1or", "d\u00eda", "noche", "vida", "gente",
+                "et", "ou", "mais", "avec", "sans", "pour", "dans",
+                "sur", "sont", "\u00eatre", "avoir", "cette", "ces",
+                "moi", "toi", "lui", "leur", "ne", "pas", "plus",
+                "aber", "oder", "auch", "noch", "sehr", "kein",
+                "mit", "auf", "f\u00fcr", "sich", "wir", "sie", "es"}
     en = sum(1 for w in words if w in _en)
     fr = sum(1 for w in words if w in _foreign)
     if fr >= 3 and fr > en:
+        return False
+    # #871: two foreign markers and not one English word is not a
+    # borrowed phrase, it is another language.
+    if fr >= 2 and en == 0:
+        return False
+    # #871: THE HOLE. This used to end `or len(words) < 14`, so any
+    # sentence under fourteen words passed whatever it contained —
+    # which is exactly the length the Spanish lines came in at. An
+    # English sentence of eight or more words essentially always
+    # carries a function word; zero of them at that length is not
+    # English, at any length.
+    # ...but a bare LIST of English nouns carries no function words
+    # either ("Hard Ops, Boxcutter, N Solve, vidBox, image Board") and
+    # is perfectly good station copy. What separates it from another
+    # language is that it has no foreign glue in it.
+    if en == 0 and fr >= 1:
         return False
     return en / len(words) >= 0.05 or len(words) < 14
 
