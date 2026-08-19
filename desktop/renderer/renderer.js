@@ -1005,10 +1005,24 @@ function initBoxPulse() {
       pulse.temp = Number(d.temp_c ?? 0);
       pulse.running = (d.shell || []).filter((r) => r.ms === null).length;
     } catch (e) {}
+    /* #896: the Box cell reports THE PANTRY — how much finished audio is
+       stacked and ready to go out. That is the number that says whether
+       the station can keep talking through a slow patch; a count of
+       running shells never did. */
+    try {
+      const pd = await api.get("/api/dj/pending");
+      pulse.buffered = Number(pd.buffered_seconds || 0);
+      pulse.takes = Number(pd.pantry_clips || 0);
+      pulse.window = String(pd.window || "");
+    } catch (e) {}
     const tasks = $("boxTasks");
     if (tasks) {
+      const secs = pulse.buffered || 0;
+      const stacked = secs >= 60
+        ? (secs / 60).toFixed(1) + " min stacked"
+        : Math.round(secs) + "s stacked";
       tasks.textContent =
-        "⚙ " + pulse.running + " running · ⏳ "
+        "🥫 " + stacked + " · ⏳ "
         + (pulse.queuedRenders ? "rendering" : "idle")
         + " · 🗂 " + pulse.held + " held · "
         + Math.round(pulse.cpu) + "% cpu";
@@ -1606,6 +1620,212 @@ function initTriagePopup() {
   cell.onclick = open;
 }
 initTriagePopup();
+
+/* #896 "The Works" — an eagle's eye view of the whole line.
+ *
+ * The station manufactures a round in four stages and every one of them
+ * used to be invisible: the desk WRITES a script, it lands on the
+ * RESERVE, the recording room RENDERS its lines into finished takes, the
+ * PANTRY holds them, and then they go out. When the air went quiet there
+ * was no way to see which stage had stopped. This draws the line as a
+ * flow chart with live numbers at every stage, plus who is in the cast,
+ * what the scheduler owes the hour, and whatever is actually blocking.
+ */
+function initWorksPopup() {
+  const cell = $("boxCell");
+  if (!cell) return;
+  cell.style.cursor = "pointer";
+  cell.title = "The Works — how the station is manufacturing its dialogue";
+  let pop = null;
+  let poll = 0;
+
+  const mk = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  };
+  const mins = (s) => (s >= 60 ? (s / 60).toFixed(1) + " min"
+                               : Math.round(s) + " s");
+
+  function close() {
+    if (poll) { clearInterval(poll); poll = 0; }
+    if (pop) { pop.remove(); pop = null; }
+  }
+
+  function stage(flow, title, num, note, cls, frac) {
+    const box = mk("div", "wk-stage" + (cls ? " " + cls : ""));
+    if (num != null) box.appendChild(mk("span", "wk-num", String(num)));
+    box.appendChild(mk("b", "", title));
+    if (note) box.appendChild(mk("div", "wk-note", note));
+    if (frac != null) {
+      const bar = mk("div", "wk-bar");
+      const fill = mk("div", "wk-fill"
+        + (frac >= 0.999 ? " good" : frac < 0.34 ? " warn" : ""));
+      fill.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + "%";
+      bar.appendChild(fill);
+      box.appendChild(bar);
+    }
+    flow.appendChild(box);
+    return box;
+  }
+
+  function paint(body, dj, pend) {
+    body.textContent = "";
+    const f = (dj && dj.dialogue_flow) || {};
+    const rows = (pend && pend.pending) || [];
+    const rendering = rows.filter((r) => r.state === "rendering");
+    const ready = rows.filter((r) => r.state === "ready");
+    const act = (dj && dj.activity) || {};
+
+    const flow = mk("div", "wk-flow");
+
+    // 1 — the writing desk
+    stage(flow, "① the writing desk",
+      (dj && dj.model) || "?",
+      f.writing ? "writing a round now"
+                : "idle — the reserve is at its target",
+      f.writing ? "on" : "");
+    flow.appendChild(mk("div", "wk-arrow", "▼"));
+
+    // 2 — the reserve of written scripts
+    const target = Number(f.target || 6);
+    const have = Number(f.ready || 0);
+    stage(flow, "② the reserve — written scripts",
+      have + " / " + target,
+      rows.length
+        ? rows.length + " round(s) banked and waiting for a slot"
+        : "nothing banked — the desk is behind",
+      have >= target ? "on" : have === 0 ? "warn" : "",
+      target ? have / target : 0);
+    flow.appendChild(mk("div", "wk-arrow", "▼"));
+
+    // 3 — the recording room
+    const cur = rendering[0] || null;
+    stage(flow, "③ the recording room",
+      cur ? (cur.made + " / " + cur.chunks) : (f.window ? "open" : "waiting"),
+      f.window
+        ? ("building through " + f.window
+           + (cur ? " — recording a round's lines" : ""))
+        : "the engine is busy with the live round — building is paused",
+      cur ? "on" : f.window ? "" : "warn",
+      cur && cur.chunks ? cur.made / cur.chunks : null);
+    flow.appendChild(mk("div", "wk-arrow", "▼"));
+
+    // 4 — the pantry
+    const secs = Number(f.buffered_seconds || pend.buffered_seconds || 0);
+    stage(flow, "④ the pantry — finished audio",
+      mins(secs),
+      (f.pantry_clips || pend.pantry_clips || 0) + " takes on the shelf"
+      + (f.pantry_mb != null
+         ? " · " + f.pantry_mb + " MB of " + f.pantry_cap_mb + " MB allowed"
+         : "")
+      + (ready.length ? " · " + ready.length + " round(s) ready to air" : ""),
+      secs > 90 ? "on" : secs < 20 ? "warn" : "",
+      Math.min(1, secs / 180));
+    flow.appendChild(mk("div", "wk-arrow", "▼"));
+
+    // 5 — on air
+    const now = (dj && dj.now) || {};
+    stage(flow, "⑤ on air",
+      dj && dj.speaking ? "talking" : "record",
+      (dj && dj.speaking_now)
+        ? String(dj.speaking_now).slice(0, 120)
+        : ((now.artist || "") + " — " + (now.title || "")).slice(0, 120),
+      dj && dj.speaking ? "on" : "");
+    body.appendChild(flow);
+
+    // the cast
+    const cast = mk("div", "wk-block");
+    cast.appendChild(mk("b", "", "THE CAST"));
+    const cg = mk("dl", "wk-grid");
+    const names = (dj && dj.dj_names) || {};
+    Object.keys(names).forEach((k) => {
+      cg.appendChild(mk("dt", "", k));
+      cg.appendChild(mk("dd", "", String(names[k])));
+    });
+    if (act.stage) {
+      cg.appendChild(mk("dt", "", "doing now"));
+      cg.appendChild(mk("dd", "", act.stage + " · " + (act.detail || "")));
+    }
+    cast.appendChild(cg);
+    body.appendChild(cast);
+
+    // the scheduler
+    const q = f.quota || {};
+    if (q.manager || q.caller) {
+      const sch = mk("div", "wk-block");
+      sch.appendChild(mk("b", "", "THE SCHEDULER — what the hour owes"));
+      const sg = mk("dl", "wk-grid");
+      ["manager", "caller"].forEach((k) => {
+        const r = q[k];
+        if (!r) return;
+        sg.appendChild(mk("dt", "", k));
+        sg.appendChild(mk("dd", "",
+          r.aired + " of " + r.target + " this hour"
+          + (r.behind ? " — behind" : " — on pace")
+          + (r.due ? ", due now" : "")));
+      });
+      sch.appendChild(sg);
+      body.appendChild(sch);
+    }
+
+    // what is stopping it
+    const stops = mk("div", "wk-block");
+    stops.appendChild(mk("b", "", "WHAT IS HOLDING IT UP"));
+    const list = (f.blockers || []);
+    if (!list.length) {
+      stops.appendChild(mk("div", "wk-note", "nothing — the line is clear"));
+    } else {
+      list.forEach((b) => {
+        const healthy = /healthy/i.test(b);
+        stops.appendChild(mk("div", healthy ? "wk-note" : "wk-note wk-stop",
+                             (healthy ? "✓ " : "• ") + b));
+      });
+    }
+    body.appendChild(stops);
+  }
+
+  async function load(body) {
+    try {
+      const [dj, pend] = await Promise.all([
+        api.get("/api/dj"),
+        api.get("/api/dj/pending"),
+      ]);
+      paint(body, dj, pend);
+    } catch (e) {
+      body.textContent = "";
+      body.appendChild(mk("div", "wk-note", "the works are unreachable"));
+    }
+  }
+
+  function open() {
+    if (pop) { close(); return; }
+    pop = mk("div", "works-pop");
+    const at = cell.getBoundingClientRect();
+    pop.style.left = Math.max(8,
+      Math.min(window.innerWidth - 570, at.left - 40)) + "px";
+    pop.style.top = (at.bottom + 8) + "px";
+    const head = mk("div", "wk-head");
+    head.appendChild(mk("b", "", "⚙ The Works"));
+    head.appendChild(mk("span", "wk-sub", "how the dialogue gets made"));
+    const x = mk("button", "wk-x", "✕");
+    x.onclick = close;
+    head.appendChild(x);
+    pop.appendChild(head);
+    pop.appendChild(mk("div", "wk-sub",
+      "Every round is written, banked, recorded and stacked before it "
+      + "goes out. This is where each one is right now."));
+    const body = mk("div", "wk-flow-wrap");
+    pop.appendChild(body);
+    document.body.appendChild(pop);
+    load(body);
+    poll = setInterval(() => load(body), 2500);
+  }
+
+  cell.addEventListener("click", open);
+}
+try { initWorksPopup(); } catch (e) { /* the desk still works without it */ }
 
 /* #799: the status bar — the machine's own ticker tape. Left: the newest
  * line of EVERYTHING the server is doing (pipeline feed + every shell

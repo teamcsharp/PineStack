@@ -109,6 +109,17 @@ SFX_DEFAULT_FOLDERS = (
 )
 SFX_DEFAULT_FOLDER = SFX_DEFAULT_FOLDERS[0]     # what the panel offers first
 SFX_MAX_FILES = 400                # one folder of stingers, not a library
+# #835: the DROP folders. New cuts land on the quickswap share while
+# the show is running - often in a subfolder that did not exist an hour
+# ago - and the operator wants them "showing up as I am adding them".
+# These roots are always in the rotation together with everything ONE
+# level beneath them, so nothing has to be named in the panel first.
+# One level ONLY: the pack tree above is 23,000 files and walking it
+# whole would turn every one of them into a sting candidate.
+SFX_DROP_FOLDERS = ("samples_grabbed",)
+SFX_DROP_SUBS = 60                 # subfolders taken from a drop root
+# #835: how often the share is re-read for arrivals, in seconds.
+SFX_RESCAN_SECONDS = 120
 # A sting punctuates a line; anything longer is a pad, and an announce
 # cannot be called back once it starts (#208).
 SFX_MAX_SECONDS = 4.0
@@ -656,6 +667,12 @@ DEFAULT_DJ = {
     # with, so it works before anyone opens the panel.
     "sfx": True,
     "sfx_folders": [],
+    # #835: folders the operator DROPS new samples into. Their contents
+    # and their immediate subfolders are always in play, and the keeper
+    # re-reads them on the interval below, so a file added mid-show can
+    # air without a restart and without naming anything in the panel.
+    "sfx_drop_folders": list(SFX_DROP_FOLDERS),
+    "sfx_rescan_seconds": SFX_RESCAN_SECONDS,
     # Make our own scratches as well as playing the packs (#211). Each one is
     # generated here and is unlike the last, so a zinger is not punctuated by
     # the same wav every time.
@@ -1287,6 +1304,20 @@ def validate_settings(data: Any) -> dict[str, Any]:
         **_dj_range(raw_dj, "fx_min", "fx_max", 0, 100),
         "sfx_gap": max(0, min(600, int(
             raw_dj.get("sfx_gap", DEFAULT_DJ["sfx_gap"]) or 0))),
+        # #835: the drop roots, and how often they are re-read. Same
+        # leading-slash scrub as sfx_folders - the real containment
+        # check still happens where the folder is opened (#208).
+        "sfx_drop_folders": [
+            str(name).strip().strip("/")[:300]
+            for name in (raw_dj.get("sfx_drop_folders")
+                         if raw_dj.get("sfx_drop_folders") is not None
+                         else list(SFX_DROP_FOLDERS))
+            if str(name or "").strip()
+        ][:20],
+        "sfx_rescan_seconds": max(15, min(3600, int(
+            raw_dj.get("sfx_rescan_seconds",
+                       DEFAULT_DJ["sfx_rescan_seconds"])
+            or SFX_RESCAN_SECONDS))),
         "dead_air_seconds": max(0, min(900, int(
             raw_dj.get("dead_air_seconds",
                        DEFAULT_DJ["dead_air_seconds"]) or 0))),
@@ -13776,6 +13807,19 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
             notes = ""
     if notes:
         song_analysis_ready(track, notes)
+    # #834: a definition found for the title rides along with the notes,
+    # so the record's own introduction can land the did-you-know as well
+    # as the round that follows it. Appended AFTER the analysis event so
+    # the booth dossier still shows the reception note by itself.
+    try:
+        _sense = track_definition(track)
+        if _sense:
+            notes = ((notes + " ") if notes else "") + (
+                "Also worth saying: the title is a real word, and it "
+                f"means {_sense}. Mention that as a fun fact and have a "
+                "quick word about it before the record takes over.")
+    except Exception:  # noqa: BLE001
+        pass
     # Hear the words (#451): whisper the song in the background so
     # a banter round this track can quote what it is actually
     # singing. Fire-and-forget — the cache is ready by the round.
@@ -15109,7 +15153,8 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
                 entry["script"] = await freshen_script(
                     str(entry.get("script") or ""),
                     str(entry.get("caller_name") or ""),
-                    str(entry.get("caller2_name") or ""))
+                    str(entry.get("caller2_name") or ""),
+                    entry.get("verbatim"))      # #838
             except Exception:  # noqa: BLE001
                 pass
             entry["frozen"] = True
@@ -18886,9 +18931,23 @@ async def track_notes(track: dict[str, Any]) -> str:
     if text.strip().upper().startswith("NONE"):
         text = ""
 
+    # #834: the dictionary sense of the title, if these same results
+    # happen to carry one. Kept beside the reception note so a round can
+    # read it without another search - and so a title whose page was
+    # "clearly about a different song" (answered NONE above) still leaves
+    # the pair something true to talk about.
+    define = ""
+    try:
+        define = title_definition(str(track.get("title") or ""), results)
+    except Exception:  # noqa: BLE001
+        define = ""
+    if define:
+        pipeline_log("model", "the title turns out to be a word - "
+                     f"{track.get('title')}: {define[:90]} (#834)")
     notes[key] = {"text": text, "ts": int(time.time()),
                   "model": str(load_settings().get("model") or ""),
                   "ms": int((time.monotonic() - _t0) * 1000),
+                  "define": define,
                   "prompt": _prompt[:2400], "query": query}
     _notes_write(notes)
     return text
@@ -21717,6 +21776,39 @@ def sfx_folders() -> list[Path]:
                 continue
             out.append(folder)
             break
+    # #835: the DROP roots, always in play. New cuts arrive on the share
+    # while the show is on - straight into the root, or into a subfolder
+    # made minutes ago that nobody has named in the panel - and the
+    # operator should not have to come and tell the station about each
+    # one. One level down only, and every lookup is wrapped: a dead SMB
+    # path must never take the show down with it.
+    try:
+        drops = dj_settings().get("sfx_drop_folders")
+        if drops is None:
+            drops = list(SFX_DROP_FOLDERS)
+    except Exception:  # noqa: BLE001
+        drops = list(SFX_DROP_FOLDERS)
+    for name in drops:
+        # An empty name would resolve to the SHARE ROOT and pull the
+        # whole 23,000-file pack tree into the rotation.
+        wanted = str(name or "").strip().strip("/")
+        if not wanted:
+            continue
+        for base in (SFX_ROOT, SFX_LOCAL_ROOT):
+            try:
+                root = (base / wanted).resolve()
+                if not root.is_relative_to(base.resolve()) \
+                        or not root.is_dir():
+                    continue
+                here = [root] + sorted(
+                    (one for one in root.iterdir() if one.is_dir()),
+                    key=lambda one: one.name)[:SFX_DROP_SUBS]
+            except Exception:  # noqa: BLE001
+                continue
+            for folder in here:
+                if folder not in out:
+                    out.append(folder)
+            break
     return out
 
 
@@ -22808,6 +22900,11 @@ async def drop_liner(station: str) -> str:
 _SFX_POOL_CACHE: list[Path] = []
 _SFX_POOL_AT = [0.0]
 _SFX_POOL_FILLING = [False]
+# #835: every sample NAME seen on the last walk. sfx_list rotates a
+# random 400 out of an over-cap folder (#817), so the playable pool
+# alone cannot tell a new arrival from the rotation shuffling - this
+# can, and it is what makes "3 new samples" in the feed mean something.
+_SFX_SEEN: set[str] = set()
 
 
 async def _sfx_pool_refresh() -> None:
@@ -22820,12 +22917,37 @@ async def _sfx_pool_refresh() -> None:
         return
     _SFX_POOL_FILLING[0] = True
     try:
-        def scan() -> list[Path]:
-            return [p for p in sfx_all() if sfx_short(p)]
-        pool = await asyncio.to_thread(scan)
+        def scan() -> tuple[list[Path], set[str]]:
+            # #835: the raw INVENTORY as well as the playable pool, so
+            # arrivals can be reported. It is the same directory read the
+            # walk below already pays for, and it runs in the same worker
+            # thread - nothing new touches the event loop.
+            seen: set[str] = set()
+            for folder in sfx_folders():
+                try:
+                    for one in folder.iterdir():
+                        if one.is_file() \
+                                and one.suffix.lower() in MUSIC_TYPES:
+                            seen.add(str(one))
+                except Exception:  # noqa: BLE001
+                    continue        # that folder went away; carry on
+            return [p for p in sfx_all() if sfx_short(p)], seen
+        pool, seen = await asyncio.to_thread(scan)
         was = len(_SFX_POOL_CACHE)
+        # #835: what turned up since the last walk, by name. The first
+        # walk of a session has nothing to compare against, so it is not
+        # announced as a pile of arrivals.
+        arrived = sorted(seen - _SFX_SEEN) if _SFX_SEEN else []
+        _SFX_SEEN.clear()
+        _SFX_SEEN.update(seen)
         _SFX_POOL_CACHE[:] = pool
         _SFX_POOL_AT[0] = time.time()
+        if arrived:
+            pipeline_log("air", f"{len(arrived)} new sample(s) turned "
+                         "up on the share and are in the rotation now "
+                         "(#835)",
+                         extra="\n".join(Path(one).name
+                                         for one in arrived[:40]))
         # #862: say the size out loud when it MOVES. A pool that
         # collapses (an unmounted share) used to be invisible — the
         # DJs simply kept hitting the same two local files.
@@ -22841,9 +22963,35 @@ async def _sfx_pool_refresh() -> None:
         _SFX_POOL_FILLING[0] = False
 
 
+async def sfx_keeper() -> None:
+    """#835: the sample share, re-read on a clock.
+
+    The pool cache only ever refreshed from inside sting_due - and only
+    once the sfx switch, the gap and the rate dice had ALL come up, so on
+    a quiet show a folder the operator was filling live could sit unseen
+    for hours. This walks the share on its own interval, in a worker
+    thread, so a file dropped into samples_grabbed is in the draw a
+    couple of minutes later with no restart and no click.
+
+    Nothing in here may take the station down: the interval read and the
+    walk are each wrapped, and a missed rescan simply waits."""
+    while True:
+        try:
+            gap = float(dj_settings().get("sfx_rescan_seconds")
+                        or SFX_RESCAN_SECONDS)
+        except Exception:  # noqa: BLE001
+            gap = float(SFX_RESCAN_SECONDS)
+        await asyncio.sleep(max(15.0, min(3600.0, gap)))
+        try:
+            await _sfx_pool_refresh()
+        except Exception:  # noqa: BLE001
+            pass                    # a missed rescan is not a dead show
+
+
 @app.on_event("startup")
 async def _startup_sfx_pool() -> None:
     fire_and_forget(_sfx_pool_refresh())
+    fire_and_forget(sfx_keeper())       # #835
 
 
 def sting_due() -> Path | None:
@@ -24627,6 +24775,97 @@ def spoken_title(title: str) -> str:
     if cjk_title(title) or UNREADABLE_RUN.search(str(title or "")):
         return _xlat_cache().get(str(title), str(title))
     return str(title)
+
+
+# --- The word in the title (#834) -------------------------------------
+# A song called FLOE, DRIFT, SPELL or KIN is a song named after a real
+# word, and the reception search has already paid for the page that
+# defines it. Pulled out here and handed to the pair as material.
+
+# A page has to LOOK like a dictionary before anything is read off it.
+_DEFINE_MARKS = (
+    "definition & meaning", "definition and meaning", "definition, meaning",
+    "merriam-webster", "dictionary.com", "wiktionary", "vocabulary.com",
+    "cambridge dictionary", "collins dictionary", "the free dictionary",
+    "meaning of", "definition of", "is defined as",
+)
+
+
+def title_definition(title: str, results: list[dict[str, Any]]) -> str:
+    """#834: a dictionary sense of the song title, out of the research
+    results the reception lookup already fetched.
+
+    Deliberately strict: a real single word (or a two-word phrase), on a
+    page that is visibly a dictionary, with a sense that can actually be
+    read off it. Anything looser would put the pair on air explaining a
+    word nobody defined, which is worse than saying nothing."""
+    word = " ".join(str(title or "").split())
+    if not word or len(word) < 3 or len(word.split()) > 2:
+        return ""
+    low = word.lower()
+    for row in (results or [])[:8]:
+        try:
+            head = " ".join(str(row.get("title") or "").split())
+            body = " ".join(str(row.get("snippet")
+                                or row.get("content") or "").split())
+        except Exception:  # noqa: BLE001
+            continue
+        blob = f"{head} {body}"
+        flat = blob.lower()
+        if low not in flat:
+            continue
+        if not any(mark in flat for mark in _DEFINE_MARKS):
+            continue
+        sense = ""
+        for pattern in (
+                r"(?:the\s+)?(?:meaning|definition)\s+of\s+"
+                + re.escape(low) + r"\s+(?:is|:)\s+(.{12,220}?)(?:[.;]|$)",
+                re.escape(low)
+                + r"\s+(?:is|means)\s+(?:defined\s+as\s+)?"
+                  r"(.{12,220}?)(?:[.;]|$)",
+                re.escape(low) + r"\s*:\s+(.{12,220}?)(?:[.;]|$)"):
+            try:
+                hit = re.search(pattern, blob, re.I)
+            except Exception:  # noqa: BLE001
+                hit = None
+            if hit:
+                sense = " ".join(hit.group(1).split()).strip(" ;,-|")
+                if len(sense) >= 12:
+                    break
+                sense = ""
+        if sense:
+            return sense[:220]
+    return ""
+
+
+def track_definition(track: dict[str, Any]) -> str:
+    """#834: the sense found for this title when it was researched, if
+    there was one. A cache READ, never a lookup - a round must never wait
+    on the network to make a joke about a word."""
+    try:
+        row = _notes_read().get(str((track or {}).get("id") or "")) or {}
+        return " ".join(str(row.get("define") or "").split())[:220]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def definition_fact(title: str, sense: str) -> str:
+    """#834: the instruction that turns a dictionary find into banter -
+    the sibling of title_fact, shared by the intro and the round."""
+    if not sense:
+        return ""
+    word = " ".join(str(title or "").split())
+    return (
+        f"\nThe title is a real word: \"{word}\" actually means {sense}. "
+        "NOTICE that on air and make a little something of it - 'hey, did "
+        "you notice the word actually means this?' - and then go into a "
+        "SHORT discussion about it: take the mickey out of it, argue about "
+        "whether the artist knew, wonder what it has to do with the song, "
+        "or simply enjoy it as a genuinely good fun fact. Two or three "
+        "turns is plenty, then get on with the show. Never read a "
+        "dictionary entry out loud - talk about it like two people who "
+        "have only just found it out."
+    )
 
 
 def title_fact(title: str, translated: str) -> str:
@@ -29316,6 +29555,18 @@ async def dj_banter(track: dict[str, Any] | None = None,
         if translated:
             playing += title_fact(str(track.get("title") or ""), translated)
             allowed.append(translated)
+        # #834: and when the title is an ordinary word with a dictionary
+        # sense behind it, the pair are told to notice. This rides in
+        # `playing`, which reaches the prompt on EVERY round - an angle
+        # alone would only fire on the free rounds, and with the speakbox
+        # seed at full strength those barely come round at all.
+        try:
+            _sense = await asyncio.to_thread(track_definition, track)
+        except Exception:  # noqa: BLE001
+            _sense = ""
+        if _sense:
+            playing += definition_fact(str(track.get("title") or ""),
+                                       _sense)
     if also_name:
         allowed.append(also_name)
     # The REAL, CALCULATED song lists (#432): what actually just played and
@@ -29494,6 +29745,20 @@ async def dj_banter(track: dict[str, Any] | None = None,
             "mildly disagree about whether this track is any good, and be "
             "polite about it",
         ] if track else []
+        # #834: when the title turned out to be a real word, one of the
+        # free rounds can be ABOUT that - the whole round given over to
+        # the definition rather than one line in passing.
+        try:
+            _word_sense = track_definition(track) if track else ""
+        except Exception:  # noqa: BLE001
+            _word_sense = ""
+        if _word_sense:
+            about_track.append(
+                "one of you has just looked the title up and found it is "
+                f"a real word: it means {_word_sense}. Bring it up as a "
+                "did-you-know, be delighted or appalled by it, argue about "
+                "whether the artist meant it that way, and riff on the "
+                "definition itself for a few turns before letting it go")
         # #713: politeness is not the only setting. Somebody in the room —
         # not necessarily a host — has a REAL feeling about this record, and
         # it lands without warning. Drawn per round so the same track can be
@@ -29951,6 +30216,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # summarized, answered over, or reduced to a decorative sentence. The
     # stream renderer may divide it into transport-safe pieces, but joins
     # those pieces in the same voice with no other speaker between them.
+    # #838: every passage placed into the script VERBATIM, and where it
+    # sits. freshen_script may not hand these to the model to reword -
+    # they are the operator's own documents, not the pair repeating
+    # themselves, and rewording them is exactly "not hearing enough
+    # speakerbox rhetoric".
+    _verbatim: list[list[str]] = []
     full_swath: dict[str, Any] = {}
     if (not caller_name and random.random() < float(
             _sb.get("speakbox_full_swath_rate") or 0)):
@@ -29962,6 +30233,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             script = f"A: {full_swath['text']}\n" + script.lstrip()
             lines += 1
             speakbox_remember(full_swath)
+            _verbatim.append(["head", str(full_swath["text"])])  # #838
             pipeline_log("speakbox", "full uninterrupted swath scheduled "
                          f"({len(str(full_swath['text']))} chars)")
     # #609/#612: PRE-PEND a fresh verbatim swath to the FRONT of the round (an
@@ -29984,6 +30256,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             script = f"A: {head['text']}\n" + script.lstrip()
             lines += 1
             speakbox_remember(head)
+            _verbatim.append(["head", str(head["text"])])        # #838
     tail: dict[str, Any] = {}
     if not caller_name and not full_swath and random.random() < min(1.0, float(
             _sb.get("speakbox_append_rate") or 0) + _lift):
@@ -29998,10 +30271,32 @@ async def dj_banter(track: dict[str, Any] | None = None,
             script = script.rstrip() + f"\nA: {_tail_text}"
             lines += 1                       # room for the appended quote
             speakbox_remember(tail)
+            _verbatim.append(["tail", _tail_text])               # #838
+    # #838: a verbatim passage is the operator's OWN document, not the
+    # model reaching for a record that is not on air - but names_only
+    # (the #176/#178 gate in speak_turns) reads ANY quoted phrase in a
+    # turn as an invented title and drops the whole turn at the door,
+    # which is how a swath that quotes somebody was never heard. What
+    # the documents themselves quote is sanctioned here so the passage
+    # can go out whole. Wrapped: a bad regex hit must not lose a round.
+    try:
+        for _one in ([str((seed or {}).get("text") or ""),
+                      str((comeback or {}).get("text") or ""),
+                      str((jab or {}).get("text") or "")]
+                     + [str(_row[1]) for _row in _verbatim]):
+            for _quoted in _QUOTED_TITLE.findall(_one):
+                _quoted = str(_quoted).strip()
+                if _quoted and _quoted not in vouched:
+                    vouched.append(_quoted)
+    except Exception:  # noqa: BLE001
+        pass
     entry = {
         "script": script, "lines": lines, "vouched": vouched,
         "source": source or seed.get("file", ""),
         "seed_text": seed.get("text", ""),
+        # #838: the passages the rewrite may not touch, carried with the
+        # round so the larder road protects them too.
+        "verbatim": _verbatim,
         "swaths": [s for s in (seed, comeback, jab, tail) if s],
         "seek_verdict": seek_verdict,
         "caller_name": caller_name, "caller_voice": caller_voice,
@@ -30029,7 +30324,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
 
 
 async def freshen_script(script: str, caller_name: str = "",
-                         caller2_name: str = "") -> str:
+                         caller2_name: str = "",
+                         verbatim: list[Any] | None = None) -> str:
     """Rewrite a round that is about to repeat itself, before it airs (#no-repeats).
 
     The old engine's only answer to a repeat was to DROP the line at the door,
@@ -30043,6 +30339,57 @@ async def freshen_script(script: str, caller_name: str = "",
     the most: banked rounds are written six to twelve deep against a shelf
     nothing updates until one airs, so several of them can carry the same
     passage and then go out one after another."""
+    # #838: "I am still not hearing enough random speakerbox rhetoric."
+    # The full reading and the prepended/appended passages are placed
+    # into the script AFTER the writing precisely so they cannot be
+    # summarised - and then this function handed the ENTIRE script to the
+    # model with "say the offending parts a COMPLETELY different way",
+    # which reworded the operator's own documents out of the round
+    # whenever ANY OTHER line tripped the hour-long cooldown. With
+    # phrase_retries at 1 and a station that has been on all night, that
+    # is most rounds. The passages are skipped by the collision scan
+    # (they are the documents, not the pair repeating themselves) and put
+    # back word for word if a rewrite dropped them anyway.
+    _keep: list[tuple[str, str]] = []
+    for _row in (verbatim or []):
+        try:
+            _where = str(_row[0] or "head")
+            _text = " ".join(str(_row[1] or "").split())
+        except Exception:  # noqa: BLE001
+            continue
+        if len(_text) >= 40:
+            _keep.append((_where, _text))
+
+    def _protected(said: str) -> bool:
+        """Whether this turn IS one of the verbatim passages."""
+        flat = " ".join(str(said or "").split())
+        if not flat:
+            return False
+        return any(flat == one or one in flat
+                   or (len(flat) >= 40 and flat in one)
+                   for _w, one in _keep)
+
+    def _restore(text: str) -> str:
+        """Put back any verbatim passage the rewrite reworded away."""
+        if not _keep:
+            return text
+        out_text = str(text or "")
+        for _where, one in _keep:
+            try:
+                probe = one.lower()[:60]
+                if probe and probe in " ".join(out_text.split()).lower():
+                    continue
+                if _where == "tail":
+                    out_text = out_text.rstrip() + f"\nA: {one}"
+                else:
+                    out_text = f"A: {one}\n" + out_text.lstrip()
+                pipeline_log("speakbox", "a verbatim passage the rewrite "
+                             "reworded away was put back word for word "
+                             "(#838)")
+            except Exception:  # noqa: BLE001
+                continue
+        return out_text
+
     cfg = phrase_setup()
     if not (cfg["station"] or cfg["self"]):
         return script
@@ -30055,6 +30402,11 @@ async def freshen_script(script: str, caller_name: str = "",
                 continue
             who = ("dj" if marker == "A"
                    else "third" if marker == "D" else "cohost")
+            # #838: the operator's own words are not a repeat by the
+            # pair, and flagging them is what sent the whole round
+            # (passages included) off to be reworded.
+            if _protected(said):
+                continue
             body = spoken_text(said)
             verdict = phrase_check(body, who, seen)
             if verdict["block"]:
@@ -30066,7 +30418,7 @@ async def freshen_script(script: str, caller_name: str = "",
     hits = _collisions(script)
     for _ in range(cfg["retries"]):
         if not hits:
-            return script
+            return _restore(script)             # #838
         banned = "; ".join(f'"{v["phrase"]}"' for _s, v in hits[:8])
         pipeline_log("model", f"{len(hits)} line(s) reuse a phrase already on "
                               "air this hour — asking for them again (#no-repeats)",
@@ -30089,12 +30441,12 @@ async def freshen_script(script: str, caller_name: str = "",
         script = rewritten
         hits = _collisions(script)
     if not hits:
-        return script
+        return _restore(script)                 # #838
     # It would not let go. Give those lines to the documents instead — this
     # is "prompt them to say more from the speakerbox database", and it is
     # also what makes holding a line back safe: the round keeps its length.
     if not cfg["swap"]:
-        return script
+        return _restore(script)                 # #838
     stuck = {said for said, _v in hits}
     out: list[str] = []
     swapped = 0
@@ -30116,7 +30468,7 @@ async def freshen_script(script: str, caller_name: str = "",
         pipeline_log("speakbox", f"{swapped} line(s) the model would not let "
                                  "go of were replaced with fresh material off "
                                  "the shelf (#no-repeats)")
-    return "\n".join(out)
+    return _restore("\n".join(out))             # #838
 
 
 async def _banter_air(entry: dict[str, Any],
@@ -30138,9 +30490,11 @@ async def _banter_air(entry: dict[str, Any],
         pipeline_log("air", "larder round bypasses model freshening while "
                      "the desk is still writing — keeping talk on air")
     else:
-        entry["script"] = await freshen_script(entry["script"],
-                                               entry.get("caller_name", ""),
-                                               entry.get("caller2_name", ""))
+        entry["script"] = await freshen_script(
+            entry["script"],
+            entry.get("caller_name", ""),
+            entry.get("caller2_name", ""),
+            entry.get("verbatim"))              # #838
     spoken = await speak_turns(banter_turns(entry["script"],
                                             entry.get("caller_name", ""),
                                             entry.get("caller2_name", "")),
