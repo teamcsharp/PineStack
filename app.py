@@ -20974,6 +20974,15 @@ def speakbox_aside(quote: dict[str, str], pair: bool = True) -> str:
            "speaker labels of any kind in what you write.")
         + " Beyond the quoted lines, let everything else you say be soaked "
         "in that passage: its subject, its attitude, its vocabulary."
+        # #845: WHERE they go was never specified, and a small model
+        # reads "say this word for word" as permission to recite it in a
+        # block at one end of the round. Interjected is the word the
+        # operator used.
+        + " Thread them INTO the conversation at the point they land —"
+        " interjected mid-discussion, answering or provoking what is"
+        " being said around them — never parked at the start or the end"
+        " as a block, and never read out as a passage. A listener should"
+        " hear one of you making a point, not reciting something."
     )
 
 
@@ -30273,6 +30282,38 @@ async def dj_banter(track: dict[str, Any] | None = None,
             lines += 1                       # room for the appended quote
             speakbox_remember(tail)
             _verbatim.append(["tail", _tail_text])               # #838
+    # #844: THE SLIDER IS A GUARANTEE AT THE TOP OF ITS RANGE. Every
+    # speakbox control was a probability on the DRAW, and nothing ever
+    # checked that the model used what it was handed — so at 100% the
+    # material was always fetched and could still be absent from the
+    # finished round. This is the post-pass on the text generation the
+    # operator asked for: if the words are not in the script, they go in.
+    try:
+        _sb_rate = float(_sb.get("speakbox_rate") or 0)
+        _seed_text = str((seed or {}).get("text") or "").strip()
+        if (_sb_rate >= 0.95 and _seed_text and not caller_name
+                and not full_swath):
+            _flat = re.sub(r"[^a-z0-9 ]+", " ", script.lower())
+            _flat = re.sub(r"\s+", " ", _flat)
+            _probe = re.sub(r"[^a-z0-9 ]+", " ", _seed_text.lower())
+            _probe = re.sub(r"\s+", " ", _probe).strip()
+            # Match on a real span of it, not the whole passage — the
+            # pair are allowed to break a long line across a turn.
+            _probe = " ".join(_probe.split()[:9])
+            if _probe and _probe not in _flat:
+                _put = _seed_text.rstrip()
+                if not re.search(r"[.!?\u2026\u2014\u00bb\"')\]]$", _put):
+                    _put += "."
+                script = script.rstrip() + f"\nB: {_put}"
+                lines += 1
+                _verbatim.append(["enforced", _put])            # #838
+                speakbox_remember(seed)
+                pipeline_log("speakbox", "grounding is at the top of the "
+                             "slider and the round came back without the "
+                             "material - the passage was put back in "
+                             "(#844)", extra=_put[:200])
+    except Exception:  # noqa: BLE001
+        pass
     # #838: a verbatim passage is the operator's OWN document, not the
     # model reaching for a record that is not on air - but names_only
     # (the #176/#178 gate in speak_turns) reads ANY quoted phrase in a
