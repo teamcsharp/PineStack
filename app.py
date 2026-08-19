@@ -5717,6 +5717,58 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
         _REPAIR_LIVE["busy"] = False
 
 
+DIALOGUE_QUIET_LIMIT = float(os.getenv("DIALOGUE_QUIET_LIMIT", "420"))
+_DIALOGUE_FIX_AT = [0.0]
+
+
+async def dialogue_watchdog() -> None:
+    """#857: the cast must be HEARD, not merely scheduled.
+
+    onair_watchdog asks whether the box has been silent; a station
+    spinning records with a mute cast sails past that for ever, and
+    that is the outage the operator kept reporting — music fine, DJs
+    gone. This watches the one number that matters: when a host line
+    was last VERIFIED audible. Seven minutes without one, while the
+    show is on and pointed at the box, and the deep repair runs on its
+    own — engines, director, device, shelf and all — with a twenty
+    minute cooldown so a genuinely quiet stretch is never thrashed."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not _RADIO.get("on") or not box_talk_ok():
+                continue
+            if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
+                continue                     # the box is not the audience
+            now = time.time()
+            if now - _DIALOGUE_FIX_AT[0] < 1200:
+                continue
+            aired = [ln for ln in (_RADIO.get("chat") or [])
+                     if ln.get("who") in ("dj", "cohost", "third", "host")
+                     and ln.get("aired") in ("box", "stream", "both")]
+            last = float(aired[-1].get("air_at")
+                         or aired[-1].get("ts") or 0) if aired else 0.0
+            # A station that just started has no history to judge.
+            if not last:
+                continue
+            quiet = now - last
+            if quiet < DIALOGUE_QUIET_LIMIT:
+                continue
+            _DIALOGUE_FIX_AT[0] = now
+            pipeline_log("repair", "no host line has been heard in "
+                         f"{int(quiet // 60)} minutes while the show is "
+                         "on and pointed at the box — running the deep "
+                         "repair without being asked (#857)")
+            note_action("🚑 the DJs went quiet — repairing on my own")
+            fire_and_forget(_deep_repair("the dialogue watchdog (#857)"))
+        except Exception:  # noqa: BLE001
+            pass                     # a watchdog must never take the show
+
+
+@app.on_event("startup")
+async def _startup_dialogue_watchdog() -> None:
+    fire_and_forget(dialogue_watchdog())
+
+
 async def onair_watchdog() -> None:
     """#810: FM ON means AUDIBLE. When the switch says broadcasting but
     nothing verified has come out of the speaker for ten minutes, the
@@ -8917,11 +8969,27 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
         # Nabu's Assist announce path can add device feedback even with
         # preannounce disabled. Its companion media-player entity plays the
         # station's authored file directly, with no extra cue.
+        #
+        # #856: "announce" is NOT optional here, and its absence was
+        # taking the record off the air on every single line. Measured
+        # against the real speaker: without the flag the clip enters the
+        # MEDIA pipeline and REPLACES what is playing — the device went
+        # from `playing` to `idle` and stayed there, so the DJs killed
+        # the music every time they opened their mouths. With it, the
+        # clip rides the ANNOUNCEMENT pipeline, which ducks the record
+        # 20 dB underneath and swells it back when the line ends.
+        #
+        # bypass_proxy is deliberately NOT set: it hands the URL
+        # straight to the device, which cannot decode the station's WAV
+        # natively (measured — nothing played at all). Home Assistant's
+        # ffmpeg proxy transcodes it to FLAC for us, at the cost of a
+        # two-conversion-per-device ceiling.
         service = "media_player/play_media"
         payload: dict[str, Any] = {
             "entity_id": NABU_MEDIA_PLAYER,
             "media_content_id": url,
             "media_content_type": "music",
+            "announce": True,
         }
     elif player.startswith("assist_satellite."):
         service = "assist_satellite/announce"
@@ -13733,6 +13801,17 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
         if rows:
             # #830: it PLAYED — now the rows may move to their real slot.
             _stream_now_set(rows, length, stamp=True)
+        # #857: and the booth stops calling it held. Nothing wrote the
+        # row back when the shelf drained it, so a line that DID air
+        # kept saying "held" for ever — the booth looked broken while
+        # the speaker was working.
+        _rid = str(clip.get("id") or "")
+        if _rid:
+            for _row in reversed(_RADIO.get("chat") or []):
+                if str(_row.get("id") or "") == _rid:
+                    _row["aired"] = "box"
+                    _row["air_at"] = time.time()
+                    break
         lp = _LAST_PLAYOUT
         if lp.get("key") == _played_out_key(clip["path"]) \
                 and time.time() - float(lp.get("at") or 0) < 200:
