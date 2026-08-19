@@ -51191,6 +51191,124 @@ function cloneGroups(rows) {
                  buckets.get(k)]);
 }
 
+/* #849: the GPU verdict on every option in a CAST picker. A voice on
+ * a different engine than the host forces a SECOND 23-24G model to
+ * stay resident on a pool this box shares with the writer, ComfyUI and
+ * the page cache — that pressure is what wedges a loading engine and
+ * takes the DJs off the air. So those options are greyed with a ⚠ that
+ * explains the cost, and disabled outright while the cast lock is on. */
+let djGpuVerdict = null;
+
+async function djVoiceGpuLoad() {
+  try {
+    djGpuVerdict = await api("/api/pinebox/gpu-load");
+  } catch (e) { djGpuVerdict = null; }
+  return djGpuVerdict;
+}
+
+function djVoiceEngineOf(name) {
+  const raw = String(name || "");
+  const pre = raw.indexOf(":");
+  if (pre > 0) return raw.slice(0, pre);
+  const row = (window.pineCloneVoices || []).find(
+    (v) => String(v.id) === raw);
+  return row ? String(row.engine || "xtts") : "piper";
+}
+
+const DJ_ENGINE_GB = {xtts: 23, f5: 24, voxcpm: 8, cosyvoice: 12,
+                      indextts: 10, vibevoice: 14};
+
+function djVoiceGpuMark(select, seat) {
+  if (!select || !djGpuVerdict) return;
+  const host = String(djGpuVerdict.host_engine || "xtts");
+  const locked = !!djGpuVerdict.cast_engine_lock;
+  Array.from(select.querySelectorAll("option")).forEach((opt) => {
+    if (!opt.value) return;
+    const eng = djVoiceEngineOf(opt.value);
+    const heavy = (eng in DJ_ENGINE_GB) && eng !== host;
+    opt.textContent = opt.textContent.replace(/^\u26a0\s*/, "");
+    opt.disabled = false;
+    opt.style.color = "";
+    if (!heavy) return;
+    opt.textContent = "\u26a0 " + opt.textContent;
+    opt.style.color = "#ff9db1";
+    opt.title = "This voice renders on " + eng.toUpperCase()
+      + " while the host is on " + host.toUpperCase() + ". Choosing it "
+      + "forces BOTH engines to stay resident \u2014 about "
+      + ((DJ_ENGINE_GB[eng] || 8) + (DJ_ENGINE_GB[host] || 23))
+      + "G instead of " + (DJ_ENGINE_GB[host] || 23) + "G \u2014 on a "
+      + "pool this box already shares with the writer model, ComfyUI "
+      + "and the page cache. That pressure is what wedges a loading "
+      + "engine and takes the DJs off the air, and the desk also has "
+      + "to swap models mid-conversation, which breaks the flow "
+      + "between speakers."
+      + (locked ? " Locked: throw the master swap to allow it."
+                : " The master swap is OPEN, so this is allowed \u2014 "
+                  + "expect more memory pressure.");
+    if (locked && seat !== "caller") opt.disabled = true;
+  });
+}
+
+/* #849: the advisor itself — what the casting costs, and the master
+ * swap that allows a heavier one. */
+async function djGpuAdvisor() {
+  const got = await djVoiceGpuLoad();
+  if (!got) { setStatus("the advisor is not answering", true); return; }
+  const rows = (got.rows || []).map((r) =>
+    "<tr><td>" + callerDossierEsc(r.seat) + "</td><td>"
+    + callerDossierEsc(r.name) + "</td><td>"
+    + callerDossierEsc(r.engine) + "</td><td>" + r.gb + " G</td></tr>")
+    .join("");
+  let win = document.getElementById("djGpuWin");
+  if (win) win.remove();
+  win = document.createElement("div");
+  win.id = "djGpuWin";
+  win.style.cssText = "position:fixed;left:50%;top:12%;"
+    + "transform:translateX(-50%);z-index:99;width:min(560px,92vw);"
+    + "background:var(--panel,#141b24);border:1px solid #4b2a5e;"
+    + "border-radius:10px;padding:14px;"
+    + "box-shadow:0 14px 48px rgba(0,0,0,.75)";
+  win.innerHTML = "<b>GPU load \u2014 what this casting costs</b>"
+    + "<div style='font-size:12.5px;line-height:1.6'><p>"
+    + callerDossierEsc(got.advice || "") + "</p>"
+    + "<table style='width:100%;border-collapse:collapse;"
+    + "font-size:11.5px'><tr style='color:#8ba0b5'>"
+    + "<th align='left'>seat</th><th align='left'>voice</th>"
+    + "<th align='left'>engine</th><th align='left'>resident</th></tr>"
+    + rows + "</table><p class='muted' style='font-size:11px'>"
+    + "resident now: " + got.resident_gb + " G of " + got.pool_gb + " G"
+    + (got.avail_gb ? " \u00b7 " + got.avail_gb + " G free" : "")
+    + "</p></div>";
+  const shut = document.createElement("button");
+  shut.textContent = "\u2715";
+  shut.style.cssText = "position:absolute;top:8px;right:10px";
+  shut.onclick = () => win.remove();
+  win.appendChild(shut);
+  const bar = document.createElement("div");
+  bar.className = "row";
+  bar.style.cssText = "gap:6px;margin-top:6px;flex-wrap:wrap";
+  const swap = document.createElement("button");
+  swap.textContent = got.cast_engine_lock
+    ? "Open the master swap (allow heavier engines)"
+    : "Lock the cast to the host's engine";
+  swap.className = got.cast_engine_lock ? "" : "primary";
+  swap.onclick = async () => {
+    swap.disabled = true;
+    try {
+      await api("/api/pinebox/cast-lock", {method: "POST",
+        body: JSON.stringify({locked: !got.cast_engine_lock})});
+      setStatus(got.cast_engine_lock
+        ? "master swap OPEN — heavier engines allowed for the cast"
+        : "cast locked to the host's engine");
+      win.remove();
+      djLoadSettings();
+    } catch (e) { setStatus(e.message, true); }
+  };
+  bar.appendChild(swap);
+  win.appendChild(bar);
+  document.body.appendChild(win);
+}
+
 function fillVoiceSelect(select, voices, current, includeBrowser) {
   select.textContent = "";
   const fallback = document.createElement("option");
@@ -66003,6 +66121,18 @@ async function djLoadSettings() {
                     dj.voice || "", false);
     fillVoiceSelect(document.getElementById("djCohostVoice"), voices,
                     dj.cohost_voice || "", false);
+    // #849: grey out and flag anything that would cost a second model.
+    await djVoiceGpuLoad();
+    djVoiceGpuMark(document.getElementById("djVoice"), "host");
+    djVoiceGpuMark(document.getElementById("djCohostVoice"), "cohost");
+    const _gpuNote = document.getElementById("djVoiceStatus");
+    if (_gpuNote && djGpuVerdict) {
+      _gpuNote.textContent = (djGpuVerdict.level === "warn" ? "\u26a0 "
+                              : "") + String(djGpuVerdict.advice || "");
+      _gpuNote.title = "Click for the GPU load advisor";
+      _gpuNote.style.cursor = "pointer";
+      _gpuNote.onclick = djGpuAdvisor;
+    }
     // Show whether each of the two is starred (#212).
     const stars = favouriteVoices();
     document.getElementById("djVoiceStar").textContent =
