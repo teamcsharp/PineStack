@@ -3775,6 +3775,21 @@ async def comfy_idle_clock() -> None:
 
 
 @app.on_event("startup")
+async def _startup_sfx_pool() -> None:
+    """#862: fill the sample pool at boot. It used to fill only on the
+    first sting_due that found the cache stale, so the opening stretch
+    of every session had no stings at all — and when the share was
+    unmounted the pool silently collapsed to the couple of files on
+    local disk, which is why one clip kept coming round."""
+    async def _prime() -> None:
+        await asyncio.sleep(3)
+        await asyncio.to_thread(_sfx_len_load)     # #863
+        await _sfx_pool_refresh()
+        await asyncio.to_thread(_sfx_len_save)
+    fire_and_forget(_prime())
+
+
+@app.on_event("startup")
 async def _startup_comfy_idle() -> None:
     fire_and_forget(comfy_idle_clock())
 
@@ -20204,6 +20219,31 @@ def sfx_cap_seconds() -> float:
 
 
 _SFX_LEN_CACHE: dict[str, float] = {}
+# #863: the measurements survive a restart. Keyed path+mtime, so a
+# replaced file is re-measured and a renamed one simply misses.
+SFX_LEN_PATH = data_path("sfx_lengths.json")
+_SFX_LEN_DIRTY = [0]
+
+
+def _sfx_len_load() -> None:
+    try:
+        rows = json.loads(SFX_LEN_PATH.read_text())
+        if isinstance(rows, dict):
+            _SFX_LEN_CACHE.update({str(k): float(v)
+                                   for k, v in rows.items()})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _sfx_len_save() -> None:
+    try:
+        SFX_LEN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SFX_LEN_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_SFX_LEN_CACHE))
+        tmp.replace(SFX_LEN_PATH)
+        _SFX_LEN_DIRTY[0] = 0
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def sfx_seconds(path: Path) -> float:
@@ -20233,9 +20273,14 @@ def sfx_seconds(path: Path) -> float:
             secs = float(getattr(getattr(info, "info", None), "length", 0) or 0)
         except Exception:
             secs = 0.0
-    if len(_SFX_LEN_CACHE) > 4000:
+    if len(_SFX_LEN_CACHE) > 8000:
         _SFX_LEN_CACHE.clear()
     _SFX_LEN_CACHE[key] = secs
+    # #863: written back in batches — one decode saved is one fewer
+    # minute of a station with no stings after a restart.
+    _SFX_LEN_DIRTY[0] += 1
+    if _SFX_LEN_DIRTY[0] >= 50:
+        _sfx_len_save()
     return secs
 
 
@@ -21001,6 +21046,39 @@ def sfx_by_id(wanted: str) -> Path | None:
 
 # Samples voted off the air (#269). A ▼ on the chat row or a toggle in the
 # folder popup lands the id here, and the draw never picks it again.
+SFX_HISTORY_PATH = data_path("sfx_history.json")
+_SFX_HISTORY_LOCK = RLock()
+
+
+def sfx_history_add(path: Path, who: str = "") -> None:
+    """#862: remember that this sample aired. The operator asked to see
+    the rotation and rule on it; nothing was recording it."""
+    try:
+        with _SFX_HISTORY_LOCK:
+            try:
+                rows = json.loads(SFX_HISTORY_PATH.read_text())
+                rows = rows if isinstance(rows, list) else []
+            except Exception:  # noqa: BLE001
+                rows = []
+            rows.append({"ts": int(time.time()), "id": sfx_id(path),
+                         "name": path.name, "who": who[:24]})
+            del rows[:-2000]
+            SFX_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = SFX_HISTORY_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows))
+            tmp.replace(SFX_HISTORY_PATH)
+    except Exception:  # noqa: BLE001
+        pass                      # a ledger must never cost a sting
+
+
+def sfx_history_rows() -> list[dict[str, Any]]:
+    try:
+        rows = json.loads(SFX_HISTORY_PATH.read_text())
+        return rows if isinstance(rows, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
 SFX_BANS_PATH = data_path("sfx_bans.json")
 _SFX_BANS_LOCK = RLock()
 
@@ -21134,8 +21212,18 @@ async def _sfx_pool_refresh() -> None:
         def scan() -> list[Path]:
             return [p for p in sfx_all() if sfx_short(p)]
         pool = await asyncio.to_thread(scan)
+        was = len(_SFX_POOL_CACHE)
         _SFX_POOL_CACHE[:] = pool
         _SFX_POOL_AT[0] = time.time()
+        # #862: say the size out loud when it MOVES. A pool that
+        # collapses (an unmounted share) used to be invisible — the
+        # DJs simply kept hitting the same two local files.
+        if _SFX_LEN_DIRTY[0]:
+            await asyncio.to_thread(_sfx_len_save)      # #863
+        if len(pool) != was:
+            pipeline_log("air", f"the sample pool is {len(pool)} clips "
+                         f"(was {was}) across "
+                         f"{len(sfx_folders())} folder(s) (#862)")
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -21309,6 +21397,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     })
     del _RADIO["chat"][:-240]
     note_activity("sting", sample.stem)
+    # #862: write it down — the operator rules on the rotation from this.
+    sfx_history_add(sample, who)
     # The stings are part of the broadcast, so the episode recording keeps them
     # too (#560) — staged from the SFX store, which lives outside /media.
     _episode_stage(f"/sfx/{key}", f"[sfx] {sample.stem}", src_path=sample)
@@ -41426,6 +41516,36 @@ async def sfx_delete_api(
     return {"deleted": sid, "name": name}
 
 
+@app.get("/api/sfx/history")
+async def sfx_history_api(
+    limit: int = 200,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#862: what has actually aired, newest first, each with how often
+    it has come round, its weight and whether it is banned — the view
+    the operator judges the rotation from."""
+    require_read_auth(authorization)
+    rows = sfx_history_rows()
+    counts: dict[str, int] = {}
+    for r in rows:
+        sid = str(r.get("id") or "")
+        counts[sid] = counts.get(sid, 0) + 1
+    banned = sfx_bans()
+    weights = sfx_weights()
+    out = []
+    for r in reversed(rows[-max(1, min(1000, limit)):]):
+        sid = str(r.get("id") or "")
+        out.append({**r, "plays": counts.get(sid, 0),
+                    "weight": float(weights.get(sid, 1.0)),
+                    "banned": sid in banned,
+                    "url": f"/sfx/{sid}?t={media_sign(sid)}"})
+    pool = len(_SFX_POOL_CACHE)
+    return {"rows": out, "distinct": len(counts), "total": len(rows),
+            "pool": pool, "folders": [str(f) for f in sfx_folders()],
+            "note": ("the pool is still filling — it primes a few "
+                     "seconds after a restart" if not pool else "")}
+
+
 @app.get("/api/sfx/stats")
 async def sfx_stats_api(
     authorization: str | None = Header(default=None),
@@ -47540,7 +47660,12 @@ border-radius:4px;background:var(--panel2)"></canvas>
     </section>
 
     <section class="panel" style="margin-top:20px">
-      <h2>Pine Box FM · the DJ</h2>
+      <h2 style="display:flex;align-items:center;gap:8px">
+        Pine Box FM · the DJ
+        <button id="boothOpenBtn" onclick="djBoothReopen()"
+                title="Open the In the booth window — every line as it airs, with play and download on each"
+                style="margin-left:auto;font-size:15px;padding:2px 10px">🎙</button>
+      </h2>
       <p style="margin:0 0 8px;color:#9ba6b7;font-size:13px">
         Who is on air, what they say, and how much they say it. Phrases accept
         <code>{station}</code>, <code>{title}</code>, <code>{artist}</code> and
@@ -54297,6 +54422,24 @@ function djTalkClose(manual) {
   if (box) box.remove();
   boothGlassStop();                    // #668: nothing to draw on
   if (manual) djTalkPinned = true;     // do not reopen until the next session
+}
+
+/* #858: the way back in. djTalkClose(manual) sets djTalkPinned so the
+ * window stays shut for the session — which left no way to reopen it.
+ * This clears the pin, builds the window and fills it with whatever is
+ * already in hand rather than waiting for the next line. */
+function djBoothReopen() {
+  djTalkPinned = false;
+  const box = djTalkPopup();
+  try {
+    if (typeof djTalkPaint === "function") djTalkPaint();
+    else if (typeof djRenderTalk === "function") djRenderTalk(djLastState);
+  } catch (e) { /* it fills on the next poll regardless */ }
+  if (box && box.scrollIntoView) {
+    try { box.scrollIntoView({block: "nearest"}); } catch (e) {}
+  }
+  setStatus("the booth is open");
+  return box;
 }
 
 function djTalkPopup() {

@@ -1612,6 +1612,164 @@ initTriagePopup();
  * command the agent runs), click for the live 8-line terminal with
  * click-to-expand detail. Right: the go-live switch and a marquee of the
  * Spark's vitals and heaviest tenants. */
+/* #859: CALL THE BOOTH. Hold the ☎, talk, let go and you are on air.
+ * The station already has the road — POST raw 16-bit mono PCM to
+ * /api/dj/callin/voice and it transcribes, spots a song request, or
+ * hands the pair a topic to take on air. All this end has to do is
+ * capture the mic honestly and resample to what the recogniser wants. */
+const CALLIN_RATE = 16000;
+let callInState = null;
+
+function callInSay(text, bad) {
+  const note = $("callInNote");
+  if (note) {
+    note.textContent = text;
+    note.style.color = bad ? "#ff9db1" : "#7ce8a9";
+  }
+  try { setStatus(text, !!bad); } catch (e) { /* rail-only */ }
+}
+
+function callInPanel() {
+  let box = $("callInPanel");
+  if (box) return box;
+  box = document.createElement("div");
+  box.id = "callInPanel";
+  box.style.cssText = "position:fixed;left:52px;bottom:64px;z-index:120;"
+    + "width:min(340px,86vw);background:var(--panel,#141b24);"
+    + "border:1px solid #2a5c3f;border-radius:10px;padding:12px;"
+    + "box-shadow:0 14px 44px rgba(0,20,8,.8);font-size:12.5px;"
+    + "display:flex;flex-direction:column;gap:8px";
+  box.innerHTML = "<b>\u260e Call the booth</b>"
+    + "<div class='muted' style='font-size:11px'>Hold the button, say "
+    + "your piece, let go. You can raise a topic or just ask for a "
+    + "song \u2014 they take both.</div>"
+    + "<button id='callInHold' style='padding:10px;font-weight:700'>"
+    + "\ud83c\udf99 Hold to talk</button>"
+    + "<div id='callInNote' class='muted' style='font-size:11px'></div>"
+    + "<div id='callInHeard' style='font-size:11.5px;line-height:1.5'></div>";
+  const shut = document.createElement("button");
+  shut.textContent = "\u2715";
+  shut.style.cssText = "position:absolute;top:8px;right:10px";
+  shut.onclick = () => { callInStop(true); box.remove(); };
+  box.appendChild(shut);
+  document.body.appendChild(box);
+
+  const hold = box.querySelector("#callInHold");
+  hold.onmousedown = callInStart;
+  hold.onmouseup = () => callInStop(false);
+  hold.onmouseleave = () => { if (callInState) callInStop(false); };
+  hold.ontouchstart = (ev) => { ev.preventDefault(); callInStart(); };
+  hold.ontouchend = (ev) => { ev.preventDefault(); callInStop(false); };
+  return box;
+}
+
+async function callInStart() {
+  if (callInState) return;
+  const hold = $("callInHold");
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: {channelCount: 1, echoCancellation: true,
+              noiseSuppression: true}});
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    const ctx = new Ctx();
+    const source = ctx.createMediaStreamSource(stream);
+    // ScriptProcessor is deprecated but it is the one node available in
+    // every Electron build without shipping a worklet file alongside.
+    const node = ctx.createScriptProcessor(4096, 1, 1);
+    const chunks = [];
+    node.onaudioprocess = (ev) => {
+      chunks.push(new Float32Array(ev.inputBuffer.getChannelData(0)));
+    };
+    source.connect(node);
+    node.connect(ctx.destination);
+    callInState = {stream, ctx, source, node, chunks};
+    if (hold) { hold.textContent = "\u25cf recording\u2026 let go to send"; }
+    callInSay("listening \u2014 the booth is waiting");
+  } catch (err) {
+    callInSay("no microphone: " + err.message, true);
+  }
+}
+
+function callInFloatsTo16k(chunks, fromRate) {
+  let total = 0;
+  chunks.forEach((c) => { total += c.length; });
+  const flat = new Float32Array(total);
+  let at = 0;
+  chunks.forEach((c) => { flat.set(c, at); at += c.length; });
+  // Linear resample to what the recogniser wants, then 16-bit signed.
+  const ratio = fromRate / CALLIN_RATE;
+  const out = new Int16Array(Math.floor(flat.length / ratio));
+  for (let i = 0; i < out.length; i++) {
+    const src = i * ratio;
+    const lo = Math.floor(src);
+    const hi = Math.min(flat.length - 1, lo + 1);
+    const v = flat[lo] + (flat[hi] - flat[lo]) * (src - lo);
+    out[i] = Math.max(-1, Math.min(1, v)) * 0x7fff;
+  }
+  return out;
+}
+
+async function callInStop(silent) {
+  const state = callInState;
+  callInState = null;
+  const hold = $("callInHold");
+  if (hold) hold.textContent = "\ud83c\udf99 Hold to talk";
+  if (!state) return;
+  try {
+    state.node.disconnect();
+    state.source.disconnect();
+    state.stream.getTracks().forEach((t) => t.stop());
+  } catch (e) { /* already torn down */ }
+  const rate = state.ctx.sampleRate || 48000;
+  try { await state.ctx.close(); } catch (e) { /* fine */ }
+  if (silent) return;
+  const pcm = callInFloatsTo16k(state.chunks, rate);
+  if (pcm.length < 1600) {          // under a tenth of a second
+    callInSay("that was too short \u2014 hold it a moment longer", true);
+    return;
+  }
+  callInSay("on the line\u2026 they are listening back");
+  try {
+    const cfg = await api.readConfig();
+    const reply = await fetch(
+      `${cfg.baseUrl}/api/dj/callin/voice?rate=${CALLIN_RATE}`,
+      {method: "POST",
+       headers: {"Authorization": "Bearer " + (cfg.apiKey || ""),
+                 "Content-Type": "application/octet-stream"},
+       body: pcm.buffer});
+    const got = await reply.json().catch(() => ({}));
+    if (!reply.ok) throw new Error(got.detail || ("HTTP " + reply.status));
+    const heard = $("callInHeard");
+    if (got.heard) {
+      callInSay(got.kind === "request"
+        ? "they took your request" : "you are on air");
+      if (heard) {
+        heard.innerHTML = "<div style='color:#9fd8ff'>you said: "
+          + String(got.heard).replace(/[&<>]/g, "") + "</div>"
+          + (got.lines || []).map((l) =>
+              "<div style='margin-top:4px'>\u2014 "
+              + String(l).replace(/[&<>]/g, "") + "</div>").join("");
+      }
+    } else {
+      callInSay(got.detail || "nothing came through \u2014 try again",
+                true);
+    }
+  } catch (err) {
+    callInSay("the booth did not pick up: " + err.message, true);
+  }
+}
+
+function initCallIn() {
+  const btn = $("callInBtn");
+  if (!btn) return;
+  btn.addEventListener("click", () => {
+    const box = $("callInPanel");
+    if (box) { callInStop(true); box.remove(); return; }
+    callInPanel();
+  });
+}
+initCallIn();
+
 function initStatusBar() {
   const line = $("sbTermLine");
   const pop = $("sbTermPopup");
