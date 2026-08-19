@@ -15831,6 +15831,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
+    _RADIO_TASK.append(asyncio.create_task(storage_keeper()))   # #836
     _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
     _RADIO_TASK.append(asyncio.create_task(pantry_keeper()))        # #886
     _RADIO_TASK.append(asyncio.create_task(tape_watch()))
@@ -47190,6 +47191,790 @@ async def pine_list(
     return {"requests": pine_read()}
 
 
+# --- #836: THE STORE ROOM --------------------------------------------------
+# "show a pop-up window that shows all of the areas that's being saved with
+#  files from the radio station ... look at every section that we're saving
+#  data to in depth that we're streaming audio and saving MP3s of ... and I
+#  want sliders at the top that lets me specify the maximum amount of memory
+#  that's able to be allocated to an area."
+#
+# Thirty-odd folders under data/ hold everything the station has ever made
+# and only two of them (the clip store and the cut tray) ever pruned
+# themselves. Nothing counted the rest, so "the disk is full" was the first
+# anybody heard about it. This is the register: every area named, measured,
+# examinable, and given a ceiling you set with a slider.
+#
+# Everything here is DELIBERATELY timid, because the one thing worse than a
+# full disk is a station that ate its own archive:
+#   * nothing is deleted without an explicit request body — there is no
+#     "purge everything" shape and an empty body is an error, not a sweep;
+#   * clips still waiting to play out of the box are never touched. The
+#     guards are the two the station already trusts: _protected_media_keys()
+#     (the hold shelf plus the pantry, #467/#886) and _staging_live() (the
+#     episode still recording, #774);
+#   * the bulk modes refuse anything written in the last STORAGE_FLOOR
+#     seconds — a clip rendered thirty seconds ago is probably on its way to
+#     the speaker right now;
+#   * the knowledge areas (the voice library, the corpora, the operator's own
+#     documents, the browser vendor libs) refuse to be purged at all;
+#   * every area ships with NO cap, so the keeper cannot delete a single
+#     byte until a slider has actually been moved.
+#
+# The walk itself is os.scandir only — no Path.glob, no stat() we have not
+# already got off the dirent — and it runs in a thread and is cached, because
+# several of these folders live on a CIFS share where a stat costs
+# milliseconds and the panel must never block on one.
+
+STORAGE_CAPS_PATH = data_path("storage_caps.json")
+STORAGE_CAPS_LOCK = RLock()
+STORAGE_TTL = 30.0              # the walk is dear over CIFS; hold the answer
+STORAGE_SWEEP = 300.0           # how often the keeper enforces the ceilings
+STORAGE_CAP_MAX = 20.0          # the top of every slider, in GB
+STORAGE_FLOOR = 300.0           # never bulk-delete anything younger than this
+STORAGE_WALK_MAX = 80_000       # one area's walk is bounded, not endless
+STORAGE_GB = float(1 << 30)
+_STORAGE_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+_STORAGE_GATE = asyncio.Lock()  # one walk at a time, not one per browser tab
+_STORAGE_SWEPT: list[dict[str, Any]] = []       # what the keeper last cycled
+
+STORAGE_TEXT = {".md", ".txt", ".json", ".jsonl", ".csv", ".log", ".srt",
+                ".vtt", ".py", ".yaml", ".yml"}
+STORAGE_AUDIO = {".mp3", ".wav", ".m4a", ".flac", ".ogg", ".opus", ".aac"}
+STORAGE_IMAGE = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+_STORAGE_MIME = {
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+    ".flac": "audio/flac", ".ogg": "audio/ogg", ".opus": "audio/opus",
+    ".aac": "audio/aac", ".mp4": "video/mp4", ".webm": "video/webm",
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+    ".webp": "image/webp", ".gif": "image/gif", ".pdf": "application/pdf",
+    ".zip": "application/zip",
+}
+
+# key / group / label / where it lives / whether it may be cycled / what it
+# holds. `dir` is a GLOBAL NAME resolved at call time, never an import-time
+# reference: this file is long and these constants are scattered through it,
+# and an area whose folder has been renamed away should quietly vanish from
+# the register rather than take the whole panel down with it.
+_STORAGE_REGISTRY: tuple[dict[str, Any], ...] = (
+    # --- what went out ----------------------------------------------------
+    {"key": "episodes", "group": "Broadcast", "dir": "RADIO_CACHE",
+     "sub": "episodes", "purge": True,
+     "label": "Saved broadcasts \u2014 the talk",
+     "holds": "Every sealed ~15-minute episode as an mp3, with its .md "
+              "transcript beside it. The offline replay shelf."},
+    {"key": "broadcasts", "group": "Broadcast", "dir": "BROADCASTS_DIR",
+     "purge": True, "label": "Saved broadcasts \u2014 the full mix",
+     "holds": "The show as it SOUNDED: records mixed back in and ducked "
+              "under the voices, one per sealed episode, transcript beside "
+              "it. This is the backup shelf that grows fastest."},
+    {"key": "calls", "group": "Broadcast", "dir": "RADIO_CACHE",
+     "sub": "calls", "purge": True, "label": "Caller recordings",
+     "holds": "Every call that went to air, kept whole."},
+    {"key": "cuts", "group": "Broadcast", "dir": "CUTS_DIR", "purge": True,
+     "label": "The cut tray",
+     "holds": "Clips you cut off the tail of the broadcast to send "
+              "somewhere. Self-trimming to the newest 40, but they are "
+              "full-length mp3s."},
+    {"key": "staging", "group": "Broadcast", "dir": "_EPISODE_STAGE",
+     "purge": True, "label": "Episode staging",
+     "holds": "The clips of the episode being recorded RIGHT NOW, waiting "
+              "to be sealed. Anything belonging to the live episode is "
+              "protected from every purge."},
+    {"key": "radio_scratch", "group": "Broadcast", "dir": "RADIO_CACHE",
+     "purge": True, "deep": True,
+     "skip": ("episodes", "broadcasts", "calls", "cuts", "_staging",
+              "_spec"),
+     "label": "Broadcast workshop scratch",
+     "holds": "The mixdown workshop: half-built compiles, export zips and "
+              "the _bmix working folders every full mix is assembled in. "
+              "All rebuildable \u2014 nothing in here is a master."},
+    {"key": "cache_spectrograms", "group": "Broadcast", "dir": "RADIO_CACHE",
+     "sub": "_spec", "purge": True, "label": "Broadcast waveform pictures",
+     "holds": "Cached spectrograms of the shelved audio. Redrawn on demand "
+              "if they go."},
+    # --- voices -----------------------------------------------------------
+    {"key": "voice_clips", "group": "Voice", "dir": "VOICE_MEDIA_DIR",
+     "purge": True, "label": "Rendered voice clips",
+     "holds": "Every line the pair have spoken, as rendered audio \u2014 the "
+              "store the whole show plays out of. Already rolls itself, but "
+              "a ceiling here is the one that decides how deep the "
+              "backlog goes."},
+    {"key": "clip_spectrograms", "group": "Voice", "dir": "SPEC_CACHE",
+     "purge": True, "label": "Clip waveform pictures",
+     "holds": "One spectrogram png per clip, so the backlog shows the shape "
+              "of the audio without playing it. Redrawn on demand."},
+    {"key": "tape_cache", "group": "Voice", "dir": "TAPE_CACHE",
+     "purge": True, "label": "Mixtape transcodes",
+     "holds": "Loudness-normalized copies of the MX tapes, made so every "
+              "output plays them in full. Rebuilt from the tape itself."},
+    {"key": "ads_audio", "group": "Voice", "dir": "PRODUCED_ADS_DIR",
+     "purge": True, "label": "Ads \u2014 produced spots",
+     "holds": "Every advert the station has produced, as finished audio. "
+              "The area #836 named: \"our ads from exceeding hypothetically "
+              "three gigabytes\"."},
+    {"key": "upstairs_audio", "group": "Voice", "dir": "UPSTAIRS_AUDIO_DIR",
+     "purge": True, "label": "Spoken spots \u2014 the manager upstairs",
+     "holds": "The bullhorn pages from upstairs, rendered and kept. The "
+              "other area #836 named: \"our spoken spots exceeding, say two "
+              "gigabytes\"."},
+    {"key": "voice_library", "group": "Voice", "dir": "VOICES_DIR",
+     "deep": True, "purge": False, "label": "The voice library",
+     "why_kept": "Cloned voices, their reference wavs and their transcripts "
+                 "\u2014 hours of work per voice and unrecoverable. Delete "
+                 "one from the voice panel, which knows what else to unpick.",
+     "holds": "One folder per cloned voice: reference audio, transcript.md, "
+              "transcript.json and the source mp3."},
+    {"key": "voice_characters", "group": "Voice", "dir": "CHARACTER_DIR",
+     "purge": False, "label": "Voice characters",
+     "why_kept": "The character sheets the Voice Director performs from.",
+     "holds": "Per-voice character definitions."},
+    # --- sound ------------------------------------------------------------
+    {"key": "sfx_made", "group": "Sound", "dir": "SFX_MADE_DIR",
+     "purge": True, "label": "Generated SFX",
+     "holds": "Stings and effects the station synthesised for itself."},
+    {"key": "samples", "group": "Sound", "dir": "SFX_LOCAL_ROOT",
+     "deep": True, "purge": True, "label": "Sample packs (local)",
+     "holds": "Samples approved into rotation and kept on this box."},
+    {"key": "sample_cache", "group": "Sound", "dir": "SAMPLE_CACHE_DIR",
+     "purge": True, "label": "Sample transcode cache",
+     "holds": "Playable copies of samples that needed converting. Rebuilt "
+              "on demand."},
+    {"key": "sfx_specs", "group": "Sound", "dir": "SFX_SPEC_DIR",
+     "purge": True, "label": "SFX spec sheets",
+     "holds": "The JSON recipes behind the generated effects."},
+    {"key": "sfxguy_quips", "group": "Sound", "dir": "SFXGUY_QUIPS_DIR",
+     "purge": True, "label": "The SFX Guy's quip books",
+     "holds": "One quip database per voice."},
+    {"key": "mixtapes", "group": "Sound", "dir": "@mixtapes", "purge": False,
+     "label": "MX mixtapes (the share)",
+     "why_kept": "This folder lives on the sample share, not in the "
+                 "station's data \u2014 it is somebody else's disk. Measured "
+                 "so you can see it; never touched from here.",
+     "holds": "The tapes that arrive in the mail from Ehm Eckx and go "
+              "straight on the air."},
+    # --- pictures ---------------------------------------------------------
+    {"key": "gallery", "group": "Pictures", "dir": "_COMFY_OUTPUT_DIR",
+     "deep": True, "purge": True, "label": "The gallery \u2014 generated art",
+     "holds": "Every painting and video the box has rendered: what the pair "
+              "hawk on air and what the panel's gallery shows."},
+    {"key": "album_art", "group": "Pictures", "dir": "ART_DIR",
+     "purge": True, "label": "Album art cache",
+     "holds": "Sleeves pulled out of the music files and off the web, "
+              "cached so a thumbnail is not a CIFS round trip."},
+    {"key": "pine_uploads", "group": "Pictures", "dir": "PINE_UPLOADS_DIR",
+     "purge": True, "label": "Inbox uploads",
+     "holds": "Screenshots and pictures pasted into the Pine Box inbox."},
+    # --- documents and corpora -------------------------------------------
+    {"key": "speakbox", "group": "Knowledge", "dir": "SPEAKBOX_DIR",
+     "deep": True, "purge": False, "label": "Speakerbox documents",
+     "why_kept": "Your documents, not the station's output.",
+     "holds": "Everything the Speakerbox reads from."},
+    {"key": "minds", "group": "Knowledge", "dir": "MINDS_DIR",
+     "purge": False, "label": "Minds",
+     "why_kept": "Working memory the show is written out of.",
+     "holds": "Per-mind state."},
+    {"key": "decisions", "group": "Knowledge", "dir": "DECISIONS_DIR",
+     "purge": False, "label": "Decisions",
+     "why_kept": "The record of what the station chose and why.",
+     "holds": "One record per decision, plus its vectors."},
+    {"key": "crystals", "group": "Knowledge", "dir": "CRYSTALS_DIR",
+     "purge": False, "label": "Song data crystals",
+     "why_kept": "Built by SongSight on another machine and rsynced in \u2014 "
+                 "deleting them here does not rebuild them here.",
+     "holds": "One distilled JSON per analysed song."},
+    {"key": "gear_manuals", "group": "Knowledge", "dir": "TE_DIR",
+     "deep": True, "purge": False, "label": "Gear manuals corpus",
+     "why_kept": "A corpus, not an output.",
+     "holds": "The manuals the station answers gear questions from."},
+    {"key": "lyrics", "group": "Knowledge", "dir": "LYRICS_DIR",
+     "purge": False, "label": "Lyrics",
+     "why_kept": "Fetched once and leaned on constantly.",
+     "holds": "Per-track lyrics."},
+    {"key": "cheats", "group": "Knowledge", "dir": "CHEATS_DIR",
+     "purge": False, "label": "Cheat sheets",
+     "why_kept": "Hand-written prompt furniture.",
+     "holds": "The cheat sheets the writer is given."},
+    # --- housekeeping -----------------------------------------------------
+    {"key": "export_kits", "group": "Housekeeping", "dir": "KIT_DIR",
+     "deep": True, "purge": True, "label": "Export kits",
+     "holds": "Zips and bundles built for taking away. Rebuildable."},
+    {"key": "ledgers", "group": "Housekeeping", "dir": "DATA_DIR",
+     "purge": False, "label": "Ledgers and settings",
+     "why_kept": "The station's memory \u2014 settings, the played log, the "
+                 "voice ledger, the request book. Small, and losing one "
+                 "loses history nothing can rebuild.",
+     "holds": "Every loose .json/.jsonl at the top of data/."},
+    {"key": "vendor", "group": "Housekeeping", "dir": "VENDOR_DIR",
+     "deep": True, "purge": False, "label": "Browser libraries",
+     "why_kept": "The panel loads these from disk so it never needs a CDN. "
+                 "Delete them and this page stops working.",
+     "holds": "three.js and friends, served locally."},
+)
+
+
+def _storage_areas() -> list[dict[str, Any]]:
+    """The register, resolved at CALL time.
+
+    The mixtape shelf is a SETTING and can move while we run; the rest are
+    module constants looked up by name so a renamed folder drops one row
+    instead of raising NameError under the panel."""
+    out: list[dict[str, Any]] = []
+    for spec in _STORAGE_REGISTRY:
+        try:
+            if spec["dir"] == "@mixtapes":
+                root = mixtape_folder()
+            else:
+                root = globals().get(spec["dir"])
+            if not isinstance(root, Path):
+                continue
+            row = dict(spec)
+            row["path"] = (root / spec["sub"]) if spec.get("sub") else root
+            out.append(row)
+        except Exception:  # noqa: BLE001
+            continue                       # a missing folder is not a crash
+    return out
+
+
+def _storage_area(key: str) -> dict[str, Any] | None:
+    for area in _storage_areas():
+        if area["key"] == key:
+            return area
+    return None
+
+
+def storage_sign(area: str, name: str) -> str:
+    """Sign the AREA and the name together. Two areas can hold a file of the
+    same name, and a signature that ignored the area would open both."""
+    return media_sign(f"storage/{area}/{name}")
+
+
+def _storage_walk(root: Path, deep: bool,
+                  skip: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Count one area with os.scandir and nothing else.
+
+    Iterative, so a deep tree cannot blow the stack; bounded by
+    STORAGE_WALK_MAX, so a sample pack with 23,000 wavs in it cannot hang
+    the popup; and it takes st_size/st_mtime off the dirent the directory
+    read already paid for."""
+    files = 0
+    total = 0
+    newest = 0.0
+    oldest = 0.0
+    truncated = False
+    stack = [str(root)]
+    while stack:
+        here = stack.pop()
+        try:
+            with os.scandir(here) as scan:
+                for entry in scan:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            if deep and entry.name not in skip:
+                                stack.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    files += 1
+                    total += int(info.st_size)
+                    when = float(info.st_mtime)
+                    if when > newest:
+                        newest = when
+                    if not oldest or when < oldest:
+                        oldest = when
+                    if files >= STORAGE_WALK_MAX:
+                        truncated = True
+                        stack.clear()
+                        break
+        except OSError:
+            continue                       # unreadable folder, not a failure
+    return {"files": files, "bytes": total, "newest": int(newest),
+            "oldest": int(oldest), "truncated": truncated}
+
+
+def _storage_list(area: dict[str, Any]) -> list[tuple[float, str, int]]:
+    """(mtime, relative name, bytes) for everything in one area, newest
+    first. Deliberately cheap: no signing, no mime work, no Path objects —
+    the page of forty rows the panel actually shows gets decorated later."""
+    root = area["path"]
+    skip = tuple(area.get("skip") or ())
+    found: list[tuple[float, str, int]] = []
+    stack = [(str(root), "")]
+    while stack:
+        here, rel = stack.pop()
+        try:
+            with os.scandir(here) as scan:
+                for entry in scan:
+                    try:
+                        name = (rel + "/" + entry.name) if rel else entry.name
+                        if entry.is_dir(follow_symlinks=False):
+                            if area.get("deep") and entry.name not in skip:
+                                stack.append((entry.path, name))
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    found.append((float(info.st_mtime), name,
+                                  int(info.st_size)))
+                    if len(found) >= STORAGE_WALK_MAX:
+                        stack.clear()
+                        break
+        except OSError:
+            continue
+    found.sort(key=lambda row: row[0], reverse=True)
+    return found
+
+
+def _storage_protected(key: str) -> set[str]:
+    """File names inside an area that must NEVER be deleted (#836).
+
+    No new policy invented here — it reuses the two guards the station
+    already trusts. If the guard itself throws we return the wildcard, which
+    protects EVERYTHING: the safe failure of a protection check is refusing
+    to delete, never assuming there was nothing to protect."""
+    try:
+        if key == "voice_clips":
+            return set(_protected_media_keys())
+        if key == "staging":
+            return {str(path).replace("\\", "/").rsplit("/", 1)[-1]
+                    for path in _staging_live() if path}
+    except Exception:  # noqa: BLE001
+        return {"*"}
+    return set()
+
+
+def _storage_resolve(area: dict[str, Any], name: str) -> Path | None:
+    """A name out of a listing back to a real file, refusing anything that
+    tries to leave the area."""
+    raw = str(name or "").replace("\\", "/").strip("/")
+    if not raw or len(raw) > 400 or ".." in raw.split("/"):
+        return None
+    root = area["path"]
+    path = root / raw
+    try:
+        if not path.is_file():
+            return None
+        home = os.path.realpath(str(root))
+        full = os.path.realpath(str(path))
+    except OSError:
+        return None
+    if full != home and not full.startswith(home + os.sep):
+        return None                        # a symlink pointing out of the tree
+    return path
+
+
+def _storage_kind(name: str) -> str:
+    ext = ("." + name.rsplit(".", 1)[-1].lower()) if "." in name else ""
+    if ext in STORAGE_AUDIO:
+        return "audio"
+    if ext in STORAGE_IMAGE:
+        return "image"
+    if ext in STORAGE_TEXT:
+        return "text"
+    return "file"
+
+
+def _storage_rows(area: dict[str, Any], limit: int,
+                  offset: int) -> dict[str, Any]:
+    """One page of an area, newest first, every row carrying a signed URL so
+    a plain <audio> or a save link works from any machine on the LAN."""
+    found = _storage_list(area)
+    protected = _storage_protected(area["key"])
+    everything = "*" in protected
+    rows: list[dict[str, Any]] = []
+    for when, name, size in found[offset:offset + limit]:
+        rows.append({
+            "name": name,
+            "bytes": size,
+            "when": int(when),
+            "kind": _storage_kind(name),
+            "protected": bool(everything
+                              or name.rsplit("/", 1)[-1] in protected),
+            "url": ("/api/storage/" + quote(area["key"]) + "/file?name="
+                    + quote(name) + "&t=" + storage_sign(area["key"], name)),
+        })
+    return {"area": area["key"], "label": area["label"],
+            "path": str(area["path"]), "count": len(found),
+            "offset": offset, "limit": limit, "shown": len(rows),
+            "files": rows, "purgeable": bool(area.get("purge"))}
+
+
+def storage_caps() -> dict[str, float]:
+    """The per-area ceilings, in GB. 0 (and missing) mean NO ceiling — which
+    is what every area ships with, so the keeper cannot delete anything at
+    all until a slider has actually been moved."""
+    with STORAGE_CAPS_LOCK:
+        try:
+            raw = json.loads(STORAGE_CAPS_PATH.read_text())
+        except Exception:  # noqa: BLE001
+            return {}
+    caps: dict[str, float] = {}
+    rows = raw.get("caps") if isinstance(raw, dict) else None
+    if not isinstance(rows, dict):
+        rows = raw if isinstance(raw, dict) else {}
+    for key, gb in rows.items():
+        try:
+            value = max(0.0, min(STORAGE_CAP_MAX, float(gb)))
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            caps[str(key)] = value
+    return caps
+
+
+def storage_caps_save(area: str, gb: float) -> dict[str, float]:
+    """Same .tmp-then-replace as every other setting in this file. A torn
+    write here is a torn ceiling, and a torn ceiling deletes things."""
+    with STORAGE_CAPS_LOCK:
+        caps = storage_caps()
+        try:
+            value = max(0.0, min(STORAGE_CAP_MAX, float(gb)))
+        except (TypeError, ValueError):
+            value = 0.0
+        if value <= 0:
+            caps.pop(area, None)           # a slider back at zero is "no cap"
+        else:
+            caps[area] = round(value, 2)
+        try:
+            STORAGE_CAPS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = STORAGE_CAPS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"caps": caps}, indent=2) + "\n")
+            tmp.replace(STORAGE_CAPS_PATH)
+        except OSError:
+            pass                           # the ceiling holds until a restart
+        return caps
+
+
+def _storage_scan() -> dict[str, Any]:
+    """Every area measured, once. Runs in a thread — see storage_report."""
+    caps = storage_caps()
+    rows: list[dict[str, Any]] = []
+    total = 0
+    for area in _storage_areas():
+        try:
+            walked = _storage_walk(area["path"], bool(area.get("deep")),
+                                   tuple(area.get("skip") or ()))
+        except Exception:  # noqa: BLE001
+            walked = {"files": 0, "bytes": 0, "newest": 0, "oldest": 0,
+                      "truncated": False}
+        cap = float(caps.get(area["key"]) or 0)
+        row = {
+            "key": area["key"], "label": area["label"],
+            "group": area.get("group") or "Other",
+            "path": str(area["path"]), "holds": area.get("holds") or "",
+            "purgeable": bool(area.get("purge")),
+            "why_kept": area.get("why_kept") or "",
+            "cap_gb": round(cap, 2), "cap_bytes": int(cap * STORAGE_GB),
+            "over_bytes": (max(0, walked["bytes"] - int(cap * STORAGE_GB))
+                           if cap > 0 else 0),
+        }
+        row.update(walked)
+        rows.append(row)
+        total += walked["bytes"]
+    try:
+        held = len(_protected_media_keys())
+    except Exception:  # noqa: BLE001
+        held = 0
+    return {"areas": rows, "bytes": total, "at": int(time.time()),
+            "max_gb": STORAGE_CAP_MAX, "sweep_seconds": int(STORAGE_SWEEP),
+            "floor_seconds": int(STORAGE_FLOOR),
+            "protected_clips": held, "pantry_clips": len(_PANTRY),
+            "swept": list(_STORAGE_SWEPT[:8])}
+
+
+async def storage_report(refresh: bool = False) -> dict[str, Any]:
+    """The measured register, cached for STORAGE_TTL.
+
+    The gate matters as much as the cache: four browser tabs polling this
+    used to mean four simultaneous walks of a CIFS share."""
+    have = _STORAGE_CACHE.get("value")
+    if have and not refresh \
+            and time.time() - float(_STORAGE_CACHE["at"]) < STORAGE_TTL:
+        return have
+    async with _STORAGE_GATE:
+        have = _STORAGE_CACHE.get("value")
+        if have and not refresh \
+                and time.time() - float(_STORAGE_CACHE["at"]) < STORAGE_TTL:
+            return have
+        got = await asyncio.to_thread(_storage_scan)
+        _STORAGE_CACHE.update({"at": time.time(), "value": got})
+        return got
+
+
+def _storage_purge(area: dict[str, Any], older_than_days: float | None,
+                   keep_bytes: int | None,
+                   names: list[str] | None) -> dict[str, Any]:
+    """Delete, conservatively, in exactly one of three shapes.
+
+    The protected set is consulted for every single file whichever shape was
+    asked for. The two BULK shapes additionally refuse anything younger than
+    STORAGE_FLOOR: a clip written a minute ago has not aired yet even if
+    nothing has claimed it. An explicit `names` list skips the age floor —
+    you named that file after looking at it — but never skips protection."""
+    if not area.get("purge"):
+        return {"deleted": [], "freed": 0, "kept_protected": 0,
+                "refused": area.get("why_kept") or "this area is kept"}
+    protected = _storage_protected(area["key"])
+    everything = "*" in protected
+    now = time.time()
+    found = _storage_list(area)            # newest first
+    doomed: list[tuple[float, str, int]] = []
+    if names:
+        want = {str(x).replace("\\", "/").strip("/") for x in names}
+        doomed = [row for row in found if row[1] in want]
+    elif older_than_days is not None:
+        edge = now - float(older_than_days) * 86400.0
+        doomed = [row for row in found
+                  if row[0] < edge and now - row[0] > STORAGE_FLOOR]
+    elif keep_bytes is not None:
+        budget = max(0, int(keep_bytes))
+        kept = 0
+        for row in found:
+            name = row[1].rsplit("/", 1)[-1]
+            young = (now - row[0]) <= STORAGE_FLOOR
+            if everything or name in protected or young \
+                    or kept + row[2] <= budget:
+                kept += row[2]             # protected bytes count against it
+                continue
+            doomed.append(row)             # oldest-out, past the budget only
+    deleted: list[str] = []
+    freed = 0
+    held = 0
+    for _when, name, size in doomed:
+        if everything or name.rsplit("/", 1)[-1] in protected:
+            held += 1
+            continue                       # queued to air — never
+        path = _storage_resolve(area, name)
+        if path is None:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            continue                       # gone already, or in use
+        deleted.append(name)
+        freed += size
+    return {"deleted": deleted[:400], "count": len(deleted), "freed": freed,
+            "kept_protected": held, "area": area["key"],
+            "label": area["label"]}
+
+
+def _storage_enforce() -> list[dict[str, Any]]:
+    """Bring every CAPPED area back under its ceiling, oldest first. An area
+    with no cap set is not looked at."""
+    caps = storage_caps()
+    did: list[dict[str, Any]] = []
+    for area in _storage_areas():
+        cap = float(caps.get(area["key"]) or 0)
+        if cap <= 0 or not area.get("purge"):
+            continue
+        try:
+            got = _storage_purge(area, None, int(cap * STORAGE_GB), None)
+        except Exception:  # noqa: BLE001
+            continue                       # one bad area is not a bad sweep
+        if got.get("deleted"):
+            did.append({"area": area["key"], "label": area["label"],
+                        "files": got["count"], "freed": got["freed"],
+                        "at": int(time.time())})
+    return did
+
+
+async def storage_keeper() -> None:
+    """#836: the ceilings mean something.
+
+    Every STORAGE_SWEEP the areas with a slider set are trimmed oldest-first
+    back under it, skipping anything protected, anything belonging to the
+    live episode, and anything written in the last few minutes. Areas with
+    no cap — which is all of them until you move a slider — are never
+    touched. Started beside larder_keeper() so it lives and dies with the
+    show, which is the only time any of these folders grow."""
+    while _RADIO.get("on"):
+        await asyncio.sleep(STORAGE_SWEEP)
+        try:
+            did = await asyncio.to_thread(_storage_enforce)
+        except Exception:  # noqa: BLE001
+            continue                       # the sweep comes round again
+        for row in did:
+            _STORAGE_SWEPT.insert(0, row)
+            pipeline_log(
+                "air",
+                f"store room: {row['files']} file(s) cycled out of "
+                f"{row['label']} \u2014 {row['freed'] // (1 << 20)} MB "
+                "freed under its ceiling (#836)")
+        del _STORAGE_SWEPT[24:]
+        if did:
+            _STORAGE_CACHE.update({"at": 0.0, "value": None})
+
+
+@app.get("/api/storage")
+async def storage_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Every area the station saves into: label, path, file count, total
+    bytes, newest/oldest mtime and its configured cap (#836).
+
+    Cached for 30 seconds because the walk crosses CIFS; ?refresh=1 pays for
+    a fresh one."""
+    require_read_auth(authorization)
+    fresh = str(request.query_params.get("refresh") or "").lower() in (
+        "1", "true", "yes", "on")
+    return await storage_report(fresh)
+
+
+@app.get("/api/storage/{area}/files")
+async def storage_files_api(
+    area: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """One page of one area, newest first, with a play/save URL per row."""
+    require_read_auth(authorization)
+    row = _storage_area(area)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such area")
+    try:
+        limit = max(1, min(400, int(request.query_params.get("limit") or 40)))
+    except (TypeError, ValueError):
+        limit = 40
+    try:
+        offset = max(0, int(request.query_params.get("offset") or 0))
+    except (TypeError, ValueError):
+        offset = 0
+    return await asyncio.to_thread(_storage_rows, row, limit, offset)
+
+
+@app.get("/api/storage/{area}/file")
+async def storage_file_api(
+    area: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """One file out of one area — play it, read it, or save it.
+
+    Signed like /media so an <audio> tag, which sends no headers at all,
+    still plays from any machine on the network. Transcripts come back as
+    text so the panel can show them in place: "review the transcripts of
+    them" is half of what #836 asked for."""
+    name = str(request.query_params.get("name") or "")
+    signature = str(request.query_params.get("t") or "")
+    expected = storage_sign(area, name)
+    if not (SPARK_AGENT_API_KEY and expected
+            and hmac.compare_digest(signature, expected)):
+        require_read_auth(authorization)
+    row = _storage_area(area)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such area")
+    path = _storage_resolve(row, name)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Not in that area")
+    want_file = bool(request.query_params.get("dl"))
+    suffix = path.suffix.lower()
+    if suffix in STORAGE_TEXT and not want_file:
+        try:
+            body = await asyncio.to_thread(
+                path.read_text, "utf-8", "replace")
+        except OSError:
+            raise HTTPException(status_code=404,
+                                detail="Unreadable") from None
+        return PlainTextResponse(body[:400_000])
+    headers = {"X-Content-Type-Options": "nosniff",
+               "Accept-Ranges": "bytes",
+               "Cache-Control": "private, max-age=3600"}
+    if want_file:
+        headers["Content-Disposition"] = (
+            'attachment; filename="' + path.name.replace('"', "") + '"')
+    return FileResponse(
+        path, headers=headers,
+        media_type=_STORAGE_MIME.get(suffix, "application/octet-stream"))
+
+
+@app.post("/api/storage/{area}/purge")
+async def storage_purge_api(
+    area: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Delete — and only ever what the body actually asked for (#836).
+
+    EXACTLY one of older_than_days / keep_bytes / names. There is no default
+    and no "everything" shape: an empty body is a 400, not a sweep. The
+    shape of this endpoint is the last thing standing between a slip of the
+    hand and the station's entire archive."""
+    require_auth(authorization)
+    row = _storage_area(area)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such area")
+    if not row.get("purge"):
+        raise HTTPException(
+            status_code=400,
+            detail=row.get("why_kept") or "That area is kept, not cycled")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    days = payload.get("older_than_days")
+    keep = payload.get("keep_bytes")
+    names = payload.get("names")
+    asked = [x for x in (days, keep, names) if x not in (None, "", [])]
+    if len(asked) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Say exactly one of older_than_days, keep_bytes or names")
+    try:
+        if days is not None:
+            days = max(0.5, min(3650.0, float(days)))
+        if keep is not None:
+            keep = max(0, min(1 << 42, int(keep)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400,
+                            detail="That is not a number") from None
+    if names is not None:
+        if not isinstance(names, list) or not names:
+            raise HTTPException(status_code=400,
+                                detail="names must be a non-empty list")
+        names = [str(x)[:400] for x in names[:2000]]
+    got = await asyncio.to_thread(_storage_purge, row, days, keep, names)
+    _STORAGE_CACHE.update({"at": 0.0, "value": None})
+    if got.get("count"):
+        note_action(
+            f"\U0001f5c4 store room: {got['count']} file(s) purged from "
+            f"{row['label']} \u2014 {got['freed'] // (1 << 20)} MB freed")
+    return got
+
+
+@app.post("/api/storage/caps")
+async def storage_caps_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Move one slider (#836). 0 GB means no ceiling at all, which is where
+    every area starts — the keeper cannot touch an uncapped area."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    area = str(payload.get("area") or "")
+    if _storage_area(area) is None:
+        raise HTTPException(status_code=404, detail="No such area")
+    try:
+        gb = float(payload.get("gb") or 0)
+    except (TypeError, ValueError):
+        gb = 0.0
+    caps = await asyncio.to_thread(storage_caps_save, area, gb)
+    _STORAGE_CACHE.update({"at": 0.0, "value": None})
+    return {"caps": caps, "area": area, "gb": caps.get(area, 0.0),
+            "max_gb": STORAGE_CAP_MAX}
+
+
 PINE_UPLOADS_DIR = data_path("pine_uploads")
 
 
@@ -49454,6 +50239,15 @@ actually played, and anything in the way"
 speaker and restart the agent."
             onclick="pineRecover()"
             style="font-size:15px;line-height:1">🔄</button>
+    <!-- #836: the store room. Every folder the station saves
+         into, what it holds, how big it has got, and a
+         ceiling per area on a slider. -->
+    <button id="storeRoomBtn" class="pine-restart"
+            title="The store room — every place the station saves
+to: broadcasts, ads, spoken spots, clips, samples, gallery. Look
+inside, play or save anything, read the transcripts, cap each area."
+            onclick="storagePanel(this)"
+            style="font-size:15px;line-height:1">🗄</button>
     <button id="cloudHeadBtn" class="pine-restart"
             title="Word cloud — closed, half, full"
             onclick="cloudCycle()"
@@ -68164,6 +68958,402 @@ function djPathsPanel(anchor) {
     };
     document.addEventListener("click", off);
   }, 0);
+}
+
+
+/* #836: THE STORE ROOM.
+ *
+ * "show a pop-up window that shows all of the areas that's being saved with
+ *  files from the radio station and allow me to purge them, download them,
+ *  examine them, review the transcripts of them ... and I want sliders at
+ *  the top that lets me specify the maximum amount of memory that's able to
+ *  be allocated to an area."
+ *
+ * One window over every folder the station writes into, grouped by what the
+ * folder is FOR, each with its own 0-20 GB ceiling on a slider at the top of
+ * its own section. Examine opens the files themselves — play them, save
+ * them, read the transcripts — so nothing is ever thrown away blind. Purge
+ * always asks for a shape (an age, or a budget to keep), never "all", and
+ * the server refuses anything queued to air whatever this asks for.
+ *
+ * Every path through here is wrapped: a store room that throws must not take
+ * the panel down with it. */
+function storagePanel(anchor) {
+  try {
+    const gone = document.getElementById("storagePanel");
+    if (gone) { gone.remove(); return; }
+    const pop = el("div", "panel", "");
+    pop.id = "storagePanel";
+    const at = (anchor && anchor.getBoundingClientRect)
+      ? anchor.getBoundingClientRect() : {left: 60, bottom: 54};
+    pop.style.cssText = "position:fixed;z-index:220;width:min(720px,96vw);"
+      + "padding:10px 12px;margin:0;max-height:84vh;overflow:auto;"
+      + "left:" + Math.max(8, Math.min(window.innerWidth - 730, at.left - 360))
+      + "px;top:" + ((at.bottom || 54) + 6) + "px";
+    pop.onclick = (e) => e.stopPropagation();
+
+    let floorSecs = 300;
+
+    const size = (v) => {
+      const n = Number(v || 0);
+      if (n >= 1073741824) return (n / 1073741824).toFixed(2) + " GB";
+      if (n >= 1048576) return (n / 1048576).toFixed(1) + " MB";
+      if (n >= 1024) return Math.round(n / 1024) + " KB";
+      return n + " B";
+    };
+    const when = (t) => t ? new Date(t * 1000).toLocaleString() : "\u2014";
+
+    const head = el("div", "row", "");
+    head.style.cssText = "gap:6px;align-items:center;margin-bottom:3px";
+    const title = el("div", "", "\ud83d\uddc4 The store room");
+    title.style.cssText = "font-weight:700;font-size:12px;flex:1;min-width:0";
+    const again = el("button", "", "\u21bb");
+    again.title = "Walk the folders again \u2014 the count is cached for 30s";
+    again.style.cssText = "font-size:10.5px;padding:1px 7px";
+    const shut = el("button", "", "\u2715");
+    shut.style.cssText = "font-size:10.5px;padding:1px 7px";
+    shut.onclick = () => pop.remove();
+    head.appendChild(title); head.appendChild(again); head.appendChild(shut);
+    pop.appendChild(head);
+
+    const note = el("div", "muted", "reading the shelves\u2026");
+    note.style.cssText = "font-size:10.5px;line-height:1.45;margin-bottom:4px";
+    pop.appendChild(note);
+    const body = el("div", "", "");
+    pop.appendChild(body);
+    document.body.appendChild(pop);
+
+    async function fillFiles(area, host, offset) {
+      try {
+        const d = await api("/api/storage/" + encodeURIComponent(area.key)
+          + "/files?limit=40&offset=" + offset);
+        if (!offset) host.textContent = "";
+        host.dataset.loaded = "1";
+        const old = host.querySelector(".storeMore");
+        if (old) old.remove();
+        if (!(d.files || []).length && !offset) {
+          const none = el("div", "muted", "nothing in here.");
+          none.style.cssText = "font-size:10px;padding:2px 0";
+          host.appendChild(none);
+          return;
+        }
+        (d.files || []).forEach((f) => host.appendChild(fileRow(area, f)));
+        if ((d.offset + d.shown) < d.count) {
+          const more = el("button", "storeMore",
+            "\u2026 " + (d.count - d.offset - d.shown) + " more");
+          more.style.cssText = "font-size:10px;padding:1px 7px;margin-top:4px";
+          more.onclick = () => {
+            more.remove();
+            fillFiles(area, host, d.offset + d.shown);
+          };
+          host.appendChild(more);
+        }
+      } catch (e) { host.textContent = e.message; }
+    }
+
+    function fileRow(area, f) {
+      const r = el("div", "", "");
+      r.style.cssText = "display:flex;gap:5px;align-items:center;"
+        + "padding:2px 0;font-size:10px";
+      const lab = el("span", "", f.name + " \u00b7 " + size(f.bytes));
+      lab.title = f.name + "\n" + when(f.when)
+        + (f.protected ? "\nqueued to air \u2014 protected from every purge"
+                       : "");
+      lab.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap"
+        + (f.protected ? ";color:var(--accent)" : "");
+      r.appendChild(lab);
+
+      if (f.kind === "audio") {
+        const play = el("button", "", "\u25b6");
+        play.style.cssText = "font-size:10px;padding:0 5px";
+        play.title = "Hear it \u2014 click again to stop";
+        play.onclick = () => {
+          try { clipToggle(f.url, play, "\u25b6"); } catch (e) {}
+        };
+        r.appendChild(play);
+      }
+      if (f.kind === "text" || f.kind === "image") {
+        const look = el("button", "", f.kind === "text" ? "\ud83d\udcc4"
+                                                        : "\ud83d\uddbc");
+        look.style.cssText = "font-size:10px;padding:0 5px";
+        look.title = f.kind === "text"
+          ? "Read it \u2014 the transcript, in here"
+          : "Look at it";
+        look.onclick = async () => {
+          try {
+            const next = r.nextSibling;
+            if (next && next.dataset && next.dataset.readout === "1") {
+              next.remove(); return;       /* second click closes it */
+            }
+            let box;
+            if (f.kind === "image") {
+              box = el("div", "", "");
+              const im = document.createElement("img");
+              im.src = f.url;
+              im.style.cssText = "max-width:100%;max-height:30vh;"
+                + "border-radius:6px;display:block";
+              box.appendChild(im);
+            } else {
+              const res = await fetch(f.url);
+              box = el("pre", "", (await res.text()).slice(0, 60000));
+              box.style.cssText = "white-space:pre-wrap;font-size:9.5px;"
+                + "max-height:30vh;overflow:auto;padding:5px;"
+                + "background:#0a1220;border-radius:6px";
+            }
+            box.style.margin = "3px 0";
+            box.dataset.readout = "1";
+            r.parentNode.insertBefore(box, r.nextSibling);
+          } catch (e) { look.title = e.message; }
+        };
+        r.appendChild(look);
+      }
+      const save = el("a", "", "\u2b07");
+      save.href = f.url + "&dl=1";
+      save.download = f.name.split("/").pop();
+      save.title = "Save it";
+      save.style.cssText = "font-size:11px;color:var(--accent);"
+        + "text-decoration:none;padding:0 3px";
+      r.appendChild(save);
+      /* One file at a time is the safest purge there is: you looked at it,
+       * you named it, and the server still refuses it if it is queued. */
+      if (f.protected) {
+        const held = el("span", "", "\ud83d\udd12");
+        held.title = "Queued to air \u2014 this one cannot be deleted";
+        held.style.cssText = "font-size:10px;padding:0 4px;opacity:.75";
+        r.appendChild(held);
+      } else if (area.purgeable) {
+        const bin = el("button", "", "\u2715");
+        bin.style.cssText = "font-size:10px;padding:0 5px";
+        bin.title = "Throw this one away";
+        bin.onclick = async () => {
+          if (!confirm("Delete " + f.name + "?\n\nThis cannot be undone."))
+            return;
+          try {
+            await api("/api/storage/" + encodeURIComponent(area.key)
+              + "/purge", {method: "POST",
+                           body: JSON.stringify({names: [f.name]})});
+            r.remove();
+          } catch (e) { bin.title = e.message; }
+        };
+        r.appendChild(bin);
+      }
+      return r;
+    }
+
+    function purgeForm(area, card, filesHost) {
+      const open = card.querySelector(".storePurge");
+      if (open) { open.remove(); return; }
+      const form = el("div", "storePurge", "");
+      form.style.cssText = "margin-top:5px;border-top:1px solid var(--border);"
+        + "padding-top:5px";
+      const mode = el("select", "", "");
+      [["older than\u2026", "age"],
+       ["keep only the newest\u2026", "keep"]].forEach(([t, v]) => {
+        const o = el("option", "", t); o.value = v; mode.appendChild(o);
+      });
+      mode.style.cssText = "font-size:10px;flex:0 0 auto;width:auto";
+      const dial = el("input", "", "");
+      dial.type = "range"; dial.min = "1"; dial.max = "90"; dial.step = "1";
+      dial.value = "30";
+      dial.style.cssText = "flex:1;min-width:90px";
+      const lab = el("div", "muted", "");
+      lab.style.cssText = "font-size:10px;line-height:1.45;margin:3px 0";
+      const say = () => {
+        lab.textContent = mode.value === "age"
+          ? ("delete everything older than " + dial.value + " day(s). "
+             + "Nothing written in the last " + Math.round(floorSecs / 60)
+             + " min and nothing queued to air is touched.")
+          : ("keep the newest " + Number(dial.value).toFixed(1)
+             + " GB and cycle the rest out, oldest first.");
+      };
+      mode.onchange = () => {
+        if (mode.value === "age") {
+          dial.min = "1"; dial.max = "90"; dial.step = "1"; dial.value = "30";
+        } else {
+          dial.min = "0.5"; dial.max = "20"; dial.step = "0.5";
+          dial.value = "2";
+        }
+        say();
+      };
+      dial.oninput = say;
+      say();
+      const go = el("button", "primary", "\ud83e\uddf9 Purge");
+      go.style.cssText = "font-size:10.5px;padding:1px 7px";
+      go.onclick = async () => {
+        const what = mode.value === "age"
+          ? {older_than_days: Number(dial.value)}
+          : {keep_bytes: Math.round(Number(dial.value) * 1073741824)};
+        if (!confirm("Purge " + area.label + " \u2014 " + lab.textContent
+                     + "\n\nThis cannot be undone.")) return;
+        const done = pending(go, "purging\u2026");
+        try {
+          const r = await api("/api/storage/" + encodeURIComponent(area.key)
+            + "/purge", {method: "POST", body: JSON.stringify(what)});
+          lab.textContent = (r.count || 0) + " file(s) gone \u00b7 "
+            + size(r.freed) + " freed"
+            + (r.kept_protected ? " \u00b7 " + r.kept_protected
+               + " left alone (queued to air)" : "");
+          filesHost.dataset.loaded = "";
+          filesHost.textContent = "";
+          if (filesHost.style.display !== "none")
+            fillFiles(area, filesHost, 0);
+          setTimeout(() => draw(true), 500);
+        } catch (e) { lab.textContent = e.message; }
+        finally { try { done(); } catch (e) {} }
+      };
+      const row = el("div", "row", "");
+      row.style.cssText = "gap:5px;align-items:center";
+      row.appendChild(mode); row.appendChild(dial); row.appendChild(go);
+      form.appendChild(row); form.appendChild(lab);
+      card.appendChild(form);
+    }
+
+    function areaCard(a, top) {
+      const card = el("div", "", "");
+      card.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+        + "padding:7px 8px;margin-bottom:6px";
+      const line = el("div", "", "");
+      line.style.cssText = "display:flex;gap:6px;align-items:baseline";
+      const name = el("div", "", a.label);
+      name.style.cssText = "font-weight:700;font-size:11.5px;flex:1;"
+        + "min-width:0;overflow:hidden;text-overflow:ellipsis;"
+        + "white-space:nowrap";
+      name.title = a.path;
+      const stat = el("div", "muted", a.files + " file(s) \u00b7 "
+        + size(a.bytes) + (a.truncated ? " (first " + a.files + ")" : ""));
+      stat.style.cssText = "font-size:10px;white-space:nowrap";
+      line.appendChild(name); line.appendChild(stat);
+      card.appendChild(line);
+
+      /* The slider sits at the TOP of its own section, which is exactly
+       * where #836 asked for it, with the usage bar right under it. */
+      const capLab = el("div", "", "");
+      capLab.style.cssText = "font-size:10px;color:var(--accent);"
+        + "margin:4px 0 1px";
+      const dial = el("input", "", "");
+      dial.type = "range"; dial.min = "0";
+      dial.max = String(top.max_gb || 20); dial.step = "0.5";
+      dial.value = String(a.cap_gb || 0);
+      dial.style.width = "100%";
+      dial.disabled = !a.purgeable;
+      dial.title = a.purgeable
+        ? "The most this area may hold. 0 = no ceiling."
+        : (a.why_kept || "this area is never purged");
+      const track = el("div", "", "");
+      track.style.cssText = "height:5px;border-radius:3px;background:#1d2330;"
+        + "overflow:hidden;margin:3px 0 2px";
+      const fill = el("div", "", "");
+      track.appendChild(fill);
+      const sayCap = () => {
+        const cap = Number(dial.value || 0);
+        const over = a.bytes - cap * 1073741824;
+        capLab.textContent = cap > 0
+          ? ("ceiling " + cap.toFixed(1) + " GB \u00b7 " + size(a.bytes)
+             + " used" + (over > 0 ? " \u00b7 " + size(over) + " over \u2014 "
+               + "the keeper cycles the oldest out" : ""))
+          : (a.purgeable
+             ? "no ceiling \u2014 nothing here is ever deleted automatically"
+             : (a.why_kept || "kept \u2014 never purged"));
+        const pct = cap > 0
+          ? Math.min(100, Math.round(100 * (a.bytes / 1073741824) / cap)) : 0;
+        fill.style.cssText = "height:100%;width:" + pct + "%;background:"
+          + (pct >= 100 ? "#e0645f" : pct >= 80 ? "#e0a75f" : "var(--accent)");
+      };
+      sayCap();
+      dial.oninput = sayCap;
+      dial.onchange = async () => {
+        try {
+          await api("/api/storage/caps", {method: "POST",
+            body: JSON.stringify({area: a.key, gb: Number(dial.value)})});
+          a.cap_gb = Number(dial.value);
+          sayCap();
+        } catch (e) { capLab.textContent = e.message; }
+      };
+      card.appendChild(capLab);
+      card.appendChild(dial);
+      card.appendChild(track);
+
+      const holds = el("div", "muted", a.holds || "");
+      holds.style.cssText = "font-size:10px;line-height:1.45;margin:2px 0 3px";
+      card.appendChild(holds);
+      const ages = el("div", "muted",
+        "newest " + when(a.newest) + " \u00b7 oldest " + when(a.oldest));
+      ages.style.cssText = "font-size:9.5px;margin-bottom:4px;opacity:.8";
+      card.appendChild(ages);
+
+      const files = el("div", "", "");
+      files.style.cssText = "margin-top:5px;max-height:34vh;overflow:auto;"
+        + "display:none";
+      const row = el("div", "row", "");
+      row.style.cssText = "gap:5px;flex-wrap:wrap";
+      const look = el("button", "", "\ud83d\udd0d Examine");
+      look.style.cssText = "font-size:10.5px;padding:1px 7px";
+      look.title = "List what is in here \u2014 play it, save it, read it";
+      look.onclick = () => {
+        const shown = files.style.display !== "none";
+        files.style.display = shown ? "none" : "";
+        if (!shown && files.dataset.loaded !== "1") fillFiles(a, files, 0);
+      };
+      row.appendChild(look);
+      if (a.purgeable) {
+        const bin = el("button", "", "\ud83e\uddf9 Purge\u2026");
+        bin.style.cssText = "font-size:10.5px;padding:1px 7px";
+        bin.title = "Cycle files out of here by age, or down to a budget";
+        bin.onclick = () => purgeForm(a, card, files);
+        row.appendChild(bin);
+      } else {
+        const kept = el("span", "muted", "\ud83d\udd12 kept");
+        kept.title = a.why_kept || "never purged from here";
+        kept.style.cssText = "font-size:10px;padding:2px 0";
+        row.appendChild(kept);
+      }
+      card.appendChild(row);
+      card.appendChild(files);
+      return card;
+    }
+
+    async function draw(fresh) {
+      let d = null;
+      try { d = await api("/api/storage" + (fresh ? "?refresh=1" : "")); }
+      catch (e) { note.textContent = e.message; return; }
+      try {
+        floorSecs = Number(d.floor_seconds || 300);
+        body.textContent = "";
+        note.textContent = size(d.bytes) + " across "
+          + (d.areas || []).length + " areas \u00b7 "
+          + (d.protected_clips || 0) + " clip(s) queued to air are protected "
+          + "from every purge \u00b7 capped areas are trimmed oldest-first "
+          + "every " + Math.round((d.sweep_seconds || 300) / 60) + " min. "
+          + "An area with no ceiling is never touched.";
+        (d.swept || []).slice(0, 3).forEach((s) => {
+          const said = el("div", "muted", "\u267b " + s.files
+            + " cycled out of " + s.label + " \u00b7 " + size(s.freed)
+            + " freed");
+          said.style.cssText = "font-size:9.5px;opacity:.8";
+          note.appendChild(said);
+        });
+        let group = "";
+        (d.areas || []).forEach((a) => {
+          if (a.group !== group) {
+            group = a.group;
+            const gh = el("div", "", group);
+            gh.style.cssText = "font-size:10px;letter-spacing:.12em;"
+              + "text-transform:uppercase;color:var(--accent);opacity:.75;"
+              + "margin:10px 0 3px";
+            body.appendChild(gh);
+          }
+          body.appendChild(areaCard(a, d));
+        });
+      } catch (e) { note.textContent = String(e.message || e); }
+    }
+
+    again.onclick = () => draw(true);
+    draw(false);
+  } catch (e) {
+    try { setStatus("the store room would not open: " + e.message, true); }
+    catch (ignored) { /* never let this blank the panel */ }
+  }
 }
 
 
