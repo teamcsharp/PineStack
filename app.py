@@ -5482,6 +5482,28 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
     try:
         got = await box_triage(fix=True)
         _REPAIR_LIVE["steps"].extend(list(got.get("steps") or []))
+        # #839: THE ROUTING RUNG — 2026-08-19's "atrocious" silence was
+        # music routed to the PAGE while every ear was on the box. The
+        # repair restores the OPERATOR's stamped routing; and if that
+        # ledger itself points music away from the box, it says so
+        # plainly instead of pretending the device is broken.
+        want = _operator_routing_read()
+        changed = []
+        for axis in ("music_to", "voice_to", "reply_to"):
+            pick = str(want.get(axis) or "")
+            if pick and pick != str(_RADIO.get(axis) or ""):
+                _RADIO[axis] = pick
+                changed.append(f"{axis.split('_')[0]}→{pick}")
+        if changed:
+            _routing_save()
+            fire_and_forget(box_route_wake())
+            mark("the routing", "drifted off the operator's own picks",
+                 "restored: " + ", ".join(changed))
+        if (_RADIO.get("music_to") or "here") not in ("box", "both"):
+            mark("the routing",
+                 "music is routed to the PAGE by the stamped operator "
+                 "choice — the box carries voice only; flip the music "
+                 "switch to Nabu if that is not what you want")
         quiet = time.time() - _BOX_LAST_OK[0]
         routed = ((_RADIO.get("music_to") or "here") in ("box", "both")
                   or (_RADIO.get("voice_to") or "box") in ("box", "both"))
