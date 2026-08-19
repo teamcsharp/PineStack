@@ -37315,6 +37315,32 @@ async def booth_clip_api(
             if cut:
                 return FileResponse(cut, media_type="audio/mpeg",
                                     filename=f"booth-{int(at)}.mp3")
+    # #847: the in-memory index is gone after a restart but the STAGED
+    # FILES are still on disk — their mtimes are their air times. Walk
+    # the folder as a second index so a restart never costs a download.
+    try:
+        staged = sorted(
+            ((f, f.stat().st_mtime) for f in _EPISODE_STAGE.glob("*.mp3")
+             if f.is_file()), key=lambda pair: pair[1])
+    except OSError:
+        staged = []
+    for ix, (path, when) in enumerate(staged):
+        span = float(_clip_seconds(str(path)) or 0)
+        ends = when + span if span else (
+            staged[ix + 1][1] if ix + 1 < len(staged) else when + 12.0)
+        # A file's mtime is written when the clip is STAGED, which is
+        # when it aired; a burst covers everything until it ends.
+        if abs(when - at) < 6:
+            return FileResponse(path, media_type="audio/mpeg",
+                                filename=f"booth-{int(at)}.mp3")
+        if when <= at < ends:
+            cut = await asyncio.to_thread(
+                _cut, path, at - when,
+                min(90.0, max(6.0, ends - at)), f"{int(at)}_s{ix}")
+            if cut:
+                return FileResponse(cut, media_type="audio/mpeg",
+                                    filename=f"booth-{int(at)}.mp3")
+
     hit: tuple[float, dict[str, Any], Path] | None = None
     for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json"),
                             reverse=True):
@@ -37345,8 +37371,15 @@ async def booth_clip_api(
         if hit and hit[0] == 0.0:
             break
     if hit is None:
-        raise HTTPException(status_code=404,
-                            detail="no audio kept for this row")
+        # #847: an honest 404 — say WHICH shelves were searched so the
+        # operator knows whether the audio aged out or was never kept.
+        raise HTTPException(
+            status_code=404,
+            detail=("no audio kept for this row — searched the open "
+                    f"episode, {len(staged)} staged clip(s) on disk and "
+                    "every sealed episode. Lines older than the last "
+                    "cache sweep are gone; a line that never aired "
+                    "(held or dropped) has no audio to keep."))
     _gap, mark, source = hit
     off = max(0.0, float(mark.get("off") or 0))
     dur = max(0.4, float(mark.get("dur") or 4.0))
