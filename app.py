@@ -14075,13 +14075,38 @@ async def hold_shelf_groomer() -> None:
     """#869: the shelf is groomed on a clock, not only when something is
     added. A station that has stopped adding to it (because every line
     is being gagged BY it) would otherwise never trim, and the gag would
-    hold for ever."""
+    hold for ever.
+
+    #873: and it is where a DEAF BOX is finally noticed. The #864
+    detector counts sends that were accepted and never played, which
+    the breaker makes impossible: once _BOX_DOWN is set nothing is sent
+    at all. But the shelf still fills, and a device that answers its
+    wire probe while carrying nothing for minutes is not busy — it is
+    deaf, and only its own restart button cures that."""
     while True:
         await asyncio.sleep(60)
         try:
             if _BOX_HOLD:
                 _hold_trim()
                 _box_hold_save()
+            if not (_RADIO.get("on") and box_talk_ok()):
+                continue
+            if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
+                continue
+            quiet = time.time() - _BOX_LAST_OK[0]
+            piled = len(_BOX_HOLD) >= 4
+            downed = time.time() < float(_BOX_DOWN.get("until") or 0)
+            if not (piled and quiet > 180 and downed):
+                continue
+            # Reachable? Then it is not the network and not the entity.
+            if await _wire_probe(NABU_PROBE_HOST) != "alive":
+                continue
+            pipeline_log("repair", "the box answers the wire but has "
+                         f"carried nothing for {int(quiet // 60)} minutes "
+                         f"with {len(_BOX_HOLD)} lines waiting — deaf, "
+                         "not busy; pressing its restart button (#873)")
+            note_action("🔁 the box went deaf — restarting it")
+            await _deaf_box_restart()
         except Exception:  # noqa: BLE001
             pass
 
@@ -26445,13 +26470,35 @@ def substantial_radio_script(script: str, expected_turns: int) -> bool:
     """
     turns = banter_turns(script)
     bodies = [text for _, text in turns if text.strip()]
-    floor = min(8, max(6, int(expected_turns or 0)))
+    # #874: the TURN floor scales with the budget too. Demanding eight
+    # bodies inside a 900-character ceiling is ~112 characters a turn —
+    # the writer sensibly produces four longer turns instead, and the
+    # gate rejected every one of them. A round is judged against what
+    # its budget can actually hold.
+    _room = int(int(dj_settings().get("reply_max_chars") or 6000) * 0.85)
+    floor = min(int(expected_turns or 8), max(6, int(expected_turns or 0)))
+    floor = min(floor, max(3, _room // 220))
     if len(bodies) < floor:
         return False
     words = [len(text.split()) for text in bodies]
-    required_chars = min(3600, max(1900, floor * 280))
+    # #874: the bar SCALES to what the writer is allowed to produce.
+    # These numbers were chosen against the 6000-character default; the
+    # station runs far lower, every budget is clamped to
+    # reply_max_chars, and ask_model clamps again — so the fixed 2240
+    # chars and 38 words/body were unreachable by arithmetic, every
+    # larder round was discarded, and the shelf stayed empty for the
+    # life of the station while the keeper burned a model slot at it.
+    budget = int(dj_settings().get("reply_max_chars") or 6000)
+    # 85% of the ceiling: a good round fills its budget without having
+    # to hit it exactly.
+    room = int(budget * 0.85)
+    required_chars = min(3600, max(1900, floor * 280), room)
+    # …and the words-per-body bar in the same proportion. Body text is
+    # most of the script; ~6 characters to a word.
+    per_body = room / max(1, floor)
+    required_words = max(12, min(38, int(per_body / 6)))
     return len(str(script or "")) >= required_chars and (
-        sum(words) / max(1, len(words))) >= 38
+        sum(words) / max(1, len(words))) >= required_words
 
 
 # What a speaker does at the seam when a long thought continues across
