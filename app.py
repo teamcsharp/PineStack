@@ -5619,6 +5619,248 @@ async def nabu_device_restart(reason: str = "") -> bool:
 _REPAIR_LIVE: dict[str, Any] = {"at": 0.0, "busy": False,
                                 "steps": [], "verdict": ""}
 
+# #880: what the station has LEARNED about its own faults. Each row is
+# a fingerprint of the failure plus the cure that restored audio, so
+# the next identical outage starts with the answer instead of the
+# ladder.
+REPAIR_LEARNED_PATH = data_path("repair_learned.json")
+_LEARNED_LOCK = RLock()
+
+# Seeded with what this session cost a day to discover. Each entry is
+# (fingerprint, cure, why) — the fingerprint is what the tree can SEE,
+# the cure is the rung that actually ended the silence.
+REPAIR_SEED = [
+    {"fp": "device:accepts|audio:none", "cure": "device_reboot",
+     "why": "the Voice PE takes announces and plays nothing; only its "
+            "own restart button clears it (measured three times)",
+     "wins": 3, "losses": 0},
+    {"fp": "engine:port_dark|process:alive", "cure": "engine_bounce",
+     "why": "a wedged TTS server keeps its port bound and never "
+            "answers — kill the process and redeploy, health alone "
+            "never recovers it",
+     "wins": 2, "losses": 0},
+    {"fp": "director:dark", "cure": "lifeboat_director",
+     "why": "the voice-director freezes on a blocking deploy; the "
+            "lifeboat restarts it from outside docker",
+     "wins": 2, "losses": 0},
+    {"fp": "library:empty", "cure": "remount_shares",
+     "why": "the CIFS mounts are fstab nofail and vanish on a host "
+            "reboot; the docker bind is rprivate so the agent must "
+            "restart after the mount",
+     "wins": 2, "losses": 0},
+    {"fp": "memory:cache_starved", "cure": "drop_caches",
+     "why": "page cache eats the unified pool until an engine hangs "
+            "mid-load with its port bound (44G cached / 23G free)",
+     "wins": 1, "losses": 0},
+    {"fp": "shelf:jammed|audio:none", "cure": "shed_stale_shelf",
+     "why": "an unplayable head clip gags every fresh line behind it; "
+            "the shelf must shed rather than preserve",
+     "wins": 1, "losses": 0},
+    {"fp": "routing:drifted", "cure": "restore_routing",
+     "why": "a client POST wrote its stale selectors into the operator "
+            "ledger and the vigil replayed it on every box flap",
+     "wins": 2, "losses": 0},
+    {"fp": "writer:silent", "cure": "switch_writer",
+     "why": "a model that returns zero characters times out every "
+            "round; swap to one benchmarked to answer",
+     "wins": 1, "losses": 0},
+]
+
+
+def repair_learned() -> list[dict[str, Any]]:
+    """The ledger, seeded the first time it is asked for."""
+    with _LEARNED_LOCK:
+        try:
+            rows = json.loads(REPAIR_LEARNED_PATH.read_text())
+            if isinstance(rows, list) and rows:
+                return rows
+        except Exception:  # noqa: BLE001
+            pass
+        rows = [dict(r) for r in REPAIR_SEED]
+        repair_learned_save(rows)
+        return rows
+
+
+def repair_learned_save(rows: list[dict[str, Any]]) -> None:
+    try:
+        REPAIR_LEARNED_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = REPAIR_LEARNED_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows[:200], indent=1))
+        tmp.replace(REPAIR_LEARNED_PATH)
+    except OSError:
+        pass
+
+
+async def repair_fingerprint() -> str:
+    """What is wrong, in the terms the tree can actually see. The same
+    outage produces the same string, which is what makes a memory of
+    cures possible at all."""
+    marks: list[str] = []
+    quiet = time.time() - _BOX_LAST_OK[0]
+    if quiet > 120:
+        marks.append("audio:none")
+    if len(_BOX_HOLD) >= 4:
+        marks.append("shelf:jammed")
+    if time.time() < float(_BOX_DOWN.get("until") or 0):
+        marks.append("device:breaker")
+    try:
+        _online = bool((await satellite_status()).get("online"))
+    except Exception:  # noqa: BLE001
+        _online = False
+    if not _online:
+        marks.append("device:unreachable")
+    elif "audio:none" in marks:
+        # #881: "the device answers" is only a FAULT when it answers and
+        # nothing is heard. On its own it is simply a healthy speaker,
+        # and fingerprinting it as a symptom had the repair reaching for
+        # the reboot button at a station that was working.
+        marks.append("device:accepts")
+    # Only the engine the cast actually renders on counts. Under the
+    # cast lock the other one is deliberately unloaded (#866) — calling
+    # that a fault would have the ledger curing the design.
+    _engines = ([host_clone_engine()] if cast_engine_locked()
+                else ["xtts", "f5"])
+    for eng in _engines:
+        try:
+            if not (await engine_health(eng)).get("ready"):
+                marks.append(f"engine:{eng}_dark")
+        except Exception:  # noqa: BLE001
+            marks.append(f"engine:{eng}_dark")
+    try:
+        async with httpx.AsyncClient(timeout=5) as c:
+            if (await c.get(f"{VOICE_DIRECTOR_URL}/host/pressure")
+                    ).status_code >= 300:
+                marks.append("director:dark")
+    except Exception:  # noqa: BLE001
+        marks.append("director:dark")
+    try:
+        if not any(Path("/music/itunes").iterdir()):
+            marks.append("library:empty")
+    except Exception:  # noqa: BLE001
+        marks.append("library:empty")
+    want = _operator_routing_read()
+    if str(want.get("music") or "") and \
+            str(want.get("music")) != str(_RADIO.get("music_to") or ""):
+        marks.append("routing:drifted")
+    return "|".join(sorted(marks)) or "healthy"
+
+
+def repair_suggest(fingerprint: str) -> list[dict[str, Any]]:
+    """The cures that have worked for a fault like this, best first.
+
+    Scored by wins against losses and freshness — a cure that stops
+    working sinks without anyone editing a list, and a new one that
+    works climbs on its own."""
+    now = time.time()
+    marks = set(fingerprint.split("|"))
+    # #881: a fingerprint carrying no actual symptom gets no cures. The
+    # ledger is for outages, not for a station that is simply running.
+    if not (marks & {"audio:none", "shelf:jammed", "device:unreachable",
+                     "device:breaker", "director:dark", "library:empty",
+                     "routing:drifted", "memory:cache_starved",
+                     "writer:silent"}) and not any(
+                         m.endswith("_dark") for m in marks):
+        return []
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for row in repair_learned():
+        seen = set(str(row.get("fp") or "").split("|"))
+        if not seen:
+            continue
+        overlap = len(seen & marks) / max(1, len(seen))
+        if overlap < 0.5:
+            continue
+        wins = float(row.get("wins") or 0)
+        losses = float(row.get("losses") or 0)
+        rate = (wins + 1) / (wins + losses + 2)      # Laplace
+        age_days = max(0.0, (now - float(row.get("at") or now)) / 86400)
+        fresh = 1.0 / (1.0 + age_days / 30.0)
+        scored.append((overlap * rate * (0.6 + 0.4 * fresh), row))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [row for _s, row in scored]
+
+
+def repair_record(fingerprint: str, cure: str, worked: bool,
+                  why: str = "") -> None:
+    """#880: remember what happened. This is the whole point — the
+    station stops paying for the same lesson twice."""
+    with _LEARNED_LOCK:
+        rows = repair_learned()
+        for row in rows:
+            if str(row.get("fp")) == fingerprint and \
+                    str(row.get("cure")) == cure:
+                row["wins"] = int(row.get("wins") or 0) + (1 if worked else 0)
+                row["losses"] = int(row.get("losses") or 0) + (
+                    0 if worked else 1)
+                row["at"] = time.time()
+                repair_learned_save(rows)
+                return
+        rows.append({"fp": fingerprint, "cure": cure,
+                     "why": why or "learned on air",
+                     "wins": 1 if worked else 0,
+                     "losses": 0 if worked else 1, "at": time.time()})
+        repair_learned_save(rows)
+
+
+async def _run_cure(cure: str) -> bool:
+    """#881: perform one remembered cure. Returns whether it ran — not
+    whether it worked; the verified-audio check afterwards decides that."""
+    try:
+        if cure == "device_reboot":
+            _NABU_REBOOT_AT[0] = 0.0
+            return await nabu_device_restart("learned cure (#881)")
+        if cure == "engine_bounce":
+            want = host_clone_engine()
+            await _director_post(f"/director/engine/{want}/terminate")
+            await asyncio.sleep(2)
+            if want == "xtts":
+                _XTTS_REVIVE_AT[0] = 0.0
+                _xtts_revive_maybe()
+            else:
+                _F5_REVIVE_AT[0] = 0.0
+                await _director_post("/director/engine/f5/deploy")
+            return True
+        if cure == "lifeboat_director":
+            return await _lifeboat_restart("voice-director")
+        if cure == "restore_routing":
+            want = _operator_routing_read()
+            moved = False
+            for key, axis in (("music", "music_to"), ("voice", "voice_to"),
+                              ("reply", "reply_to")):
+                pick = str(want.get(key) or "")
+                if pick and pick != str(_RADIO.get(axis) or ""):
+                    _RADIO[axis] = pick
+                    moved = True
+            if moved:
+                _routing_save()
+                fire_and_forget(box_route_wake())
+            return moved
+        if cure == "shed_stale_shelf":
+            before = len(_BOX_HOLD)
+            _hold_trim()
+            _box_hold_save()
+            fire_and_forget(_box_hold_drain_soon())
+            return len(_BOX_HOLD) < before or before > 0
+        if cure == "music_kick":
+            try:
+                await music_box_stop_now()
+            except Exception:  # noqa: BLE001
+                pass
+            _RADIO["fast_skip"] = True
+            dj_skip()
+            return True
+        if cure == "piper_restart":
+            return await _lifeboat_restart("wyoming-piper")
+        if cure in ("drop_caches", "remount_shares", "switch_writer"):
+            # These need root on the host or an operator decision; the
+            # station says so plainly rather than pretending it acted.
+            pipeline_log("repair", f"the ledger says {cure!r} is what "
+                         "cures this, and it needs a hand on the host "
+                         "— see the triage popup (#881)")
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
 
 async def _deep_repair(reason: str = "") -> dict[str, Any]:
     """#836: the ONE BUTTON. The triage tree first; then the rung the
@@ -5639,6 +5881,33 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                      + (f" → {did}" if did else "") + " (#836)")
 
     try:
+        # #881: WHAT DOES THE STATION ALREADY KNOW? Fingerprint the
+        # fault, ask the ledger which cure has ended this before, and
+        # try that first — the ladder is what you climb when you have
+        # no memory, not what you climb every time.
+        fp = await repair_fingerprint()
+        _REPAIR_LIVE["fingerprint"] = fp
+        if fp != "healthy":
+            for row in repair_suggest(fp)[:3]:
+                cure = str(row.get("cure") or "")
+                mark("what I remember",
+                     f"this looks like {fp} — {cure} has worked "
+                     f"{int(row.get('wins') or 0)}x here",
+                     str(row.get("why") or "")[:120])
+                if not await _run_cure(cure):
+                    continue
+                await asyncio.sleep(12)
+                healed = time.time() - _BOX_LAST_OK[0] < 90
+                repair_record(fp, cure, healed)
+                mark("the remembered cure",
+                     "it worked — audio is verified again" if healed
+                     else "it did not settle it; climbing the tree",
+                     cure)
+                if healed:
+                    _REPAIR_LIVE["verdict"] = (
+                        f"fixed from memory — {cure} (the station has "
+                        f"seen {fp} before)")
+                    return dict(_REPAIR_LIVE)
         got = await box_triage(fix=True)
         _REPAIR_LIVE["steps"].extend(list(got.get("steps") or []))
         # #839: THE ROUTING RUNG — 2026-08-19's "atrocious" silence was
@@ -5771,6 +6040,20 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                 "check its power and volume; the show keeps knocking "
                 "on its own")
         mark("the verdict", _REPAIR_LIVE["verdict"])
+        # #881: the ladder teaches as well. Whatever the tree did, the
+        # outcome is attached to this fingerprint so the next identical
+        # fault starts nearer the answer.
+        try:
+            _fp = str(_REPAIR_LIVE.get("fingerprint") or "")
+            if _fp and _fp != "healthy":
+                _did = [s for s in (_REPAIR_LIVE.get("steps") or [])
+                        if s.get("did")]
+                _worked = time.time() - _BOX_LAST_OK[0] < 120
+                for _s in _did[-2:]:
+                    repair_record(_fp, str(_s.get("name") or "the tree"),
+                                  _worked, str(_s.get("did") or "")[:120])
+        except Exception:  # noqa: BLE001
+            pass
         return dict(_REPAIR_LIVE)
     finally:
         _REPAIR_LIVE["busy"] = False
@@ -6373,6 +6656,23 @@ async def pinebox_repair_state(
 ) -> dict[str, Any]:
     require_read_auth(authorization)
     return dict(_REPAIR_LIVE)
+
+
+@app.get("/api/pinebox/learned")
+async def pinebox_learned(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#881: what the station has learned about its own faults — every
+    fingerprint it has seen, the cure that ended it, and how reliably."""
+    require_read_auth(authorization)
+    rows = sorted(repair_learned(),
+                  key=lambda r: (int(r.get("wins") or 0)
+                                 - int(r.get("losses") or 0)),
+                  reverse=True)
+    now = await repair_fingerprint()
+    return {"learned": rows, "now": now,
+            "suggests": [r.get("cure") for r in repair_suggest(now)[:3]]
+            if now != "healthy" else []}
 
 
 @app.get("/api/pinebox/engines")
