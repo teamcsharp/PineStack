@@ -65771,7 +65771,11 @@ async function callRecordings() {
     ads.forEach((a) => {
       const row = el("div", "", "");
       row.style.cssText = "padding:8px 0;border-top:1px solid var(--border)";
+      // #819: the download rides the TOP RIGHT corner of the row.
+      const head = el("div", "row", "");
+      head.style.cssText = "align-items:flex-start;gap:6px";
       const title = el("div", "", "");
+      title.style.cssText = "flex:1;min-width:0";
       title.innerHTML = "<b>" + callerDossierEsc(a.product || "an ad read")
         + "</b> <span class='muted' style='font-size:11px'>· "
         + (a.ts ? new Date(a.ts * 1000).toLocaleString() : "")
@@ -65780,7 +65784,18 @@ async function callRecordings() {
            + new Date(a.last_aired * 1000).toLocaleString() : "")
         + (a.bed ? " · bed: " + callerDossierEsc(a.bed) : "")
         + "</span>";
-      row.appendChild(title);
+      head.appendChild(title);
+      if (a.audio) {
+        const corner = el("a", "", "⬇");
+        corner.href = a.audio;
+        corner.download = ((a.product || "ad")
+          .replace(/[^\w -]+/g, "").slice(0, 48) || "ad") + ".mp3";
+        corner.title = "Download this spot";
+        corner.style.cssText = "flex:0 0 auto;font-size:16px;"
+          + "color:#ffd479;text-decoration:none;padding:0 2px";
+        head.appendChild(corner);
+      }
+      row.appendChild(head);
       if (a.audio) {
         const audio = document.createElement("audio");
         audio.controls = true; audio.preload = "metadata";
@@ -65807,20 +65822,6 @@ async function callRecordings() {
         + "align-items:center";
       const note = el("span", "muted", "");
       note.style.cssText = "font-size:10.5px";
-
-      // #816: the produced audio is one click from being KEPT, right on
-      // the desk row — not only in the popup and the booth tile.
-      if (a.audio) {
-        const keep = el("a", "", "⬇ keep the mp3");
-        keep.href = a.audio;
-        keep.download = ((a.product || "ad")
-          .replace(/[^\w -]+/g, "").slice(0, 48) || "ad") + ".mp3";
-        keep.title = "Download this spot";
-        keep.style.cssText = "font-size:11px;padding:2px 8px;"
-          + "color:#ffd479;border:1px solid var(--border);"
-          + "border-radius:7px;text-decoration:none";
-        acts.appendChild(keep);
-      }
 
       const save = el("button", "", "💾 Save the words");
       save.style.cssText = "font-size:11px;padding:2px 8px";
