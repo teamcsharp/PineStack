@@ -36951,6 +36951,67 @@ async def music_played_api(
     return {"played": rows}
 
 
+@app.get("/api/booth/clip")
+async def booth_clip_api(
+    at: float = 0.0,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """#840: the audio behind ONE booth row, found by air time. The
+    open episode's staging holds every aired clip as its own file; a
+    sealed episode still yields an exact cut through its marks."""
+    require_read_auth(authorization)
+    if not at:
+        raise HTTPException(status_code=400, detail="at=epoch seconds")
+    best: tuple[float, dict[str, Any]] | None = None
+    for item in list((_RADIO.get("episode") or {}).get("items") or []):
+        gap = abs(float(item.get("t") or 0) - at)
+        if gap < 10 and (best is None or gap < best[0]):
+            best = (gap, item)
+    if best is not None:
+        path = Path(str(best[1].get("file") or ""))
+        if path.is_file():
+            return FileResponse(path, media_type="audio/mpeg",
+                                filename=f"booth-{int(at)}.mp3")
+    hit: tuple[float, dict[str, Any], Path] | None = None
+    for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json"),
+                            reverse=True):
+        source = mark_file.with_suffix(".mp3")
+        if not source.is_file():
+            continue
+        try:
+            marks = json.loads(mark_file.read_text())
+        except Exception:
+            continue
+        for mark in marks:
+            gap = abs(float(mark.get("t") or 0) - at)
+            if gap < 10 and (hit is None or gap < hit[0]):
+                hit = (gap, mark, source)
+    if hit is None:
+        raise HTTPException(status_code=404,
+                            detail="no audio kept for this row")
+    _gap, mark, source = hit
+    off = max(0.0, float(mark.get("off") or 0))
+    dur = max(0.4, float(mark.get("dur") or 4.0))
+    SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    out = SAMPLE_CACHE_DIR / f"booth_{int(at)}.mp3"
+    if not out.is_file():
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:  # noqa: BLE001
+            exe = "ffmpeg"
+        got = await asyncio.to_thread(
+            _real_subprocess_run,
+            [exe, "-nostdin", "-y", "-ss", f"{off:.2f}",
+             "-t", f"{dur:.2f}", "-i", str(source),
+             "-codec:a", "copy", str(out)],
+            capture_output=True, timeout=60)
+        if got.returncode != 0 or not out.is_file():
+            raise HTTPException(status_code=404, detail="the cut failed")
+    return FileResponse(out, media_type="audio/mpeg",
+                        filename=f"booth-{int(at)}.mp3")
+
+
 @app.post("/api/dj/line/vote")
 async def dj_line_vote(
     request: Request,
@@ -56243,6 +56304,97 @@ function boothAnalysisDossier(line) {
 }
 
 function djTalkRow(line) {
+  const row = djTalkRowInner(line);
+  if (line && line.kind !== "song_analysis"
+      && line.kind !== "image_analysis") boothRowAudio(row, line);
+  return row;
+}
+
+/* #840: EVERY booth entry plays and downloads — its own audio, found
+ * by air time on the server (episode staging, then sealed marks). */
+let boothClipPlaying = null;
+function boothRowAudio(row, line) {
+  const at = (typeof djTalkAirAt === "function"
+    ? Number(djTalkAirAt(line)) : 0) || Number(line.ts) || 0;
+  if (!at) return;
+  const wrap = el("span", "", "");
+  wrap.style.cssText = "display:inline-flex;gap:3px;margin-left:auto;"
+    + "flex:0 0 auto;align-self:flex-start";
+  const mk = (label, title) => {
+    const b = el("button", "", label);
+    b.title = title;
+    b.style.cssText = "font-size:9.5px;padding:0 5px;opacity:.55;"
+      + "background:transparent;border:1px solid var(--border);"
+      + "border-radius:5px;cursor:pointer;line-height:1.5";
+    b.onmouseenter = () => { b.style.opacity = "1"; };
+    b.onmouseleave = () => { b.style.opacity = ".55"; };
+    return b;
+  };
+  async function grab() {
+    const r = await fetch("/api/booth/clip?at=" + Math.round(at),
+      {headers: {"Authorization": "Bearer " + key()}});
+    if (!r.ok) {
+      let why = "no audio kept for this row";
+      try { why = (await r.json()).detail || why; } catch (e2) {}
+      throw new Error(why);
+    }
+    return URL.createObjectURL(await r.blob());
+  }
+  const play = mk("▶", "Play this entry's own audio (ducks the station)");
+  play.onclick = async (ev) => {
+    ev.stopPropagation();
+    if (boothClipPlaying) {
+      try { boothClipPlaying.pause(); } catch (e2) {}
+      boothClipPlaying = null;
+      if (play.textContent === "⏹") { play.textContent = "▶"; return; }
+    }
+    play.textContent = "…";
+    try {
+      const src = await grab();
+      const audio = new Audio(src);
+      boothClipPlaying = audio;
+      try { cacheHoldStart("duck"); djApplyGain(); } catch (e2) {}
+      const done = () => {
+        if (boothClipPlaying === audio) boothClipPlaying = null;
+        play.textContent = "▶";
+        try { setTimeout(cacheHoldEnd, 150); } catch (e2) {}
+        setTimeout(() => URL.revokeObjectURL(src), 4000);
+      };
+      audio.onended = done; audio.onerror = done; audio.onpause = done;
+      await audio.play();
+      play.textContent = "⏹";
+    } catch (err) {
+      play.textContent = "▶";
+      setStatus(err.message, true);
+    }
+  };
+  const take = mk("⬇", "Download this entry's audio as mp3");
+  take.onclick = async (ev) => {
+    ev.stopPropagation();
+    take.textContent = "…";
+    try {
+      const src = await grab();
+      const words = String(line.text || line.sting || "clip")
+        .replace(/[^\w ]+/g, "").trim().split(/\s+/)
+        .slice(0, 6).join(" ");
+      const a = document.createElement("a");
+      a.href = src;
+      a.download = ((line.who || "booth") + " "
+        + (words || "clip")).slice(0, 60) + ".mp3";
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(src), 15000);
+      take.textContent = "⬇";
+    } catch (err) {
+      take.textContent = "⬇";
+      setStatus(err.message, true);
+    }
+  };
+  wrap.appendChild(play);
+  wrap.appendChild(take);
+  row.appendChild(wrap);
+}
+
+function djTalkRowInner(line) {
   {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
