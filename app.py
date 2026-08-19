@@ -588,7 +588,15 @@ DEFAULT_DJ = {
     "upstairs_per_hour": 3.0,
     # A tape from the mysterious Ehm Eckx after every Nth song (#239).
     # 0 = the mail has stopped. The folder is named relative to the share.
-    "mixtape_every": 3,
+    # #828/#829: EIGHT, not three. A tape is not just another record — it
+    # sets `segment = tape_slot` in the show loop, and that vetoes all
+    # four talk slots for the whole record: no memo from upstairs, no
+    # caller, no news, no banter. Every third record was therefore one
+    # record in three with the desk gagged, which from the room sounds
+    # exactly like "too many MX Mix tapes too often" and like dead air
+    # with music under it. The slider reaches 40 now if you want the mail
+    # rarer still, and 0 stops it entirely.
+    "mixtape_every": 8,
     "mixtape_folder": "_music by me",
     # Let the active system prompt colour the pair's mood, so switching
     # prompts swings the disposition of the show. Off by default: the DJ
@@ -1209,7 +1217,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "upstairs_per_hour": max(0.0, min(12.0, float(
             raw_dj.get("upstairs_per_hour",
                        DEFAULT_DJ["upstairs_per_hour"]) or 0))),
-        "mixtape_every": max(0, min(10, int(
+        # #828/#829: the ceiling was 10, so a slider past "every tenth
+        # song" silently snapped back and the owner could not make the
+        # mail rare. 40 is the new top; 0 still stops it altogether.
+        "mixtape_every": max(0, min(40, int(
             raw_dj.get("mixtape_every",
                        DEFAULT_DJ["mixtape_every"]) or 0))),
         "mixtape_folder": (str(raw_dj.get("mixtape_folder")
@@ -1376,7 +1387,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "model": model or "qwen3:14b",
         "temperature": max(0.0, min(2.0, temperature)),
         "top_p": max(0.0, min(1.0, top_p)),
-        "max_tokens": max(20, min(1000, max_tokens)),
+        # #894/#832: 1000 tokens was a small visit to the model. The
+        # operator asked for enough rhetoric per call that the desk does
+        # not have to go back for more.
+        "max_tokens": max(20, min(8000, max_tokens)),
         "web_search": bool(data.get("web_search", True)),
         "game_search": bool(data.get("game_search", True)),
         "gear_manuals": bool(data.get("gear_manuals", True)),
@@ -1385,7 +1399,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "long_term_memory": bool(data.get("long_term_memory", True)),
         "openwebui_logging": bool(data.get("openwebui_logging", True)),
         "wake": validate_wake(data.get("wake")),
-        "num_ctx": max(2048, min(32768, num_ctx)),
+        # #894/#832: gemma4 carries 131072; clamping the SETTING to
+        # 32768 meant the operator could not give the writer more room
+        # even when the model had it.
+        "num_ctx": max(2048, min(131072, num_ctx)),
         "render_replies": render_replies,
         "voice_out": voice_out,
         "dj": dj,
@@ -5848,6 +5865,12 @@ async def _run_cure(cure: str) -> bool:
             fire_and_forget(_box_hold_drain_soon())
             return len(_BOX_HOLD) < before or before > 0
         if cure == "music_kick":
+            # #840: right medicine for a zombie or dead stream, exactly
+            # wrong over a healthy record — that is the station changing
+            # the song under the listener. Asked before the stop, so a
+            # refusal never leaves the air stopped with nothing behind it.
+            if not track_may_cut("the remembered music_kick cure"):
+                return False
             try:
                 await music_box_stop_now()
             except Exception:  # noqa: BLE001
@@ -5972,8 +5995,17 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                  "cutting to a fresh round and putting a live line "
                  "out as proof")
             _TALK_CUT[0] += 1
-            _RADIO["fast_skip"] = True
-            dj_skip()
+            # #840: cut the ROUND, never the record. The round is dead —
+            # _TALK_CUT above abandons it — but a quiet desk over a
+            # perfectly good record is fixed by the proof line below,
+            # which speaks over the top of it. Changing the song was
+            # never part of the cure.
+            if track_may_cut("the deep repair's DJ rung"):
+                _RADIO["fast_skip"] = True
+                dj_skip()
+            else:
+                mark("the record", "mid-play — left turning; the fresh "
+                     "round comes over the top of it (#840)")
         if _talk_gap > 180:
             async def _prove() -> None:
                 try:
@@ -6019,6 +6051,11 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                  else "did NOT rejoin within a minute — that is a power "
                  "cord, not software", "")
             _RADIO["fast_skip"] = True
+            # #840 EXEMPT: the device was just power-cycled and nothing
+            # has VERIFIED audible for two minutes — whatever the record
+            # clock believes, none of it is reaching the room. The fresh
+            # session needs a record pushed onto it or the box stays
+            # silent until the old record's clock runs out.
             dj_skip()
             mark("the fresh needle",
                  "a new record pushed onto the fresh session")
@@ -8350,6 +8387,10 @@ def media_sign(key: str) -> str:
 _PANTRY: dict[str, dict[str, Any]] = {}
 PANTRY_LIFE = 5400.0                    # ninety minutes, then it is stale
 PANTRY_MAX = 600
+# #894/#832: "we never let our cache get over six gigabytes total".
+# Counting clips says nothing about disk; this counts bytes and sheds
+# oldest-first the moment the shelf is over its allowance.
+PANTRY_MAX_BYTES = int(os.getenv("PANTRY_MAX_BYTES", str(6 * 1024 ** 3)))
 _PANTRY_GATE = asyncio.Semaphore(2)     # never crowd the live round
 
 
@@ -8375,6 +8416,25 @@ def pantry_get(key: str) -> dict[str, Any] | None:
     return dict(clip)
 
 
+def _pantry_bytes_of(row: dict[str, Any]) -> int:
+    got = row.get("bytes")
+    if isinstance(got, int):
+        return got
+    name = str((row.get("clip") or {}).get("path") or "")
+    name = name.rsplit("/", 1)[-1].split("?")[0]
+    size = 0
+    try:
+        size = (VOICE_MEDIA_DIR / name).stat().st_size if name else 0
+    except OSError:
+        size = 0
+    row["bytes"] = size
+    return size
+
+
+def pantry_bytes() -> int:
+    return sum(_pantry_bytes_of(r) for r in list(_PANTRY.values()))
+
+
 def pantry_put(key: str, clip: dict[str, Any]) -> None:
     if not (clip or {}).get("path"):
         return
@@ -8384,6 +8444,22 @@ def pantry_put(key: str, clip: dict[str, Any]) -> None:
                           key=lambda k: float(_PANTRY[k].get("at") or 0)
                           )[:len(_PANTRY) - PANTRY_MAX]:
             _PANTRY.pop(old, None)
+    # #894: and the six-gigabyte allowance. Oldest goes first, and only
+    # the SHELF entry is dropped — the file itself is left to the normal
+    # media prune, which knows what is still queued to air.
+    try:
+        held = pantry_bytes()
+        if held > PANTRY_MAX_BYTES:
+            for old in sorted(_PANTRY,
+                              key=lambda k: float(_PANTRY[k].get("at") or 0)):
+                if held <= PANTRY_MAX_BYTES:
+                    break
+                held -= _pantry_bytes_of(_PANTRY[old])
+                _PANTRY.pop(old, None)
+            pipeline_log("lookahead", "the pantry reached its six-gigabyte "
+                         "allowance — oldest takes shed (#894)")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def pantry_seconds() -> float:
@@ -13491,6 +13567,57 @@ _TALK_CUT = [0]
 _SEGMENT_TASK: list[Any] = []
 
 
+# #840: "Stop having the DJs change the track in the middle of the track.
+# Only have the track change by me changing it, a request to change it, or
+# the track ending."
+#
+# dj_skip() is the ONE lever that moves the needle and a dozen places pull
+# it. Three kinds of caller: the operator's own buttons and the request
+# line (which must keep working), the record ending (which is the whole
+# point), and a handful of watchdogs and repair rungs that reach in while
+# a record is happily turning. Only the third kind is the complaint — from
+# the room it is the song changing for no reason half way through.
+#
+# So the automatic callers ask first. True means the cut may go ahead:
+# nothing is playing (dead-air recovery must NEVER be blocked), or the
+# record is inside its run-out groove and was ending anyway. False means a
+# record is mid-play, the cut is refused, and the ledger says so.
+CUT_TAIL_SECONDS = 12.0
+
+
+def track_may_cut(reason: str) -> bool:
+    """May an AUTOMATIC cut move the needle right now? (#840)
+
+    The operator's skip, a listener request, a downvote on the record
+    playing and the show stopping never come through here — a hand on the
+    desk always wins. Watchdogs and repair rungs do.
+    """
+    try:
+        if not _RADIO.get("on"):
+            return True                  # no show to protect
+        track = _RADIO.get("now")
+        if not track:
+            return True                  # nothing on the needle
+        if not now_really_playing(slack=2.0):
+            return True                  # a stale pin, not a record
+        started = float(_RADIO.get("started") or 0)
+        length = float(track.get("seconds") or 0)
+        if started <= 0 or length <= 0:
+            return True                  # no clock to judge by
+        left = (started + length) - time.time()
+        if left <= CUT_TAIL_SECONDS:
+            return True                  # it was ending anyway
+        pipeline_log(
+            "air", "refused to cut "
+                   f"{track.get('title') or 'the record'} with "
+                   f"{int(left)}s still to run — {reason}. The track "
+                   "changes when YOU change it, when it is requested, or "
+                   "when it ends (#840)")
+        return False
+    except Exception:  # noqa: BLE001
+        return True                      # the guard never takes the show
+
+
 def dj_skip() -> None:
     for event in _DJ_SKIP:
         try:
@@ -14982,12 +15109,21 @@ async def pantry_keeper() -> None:
             window = pantry_window()
             if not window:
                 continue
-            nxt = next((e for e in _LARDER
-                        if not e.get("prepared") and not e.get("preparing")),
-                       None)
-            if nxt is None:
+            # #894/#832: while we have the room, record MORE than one.
+            # Preparing a single round per window is what kept the buffer
+            # shallow — the point of the visit is to come away with
+            # enough material that nobody has to be sent back.
+            made_any = False
+            for _entry in list(_LARDER):
+                if pantry_window() != window:
+                    break               # the live road wants the engine
+                if _entry.get("prepared") or _entry.get("preparing"):
+                    continue
+                made_any = True
+                if not await larder_prepare(_entry):
+                    break               # engine said no; try again later
+            if not made_any:
                 continue
-            await larder_prepare(nxt)
         except Exception:  # noqa: BLE001
             pass
 
@@ -15081,6 +15217,8 @@ def dialogue_flow_state() -> dict[str, Any]:
         "prepared": sum(1 for e in _LARDER if e.get("prepared")),
         "buffered_seconds": pantry_seconds(),
         "pantry_clips": len(_PANTRY),
+        "pantry_mb": round(pantry_bytes() / 1048576, 1),
+        "pantry_cap_mb": round(PANTRY_MAX_BYTES / 1048576),
         "window": pantry_window(),
     }
 
@@ -15440,6 +15578,11 @@ async def dead_air_watch() -> None:
             repair_note(f"dead air {int(quiet)}s — strike {strikes}, "
                         "kicking the show forward")
             _TALK_CUT[0] += 1
+            # #840 EXEMPT: this is the dead-air recovery and it is never
+            # guarded. It is only reached with nothing really playing,
+            # nobody speaking and nothing rendering for longer than the
+            # silence slider allows. The station must never be silent,
+            # and that outranks every other rule here.
             dj_skip()
             if strikes == 2 and box_worth_healing():
                 # Second strike: assume the speaker link, not the show —
@@ -31403,7 +31546,11 @@ async def ask_model(prompt: str, limit: int = 300,
         repeat_penalty=1.12,
         # A caller may ask for an EXPANDED window (#496): a deep round hands
         # the model far more foundation and needs room to hold it.
-        num_ctx=max(2048, min(32768, num_ctx or settings["num_ctx"])),
+        # #894/#832: 32768 was a hard ceiling against models that carry
+        # far more — gemma4 reports 131072. The operator asked for more
+        # rhetoric per visit to the model; this is the room to write it
+        # in. The setting still governs; this only stops clamping it.
+        num_ctx=max(2048, min(131072, num_ctx or settings["num_ctx"])),
     )
     answer = ((result.get("message") or {}).get("content") or "").strip()
     answer = re.sub(r"<think>.*?</think>", " ", answer, flags=re.S)
@@ -74151,8 +74298,11 @@ async function djBanterPanel() {
     const tapes = el("div", "", "");
     tapes.style.marginTop = "14px";
     tapes.appendChild(el("div", "", "The MX mixtapes"));
-    const tapeSlider = slider("a tape after every", "mixtape_every", 0, 10,
-      dj.mixtape_every ?? 3,
+    // #828/#829: the slider tops out at 40 now and rests at 8. A tape
+    // takes the whole record AND gags the talk desk for it, so frequent
+    // mail is dead air with music on it.
+    const tapeSlider = slider("a tape after every", "mixtape_every", 0, 40,
+      dj.mixtape_every ?? 8,
       (v) => v ? v + (v === 1 ? " song" : " songs") : "the mail has stopped");
     tapes.appendChild(tapeSlider.wrap);
     tapes.appendChild(el("div", "muted", "New files dropped in the folder "
@@ -83692,7 +83842,29 @@ if __name__ == "__main__":
         _RADIO.setdefault("recent", {}).pop("tape", None)
     # The mail interrupts the queue: with the counter run down, the next
     # pick IS the tape, and an ordinary pick winds the counter back up.
-    assert DEFAULT_DJ["mixtape_every"] == 3
+    # #828/#829: eight by default now, and the slider reaches forty — the
+    # old clamp of ten was the reason a rarer setting would not save.
+    assert DEFAULT_DJ["mixtape_every"] == 8
+    assert validate_settings(
+        {**DEFAULT_SETTINGS, "dj": {**DEFAULT_DJ, "mixtape_every": 40}}
+    )["dj"]["mixtape_every"] == 40
+
+    # #840: the guard that keeps an automatic cut off a turning record.
+    # Nothing on the needle → allowed, because dead-air recovery must
+    # never be blocked; ten seconds into a five minute record → refused;
+    # the run-out groove of the same record → allowed, it was ending.
+    _cut_was = (_RADIO.get("on"), _RADIO.get("now"), _RADIO.get("started"))
+    try:
+        _RADIO["on"] = True
+        _RADIO["now"] = None
+        assert track_may_cut("selfcheck: nothing on the needle")
+        _RADIO["now"] = {"id": "sc", "title": "Selfcheck", "seconds": 300}
+        _RADIO["started"] = time.time() - 10.0
+        assert not track_may_cut("selfcheck: ten seconds in")
+        _RADIO["started"] = time.time() - 296.0
+        assert track_may_cut("selfcheck: the run-out groove")
+    finally:
+        (_RADIO["on"], _RADIO["now"], _RADIO["started"]) = _cut_was
 
     # The caller vocoder: a stranger's mangle is stable and scaled by the
     # depth, the master switch silences the whole rack, and every character
