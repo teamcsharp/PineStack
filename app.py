@@ -4738,7 +4738,13 @@ async def piper_catalog() -> list[str]:
     if _PIPER_CATALOG["voices"] and time.time() - _PIPER_CATALOG["at"] < 300:
         return _PIPER_CATALOG["voices"]
     try:
-        names = await piper_voices()
+        # #850: SIX SECONDS, not forever. Every other call site already
+        # wrapped this in wait_for; this one did not, and #842 put it on
+        # the hot path of every render — so a wyoming-piper that accepts
+        # the connection and then dies mid-frame (its log shows exactly
+        # that) left `await reader.readline()` blocked for ever and hung
+        # voice_render_any before a single rung was tried.
+        names = await asyncio.wait_for(piper_voices(), 6)
     except Exception:
         names = []
     if names:
@@ -4916,7 +4922,13 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
     # clone engines were down a named DJ had NO last resort and the line
     # was simply lost, while the drop log claimed "Piper included". A
     # stand-in voice is a smaller loss than silence, every time.
-    stand_in = await piper_fallback_voice(who)
+    try:
+        # #850: belt as well as braces. The stand-in is looked up on
+        # EVERY render now, so it gets its own ceiling — a slow catalog
+        # must never delay the engines that were going to work.
+        stand_in = await asyncio.wait_for(piper_fallback_voice(who), 8)
+    except Exception:  # noqa: BLE001
+        stand_in = ""
     rungs: list[tuple[str, str, str]] = []
     if is_clone:
         bare = _rung_bare or voice
@@ -5002,6 +5014,22 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
 _BACKLOG_BUSY = [False]
 
 
+async def _box_hold_drain_soon() -> None:
+    """#850: nudge the hold shelf so a rescued box-bound line plays now
+    rather than at the next scheduled drain."""
+    try:
+        await asyncio.sleep(0.5)
+        n = 0
+        while _BOX_HOLD and n < 6:
+            if not await _replay_held(_BOX_HOLD[0]):
+                break
+            _BOX_HOLD.pop(0)
+            _box_hold_save()
+            n += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def render_backlog_drain() -> None:
     """Air the lines that could not be rendered when they were written.
 
@@ -5028,6 +5056,18 @@ async def render_backlog_drain() -> None:
             if not (clip and clip.get("path")):
                 break                   # still nothing; try again next time
             _RENDER_BACKLOG.pop(0)
+            # #850: a line that was BOUND FOR THE BOX goes to the box.
+            # The drain only ever republished to the page feed, so a
+            # rescued line reached the website and still never reached
+            # the speaker the operator is listening to.
+            if held.get("to_box"):
+                try:
+                    box_hold(clip, str(held.get("text") or ""),
+                             str(held.get("who") or ""),
+                             str(held.get("id") or ""))
+                    fire_and_forget(_box_hold_drain_soon())
+                except Exception:  # noqa: BLE001
+                    pass
             _RADIO["voice_clips"].append({
                 "ts": int(time.time() * 1000),
                 "url": f"{clip['path']}?t={clip['sig']}",
@@ -12202,7 +12242,27 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
             diverted = True
             why = ""
         else:
-            note_drop(who, spoken, f"never aired (no voice) — {why}"[:200])
+            # #850: the box road used to DELETE the line here — no shelf,
+            # no chat row, nothing to retry — while the page road put its
+            # twin on _RENDER_BACKLOG and tried it for twenty minutes.
+            # A station fault is a delay, not a deletion; the words wait
+            # and go out when an engine answers. `to_box` rides along so
+            # the drain sends it to the SPEAKER and not just the page.
+            note_drop(who, spoken,
+                      f"no voice yet — shelved for retry: {why}"[:200])
+            _RENDER_BACKLOG.append({
+                "text": spoken, "who": who, "kind": kind,
+                "voice": forced or "", "id": line_id,
+                "to_box": True, "at": time.time()})
+            del _RENDER_BACKLOG[:-40]
+            render_backlog_top()
+            _RADIO["chat"].append({
+                "ts": int(time.time()), "who": who, "kind": kind,
+                "text": spoken, "voice": forced or "",
+                "name": booth_actor_name(who, name),
+                "aired": "held", "id": line_id,
+            })
+            del _RADIO["chat"][:-240]
             _speaking_now_clear(line_id)
             return ""
     # #770: the moment this line STARTED sounding. dj_speak writes its entry
