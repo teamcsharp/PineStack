@@ -23,7 +23,8 @@ from urllib.parse import quote, urlparse
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import (FileResponse, HTMLResponse,
-                               PlainTextResponse, Response)
+                               PlainTextResponse, Response,
+                               StreamingResponse)
 
 app = FastAPI(
     title="PineBoxAgent",
@@ -8380,6 +8381,30 @@ def _media_prune() -> None:
         pass
 
 
+async def _range_stream(path: Path, start: int, end: int,
+                        chunk: int = 262144):
+    """#883: hand the bytes over as they come off the disk.
+
+    The music route used to read the whole requested window into memory
+    before writing a single byte, and a phone opens a track with
+    `Range: bytes=0-` — the WHOLE file. On a 90MB track off CIFS that
+    was 11.82s before the listener heard anything, against 0.070s
+    streamed. Every spurious client seek re-issued that same whole-file
+    range, which is how one hiccup became the stall heard in the car."""
+    left = end - start + 1
+    handle = await asyncio.to_thread(path.open, "rb")
+    try:
+        await asyncio.to_thread(handle.seek, start)
+        while left > 0:
+            block = await asyncio.to_thread(handle.read, min(chunk, left))
+            if not block:
+                break
+            left -= len(block)
+            yield block
+    finally:
+        await asyncio.to_thread(handle.close)
+
+
 def _range_slice(header: str, total: int) -> tuple[int, int] | None:
     """Parse one byte range. None = send the whole file, (-1, -1) = 416.
     iOS Safari refuses audio it cannot seek within, so this is not optional."""
@@ -14963,7 +14988,32 @@ async def _torrent_talk() -> None:
                 kinds = [k for k in kinds if k != "caller"]
             last = str(_RADIO.get("last_round_kind") or "")
             choices = [k for k in kinds if k != last] or kinds
-            kind = random.choice(choices)
+            # #884: the operator gets asked first. A standing choice off
+            # the switchboard overrides the random draw for this round
+            # only; with nothing chosen the show runs exactly as before.
+            _chosen = switchboard_take()
+            _RADIO["switch_angle"] = ""
+            if _chosen:
+                _want = str(SWITCH_KINDS.get(
+                    str(_chosen.get("kind") or ""), {}).get("round") or "")
+                _RADIO["switch_angle"] = str(_chosen.get("premise") or "")
+                if _want == "track":
+                    # "drop the needle" is not a round — it is the end of
+                    # one. Cut the talk and let the record have the air.
+                    try:
+                        dj_skip()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    pipeline_log("switchboard",
+                                 "the operator called for the record (#884)")
+                    await asyncio.sleep(2)
+                    continue
+                if _want and (_want in kinds or _want == "bombshell"):
+                    kind = _want
+                else:
+                    kind = random.choice(choices)
+            else:
+                kind = random.choice(choices)
             _RADIO["last_round_kind"] = kind
             aired = False
             try:
@@ -14990,9 +15040,13 @@ async def _torrent_talk() -> None:
                         aired = bool(await dj_banter(track, render_stream=bool(
                             dj.get("stream_show", True))))
                 elif kind == "bombshell":
-                    shell = drop_bombshell()
-                    angle = (bombshell_angle(shell["text"])
-                             if shell and shell.get("text") else "")
+                    # #884: an operator-chosen rant carries its own
+                    # premise; otherwise the station picks its own.
+                    angle = str(_RADIO.get("switch_angle") or "")
+                    if not angle:
+                        shell = drop_bombshell()
+                        angle = (bombshell_angle(shell["text"])
+                                 if shell and shell.get("text") else "")
                     aired = bool(await dj_banter(
                         track, angle=angle or None,
                         render_stream=bool(dj.get("stream_show", True))))
@@ -15195,6 +15249,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
+    _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
     _RADIO_TASK.append(asyncio.create_task(tape_watch()))
     tape_warmer()                      # the shelf normalizes itself (#242)
     remember_radio(True, _RADIO["station"])
@@ -19338,6 +19393,253 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
 # size. ponytail: no numpy/faiss; add one only if the folder passes tens of
 # thousands of swaths. The embedder being down is a no-op, never a dead radio.
 SPEAKBOX_VECTORS = data_path("speakbox_vectors.json")
+# --- The switchboard (#884) ------------------------------------------
+# Five roads out of any moment, each mapped onto a round the station
+# already knows how to do. The operator picks one from the booth; the
+# station remembers what they picked.
+SWITCH_KINDS: dict[str, dict[str, str]] = {
+    "plot": {"round": "deep",
+             "face": "a plot line",
+             "ask": "an ongoing story thread between the pair — "
+                    "something unresolved that they pick at"},
+    "producer": {"round": "manager",
+                 "face": "word from the producer",
+                 "ask": "a message from the station's producer, which "
+                        "the pair have to react to live"},
+    "caller": {"round": "caller",
+               "face": "a call comes in",
+               "ask": "somebody ringing the station with a reason"},
+    "track": {"round": "track",
+              "face": "drop the needle",
+              "ask": "stop talking and play the next record"},
+    "rant": {"round": "bombshell",
+             "face": "a side rant",
+             "ask": "one of them goes off on a tangent sparked by "
+                    "something out of the speakbox"},
+}
+
+DECISIONS_DIR = data_path("decisions")
+DECISION_VECTORS = data_path("decision_vectors.json")
+SWITCH_OFFER_LIFE = 300.0               # a board goes stale in 5 minutes
+_SWITCHBOARD: list[dict[str, Any]] = []
+_SWITCH_QUEUE: list[dict[str, Any]] = []    # what the operator has chosen
+_SWITCH_FILLING = [False]
+_SWITCH_LOCK = RLock()
+
+
+def switchboard_live() -> list[dict[str, Any]]:
+    """The offers still worth showing."""
+    now = time.time()
+    with _SWITCH_LOCK:
+        _SWITCHBOARD[:] = [o for o in _SWITCHBOARD
+                           if now - float(o.get("at") or 0) < SWITCH_OFFER_LIFE]
+        return [dict(o) for o in _SWITCHBOARD]
+
+
+def switchboard_take() -> dict[str, Any]:
+    """The operator's next instruction, if they left one."""
+    with _SWITCH_LOCK:
+        if not _SWITCH_QUEUE:
+            return {}
+        return _SWITCH_QUEUE.pop(0)
+
+
+def _decision_vectors() -> dict[str, Any]:
+    try:
+        got = json.loads(DECISION_VECTORS.read_text())
+        if isinstance(got, dict):
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return {"rows": []}
+
+
+def _decision_vectors_save(store: dict[str, Any]) -> None:
+    try:
+        DECISION_VECTORS.parent.mkdir(parents=True, exist_ok=True)
+        store["rows"] = list(store.get("rows") or [])[-4000:]
+        tmp = DECISION_VECTORS.with_suffix(".tmp")
+        tmp.write_text(json.dumps(store))
+        tmp.replace(DECISION_VECTORS)
+    except OSError:
+        pass
+
+
+async def decision_record(chosen: dict[str, Any],
+                          refused: list[dict[str, Any]],
+                          how: str = "picked") -> None:
+    """#884: write the decision down — a markdown document AND a vector.
+
+    This is the part that compounds. Every choice the operator makes is
+    a statement about how this station should run, and until now every
+    one of them evaporated the moment the round aired."""
+    try:
+        DECISIONS_DIR.mkdir(parents=True, exist_ok=True)
+        now = time.time()
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+        kind = str(chosen.get("kind") or "")
+        face = str(chosen.get("face") or SWITCH_KINDS.get(kind, {}).get(
+            "face", kind))
+        premise = str(chosen.get("premise") or "")
+        track = (_RADIO.get("now") or {})
+        on_air = " - ".join(x for x in (str(track.get("artist") or ""),
+                                        str(track.get("title") or "")) if x)
+        turned_down = "; ".join(
+            f"{o.get('kind')}: {str(o.get('premise') or '')[:80]}"
+            for o in refused)[:600]
+        body = (
+            f"---\n"
+            f"at: {int(now)}\n"
+            f"when: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now))}\n"
+            f"kind: {kind}\n"
+            f"how: {how}\n"
+            f"on_air: {on_air}\n"
+            f"---\n\n"
+            f"# {face}\n\n"
+            f"The operator sent the show down the *{face}* road.\n\n"
+            f"**The premise taken:** {premise or '(none)'}\n\n"
+            f"**Turned down:** {turned_down or '(nothing else was offered)'}\n\n"
+            f"**Playing at the time:** {on_air or '(nothing)'}\n")
+        (DECISIONS_DIR / f"{stamp}-{kind}.md").write_text(
+            body, encoding="utf-8")
+        # …and into the vector store, so the next board can lean on it.
+        text = (f"{face}. {premise}. while playing {on_air}"
+                if premise else f"{face}. while playing {on_air}")
+        vecs = await _embed_texts([text])
+        if vecs:
+            store = _decision_vectors()
+            store.setdefault("rows", []).append({
+                "at": now, "kind": kind, "face": face,
+                "premise": premise[:400], "on_air": on_air[:160],
+                "how": how, "v": vecs[0]})
+            _decision_vectors_save(store)
+        pipeline_log("switchboard",
+                     f"decision written down - {face} (#884)",
+                     extra=premise[:180])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def decisions_recall(query: str, k: int = 5) -> list[dict[str, Any]]:
+    """What the operator has chosen in moments like this one."""
+    try:
+        store = _decision_vectors()
+        rows = list(store.get("rows") or [])
+        if not rows or not query.strip():
+            return []
+        got = await _embed_texts([query])
+        if not got:
+            return []
+        q = got[0]
+        scored = []
+        for row in rows:
+            v = row.get("v") or []
+            if len(v) != len(q):
+                continue
+            scored.append((sum(a * b for a, b in zip(q, v)), row))
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+        return [dict(r, score=round(s, 4)) for s, r in scored[:k]]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def decisions_taste() -> dict[str, int]:
+    """A blunt tally of which roads get taken — enough to bias a board
+    without needing the model to think about it."""
+    tally: dict[str, int] = {}
+    for row in (_decision_vectors().get("rows") or []):
+        key = str(row.get("kind") or "")
+        if key:
+            tally[key] = tally.get(key, 0) + 1
+    return tally
+
+
+async def switch_premise(kind: str) -> str:
+    """A concrete, already-decided premise for one road.
+
+    Drawn from the station's own material rather than written by the
+    model, so standing a fresh board up costs nothing on a GPU that is
+    already busy making voices."""
+    try:
+        if kind == "track":
+            nxt = (_RADIO.get("coming") or {})
+            title = " - ".join(x for x in (str(nxt.get("artist") or ""),
+                                           str(nxt.get("title") or "")) if x)
+            return f"cut the talk and play {title}" if title else \
+                "cut the talk and drop the needle on the next record"
+        seed = await speakbox_quote(most=2, cap=200)
+        line = str((seed or {}).get("text") or "").strip()
+        if not line:
+            return str(SWITCH_KINDS.get(kind, {}).get("ask") or "")
+        if kind == "rant":
+            return f"set one of them off about this: \"{line[:170]}\""
+        if kind == "caller":
+            return f"a caller who turns up with this on their mind: " \
+                   f"\"{line[:150]}\""
+        if kind == "producer":
+            return f"the producer sends word, and it lands on this: " \
+                   f"\"{line[:150]}\""
+        return f"the thread they keep circling: \"{line[:170]}\""
+    except Exception:  # noqa: BLE001
+        return str(SWITCH_KINDS.get(kind, {}).get("ask") or "")
+
+
+async def switchboard_fill(want: int = 4) -> None:
+    """Stand a fresh board up, weighted by what the operator likes."""
+    if _SWITCH_FILLING[0]:
+        return
+    _SWITCH_FILLING[0] = True
+    try:
+        taste = decisions_taste()
+        kinds = list(SWITCH_KINDS)
+        # Roads the operator has taken before come up more often, but
+        # every road keeps a floor so the board never collapses onto one.
+        weights = [1.0 + 1.6 * float(taste.get(k, 0)) /
+                   float(max(1, sum(taste.values()))) for k in kinds]
+        picked: list[str] = []
+        pool = list(zip(kinds, weights))
+        while pool and len(picked) < max(2, min(int(want), len(kinds))):
+            total = sum(w for _k, w in pool) or 1.0
+            roll = random.random() * total
+            run = 0.0
+            for i, (k, w) in enumerate(pool):
+                run += w
+                if roll <= run:
+                    picked.append(k)
+                    pool.pop(i)
+                    break
+            else:
+                picked.append(pool.pop(0)[0])
+        fresh: list[dict[str, Any]] = []
+        for kind in picked:
+            fresh.append({
+                "id": uuid.uuid4().hex[:10],
+                "kind": kind,
+                "face": SWITCH_KINDS[kind]["face"],
+                "premise": await switch_premise(kind),
+                "at": time.time(),
+            })
+        with _SWITCH_LOCK:
+            _SWITCHBOARD[:] = fresh
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _SWITCH_FILLING[0] = False
+
+
+async def switchboard_keeper() -> None:
+    """Keep a board standing whenever the station is on air."""
+    while True:
+        try:
+            if _RADIO.get("on"):
+                live = switchboard_live()
+                if len(live) < 2:
+                    await switchboard_fill()
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(20)
+
+
 EMBED_MODEL = os.getenv("EMBED_MODEL", "nomic-embed-text")
 SPEAKBOX_VEC_MAX = 40000                # #816: 24000 was REACHED — the
                                         # positional cut silently erased
@@ -21810,6 +22112,88 @@ DROP_LINES = (
     "Somebody had to say it.",
 )
 
+# #882: the SFX guy's liners are WRITTEN, not picked off a shelf of six.
+# Four of those six named the station, and a bare random.choice over
+# four options repeats back-to-back a quarter of the time — which is
+# exactly what the operator heard, the same ID three stings running.
+# These are brewed from speakbox material in the background and kept in
+# a small stack, so the sting itself never waits on a model.
+_DROP_FRESH: list[str] = []
+_DROP_BREW_AT = [0.0]
+
+
+async def drop_liner_brew(want: int = 6) -> None:
+    """Write the SFX guy a fresh stack of station IDs."""
+    if time.time() - _DROP_BREW_AT[0] < 90:
+        return
+    _DROP_BREW_AT[0] = time.time()
+    station = dj_settings()["station_name"]
+    got: dict[str, Any] = {}
+    seed = ""
+    try:
+        got = await speakbox_quote(most=2, cap=200) or {}
+        seed = str(got.get("text") or "").strip()
+    except Exception:  # noqa: BLE001
+        seed = ""
+    ask = (
+        "You are the sting voice on a radio station — the guy who says "
+        "one hard line over a stab of sound and gets out. Write "
+        f"{want} DIFFERENT station IDs for a station called "
+        f"\"{station}\". Rules: one line each, under twelve words, "
+        "English only, no stage directions, no quotation marks, no "
+        "numbering. Most of them should name the station outright. "
+        "They must not resemble each other — different rhythm, "
+        "different angle, different attitude on every one.")
+    if seed:
+        ask += ("\n\nTake your colour from this material, without "
+                f"quoting it directly:\n{seed[:400]}")
+    try:
+        raw = await ask_model(ask, limit=40 * max(1, want), spice=0.9)
+    except Exception:  # noqa: BLE001
+        return
+    fresh: list[str] = []
+    for row in str(raw or "").splitlines():
+        line = re.sub(r"^\s*[-*\d.)\]]+\s*", "", row).strip()
+        line = line.strip('"').strip("'").strip()
+        if not (4 < len(line) <= 90):
+            continue
+        if not english_only(line):
+            continue
+        if line in _DROP_FRESH or line in fresh:
+            continue
+        fresh.append(line)
+    if not fresh:
+        return
+    _DROP_FRESH.extend(fresh)
+    del _DROP_FRESH[24:]
+    if seed:
+        try:
+            _crystal_influence_note("drop", str(got.get("file") or ""),
+                                    seed, "sting")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def drop_liner(station: str) -> str:
+    """One station ID, and never the one just heard.
+
+    A written line if the stack has one — consumed on use, so it is
+    genuinely new material every sting — and otherwise the old shelf,
+    but drawn through unrepeated() so it cannot land twice running."""
+    if len(_DROP_FRESH) < 3:
+        fire_and_forget(drop_liner_brew())
+    pool = [ln for ln in _DROP_FRESH if ln]
+    if pool:
+        line = unrepeated(pool, "drop_liner", keep=10)
+        try:
+            _DROP_FRESH.remove(line)
+        except ValueError:
+            pass
+        return line
+    naming = [ln for ln in DROP_LINES if "{station}" in ln] or list(DROP_LINES)
+    return unrepeated([ln.format(station=station) for ln in naming],
+                      "drop_fallback", keep=3)
+
 
 _SFX_POOL_CACHE: list[Path] = []
 _SFX_POOL_AT = [0.0]
@@ -21987,8 +22371,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         # it in full (#462) — pick only the station-naming lines, and route
         # it as a station ID so the name governor leaves the full name in
         # (an "interject" would have scrubbed it down to "the station").
-        naming = [ln for ln in DROP_LINES if "{station}" in ln] or DROP_LINES
-        line = random.choice(naming).format(station=station)
+        # #882: written, seeded, and never the line just heard.
+        line = await drop_liner(station)
         if station and station.lower() not in line.lower():
             line = f"{line} {station}."
         try:
@@ -37970,6 +38354,66 @@ async def dj_topics_get(
     return {"topics": read_bombshells()}
 
 
+@app.get("/api/dj/paths")
+async def dj_paths(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#884: the board as it stands — the roads out of this moment."""
+    require_read_auth(authorization)
+    live = switchboard_live()
+    if not live:
+        fire_and_forget(switchboard_fill())
+    return {"paths": live, "taste": decisions_taste(),
+            "queued": len(_SWITCH_QUEUE)}
+
+
+@app.post("/api/dj/paths/choose")
+async def dj_paths_choose(
+    body: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#884: send the show down one of them, and write the choice down."""
+    require_auth(authorization)
+    want = str(body.get("id") or "")
+    with _SWITCH_LOCK:
+        chosen = next((dict(o) for o in _SWITCHBOARD
+                       if str(o.get("id")) == want), {})
+        refused = [dict(o) for o in _SWITCHBOARD
+                   if str(o.get("id")) != want]
+        if not chosen:
+            return {"ok": False, "why": "that path has already expired"}
+        _SWITCH_QUEUE.append(chosen)
+        del _SWITCH_QUEUE[3:]           # a short queue, not a programme
+        _SWITCHBOARD.clear()
+    fire_and_forget(decision_record(chosen, refused, "picked"))
+    fire_and_forget(switchboard_fill())
+    return {"ok": True, "took": chosen.get("face"),
+            "premise": chosen.get("premise"), "queued": len(_SWITCH_QUEUE)}
+
+
+@app.get("/api/dj/paths/learned")
+async def dj_paths_learned(
+    q: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#884: what the station has worked out about how you run it."""
+    require_read_auth(authorization)
+    rows = sorted((_decision_vectors().get("rows") or []),
+                  key=lambda r: float(r.get("at") or 0), reverse=True)
+    near = await decisions_recall(q, 6) if q.strip() else []
+    return {
+        "taste": decisions_taste(),
+        "decisions": len(rows),
+        "recent": [{k: r.get(k) for k in
+                    ("at", "kind", "face", "premise", "on_air", "how")}
+                   for r in rows[:25]],
+        "similar": [{k: r.get(k) for k in
+                     ("kind", "face", "premise", "on_air", "score")}
+                    for r in near],
+        "documents": str(DECISIONS_DIR),
+    }
+
+
 @app.post("/api/dj/topics")
 async def dj_topics_add(
     request: Request,
@@ -43925,21 +44369,14 @@ async def music_file(
         return Response(status_code=416, headers=headers)
     if window:
         start, end = window
-
-        def _slice() -> bytes:
-            with path.open("rb") as handle:      # seek, never read 100 MB
-                handle.seek(start)
-                return handle.read(end - start + 1)
-
-        try:
-            # An <audio> element issues several of these per track, each a
-            # multi-hundred-millisecond CIFS read.
-            chunk = await asyncio.to_thread(_slice)
-        except Exception:
-            return Response(status_code=404)
+        # #883: stream it. Nothing is held in memory but one 256KB block,
+        # and the first one is on the wire immediately instead of after
+        # the whole track has been pulled off the share.
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(chunk, status_code=206, headers=headers,
-                        media_type=media_type)
+        headers["Content-Length"] = str(end - start + 1)
+        return StreamingResponse(_range_stream(path, start, end),
+                                 status_code=206, headers=headers,
+                                 media_type=media_type)
     return FileResponse(path, media_type=media_type, headers=headers)
 
 
@@ -55375,6 +55812,15 @@ function djTalkPopup() {
   hang.title = "How calls end — the randomized termination rules, their "
     + "odds, and the ledger of which ending each call took";
   hang.onclick = (ev) => { ev.stopPropagation(); hangupRules(""); };
+  /* #884/#885: the switchboard. The roads out of this moment, written
+   * ahead of being wanted — pick one and the next round goes that way.
+   * Every pick is written down and embedded, so the station slowly
+   * learns how you want it run. */
+  const paths = el("button", "", "🔀");
+  paths.id = "djPathsBtn";
+  paths.title = "The switchboard — choose where the show goes next. "
+    + "Every choice teaches the station how you run it (#884)";
+  paths.onclick = (ev) => { ev.stopPropagation(); djPathsPanel(paths); };
   // #656: the history is kept forever now, so there is a way to end it —
   // and only this, never the window doing it on its own.
   // #745: only the newest rows are kept in the document — the night itself
@@ -55408,7 +55854,8 @@ function djTalkPopup() {
   head.appendChild(title);
   head.appendChild(dot);                                        // #678
   head.appendChild(grab);
-  head.appendChild(hang);                                       // #691
+  head.appendChild(hang);
+  head.appendChild(paths);                                       // #691
   head.appendChild(all);                                        // #745
   head.appendChild(wipe);
   head.appendChild(mute);
@@ -66093,6 +66540,105 @@ function djCutTheater(tray, running) {
   });
   th._log.textContent = ops.join("\n");
 }
+
+function djPathsPanel(anchor) {
+  /* #884: the board. Each row is a road the station has already written
+   * a premise for, so choosing one costs no thinking time on air. */
+  const gone = document.getElementById("djPathsPanel");
+  if (gone) { gone.remove(); return; }
+  const pop = el("div", "panel", "");
+  pop.id = "djPathsPanel";
+  const at = anchor.getBoundingClientRect();
+  pop.style.cssText = "position:fixed;z-index:220;width:min(430px,94vw);"
+    + "padding:10px 12px;margin:0;max-height:78vh;overflow:auto;"
+    + "left:" + Math.max(8, Math.min(window.innerWidth - 440, at.left - 200))
+    + "px;top:" + (at.bottom + 6) + "px";
+  pop.onclick = (e) => e.stopPropagation();
+  const hd = el("div", "", "🔀 where does the show go next?");
+  hd.style.cssText = "font-weight:700;font-size:12px";
+  pop.appendChild(hd);
+  const sub = el("div", "muted", "Each road is already written. Pick one "
+    + "and the next round takes it — the station remembers what you chose.");
+  sub.style.cssText = "font-size:10px;line-height:1.5;margin:3px 0 7px";
+  pop.appendChild(sub);
+  const body = el("div", "", "Standing the board up…");
+  body.style.cssText = "font-size:11px;color:var(--muted)";
+  pop.appendChild(body);
+  const foot = el("div", "muted", "");
+  foot.style.cssText = "font-size:10px;margin-top:8px;line-height:1.5";
+  pop.appendChild(foot);
+  document.body.appendChild(pop);
+
+  const FACE = {plot: "🧵", producer: "📻", caller: "☎", track: "💿",
+                rant: "🌶"};
+  const draw = async () => {
+    let got = null;
+    try { got = await api("/api/dj/paths"); }
+    catch (e) { body.textContent = "the board is unreachable"; return; }
+    const rows = (got && got.paths) || [];
+    body.textContent = "";
+    if (!rows.length) {
+      body.textContent = "no roads standing yet — one moment.";
+      setTimeout(draw, 2500);
+      return;
+    }
+    rows.forEach((o) => {
+      const row = el("button", "", "");
+      row.style.cssText = "display:block;width:100%;text-align:left;"
+        + "margin:0 0 6px;padding:7px 9px;font-size:11px;line-height:1.5;"
+        + "white-space:normal;border-radius:7px";
+      const name = el("div", "", (FACE[o.kind] || "•") + "  " + o.face);
+      name.style.cssText = "font-weight:700;margin-bottom:2px";
+      row.appendChild(name);
+      const why = el("div", "muted", String(o.premise || ""));
+      why.style.cssText = "font-size:10px;line-height:1.45";
+      row.appendChild(why);
+      row.onclick = async (ev) => {
+        ev.stopPropagation();
+        row.disabled = true;
+        name.textContent = (FACE[o.kind] || "•") + "  taking that road…";
+        try {
+          const r = await api("/api/dj/paths/choose", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({id: o.id}),
+          });
+          body.textContent = "";
+          const ok = el("div", "", r && r.ok
+            ? "✓ the next round goes down " + (r.took || "that road")
+            : "that road expired — here is a fresh board");
+          ok.style.cssText = "font-size:11px;color:var(--accent);"
+            + "margin-bottom:6px";
+          body.appendChild(ok);
+          setTimeout(draw, 1800);
+        } catch (e) {
+          name.textContent = "could not take that road";
+          row.disabled = false;
+        }
+      };
+      body.appendChild(row);
+    });
+    const taste = (got && got.taste) || {};
+    const seen = Object.keys(taste).sort((a, b) => taste[b] - taste[a]);
+    foot.textContent = seen.length
+      ? ("what you tend to pick: "
+         + seen.map((k) => k + " ×" + taste[k]).join(", ")
+         + " — these bias which roads come up.")
+      : "nothing learned yet. Your first pick starts the record.";
+  };
+  draw();
+  setTimeout(() => {
+    const off = (ev) => {
+      const live = document.getElementById("djPathsPanel");
+      if (live && !live.contains(ev.target)) {
+        live.remove();
+        document.removeEventListener("click", off);
+      }
+    };
+    document.addEventListener("click", off);
+  }, 0);
+}
+
 
 function djTailPanel(anchor) {
   const gone = document.getElementById("djTailPanel");
