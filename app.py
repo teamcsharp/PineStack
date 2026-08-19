@@ -8967,6 +8967,39 @@ def _clip_seconds(path: str) -> float:
         return 0.0
 
 
+# #864: consecutive sends that Home Assistant accepted and the speaker
+# never played. Reset by any verified playout.
+_PAPER_MISS = [0]
+
+
+async def _deaf_box_restart() -> None:
+    """#864: press the device's own restart button and wait for it to
+    come back, then let the hold shelf pour the backlog into it. The
+    30-minute cooldown inside nabu_device_restart is deliberately NOT
+    cleared here — a box that goes deaf twice in half an hour is a
+    hardware conversation, not something to keep rebooting."""
+    try:
+        if not await nabu_device_restart("deaf box — accepted, never "
+                                         "played (#864)"):
+            return
+        for _ in range(12):
+            await asyncio.sleep(6)
+            _SAT_ALIVE.update({"checked": 0.0, "entity": ""})
+            if bool((await satellite_status()).get("online")):
+                break
+        pipeline_log("repair", "the box is back after its restart — "
+                               "draining whatever waited (#864)")
+        drained = 0
+        while _BOX_HOLD and drained < 6:
+            if not await _replay_held(_BOX_HOLD[0]):
+                break
+            _BOX_HOLD.pop(0)
+            _box_hold_save()
+            drained += 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def _play_on_box(path: str, sig: str, reply: bool = False,
                        replay: bool = False) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
@@ -9141,6 +9174,7 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                             _BOX_DOWN.update({"fails": 0, "until": 0.0})
                             _BOX_LAST_OK[0] = time.time()
                             _HEAL_STREAK[0] = 0
+                            _PAPER_MISS[0] = 0            # #864: it hears
                         else:
                             _airtime_note(seconds, 0.0)
                             _ANNOUNCE_LAST["error"] = (
@@ -9152,6 +9186,23 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                                          "(#822)", extra=path)
                             _box_announce_failed()
                             fire_and_forget(satellite_selfheal())
+                            # #864: THE DEAF BOX. A paper acceptance is
+                            # the signature of a Voice PE that takes
+                            # everything and plays nothing, and the
+                            # session rebuild above cannot touch it —
+                            # only the device's own restart button can.
+                            # Three in a row is not ambiguity.
+                            _PAPER_MISS[0] += 1
+                            if _PAPER_MISS[0] >= 3:
+                                _PAPER_MISS[0] = 0
+                                pipeline_log(
+                                    "repair", "three sends accepted and "
+                                    "none heard — the box is deaf, not "
+                                    "busy; pressing its restart button "
+                                    "(#864)")
+                                note_action("🔁 the box went deaf — "
+                                            "restarting it")
+                                fire_and_forget(_deaf_box_restart())
                             return ""
                     return player
                 retry, wait, rebuild = say_retry_plan(
