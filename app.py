@@ -19592,6 +19592,10 @@ def perf_dsp_chain(vec: dict[str, Any], rate: int) -> str:
         parts.append(f"atempo={pace:.3f}")
     st = int(round(float(vec.get("pitch_st") or 0)
                    + float(vec.get("pitch_trim") or 0)))     # #756
+    # #832: the pitch road is an asetrate resample trick — past two
+    # semitones it audibly warbles ("modulating terribly", the
+    # operator's ear). Intonation stays; the artifacts go.
+    st = max(-2, min(2, st))
     if st:
         parts.append(_pitch_chain(st, rate))
     energy = float(vec.get("energy") or 0.0)
@@ -32081,7 +32085,9 @@ def _lyric_usable(text: str) -> bool:
     words = re.findall(r"[A-Za-z']+", text)
     if len(words) < 25:
         return False
-    if _LYRIC_JUNK.search(text.strip()[:200]):
+    # #831: [:200] meant a transcript's own headers filled the junk
+    # window and hallucinations past it were never seen.
+    if _LYRIC_JUNK.search(text.strip()):
         return False
     # A loop of the same phrase is the other way it fails.
     runs: dict[str, int] = {}
@@ -32155,7 +32161,7 @@ async def _lyric_one(path: Path) -> str:
 async def _lyric_digest(artist: str, songs: list[dict[str, Any]]) -> str:
     """What the catalogue is ABOUT — the part the DJs actually read."""
     corpus = "\n\n".join(
-        f"## {s['title']}\n{s['text'][:2500]}" for s in songs)[:24000]
+        f"## {s['title']}\n{s['text'][:1500]}" for s in songs)[:60000]
     head = (f"# {artist} — the world of the songs\n\n"
             f"_Read from {len(songs)} recordings in the library._\n\n")
     try:
@@ -32192,6 +32198,117 @@ async def _lyric_digest(artist: str, songs: list[dict[str, Any]]) -> str:
             + ", ".join(f"{w} ({n})" for n, w in top) + "\n\n"
             + "## The songs\n\n"
             + "\n".join(f"- {s['title']}" for s in songs) + "\n")
+
+
+SUNO_LYRICS_PATH = data_path("suno_lyrics.json")
+_SUNO_ROWS: list[dict[str, Any]] = []
+_SUNO_AT = [0.0]
+
+
+def _suno_norm(t: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(t or "").lower())
+
+
+def _suno_rows() -> list[dict[str, Any]]:
+    if _SUNO_ROWS and time.time() - _SUNO_AT[0] < 600:
+        return _SUNO_ROWS
+    try:
+        rows = json.loads(SUNO_LYRICS_PATH.read_text())
+        if isinstance(rows, list):
+            _SUNO_ROWS[:] = rows
+            _SUNO_AT[0] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+    return _SUNO_ROWS
+
+
+def _lyric_from_suno(title: str, seconds: float = 0.0) -> str:
+    """#831: the artist's OWN sheet off their Suno catalog — byte-perfect
+    and complete, which no transcription of a produced mix will ever be.
+    Matched by normalized title, tie-broken by duration."""
+    rows = _suno_rows()
+    if not rows:
+        return ""
+    key = _suno_norm(title)
+    if not key:
+        return ""
+    hits = [r for r in rows if r.get("norm") == key]
+    if not hits:
+        hits = [r for r in rows if len(key) > 6
+                and (key in str(r.get("norm")) or str(r.get("norm")) in key)]
+    if not hits:
+        return ""
+    if len(hits) > 1 and seconds:
+        hits.sort(key=lambda r: abs(float(r.get("duration") or 0)
+                                    - seconds))
+    return str(hits[0].get("lyrics") or "")
+
+
+async def suno_catalog_refresh(handle: str = "mx1001") -> dict[str, Any]:
+    """#831: pull the WHOLE catalog's lyric sheets — the profile listing
+    embeds every clip's full text, ~20 clips a page, no auth. Cached to
+    disk; a refresh is cheap and paced at one request a second."""
+    rows: dict[str, dict[str, Any]] = {}
+    total = None
+    page = 1
+    async with httpx.AsyncClient(timeout=30, headers={
+            "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                           "AppleWebKit/537.36 (KHTML, like Gecko) "
+                           "Chrome/126.0 Safari/537.36")}) as client:
+        while page <= 60 and (total is None or (page - 1) * 20 < total):
+            r = await client.get(
+                f"https://studio-api.prod.suno.com/api/profiles/{handle}",
+                params={"playlists_sort_by": "upvote_count",
+                        "clips_sort_by": "created_at", "page": page})
+            if r.status_code != 200:
+                break
+            d = r.json() or {}
+            total = int(d.get("num_total_clips") or 0)
+            clips = d.get("clips") or []
+            if not clips:
+                break
+            for c in clips:
+                md = c.get("metadata") or {}
+                if md.get("make_instrumental"):
+                    continue
+                if md.get("gpt_description_prompt"):
+                    continue            # style prompt, not a lyric sheet
+                raw = str(md.get("prompt") or "")
+                clean = "\n".join(
+                    ln for ln in raw.splitlines()
+                    if not re.fullmatch(r"\s*\[[^\]]*\]\s*", ln)).strip()
+                if len(clean) < 60:
+                    continue
+                cid = str(c.get("id") or "")
+                rows[cid] = {"id": cid,
+                             "title": str(c.get("title") or ""),
+                             "norm": _suno_norm(c.get("title")),
+                             "duration": md.get("duration"),
+                             "tags": str(md.get("tags") or "")[:200],
+                             "lyrics": clean[:12000]}
+            page += 1
+            await asyncio.sleep(1.0)
+    out = list(rows.values())
+    if out:
+        SUNO_LYRICS_PATH.write_text(json.dumps(out))
+        _SUNO_ROWS[:] = out
+        _SUNO_AT[0] = time.time()
+    pipeline_log("speakbox", f"Suno catalog for @{handle}: "
+                 f"{len(out)} lyric sheets cached of "
+                 f"{total or 0} clips (#831)")
+    return {"handle": handle, "sheets": len(out), "clips": total or 0}
+
+
+@app.post("/api/lyrics/suno")
+async def lyrics_suno_refresh(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#831: refresh the artist's Suno lyric catalog. {"handle": "..."}"""
+    require_auth(authorization)
+    payload = await request.json()
+    return await suno_catalog_refresh(
+        str(payload.get("handle") or "mx1001"))
 
 
 def _lyric_from_tags(path: Path) -> str:
@@ -32237,7 +32354,8 @@ def _lyric_from_tags(path: Path) -> str:
     return max(texts, key=len).strip() if texts else ""
 
 
-def _mind_song(mind: str, title: str, body: str) -> int:
+def _mind_song(mind: str, title: str, body: str,
+               refresh: bool = False) -> int:
     """#793: the LYRICS go into the mind song by song, as they are won —
     not one digest at the end of a job a restart can erase. Returns 1
     when a new document lands so the caller can pace reindexing."""
@@ -32254,7 +32372,7 @@ def _mind_song(mind: str, title: str, body: str) -> int:
         root = speakbox_dir(mind)
         root.mkdir(parents=True, exist_ok=True)
         doc = root / f"{safe_key(title) or 'track'} - lyrics.md"
-        if doc.is_file():
+        if doc.is_file() and not refresh:
             return 0
         doc.write_text(body, encoding="utf-8")
         return 1
@@ -32274,6 +32392,10 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
         for at, track in enumerate(tracks):
             if job.get("stage") == "cancelled":
                 break
+            # #831: BREATHE. A 2,109-track sweep whose existing pages
+            # all short-circuit runs as ONE synchronous block otherwise
+            # — the whole event loop starves and the station stalls.
+            await asyncio.sleep(0)
             title = str(track.get("title") or f"track {at + 1}")
             _lyric_note(job, current=title, done=at,
                         progress=round(at / max(1, len(tracks)), 3))
@@ -32295,22 +32417,49 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
                 _cands += sorted(folder.glob(f"* - {_t}.md"))
                 if _cands:
                     page = _cands[0]
+            _tsecs = float(track.get("seconds") or 0)
+            _suno_txt = _lyric_from_suno(title, _tsecs)
+            _upgrade = False
             if page.is_file() and not force:
                 body = page.read_text(errors="replace")
-                songs.append({"title": title, "text": body})
-                _fresh += _mind_song(mind, title, body)
-                if _fresh and _fresh % 8 == 0:
-                    fire_and_forget(speakbox_reindex(rid=mind))
-                continue
+                # #831: a THIN page (a paltry capture) upgrades itself
+                # the moment the artist's own sheet is on hand.
+                if (_suno_txt and len(_suno_txt) > 120
+                        and len(body) < 0.6 * len(_suno_txt) + 200):
+                    _upgrade = True
+                    pipeline_log("speakbox", f"{title} \u2014 thin page "
+                                 "upgraded from the Suno sheet (#831)")
+                else:
+                    songs.append({"title": title, "text": body})
+                    _fresh += _mind_song(mind, title, body)
+                    if _fresh and _fresh % 8 == 0:
+                        fire_and_forget(speakbox_reindex(rid=mind))
+                    continue
             _src_note = "transcribed"
-            text = _lyric_from_tags(Path(str(track.get("path") or "")))
-            if text and len(text) > 200:
-                _src_note = "lyrics from the file's own tags"
-                pipeline_log("speakbox", f"{title} \u2014 lyrics shipped in "
-                             "the tags; no rip needed (#832)")
+            if _suno_txt and len(_suno_txt) > 120:
+                # #831: the artist's own sheet outranks every capture —
+                # complete and byte-perfect where whisper guesses.
+                _src_note = "the artist's own Suno lyric sheet"
+                text = _suno_txt
             else:
-                text = await _lyric_one(
-                    Path(str(track.get("path") or "")))
+                text = _lyric_from_tags(Path(str(track.get("path") or "")))
+                if text and len(text) > 200:
+                    _src_note = "lyrics from the file's own tags"
+                    pipeline_log("speakbox", f"{title} \u2014 lyrics "
+                                 "shipped in the tags; no rip needed "
+                                 "(#832)")
+                else:
+                    text = await _lyric_one(
+                        Path(str(track.get("path") or "")))
+            # #831: the voice-lab transcript ships headers — "# Source
+            # Transcript", durations, "## HH:MM:SS — Speaker N" — which
+            # were written INTO the lyric pages, inflating word counts
+            # and spending the digest budget on timestamps.
+            if text:
+                text = "\n".join(
+                    ln for ln in text.splitlines()
+                    if not re.match(
+                        r"\s*(#|\*\*Duration|## ?\d\d:)", ln)).strip()
             if not (text and _lyric_usable(text)):
                 job["instrumental"] = int(job.get("instrumental") or 0) + 1
                 pipeline_log("speakbox",
@@ -32322,7 +32471,8 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
                 f"- {_src_note} {time.strftime('%Y-%m-%d %H:%M')}\n\n"
                 + text, encoding="utf-8")
             songs.append({"title": title, "text": text})
-            _fresh += _mind_song(mind, title, f"# {title}\n\n{text}")
+            _fresh += _mind_song(mind, title, f"# {title}\n\n{text}",
+                                 refresh=_upgrade)
             if _fresh and _fresh % 8 == 0:
                 fire_and_forget(speakbox_reindex(rid=mind))
             pipeline_log("speakbox", f"read {title} — "
@@ -32330,7 +32480,11 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
         _lyric_note(job, stage="digesting", progress=0.97)
         if songs:
             digest = await _lyric_digest(artist, songs)
-            (folder / "_artist.md").write_text(digest, encoding="utf-8")
+            # #831: sixty-one sequential album jobs each overwrote one
+            # shared _artist.md — the "world of the songs" was always
+            # just the last album processed. One digest per mind.
+            (folder / f"_{mind or 'artist'}.md").write_text(
+                digest, encoding="utf-8")
             # And into the mind, where the pair can actually mine it —
             # #829: NEVER into "main" by fallback; the shared shelf is
             # the operator's, not a dumping ground for extractions.
