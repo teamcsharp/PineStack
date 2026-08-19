@@ -543,6 +543,16 @@ DEFAULT_DJ = {
     # A memo comes down from the manager upstairs every N tracks (0 = never).
     # The manager is the active system prompt (#189).
     "manager_every": 7,
+    # #841/#839: THE HOURLY QUOTAS, and the schedule the station actually
+    # runs on now. The two counters above are a modulo on records PLAYED,
+    # so their real rate is whatever length the shuffle happens to deal,
+    # and a slot that cannot be used (a segment already ran, the record is
+    # nearly over) is skipped with no retry until the modulo comes round
+    # again. That is why the hourly count was never hit. These are counted
+    # against what has genuinely AIRED in the last sixty minutes; 0 hands
+    # the road back to the old counter and nothing else changes.
+    "manager_per_hour": 4,          # #841: "3-5 messages an hour"
+    "caller_per_hour": 5,           # #839: "I need that quota hit"
     # The news desk (#228, #229): a loose story between tracks every N
     # tracks (0 = never), and the bulletin on the hour, every hour.
     "news_every": 8,
@@ -1171,6 +1181,15 @@ def validate_settings(data: Any) -> dict[str, Any]:
             raw_dj.get("caller_every", DEFAULT_DJ["caller_every"]) or 0))),
         "manager_every": max(0, min(50, int(
             raw_dj.get("manager_every", DEFAULT_DJ["manager_every"]) or 0))),
+        # #841/#839: the per-hour targets. Twelve is the ceiling for the
+        # same reason upstairs_per_hour stops there: past one every five
+        # minutes it is no longer a segment, it is the show.
+        "manager_per_hour": max(0, min(12, int(
+            raw_dj.get("manager_per_hour",
+                       DEFAULT_DJ["manager_per_hour"]) or 0))),
+        "caller_per_hour": max(0, min(12, int(
+            raw_dj.get("caller_per_hour",
+                       DEFAULT_DJ["caller_per_hour"]) or 0))),
         "news_every": max(0, min(50, int(
             raw_dj.get("news_every", DEFAULT_DJ["news_every"]) or 0))),
         "news_hourly": bool(raw_dj.get("news_hourly", True)),
@@ -8834,8 +8853,15 @@ _RENDER_COST: list[float] = []
 # spent the night in Piper stand-in voices instead of their own, which
 # is the opposite of what the relief is for. Continuity is the pantry's
 # job now (#886); this is only for a genuinely sick engine.
-RENDER_COST_SLOW = 2.8          # sustained ratio at which we borrow Piper
-RENDER_COST_OK = 2.0            # ...and the ratio at which the clones return
+# #895: measured again under real load with the vision model gone —
+# XTTS sits around 2.9x on this box while the station is working, so a
+# 2.8 trigger still flapped, and every flap did two bad things: it put
+# the pair in Piper stand-in voices instead of their own, and it closed
+# the pantry's building window (#890), starving the very buffer that
+# makes relief unnecessary. Piper is now the answer to a SICK engine,
+# not a busy one. Continuity is the pantry's job.
+RENDER_COST_SLOW = 4.5          # sustained ratio at which we borrow Piper
+RENDER_COST_OK = 3.4            # ...and the ratio at which the clones return
 _RENDER_RELIEF = [False]
 _RENDER_RELIEF_AT = [0.0]        # when it latched on (#784)
 
@@ -11871,6 +11897,12 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                   ("sfxguy_rate", "SFX Guy interjections", "range", 0, 100, 1),
                   ("sfxguy_warp", "SFX Guy invention", "range", 0, 100, 1)],
         "caller": [("callin_per_hour", "Calls per hour", "range", 0, 20, 1),
+                   # #839: the request-line quota. Distinct from the line
+                   # above: callin_per_hour is the generated call-in road,
+                   # this is the road that reads back his own requests and
+                   # used to ring off a track counter.
+                   ("caller_per_hour", "Request-line calls an hour (quota)",
+                    "range", 0, 12, 1),
                    ("caller_success_rate", "Successful calls", "range", 0, 100, 1),
                    ("caller_insanity", "Caller intensity", "range", 0, 100, 1),
                    # #798: the behaviour deck, exposed — relative weights.
@@ -11882,6 +11914,10 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("caller_plain", "Deck · ordinary folk", "range", 0, 100, 1),
                    ("caller_carefree", "Deck · could not care less", "range", 0, 100, 1)],
         "manager": [("upstairs_per_hour", "Manager interruptions per hour", "range", 0, 12, 0.5),
+                    # #841: "I want him doing 3-5 messages an hour, and
+                    # I want him on a slider I can adjust."
+                    ("manager_per_hour", "Memos from upstairs an hour (quota)",
+                     "range", 0, 12, 1),
                     ("manager_name", "Manager name", "text", 0, 0, 0)],
         "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 20, 1),
                         ("banter_max_lines", "Maximum exchange lines", "number", 2, 20, 1),
@@ -11899,6 +11935,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                   ("research", "Track research enabled", "checkbox", 0, 0, 0),
                   ("talk_radio", "Talk-show intensity", "range", 0, 100, 1)],
         "workplace": [("upstairs_per_hour", "Management interruptions per hour", "range", 0, 12, 0.5),
+                      # #841: the same dial, on the desk that owns the
+                      # manager relationship.
+                      ("manager_per_hour",
+                       "Memos from upstairs an hour (quota)",
+                       "range", 0, 12, 1),
                       ("manager_name", "Manager name", "text", 0, 0, 0)],
     }
     systems = {
@@ -13812,16 +13853,84 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
                       - float(_RADIO.get("started") or time.time())))
 
     segment = tape_slot        # the tape IS the segment (#242)
-    if dj["manager_every"] and not segment and _room() > 45 \
-            and played % dj["manager_every"] == 0:
+
+    # #841/#839: THE QUOTA GATE. What used to be `played % every == 0` is
+    # now "is the hour short of its target, and has enough time passed" -
+    # a clock question, asked of a clock. The modulo stays as a SECONDARY
+    # trigger so anything else reading `*_every` still behaves and an
+    # operator who never touches the new sliders sees the old show; but
+    # while a per-hour target is set it also caps the modulo, so the two
+    # roads together can never overshoot the number the owner asked for.
+    def _quota_open(kind: str, every_key: str) -> bool:
+        try:
+            target = quota_target(kind, dj)
+            if quota_due(kind, dj):
+                return True
+            every = int(dj.get(every_key) or 0)
+            if not every or played % every != 0:
+                return False
+            # the old counter may still open a door, never past the target
+            return not (target > 0 and quota_count(kind) >= target)
+        except Exception:  # noqa: BLE001
+            # Never let the scheduler's own arithmetic take the show down:
+            # fall back to precisely the behaviour that shipped before.
+            try:
+                every = int(dj.get(every_key) or 0)
+                return bool(every) and played % every == 0
+            except Exception:  # noqa: BLE001
+                return False
+
+    def _quota_short(kind: str) -> float:
+        """How far behind its target this hour is, as a fraction. -1 means
+        the dial is off and this road has no quota to be short of."""
+        try:
+            target = quota_target(kind, dj)
+            if target <= 0:
+                return -1.0
+            return (target - quota_count(kind)) / float(target)
+        except Exception:  # noqa: BLE001
+            return -1.0
+
+    _mgr_open = (not segment and _room() > 45
+                 and _quota_open("manager", "manager_every"))
+    # #839: WHEN THE SLOT IS SCARCE IT GOES TO WHOEVER IS WORSE OFF. Under
+    # long records a record carries one segment, the manager is tested
+    # first, and the phones therefore starve behind him however far behind
+    # their own quota they are - measured at one call an hour against a
+    # target of five. This only ever fires when BOTH are due and a call
+    # genuinely fits; otherwise nothing about the order changes.
+    if (_mgr_open and _room() > 90
+            and _quota_open("caller", "caller_every")
+            and _quota_short("caller") > _quota_short("manager")):
+        _mgr_open = False
+
+    if _mgr_open:
+        try:
+            pipeline_log("air", "a memo from upstairs is due - "
+                                f"{quota_count('manager')} of "
+                                f"{quota_target('manager', dj)} this hour "
+                                + ("(BEHIND, taking this opening) "
+                                   if quota_behind("manager", dj) else "")
+                                + "(#841)")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             segment = bool(await dj_manager_note(track))
             await asyncio.sleep(0.8)
         except Exception:
             pass
 
-    if (not segment and dj["caller_every"] and _room() > 90
-            and played % dj["caller_every"] == 0):
+    if not segment and _room() > 90 and _quota_open("caller",
+                                                    "caller_every"):
+        try:
+            pipeline_log("air", "a call is due on the request line - "
+                                f"{quota_count('caller')} of "
+                                f"{quota_target('caller', dj)} this hour "
+                                + ("(BEHIND, taking this opening) "
+                                   if quota_behind("caller", dj) else "")
+                                + "(#839)")
+        except Exception:  # noqa: BLE001
+            pass
         try:
             segment = bool(await dj_caller(track))
             await asyncio.sleep(0.8)
@@ -15220,6 +15329,11 @@ def dialogue_flow_state() -> dict[str, Any]:
         "pantry_mb": round(pantry_bytes() / 1048576, 1),
         "pantry_cap_mb": round(PANTRY_MAX_BYTES / 1048576),
         "window": pantry_window(),
+        # #841/#839: is the hourly quota actually being hit? The complaint
+        # was a COUNT, so the count is the answer: what aired in the last
+        # sixty minutes, what was asked for, and whether this hour is
+        # behind its pace. Rides /api/dj under "dialogue_flow" too.
+        "quota": quota_state(),
     }
 
 
@@ -15370,7 +15484,12 @@ async def _torrent_talk() -> None:
                      "news", "manager", "bombshell"]
             if not dj.get("deep_convo", True):
                 kinds = [k for k in kinds if k != "deep"]
-            if not dj.get("caller_every"):
+            # #839: the phone is off only when BOTH roads are off. The
+            # hourly quota is the primary schedule now, so an operator who
+            # zeroes the old track counter and sets a per-hour target must
+            # not silently lose the torrent's calls along with it.
+            if not (dj.get("caller_every")
+                    or quota_target("caller", dj)):
                 kinds = [k for k in kinds if k != "caller"]
             last = str(_RADIO.get("last_round_kind") or "")
             choices = [k for k in kinds if k != last] or kinds
@@ -15400,6 +15519,29 @@ async def _torrent_talk() -> None:
                     kind = random.choice(choices)
             else:
                 kind = random.choice(choices)
+                # #839/#841: BEHIND BEATS THE DICE. A missed opportunity
+                # in the record loop waits for the next modulo, which is
+                # how an hour that falls short never catches back up. The
+                # torrent throws a round every breath, so when a quota is
+                # behind its pace for the hour AND spaced far enough from
+                # the last one, this round becomes that round instead of a
+                # coin toss. Only the random road is overridden - an
+                # operator's switchboard choice above still wins outright.
+                try:
+                    for _q in ("caller", "manager"):
+                        if (_q in kinds and _q != last
+                                and quota_behind(_q, dj)
+                                and quota_due(_q, dj)):
+                            kind = _q
+                            pipeline_log(
+                                "air", f"the torrent takes a {_q} round - "
+                                       "the hour is behind quota "
+                                       f"({quota_count(_q)} of "
+                                       f"{quota_target(_q, dj)}) "
+                                       "(#839/#841)")
+                            break
+                except Exception:  # noqa: BLE001
+                    pass        # the dice already chose; never fail here
             _RADIO["last_round_kind"] = kind
             aired = False
             try:
@@ -18955,6 +19097,73 @@ def callback_angles(count: int = 2) -> list[str]:
 
 
 COMFY_OUTPUT = Path("/comfy-output")
+
+# #831: where a picture actually LIVES under the mounted output tree.
+#
+# Every corner of the panel addresses art by bare filename, and all of it was
+# served by proxying ComfyUI's own /view. Two ways that breaks, and the
+# caller's licence hit both: /view only ever resolves the output ROOT, so
+# anything sitting in a subfolder (_contact_sheets/, smut/, video/) came back
+# 404 — and when ComfyUI itself is not up, which is often on a box that wants
+# its VRAM for the voices, EVERY image on the page fails at once. The folder
+# is bind-mounted at /comfy-output. Read it.
+_COMFY_FOUND: dict[str, Path] = {}
+
+_IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg", ".webp": "image/webp",
+                ".gif": "image/gif", ".bmp": "image/bmp",
+                ".mp4": "video/mp4", ".webm": "video/webm"}
+
+# A contact sheet is a 3x3 grid of thumbnails and the video/audio folders are
+# not pictures at all — nothing in either is anybody's face.
+_FACE_SKIP_DIRS = ("_contact_sheets", "video", "audio",
+                   "_output_images_will_be_put_here")
+
+
+def comfy_output_find(filename: str) -> Path | None:
+    """The file behind a bare gallery filename, subfolders included (#831)."""
+    name = str(filename or "").strip()
+    if not name or "/" in name or ".." in name:
+        return None
+    try:
+        held = _COMFY_FOUND.get(name)
+        if held is not None and held.is_file():
+            return held
+        direct = COMFY_OUTPUT / name
+        if direct.is_file():
+            _COMFY_FOUND[name] = direct
+            return direct
+        for found in COMFY_OUTPUT.rglob("*"):
+            if found.name == name and found.is_file():
+                if len(_COMFY_FOUND) > 600:
+                    _COMFY_FOUND.clear()
+                _COMFY_FOUND[name] = found
+                return found
+    except OSError:
+        return None
+    return None
+
+
+def comfy_output_bytes(filename: str) -> tuple[bytes, str] | None:
+    """A picture straight off the mount, with its content type (#831)."""
+    found = comfy_output_find(filename)
+    if found is None:
+        return None
+    try:
+        blob = found.read_bytes()
+    except OSError:
+        return None
+    return blob, _IMAGE_TYPES.get(found.suffix.lower(), "image/png")
+
+
+def face_candidate(path: Path) -> bool:
+    """Is this picture fit to be somebody's licence photo (#831)?"""
+    try:
+        if any(part in _FACE_SKIP_DIRS for part in path.parts):
+            return False
+        return "contact_sheet" not in path.name.lower()
+    except Exception:
+        return False
 
 
 def gallery_sample(limit: int = 8) -> list[str]:
@@ -23662,6 +23871,146 @@ def banter_due(dj: dict[str, Any], played: int) -> bool:
     return False
 
 
+# --- The hourly content quota (#841, #839) ---------------------------------
+#
+# "The manager isn't sending enough messages from upstairs... I want him
+# doing 3-5 messages an hour" (#841) and "I am not seeing enough phone
+# calls come into the station. The DJs fall behind on their hourly quota"
+# (#839) are the same bug reported twice: both segments were scheduled by
+# `played % every == 0`, a modulo on records PLAYED. So the rate was set
+# by record length rather than by the clock, and a slot that could not be
+# used was dropped with no retry.
+#
+# What follows counts what has actually AIRED in a rolling sixty minutes
+# and schedules against a per-hour target instead. Nothing here may ever
+# raise into the show: every entry point returns a safe answer on fault,
+# and "safe" always means "do not fire", so a broken counter can only make
+# the station quieter, never louder and never dead.
+
+QUOTA_KINDS = ("manager", "caller")
+
+# The floor between two of the same segment, however far behind the hour
+# is. Catching up is worth doing; four memos back to back is not.
+QUOTA_MIN_GAP = {"manager": 240.0, "caller": 180.0}
+
+
+def _quota_ring(kind: str) -> list[float]:
+    """The stamps of what genuinely went out, pruned to the last hour."""
+    quota = _RADIO.setdefault("quota", {})
+    ring = quota.setdefault(str(kind), [])
+    cut = time.time() - 3600.0
+    ring[:] = [t for t in ring if float(t or 0) >= cut][-60:]
+    return ring
+
+
+def quota_stamp(kind: str) -> None:
+    """One of these AIRED. Stamped at the point audio was really produced,
+    not where it was scheduled, because a round that came back empty is
+    exactly the case the old modulo miscounted as done (#841/#839)."""
+    try:
+        _quota_ring(kind).append(time.time())
+    except Exception:  # noqa: BLE001
+        pass                    # a counter never takes the show down
+
+
+def quota_target(kind: str, dj: dict[str, Any] | None = None) -> int:
+    """How many an hour the operator has asked for. 0 = the dial is off."""
+    try:
+        row = dj if isinstance(dj, dict) else dj_settings()
+        return max(0, min(12, int(row.get(f"{kind}_per_hour") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def quota_count(kind: str) -> int:
+    """How many have aired inside the last sixty minutes."""
+    try:
+        return len(_quota_ring(kind))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def quota_behind(kind: str, dj: dict[str, Any] | None = None) -> bool:
+    """Is the station BEHIND its pace for this clock hour?
+
+    The important case, and the one the owner is actually describing. He
+    is not complaining that the spacing is uneven, he is complaining the
+    COUNT is short: forty minutes into the hour with one call on the board
+    is behind, and being behind is what makes the next opportunity get
+    taken instead of skipped.
+
+    Deliberately conservative: the count is the ROLLING hour's, which is
+    never smaller than the count inside the current clock hour, so this
+    can only under-report being behind. It will not invent a deficit."""
+    try:
+        target = quota_target(kind, dj)
+        if target <= 0:
+            return False
+        clock = time.localtime()
+        into = (clock.tm_min * 60.0 + clock.tm_sec) / 3600.0
+        return (len(_quota_ring(kind)) + 0.75) < target * into
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def quota_due(kind: str, dj: dict[str, Any] | None = None) -> bool:
+    """Is one of these OWED right now?
+
+    Due when the rolling hour is short of its target AND enough time has
+    passed since the last one. Target spacing is 3600/target seconds with
+    tolerance, because opportunities are DISCRETE: records end when they
+    end, and demanding the full spacing means every near-miss slides a
+    whole record later and the hour quietly loses one. When the hour is
+    behind pace the spacing requirement collapses to a third (never below
+    QUOTA_MIN_GAP), which is the catch-up the modulo never had."""
+    try:
+        target = quota_target(kind, dj)
+        if target <= 0:
+            return False        # dial off: the old counter owns this road
+        ring = _quota_ring(kind)
+        if len(ring) >= target:
+            return False        # the hour's work is done; do not overrun
+        now = time.time()
+        spacing = 3600.0 / float(target)
+        floor = QUOTA_MIN_GAP.get(str(kind), 180.0)
+        need = max(floor, spacing * (0.34 if quota_behind(kind, dj)
+                                     else 0.85))
+        # Nothing on the board at all (a fresh show, a restart) means the
+        # very next opening is taken, which is the whole ask in #839.
+        since = (now - float(ring[-1])) if ring else 1e9
+        return since >= need
+    except Exception:  # noqa: BLE001
+        return False            # on fault, stay quiet rather than storm
+
+
+def quota_state() -> dict[str, Any]:
+    """What has aired this hour against what was asked for (#841/#839).
+
+    The complaint is a COUNT, so the count is what gets shown."""
+    out: dict[str, Any] = {}
+    try:
+        dj = dj_settings()
+    except Exception:  # noqa: BLE001
+        dj = {}
+    for kind in QUOTA_KINDS:
+        try:
+            ring = _quota_ring(kind)
+            target = quota_target(kind, dj)
+            last = float(ring[-1]) if ring else 0.0
+            out[str(kind)] = {
+                "aired": len(ring),
+                "target": target,
+                "behind": quota_behind(kind, dj),
+                "due": quota_due(kind, dj),
+                "since": round(time.time() - last, 1) if last else None,
+                "spacing": round(3600.0 / target) if target else 0,
+            }
+        except Exception:  # noqa: BLE001
+            out[str(kind)] = {"aired": 0, "target": 0, "behind": False,
+                              "due": False, "since": None, "spacing": 0}
+    return out
+
+
 # --- Things to spring on the other host ------------------------------------
 # The built-in angles keep the pair talking. These are yours: one of them
 # drops it cold and the other has to deal with it on air, unprepared.
@@ -25582,12 +25931,18 @@ def caller_face(name: str) -> str:
         except Exception:
             book = {}
         held = str(book.get(name) or "")
-        if held:
+        # #831: a remembered face is only good while its picture can still be
+        # SERVED. Five callers were holding contact-sheet jpgs out of a
+        # subfolder the image route could never resolve, and a held pick came
+        # straight back unchecked — so their licence photo was broken for
+        # good. One that cannot be found is re-drawn instead.
+        if held and comfy_output_find(held) is not None:
             return held
         try:
             found = [q.name for q in COMFY_OUTPUT.rglob("*")
                      if q.is_file() and q.suffix.lower() in
-                     (".png", ".jpg", ".jpeg", ".webp")]
+                     (".png", ".jpg", ".jpeg", ".webp")
+                     and face_candidate(q)]
         except OSError:
             found = []
         if not found:
@@ -29942,20 +30297,69 @@ async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
     # When the machine runs hot, the memo is about the HEAT (#375): the
     # manager upstairs feels the same air the computer makes.
     hot = booth_hot()
-    if hot >= 70 and random.random() < 0.5:
-        return await dj_banter(track, lines=3, angle=(
+    # #841: whether there is anything to READ OUT is settled BEFORE any
+    # material is drawn. A memo that cannot run must not eat a swath off
+    # the shelf or file a phantom row in the crystal observatory for words
+    # that never reached the air.
+    _hot_memo = hot >= 70 and random.random() < 0.5
+    note = (active_prompt_text(800) + radio_prompt_instruction("manager")
+            + radio_prompt_instruction("workplace")).strip()
+    if not _hot_memo and not note:
+        return []               # nothing has come down from upstairs
+    # "tinted and talking speakerbox". Drawn exactly the way the
+    # caller's own disposition draws hers (#879) - a swath off the shelf,
+    # folded into the memo as something management have put IN WRITING,
+    # and stamped into the observatory feed so the crystal trajectory view
+    # sees upstairs too. speakbox_quote already prefers a crystal's own
+    # minds while one is on (#834), so the tint arrives as MATERIAL, which
+    # a small model obeys far harder than an instruction.
+    flavour = ""
+    try:
+        _mseed = await speakbox_quote(most=3, cap=280)
+        _mtext = str((_mseed or {}).get("text") or "").strip()
+        if _mtext:
+            flavour = (
+                " The memo is not only orders: management have LIFTED a "
+                "passage out of the station's own material and typed it "
+                "into the memo word for word. The pair have to deal with "
+                "it as written, on air, with no idea where he got it: "
+                f"\"{_mtext[:280]}\".")
+            # NB: four arguments - mind, file, text, kind.
+            _crystal_influence_note(str(_mseed.get("mind") or ""),
+                                    str(_mseed.get("file") or ""),
+                                    _mtext[:280], "manager")
+    except Exception:  # noqa: BLE001
+        flavour = ""            # the memo still goes out, just untinted
+    try:
+        # ...and the world-tint in HIS mouth specifically. dj_banter folds
+        # crystal_clause() into every prompt already; this is the same
+        # nudge the SFX guy's brews carry (#820), aimed at upstairs.
+        _mcrs = crystal_active()
+        if _mcrs:
+            _mcr = random.choice(_mcrs)
+            flavour += (" Upstairs has fallen into it as hard as the rest "
+                        "of the town: let this flavour run through the "
+                        "memo's own wording and through how they read it "
+                        "out - "
+                        f"{str(_mcr.get('tint') or _mcr.get('name'))[:120]}.")
+    except Exception:  # noqa: BLE001
+        pass
+    if _hot_memo:
+        _hot_said = await dj_banter(track, lines=3, angle=(
             "an urgent memo has just come down from the manager upstairs: "
             f"it is VERY hot in the building — {hot:.0f} degrees Celsius, "
             f"{hot * 9 / 5 + 32:.0f} Fahrenheit, straight off the "
             "machine's own sensors — and management wants it COOLED OFF: "
             "calmer records, fewer renders, someone fan the servers. Read "
             "it out, react, and take it personally — you two are the ones "
-            "sweating in here."))
-    note = (active_prompt_text(800) + radio_prompt_instruction("manager")
-            + radio_prompt_instruction("workplace")).strip()
-    if not note:
-        return []
-    return await dj_banter(track, lines=3, angle=(
+            "sweating in here." + flavour))
+        if _hot_said:
+            # #841: stamped where it AIRED, not where it was scheduled.
+            quota_stamp("manager")
+        return _hot_said
+    # `note` and its guard now live at the top of the function, above the
+    # material draw (#841).
+    _said = await dj_banter(track, lines=3, angle=(
         "a memo has just come down from the manager upstairs. One of you "
         "reads it out to the other and to the listeners, and you both react "
         "on air — agree with it, wince at it, push back on it, whatever it "
@@ -29963,7 +30367,11 @@ async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
         f"\"{note}\"\n"
         "Do not read that back word for word. Say what it means for the show "
         "tonight, and mention any product or sponsorship it asks you to push."
+        + flavour
     ))
+    if _said:
+        quota_stamp("manager")             # #841: the hour counts it
+    return _said
 
 
 async def dj_manager_call(text: str, doc: str = "") -> list[str]:
@@ -30099,6 +30507,11 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
             "back to the record." + tail))
         call_ended("the caller about the heat", line_say, started, rule,
                    len(heat_lines or []))
+        if heat_lines:
+            # #839: only a call that produced lines counts toward the
+            # hour. A round that came back empty is precisely what the
+            # old modulo miscounted as "done" and then skipped.
+            quota_stamp("caller")
         return heat_lines
     want = random.choice(wants)[:160]
     # #879: EIGHT to TWELVE turns, not four — a call should be a
@@ -30124,6 +30537,8 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     ))
     call_ended("the caller on the request line", line_say, started, rule,
                len(lines or []))
+    if lines:
+        quota_stamp("caller")              # #839: the hour counts it
     return lines
 
 
@@ -46259,6 +46674,19 @@ async def generation_image(
         r"[\w.\- ()\[\]]{1,200}", filename
     ):
         raise HTTPException(status_code=400, detail="Bad filename")
+    # #831: DISK FIRST. The output folder is bind-mounted at /comfy-output,
+    # so the picture is one file read away — and that read does not care
+    # whether ComfyUI is up, nor which subfolder the file is sitting in.
+    # Going out over HTTP for it is why every image on the panel, the face on
+    # a caller's licence included, broke the moment 8188 stopped answering.
+    # ComfyUI stays as the fallback for anything not on the mount.
+    off_disk = await asyncio.to_thread(comfy_output_bytes, filename)
+    if off_disk is not None:
+        return Response(
+            content=off_disk[0],
+            media_type=off_disk[1],
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             upstream = await client.get(
@@ -49972,6 +50400,34 @@ requests, and the pair take the call.">A caller gets through every N tracks
 sends down memos about what to push tonight and the pair read them out and
 react.">A memo from the manager upstairs every N tracks (0 = never)</label>
         <input id="djManagerEvery" type="number" min="0" max="50">
+
+        <!-- #841/#839: the counters above are a modulo on records PLAYED,
+             so the real rate is whatever length the shuffle deals and a
+             missed slot is skipped outright. These are the HOURLY QUOTAS
+             the station schedules against now; 0 hands the road back to
+             the counter above. -->
+        <label class="film-size" style="display:flex;gap:10px;margin-top:10px"
+               title="How many memos from upstairs should actually AIR every
+hour. The station counts what has gone out in the last sixty minutes and takes
+the next opening when it is behind, instead of waiting for a track count
+(#841).">
+          Memos from upstairs an hour
+          <input id="djManagerPerHour" type="range" min="0" max="12"
+                 oninput="document.getElementById('djManagerPerHourVal').textContent
+                   = Number(this.value) ? this.value + ' an hour' : 'off'">
+          <span id="djManagerPerHourVal" class="val"></span>
+        </label>
+
+        <label class="film-size" style="display:flex;gap:10px"
+               title="How many calls should actually GET THROUGH every hour.
+Counted over a rolling sixty minutes; when the hour is short, the next record
+with room takes a call rather than waiting for the track count (#839).">
+          Calls an hour
+          <input id="djCallerPerHour" type="range" min="0" max="12"
+                 oninput="document.getElementById('djCallerPerHourVal').textContent
+                   = Number(this.value) ? this.value + ' an hour' : 'off'">
+          <span id="djCallerPerHourVal" class="val"></span>
+        </label>
 
         <label class="toggle">
           <input id="djFollowPrompt" type="checkbox">
@@ -56971,6 +57427,47 @@ function boothBubble(text, kind) {
   if (boothBubbles.length > 8) boothBubbles.splice(0, boothBubbles.length - 8);
 }
 
+/* #830/#837: the picture behind a pitch.
+ *
+ * A spot that is selling something off the Pine Box gallery names the file
+ * in its own product line — 'the original painting "z-image-turbo_00387_
+ * .png" — in it: …'. This pulls it back out so any listing that is selling a
+ * gallery item can hang the thumbnail of that item beside the words. Returns
+ * "" for the spots that sell a sponsor rather than a painting. */
+function artInPitch() {
+  try {
+    const hay = Array.prototype.slice.call(arguments)
+      .filter(Boolean).join(" ");
+    const m =
+      /(?:painting|piece|picture|artwork|image)\s+["\u201c]?\s*([\w.()\[\] -]+?\.(?:png|jpe?g|webp))/i
+        .exec(hay);
+    return m ? m[1].trim() : "";
+  } catch (error) {
+    return "";
+  }
+}
+
+/* One small square of the artwork being sold, for the listing to wear (#830).
+ * Degrades to nothing at all when there is no such picture. */
+function artThumb(name, px) {
+  const im = document.createElement("img");
+  im.src = "/api/generations/image/" + encodeURIComponent(name);
+  im.loading = "lazy";
+  im.title = name + " — the piece this is selling; click to open it";
+  im.style.cssText = "width:" + px + "px;height:" + px + "px;flex:0 0 auto;"
+    + "object-fit:cover;border-radius:6px;border:1px solid #4a3c14;"
+    + "background:#0b0904;cursor:zoom-in";
+  im.onerror = () => { im.style.display = "none"; };
+  im.onclick = (ev) => {
+    ev.stopPropagation();
+    try { artFullscreen(name); } catch (error) { /* no viewer, no harm */ }
+  };
+  im.oncontextmenu = (ev) => {
+    try { artHawkMenu(ev, name); } catch (error) { /* optional */ }
+  };
+  return im;
+}
+
 /* The paintings on the block and the product in the ad, circulating under
  * the glass — a marquee that only exists while something is being sold. */
 function boothSellPaint(state) {
@@ -56989,6 +57486,15 @@ function boothSellPaint(state) {
     // The ad on air right now, named. Most of them are a painting off the
     // wall, and those arrive with pictures below; the rest at least say
     // what is being sold.
+    // #830/#837: when the spot IS selling something off the wall, the
+    // thumbnail of that very piece rides in front of its name — unless the
+    // marquee behind it is already holding the same picture up.
+    try {
+      const sold = artInPitch(pitch);
+      if (sold && names.indexOf(sold) < 0) {
+        strip.appendChild(artThumb(sold, 34));
+      }
+    } catch (error) { /* the strip still reads without it */ }
     const chip = el("span", "", "📣 " + pitch);
     chip.style.cssText = "font-size:10px;color:#ffd479;border:1px solid "
       + "#ffd47955;border-radius:9px;padding:1px 7px;flex:0 0 auto;"
@@ -57967,11 +58473,9 @@ async function adArchivePopup(focusId) {
   }
   /* #812: the painting being hawked, admired — the product names its
    * file, so the picture can hang beside the pitch. */
-  const adPainting = (a) => {
-    const m = /painting\s+["\u201c]?([\w. \-]+?\.(?:png|jpe?g|webp))/i
-      .exec(String(a.product || "") + " " + String(a.text || ""));
-    return m ? m[1] : "";
-  };
+  // #830/#837: one reader for the whole panel, so a listing in here and the
+  // tile in the booth agree about which picture a spot is selling.
+  const adPainting = (a) => artInPitch(a.product, a.text);
 
   // --- the one you clicked, in full -------------------------------------
   const top = el("div", "", "");
@@ -59496,6 +60000,20 @@ function djTalkRowInner(line) {
       // Box gallery" — and there was nothing to look at. Spoken lines have
       // had their pictures in the margin since #707; this tile returns
       // before that code and never got them.
+      // #830/#837: …and when the round hung no images on the line at all —
+      // which is every ad written from the wall rather than aired inside a
+      // gallery segment — the product line still names the file, so the
+      // piece being sold gets its thumbnail here anyway.
+      if (!(line.images && line.images.length)) {
+        try {
+          const sold = artInPitch(line.product, line.text);
+          if (sold) {
+            const one = artThumb(sold, 40);
+            one.style.marginTop = "2px";
+            row.appendChild(one);
+          }
+        } catch (error) { /* the tile still reads without it */ }
+      }
       if (line.images && line.images.length) {
         const shelf = el("div", "row", "");
         shelf.style.cssText = "gap:5px;flex-wrap:wrap;width:100%;"
@@ -68429,6 +68947,18 @@ async function djLoadSettings() {
     document.getElementById("djBanterEvery").value = dj.banter_every ?? 1;
     document.getElementById("djCallerEvery").value = dj.caller_every ?? 5;
     document.getElementById("djManagerEvery").value = dj.manager_every ?? 7;
+    // #841/#839: the hourly quotas, and their readouts.
+    const mgrHour = document.getElementById("djManagerPerHour");
+    const callHour = document.getElementById("djCallerPerHour");
+    mgrHour.value = dj.manager_per_hour ?? 4;
+    callHour.value = dj.caller_per_hour ?? 5;
+    const quotaPaint = () => {
+      document.getElementById("djManagerPerHourVal").textContent =
+        Number(mgrHour.value) ? mgrHour.value + " an hour" : "off";
+      document.getElementById("djCallerPerHourVal").textContent =
+        Number(callHour.value) ? callHour.value + " an hour" : "off";
+    };
+    mgrHour.oninput = quotaPaint; callHour.oninput = quotaPaint; quotaPaint();
     document.getElementById("djFollowPrompt").checked = !!dj.follow_prompt;
     document.getElementById("djDiceHosts").checked = !!dj.dice_hosts;      // #676
     document.getElementById("djDiceCallers").checked = !!dj.dice_callers;  // #676
@@ -74488,6 +75018,11 @@ async function djSaveSettings() {
       banter_every: Number(document.getElementById("djBanterEvery").value),
       caller_every: Number(document.getElementById("djCallerEvery").value),
       manager_every: Number(document.getElementById("djManagerEvery").value),
+      // #841/#839: the hourly quotas the scheduler actually runs on.
+      manager_per_hour:
+        Number(document.getElementById("djManagerPerHour").value),
+      caller_per_hour:
+        Number(document.getElementById("djCallerPerHour").value),
       follow_prompt: document.getElementById("djFollowPrompt").checked,
       dice_hosts: document.getElementById("djDiceHosts").checked,      // #676
       dice_callers: document.getElementById("djDiceCallers").checked,  // #676
@@ -80056,9 +80591,53 @@ function updateConsoleMarquee() {
   mq.textContent = text + "   ·   " + text;
 }
 
+/* #833: the behind-the-scenes window belongs to whoever is reading it.
+ *
+ * Every pipeline event slammed the feed back to the bottom and pruned the
+ * top of it, so scrolling back through the night — or opening an entry to
+ * read its payload — lasted about three seconds, until the next line landed.
+ * The rule now: follow the tail ONLY while the feed is parked at the bottom.
+ * The moment a hand moves it off the bottom, or opens an entry, it holds
+ * still and keeps far more history, so nothing being read is pruned out from
+ * under it. Scrolling back down to the bottom re-arms the follow. */
+let consoleStuck = true;
+let consoleTouched = 0;
+const consoleOpen = new Set();     // entries the reader expanded, by key
+
+function consoleReading() {
+  return !consoleStuck || (Date.now() - consoleTouched) < 60000;
+}
+
+function consoleHandsOn() {
+  consoleTouched = Date.now();
+}
+
+function consoleWatch(feed) {
+  if (!feed || feed.dataset.cxWatch === "1") return;
+  feed.dataset.cxWatch = "1";
+  feed.addEventListener("scroll", () => {
+    const gap = feed.scrollHeight - feed.scrollTop - feed.clientHeight;
+    const wasStuck = consoleStuck;
+    consoleStuck = gap <= 24;
+    if (consoleStuck) consoleTouched = 0;       // back at the tail: follow
+    else if (wasStuck) consoleHandsOn();        // moved off it: hands off
+  }, {passive: true});
+}
+
 function trimAndScrollConsole(feed) {
-  while (feed.children.length > 60) feed.removeChild(feed.firstChild);
-  feed.scrollTop = feed.scrollHeight;
+  try {
+    consoleWatch(feed);
+    if (consoleReading()) {
+      // Their scroll position is theirs, and a pruned first child would
+      // yank it — so the trim only bites at a much deeper backlog.
+      while (feed.children.length > 400) feed.removeChild(feed.firstChild);
+      return;
+    }
+    while (feed.children.length > 60) feed.removeChild(feed.firstChild);
+    feed.scrollTop = feed.scrollHeight;
+  } catch (error) {
+    while (feed.children.length > 400) feed.removeChild(feed.firstChild);
+  }
 }
 
 function consoleAddTurn(turn) {
@@ -81902,15 +82481,33 @@ function consoleAddPipeline(ev) {
   body.textContent = (ev.text || "") + (ev.extra ? "  ⤵" : "");
   entry.appendChild(body);
   if (ev.extra) {
+    // #833: an entry the reader opened STAYS open. The expansion is held
+    // against the event's own key rather than against the element, so a
+    // redraw of the feed cannot fold it back up — and opening one counts as
+    // interaction, which is what stops the feed chasing its own tail.
+    const key = String(ev.ts || "") + "|" + String(ev.kind || "") + "|"
+      + String(ev.text || "").slice(0, 60);
     const more = document.createElement("div");
     more.textContent = ev.extra;
     more.style.cssText = "display:none;white-space:pre-wrap;font-size:11px;"
       + "opacity:.85;margin-top:4px;max-height:240px;overflow-y:auto;"
       + "border-left:2px solid var(--border);padding-left:8px";
+    try {
+      if (consoleOpen.has(key)) more.style.display = "block";
+    } catch (error) { /* an unopened entry is no worse than before */ }
     entry.appendChild(more);
     entry.style.cursor = "pointer";
     entry.onclick = () => {
-      more.style.display = more.style.display === "none" ? "block" : "none";
+      const open = more.style.display === "none";
+      more.style.display = open ? "block" : "none";
+      try {
+        if (open) consoleOpen.add(key);
+        else consoleOpen.delete(key);
+        if (consoleOpen.size > 300) {
+          consoleOpen.delete(consoleOpen.values().next().value);
+        }
+        consoleHandsOn();
+      } catch (error) { /* the toggle above already happened */ }
     };
   }
   feed.appendChild(entry);
