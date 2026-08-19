@@ -18266,22 +18266,12 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
                     "messages": [{
                         "role": "user",
                         "content": (
+                            # #878: the looking prompt is the operator's now — see
+                            # vision_prompt_active(). This literal remains
+                            # the CLASSIC, and reverting comes back here.
                             # #646: when they DO look, they look properly —
                             # atomic detail, and visibly affected by it.
-                            "You are a radio host holding this picture up "
-                            "for listeners who cannot see it, and it has "
-                            "got under your skin. Describe it in FIVE or "
-                            "SIX spoken sentences, in lurid, atomic "
-                            "detail: the exact colours and where they sit, "
-                            "the light and what it is doing, every figure "
-                            "or object and its posture and expression, the "
-                            "texture of the paint or the grain of the "
-                            "photograph, what is happening in the corners "
-                            "and the background that a careless eye would "
-                            "miss. Then say plainly what it DOES to you — "
-                            "be unsettled, disturbed, moved, unable to "
-                            "leave it alone. Speak it aloud; no markdown, "
-                            "no preamble, no list."),
+                            vision_prompt_active()),
                         "images": [image_b64],
                     }],
                     "stream": False,
@@ -18301,11 +18291,7 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
             image_analysis_ready(
                 picked.name, said, model=VISION_MODEL,
                 ms=int((time.monotonic() - _vt0) * 1000),
-                prompt="You are a radio host holding this picture up for "
-                       "listeners who cannot see it… (the #646 atomic-"
-                       "detail contract: colours and where they sit, the "
-                       "light, every figure and its posture, the corners "
-                       "— then what it DOES to you.)")
+                prompt=vision_prompt_active())
             # Any time a gallery picture is looked at and talked about, the
             # booth holds up its thumbnail (#506, #523) — not only during the
             # dedicated gallery round.
@@ -18316,6 +18302,66 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         return picked.name, said
     except Exception:
         return "", ""                   # a model without eyes riffs blind
+
+
+VISION_PROMPTS_PATH = data_path("vision_prompts.json")
+
+# #878: the classic — the #646 atomic-detail contract. Entry one of the
+# library, never deletable, and what "revert" comes back to.
+VISION_PROMPT_CLASSIC = (
+    "You are a radio host holding this picture up for listeners who "
+    "cannot see it, and it has got under your skin. Describe it in "
+    "FIVE or SIX spoken sentences, in lurid, atomic detail: the exact "
+    "colours and where they sit, the light and what it is doing, every "
+    "figure or object and its posture and expression, the texture of "
+    "the paint or the grain of the photograph, what is happening in "
+    "the corners and the background that a careless eye would miss. "
+    "Then say plainly what it DOES to you — be unsettled, disturbed, "
+    "moved, unable to leave it alone. Speak it aloud; no markdown, no "
+    "preamble, no list.")
+
+
+def vision_prompts() -> dict[str, Any]:
+    """The library, with the classic always at the head."""
+    rows: list[dict[str, Any]] = []
+    active = "classic"
+    try:
+        got = json.loads(VISION_PROMPTS_PATH.read_text())
+        rows = [r for r in (got.get("prompts") or [])
+                if isinstance(r, dict) and str(r.get("id") or "")
+                != "classic"]
+        active = str(got.get("active") or "classic")
+    except Exception:  # noqa: BLE001
+        pass
+    rows.insert(0, {"id": "classic", "name": "the classic (#646)",
+                    "text": VISION_PROMPT_CLASSIC, "builtin": True})
+    if active not in {str(r.get("id")) for r in rows}:
+        active = "classic"
+    return {"prompts": rows, "active": active}
+
+
+def vision_prompts_save(rows: list[dict[str, Any]], active: str) -> None:
+    try:
+        VISION_PROMPTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        keep = [{"id": str(r.get("id") or "")[:40],
+                 "name": str(r.get("name") or "untitled")[:60],
+                 "text": str(r.get("text") or "")[:4000]}
+                for r in rows if str(r.get("id") or "") != "classic"
+                and str(r.get("text") or "").strip()][:24]
+        tmp = VISION_PROMPTS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"prompts": keep, "active": active}))
+        tmp.replace(VISION_PROMPTS_PATH)
+    except OSError:
+        pass
+
+
+def vision_prompt_active() -> str:
+    """What the station looks through right now (#878)."""
+    lib = vision_prompts()
+    for row in lib["prompts"]:
+        if str(row.get("id")) == lib["active"]:
+            return str(row.get("text") or VISION_PROMPT_CLASSIC)
+    return VISION_PROMPT_CLASSIC
 
 
 def image_analysis_ready(name: str, analysis: str, model: str = "",
@@ -28689,6 +28735,63 @@ async def _banter_air(entry: dict[str, Any],
 CALLER_MOODS = ("surprise", "pity", "hope", "lust", "alarm", "envy",
                 "grudging respect", "genuine concern")
 
+# #879: who the caller IS tonight. A stranger rings with a temper and a
+# reason, not as a prop for the hosts — and they arrive with something
+# already prepared to say, so the pair can be caught out by them.
+CALLER_DISPOSITIONS = (
+    "wound up and talking too fast, convinced they are being ignored",
+    "flat and exhausted, saying enormous things in a small voice",
+    "delighted, almost manic, treating this as the highlight of a "
+    "terrible week",
+    "suspicious of the hosts, testing whether they are really live",
+    "grieving something they will not name outright",
+    "half-cut and far too honest, cheerfully overshares",
+    "an expert on something nobody asked about, and correct",
+    "furious about a thing that turns out to be tiny",
+    "shy to the point of pain, then suddenly savage",
+    "a regular who behaves like an old friend the hosts do not recall",
+    "calling from somewhere loud with a story they keep losing",
+    "eerily calm, and knows something about the station",
+    "on the wind-up, playing a character and enjoying it",
+    "in the middle of doing something else, distracted, then rapt",
+    "lonely and stretching the call, dodging the goodbye",
+)
+
+
+async def caller_disposition_clause(themed: str = "") -> str:
+    """#879: the caller's own temper, and a line they arrived ready to
+    say. The speakbox supplies the line so it is genuinely material the
+    hosts have not seen — and under an active crystal it is tinted like
+    every other word on this station."""
+    mood = random.choice(CALLER_DISPOSITIONS)
+    prepared = ""
+    try:
+        seed = await speakbox_quote(most=2, cap=220)
+        line = str((seed or {}).get("text") or "").strip()
+        if line:
+            prepared = (
+                " They did not ring in empty-handed: they have ALREADY "
+                "decided to say this, and they work it in whether or not "
+                "it fits the hosts' mood — the pair have never heard it "
+                f"and must react on the spot: \"{line[:220]}\"."
+                )
+            # #879: the observatory sees the caller too — a stranger
+            # arriving with tinted material is exactly the kind of
+            # trajectory that view exists to draw.
+            try:
+                _crystal_influence_note(str(seed.get("mind") or ""),
+                                        str(seed.get("file") or ""),
+                                        line[:220], "caller")
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        prepared = ""
+    return (f" The caller's own disposition tonight: {mood}. Play them "
+            "as a person with their own evening, not a prop — they can "
+            "interrupt, disagree, refuse to be handled, and take the "
+            "hosts somewhere they did not plan to go." + prepared
+            + (themed or ""))
+
 
 def show_open_when() -> str:
     """What to say about the hour at the top of the show (#194)."""
@@ -28895,14 +28998,26 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
                    len(heat_lines or []))
         return heat_lines
     want = random.choice(wants)[:160]
-    lines = await dj_banter(track, lines=4, also_name=want, angle=(
+    # #879: EIGHT to TWELVE turns, not four — a call should be a
+    # conversation with a shape, and the outcome is drawn FIRST so the
+    # exchange has somewhere to arrive rather than simply stopping.
+    _turns = random.randint(8, 12)
+    _disp = await caller_disposition_clause(theme_air_clause(_themed))
+    lines = await dj_banter(track, lines=_turns, also_name=want, angle=(
         "a caller has got through on the request line. Give them a name, and "
         "between the two of you relay what they are asking for, which is "
         f"this: \"{want}\"."
-        # #775: and this road knows what tonight is about now.
-        + theme_air_clause(_themed)
+        + _disp
         + " Take the call with unmistakable "
-        f"{random.choice(CALLER_MOODS)}, then cut back to the record." + tail
+        f"{random.choice(CALLER_MOODS)}."
+        + f" Let it RUN — {_turns} turns of real back and forth, the "
+        "caller pushing and the hosts answering, before anybody thinks "
+        "about the record."
+        # #879: the ending is chosen from the station's own outcome
+        # shelf and STEERED towards, not merely stamped on afterwards.
+        + " The call must END this way, arrived at honestly over the "
+        f"last two or three turns: {str(rule.get('text') or '')}. "
+        "Then cut back to the record." + tail
     ))
     call_ended("the caller on the request line", line_say, started, rule,
                len(lines or []))
@@ -44766,6 +44881,59 @@ async def remove_memory(
     require_auth(authorization)
     delete_memory(ts)
     return {"deleted": True}
+
+
+@app.get("/api/vision/prompts")
+async def vision_prompts_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#878: every looking prompt, and which one is in use."""
+    require_read_auth(authorization)
+    return vision_prompts()
+
+
+@app.post("/api/vision/prompts")
+async def vision_prompts_write(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#878: save a prompt, choose the active one, or revert.
+
+    {text, name?, id?}   write or update one (id absent = a new one)
+    {active: "<id>"}     look through that one from now on
+    {revert: true}       back to the classic
+    {delete: "<id>"}     remove one of your own
+    """
+    require_auth(authorization)
+    payload = await request.json()
+    lib = vision_prompts()
+    rows = [r for r in lib["prompts"] if not r.get("builtin")]
+    active = lib["active"]
+    if payload.get("revert"):
+        active = "classic"
+    elif payload.get("delete"):
+        kill = str(payload["delete"])
+        rows = [r for r in rows if str(r.get("id")) != kill]
+        if active == kill:
+            active = "classic"
+    elif str(payload.get("text") or "").strip():
+        pid = str(payload.get("id") or "").strip() or (
+            "vp_" + uuid.uuid4().hex[:8])
+        row = {"id": pid,
+               "name": str(payload.get("name") or "").strip()
+               or "my prompt",
+               "text": str(payload["text"]).strip()}
+        rows = [r for r in rows if str(r.get("id")) != pid] + [row]
+        active = pid if payload.get("use", True) else active
+    elif payload.get("active"):
+        active = str(payload["active"])
+    vision_prompts_save(rows, active)
+    out = vision_prompts()
+    pipeline_log("air", "the looking prompt is now "
+                 f"{out['active']!r} — the pair describe pictures "
+                 "through it from the next one on (#878)")
+    note_action("👁 looking prompt: " + out["active"])
+    return out
 
 
 @app.get("/api/generations")
