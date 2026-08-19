@@ -44657,6 +44657,24 @@ h2 .film-size select { flex: 0 1 auto; min-width: 0; }
     background: rgba(255,95,95,.12);
   }
 }
+/* #830: a new line slides into the booth as it lands on air… */
+.booth-arrive {
+  animation: boothArrive .85s cubic-bezier(.2, .9, .3, 1);
+}
+@keyframes boothArrive {
+  0% { transform: translateX(-28px); opacity: 0;
+       box-shadow: 0 0 0 2px rgba(121, 216, 255, .0); }
+  35% { opacity: 1; box-shadow: 0 0 18px rgba(121, 216, 255, .55); }
+  70% { transform: translateX(3px); }
+  100% { transform: none; box-shadow: none; }
+}
+/* …and the newest entry wears the standing edge until the next lands */
+.booth-latest {
+  border-left: 3px solid #79d8ff;
+  background: linear-gradient(90deg, rgba(18, 36, 52, .8),
+    transparent 60%);
+}
+
 /* #670: the landing flash after jumping to the live line. Distinct from
    .booth-live on purpose — that one says "this is airing", this one says
    "this is the one you just asked for", and they show up together. */
@@ -54470,6 +54488,7 @@ async function adArchivePopup(focusId) {
  * accumulated here instead, in order, and nothing is dropped until you
  * press Clear. */
 let djTalkAll = [];
+let djTalkLatestEl = null;   // #830: the standing newest-entry marker
 const djTalkSeenIds = new Set();
 // #742: where each line with an id sits in djTalkAll. A line now arrives
 // TWICE — once the moment it starts going out, and again, fuller, when it
@@ -54818,9 +54837,18 @@ function djTalkRender(state) {
     djTalkScroll(log, atBottom, keepTop);
     return;
   }
+  const _nowS = Date.now() / 1000;
   for (let at = djTalkPainted; at < lines.length; at += 1) {
     const built = djTalkRow(lines[at]);
     if (!built) continue;
+    // #830: a genuinely-new row SLIDES IN with a glow — but only a
+    // live arrival, never the initial backfill of the night.
+    if (djTalkPainted > 0
+        && Math.abs(djTalkAirAt(lines[at]) - _nowS) < 180) {
+      built.classList.add("booth-arrive");
+      built.addEventListener("animationend",
+        () => built.classList.remove("booth-arrive"), {once: true});
+    }
     djTalkRows.set(at, built);
     log.appendChild(built);
   }
@@ -54841,6 +54869,7 @@ function djTalkRender(state) {
     djTalkDirty.clear();
   }
   djTalkTrim(log);
+  djTalkMarkLatest();
   djTalkScroll(log, atBottom, keepTop);
   djTalkMarkLive();
 }
@@ -54867,7 +54896,20 @@ function djTalkRepaint() {
   }
   djTalkPainted = lines.length;
   log.scrollTop = log.scrollHeight;
+  djTalkMarkLatest();
   djTalkMarkLive();
+}
+
+/* #830: one row is always THE newest — it wears the standing highlight
+ * until something newer lands. */
+function djTalkMarkLatest() {
+  const rowEl = djTalkRows.get(djTalkAll.length - 1);
+  if (!rowEl) return;
+  if (djTalkLatestEl && djTalkLatestEl !== rowEl) {
+    djTalkLatestEl.classList.remove("booth-latest");
+  }
+  rowEl.classList.add("booth-latest");
+  djTalkLatestEl = rowEl;
 }
 
 /* #745: the header blocks live above the rows and survive every poll. */
