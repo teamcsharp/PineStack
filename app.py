@@ -3928,6 +3928,38 @@ def _xtts_revive_maybe() -> None:
     fire_and_forget(_up())
 
 
+async def one_engine_keeper() -> None:
+    """#866: under the cast lock, exactly one cloning engine stays
+    resident — the host's. The other is unloaded on sight.
+
+    Not a memory nicety: with both loaded beside the writer, renders on
+    this box went from ~9s to over 100s and the talk audibly gapped."""
+    while True:
+        await asyncio.sleep(180)
+        try:
+            if not cast_engine_locked():
+                continue
+            want = host_clone_engine()
+            other = "f5" if want == "xtts" else "xtts"
+            if not (await engine_health(other)).get("ready"):
+                continue
+            # Never leave the cast with nothing: only release the spare
+            # once the engine we are keeping actually answers.
+            if not (await engine_health(want)).get("ready"):
+                continue
+            if await _director_post(f"/director/engine/{other}/terminate"):
+                pipeline_log("gpu", f"{other} was resident but the cast "
+                             f"renders on {want} — released it so one "
+                             "model has the box (#866)")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.on_event("startup")
+async def _startup_one_engine() -> None:
+    fire_and_forget(one_engine_keeper())
+
+
 async def xtts_idle_clock() -> None:
     while True:
         await asyncio.sleep(300)
@@ -5000,9 +5032,21 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                 clone_engine = pick
             rungs.append((bare, clone_engine, ""))
             other = "f5" if clone_engine == "xtts" else "xtts"
-            rungs.append((bare, other,
-                          f"{clone_engine} would not render it — the "
-                          f"same clone through {other} (#784)"))
+            # #866: under the cast lock the OTHER engine is deliberately
+            # not resident — naming it here would wake a second 23-24G
+            # model to say one line, on a pool the writer already
+            # shares. Fall to Piper instead; the cast returns the moment
+            # the host's own engine answers.
+            if cast_engine_locked() and other != host_clone_engine():
+                rungs.append((stand_in or "", "piper",
+                              f"{clone_engine} would not render it and "
+                              "the cast is locked to one engine — a "
+                              "stand-in rather than loading a second "
+                              "model (#866)"))
+            else:
+                rungs.append((bare, other,
+                              f"{clone_engine} would not render it — "
+                              f"the same clone through {other} (#784)"))
         if stand_in and stand_in != voice:
             rungs.append((stand_in, "piper",
                           "BOTH cloning engines refused — airing this line "
@@ -7143,7 +7187,8 @@ async def clone_engine_ready(engine: str) -> bool:
     silently means an F5 voice is never checked and never falls back."""
     if engine == "xtts":
         _ok = bool((await xtts_health())["ready"])
-        if not _ok:
+        if not _ok and not (cast_engine_locked()
+                            and host_clone_engine() != "xtts"):
             # #833: SKIPPING a dead XTTS never woke it — only a failed
             # ATTEMPT did, and this gate meant no attempt was ever made,
             # so the whole cast quietly lived on F5 for hours at a time.
@@ -7151,6 +7196,11 @@ async def clone_engine_ready(engine: str) -> bool:
         return _ok
     if engine == "f5":
         _ok5 = bool((await f5_health())["ready"])
+        # #866: only revive F5 if it is the engine the cast is actually
+        # on. Waking it under the lock is 24G spent to duplicate a model
+        # already loaded.
+        if (cast_engine_locked() and host_clone_engine() != "f5"):
+            return _ok5
         if not _ok5 and time.time() - _F5_REVIVE_AT[0] > 600:
             _F5_REVIVE_AT[0] = time.time()
             fire_and_forget(_director_post("/director/engine/f5/deploy"))
@@ -37714,15 +37764,13 @@ async def booth_clip_api(
             return FileResponse(path, media_type="audio/mpeg",
                                 filename=f"booth-{int(at)}.mp3")
         if began <= at < ends:
-            off = at - began
-            # to the end of the burst, capped — the row's own words
-            # start here and the operator can trim what they keep
-            cut = await asyncio.to_thread(
-                _cut, path, off, min(90.0, max(6.0, ends - at)),
-                f"{int(at)}_{ix}")
-            if cut:
-                return FileResponse(cut, media_type="audio/mpeg",
-                                    filename=f"booth-{int(at)}.mp3")
+            # #867: the WHOLE moment. This file IS the burst — the whole
+            # call, the whole round — and handing back a slice starting
+            # at the clicked line gave a fragment that opened
+            # mid-sentence. The operator wants the moment, not their
+            # row's share of it.
+            return FileResponse(path, media_type="audio/mpeg",
+                                filename=f"booth-{int(at)}.mp3")
     # #847: the in-memory index is gone after a restart but the STAGED
     # FILES are still on disk — their mtimes are their air times. Walk
     # the folder as a second index so a restart never costs a download.
@@ -37742,12 +37790,8 @@ async def booth_clip_api(
             return FileResponse(path, media_type="audio/mpeg",
                                 filename=f"booth-{int(at)}.mp3")
         if when <= at < ends:
-            cut = await asyncio.to_thread(
-                _cut, path, at - when,
-                min(90.0, max(6.0, ends - at)), f"{int(at)}_s{ix}")
-            if cut:
-                return FileResponse(cut, media_type="audio/mpeg",
-                                    filename=f"booth-{int(at)}.mp3")
+            return FileResponse(path, media_type="audio/mpeg",
+                                filename=f"booth-{int(at)}.mp3")
 
     hit: tuple[float, dict[str, Any], Path] | None = None
     for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json"),
@@ -37766,11 +37810,12 @@ async def booth_clip_api(
             # is at (at - began) seconds into it, not within 10s of its
             # start — that miss is why most rows answered 404.
             if began <= at < began + max(dur, 1.0):
-                inside = at - began
+                # #867: from the START of the mark, for its whole
+                # length — the mark IS the moment. Starting at the
+                # clicked instant is what truncated the download.
                 hit = (0.0, {**mark,
-                             "off": float(mark.get("off") or 0) + inside,
-                             "dur": max(4.0, min(90.0,
-                                                 began + dur - at))},
+                             "off": float(mark.get("off") or 0),
+                             "dur": max(4.0, min(900.0, dur))},
                        source)
                 break
             gap = abs(began - at)
