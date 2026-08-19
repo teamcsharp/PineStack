@@ -5432,6 +5432,91 @@ async def nabu_device_restart(reason: str = "") -> bool:
         return False
 
 
+_REPAIR_LIVE: dict[str, Any] = {"at": 0.0, "busy": False,
+                                "steps": [], "verdict": ""}
+
+
+async def _deep_repair(reason: str = "") -> dict[str, Any]:
+    """#836: the ONE BUTTON. The triage tree first; then the rung the
+    tree cannot see — a device whose entities all answer while the
+    speaker itself is deaf (the post-reboot ESPHome half-session that
+    silenced the station on 2026-08-19: media player "playing" with no
+    content, play_media accepted and ignored) — ending with a fresh
+    record pushed onto a fresh device session and an audible check."""
+    if _REPAIR_LIVE["busy"]:
+        return {"busy": True}
+    _REPAIR_LIVE.update({"at": time.time(), "busy": True,
+                         "steps": [], "verdict": "working…"})
+
+    def mark(name: str, finding: str, did: str = "") -> None:
+        _REPAIR_LIVE["steps"].append(
+            {"name": name, "finding": finding, "did": did})
+        pipeline_log("repair", f"deep repair: {name} — {finding}"
+                     + (f" → {did}" if did else "") + " (#836)")
+
+    try:
+        got = await box_triage(fix=True)
+        _REPAIR_LIVE["steps"].extend(list(got.get("steps") or []))
+        quiet = time.time() - _BOX_LAST_OK[0]
+        routed = ((_RADIO.get("music_to") or "here") in ("box", "both")
+                  or (_RADIO.get("voice_to") or "box") in ("box", "both"))
+        if _RADIO.get("on") and routed and box_talk_ok() and quiet > 120:
+            mark("the deaf-device rung",
+                 f"nothing VERIFIED audible for {int(quiet)}s — after a "
+                 "reboot the entities can all answer while the speaker "
+                 "is deaf",
+                 "stopping any zombie stream and pressing the device's "
+                 "own restart button")
+            try:
+                await music_box_stop_now()
+            except Exception:  # noqa: BLE001
+                pass
+            _NABU_REBOOT_AT[0] = 0.0    # the button outranks the cooldown
+            await nabu_device_restart(reason or "deep repair (#836)")
+            back = False
+            for _ in range(10):
+                await asyncio.sleep(6)
+                _SAT_ALIVE.update({"checked": 0.0, "entity": ""})
+                if bool((await satellite_status()).get("online")):
+                    back = True
+                    break
+            mark("the device", "rejoined after its reboot" if back
+                 else "did NOT rejoin within a minute — that is a power "
+                 "cord, not software", "")
+            _RADIO["fast_skip"] = True
+            dj_skip()
+            mark("the fresh needle",
+                 "a new record pushed onto the fresh session")
+            drained = 0
+            while _BOX_HOLD and drained < 6:
+                if not await _replay_held(_BOX_HOLD[0]):
+                    break
+                _BOX_HOLD.pop(0)
+                _box_hold_save()
+                drained += 1
+            if drained:
+                mark("the backlog", f"{drained} held clip(s) replayed")
+        for _ in range(12):
+            if time.time() - _BOX_LAST_OK[0] < 90:
+                break
+            await asyncio.sleep(5)
+        fresh = time.time() - _BOX_LAST_OK[0]
+        if fresh < 120:
+            _REPAIR_LIVE["verdict"] = (
+                "ON AIR and VERIFIED AUDIBLE — the speaker carried "
+                f"sound {int(fresh)}s ago")
+        else:
+            _REPAIR_LIVE["verdict"] = (
+                "everything restartable was restarted, but no playout "
+                "has verified yet — if the speaker is still quiet, "
+                "check its power and volume; the show keeps knocking "
+                "on its own")
+        mark("the verdict", _REPAIR_LIVE["verdict"])
+        return dict(_REPAIR_LIVE)
+    finally:
+        _REPAIR_LIVE["busy"] = False
+
+
 async def onair_watchdog() -> None:
     """#810: FM ON means AUDIBLE. When the switch says broadcasting but
     nothing verified has come out of the speaker for ten minutes, the
@@ -5722,6 +5807,114 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
             "Do not invent findings that are not listed.")))
     return {"steps": steps, "verdict": verdict, "wire": wire,
             "ha": ha_ok, "entity": ent}
+
+
+@app.post("/api/pinebox/repair")
+async def pinebox_repair_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#836: the ONE BUTTON — deep repair in the background; poll the
+    GET side for live steps and the verdict."""
+    require_auth(authorization)
+    if _REPAIR_LIVE["busy"]:
+        return {"started": False, "busy": True}
+    fire_and_forget(_deep_repair("operator button (#836)"))
+    return {"started": True}
+
+
+@app.get("/api/pinebox/repair")
+async def pinebox_repair_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return dict(_REPAIR_LIVE)
+
+
+@app.get("/api/pinebox/engines")
+async def pinebox_engines_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#836: fresh probes of both cloning engines, for the triage
+    popup's engine rack."""
+    require_read_auth(authorization)
+    return {"xtts": dict(await xtts_health(force=True)),
+            "f5": dict(await f5_health(force=True))}
+
+
+@app.post("/api/pinebox/engine")
+async def pinebox_engine_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#836: start, stop or bounce a cloning engine by hand. Deploying
+    XTTS goes through the room-making revive road so the load does not
+    die silently of memory pressure."""
+    require_auth(authorization)
+    payload = await request.json()
+    engine = str(payload.get("engine") or "").strip()
+    act = str(payload.get("act") or "").strip()
+    if engine not in ("xtts", "f5") or act not in ("deploy", "terminate",
+                                                  "bounce"):
+        raise HTTPException(status_code=400,
+                            detail="engine xtts|f5, act "
+                                   "deploy|terminate|bounce")
+    ok = True
+    if act in ("terminate", "bounce"):
+        ok = await _director_post(f"/director/engine/{engine}/terminate")
+        pipeline_log("gpu", f"operator: {engine} terminated "
+                     f"({'ok' if ok else 'refused'}) (#836)")
+    if act in ("deploy", "bounce"):
+        if act == "bounce":
+            await asyncio.sleep(2)
+        if engine == "xtts":
+            _XTTS_REVIVE_AT[0] = 0.0    # the button outranks the cooldown
+            _xtts_revive_maybe()
+        else:
+            _F5_REVIVE_AT[0] = 0.0
+            ok = await _director_post("/director/engine/f5/deploy")
+        pipeline_log("gpu", f"operator: {engine} deploy requested (#836)")
+    return {"ok": bool(ok), "engine": engine, "act": act}
+
+
+@app.post("/api/pinebox/act")
+async def pinebox_act_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#836: the triage popup's utility row — one small action each."""
+    require_auth(authorization)
+    payload = await request.json()
+    act = str(payload.get("act") or "").strip()
+    if act == "device_reboot":
+        _NABU_REBOOT_AT[0] = 0.0
+        ok = await nabu_device_restart("operator (#836)")
+        return {"ok": ok, "act": act,
+                "note": "the device drops ~20s and rejoins"}
+    if act == "music_kick":
+        try:
+            await music_box_stop_now()
+        except Exception:  # noqa: BLE001
+            pass
+        _RADIO["fast_skip"] = True
+        dj_skip()
+        return {"ok": True, "act": act,
+                "note": "zombie stream stopped — a fresh record follows"}
+    if act == "drain":
+        async def _drain() -> None:
+            n2 = 0
+            while _BOX_HOLD and n2 < 12:
+                if not await _replay_held(_BOX_HOLD[0]):
+                    break
+                _BOX_HOLD.pop(0)
+                _box_hold_save()
+                n2 += 1
+        fire_and_forget(_drain())
+        return {"ok": True, "act": act, "note": f"{len(_BOX_HOLD)} held"}
+    if act == "director_restart":
+        ok = await _lifeboat_restart("voice-director")
+        return {"ok": ok, "act": act}
+    raise HTTPException(status_code=400, detail="act device_reboot|"
+                        "music_kick|drain|director_restart")
 
 
 @app.post("/api/pinebox/triage")
@@ -29222,13 +29415,18 @@ async def generate_answer(
     if is_radio_rescue(user_text):
         async def _rescue() -> None:
             try:
-                got = await box_triage(fix=True)
-                verdict = str(got.get("verdict") or "triage finished")
-                fixes = [s for s in (got.get("steps") or [])
-                         if s.get("did")]
-                line = verdict if not fixes else (
-                    verdict + " — " + "; ".join(
-                        f"{s['name']}: {s['did']}" for s in fixes[:4]))
+                got = await _deep_repair("spoken rescue (#827)")
+                if got.get("busy"):
+                    line = ("a repair is already running — give it a "
+                            "minute and ask again")
+                else:
+                    verdict = str(_REPAIR_LIVE.get("verdict") or "done")
+                    fixes = [s for s in (_REPAIR_LIVE.get("steps") or [])
+                             if s.get("did")]
+                    line = verdict if not fixes else (
+                        verdict + " — " + "; ".join(
+                            f"{s['name']}: {s['did']}"
+                            for s in fixes[:4]))
                 await home_assistant_say(line[:400], plain=True)
             except Exception:  # noqa: BLE001
                 pass

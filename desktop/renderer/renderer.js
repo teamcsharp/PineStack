@@ -1445,6 +1445,168 @@ function initRouteSpeak() {
 }
 initRouteSpeak();
 
+/* #836: the radio triage — the Agent cell opens a troubleshooter that
+ * reboots whatever it takes: the full tree with the deaf-device rung,
+ * plus hand controls for the engines, the device, the stream, the
+ * shelf and the voice-director. */
+function initTriagePopup() {
+  const cell = $("agentCell");
+  if (!cell) return;
+  cell.style.cursor = "pointer";
+  let pop = null;
+  let poll = 0;
+
+  const mk = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  };
+
+  function close() {
+    if (poll) { clearInterval(poll); poll = 0; }
+    if (pop) { pop.remove(); pop = null; }
+  }
+
+  function paintSteps(box, steps, verdict, busy) {
+    box.textContent = "";
+    (steps || []).forEach((s) => {
+      const row = mk("div", "tri-step");
+      row.appendChild(mk("b", "", s.name));
+      row.appendChild(document.createTextNode(" — " + (s.finding || "")));
+      if (s.did) row.appendChild(mk("i", "", " → " + s.did));
+      box.appendChild(row);
+    });
+    if (busy) box.appendChild(mk("div", "tri-busy", "⛏ working…"));
+    if (verdict && !busy) {
+      box.appendChild(mk("div", "tri-verdict", verdict));
+    }
+    box.scrollTop = box.scrollHeight;
+  }
+
+  async function paintEngines(scope) {
+    let h = {};
+    try { h = await api.get("/api/pinebox/engines"); } catch { h = {}; }
+    scope.querySelectorAll(".tri-eng").forEach((row) => {
+      const got = h[row.dataset.eng] || {};
+      row.querySelector(".tri-dot").classList.toggle("up", !!got.ready);
+      row.querySelector(".tri-stat").textContent = got.ready ? "up"
+        : String(got.detail || "down").slice(0, 42);
+    });
+  }
+
+  function open() {
+    if (pop) { close(); return; }
+    pop = mk("div", "triage-pop");
+    const head = mk("div", "tri-head");
+    head.appendChild(mk("b", "", "📻 Radio Triage"));
+    const x = mk("button", "tri-x", "✕");
+    x.onclick = close;
+    head.appendChild(x);
+    pop.appendChild(head);
+
+    const log = mk("div", "tri-log");
+    log.appendChild(mk("div", "tri-busy",
+      "The troubleshooter. Repair runs the whole tree — the show, Home "
+      + "Assistant, both device entities, the wire, the voice director, "
+      + "both engines — then the deaf-device reboot when nothing has "
+      + "verified audible, a fresh record, and the held backlog."));
+    pop.appendChild(log);
+
+    const acts = mk("div", "tri-acts");
+    const repair = mk("button", "tri-primary", "🔧 Repair the radio");
+    repair.onclick = async () => {
+      repair.disabled = true;
+      try {
+        const got = await api.post("/api/pinebox/repair", {});
+        if (got && got.busy) paintSteps(log, [], "", true);
+      } catch (e) {
+        paintSteps(log, [], "could not start: " + e.message, false);
+        repair.disabled = false;
+        return;
+      }
+      if (poll) clearInterval(poll);
+      poll = setInterval(async () => {
+        let st = {};
+        try { st = await api.get("/api/pinebox/repair"); }
+        catch { return; }
+        paintSteps(log, st.steps, st.verdict, st.busy);
+        if (!st.busy && (st.steps || []).length) {
+          clearInterval(poll); poll = 0;
+          repair.disabled = false;
+          paintEngines(pop);
+        }
+      }, 2000);
+    };
+    acts.appendChild(repair);
+
+    const diag = mk("button", "", "🔍 Diagnose only");
+    diag.onclick = async () => {
+      diag.disabled = true;
+      paintSteps(log, [], "", true);
+      try {
+        const got = await api.post("/api/pinebox/triage", { fix: false });
+        paintSteps(log, got.steps, got.verdict, false);
+      } catch (e) { paintSteps(log, [], e.message, false); }
+      diag.disabled = false;
+    };
+    acts.appendChild(diag);
+    pop.appendChild(acts);
+
+    const rack = mk("div", "tri-rack");
+    ["xtts", "f5"].forEach((eng) => {
+      const row = mk("div", "tri-eng");
+      row.dataset.eng = eng;
+      row.appendChild(mk("span", "tri-dot"));
+      row.appendChild(mk("b", "", eng.toUpperCase()));
+      row.appendChild(mk("span", "tri-stat", "…"));
+      [["deploy", "▶ start"], ["terminate", "⏹ stop"],
+       ["bounce", "♻ bounce"]].forEach(([act, label]) => {
+        const b = mk("button", "", label);
+        b.onclick = async () => {
+          b.disabled = true;
+          try {
+            await api.post("/api/pinebox/engine", { engine: eng, act });
+          } catch { /* the health refresh shows the truth */ }
+          setTimeout(() => {
+            paintEngines(rack);
+            b.disabled = false;
+          }, 3000);
+        };
+        row.appendChild(b);
+      });
+      rack.appendChild(row);
+    });
+    pop.appendChild(rack);
+
+    const util = mk("div", "tri-acts");
+    [["device_reboot", "🔁 Reboot the box"],
+     ["music_kick", "🎵 Kick the stream"],
+     ["drain", "📤 Drain the shelf"],
+     ["director_restart", "🚑 Restart director"]].forEach(([act, label]) => {
+      const b = mk("button", "", label);
+      b.onclick = async () => {
+        b.disabled = true;
+        try {
+          const got = await api.post("/api/pinebox/act", { act });
+          paintSteps(log, [{ name: label,
+            finding: (got.ok ? "done" : "refused")
+              + (got.note ? " — " + got.note : "") }], "", false);
+        } catch (e) { paintSteps(log, [], e.message, false); }
+        setTimeout(() => { b.disabled = false; }, 4000);
+      };
+      util.appendChild(b);
+    });
+    pop.appendChild(util);
+
+    document.body.appendChild(pop);
+    paintEngines(rack);
+  }
+
+  cell.onclick = open;
+}
+initTriagePopup();
+
 /* #799: the status bar — the machine's own ticker tape. Left: the newest
  * line of EVERYTHING the server is doing (pipeline feed + every shell
  * command the agent runs), click for the live 8-line terminal with

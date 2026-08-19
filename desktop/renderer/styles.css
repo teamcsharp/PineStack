@@ -459,6 +459,45 @@ body { padding-bottom: 28px; }
   min-width: 120px; border-radius: 8px;
   border: 1px solid #4b2a5e;
   background: radial-gradient(ellipse at 50% 20%, #1b1030, #05070f); }
+/* #836: the radio triage popup off the Agent cell. */
+.agent-cell { cursor: pointer; }
+.agent-cell:hover b { color: #7ce8a9; }
+.triage-pop {
+  position: fixed; top: 52px; left: 16px; z-index: 120;
+  width: min(560px, calc(100vw - 32px));
+  background: var(--panel, #141b24); border: 1px solid #2a5c3f;
+  border-radius: 10px; padding: 12px; font-size: 12.5px;
+  box-shadow: 0 14px 48px rgba(0, 24, 10, .8);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.triage-pop .tri-head { display: flex; align-items: baseline; gap: 8px; }
+.triage-pop .tri-x { margin-left: auto; }
+.triage-pop .tri-log { max-height: 40vh; overflow: auto;
+  border: 1px solid var(--border, #2a3644); border-radius: 8px;
+  padding: 7px 9px; display: flex; flex-direction: column; gap: 4px;
+  background: #05090f; }
+.triage-pop .tri-step { font-size: 11.5px; line-height: 1.5; }
+.triage-pop .tri-step b { color: #9fd8ff; }
+.triage-pop .tri-step i { color: #7ce8a9; font-style: normal; }
+.triage-pop .tri-verdict { margin-top: 4px; font-weight: 700;
+  color: #7ce8a9; }
+.triage-pop .tri-busy { color: #8ba0b5; font-size: 11px; }
+.triage-pop .tri-acts { display: flex; gap: 6px; flex-wrap: wrap; }
+.triage-pop .tri-primary { font-weight: 700; background: #14351f;
+  border-color: #2a5c3f; }
+.triage-pop .tri-rack { display: flex; flex-direction: column;
+  gap: 4px; }
+.triage-pop .tri-eng { display: flex; align-items: center; gap: 6px;
+  font-size: 11.5px; }
+.triage-pop .tri-eng .tri-stat { flex: 1; min-width: 0;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: #8ba0b5; }
+.triage-pop .tri-dot { width: 9px; height: 9px; border-radius: 50%;
+  background: #5a2a2a; flex: 0 0 auto; }
+.triage-pop .tri-dot.up { background: #43d17c;
+  box-shadow: 0 0 8px #43d17c; }
+.triage-pop button { font-size: 11px; padding: 3px 9px; }
+
 /* #824: nothing in the tower view escapes the frame — the body clips at
    its own border, every flex child may shrink, long names ellipsise. */
 #crystalPopup .cp-body { min-height: 0; overflow: hidden; }
