@@ -39,7 +39,13 @@ OLLAMA_URL = os.getenv(
 # Image recognition needs a MULTIMODAL model — the writer model (a text
 # MoE) is blind and returns hallucinations for an image (#441). Kept
 # separate so the writer can be any model without breaking vision.
-VISION_MODEL = os.getenv("VISION_MODEL", "qwen2.5vl:7b")
+# #892: the WRITER does the looking too. gemma4:e2b reports vision,
+# audio, tools and thinking, and it is already resident for every round
+# — so the station stopped paying 6.6GB and a second llama-server for a
+# specialist. Measured: with qwen2.5vl:7b resident the GPU sat at 92%
+# and XTTS rendered at 6.37x realtime; without it, 48% and 1.61x. The
+# env var still wins if you want the specialist back.
+VISION_MODEL = os.getenv("VISION_MODEL", "gemma4:e2b")
 
 SEARXNG_URL = os.getenv(
     "SEARXNG_URL",
@@ -8336,6 +8342,62 @@ def media_sign(key: str) -> str:
     ).hexdigest()[:32]
 
 
+# --- The pantry (#886) -----------------------------------------------
+# Rendered lines, made before anybody asked for them. Keyed by exactly
+# what determines the audio — the spoken text, the voice, the engine —
+# so the key a preparer computes during a record is the key speak_turns
+# computes when the round airs.
+_PANTRY: dict[str, dict[str, Any]] = {}
+PANTRY_LIFE = 5400.0                    # ninety minutes, then it is stale
+PANTRY_MAX = 600
+_PANTRY_GATE = asyncio.Semaphore(2)     # never crowd the live round
+
+
+def pantry_key(text: str, voice: str, engine: str) -> str:
+    raw = f"{engine}\x00{voice}\x00{str(text or '').strip()}"
+    return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
+
+
+def pantry_get(key: str) -> dict[str, Any] | None:
+    """A ready clip, if it is still on the shelf AND still on disk."""
+    row = _PANTRY.get(key)
+    if not row:
+        return None
+    if time.time() - float(row.get("at") or 0) > PANTRY_LIFE:
+        _PANTRY.pop(key, None)
+        return None
+    clip = row.get("clip") or {}
+    name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
+    if name and not (VOICE_MEDIA_DIR / name).exists():
+        _PANTRY.pop(key, None)          # pruned out from under us
+        return None
+    row["used"] = int(row.get("used") or 0) + 1
+    return dict(clip)
+
+
+def pantry_put(key: str, clip: dict[str, Any]) -> None:
+    if not (clip or {}).get("path"):
+        return
+    _PANTRY[key] = {"clip": dict(clip), "at": time.time(), "used": 0}
+    if len(_PANTRY) > PANTRY_MAX:
+        for old in sorted(_PANTRY,
+                          key=lambda k: float(_PANTRY[k].get("at") or 0)
+                          )[:len(_PANTRY) - PANTRY_MAX]:
+            _PANTRY.pop(old, None)
+
+
+def pantry_seconds() -> float:
+    """How much finished audio is standing by, in seconds — the number
+    the operator actually cares about. Depth in ROUNDS says nothing."""
+    total = 0.0
+    for row in _PANTRY.values():
+        try:
+            total += float((row.get("clip") or {}).get("seconds") or 0)
+        except Exception:  # noqa: BLE001
+            pass
+    return round(total, 1)
+
+
 def _protected_media_keys() -> set[str]:
     """Clip files we must NEVER prune because their audio has not played out
     of the box yet (#467): everything waiting on the hold shelf. Deleting a
@@ -8344,6 +8406,13 @@ def _protected_media_keys() -> set[str]:
     keys: set[str] = set()
     for row in list(_BOX_HOLD):
         path = str((row or {}).get("path") or "")
+        key = path.rsplit("/", 1)[-1].split("?")[0]
+        if key:
+            keys.add(key)
+    # #886: audio made in advance has not played either. Pruning it would
+    # quietly undo the whole point of preparing it.
+    for row in list(_PANTRY.values()):
+        path = str((row.get("clip") or {}).get("path") or "")
         key = path.rsplit("/", 1)[-1].split("?")[0]
         if key:
             keys.add(key)
@@ -8683,8 +8752,14 @@ def _trim_wav_seconds(raw: bytes, most: float = 120.0) -> bytes:
 _MODEL_CALLS: list[dict[str, Any]] = []
 
 _RENDER_COST: list[float] = []
-RENDER_COST_SLOW = 1.6          # sustained ratio at which we borrow Piper
-RENDER_COST_OK = 1.1            # ...and the ratio at which the clones return
+# #892: CALIBRATED TO THIS BOX. XTTS renders at roughly 1.6-1.75x real
+# time here when nothing else is on the GPU, so a 1.6 trigger fired on
+# healthy performance and a 1.1 release could never clear it — the pair
+# spent the night in Piper stand-in voices instead of their own, which
+# is the opposite of what the relief is for. Continuity is the pantry's
+# job now (#886); this is only for a genuinely sick engine.
+RENDER_COST_SLOW = 2.8          # sustained ratio at which we borrow Piper
+RENDER_COST_OK = 2.0            # ...and the ratio at which the clones return
 _RENDER_RELIEF = [False]
 _RENDER_RELIEF_AT = [0.0]        # when it latched on (#784)
 
@@ -14751,6 +14826,172 @@ def repair_note(what: str) -> None:
     pipeline_log("air", f"repair mode: {what}"[:190])
 
 
+def _round_chunks(turns: list[tuple[str, str]],
+                  voices: dict[str, str]) -> list[tuple[str, str, str]]:
+    """The exact (text, voice, who) speak_turns will ask the engine for.
+
+    This mirrors the playlist build deliberately and only for the seats
+    the larder actually banks — no callers, no phone line. Anything it
+    gets wrong is a cache MISS, which is simply today's behaviour."""
+    out: list[tuple[str, str, str]] = []
+    cap = say_max_chars()
+    for marker, said in turns:
+        who = ("caller" if marker == "C" else "caller2" if marker == "E"
+               else "dj" if marker == "A"
+               else "third" if marker == "D" else "cohost")
+        if who in ("caller", "caller2"):
+            return []                   # the phone line is drawn per call
+        text = spoken_text(said)
+        if not text:
+            continue
+        voice = str(voices.get(who) or "")
+        if not voice:
+            continue
+        vec = performance_vector(who, voice)
+        for at, chunk in enumerate(
+                sentence_chunks(text, cap=cap,
+                                most=say_chunks_for(text, cap))):
+            if at:
+                chunk = breath_for(f"{who}{len(out)}") + chunk
+            out.append((inject_disfluencies(chunk, vec,
+                                            seed=f"{who}{len(out)}"),
+                        voice, who))
+    return out
+
+
+async def larder_prepare(entry: dict[str, Any]) -> bool:
+    """#886: make a banked round's AUDIO, before anybody wants it."""
+    if entry.get("prepared") or entry.get("preparing"):
+        return False
+    entry["preparing"] = True
+    try:
+        # The freshening model call comes OFF the critical path — it is
+        # done once, here, and the script is frozen so the air road can
+        # skip it and the chunk text stays exactly what we rendered.
+        if not entry.get("frozen"):
+            try:
+                entry["script"] = await freshen_script(
+                    str(entry.get("script") or ""),
+                    str(entry.get("caller_name") or ""),
+                    str(entry.get("caller2_name") or ""))
+            except Exception:  # noqa: BLE001
+                pass
+            entry["frozen"] = True
+        turns = banter_turns(str(entry.get("script") or ""),
+                             str(entry.get("caller_name") or ""),
+                             str(entry.get("caller2_name") or ""))
+        voices = await session_voices()
+        plan = _round_chunks(turns, voices)
+        if not plan:
+            entry["prepared"] = False
+            entry["chunks"] = 0
+            return False
+        dj = dj_settings()
+        entry["chunks"] = len(plan)
+        entry["made"] = int(entry.get("made") or 0)
+        entry["seconds"] = float(entry.get("seconds") or 0.0)
+        made = 0
+        for text, voice, who in plan:
+            # #886: EXACTLY as the air road computes it — _premake_inner
+            # calls voice_engine_for(v) with no seat, and passing one here
+            # applies role pinning and the cast lock, which can name a
+            # different engine and silently miss every key we store.
+            engine = voice_engine_for(voice)
+            key = pantry_key(text, voice, engine)
+            got = pantry_get(key)
+            if got:
+                made += 1
+                entry["made"] = made
+                continue
+            if engine in ("xtts", "f5") and \
+                    not await clone_engine_ready(engine):
+                break                   # the engine is busy or down; later
+            # #890: yield the moment the live road wants the engine. The
+            # buffer is worth nothing if building it is what made the
+            # station late.
+            if render_relief() or _PREMAKE_GATE.locked():
+                break
+            # The same effects the live road would have drawn for this
+            # seat — a real random draw, baked in now instead of then.
+            fx = dict(voice_effect_pick())
+            if vec_for := performance_vector(who, voice):
+                fx["perf"] = vec_for
+            strip = str(dj.get(f"strip_{who}") or "")
+            if strip:
+                fx["strip"] = strip
+            try:
+                async with _PANTRY_GATE:
+                    clip = await voice_render_any(text, voice, engine,
+                                                  fx=fx, who=who)
+            except Exception:  # noqa: BLE001
+                clip = None
+            if not (clip or {}).get("path"):
+                break
+            pantry_put(key, clip)
+            made += 1
+            entry["made"] = made
+            entry["seconds"] = round(
+                float(entry.get("seconds") or 0)
+                + float((clip or {}).get("seconds") or 0), 1)
+        entry["prepared"] = made >= len(plan)
+        if entry["prepared"]:
+            pipeline_log("lookahead", f"a round is READY to air - "
+                         f"{made} lines, {entry.get('seconds')}s of finished "
+                         "audio waiting (#886)")
+        return bool(entry["prepared"])
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        entry["preparing"] = False
+
+
+def pantry_window() -> str:
+    """When it is cheap to build ahead: a record with room left on it, or
+    an ad break. Both are stretches where nobody is waiting on a voice.
+
+    #890: and only when the engine is genuinely spare. Preparing while
+    the live road is rendering makes the very thing it is trying to get
+    ahead of slower, and under render_relief there is nothing worth
+    building at all — the air is going to Piper, so XTTS clips made now
+    would never be asked for."""
+    if render_relief():
+        return ""
+    if _PREMAKE_GATE.locked():
+        return ""                       # the live round has the engine
+    if _RADIO.get("ad_now") and time.time() - float(
+            (_RADIO.get("ad_now") or {}).get("at") or 0) < 180:
+        return "an ad break"
+    if _SPEAKING[0]:
+        return ""                       # somebody is talking; leave the GPU
+    track = _RADIO.get("now") or {}
+    try:
+        left = float(track.get("seconds") or 0) - (
+            time.time() - float(_RADIO.get("started") or 0))
+    except Exception:  # noqa: BLE001
+        return ""
+    return "a record" if left > 25 else ""
+
+
+async def pantry_keeper() -> None:
+    """#886: use the records and the ad breaks to build the buffer."""
+    while True:
+        await asyncio.sleep(6)
+        try:
+            if not _RADIO.get("on"):
+                continue
+            window = pantry_window()
+            if not window:
+                continue
+            nxt = next((e for e in _LARDER
+                        if not e.get("prepared") and not e.get("preparing")),
+                       None)
+            if nxt is None:
+                continue
+            await larder_prepare(nxt)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 async def larder_keeper() -> None:
     """Idle hands write tomorrow's radio (#349, #351): whenever the shelf
     is short and the writer is free, another round goes up, so there is
@@ -14834,6 +15075,13 @@ def dialogue_flow_state() -> dict[str, Any]:
         "delivery_waiting": len(_BOX_HOLD), "synth_age": synth_age,
         "prefill": bool(dj.get("dialogue_prefill", True)),
         "blockers": blockers,
+        # #886/#887: depth in ROUNDS says nothing about whether the
+        # station can keep talking. These say it in seconds of finished
+        # audio, which is the only number that answers the question.
+        "prepared": sum(1 for e in _LARDER if e.get("prepared")),
+        "buffered_seconds": pantry_seconds(),
+        "pantry_clips": len(_PANTRY),
+        "window": pantry_window(),
     }
 
 
@@ -15114,11 +15362,15 @@ async def needle_watch() -> None:
             # would just be noise.
             if length <= 0 or over < 6.0:
                 continue
+            # #889: the needle drops, the CONVERSATION CARRIES ON. This
+            # used to bump _TALK_CUT as well, and speak_turns abandons
+            # every remaining turn on that — a working round losing its
+            # last lines because the record underneath it ran out. The
+            # pair are supposed to talk over the music; let them.
             pipeline_log(
-                "air", f"the record ran out {int(over)}s ago and the desk is "
-                       "still talking — cutting the round short so the next "
-                       "one can start (#689)")
-            _TALK_CUT[0] += 1
+                "air", f"the record ran out {int(over)}s ago while the pair "
+                       "were still talking — starting the next one under "
+                       "them and letting the round finish (#889)")
             dj_skip()
         except Exception:
             pass                  # a watchdog never takes the show down
@@ -15250,6 +15502,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
     _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
+    _RADIO_TASK.append(asyncio.create_task(pantry_keeper()))        # #886
     _RADIO_TASK.append(asyncio.create_task(tape_watch()))
     tape_warmer()                      # the shelf normalizes itself (#242)
     remember_radio(True, _RADIO["station"])
@@ -20090,7 +20343,8 @@ def _crystal_influence_note(mind: str, file: str, text: str,
 
 
 async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
-                         rid: str = "", only: str = "") -> dict[str, Any]:
+                         rid: str = "", only: str = "",
+                         tinted: bool = True) -> dict[str, Any]:
     """A swath out of one document, both drawn at random.
 
     The directory is read every time, so anything dropped in the folder is in
@@ -20131,7 +20385,11 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # at the dial's strength the swath is drawn from the crystal's own
     # minds, so DOOM (or whoever) enters the pair's mouths as material,
     # which a small model obeys far harder than an instruction.
-    if not rid and not only:
+    # #891: `tinted=False` is the operator's own sliders talking — the
+    # opening and closing passages are about HOW MUCH verbatim material
+    # airs, not about which mind it comes from, so a crystal never takes
+    # those draws away from the studio library.
+    if not rid and not only and tinted:
         _crs = crystal_active()
         if _crs:
             _cr = random.choice(_crs)
@@ -27729,6 +27987,13 @@ async def speak_turns(turns: list[tuple[str, str]],
             text = spoken_text(item["chunk"])
             if not text or not re.search(r"[^\W_]", text):
                 return None
+            # #886: made already, while a record was playing. This is the
+            # whole buffer — a hit costs nothing and skips the engine.
+            _ready = pantry_get(pantry_key(text, v, engine))
+            if _ready:
+                pipeline_log("lookahead", "off the pantry shelf - no render "
+                             f"needed - {item['who']} (#886)")
+                return _ready
             # #746: BOTH cloning engines. This probed XTTS only, so an
             # F5 voice with :8772 down raised out of voice_generate
             # instead of falling back to Piper like everything else.
@@ -29173,12 +29438,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # #752: seeded with the drawn approach as well as the script, so
         # the material the vector index hands back rhymes with the FRAME
         # rather than with the last 400 characters of what was said.
+        # #891: the fallback draw is UNTINTED. Under a strong crystal
+        # every blind pull was landing in one mind, so the operator's
+        # opening/closing passage sliders stopped delivering the studio's
+        # own documents at all. The crystal still owns the round's seed.
         return (await speakbox_semantic_seed(
                     (str(_approach.get("text") or "") + " "
                      + (script[-400:] or angle or "")),
                     exclude=seed.get("file", ""))
                 or await speakbox_quote(exclude=seed.get("file", ""),
-                                        most=5, cap=500))
+                                        most=5, cap=500, tinted=False))
     # A full reading is placed into the script AFTER the model has written its
     # exchange. It is therefore verbatim, one speaker's turn, and cannot be
     # summarized, answered over, or reduced to a decorative sentence. The
@@ -29360,7 +29629,14 @@ async def _banter_air(entry: dict[str, Any],
     # segment is already holding the model gate, never queue this reserve
     # behind a rewrite: speak_turns still applies its line-level repetition
     # checks, but the ready audio path must remain immediately available.
-    if _OLLAMA_GATE.locked():
+    if entry.get("frozen"):
+        # #886: already freshened while a record played, and the audio was
+        # rendered against exactly this text. Rewriting it now would throw
+        # the prepared clips away and put a model call back on the air
+        # path — the two things preparing it was for.
+        pipeline_log("air", "a prepared round goes straight to air — its "
+                     "audio was made during the last record (#886)")
+    elif _OLLAMA_GATE.locked():
         pipeline_log("air", "larder round bypasses model freshening while "
                      "the desk is still writing — keeping talk on air")
     else:
@@ -32086,6 +32362,34 @@ async def api_test(
     }
 
 
+# #893: what each model can actually do, asked once and remembered.
+# Capabilities do not change for a given tag, so this is cached for the
+# life of the process — /api/show is far too slow to call per request
+# across twenty models.
+_MODEL_CAPS: dict[str, list[str]] = {}
+# What the station asks of a writer. Vision is on the list because the
+# alternative is loading a second model just to look at pictures (#892).
+PINEBOX_NEEDS = ("completion", "vision")
+
+
+async def model_capabilities(name: str) -> list[str]:
+    if name in _MODEL_CAPS:
+        return _MODEL_CAPS[name]
+    caps: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            r = await client.post(f"{OLLAMA_URL}/api/show",
+                                  json={"model": name})
+        if r.status_code == 200:
+            got = r.json() or {}
+            caps = [str(c) for c in (got.get("capabilities") or [])]
+    except Exception:  # noqa: BLE001
+        caps = []
+    if caps:
+        _MODEL_CAPS[name] = caps
+    return caps
+
+
 @app.get("/api/ollama-models")
 async def ollama_models(
     authorization: str | None = Header(default=None),
@@ -32096,10 +32400,38 @@ async def ollama_models(
             response = await client.get(f"{OLLAMA_URL}/api/tags")
             response.raise_for_status()
             data = response.json()
-        names = [m.get("name") for m in data.get("models", []) if m.get("name")]
+        rows = [m for m in data.get("models", []) if m.get("name")]
     except Exception:
-        names = []
-    return {"models": names}
+        rows = []
+    names = [str(m["name"]) for m in rows]
+    sizes = {str(m["name"]): int(m.get("size") or 0) for m in rows}
+    caps = dict(zip(names, await asyncio.gather(
+        *[model_capabilities(x) for x in names]))) if names else {}
+
+    detail: list[dict[str, Any]] = []
+    for name in names:
+        able = caps.get(name) or []
+        missing = [want for want in PINEBOX_NEEDS if want not in able]
+        detail.append({
+            "name": name,
+            "capabilities": able,
+            "vision": "vision" in able,
+            "tools": "tools" in able,
+            "complete": not missing and bool(able),
+            "missing": missing if able else ["unknown"],
+            "gb": round(sizes.get(name, 0) / 1073741824, 1),
+        })
+    # Everything the station needs first, then by the smallest model that
+    # still does the whole job — the cheapest way to keep one model
+    # resident instead of two.
+    detail.sort(key=lambda r: (not r["complete"], not r["tools"],
+                               r["gb"] or 999, r["name"]))
+    return {
+        "models": [r["name"] for r in detail],   # unchanged for old callers
+        "detail": detail,
+        "needs": list(PINEBOX_NEEDS),
+        "complete": [r["name"] for r in detail if r["complete"]],
+    }
 
 
 @app.post("/api/conversations/title")
@@ -38352,6 +38684,60 @@ async def dj_topics_get(
     """Everything in the bank, most recently added first."""
     require_read_auth(authorization)
     return {"topics": read_bombshells()}
+
+
+@app.get("/api/dj/pending")
+async def dj_pending(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#887: the rounds waiting to go on air, and how ready each one is."""
+    require_read_auth(authorization)
+    rows: list[dict[str, Any]] = []
+    for at, entry in enumerate(list(_LARDER)):
+        try:
+            turns = banter_turns(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or ""))
+        except Exception:  # noqa: BLE001
+            turns = []
+        said = []
+        for marker, text in turns[:14]:
+            who = ("caller" if marker == "C" else "caller2" if marker == "E"
+                   else "dj" if marker == "A"
+                   else "third" if marker == "D" else "cohost")
+            clean = spoken_text(text)
+            if clean:
+                said.append({"who": who,
+                             "name": booth_actor_name(who, ""),
+                             "text": clean[:400]})
+        chunks = int(entry.get("chunks") or 0)
+        made = int(entry.get("made") or 0)
+        state = ("ready" if entry.get("prepared")
+                 else "rendering" if entry.get("preparing")
+                 else "written")
+        rows.append({
+            "id": hashlib.sha1(
+                str(entry.get("script") or "").encode("utf-8", "ignore")
+            ).hexdigest()[:10],
+            "at": float(entry.get("at") or 0),
+            "state": state,
+            "chunks": chunks,
+            "made": made,
+            "progress": round(made / chunks, 3) if chunks else 0.0,
+            "seconds": float(entry.get("seconds") or 0),
+            "frozen": bool(entry.get("frozen")),
+            "turns": len(turns),
+            "lines": said,
+        })
+    window = pantry_window()
+    return {
+        "pending": rows,
+        "buffered_seconds": pantry_seconds(),
+        "pantry_clips": len(_PANTRY),
+        "window": window,
+        "building": bool(window),
+        "target": int(dj_settings().get("dialogue_reserve_target") or 6),
+    }
 
 
 @app.get("/api/dj/paths")
@@ -55923,7 +56309,15 @@ function djTalkPopup() {
 
   box.appendChild(head);
   box.appendChild(boothGlass());          // #668
+  /* #888: what is COMING. One strip per round still to air, with the
+   * dialogue it will say and how much of its audio exists yet. */
+  const pend = el("div", "", "");
+  pend.id = "djPendingBox";
+  pend.style.cssText = "flex:0 0 auto;margin:0 0 5px;display:none;"
+    + "max-height:34vh;overflow:auto";
+  box.appendChild(pend);
   box.appendChild(log);
+  djPendingStart();
   document.body.appendChild(box);
   boothGlassStart();
   return box;
@@ -58450,6 +58844,120 @@ function boothAnalysisDossier(line) {
   };
   setTimeout(() => document.addEventListener("click", off, true), 0);
 }
+
+/* #888: the queue above the transcript. -------------------------------
+ * Everything here is additive: if the endpoint is unreachable the strip
+ * area simply hides and the booth is exactly as it was. */
+var djPendTimer = null;
+var djPendFrame = 0;
+const DJ_SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+function djPendingStyle() {
+  if (document.getElementById("djPendCss")) return;
+  const css = el("style", "", "");
+  css.id = "djPendCss";
+  css.textContent =
+    "@keyframes djPendSweep{0%{background-position:-220px 0}"
+    + "100%{background-position:220px 0}}"
+    + ".djPendBar{position:relative;height:5px;border-radius:3px;"
+    + "background:rgba(255,255,255,.09);overflow:hidden;margin:4px 0 3px}"
+    + ".djPendFill{height:100%;border-radius:3px;background:var(--accent);"
+    + "transition:width .45s ease}"
+    + ".djPendGlow{position:absolute;inset:0;"
+    + "background:linear-gradient(90deg,transparent,"
+    + "rgba(255,255,255,.42),transparent);background-size:220px 100%;"
+    + "background-repeat:no-repeat;animation:djPendSweep 1.25s linear "
+    + "infinite}";
+  document.head.appendChild(css);
+}
+
+async function djPendingTick() {
+  const host = document.getElementById("djPendingBox");
+  if (!host) { if (djPendTimer) { clearInterval(djPendTimer); djPendTimer = null; } return; }
+  djPendFrame = (djPendFrame + 1) % DJ_SPIN.length;
+  let got = null;
+  try { got = await api("/api/dj/pending"); }
+  catch (e) { host.style.display = "none"; return; }
+  const rows = (got && got.pending) || [];
+  if (!rows.length) { host.style.display = "none"; host.textContent = ""; return; }
+  host.style.display = "block";
+  host.textContent = "";
+
+  const cap = el("div", "muted", "");
+  cap.style.cssText = "font-size:10px;margin:0 0 4px;letter-spacing:.03em";
+  const secs = Number((got && got.buffered_seconds) || 0);
+  cap.textContent = "⏱ coming up — " + rows.length + " round"
+    + (rows.length === 1 ? "" : "s") + " written, "
+    + (secs >= 60 ? (secs / 60).toFixed(1) + " min" : secs.toFixed(0) + " s")
+    + " of audio already made"
+    + (got && got.window ? " · building through " + got.window : "");
+  host.appendChild(cap);
+
+  rows.forEach((r) => {
+    const wrap = el("div", "", "");
+    const done = r.state === "ready";
+    wrap.style.cssText = "border:1px solid " + (done
+      ? "rgba(120,220,140,.45)" : "rgba(255,255,255,.14)")
+      + ";border-left:3px solid " + (done ? "#78dc8c" : "var(--accent)")
+      + ";border-radius:7px;padding:6px 8px;margin:0 0 5px;"
+      + "background:rgba(255,255,255,.03)";
+    const top = el("div", "", "");
+    top.style.cssText = "display:flex;align-items:center;gap:6px;"
+      + "font-size:10px;font-weight:700";
+    const badge = el("span", "", done
+      ? "✓ ready to air"
+      : (r.state === "rendering"
+         ? DJ_SPIN[djPendFrame] + " rendering"
+         : "✎ written — waiting for a window"));
+    badge.style.color = done ? "#78dc8c" : "var(--accent)";
+    top.appendChild(badge);
+    const meta = el("span", "muted", "");
+    meta.style.cssText = "font-weight:400;margin-left:auto";
+    meta.textContent = r.turns + " turns"
+      + (r.chunks ? " · " + r.made + "/" + r.chunks + " lines made" : "")
+      + (r.seconds ? " · " + Number(r.seconds).toFixed(0) + "s" : "");
+    top.appendChild(meta);
+    wrap.appendChild(top);
+
+    if (!done) {
+      const bar = el("div", "djPendBar", "");
+      const fill = el("div", "djPendFill", "");
+      fill.style.width = Math.round((Number(r.progress) || 0) * 100) + "%";
+      bar.appendChild(fill);
+      if (r.state === "rendering") bar.appendChild(el("div", "djPendGlow", ""));
+      wrap.appendChild(bar);
+      const blocks = el("div", "muted", "");
+      blocks.style.cssText = "font-size:9px;letter-spacing:1px;margin-bottom:2px";
+      const total = 18;
+      const lit = Math.max(0, Math.min(total,
+        Math.round((Number(r.progress) || 0) * total)));
+      blocks.textContent = "▰".repeat(lit) + "▱".repeat(total - lit);
+      wrap.appendChild(blocks);
+    }
+
+    (r.lines || []).forEach((ln) => {
+      const line = el("div", "", "");
+      line.style.cssText = "font-size:10px;line-height:1.5;margin-top:2px;"
+        + "opacity:" + (done ? ".82" : ".62");
+      const nm = el("b", "", (ln.name || ln.who) + " ");
+      nm.style.color = "var(--accent)";
+      line.appendChild(nm);
+      line.appendChild(document.createTextNode(String(ln.text || "")));
+      wrap.appendChild(line);
+    });
+    host.appendChild(wrap);
+  });
+}
+
+function djPendingStart() {
+  try {
+    djPendingStyle();
+    if (djPendTimer) clearInterval(djPendTimer);
+    djPendingTick();
+    djPendTimer = setInterval(djPendingTick, 1600);
+  } catch (e) { /* the booth still works without the queue */ }
+}
+
 
 function djTalkRow(line) {
   const row = djTalkRowInner(line);
