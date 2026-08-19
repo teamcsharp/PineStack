@@ -13690,7 +13690,11 @@ _BOX_HOLD: list[dict[str, Any]] = []
 # and cycled oldest-out only when the budget is genuinely full — so a long
 # outage never silently drops un-played lines the way a 30-item cap did.
 HOLD_KEEP_BYTES = int(os.getenv("HOLD_KEEP_BYTES", str(3 * 1024 ** 3)))
-_BOX_HOLD_MAX = int(os.getenv("BOX_HOLD_MAX", "20000"))   # safety ceiling
+# #869: twelve, not twenty thousand. This is a LIVE station: the shelf
+# exists to cover a brief device outage, not to bank a night of
+# dialogue. A ceiling of 20000 meant it could never trim, and every
+# fresh line was gagged behind whatever had piled up.
+_BOX_HOLD_MAX = int(os.getenv("BOX_HOLD_MAX", "12"))
 # How long held dialogue survives a restart before it is considered stale
 # (#473): a full day, bounded by the size budget above.
 HOLD_MAX_AGE = float(os.getenv("HOLD_MAX_AGE", str(24 * 3600)))
@@ -13740,6 +13744,11 @@ def _box_hold_load() -> None:
         _hold_trim()
 
 
+# #869: how long a held line is still worth airing. Past this it is
+# about a record nobody is playing and a moment nobody remembers.
+HOLD_STALE_SECONDS = float(os.getenv("HOLD_STALE_SECONDS", "300"))
+
+
 def _hold_trim() -> None:
     """Account for an overloaded hold shelf without deleting unplayed audio.
 
@@ -13749,11 +13758,44 @@ def _hold_trim() -> None:
     operator deletion. The warning gives operations a chance to add storage
     or repair the device before the filesystem itself becomes the constraint.
     """
+    # #869: RADIO IS LIVE. This used to preserve every line for ever on
+    # the reasoning that dropping held audio is data loss — correct for
+    # a message queue, wrong for a station. The pair out-produce a
+    # device that plays one announce at a time and blocks for its full
+    # length, so the shelf only grew, and _play_on_box gags fresh lines
+    # behind it: the operator hears an ever-older queue while the live
+    # show is silenced. A line about a record that finished ten minutes
+    # ago is not worth the air it would cost.
+    now = time.time()
+    stale = [r for r in _BOX_HOLD
+             if now - float(r.get("ts") or now) > HOLD_STALE_SECONDS]
+    for row in stale:
+        try:
+            _BOX_HOLD.remove(row)
+        except ValueError:
+            continue
+    if stale:
+        pipeline_log("air", f"{len(stale)} held line(s) aged out of the "
+                     "shelf — the show is live and they were no longer "
+                     "this show (#869)",
+                     extra=" | ".join(str(r.get("text") or "")[:70]
+                                      for r in stale[:4]))
+    # And a hard ceiling regardless of age: the newest N are what the
+    # station still has any chance of airing in time.
+    if len(_BOX_HOLD) > _BOX_HOLD_MAX:
+        cut = len(_BOX_HOLD) - _BOX_HOLD_MAX
+        dropped = _BOX_HOLD[:cut]
+        del _BOX_HOLD[:cut]
+        pipeline_log("air", f"the hold shelf was over {_BOX_HOLD_MAX} — "
+                     f"released the {cut} oldest so the live show is not "
+                     "queued behind yesterday (#869)",
+                     extra=" | ".join(str(r.get("text") or "")[:70]
+                                      for r in dropped[:4]))
     total = sum(int(r.get("bytes") or 0) for r in _BOX_HOLD)
-    if total > HOLD_KEEP_BYTES or len(_BOX_HOLD) > _BOX_HOLD_MAX:
+    if total > HOLD_KEEP_BYTES:
         pipeline_log(
-            "air", "hold shelf exceeds its storage advisory - preserving every line",
-            extra=(f"{len(_BOX_HOLD)} clips / {round(total / 1e6, 1)} MB remain "
+            "air", "hold shelf is heavy on disk",
+            extra=(f"{len(_BOX_HOLD)} clips / {round(total / 1e6, 1)} MB "
                    "queued until verified Pine Box playout."))
 
 
@@ -13975,6 +14017,26 @@ async def box_route_wake() -> None:
                      "routing change — starting guarded link repair")
     if box_worth_healing():
         await satellite_selfheal()
+
+
+async def hold_shelf_groomer() -> None:
+    """#869: the shelf is groomed on a clock, not only when something is
+    added. A station that has stopped adding to it (because every line
+    is being gagged BY it) would otherwise never trim, and the gag would
+    hold for ever."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if _BOX_HOLD:
+                _hold_trim()
+                _box_hold_save()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.on_event("startup")
+async def _startup_hold_groomer() -> None:
+    fire_and_forget(hold_shelf_groomer())
 
 
 async def box_hold_watch() -> None:
