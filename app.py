@@ -4432,6 +4432,19 @@ async def ask_openwebui(text: str, model: str) -> str:
 _BG_TASKS: set[Any] = set()
 
 
+# #852: the main event loop, captured at startup, so work handed over
+# from a worker thread has somewhere to go.
+_MAIN_LOOP: list[Any] = [None]
+
+
+@app.on_event("startup")
+async def _startup_capture_loop() -> None:
+    try:
+        _MAIN_LOOP[0] = asyncio.get_running_loop()
+    except RuntimeError:
+        _MAIN_LOOP[0] = None
+
+
 def fire_and_forget_speech(coro: Any) -> None:
     """Speech we can later cancel from the Stop button."""
     try:
@@ -4443,7 +4456,30 @@ def fire_and_forget_speech(coro: Any) -> None:
 
 
 def fire_and_forget(coro: Any) -> None:
-    task = asyncio.create_task(coro)
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        # #852: called from a worker thread, where there is no running
+        # loop. fire_and_forget_speech has always guarded this; this one
+        # raised instead — and sting_due runs in a thread, so the raise
+        # tore down the whole talk round (~40 times in a day). Hand the
+        # work to the main loop when we can find it, and say so rather
+        # than swallowing a real misuse in silence.
+        loop = _MAIN_LOOP[0]
+        if loop is not None and loop.is_running():
+            try:
+                asyncio.run_coroutine_threadsafe(coro, loop)
+                return
+            except Exception:  # noqa: BLE001
+                pass
+        try:
+            coro.close()
+        except Exception:  # noqa: BLE001
+            pass
+        pipeline_log("repair", "background work was requested off the "
+                               "event loop and could not be scheduled "
+                               "(#852)")
+        return
     _BG_TASKS.add(task)
     task.add_done_callback(_BG_TASKS.discard)
 
@@ -5238,6 +5274,7 @@ _SAT_SAW_TURN_AT = [0.0]
 # show working, not dead air (#394): the watchdog restarting mid-round
 # was how the openers aired twice in seventy seconds.
 _LAST_SYNTH = [0.0]
+_SYNTH_TRIED = [0.0]              # #852: attempted, as distinct from done
 
 # One writer plus one long looker, never a pile: every chat call to ollama
 # goes through this gate, because the show's clocks stacking unbounded
@@ -5953,11 +5990,43 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
     # the middle of an all-engines-refused outage (#824).
     _xtts_ok = bool((await xtts_health()).get("ready"))
     _f5_ok = bool((await f5_health()).get("ready"))
+    # #853: PIPER, the floor. Every ladder in the station ends here, and
+    # until now nothing probed it — the rung below simply asserted
+    # "NOTHING can render but Piper" without ever asking Piper. Ask it
+    # for its voice list with a deadline; an open port that returns no
+    # voices is the wedge, and the lifeboat has always been able to
+    # restart the container.
+    try:
+        _piper_names = await asyncio.wait_for(piper_voices(), 8)
+    except Exception:  # noqa: BLE001
+        _piper_names = []
+    _piper_ok = bool(_piper_names)
+    note("the floor (piper)",
+         f"{len(_piper_names)} voices — every ladder ends here"
+         if _piper_ok else
+         "NOT ANSWERING — the last resort is gone, so a line with no "
+         "clone engine has nowhere left to go",
+         "" if _piper_ok else
+         ("restarting wyoming-piper through the lifeboat" if fix else ""))
+    if fix and not _piper_ok:
+        await _lifeboat_restart("wyoming-piper")
+        for _ in range(6):
+            await asyncio.sleep(5)
+            try:
+                if await asyncio.wait_for(piper_voices(), 6):
+                    note("the floor (piper)", "back — the ladder has its "
+                         "last rung again")
+                    _piper_ok = True
+                    break
+            except Exception:  # noqa: BLE001
+                continue
     note("the voice engines",
          f"xtts {'up' if _xtts_ok else 'DOWN'} · f5 "
          f"{'up' if _f5_ok else 'DOWN'}"
          + ("" if (_xtts_ok or _f5_ok) else
-            " — NOTHING can render but Piper"),
+            (" — NOTHING can render but Piper" if _piper_ok else
+             " — and PIPER IS DOWN TOO: nothing on this box can make "
+             "audio at all")),
          "" if (_xtts_ok and _f5_ok) else
          ("redeploying the dead engine(s)" if fix else ""))
     if fix and not (_xtts_ok and _f5_ok):
@@ -8513,7 +8582,12 @@ async def voice_generate(text: str, voice: str, engine: str,
         )
 
     started = time.monotonic()
-    _LAST_SYNTH[0] = time.time()
+    # #852: this used to stamp _LAST_SYNTH here, BEFORE synthesis — so a
+    # render that failed still looked like recent activity and the
+    # dead-air watchdog slept through the outage it exists to catch.
+    # The attempt and the success are different facts; only success
+    # resets the clock (stamped after the engine answers, below).
+    _SYNTH_TRIED[0] = time.time()
     note_activity("voicing", f"{engine} · {len(text)} chars")
     pipeline_log("voice", f"{engine} · {voice or 'default voice'} · "
                           f"{len(text)} chars in",
@@ -8534,6 +8608,11 @@ async def voice_generate(text: str, voice: str, engine: str,
         raise HTTPException(
             status_code=502, detail="Synthesis returned nothing"
         )
+    # #852: the clock the dead-air watchdog reads is stamped HERE — an
+    # engine actually answered with audio. Stamping it before the call
+    # (as it was) meant a stream of FAILED renders looked like a busy
+    # station and the watchdog slept through the outage.
+    _LAST_SYNTH[0] = time.time()
     # A 200 with an audio content-type but a silent body slips past the check
     # above, then airs and caches as a BLANK call (#575). Judge the RAW synth
     # here, before any caller static is mixed in — a 502 sends dj_speak /
