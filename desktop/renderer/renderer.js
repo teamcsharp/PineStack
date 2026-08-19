@@ -2015,19 +2015,119 @@ function initStatusBar() {
 }
 initStatusBar();
 
-/* #800: the sample extractor — paste a link (Ctrl+V over the 🎬 works),
- * hear the clip, set IN/OUT ranges off the playhead, stack as many ranges
- * as wanted, extract them all at once into the DJs' rotation. */
+/* #800/#838: the sample extractor — paste a link (Ctrl+V over the 🎬
+ * works), watch the fetch assemble as a rotating ASCII hexagon fed by
+ * data streams, then scrub the VIDEO like a phone clip editor: IN/OUT
+ * off the playhead, stack ranges, extract them all. Every cut whispers
+ * its own words into a proposed name; the batch editor approves names
+ * and the destination folder before anything joins the rotation. */
 function initSamplePopup() {
   const btn = $("sampleBtn");
   const pop = $("samplePopup");
   if (!btn || !pop) return;
-  let job = "", audioUrl = "", dur = 0, ranges = [], hoverBtn = false;
+  let job = "", audioUrl = "", videoUrl = "", dur = 0, ranges = [],
+      hoverBtn = false;
+  const anim = { timer: 0, tick: 0, prog: 0, stage: "", note: "",
+                 streams: [], el: null, bar: null };
 
   const fmt = (s) => Math.floor(s / 60) + ":" +
     String(Math.floor(s % 60)).padStart(2, "0");
+  const escq = (s) => String(s || "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;",
+    '"': "&quot;", "'": "&#39;" }[c]));
 
+  /* ---- the hexagon ---------------------------------------------------- */
+  const HEX = [
+    "      _________      ",
+    "     /  _____  \\     ",
+    "    /  /     \\  \\    ",
+    "   |  |       |  |   ",
+    "   |  |   @   |  |   ",
+    "   |  |       |  |   ",
+    "    \\  \\_____/  /    ",
+    "     \\_________/     ",
+  ];
+  const HEXW = HEX[0].length, GUT = 15, W = HEXW + GUT * 2;
+  const CELLS = [];
+  HEX.forEach((line, r) => {
+    for (let c = 0; c < line.length; c++) {
+      if (line[c] !== " ") {
+        const ang = Math.atan2(r - 3.5, c - HEXW / 2);
+        CELLS.push({ r, c, ch: line[c], ang });
+      }
+    }
+  });
+  CELLS.sort((x, y) => x.ang - y.ang);
+  const SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏";
+  const CORE = "|/-\\";
+  const DATA = "01#$%&*+=~<>";
+
+  function hexFrame() {
+    const t = anim.tick;
+    const grid = Array.from({ length: HEX.length },
+      () => Array(W).fill(" "));
+    // the streams: characters coalescing into the form
+    if (!anim.streams.length) {
+      for (let k = 0; k < 16; k++) {
+        anim.streams.push({
+          r: Math.floor(Math.random() * HEX.length),
+          x: Math.random() * GUT, left: k % 2 === 0,
+          v: 0.5 + Math.random() * 1.2,
+          ch: DATA[Math.floor(Math.random() * DATA.length)] });
+      }
+    }
+    anim.streams.forEach((s) => {
+      s.x += s.v;
+      if (s.x >= GUT - 1) {           // it reaches the form: absorbed
+        s.x = 0; s.r = Math.floor(Math.random() * HEX.length);
+        s.ch = DATA[Math.floor(Math.random() * DATA.length)];
+        s.v = 0.5 + Math.random() * 1.2;
+      }
+      const col = s.left ? Math.floor(s.x)
+        : W - 1 - Math.floor(s.x);
+      grid[s.r][col] = s.ch;
+    });
+    // the hexagon, assembling — reveal rotates with the tick so the
+    // form appears to turn as it builds
+    const shown = Math.max(3, Math.round(anim.prog * CELLS.length));
+    for (let k = 0; k < shown; k++) {
+      const cell = CELLS[(k + t) % CELLS.length];
+      grid[cell.r][GUT + cell.c] =
+        cell.ch === "@" ? CORE[t % CORE.length] : cell.ch;
+    }
+    // the core always spins
+    grid[4][GUT + 10] = CORE[t % CORE.length];
+    return grid.map((row) => row.join("")).join("\n");
+  }
+
+  function barLine() {
+    const width = 26;
+    const on = Math.round(anim.prog * width);
+    return SPIN[anim.tick % SPIN.length] + " "
+      + (anim.stage || "working") + " ▐"
+      + "█".repeat(on) + "░".repeat(width - on) + "▌ "
+      + Math.round(anim.prog * 100) + "%"
+      + (anim.note ? "  · " + anim.note : "");
+  }
+
+  function animStart() {
+    if (anim.timer) return;
+    anim.timer = setInterval(() => {
+      anim.tick += 1;
+      if (anim.el && anim.el.isConnected) {
+        anim.el.textContent = hexFrame();
+        if (anim.bar) anim.bar.textContent = barLine();
+      } else { animStop(); }
+    }, 110);
+  }
+  function animStop() {
+    if (anim.timer) { clearInterval(anim.timer); anim.timer = 0; }
+    anim.streams = [];
+  }
+
+  /* ---- the popup ------------------------------------------------------ */
   function draw(stage, note) {
+    animStop();
     pop.innerHTML = "<b>🎬 Add a sample</b>";
     const urlRow = document.createElement("div");
     urlRow.className = "sp-row";
@@ -2035,25 +2135,50 @@ function initSamplePopup() {
       + "YouTube / any video link…'><button id='spFetch'>Fetch</button>"
       + "<button id='spClose'>✕</button>";
     pop.appendChild(urlRow);
-    if (note) {
+    if (note && stage !== "fetching") {
       const st = document.createElement("div");
       st.className = "muted";
       st.textContent = note;
       pop.appendChild(st);
     }
+    if (stage === "fetching") {
+      const hex = document.createElement("pre");
+      hex.className = "sp-hex";
+      const bar = document.createElement("div");
+      bar.className = "sp-hexbar";
+      pop.appendChild(hex);
+      pop.appendChild(bar);
+      anim.el = hex; anim.bar = bar;
+      anim.note = note || "";
+      animStart();
+    }
     if (stage === "ready") {
-      const player = document.createElement("audio");
-      player.controls = true;
-      player.src = audioUrl;
-      player.addEventListener("loadedmetadata", () => {
-        dur = player.duration || 0; paint();
+      let media;
+      if (videoUrl) {
+        media = document.createElement("video");
+        media.controls = true; media.playsInline = true;
+        media.preload = "metadata";
+        media.style.cssText = "width:100%;max-height:280px;background:#000;"
+          + "border-radius:8px";
+        media.src = videoUrl;
+        media.onerror = () => {          // no picture kept — audio still cuts
+          videoUrl = "";
+          draw("ready", "no video for this one — cutting by ear");
+        };
+      } else {
+        media = document.createElement("audio");
+        media.controls = true;
+        media.src = audioUrl;
+      }
+      media.addEventListener("loadedmetadata", () => {
+        dur = media.duration || 0; paint();
       });
-      pop.appendChild(player);
+      pop.appendChild(media);
       const bar = document.createElement("div");
       bar.className = "sp-bar";
       bar.onclick = (ev) => {
         const r = bar.getBoundingClientRect();
-        player.currentTime = dur * (ev.clientX - r.left) / r.width;
+        media.currentTime = dur * (ev.clientX - r.left) / r.width;
       };
       pop.appendChild(bar);
       const tools = document.createElement("div");
@@ -2078,8 +2203,9 @@ function initSamplePopup() {
         });
         list.innerHTML = ranges.map((r, n) =>
           "<div class='sp-range'>" + (n + 1) + ". " + fmt(r.a) + " → "
-          + fmt(r.b) + " <input type='text' placeholder='name it…' "
-          + "data-n='" + n + "' value='" + (r.name || "") + "'>"
+          + fmt(r.b) + " <input type='text' placeholder='name it — or "
+          + "leave blank and it names itself from the words…' "
+          + "data-n='" + n + "' value='" + escq(r.name) + "'>"
           + "<button data-x='" + n + "'>✕</button></div>").join("")
           + (b > a ? "<div class='sp-range muted'>working range: "
              + fmt(a) + " → " + fmt(b) + "</div>" : "");
@@ -2090,15 +2216,15 @@ function initSamplePopup() {
           x.onclick = () => { ranges.splice(+x.dataset.x, 1); paint(); };
         });
       }
-      player.addEventListener("timeupdate", () => {
-        if (stopAt && player.currentTime >= stopAt) {
-          player.pause(); stopAt = 0;
+      media.addEventListener("timeupdate", () => {
+        if (stopAt && media.currentTime >= stopAt) {
+          media.pause(); stopAt = 0;
         }
       });
-      $("spIn").onclick = () => { a = player.currentTime; paint(); };
-      $("spOut").onclick = () => { b = player.currentTime; paint(); };
+      $("spIn").onclick = () => { a = media.currentTime; paint(); };
+      $("spOut").onclick = () => { b = media.currentTime; paint(); };
       $("spPrev").onclick = () => {
-        if (b > a) { player.currentTime = a; stopAt = b; player.play(); }
+        if (b > a) { media.currentTime = a; stopAt = b; media.play(); }
       };
       $("spAdd").onclick = () => {
         if (b > a) { ranges.push({a, b}); a = b = 0; paint(); }
@@ -2106,36 +2232,130 @@ function initSamplePopup() {
       $("spCut").onclick = async () => {
         if (b > a) { ranges.push({a, b}); a = b = 0; }
         if (!ranges.length) return;
-        $("spCut").textContent = "cutting…";
+        $("spCut").textContent = "cutting + naming…";
+        $("spCut").disabled = true;
         try {
           const got = await api.post("/api/samples/extract",
-            {job_id: job, ranges});
-          draw("done", "✓ " + got.made.length + " sample(s) cut into "
-            + got.folder + " — the DJs have them in rotation now: "
-            + got.made.join(", "));
+            {job_id: job, ranges, stage_only: true});
+          drawBatch(got.staged || []);
           ranges = [];
-        } catch (err) { draw("ready", err.message); }
+        } catch (err) {
+          $("spCut").disabled = false;
+          $("spCut").textContent = "✂ Extract all";
+          const st = document.createElement("div");
+          st.className = "muted";
+          st.textContent = err.message;
+          pop.appendChild(st);
+        }
       };
       paint();
     }
-    $("spClose").onclick = () => { pop.style.display = "none"; };
+    $("spClose").onclick = () => {
+      animStop(); pop.style.display = "none";
+    };
     $("spFetch").onclick = () => fetchUrl($("spUrl").value.trim());
     if (stage === "idle") $("spUrl").focus();
+  }
+
+  /* ---- the batch approval editor (#838) ------------------------------- */
+  function drawBatch(rows) {
+    animStop();
+    pop.innerHTML = "<b>🎬 Approve the cuts</b>";
+    const head = document.createElement("div");
+    head.className = "muted";
+    head.textContent = rows.length + " cut(s) staged — each named from "
+      + "its own words. Fix any name, pick the folder, save the batch. "
+      + "Nothing reaches the rotation until you approve it.";
+    pop.appendChild(head);
+    const folderRow = document.createElement("div");
+    folderRow.className = "sp-row";
+    folderRow.innerHTML = "<span class='muted'>folder under the SFX "
+      + "root:</span> <input type='text' id='spFolder' "
+      + "style='flex:1;min-width:120px'>"
+      + "<button id='spBack'>‹ back</button>"
+      + "<button id='spClose'>✕</button>";
+    pop.appendChild(folderRow);
+    const fInp = folderRow.querySelector("#spFolder");
+    fInp.value = localStorage.getItem("pineSampleFolder") || "Samples";
+    const list = document.createElement("div");
+    list.className = "sp-batch";
+    rows.forEach((r) => {
+      const row = document.createElement("div");
+      row.className = "sp-range";
+      row.dataset.id = r.id;
+      const play = document.createElement("audio");
+      play.controls = true; play.preload = "none";
+      play.src = desktopMusicUrl(r.url);
+      play.style.cssText = "height:26px;width:170px;flex:0 0 auto";
+      row.appendChild(play);
+      const name = document.createElement("input");
+      name.type = "text";
+      name.value = r.name || "";
+      name.style.cssText = "flex:1;min-width:0";
+      name.title = r.words ? "it heard: " + r.words : "no words heard";
+      row.appendChild(name);
+      const secs = document.createElement("span");
+      secs.className = "muted";
+      secs.textContent = (r.seconds || 0) + "s";
+      row.appendChild(secs);
+      const x = document.createElement("button");
+      x.textContent = "✕";
+      x.title = "Drop this cut — it will not be saved";
+      x.onclick = () => row.remove();
+      row.appendChild(x);
+      list.appendChild(row);
+    });
+    pop.appendChild(list);
+    const save = document.createElement("button");
+    save.className = "primary";
+    save.textContent = "💾 Save the batch as named";
+    save.onclick = async () => {
+      const items = Array.from(list.querySelectorAll(".sp-range"))
+        .map((row) => ({ id: row.dataset.id,
+          name: row.querySelector("input").value.trim() }));
+      if (!items.length) { draw("idle", "nothing left to save"); return; }
+      save.disabled = true; save.textContent = "saving…";
+      try {
+        const folder = fInp.value.trim() || "Samples";
+        localStorage.setItem("pineSampleFolder", folder);
+        const got = await api.post("/api/samples/commit", {items, folder});
+        draw("done", "✓ " + got.saved.length + " sample(s) saved into "
+          + got.folder + " — the DJs have them in rotation now: "
+          + got.saved.join(", "));
+      } catch (err) {
+        save.disabled = false;
+        save.textContent = "💾 Save the batch as named";
+        head.textContent = err.message;
+      }
+    };
+    pop.appendChild(save);
+    folderRow.querySelector("#spBack").onclick = () =>
+      draw("ready", "the staged cuts are still on the shelf — extract "
+        + "again or approve them later");
+    folderRow.querySelector("#spClose").onclick = () => {
+      pop.style.display = "none";
+    };
   }
 
   async function fetchUrl(url) {
     if (!url) return;
     pop.style.display = "flex";
-    draw("fetching", "fetching the media — fast path, no analysis…");
+    anim.prog = 0; anim.stage = "reaching out";
+    draw("fetching", "");
     $("spUrl").value = url;
     try {
       job = (await api.post("/api/samples/fetch", {url})).job_id;
       const t0 = Date.now();
-      while (Date.now() - t0 < 600000) {
-        await new Promise((r) => setTimeout(r, 4000));
-        const st = await api.get("/api/samples/job/" + job);
+      while (Date.now() - t0 < 900000) {
+        await new Promise((r) => setTimeout(r, 2500));
+        let st = {};
+        try { st = await api.get("/api/samples/job/" + job); }
+        catch { continue; }
         if (st.stage === "done" && st.audio) {
-          audioUrl = st.audio; ranges = [];
+          audioUrl = desktopMusicUrl(st.audio);
+          videoUrl = st.video ? desktopMusicUrl(st.video) : "";
+          ranges = [];
+          anim.prog = 1;
           draw("ready", (st.title || "ready") + " — set IN/OUT off the "
             + "playhead, stack ranges, extract them all at once.");
           return;
@@ -2143,9 +2363,15 @@ function initSamplePopup() {
         if (st.stage === "error") {
           draw("idle", st.error || "that link would not fetch"); return;
         }
-        draw("fetching", (st.stage || "working") + "… "
-          + (st.note || ""));
+        anim.stage = st.stage || "working";
+        anim.prog = Math.max(anim.prog,
+          Math.min(0.99, Number(st.progress) || 0));
+        anim.note = st.note || "";
+        if (!anim.timer || !anim.el || !anim.el.isConnected) {
+          draw("fetching", "");
+        }
       }
+      draw("idle", "that took too long — try again");
     } catch (err) { draw("idle", err.message); }
   }
 

@@ -4298,12 +4298,37 @@ _RESCUE_RX = re.compile(
     r"(?:up|on|down|dead|alive|working|broken))", re.IGNORECASE)
 
 
+_RESCUE_NOUN = re.compile(
+    r"\b(?:radio|station|pine\s*fm|broadcast)\b", re.IGNORECASE)
+_RESCUE_MOOD = re.compile(
+    r"\b(?:where|down|dead|gone|missing|broke(?:n)?|offline|quiet|"
+    r"silent|bro|wtf|fuck(?:ing)?|restore|fix|help|back|at)\b",
+    re.IGNORECASE)
+_RESCUE_MUSICY = re.compile(
+    r"\b(?:play|request|song|track|tune|volume|louder|quieter|turn)\b",
+    re.IGNORECASE)
+_RESCUE_HARD = re.compile(
+    r"\b(?:down|dead|where|fix|restore|gone|missing|broke(?:n)?|"
+    r"offline)\b", re.IGNORECASE)
+
+
 def is_radio_rescue(text: str) -> bool:
-    """#827: 'where is the radio station', 'what happened to the
-    network', 'reboot the radio' — very basic words that mean ONE thing:
-    run the whole triage tree, fix every fixable branch, and end with a
-    station somebody can hear."""
-    return bool(_RESCUE_RX.search(str(text or "")))
+    """#827/#839: 'where is the radio station', 'what happened to the
+    network', 'reboot the radio' — and the SHORT SHOUTS: 'station bro',
+    'dead station', 'where the fuck is the station', 'station is down',
+    'where the station at'. Any brief line that names the station and
+    carries a where/dead/fix mood is the same order: run the whole
+    tree, fix every branch, end with a station somebody can hear."""
+    t = str(text or "")
+    if _RESCUE_RX.search(t):
+        return True
+    if len(t) <= 70 and _RESCUE_NOUN.search(t) and _RESCUE_MOOD.search(t):
+        # A music order that happens to name the radio is not a rescue —
+        # unless it ALSO says the station is gone.
+        if _RESCUE_MUSICY.search(t) and not _RESCUE_HARD.search(t):
+            return False
+        return True
+    return False
 
 
 _PLAY_ON_DEVICE_RX = re.compile(
@@ -19555,23 +19580,35 @@ async def sfxguy_quips_del(
 # built against is the default so it works before you name one.
 
 
+# #839: the sample SHARE is mounted read-only by design — it is the
+# drop box other machines fill. Extracted cuts need somewhere WRITABLE:
+# they land under data/samples (on the agent share, visible from any
+# PC), and the rotation reads BOTH roots.
+SFX_LOCAL_ROOT = data_path("samples")
+
+
 def sfx_folders() -> list[Path]:
     """The folders in play, only the ones that really exist.
 
     A named folder that has gone (an unplugged NAS, a renamed pack) is simply
-    not in the list: a dead SMB path must never take the show down with it."""
+    not in the list: a dead SMB path must never take the show down with it.
+    #839: a name resolves against the read-only share first, then the
+    writable local root where extracted cuts live."""
     names = dj_settings()["sfx_folders"] or list(SFX_DEFAULT_FOLDERS)
-    root = SFX_ROOT.resolve()
     out: list[Path] = []
     for name in names:
-        try:
-            folder = (SFX_ROOT / name).resolve()
-            # A pasted path from anywhere else on disk is not a sample folder.
-            if not folder.is_relative_to(root) or not folder.is_dir():
+        for base in (SFX_ROOT, SFX_LOCAL_ROOT):
+            try:
+                folder = (base / name).resolve()
+                # A pasted path from anywhere else on disk is not a
+                # sample folder.
+                if not folder.is_relative_to(base.resolve()) \
+                        or not folder.is_dir():
+                    continue
+            except OSError:
                 continue
-        except OSError:
-            continue
-        out.append(folder)
+            out.append(folder)
+            break
     return out
 
 
@@ -32346,8 +32383,10 @@ SAMPLE_CACHE_DIR = data_path("sample_cache")
 
 
 def samples_dir() -> Path:
+    # #839: cuts land under the WRITABLE local root — the sample share
+    # is a read-only drop box and every save into it failed silently.
     name = str(dj_settings().get("samples_dir") or "Samples").strip("/. ")
-    p = SFX_ROOT / (name or "Samples")
+    p = SFX_LOCAL_ROOT / (name or "Samples")
     p.mkdir(parents=True, exist_ok=True)
     return p
 
@@ -32362,7 +32401,10 @@ async def samples_fetch(
     payload = await request.json()
     async with httpx.AsyncClient(timeout=30) as client:
         reply = await client.post(f"{VOICE_LAB_URL}/ingest", json={
-            "url": str(payload.get("url") or ""), "mode": "fetch"})
+            "url": str(payload.get("url") or ""), "mode": "fetch",
+            # #838: the scrubber wants the picture — locate moments by
+            # eye instead of by ear alone.
+            "video": bool(payload.get("video", True))})
     if reply.status_code >= 400:
         raise HTTPException(status_code=reply.status_code,
                             detail=reply.text[:200])
@@ -32381,6 +32423,10 @@ async def samples_job(
     if out.get("stage") == "done":
         out["audio"] = (f"/api/samples/audio/{job_id}"
                         f"?t={media_sign(job_id)}")
+        # #838: the picture, when the lab kept one — the client falls
+        # back to audio-only when this 404s.
+        out["video"] = (f"/api/samples/video/{job_id}"
+                        f"?t={media_sign('v' + job_id)}")
     return out
 
 
@@ -32400,6 +32446,107 @@ async def samples_audio(job_id: str, t: str = "") -> Response:
                 raise HTTPException(status_code=404, detail="no audio yet")
             cache.write_bytes(reply.content)
     return FileResponse(cache, media_type="audio/mpeg")
+
+
+@app.get("/api/samples/video/{job_id}")
+async def samples_video(job_id: str, t: str = "") -> Response:
+    """#838: the fetched PICTURE, cached and served with Range support
+    so a bare <video> can scrub. Signed query, no bearer needed."""
+    if not hmac.compare_digest(media_sign("v" + job_id), str(t or "")):
+        raise HTTPException(status_code=403, detail="bad signature")
+    SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache = SAMPLE_CACHE_DIR / f"{re.sub(r'[^a-z0-9_]', '', job_id)}.mp4"
+    if not cache.is_file():
+        async with httpx.AsyncClient(timeout=300) as client:
+            reply = await client.get(
+                f"{VOICE_LAB_URL}/jobs/{job_id}/files/video.mp4")
+            if reply.status_code >= 400:
+                raise HTTPException(status_code=404, detail="no video")
+            cache.write_bytes(reply.content)
+    return FileResponse(cache, media_type="video/mp4")
+
+
+@app.get("/api/samples/staged/{name}")
+async def samples_staged_file(name: str, t: str = "") -> Response:
+    """#838: a staged (not yet approved) cut, for the batch editor's
+    preview players."""
+    clean = re.sub(r"[^A-Za-z0-9_.-]", "", name)
+    if not hmac.compare_digest(media_sign(clean), str(t or "")):
+        raise HTTPException(status_code=403, detail="bad signature")
+    path = SAMPLE_CACHE_DIR / "staged" / clean
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="no such staged cut")
+    return FileResponse(path, media_type="audio/mpeg")
+
+
+def _clip_words(path: Path, most: int = 8) -> str:
+    """#838: a clip NAMES ITSELF — whisper its first seconds and keep
+    the opening words. Empty when nothing intelligible came back."""
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        exe = "ffmpeg"
+    try:
+        got = _real_subprocess_run(
+            [exe, "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-t", "24", "-i", str(path),
+             "-ac", "1", "-ar", "16000", "-f", "s16le", "-"],
+            capture_output=True, timeout=60)
+        pcm = got.stdout
+        if len(pcm) < 16000:
+            return ""
+        text = wyoming_transcribe(pcm, rate=16000)
+        words = re.findall(r"[A-Za-z0-9']+", text or "")[:most]
+        return " ".join(words)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@app.post("/api/samples/commit")
+async def samples_commit(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#838: the batch editor's SAVE — approved staged cuts move into a
+    chosen folder under the SFX root, named exactly as approved, and the
+    folder joins the rotation."""
+    require_auth(authorization)
+    import shutil
+    payload = await request.json()
+    items = [i for i in (payload.get("items") or [])
+             if isinstance(i, dict)][:24]
+    folder_name = re.sub(r"[^\w\- ]", "",
+                         str(payload.get("folder") or "")).strip("/. ")[:40]
+    folder_name = folder_name or samples_dir().name
+    dest = SFX_LOCAL_ROOT / folder_name
+    dest.mkdir(parents=True, exist_ok=True)
+    staged_dir = SAMPLE_CACHE_DIR / "staged"
+    saved: list[str] = []
+    for item in items:
+        fid = re.sub(r"[^A-Za-z0-9_.-]", "", str(item.get("id") or ""))
+        src_path = staged_dir / fid
+        if not (fid.endswith(".mp3") and src_path.is_file()):
+            continue
+        stem = re.sub(r"[^A-Za-z0-9 _-]", "",
+                      str(item.get("name") or "")).strip()[:70]             or Path(fid).stem
+        final = dest / f"{stem}.mp3"
+        k = 2
+        while final.exists():
+            final = dest / f"{stem}-{k}.mp3"
+            k += 1
+        try:
+            shutil.move(str(src_path), str(final))
+            saved.append(final.name)
+        except OSError:
+            continue
+    dj = dict(dj_settings())
+    if saved and folder_name not in (dj.get("sfx_folders") or []):
+        settings = load_settings()
+        settings["dj"]["sfx_folders"] =             list(dj.get("sfx_folders") or []) + [folder_name]
+        save_settings(validate_settings(settings))
+    note_action(f"🎬 {len(saved)} sample(s) approved into {folder_name}")
+    return {"saved": saved, "folder": str(dest), "in_rotation": bool(saved)}
 
 
 @app.post("/api/samples/extract")
@@ -32431,23 +32578,65 @@ async def samples_extract(
         ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     except Exception:  # noqa: BLE001
         ffmpeg = "ffmpeg"
-    out_dir = samples_dir()
+    # #838: stage_only cuts into a holding shelf and TRANSCRIBES each
+    # cut so it can name itself — the batch editor approves names and a
+    # destination folder before anything reaches the rotation.
+    stage_only = bool(payload.get("stage_only"))
+    _folder_ask = re.sub(r"[^\w\- ]", "",
+                         str(payload.get("folder") or "")).strip("/. ")[:40]
+    out_dir = (SFX_LOCAL_ROOT / _folder_ask) if (_folder_ask and not stage_only) \
+        else (SAMPLE_CACHE_DIR / "staged" if stage_only else samples_dir())
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    def cut(rng: dict[str, Any], n: int) -> str:
+    def cut(rng: dict[str, Any], n: int) -> dict[str, Any]:
         a = max(0.0, float(rng.get("a") or 0))
         b = max(a + 0.2, float(rng.get("b") or 0))
-        base = re.sub(r"[^A-Za-z0-9 _-]", "",
-                      str(rng.get("name") or f"sample_{job_id}_{n}"))[:60]
-        path = out_dir / f"{base.strip() or 'sample'}_{int(a)}s.mp3"
+        if stage_only:
+            fname = f"{job_id}_{n}_{uuid.uuid4().hex[:6]}.mp3"
+        else:
+            _base = re.sub(r"[^A-Za-z0-9 _-]", "",
+                           str(rng.get("name")
+                               or f"sample_{job_id}_{n}"))[:60]
+            fname = f"{_base.strip() or 'sample'}_{int(a)}s.mp3"
+        path = out_dir / fname
         got = _real_subprocess_run(
             [ffmpeg, "-nostdin", "-y", "-ss", f"{a:.2f}", "-to", f"{b:.2f}",
              "-i", str(cache), "-codec:a", "libmp3lame", "-q:a", "3",
              str(path)], capture_output=True, timeout=120)
-        return str(path.name) if path.is_file() and got.returncode == 0 \
-            else ""
-    made = await asyncio.gather(*[
+        if not (path.is_file() and got.returncode == 0):
+            return {}
+        # The words become the proposed name unless one was given.
+        words = ""
+        if not str(rng.get("name") or "").strip():
+            words = _clip_words(path)
+        return {"id": fname, "file": str(path.name),
+                "seconds": round(b - a, 2), "a": round(a, 2),
+                "words": words,
+                "name": (str(rng.get("name") or "").strip() or words
+                         or f"sample {n + 1}")}
+
+    rows = await asyncio.gather(*[
         asyncio.to_thread(cut, rng, n) for n, rng in enumerate(ranges)])
-    made = [m for m in made if m]
+    rows = [r for r in rows if r]
+    if stage_only:
+        for r in rows:
+            r["url"] = f"/api/samples/staged/{r['id']}?t={media_sign(r['id'])}"
+        note_action(f"🎬 staged {len(rows)} cut(s) for the batch editor")
+        return {"staged": rows}
+    # Legacy one-shot road: transcript names applied at cut time above.
+    made = []
+    for r in rows:
+        old = out_dir / r["file"]
+        want = re.sub(r"[^A-Za-z0-9 _-]", "", r["name"]).strip()[:70]
+        if want and not r["file"].startswith(want):
+            final = out_dir / f"{want}_{int(r['a'])}s.mp3"
+            try:
+                old.replace(final)
+                made.append(final.name)
+                continue
+            except OSError:
+                pass
+        made.append(r["file"])
     # The folder joins the rotation the moment it holds a cut.
     folder_name = out_dir.name
     dj = dict(dj_settings())
