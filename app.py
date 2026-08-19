@@ -1248,7 +1248,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "say_max_seconds": max(4, min(60, int(
             raw_dj.get("say_max_seconds",
                        DEFAULT_DJ["say_max_seconds"]) or 0))),
-        "reply_max_chars": max(300, min(6500, int(
+        # #842: the cast may speak as much as they have to. The old 6500
+        # ceiling truncated the WRITING; the speaking road splits and
+        # joins any length (voice_render_any past VOICE_MAX_CHARS,
+        # say_chunks_for past the slider), so the only real bound is
+        # SAY_MAX_ANNOUNCES, which is generous now.
+        "reply_max_chars": max(300, min(60000, int(
             raw_dj.get("reply_max_chars",
                        DEFAULT_DJ["reply_max_chars"]) or 2500))),
         "box_volume": max(0.3, min(1.6, float(
@@ -4898,7 +4903,12 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
     # A named on-air actor is a casting decision. Do not substitute it merely
     # because the fast relief path is active; a failed take goes to retry.
     actor_locked = bool(selected and voice == selected and who in seats)
-    stand_in = await piper_fallback_voice(who) if not actor_locked else ""
+    # #842: the stand-in is ALWAYS resolved. It used to be withheld from a
+    # locked actor, which removed the Piper rung entirely — so when both
+    # clone engines were down a named DJ had NO last resort and the line
+    # was simply lost, while the drop log claimed "Piper included". A
+    # stand-in voice is a smaller loss than silence, every time.
+    stand_in = await piper_fallback_voice(who)
     rungs: list[tuple[str, str, str]] = []
     if is_clone:
         bare = _rung_bare or voice
@@ -4923,25 +4933,27 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                           f"{clone_engine} would not render it — the "
                           f"same clone through {other} (#784)"))
         if stand_in and stand_in != voice:
-            rungs.append((stand_in, "piper", "the clone road is down — a "
-                          "stand-in Piper voice so the line still goes out (#784)"))
+            rungs.append((stand_in, "piper",
+                          "BOTH cloning engines refused — airing this line "
+                          "in a stand-in voice rather than losing it; the "
+                          "cast returns the moment an engine answers (#842)"))
     else:
         rungs.append((voice, engine, ""))
         if stand_in and stand_in != voice:
             rungs.append((stand_in, "piper", "the selected Piper voice is "
                           "unavailable — a stand-in keeps the line moving (#784)"))
-        if not actor_locked:
-            borrowed = clone_fallback_voice(who)
-            if borrowed:
-                rungs.append((borrowed, "xtts", "Piper is not answering — the "
-                              "line goes out in a borrowed cloned voice (#784)"))
-                rungs.append((borrowed, "f5", "Piper is not answering — the "
-                              "line goes out in a borrowed cloned voice (#784)"))
-    # A configured actor never falls through to an unnamed voice. A failed
-    # engine becomes a retried line rather than a different character.
-    if not actor_locked:
-        rungs.append(("", "piper", "every named voice refused — the line goes "
-                                   "out plain rather than not at all (#784)"))
+        borrowed = clone_fallback_voice(who)
+        if borrowed:
+            rungs.append((borrowed, "xtts", "Piper is not answering — the "
+                          "line goes out in a borrowed cloned voice (#784)"))
+            rungs.append((borrowed, "f5", "Piper is not answering — the "
+                          "line goes out in a borrowed cloned voice (#784)"))
+    # #842: THE FLOOR, for every line without exception. Piper's default
+    # voice needs no library, no GPU and no director — if this rung fails
+    # the box itself is gone. It used to be skipped for a locked actor,
+    # which is precisely how a cast line ended up with no audio at all.
+    rungs.append(("", "piper", "every named voice refused — the line goes "
+                               "out plain rather than not at all (#784)"))
     tried: list[str] = []
     for name, eng, why in rungs:
         try:
@@ -4971,7 +4983,8 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
     # this is the only remaining way a line can fail, and it is a station
     # fault rather than a line fault.
     pipeline_log("drop", "NOTHING could render this line — every engine "
-                         "refused it, Piper included (#784)",
+                         "refused it, Piper included (#784) — the rungs "
+                         "and their reasons are in the detail",
                  extra=(f"{who or 'line'} - {len(text)} chars: "
                         f"{text[:300]}\n\n"
                         + "\n".join(tried)))
@@ -11876,7 +11889,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                 # stream, and the voice simply continues.
                 pieces = (sentence_chunks(
                               spoken, cap=say_max_chars(),
-                              most=say_max_chunks(say_max_chars()))
+                              most=say_chunks_for(spoken, say_max_chars()))
                           if len(spoken) > say_max_chars() else [spoken])
                 why = ""
                 for at, piece in enumerate(pieces):
@@ -25656,6 +25669,9 @@ def say_max_chars() -> int:
 
 # How much of one turn may go to air, in characters, regardless of how short
 # the slider has made the individual pieces (#710, #722).
+# #842: the operator's rule — "they must be able to speak as much as they
+# have to". This is no longer a truncation point; it is only the floor of
+# the per-turn budget, and say_max_chunks scales past it with the text.
 SAY_TURN_BUDGET = 3600
 
 # …but a chunk is an ANNOUNCE, and the box can only play one at a time.
@@ -25664,7 +25680,11 @@ SAY_TURN_BUDGET = 3600
 # SatelliteBusyError while the box wedged and its Wyoming port went dark
 # (#712). Whatever the arithmetic says, one turn may not queue more than
 # this many separate announces at the device.
-SAY_MAX_ANNOUNCES = 16
+# #842: raised from 16. Each announce is still played one at a time and
+# each is a whole sentence-group, so 40 covers a ~20,000-character turn
+# without ever dropping a tail; the device is protected by the pacing in
+# speak_turns, not by throwing words away.
+SAY_MAX_ANNOUNCES = 40
 
 
 def say_max_chunks(cap: int) -> int:
@@ -25691,6 +25711,15 @@ def say_max_chunks(cap: int) -> int:
                  int(dj_settings().get("reply_max_chars") or 0))
     cap = max(1, cap)
     return max(10, min(SAY_MAX_ANNOUNCES, (budget + cap - 1) // cap))
+
+
+def say_chunks_for(text: str, cap: int) -> int:
+    """#842: how many chunks THIS text needs — never fewer than it takes
+    to say all of it. The old ceiling was computed from a budget alone,
+    so a long reply lost its tail deterministically; now the text itself
+    sets the number and SAY_MAX_ANNOUNCES is the only bound."""
+    need = (len(str(text or "")) + cap - 1) // max(1, cap) + 1
+    return max(say_max_chunks(cap), min(SAY_MAX_ANNOUNCES, need))
 
 
 def sentence_chunks(text: str, cap: int = 300, most: int = 10) -> list[str]:
@@ -25977,7 +26006,8 @@ async def speak_turns(turns: list[tuple[str, str]],
         # each seam and simply continues the thought.
         for at, chunk in enumerate(
                 sentence_chunks(text, cap=say_max_chars(),
-                                most=say_max_chunks(say_max_chars()))):
+                                most=say_chunks_for(
+                                    text, say_max_chars()))):
             if at:
                 chunk = breath_for(f"{who}{len(playlist)}") + chunk
             playlist.append({
