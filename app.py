@@ -523,6 +523,13 @@ DEFAULT_DJ = {
     # records and adverts rather than in the silence after them.
     "dialogue_prefill": True,
     "dialogue_reserve_target": 6,   # #786: was 4 — deeper written lookahead
+    # #842: how many HOURS of finished audio to keep standing by. Depth in
+    # ROUNDS says nothing about whether the station can keep talking; this
+    # is the number the operator actually asked in — "an hour, 2 hours or
+    # even a day worth of takes". The keeper builds every content type
+    # until pantry_seconds() covers this, then idles; anything still
+    # unaired at PANTRY_BURN_SECONDS is burned.
+    "prepare_hours": 1.0,
     # How much of the talk comes out of the speakbox documents, 0 to 1.
     # Raised with the gallery governor (#646): the wall was eating the show,
     # and the documents are what it is supposed to be made of.
@@ -1167,6 +1174,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "dialogue_reserve_target": max(1, min(12, int(
             raw_dj.get("dialogue_reserve_target",
                        DEFAULT_DJ["dialogue_reserve_target"]) or 1))),
+        # #842: a quarter of an hour is the least worth preparing; a full
+        # day is the burn ceiling, so asking for more would only build
+        # material that burns before it can air.
+        "prepare_hours": max(0.25, min(24.0, float(
+            raw_dj.get("prepare_hours",
+                       DEFAULT_DJ["prepare_hours"]) or 1.0))),
         "speakbox_rate": max(0.0, min(1.0, float(
             raw_dj.get("speakbox_rate", DEFAULT_DJ["speakbox_rate"]) or 0))),
         "speakbox_append_rate": max(0.0, min(1.0, float(
@@ -8435,7 +8448,95 @@ def media_sign(key: str) -> str:
 # so the key a preparer computes during a record is the key speak_turns
 # computes when the round airs.
 _PANTRY: dict[str, dict[str, Any]] = {}
-PANTRY_LIFE = 5400.0                    # ninety minutes, then it is stale
+
+# #899: WHO went into the recording room, what they said, what it cost.
+# The pantry holds audio behind a hash; nothing recorded the work
+# itself, so there was no way to see whether the room was being used
+# well or which actor was eating the engine.
+_TAKES: list[dict[str, Any]] = []
+TAKES_MAX = 400
+
+
+def take_note(who: str, voice: str, engine: str, text: str,
+              clip: dict[str, Any] | None, ms: int, how: str) -> None:
+    """One line recorded, or one served off the shelf. `how` is
+    "shelf" when the pantry answered and "live" when the engine did."""
+    try:
+        secs = float((clip or {}).get("seconds") or 0)
+        _TAKES.append({
+            "at": time.time(),
+            "who": str(who or "")[:24],
+            "name": booth_actor_name(str(who or ""), ""),
+            "voice": str(voice or "")[:32],
+            "engine": str(engine or "")[:12],
+            "chars": len(str(text or "")),
+            "text": str(text or "")[:400],
+            "seconds": round(secs, 2),
+            "ms": int(ms or 0),
+            # what the engine cost against real time — the number that
+            # says whether the room is keeping up
+            "cost": round((ms / 1000.0) / secs, 2) if (secs and ms) else None,
+            "how": how,
+        })
+        del _TAKES[:-TAKES_MAX]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def recording_room() -> dict[str, Any]:
+    """#899: the room, per actor. Takes, airtime, engine cost, and how
+    much of the work the shelf is saving."""
+    rows = list(_TAKES)
+    by: dict[str, dict[str, Any]] = {}
+    for t in rows:
+        seat = str(t.get("who") or "?")
+        got = by.setdefault(seat, {
+            "who": seat, "name": t.get("name") or seat,
+            "takes": 0, "shelf": 0, "live": 0, "seconds": 0.0,
+            "chars": 0, "costs": [], "voice": t.get("voice"),
+            "engine": t.get("engine")})
+        got["takes"] += 1
+        got["shelf" if t.get("how") == "shelf" else "live"] += 1
+        got["seconds"] += float(t.get("seconds") or 0)
+        got["chars"] += int(t.get("chars") or 0)
+        if t.get("cost"):
+            got["costs"].append(float(t["cost"]))
+    actors = []
+    for got in by.values():
+        costs = got.pop("costs") or []
+        got["seconds"] = round(got["seconds"], 1)
+        got["cost"] = round(sum(costs) / len(costs), 2) if costs else None
+        got["saved_pct"] = (round(100.0 * got["shelf"] / got["takes"])
+                            if got["takes"] else 0)
+        actors.append(got)
+    actors.sort(key=lambda r: -r["takes"])
+    live = [t for t in rows if t.get("how") == "live" and t.get("cost")]
+    return {
+        "actors": actors,
+        "takes": len(rows),
+        "shelf_served": sum(1 for t in rows if t.get("how") == "shelf"),
+        "airtime": round(sum(float(t.get("seconds") or 0) for t in rows), 1),
+        "cost": (round(sum(float(t["cost"]) for t in live) / len(live), 2)
+                 if live else None),
+        "recent": list(reversed(rows[-40:])),
+    }
+PANTRY_LIFE = 5400.0                    # the FLOOR; see pantry_life()
+
+
+def pantry_life() -> float:
+    """#899: how long a prepared take stays servable.
+
+    This was a flat ninety minutes, which quietly capped how deep
+    prepare_hours could usefully go — material built beyond about an
+    hour and a half went stale before it could air, so the station
+    would have burned GPU making takes it could never use. It follows
+    the operator's target now, with the burn ceiling as the limit."""
+    try:
+        want = float(dj_settings().get("prepare_hours") or 1.0) * 3600.0
+    except Exception:  # noqa: BLE001
+        want = 3600.0
+    ceiling = float(globals().get("PANTRY_BURN_SECONDS") or 86400.0)
+    return max(PANTRY_LIFE, min(ceiling, want + 1800.0))
 PANTRY_MAX = 600
 # #894/#832: "we never let our cache get over six gigabytes total".
 # Counting clips says nothing about disk; this counts bytes and sheds
@@ -8454,7 +8555,7 @@ def pantry_get(key: str) -> dict[str, Any] | None:
     row = _PANTRY.get(key)
     if not row:
         return None
-    if time.time() - float(row.get("at") or 0) > PANTRY_LIFE:
+    if time.time() - float(row.get("at") or 0) > pantry_life():
         _PANTRY.pop(key, None)
         return None
     clip = row.get("clip") or {}
@@ -8522,6 +8623,146 @@ def pantry_seconds() -> float:
         except Exception:  # noqa: BLE001
             pass
     return round(total, 1)
+
+
+# --- The prepared shelf (#842) ---------------------------------------
+# #886 gave the station a pantry of pre-rendered LINES, but only plain
+# banter ever shopped it. The ask is the whole board: "we have such a
+# cache of ads and media backlogged... send people into the voice studio
+# to record an hour, 2 hours or even a day worth of takes... and burn
+# after 24 hours".
+#
+# This is the INDEX over that material — one row per prepared ITEM (an
+# advert, a station ID, a memo from upstairs, a call on the request
+# line), each pointing at audio that already sits in _PANTRY under its
+# own pantry_key. No second cache: a shelf row is a note saying "this
+# text, in this voice, is already made". A miss anywhere at all simply
+# renders live, exactly as the station always did.
+PANTRY_BURN_SECONDS = float(os.getenv("PANTRY_BURN_SECONDS", "86400"))
+_SHELF: dict[str, list[dict[str, Any]]] = {}
+# How many of each to hold. The real governor is prepare_hours (TIME on
+# the shelf); these only stop one content type eating the whole
+# allowance while another starves.
+SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 4, "caller": 4}
+SHELF_LABEL = {"ad": "an advert", "station_id": "a station ID",
+               "manager": "a message from upstairs",
+               "caller": "a phone call"}
+
+
+def shelf_rows(kind: str) -> list[dict[str, Any]]:
+    return _SHELF.setdefault(str(kind), [])
+
+
+def shelf_full(kind: str) -> bool:
+    return len(shelf_rows(kind)) >= int(SHELF_CAPS.get(kind, 6))
+
+
+def shelf_put(kind: str, row: dict[str, Any]) -> None:
+    """Shelve one prepared item. The AUDIO is already in the pantry —
+    this only writes down what was prepared and how to find it."""
+    try:
+        row = dict(row)
+        row.setdefault("at", time.time())
+        row["kind"] = str(kind)
+        rows = shelf_rows(kind)
+        rows.append(row)
+        del rows[:-int(SHELF_CAPS.get(kind, 6))]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
+    """The oldest prepared item of this kind that is still good.
+
+    Still inside the 24-hour burn, still written to today's contract,
+    and — for a single-line item — with its audio still on the pantry
+    shelf. None means nothing is prepared, and every caller of this
+    falls back to the live road it has always had."""
+    try:
+        rows = shelf_rows(kind)
+        for row in list(rows):
+            if time.time() - float(row.get("at") or 0) > PANTRY_BURN_SECONDS:
+                continue
+            if voice and str(row.get("voice") or "") != str(voice):
+                continue            # prepared for a seat that has changed
+            key = str(row.get("key") or "")
+            if key and not pantry_get(key):
+                continue            # the clip went stale or was pruned
+            entry = row.get("entry")
+            if isinstance(entry, dict) and not _larder_current(entry):
+                continue            # written against a contract that moved
+            rows.remove(row)
+            return row
+        # Nothing usable: shed what is plainly dead so the shelf does not
+        # grow a tail of rows nobody can ever take.
+        _SHELF[str(kind)] = [
+            r for r in rows
+            if time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS]
+    except Exception:  # noqa: BLE001
+        return None
+    return None
+
+
+def prepared_by_kind() -> dict[str, int]:
+    """What is standing by, BY CONTENT TYPE — the answer to "what have we
+    actually got ready", which one depth number never gave."""
+    out: dict[str, int] = {
+        "banter": sum(1 for e in _LARDER if e.get("prepared"))}
+    for kind in SHELF_CAPS:
+        out[kind] = len(_SHELF.get(kind) or [])
+    return out
+
+
+def prepare_target_seconds() -> float:
+    """How much finished audio to keep standing by, in SECONDS, off the
+    operator's hours dial — "an hour, 2 hours or even a day worth"."""
+    try:
+        hours = float(dj_settings().get("prepare_hours") or 1.0)
+    except Exception:  # noqa: BLE001
+        hours = 1.0
+    return max(0.25, min(24.0, hours)) * 3600.0
+
+
+def pantry_burn() -> int:
+    """Burn after 24 hours (#842).
+
+    Prepared-but-unaired material gets a hard ceiling, well above the
+    90-minute freshness life: material nobody ever asked for otherwise
+    sits in the index forever holding its bytes against the allowance.
+
+    ONLY the shelf entry is dropped. Deleting the FILE is the media
+    pruner's job, and it is the one that knows what is still queued to
+    play (_protected_media_keys) — a preparer unlinking audio out from
+    under a queued line is exactly the fault #467 exists to prevent."""
+    burned: dict[str, int] = {}
+    now = time.time()
+    try:
+        for kind in list(_SHELF):
+            rows = _SHELF.get(kind) or []
+            keep = [r for r in rows
+                    if now - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS]
+            if len(keep) != len(rows):
+                burned[str(kind)] = len(rows) - len(keep)
+                _SHELF[kind] = keep
+        for key in [k for k, r in list(_PANTRY.items())
+                    if now - float(r.get("at") or 0) > PANTRY_BURN_SECONDS]:
+            _PANTRY.pop(key, None)
+            burned["clips"] = int(burned.get("clips") or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    if burned:
+        try:
+            pipeline_log(
+                "lookahead",
+                f"burned after {PANTRY_BURN_SECONDS / 3600:.0f}h without "
+                "airing: "
+                + ", ".join(f"{count} {name}"
+                            for name, count in sorted(burned.items()))
+                + " — the shelf entries only, the files are left to the "
+                "media prune (#842)")
+        except Exception:  # noqa: BLE001
+            pass
+    return sum(burned.values())
 
 
 def _protected_media_keys() -> set[str]:
@@ -11895,13 +12136,25 @@ def radio_prompt_enabled(slot: str) -> bool:
 
 
 def radio_prompt_instruction(slot: str) -> str:
-    """Operator-authored instruction for one radio-writing path."""
+    """Operator-authored instruction for one radio-writing path.
+
+    #843: and the SCHEDULE's instruction for the entry currently on
+    air. It rides the "host" layer because every round the station
+    writes assembles that one — banter, news, the gallery press, a
+    call, the memo — so a prompt attached to a schedule entry reaches
+    the writing of that entry's round and of nothing else. It is hung
+    on the FRONT, never replacing what you typed on the prompt desk,
+    and it is empty whenever the schedule is not driving."""
+    try:
+        lead = _schedule_prompt_clause() if slot == "host" else ""
+    except Exception:  # noqa: BLE001
+        lead = ""       # a broken schedule never silences the booth
     if not radio_prompt_enabled(slot):
-        return ""
+        return lead
     text = str((dj_settings().get("radio_prompt_overrides") or {}).get(slot)
                or "").strip()
-    return ("\n\nOPERATOR RADIO INSTRUCTION FOR THIS TURN: " + text
-            if text else "")
+    return lead + ("\n\nOPERATOR RADIO INSTRUCTION FOR THIS TURN: " + text
+                   if text else "")
 
 
 def radio_persona(slot: str, text: str) -> str:
@@ -11952,6 +12205,10 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                     ("manager_name", "Manager name", "text", 0, 0, 0)],
         "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 20, 1),
                         ("banter_max_lines", "Maximum exchange lines", "number", 2, 20, 1),
+                        # #842: how deep the pre-recorded shelf runs, in
+                        # HOURS of finished audio rather than in items.
+                        ("prepare_hours", "Hours prepared ahead", "number",
+                         0.25, 24, 0.25),
                         ("talk_radio", "Talk-show intensity", "range", 0, 100, 1),
                         ("overlap", "Interruptions", "range", 0, 100, 1)],
         "speakerbox": [("speakbox_rate", "Material grounding", "range", 0, 100, 1),
@@ -12851,6 +13108,27 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         want_clip = (fx or voice_to != "box" or engine != "piper"
                      or len(spoken) <= say_max_chars())
         if want_clip:
+            # #842: made ALREADY, during an earlier record — the same
+            # shelf the round lines shop (#886), now stocked with ad
+            # reads, station IDs and bumpers too. Keyed on EXACTLY what
+            # determines the audio at this point in the road: the spoken
+            # text after every rewrite, the voice this seat is forced to,
+            # and the engine that voice names. A MISS renders below
+            # precisely as it always did, which is what keeps this safe.
+            _prep_voice = forced or _event_voice("default")
+            _prep_ready = None
+            try:
+                _prep_ready = pantry_get(pantry_key(
+                    spoken, _prep_voice,
+                    engine or voice_engine_for(_prep_voice)))
+            except Exception:  # noqa: BLE001
+                _prep_ready = None
+            if _prep_ready:
+                pipeline_log("lookahead", "off the pantry shelf - no render "
+                             f"needed - {kind} (#842)")
+                clip = _prep_ready
+                engine = str(_prep_ready.get("engine") or engine)
+        if want_clip and clip is None:
             # #784: ONE ladder, and it tests the OUTCOME rather than the
             # engine's name. This was two attempts gated on `engine !=
             # "piper"`, which is False under render relief — the exact
@@ -15226,6 +15504,194 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         entry["preparing"] = False
 
 
+# --- Writing and rendering ahead, by content type (#842) --------------
+# #886 prepared banter rounds and nothing else. Every other thing on the
+# board — the ad reads, the station IDs the SFX guy shouts, the memos
+# from upstairs, the calls that get through — was still being written
+# AND rendered at the moment it was wanted, which is the one moment
+# there is no time for either. These write ONE ahead and render it into
+# the same pantry, under the same keys, so the segment costs nothing at
+# all when it comes round.
+#
+# Deliberately NOT here: cutting one long take into per-line clips by
+# silence detection. Measured — a three-line take with deliberate
+# separators reported 2 silences at -35dB/0.45s and 3 at -40dB/0.35s,
+# one of them the trailing tail. No threshold tells a separator from a
+# natural pause, and a mis-split puts lines on air out of order. With
+# VOICE_MAX_CHARS at 800 a "take" is about a minute anyway. Recording
+# MORE ITEMS per window is the same economy, reliably.
+
+
+def prep_air_text(raw: str, kind: str) -> str:
+    """The EXACT string dj_speak will hand to the engine for this line.
+
+    dj_speak scrubs the station's name out of most lines (#357) with a
+    one-in-four reprieve — so a prepared line that KEPT the name would
+    be scrubbed at air time and then miss its own audio. Scrubbing here
+    until the name is gone makes the air-time pass a no-op whichever way
+    its dice fall, and a miss would only have meant a live render."""
+    text = spoken_text(str(raw or ""))
+    if kind in ("station_id", "reply") or not text:
+        return text
+    name = str(dj_settings().get("station_name") or "").strip()
+    for _ in range(8):
+        if len(name) < 3 or name.lower() not in text.lower():
+            break
+        text = station_name_scrub(text)
+    return text
+
+
+async def prep_render_line(text: str, who: str,
+                           voice: str = "") -> dict[str, Any] | None:
+    """Render one prepared line into the pantry, keyed EXACTLY as
+    dj_speak will key it when the line airs: the spoken text, the voice
+    dj_speak forces for this seat, and the engine that voice names —
+    voice_engine_for with NO seat, or role pinning names a different
+    engine and silently misses every key we store (#886)."""
+    text = str(text or "").strip()
+    if not text:
+        return None
+    voice = configured_radio_voice(who, voice) or _event_voice("default")
+    if not voice:
+        return None
+    engine = voice_engine_for(voice)
+    key = pantry_key(text, voice, engine)
+    ready = pantry_get(key)
+    if ready:
+        return {"key": key, "voice": voice, "engine": engine,
+                "seconds": float((ready or {}).get("seconds") or 0)}
+    if engine in ("xtts", "f5") and not await clone_engine_ready(engine):
+        return None                     # the engine is busy or down; later
+    # #890: yield the moment the live road wants the engine. A buffer is
+    # worth nothing if building it is what made the station late.
+    if render_relief() or _PREMAKE_GATE.locked():
+        return None
+    fx = dict(voice_effect_pick())
+    vec = performance_vector(who, voice)
+    if vec:
+        fx["perf"] = vec
+    if who in ("dj", "cohost", "caller", "third"):
+        strip = str(dj_settings().get(f"strip_{who}") or "")
+        if strip:
+            fx["strip"] = strip
+    try:
+        async with _PANTRY_GATE:
+            clip = await voice_render_any(text, voice, engine, fx=fx, who=who)
+    except Exception:  # noqa: BLE001
+        clip = None
+    if not (clip or {}).get("path"):
+        return None
+    pantry_put(key, clip)
+    return {"key": key, "voice": voice, "engine": engine,
+            "seconds": float((clip or {}).get("seconds") or 0)}
+
+
+async def prep_ad() -> bool:
+    """One advert, written and read into the pantry before the break."""
+    dj = dj_settings()
+    product = ""
+    try:
+        sponsors = [str(s) for s in (dj.get("sponsors") or []) if str(s)]
+        if sponsors and random.random() < 0.7:
+            product = random.choice(sponsors)
+        if not product and dj.get("gallery_ads"):
+            product = gallery_product()
+        if not product and sponsors:
+            product = random.choice(sponsors)
+    except Exception:  # noqa: BLE001
+        product = ""
+    if not product:
+        return False                    # nothing is being sold tonight
+    # No track handed in: a spot prepared now may not air for an hour,
+    # and a read built around a record that finished long ago dates
+    # itself the moment it goes out.
+    raw = await dj_line("ad", None, extra=product)
+    text = prep_air_text(raw, "ad")
+    if len(text) < 20:
+        return False
+    made = await prep_render_line(text, "dj")
+    if not made:
+        return False
+    shelf_put("ad", {"text": text, "product": str(product)[:160], **made})
+    pipeline_log("lookahead", "an advert is READY to air - written and read "
+                 f"during a record, {made.get('seconds')}s of finished "
+                 "audio waiting (#842)")
+    return True
+
+
+async def prep_station_id() -> bool:
+    """One bumper for the SFX guy, shouted in his own voice ahead of the
+    sting that will carry it."""
+    dj = dj_settings()
+    drop_voice = str(dj.get("drop_voice") or "")
+    if not drop_voice:
+        return False                    # the drop guy does not exist here
+    station = str(dj.get("station_name") or "")
+    line = await drop_liner(station)
+    if not line:
+        return False
+    # The same read FOR the station the live road builds (#462).
+    if station and station.lower() not in line.lower():
+        line = f"{line} {station}."
+    text = prep_air_text(line, "station_id")
+    if not text:
+        return False
+    made = await prep_render_line(text, "drop", drop_voice)
+    if not made:
+        return False
+    shelf_put("station_id", {"text": text, **made})
+    pipeline_log("lookahead", "a station ID is READY to air - the SFX guy "
+                 "recorded it during a record (#842)")
+    return True
+
+
+async def prep_round(kind: str) -> bool:
+    """One whole SEGMENT written ahead — a memo from upstairs, or a call
+    on the request line — with every line of it rendered into the pantry
+    by the same larder_prepare the banter rounds use."""
+    pile: list[dict[str, Any]] = []
+    if kind == "manager":
+        await dj_manager_note(None, bank_to=pile)
+    else:
+        await dj_caller(None, bank_to=pile)
+    if not pile:
+        return False                    # nothing to say from that road
+    entry = pile[0]
+    entry["prep_kind"] = str(kind)
+    # A partially rendered segment is still shelved: the keeper finishes
+    # it on a later visit, and any line that never got made simply
+    # renders on air the way it always would have.
+    await larder_prepare(entry)
+    shelf_put(kind, {"entry": entry,
+                     "seconds": float(entry.get("seconds") or 0)})
+    pipeline_log("lookahead",
+                 f"{SHELF_LABEL.get(kind, kind)} is READY to air - "
+                 f"{entry.get('made') or 0} of {entry.get('chunks') or 0} "
+                 f"lines made, {entry.get('seconds') or 0}s of finished "
+                 "audio waiting (#842)")
+    return True
+
+
+async def prep_one(kind: str) -> bool:
+    """Prepare exactly one item of one content type. Never raises: the
+    station stays on air whatever the preparer runs into."""
+    try:
+        if kind == "ad":
+            return await prep_ad()
+        if kind == "station_id":
+            return await prep_station_id()
+        if kind in ("manager", "caller"):
+            return await prep_round(kind)
+    except Exception:  # noqa: BLE001
+        return False
+    return False
+
+
+# Round-robin across the board, so no one content type starves the rest.
+_PREP_ROTA = ("ad", "station_id", "manager", "caller")
+_PREP_AT = [0]
+
+
 def pantry_window() -> str:
     """When it is cheap to build ahead: a record with room left on it, or
     an ad break. Both are stretches where nobody is waiting on a voice.
@@ -15254,30 +15720,77 @@ def pantry_window() -> str:
 
 
 async def pantry_keeper() -> None:
-    """#886: use the records and the ad breaks to build the buffer."""
+    """#886/#842: use the records and the ad breaks to build the buffer.
+
+    Depth is measured in HOURS OF FINISHED AUDIO, not in items: it builds
+    across every content type until pantry_seconds() covers the
+    operator's prepare_hours, or the six-gigabyte allowance is spent, and
+    then it IDLES. A full shelf is the goal; a busy GPU is not.
+
+    pantry_window() is the whole of the courtesy to the live round — it
+    is empty under render_relief() and while _PREMAKE_GATE is saturated —
+    and it is re-asked between every single item, not once per pass."""
     while True:
         await asyncio.sleep(6)
         try:
+            pantry_burn()               # the 24-hour ceiling, every pass
             if not _RADIO.get("on"):
                 continue
             window = pantry_window()
             if not window:
                 continue
+            target = prepare_target_seconds()
+            if pantry_seconds() >= target:
+                continue                # the hours asked for are covered
+            if pantry_bytes() >= PANTRY_MAX_BYTES:
+                continue                # the allowance is spent (#894)
             # #894/#832: while we have the room, record MORE than one.
             # Preparing a single round per window is what kept the buffer
             # shallow — the point of the visit is to come away with
             # enough material that nobody has to be sent back.
-            made_any = False
             for _entry in list(_LARDER):
                 if pantry_window() != window:
                     break               # the live road wants the engine
                 if _entry.get("prepared") or _entry.get("preparing"):
                     continue
-                made_any = True
                 if not await larder_prepare(_entry):
                     break               # engine said no; try again later
-            if not made_any:
-                continue
+            # #842: a segment already WRITTEN but not fully rendered gets
+            # its remaining lines before anything new is written — half a
+            # call on the shelf is worth finishing first.
+            for _kind in ("manager", "caller"):
+                for _row in list(_SHELF.get(_kind) or []):
+                    _shelved = _row.get("entry") or {}
+                    if _shelved.get("prepared") or _shelved.get("preparing"):
+                        continue
+                    if (_shelved.get("frozen")
+                            and not int(_shelved.get("chunks") or 0)):
+                        continue        # nothing in it a preparer can make
+                    if pantry_window() != window:
+                        break
+                    await larder_prepare(_shelved)
+                    _row["seconds"] = float(_shelved.get("seconds") or 0)
+            # #842: and then the rest of the board — the ads, the bumpers,
+            # the memos from upstairs, the phone calls. One item per pass,
+            # in rotation, so the shelf fills evenly rather than filling
+            # with whichever road happened to be cheapest.
+            for _ in range(len(_PREP_ROTA)):
+                if pantry_window() != window:
+                    break
+                if (pantry_seconds() >= target
+                        or pantry_bytes() >= PANTRY_MAX_BYTES):
+                    break
+                _PREP_AT[0] = (_PREP_AT[0] + 1) % len(_PREP_ROTA)
+                _kind = _PREP_ROTA[_PREP_AT[0]]
+                if shelf_full(_kind):
+                    continue
+                # Writing is a MODEL visit, and live work outranks it. A
+                # bumper is exempt: its liners are brewed in the
+                # background and taken off a stack, not written here.
+                if _OLLAMA_GATE.locked() and _kind != "station_id":
+                    continue
+                if await prep_one(_kind):
+                    break               # one item a visit; come back soon
         except Exception:  # noqa: BLE001
             pass
 
@@ -15374,6 +15887,14 @@ def dialogue_flow_state() -> dict[str, Any]:
         "pantry_mb": round(pantry_bytes() / 1048576, 1),
         "pantry_cap_mb": round(PANTRY_MAX_BYTES / 1048576),
         "window": pantry_window(),
+        # #842: what is standing by BY CONTENT TYPE — ads, bumpers,
+        # messages from upstairs, phone calls, banter — and the depth in
+        # the only unit the operator asked in: hours of finished audio,
+        # against the hours they asked for.
+        "prepared_by_kind": prepared_by_kind(),
+        "hours_ready": round(pantry_seconds() / 3600.0, 2),
+        "target_hours": round(prepare_target_seconds() / 3600.0, 2),
+        "burn_hours": round(PANTRY_BURN_SECONDS / 3600.0, 1),
         # #841/#839: is the hourly quota actually being hit? The complaint
         # was a COUNT, so the count is the answer: what aired in the last
         # sixty minutes, what was asked for, and whether this hour is
@@ -15543,6 +16064,13 @@ async def _torrent_talk() -> None:
             # only; with nothing chosen the show runs exactly as before.
             _chosen = switchboard_take()
             _RADIO["switch_angle"] = ""
+            # #843: the schedule's instruction is drawn fresh for each
+            # round and belongs to that round only — cleared here so an
+            # operator override, or the schedule going off mid-hour,
+            # cannot leave the last entry's prompt hanging over the
+            # next one.
+            _RADIO["sched_prompt"] = ""
+            _slot: dict[str, Any] = {}
             if _chosen:
                 _want = str(SWITCH_KINDS.get(
                     str(_chosen.get("kind") or ""), {}).get("round") or "")
@@ -15563,7 +16091,28 @@ async def _torrent_talk() -> None:
                 else:
                     kind = random.choice(choices)
             else:
-                kind = random.choice(choices)
+                # #843: THE SCHEDULE. Below the operator's switchboard,
+                # which still wins outright above, and ABOVE the random
+                # draw: with a schedule on air the entry the clock has
+                # reached names this round, and its own system prompt
+                # goes into the writing of it. The master switch off, no
+                # entries enabled, or a schedule that will not parse —
+                # each of those returns nothing and the show falls
+                # straight through to the draw it has always used.
+                _slot = schedule_take()
+                kind = str(_slot.get("kind") or "")
+                if kind:
+                    _pos = _RADIO.get("sched_pos") or {}
+                    pipeline_log(
+                        "air",
+                        "the schedule takes this round - "
+                        + str(_slot.get("label") or kind)
+                        + " (entry "
+                        + str(int(_pos.get("index") or 0) + 1)
+                        + " on " + str(_pos.get("preset") or "")
+                        + ") (#843)")
+                else:
+                    kind = random.choice(choices)
                 # #839/#841: BEHIND BEATS THE DICE. A missed opportunity
                 # in the record loop waits for the next modulo, which is
                 # how an hour that falls short never catches back up. The
@@ -15573,7 +16122,7 @@ async def _torrent_talk() -> None:
                 # coin toss. Only the random road is overridden - an
                 # operator's switchboard choice above still wins outright.
                 try:
-                    for _q in ("caller", "manager"):
+                    for _q in (() if _slot else ("caller", "manager")):
                         if (_q in kinds and _q != last
                                 and quota_behind(_q, dj)
                                 and quota_due(_q, dj)):
@@ -15589,8 +16138,21 @@ async def _torrent_talk() -> None:
                     pass        # the dice already chose; never fail here
             _RADIO["last_round_kind"] = kind
             aired = False
+            # #843: the roads the SCHEDULE added on top of the torrent's
+            # own rotation — dropping the needle, the ad break, a whole
+            # generated call, the recap on the hour. None means "not one
+            # of mine" and the chain below runs exactly as it always has.
+            _sched_aired: bool | None = None
             try:
-                if kind == "caller":
+                _sched_aired = await schedule_extra_round(kind, track, dj)
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", f"scheduled round failed - {kind}",
+                             extra=f"{type(exc).__name__}: {exc}"[:500])
+                _sched_aired = None
+            try:
+                if _sched_aired is not None:
+                    aired = bool(_sched_aired)
+                elif kind == "caller":
                     aired = bool(await dj_caller(track))
                 elif kind == "deep":
                     aired = bool(await dj_deep_round(track))
@@ -17131,6 +17693,869 @@ async def mx_ad_clock() -> None:
             pass
 
 
+# --- THE DJ SCHEDULER (#843) -------------------------------------------
+#
+# "the core of how the system is ran and all the support systems refer to
+# this master system."
+#
+# An hour stops being a bag of dice and becomes an ORDERED LIST: news, a
+# record, a painting sold, an ad, a call — each entry holding the air for
+# its own number of minutes, each able to carry its own system prompt, the
+# whole list reorderable, switchable on the fly for a different one, and
+# assignable per hour of the day and per day of the month.
+#
+# Where it sits in the show:
+#
+#     the operator's switchboard (#884)   <- still wins OUTRIGHT
+#             |
+#     THE SCHEDULE (#843)                 <- this
+#             |
+#     the torrent's random draw (#702)    <- unchanged fallback
+#
+# With the master switch off, no entries enabled, or a schedule that will
+# not parse, every road here returns nothing and the station runs exactly
+# as it did before. Nothing in this file may take the show off air.
+SCHEDULE_PATH = data_path("schedule.json")
+_SCHEDULE_LOCK = RLock()
+
+# Every kind maps onto machinery the station ALREADY has. Nothing here is a
+# new sort of show — it is the shows already in the building, put in an
+# order somebody chose.
+SCHEDULE_KINDS: list[dict[str, str]] = [
+    {"kind": "news", "label": "News coverage",
+     "blurb": "The pair take the wire — headlines pulled live, the lead "
+              "story dug into and reacted to rather than read out "
+              "(dj_news)."},
+    {"kind": "record", "label": "Spin a record",
+     "blurb": "Not a round — the END of one. The needle goes down, the "
+              "talk stops, and the record has the air for the rest of "
+              "this entry (dj_skip)."},
+    {"kind": "gallery", "label": "Painting selling",
+     "blurb": "The gallery press — paintings described from their actual "
+              "pixels, argued over, priced absurdly and hawked to the "
+              "listeners (dj_gallery_round)."},
+    {"kind": "ad", "label": "Ad read",
+     "blurb": "The commercial break: a stored read, a sponsor, or a fresh "
+              "spot bedded in the station's own music (dj_ad_break)."},
+    {"kind": "banter", "label": "Banter",
+     "blurb": "The pair talking, with the speakbox seeding underneath "
+              "(dj_banter)."},
+    {"kind": "banter_caller", "label": "Call with banter",
+     "blurb": "A whole generated caller on the line — ring, name, voice, "
+              "an arc, and an ending off the hang-up shelf "
+              "(dj_call_generated)."},
+    {"kind": "caller", "label": "Phone call",
+     "blurb": "A call on the request line: one of his own requests read "
+              "back to him by a stranger (dj_caller)."},
+    {"kind": "manager", "label": "Message from upstairs",
+     "blurb": "A memo down from the manager, read out on air and reacted "
+              "to (dj_manager_note)."},
+    {"kind": "recap", "label": "Recap on the hour",
+     "blurb": "The pair take stock of the hour just gone, off the "
+              "station's own log — what played, who rang, what sold."},
+    {"kind": "deep", "label": "Deep conversation",
+     "blurb": "The long-form dig: one subject, taken further than it "
+              "should be (dj_deep_round)."},
+    {"kind": "bombshell", "label": "Side rant",
+     "blurb": "Something off the shelf sets one of them off and the whole "
+              "round becomes the rant (drop_bombshell into dj_banter)."},
+]
+SCHEDULE_KIND_NAMES = tuple(k["kind"] for k in SCHEDULE_KINDS)
+
+# The default system prompt each kind writes with. Deliberately short and
+# on-brand: this layer rides in beside the operator's own prompt desk, and
+# it is the thing the owner cycles, stores, defaults and varies.
+SCHEDULE_PROMPT_SEED: dict[str, str] = {
+    "news": "Cover it like two people who actually read the story: what "
+            "happened, who it happened to, and the detail nobody else "
+            "would have picked out. React as yourselves, never as a wire "
+            "service, and get back to the music before it turns into a "
+            "lecture.",
+    "record": "Hand off to the record cleanly — name it once, say why it "
+              "is going on now, and get out of its way.",
+    "gallery": "Sell the painting off what you can actually SEE in it. "
+               "Describe it, argue about what it means, put a ludicrous "
+               "price on it, and tell the listeners the first caller "
+               "takes it.",
+    "ad": "Read it like it is the best thing in the world and you are "
+          "only slightly embarrassed about that. Name the product, say "
+          "what it does, and land the price.",
+    "banter": "Talk to each other, not at the listener. Every line "
+              "answers the one before it, and somebody has to be "
+              "genuinely surprised at least once.",
+    "banter_caller": "The caller is a person with a reason for ringing. "
+                     "Let them finish, dig into what they actually said, "
+                     "and let the call ARRIVE somewhere rather than "
+                     "simply stopping.",
+    "caller": "It is the request line. Find out what they want, read it "
+              "back to them, take the mickey out of it affectionately, "
+              "and cut to the record.",
+    "manager": "It is a memo, not an order. Read it out, react honestly "
+               "— wince at it, argue with it, agree with it — and say "
+               "what it means for the show tonight.",
+    "recap": "Take stock of the hour that just went out: what played, "
+             "who rang, what sold, what came down from upstairs. Two "
+             "moments worth remembering, a joke on each, then straight "
+             "back to the music.",
+    "deep": "One subject, taken further than it should be. No "
+            "topic-hopping — dig.",
+    "bombshell": "Something has set one of you off. Let the rant run, "
+                 "and let the other one try and fail to steer it back.",
+}
+
+# The owner's own hour, in the owner's own order (#843). Twenty entries,
+# sixty minutes, and the last one is the wrap: at the end of the list the
+# clock comes back to the top and the hour runs again.
+CANONICAL_PRESET = "canonical hour"
+CANONICAL_HOUR: tuple[tuple[str, str, float, str], ...] = (
+    ("news", "News coverage", 4, ""),
+    ("record", "Spin record (start)", 3, "The top of the hour: the needle "
+     "goes down and the record gets the air."),
+    ("gallery", "Painting selling", 3, ""),
+    ("ad", "Ad read", 2, ""),
+    ("banter", "Banter during recordings", 3, "They talk OVER the record, "
+     "the way the pair do when the music is running underneath."),
+    ("manager", "Angry messages from upstairs", 2, "Upstairs is ANGRY "
+     "this time — the memo is a rocket, and the pair take it standing up."),
+    ("caller", "Call", 4, ""),
+    ("banter_caller", "Call with banter", 5, ""),
+    ("ad", "Ad read", 2, ""),
+    ("banter", "Banter without caller", 3, "No caller on this one — the "
+     "two of them, alone, on whatever is in the room."),
+    ("banter_caller", "Call with banter", 4, ""),
+    ("gallery", "Painting selling", 3, ""),
+    ("ad", "Ad read", 2, ""),
+    ("news", "Different news story", 4, "A DIFFERENT story from the one "
+     "at the top of the hour — not the same lead said twice."),
+    ("banter", "Banter", 3, ""),
+    ("caller", "Phone call", 4, ""),
+    ("gallery", "Painting selling", 3, ""),
+    ("manager", "Message from upstairs", 2, ""),
+    ("recap", "Recap on the hour", 3, ""),
+    ("record", "Repeat (end)", 1, "The hour wraps here and begins again "
+     "at the top."),
+)
+
+
+def _sched_slot(raw: Any) -> dict[str, Any]:
+    """One entry off the panel, cleaned. Everything missing gets a sane
+    default, so a half-written row can never take the station down."""
+    row = raw if isinstance(raw, dict) else {}
+    kind = str(row.get("kind") or "banter").strip().lower()
+    if kind not in SCHEDULE_KIND_NAMES:
+        kind = "banter"
+    label = str(row.get("label") or "").strip()[:80]
+    if not label:
+        label = next((k["label"] for k in SCHEDULE_KINDS
+                      if k["kind"] == kind), kind)
+    try:
+        minutes = float(row.get("minutes"))
+    except (TypeError, ValueError):
+        minutes = 3.0
+    if minutes != minutes:                     # NaN off a text box
+        minutes = 3.0
+    minutes = max(0.25, min(600.0, minutes))
+    pid = row.get("prompt_id")
+    pid = str(pid).strip()[:64] if pid not in (None, "") else None
+    return {
+        "id": (str(row.get("id") or "").strip()[:48]
+               or f"slot-{uuid.uuid4().hex[:10]}"),
+        "kind": kind,
+        "label": label,
+        "enabled": bool(row.get("enabled", True)),
+        "minutes": round(minutes, 3),
+        "prompt_id": pid or None,
+        "notes": str(row.get("notes") or "")[:400],
+    }
+
+
+def _sched_is_date(text: str) -> bool:
+    try:
+        time.strptime(str(text), "%Y-%m-%d")
+        return True
+    except Exception:                          # noqa: BLE001
+        return False
+
+
+def schedule_defaults() -> dict[str, Any]:
+    """A station that has never been scheduled still has the owner's hour."""
+    slots = [
+        _sched_slot({"id": f"hour-{i + 1:02d}", "kind": kind, "label": label,
+                     "minutes": mins, "notes": note, "enabled": True})
+        for i, (kind, label, mins, note) in enumerate(CANONICAL_HOUR)
+    ]
+    return {
+        "enabled": True,
+        "active": CANONICAL_PRESET,
+        "presets": {CANONICAL_PRESET: slots},
+        "day": {},
+        "month": {},
+        "prompts": {
+            k["kind"]: {
+                "active": 0,
+                "variants": [{
+                    "id": f"{k['kind']}-default",
+                    "name": "Station default",
+                    "text": SCHEDULE_PROMPT_SEED.get(k["kind"], ""),
+                }],
+            } for k in SCHEDULE_KINDS
+        },
+    }
+
+
+def schedule_read() -> dict[str, Any]:
+    """The schedule off disk, merged over the defaults and scrubbed.
+
+    Anything that will not parse falls back to the seeded hour rather than
+    raising: a corrupt file must not stop the show choosing a round."""
+    store = schedule_defaults()
+    try:
+        raw = json.loads(SCHEDULE_PATH.read_text(encoding="utf-8"))
+    except Exception:                          # noqa: BLE001
+        return store
+    if not isinstance(raw, dict):
+        return store
+    try:
+        presets = raw.get("presets")
+        if isinstance(presets, dict):
+            cleaned = {
+                str(name)[:60]: [_sched_slot(s) for s in rows][:200]
+                for name, rows in presets.items()
+                if str(name).strip() and isinstance(rows, list)
+            }
+            if cleaned:
+                store["presets"] = cleaned
+        store["enabled"] = bool(raw.get("enabled", True))
+        if str(raw.get("active") or "") in store["presets"]:
+            store["active"] = str(raw["active"])
+        elif store["active"] not in store["presets"]:
+            store["active"] = next(iter(store["presets"]))
+        day = raw.get("day")
+        if isinstance(day, dict):
+            store["day"] = {
+                str(int(h)): str(name) for h, name in day.items()
+                if str(h).strip().lstrip("-").isdigit()
+                and 0 <= int(h) <= 23 and str(name) in store["presets"]}
+        month = raw.get("month")
+        if isinstance(month, dict):
+            store["month"] = {
+                str(d): str(name) for d, name in month.items()
+                if _sched_is_date(str(d)) and str(name) in store["presets"]}
+        prompts = raw.get("prompts")
+        if isinstance(prompts, dict):
+            for kind, blob in prompts.items():
+                cleaned_blob = _sched_prompt_blob(blob)
+                if cleaned_blob:
+                    store["prompts"][str(kind)[:40]] = cleaned_blob
+    except Exception:                          # noqa: BLE001
+        return schedule_defaults()
+    return store
+
+
+def _sched_prompt_blob(blob: Any) -> dict[str, Any]:
+    """One kind's prompt shelf: its variants and which one is armed."""
+    if not isinstance(blob, dict):
+        return {}
+    variants: list[dict[str, str]] = []
+    for row in (blob.get("variants") or []):
+        if not isinstance(row, dict):
+            continue
+        variants.append({
+            "id": (str(row.get("id") or "").strip()[:64]
+                   or f"pv-{uuid.uuid4().hex[:10]}"),
+            "name": str(row.get("name") or "Untitled").strip()[:80],
+            "text": str(row.get("text") or "")[:4000],
+        })
+    if not variants:
+        return {}
+    try:
+        active = int(blob.get("active") or 0)
+    except (TypeError, ValueError):
+        active = 0
+    return {"active": max(0, min(len(variants) - 1, active)),
+            "variants": variants[:60]}
+
+
+def schedule_write(store: dict[str, Any]) -> dict[str, Any]:
+    """Atomically, the way every other shelf in this file is written."""
+    with _SCHEDULE_LOCK:
+        SCHEDULE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SCHEDULE_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
+        tmp.replace(SCHEDULE_PATH)
+    return store
+
+
+def schedule_preset_now(store: dict[str, Any] | None = None,
+                        when: float | None = None) -> str:
+    """Which list of entries owns THIS moment.
+
+    The month plan for today wins, then the hour-of-day plan, then
+    whatever preset the operator last put on air. A day nobody has said
+    anything about therefore runs the day defaults, and an hour nobody has
+    said anything about runs the active preset — which is what "month auto
+    populated from the defaults" means from the clock's side."""
+    store = store if isinstance(store, dict) else schedule_read()
+    presets = store.get("presets") or {}
+    lt = time.localtime(when if when is not None else time.time())
+    name = str((store.get("month") or {}).get(
+        time.strftime("%Y-%m-%d", lt)) or "")
+    if name not in presets:
+        name = str((store.get("day") or {}).get(str(lt.tm_hour)) or "")
+    if name not in presets:
+        name = str(store.get("active") or "")
+    if name not in presets:
+        name = next(iter(presets), "")
+    return name
+
+
+def schedule_prompt_for(store: dict[str, Any],
+                        slot: dict[str, Any]) -> str:
+    """The system prompt this entry writes with: the variant it PINS, or
+    else whichever variant is currently armed for its kind."""
+    blob = (store.get("prompts") or {}).get(str(slot.get("kind") or ""))
+    if not isinstance(blob, dict):
+        return ""
+    variants = [v for v in (blob.get("variants") or []) if isinstance(v, dict)]
+    if not variants:
+        return ""
+    pinned = slot.get("prompt_id")
+    if pinned:
+        for row in variants:
+            if str(row.get("id") or "") == str(pinned):
+                return str(row.get("text") or "").strip()
+    try:
+        idx = int(blob.get("active") or 0) % len(variants)
+    except (TypeError, ValueError):
+        idx = 0
+    return str(variants[idx].get("text") or "").strip()
+
+
+def _schedule_clause(preset: str, slot: dict[str, Any], text: str) -> str:
+    """The entry's prompt, dressed as the instruction it is."""
+    note = str(slot.get("notes") or "").strip()[:300]
+    return ("\n\nSCHEDULE (#843) — THIS ROUND IS THE \""
+            + str(slot.get("label") or slot.get("kind") or "")[:80]
+            + "\" ENTRY ON THE \"" + str(preset)[:60] + "\" SCHEDULE"
+            + (", AND ITS STANDING INSTRUCTION GOVERNS IT: " + text[:2200]
+               if text else ".")
+            + (" The working note on this entry: " + note if note else "")
+            + "\n")
+
+
+def _schedule_prompt_clause() -> str:
+    """What the entry currently on air wants said. Empty whenever the
+    schedule is not driving, which is what keeps an unscheduled station
+    writing exactly as it always did."""
+    try:
+        return str(_RADIO.get("sched_prompt") or "")
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def schedule_take() -> dict[str, Any]:
+    """The entry that owns the air right now — and the round it names.
+
+    Advances by the CLOCK: each entry holds for its own `minutes`, then
+    the next ENABLED one takes over, wrapping at the end of the list. The
+    position lives in `_RADIO` so a restart starts the hour cleanly, and
+    the whole thing is wrapped: anything at all going wrong returns {} and
+    the torrent falls straight back to its own draw."""
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            _RADIO.pop("sched_pos", None)
+            return {}
+        name = schedule_preset_now(store)
+        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
+                 if s.get("enabled", True)]
+        if not slots:
+            _RADIO.pop("sched_pos", None)
+            return {}
+        now = time.time()
+        pos = _RADIO.get("sched_pos") or {}
+        idx = int(pos.get("index") or 0)
+        started = float(pos.get("started") or 0)
+        fresh = (str(pos.get("preset") or "") != name
+                 or not 0 <= idx < len(slots)
+                 or started <= 0
+                 or str(pos.get("slot_id") or "")
+                 != str(slots[idx].get("id") or ""))
+        if fresh:
+            idx, started = 0, now
+        else:
+            # Walk the clock forward. Bounded, so a station that has been
+            # sitting on one entry since last week cannot spin here.
+            for _ in range(len(slots) * 2):
+                hold = max(0.25, float(slots[idx].get("minutes") or 3)) * 60.0
+                if now - started < hold:
+                    break
+                started += hold
+                idx = (idx + 1) % len(slots)
+            else:
+                idx, started = 0, now
+        slot = dict(slots[idx])
+        # Whether this is the FIRST round of this entry — the needle road
+        # drops one record when its entry begins, not one every breath.
+        _RADIO["sched_first"] = (
+            str(pos.get("preset") or "") != name
+            or int(pos.get("index") or -1) != idx
+            or abs(float(pos.get("started") or 0) - started) > 0.01)
+        _RADIO["sched_pos"] = {"preset": name, "index": idx,
+                               "started": started,
+                               "slot_id": str(slot.get("id") or "")}
+        text = schedule_prompt_for(store, slot)
+        _RADIO["sched_prompt"] = (
+            _schedule_clause(name, slot, text)
+            if (text or slot.get("notes")) else "")
+        return slot
+    except Exception:                          # noqa: BLE001
+        _RADIO["sched_prompt"] = ""
+        return {}
+
+
+async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
+    """The recap on the hour (#843).
+
+    Built out of the station's OWN log — the records that really played,
+    what really went out — so the pair recap an hour that happened rather
+    than inventing one."""
+    played: list[str] = []
+    for row in reversed(list(_RADIO.get("history") or [])[-14:]):
+        named = " - ".join(x for x in (str(row.get("artist") or ""),
+                                       str(row.get("title") or "")) if x)
+        if named and named not in played:
+            played.append(named)
+    beats: list[str] = []
+    for row in list(_RADIO.get("chat") or [])[-60:]:
+        text = str(row.get("text") or "").strip()
+        if text and str(row.get("kind") or "") in (
+                "news", "call", "caller", "ad", "gallery", "manager"):
+            beats.append(f"{row.get('kind')}: {text[:110]}")
+    del beats[:-8]
+    stats = _RADIO.get("session_stats") or {}
+    when = time.strftime("%I:%M %p", time.localtime()).lstrip("0")
+    angle = (
+        f"IT IS {when} AND THIS IS THE RECAP ON THE HOUR. The two of you "
+        "take stock of the hour that just went out — briskly, in your own "
+        "voices, never read like a wire service. Say what actually "
+        "happened: the records, who rang in and what they wanted, anything "
+        "that got sold, and whatever came down from upstairs. Pick the two "
+        "moments worth remembering and land a joke on each. Finish by "
+        "telling the listeners what the next hour holds, then hand straight "
+        "back to the music."
+        + (f"\n\nRecords that actually played: {'; '.join(played[:8])}."
+           if played else "")
+        + (f"\n\nWhat went out on air: {'; '.join(beats)}." if beats else "")
+        + (f"\n\nCalls taken tonight: {int(stats.get('calls') or 0)}."
+           if stats.get("calls") else ""))
+    return await dj_banter(track, angle=angle, lines=6,
+                           render_stream=bool(
+                               dj_settings().get("stream_show", True)))
+
+
+async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
+                               dj: dict[str, Any]) -> bool | None:
+    """The roads the SCHEDULE can name that the torrent's own rotation
+    never had — the needle, the ad break, a whole generated call, and the
+    recap on the hour.
+
+    Returns None for "not one of mine", and the torrent's existing chain
+    then runs exactly as it always has."""
+    if kind == "record":
+        # Not a round at all: the END of one. The needle goes down ONCE,
+        # when this entry begins, and the rest of its minutes are the
+        # record's — the pair keep quiet over their own scheduling.
+        if _RADIO.get("sched_first"):
+            try:
+                dj_skip()
+            except Exception:                  # noqa: BLE001
+                pass
+            pipeline_log("air", "the schedule drops the needle (#843)")
+        await asyncio.sleep(8)
+        return True
+    if kind == "ad":
+        try:
+            return bool(await dj_ad_break())
+        except Exception as exc:               # noqa: BLE001
+            pipeline_log("drop", "the scheduled ad break failed",
+                         extra=f"{type(exc).__name__}: {exc}"[:500])
+            return False
+    if kind == "banter_caller":
+        try:
+            got = await dj_call_generated()
+            return bool((got or {}).get("lines"))
+        except Exception as exc:               # noqa: BLE001
+            pipeline_log("drop", "the scheduled call failed",
+                         extra=f"{type(exc).__name__}: {exc}"[:500])
+            return False
+    if kind == "recap":
+        try:
+            return bool(await dj_recap_round(track))
+        except Exception as exc:               # noqa: BLE001
+            pipeline_log("drop", "the scheduled recap failed",
+                         extra=f"{type(exc).__name__}: {exc}"[:500])
+            return False
+    return None
+
+
+def schedule_tinting() -> dict[str, Any]:
+    """The world-tint currently on, for the top of the popup."""
+    try:
+        ons = crystal_active()
+        if not ons:
+            return {"crystal": None, "strength": None}
+        top = max(ons, key=lambda c: int(c.get("strength") or 0))
+        return {"crystal": str(top.get("name") or "") or None,
+                "strength": int(top.get("strength") or 0)}
+    except Exception:                          # noqa: BLE001
+        return {"crystal": None, "strength": None}
+
+
+def schedule_speakbox() -> dict[str, float]:
+    """The speakbox sliders as they stand, for the top of the popup."""
+    try:
+        dj = dj_settings()
+    except Exception:                          # noqa: BLE001
+        dj = {}
+
+    def _f(key: str) -> float:
+        try:
+            return round(float(dj.get(key) or 0), 3)
+        except (TypeError, ValueError):
+            return 0.0
+
+    return {"rate": _f("speakbox_rate"),
+            "prepend": _f("speakbox_prepend_rate"),
+            "append": _f("speakbox_append_rate"),
+            "full_swath": _f("speakbox_full_swath_rate")}
+
+
+def schedule_public(store: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Everything the scheduler popup needs in one read."""
+    store = store if isinstance(store, dict) else schedule_read()
+    presets = store.get("presets") or {}
+    name = schedule_preset_now(store)
+    slots = [dict(s) for s in (presets.get(name) or [])]
+    pos = _RADIO.get("sched_pos") or {}
+    slot_id = str(pos.get("slot_id") or "")
+    index = next((i for i, s in enumerate(slots)
+                  if str(s.get("id") or "") == slot_id), None) \
+        if slot_id and str(pos.get("preset") or "") == name else None
+    day_plan = store.get("day") or {}
+    fallback = str(store.get("active") or name or "")
+    return {
+        "enabled": bool(store.get("enabled", True)),
+        "active": name,
+        "presets": sorted(presets),
+        "slots": slots,
+        "kinds": [dict(k) for k in SCHEDULE_KINDS],
+        "now": {"index": index,
+                "slot_id": slot_id or None,
+                "started": (float(pos.get("started") or 0) or None)},
+        "day": {str(h): str(day_plan.get(str(h)) or fallback)
+                for h in range(24)},
+        "tinting": schedule_tinting(),
+        "speakbox": schedule_speakbox(),
+    }
+
+
+def schedule_month_plan(start: str = "", days: int = 31) -> dict[str, Any]:
+    """The month, auto-populated. A date nobody has pinned takes whichever
+    preset owns most of that day's hours, and failing that the active one —
+    so a fresh month is already full rather than empty."""
+    store = schedule_read()
+    try:
+        days = max(1, min(366, int(days)))
+    except (TypeError, ValueError):
+        days = 31
+    try:
+        anchor = time.mktime(time.strptime(str(start), "%Y-%m-%d")[:3]
+                             + (0, 0, 0, 0, 1, -1))
+    except Exception:                          # noqa: BLE001
+        lt = time.localtime()
+        anchor = time.mktime((lt.tm_year, lt.tm_mon, 1, 0, 0, 0, 0, 1, -1))
+    pinned = store.get("month") or {}
+    day_plan = store.get("day") or {}
+    fallback = str(store.get("active") or "")
+    tally: dict[str, int] = {}
+    for hour in range(24):
+        pick = str(day_plan.get(str(hour)) or fallback)
+        tally[pick] = tally.get(pick, 0) + 1
+    auto_name = max(tally, key=lambda k: tally[k]) if tally else fallback
+    rows = []
+    for step in range(days):
+        lt = time.localtime(anchor + step * 86400 + 43200)
+        key = time.strftime("%Y-%m-%d", lt)
+        chosen = str(pinned.get(key) or "")
+        rows.append({"date": key, "weekday": lt.tm_wday,
+                     "preset": chosen or auto_name,
+                     "auto": not chosen})
+    return {"from": rows[0]["date"] if rows else "",
+            "days": days,
+            "presets": sorted(store.get("presets") or {}),
+            "month": rows}
+
+
+@app.get("/api/schedule")
+async def schedule_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The whole desk: what is on air, what else exists, and where the
+    clock has got to."""
+    require_read_auth(authorization)
+    return schedule_public()
+
+
+@app.get("/api/schedule/kinds")
+async def schedule_kinds_api(
+    authorization: str | None = Header(default=None),
+) -> list[dict[str, str]]:
+    """Every kind of entry, and the machinery each one drives."""
+    require_read_auth(authorization)
+    return [dict(k) for k in SCHEDULE_KINDS]
+
+
+@app.post("/api/schedule/slots")
+async def schedule_slots_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Replace one preset's list of entries. Reorder, enable, edit and add
+    all save through here — the list you send IS the schedule."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400,
+                            detail="Expected an object")
+    rows = payload.get("slots")
+    if not isinstance(rows, list):
+        raise HTTPException(status_code=400,
+                            detail="slots must be a list")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        name = (str(payload.get("preset") or "").strip()[:60]
+                or str(store.get("active") or ""))
+        if name not in (store.get("presets") or {}):
+            raise HTTPException(status_code=404,
+                                detail=f"No schedule called {name!r}")
+        store["presets"][name] = [_sched_slot(r) for r in rows][:200]
+        schedule_write(store)
+    note_action(f"🗓 schedule saved: {name} "
+                f"({len(store['presets'][name])} entries) (#843)")
+    return schedule_public(store)
+
+
+@app.post("/api/schedule/preset")
+async def schedule_preset_create_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Create a schedule, or duplicate one: {name, copy_from}."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    name = str(payload.get("name") or "").strip()[:60]
+    if not name:
+        raise HTTPException(status_code=400,
+                            detail="A schedule needs a name")
+    source = str(payload.get("copy_from") or "").strip()[:60]
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        presets = store.setdefault("presets", {})
+        if name in presets:
+            raise HTTPException(status_code=409,
+                                detail=f"{name!r} already exists")
+        copied = list(presets.get(source) or [])
+        presets[name] = [_sched_slot(dict(r, id="")) for r in copied]
+        schedule_write(store)
+    note_action(f"🗓 schedule created: {name}"
+                + (f" — copied from {source}" if copied else "")
+                + " (#843)")
+    return schedule_public(store)
+
+
+@app.post("/api/schedule/activate")
+async def schedule_activate_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Put a schedule on the air, on the fly. The clock restarts at the
+    top of the new list, and the next round is already running it."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    name = str(payload.get("name") or "").strip()[:60]
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        if name and name not in (store.get("presets") or {}):
+            raise HTTPException(status_code=404,
+                                detail=f"No schedule called {name!r}")
+        if name:
+            store["active"] = name
+        if "enabled" in payload:
+            store["enabled"] = bool(payload.get("enabled"))
+        schedule_write(store)
+    _RADIO.pop("sched_pos", None)
+    _RADIO["sched_prompt"] = ""
+    note_action("🗓 schedule on air: " + str(store.get("active") or "")
+                + ("" if store.get("enabled", True)
+                   else " — MASTER SWITCH OFF, the show runs on the draw")
+                + " (#843)")
+    return schedule_public(store)
+
+
+@app.delete("/api/schedule/preset/{name}")
+async def schedule_preset_delete_api(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Throw a schedule away. The last one standing cannot go — a station
+    with no schedule at all has nothing to fall back to but the dice."""
+    require_auth(authorization)
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        presets = store.get("presets") or {}
+        if name not in presets:
+            raise HTTPException(status_code=404,
+                                detail=f"No schedule called {name!r}")
+        if len(presets) <= 1:
+            raise HTTPException(
+                status_code=400,
+                detail="That is the last schedule — it cannot be deleted")
+        presets.pop(name, None)
+        store["day"] = {h: p for h, p in (store.get("day") or {}).items()
+                        if p != name}
+        store["month"] = {d: p for d, p in (store.get("month") or {}).items()
+                          if p != name}
+        if str(store.get("active") or "") not in presets:
+            store["active"] = next(iter(presets))
+        schedule_write(store)
+    _RADIO.pop("sched_pos", None)
+    note_action(f"🗓 schedule deleted: {name} (#843)")
+    return schedule_public(store)
+
+
+@app.post("/api/schedule/day")
+async def schedule_day_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Assign schedules to the hours of the day: {"hours": {"0": name}}.
+    An empty name clears that hour back to the active schedule."""
+    require_auth(authorization)
+    payload = await request.json()
+    hours = (payload or {}).get("hours") if isinstance(payload, dict) else None
+    if not isinstance(hours, dict):
+        raise HTTPException(status_code=400,
+                            detail="hours must be an object")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        plan = dict(store.get("day") or {})
+        for key, value in hours.items():
+            try:
+                hour = int(str(key).strip())
+            except (TypeError, ValueError):
+                continue
+            if not 0 <= hour <= 23:
+                continue
+            name = str(value or "").strip()
+            if not name:
+                plan.pop(str(hour), None)
+            elif name in (store.get("presets") or {}):
+                plan[str(hour)] = name
+        store["day"] = plan
+        schedule_write(store)
+    note_action(f"🗓 day plan saved — {len(store['day'])} hours pinned "
+                "(#843)")
+    return schedule_public(store)
+
+
+@app.post("/api/schedule/month")
+async def schedule_month_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Pin schedules to dates: {"days": {"2026-08-19": name}}. An empty
+    name unpins that date and it goes back to the day defaults."""
+    require_auth(authorization)
+    payload = await request.json()
+    days = (payload or {}).get("days") if isinstance(payload, dict) else None
+    if not isinstance(days, dict):
+        raise HTTPException(status_code=400,
+                            detail="days must be an object")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        plan = dict(store.get("month") or {})
+        for key, value in days.items():
+            date = str(key).strip()
+            if not _sched_is_date(date):
+                continue
+            name = str(value or "").strip()
+            if not name:
+                plan.pop(date, None)
+            elif name in (store.get("presets") or {}):
+                plan[date] = name
+        store["month"] = dict(sorted(plan.items())[-800:])
+        schedule_write(store)
+    note_action(f"🗓 month plan saved — {len(store['month'])} days pinned "
+                "(#843)")
+    return schedule_public(store)
+
+
+@app.get("/api/schedule/month")
+async def schedule_month_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The month view — ?from=YYYY-MM-DD&days=31. Every day comes back
+    filled: `auto` false means somebody pinned it, true means it was
+    populated from the day defaults."""
+    require_read_auth(authorization)
+    return schedule_month_plan(
+        str(request.query_params.get("from") or ""),
+        request.query_params.get("days") or 31)
+
+
+@app.get("/api/schedule/prompts")
+async def schedule_prompts_get_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The per-kind system prompt shelves and which variant is armed."""
+    require_read_auth(authorization)
+    return schedule_read().get("prompts") or {}
+
+
+@app.post("/api/schedule/prompts")
+async def schedule_prompts_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Store, cycle and vary the per-kind prompts. Used IMMEDIATELY: the
+    entry on air re-reads its prompt on the very next round, not at the
+    next restart."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        prompts = dict(store.get("prompts") or {})
+        for kind, blob in payload.items():
+            cleaned = _sched_prompt_blob(blob)
+            if cleaned:
+                prompts[str(kind)[:40]] = cleaned
+            else:
+                prompts.pop(str(kind)[:40], None)
+        store["prompts"] = prompts
+        schedule_write(store)
+    _RADIO["sched_prompt"] = ""
+    note_action("🗓 schedule prompts saved (#843)")
+    return prompts
+
+
 # --- The plotline desk: hand-written storylines the pair play out on air ---
 # You structure a plot in acts; while it is ACTIVE the booth weaves the
 # current act into its rounds — in character, never announced as a script —
@@ -17380,14 +18805,19 @@ async def dj_engineering_ad() -> list[str]:
 
 
 async def dj_ad(product: str, remember: bool = True,
-                custom: bool = False) -> dict[str, Any]:
+                custom: bool = False,
+                script: str = "") -> dict[str, Any]:
     """Write, speak and keep an ad read. A CUSTOM ad (one the DJs make on
     demand) always gets a sound effect mixed in and is kept a week (#464)."""
     # What is being SOLD right now (#668), so the booth can hold it up the
     # way it already holds up the paintings.
     _RADIO["ad_now"] = {"product": str(product)[:160], "at": time.time()}
+    # #842: `script` is a read WRITTEN AHEAD — and already rendered into
+    # the pantry — so it is handed to dj_speak as the line itself: spoken
+    # word for word, with its audio found rather than made. Empty means
+    # the read is written here and now, exactly as it always was.
     line = await dj_speak("ad", _RADIO.get("now"), extra=product,
-                          sting=not custom)
+                          line=script, sting=not custom)
     # Custom ads always punch in an SFX (#464) — forced past the rate gate,
     # dropped off the end of the read where a second announce is safe.
     if custom and line and (_RADIO.get("voice_to") or "box") in ("box", "both"):
@@ -18549,6 +19979,24 @@ async def dj_ad_break() -> str:
     _RADIO["last_ad"] = time.time()    # the clock and track paths share this
     dj = dj_settings()
     stored = ad_pick()
+
+    # #842: a spot WRITTEN AND READ during an earlier record. The words
+    # and the audio both exist already, so this break costs the model and
+    # the voice engine nothing at all — which is the whole point of the
+    # backlog. An empty shelf falls straight through to the road below.
+    try:
+        _prep_ad = shelf_take("ad")
+    except Exception:  # noqa: BLE001
+        _prep_ad = None
+    if _prep_ad and str(_prep_ad.get("text") or ""):
+        try:
+            _prep_said = (await dj_ad(
+                str(_prep_ad.get("product") or "our sponsor"),
+                script=str(_prep_ad.get("text") or "")))["ad"]
+            if _prep_said:
+                return _prep_said
+        except Exception:  # noqa: BLE001
+            pass                       # fall through and write one live
 
     # The between-tracks ad over a swell of the station's own music (#463).
     # Most of them now (#643): a spot bedded in music is the thing that
@@ -23140,9 +24588,21 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         # it as a station ID so the name governor leaves the full name in
         # (an "interject" would have scrubbed it down to "the station").
         # #882: written, seeded, and never the line just heard.
-        line = await drop_liner(station)
-        if station and station.lower() not in line.lower():
-            line = f"{line} {station}."
+        # #842: a liner WRITTEN AND SHOUTED during an earlier record —
+        # the sting costs the model and the voice engine nothing. Only a
+        # liner prepared for THIS voice is taken; an empty shelf writes
+        # one here exactly as before.
+        _prep_id = None
+        try:
+            _prep_id = shelf_take("station_id", voice=drop_voice)
+        except Exception:  # noqa: BLE001
+            _prep_id = None
+        if _prep_id and str(_prep_id.get("text") or ""):
+            line = str(_prep_id["text"])
+        else:
+            line = await drop_liner(station)
+            if station and station.lower() not in line.lower():
+                line = f"{line} {station}."
         try:
             await dj_speak("station_id", None, line=line, who="drop",
                            voice=drop_voice, name="The SFX Guy")
@@ -28740,6 +30200,7 @@ async def speak_turns(turns: list[tuple[str, str]],
             if _ready:
                 pipeline_log("lookahead", "off the pantry shelf - no render "
                              f"needed - {item['who']} (#886)")
+                take_note(item["who"], v, engine, text, _ready, 0, "shelf")
                 return _ready
             # #746: BOTH cloning engines. This probed XTTS only, so an
             # F5 voice with :8772 down raised out of voice_generate
@@ -28757,9 +30218,13 @@ async def speak_turns(turns: list[tuple[str, str]],
             if not cold:
                 pipeline_log("lookahead", "pre-rendering the next line - "
                              f"{engine} - {item['who']}")
-            return await voice_render_any(text, v, "" if cold else engine,
-                                          fx=_turn_fx(item),
-                                          who=item["who"])
+            _t0 = time.monotonic()
+            _made = await voice_render_any(text, v, "" if cold else engine,
+                                           fx=_turn_fx(item),
+                                           who=item["who"])
+            take_note(item["who"], v, engine, text, _made,
+                      int((time.monotonic() - _t0) * 1000), "live")
+            return _made
         except Exception:
             return None                 # dj_speak will render it itself
 
@@ -29396,7 +30861,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     caller2_name: str = "",
                     caller2_voice: str = "",
                     render_stream: bool = False,
-                    feel: bool = False) -> list[str]:
+                    feel: bool = False,
+                    bank_to: list[dict[str, Any]] | None = None
+                    ) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
     `angle` overrides the usual random pick — that is how one particular
@@ -29454,6 +30921,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # Nine total lines frequently left the caller's actual point with no
         # room to land once the ring and introduction were included.
         lines = max(lines, 11)
+    # #842: a PRE-WRITTEN round has the one thing a live round never has —
+    # TIME. Nobody is waiting on it, so it is written LONGER and richer,
+    # and read with a wider context window: "increase the context length
+    # for the LLM to get more lines or script the dialogue richer before
+    # we edit it". A LIVE round asks for exactly what it always asked for;
+    # only the banked ones stretch.
+    _bank_rich = bool(bank)
+    if _bank_rich:
+        lines = max(2, min(24, lines + 4))
     # A round off the larder shelf (#349, #351): written minutes ago while
     # the desk was quiet, on air the instant it is wanted. Only the plain
     # random rounds shop here — anything with its own subject (an angle, a
@@ -30105,7 +31581,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
                if caller_name else "")
             + f".{playing}{only_song}{aside}{show_memory()}{call_flow}"
             f"{crystal_clause()}{avoid_reruns()}{approach_clause(_approach)}\n\n"
-            "The two lists below are prompts he typed and pictures we made "
+            # #842: the banked round is told it is being PRE-RECORDED, so
+            # the model spends the room it has been given on more lines
+            # rather than on a tighter version of the same six.
+            + ("THIS ONE IS BEING RECORDED IN ADVANCE, not live: there is "
+               "no clock on it and nothing is waiting on you. Use that. "
+               "Write it FULLER than a live link — every turn developed, "
+               "the subject genuinely taken somewhere over the course of "
+               "the exchange, and a real landing on the last turn rather "
+               "than a stop. Give us MORE TURNS rather than longer "
+               "ones.\n\n" if _bank_rich else "")
+            + "The two lists below are prompts he typed and pictures we made "
             "for him. They are not songs and must never be announced as "
             "songs.\n"
             f"Things he keeps asking for:\n{material or '- (nothing yet)'}\n\n"
@@ -30117,10 +31603,20 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # like (#168).
             limit=min(
                 int(dj.get("reply_max_chars") or 6000),
-                max(3600, 560 * lines + len(seed.get("text", ""))
+                # #842: a banked round asks for a bigger script than a
+                # live one. reply_max_chars is still the ceiling — this
+                # only stops the round asking for less than the operator
+                # is willing to give it.
+                max(3600 + (2400 if _bank_rich else 0),
+                    (760 if _bank_rich else 560) * lines
+                    + len(seed.get("text", ""))
                     + len(aside) + len((comeback or {}).get("text", ""))
                     + len(angle)),
             ),
+            # #842: "we can increase the context length for the LLM to get
+            # more lines". The banked round is written in the wide window;
+            # a live one keeps the operator's own num_ctx untouched.
+            num_ctx=(32768 if _bank_rich else 0),
         )
     except Exception as exc:
         # #805: this `except` was SILENT, and the ledger showed what
@@ -30349,6 +31845,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "profile": _larder_profile_signature(),
     }
     if bank:
+        # #842: a round written for a PARTICULAR segment — a memo from
+        # upstairs, a call on the request line — is handed back to its
+        # preparer instead of joining the general banter shelf, where the
+        # next plain round would simply have eaten it.
+        if bank_to is not None:
+            bank_to.append(entry)
+            return []
         _LARDER.append(entry)
         del _LARDER[:-_LARDER_MAX]      # a deep backlog is allowed (#445)
         _larder_save()
@@ -30682,7 +32185,9 @@ async def dj_open_show() -> list[str]:
     ))
 
 
-async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
+async def dj_manager_note(track: dict[str, Any] | None = None,
+                          bank_to: list[dict[str, Any]] | None = None
+                          ) -> list[str]:
     """A memo from the manager upstairs, read out on air.
 
     The manager is whatever system prompt is armed: his instructions are its
@@ -30690,6 +32195,25 @@ async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
     tonight — the ad reads, the sponsorships, the tone (#189). It is read as
     a memo rather than obeyed as an instruction, which is what keeps a prompt
     written for the assistant from turning the DJs into one."""
+    # #842: a memo WRITTEN AND VOICED during an earlier record goes
+    # straight out — no model call, no render, no wait. `bank_to` is the
+    # other side of the same door: the preparer calls THIS function to
+    # write one, and is handed the round back instead of it airing. An
+    # empty shelf falls through to the live road below, unchanged.
+    if bank_to is None:
+        try:
+            _prep_memo = shelf_take("manager")
+        except Exception:  # noqa: BLE001
+            _prep_memo = None
+        if _prep_memo:
+            try:
+                _prep_said = await _banter_air(
+                    _prep_memo.get("entry") or {}, track)
+            except Exception:  # noqa: BLE001
+                _prep_said = []
+            if _prep_said:
+                quota_stamp("manager")     # #841: the hour counts it
+                return _prep_said
     # When the machine runs hot, the memo is about the HEAT (#375): the
     # manager upstairs feels the same air the computer makes.
     hot = booth_hot()
@@ -30741,7 +32265,9 @@ async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
     except Exception:  # noqa: BLE001
         pass
     if _hot_memo:
-        _hot_said = await dj_banter(track, lines=3, angle=(
+        _hot_said = await dj_banter(track, lines=3,
+                                    bank=bank_to is not None,
+                                    bank_to=bank_to, angle=(
             "an urgent memo has just come down from the manager upstairs: "
             f"it is VERY hot in the building — {hot:.0f} degrees Celsius, "
             f"{hot * 9 / 5 + 32:.0f} Fahrenheit, straight off the "
@@ -30755,7 +32281,8 @@ async def dj_manager_note(track: dict[str, Any] | None = None) -> list[str]:
         return _hot_said
     # `note` and its guard now live at the top of the function, above the
     # material draw (#841).
-    _said = await dj_banter(track, lines=3, angle=(
+    _said = await dj_banter(track, lines=3, bank=bank_to is not None,
+                            bank_to=bank_to, angle=(
         "a memo has just come down from the manager upstairs. One of you "
         "reads it out to the other and to the listeners, and you both react "
         "on air — agree with it, wince at it, push back on it, whatever it "
@@ -30855,12 +32382,45 @@ def heat_joke_bank(most: int = 6) -> str:
     return "; ".join(pool[:most])
 
 
-async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
+async def dj_caller(track: dict[str, Any] | None = None,
+                    bank_to: list[dict[str, Any]] | None = None
+                    ) -> list[str]:
     """A call gets through on the request line.
 
     What the caller wants is one of his own past requests, read back to him by
     a stranger — the joke only lands because it is really his. They take the
     call, react, and cut to the record (#179)."""
+    # #842: a call WRITTEN AND VOICED during an earlier record — script,
+    # ending and every line's audio already made — goes straight to air.
+    # `bank_to` is the preparer's side of the same door: it asks this
+    # function to WRITE one and is handed the round back rather than it
+    # airing. Nothing prepared means the live road below runs unchanged.
+    if bank_to is None:
+        try:
+            _prep_call = shelf_take("caller")
+        except Exception:  # noqa: BLE001
+            _prep_call = None
+        if _prep_call:
+            _prep_entry = _prep_call.get("entry") or {}
+            _prep_began = time.time()
+            try:
+                _prep_said = await _banter_air(_prep_entry, track)
+            except Exception:  # noqa: BLE001
+                _prep_said = []
+            if _prep_said:
+                # The ledger is told the truth about a call that WAS
+                # written earlier: the ending it was steered towards
+                # travelled with the round (#691).
+                try:
+                    call_ended(str(_prep_entry.get("prep_name")
+                                   or "the caller on the request line"),
+                               call_line_say(call_line_no()), _prep_began,
+                               _prep_entry.get("prep_rule") or {},
+                               len(_prep_said))
+                except Exception:  # noqa: BLE001
+                    pass
+                quota_stamp("caller")      # #839: the hour counts it
+                return _prep_said
     hot = booth_hot()
     # When the building is genuinely cooking, some callers ring in about
     # THAT instead, and they compete at it (#644).
@@ -30889,7 +32449,9 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     started = time.time()
     line_say = call_line_say(call_line_no())
     if heat_call:
-        heat_lines = await dj_banter(track, lines=4, angle=(
+        heat_lines = await dj_banter(track, lines=4,
+                                     bank=bank_to is not None,
+                                     bank_to=bank_to, angle=(
             "A listener has got through and they are calling about the HEAT. "
             f"It is {hot:.0f} degrees Celsius, {hot * 9 / 5 + 32:.0f} "
             "Fahrenheit, in the building. Give them a name and a voice. They "
@@ -30901,6 +32463,14 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
             "their own, one of them brings it back to their own melting "
             "Pine Box, and it becomes a competition nobody wins. Then cut "
             "back to the record." + tail))
+        if bank_to is not None:
+            # Banked, not aired: nothing ended, so nothing is written to
+            # the ledger. The outcome it was written towards rides WITH
+            # the round so the ledger can be told the truth when it goes.
+            if bank_to:
+                bank_to[-1]["prep_rule"] = dict(rule or {})
+                bank_to[-1]["prep_name"] = "the caller about the heat"
+            return []
         call_ended("the caller about the heat", line_say, started, rule,
                    len(heat_lines or []))
         if heat_lines:
@@ -30915,7 +32485,8 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
     # exchange has somewhere to arrive rather than simply stopping.
     _turns = random.randint(8, 12)
     _disp = await caller_disposition_clause(theme_air_clause(_themed))
-    lines = await dj_banter(track, lines=_turns, also_name=want, angle=(
+    lines = await dj_banter(track, lines=_turns, also_name=want,
+                            bank=bank_to is not None, bank_to=bank_to, angle=(
         "a caller has got through on the request line. Give them a name, and "
         "between the two of you relay what they are asking for, which is "
         f"this: \"{want}\"."
@@ -30931,6 +32502,11 @@ async def dj_caller(track: dict[str, Any] | None = None) -> list[str]:
         f"last two or three turns: {str(rule.get('text') or '')}. "
         "Then cut back to the record." + tail
     ))
+    if bank_to is not None:
+        if bank_to:
+            bank_to[-1]["prep_rule"] = dict(rule or {})
+            bank_to[-1]["prep_name"] = "the caller on the request line"
+        return []
     call_ended("the caller on the request line", line_say, started, rule,
                len(lines or []))
     if lines:
@@ -39642,6 +41218,25 @@ async def dj_topics_get(
     """Everything in the bank, most recently added first."""
     require_read_auth(authorization)
     return {"topics": read_bombshells()}
+
+
+@app.get("/api/recording-room")
+async def api_recording_room(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#899: check in on the recording room — who has been in, what they
+    said, what it cost, and how much the shelf is saving."""
+    require_read_auth(authorization)
+    room = recording_room()
+    room["shelf"] = {
+        "seconds": pantry_seconds(),
+        "clips": len(_PANTRY),
+        "life_hours": round(pantry_life() / 3600.0, 2),
+        "burn_hours": round(float(globals().get("PANTRY_BURN_SECONDS")
+                                  or 86400.0) / 3600.0, 1),
+        "window": pantry_window(),
+    }
+    return room
 
 
 @app.get("/api/dj/pending")
@@ -49443,6 +51038,121 @@ button.danger {
   border-radius: 10px; cursor: pointer;
 }
 .pine-restart:hover { border-color: var(--accent); }
+
+/* ---- #843: the DJ scheduler — an hour at a glance -----------------------
+   The hour is the unit the station actually runs on, so the hour is what
+   the window draws: tiles in the order they air, the one on air lit from
+   the left edge. Everything scoped .sched- so nothing here can reach out
+   and touch the desk. */
+.sched-strip {
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--panel2); padding: 6px 8px; margin-bottom: 6px;
+}
+.sched-strip-row {
+  display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+}
+.sched-strip-row + .sched-strip-row { margin-top: 6px; }
+.sched-lab {
+  font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase;
+  color: var(--accent); opacity: .8; flex: 0 0 auto;
+}
+.sched-chip {
+  display: inline-flex; align-items: baseline; gap: 4px; white-space: nowrap;
+  font-size: 10.5px; padding: 2px 9px; border-radius: 999px;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+}
+.sched-chip b {
+  font-weight: 600; color: var(--muted); font-size: 9.5px;
+  text-transform: uppercase; letter-spacing: .08em;
+}
+.sched-chip-tint { border-color: var(--accent); color: var(--accent); }
+.sched-chip-dim { color: var(--muted); }
+.sched-zoom { display: flex; flex-wrap: wrap; gap: 5px; margin-bottom: 5px; }
+.sched-zoom button { font-size: 10.5px; padding: 2px 9px; flex: 0 0 auto; }
+.sched-zoom button.sched-on, .sched-rail button.sched-on {
+  background: var(--accent); color: #001018; border-color: var(--accent);
+  font-weight: 700;
+}
+.sched-list { display: flex; flex-direction: column; gap: 5px; }
+.sched-tile {
+  display: flex; align-items: center; gap: 7px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--panel2); padding: 5px 7px; min-width: 0;
+}
+.sched-tile.sched-off { opacity: .48; }
+.sched-tile.sched-live {
+  border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent);
+}
+.sched-tile.sched-dragging { opacity: .35; }
+.sched-tile.sched-over { border-color: var(--accent); border-style: dashed; }
+.sched-grip {
+  flex: 0 0 auto; cursor: grab; color: var(--muted); font-size: 14px;
+  line-height: 1; padding: 0 2px; user-select: none; touch-action: none;
+}
+.sched-grip:hover { color: var(--accent); }
+.sched-grip:active { cursor: grabbing; }
+.sched-icon { flex: 0 0 auto; font-size: 15px; line-height: 1; }
+.sched-mid {
+  flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 3px;
+}
+.sched-row1, .sched-row2 {
+  display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-width: 0;
+}
+.sched-tile input, .sched-tile select {
+  padding: 2px 6px; font-size: 11px; border-radius: 6px; width: auto;
+}
+.sched-label { flex: 1 1 110px; min-width: 0; }
+.sched-kind { flex: 0 1 132px; min-width: 0; }
+.sched-mins { flex: 0 0 56px; text-align: right; }
+.sched-unit, .sched-when { font-size: 10px; color: var(--muted); flex: 0 0 auto; }
+.sched-when { font-variant-numeric: tabular-nums; }
+.sched-air {
+  font-size: 9.5px; letter-spacing: .09em; color: var(--accent);
+  font-weight: 700; flex: 0 0 auto; font-variant-numeric: tabular-nums;
+}
+.sched-rail { flex: 0 0 auto; display: flex; gap: 2px; align-items: center; }
+.sched-mini { font-size: 10px; padding: 2px 6px; line-height: 1.15; width: auto; }
+.sched-hours { display: flex; flex-direction: column; gap: 4px; }
+.sched-hrow {
+  display: flex; align-items: center; gap: 7px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm);
+  background: var(--panel2); padding: 3px 7px; min-width: 0;
+}
+.sched-hrow.sched-live { border-color: var(--accent); }
+.sched-htime {
+  flex: 0 0 46px; font-size: 11px; color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.sched-hrow select {
+  width: auto; flex: 1; min-width: 0; font-size: 11px; padding: 3px 7px;
+  border-radius: 6px;
+}
+.sched-htag {
+  flex: 0 0 auto; font-size: 9.5px; letter-spacing: .1em;
+  text-transform: uppercase; color: var(--accent); font-weight: 700;
+}
+.sched-cal {
+  display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 3px;
+}
+.sched-cal-h {
+  font-size: 9.5px; letter-spacing: .08em; text-transform: uppercase;
+  color: var(--muted); text-align: center; padding-bottom: 2px;
+}
+.sched-cal-x { min-height: 8px; }
+.sched-cal-c {
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--panel2); padding: 3px; min-width: 0;
+}
+.sched-cal-c.sched-live { border-color: var(--accent); }
+.sched-cal-n { font-size: 10px; color: var(--muted); line-height: 1.25; }
+.sched-cal-c select {
+  width: 100%; font-size: 9.5px; padding: 1px 3px; border-radius: 5px;
+}
+/* Narrow windows: the calendar stops pretending to be a week grid. */
+@media (max-width: 640px) {
+  .sched-cal { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .sched-cal-h, .sched-cal-x { display: none; }
+}
 .hp-bars { display: flex; flex-direction: column; gap: 7px; margin-top: 6px; }
 .hp-bar { font-size: 11px; color: var(--muted); }
 .hp-bar .track {
@@ -50283,12 +51993,28 @@ speaker and restart the agent."
     <!-- #836: the store room. Every folder the station saves
          into, what it holds, how big it has got, and a
          ceiling per area on a slider. -->
+    <!-- #900: the recording room. Who has been in, what they said,
+         what it cost, and how much the shelf is saving. -->
+    <button id="roomBtn" class="pine-restart"
+            title="The recording room - every take, who made it, what the
+engine charged for it, and how much work the pantry is saving"
+            onclick="roomPanel(this)"
+            style="font-size:15px;line-height:1">🎙</button>
     <button id="storeRoomBtn" class="pine-restart"
             title="The store room — every place the station saves
 to: broadcasts, ads, spoken spots, clips, samples, gallery. Look
 inside, play or save anything, read the transcripts, cap each area."
             onclick="storagePanel(this)"
             style="font-size:15px;line-height:1">🗄</button>
+    <!-- #843: the DJ scheduler. How the hour flows — every entry
+         in the order it airs, what is on air right now, and the same
+         window pulled back to 6h, 12h, a day, a month. -->
+    <button id="schedBtn" class="pine-restart"
+            title="The DJ scheduler — how the hour flows. Every entry in
+order: drag to reorder, switch one out of the hour, edit its minutes and
+its system prompt. Pull back to 6 hours, 12, a day, or a month."
+            onclick="schedulePanel(this)"
+            style="font-size:15px;line-height:1">🗓</button>
     <button id="cloudHeadBtn" class="pine-restart"
             title="Word cloud — closed, half, full"
             onclick="cloudCycle()"
@@ -69395,6 +71121,1195 @@ function storagePanel(anchor) {
     try { setStatus("the store room would not open: " + e.message, true); }
     catch (ignored) { /* never let this blank the panel */ }
   }
+}
+
+
+/* --------------------------------------------------------------------------
+ * #843: THE DJ SCHEDULER — "an hour at a glance".
+ *
+ * "a popup of a schedule for how the hour flows ... see all the entries
+ *  scheduled for an hour ... slide and reorder tiles and enable and disable
+ *  tiles ... see at the top if I have crystal tinting everything and the
+ *  sliders for speakerbox appending."
+ *
+ * The hour is the unit the station actually runs on, so the hour is the
+ * default view: the entries as tiles in the order they air, with the one on
+ * air right now lit and counting. Above the tiles sits the context you can
+ * NOT change from here — which crystal is tinting the talk, and the four
+ * speakbox rates — read-only chips, because an hour read without them is an
+ * hour read wrong.
+ *
+ * Pull back and the same window becomes 6 hours, 12, a day, a month: which
+ * running order runs when. One popup, five focal lengths.
+ *
+ * Every call is wrapped. If the scheduler half of the server is not deployed
+ * the window says so and stays a window — it must never throw and blank the
+ * page behind it.
+ * ----------------------------------------------------------------------- */
+
+const SCHED_ICONS = [
+  [/music|song|track|record|tune|set|mix/, "\ud83c\udfb5"],
+  [/ad|sponsor|spot|promo|commercial/, "\ud83d\udce3"],
+  [/news|headline|bulletin/, "\ud83d\udcf0"],
+  [/weather|forecast/, "\ud83c\udf26"],
+  [/call|phone|listener/, "\ud83d\udcde"],
+  [/request|mail|inbox/, "\ud83d\udce8"],
+  [/sting|sfx|jingle|drop|effect/, "\ud83d\udd14"],
+  [/ident|station|top.?of|legal/, "\ud83d\udcfb"],
+  [/crystal|tint/, "\ud83d\udd2e"],
+  [/story|plot|serial|drama/, "\ud83d\udcd6"],
+  [/quip|banter|chat|talk|host|dj|manager/, "\ud83c\udf99"],
+  [/break|silence|rest|dead/, "\u23f8"]
+];
+
+function schedIcon(kind) {
+  try {
+    const k = String(kind || "").toLowerCase();
+    for (let i = 0; i < SCHED_ICONS.length; i++) {
+      if (SCHED_ICONS[i][0].test(k)) return SCHED_ICONS[i][1];
+    }
+  } catch (ignored) { /* an icon is never worth an exception */ }
+  return "\ud83c\udf9a";
+}
+
+function schedPad(v) { return (Number(v) < 10 ? "0" : "") + Number(v); }
+
+/* Where in the hour something falls: ":05", and "1h05" once it runs over. */
+function schedClock(mins) {
+  const m = Math.max(0, Math.round(Number(mins) || 0));
+  if (m < 60) return ":" + schedPad(m);
+  return Math.floor(m / 60) + "h" + schedPad(m % 60);
+}
+
+/* The speakbox rates arrive as 0..1. Some day one may arrive as 0..100 —
+   read both rather than print "8200%". */
+function schedPct(v) {
+  if (v === null || v === undefined || v === "" || isNaN(Number(v))) {
+    return "\u2014";
+  }
+  const x = Number(v);
+  return Math.round(x <= 1 ? x * 100 : x) + "%";
+}
+
+function schedNotThere(e) {
+  return /not found|404/i.test(String((e && e.message) || e || ""));
+}
+
+function schedulePanel(anchor) {
+  try {
+    const gone = document.getElementById("schedulePanel");
+    if (gone) { gone.remove(); return; }
+    const pop = el("div", "panel", "");
+    pop.id = "schedulePanel";
+    const at = (anchor && anchor.getBoundingClientRect)
+      ? anchor.getBoundingClientRect() : {left: 60, bottom: 54};
+    pop.style.cssText = "position:fixed;z-index:221;width:min(780px,96vw);"
+      + "padding:10px 12px;margin:0;max-height:86vh;overflow:auto;"
+      + "left:" + Math.max(8, Math.min(window.innerWidth - 790, at.left - 390))
+      + "px;top:" + ((at.bottom || 54) + 6) + "px";
+    pop.onclick = (e) => e.stopPropagation();
+
+    let data = {};        // the last /api/schedule payload
+    let slots = [];       // the working copy the tiles edit and POST back
+    let kinds = [];       // [{kind, label, blurb}]
+    let month = {};       // {"YYYY-MM-DD": preset} for the month on screen
+    let monthAt = new Date();
+    let zoom = "hour";
+    let dragFrom = null;
+    let lastAir = "";
+    let ticker = 0;
+    let poller = 0;
+
+    const stop = () => { clearInterval(ticker); clearTimeout(poller); };
+
+    /* ---- chrome ---------------------------------------------------- */
+    const head = el("div", "row", "");
+    head.style.cssText = "gap:6px;align-items:center;margin-bottom:4px";
+    const title = el("div", "", "\ud83d\uddd3 The hour, at a glance");
+    title.style.cssText = "font-weight:700;font-size:12px;flex:1;min-width:0";
+    const again = el("button", "", "\u21bb");
+    again.title = "Read the schedule again";
+    again.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
+    again.onclick = () => load(false);
+    const shut = el("button", "", "\u2715");
+    shut.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
+    shut.onclick = () => {
+      stop();
+      const kid = document.getElementById("schedPromptPanel");
+      if (kid) kid.remove();
+      pop.remove();
+    };
+    head.appendChild(title); head.appendChild(again); head.appendChild(shut);
+    pop.appendChild(head);
+
+    const strip = el("div", "sched-strip", "");
+    pop.appendChild(strip);
+    const zoomRow = el("div", "sched-zoom", "");
+    pop.appendChild(zoomRow);
+    const note = el("div", "muted", "reading the schedule\u2026");
+    note.style.cssText = "font-size:10.5px;line-height:1.45;margin:4px 0";
+    pop.appendChild(note);
+    const body = el("div", "", "");
+    pop.appendChild(body);
+    document.body.appendChild(pop);
+
+    const say = (text, bad) => {
+      note.textContent = text || "";
+      note.style.color = bad ? "var(--danger)" : "";
+    };
+
+    /* ---- the read -------------------------------------------------- */
+    async function load(quiet) {
+      if (!quiet) say("reading the schedule\u2026");
+      try {
+        const d = await api("/api/schedule");
+        data = d || {};
+        slots = (Array.isArray(data.slots) ? data.slots : []).map((s) => ({
+          id: String((s && s.id) || ""),
+          kind: String((s && s.kind) || ""),
+          label: String((s && s.label) || ""),
+          enabled: !(s && s.enabled === false),
+          minutes: Number((s && s.minutes) || 0),
+          prompt_id: (s && s.prompt_id) ? String(s.prompt_id) : "",
+          notes: String((s && s.notes) || "")
+        }));
+        kinds = Array.isArray(data.kinds) ? data.kinds : [];
+        if (!kinds.length) {
+          try { kinds = (await api("/api/schedule/kinds")) || []; }
+          catch (ignored) { kinds = []; }
+        }
+        kinds = (Array.isArray(kinds) ? kinds : []).map((k) => (
+          (typeof k === "string")
+            ? {kind: k, label: k, blurb: ""}
+            : {kind: String((k && k.kind) || ""),
+               label: String((k && (k.label || k.kind)) || ""),
+               blurb: String((k && k.blurb) || "")}
+        )).filter((k) => k.kind);
+        if (!kinds.length) {
+          const seen = {};
+          slots.forEach((s) => { if (s.kind) seen[s.kind] = 1; });
+          kinds = Object.keys(seen).map(
+            (k) => ({kind: k, label: k, blurb: ""}));
+        }
+        lastAir = String((data.now && data.now.slot_id) || "");
+        say("");
+        paintStrip(); paintZoom(); paintBody(); tick();
+      } catch (e) {
+        strip.textContent = ""; zoomRow.textContent = ""; body.textContent = "";
+        strip.style.display = "none";   // no empty bar over the apology
+        if (schedNotThere(e)) {
+          say("the scheduler is not available yet \u2014 this half of the "
+            + "station has not been deployed. Press \u21bb when it is.", true);
+        } else {
+          say(String((e && e.message) || e), true);
+        }
+      }
+    }
+
+    /* ---- the strip: the running order, the tint, the speakbox ------- */
+    function paintStrip() {
+      strip.textContent = "";
+      strip.style.display = "";
+      const presets = (Array.isArray(data.presets) ? data.presets : [])
+        .map((x) => String(x));
+      const live = String(data.active || presets[0] || "");
+      if (live && presets.indexOf(live) < 0) presets.unshift(live);
+
+      const line = el("div", "sched-strip-row", "");
+      line.appendChild(el("span", "sched-lab", "running order"));
+      const pick = el("select", "", "");
+      presets.forEach((name) => {
+        const o = el("option", "", name);
+        o.value = name;
+        if (name === live) o.selected = true;
+        pick.appendChild(o);
+      });
+      if (!presets.length) {
+        const o = el("option", "", "\u2014 none stored \u2014");
+        o.value = ""; pick.appendChild(o);
+      }
+      pick.title = "Which running order is on the air. Switch it and the "
+        + "hour changes under the next entry.";
+      pick.style.cssText = "flex:1 1 140px;min-width:0;font-size:11px;"
+        + "padding:3px 6px;width:auto";
+      pick.onchange = async () => {
+        try {
+          await api("/api/schedule/activate",
+            {method: "POST", body: JSON.stringify({name: pick.value})});
+          await load(true);
+          say("\u201c" + pick.value + "\u201d is on the air.");
+        } catch (e) { say(String((e && e.message) || e), true); paintStrip(); }
+      };
+      line.appendChild(pick);
+
+      const mk = (label, hint, fn) => {
+        const b = el("button", "", label);
+        b.title = hint;
+        b.style.cssText = "font-size:10.5px;padding:2px 8px;flex:0 0 auto";
+        b.onclick = fn;
+        line.appendChild(b);
+      };
+      mk("+ New", "Start a running order from nothing", async () => {
+        const name = (window.prompt("Name the new running order", "") || "")
+          .trim();
+        if (!name) return;
+        try {
+          await api("/api/schedule/preset", {method: "POST",
+            body: JSON.stringify({name: name, copy_from: null})});
+          await load(true);
+          say("\u201c" + name + "\u201d is on the shelf.");
+        } catch (e) { say(String((e && e.message) || e), true); }
+      });
+      mk("\u29c9 Duplicate", "Copy this running order into a new one you can "
+        + "change without touching the air", async () => {
+        if (!live) return;
+        const name = (window.prompt("Name the copy", live + " copy") || "")
+          .trim();
+        if (!name) return;
+        try {
+          await api("/api/schedule/preset", {method: "POST",
+            body: JSON.stringify({name: name, copy_from: live})});
+          await load(true);
+          say("\u201c" + name + "\u201d copied off \u201c" + live + "\u201d.");
+        } catch (e) { say(String((e && e.message) || e), true); }
+      });
+      mk("\ud83d\uddd1 Delete", "Throw this running order away", async () => {
+        if (!live) return;
+        if (!window.confirm("Throw away the running order \u201c" + live
+            + "\u201d?")) return;
+        try {
+          await api("/api/schedule/preset/" + encodeURIComponent(live),
+            {method: "DELETE"});
+          await load(true);
+        } catch (e) { say(String((e && e.message) || e), true); }
+      });
+      strip.appendChild(line);
+
+      const second = el("div", "sched-strip-row", "");
+      const tint = data.tinting || {};
+      const tchip = el("span", "sched-chip sched-chip-tint", "");
+      if (tint.crystal) {
+        tchip.textContent = "\ud83d\udd2e " + String(tint.crystal)
+          + " tinting everything at "
+          + (tint.strength === null || tint.strength === undefined
+             ? "\u2014" : Math.round(Number(tint.strength)) + "%");
+        tchip.title = "A crystal is colouring every word the station says. "
+          + "Every entry below speaks through it.";
+      } else {
+        tchip.textContent = "\ud83d\udd2e no crystal on the air";
+        tchip.className = "sched-chip sched-chip-dim";
+        tchip.title = "Nothing is tinting the talk right now.";
+      }
+      second.appendChild(tchip);
+
+      const sb = data.speakbox || {};
+      [["rate", "rate", "how much of the talk comes out of the speakbox"],
+       ["prepend", "prepend", "how often a swath opens the turn"],
+       ["append", "append", "how often a swath closes the turn"],
+       ["full swath", "full_swath",
+        "how often a whole uninterrupted swath runs"]
+      ].forEach((row) => {
+        const c = el("span", "sched-chip", "");
+        c.appendChild(el("b", "", row[0]));
+        c.appendChild(document.createTextNode(schedPct(sb[row[1]])));
+        c.title = "speakbox " + row[0] + " \u2014 " + row[2]
+          + ". Set on the DJ desk; shown here so the hour reads in context.";
+        second.appendChild(c);
+      });
+      strip.appendChild(second);
+    }
+
+    /* ---- the focal length ------------------------------------------ */
+    function paintZoom() {
+      zoomRow.textContent = "";
+      [["hour", "Hour", "The entries in this hour, in order"],
+       ["6h", "6h", "The next six hours and what runs in each"],
+       ["12h", "12h", "The next twelve hours and what runs in each"],
+       ["day", "Day", "Midnight to midnight"],
+       ["month", "Month", "A month of days, auto-populated from the defaults"]
+      ].forEach((z) => {
+        const b = el("button", z[0] === zoom ? "sched-on" : "", z[1]);
+        b.title = z[2];
+        b.onclick = () => { zoom = z[0]; paintZoom(); paintBody(); };
+        zoomRow.appendChild(b);
+      });
+    }
+
+    function paintBody() {
+      try {
+        body.textContent = "";
+        if (zoom === "hour") paintHour();
+        else if (zoom === "month") paintMonth();
+        else paintHours(zoom === "6h" ? 6 : (zoom === "12h" ? 12 : 24));
+      } catch (e) { say(String((e && e.message) || e), true); }
+    }
+
+    /* ---- the hour --------------------------------------------------- */
+
+    /* Where each entry falls in the hour. An entry that is switched off
+       costs the hour nothing, so the clock closes over it. */
+    function schedRuns() {
+      let acc = 0;
+      return slots.map((s) => {
+        const from = acc;
+        if (s.enabled) acc += Math.max(0, Number(s.minutes) || 0);
+        return {at: from, end: acc};
+      });
+    }
+
+    function clockText(s, run) {
+      if (!run) return "";
+      if (!s.enabled) return "\u2014 out of the hour";
+      return schedClock(run.at) + " \u2192 " + schedClock(run.end);
+    }
+
+    function totalText(runs) {
+      const total = runs.length ? runs[runs.length - 1].end : 0;
+      const on = slots.filter((s) => s.enabled).length;
+      let tail = "fills the hour exactly.";
+      if (total < 60) tail = (60 - total) + " min short of the hour.";
+      if (total > 60) tail = (total - 60) + " min over the hour.";
+      return on + " of " + slots.length + " on the air \u00b7 " + total
+        + " min \u00b7 " + tail;
+    }
+
+    /* Minutes changed: redo the arithmetic in place rather than repaint,
+       so the field the owner is typing in keeps the caret. */
+    function repaintClocks() {
+      const runs = schedRuns();
+      Array.prototype.forEach.call(
+        body.querySelectorAll(".sched-tile"), (node, i) => {
+          const w = node.querySelector(".sched-when");
+          if (w && slots[i]) w.textContent = clockText(slots[i], runs[i]);
+        });
+      const tot = body.querySelector(".sched-total");
+      if (tot) tot.textContent = totalText(runs);
+    }
+
+    function paintHour() {
+      if (!slots.length) {
+        const none = el("div", "muted",
+          "Nothing in this hour yet \u2014 add the first entry below.");
+        none.style.cssText = "font-size:10.5px;padding:6px 0";
+        body.appendChild(none);
+      }
+      const runs = schedRuns();
+      const list = el("div", "sched-list", "");
+      slots.forEach((s, i) => list.appendChild(tile(s, i, runs[i])));
+      body.appendChild(list);
+      body.appendChild(adder());
+      const foot = el("div", "sched-total muted", totalText(runs));
+      foot.style.cssText = "font-size:10.5px;margin-top:6px";
+      body.appendChild(foot);
+      const hint = el("div", "muted", "Drag \u283f to slide an entry up or "
+        + "down the hour \u2014 the whole order saves the moment it lands.");
+      hint.style.cssText = "font-size:10px;margin-top:3px;opacity:.7";
+      body.appendChild(hint);
+    }
+
+    function tile(s, i, run) {
+      const t = el("div", "sched-tile", "");
+      if (!s.enabled) t.classList.add("sched-off");
+      const onAir = !!(s.id && data.now
+        && String(data.now.slot_id || "") === s.id);
+      if (onAir) t.classList.add("sched-live");
+      if (s.notes) t.title = s.notes;
+
+      /* The tile only becomes draggable while the grip is held, so every
+         input inside it stays selectable the rest of the time. */
+      const grip = el("div", "sched-grip", "\u283f");
+      grip.title = "Drag to move this entry up or down the hour";
+      grip.onmousedown = () => { t.draggable = true; };
+      grip.ontouchstart = () => { t.draggable = true; };
+      t.ondragstart = (ev) => {
+        dragFrom = i;
+        t.classList.add("sched-dragging");
+        try {
+          ev.dataTransfer.effectAllowed = "move";
+          ev.dataTransfer.setData("text/plain", String(i));
+        } catch (ignored) { /* some engines refuse the payload */ }
+      };
+      t.ondragend = () => {
+        t.draggable = false;
+        t.classList.remove("sched-dragging");
+        Array.prototype.forEach.call(body.querySelectorAll(".sched-over"),
+          (nd) => nd.classList.remove("sched-over"));
+      };
+      t.ondragover = (ev) => {
+        if (dragFrom === null || dragFrom === i) return;
+        ev.preventDefault();
+        try { ev.dataTransfer.dropEffect = "move"; } catch (ignored) {}
+        t.classList.add("sched-over");
+      };
+      t.ondragleave = () => t.classList.remove("sched-over");
+      t.ondrop = (ev) => {
+        ev.preventDefault();
+        t.classList.remove("sched-over");
+        const from = dragFrom;
+        dragFrom = null;
+        moveSlot(from, i);
+      };
+      t.appendChild(grip);
+
+      const icon = el("div", "sched-icon", schedIcon(s.kind));
+      icon.title = s.kind || "";
+      t.appendChild(icon);
+
+      const mid = el("div", "sched-mid", "");
+      const row1 = el("div", "sched-row1", "");
+      const lab = el("input", "sched-label", "");
+      lab.value = s.label || "";
+      lab.placeholder = "name this entry";
+      lab.title = "What this entry is called on the running order";
+      lab.onchange = () => { s.label = lab.value.trim(); saveSlots(false); };
+      row1.appendChild(lab);
+
+      const kindPick = el("select", "sched-kind", "");
+      const known = kinds.slice();
+      if (s.kind && !known.some((k) => k.kind === s.kind)) {
+        known.unshift({kind: s.kind, label: s.kind, blurb: ""});
+      }
+      if (!known.length) known.push({kind: "", label: "\u2014", blurb: ""});
+      known.forEach((k) => {
+        const o = el("option", "", k.label || k.kind);
+        o.value = k.kind;
+        if (k.blurb) o.title = k.blurb;
+        if (k.kind === s.kind) o.selected = true;
+        kindPick.appendChild(o);
+      });
+      kindPick.title = "What kind of thing this entry is";
+      kindPick.onchange = () => {
+        s.kind = kindPick.value;
+        icon.textContent = schedIcon(s.kind);
+        icon.title = s.kind;
+        saveSlots(false);
+      };
+      row1.appendChild(kindPick);
+      mid.appendChild(row1);
+
+      const row2 = el("div", "sched-row2", "");
+      const mins = el("input", "sched-mins", "");
+      mins.type = "number"; mins.min = "0"; mins.max = "600"; mins.step = "1";
+      mins.value = String(Number(s.minutes) || 0);
+      mins.title = "How many minutes of the hour this entry takes";
+      mins.onchange = () => {
+        s.minutes = Math.max(0, Math.min(600, Number(mins.value) || 0));
+        mins.value = String(s.minutes);
+        repaintClocks();
+        saveSlots(false);
+      };
+      row2.appendChild(mins);
+      row2.appendChild(el("span", "sched-unit", "min"));
+      const when = el("span", "sched-when", clockText(s, run));
+      when.title = "Where this lands in the hour";
+      row2.appendChild(when);
+      if (onAir) {
+        const air = el("span", "sched-air", "\u25cf ON AIR");
+        air.title = "This is what the station is doing right now";
+        row2.appendChild(air);
+      }
+      mid.appendChild(row2);
+      t.appendChild(mid);
+
+      const rail = el("div", "sched-rail", "");
+      const up = el("button", "sched-mini", "\u25b2");
+      up.title = "Move this entry earlier in the hour";
+      up.disabled = (i === 0);
+      up.onclick = () => moveSlot(i, i - 1);
+      const down = el("button", "sched-mini", "\u25bc");
+      down.title = "Move this entry later in the hour";
+      down.disabled = (i === slots.length - 1);
+      down.onclick = () => moveSlot(i, i + 1);
+      const onoff = el("button",
+        "sched-mini" + (s.enabled ? " sched-on" : ""), s.enabled ? "on" : "off");
+      onoff.title = s.enabled
+        ? "On the air \u2014 click to take it out of the hour"
+        : "Out of the hour \u2014 click to put it back on";
+      onoff.onclick = () => {
+        s.enabled = !s.enabled;
+        paintBody();
+        saveSlots(false);
+      };
+      const gear = el("button", "sched-mini", "\u2699");
+      gear.title = "The system prompt this entry speaks from";
+      gear.onclick = (ev) => { ev.stopPropagation(); promptPanel(s, gear); };
+      const bin = el("button", "sched-mini", "\u2715");
+      bin.title = "Take this entry off the running order for good";
+      bin.onclick = () => {
+        if (!window.confirm("Drop \u201c" + (s.label || s.kind || "this entry")
+            + "\u201d out of the hour?")) return;
+        slots.splice(i, 1);
+        paintBody();
+        saveSlots(true);
+      };
+      [up, down, onoff, gear, bin].forEach((b) => rail.appendChild(b));
+      t.appendChild(rail);
+      return t;
+    }
+
+    function adder() {
+      const row = el("div", "row", "");
+      row.style.cssText = "gap:6px;margin-top:8px;align-items:center";
+      const pick = el("select", "", "");
+      const choices = kinds.length ? kinds
+        : [{kind: "talk", label: "talk", blurb: ""}];
+      choices.forEach((k) => {
+        const o = el("option", "", k.label || k.kind);
+        o.value = k.kind;
+        if (k.blurb) o.title = k.blurb;
+        pick.appendChild(o);
+      });
+      pick.style.cssText = "flex:1 1 170px;min-width:0;font-size:11px;"
+        + "padding:3px 6px;width:auto";
+      pick.title = "What to put into the hour";
+      const add = el("button", "primary", "+ Add to the hour");
+      add.style.cssText = "font-size:10.5px;padding:3px 11px;flex:0 0 auto";
+      add.title = "Append a fresh entry at the end of the running order";
+      add.onclick = async () => {
+        const k = choices.filter((x) => x.kind === pick.value)[0]
+          || {kind: pick.value, label: pick.value};
+        slots.push({id: "", kind: k.kind, label: k.label || k.kind,
+                    enabled: true, minutes: 5, prompt_id: "", notes: ""});
+        paintBody();
+        await saveSlots(true);
+      };
+      row.appendChild(pick); row.appendChild(add);
+      return row;
+    }
+
+    /* Reorder in the array, repaint, then POST the WHOLE list — the server
+       holds the order, so the order is what gets sent, every time. */
+    function moveSlot(from, to) {
+      if (from === null || from === undefined) return;
+      if (to < 0 || to >= slots.length || to === from) return;
+      const moved = slots.splice(from, 1)[0];
+      slots.splice(to, 0, moved);
+      paintBody();
+      saveSlots(false);
+    }
+
+    async function saveSlots(reload) {
+      try {
+        await api("/api/schedule/slots", {method: "POST",
+          body: JSON.stringify({
+            preset: String(data.active || ""),
+            slots: slots.map((s) => ({
+              id: s.id || "", kind: s.kind || "", label: s.label || "",
+              enabled: !!s.enabled, minutes: Number(s.minutes) || 0,
+              prompt_id: s.prompt_id || "", notes: s.notes || ""
+            }))
+          })});
+        say("saved \u2014 " + slots.length + " entries in the running order.");
+        if (reload) await load(true);
+      } catch (e) {
+        say("that did not save: " + String((e && e.message) || e), true);
+        // Put the window back to what the server actually holds.
+        await load(true);
+      }
+    }
+
+    /* ---- 6h / 12h / a day: which running order runs in each hour ----- */
+    function paintHours(count) {
+      const presets = (Array.isArray(data.presets) ? data.presets : [])
+        .map((x) => String(x));
+      const day = Object.assign({}, data.day || {});
+      const nowH = new Date().getHours();
+      const first = (count >= 24) ? 0 : nowH;
+      const wrap = el("div", "sched-hours", "");
+      for (let step = 0; step < count; step++) {
+        const h = (first + step) % 24;
+        const row = el("div", "sched-hrow", "");
+        if (h === nowH) row.classList.add("sched-live");
+        row.appendChild(el("span", "sched-htime", schedPad(h) + ":00"));
+        const pick = el("select", "", "");
+        const here = String(day[String(h)] || data.active || "");
+        const opts = presets.slice();
+        if (here && opts.indexOf(here) < 0) opts.unshift(here);
+        if (!opts.length) opts.push("");
+        opts.forEach((name) => {
+          const o = el("option", "", name || "\u2014");
+          o.value = name;
+          if (name === here) o.selected = true;
+          pick.appendChild(o);
+        });
+        pick.title = "Which running order runs at " + schedPad(h) + ":00";
+        pick.onchange = async () => {
+          day[String(h)] = pick.value;
+          data.day = day;
+          try {
+            // The whole day goes back, so it reads the same whether the
+            // server merges the map or replaces it.
+            const hours = {};
+            for (let x = 0; x < 24; x++) {
+              hours[String(x)] = String(day[String(x)] || data.active || "");
+            }
+            await api("/api/schedule/day",
+              {method: "POST", body: JSON.stringify({hours: hours})});
+            say(schedPad(h) + ":00 runs \u201c" + pick.value + "\u201d now.");
+          } catch (e) { say(String((e && e.message) || e), true); }
+        };
+        row.appendChild(pick);
+        if (h === nowH) row.appendChild(el("span", "sched-htag", "now"));
+        wrap.appendChild(row);
+      }
+      body.appendChild(wrap);
+      const hint = el("div", "muted", count >= 24
+        ? "A whole day, midnight to midnight \u2014 every hour picks the "
+          + "running order it runs."
+        : "The next " + count + " hours from where the clock is now.");
+      hint.style.cssText = "font-size:10.5px;margin-top:6px";
+      body.appendChild(hint);
+    }
+
+    /* ---- the month -------------------------------------------------- */
+    function paintMonth() {
+      const host = el("div", "", "");
+      body.appendChild(host);
+      fillMonth(host);
+    }
+
+    function schedIso(d) {
+      return d.getFullYear() + "-" + schedPad(d.getMonth() + 1)
+        + "-" + schedPad(d.getDate());
+    }
+
+    async function fillMonth(host) {
+      host.textContent = "";
+      const nav = el("div", "row", "");
+      nav.style.cssText = "gap:6px;align-items:center;margin-bottom:5px";
+      const back = el("button", "", "\u2039");
+      const fwd = el("button", "", "\u203a");
+      back.title = "The month before";
+      fwd.title = "The month after";
+      [back, fwd].forEach((b) => {
+        b.style.cssText = "font-size:12px;padding:1px 10px;flex:0 0 auto";
+      });
+      const name = el("div", "", "");
+      try {
+        name.textContent = monthAt.toLocaleString(undefined,
+          {month: "long", year: "numeric"});
+      } catch (ignored) {
+        name.textContent = (monthAt.getMonth() + 1) + "/"
+          + monthAt.getFullYear();
+      }
+      name.style.cssText = "font-weight:700;font-size:11.5px;flex:1;"
+        + "min-width:0;text-align:center";
+      back.onclick = () => {
+        monthAt = new Date(monthAt.getFullYear(), monthAt.getMonth() - 1, 1);
+        fillMonth(host);
+      };
+      fwd.onclick = () => {
+        monthAt = new Date(monthAt.getFullYear(), monthAt.getMonth() + 1, 1);
+        fillMonth(host);
+      };
+      nav.appendChild(back); nav.appendChild(name); nav.appendChild(fwd);
+      host.appendChild(nav);
+
+      const y = monthAt.getFullYear();
+      const m = monthAt.getMonth();
+      const firstDay = new Date(y, m, 1);
+      const days = new Date(y, m + 1, 0).getDate();
+      const waiting = el("div", "muted", "reading the month\u2026");
+      waiting.style.cssText = "font-size:10.5px";
+      host.appendChild(waiting);
+      try {
+        const d = await api("/api/schedule/month?from=" + schedIso(firstDay)
+          + "&days=" + days);
+        month = (d && d.days && typeof d.days === "object")
+          ? d.days : ((d && typeof d === "object") ? d : {});
+      } catch (e) {
+        waiting.textContent = schedNotThere(e)
+          ? "the scheduler is not available yet."
+          : String((e && e.message) || e);
+        waiting.style.color = "var(--danger)";
+        return;
+      }
+      waiting.remove();
+
+      const grid = el("div", "sched-cal", "");
+      ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"].forEach((w) => {
+        grid.appendChild(el("div", "sched-cal-h", w));
+      });
+      const lead = (firstDay.getDay() + 6) % 7;   // the week starts Monday
+      for (let b = 0; b < lead; b++) {
+        grid.appendChild(el("div", "sched-cal-x", ""));
+      }
+      const presets = (Array.isArray(data.presets) ? data.presets : [])
+        .map((x) => String(x));
+      const today = schedIso(new Date());
+      for (let dn = 1; dn <= days; dn++) {
+        const date = schedIso(new Date(y, m, dn));
+        const cell = el("div", "sched-cal-c", "");
+        if (date === today) cell.classList.add("sched-live");
+        cell.appendChild(el("div", "sched-cal-n", String(dn)));
+        const pick = el("select", "", "");
+        const here = String(month[date] || data.active || "");
+        const opts = presets.slice();
+        if (here && opts.indexOf(here) < 0) opts.unshift(here);
+        if (!opts.length) opts.push("");
+        opts.forEach((nm) => {
+          const o = el("option", "", nm || "\u2014");
+          o.value = nm;
+          if (nm === here) o.selected = true;
+          pick.appendChild(o);
+        });
+        pick.title = date + " \u2014 which running order the day takes";
+        pick.onchange = async () => {
+          month[date] = pick.value;
+          try {
+            await api("/api/schedule/month", {method: "POST",
+              body: JSON.stringify({days: month})});
+            say(date + " runs \u201c" + pick.value + "\u201d.");
+          } catch (e) { say(String((e && e.message) || e), true); }
+        };
+        cell.appendChild(pick);
+        grid.appendChild(cell);
+      }
+      host.appendChild(grid);
+      const hint = el("div", "muted", "Every day comes up already filled in "
+        + "from the defaults \u2014 change only the ones that are different.");
+      hint.style.cssText = "font-size:10.5px;margin-top:6px";
+      host.appendChild(hint);
+    }
+
+    /* ---- the system prompt behind one kind of entry ------------------ */
+    function promptPanel(slot, at2) {
+      try {
+        const old = document.getElementById("schedPromptPanel");
+        if (old) old.remove();
+        const kind = String(slot.kind || "");
+        const pop2 = el("div", "panel", "");
+        pop2.id = "schedPromptPanel";
+        const r = (at2 && at2.getBoundingClientRect)
+          ? at2.getBoundingClientRect() : {left: 90, bottom: 100};
+        pop2.style.cssText = "position:fixed;z-index:222;"
+          + "width:min(520px,94vw);padding:10px 12px;margin:0;max-height:80vh;"
+          + "overflow:auto;left:"
+          + Math.max(8, Math.min(window.innerWidth - 530, r.left - 430))
+          + "px;top:" + ((r.bottom || 100) + 6) + "px";
+        pop2.onclick = (e) => e.stopPropagation();
+
+        const h2 = el("div", "row", "");
+        h2.style.cssText = "gap:6px;align-items:center;margin-bottom:3px";
+        const t2 = el("div", "", "\u2699 " + (slot.label || kind || "entry")
+          + " \u2014 what it speaks from");
+        t2.style.cssText = "font-weight:700;font-size:12px;flex:1;min-width:0";
+        const x2 = el("button", "", "\u2715");
+        x2.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
+        x2.onclick = () => pop2.remove();
+        h2.appendChild(t2); h2.appendChild(x2);
+        pop2.appendChild(h2);
+
+        const blurb = (kinds.filter((k) => k.kind === kind)[0] || {}).blurb;
+        const noteNode = el("div", "muted",
+          blurb || "reading the prompts\u2026");
+        noteNode.style.cssText = "font-size:10.5px;line-height:1.45;"
+          + "margin-bottom:5px";
+        pop2.appendChild(noteNode);
+        const say2 = (m, bad) => {
+          noteNode.textContent = m || "";
+          noteNode.style.color = bad ? "var(--danger)" : "";
+        };
+        const wrap2 = el("div", "", "");
+        pop2.appendChild(wrap2);
+        document.body.appendChild(pop2);
+
+        let book = null;
+        let sel = -1;   // until the owner picks: whichever is starred
+
+        function entry() {
+          if (!book || typeof book !== "object") book = {};
+          if (!book[kind] || typeof book[kind] !== "object") {
+            book[kind] = {active: 0, variants: []};
+          }
+          if (!Array.isArray(book[kind].variants)) book[kind].variants = [];
+          return book[kind];
+        }
+
+        async function pull() {
+          try {
+            book = (await api("/api/schedule/prompts")) || {};
+            draw();
+          } catch (e) {
+            say2(schedNotThere(e)
+              ? "the scheduler is not available yet."
+              : String((e && e.message) || e), true);
+          }
+        }
+
+        async function push(msg) {
+          try {
+            const b = entry();
+            const out = {};
+            out[kind] = {
+              active: Math.max(0, Number(b.active) || 0),
+              variants: b.variants.map((v) => ({
+                id: String((v && v.id) || ""),
+                name: String((v && v.name) || ""),
+                text: String((v && v.text) || "")
+              }))
+            };
+            const backed = await api("/api/schedule/prompts",
+              {method: "POST", body: JSON.stringify(out)});
+            if (backed && backed[kind]
+                && Array.isArray(backed[kind].variants)) {
+              book = backed;
+            } else {
+              book[kind] = out[kind];
+            }
+            draw();
+            say2(msg || "saved.");
+          } catch (e) { say2(String((e && e.message) || e), true); }
+        }
+
+        function draw() {
+          wrap2.textContent = "";
+          const b = entry();
+          if (!b.variants.length) {
+            // Nothing stored for this kind yet: give the owner a blank to
+            // write into. Saving it is what creates the first variant.
+            b.variants = [{id: "default", name: "Default", text: ""}];
+            b.active = 0;
+          }
+          const star = Math.max(0,
+            Math.min(b.variants.length - 1, Number(b.active) || 0));
+          // Opening the editor shows what the hour is ACTUALLY speaking.
+          if (sel < 0 || sel >= b.variants.length) sel = star;
+
+          const pickRow = el("div", "row", "");
+          pickRow.style.cssText = "gap:6px;align-items:center;margin-bottom:5px";
+          pickRow.appendChild(el("span", "sched-lab", "variant"));
+          const pick = el("select", "", "");
+          b.variants.forEach((v, i) => {
+            const o = el("option", "", (i === star ? "\u2605 " : "")
+              + (v.name || ("variant " + (i + 1))));
+            o.value = String(i);
+            if (i === sel) o.selected = true;
+            pick.appendChild(o);
+          });
+          pick.title = "Every wording stored for a \u201c" + (kind || "?")
+            + "\u201d \u2014 cycle them here";
+          pick.style.cssText = "flex:1;min-width:0;font-size:11px;"
+            + "padding:3px 6px;width:auto";
+          pick.onchange = () => { sel = Number(pick.value) || 0; draw(); };
+          pickRow.appendChild(pick);
+          const use = el("button", "", "\u2605 Use this one");
+          use.style.cssText = "font-size:10.5px;padding:2px 8px;flex:0 0 auto";
+          use.title = "Make this the wording every \u201c" + (kind || "?")
+            + "\u201d in the hour speaks from";
+          use.disabled = (sel === star);
+          use.onclick = () => {
+            b.active = sel;
+            push("\u201c" + (b.variants[sel].name || "that one")
+              + "\u201d is the one now.");
+          };
+          pickRow.appendChild(use);
+          wrap2.appendChild(pickRow);
+
+          const ta = el("textarea", "", "");
+          ta.value = String(b.variants[sel].text || "");
+          ta.placeholder = "What this entry is told before it speaks\u2026";
+          ta.style.cssText = "min-height:150px;font-size:11.5px;"
+            + "line-height:1.5;padding:8px";
+          wrap2.appendChild(ta);
+
+          const acts = el("div", "row", "");
+          acts.style.cssText = "gap:6px;margin-top:6px";
+          const mk2 = (label, hint, fn) => {
+            const bt = el("button", "", label);
+            bt.title = hint;
+            bt.style.cssText = "font-size:10.5px;padding:3px 8px;flex:0 0 auto";
+            bt.onclick = fn;
+            acts.appendChild(bt);
+            return bt;
+          };
+          mk2("\ud83d\udcbe Save", "Keep this wording on this variant", () => {
+            b.variants[sel].text = ta.value;
+            push("saved.");
+          });
+          mk2("+ Save as new", "Leave the old wording where it is and store "
+            + "this as another variant you can flip between", () => {
+            const nm = (window.prompt("Name this variant",
+              (b.variants[sel].name || "variant") + " 2") || "").trim();
+            if (!nm) return;
+            b.variants.push({id: "", name: nm, text: ta.value});
+            sel = b.variants.length - 1;
+            push("\u201c" + nm + "\u201d stored.");
+          });
+          mk2("\u270e Rename", "Rename this variant", () => {
+            const nm = (window.prompt("Rename this variant",
+              b.variants[sel].name || "") || "").trim();
+            if (!nm) return;
+            b.variants[sel].name = nm;
+            push("renamed.");
+          });
+          mk2("\u21ba Revert to default", "Take the station's default wording "
+            + "back for this kind \u2014 your other variants stay on the "
+            + "shelf", async () => {
+            let home = -1;
+            b.variants.forEach((v, i) => {
+              if (home >= 0) return;
+              const tag = (String((v && v.id) || "")
+                + " " + String((v && v.name) || "")).toLowerCase();
+              if (/(^|\s)default(\s|$)/.test(tag)) home = i;
+            });
+            const idx = home < 0 ? 0 : home;
+            sel = idx;
+            b.active = idx;
+            try {
+              // Re-read, so a default that was edited comes back the way
+              // the server holds it rather than the way the box holds it.
+              const fresh = await api("/api/schedule/prompts");
+              if (fresh && fresh[kind] && Array.isArray(fresh[kind].variants)
+                  && fresh[kind].variants[idx]) {
+                b.variants[idx].text =
+                  String(fresh[kind].variants[idx].text || "");
+              }
+            } catch (ignored) { /* the copy in hand will do */ }
+            push("back on the default.");
+          });
+          const kill = mk2("\ud83d\uddd1", "Throw this variant away", () => {
+            if (b.variants.length < 2) return;
+            if (!window.confirm("Throw away \u201c"
+                + (b.variants[sel].name || "this variant") + "\u201d?")) return;
+            b.variants.splice(sel, 1);
+            if (Number(b.active) >= b.variants.length) b.active = 0;
+            sel = 0;
+            push("gone.");
+          });
+          kill.disabled = (b.variants.length < 2);
+          wrap2.appendChild(acts);
+
+          /* One entry can break ranks and pin a wording of its own. */
+          const pinRow = el("div", "row", "");
+          pinRow.style.cssText = "gap:6px;align-items:center;margin-top:9px;"
+            + "border-top:1px solid var(--border);padding-top:7px";
+          pinRow.appendChild(el("span", "sched-lab", "this entry"));
+          const pin = el("select", "", "");
+          const follow = el("option", "",
+            "follows whichever is starred \u2605");
+          follow.value = "";
+          pin.appendChild(follow);
+          b.variants.forEach((v, i) => {
+            const o = el("option", "", v.name || ("variant " + (i + 1)));
+            o.value = String((v && v.id) || (v && v.name) || i);
+            if (String(slot.prompt_id || "") === o.value) o.selected = true;
+            pin.appendChild(o);
+          });
+          if (!slot.prompt_id) follow.selected = true;
+          pin.style.cssText = "flex:1;min-width:0;font-size:11px;"
+            + "padding:3px 6px;width:auto";
+          pin.title = "Pin this one entry to a wording of its own, or let it "
+            + "follow the kind";
+          pin.onchange = () => {
+            slot.prompt_id = pin.value;
+            saveSlots(false);
+            say2(pin.value ? "this entry is pinned to \u201c"
+              + pin.options[pin.selectedIndex].textContent + "\u201d."
+              : "this entry follows the starred one again.");
+          };
+          pinRow.appendChild(pin);
+          wrap2.appendChild(pinRow);
+
+          const noteRow = el("div", "row", "");
+          noteRow.style.cssText = "gap:6px;align-items:center;margin-top:5px";
+          noteRow.appendChild(el("span", "sched-lab", "notes"));
+          const nz = el("input", "", "");
+          nz.value = String(slot.notes || "");
+          nz.placeholder = "anything to remember about this entry";
+          nz.style.cssText = "flex:1;min-width:0;font-size:11px;"
+            + "padding:3px 6px;width:auto";
+          nz.onchange = () => { slot.notes = nz.value; saveSlots(false); };
+          noteRow.appendChild(nz);
+          wrap2.appendChild(noteRow);
+        }
+
+        pull();
+      } catch (e) {
+        try { say(String((e && e.message) || e), true); }
+        catch (ignored) { /* never let this blank the panel */ }
+      }
+    }
+
+    /* ---- the clock, and a light look for the entry on air ------------ */
+    function tick() {
+      clearInterval(ticker);
+      ticker = setInterval(() => {
+        try {
+          if (!pop.isConnected) { stop(); return; }
+          const air = body.querySelector(".sched-air");
+          if (!air) return;
+          const started = data.now && data.now.started;
+          if (!started) { air.textContent = "\u25cf ON AIR"; return; }
+          const secs = Math.max(0,
+            Math.floor(Date.now() / 1000 - Number(started)));
+          air.textContent = "\u25cf ON AIR \u00b7 " + Math.floor(secs / 60)
+            + ":" + schedPad(secs % 60) + " in";
+        } catch (ignored) { /* a clock is never worth the window */ }
+      }, 1000);
+      clearTimeout(poller);
+      poller = setTimeout(watch, 20000);
+    }
+
+    async function watch() {
+      if (!pop.isConnected) { stop(); return; }
+      try {
+        const d = await api("/api/schedule");
+        if (d) {
+          if (d.now) data.now = d.now;
+          if (d.tinting) data.tinting = d.tinting;
+          if (d.speakbox) data.speakbox = d.speakbox;
+          if (Array.isArray(d.presets)) data.presets = d.presets;
+          if (d.active) data.active = d.active;
+        }
+        // Never yank a control out from under a hand that is in it.
+        const busy = document.activeElement && pop.contains(document.activeElement)
+          && /INPUT|TEXTAREA|SELECT/.test(document.activeElement.tagName || "");
+        if (!busy) {
+          paintStrip();
+          const nowId = String((data.now && data.now.slot_id) || "");
+          if (nowId !== lastAir) {
+            lastAir = nowId;
+            if (zoom === "hour") paintBody();
+          }
+        }
+      } catch (ignored) { /* the window keeps what it already has */ }
+      clearTimeout(poller);
+      if (pop.isConnected) poller = setTimeout(watch, 20000);
+    }
+
+    load(false);
+  } catch (e) {
+    try { setStatus("the scheduler would not open: " + e.message, true); }
+    catch (ignored) { /* never let this blank the panel */ }
+  }
+}
+
+
+function roomPanel(anchor) {
+  /* #900: the recording room. Every take is logged where it is made —
+   * either the engine rendered it or the pantry answered — so this can
+   * say per actor how much of their work is being saved rather than
+   * paid for twice. */
+  const gone = document.getElementById("roomPanel");
+  if (gone) { gone.remove(); return; }
+  const pop = el("div", "panel", "");
+  pop.id = "roomPanel";
+  const at = anchor.getBoundingClientRect();
+  pop.style.cssText = "position:fixed;z-index:230;width:min(560px,95vw);"
+    + "padding:10px 12px;margin:0;max-height:82vh;overflow:auto;"
+    + "left:" + Math.max(8, Math.min(window.innerWidth - 570, at.left - 300))
+    + "px;top:" + (at.bottom + 6) + "px";
+  pop.onclick = (e) => e.stopPropagation();
+  const hd = el("div", "", "🎙 the recording room");
+  hd.style.cssText = "font-weight:700;font-size:12px";
+  pop.appendChild(hd);
+  const sub = el("div", "muted", "Every line is either recorded here or "
+    + "taken off the shelf. What is on the shelf never has to be recorded "
+    + "again — that is the whole economy.");
+  sub.style.cssText = "font-size:10px;line-height:1.5;margin:3px 0 7px";
+  pop.appendChild(sub);
+  const body = el("div", "", "checking the room…");
+  body.style.cssText = "font-size:11px;color:var(--muted)";
+  pop.appendChild(body);
+  document.body.appendChild(pop);
+
+  const draw = async () => {
+    let d = null;
+    try { d = await api("/api/recording-room"); }
+    catch (e) { body.textContent = "the room is unreachable"; return; }
+    body.textContent = "";
+    const s = d.shelf || {};
+
+    const top = el("div", "", "");
+    top.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+      + "padding:7px 9px;margin-bottom:7px;font-size:10.5px;line-height:1.6";
+    const secs = Number(s.seconds || 0);
+    top.appendChild(el("div", "", "🥫 on the shelf — "
+      + (secs >= 60 ? (secs / 60).toFixed(1) + " min" : Math.round(secs) + " s")
+      + " of finished audio in " + (s.clips || 0) + " takes"));
+    top.appendChild(el("div", "muted", "kept servable for "
+      + (s.life_hours || 0) + " h · burned after " + (s.burn_hours || 0)
+      + " h · " + (s.window ? "recording through " + s.window
+                            : "the engine is busy with the live round")));
+    const served = Number(d.shelf_served || 0);
+    const total = Number(d.takes || 0);
+    top.appendChild(el("div", "", "📼 " + total + " takes logged · "
+      + served + " served off the shelf"
+      + (total ? " (" + Math.round(100 * served / total) + "% of the work saved)" : "")
+      + (d.cost ? " · engine costs " + d.cost + "× real time" : "")));
+    body.appendChild(top);
+
+    const actors = d.actors || [];
+    if (!actors.length) {
+      body.appendChild(el("div", "muted",
+        "nobody has been in yet — the room logs a take the moment one is made."));
+    } else {
+      const tbl = el("div", "");
+      tbl.style.cssText = "display:grid;grid-template-columns:"
+        + "1fr 46px 46px 58px 52px 46px;gap:2px 6px;font-size:10.5px;"
+        + "align-items:center";
+      ["who", "takes", "saved", "airtime", "cost", "engine"].forEach((h) => {
+        const c = el("div", "muted", h);
+        c.style.cssText = "font-size:9.5px;letter-spacing:.04em";
+        tbl.appendChild(c);
+      });
+      actors.forEach((a) => {
+        const nm = el("b", "", String(a.name || a.who));
+        nm.style.color = "var(--accent)";
+        tbl.appendChild(nm);
+        tbl.appendChild(el("div", "", String(a.takes)));
+        const sv = el("div", "", a.saved_pct + "%");
+        sv.style.color = a.saved_pct >= 50 ? "#7ce8a9"
+          : a.saved_pct > 0 ? "" : "#8ba0b5";
+        tbl.appendChild(sv);
+        tbl.appendChild(el("div", "", Math.round(a.seconds) + "s"));
+        tbl.appendChild(el("div", "", a.cost ? a.cost + "×" : "—"));
+        tbl.appendChild(el("div", "muted", String(a.engine || "")));
+      });
+      body.appendChild(tbl);
+    }
+
+    const recent = d.recent || [];
+    if (recent.length) {
+      const rh = el("div", "muted", "the last takes, newest first");
+      rh.style.cssText = "font-size:9.5px;margin:9px 0 4px;"
+        + "letter-spacing:.04em";
+      body.appendChild(rh);
+      recent.slice(0, 24).forEach((t) => {
+        const row = el("div", "");
+        row.style.cssText = "border-left:2px solid "
+          + (t.how === "shelf" ? "#7ce8a9" : "var(--accent)")
+          + ";padding:2px 0 2px 7px;margin-bottom:3px;font-size:10px;"
+          + "line-height:1.45";
+        const tag = el("b", "", (t.how === "shelf" ? "🥫 " : "🎙 ")
+          + (t.name || t.who) + " ");
+        tag.style.color = t.how === "shelf" ? "#7ce8a9" : "var(--accent)";
+        row.appendChild(tag);
+        const meta = el("span", "muted", "" + (t.seconds || 0) + "s"
+          + (t.cost ? " · " + t.cost + "×" : "") + " — ");
+        meta.style.fontSize = "9.5px";
+        row.appendChild(meta);
+        row.appendChild(document.createTextNode(String(t.text || "").slice(0, 190)));
+        body.appendChild(row);
+      });
+    }
+  };
+  draw();
+  const timer = setInterval(() => {
+    if (!document.getElementById("roomPanel")) { clearInterval(timer); return; }
+    draw();
+  }, 3000);
+  setTimeout(() => {
+    const off = (ev) => {
+      const live = document.getElementById("roomPanel");
+      if (live && !live.contains(ev.target)) {
+        live.remove();
+        document.removeEventListener("click", off);
+      }
+    };
+    document.addEventListener("click", off);
+  }, 0);
 }
 
 
