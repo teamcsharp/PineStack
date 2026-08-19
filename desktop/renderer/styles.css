@@ -455,9 +455,19 @@ body { padding-bottom: 28px; }
   min-height: 320px; }
 #crystalPopup .cp-left { flex: 1; overflow: auto; display: flex;
   flex-direction: column; gap: 6px; min-width: 0; }
-#cpTower { width: 190px; flex: none; border-radius: 8px;
+#cpTower { width: 190px; flex: 0 1 auto; max-width: 52%;
+  min-width: 120px; border-radius: 8px;
   border: 1px solid #4b2a5e;
   background: radial-gradient(ellipse at 50% 20%, #1b1030, #05070f); }
+/* #824: nothing in the tower view escapes the frame — the body clips at
+   its own border, every flex child may shrink, long names ellipsise. */
+#crystalPopup .cp-body { min-height: 0; overflow: hidden; }
+#crystalPopup .cp-head { flex-wrap: wrap; min-width: 0; }
+#crystalPopup .cp-head b,
+#crystalPopup .cp-head .cp-count { min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+#crystalPopup .cp-head .cp-count { flex: 1 1 auto; }
+#crystalPopup .cp-strangers summary { color: #5d5566; }
 #crystalPopup .cp-source { display: flex; gap: 6px;
   align-items: center; border: 1px solid var(--border, #2a3644);
   border-radius: 7px; padding: 4px 8px; }

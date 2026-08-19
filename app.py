@@ -10968,6 +10968,20 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
                       3600 + len(aside)),
             spice=0.35,                 # wider intonation draw (#371)
         )
+        if answer and not looks_english(answer):
+            # #820: whatever language the model wandered into, the AIR is
+            # English. One rewrite pass keeps the content; a second
+            # failure falls to the stock phrase instead of airing it.
+            pipeline_log("model", "solo line came back non-English — "
+                         "rewriting it in English (#820)")
+            answer = await ask_model(
+                "Rewrite the following radio line ENTIRELY IN ENGLISH — "
+                "every word. Keep its energy, meaning and length; return "
+                "ONLY the rewritten line, no preamble:\n\n" + answer,
+                limit=min(int(dj.get("reply_max_chars") or 6000), 3600),
+                spice=0.2)
+            if answer and not looks_english(answer):
+                answer = ""
         if answer:
             return answer
     except Exception:
@@ -11344,7 +11358,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # cannot be clobbered by another task.
     _line_started = time.time()
     paged = False
-    if voice_to in ("here", "both") or (to_box and box_down):
+    if (voice_to in ("here", "both") or (to_box and box_down)
+            or _RADIO.get("monitor")):     # #825
         if clip:
             _RADIO["voice_clips"].append({
                 "ts": int(time.time() * 1000),
@@ -11498,7 +11513,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # The browser copy already went out the moment the clip was rendered
     # (above) so the page never waits on the box; this only catches a late
     # clip that the early append missed.
-    if clip and voice_to != "box" and not paged:
+    if clip and not paged and (voice_to != "box"
+                               or _RADIO.get("monitor")):     # #825
         _RADIO["voice_clips"].append({
             "ts": int(time.time() * 1000),
             "url": f"{clip['path']}?t={clip['sig']}",
@@ -11935,6 +11951,9 @@ def dj_state() -> dict[str, Any]:
         "voice_device": _RADIO.get("voice_device") or "nabu",  # #786: core
         "reply_to": _RADIO.get("reply_to") or "box",
         "box_talk": bool(_RADIO.get("box_talk", True)),
+        # #825: whether the operator's monitor is on — box-bound clips
+        # also ride the page feed while it is.
+        "monitor": bool(_RADIO.get("monitor")),
         # The painting(s) the pair are currently hawking, so the booth can
         # hold them up (#506). Only while the gallery segment is fresh.
         "gallery_now": (
@@ -20400,7 +20419,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # ride along or the page hears talk with no punctuation.
     _sfx_box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                      or len(_BOX_HOLD) >= 6)
-    if (_RADIO.get("voice_to") or "box") != "box" or _sfx_box_down:
+    if ((_RADIO.get("voice_to") or "box") != "box" or _sfx_box_down
+            or _RADIO.get("monitor")):     # #825
         _RADIO["voice_clips"].append({
             "ts": int(time.time() * 1000),
             "url": f"/sfx/{key}?t={signature}",
@@ -26075,7 +26095,9 @@ async def speak_turns(turns: list[tuple[str, str]],
                             or len(_BOX_HOLD) >= 6)
                 stream_label = ("☎ " + caller_name if caller_name
                                 else "🎙 a conversation")
-                stream_paged = vto in ("here", "both") or (to_box and box_down)
+                stream_paged = (vto in ("here", "both")
+                                or (to_box and box_down)
+                                or bool(_RADIO.get("monitor")))   # #825
                 if stream_paged:
                     _RADIO["voice_clips"].append({
                         "ts": int(time.time() * 1000),
@@ -34250,6 +34272,26 @@ async def dj_voice_api(
         clips.append({**clip, "broadcast_ms": int(clip.get("broadcast_ms")
             or int(clip["ts"]) + VOICE_BROADCAST_LEAD_MS)})
     return {"server_ms": server_ms, "clips": clips}
+
+
+@app.post("/api/dj/monitor")
+async def dj_monitor_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#825: the operator's monitor. While on, every box-bound clip is
+    ALSO published to the page feed, so the panel (and /radio) carry the
+    full broadcast at their own mixer levels no matter the routing —
+    music, dialogue, stings, ducking, all of it, judgeable by ear."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    _RADIO["monitor"] = bool(payload.get("on"))
+    pipeline_log("radio", "the monitor is ON — box-bound clips also ride "
+                 "the page feed at the page's own levels (#825)"
+                 if _RADIO["monitor"] else
+                 "the monitor is off — page playback follows the routing "
+                 "again (#825)")
+    return {"monitor": bool(_RADIO["monitor"])}
 
 
 @app.get("/api/dj")
@@ -46596,6 +46638,11 @@ element on its own cannot go past 100%.">
         </label>
         <button onclick="djGainReset()" title="Back to sensible levels">
           Reset levels</button>
+        <button id="djMonitorBtn" onclick="djMonitorFlip()"
+                title="#825: hear the station HERE exactly as it goes out —
+even with everything routed to the box, the music and every voice ride
+this page's own mixer, so you can judge the levels and the ducking
+together by ear.">🎧 Monitor the air</button>
       </div>
       <div id="djStatus" class="muted"
            style="font-size:12px;margin-top:6px"></div>
@@ -59043,9 +59090,30 @@ async function adBookLoad() {
       dl.style.cssText = "font-size:11px";
       acts.appendChild(dl);
     } else {
-      const none = el("span", "muted", "audio not kept for this one");
-      none.style.cssText = "font-size:10px";
-      acts.appendChild(none);
+      // #822: a spot whose audio was never kept cuts itself quietly and
+      // plays right here — nothing goes on air.
+      const hear = el("button", "", "▶ Cut it & hear it");
+      hear.style.cssText = "font-size:11px;padding:2px 8px";
+      hear.title = "Render this spot's audio and play it here — nothing "
+        + "goes on air";
+      hear.onclick = async () => {
+        hear.disabled = true; hear.textContent = "⏳ cutting…";
+        try {
+          const got = await api("/api/dj/ads/" + ad.id + "/recut",
+            {method: "POST", body: JSON.stringify({air: false})});
+          const player = el("audio", "", "");
+          player.controls = true; player.preload = "auto";
+          player.src = got.url;
+          player.style.cssText = "width:100%;height:32px";
+          body.insertBefore(player, acts);
+          try { await player.play(); } catch (e2) { /* click it */ }
+          hear.remove();
+        } catch (e) {
+          hear.disabled = false; hear.textContent = "▶ Cut it & hear it";
+          setStatus(e.message, true);
+        }
+      };
+      acts.appendChild(hear);
     }
     body.appendChild(acts);
     card.appendChild(body);
@@ -61548,11 +61616,37 @@ function djHearingElsewhere(now) {
             && musicLastTrack.id && musicLastTrack.id !== (now || {}).id);
 }
 
+/* #825: the monitor — while on, the page carries the WHOLE broadcast
+ * at the mixer's own levels even when every route points at the box.
+ * The server publishes box-bound clips to the page feed; this side only
+ * has to keep following the record clock instead of standing down. */
+let djMonitorAir = false;
+async function djMonitorFlip() {
+  const btn = document.getElementById("djMonitorBtn");
+  try {
+    const got = await api("/api/dj/monitor", {method: "POST",
+      body: JSON.stringify({on: !djMonitorAir})});
+    djMonitorAir = !!got.monitor;
+  } catch (e) { setStatus(e.message, true); return; }
+  if (btn) btn.classList.toggle("primary", djMonitorAir);
+  setStatus(djMonitorAir
+    ? "monitoring the air — this page now carries the full broadcast at "
+      + "the mixer's levels (the box keeps playing too)"
+    : "monitor off — playback follows the routing again");
+  if (djMonitorAir) { try { radioClockPoll(); } catch (e) {} }
+}
+
 async function pollDJ() {
   try {
     const state = await api("/api/dj");
     djStateAt = Date.now();             // when this truth arrived (#631)
     djRender(state);
+    if (typeof state.monitor !== "undefined"
+        && djMonitorAir !== !!state.monitor) {
+      djMonitorAir = !!state.monitor;
+      const mb = document.getElementById("djMonitorBtn");
+      if (mb) mb.classList.toggle("primary", djMonitorAir);
+    }
     pineActivityPaint(state);
     djRepairBanner(state.repairing, state.repair_log || []);
   } catch (error) { /* the panel works without it */ }
@@ -61571,7 +61665,9 @@ function djResync(clock) {
     radioFollowing = false;      // nothing to follow; the page is its own
     return;
   }
-  if (djOutputExternal()) return;            // the speaker carries it
+  // #825: the monitor overrides the stand-down — the speaker carries it
+  // AND this page follows along at its own levels.
+  if (djOutputExternal() && !djMonitorAir) return;
   if (djPinned && djPinned !== clock.id) return;   // a hand-picked record
   const player = document.getElementById("musicPlayer");
   if (!player) return;
@@ -61604,7 +61700,7 @@ function djResync(clock) {
 }
 
 async function radioClockPoll() {
-  if (djOutputExternal()) return;
+  if (djOutputExternal() && !djMonitorAir) return;   // #825
   try {
     const clock = await api("/api/radio/clock?listener="
       + encodeURIComponent(pineListenerId()));
@@ -66056,6 +66152,38 @@ async function callRecordings() {
         finally { done(); }
       };
       acts.appendChild(recut);
+
+      if (!a.audio) {
+        // #822: EVERY entry is hearable. A written spot cuts itself
+        // quietly first — voice, bed, vocode — then plays right here;
+        // nothing goes on air.
+        const hear = el("button", "primary", "▶ Cut it & hear it");
+        hear.style.cssText = "font-size:11px;padding:2px 8px";
+        hear.title = "Render this spot's audio and play it here — "
+          + "nothing goes on air";
+        hear.onclick = async () => {
+          const done = pending(hear, "⏳ cutting…");
+          note.textContent = "voice, bed, vocode… then it plays here";
+          try {
+            const got = await api("/api/dj/ads/" + a.id + "/recut",
+              {method: "POST",
+               body: JSON.stringify({text: script.value, air: false})});
+            const audio = document.createElement("audio");
+            audio.controls = true; audio.preload = "auto";
+            audio.src = got.url;
+            audio.style.cssText = "width:100%;height:34px;margin-top:5px";
+            audio.onplay = () => { cacheHoldStart("duck"); djApplyGain(); };
+            audio.onpause = () => setTimeout(cacheHoldEnd, 150);
+            audio.onended = () => setTimeout(cacheHoldEnd, 150);
+            row.insertBefore(audio, script);
+            note.textContent = "cut ✓ — playing";
+            try { await audio.play(); } catch (e2) { /* click it */ }
+            hear.remove();
+          } catch (e) { note.textContent = e.message; }
+          finally { done(); }
+        };
+        acts.appendChild(hear);
+      }
 
       const airNow = el("button", "", "📻 Queue it on air");
       airNow.style.cssText = "font-size:11px;padding:2px 8px";

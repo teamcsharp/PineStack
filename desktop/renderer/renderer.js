@@ -2070,11 +2070,33 @@ function initCrystalBtn() {
       return;
     }
     const T = window.THREE;
-    const PER = 14, CAP = 4200, R = 26, CH = 3.2;
+    // #821: every data point is a HEXAGON in an interlocked honeycomb.
+    // Each storey is a full hex-grid disc; the discs stack into the
+    // tower, so the base is a wide slab instead of a thin cylinder.
+    const CAP = 6200, CH = 2.35, S = 2.55;   // cell circumradius
     const scale = Math.max(1, Math.ceil((N || 1) / CAP));
     const cells = Math.max(1, Math.ceil((N || 1) / scale));
-    const rings = Math.ceil(cells / PER);
-    const w = 190, h = Math.max(300, canvas.parentElement
+    // rings k give 1+3k(k+1) hexes a disc — take the smallest disc that
+    // keeps the tower under ~34 storeys, capped at 8 rings (217/storey).
+    let K = 1;
+    while (K < 8 && cells / (1 + 3 * K * (K + 1)) > 34) K++;
+    const spots = [[0, 0]];                  // spiral: centre out
+    for (let k = 1; k <= K; k++) {
+      let q = k, r = 0;
+      const dirs = [[-1, 1], [-1, 0], [0, -1], [1, -1], [1, 0], [0, 1]];
+      for (const d of dirs) {
+        for (let s = 0; s < k; s++) {
+          spots.push([q, r]); q += d[0]; r += d[1];
+        }
+      }
+    }
+    const PER = spots.length;
+    const layers = Math.ceil(cells / PER);
+    const w = Math.max(190, Math.min(300, Math.floor(
+      (canvas.parentElement ? canvas.parentElement.clientWidth : 560)
+      * 0.42)));
+    canvas.style.width = w + "px";
+    const h = Math.max(300, canvas.parentElement
       ? canvas.parentElement.clientHeight - 2 : 420);
     const renderer = new T.WebGLRenderer(
       { canvas, antialias: true, alpha: true });
@@ -2085,19 +2107,19 @@ function initCrystalBtn() {
     const sun = new T.DirectionalLight(0xc9a0ff, 1.1);
     sun.position.set(60, 120, 80);
     scene.add(sun);
-    const geo = new T.CylinderGeometry(2.6, 2.6, 2.2, 6);
+    const geo = new T.CylinderGeometry(S, S, CH * 0.92, 6);
     const mat = new T.MeshStandardMaterial(
       { metalness: 0.35, roughness: 0.45 });
     const mesh = new T.InstancedMesh(geo, mat, cells);
     const dummy = new T.Object3D();
     const dim = new T.Color(0x4b2a6e);
     for (let i = 0; i < cells; i++) {
-      const ring = Math.floor(i / PER);
-      const ang = (i % PER) / PER * Math.PI * 2
-        + (ring % 2 ? Math.PI / PER : 0);
-      dummy.position.set(Math.cos(ang) * R, ring * CH,
-        Math.sin(ang) * R);
-      dummy.rotation.y = -ang;
+      const layer = Math.floor(i / PER);
+      const qr = spots[i % PER];
+      // flat-side-to-flat-side spacing: tangent neighbours, no gaps
+      dummy.position.set(S * 1.5 * qr[0], layer * CH + CH / 2,
+        S * Math.sqrt(3) * (qr[1] + qr[0] / 2));
+      dummy.rotation.y = Math.PI / 6;   // faces mate across the lattice
       dummy.updateMatrix();
       mesh.setMatrixAt(i, dummy.matrix);
       mesh.setColorAt(i, dim);
@@ -2106,18 +2128,57 @@ function initCrystalBtn() {
     const group = new T.Group();
     group.add(mesh);
     scene.add(group);
-    const height = rings * CH;
+    const height = layers * CH;
+    const baseR = S * Math.sqrt(3) * (K + 1);
     tower = { renderer, scene, camera, mesh, group, raf: 0, scale,
               cells, PER, CH, height, camY: height * 0.35,
-              targetY: height * 0.35 };
-    camera.position.set(0, height * 0.35, R * 3.4);
+              targetY: height * 0.35, yaw: 0, pitch: 0.34,
+              dist: Math.max(baseR * 3.2, height * 0.95), panX: 0,
+              auto: true };
+    // #821: orbit controls — drag turns, wheel zooms, shift/right-drag
+    // pans. The self-spin stops at the first touch of the hand.
+    let drag = null;
+    canvas.style.touchAction = "none";
+    canvas.onpointerdown = (ev) => {
+      drag = { x: ev.clientX, y: ev.clientY,
+               pan: ev.button === 2 || ev.shiftKey };
+      if (tower) tower.auto = false;
+      try { canvas.setPointerCapture(ev.pointerId); } catch { /* old */ }
+    };
+    canvas.onpointermove = (ev) => {
+      if (!drag || !tower) return;
+      const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+      drag.x = ev.clientX; drag.y = ev.clientY;
+      if (drag.pan) {
+        tower.panX -= dx * tower.dist * 0.0014;
+        tower.targetY += dy * tower.dist * 0.0014;
+        tower.camY = tower.targetY;      // a pan lands, it never chases
+      } else {
+        tower.yaw += dx * 0.008;
+        tower.pitch = Math.max(-1.2, Math.min(1.35,
+          tower.pitch + dy * 0.006));
+      }
+    };
+    canvas.onpointerup = () => { drag = null; };
+    canvas.oncontextmenu = (ev) => ev.preventDefault();
+    canvas.onwheel = (ev) => {
+      ev.preventDefault();
+      if (!tower) return;
+      tower.auto = false;
+      tower.dist = Math.max(baseR * 1.3, Math.min(baseR * 40,
+        tower.dist * (ev.deltaY > 0 ? 1.12 : 0.9)));
+    };
     (function spin() {
       if (!tower) return;
       tower.raf = requestAnimationFrame(spin);
-      group.rotation.y += 0.004;
+      if (tower.auto) tower.yaw += 0.004;
       tower.camY += (tower.targetY - tower.camY) * 0.06;
-      camera.position.y = tower.camY + tower.height * 0.06;
-      camera.lookAt(0, tower.camY, 0);
+      const cy = tower.camY + tower.height * 0.06;
+      const cp = Math.cos(tower.pitch) * tower.dist;
+      camera.position.set(tower.panX + Math.sin(tower.yaw) * cp,
+        cy + Math.sin(tower.pitch) * tower.dist,
+        Math.cos(tower.yaw) * cp);
+      camera.lookAt(tower.panX, cy, 0);
       renderer.render(scene, camera);
     })();
   }
@@ -2478,8 +2539,9 @@ function initCrystalBtn() {
     left.className = "cp-left";
     const canvas = document.createElement("canvas");
     canvas.id = "cpTower";
-    canvas.title = "the mind as a tower — every hexagon is a data "
-      + "point; the white one is the point you are exploring";
+    canvas.title = "the mind as a honeycomb tower — every hexagon "
+      + "is a data point; the white one is the point you are exploring. "
+      + "Drag to turn, wheel to zoom, shift-drag or right-drag to pan";
     body.appendChild(left);
     body.appendChild(canvas);
     pop.appendChild(body);
@@ -3146,7 +3208,32 @@ function initCrystalBtn() {
         return node;
       };
       const members = allRows.filter((m) => have.has(m.id));
-      const others = allRows.filter((m) => !have.has(m.id));
+      // #823: the branch under a crystal lists ONLY this artist's own
+      // albums — a Doom crystal never shows Allen Interface discs. The
+      // artist is read from the crystal's name and from the member
+      // minds' id stems ("alleninterface-bomb" → "alleninterface").
+      const norm = (s) => String(s || "").toLowerCase()
+        .replace(/[^a-z0-9]+/g, "");
+      const stems = new Set();
+      [norm(c.name), norm(c.id)].forEach((s) => { if (s) stems.add(s); });
+      members.forEach((m) => {
+        const st = norm(String(m.id).split("-")[0]);
+        if (st) stems.add(st);
+        const nm = norm(String(m.name || "").split("—")[0]);
+        if (nm) stems.add(nm);
+      });
+      const sameArtist = (m) => {
+        const id = norm(m.id), nm = norm(m.name);
+        for (const s of stems) {
+          if (s.length >= 3 && (id.indexOf(s) === 0
+              || nm.indexOf(s) === 0 || s.indexOf(id) === 0)) return true;
+        }
+        return false;
+      };
+      const others = allRows.filter((m) =>
+        !have.has(m.id) && sameArtist(m));
+      const strangers = allRows.filter((m) =>
+        !have.has(m.id) && !sameArtist(m));
       members.forEach((m) => r3.appendChild(mindNode(m)));
       if (!members.length) {
         const none = document.createElement("div");
@@ -3161,7 +3248,7 @@ function initCrystalBtn() {
         const branch = document.createElement("details");
         branch.className = "cp-addminds";
         const cap = document.createElement("summary");
-        cap.textContent = "＋ other minds (" + others.length
+        cap.textContent = "＋ more of this artist (" + others.length
           + ") — check one to add it to this crystal";
         branch.appendChild(cap);
         const box = document.createElement("div");
@@ -3169,6 +3256,27 @@ function initCrystalBtn() {
         others.forEach((m) => box.appendChild(mindNode(m)));
         branch.appendChild(box);
         r3.appendChild(branch);
+      }
+      if (strangers.length) {
+        // #823: different artists stay OUT of this crystal's list — one
+        // collapsed line at the very bottom is the only trace, kept so
+        // a mind can still be grafted across on purpose.
+        const far = document.createElement("details");
+        far.className = "cp-addminds cp-strangers";
+        const cap2 = document.createElement("summary");
+        cap2.textContent = "⚠ different artists (" + strangers.length
+          + ") — not this crystal's; open only to graft one in";
+        far.appendChild(cap2);
+        const box2 = document.createElement("div");
+        box2.className = "cp-mindtable";
+        far.appendChild(box2);
+        let built = false;
+        far.ontoggle = () => {
+          if (!far.open || built) return;
+          built = true;
+          strangers.forEach((m) => box2.appendChild(mindNode(m)));
+        };
+        r3.appendChild(far);
       }
       card.appendChild(r3);
 
