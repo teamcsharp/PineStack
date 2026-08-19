@@ -6370,16 +6370,62 @@ async def f5_health(force: bool = False) -> dict[str, Any]:
     return dict(_F5_HEALTH)
 
 
+_F5_REVIVE_AT = [0.0]
+
+
 async def clone_engine_ready(engine: str) -> bool:
     """Whichever cloning engine this voice actually renders on (#746).
 
     Seven call sites wrote `engine == "xtts" and not xtts_health()` — which
     silently means an F5 voice is never checked and never falls back."""
     if engine == "xtts":
-        return bool((await xtts_health())["ready"])
+        _ok = bool((await xtts_health())["ready"])
+        if not _ok:
+            # #833: SKIPPING a dead XTTS never woke it — only a failed
+            # ATTEMPT did, and this gate meant no attempt was ever made,
+            # so the whole cast quietly lived on F5 for hours at a time.
+            _xtts_revive_maybe()
+        return _ok
     if engine == "f5":
-        return bool((await f5_health())["ready"])
+        _ok5 = bool((await f5_health())["ready"])
+        if not _ok5 and time.time() - _F5_REVIVE_AT[0] > 600:
+            _F5_REVIVE_AT[0] = time.time()
+            fire_and_forget(_director_post("/director/engine/f5/deploy"))
+            pipeline_log("gpu", "F5 is down and wanted — redeploying "
+                         "through the director (#833)")
+        return _ok5
     return True
+
+
+def _wav_fade_tail(raw: bytes, ms: int = 220) -> bytes:
+    """#833: the last fraction of an F5 clip is where its duration
+    guess frays into warble — a short fade drains the artifact without
+    touching a word."""
+    import array
+    import io
+    import wave
+    try:
+        with wave.open(io.BytesIO(raw), "rb") as w:
+            params = w.getparams()
+            frames = w.readframes(w.getnframes())
+        if params.sampwidth != 2:
+            return raw
+        pcm = array.array("h", frames)
+        n = min(len(pcm),
+                int(params.framerate * params.nchannels * ms / 1000))
+        if n < 8:
+            return raw
+        total = len(pcm)
+        for i in range(n):
+            pcm[total - n + i] = int(
+                pcm[total - n + i] * (1.0 - (i + 1) / n))
+        out = io.BytesIO()
+        with wave.open(out, "wb") as dst:
+            dst.setparams(params)
+            dst.writeframes(pcm.tobytes())
+        return out.getvalue()
+    except Exception:  # noqa: BLE001
+        return raw
 
 
 def _wav_stitch(parts: list[bytes], gap_ms: int = 120) -> bytes:
@@ -6467,6 +6513,9 @@ async def _f5_synthesize(text: str, voice: str) -> bytes:
                     detail = resp.text[:200]
                 raise RuntimeError(f"F5 refused: {detail}")
             outs.append(resp.content)    # 24 kHz mono s16 WAV
+    if outs:
+        # #833: every F5 clip's tail fades before the warble is audible.
+        outs[-1] = _wav_fade_tail(outs[-1])
     if len(outs) > 1:
         pipeline_log("voice", f"f5 stitched {len(outs)} sentence pieces "
                      "— no long-call tail garble (#811)")
