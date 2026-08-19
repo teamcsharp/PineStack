@@ -600,6 +600,12 @@ DEFAULT_DJ = {
     # "xtts" or "f5" forces the whole library onto one engine so the
     # two can be compared on the same voices, same night.
     "clone_engine": "",
+    # #846: the main cast (host, co-host, third seat, the drop guy) all
+    # render on the HOST's engine — one model resident, one voice
+    # character across the desk, no mid-conversation engine swap. The
+    # master swap below is what lets a cast voice ride a different,
+    # heavier engine; callers are never governed by it.
+    "cast_engine_lock": True,
     # #786: the engine bench. Pin an engine to a role (a preset engine like
     # Kokoro makes that role render instantly in its own voice; a clone
     # engine renders that role's clone voice through it); "" = auto. And the
@@ -1213,6 +1219,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "clone_engine": (str(raw_dj.get("clone_engine") or "")
                          if str(raw_dj.get("clone_engine") or "")
                          in ("xtts", "f5") else ""),
+        "cast_engine_lock": bool(raw_dj.get(
+            "cast_engine_lock", DEFAULT_DJ["cast_engine_lock"])),
         "role_engine": {
             role: str((raw_dj.get("role_engine") or {}).get(role) or "")
             for role in VOICE_ROLES
@@ -5940,6 +5948,181 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
             "ha": ha_ok, "entity": ent}
 
 
+# #844: what each engine costs to keep resident, in GB. The GB10 has
+# 128G of UNIFIED memory shared by the GPU, the page cache and every
+# process — so a second clone engine is not free headroom, it is half
+# the pool.
+ENGINE_WEIGHT_GB = {"xtts": 23.0, "f5": 24.0, "piper": 0.3,
+                    "voxcpm": 8.0, "cosyvoice": 12.0, "indextts": 10.0,
+                    "vibevoice": 14.0, "qwen_tts": 6.0, "kokoro": 1.0}
+GPU_POOL_GB = float(os.getenv("GPU_POOL_GB", "128"))
+
+
+async def gpu_load_report() -> dict[str, Any]:
+    """#844: the honest cost of the current casting, plus what it would
+    cost consolidated. Every seat the operator has cast is listed with
+    the engine it forces resident."""
+    dj = dj_settings()
+    seats = [("host", "voice"), ("cohost", "cohost_voice"),
+             ("third", "third_voice"), ("drop", "drop_voice"),
+             ("caller", "caller_voice")]
+    rows: list[dict[str, Any]] = []
+    for seat, key in seats:
+        v = str(dj.get(key) or "").strip()
+        if not v:
+            continue
+        meta = voice_meta(split_engine_voice(v)[1] or v) or {}
+        eng = voice_engine_for(v, seat)
+        rows.append({"seat": seat, "key": key, "voice": v,
+                     "name": str(meta.get("name") or v),
+                     "engine": eng,
+                     "gb": ENGINE_WEIGHT_GB.get(eng, 4.0)})
+    engines = sorted({r["engine"] for r in rows
+                      if r["engine"] in ENGINE_WEIGHT_GB})
+    resident = sum(ENGINE_WEIGHT_GB.get(e, 4.0) for e in engines)
+    # What ELSE is holding the pool right now.
+    others: dict[str, float] = {}
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            press = (await client.get(
+                f"{VOICE_DIRECTOR_URL}/host/pressure")).json()
+        avail = float(press.get("avail_gb") or 0)
+    except Exception:  # noqa: BLE001
+        avail = 0.0
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            ps = (await client.get(
+                "http://127.0.0.1:11434/api/ps")).json()
+        for m in (ps.get("models") or []):
+            others[str(m.get("name") or "a model")] = round(
+                float(m.get("size") or 0) / (1 << 30), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    # The counsel.
+    warn = ""
+    level = "ok"
+    cheapest = min(engines, key=lambda e: ENGINE_WEIGHT_GB.get(e, 4.0),
+                   default="")
+    if len(engines) > 1:
+        level = "warn"
+        saving = resident - max(
+            ENGINE_WEIGHT_GB.get(e, 4.0) for e in engines)
+        warn = (f"Your cast spans {len(engines)} cloning engines "
+                f"({', '.join(engines)}), so ALL of them must stay "
+                f"resident — about {resident:.0f}G of the {GPU_POOL_GB:.0f}G "
+                f"pool. Consolidating the cast onto one engine frees "
+                f"roughly {saving:.0f}G and removes the memory pressure "
+                f"that wedges a loading engine (which is what silences "
+                f"the DJs).")
+    elif avail and avail < 30:
+        level = "warn"
+        warn = (f"One engine is enough for this cast, but the pool is "
+                f"down to {avail:.0f}G free — the page cache or another "
+                f"model is holding it. The station's UMA guard reclaims "
+                f"cache every five minutes; if this persists, unload a "
+                f"model you are not using.")
+    else:
+        warn = (f"This casting is easy on the box: one engine "
+                f"({engines[0] if engines else 'none'}) covers the whole "
+                f"cast, about {resident:.0f}G resident.")
+    locked = cast_engine_locked()
+    host_eng = host_clone_engine()
+    if locked:
+        # Under the lock the cast RENDERS on one engine whatever their
+        # metas say, so the honest resident cost is that one engine.
+        engines = [host_eng]
+        resident = ENGINE_WEIGHT_GB.get(host_eng, 4.0)
+        for r in rows:
+            if r["seat"] in CAST_SEATS:
+                r["engine"] = host_eng
+                r["gb"] = ENGINE_WEIGHT_GB.get(host_eng, 4.0)
+                r["follows_host"] = True
+        level = "ok"
+        warn = (f"The cast is unified on {host_eng} — the host's engine "
+                f"is the law, about {resident:.0f}G resident, and the "
+                f"lines flow without a model swap between speakers. "
+                f"Heavier engines are greyed out for the cast until you "
+                f"throw the master swap; callers may ride any engine.")
+        if avail and avail < 25:
+            level = "warn"
+            warn += (f" The pool is tight though ({avail:.0f}G free) — "
+                     "something else is holding memory.")
+    return {"rows": rows, "engines": engines,
+            "cast_engine_lock": locked, "host_engine": host_eng,
+            "resident_gb": round(resident, 1),
+            "pool_gb": GPU_POOL_GB, "avail_gb": avail,
+            "others": others, "level": level, "advice": warn,
+            "consolidate_to": engines[0] if len(engines) == 1 else (
+                "xtts" if "xtts" in engines else cheapest),
+            "options": [
+                {"engine": e, "gb": ENGINE_WEIGHT_GB.get(e, 4.0),
+                 "note": ("the cast's own engine" if e in engines
+                          else "would need loading")}
+                for e in ("xtts", "f5")],
+            }
+
+
+@app.get("/api/pinebox/gpu-load")
+async def pinebox_gpu_load(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return await gpu_load_report()
+
+
+@app.post("/api/pinebox/gpu-load")
+async def pinebox_gpu_consolidate(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#844: put the WHOLE cast on one cloning engine — one model
+    resident instead of two — and optionally unload the other."""
+    require_auth(authorization)
+    payload = await request.json()
+    engine = str(payload.get("engine") or "").strip()
+    if engine not in ("xtts", "f5"):
+        raise HTTPException(status_code=400, detail="engine xtts|f5")
+    settings = load_settings()
+    settings.setdefault("dj", {})["clone_engine"] = engine
+    save_settings(validate_settings(settings))
+    freed = ""
+    if bool(payload.get("unload_other", True)):
+        other = "f5" if engine == "xtts" else "xtts"
+        if await _director_post(f"/director/engine/{other}/terminate"):
+            freed = other
+    pipeline_log("gpu", f"the cast is consolidated onto {engine} — one "
+                        "model resident instead of two"
+                        + (f"; {freed} unloaded" if freed else "")
+                        + " (#844)")
+    note_action(f"🎛 cast consolidated onto {engine}")
+    return {"engine": engine, "unloaded": freed,
+            "report": await gpu_load_report()}
+
+
+@app.post("/api/pinebox/cast-lock")
+async def pinebox_cast_lock(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#846: the master swap. Locked (the default) the whole cast
+    renders on the host's engine; unlocked, each cast voice may ride
+    its own — heavier, two models resident, and the desk can change
+    engine mid-conversation."""
+    require_auth(authorization)
+    payload = await request.json()
+    on = bool(payload.get("locked", True))
+    settings = load_settings()
+    settings.setdefault("dj", {})["cast_engine_lock"] = on
+    save_settings(validate_settings(settings))
+    pipeline_log("gpu", ("the cast is LOCKED to the host's engine — one "
+                         "model resident (#846)") if on else
+                 ("the master swap is OPEN — cast voices may ride "
+                  "different engines; expect both models resident and "
+                  "more memory pressure (#846)"))
+    note_action("🎛 cast engine lock " + ("ON" if on else "OFF"))
+    return {"cast_engine_lock": on, "report": await gpu_load_report()}
+
+
 @app.post("/api/pinebox/repair")
 async def pinebox_repair_api(
     authorization: str | None = Header(default=None),
@@ -7738,6 +7921,27 @@ def _engine_now(meta: dict[str, Any]) -> str:
     return pick if pick in ("xtts", "f5") else engine
 
 
+CAST_SEATS = ("dj", "host", "cohost", "third", "drop", "sfxguy")
+
+
+def host_clone_engine() -> str:
+    """#846: the engine the HOST renders on — the law the rest of the
+    cast follows. The station-wide override wins when set; otherwise
+    the host voice's own meta decides."""
+    dj = dj_settings()
+    pick = str(dj.get("clone_engine") or "")
+    if pick in ("xtts", "f5"):
+        return pick
+    v = str(dj.get("voice") or "")
+    bare = split_engine_voice(v)[1] or v
+    eng = str((voice_meta(bare) or {}).get("engine") or "xtts")
+    return eng if eng in ("xtts", "f5") else "xtts"
+
+
+def cast_engine_locked() -> bool:
+    return bool(dj_settings().get("cast_engine_lock", True))
+
+
 def caller_clone_pool() -> list[str]:
     """Every cloned voice a random caller can borrow (#457): the vl_* library
     entries that actually have a reference to synthesize from. Cached briefly
@@ -8027,6 +8231,13 @@ def voice_engine_for(voice: str, who: str = "") -> str:
     if VOICE_ID_SHAPE.match(voice):
         meta = voice_meta(voice)
         engine = str((meta or {}).get("engine") or "xtts")
+        # #846: a CAST seat follows the host's engine so the desk never
+        # swaps models mid-conversation and only one stays resident.
+        # Callers are deliberately exempt — variety belongs on the
+        # phone line, not across the hosts.
+        if (who in CAST_SEATS and cast_engine_locked()
+                and engine in ("xtts", "f5")):
+            return host_clone_engine()
         # #726: one switch for the whole library, so both cloning
         # engines can be tried against the same voices without editing
         # sixty meta files. A voice that names a NON-cloning engine
@@ -37053,16 +37264,57 @@ async def booth_clip_api(
     require_read_auth(authorization)
     if not at:
         raise HTTPException(status_code=400, detail="at=epoch seconds")
-    best: tuple[float, dict[str, Any]] | None = None
-    for item in list((_RADIO.get("episode") or {}).get("items") or []):
-        gap = abs(float(item.get("t") or 0) - at)
-        if gap < 10 and (best is None or gap < best[0]):
-            best = (gap, item)
-    if best is not None:
-        path = Path(str(best[1].get("file") or ""))
-        if path.is_file():
+    try:
+        import imageio_ffmpeg
+        _exe = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:  # noqa: BLE001
+        _exe = "ffmpeg"
+
+    def _cut(source: Path, off: float, dur: float, tag: str) -> Path | None:
+        SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        out = SAMPLE_CACHE_DIR / f"booth_{tag}.mp3"
+        if out.is_file():
+            return out
+        args = [_exe, "-nostdin", "-y", "-ss", f"{max(0.0, off):.2f}"]
+        if dur > 0:
+            args += ["-t", f"{dur:.2f}"]
+        args += ["-i", str(source), "-codec:a", "libmp3lame",
+                 "-q:a", "4", str(out)]
+        got = _real_subprocess_run(args, capture_output=True, timeout=90)
+        return out if (got.returncode == 0 and out.is_file()) else None
+
+    # #845: the OPEN episode. A coalesced round stages ONE file holding
+    # many turns at burst time, so a row that aired two minutes into
+    # that burst is INSIDE this file, not near its stamp. Match by span
+    # (this file's stamp .. the next file's stamp) and cut at the
+    # offset; fall back to the whole file when it is a single clip.
+    items = sorted(
+        [i for i in ((_RADIO.get("episode") or {}).get("items") or [])
+         if float(i.get("t") or 0) > 0],
+        key=lambda i: float(i["t"]))
+    for ix, item in enumerate(items):
+        began = float(item.get("t") or 0)
+        path = Path(str(item.get("file") or ""))
+        if not path.is_file():
+            continue
+        span = float(_clip_seconds(str(path)) or 0)
+        ends = began + span if span else (
+            float(items[ix + 1]["t"]) if ix + 1 < len(items)
+            else began + 12.0)
+        # exact-stamp rows (a single line, a sting) still win outright
+        if abs(began - at) < 6:
             return FileResponse(path, media_type="audio/mpeg",
                                 filename=f"booth-{int(at)}.mp3")
+        if began <= at < ends:
+            off = at - began
+            # to the end of the burst, capped — the row's own words
+            # start here and the operator can trim what they keep
+            cut = await asyncio.to_thread(
+                _cut, path, off, min(90.0, max(6.0, ends - at)),
+                f"{int(at)}_{ix}")
+            if cut:
+                return FileResponse(cut, media_type="audio/mpeg",
+                                    filename=f"booth-{int(at)}.mp3")
     hit: tuple[float, dict[str, Any], Path] | None = None
     for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json"),
                             reverse=True):
@@ -37074,9 +37326,24 @@ async def booth_clip_api(
         except Exception:
             continue
         for mark in marks:
-            gap = abs(float(mark.get("t") or 0) - at)
+            began = float(mark.get("t") or 0)
+            dur = float(mark.get("dur") or 0)
+            # #845: a mark covers a SPAN. A row inside a long burst mark
+            # is at (at - began) seconds into it, not within 10s of its
+            # start — that miss is why most rows answered 404.
+            if began <= at < began + max(dur, 1.0):
+                inside = at - began
+                hit = (0.0, {**mark,
+                             "off": float(mark.get("off") or 0) + inside,
+                             "dur": max(4.0, min(90.0,
+                                                 began + dur - at))},
+                       source)
+                break
+            gap = abs(began - at)
             if gap < 10 and (hit is None or gap < hit[0]):
                 hit = (gap, mark, source)
+        if hit and hit[0] == 0.0:
+            break
     if hit is None:
         raise HTTPException(status_code=404,
                             detail="no audio kept for this row")
@@ -37091,12 +37358,14 @@ async def booth_clip_api(
             exe = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:  # noqa: BLE001
             exe = "ffmpeg"
+        # #845: re-encode rather than copy — a stream copy cannot start
+        # mid-frame, so an offset cut came out empty or silent.
         got = await asyncio.to_thread(
             _real_subprocess_run,
             [exe, "-nostdin", "-y", "-ss", f"{off:.2f}",
              "-t", f"{dur:.2f}", "-i", str(source),
-             "-codec:a", "copy", str(out)],
-            capture_output=True, timeout=60)
+             "-codec:a", "libmp3lame", "-q:a", "4", str(out)],
+            capture_output=True, timeout=90)
         if got.returncode != 0 or not out.is_file():
             raise HTTPException(status_code=404, detail="the cut failed")
     return FileResponse(out, media_type="audio/mpeg",
