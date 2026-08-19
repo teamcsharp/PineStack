@@ -8937,13 +8937,14 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
     # The swamped guard protects fresh live traffic from adding to a failing
     # device. A replay is the recovery path itself: blocking it at the same
     # threshold creates a permanent queue deadlock once the shelf reaches 10.
-    if not replay and _BOX_HOLD:
+    if not replay and _BOX_HOLD and not shelf_is_stuck():
         # Legacy clips have no cast signature and may have been rendered in
         # a default voice before the current actors were selected. Preserve
         # them and recast them on replay, but do not let that migration hold
         # every fresh live discussion hostage behind an old shelf.
         if str(_BOX_HOLD[0].get("cast") or "") == _radio_cast_signature():
-            note_activity("held", "earlier dialogue is airing first - queued in order")
+            note_activity("held",
+                          "earlier dialogue is airing first - queued in order")
             return ""
         note_activity("recasting", "legacy dialogue is being rebuilt between live turns")
         note_activity("held", "box swamped — kept for the page + shelf")
@@ -13653,6 +13654,22 @@ def box_hold(clip: dict[str, Any], spoken: str, who: str,
             state_bump(host, {"nervousness": 0.5})
 
 
+# #854: when the shelf last MOVED. A shelf that is draining may gag
+# live dialogue; a shelf that is stuck may not.
+_SHELF_MOVED_AT = [0.0]
+SHELF_STUCK_AFTER = 90.0
+
+
+def shelf_is_stuck() -> bool:
+    """True when the hold shelf has not advanced recently. A stuck shelf
+    has no claim on the air — that claim is what silenced the whole
+    station for hours (#854)."""
+    if not _BOX_HOLD:
+        return False
+    since = _SHELF_MOVED_AT[0] or float(_BOX_HOLD[0].get("at") or 0)
+    return (time.time() - since) > SHELF_STUCK_AFTER
+
+
 async def _replay_held(clip: dict[str, Any]) -> bool:
     """Play a held clip and report whether it TRULY came out of the box
     (#467). HA accepting an announce is not delivery — a wedged box accepts
@@ -13680,7 +13697,28 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
     try:
         _rt0 = time.time()
         if not await _play_on_box(clip["path"], clip["sig"], replay=True):
+            # #854: THREE TRIES, then the head clip stops being the
+            # station's problem. An unplayable head used to jam the
+            # shelf for ever, and the shelf gagged every live line
+            # behind it — hours of total silence from three clips.
+            clip["tries"] = int(clip.get("tries") or 0) + 1
+            if clip["tries"] >= 3:
+                pipeline_log("air", "a held clip would not play three "
+                             "times — letting it go so the shelf (and "
+                             "the show) can move on (#854)",
+                             extra=str(clip.get("text") or "")[:200])
+                note_drop(str(clip.get("who") or "dj"),
+                          str(clip.get("text") or ""),
+                          "unplayable after three tries — released so "
+                          "the live show could speak (#854)")
+                try:
+                    _BOX_HOLD.remove(clip)
+                    _box_hold_save()
+                    _SHELF_MOVED_AT[0] = time.time()
+                except ValueError:
+                    pass
             return False
+        _SHELF_MOVED_AT[0] = time.time()
         if rows:
             # #830: it PLAYED — now the rows may move to their real slot.
             _stream_now_set(rows, length, stamp=True)
