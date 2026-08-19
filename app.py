@@ -11736,7 +11736,7 @@ def _speaking_now_clear(line_id: str = "") -> None:
         _SPEAKING_NOW.clear()
 
 
-def _stream_now_set(rows: list[dict[str, Any]], length: float) -> None:
+def _stream_now_set(rows: list[dict[str, Any]], length: float, stamp: bool = True) -> None:
     """A coalesced round is playing: remember its per-turn timeline (#748).
 
     dj_speak is the only thing that publishes a live line, and the coalesced
@@ -11755,6 +11755,8 @@ def _stream_now_set(rows: list[dict[str, Any]], length: float) -> None:
     # back onto the booth entries that were staged a beat ago. This is the
     # only place the true air time is ever known, and it used to be used for
     # nothing but "what is sounding right now" and then discarded.
+    if not stamp:
+        return
     when = {str(r.get("id") or ""): started + float(r.get("from") or 0)
             for r in rows if r.get("id")}
     if when:
@@ -12838,14 +12840,21 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
     length = float(clip.get("length") or 0.0)
     live_id = line_id or uuid.uuid4().hex[:6]
     if rows:
-        _stream_now_set(rows, length)
+        # #830: publish the window WITHOUT stamping — a failed replay
+        # used to drag every row to "now" on each knock, reshuffling
+        # the feed every second while the box was down.
+        _stream_now_set(rows, length, stamp=False)
     else:
         _speaking_now_set(live_id, str(clip.get("who") or "dj"),
                           "replay", str(clip.get("text") or ""),
                           "", "", "held")
     try:
+        _rt0 = time.time()
         if not await _play_on_box(clip["path"], clip["sig"], replay=True):
             return False
+        if rows:
+            # #830: it PLAYED — now the rows may move to their real slot.
+            _stream_now_set(rows, length, stamp=True)
         lp = _LAST_PLAYOUT
         if lp.get("key") == _played_out_key(clip["path"]) \
                 and time.time() - float(lp.get("at") or 0) < 200:
@@ -15704,7 +15713,7 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
         "page_id": str(made.get("id") or ""),
         "page_audio": name, "page_sig": sig,
     })
-    del _RADIO["chat"][:-160]
+    del _RADIO["chat"][:-240]
     # (c) PLAY IT — the point of the whole request is that you hear him.
     to = _RADIO.get("voice_to") or "box"
     if to in ("box", "both"):
@@ -16515,7 +16524,7 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
         "voice": str(entry.get("voice") or ""),
         "aired": "box" if ad_to in ("box", "both") else "page",
     })
-    del _RADIO["chat"][:-160]
+    del _RADIO["chat"][:-240]
     ad_aired(entry, "box" if ad_to in ("box", "both") else "page")   # #743
 
 
@@ -20316,7 +20325,8 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     # On the record like any spoken line (#269): which sample, from which
     # folder, with enough identity for the panel to vote it off the air.
     _RADIO["chat"].append({
-        "ts": int(time.time()), "who": "board", "kind": "sfx",
+        "ts": int(time.time()), "air_at": time.time(),
+        "who": "board", "kind": "sfx",
         "text": sample.stem, "sfx": key,
         "sfx_dir": sample.parent.name or "sfx",
         # #704: how long it ran, on the entry — the point of seeing them
@@ -22706,7 +22716,7 @@ def call_ended(name: str, line_say: str, started: float,
             "rule": outcome, "rule_id": str(rule.get("id") or ""),
             "seconds": round(ran, 1),
         })
-        del _RADIO["chat"][:-160]
+        del _RADIO["chat"][:-240]
         call_log_add({
             "ts": int(ended), "name": name, "line": line_say,
             "seconds": round(ran, 1), "turns": 0,
@@ -22726,7 +22736,7 @@ def call_ended(name: str, line_say: str, started: float,
         "rule_id": str(rule.get("id") or ""),
         "seconds": round(ran, 1),
     })
-    del _RADIO["chat"][:-160]
+    del _RADIO["chat"][:-240]
     call_log_add({
         "ts": int(ended), "name": name, "line": line_say,
         "seconds": round(ran, 1), "turns": int(turns),
@@ -25680,6 +25690,11 @@ async def speak_turns(turns: list[tuple[str, str]],
                     # a ring-length early.
                     ring_secs = sfx_seconds(ring) or 0.0
             transcript: list[tuple[str, str]] = []
+            # #830: transcript mirrors seg EXACTLY. These map each row
+            # to its seg slot (for the beat glued after it) and to its
+            # aired_items turn (-1 for stings and quips).
+            seg_ix: list[int] = []
+            turn_ix: list[int] = []
             # #no-repeats: the playlist item behind each transcript row, kept in step
             # with it, so the ledger below can be written from the item's
             # turn_text — the whole clean turn the gate tested — instead of
@@ -25752,6 +25767,15 @@ async def speak_turns(turns: list[tuple[str, str]],
                 if clip and clip.get("path"):
                     key = clip["path"].rsplit("/", 1)[-1]
                     seg.append(str(VOICE_MEDIA_DIR / key))
+                    # #830: the turn's row goes down NOW, before whatever
+                    # punches in after it — the booth's order IS the
+                    # audio's order (the quip used to land above the
+                    # line it was answering).
+                    transcript.append((item["who"], item["chunk"],
+                                       _clip_seconds(clip["path"])))
+                    seg_ix.append(len(seg) - 1)
+                    turn_ix.append(len(aired_items))
+                    aired_items.append(item)                          # #no-repeats
                     # #833: sting_due() existed, had a dial, had TESTS —
                     # and no live path ever called it. The samples now
                     # punch into the stream between lines, at the dial's
@@ -25760,6 +25784,14 @@ async def speak_turns(turns: list[tuple[str, str]],
                     if _sting:
                         seg.append(str(_sting))
                         _STING_AT[0] = time.time()
+                        # #830: the sting is IN the timeline — a board
+                        # row with its own window, not invisible audio
+                        # smeared across every later turn's clock.
+                        transcript.append(("board",
+                                           f"🔊 {_sting.stem}",
+                                           sfx_seconds(_sting)))
+                        seg_ix.append(len(seg) - 1)
+                        turn_ix.append(-1)
                         pipeline_log("air", f"sting: {_sting.stem} "
                                      "dropped between lines (#833)")
                     # #835: the SFX Guy's MOUTH — at the slider's rate a
@@ -25785,14 +25817,12 @@ async def speak_turns(turns: list[tuple[str, str]],
                             transcript.append(
                                 ("drop", _quip,
                                  _clip_seconds(_qc["path"])))
+                            seg_ix.append(len(seg) - 1)
+                            turn_ix.append(-1)
                             pipeline_log("air", "the SFX guy pipes up: "
                                          f"{_quip[:60]} (#835)")
-                    # #748: how long THIS turn runs, so the booth can follow the
-                    # coalesced clip turn by turn instead of knowing only that
-                    # "a round" is playing.
-                    transcript.append((item["who"], item["chunk"],
-                                       _clip_seconds(clip["path"])))
-                    aired_items.append(item)                          # #no-repeats
+                    # #748/#830: the turn's transcript row was appended
+                    # above, before the sting and the quip, mirroring seg.
                     # #782: what it cost to make this turn, kept on the item
                     # so the dossier can show it beside what it cost to say.
                     item["render"] = {
@@ -25874,6 +25904,8 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # a turn's index in `beats` is its row plus the ring.
                 offset = ring_secs
                 lead = 1 if ring_secs else 0
+                _est0 = time.time()
+                _entries: list[dict[str, Any]] = []
                 for _row, (who, chunk, secs) in enumerate(transcript):
                     spoken.append(f"{who}: {chunk}")
                     # #752: the coalesced path never went near dj_speak, so
@@ -25889,16 +25921,21 @@ async def speak_turns(turns: list[tuple[str, str]],
                     # first chunk of each turn; continuation chunks add
                     # nothing, which is also what stops one turn being counted
                     # three times.
-                    _turn = str((aired_items[_row].get("turn_text") or "")
-                                if _row < len(aired_items) else "")
+                    _ti = turn_ix[_row] if _row < len(turn_ix) else -1
+                    _turn = str((aired_items[_ti].get("turn_text") or "")
+                                if 0 <= _ti < len(aired_items) else "")
                     if _turn:
                         print_remember(_turn, who, "stream")
                         said_remember(_turn)
                         phrase_remember(_turn, who)
                     rid = uuid.uuid4().hex[:6]
+                    _kind = "sfx" if who == "board" else "call"
                     entry = {
                         "id": rid,
-                        "ts": int(time.time()), "who": who, "kind": "call",
+                        "ts": int(time.time()), "who": who, "kind": _kind,
+                        **({"sfx": chunk, "sfx_dir": "the stream",
+                            "seconds": round(float(secs or 0), 2)}
+                           if who == "board" else {}),
                         "text": chunk, "aired": "stream",
                         "name": booth_actor_name(
                             who, caller_name if who == "caller"
@@ -25909,7 +25946,7 @@ async def speak_turns(turns: list[tuple[str, str]],
                         # is an estimate — playback starts a beat after this
                         # loop — and _stream_now_set corrects it below with
                         # the real handover time.
-                        "air_at": time.time() + offset,
+                        "air_at": _est0 + offset,
                         # #766: which document seeded it. dj_speak has carried
                         # this since #226 and the coalesced road never did —
                         # which is most of the show, and all of every call. It
@@ -25922,8 +25959,8 @@ async def speak_turns(turns: list[tuple[str, str]],
                         # which is where most of the show comes from.
                         "trace": {
                             "queued_at": time.time(),
-                            "render": (aired_items[_row].get("render") or {})
-                            if _row < len(aired_items) else {},
+                            "render": (aired_items[_ti].get("render") or {})
+                            if 0 <= _ti < len(aired_items) else {},
                             "written": _model_call_for(chunk),
                             "chars": len(chunk),
                             "kind": "burst",
@@ -25931,13 +25968,16 @@ async def speak_turns(turns: list[tuple[str, str]],
                         },
                     }
                     _RADIO["chat"].append(entry)
+                    _entries.append(entry)
                     # #778: the length this turn actually runs for INSIDE the
                     # coalesced clip.
+                    _sx = (seg_ix[_row] if _row < len(seg_ix)
+                           else _row + lead)
                     _real = (concat_real_seconds(
-                                 secs, beats[_row + lead]
-                                 if _row + lead < len(beats) else 0.0)
+                                 secs, beats[_sx]
+                                 if _sx < len(beats) else 0.0)
                              if mixed else max(0.4, secs))
-                    rows.append({"id": rid, "who": who, "kind": "call",
+                    rows.append({"id": rid, "who": who, "kind": _kind,
                                  "text": chunk,
                                  "name": booth_actor_name(
                                      who, caller_name if who == "caller"
@@ -25967,6 +26007,11 @@ async def speak_turns(turns: list[tuple[str, str]],
                     for r in rows:
                         r["from"] = ring_secs + (r["from"] - ring_secs) * scale
                         r["until"] = ring_secs + (r["until"] - ring_secs) * scale
+                    # #830: page-routed bursts never get the box road's
+                    # real correction — the estimate must at least agree
+                    # with the SCALED timeline instead of the raw sums.
+                    for _r2, _e2 in zip(rows, _entries):
+                        _e2["air_at"] = _est0 + float(_r2.get("from") or 0)
                 # Deliver the ONE clip on the routing the DJ voice is set to,
                 # mirroring to the page when the box is down (#536).
                 vto = _RADIO.get("voice_to") or "box"
@@ -32197,6 +32242,15 @@ def _mind_song(mind: str, title: str, body: str) -> int:
     not one digest at the end of a job a restart can erase. Returns 1
     when a new document lands so the caller can pace reindexing."""
     try:
+        # #829: 330 song files landed in the OPERATOR'S OWN speakbox —
+        # mind_id() silently falls back to "main" for an unregistered
+        # id, and extraction lyrics do not belong in the shared shelf.
+        # An album mind that will not resolve keeps its pages under
+        # data/lyrics and stays OUT of the speakbox system.
+        if mind != "main" and mind_id(mind) == "main":
+            pipeline_log("speakbox", f"mind {mind} not registered — "
+                         "lyrics stay OUT of the shared speakbox (#829)")
+            return 0
         root = speakbox_dir(mind)
         root.mkdir(parents=True, exist_ok=True)
         doc = root / f"{safe_key(title) or 'track'} - lyrics.md"
@@ -32277,7 +32331,16 @@ async def _lyric_run(job_id: str, artist: str, tracks: list[dict[str, Any]],
         if songs:
             digest = await _lyric_digest(artist, songs)
             (folder / "_artist.md").write_text(digest, encoding="utf-8")
-            # And into the mind, where the pair can actually mine it.
+            # And into the mind, where the pair can actually mine it —
+            # #829: NEVER into "main" by fallback; the shared shelf is
+            # the operator's, not a dumping ground for extractions.
+            if mind != "main" and mind_id(mind) == "main":
+                _lyric_note(job, stage="done", progress=1.0,
+                            done=len(tracks), songs=len(songs),
+                            folder=str(folder))
+                pipeline_log("speakbox", f"digest for {artist} kept out "
+                             "of the speakbox — mind unregistered (#829)")
+                return
             root = speakbox_dir(mind)
             root.mkdir(parents=True, exist_ok=True)
             clean = re.sub(r"[^A-Za-z0-9 ._-]", "", artist).strip() or "artist"
@@ -65702,6 +65765,20 @@ async function callRecordings() {
         + "align-items:center";
       const note = el("span", "muted", "");
       note.style.cssText = "font-size:10.5px";
+
+      // #816: the produced audio is one click from being KEPT, right on
+      // the desk row — not only in the popup and the booth tile.
+      if (a.audio) {
+        const keep = el("a", "", "⬇ keep the mp3");
+        keep.href = a.audio;
+        keep.download = ((a.product || "ad")
+          .replace(/[^\w -]+/g, "").slice(0, 48) || "ad") + ".mp3";
+        keep.title = "Download this spot";
+        keep.style.cssText = "font-size:11px;padding:2px 8px;"
+          + "color:#ffd479;border:1px solid var(--border);"
+          + "border-radius:7px;text-decoration:none";
+        acts.appendChild(keep);
+      }
 
       const save = el("button", "", "💾 Save the words");
       save.style.cssText = "font-size:11px;padding:2px 8px";

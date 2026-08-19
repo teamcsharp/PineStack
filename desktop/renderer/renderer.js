@@ -3108,7 +3108,11 @@ function initCrystalBtn() {
           });
         } catch (err) { box.textContent = err.message; }
       };
-      for (const m of allRows) {
+      // #817: THIS crystal's minds inline; every other registered
+      // mind lives behind a collapsed branch — still fully expandable
+      // (albums → songs → lyrics), never mixed into the crystal's own
+      // section.
+      const mindNode = (m) => {
         const node = document.createElement("details");
         node.className = "cp-mindnode";
         const cap = document.createElement("summary");
@@ -3139,7 +3143,32 @@ function initCrystalBtn() {
         songs.className = "cp-songs";
         node.appendChild(songs);
         node.ontoggle = () => { if (node.open) loadSongs(songs, m.id); };
-        r3.appendChild(node);
+        return node;
+      };
+      const members = allRows.filter((m) => have.has(m.id));
+      const others = allRows.filter((m) => !have.has(m.id));
+      members.forEach((m) => r3.appendChild(mindNode(m)));
+      if (!members.length) {
+        const none = document.createElement("div");
+        none.className = "cp-mindrow";
+        none.style.cursor = "default";
+        none.innerHTML = "<span></span><span class='muted'>no minds in "
+          + "this crystal yet — open the branch below</span>"
+          + "<span></span><span></span>";
+        r3.appendChild(none);
+      }
+      if (others.length) {
+        const branch = document.createElement("details");
+        branch.className = "cp-addminds";
+        const cap = document.createElement("summary");
+        cap.textContent = "＋ other minds (" + others.length
+          + ") — check one to add it to this crystal";
+        branch.appendChild(cap);
+        const box = document.createElement("div");
+        box.className = "cp-mindtable";
+        others.forEach((m) => box.appendChild(mindNode(m)));
+        branch.appendChild(box);
+        r3.appendChild(branch);
       }
       card.appendChild(r3);
 
