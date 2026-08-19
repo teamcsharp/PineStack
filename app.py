@@ -5715,6 +5715,26 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
     elif mp_state:
         note("the music player", mp_state)
 
+    # 3c (#837, the 2026-08-19 reboot): the music LIBRARY is a CIFS
+    # mount with `nofail` — a host reboot can silently skip it, and the
+    # show then queues 35k indexed tracks whose files all 404. The
+    # remount needs root on the host, so the tree can only say it
+    # plainly and loudly.
+    try:
+        _lib_ok = await asyncio.to_thread(
+            lambda: any(Path("/music/itunes").iterdir()))
+    except Exception:  # noqa: BLE001
+        _lib_ok = False
+    if not _lib_ok:
+        note("the music library",
+             "/music/itunes is EMPTY — the CIFS share did not survive a "
+             "host reboot (nofail); every indexed track 404s",
+             "needs a hand on the host: sudo mount "
+             "/home/ehm_eckx/music/itunes, then restart spark-agent so "
+             "the bind sees it")
+    else:
+        note("the music library", "mounted and populated")
+
     # 4. the device, on the wire — the truth no entity can fake
     wire = await _wire_probe(NABU_PROBE_HOST)
     if wire == "alive" and not link.get("online"):
@@ -6895,6 +6915,21 @@ async def engine_health(engine: str, force: bool = False) -> dict[str, Any]:
     return dict(slot)
 
 
+_DIRECTOR_STAMP_AT = {"xtts": 0.0, "f5": 0.0}
+
+
+def _director_stamp(engine: str) -> None:
+    """#836: tell the director the engine is EARNING its residency.
+    Direct renders (:8770/:8772) never pass through the director, so
+    its idle clock read a busy engine as silent and unloaded a working
+    XTTS every 30 minutes. Throttled to one ping a minute."""
+    now = time.time()
+    if now - _DIRECTOR_STAMP_AT.get(engine, 0.0) < 60:
+        return
+    _DIRECTOR_STAMP_AT[engine] = now
+    fire_and_forget(_director_post(f"/director/engine/{engine}/rendered"))
+
+
 async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
     """THE seam. Add an engine here and the rest of the system inherits it."""
     if engine == "piper":
@@ -6914,9 +6949,12 @@ async def synthesize(text: str, voice: str, engine: str) -> tuple[bytes, str]:
             fire_and_forget(_xtts_bounce_maybe())
             raise
         _XTTS_LAST_USED[0] = time.time()
+        _director_stamp("xtts")             # #836: the director's clock too
         return _out, "wav"
     if engine == "f5":
-        return await asyncio.wait_for(_f5_synthesize(text, voice), 150), "wav"
+        _out5 = await asyncio.wait_for(_f5_synthesize(text, voice), 150)
+        _director_stamp("f5")               # #836
+        return _out5, "wav"
     if engine == "voxtral":
         return await asyncio.wait_for(_voxtral_synthesize(text, voice), 120)
     # #786: the bench. Clone engines share the base64-reference contract;
@@ -37231,6 +37269,72 @@ async def radio_cache_remix(
             "sig": media_sign(name)}
 
 
+@app.post("/api/radio-cache/span")
+async def radio_cache_span(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#837: cut the broadcast AS IT SOUNDED for an arbitrary window —
+    the call-download button. Talk, records, ads, stings — everything
+    that aired inside [lo, hi], mixed at the current levels, shelved
+    with the collected sets so it also shows in the Broadcast tab."""
+    require_auth(authorization)
+    payload = await request.json()
+    try:
+        lo = float(payload["lo"])
+        hi = float(payload["hi"])
+    except Exception:
+        raise HTTPException(status_code=400,
+                            detail="lo and hi, epoch seconds")
+    if not (0 < hi - lo <= 3600):
+        raise HTTPException(status_code=400,
+                            detail="a span between 1s and 60 minutes")
+    label = (re.sub(r"[^\w\- ]+", "",
+                    str(payload.get("label") or "call"))[:40]
+             .strip().replace(" ", "-") or "call")
+    if _MIX_GATE:
+        raise HTTPException(
+            status_code=409,
+            detail="A mix is already rendering — one at a time.")
+    # #837: a call that JUST ended still lives in the open episode — the
+    # rebuild only reads sealed ones, so seal first when they overlap.
+    ep = _RADIO.get("episode") or {}
+    if (ep.get("items") or []) and float(ep.get("started") or 0) < hi:
+        sealed = await asyncio.to_thread(_episode_finalize)
+        if sealed:
+            pipeline_log("air", "sealed the open episode so the span cut "
+                                "can include it (#837)")
+    levels = mix_levels()
+    _MIX_GATE.append(1)
+    try:
+        built = await asyncio.to_thread(
+            _broadcast_mix, lo, hi,
+            max(0.0, min(2.0, levels["music"] / 100)),
+            max(0.0, min(0.9, levels["duck"] / 100)),
+            max(0.25, min(2.0, levels["voice"] / 100)),
+            "_span")
+    finally:
+        _MIX_GATE.clear()
+    if not built:
+        raise HTTPException(status_code=500,
+                            detail="The cut came out empty")
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(lo))
+    name = f"{label}-{stamp}.mp3"
+    BROADCASTS_DIR.mkdir(parents=True, exist_ok=True)
+    target = BROADCASTS_DIR / name
+    built.replace(target)
+    try:
+        target.with_suffix(".json").write_text(
+            json.dumps({"lo": lo, "hi": hi, "levels": levels}))
+    except OSError:
+        pass
+    pipeline_log("air", f"a {int(hi - lo)}s call segment was cut from "
+                        f"the broadcast rebuild — {name} (#837)")
+    return {"name": name, "seconds": round(hi - lo, 1),
+            "url": f"/api/radio-cache/broadcasts/{name}"
+                   f"?t={media_sign(name)}"}
+
+
 @app.get("/api/radio-cache/broadcasts/{name}")
 async def radio_cache_broadcast_file(
     name: str,
@@ -55963,9 +56067,44 @@ function djTalkRow(line) {
     if (line.kind === "hangup") {
       row.style.cssText += ";background:#1a0f14;border:1px solid #4a2230;"
         + "flex-direction:column;gap:3px;margin:4px 0";
+      const top = el("div", "row", "");
+      top.style.cssText = "gap:6px;align-items:flex-start;width:100%";
       const head = el("div", "", line.text || "the call ended");
-      head.style.cssText = "font-size:11.5px;color:#ff9db1;font-weight:600";
-      row.appendChild(head);
+      head.style.cssText = "font-size:11.5px;color:#ff9db1;font-weight:600;"
+        + "flex:1;min-width:0";
+      top.appendChild(head);
+      // #837: the whole SEGMENT as it aired — guests, hosts, records,
+      // ads, stings — cut from the broadcast rebuild and handed over.
+      const take = el("button", "", "⬇");
+      take.title = "Download the broadcast of this call — everything "
+        + "that aired while they were on the line, music and ads "
+        + "included, mixed as it sounded";
+      take.style.cssText = "flex:0 0 auto;background:#2a1620;"
+        + "border:1px solid #63304a;color:#ffc2d1;border-radius:6px;"
+        + "padding:1px 7px;font-size:12px;cursor:pointer";
+      take.onclick = async (ev) => {
+        ev.stopPropagation();
+        const secs = Number(line.seconds || 0) || 180;
+        const done = pending(take, "⏳");
+        try {
+          const got = await api("/api/radio-cache/span", {method: "POST",
+            body: JSON.stringify({
+              lo: Number(line.ts) - secs - 6,
+              hi: Number(line.ts) + 4,
+              label: "call-" + (line.name || "caller")})});
+          const r = await fetch(got.url);
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const url = URL.createObjectURL(await r.blob());
+          const a = document.createElement("a");
+          a.href = url; a.download = got.name;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(url), 15000);
+          setStatus("the call segment is saved — " + got.name);
+        } catch (e) { setStatus(e.message, true); }
+        finally { done(); }
+      };
+      top.appendChild(take);
+      row.appendChild(top);
       const why = el("button", "", "⛓ " + (line.reason || "no reason on file"));
       why.title = (line.rule || "")
         + "\n\nClick to open how call terminations are handled — the rules "
