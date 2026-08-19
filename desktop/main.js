@@ -524,12 +524,19 @@ async function reconstituteDesktop() {
       supportProgress("routing", 84, "restoring Nabu/app broadcast route");
       await fetchJson(`${readConfig().baseUrl}/api/dj/output`, {
         method: "POST",
+        // #855: a rebuild must NOT move the music switch, and must not
+        // masquerade as an operator choice. This POSTed music:"off"
+        // with no `system` flag, so every rebuild click both silenced
+        // the records AND wrote "off" into the operator ledger as
+        // though it had been chosen — after which the box vigil
+        // faithfully replayed it. The operator was clicking rebuild
+        // BECAUSE the radio had gone quiet, which made it quieter.
         body: JSON.stringify({
-          music: "off",
           voice: "box",
           reply: "box",
           voice_device: "nabu",
-          box_talk: true
+          box_talk: true,
+          system: true
         })
       });
     } catch (err) {

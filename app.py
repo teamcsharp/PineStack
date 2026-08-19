@@ -5589,11 +5589,15 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
         # plainly instead of pretending the device is broken.
         want = _operator_routing_read()
         changed = []
-        for axis in ("music_to", "voice_to", "reply_to"):
-            pick = str(want.get(axis) or "")
+        # #855: the ledger is keyed "music"/"voice"/"reply" — this used
+        # to look up "music_to" and so never matched, never restored and
+        # never warned. Dead code guarding the very thing that broke.
+        for _key, axis in (("music", "music_to"), ("voice", "voice_to"),
+                           ("reply", "reply_to")):
+            pick = str(want.get(_key) or want.get(axis) or "")
             if pick and pick != str(_RADIO.get(axis) or ""):
                 _RADIO[axis] = pick
-                changed.append(f"{axis.split('_')[0]}→{pick}")
+                changed.append(f"{_key}→{pick}")
         if changed:
             _routing_save()
             fire_and_forget(box_route_wake())
@@ -5813,9 +5817,12 @@ async def _box_vigil() -> None:
                                 "http://127.0.0.1:8096/api/dj/output",
                                 headers={"Authorization":
                                          f"Bearer {_api_key}"},
-                                json={**ledger, "system": True})
+                                json={**{k: v for k, v in ledger.items()
+                                         if k != "music"},
+                                      "system": True})
                         pipeline_log("repair", "vigil: operator routing "
-                                     f"restored — {ledger} (#818)")
+                                     f"restored — {ledger} (music left "
+                                     "alone, #855)")
                     except Exception:  # noqa: BLE001
                         pass
                 if _RADIO.get("on"):
@@ -5964,8 +5971,12 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
                     await client.post(
                         "http://127.0.0.1:8096/api/dj/output",
                         headers={"Authorization": f"Bearer {_api_key}"},
-                        json={"music": "both", "voice": "both",
-                              "system": True})
+                        # #855: the failover moves the VOICE road,
+                        # never the music road. The music switch is the
+                        # operator's alone, and rerouting it on a dark
+                        # blip is how records ended up playing into a
+                        # browser nobody had open.
+                        json={"voice": "both", "system": True})
             except Exception:  # noqa: BLE001
                 pass
             fire_and_forget(_box_vigil())
@@ -30027,7 +30038,7 @@ async def generate_answer(
         _RADIO["music_to"] = "both"
         _RADIO["voice_to"] = "both"
         _routing_save()
-        _operator_routing_stamp({"music_to": "both", "voice_to": "both"})
+        _operator_routing_stamp({"music": "both", "voice": "both"})
         fire_and_forget(box_route_wake())
         feature_meta["system_status_used"] = True
         return ("Done — the music and the DJs now play out of the box "
@@ -64074,8 +64085,11 @@ async function djVoicePoll(immediate) {
 async function djGo() {
   const status = document.getElementById("musicStatus");
   if (status) status.textContent = "Getting Pine Box FM on air…";
-  // Whatever the output selectors say is what the session should use.
-  await djSetOutput().catch(() => {});
+  // #855: routing is SERVER-authoritative (#501). This used to POST
+  // the browser's own selector values on every go-on-air, so a tab
+  // holding a stale "this page" pick rewrote the operator ledger and
+  // the vigil then replayed it forever. djRender's sync keeps the
+  // selects honest in the other direction.
   const state = await api("/api/dj/start", {
     method: "POST",
     body: JSON.stringify({
@@ -64143,8 +64157,7 @@ async function djToggleSession() {
       return;
     }
     const station = (document.getElementById("djStation") || {}).value || "all";
-    // Whatever the output selectors say is what the session should use.
-    await djSetOutput().catch(() => {});
+    // #855: no stale-selector echo here either — see djGo.
     const state = await api("/api/dj/start", {
       method: "POST", body: JSON.stringify({station}),
     });
