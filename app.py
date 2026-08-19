@@ -4281,6 +4281,44 @@ def wake_route(text: str, settings: dict[str, Any] | None = None) \
     return None
 
 
+_RESCUE_RX = re.compile(
+    r"(?:where(?:'s| is| did)\s+(?:the\s+)?"
+    r"(?:radio|station|show|broadcast|pine\s*fm)"
+    r"|what(?:'s| is| has)?\s+(?:happened|happening|going on|wrong)\s+"
+    r"(?:to|with)\s+(?:the\s+)?"
+    r"(?:radio|station|network|system|show|broadcast|pine\s*fm|box)"
+    r"|why\s+(?:is|isn'?t|was)\s+(?:the\s+)?"
+    r"(?:radio|station|network|show|broadcast|music|sound)"
+    r"|(?:fix|reboot|restart|revive|resurrect)\s+(?:the\s+)?"
+    r"(?:radio|station|network|system|show|broadcast|pine\s*fm)"
+    r"|bring\s+(?:up|back)\s+(?:the\s+)?"
+    r"(?:radio|station|pine\s*fm|show|broadcast)"
+    r"|get\s+(?:the\s+)?(?:radio|station|show|broadcast)\s+back"
+    r"|is\s+(?:the\s+)?(?:radio|station|show)\s+"
+    r"(?:up|on|down|dead|alive|working|broken))", re.IGNORECASE)
+
+
+def is_radio_rescue(text: str) -> bool:
+    """#827: 'where is the radio station', 'what happened to the
+    network', 'reboot the radio' — very basic words that mean ONE thing:
+    run the whole triage tree, fix every fixable branch, and end with a
+    station somebody can hear."""
+    return bool(_RESCUE_RX.search(str(text or "")))
+
+
+_PLAY_ON_DEVICE_RX = re.compile(
+    r"play\s+(?:the\s+)?(?:audio|music|sound|d\.?\s?j\.?s?|deejays?"
+    r"|broadcast|show|station|radio)\b"
+    r".{0,50}?\b(?:out of|on|through|from|to)\s+(?:the\s+)?"
+    r"(?:device|nabu|pine\s*box|box|speaker)", re.IGNORECASE)
+
+
+def is_play_on_device(text: str) -> bool:
+    """#827: 'play the music and the DJs out of the device' — a routing
+    order in plain words."""
+    return bool(_PLAY_ON_DEVICE_RX.search(str(text or "")))
+
+
 def is_openwebui_request(text: str) -> bool:
     hit = wake_route(text)
     if hit:
@@ -5569,6 +5607,29 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
     ent = ("available" if link.get("online") else "unavailable")
     note("the satellite entity", ent)
 
+    # 3b (#826): the MUSIC half has its own entity — the media player.
+    # A silent device with a healthy satellite was exactly this: voice
+    # announces landing while every record fell into a void.
+    mp_state = ""
+    if token and NABU_MEDIA_PLAYER:
+        try:
+            async with httpx.AsyncClient(timeout=8) as client:
+                _mp = await client.get(
+                    f"{HA_URL}/api/states/{NABU_MEDIA_PLAYER}",
+                    headers={"Authorization": f"Bearer {token}"})
+                mp_state = (str(_mp.json().get("state") or "")
+                            if _mp.status_code == 200 else "missing")
+        except Exception:  # noqa: BLE001
+            mp_state = "unreachable"
+    if mp_state in ("unavailable", "unknown", "missing", "unreachable"):
+        note("the music player", f"entity {mp_state} — records are "
+             "routed into a void while the satellite still talks",
+             "climbing the link ladder" if fix else "")
+        if fix and ha_ok:
+            fire_and_forget(nabu_link_ladder("music player dead (#826)"))
+    elif mp_state:
+        note("the music player", mp_state)
+
     # 4. the device, on the wire — the truth no entity can fake
     wire = await _wire_probe(NABU_PROBE_HOST)
     if wire == "alive" and not link.get("online"):
@@ -6223,6 +6284,14 @@ async def xtts_health(force: bool = False) -> dict[str, Any]:
             detail = str(data.get("error") or data.get("status") or "")
     except Exception as exc:
         detail = f"unreachable — {exc}"
+    if ready and not _XTTS_HEALTH.get("ready"):
+        # #835: a FRESH arrival counts as used. The idle clock's baseline
+        # was hours stale after any downtime, so every revived XTTS was
+        # terminated within one tick of coming ready — before the first
+        # render could find it. That was the endless F5-only cast.
+        _XTTS_LAST_USED[0] = time.time()
+        pipeline_log("gpu", "XTTS is back — the idle clock resets so it "
+                     "gets a full window to catch its first render (#835)")
     _XTTS_HEALTH.update({"at": time.time(), "ready": ready, "detail": detail})
     return _XTTS_HEALTH
 
@@ -29141,6 +29210,57 @@ async def generate_answer(
             **feature_meta,
             "active_prompt": prompt_entry["name"],
             "model": ow_model,
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    # #827: the rescue words. "Where is the radio station?" IS the
+    # order: run the whole tree, fix everything fixable, and call the
+    # verdict on this same speaker. The answer returns immediately; the
+    # work rides behind it, and the tree itself resumes the show, climbs
+    # the link ladder, revives engines and routes around a dark device.
+    if is_radio_rescue(user_text):
+        async def _rescue() -> None:
+            try:
+                got = await box_triage(fix=True)
+                verdict = str(got.get("verdict") or "triage finished")
+                fixes = [s for s in (got.get("steps") or [])
+                         if s.get("did")]
+                line = verdict if not fixes else (
+                    verdict + " — " + "; ".join(
+                        f"{s['name']}: {s['did']}" for s in fixes[:4]))
+                await home_assistant_say(line[:400], plain=True)
+            except Exception:  # noqa: BLE001
+                pass
+        fire_and_forget(_rescue())
+        feature_meta["system_status_used"] = True
+        return ("On it. Running the full triage — the show, Home "
+                "Assistant, the satellite, the music player, the wire, "
+                "the voice director and both engines — and fixing every "
+                "branch that needs it. The verdict follows on this "
+                "speaker in a moment."), {
+            **feature_meta,
+            "active_prompt": prompt_entry["name"],
+            "model": "triage",
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+        }
+
+    # #827: "play the music and the DJs out of the device" — a routing
+    # order in plain words. 'both' keeps the page alive alongside the
+    # box, so nothing the operator was hearing goes away.
+    if is_play_on_device(user_text):
+        _RADIO["music_to"] = "both"
+        _RADIO["voice_to"] = "both"
+        _routing_save()
+        _operator_routing_stamp({"music_to": "both", "voice_to": "both"})
+        fire_and_forget(box_route_wake())
+        feature_meta["system_status_used"] = True
+        return ("Done — the music and the DJs now play out of the box "
+                "as well as the page."), {
+            **feature_meta,
+            "active_prompt": prompt_entry["name"],
+            "model": "routing",
             "prompt_tokens": 0,
             "completion_tokens": 0,
         }
