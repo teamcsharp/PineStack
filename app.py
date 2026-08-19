@@ -4286,7 +4286,8 @@ _RESCUE_RX = re.compile(
     r"(?:radio|station|show|broadcast|pine\s*fm)"
     r"|what(?:'s| is| has)?\s+(?:happened|happening|going on|wrong)\s+"
     r"(?:to|with)\s+(?:the\s+)?"
-    r"(?:radio|station|network|system|show|broadcast|pine\s*fm|box)"
+    r"(?:radio|station|network|system|show|broadcast|pine\s*fm|box"
+    r"|d\.?\s?j\.?s?|deejays?|hosts?|banter)"
     r"|why\s+(?:is|isn'?t|was)\s+(?:the\s+)?"
     r"(?:radio|station|network|show|broadcast|music|sound)"
     r"|(?:fix|reboot|restart|revive|resurrect)\s+(?:the\s+)?"
@@ -4299,7 +4300,8 @@ _RESCUE_RX = re.compile(
 
 
 _RESCUE_NOUN = re.compile(
-    r"\b(?:radio|station|pine\s*fm|broadcast)\b", re.IGNORECASE)
+    r"\b(?:radio|station|pine\s*fm|broadcast|d\.?\s?j\.?s?|deejays?"
+    r"|hosts?|banter|dialogue)\b", re.IGNORECASE)
 _RESCUE_MOOD = re.compile(
     r"\b(?:where|down|dead|gone|missing|broke(?:n)?|offline|quiet|"
     r"silent|bro|wtf|fuck(?:ing)?|restore|fix|help|back|at)\b",
@@ -5504,6 +5506,55 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                  "music is routed to the PAGE by the stamped operator "
                  "choice — the box carries voice only; flip the music "
                  "switch to Nabu if that is not what you want")
+        # #841: THE DJ RUNG — "what happened to the djs": music can
+        # roll while the TALK chain is dead (writer model down, engines
+        # cold, a beheaded round). Measure the last AIRED line, check
+        # the writer, cut to a fresh round, and put a live voice on the
+        # air as proof.
+        _now = time.time()
+        _aired = [ln for ln in (_RADIO.get("chat") or [])
+                  if ln.get("who") in ("dj", "cohost", "third", "host")
+                  and ln.get("aired") not in ("held",)]
+        _last_talk = float(_aired[-1].get("ts") or 0) if _aired else 0.0
+        _talk_gap = _now - _last_talk if _last_talk else 1e9
+        _writer_ok = False
+        try:
+            async with httpx.AsyncClient(timeout=6) as _c:
+                _writer_ok = (await _c.get(
+                    "http://127.0.0.1:11434/api/tags")).status_code == 200
+        except Exception:  # noqa: BLE001
+            _writer_ok = False
+        if not _writer_ok:
+            mark("the writer", "ollama is NOT answering — nobody can "
+                 "write a round",
+                 "asking the lifeboat to restart it (best effort)")
+            await _lifeboat_restart("ollama")
+        if _talk_gap > 600:
+            mark("the DJs", "no host line has AIRED in "
+                 f"{int(_talk_gap // 60)} minutes",
+                 "cutting to a fresh round and putting a live line "
+                 "out as proof")
+            _TALK_CUT[0] += 1
+            _RADIO["fast_skip"] = True
+            dj_skip()
+        if _talk_gap > 180:
+            async def _prove() -> None:
+                try:
+                    await dj_speak(
+                        "interject", _RADIO.get("now"),
+                        extra=("one short line proving the desk is "
+                               "alive: the DJs are back on the air "
+                               "and the repair just ran"),
+                        who="dj", by_hand=True)
+                except Exception:  # noqa: BLE001
+                    pass
+            fire_and_forget(_prove())
+            if _talk_gap <= 600:
+                mark("the DJs", f"last aired line {int(_talk_gap)}s "
+                     "ago — a proof line goes out now")
+        else:
+            mark("the DJs", "talking normally — last aired line "
+                 f"{int(_talk_gap)}s ago")
         quiet = time.time() - _BOX_LAST_OK[0]
         routed = ((_RADIO.get("music_to") or "here") in ("box", "both")
                   or (_RADIO.get("voice_to") or "box") in ("box", "both"))
@@ -25628,8 +25679,18 @@ def say_max_chunks(cap: int) -> int:
 
     Bounded by SAY_MAX_ANNOUNCES, because each chunk is a separate announce
     at the box and it plays them one at a time. Trading truncation for a
-    flooded device is not a trade worth making."""
-    return max(10, min(SAY_MAX_ANNOUNCES, SAY_TURN_BUDGET // max(1, cap)))
+    flooded device is not a trade worth making.
+
+    #841: the budget FOLLOWS the reply ceiling. SAY_TURN_BUDGET was a
+    flat 3600 while reply_max_chars sat at 5000+ — every long reply
+    deterministically lost its tail, which the operator heard as
+    'replies cut off prematurely'. The full reply always plays now:
+    budget = max(3600, reply_max_chars), ceiling-divided so the last
+    partial chunk is kept, still capped at SAY_MAX_ANNOUNCES."""
+    budget = max(SAY_TURN_BUDGET,
+                 int(dj_settings().get("reply_max_chars") or 0))
+    cap = max(1, cap)
+    return max(10, min(SAY_MAX_ANNOUNCES, (budget + cap - 1) // cap))
 
 
 def sentence_chunks(text: str, cap: int = 300, most: int = 10) -> list[str]:
