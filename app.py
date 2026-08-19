@@ -9001,18 +9001,38 @@ def _played_out_key(path: str) -> str:
     return path.rsplit("/", 1)[-1].split("?")[0]
 
 
+_CLIP_SECS_CACHE: dict[str, float] = {}
+
+
 def _clip_seconds(path: str) -> float:
     """How long a clip actually plays, read off the file itself — so the
     announce lock can be held for the AUDIO, not merely for the API call
-    that started it (#319)."""
+    that started it (#319).
+
+    #872: cached on name+mtime, and able to measure a file by its own
+    path rather than only a media key. It used to reopen the file on
+    every single call and silently return 0.0 for anything outside
+    VOICE_MEDIA_DIR — which is every staged episode clip, so the booth
+    download probed hundreds of files to learn nothing."""
     try:
-        key = path.rsplit("/", 1)[-1].split("?")[0]
-        if not MEDIA_KEY_SHAPE.match(key):
+        raw = str(path or "").split("?")[0]
+        key = raw.rsplit("/", 1)[-1]
+        target = (VOICE_MEDIA_DIR / key
+                  if MEDIA_KEY_SHAPE.match(key) else Path(raw))
+        if not target.is_file():
             return 0.0
+        ck = f"{target}:{target.stat().st_mtime_ns}"
+        held = _CLIP_SECS_CACHE.get(ck)
+        if held is not None:
+            return held
         import mutagen
-        info = mutagen.File(VOICE_MEDIA_DIR / key)
-        return float(getattr(getattr(info, "info", None), "length", 0.0)
+        info = mutagen.File(target)
+        secs = float(getattr(getattr(info, "info", None), "length", 0.0)
                      or 0.0)
+        if len(_CLIP_SECS_CACHE) > 6000:
+            _CLIP_SECS_CACHE.clear()
+        _CLIP_SECS_CACHE[ck] = secs
+        return secs
     except Exception:
         return 0.0
 
@@ -37836,152 +37856,176 @@ async def music_played_api(
     return {"played": rows}
 
 
-@app.get("/api/booth/clip")
-async def booth_clip_api(
-    at: float = 0.0,
-    authorization: str | None = Header(default=None),
-) -> Response:
-    """#840: the audio behind ONE booth row, found by air time. The
-    open episode's staging holds every aired clip as its own file; a
-    sealed episode still yields an exact cut through its marks."""
-    require_read_auth(authorization)
-    if not at:
-        raise HTTPException(status_code=400, detail="at=epoch seconds")
+# #872: the booth's own index. (start, end, path, offset_into_file),
+# sorted by start, rebuilt only when the folders change.
+_BOOTH_INDEX: list[tuple[float, float, str, float]] = []
+_BOOTH_INDEX_SIG = [""]
+
+
+def _booth_index_sig() -> str:
+    """Cheap fingerprint of the two shelves. A new staged clip or a
+    freshly sealed episode changes it; nothing else does."""
     try:
-        import imageio_ffmpeg
-        _exe = imageio_ffmpeg.get_ffmpeg_exe()
-    except Exception:  # noqa: BLE001
-        _exe = "ffmpeg"
+        st = _EPISODE_STAGE.stat().st_mtime_ns if _EPISODE_STAGE.is_dir() \
+            else 0
+    except OSError:
+        st = 0
+    try:
+        eps = (RADIO_CACHE / "episodes")
+        ep = eps.stat().st_mtime_ns if eps.is_dir() else 0
+    except OSError:
+        ep = 0
+    return f"{st}:{ep}:{len(_RADIO.get('episode', {}).get('items') or [])}"
 
-    def _cut(source: Path, off: float, dur: float, tag: str) -> Path | None:
-        SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        out = SAMPLE_CACHE_DIR / f"booth_{tag}.mp3"
-        if out.is_file():
-            return out
-        args = [_exe, "-nostdin", "-y", "-ss", f"{max(0.0, off):.2f}"]
-        if dur > 0:
-            args += ["-t", f"{dur:.2f}"]
-        args += ["-i", str(source), "-codec:a", "libmp3lame",
-                 "-q:a", "4", str(out)]
-        got = _real_subprocess_run(args, capture_output=True, timeout=90)
-        return out if (got.returncode == 0 and out.is_file()) else None
 
-    # #845: the OPEN episode. A coalesced round stages ONE file holding
-    # many turns at burst time, so a row that aired two minutes into
-    # that burst is INSIDE this file, not near its stamp. Match by span
-    # (this file's stamp .. the next file's stamp) and cut at the
-    # offset; fall back to the whole file when it is a single clip.
+def _booth_index_build() -> list[tuple[float, float, str, float]]:
+    """Every moment the station can still hand over, as spans."""
+    rows: list[tuple[float, float, str, float]] = []
+    # the open episode, by its own ledger (exact air times)
     items = sorted(
         [i for i in ((_RADIO.get("episode") or {}).get("items") or [])
          if float(i.get("t") or 0) > 0],
         key=lambda i: float(i["t"]))
     for ix, item in enumerate(items):
-        began = float(item.get("t") or 0)
-        path = Path(str(item.get("file") or ""))
-        if not path.is_file():
+        began = float(item["t"])
+        path = str(item.get("file") or "")
+        if not path or not Path(path).is_file():
             continue
-        span = float(_clip_seconds(str(path)) or 0)
+        span = _clip_seconds(path)
         ends = began + span if span else (
             float(items[ix + 1]["t"]) if ix + 1 < len(items)
             else began + 12.0)
-        # exact-stamp rows (a single line, a sting) still win outright
-        if abs(began - at) < 6:
-            return FileResponse(path, media_type="audio/mpeg",
-                                filename=f"booth-{int(at)}.mp3")
-        if began <= at < ends:
-            # #867: the WHOLE moment. This file IS the burst — the whole
-            # call, the whole round — and handing back a slice starting
-            # at the clicked line gave a fragment that opened
-            # mid-sentence. The operator wants the moment, not their
-            # row's share of it.
-            return FileResponse(path, media_type="audio/mpeg",
-                                filename=f"booth-{int(at)}.mp3")
-    # #847: the in-memory index is gone after a restart but the STAGED
-    # FILES are still on disk — their mtimes are their air times. Walk
-    # the folder as a second index so a restart never costs a download.
+        rows.append((began, ends, path, 0.0))
+    # …and the staged files on disk, whose mtimes are their air times
+    # (this is what survives a restart, when the ledger above is gone)
     try:
-        staged = sorted(
-            ((f, f.stat().st_mtime) for f in _EPISODE_STAGE.glob("*.mp3")
-             if f.is_file()), key=lambda pair: pair[1])
+        staged = sorted(((f, f.stat().st_mtime)
+                         for f in _EPISODE_STAGE.glob("*.mp3")
+                         if f.is_file()), key=lambda pair: pair[1])
     except OSError:
         staged = []
+    known = {r[2] for r in rows}
     for ix, (path, when) in enumerate(staged):
-        span = float(_clip_seconds(str(path)) or 0)
+        if str(path) in known:
+            continue
+        span = _clip_seconds(str(path))
         ends = when + span if span else (
             staged[ix + 1][1] if ix + 1 < len(staged) else when + 12.0)
-        # A file's mtime is written when the clip is STAGED, which is
-        # when it aired; a burst covers everything until it ends.
-        if abs(when - at) < 6:
-            return FileResponse(path, media_type="audio/mpeg",
-                                filename=f"booth-{int(at)}.mp3")
-        if when <= at < ends:
-            return FileResponse(path, media_type="audio/mpeg",
-                                filename=f"booth-{int(at)}.mp3")
-
-    hit: tuple[float, dict[str, Any], Path] | None = None
-    for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json"),
-                            reverse=True):
+        rows.append((when, ends, str(path), 0.0))
+    # the sealed episodes, by their marks
+    for mark_file in sorted((RADIO_CACHE / "episodes").glob("*.json")):
         source = mark_file.with_suffix(".mp3")
         if not source.is_file():
             continue
         try:
             marks = json.loads(mark_file.read_text())
-        except Exception:
+        except Exception:  # noqa: BLE001
             continue
         for mark in marks:
             began = float(mark.get("t") or 0)
             dur = float(mark.get("dur") or 0)
-            # #845: a mark covers a SPAN. A row inside a long burst mark
-            # is at (at - began) seconds into it, not within 10s of its
-            # start — that miss is why most rows answered 404.
-            if began <= at < began + max(dur, 1.0):
-                # #867: from the START of the mark, for its whole
-                # length — the mark IS the moment. Starting at the
-                # clicked instant is what truncated the download.
-                hit = (0.0, {**mark,
-                             "off": float(mark.get("off") or 0),
-                             "dur": max(4.0, min(900.0, dur))},
-                       source)
-                break
-            gap = abs(began - at)
-            if gap < 10 and (hit is None or gap < hit[0]):
-                hit = (gap, mark, source)
-        if hit and hit[0] == 0.0:
+            if began <= 0 or dur <= 0:
+                continue
+            rows.append((began, began + dur, str(source),
+                         float(mark.get("off") or 0)))
+    rows.sort(key=lambda r: r[0])
+    return rows
+
+
+async def booth_index() -> list[tuple[float, float, str, float]]:
+    sig = await asyncio.to_thread(_booth_index_sig)
+    if sig != _BOOTH_INDEX_SIG[0] or not _BOOTH_INDEX:
+        built = await asyncio.to_thread(_booth_index_build)
+        _BOOTH_INDEX[:] = built
+        _BOOTH_INDEX_SIG[0] = sig
+    return _BOOTH_INDEX
+
+
+@app.get("/api/booth/clip")
+async def booth_clip_api(
+    at: float = 0.0,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """The audio behind ONE booth row, found by air time (#840).
+
+    #872: a bisect over a cached index rather than a fresh walk of the
+    staging folder plus a JSON parse of every sealed episode on every
+    click — which is what made a download take an age. #867: a row
+    inside a burst hands back the WHOLE moment, because the burst IS
+    the moment; only a sealed episode, where one file holds an hour, is
+    cut, and then from the start of its mark for its full length."""
+    require_read_auth(authorization)
+    if not at:
+        raise HTTPException(status_code=400, detail="at=epoch seconds")
+
+    rows = await booth_index()
+    if not rows:
+        raise HTTPException(status_code=404,
+                            detail="nothing is shelved yet — a line has "
+                                   "to air before it can be downloaded")
+
+    import bisect
+    starts = [r[0] for r in rows]
+    hit = None
+    # the last span that begins at or before this moment, walking back
+    # over any that end too early
+    ix = bisect.bisect_right(starts, at) - 1
+    while ix >= 0 and at - starts[ix] < 3600:
+        began, ends, path, off = rows[ix]
+        if began <= at < ends and Path(path).is_file():
+            hit = rows[ix]
             break
+        ix -= 1
     if hit is None:
-        # #847: an honest 404 — say WHICH shelves were searched so the
-        # operator knows whether the audio aged out or was never kept.
+        # a row can sit a moment before its file's stamp; take the
+        # nearest start within six seconds rather than failing
+        ix = bisect.bisect_left(starts, at)
+        for cand in (ix - 1, ix):
+            if 0 <= cand < len(rows) and abs(rows[cand][0] - at) < 6 \
+                    and Path(rows[cand][2]).is_file():
+                hit = rows[cand]
+                break
+    if hit is None:
         raise HTTPException(
             status_code=404,
-            detail=("no audio kept for this row — searched the open "
-                    f"episode, {len(staged)} staged clip(s) on disk and "
-                    "every sealed episode. Lines older than the last "
-                    "cache sweep are gone; a line that never aired "
-                    "(held or dropped) has no audio to keep."))
-    _gap, mark, source = hit
-    off = max(0.0, float(mark.get("off") or 0))
-    dur = max(0.4, float(mark.get("dur") or 4.0))
+            detail=(f"no audio kept for this row — {len(rows)} moment(s) "
+                    "are shelved but none covers it. Lines older than "
+                    "the last cache sweep are gone, and a line that "
+                    "never aired (held or dropped) has no audio to "
+                    "keep."))
+
+    began, ends, path, off = hit
+    source = Path(path)
+    # A staged burst file IS the moment — hand it over whole (#867).
+    if off <= 0.01 and source.parent == _EPISODE_STAGE:
+        return FileResponse(source, media_type="audio/mpeg",
+                            filename=f"booth-{int(at)}.mp3")
+    if off <= 0.01 and (_RADIO.get("episode") or {}).get("items"):
+        for item in ((_RADIO.get("episode") or {}).get("items") or []):
+            if str(item.get("file") or "") == path:
+                return FileResponse(source, media_type="audio/mpeg",
+                                    filename=f"booth-{int(at)}.mp3")
+    # A sealed episode holds an hour; cut this moment out of it.
+    dur = max(4.0, min(900.0, ends - began))
     SAMPLE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    out = SAMPLE_CACHE_DIR / f"booth_{int(at)}.mp3"
+    out = SAMPLE_CACHE_DIR / f"booth_{int(began)}_{int(dur)}.mp3"
     if not out.is_file():
         try:
             import imageio_ffmpeg
             exe = imageio_ffmpeg.get_ffmpeg_exe()
         except Exception:  # noqa: BLE001
             exe = "ffmpeg"
-        # #845: re-encode rather than copy — a stream copy cannot start
-        # mid-frame, so an offset cut came out empty or silent.
         got = await asyncio.to_thread(
             _real_subprocess_run,
-            [exe, "-nostdin", "-y", "-ss", f"{off:.2f}",
+            [exe, "-nostdin", "-y", "-ss", f"{max(0.0, off):.2f}",
              "-t", f"{dur:.2f}", "-i", str(source),
              "-codec:a", "libmp3lame", "-q:a", "4", str(out)],
-            capture_output=True, timeout=90)
+            capture_output=True, timeout=120)
         if got.returncode != 0 or not out.is_file():
-            raise HTTPException(status_code=404, detail="the cut failed")
+            raise HTTPException(status_code=404,
+                                detail="the cut failed")
     return FileResponse(out, media_type="audio/mpeg",
                         filename=f"booth-{int(at)}.mp3")
-
 
 @app.post("/api/dj/line/vote")
 async def dj_line_vote(
