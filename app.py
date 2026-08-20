@@ -9891,8 +9891,12 @@ def prep_should_stop() -> str:
     try:
         if prep_yielding():
             return _PREP_YIELD_WHY[0] or "a forced interjection"
-        if render_relief():
-            return "the engine is in relief"
+        # #953: NOT relief. This stopped the room dead between every
+        # line — "7 of 15 lines are made and kept" — and then the next
+        # pass hit the same wall, so a round under relief was never
+        # finished and the roads that had nothing stayed at nothing.
+        # The render is refused in prep_render_line instead; the writing
+        # carries on and the words are shelved.
         # #919: these two used to stop the room dead, and they are true
         # almost all the time — so a call could be WRITTEN and then never
         # recorded a single line of. Measured: 3 calls and 8 station IDs
@@ -17712,6 +17716,13 @@ async def prep_render_line(text: str, who: str,
     if ready:
         return {"key": key, "voice": voice, "engine": engine,
                 "seconds": float((ready or {}).get("seconds") or 0)}
+    # #953: THIS is where relief belongs. Under relief the air is going
+    # out on Piper, so a clone clip made now would be keyed to a voice
+    # nobody is asking for — the original reasoning, kept, and applied
+    # at the one place it is actually true. The caller keeps the words
+    # (#904) and the keeper comes back for the voice on a later pass.
+    if render_relief() and engine in ("xtts", "f5"):
+        return None
     if engine in ("xtts", "f5") and not await clone_engine_ready(engine):
         return None                     # the engine is busy or down; later
     # #890/#872: yield the moment the live road wants the engine. A
@@ -18437,8 +18448,16 @@ def pantry_window() -> str:
     ahead of slower, and under render_relief there is nothing worth
     building at all — the air is going to Piper, so XTTS clips made now
     would never be asked for."""
+    # #953: relief no longer closes this door. It closes the RENDER
+    # door, in prep_render_line, where the caller already keeps the
+    # words (#904). Relief engages when the engine is behind; the engine
+    # is behind because everything is being written and voiced live; and
+    # everything is live because nothing is prepared — so shutting the
+    # writing room under relief shuts it exactly when it is most needed.
+    # A written round means the live moment pays only for a voice, not
+    # for a writer, and that is the expensive half.
     if render_relief():
-        return ""
+        return "the engine is in relief - writing only"
     # #904: renders IN FLIGHT, not _PREMAKE_GATE.locked(). speak_turns
     # fires a _premake task for every line of the round at once and
     # each one takes the gate before doing anything, so the gate read
