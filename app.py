@@ -9474,6 +9474,42 @@ def shelf_cap(kind: str) -> int:
     return max(1, base, min(base * 8, int(round(base * hours))))
 
 
+# #986: how many WRITTEN BUT UNVOICED rows a road may stack up before the
+# writing desk should stop feeding it.
+#
+# #904 shelves the text of a read the engine refused, so the model visit
+# is never spent twice and a later pass can come back and give it a
+# voice. That is right, and it has no ceiling — so when the voice never
+# becomes available the desk keeps writing into a road that cannot
+# finish anything. Measured on the live station: the advert road held
+# TWELVE written reads and had rendered NONE of them, for hours, while
+# news, gallery, manager and caller all sat short. Every one of those was
+# a model visit spent on something unusable, taken from roads that could
+# have been completed.
+#
+# Three is a working round plus two in hand. Past that the road is told
+# to wait for its voice rather than write another.
+SHELF_UNVOICED_MOST = 3
+
+
+def shelf_unvoiced(kind: str) -> int:
+    """#986: rows on this shelf that have words and no audio."""
+    try:
+        rows = list(_SHELF.get(str(kind)) or [])
+    except Exception:  # noqa: BLE001
+        return 0
+    out = 0
+    for row in rows:
+        try:
+            if row.get("key") or row.get("produced"):
+                continue                # it has its audio
+            if str(row.get("text") or ""):
+                out += 1                # words, no voice
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 def shelf_full(kind: str) -> bool:
     # #855: two roads on the running order do not own a row in _SHELF,
     # and asking _SHELF about them answered "room for plenty more"
@@ -10328,6 +10364,12 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                 if track_talk_full():
                     continue
             elif shelf_full(kind):
+                continue
+            elif shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST:
+                # #986: this road is not short of WORDS, it is short of a
+                # VOICE. Writing another would spend a model visit on
+                # something that cannot air, and take the window from a
+                # road that could have finished. See SHELF_UNVOICED_MOST.
                 continue
             cost = task_cost(kind)
             rows.append({"kind": kind,
@@ -19960,6 +20002,10 @@ def coord_road_report(road: str) -> dict[str, Any]:
         out["quota"] = (quota_state() or {}).get(road) or {}
         out["bare_arrivals"] = int(_BARE_ARRIVALS.get(road) or 0)
         out["cannot"] = CANNOT_PREPARE.get(road) or ""
+        # #986: words with no voice — the shape that had the advert road
+        # holding twelve unusable reads while four other roads starved.
+        out["unvoiced"] = shelf_unvoiced(road)
+        out["unvoiced_cap"] = SHELF_UNVOICED_MOST
         out["cost_seconds"] = round(float(task_cost(road) or 0), 1)
         # The coming entries this road has to fill.
         for ent in coord_upcoming():
@@ -20054,6 +20100,14 @@ def _coord_road_doing(rep: dict[str, Any]) -> list[dict[str, str]]:
                     + "s standing by against the "
                     + str(int(float(owes.get("owed_seconds") or 0)))
                     + "s the running order owes it.")})
+            elif int(rep.get("unvoiced") or 0) >= int(
+                    rep.get("unvoiced_cap") or 99):
+                say.append({"tag": "blocked", "text": (
+                    "It is holding " + str(rep.get("unvoiced"))
+                    + " read(s) that have words and no voice, so the desk "
+                    "has stopped writing more of them — this road is not "
+                    "short of writing, it is waiting on the voice engine. "
+                    "They are given a voice the moment one is free.")})
             elif cand and not cand.get("fits"):
                 say.append({"tag": "blocked", "text": (
                     "The preparer can see it and will not start it yet: it "
