@@ -18910,6 +18910,129 @@ def coord_close_half(half: str) -> dict[str, Any]:
     return report
 
 
+COORD_AHEAD_SECONDS = 2400.0            # forty minutes of lookahead
+_BARE_ARRIVALS: dict[str, int] = {}     # road -> times it arrived empty
+
+
+def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
+    """#911: the entries about to take the air, and whether anything is
+    ready for them.
+
+    Walks the running order forward from where the clock is standing and
+    puts a wall-clock moment on each coming entry. "The advert road is
+    540s short" and "the Ad read entry starts in four minutes with
+    nothing recorded" are the same fact; only the second one makes
+    anybody move, and only the second one can be worked in deadline
+    order."""
+    out: list[dict[str, Any]] = []
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return out
+        name = schedule_preset_now(store)
+        rows = list((store.get("presets") or {}).get(name) or [])
+        try:
+            hour_key = _sched_hour_key()
+            picked, hour_rows, overridden = schedule_hour_slots(
+                store, hour_key)
+            if overridden and hour_rows:
+                name, rows = picked, hour_rows
+        except Exception:  # noqa: BLE001
+            pass
+        slots = [s for s in rows if s.get("enabled", True)]
+        if not slots:
+            return out
+        pos = _RADIO.get("sched_pos") or {}
+        idx = int(pos.get("index") or 0)
+        started = float(pos.get("started") or time.time())
+        if not 0 <= idx < len(slots):
+            idx, started = 0, time.time()
+        needs = hour_needs() or {}
+        # The entry on air still has time left on it; everything after
+        # begins when the one before it ends.
+        owns = max(0.25, float(slots[idx].get("minutes") or 3)) * 60.0
+        at = started + owns
+        step = 0
+        while at - time.time() <= window and step < len(slots) * 3:
+            step += 1
+            idx = (idx + 1) % len(slots)
+            slot = slots[idx]
+            kind = str(slot.get("kind") or "")
+            mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            road = str(SCHED_PREP_KIND.get(kind) or kind)
+            cannot = CANNOT_PREPARE.get(kind) or ""
+            held = float((needs.get(road) or {}).get("held") or 0)
+            rows_held = int((needs.get(road) or {}).get("rows") or 0)
+            out.append({
+                "index": idx,
+                "kind": kind,
+                "road": road,
+                "label": str(slot.get("label") or kind),
+                "starts_in": round(at - time.time(), 1),
+                "owns_seconds": round(mins, 1),
+                "held_seconds": round(held, 1),
+                "rows": rows_held,
+                "bare": (not cannot) and rows_held <= 0,
+                "cannot": cannot,
+            })
+            at += mins
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def coord_bare_note(road: str) -> None:
+    """#911: an entry took the air with nothing behind it. Remember it.
+
+    A road that has arrived bare before is asked for more, sooner, in
+    every plan after this — which is the "understand and internalize and
+    react to these failures" half of the request. Without this the
+    coordinator would make the same plan tomorrow that failed today."""
+    try:
+        road = str(road or "")
+        if not road:
+            return
+        _BARE_ARRIVALS[road] = int(_BARE_ARRIVALS.get(road) or 0) + 1
+        pipeline_log("lookahead",
+                     f"the coordinator noted a BARE ARRIVAL - "
+                     f"{SHELF_LABEL.get(road, road)} took the air with "
+                     f"nothing prepared ({_BARE_ARRIVALS[road]} time(s) "
+                     "now); it gets asked for more, sooner (#911)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def coord_carry_forward(road: str, label: str = "") -> int:
+    """#912: the clock has left an entry behind. Carry its material on.
+
+    Material prepared for an entry that came and went unused is not
+    stale — it is a segment nobody has heard, and the most expensive
+    thing on the box. Any pin binding it to the hour that has just
+    passed is released and it is nudged up the order so it is used soon
+    rather than sitting behind material written later. Nothing is
+    deleted and nothing is duplicated; it stops being owned by an hour
+    that is over."""
+    moved = 0
+    try:
+        for row in list(_SHELF.get(str(road)) or []):
+            if row.get("carried"):
+                continue                # already rolled once
+            row["carried"] = True
+            row["carried_at"] = time.time()
+            row.pop("hour", None)       # no longer owned by that hour
+            row["priority"] = int(row.get("priority") or 0) + 2
+            moved += 1
+        if moved:
+            pipeline_log("lookahead",
+                         f"{moved} prepared {SHELF_LABEL.get(road, road)} "
+                         f"went unused in {label or road} and was carried "
+                         "forward to the next half hour rather than left "
+                         "to go stale (#912)")
+    except Exception:  # noqa: BLE001
+        pass
+    return moved
+
+
 def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
     """#942: THE WORK ORDER for the next half hour.
 
@@ -18977,9 +19100,43 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
                         "it is " + str(int(gap)) + "s short of what the "
                         "coming entries call for"),
             })
-        # Worst first: what bled, then what is shortest.
-        plan["tasks"].sort(key=lambda t: (-float(t["bled_seconds"]),
-                                          -float(t["want_seconds"])))
+        # #911: DEADLINES FIRST. A bulletin 720s short but not due for
+        # forty minutes must not push in front of an advert due in four.
+        # Everything with a deadline is worked in deadline order; the
+        # rest keeps #942's worst-first ordering behind it.
+        soon: dict[str, float] = {}
+        bare_now: dict[str, bool] = {}
+        for row in coord_upcoming():
+            road = str(row.get("road") or "")
+            if not road or row.get("cannot"):
+                continue
+            when = float(row.get("starts_in") or 0)
+            if road not in soon or when < soon[road]:
+                soon[road] = when
+                bare_now[road] = bool(row.get("bare"))
+        for task in plan["tasks"]:
+            road = str(task.get("road") or "")
+            task["due_in"] = round(soon.get(road, 1e9), 1)
+            task["bare"] = bool(bare_now.get(road))
+            # #911: a road that has ARRIVED BARE before is asked for
+            # more. The coordinator has to learn from the failure or it
+            # makes the same plan tomorrow that failed today.
+            misses = int(_BARE_ARRIVALS.get(road) or 0)
+            task["bare_arrivals"] = misses
+            if misses:
+                task["want_seconds"] = round(
+                    float(task["want_seconds"]) * (1.0 + 0.25 * min(4, misses)),
+                    1)
+                task["why"] = (task["why"] + "; it has arrived bare "
+                               + str(misses) + " time(s), so it is asked "
+                               "for more")
+        plan["tasks"].sort(key=lambda t: (
+            0 if t.get("bare") else 1,          # bare and coming: first
+            float(t.get("due_in") or 1e9),      # then by deadline
+            -float(t["bled_seconds"]),          # then #942's ordering
+            -float(t["want_seconds"])))
+        plan["upcoming"] = coord_upcoming()[:10]
+        plan["bare_arrivals"] = dict(_BARE_ARRIVALS)
         dead = (report.get("dead") or {})
         plan["why"] = (
             "last half hour lost " + str(int(float(dead.get("seconds") or 0)))
@@ -19014,6 +19171,9 @@ def coordinator_state() -> dict[str, Any]:
             "open_gap": (round(float(_GAP_OPEN.get("seconds") or 0), 1)
                          if _GAP_OPEN else 0.0),
             "plan": dict(_COORD_PLAN),
+            # #911: what is COMING and whether anything is ready for it.
+            "upcoming": coord_upcoming()[:10],
+            "bare_arrivals": dict(_BARE_ARRIVALS),
             "halves": list(_HALVES[-6:])[::-1],
             # The one number the operator asked for: how much of this
             # half hour has been silence.
@@ -19424,6 +19584,18 @@ async def _torrent_talk() -> None:
                         int(_pos.get("index") or 0), kind,
                         str(_slot.get("label") or kind),
                         str(_pos.get("preset") or ""))
+                    # #911: did this entry arrive with anything behind
+                    # it? The operator's example was exactly this — "we
+                    # are about to get to ad read and there's no pre
+                    # recorded sections for it".
+                    try:
+                        _road = str(SCHED_PREP_KIND.get(kind) or kind)
+                        if (_road in ALT_PREP_KINDS
+                                and not (_SHELF.get(_road) or [])
+                                and kind not in CANNOT_PREPARE):
+                            coord_bare_note(_road)
+                    except Exception:  # noqa: BLE001
+                        pass
                     pipeline_log(
                         "air",
                         "the schedule takes this round - "
@@ -21754,6 +21926,18 @@ def schedule_take() -> dict[str, Any]:
                 hold = max(0.25, float(slots[idx].get("minutes") or 3)) * 60.0
                 if now - started < hold:
                     break
+                # #912: this entry's time is up. Anything still standing
+                # on its shelf is carried forward rather than left to go
+                # stale behind material written later.
+                try:
+                    _gone = slots[idx]
+                    _road = str(SCHED_PREP_KIND.get(str(_gone.get("kind")))
+                                or _gone.get("kind") or "")
+                    if _road and _road in ALT_PREP_KINDS:
+                        coord_carry_forward(_road,
+                                            str(_gone.get("label") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
                 started += hold
                 idx = (idx + 1) % len(slots)
             else:
