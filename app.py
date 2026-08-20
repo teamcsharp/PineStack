@@ -15617,6 +15617,25 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         entry["made"] = int(entry.get("made") or 0)
         entry["seconds"] = float(entry.get("seconds") or 0.0)
         made = 0
+        # #906 (#858): ONE PERSON AT A TIME. The round alternates
+        # speakers, and rendering it in script order makes the engine
+        # swap speaker conditioning on every single line — host, co-host,
+        # host, co-host, all the way down. Grouping by voice lets it stay
+        # on one performer and work through everything they say before
+        # moving to the next, which is the "record one person, cut it into
+        # strips" the operator asked for.
+        #
+        # This is safe precisely BECAUSE the pantry is content-addressed:
+        # playback looks each line up by its own text, so the order the
+        # takes were recorded in has no bearing on the order they air.
+        # Nothing is spliced and no boundary is guessed.
+        try:
+            _order: dict[str, int] = {}
+            for _t, _v, _w in plan:
+                _order.setdefault(str(_v), len(_order))
+            plan = sorted(plan, key=lambda row: _order.get(str(row[1]), 99))
+        except Exception:  # noqa: BLE001
+            pass
         for text, voice, who in plan:
             # #886: EXACTLY as the air road computes it — _premake_inner
             # calls voice_engine_for(v) with no seat, and passing one here
