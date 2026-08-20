@@ -64,8 +64,8 @@ def _font(px):
     return ImageFont.load_default()
 
 
-def mark(size=S):
-    """The PB badge, at any size."""
+def pb_mark(size=S):
+    """The PB badge, kept as the alternate."""
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
     d.rounded_rectangle([0, 0, size - 1, size - 1],
@@ -92,8 +92,8 @@ def mark(size=S):
     return img
 
 
-def pine_mark(size=S):
-    """The alternative: a pine standing in a box, on the app's navy."""
+def mark(size=S):
+    """THE MARK: a pine standing in a box, on the app's navy."""
     k = size / 256.0
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -172,12 +172,12 @@ def main(outdir):
     art.resize((256, 256), Image.LANCZOS).save(
         os.path.join(outdir, "pinebox-256.png"))
     # kept beside it so the choice can be reversed without re-deriving it
-    build_ico(os.path.join(outdir, "pinebox-pine.ico"), art=pine_mark(S))
+    build_ico(os.path.join(outdir, "pinebox-pb.ico"), art=pb_mark(S))
     print("wrote %s (%d bytes)" % (ico, total))
     for n, blob in entries:
         kind = "PNG" if blob[:8] == b"\x89PNG\r\n\x1a\n" else "BMP"
         print("  %3dx%-3d %7d bytes  %s" % (n, n, len(blob), kind))
-    print("wrote pinebox.png (512), pinebox-256.png, pinebox-pine.ico")
+    print("wrote pinebox.png (512), pinebox-256.png, pinebox-pb.ico")
 
 
 if __name__ == "__main__":

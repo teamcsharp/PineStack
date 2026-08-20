@@ -76,17 +76,27 @@ body.resizing-rail .rail-resizer::before {
 
 .brand { display: flex; gap: 12px; align-items: center; margin-bottom: 22px; }
 .brand > div { min-width: 0; }
+/* #976: the badge wears the LOGO now - a pine standing in a box - so the
+   pale plate and the two letters both go. The mark draws its own rounded
+   plate with transparent corners, which is why the background here is
+   cleared rather than kept behind it: two rounded squares of slightly
+   different radius stacked on each other read as a printing error. */
 .mark {
   width: 42px;
   height: 42px;
   display: grid;
   place-items: center;
   border-radius: 8px;
-  background: #d6f2de;
-  color: #112318;
-  font-weight: 800;
+  background: transparent;
   border: 2px solid transparent;
   padding: 0;
+  overflow: hidden;
+}
+.mark img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 .mark:hover { border-color: var(--cyan); }
 .mark:disabled { opacity: .75; cursor: wait; }
@@ -1024,10 +1034,14 @@ body.immersive main {
   display: grid;
   place-items: center;
   border-radius: 8px;
-  color: #102118;
-  background: #d6f2de;
-  font-weight: 900;
+  background: transparent;          /* #976: the logo carries its own plate */
   animation: rebuildPulse 1.4s ease-in-out infinite;
+}
+.rebuild-mark img {
+  width: 100%;
+  height: 100%;
+  display: block;
+  object-fit: contain;
 }
 
 .rebuild-head h2 {
