@@ -16096,6 +16096,7 @@ async def _torrent_talk() -> None:
             # cannot leave the last entry's prompt hanging over the
             # next one.
             _RADIO["sched_prompt"] = ""
+            _RADIO["sched_kind"] = ""              # #853
             _slot: dict[str, Any] = {}
             if _chosen:
                 _want = str(SWITCH_KINDS.get(
@@ -18134,9 +18135,13 @@ def schedule_take() -> dict[str, Any]:
         _RADIO["sched_prompt"] = (
             _schedule_clause(name, slot, text)
             if (text or slot.get("notes")) else "")
+        # #853: the writing room is told WHAT it is about to write, so it
+        # can be given room and temperament to suit the job.
+        _RADIO["sched_kind"] = str(slot.get("kind") or "")
         return slot
     except Exception:                          # noqa: BLE001
         _RADIO["sched_prompt"] = ""
+        _RADIO["sched_kind"] = ""
         return {}
 
 
@@ -33957,6 +33962,36 @@ def whole_sentences(text: str) -> str:
     return trimmed[:ends[-1].end()].strip() or trimmed
 
 
+# #853: what each kind of segment needs from the model. Context is KV
+# cache on a GPU the voices are also using, so it is spent where it buys
+# something — a recap has to hold the hour it is recapping; a sting does
+# not. Temperature follows the job rather than one house setting.
+WRITING_PROFILES: dict[str, dict[str, float]] = {
+    "recap":         {"num_ctx": 131072, "spice": 0.45},
+    "deep":          {"num_ctx": 131072, "spice": 0.60},
+    "banter":        {"num_ctx": 65536,  "spice": 0.70},
+    "banter_caller": {"num_ctx": 65536,  "spice": 0.75},
+    "caller":        {"num_ctx": 65536,  "spice": 0.75},
+    "news":          {"num_ctx": 32768,  "spice": 0.50},
+    "gallery":       {"num_ctx": 32768,  "spice": 0.70},
+    "manager":       {"num_ctx": 32768,  "spice": 0.60},
+    "bombshell":     {"num_ctx": 16384,  "spice": 0.90},
+    "ad":            {"num_ctx": 16384,  "spice": 0.85},
+    "station_id":    {"num_ctx": 8192,   "spice": 0.90},
+    "record":        {"num_ctx": 8192,   "spice": 0.70},
+}
+
+
+def writing_profile() -> dict[str, float]:
+    """The brief for the segment being written, or {} when the schedule
+    is not running — in which case nothing changes."""
+    try:
+        return WRITING_PROFILES.get(
+            str(_RADIO.get("sched_kind") or ""), {}) or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 async def ask_model(prompt: str, limit: int = 300,
                     spice: float = 0.0, num_ctx: int = 0) -> str:
     """A plain model call for the agent's own voice lines — no web search, no
@@ -33977,6 +34012,10 @@ async def ask_model(prompt: str, limit: int = 300,
     # what gets heard, and unused budget costs nothing.
     # `spice` jitters the temperature upward per call (#324): the same
     # prompt stops producing the same shape of answer twice.
+    # #853: and the temperament. A caller that named its own spice keeps
+    # it; otherwise the segment's brief decides how loose to be — a recap
+    # steady, a rant loose.
+    spice = spice or float(writing_profile().get("spice") or 0.0)
     temperature = min(1.2, float(settings["temperature"])
                       + (random.uniform(0.0, spice) if spice else 0.0))
     max_tokens = max(settings["max_tokens"], limit // 2 + 40)
@@ -34007,7 +34046,11 @@ async def ask_model(prompt: str, limit: int = 300,
         # far more — gemma4 reports 131072. The operator asked for more
         # rhetoric per visit to the model; this is the room to write it
         # in. The setting still governs; this only stops clamping it.
-        num_ctx=max(2048, min(131072, num_ctx or settings["num_ctx"])),
+        # #853: the caller's own argument wins; then the brief for this
+        # segment; then the operator's setting.
+        num_ctx=max(2048, min(131072, num_ctx
+                              or int(writing_profile().get("num_ctx") or 0)
+                              or settings["num_ctx"])),
     )
     answer = ((result.get("message") or {}).get("content") or "").strip()
     answer = re.sub(r"<think>.*?</think>", " ", answer, flags=re.S)
