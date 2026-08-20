@@ -3268,6 +3268,160 @@ def _gpu_stats() -> str:
         return ""
 
 
+# --- The temperature everyone on air means (#886) --------------------------
+#
+# "Anytime that a customer calls in and refers to the temperature, or anyone
+# refers to the temperature, they are referring to the actual temperatures of
+# the DGX spark that they're able to get query from the Nvidia utility."
+#
+# nvidia-smi is a subprocess and the show writes lines on the event loop, so
+# it is NEVER queried from a writing path.  It is read on a clock, in a
+# thread, into this one slot; every consumer reads the slot.  A box with no
+# NVIDIA utility falls back to the board's own sensors and, failing that,
+# says nothing at all rather than guessing — an invented temperature is
+# exactly what this request is about.
+_GPU_TEMP: dict[str, Any] = {"c": 0.0, "at": 0.0, "zone": "", "how": "",
+                             "busy": False}
+GPU_TEMP_TTL = 45.0                # seconds a reading is good for
+
+
+def _gpu_temp_blocking() -> dict[str, Any]:
+    """The Spark's GPU temperature, straight off the NVIDIA utility.
+
+    BLOCKING — a subprocess.  Only ever called through asyncio.to_thread.
+    Falls back to the host thermal zones so a box without nvidia-smi still
+    has a real number rather than a made-up one."""
+    try:
+        import subprocess
+
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=temperature.gpu",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=8)
+        for row in (out.stdout or "").strip().splitlines():
+            try:
+                celsius = float(row.strip().split(",")[0])
+            except (TypeError, ValueError):
+                continue
+            if 0 < celsius < 150:
+                return {"c": round(celsius, 1), "zone": "the GPU",
+                        "how": "nvidia-smi"}
+    except Exception:  # noqa: BLE001
+        pass
+    # No utility to ask: the board's own sensors, which are the same silicon
+    # from the other side.
+    for probe in ("/sys/class/thermal", "/host-thermal"):
+        try:
+            temps = []
+            for zone in Path(probe).glob("thermal_zone*/temp"):
+                try:
+                    milli = int(zone.read_text().strip())
+                except (OSError, ValueError):
+                    continue
+                if 1000 < milli < 150000:
+                    temps.append(milli / 1000.0)
+            if temps:
+                return {"c": round(max(temps), 1), "zone": "the board",
+                        "how": "the thermal sensors"}
+        except Exception:  # noqa: BLE001
+            continue
+    return {}
+
+
+async def gpu_temp_refresh() -> dict[str, Any]:
+    """Take a fresh reading in a thread and file it.  Awaitable, but nothing
+    on a writing path awaits it — the clock below does."""
+    try:
+        got = await asyncio.to_thread(_gpu_temp_blocking)
+    except Exception:  # noqa: BLE001
+        got = {}
+    if got.get("c"):
+        _GPU_TEMP.update(got)
+    # Stamped either way, so a box with no sensors is not probed every round.
+    _GPU_TEMP["at"] = time.time()
+    return dict(_GPU_TEMP)
+
+
+def gpu_temp_kick() -> None:
+    """Top the reading up in the background if it has gone stale.  Never
+    blocks, never raises, and does nothing at all when called from a worker
+    thread (no loop) — the clock has it covered either way."""
+    try:
+        if float(_GPU_TEMP.get("at") or 0) > time.time() - GPU_TEMP_TTL:
+            return
+        if _GPU_TEMP.get("busy"):
+            return
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return                      # off the loop: leave it to the clock
+    except Exception:  # noqa: BLE001
+        return
+
+    async def _go() -> None:
+        try:
+            await gpu_temp_refresh()
+        finally:
+            _GPU_TEMP["busy"] = False
+
+    _GPU_TEMP["busy"] = True
+    try:
+        loop.create_task(_go())
+    except Exception:  # noqa: BLE001
+        _GPU_TEMP["busy"] = False
+
+
+def gpu_temp_read() -> dict[str, Any]:
+    """The reading as it stands.  A pure cache read — this is what every
+    caller, every prompt and every heat road goes through."""
+    try:
+        gpu_temp_kick()
+        return {"c": float(_GPU_TEMP.get("c") or 0.0),
+                "at": float(_GPU_TEMP.get("at") or 0.0),
+                "zone": str(_GPU_TEMP.get("zone") or ""),
+                "how": str(_GPU_TEMP.get("how") or "")}
+    except Exception:  # noqa: BLE001
+        return {"c": 0.0, "at": 0.0, "zone": "", "how": ""}
+
+
+def gpu_temp_fact() -> str:
+    """THE TEMPERATURE, as a fact for the writing room (#886).
+
+    Empty when nothing can be read — the pair then talk about the heat the
+    way they always did rather than quoting a number nobody measured."""
+    try:
+        got = gpu_temp_read()
+        celsius = float(got.get("c") or 0.0)
+        if not celsius:
+            return ""
+        fahrenheit = celsius * 9 / 5 + 32
+        return (
+            "THE TEMPERATURE, whenever anyone on air says it, means the "
+            "actual temperature of the DGX Spark this station runs on, and "
+            f"right now that is {celsius:.0f} degrees Celsius "
+            f"({fahrenheit:.0f} Fahrenheit) — a real reading of "
+            f"{got.get('zone') or 'the machine'} off "
+            f"{got.get('how') or 'its own sensors'}, taken seconds ago. "
+            "Anyone: either of you, a caller ringing in "
+            "about the heat, the manager upstairs. It is never the weather "
+            "outside and never an invented figure; if a number is said, it "
+            "is THIS number, and quoting both units is fair game"
+        )
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def gpu_temp_clock() -> None:
+    """Read the machine's temperature on its own clock, off the writing
+    paths entirely (#886).  Half a minute is plenty for a number the pair
+    quote in whole degrees."""
+    while True:
+        try:
+            await gpu_temp_refresh()
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(30)
+
+
 def system_stats() -> str:
     import shutil
 
@@ -3910,6 +4064,13 @@ async def _startup_sfx_pool() -> None:
 @app.on_event("startup")
 async def _startup_comfy_idle() -> None:
     fire_and_forget(comfy_idle_clock())
+
+
+@app.on_event("startup")
+async def _startup_gpu_temp() -> None:
+    """#886: the machine's own temperature, read on a clock so no writing
+    path ever waits on a subprocess for it."""
+    fire_and_forget(gpu_temp_clock())
 
 
 # #797: XTTS is the box's single biggest tenant (~23G of unified memory).
@@ -13575,6 +13736,16 @@ def show_memory() -> str:
                 f"the pine box speaker has not carried a line in "
                 f"{out_min:.0f} minutes — you are starting to notice, "
                 "and starting to get nervous about it")
+    # #886: the temperature, as a live fact rather than a thing to invent.
+    # This rides show_memory(), so it reaches dj_banter's prompt, dj_line's
+    # (every single line the pair or a caller speak) and the deep round's
+    # foundation — every road on which somebody could say "the temperature".
+    try:
+        _degrees = gpu_temp_fact()
+    except Exception:  # noqa: BLE001
+        _degrees = ""
+    if _degrees:
+        bits.append(_degrees)
     if not bits:
         return ""
     return ("\nTONIGHT SO FAR — carry this forward, refer back to it, "
@@ -19697,7 +19868,20 @@ def spoken_units(text: str) -> str:
 
 def booth_hot() -> float:
     """The booth thermometer IS the machine's (#375, #376): hottest host
-    sensor in Celsius, 0.0 when unreadable."""
+    sensor in Celsius, 0.0 when unreadable.
+
+    #886: and the machine means the GPU. "Anytime that a customer calls in
+    and refers to the temperature ... they are referring to the actual
+    temperatures of the DGX spark that they're able to get query from the
+    Nvidia utility." Every heat road in this file — the band, the buried
+    references, the "it's so hot that" bank, the caller who rings in about
+    it, the memo from upstairs — comes through here, so this one line is
+    what makes all of them mean the real GPU. It is a CACHE read: the
+    reading is taken on gpu_temp_clock(), in a thread, never here. The
+    board sensors below remain the fallback for a box with no utility."""
+    got = gpu_temp_read()
+    if got.get("c"):
+        return float(got["c"])
     temps = []
     try:
         for zone in Path("/host-thermal").glob("thermal_zone*/temp"):
@@ -20132,6 +20316,8 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
     minutes = max(0.25, min(600.0, minutes))
     pid = row.get("prompt_id")
     pid = str(pid).strip()[:64] if pid not in (None, "") else None
+    tid = row.get("track_id")                                     # #891
+    tid = str(tid).strip()[:48] if tid not in (None, "") else None
     # #926: the ALTERNATE chosen for this entry — one prepared candidate
     # off that kind's shelf, named by its stable id. It lives on the SLOT
     # and not on the material, because a pin is a fact about one entry of
@@ -20149,6 +20335,12 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
         "prompt_id": pid or None,
         "notes": str(row.get("notes") or "")[:400],
         "pinned_id": pin or None,                              # #926
+        # #891: the record pinned to THIS entry, if one is. Cleaned here so
+        # it rides every road a slot travels — the preset shelf, an hour's
+        # own copy of the order, and the panel — without a second store.
+        # `track` is only the name to show; `track_id` is the truth.
+        "track_id": tid or None,
+        "track": str(row.get("track") or "")[:120],
     }
 
 
@@ -20524,10 +20716,17 @@ def schedule_take() -> dict[str, Any]:
         # #853: the writing room is told WHAT it is about to write, so it
         # can be given room and temperament to suit the job.
         _RADIO["sched_kind"] = str(slot.get("kind") or "")
+        # #891: the WHOLE entry, so the roads that run it can read what has
+        # been pinned to this one — the record a "spin record" segment is
+        # to play — without going back to disk mid-show. Written together
+        # with sched_pos, and the roads below only trust it while the two
+        # still agree about which entry is on air.
+        _RADIO["sched_slot"] = dict(slot)
         return slot
     except Exception:                          # noqa: BLE001
         _RADIO["sched_prompt"] = ""
         _RADIO["sched_kind"] = ""
+        _RADIO["sched_slot"] = {}                                 # #891
         return {}
 
 
@@ -20571,6 +20770,56 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
                                dj_settings().get("stream_show", True)))
 
 
+def _schedule_pin_record() -> dict[str, Any] | None:
+    """#891: the record PINNED to this "spin record" entry, put up so it is
+    the next thing the needle plays.
+
+    QUEUING IS NOT CUTTING. The track goes to the FRONT of the request line
+    — the same place an operator's own "play this now" goes — and nothing
+    in here touches the needle. The caller still asks track_may_cut()
+    afterwards, so a record already turning is left to finish and the pin
+    is simply what comes up next (#840, #846: "tracks play whole").
+
+    "It's just the track that's played for that segment": it is put up ONCE
+    per segment, stamped on the entry id and the minute that entry began,
+    and dj_next_track pops it — so it plays once and the queue takes over
+    again. Returns the track it queued, or None. Never raises."""
+    try:
+        slot = _RADIO.get("sched_slot") or {}
+        pos = _RADIO.get("sched_pos") or {}
+        # Only trust the published entry while it still IS the entry on air:
+        # with the schedule switched off sched_pos is dropped and a stale
+        # slot could otherwise pin a record to a round nobody scheduled.
+        if not slot or str(slot.get("id") or "") \
+                != str(pos.get("slot_id") or ""):
+            return None
+        track_id = str(slot.get("track_id") or "")
+        if not track_id:
+            return None                    # no pin: the queue picks, as ever
+        stamp = f"{slot.get('id') or ''}@{pos.get('started') or ''}"
+        if str(_RADIO.get("sched_pin_at") or "") == stamp:
+            return None                    # already put up for this segment
+        _RADIO["sched_pin_at"] = stamp
+        track = music_track(track_id)
+        if not track:
+            pipeline_log("air", "the schedule wanted a pinned record that is "
+                                f"not in the library any more ({track_id}) — "
+                                "the queue picks this one instead (#891)")
+            return None
+        queue = _RADIO.setdefault("requests", [])
+        if not any(str(t.get("id") or "") == track_id for t in queue[:2]):
+            queue.insert(0, dict(track))
+        pipeline_log(
+            "air", "the schedule pins "
+                   + (str(track.get("title") or "a record"))
+                   + (f" by {track['artist']}" if track.get("artist") else "")
+                   + " to this entry — it is next up. Nothing already "
+                     "playing is cut for it: a record plays whole (#891)")
+        return track
+    except Exception:  # noqa: BLE001
+        return None                        # a pin never takes the show off air
+
+
 async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
                                dj: dict[str, Any]) -> bool | None:
     """The roads the SCHEDULE can name that the torrent's own rotation
@@ -20589,6 +20838,12 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
         # guard in #843 and the operator heard it immediately: two record
         # entries in the canonical hour, both cutting a live track.
         if _RADIO.get("sched_first"):
+            # #891: the record chosen for THIS segment, if one was chosen,
+            # goes to the front of the queue BEFORE the needle question is
+            # asked — so whichever way that question is answered, the
+            # pinned track is what comes up next. It is never a reason to
+            # cut: track_may_cut() below still has the last word.
+            _schedule_pin_record()
             if track_may_cut("the schedule's record entry"):
                 try:
                     dj_skip()
@@ -21249,6 +21504,78 @@ async def schedule_hours_delete_api(
         schedule_write(store)
     _RADIO["sched_prompt"] = ""
     note_action(f"🗓 hour orders torn up: {key} — back on the plan (#883)")
+    return schedule_hours_view(key, 1)
+
+
+@app.post("/api/schedule/hours/{key}/track")
+async def schedule_hour_track_api(
+    key: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#891: pin ONE record to ONE "spin record" entry in ONE hour.
+
+    {"slot_id": "...", "track_id": "...", "track": "the name to show"} — an
+    empty track_id unpins it. The track is checked against the station's
+    own library index (the same one /api/music/search reads), so a pin can
+    never name a record that is not there.
+
+    The hour is materialised as its own copy of the running order in the
+    same breath, exactly as scripting an entry is: choosing the record for
+    tonight's eleven o'clock is an order for tonight's eleven o'clock, not
+    a permanent edit to the plan. Tear it up with DELETE on the hour.
+
+    What happens on air: the pinned track is put at the FRONT of the
+    request line when that entry begins, ONCE, and the needle only drops if
+    nothing is playing — a record already turning always finishes (#840,
+    #846)."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    key = str(key or "").strip()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="key must be a local hour like 2026-08-19T22")
+    slot_id = str(payload.get("slot_id") or "").strip()[:48]
+    if not slot_id:
+        raise HTTPException(status_code=400,
+                            detail="Which entry? Send slot_id")
+    track_id = str(payload.get("track_id") or "").strip()[:48]
+    title = str(payload.get("track") or "").strip()[:120]
+    if track_id:
+        found = music_track(track_id)
+        if not found:
+            raise HTTPException(status_code=404,
+                                detail="No such track in the library")
+        title = title or " \u2014 ".join(
+            x for x in (str(found.get("title") or ""),
+                        str(found.get("artist") or "")) if x)[:120]
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        _name, rows, _on = schedule_hour_slots(store, key)
+        rows = [_sched_slot(r) for r in rows]
+        hit = next((r for r in rows
+                    if str(r.get("id") or "") == slot_id), None)
+        if hit is None:
+            raise HTTPException(status_code=404,
+                                detail=f"No entry {slot_id!r} in {key}")
+        hit["track_id"] = track_id or None
+        hit["track"] = title if track_id else ""
+        entry = dict((store.get("hours") or {}).get(key) or {})
+        entry["slots"] = rows
+        entry["at"] = round(time.time(), 3)
+        _sched_hours_put(store, key, entry)
+        schedule_write(store)
+    # The entry on air re-reads itself on the very next round; the position
+    # is left alone, exactly as the prompt road leaves it.
+    _RADIO["sched_prompt"] = ""
+    _label = str(hit.get("label") or hit.get("kind") or "that entry")
+    note_action("\U0001f3b5 " + key + " \u00b7 " + _label
+                + (f" spins {title}" if track_id
+                   else " is back on whatever the queue picks")
+                + " (#891)")
     return schedule_hours_view(key, 1)
 
 
@@ -22624,7 +22951,8 @@ async def dj_service_ad() -> list[str]:
     facts = await service_sponsor_facts(name)
     stats = spoken_units("; ".join(facts) if facts
                          else "its numbers are a trade secret tonight")
-    return await dj_banter(None, lines=4, angle=(
+    _spot_at = time.time()                                        # #892
+    _spot = await dj_banter(None, lines=4, angle=(
         f"A SPONSOR SPOT for tonight's sponsor: {name.upper()}, one of "
         "the actual services running on the DGX Spark this station lives "
         "on. The TWO of you sell it TOGETHER, trading it back and forth — "
@@ -22634,6 +22962,14 @@ async def dj_service_ad() -> list[str]:
         f"several verbatim between you: {stats}. One of you notes, with mild "
         "vertigo, that this very ad was written by the machinery being "
         "advertised, and the other has to sit with that."))
+    # #892: this IS an advert — a sponsor sold on air — and it went out as
+    # ordinary banter with nothing in the booth saying a spot had run. The
+    # read itself stays where it is, in the pair's own lines; this is the
+    # LISTING above it, so the log shows an ad aired here.
+    if _spot:
+        ad_booth_row("\U0001f4e3 sponsor spot \u2014 " + name.upper(),
+                     product=name, air_at=_spot_at)
+    return _spot
 
 
 async def dj_engineering_ad() -> list[str]:
@@ -22641,7 +22977,8 @@ async def dj_engineering_ad() -> list[str]:
     numbers — temperature, GPU, memory, load — read on air as though the
     machine itself were the sponsor."""
     stats = spoken_units(await asyncio.to_thread(system_stats))
-    return await dj_banter(None, lines=4, angle=(
+    _spot_at = time.time()                                        # #892
+    _spot = await dj_banter(None, lines=4, angle=(
         "The STATION ENGINEERING REPORT as a sponsor spot — the sponsor is "
         "the DGX Spark, the machine this very station runs on. The TWO of "
         "you deliver it TOGETHER, trading it back and forth: one reads a "
@@ -22650,6 +22987,12 @@ async def dj_engineering_ad() -> list[str]:
         "alternating, never a monologue. These are its live numbers, real, "
         f"straight off the sensors this second: {stats} Use several of them "
         "verbatim between you and sell the machine like a luxury product."))
+    # #892: the engineering report is sold as a sponsor spot, so it is an
+    # ad, so it is listed — same as every other road.
+    if _spot:
+        ad_booth_row("\U0001f4e3 sponsor spot \u2014 the DGX Spark itself",
+                     product="the DGX Spark", air_at=_spot_at)
+    return _spot
 
 
 async def dj_ad(product: str, remember: bool = True,
@@ -22723,6 +23066,68 @@ def ad_line_mark(ad_id: str, product: str, audio: str = "") -> None:
         # Only look back over the handful of lines an ad can span.
         if entry.get("kind") not in ("ad", "sfx"):
             return
+
+
+def ad_booth_row(text: str, product: str = "", who: str = "dj",
+                 name: str = "the desk", ad_id: str = "", audio: str = "",
+                 media: str = "", sig: str = "", voice: str = "",
+                 aired: str = "", air_at: float = 0.0) -> dict[str, Any]:
+    """#892: "If an ad is ran, be sure to list it in the booth."
+
+    One listing, one shape, for every road an advert can air on. The shape
+    is the one dj_speak already writes — who, kind, text, air_at, an id —
+    so the booth sorts it with everything else, the delivery mark lands on
+    it, and the ad tile finds its clip.
+
+    `aired` is only ever one of the values the panel's ladder actually
+    knows: airing / held / page / never / box / stream. Left empty it is
+    read off the DJ-VOICE routing, which is what decides where an ad goes:
+    the box (or both) means the speaker had it, the page means the browser
+    feed only, and muted output means nobody heard it — which is "never",
+    not a quiet lie about having aired.
+
+    `audio` names a durable spot under /ads-audio; `media` is a served clip
+    key or path under /media (a music-bedded spot is mixed fresh and lives
+    there). Either gives the tile its play and its download. Never raises:
+    a booth listing is not worth taking the show off air for."""
+    try:
+        to = str(_RADIO.get("voice_to") or "box")
+        if not aired:
+            aired = ("box" if to in ("box", "both")
+                     else "page" if to == "here" else "never")
+        if aired not in ("airing", "held", "page", "never", "box", "stream"):
+            aired = "box"
+        row: dict[str, Any] = {
+            "id": uuid.uuid4().hex[:6],
+            "ts": int(time.time()),
+            "air_at": float(air_at or time.time()),
+            "who": str(who or "dj"),
+            "kind": "ad",
+            "name": booth_actor_name(who, name),
+            "text": str(text or "")[:1200],
+            "product": str(product or "")[:160],
+            "voice": str(voice or ""),
+            "aired": aired,
+        }
+        if ad_id:
+            row["ad_id"] = str(ad_id)
+        if audio:
+            row["ad_audio"] = str(audio)
+            try:
+                row["ad_sig"] = media_sign(str(audio))
+            except Exception:  # noqa: BLE001
+                pass
+        if media:
+            # A path or a bare key, both accepted — the booth wants the key.
+            key = str(media).rsplit("/", 1)[-1].split("?")[0]
+            if key:
+                row["media"] = key
+                row["sig"] = str(sig or "")
+        _RADIO["chat"].append(row)
+        del _RADIO["chat"][:-240]
+        return row
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _store_media(audio: bytes, ext: str = "wav") -> dict[str, Any]:
@@ -23749,6 +24154,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     Renders the voice, mixes it with a random track, plays the one mixed
     clip. Any failure falls back to a plain read so an ad always airs."""
     _RADIO["ad_now"] = {"product": str(product)[:160], "at": time.time()}
+    _ad_at = time.time()                                          # #892
     line = spoken_text(await dj_line("ad", _RADIO.get("now"), extra=product))
     if not line:
         return {"ad": "", "product": product, "id": ""}
@@ -23815,8 +24221,26 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
             "text": line, "engine": engine, "voice": forced or ""})
         del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     entry = ad_save(product, line, kind="music") if remember else None
-    if entry:
-        ad_line_mark(entry.get("id", ""), product)
+    # #892: THE ROAD THAT LEFT NO TRACE. A music-bedded spot never goes
+    # through dj_speak, so nothing ever wrote it a booth row — and the
+    # ad_line_mark() this road used to call exists to STAMP the row
+    # dj_speak leaves behind, so here it walked back over lines that were
+    # not ads and marked nothing at all. The spot swelled up over the
+    # record, sold something, was kept on the shelf, and the booth had
+    # no sign at all that it had
+    # happened; the airings ledger never saw it either. It files its own
+    # listing now, the same shape as every other ad, carrying the mixed
+    # clip so the tile can play it and keep it.
+    ad_booth_row(line, product,
+                 ad_id=str((entry or {}).get("id") or ""),
+                 media=str((play or {}).get("path") or ""),
+                 sig=str((play or {}).get("sig") or ""),
+                 voice=forced or "", air_at=_ad_at)
+    try:
+        ad_aired(entry or {"product": product, "text": line},
+                 _RADIO.get("voice_to") or "box")                  # #743
+    except Exception:  # noqa: BLE001
+        pass
     return {"ad": line, "product": product, "id": (entry or {}).get("id", "")}
 
 
@@ -23864,7 +24288,20 @@ async def dj_ad_break() -> str:
         if stored.get("audio"):
             await _air_produced_ad(stored)
             return stored.get("text", "")
-        return await dj_speak("ad", _RADIO.get("now"), line=stored["text"])
+        # #892: a stored DRY read reruns through dj_speak, which files its
+        # own kind="ad" row — but nothing stamped the spot onto it, so the
+        # booth listed an ad with no product on it, no play and no keep,
+        # and the airings ledger never counted the rerun. Same spot: say
+        # which one it was.
+        _rerun = await dj_speak("ad", _RADIO.get("now"), line=stored["text"])
+        if _rerun:
+            try:
+                ad_line_mark(str(stored.get("id") or ""),
+                             str(stored.get("product") or ""))
+                ad_aired(stored, _RADIO.get("voice_to") or "box")
+            except Exception:  # noqa: BLE001
+                pass
+        return _rerun
 
     product = ""
     # The art-hawking governor: a painting pitch at most every ~15 minutes;
@@ -23893,7 +24330,20 @@ async def dj_ad_break() -> str:
         if stored.get("audio"):
             await _air_produced_ad(stored)
             return stored.get("text", "")
-        return await dj_speak("ad", _RADIO.get("now"), line=stored["text"])
+        # #892: a stored DRY read reruns through dj_speak, which files its
+        # own kind="ad" row — but nothing stamped the spot onto it, so the
+        # booth listed an ad with no product on it, no play and no keep,
+        # and the airings ledger never counted the rerun. Same spot: say
+        # which one it was.
+        _rerun = await dj_speak("ad", _RADIO.get("now"), line=stored["text"])
+        if _rerun:
+            try:
+                ad_line_mark(str(stored.get("id") or ""),
+                             str(stored.get("product") or ""))
+                ad_aired(stored, _RADIO.get("voice_to") or "box")
+            except Exception:  # noqa: BLE001
+                pass
+        return _rerun
     if not product:
         return ""
     # A produced (music-bed) ad sometimes sells a SERVICE running on the DGX
@@ -23940,6 +24390,7 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
     name = str(entry.get("audio") or "")
     if not name or not (PRODUCED_ADS_DIR / name).is_file():
         return
+    _air_at = time.time()                                         # #892
     path, sig = f"/ads-audio/{name}", media_sign(name)
     label = "📣 " + (entry.get("product") or "a produced spot")
     # #731: what is being SOLD right now, so the booth can light the tile of
@@ -23961,17 +24412,15 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
     _episode_stage(f"{path}?t={sig}", label)
     # #701: a stored spot never went through dj_speak, so it made a noise and
     # left no trace in the booth. It gets its own entry like any other ad.
-    _RADIO["chat"].append({
-        "ts": int(time.time()), "who": "dj", "kind": "ad",
-        "name": "the desk", "text": label,
-        "ad_id": str(entry.get("id") or ""),
-        "product": str(entry.get("product") or "")[:160],
-        "ad_audio": name,
-        "ad_sig": media_sign(name),          # #733
-        "voice": str(entry.get("voice") or ""),
-        "aired": "box" if ad_to in ("box", "both") else "page",
-    })
-    del _RADIO["chat"][:-240]
+    # #892: the same listing every other ad road writes now — and with the
+    # two fields this hand-rolled copy was missing, an `id` to jump to and
+    # the `air_at` the booth sorts on, so a stored spot no longer sorts to
+    # the moment its playback FINISHED.
+    ad_booth_row(label, str(entry.get("product") or ""),
+                 ad_id=str(entry.get("id") or ""), audio=name,
+                 voice=str(entry.get("voice") or ""),
+                 aired="box" if ad_to in ("box", "both") else "page",
+                 air_at=_air_at)
     ad_aired(entry, "box" if ad_to in ("box", "both") else "page")   # #743
 
 
@@ -78653,6 +79102,7 @@ function schedulePanel(anchor) {
     let monthAt = new Date();
     let zoom = "hour";
     let dragFrom = null;
+    let hourPins = {};    /* #891: {slot_id: {track_id, track}} for this hour */
     let lastAir = "";
     let ticker = 0;
     let poller = 0;
@@ -78674,6 +79124,8 @@ function schedulePanel(anchor) {
       stop();
       const kid = document.getElementById("schedPromptPanel");
       if (kid) kid.remove();
+      const kid2 = document.getElementById("schedTrackPanel");   /* #891 */
+      if (kid2) kid2.remove();
       pop.remove();
     };
     head.appendChild(title); head.appendChild(again); head.appendChild(shut);
@@ -78709,8 +79161,13 @@ function schedulePanel(anchor) {
           enabled: !(s && s.enabled === false),
           minutes: Number((s && s.minutes) || 0),
           prompt_id: (s && s.prompt_id) ? String(s.prompt_id) : "",
-          notes: String((s && s.notes) || "")
+          notes: String((s && s.notes) || ""),
+          /* #891: the record pinned to this entry on the plan, if any. The
+             pin that actually runs tonight lives on the HOUR, read below. */
+          track_id: String((s && s.track_id) || ""),
+          track: String((s && s.track) || "")
         }));
+        await loadHourPins();
         kinds = Array.isArray(data.kinds) ? data.kinds : [];
         if (!kinds.length) {
           try { kinds = (await api("/api/schedule/kinds")) || []; }
@@ -79080,7 +79537,33 @@ function schedulePanel(anchor) {
         paintBody();
         saveSlots(true);
       };
+      /* #891: "For spinning records, put a play icon here that when
+       * clicked allows me to select a track ... and it's just the track
+       * that's played for that segment." Only a record entry gets one —
+       * nothing else drops a needle. Lit when something is pinned. */
+      let pin = null;
+      if (String(s.kind || "") === "record") {
+        pin = el("button", "sched-mini", "\u25b6");
+        const p0 = schedPinOf(s);
+        pin.title = p0.track_id
+          ? "This hour it spins " + (p0.track || p0.track_id)
+            + " \u2014 click to choose another"
+          : "Choose the record this segment spins";
+        if (p0.track_id) pin.classList.add("sched-on");
+        pin.onclick = (ev) => { ev.stopPropagation(); trackPanel(s, pin); };
+        if (p0.track_id) {
+          const tag = el("div", "sched-pinned", "\u266a " + (p0.track
+            || p0.track_id));
+          tag.style.cssText = "font-size:10px;opacity:.8;margin-top:2px;"
+            + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+          tag.title = "Pinned for this hour. It goes to the front of the "
+            + "queue when this entry starts and plays once \u2014 it never "
+            + "cuts a record that is already playing.";
+          mid.appendChild(tag);
+        }
+      }
       [up, down, onoff, gear, bin].forEach((b) => rail.appendChild(b));
+      if (pin) rail.insertBefore(pin, gear);
       t.appendChild(rail);
       return t;
     }
@@ -79134,7 +79617,8 @@ function schedulePanel(anchor) {
             slots: slots.map((s) => ({
               id: s.id || "", kind: s.kind || "", label: s.label || "",
               enabled: !!s.enabled, minutes: Number(s.minutes) || 0,
-              prompt_id: s.prompt_id || "", notes: s.notes || ""
+              prompt_id: s.prompt_id || "", notes: s.notes || "",
+              track_id: s.track_id || "", track: s.track || ""
             }))
           })});
         say("saved \u2014 " + slots.length + " entries in the running order.");
@@ -79311,6 +79795,197 @@ function schedulePanel(anchor) {
     }
 
     /* ---- the system prompt behind one kind of entry ------------------ */
+    /* ---- #891: which record this segment spins --------------------- */
+
+    /* The hour the studio clock is standing in, in the key the server files
+       overrides under: local wall clock, "YYYY-MM-DDTHH". */
+    function schedHourKey() {
+      const d = new Date();
+      return d.getFullYear() + "-" + schedPad(d.getMonth() + 1) + "-"
+        + schedPad(d.getDate()) + "T" + schedPad(d.getHours());
+    }
+
+    /* What is pinned to an entry: this hour's own orders first, then
+       whatever the plan itself carries. */
+    function schedPinOf(s) {
+      const id = String((s && s.id) || "");
+      if (id && hourPins[id]) return hourPins[id];
+      return {track_id: String((s && s.track_id) || ""),
+              track: String((s && s.track) || "")};
+    }
+
+    /* This hour's overrides, so the tiles can show what really runs tonight.
+       A bonus, never a blocker: if the hour view is not there the tiles fall
+       back to the plan and everything else still works. */
+    async function loadHourPins() {
+      hourPins = {};
+      try {
+        const d = await api("/api/schedule/hours?count=1");
+        const h = (d && Array.isArray(d.hours) ? d.hours : [])[0];
+        ((h && Array.isArray(h.slots)) ? h.slots : []).forEach((r) => {
+          const id = String((r && r.id) || "");
+          if (id && r && r.track_id) {
+            hourPins[id] = {track_id: String(r.track_id),
+                            track: String(r.track || "")};
+          }
+        });
+      } catch (ignored) { /* the plan still paints without it */ }
+    }
+
+    /* The picker. Reuses the station's ONE music index through the two
+       endpoints that already serve it — /api/music/search for a hunt and
+       /api/music/browse for a look around — rather than growing a second
+       library road. Choosing pins the track to THIS HOUR's copy of this
+       entry; the needle honours it once, and never over a record that is
+       already turning. */
+    function trackPanel(slot, at2) {
+      try {
+        const old = document.getElementById("schedTrackPanel");
+        if (old) old.remove();
+        const pop2 = el("div", "panel", "");
+        pop2.id = "schedTrackPanel";
+        const r = (at2 && at2.getBoundingClientRect)
+          ? at2.getBoundingClientRect() : {left: 90, bottom: 100};
+        pop2.style.cssText = "position:fixed;z-index:222;"
+          + "width:min(460px,94vw);padding:10px 12px;margin:0;max-height:80vh;"
+          + "overflow:auto;left:"
+          + Math.max(8, Math.min(window.innerWidth - 470, r.left - 370))
+          + "px;top:" + ((r.bottom || 100) + 6) + "px";
+        pop2.onclick = (e) => e.stopPropagation();
+
+        const h2 = el("div", "row", "");
+        h2.style.cssText = "gap:6px;align-items:center;margin-bottom:3px";
+        const t2 = el("div", "", "\u25b6 " + (slot.label || "spin record")
+          + " \u2014 which record");
+        t2.style.cssText = "font-weight:700;font-size:12px;flex:1;min-width:0";
+        const x2 = el("button", "", "\u2715");
+        x2.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
+        x2.onclick = () => pop2.remove();
+        h2.appendChild(t2); h2.appendChild(x2);
+        pop2.appendChild(h2);
+
+        const noteNode = el("div", "muted", "");
+        noteNode.style.cssText = "font-size:10.5px;line-height:1.45;"
+          + "margin-bottom:5px";
+        pop2.appendChild(noteNode);
+        const say2 = (m, bad) => {
+          noteNode.textContent = m || "";
+          noteNode.style.color = bad ? "var(--danger)" : "";
+        };
+
+        const standing = el("div", "", "");
+        standing.style.cssText = "font-size:10.5px;margin-bottom:6px";
+        function drawStanding() {
+          standing.textContent = "";
+          const p = schedPinOf(slot);
+          if (!p.track_id) {
+            standing.className = "muted";
+            standing.textContent = "Nothing pinned \u2014 this segment takes "
+              + "whatever the queue has next.";
+            return;
+          }
+          standing.className = "";
+          standing.appendChild(el("span", "", "\u266a " + (p.track
+            || p.track_id)));
+          const off = el("button", "", "unpin");
+          off.style.cssText = "font-size:10px;padding:1px 7px;margin-left:6px";
+          off.title = "Back to whatever the queue picks";
+          off.onclick = () => setPin("", "");
+          standing.appendChild(off);
+        }
+        drawStanding();
+        pop2.appendChild(standing);
+
+        const box = el("input", "", "");
+        box.type = "search";
+        box.placeholder = "search the library \u2014 title, artist, album";
+        box.style.cssText = "width:100%;font-size:11px;padding:3px 6px";
+        pop2.appendChild(box);
+        const list = el("div", "", "");
+        list.style.cssText = "margin-top:6px;max-height:42vh;overflow:auto";
+        pop2.appendChild(list);
+        const rule = el("div", "muted", "It goes to the front of the queue "
+          + "when this entry starts and plays ONCE. It never cuts a record "
+          + "that is already playing \u2014 a record plays whole.");
+        rule.style.cssText = "font-size:10px;line-height:1.4;margin-top:6px;"
+          + "opacity:.75";
+        pop2.appendChild(rule);
+        document.body.appendChild(pop2);
+        try { box.focus(); } catch (ignored) { /* no keyboard, no matter */ }
+
+        async function setPin(id, title) {
+          try {
+            say2(id ? "pinning\u2026" : "unpinning\u2026");
+            await api("/api/schedule/hours/"
+              + encodeURIComponent(schedHourKey()) + "/track",
+              {method: "POST", body: JSON.stringify({
+                slot_id: String(slot.id || ""),
+                track_id: String(id || ""),
+                track: String(title || "")})});
+            if (id) {
+              hourPins[String(slot.id || "")] = {
+                track_id: String(id), track: String(title || "")};
+            } else {
+              delete hourPins[String(slot.id || "")];
+            }
+            drawStanding();
+            paintBody();
+            say2(id
+              ? "pinned \u2014 this hour, that entry spins it."
+              : "unpinned \u2014 the queue picks again.");
+          } catch (e) { say2(String((e && e.message) || e), true); }
+        }
+
+        function results(rows) {
+          list.textContent = "";
+          if (!rows.length) {
+            const none = el("div", "muted", "nothing matched.");
+            none.style.cssText = "font-size:10.5px;padding:3px 0";
+            list.appendChild(none);
+            return;
+          }
+          rows.slice(0, 25).forEach((tr) => {
+            const id = String((tr && tr.id) || "");
+            if (!id) return;
+            const song = String((tr && tr.title) || id);
+            const who = String((tr && tr.artist) || "");
+            const shown = song + (who ? " \u2014 " + who : "");
+            const b = el("button", "", "");
+            b.style.cssText = "display:block;width:100%;text-align:left;"
+              + "font-size:10.5px;padding:3px 6px;margin:1px 0;"
+              + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+            b.textContent = shown;
+            b.title = "Spin this one for that segment";
+            b.onclick = () => setPin(id, shown);
+            list.appendChild(b);
+          });
+        }
+
+        let typing = 0;
+        async function hunt() {
+          const q = box.value.trim();
+          try {
+            if (!q) {
+              const d = await api("/api/music/browse?limit=25&seed="
+                + Math.floor(Date.now() / 1000));
+              results(Array.isArray(d && d.results) ? d.results : []);
+              say2("a handful out of the library \u2014 type to search it.");
+              return;
+            }
+            const d = await api("/api/music/search?limit=25&q="
+              + encodeURIComponent(q));
+            results(Array.isArray(d && d.results) ? d.results : []);
+            say2("");
+          } catch (e) { say2(String((e && e.message) || e), true); }
+        }
+        box.oninput = () => {
+          clearTimeout(typing);
+          typing = setTimeout(hunt, 220);
+        };
+        hunt();
+      } catch (e) { say(String((e && e.message) || e), true); }
+    }
+
     function promptPanel(slot, at2) {
       try {
         const old = document.getElementById("schedPromptPanel");

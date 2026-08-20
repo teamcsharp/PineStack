@@ -2400,8 +2400,105 @@ function worksSchedule(anchorPop) {
       row.appendChild(tri);
       row.appendChild(drw);
       if (segOpen[okey]) segLoad(s, drw, okey);
+
+      /* #928 (#891): a Spin record entry gets a play icon — pick the
+       * track that fills it. Pinning QUEUES the track; it never cuts a
+       * record that is still turning. */
+      if (s.kind === "record") {
+        const pick = mk("button", "",
+                        (s.track_id ? "\u25b6 " + String(s.track || "pinned")
+                                    : "\u25b6 choose the record"));
+        pick.title = s.track_id
+          ? "This track fills the entry. Click to change or unpin it."
+          : "Pick the track that fills this entry, this hour";
+        pick.style.cssText = "font-size:9.5px;margin:3px 0 0 6px;"
+          + "padding:1px 6px;max-width:230px;overflow:hidden;"
+          + "text-overflow:ellipsis;white-space:nowrap"
+          + (s.track_id ? ";color:#7ce8a9" : "");
+        pick.onclick = (ev) => { ev.stopPropagation(); trackPick(s); };
+        row.appendChild(pick);
+      }
       body.appendChild(row);
     });
+  }
+
+  /* #928: search the library and pin one track to this entry. */
+  function trackPick(slot) {
+    const old = document.getElementById("worksTrackPick");
+    if (old) old.remove();
+    const d = mk("div", "works-pop");
+    d.id = "worksTrackPick";
+    const r = pop.getBoundingClientRect();
+    d.style.cssText = "position:fixed;z-index:403;width:min(420px,44vw);"
+      + "max-height:70vh;overflow:auto;left:"
+      + Math.max(8, Math.round(r.left - 30)) + "px;top:"
+      + Math.round(r.top + 60) + "px";
+    d.onclick = (e) => e.stopPropagation();
+    const h = mk("div", "wk-head");
+    h.appendChild(mk("b", "", "\u25b6 the record for this entry"));
+    const cx = mk("button", "wk-x", "\u2715");
+    cx.onclick = () => d.remove();
+    h.appendChild(cx);
+    d.appendChild(h);
+    d.appendChild(mk("div", "wk-sub",
+      hour.label + " on " + hour.date + " \u00b7 " + (slot.label || "")
+      + " \u00b7 this hour only. Pinning QUEUES the track \u2014 it never "
+      + "cuts a record that is still playing."));
+
+    const box = mk("input", "");
+    box.placeholder = "search your library\u2026";
+    box.style.cssText = "width:100%;font-size:11px;margin:6px 0";
+    d.appendChild(box);
+    const list = mk("div", "");
+    d.appendChild(list);
+
+    const pin = async (id, title) => {
+      try {
+        await api.post("/api/schedule/hours/"
+                       + encodeURIComponent(hour.key) + "/track",
+                       {slot_id: slot.id, track_id: id || "",
+                        track: title || ""});
+      } catch (e) {}
+      d.remove();
+      load();
+    };
+    if (slot.track_id) {
+      const un = mk("button", "", "unpin \u2014 let the queue decide");
+      un.style.cssText = "font-size:10px;margin-bottom:6px;padding:2px 7px";
+      un.onclick = () => pin("", "");
+      d.appendChild(un);
+    }
+    const draw = (rows) => {
+      list.textContent = "";
+      (rows || []).slice(0, 40).forEach((t) => {
+        const b = mk("button", "", "");
+        b.style.cssText = "display:block;width:100%;text-align:left;"
+          + "font-size:10px;padding:3px 6px;margin-bottom:3px;"
+          + "white-space:normal;line-height:1.4";
+        b.textContent = ((t.artist ? t.artist + " \u2014 " : "")
+                         + (t.title || t.id));
+        b.onclick = () => pin(t.id, ((t.artist ? t.artist + " - " : "")
+                                     + (t.title || "")));
+        list.appendChild(b);
+      });
+      if (!(rows || []).length) {
+        list.appendChild(mk("div", "wk-note", "nothing matched that"));
+      }
+    };
+    let timer = 0;
+    const hunt = () => {
+      const q = String(box.value || "").trim();
+      api.get(q ? "/api/music/search?q=" + encodeURIComponent(q) + "&limit=40"
+                : "/api/music/browse?limit=40")
+        .then((got) => draw((got && (got.tracks || got.rows || got.items))
+                            || (Array.isArray(got) ? got : [])))
+        .catch(() => { list.textContent = "the library is unreachable"; });
+    };
+    box.oninput = () => { clearTimeout(timer); timer = setTimeout(hunt, 260); };
+    hunt();
+    document.body.appendChild(d);
+    try { pvFloatDesk(d); } catch (e) {}
+    box.focus();
   }
 
   function detail(slot, i) {
