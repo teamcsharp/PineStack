@@ -3,7 +3,10 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Pine Box Desktop</title>
+  <!-- #971: the page title IS the window title in Electron - it
+       overrides the BrowserWindow `title` option the moment the
+       document loads, so the application is named here too. -->
+  <title>Pine Box</title>
   <link rel="stylesheet" href="./styles.css">
 </head>
 <!-- agent-down until the first health check proves otherwise: the compact
@@ -12,7 +15,7 @@
 <body class="agent-down">
   <aside class="rail">
     <div class="brand">
-      <button id="panicBtn" class="mark" title="Collapse, rebuild, restore, and relaunch Pine Box Desktop">PB</button>
+      <button id="panicBtn" class="mark" title="Collapse, rebuild, restore, and relaunch Pine Box">PB</button>
       <div>
         <h1>Pine Box</h1>
         <p id="connLine">checking agent...</p>

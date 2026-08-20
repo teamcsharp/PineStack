@@ -29,6 +29,66 @@ for (const stream of [process.stdout, process.stderr]) {
 
 app.commandLine.appendSwitch("autoplay-policy", "no-user-gesture-required");
 
+// #971 — THE APPLICATION IS CALLED PINE BOX, AND WINDOWS HAS TO KNOW IT.
+//
+// "make it where I'm able to pin this to the taskbar and load this as an
+//  application ... give the program a pine box logo and icon for whenever
+//  I pin it to the taskbar and have the application called Pine Box."
+//
+// Windows groups taskbar buttons, jump lists and pins by AppUserModelID.
+// An app that never sets one inherits a default derived from the running
+// executable — which here is electron.exe — so the taskbar button was
+// "Electron", wearing the Electron icon, and pinning it captured
+// electron.exe with NO arguments and the wrong working directory. That
+// pin then launched a bare Electron with no app in it. The stale
+// Electron.lnk found in the taskbar pin folder was exactly that.
+//
+// This id is the single string that has to match in three places: here,
+// the Start Menu shortcut pine_box.exe writes, and nothing else. If they
+// ever disagree, the running window and the pinned button become two
+// separate buttons again.
+const PINE_AUMID = "local.lilspark.pinebox";
+if (process.platform === "win32") {
+  try { app.setAppUserModelId(PINE_AUMID); } catch {}
+}
+// #971: renaming the app RENAMES ITS STATE DIRECTORY, which is not what
+// was wanted and is not obvious. Electron derives userData as
+// appData/<app.getName()>, so setName("Pine Box") silently moved it from
+// %APPDATA%\pinebox-desktop to %APPDATA%\Pine Box - and the five call
+// sites below it (the config file, agent-data, agent-venv, the rebuild
+// script and its log) all followed, so the app came up with a blank
+// config and lost the operator's saveDir. Caught by comparing the two
+// files: the old one had saveDir pointing at the QuickSwap recordings
+// share, the new one had no saveDir at all.
+//
+// The display name and the state directory are two different things, so
+// they are set as two different things. The name is what Windows shows;
+// the path stays exactly where every previous version of this app put it.
+const PINE_USER_DATA = path.join(app.getPath("appData"), "pinebox-desktop");
+try {
+  app.setName("Pine Box");
+  app.setPath("userData", PINE_USER_DATA);
+} catch {}
+
+// #971: one Pine Box, not one per click. A pinned taskbar button is
+// pressed to GET to the app, not to start a second copy of it — and
+// pine_box.exe is run again on every launch, so without this the shortcut
+// and the pin would stack instances. The second instance hands its
+// argument list to the first and dies; the first comes to the front.
+const pineLock = app.requestSingleInstanceLock();
+if (!pineLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    try {
+      if (!win || win.isDestroyed()) return;
+      if (win.isMinimized()) win.restore();
+      win.show();
+      win.focus();
+    } catch {}
+  });
+}
+
 const defaults = {
   // The portable pine_box exe lands on ANY machine on the network and taps
   // the live broadcast out of the box: attach to the master DGX agent by
@@ -279,22 +339,22 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
     ")",
     "if not exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" goto fail",
     "> \"%RUN_DIR%\\node_modules\\electron\\path.txt\" echo electron.exe",
-    ">> \"%LOG%\" echo [rebuild] relaunching Pine Box Desktop",
+    ">> \"%LOG%\" echo [rebuild] relaunching Pine Box",
     `set "PINE_AGENT_ROOT=${cmdEscape(sourceRoot)}"`,
     "set \"PINE_DESKTOP_BASE_URL=%BASE_URL%\"",
     "set \"PINE_DESKTOP_MODE=%MODE%\"",
     // A shell spawned from Electron may carry ELECTRON_RUN_AS_NODE,
     // which turns electron.exe into plain Node. Always clear it.
     "set \"ELECTRON_RUN_AS_NODE=\"",
-    "start \"Pine Box Desktop\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
+    "start \"Pine Box\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
     "exit /b 0",
     ":fail",
     ">> \"%LOG%\" echo [rebuild] FAILED — see above",
     "set \"ELECTRON_RUN_AS_NODE=\"",
     "if exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" (",
-    "  start \"Pine Box Desktop\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
+    "  start \"Pine Box\" /D \"%RUN_DIR%\" \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" .",
     ") else (",
-    "  start \"Pine Box Desktop rebuild failed\" cmd /d /k \"echo [rebuild] The Electron runtime is missing and the share bundle could not be unpacked. & echo Double-click \\\\10.89.1.246\\ehm_eckx\\pinevoice-stack\\pine_box.exe to rebuild from scratch, or read: & echo %LOG%\"",
+    "  start \"Pine Box rebuild failed\" cmd /d /k \"echo [rebuild] The Electron runtime is missing and the share bundle could not be unpacked. & echo Double-click \\\\10.89.1.246\\ehm_eckx\\pinevoice-stack\\pine_box.exe to rebuild from scratch, or read: & echo %LOG%\"",
     ")",
     "exit /b 1",
     ""
@@ -444,7 +504,7 @@ async function reconstituteDesktop() {
   const cfg = readConfig();
   const runnerRoot = path.resolve(__dirname, "..");
   try {
-    supportProgress("ignition", 3, "reconstituting Pine Box Desktop");
+    supportProgress("ignition", 3, "reconstituting Pine Box");
     if (process.platform === "win32") {
       const sourceRoot = process.env.PINE_AGENT_ROOT || agentRoot();
       supportProgress("collapse", 8, "arming post-exit rebuild script");
@@ -588,7 +648,12 @@ function createWindow() {
       ? { x: savedBounds.x, y: savedBounds.y } : {}),
     minWidth: 520,
     minHeight: 420,
-    title: "Pine Box Desktop",
+    title: "Pine Box",
+    // #971: the window icon is what alt-tab and the taskbar button show
+    // while the app is RUNNING; the .ico on the shortcut is what the pin
+    // shows when it is not. Both have to be the same mark or the button
+    // changes picture the moment you launch it.
+    icon: path.join(__dirname, "assets", "pinebox.ico"),
     backgroundColor: "#101419",
     webPreferences: {
       preload: path.join(__dirname, "preload.js"),

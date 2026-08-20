@@ -2,7 +2,7 @@
   "name": "pinebox-desktop",
   "version": "0.1.0",
   "private": true,
-  "description": "Desktop controller for PineBoxAgent and Pine Box FM.",
+  "description": "Pine Box — the station, on this PC.",
   "main": "desktop/main.js",
   "scripts": {
     "desktop": "electron .",
@@ -17,8 +17,8 @@
     "electron-builder": "^26.0.12"
   },
   "build": {
-    "appId": "local.lilspark.pinebox-desktop",
-    "productName": "Pine Box Desktop",
+    "appId": "local.lilspark.pinebox",
+    "productName": "Pine Box",
     "directories": {
       "output": "dist-desktop"
     },
@@ -51,6 +51,7 @@
       }
     ],
     "win": {
+      "icon": "desktop/assets/pinebox.ico",
       "target": [
         "nsis",
         "portable"
