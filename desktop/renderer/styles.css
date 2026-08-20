@@ -1181,3 +1181,13 @@ body.immersive main {
 .works-pop .wk-drawer { margin-top: 6px; padding-top: 6px;
   border-top: 1px dashed #24384a; }
 .works-pop .wk-stage b { cursor: default; }
+
+/* #923: the hour sheet, docked beside The Works. */
+.works-pop.works-sched { border-color: #2a4a5c; }
+.works-pop.works-sched .wk-stage { cursor: default; }
+.works-pop.works-sched button { background: #0d1620; border: 1px solid #24384a;
+  color: #c8d6e4; border-radius: 6px; cursor: pointer; }
+.works-pop.works-sched button:hover { border-color: #3f7fa8; }
+.works-pop input, .works-pop textarea { background: #05090f;
+  border: 1px solid #24384a; color: #c8d6e4; border-radius: 6px;
+  padding: 4px 6px; }

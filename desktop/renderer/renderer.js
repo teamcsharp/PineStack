@@ -1663,6 +1663,10 @@ function initWorksPopup() {
     Object.assign(wkOpen,
       JSON.parse(localStorage.getItem("wkOpen") || "{}") || {});
   } catch (e) { /* first run */ }
+  /* #922: the drawer ELEMENTS themselves, kept across rebuilds and
+   * re-adopted into each new flow, so an open one is never torn down
+   * while it is being read. */
+  const wkBody = {};
 
   function stage(flow, title, num, note, cls, frac, key, fill_) {
     const box = mk("div", "wk-stage" + (cls ? " " + cls : ""));
@@ -1680,13 +1684,23 @@ function initWorksPopup() {
       box.appendChild(bar);
     }
     if (key) {
-      const drawer = mk("div", "wk-drawer");
+      /* #922: THE DRAWER IS NOT REBUILT. paint() runs every 2.5 seconds
+       * and used to make a fresh drawer and re-fill it each time, so an
+       * open one flashed and threw away your scroll position and your
+       * text selection while you were reading it. The element is kept
+       * outside the flow and RE-ADOPTED into each rebuild instead, and
+       * its contents are only refilled when a signature says something
+       * actually changed. Reading it now holds still. */
+      let drawer = wkBody[key];
+      if (!drawer) { drawer = mk("div", "wk-drawer"); wkBody[key] = drawer; }
       drawer.style.display = wkOpen[key] ? "block" : "none";
-      box.appendChild(drawer);
+      box.appendChild(drawer);              // moves it; does not clone it
+      /* The fill is ADDITIVE and idempotent: it is handed the same
+       * element every time and is responsible for adding only what is
+       * new. Nothing already on screen is touched, so entries stack up
+       * and what you are reading holds still. */
       if (wkOpen[key] && typeof fill_ === "function") {
-        try { fill_(drawer); } catch (e) {
-          drawer.appendChild(mk("div", "wk-note", "could not read that"));
-        }
+        try { fill_(drawer); } catch (e) { /* keep what is already there */ }
       }
       head.onclick = (ev) => {
         ev.stopPropagation();
@@ -1695,8 +1709,7 @@ function initWorksPopup() {
         catch (e) { /* private mode */ }
         head.textContent = (wkOpen[key] ? "▾ " : "▸ ") + title;
         drawer.style.display = wkOpen[key] ? "block" : "none";
-        if (wkOpen[key] && !drawer.childNodes.length
-            && typeof fill_ === "function") {
+        if (wkOpen[key] && typeof fill_ === "function") {
           try { fill_(drawer); } catch (e) {}
         }
       };
@@ -1738,17 +1751,38 @@ function initWorksPopup() {
       f.writing ? "on" : "", null,
       "desk",
       (drawer) => {
-        drawer.appendChild(mk("div", "wk-note", "reading the desk…"));
+        /* #922: ADDITIVE. Each call the desk makes is added ONCE, newest
+         * on top, and nothing already on screen is touched — so entries
+         * stack up as they happen and reading one does not get
+         * interrupted by the 2.5-second repaint. */
+        if (!drawer.dataset.init) {
+          drawer.dataset.init = "1";
+          drawer.dataset.seen = "|";
+          const hd = mk("div", "wk-note", "reading the desk…");
+          hd.className = "wk-note wkDeskHead";
+          hd.style.cssText = "font-size:10px;margin-bottom:4px";
+          drawer.appendChild(hd);
+          const list = mk("div", "");
+          list.className = "wkDeskList";
+          drawer.appendChild(list);
+        }
+        const head = drawer.querySelector(".wkDeskHead");
+        const list = drawer.querySelector(".wkDeskList");
         api.get("/api/writing-desk").then((wd) => {
-          drawer.textContent = "";
           const calls = (wd && wd.calls) || [];
-          const head = mk("div", "wk-note",
-            calls.length + " calls held · mean " + (wd.mean_ms || 0)
-            + " ms, slowest " + (wd.slowest_ms || 0) + " ms"
-            + (wd.kind_now ? " · on a " + wd.kind_now + " segment" : ""));
-          head.style.cssText = "font-size:10px;margin-bottom:4px";
-          drawer.appendChild(head);
-          calls.slice(0, 4).forEach((c) => {
+          if (head) {
+            head.textContent = calls.length + " calls held · mean "
+              + (wd.mean_ms || 0) + " ms, slowest " + (wd.slowest_ms || 0)
+              + " ms" + (wd.kind_now ? " · on a " + wd.kind_now + " segment" : "");
+          }
+          if (!list) return;
+          const seen = String(drawer.dataset.seen || "|");
+          // oldest first so each new one is PREPENDED and the order is
+          // newest-at-top without ever moving what is already there
+          calls.slice(0, 12).reverse().forEach((c) => {
+            const id = "c" + String(c.at || 0) + ":" + String(c.ms || 0);
+            if (seen.indexOf("|" + id + "|") >= 0) return;
+            drawer.dataset.seen = drawer.dataset.seen + id + "|";
             const t = mk("div", "");
             t.style.cssText = "border-left:2px solid #3f7fa8;padding-left:7px;"
               + "margin:6px 0";
@@ -1756,22 +1790,25 @@ function initWorksPopup() {
             nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff";
             nm.textContent = (c.kind || "a round") + " · " + (c.ms || 0)
               + " ms · " + (c.chars || 0) + " chars · ctx "
-              + (c.num_ctx || "?") + " · temp " + (c.temp != null ? c.temp : "?");
+              + (c.num_ctx || "?") + " · temp "
+              + (c.temp != null ? c.temp : "?");
             t.appendChild(nm);
-            drawer.appendChild(t);
-            wkPut(drawer, "GOVERNED BY",
+            wkPut(t, "GOVERNED BY",
               (c.armed ? "system prompt: " + c.armed : "")
               + (c.sched ? (c.armed ? "\n\n" : "") + c.sched : ""));
-            wkPut(drawer, "WHAT WE SENT", c.prompt, true);
-            wkPut(drawer, "WHAT CAME BACK", c.script || c.text, true);
+            wkPut(t, "WHAT WE SENT", c.prompt, true);
+            wkPut(t, "WHAT CAME BACK", c.script || c.text, true);
+            list.insertBefore(t, list.firstChild);
           });
-          if (!calls.length) {
-            drawer.appendChild(mk("div", "wk-note",
-              "nothing yet — each call is recorded as the desk makes it."));
+          while (list.childNodes.length > 24) {
+            list.removeChild(list.lastChild);   // the tail ages out quietly
+          }
+          if (!calls.length && !list.childNodes.length && head) {
+            head.textContent =
+              "nothing yet — each call is recorded as the desk makes it.";
           }
         }).catch(() => {
-          drawer.textContent = "";
-          drawer.appendChild(mk("div", "wk-note", "the desk is unreachable"));
+          if (head) head.textContent = "the desk is unreachable";
         });
       });
     flow.appendChild(mk("div", "wk-arrow", "▼"));
@@ -2005,11 +2042,289 @@ function initWorksPopup() {
     document.body.appendChild(pop);
     load(body);
     poll = setInterval(() => load(body), 2500);
+    try { worksSchedule(pop); } catch (e) { /* the flow still opens */ }
   }
 
   cell.addEventListener("click", open);
 }
 try { initWorksPopup(); } catch (e) { /* the desk still works without it */ }
+
+/* #923 — THE HOUR, beside The Works.
+ *
+ * The Works answers "where is each round right now". This answers the
+ * other half: what the HOUR is supposed to be, entry by entry, and what
+ * the rooms have actually got ready for each one. It scrolls forward
+ * into hours that have not happened yet, and anything changed there is
+ * an override on that hour alone — the running order everywhere else is
+ * untouched.
+ */
+const SCHED_ICON = {news: "📰", record: "💿", gallery: "🖼", ad: "📣",
+                    banter: "💬", banter_caller: "☎💬", caller: "☎",
+                    manager: "📻", recap: "🔁", deep: "🧠",
+                    bombshell: "🌶"};
+
+function worksSchedule(anchorPop) {
+  const gone = document.getElementById("worksSched");
+  if (gone) gone.remove();
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const pop = mk("div", "works-pop works-sched");
+  pop.id = "worksSched";
+  const at = anchorPop.getBoundingClientRect();
+  pop.style.width = "min(430px,42vw)";
+  pop.style.left = Math.round(at.right + 10) + "px";
+  pop.style.top = Math.round(at.top) + "px";
+  pop.style.maxHeight = "86vh";
+  pop.onclick = (e) => e.stopPropagation();
+
+  const head = mk("div", "wk-head");
+  head.appendChild(mk("b", "", "🗓 the hour"));
+  const sub = mk("span", "wk-sub", "");
+  head.appendChild(sub);
+  const x = mk("button", "wk-x", "✕");
+  x.onclick = () => { clearInterval(tick); pop.remove(); };
+  head.appendChild(x);
+  pop.appendChild(head);
+
+  const nav = mk("div", "wk-note", "");
+  nav.style.cssText = "display:flex;gap:6px;align-items:center;margin:2px 0 6px";
+  const prev = mk("button", "", "‹");
+  const label = mk("b", "", "");
+  label.style.cssText = "flex:1;text-align:center;font-size:11.5px";
+  const next = mk("button", "", "›");
+  [prev, next].forEach((b) => {
+    b.style.cssText = "font-size:11px;line-height:1;padding:1px 8px";
+  });
+  nav.appendChild(prev); nav.appendChild(label); nav.appendChild(next);
+  pop.appendChild(nav);
+
+  const body = mk("div", "");
+  pop.appendChild(body);
+  document.body.appendChild(pop);
+
+  let offset = 0;              // hours forward from now
+  let hour = null;             // the hour being shown
+  let dragFrom = null;
+
+  const save = async (slots) => {
+    if (!hour) return;
+    try {
+      const got = await api.post("/api/schedule/hours",
+                                 {key: hour.key, slots: slots});
+      hour = ((got && got.hours) || [])[0] || hour;
+      paint();
+    } catch (e) { sub.textContent = "could not save that"; }
+  };
+
+  const revert = async () => {
+    if (!hour) return;
+    try {
+      await api.del("/api/schedule/hours/" + encodeURIComponent(hour.key));
+    } catch (e) {}
+    load();
+  };
+
+  function paint() {
+    body.textContent = "";
+    if (!hour) { body.appendChild(mk("div", "wk-note", "reading…")); return; }
+    label.textContent = hour.label + " · " + hour.date
+      + (hour.is_now ? "  (on air)" : "");
+    sub.textContent = hour.preset + (hour.overridden ? " · edited" : "");
+    if (hour.overridden) {
+      const rv = mk("button", "", "↺ back to the running order");
+      rv.style.cssText = "font-size:10px;margin-bottom:6px;padding:2px 7px";
+      rv.onclick = revert;
+      body.appendChild(rv);
+    }
+    (hour.slots || []).forEach((s, i) => {
+      const row = mk("div", "wk-stage");
+      row.style.cssText = "padding:5px 8px;margin:0 0 4px;"
+        + "border-left:3px solid "
+        + (s.state === "on air" ? "#7ce8a9"
+           : s.enabled === false ? "#44515f" : "#3f7fa8")
+        + ";opacity:" + (s.enabled === false ? ".5" : "1");
+      row.draggable = true;
+      row.addEventListener("dragstart", () => { dragFrom = i; });
+      row.addEventListener("dragover", (ev) => ev.preventDefault());
+      row.addEventListener("drop", (ev) => {
+        ev.preventDefault();
+        if (dragFrom == null || dragFrom === i) return;
+        const list = hour.slots.slice();
+        const [moved] = list.splice(dragFrom, 1);
+        list.splice(i, 0, moved);
+        dragFrom = null;
+        hour.slots = list;
+        save(list);
+      });
+      const top = mk("div", "");
+      top.style.cssText = "display:flex;gap:6px;align-items:center;"
+        + "font-size:11px;cursor:grab";
+      const t = mk("span", "wk-note", s.starts_at);
+      t.style.cssText = "font-size:10px;opacity:.7;width:38px";
+      top.appendChild(t);
+      top.appendChild(mk("span", "", SCHED_ICON[s.kind] || "•"));
+      const nm = mk("b", "", s.label || s.kind);
+      nm.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap";
+      top.appendChild(nm);
+      const mins = mk("span", "wk-note", s.minutes + "m");
+      mins.style.cssText = "font-size:10px;opacity:.7";
+      top.appendChild(mins);
+      const onoff = mk("button", "", s.enabled === false ? "○" : "●");
+      onoff.title = s.enabled === false ? "Off — click to run it"
+                                        : "On — click to skip it this hour";
+      onoff.style.cssText = "font-size:10px;line-height:1;padding:0 5px";
+      onoff.onclick = (ev) => {
+        ev.stopPropagation();
+        const list = hour.slots.map((r, j) =>
+          j === i ? Object.assign({}, r, {enabled: !(r.enabled !== false)}) : r);
+        hour.slots = list;
+        save(list);
+      };
+      top.appendChild(onoff);
+      row.appendChild(top);
+
+      const p = s.prep || {};
+      const line2 = mk("div", "wk-note", "");
+      line2.style.cssText = "font-size:9.5px;margin-top:2px;opacity:.75";
+      line2.textContent = (s.state === "on air" ? "● on air · " : "")
+        + "the rooms hold " + (p.written || 0) + " written, "
+        + (p.rendered || 0) + " recorded, " + (p.ready || 0) + " ready"
+        + (p.seconds ? " · " + Math.round(p.seconds) + "s" : "");
+      row.appendChild(line2);
+
+      const gear = mk("button", "", "⚙ this entry, this hour");
+      gear.style.cssText = "font-size:9.5px;margin-top:3px;padding:1px 6px";
+      gear.onclick = (ev) => { ev.stopPropagation(); detail(s, i); };
+      row.appendChild(gear);
+      body.appendChild(row);
+    });
+  }
+
+  function detail(slot, i) {
+    const old = document.getElementById("worksSchedDetail");
+    if (old) old.remove();
+    const d = mk("div", "works-pop");
+    d.id = "worksSchedDetail";
+    const r = pop.getBoundingClientRect();
+    d.style.cssText = "position:fixed;z-index:402;width:min(420px,44vw);"
+      + "max-height:70vh;overflow:auto;left:"
+      + Math.max(8, Math.round(r.left - 30)) + "px;top:"
+      + Math.round(r.top + 60) + "px";
+    d.onclick = (e) => e.stopPropagation();
+    const h = mk("div", "wk-head");
+    h.appendChild(mk("b", "", (SCHED_ICON[slot.kind] || "•") + " "
+                              + (slot.label || slot.kind)));
+    const cx = mk("button", "wk-x", "✕");
+    cx.onclick = () => d.remove();
+    h.appendChild(cx);
+    d.appendChild(h);
+    d.appendChild(mk("div", "wk-sub",
+      hour.label + " on " + hour.date + " · starts " + slot.starts_at
+      + " · this hour only"));
+
+    const nameIn = mk("input", "");
+    nameIn.value = slot.label || "";
+    nameIn.style.cssText = "width:100%;font-size:11px;margin:6px 0 4px";
+    d.appendChild(mk("div", "wk-note", "WHAT IT IS CALLED"));
+    d.appendChild(nameIn);
+
+    const minIn = mk("input", "");
+    minIn.type = "number"; minIn.min = "0.25"; minIn.step = "0.25";
+    minIn.value = String(slot.minutes);
+    minIn.style.cssText = "width:90px;font-size:11px;margin-bottom:4px";
+    d.appendChild(mk("div", "wk-note", "MINUTES OF THE HOUR"));
+    d.appendChild(minIn);
+
+    d.appendChild(mk("div", "wk-note", "THE SYSTEM PROMPT FOR THIS ENTRY"));
+    const ta = mk("textarea", "");
+    ta.style.cssText = "width:100%;height:150px;font-size:10.5px;"
+      + "font-family:ui-monospace,Consolas,monospace";
+    ta.placeholder = "Leave empty to use whatever is armed for a "
+      + slot.kind + " round.";
+    d.appendChild(ta);
+    api.get("/api/schedule/prompts").then((pr) => {
+      const band = (pr || {})[slot.kind] || {};
+      const vs = band.variants || [];
+      const pinned = vs.filter((v) => v.id === slot.prompt_id)[0];
+      const armed = vs[band.active || 0];
+      ta.value = (pinned || armed || {}).text || "";
+    }).catch(() => {});
+
+    const acts = mk("div", "wk-note", "");
+    acts.style.cssText = "display:flex;gap:6px;margin-top:6px";
+    const saven = mk("button", "", "save for this hour");
+    saven.style.cssText = "font-size:10.5px;padding:2px 8px;font-weight:700";
+    saven.onclick = async () => {
+      saven.textContent = "saving…";
+      const list = hour.slots.map((r2, j) => j === i
+        ? Object.assign({}, r2, {label: nameIn.value,
+                                 minutes: Number(minIn.value) || r2.minutes})
+        : r2);
+      hour.slots = list;
+      await save(list);
+      if (String(ta.value || "").trim()) {
+        try {
+          await api.post("/api/schedule/hours/"
+                         + encodeURIComponent(hour.key) + "/prompt",
+                         {slot_id: slot.id, text: ta.value,
+                          name: hour.label + " " + (slot.label || slot.kind)});
+        } catch (e) {}
+      }
+      d.remove();
+      load();
+    };
+    acts.appendChild(saven);
+    d.appendChild(acts);
+    document.body.appendChild(d);
+    try { pvFloatDesk(d); } catch (e) {}
+  }
+
+  async function load() {
+    try {
+      const from = offset ? hourKeyAhead(offset) : "";
+      const got = await api.get("/api/schedule/hours?count=1"
+                                + (from ? "&from=" + encodeURIComponent(from) : ""));
+      hour = ((got && got.hours) || [])[0] || null;
+      paint();
+    } catch (e) {
+      body.textContent = "";
+      body.appendChild(mk("div", "wk-note",
+        "the hour sheet is not available yet"));
+    }
+  }
+
+  function hourKeyAhead(n) {
+    const d = new Date();
+    d.setMinutes(0, 0, 0);
+    d.setHours(d.getHours() + n);
+    const p = (v) => String(v).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+           + "T" + p(d.getHours());
+  }
+
+  prev.onclick = () => { offset = Math.max(0, offset - 1); load(); };
+  next.onclick = () => { offset = Math.min(72, offset + 1); load(); };
+  load();
+  const tick = setInterval(() => { if (!offset) load(); }, 5000);
+}
+
+/* The Works' own popups are plain divs, not the panel's — give them the
+ * same "stay on screen" courtesy (#877). */
+function pvFloatDesk(el2) {
+  try {
+    const r = el2.getBoundingClientRect();
+    const mw = window.innerWidth, mh = window.innerHeight;
+    el2.style.left = Math.round(Math.min(Math.max(8, r.left),
+                                         Math.max(8, mw - r.width - 8))) + "px";
+    el2.style.top = Math.round(Math.min(Math.max(8, r.top),
+                                        Math.max(8, mh - r.height - 8))) + "px";
+  } catch (e) {}
+}
 
 /* #799: the status bar — the machine's own ticker tape. Left: the newest
  * line of EVERYTHING the server is doing (pipeline feed + every shell

@@ -17378,8 +17378,16 @@ def schedule_prep_order(most: int = 6) -> list[str]:
         if not store.get("enabled", True):
             return []
         name = schedule_preset_now(store)
-        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
-                 if s.get("enabled", True)]
+        rows = list((store.get("presets") or {}).get(name) or [])
+        try:
+            # #883: this docstring promises the same sheet and the same
+            # clock schedule_take() reads, so it honours the same override.
+            _picked, _rows, _on = schedule_hour_slots(store)
+            if _on and _rows:
+                rows = _rows
+        except Exception:  # noqa: BLE001
+            pass
+        slots = [s for s in rows if s.get("enabled", True)]
         if not slots:
             return []
         pos = _RADIO.get("sched_pos") or {}
@@ -18015,7 +18023,23 @@ async def _torrent_talk() -> None:
                 # coin toss. Only the random road is overridden - an
                 # operator's switchboard choice above still wins outright.
                 try:
-                    for _q in (() if _slot else ("caller", "manager")):
+                    # #921: the schedule no longer switches this OFF.
+                    #
+                    # This read `() if _slot else (...)` — so the moment a
+                    # running order existed, the quota could never catch
+                    # up. Measured live: manager 0 of 4 and caller 0 of 5,
+                    # both "behind, due now", for the whole hour, while
+                    # the sheet sat on one entry that had overrun its slot
+                    # by 2.1x. Segments were being written and recorded
+                    # and then never called for.
+                    #
+                    # The sheet still leads. It is only overruled when a
+                    # quota is BEHIND ITS PACE FOR THE HOUR *and* spaced
+                    # far enough from the last one — i.e. when the hour is
+                    # demonstrably not going to be delivered otherwise.
+                    # An operator's switchboard choice still wins outright
+                    # above this.
+                    for _q in ("caller", "manager"):
                         if (_q in kinds and _q != last
                                 and quota_behind(_q, dj)
                                 and quota_due(_q, dj)):
@@ -19771,6 +19795,100 @@ def _sched_is_date(text: str) -> bool:
         return False
 
 
+# --- #883: the hour an override is filed under ----------------------------
+# Local WALL CLOCK, "YYYY-MM-DDTHH" — the hour the operator sees on the
+# studio clock, not UTC, because the thing being scheduled is the hour that
+# goes out at ten at night where the station is.
+
+def _sched_hour_key(when: float | None = None) -> str:
+    """The hour key for a moment. Now, unless told otherwise."""
+    try:
+        return time.strftime(
+            "%Y-%m-%dT%H",
+            time.localtime(when if when is not None else time.time()))
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def _sched_is_hour_key(text: str) -> bool:
+    try:
+        time.strptime(str(text), "%Y-%m-%dT%H")
+        return True
+    except Exception:                          # noqa: BLE001
+        return False
+
+
+def _sched_hour_epoch(key: str) -> float:
+    """The top of that hour, as local time. -1 when the key is nonsense."""
+    try:
+        got = time.strptime(str(key), "%Y-%m-%dT%H")
+        return time.mktime((got.tm_year, got.tm_mon, got.tm_mday,
+                            got.tm_hour, 0, 0, 0, 1, -1))
+    except Exception:                          # noqa: BLE001
+        return -1.0
+
+
+def _sched_hour_shift(key: str, steps: int) -> str:
+    """`steps` hours on from `key`. Goes back out through localtime rather
+    than adding to a wall clock, so the clocks changing does not hand the
+    panel an hour that does not exist."""
+    try:
+        at = _sched_hour_epoch(key)
+        if at < 0:
+            at = _sched_hour_epoch(_sched_hour_key())
+        if at < 0:
+            at = time.time()
+        return _sched_hour_key(at + int(steps) * 3600.0 + 60.0)
+    except Exception:                          # noqa: BLE001
+        return _sched_hour_key()
+
+
+def _sched_hour_entry(raw: Any,
+                      presets: Any = None) -> dict[str, Any]:
+    """One hour's override, scrubbed.
+
+    `preset` points the hour at another schedule; `slots` is a whole
+    bespoke list for that hour alone. Either may be None. An EMPTY slot
+    list is deliberately turned back into None — "this hour runs nothing"
+    is not a thing the operator can ask for, because it would hand the
+    torrent an hour of silence to fill; clearing an hour is a DELETE."""
+    row = raw if isinstance(raw, dict) else {}
+    preset = str(row.get("preset") or "").strip()[:60] or None
+    if (preset is not None and isinstance(presets, dict)
+            and preset not in presets):
+        preset = None
+    rows = row.get("slots")
+    slots = ([_sched_slot(s) for s in rows][:200]
+             if isinstance(rows, list) else None)
+    if not slots:
+        slots = None
+    try:
+        at = round(float(row.get("at") or 0.0), 3)
+    except (TypeError, ValueError):
+        at = 0.0
+    return {"preset": preset, "slots": slots, "at": at}
+
+
+def _sched_hours_clean(raw: Any, store: dict[str, Any]) -> dict[str, Any]:
+    """The whole `hours` shelf off disk. Bad keys and empty overrides fall
+    away, and the shelf is capped in key order — which for this format is
+    chronological — so a station scheduled every hour for a year cannot
+    grow the file without bound."""
+    out: dict[str, Any] = {}
+    if not isinstance(raw, dict):
+        return out
+    presets = store.get("presets") or {}
+    for key, blob in raw.items():
+        name = str(key).strip()
+        if not _sched_is_hour_key(name):
+            continue
+        entry = _sched_hour_entry(blob, presets)
+        if entry.get("preset") is None and entry.get("slots") is None:
+            continue                    # an override of nothing is nothing
+        out[name] = entry
+    return dict(sorted(out.items())[-2000:])
+
+
 def schedule_defaults() -> dict[str, Any]:
     """A station that has never been scheduled still has the owner's hour."""
     slots = [
@@ -19784,6 +19902,10 @@ def schedule_defaults() -> dict[str, Any]:
         "presets": {CANONICAL_PRESET: slots},
         "day": {},
         "month": {},
+        # #883: per-HOUR overrides, keyed by local wall clock YYYY-MM-DDTHH.
+        # Empty is the normal state — an hour only appears here once the
+        # operator has actually changed something about it.
+        "hours": {},
         "prompts": {
             k["kind"]: {
                 "active": 0,
@@ -19835,6 +19957,9 @@ def schedule_read() -> dict[str, Any]:
             store["month"] = {
                 str(d): str(name) for d, name in month.items()
                 if _sched_is_date(str(d)) and str(name) in store["presets"]}
+        # #883: the per-hour overrides. Scrubbed the same way everything
+        # else here is — a half-written hour is dropped, never raised on.
+        store["hours"] = _sched_hours_clean(raw.get("hours"), store)
         prompts = raw.get("prompts")
         if isinstance(prompts, dict):
             for kind, blob in prompts.items():
@@ -19961,8 +20086,26 @@ def schedule_take() -> dict[str, Any]:
             _RADIO.pop("sched_pos", None)
             return {}
         name = schedule_preset_now(store)
-        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
-                 if s.get("enabled", True)]
+        rows = list((store.get("presets") or {}).get(name) or [])
+        # #883: the hour the clock is standing in may carry the operator's
+        # own override — a copy-on-write of the plan for that hour only.
+        # `stamp` is the hour key while one is in force and "" otherwise,
+        # and it rides in the saved position: crossing INTO or OUT OF an
+        # overridden hour therefore re-seats the walk at the top of the
+        # list it is now running, which is what the top of an hour means.
+        # An hour nobody has touched leaves stamp "" and every line below
+        # behaves exactly as it did before this shipped, and anything at
+        # all going wrong in here falls straight back to the plan.
+        stamp = ""
+        try:
+            hour_key = _sched_hour_key()
+            picked, hour_rows, overridden = schedule_hour_slots(
+                store, hour_key)
+            if overridden and hour_rows:
+                name, rows, stamp = picked, hour_rows, hour_key
+        except Exception:                      # noqa: BLE001
+            stamp = ""
+        slots = [s for s in rows if s.get("enabled", True)]
         if not slots:
             _RADIO.pop("sched_pos", None)
             return {}
@@ -19971,6 +20114,7 @@ def schedule_take() -> dict[str, Any]:
         idx = int(pos.get("index") or 0)
         started = float(pos.get("started") or 0)
         fresh = (str(pos.get("preset") or "") != name
+                 or str(pos.get("hour") or "") != stamp
                  or not 0 <= idx < len(slots)
                  or started <= 0
                  or str(pos.get("slot_id") or "")
@@ -19996,7 +20140,7 @@ def schedule_take() -> dict[str, Any]:
             or int(pos.get("index") or -1) != idx
             or abs(float(pos.get("started") or 0) - started) > 0.01)
         _RADIO["sched_pos"] = {"preset": name, "index": idx,
-                               "started": started,
+                               "started": started, "hour": stamp,
                                "slot_id": str(slot.get("id") or "")}
         _sched_pos_save()                                   # #915
         text = schedule_prompt_for(store, slot)
@@ -20426,6 +20570,400 @@ async def schedule_month_api(
     return schedule_month_plan(
         str(request.query_params.get("from") or ""),
         request.query_params.get("days") or 31)
+
+
+# --- #883: the dynamic hour ----------------------------------------------
+# What the plan says an hour runs, and what the operator has said THIS hour
+# runs instead. Everything below reads the same store, the same clock and
+# the same prompt shelves the rest of the desk already uses.
+
+
+def _sched_clock_at(key: str, minutes: float) -> str:
+    """The wall clock `minutes` into that hour, as HH:MM. An hour whose
+    entries add up to more than sixty simply runs past the top, and the
+    times say so rather than pretending."""
+    try:
+        at = _sched_hour_epoch(key)
+        if at < 0:
+            return ""
+        return time.strftime("%H:%M", time.localtime(at + minutes * 60.0))
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def _sched_pinned_prompt_ids(store: dict[str, Any]) -> set:
+    """Every prompt variant id something in the book still points at —
+    across the presets AND the per-hour overrides. Used to work out which
+    hour-scoped variants are safe to let go of."""
+    out: set = set()
+    try:
+        for rows in (store.get("presets") or {}).values():
+            for row in (rows or []):
+                if isinstance(row, dict) and row.get("prompt_id"):
+                    out.add(str(row.get("prompt_id")))
+        for entry in (store.get("hours") or {}).values():
+            for row in ((entry or {}).get("slots") or []):
+                if isinstance(row, dict) and row.get("prompt_id"):
+                    out.add(str(row.get("prompt_id")))
+    except Exception:                          # noqa: BLE001
+        pass
+    return out
+
+
+def _sched_prep_snapshot() -> dict[str, Any]:
+    """The rooms' holdings, off the very same prep_board() the recording
+    room reads. Keyed by PREP kind."""
+    out: dict[str, Any] = {}
+    try:
+        for row in prep_board():
+            if not isinstance(row, dict):
+                continue
+            out[str(row.get("kind") or "")] = {
+                "written": int(row.get("written") or 0),
+                "rendered": int(row.get("rendered") or 0),
+                "ready": int(row.get("ready") or 0),
+                "seconds": round(float(row.get("seconds") or 0), 1),
+            }
+    except Exception:                          # noqa: BLE001
+        pass
+    return out
+
+
+def _sched_slot_prep(kind: str, board: dict[str, Any]) -> dict[str, Any]:
+    """What the rooms are holding for this KIND.
+
+    READ THIS BEFORE BELIEVING THE NUMBERS: they are per KIND, never per
+    slot instance. Three "ad read" entries in one hour all report the same
+    figures — the one shelf all three will draw from — and nothing here is
+    reserved against a particular entry. A kind nothing can be prepared
+    for (news, a record, the deep dig, the recap on the hour) comes back
+    zeroed, which is the truth about it: it is written at the moment it is
+    wanted. SCHED_PREP_KIND is the same map the prep keeper uses, so this
+    panel and the keeper never disagree about what can be got in early."""
+    zero = {"written": 0, "rendered": 0, "ready": 0, "seconds": 0.0}
+    try:
+        prep_kind = SCHED_PREP_KIND.get(str(kind or "")) or str(kind or "")
+        return dict(board.get(prep_kind) or zero)
+    except Exception:                          # noqa: BLE001
+        return dict(zero)
+
+
+def schedule_hour_slots(store: dict[str, Any] | None = None,
+                        key: str = "",
+                        when: float | None = None) -> tuple:
+    """What ONE hour actually runs: (preset name, its whole slot list,
+    whether an override is in force).
+
+    An hour nobody has touched is exactly the plan — the month, then the
+    day, then the preset on air — resolved AT THAT HOUR, so tomorrow
+    night's ten o'clock reads tomorrow night's plan rather than tonight's.
+    An hour the operator HAS touched either keeps its own copy of the list
+    or points at a different preset. Anything that will not resolve falls
+    back to the plan; this never returns nothing on purpose."""
+    store = store if isinstance(store, dict) else schedule_read()
+    presets = store.get("presets") or {}
+    if not key:
+        key = _sched_hour_key(when)
+    at = _sched_hour_epoch(key)
+    if at < 0:
+        at = time.time()
+    else:
+        at += 60.0                       # safely inside the hour, not on it
+    name = schedule_preset_now(store, at)
+    entry = None
+    try:
+        got = (store.get("hours") or {}).get(str(key))
+        entry = got if isinstance(got, dict) else None
+    except Exception:                          # noqa: BLE001
+        entry = None
+    if entry is not None:
+        pinned = str(entry.get("preset") or "")
+        on = False
+        if pinned and pinned in presets:
+            name, on = pinned, True
+        rows = entry.get("slots")
+        if isinstance(rows, list) and rows:
+            return name, [dict(r) for r in rows], True
+        if on:
+            return name, [dict(r) for r in (presets.get(name) or [])], True
+    return name, [dict(r) for r in (presets.get(name) or [])], False
+
+
+def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
+    """The running order HOUR BY HOUR — the one on air and the ones coming.
+
+    Every hour comes back filled: what it runs, in what order, when each
+    entry starts on the wall clock, and what the writing and recording
+    rooms are already holding for it. `overridden` false means that hour
+    is running the plan and touching nothing; true means it has its own
+    orders."""
+    store = schedule_read()
+    try:
+        count = max(1, min(24, int(count)))
+    except (TypeError, ValueError):
+        count = 6
+    first = str(start or "").strip()
+    if not _sched_is_hour_key(first):
+        first = _sched_hour_key()
+    now_key = _sched_hour_key()
+    board = _sched_prep_snapshot()
+    pos = _RADIO.get("sched_pos") or {}
+    live_id = str(pos.get("slot_id") or "")
+    try:
+        started = float(pos.get("started") or 0) or None
+    except (TypeError, ValueError):
+        started = None
+    rows: list[dict[str, Any]] = []
+    for step in range(count):
+        key = _sched_hour_shift(first, step)
+        is_now = key == now_key
+        try:
+            name, slots, overridden = schedule_hour_slots(store, key)
+        except Exception:                      # noqa: BLE001
+            name, slots, overridden = str(store.get("active") or ""), [], False
+        index = None
+        if is_now and live_id:
+            index = next((i for i, s in enumerate(slots)
+                          if str(s.get("id") or "") == live_id), None)
+        out: list[dict[str, Any]] = []
+        minutes = 0.0
+        for i, raw in enumerate(slots):
+            row = _sched_slot(raw)
+            # The running clock: each ENABLED entry pushes the next one on
+            # by its own minutes from the top of this hour. A disabled
+            # entry sits at the time the one after it starts and costs
+            # nothing, which is what "disabled" means to the walk.
+            row["starts_at"] = _sched_clock_at(key, minutes)
+            if row.get("enabled", True):
+                try:
+                    minutes += float(row.get("minutes") or 0)
+                except (TypeError, ValueError):
+                    pass
+            row["state"] = "coming"
+            if is_now and index is not None:
+                row["state"] = ("on air" if i == index
+                                else "done" if i < index else "coming")
+            row["prep"] = _sched_slot_prep(str(row.get("kind") or ""), board)
+            out.append(row)
+        rows.append({
+            "key": key,
+            "label": key[11:13] + ":00",
+            "date": key[:10],
+            "preset": name,
+            "overridden": bool(overridden),
+            "is_now": bool(is_now),
+            "slots": out,
+            "now": {"index": index,
+                    "slot_id": (live_id or None) if is_now else None,
+                    "started": started if is_now else None},
+        })
+    return {"hours": rows,
+            "kinds": [dict(k) for k in SCHEDULE_KINDS],
+            "presets": sorted(store.get("presets") or {})}
+
+
+def _sched_hours_put(store: dict[str, Any], key: str,
+                     entry: dict[str, Any]) -> dict[str, Any]:
+    """File one hour's override, or drop the key when the override has
+    stopped saying anything. Capped and in clock order."""
+    hours = dict(store.get("hours") or {})
+    cleaned = _sched_hour_entry(entry, store.get("presets") or {})
+    if cleaned.get("preset") is None and cleaned.get("slots") is None:
+        hours.pop(key, None)
+    else:
+        hours[key] = cleaned
+    store["hours"] = dict(sorted(hours.items())[-2000:])
+    return store
+
+
+@app.get("/api/schedule/hours")
+async def schedule_hours_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#883: the dynamic hour — ?from=YYYY-MM-DDTHH (empty for the hour on
+    air) &count=1..24 (default 6). Scroll it forward to see, and set up,
+    the hours that have not happened yet."""
+    require_read_auth(authorization)
+    return schedule_hours_view(
+        str(request.query_params.get("from") or ""),
+        request.query_params.get("count") or 6)
+
+
+@app.post("/api/schedule/hours")
+async def schedule_hours_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Write ONE hour's orders: {"key": "2026-08-19T22", "slots": [...]}.
+
+    Reorder, enable, retime, re-label, re-note and prompt-pin all save
+    through here — the list you send IS that hour, exactly as
+    /api/schedule/slots works for a whole preset, and the entries are
+    validated by the same _sched_slot(). Send {"key":..., "preset": name}
+    instead to point that hour at a different schedule without giving it a
+    bespoke list; send both to do both. An hour that already had orders
+    keeps whichever half you do not send."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    key = str(payload.get("key") or "").strip() or _sched_hour_key()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="key must be a local hour like 2026-08-19T22")
+    rows = payload.get("slots")
+    has_slots = isinstance(rows, list)
+    if rows is not None and not has_slots:
+        raise HTTPException(status_code=400, detail="slots must be a list")
+    preset = str(payload.get("preset") or "").strip()[:60]
+    if not has_slots and not preset:
+        raise HTTPException(
+            status_code=400,
+            detail="Send slots, a preset, or both — there is nothing here")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        if preset and preset not in (store.get("presets") or {}):
+            raise HTTPException(status_code=404,
+                                detail=f"No schedule called {preset!r}")
+        entry = dict((store.get("hours") or {}).get(key) or {})
+        if preset:
+            entry["preset"] = preset
+        if has_slots:
+            entry["slots"] = [_sched_slot(r) for r in rows][:200]
+        entry["at"] = round(time.time(), 3)
+        _sched_hours_put(store, key, entry)
+        schedule_write(store)
+    kept = (store.get("hours") or {}).get(key) or {}
+    note_action("🗓 hour orders saved: " + key
+                + (f" — {len(kept.get('slots') or [])} entries"
+                   if kept.get("slots") else "")
+                + (f" — runs {preset}" if preset else "")
+                + (" — nothing left in it, back on the plan"
+                   if not kept else "") + " (#883)")
+    # The entry on air re-reads its prompt on the very next round rather
+    # than at the next restart. The POSITION is deliberately left alone:
+    # the walk in schedule_take() re-seats itself only if the list really
+    # changed under it, so editing a note does not throw the hour back to
+    # the top of the list mid-air.
+    _RADIO["sched_prompt"] = ""
+    return schedule_hours_view(key, 1)
+
+
+@app.delete("/api/schedule/hours/{key}")
+async def schedule_hours_delete_api(
+    key: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Tear up one hour's orders. That hour falls straight back to the
+    plan — the month, then the day, then the schedule on air."""
+    require_auth(authorization)
+    key = str(key or "").strip()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="key must be a local hour like 2026-08-19T22")
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        hours = dict(store.get("hours") or {})
+        if key not in hours:
+            raise HTTPException(status_code=404,
+                                detail=f"Nothing overridden on {key}")
+        hours.pop(key, None)
+        store["hours"] = hours
+        schedule_write(store)
+    _RADIO["sched_prompt"] = ""
+    note_action(f"🗓 hour orders torn up: {key} — back on the plan (#883)")
+    return schedule_hours_view(key, 1)
+
+
+@app.post("/api/schedule/hours/{key}/prompt")
+async def schedule_hour_prompt_api(
+    key: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Script ONE entry in ONE hour, in one move: {"slot_id", "text",
+    "name"}.
+
+    The text is stored as a variant on that entry's KIND, on the very same
+    shelf /api/schedule/prompts manages — there is no second prompt store
+    — and the entry in this hour is pinned to it. The hour is materialised
+    as an override in the same breath, so scripting an hour is what makes
+    it that hour's own.
+
+    The variant id is derived from the hour and the entry, so coming back
+    and rewriting the same entry's prompt REWRITES that variant instead of
+    piling up a new one each time. Hand a `name` in to title it; without
+    one it is titled after the entry and the hour."""
+    require_auth(authorization)
+    key = str(key or "").strip()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="key must be a local hour like 2026-08-19T22")
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    slot_id = str(payload.get("slot_id") or "").strip()[:48]
+    if not slot_id:
+        raise HTTPException(status_code=400, detail="slot_id is required")
+    text = str(payload.get("text") or "")[:4000]
+    given = str(payload.get("name") or "").strip()[:80]
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        _name, resolved, _on = schedule_hour_slots(store, key)
+        rows = [_sched_slot(s) for s in resolved]
+        at = next((i for i, s in enumerate(rows)
+                   if str(s.get("id") or "") == slot_id), None)
+        if at is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No entry {slot_id!r} in the hour {key}")
+        kind = str(rows[at].get("kind") or "banter")
+        prompts = dict(store.get("prompts") or {})
+        blob = dict(prompts.get(kind) or {})
+        variants = [dict(v) for v in (blob.get("variants") or [])
+                    if isinstance(v, dict)]
+        vid = f"hv-{key}-{slot_id}"[:64]
+        label = given or f"{rows[at].get('label') or kind} · {key[11:13]}:00"
+        found = next((v for v in variants
+                      if str(v.get("id") or "") == vid), None)
+        if found:
+            found["name"], found["text"] = label, text
+        else:
+            variants.append({"id": vid, "name": label, "text": text})
+        if len(variants) > 56:
+            # A read keeps the FIRST sixty variants a kind has, so a
+            # station scripted hour by hour would otherwise quietly lose
+            # its newest work. The hour-scoped variants nothing points at
+            # any more are the ones that go; the station's own defaults
+            # and anything still pinned never do.
+            safe = _sched_pinned_prompt_ids(store)
+            safe.add(vid)
+            variants = [v for v in variants
+                        if not str(v.get("id") or "").startswith("hv-")
+                        or str(v.get("id") or "") in safe][:60]
+        blob["variants"] = variants
+        try:
+            blob["active"] = max(0, min(len(variants) - 1,
+                                        int(blob.get("active") or 0)))
+        except (TypeError, ValueError):
+            blob["active"] = 0
+        prompts[kind] = blob
+        store["prompts"] = prompts
+        # Copy-on-write: from here this hour keeps its own list, with this
+        # entry pinned to the words just written for it.
+        rows[at]["prompt_id"] = vid
+        entry = dict((store.get("hours") or {}).get(key) or {})
+        entry["slots"] = rows
+        entry["at"] = round(time.time(), 3)
+        _sched_hours_put(store, key, entry)
+        schedule_write(store)
+    _RADIO["sched_prompt"] = ""
+    note_action(f"🗓 hour {key} — {label[:40]} scripted and pinned (#883)")
+    return schedule_hours_view(key, 1)
 
 
 @app.get("/api/schedule/prompts")
