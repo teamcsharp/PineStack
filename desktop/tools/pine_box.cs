@@ -163,8 +163,11 @@ static class PineBox
         //
         // The version in the name is deliberate: bump it and every
         // shortcut repaints, with no cache clearing and no logout.
+        // Moved 1 -> 2 when the mark changed from the pine to the
+        // PB badge the app wears in its own header (#974), which is
+        // the whole reason the number is there.
         string icon = Path.Combine(Path.GetDirectoryName(runDir),
-                                   "pinebox-1.ico");
+                                   "pinebox-2.ico");
         try
         {
             string src = Path.Combine(runDir, @"desktop\assets\pinebox.ico");
