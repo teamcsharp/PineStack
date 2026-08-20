@@ -8845,10 +8845,23 @@ _SHELF: dict[str, list[dict[str, Any]]] = {}
 # How many of each to hold. The real governor is prepare_hours (TIME on
 # the shelf); these only stop one content type eating the whole
 # allowance while another starves.
-SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 4, "caller": 4}
+SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 4, "caller": 4,
+              # #855: the gallery press. Nine of the owner's sixty
+              # canonical minutes, the DEAREST road on the board - up to
+              # four vision passes before a word of it is written - and
+              # the one thing on the board that cannot go stale, because
+              # a painting pitch is as good in an hour as it is now.
+              "gallery": 3,
+              # #855: a bulletin, and ONE at a time. Deliberately not
+              # stocked: news goes off, so prep_news() writes one only
+              # when the running order is about to want it and never
+              # builds a backlog of yesterday's page.
+              "news": 1}
 SHELF_LABEL = {"ad": "an advert", "station_id": "a station ID",
                "manager": "a message from upstairs",
-               "caller": "a phone call"}
+               "caller": "a phone call",
+               "gallery": "a painting round",
+               "news": "a news bulletin"}
 
 
 def shelf_rows(kind: str) -> list[dict[str, Any]]:
@@ -8877,6 +8890,34 @@ def shelf_cap(kind: str) -> int:
 
 
 def shelf_full(kind: str) -> bool:
+    # #855: two roads on the running order do not own a row in _SHELF,
+    # and asking _SHELF about them answered "room for plenty more"
+    # for ever. Both are answered from the thing that really holds
+    # them. Anything at all going wrong here reads as FULL, which
+    # builds nothing - the safe direction.
+    try:
+        if str(kind) == "banter":
+            # A booth round's shelf IS the larder, and has been since
+            # #349. The sheet can name `banter` now, so the question is
+            # answered off the depth that genuinely exists.
+            return len(_LARDER) >= _LARDER_MAX
+        if str(kind) == "news":
+            _news_rows = shelf_rows("news")
+            # A bulletin whose front page has moved on is dead weight:
+            # shed it here rather than let it block the shelf against a
+            # fresh one dj_news would actually read out.
+            _news_rows[:] = [
+                r for r in _news_rows
+                if time.time() - float((r.get("entry") or {}).get(
+                    "prep_news_at") or 0) <= NEWS_PREP_LIFE]
+            if _news_rows:
+                return True             # one at a time, never a backlog
+            # ...and outside the short horizon a bulletin can survive,
+            # this road is "full" so the adaptive planner never picks a
+            # task that could only refuse itself. See prep_news().
+            return not (0.0 <= schedule_prep_eta("news") <= NEWS_PREP_AHEAD)
+    except Exception:  # noqa: BLE001
+        return True
     return len(shelf_rows(kind)) >= shelf_cap(kind)
 
 
@@ -8942,7 +8983,7 @@ def prepared_by_kind() -> dict[str, int]:
 # The same roads PREP_BOARD schedules, plus the booth rounds the larder
 # writes for itself, each named as the owner would say it out loud.
 PREP_BOARD_KINDS = ("banter", "ad", "station_id", "track_talk",
-                    "manager", "caller")
+                    "manager", "caller", "gallery", "news")
 PREP_BOARD_LABEL = {
     "banter": "booth rounds",
     "ad": "advert reads",
@@ -8950,6 +8991,8 @@ PREP_BOARD_LABEL = {
     "track_talk": "record intros and send-offs",
     "manager": "memos from upstairs",
     "caller": "phone calls",
+    "gallery": "painting rounds",       # #855
+    "news": "news bulletins",           # #855
 }
 
 
@@ -9008,7 +9051,10 @@ def prep_board() -> list[dict[str, Any]]:
             if kind == "banter":
                 held = [e for e in list(_LARDER) if isinstance(e, dict)]
                 row["cap"] = _LARDER_MAX
-            elif kind in ("manager", "caller"):
+            elif kind in ("manager", "caller", "gallery", "news"):
+                # #855: a painting round and a bulletin are whole
+                # SEGMENTS, so they count in lines like a memo or a
+                # call - not one line each like an advert.
                 held = [dict(r.get("entry") or {})
                         for r in list(_SHELF.get(kind) or [])]
                 row["cap"] = shelf_cap(kind)
@@ -9098,24 +9144,37 @@ _TASK_LEDGER_SAVED = [0.0]
 TASK_SEED_COST = {
     "station_id": 14.0, "ad": 24.0, "track_talk": 30.0,
     "manager": 60.0, "caller": 80.0, "banter": 80.0,
+    # #855: the gallery press looks at up to FOUR pictures with the
+    # vision model before a word of it is written, so it is seeded as
+    # the dearest thing on the board; a bulletin is a round plus two
+    # article fetches. Both are replaced by measurement within a few
+    # passes, like every other seed here.
+    "gallery": 150.0, "news": 90.0,
     "write": 14.0, "render_line": 7.0,
 }
 TASK_SEED_GAIN = {
     "station_id": 6.0, "ad": 18.0, "track_talk": 20.0,
     "manager": 45.0, "caller": 65.0, "banter": 65.0,
+    "gallery": 90.0, "news": 55.0,
     "write": 0.0, "render_line": 6.0,
 }
 TASK_LABEL = {
     "station_id": "a station ID", "ad": "an advert",
     "track_talk": "a record's own intro or send-off",
     "manager": "a memo from upstairs", "caller": "a phone call",
+    "gallery": "a painting round", "news": "a news bulletin",
     "banter": "a banter round", "write": "one model visit",
     "render_line": "one line rendered",
 }
 # The board the preparer picks from. Which of these is "cheapest" is a
 # question for the ledger, never a constant: prep_cheapest() reads the
 # measured costs and takes the real minimum.
-PREP_BOARD = ("ad", "station_id", "manager", "caller", "track_talk")
+# #855: `gallery` and `news` join it. Neither can become the "cheapest"
+# road that sets prep_thin_seconds() - both are seeded dear and both
+# measure dear - and `news` is refused outright by shelf_full() until
+# the running order is genuinely about to want it.
+PREP_BOARD = ("ad", "station_id", "manager", "caller", "track_talk",
+              "gallery", "news")
 
 
 def task_ledger_load() -> None:
@@ -17081,6 +17140,122 @@ async def prep_round(kind: str) -> bool:
     return True
 
 
+async def prep_gallery() -> bool:
+    """#855: THE GALLERY PRESS, RECORDED BEFORE IT IS WANTED.
+
+    prep_round's shape exactly - write the whole segment through the very
+    function that airs it, render every line into the pantry with the
+    same larder_prepare, shelf it - with one addition a memo and a call
+    do not need: THE PICTURES RIDE ON THE BANKED ENTRY. A gallery round
+    is about three particular paintings and the descriptions the vision
+    model gave for them, so `prep_gallery` on the entry is what lets the
+    round still know what it is about when it airs an hour later: the
+    booth holds the right image up (#506) and #702 hangs it on the lines
+    that discuss it.
+
+    This is the dearest road on the board and the one that pays back
+    best - up to four vision passes, and not one word of it goes off."""
+    pile: list[dict[str, Any]] = []
+    try:
+        await dj_gallery_round(bank_to=pile)
+    except Exception:  # noqa: BLE001
+        return False                    # the live road is untouched
+    if not pile:
+        return False                    # nothing on the wall to sell
+    entry = pile[0]
+    entry["prep_kind"] = "gallery"
+    # A partially rendered segment is still shelved: the keeper finishes
+    # it on a later visit, and any line that never got made simply
+    # renders on air the way it always would have.
+    try:
+        await larder_prepare(entry)
+    except Exception:  # noqa: BLE001
+        pass
+    shelf_put("gallery", {"entry": entry,
+                          "seconds": float(entry.get("seconds") or 0)})
+    try:
+        _named = ", ".join(str((p or {}).get("name") or "")[:40]
+                           for p in (entry.get("prep_gallery") or [])
+                           if (p or {}).get("name"))
+        pipeline_log("lookahead",
+                     f"{SHELF_LABEL.get('gallery', 'a painting round')} is "
+                     f"READY to air - {entry.get('made') or 0} of "
+                     f"{entry.get('chunks') or 0} lines made, "
+                     f"{entry.get('seconds') or 0}s of finished audio "
+                     "waiting, and the paintings it was written about ride "
+                     f"with it ({_named or 'none named'}) - the vision "
+                     "passes are paid for once, here, not on air (#855)")
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
+# --- #855: the one road with a clock on its words ---------------------
+#
+# Every other kind on the board may be recorded an hour early because an
+# advert, a memo, a phone call and a painting pitch are all as true then
+# as they are now. A BULLETIN IS NOT. Reading out a page that has moved
+# on is worse radio than writing one live, and it is the fault the
+# operator would hear first. So news gets a SHORT HORIZON rather than the
+# hour every other road gets:
+#
+#   * it may only be written when the running order is genuinely about
+#     to want a news entry (NEWS_PREP_AHEAD) - which is exactly why
+#     shelf_full() calls this road "full" the rest of the time, so the
+#     adaptive planner never picks a task that would only refuse itself;
+#   * ONE bulletin at a time, never a backlog;
+#   * the round carries the timestamp of the FRONT PAGE it was written
+#     off, and dj_news throws away anything older than NEWS_PREP_LIFE
+#     and reads the wire live - which is today's behaviour exactly.
+#
+# The one cost, said plainly: news_selection() marks the stories it draws
+# as covered at the moment it draws them, so a bulletin later thrown away
+# has spent three headlines. That is bounded to the quarter of an hour
+# before a news entry that was going to spend them anyway, and the effect
+# is that the desk covers different stories rather than the same ones -
+# it can never go quiet over it, because news_selection's own fallback
+# reaches for the least recently covered when the page is exhausted.
+NEWS_PREP_AHEAD = 900.0                 # write one only this close to it
+NEWS_PREP_LIFE = 1200.0                 # and never air one older than this
+
+
+async def prep_news() -> bool:
+    """#855: one bulletin, written and recorded just before it is due."""
+    try:
+        if shelf_rows("news"):
+            return False                # one at a time; never a backlog
+        eta = schedule_prep_eta("news")
+        if not 0.0 <= eta <= NEWS_PREP_AHEAD:
+            # No running order, or the next news entry is too far off for
+            # a bulletin to survive the wait. Not a failure: the live
+            # road reads the wire when the entry comes round, as now.
+            return False
+        pile: list[dict[str, Any]] = []
+        await dj_news(bank_to=pile)
+        if not pile:
+            return False                # nothing on the wire to cover
+        entry = pile[0]
+        entry["prep_kind"] = "news"
+        try:
+            await larder_prepare(entry)
+        except Exception:  # noqa: BLE001
+            pass
+        shelf_put("news", {"entry": entry,
+                           "seconds": float(entry.get("seconds") or 0)})
+        pipeline_log(
+            "lookahead",
+            f"{SHELF_LABEL.get('news', 'a news bulletin')} is READY to "
+            f"air - {entry.get('made') or 0} of {entry.get('chunks') or 0} "
+            f"lines made, {entry.get('seconds') or 0}s of finished audio "
+            f"waiting, and the running order wants news in about "
+            f"{int(eta / 60)} minute(s). It carries the timestamp of the "
+            "page it was written from, and will be thrown away rather "
+            "than read out if that page has moved on (#855)")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # --- #869: the ten-track lookahead ------------------------------------
 # "I want a system that sets up the queue for the next 10 tracks that's
 # playing, and then the writing desk generates the dialogue for the DJs
@@ -17341,6 +17516,11 @@ async def prep_one(kind: str) -> bool:
             return await prep_station_id()
         if kind in ("manager", "caller"):
             return await prep_round(kind)
+        # #855: the gallery press, and the short-horizon bulletin.
+        if kind == "gallery":
+            return await prep_gallery()
+        if kind == "news":
+            return await prep_news()
     except Exception:  # noqa: BLE001
         return False
     finally:
@@ -17349,20 +17529,48 @@ async def prep_one(kind: str) -> bool:
 
 
 # Round-robin across the board, so no one content type starves the rest.
-_PREP_ROTA = ("ad", "station_id", "manager", "caller")
+_PREP_ROTA = ("ad", "station_id", "manager", "caller", "gallery", "news")
 _PREP_AT = [0]
 
 # #855: which schedule entries can be recorded before they are wanted.
-# `record` is not a round. `news` is a bulletin and goes stale. `deep`
-# and `recap` both read the last hour of the station's own log when they
-# are written, so preparing them early would have them recapping an hour
-# that has not happened.
+#
+# WHAT IS DELIBERATELY NOT HERE, AND WHY - these three are not "not done
+# yet", they are ones preparation would get WRONG:
+#
+#   `record`  is not a round at all, it is the END of one. The needle
+#             goes down and the record has the air; there is no script
+#             to write and no line to voice, so there is nothing that
+#             preparing it could possibly mean.
+#   `recap`   reads the last hour of the station's OWN log at the moment
+#             it is written - dj_recap_round walks _RADIO["history"] and
+#             the booth feed - so preparing it an hour early would have
+#             the pair recapping an hour that had not happened yet.
+#   `deep`    the same fault exactly: the long-form dig is written off
+#             what the station has just been doing, and written early it
+#             would be digging into an hour that did not exist.
+#
+# WHAT IS HERE NOW:
+#
+#   `gallery` a whole segment on a shelf of its own, hours early, with
+#             the paintings it was written about riding on the banked
+#             entry - the dearest road on the board (four vision passes)
+#             and the one that can never go off. See prep_gallery().
+#   `banter`  has no shelf of its own: it maps onto the LARDER, which
+#             has banked booth rounds since #349. shelf_full() and
+#             prep_board() read the larder's real depth for it, so an
+#             hour sheet stops reading zero against the one kind this
+#             station has always prepared.
+#   `news`    is prepared, but never an hour early - see prep_news() for
+#             the short horizon and the staleness stamp that guard it.
 SCHED_PREP_KIND = {
     "ad": "ad",
     "manager": "manager",
     "caller": "caller",
     "banter_caller": "caller",
     "bombshell": "ad",          # a short written read, same shelf shape
+    "gallery": "gallery",       # #855: hours early, and never stale
+    "banter": "banter",         # #855: the larder IS its shelf
+    "news": "news",             # #855: short horizon only - see prep_news
 }
 
 
@@ -17405,6 +17613,67 @@ def schedule_prep_order(most: int = 6) -> list[str]:
         return out
     except Exception:  # noqa: BLE001
         return []
+
+
+def schedule_prep_eta(kind: str) -> float:
+    """#855: HOW LONG until the running order next wants this road, in
+    seconds. -1 means "never" - no schedule running, or a sheet that does
+    not call for it at all.
+
+    The same sheet, the same clock and the same saved position
+    schedule_prep_order() and schedule_take() read; this only adds up the
+    minutes standing in front of the entry instead of naming it. It
+    exists for the one road whose material has a clock on it: a bulletin
+    may be written a quarter of an hour early and no further, and this is
+    what answers "is it that close yet". Everything is wrapped, and -1
+    simply means "do not prepare" - which is the behaviour every one of
+    these kinds had before any of this shipped."""
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return -1.0
+        name = schedule_preset_now(store)
+        rows = list((store.get("presets") or {}).get(name) or [])
+        try:
+            # #883: the same hour override schedule_take() honours.
+            _picked, _rows, _on = schedule_hour_slots(store)
+            if _on and _rows:
+                rows = _rows
+        except Exception:  # noqa: BLE001
+            pass
+        slots = [s for s in rows if s.get("enabled", True)]
+        if not slots:
+            return -1.0
+
+        def _hold(slot: dict[str, Any]) -> float:
+            """One entry's minutes, in seconds - schedule_take()'s own."""
+            try:
+                return max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            except Exception:  # noqa: BLE001
+                return 180.0
+
+        want = str(kind or "")
+        pos = _RADIO.get("sched_pos") or {}
+        at = int(pos.get("index") or 0)
+        if not 0 <= at < len(slots):
+            at = 0
+        if str(SCHED_PREP_KIND.get(
+                str(slots[at].get("kind") or "")) or "") == want:
+            return 0.0                  # it is what owns the air already
+        started = float(pos.get("started") or 0)
+        # What is left of the entry on air, then every entry in front of
+        # the one we are looking for.
+        ahead = (max(0.0, started + _hold(slots[at]) - time.time())
+                 if started > 0 else _hold(slots[at]))
+        for step in range(1, len(slots) + 1):
+            slot = slots[(at + step) % len(slots)]
+            if str(SCHED_PREP_KIND.get(
+                    str(slot.get("kind") or "")) or "") == want:
+                return round(ahead, 1)
+            ahead += _hold(slot)
+        return -1.0                     # the sheet never calls for it
+    except Exception:  # noqa: BLE001
+        return -1.0
 
 
 def pantry_window() -> str:
@@ -17515,7 +17784,10 @@ async def pantry_keeper() -> None:
             # #842: a segment already WRITTEN but not fully rendered gets
             # its remaining lines before anything new is written — half a
             # call on the shelf is worth finishing first.
-            for _kind in ("manager", "caller"):
+            # #855: ...and a painting round or a bulletin, which are
+            # banked in exactly the same shape and are worth finishing
+            # for exactly the same reason.
+            for _kind in ("manager", "caller", "gallery", "news"):
                 for _row in list(_SHELF.get(_kind) or []):
                     _shelved = _row.get("entry") or {}
                     if _shelved.get("prepared") or _shelved.get("preparing"):
@@ -17753,7 +18025,10 @@ CANNOT_PREPARE = {
     "deep": "a deep conversation reads the last stretch of the show, so "
             "writing it early would be recapping something that has not "
             "happened",
-    "news": "a bulletin goes stale — it is written close to the hour",
+    # #925: news is NOT here any more. It is preparable on a short
+    # horizon — written only inside the quarter hour before its entry,
+    # stamped with the front page it was written from, and discarded
+    # rather than aired if the wire has moved on.
 }
 
 
@@ -23489,12 +23764,64 @@ def image_analysis_ready(name: str, analysis: str, model: str = "",
     del _RADIO["chat"][:-240]
 
 
-async def dj_gallery_round() -> list[str]:
+async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None
+                           ) -> list[str]:
     """The gallery press (#346): several paintings in one round, each
     described from its pixels (#341, #343), argued over, priced absurdly
     and hawked to the listeners — speakbox rhetoric stitched through."""
+    # #855: a painting round WRITTEN AND VOICED during an earlier record
+    # goes straight out - no vision pass, no model call, no render, no
+    # wait. `bank_to` is the other side of the same door dj_manager_note
+    # and dj_caller already have: the preparer calls THIS function to
+    # write one and is handed the round back instead of it airing. An
+    # empty shelf falls straight through to the live road below.
+    if bank_to is None:
+        try:
+            _prep_art = shelf_take("gallery")
+        except Exception:  # noqa: BLE001
+            _prep_art = None
+        if _prep_art:
+            _prep_entry = _prep_art.get("entry") or {}
+            # THE PICTURES RODE WITH IT. A prepared round still knows
+            # exactly what it is about because the chosen paintings and
+            # the descriptions they were written from were banked ON the
+            # entry - so the booth holds up the very image being hawked
+            # (#506) and #702 can hang it on the lines, an hour later.
+            _prep_pics = [p for p in (_prep_entry.get("prep_gallery") or [])
+                          if isinstance(p, dict) and p.get("name")]
+            if _prep_pics:
+                _RADIO["gallery_now"] = {
+                    "at": time.time(),
+                    "images": [{"name": str(p.get("name") or ""),
+                                "desc": str(p.get("desc") or "")}
+                               for p in _prep_pics[:3]],
+                }
+            _prep_began = time.time()
+            try:
+                _prep_said = await _banter_air(_prep_entry, None)
+            except Exception:  # noqa: BLE001
+                _prep_said = []
+            if _prep_said:
+                try:
+                    gallery_line_mark([str(p.get("name") or "")
+                                       for p in _prep_pics], _prep_began)
+                except Exception:  # noqa: BLE001
+                    pass
+                pipeline_log("air", "a painting round goes straight to air "
+                             "- it was written and recorded during an "
+                             "earlier record, and the pictures it is about "
+                             "came with it (#855)")
+                return _prep_said
+            # Nothing came out of it: fall through and write a fresh one,
+            # which is the road this segment has always had.
     pieces: list[tuple[str, str]] = []
     for _ in range(4):
+        # #872: the vision model is the dearest thing on this road. On
+        # the PREPARING road only, stand down between pictures the
+        # instant the live show wants the room - one painting is enough
+        # to write a round about, and the rest come on a later pass.
+        if bank_to is not None and pieces and prep_should_stop():
+            break
         name, desc = await describe_gallery_image()
         if desc and all(desc != held for _, held in pieces):
             pieces.append((name, desc))
@@ -23505,10 +23832,15 @@ async def dj_gallery_round() -> list[str]:
     # Show the booth what they're selling (#506): the paintings of this round,
     # so the side panel can hold up the very image being hawked on air. Fresh
     # for the length of the segment; dj_state ages it out.
-    _RADIO["gallery_now"] = {
-        "at": time.time(),
-        "images": [{"name": n, "desc": d} for n, d in pieces],
-    }
+    # #855: NOT on the preparing road. This round is not airing yet, and
+    # holding a painting up beside whatever IS on air would be a lie. It
+    # goes up at the moment the prepared round actually airs, off the
+    # pictures banked on the entry - see the shelf road above.
+    if bank_to is None:
+        _RADIO["gallery_now"] = {
+            "at": time.time(),
+            "images": [{"name": n, "desc": d} for n, d in pieces],
+        }
     seed = await speakbox_quote(most=5, cap=450)
     listing = " ".join(
         f"PAINTING {i + 1}: \"{desc}\""
@@ -23528,7 +23860,25 @@ async def dj_gallery_round() -> list[str]:
     angle += radio_prompt_instruction("gallery")
     began = time.time()
     lines = await dj_banter(None, angle=angle, lines=12,
-                            source=(seed or {}).get("file", ""))
+                            source=(seed or {}).get("file", ""),
+                            bank=bank_to is not None, bank_to=bank_to)
+    if bank_to is not None:
+        # #855: THE PICTURES GO WITH THE ROUND. Everything the airing
+        # needs in order to know what this round is ABOUT - which
+        # paintings, and the descriptions they were written from - is
+        # banked on the entry itself, so nothing has to be looked at a
+        # second time when it finally airs and the vision passes are
+        # paid for exactly once.
+        try:
+            if bank_to:
+                bank_to[-1]["prep_gallery"] = [
+                    {"name": str(n), "desc": str(d)[:600]}
+                    for n, d in pieces]
+                if seed:
+                    speakbox_remember(seed)
+        except Exception:  # noqa: BLE001
+            pass
+        return []
     # #702: the paintings ride the lines that are about them.
     gallery_line_mark([n for n, _ in pieces], began)
     if lines and seed:
@@ -28972,7 +29322,8 @@ async def drudge_story(url: str) -> str:
     return boiled
 
 
-async def dj_news(hourly: bool = False) -> list[str]:
+async def dj_news(hourly: bool = False,
+                  bank_to: list[dict[str, Any]] | None = None) -> list[str]:
     """The pair take a moment for what is happening in the world.
 
     On the hour it is a bulletin — the lead plus a sample of the page; the
@@ -28983,6 +29334,54 @@ async def dj_news(hourly: bool = False) -> list[str]:
     # different stories being covered" — 24 headlines against a bulletin
     # every few minutes exhausts the page in under an hour and forces
     # the repeat road. Take the whole front page.
+    # #855: A BULLETIN PREPARED IN THE LAST QUARTER OF AN HOUR - and
+    # only if the front page it was written off is STILL current. This
+    # is the one road on the board whose words have a clock on them, so
+    # the timestamp of the page rides with the round and an old one is
+    # thrown away rather than read out. Throwing one away costs nothing
+    # at all: the live road below then runs exactly as it does today.
+    # The bulletin ON THE HOUR is never served off the shelf - that one
+    # is the top-of-the-hour read and is written at the top of the hour.
+    if bank_to is None and not hourly:
+        try:
+            _prep_news = shelf_take("news")
+        except Exception:  # noqa: BLE001
+            _prep_news = None
+        if _prep_news:
+            _pn_entry = _prep_news.get("entry") or {}
+            _pn_at = float(_pn_entry.get("prep_news_at") or 0)
+            _pn_age = (time.time() - _pn_at) if _pn_at else 1e9
+            if _pn_age <= NEWS_PREP_LIFE:
+                try:
+                    _pn_said = await _banter_air(_pn_entry,
+                                                 _RADIO.get("now"))
+                except Exception:  # noqa: BLE001
+                    _pn_said = []
+                if _pn_said:
+                    # The booth is told what went out WHEN it goes out,
+                    # never when it was written - the recap reads this.
+                    try:
+                        _RADIO["chat"].append({
+                            "ts": int(time.time()), "who": "host",
+                            "kind": "news",
+                            "text": "News break: " + str(
+                                _pn_entry.get("prep_news_titles") or ""),
+                        })
+                    except Exception:  # noqa: BLE001
+                        pass
+                    return _pn_said
+            else:
+                try:
+                    pipeline_log(
+                        "lookahead",
+                        "a prepared bulletin was thrown away rather than "
+                        "read out - the headlines it was written from are "
+                        f"about {int(_pn_age / 60)} minutes old, and news "
+                        "is the one thing preparation may not be allowed "
+                        "to make stale. The wire is read live instead, "
+                        "which is this station's own behaviour (#855)")
+                except Exception:  # noqa: BLE001
+                    pass
     picks = news_selection(await drudge_headlines(80), hourly)
     if not picks:
         return []
@@ -29018,13 +29417,33 @@ async def dj_news(hourly: bool = False) -> list[str]:
             "music.\n\n"
             f"In the news right now:\n{listed}{dug}"
         )
-    _RADIO["chat"].append({
-        "ts": int(time.time()), "who": "host", "kind": "news",
-        "text": ("News on the hour: " if hourly else "News break: ")
-                + " / ".join(h["title"][:60] for h in picks[:3]),
-    })
-    return await dj_banter(_RADIO.get("now"), angle=angle,
-                           lines=7 if hourly else 6)
+    _titles = " / ".join(h["title"][:60] for h in picks[:3])
+    # #855: a PREPARED bulletin files this line at the moment it airs
+    # (see the shelf road at the top), not at the moment it was written
+    # - or the recap on the hour would be reading an hour that had not
+    # happened yet.
+    if bank_to is None:
+        _RADIO["chat"].append({
+            "ts": int(time.time()), "who": "host", "kind": "news",
+            "text": ("News on the hour: " if hourly else "News break: ")
+                    + _titles,
+        })
+    _said = await dj_banter(_RADIO.get("now"), angle=angle,
+                            lines=7 if hourly else 6,
+                            bank=bank_to is not None, bank_to=bank_to)
+    if bank_to is not None:
+        # THE STAMP THAT MAKES THIS SAFE (#855): what rides with a banked
+        # bulletin is the age of the FRONT PAGE it was written off, not
+        # the moment the round was written. dj_news at the top throws
+        # away anything older than NEWS_PREP_LIFE and reads the wire live.
+        try:
+            if bank_to:
+                bank_to[-1]["prep_news_at"] = (
+                    float(_DRUDGE_CACHE.get("at") or 0) or time.time())
+                bank_to[-1]["prep_news_titles"] = _titles
+        except Exception:  # noqa: BLE001
+            pass
+    return _said
 
 
 async def news_clock() -> None:
