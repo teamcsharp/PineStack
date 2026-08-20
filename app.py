@@ -31078,6 +31078,9 @@ async def speak_turns(turns: list[tuple[str, str]],
                       track: dict[str, Any] | None, limit: int,
                       vouched: list[str] | None = None,
                       source: str = "", by_hand: bool = False,
+                      whole: bool = False,      # #859: a message, not a
+                                                # conversation - never cut
+
                       caller_name: str = "",
                       caller_voice: str = "",
                       caller_fx: dict[str, Any] | None = None,
@@ -31951,7 +31954,10 @@ async def speak_turns(turns: list[tuple[str, str]],
     consumed = 0
     # A normal booth round may yield between turns. A live caller has a
     # promised arc, so a skip can never strand their final thought on a shelf.
-    can_cut = not bool(caller_name)
+    # #859: and so does a MESSAGE — a memo from upstairs is three lines with
+    # a beginning, a point and an instruction, and losing the last two makes
+    # the first one nonsense. The operator watched the boss get cut off.
+    can_cut = not bool(caller_name) and not whole
     for at in order:
         item = playlist[at]
         reached.add(at)
@@ -32095,7 +32101,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     caller2_voice: str = "",
                     render_stream: bool = False,
                     feel: bool = False,
-                    bank_to: list[dict[str, Any]] | None = None
+                    bank_to: list[dict[str, Any]] | None = None,
+                    whole: bool = False,           # #859: a message, not
+                                                   # a conversation
                     ) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
@@ -33087,6 +33095,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "caller_fx": caller_fx, "at": time.time(),
         "caller2_name": caller2_name, "caller2_voice": caller2_voice,
         "render_stream": render_stream,
+        "whole": bool(whole),                  # #859
+
         "feel": feel,                                          # #750
         "profile": _larder_profile_signature(),
     }
@@ -33298,6 +33308,10 @@ async def _banter_air(entry: dict[str, Any],
                                source_text=entry.get("seed_text", ""),
                                caller2_name=entry.get("caller2_name", ""),
                                caller2_voice=entry.get("caller2_voice", ""),
+                               # #859: a message stays whole even when it
+                               # airs off the shelf hours after it was
+                               # written, which is its usual road now.
+                               whole=bool(entry.get("whole")),
                                # #769: the round decides how it AIRS at the
                                # moment it airs. Larder rounds are banked by
                                # dj_banter(bank=True), which takes the default
@@ -33511,7 +33525,7 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     except Exception:  # noqa: BLE001
         pass
     if _hot_memo:
-        _hot_said = await dj_banter(track, lines=3,
+        _hot_said = await dj_banter(track, lines=3, whole=True,   # #859
                                     bank=bank_to is not None,
                                     bank_to=bank_to, angle=(
             "an urgent memo has just come down from the manager upstairs: "
@@ -33527,7 +33541,8 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
         return _hot_said
     # `note` and its guard now live at the top of the function, above the
     # material draw (#841).
-    _said = await dj_banter(track, lines=3, bank=bank_to is not None,
+    _said = await dj_banter(track, lines=3, whole=True,           # #859
+                            bank=bank_to is not None,
                             bank_to=bank_to, angle=(
         "a memo has just come down from the manager upstairs. One of you "
         "reads it out to the other and to the listeners, and you both react "
@@ -64500,15 +64515,43 @@ async function djPendingTick() {
   host.style.display = "block";
   host.textContent = "";
 
+  /* #863: a toolbar on the coming-up strip, because it can grow tall
+   * enough to push the live feed off the screen. Collapse it and the
+   * feed comes straight back; the choice is remembered. */
+  const shut = localStorage.getItem("djPendShut") === "1";
+  const bar = el("div", "", "");
+  bar.style.cssText = "display:flex;align-items:center;gap:6px;"
+    + "margin:0 0 4px;padding:2px 4px;border-radius:6px;"
+    + "background:rgba(255,255,255,.04)";
+  const fold = el("button", "", shut ? "▸" : "▾");
+  fold.title = shut ? "Show what is coming up"
+                    : "Collapse this and get back to the feed";
+  fold.style.cssText = "font-size:11px;line-height:1;padding:1px 6px";
   const cap = el("div", "muted", "");
-  cap.style.cssText = "font-size:10px;margin:0 0 4px;letter-spacing:.03em";
+  cap.style.cssText = "font-size:10px;letter-spacing:.03em;flex:1;min-width:0;"
+    + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
   const secs = Number((got && got.buffered_seconds) || 0);
   cap.textContent = "⏱ coming up — " + rows.length + " round"
     + (rows.length === 1 ? "" : "s") + " written, "
     + (secs >= 60 ? (secs / 60).toFixed(1) + " min" : secs.toFixed(0) + " s")
     + " of audio already made"
     + (got && got.window ? " · building through " + got.window : "");
-  host.appendChild(cap);
+  fold.onclick = (ev) => {
+    ev.stopPropagation();
+    const now = localStorage.getItem("djPendShut") === "1";
+    localStorage.setItem("djPendShut", now ? "0" : "1");
+    try { djPendingTick(); } catch (e) {}
+  };
+  bar.appendChild(fold);
+  bar.appendChild(cap);
+  host.appendChild(bar);
+  if (shut) {
+    /* Collapsed: the headline stays so the queue is never invisible,
+     * but the rounds themselves fold away and the feed has the room. */
+    host.style.maxHeight = "";
+    return;
+  }
+  host.style.maxHeight = "34vh";
 
   rows.forEach((r, at) => {
     const done = r.state === "ready";
