@@ -19255,6 +19255,28 @@ async def pantry_keeper() -> None:
             # already paid for, and this is the pass that turns it
             # into finished audio.
             for _kind, _who in (("ad", "dj"), ("station_id", "drop")):
+                # #987: ONE BAD ROW MUST NOT JAM THE SHELF BEHIND IT.
+                #
+                # The refusal below used to break the whole kind on the
+                # first row that would not render, and this loop always
+                # starts at the head of the shelf - so a single row the
+                # engine will never accept (a text that survives the
+                # length guard but not the engine, a voice that no longer
+                # resolves) meant the eleven good reads behind it were
+                # never attempted, on any pass, for ever. Measured live:
+                # advert reads 11 written, 0 of 11 lines rendered, while
+                # station IDs - the very next kind in this same loop, the
+                # same function, the same clone engine - sat at 12 of 16.
+                # That asymmetry is the tell: it was never the engine.
+                #
+                # This is the same shape as #854 on the hold shelf, where
+                # "a genuinely unplayable head clip jams the shelf" was
+                # the whole outage. Two refusals in a row still means the
+                # engine is busy and the pass gives up, which is what the
+                # original break was for; a single one now moves on and
+                # the bad row is tried again next pass with the good ones
+                # already made.
+                _refused = 0
                 for _row in list(_SHELF.get(_kind) or []):
                     # #916: a PRODUCED spot has no pantry `key` because its
                     # audio is a durable mp3 under /ads-audio rather than a
@@ -19274,7 +19296,11 @@ async def pantry_keeper() -> None:
                     except Exception:  # noqa: BLE001
                         _late = None
                     if not _late:
-                        break       # the engine said no; come back
+                        _refused += 1
+                        if _refused >= 2:
+                            break   # the engine really is saying no
+                        continue    # #987: try the ones behind it
+                    _refused = 0
                     _row.update(_late)
                     pipeline_log("lookahead",
                                  f"{SHELF_LABEL.get(_kind, _kind)} that "

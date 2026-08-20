@@ -158,13 +158,29 @@ function setAppVolume(value, persist = true) {
 
 function appVolumeScript(audible = true) {
   return `(() => {
-    const volume = ${JSON.stringify(appVolume)};
-    const audible = ${JSON.stringify(audible)};
-    // #981: how loud each stream is, as a proportion of app volume.
-    const streams = ${JSON.stringify(streamVolumes)};
+    /* #988: EVERY INJECTION REWRITES THESE; THE HOOKS READ THEM.
+     *
+     * apply() used to close over the values of the injection that
+     * happened to install the observer, and the MutationObserver, the
+     * two capture listeners and the one-second interval are installed
+     * ONCE behind a guard - so every later injection updated numbers
+     * that the persistent hooks never looked at again. The sliders moved
+     * and a second later the stale interval put the old level back.
+     *
+     * They live on window now, rewritten by each injection and read on
+     * every apply. */
+    window.__pineDesktopVolume = ${JSON.stringify(appVolume)};
+    window.__pineDesktopAudible = ${JSON.stringify(audible)};
+    window.__pineDesktopStreams = ${JSON.stringify(streamVolumes)};
+    /* ...and the rAF latch is cleared, because a hidden or throttled
+     * webview can leave it set for ever and every hook becomes a no-op. */
+    window.__pineDesktopVolumePending = false;
     window.__pineDesktopVolume = audible ? volume : 0;
     window.__pineDesktopAudible = audible;
     const apply = () => {
+      const volume = Number(window.__pineDesktopVolume) || 0;
+      const audible = !!window.__pineDesktopAudible;
+      const streams = window.__pineDesktopStreams || {};
       try {
         localStorage.setItem("pineMusicVolume", String(audible ? volume : 0));
         localStorage.setItem("pineMusicMuted", audible && volume > 0 ? "0" : "1");
@@ -207,7 +223,7 @@ function appVolumeScript(audible = true) {
       document.addEventListener("loadedmetadata", schedule, true);
       window.__pineDesktopVolumeInterval = setInterval(schedule, 1000);
     }
-    return volume;
+    return Number(window.__pineDesktopVolume) || 0;
   })();`;
 }
 
@@ -369,6 +385,24 @@ function audibleFrame() {
    * frame is audible. The switch keeps its real job: hearing the booth
    * while the show is on the box. */
   if (!boothMonitor && !routeIsHere()) return null;
+  /* #988: SWITCHING TABS WAS MUTING THE STATION.
+   *
+   * This returned activeFrame() - whichever view is on top - so the
+   * moment the operator selected Radio or Guide, controlFrame stopped
+   * being the audible frame and was injected with audible=false, which
+   * is a hard volume=0 / muted=true on the music player AND both DJ
+   * elements. Going back to Control restored it. Audio away, audio back,
+   * on an action performed constantly: that is the cutting in and out.
+   *
+   * Audibility is a property of the ROUTE and of which frame carries the
+   * broadcast, not of which tab happens to be visible. When the route
+   * sends audio here, the control frame is the broadcast and it is
+   * audible from any tab. activeFrame() still decides in the monitor
+   * case, which is what that switch is actually for. */
+  if (routeIsHere()) {
+    const carrier = $("controlFrame");
+    if (carrier && carrier.src) return carrier;
+  }
   return activeFrame() || ($("controlFrame")?.src ? $("controlFrame") : null)
     || ($("radioFrame")?.src ? $("radioFrame") : null);
 }

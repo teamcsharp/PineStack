@@ -177,11 +177,17 @@
     </header>
 
     <section id="control" class="view frame-view active">
-      <webview id="controlFrame" allowpopups></webview>
+      <!-- #988: backgroundThrottling=no - the control frame carries
+           the broadcast on the Application route and must keep
+           decoding while another tab is on top. A hidden webview
+           is otherwise frozen: no animation frames, timers cut to
+           one wake a minute, and eventually a suspended audio
+           context. -->
+      <webview id="controlFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
     </section>
 
     <section id="radio" class="view frame-view">
-      <webview id="radioFrame" allowpopups></webview>
+      <webview id="radioFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
     </section>
 
     <section id="overview" class="view">
@@ -241,7 +247,7 @@
     </section>
 
     <section id="guide" class="view frame-view">
-      <webview id="guideFrame" allowpopups></webview>
+      <webview id="guideFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
     </section>
 
     <section id="logs" class="view">
