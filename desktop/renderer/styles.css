@@ -1176,3 +1176,8 @@ body.immersive main {
 .works-pop .wk-block > b { color: #9fd8ff; font-size: 11px;
   letter-spacing: .04em; }
 .works-pop .wk-stop { color: #e88c8c; }
+
+/* #864: the drawers inside The Works' stages. */
+.works-pop .wk-drawer { margin-top: 6px; padding-top: 6px;
+  border-top: 1px dashed #24384a; }
+.works-pop .wk-stage b { cursor: default; }

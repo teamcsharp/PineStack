@@ -1653,10 +1653,23 @@ function initWorksPopup() {
     if (pop) { pop.remove(); pop = null; }
   }
 
-  function stage(flow, title, num, note, cls, frac) {
+  /* #864: every stage OPENS. The owner wants the writing desk's own
+   * detail — what it is writing, for whom, under which prompt, and the
+   * script that came back — in the same place as the rest of the line.
+   * Open/closed lives outside the DOM because paint() rebuilds this
+   * whole flow every 2.5 seconds. */
+  const wkOpen = {};
+  try {
+    Object.assign(wkOpen,
+      JSON.parse(localStorage.getItem("wkOpen") || "{}") || {});
+  } catch (e) { /* first run */ }
+
+  function stage(flow, title, num, note, cls, frac, key, fill_) {
     const box = mk("div", "wk-stage" + (cls ? " " + cls : ""));
     if (num != null) box.appendChild(mk("span", "wk-num", String(num)));
-    box.appendChild(mk("b", "", title));
+    const head = mk("b", "", (key ? (wkOpen[key] ? "▾ " : "▸ ") : "") + title);
+    if (key) head.style.cursor = "pointer";
+    box.appendChild(head);
     if (note) box.appendChild(mk("div", "wk-note", note));
     if (frac != null) {
       const bar = mk("div", "wk-bar");
@@ -1666,8 +1679,45 @@ function initWorksPopup() {
       bar.appendChild(fill);
       box.appendChild(bar);
     }
+    if (key) {
+      const drawer = mk("div", "wk-drawer");
+      drawer.style.display = wkOpen[key] ? "block" : "none";
+      box.appendChild(drawer);
+      if (wkOpen[key] && typeof fill_ === "function") {
+        try { fill_(drawer); } catch (e) {
+          drawer.appendChild(mk("div", "wk-note", "could not read that"));
+        }
+      }
+      head.onclick = (ev) => {
+        ev.stopPropagation();
+        wkOpen[key] = !wkOpen[key];
+        try { localStorage.setItem("wkOpen", JSON.stringify(wkOpen)); }
+        catch (e) { /* private mode */ }
+        head.textContent = (wkOpen[key] ? "▾ " : "▸ ") + title;
+        drawer.style.display = wkOpen[key] ? "block" : "none";
+        if (wkOpen[key] && !drawer.childNodes.length
+            && typeof fill_ === "function") {
+          try { fill_(drawer); } catch (e) {}
+        }
+      };
+    }
     flow.appendChild(box);
     return box;
+  }
+
+  /* One labelled block inside a drawer. */
+  function wkPut(drawer, label, text, mono) {
+    if (!text) return;
+    const h = mk("div", "wk-note", label);
+    h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:6px 0 2px;"
+      + "opacity:.8";
+    drawer.appendChild(h);
+    const b = mk("div", "", String(text));
+    b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
+      + "max-height:26vh;overflow:auto;padding:5px 7px;border-radius:6px;"
+      + "background:#05090f;border:1px solid #24384a"
+      + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+    drawer.appendChild(b);
   }
 
   function paint(body, dj, pend) {
@@ -1680,15 +1730,53 @@ function initWorksPopup() {
 
     const flow = mk("div", "wk-flow");
 
-    // 1 — the writing desk
+    // 1 — the writing desk  (#864: opens onto the paperwork)
     stage(flow, "① the writing desk",
       (dj && dj.model) || "?",
       f.writing ? "writing a round now"
                 : "idle — the reserve is at its target",
-      f.writing ? "on" : "");
+      f.writing ? "on" : "", null,
+      "desk",
+      (drawer) => {
+        drawer.appendChild(mk("div", "wk-note", "reading the desk…"));
+        api.get("/api/writing-desk").then((wd) => {
+          drawer.textContent = "";
+          const calls = (wd && wd.calls) || [];
+          const head = mk("div", "wk-note",
+            calls.length + " calls held · mean " + (wd.mean_ms || 0)
+            + " ms, slowest " + (wd.slowest_ms || 0) + " ms"
+            + (wd.kind_now ? " · on a " + wd.kind_now + " segment" : ""));
+          head.style.cssText = "font-size:10px;margin-bottom:4px";
+          drawer.appendChild(head);
+          calls.slice(0, 4).forEach((c) => {
+            const t = mk("div", "");
+            t.style.cssText = "border-left:2px solid #3f7fa8;padding-left:7px;"
+              + "margin:6px 0";
+            const nm = mk("div", "");
+            nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff";
+            nm.textContent = (c.kind || "a round") + " · " + (c.ms || 0)
+              + " ms · " + (c.chars || 0) + " chars · ctx "
+              + (c.num_ctx || "?") + " · temp " + (c.temp != null ? c.temp : "?");
+            t.appendChild(nm);
+            drawer.appendChild(t);
+            wkPut(drawer, "GOVERNED BY",
+              (c.armed ? "system prompt: " + c.armed : "")
+              + (c.sched ? (c.armed ? "\n\n" : "") + c.sched : ""));
+            wkPut(drawer, "WHAT WE SENT", c.prompt, true);
+            wkPut(drawer, "WHAT CAME BACK", c.script || c.text, true);
+          });
+          if (!calls.length) {
+            drawer.appendChild(mk("div", "wk-note",
+              "nothing yet — each call is recorded as the desk makes it."));
+          }
+        }).catch(() => {
+          drawer.textContent = "";
+          drawer.appendChild(mk("div", "wk-note", "the desk is unreachable"));
+        });
+      });
     flow.appendChild(mk("div", "wk-arrow", "▼"));
 
-    // 2 — the reserve of written scripts
+    // 2 — the reserve of written scripts  (#864: opens onto the rounds)
     const target = Number(f.target || 6);
     const have = Number(f.ready || 0);
     stage(flow, "② the reserve — written scripts",
@@ -1697,7 +1785,37 @@ function initWorksPopup() {
         ? rows.length + " round(s) banked and waiting for a slot"
         : "nothing banked — the desk is behind",
       have >= target ? "on" : have === 0 ? "warn" : "",
-      target ? have / target : 0);
+      target ? have / target : 0,
+      "reserve",
+      (drawer) => {
+        if (!rows.length) {
+          drawer.appendChild(mk("div", "wk-note", "the shelf is empty"));
+          return;
+        }
+        rows.forEach((r, i) => {
+          const t = mk("div", "");
+          t.style.cssText = "border-left:2px solid "
+            + (r.state === "ready" ? "#7ce8a9" : "#3f7fa8")
+            + ";padding-left:7px;margin:6px 0";
+          const nm = mk("div", "");
+          nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff";
+          nm.textContent = "#" + (i + 1) + " · " + r.state + " · "
+            + r.turns + " turns · " + r.made + "/" + r.chunks + " lines made"
+            + (r.seconds ? " · " + Math.round(r.seconds) + "s" : "");
+          t.appendChild(nm);
+          (r.lines || []).forEach((ln) => {
+            const l = mk("div", "");
+            l.style.cssText = "font-size:10px;line-height:1.45;margin-top:2px;"
+              + "opacity:.75";
+            const w = mk("b", "", (ln.name || ln.who) + " ");
+            w.style.color = "#7ce8a9";
+            l.appendChild(w);
+            l.appendChild(document.createTextNode(String(ln.text || "")));
+            t.appendChild(l);
+          });
+          drawer.appendChild(t);
+        });
+      });
     flow.appendChild(mk("div", "wk-arrow", "▼"));
 
     // 3 — the recording room

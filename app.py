@@ -33250,7 +33250,14 @@ async def dj_banter(track: dict[str, Any] | None = None,
         pipeline_log("speakbox", f"the cooldown is holding back "
                                  f"{_lift * 100:.0f}% of recent lines — "
                                  "leaning harder on the documents (#no-repeats)")
-    if not caller_name and not full_swath and random.random() < min(1.0, float(
+    # #867: THE SLIDER IS THE ANSWER, and nothing overrules it. The full
+    # swath used to suppress both passages — at a 45% swath rate that was
+    # nearly half of all rounds losing an 80% opening and a 68% closing
+    # passage, so two dials the operator had set were being quietly
+    # cancelled by a third. "If the sliders are up for the speaker box
+    # rhetoric, there is nothing that can stop it." The budget is what
+    # gets expanded to fit, not the material that gets dropped.
+    if not caller_name and random.random() < min(1.0, float(
             _sb.get("speakbox_prepend_rate") or 0) + _lift):
         head = await _fresh_swath()
         if head.get("text"):
@@ -33259,7 +33266,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             speakbox_remember(head)
             _verbatim.append(["head", str(head["text"])])        # #838
     tail: dict[str, Any] = {}
-    if not caller_name and not full_swath and random.random() < min(1.0, float(
+    if not caller_name and random.random() < min(1.0, float(   # #867
             _sb.get("speakbox_append_rate") or 0) + _lift):
         tail = await _fresh_swath()
         if tail.get("text"):
