@@ -8520,6 +8520,47 @@ def take_note(who: str, voice: str, engine: str, text: str,
         pass
 
 
+# #865: WHO is going through the rooms THIS INSTANT. _TAKES above is
+# a ledger of work already finished; this is the one segment currently
+# at the model or at the microphone, so the owner can WATCH the writing
+# room and the recording room rather than reconstruct them afterwards
+# out of the log. Deliberately a plain dict with a timestamp: a status
+# board may never cost a lock, a render or a model visit.
+_PREP_NOW: dict[str, Any] = {}
+PREP_NOW_LIFE = 25.0                    # after this, nobody is in there
+
+
+def prep_note(kind: str, stage: str, **more: Any) -> None:
+    """One line about the segment in the rooms this moment."""
+    try:
+        _PREP_NOW.update({"kind": str(kind or "")[:24],
+                          "stage": str(stage or "")[:16],
+                          "at": time.time()})
+        for key, value in (more or {}).items():
+            _PREP_NOW[str(key)[:16]] = value
+    except Exception:  # noqa: BLE001
+        pass                            # a status board never raises
+
+
+def prep_now() -> dict[str, Any]:
+    """What is in the rooms, or {} when nobody has been for a while."""
+    try:
+        if not _PREP_NOW:
+            return {}
+        if time.time() - float(_PREP_NOW.get("at") or 0) > PREP_NOW_LIFE:
+            return {}
+        row = dict(_PREP_NOW)
+        who = str(row.get("who") or "")
+        if who:
+            row["name"] = booth_actor_name(who, "")
+        row["label"] = PREP_BOARD_LABEL.get(str(row.get("kind") or ""),
+                                            str(row.get("kind") or ""))
+        row["ago"] = round(time.time() - float(row.get("at") or 0), 1)
+        return row
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def recording_room() -> dict[str, Any]:
     """#899: the room, per actor. Takes, airtime, engine cost, and how
     much of the work the shelf is saving."""
@@ -8556,6 +8597,14 @@ def recording_room() -> dict[str, Any]:
         "cost": (round(sum(float(t["cost"]) for t in live) / len(live), 2)
                  if live else None),
         "recent": list(reversed(rows[-40:])),
+        # #865: "I wanna see callers, managers, I wanna see everyone
+        # going through the writing room, through the recording room,
+        # stacking up things in the pantry." The rows above say who has
+        # BEEN in and what it cost; these say what is moving through the
+        # rooms right now, by content type, and who is at the mic.
+        "kinds": prep_board(),
+        "preparing": prep_now(),
+        "quota": quota_state(),
     }
 PANTRY_LIFE = 5400.0                    # the FLOOR; see pantry_life()
 
@@ -8595,7 +8644,21 @@ PANTRY_MAX_BYTES = int(os.getenv("PANTRY_MAX_BYTES", str(6 * 1024 ** 3)))
 #   * preparation takes a slot only if the engine is free THIS
 #     INSTANT, and otherwise skips and comes back next pass. A
 #     prepared take can never be the reason a live line is late.
-ENGINE_BUDGET = 2                       # renders in flight, both roads
+# #918: THREE, and the third is preparation's alone.
+#
+# At two, live rendering used the whole budget — _PREMAKE_GATE is also
+# 2 — so `engine_inflight() >= ENGINE_BUDGET` was true whenever the
+# show was working, the window never opened, nothing was ever prepared,
+# and with nothing prepared every line had to be rendered live. The
+# buffer could not be built because there was no buffer. Measured:
+# prepared_by_kind {banter: 4, ad: 0, station_id: 0, manager: 0,
+# caller: 0} after hours of running.
+#
+# Live keeps its two slots (_PREMAKE_GATE is unchanged), so a live
+# render NEVER waits on a prepared one. The third exists only so the
+# room is not standing empty while the show renders — which is the
+# whole point of having a room.
+ENGINE_BUDGET = 3                       # renders in flight, both roads
 _ENGINE_LIVE = [0]                      # air renders in flight
 _ENGINE_PREP = [0]                      # preparation renders in flight
 
@@ -8658,7 +8721,12 @@ def engine_prep_take() -> bool:
     a live one, and the pair of them push the next live line into a
     queue — which is the one thing preparation may never do."""
     try:
-        if engine_inflight() > max(0, int(ENGINE_BUDGET) - 2):
+        # #917: preparation may hold the SPARE slot. The rule that
+        # mattered is that it never takes the last one — a live render
+        # must always find the engine free — and that still holds:
+        # ENGINE_BUDGET is 2, so this permits at most one prepared take
+        # alongside at most one live take.
+        if engine_inflight() > max(0, int(ENGINE_BUDGET) - 1):
             return False
         _ENGINE_PREP[0] = max(0, int(_ENGINE_PREP[0])) + 1
         return True
@@ -8866,6 +8934,126 @@ def prepared_by_kind() -> dict[str, int]:
     for kind in SHELF_CAPS:
         out[kind] = len(_SHELF.get(kind) or [])
     return out
+
+
+# #865: the board the owner asked to be able to WATCH — "I wanna see
+# callers, managers, I wanna see everyone going through the writing
+# room, through the recording room, stacking up things in the pantry."
+# The same roads PREP_BOARD schedules, plus the booth rounds the larder
+# writes for itself, each named as the owner would say it out loud.
+PREP_BOARD_KINDS = ("banter", "ad", "station_id", "track_talk",
+                    "manager", "caller")
+PREP_BOARD_LABEL = {
+    "banter": "booth rounds",
+    "ad": "advert reads",
+    "station_id": "station IDs",
+    "track_talk": "record intros and send-offs",
+    "manager": "memos from upstairs",
+    "caller": "phone calls",
+}
+
+
+def calls_wanted() -> int:
+    """#871: how many prepared CALLS to keep standing by.
+
+    The operator sets CALLS PER HOUR and the quota engine paces the AIR
+    off it (quota_target / quota_due / quota_behind). This is that same
+    number read as a SHELF DEPTH: enough finished calls standing by to
+    cover the coming hour, so no call has to be written AND voiced at
+    the one moment there is no time for either.
+
+    Deliberately the SAME notion of the hour the air road uses — there
+    is no second idea of "how many calls we owe" anywhere in here. Zero
+    when the dial is off, which leaves the scheduler exactly as it
+    was."""
+    try:
+        target = quota_target("caller")
+        if target <= 0:
+            return 0                    # dial off: nothing is owed
+        return max(1, min(shelf_cap("caller"), target))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def calls_short() -> int:
+    """How far the caller shelf is from covering the hour's quota."""
+    try:
+        want = calls_wanted()
+        if not want:
+            return 0
+        return max(0, want - len(_SHELF.get("caller") or []))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def prep_board() -> list[dict[str, Any]]:
+    """#865: the writing room and the recording room, BY CONTENT TYPE.
+
+    Per kind: how many segments are WRITTEN (the model has been), how
+    many of their lines are RENDERED into the pantry, how many are READY
+    to air, and how much airtime that is. Rounds — booth banter, memos
+    from upstairs, phone calls — count LINES, because a line is what a
+    preparer actually makes; the single-line kinds (adverts, bumpers,
+    and each side of a record's own talk) are one line each, and their
+    `key` is the whole of their audio."""
+    rows: list[dict[str, Any]] = []
+    for kind in PREP_BOARD_KINDS:
+        row: dict[str, Any] = {
+            "kind": kind, "label": PREP_BOARD_LABEL.get(kind, kind),
+            "written": 0, "lines": 0, "rendered": 0, "ready": 0,
+            "recording": 0, "seconds": 0.0, "cap": 0}
+        try:
+            held: list[dict[str, Any]] = []      # rounds, counted in lines
+            ones: list[dict[str, Any]] = []      # one-line items
+            if kind == "banter":
+                held = [e for e in list(_LARDER) if isinstance(e, dict)]
+                row["cap"] = _LARDER_MAX
+            elif kind in ("manager", "caller"):
+                held = [dict(r.get("entry") or {})
+                        for r in list(_SHELF.get(kind) or [])]
+                row["cap"] = shelf_cap(kind)
+            elif kind == "track_talk":
+                # #869 holds its words per RECORD, one part each side.
+                for _rec in list(_TRACK_TALK.values()):
+                    if not isinstance(_rec, dict):
+                        continue
+                    for _side in ("intro", "outro"):
+                        _got = _rec.get(_side)
+                        if isinstance(_got, dict):
+                            ones.append(_got)
+                row["cap"] = TRACK_TALK_MAX
+            else:
+                ones = list(_SHELF.get(kind) or [])
+                row["cap"] = shelf_cap(kind)
+            if ones:
+                # #904 shelves the TEXT of a read the engine refused, so
+                # written and rendered genuinely differ here.
+                row["written"] = len(ones)
+                row["lines"] = len(ones)
+                row["rendered"] = sum(1 for x in ones if x.get("key"))
+                row["ready"] = row["rendered"]
+                row["seconds"] = round(sum(float(x.get("seconds") or 0)
+                                           for x in ones), 1)
+            if held:
+                row["written"] = len(held)
+                row["lines"] = sum(int(e.get("chunks") or 0) for e in held)
+                row["rendered"] = sum(int(e.get("made") or 0) for e in held)
+                row["ready"] = sum(1 for e in held if e.get("prepared"))
+                row["recording"] = sum(1 for e in held if e.get("preparing"))
+                row["seconds"] = round(sum(float(e.get("seconds") or 0)
+                                           for e in held), 1)
+            if kind in QUOTA_KINDS:
+                # The hour's promise, straight off the quota engine.
+                row["per_hour"] = quota_target(kind)
+                row["aired"] = quota_count(kind)
+                row["behind"] = bool(quota_behind(kind))
+            if kind == "caller":
+                row["want"] = calls_wanted()
+                row["short"] = calls_short()
+        except Exception:  # noqa: BLE001
+            pass                        # one bad row never empties the board
+        rows.append(row)
+    return rows
 
 
 def prepare_target_seconds() -> float:
@@ -9169,12 +9357,23 @@ def prep_should_stop() -> str:
     try:
         if prep_yielding():
             return _PREP_YIELD_WHY[0] or "a forced interjection"
-        if live_rendering():
-            return "a live line is on the engine"
         if render_relief():
             return "the engine is in relief"
-        if _SPEAKING[0]:
-            return "somebody is talking"
+        # #919: these two used to stop the room dead, and they are true
+        # almost all the time — so a call could be WRITTEN and then never
+        # recorded a single line of. Measured: 3 calls and 8 station IDs
+        # written, 0 rendered, because every line yielded before it
+        # started.
+        #
+        # They were the right rule when preparation had no slot of its
+        # own and would have stolen one from the show. It has the third
+        # slot now (#918), so a live render being in flight is the NORMAL
+        # state, not a reason to down tools, and talking is playback on
+        # the box that costs the engine nothing. What still stops the
+        # room is a forced interjection, relief, a genuinely full engine,
+        # and the task overrunning the room it was given.
+        if engine_inflight() > max(1, int(ENGINE_BUDGET) - 1):
+            return "the engine is full"
         due = float(_PREP_DEADLINE[0] or 0)
         if due and time.time() > due:
             return "this task has used the room it was given"
@@ -16388,37 +16587,98 @@ def repair_note(what: str) -> None:
     pipeline_log("air", f"repair mode: {what}"[:190])
 
 
+def _prep_intro_pad(turns: list[tuple[str, str]],
+                    caller_name: str) -> list[tuple[str, str]]:
+    """#871: the hello speak_turns will put in front of a silent caller.
+
+    _caller_introduces (#753) guarantees a caller says their own name,
+    adding a turn of its own when the writer forgot — and that turn
+    shifts every chunk index after it. The index IS the disfluency seed,
+    so a plan built without it would key every host line after the
+    caller's first turn differently from the way the call actually airs,
+    and miss its own audio. The live hello is drawn with unrepeated(),
+    which SPENDS a draw, so this stands a same-shaped placeholder in its
+    place: one caller chunk, counted, never rendered. Every entry in
+    CALLER_HELLOS is one sentence group well inside say_max_chars(), so
+    the placeholder is the same single chunk whichever one is drawn."""
+    try:
+        if not caller_name or not turns:
+            return turns
+        parts = str(caller_name).split()
+        if not parts:
+            return turns                # #786: a whitespace-only name
+        first = parts[0].lower()
+        for at, (marker, said) in enumerate(turns):
+            if marker != "C":
+                continue
+            words = re.sub(r"[^a-z0-9 ]+", " ", str(said).lower()).split()
+            if first and first in words:
+                return turns            # they introduce themselves already
+            return (list(turns[:at])
+                    + [("C", CALLER_HELLOS[0].format(name=caller_name))]
+                    + list(turns[at:]))
+    except Exception:  # noqa: BLE001
+        pass                            # a miss here is only a cache miss
+    return turns
+
+
 def _round_chunks(turns: list[tuple[str, str]],
-                  voices: dict[str, str]) -> list[tuple[str, str, str]]:
+                  voices: dict[str, str],
+                  caller_name: str = "") -> list[tuple[str, str, str]]:
     """The exact (text, voice, who) speak_turns will ask the engine for.
 
-    This mirrors the playlist build deliberately and only for the seats
-    the larder actually banks — no callers, no phone line. Anything it
-    gets wrong is a cache MISS, which is simply today's behaviour."""
+    This mirrors the playlist build deliberately. Anything it gets wrong
+    is a cache MISS, which is simply today's behaviour.
+
+    #871: IT USED TO RETURN [] FOR THE WHOLE ROUND the moment it saw a
+    caller marker, and that one line is the reason a prepared call was
+    never a prepared call. larder_prepare read the empty plan as
+    "nothing to make" and wrote prepared=False / chunks=0 — having
+    ALREADY set frozen=True — so pantry_keeper's `frozen and not chunks`
+    skip wrote the entry off for ever. prep_round("caller") spent a
+    whole eight-to-twelve-turn model write and shelved a row with no
+    audio behind it at all, every single time.
+
+    Only the CALLER genuinely cannot be pre-keyed: their phone line —
+    the static, the echo, the room, their own drawn voice — is made once
+    per call inside speak_turns, so a clip rendered now would carry a
+    different phone from the one the call airs on. The HOSTS have no
+    such problem; they are ordinary seats holding the session's stable
+    voices. Their turns are prepared, the caller's are left to the live
+    road, and the caller's chunks are still COUNTED here (blank rows,
+    dropped at the end) so the running chunk index — which is the
+    disfluency seed — stays in step with the live playlist."""
     out: list[tuple[str, str, str]] = []
     cap = say_max_chars()
+    turns = _prep_intro_pad(turns, caller_name)
     for marker, said in turns:
         who = ("caller" if marker == "C" else "caller2" if marker == "E"
                else "dj" if marker == "A"
                else "third" if marker == "D" else "cohost")
-        if who in ("caller", "caller2"):
-            return []                   # the phone line is drawn per call
         text = spoken_text(said)
         if not text:
-            continue
+            continue                    # speak_turns drops it too
         voice = str(voices.get(who) or "")
-        if not voice:
-            continue
-        vec = performance_vector(who, voice)
+        # The phone line is drawn per call, and a seat with no voice has
+        # nothing to render with. BOTH still take their place in the
+        # live playlist, so both are counted here and neither is made.
+        # (banter_turns folds a bare "Caller:" label to C whatever the
+        # caller_name is, so an ordinary booth round that picked one up
+        # now loses that single turn instead of every turn it has.)
+        live_only = who in ("caller", "caller2") or not voice
+        vec = {} if live_only else performance_vector(who, voice)
         for at, chunk in enumerate(
                 sentence_chunks(text, cap=cap,
                                 most=say_chunks_for(text, cap))):
+            if live_only:
+                out.append(("", "", who))
+                continue
             if at:
                 chunk = breath_for(f"{who}{len(out)}") + chunk
             out.append((inject_disfluencies(chunk, vec,
                                             seed=f"{who}{len(out)}"),
                         voice, who))
-    return out
+    return [row for row in out if row[0] and row[1]]
 
 
 async def larder_prepare(entry: dict[str, Any]) -> bool:
@@ -16430,7 +16690,19 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         # The freshening model call comes OFF the critical path — it is
         # done once, here, and the script is frozen so the air road can
         # skip it and the chunk text stays exactly what we rendered.
-        if not entry.get("frozen"):
+        #
+        # #871: THOSE ARE TWO DIFFERENT FACTS AND USED TO BE ONE FLAG.
+        # `freshened` says the model visit has been PAID FOR; `frozen`
+        # is the promise to the air road that the text will not move
+        # under the audio. Fused, a round with nothing preparable in it
+        # was frozen anyway, and pantry_keeper skips exactly that shape
+        # (`frozen and not chunks`) for ever — which is why a banked
+        # call, whose plan was always empty, was written once and then
+        # never looked at again. Split, the visit still happens once and
+        # the freeze is only given when there is audio to protect.
+        _pkind = str(entry.get("prep_kind") or "banter")
+        if not (entry.get("freshened") or entry.get("frozen")):
+            prep_note(_pkind, "writing")
             try:
                 entry["script"] = await freshen_script(
                     str(entry.get("script") or ""),
@@ -16439,16 +16711,30 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
                     entry.get("verbatim"))      # #838
             except Exception:  # noqa: BLE001
                 pass
-            entry["frozen"] = True
+            entry["freshened"] = True
         turns = banter_turns(str(entry.get("script") or ""),
                              str(entry.get("caller_name") or ""),
                              str(entry.get("caller2_name") or ""))
         voices = await session_voices()
-        plan = _round_chunks(turns, voices)
+        # #871: the caller's name goes in, so the plan accounts for the
+        # hello speak_turns puts in front of a caller who never
+        # introduces themselves — see _prep_intro_pad.
+        plan = _round_chunks(turns, voices,
+                             str(entry.get("caller_name") or ""))
+        entry["prep_turns"] = len(turns)
         if not plan:
             entry["prepared"] = False
             entry["chunks"] = 0
+            # #871: nothing in this one a preparer can make — every seat
+            # in it is on the phone, or the voices have not settled yet.
+            # It must NOT be left frozen: that is precisely the shape
+            # the keeper skips for ever. Hand the freeze back and it is
+            # tried again on a later pass; the model visit is not
+            # repeated, because `freshened` remembers it was made.
+            entry["frozen"] = False
             return False
+        # There is audio to protect now, so the script stops moving.
+        entry["frozen"] = True
         dj = dj_settings()
         entry["chunks"] = len(plan)
         entry["made"] = int(entry.get("made") or 0)
@@ -16467,6 +16753,16 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         # takes were recorded in has no bearing on the order they air.
         # Nothing is spliced and no boundary is guessed.
         try:
+            # #871: and this is what SECTIONS A CALL OUT TO ITS
+            # ACTORS. A call reaches here through prep_round ->
+            # larder_prepare like every other round, so the host's lines
+            # and the co-host's lines each record as one continuous
+            # session in that performer's own voice — "having the actors
+            # run all of their lines" — instead of the engine swapping
+            # conditioning line by line down the script. The cutting and
+            # dissecting is the pantry's: playback looks each line up by
+            # its own text, so the order they were recorded in has no
+            # bearing at all on the order they air.
             _order: dict[str, int] = {}
             for _t, _v, _w in plan:
                 _order.setdefault(str(_v), len(_order))
@@ -16474,6 +16770,11 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         except Exception:  # noqa: BLE001
             pass
         for text, voice, who in plan:
+            # #865: the recording room, live — which actor is at the
+            # microphone this instant and how far through the section
+            # of lines that was cut for them.
+            prep_note(_pkind, "recording", who=who, voice=voice,
+                      made=made, lines=len(plan))
             # #886: EXACTLY as the air road computes it — _premake_inner
             # calls voice_engine_for(v) with no seat, and passing one here
             # applies role pinning and the cast lock, which can name a
@@ -16764,11 +17065,19 @@ async def prep_round(kind: str) -> bool:
     await larder_prepare(entry)
     shelf_put(kind, {"entry": entry,
                      "seconds": float(entry.get("seconds") or 0)})
+    # #871: and a CALL says plainly what was prepared and what was not.
+    # The hosts' halves are cut here; the caller's own turns ride the
+    # live road, because their phone line is drawn once per call and
+    # cannot be baked in hours early.
     pipeline_log("lookahead",
                  f"{SHELF_LABEL.get(kind, kind)} is READY to air - "
                  f"{entry.get('made') or 0} of {entry.get('chunks') or 0} "
                  f"lines made, {entry.get('seconds') or 0}s of finished "
-                 "audio waiting (#842)")
+                 "audio waiting (#842)"
+                 + (f" - the hosts' halves of "
+                    f"{entry.get('prep_turns') or 0} turns are recorded; "
+                    "the caller's own turns ride the live phone line "
+                    "(#871)" if kind == "caller" else ""))
     return True
 
 
@@ -17019,6 +17328,10 @@ async def prep_track_talk() -> bool:
 async def prep_one(kind: str) -> bool:
     """Prepare exactly one item of one content type. Never raises: the
     station stays on air whatever the preparer runs into."""
+    # #865: the writing-room door. This says who is at the model now;
+    # larder_prepare takes the note over and starts naming actors and
+    # lines the moment there is a script to record.
+    prep_note(str(kind), "writing")
     try:
         if kind == "track_talk":
             return await prep_track_talk()
@@ -17030,6 +17343,8 @@ async def prep_one(kind: str) -> bool:
             return await prep_round(kind)
     except Exception:  # noqa: BLE001
         return False
+    finally:
+        prep_note(str(kind), "stacked")
     return False
 
 
@@ -17101,13 +17416,25 @@ def pantry_window() -> str:
     # saturated from the first instant of every round to its last
     # render — and this window, which asked exactly that, was almost
     # never open. Every other condition below is unchanged.
-    if engine_inflight():
-        return ""                       # a render is happening now
+    # #917: the SECOND slot, not an idle engine. Requiring
+    # engine_inflight() == 0 held this door shut about 96% of the time
+    # on a station that talks continuously, and the measured result was
+    # prepared_by_kind {banter: 4, ad: 0, station_id: 0, manager: 0,
+    # caller: 0} — the memos and the phone calls were never written
+    # ahead at all. Preparation takes the spare slot and never the
+    # first, so a live line still never queues behind a prepared one.
+    if engine_inflight() >= max(1, int(ENGINE_BUDGET)):
+        return ""                       # the engine is genuinely full
     if _RADIO.get("ad_now") and time.time() - float(
             (_RADIO.get("ad_now") or {}).get("at") or 0) < 180:
         return "an ad break"
+    # #917: talking is NOT a reason to stop building. It is playback on
+    # the box and costs the GPU nothing, and it is the one stretch where
+    # the air is guaranteed covered — which makes it the best time in
+    # the hour to be recording ahead, not the worst. The old rule built
+    # only in the gaps, and the gaps are the thing being abolished.
     if _SPEAKING[0]:
-        return ""                       # somebody is talking; leave the GPU
+        return "the pair are talking"
     track = _RADIO.get("now") or {}
     try:
         left = float(track.get("seconds") or 0) - (
@@ -17142,7 +17469,16 @@ async def pantry_keeper() -> None:
             if not window:
                 continue
             target = prepare_target_seconds()
-            if pantry_seconds() >= target:
+            # #871: CALLS PER HOUR is a promise about what AIRS, and the
+            # hours-of-audio ceiling is met by booth rounds and bumpers
+            # long before the phone line has anything on it — so the
+            # pass used to end right here with the caller shelf empty,
+            # and a call was still written AND voiced at the moment it
+            # was wanted. A shelf short of the hour's calls keeps the
+            # pass alive; nothing else about the ceiling changes, and
+            # the six-gigabyte allowance below is untouched.
+            _calls_short = calls_short()
+            if pantry_seconds() >= target and not _calls_short:
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
@@ -17176,7 +17512,20 @@ async def pantry_keeper() -> None:
                     _shelved = _row.get("entry") or {}
                     if _shelved.get("prepared") or _shelved.get("preparing"):
                         continue
+                    # #871: THIS was the trap door. larder_prepare froze
+                    # a round before it knew whether anything in it could
+                    # be prepared, and a caller round could never have
+                    # anything (the old _round_chunks voided the whole
+                    # plan on the first caller marker), so every banked
+                    # call landed here as `frozen and chunks == 0` and
+                    # was never looked at again. The freeze is only given
+                    # now when there is audio to protect; a round that
+                    # has genuinely been SEEN says so with prep_turns,
+                    # and only that one is skipped — so a row banked by
+                    # the old code is picked back up rather than left to
+                    # burn with nothing in it.
                     if (_shelved.get("frozen")
+                            and int(_shelved.get("prep_turns") or 0)
                             and not int(_shelved.get("chunks") or 0)):
                         continue        # nothing in it a preparer can make
                     if pantry_window() != window:
@@ -17244,14 +17593,57 @@ async def pantry_keeper() -> None:
             for _slot_at in range(len(_queue) + 1):
                 if pantry_window() != window:
                     break
-                if (pantry_seconds() >= target
-                        or pantry_bytes() >= PANTRY_MAX_BYTES):
+                if pantry_bytes() >= PANTRY_MAX_BYTES:
+                    break               # the allowance is spent (#894)
+                # #871: is a CALL still owed to this hour, and could this
+                # pass actually make one? CALLS PER HOUR is a promise
+                # about what AIRS, so it outranks the depth ceiling
+                # below; everything else still stops at the target.
+                _call_owed = bool(_calls_short and "caller" not in _skipped
+                                  and not shelf_full("caller"))
+                if pantry_seconds() >= target and not _call_owed:
                     break
                 try:
                     _plan = prep_plan(_skipped)
                 except Exception:  # noqa: BLE001
                     _plan = {}
                 _kind = str(_plan.get("kind") or "")
+                # #871: THE QUOTA RIDES THE PLAN (#872). prep_plan is the
+                # one place that decides what gets built, so the hour's
+                # calls are asked for HERE rather than through a second
+                # rotation of their own — and strictly on the plan's own
+                # terms: the budget it has just worked out must cover
+                # what a call has actually MEASURED at on this box
+                # (task_stat p90, the seed until three have been run).
+                # A call that will not fit this window is still refused,
+                # which is #872's rule three exactly.
+                if _call_owed:
+                    try:
+                        _cost = float(task_stat("caller").get("p90")
+                                      or task_cost("caller") or 0.0)
+                        _fits = float(_plan.get("budget") or 0.0)
+                    except Exception:  # noqa: BLE001
+                        _cost, _fits = 0.0, 0.0
+                    if _cost and _fits >= _cost:
+                        _plan = dict(_plan)
+                        _plan["kind"] = "caller"
+                        _plan["quota"] = True
+                        _plan["why"] = (
+                            f"the hour is {_calls_short} call(s) short of "
+                            f"the {quota_target('caller')} CALLS PER HOUR "
+                            f"asked for, and a {int(_fits)}s budget covers "
+                            f"one at about {int(_cost)}s"
+                            + (" - and the hour is BEHIND its pace"
+                               if quota_behind("caller") else "")
+                            + " (#871)")
+                        _kind = "caller"
+                    elif pantry_seconds() >= target:
+                        # Past the depth ceiling, and a call will not fit
+                        # this window. Build nothing rather than spend
+                        # the room on something the hour has not asked
+                        # for — the call comes back next window.
+                        prep_log_plan(_plan)
+                        break
                 if not _kind:
                     prep_log_plan(_plan)
                     break               # nothing on the board fits; wait
@@ -77130,7 +77522,8 @@ function roomPanel(anchor) {
   pop.appendChild(hd);
   const sub = el("div", "muted", "Every line is either recorded here or "
     + "taken off the shelf. What is on the shelf never has to be recorded "
-    + "again — that is the whole economy.");
+    + "again — that is the whole economy. Below: who is in the rooms right "
+    + "now, then the board by content type, then the cast (#865).");
   sub.style.cssText = "font-size:10px;line-height:1.5;margin:3px 0 7px";
   pop.appendChild(sub);
   const body = el("div", "", "checking the room…");
@@ -77163,6 +77556,95 @@ function roomPanel(anchor) {
       + (total ? " (" + Math.round(100 * served / total) + "% of the work saved)" : "")
       + (d.cost ? " · engine costs " + d.cost + "× real time" : "")));
     body.appendChild(top);
+
+    /* #865: "When I'm looking at the recording room, I want to see
+     * everyone getting sent through the room, getting their dialogue
+     * prepared. I wanna see callers, managers, I wanna see everyone
+     * going through the writing room, through the recording room,
+     * stacking up things in the pantry." So: who is in the rooms this
+     * instant, and then a row per KIND beside the per-actor rows. */
+    try {
+      const now = d.preparing || {};
+      const line = el("div", "", "");
+      line.style.cssText = "border:1px solid var(--border);border-radius:8px;"
+        + "padding:6px 9px;margin-bottom:7px;font-size:10.5px;"
+        + "line-height:1.55";
+      if (now.kind) {
+        const stage = String(now.stage || "");
+        const room = stage === "writing" ? "in the writing room"
+          : stage === "recording" ? "in the recording room"
+          : "just stacked in the pantry";
+        const head = el("div", "",
+          (stage === "recording" ? "🎙 " : stage === "writing" ? "✍ " : "🥫 ")
+          + room + " — " + String(now.label || now.kind));
+        head.style.color = "var(--accent)";
+        line.appendChild(head);
+        if (stage === "recording") {
+          const lines = Number(now.lines) || 0;
+          const made = Number(now.made) || 0;
+          line.appendChild(el("div", "muted",
+            String(now.name || now.who || "an actor") + " at the microphone"
+            + (now.voice ? " (" + now.voice + ")" : "")
+            + " — line " + Math.min(lines, made + 1) + " of " + lines));
+          pvBar(line, lines ? made / lines : 0,
+                "this segment recorded", true);
+        }
+      } else {
+        line.appendChild(el("div", "muted",
+          "nobody is in the rooms this instant — the preparer works "
+          + "through the records and the ad breaks"));
+      }
+      body.appendChild(line);
+
+      const kinds = d.kinds || [];
+      if (kinds.length) {
+        const KC = "12px 1fr 50px 58px 44px 50px";
+        const kh = el("div", "");
+        kh.style.cssText = "display:grid;grid-template-columns:" + KC
+          + ";gap:2px 6px;font-size:10.5px;align-items:center";
+        ["", "on the board", "written", "recorded", "ready", "airtime"]
+          .forEach((h) => {
+            const c = el("div", "muted", h);
+            c.style.cssText = "font-size:9.5px;letter-spacing:.04em";
+            kh.appendChild(c);
+          });
+        body.appendChild(kh);
+        const kt = el("div", "");
+        kinds.forEach((k) => {
+          const disc = pvDisc("prepkind:" + String(k.kind), {
+            title: "Open " + String(k.label || k.kind)
+              + " — what is written, what is recorded, what is ready",
+            sig: [k.written, k.lines, k.rendered, k.ready, k.seconds,
+                  k.behind, k.recording, pvPipeTip()].join("/"),
+            fill: (b) => roomKindDetail(b, k, d),
+          });
+          disc.head.style.cssText = "display:grid;grid-template-columns:"
+            + KC + ";gap:2px 6px;font-size:10.5px;align-items:center;"
+            + "padding:1px 0;cursor:pointer";
+          const nm = el("b", "pvOne", String(k.label || k.kind));
+          nm.style.color = k.behind ? "#f0a35e" : "var(--accent)";
+          disc.head.appendChild(nm);
+          disc.head.appendChild(el("div", "", String(k.written || 0)
+            + (k.cap ? "/" + k.cap : "")));
+          disc.head.appendChild(el("div", "", String(k.rendered || 0)
+            + " / " + String(k.lines || 0)));
+          const rd = el("div", "", String(k.ready || 0));
+          rd.style.color = (k.ready || 0) > 0 ? "#7ce8a9" : "#8ba0b5";
+          disc.head.appendChild(rd);
+          const sc = Number(k.seconds || 0);
+          disc.head.appendChild(el("div", "", sc >= 60
+            ? (sc / 60).toFixed(1) + "m" : Math.round(sc) + "s"));
+          kt.appendChild(disc.wrap);
+        });
+        body.appendChild(kt);
+        const note = el("div", "muted",
+          "written = segments off the model · recorded = their lines cut "
+          + "into the pantry · ready = whole segments that can air without "
+          + "touching the engine");
+        note.style.cssText = "font-size:9px;line-height:1.5;margin:3px 0 8px";
+        body.appendChild(note);
+      }
+    } catch (e) { /* the per-actor rows below still draw */ }
 
     const actors = d.actors || [];
     if (!actors.length) {
@@ -77329,6 +77811,48 @@ function roomActorDetail(box, a, d) {
     pvMentions([String(a.name || ""), String(a.who || ""),
                 String(a.voice || "")],
                ["voice", "air", "speakbox", "drop", "gpu"]), 3);
+}
+
+
+/* #865: one content type, in full — how far through the rooms it has
+ * got, what the hour has asked for, and what the pantry is actually
+ * holding for it. Same idiom as roomActorDetail above. */
+function roomKindDetail(box, k, d) {
+  try {
+    const kv = pvKVBox(box, "THROUGH THE ROOMS");
+    pvKV(kv, "written", (k.written || 0) + " segment(s) off the model"
+      + (k.cap ? " — the shelf holds " + k.cap : ""));
+    pvKV(kv, "recorded", (k.rendered || 0) + " of " + (k.lines || 0)
+      + " line(s) cut and stacked in the pantry");
+    pvKV(kv, "ready", (k.ready || 0) + " ready to air with no engine at all"
+      + (k.recording ? " · " + k.recording + " at the mic now" : ""));
+    pvKV(kv, "airtime", Math.round(Number(k.seconds || 0))
+      + "s of finished audio standing by");
+    if (k.per_hour !== undefined) {
+      pvKV(kv, "the hour", (k.aired || 0) + " aired of " + (k.per_hour || 0)
+        + " an hour — " + (k.behind ? "BEHIND the pace" : "on pace"));
+    }
+    if (k.want) {
+      pvKV(kv, "wanted", k.want + " prepared to cover the coming hour — "
+        + (k.short ? k.short + " short, so a call goes in next"
+                   : "covered"));
+    }
+    if (String(k.kind) === "caller") {
+      const why = el("div", "muted", "a prepared call is the HOSTS' halves "
+        + "— the caller's own turns are drawn live, because their phone "
+        + "line (the static, the echo, their voice) is made once per call.");
+      why.style.cssText = "font-size:9px;line-height:1.5;margin:3px 0";
+      box.appendChild(why);
+    }
+    pvBar(box, (Number(k.lines) || 0)
+      ? (Number(k.rendered) || 0) / Number(k.lines) : 0,
+      "their lines recorded", !!k.recording);
+    pvServerLines(box, "prepkind" + String(k.kind),
+      pvMentions([String(k.label || ""), String(k.kind || "")],
+                 ["lookahead", "air", "model"]), 3);
+  } catch (e) {
+    box.appendChild(el("div", "muted", "this detail is not available"));
+  }
 }
 
 
