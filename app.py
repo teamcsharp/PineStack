@@ -17240,9 +17240,17 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             _order: dict[str, int] = {}
             for _t, _v, _w in plan:
                 _order.setdefault(str(_v), len(_order))
+            # #934: remember where each line stood in the SCRIPT before
+            # the plan is regrouped by performer. The regrouping is what
+            # lets an actor run all their lines in one sitting, and it
+            # is also why the takes come back out of order — the
+            # transcript has to be readable in the order it is spoken.
+            _script_ix = {}
+            for _i, (_t, _v, _w) in enumerate(plan):
+                _script_ix.setdefault((_t, _v, _w), _i)
             plan = sorted(plan, key=lambda row: _order.get(str(row[1]), 99))
         except Exception:  # noqa: BLE001
-            pass
+            _script_ix = {}
         for text, voice, who in plan:
             # #865: the recording room, live — which actor is at the
             # microphone this instant and how far through the section
@@ -17323,6 +17331,17 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
                 _held = entry.setdefault("keys", [])
                 if key not in _held:
                     _held.append(key)
+                # #934: and the take itself — the line, who says it, the
+                # voice it was cut in, and where it stands in the
+                # script. This is what lets a section be read as a
+                # transcript and any one line of it played or kept.
+                _takes = entry.setdefault("takes", [])
+                if not any(t.get("key") == key for t in _takes):
+                    _takes.append({
+                        "i": int(_script_ix.get((text, voice, who), 999)),
+                        "who": str(who), "voice": str(voice),
+                        "text": str(text)[:1200], "key": key,
+                        "seconds": float((clip or {}).get("seconds") or 0)})
             except Exception:  # noqa: BLE001
                 pass
             made += 1
@@ -18183,6 +18202,13 @@ async def pantry_keeper() -> None:
             # pass alive; nothing else about the ceiling changes, and
             # the six-gigabyte allowance below is untouched.
             _calls_short = calls_short()
+            # #934: and what the RUNNING ORDER is short of. The bucket
+            # below is a depth question; this is the coverage question,
+            # and the coverage question is the one the hour is actually
+            # asking. See the note at the top of #934: banter filled the
+            # bucket every time and the advert, the memo, the painting
+            # round and the bulletin were never reached at all.
+            _hour_short = hour_short_kinds()
             # #930: PREPARED seconds. This one line is the whole of the
             # "how is the writing desk idle and the reserve at target
             # while the entire hour's segments aren't prepared" fault:
@@ -18190,7 +18216,8 @@ async def pantry_keeper() -> None:
             # which a station that talks continuously fills all by
             # itself, and standing down on the strength of it. An hour
             # of already-aired banter is not an hour of cover.
-            if prepared_seconds() >= target and not _calls_short:
+            if (prepared_seconds() >= target and not _calls_short
+                    and not _hour_short):
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
@@ -18281,7 +18308,13 @@ async def pantry_keeper() -> None:
             # and the old rotation follows to keep the rest of the board
             # stocked. With no schedule running the list is empty and
             # this is exactly the old round-robin.
-            _coming = schedule_prep_order()
+            # #934: THE EMPTIEST SEGMENT FIRST. schedule_prep_order
+            # names what is coming up soonest, which is the right tie
+            # break, but it says nothing about what is BARE — and a road
+            # with nothing behind it at all is the one that puts a hole
+            # in the hour, whenever its entry happens to fall.
+            _coming = hour_short_kinds() + [
+                k for k in schedule_prep_order() if k not in _hour_short]
             _board = list(_PREP_ROTA)
             _queue = _coming + [k for k in _board if k not in _coming]
             if _coming:
@@ -18506,6 +18539,73 @@ def hour_shortfall() -> dict[str, Any]:
     return out
 
 
+def hour_needs() -> dict[str, dict[str, float]]:
+    """Per preparing road: seconds the coming hours owe it, and seconds
+    it is holding.
+
+    #934: the entries' OWN MINUTES are the unit — the same figure the
+    hour sheet draws each tile's bar against — multiplied by how many
+    hours the horizon covers. This is the question "is the hour
+    stocked", which is not the same question as "is there an hour of
+    audio somewhere", and answering the second in place of the first is
+    how four segments stayed empty all night while the buffer read
+    full."""
+    out: dict[str, dict[str, float]] = {}
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return out
+        name = schedule_preset_now(store)
+        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
+                 if s.get("enabled", True)]
+        hours = max(1.0, min(6.0, prepare_target_seconds() / 3600.0))
+        for slot in slots:
+            kind = str(slot.get("kind") or "")
+            if kind in CANNOT_PREPARE or not kind:
+                continue
+            road = str(SCHED_PREP_KIND.get(kind) or kind)
+            if road not in ALT_PREP_KINDS:
+                continue
+            owed = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            row = out.setdefault(road, {"owed": 0.0, "held": 0.0,
+                                        "rows": 0.0, "cap": 0.0})
+            row["owed"] += owed * hours
+        for road in list(out):
+            rows = list(_SHELF.get(road) or [])
+            held = sum(float(r.get("seconds") or 0) for r in rows)
+            if road == "banter":
+                rows = rows + [e for e in _LARDER if e.get("prepared")]
+                held += sum(float(e.get("seconds") or 0)
+                            for e in _LARDER if e.get("prepared"))
+            out[road]["held"] = round(held, 1)
+            out[road]["rows"] = float(len(rows))
+            out[road]["cap"] = float(shelf_cap(road))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def hour_short_kinds() -> list[str]:
+    """The roads the coming hours are short of, emptiest first.
+
+    #934: a road already at its shelf cap is NOT short however much it
+    owes — it cannot hold another row, so calling it short would ask
+    the keeper for something it can never deliver and spin the GPU on
+    it for ever."""
+    short: list[tuple[float, str]] = []
+    try:
+        for road, row in hour_needs().items():
+            if row.get("rows", 0) >= max(1.0, row.get("cap") or 1.0):
+                continue                # full — not short, just full
+            gap = float(row.get("owed") or 0) - float(row.get("held") or 0)
+            if gap > 0:
+                short.append((-gap, road))
+    except Exception:  # noqa: BLE001
+        return []
+    short.sort()
+    return [road for _gap, road in short]
+
+
 def dialogue_flow_state() -> dict[str, Any]:
     """Explain the continuity pipeline without hiding the bottleneck."""
     dj = dj_settings()
@@ -18563,6 +18663,10 @@ def dialogue_flow_state() -> dict[str, Any]:
         # #930: what is genuinely SPOKEN FOR, beside the cache figure
         # above — the pair of them is how the glass tells an hour of
         # prepared segments from an hour of already-aired renders.
+        # #934: what the running order owes each road against what it
+        # is holding, and which roads are bare.
+        "hour_needs": hour_needs(),
+        "hour_short": hour_short_kinds(),
         "prepared_seconds": prepared_seconds(),
         "prepared_hours": round(prepared_seconds() / 3600.0, 2),
         "cached_seconds": pantry_seconds(),
@@ -22837,6 +22941,9 @@ def pantry_table(kind: str = "", most: int = 0) -> dict[str, Any]:
             "held_by": by.get(key, ""),
             "loose": key not in held,
             "media": name,
+            # #935: `t` is what /media checks — see _line_row. This is
+            # the same one-word fault; the table's own player and its
+            # download both answered 401 from the day it shipped.
             "sig": media_sign(name) if name else "",
         })
     out.sort(key=lambda r: -float(r.get("at") or 0))
@@ -22858,6 +22965,157 @@ def pantry_table(kind: str = "", most: int = 0) -> dict[str, Any]:
         # read as an empty pantry.
         "unlabelled": sum(1 for r in out if not r["text"]),
     }
+
+
+def _shelf_find(kind: str, sid: str) -> dict[str, Any] | None:
+    """One shelved candidate by its stable id."""
+    for row in list(_SHELF.get(str(kind)) or []):
+        try:
+            if alt_sid_of(kind, row) == str(sid):
+                return row
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _line_row(i: int, who: str, text: str, voice: str,
+              key: str) -> dict[str, Any]:
+    """One line of a section, with its clip if the clip exists."""
+    clip = (_PANTRY.get(str(key)) or {}).get("clip") or {}
+    name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
+    return {
+        "i": int(i),
+        "who": str(who or ""),
+        "name": booth_actor_name(str(who or ""), ""),
+        "text": str(text or ""),
+        "voice": str(voice or ""),
+        "seconds": round(float(clip.get("seconds") or 0), 1),
+        "key": str(key or ""),
+        "media": name,
+        # #935: `t`, which is what /media checks. #931 emitted `sig` and
+        # every player and every download in the pantry answered 401.
+        "sig": media_sign(name) if name else "",
+        "recorded": bool(name),
+    }
+
+
+async def shelf_transcript(kind: str, sid: str) -> dict[str, Any]:
+    """A prepared section, opened out into its lines in script order."""
+    row = _shelf_find(kind, sid)
+    if row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"nothing on the {kind} shelf with that id")
+    out: dict[str, Any] = {
+        "kind": str(kind), "id": str(sid),
+        "label": SHELF_LABEL.get(str(kind), str(kind)),
+        "at": float(row.get("at") or 0),
+        "age_minutes": round(max(0.0, time.time() - float(row.get("at") or 0))
+                             / 60.0, 1),
+        "seconds": round(float(row.get("seconds") or 0), 1),
+        "product": str(row.get("product") or ""),
+        "lines": [],
+        "derived": False,
+    }
+    entry = row.get("entry") or {}
+    if not entry:
+        # A single-line item — an advert read, a station ID. The row IS
+        # the line.
+        out["lines"] = [_line_row(0, str(row.get("who") or "dj"),
+                                  str(row.get("text") or ""),
+                                  str(row.get("voice") or ""),
+                                  str(row.get("key") or ""))]
+        out["script"] = str(row.get("text") or "")
+        return out
+    out["script"] = str(entry.get("script") or "")
+    out["caller_name"] = str(entry.get("caller_name") or "")
+    out["turns"] = int(entry.get("prep_turns") or 0)
+    takes = list(entry.get("takes") or [])
+    if takes:
+        takes.sort(key=lambda t: int(t.get("i") or 0))
+        out["lines"] = [
+            _line_row(int(t.get("i") or i), str(t.get("who") or ""),
+                      str(t.get("text") or ""), str(t.get("voice") or ""),
+                      str(t.get("key") or ""))
+            for i, t in enumerate(takes)]
+        return out
+    # #935: prepared before the takes were written down. Rederive the
+    # plan exactly as the air road does — same turns, same voices, same
+    # pantry_key — so anything that can be PLAYED can be listed.
+    out["derived"] = True
+    try:
+        turns = banter_turns(str(entry.get("script") or ""),
+                             str(entry.get("caller_name") or ""),
+                             str(entry.get("caller2_name") or ""))
+        plan = _round_chunks(turns, await session_voices(),
+                             str(entry.get("caller_name") or ""))
+        out["lines"] = [
+            _line_row(i, who, text, voice,
+                      pantry_key(text, voice, voice_engine_for(voice)))
+            for i, (text, voice, who) in enumerate(plan)]
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"the script could not be re-read: {exc}"[:160]
+    return out
+
+
+@app.get("/api/shelf/candidate")
+async def shelf_candidate_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#935: ONE PREPARED SECTION, OPENED OUT — ?kind=&id=
+
+    Every line in script order, with who says it, the voice, the length,
+    and a signed media key that both plays it and downloads it."""
+    require_read_auth(authorization)
+    query = request.query_params
+    return await shelf_transcript(str(query.get("kind") or ""),
+                                  str(query.get("id") or ""))
+
+
+# #935: a welded section, remembered against the id that asked for it.
+_BUNDLES: dict[str, dict[str, Any]] = {}
+
+
+@app.get("/api/shelf/bundle")
+async def shelf_bundle_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#935: THE WHOLE SECTION AS ONE FILE — ?kind=&id=
+
+    Welded end to end by the same coalescer the air road uses, so what
+    comes down is what would go out. Built once and remembered: welding
+    twenty clips costs seconds and this button gets pressed twice."""
+    require_read_auth(authorization)
+    query = request.query_params
+    kind = str(query.get("kind") or "")
+    sid = str(query.get("id") or "")
+    got = await shelf_transcript(kind, sid)
+    lines = [ln for ln in (got.get("lines") or []) if ln.get("media")]
+    if not lines:
+        raise HTTPException(
+            status_code=409,
+            detail="nothing in this section has been recorded yet — "
+                   "there is a script but no audio to weld")
+    held = _BUNDLES.get(kind + ":" + sid)
+    if held and held.get("lines") == len(lines):
+        return dict(held)
+    paths = [str(VOICE_MEDIA_DIR / str(ln["media"])) for ln in lines]
+    made = await asyncio.to_thread(_call_concat_blocking, paths, False)
+    if not made:
+        raise HTTPException(status_code=500,
+                            detail="the section could not be welded")
+    clip = _store_media(made, "wav")
+    row = {"kind": kind, "id": sid, "lines": len(lines),
+           "label": got.get("label"),
+           "seconds": round(sum(float(ln.get("seconds") or 0)
+                                for ln in lines), 1),
+           "media": str(clip["path"]).rsplit("/", 1)[-1],
+           "sig": clip["sig"], "bytes": clip["bytes"]}
+    if len(_BUNDLES) > 60:
+        _BUNDLES.clear()
+    _BUNDLES[kind + ":" + sid] = dict(row)
+    return row
 
 
 @app.get("/api/pantry/table")
