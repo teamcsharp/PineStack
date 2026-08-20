@@ -1855,6 +1855,9 @@ function initWorksPopup() {
         };
         it.appendChild(b);
       });
+      /* #939: play the section, keep it, or open its transcript and
+       * take any single line out of it. */
+      try { wkTapeBar(it, kind, c.id); } catch (e) { /* still listed */ }
       drw.appendChild(it);
     });
   }
@@ -2821,6 +2824,8 @@ function worksSchedule(anchorPop) {
       bt("\u2715", "Throw this candidate away (the audio is left alone)",
          () => api.del("/api/schedule/segment/" + encodeURIComponent(c.id)));
       it.appendChild(acts);
+      /* #939: and the same three tape controls the pantry drawers have. */
+      try { wkTapeBar(it, c.kind || slot.kind, c.id); } catch (e) { /* still listed */ }
       drw.appendChild(it);
     });
 
@@ -2939,6 +2944,21 @@ function worksSchedule(anchorPop) {
       row.appendChild(onoff);            // #890: cornered, not in the flow
       row.appendChild(top);
 
+      /* #940: the entry that owns the air is lit, not merely mentioned.
+       * A dot inside a grey sentence is not "I can see which segment is
+       * going on" — this is a bordered, tinted tile with its own
+       * running clock. */
+      if (s.state === "on air") {
+        row.style.borderColor = "#7ce8a9";
+        row.style.background = "rgba(124,232,169,.08)";
+        row.style.boxShadow = "0 0 0 1px rgba(124,232,169,.35),"
+          + "0 0 14px rgba(124,232,169,.16)";
+        const flag = mk("div", "");
+        flag.style.cssText = "font-size:9px;letter-spacing:.08em;"
+          + "color:#7ce8a9;font-weight:700;margin-top:1px";
+        flag.textContent = "● ON AIR NOW";
+        row.appendChild(flag);
+      }
       const p = s.prep || {};
       const line2 = mk("div", "wk-note", "");
       line2.style.cssText = "font-size:9.5px;margin-top:2px;opacity:.75";
@@ -2954,13 +2974,19 @@ function worksSchedule(anchorPop) {
        * nothing behind it. The entry ON AIR gets a second, brighter bar
        * showing how far through its own slot the clock is. */
       const need = Math.max(1, Number(s.minutes || 1) * 60);
+      row.dataset.kind = String(s.kind || "");
       const have = Number(p.seconds || 0);
       const frac = Math.max(0, Math.min(1, have / need));
       const bar = mk("div", "wk-bar");
-      bar.style.marginTop = "4px";
+      /* #940: an empty fill on a dark ground reads as NO BAR. The track
+       * is drawn explicitly so an empty segment looks empty rather than
+       * looking like a segment with no bar. */
+      bar.style.cssText = "margin-top:4px;background:rgba(255,255,255,.13);"
+        + "border:1px solid rgba(255,255,255,.10)";
       const fillb = mk("div", "wk-fill"
         + (frac >= 0.999 ? " good" : frac < 0.15 ? " warn" : ""));
-      fillb.style.width = Math.round(frac * 100) + "%";
+      fillb.style.width = (frac > 0 ? Math.max(2, Math.round(frac * 100))
+                                    : 0) + "%";
       bar.appendChild(fillb);
       row.appendChild(bar);
       const cap = mk("div", "wk-note", "");
@@ -2971,16 +2997,31 @@ function worksSchedule(anchorPop) {
           + "s this entry owns";
       row.appendChild(cap);
       if (s.state === "on air" && hour.now && hour.now.started) {
+        const started = Number(hour.now.started);
         const through = Math.max(0, Math.min(1,
-          (Date.now() / 1000 - Number(hour.now.started)) / need));
+          (Date.now() / 1000 - started) / need));
         const b2 = mk("div", "wk-bar");
-        b2.style.cssText = "margin-top:3px;height:3px";
+        b2.style.cssText = "margin-top:3px;height:4px;"
+          + "background:rgba(124,232,169,.16)";
         const f2 = mk("div", "wk-fill good");
         f2.style.width = Math.round(through * 100) + "%";
         b2.appendChild(f2);
         row.appendChild(b2);
+        /* #940: and the clock in words beside it, so the tile says how
+         * far through its own slot it is without being measured by eye. */
+        const clock = mk("div", "wk-note", "");
+        clock.style.cssText = "font-size:9px;color:#7ce8a9;margin-top:1px";
+        const say = () => {
+          const el = Math.max(0, Date.now() / 1000 - started);
+          clock.textContent = Math.round(Math.min(el, need)) + "s of "
+            + Math.round(need) + "s through this entry \u00b7 "
+            + Math.round(Math.min(1, el / need) * 100) + "%";
+        };
+        say();
+        row.appendChild(clock);
         body.wkAir = f2;              // nudged in place between rebuilds
         body.wkAirNeed = need;
+        body.wkAirClock = say;        // #940: and the words tick too
       }
 
       const gear = mk("button", "", "⚙ this entry, this hour");
@@ -3047,6 +3088,9 @@ function worksSchedule(anchorPop) {
       const through = Math.max(0, Math.min(1,
         (Date.now() / 1000 - Number(hour.now.started)) / need));
       body.wkAir.style.width = Math.round(through * 100) + "%";
+      /* #940: and the words beside it, so the tile's clock runs rather
+       * than jumping whenever the sheet happens to reload. */
+      if (typeof body.wkAirClock === "function") body.wkAirClock();
     } catch (e) { /* the bar is cosmetic */ }
   }
 
@@ -3335,6 +3379,172 @@ function wkPutInto(box, label, text, mono) {
     + "background:#05090f;border:1px solid #24384a"
     + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
   box.appendChild(b);
+}
+
+/* #939: THE TAPE CONTROLS for one prepared section — play the welded
+ * whole, keep it, or open the transcript and take any single line.
+ * Deliberately module-level: the kind drawers live inside The Works and
+ * the hour sheet is its own function, and both want the same three
+ * buttons. Everything is built lazily — a transcript is only fetched
+ * when its tick is opened, and a section is only welded when ▶ or ⬇ is
+ * actually pressed, because welding twenty clips is seconds of work. */
+function wkMediaUrl(row) {
+  if (!row || !row.media || !row.sig) return "";
+  return desktopMusicUrl("/media/" + encodeURIComponent(row.media)
+                         + "?t=" + encodeURIComponent(row.sig));
+}
+
+function wkTapeBar(host, kind, id) {
+  const bar = document.createElement("div");
+  bar.style.cssText = "display:flex;gap:4px;align-items:center;margin-top:3px";
+  const mk2 = (txt, title) => {
+    const b = document.createElement("button");
+    b.textContent = txt;
+    b.title = title;
+    b.style.cssText = "font-size:9px;padding:1px 6px";
+    bar.appendChild(b);
+    return b;
+  };
+  const player = document.createElement("div");
+  player.style.marginTop = "3px";
+
+  let welded = null;
+  const weld = async (btn, then) => {
+    const was = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = "welding\u2026";
+    try {
+      if (!welded) {
+        welded = await api.get("/api/shelf/bundle?kind="
+                               + encodeURIComponent(kind) + "&id="
+                               + encodeURIComponent(id));
+      }
+      btn.textContent = was;
+      btn.disabled = false;
+      then(welded);
+    } catch (e) {
+      btn.textContent = (e && e.message && /409/.test(String(e.message)))
+        ? "not recorded yet" : "could not weld";
+      setTimeout(() => { btn.textContent = was; btn.disabled = false; }, 3000);
+    }
+  };
+
+  mk2("\u25b6", "Play this whole section, welded end to end the way it "
+                 + "would go out").onclick = (ev) => {
+    ev.stopPropagation();
+    weld(ev.target, (got) => {
+      player.textContent = "";
+      const au = document.createElement("audio");
+      au.controls = true;
+      au.autoplay = true;
+      au.src = wkMediaUrl(got);
+      au.style.cssText = "width:100%;height:26px";
+      player.appendChild(au);
+      const note = document.createElement("div");
+      note.className = "wk-note";
+      note.style.cssText = "font-size:9px;opacity:.6";
+      note.textContent = got.lines + " lines \u00b7 "
+        + Math.round(got.seconds) + "s \u00b7 "
+        + Math.round((got.bytes || 0) / 1024) + " KB";
+      player.appendChild(note);
+    });
+  };
+  mk2("\u2b07", "Keep the whole section as one file").onclick = (ev) => {
+    ev.stopPropagation();
+    weld(ev.target, (got) => {
+      try { api.openExternal(wkMediaUrl(got)); } catch (e) {}
+    });
+  };
+
+  const drw = document.createElement("div");
+  drw.style.cssText = "display:none;margin:3px 0 2px 10px";
+  const tri = mk2("\u25b8 transcript",
+                  "Read every line of this section, and take any one of "
+                  + "them on its own");
+  tri.onclick = async (ev) => {
+    ev.stopPropagation();
+    const on = drw.style.display === "none";
+    drw.style.display = on ? "block" : "none";
+    tri.textContent = (on ? "\u25be" : "\u25b8") + " transcript";
+    if (!on || drw.dataset.filled) return;
+    drw.textContent = "reading the tape\u2026";
+    let d = null;
+    try {
+      d = await api.get("/api/shelf/candidate?kind="
+                        + encodeURIComponent(kind) + "&id="
+                        + encodeURIComponent(id));
+    } catch (e) {
+      drw.textContent = "that section could not be read";
+      return;
+    }
+    drw.dataset.filled = "1";
+    drw.textContent = "";
+    const lines = d.lines || [];
+    const head = document.createElement("div");
+    head.className = "wk-note";
+    head.style.cssText = "font-size:9px;opacity:.65;margin-bottom:3px";
+    head.textContent = lines.length + " line(s) \u00b7 "
+      + lines.filter((l) => l.recorded).length + " recorded"
+      + (d.derived ? " \u00b7 read back off the script" : "");
+    head.title = d.derived
+      ? "This round was prepared before the takes were written down, so "
+        + "its lines are rederived exactly as the air road derives them."
+      : "";
+    drw.appendChild(head);
+    lines.forEach((ln) => {
+      const row = document.createElement("div");
+      row.style.cssText = "display:flex;gap:4px;align-items:flex-start;"
+        + "font-size:9.5px;padding:2px 0;border-bottom:"
+        + "1px solid rgba(255,255,255,.05)";
+      const who = document.createElement("span");
+      who.textContent = ln.name || ln.who || "";
+      who.style.cssText = "min-width:46px;color:#9fd8ff;flex:none";
+      row.appendChild(who);
+      const txt = document.createElement("span");
+      txt.textContent = ln.text || "";
+      txt.style.cssText = "flex:1;min-width:0;line-height:1.45;"
+        + "white-space:pre-wrap";
+      row.appendChild(txt);
+      const meta = document.createElement("span");
+      meta.className = "wk-note";
+      meta.style.cssText = "font-size:9px;opacity:.6;flex:none";
+      meta.textContent = ln.recorded ? Math.round(ln.seconds) + "s"
+                                     : "not cut";
+      row.appendChild(meta);
+      if (ln.recorded) {
+        const play = document.createElement("button");
+        play.textContent = "\u25b6";
+        play.title = "Play this line";
+        play.style.cssText = "font-size:8px;padding:0 4px;flex:none";
+        play.onclick = (e2) => {
+          e2.stopPropagation();
+          const old = row.querySelector("audio");
+          if (old) { old.remove(); return; }
+          const au = document.createElement("audio");
+          au.controls = true;
+          au.autoplay = true;
+          au.src = wkMediaUrl(ln);
+          au.style.cssText = "width:100%;height:24px;margin-top:2px";
+          row.appendChild(au);
+        };
+        row.appendChild(play);
+        const keep = document.createElement("button");
+        keep.textContent = "\u2b07";
+        keep.title = "Keep this line";
+        keep.style.cssText = "font-size:8px;padding:0 4px;flex:none";
+        keep.onclick = (e2) => {
+          e2.stopPropagation();
+          try { api.openExternal(wkMediaUrl(ln)); } catch (e3) {}
+        };
+        row.appendChild(keep);
+      }
+      drw.appendChild(row);
+    });
+  };
+
+  host.appendChild(bar);
+  host.appendChild(player);
+  host.appendChild(drw);
 }
 
 /* The Works' own popups are plain divs, not the panel's — give them the
