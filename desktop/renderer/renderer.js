@@ -3394,6 +3394,133 @@ function wkMediaUrl(row) {
                          + "?t=" + encodeURIComponent(row.sig));
 }
 
+/* #943: temperature, speakbox seeding, crystal tinting, chunks used —
+ * and the dial that sends the whole thing back hotter. */
+function wkStatStrip(host, kind, id, d) {
+  const st = (d && d.stats) || {};
+  const box = document.createElement("div");
+  box.style.cssText = "border:1px solid #24384a;border-radius:6px;"
+    + "padding:5px 7px;margin-bottom:5px;background:rgba(255,255,255,.02)";
+  const grid = document.createElement("div");
+  grid.style.cssText = "display:grid;grid-template-columns:86px 1fr;"
+    + "gap:2px 8px;font-size:9.5px;line-height:1.5";
+  const row = (label, value, title) => {
+    const dt = document.createElement("div");
+    dt.textContent = label;
+    dt.style.color = "#6d8199";
+    const dd = document.createElement("div");
+    dd.textContent = value;
+    dd.style.color = "#c8d6e4";
+    if (title) { dt.title = title; dd.title = title; }
+    grid.appendChild(dt);
+    grid.appendChild(dd);
+  };
+
+  const known = Object.keys(st).length > 0;
+  if (!known) {
+    const none = document.createElement("div");
+    none.className = "wk-note";
+    none.style.cssText = "font-size:9.5px;opacity:.6";
+    /* Not "0" for each — four blanks read as "made with nothing" when
+     * the truth is "nobody wrote it down at the time". */
+    none.textContent = "this round was prepared before the working was "
+      + "kept \u2014 its temperature, seed and tinting were not written "
+      + "down at the time";
+    box.appendChild(none);
+  } else {
+    const heat = Number(st.heat || 0);
+    row("temperature",
+        (st.temperature != null ? Number(st.temperature).toFixed(2)
+                                : "\u2014")
+        + (heat > 0.02 ? "  \u00b7  dial " + Math.round(heat * 100) + "%"
+                       : "")
+        + (st.model ? "  \u00b7  " + st.model : ""),
+        "What this round was actually written at. The dial is #941's "
+        + "heat: how hard this road was being pushed when it was "
+        + "written, which rises with how many are already stacked "
+        + "behind it.");
+    row("speakbox",
+        st.seed_file
+          ? (st.seed_file + "  \u00b7  " + (st.seed_lines || 0)
+             + " line(s), " + (st.seed_chars || 0) + " chars"
+             + (st.seed_depth != null
+                ? "  \u00b7  dug " + Math.round(Number(st.seed_depth) * 100)
+                  + "%" : ""))
+          : "no swath was drawn for this one",
+        "Which document seeded it, how much of it came out, and how far "
+        + "into the document the draw started (#895 — the deeper the "
+        + "queue, the further in and the more obscure).");
+    row("crystal",
+        st.crystal ? (st.crystal + "  \u00b7  strength "
+                      + (st.crystal_strength || 0) + "%"
+                      + (st.crystal_mind ? "  \u00b7  " + st.crystal_mind
+                                         : ""))
+                   : "untinted \u2014 drawn from the studio library",
+        "Whether a crystal was tinting the universe when this was "
+        + "written, and which of its minds the material came from.");
+    row("chunks",
+        (st.chunks != null ? st.chunks : "\u2014") + " cut"
+        + (st.made != null ? "  \u00b7  " + st.made + " recorded" : "")
+        + (st.turns ? "  \u00b7  " + st.turns + " turns" : "")
+        + (st.seconds ? "  \u00b7  " + Math.round(st.seconds) + "s" : ""),
+        "How many separate takes the round was cut into, how many of "
+        + "them have audio, and how long it runs.");
+    if (st.regenerated_from) {
+      row("came from", String(st.regenerated_from),
+          "This one was written as a hotter version of another.");
+    }
+    if (st.operator_note) {
+      row("your note", String(st.operator_note), "");
+    }
+    box.appendChild(grid);
+  }
+
+  /* The dial. */
+  const dial = document.createElement("div");
+  dial.style.cssText = "display:flex;gap:5px;align-items:center;"
+    + "margin-top:5px;font-size:9px";
+  const lab = document.createElement("span");
+  lab.style.color = "#6d8199";
+  lab.textContent = "insanity";
+  dial.appendChild(lab);
+  const rng = document.createElement("input");
+  rng.type = "range";
+  rng.min = "0";
+  rng.max = "100";
+  rng.value = "70";
+  rng.style.cssText = "flex:1;min-width:70px;max-width:150px";
+  dial.appendChild(rng);
+  const val = document.createElement("span");
+  val.style.cssText = "min-width:74px;color:#9fd8ff";
+  const bands = (v) => (v < 34 ? "as written" : v < 55 ? "stranger"
+                        : v < 78 ? "peculiar" : "unhinged");
+  val.textContent = bands(70);
+  rng.oninput = () => { val.textContent = bands(Number(rng.value)); };
+  dial.appendChild(val);
+  const go = document.createElement("button");
+  go.textContent = "\ud83d\udd01 send it back";
+  go.title = "Write another of this section down the same road, at this "
+    + "dial, and stack it above the one it came from. The original is "
+    + "left alone \u2014 bin it yourself once you have heard both.";
+  go.style.cssText = "font-size:9px;padding:1px 6px";
+  go.onclick = async (ev) => {
+    ev.stopPropagation();
+    go.disabled = true;
+    const was = go.textContent;
+    go.textContent = "\u2026";
+    try {
+      await api.post("/api/shelf/regenerate",
+                     {kind: kind, id: id,
+                      insanity: Number(rng.value) / 100, promote: true});
+      go.textContent = "the desk is on it";
+    } catch (e) { go.textContent = "the desk refused that"; }
+    setTimeout(() => { go.textContent = was; go.disabled = false; }, 5000);
+  };
+  dial.appendChild(go);
+  box.appendChild(dial);
+  host.appendChild(box);
+}
+
 function wkTapeBar(host, kind, id) {
   const bar = document.createElement("div");
   bar.style.cssText = "display:flex;gap:4px;align-items:center;margin-top:3px";
@@ -3479,6 +3606,9 @@ function wkTapeBar(host, kind, id) {
     }
     drw.dataset.filled = "1";
     drw.textContent = "";
+    /* #943 (#941): the four figures, above the dialogue, in the order
+     * they were asked for. */
+    try { wkStatStrip(drw, kind, id, d); } catch (e) { /* the lines still show */ }
     const lines = d.lines || [];
     const head = document.createElement("div");
     head.className = "wk-note";
