@@ -9110,6 +9110,11 @@ def _row_clip_keys(row: Any, depth: int = 0) -> list[str]:
             got = row.get("key")
             if isinstance(got, str) and got in _PANTRY:
                 found.append(got)
+            # #932: and a round's list of them, which is a list of
+            # plain strings rather than of rows carrying a "key".
+            for got in (row.get("keys") or [])[:64]:
+                if isinstance(got, str) and got in _PANTRY:
+                    found.append(got)
             for val in row.values():
                 if isinstance(val, (dict, list)):
                     found.extend(_row_clip_keys(val, depth + 1))
@@ -10145,8 +10150,17 @@ def pantry_burn() -> int:
         over = pantry_seconds() - want
         if want > 0 and over > want * 0.15:
             held = pantry_spoken_for()
+            # #932: and nothing made in the last twenty minutes, whether
+            # anything admits to holding it or not. Every round already
+            # on the shelf when this shipped has no key list — they were
+            # never written down — so they read as loose until each is
+            # prepared again. A clip worth rolling off the horizon is
+            # old by definition, so this costs nothing and closes the
+            # window where a fresh round could lose its audio.
+            _young = time.time() - 1200.0
             loose = [(float(r.get("at") or 0), k)
-                     for k, r in list(_PANTRY.items()) if k not in held]
+                     for k, r in list(_PANTRY.items())
+                     if k not in held and float(r.get("at") or 0) < _young]
             loose.sort()                        # oldest render first
             rolled = 0
             for _at, key in loose:
@@ -17299,6 +17313,18 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
                 break
             pantry_put(key, clip, text=text, voice=voice, who=who,
                        kind=str(entry.get("prep_kind") or "banter"))
+            # #932: WRITE THE KEY DOWN. The airing road re-derives it
+            # from the text and never needed this, which is why it was
+            # never kept — but that makes a round's audio invisible to
+            # everything else on the box, and something that cannot be
+            # seen to be spoken for gets treated as spare. See the note
+            # at the top of this change.
+            try:
+                _held = entry.setdefault("keys", [])
+                if key not in _held:
+                    _held.append(key)
+            except Exception:  # noqa: BLE001
+                pass
             made += 1
             entry["made"] = made
             entry["seconds"] = round(
