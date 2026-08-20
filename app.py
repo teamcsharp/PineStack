@@ -8686,6 +8686,23 @@ _TAKES: list[dict[str, Any]] = []
 TAKES_MAX = 400
 
 
+def _take_media_name(clip: dict[str, Any] | None) -> str:
+    """#964: the servable file name off a clip, or nothing."""
+    try:
+        return str((clip or {}).get("path") or "").rsplit(
+            "/", 1)[-1].split("?")[0]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _take_media_sig(clip: dict[str, Any] | None) -> str:
+    try:
+        name = _take_media_name(clip)
+        return media_sign(name) if name else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def take_note(who: str, voice: str, engine: str, text: str,
               clip: dict[str, Any] | None, ms: int, how: str) -> None:
     """One line recorded, or one served off the shelf. `how` is
@@ -8706,6 +8723,14 @@ def take_note(who: str, voice: str, engine: str, text: str,
             # says whether the room is keeping up
             "cost": round((ms / 1000.0) / secs, 2) if (secs and ms) else None,
             "how": how,
+            # #964: WHERE THE AUDIO IS. The ledger recorded that a line
+            # had been cut and what it cost and then threw away the only
+            # thing that would let anybody hear it again, so the
+            # recording room could describe its own work in numbers and
+            # never play a second of it. The clip is already in hand
+            # here; its signed name is two cheap string operations.
+            "media": _take_media_name(clip),
+            "sig": _take_media_sig(clip),
         })
         del _TAKES[:-TAKES_MAX]
         # #872: and into the task-cost ledger. The recording room already
@@ -9287,6 +9312,14 @@ def box_rate_now(rate: float) -> float:
 # own pantry_key. No second cache: a shelf row is a note saying "this
 # text, in this voice, is already made". A miss anywhere at all simply
 # renders live, exactly as the station always did.
+# #960: how long a round that is DEMONSTRABLY still speaking may run
+# before the reaper takes it anyway. The plain ceiling is five minutes;
+# this one applies only when the booth is mid-word, the engine rendered
+# within the last two minutes, or a line went out in the last twenty-five
+# seconds. A four-minute call plus its ring and its hang-up needs the
+# room, and losing the last ten seconds of a call is losing the whole
+# point of it.
+SEGMENT_LIVELY_CEILING = 720.0
 PANTRY_BURN_SECONDS = float(os.getenv("PANTRY_BURN_SECONDS", "86400"))
 _SHELF: dict[str, list[dict[str, Any]]] = {}
 # How many of each to hold. The real governor is prepare_hours (TIME on
@@ -9304,6 +9337,13 @@ SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 4, "caller": 4,
               # when the running order is about to want it and never
               # builds a backlog of yesterday's page.
               "news": 1}
+# #957: how far past the row cap a road may stock when the running
+# order genuinely owes it that much airtime. The cap stops one content
+# type eating the allowance; this says the cap is a CEILING, not the
+# definition of "enough". The real governors are untouched underneath -
+# pantry_seconds() against prepare_target_seconds(), and the six-gigabyte
+# allowance below that.
+SHELF_ROW_CEILING = 3
 SHELF_LABEL = {"ad": "an advert", "station_id": "a station ID",
                "manager": "a message from upstairs",
                "caller": "a phone call",
@@ -9374,6 +9414,26 @@ def shelf_full(kind: str) -> bool:
                 return True             # deep enough; never a backlog
             return sum(float(r.get("seconds") or 0)
                        for r in _news_rows) >= _want
+        # #957: THE SAME MEASURE #921 GAVE THE NEWS, GIVEN TO THE WHOLE
+        # BOARD. Everything below this line used to be a ROW COUNT, and a
+        # row says nothing about how much of the hour it covers. The
+        # canonical hour carries THREE "Painting selling" entries of three
+        # minutes each - nine minutes of gallery - and four short rows on
+        # the gallery shelf read as FULL against every one of them. That
+        # is precisely the segment the operator watched go out with
+        # "nothing stacked for this entry yet" on it.
+        #
+        # Full means the shelf covers the SECONDS the running order owes
+        # this road, measured by hour_needs() - the very figure the hour
+        # tiles draw their bars against. The row cap survives as a hard
+        # ceiling so one road still cannot eat the whole allowance, but it
+        # is no longer the thing that decides "enough".
+        _need = (hour_needs_now() or {}).get(str(kind)) or {}
+        _owed = float(_need.get("owed") or 0)
+        if _owed > 0:
+            if len(shelf_rows(kind)) >= shelf_cap(kind) * SHELF_ROW_CEILING:
+                return True             # deep enough; never a hoard
+            return float(_need.get("held") or 0) >= _owed
     except Exception:  # noqa: BLE001
         return True
     return len(shelf_rows(kind)) >= shelf_cap(kind)
@@ -10058,6 +10118,77 @@ _PREP_LOG_AT = [0.0]
 _PREP_LOG_KEY = [""]
 
 
+# #957: how far ahead the deadline planner looks. Long enough that a
+# dear road (the gallery measures about 150s) can be written and voiced
+# before its entry arrives, short enough that it does not simply become
+# a second running order.
+PREP_DEADLINE_WINDOW = 900.0
+# ...and the least window worth starting a deadline task in. Below this
+# the pass would write nothing before the record ends, so it waits for a
+# window it can actually make a line in.
+PREP_DEADLINE_FLOOR = 20.0
+
+
+def prep_deadline_pick(rows: list[dict[str, Any]],
+                       room: float, cover: float) -> dict[str, Any]:
+    """#957: the coming entry that will take the air short, and the road
+    that would cover it.
+
+    `rows` are prep_plan's live candidates - already filtered for shelves
+    that are full and roads tried this pass, so anything named here is
+    genuinely buildable. The entries come back in deadline order, so the
+    first one that can be covered wins: the nearest hole gets filled
+    first, which is the whole of what a coordinator is for.
+
+    THE WINDOW IS NOT A CEILING HERE, and that is the whole point.
+    prep_budget() ends in `min(room, ...)`, so the budget can never
+    exceed the seconds left on the record that is playing - about 155s
+    on a three-minute track. The gallery road measures 256s and the call
+    road 215s on this box, so BOTH are permanently ineligible, and
+    measurably were: the board reported caller/gallery/manager/ad all
+    `fits: false` while it built station IDs, and the operator watched
+    "Painting selling" take the air with nothing behind it.
+    
+    A round is not lost when its window closes. prep_render_line keeps
+    every line it finished, the shelf row survives, and the keeper's
+    second pass comes back and finishes it - which is precisely what
+    #904 built that road for. So a deadline pick is measured against the
+    RESERVE instead: the station must have enough finished audio banked
+    to stay on the air while the work is done, and there must be a real
+    window open to start in. Those two are the safety; the budget is an
+    efficiency rule, and efficiency does not get to overrule the clock."""
+    try:
+        by_road = {str(r.get("kind")): r for r in (rows or [])}
+        if not by_road:
+            return {}
+        for ent in coord_upcoming(PREP_DEADLINE_WINDOW):
+            if ent.get("cannot") or ent.get("covered"):
+                continue
+            row = by_road.get(str(ent.get("road") or ""))
+            if not row:
+                continue                # its shelf is full, or already tried
+            cost = float(row.get("cost") or 0)
+            if float(room) < PREP_DEADLINE_FLOOR:
+                continue                # not enough window to start anything
+            if cost > max(0.0, float(cover)):
+                continue                # the reserve would run dry first
+            short = float(ent.get("short_seconds") or 0)
+            starts = float(ent.get("starts_in") or 0)
+            return {
+                "kind": row["kind"],
+                "entry": dict(ent),
+                "why": (f"{ent.get('label') or row['label']} takes the air "
+                        f"in {int(starts)}s and is {int(short)}s short of "
+                        f"the {int(float(ent.get('owns_seconds') or 0))}s "
+                        f"it owns - {row['label']} at about "
+                        f"{int(cost)}s covers it, and a deadline outranks "
+                        f"the ledger (#957)"),
+            }
+    except Exception:  # noqa: BLE001
+        return {}
+    return {}
+
+
 def prep_plan(skip: Any = None) -> dict[str, Any]:
     """WHAT to prepare next and WHY - the whole decision, in one place,
     written down so the operator can read the reasoning.
@@ -10078,6 +10209,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         "at": time.time(), "kind": "", "why": "", "tier": "bare",
         "room": 0.0, "cover": 0.0, "budget": 0.0, "thin": 0.0,
         "deep": 0.0, "forced": False, "critical": False,
+        "deadline": {},                 # #957: the entry that forced it
         "candidates": []}
     try:
         room = prep_room_left()
@@ -10117,6 +10249,32 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             out["why"] = ("every road on the board has already been tried "
                           "this pass" if skip
                           else "every shelf on the board is full")
+            return out
+        # #957: THE DEADLINE OVERRIDES THE LEDGER.
+        #
+        # Every branch below this point ranks the board by what it COSTS
+        # and what it BUYS, and the running order only ever got a look in
+        # as a tie-break in the two richest tiers. So the one moment the
+        # sheet most needed to be obeyed - a thin reserve, an entry three
+        # minutes out with nothing stacked for it - was the exact moment
+        # the sheet was thrown away. The gallery road made this plainest:
+        # it measures the dearest on the board, so a "bare" budget of
+        # cheap * 1.6 could never reach it, and "Painting selling" took
+        # the air with nothing prepared however loudly the coordinator
+        # said it was coming.
+        #
+        # An entry that is about to take the air short is worth more than
+        # any rate on the board, so it is picked FIRST and measured
+        # against the WINDOW rather than the tier's budget - the budget
+        # exists to stop long work crowding out short work, and it has no
+        # business refusing the one piece of work the clock has already
+        # ordered. Nothing else about the ledger changes: if it will not
+        # fit the window it is not taken, and the ordinary reasoning
+        # below runs exactly as it did.
+        due = prep_deadline_pick(rows, room, cover)
+        if due:
+            out.update({"kind": due["kind"], "forced": True,
+                        "why": due["why"], "deadline": due["entry"]})
             return out
         fits = [r for r in rows if r["fits"]]
         if not fits:
@@ -16210,7 +16368,24 @@ async def _dj_loop() -> None:
                     lively = (_SPEAKING[0] > 0
                               or time.time() - _LAST_SYNTH[0] < 120
                               or time.time() - _SPOKE_AT[0] < 25)
-                    if age > 300 or (over > 45 and not lively):
+                    # #960: THE FIVE MINUTES IS NOT UNCONDITIONAL ANY
+                    # MORE. `age > 300` is an outright task kill, and a
+                    # phone call is the one round in the station that
+                    # regularly runs past it — it is written long, it airs
+                    # as one coalesced stream, and its hang-up is spliced
+                    # into the LAST burst. Cancelling it there takes the
+                    # audio off mid-word and throws the ending away, which
+                    # is the "audio cut out and the call didn't conclude
+                    # properly" report exactly.
+                    #
+                    # A round that is audibly still working is not a wedge
+                    # at any age. The ceiling now applies to a round with
+                    # no signs of life, and a lively one is given a second
+                    # ceiling — generous, but still a ceiling, because a
+                    # round spanning three records really has stopped
+                    # being a round.
+                    if age > (SEGMENT_LIVELY_CEILING if lively else 300) \
+                            or (over > 45 and not lively):
                         _SEGMENT_TASK[0].cancel()
                         pipeline_log("air", "the last record's talk was still "
                                             "going and its record is over — "
@@ -17456,6 +17631,60 @@ def _round_chunks(turns: list[tuple[str, str]],
                                             seed=f"{who}{len(out)}"),
                         voice, who))
     return [row for row in out if row[0] and row[1]]
+
+
+def round_line_plan(turns: list[tuple[str, str]],
+                    caller_name: str = "") -> list[dict[str, Any]]:
+    """#959: every turn of a round, INCLUDING the caller's.
+
+    _round_chunks above answers "what will the engine be asked to make",
+    and for a call the honest answer leaves the caller out — their phone
+    line is drawn live, once, inside speak_turns. That answer was then
+    used as the record of what the round CONTAINS, and the two are not
+    the same question. `takes`, `chunks`, `made`, `seconds` and the
+    panel's transcript all came off the first one, so a banked phone call
+    listed only the hosts: "this phone call doesn't show the person who
+    called speaking at all", and the conversation read as two hosts
+    talking about somebody who was never there.
+
+    This is the other answer — the whole cast of the round in order, each
+    row saying whether its audio is prepared or made live — and it is
+    what the transcript reads from."""
+    out: list[dict[str, Any]] = []
+    try:
+        cap = say_max_chars()
+        seen = 0                        # chunks the prepared plan will hold
+        for at, (marker, said) in enumerate(
+                _prep_intro_pad(list(turns or []), caller_name)):
+            who = ("caller" if marker == "C" else "caller2" if marker == "E"
+                   else "dj" if marker == "A"
+                   else "third" if marker == "D" else "cohost")
+            text = spoken_text(said)
+            if not text:
+                continue
+            live = who in ("caller", "caller2")
+            # How many pantry lines this turn becomes, so the panel can
+            # line a turn up against the takes that were made for it.
+            # _round_chunks drops the live rows, so only prepared turns
+            # advance the offset — the same arithmetic, from the same
+            # three functions, so the two lists cannot drift apart.
+            n = len(sentence_chunks(text, cap=cap,
+                                    most=say_chunks_for(text, cap)))
+            out.append({
+                "at": at, "marker": marker, "who": who, "text": text,
+                # The caller's turns are real turns that are voiced at the
+                # moment the call airs, not missing ones.
+                "live": live,
+                "name": (caller_name if who == "caller" else ""),
+                "chunks": (0 if live else n),
+                "line_from": (-1 if live else seen),
+                "line_to": (-1 if live else seen + n),
+            })
+            if not live:
+                seen += n
+    except Exception:  # noqa: BLE001
+        return out
+    return out
 
 
 async def larder_prepare(entry: dict[str, Any]) -> bool:
@@ -18837,7 +19066,15 @@ async def pantry_keeper() -> None:
                 # below; everything else still stops at the target.
                 _call_owed = bool(_calls_short and "caller" not in _skipped
                                   and not shelf_full("caller"))
-                if pantry_seconds() >= target and not _call_owed:
+                # #957: ...and so does an entry that is about to take
+                # the air short. The depth ceiling is a bucket question -
+                # "is there an hour of audio somewhere" - and an hour of
+                # already-aired banter answers it while the Painting
+                # selling entry three minutes out still has nothing
+                # behind it. Same reasoning as the outer stand-down
+                # above, which #934 already taught this lesson to.
+                if (pantry_seconds() >= target and not _call_owed
+                        and not _hour_short):
                     break
                 try:
                     _plan = prep_plan(_skipped)
@@ -18853,7 +19090,20 @@ async def pantry_keeper() -> None:
                 # (task_stat p90, the seed until three have been run).
                 # A call that will not fit this window is still refused,
                 # which is #872's rule three exactly.
-                if _call_owed:
+                # #957: ...and it yields to a NEARER deadline. This
+                # override rewrites whatever prep_plan chose, which is
+                # right when the choice was made on rate; it is wrong
+                # when the choice was made because a different entry is
+                # about to take the air short. Topping up the call shelf
+                # is a promise about the hour; an entry five minutes out
+                # with nothing behind it is a promise about the next five
+                # minutes, and the nearer promise is kept first.
+                _due_now = _plan.get("deadline") or {}
+                _due_soon = bool(
+                    _plan.get("forced") and _due_now
+                    and str(_due_now.get("road") or "") != "caller"
+                    and float(_due_now.get("starts_in") or 1e9) <= 300.0)
+                if _call_owed and not _due_soon:
                     try:
                         _cost = float(task_stat("caller").get("p90")
                                       or task_cost("caller") or 0.0)
@@ -18894,8 +19144,16 @@ async def pantry_keeper() -> None:
                 # stood down at its next line boundary if it runs past
                 # what the plan said it could have, and every line it did
                 # finish stays on the shelf.
-                _PREP_DEADLINE[0] = time.time() + max(
-                    10.0, float(_plan.get("budget") or 0) * 1.5)
+                # #957: a deadline pick is deliberately allowed to cost
+                # MORE than the tier's budget, so timing it against the
+                # budget would stand it down halfway through the very
+                # round the clock asked for. It is timed against what the
+                # task actually measures, and still never past the window.
+                _allow = float(_plan.get("budget") or 0)
+                if _plan.get("deadline"):
+                    _allow = max(_allow, float(task_cost(_kind) or 0),
+                                 float(_plan.get("room") or 0))
+                _PREP_DEADLINE[0] = time.time() + max(10.0, _allow * 1.5)
                 try:
                     _did = await prep_measure(_kind, prep_one(_kind))
                 finally:
@@ -19372,7 +19630,18 @@ def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
         started = float(pos.get("started") or time.time())
         if not 0 <= idx < len(slots):
             idx, started = 0, time.time()
-        needs = hour_needs() or {}
+        needs = hour_needs_now() or {}
+        # #957: ONE SHELF, MANY ENTRIES. The seconds a road is holding
+        # are not held for each of its entries separately — the canonical
+        # hour has three Painting selling entries and one gallery shelf
+        # between them. Reporting the same `held` against every entry is
+        # what let the second and third read as covered while nothing at
+        # all had been made for them. The stock is SPENT as the walk goes
+        # forward, so the first entry is covered, the second is short by
+        # what is left, and the third is bare — which is what actually
+        # happens on air.
+        left = {k: float((v or {}).get("held") or 0)
+                for k, v in needs.items()}
         # The entry on air still has time left on it; everything after
         # begins when the one before it ends.
         owns = max(0.25, float(slots[idx].get("minutes") or 3)) * 60.0
@@ -19386,7 +19655,9 @@ def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
             mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
             road = str(SCHED_PREP_KIND.get(kind) or kind)
             cannot = CANNOT_PREPARE.get(kind) or ""
-            held = float((needs.get(road) or {}).get("held") or 0)
+            held = max(0.0, float(left.get(road, 0.0)))
+            left[road] = held - mins        # this entry eats its share
+            held = min(held, mins)          # ...and only its share counts
             rows_held = int((needs.get(road) or {}).get("rows") or 0)
             out.append({
                 "index": idx,
@@ -19398,12 +19669,228 @@ def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
                 "held_seconds": round(held, 1),
                 "rows": rows_held,
                 "bare": (not cannot) and rows_held <= 0,
+                # #957: "bare" asked only whether the shelf was EMPTY, and
+                # an entry that owns three minutes with forty seconds
+                # standing by is not bare - it is short, and it will still
+                # go quiet two thirds of the way through. This is the
+                # figure the deadline planner works in.
+                "short_seconds": (0.0 if cannot
+                                  else round(max(0.0, mins - held), 1)),
+                # A second either way is not a hole; rounding one into a
+                # deadline would have the planner chase entries that are
+                # already full.
+                "covered": bool(cannot) or held >= mins - 1.0,
                 "cannot": cannot,
             })
             at += mins
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def coord_road_report(road: str) -> dict[str, Any]:
+    """#958: "anytime they're behind, if I click on that, I want to see a
+    pop up explaining what is being done."
+
+    Everything the station already knows about ONE road, gathered in
+    deadline order and turned into sentences. Nothing here is new
+    measurement - the coordinator's plan, the preparer's own candidate
+    table, the hour's needs, the shelf, the quota ring and the lookahead
+    log all existed; they were simply scattered across five endpoints,
+    and none of them answered the only question worth asking, which is
+    "and what is being DONE about it".
+
+    `doing` is that answer, in the order a person would want it: what is
+    happening this second, what is queued next, what is refusing it, and
+    when the hole actually lands."""
+    road = str(road or "")
+    label = PREP_BOARD_LABEL.get(road) or TASK_LABEL.get(road) or road
+    out: dict[str, Any] = {
+        "road": road, "label": label, "doing": [], "entries": [],
+        "log": [], "at": time.time()}
+    try:
+        needs = (hour_needs_now() or {}).get(road) or {}
+        owed = float(needs.get("owed") or 0)
+        held = float(needs.get("held") or 0)
+        out["owes"] = {
+            "owed_seconds": round(owed, 1), "held_seconds": round(held, 1),
+            "short_seconds": round(max(0.0, owed - held), 1),
+            "rows": int(needs.get("rows") or 0),
+            "cap": int(needs.get("cap") or 0),
+        }
+        rows = list(_SHELF.get(road) or [])
+        out["shelf"] = {
+            "rows": len(rows), "cap": shelf_cap(road),
+            "ceiling": shelf_cap(road) * SHELF_ROW_CEILING,
+            "seconds": round(sum(float(r.get("seconds") or 0)
+                                 for r in rows), 1),
+            "full": bool(shelf_full(road)),
+        }
+        out["quota"] = (quota_state() or {}).get(road) or {}
+        out["bare_arrivals"] = int(_BARE_ARRIVALS.get(road) or 0)
+        out["cannot"] = CANNOT_PREPARE.get(road) or ""
+        out["cost_seconds"] = round(float(task_cost(road) or 0), 1)
+        # The coming entries this road has to fill.
+        for ent in coord_upcoming():
+            if str(ent.get("road") or "") == road:
+                out["entries"].append(ent)
+        out["entries"] = out["entries"][:6]
+        # What the preparer last decided, and how this road placed in it.
+        plan = dict(_PREP_LAST or {})
+        cand: dict[str, Any] = {}
+        for row in (plan.get("candidates") or []):
+            if str(row.get("kind") or "") == road:
+                cand = dict(row)
+                break
+        out["plan"] = {
+            "kind": str(plan.get("kind") or ""),
+            "why": str(plan.get("why") or ""),
+            "tier": str(plan.get("tier") or ""),
+            "budget": round(float(plan.get("budget") or 0), 1),
+            "room": round(float(plan.get("room") or 0), 1),
+            "cover": round(float(plan.get("cover") or 0), 1),
+            "forced": bool(plan.get("forced")),
+            "deadline": dict(plan.get("deadline") or {}),
+            "candidate": cand,
+        }
+        now = prep_now() or {}
+        out["preparing"] = (dict(now)
+                            if str(now.get("kind") or "") == road else {})
+        # The coordinator's own ranked task row, if it has one.
+        for task in ((_COORD_PLAN or {}).get("tasks") or []):
+            if str(task.get("road") or "") == road:
+                out["task"] = dict(task)
+                break
+        # The lookahead commentary that actually names this road.
+        words = [w for w in (road, label, SHELF_LABEL.get(road, ""),
+                             TASK_LABEL.get(road, "")) if w]
+        for ent in list(_RADIO.get("pipeline") or [])[::-1]:
+            text = str(ent.get("text") or "")
+            low = text.lower()
+            if any(w.lower() in low for w in words):
+                out["log"].append({"ts": ent.get("ts"),
+                                   "kind": ent.get("kind"), "text": text})
+            if len(out["log"]) >= 8:
+                break
+        out["doing"] = _coord_road_doing(out)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _coord_road_doing(rep: dict[str, Any]) -> list[dict[str, str]]:
+    """The report, said out loud. One row per thing genuinely happening,
+    each tagged so the panel can colour it: `now`, `next`, `blocked`,
+    `clear`, `due`."""
+    say: list[dict[str, str]] = []
+    road = str(rep.get("road") or "")
+    label = str(rep.get("label") or road)
+    owes = rep.get("owes") or {}
+    shelf = rep.get("shelf") or {}
+    plan = rep.get("plan") or {}
+    cand = plan.get("candidate") or {}
+    try:
+        if rep.get("cannot"):
+            say.append({"tag": "clear",
+                        "text": "This one is never prepared ahead: "
+                                + str(rep["cannot"]) + "."})
+        prep = rep.get("preparing") or {}
+        if prep:
+            stage = str(prep.get("stage") or "")
+            lines = int(prep.get("lines") or 0)
+            made = int(prep.get("made") or 0)
+            if stage == "recording":
+                say.append({"tag": "now", "text": (
+                    "It is in the recording room this second - "
+                    + str(prep.get("name") or prep.get("who") or "an actor")
+                    + " at the microphone, line " + str(min(lines, made + 1))
+                    + " of " + str(lines) + ".")})
+            else:
+                say.append({"tag": "now", "text": (
+                    "It is at the writing desk this second - the model is "
+                    "writing a round of it now.")})
+        elif str(plan.get("kind") or "") == road:
+            say.append({"tag": "next",
+                        "text": "It is what the preparer builds next: "
+                                + str(plan.get("why") or "it is the pick")
+                                + "."})
+        # Why it is NOT being built, if it is not.
+        if not prep and str(plan.get("kind") or "") != road:
+            if shelf.get("full"):
+                say.append({"tag": "clear", "text": (
+                    "Nothing is being built for it because it is already "
+                    "covered - " + str(int(float(shelf.get("seconds") or 0)))
+                    + "s standing by against the "
+                    + str(int(float(owes.get("owed_seconds") or 0)))
+                    + "s the running order owes it.")})
+            elif cand and not cand.get("fits"):
+                say.append({"tag": "blocked", "text": (
+                    "The preparer can see it and will not start it yet: it "
+                    "measures about " + str(int(float(cand.get("cost") or 0)))
+                    + "s on this box and the window open right now allows "
+                    + str(int(float(plan.get("budget") or 0)))
+                    + "s. It goes as soon as a longer record or an ad break "
+                    "gives it the room.")})
+            elif cand:
+                say.append({"tag": "next", "text": (
+                    "It is on the board and eligible - about "
+                    + str(int(float(cand.get("cost") or 0)))
+                    + "s of room buys "
+                    + str(int(float(cand.get("airtime") or 0)))
+                    + "s of air. The preparer is on "
+                    + str(plan.get("kind") or "another road")
+                    + " first: " + str(plan.get("why") or "") + ".")})
+            else:
+                say.append({"tag": "blocked", "text": (
+                    "It was not on the board this pass - either its shelf "
+                    "is full or it was already tried and stood down.")})
+        # The hole itself, with a clock on it.
+        ents = rep.get("entries") or []
+        nxt = None
+        for ent in ents:
+            if not ent.get("covered"):
+                nxt = ent
+                break
+        if nxt:
+            say.append({"tag": "due", "text": (
+                str(nxt.get("label") or label) + " takes the air in "
+                + str(int(float(nxt.get("starts_in") or 0))) + "s and is "
+                + str(int(float(nxt.get("short_seconds") or 0)))
+                + "s short of the "
+                + str(int(float(nxt.get("owns_seconds") or 0)))
+                + "s it owns. That is the hole being worked towards.")})
+        elif ents:
+            say.append({"tag": "clear", "text": (
+                "Every " + label + " entry inside the lookahead has enough "
+                "standing by to fill it.")})
+        misses = int(rep.get("bare_arrivals") or 0)
+        if misses:
+            say.append({"tag": "due", "text": (
+                "It has arrived with nothing prepared " + str(misses)
+                + " time(s) this session, so the coordinator asks for more "
+                "of it than it strictly owes.")})
+        quota = rep.get("quota") or {}
+        if quota.get("target"):
+            say.append({"tag": ("due" if quota.get("behind") else "clear"),
+                        "text": (
+                str(quota.get("aired") or 0) + " of "
+                + str(quota.get("target") or 0) + " have aired this hour"
+                + (" - behind the pace, so the preparer is told to put one "
+                   "on the shelf ahead of anything chosen on rate."
+                   if quota.get("behind") else " - on pace.")
+                + (" One is due now." if quota.get("due") else ""))})
+        try:
+            waiting = len(_RENDER_BACKLOG)
+        except Exception:  # noqa: BLE001
+            waiting = 0
+        if waiting:
+            say.append({"tag": "blocked", "text": (
+                str(waiting) + " line(s) across the whole station are "
+                "waiting on the voice engine - everything written is "
+                "queued behind that.")})
+    except Exception:  # noqa: BLE001
+        pass
+    return say
 
 
 # #922: how long a prepared item may sit unheard before it is retired
@@ -19881,6 +20368,29 @@ def hour_needs() -> dict[str, dict[str, float]]:
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+_HOUR_NEEDS_CACHE: dict[str, Any] = {"at": 0.0, "rows": {}}
+HOUR_NEEDS_TTL = 5.0
+
+
+def hour_needs_now() -> dict[str, dict[str, float]]:
+    """#957: hour_needs(), cached for five seconds.
+
+    shelf_full() is asked this question once per road per planning pass,
+    several times a minute, and hour_needs() re-reads the schedule store
+    and walks every slot to answer it. Five seconds is far finer than
+    anything on the sheet moves and it keeps the hot path cheap."""
+    try:
+        now = time.time()
+        if now - float(_HOUR_NEEDS_CACHE.get("at") or 0) <= HOUR_NEEDS_TTL:
+            return dict(_HOUR_NEEDS_CACHE.get("rows") or {})
+        rows = hour_needs()
+        _HOUR_NEEDS_CACHE["at"] = now
+        _HOUR_NEEDS_CACHE["rows"] = rows
+        return rows
+    except Exception:  # noqa: BLE001
+        return dict(_HOUR_NEEDS_CACHE.get("rows") or {})
 
 
 def hour_short_kinds() -> list[str]:
@@ -26127,6 +26637,24 @@ async def shelf_transcript(kind: str, sid: str) -> dict[str, Any]:
     # temperature, speakbox seeding, crystal tinting, chunks used — plus
     # what they were derived from, so the number can be argued with.
     out["stats"] = dict(entry.get("stats") or {})
+    # #959: THE WHOLE CAST OF THE ROUND, IN SCRIPT ORDER. `lines` below is
+    # the list of PANTRY TAKES, and a caller has none by design — their
+    # phone line is drawn once, live, inside speak_turns. Listing the
+    # takes and calling it the transcript is why a banked "Phone call"
+    # opened in the panel showed only Host and Skip: "this phone call
+    # doesn't show the person who called speaking at all". This says who
+    # actually speaks and in what order, with each row pointing at the
+    # takes made for it, so the panel can show a call as a call.
+    try:
+        _cast_turns = banter_turns(str(entry.get("script") or ""),
+                                   str(entry.get("caller_name") or ""),
+                                   str(entry.get("caller2_name") or ""))
+        out["cast"] = round_line_plan(
+            _cast_turns, str(entry.get("caller_name") or ""))
+        out["caller_turns"] = sum(1 for r in out["cast"] if r.get("live"))
+    except Exception:  # noqa: BLE001
+        out["cast"] = []
+        out["caller_turns"] = 0
     takes = list(entry.get("takes") or [])
     if takes:
         takes.sort(key=lambda t: int(t.get("i") or 0))
@@ -40899,7 +41427,17 @@ def banter_turns(script: str, caller_name: str = "",
     for name, letter in labels:
         script = re.sub(rf"(^|\s){re.escape(name)}\s*:\s*",
                         rf"\g<1>{letter}: ", script, flags=re.I)
-    parts = re.split(r"(?:^|\s)([ABCDE])\s*[:\-]\s*", " " + script,
+    # #959: THE DASH FORM WAS CUTTING CALLERS IN HALF. The split below is
+    # case-insensitive, so "[ABCDE]\s*[:\-]" also matched an ordinary
+    # lowercase article followed by a hyphen — " a - well, the thing is",
+    # " a -that's the point" — and every one of those started a NEW turn
+    # marked A. A caller's sentence with that shape was cut at the dash
+    # and its tail re-attributed to the host: the caller "not present"
+    # and the host saying things the caller said. The dash is folded to a
+    # colon FIRST and only for a genuine uppercase marker; the split
+    # itself then wants a colon, which no article can supply.
+    script = re.sub(r"(^|\s)([ABCDE])\s*-\s*", r"\1\2: ", script)
+    parts = re.split(r"(?:^|\s)([ABCDE])\s*:\s*", " " + script,
                      flags=re.I)
     turns = [(parts[i].upper(), parts[i + 1].strip())
              for i in range(1, len(parts) - 1, 2)]
@@ -40911,8 +41449,20 @@ def banter_turns(script: str, caller_name: str = "",
         # — so make the loss visible instead of vanishing it silently (#520).
         _who = {"A": "dj", "B": "cohost", "C": "caller",
                 "D": "third", "E": "caller2"}.get(turns[-1][0], "cohost")
-        note_drop(_who, turns[-1][1], "ran out of tokens mid-line (#168)")
-        turns.pop()
+        # #959: ...but NOT the last thing the caller ever says. On a phone
+        # call the final turn is the goodbye, and a goodbye the model
+        # ended without a full stop was being deleted outright — which is
+        # exactly "the call didn't conclude properly". A tail with real
+        # words in it is closed with a full stop and kept; only a stub
+        # (a few characters, a hanging clause with nothing in it) is
+        # still dropped, because that is what a truncated line looks
+        # like.
+        _tail = turns[-1][1].strip()
+        if _who in ("caller", "caller2") and len(_tail.split()) >= 4:
+            turns[-1] = (turns[-1][0], _tail.rstrip(",;:- ") + ".")
+        else:
+            note_drop(_who, _tail, "ran out of tokens mid-line (#168)")
+            turns.pop()
 
     # Two people in a booth take it in turns. The model labels two lines in a
     # row "A:" often enough that the DJ was heard answering himself, which is
@@ -43421,6 +43971,50 @@ def _script_repeats(script: str, caller_name: str = "",
 async def freshen_script(script: str, caller_name: str = "",
                          caller2_name: str = "",
                          verbatim: list[Any] | None = None) -> str:
+    """#959: the freshener, with the caller counted either side of it.
+
+    The rewrite hands the WHOLE script to the model and asks it to keep
+    every speaker label as it stands. Mostly it does. When it does not —
+    and a one-line script, which is what the model returns most of the
+    time, gives it every chance not to — the 'C:' markers come back
+    folded into the hosts and the call has no caller in it any more.
+    Nothing checked. It runs TWICE on a banked call (once in
+    larder_prepare, again in _banter_air when the script has gone stale),
+    so a prepared phone call had two chances to quietly become two hosts
+    talking about somebody who was never on the line. That is the fault
+    the operator has now reported three separate ways.
+
+    So it is counted. If the round went in with a caller and comes back
+    without one, the rewrite is refused and the original script stands —
+    a script that repeats a phrase is a far smaller fault than a phone
+    call with nobody on the phone."""
+    before = 0
+    try:
+        if caller_name or caller2_name:
+            before = sum(1 for m, _t in banter_turns(
+                script, caller_name, caller2_name) if m in ("C", "E"))
+    except Exception:  # noqa: BLE001
+        before = 0
+    fresh = await _freshen_script(script, caller_name, caller2_name, verbatim)
+    if not before:
+        return fresh
+    try:
+        after = sum(1 for m, _t in banter_turns(
+            fresh, caller_name, caller2_name) if m in ("C", "E"))
+    except Exception:  # noqa: BLE001
+        return script
+    if after < before:
+        pipeline_log("model", f"the freshener came back with {after} caller "
+                              f"turn(s) where the call had {before} — the "
+                              "rewrite is refused and the original script "
+                              "stands (#959)")
+        return script
+    return fresh
+
+
+async def _freshen_script(script: str, caller_name: str = "",
+                          caller2_name: str = "",
+                          verbatim: list[Any] | None = None) -> str:
     """Rewrite a round that is about to repeat itself, before it airs (#no-repeats).
 
     The old engine's only answer to a repeat was to DROP the line at the door,
@@ -44131,6 +44725,38 @@ async def call_plot_clause() -> tuple[str, dict[str, Any]]:
         "and never say where it came from:\n" + text + "\n", swath or {})
 
 
+# #960: a spoken turn on this station measures about this long. Drawn
+# from the same 14 characters a second the say-budget works in, against
+# the "four to seven sentences, 60 to 100 words" every turn is briefed
+# with — call it five hundred characters, so about thirty-five seconds,
+# and the ring, the answer and the hang-up on top of that.
+CALL_TURN_SECONDS = 35.0
+CALL_TOP_AND_TAIL = 25.0
+CALL_TURNS_MIN = 6
+CALL_TURNS_MAX = 12
+
+
+def call_turns_for_slot() -> int:
+    """#960: how many turns a call may be written to, so that it LANDS
+    inside the entry it is going to air in.
+
+    The floor is six, because fewer than that is not a phone call. The
+    ceiling is the old twelve. Between them the running order decides,
+    and a station with no sheet at all behaves exactly as it did."""
+    try:
+        owns = 0.0
+        for ent in coord_upcoming(1800.0):
+            if str(ent.get("road") or "") == "caller":
+                owns = float(ent.get("owns_seconds") or 0)
+                break
+        if owns <= 0:
+            return random.randint(8, CALL_TURNS_MAX)
+        fits = int((owns - CALL_TOP_AND_TAIL) / CALL_TURN_SECONDS)
+        return max(CALL_TURNS_MIN, min(CALL_TURNS_MAX, fits))
+    except Exception:  # noqa: BLE001
+        return random.randint(8, CALL_TURNS_MAX)
+
+
 async def dj_caller(track: dict[str, Any] | None = None,
                     bank_to: list[dict[str, Any]] | None = None,
                     case_id: str = "",
@@ -44321,7 +44947,22 @@ async def dj_caller(track: dict[str, Any] | None = None,
     # #879: EIGHT to TWELVE turns, not four — a call should be a
     # conversation with a shape, and the outcome is drawn FIRST so the
     # exchange has somewhere to arrive rather than simply stopping.
-    _turns = random.randint(8, 12)
+    #
+    # #960: ...AGAINST THE SLOT IT HAS TO FILL. This number was drawn with
+    # no reference at all to the entry the call would air in. The
+    # canonical hour gives a Call four minutes; dj_banter lifts any call
+    # to an eleven-line floor and a BANKED one to fifteen or sixteen, and
+    # every turn is briefed as "a developed four-to-seven-sentence
+    # thought, usually 60 to 100 words". That commissions five to ten
+    # minutes of speech for a four-minute entry — which is the
+    # "311s banked of 240s this entry owns" the operator photographed,
+    # and then the whole thing is beheaded by the five-minute segment
+    # reaper mid-sentence with the hang-up never reached.
+    #
+    # So the slot decides. call_turns_for_slot measures the entry's own
+    # minutes against what a turn actually runs on this box, and a call
+    # is written to LAND inside its entry rather than be cut out of it.
+    _turns = call_turns_for_slot()
     _disp = await caller_disposition_clause(theme_air_clause(_themed))
     lines = await dj_banter(track, lines=_turns, also_name=want,
                             bank=bank_to is not None, bank_to=bank_to,
@@ -52390,6 +53031,199 @@ async def dj_caller_card(
     }
 
 
+def _call_slot_prompt() -> str:
+    """#970: the system prompt the running order's CALL entry writes with."""
+    try:
+        store = schedule_read()
+        return str(schedule_prompt_for(store, "caller") or "")[:12000]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+@app.get("/api/dj/call/flow")
+async def dj_call_flow(
+    line: str = "",
+    name: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#970: ONE PHONE CALL, END TO END, AND HOW IT WENT.
+
+    "When I click on a phone call, I want that pop up to also have a
+     transcript of the phone call and a flow chart showing how the phone
+     call flowed and how it terminated, illustrating how the customer's
+     experience went with the station, where I can then look at the
+     system prompts, look at how we interacted with it, look at how the
+     dialogue was generated and come up with game plans for how we can
+     interact with this customer better in the future."
+
+    /api/dj/caller/transcript answers a nearby question — the LAST call
+    by a named caller — which is not the same as "the call I just
+    clicked on". This is anchored on the booth row itself: give it the
+    id of the hang-up row (or of any line inside the call) and it walks
+    back to the banner that put that person on the line, forward to the
+    hang-up, and returns the whole thing with a stage list a flow chart
+    can be drawn from.
+
+    The stages are DERIVED, never invented: each one names the booth row
+    it came from, so anything drawn here can be checked against the log.
+    """
+    require_read_auth(authorization)
+    _ensure_chat_ids()
+    chat = list(_RADIO.get("chat") or [])
+    want = str(line or "").strip()
+    at = -1
+    if want:
+        for i in range(len(chat) - 1, -1, -1):
+            if str(chat[i].get("id") or "") == want:
+                at = i
+                break
+        if at < 0:
+            raise HTTPException(status_code=404,
+                                detail="That line is no longer in the booth")
+    who_called = str(name or "").strip()
+    if at >= 0 and not who_called:
+        who_called = str(chat[at].get("name") or "")
+    # Walk BACK to the banner that put this person on the line. The banner
+    # is the "On line N: Name" row the call roads post the moment somebody
+    # gets through (kind "call").
+    start = 0
+    banner: dict[str, Any] = {}
+    scan_from = at if at >= 0 else len(chat) - 1
+    for i in range(scan_from, -1, -1):
+        row = chat[i]
+        if str(row.get("kind") or "") != "call":
+            continue
+        if who_called and who_called not in str(row.get("text") or ""):
+            continue
+        start = i
+        banner = dict(row)
+        break
+    if not who_called:
+        # No name to hand: read it off the banner if there is one.
+        said = str(banner.get("text") or "")
+        who_called = said.split(":")[-1].strip() if ":" in said else ""
+    turns: list[dict[str, Any]] = []
+    ended: dict[str, Any] = {}
+    end_at = len(chat)
+    for i in range(start, len(chat)):
+        row = chat[i]
+        kind = str(row.get("kind") or "")
+        seat = str(row.get("who") or "")
+        if kind in ("hangup", "drop") and (
+                not who_called
+                or str(row.get("name") or "") == who_called):
+            ended = {
+                "id": str(row.get("id") or ""),
+                "text": str(row.get("text") or ""),
+                "reason": str(row.get("reason") or ""),
+                "rule": str(row.get("rule") or ""),
+                "rule_id": str(row.get("rule_id") or ""),
+                "seconds": float(row.get("seconds") or 0),
+                "ts": int(row.get("ts") or 0),
+                "never_aired": kind == "drop",
+            }
+            end_at = i
+            break
+        if seat not in ("dj", "cohost", "third", "caller", "caller2"):
+            continue
+        turns.append({
+            "id": str(row.get("id") or ""),
+            "ts": int(row.get("air_at") or row.get("ts") or 0),
+            "who": seat,
+            "name": str(row.get("name") or ""),
+            "text": str(row.get("text") or ""),
+            "seconds": float(row.get("seconds") or 0),
+            "mine": seat in ("caller", "caller2"),
+        })
+    # The flow chart's own rows: what happened, in order, each pointing at
+    # the booth row it was read from.
+    flow: list[dict[str, Any]] = []
+    if banner:
+        flow.append({"stage": "ring", "label": "the phone rings",
+                     "detail": str(banner.get("text") or ""),
+                     "id": str(banner.get("id") or ""),
+                     "ts": int(banner.get("ts") or 0)})
+    for turn in turns:
+        flow.append({
+            "stage": "caller" if turn["mine"] else "host",
+            "label": (turn["name"] or ("the caller" if turn["mine"]
+                                       else "the booth")),
+            "detail": turn["text"],
+            "id": turn["id"], "ts": turn["ts"],
+            "seconds": turn["seconds"],
+        })
+    if ended:
+        flow.append({
+            "stage": "never_aired" if ended.get("never_aired") else "hangup",
+            "label": ("the call never reached the air"
+                      if ended.get("never_aired") else "the call ends"),
+            "detail": ended.get("text") or "",
+            "why": ended.get("reason") or ended.get("rule") or "",
+            "id": ended.get("id") or "", "ts": ended.get("ts") or 0,
+        })
+    mine = sum(1 for t in turns if t["mine"])
+    theirs = len(turns) - mine
+    started = int(banner.get("ts") or (turns[0]["ts"] if turns else 0))
+    ran = float(ended.get("seconds") or 0)
+    if not ran and turns:
+        ran = max(0.0, float(turns[-1]["ts"]) - float(started or 0))
+    # The honest verdict on the customer's experience. These are the exact
+    # faults the operator has reported, so the window says them plainly
+    # rather than leaving them to be counted by eye.
+    faults: list[str] = []
+    if not mine:
+        faults.append("The caller never speaks. Every line in this call is "
+                      "a host — the person who rang in is talked ABOUT and "
+                      "never talked TO.")
+    elif mine < 3:
+        faults.append(f"The caller gets only {mine} turn(s). A call needs "
+                      "the caller to state something, be answered, and "
+                      "answer back.")
+    if not ended:
+        faults.append("There is no hang-up on file — the call has no "
+                      "ending, so it stops rather than finishes.")
+    elif ended.get("never_aired"):
+        faults.append("The call was written but no turn of it reached the "
+                      "speaker.")
+    if turns and not turns[0]["mine"] and mine:
+        first_caller = next((i for i, t in enumerate(turns) if t["mine"]), 0)
+        if first_caller > 3:
+            faults.append(f"The caller does not speak until turn "
+                          f"{first_caller + 1} — the hosts talk among "
+                          "themselves first.")
+    if theirs and mine and theirs > mine * 3:
+        faults.append(f"The hosts take {theirs} turns to the caller's "
+                      f"{mine} — it reads as a booth round with a guest "
+                      "mentioned in it.")
+    # And how it was written: the model call behind the first turn.
+    written: dict[str, Any] = {}
+    try:
+        if turns:
+            found = _model_call_full(turns[0]["text"])
+            if found:
+                written = {"prompt": str(found.get("prompt") or "")[:12000],
+                           "script": str(found.get("script") or "")[:12000],
+                           "model": str(found.get("model") or ""),
+                           "ms": found.get("ms")}
+    except Exception:  # noqa: BLE001
+        written = {}
+    return {
+        "name": who_called,
+        "started": started,
+        "seconds": round(ran, 1),
+        "turns": turns,
+        "flow": flow,
+        "ended": ended,
+        "counts": {"caller": mine, "hosts": theirs, "all": len(turns)},
+        "faults": faults,
+        "written": written,
+        # The system prompt the CALL entry of the running order writes
+        # with — the thing to change when the plan is "handle this
+        # customer better next time".
+        "prompt": _call_slot_prompt(),
+    }
+
+
 @app.get("/api/dj/caller/transcript")
 async def dj_caller_transcript(
     name: str = "",
@@ -53983,6 +54817,159 @@ async def api_writing_desk(
         "mean_ms": (round(sum(int(r.get("ms") or 0) for r in live) / len(live))
                     if live else 0),
     }
+
+
+# --- #961: the caches the STATION holds, and a way to let go of them ---
+#
+# "Offer an area here that says how much memory we're taking up with our
+#  caching and allow me to purge the cache at any time with a button ...
+#  a purge cache dialogue window and I can choose specifically what part
+#  of the cache I need to purge, which basically will cause the
+#  coordinator to begin queuing up tasks again."
+#
+# The store room (#836) already measures and cycles what is on DISK. This
+# is the other half — the four live caches the dialogue machine keeps in
+# memory, which is what "the coordinator begins queuing again" actually
+# depends on. Dropping a shelf is not destructive in the way deleting an
+# archive is: every one of these is derived material the station will
+# simply make again, which is precisely why the operator wants a button
+# for it.
+#
+# The audio files themselves are left alone — they live under the store
+# room's clips area, they are content-addressed, and the horizon burn
+# already ages them out. What is dropped here is the station's memory of
+# holding them, which is the thing that makes the preparer stand down.
+
+CACHE_AREAS = {
+    "pantry": "Finished takes — the rendered audio every road draws from",
+    "shelf": "Prepared segments — adverts, calls, memos, painting rounds",
+    "larder": "Banked booth rounds waiting for a slot",
+    "takes": "The recording-room ledger — who has been in and what it cost",
+}
+
+
+def cache_state() -> dict[str, Any]:
+    """#961: what each live cache is holding, in bytes and in airtime."""
+    out: dict[str, Any] = {"areas": [], "at": time.time()}
+    try:
+        shelf_rows_total = sum(len(v or []) for v in _SHELF.values())
+        shelf_secs = sum(float(r.get("seconds") or 0)
+                         for v in _SHELF.values() for r in (v or []))
+        rows = [
+            {"key": "pantry", "rows": len(_PANTRY),
+             "bytes": pantry_bytes(), "seconds": round(pantry_seconds(), 1),
+             "cap_bytes": int(PANTRY_MAX_BYTES)},
+            {"key": "shelf", "rows": shelf_rows_total, "bytes": 0,
+             "seconds": round(shelf_secs, 1), "cap_bytes": 0,
+             "by_kind": {k: len(v or []) for k, v in _SHELF.items()}},
+            {"key": "larder", "rows": len(_LARDER), "bytes": 0,
+             "seconds": round(sum(float(e.get("seconds") or 0)
+                                  for e in _LARDER), 1),
+             "cap_bytes": 0, "cap_rows": _LARDER_MAX},
+            {"key": "takes", "rows": len(_TAKES), "bytes": 0,
+             "seconds": 0.0, "cap_bytes": 0},
+        ]
+        for row in rows:
+            row["label"] = CACHE_AREAS.get(row["key"], row["key"])
+            out["areas"].append(row)
+        out["bytes"] = sum(int(r.get("bytes") or 0) for r in rows)
+        out["cap_bytes"] = int(PANTRY_MAX_BYTES)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+@app.get("/api/cache/state")
+async def cache_state_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#961: how much memory the station's live caches are taking up."""
+    require_read_auth(authorization)
+    return cache_state()
+
+
+@app.post("/api/cache/purge")
+async def cache_purge_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#961: let go of one or more live caches, by name.
+
+    Deliberately the same shape as the store room's purge: nothing goes
+    without being named, and an empty body is an error rather than a
+    sweep. Anything the box is still holding for playout survives —
+    _protected_media_keys() is the guard the station already trusts."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    want = (payload or {}).get("areas")
+    if not isinstance(want, list) or not want:
+        raise HTTPException(
+            status_code=400,
+            detail="Name the areas to purge, e.g. {\"areas\": [\"pantry\"]}")
+    want = [str(x) for x in want if str(x) in CACHE_AREAS]
+    if not want:
+        raise HTTPException(status_code=400, detail="No such cache area")
+    freed = 0
+    dropped: dict[str, int] = {}
+    try:
+        keep = _protected_media_keys()
+    except Exception:  # noqa: BLE001
+        keep = set()
+    if "pantry" in want:
+        gone = 0
+        for key in list(_PANTRY):
+            if key in keep:
+                continue                # on its way to the speaker
+            try:
+                freed += _pantry_bytes_of(_PANTRY[key])
+            except Exception:  # noqa: BLE001
+                pass
+            del _PANTRY[key]
+            gone += 1
+        dropped["pantry"] = gone
+        try:
+            _pantry_save(True)
+        except Exception:  # noqa: BLE001
+            pass
+    if "shelf" in want:
+        gone = sum(len(v or []) for v in _SHELF.values())
+        _SHELF.clear()
+        dropped["shelf"] = gone
+    if "larder" in want:
+        dropped["larder"] = len(_LARDER)
+        del _LARDER[:]
+    if "takes" in want:
+        dropped["takes"] = len(_TAKES)
+        del _TAKES[:]
+    note_action("\U0001f9f9 cache purged: "
+                + ", ".join(f"{k} {v}" for k, v in dropped.items())
+                + (f" \u2014 {freed // (1 << 20)} MB freed" if freed else ""))
+    pipeline_log("lookahead", "the operator purged "
+                 + ", ".join(want) + " \u2014 the coordinator starts "
+                 "queueing work for the hour again (#961)")
+    # The preparer's own memory of "what did I pick last" is now about a
+    # board that no longer exists; clearing it makes the next pass plan
+    # from what is actually there.
+    try:
+        _PREP_LAST.clear()
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "dropped": dropped, "freed": freed,
+            "state": cache_state()}
+
+
+@app.get("/api/coordinator/road/{road}")
+async def api_coord_road(
+    road: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#958: one road of the running order, and what is being DONE about
+    it being behind. See coord_road_report()."""
+    require_read_auth(authorization)
+    return coord_road_report(road)
 
 
 @app.get("/api/recording-room")
@@ -75031,9 +76018,22 @@ function djBoothTick() {
     });
   }
   const id = djStreamCurrentId();
-  if (!id || id === djStreamLiveId) return;
+  /* #963: AND IT LETS GO WHEN THE ROUND ENDS. `if (!id …) return` never
+   * cleared the mark, so between rounds window.djSpeakingEid still named
+   * the last turn of the last round — and the ● jumped there and called
+   * it live. An empty id is a fact worth writing down. */
+  if (!id) {
+    if (djStreamLiveId) {
+      djStreamLiveId = "";
+      window.djSpeakingEid = "";
+      djTalkMarkLive();
+    }
+    return;
+  }
+  if (id === djStreamLiveId) return;
   djStreamLiveId = id;
   window.djSpeakingEid = id;
+  djLiveTrailPush(id);
   djTalkMarkLive();
 }
 // index in djTalkAll -> the row element painted for it
@@ -75168,6 +76168,8 @@ function djTalkRender(state) {
   const localId = djStreamCurrentId();
   const live = state.speaking_now || null;
   window.djSpeakingEid = localId || (live ? String(live.id || "") : "");
+  // #963: every id that was ever live goes on the trail the jump walks.
+  try { djLiveTrailPush(window.djSpeakingEid); } catch (e) {}
   if (localId) djStreamLiveId = localId;
   window.djSpeakingWho = live ? String(live.who || "") : "";
   if (live && live.text) djTalkAbsorb([live]);
@@ -77748,7 +78750,21 @@ function djTalkRowInner(line) {
         if (ev.target.closest("button,a,audio")) return;
         adArchivePopup(line.ad_id || "");
       };
-      row.appendChild(head);
+      /* #962: "let's format it more intelligently — put the play icon
+       * where I have the arrow and put the download icon in the top
+       * right corner of it. That way it's more formal."
+       *
+       * The tile is a wrapping column, so the two icons appended after
+       * the heading fell onto lines of their own underneath it and read
+       * as a little stack of loose controls. They belong on the title
+       * line: play at the front where the eye starts, the name between
+       * them, download hard against the right edge. One row, three
+       * parts, nothing wrapping. */
+      const capRow = el("div", "", "");
+      capRow.style.cssText = "display:flex;align-items:center;gap:7px;"
+        + "width:100%;min-width:0";
+      row.appendChild(capRow);
+      capRow.appendChild(head);
       // #732: play and download ON the tile, beside the name, rather
       // than only in the action row underneath. The heading now shares
       // its line with two icons so the spot is one click from being
@@ -77771,17 +78787,23 @@ function djTalkRowInner(line) {
           ev.stopPropagation();
           clipToggle(url, go, "\u25b6");
         };
-        row.appendChild(go);
+        go.style.fontSize = "13px";
+        go.style.padding = "1px 4px";
+        // #962: FIRST on the line, in front of the name.
+        capRow.insertBefore(go, head);
         const save = el("a", "", "\u2b07");
         save.href = url;
         save.download = ((line.product || "ad")
           .replace(/[^\w -]+/g, "").slice(0, 48) || "ad")
           + (line.media && line.media.endsWith(".mp3") ? ".mp3" : ".wav");
         save.title = "Download this spot";
-        save.style.cssText = "flex:0 0 auto;font-size:12px;"
-          + "color:#ffd479;text-decoration:none;padding:0 3px";
+        // #962: ...and the download in the top right corner, boxed, so
+        // it reads as the tile's own control rather than a stray glyph.
+        save.style.cssText = "flex:0 0 auto;font-size:12px;margin-left:auto;"
+          + "color:#ffd479;text-decoration:none;padding:1px 6px;"
+          + "border:1px solid #4a3c14;border-radius:6px;line-height:1.35";
         save.onclick = (ev) => ev.stopPropagation();
-        row.appendChild(save);
+        capRow.appendChild(save);
       })();
       // The trace, drawn off whichever element is playing this spot (#731).
       // Only while it is actually sounding — a still canvas on every ad in
@@ -84142,9 +85164,62 @@ let djVoiceNow = null;
  * already carries a pulsing outline, but once you have scrolled back
  * through the night it is somewhere off-screen with no way home; this is
  * the way home. */
+/* #963: THE LAST FEW LINES THAT WERE GENUINELY LIVE.
+ *
+ * "I need us to always be aware of the message that's being broadcasted
+ *  and to be able to jump accurately to the message that is being said
+ *  that moment."
+ *
+ * The live id arrives from three places at three cadences — the round
+ * clock every 250ms, speaking_now every 4s, and the local player — and
+ * each of them can be empty at the instant the button is pressed. One
+ * variable holding the newest of them therefore said "nothing" a good
+ * deal of the time, and the jump fell all the way through to "here is
+ * the last thing anybody said", which is the complaint. A short trail
+ * survives those gaps: if the very newest id is not on the glass, the
+ * one before it almost certainly is, and it is a great deal nearer the
+ * truth than the bottom of the log. */
+const djLiveTrail = [];
+function djLiveTrailPush(id) {
+  try {
+    const one = String(id || "");
+    if (!one || djLiveTrail[djLiveTrail.length - 1] === one) return;
+    djLiveTrail.push(one);
+    if (djLiveTrail.length > 12) djLiveTrail.shift();
+  } catch (e) { /* the jump has other roads */ }
+}
+
+/* #963: the row whose AIR TIME contains this moment. During a coalesced
+ * round the booth holds every turn with its own air_at, so "what is being
+ * said right now" is answerable from the transcript itself even when no
+ * id has landed — which is exactly the window in which the button used to
+ * give up. The newest row that has already aired IS the line sounding. */
+function djRowAtNow(log) {
+  try {
+    const now = djStreamAt();
+    let best = null;
+    let bestAt = -1;
+    log.querySelectorAll("[data-airat]").forEach((r) => {
+      if (r.hasAttribute("data-coming")) return;
+      const at = Number(r.getAttribute("data-airat") || 0);
+      if (at <= now + 1 && at > bestAt) { bestAt = at; best = r; }
+    });
+    return best;
+  } catch (e) { return null; }
+}
+
 function djJumpLive() {
   const log = document.getElementById("djTalkLog");
-  if (!log) return;
+  /* #963: a closed booth used to swallow the click in silence. The
+   * request is "take me to the line going out"; opening the window is
+   * part of honouring it. */
+  if (!log) {
+    try {
+      djBoothReopen();
+      setTimeout(djJumpLive, 250);
+    } catch (e) { /* nothing else to try */ }
+    return;
+  }
   // Scrolling back sets a flag that stops the auto-follow. Asking to be
   // taken to the live line is asking for that flag to be cleared.
   log._userScrolled = false;
@@ -84157,8 +85232,16 @@ function djJumpLive() {
   const liveId = (window.djSpeakingEid || "");
   const want = djVoiceNow ? djTalkKey(djVoiceNow.text) : "";
   let row = null;
-  if (liveId) {
-    row = log.querySelector('[data-eid="' + CSS.escape(liveId) + '"]');
+  let exact = false;
+  // #963: the newest live id first, then back down the trail.
+  const tries = [];
+  if (liveId) tries.push(liveId);
+  for (let i = djLiveTrail.length - 1; i >= 0; i -= 1) {
+    if (tries.indexOf(djLiveTrail[i]) < 0) tries.push(djLiveTrail[i]);
+  }
+  for (let i = 0; i < tries.length && !row; i += 1) {
+    row = log.querySelector('[data-eid="' + CSS.escape(tries[i]) + '"]');
+    if (row) exact = true;
   }
   // #748: the row may not be DRAWN — the log keeps the newest 500 attached
   // and the night can be longer than that. If the id is in the history but
@@ -84170,7 +85253,9 @@ function djJumpLive() {
     djTalkRepaint();
     row = log.querySelector('[data-eid="' + CSS.escape(liveId) + '"]');
   }
-  if (!row) row = log.querySelector(".booth-live");
+  if (!row) { row = log.querySelector(".booth-live"); exact = !!row; }
+  // #963: before falling back to "the last thing said", ask the clock.
+  if (!row) { row = djRowAtNow(log); exact = !!row; }
   if (!row && want) {
     // #748: the LAST match, not the first — djTalkMarkLive takes the last,
     // and the two disagreeing by hours on a repeated liner is exactly what
@@ -84185,6 +85270,8 @@ function djJumpLive() {
     row = all.length ? all[all.length - 1] : null;
     setStatus(row ? "nothing is going out — this is the last line said"
                   : "the booth has not said anything yet");
+  } else if (exact) {
+    setStatus("here is the line going out right now");
   }
   if (!row) return;
   // #748: "auto", not "smooth". A smooth scroll runs for ~400ms, and a
@@ -89771,16 +90858,55 @@ function djFlowPhases(host, flow, line) {
       pvKV(kv, "last render",
         (flow.synth_age === null || flow.synth_age === undefined)
           ? "nothing yet" : Number(flow.synth_age).toFixed(1) + "s ago");
-      if (qk.length) {
+      /* #958: "I want to be able to click each of these entries and have
+       * a pop up that shows me what is being done about resolving them
+       * being behind."  Every row here is a road of the running order, so
+       * every row opens coordRoadPop() — what is in the rooms for it this
+       * second, what is queued next, what is refusing it, and when the
+       * hole it is short of actually lands.
+       *
+       * #957: and the list is no longer the two quota kinds alone. The
+       * hour owes airtime to nine roads and only `manager` and `caller`
+       * carry a quota, so the readout named the two that were measured
+       * and stayed silent about the seven that were not — including the
+       * painting round the operator watched go out empty. */
+      const needs = flow.hour_needs || {};
+      const roads = qk.concat(Object.keys(needs)
+        .filter((k) => qk.indexOf(k) < 0));
+      if (roads.length) {
         b.appendChild(el("div", "muted pvCap",
           "THE SCHEDULER — WHAT THE HOUR OWES"));
         const g = pvKVBox(b, "");
-        qk.forEach((k) => {
+        roads.forEach((k) => {
           const q = quota[k] || {};
-          pvKV(g, k, (q.aired || 0) + " of " + (q.target || 0) + " this hour"
-            + (q.behind ? " — behind" : " — on pace")
-            + (q.due ? ", due now" : "")
-            + (q.since ? " · last " + Math.round(q.since) + "s ago" : ""));
+          const n = needs[k] || {};
+          const owed = Number(n.owed || 0);
+          const held = Number(n.held || 0);
+          const short = Math.max(0, owed - held);
+          const say = q.target
+            ? ((q.aired || 0) + " of " + (q.target || 0) + " this hour"
+               + (q.behind ? " — behind" : " — on pace")
+               + (q.due ? ", due now" : "")
+               + (q.since ? " · last " + Math.round(q.since) + "s ago" : ""))
+            : (owed
+               ? (Math.round(held) + "s of " + Math.round(owed)
+                  + "s the hours owe it"
+                  + (short > 0 ? " — " + Math.round(short) + "s short"
+                               : " — covered"))
+               : "nothing scheduled for it");
+          const v = pvKV(g, k, say);
+          try {
+            const late = !!q.behind || short > 0;
+            v.style.cursor = "pointer";
+            v.style.textDecoration = "underline dotted";
+            v.style.textUnderlineOffset = "2px";
+            if (late) v.style.color = "#f0a35e";
+            v.title = "What is being done about " + k + " — click to open";
+            v.onclick = (ev) => {
+              ev.stopPropagation();
+              coordRoadPop(k, v);
+            };
+          } catch (e) { /* the row still reads */ }
         });
       }
       const slot = pvKV(pvKVBox(b, "THE RUNNING ORDER"), "now",

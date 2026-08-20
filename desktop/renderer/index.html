@@ -96,6 +96,11 @@
         <div id="dxTickerTrack" class="dx-track"></div>
         <span id="dxIdle" class="dx-idle">the booth is quiet</span>
       </div>
+      <!-- #968: the booth, from the marquee. The transcript window lives
+           inside the control panel, so this reaches into that frame and
+           toggles it - the same door the panel's own header opens. -->
+      <button id="dxBoothBtn" class="dx-booth"
+              title="Show or hide the In the booth window - every line as it airs, with play and download on each">🎙</button>
       <button id="dxSelling" class="dx-selling" style="display:none"
               title="What the station is selling right now — click to hold it up big">
         <img id="dxSellingArt" alt="">

@@ -1863,9 +1863,8 @@ function initWorksPopup() {
                         Math.round(c.seconds || 0) + "s"));
       [["\u25b2", 1, "Push it up the order"],
        ["\u25bc", -1, "Push it down the order"]].forEach(([g, d2, ti]) => {
-        const b = mk("button", "", g);
+        const b = mk("button", "wk-ico", g);          // #966
         b.title = ti;
-        b.style.cssText = "font-size:8px;padding:0 4px";
         b.onclick = async (ev) => {
           ev.stopPropagation();
           b.disabled = true;
@@ -1884,10 +1883,9 @@ function initWorksPopup() {
        * interjects a single round — the hour is not moved, so the
        * running order carries on from where it was afterwards. */
       try {
-        const ring = mk("button", "", "\u260e");
+        const ring = mk("button", "wk-ico", "\u260e");     // #966
         ring.title = "Put this one on the air now. The hour is not "
           + "moved \u2014 it carries on from where it was afterwards.";
-        ring.style.cssText = "font-size:9px;padding:0 5px";
         ring.onclick = async (ev) => {
           ev.stopPropagation();
           ring.disabled = true;
@@ -2396,14 +2394,31 @@ function initWorksPopup() {
           }
           const rows2 = (rr && rr.kinds) || [];
           if (rows2.length) {
-            const t = rows2.map((k) =>
-              (k.label || k.kind) + " — written " + (k.written || 0)
-              + ", lines " + (k.lines || 0)
-              + ", rendered " + (k.rendered || 0)
-              + ", ready " + (k.ready || 0)
-              + (k.seconds ? ", " + Math.round(k.seconds) + "s" : "")).join("\n");
-            wkPut(drawer, "THE BOARD, BY CONTENT TYPE", t);
+            /* #959: "put a triangle tick at the front of these that's
+             * able to expand showing me more details about each and
+             * every task in these sections."  It was one block of
+             * pre-formatted text — nine lines of numbers with no way to
+             * ask any of them a question. Each road is its own row now,
+             * and opening one asks the coordinator what is actually
+             * being done about it. */
+            const h = mk("div", "wk-note", "THE BOARD, BY CONTENT TYPE");
+            h.style.cssText = "font-size:9px;letter-spacing:.05em;"
+              + "margin:6px 0 2px;opacity:.8";
+            drawer.appendChild(h);
+            const board = mk("div", "");
+            board.style.cssText = "padding:4px 6px;border-radius:6px;"
+              + "background:#05090f;border:1px solid #24384a";
+            rows2.forEach((k) => wkBoardRow(board, k));
+            drawer.appendChild(board);
           }
+          /* #964: "In the recording room offer the last line that was
+           * created to be played or downloaded or to have the transcript
+           * viewed of it in a single line."  The room described its work
+           * in numbers and could not play a second of it. */
+          try {
+            const last = ((rr && rr.recent) || [])[0] || null;
+            if (last) wkLastLine(drawer, last);
+          } catch (e) { /* the rest of the room still draws */ }
           const acts = (rr && rr.actors) || [];
           if (acts.length) {
             wkPut(drawer, "WHO HAS BEEN IN", acts.map((a) =>
@@ -2517,23 +2532,59 @@ function initWorksPopup() {
         into.appendChild(cg);
       });
 
+    /* #957: EVERY ROAD THE HOUR OWES, not the two that carry a quota.
+     * Only `manager` and `caller` have a per-hour dial, so this readout
+     * named those two and said nothing at all about the seven others —
+     * including the painting round the operator watched go out with
+     * nothing behind it. The others are measured the way the hour
+     * measures them: seconds owed against seconds standing by.
+     *
+     * #958: ...and every row opens. "Anytime they're behind, if I click
+     * on that, I want to see a pop up explaining what is being done." */
     const q = f.quota || {};
+    const needs = f.hour_needs || {};
+    const roads = Object.keys(q).concat(
+      Object.keys(needs).filter((k) => !q[k]));
     const sch = wkBlock(body, "sched",
-      "THE SCHEDULER \u2014 what the hour owes", JSON.stringify(q),
+      "THE SCHEDULER \u2014 what the hour owes",
+      JSON.stringify([q, needs]),
       (into) => {
         const sg = mk("dl", "wk-grid");
-        ["manager", "caller"].forEach((k) => {
+        roads.forEach((k) => {
           const r = q[k];
-          if (!r) return;
-          sg.appendChild(mk("dt", "", k));
-          sg.appendChild(mk("dd", "",
-            r.aired + " of " + r.target + " this hour"
-            + (r.behind ? " \u2014 behind" : " \u2014 on pace")
-            + (r.due ? ", due now" : "")));
+          const n = needs[k] || {};
+          const owed = Number(n.owed || 0);
+          const held = Number(n.held || 0);
+          const short = Math.max(0, owed - held);
+          const late = (r && r.behind) || short > 0;
+          const dt = mk("dt", "", k);
+          const dd = mk("dd", "", r
+            ? (r.aired + " of " + r.target + " this hour"
+               + (r.behind ? " \u2014 behind" : " \u2014 on pace")
+               + (r.due ? ", due now" : ""))
+            : (owed
+               ? (Math.round(held) + "s of " + Math.round(owed) + "s owed"
+                  + (short > 0 ? " \u2014 " + Math.round(short) + "s short"
+                               : " \u2014 covered"))
+               : "nothing scheduled for it"));
+          [dt, dd].forEach((cell2) => {
+            cell2.style.cursor = "pointer";
+            cell2.title = "What is being done about " + k
+              + " \u2014 click to open";
+            cell2.onclick = (ev) => {
+              ev.stopPropagation();
+              wkRoadPop(k, cell2);
+            };
+          });
+          if (late) dd.style.color = "#f0a35e";
+          dd.style.textDecoration = "underline dotted";
+          dd.style.textUnderlineOffset = "2px";
+          sg.appendChild(dt);
+          sg.appendChild(dd);
         });
         into.appendChild(sg);
       });
-    if (sch) sch.style.display = (q.manager || q.caller) ? "" : "none";
+    if (sch) sch.style.display = roads.length ? "" : "none";
 
     const stopping = f.blockers || [];
     wkBlock(body, "stops", "WHAT IS HOLDING IT UP",
@@ -2682,6 +2733,11 @@ function initWorksPopup() {
      * was asked for. Everything the preparer does is measured against
      * this line, and material past it rolls off oldest-first. */
     head.appendChild(wkHorizon());
+    /* #961: HOW MUCH MEMORY THE CACHING IS TAKING UP, and the P that
+     * lets go of it. Asked for right here, beside the horizon dial that
+     * decides how much gets made in the first place. */
+    try { head.appendChild(wkCacheBadge()); }
+    catch (e) { /* the flow still opens */ }
     const x = mk("button", "wk-x", "✕");
     x.onclick = close;
     head.appendChild(x);
@@ -2703,6 +2759,1064 @@ function initWorksPopup() {
   cell.addEventListener("click", open);
 }
 try { initWorksPopup(); } catch (e) { /* the desk still works without it */ }
+
+/* #970 — one whole phone call, inside the line's own window.
+ *
+ * Three things, in the order a person wants them: whether it actually
+ * worked, how it flowed, and what was said. Everything is read from
+ * /api/dj/call/flow, which derives its stages from the booth log itself
+ * — so every box in the chart names the row it came from and nothing
+ * here is a reconstruction. */
+function dxCallPanel(side, lineId) {
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const box = mk("div", "dxp-sys");
+  box.style.cssText = "border-color:#6b4a1f";
+  const h = mk("h5", "");
+  const dot = mk("span", "", "☎");
+  dot.style.color = "#ffb35e";
+  h.appendChild(dot);
+  h.appendChild(mk("span", "", "the call, end to end"));
+  box.appendChild(h);
+  const body = mk("div", "");
+  box.appendChild(body);
+  side.appendChild(box);
+  body.appendChild(mk("p", "", "reading the call…"));
+
+  return api.get("/api/dj/call/flow?line=" + encodeURIComponent(lineId))
+    .then((d) => {
+      body.textContent = "";
+      const c = (d && d.counts) || {};
+      const sub = mk("p", "",
+        (d.name || "somebody") + " · " + (c.caller || 0)
+        + " turn(s) from the caller, " + (c.hosts || 0) + " from the booth"
+        + (d.seconds ? " · " + Math.round(d.seconds) + "s on air" : ""));
+      sub.style.cssText = "opacity:.8";
+      body.appendChild(sub);
+
+      /* HOW IT WENT. The faults the server counted, said plainly — this
+       * is the "how the customer's experience went" the operator asked
+       * for, and it is the difference between a call that worked and one
+       * that only looks like a call in the log. */
+      const faults = d.faults || [];
+      const verdict = mk("div", "");
+      verdict.style.cssText = "margin:5px 0;padding:5px 7px;border-radius:6px;"
+        + "font-size:10px;line-height:1.55;border:1px solid "
+        + (faults.length ? "#6b2f2f;background:#1c0f0f;color:#f0b0b0"
+                         : "#2c5f43;background:#0c1a13;color:#9fe0bb");
+      if (!faults.length) {
+        verdict.textContent = "✓ This one worked as a phone call: the "
+          + "caller speaks, the hosts answer them, and it ends.";
+      } else {
+        verdict.appendChild(mk("b", "", "How this went wrong"));
+        faults.forEach((f) => {
+          const line = mk("div", "", "• " + f);
+          line.style.marginTop = "3px";
+          verdict.appendChild(line);
+        });
+      }
+      body.appendChild(verdict);
+
+      /* THE FLOW CHART. A vertical chain — ring, then every turn in the
+       * order it aired with the two sides on opposite margins, then how
+       * it terminated. The shape itself is the diagnosis: a call with no
+       * caller boxes is a call with nobody on the phone. */
+      const chart = mk("div", "");
+      chart.style.cssText = "margin:6px 0;padding:6px;border-radius:7px;"
+        + "background:#05090f;border:1px solid #24384a;max-height:34vh;"
+        + "overflow:auto";
+      const TONE = {
+        ring: ["#65c7da", "☎", "flex-start"],
+        caller: ["#ffd7a1", "▸", "flex-start"],
+        host: ["#7ce8a9", "◂", "flex-end"],
+        hangup: ["#f0a35e", "⏹", "center"],
+        never_aired: ["#e88c8c", "✗", "center"],
+      };
+      (d.flow || []).forEach((step, i) => {
+        const spec = TONE[step.stage] || TONE.host;
+        if (i) {
+          const arrow = mk("div", "", "│");
+          arrow.style.cssText = "text-align:center;color:#33465a;"
+            + "font-size:9px;line-height:1;margin:1px 0";
+          chart.appendChild(arrow);
+        }
+        const wrap = mk("div", "");
+        wrap.style.cssText = "display:flex;justify-content:" + spec[2];
+        const node = mk("div", "");
+        node.style.cssText = "max-width:82%;font-size:9.5px;line-height:1.5;"
+          + "padding:4px 7px;border-radius:6px;background:#0a121b;"
+          + "border:1px solid #1d2f3f;border-left:3px solid " + spec[0];
+        const lab = mk("div", "", spec[1] + " " + String(step.label || ""));
+        lab.style.cssText = "color:" + spec[0] + ";font-weight:600";
+        node.appendChild(lab);
+        const det = mk("div", "", String(step.detail || "").slice(0, 190)
+          + (String(step.detail || "").length > 190 ? "…" : ""));
+        det.style.cssText = "color:#c8d6e4;margin-top:1px";
+        det.title = String(step.detail || "");
+        node.appendChild(det);
+        if (step.why) {
+          const why = mk("div", "", "why: " + step.why);
+          why.style.cssText = "color:#8ba0b5;margin-top:2px;font-size:9px";
+          node.appendChild(why);
+        }
+        wrap.appendChild(node);
+        chart.appendChild(wrap);
+      });
+      if (!(d.flow || []).length) {
+        chart.appendChild(mk("div", "",
+          "nothing of this call is still in the booth log"));
+      }
+      body.appendChild(mk("p", "", "THE FLOW"));
+      body.appendChild(chart);
+
+      /* THE TRANSCRIPT, both sides, in the order it aired. */
+      const turns = d.turns || [];
+      if (turns.length) {
+        const tw = mk("div", "");
+        tw.style.cssText = "margin:6px 0;padding:6px 7px;border-radius:7px;"
+          + "background:#05090f;border:1px solid #24384a;max-height:30vh;"
+          + "overflow:auto;font-size:10px;line-height:1.6";
+        turns.forEach((t) => {
+          const row = mk("div", "");
+          row.style.marginBottom = "3px";
+          const w = mk("b", "", (t.name || (t.mine ? "the caller" : t.who))
+                                + ": ");
+          w.style.color = t.mine ? "#ffd7a1" : "#7ce8a9";
+          row.appendChild(w);
+          row.appendChild(document.createTextNode(String(t.text || "")));
+          tw.appendChild(row);
+        });
+        body.appendChild(mk("p", "", "THE TRANSCRIPT"));
+        body.appendChild(tw);
+      }
+
+      /* AND THE PAPERWORK — the prompts to change if the plan is
+       * "handle this customer better next time". */
+      const fold = (label, text) => {
+        if (!text) return;
+        const b = mk("button", "", "▸ " + label);
+        b.style.cssText = "display:block;width:100%;text-align:left;"
+          + "height:auto;font-size:9.5px;padding:4px 7px;margin-top:4px;"
+          + "border-radius:6px";
+        const pre = mk("div", "", String(text));
+        pre.style.cssText = "display:none;font-size:9px;line-height:1.5;"
+          + "white-space:pre-wrap;max-height:28vh;overflow:auto;"
+          + "padding:5px 7px;margin-top:3px;border-radius:6px;"
+          + "background:#05090f;border:1px solid #24384a;color:#c8d6e4";
+        b.onclick = () => {
+          const on = pre.style.display === "none";
+          pre.style.display = on ? "block" : "none";
+          b.textContent = (on ? "▾ " : "▸ ") + label;
+        };
+        body.appendChild(b);
+        body.appendChild(pre);
+      };
+      const w = d.written || {};
+      fold("the system prompt this entry writes with", d.prompt);
+      fold("the prompt this call was written from", w.prompt);
+      fold("the script that came back", w.script);
+      if (w.model) {
+        const m = mk("p", "", "written by " + w.model
+          + (w.ms ? " in " + Math.round(w.ms) + " ms" : ""));
+        m.style.cssText = "opacity:.6;margin-top:4px";
+        body.appendChild(m);
+      }
+    })
+    .catch(() => {
+      body.textContent = "";
+      body.appendChild(mk("p", "",
+        "this call is no longer in the booth log"));
+    });
+}
+
+/* ===================================================================
+ * #969 — the right-click menu on a line going past the marquee.
+ *
+ * Three actions, each one a road the station already has:
+ *   transcript — /api/dj/provenance/{id} carries the whole booth row,
+ *                the prompt it was written from and how it was made;
+ *   download   — /api/booth/clip cuts the exact span of that line out of
+ *                the welded round it aired in (X-Pine-Exact says whether
+ *                it managed to);
+ *   play again — /api/dj/announce in mode "exact" says the words back in
+ *                the same seat, which is what "cued for play" means for
+ *                a line that has already gone out.
+ * =================================================================== */
+function dxLineMenu(ev, item) {
+  const gone = document.getElementById("dxLineMenu");
+  if (gone) gone.remove();
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const menu = mk("div", "works-pop");
+  menu.id = "dxLineMenu";
+  menu.style.cssText = "position:fixed;z-index:520;width:min(280px,80vw);"
+    + "padding:5px;left:" + Math.min(window.innerWidth - 290,
+                                     Math.max(6, ev.clientX)) + "px;"
+    + "top:" + Math.min(window.innerHeight - 190,
+                        Math.max(6, ev.clientY)) + "px";
+  menu.onclick = (e) => e.stopPropagation();
+  const cap = mk("div", "wk-sub",
+    (item.name || "the booth") + " · "
+    + String(item.say || "").slice(0, 70)
+    + (String(item.say || "").length > 70 ? "…" : ""));
+  cap.style.cssText = "font-size:9.5px;line-height:1.45;padding:3px 6px 5px;"
+    + "border-bottom:1px solid #24384a;margin-bottom:3px";
+  menu.appendChild(cap);
+  const note = mk("div", "wk-sub", "");
+  note.style.cssText = "font-size:9px;padding:3px 6px 0;min-height:12px";
+  const close = () => { menu.remove(); document.removeEventListener("click", away, true); };
+  const away = () => close();
+  const row = (label, title, fn) => {
+    const b = mk("button", "", label);
+    b.title = title;
+    b.style.cssText = "display:block;width:100%;text-align:left;height:auto;"
+      + "font-size:10.5px;padding:5px 8px;margin-bottom:2px;border-radius:6px";
+    b.onclick = async (e2) => {
+      e2.stopPropagation();
+      b.disabled = true;
+      try { await fn(b); } catch (err) {
+        note.textContent = (err && err.message) || String(err);
+      }
+      b.disabled = false;
+    };
+    menu.appendChild(b);
+    return b;
+  };
+
+  row("📄 transcript", "Read this line in full, and what made it",
+      async () => { close(); await dxLineTranscript(item); });
+
+  row("⬇ download this moment",
+      "Save the mp3 of the exact moment this line was said",
+      async (b) => {
+        note.textContent = "cutting…";
+        const url = (config.baseUrl || "")
+          + "/api/booth/clip?at=" + Math.round(item.at || 0)
+          + "&line=" + encodeURIComponent(item.id);
+        try {
+          await wkSaveBlob(url,
+            wkFileName((item.name || "booth") + " "
+                       + String(item.say || "").slice(0, 40), "mp3"), b);
+          close();
+        } catch (e3) {
+          note.textContent = "that moment is no longer on the shelf";
+        }
+      });
+
+  row("▶ play it again",
+      "Say this line again, in the same voice, on the air",
+      async () => {
+        note.textContent = "cueing…";
+        await api.post("/api/dj/announce", {
+          text: String(item.say || ""),
+          mode: "exact",
+          who: item.who || "dj",
+        });
+        note.textContent = "cued — it goes out next";
+        setTimeout(close, 1200);
+      });
+
+  menu.appendChild(note);
+  document.body.appendChild(menu);
+  setTimeout(() => document.addEventListener("click", away, true), 0);
+}
+
+/* The line in full, with everything the station remembers about it. */
+async function dxLineTranscript(item) {
+  const gone = document.getElementById("dxLineText");
+  if (gone) gone.remove();
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const pop = mk("div", "works-pop");
+  pop.id = "dxLineText";
+  pop.style.cssText = "position:fixed;z-index:520;width:min(560px,92vw);"
+    + "max-height:80vh;overflow:auto;left:50%;top:12vh;"
+    + "transform:translateX(-50%)";
+  pop.onclick = (e) => e.stopPropagation();
+  const head = mk("div", "wk-head");
+  head.appendChild(mk("b", "", "📄 " + (item.name || "the booth")));
+  const sub = mk("span", "wk-sub", "reading the paperwork…");
+  head.appendChild(sub);
+  const x = mk("button", "wk-x", "✕");
+  x.onclick = () => pop.remove();
+  head.appendChild(x);
+  pop.appendChild(head);
+  const said = mk("div", "", String(item.say || ""));
+  said.style.cssText = "font-size:12px;line-height:1.65;white-space:pre-wrap;"
+    + "margin-top:6px;padding:8px 10px;border-radius:7px;background:#05090f;"
+    + "border:1px solid #24384a;color:#dceaf5";
+  pop.appendChild(said);
+  const more = mk("div", "");
+  pop.appendChild(more);
+  document.body.appendChild(pop);
+  try { wkDraggable(pop); } catch (e) { /* it still opens */ }
+
+  let p = null;
+  try {
+    p = await api.get("/api/dj/provenance/" + encodeURIComponent(item.id));
+  } catch (e) {
+    sub.textContent = "that line has scrolled out of the booth — "
+      + "its paperwork went with it";
+    return;
+  }
+  const line = (p && p.line) || {};
+  sub.textContent = [
+    line.kind || item.kind || "",
+    line.voice || "",
+    line.engine || "",
+    line.seconds ? Math.round(line.seconds) + "s" : "",
+    item.at ? new Date(item.at * 1000).toLocaleTimeString() : "",
+  ].filter(Boolean).join(" · ");
+  if (line.text && line.text !== item.say) said.textContent = line.text;
+  const put = (label, text) => {
+    if (!text) return;
+    const h = mk("div", "wk-note", label);
+    h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:7px 0 2px;"
+      + "opacity:.8";
+    more.appendChild(h);
+    const b = mk("div", "", String(text));
+    b.style.cssText = "font-size:10px;line-height:1.55;white-space:pre-wrap;"
+      + "padding:6px 8px;border-radius:6px;background:#05090f;"
+      + "border:1px solid #24384a;color:#c8d6e4;max-height:30vh;"
+      + "overflow:auto";
+    more.appendChild(b);
+  };
+  const w = (p && p.written) || {};
+  put("HOW IT WAS MADE", [
+    p.how ? "road: " + p.how : "",
+    w.model ? "model: " + w.model : "",
+    w.ms ? "took " + Math.round(w.ms) + " ms" : "",
+    p.prepared ? "prepared ahead, served off the shelf" : "",
+  ].filter(Boolean).join("\n"));
+  put("THE SCRIPT IT CAME OUT OF", w.script);
+  put("THE PROMPT IT WAS WRITTEN FROM", w.prompt);
+  if (Array.isArray(p.material) && p.material.length) {
+    put("WHAT IT WAS BUILT ON",
+        p.material.map((m) => "• "
+          + String((m && (m.text || m.title || m.file)) || m)).join("\n"));
+  }
+}
+
+/* #966 — which of the two button shapes a label wants.
+ *
+ * A label with no spaces and at most a couple of glyphs is an ICON and
+ * belongs in a square box. Anything with words in it is a text button
+ * and gets the pill, whose padding is the same on every side. Emoji are
+ * surrogate pairs, so the length test counts CODE POINTS — "☎💬" is two
+ * characters, not four. */
+function wkBtnClass(label) {
+  try {
+    const t = String(label == null ? "" : label).trim();
+    if (!t) return "wk-ico";
+    if (/\s/.test(t)) return "wk-pill";
+    return (Array.from(t).length <= 2) ? "wk-ico" : "wk-pill";
+  } catch (e) { return "wk-pill"; }
+}
+
+/* #965 — one entry's own download, whatever part of the hour it is in.
+ *
+ * Past  → what actually aired inside this entry's span, welded by the
+ *         server out of the booth's own record and kept for two hours.
+ * Else  → what is STACKED for it: the prepared segment on the shelf this
+ *         entry will draw from, welded by the same coalescer the air
+ *         road uses, so what comes down is what would go out.
+ * Neither → the button says which of the two is missing, rather than
+ *         vanishing and leaving the operator to guess. */
+function wkEntryGrab(row, hour, s, gone) {
+  const grab = document.createElement("button");
+  grab.textContent = "⬇";
+  grab.title = gone
+    ? "Download what actually went out in this entry"
+    : "Download the segment stacked for this entry, welded into one file";
+  grab.style.cssText = "position:absolute;right:5px;bottom:5px;"
+    + "width:22px;height:22px;padding:0;font-size:10px;line-height:1;"
+    + "display:inline-flex;align-items:center;justify-content:center;"
+    + "border-radius:6px";
+  const settle = (mark, why) => {
+    grab.textContent = mark;
+    if (why) grab.title = why;
+    setTimeout(() => {
+      grab.textContent = "⬇";
+      grab.disabled = false;
+    }, 5000);
+  };
+  grab.onclick = async (ev) => {
+    ev.stopPropagation();
+    grab.disabled = true;
+    grab.textContent = "…";
+    const name = wkFileName(
+      hour.date + " " + (s.starts_at || "") + " " + (s.label || s.kind),
+      "wav");
+    try {
+      if (gone) {
+        const got = await api.get("/api/schedule/aired?hour="
+          + encodeURIComponent(hour.key) + "&slot="
+          + encodeURIComponent(s.id));
+        if (!got || !got.ready) {
+          settle("✗", (got && got.why)
+            || (got && got.pruned ? "kept for two hours, then deleted"
+                                  : "nothing was kept for this entry"));
+          return;
+        }
+        grab.textContent = "⬇";
+        grab.disabled = false;
+        await wkSaveBlob(wkMediaUrl(got),
+                         wkFileName(hour.date + " " + (s.starts_at || "")
+                                    + " " + (s.label || s.kind),
+                                    String(got.media || "x.wav")
+                                      .split(".").pop()),
+                         grab);
+        return;
+      }
+      const seg = await api.get("/api/schedule/segment?kind="
+        + encodeURIComponent(s.kind) + "&hour="
+        + encodeURIComponent(hour.key) + "&slot="
+        + encodeURIComponent(s.id));
+      const c = (seg.candidates || [])[0];
+      if (!c) {
+        settle("✗", CANNOT_SAY[s.kind]
+          || "nothing is stacked for this entry yet");
+        return;
+      }
+      const got = await api.get("/api/shelf/bundle?kind="
+        + encodeURIComponent(c.kind || s.kind) + "&id="
+        + encodeURIComponent(c.id));
+      grab.textContent = "⬇";
+      grab.disabled = false;
+      await wkSaveBlob(wkMediaUrl(got), name, grab);
+    } catch (e) {
+      settle("✗", (e && e.message) || "that could not be fetched");
+    }
+  };
+  row.appendChild(grab);
+  return grab;
+}
+
+/* ===================================================================
+ * #961 — THE CACHE, MEASURED, AND A BUTTON THAT LETS GO OF IT.
+ *
+ * "Offer an area here that says how much memory we're taking up with our
+ *  caching and allow me to purge the cache at any time with a button ...
+ *  I want to be able to just click a P button to purge the cache where
+ *  it brings up a purge cache dialogue window and I can choose
+ *  specifically what part of the cache I need to purge, which basically
+ *  will cause the coordinator to begin queuing up tasks again."
+ *
+ * Two registers, deliberately kept apart in the dialog because they are
+ * different kinds of thing:
+ *   the LIVE caches (/api/cache/*) — derived material the station will
+ *     simply make again, and the thing whose emptying actually makes the
+ *     coordinator start queueing work;
+ *   the STORE ROOM (/api/storage/*) — what is on disk, the archive, with
+ *     its own protections. Nothing here is deleted without being named.
+ * =================================================================== */
+function wkMB(bytes) {
+  const n = Number(bytes) || 0;
+  if (n >= (1 << 30)) return (n / (1 << 30)).toFixed(2) + " GB";
+  return Math.round(n / (1 << 20)) + " MB";
+}
+
+function wkCacheBadge() {
+  const wrap = document.createElement("div");
+  wrap.style.cssText = "display:flex;align-items:center;gap:5px;"
+    + "margin-left:6px";
+  const say = document.createElement("span");
+  say.className = "wk-sub";
+  say.textContent = "cache —";
+  say.style.whiteSpace = "nowrap";
+  wrap.appendChild(say);
+  const p = document.createElement("button");
+  p.textContent = "P";
+  p.title = "Purge the cache — choose exactly what to let go of";
+  p.style.cssText = "width:20px;height:20px;padding:0;flex:0 0 auto;"
+    + "display:inline-flex;align-items:center;justify-content:center;"
+    + "border:1px solid #24384a;border-radius:6px;background:#0b1520;"
+    + "color:#ffb35e;font-size:11px;font-weight:700;line-height:1;"
+    + "cursor:pointer";
+  p.onclick = (ev) => { ev.stopPropagation(); wkPurgePop(p); };
+  wrap.appendChild(p);
+  const draw = async () => {
+    try {
+      const c = await api.get("/api/cache/state");
+      const used = Number(c.bytes || 0);
+      const cap = Number(c.cap_bytes || 0);
+      say.textContent = "cache " + wkMB(used)
+        + (cap ? " of " + wkMB(cap) : "");
+      say.title = (c.areas || []).map((a) =>
+        a.label + " — " + (a.rows || 0) + " row(s)"
+        + (a.bytes ? ", " + wkMB(a.bytes) : "")
+        + (a.seconds ? ", " + Math.round(a.seconds) + "s of audio" : ""))
+        .join("\n");
+      say.style.color = (cap && used > cap * 0.85) ? "#f0a35e" : "";
+    } catch (e) { say.textContent = "cache —"; }
+  };
+  draw();
+  /* The badge is appended by the caller, so it is not in the document
+     yet on that first draw - the liveness check belongs on the TICK, not
+     on the draw, or the first call clears an interval that does not
+     exist yet and throws before it can read anything. */
+  const tick = setInterval(() => {
+    if (!wrap.isConnected) { clearInterval(tick); return; }
+    draw();
+  }, 10000);
+  return wrap;
+}
+
+function wkPurgePop(anchor) {
+  const gone = document.getElementById("wkPurgePop");
+  if (gone) { gone.remove(); return; }
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const pop = mk("div", "works-pop");
+  pop.id = "wkPurgePop";
+  pop.style.width = "min(520px,94vw)";
+  pop.style.maxHeight = "82vh";
+  pop.style.overflow = "auto";
+  try {
+    const at = anchor.getBoundingClientRect();
+    pop.style.left = Math.max(8, Math.min(window.innerWidth - 540,
+                                          at.left - 240)) + "px";
+    pop.style.top = (at.bottom + 8) + "px";
+  } catch (e) {
+    pop.style.left = "60px";
+    pop.style.top = "90px";
+  }
+  pop.onclick = (e) => e.stopPropagation();
+  const head = mk("div", "wk-head");
+  head.appendChild(mk("b", "", "🧹 purge the cache"));
+  head.appendChild(mk("span", "wk-sub", "choose exactly what to let go of"));
+  const x = mk("button", "wk-x", "✕");
+  x.onclick = () => pop.remove();
+  head.appendChild(x);
+  pop.appendChild(head);
+  pop.appendChild(mk("div", "wk-sub",
+    "Nothing goes that is not ticked. Everything here is material the "
+    + "station made and can make again — emptying the live shelves is "
+    + "what starts the coordinator queueing work for the hour again."));
+  const body = mk("div", "");
+  body.style.marginTop = "6px";
+  pop.appendChild(body);
+  const foot = mk("div", "");
+  foot.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "margin-top:9px;padding-top:8px;border-top:1px solid #24384a";
+  const note = mk("span", "wk-sub", "");
+  const go = mk("button", "", "purge what is ticked");
+  go.style.cssText = "padding:4px 11px;border-radius:7px;font-size:11px;"
+    + "border:1px solid #6b4a1f;background:#221709;color:#ffb35e;"
+    + "cursor:pointer";
+  foot.appendChild(go);
+  foot.appendChild(note);
+  pop.appendChild(foot);
+  document.body.appendChild(pop);
+  try { wkDraggable(pop); } catch (e) { /* it still opens */ }
+
+  const ticked = { live: {}, disk: {} };
+  const section = (title, blurb) => {
+    const h = mk("div", "wk-note", title);
+    h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:8px 0 2px;"
+      + "opacity:.8";
+    body.appendChild(h);
+    if (blurb) {
+      const b = mk("div", "wk-sub", blurb);
+      b.style.cssText = "font-size:9.5px;line-height:1.5;margin-bottom:3px";
+      body.appendChild(b);
+    }
+    const box = mk("div", "");
+    box.style.cssText = "border:1px solid #24384a;border-radius:7px;"
+      + "background:#05090f;padding:4px 7px";
+    body.appendChild(box);
+    return box;
+  };
+  const tickRow = (box, bag, key, label, right, title) => {
+    const row = mk("label", "");
+    row.style.cssText = "display:flex;align-items:center;gap:7px;"
+      + "font-size:10.5px;line-height:1.6;padding:2px 0;cursor:pointer";
+    if (title) row.title = title;
+    const cb = mk("input", "");
+    cb.type = "checkbox";
+    cb.style.cssText = "flex:0 0 auto;margin:0";
+    cb.onchange = () => {
+      if (cb.checked) bag[key] = 1; else delete bag[key];
+    };
+    row.appendChild(cb);
+    const nm = mk("span", "", label);
+    nm.style.cssText = "flex:1 1 auto;min-width:0;color:#c8d6e4";
+    row.appendChild(nm);
+    const fig = mk("span", "", right);
+    fig.style.cssText = "flex:0 0 auto;color:#6d8199;font-size:9.5px";
+    row.appendChild(fig);
+    box.appendChild(row);
+  };
+
+  const load = async () => {
+    body.textContent = "";
+    let live = null;
+    let disk = null;
+    try { live = await api.get("/api/cache/state"); } catch (e) { live = null; }
+    try { disk = await api.get("/api/storage"); } catch (e) { disk = null; }
+    if (live && live.areas) {
+      const box = section("THE LIVE SHELVES",
+        "In memory. Emptying these is what makes the coordinator start "
+        + "queueing the hour's work again.");
+      live.areas.forEach((a) => {
+        tickRow(box, ticked.live, a.key,
+          a.key + " — " + a.label,
+          (a.rows || 0) + " row(s)"
+          + (a.bytes ? " · " + wkMB(a.bytes) : "")
+          + (a.seconds ? " · " + Math.round(a.seconds) + "s" : ""),
+          a.label);
+      });
+    }
+    // The register calls it `purgeable`, not `purge` — an area that is
+    // kept says so in `why_kept` and must never be offered here.
+    const areas = ((disk && disk.areas) || []).filter((a) => a.purgeable
+      && Number(a.bytes || 0) > 0);
+    if (areas.length) {
+      const box = section("THE STORE ROOM — on disk",
+        "Ticking one empties that folder. Anything still being played "
+        + "out, and anything written in the last few minutes, is kept.");
+      areas.sort((a, b) => Number(b.bytes || 0) - Number(a.bytes || 0));
+      areas.slice(0, 24).forEach((a) => {
+        tickRow(box, ticked.disk, a.key,
+          String(a.label || a.key),
+          (a.files || 0) + " file(s) · " + wkMB(a.bytes),
+          String(a.holds || ""));
+      });
+    }
+    if (!body.firstChild) {
+      body.appendChild(mk("div", "wk-note",
+                          "nothing is cached and nothing is stored"));
+    }
+  };
+  load();
+
+  go.onclick = async () => {
+    const liveKeys = Object.keys(ticked.live);
+    const diskKeys = Object.keys(ticked.disk);
+    if (!liveKeys.length && !diskKeys.length) {
+      note.textContent = "nothing is ticked";
+      return;
+    }
+    if (!window.confirm("Purge " + (liveKeys.concat(diskKeys)).join(", ")
+                        + "? The station makes this material again.")) return;
+    go.disabled = true;
+    note.textContent = "purging…";
+    let freed = 0;
+    const said = [];
+    try {
+      if (liveKeys.length) {
+        const r = await api.post("/api/cache/purge", {areas: liveKeys});
+        freed += Number((r && r.freed) || 0);
+        said.push(Object.keys((r && r.dropped) || {})
+          .map((k) => k + " " + r.dropped[k]).join(", "));
+      }
+      for (let i = 0; i < diskKeys.length; i += 1) {
+        const r = await api.post(
+          "/api/storage/" + encodeURIComponent(diskKeys[i]) + "/purge",
+          {keep_bytes: 0});
+        freed += Number((r && r.freed) || 0);
+        if (r && r.count) said.push(diskKeys[i] + " " + r.count + " file(s)");
+      }
+      note.textContent = "purged — " + wkMB(freed) + " freed"
+        + (said.filter(Boolean).length
+           ? " (" + said.filter(Boolean).join("; ") + ")" : "");
+      load();
+    } catch (e) {
+      note.textContent = "purge failed: " + ((e && e.message) || String(e));
+    }
+    go.disabled = false;
+  };
+}
+
+/* #964 — THE LAST LINE THE ROOM MADE, on one line.
+ *
+ * Play it, keep it, or read it — the three things you want from a take
+ * you have just watched being cut, without leaving the window. The take
+ * ledger carries the signed media name since #964, so this needs no
+ * second round trip. */
+function wkLastLine(host, take) {
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const h = mk("div", "wk-note", "THE LAST LINE MADE");
+  h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:7px 0 2px;"
+    + "opacity:.8";
+  host.appendChild(h);
+  const row = mk("div", "");
+  row.style.cssText = "display:flex;align-items:center;gap:6px;"
+    + "font-size:10px;line-height:1.5;padding:5px 7px;border-radius:6px;"
+    + "background:#05090f;border:1px solid #24384a";
+  /* desktopMusicUrl is the renderer's one absolute-URL helper — the
+   * page is loaded from file://, so a bare "/media/..." resolves at the
+   * app itself and 404s. Every other player in here goes through it. */
+  const url = (take.media && take.sig)
+    ? desktopMusicUrl("/media/" + encodeURIComponent(take.media)
+                      + "?t=" + encodeURIComponent(take.sig))
+    : "";
+  const btn = (label, title) => {
+    const b = mk("button", "", label);
+    b.title = title;
+    b.style.cssText = "flex:0 0 auto;width:22px;height:22px;padding:0;"
+      + "display:inline-flex;align-items:center;justify-content:center;"
+      + "border:1px solid #24384a;border-radius:6px;background:#0b1520;"
+      + "color:#9fd8ff;font-size:11px;line-height:1;cursor:pointer";
+    return b;
+  };
+  if (url) {
+    const play = btn("▶", "Play this take — click again to stop");
+    let audio = null;
+    play.onclick = (ev) => {
+      ev.stopPropagation();
+      if (audio) {
+        try { audio.pause(); } catch (e) {}
+        audio = null;
+        play.textContent = "▶";
+        return;
+      }
+      try {
+        audio = new Audio(url);
+        audio.onended = () => { audio = null; play.textContent = "▶"; };
+        audio.onerror = () => { audio = null; play.textContent = "▶"; };
+        audio.play();
+        play.textContent = "⏹";
+      } catch (e) { audio = null; }
+    };
+    row.appendChild(play);
+    const save = btn("⬇", "Download this take");
+    /* The save goes through the shell, the way every other download in
+     * this window does — main.js owns the save dialog and remembers the
+     * folder (#808); an <a download> from file:// does not. */
+    save.onclick = (ev) => {
+      ev.stopPropagation();
+      try { api.openExternal(url); } catch (e) { /* nothing to save */ }
+    };
+    row.appendChild(save);
+  }
+  const doc = btn("📄", "Read the whole line");
+  doc.onclick = (ev) => {
+    ev.stopPropagation();
+    wkTakeText(take);
+  };
+  row.appendChild(doc);
+  const who = mk("b", "", String(take.name || take.who || "the booth"));
+  who.style.cssText = "flex:0 0 auto;color:#7ce8a9";
+  row.appendChild(who);
+  const said = mk("span", "", String(take.text || ""));
+  said.style.cssText = "flex:1 1 auto;min-width:0;color:#c8d6e4;"
+    + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+  said.title = String(take.text || "");
+  row.appendChild(said);
+  const fig = mk("span", "",
+    Math.round(Number(take.seconds) || 0) + "s"
+    + (take.how === "shelf" ? " · off the shelf" : "")
+    + (take.engine ? " · " + take.engine : ""));
+  fig.style.cssText = "flex:0 0 auto;color:#6d8199;font-size:9px";
+  row.appendChild(fig);
+  host.appendChild(row);
+}
+
+/* The take's own words, in full, in a small window of their own. */
+function wkTakeText(take) {
+  const gone = document.getElementById("wkTakeText");
+  if (gone) gone.remove();
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const pop = mk("div", "works-pop");
+  pop.id = "wkTakeText";
+  pop.style.width = "min(460px,92vw)";
+  pop.style.left = "50%";
+  pop.style.top = "16vh";
+  pop.style.transform = "translateX(-50%)";
+  pop.onclick = (e) => e.stopPropagation();
+  const head = mk("div", "wk-head");
+  head.appendChild(mk("b", "", "📄 the take"));
+  head.appendChild(mk("span", "wk-sub",
+    String(take.name || take.who || "") + " · "
+    + Math.round(Number(take.seconds) || 0) + "s"
+    + (take.voice ? " · " + take.voice : "")));
+  const x = mk("button", "wk-x", "✕");
+  x.onclick = () => pop.remove();
+  head.appendChild(x);
+  pop.appendChild(head);
+  const body = mk("div", "", String(take.text || "(no words recorded)"));
+  body.style.cssText = "font-size:11px;line-height:1.6;white-space:pre-wrap;"
+    + "margin-top:6px;padding:7px 9px;border-radius:7px;background:#05090f;"
+    + "border:1px solid #24384a;color:#c8d6e4;max-height:60vh;overflow:auto";
+  pop.appendChild(body);
+  document.body.appendChild(pop);
+  try { wkDraggable(pop); } catch (e) { /* it still opens */ }
+}
+
+/* ===================================================================
+ * #958 — WHAT IS BEING DONE ABOUT IT.
+ *
+ * "I want to be able to click each of these entries and have a pop up
+ *  that shows me what is being done about resolving them being behind.
+ *  So anytime they're behind, if I click on that, I want to see a pop up
+ *  explaining what is being done."
+ *
+ * The readouts said a road was behind and stopped there. Everything
+ * needed to answer the next question already existed on the server —
+ * the coordinator's ranked plan, the preparer's own candidate table with
+ * its costs and its refusals, the coming entries with a clock on each,
+ * the shelf, the quota ring, the lookahead log — scattered across five
+ * endpoints and joined up nowhere. /api/coordinator/road/{road} joins
+ * them, and this is the window it draws.
+ * =================================================================== */
+const WK_ROAD_TAG = {
+  now: ["#7ce8a9", "● on it now"],
+  next: ["#9fd8ff", "▸ queued"],
+  blocked: ["#f0a35e", "⚠ held up"],
+  due: ["#ffb35e", "⏱ the deadline"],
+  clear: ["#8ba0b5", "✓ clear"],
+};
+
+function wkRoadPop(road, anchor) {
+  const gone = document.getElementById("wkRoadPop");
+  if (gone) {
+    const was = gone.dataset.road;
+    gone.remove();
+    if (was === String(road)) return;          // clicking it again closes
+  }
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const pop = mk("div", "works-pop wk-road");
+  pop.id = "wkRoadPop";
+  pop.dataset.road = String(road);
+  pop.style.width = "min(500px,92vw)";
+  pop.style.maxHeight = "80vh";
+  pop.style.overflow = "auto";
+  try {
+    const at = anchor.getBoundingClientRect();
+    pop.style.left = Math.max(8, Math.min(window.innerWidth - 520,
+                                          at.left - 60)) + "px";
+    pop.style.top = Math.min(window.innerHeight - 200,
+                             at.bottom + 8) + "px";
+  } catch (e) {
+    pop.style.left = "40px";
+    pop.style.top = "80px";
+  }
+  pop.onclick = (e) => e.stopPropagation();
+  const head = mk("div", "wk-head");
+  head.appendChild(mk("b", "", "⚙ " + String(road)));
+  const sub = mk("span", "wk-sub", "what is being done about it");
+  head.appendChild(sub);
+  const x = mk("button", "wk-x", "✕");
+  x.onclick = () => { clearInterval(tick); pop.remove(); };
+  head.appendChild(x);
+  pop.appendChild(head);
+  const body = mk("div", "");
+  pop.appendChild(body);
+  document.body.appendChild(pop);
+  try { wkDraggable(pop); } catch (e) { /* it still opens */ }
+
+  const put = (label, text, colour) => {
+    if (!text) return;
+    const h = mk("div", "wk-note", label);
+    h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:7px 0 2px;"
+      + "opacity:.8";
+    body.appendChild(h);
+    const b = mk("div", "", String(text));
+    b.style.cssText = "font-size:10.5px;line-height:1.55;white-space:pre-wrap;"
+      + "padding:5px 7px;border-radius:6px;background:#05090f;"
+      + "border:1px solid #24384a" + (colour ? ";color:" + colour : "");
+    body.appendChild(b);
+  };
+
+  const draw = async () => {
+    let d = null;
+    try {
+      d = await api.get("/api/coordinator/road/"
+                        + encodeURIComponent(String(road)));
+    } catch (e) {
+      if (!body.firstChild) {
+        body.appendChild(mk("div", "wk-note",
+                            "the coordinator is unreachable"));
+      }
+      return;
+    }
+    const sig = JSON.stringify([d.doing, d.owes, d.entries, d.shelf,
+                                d.quota, d.plan && d.plan.kind]);
+    if (body.wkSig === sig && body.firstChild) return;
+    body.wkSig = sig;
+    body.textContent = "";
+    sub.textContent = String(d.label || road);
+
+    /* The answer, first and largest: one row per thing genuinely
+     * happening, in the order a person would want it. */
+    const doing = d.doing || [];
+    if (!doing.length) {
+      body.appendChild(mk("div", "wk-note",
+                          "nothing to report — this road is quiet"));
+    }
+    doing.forEach((row) => {
+      const spec = WK_ROAD_TAG[row.tag] || WK_ROAD_TAG.clear;
+      const line = mk("div", "");
+      line.style.cssText = "display:flex;gap:7px;align-items:flex-start;"
+        + "font-size:10.5px;line-height:1.55;margin:4px 0;padding:6px 8px;"
+        + "border-radius:7px;background:#070d14;border:1px solid #1d2f3f;"
+        + "border-left:3px solid " + spec[0];
+      const tag = mk("b", "", spec[1]);
+      tag.style.cssText = "flex:0 0 auto;color:" + spec[0]
+        + ";font-size:9.5px;white-space:nowrap;padding-top:1px";
+      line.appendChild(tag);
+      const said = mk("div", "", String(row.text || ""));
+      said.style.cssText = "flex:1 1 auto;min-width:0;color:#c8d6e4";
+      line.appendChild(said);
+      body.appendChild(line);
+    });
+
+    const owes = d.owes || {};
+    put("THE ARITHMETIC",
+        "the hours owe it " + Math.round(owes.owed_seconds || 0) + "s\n"
+        + "it is holding " + Math.round(owes.held_seconds || 0) + "s\n"
+        + "short by " + Math.round(owes.short_seconds || 0) + "s\n"
+        + "on the shelf: " + ((d.shelf || {}).rows || 0) + " row(s) of "
+        + ((d.shelf || {}).cap || 0)
+        + " (ceiling " + ((d.shelf || {}).ceiling || 0) + ")\n"
+        + "one of these costs about " + Math.round(d.cost_seconds || 0)
+        + "s of room to make");
+
+    const ents = d.entries || [];
+    if (ents.length) {
+      put("THE ENTRIES IT HAS TO FILL", ents.map((e) =>
+        (e.covered ? "✓ " : "✗ ")
+        + String(e.label || e.kind)
+        + " — in " + Math.round(e.starts_in || 0) + "s, owns "
+        + Math.round(e.owns_seconds || 0) + "s, holding "
+        + Math.round(e.held_seconds || 0) + "s"
+        + (e.covered ? "" : " (" + Math.round(e.short_seconds || 0)
+                            + "s short)")).join("\n"));
+    }
+
+    const plan = d.plan || {};
+    if (plan.why) {
+      put("THE PREPARER'S LAST DECISION",
+          "it chose: " + (plan.kind || "nothing") + "\n" + plan.why
+          + "\ntier " + plan.tier + " · budget "
+          + Math.round(plan.budget || 0) + "s · window "
+          + Math.round(plan.room || 0) + "s · reserve "
+          + Math.round(plan.cover || 0) + "s");
+    }
+    const task = d.task || null;
+    if (task && task.why) put("THE COORDINATOR'S OWN NOTE", String(task.why));
+    const log = d.log || [];
+    if (log.length) {
+      put("WHAT THE LOG SAYS ABOUT IT",
+          log.map((r) => "• " + String(r.text || "")).join("\n"));
+    }
+  };
+  draw();
+  const tick = setInterval(() => {
+    if (!document.getElementById("wkRoadPop")) { clearInterval(tick); return; }
+    draw();
+  }, 4000);
+  pop.wkTick = tick;
+}
+
+/* #959 — one road of THE BOARD, with a tick that opens it.
+ *
+ * The board was nine lines of pre-formatted text. Each road is a row
+ * now: the triangle opens what the rooms are actually holding for it,
+ * and the same coordinator report the scheduler rows open. */
+function wkBoardRow(host, k) {
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = text;
+    return n;
+  };
+  const key = "board:" + String(k.kind);
+  const wrap = mk("div", "");
+  wrap.style.cssText = "margin:1px 0";
+  const head = mk("div", "");
+  head.style.cssText = "display:flex;align-items:center;gap:5px;"
+    + "font-size:10px;line-height:1.5;cursor:pointer";
+  const tick = mk("span", "", wkOpenBoard[key] ? "▾" : "▸");
+  tick.style.cssText = "flex:0 0 auto;color:#3f7fa8;font-size:9px;width:9px";
+  head.appendChild(tick);
+  const nm = mk("b", "", String(k.label || k.kind));
+  nm.style.cssText = "flex:1 1 auto;min-width:0;color:"
+    + (k.behind ? "#f0a35e" : "#9fd8ff");
+  head.appendChild(nm);
+  const fig = mk("span", "",
+    (k.written || 0) + "w · " + (k.rendered || 0) + "/"
+    + (k.lines || 0) + "L · " + (k.ready || 0) + " ready"
+    + (k.seconds ? " · " + Math.round(k.seconds) + "s" : ""));
+  fig.style.cssText = "flex:0 0 auto;color:"
+    + ((k.ready || 0) > 0 ? "#7ce8a9" : "#8ba0b5") + ";font-size:9.5px";
+  head.appendChild(fig);
+  wrap.appendChild(head);
+  const drawer = mk("div", "");
+  drawer.style.cssText = "display:" + (wkOpenBoard[key] ? "block" : "none")
+    + ";margin:3px 0 6px 14px;padding:5px 7px;border-radius:6px;"
+    + "background:#070d14;border:1px solid #1d2f3f;font-size:10px;"
+    + "line-height:1.55;color:#c8d6e4;white-space:pre-wrap";
+  const fill = () => {
+    drawer.textContent =
+      "written — " + (k.written || 0) + " segment(s) off the model"
+      + (k.cap ? " of " + k.cap + " the shelf holds" : "") + "\n"
+      + "recorded — " + (k.rendered || 0) + " of " + (k.lines || 0)
+      + " line(s) cut into the pantry\n"
+      + "ready — " + (k.ready || 0)
+      + " whole segment(s) that can air without touching the engine\n"
+      + (k.recording ? "in the room now — " + k.recording + "\n" : "")
+      + "airtime standing by — " + Math.round(k.seconds || 0) + "s"
+      + (k.per_hour != null
+         ? "\nthe hour — " + (k.aired || 0) + " aired of " + k.per_hour
+           + (k.behind ? " (behind)" : " (on pace)") : "")
+      + (k.short ? "\nshort of the hour's calls by " + k.short : "");
+    const more = document.createElement("button");
+    more.textContent = "what is being done about it →";
+    more.style.cssText = "display:block;margin-top:6px;font-size:9.5px;"
+      + "padding:3px 8px;border-radius:6px;border:1px solid #24384a;"
+      + "background:#0b1520;color:#9fd8ff;cursor:pointer";
+    more.onclick = (ev) => { ev.stopPropagation(); wkRoadPop(k.kind, more); };
+    drawer.appendChild(more);
+  };
+  if (wkOpenBoard[key]) fill();
+  head.onclick = (ev) => {
+    ev.stopPropagation();
+    wkOpenBoard[key] = !wkOpenBoard[key];
+    try { localStorage.setItem("wkOpenBoard", JSON.stringify(wkOpenBoard)); }
+    catch (e) { /* private mode */ }
+    tick.textContent = wkOpenBoard[key] ? "▾" : "▸";
+    drawer.style.display = wkOpenBoard[key] ? "block" : "none";
+    if (wkOpenBoard[key]) fill();
+  };
+  wrap.appendChild(drawer);
+  host.appendChild(wrap);
+}
+let wkOpenBoard = {};
+try { wkOpenBoard = JSON.parse(localStorage.getItem("wkOpenBoard") || "{}"); }
+catch (e) { wkOpenBoard = {}; }
 
 /* #923 — THE HOUR, beside The Works.
  *
@@ -2868,12 +3982,11 @@ function worksSchedule(anchorPop) {
         bad.style.cssText = "font-size:9px;color:#e88c8c;margin-top:2px";
         it.appendChild(bad);
       }
-      const acts = mk("div", "");
-      acts.style.cssText = "display:flex;gap:4px;margin-top:3px";
+      const acts = mk("div", "wk-actbar");                 // #966
+      acts.style.marginTop = "3px";
       const bt = (txt, title, fn) => {
-        const b = mk("button", "", txt);
+        const b = mk("button", wkBtnClass(txt), txt);      // #966
         b.title = title;
-        b.style.cssText = "font-size:9px;padding:1px 6px";
         b.onclick = async (ev) => {
           ev.stopPropagation();
           b.disabled = true;
@@ -3152,46 +4265,22 @@ function worksSchedule(anchorPop) {
         body.wkAir = f2;              // nudged in place between rebuilds
         body.wkAirNeed = need;
         body.wkAirClock = say;        // #940: and the words tick too
-        /* #910: and a download in the corner that takes what THIS entry
-         * is airing, welded, off the shelf where it is stored. Only the
-         * entry on air gets one — "the currently aired interaction" is
-         * something exactly one entry has at a time. */
-        try {
-          const grab = mk("button", "", "\u2b07");
-          grab.title = "Keep what this entry is airing right now, welded "
-            + "into one file from the shelf it is stored on";
-          grab.style.cssText = "position:absolute;right:5px;bottom:5px;"
-            + "width:20px;height:20px;padding:0;font-size:10px;"
-            + "line-height:18px;border-radius:5px";
-          grab.onclick = async (ev) => {
-            ev.stopPropagation();
-            grab.disabled = true;
-            const was = grab.textContent;
-            grab.textContent = "\u2026";
-            try {
-              const seg = await api.get("/api/schedule/segment?kind="
-                + encodeURIComponent(s.kind) + "&hour="
-                + encodeURIComponent(hour.key) + "&slot="
-                + encodeURIComponent(s.id));
-              const c = (seg.candidates || [])[0];
-              if (!c) throw new Error("nothing on this entry's shelf");
-              const got = await api.get("/api/shelf/bundle?kind="
-                + encodeURIComponent(c.kind || s.kind) + "&id="
-                + encodeURIComponent(c.id));
-              api.openExternal(wkMediaUrl(got));
-              grab.textContent = was;
-            } catch (e) {
-              grab.textContent = "\u2717";
-              grab.title = "nothing recorded on this entry yet";
-            }
-            setTimeout(() => {
-              grab.textContent = was;
-              grab.disabled = false;
-            }, 4000);
-          };
-          row.appendChild(grab);
-        } catch (e) { /* the tile still draws */ }
       }
+      /* #910/#965: A DOWNLOAD IN THE CORNER OF EVERY ENTRY.
+       *
+       * "For each option in the hour, offer a download button that I can
+       *  click to download that segment for the broadcast for the hour —
+       *  to just download just that section in general."
+       *
+       * It used to be the on-air entry's alone, on the reasoning that
+       * "the currently aired interaction" is something exactly one entry
+       * has at a time. True, and beside the point: what the operator
+       * wants off a coming entry is what is STACKED for it, and off a
+       * past one what actually WENT OUT. Every entry has one of those,
+       * so every entry has a button — and one that genuinely has nothing
+       * says so on the button rather than not being there. */
+      try { wkEntryGrab(row, hour, s, gone); }
+      catch (e) { /* the tile still draws */ }
 
       /* #920: and the DOWNLOAD of what actually went out in this entry.
        * Only a tile the clock has finished with has one. The server
@@ -3386,33 +4475,161 @@ function worksSchedule(anchorPop) {
       un.onclick = () => pin("", "");
       d.appendChild(un);
     }
-    const draw = (rows) => {
+    /* #967 — THE SEARCH THAT NEVER MATCHED ANYTHING.
+     *
+     * "When I'm choosing a record and typing in the pop-up, I want it to
+     *  be showing suggestions of people in my library and allow me to
+     *  explore them by clicking on them and finding the right song and
+     *  album in the library by going through the advanced search that's
+     *  basically growing and auto populating as I'm typing in."
+     *
+     * The first fault was one word. /api/music/search answers
+     * {query, results} and /api/music/browse answers {total, results};
+     * this read `got.tracks || got.rows || got.items` and then fell back
+     * to "is it an array" — so EVERY search, however good, drew the
+     * empty list and said "nothing matched that". That is the screenshot.
+     *
+     * The rest is what was asked for on top of it: the results grouped
+     * by the person who made them, the artist and the album clickable so
+     * you can walk into them, and a query that keeps its footing — when
+     * the whole phrase finds nothing it falls back to the longest part
+     * of it that finds something, and says which part that was, rather
+     * than going blank on a typo. */
+    const rowsOf = (got) => {
+      if (!got) return [];
+      if (Array.isArray(got)) return got;
+      return got.results || got.tracks || got.rows || got.items || [];
+    };
+    const draw = (rows, said) => {
       list.textContent = "";
-      (rows || []).slice(0, 40).forEach((t) => {
-        const b = mk("button", "", "");
-        b.style.cssText = "display:block;width:100%;text-align:left;"
-          + "font-size:10px;padding:3px 6px;margin-bottom:3px;"
-          + "white-space:normal;line-height:1.4";
-        b.textContent = ((t.artist ? t.artist + " \u2014 " : "")
-                         + (t.title || t.id));
-        b.onclick = () => pin(t.id, ((t.artist ? t.artist + " - " : "")
-                                     + (t.title || "")));
-        list.appendChild(b);
-      });
-      if (!(rows || []).length) {
-        list.appendChild(mk("div", "wk-note", "nothing matched that"));
+      if (said) {
+        const n = mk("div", "wk-note", said);
+        n.style.cssText = "font-size:9px;opacity:.7;margin-bottom:4px";
+        list.appendChild(n);
       }
+      const use = (rows || []).slice(0, 60);
+      if (!use.length) {
+        list.appendChild(mk("div", "wk-note",
+                            "nothing in the library matched that"));
+        return;
+      }
+      /* Grouped by artist, in the order they first appear, so a search
+       * for a person reads as that person's shelf rather than a flat
+       * list of tracks that happen to share a word. */
+      const order = [];
+      const by = {};
+      use.forEach((t) => {
+        const who = String(t.artist || "unknown");
+        if (!by[who]) { by[who] = []; order.push(who); }
+        by[who].push(t);
+      });
+      order.forEach((who) => {
+        const head = mk("div", "");
+        head.style.cssText = "display:flex;align-items:center;gap:6px;"
+          + "margin:5px 0 2px";
+        const nm = mk("b", "", who);
+        nm.style.cssText = "flex:1 1 auto;min-width:0;color:#7ce8a9;"
+          + "font-size:10px;cursor:pointer;overflow:hidden;"
+          + "text-overflow:ellipsis;white-space:nowrap";
+        nm.title = "Search the library for everything by " + who;
+        nm.onclick = () => { box.value = who; hunt(true); };
+        head.appendChild(nm);
+        const count = mk("span", "wk-note", by[who].length + "");
+        count.style.cssText = "flex:0 0 auto;font-size:9px;opacity:.55";
+        head.appendChild(count);
+        list.appendChild(head);
+        by[who].forEach((t) => {
+          const b = mk("button", "", "");
+          b.style.cssText = "display:flex;align-items:center;gap:6px;"
+            + "width:100%;text-align:left;font-size:10px;padding:3px 6px;"
+            + "margin-bottom:2px;white-space:normal;line-height:1.4;"
+            + "height:auto";
+          if (t.art) {
+            const im = mk("img", "");
+            im.src = desktopMusicUrl(t.art);
+            im.loading = "lazy";
+            im.style.cssText = "width:22px;height:22px;border-radius:4px;"
+              + "object-fit:cover;flex:0 0 auto";
+            im.onerror = () => { im.style.display = "none"; };
+            b.appendChild(im);
+          }
+          const words = mk("span", "", "");
+          words.style.cssText = "flex:1 1 auto;min-width:0";
+          words.appendChild(mk("div", "", String(t.title || t.id)));
+          if (t.album) {
+            const al = mk("div", "wk-note", t.album
+              + (t.seconds ? " \u00b7 " + Math.round(t.seconds / 60)
+                             + ":" + String(Math.round(t.seconds % 60))
+                               .padStart(2, "0") : ""));
+            al.style.cssText = "font-size:8.5px;opacity:.6";
+            words.appendChild(al);
+          }
+          b.appendChild(words);
+          b.onclick = () => pin(t.id, ((t.artist ? t.artist + " - " : "")
+                                       + (t.title || "")));
+          list.appendChild(b);
+          if (t.album) {
+            // Right-click walks into the album; a left click is already
+            // spoken for by pinning the track.
+            b.title = "Click to pin · right-click to open “"
+              + t.album + "”";
+            b.oncontextmenu = (ev) => {
+              ev.preventDefault();
+              box.value = t.album;
+              hunt(true);
+            };
+          }
+        });
+      });
     };
     let timer = 0;
-    const hunt = () => {
-      const q = String(box.value || "").trim();
-      api.get(q ? "/api/music/search?q=" + encodeURIComponent(q) + "&limit=40"
-                : "/api/music/browse?limit=40")
-        .then((got) => draw((got && (got.tracks || got.rows || got.items))
-                            || (Array.isArray(got) ? got : [])))
-        .catch(() => { list.textContent = "the library is unreachable"; });
+    let seq = 0;
+    /* The library is asked for the whole phrase first; if that comes
+     * back empty, for the phrase minus its last word, and so on down to
+     * the first word. The first thing that answers is what is shown. */
+    const tries = (q) => {
+      const bits = q.split(/\s+/).filter(Boolean);
+      const out = [];
+      for (let i = bits.length; i > 0; i -= 1) out.push(bits.slice(0, i).join(" "));
+      return out.length ? out : [""];
     };
-    box.oninput = () => { clearTimeout(timer); timer = setTimeout(hunt, 260); };
+    const hunt = async (now) => {
+      const me = ++seq;
+      const q = String(box.value || "").trim();
+      list.dataset.busy = "1";
+      if (!q) {
+        try {
+          const got = await api.get("/api/music/browse?limit=40");
+          if (me === seq) draw(rowsOf(got), "everything in the library");
+        } catch (e) {
+          if (me === seq) list.textContent = "the library is unreachable";
+        }
+        return;
+      }
+      const ladder = tries(q);
+      for (let i = 0; i < ladder.length; i += 1) {
+        let got = null;
+        try {
+          got = await api.get("/api/music/search?q="
+                              + encodeURIComponent(ladder[i]) + "&limit=60");
+        } catch (e) {
+          if (me === seq) list.textContent = "the library is unreachable";
+          return;
+        }
+        if (me !== seq) return;             // a newer keystroke won
+        const rows = rowsOf(got);
+        if (rows.length) {
+          draw(rows, i === 0
+            ? rows.length + " in the library for \u201c" + q + "\u201d"
+            : "nothing for \u201c" + q + "\u201d \u2014 showing \u201c"
+              + ladder[i] + "\u201d instead");
+          return;
+        }
+      }
+      if (me === seq) draw([], "");
+      void now;
+    };
+    box.oninput = () => { clearTimeout(timer); timer = setTimeout(hunt, 180); };
     hunt();
     document.body.appendChild(d);
     try { pvFloatDesk(d); } catch (e) {}
@@ -4010,7 +5227,17 @@ async function wkSaveBlob(url, name, btn) {
   const was = btn ? btn.textContent : "";
   if (btn) { btn.disabled = true; btn.textContent = "\u2026"; }
   try {
-    const r = await fetch(url);
+    /* #969: with the key on it. Signed /media links need nothing, but an
+     * /api/... road goes through require_read_auth, and this helper is
+     * used for both now — a bare fetch there comes back 401 and reads as
+     * "could not save". The header is harmless when reads are open. */
+    const head = {};
+    try {
+      if (config && config.apiKey) {
+        head.Authorization = "Bearer " + config.apiKey;
+      }
+    } catch (e2) { /* no config yet */ }
+    const r = await fetch(url, {headers: head});
     if (!r.ok) throw new Error("HTTP " + r.status);
     const blob = URL.createObjectURL(await r.blob());
     const a = document.createElement("a");
@@ -4150,7 +5377,7 @@ function wkStatStrip(host, kind, id, d) {
   go.title = "Write another of this section down the same road, at this "
     + "dial, and stack it above the one it came from. The original is "
     + "left alone \u2014 bin it yourself once you have heard both.";
-  go.style.cssText = "font-size:9px;padding:1px 6px";
+  go.className = wkBtnClass(go.textContent);              // #966
   go.onclick = async (ev) => {
     ev.stopPropagation();
     go.disabled = true;
@@ -4171,12 +5398,17 @@ function wkStatStrip(host, kind, id, d) {
 
 function wkTapeBar(host, kind, id) {
   const bar = document.createElement("div");
-  bar.style.cssText = "display:flex;gap:4px;align-items:center;margin-top:3px";
+  bar.className = "wk-actbar";                             // #966
+  bar.style.marginTop = "3px";
+  /* #966: a single glyph gets a square box; anything with words gets a
+   * pill with the same padding on all four sides. The styling lives in
+   * two CSS classes now rather than in a different inline rule per
+   * button, which is how this row came to hold six different widths. */
   const mk2 = (txt, title) => {
     const b = document.createElement("button");
     b.textContent = txt;
     b.title = title;
-    b.style.cssText = "font-size:9px;padding:1px 6px";
+    b.className = wkBtnClass(txt);
     bar.appendChild(b);
     return b;
   };
@@ -4256,6 +5488,7 @@ function wkTapeBar(host, kind, id) {
     const on = drw.style.display === "none";
     drw.style.display = on ? "block" : "none";
     tri.textContent = (on ? "\u25be" : "\u25b8") + " transcript";
+    tri.className = wkBtnClass(tri.textContent);
     if (!on || drw.dataset.filled) return;
     drw.textContent = "reading the tape\u2026";
     let d = null;
@@ -4272,18 +5505,69 @@ function wkTapeBar(host, kind, id) {
     /* #943 (#941): the four figures, above the dialogue, in the order
      * they were asked for. */
     try { wkStatStrip(drw, kind, id, d); } catch (e) { /* the lines still show */ }
-    const lines = d.lines || [];
+    const takes = d.lines || [];
+    /* #959: THE CALLER GOES IN THE TRANSCRIPT.
+     *
+     * "This phone call doesn't show the person who called speaking at
+     *  all, and the conversation doesn't actually make sense."
+     *
+     * `d.lines` is the list of PANTRY TAKES, and a caller has none by
+     * design — their phone line is drawn once, live, inside speak_turns.
+     * Listing the takes and calling it the transcript is why a banked
+     * "Phone call" showed only Host and Skip talking about somebody who
+     * was never there. The server sends the whole CAST now, in script
+     * order, each row pointing at the takes made for it; the caller's
+     * rows point at none and say so. Where there is no cast (an older
+     * shelf row) this falls back to exactly what it did before. */
+    const cast = (d.cast || []).length ? d.cast : null;
+    const lines = cast
+      ? cast.map((c) => {
+          if (c.live) {
+            return {who: c.who, name: c.name || "the caller", text: c.text,
+                    recorded: false, live: true, seconds: 0};
+          }
+          const own = takes.slice(c.line_from, c.line_to);
+          const first = own[0] || {};
+          return Object.assign({}, first, {
+            who: c.who,
+            name: first.name || c.who,
+            text: c.text,
+            seconds: own.reduce((a, b) => a + (Number(b.seconds) || 0), 0),
+            recorded: own.some((x) => x.recorded),
+          });
+        })
+      : takes;
     const head = document.createElement("div");
     head.className = "wk-note";
     head.style.cssText = "font-size:9px;opacity:.65;margin-bottom:3px";
+    const spoken = lines.filter((l) => l.live).length;
     head.textContent = lines.length + " line(s) \u00b7 "
       + lines.filter((l) => l.recorded).length + " recorded"
+      + (spoken ? " \u00b7 " + spoken + " voiced live on the call" : "")
       + (d.derived ? " \u00b7 read back off the script" : "");
     head.title = d.derived
       ? "This round was prepared before the takes were written down, so "
         + "its lines are rederived exactly as the air road derives them."
       : "";
     drw.appendChild(head);
+    /* And say so plainly when a phone call has nobody on the phone —
+     * that is the fault, and counting Host rows by eye is how it went
+     * unnoticed for so long. */
+    if (cast && String(kind) === "caller") {
+      const n = Number(d.caller_turns || 0);
+      const flag = document.createElement("div");
+      flag.style.cssText = "font-size:9px;line-height:1.5;margin-bottom:4px;"
+        + "padding:4px 6px;border-radius:6px;border:1px solid "
+        + (n ? "#2c5f43;background:#0c1a13;color:#9fe0bb"
+             : "#6b2f2f;background:#1c0f0f;color:#f0b0b0");
+      flag.textContent = n
+        ? "\u2713 " + (d.caller_name || "the caller") + " has " + n
+          + " turn(s) in this call."
+        : "\u26a0 Nobody is on the phone in this call \u2014 every line "
+          + "is a host. It will air as two presenters talking about a "
+          + "caller who never speaks.";
+      drw.appendChild(flag);
+    }
     lines.forEach((ln) => {
       const row = document.createElement("div");
       row.style.cssText = "display:flex;gap:4px;align-items:flex-start;"
@@ -4301,8 +5585,12 @@ function wkTapeBar(host, kind, id) {
       const meta = document.createElement("span");
       meta.className = "wk-note";
       meta.style.cssText = "font-size:9px;opacity:.6;flex:none";
-      meta.textContent = ln.recorded ? Math.round(ln.seconds) + "s"
-                                     : "not cut";
+      /* #959: a caller's turn is not a missing take — it is a turn whose
+       * phone line is drawn at the moment the call airs, so "not cut" was
+       * the wrong word for the one row that most needed the right one. */
+      meta.textContent = ln.live ? "voiced on the call"
+        : ln.recorded ? Math.round(ln.seconds) + "s" : "not cut";
+      if (ln.live) who.style.color = "#ffd7a1";
       row.appendChild(meta);
       if (ln.recorded) {
         const play = document.createElement("button");
@@ -7585,6 +8873,27 @@ async function dxProvOpen(lineId, who, said) {
   head.querySelector(".dxp-who").textContent =
     String((prov.line || {}).name || (prov.line || {}).who || who || "");
 
+  /* #970: A PHONE CALL IS NOT A LINE, IT IS A CONVERSATION.
+   *
+   * "When I click on a phone call, I want that pop up to also have a
+   *  transcript of the phone call and a flow chart showing how the phone
+   *  call flowed and how it terminated, illustrating how the customer's
+   *  experience went with the station."
+   *
+   * The provenance graph answers "what made this ONE line", which is the
+   * right answer for a line of banter and the wrong one for a hang-up
+   * notice — the thing behind that row is a whole call. When the row is
+   * part of a call, the call goes at the TOP of the side panel: the
+   * verdict on how it went, the flow chart, the transcript, and the
+   * prompts underneath it. */
+  try {
+    const kind = String((prov.line || {}).kind || "");
+    if (kind === "hangup" || kind === "call" || kind === "drop"
+        || String((prov.line || {}).who || "") === "caller") {
+      await dxCallPanel(side, lineId);
+    }
+  } catch (e) { /* the provenance below still draws */ }
+
   const systems = dxProvSystems(prov);
   const cards = {};
   systems.forEach((sys) => {
@@ -7662,6 +8971,7 @@ function initAirMarquee() {
   let paused = false;
   let last = 0;
   let liveId = "";
+  let looped = false;           // #967: the belt is showing reruns
   let segWas = "";
   let slidTo = "";
   let sellArtNow = "";
@@ -7672,12 +8982,33 @@ function initAirMarquee() {
     if (node && node.textContent !== s) node.textContent = s;
   };
 
+  /* #967: what sort of thing is going past. "I want to see any
+   * references that we do when we are running ads, sound effects,
+   * whenever the sound effects guy's talking, anything that's
+   * happening." The booth already labels its rows; the belt threw the
+   * label away. */
+  const DX_KIND = {
+    ad: "📣", sfx: "🔊", call: "☎", caller: "☎", news: "📰",
+    manager: "📻", gallery: "🖼", station_id: "📢", track_talk: "💿",
+    recap: "🔁", sting: "🔊", song: "🎵", image: "🖼",
+  };
+
   function addToBelt(item) {
     const el = document.createElement("span");
     el.className = "dx-item";
     el.dataset.lineId = item.id;
     el.dataset.say = item.text;
     el.dataset.name = item.name;
+    el.dataset.who = item.who || "";
+    el.dataset.kind = item.kind || "";
+    el.dataset.at = String(item.at || 0);
+    const glyph = DX_KIND[String(item.kind || "").toLowerCase()];
+    if (glyph) {
+      const tag = document.createElement("em");
+      tag.textContent = glyph;
+      tag.title = String(item.kind || "");
+      el.appendChild(tag);
+    }
     const who = document.createElement("b");
     who.textContent = item.name;
     const what = document.createElement("i");
@@ -7701,6 +9032,7 @@ function initAirMarquee() {
       if (offset + beltW > lane.clientWidth * 1.8) break;
       if (feedAt >= pool.length) {
         feedAt = Math.max(0, pool.length - 12);
+        looped = true;          // #967: from here on it is a rerun
       }
       addToBelt(pool[feedAt]);
       feedAt += 1;
@@ -7744,13 +9076,44 @@ function initAirMarquee() {
   function markLive(id) {
     if (id === liveId) return;
     liveId = id;
+    let on_belt = false;
     const kids = track.children;
     for (let i = 0; i < kids.length; i += 1) {
       const on = Boolean(id) && kids[i].dataset.lineId === id;
+      if (on) on_belt = true;
       if (kids[i].classList.contains("live") !== on) {
         kids[i].classList.toggle("live", on);
       }
     }
+    /* #967: AND THE BELT GOES AND GETS IT.
+     *
+     * "Make sure the marquee is scrolling, showing the message that's
+     *  being said as it's being said ... I need whatever is being said
+     *  to be what is scrolling by, so I can see it in real time."
+     *
+     * The belt only ever fed forward from wherever it had got to, and
+     * looped the last dozen lines when it ran out — so what was
+     * scrolling past was usually a rerun of the last minute while
+     * something else entirely was going out. When a new line starts, if
+     * it is not already on the belt, the feed is re-seated onto it and
+     * anything looped is dropped, so the next thing to slide in is the
+     * line actually being said. Lines that ARE on the belt are left
+     * alone: no jump, no flicker, and nothing on screen is rewritten. */
+    if (!id || on_belt) return;
+    let at = -1;
+    for (let i = pool.length - 1; i >= 0; i -= 1) {
+      if (pool[i].id === id) { at = i; break; }
+    }
+    if (at < 0) return;                 // not in the pool yet; next pull
+    feedAt = at;
+    if (looped) {
+      // Everything on the belt is a rerun. Clear it and come in fresh.
+      track.textContent = "";
+      offset = lane.clientWidth;
+      beltW = 0;
+      looped = false;
+    }
+    fill();
   }
 
   function paintSegment(state) {
@@ -7817,9 +9180,19 @@ function initAirMarquee() {
         const text = String(row.text || "").trim();
         if (!id || !text || seen.has(id)) return;
         seen.add(id);
+        /* #967/#969: the row is kept WHOLE now, near enough. It used to
+         * be reduced to {id, name, text} and everything else thrown
+         * away — which is why a line on the belt could not be played
+         * back, could not be downloaded, and could not say what kind of
+         * thing it was. `at` is what /api/booth/clip cuts against and
+         * `who` is the seat /api/dj/announce speaks in; neither can be
+         * recovered from the belt afterwards. */
         pool.push({ id,
                     name: String(row.name || row.who || "the booth"),
-                    text });
+                    text,
+                    who: String(row.who || ""),
+                    kind: String(row.kind || ""),
+                    at: Number(row.air_at || row.ts || 0) });
       });
       if (pool.length > KEEP) {
         const cut = pool.length - KEEP;
@@ -7933,8 +9306,59 @@ function initAirMarquee() {
 
   // Reading a line means stopping it: the belt holds while the pointer is
   // over it, which is also what makes a moving line clickable.
+  /* #968: the booth window, toggled from up here. It lives inside the
+   * control panel's own page, so the door is opened by running the
+   * panel's own function in that frame — nothing is duplicated. */
+  const boothBtn = $("dxBoothBtn");
+  if (boothBtn) {
+    boothBtn.onclick = async () => {
+      const frame = $("controlFrame");
+      if (!frame || !frame.src || typeof frame.executeJavaScript !== "function") {
+        noteRouteError("the control panel is not loaded yet");
+        return;
+      }
+      try {
+        const on = await frame.executeJavaScript(
+          "(function(){try{"
+          + "var p=document.getElementById('djTalkPopup');"
+          + "if(p){djTalkClose(true);return false;}"
+          + "djBoothReopen();return true;"
+          + "}catch(e){return null;}})()");
+        boothBtn.classList.toggle("on", on === true);
+      } catch (e) {
+        noteRouteError("the booth could not be reached");
+      }
+    };
+  }
+
   lane.addEventListener("mouseenter", () => { paused = true; });
   lane.addEventListener("mouseleave", () => { paused = false; });
+  /* #969: RIGHT-CLICK ANY LINE GOING PAST.
+   *
+   * "I want to be able to right click any option in the marquee and have
+   *  a drop down menu that offers options for viewing the transcript,
+   *  which shows the transcript in a pop-up, or to download the MP3 of
+   *  that moment in time at which that clip was said. Also offer an
+   *  option for play where basically the moment is cued for play again."
+   *
+   * Left click already opens the provenance graph, so the three actions
+   * asked for go on the right button. Everything they need is on the
+   * item since #967 — the id the server cuts audio against, the air time
+   * that names the moment, the seat to speak it back in, and the words. */
+  track.addEventListener("contextmenu", (ev) => {
+    let el = ev.target;
+    while (el && el !== track && !el.dataset.lineId) el = el.parentElement;
+    if (!el || el === track || !el.dataset.lineId) return;
+    ev.preventDefault();
+    dxLineMenu(ev, {
+      id: el.dataset.lineId,
+      say: el.dataset.say || "",
+      name: el.dataset.name || "",
+      who: el.dataset.who || "",
+      kind: el.dataset.kind || "",
+      at: Number(el.dataset.at || 0),
+    });
+  });
   track.addEventListener("click", (ev) => {
     let el = ev.target;
     while (el && el !== track && !el.dataset.lineId) el = el.parentElement;
