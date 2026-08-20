@@ -15450,6 +15450,22 @@ def _larder_profile_signature() -> str:
         "swath": [round(float(dj.get("speakbox_full_swath_rate") or 0), 3),
                   int(dj.get("speakbox_full_swath_chars") or 0)],
     }
+    # #862: THE WORLD-TINT IS PART OF THE WRITING CONTRACT. A banked round
+    # is written by dj_banter, so it carries whatever crystal_clause() said
+    # at the moment it was written and whatever mind the crystal redirected
+    # its swath to - and then it keeps for larder_fresh(), ninety minutes at
+    # the default dial. Nothing dropped those rounds when a crystal was
+    # switched on, off or moved, so the operator turned the dial and went on
+    # hearing an untinted shelf for an hour and a half. A frozen round is
+    # worse: _banter_air skips freshening it, so not one stage downstream
+    # could have tinted it either.
+    try:
+        profile["tint"] = sorted(
+            [str(c.get("name") or c.get("tint") or "")[:60],
+             int(c.get("strength") or 0)]
+            for c in crystal_active())
+    except Exception:  # noqa: BLE001
+        profile["tint"] = []
     return json.dumps(profile, sort_keys=True, separators=(",", ":"))
 
 
@@ -21098,7 +21114,8 @@ def gallery_sample(limit: int = 8) -> list[str]:
     return out
 
 
-async def describe_gallery_image(want: str = "") -> tuple[str, str]:
+async def describe_gallery_image(want: str = "",
+                                 prompt: str = "") -> tuple[str, str]:
     """A picture off the render machine, actually LOOKED AT (#341): the
     resident model is multimodal, so the description comes from the pixels,
     not from the prompt that made them. `want` names ONE picture — that is
@@ -21128,6 +21145,10 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
         del shown[:-60]
         image_b64 = base64.b64encode(picked.read_bytes()).decode()
         settings = load_settings()
+        # #860: `prompt` is the operator looking again through something
+        # they just wrote. Empty means the station's own armed prompt,
+        # which is every ordinary round.
+        _look = str(prompt or "").strip() or vision_prompt_active()
         _vt0 = time.monotonic()
         async with _OLLAMA_GATE, httpx.AsyncClient(timeout=120) as client:
             response = await client.post(
@@ -21143,7 +21164,7 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
                             # the CLASSIC, and reverting comes back here.
                             # #646: when they DO look, they look properly —
                             # atomic detail, and visibly affected by it.
-                            vision_prompt_active()),
+                            _look),
                         "images": [image_b64],
                     }],
                     "stream": False,
@@ -21163,7 +21184,7 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
             image_analysis_ready(
                 picked.name, said, model=VISION_MODEL,
                 ms=int((time.monotonic() - _vt0) * 1000),
-                prompt=vision_prompt_active())
+                prompt=_look)
             # Any time a gallery picture is looked at and talked about, the
             # booth holds up its thumbnail (#506, #523) — not only during the
             # dedicated gallery round.
@@ -21193,47 +21214,132 @@ VISION_PROMPT_CLASSIC = (
     "preamble, no list.")
 
 
+_VISION_LOCK = RLock()
+
+
 def vision_prompts() -> dict[str, Any]:
-    """The library, with the classic always at the head."""
+    """The library (#878, opened up in #860).
+
+    Every looking prompt the station owns, in order, with the classic
+    always at the head: it is entry one, it cannot be deleted or
+    overwritten, and it is what "revert to default" comes back to. One
+    of them is ACTIVE - that is the one pictures are read through.
+
+    `prefs` is the standing preferences (#860: "additional preferences
+    that we're using for going through and analyzing these images") -
+    one shelf of house rules that ride on top of whichever variant is
+    armed, so they do not have to be re-typed into every prompt."""
     rows: list[dict[str, Any]] = []
     active = "classic"
+    prefs = ""
     try:
         got = json.loads(VISION_PROMPTS_PATH.read_text())
-        rows = [r for r in (got.get("prompts") or [])
-                if isinstance(r, dict) and str(r.get("id") or "")
-                != "classic"]
+        for raw in (got.get("prompts") or []):
+            if not isinstance(raw, dict):
+                continue
+            pid = str(raw.get("id") or "").strip()
+            if not pid or pid == "classic":
+                continue
+            rows.append({
+                "id": pid[:40],
+                "name": str(raw.get("name") or "untitled")[:60],
+                "text": str(raw.get("text") or "")[:4000],
+                "notes": str(raw.get("notes") or "")[:1200],
+                "at": int(raw.get("at") or 0),
+                "builtin": False,
+            })
         active = str(got.get("active") or "classic")
+        prefs = str(got.get("prefs") or "")[:1200]
     except Exception:  # noqa: BLE001
         pass
     rows.insert(0, {"id": "classic", "name": "the classic (#646)",
-                    "text": VISION_PROMPT_CLASSIC, "builtin": True})
+                    "text": VISION_PROMPT_CLASSIC, "builtin": True,
+                    "notes": "", "at": 0})
     if active not in {str(r.get("id")) for r in rows}:
         active = "classic"
-    return {"prompts": rows, "active": active}
+    return {"prompts": rows, "active": active, "prefs": prefs,
+            "default_id": "classic",
+            "default_text": VISION_PROMPT_CLASSIC}
 
 
-def vision_prompts_save(rows: list[dict[str, Any]], active: str) -> None:
+def vision_prompts_save(rows: list[dict[str, Any]], active: str,
+                        prefs: str | None = None) -> None:
+    """Write the library down whole - .tmp then .replace, under the
+    lock, so a half-written library can never be what the station wakes
+    up to. `prefs` left None keeps whatever is already on disk, so an
+    older two-argument caller cannot quietly wipe the house rules."""
+    with _VISION_LOCK:
+        try:
+            keep_prefs = str(
+                prefs if prefs is not None
+                else (vision_prompts().get("prefs") or ""))[:1200]
+        except Exception:  # noqa: BLE001
+            keep_prefs = ""
+        try:
+            VISION_PROMPTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            keep = [{"id": str(r.get("id") or "")[:40],
+                     "name": str(r.get("name") or "untitled")[:60],
+                     "text": str(r.get("text") or "")[:4000],
+                     "notes": str(r.get("notes") or "")[:1200],
+                     "at": int(r.get("at") or 0) or int(time.time())}
+                    for r in rows if str(r.get("id") or "") != "classic"
+                    and str(r.get("text") or "").strip()][:24]
+            tmp = VISION_PROMPTS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {"prompts": keep, "active": active, "prefs": keep_prefs}))
+            tmp.replace(VISION_PROMPTS_PATH)
+        except OSError:
+            pass
+
+
+def vision_prompt_compose(text: str, prefs: str = "") -> str:
+    """One prompt as the model actually receives it: the variant's own
+    words, then the standing preferences underneath (#860). Composing in
+    ONE place means the prompt that is sent is byte for byte the prompt
+    the dossier shows you afterwards."""
+    body = str(text or "").strip() or VISION_PROMPT_CLASSIC
+    extra = " ".join(str(prefs or "").split())[:1200]
+    if extra:
+        body += ("\n\nSTANDING PREFERENCES for looking at pictures at "
+                 "this station, which apply on top of everything above: "
+                 + extra)
+    return body
+
+
+def vision_prompt_row(pid: str = "") -> dict[str, Any]:
+    """One variant by id - or the active one when `pid` is empty. Never
+    raises and never comes back empty: the classic is the floor."""
     try:
-        VISION_PROMPTS_PATH.parent.mkdir(parents=True, exist_ok=True)
-        keep = [{"id": str(r.get("id") or "")[:40],
-                 "name": str(r.get("name") or "untitled")[:60],
-                 "text": str(r.get("text") or "")[:4000]}
-                for r in rows if str(r.get("id") or "") != "classic"
-                and str(r.get("text") or "").strip()][:24]
-        tmp = VISION_PROMPTS_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"prompts": keep, "active": active}))
-        tmp.replace(VISION_PROMPTS_PATH)
-    except OSError:
-        pass
+        lib = vision_prompts()
+        want = str(pid or "").strip() or str(lib["active"])
+        for row in lib["prompts"]:
+            if str(row.get("id")) == want:
+                return dict(row)
+        return dict(lib["prompts"][0])
+    except Exception:  # noqa: BLE001
+        return {"id": "classic", "name": "the classic (#646)",
+                "text": VISION_PROMPT_CLASSIC, "builtin": True}
+
+
+def vision_prompt_for(pid: str = "") -> str:
+    """What the station would look through if it used that variant -
+    the variant's text with the house rules already folded in."""
+    try:
+        lib = vision_prompts()
+        want = str(pid or "").strip() or str(lib["active"])
+        text = ""
+        for row in lib["prompts"]:
+            if str(row.get("id")) == want:
+                text = str(row.get("text") or "")
+                break
+        return vision_prompt_compose(text, str(lib.get("prefs") or ""))
+    except Exception:  # noqa: BLE001
+        return VISION_PROMPT_CLASSIC
 
 
 def vision_prompt_active() -> str:
     """What the station looks through right now (#878)."""
-    lib = vision_prompts()
-    for row in lib["prompts"]:
-        if str(row.get("id")) == lib["active"]:
-            return str(row.get("text") or VISION_PROMPT_CLASSIC)
-    return VISION_PROMPT_CLASSIC
+    return vision_prompt_for("")
 
 
 def image_analysis_ready(name: str, analysis: str, model: str = "",
@@ -21301,6 +21407,129 @@ async def dj_gallery_round() -> list[str]:
     if lines and seed:
         speakbox_remember(seed)
     return lines
+
+
+# --- Look again (#860) ------------------------------------------------------
+#
+# "Whenever I edit the prompt and I submit it, I want to submit the image for
+#  re analysis and have the lines for speaking about it redone based on the
+#  new analysis of the system prompt that I write in there."
+#
+# Looking takes the vision model the better part of a minute and writing a
+# round takes longer still, so a re-analysis is a JOB: the panel gets a ticket
+# straight back and watches it land. The new reading goes down the SAME road
+# the gallery press uses and nowhere else -
+#
+#   describe_gallery_image(name, prompt=...)   looks, and on the way out
+#     image_analysis_ready(...)                puts the new description in the
+#                                              booth with the exact prompt
+#     _RADIO["gallery_now"]                    holds the picture up beside the
+#                                              dialogue
+#   dj_reanalysis_round(name, desc)            writes and AIRS fresh lines off
+#                                              the new description
+#     gallery_line_mark([name], began)         hangs the picture on every line
+#                                              the round just aired (#702)
+#
+# so the pair really are talking about the new reading, in their own voices,
+# on the actual broadcast - not about a cached one.
+_VISION_JOBS: dict[str, dict[str, Any]] = {}
+_VISION_JOB_LOCK = RLock()
+
+
+def vision_job_put(job: str, **fields: Any) -> dict[str, Any]:
+    """Set down where a re-analysis got to. Keeps the last two dozen."""
+    with _VISION_JOB_LOCK:
+        row = _VISION_JOBS.setdefault(
+            str(job), {"job": str(job), "state": "queued", "at": time.time(),
+                       "image": "", "prompt": "", "description": "",
+                       "lines": [], "error": "", "ms": 0})
+        row.update(fields)
+        row["seen"] = time.time()
+        if len(_VISION_JOBS) > 24:
+            old = sorted(_VISION_JOBS,
+                         key=lambda k: float(_VISION_JOBS[k].get("at") or 0))
+            for dead in old[:-24]:
+                _VISION_JOBS.pop(dead, None)
+        return dict(row)
+
+
+def vision_job_get(job: str) -> dict[str, Any]:
+    with _VISION_JOB_LOCK:
+        row = _VISION_JOBS.get(str(job or ""))
+        return dict(row) if row else {}
+
+
+async def dj_reanalysis_round(name: str, desc: str) -> list[str]:
+    """The pair take ONE picture up again, off the new reading (#860).
+
+    The same shape as the gallery press: the description IS the thing they
+    talk about, the booth holds the picture up, and every line the round airs
+    gets the picture hung on it."""
+    if not (name and desc):
+        return []
+    _RADIO["gallery_now"] = {
+        "at": time.time(),
+        "images": [{"name": name, "desc": desc}],
+    }
+    try:
+        seed = await speakbox_quote(most=4, cap=380)
+    except Exception:                              # noqa: BLE001
+        seed = None
+    angle = (
+        "THE PAIR LOOK AT ONE PICTURE AGAIN, PROPERLY. The station has just "
+        "re-read this piece off the wall with fresh eyes and a new brief, and "
+        "THIS is what came back - the only account of it that counts now: "
+        f"\"{desc}\" "
+        "Talk about THIS reading of it and nothing else: the colours and "
+        "where they sit, the figures, what is happening in the corners, and "
+        "what it does to you. Say out loud that you are looking at it again "
+        "and seeing something you did not see the first time, and argue "
+        "about what changed. One of you must propose a title out of what is "
+        "actually described here, phrased naturally as 'it should have been "
+        "called ...'. Spoken aloud; no markdown, no preamble, no list."
+        + (f" Somewhere in it one of you drops this, word for word, as "
+           f"though it settles the argument: \"{seed['text']}\""
+           if seed else ""))
+    angle += radio_prompt_instruction("gallery")
+    began = time.time()
+    lines = await dj_banter(None, angle=angle, lines=8,
+                            source=(seed or {}).get("file", ""))
+    gallery_line_mark([name], began)
+    if lines and seed:
+        speakbox_remember(seed)
+    return lines
+
+
+async def vision_reanalyse_job(job: str, image: str, look: str,
+                               redo_lines: bool = True) -> None:
+    """Read one picture again through `look`, then redo what is said about
+    it. Wrapped end to end - nothing in here may take the station off air."""
+    try:
+        vision_job_put(job, state="looking", image=image, prompt=look)
+        began = time.monotonic()
+        name, desc = await describe_gallery_image(image, prompt=look)
+        if not desc:
+            vision_job_put(
+                job, state="failed",
+                error=f"the vision model came back empty on {image[:60]!r} - "
+                      "is that picture still on the wall?")
+            return
+        vision_job_put(job, state="writing", image=name, description=desc,
+                       ms=int((time.monotonic() - began) * 1000))
+        pipeline_log("model", f"looked again at {name} through an edited "
+                              f"prompt - {len(desc)} chars (#860)")
+        if not redo_lines:
+            vision_job_put(job, state="done", lines=[])
+            return
+        said = await dj_reanalysis_round(name, desc)
+        vision_job_put(job, state="done",
+                       lines=[str(x) for x in (said or [])])
+    except Exception as exc:                       # noqa: BLE001
+        try:
+            vision_job_put(job, state="failed", error=str(exc)[:200])
+            pipeline_log("drop", f"the re-analysis died: {exc}"[:200])
+        except Exception:                          # noqa: BLE001
+            pass
 
 
 # --- Hawking the art (#719, #723) -------------------------------------------
@@ -32949,11 +33178,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
         except Exception:
             pass                    # the draft stands; bank it as written
 
+    _seed_forced = False                                    # #862
     if seed.get("text"):
         # Mined means SAID (#404): a swath the model paraphrased away is
         # put back as the round's opening line, verbatim.
         probe = " ".join(seed["text"].split()).lower()[:60]
         if probe and probe not in " ".join(script.split()).lower():
+            # #862: and being put back word for word is what makes it a
+            # VERBATIM passage, with the same protection as the ones
+            # below. Registered where `_verbatim` is declared.
+            _seed_forced = True
             script = f"A: {seed['text']}\n" + script
     _sb = dj_settings()
 
@@ -32982,6 +33216,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # themselves, and rewording them is exactly "not hearing enough
     # speakerbox rhetoric".
     _verbatim: list[list[str]] = []
+    # #862: the seed the model dropped and #404 put back is the operator's
+    # own document too - and under a crystal it is the tinted draw (#834),
+    # so leaving it off this list meant the ONE passage the rewrite could
+    # paraphrase away was the crystal's. It goes in at the head, which is
+    # where #404 put it, so _restore() puts it back in the same place.
+    if _seed_forced and str(seed.get("text") or "").strip():
+        _verbatim.append(["head", str(seed["text"]).strip()])
     full_swath: dict[str, Any] = {}
     if (not caller_name and random.random() < float(
             _sb.get("speakbox_full_swath_rate") or 0)):
@@ -33082,6 +33323,30 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     vouched.append(_quoted)
     except Exception:  # noqa: BLE001
         pass
+    # #862: GENERATE, ALTER, ENHANCE, THEN REPROCESS. Everything above
+    # this line has assembled the round: the model wrote it under the
+    # crystal's tint, the speakbox stapled its verbatim passages onto the
+    # front and the back, and #844 put back anything the slider guaranteed.
+    # Now it goes back through the writing room once, to have the pair
+    # actually react to what was stapled in - the passages held word for
+    # word, only the conversation around them rewritten. Bank road only:
+    # #842 says a pre-recorded round has no clock on it, so the air path
+    # never waits on this, and blend_script returns the round untouched on
+    # any doubt at all.
+    if bank and not caller_name and _verbatim:
+        try:
+            _blended = await blend_script(script, _verbatim, caller_name)
+            if _blended and _blended != script:
+                script = _blended
+                # The blend may answer a passage with a turn of its own,
+                # and `lines` is a HARD cap on how many turns speak_turns
+                # will air - so a round that grew has to be allowed to
+                # finish. Bounded by the same six the blend is bounded by.
+                _bt = len(banter_turns(script, caller_name))
+                if _bt > lines:
+                    lines = min(_bt, lines + 6)
+        except Exception:  # noqa: BLE001
+            pass                        # the assembled round stands
     entry = {
         "script": script, "lines": lines, "vouched": vouched,
         "source": source or seed.get("file", ""),
@@ -33122,6 +33387,110 @@ async def dj_banter(track: dict[str, Any] | None = None,
                              f"{type(exc).__name__}: {exc}"[:180],
                      extra=traceback.format_exc()[-1200:])
         return []
+
+
+async def blend_script(script: str, verbatim: list[Any] | None = None,
+                       caller_name: str = "") -> str:
+    """#862: THE REPROCESS PASS - the stage that was missing.
+
+    A round is built in three movements that never met. The model WRITES
+    it, under the crystal's tint and around the seed it was handed; the
+    speakbox then STAPLES verbatim passages onto the front and the back of
+    whatever came back; and then it airs. Nothing ever put the two
+    together, so a passage lifted out of the documents lands as a
+    monologue nobody answers and the conversation carries on as though it
+    had not been said - a reading with chatter either side of it, which is
+    exactly what "we need them to stack up" is about.
+
+    This hands the ASSEMBLED script back to the writing room with one job:
+    leave the passages alone, word for word, and rewrite what is AROUND
+    them so the room reacts. It FAILS CLOSED - any doubt at all and the
+    original airs unchanged, because a stapled round is worse radio than a
+    blended one but a LOST round is worse than both, and a reworded
+    document is the thing #838 exists to stop.
+
+    Called on the BANK road only: #842 already establishes that a
+    pre-recorded round has no clock on it and nothing waiting on it, so
+    this never touches the air path."""
+    if os.getenv("PINE_BLEND", "1") == "0":
+        return script                   # the kill switch, no restart
+    script = str(script or "")
+    keep: list[str] = []
+    for _row in (verbatim or []):
+        try:
+            one = " ".join(str(_row[1] or "").split())
+        except Exception:  # noqa: BLE001
+            continue
+        if len(one) >= 40 and one not in keep:
+            keep.append(one)
+    if not keep or not script.strip():
+        return script                   # nothing stapled; nothing to blend
+    was = banter_turns(script, caller_name)
+    if len(was) < 2:
+        return script
+    # ask_model clamps its budget to reply_max_chars and then truncates to
+    # it, so a script already at the ceiling cannot come back whole and
+    # blending it would only cost the round its tail. Said out loud in the
+    # log, because the cure is the operator's own reply budget.
+    budget = int(dj_settings().get("reply_max_chars") or 6000)
+    if len(script) + 400 > budget:
+        pipeline_log("model", "the round is already at the reply budget, "
+                     "so blending it would truncate it - it airs as "
+                     f"assembled ({len(script)} of {budget} chars) (#862)")
+        return script
+    quoted = "\n\n".join(f"PASSAGE {_n + 1}: {one}"
+                         for _n, one in enumerate(keep))
+    try:
+        out = await ask_model(
+            "Below is a radio script about to go out, and the passages "
+            "inside it that get read on air WORD FOR WORD.\n\n"
+            "THE PASSAGES ARE UNTOUCHABLE. They are lifted out of the "
+            "station's own documents, they are already in the script, and "
+            "they must still be in it, unaltered, when you are done - "
+            "every word, in the same order. Do not reword, shorten, "
+            "translate, re-punctuate or summarise a syllable of them, and "
+            "never fold one into somebody else's sentence.\n\n"
+            "EVERYTHING ELSE IS YOURS. Rewrite the turns AROUND each "
+            "passage so the room reacts to it: whoever speaks next picks "
+            "up a SPECIFIC word or image out of it - repeats it back, "
+            "argues with it, is thrown by it, deliberately mishears it - "
+            "and the turn after that carries it on. Lead INTO each "
+            "passage and land OUT of it. No passage may sit at the start "
+            "or the end of the round with nothing answering it. A "
+            "listener has to hear ONE conversation, not a reading with "
+            "chatter either side of it.\n\n"
+            "Keep every speaker label as it is, keep the same number of "
+            "turns, keep the subject and the energy. No markdown, no "
+            "stage directions, no commentary about the rewrite, no "
+            "preamble - return the script and nothing else."
+            + crystal_clause()
+            + f"\n\nTHE PASSAGES:\n{quoted}\n\nTHE SCRIPT:\n{script}",
+            limit=min(budget, max(900, len(script) + 300)),
+            spice=0.3, num_ctx=16384)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("model", "the blend pass failed; the round airs as "
+                     f"assembled ({type(exc).__name__}) (#862)")
+        return script
+    out = str(out or "")
+    # Every gate below returns the ORIGINAL. Blending is an improvement,
+    # never a dependency.
+    if ":" not in out or not looks_english(out) \
+            or len(out) < int(len(script) * 0.8):
+        return script
+    now = banter_turns(out, caller_name)
+    if not (len(was) <= len(now) <= len(was) + 6):
+        return script
+    flat = " ".join(out.split()).lower()
+    for one in keep:
+        if one.lower()[:60] not in flat:
+            pipeline_log("speakbox", "the blend reworded a verbatim "
+                         "passage - the round airs as assembled, word "
+                         "for word (#862/#838)")
+            return script
+    pipeline_log("model", f"the round was blended: {len(keep)} verbatim "
+                 f"passage(s) kept word for word and {len(now)} turns "
+                 "written around them (#862)", extra=out[:1200])
+    return out
 
 
 async def freshen_script(script: str, caller_name: str = "",
@@ -33220,6 +33589,19 @@ async def freshen_script(script: str, caller_name: str = "",
     for _ in range(cfg["retries"]):
         if not hits:
             return _restore(script)             # #838
+        # #862: ask_model clamps its answer to reply_max_chars and then
+        # TRUNCATES to it, so a script longer than the budget is handed
+        # back with its ending missing - the appended passage and the
+        # turns around it included. Fall through to the swap instead: it
+        # replaces only the repeated lines, off the documents, and the
+        # round keeps its length and its verbatim material.
+        if len(script) + 400 > int(dj_settings().get("reply_max_chars")
+                                   or 6000):
+            pipeline_log("model", "the round is longer than the reply "
+                         "budget - a rewrite would come back with its "
+                         "ending cut off, so the repeated lines are "
+                         "swapped for fresh material instead (#862)")
+            break
         banned = "; ".join(f'"{v["phrase"]}"' for _s, v in hits[:8])
         pipeline_log("model", f"{len(hits)} line(s) reuse a phrase already on "
                               "air this hour — asking for them again (#no-repeats)",
@@ -50056,6 +50438,19 @@ async def vision_prompts_write(
     lib = vision_prompts()
     rows = [r for r in lib["prompts"] if not r.get("builtin")]
     active = lib["active"]
+    prefs = str(lib.get("prefs") or "")
+    # #860: the house rules can be set on their own, or in the same
+    # breath as a prompt. Absent means "leave them alone".
+    if "prefs" in payload:
+        prefs = str(payload.get("prefs") or "").strip()[:1200]
+    # #860: a rename must not demand the whole text back again.
+    if payload.get("rename"):
+        want = str(payload["rename"])
+        for row in rows:
+            if str(row.get("id")) == want:
+                row["name"] = (str(payload.get("name") or "").strip()
+                               or str(row.get("name") or "")
+                               or "untitled")[:60]
     if payload.get("revert"):
         active = "classic"
     elif payload.get("delete"):
@@ -50066,21 +50461,102 @@ async def vision_prompts_write(
     elif str(payload.get("text") or "").strip():
         pid = str(payload.get("id") or "").strip() or (
             "vp_" + uuid.uuid4().hex[:8])
+        # The classic is never overwritten - editing it and pressing
+        # save makes a NEW one, so revert always has somewhere to go.
+        if pid == "classic":
+            pid = "vp_" + uuid.uuid4().hex[:8]
+        old = next((r for r in rows if str(r.get("id")) == pid), {})
         row = {"id": pid,
-               "name": str(payload.get("name") or "").strip()
-               or "my prompt",
-               "text": str(payload["text"]).strip()}
+               "name": (str(payload.get("name") or "").strip()
+                        or str(old.get("name") or "")
+                        or "my prompt")[:60],
+               "text": str(payload["text"]).strip(),
+               "notes": (str(payload.get("notes") or "").strip()
+                         or str(old.get("notes") or ""))[:1200],
+               "at": int(time.time())}
         rows = [r for r in rows if str(r.get("id")) != pid] + [row]
         active = pid if payload.get("use", True) else active
     elif payload.get("active"):
         active = str(payload["active"])
-    vision_prompts_save(rows, active)
+    vision_prompts_save(rows, active, prefs)
     out = vision_prompts()
     pipeline_log("air", "the looking prompt is now "
                  f"{out['active']!r} — the pair describe pictures "
                  "through it from the next one on (#878)")
     note_action("👁 looking prompt: " + out["active"])
     return out
+
+
+@app.post("/api/vision/reanalyze")
+@app.post("/api/vision/reanalyse")
+async def vision_reanalyse_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#860: read ONE picture again through a prompt you just wrote, and redo
+    what the pair say about it.
+
+    {image, text?, id?, lines?}
+        image   the gallery filename to look at again
+        text    the prompt to look through - what you just typed, saved or
+                not. Wins over everything.
+        id      or a stored variant to look through instead
+        lines   false looks again WITHOUT sending the pair back on air
+
+    Comes back at once with a ticket, because looking takes the vision model
+    most of a minute and the round takes longer. Poll
+    GET /api/vision/reanalyse/{job} and the new description, then the new
+    lines, land on it as they happen."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    image = str(payload.get("image") or payload.get("name") or "").strip()
+    if not image:
+        raise HTTPException(status_code=400,
+                            detail="Name the picture to look at again")
+    text = str(payload.get("text") or "").strip()
+    if text:
+        try:
+            prefs = str(vision_prompts().get("prefs") or "")
+        except Exception:                          # noqa: BLE001
+            prefs = ""
+        look = vision_prompt_compose(text, prefs)
+    else:
+        look = vision_prompt_for(str(payload.get("id") or "").strip())
+    redo = bool(payload.get("lines", True))
+    job = "vr_" + uuid.uuid4().hex[:10]
+    vision_job_put(job, state="queued", image=image, prompt=look, redo=redo)
+    pipeline_log("air", f"looking at {image} again through an edited "
+                        "prompt (#860)")
+    note_action("👁 look again: " + image[:40])
+
+    async def _again() -> None:
+        try:
+            await vision_reanalyse_job(job, image, look, redo)
+        except Exception as exc:                   # noqa: BLE001
+            pipeline_log("drop", f"the re-analysis task died: {exc}"[:200])
+
+    asyncio.create_task(_again())
+    return {"job": job, "state": "queued", "image": image, "prompt": look,
+            "redo": redo}
+
+
+@app.get("/api/vision/reanalyze/{job}")
+@app.get("/api/vision/reanalyse/{job}")
+async def vision_reanalyse_state(
+    job: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#860: where that re-analysis got to - queued, looking, writing, done
+    or failed, with the new description and the new lines as they arrive."""
+    require_read_auth(authorization)
+    row = vision_job_get(job)
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail="No such re-analysis - it may have aged "
+                                   "off the shelf")
+    return row
 
 
 @app.get("/api/generations")
@@ -64175,14 +64651,449 @@ function boothAnalysisDossier(line) {
   pr.textContent = line.prompt
     || "(recorded for analyses from here on — this one is older)";
   pop.appendChild(pr);
+  /* #860: the prompt is not a read-only receipt any more. Click it and
+   * the library opens - every looking prompt the station owns, the one
+   * it is using, an edit box, and the button that sends THIS picture
+   * back to be read again through whatever you just wrote. */
+  try {
+    if (line.image) {
+      pr.style.cursor = "pointer";
+      pr.style.borderColor = "#7a4fa8";
+      pr.title = "Click to edit this prompt, keep it, and look at this "
+        + "picture again through it (#860)";
+      const hint = el("div", "muted",
+        "click the prompt to edit it, store it, and re-analyse this "
+        + "picture");
+      hint.style.cssText = "font-size:10px;color:#a07fc8;cursor:pointer;"
+        + "margin-top:-2px";
+      const openDesk = (ev) => {
+        if (ev) ev.stopPropagation();
+        try {
+          visionPromptDesk(line, pr, (got) => {
+            try {
+              if (got && got.description) res.textContent = got.description;
+              if (got && got.prompt) pr.textContent = got.prompt;
+            } catch (e) { }
+          });
+        } catch (e) { }
+      };
+      pr.onclick = openDesk;
+      hint.onclick = openDesk;
+      pop.appendChild(hint);
+    }
+  } catch (e) { }
   document.body.appendChild(pop);
   const off = (ev) => {
+    /* The desk is a panel of its own, outside this one, and this
+     * listener runs in the CAPTURE phase - so it has to be told to
+     * spare it, or reaching for the edit box shuts the dossier. */
+    let desk = null;
+    try { desk = document.getElementById("visionPromptDesk"); }
+    catch (e) { desk = null; }
+    if (desk && desk.contains(ev.target)) return;
     if (!pop.contains(ev.target)) {
       pop.remove();
       document.removeEventListener("click", off, true);
     }
   };
   setTimeout(() => document.addEventListener("click", off, true), 0);
+}
+
+/* #860: the looking-prompt desk.
+ *
+ * "I want to be able to click on the prompt and edit what the prompt is and
+ *  have a storage of the system prompts that we're using for analyzing these
+ *  images... whenever I edit the prompt and I submit it, I want to submit the
+ *  image for re analysis and have the lines for speaking about it redone
+ *  based on the new analysis of the system prompt that I write in there."
+ *
+ * Anchored to the prompt block in the dossier, in the djTailPanel idiom. The
+ * library cycles with the arrows or the dropdown and scrolls in the shelf;
+ * the classic sits at the head of it, starred when armed, and can never be
+ * overwritten or thrown away - which is what makes "Default" a promise. The
+ * standing preferences underneath are folded into EVERY look, so the house
+ * rules do not have to be retyped into each prompt.
+ *
+ * Submitting is the point: the picture goes back to the vision model through
+ * whatever is in the box, and when the new reading lands the pair are sent
+ * back on air about it. That takes minutes, so the desk takes a ticket and
+ * watches - the new description first, then the new lines. Everything here
+ * is wrapped; a failure must never blank the panel or the broadcast. */
+function visionPromptDesk(line, anchor, onResult) {
+  try {
+    const gone = document.getElementById("visionPromptDesk");
+    if (gone) { gone.remove(); return; }
+    const pop = el("div", "panel", "");
+    pop.id = "visionPromptDesk";
+    let at = {left: 60, bottom: 90};
+    try { at = anchor.getBoundingClientRect(); } catch (e) { }
+    pop.style.cssText = "position:fixed;z-index:260;width:min(470px,94vw);"
+      + "padding:10px 12px;margin:0;max-height:86vh;overflow:auto;"
+      + "box-shadow:0 20px 60px rgba(0,0,0,.75);"
+      + "left:" + Math.max(8, Math.min(window.innerWidth - 480,
+          (at.left || 60) - 30)) + "px;"
+      + "top:" + Math.max(8, Math.min(window.innerHeight - 220,
+          (at.bottom || 90) + 6)) + "px";
+    pop.onclick = (e) => e.stopPropagation();
+
+    let book = {prompts: [], active: "classic", prefs: ""};
+    let hold = "classic";
+    let timer = 0;
+
+    const head = el("div", "row", "");
+    head.style.cssText = "gap:6px;align-items:center";
+    const title = el("b", "", "\u25c8 the looking prompt");
+    title.style.cssText = "flex:1;font-size:12px;color:#c9a0e0";
+    const shut = el("button", "", "\u2715");
+    shut.title = "Close the desk";
+    shut.onclick = () => { clearTimeout(timer); pop.remove(); };
+    head.appendChild(title); head.appendChild(shut);
+    pop.appendChild(head);
+    const blurb = el("div", "muted",
+      "Every prompt the station looks through. Edit one, keep it, and send "
+      + "this picture back to be read again - the pair redo what they say "
+      + "about it, on air, off the new reading.");
+    blurb.style.cssText = "font-size:10.5px;line-height:1.45;margin:2px 0 6px";
+    pop.appendChild(blurb);
+
+    const pick = el("div", "row", "");
+    pick.style.cssText = "gap:5px;align-items:center;margin-bottom:5px";
+    const back = el("button", "", "\u2039");
+    const sel = el("select", "", "");
+    const fwd = el("button", "", "\u203a");
+    back.title = "The one before";
+    fwd.title = "The next one";
+    back.style.cssText = "padding:1px 9px";
+    fwd.style.cssText = "padding:1px 9px";
+    sel.style.cssText = "flex:1;min-width:0;font-size:11px";
+    pick.appendChild(back); pick.appendChild(sel); pick.appendChild(fwd);
+    pop.appendChild(pick);
+
+    const shelf = el("div", "", "");
+    shelf.style.cssText = "max-height:104px;overflow-y:auto;border:1px solid "
+      + "var(--border);border-radius:6px;padding:3px;margin-bottom:6px";
+    pop.appendChild(shelf);
+
+    const nameBox = el("input", "", "");
+    nameBox.placeholder = "what this one is called";
+    nameBox.style.cssText = "width:100%;font-size:11px;margin-bottom:4px";
+    pop.appendChild(nameBox);
+    const box = el("textarea", "", "");
+    box.style.cssText = "width:100%;min-height:150px;font-size:11.5px;"
+      + "line-height:1.5";
+    box.placeholder = "How the station is to look at a picture...";
+    pop.appendChild(box);
+
+    const prefCap = el("b", "",
+      "STANDING PREFERENCES \u2014 folded into every look");
+    prefCap.style.cssText = "font-size:10px;color:#6db3d1;display:block;"
+      + "margin-top:7px";
+    pop.appendChild(prefCap);
+    const prefs = el("textarea", "", "");
+    prefs.placeholder = "e.g. name the dominant colour first; never guess who "
+      + "a person is; always say what is happening in the background.";
+    prefs.style.cssText = "width:100%;min-height:52px;font-size:11px;"
+      + "line-height:1.45";
+    pop.appendChild(prefs);
+
+    const bar = el("div", "row", "");
+    bar.style.cssText = "gap:5px;flex-wrap:wrap;margin-top:7px";
+    const save = el("button", "", "\ud83d\udcbe Save");
+    const asNew = el("button", "", "\uff0b Save as new");
+    const rename = el("button", "", "\u270e Rename");
+    const revert = el("button", "", "\u21a9 Default");
+    const use = el("button", "", "\u2605 Use this");
+    asNew.title = "Keep what is in the box as a NEW prompt and arm it";
+    rename.title = "Just change what this one is called";
+    revert.title = "Back to the classic - the default is always there";
+    use.title = "Look through this one from the next picture on";
+    [save, asNew, rename, revert, use].forEach((b) => {
+      b.style.cssText = "font-size:10.5px;padding:2px 7px";
+      bar.appendChild(b);
+    });
+    pop.appendChild(bar);
+
+    const go = el("button", "primary", "\ud83d\udc41 Re-analyse this picture");
+    go.style.cssText = "margin-top:7px;width:100%;font-size:11.5px";
+    go.title = "Look at this picture again through what is in the box, then "
+      + "redo the lines the pair speak about it";
+    pop.appendChild(go);
+    const say = el("div", "muted", "");
+    say.style.cssText = "font-size:10.5px;margin:6px 0 2px;min-height:13px;"
+      + "line-height:1.4";
+    pop.appendChild(say);
+    const outWrap = el("div", "", "");
+    pop.appendChild(outWrap);
+
+    function current() {
+      const rows = book.prompts || [];
+      for (let i = 0; i < rows.length; i++) {
+        if (String(rows[i].id) === hold) return rows[i];
+      }
+      return null;
+    }
+
+    function fill() {
+      try {
+        const row = current();
+        const builtin = !!(row && row.builtin);
+        box.value = row ? String(row.text || "") : "";
+        nameBox.value = row ? String(row.name || "") : "";
+        nameBox.disabled = builtin;
+        rename.disabled = builtin;
+        save.disabled = builtin;
+        save.title = builtin
+          ? "The default is never overwritten - use Save as new"
+          : "Overwrite this stored prompt with what is in the box";
+      } catch (e) { }
+    }
+
+    function syncSel() {
+      try {
+        sel.innerHTML = "";
+        (book.prompts || []).forEach((row) => {
+          const o = el("option", "",
+            (String(row.id) === String(book.active) ? "\u2605 " : "")
+            + String(row.name || row.id));
+          o.value = String(row.id);
+          sel.appendChild(o);
+        });
+        sel.value = hold;
+      } catch (e) { }
+    }
+
+    function paintShelf() {
+      try {
+        shelf.innerHTML = "";
+        (book.prompts || []).forEach((row) => {
+          const armed = String(row.id) === String(book.active);
+          const r = el("div", "", "");
+          r.style.cssText = "display:flex;gap:5px;align-items:center;"
+            + "padding:2px 4px;font-size:10.5px;border-radius:4px;"
+            + "cursor:pointer;"
+            + (String(row.id) === hold ? "background:#16233a" : "");
+          const star = el("span", "", armed ? "\u2605" : "\u25cb");
+          star.style.color = armed ? "#f0c667" : "#3d5570";
+          const nm = el("span", "", String(row.name || row.id));
+          nm.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+            + "text-overflow:ellipsis;white-space:nowrap";
+          nm.title = String(row.text || "").slice(0, 300);
+          r.appendChild(star); r.appendChild(nm);
+          if (row.builtin) {
+            const lock = el("span", "muted", "default");
+            lock.style.cssText = "font-size:9px;color:#5d7189";
+            r.appendChild(lock);
+          } else {
+            const bin = el("button", "", "\u2715");
+            bin.style.cssText = "font-size:9.5px;padding:0 5px";
+            bin.title = "Throw this prompt away";
+            bin.onclick = async (ev) => {
+              ev.stopPropagation();
+              try { await post({"delete": String(row.id)}); }
+              catch (e) { say.textContent = e.message; }
+            };
+            r.appendChild(bin);
+          }
+          r.onclick = () => { hold = String(row.id); repaint(); };
+          shelf.appendChild(r);
+        });
+      } catch (e) { }
+    }
+
+    function repaint() { syncSel(); paintShelf(); fill(); }
+
+    async function post(body) {
+      const got = await api("/api/vision/prompts",
+        {method: "POST", body: JSON.stringify(body)});
+      if (got && got.prompts) book = got;
+      let there = false;
+      (book.prompts || []).forEach((row) => {
+        if (String(row.id) === hold) there = true;
+      });
+      if (!there) hold = String(book.active || "classic");
+      prefs.value = String(book.prefs || "");
+      repaint();
+      return book;
+    }
+
+    async function load() {
+      try {
+        book = await api("/api/vision/prompts");
+        hold = String(book.active || "classic");
+        /* If this analysis was made through one of the stored prompts, open
+         * on THAT one - it is the one being looked at, after all. */
+        try {
+          const was = String(line.prompt || "");
+          (book.prompts || []).forEach((row) => {
+            const stub = String(row.text || "").slice(0, 60);
+            if (stub && was.indexOf(stub) >= 0) hold = String(row.id);
+          });
+        } catch (e) { }
+        prefs.value = String(book.prefs || "");
+        repaint();
+      } catch (e) { say.textContent = e.message; }
+    }
+
+    const step = (d) => {
+      try {
+        const ids = (book.prompts || []).map((row) => String(row.id));
+        if (!ids.length) return;
+        let i = ids.indexOf(hold);
+        if (i < 0) i = 0;
+        hold = ids[(i + d + ids.length) % ids.length];
+        repaint();
+      } catch (e) { }
+    };
+    back.onclick = () => step(-1);
+    fwd.onclick = () => step(1);
+    sel.onchange = () => { hold = sel.value; fill(); paintShelf(); };
+    shelf.addEventListener("wheel", (ev) => { ev.stopPropagation(); },
+      {passive: true});
+
+    save.onclick = async () => {
+      const done = pending(save, "saving\u2026");
+      try {
+        await post({id: hold, name: nameBox.value.trim(), text: box.value,
+                    use: false, prefs: prefs.value});
+        say.textContent = "kept \u2713";
+      } catch (e) { say.textContent = e.message; }
+      finally { done(); }
+    };
+    asNew.onclick = async () => {
+      const done = pending(asNew, "keeping\u2026");
+      try {
+        const got = await post({name: nameBox.value.trim() || "my prompt",
+                                text: box.value, use: true,
+                                prefs: prefs.value});
+        hold = String((got && got.active) || hold);
+        repaint();
+        say.textContent = "stored, and armed \u2713";
+      } catch (e) { say.textContent = e.message; }
+      finally { done(); }
+    };
+    rename.onclick = async () => {
+      const done = pending(rename, "renaming\u2026");
+      try {
+        await post({rename: hold, name: nameBox.value.trim()});
+        say.textContent = "renamed \u2713";
+      } catch (e) { say.textContent = e.message; }
+      finally { done(); }
+    };
+    revert.onclick = async () => {
+      const done = pending(revert, "reverting\u2026");
+      try {
+        await post({revert: true});
+        hold = "classic";
+        repaint();
+        say.textContent = "back to the default \u2713";
+      } catch (e) { say.textContent = e.message; }
+      finally { done(); }
+    };
+    use.onclick = async () => {
+      const done = pending(use, "arming\u2026");
+      try {
+        await post({active: hold});
+        say.textContent = "the station looks through this one now \u2713";
+      } catch (e) { say.textContent = e.message; }
+      finally { done(); }
+    };
+
+    function paintOut(d) {
+      try {
+        outWrap.innerHTML = "";
+        if (d.description) {
+          const c = el("b", "", "THE NEW READING");
+          c.style.cssText = "font-size:10px;color:#9ce7c4";
+          outWrap.appendChild(c);
+          const t = el("div", "", String(d.description));
+          t.style.cssText = "font-size:11px;line-height:1.55;"
+            + "white-space:pre-wrap;border:1px solid var(--border);"
+            + "border-radius:6px;padding:6px 8px;background:#0a1118;"
+            + "margin:2px 0 7px";
+          outWrap.appendChild(t);
+        }
+        const said = d.lines || [];
+        if (said.length) {
+          const c = el("b", "", "THE NEW LINES \u2014 what they say about it "
+            + "now");
+          c.style.cssText = "font-size:10px;color:#79d8ff";
+          outWrap.appendChild(c);
+          const wrap = el("div", "", "");
+          wrap.style.cssText = "font-size:11px;line-height:1.55;border:1px "
+            + "solid var(--border);border-radius:6px;padding:6px 8px;"
+            + "background:#0a1118;max-height:160px;overflow-y:auto;"
+            + "margin-top:2px";
+          said.forEach((ln) => {
+            const r = el("div", "", String(ln));
+            r.style.cssText = "padding:1px 0";
+            wrap.appendChild(r);
+          });
+          outWrap.appendChild(wrap);
+        }
+        if (d.description && typeof onResult === "function") {
+          onResult({description: String(d.description),
+                    prompt: String(d.prompt || "")});
+        }
+      } catch (e) { }
+    }
+
+    function watch(job) {
+      clearTimeout(timer);
+      if (!job) return;
+      const tick = async () => {
+        if (!pop.isConnected) { clearTimeout(timer); return; }
+        let d = {};
+        try {
+          d = await api("/api/vision/reanalyse/" + encodeURIComponent(job));
+        } catch (e) { say.textContent = e.message; return; }
+        const state = String(d.state || "");
+        say.textContent = ({
+          queued: "on the queue\u2026",
+          looking: "the vision model is reading the picture\u2026",
+          writing: "read \u2713 \u2014 the pair are being sent back on air "
+            + "about it\u2026",
+          done: "done \u2713 \u2014 new reading, new lines, on the broadcast",
+          failed: "\u2717 " + (d.error || "it did not take")
+        }[state] || state);
+        paintOut(d);
+        if (state === "done" || state === "failed") {
+          clearTimeout(timer);
+          return;
+        }
+        timer = setTimeout(tick, 2500);
+      };
+      tick();
+    }
+
+    go.onclick = async () => {
+      const img = String(line.image || "");
+      if (!img) {
+        say.textContent = "there is no picture on this analysis to look at";
+        return;
+      }
+      const done = pending(go, "\ud83d\udc41 looking again\u2026");
+      try {
+        /* The house rules go down FIRST, so the look really is made through
+         * what is on the screen rather than what was on it last time. */
+        if (String(prefs.value || "") !== String(book.prefs || "")) {
+          await post({prefs: prefs.value});
+        }
+        const started = await api("/api/vision/reanalyse",
+          {method: "POST", body: JSON.stringify(
+            {image: img, text: box.value, lines: true})});
+        outWrap.innerHTML = "";
+        say.textContent = "sent \u2014 the model is looking at it again\u2026";
+        watch(started && started.job);
+      } catch (e) { say.textContent = e.message; }
+      finally { done(); }
+    };
+
+    document.body.appendChild(pop);
+    load();
+  } catch (e) {
+    try { setStatus("the looking-prompt desk fell over: " + e.message, true); }
+    catch (e2) { }
+  }
 }
 
 /* ---- #850/#852: the disclosure triangle -------------------------------
