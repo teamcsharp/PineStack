@@ -35285,10 +35285,33 @@ async def ask_model(prompt: str, limit: int = 300,
     # #782: the writing half of a line's story. A spoken line knows which
     # model made it but never how long it waited to be written, and "why was
     # there a gap there" is usually answered here rather than in the render.
+    # #861: and the PAPERWORK. What was asked never survived the call,
+    # so "what did we actually send it?" — the one question worth asking
+    # of a bad round — could not be answered.
+    try:
+        _armed = ""
+        try:
+            _s = load_settings()
+            _armed = str((_s["prompts"][_s["active_prompt"]] or {}).get(
+                "name") or "")
+        except Exception:  # noqa: BLE001
+            _armed = ""
+        _ctx = max(2048, min(131072, num_ctx
+                             or int(writing_profile().get("num_ctx") or 0)
+                             or settings["num_ctx"]))
+    except Exception:  # noqa: BLE001
+        _armed, _ctx = "", 0
     _MODEL_CALLS.append({"at": time.time(), "model": settings["model"],
                          "ms": took, "chars": len(kept),
                          "temp": round(temperature, 2),
-                         "budget": limit, "text": kept[:400]})
+                         "budget": limit, "text": kept[:400],
+                         # #861 — the whole exchange
+                         "prompt": str(prompt)[:6000],
+                         "script": kept[:6000],
+                         "kind": str(_RADIO.get("sched_kind") or ""),
+                         "armed": _armed,
+                         "sched": str(_RADIO.get("sched_prompt") or "")[:900],
+                         "num_ctx": _ctx})
     del _MODEL_CALLS[:-40]
     return kept
 
@@ -42634,6 +42657,27 @@ async def dj_topics_get(
     """Everything in the bank, most recently added first."""
     require_read_auth(authorization)
     return {"topics": read_bombshells()}
+
+
+@app.get("/api/writing-desk")
+async def api_writing_desk(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#861: everything the desk has sent to the model and got back —
+    the prompt as sent, who it was for, what was governing it, and the
+    script that came out."""
+    require_read_auth(authorization)
+    rows = list(reversed(_MODEL_CALLS))
+    live = [r for r in rows if r.get("ms")]
+    return {
+        "calls": rows,
+        "model": (load_settings() or {}).get("model"),
+        "writing_now": bool(_LARDER_WRITING[0] or _OLLAMA_GATE.locked()),
+        "kind_now": str(_RADIO.get("sched_kind") or ""),
+        "slowest_ms": max((int(r.get("ms") or 0) for r in live), default=0),
+        "mean_ms": (round(sum(int(r.get("ms") or 0) for r in live) / len(live))
+                    if live else 0),
+    }
 
 
 @app.get("/api/recording-room")
@@ -53422,6 +53466,12 @@ speaker and restart the agent."
          ceiling per area on a slider. -->
     <!-- #900: the recording room. Who has been in, what they said,
          what it cost, and how much the shelf is saving. -->
+    <!-- #861: the writing desk — every prompt sent and script returned. -->
+    <button id="deskBtn" class="pine-restart"
+            title="The writing desk - every call to the model, the exact
+prompt that went out and the script that came back"
+            onclick="deskPanel(this)"
+            style="font-size:15px;line-height:1">\u270d</button>
     <button id="roomBtn" class="pine-restart"
             title="The recording room - every take, who made it, what the
 engine charged for it, and how much work the pantry is saving"
@@ -74425,6 +74475,112 @@ function schedulePanel(anchor) {
     try { setStatus("the scheduler would not open: " + e.message, true); }
     catch (ignored) { /* never let this blank the panel */ }
   }
+}
+
+
+function deskPanel(anchor) {
+  /* #861: the writing desk. Every model call the station has made, and
+   * for each one the exact prompt that went out and the script that came
+   * back — opened with the same disclosure triangle as everything else. */
+  const gone = document.getElementById("deskPanel");
+  if (gone) { gone.remove(); return; }
+  const pop = el("div", "panel", "");
+  pop.id = "deskPanel";
+  const at = anchor.getBoundingClientRect();
+  pop.style.cssText = "position:fixed;z-index:232;width:min(620px,96vw);"
+    + "padding:10px 12px;margin:0;max-height:84vh;overflow:auto;"
+    + "left:" + Math.max(8, Math.min(window.innerWidth - 630, at.left - 340))
+    + "px;top:" + (at.bottom + 6) + "px";
+  pop.onclick = (e) => e.stopPropagation();
+  const hd = el("div", "", "\u270d the writing desk");
+  hd.style.cssText = "font-weight:700;font-size:12px";
+  pop.appendChild(hd);
+  const sub = el("div", "muted", "Every call the desk has made to the "
+    + "model \u2014 what was sent, what was governing it, and what came "
+    + "back. Open one to read the whole exchange.");
+  sub.style.cssText = "font-size:10px;line-height:1.5;margin:3px 0 7px";
+  pop.appendChild(sub);
+  const body = el("div", "", "reading the desk\u2026");
+  body.style.cssText = "font-size:11px;color:var(--muted)";
+  pop.appendChild(body);
+  document.body.appendChild(pop);
+
+  const draw = async () => {
+    let d = null;
+    try { d = await api("/api/writing-desk"); }
+    catch (e) { body.textContent = "the desk is unreachable"; return; }
+    body.textContent = "";
+    const top = el("div", "muted", "");
+    top.style.cssText = "font-size:10px;margin-bottom:6px;line-height:1.5";
+    top.textContent = (d.calls || []).length + " calls held \u00b7 "
+      + (d.writing_now ? "writing now" : "idle")
+      + (d.kind_now ? " \u00b7 on a " + d.kind_now + " segment" : "")
+      + " \u00b7 mean " + (d.mean_ms || 0) + " ms, slowest "
+      + (d.slowest_ms || 0) + " ms \u00b7 " + (d.model || "");
+    body.appendChild(top);
+    (d.calls || []).forEach((c, i) => {
+      const wrap = el("div", "");
+      wrap.style.cssText = "border:1px solid var(--border);border-radius:7px;"
+        + "padding:5px 8px;margin-bottom:5px;background:rgba(255,255,255,.02)";
+      const head = el("div", "");
+      head.style.cssText = "display:flex;gap:6px;align-items:center;"
+        + "cursor:pointer;font-size:10.5px";
+      const tri = el("span", "", "\u25b8");
+      tri.style.cssText = "font-size:9px;width:9px";
+      head.appendChild(tri);
+      const nm = el("b", "", c.kind ? c.kind : "a round");
+      nm.style.color = "var(--accent)";
+      head.appendChild(nm);
+      const meta = el("span", "muted", "");
+      meta.style.cssText = "margin-left:auto;font-size:9.5px";
+      meta.textContent = (c.ms || 0) + " ms \u00b7 " + (c.chars || 0)
+        + " chars \u00b7 ctx " + (c.num_ctx || "?")
+        + " \u00b7 temp " + (c.temp != null ? c.temp : "?");
+      head.appendChild(meta);
+      wrap.appendChild(head);
+      const drawer = el("div", "");
+      drawer.style.display = "none";
+      const put = (label, text, mono) => {
+        if (!text) return;
+        const h = el("div", "muted", label);
+        h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:6px 0 2px";
+        drawer.appendChild(h);
+        const b = el("div", "", String(text));
+        b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
+          + "max-height:30vh;overflow:auto;padding:5px 7px;border-radius:6px;"
+          + "background:#05090f;border:1px solid var(--border)"
+          + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+        drawer.appendChild(b);
+      };
+      put("GOVERNED BY", (c.armed ? "system prompt: " + c.armed : "")
+        + (c.sched ? (c.armed ? "\n\n" : "")
+                     + "the schedule's clause for this entry:\n" + c.sched : ""));
+      put("WHAT WE SENT", c.prompt, true);
+      put("WHAT CAME BACK", c.script || c.text, true);
+      wrap.appendChild(drawer);
+      head.onclick = () => {
+        const open = drawer.style.display !== "none";
+        drawer.style.display = open ? "none" : "block";
+        tri.textContent = open ? "\u25b8" : "\u25be";
+      };
+      body.appendChild(wrap);
+    });
+    if (!(d.calls || []).length) {
+      body.appendChild(el("div", "muted",
+        "nothing yet \u2014 the desk records each call as it makes it."));
+    }
+  };
+  draw();
+  setTimeout(() => {
+    const off = (ev) => {
+      const live = document.getElementById("deskPanel");
+      if (live && !live.contains(ev.target)) {
+        live.remove();
+        document.removeEventListener("click", off);
+      }
+    };
+    document.addEventListener("click", off);
+  }, 0);
 }
 
 
