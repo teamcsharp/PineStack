@@ -5560,8 +5560,29 @@ function wkDeskEntry(id, c) {
   nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff;"
     + "cursor:pointer;user-select:none";
   nm.textContent = (open ? "\u25be " : "\u25b8 ") + label;
+  nm.title = "Click to open this call \u2014 the prompt as sent, "
+    + "what was governing it, and the script that came back";
   t.wkHead = nm;
   t.appendChild(nm);
+  /* #984: A ROW SAYS SOMETHING WHEN IT IS SHUT.
+   *
+   * The desk holds forty calls and every one of them read as the
+   * same sentence - a kind, a duration, a character count - so
+   * finding the call you actually wanted meant opening them one at
+   * a time. The first line of what came back is the one thing that
+   * tells them apart at a glance, and it costs nothing: the payload
+   * already carries it. */
+  const peek = mk2("div", "");
+  peek.style.cssText = "font-size:9.5px;line-height:1.45;opacity:.62;"
+    + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+    + "cursor:pointer;margin-top:1px";
+  const said = String(c.script || c.text || "")
+    .replace(/\s+/g, " ").trim();
+  peek.textContent = said ? said.slice(0, 150) : "(nothing came back)";
+  peek.title = said.slice(0, 400);
+  peek.style.display = open ? "none" : "block";
+  t.wkPeek = peek;
+  t.appendChild(peek);
   const inner = mk2("div", "");
   inner.style.display = open ? "block" : "none";
   t.wkInner = inner;
@@ -5573,10 +5594,12 @@ function wkDeskEntry(id, c) {
     wkPutInto(inner, "WHAT CAME BACK", c.script || c.text, true);
   } catch (e) { /* an entry with no paperwork still lists */ }
   t.appendChild(inner);
-  nm.onclick = (ev) => {
+  const flip = (ev) => {
     ev.stopPropagation();
     wkDeskFold(t, !wkDeskOpen(key));
   };
+  nm.onclick = flip;
+  peek.onclick = flip;      // #984: the whole row opens, not just the name
   return t;
 }
 
@@ -5603,6 +5626,9 @@ function wkDeskFold(t, want) {
     catch (e) { /* private mode: it still works for this session */ }
     t.wkHead.textContent = (want ? "\u25be " : "\u25b8 ") + t.wkLabel;
     t.wkInner.style.display = want ? "block" : "none";
+    // #984: the preview IS the closed state's content, so it steps
+    // aside when the real thing arrives.
+    if (t.wkPeek) t.wkPeek.style.display = want ? "none" : "block";
   } catch (e) { /* one stubborn entry is not worth the drawer */ }
 }
 
