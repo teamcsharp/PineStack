@@ -1727,10 +1727,18 @@ function initWorksPopup() {
 
     // 5 — on air
     const now = (dj && dj.now) || {};
+    /* #904: speaking_now is an OBJECT — {id, who, kind, text, name, …} —
+     * and String()ing it printed "[object Object]" on the glass. Read the
+     * line out of it, with the speaker's name in front. */
+    const sayingRaw = dj && dj.speaking_now;
+    const saying = sayingRaw && typeof sayingRaw === "object"
+      ? ((sayingRaw.name ? sayingRaw.name + ": " : "")
+         + String(sayingRaw.text || "")).trim()
+      : String(sayingRaw || "");
     stage(flow, "⑤ on air",
       dj && dj.speaking ? "talking" : "record",
-      (dj && dj.speaking_now)
-        ? String(dj.speaking_now).slice(0, 120)
+      saying
+        ? saying.slice(0, 160)
         : ((now.artist || "") + " — " + (now.title || "")).slice(0, 120),
       dj && dj.speaking ? "on" : "");
     body.appendChild(flow);

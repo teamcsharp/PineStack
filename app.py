@@ -15006,6 +15006,25 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
                     _row["aired"] = "box"
                     _row["air_at"] = time.time()
                     break
+        elif rows:
+            # #903 (#848): a coalesced BURST has no single line id — it is
+            # a whole conversation — so the #857 repair above could never
+            # fire for it, and every row of a round that DID air kept
+            # saying "held" for ever. The timeline the shelf carries has
+            # the ids; clear them all. air_at is left alone because
+            # _stream_now_set(stamp=True) above has already put each row
+            # at its real moment.
+            _ids = {str(_r.get("id") or "") for _r in rows if _r.get("id")}
+            if _ids:
+                _fixed = 0
+                for _row in _RADIO.get("chat") or []:
+                    if str(_row.get("id") or "") in _ids:
+                        _row["aired"] = "box"
+                        _fixed += 1
+                if _fixed:
+                    pipeline_log("air", f"the shelf replayed a round — "
+                                 f"{_fixed} booth row(s) corrected from "
+                                 "held to aired (#848)")
         lp = _LAST_PLAYOUT
         if lp.get("key") == _played_out_key(clip["path"]) \
                 and time.time() - float(lp.get("at") or 0) < 200:
@@ -24689,7 +24708,11 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     signature = media_sign(key)
     # On the record like any spoken line (#269): which sample, from which
     # folder, with enough identity for the panel to vote it off the air.
-    _RADIO["chat"].append({
+    # #903 (#848): this row was written BEFORE any attempt to play, and
+    # carried no `aired` key at all — so a sting that never sounded read
+    # exactly like one that did. It is stamped now, and the branch below
+    # that already knows it was dropped corrects it.
+    _sting_row = {
         "ts": int(time.time()), "air_at": time.time(),
         "who": "board", "kind": "sfx",
         "text": sample.stem, "sfx": key,
@@ -24698,7 +24721,9 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         # listed is being able to weed the ones that do not fit.
         "seconds": round(sfx_seconds(sample), 2),
         "url": f"/sfx/{key}?t={signature}",
-    })
+        "aired": "airing",
+    }
+    _RADIO["chat"].append(_sting_row)
     del _RADIO["chat"][:-240]
     note_activity("sting", sample.stem)
     # #862: write it down — the operator rules on the rotation from this.
@@ -24762,6 +24787,10 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
                       ms=int((time.monotonic() - _sting_started) * 1000))
     else:
         pipeline_log("drop", f"sting {sample.stem} never sounded (#738)")
+        try:                                   # #903 (#848)
+            _sting_row["aired"] = "never sounded"
+        except Exception:  # noqa: BLE001
+            pass
     # Sometimes the other presenter has FEELINGS about the sample (#292).
     if who in ("dj", "cohost", "third") and random.random() < 0.3:
         other = "cohost" if who != "cohost" else "dj"
@@ -62524,6 +62553,348 @@ function boothAnalysisDossier(line) {
   setTimeout(() => document.addEventListener("click", off, true), 0);
 }
 
+/* ---- #850/#852: the disclosure triangle -------------------------------
+ * "I want to expand all of these with a tri[angle] and see the data."
+ *
+ * One control, used by the booth strip, the recording room and the phase
+ * rows. The catch is that all three panels REPAINT on a timer and rebuild
+ * their rows from scratch, so "this one is open" cannot live in the DOM —
+ * naive code folds every drawer up again a second and a half later.
+ *
+ *   PV_OPEN  which keys are open, keyed by a STABLE server id
+ *            (round:<sha1>, actor:<seat>, phase:<name>, take:<seat>:<at>).
+ *            Mirrored into localStorage so a reload keeps them too.
+ *   PV_BODY  the drawer element itself, reused across repaints, so an open
+ *            drawer keeps its content — and your text selection — instead
+ *            of being torn down and rebuilt ten times a minute.
+ *
+ * A drawer is only re-filled when its signature changes: the row's own
+ * state plus the newest server-log stamp. So it holds still while nothing
+ * is happening, and updates the moment something does.
+ *
+ * The head is a real focus stop: Enter/Space toggle, Right opens, Left
+ * closes, and aria-expanded/aria-controls are kept honest. Everything is
+ * wrapped — a failure here must never blank a panel. */
+var PV_OPEN = (function () {
+  try { return JSON.parse(localStorage.getItem("pvDiscOpen") || "{}") || {}; }
+  catch (e) { return {}; }
+})();
+var PV_BODY = {};
+var PV_DISC_N = 0;
+
+function pvDiscStyle() {
+  try {
+    try { djPendingStyle(); } catch (e) { /* the glow class is optional */ }
+    if (document.getElementById("pvDiscCss")) return;
+    const css = el("style", "", "");
+    css.id = "pvDiscCss";
+    css.textContent =
+      ".pvDiscHead{display:flex;align-items:center;gap:6px;cursor:pointer;"
+      + "user-select:none;border-radius:5px}"
+      + ".pvDiscHead:hover{background:rgba(255,255,255,.05)}"
+      + ".pvDiscHead:focus-visible{outline:1px solid var(--accent);"
+      + "outline-offset:1px}"
+      + ".pvDiscMark{flex:0 0 auto;width:10px;color:var(--accent);"
+      + "font-size:9px;line-height:1;transition:transform .18s ease}"
+      + ".pvDiscOpen>.pvDiscHead>.pvDiscMark{transform:rotate(90deg)}"
+      + ".pvDiscBody{display:none;margin:3px 0 2px 11px;padding-left:8px;"
+      + "border-left:1px solid var(--border)}"
+      + ".pvDiscOpen>.pvDiscBody{display:block}"
+      + ".pvKV{display:grid;grid-template-columns:86px 1fr;gap:1px 7px;"
+      + "font-size:10px;line-height:1.5;margin-bottom:2px}"
+      + ".pvKV>b{color:var(--accent);font-weight:600}"
+      + ".pvCap{font-size:9px;letter-spacing:.05em;margin:6px 0 2px}"
+      + ".pvWire{font-size:9.5px;line-height:1.45;white-space:pre-wrap;"
+      + "word-break:break-word;color:#8fa6c2;border:1px solid var(--border);"
+      + "border-radius:6px;padding:5px 7px;background:#0a1118;margin-top:2px}"
+      + ".pvBar{position:relative;height:5px;border-radius:3px;"
+      + "background:rgba(255,255,255,.09);overflow:hidden;margin:3px 0}"
+      + ".pvBarFill{height:100%;border-radius:3px;background:var(--accent);"
+      + "transition:width .45s ease}"
+      + ".pvOne{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+      + "min-width:0}";
+    document.head.appendChild(css);
+  } catch (e) { /* plain rows still work without the styling */ }
+}
+
+/* pvDisc(key, {title, fill, sig}) -> {wrap, head, body, open}
+ * Append your own summary to `head`; `fill(body)` draws the drawer. */
+function pvDisc(key, opts) {
+  opts = opts || {};
+  pvDiscStyle();
+  const wrap = el("div", "pvDisc", "");
+  const head = el("div", "pvDiscHead", "");
+  let body = null;
+  try {
+    if (Object.keys(PV_BODY).length > 500) PV_BODY = {};   // never grow forever
+    body = PV_BODY[key];
+    if (!body) {
+      body = el("div", "pvDiscBody", "");
+      body.id = "pvDiscBody" + (++PV_DISC_N);
+      PV_BODY[key] = body;
+    }
+    body.className = "pvDiscBody";
+    head.tabIndex = 0;
+    head.setAttribute("role", "button");
+    head.setAttribute("aria-controls", body.id);
+    head.title = opts.title || "Expand this row for everything behind it";
+    const mark = el("span", "pvDiscMark", "▸");
+    mark.setAttribute("aria-hidden", "true");
+    head.appendChild(mark);
+    const show = () => {
+      const on = !!PV_OPEN[key];
+      wrap.classList.toggle("pvDiscOpen", on);
+      head.setAttribute("aria-expanded", on ? "true" : "false");
+      mark.textContent = on ? "▾" : "▸";
+    };
+    const fill = (force) => {
+      if (!PV_OPEN[key] || typeof opts.fill !== "function") return;
+      const sig = (opts.sig === undefined || opts.sig === null)
+        ? String(Date.now()) : String(opts.sig);
+      if (!force && body._pvSig === sig && body.firstChild) return;
+      body._pvSig = sig;
+      try { body.textContent = ""; opts.fill(body); }
+      catch (e) { body.textContent = "this detail is not available"; }
+    };
+    const flip = (ev) => {
+      if (ev) { ev.preventDefault(); ev.stopPropagation(); }
+      if (PV_OPEN[key]) { delete PV_OPEN[key]; } else { PV_OPEN[key] = 1; }
+      try { localStorage.setItem("pvDiscOpen", JSON.stringify(PV_OPEN)); }
+      catch (e) { /* private mode: it still works for this session */ }
+      show();
+      fill(true);
+    };
+    head.onclick = flip;
+    head.onkeydown = (ev) => {
+      const k = ev.key;
+      if (k === "Enter" || k === " " || k === "Spacebar") flip(ev);
+      else if (k === "ArrowRight" && !PV_OPEN[key]) flip(ev);
+      else if (k === "ArrowLeft" && PV_OPEN[key]) flip(ev);
+    };
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    show();
+    fill(false);              // a repaint re-adopts whatever was open
+  } catch (e) {
+    if (!body) { body = el("div", "pvDiscBody", ""); wrap.appendChild(body); }
+  }
+  return {wrap: wrap, head: head, body: body,
+          open: function () { return !!PV_OPEN[key]; }};
+}
+
+/* A label/value grid inside a drawer. */
+function pvKVBox(box, cap) {
+  const grid = el("div", "pvKV", "");
+  try {
+    if (cap) box.appendChild(el("div", "muted pvCap", cap));
+    box.appendChild(grid);
+  } catch (e) { /* the caller still gets a node to write into */ }
+  return grid;
+}
+
+function pvKV(grid, label, value) {
+  const v = el("div", "", "");
+  try {
+    grid.appendChild(el("b", "", String(label)));
+    v.textContent = (value === undefined || value === null || value === "")
+      ? "—" : String(value);
+    grid.appendChild(v);
+  } catch (e) { /* one missing row must not stop the drawer */ }
+  return v;
+}
+
+/* A loading bar. Anything still rendering keeps one (#850). */
+function pvBar(box, frac, label, busy) {
+  try {
+    const pct = Math.max(0, Math.min(1, Number(frac) || 0));
+    const bar = el("div", "pvBar", "");
+    const fill = el("div", "pvBarFill", "");
+    fill.style.width = Math.round(pct * 100) + "%";
+    bar.appendChild(fill);
+    if (busy) bar.appendChild(el("div", "djPendGlow", ""));
+    box.appendChild(bar);
+    if (label) {
+      const cap = el("div", "muted",
+                     label + " · " + Math.round(pct * 100) + "%");
+      cap.style.cssText = "font-size:9px;margin:-2px 0 3px";
+      box.appendChild(cap);
+    }
+    return bar;
+  } catch (e) { return null; }
+}
+
+/* ---- the shared reads ---------------------------------------------------
+ * Every drawer wants the same three feeds. They are fetched at most this
+ * often no matter how many drawers are open, and the last answer is served
+ * to everyone in between. */
+var PV_PIPE = {at: 0, events: [], busy: false};
+var PV_PEND = {at: 0, data: null, busy: false};
+var PV_SCHED = {at: 0, data: null, busy: false};
+
+async function pvPipeline() {
+  try {
+    if (!PV_PIPE.busy && Date.now() - PV_PIPE.at > 2500) {
+      PV_PIPE.busy = true;
+      try {
+        const got = await api("/api/dj/pipeline");
+        PV_PIPE.events = (got && (got.events || got.pipeline)) || [];
+      } catch (e) { /* keep the last answer */ }
+      PV_PIPE.at = Date.now();
+      PV_PIPE.busy = false;
+    }
+  } catch (e) { PV_PIPE.busy = false; }
+  return PV_PIPE.events || [];
+}
+
+/* The newest server stamp. Drawers put this in their signature so they
+ * redraw when the back end speaks and hold still when it does not. */
+function pvPipeTip() {
+  try {
+    const ev = PV_PIPE.events || [];
+    return ev.length ? String(ev[ev.length - 1].ts || 0) : "0";
+  } catch (e) { return "0"; }
+}
+
+async function pvPending() {
+  try {
+    if (!PV_PEND.busy && Date.now() - PV_PEND.at > 2500) {
+      PV_PEND.busy = true;
+      try { PV_PEND.data = await api("/api/dj/pending"); }
+      catch (e) { /* keep the last answer */ }
+      PV_PEND.at = Date.now();
+      PV_PEND.busy = false;
+    }
+  } catch (e) { PV_PEND.busy = false; }
+  return PV_PEND.data || {};
+}
+
+async function pvSchedule() {
+  try {
+    if (!PV_SCHED.busy && Date.now() - PV_SCHED.at > 15000) {
+      PV_SCHED.busy = true;
+      try { PV_SCHED.data = await api("/api/schedule"); }
+      catch (e) { /* keep the last answer */ }
+      PV_SCHED.at = Date.now();
+      PV_SCHED.busy = false;
+    }
+  } catch (e) { PV_SCHED.busy = false; }
+  return PV_SCHED.data || null;
+}
+
+function pvSlotSay(s) {
+  if (!s) return "";
+  return String(s.label || s.kind || "an entry")
+    + " (" + String(s.kind || "?")
+    + (s.minutes ? " · " + s.minutes + " min" : "")
+    + (s.enabled === false ? " · switched out" : "") + ")";
+}
+
+/* What the running order says about right now, and what is next. */
+function pvSlotNow(sched) {
+  try {
+    const slots = (sched && sched.slots) || [];
+    const raw = (sched && sched.now) ? sched.now.index : null;
+    const at = (raw === null || raw === undefined) ? -1 : Number(raw);
+    return {cur: (at >= 0 ? slots[at] : null) || null,
+            next: slots.length ? slots[(at + 1 + slots.length) % slots.length]
+                               : null,
+            count: slots.length,
+            preset: String((sched && sched.active) || "")};
+  } catch (e) { return {cur: null, next: null, count: 0, preset: ""}; }
+}
+
+function pvClock(ms) {
+  try {
+    const at = Number(ms) || 0;
+    if (!at) return "";
+    return new Date(at).toLocaleTimeString([], {hour12: false});
+  } catch (e) { return ""; }
+}
+
+/* Which server lines belong to a row: the ones naming it. */
+function pvMentions(words, kinds) {
+  const w = (words || []).map((s) => String(s || "").toLowerCase().trim())
+    .filter((s) => s.length > 3);
+  const k = kinds || [];
+  return function (ev) {
+    try {
+      if (k.length && k.indexOf(String(ev.kind || "")) < 0) return false;
+      if (!w.length) return true;
+      const hay = (String(ev.text || "") + " "
+        + String(ev.extra || "")).toLowerCase();
+      return w.some((s) => hay.indexOf(s) >= 0);
+    } catch (e) { return false; }
+  };
+}
+
+/* #852: "three lines of output when I expand it that shows what the server
+ * is doing on the back end in regards with our command." Exactly three, the
+ * newest first, and each one is itself a triangle that opens the actual
+ * prompt or the actual reply the server kept beside it. */
+function pvServerLines(box, ctx, pick, want) {
+  const n = want || 3;
+  try {
+    box.appendChild(el("div", "muted pvCap",
+      "⌁ THE BACK END — THE LAST " + n + " LINES ABOUT THIS"));
+    const hold = el("div", "", "");
+    const wait = el("div", "muted", "reading the server…");
+    wait.style.fontSize = "9.5px";
+    hold.appendChild(wait);
+    box.appendChild(hold);
+    const oops = (why) => {
+      try {
+        hold.textContent = "";
+        const row = el("div", "muted", why);
+        row.style.fontSize = "9.5px";
+        hold.appendChild(row);
+      } catch (e) { /* nothing more to do */ }
+    };
+    pvPipeline().then((events) => {
+      try {
+        hold.textContent = "";
+        const all = (events || []).slice();
+        let hit = all;
+        try { if (typeof pick === "function") hit = all.filter(pick); }
+        catch (e) { hit = all; }
+        let exact = true;
+        if (!hit.length) { hit = all; exact = false; }
+        hit = hit.slice(-n).reverse();
+        if (!hit.length) { oops("the server has not said anything yet"); return; }
+        if (!exact) {
+          const note = el("div", "muted",
+            "nothing named this one — the newest lines instead");
+          note.style.cssText = "font-size:9px;opacity:.7;margin-bottom:1px";
+          hold.appendChild(note);
+        }
+        hit.forEach((ev) => {
+          const one = pvDisc("pipe:" + ctx + ":" + String(ev.ts || 0), {
+            title: "Open exactly what was sent, and what came back",
+            sig: String(ev.ts || 0),
+            fill: (b) => {
+              const wire = el("div", "pvWire", "");
+              wire.textContent = String(ev.extra
+                || "(the server kept no detail beside this line)");
+              b.appendChild(wire);
+            },
+          });
+          one.head.style.cssText = "font-size:9.5px;line-height:1.45;"
+            + "align-items:flex-start;gap:5px;cursor:pointer";
+          const when = el("span", "muted", pvClock(ev.ts));
+          when.style.cssText = "flex:0 0 auto;font-size:9px;opacity:.7";
+          one.head.appendChild(when);
+          const tag = el("b", "", String(ev.kind || "log"));
+          tag.style.cssText = "flex:0 0 auto;font-size:9px;color:var(--accent)";
+          one.head.appendChild(tag);
+          const txt = el("span", "pvOne", String(ev.text || ""));
+          txt.style.flex = "1 1 auto";
+          one.head.appendChild(txt);
+          hold.appendChild(one.wrap);
+        });
+      } catch (e) { oops("the server log could not be read"); }
+    }).catch(() => oops("the server log is unreachable"));
+  } catch (e) { /* the rest of the drawer still stands */ }
+}
+
 /* #888: the queue above the transcript. -------------------------------
  * Everything here is additive: if the endpoint is unreachable the strip
  * area simply hides and the booth is exactly as it was. */
@@ -62572,60 +62943,199 @@ async function djPendingTick() {
     + (got && got.window ? " · building through " + got.window : "");
   host.appendChild(cap);
 
-  rows.forEach((r) => {
-    const wrap = el("div", "", "");
+  rows.forEach((r, at) => {
     const done = r.state === "ready";
+    /* #850/#852: the round opens IN PLACE. The key is the server's own id
+     * for the script, so the 1.6-second repaint above rebuilds this strip
+     * and every drawer that was open comes back open. */
+    const key = "round:" + String(r.id || ("slot" + at));
+    const disc = pvDisc(key, {
+      title: "Open this round — what is being written and for whom, the "
+        + "plan, who is queued behind it, and what the server is doing",
+      sig: [r.state, r.made, r.chunks, r.turns, rows.length,
+            pvPipeTip()].join("/"),
+      fill: (b) => djPendDetail(b, r, at, rows, got, "booth"),
+    });
+    const wrap = disc.wrap;
     wrap.style.cssText = "border:1px solid " + (done
       ? "rgba(120,220,140,.45)" : "rgba(255,255,255,.14)")
       + ";border-left:3px solid " + (done ? "#78dc8c" : "var(--accent)")
       + ";border-radius:7px;padding:6px 8px;margin:0 0 5px;"
       + "background:rgba(255,255,255,.03)";
-    const top = el("div", "", "");
+    const top = disc.head;
     top.style.cssText = "display:flex;align-items:center;gap:6px;"
-      + "font-size:10px;font-weight:700";
+      + "font-size:10px;font-weight:700;cursor:pointer";
     const badge = el("span", "", done
       ? "✓ ready to air"
       : (r.state === "rendering"
          ? DJ_SPIN[djPendFrame] + " rendering"
          : "✎ written — waiting for a window"));
-    badge.style.color = done ? "#78dc8c" : "var(--accent)";
+    badge.style.cssText = "flex:0 0 auto;color:"
+      + (done ? "#78dc8c" : "var(--accent)");
     top.appendChild(badge);
+    const seat = el("span", "muted pvOne",
+                    "#" + (at + 1) + " · " + djPendSeats(r));
+    seat.style.cssText = "font-weight:400;font-size:9.5px;opacity:.85;"
+      + "flex:1 1 auto";
+    top.appendChild(seat);
     const meta = el("span", "muted", "");
-    meta.style.cssText = "font-weight:400;margin-left:auto";
+    meta.style.cssText = "font-weight:400;margin-left:auto;flex:0 0 auto";
     meta.textContent = r.turns + " turns"
       + (r.chunks ? " · " + r.made + "/" + r.chunks + " lines made" : "")
       + (r.seconds ? " · " + Number(r.seconds).toFixed(0) + "s" : "");
     top.appendChild(meta);
-    wrap.appendChild(top);
 
+    /* The loading bar stays on the CLOSED row too — #850 asked to watch
+     * them progress, which must not need a click first. */
+    const sum = el("div", "", "");
     if (!done) {
       const bar = el("div", "djPendBar", "");
       const fill = el("div", "djPendFill", "");
       fill.style.width = Math.round((Number(r.progress) || 0) * 100) + "%";
       bar.appendChild(fill);
       if (r.state === "rendering") bar.appendChild(el("div", "djPendGlow", ""));
-      wrap.appendChild(bar);
+      sum.appendChild(bar);
       const blocks = el("div", "muted", "");
       blocks.style.cssText = "font-size:9px;letter-spacing:1px;margin-bottom:2px";
       const total = 18;
       const lit = Math.max(0, Math.min(total,
         Math.round((Number(r.progress) || 0) * total)));
       blocks.textContent = "▰".repeat(lit) + "▱".repeat(total - lit);
-      wrap.appendChild(blocks);
+      sum.appendChild(blocks);
     }
-
-    (r.lines || []).forEach((ln) => {
-      const line = el("div", "", "");
-      line.style.cssText = "font-size:10px;line-height:1.5;margin-top:2px;"
+    const first = (r.lines || [])[0];
+    if (first && !disc.open()) {
+      const peek = el("div", "pvOne", "");
+      peek.style.cssText = "font-size:10px;line-height:1.5;margin-top:2px;"
         + "opacity:" + (done ? ".82" : ".62");
-      const nm = el("b", "", (ln.name || ln.who) + " ");
+      const nm = el("b", "", (first.name || first.who) + " ");
       nm.style.color = "var(--accent)";
-      line.appendChild(nm);
-      line.appendChild(document.createTextNode(String(ln.text || "")));
-      wrap.appendChild(line);
-    });
+      peek.appendChild(nm);
+      peek.appendChild(document.createTextNode(String(first.text || "")));
+      sum.appendChild(peek);
+    }
+    wrap.insertBefore(sum, disc.body);
     host.appendChild(wrap);
   });
+}
+
+/* Who a written round is FOR: the seats it puts words in the mouth of. */
+function djPendSeats(r) {
+  try {
+    const seen = [];
+    ((r && r.lines) || []).forEach((ln) => {
+      const nm = String(ln.name || ln.who || "").trim();
+      if (nm && seen.indexOf(nm) < 0) seen.push(nm);
+    });
+    return seen.length ? "for " + seen.join(", ") : "for the booth";
+  } catch (e) { return "for the booth"; }
+}
+
+function djPendState(r) {
+  if (!r) return "";
+  return r.state === "ready" ? "ready to air"
+    : r.state === "rendering"
+      ? "in the recording room — " + (r.made || 0) + "/" + (r.chunks || 0)
+      : "written, waiting for a recording window";
+}
+
+/* #850/#852 — the whole minutiae of one round: what is being written and
+ * for whom, the plan it is filling, who is queued behind it, its render as
+ * a bar, the script itself, and three lines of the back end. */
+function djPendDetail(box, r, at, rows, got, ctx) {
+  const kv = pvKVBox(box, "WHAT IS BEING WRITTEN, AND FOR WHOM");
+  const seats = [];
+  const tally = {};
+  ((r && r.lines) || []).forEach((ln) => {
+    const who = String(ln.who || "?");
+    if (tally[who] === undefined) {
+      tally[who] = 0;
+      seats.push([who, String(ln.name || who)]);
+    }
+    tally[who] += 1;
+  });
+  pvKV(kv, "the round", "#" + (at + 1) + " of " + rows.length
+    + " written · id " + String(r.id || "?"));
+  pvKV(kv, "written for", seats.length
+    ? seats.map((s) => s[1] + " (" + s[0] + " · " + tally[s[0]]
+        + " line" + (tally[s[0]] === 1 ? "" : "s") + ")").join(", ")
+    : "nobody is named in this script yet");
+  pvKV(kv, "state", djPendState(r));
+  pvKV(kv, "length", (r.turns || 0) + " turns"
+    + (r.seconds ? " · " + Number(r.seconds).toFixed(0)
+        + "s of audio made so far" : ""));
+  if (r.frozen) pvKV(kv, "held", "frozen — it will not air until it thaws");
+
+  const plan = pvKVBox(box, "THE PLAN — WHAT THIS ROUND IS FOR");
+  pvKV(plan, "kind",
+    "banter — a written round between the seats, aired between records");
+  pvKV(plan, "the reserve", rows.length + " written of "
+    + String((got && got.target) || "?") + " wanted"
+    + (got && got.window ? " · recording through " + got.window
+                         : " · the engine is busy with the live round"));
+  pvKV(plan, "on the shelf",
+    Math.round(Number((got && got.buffered_seconds) || 0))
+    + "s of finished audio · " + String((got && got.pantry_clips) || 0)
+    + " clips");
+  const slot = pvKV(plan, "schedule", "reading the running order…");
+  pvSchedule().then((s) => {
+    try {
+      const w = pvSlotNow(s);
+      slot.textContent = w.cur
+        ? "now: " + pvSlotSay(w.cur)
+          + (w.next ? " · next: " + pvSlotSay(w.next) : "")
+        : (w.count ? w.count + " entries in the hour — none pinned as now"
+                   : "no running order is set");
+    } catch (e) { slot.textContent = "the running order could not be read"; }
+  }).catch(() => { slot.textContent = "the running order is unreachable"; });
+
+  const made = Number(r.made || 0), chunks = Number(r.chunks || 0);
+  box.appendChild(el("div", "muted pvCap", "RENDERING — " + made
+    + " of " + (chunks || "?") + " lines recorded"));
+  pvBar(box, chunks ? made / chunks : Number(r.progress) || 0,
+    r.state === "rendering" ? "recording now"
+      : r.state === "ready" ? "finished" : "waiting for a window",
+    r.state === "rendering");
+
+  box.appendChild(el("div", "muted pvCap", "WHO IS IN THE QUEUE BEHIND IT"));
+  const behind = rows.slice(at + 1);
+  if (!behind.length) {
+    const none = el("div", "muted",
+      "nothing behind this one — it is the last round written");
+    none.style.fontSize = "9.5px";
+    box.appendChild(none);
+  } else {
+    behind.slice(0, 8).forEach((o, i) => {
+      const row = el("div", "pvOne", "");
+      row.style.cssText = "font-size:9.5px;line-height:1.5;opacity:.85";
+      const nm = el("b", "", "#" + (at + 2 + i) + " ");
+      nm.style.color = "var(--accent)";
+      row.appendChild(nm);
+      row.appendChild(document.createTextNode(
+        djPendState(o) + " — " + djPendSeats(o)));
+      box.appendChild(row);
+    });
+  }
+
+  box.appendChild(el("div", "muted pvCap", "THE SCRIPT AS WRITTEN"));
+  ((r && r.lines) || []).forEach((ln) => {
+    const line = el("div", "", "");
+    line.style.cssText = "font-size:10px;line-height:1.5;margin-top:1px";
+    const nm = el("b", "", (ln.name || ln.who) + " ");
+    nm.style.color = "var(--accent)";
+    line.appendChild(nm);
+    line.appendChild(document.createTextNode(String(ln.text || "")));
+    box.appendChild(line);
+  });
+
+  const words = [];
+  ((r && r.lines) || []).forEach((ln) => {
+    if (ln.name) words.push(String(ln.name));
+    const t = String(ln.text || "").split(" ").slice(0, 5).join(" ");
+    if (t.length > 8) words.push(t);
+  });
+  pvServerLines(box, String(ctx || "round") + String(r.id || at),
+                pvMentions(words, []), 3);
 }
 
 function djPendingStart() {
@@ -72358,27 +72868,47 @@ function roomPanel(anchor) {
       body.appendChild(el("div", "muted",
         "nobody has been in yet — the room logs a take the moment one is made."));
     } else {
+      /* #850: "detailed entries for each person and how they are
+       * delegated." Every seat is a triangle now — open one and you get
+       * their delegation, their share of the shelf, and every take of
+       * theirs in the log, each of THOSE opening onto the whole line.
+       * Keyed by the seat, so the three-second repaint below leaves
+       * whoever you opened open. */
+      const COLS = "12px 1fr 46px 46px 58px 52px 46px";
+      const hdr = el("div", "");
+      hdr.style.cssText = "display:grid;grid-template-columns:" + COLS
+        + ";gap:2px 6px;font-size:10.5px;align-items:center";
+      ["", "who", "takes", "saved", "airtime", "cost", "engine"]
+        .forEach((h) => {
+          const c = el("div", "muted", h);
+          c.style.cssText = "font-size:9.5px;letter-spacing:.04em";
+          hdr.appendChild(c);
+        });
+      body.appendChild(hdr);
       const tbl = el("div", "");
-      tbl.style.cssText = "display:grid;grid-template-columns:"
-        + "1fr 46px 46px 58px 52px 46px;gap:2px 6px;font-size:10.5px;"
-        + "align-items:center";
-      ["who", "takes", "saved", "airtime", "cost", "engine"].forEach((h) => {
-        const c = el("div", "muted", h);
-        c.style.cssText = "font-size:9.5px;letter-spacing:.04em";
-        tbl.appendChild(c);
-      });
       actors.forEach((a) => {
-        const nm = el("b", "", String(a.name || a.who));
+        const disc = pvDisc("actor:" + String(a.who || a.name), {
+          title: "Open " + String(a.name || a.who)
+            + " — how they are delegated and every take of theirs",
+          sig: [a.takes, a.shelf, a.live, a.seconds, a.engine,
+                pvPipeTip()].join("/"),
+          fill: (b) => roomActorDetail(b, a, d),
+        });
+        disc.head.style.cssText = "display:grid;grid-template-columns:" + COLS
+          + ";gap:2px 6px;font-size:10.5px;align-items:center;"
+          + "padding:1px 0;cursor:pointer";
+        const nm = el("b", "pvOne", String(a.name || a.who));
         nm.style.color = "var(--accent)";
-        tbl.appendChild(nm);
-        tbl.appendChild(el("div", "", String(a.takes)));
+        disc.head.appendChild(nm);
+        disc.head.appendChild(el("div", "", String(a.takes)));
         const sv = el("div", "", a.saved_pct + "%");
         sv.style.color = a.saved_pct >= 50 ? "#7ce8a9"
           : a.saved_pct > 0 ? "" : "#8ba0b5";
-        tbl.appendChild(sv);
-        tbl.appendChild(el("div", "", Math.round(a.seconds) + "s"));
-        tbl.appendChild(el("div", "", a.cost ? a.cost + "×" : "—"));
-        tbl.appendChild(el("div", "muted", String(a.engine || "")));
+        disc.head.appendChild(sv);
+        disc.head.appendChild(el("div", "", Math.round(a.seconds) + "s"));
+        disc.head.appendChild(el("div", "", a.cost ? a.cost + "×" : "—"));
+        disc.head.appendChild(el("div", "muted", String(a.engine || "")));
+        tbl.appendChild(disc.wrap);
       });
       body.appendChild(tbl);
     }
@@ -72423,6 +72953,81 @@ function roomPanel(anchor) {
     };
     document.addEventListener("click", off);
   }, 0);
+}
+
+
+/* #850: one person in the recording room, in full — what seat they hold,
+ * which voice on which engine is delegated to them, how much of their work
+ * the shelf is answering rather than the GPU, and every take of theirs in
+ * the log. Each take opens again onto the whole line, what it cost, and
+ * whether it was recorded or served off the shelf. */
+function roomActorDetail(box, a, d) {
+  const kv = pvKVBox(box, "HOW THIS ONE IS DELEGATED");
+  pvKV(kv, "seat", String(a.who || "?"));
+  pvKV(kv, "voice", String(a.voice || "—") + " on " + String(a.engine || "—"));
+  pvKV(kv, "takes", (a.takes || 0) + " — " + (a.live || 0)
+    + " recorded live, " + (a.shelf || 0) + " served off the shelf");
+  pvKV(kv, "airtime", Math.round(Number(a.seconds || 0)) + "s"
+    + (a.chars ? " · " + a.chars + " characters read" : ""));
+  pvKV(kv, "engine cost",
+    a.cost ? a.cost + "× real time" : "nothing charged yet");
+  pvBar(box, (Number(a.saved_pct) || 0) / 100,
+    "their work the shelf is saving", false);
+
+  const log = (d && d.recent) || [];
+  const mine = log.filter((t) => String(t.who || "") === String(a.who || ""));
+  box.appendChild(el("div", "muted pvCap", "THEIR TAKES — newest first ("
+    + mine.length + " of the last " + log.length + " logged)"));
+  if (!mine.length) {
+    const none = el("div", "muted", "nothing of theirs in the recent log");
+    none.style.fontSize = "9.5px";
+    box.appendChild(none);
+  }
+  mine.slice(0, 20).forEach((t, i) => {
+    const shelf = t.how === "shelf";
+    const one = pvDisc("take:" + String(a.who) + ":" + String(t.at || i), {
+      title: "Open this take in full",
+      sig: String(t.at || i),
+      fill: (b) => {
+        const g = pvKVBox(b, "");
+        pvKV(g, "at",
+          t.at ? new Date(Number(t.at) * 1000).toLocaleTimeString() : "");
+        pvKV(g, "how", shelf
+          ? "off the shelf — nothing was recorded for it"
+          : "recorded live by the engine");
+        pvKV(g, "voice",
+          String(t.voice || "—") + " on " + String(t.engine || "—"));
+        pvKV(g, "length", (t.seconds || 0) + "s"
+          + (t.ms ? " · took " + Math.round(Number(t.ms)) + " ms" : "")
+          + (t.chars ? " · " + t.chars + " characters" : ""));
+        pvKV(g, "cost", t.cost ? t.cost + "× real time" : "");
+        const wire = el("div", "pvWire", "");
+        wire.textContent = String(t.text || "(no text was kept)");
+        b.appendChild(wire);
+      },
+    });
+    one.head.style.cssText = "font-size:10px;line-height:1.45;gap:5px;"
+      + "align-items:flex-start;cursor:pointer;border-left:2px solid "
+      + (shelf ? "#7ce8a9" : "var(--accent)")
+      + ";padding-left:5px;margin-bottom:2px";
+    const tag = el("b", "", shelf ? "🥫" : "🎙");
+    tag.style.cssText = "flex:0 0 auto;color:"
+      + (shelf ? "#7ce8a9" : "var(--accent)");
+    one.head.appendChild(tag);
+    const meta = el("span", "muted", (t.seconds || 0) + "s"
+      + (t.cost ? " · " + t.cost + "×" : ""));
+    meta.style.cssText = "flex:0 0 auto;font-size:9px";
+    one.head.appendChild(meta);
+    const say = el("span", "pvOne", String(t.text || ""));
+    say.style.flex = "1 1 auto";
+    one.head.appendChild(say);
+    box.appendChild(one.wrap);
+  });
+
+  pvServerLines(box, "actor" + String(a.who || ""),
+    pvMentions([String(a.name || ""), String(a.who || ""),
+                String(a.voice || "")],
+               ["voice", "air", "speakbox", "drop", "gpu"]), 3);
 }
 
 
@@ -73976,8 +74581,317 @@ function djDialogueFlowPaint(flow) {
   ];
   if (flow.ad_cover) stages.push("ad cover: reserve priority raised");
   const blockers = Array.isArray(flow.blockers) ? flow.blockers : [];
-  explain.textContent = stages.join(" · ") + (blockers.length
+  const line = stages.join(" · ") + (blockers.length
     ? " — " + blockers.join("; ") : "");
+  /* #850: "I want to see everything to do with each phase and be able to
+   * expand them to find out more information on the minutia." The summary
+   * line still reads first; under it the line is broken into its five
+   * phases, each one a triangle. */
+  try { djFlowPhases(explain, flow, line); }
+  catch (e) { explain.textContent = line; }
+}
+
+/* One phase row: number, name, where it has got to, a bar if it is moving,
+ * and a drawer holding the minutiae. */
+function djFlowRow(host, spec) {
+  const disc = pvDisc("phase:" + spec.key, {
+    title: "Open " + spec.name + " — everything this phase is doing",
+    sig: [spec.right, spec.sub, spec.frac, pvPipeTip()].join("/"),
+    fill: spec.fill,
+  });
+  disc.wrap.style.cssText = "border:1px solid var(--border);border-left:3px "
+    + "solid " + (spec.lit ? "var(--accent)" : "#3a4a5c")
+    + ";border-radius:7px;padding:5px 8px;margin:0 0 3px;"
+    + "background:rgba(255,255,255,.03)";
+  disc.head.style.cssText = "display:flex;align-items:center;gap:6px;"
+    + "font-size:11px;font-weight:700;cursor:pointer";
+  const nm = el("span", "pvOne", spec.mark + " " + spec.name);
+  nm.style.flex = "1 1 auto";
+  disc.head.appendChild(nm);
+  const right = el("span", "", String(spec.right || ""));
+  right.style.cssText = "flex:0 0 auto;font-size:10px;font-weight:600;color:"
+    + (spec.lit ? "var(--accent)" : "var(--muted)");
+  disc.head.appendChild(right);
+  const under = el("div", "", "");
+  under.style.margin = "1px 0 0 15px";
+  const sub = el("div", "muted", String(spec.sub || ""));
+  sub.style.cssText = "font-size:10px;line-height:1.45";
+  under.appendChild(sub);
+  if (spec.frac !== undefined && spec.frac !== null) {
+    pvBar(under, spec.frac, "", !!spec.busy);
+  }
+  disc.wrap.insertBefore(under, disc.body);
+  host.appendChild(disc.wrap);
+  if (!spec.last) {
+    const tick = el("div", "muted", "▾");
+    tick.style.cssText = "text-align:center;font-size:8px;opacity:.45;"
+      + "margin:-1px 0 1px";
+    host.appendChild(tick);
+  }
+  return disc;
+}
+
+/* The five phases every round passes through: written at the desk, banked
+ * in the reserve, recorded in the room, stacked in the pantry, aired. */
+function djFlowPhases(host, flow, line) {
+  host.textContent = "";
+  const top = el("div", "muted", line);
+  top.style.cssText = "font-size:11px;line-height:1.5;margin-bottom:5px";
+  host.appendChild(top);
+  const ready = Number(flow.ready || 0);
+  const target = Number(flow.target || 0);
+  const waiting = Number(flow.render_waiting || 0);
+  const held = Number(flow.delivery_waiting || 0);
+  const secs = Number(flow.buffered_seconds || 0);
+  const hours = Number(flow.hours_ready || 0);
+  const wantH = Number(flow.target_hours || 0);
+  const blockers = Array.isArray(flow.blockers) ? flow.blockers : [];
+  const kinds = flow.prepared_by_kind || {};
+  const quota = flow.quota || {};
+  const dur = (s) => (s >= 60 ? (s / 60).toFixed(1) + " min"
+                              : Math.round(s) + " s");
+  const byKind = () => (Object.keys(kinds).length
+    ? Object.keys(kinds).map((k) => k + " " + kinds[k]).join(" · ")
+    : "nothing standing by");
+
+  /* Every phase closes the same way: the blockers that name it, then three
+   * lines of what the back end is doing about it. */
+  const tail = (b, ctx, kindList, words) => {
+    const mine = blockers.filter((t) => (words || []).some(
+      (w) => String(t).toLowerCase().indexOf(String(w).toLowerCase()) >= 0));
+    if (mine.length) {
+      b.appendChild(el("div", "muted pvCap", "WHAT IS HOLDING THIS PHASE UP"));
+      mine.forEach((t) => {
+        const row = el("div", "", "• " + t);
+        row.style.cssText = "font-size:9.5px;line-height:1.5;color:#ef8f8f";
+        b.appendChild(row);
+      });
+    }
+    pvServerLines(b, ctx, pvMentions([], kindList), 3);
+  };
+
+  djFlowRow(host, {
+    key: "write", mark: "①", name: "the writing desk",
+    lit: !!flow.writing, busy: !!flow.writing,
+    right: flow.writing ? "writing a round now" : "idle",
+    sub: flow.writing
+      ? "the language model is writing the next round"
+      : "waiting for its turn at the model",
+    frac: target ? Math.min(1, ready / target) : 0,
+    last: false,
+    fill: (b) => {
+      const kv = pvKVBox(b, "WHAT THE DESK IS DOING");
+      pvKV(kv, "state", flow.writing
+        ? "the language model is writing a round right now"
+        : "no round is being written this second");
+      pvKV(kv, "write ahead", flow.prefill === false
+        ? "off — nothing is written between rounds"
+        : "on — it fills the reserve while a record or an advert carries "
+          + "the show");
+      pvKV(kv, "ad cover", flow.ad_cover
+        ? "an advert is on air — reserve priority raised" : "no");
+      pvKV(kv, "it is filling", ready + " of " + target + " rounds wanted");
+      const who = pvKV(kv, "for whom", "reading the desk…");
+      pvPending().then((pend) => {
+        try {
+          const rows = (pend && pend.pending) || [];
+          const newest = rows[rows.length - 1];
+          who.textContent = newest
+            ? "the newest round on the desk is " + djPendSeats(newest)
+              + " — " + (newest.turns || 0) + " turns, " + djPendState(newest)
+            : "nothing on the desk yet";
+        } catch (e) { who.textContent = "the desk could not be read"; }
+      }).catch(() => { who.textContent = "the desk is unreachable"; });
+      tail(b, "phase-write", ["model", "speakbox", "theme", "switchboard"],
+           ["model", "writing", "reserve"]);
+    },
+  });
+
+  djFlowRow(host, {
+    key: "reserve", mark: "②", name: "the reserve — written scripts",
+    lit: ready > 0, busy: false,
+    right: ready + " / " + target,
+    sub: ready
+      ? ready + " round" + (ready === 1 ? "" : "s")
+        + " banked and waiting for a window"
+      : "nothing banked — the desk is behind",
+    frac: target ? Math.min(1, ready / target) : 0,
+    last: false,
+    fill: (b) => {
+      const kv = pvKVBox(b, "WHAT IS BANKED");
+      pvKV(kv, "rounds", ready + " written, " + Number(flow.prepared || 0)
+        + " of them fully recorded");
+      pvKV(kv, "target", target + " rounds — the continuity reserve");
+      pvKV(kv, "by kind", byKind());
+      b.appendChild(el("div", "muted pvCap",
+        "EVERY ROUND IN THE RESERVE — OPEN ONE FOR ITS SCRIPT"));
+      const list = el("div", "", "");
+      const wait = el("div", "muted", "reading the reserve…");
+      wait.style.fontSize = "9.5px";
+      list.appendChild(wait);
+      b.appendChild(list);
+      pvPending().then((pend) => {
+        try {
+          list.textContent = "";
+          const rows = (pend && pend.pending) || [];
+          if (!rows.length) {
+            const none = el("div", "muted", "nothing banked yet");
+            none.style.fontSize = "9.5px";
+            list.appendChild(none);
+            return;
+          }
+          rows.forEach((r, at) => {
+            const one = pvDisc("reserve:" + String(r.id || at), {
+              title: "Open this round in full",
+              sig: [r.state, r.made, r.chunks, pvPipeTip()].join("/"),
+              fill: (bb) => djPendDetail(bb, r, at, rows, pend, "reserve"),
+            });
+            one.head.style.cssText = "font-size:9.5px;line-height:1.5;"
+              + "gap:5px;cursor:pointer";
+            const t = el("span", "pvOne", "#" + (at + 1) + " "
+              + djPendState(r) + " — " + djPendSeats(r));
+            t.style.flex = "1 1 auto";
+            one.head.appendChild(t);
+            const holder = el("div", "", "");
+            if (r.state !== "ready") {
+              pvBar(holder, Number(r.progress) || 0, "",
+                    r.state === "rendering");
+            }
+            one.wrap.insertBefore(holder, one.body);
+            list.appendChild(one.wrap);
+          });
+        } catch (e) { list.textContent = "the reserve could not be read"; }
+      }).catch(() => { list.textContent = "the reserve is unreachable"; });
+      tail(b, "phase-reserve", ["lookahead", "model"], ["reserve", "banked"]);
+    },
+  });
+
+  djFlowRow(host, {
+    key: "room", mark: "③", name: "the recording room",
+    lit: waiting > 0, busy: waiting > 0,
+    right: waiting ? waiting + " waiting"
+                   : (flow.window ? "building" : "clear"),
+    sub: flow.window
+      ? "recording through " + flow.window
+      : "the engine is busy with the live round — building is paused",
+    frac: waiting ? 1 : (flow.window ? 0.5 : 0),
+    last: false,
+    fill: (b) => {
+      const kv = pvKVBox(b, "WHAT THE ROOM IS DOING");
+      pvKV(kv, "waiting", waiting + " line" + (waiting === 1 ? "" : "s")
+        + " queued for voice rendering");
+      pvKV(kv, "window", flow.window
+        ? "recording through " + flow.window
+        : "no window — the live round has the engine");
+      pvKV(kv, "last render",
+        (flow.synth_age === null || flow.synth_age === undefined)
+          ? "nothing rendered yet this session"
+          : Number(flow.synth_age).toFixed(1) + "s ago");
+      b.appendChild(el("div", "muted pvCap", "WHAT IS ON THE BENCH NOW"));
+      const list = el("div", "", "");
+      const wait = el("div", "muted", "reading the room…");
+      wait.style.fontSize = "9.5px";
+      list.appendChild(wait);
+      b.appendChild(list);
+      pvPending().then((pend) => {
+        try {
+          list.textContent = "";
+          const rows = ((pend && pend.pending) || [])
+            .filter((r) => r.state !== "ready");
+          if (!rows.length) {
+            const none = el("div", "muted",
+              "nothing on the bench — every banked round is recorded");
+            none.style.fontSize = "9.5px";
+            list.appendChild(none);
+            return;
+          }
+          rows.forEach((r) => {
+            const row = el("div", "", "");
+            const t = el("div", "pvOne",
+                         djPendState(r) + " — " + djPendSeats(r));
+            t.style.cssText = "font-size:9.5px;line-height:1.4";
+            row.appendChild(t);
+            pvBar(row, Number(r.progress) || 0, "", r.state === "rendering");
+            list.appendChild(row);
+          });
+        } catch (e) { list.textContent = "the room could not be read"; }
+      }).catch(() => { list.textContent = "the room is unreachable"; });
+      tail(b, "phase-room", ["voice", "gpu"], ["render", "voice"]);
+    },
+  });
+
+  djFlowRow(host, {
+    key: "pantry", mark: "④", name: "the pantry — finished audio",
+    lit: secs > 0, busy: false,
+    right: dur(secs),
+    sub: Number(flow.pantry_clips || 0) + " takes on the shelf · "
+      + Number(flow.pantry_mb || 0) + " MB of "
+      + Number(flow.pantry_cap_mb || 0) + " MB allowed",
+    frac: wantH ? Math.min(1, hours / wantH) : 0,
+    last: false,
+    fill: (b) => {
+      const kv = pvKVBox(b, "WHAT IS STACKED AND READY");
+      pvKV(kv, "standing by", dur(secs) + " of finished audio");
+      pvKV(kv, "depth", hours + " h ready of " + wantH + " h asked for");
+      pvKV(kv, "clips", Number(flow.pantry_clips || 0) + " takes · "
+        + Number(flow.pantry_mb || 0) + " MB of "
+        + Number(flow.pantry_cap_mb || 0) + " MB");
+      pvKV(kv, "burn", "unaired material is dropped after "
+        + Number(flow.burn_hours || 0) + " h");
+      pvKV(kv, "by kind", byKind());
+      b.appendChild(el("div", "muted pvCap", "DEPTH AGAINST THE TARGET"));
+      pvBar(b, wantH ? Math.min(1, hours / wantH) : 0,
+        hours + " h of " + wantH + " h", false);
+      tail(b, "phase-pantry", ["lookahead", "drop"], ["pantry", "shelf"]);
+    },
+  });
+
+  const qk = Object.keys(quota);
+  djFlowRow(host, {
+    key: "air", mark: "⑤", name: "on air",
+    lit: held === 0, busy: held > 0,
+    right: held ? held + " held" : "talking",
+    sub: held
+      ? held + " clip" + (held === 1 ? "" : "s")
+        + " waiting for speaker delivery"
+      : "everything recorded has reached the speaker",
+    frac: null,
+    last: true,
+    fill: (b) => {
+      const kv = pvKVBox(b, "WHAT IS REACHING THE SPEAKER");
+      pvKV(kv, "held", held + " clip" + (held === 1 ? "" : "s")
+        + " waiting for delivery");
+      pvKV(kv, "last render",
+        (flow.synth_age === null || flow.synth_age === undefined)
+          ? "nothing yet" : Number(flow.synth_age).toFixed(1) + "s ago");
+      if (qk.length) {
+        b.appendChild(el("div", "muted pvCap",
+          "THE SCHEDULER — WHAT THE HOUR OWES"));
+        const g = pvKVBox(b, "");
+        qk.forEach((k) => {
+          const q = quota[k] || {};
+          pvKV(g, k, (q.aired || 0) + " of " + (q.target || 0) + " this hour"
+            + (q.behind ? " — behind" : " — on pace")
+            + (q.due ? ", due now" : "")
+            + (q.since ? " · last " + Math.round(q.since) + "s ago" : ""));
+        });
+      }
+      const slot = pvKV(pvKVBox(b, "THE RUNNING ORDER"), "now",
+                        "reading the running order…");
+      pvSchedule().then((s) => {
+        try {
+          const w = pvSlotNow(s);
+          slot.textContent = (w.preset ? w.preset + ": " : "")
+            + (w.cur ? pvSlotSay(w.cur) : "nothing pinned as now")
+            + (w.next ? " · next " + pvSlotSay(w.next) : "");
+        } catch (e) {
+          slot.textContent = "the running order could not be read";
+        }
+      }).catch(() => { slot.textContent = "the running order is unreachable"; });
+      tail(b, "phase-air", ["air", "drop", "call"],
+           ["speaker", "delivery", "air"]);
+    },
+  });
 }
 
 /* The one slider that lives out on the panel: how often the pair start a
