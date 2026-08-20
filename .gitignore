@@ -9,3 +9,4 @@ dist-desktop/
 # Patch scripts used to drop a timestamped copy of app.py here before
 # editing. Git already keeps every version; backups now go to /tmp.
 *.backup.*
+h1.json
