@@ -1827,10 +1827,47 @@ function initWorksPopup() {
            + (cur ? " — recording a round's lines" : ""))
         : "the engine is busy with the live round — building is paused",
       cur ? "on" : f.window ? "" : "warn",
-      cur && cur.chunks ? cur.made / cur.chunks : null);
+      cur && cur.chunks ? cur.made / cur.chunks : null,
+      "room",                                            // #876
+      (drawer) => {
+        drawer.appendChild(mk("div", "wk-note", "reading the room…"));
+        api.get("/api/recording-room").then((rr) => {
+          drawer.textContent = "";
+          const p = rr && rr.preparing;
+          if (p && p.kind) {
+            wkPut(drawer, "IN THE ROOMS NOW",
+              (p.stage === "writing" ? "✍ writing room" : "🎙 recording room")
+              + " · " + (p.label || p.kind)
+              + (p.name ? " · " + p.name : "")
+              + (p.voice ? " (" + p.voice + ")" : "")
+              + (p.lines ? " · line " + (p.made || 0) + " of " + p.lines : ""));
+          }
+          const rows2 = (rr && rr.kinds) || [];
+          if (rows2.length) {
+            const t = rows2.map((k) =>
+              (k.label || k.kind) + " — written " + (k.written || 0)
+              + ", lines " + (k.lines || 0)
+              + ", rendered " + (k.rendered || 0)
+              + ", ready " + (k.ready || 0)
+              + (k.seconds ? ", " + Math.round(k.seconds) + "s" : "")).join("\n");
+            wkPut(drawer, "THE BOARD, BY CONTENT TYPE", t);
+          }
+          const acts = (rr && rr.actors) || [];
+          if (acts.length) {
+            wkPut(drawer, "WHO HAS BEEN IN", acts.map((a) =>
+              (a.name || a.who) + " — " + a.takes + " takes, "
+              + Math.round(a.seconds) + "s"
+              + (a.cost ? ", " + a.cost + "× real time" : "")
+              + ", " + a.saved_pct + "% off the shelf").join("\n"));
+          }
+        }).catch(() => {
+          drawer.textContent = "";
+          drawer.appendChild(mk("div", "wk-note", "the room is unreachable"));
+        });
+      });
     flow.appendChild(mk("div", "wk-arrow", "▼"));
 
-    // 4 — the pantry
+    // 4 — the pantry  (#876: opens onto what is actually on the shelf)
     const secs = Number(f.buffered_seconds || pend.buffered_seconds || 0);
     stage(flow, "④ the pantry — finished audio",
       mins(secs),
@@ -1840,7 +1877,28 @@ function initWorksPopup() {
          : "")
       + (ready.length ? " · " + ready.length + " round(s) ready to air" : ""),
       secs > 90 ? "on" : secs < 20 ? "warn" : "",
-      Math.min(1, secs / 180));
+      Math.min(1, secs / 180),
+      "pantry",
+      (drawer) => {
+        const k = f.prepared_by_kind || {};
+        const named = Object.keys(k);
+        if (named.length) {
+          wkPut(drawer, "PREPARED, BY KIND",
+            named.map((x) => x + ": " + k[x]).join("\n"));
+        }
+        wkPut(drawer, "THE SHELF",
+          "kept servable for " + (f.life_hours || "?") + " h\n"
+          + "burned after " + (f.burn_hours || 24) + " h\n"
+          + "hours ready: " + (f.hours_ready || 0)
+          + " of " + (f.target_hours || 1)
+          + (f.window ? "\nbuilding through " + f.window
+                      : "\nthe engine is full — building is paused"));
+        if (ready.length) {
+          wkPut(drawer, "READY TO AIR", ready.map((r, i) =>
+            "#" + (i + 1) + " — " + r.turns + " turns, "
+            + Math.round(r.seconds || 0) + "s").join("\n"));
+        }
+      });
     flow.appendChild(mk("div", "wk-arrow", "▼"));
 
     // 5 — on air

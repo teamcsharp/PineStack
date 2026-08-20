@@ -28226,6 +28226,10 @@ async def drudge_headlines(limit: int = 24) -> list[dict[str, str]]:
 # again is still the same news twice.
 NEWS_COVERED_PATH = data_path("news_covered.json")
 NEWS_COVER_HOURS = 3.0
+# #875: even when every story on the page is inside the three-hour
+# window and the desk must repeat something rather than go quiet, it
+# will not repeat one it covered in the last three quarters of an hour.
+NEWS_FLOOR_MINUTES = 45.0
 _NEWS_STOP = {
     "the", "a", "an", "of", "to", "in", "on", "for", "and", "with",
     "after", "over", "as", "at", "by", "from", "his", "her", "its",
@@ -28303,9 +28307,30 @@ def news_selection(headlines: list[dict[str, str]],
             break
         picks.append(random.choice(by_band[slot]))
     if not picks:
-        stamp = {r.get("title"): float(r.get("ts") or 0) for r in covered}
-        picks = sorted(headlines,
-                       key=lambda h: stamp.get(h["title"], 0))[:want]
+        # #875: THIS IS WHERE THE SAME STORY CAME BACK SEVENTEEN TIMES.
+        #
+        # `covered` is newest-first, so a dict comprehension kept the
+        # LAST value seen for each title — the OLDEST coverage. Sorting
+        # ascending on that put the most-covered story first, every
+        # time: measured on the live ledger, one headline covered 17
+        # times with seven of those inside half an hour.
+        #
+        # Take the most RECENT coverage per title, so the fallback
+        # genuinely reaches for whatever has been left alone longest.
+        stamp: dict[str, float] = {}
+        for _r in covered:
+            _t = _r.get("title")
+            _ts = float(_r.get("ts") or 0)
+            if _t is not None and _ts > stamp.get(_t, 0.0):
+                stamp[_t] = _ts
+        # And a hard floor even here: a story said in the last
+        # NEWS_FLOOR_MINUTES is not said again, whatever else is on the
+        # page. Only if that leaves nothing at all does the desk fall
+        # back to the least-recently-covered.
+        _floor = time.time() - NEWS_FLOOR_MINUTES * 60.0
+        _cool = [h for h in headlines if stamp.get(h["title"], 0.0) < _floor]
+        picks = sorted(_cool or headlines,
+                       key=lambda h: stamp.get(h["title"], 0.0))[:want]
     _news_note(picks)
     return picks
 
@@ -28350,7 +28375,11 @@ async def dj_news(hourly: bool = False) -> list[str]:
     between-tracks version is looser, stories drawn from anywhere on the
     page, reacted to organically and funnily, then back to the music (#228,
     #229, #248)."""
-    picks = news_selection(await drudge_headlines(24), hourly)
+    # #875: "there are tons of news stories on the page and I need
+    # different stories being covered" — 24 headlines against a bulletin
+    # every few minutes exhausts the page in under an hour and forces
+    # the repeat road. Take the whole front page.
+    picks = news_selection(await drudge_headlines(80), hourly)
     if not picks:
         return []
     listed = "\n".join(f"- {h['title']}" for h in picks)
@@ -30073,6 +30102,39 @@ def case_for_call(case_id: str = "", heat: int | None = None) -> dict[str, Any]:
         return chosen
     except Exception:  # noqa: BLE001
         return {}
+
+
+def call_escalation_clause(depth: int) -> str:
+    """#873: each call QUEUED BEHIND the first pushes further than the one
+    in front of it.
+
+    The first call on an empty shelf is played straight. The second and
+    third take the same shape and lean on it; by the fourth the station
+    has enough cover in hand to risk a genuinely unhinged one. Depth is
+    how many calls are already waiting, so this escalates only while a
+    reserve is actually being built — it never makes the NEXT thing on
+    air wilder than the operator asked for."""
+    if depth <= 0:
+        return ""
+    if depth == 1:
+        return (" This one is the SECOND call in the queue: take whatever "
+                "shape the last one had and lean on it — one notch louder, "
+                "one notch stranger, and let the caller get further under "
+                "the hosts' skin before it turns.")
+    if depth == 2:
+        return (" This is the THIRD call stacked up: push the premise past "
+                "where a normal call would stop. The caller wants something "
+                "the station cannot reasonably give, says a thing nobody "
+                "expected, and the hosts have to work to keep the show on "
+                "the rails. Work MORE of the speakbox material in, verbatim, "
+                "and let it sit oddly rather than smoothing it over.")
+    return (" This is call number " + str(depth + 1) + " on the shelf, so "
+            "there is cover in hand and this one can be OUTLANDISH. Take "
+            "the premise somewhere genuinely unhinged and commit to it "
+            "completely — nobody breaks character, nobody winks at the "
+            "audience, and the hosts treat it as though it were ordinary. "
+            "Lean hard on the speakbox lines, word for word, and let them "
+            "land in the strangest places in the conversation.")
 
 
 def case_clause(case: dict[str, Any], where: str = "call") -> str:
@@ -35742,6 +35804,11 @@ async def dj_caller(track: dict[str, Any] | None = None,
         # the call turns out to be about, so the joke this road exists for
         # is not trampled by it.
         + case_clause(_case, "request")
+        # #873: a call being QUEUED pushes further than the ones already
+        # waiting in front of it. Only on the prepared road — a live call
+        # has no queue behind it and no cover to spend.
+        + (call_escalation_clause(len(_SHELF.get("caller") or []))
+           if bank_to is not None else "")
         + " Take the call with unmistakable "
         f"{random.choice(CALLER_MOODS)}."
         + f" Let it RUN — {_turns} turns of real back and forth, the "
@@ -66690,6 +66757,7 @@ function boothAnalysisDossier(line) {
     }
   } catch (e) { }
   document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
   const off = (ev) => {
     /* The desk is a panel of its own, outside this one, and this
      * listener runs in the CAPTURE phase - so it has to be told to
@@ -67096,6 +67164,7 @@ function visionPromptDesk(line, anchor, onResult) {
     };
 
     document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
     load();
   } catch (e) {
     try { setStatus("the looking-prompt desk fell over: " + e.message, true); }
@@ -67131,6 +67200,70 @@ var PV_OPEN = (function () {
 })();
 var PV_BODY = {};
 var PV_DISC_N = 0;
+
+/* #877: a popup that opens half off the screen is unreachable, and none
+ * of them could be moved. pvFloat() does both: it pulls the panel fully
+ * into the viewport (centring it if it is simply too big to place where
+ * it was asked for), and makes it draggable by any empty part of its own
+ * top edge. Position is remembered per popup id. */
+function pvFloat(pop) {
+  try {
+    if (!pop || pop.dataset.pvFloat) return;
+    pop.dataset.pvFloat = "1";
+    const fit = () => {
+      const r = pop.getBoundingClientRect();
+      const mw = window.innerWidth, mh = window.innerHeight;
+      let L = r.left, T = r.top;
+      if (r.width >= mw - 16) L = Math.max(8, (mw - r.width) / 2);
+      else L = Math.min(Math.max(8, L), mw - r.width - 8);
+      if (r.height >= mh - 16) T = Math.max(8, (mh - r.height) / 2);
+      else T = Math.min(Math.max(8, T), mh - r.height - 8);
+      pop.style.left = Math.round(L) + "px";
+      pop.style.top = Math.round(T) + "px";
+    };
+    try {
+      const saved = JSON.parse(
+        localStorage.getItem("pvPop:" + (pop.id || "")) || "null");
+      if (saved && typeof saved.l === "number") {
+        pop.style.left = saved.l + "px";
+        pop.style.top = saved.t + "px";
+      }
+    } catch (e) {}
+    fit();
+    requestAnimationFrame(fit);            // after content has laid out
+    window.addEventListener("resize", fit);
+    let from = null;
+    pop.addEventListener("pointerdown", (ev) => {
+      const tag = String((ev.target && ev.target.tagName) || "").toLowerCase();
+      if (["input", "textarea", "select", "button", "a"].indexOf(tag) >= 0) return;
+      if (ev.target !== pop && ev.offsetY > 26 && ev.target.parentElement !== pop) return;
+      const r = pop.getBoundingClientRect();
+      from = {x: ev.clientX, y: ev.clientY, l: r.left, t: r.top};
+      pop.setPointerCapture(ev.pointerId);
+      pop.style.cursor = "grabbing";
+    });
+    pop.addEventListener("pointermove", (ev) => {
+      if (!from) return;
+      pop.style.left = Math.round(from.l + ev.clientX - from.x) + "px";
+      pop.style.top = Math.round(from.t + ev.clientY - from.y) + "px";
+    });
+    const drop = () => {
+      if (!from) return;
+      from = null;
+      pop.style.cursor = "";
+      fit();
+      try {
+        const r = pop.getBoundingClientRect();
+        localStorage.setItem("pvPop:" + (pop.id || ""),
+                             JSON.stringify({l: Math.round(r.left),
+                                             t: Math.round(r.top)}));
+      } catch (e) {}
+    };
+    pop.addEventListener("pointerup", drop);
+    pop.addEventListener("pointercancel", drop);
+  } catch (e) { /* a popup that will not float still opens */ }
+}
+
 
 function pvDiscStyle() {
   try {
@@ -67581,8 +67714,16 @@ async function djPendingTick() {
       blocks.textContent = "▰".repeat(lit) + "▱".repeat(total - lit);
       sum.appendChild(blocks);
     }
+    /* #874: once a round is READY it folds down to one line. It has no
+     * progress left to watch and the operator asked for the queue to stop
+     * taking the room — the triangle opens it again to read it. Anything
+     * still being written or recorded keeps its bar and its peek. */
     const first = (r.lines || [])[0];
-    if (first && !disc.open()) {
+    if (done && !disc.open()) {
+      const rdy = el("div", "muted", "ready to air — open to read it");
+      rdy.style.cssText = "font-size:9.5px;opacity:.6;margin-top:1px";
+      sum.appendChild(rdy);
+    } else if (first && !disc.open()) {
       const peek = el("div", "pvOne", "");
       peek.style.cssText = "font-size:10px;line-height:1.5;margin-top:2px;"
         + "opacity:" + (done ? ".82" : ".62");
@@ -74176,6 +74317,7 @@ function djRepairPopup() {
           x.onclick = () => pop.remove();
           pop.appendChild(x);
           document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
         };
         term.appendChild(line);
       });
@@ -75866,6 +76008,7 @@ function djPathsPanel(anchor) {
   foot.style.cssText = "font-size:10px;margin-top:8px;line-height:1.5";
   pop.appendChild(foot);
   document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
 
   const FACE = {plot: "🧵", producer: "📻", caller: "☎", track: "💿",
                 rant: "🌶"};
@@ -75999,6 +76142,7 @@ function storagePanel(anchor) {
     const body = el("div", "", "");
     pop.appendChild(body);
     document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
 
     async function fillFiles(area, host, offset) {
       try {
@@ -76462,6 +76606,7 @@ function schedulePanel(anchor) {
     const body = el("div", "", "");
     pop.appendChild(body);
     document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
 
     const say = (text, bad) => {
       note.textContent = text || "";
@@ -77422,6 +77567,7 @@ function deskPanel(anchor) {
   body.style.cssText = "font-size:11px;color:var(--muted)";
   pop.appendChild(body);
   document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
 
   const draw = async () => {
     let d = null;
@@ -77530,6 +77676,7 @@ function roomPanel(anchor) {
   body.style.cssText = "font-size:11px;color:var(--muted)";
   pop.appendChild(body);
   document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
 
   const draw = async () => {
     let d = null;
@@ -78030,6 +78177,7 @@ function djTailPanel(anchor) {
   pop.appendChild(kindRow); pop.appendChild(levelNote); pop.appendChild(row);
   pop.appendChild(tray);
   document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
   paintTray();
 }
 
@@ -78233,6 +78381,7 @@ async function djConverseHistory() {
     pop.appendChild(row);
   });
   document.body.appendChild(pop);
+  pvFloat(pop);                                             // #877
 }
 
 /* ---- Ad reads (#119) ---- */
