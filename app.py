@@ -588,6 +588,14 @@ DEFAULT_DJ = {
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
+    # #854: THE CASE BOOK. How often a caller rings about a written case
+    # from data/caller_cases.json rather than about whatever the speakbox
+    # coughed up; how often the case drawn is a HOT one (heated or
+    # hostile) rather than a gentle or warm one; and how often the case is
+    # a giveaway, where the station actually parts with something.
+    "caller_case_rate": 55,
+    "caller_case_heat": 30,
+    "caller_case_prize": 18,
     # How deeply fresh Speakerbox material contaminates a caller's rhetoric.
     "caller_insanity": 45,
     # The caller vocoder: the master switch, and how hard the strangers are
@@ -1248,6 +1256,13 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "caller_insanity": max(0, min(100, int(
             raw_dj.get("caller_insanity",
                        DEFAULT_DJ["caller_insanity"]) or 0))),
+        # #854: the case book's three dials. This dict is rebuilt wholesale
+        # on every save, so a key that is not clamped HERE never survives a
+        # write — which is the trap that made manager_name a dead setting.
+        **{f"caller_case_{k}": max(0, min(100, int(
+            raw_dj.get(f"caller_case_{k}",
+                       DEFAULT_DJ[f"caller_case_{k}"]) or 0)))
+           for k in ("rate", "heat", "prize")},
         "caller_fx": bool(raw_dj.get("caller_fx", True)),
         "caller_fx_depth": max(0, min(100, int(
             raw_dj.get("caller_fx_depth",
@@ -12299,6 +12314,15 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                     "range", 0, 12, 1),
                    ("caller_success_rate", "Successful calls", "range", 0, 100, 1),
                    ("caller_insanity", "Caller intensity", "range", 0, 100, 1),
+                   # #854: the case book — what they ring ABOUT, and how
+                   # hot it gets. The book itself is edited in the 🗂
+                   # popup on the booth; these are only the odds.
+                   ("caller_case_rate", "Case book · calls off the book",
+                    "range", 0, 100, 1),
+                   ("caller_case_heat", "Case book · how often calls run hot",
+                    "range", 0, 100, 1),
+                   ("caller_case_prize", "Case book · giveaway calls",
+                    "range", 0, 100, 1),
                    # #798: the behaviour deck, exposed — relative weights.
                    ("caller_prize", "Deck · prize hunters", "range", 0, 100, 1),
                    ("caller_mad", "Deck · turn on the hosts", "range", 0, 100, 1),
@@ -27454,6 +27478,774 @@ def hangup_delete(rule_id: str) -> bool:
         return True
 
 
+# --- The case book (#854) --------------------------------------------------
+# "connect the writing desk to the database of cases that come up when
+# customers call ... sophisticated cases written for calls that's able to be
+# acted out and set up in the reserve that's able to play out through the
+# radio in a stream seamlessly."
+#
+# CALLER_DISPOSITIONS (#879) says what TEMPER the caller arrived in. The
+# hang-up shelf above (#691) says how the call ENDS. Neither has ever said
+# what the call is ABOUT: the subject was whatever the speakbox happened to
+# hand over that second, which is why the phone could ring nine times in an
+# hour and every call be the same shape.
+#
+# This is the missing third leg. A persisted, operator-editable database of
+# SITUATIONS — a grievance, a question, a demand, a giveaway — each graded
+# on a heat scale so the desk can ask for a gentle one or a hostile one and
+# get a script that actually behaves that way.
+#
+# The division of labour is strict, and it is the whole reason three
+# generators can share one prompt without fighting:
+#     the CASE        supplies the SUBJECT   (what they rang about)
+#     the RULE        supplies the ENDING    (how the call terminates)
+#     the DISPOSITION supplies the TEMPER    (who is holding the phone)
+CASES_PATH = data_path("caller_cases.json")
+_CASES_LOCK = RLock()
+
+# THE HEAT SCALE. Four rungs, and a call written at one of them has to sound
+# like that rung — a gentle case must not be talked into a row, a hostile one
+# must not be defused into a chat.
+CASE_HEATS = (0, 1, 2, 3)
+CASE_HEAT_NAMES = {0: "gentle", 1: "warm", 2: "heated", 3: "hostile"}
+CASE_COOL_HEATS = (0, 1)
+CASE_HOT_HEATS = (2, 3)
+# A PRIZE call is a different KIND of thing rather than another rung: the
+# station gives something away, and a giveaway is a promise the script has to
+# keep. A prize case still carries a heat — a hostile caller who ends up
+# winning is the best call this station knows how to make.
+CASE_KINDS = ("call", "prize")
+
+CASE_HEAT_CLAUSE = {
+    0: (" HEAT — GENTLE. This one never gets loud. The caller is warm, or "
+        "shy, or simply glad somebody picked up, and the pair are gentle "
+        "back. Whatever they came for is small and human and they are not "
+        "spoiling for anything. If friction appears at all it dissolves in "
+        "a laugh inside two lines. Nobody raises their voice at any point "
+        "of this call and the hosts do not manufacture a row out of it to "
+        "make it interesting — the interest is in how ordinary it is."),
+    1: (" HEAT — WARM. There is a real edge under the politeness. The "
+        "caller has a genuine grievance and they do say it, but they say "
+        "it civilly and they let the hosts answer before going again. It "
+        "is allowed to get pointed — one dry remark, one flash of "
+        "impatience, one 'well, that's easy for you to say' — and then it "
+        "settles. It never becomes a shouting match, and both sides come "
+        "out of it still liking each other."),
+    2: (" HEAT — HEATED, AND IT CLIMBS. It opens reasonably and it does "
+        "NOT stay there. The caller starts firm, gets less patient with "
+        "every answer they will not accept, begins talking over one of the "
+        "hosts, and by the middle of the call they are plainly angry. Play "
+        "the escalation IN STAGES so a listener can hear it climbing — the "
+        "volume, the speed, the manners going one at a time. The hosts do "
+        "not simply capitulate to make it stop: one of them holds the "
+        "station's corner, which makes it worse before it gets better."),
+    3: (" HEAT — HOSTILE. This person did not ring to be handled. They "
+        "come in hot from their very first line, they accuse, they "
+        "interrupt, they will not be soothed, and they take everything "
+        "offered as further proof of what they already believe. Let it be "
+        "genuinely uncomfortable to listen to: the pair are rattled, one "
+        "takes it personally, the other tries to be reasonable and gets "
+        "nowhere at all. Never cut the tension with a joke to escape it — "
+        "whatever comedy is in this call is in how badly the two of them "
+        "handle it. Real anger, real words, and nobody narrates the arc."),
+}
+
+CASE_PRIZE_CLAUSE = (
+    " THIS IS A PRIZE CALL AND THE STAKES ARE REAL. The station is GIVING "
+    "SOMETHING AWAY on this call and it has to be honoured OUT LOUD before "
+    "the call is over: the pair name the prize plainly, say what this "
+    "caller has actually won, and settle how they get it — when they can "
+    "collect, from whom, and what they have to bring. Nobody hints at it "
+    "and moves on, nobody quietly takes it back, and it is never revealed "
+    "to be a trick. The caller reacts entirely in character: a gentle one "
+    "is overwhelmed by it, an angry one is thrown by winning and does not "
+    "soften anything like as much as the pair expect. The prize is not the "
+    "joke; the reaction to it is. The giveaway is settled BEFORE the "
+    "ending below, which still has to be the last thing that happens.")
+
+
+def case_heat(case: dict[str, Any]) -> int:
+    """The rung this case sits on, always a legal one."""
+    try:
+        return max(0, min(3, int(case.get("heat") or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def case_heat_name(case: dict[str, Any]) -> str:
+    return CASE_HEAT_NAMES.get(case_heat(case), "gentle") if case else ""
+
+
+def case_is_prize(case: dict[str, Any]) -> bool:
+    return bool(case) and str(case.get("kind") or "call") == "prize"
+
+
+def _case_row(row: dict[str, Any]) -> dict[str, Any]:
+    """One case, normalized. Everything that reaches a prompt or a slider is
+    clamped here, so a hand-edited file can be wrong without being fatal."""
+    try:
+        weight = max(0.0, min(10.0, float(row.get("weight", 1.0))))
+    except (TypeError, ValueError):
+        weight = 1.0
+    kind = str(row.get("kind") or "call")
+    return {
+        "id": str(row.get("id") or uuid.uuid4().hex[:8])[:40],
+        "title": str(row.get("title") or "")[:120],
+        "blurb": str(row.get("blurb") or "")[:900],
+        "heat": case_heat(row),
+        "kind": kind if kind in CASE_KINDS else "call",
+        "weight": weight,
+        "outcome": str(row.get("outcome") or "")[:400],
+        "props": str(row.get("props") or "")[:300],
+        "enabled": bool(row.get("enabled", True)),
+        "uses": int(row.get("uses") or 0),          # times it has AIRED
+        "picks": int(row.get("picks") or 0),        # times it has been WRITTEN
+        "last": int(row.get("last") or 0),
+        "aired": int(row.get("aired") or 0),
+        "added": int(row.get("added") or 0),
+    }
+
+
+def _case_seed() -> list[dict[str, Any]]:
+    """The book the station opens with.
+
+    Twenty-nine situations across the whole range the owner named — the
+    gentle ones, the ones that climb, the ones that arrive already shouting,
+    and the ones where somebody genuinely wins something. Written as
+    directions a writer can act on rather than as labels, because a case that
+    only names a category produces a call that only names a category."""
+    now = int(time.time())
+    book = [
+        # --- GENTLE (0) ---------------------------------------------------
+        {"id": "toll-booth", "heat": 0, "weight": 1.3,
+         "title": "The night shift on the county road",
+         "blurb": "They work the toll booth out on the county road, ten at "
+                  "night until six, and this station is the only voice that "
+                  "reaches the hut. They have not rung to ask for anything. "
+                  "They want to know what the pair had for dinner, whether "
+                  "the building really is as cold as it sounds on air, and "
+                  "whether anybody there has ever seen a fox at four in the "
+                  "morning.",
+         "outcome": "The pair answer the small questions properly and "
+                    "honestly, and one of them says out loud that the hut is "
+                    "not as alone as it feels.",
+         "props": "booth 3 on the county road; a thermos with a dented lid"},
+        {"id": "wrong-number", "heat": 0, "weight": 0.9,
+         "title": "They meant to ring the vet",
+         "blurb": "This caller has dialled the wrong number entirely — they "
+                  "were ringing the veterinary surgery about a cat — and "
+                  "only works out where they have got through to about four "
+                  "lines in. They are mortified, then delighted, then they "
+                  "stay on and tell the pair about the cat anyway.",
+         "outcome": "The hosts give the cat a proper on-air consultation "
+                    "they are in no way qualified to give, and the caller "
+                    "leaves happier than the vet would have made them.",
+         "props": "a cat called Duchess; the surgery number is one digit off "
+                  "the station's"},
+        {"id": "four-notes", "heat": 0, "weight": 1.2,
+         "title": "Four notes and a nurse",
+         "blurb": "They half-remember a song a night nurse played on a ward "
+                  "radio in 1988 and they have never found it since. They "
+                  "cannot name it, they cannot name the artist, and they hum "
+                  "four notes down the phone, badly, twice. It matters to "
+                  "them enormously and they apologise for that.",
+         "outcome": "The pair take the four notes completely seriously, "
+                    "argue about what it is, and promise on air to keep "
+                    "looking — and mean it.",
+         "props": "Ward 6; a nurse called Bernadette; 1988"},
+        {"id": "cassette-kid", "heat": 0, "weight": 1.0,
+         "title": "Taping the show for Nan",
+         "blurb": "A young caller has been recording the show onto a "
+                  "cassette every week to post to a grandparent who cannot "
+                  "get the signal. They ring to ask the pair to say hello on "
+                  "the tape, and to check they are not doing anything "
+                  "illegal.",
+         "outcome": "The pair record the hello, badly, twice, and then get "
+                    "unexpectedly sincere about it.",
+         "props": "a C90; a grandmother three counties away"},
+        {"id": "bread-round", "heat": 0, "weight": 1.0,
+         "title": "The baker who has been up since two",
+         "blurb": "A baker rings from the back of the shop between trays. "
+                  "They have been awake since two in the morning, they are "
+                  "cheerful about it in a way nobody should be, and they "
+                  "want something played for the ovens because the ovens "
+                  "have had a hard week too.",
+         "outcome": "A record goes out dedicated, entirely without irony, to "
+                    "a pair of ovens — and the pair are invited to come and "
+                    "collect something warm.",
+         "props": "the ovens are called the twins; first trays out at 05:40"},
+        {"id": "dog-name", "heat": 0, "weight": 0.9,
+         "title": "The dog only reacts to one of you",
+         "blurb": "Their dog sits up and stares at the radio whenever ONE of "
+                  "the two hosts speaks, and ignores the other one "
+                  "completely. They would like to know what that means. They "
+                  "are entirely serious and quite gentle about it.",
+         "outcome": "The favoured host is insufferable about it, the other "
+                    "takes it far harder than a person should take the "
+                    "opinion of a dog, and the caller is asked to keep the "
+                    "station updated.",
+         "props": "a lurcher called Sixpence"},
+
+        # --- WARM (1) -----------------------------------------------------
+        {"id": "pub-quiz", "heat": 1, "weight": 1.3,
+         "title": "You cost me the pub quiz",
+         "blurb": "One of the hosts said something on air with total "
+                  "confidence, the caller repeated it at the Thursday quiz, "
+                  "and it was wrong. They lost by a point. They are being "
+                  "very polite about it and they would like an apology, or "
+                  "at minimum an admission.",
+         "outcome": "The guilty host is made to admit it on air, at length, "
+                    "while the other one enjoys it far too much.",
+         "props": "the Thursday quiz at the Fleece; lost by one point; "
+                  "question 14"},
+        {"id": "jingle-stuck", "heat": 1, "weight": 1.1,
+         "title": "Eleven days of the station ID",
+         "blurb": "The station's own jingle has been stuck in this caller's "
+                  "head for eleven days. They have stopped sleeping properly. "
+                  "They are half-joking and half not, and they want to know "
+                  "who wrote it and whether it can be undone.",
+         "outcome": "The pair try to dislodge it by singing something worse, "
+                    "which works, and the caller rings off humming the worse "
+                    "thing.",
+         "props": "eleven days; the four-note sting after the news"},
+        {"id": "amp-order", "heat": 1, "weight": 1.2,
+         "title": "Where is the amplifier",
+         "blurb": "They bought an amplifier off an advert they heard on this "
+                  "station and it has not come. They have the order number "
+                  "written on the back of an envelope and they read it out "
+                  "twice. They are not angry — they are one polite phone "
+                  "call away from angry, and everybody can hear it.",
+         "outcome": "The pair take the number down on air, promise to chase "
+                    "it with a department that does not exist, and the "
+                    "caller is treated like a customer instead of a joke.",
+         "props": "order 4471-B; a Rowntree 30-watt combo; ordered nine "
+                  "weeks ago"},
+        {"id": "wedding-date", "heat": 1, "weight": 1.0,
+         "title": "One song, six weeks from Saturday",
+         "blurb": "They are getting married six weeks from Saturday and they "
+                  "want the station to promise — on air, so it counts — to "
+                  "play one particular record at a particular time that "
+                  "morning. They will not be fobbed off with a vague yes.",
+         "outcome": "A promise is made out loud with a time attached to it, "
+                    "and one of the pair writes it on something they will "
+                    "obviously lose.",
+         "props": "the 14th, 11:20 in the morning; a marquee in the rain"},
+        {"id": "taxi-dial", "heat": 1, "weight": 1.0,
+         "title": "My passengers keep changing the station",
+         "blurb": "A taxi driver rings from a rank. Their fares keep leaning "
+                  "forward and retuning the radio off this station, and the "
+                  "driver has started arguing with them about it. They want "
+                  "the hosts to say something on air they can quote at the "
+                  "next one.",
+         "outcome": "The pair supply an unhelpfully grand line for the "
+                    "driver to use, and the caller practises it back at "
+                    "them until it sounds right.",
+         "props": "cab 11; the rank outside the station's own building"},
+        {"id": "moved-away", "heat": 1, "weight": 0.9,
+         "title": "I lose you at the tunnel",
+         "blurb": "They moved three counties over and the signal now dies "
+                  "in the same tunnel every single morning, always in the "
+                  "middle of a sentence. They have started guessing the ends "
+                  "of sentences and they want to know how many they have "
+                  "got right.",
+         "outcome": "The pair test them on air with the last three, the "
+                    "caller gets one and a half, and everybody agrees the "
+                    "tunnel is the enemy.",
+         "props": "the Ridge tunnel; 40 seconds of dead air, every morning"},
+
+        # --- HEATED (2) ---------------------------------------------------
+        {"id": "played-twice", "heat": 2, "weight": 1.3,
+         "title": "You played it twice and I timed it",
+         "blurb": "The station played the same record twice inside ninety "
+                  "minutes and this caller timed the gap. They open "
+                  "reasonably, with the times written down, and get "
+                  "progressively less reasonable as the pair fail to explain "
+                  "it and start blaming each other and then the shuffle.",
+         "outcome": "Somebody in the room finally takes responsibility for "
+                    "it, badly, and the caller is not remotely satisfied but "
+                    "is heard all the way out.",
+         "props": "09:14 and 10:41; they have both times written down"},
+        {"id": "damp-painting", "heat": 2, "weight": 1.2,
+         "title": "The painting came damp",
+         "blurb": "They bought one of the paintings the station has been "
+                  "trying to shift and it arrived damp, smelling of the "
+                  "inside of the building, in a bin bag. They want their "
+                  "money back. The pair defend the painting far past the "
+                  "point of dignity, which is what turns the heat up.",
+         "outcome": "The station is made to concede SOMETHING — a refund, a "
+                    "swap, a second painting nobody wants — and does so "
+                    "grudgingly and out loud.",
+         "props": "Lot 14; forty dollars; it arrived in a bin bag"},
+        {"id": "tape-skipped", "heat": 2, "weight": 1.1,
+         "title": "Who decides what gets played",
+         "blurb": "They sent a tape of their own in months ago and it has "
+                  "never aired. They want a name — an actual person who "
+                  "made that decision — and they will not accept 'the "
+                  "shuffle' or 'the system' as an answer. They get louder "
+                  "every time they are handed a process instead of a person.",
+         "outcome": "One of the pair finally says a name, possibly their "
+                    "own, possibly invented, and has to live with it.",
+         "props": "a tape posted in March; a jiffy bag with no stamp on the "
+                  "return"},
+        {"id": "prize-never-came", "heat": 2, "weight": 1.2,
+         "title": "I won in April and nothing came",
+         "blurb": "They won something on this station months ago and nothing "
+                  "ever arrived in the post. They start almost apologetic, "
+                  "and the more the pair improvise around it the angrier "
+                  "they get, because they can hear the improvising.",
+         "outcome": "The station is cornered into honouring it there and "
+                    "then, on air, with a date and a name attached.",
+         "props": "won on the 3rd of April; a hamper; nine weeks of nothing"},
+        {"id": "cattle-mast", "heat": 2, "weight": 1.0,
+         "title": "The cattle will not go near the mast",
+         "blurb": "A farmer whose bottom field holds the station's "
+                  "transmitter mast rings to say the cattle will not go "
+                  "within thirty feet of it any more. They are not a crank, "
+                  "they are furious and practical, and they want somebody to "
+                  "come out and look.",
+         "outcome": "Somebody from the station agrees, on air, to walk the "
+                    "field this week — and it is clear neither of them wants "
+                    "to be that somebody.",
+         "props": "the bottom field off Marrow Lane; nineteen head of cattle"},
+        {"id": "solo-talkover", "heat": 2, "weight": 1.1,
+         "title": "You talked over the solo",
+         "blurb": "The pair talked straight over the guitar solo — THE guitar "
+                  "solo — and this caller has pulled over to ring about it. "
+                  "It escalates because one of the hosts genuinely does not "
+                  "understand why it matters and says so.",
+         "outcome": "The record is put back on and the solo played clean, "
+                    "in silence, with both hosts made to sit through it.",
+         "props": "they pulled into a lay-by to make this call"},
+
+        # --- HOSTILE (3) --------------------------------------------------
+        {"id": "screened-out", "heat": 3, "weight": 1.1,
+         "title": "Nine calls, nine hang-ups",
+         "blurb": "They have been trying to get on air for a fortnight and "
+                  "believe they are being deliberately screened out. They "
+                  "are already shouting when the line opens. Every "
+                  "reassurance is taken as confirmation, and they have kept "
+                  "a list of the times.",
+         "outcome": "They are given the whole floor for one uninterrupted "
+                    "run at it, which is the only thing that was ever going "
+                    "to work, and it half works.",
+         "props": "nine calls, all written down with times"},
+        {"id": "brother-band", "heat": 3, "weight": 1.0,
+         "title": "You buried my brother's band",
+         "blurb": "One of the hosts said something dismissive on air about a "
+                  "local band. The caller is the guitarist's sibling and "
+                  "they have taken it entirely personally. They quote the "
+                  "line back word for word, and they have the date.",
+         "outcome": "The host either stands by it and pays for that, or "
+                    "backs down and pays for that instead — but it is "
+                    "settled in front of everybody, not smoothed over.",
+         "props": "the band is called Wet Cement; said on air a week last "
+                  "Tuesday"},
+        {"id": "dedication-bill", "heat": 3, "weight": 1.0,
+         "title": "Somebody charged me for a dedication",
+         "blurb": "They were charged for a song dedication. This station has "
+                  "never charged for a dedication in its life. They believe "
+                  "one of the pair pocketed it and they say so, flatly, "
+                  "within the first thirty seconds.",
+         "outcome": "The station gets to the bottom of it live and the "
+                    "answer is worse and funnier than either host wanted it "
+                    "to be — and the money goes back.",
+         "props": "eighteen dollars; paid in cash to somebody at the door"},
+        {"id": "regulator", "heat": 3, "weight": 0.9,
+         "title": "I have the regulator's number right here",
+         "blurb": "They are threatening to report the station to whoever "
+                  "regulates radio and they claim to have the number in "
+                  "front of them. They are cold rather than shouty, which is "
+                  "far worse, and they will not say what the complaint "
+                  "actually is until late in the call.",
+         "outcome": "What they are actually upset about turns out to be "
+                    "small and human, and the pair get there — but not "
+                    "before the threat has properly landed.",
+         "props": "a number written on the back of a licence renewal"},
+        {"id": "read-my-street", "heat": 3, "weight": 0.9,
+         "title": "You read my street out on the air",
+         "blurb": "The pair read a name and a street out on air last night. "
+                  "It was this caller's street. They are furious and, "
+                  "underneath it, frightened — and the fright is what the "
+                  "hosts keep failing to hear while they defend themselves.",
+         "outcome": "The station apologises properly, without a joke "
+                    "anywhere near it, and says on air that it will not "
+                    "happen again.",
+         "props": "Farriers Row; read out at about ten past eleven"},
+
+        # --- PRIZE (kind: prize, heat spread) ------------------------------
+        {"id": "magic-number", "heat": 0, "kind": "prize", "weight": 1.3,
+         "title": "The magic number",
+         "blurb": "This caller has got through on the exact number the "
+                  "station has been counting to all hour, and they have no "
+                  "idea. They rang in about something perfectly ordinary and "
+                  "walk into a prize sideways.",
+         "outcome": "The pair make an enormous, badly-organised ceremony of "
+                    "it, name the prize plainly, and settle when and where "
+                    "it can be collected.",
+         "props": "caller number 47; a cardboard box behind the desk"},
+        {"id": "four-note-game", "heat": 1, "kind": "prize", "weight": 1.2,
+         "title": "Name it in four notes",
+         "blurb": "The on-air game: four notes, one guess, and the caller "
+                  "has to name the record. They are enormously competitive "
+                  "about it, they argue about whether the four notes were "
+                  "played fairly, and they get it — or they get it wrong in "
+                  "a way that is better than getting it right.",
+         "outcome": "The result is honoured either way: a win is paid out "
+                    "and named, and a loss gets the consolation prize the "
+                    "station is even more desperate to be rid of.",
+         "props": "four notes on the studio keyboard; one guess only"},
+        {"id": "painting-prize", "heat": 1, "kind": "prize", "weight": 1.1,
+         "title": "You have won the painting nobody bought",
+         "blurb": "The prize is one of the paintings still leaning against "
+                  "the desk, and the caller has to be TOLD what they have "
+                  "won. The pair describe it in glowing terms that get less "
+                  "convincing the longer they go on, and the caller asks "
+                  "several extremely reasonable questions about it.",
+         "outcome": "The painting is genuinely, formally given away — "
+                    "described, named and arranged for — whether the caller "
+                    "sounds delighted or appalled.",
+         "props": "the big one by the door; it is still slightly damp"},
+        {"id": "arena-tickets", "heat": 0, "kind": "prize", "weight": 1.1,
+         "title": "Two for the Pine Box Arena",
+         "blurb": "Two tickets to see somebody who was actually on this "
+                  "station tonight, live at the Pine Box Arena on the edge "
+                  "of town. The caller is thrilled and immediately has a "
+                  "problem: they cannot decide who to take, and they think "
+                  "out loud about it on air for far too long.",
+         "outcome": "The tickets are awarded properly, and the pair are "
+                    "dragged into helping choose the second seat, which they "
+                    "do badly and with strong opinions.",
+         "props": "two tickets, row K; the Pine Box Arena on the edge of "
+                  "town"},
+        {"id": "angry-winner", "heat": 3, "kind": "prize", "weight": 1.0,
+         "title": "They rang to complain and won anyway",
+         "blurb": "This caller rang in genuinely furious about something the "
+                  "station did, and mid-row it turns out they are the "
+                  "winner. The prize does not calm them down. If anything it "
+                  "insults them — they think they are being bought off, and "
+                  "they say so while accepting it.",
+         "outcome": "The prize is awarded, out loud and in full, to somebody "
+                    "who is still angry at the end of the call and takes it "
+                    "anyway.",
+         "props": "they were on hold for eleven minutes before this"},
+        {"id": "runner-up", "heat": 2, "kind": "prize", "weight": 1.0,
+         "title": "The runner-up who was told they had won",
+         "blurb": "Somebody in this building told this caller they had won, "
+                  "and on air it turns out they are the runner-up. The "
+                  "consolation prize is real and it is not nothing, but it "
+                  "is not what they were promised, and they will not let "
+                  "the pair paper over the difference.",
+         "outcome": "The runner-up prize is genuinely given — named, "
+                    "described and arranged for — and somebody admits out "
+                    "loud that the caller was told wrong.",
+         "props": "they were rung on Tuesday and told they had won outright"},
+        {"id": "prize-tax", "heat": 3, "kind": "prize", "weight": 0.9,
+         "title": "Who pays the tax on this",
+         "blurb": "They win live and, instead of celebrating, they want to "
+                  "know immediately whether they have to declare it, whether "
+                  "they can have the cash instead, and who is paying for the "
+                  "drive out to collect it. Every fumbled answer makes them "
+                  "harder, and by the end they are properly angry at a "
+                  "station that has just given them something.",
+         "outcome": "The prize is awarded in full and on the record, and the "
+                    "pair are made to say plainly what it is worth and who "
+                    "is covering the collection.",
+         "props": "a forty-mile drive; they want it in writing"},
+        {"id": "cupboard-sight-unseen", "heat": 2, "kind": "prize",
+         "weight": 1.0,
+         "title": "The prize cupboard, sight unseen",
+         "blurb": "The caller is offered whatever is in the prize cupboard "
+                  "without being told what it is, and has to decide on air. "
+                  "They interrogate the pair about it, the pair cannot "
+                  "answer because neither of them has looked, and it gets "
+                  "genuinely tense before they commit.",
+         "outcome": "The cupboard is opened live, the contents are named "
+                    "honestly however grim they are, and the caller gets "
+                    "exactly what was promised.",
+         "props": "the cupboard by the fire door; nobody has the key"},
+    ]
+    return [_case_row({**row, "added": now}) for row in book]
+
+
+def read_cases() -> list[dict[str, Any]]:
+    """The book, seeded the first time it is asked for.
+
+    An EMPTY list on disk is a legitimate, deliberate state — the operator
+    has cleared the book and calls should ring the way they always did — so
+    it is returned as-is. Only a missing or unreadable file re-seeds, which
+    is the trap the hang-up shelf had to work around with an undeletable
+    last row."""
+    with _CASES_LOCK:
+        try:
+            rows = json.loads(CASES_PATH.read_text())
+            if isinstance(rows, list):
+                return [_case_row(r) for r in rows
+                        if isinstance(r, dict) and r.get("id")]
+        except Exception:  # noqa: BLE001
+            pass
+        rows = _case_seed()
+        _cases_write(rows)
+        return rows
+
+
+def _cases_write(rows: list[dict[str, Any]]) -> None:
+    try:
+        CASES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CASES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows[:400], indent=1) + "\n")
+        tmp.replace(CASES_PATH)
+    except OSError:
+        pass
+
+
+def case_by_id(case_id: str) -> dict[str, Any]:
+    """One case by id, for a PREPARED call that has to look up what it was
+    written about hours after it was written."""
+    if not case_id:
+        return {}
+    try:
+        return next((r for r in read_cases() if r.get("id") == case_id), {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def case_add(**fields: Any) -> dict[str, Any]:
+    with _CASES_LOCK:
+        rows = read_cases()
+        entry = _case_row({**fields, "id": uuid.uuid4().hex[:8],
+                           "uses": 0, "picks": 0, "last": 0, "aired": 0,
+                           "added": int(time.time())})
+        rows.append(entry)
+        _cases_write(rows)
+        return entry
+
+
+def case_update(case_id: str, **fields: Any) -> dict[str, Any] | None:
+    with _CASES_LOCK:
+        rows = read_cases()
+        for index, row in enumerate(rows):
+            if row.get("id") != case_id:
+                continue
+            merged = {**row}
+            for key in ("title", "blurb", "outcome", "props", "heat", "kind",
+                        "weight", "enabled"):
+                if key in fields:
+                    merged[key] = fields[key]
+            rows[index] = _case_row(merged)
+            _cases_write(rows)
+            return rows[index]
+    return None
+
+
+def case_delete(case_id: str) -> bool:
+    """Retire a case. Unlike the hang-up shelf the LAST one may go: a call
+    with no case simply rings about whatever it would have rung about before
+    this file existed, which is a working station, not a broken one."""
+    with _CASES_LOCK:
+        rows = read_cases()
+        keep = [r for r in rows if r.get("id") != case_id]
+        if len(keep) == len(rows):
+            return False
+        _cases_write(keep)
+        return True
+
+
+def case_reseed() -> list[dict[str, Any]]:
+    """Put the house book back, keeping anything the operator wrote."""
+    with _CASES_LOCK:
+        rows = read_cases()
+        known = {str(r.get("id") or "") for r in rows}
+        rows.extend(r for r in _case_seed() if r["id"] not in known)
+        _cases_write(rows)
+        return rows
+
+
+def case_drawn(case: dict[str, Any]) -> dict[str, Any]:
+    """Write down that this case went to the WRITER.
+
+    Airing is counted separately (case_aired) because a prepared call can be
+    written during one record and go out three hours later — and "how often
+    it has aired" has to mean aired."""
+    case_id = str((case or {}).get("id") or "")
+    if not case_id:
+        return dict(case or {})
+    try:
+        with _CASES_LOCK:
+            rows = read_cases()
+            for row in rows:
+                if row.get("id") == case_id:
+                    row["picks"] = int(row.get("picks") or 0) + 1
+                    row["last"] = int(time.time())
+            _cases_write(rows)
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(case or {})
+
+
+def case_aired(case_id: str) -> None:
+    """This case went OUT. Called when the lines actually reach the air —
+    including for a call written hours earlier, whose case id travelled on
+    the round through the reserve and the pantry."""
+    if not case_id:
+        return
+    try:
+        with _CASES_LOCK:
+            rows = read_cases()
+            hit = False
+            for row in rows:
+                if row.get("id") == case_id:
+                    row["uses"] = int(row.get("uses") or 0) + 1
+                    row["aired"] = int(time.time())
+                    hit = True
+            if hit:
+                _cases_write(rows)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def case_pick(case_id: str = "", heat: int | None = None,
+              kind: str = "") -> dict[str, Any]:
+    """One case off the book, by weight, avoiding what has just been used.
+
+    Steerable three ways: name a case outright, name a HEAT, or name a KIND.
+    Left alone it consults the operator's two dials — how often calls run hot
+    and how often there is a prize on the line — and draws inside whichever
+    band those land on.
+
+    The weighted draw and the no-repeats guard are the same mechanism: the
+    pool is expanded so an id appears once per half-point of weight, and
+    unrepeated() picks out of THAT, which makes a heavy case likelier without
+    letting it come round twice in six calls.
+
+    Two details that matter, both about how much history to hold back.
+
+    unrepeated() sizes its own history against the pool it is HANDED, and
+    what it is handed here is the weight-expanded list — so `keep` has to be
+    worked out from the count of DISTINCT cases in the band instead. Half
+    the band, capped at six: any history at all is a hard ceiling on how
+    often the heaviest case can come round (nothing can appear more than
+    once every keep+1 draws), so holding back all but one of a small band
+    turns the weighted draw into a plain round-robin and the weight slider
+    does nothing at all. Half leaves the weights somewhere to work.
+
+    And the giveaways keep their own history, because the prize band is much
+    the smaller of the two and letting it truncate the shared list would
+    quietly wipe out the guard on the ordinary calls."""
+    rows = [r for r in read_cases()
+            if r.get("enabled", True) and float(r.get("weight") or 0) > 0]
+    if case_id:
+        # Asked for BY NAME — honoured even if it is switched off or
+        # weighted to zero, because naming it is the override.
+        named = next((r for r in read_cases() if r.get("id") == case_id), None)
+        return case_drawn(dict(named)) if named else {}
+    if not rows:
+        return {}
+    dj = dj_settings()
+    if not kind:
+        prize_rate = max(0, min(100, int(dj.get("caller_case_prize", 18) or 0)))
+        kind = "prize" if random.random() < prize_rate / 100 else "call"
+    pool = [r for r in rows if str(r.get("kind") or "call") == kind] or rows
+    if heat is None:
+        hot_rate = max(0, min(100, int(dj.get("caller_case_heat", 30) or 0)))
+        band = (CASE_HOT_HEATS if random.random() < hot_rate / 100
+                else CASE_COOL_HEATS)
+        banded = [r for r in pool if case_heat(r) in band]
+    else:
+        want = max(0, min(3, int(heat)))
+        banded = [r for r in pool if case_heat(r) == want]
+        if not banded:
+            # Nothing written at that rung: take the NEAREST rung rather
+            # than quietly ignoring the operator and handing back a gentle
+            # one. An explicit heat is an instruction, not a preference.
+            near = min((abs(case_heat(r) - want) for r in pool), default=None)
+            if near is not None:
+                banded = [r for r in pool if abs(case_heat(r) - want) == near]
+    pool = banded or pool
+    spread: list[str] = []
+    for row in pool:
+        copies = max(1, min(20, int(round(float(row.get("weight") or 1) * 2))))
+        spread.extend([str(row.get("id") or "")] * copies)
+    picked = unrepeated(spread,
+                        "caller-case-prize" if kind == "prize"
+                        else "caller-case",
+                        keep=max(1, min(6, len(pool) // 2)))
+    chosen = next((r for r in pool if str(r.get("id") or "") == picked), None) \
+        or random.choice(pool)
+    return case_drawn(dict(chosen))
+
+
+def case_for_call(case_id: str = "", heat: int | None = None) -> dict[str, Any]:
+    """The case this call rings about, or {} for a call that rings about
+    whatever the station would have had it ring about anyway.
+
+    Never raises. A missing, empty or hand-mangled case file means tonight
+    sounds exactly like last night rather than taking the phones off air."""
+    try:
+        if case_id or heat is not None:
+            return case_pick(case_id=case_id, heat=heat)   # asked for by hand
+        if theme_owns_air():
+            # #775's rule, applied to the book: a subject the OPERATOR has
+            # named outranks the station's own material, and a case is
+            # exactly that kind of material.
+            return {}
+        rate = max(0, min(100, int(
+            dj_settings().get("caller_case_rate", 55) or 0)))
+        if random.random() >= rate / 100:
+            return {}
+        chosen = case_pick()
+        if chosen:
+            pipeline_log("call", "case #" + str(chosen.get("id") or "")
+                         + " - " + str(chosen.get("title") or "")
+                         + " (" + case_heat_name(chosen)
+                         + (", PRIZE" if case_is_prize(chosen) else "")
+                         + ") (#854)")
+        return chosen
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def case_clause(case: dict[str, Any], where: str = "call") -> str:
+    """The case, written into the prompt the way the disposition clause is.
+
+    `where` decides how it is introduced. On the generated call-in road the
+    case IS the subject. On the request line the request is how they got on
+    air and the case is what the call turns out to be about, so the joke
+    that road exists for — his own request read back by a stranger — is not
+    trampled by it."""
+    if not case:
+        return ""
+    title = str(case.get("title") or "").strip()
+    blurb = str(case.get("blurb") or "").strip()
+    if not blurb:
+        return ""
+    lead = (" WHY THEY REALLY RANG — the request above is how they got on "
+            "air; THIS is what the call turns out to be about once the "
+            "record is sorted out"
+            if where == "request" else
+            " WHAT THIS CALL IS ACTUALLY ABOUT — the case on the "
+            "switchboard tonight, which outranks anything above about "
+            "their subject")
+    out = [lead + ". " + (title + ": " if title else "") + blurb]
+    props = str(case.get("props") or "").strip()
+    if props:
+        out.append(
+            " They have CONCRETE DETAILS to hand and they use them out "
+            "loud, exactly as written, more than once — a caller with a "
+            f"number in front of them is a real person: {props}.")
+    out.append(CASE_HEAT_CLAUSE.get(case_heat(case), ""))
+    outcome = str(case.get("outcome") or "").strip()
+    if outcome:
+        out.append(
+            " WHAT A SATISFYING END TO THE CASE ITSELF LOOKS LIKE: "
+            f"{outcome} That is the BUSINESS of the call and it is settled "
+            "before the pair let them go. It is NOT how the call "
+            "terminates — that is set separately below and is still the "
+            "last thing that happens.")
+    if case_is_prize(case):
+        out.append(CASE_PRIZE_CLAUSE)
+    return "".join(out)
+
+
 def caller_hangup_pin(name: str) -> str:
     """The ending pinned to one caller, if any (#715). A regular who always
     gets the phone taken off them by their spouse should get that every
@@ -28500,7 +29292,9 @@ async def _theme_ring_now() -> None:
 
 
 async def dj_call_generated(caller: dict[str, Any] | None = None,
-                            force: bool = False) -> dict[str, Any]:
+                            force: bool = False,
+                            case_id: str = "",
+                            heat: int | None = None) -> dict[str, Any]:
     """A generated person rings the station and the pair take the call.
 
     The caller is a third voice on a phone line — static, a little echo, the
@@ -28570,10 +29364,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # at the draw, so the guard covers the override above.
     name_used(str(caller.get("name") or ""))
     state = unrepeated(list(CALLER_STATES), "caller-state")
+    # #854: the case book FIRST — what the person on the line has actually
+    # rung about, and at what heat. It has to come before the ending is
+    # drawn, because a PRIZE case is a promise the station has to keep: it
+    # steers the shelf towards an outcome that can honour a giveaway rather
+    # than colliding with a hang-up afterwards. A caller named ending
+    # (#715) still outranks everything, as it should.
+    call_case = case_for_call(case_id, heat)
     # #691: how this call ENDS, drawn off the editable shelf by weight
     # rather than out of a frozen tuple. The rule travels with the call so
     # the booth can name it afterwards and the ledger can count it.
-    hangup_rule = hangup_pick(str(caller.get("name") or ""))    # #715
+    hangup_rule = hangup_pick(str(caller.get("name") or ""),
+                              success_rate=(100 if case_is_prize(call_case)
+                                            else None))          # #715
     outcome = str(hangup_rule.get("text") or "")
     winning_call = _successful_call_outcome(outcome)
     # The prose state seeds the caller's emotion vector, so "furious" is
@@ -29145,7 +29948,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     angle = (
         f"The request line rings and {caller['name']} is on {line_say}, "
         f"{state}.{temper_bit}{behavior_bit}"
-        f"{persona_bit}{goal_bit} {topic} "
+        f"{persona_bit}{goal_bit} {topic}{case_clause(call_case)} "
         # #544: the pair HEAR the phone ring and react to it before they pick
         # it up — the ring is a beat they play off of, not a silent cut.
         "It OPENS with the phone RINGING and the pair HEARING it: one of them "
@@ -29182,7 +29985,13 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     })
     pipeline_log("call", f"{caller['name']} on {line_say} — {state}"
                          + (" · cloned voice" if caller.get("voice_id")
-                            else ""))
+                            else "")
+                         # #854: which case it is, so the operator can watch
+                         # a case they just wrote go out on the air.
+                         + (f" · case: {call_case.get('title')}"
+                            f" ({case_heat_name(call_case)}"
+                            + (", prize" if case_is_prize(call_case) else "")
+                            + ")" if call_case else ""))
     # A phone rings before anyone speaks (#237) — but NOT before the script
     # exists (#805). The ring aired, then the write died silently, and the
     # listener heard ring-then-nothing 52 times in 12 hours. On the
@@ -29248,9 +30057,17 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     if lines and defuse:
         speakbox_remember(defuse)       # #750: the peacemaker's swath rotates
 
+    # #854: the book counts what AIRED, not what was written — a round
+    # that came back empty must not be marked as a case that went out.
+    if lines:
+        case_aired(str(call_case.get("id") or ""))
     return {"caller": caller["name"], "lines": lines, "state": state,
             "voice": mangle, "hangup": str(outcome),
             "rule_id": str(hangup_rule.get("id") or ""),
+            "case_id": str(call_case.get("id") or ""),
+            "case": str(call_case.get("title") or ""),
+            "case_heat": case_heat_name(call_case),
+            "case_prize": case_is_prize(call_case),
             "seconds": round(ran, 1)}
 
 
@@ -32749,7 +33566,9 @@ def heat_joke_bank(most: int = 6) -> str:
 
 
 async def dj_caller(track: dict[str, Any] | None = None,
-                    bank_to: list[dict[str, Any]] | None = None
+                    bank_to: list[dict[str, Any]] | None = None,
+                    case_id: str = "",
+                    heat: int | None = None
                     ) -> list[str]:
     """A call gets through on the request line.
 
@@ -32785,6 +33604,14 @@ async def dj_caller(track: dict[str, Any] | None = None,
                                len(_prep_said))
                 except Exception:  # noqa: BLE001
                     pass
+                # #854: the case this script was WRITTEN about is
+                # credited now, as it airs, not when it was written — the
+                # id rode the round through the reserve and the pantry
+                # exactly the way the ending rule does.
+                try:
+                    case_aired(str(_prep_entry.get("prep_case") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
                 quota_stamp("caller")      # #839: the hour counts it
                 return _prep_said
     hot = booth_hot()
@@ -32804,12 +33631,18 @@ async def dj_caller(track: dict[str, Any] | None = None,
     ]
     if not heat_call and not wants:
         return []                      # nothing of his to call in about yet
+    # #854: the case, drawn only on the road that can use it — the heat
+    # road below is already about a subject of its own and a second one
+    # would just be two calls talking over each other. Drawn BEFORE the
+    # ending so a giveaway case can steer the shelf towards an outcome
+    # that is able to honour it.
+    _case = {} if heat_call else case_for_call(case_id, heat)
     # #691: the request line ends its calls off the same shelf as every
     # other road, so the rules you write govern ALL the calls and not just
     # the long generated ones. Drawn only once the call is certain to
     # happen — a pick bumps the rule's tally, and a call that never rang
     # must not count toward it.
-    rule = hangup_pick()
+    rule = hangup_pick(success_rate=(100 if case_is_prize(_case) else None))
     tail = (f" By the end of the call, {rule['text']}."
             if rule.get("text") else "")
     started = time.time()
@@ -32857,6 +33690,12 @@ async def dj_caller(track: dict[str, Any] | None = None,
         "between the two of you relay what they are asking for, which is "
         f"this: \"{want}\"."
         + _disp
+        # #854: the case supplies the SUBJECT, the disposition above
+        # supplies the TEMPER, and the rule below supplies the ENDING. On
+        # THIS road the request is how they got on air and the case is what
+        # the call turns out to be about, so the joke this road exists for
+        # is not trampled by it.
+        + case_clause(_case, "request")
         + " Take the call with unmistakable "
         f"{random.choice(CALLER_MOODS)}."
         + f" Let it RUN — {_turns} turns of real back and forth, the "
@@ -32872,11 +33711,16 @@ async def dj_caller(track: dict[str, Any] | None = None,
         if bank_to:
             bank_to[-1]["prep_rule"] = dict(rule or {})
             bank_to[-1]["prep_name"] = "the caller on the request line"
+            # #854: the CASE id travels with the round, exactly as the
+            # ending rule does, so a call written now and aired in three
+            # hours is still credited to the case it was written about.
+            bank_to[-1]["prep_case"] = str(_case.get("id") or "")
         return []
     call_ended("the caller on the request line", line_say, started, rule,
                len(lines or []))
     if lines:
         quota_stamp("caller")              # #839: the hour counts it
+        case_aired(str(_case.get("id") or ""))                    # #854
     return lines
 
 
@@ -40219,6 +41063,96 @@ async def dj_hangups_delete(
     return {"deleted": rule_id}
 
 
+@app.get("/api/dj/cases")
+async def dj_cases_list(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The case book (#854) — what callers ring the station ABOUT.
+
+    Each row carries its heat, its weight, whether it is in the draw, how
+    many times it has been WRITTEN into a script and how many times one of
+    those scripts actually reached the air. Those two differ on purpose: a
+    call prepared during one record can go out hours later, and "how often
+    it has aired" has to mean aired."""
+    require_read_auth(authorization)
+    rows = await asyncio.to_thread(read_cases)
+    dj = dj_settings()
+    # Share is worked out INSIDE each kind, because the prize/ordinary
+    # split is decided first and a prize case never competes with an
+    # ordinary one for the same slot.
+    totals: dict[str, float] = {}
+    for row in rows:
+        if row.get("enabled", True) and float(row.get("weight") or 0) > 0:
+            key = str(row.get("kind") or "call")
+            totals[key] = totals.get(key, 0.0) + float(row.get("weight") or 0)
+    def _share(row: dict[str, Any]) -> float:
+        if not (row.get("enabled", True)
+                and float(row.get("weight") or 0) > 0):
+            return 0.0
+        total = totals.get(str(row.get("kind") or "call")) or 1.0
+        return round(float(row.get("weight") or 0) / total * 100, 1)
+    return {
+        "cases": [{**r, "heat_name": CASE_HEAT_NAMES.get(case_heat(r), ""),
+                   "share": _share(r)} for r in rows],
+        "heats": [{"heat": h, "name": CASE_HEAT_NAMES[h]} for h in CASE_HEATS],
+        "kinds": list(CASE_KINDS),
+        "rate": dj.get("caller_case_rate"),
+        "hot": dj.get("caller_case_heat"),
+        "prize_rate": dj.get("caller_case_prize"),
+        "seeded": len(_case_seed()),
+    }
+
+
+@app.post("/api/dj/cases")
+async def dj_cases_save(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Write a case, or change one. With `id` it edits — enable, disable,
+    re-weight, re-heat, rewrite; without, it adds. `reseed` puts the house
+    book back alongside anything you have written yourself."""
+    require_auth(authorization)
+    payload = await request.json() if await request.body() else {}
+    if payload.get("reseed"):
+        return {"cases": await asyncio.to_thread(case_reseed)}
+    case_id = str(payload.get("id") or "")
+    fields = {k: payload[k] for k in
+              ("title", "blurb", "outcome", "props", "heat", "kind",
+               "weight", "enabled") if k in payload}
+    if case_id:
+        row = await asyncio.to_thread(case_update, case_id, **fields)
+        if not row:
+            raise HTTPException(status_code=404, detail="No such case")
+        return {"case": row}
+    title = " ".join(str(fields.get("title") or "").split())
+    blurb = " ".join(str(fields.get("blurb") or "").split())
+    if len(title) < 3:
+        raise HTTPException(status_code=400,
+                            detail="Give the case a title you would "
+                                   "recognise on a list.")
+    if len(blurb) < 12:
+        raise HTTPException(
+            status_code=400,
+            detail="Write what the caller WANTS, in a sentence the writer "
+                   "can act on — not a category.")
+    fields["title"], fields["blurb"] = title, blurb
+    fields.setdefault("weight", 1.0)
+    return {"case": await asyncio.to_thread(case_add, **fields)}
+
+
+@app.delete("/api/dj/cases/{case_id}")
+async def dj_cases_delete(
+    case_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Retire a case. The last one may go — a station with an empty case
+    book simply rings the way it did before the book existed."""
+    require_auth(authorization)
+    if not await asyncio.to_thread(case_delete, case_id):
+        raise HTTPException(status_code=404, detail="No such case")
+    return {"deleted": case_id}
+
+
 @app.get("/api/dj/caller")
 async def dj_caller_card(
     name: str = "",
@@ -44873,7 +45807,18 @@ async def dj_callers_ring(
     caller = next((r for r in read_callers() if r.get("id") == wanted), None)
     note_action("📞 you put a caller on air"
                 + (f": {caller.get('name')}" if caller else ""))
-    return await dj_call_generated(caller)
+    # #854: the desk can name a CASE, or just a HEAT, and get a call
+    # written to it — which is how you audition one you have just written
+    # without waiting for the draw to come round to it.
+    _want_heat = payload.get("heat")
+    try:
+        _want_heat = (None if _want_heat in (None, "")
+                      else max(0, min(3, int(_want_heat))))
+    except (TypeError, ValueError):
+        _want_heat = None
+    return await dj_call_generated(caller,
+                                   case_id=str(payload.get("case_id") or ""),
+                                   heat=_want_heat)
 
 
 @app.post("/api/dj/dice")
@@ -60120,6 +61065,13 @@ function djTalkPopup() {
   hang.title = "How calls end — the randomized termination rules, their "
     + "odds, and the ledger of which ending each call took";
   hang.onclick = (ev) => { ev.stopPropagation(); hangupRules(""); };
+  /* #854: the case book — what callers ring ABOUT. The hang-up shelf next
+   * door governs how a call ENDS; this governs what it is for. */
+  const cases = el("button", "", "🗂");
+  cases.title = "The case book — what callers ring about, graded gentle to "
+    + "hostile, with the giveaway calls. Edit it, weight it, and ring one "
+    + "on demand (#854)";
+  cases.onclick = (ev) => { ev.stopPropagation(); callerCases(""); };
   /* #884/#885: the switchboard. The roads out of this moment, written
    * ahead of being wanted — pick one and the next round goes that way.
    * Every pick is written down and embedded, so the station slowly
@@ -60163,6 +61115,7 @@ function djTalkPopup() {
   head.appendChild(dot);                                        // #678
   head.appendChild(grab);
   head.appendChild(hang);
+  head.appendChild(cases);                                       // #854
   head.appendChild(paths);                                       // #691
   head.appendChild(all);                                        // #745
   head.appendChild(wipe);
@@ -61569,6 +62522,295 @@ async function hangupRules(focusId) {
       head2.style.cursor = "pointer";
       head2.title = "Open " + (c.name || "this caller") + "'s file";
       head2.onclick = () => callerDossier(c.name || "", "hangup");
+      body.appendChild(row);
+    });
+  }
+  draw();
+}
+
+/* ---- The case book (#854) ---------------------------------------------
+ * "connect the writing desk to the database of cases that come up when
+ * customers call ... sophisticated cases written for calls."
+ *
+ * The shelf next door says how a call ENDS. This says what it is ABOUT —
+ * a grievance, a question, a demand, a giveaway — each on a heat rung from
+ * gentle to hostile, so the desk can ask for a nasty one and get a nasty
+ * one. Weight is the odds inside its own kind; unticked takes it out of the
+ * draw without losing the writing. ▶ rings one this second.
+ */
+async function callerCases(focusId) {
+  const open = document.getElementById("caseModal");
+  if (open) open.remove();
+  const shade = el("div", "", "");
+  shade.id = "caseModal";
+  shade.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:186;display:flex;align-items:center;justify-content:center";
+  shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
+  const box = el("div", "panel", "");
+  box.style.cssText = "width:min(760px,94vw);max-height:86vh;overflow:auto;"
+    + "padding:16px;margin:0";
+  const head = el("div", "row", "");
+  head.style.cssText = "align-items:center;gap:10px;margin-bottom:4px";
+  head.appendChild(el("h2", "", "🗂 The case book — what callers ring about"));
+  head.lastChild.style.margin = "0";
+  const x = el("span", "", "✕");
+  x.style.cssText = "margin-left:auto;cursor:pointer;font-size:18px";
+  x.onclick = () => shade.remove();
+  head.appendChild(x);
+  box.appendChild(head);
+  const why = el("div", "muted", "");
+  why.style.cssText = "font-size:11.5px;line-height:1.55;margin-bottom:10px";
+  box.appendChild(why);
+  const body = el("div", "", "");
+  box.appendChild(body);
+  shade.appendChild(box);
+  document.body.appendChild(shade);
+
+  const HEATCOL = ["#8fd0a8", "#d7c98a", "#e8a76a", "#ef6461"];
+
+  async function draw() {
+    body.textContent = "Loading…";
+    let data = {cases: [], heats: []};
+    try { data = await api("/api/dj/cases"); }
+    catch (e) { body.textContent = e.message; return; }
+    body.textContent = "";
+    const heats = data.heats || [];
+    why.textContent = "One of these is the SUBJECT of a call — the hang-up "
+      + "shelf next door supplies the ENDING and the caller's own temper "
+      + "supplies the mood, so the three never fight. The desk is set to "
+      + (data.rate == null ? "?" : data.rate) + "% of calls off this book, "
+      + (data.hot == null ? "?" : data.hot) + "% of those running hot, and "
+      + (data.prize_rate == null ? "?" : data.prize_rate) + "% giveaways — "
+      + "change those on the caller page of the prompt desk. Weight is the "
+      + "odds inside a case's own kind; unticked takes it out of the draw "
+      + "without losing the writing.";
+
+    /* --- write a new one ------------------------------------------------ */
+    const add = el("div", "", "");
+    add.style.cssText = "border:1px solid var(--border);border-radius:7px;"
+      + "padding:8px;margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap";
+    const title = el("input", "", "");
+    title.type = "text";
+    title.placeholder = "title — how you would recognise it on a list";
+    title.style.cssText = "flex:1 1 220px;min-width:0;font-size:12px";
+    const heat = el("select", "", "");
+    heats.forEach((h) => {
+      const o = el("option", "", h.heat + " · " + h.name);
+      o.value = String(h.heat); heat.appendChild(o);
+    });
+    heat.style.cssText = "flex:0 0 auto;font-size:11px";
+    const kind = el("select", "", "");
+    [["an ordinary call", "call"], ["a PRIZE call", "prize"]]
+      .forEach(([t, v]) => {
+        const o = el("option", "", t); o.value = v; kind.appendChild(o);
+      });
+    kind.style.cssText = "flex:0 0 auto;font-size:11px";
+    const blurb = el("textarea", "", "");
+    blurb.placeholder = "what the caller WANTS, in a sentence the writer can "
+      + "act on";
+    blurb.style.cssText = "flex:1 1 100%;min-height:52px;font:inherit;"
+      + "font-size:12px";
+    const outcome = el("input", "", "");
+    outcome.type = "text";
+    outcome.placeholder = "what a satisfying end to the case looks like";
+    outcome.style.cssText = "flex:1 1 300px;min-width:0;font-size:12px";
+    const props = el("input", "", "");
+    props.type = "text";
+    props.placeholder = "props — an order number, a street, a product";
+    props.style.cssText = "flex:1 1 200px;min-width:0;font-size:12px";
+    const go = el("button", "primary", "+ Add the case");
+    go.style.cssText = "flex:0 0 auto";
+    go.onclick = async () => {
+      if (title.value.trim().length < 3 || blurb.value.trim().length < 12) {
+        setStatus("a case needs a title and a sentence the writer can act on",
+                  true);
+        return;
+      }
+      const done = pending(go, "…");
+      try {
+        await api("/api/dj/cases", {method: "POST", body: JSON.stringify({
+          title: title.value.trim(), blurb: blurb.value.trim(),
+          outcome: outcome.value.trim(), props: props.value.trim(),
+          heat: Number(heat.value), kind: kind.value, weight: 1})});
+        title.value = ""; blurb.value = "";
+        outcome.value = ""; props.value = "";
+        await draw();
+      } catch (e) { setStatus(e.message, true); }
+      finally { done(); }
+    };
+    [title, heat, kind, blurb, outcome, props, go]
+      .forEach((node) => add.appendChild(node));
+    body.appendChild(add);
+
+    if (!(data.cases || []).length) {
+      const none = el("div", "muted", "The book is empty — calls ring about "
+        + "whatever the speakbox hands over, the way they did before this "
+        + "existed.");
+      none.style.cssText = "font-size:11.5px;margin-bottom:8px";
+      body.appendChild(none);
+      const back = el("button", "", "↺ Put the house book back");
+      back.onclick = async () => {
+        try { await api("/api/dj/cases", {method: "POST",
+                        body: JSON.stringify({reseed: true})}); await draw(); }
+        catch (e) { setStatus(e.message, true); }
+      };
+      body.appendChild(back);
+    }
+
+    /* --- the book ------------------------------------------------------- */
+    (data.cases || []).forEach((c) => {
+      const row = el("div", "", "");
+      const lit = c.id && c.id === focusId;
+      row.style.cssText = "border-top:1px solid var(--border);padding:8px 6px;"
+        + "display:flex;gap:8px;align-items:flex-start;flex-wrap:wrap"
+        + (lit ? ";background:#141a24;border-radius:7px;"
+               + "box-shadow:inset 3px 0 0 var(--accent)" : "");
+      const on = el("input", "", "");
+      on.type = "checkbox";
+      on.checked = c.enabled !== false;
+      on.title = "In the draw";
+      on.style.cssText = "flex:0 0 auto;margin-top:4px";
+      on.onchange = async () => {
+        try {
+          await api("/api/dj/cases", {method: "POST",
+            body: JSON.stringify({id: c.id, enabled: on.checked})});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      row.appendChild(on);
+
+      const mid = el("div", "", "");
+      mid.style.cssText = "flex:1 1 300px;min-width:200px"
+        + (c.enabled === false ? ";opacity:.5" : "");
+      const line = el("div", "", "");
+      line.style.cssText = "display:flex;gap:6px;align-items:center;"
+        + "flex-wrap:wrap";
+      const nm = el("span", "", c.title || "(untitled)");
+      nm.style.cssText = "font-size:12.5px;font-weight:700";
+      line.appendChild(nm);
+      const chip = el("span", "", String(c.heat_name || ""));
+      chip.style.cssText = "font-size:9.5px;font-weight:700;padding:1px 6px;"
+        + "border-radius:9px;text-transform:uppercase;letter-spacing:.4px;"
+        + "border:1px solid " + (HEATCOL[c.heat] || "#5c6b82")
+        + ";color:" + (HEATCOL[c.heat] || "#5c6b82");
+      line.appendChild(chip);
+      if (c.kind === "prize") {
+        const pz = el("span", "", "🏆 prize");
+        pz.style.cssText = "font-size:9.5px;font-weight:700;padding:1px 6px;"
+          + "border-radius:9px;border:1px solid #d7c98a;color:#d7c98a";
+        line.appendChild(pz);
+      }
+      mid.appendChild(line);
+
+      const words = el("div", "", c.blurb || "");
+      words.style.cssText = "font-size:11.5px;line-height:1.45;margin-top:3px;"
+        + "cursor:text";
+      words.title = "Click to rewrite what the caller wants";
+      words.onclick = () => {
+        const edit = document.createElement("textarea");
+        edit.value = c.blurb || "";
+        edit.style.cssText = "width:100%;min-height:76px;font:inherit;"
+          + "font-size:11.5px";
+        const save = async (commit) => {
+          const value = edit.value.trim();
+          if (commit && value.length >= 12 && value !== c.blurb) {
+            try {
+              await api("/api/dj/cases", {method: "POST",
+                body: JSON.stringify({id: c.id, blurb: value})});
+              await draw();
+              return;
+            } catch (e) { setStatus(e.message, true); }
+          }
+          edit.replaceWith(words);
+        };
+        edit.onblur = () => save(true);
+        edit.onkeydown = (e) => { if (e.key === "Escape") save(false); };
+        words.replaceWith(edit);
+        edit.focus();
+      };
+      mid.appendChild(words);
+
+      if (c.outcome) {
+        const end = el("div", "muted", "→ " + c.outcome);
+        end.style.cssText = "font-size:10.5px;line-height:1.45;margin-top:3px";
+        mid.appendChild(end);
+      }
+      if (c.props) {
+        const pr = el("div", "muted", "props · " + c.props);
+        pr.style.cssText = "font-size:10.5px;margin-top:2px;opacity:.8";
+        mid.appendChild(pr);
+      }
+      const stat = el("div", "muted",
+        "aired " + (c.uses || 0) + "× · written " + (c.picks || 0) + "×"
+        + (c.aired ? " · last on air "
+           + new Date(c.aired * 1000).toLocaleString() : " · never on air yet")
+        + (c.share ? " · " + c.share + "% of "
+           + (c.kind === "prize" ? "giveaway" : "ordinary") + " calls" : ""));
+      stat.style.cssText = "font-size:10px;margin-top:4px";
+      mid.appendChild(stat);
+      row.appendChild(mid);
+
+      const side = el("div", "", "");
+      side.style.cssText = "flex:0 0 auto;display:flex;gap:5px;"
+        + "align-items:center;flex-wrap:wrap;justify-content:flex-end";
+      const hsel = el("select", "", "");
+      heats.forEach((h) => {
+        const o = el("option", "", h.heat + " · " + h.name);
+        o.value = String(h.heat); hsel.appendChild(o);
+      });
+      hsel.value = String(c.heat || 0);
+      hsel.title = "How hot this case runs";
+      hsel.style.cssText = "font-size:10.5px";
+      hsel.onchange = async () => {
+        try {
+          await api("/api/dj/cases", {method: "POST",
+            body: JSON.stringify({id: c.id, heat: Number(hsel.value)})});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      side.appendChild(hsel);
+      const w = el("input", "", "");
+      w.type = "range"; w.min = "0"; w.max = "5"; w.step = "0.5";
+      w.value = String(c.weight != null ? c.weight : 1);
+      w.title = "How often this case comes up";
+      w.style.cssText = "flex:0 0 100px";
+      const wv = el("span", "muted", "×" + w.value);
+      wv.style.cssText = "font-size:11px;width:30px;text-align:right";
+      w.oninput = () => { wv.textContent = "×" + w.value; };
+      w.onchange = async () => {
+        try {
+          await api("/api/dj/cases", {method: "POST",
+            body: JSON.stringify({id: c.id, weight: Number(w.value)})});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      side.appendChild(w); side.appendChild(wv);
+      const ring = el("button", "", "▶");
+      ring.title = "Ring this case NOW — a call written to it goes to air";
+      ring.style.cssText = "padding:2px 8px;font-size:11px";
+      ring.onclick = async () => {
+        const done = pending(ring, "…");
+        try {
+          await api("/api/dj/callers/ring", {method: "POST",
+            body: JSON.stringify({case_id: c.id})});
+          setStatus("the phone is ringing — " + (c.title || "that case"));
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+        finally { done(); }
+      };
+      side.appendChild(ring);
+      const kill = el("button", "danger", "✕");
+      kill.title = "Retire this case";
+      kill.style.cssText = "padding:2px 8px;font-size:11px";
+      kill.onclick = async () => {
+        if (!confirm("Retire \"" + (c.title || "this case") + "\"?")) return;
+        try {
+          await api("/api/dj/cases/" + c.id, {method: "DELETE"});
+          await draw();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      side.appendChild(kill);
+      row.appendChild(side);
       body.appendChild(row);
     });
   }
