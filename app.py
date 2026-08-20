@@ -529,7 +529,10 @@ DEFAULT_DJ = {
     # even a day worth of takes". The keeper builds every content type
     # until pantry_seconds() covers this, then idles; anything still
     # unaired at PANTRY_BURN_SECONDS is burned.
-    "prepare_hours": 1.0,
+    # #896: an hour and a half, in the operator's words, and the
+    # horizon BURNS — material past it is not merely un-built, it is
+    # rolled off oldest-first as new material lands. See pantry_burn.
+    "prepare_hours": 1.5,
     # How much of the talk comes out of the speakbox documents, 0 to 1.
     # Raised with the gallery governor (#646): the wall was eating the show,
     # and the documents are what it is supposed to be made of.
@@ -5194,6 +5197,30 @@ def _model_call_for(text: str) -> dict[str, Any]:
     return {}
 
 
+def _model_call_full(text: str) -> dict[str, Any]:
+    """The WHOLE exchange that produced this line - prompt, script and all.
+
+    _model_call_for matches against the first 400 characters of the answer,
+    which is all the hot path needs. A round is written as one script and
+    spoken a turn at a time, so a turn from the back half of a long round
+    falls outside that window entirely; this one searches the full script
+    kept since #861, then relaxes the probe once before giving up. Used by
+    the provenance card only, so it can afford to look twice."""
+    probe = " ".join(str(text or "").split()).lower()
+    if len(probe) < 12:
+        return {}
+    for width in (60, 30):
+        key = probe[:width]
+        if not key:
+            continue
+        for call in reversed(_MODEL_CALLS):
+            hay = " ".join(str(call.get("script")
+                               or call.get("text") or "").split()).lower()
+            if key in hay:
+                return dict(call)
+    return {}
+
+
 async def voice_render_any(text: str, voice: str, engine: str = "",
                            fx: dict[str, float] | None = None,
                            who: str = "") -> dict[str, Any] | None:
@@ -8943,10 +8970,23 @@ def pantry_bytes() -> int:
     return sum(_pantry_bytes_of(r) for r in list(_PANTRY.values()))
 
 
-def pantry_put(key: str, clip: dict[str, Any]) -> None:
+def pantry_put(key: str, clip: dict[str, Any],
+               text: str = "", voice: str = "", who: str = "",
+               kind: str = "") -> None:
+    """#894: and WHAT IT SAYS, beside it.
+
+    The key is a hash of engine+voice+text, which is perfect for finding
+    a take and useless for reading one — so the pantry could report 313
+    takes and 61 minutes without being able to tell the operator a
+    single thing any of them said. The words are cheap to keep and are
+    the entire content of the table this exists to serve."""
     if not (clip or {}).get("path"):
         return
-    _PANTRY[key] = {"clip": dict(clip), "at": time.time(), "used": 0}
+    _PANTRY[key] = {"clip": dict(clip), "at": time.time(), "used": 0,
+                    "text": str(text or "")[:600],
+                    "voice": str(voice or "")[:64],
+                    "who": str(who or "")[:24],
+                    "kind": str(kind or "")[:24]}
     _pantry_save()                                          # #915
     if len(_PANTRY) > PANTRY_MAX:
         for old in sorted(_PANTRY,
@@ -8986,6 +9026,114 @@ def pantry_seconds() -> float:
         except Exception:  # noqa: BLE001
             pass
     return round(total, 1)
+
+
+def box_depth() -> float:
+    """How far the pantry has come toward the horizon, 0.0 to 1.0.
+
+    #895: the one number behind "as we build up the queue, I want the
+    customers digging deeper and deeper into the speaker box". At 0.0
+    nothing anywhere behaves differently — which is the other half of
+    the same ask, that the early entries stay on the goal. Everything
+    that reads it scales FROM zero, so a cold shelf writes exactly the
+    show it wrote before this existed."""
+    try:
+        want = prepare_target_seconds()
+        if want <= 0:
+            return 0.0
+        # #930: PREPARED seconds, not cached ones. A fat render cache
+        # reported a full hour of cover on a bare shelf, which is both
+        # the wrong answer to "how deep is the queue" and, through
+        # box_depth, the wrong reason to start experimenting.
+        return max(0.0, min(1.0, prepared_seconds() / want))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def pantry_spoken_for() -> set[str]:
+    """Every pantry clip something is actually holding.
+
+    #930: the cache and the prepared shelf are different piles, and
+    telling them apart is the whole of the horizon rule. A clip a shelf
+    row, a banked round or the hold shelf points at is MATERIAL. Every
+    other clip is a render the station happened to cache on its way
+    past, and that is what "the other content that is previously there"
+    means when the horizon rolls."""
+    held: set[str] = set()
+    try:
+        for rows in _SHELF.values():
+            for row in (rows or []):
+                held.update(_row_clip_keys(row))
+        for entry in list(_LARDER):
+            held.update(_row_clip_keys(entry))
+        for row in list(_BOX_HOLD):
+            held.update(_row_clip_keys(row))
+    except Exception:  # noqa: BLE001
+        pass
+    return held
+
+
+def prepared_seconds() -> float:
+    """Seconds of finished audio that is SPOKEN FOR — the honest depth.
+
+    #930: `pantry_seconds()` answers "how much audio is cached", which
+    on a station that voices continuously is mostly lines already aired.
+    Reporting that as cover is how the preparer came to stand down with
+    a bare shelf. This counts only what a shelf row or a banked round is
+    holding."""
+    total = 0.0
+    try:
+        for key in pantry_spoken_for():
+            row = _PANTRY.get(key) or {}
+            total += float((row.get("clip") or {}).get("seconds") or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    return round(total, 1)
+
+
+def _row_clip_keys(row: Any, depth: int = 0) -> list[str]:
+    """Every pantry clip a shelf row points at.
+
+    #896: a shelf row comes in two shapes — a single prepared line,
+    which carries its pantry key directly, and a whole prepared round,
+    whose keys sit one or two levels down inside `entry`. Rather than
+    encode both shapes here and have this quietly stop finding half of
+    them the next time a road changes, it walks for any "key" that
+    names something actually on the pantry shelf. Bounded depth,
+    because a status-adjacent helper may never be the thing that hangs
+    the station."""
+    found: list[str] = []
+    if depth > 4:
+        return found
+    try:
+        if isinstance(row, dict):
+            got = row.get("key")
+            if isinstance(got, str) and got in _PANTRY:
+                found.append(got)
+            for val in row.values():
+                if isinstance(val, (dict, list)):
+                    found.extend(_row_clip_keys(val, depth + 1))
+        elif isinstance(row, list):
+            for val in row[:64]:
+                if isinstance(val, (dict, list)):
+                    found.extend(_row_clip_keys(val, depth + 1))
+    except Exception:  # noqa: BLE001
+        pass
+    return found
+
+
+def box_rate_now(rate: float) -> float:
+    """The speakbox rate, lifted toward certain as the queue deepens.
+
+    MULTIPLICATIVE on the operator's own slider, never additive: at 0
+    the answer is 0, because "these sliders for the speakerbox must
+    always be taken into account, no matter the tint" — twice asked,
+    in those words. A slider at zero is an instruction, not a hint."""
+    try:
+        rate = max(0.0, min(1.0, float(rate)))
+        return rate + (1.0 - rate) * 0.45 * box_depth()
+    except Exception:  # noqa: BLE001
+        return rate
 
 
 # --- The prepared shelf (#842) ---------------------------------------
@@ -9976,6 +10124,42 @@ def pantry_burn() -> int:
                     if now - float(r.get("at") or 0) > PANTRY_BURN_SECONDS]:
             _PANTRY.pop(key, None)
             burned["clips"] = int(burned.get("clips") or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
+    # #896: THE HORIZON BURNS. The 24-hour ceiling above is a
+    # staleness rule; this is the operator's depth rule — "only generate
+    # up to an hour and a half ahead automatically and then the other
+    # content that is previously there is being burned as we're
+    # generating new content as time goes on". Oldest unaired material
+    # goes first, and it stops AT the line rather than under it: the
+    # preparer's own stop condition is `pantry_seconds() >= target`, so
+    # burning below the horizon would have the two of them chasing each
+    # other around the same number forever. The 15% band is the same
+    # guard from the other side.
+    # #930: and it takes it out of the CACHE. Never out of the shelf —
+    # see the note at the top of this change; paying the horizon out of
+    # prepared segments is how one pass emptied the station IDs, the
+    # memos, the calls and the painting rounds at a stroke.
+    try:
+        want = prepare_target_seconds()
+        over = pantry_seconds() - want
+        if want > 0 and over > want * 0.15:
+            held = pantry_spoken_for()
+            loose = [(float(r.get("at") or 0), k)
+                     for k, r in list(_PANTRY.items()) if k not in held]
+            loose.sort()                        # oldest render first
+            rolled = 0
+            for _at, key in loose:
+                if over <= 0:
+                    break
+                row = _PANTRY.pop(key, None)
+                if row is None:
+                    continue
+                over -= max(1.0, float((row.get("clip") or {}).get(
+                    "seconds") or 0))
+                rolled += 1
+            if rolled:
+                burned["cached renders rolled off the horizon"] = rolled
     except Exception:  # noqa: BLE001
         pass
     if burned:
@@ -11451,6 +11635,19 @@ async def speak(
     belong to the box addressing YOU — a DJ line routed through here on a
     fallback was coming out as "Yo Boss. <the line> …", which is not a
     thing a DJ says."""
+    # #889: the box speaks ENGLISH too. Every STATION road passes
+    # english_only inside spoken_text; this one - the assistant answering
+    # you, home_assistant_say behind it, and the fallback a booth line
+    # takes when its own road fails - never did, so a model that wandered
+    # into another language came out of the speaker anyway. Judged here,
+    # and never silenced: a refusal is answered in English rather than
+    # with dead air.
+    try:
+        if str(text or "").strip() and not english_only(str(text)):
+            text = ("That came back in another language, so I am not going "
+                    "to say it. Ask me again and I will answer in English.")
+    except Exception:  # noqa: BLE001
+        pass
     chosen = engine if engine in VOICE_ENGINES else voice_engine()
 
     if chosen == "ha":
@@ -13941,8 +14138,13 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
     # An advert, a track intro, a passing remark — all of them get built
     # around something out of his documents rather than out of nothing (#207).
     # Gated on the speakbox slider so zero still means zero.
+    # #895: the rate lifts as the queue builds — and THIS is the line
+    # that puts the box into the advert reads and the memos from
+    # upstairs, because every kind dj_speak handles (ad, station_id,
+    # interject, media, reply) draws through here.
     aside = ""
-    if seed is not None and random.random() < dj["speakbox_rate"]:
+    if seed is not None and random.random() < box_rate_now(
+            dj["speakbox_rate"]):
         seed.update(await speakbox_quote())
         aside = speakbox_aside(seed, pair=False) if seed else ""
 
@@ -14048,12 +14250,15 @@ _ENGLISH_REFUSED = [0]
 def english_only(line: str) -> str:
     """Return the line if it is English, else nothing.
 
-    Deliberately permissive about SHORT text — a sting label, a name, a
-    number or a shout has too few words to judge, and looks_english is
-    built for sentences. Anything long enough to carry a language, and
-    not in English, does not reach a voice."""
+    #889: it used to hand back ANYTHING under 25 characters unjudged
+    — a sting label, a name, a number, a shout — on the grounds that
+    looks_english was built for sentences. It is not any more: it passes
+    fewer than four words unless they are written in letters English
+    does not use, which is exactly the judgement a short line can bear.
+    So short text goes through the door too, and only text with nothing
+    to judge comes back untouched."""
     text = str(line or "")
-    if len(text.strip()) < 25:
+    if not text.strip():
         return text
     if looks_english(text):
         return text
@@ -17092,7 +17297,8 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
                 engine_prep_give()
             if not (clip or {}).get("path"):
                 break
-            pantry_put(key, clip)
+            pantry_put(key, clip, text=text, voice=voice, who=who,
+                       kind=str(entry.get("prep_kind") or "banter"))
             made += 1
             entry["made"] = made
             entry["seconds"] = round(
@@ -17208,7 +17414,7 @@ async def prep_render_line(text: str, who: str,
         pass
     if not (clip or {}).get("path"):
         return None
-    pantry_put(key, clip)
+    pantry_put(key, clip, text=text, voice=voice, who=who)
     return {"key": key, "voice": voice, "engine": engine,
             "seconds": float((clip or {}).get("seconds") or 0)}
 
@@ -17951,7 +18157,14 @@ async def pantry_keeper() -> None:
             # pass alive; nothing else about the ceiling changes, and
             # the six-gigabyte allowance below is untouched.
             _calls_short = calls_short()
-            if pantry_seconds() >= target and not _calls_short:
+            # #930: PREPARED seconds. This one line is the whole of the
+            # "how is the writing desk idle and the reserve at target
+            # while the entire hour's segments aren't prepared" fault:
+            # the keeper was measuring its cover in the render CACHE,
+            # which a station that talks continuously fills all by
+            # itself, and standing down on the strength of it. An hour
+            # of already-aired banter is not an hour of cover.
+            if prepared_seconds() >= target and not _calls_short:
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
@@ -18316,6 +18529,17 @@ def dialogue_flow_state() -> dict[str, Any]:
         "prepared_by_kind": prepared_by_kind(),
         "hours_ready": round(pantry_seconds() / 3600.0, 2),
         "target_hours": round(prepare_target_seconds() / 3600.0, 2),
+        # #896/#895: the horizon dial itself, and how deep the digging
+        # has got as a result — the glass sets the first and watches the
+        # second.
+        "horizon_hours": round(prepare_target_seconds() / 3600.0, 2),
+        "box_depth": round(box_depth(), 3),
+        # #930: what is genuinely SPOKEN FOR, beside the cache figure
+        # above — the pair of them is how the glass tells an hour of
+        # prepared segments from an hour of already-aired renders.
+        "prepared_seconds": prepared_seconds(),
+        "prepared_hours": round(prepared_seconds() / 3600.0, 2),
+        "cached_seconds": pantry_seconds(),
         "burn_hours": round(PANTRY_BURN_SECONDS / 3600.0, 1),
         # #841/#839: is the hourly quota actually being hit? The complaint
         # was a COUNT, so the count is the answer: what aired in the last
@@ -18986,16 +19210,121 @@ _REQUESTS_LOCK = RLock()
 _ASKED_KEPT = 8                   # bounded — this file lives for years
 
 
+# #888: "I never requested that song that many times." He was right, and
+# the fault was never the model's. ONE counter below was bumped by two
+# different things - a song ASKED for, and a song PUT ON by hand - because
+# dj_played (every click of a track in the library POSTs /api/dj/played)
+# called request_remember exactly the way dj_request does. Twelve
+# "requests" for blue monday were mostly his own clicks; banter_material
+# fed that number straight into the writing prompt under "Things he keeps
+# asking for", and the co-host dutifully told him so on air.
+#
+# From here on a tally is only a tally when the words it was asked in
+# actually name the song, and a repeat inside this window is one ask heard
+# twice rather than two asks - the same utterance reaches the station down
+# several roads (the panel, the box, /v1/chat/completions and whatever
+# OpenWebUI replays behind it) and each one used to count.
+_REQUEST_ECHO = 150.0
+
+
+def _request_words(text: str) -> set[str]:
+    """The words in a phrase that could plausibly name a record."""
+    return {w for w in re.findall(r"[a-z0-9']+", str(text or "").lower())
+            if len(w) > 2 and w not in DJ_FILLER}
+
+
+def request_names_track(query: str, row: dict[str, Any]) -> bool:
+    """Do the words someone asked in actually name THIS song?
+
+    "blue monday" names blue monday. "the library" - which is the SOURCE
+    string dj_played writes, not anything anybody said - names nothing, and
+    neither does a stray sentence that happened to match the search."""
+    want = _request_words(query)
+    if not want:
+        return False
+    have = _request_words(
+        f"{row.get('title') or ''} {row.get('artist') or ''}")
+    return bool(want & have)
+
+
+def request_evidenced(row: dict[str, Any]) -> int:
+    """How many of a row's kept queries genuinely name the song.
+
+    The receipts. A number the station is willing to say out loud has to be
+    one it can show the working for."""
+    return sum(1 for q in (row.get("asked") or [])
+               if request_names_track(q, row))
+
+
+_REQUESTS_REPAIRED = [False]
+
+
+def _requests_repair(log: dict[str, Any]) -> dict[str, Any]:
+    """Bring every row down to what its own receipts support (#888).
+
+    Nothing is deleted. The un-evidenced part of a count is MOVED to
+    `plays`, where a hand-play belonged all along, and the query strings
+    that were never queries - the play SOURCES - move to `played_by`. A row
+    whose every entry is a play keeps its whole history and simply stops
+    claiming to have been asked for.
+
+    It clamps downward only. A genuinely popular record loses whatever the
+    eight-entry receipt window cannot vouch for, which is the right way to
+    be wrong about a number the show is going to read out."""
+    changed = False
+    for key, row in list(log.items()):
+        if not isinstance(row, dict) or row.get("repaired"):
+            continue
+        count = int(row.get("count") or 0)
+        asked = [str(q) for q in (row.get("asked") or [])]
+        keep: list[str] = []
+        moved: list[str] = []
+        for q in asked:
+            (keep if request_names_track(q, row) else moved).append(q)
+        honest = max(0, min(count, len(keep))) if asked else count
+        row["count"] = honest
+        row["plays"] = int(row.get("plays") or 0) + max(0, count - honest)
+        row["asked"] = keep
+        if moved:
+            row["played_by"] = (list(row.get("played_by") or []) + moved)[-16:]
+        row["repaired"] = "#888"
+        changed = True
+    if changed and not _REQUESTS_REPAIRED[0]:
+        _REQUESTS_REPAIRED[0] = True
+        try:
+            with _REQUESTS_LOCK:
+                REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                REQUESTS_PATH.write_text(json.dumps(log, indent=2))
+            pipeline_log("drop", "the request ledger was carrying hand-plays "
+                                 "as requests - counts brought back to what "
+                                 "the receipts show (#888)")
+        except Exception:  # noqa: BLE001
+            pass
+    return log
+
+
 def read_requests() -> dict[str, dict[str, Any]]:
     try:
         data = json.loads(REQUESTS_PATH.read_text())
-        return data if isinstance(data, dict) else {}
+        data = data if isinstance(data, dict) else {}
     except Exception:
         return {}
+    try:
+        return _requests_repair(data)
+    except Exception:  # noqa: BLE001
+        return data
 
 
-def request_remember(track: dict[str, Any], query: str = "") -> int:
-    """Count this request. Returns how many times it has now been asked for."""
+def request_remember(track: dict[str, Any], query: str = "",
+                     asked: bool = True) -> int:
+    """Count this request. Returns how many times it has now been ASKED for.
+
+    #888: `asked=False` is a song PUT ON by hand - from the library, from
+    the panel, from the box. It is remembered, on `plays`, because it is
+    not something he asked for and the show must never tell him it was.
+    An "ask" whose words do not name this track is a play too, and an ask
+    that arrives again within _REQUEST_ECHO seconds is the SAME ask heard
+    down a second road, not a second ask."""
     with _REQUESTS_LOCK:
         log = read_requests()
         row = log.get(track["id"]) or {
@@ -19003,13 +19332,29 @@ def request_remember(track: dict[str, Any], query: str = "") -> int:
             "artist": track.get("artist") or "",
             "count": 0, "first": int(time.time()), "asked": [],
         }
-        row["count"] = int(row.get("count") or 0) + 1
-        row["last"] = int(time.time())
-        row["title"] = track.get("title") or row["title"]
-        row["artist"] = track.get("artist") or row["artist"]
-        if query:
-            row.setdefault("asked", []).append(query[:80])
-            del row["asked"][:-_ASKED_KEPT]
+        row["title"] = track.get("title") or row.get("title") or ""
+        row["artist"] = track.get("artist") or row.get("artist") or ""
+        now_ts = int(time.time())
+        real = bool(asked) and (not query or request_names_track(query, row))
+        echo = bool(real and query
+                    and now_ts - int(row.get("asked_at") or 0) <= _REQUEST_ECHO
+                    and str(query)[:80] == str(row.get("asked_last") or ""))
+        if real and not echo:
+            row["count"] = int(row.get("count") or 0) + 1
+            row["asked_at"] = now_ts
+            if query:
+                row["asked_last"] = str(query)[:80]
+                row.setdefault("asked", []).append(query[:80])
+                del row["asked"][:-_ASKED_KEPT]
+        elif echo:
+            row["echoes"] = int(row.get("echoes") or 0) + 1
+        else:
+            row["plays"] = int(row.get("plays") or 0) + 1
+            if query:
+                row["played_by"] = (
+                    list(row.get("played_by") or []) + [query[:80]])[-16:]
+        row["last"] = now_ts
+        row["repaired"] = "#888"
         log[track["id"]] = row
         try:
             REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -19024,6 +19369,9 @@ def request_history(track_id: str = "") -> dict[str, Any]:
     ranked = sorted(log.values(), key=lambda r: -int(r.get("count") or 0))
     return {
         "total": sum(int(r.get("count") or 0) for r in log.values()),
+        # #888: what was PUT ON rather than asked for, kept apart so the
+        # two can never be added together again.
+        "plays": sum(int(r.get("plays") or 0) for r in log.values()),
         "songs": len(log),
         "top": ranked[:12],
         "this": log.get(track_id) or {},
@@ -22320,6 +22668,13 @@ def alt_prep_road(kind: str) -> Any:
     return None
 
 
+# #893: which roads alt_prep_road knows, as a plain set. Asking it
+# directly BUILDS the coroutine, so a caller that only wants to know
+# whether a road exists leaves an un-awaited one behind every time.
+ALT_PREP_KINDS = ("ad", "station_id", "manager", "caller", "gallery",
+                  "news", "banter")
+
+
 def alt_job_put(job: str, **more: Any) -> dict[str, Any]:
     row = _ALT_JOBS.setdefault(str(job), {"job": str(job)})
     try:
@@ -22394,6 +22749,151 @@ async def alt_generate_job(job: str, kind: str, count: int) -> None:
             _PREP_DEADLINE[0] = 0.0
         except Exception:  # noqa: BLE001
             pass
+
+
+PANTRY_TABLE_MOST = 400
+
+
+def pantry_table(kind: str = "", most: int = 0) -> dict[str, Any]:
+    """#894: every take on the shelf, newest first, as a table.
+
+    Each row says what it is, who says it, how long it runs, how big it
+    is, whether anything is holding it — and carries a signed media key,
+    which is what makes a row playable where it sits and keeps the
+    "download" honest: the same URL, the same signature, no second road.
+
+    A take nothing is holding is marked LOOSE. That is not a fault — it
+    is the render cache doing its job — but it is the material the
+    horizon rolls off first (#930), and the operator asked to see the
+    pantry, not a flattering version of it."""
+    most = max(1, min(PANTRY_TABLE_MOST, int(most or PANTRY_TABLE_MOST)))
+    held = pantry_spoken_for()
+    # What each held key is held BY, so a row can say so out loud.
+    by: dict[str, str] = {}
+    try:
+        for shelf_kind, rows in _SHELF.items():
+            for row in (rows or []):
+                for k in _row_clip_keys(row):
+                    by[k] = SHELF_LABEL.get(str(shelf_kind),
+                                            str(shelf_kind))
+        for entry in list(_LARDER):
+            for k in _row_clip_keys(entry):
+                by.setdefault(k, "a banked round")
+    except Exception:  # noqa: BLE001
+        pass
+    out: list[dict[str, Any]] = []
+    now = time.time()
+    for key, row in _PANTRY.items():
+        clip = row.get("clip") or {}
+        name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
+        row_kind = str(row.get("kind") or "")
+        if kind and row_kind != str(kind):
+            continue
+        try:
+            size = _pantry_bytes_of(row)
+        except Exception:  # noqa: BLE001
+            size = 0
+        out.append({
+            "key": key,
+            "text": str(row.get("text") or ""),
+            "who": str(row.get("who") or ""),
+            "name": booth_actor_name(str(row.get("who") or ""), ""),
+            "voice": str(row.get("voice") or ""),
+            "kind": row_kind,
+            "label": (SHELF_LABEL.get(row_kind, row_kind)
+                      if row_kind else "a take"),
+            "seconds": round(float(clip.get("seconds") or 0), 1),
+            "bytes": int(size),
+            "used": int(row.get("used") or 0),
+            "at": round(float(row.get("at") or 0), 3),
+            "age_minutes": round(max(0.0, now - float(row.get("at") or 0))
+                                 / 60.0, 1),
+            "held_by": by.get(key, ""),
+            "loose": key not in held,
+            "media": name,
+            "sig": media_sign(name) if name else "",
+        })
+    out.sort(key=lambda r: -float(r.get("at") or 0))
+    kinds: dict[str, int] = {}
+    for r in out:
+        k = str(r.get("kind") or "")
+        kinds[k] = int(kinds.get(k) or 0) + 1
+    return {
+        "rows": out[:most],
+        "shown": min(len(out), most),
+        "takes": len(out),
+        "seconds": round(sum(float(r["seconds"]) for r in out), 1),
+        "bytes": sum(int(r["bytes"]) for r in out),
+        "cap_bytes": int(PANTRY_MAX_BYTES),
+        "loose": sum(1 for r in out if r["loose"]),
+        "kinds": kinds,
+        # The takes that predate #894 have no words written beside them;
+        # say so rather than showing a table of blanks and letting it
+        # read as an empty pantry.
+        "unlabelled": sum(1 for r in out if not r["text"]),
+    }
+
+
+@app.get("/api/pantry/table")
+async def pantry_table_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#894: THE PANTRY, LISTED — ?kind=<kind>&most=<n>.
+
+    Newest first. Every row carries a signed media key, so the same URL
+    plays it in place and downloads it."""
+    require_read_auth(authorization)
+    query = request.query_params
+    try:
+        most = int(query.get("most") or 0)
+    except (TypeError, ValueError):
+        most = 0
+    return pantry_table(str(query.get("kind") or ""), most)
+
+
+@app.post("/api/pantry/commission")
+async def pantry_commission_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#893: MAKE ANOTHER ONE OF THESE — {"kind": "manager", "count": 1}.
+
+    Named by ROAD rather than by an entry of the hour, because the
+    operator was clicking the PREPARED, BY KIND counts: "I see some of
+    these are empty and I want to have some actually made for those".
+    Same road, same window, same spare engine slot as the keeper's own
+    work — it takes its turn and the live round never waits on it.
+
+    Comes back at once with a ticket; poll
+    GET /api/schedule/segment/generate/{job}."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    kind = str(payload.get("kind") or "").strip()[:24]
+    # Deliberately NOT `if not alt_prep_road(kind)`: that call BUILDS the
+    # coroutine, and testing it for truthiness and dropping it leaves an
+    # un-awaited coroutine behind on every refused request.
+    if kind not in ALT_PREP_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"there is no preparing road for {kind!r} — "
+                    + (CANNOT_PREPARE.get(kind)
+                       or "nothing on the board writes that ahead")))
+    try:
+        count = max(1, min(ALT_GEN_MOST, int(payload.get("count") or 1)))
+    except (TypeError, ValueError):
+        count = 1
+    job = uuid.uuid4().hex[:12]
+    alt_job_put(job, kind=kind, count=count, state="queued", made=0,
+                new=[], why="")
+    asyncio.create_task(alt_generate_job(job, kind, count))
+    note_action(f"🗓 another {SHELF_LABEL.get(kind, kind)} was "
+                "commissioned from the pantry (#893)")
+    return {"job": job, "kind": kind, "count": count,
+            "label": SHELF_LABEL.get(kind, kind),
+            "watch": f"/api/schedule/segment/generate/{job}"}
 
 
 @app.get("/api/schedule/segment")
@@ -24750,14 +25250,29 @@ def banter_material(limit: int = 12) -> str:
             + " and asked us to play it more")
 
     # What he keeps coming back to, across every show there has ever been.
+    #
+    # #888: WITHOUT THE NUMBER. This line is the one that put "he has asked
+    # for blue monday by Flunk 12 times now" into the writing prompt under
+    # "Things he keeps asking for", and the co-host read the count back to
+    # him on air as a fact about him. It was not a fact: most of those
+    # twelve were his own library clicks landing on the same counter.
+    #
+    # The ledger is honest now, but an ambient tally is still the station
+    # asserting an arithmetic nobody asked it to keep. The pair are told
+    # WHAT he comes back to - which is the useful part and the part that is
+    # true - and the count is left to request_brief, which fires at the
+    # moment he actually asks for a repeat and is a number he would
+    # recognise.
     try:
         for row in request_history()["top"][:4]:
             times = int(row.get("count") or 0)
+            if row.get("asked"):
+                times = min(times, request_evidenced(row))
             if times > 1:
                 bits.append(
-                    f'he has asked for "{row.get("title")}"'
+                    f'he keeps coming back to "{row.get("title")}"'
                     + (f' by {row.get("artist")}' if row.get("artist") else "")
-                    + f" {times} times now")
+                    + " - do not put a number on it")
     except Exception:
         pass
 
@@ -25687,6 +26202,19 @@ def banter_pictures(limit: int = 6) -> str:
     return "\n".join(lines[:limit])
 
 
+# #889: the accented letters that turn up in perfectly ordinary station
+# copy - cafe, Bjork, Motorhead, Motley Crue, Sigur Ros, Beyonce. English
+# borrows these; it does not borrow the rest of the Latin alphabet's
+# extensions, and it does not use Greek, Cyrillic or anything east of them.
+ENGLISH_ACCENTS = set(
+    "\u00e1\u00e0\u00e2\u00e4\u00e3\u00e5\u00e9\u00e8\u00ea\u00eb"
+    "\u00ed\u00ec\u00ee\u00ef\u00f3\u00f2\u00f4\u00f6\u00f5\u00fa"
+    "\u00f9\u00fb\u00fc\u00e7\u00f1\u00f8\u00e6\u0153\u00df\u00ff"
+    "\u00c1\u00c0\u00c2\u00c4\u00c3\u00c5\u00c9\u00c8\u00ca\u00cb"
+    "\u00cd\u00cc\u00ce\u00cf\u00d3\u00d2\u00d4\u00d6\u00d5\u00da"
+    "\u00d9\u00db\u00dc\u00c7\u00d1\u00d8\u00c6\u0152")
+
+
 def looks_english(text: str) -> bool:
     """#792: the station broadcasts in ENGLISH. A Portuguese lyric swath
     rode a whole turn on air verbatim, so lines are checked: heavy
@@ -25696,10 +26224,24 @@ def looks_english(text: str) -> bool:
     worth blocking on."""
     t = str(text or "")
     words = [w.lower() for w in re.findall(r"[A-Za-z\u00c0-\u00ff']+", t)]
-    if len(words) < 8:
-        return True
+    # #889: THE SHORT-LINE HOLE. "Tak nudzi sie depresji dziura." went out
+    # in the HOST's voice, on air, because five words fell under this floor
+    # of eight and the line was therefore never judged at all - the gate
+    # returned True without looking. Short lines are judged now, on the
+    # evidence a short line can actually carry.
     letters = [c for c in t if c.isalpha()]
-    if letters:
+    # Letters English does not use. A stray one is a borrowed name -
+    # Tokyo, Bjork, a romanised title - and proves nothing.
+    # A RUN of them is another script.
+    _exotic = sum(1 for c in letters
+                  if ord(c) > 127 and c not in ENGLISH_ACCENTS)
+    if len(words) < 4:
+        # Three words or fewer carry no grammar to judge, so the only
+        # evidence left is the alphabet: "Skip", "1247" and "Bjork" pass,
+        # "Dzien dobry" written with its own letters does not.
+        return not _exotic
+    _short = len(words) < 8
+    if letters and not _short:
         _dia = sum(c in "\u00e1\u00e0\u00e2\u00e3\u00e4\u00e5\u00e6"
                         "\u00e7\u00e8\u00e9\u00ea\u00eb\u00ec\u00ed"
                         "\u00ee\u00ef\u00f1\u00f2\u00f3\u00f4\u00f5"
@@ -25742,9 +26284,39 @@ def looks_english(text: str) -> bool:
                 "sur", "sont", "\u00eatre", "avoir", "cette", "ces",
                 "moi", "toi", "lui", "leur", "ne", "pas", "plus",
                 "aber", "oder", "auch", "noch", "sehr", "kein",
-                "mit", "auf", "f\u00fcr", "sich", "wir", "sie", "es"}
+                "mit", "auf", "f\u00fcr", "sich", "wir", "sie", "es",
+                # #889: the glue of the language that actually went
+                # out - POLISH - plus Italian, neither of which this
+                # list held a single word of. Only words English does
+                # not also own, so nothing here can convict an English
+                # line ("ale", "dove" and "come" are deliberately
+                # absent).
+                "nie", "jest", "jestem", "tego", "tym", "czy",
+                "tylko", "bardzo", "jeszcze", "wszystko", "dlaczego",
+                "dobrze", "teraz", "gdzie", "kiedy", "mnie", "ciebie",
+                "nasz", "tutaj", "dzisiaj", "wiem", "moje", "twoje",
+                "che", "non", "sono", "questo", "questa", "della",
+                "delle", "anche", "molto", "perche", "sempre",
+                "niente", "tutto", "essere", "quando", "adesso",
+                "cosa"}
     en = sum(1 for w in words if w in _en)
     fr = sum(1 for w in words if w in _foreign)
+    # #889: an English sentence of four words or more essentially always
+    # carries one of the function words above. NONE of them, plus a letter
+    # English does not use, is another language however short the line is -
+    # which is precisely the case the eight-word floor used to wave past.
+    if en == 0 and _exotic:
+        return False
+    # A run of letters English does not use, with barely any English
+    # around them, is another script outright - at any length. The floor
+    # of two is what catches Polish, which spends its diacritics sparingly
+    # ("Nie ma nic wazniejszego niz to co robimy tutaj" carries exactly
+    # two); the length term keeps a long English line from tripping on a
+    # couple of borrowed names.
+    if _exotic >= max(2, len(letters) // 16) and en <= 1:
+        return False
+    if _short:
+        return not (fr >= 1 and en == 0)
     if fr >= 3 and fr > en:
         return False
     # #871: two foreign markers and not one English word is not a
@@ -26936,6 +27508,17 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                 pipeline_log("speakbox", "the swath comes from the "
                              f"{_cr.get('name')} crystal ({rid}) — the "
                              "universe is tinted (#834)")
+    # #895: how deep to dig, this draw. Zero when the shelf is cold,
+    # and every use of it below scales from zero — so an empty pantry
+    # gets exactly the draw it always got.
+    _depth = box_depth()
+    if _depth > 0.05:
+        # A longer swath and a bigger budget: "saying more and more
+        # obscure things as they talk about the current topic at hand"
+        # is partly just MORE of the passage, taken from further in.
+        most = max(1, int(round(most * (1.0 + 0.6 * _depth))))
+        cap = int(round((cap or SPEAKBOX_SWATH_MAX)
+                        * (1.0 + 0.5 * _depth)))
     key = mind_id(rid)
     files = [p for p in speakbox_files(key) if p.name != exclude]
     if not files:
@@ -26977,7 +27560,12 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # the oldest documents so the deepest, most-forgotten material gets mined
     # and mixed back in — the swath itself already starts at a random (often
     # deep) point, so this reaches the obscure sections of old files.
-    if len(files) > 2 and random.random() < 0.25:
+    # #895: and the ARCHIVE dive gets likelier the deeper the queue —
+    # a quarter of draws at rest, better than half of them once the
+    # horizon is covered. The oldest documents are where the obscure
+    # material is; they are only rarely worth the risk when the show is
+    # living hand to mouth, and always worth it when it is not.
+    if len(files) > 2 and random.random() < (0.25 + 0.30 * _depth):
         oldest = min(files, key=lambda p: p.stat().st_mtime
                      if p.exists() else 0)
         first = oldest.name
@@ -27006,7 +27594,8 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
             fresh = [line for line in gems
                      if line not in said and looks_english(line)]
         if fresh:
-            lines = speakbox_swath_lines(fresh, most=most, cap=cap)
+            lines = speakbox_swath_lines(fresh, most=most, cap=cap,
+                                         deep=_depth)
             pipeline_log("speakbox",
                          f"mined {doc.name} — {len(fresh)} unused lines "
                          f"on the shelf, swath of {len(lines)} taken",
@@ -27042,7 +27631,7 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                   if not phrase_check(line).get("block")]
         pool = cooled or pool
         lines = speakbox_swath_lines(pool[:max(most * 2, 12)],
-                                     most=most, cap=cap)
+                                     most=most, cap=cap, deep=_depth)
         return {"file": name, "text": " ".join(lines), "lines": lines,
                 "mind": key}
     return {}
@@ -27055,17 +27644,27 @@ SPEAKBOX_SWATH_MAX = 1100
 
 
 def speakbox_swath_lines(pool: list[str], most: int = 9,
-                         cap: int = 0) -> list[str]:
+                         cap: int = 0, deep: float = 0.0) -> list[str]:
     """A run of consecutive lines out of the pool, not a single sentence.
 
     Consecutive matters: the gems were split out of one passage in order, so
     taking neighbours keeps the thought whole instead of stapling two
     unrelated remarks together. Returned as the lines themselves so each one
-    can be remembered on its own (#235)."""
+    can be remembered on its own (#235).
+
+    #895: `deep` pushes the start toward the BACK of the document. A
+    flat random start lands in the opening pages as often as anywhere,
+    and the opening pages of a report are its abstract — the most
+    quoted, least surprising part of it. "More and more obscure things"
+    means the middle and the end of an old file, so as the queue builds
+    the draw is taken from further in."""
     if not pool:
         return []
     cap = cap or SPEAKBOX_SWATH_MAX
-    start = random.randrange(len(pool))
+    deep = max(0.0, min(1.0, float(deep or 0.0)))
+    floor = int(len(pool) * 0.55 * deep)        # 0 at rest — unchanged
+    start = (random.randrange(min(floor, max(0, len(pool) - 1)), len(pool))
+             if floor else random.randrange(len(pool)))
     swath = [pool[start]]
     for line in pool[start + 1:start + most]:
         if len(" ".join(swath)) + len(line) + 1 > cap:
@@ -36033,11 +36632,23 @@ async def speak_turns(turns: list[tuple[str, str]],
                             and item["who"] in ("dj", "cohost", "third")
                             and random.random() < _gq_rate / 100.0):
                         _gv = str(dj_settings()["drop_voice"])
-                        _quip = sfxguy_line(
+                        _qraw = sfxguy_line(
                             _gv, spoken_text(item["chunk"])[:200])
+                        # #889: his mouth is a road to air like any other,
+                        # and it was the one road that never passed the
+                        # English door - it rendered whatever sfxguy_line
+                        # returned. The story he BREAKS carries a raw
+                        # headline off the wire, which nothing had judged
+                        # at all: only the take beside it was ever checked.
+                        _quip = spoken_text(_qraw)
+                        if _qraw and not _quip:
+                            note_drop("drop", _qraw,
+                                      "the SFX guy's line did not pass the "
+                                      "English door - the station is "
+                                      "English (#889)")
                         try:
                             _qc = await voice_render_any(
-                                _quip, _gv, who="drop")
+                                _quip, _gv, who="drop") if _quip else None
                         except Exception:  # noqa: BLE001
                             _qc = None
                         if _qc and _qc.get("path"):
@@ -36799,7 +37410,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     "text": pushed["text"],
                     "lines": speakbox_lines(pushed["text"]) or [pushed["text"]]}
     if not angle and not seed and (force_seed
-                                   or random.random() < dj["speakbox_rate"]):
+                                   or random.random() < box_rate_now(
+                                       dj["speakbox_rate"])):
         # Best-of-two off the shelf (#418): the rounds open with the
         # more intriguing swath, same scoring the callers use (#359).
         # Pull fuller swaths so they quote entire phrases at each other, not
@@ -37022,7 +37634,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # Incessantly is the word he used (#207): the only way to have none is to
     # turn the speakbox down to zero, which is what that slider is for.
     aside = ""
-    if not caller_name and not seed and random.random() < dj["speakbox_rate"]:
+    if not caller_name and not seed and random.random() < box_rate_now(
+            dj["speakbox_rate"]):
         seed = await speakbox_quote()
         if seed:
             aside = speakbox_aside(seed)
@@ -39796,8 +40409,16 @@ async def ask_model(prompt: str, limit: int = 300,
     # it; otherwise the segment's brief decides how loose to be — a recap
     # steady, a rant loose.
     spice = spice or float(writing_profile().get("spice") or 0.0)
+    # #895: "as we build up a queue and we've gotten further in our
+    # pantry, then we can start experimenting and pushing the
+    # temperatures". A deep shelf is exactly when a strange take is
+    # affordable — there is an hour of finished audio behind it, so a
+    # round that comes out odd costs nothing but itself. A cold shelf
+    # gets none of this; the bonus is zero at zero depth.
+    _hot = 0.30 * box_depth()
     temperature = min(1.2, float(settings["temperature"])
-                      + (random.uniform(0.0, spice) if spice else 0.0))
+                      + (random.uniform(0.0, spice) if spice else 0.0)
+                      + (random.uniform(0.0, _hot) if _hot > 0.02 else 0.0))
     max_tokens = max(settings["max_tokens"], limit // 2 + 40)
     pipeline_log("model", f"{settings['model']} writing · "
                           f"budget {limit} chars · temp {temperature:.2f}",
@@ -46491,6 +47112,228 @@ async def dj_requests_api(
     """Every song ever requested, and how often."""
     require_read_auth(authorization)
     return request_history()
+
+
+@app.post("/api/dj/requests/forget")
+async def dj_requests_forget(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#888: "that never happened" - correct one song's request tally.
+
+    The row stays, its play history stays, its receipts stay. Only the
+    number the pair are allowed to make a claim out of changes, and the
+    difference is moved onto `plays` rather than thrown away. `count`
+    defaults to zero: the usual answer to "I never asked for that"."""
+    require_auth(authorization)
+    payload = await request.json()
+    track_id = str(payload.get("id") or "").strip()
+    if not track_id:
+        raise HTTPException(status_code=400, detail="Which song?")
+    try:
+        to = max(0, min(999, int(payload.get("count") or 0)))
+    except Exception:  # noqa: BLE001
+        to = 0
+    with _REQUESTS_LOCK:
+        log = read_requests()
+        row = log.get(track_id)
+        if not isinstance(row, dict):
+            raise HTTPException(status_code=404,
+                                detail="That song is not in the ledger")
+        was = int(row.get("count") or 0)
+        row["plays"] = int(row.get("plays") or 0) + max(0, was - to)
+        row["count"] = to
+        row["asked"] = list(row.get("asked") or [])[:to]
+        row["corrected"] = int(time.time())
+        row["repaired"] = "#888"
+        log[track_id] = row
+        try:
+            REQUESTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            REQUESTS_PATH.write_text(json.dumps(log, indent=2))
+        except Exception:  # noqa: BLE001
+            pass
+    note_action(f"\U0001f9fe request tally corrected: "
+                f"{row.get('title') or track_id} {was} -> {to} (#888)")
+    return {"ok": True, "id": track_id, "was": was, "count": to,
+            "plays": int(row.get("plays") or 0),
+            "title": str(row.get("title") or "")}
+
+
+def _provenance_material(prompt: str) -> list[dict[str, Any]]:
+    """The bullet list of HIS material that went into a prompt (#888).
+
+    banter_material, banter_pool and the picture walk all hand the model
+    bullet lines about him - what he asks for, what he had us make, what
+    he once told us. This is where "you asked for blue monday twelve
+    times" came from, so it is the first thing the card has to show, with
+    the ledger row it names attached so the number can be corrected on the
+    spot."""
+    out: list[dict[str, Any]] = []
+    try:
+        ledger = read_requests()
+    except Exception:  # noqa: BLE001
+        ledger = {}
+    for raw in str(prompt or "").splitlines():
+        bullet = raw.strip()
+        if not bullet.startswith("- ") or len(bullet) < 6:
+            continue
+        said = bullet[2:][:240]
+        track_id = ""
+        for key, row in ledger.items():
+            title = str((row or {}).get("title") or "")
+            if len(title) > 3 and title.lower()[:60] in said.lower():
+                track_id = str(key)
+                break
+        out.append({"text": said,
+                    "tally": bool(re.search(r"\b\d+ times\b", said)),
+                    "track_id": track_id})
+        if len(out) >= 40:
+            break
+    return out
+
+
+@app.get("/api/dj/provenance/{line_id}")
+async def dj_provenance_api(
+    line_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#888/#889: where one booth line CAME FROM. Right-click any entry.
+
+    "I need to be able to right click an entry in the booth window and see
+    exactly where the influence for that message came from."
+
+    Everything already exists - it is simply scattered across the feeds
+    that each hold one piece of it. This gathers them onto the line: its
+    own dossier (voice, engine, render, where it went), the model call
+    that wrote it with the PROMPT AS SENT and the script that came back,
+    the material about him that was in that prompt, the speakbox
+    document(s) and swath it was seeded from, the crystal tinting the
+    water, the vector searches around it, the schedule slot and system
+    prompt in force, and whether the audio was prepared ahead or made
+    live while you were listening."""
+    require_read_auth(authorization)
+    _ensure_chat_ids()
+    want = str(line_id or "").strip()
+    row: dict[str, Any] = {}
+    for candidate in reversed(_RADIO.get("chat") or []):
+        if str(candidate.get("id") or "") == want:
+            row = dict(candidate)
+            break
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail="That line is no longer in the booth")
+
+    text = str(row.get("text") or row.get("analysis") or "")
+    trace = dict(row.get("trace") or {})
+    render = dict(trace.get("render") or {})
+    written = dict(trace.get("written") or {})
+    if not written.get("prompt"):
+        # Older rows, and the analysis rows, carry the paperwork elsewhere
+        # or not at all - go and find the call itself.
+        found = _model_call_full(text)
+        if found:
+            written = {**found, **{k: v for k, v in written.items() if v}}
+    if not written.get("prompt") and row.get("prompt"):
+        written = {**written, "prompt": str(row.get("prompt") or ""),
+                   "script": str(row.get("analysis") or text)}
+    prompt = str(written.get("prompt") or "")
+
+    # Prepared ahead, or made while you were listening? The recording room
+    # stamps every take "shelf" (the pantry answered) or "live" (an engine
+    # did the work then and there), which is the only honest source for it.
+    how = ""
+    if text:
+        for take in reversed(_TAKES):
+            if str(take.get("text") or "")[:60] == text[:60]:
+                how = str(take.get("how") or "")
+                break
+    prepared = ("prepared ahead - served off the shelf" if how == "shelf"
+                else "made live, while you were listening" if how == "live"
+                else "not recorded - this line predates the room log")
+
+    at = float(row.get("ts") or 0)
+
+    def _near(rows: Any, span: float = 420.0) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for one in (rows or []):
+            if not isinstance(one, dict):
+                continue
+            when = float(one.get("ts") or one.get("at") or 0)
+            if not at or not when or abs(when - at) <= span:
+                out.append(dict(one))
+        return out[:10]
+
+    crystal = _near(_RADIO.get("crystal_influence"))
+    for one in crystal:
+        shard = str(one.get("text") or "")[:40]
+        one["in_prompt"] = bool(prompt and shard and shard in prompt)
+    vectors = _near(_RADIO.get("vector_access"))
+
+    documents: list[dict[str, Any]] = []
+
+    def _doc(name: Any, how_found: str) -> None:
+        got = str(name or "").strip()
+        if not got or any(d["file"] == got for d in documents):
+            return
+        documents.append({"file": got, "how": how_found,
+                          "quoted": bool(prompt and got in prompt)})
+
+    _doc(row.get("source"), "the swath this line was seeded from")
+    _doc((row.get("vec") or {}).get("file"),
+         "the vector index handed it to this line")
+    for one in vectors:
+        _doc(one.get("file"), "a booth vector search around this line")
+    for one in crystal:
+        _doc(one.get("file"), "crystal material staged for the booth")
+
+    entry: dict[str, Any] = {}
+    try:
+        settings = load_settings()
+        prompts = settings.get("prompts") or []
+        if prompts:
+            entry = prompts[int(settings.get("active_prompt") or 0)
+                            % len(prompts)] or {}
+    except Exception:  # noqa: BLE001
+        entry = {}
+    try:
+        followed = bool(dj_settings().get("follow_prompt"))
+    except Exception:  # noqa: BLE001
+        followed = False
+
+    return {
+        "ok": True,
+        "id": want,
+        "line": {k: v for k, v in row.items()
+                 if k in ("id", "ts", "air_at", "who", "name", "kind", "text",
+                          "voice", "engine", "model", "aired", "source",
+                          "macro", "media", "sig", "ad_audio", "ad_sig",
+                          "product", "track_id", "analysis", "seconds")},
+        "render": render,
+        "written": {k: v for k, v in written.items()
+                    if k in ("model", "ms", "chars", "temp", "budget",
+                             "kind", "armed", "sched", "num_ctx", "at",
+                             "prompt", "script")},
+        "prepared": prepared,
+        "how": how,
+        "material": _provenance_material(prompt),
+        "documents": documents,
+        "crystal": crystal,
+        "vectors": vectors,
+        "schedule": {
+            "kind": str(written.get("kind") or ""),
+            "prompt": str(written.get("sched") or ""),
+            "kind_now": str(_RADIO.get("sched_kind") or ""),
+            "prompt_now": str(_RADIO.get("sched_prompt") or "")[:900],
+        },
+        "system": {
+            "name": str(written.get("armed") or entry.get("name") or ""),
+            "armed_now": str(entry.get("name") or ""),
+            "text": str(entry.get("prompt") or "")[:2400],
+            "followed": followed,
+        },
+        "burst": int(trace.get("burst") or 0),
+        "requests": (request_history().get("top") or [])[:6],
+    }
 
 
 # #787: "hey DJ …" said to the box — the booth's own wake. A request if
@@ -69119,6 +69962,278 @@ function djDossierArmCard() {
     djDossierGrace = setTimeout(() => djDossierClose(), 350);
   });
 }
+/* ---- Where a line came from (#888/#889) ------------------------------
+ *
+ * "I need to be able to right click an entry in the booth window and see
+ * exactly where the influence for that message came from."
+ *
+ * The hover dossier above answers "how did this line get made". This
+ * answers "why does it say THAT" - the prompt as it was sent, the bullet
+ * list of his own material that was in it, the documents and the crystal
+ * behind it, the slot and the system prompt in force. And where a bullet
+ * makes a claim about a song, the ledger row behind it comes with a
+ * button that takes the claim back.
+ */
+function djProvenanceClose() {
+  const gone = document.getElementById("djProvenance");
+  if (gone) gone.remove();
+}
+
+function djProvRow(into, key, value, tone) {
+  const line = el("div", "", "");
+  line.style.cssText = "display:flex;gap:8px;padding:2px 0;"
+    + "border-top:1px solid var(--border)";
+  const k = el("div", "muted", String(key));
+  k.style.cssText = "flex:0 0 118px;font-size:10.5px;word-break:break-word";
+  const v = el("div", "",
+    String(value === null || value === undefined || value === "" ? "—" : value));
+  v.style.cssText = "flex:1;min-width:0;font-size:10.5px;word-break:break-word"
+    + (tone ? ";color:" + tone : "");
+  line.appendChild(k);
+  line.appendChild(v);
+  into.appendChild(line);
+  return line;
+}
+
+function djProvHead(into, text) {
+  const h = el("div", "", text);
+  h.style.cssText = "font-weight:700;font-size:11px;margin:11px 0 2px;"
+    + "color:var(--accent)";
+  into.appendChild(h);
+  return h;
+}
+
+function djProvBlock(into, label, body) {
+  if (!body) return;
+  const wrap = el("details", "", "");
+  wrap.style.marginTop = "5px";
+  const sum = el("summary", "", label);
+  sum.style.cssText = "cursor:pointer;font-size:10.5px;color:#9fb4c9";
+  wrap.appendChild(sum);
+  const pre = el("pre", "", String(body));
+  pre.style.cssText = "white-space:pre-wrap;word-break:break-word;"
+    + "font-size:10px;line-height:1.45;margin:5px 0 0;max-height:36vh;"
+    + "overflow:auto;background:rgba(0,0,0,.28);padding:6px 7px;"
+    + "border-radius:5px";
+  wrap.appendChild(pre);
+  into.appendChild(wrap);
+}
+
+async function djProvenanceShow(line, event) {
+  djProvenanceClose();
+  const pop = el("div", "panel", "");
+  pop.id = "djProvenance";
+  const x = (event && event.clientX) || 90;
+  const y = (event && event.clientY) || 90;
+  pop.style.cssText = "position:fixed;z-index:430;width:min(470px,94vw);"
+    + "max-height:82vh;overflow:auto;padding:11px 13px;margin:0;"
+    + "font-size:11px;line-height:1.5;box-shadow:0 14px 42px rgba(0,0,0,.82);"
+    + "left:" + Math.max(8, Math.min(
+        window.innerWidth - Math.min(470, window.innerWidth * 0.94) - 8,
+        x - 40)) + "px;"
+    + "top:" + Math.max(8, Math.min(window.innerHeight - 180, y - 24)) + "px";
+  pop.onclick = (e) => e.stopPropagation();
+  pop.oncontextmenu = (e) => e.stopPropagation();
+
+  const head = el("div", "row", "");
+  head.style.cssText = "gap:8px;align-items:baseline;margin-bottom:4px";
+  const title = el("b", "", "\u{1f9ec} where this line came from");
+  title.style.cssText = "flex:1;font-size:12.5px";
+  const shut = el("span", "", "\u2715");
+  shut.style.cssText = "cursor:pointer;opacity:.6";
+  shut.onclick = djProvenanceClose;
+  head.appendChild(title);
+  head.appendChild(shut);
+  pop.appendChild(head);
+
+  const waiting = el("div", "muted", "reading the paperwork\u2026");
+  waiting.style.cssText = "font-size:10.5px";
+  pop.appendChild(waiting);
+  document.body.appendChild(pop);
+  setTimeout(() => {
+    document.addEventListener("click", djProvenanceClose, {once: true});
+  }, 0);
+
+  let got = null;
+  try {
+    got = await api("/api/dj/provenance/"
+      + encodeURIComponent(String(line.id || "")));
+  } catch (err) {
+    waiting.textContent = err.message;
+    return;
+  }
+  if (!pop.isConnected) return;
+  waiting.remove();
+
+  const L = got.line || {};
+  const W = got.written || {};
+  const R = got.render || {};
+  const S = got.schedule || {};
+  const P = got.system || {};
+
+  const body = String(L.text || L.analysis || "");
+  const said = el("div", "muted",
+    "\u201c" + body.slice(0, 240) + (body.length > 240 ? "\u2026" : "")
+    + "\u201d");
+  said.style.cssText = "font-style:italic;font-size:10.5px;opacity:.78;"
+    + "margin-bottom:7px";
+  pop.appendChild(said);
+
+  const facts = el("div", "", "");
+  djProvRow(facts, "Who said it",
+    (L.name || L.who || "\u2014") + (L.kind ? " \u00b7 " + L.kind : ""));
+  djProvRow(facts, "Written by", (W.model || L.model || "\u2014")
+    + (W.ms ? " \u00b7 " + W.ms + " ms" : "")
+    + (W.temp === null || W.temp === undefined ? "" : " \u00b7 temp " + W.temp));
+  djProvRow(facts, "Voice \u00b7 engine",
+    (L.voice || R.voice || "\u2014") + " \u00b7 "
+    + (R.engine || L.engine || "\u2014")
+    + (R.service ? " (" + R.service + ")" : ""));
+  djProvRow(facts, "The audio", got.prepared || "\u2014");
+  djProvRow(facts, "Where it went", {
+    box: "the Pine Box", page: "this page only",
+    stream: "a coalesced round", held: "held \u2014 waiting on an engine",
+    analysis: "the booth only \u2014 never spoken",
+  }[L.aired || ""] || (L.aired || "on air"));
+  djProvRow(facts, "Schedule slot", S.kind
+    || "\u2014 (no slot was driving this)");
+  djProvRow(facts, "System prompt", (P.name || "\u2014")
+    + (P.followed ? " \u00b7 folded into the booth"
+                  : " \u00b7 not folded into the booth"));
+  if (got.burst) djProvRow(facts, "Aired in a burst of", got.burst + " turns");
+  pop.appendChild(facts);
+
+  const mat = got.material || [];
+  if (mat.length) {
+    djProvHead(pop, "What the desk told them about YOU");
+    const note = el("div", "muted", "the bullet list handed to the model "
+      + "before it wrote a word \u2014 this is where a claim about you "
+      + "comes from");
+    note.style.cssText = "font-size:9.5px;opacity:.7;margin-bottom:3px";
+    pop.appendChild(note);
+    mat.forEach((m) => {
+      const line2 = el("div", "", "");
+      line2.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
+        + "padding:2px 0;font-size:10.5px";
+      const dot = el("span", "", m.tally ? "\u26a0" : "\u00b7");
+      dot.style.cssText = "flex:0 0 auto;opacity:.75";
+      const txt = el("span", "", m.text);
+      txt.style.cssText = "flex:1;min-width:0;word-break:break-word"
+        + (m.tally ? ";color:#ffd479" : "");
+      line2.appendChild(dot);
+      line2.appendChild(txt);
+      if (m.track_id) {
+        const fix = el("button", "", "that never happened");
+        fix.title = "Take this song's request tally back to nothing. The "
+          + "play history and the receipts stay.";
+        fix.style.cssText = "flex:0 0 auto;font-size:9.5px;padding:1px 6px;"
+          + "border-radius:5px;cursor:pointer";
+        fix.onclick = async (ev) => {
+          ev.stopPropagation();
+          fix.disabled = true;
+          try {
+            const done = await api("/api/dj/requests/forget", {
+              method: "POST",
+              body: JSON.stringify({id: m.track_id, count: 0}),
+            });
+            fix.textContent = "cleared (" + done.was + " \u2192 0)";
+            txt.style.textDecoration = "line-through";
+            txt.style.opacity = ".55";
+          } catch (err2) {
+            fix.disabled = false;
+            fix.textContent = err2.message;
+          }
+        };
+        line2.appendChild(fix);
+      }
+      pop.appendChild(line2);
+    });
+  }
+
+  const docs = got.documents || [];
+  if (docs.length) {
+    djProvHead(pop, "Documents behind it");
+    const table = el("div", "", "");
+    docs.forEach((d) => djProvRow(table, d.file,
+      d.how + (d.quoted ? " \u00b7 quoted in the prompt" : "")));
+    pop.appendChild(table);
+  }
+
+  const cry = got.crystal || [];
+  if (cry.length) {
+    djProvHead(pop, "Crystal in the water");
+    const table = el("div", "", "");
+    cry.forEach((c) => djProvRow(table,
+      (c.crystal || "a crystal") + " \u00b7 " + (c.strength || 0) + "%",
+      (c.in_prompt ? "in THIS prompt: " : "staged for " + (c.targets || [])
+        .join(", ") + ": ") + String(c.text || "").slice(0, 150)));
+    pop.appendChild(table);
+  }
+
+  const vecs = got.vectors || [];
+  if (vecs.length) {
+    djProvHead(pop, "Vector searches around it");
+    const table = el("div", "", "");
+    vecs.forEach((v) => djProvRow(table, v.file || "\u2014",
+      "\u201c" + (v.query || "") + "\u201d \u00b7 score "
+      + (v.score === null || v.score === undefined ? "\u2014" : v.score)
+      + " \u00b7 " + (v.ms || 0) + " ms \u00b7 " + (v.who || "booth")));
+    pop.appendChild(table);
+  }
+
+  djProvHead(pop, "The paperwork");
+  djProvBlock(pop, "\u25b8 the prompt exactly as it was sent ("
+    + String(W.prompt || "").length + " chars)", W.prompt || "");
+  djProvBlock(pop, "\u25b8 the script that came back", W.script || "");
+  if (S.prompt) {
+    djProvBlock(pop, "\u25b8 the schedule slot's own instructions", S.prompt);
+  }
+  if (P.text) {
+    djProvBlock(pop, "\u25b8 the station system prompt in force", P.text);
+  }
+  if (!W.prompt) {
+    const none = el("div", "muted", "The writing desk keeps the last forty "
+      + "calls. This line's own call has scrolled off, so the prompt behind "
+      + "it is gone \u2014 everything above still holds.");
+    none.style.cssText = "font-size:9.5px;opacity:.7;margin-top:4px";
+    pop.appendChild(none);
+  }
+
+  const bar = el("div", "row", "");
+  bar.style.cssText = "gap:6px;margin-top:10px;flex-wrap:wrap";
+  const bury = el("button", "", "\u{1faa6} bury this line");
+  bury.title = "Down-vote it \u2014 dropped if it ever comes round again";
+  bury.style.cssText = "font-size:10.5px;padding:2px 8px";
+  bury.onclick = (ev) => { ev.stopPropagation(); djBanLine(line, bury); };
+  bar.appendChild(bury);
+  if (W.prompt) {
+    const copy = el("button", "", "\u29c9 copy the prompt");
+    copy.style.cssText = "font-size:10.5px;padding:2px 8px";
+    copy.onclick = async (ev) => {
+      ev.stopPropagation();
+      try {
+        await navigator.clipboard.writeText(String(W.prompt));
+        copy.textContent = "copied";
+      } catch (err3) { copy.textContent = "could not copy"; }
+    };
+    bar.appendChild(copy);
+  }
+  pop.appendChild(bar);
+}
+
+/* Right-click ANY booth row - a line, an ad, a sting, a hang-up - and the
+ * card opens on it. Shift+right-click still gets the browser's own menu. */
+function djProvenanceWatch(row, line) {
+  row.addEventListener("contextmenu", (event) => {
+    if (!line || !line.id) return;
+    if (event.shiftKey) return;
+    event.preventDefault();
+    event.stopPropagation();
+    try { djDossierClose(); } catch (e) {}
+    djProvenanceShow(line, event);
+  });
+}
+
 function djDossierWatch(row, line) {
   row.addEventListener("mouseenter", () => {
     if (djDossierTimer) clearTimeout(djDossierTimer);
@@ -69897,6 +71012,126 @@ function pvDisc(key, opts) {
           open: function () { return !!PV_OPEN[key]; }};
 }
 
+/* ---- #883/#884/#887: windows that hold still while you read ---------
+ * "Stop refreshing these windows when I'm reading them. I'm reading them
+ * and it's resetting them and collapsing them", and "this window is still
+ * blinking whenever I'm scrolling it, trying to jump to some other
+ * window". Both are the same fault. Every panel below repaints on a timer
+ * by emptying its body and building it again, and emptying a box that
+ * scrolls makes the browser clamp its scroll to the top - the jump - as
+ * well as tearing out every element inside it, which takes the open
+ * drawer, its own scroll and your selection with it.
+ *
+ *   pvStill(id, sig)  true when nothing has actually changed since the
+ *                     last paint, so the paint can be skipped outright.
+ *   pvReading(host)   true when there is a live selection or a caret
+ *                     inside this box - do not touch it at all.
+ *   pvKeep(host, fn)  for a rebuild that cannot be avoided: run it, then
+ *                     put every scroll offset back - the box itself, each
+ *                     scrolling parent, and every element that survived
+ *                     (a pvDisc drawer is the same element either side).
+ *   pvAnchor(box, fn) add rows at the TOP and give the scroll the same
+ *                     number of pixels back, so what you are reading does
+ *                     not slide down the page.
+ *   pvText(node, s)   only write text that has actually changed - writing
+ *                     the same sentence again still kills a selection.
+ * All of them are wrapped: a failure here must never blank a panel. */
+var PV_STILL = {};
+
+function pvStill(id, sig) {
+  try {
+    const k = "s:" + String(id), v = String(sig);
+    if (PV_STILL[k] === v) return true;
+    PV_STILL[k] = v;
+    return false;
+  } catch (e) { return false; }
+}
+
+function pvStillDrop(id) {
+  try { delete PV_STILL["s:" + String(id)]; } catch (e) { /* fine */ }
+}
+
+function pvReading(host) {
+  try {
+    if (!host) return false;
+    const sel = window.getSelection ? window.getSelection() : null;
+    if (sel && sel.rangeCount && !sel.isCollapsed) {
+      const node = sel.getRangeAt(0).commonAncestorContainer;
+      const box = (node && node.nodeType === 1) ? node
+                                                : (node && node.parentElement);
+      if (box && (host === box || host.contains(box))) return true;
+    }
+    const on = document.activeElement;
+    if (on && on !== document.body && host.contains(on)
+        && /INPUT|TEXTAREA|SELECT/.test(String(on.tagName || ""))) return true;
+  } catch (e) { /* if we cannot tell, repaint */ }
+  return false;
+}
+
+function pvKeep(host, redraw) {
+  const marks = [];
+  const ups = [];
+  try {
+    let up = host;
+    while (up && up.nodeType === 1) {
+      ups.push([up, up.scrollTop, up.scrollLeft]);
+      up = up.parentElement;
+    }
+    const kids = host && host.querySelectorAll
+      ? host.querySelectorAll("*") : [];
+    for (let i = 0; i < kids.length; i++) {
+      if (kids[i].scrollTop || kids[i].scrollLeft) {
+        marks.push([kids[i], kids[i].scrollTop, kids[i].scrollLeft]);
+      }
+    }
+  } catch (e) { /* we can still run the rebuild */ }
+  const put = () => {
+    try {
+      marks.forEach((m) => {
+        if (m[0] && m[0].isConnected) {
+          if (m[0].scrollTop !== m[1]) m[0].scrollTop = m[1];
+          if (m[0].scrollLeft !== m[2]) m[0].scrollLeft = m[2];
+        }
+      });
+      ups.forEach((m) => {
+        if (m[0] && m[0].isConnected) {
+          if (m[0].scrollTop !== m[1]) m[0].scrollTop = m[1];
+          if (m[0].scrollLeft !== m[2]) m[0].scrollLeft = m[2];
+        }
+      });
+    } catch (e) { /* the panel is drawn either way */ }
+  };
+  let out = null;
+  try { out = (typeof redraw === "function") ? redraw() : null; }
+  finally {
+    put();
+    try { requestAnimationFrame(put); } catch (e) { /* older engines */ }
+  }
+  return out;
+}
+
+function pvAnchor(scroller, add) {
+  let was = 0, top = 0, ok = false;
+  try {
+    if (scroller) { was = scroller.scrollHeight; top = scroller.scrollTop; ok = true; }
+  } catch (e) { ok = false; }
+  try { if (typeof add === "function") add(); }
+  catch (e) { /* one bad row must not stop the rest */ }
+  try {
+    if (ok && top > 0) {
+      const grew = scroller.scrollHeight - was;
+      if (grew) scroller.scrollTop = top + grew;
+    }
+  } catch (e) { /* the list is there either way */ }
+}
+
+function pvText(node, text) {
+  try {
+    const s = (text === undefined || text === null) ? "" : String(text);
+    if (node && node.textContent !== s) node.textContent = s;
+  } catch (e) { /* never worth a panel */ }
+}
+
 /* A label/value grid inside a drawer. */
 function pvKVBox(box, cap) {
   const grid = el("div", "pvKV", "");
@@ -70136,7 +71371,7 @@ function djPendingStyle() {
   document.head.appendChild(css);
 }
 
-async function djPendingTick() {
+async function djPendingTick(force) {
   const host = document.getElementById("djPendingBox");
   if (!host) { if (djPendTimer) { clearInterval(djPendTimer); djPendTimer = null; } return; }
   djPendFrame = (djPendFrame + 1) % DJ_SPIN.length;
@@ -70146,6 +71381,28 @@ async function djPendingTick() {
   const rows = (got && got.pending) || [];
   if (!rows.length) { host.style.display = "none"; host.textContent = ""; return; }
   host.style.display = "block";
+  /* #883/#887: this strip is thrown away and rebuilt every 1.6 seconds,
+   * and it is a box that scrolls (34vh). If nothing has actually moved
+   * there is nothing to repaint, and if you are selecting text in it we
+   * do not touch it at all. The spinner only earns a repaint while
+   * something really is rendering. */
+  try {
+    if (force) {
+      pvStillDrop("djPending");
+    } else {
+      const busy = rows.some((r) => r.state === "rendering");
+      const sig = JSON.stringify([
+        localStorage.getItem("djPendShut") === "1",
+        Math.round(Number((got && got.buffered_seconds) || 0)),
+        String((got && got.window) || ""),
+        rows.map((r) => [r.id, r.state, r.made, r.chunks, r.turns,
+                         Math.round((Number(r.progress) || 0) * 100)]),
+        busy ? djPendFrame : 0]);
+      if (host.firstChild && pvStill("djPending", sig)) return;
+      if (host.firstChild && pvReading(host)) return;
+    }
+  } catch (e) { /* a guard that fails simply repaints */ }
+  pvKeep(host, () => {
   host.textContent = "";
 
   /* #863: a toolbar on the coming-up strip, because it can grow tall
@@ -70173,7 +71430,7 @@ async function djPendingTick() {
     ev.stopPropagation();
     const now = localStorage.getItem("djPendShut") === "1";
     localStorage.setItem("djPendShut", now ? "0" : "1");
-    try { djPendingTick(); } catch (e) {}
+    try { djPendingTick(true); } catch (e) {}
   };
   bar.appendChild(fold);
   bar.appendChild(cap);
@@ -70268,6 +71525,7 @@ async function djPendingTick() {
     wrap.insertBefore(sum, disc.body);
     host.appendChild(wrap);
   });
+  });                  // pvKeep: the strip keeps where it was scrolled to
 }
 
 /* Who a written round is FOR: the seats it puts words in the mouth of. */
@@ -70508,6 +71766,10 @@ function djTalkRowInner(line) {
      * where it went. Attached HERE, above every early return, so the ad,
      * sting, hang-up and desk rows get it too. */
     djDossierWatch(row, line);
+    /* #888: …and right-click tells you WHY it says what it says. Attached
+     * here, above every early return, so the ad, sting, hang-up and desk
+     * rows answer for themselves too. */
+    djProvenanceWatch(row, line);
     /* #770/#772: this row's place on the broadcast clock, and whether it has
      * got here yet. A staged burst is written before it is audible, so the
      * bottom of the feed can legitimately hold lines nobody has heard — they
@@ -71201,12 +72463,19 @@ function djTalkRowInner(line) {
     // Right-click any line to bury it forever (#444): it is dropped if it
     // ever comes round again.
     if (spoken && line.text) {
+      /* #888: right-click is PROVENANCE now — "I need to be able to right
+       * click an entry in the booth window and see exactly where the
+       * influence for that message came from." Burying keeps both of its
+       * own handles: the R button trailing the line, and a button inside
+       * the card this opens. */
       said.oncontextmenu = (event) => {
         event.preventDefault();
-        djBanLine(line, said);
+        event.stopPropagation();
+        try { djDossierClose(); } catch (e) {}
+        djProvenanceShow(line, event);
       };
-      said.title = "Click to say again · right-click to mark it a REPEAT "
-        + "— buried, and never said again";
+      said.title = "Click to say it again · right-click to see exactly "
+        + "where this line came from · R buries it";
     }
     row.appendChild(said);
     // #707/#745: …and the pictures this line is about, in the margin beside
@@ -78972,6 +80241,9 @@ function storagePanel(anchor) {
       catch (e) { note.textContent = e.message; return; }
       try {
         floorSecs = Number(d.floor_seconds || 300);
+        /* #887: the store room is rebuilt whole on every read; the window
+         * it lives in scrolls, so hold the scroll across it. */
+        pvKeep(pop, () => {
         body.textContent = "";
         note.textContent = size(d.bytes) + " across "
           + (d.areas || []).length + " areas \u00b7 "
@@ -78998,6 +80270,7 @@ function storagePanel(anchor) {
           }
           body.appendChild(areaCard(a, d));
         });
+        });            // pvKeep: the store room keeps where it was
       } catch (e) { note.textContent = String(e.message || e); }
     }
 
@@ -79332,10 +80605,15 @@ function schedulePanel(anchor) {
 
     function paintBody() {
       try {
-        body.textContent = "";
-        if (zoom === "hour") paintHour();
-        else if (zoom === "month") paintMonth();
-        else paintHours(zoom === "6h" ? 6 : (zoom === "12h" ? 12 : 24));
+        /* #887: this one is rebuilt whenever the entry on air changes.
+         * The window it lives in scrolls, so the rebuild happens inside
+         * pvKeep and the scroll goes straight back. */
+        pvKeep(pop, () => {
+          body.textContent = "";
+          if (zoom === "hour") paintHour();
+          else if (zoom === "month") paintMonth();
+          else paintHours(zoom === "6h" ? 6 : (zoom === "12h" ? 12 : 24));
+        });
       } catch (e) { say(String((e && e.message) || e), true); }
     }
 
@@ -80313,94 +81591,205 @@ function deskPanel(anchor) {
     + "left:" + Math.max(8, Math.min(window.innerWidth - 630, at.left - 340))
     + "px;top:" + (at.bottom + 6) + "px";
   pop.onclick = (e) => e.stopPropagation();
-  const hd = el("div", "", "\u270d the writing desk");
-  hd.style.cssText = "font-weight:700;font-size:12px";
+  const hd = el("div", "", "");
+  hd.style.cssText = "display:flex;align-items:center;gap:6px";
+  const ttl = el("span", "", "\u270d the writing desk");
+  ttl.style.cssText = "font-weight:700;font-size:12px;flex:1 1 auto";
+  hd.appendChild(ttl);
+  const openAll = el("button", "", "open all");
+  const shutAll = el("button", "", "close all");
+  [openAll, shutAll].forEach((b) => {
+    b.style.cssText = "font-size:9px;padding:1px 6px;flex:0 0 auto";
+  });
+  openAll.title = "Open every entry on the desk";
+  shutAll.title = "Fold every entry away again";
+  hd.appendChild(openAll);
+  hd.appendChild(shutAll);
+  const shut = el("button", "", "\u2715");
+  shut.title = "Close the writing desk";
+  shut.style.cssText = "font-size:10.5px;padding:1px 7px;flex:0 0 auto";
+  shut.onclick = (ev) => { ev.stopPropagation(); pop.remove(); };
+  hd.appendChild(shut);
   pop.appendChild(hd);
   const sub = el("div", "muted", "Every call the desk has made to the "
     + "model \u2014 what was sent, what was governing it, and what came "
-    + "back. Open one to read the whole exchange.");
+    + "back. Each one opens on its own triangle; new calls are added "
+    + "above them, and the one you are reading is never closed, never "
+    + "moved and never rebuilt underneath you.");
   sub.style.cssText = "font-size:10px;line-height:1.5;margin:3px 0 7px";
   pop.appendChild(sub);
-  const body = el("div", "", "reading the desk\u2026");
+  const body = el("div", "", "");
   body.style.cssText = "font-size:11px;color:var(--muted)";
+  const top = el("div", "muted", "reading the desk\u2026");
+  top.style.cssText = "font-size:10px;margin-bottom:6px;line-height:1.5";
+  body.appendChild(top);
+  const list = el("div", "", "");
+  body.appendChild(list);
+  const none = el("div", "muted",
+    "nothing yet \u2014 the desk records each call as it makes it.");
+  none.style.cssText = "font-size:10px";
+  body.appendChild(none);
   pop.appendChild(body);
   document.body.appendChild(pop);
   pvFloat(pop);                                             // #877
 
+  /* ---- #884/#885: the desk is ADDITIVE -------------------------------
+   * "When I expand the writing desk and I'm reading the entries inside,
+   * keep the window stable while I'm reading it - adding entries, but not
+   * closing the one that I'm currently looking at", and "I want to be
+   * able to collapse and expand each entry inside of the writing desk".
+   *
+   * So: every model call is its own row, keyed by the moment it happened
+   * (its timestamp to the millisecond, which the server already keeps),
+   * and rows are only ever ADDED - newest at the top, the tail ageing off
+   * the bottom. An existing row is never touched again: it keeps its open
+   * state, its scroll, its selection and its place. Each row is a pvDisc,
+   * so it opens and closes on its own and remembers which it was, and
+   * prepending gives the scroll its pixels back so what you are reading
+   * does not slide down the window. */
+  const order = [];                    // [{k, w}], newest first
+  const seen = {};
+  let busy = false;
+
+  const allOpen = (want) => {
+    try {
+      const kids = list.querySelectorAll(".pvDisc");
+      for (let i = 0; i < kids.length; i++) {
+        if (kids[i].classList.contains("pvDiscOpen") === want) continue;
+        const h = kids[i].querySelector(".pvDiscHead");
+        if (h) h.click();
+      }
+    } catch (e) { /* every row still opens by hand */ }
+  };
+  openAll.onclick = (ev) => { ev.stopPropagation(); allOpen(true); };
+  shutAll.onclick = (ev) => { ev.stopPropagation(); allOpen(false); };
+
+  const deskEntry = (key, c) => {
+    const one = pvDisc(key, {
+      title: "Open this call \u2014 what was governing it, exactly what "
+        + "was sent, and exactly what came back",
+      sig: key,               // a finished call never changes again
+      fill: (b) => {
+        const put = (label, text, mono) => {
+          if (!text) return;
+          const h = el("div", "muted", label);
+          h.style.cssText = "font-size:9px;letter-spacing:.05em;"
+            + "margin:6px 0 2px";
+          b.appendChild(h);
+          const box = el("div", "", String(text));
+          box.style.cssText = "font-size:10px;line-height:1.5;"
+            + "white-space:pre-wrap;max-height:30vh;overflow:auto;"
+            + "padding:5px 7px;border-radius:6px;background:#05090f;"
+            + "border:1px solid var(--border)"
+            + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+          b.appendChild(box);
+        };
+        put("GOVERNED BY", (c.armed ? "system prompt: " + c.armed : "")
+          + (c.sched ? (c.armed ? "\n\n" : "")
+                       + "the schedule's clause for this entry:\n" + c.sched
+                     : ""));
+        put("WHAT WE SENT", c.prompt, true);
+        put("WHAT CAME BACK", c.script || c.text, true);
+      },
+    });
+    one.wrap.style.cssText = "border:1px solid var(--border);"
+      + "border-radius:7px;padding:5px 8px;margin:0 0 5px;"
+      + "background:rgba(255,255,255,.02)";
+    one.head.style.cssText = "display:flex;gap:6px;align-items:center;"
+      + "cursor:pointer;font-size:10.5px";
+    const nm = el("b", "", c.kind ? String(c.kind) : "a round");
+    nm.style.color = "var(--accent)";
+    one.head.appendChild(nm);
+    const meta = el("span", "muted", "");
+    meta.style.cssText = "margin-left:auto;font-size:9.5px";
+    meta.textContent = (c.ms || 0) + " ms \u00b7 " + (c.chars || 0)
+      + " chars \u00b7 ctx " + (c.num_ctx || "?")
+      + " \u00b7 temp " + (c.temp != null ? c.temp : "?")
+      + (c.at ? " \u00b7 " + pvClock(Number(c.at) * 1000) : "");
+    one.head.appendChild(meta);
+    return one;
+  };
+
   const draw = async () => {
+    if (busy) return;
+    busy = true;
     let d = null;
     try { d = await api("/api/writing-desk"); }
-    catch (e) { body.textContent = "the desk is unreachable"; return; }
-    body.textContent = "";
-    const top = el("div", "muted", "");
-    top.style.cssText = "font-size:10px;margin-bottom:6px;line-height:1.5";
-    top.textContent = (d.calls || []).length + " calls held \u00b7 "
-      + (d.writing_now ? "writing now" : "idle")
-      + (d.kind_now ? " \u00b7 on a " + d.kind_now + " segment" : "")
-      + " \u00b7 mean " + (d.mean_ms || 0) + " ms, slowest "
-      + (d.slowest_ms || 0) + " ms \u00b7 " + (d.model || "");
-    body.appendChild(top);
-    (d.calls || []).forEach((c, i) => {
-      const wrap = el("div", "");
-      wrap.style.cssText = "border:1px solid var(--border);border-radius:7px;"
-        + "padding:5px 8px;margin-bottom:5px;background:rgba(255,255,255,.02)";
-      const head = el("div", "");
-      head.style.cssText = "display:flex;gap:6px;align-items:center;"
-        + "cursor:pointer;font-size:10.5px";
-      const tri = el("span", "", "\u25b8");
-      tri.style.cssText = "font-size:9px;width:9px";
-      head.appendChild(tri);
-      const nm = el("b", "", c.kind ? c.kind : "a round");
-      nm.style.color = "var(--accent)";
-      head.appendChild(nm);
-      const meta = el("span", "muted", "");
-      meta.style.cssText = "margin-left:auto;font-size:9.5px";
-      meta.textContent = (c.ms || 0) + " ms \u00b7 " + (c.chars || 0)
-        + " chars \u00b7 ctx " + (c.num_ctx || "?")
-        + " \u00b7 temp " + (c.temp != null ? c.temp : "?");
-      head.appendChild(meta);
-      wrap.appendChild(head);
-      const drawer = el("div", "");
-      drawer.style.display = "none";
-      const put = (label, text, mono) => {
-        if (!text) return;
-        const h = el("div", "muted", label);
-        h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:6px 0 2px";
-        drawer.appendChild(h);
-        const b = el("div", "", String(text));
-        b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
-          + "max-height:30vh;overflow:auto;padding:5px 7px;border-radius:6px;"
-          + "background:#05090f;border:1px solid var(--border)"
-          + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
-        drawer.appendChild(b);
-      };
-      put("GOVERNED BY", (c.armed ? "system prompt: " + c.armed : "")
-        + (c.sched ? (c.armed ? "\n\n" : "")
-                     + "the schedule's clause for this entry:\n" + c.sched : ""));
-      put("WHAT WE SENT", c.prompt, true);
-      put("WHAT CAME BACK", c.script || c.text, true);
-      wrap.appendChild(drawer);
-      head.onclick = () => {
-        const open = drawer.style.display !== "none";
-        drawer.style.display = open ? "none" : "block";
-        tri.textContent = open ? "\u25b8" : "\u25be";
-      };
-      body.appendChild(wrap);
-    });
-    if (!(d.calls || []).length) {
-      body.appendChild(el("div", "muted",
-        "nothing yet \u2014 the desk records each call as it makes it."));
+    catch (e) {
+      busy = false;
+      if (!list.firstChild) pvText(top, "the desk is unreachable");
+      return;
     }
+    try {
+      const calls = (d.calls || []);
+      const fresh = [];
+      calls.forEach((c) => {
+        const key = "desk:" + String(c.at || 0) + ":" + String(c.ms || 0);
+        if (!seen[key]) fresh.push([key, c]);
+      });
+      if (fresh.length) {
+        pvAnchor(pop, () => {
+          fresh.reverse().forEach((pair) => {
+            seen[pair[0]] = 1;
+            const one = deskEntry(pair[0], pair[1]);
+            list.insertBefore(one.wrap, list.firstChild);
+            order.unshift({k: pair[0], w: one.wrap});
+          });
+          /* Cap it, and let the tail age out quietly - but never bin a
+           * row that is open, because that is the one being read. */
+          while (order.length > 60) {
+            let at = order.length - 1;
+            while (at >= 0 && PV_OPEN[order[at].k]) at--;
+            if (at < 0) break;
+            const old = order.splice(at, 1)[0];
+            try {
+              if (old.w) old.w.remove();
+              delete PV_BODY[old.k];
+              delete PV_OPEN[old.k];
+              delete seen[old.k];
+            } catch (e) { /* one stubborn row is not worth the desk */ }
+          }
+        });
+      }
+      pvText(top, calls.length + " calls held \u00b7 "
+        + (d.writing_now ? "writing now" : "idle")
+        + (d.kind_now ? " \u00b7 on a " + d.kind_now + " segment" : "")
+        + " \u00b7 mean " + (d.mean_ms || 0) + " ms, slowest "
+        + (d.slowest_ms || 0) + " ms \u00b7 " + (d.model || "")
+        + " \u00b7 " + order.length + " on the desk here");
+      none.style.display = list.firstChild ? "none" : "";
+    } catch (e) { /* whatever is on the desk stays on the desk */ }
+    busy = false;
   };
   draw();
+  const timer = setInterval(() => {
+    if (!document.getElementById("deskPanel")) { clearInterval(timer); return; }
+    draw();
+  }, 4000);
+
+  /* #883: clicking away still closes the desk - but not when the click is
+   * the end of a drag that STARTED inside it, and not while there is a
+   * live selection in it. Reading a prompt, sweeping the mouse over it
+   * and letting go outside the window used to close the whole desk. */
   setTimeout(() => {
+    let began = false;
+    const down = (ev) => {
+      const live = document.getElementById("deskPanel");
+      began = !!(live && live.contains(ev.target));
+    };
     const off = (ev) => {
       const live = document.getElementById("deskPanel");
-      if (live && !live.contains(ev.target)) {
-        live.remove();
+      if (!live) {
         document.removeEventListener("click", off);
+        document.removeEventListener("pointerdown", down, true);
+        return;
       }
+      if (live.contains(ev.target) || began || pvReading(live)) return;
+      live.remove();
+      document.removeEventListener("click", off);
+      document.removeEventListener("pointerdown", down, true);
     };
+    document.addEventListener("pointerdown", down, true);
     document.addEventListener("click", off);
   }, 0);
 }
@@ -80436,10 +81825,24 @@ function roomPanel(anchor) {
   document.body.appendChild(pop);
   pvFloat(pop);                                             // #877
 
-  const draw = async () => {
+  const draw = async (force) => {
     let d = null;
     try { d = await api("/api/recording-room"); }
     catch (e) { body.textContent = "the room is unreachable"; return; }
+    /* #883: the room repaints every three seconds. If the answer is the
+     * same answer, there is nothing to repaint - and if you are holding a
+     * selection in it, it waits. When it does have to rebuild, pvKeep
+     * puts the scroll back where you left it, in the window and in every
+     * drawer that survived. */
+    try {
+      if (force) {
+        pvStillDrop("roomPanel");
+      } else if (body.firstChild) {
+        if (pvReading(pop)) return;
+        if (pvStill("roomPanel", JSON.stringify(d))) return;
+      }
+    } catch (e) { /* a guard that fails simply repaints */ }
+    pvKeep(pop, () => {
     body.textContent = "";
     const s = d.shelf || {};
 
@@ -80625,11 +82028,12 @@ function roomPanel(anchor) {
         body.appendChild(row);
       });
     }
+    });               // pvKeep: the room keeps where it was scrolled to
   };
-  draw();
+  draw(true);
   const timer = setInterval(() => {
     if (!document.getElementById("roomPanel")) { clearInterval(timer); return; }
-    draw();
+    draw(false);
   }, 3000);
   setTimeout(() => {
     const off = (ev) => {
@@ -97248,6 +98652,32 @@ if __name__ == "__main__":
         "This one is Prey by 10 Years")
     assert spoken_text("[warmly] Hello (pause) there") == "Hello there"
     assert spoken_text("see http://x.example/y now") == "see now"
+
+    # #889: the line that actually went out in the host's voice. Five words,
+    # so the old eight-word floor waved it straight past the door.
+    assert not looks_english("Tak nudzi si\u0119 depresji dziura.")
+    assert not spoken_text("Tak nudzi si\u0119 depresji dziura.")
+    assert not looks_english("Wpad\u0142em w depresj\u0119")
+    assert not looks_english("Est\u00e1 muy cansado hoy se\u00f1or")
+    # …and the English copy that must still get through it.
+    assert looks_english("Big hat, no cattle.")
+    assert looks_english("Hold my sweet tea.")
+    # A bare list of names carries no function words either, and a
+    # borrowed accent or a romanised title is not another language.
+    assert looks_english("Mot\u00f6rhead, M\u00f6tley Cr\u00fce, Blue "
+                         "\u00d6yster Cult")
+    assert looks_english("Here is T\u014dky\u014d Drift tonight")
+    assert looks_english("It is a quarter past nine and the phones are hot.")
+
+    # #888: a play is not a request, and a phrase that names nothing is not
+    # a request either.
+    assert request_names_track("blue monday",
+                               {"title": "blue monday", "artist": "Flunk"})
+    assert not request_names_track(
+        "the library", {"title": "blue monday", "artist": "Flunk"})
+    assert request_evidenced(
+        {"title": "blue monday", "artist": "Flunk",
+         "asked": ["blue monday", "the library", "blue monday"]}) == 2
 
     # Spoken requests reach the DJ only while the show is on.
     assert not is_dj_request("request a song for pine box fm")   # radio is off

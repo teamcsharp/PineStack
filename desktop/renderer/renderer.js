@@ -1638,6 +1638,11 @@ function initWorksPopup() {
   cell.title = "The Works — how the station is manufacturing its dialogue";
   let pop = null;
   let poll = 0;
+  let horizonBox = null;       // #896
+  const kindOpen = {};         // #893: which kind rows are open
+  const kindBody = {};         // ...and their drawers, kept across paints
+  let pantryOpen = false;      // #894: the table, expanded
+  let pantryRows = null;       // ...and its own drawer
 
   const mk = (tag, cls, text) => {
     const node = document.createElement(tag);
@@ -1667,54 +1672,424 @@ function initWorksPopup() {
    * re-adopted into each new flow, so an open one is never torn down
    * while it is being read. */
   const wkBody = {};
+  /* #883/#887: "stop refreshing these windows when I'm reading them ...
+   * it's resetting them and collapsing them", and "this window is still
+   * blinking whenever I'm scrolling it, trying to jump to some other
+   * window". paint() used to empty the popup and build the whole line
+   * again every 2.5 seconds. Emptying a box that scrolls makes the
+   * browser clamp its scroll to the top - that IS the jump - and it tore
+   * every open drawer out of the document on the way to the new box,
+   * taking its scroll and your selection with it.
+   *
+   * Nothing is emptied any more. The flow, every stage box and every
+   * block below it are built ONCE, kept here, and updated in place; text
+   * that has not changed is not even rewritten. */
+  let wkFlow = null;              // the flow, made once
+  const wkBox = {};               // key -> stage box, made once each
+  const wkBlocks = {};            // key -> a block under the flow
+  const wkSig = {};               // key -> what it last said
+  let wkArrowN = 0;
+
+  const wkText = (node, text) => {
+    try {
+      const s = (text === undefined || text === null) ? "" : String(text);
+      if (node && node.textContent !== s) node.textContent = s;
+    } catch (e) { /* never worth the window */ }
+  };
+
+  /* A rebuild that cannot be avoided: run it, then put the popup's scroll
+   * and every surviving inner scroll back exactly where they were. */
+  const wkKeep = (fn) => {
+    const marks = [];
+    let top = 0;
+    try {
+      top = pop ? pop.scrollTop : 0;
+      const kids = pop ? pop.querySelectorAll("*") : [];
+      for (let i = 0; i < kids.length; i++) {
+        if (kids[i].scrollTop) marks.push([kids[i], kids[i].scrollTop]);
+      }
+    } catch (e) { /* we can still run the rebuild */ }
+    try { if (typeof fn === "function") fn(); } catch (e) { /* keep it */ }
+    const put = () => {
+      try {
+        marks.forEach((m) => {
+          if (m[0] && m[0].isConnected && m[0].scrollTop !== m[1]) {
+            m[0].scrollTop = m[1];
+          }
+        });
+        if (pop && pop.scrollTop !== top) pop.scrollTop = top;
+      } catch (e) { /* drawn either way */ }
+    };
+    put();
+    try { requestAnimationFrame(put); } catch (e) { /* older engines */ }
+  };
+
+  /* Rows arrive at the TOP. Give the scroll the pixels they took, so what
+   * you are reading stays under your eye instead of sliding down. */
+  const wkAnchor = (add) => {
+    let was = 0, top = 0, ok = false;
+    try { if (pop) { was = pop.scrollHeight; top = pop.scrollTop; ok = true; } }
+    catch (e) { ok = false; }
+    try { if (typeof add === "function") add(); } catch (e) { /* keep */ }
+    try {
+      if (ok && top > 0) {
+        const grew = pop.scrollHeight - was;
+        if (grew) pop.scrollTop = top + grew;
+      }
+    } catch (e) { /* the list is there either way */ }
+  };
+
+  /* The arrows between the stages: made once, in the order paint() asks
+   * for them, and left alone from then on. */
+  /* #893: one road — its count, a button that commissions another, and
+   * a tick onto everything already stacked behind it. */
+  function kindRow(host, kind, count) {
+    const KNOWN = ["ad", "station_id", "manager", "caller", "gallery",
+                   "news", "banter"];
+    const row = mk("div", "");
+    row.style.cssText = "display:flex;align-items:center;gap:5px;"
+      + "font-size:10px;padding:1px 0";
+    const okey = "kind:" + kind;
+    const tri = mk("button", "", kindOpen[okey] ? "\u25be" : "\u25b8");
+    tri.style.cssText = "font-size:9px;padding:0 3px;min-width:16px";
+    tri.title = "What is already stacked on this road";
+    const drw = kindBody[okey] || mk("div", "");
+    kindBody[okey] = drw;
+    drw.style.display = kindOpen[okey] ? "block" : "none";
+    drw.style.cssText += ";margin:2px 0 4px 18px";
+    row.appendChild(tri);
+    const nm = mk("span", "", kind);
+    nm.style.cssText = "flex:1;min-width:0;color:#9fd8ff";
+    row.appendChild(nm);
+    const num = mk("b", "", String(count));
+    num.style.color = Number(count) > 0 ? "#7ce8a9" : "#e0a35c";
+    row.appendChild(num);
+    if (KNOWN.indexOf(kind) >= 0) {
+      const add = mk("button", "", "+1");
+      add.title = "Have another " + kind + " written, recorded and "
+        + "stacked. It takes the spare engine slot in a quiet stretch, "
+        + "so the live round never waits on it.";
+      add.style.cssText = "font-size:9px;padding:0 5px";
+      add.onclick = async (ev) => {
+        ev.stopPropagation();
+        add.disabled = true;
+        const was = add.textContent;
+        add.textContent = "\u2026";
+        try {
+          await api.post("/api/pantry/commission", {kind, count: 1});
+          add.textContent = "queued";
+        } catch (e) { add.textContent = "refused"; }
+        setTimeout(() => {
+          add.textContent = was;
+          add.disabled = false;
+        }, 4000);
+      };
+      row.appendChild(add);
+    }
+    tri.onclick = (ev) => {
+      ev.stopPropagation();
+      kindOpen[okey] = !kindOpen[okey];
+      tri.textContent = kindOpen[okey] ? "\u25be" : "\u25b8";
+      drw.style.display = kindOpen[okey] ? "block" : "none";
+      if (kindOpen[okey]) kindLoad(kind, drw);
+    };
+    host.appendChild(row);
+    host.appendChild(drw);
+    if (kindOpen[okey]) kindLoad(kind, drw);
+  }
+
+  /* The variants behind one road, in the order the shelf will really
+   * consider them, each pushable up or down that order. */
+  async function kindLoad(kind, drw) {
+    let d = null;
+    try {
+      d = await api.get("/api/schedule/segment?kind="
+                        + encodeURIComponent(kind));
+    } catch (e) {
+      if (!drw.childNodes.length) drw.textContent = "could not read that";
+      return;
+    }
+    const cands = d.candidates || [];
+    const sig = JSON.stringify(cands.map(
+      (c) => [c.id, c.priority, c.seconds, c.usable]));
+    if (drw.dataset.sig === sig) return;
+    drw.dataset.sig = sig;
+    drw.textContent = "";
+    if (!cands.length) {
+      const none = mk("div", "wk-note",
+                      "nothing stacked \u2014 use +1 to have one made");
+      none.style.cssText = "font-size:9px;opacity:.6";
+      drw.appendChild(none);
+      return;
+    }
+    cands.forEach((c, ix) => {
+      const it = mk("div", "");
+      it.style.cssText = "display:flex;gap:4px;align-items:center;"
+        + "font-size:9px;padding:1px 0;opacity:"
+        + (c.usable === false ? ".45" : "1");
+      const mark = mk("b", "", ix === 0 ? "\u25b6" : String(ix + 1));
+      mark.style.color = ix === 0 ? "#9fd8ff" : "#6d8199";
+      it.appendChild(mark);
+      const t = mk("span", "", String(c.preview || c.title || c.id));
+      t.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap";
+      t.title = String(c.preview || "");
+      it.appendChild(t);
+      it.appendChild(mk("span", "wk-note",
+                        Math.round(c.seconds || 0) + "s"));
+      [["\u25b2", 1, "Push it up the order"],
+       ["\u25bc", -1, "Push it down the order"]].forEach(([g, d2, ti]) => {
+        const b = mk("button", "", g);
+        b.title = ti;
+        b.style.cssText = "font-size:8px;padding:0 4px";
+        b.onclick = async (ev) => {
+          ev.stopPropagation();
+          b.disabled = true;
+          try {
+            await api.post("/api/schedule/segment/priority",
+                           {shelf_id: c.id,
+                            priority: (c.priority || 0) + d2});
+          } catch (e) {}
+          drw.dataset.sig = "";
+          kindLoad(kind, drw);
+        };
+        it.appendChild(b);
+      });
+      drw.appendChild(it);
+    });
+  }
+
+  /* #894: the pantry, as a table. Each take opens onto its own words,
+   * and plays and downloads off the one signed URL. */
+  function pantryTable(host) {
+    const tri = mk("button", "",
+                   (pantryOpen ? "\u25be" : "\u25b8") + " EVERY TAKE");
+    tri.style.cssText = "font-size:9.5px;padding:1px 6px;margin-top:4px";
+    tri.title = "Every take on the shelf, newest first \u2014 what it "
+      + "says, who says it, and a play and a keep on each.";
+    const drw = pantryRows || mk("div", "");
+    pantryRows = drw;
+    drw.style.display = pantryOpen ? "block" : "none";
+    drw.style.marginTop = "4px";
+    tri.onclick = (ev) => {
+      ev.stopPropagation();
+      pantryOpen = !pantryOpen;
+      tri.textContent = (pantryOpen ? "\u25be" : "\u25b8") + " EVERY TAKE";
+      drw.style.display = pantryOpen ? "block" : "none";
+      if (pantryOpen) pantryLoad(drw);
+    };
+    host.appendChild(tri);
+    host.appendChild(drw);
+    if (pantryOpen) pantryLoad(drw);
+  }
+
+  async function pantryLoad(drw) {
+    let d = null;
+    try {
+      d = await api.get("/api/pantry/table?most=200");
+    } catch (e) {
+      if (!drw.childNodes.length) drw.textContent = "the pantry is closed";
+      return;
+    }
+    const rows = d.rows || [];
+    const sig = JSON.stringify([d.takes, d.loose, d.unlabelled,
+                                rows.length && rows[0].key]);
+    if (drw.dataset.sig === sig) return;
+    drw.dataset.sig = sig;
+    drw.textContent = "";
+    const head = mk("div", "wk-note", "");
+    head.style.cssText = "font-size:9px;opacity:.7;margin-bottom:3px";
+    head.textContent = d.shown + " of " + d.takes + " shown \u00b7 "
+      + Math.round((d.seconds || 0) / 60) + " min \u00b7 "
+      + d.loose + " loose"
+      + (d.unlabelled ? " \u00b7 " + d.unlabelled
+                        + " made before the words were kept" : "");
+    head.title = "A LOOSE take is one nothing is holding \u2014 the "
+      + "render cache doing its job. Those are the ones the horizon "
+      + "rolls off first.";
+    drw.appendChild(head);
+    rows.forEach((r) => drw.appendChild(pantryRow(r)));
+  }
+
+  function pantryRow(r) {
+    const box = mk("div", "");
+    box.style.cssText = "border-bottom:1px solid rgba(255,255,255,.05);"
+      + "padding:2px 0";
+    const line = mk("div", "");
+    line.style.cssText = "display:flex;gap:5px;align-items:center;"
+      + "font-size:9.5px";
+    const tri = mk("button", "", "\u25b8");
+    tri.style.cssText = "font-size:9px;padding:0 3px;min-width:16px";
+    line.appendChild(tri);
+    const who = mk("span", "", String(r.name || r.who || r.label || ""));
+    who.style.cssText = "min-width:52px;color:#9fd8ff";
+    line.appendChild(who);
+    const txt = mk("span", "",
+                   String(r.text || "\u2014 made before the words were "
+                                    + "kept \u2014"));
+    txt.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+      + "text-overflow:ellipsis;white-space:nowrap"
+      + (r.text ? "" : ";opacity:.5;font-style:italic");
+    line.appendChild(txt);
+    const meta = mk("span", "wk-note", "");
+    meta.style.cssText = "font-size:9px;opacity:.7;white-space:nowrap";
+    meta.textContent = Math.round(r.seconds || 0) + "s"
+      + (r.loose ? " \u00b7 loose" : "");
+    meta.title = r.held_by ? "held by " + r.held_by
+                           : "nothing is holding this take";
+    line.appendChild(meta);
+    box.appendChild(line);
+
+    const body = mk("div", "");
+    body.style.cssText = "display:none;margin:3px 0 4px 22px";
+    tri.onclick = (ev) => {
+      ev.stopPropagation();
+      const on = body.style.display === "none";
+      body.style.display = on ? "block" : "none";
+      tri.textContent = on ? "\u25be" : "\u25b8";
+      if (on && !body.childNodes.length) {
+        const full = mk("div", "");
+        full.style.cssText = "font-size:9.5px;line-height:1.5;"
+          + "white-space:pre-wrap;opacity:.85;margin-bottom:3px";
+        full.textContent = String(r.text || "nothing was written down "
+          + "beside this take \u2014 it was made before the pantry kept "
+          + "the words (#894)");
+        body.appendChild(full);
+        const facts = mk("div", "wk-note", "");
+        facts.style.cssText = "font-size:9px;opacity:.65;margin-bottom:3px";
+        facts.textContent = [
+          r.voice ? "voice " + r.voice : "",
+          r.label || "",
+          Math.round(r.seconds || 0) + "s",
+          Math.round((r.bytes || 0) / 1024) + " KB",
+          r.age_minutes + " min old",
+          "used " + (r.used || 0) + "\u00d7",
+          r.held_by ? "held by " + r.held_by : "loose",
+        ].filter(Boolean).join(" \u00b7 ");
+        body.appendChild(facts);
+        if (r.media && r.sig) {
+          const url = desktopMusicUrl(
+            "/media/" + encodeURIComponent(r.media)
+            + "?sig=" + encodeURIComponent(r.sig));
+          const au = mk("audio", "");
+          au.controls = true;
+          au.preload = "none";
+          au.src = url;
+          au.style.cssText = "width:100%;height:26px";
+          body.appendChild(au);
+          const keep = mk("button", "", "\u2b07 keep it");
+          keep.title = "Save this take. Same signed URL the player uses.";
+          keep.style.cssText = "font-size:9px;padding:1px 6px;margin-top:3px";
+          keep.onclick = (e2) => {
+            e2.stopPropagation();
+            try { api.openExternal(url); } catch (e3) {}
+          };
+          body.appendChild(keep);
+        }
+      }
+    };
+    box.appendChild(body);
+    return box;
+  }
+
+  function wkArrow(host) {
+    const k = "arrow" + (++wkArrowN);
+    if (!wkBox[k]) {
+      wkBox[k] = mk("div", "wk-arrow", "\u25bc");
+      flow.appendChild(wkBox[k]);
+    }
+    return wkBox[k];
+  }
+
+  /* One block under the flow (the cast, the scheduler, the blockers):
+   * made once, and only refilled when what it says has changed - so a
+   * repaint does not throw away the sentence you were half way through. */
+  function wkBlock(host, key, title, sig, fill_) {
+    try {
+      let block = wkBlocks[key];
+      if (!block) {
+        block = mk("div", "wk-block");
+        block.wkHead = mk("b", "", title);
+        block.appendChild(block.wkHead);
+        block.wkIn = mk("div", "");
+        block.appendChild(block.wkIn);
+        wkBlocks[key] = block;
+      }
+      if (block.parentElement !== host) host.appendChild(block);
+      wkText(block.wkHead, title);
+      if (wkSig[key] !== sig) {
+        wkSig[key] = sig;
+        block.wkIn.textContent = "";
+        try { fill_(block.wkIn); } catch (e) { /* leave it empty */ }
+      }
+      return block;
+    } catch (e) { return null; }
+  }
 
   function stage(flow, title, num, note, cls, frac, key, fill_) {
-    const box = mk("div", "wk-stage" + (cls ? " " + cls : ""));
-    if (num != null) box.appendChild(mk("span", "wk-num", String(num)));
-    const head = mk("b", "", (key ? (wkOpen[key] ? "▾ " : "▸ ") : "") + title);
-    if (key) head.style.cursor = "pointer";
-    box.appendChild(head);
-    if (note) box.appendChild(mk("div", "wk-note", note));
-    if (frac != null) {
-      const bar = mk("div", "wk-bar");
-      const fill = mk("div", "wk-fill"
-        + (frac >= 0.999 ? " good" : frac < 0.34 ? " warn" : ""));
-      fill.style.width = Math.round(Math.max(0, Math.min(1, frac)) * 100) + "%";
-      bar.appendChild(fill);
-      box.appendChild(bar);
+    /* #883/#887: made once, keyed, and updated in place from then on.
+     * The drawer is moved in ONCE - re-adopting it on every paint is what
+     * threw away its scroll and your selection ten times a minute. */
+    const k = key || ("t:" + title);
+    let box = wkBox[k];
+    if (!box) {
+      box = mk("div", "wk-stage");
+      box.wkNum = mk("span", "wk-num", "");
+      box.appendChild(box.wkNum);
+      box.wkHead = mk("b", "", "");
+      box.appendChild(box.wkHead);
+      box.wkNote = mk("div", "wk-note", "");
+      box.appendChild(box.wkNote);
+      box.wkBar = mk("div", "wk-bar");
+      box.wkFill = mk("div", "wk-fill");
+      box.wkBar.appendChild(box.wkFill);
+      box.appendChild(box.wkBar);
+      wkBox[k] = box;
+      flow.appendChild(box);
+    }
+    box.wkTitle = title;
+    const cn = "wk-stage" + (cls ? " " + cls : "");
+    if (box.className !== cn) box.className = cn;
+    box.wkNum.style.display = (num == null) ? "none" : "";
+    wkText(box.wkNum, num == null ? "" : String(num));
+    wkText(box.wkHead,
+           (key ? (wkOpen[key] ? "\u25be " : "\u25b8 ") : "") + title);
+    box.wkHead.style.cursor = key ? "pointer" : "default";
+    box.wkNote.style.display = note ? "" : "none";
+    wkText(box.wkNote, note ? String(note) : "");
+    if (frac == null) {
+      box.wkBar.style.display = "none";
+    } else {
+      box.wkBar.style.display = "";
+      const fc = "wk-fill"
+        + (frac >= 0.999 ? " good" : frac < 0.34 ? " warn" : "");
+      if (box.wkFill.className !== fc) box.wkFill.className = fc;
+      box.wkFill.style.width =
+        Math.round(Math.max(0, Math.min(1, frac)) * 100) + "%";
     }
     if (key) {
-      /* #922: THE DRAWER IS NOT REBUILT. paint() runs every 2.5 seconds
-       * and used to make a fresh drawer and re-fill it each time, so an
-       * open one flashed and threw away your scroll position and your
-       * text selection while you were reading it. The element is kept
-       * outside the flow and RE-ADOPTED into each rebuild instead, and
-       * its contents are only refilled when a signature says something
-       * actually changed. Reading it now holds still. */
       let drawer = wkBody[key];
       if (!drawer) { drawer = mk("div", "wk-drawer"); wkBody[key] = drawer; }
+      if (drawer.parentElement !== box) box.appendChild(drawer);  // once
       drawer.style.display = wkOpen[key] ? "block" : "none";
-      box.appendChild(drawer);              // moves it; does not clone it
-      /* The fill is ADDITIVE and idempotent: it is handed the same
-       * element every time and is responsible for adding only what is
-       * new. Nothing already on screen is touched, so entries stack up
-       * and what you are reading holds still. */
+      /* The fill is additive and idempotent: it is handed the same
+       * element every time and only adds what is new. */
       if (wkOpen[key] && typeof fill_ === "function") {
-        try { fill_(drawer); } catch (e) { /* keep what is already there */ }
+        try { fill_(drawer); } catch (e) { /* keep what is there */ }
       }
-      head.onclick = (ev) => {
+      box.wkHead.onclick = (ev) => {
         ev.stopPropagation();
         wkOpen[key] = !wkOpen[key];
         try { localStorage.setItem("wkOpen", JSON.stringify(wkOpen)); }
         catch (e) { /* private mode */ }
-        head.textContent = (wkOpen[key] ? "▾ " : "▸ ") + title;
+        box.wkHead.textContent =
+          (wkOpen[key] ? "\u25be " : "\u25b8 ") + box.wkTitle;
         drawer.style.display = wkOpen[key] ? "block" : "none";
         if (wkOpen[key] && typeof fill_ === "function") {
-          try { fill_(drawer); } catch (e) {}
+          try { fill_(drawer); } catch (e) { /* keep what is there */ }
         }
       };
     }
-    flow.appendChild(box);
     return box;
   }
 
@@ -1734,14 +2109,27 @@ function initWorksPopup() {
   }
 
   function paint(body, dj, pend) {
-    body.textContent = "";
+    /* #883/#887: NOTHING IS EMPTIED HERE. The flow is built once and
+     * every stage is updated in place, so the popup never loses its
+     * scroll, never blinks, and never closes the drawer you are reading.
+     * The only rebuild left is when the popup itself has been closed and
+     * opened again, which is a new body element. */
+    wkArrowN = 0;
+    if (!wkFlow || wkFlow.parentElement !== body) {
+      body.textContent = "";
+      wkFlow = mk("div", "wk-flow");
+      [wkBox, wkBlocks, wkSig].forEach((m) => {
+        Object.keys(m).forEach((key2) => { delete m[key2]; });
+      });
+      body.appendChild(wkFlow);
+    }
     const f = (dj && dj.dialogue_flow) || {};
     const rows = (pend && pend.pending) || [];
     const rendering = rows.filter((r) => r.state === "rendering");
     const ready = rows.filter((r) => r.state === "ready");
     const act = (dj && dj.activity) || {};
 
-    const flow = mk("div", "wk-flow");
+    const flow = wkFlow;
 
     // 1 — the writing desk  (#864: opens onto the paperwork)
     stage(flow, "① the writing desk",
@@ -1751,67 +2139,85 @@ function initWorksPopup() {
       f.writing ? "on" : "", null,
       "desk",
       (drawer) => {
-        /* #922: ADDITIVE. Each call the desk makes is added ONCE, newest
-         * on top, and nothing already on screen is touched — so entries
-         * stack up as they happen and reading one does not get
-         * interrupted by the 2.5-second repaint. */
+        /* #884/#885: ADDITIVE, and every entry folds on its own. Each
+         * call the desk makes is added ONCE, newest on top, and nothing
+         * already on screen is touched - so entries stack up as they
+         * happen and the one you are reading keeps its place, its scroll
+         * and its selection. The triangle on an entry folds just that
+         * entry away, and the choice is remembered. */
         if (!drawer.dataset.init) {
           drawer.dataset.init = "1";
-          drawer.dataset.seen = "|";
-          const hd = mk("div", "wk-note", "reading the desk…");
-          hd.className = "wk-note wkDeskHead";
-          hd.style.cssText = "font-size:10px;margin-bottom:4px";
-          drawer.appendChild(hd);
-          const list = mk("div", "");
-          list.className = "wkDeskList";
-          drawer.appendChild(list);
+          drawer.wkSeen = {};
+          const tools = mk("div", "");
+          tools.style.cssText = "display:flex;gap:6px;align-items:center;"
+            + "margin-bottom:4px";
+          const hd = mk("div", "wk-note wkDeskHead", "reading the desk\u2026");
+          hd.style.cssText = "font-size:10px;flex:1;min-width:0";
+          tools.appendChild(hd);
+          [["open all", true], ["close all", false]].forEach((pair) => {
+            const b = mk("button", "wk-icon", "");
+            b.textContent = pair[0];
+            b.style.cssText = "position:static;width:auto;height:auto;"
+              + "font-size:9px;padding:1px 5px";
+            b.onclick = (ev) => {
+              ev.stopPropagation();
+              try {
+                const kids = drawer.querySelectorAll(".wkDeskEntry");
+                for (let i = 0; i < kids.length; i++) {
+                  wkDeskFold(kids[i], pair[1]);
+                }
+              } catch (e) { /* each entry still folds by hand */ }
+            };
+            tools.appendChild(b);
+          });
+          drawer.appendChild(tools);
+          drawer.appendChild(mk("div", "wkDeskList"));
         }
+        if (!drawer.wkSeen) drawer.wkSeen = {};
         const head = drawer.querySelector(".wkDeskHead");
         const list = drawer.querySelector(".wkDeskList");
         api.get("/api/writing-desk").then((wd) => {
           const calls = (wd && wd.calls) || [];
-          if (head) {
-            head.textContent = calls.length + " calls held · mean "
-              + (wd.mean_ms || 0) + " ms, slowest " + (wd.slowest_ms || 0)
-              + " ms" + (wd.kind_now ? " · on a " + wd.kind_now + " segment" : "");
-          }
+          wkText(head, calls.length + " calls held \u00b7 mean "
+            + (wd.mean_ms || 0) + " ms, slowest " + (wd.slowest_ms || 0)
+            + " ms"
+            + (wd.kind_now ? " \u00b7 on a " + wd.kind_now + " segment" : ""));
           if (!list) return;
-          const seen = String(drawer.dataset.seen || "|");
-          // oldest first so each new one is PREPENDED and the order is
-          // newest-at-top without ever moving what is already there
-          calls.slice(0, 12).reverse().forEach((c) => {
+          const fresh = [];
+          calls.slice(0, 12).forEach((c) => {
             const id = "c" + String(c.at || 0) + ":" + String(c.ms || 0);
-            if (seen.indexOf("|" + id + "|") >= 0) return;
-            drawer.dataset.seen = drawer.dataset.seen + id + "|";
-            const t = mk("div", "");
-            t.style.cssText = "border-left:2px solid #3f7fa8;padding-left:7px;"
-              + "margin:6px 0";
-            const nm = mk("div", "");
-            nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff";
-            nm.textContent = (c.kind || "a round") + " · " + (c.ms || 0)
-              + " ms · " + (c.chars || 0) + " chars · ctx "
-              + (c.num_ctx || "?") + " · temp "
-              + (c.temp != null ? c.temp : "?");
-            t.appendChild(nm);
-            wkPut(t, "GOVERNED BY",
-              (c.armed ? "system prompt: " + c.armed : "")
-              + (c.sched ? (c.armed ? "\n\n" : "") + c.sched : ""));
-            wkPut(t, "WHAT WE SENT", c.prompt, true);
-            wkPut(t, "WHAT CAME BACK", c.script || c.text, true);
-            list.insertBefore(t, list.firstChild);
+            if (drawer.wkSeen[id]) return;
+            drawer.wkSeen[id] = 1;
+            fresh.push([id, c]);
           });
-          while (list.childNodes.length > 24) {
-            list.removeChild(list.lastChild);   // the tail ages out quietly
+          if (!fresh.length) {
+            if (!calls.length && !list.firstChild) {
+              wkText(head,
+                "nothing yet - each call is recorded as the desk makes it.");
+            }
+            return;
           }
-          if (!calls.length && !list.childNodes.length && head) {
-            head.textContent =
-              "nothing yet — each call is recorded as the desk makes it.";
-          }
+          // oldest first, so each new one is PREPENDED and the order is
+          // newest-at-top without ever moving what is already there
+          wkAnchor(() => {
+            fresh.reverse().forEach((pair) => {
+              list.insertBefore(wkDeskEntry(pair[0], pair[1]),
+                                list.firstChild);
+            });
+            while (list.childNodes.length > 24) {
+              const gone = list.lastChild;                 // ages out quietly
+              try { wkDeskForget(gone.wkId); }
+              catch (e) { /* the row goes either way */ }
+              list.removeChild(gone);
+            }
+          });
         }).catch(() => {
-          if (head) head.textContent = "the desk is unreachable";
+          if (!list || !list.firstChild) {
+            wkText(head, "the desk is unreachable");
+          }
         });
       });
-    flow.appendChild(mk("div", "wk-arrow", "▼"));
+    wkArrow(flow);
 
     // 2 — the reserve of written scripts  (#864: opens onto the rounds)
     const target = Number(f.target || 6);
@@ -1825,6 +2231,17 @@ function initWorksPopup() {
       target ? have / target : 0,
       "reserve",
       (drawer) => {
+        /* #883: this used to append the whole reserve again on every one
+         * of the 2.5-second paints - the drawer grew without limit and
+         * whatever you were reading marched down the window. It is only
+         * rebuilt when the reserve itself has changed, and the scroll is
+         * put back when it is. */
+        const sig = JSON.stringify((rows || []).map((r) => [r.id, r.state,
+          r.turns, r.made, r.chunks, (r.lines || []).length]));
+        if (drawer.wkSig === sig && drawer.firstChild) return;
+        drawer.wkSig = sig;
+        wkKeep(() => {
+        drawer.textContent = "";
         if (!rows.length) {
           drawer.appendChild(mk("div", "wk-note", "the shelf is empty"));
           return;
@@ -1852,8 +2269,9 @@ function initWorksPopup() {
           });
           drawer.appendChild(t);
         });
+        });
       });
-    flow.appendChild(mk("div", "wk-arrow", "▼"));
+    wkArrow(flow);
 
     // 3 — the recording room
     const cur = rendering[0] || null;
@@ -1867,8 +2285,20 @@ function initWorksPopup() {
       cur && cur.chunks ? cur.made / cur.chunks : null,
       "room",                                            // #876
       (drawer) => {
-        drawer.appendChild(mk("div", "wk-note", "reading the room…"));
+        /* #883/#887: the waiting note used to be appended on every paint
+         * and cleared again a moment later - that flash, twice a second
+         * of every five, is the blink. It is said once, and the drawer is
+         * only rebuilt when the room has something different to say. */
+        if (!drawer.dataset.init) {
+          drawer.dataset.init = "1";
+          drawer.appendChild(mk("div", "wk-note", "reading the room\u2026"));
+        }
         api.get("/api/recording-room").then((rr) => {
+          const sig = JSON.stringify([rr && rr.preparing, rr && rr.kinds,
+                                      rr && rr.actors]);
+          if (drawer.wkSig === sig && drawer.firstChild) return;
+          drawer.wkSig = sig;
+          wkKeep(() => {
           drawer.textContent = "";
           const p = rr && rr.preparing;
           if (p && p.kind) {
@@ -1897,12 +2327,19 @@ function initWorksPopup() {
               + (a.cost ? ", " + a.cost + "× real time" : "")
               + ", " + a.saved_pct + "% off the shelf").join("\n"));
           }
+          });
         }).catch(() => {
+          if (drawer.wkSig === "gone") return;
+          drawer.wkSig = "gone";
           drawer.textContent = "";
           drawer.appendChild(mk("div", "wk-note", "the room is unreachable"));
         });
       });
-    flow.appendChild(mk("div", "wk-arrow", "▼"));
+    wkArrow(flow);
+
+    /* #896: the header dial follows the live figures. */
+    try { if (horizonBox && horizonBox.wkShow) horizonBox.wkShow(f); }
+    catch (e) { /* the flow still paints */ }
 
     // 4 — the pantry  (#876: opens onto what is actually on the shelf)
     const secs = Number(f.buffered_seconds || pend.buffered_seconds || 0);
@@ -1917,11 +2354,31 @@ function initWorksPopup() {
       Math.min(1, secs / 180),
       "pantry",
       (drawer) => {
+        /* #883: this appended itself again on every paint too. */
+        const sig = JSON.stringify([f.prepared_by_kind, f.life_hours,
+          f.burn_hours, f.hours_ready, f.target_hours, f.window,
+          ready.map((r) => [r.turns, Math.round(Number(r.seconds) || 0)])]);
+        if (drawer.wkSig === sig && drawer.firstChild) return;
+        drawer.wkSig = sig;
+        wkKeep(() => {
+        drawer.textContent = "";
         const k = f.prepared_by_kind || {};
         const named = Object.keys(k);
         if (named.length) {
-          wkPut(drawer, "PREPARED, BY KIND",
-            named.map((x) => x + ": " + k[x]).join("\n"));
+          /* #893: each kind COMMISSIONS ANOTHER of itself, and opens
+           * onto the variants already stacked behind it. It was seven
+           * numbers, four of them zero, and no way to act on that. */
+          const lab = mk("div", "wk-note", "PREPARED, BY KIND");
+          lab.style.cssText = "font-size:9px;letter-spacing:.05em;"
+            + "margin:6px 0 2px;opacity:.8";
+          lab.title = "Click a road to have another one written, "
+            + "recorded and stacked. Open the tick to see what is "
+            + "already behind it.";
+          drawer.appendChild(lab);
+          const grid = mk("div", "");
+          grid.style.cssText = "margin-bottom:6px";
+          named.forEach((x) => kindRow(grid, x, k[x]));
+          drawer.appendChild(grid);
         }
         wkPut(drawer, "THE SHELF",
           "kept servable for " + (f.life_hours || "?") + " h\n"
@@ -1935,8 +2392,11 @@ function initWorksPopup() {
             "#" + (i + 1) + " — " + r.turns + " turns, "
             + Math.round(r.seconds || 0) + "s").join("\n"));
         }
+        /* #894: and the pantry ITSELF, listed. */
+        pantryTable(drawer);
+        });
       });
-    flow.appendChild(mk("div", "wk-arrow", "▼"));
+    wkArrow(flow);
 
     // 5 — on air
     const now = (dj && dj.now) || {};
@@ -1954,57 +2414,56 @@ function initWorksPopup() {
         ? saying.slice(0, 160)
         : ((now.artist || "") + " — " + (now.title || "")).slice(0, 120),
       dj && dj.speaking ? "on" : "");
-    body.appendChild(flow);
-
-    // the cast
-    const cast = mk("div", "wk-block");
-    cast.appendChild(mk("b", "", "THE CAST"));
-    const cg = mk("dl", "wk-grid");
+    /* #883: the three blocks under the flow are made once and only
+     * refilled when what they say has actually changed. */
     const names = (dj && dj.dj_names) || {};
-    Object.keys(names).forEach((k) => {
-      cg.appendChild(mk("dt", "", k));
-      cg.appendChild(mk("dd", "", String(names[k])));
-    });
-    if (act.stage) {
-      cg.appendChild(mk("dt", "", "doing now"));
-      cg.appendChild(mk("dd", "", act.stage + " · " + (act.detail || "")));
-    }
-    cast.appendChild(cg);
-    body.appendChild(cast);
+    wkBlock(body, "cast", "THE CAST",
+      JSON.stringify([names, act.stage, act.detail]), (into) => {
+        const cg = mk("dl", "wk-grid");
+        Object.keys(names).forEach((k) => {
+          cg.appendChild(mk("dt", "", k));
+          cg.appendChild(mk("dd", "", String(names[k])));
+        });
+        if (act.stage) {
+          cg.appendChild(mk("dt", "", "doing now"));
+          cg.appendChild(mk("dd", "",
+                            act.stage + " \u00b7 " + (act.detail || "")));
+        }
+        into.appendChild(cg);
+      });
 
-    // the scheduler
     const q = f.quota || {};
-    if (q.manager || q.caller) {
-      const sch = mk("div", "wk-block");
-      sch.appendChild(mk("b", "", "THE SCHEDULER — what the hour owes"));
-      const sg = mk("dl", "wk-grid");
-      ["manager", "caller"].forEach((k) => {
-        const r = q[k];
-        if (!r) return;
-        sg.appendChild(mk("dt", "", k));
-        sg.appendChild(mk("dd", "",
-          r.aired + " of " + r.target + " this hour"
-          + (r.behind ? " — behind" : " — on pace")
-          + (r.due ? ", due now" : "")));
+    const sch = wkBlock(body, "sched",
+      "THE SCHEDULER \u2014 what the hour owes", JSON.stringify(q),
+      (into) => {
+        const sg = mk("dl", "wk-grid");
+        ["manager", "caller"].forEach((k) => {
+          const r = q[k];
+          if (!r) return;
+          sg.appendChild(mk("dt", "", k));
+          sg.appendChild(mk("dd", "",
+            r.aired + " of " + r.target + " this hour"
+            + (r.behind ? " \u2014 behind" : " \u2014 on pace")
+            + (r.due ? ", due now" : "")));
+        });
+        into.appendChild(sg);
       });
-      sch.appendChild(sg);
-      body.appendChild(sch);
-    }
+    if (sch) sch.style.display = (q.manager || q.caller) ? "" : "none";
 
-    // what is stopping it
-    const stops = mk("div", "wk-block");
-    stops.appendChild(mk("b", "", "WHAT IS HOLDING IT UP"));
-    const list = (f.blockers || []);
-    if (!list.length) {
-      stops.appendChild(mk("div", "wk-note", "nothing — the line is clear"));
-    } else {
-      list.forEach((b) => {
-        const healthy = /healthy/i.test(b);
-        stops.appendChild(mk("div", healthy ? "wk-note" : "wk-note wk-stop",
-                             (healthy ? "✓ " : "• ") + b));
+    const stopping = f.blockers || [];
+    wkBlock(body, "stops", "WHAT IS HOLDING IT UP",
+      JSON.stringify(stopping), (into) => {
+        if (!stopping.length) {
+          into.appendChild(mk("div", "wk-note",
+                              "nothing \u2014 the line is clear"));
+          return;
+        }
+        stopping.forEach((b) => {
+          const healthy = /healthy/i.test(b);
+          into.appendChild(mk("div", healthy ? "wk-note" : "wk-note wk-stop",
+                              (healthy ? "\u2713 " : "\u2022 ") + b));
+        });
       });
-    }
-    body.appendChild(stops);
   }
 
   async function load(body) {
@@ -2020,6 +2479,69 @@ function initWorksPopup() {
     }
   }
 
+  /* #896: the horizon control. Reads the live figure, writes it back
+   * through the settings document the panel's own sliders use, and says
+   * plainly what the number means — because "1.5" on its own reads as a
+   * quality setting rather than an hour and a half of cover. */
+  function wkHorizon() {
+    const wrap = mk("span", "");
+    wrap.style.cssText = "display:inline-flex;align-items:center;gap:4px;"
+      + "margin-left:10px;font-size:10px;opacity:.85";
+    wrap.title = "How far ahead the station writes and records. Material "
+      + "past this line is burned oldest-first as new material lands, so "
+      + "the buffer rolls rather than grows.";
+    wrap.appendChild(mk("span", "wk-sub", "build ahead"));
+    const box = mk("select", "");
+    box.style.cssText = "font-size:10px;padding:0 2px";
+    [["0.5", "30 min"], ["1", "1 hour"], ["1.5", "1\u00bd hours"],
+     ["2", "2 hours"], ["3", "3 hours"], ["6", "6 hours"],
+     ["12", "12 hours"], ["24", "a day"]].forEach(([v, t]) => {
+      const o = mk("option", "", t);
+      o.value = v;
+      box.appendChild(o);
+    });
+    const note = mk("span", "wk-sub", "");
+    note.style.cssText = "font-size:9.5px;opacity:.7";
+    wrap.appendChild(box);
+    wrap.appendChild(note);
+    wrap.wkShow = (f) => {
+      if (box.wkBusy) return;
+      const h = Number(f.horizon_hours || f.target_hours || 1.5);
+      const want = String(h);
+      if (box.value !== want
+          && Array.prototype.some.call(box.options,
+                                       (o) => o.value === want)) {
+        box.value = want;
+      }
+      const got = Number(f.prepared_hours != null
+                         ? f.prepared_hours : f.hours_ready || 0);
+      note.textContent = got.toFixed(2) + "h ready"
+        + (f.box_depth != null
+           ? " \u00b7 digging " + Math.round(Number(f.box_depth) * 100) + "%"
+           : "");
+      note.title = "How much is genuinely SPOKEN FOR \u2014 prepared "
+        + "segments, not cached renders of lines already aired. The "
+        + "digging figure is how deep into the speakbox the pair go as "
+        + "the queue builds (#895).";
+    };
+    box.onchange = async () => {
+      box.wkBusy = true;
+      const was = note.textContent;
+      note.textContent = "setting\u2026";
+      try {
+        const s = await api.get("/api/settings");
+        if (s.voice_out) delete s.voice_out.ha_token;
+        s.dj = Object.assign({}, s.dj || {},
+                             {prepare_hours: Number(box.value)});
+        await api.put("/api/settings", s);
+        note.textContent = "set";
+      } catch (e) { note.textContent = was; }
+      setTimeout(() => { box.wkBusy = false; }, 1500);
+    };
+    horizonBox = wrap;
+    return wrap;
+  }
+
   function open() {
     if (pop) { close(); return; }
     pop = mk("div", "works-pop");
@@ -2030,6 +2552,10 @@ function initWorksPopup() {
     const head = mk("div", "wk-head");
     head.appendChild(mk("b", "", "⚙ The Works"));
     head.appendChild(mk("span", "wk-sub", "how the dialogue gets made"));
+    /* #896: HOW FAR AHEAD to build, right here in the header where it
+     * was asked for. Everything the preparer does is measured against
+     * this line, and material past it rolls off oldest-first. */
+    head.appendChild(wkHorizon());
     const x = mk("button", "wk-x", "✕");
     x.onclick = close;
     head.appendChild(x);
@@ -2273,6 +2799,16 @@ function worksSchedule(anchorPop) {
   };
 
   function paint() {
+    /* #883/#887: the hour sheet reloads every five seconds. It was
+     * rebuilt every time, which threw the popup's scroll to the top
+     * and tore the row you were reading out from under you. It is
+     * only rebuilt when the hour has actually changed, and the
+     * scroll goes back where it was either way. */
+    const sig = JSON.stringify(hour || null);
+    if (body.wkSig === sig && body.firstChild) { paintAir(); return; }
+    body.wkSig = sig;
+    const wasAt = pop.scrollTop;
+    body.wkAir = null;
     body.textContent = "";
     if (!hour) { body.appendChild(mk("div", "wk-note", "reading…")); return; }
     label.textContent = hour.label + " · " + hour.date
@@ -2372,6 +2908,8 @@ function worksSchedule(anchorPop) {
         f2.style.width = Math.round(through * 100) + "%";
         b2.appendChild(f2);
         row.appendChild(b2);
+        body.wkAir = f2;              // nudged in place between rebuilds
+        body.wkAirNeed = need;
       }
 
       const gear = mk("button", "", "⚙ this entry, this hour");
@@ -2420,6 +2958,25 @@ function worksSchedule(anchorPop) {
       }
       body.appendChild(row);
     });
+    try {
+      pop.scrollTop = wasAt;
+      requestAnimationFrame(() => {
+        try { pop.scrollTop = wasAt; } catch (e) { /* fine */ }
+      });
+    } catch (e) { /* the sheet is drawn either way */ }
+  }
+
+  /* The one thing that moves between rebuilds: how far the clock is
+   * through the entry on air. Nudged in place, nothing torn down. */
+  function paintAir() {
+    try {
+      if (!body.wkAir || !body.wkAir.isConnected) return;
+      if (!hour || !hour.now || !hour.now.started) return;
+      const need = Math.max(1, Number(body.wkAirNeed || 1));
+      const through = Math.max(0, Math.min(1,
+        (Date.now() / 1000 - Number(hour.now.started)) / need));
+      body.wkAir.style.width = Math.round(through * 100) + "%";
+    } catch (e) { /* the bar is cosmetic */ }
   }
 
   /* #928: search the library and pin one track to this entry. */
@@ -2607,6 +3164,106 @@ function worksSchedule(anchorPop) {
   next.onclick = () => { offset = Math.min(72, offset + 1); load(); };
   load();
   const tick = setInterval(() => { if (!offset) load(); }, 5000);
+}
+
+/* #885: one entry on the writing desk. Its own triangle, its own memory
+ * of whether it is open, and it is built once and never touched again. */
+function wkDeskEntry(id, c) {
+  const mk2 = (tag, cls, text) => {
+    const node = document.createElement(tag);
+    if (cls) node.className = cls;
+    if (text != null) node.textContent = text;
+    return node;
+  };
+  const key = "desk:" + id;
+  const open = wkDeskOpen(key);
+  const t = mk2("div", "wkDeskEntry");
+  t.wkId = id;
+  t.wkKey = key;
+  t.style.cssText = "border-left:2px solid #3f7fa8;padding-left:7px;"
+    + "margin:6px 0";
+  const label = (c.kind || "a round") + " \u00b7 " + (c.ms || 0)
+    + " ms \u00b7 " + (c.chars || 0) + " chars \u00b7 ctx "
+    + (c.num_ctx || "?") + " \u00b7 temp "
+    + (c.temp != null ? c.temp : "?");
+  t.wkLabel = label;
+  const nm = mk2("div", "");
+  nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff;"
+    + "cursor:pointer;user-select:none";
+  nm.textContent = (open ? "\u25be " : "\u25b8 ") + label;
+  t.wkHead = nm;
+  t.appendChild(nm);
+  const inner = mk2("div", "");
+  inner.style.display = open ? "block" : "none";
+  t.wkInner = inner;
+  try {
+    wkPutInto(inner, "GOVERNED BY",
+      (c.armed ? "system prompt: " + c.armed : "")
+      + (c.sched ? (c.armed ? "\n\n" : "") + c.sched : ""));
+    wkPutInto(inner, "WHAT WE SENT", c.prompt, true);
+    wkPutInto(inner, "WHAT CAME BACK", c.script || c.text, true);
+  } catch (e) { /* an entry with no paperwork still lists */ }
+  t.appendChild(inner);
+  nm.onclick = (ev) => {
+    ev.stopPropagation();
+    wkDeskFold(t, !wkDeskOpen(key));
+  };
+  return t;
+}
+
+/* Open unless it has been folded away: a fresh call arrives open, the way
+ * it always did, and only the ones you CLOSE are remembered - so this
+ * never grows. It is kept apart from wkOpen, which the five stages own
+ * and rewrite wholesale. */
+function wkDeskShut() {
+  try { return JSON.parse(localStorage.getItem("wkDeskShut") || "{}") || {}; }
+  catch (e) { return {}; }
+}
+
+function wkDeskOpen(key) {
+  try { return wkDeskShut()[key] !== true; } catch (e) { return true; }
+}
+
+function wkDeskFold(t, want) {
+  try {
+    if (!t || !t.wkKey) return;
+    const all = wkDeskShut();
+    if (want) delete all[t.wkKey];
+    else all[t.wkKey] = true;
+    try { localStorage.setItem("wkDeskShut", JSON.stringify(all)); }
+    catch (e) { /* private mode: it still works for this session */ }
+    t.wkHead.textContent = (want ? "\u25be " : "\u25b8 ") + t.wkLabel;
+    t.wkInner.style.display = want ? "block" : "none";
+  } catch (e) { /* one stubborn entry is not worth the drawer */ }
+}
+
+/* A call that has aged off the bottom takes its memory with it. */
+function wkDeskForget(id) {
+  try {
+    if (!id) return;
+    const all = wkDeskShut();
+    if (all["desk:" + id] === undefined) return;
+    delete all["desk:" + id];
+    localStorage.setItem("wkDeskShut", JSON.stringify(all));
+  } catch (e) { /* nothing here is worth the drawer */ }
+}
+
+/* One labelled block inside an entry - the same look as wkPut. */
+function wkPutInto(box, label, text, mono) {
+  if (!text) return;
+  const h = document.createElement("div");
+  h.className = "wk-note";
+  h.textContent = label;
+  h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:6px 0 2px;"
+    + "opacity:.8";
+  box.appendChild(h);
+  const b = document.createElement("div");
+  b.textContent = String(text);
+  b.style.cssText = "font-size:10px;line-height:1.5;white-space:pre-wrap;"
+    + "max-height:26vh;overflow:auto;padding:5px 7px;border-radius:6px;"
+    + "background:#05090f;border:1px solid #24384a"
+    + (mono ? ";font-family:ui-monospace,Consolas,monospace" : "");
+  box.appendChild(b);
 }
 
 /* The Works' own popups are plain divs, not the panel's — give them the
