@@ -46209,6 +46209,55 @@ async def _arp_state(host: str) -> str:
         return "no entry"
 
 
+# #985: THE SERVICES THE PINE BOX LEANS ON, AND WHETHER THEY ARE THERE.
+#
+# "I just put a request through ComfyUI and it failed. Make sure the DJs
+#  have the resources available to triage and resolve and auto repair any
+#  issues in order to make sure that the services work for the pine box."
+#
+# ComfyUI had been down for some time and NOTHING in the station knew.
+# Every readout the operator had — the diagnose ladder, the repair tree,
+# the engine panel — is about the speaker, the voice engines and Home
+# Assistant. The image side had no rung at all, so a dead ComfyUI was
+# indistinguishable from a slow one, and the only symptom was a request
+# quietly failing.
+#
+# The lifeboat already probes every peer port once and answers without
+# auth, so this asks IT rather than opening eight sockets of its own.
+# Falling back to a direct probe keeps it honest when the lifeboat is the
+# thing that is down.
+PEER_SERVICES = {
+    "comfyui": ("ComfyUI (pictures)", "http://127.0.0.1:8188/system_stats"),
+    "ollama": ("Ollama (the writer)", "http://127.0.0.1:11434/api/version"),
+    "voice-lab": ("Voice lab", "http://127.0.0.1:8771/health"),
+}
+LIFEBOAT_URL = os.getenv("LIFEBOAT_URL", "http://127.0.0.1:8099")
+
+
+async def peer_service_state() -> dict[str, Any]:
+    """Which peer services are answering, and who can restart them."""
+    out: dict[str, Any] = {"ports": {}, "restartable": [], "via": ""}
+    try:
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            got = (await client.get(f"{LIFEBOAT_URL}/status")).json()
+        out["ports"] = dict(got.get("ports") or {})
+        out["restartable"] = list(got.get("restartable") or [])
+        out["via"] = "lifeboat"
+        return out
+    except Exception:  # noqa: BLE001
+        pass
+    # The lifeboat is the thing that is down: ask the ports directly.
+    out["via"] = "direct"
+    for key, (_label, url) in PEER_SERVICES.items():
+        try:
+            async with httpx.AsyncClient(timeout=4.0) as client:
+                got = await client.get(url)
+            out["ports"][key] = got.status_code < 500
+        except Exception:  # noqa: BLE001
+            out["ports"][key] = False
+    return out
+
+
 async def pinebox_diagnose() -> dict[str, Any]:
     """Work down the chain and stop at the first thing that is actually
     broken, so the advice is about that and not about everything."""
@@ -46224,6 +46273,30 @@ async def pinebox_diagnose() -> dict[str, Any]:
             f"{len(voices)} voices" if voices else "not answering on :10200")
     except Exception as exc:
         add("Speech engine (wyoming-piper)", False, str(exc)[:120])
+
+    # #985: the peer services, before Home Assistant — a dead ComfyUI or
+    # a dead Ollama breaks the station just as thoroughly as a dead
+    # speaker, and until now neither had a rung anywhere.
+    try:
+        peers = await peer_service_state()
+        _ports = peers.get("ports") or {}
+        _down = [PEER_SERVICES.get(k, (k, ""))[0]
+                 for k, alive in _ports.items()
+                 if k in PEER_SERVICES and not alive]
+        _fixable = [k for k in _ports
+                    if k in (peers.get("restartable") or [])]
+        if _down:
+            add("Services the station leans on", False,
+                ", ".join(_down) + " not answering"
+                + (" — the lifeboat can restart "
+                   + ", ".join(_fixable) if _fixable
+                   else " — needs a hand on the host"))
+        else:
+            add("Services the station leans on", True,
+                str(len([k for k, v in _ports.items() if v]))
+                + " answering (" + (peers.get("via") or "?") + ")")
+    except Exception as exc:  # noqa: BLE001
+        add("Services the station leans on", None, str(exc)[:120])
 
     token, player = _ha_creds()
     add("Home Assistant token", bool(token),
