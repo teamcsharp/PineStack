@@ -2058,6 +2058,13 @@ try { initWorksPopup(); } catch (e) { /* the desk still works without it */ }
  * an override on that hour alone — the running order everywhere else is
  * untouched.
  */
+/* #926: entries that can never be stacked ahead — say so on the bar
+ * rather than drawing an empty one and letting it read as a failure. */
+const CANNOT_SAY = {
+  record: "a record is not written ahead — the needle just drops",
+  recap: "written at the end of the hour it recaps",
+  deep: "written from the last stretch of the show",
+};
 const SCHED_ICON = {news: "📰", record: "💿", gallery: "🖼", ad: "📣",
                     banter: "💬", banter_caller: "☎💬", caller: "☎",
                     manager: "📻", recap: "🔁", deep: "🧠",
@@ -2142,8 +2149,9 @@ function worksSchedule(anchorPop) {
     }
     (hour.slots || []).forEach((s, i) => {
       const row = mk("div", "wk-stage");
-      row.style.cssText = "padding:5px 8px;margin:0 0 4px;"
-        + "border-left:3px solid "
+      // #890: room for the corner icon, and nothing runs under it.
+      row.style.cssText = "position:relative;padding:5px 34px 5px 8px;"
+        + "margin:0 0 4px;border-left:3px solid "
         + (s.state === "on air" ? "#7ce8a9"
            : s.enabled === false ? "#44515f" : "#3f7fa8")
         + ";opacity:" + (s.enabled === false ? ".5" : "1");
@@ -2174,10 +2182,9 @@ function worksSchedule(anchorPop) {
       const mins = mk("span", "wk-note", s.minutes + "m");
       mins.style.cssText = "font-size:10px;opacity:.7";
       top.appendChild(mins);
-      const onoff = mk("button", "", s.enabled === false ? "○" : "●");
+      const onoff = mk("button", "wk-icon", s.enabled === false ? "○" : "●");
       onoff.title = s.enabled === false ? "Off — click to run it"
                                         : "On — click to skip it this hour";
-      onoff.style.cssText = "font-size:10px;line-height:1;padding:0 5px";
       onoff.onclick = (ev) => {
         ev.stopPropagation();
         const list = hour.slots.map((r, j) =>
@@ -2185,7 +2192,7 @@ function worksSchedule(anchorPop) {
         hour.slots = list;
         save(list);
       };
-      top.appendChild(onoff);
+      row.appendChild(onoff);            // #890: cornered, not in the flow
       row.appendChild(top);
 
       const p = s.prep || {};
@@ -2196,6 +2203,39 @@ function worksSchedule(anchorPop) {
         + (p.rendered || 0) + " recorded, " + (p.ready || 0) + " ready"
         + (p.seconds ? " · " + Math.round(p.seconds) + "s" : "");
       row.appendChild(line2);
+
+      /* #926: the bar. How much finished audio stands behind this entry
+       * against the minutes it owns — so an hour reads at a glance as a
+       * row of columns filling up, and a hollow one is a segment with
+       * nothing behind it. The entry ON AIR gets a second, brighter bar
+       * showing how far through its own slot the clock is. */
+      const need = Math.max(1, Number(s.minutes || 1) * 60);
+      const have = Number(p.seconds || 0);
+      const frac = Math.max(0, Math.min(1, have / need));
+      const bar = mk("div", "wk-bar");
+      bar.style.marginTop = "4px";
+      const fillb = mk("div", "wk-fill"
+        + (frac >= 0.999 ? " good" : frac < 0.15 ? " warn" : ""));
+      fillb.style.width = Math.round(frac * 100) + "%";
+      bar.appendChild(fillb);
+      row.appendChild(bar);
+      const cap = mk("div", "wk-note", "");
+      cap.style.cssText = "font-size:9px;opacity:.55;margin-top:1px";
+      cap.textContent = CANNOT_SAY[s.kind]
+        ? CANNOT_SAY[s.kind]
+        : Math.round(have) + "s banked of " + Math.round(need)
+          + "s this entry owns";
+      row.appendChild(cap);
+      if (s.state === "on air" && hour.now && hour.now.started) {
+        const through = Math.max(0, Math.min(1,
+          (Date.now() / 1000 - Number(hour.now.started)) / need));
+        const b2 = mk("div", "wk-bar");
+        b2.style.cssText = "margin-top:3px;height:3px";
+        const f2 = mk("div", "wk-fill good");
+        f2.style.width = Math.round(through * 100) + "%";
+        b2.appendChild(f2);
+        row.appendChild(b2);
+      }
 
       const gear = mk("button", "", "⚙ this entry, this hour");
       gear.style.cssText = "font-size:9.5px;margin-top:3px;padding:1px 6px";
