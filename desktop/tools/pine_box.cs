@@ -143,8 +143,39 @@ static class PineBox
     {
         string electron = Path.Combine(runDir,
             @"node_modules\electron\dist\electron.exe");
-        string icon = Path.Combine(runDir,
-            @"desktop\assets\pinebox.ico");
+        // #972: THE ICON IS COPIED OUT OF THE RUNNER, and the shortcut
+        // points at the copy. Two reasons, both learned the hard way.
+        //
+        // 1. The runner is mirrored delete-extra on every launch and the
+        //    electron folder is wiped and re-unpacked on a runtime
+        //    change, so an icon addressed inside it is an icon that can
+        //    momentarily not exist - and a shortcut whose icon file is
+        //    missing falls back to the target's own icon, which is
+        //    electron.exe's. That is the Electron atom coming back.
+        //
+        // 2. Windows caches shortcut icons by PATH. The stale pin was
+        //    still painting the Electron atom long after its .lnk had
+        //    been repaired, because the shell had that path's icon
+        //    cached from before. Addressing the icon at a path the cache
+        //    has never seen sidesteps the stale entry entirely, which is
+        //    far less rude than clearing the icon cache under a running
+        //    desktop.
+        //
+        // The version in the name is deliberate: bump it and every
+        // shortcut repaints, with no cache clearing and no logout.
+        string icon = Path.Combine(Path.GetDirectoryName(runDir),
+                                   "pinebox-1.ico");
+        try
+        {
+            string src = Path.Combine(runDir, @"desktop\assets\pinebox.ico");
+            if (File.Exists(src)
+                && (!File.Exists(icon)
+                    || new FileInfo(icon).Length != new FileInfo(src).Length))
+            {
+                File.Copy(src, icon, true);
+            }
+        }
+        catch (Exception) { /* the shortcut still gets written */ }
         string programs = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             @"Microsoft\Windows\Start Menu\Programs");
@@ -175,6 +206,12 @@ static class PineBox
             finally { pv.Dispose(); }
             ((IPersistFile)raw).Save(lnk, true);
             Marshal.FinalReleaseComObject(raw);
+            // #972: nudge the shell so the Start Menu and any pin made
+            // from it repaint now rather than whenever Explorer next
+            // feels like it. SHCNE_ASSOCCHANGED with no path is the
+            // documented "icons may have changed" signal.
+            try { SHChangeNotify(0x08000000, 0x0000, IntPtr.Zero, IntPtr.Zero); }
+            catch (Exception) { }
             Say("Start Menu entry ready — search \"Pine Box\", then "
                 + "right-click it to pin.");
         }
@@ -184,6 +221,10 @@ static class PineBox
                 + ") — the app still launches.");
         }
     }
+
+    [DllImport("shell32.dll")]
+    static extern void SHChangeNotify(int eventId, uint flags, IntPtr item1,
+                                      IntPtr item2);
 
     static void Say(string line)
     {
