@@ -26619,6 +26619,30 @@ def looks_english(text: str) -> bool:
     # language is that it has no foreign glue in it.
     if en == 0 and fr >= 1:
         return False
+    # #936: NOTHING FOREIGN IN IT AT ALL — no letter English does not
+    # use, and no foreign function word anywhere — so there is nothing
+    # to convict on, at any length.
+    #
+    # The rule below used to end the function, and it reads "over
+    # fourteen words with no function word is not English". That is
+    # treating the ABSENCE of English as evidence of another language,
+    # and it is not: it is the absence of evidence. Wordplay does it,
+    # dense rap does it, a long list of titles does it. It refused this,
+    # in the host's own voice, 487 times in one day:
+    #
+    #   "Empty today, rarely entertaining good rhymes. Enterprise time,
+    #    roll economically growing. Extroverted guy round every thick
+    #    red ebony goon, rigid."
+    #
+    # An acrostic — every word picked for its first letter, so not one
+    # of "the, a, and, of, to, is" survives. This station's speakbox is
+    # lyrics and wordplay, so the door was shut on precisely the
+    # material the show is made of.
+    #
+    # Every branch above convicts on something POSITIVE and none of
+    # them is touched. This one asks for evidence before convicting.
+    if not _exotic and fr == 0:
+        return True
     return en / len(words) >= 0.05 or len(words) < 14
 
 

@@ -1970,7 +1970,7 @@ function initWorksPopup() {
         if (r.media && r.sig) {
           const url = desktopMusicUrl(
             "/media/" + encodeURIComponent(r.media)
-            + "?sig=" + encodeURIComponent(r.sig));
+            + "?t=" + encodeURIComponent(r.sig));
           const au = mk("audio", "");
           au.controls = true;
           au.preload = "none";
