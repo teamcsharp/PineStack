@@ -9548,7 +9548,10 @@ def prep_board() -> list[dict[str, Any]]:
                 # written and rendered genuinely differ here.
                 row["written"] = len(ones)
                 row["lines"] = len(ones)
-                row["rendered"] = sum(1 for x in ones if x.get("key"))
+                # #916: a produced spot carries its own finished audio, so
+                # it is RECORDED even though it holds no pantry key.
+                row["rendered"] = sum(1 for x in ones
+                                      if x.get("key") or x.get("produced"))
                 row["ready"] = row["rendered"]
                 row["seconds"] = round(sum(float(x.get("seconds") or 0)
                                            for x in ones), 1)
@@ -17164,6 +17167,58 @@ def _sched_pos_save() -> None:
         pass
 
 
+_SCHED_POS_LOADED = [False]
+
+
+def _sched_pos_restore() -> None:
+    """#915: the saved position, taken up by WHOEVER asks for it first.
+
+    _pantry_load() already restores this — but it is called from
+    dj_start(), and dj_start is NOT the first thing that reads the
+    running order after a restart. The panel polls /api/dj continuously;
+    that calls dialogue_flow_state(), which calls schedule_adherence(),
+    which calls schedule_take(). The coordinator's fifteen-second sample
+    calls it too, and so does schedule_jammed(). Any one of those landing
+    in the few seconds between the port opening and dj_start() finishing
+    finds no position at all, RE-SEATS THE HOUR AT ENTRY ONE, and
+    _sched_pos_save() then writes that over the real one.
+
+    Measured on the live station while investigating #915:
+
+        08:21:51  index 3, "Ad read",        adherence kept=1
+        08:22:51  index 0, "News coverage",  adherence kept=0
+
+    — the ledger reset is a process restart, and the hour went with it.
+    It happened three times inside half an hour on a box under active
+    redeployment. Painting selling is entries 3, 12 and 17 of twenty, and
+    the memos from upstairs are 6 and 18: a sheet that keeps being sent
+    back to the top NEVER REACHES THEM. That is the whole of "during this
+    segment, I did not hear a single painting getting sold" — not a
+    refusing gallery road, not a missing painting, but an hour that kept
+    starting again at the news.
+
+    One shot per process. A deliberate stop still pops sched_pos and
+    still restarts the hour, because that is what stopping means; and a
+    position too stale to catch up still falls through schedule_take's
+    own bounded walk to entry one, exactly as before."""
+    if _SCHED_POS_LOADED[0]:
+        return
+    _SCHED_POS_LOADED[0] = True
+    try:
+        if _RADIO.get("sched_pos"):
+            return
+        pos = json.loads(SCHED_POS_PATH.read_text())
+        if isinstance(pos, dict) and pos.get("preset"):
+            _RADIO["sched_pos"] = pos
+            pipeline_log(
+                "air", "the running order came back from disk at entry "
+                + str(int(pos.get("index") or 0) + 1)
+                + " - the hour is not thrown back to the top every time "
+                "the box is redeployed (#915)")
+    except Exception:  # noqa: BLE001
+        pass                            # no saved hour: start it, as before
+
+
 def _larder_save() -> None:
     try:
         LARDER_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -17701,16 +17756,15 @@ async def prep_render_line(text: str, who: str,
 
 async def prep_ad() -> bool:
     """One advert, written and read into the pantry before the break."""
-    dj = dj_settings()
-    product = ""
+    # #916: the product is DRAWN, not picked off a one-item list. This
+    # road did `random.choice(dj["sponsors"])` seven times in ten, and on
+    # this station `sponsors` holds exactly one string — so the shelf
+    # filled with adverts for the same thing, and the break rotated
+    # between copies of one advert. ad_product_pick() rotates the
+    # sponsors, the wall, the machines on the Spark and the house tat,
+    # and holds the draw against what has actually gone out.
     try:
-        sponsors = [str(s) for s in (dj.get("sponsors") or []) if str(s)]
-        if sponsors and random.random() < 0.7:
-            product = random.choice(sponsors)
-        if not product and dj.get("gallery_ads"):
-            product = gallery_product()
-        if not product and sponsors:
-            product = random.choice(sponsors)
+        product = await ad_product_pick()
     except Exception:  # noqa: BLE001
         product = ""
     if not product:
@@ -17718,8 +17772,15 @@ async def prep_ad() -> bool:
     # No track handed in: a spot prepared now may not air for an hour,
     # and a read built around a record that finished long ago dates
     # itself the moment it goes out.
-    raw = await dj_line("ad", None, extra=product)
-    text = prep_air_text(raw, "ad")
+    # #916b/c: written off a speakbox swath and held against every advert
+    # already on the books. Two attempts, not three — this is the cheap
+    # road that exists to stop dead air, and it must not become the
+    # expensive one. A refusal simply prepares nothing this pass.
+    try:
+        _mk = await ad_write_fresh(product, tries=2)
+    except Exception:  # noqa: BLE001
+        _mk = {}
+    text = str(_mk.get("text") or "")
     if len(text) < 20:
         return False
     made = await prep_render_line(text, "dj")
@@ -17744,7 +17805,10 @@ async def prep_ad() -> bool:
     shelf_put("ad", {"text": text, "product": str(product)[:160], **made})
     pipeline_log("lookahead", "an advert is READY to air - written and read "
                  f"during a record, {made.get('seconds')}s of finished "
-                 "audio waiting (#842)")
+                 "audio waiting, off "
+                 + str((_mk.get("seed") or {}).get("file") or "no document")
+                 + " and checked against every advert already run "
+                 "(#842/#916)")
     return True
 
 
@@ -18537,7 +18601,13 @@ async def pantry_keeper() -> None:
             # into finished audio.
             for _kind, _who in (("ad", "dj"), ("station_id", "drop")):
                 for _row in list(_SHELF.get(_kind) or []):
-                    if _row.get("key") or not str(_row.get("text") or ""):
+                    # #916: a PRODUCED spot has no pantry `key` because its
+                    # audio is a durable mp3 under /ads-audio rather than a
+                    # pantry clip — it is finished, and rendering its script
+                    # as a dry read would spend the engine on something that
+                    # will never be spoken.
+                    if (_row.get("key") or _row.get("produced")
+                            or not str(_row.get("text") or "")):
                         continue    # already made, or nothing to make
                     if pantry_window() != window:
                         break
@@ -18835,6 +18905,64 @@ def sched_result(row: dict[str, Any] | None, aired: bool,
         row["took"] = round(time.time() - float(row.get("at") or 0), 1)
     except Exception:  # noqa: BLE001
         pass
+
+
+# #951: which running-order kinds each independent clock belongs to.
+# A clock fires on brief when the entry on air is one of these.
+CLOCK_HOME = {
+    "caller": ("caller", "banter_caller"),
+    "ad": ("ad", "bombshell"),
+    "news": ("news",),
+    "manager": ("manager",),
+}
+CLOCK_QUIET_FLOOR = 25.0                # silence that outranks the sheet
+_CLOCK_HELD: dict[str, float] = {}      # kind -> when it first deferred
+CLOCK_HOLD_MOST = 900.0                 # never defer longer than this
+
+
+def clock_may_air(kind: str) -> str:
+    """#951: may this independent clock put its content on air NOW?
+
+    Five timers — the phone, the adverts, the bulletin, the memos from
+    upstairs, the sponsor round — were written before the running order
+    existed and never learned to ask about it. So a call went out over
+    the Ad read, which is the operator's complaint word for word.
+
+    They are NOT switched off: they are also the station's oldest
+    guarantee against silence, and the first rule here is that the air
+    is never dead. Returns "" to defer, or the reason it may go."""
+    kind = str(kind or "")
+    try:
+        # Silence outranks everything. Covering the air is the whole job
+        # and a segment heard late is better than a segment heard over
+        # nothing at all.
+        if time.time() - _BOX_LAST_OK[0] > CLOCK_QUIET_FLOOR:
+            _CLOCK_HELD.pop(kind, None)
+            return "the air is quiet"
+        slot = schedule_take()
+        if not slot:
+            _CLOCK_HELD.pop(kind, None)
+            return "no running order"      # nothing to obey
+        on = str(slot.get("kind") or "")
+        if on in (CLOCK_HOME.get(kind) or ()):
+            _CLOCK_HELD.pop(kind, None)
+            return "the sheet is on " + str(slot.get("label") or on)
+        # A clock that has been waiting a very long time goes anyway —
+        # an entry that never comes round must not silence a road for
+        # the rest of the day.
+        since = float(_CLOCK_HELD.get(kind) or 0)
+        if since and time.time() - since > CLOCK_HOLD_MOST:
+            _CLOCK_HELD.pop(kind, None)
+            return "it has waited long enough"
+        if not since:
+            _CLOCK_HELD[kind] = time.time()
+            pipeline_log("air", f"the {kind} clock is holding - the sheet "
+                                f"is on {slot.get('label') or on} and this "
+                                "is not that; it goes when its own entry "
+                                "comes round (#951)")
+    except Exception:  # noqa: BLE001
+        return "the sheet could not be read"
+    return ""
 
 
 def schedule_jammed() -> str:
@@ -19294,6 +19422,103 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
     return plan
 
 
+# --- #916d: the half of the coordinator that ACTS -----------------------
+#
+# "We need to be running ads and produce spots and having those stacked up
+#  in our database so we can run those in between segments during dead
+#  air."
+#
+# The coordinator already MEASURES the dead air and writes a work order
+# about it; until now nothing it knew ever reached the air. This is the
+# other half, and it is deliberately the smallest possible one: when a
+# hole has been open long enough to be a hole rather than a breath, and
+# there is a produced spot already made, play it. It only ever plays audio
+# that ALREADY EXISTS — no model visit, no render, no ffmpeg — so it can
+# never itself become the thing the station is waiting on, which is the
+# failure mode every other gap-filler in radio has.
+COORD_SPOT_AFTER = 25.0         # a hole this long may take a spot
+COORD_SPOT_GAP = 240.0          # and never two inside this
+_COORD_SPOT_AT = [0.0]
+
+
+def coord_spot_ready() -> dict[str, Any] | None:
+    """The produced spot to reach for.
+
+    One off the prepared shelf first — that one has never aired, and a
+    spot nobody has heard beats a fourth airing of one they have. Failing
+    that, the least-run stored spot whose audio is still on disk, which is
+    exactly ad_pick()'s rule narrowed to spots that can be PLAYED."""
+    try:
+        for row in list(_SHELF.get("ad") or []):
+            made = str(row.get("produced") or "")
+            if not made:
+                continue
+            entry = next((r for r in ad_list() if r.get("id") == made), None)
+            if entry and entry.get("audio") and (
+                    PRODUCED_ADS_DIR / str(entry["audio"])).is_file():
+                # Taken off the shelf by IDENTITY, like shelf_take (#926).
+                _SHELF["ad"] = [r for r in (_SHELF.get("ad") or [])
+                                if r is not row]
+                return entry
+        pool = [r for r in ad_list()
+                if r.get("audio")
+                and (PRODUCED_ADS_DIR / str(r["audio"])).is_file()]
+        if not pool:
+            return None
+        fewest = min(int(r.get("uses") or 0) for r in pool)
+        return random.choice([r for r in pool
+                              if int(r.get("uses") or 0) == fewest])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def coord_fill_gap() -> bool:
+    """Put a stacked spot into a hole in the air (#916d).
+
+    Conservative on purpose. It refuses while anybody is speaking, while
+    anything is rendering, while an advert is already running, and inside
+    COORD_SPOT_GAP of the last one it ran — so the worst it can do is one
+    commercial every four minutes on a station that is otherwise silent,
+    which is what a station that is otherwise silent should be doing. It
+    stamps _RADIO['last_ad'], which is the same clock ad_clock() and the
+    record loop read, so it can never double up with them either."""
+    try:
+        if not _RADIO.get("on"):
+            return False
+        gap = float(_GAP_OPEN.get("seconds") or 0)
+        if gap < COORD_SPOT_AFTER:
+            return False                # a breath, not a hole
+        if time.time() - _COORD_SPOT_AT[0] < COORD_SPOT_GAP:
+            return False
+        if _SPEAKING[0] or time.time() - _LAST_SYNTH[0] < 12.0:
+            return False                # somebody is talking, or about to
+        if _BOX_HOLD:
+            return False                # the box is already behind
+        _running = _RADIO.get("ad_now") or {}
+        if _running and time.time() - float(_running.get("at") or 0) < 120:
+            return False                # an advert is on air this minute
+        entry = coord_spot_ready()
+        if not entry:
+            return False                # nothing made; the desk is thin
+        _COORD_SPOT_AT[0] = time.time()
+        _RADIO["last_ad"] = time.time()
+        pipeline_log(
+            "air", "the coordinator reached for a produced spot - "
+            + str(int(gap)) + "s of dead air"
+            + (" in " + str(_GAP_OPEN.get("label") or "")
+               if _GAP_OPEN.get("label") else "")
+            + ", and one was stacked and ready to run (#916)")
+        await _air_produced_ad(entry)
+        try:
+            ad_update(str(entry.get("id") or ""),
+                      uses=int(entry.get("uses") or 0) + 1)
+        except Exception:  # noqa: BLE001
+            pass
+        return True
+    except Exception:  # noqa: BLE001
+        return False                    # a filler never takes the air down
+
+
 def coord_order() -> list[str]:
     """The roads the coordinator wants worked, in its order."""
     try:
@@ -19343,6 +19568,13 @@ async def coordinator() -> None:
         await asyncio.sleep(COORD_TICK)
         try:
             coord_air_sample()
+            # #916d: and the moment a hole is measured, something already
+            # made goes into it. Measuring dead air and doing nothing
+            # about it is a report, not a coordinator.
+            try:
+                await coord_fill_gap()
+            except Exception:  # noqa: BLE001
+                pass
             here = _half_key()
             if here != seen:
                 report = coord_close_half(seen)
@@ -20131,6 +20363,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(speakbox_index_clock()))
     _RADIO_TASK.append(asyncio.create_task(heat_clock()))
     _RADIO_TASK.append(asyncio.create_task(mx_ad_clock()))
+    _RADIO_TASK.append(asyncio.create_task(ad_studio_clock()))      # #916
     _RADIO_TASK.append(asyncio.create_task(dead_air_watch()))
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
@@ -21217,8 +21450,12 @@ def ad_update(ad_id: str, **fields: Any) -> dict[str, Any] | None:
         for row in rows:
             if row.get("id") == ad_id:
                 for key, value in fields.items():
+                    # #916c: seed_file/seed_text/seed_mind are the speakbox
+                    # document a stacked spot was written off, kept ON the
+                    # entry so the credit can be paid when it finally airs
+                    # — which may be an hour after it was cut.
                     if key in ("product", "text", "kind", "audio", "voice",
-                               "bed"):
+                               "bed", "seed_file", "seed_text", "seed_mind"):
                         row[key] = str(value)[:1200]
                     elif key == "uses":
                         row["uses"] = int(value)
@@ -21247,6 +21484,441 @@ def ad_pick() -> dict[str, Any] | None:
         return None
     fewest = min(r.get("uses", 0) for r in rows)
     return random.choice([r for r in rows if r.get("uses", 0) == fewest])
+
+
+# --- #916: THE ADS DESK -----------------------------------------------
+#
+# "Every hour I want to see produced ads being created that are being ran
+#  on the station that are varied and unique compared to the previous ads
+#  ... I want you to make sure that they do not have the same dialogue as
+#  the previous ads and I want them to be using random rhetoric out of the
+#  speaker box to make these ads unique ... stacked up in our database so
+#  we can run those in between segments during dead air."
+#
+# WHAT WAS ACTUALLY WRONG, measured on the live station before this:
+#
+#   * NO SPOT HAD BEEN PRODUCED IN FIFTY-THREE HOURS. The book held 20
+#     produced spots, eighteen of them cut on 14-16 August. ad_clock()
+#     only ever built one while `banked < 12`, and `banked` counts every
+#     produced spot ever kept — so the moment the shelf passed twelve the
+#     road closed for good and the station has been rerunning a
+#     fortnight-old cupboard ever since. mx_ad_clock(), the other
+#     producing road, sleeps its whole interval BEFORE its first spot, so
+#     on a station redeployed more often than every two hours it has never
+#     once fired.
+#   * THE SAME PRODUCT, OVER AND OVER. `sponsors` holds ONE string on this
+#     station and every road reached for it with random.choice() — seven
+#     consecutive adverts in six hours sold the identical thing. A
+#     one-item list is not a rotation.
+#   * NO ANTI-REPEAT AT ALL. Audited: rerun_check() EXEMPTS kind="ad" by
+#     name, and the check itself lives in speak_turns, which only
+#     conversational rounds pass through. dj_ad's read goes out through
+#     dj_speak, which has nothing but the ten-line _RECENT_SPOKEN
+#     goldfish; dj_music_ad() and ad_produce() never touch dj_speak at
+#     all, so a bedded or produced spot was never written into
+#     said_lines.json, line_prints.json or phrase_prints.json — invisible
+#     to every gate in the building AND to avoid_reruns(), which is how
+#     near-identical adverts kept being written with nothing contesting
+#     them.
+#   * NO SPEAKBOX. dj_line() only draws a swath when it is handed a `seed`
+#     dict. dj_ad passes one (through dj_speak); dj_music_ad, ad_produce
+#     and prep_ad all passed None — so the PRODUCED spots, the ones this
+#     request is about, were written off nothing but the product name.
+#
+# Everything below is defensive: every road falls through to exactly the
+# behaviour that shipped before it, and nothing here may take the air.
+
+AD_REPEAT_JACCARD = 0.50        # an advert is a whole read, not one line
+AD_REPEAT_CONTAIN = 0.70
+# The whole book. _ads_write() already holds it to about two hundred
+# rows, so "the last 200 adverts" and "every advert we still have" are
+# the same list — and the operator said PREVIOUS ADS, not recent ones.
+AD_REPEAT_AGAINST = 200
+ADS_PER_HOUR = 2                # produced spots BUILT every hour (#916a)
+AD_STUDIO_TICK = 300.0          # how often the desk looks at the hour
+AD_STUDIO_TRIES = 3             # rewrites before an advert is given up on
+AD_HOUSE_TAT = (
+    "the Pine Box FM commemorative lighthouse plate",
+    "a Pine Box FM enamel mug, dishwasher hostile",
+    "the Pine Box FM weather rock, guaranteed accurate",
+    "a signed photograph of the transmitter",
+    "the Pine Box FM lifetime membership card, laminated by hand",
+)
+
+
+def ad_shingle_book(most: int = AD_REPEAT_AGAINST):
+    """The 4-word runs of the adverts already on the books.
+
+    The ad book IS the record of previous adverts, which is where the
+    operator asked the comparison to be made — not against the hosts'
+    banter, which an advert is allowed to sound nothing like."""
+    out: list[tuple[str, set[str]]] = []
+    try:
+        rows = sorted(ad_list(), key=lambda r: r.get("ts") or 0)[-most:]
+        for row in rows:
+            text = str(row.get("text") or "")
+            if len(text) < 25:
+                continue
+            out.append((str(row.get("id") or ""), _shingles(text)))
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def ad_repeat_check(text: str, phrases: bool = True) -> dict[str, Any]:
+    """Has this advert already been run? (#916b)
+
+    The same shingles and the same two legs rerun_check() uses — a
+    Jaccard overlap and a containment test — run over the ad book rather
+    than the line ledger, plus the station-wide hour cooldown so an
+    advert may not lean on a turn of phrase the hosts used ten minutes
+    ago either. `phrases=False` drops that last leg, which is what the
+    final rewrite attempt uses: repetition is a bad show, silence is no
+    show, and an advert refused for ever is silence."""
+    verdict: dict[str, Any] = {"block": False, "why": "", "hit": ""}
+    try:
+        mine = _shingles(text)
+        if len(mine) < 4:
+            return verdict
+        for ad_id, theirs in ad_shingle_book():
+            if not theirs:
+                continue
+            overlap = len(mine & theirs)
+            if not overlap:
+                continue
+            union = len(mine | theirs)
+            if union and overlap / union >= AD_REPEAT_JACCARD:
+                verdict.update({
+                    "block": True, "hit": ad_id,
+                    "why": "it is near-identical to an advert already run"})
+                return verdict
+            small = min(len(mine), len(theirs))
+            if small >= 6 and overlap / small >= AD_REPEAT_CONTAIN:
+                verdict.update({
+                    "block": True, "hit": ad_id,
+                    "why": "it contains an earlier advert whole"})
+                return verdict
+        if phrases:
+            hot = phrase_check(text, "dj")
+            if hot.get("block"):
+                verdict.update({"block": True,
+                                "why": str(hot.get("why") or "")})
+    except Exception:  # noqa: BLE001
+        return {"block": False, "why": "", "hit": ""}
+    return verdict
+
+
+def ad_remember(text: str, also_said: bool = True) -> None:
+    """An advert that AIRED goes into the same books every other spoken
+    line goes into (#916b).
+
+    dj_speak does said_remember() for a dry read and nothing else; the
+    bedded and produced roads never went near any of it. Without this the
+    pair genuinely cannot remember their own adverts, which is the whole
+    of "they do not have the same dialogue as the previous ads"."""
+    try:
+        line = " ".join(str(text or "").split())
+        if len(line) < 20:
+            return                      # a label, not a read
+        if also_said:
+            said_remember(line)         # feeds avoid_reruns() in the prompt
+        print_remember(line, "dj", "ad")
+        phrase_remember(line, "dj")
+    except Exception:  # noqa: BLE001
+        pass                            # a forgetful desk still sells
+
+
+def ad_avoid_note(most: int = 6) -> str:
+    """The recent adverts, handed to the writer as a DO-NOT list (#916b).
+
+    avoid_reruns() carries what the pair have SAID; two of the three ad
+    roads never went through dj_speak, so the adverts were never in it.
+    This is the same idea aimed at the ad book itself."""
+    try:
+        rows = sorted(ad_list(), key=lambda r: r.get("ts") or 0)[-most:]
+        lines = [" ".join(str(r.get("text") or "").split())[:130]
+                 for r in rows if len(str(r.get("text") or "")) > 25]
+        if not lines:
+            return ""
+        return ("\n\nTHESE ADVERTS HAVE ALREADY RUN ON THIS STATION. Yours "
+                "must not resemble any of them — not the opening, not the "
+                "shape, not the jokes, not the sign-off. Sell it a "
+                "completely different way, from a completely different "
+                "angle:\n- " + "\n- ".join(lines))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def ad_recent_products(hours: float = 3.0) -> list[str]:
+    """What the station has actually been selling lately — off the
+    AIRINGS ledger, which is the only thing that knows what went out as
+    opposed to what was written."""
+    try:
+        cut = time.time() - max(0.25, hours) * 3600.0
+        return [" ".join(str(r.get("product") or "").split()).lower()[:80]
+                for r in ad_airings() if float(r.get("ts") or 0) >= cut]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def ad_product_one(road: str) -> str:
+    """One product off one road. "" means that road has nothing today."""
+    dj = dj_settings()
+    try:
+        if road == "sponsor":
+            pool = [str(s) for s in (dj.get("sponsors") or []) if str(s)]
+            return unrepeated(pool, "ad-sponsor",
+                              keep=max(0, min(4, len(pool) - 1))) if pool \
+                else ""
+        if road == "gallery":
+            if not dj.get("gallery_ads"):
+                return ""
+            # A painting SEEN, where the vision model will answer — this
+            # runs off air, so it can afford the look the live break
+            # cannot. #915: "I did not hear a single painting getting
+            # sold", and a produced spot about an actual canvas is the
+            # cheapest way to make sure one gets sold every hour whatever
+            # the gallery round is doing.
+            try:
+                name, desc = await asyncio.wait_for(
+                    describe_gallery_image(), 120)
+            except Exception:  # noqa: BLE001
+                name, desc = "", ""
+            if desc:
+                price = random.randint(dj["ad_price_low"], dj["ad_price_high"])
+                return (f'the original painting "{name}" — in it: {desc} — '
+                        f"from the Pine Box gallery, {price} dollars, first "
+                        "caller takes it")
+            return gallery_product()
+        if road == "service":
+            svc = unrepeated(list(SPONSOR_SERVICES), "ad-service")
+            facts = await service_sponsor_facts(svc)
+            return (f"{svc.upper()}, one of the live services running on "
+                    "this station's own DGX Spark — "
+                    + ("; ".join(facts[:2]) if facts
+                       else "its live numbers a trade secret tonight")
+                    + ", sold like a luxury product")
+        if road == "house":
+            return unrepeated(list(AD_HOUSE_TAT), "ad-house")
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+async def ad_product_pick() -> str:
+    """WHAT the next advert sells (#916).
+
+    Four roads, drawn without immediate repeats, and whatever comes back
+    is then held against what has ACTUALLY gone out in the last three
+    hours — so the same product cannot come round twice while another one
+    is willing. This is the fix for the seven-identical-adverts-in-six-
+    hours measurement: `sponsors` holds one string, and one string is not
+    a rotation. The station can sell the wall, the machines it runs on
+    and its own tat as well, and now it does."""
+    recent = ad_recent_products()
+    roads = ["sponsor", "gallery", "service", "house"]
+    first = unrepeated(list(roads), "ad-road", keep=2)
+    order = [first] + [r for r in roads if r != first]
+    fallback = ""
+    for road in order:
+        try:
+            product = (await ad_product_one(road)).strip()
+        except Exception:  # noqa: BLE001
+            product = ""
+        if not product:
+            continue
+        fallback = fallback or product
+        key = " ".join(product.split()).lower()[:80]
+        if key not in recent:
+            return product
+    # Everything on the board has been sold in the last three hours.
+    # Selling one of them again beats selling nothing.
+    return fallback
+
+
+async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
+                         ) -> dict[str, Any]:
+    """Write ONE advert that is not any of the previous adverts (#916b/c).
+
+    (c) is the `direct` channel: dj_line() only draws a speakbox swath
+    when it is handed a `seed` dict to fill, and it draws one on a ROLL
+    even then. Here the swath is drawn outright, for every single
+    advert, and a FRESH one is drawn for each rewrite — so a second
+    attempt is written off different material rather than off the same
+    material said differently. The document is credited at air time, not
+    here, exactly as a banter round credits its swath.
+
+    Returns {"text", "product", "seed"} or {} — and every caller of this
+    falls through to the road it has always had when it comes back
+    empty, so a refused advert is never dead air."""
+    out: dict[str, Any] = {}
+    for attempt in range(max(1, int(tries))):
+        seed: dict[str, Any] = {}
+        try:
+            seed = await speakbox_quote(most=5, cap=420) or {}
+        except Exception:  # noqa: BLE001
+            seed = {}
+        direct = ""
+        if seed.get("text"):
+            direct += speakbox_aside(seed, pair=False)
+        direct += ad_avoid_note()
+        try:
+            raw = await dj_line("ad", None, extra=product, direct=direct)
+        except Exception:  # noqa: BLE001
+            raw = ""
+        text = prep_air_text(raw, "ad")
+        if len(text) < 40:
+            continue
+        # The last attempt drops the station-wide phrase leg — see
+        # ad_repeat_check(). The ad-book legs never stand down.
+        verdict = ad_repeat_check(text, phrases=attempt < tries - 1)
+        if not verdict.get("block"):
+            return {"text": text, "product": product, "seed": seed}
+        out = {}
+        pipeline_log(
+            "drop", "an advert repeated an earlier advert - "
+            + str(verdict.get("why") or "") + " - rewriting it off a fresh "
+            "swath (#916)", extra=text[:400])
+    return out
+
+
+def ads_produced_since(seconds: float = 3600.0) -> int:
+    """How many PRODUCED spots have actually been cut in the window.
+
+    #916a asks for produced spots "every hour", which is a question about
+    the last hour and not about how many are in the cupboard. The old
+    gate asked the second question (`banked < 12`) and therefore closed
+    itself permanently the moment the cupboard filled."""
+    try:
+        cut = time.time() - max(60.0, seconds)
+        return sum(1 for r in ad_list()
+                   if r.get("audio") and float(r.get("ts") or 0) >= cut)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def ad_shelf_produced() -> int:
+    """Produced spots standing on the prepared shelf, unaired."""
+    try:
+        return sum(1 for r in (_SHELF.get("ad") or []) if r.get("produced"))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def ad_studio_build() -> bool:
+    """Cut ONE produced spot and stack it, without airing it (#916a/d).
+
+    A real advert: a read written off a speakbox swath for a product
+    nothing has sold recently, vocoded, mixed over a record with a sting
+    punched into the swell, stored as a durable mp3 and put on the SAME
+    shelf dj_ad_break() already shops — so the next break, or the next
+    hole in the air, costs the station nothing at all."""
+    product = await ad_product_pick()
+    if not product:
+        return False                    # nothing is being sold tonight
+    if prep_should_stop():
+        return False                    # the live road wants the room
+    written = await ad_write_fresh(product)
+    text = str(written.get("text") or "")
+    if not text:
+        return False                    # every attempt repeated; try later
+    # #904's rule, applied here: the WRITE is already paid for. If the
+    # engine will not have us now, the words go on the shelf as a plain
+    # read rather than being thrown away, and the break can still take
+    # them; the produced cut comes on a later pass.
+    if prep_should_stop() or not engine_prep_take():
+        try:
+            shelf_put("ad", {"text": text,
+                             "product": str(product)[:160],
+                             "seconds": 0.0})
+            pipeline_log("lookahead", "the ads desk has WRITTEN a spot and "
+                         "the engine is busy - the words are shelved and "
+                         "the cut comes on a later pass (#904/#916)")
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+    try:
+        made = await ad_produce(product, text, "", "", remember=True,
+                                air=False)
+    finally:
+        engine_prep_give()
+    if made.get("error"):
+        pipeline_log("drop", "the ads desk could not cut a spot - "
+                     + str(made.get("error"))[:140] + " (#916)")
+        return False
+    seed = written.get("seed") or {}
+    # The document rides ON the entry, so the credit lands at the moment
+    # the spot actually airs — which may be an hour from now.
+    try:
+        if seed.get("file"):
+            ad_update(str(made.get("id") or ""),
+                      seed_file=str(seed.get("file") or ""),
+                      seed_text=str(seed.get("text") or "")[:1200],
+                      seed_mind=str(seed.get("mind") or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        shelf_put("ad", {
+            "produced": str(made.get("id") or ""),
+            "product": str(product)[:160],
+            "text": text,
+            "audio": str(made.get("audio") or ""),
+            "seconds": float(made.get("seconds") or 0.0),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+    pipeline_log(
+        "lookahead",
+        "a PRODUCED spot is stacked and ready to run - "
+        + str(product)[:70]
+        + (", bedded on " + str(made.get("bed") or "")[:40]
+           if made.get("bed") else ", dry")
+        + ", " + str(int(float(made.get("seconds") or 0))) + "s of finished "
+        "audio, written off "
+        + (str(seed.get("file") or "the documents") if seed else "no document")
+        + " and checked against every advert already run (#916)",
+        extra=text[:900])
+    return True
+
+
+async def ad_studio_clock() -> None:
+    """#916a: THE ADS DESK, ON THE HOUR.
+
+    Its own clock, deliberately, because the two roads that used to
+    produce spots both answer to something else: ad_clock() stands down
+    whenever any other road has run an advert recently (which on a
+    station with Ad read entries on the sheet is nearly always), and
+    mx_ad_clock() only ever cuts an MX-bedded one. This one asks a single
+    question — have ADS_PER_HOUR spots been CUT in the last hour — and if
+    not, cuts one. It never airs anything: everything it makes goes on
+    the shelf for the break, the gap, or the operator to reach for.
+
+    Yields to the live show at every turn: a busy writer, a speaking
+    booth or an engine with no spare slot all mean "come back later",
+    because a desk that makes the station late is worse than a thin
+    cupboard."""
+    first = True
+    while _RADIO.get("on"):
+        await asyncio.sleep(45.0 if first else AD_STUDIO_TICK)
+        first = False
+        try:
+            if not _RADIO.get("on"):
+                continue
+            made = ads_produced_since(3600.0)
+            if made >= ADS_PER_HOUR:
+                continue                # the hour has its spots
+            if shelf_full("ad") or ad_shelf_produced() >= ADS_PER_HOUR:
+                continue                # stacked deep enough already
+            if _SPEAKING[0] or _OLLAMA_GATE.locked():
+                continue                # the live show owns the writer
+            if prep_should_stop():
+                continue                # the engine is full, or in relief
+            await ad_studio_build()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"the ads desk faulted: {exc}"[:180],
+                         extra=traceback.format_exc()[-1200:])
 
 
 def gallery_product() -> str:
@@ -21645,24 +22317,40 @@ async def mx_ad_clock() -> None:
     air — 'he's a nameless guy who inundates us with envelopes, what can he
     do' — and now and then a cease-and-desist from Ehm Eckx's lawyers
     arrives, which shocks them and changes nothing."""
+    _first = True
     while _RADIO.get("on"):
         hours = float(dj_settings().get("mx_ad_hours") or 0)
         if not hours:
             await asyncio.sleep(600)      # off — check back in later
             continue
         try:
-            await asyncio.sleep(hours * 3600)
+            # #916: THE FIRST ONE COMES EARLY. This slept the whole
+            # interval before its first spot, and the interval on this
+            # station is two hours — so on a box that is redeployed more
+            # often than that (which this one is, constantly) the road
+            # never fired at all. Measured: mx_ad_hours at 2.0 and not one
+            # MX-bedded spot cut in fifty-three hours. Every other clock
+            # in this file already opens a fresh show early; this one
+            # never learned to.
+            await asyncio.sleep(min(300.0, hours * 3600.0) if _first
+                                else hours * 3600.0)
         except asyncio.CancelledError:
             break
+        _first = False
         if not _RADIO.get("on"):
             break
         try:
-            dj = dj_settings()
-            product = ((random.choice(dj["sponsors"]) if dj.get("sponsors")
-                        else "") or gallery_product()
+            # #916: the same rotation every other ad road uses now — the
+            # sponsors, the wall, the machines and the house tat — rather
+            # than random.choice() over a one-item list.
+            product = (await ad_product_pick()
                        or "the Pine Box FM commemorative lighthouse plate")
             made = await ad_produce(product, "", "", "mx", air=True)
             if made.get("error"):
+                # #916: a silent `continue` is how a producing road can be
+                # dead for two days without anybody knowing. Say it.
+                pipeline_log("drop", "the MX-tape spot could not be cut - "
+                             + str(made.get("error"))[:140] + " (#916)")
                 continue
             pipeline_log("air", "MX-tape ad aired — "
                                 + str(made.get("bed") or "")[:80])
@@ -22751,6 +23439,12 @@ def schedule_take() -> dict[str, Any]:
     the whole thing is wrapped: anything at all going wrong returns {} and
     the torrent falls straight back to its own draw."""
     try:
+        # #915: take the saved hour up BEFORE anything is decided. This
+        # function is read by the panel poll and the coordinator as well
+        # as by the show, and whichever of them arrives first after a
+        # restart used to re-seat the hour at entry one and persist it.
+        if not _RADIO.get("sched_pos"):
+            _sched_pos_restore()
         store = schedule_read()
         if not store.get("enabled", True):
             _RADIO.pop("sched_pos", None)
@@ -27120,6 +27814,9 @@ async def upstairs_clock() -> None:
             return
         if float(dj_settings().get("upstairs_per_hour") or 0) <= 0:
             continue
+        # #951: upstairs rings during the memo entry, not over a call.
+        if not clock_may_air("manager"):
+            continue
         try:
             await dj_upstairs_page()
         except Exception as exc:            # noqa: BLE001
@@ -27674,7 +28371,20 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     clip. Any failure falls back to a plain read so an ad always airs."""
     ad_now_set(product)                                   # #900
     _ad_at = time.time()                                          # #892
-    line = spoken_text(await dj_line("ad", _RADIO.get("now"), extra=product))
+    # #916b/c: THE BEDDED SPOT WAS WRITTEN OFF NOTHING AND REMEMBERED BY
+    # NOBODY. dj_line draws a speakbox swath only when it is handed a
+    # `seed` dict; this road passed none, so the spot that sounds most
+    # like a real commercial was the one with the least material behind
+    # it. ad_write_fresh() draws the swath outright and holds the result
+    # against every advert already on the books; a refusal falls straight
+    # back to the plain write this road has always had.
+    _mk: dict[str, Any] = {}
+    try:
+        _mk = await ad_write_fresh(product, tries=2)
+    except Exception:  # noqa: BLE001
+        _mk = {}
+    line = spoken_text(str(_mk.get("text") or "")) or spoken_text(
+        await dj_line("ad", _RADIO.get("now"), extra=product))
     if not line:
         return {"ad": "", "product": product, "id": ""}
     forced = (await session_voices()).get("dj") or None
@@ -27760,6 +28470,18 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
                  _RADIO.get("voice_to") or "box")                  # #743
     except Exception:  # noqa: BLE001
         pass
+    # #916b: it went out, so the books get it — said_lines for the prompt's
+    # do-not-reuse list, line_prints and phrase_prints for the gates. This
+    # road never went through dj_speak, so none of that had ever happened
+    # for a bedded spot and the next one had nothing to avoid.
+    ad_remember(line)
+    # ...and the document it was built from is credited now that it has
+    # actually aired, the same way a banter round credits its swath.
+    try:
+        if (_mk.get("seed") or {}).get("text"):
+            speakbox_remember(_mk["seed"])
+    except Exception:  # noqa: BLE001
+        pass
     return {"ad": line, "product": product, "id": (entry or {}).get("id", "")}
 
 
@@ -27779,6 +28501,29 @@ async def dj_ad_break() -> str:
         _prep_ad = shelf_take("ad")
     except Exception:  # noqa: BLE001
         _prep_ad = None
+    # #916a: a PRODUCED spot off the shelf — finished audio with its bed,
+    # its vocode and its sting already mixed in. It is PLAYED, not read:
+    # handing its script to dj_ad() would have the host recite a
+    # commercial that already exists as a file, which is both a wasted
+    # render and the wrong sound. The row carries the id of the entry in
+    # the ad book; a spot whose audio has been swept falls through to the
+    # ordinary road below.
+    if _prep_ad and str(_prep_ad.get("produced") or ""):
+        try:
+            _made = next((r for r in ad_list()
+                          if r.get("id") == str(_prep_ad.get("produced"))),
+                         None)
+            if _made and _made.get("audio"):
+                await _air_produced_ad(_made)
+                ad_update(str(_made.get("id") or ""),
+                          uses=int(_made.get("uses") or 0) + 1)
+                pipeline_log("air", "the break took a PRODUCED spot off the "
+                             "shelf - it was written, voiced and mixed "
+                             "during an earlier record and cost this break "
+                             "nothing at all (#916)")
+                return str(_made.get("text") or "")
+        except Exception:  # noqa: BLE001
+            pass                       # fall through to the read below
     if _prep_ad and str(_prep_ad.get("text") or ""):
         try:
             _prep_said = (await dj_ad(
@@ -27944,6 +28689,25 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
                  aired="box" if ad_to in ("box", "both") else "page",
                  air_at=_air_at)
     ad_aired(entry, "box" if ad_to in ("box", "both") else "page")   # #743
+    # #916b: EVERY road that airs a produced spot funnels through here, so
+    # this is the one place worth remembering it from. A produced spot
+    # never touched dj_speak, so its words were invisible to
+    # said_lines.json, line_prints.json and phrase_prints.json — and
+    # therefore to avoid_reruns(), which is what the writer is shown when
+    # it sits down to write the next one. `also_said` is on: the read is
+    # the pair's own speech even though a file played it.
+    ad_remember(str(entry.get("text") or ""))
+    # The speakbox document a stacked spot was written off is credited at
+    # the moment it airs rather than at the moment it was cut, so a swath
+    # sitting unheard on the shelf is not retired early (#916c).
+    try:
+        if entry.get("seed_file") and entry.get("seed_text"):
+            speakbox_remember({"file": str(entry.get("seed_file") or ""),
+                               "text": str(entry.get("seed_text") or ""),
+                               "lines": [str(entry.get("seed_text") or "")],
+                               "mind": str(entry.get("seed_mind") or "")})
+    except Exception:  # noqa: BLE001
+        pass
 
 
 async def ad_produce(product: str, script: str, voice: str,
@@ -27958,8 +28722,22 @@ async def ad_produce(product: str, script: str, voice: str,
     saved with its finished audio so the DJs can rerun it between tracks, after
     calls and on commercial breaks. Falls back gracefully at each step so it
     never breaks the show."""
-    line = spoken_text(script) if script.strip() else spoken_text(
-        await dj_line("ad", _RADIO.get("now"), extra=product))
+    # #916c: a read WRITTEN HERE is written off the documents. This
+    # passed no `seed` to dj_line, and dj_line only draws a swath when it
+    # is handed one — so every hand-produced spot with no script was
+    # built out of nothing but the product name. The swath rides the
+    # `direct` channel (the same one the performance directive uses) so
+    # the task itself is untouched, and the do-not-repeat list of adverts
+    # already run rides with it.
+    _mk: dict[str, Any] = {}
+    if not script.strip():
+        try:
+            _mk = await ad_write_fresh(product, tries=2)
+        except Exception:  # noqa: BLE001
+            _mk = {}
+    line = spoken_text(script) if script.strip() else (
+        spoken_text(str(_mk.get("text") or ""))
+        or spoken_text(await dj_line("ad", _RADIO.get("now"), extra=product)))
     if not line:
         return {"error": "Nothing to say — give a prompt or a script."}
     v = voice or (await session_voices()).get("dj") or ""
@@ -28053,9 +28831,22 @@ async def ad_produce(product: str, script: str, voice: str,
         return {"error": "Could not store the ad audio."}
     ad_update(entry["id"], audio=name, voice=v, bed=bed_title)
     entry.update({"audio": name, "voice": v, "bed": bed_title})
+    # #916: how long the finished spot actually RUNS. A stacked spot is
+    # shelved material like any other, and hour_needs() adds shelves up in
+    # seconds — a produced spot with no length on it reads to the
+    # coordinator as nothing at all, so the ad road would go on being
+    # called bare with a cupboard full of finished audio in it. Measured
+    # in a thread; a failure is 0.0 and costs nothing but the arithmetic.
+    _secs = 0.0
+    try:
+        _secs = float(await asyncio.to_thread(
+            sfx_seconds, PRODUCED_ADS_DIR / name) or 0.0)
+    except Exception:  # noqa: BLE001
+        _secs = 0.0
     if air:
         await _air_produced_ad(entry)
     return {"id": entry["id"], "text": line, "bed": bed_title,
+            "audio": name, "seconds": round(_secs, 1),
             "url": f"/ads-audio/{name}?t={media_sign(name)}"}
 
 
@@ -34891,6 +35682,10 @@ async def news_clock() -> None:
         await asyncio.sleep(max(30.0, wait))
         if not (_RADIO.get("on") and dj_settings()["news_hourly"]):
             continue
+        # #951: the bulletin belongs to the news entry. It waits for it,
+        # and goes anyway if the air is quiet or the entry never comes.
+        if not clock_may_air("news"):
+            continue
         try:
             await dj_news(hourly=True)
         except Exception:
@@ -38644,6 +39439,9 @@ async def ad_clock() -> None:
         # house engineering report, sometimes a running DGX service sold as
         # tonight's sponsor, mostly a product read — so the clock also sells
         # the systems on the Spark, not only gallery pieces.
+        # #951: an advert goes in an advert's slot, or into silence.
+        if not clock_may_air("ad"):
+            continue
         _RADIO["last_ad"] = time.time()
         try:
             roll = random.random()
@@ -38652,16 +39450,23 @@ async def ad_clock() -> None:
                 await dj_engineering_ad()
             elif roll < 0.22:
                 await dj_service_ad()
-            elif banked < 12 and _music_bed_track() is not None:
+            elif (ads_produced_since(3600.0) < ADS_PER_HOUR
+                    and _music_bed_track() is not None):
                 # Build the shelf (#643): a spot written for a product,
                 # rendered over a real record with a sting punched in, and
                 # KEPT — that is what a commercial break is made of, and
                 # what lets the station rerun itself without repeating.
-                dj = dj_settings()
-                product = ((random.choice(dj["sponsors"])
-                            if dj.get("sponsors") else "")
-                           or gallery_product()
-                           or "the Pine Box FM commemorative lighthouse plate")
+                #
+                # #916: this used to read `banked < 12`, and `banked` is
+                # every produced spot ever kept — so once the cupboard
+                # passed twelve the road CLOSED FOR GOOD. Measured on the
+                # live station: twenty produced spots in the book, the
+                # newest of them fifty-three hours old, and this branch
+                # unreachable for the whole of that time. The question the
+                # operator asked is about the HOUR — "every hour I want to
+                # see produced ads being created" — so that is the
+                # question asked here now.
+                product = await ad_product_pick()
                 made = await ad_produce(product, "", "", "", remember=True,
                                         air=True)
                 if made.get("error"):
@@ -38695,6 +39500,11 @@ async def caller_clock() -> None:
         if time.time() < float(_RADIO.get("call_cooldown") or 0):
             continue                   # a pressed skip holds the phones (#394)
         if _RADIO.get("on") and dj_settings()["callin_per_hour"]:
+            # #951: not over the Ad read. The phone goes when the sheet
+            # is on a call, or when the air has gone quiet — see the
+            # note on clock_may_air.
+            if not clock_may_air("caller"):
+                continue
             try:
                 await dj_call_generated()
             except Exception as exc:
