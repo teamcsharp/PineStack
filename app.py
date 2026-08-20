@@ -17892,9 +17892,50 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             # applies role pinning and the cast lock, which can name a
             # different engine and silently miss every key we store.
             engine = voice_engine_for(voice)
+            # #978: RELIEF STANDS THE ROOM DOWN. pantry_window() returns
+            # a truthy string under relief ("the engine is in relief -
+            # writing only"), and larder_prepare never asked - only
+            # prep_render_line did. Until now the stale-window comparison
+            # below was accidentally braking this; fixing that removes the
+            # brake, so the guard has to be real or relief would
+            # manufacture hours of clone audio keyed to an engine the air
+            # road will not re-derive once relief releases.
+            #
+            # break, not continue: under relief the whole sitting is
+            # unproductive. The words are already kept - #904's road comes
+            # back and gives them a voice.
+            if render_relief() and engine in ("xtts", "f5"):
+                break
             key = pantry_key(text, voice, engine)
             got = pantry_get(key)
             if got:
+                # #978: A HIT IS A TAKE. This advanced `made` and wrote
+                # down nothing else, so a line the round is genuinely
+                # depending on left no trace on the entry: not in `keys`,
+                # not in `takes`. pantry_spoken_for()/_row_clip_keys()
+                # therefore read the clip as LOOSE, prepared_seconds()
+                # under-counted it, and the oldest-first shedding at
+                # PANTRY_MAX was free to throw it away WHILE the round
+                # that needed it was still being cut. Measured live: 250
+                # of 400 listed pantry rows loose.
+                #
+                # It matters more the better the shelf gets — every hit is
+                # a line some other round already paid for — so it is
+                # fixed before anything that increases the hit rate.
+                # Same de-dup guards as the fresh path below.
+                try:
+                    _held = entry.setdefault("keys", [])
+                    if key not in _held:
+                        _held.append(key)
+                    _takes = entry.setdefault("takes", [])
+                    if not any(t.get("key") == key for t in _takes):
+                        _takes.append({
+                            "i": int(_script_ix.get((text, voice, who), 999)),
+                            "who": str(who), "voice": str(voice),
+                            "text": str(text)[:1200], "key": key,
+                            "seconds": float(got.get("seconds") or 0)})
+                except Exception:  # noqa: BLE001
+                    pass
                 made += 1
                 entry["made"] = made
                 continue
@@ -18049,7 +18090,8 @@ def prep_air_text(raw: str, kind: str) -> str:
 
 
 async def prep_render_line(text: str, who: str,
-                           voice: str = "") -> dict[str, Any] | None:
+                           voice: str = "",
+                           kind: str = "") -> dict[str, Any] | None:
     """Render one prepared line into the pantry, keyed EXACTLY as
     dj_speak will key it when the line airs: the spoken text, the voice
     dj_speak forces for this seat, and the engine that voice names —
@@ -18111,7 +18153,13 @@ async def prep_render_line(text: str, who: str,
         pass
     if not (clip or {}).get("path"):
         return None
-    pantry_put(key, clip, text=text, voice=voice, who=who)
+    # #978: with its ROAD. Without `kind` the pantry cannot say what a
+    # clip was made for - measured: 151 of 400 rows carrying kind "" -
+    # which makes the shelf table unattributable and the loose/held count
+    # unreadable. The larder's own path a few hundred lines up already
+    # passes it.
+    pantry_put(key, clip, text=text, voice=voice, who=who,
+               kind=str(kind or ""))
     return {"key": key, "voice": voice, "engine": engine,
             "seconds": float((clip or {}).get("seconds") or 0)}
 
@@ -18145,7 +18193,7 @@ async def prep_ad() -> bool:
     text = str(_mk.get("text") or "")
     if len(text) < 20:
         return False
-    made = await prep_render_line(text, "dj")
+    made = await prep_render_line(text, "dj", kind="ad")   # #978
     if not made:
         # #904: the WRITE is already paid for. A refused render — the
         # engine busy, the live road wanting it — used to throw the
@@ -18191,7 +18239,8 @@ async def prep_station_id() -> bool:
     text = prep_air_text(line, "station_id")
     if not text:
         return False
-    made = await prep_render_line(text, "drop", drop_voice)
+    made = await prep_render_line(text, "drop", drop_voice,
+                                  kind="station_id")       # #978
     if not made:
         # #904: the words survive a refused render, as with prep_ad.
         # The voice is written down beside them — shelf_take asks for
@@ -18700,7 +18749,8 @@ async def prep_track_talk() -> bool:
             voice = str((await session_voices()).get(who) or "")
         except Exception:  # noqa: BLE001
             voice = ""
-        made = await prep_render_line(text, who, voice)
+        made = await prep_render_line(text, who, voice,
+                                      kind="track_talk")   # #978
         row = _TRACK_TALK.setdefault(str(track.get("id")), {
             "id": str(track.get("id")),
             "title": str(track.get("title") or "")[:160],
@@ -19026,8 +19076,35 @@ async def pantry_keeper() -> None:
             # Preparing a single round per window is what kept the buffer
             # shallow — the point of the visit is to come away with
             # enough material that nobody has to be sent back.
-            for _entry in list(_LARDER):
-                if pantry_window() != window:
+            # #978: BANTER GOES LAST WHEN THE HOUR IS SHORT OF SOMETHING
+            # ELSE. _hour_short is computed above and until now only gated
+            # the stand-down; this loop ran unconditionally ahead of the
+            # roads that were actually starving. Measured live: banter
+            # held 1012.3s against 810 owed, at 7 rows of a cap of 9,
+            # while news held 0 against 720 owed and the advert road sat
+            # at rendered 1. The larder still gets its floor - a reserve
+            # under target is a silence risk - but a full one waits its
+            # turn behind whatever the running order is missing.
+            _banter_wait = bool(_hour_short) and "banter" not in _hour_short \
+                and len(_LARDER) >= target
+            if _banter_wait:
+                pipeline_log("lookahead", "the larder is deep enough and "
+                             "the hour is short of "
+                             + ", ".join(_hour_short[:3])
+                             + " — those go first (#978)")
+            for _entry in ([] if _banter_wait else list(_LARDER)):
+                # #978: IS A WINDOW OPEN - not "is it the same REASON a
+                # window was open when this pass began". `window` is a
+                # reason string captured once at the top of the pass, and
+                # pantry_window() legitimately returns a different one
+                # minute to minute ("a record", "an ad break", "the pair
+                # are talking", "the air is quiet"). The banter loop below
+                # spends minutes rendering, so by the time control reached
+                # the ad catch-up further down the string had almost
+                # always changed and it broke on its first row - every
+                # pass, for ever. That is why the advert road sat at
+                # rendered 1 while seven ads waited written.
+                if not pantry_window():
                     break               # the live road wants the engine
                 if _entry.get("prepared") or _entry.get("preparing"):
                     continue
@@ -19037,12 +19114,29 @@ async def pantry_keeper() -> None:
                 # ends at the next line boundary with everything made so
                 # far kept, rather than running on over the handover.
                 _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+                # #978: did THIS call make progress? larder_prepare
+                # returns bool(entry["prepared"]), and a half-made round
+                # is the NORMAL outcome - so `if not _ok: break` stopped
+                # the whole pass on the first round that did not finish,
+                # and every round behind it waited.
+                #
+                # Deliberately not `not _ok and not entry["made"]`: `made`
+                # is sticky (it is read back from the entry and re-counts
+                # every pantry hit), so once a round had ever made one
+                # line that test would never fire again and the keeper
+                # would walk all fourteen larder entries on a full engine,
+                # paying a plan rebuild and a clone probe each, landing
+                # every walk in the ledger as a ~0-2s zero-gain sample.
+                # TASK_LEDGER_KEEP is 60, so that flushes the real banter
+                # cost within a few passes and prep_plan starts believing
+                # banter is nearly free.
+                _before = int(_entry.get("made") or 0)
                 try:
                     _ok = await prep_measure("banter",
                                              larder_prepare(_entry))
                 finally:
                     _PREP_DEADLINE[0] = 0.0
-                if not _ok:
+                if not _ok and int(_entry.get("made") or 0) <= _before:
                     break               # engine said no; try again later
             # #842: a segment already WRITTEN but not fully rendered gets
             # its remaining lines before anything new is written — half a
@@ -19071,7 +19165,7 @@ async def pantry_keeper() -> None:
                             and int(_shelved.get("prep_turns") or 0)
                             and not int(_shelved.get("chunks") or 0)):
                         continue        # nothing in it a preparer can make
-                    if pantry_window() != window:
+                    if not pantry_window():   # #978: see the note above
                         break
                     await larder_prepare(_shelved)
                     _row["seconds"] = float(_shelved.get("seconds") or 0)
@@ -19090,12 +19184,13 @@ async def pantry_keeper() -> None:
                     if (_row.get("key") or _row.get("produced")
                             or not str(_row.get("text") or "")):
                         continue    # already made, or nothing to make
-                    if pantry_window() != window:
+                    if not pantry_window():   # #978: see the note above
                         break
                     try:
                         _late = await prep_render_line(
                             str(_row.get("text") or ""), _who,
-                            str(_row.get("voice") or ""))
+                            str(_row.get("voice") or ""),
+                            kind=str(_kind or ""))              # #978
                     except Exception:  # noqa: BLE001
                         _late = None
                     if not _late:
@@ -39171,7 +39266,14 @@ def call_log_add(entry: dict[str, Any]) -> None:
 # ever waits: a second call defers and comes back on the next pass, which
 # keeps the round supervisor free.
 _CALL_LIVE: dict[str, Any] = {"who": "", "at": 0.0}
-CALL_LINE_STALE = 900.0                 # a call cannot outlive this
+# Every road reaches call_ended on its normal path - checked, each of them
+# has exactly one return and the hang-up always precedes it - so the only
+# way the line leaks is an exception between the banner and the hang-up.
+# This is the backstop for that. Ten minutes is comfortably past the
+# longest call the sheet allows now that #977 sizes calls to their slot
+# (a four-minute entry plus its ring and hang-up), and short enough that
+# a leak costs one entry rather than a quarter of an hour.
+CALL_LINE_STALE = 600.0
 
 
 def call_line_busy() -> str:
@@ -39181,7 +39283,16 @@ def call_line_busy() -> str:
         if not who:
             return ""
         if time.time() - float(_CALL_LIVE.get("at") or 0) > CALL_LINE_STALE:
+            # A leak is a fault, not routine housekeeping: say so, because
+            # a silently self-healing bug is one nobody ever fixes.
             _CALL_LIVE.update({"who": "", "at": 0.0})
+            try:
+                pipeline_log("call", f"the line was still showing {who} "
+                             f"after {int(CALL_LINE_STALE)}s — a call road "
+                             "ended without hanging up; the phone is free "
+                             "again (#977)")
+            except Exception:  # noqa: BLE001
+                pass
             return ""
         return who
     except Exception:  # noqa: BLE001
