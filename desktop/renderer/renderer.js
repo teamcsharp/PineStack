@@ -1796,13 +1796,19 @@ function initWorksPopup() {
       };
       row.appendChild(add);
     }
-    tri.onclick = (ev) => {
-      ev.stopPropagation();
+    /* #903: the road's NAME opens it too, not only the triangle. */
+    const kindToggle = (ev) => {
+      if (ev) ev.stopPropagation();
       kindOpen[okey] = !kindOpen[okey];
       tri.textContent = kindOpen[okey] ? "\u25be" : "\u25b8";
       drw.style.display = kindOpen[okey] ? "block" : "none";
       if (kindOpen[okey]) kindLoad(kind, drw);
     };
+    tri.onclick = kindToggle;
+    nm.style.cursor = "pointer";
+    nm.title = "Click to open or close what is already stacked on this "
+      + "road";
+    nm.onclick = kindToggle;
     host.appendChild(row);
     host.appendChild(drw);
     if (kindOpen[okey]) kindLoad(kind, drw);
@@ -1842,8 +1848,16 @@ function initWorksPopup() {
       it.appendChild(mark);
       const t = mk("span", "", String(c.preview || c.title || c.id));
       t.style.cssText = "flex:1;min-width:0;overflow:hidden;"
-        + "text-overflow:ellipsis;white-space:nowrap";
-      t.title = String(c.preview || "");
+        + "text-overflow:ellipsis;white-space:nowrap;cursor:pointer";
+      /* #902: the same review from the road drawers in The Works. */
+      t.title = String(c.preview || "") + "\n\nClick to open this one: "
+        + "the recording, every line of the transcript, and your own "
+        + "version back through the rooms";
+      t.onclick = (ev) => {
+        ev.stopPropagation();
+        try { wkReviewPopup(kind, c.id); }
+        catch (e) { /* the list still works */ }
+      };
       it.appendChild(t);
       it.appendChild(mk("span", "wk-note",
                         Math.round(c.seconds || 0) + "s"));
@@ -2001,6 +2015,9 @@ function initWorksPopup() {
         }
       }
     };
+    /* #903: and the take's own words open it, not just the triangle. */
+    txt.style.cursor = "pointer";
+    txt.onclick = tri.onclick;
     box.appendChild(body);
     return box;
   }
@@ -2797,7 +2814,17 @@ function worksSchedule(anchorPop) {
       t1.appendChild(mark);
       const ttl = mk("span", "", String(c.title || c.label || c.id));
       ttl.style.cssText = "flex:1;min-width:0;overflow:hidden;"
-        + "text-overflow:ellipsis;white-space:nowrap;color:#9fd8ff";
+        + "text-overflow:ellipsis;white-space:nowrap;color:#9fd8ff;"
+        + "cursor:pointer";
+      /* #902: "If I click any of these show a pop up showing me the
+       * transcript, the recording..." */
+      ttl.title = "Open this one: the recording, every line of the "
+        + "transcript, and your own version back through the rooms";
+      ttl.onclick = (ev) => {
+        ev.stopPropagation();
+        try { wkReviewPopup(c.kind || slot.kind, c.id); }
+        catch (e) { /* the list still works */ }
+      };
       t1.appendChild(ttl);
       const meta = mk("span", "wk-note", "");
       meta.style.cssText = "font-size:9px;opacity:.7";
@@ -3110,14 +3137,24 @@ function worksSchedule(anchorPop) {
       segBody[okey] = drw;
       drw.style.display = segOpen[okey] ? "block" : "none";
       drw.style.marginTop = "4px";
-      tri.onclick = (ev) => {
-        ev.stopPropagation();
+      /* #903: "If I click the title of a section, expand that section.
+       * and collapse it." The little triangle down at the bottom of the
+       * tile was the only way in - the entry's own NAME, which is the
+       * thing anybody actually aims at, did nothing at all. One toggle,
+       * two handles. */
+      const segToggle = (ev) => {
+        if (ev) ev.stopPropagation();
         segOpen[okey] = !segOpen[okey];
         tri.textContent = (segOpen[okey] ? "\u25be" : "\u25b8")
                           + " what is stacked";
         drw.style.display = segOpen[okey] ? "block" : "none";
         if (segOpen[okey]) segLoad(s, drw, okey, true);
       };
+      tri.onclick = segToggle;
+      nm.style.cursor = "pointer";
+      nm.title = "Click the name to open or close what is stacked for "
+        + "this entry";
+      nm.onclick = segToggle;
       row.appendChild(tri);
       row.appendChild(drw);
       if (segOpen[okey]) segLoad(s, drw, okey);
@@ -3794,6 +3831,48 @@ function wkPutInto(box, label, text, mono) {
  * buttons. Everything is built lazily — a transcript is only fetched
  * when its tick is opened, and a section is only welded when ▶ or ⬇ is
  * actually pressed, because welding twenty clips is seconds of work. */
+/* #898/#902: SAVE, rather than "open it somewhere else". Every keep in
+ * the works called api.openExternal, which hands the signed URL to the
+ * system browser - the operator asked to DOWNLOAD the clip. Fetching it
+ * and clicking a blob link puts it through Electron's own download
+ * road, which opens the save dialog in the folder the last one went to
+ * (#808) and reveals the file in File Explorer when it lands (#817). */
+function wkFileName(bits, ext) {
+  const clean = String(bits || "clip").replace(/[^\w \-]+/g, " ")
+    .replace(/\s+/g, " ").trim();
+  return (clean || "clip").slice(0, 60) + "." + (ext || "wav");
+}
+
+async function wkSaveBlob(url, name, btn) {
+  const was = btn ? btn.textContent : "";
+  if (btn) { btn.disabled = true; btn.textContent = "\u2026"; }
+  try {
+    const r = await fetch(url);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    const blob = URL.createObjectURL(await r.blob());
+    const a = document.createElement("a");
+    a.href = blob;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(blob), 20000);
+    if (btn) {
+      btn.textContent = "saved";
+      setTimeout(() => { btn.textContent = was; btn.disabled = false; },
+                 2500);
+    }
+    return true;
+  } catch (e) {
+    if (btn) {
+      btn.textContent = "could not save";
+      setTimeout(() => { btn.textContent = was; btn.disabled = false; },
+                 3000);
+    }
+    return false;
+  }
+}
+
 function wkMediaUrl(row) {
   if (!row || !row.media || !row.sig) return "";
   return desktopMusicUrl("/media/" + encodeURIComponent(row.media)
@@ -3982,11 +4061,26 @@ function wkTapeBar(host, kind, id) {
       player.appendChild(note);
     });
   };
-  mk2("\u2b07", "Keep the whole section as one file").onclick = (ev) => {
+  mk2("\u2b07", "Download this whole section as one file").onclick =
+      (ev) => {
     ev.stopPropagation();
-    weld(ev.target, (got) => {
-      try { api.openExternal(wkMediaUrl(got)); } catch (e) {}
+    const btn = ev.target;
+    weld(btn, (got) => {
+      /* #898: "allow me to download that full clip" - the welded whole,
+       * saved to disk, not opened in a browser tab. */
+      wkSaveBlob(wkMediaUrl(got),
+                 wkFileName((got.label || kind) + " " + id, "wav"), btn);
     });
+  };
+  /* #902: and the whole review - the recording, every line of the
+   * transcript playable on its own, where each one came from, and the
+   * operator's own cut sent back through the writing and recording
+   * rooms to be stacked on top. */
+  mk2("\u25a4 review", "Open this section: play it, read every line, "
+      + "hear any single phrase, see how it was written, and send your "
+      + "own version back through the rooms").onclick = (ev) => {
+    ev.stopPropagation();
+    try { wkReviewPopup(kind, id); } catch (e) { /* the list still works */ }
   };
 
   const drw = document.createElement("div");
@@ -4070,7 +4164,10 @@ function wkTapeBar(host, kind, id) {
         keep.style.cssText = "font-size:8px;padding:0 4px;flex:none";
         keep.onclick = (e2) => {
           e2.stopPropagation();
-          try { api.openExternal(wkMediaUrl(ln)); } catch (e3) {}
+          /* #898: this line's OWN clip, saved. */
+          wkSaveBlob(wkMediaUrl(ln),
+                     wkFileName((ln.name || ln.who || "line") + " "
+                                + (ln.text || ""), "wav"), keep);
         };
         row.appendChild(keep);
       }
@@ -4081,6 +4178,457 @@ function wkTapeBar(host, kind, id) {
   host.appendChild(bar);
   host.appendChild(player);
   host.appendChild(drw);
+}
+
+/* #902: THE REVIEW - one prepared section, opened right out.
+ *
+ * "show me the transcript, the recording offering me to download it...
+ *  If I click on a phrase of the transcript, I want to play that out
+ *  loud... expand each and every line of the transcript and be able to
+ *  see how the scripting was done for it... and be able to even modify
+ *  what's going on here and resubmit it... stacking another version in
+ *  the pantry that is stacked higher."
+ *
+ * Almost all of this already existed and was simply scattered:
+ * /api/shelf/candidate is the transcript with a signed, playable media
+ * key on every line (#935), /api/shelf/bundle is the welded whole
+ * (#935), and the round's own writing paperwork rides on the section as
+ * `stats` (#941). This puts them on one page and adds the one thing
+ * that was missing - an edit box that goes back through the rooms
+ * (POST /api/shelf/recast) and lands ABOVE the round it came from. */
+let wkReviewAudio = null;
+
+function wkReviewClose() {
+  try { if (wkReviewAudio) wkReviewAudio.pause(); } catch (e) { /* fine */ }
+  wkReviewAudio = null;
+  const gone = document.getElementById("wkReview");
+  if (gone) gone.remove();
+}
+
+function wkReviewRow(host, label, value) {
+  if (value === "" || value === null || value === undefined) return null;
+  const r = document.createElement("div");
+  r.style.cssText = "display:flex;gap:8px;padding:2px 0;font-size:9.5px;"
+    + "border-top:1px solid rgba(255,255,255,.06)";
+  const k = document.createElement("div");
+  k.textContent = String(label);
+  k.style.cssText = "flex:0 0 112px;opacity:.6;word-break:break-word";
+  const v = document.createElement("div");
+  v.textContent = String(value);
+  v.style.cssText = "flex:1;min-width:0;word-break:break-word";
+  r.appendChild(k);
+  r.appendChild(v);
+  host.appendChild(r);
+  return r;
+}
+
+function wkReviewHead(host, text) {
+  const h = document.createElement("div");
+  h.textContent = text;
+  h.style.cssText = "font-size:9px;letter-spacing:.06em;font-weight:700;"
+    + "color:#9fd8ff;margin:11px 0 3px;opacity:.85";
+  host.appendChild(h);
+  return h;
+}
+
+function wkReviewBtn(host, text, title) {
+  const b = document.createElement("button");
+  b.textContent = text;
+  b.title = title || "";
+  b.style.cssText = "font-size:9.5px;padding:2px 8px";
+  host.appendChild(b);
+  return b;
+}
+
+function wkReviewPopup(kind, id) {
+  wkReviewClose();
+  const pop = document.createElement("div");
+  pop.id = "wkReview";
+  pop.style.cssText = "position:fixed;left:50%;top:4vh;"
+    + "transform:translateX(-50%);z-index:520;width:min(700px,95vw);"
+    + "max-height:90vh;overflow:auto;padding:12px 14px;border-radius:9px;"
+    + "background:#080d14;border:1px solid #24384a;color:#cfe3f4;"
+    + "box-shadow:0 18px 54px rgba(0,0,0,.82);font-size:10.5px;"
+    + "line-height:1.5";
+  pop.onclick = (ev) => ev.stopPropagation();
+
+  const head = document.createElement("div");
+  head.style.cssText = "display:flex;gap:8px;align-items:baseline";
+  const ttl = document.createElement("b");
+  ttl.textContent = "\u25a4 reading the tape\u2026";
+  ttl.style.cssText = "flex:1;font-size:12px;color:#9fd8ff";
+  const shut = document.createElement("span");
+  shut.textContent = "\u2715";
+  shut.style.cssText = "cursor:pointer;opacity:.6";
+  shut.onclick = wkReviewClose;
+  head.appendChild(ttl);
+  head.appendChild(shut);
+  pop.appendChild(head);
+
+  const body = document.createElement("div");
+  body.textContent = "reading the tape\u2026";
+  pop.appendChild(body);
+  document.body.appendChild(pop);
+
+  const esc = (ev) => {
+    if (ev.key !== "Escape") return;
+    document.removeEventListener("keydown", esc);
+    wkReviewClose();
+  };
+  document.addEventListener("keydown", esc);
+
+  /* The script box is made up front: a per-line edit patches ITS text,
+   * so the one thing that goes back to the rooms is the one thing the
+   * operator can see in full. */
+  const scriptBox = document.createElement("textarea");
+
+  api.get("/api/shelf/candidate?kind=" + encodeURIComponent(kind)
+          + "&id=" + encodeURIComponent(id))
+    .then((d) => {
+      try { fill(d); }
+      catch (e) {
+        body.textContent = "that section could not be drawn: "
+          + (e && e.message ? e.message : "unknown");
+      }
+    })
+    .catch((e) => {
+      body.textContent = "that section could not be read: "
+        + (e && e.message ? e.message : "no answer");
+    });
+
+  function fill(d) {
+    body.textContent = "";
+    const lines = d.lines || [];
+    ttl.textContent = "\u25a4 " + (d.label || kind) + " \u00b7 "
+      + lines.length + " line(s)";
+
+    const facts = document.createElement("div");
+    wkReviewRow(facts, "on the shelf", (d.kind || kind) + " \u00b7 "
+                + (d.id || id));
+    wkReviewRow(facts, "written", Math.round(d.age_minutes || 0)
+                + " min ago");
+    wkReviewRow(facts, "recorded", Math.round(d.seconds || 0)
+                + "s of finished audio \u00b7 "
+                + lines.filter((l) => l.recorded).length + " of "
+                + lines.length + " lines cut");
+    wkReviewRow(facts, "stacked",
+                ((d.priority || 0) > 0 ? "+" : "") + (d.priority || 0)
+                + ((d.priority || 0) ? " \u2014 above the untouched ones"
+                                     : " \u2014 untouched"));
+    if (d.recast_from) {
+      wkReviewRow(facts, "your recast of", d.recast_from);
+    }
+    if (d.note) wkReviewRow(facts, "your note", d.note);
+    if (d.derived) {
+      wkReviewRow(facts, "note", "prepared before the takes were written "
+        + "down \u2014 these lines are rederived exactly as the air road "
+        + "derives them");
+    }
+    body.appendChild(facts);
+
+    /* --- the recording ------------------------------------------- */
+    wkReviewHead(body, "THE RECORDING");
+    const tape = document.createElement("div");
+    tape.style.cssText = "display:flex;gap:5px;align-items:center;"
+      + "flex-wrap:wrap";
+    const player = document.createElement("div");
+    player.style.marginTop = "4px";
+    let welded = null;
+    const weld = async (btn) => {
+      if (welded) return welded;
+      const was = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "welding\u2026";
+      try {
+        welded = await api.get("/api/shelf/bundle?kind="
+                               + encodeURIComponent(kind) + "&id="
+                               + encodeURIComponent(id));
+      } finally {
+        btn.textContent = was;
+        btn.disabled = false;
+      }
+      return welded;
+    };
+    wkReviewBtn(tape, "\u25b6 play the whole thing",
+                "Weld this section end to end the way it would go out, "
+                + "and play it").onclick = async (ev) => {
+      try {
+        const got = await weld(ev.target);
+        player.textContent = "";
+        const au = document.createElement("audio");
+        au.controls = true;
+        au.autoplay = true;
+        au.src = wkMediaUrl(got);
+        au.style.cssText = "width:100%;height:28px";
+        player.appendChild(au);
+        wkReviewAudio = au;
+        const note2 = document.createElement("div");
+        note2.style.cssText = "font-size:9px;opacity:.6";
+        note2.textContent = got.lines + " lines \u00b7 "
+          + Math.round(got.seconds) + "s \u00b7 "
+          + Math.round((got.bytes || 0) / 1024) + " KB";
+        player.appendChild(note2);
+      } catch (e) {
+        player.textContent = /409/.test(String(e && e.message))
+          ? "nothing in this section has been recorded yet \u2014 there "
+            + "is a script but no audio to weld"
+          : "it could not be welded";
+      }
+    };
+    wkReviewBtn(tape, "\u2b07 download it",
+                "Save the whole section as one file").onclick =
+        async (ev) => {
+      const btn = ev.target;
+      try {
+        const got = await weld(btn);
+        await wkSaveBlob(wkMediaUrl(got),
+                         wkFileName((d.label || kind) + " " + id, "wav"),
+                         btn);
+      } catch (e) { btn.textContent = "could not weld"; }
+    };
+    body.appendChild(tape);
+    body.appendChild(player);
+
+    /* --- the transcript ------------------------------------------ */
+    wkReviewHead(body, "THE TRANSCRIPT \u2014 CLICK ANY PHRASE TO HEAR IT");
+    if (!lines.length) {
+      const none = document.createElement("div");
+      none.style.cssText = "font-size:9.5px;opacity:.6";
+      none.textContent = d.why || "nothing was written down for this one";
+      body.appendChild(none);
+    }
+    lines.forEach((ln, ix) => {
+      const box = document.createElement("div");
+      box.style.cssText = "padding:3px 0;border-bottom:"
+        + "1px solid rgba(255,255,255,.05)";
+      const top = document.createElement("div");
+      top.style.cssText = "display:flex;gap:5px;align-items:flex-start";
+      const tri = document.createElement("button");
+      tri.textContent = "\u25b8";
+      tri.title = "How this line was made";
+      tri.style.cssText = "font-size:9px;padding:0 4px;flex:none";
+      top.appendChild(tri);
+      const who = document.createElement("span");
+      who.textContent = ln.name || ln.who || "";
+      who.style.cssText = "flex:none;min-width:52px;color:#9fd8ff;"
+        + "font-size:9.5px";
+      top.appendChild(who);
+      const txt = document.createElement("span");
+      txt.textContent = ln.text || "";
+      txt.style.cssText = "flex:1;min-width:0;white-space:pre-wrap;"
+        + "line-height:1.5"
+        + (ln.recorded ? ";cursor:pointer" : ";opacity:.6");
+      txt.title = ln.recorded
+        ? "Click to hear this phrase on its own"
+        : "not cut yet \u2014 this one renders on air";
+      if (ln.recorded) {
+        txt.onclick = (e2) => {
+          e2.stopPropagation();
+          const old = box.querySelector("audio");
+          if (old) { old.remove(); return; }
+          const au = document.createElement("audio");
+          au.controls = true;
+          au.autoplay = true;
+          au.src = wkMediaUrl(ln);
+          au.style.cssText = "width:100%;height:24px;margin-top:2px";
+          box.appendChild(au);
+          wkReviewAudio = au;
+        };
+      }
+      top.appendChild(txt);
+      const meta = document.createElement("span");
+      meta.textContent = ln.recorded ? Math.round(ln.seconds) + "s"
+                                     : "not cut";
+      meta.style.cssText = "flex:none;font-size:9px;opacity:.55";
+      top.appendChild(meta);
+      if (ln.recorded) {
+        const keep = document.createElement("button");
+        keep.textContent = "\u2b07";
+        keep.title = "Download just this phrase";
+        keep.style.cssText = "font-size:9px;padding:0 4px;flex:none";
+        keep.onclick = (e2) => {
+          e2.stopPropagation();
+          wkSaveBlob(wkMediaUrl(ln),
+                     wkFileName((ln.name || ln.who || "line") + " "
+                                + (ln.text || ""), "wav"), keep);
+        };
+        top.appendChild(keep);
+      }
+      box.appendChild(top);
+
+      const inner = document.createElement("div");
+      inner.style.cssText = "display:none;margin:3px 0 5px 22px";
+      tri.onclick = (e2) => {
+        e2.stopPropagation();
+        const on = inner.style.display === "none";
+        inner.style.display = on ? "block" : "none";
+        tri.textContent = on ? "\u25be" : "\u25b8";
+        if (!on || inner.childNodes.length) return;
+        wkReviewRow(inner, "seat", ln.who || "\u2014");
+        wkReviewRow(inner, "voice", ln.voice || "\u2014");
+        wkReviewRow(inner, "engine", ln.engine || "\u2014");
+        wkReviewRow(inner, "in the script",
+                    "line " + ((ln.i == null ? ix : ln.i) + 1));
+        wkReviewRow(inner, "pantry key", ln.key || "\u2014");
+        wkReviewRow(inner, "recorded", ln.recorded
+          ? Math.round(ln.seconds) + "s standing on the shelf"
+          : "not yet \u2014 it renders the moment it airs");
+        /* The transcript is what was SAID; the script is what was
+         * WRITTEN, and the recording room breaks a long turn into
+         * pieces and puts the breaths and stumbles in on the way past.
+         * When the phrase is in the script verbatim, editing it here
+         * patches the script below. When it is not, say so rather than
+         * pretending the edit will land. */
+        const at0 = String(scriptBox.value).indexOf(String(ln.text || ""));
+        if (!ln.text || at0 < 0) {
+          const warn = document.createElement("div");
+          warn.style.cssText = "font-size:9px;margin-top:3px;"
+            + "color:#e0a35c;line-height:1.5";
+          warn.textContent = "this phrase is not in the script word for "
+            + "word \u2014 the recording room cut the turn into pieces "
+            + "and put the breaths in on the way past, so edit the "
+            + "script itself further down";
+          inner.appendChild(warn);
+          return;
+        }
+        let cur = String(ln.text || "");
+        const ed = document.createElement("textarea");
+        ed.value = cur;
+        ed.spellcheck = false;
+        ed.title = "Change what this line says. It patches the script "
+          + "below; nothing moves until you send the section back.";
+        ed.style.cssText = "width:100%;min-height:46px;margin-top:4px;"
+          + "font-size:10px;line-height:1.5;background:#05090f;"
+          + "color:#cfe3f4;border:1px solid #24384a;border-radius:5px;"
+          + "padding:4px 6px";
+        ed.oninput = () => {
+          const at1 = scriptBox.value.indexOf(cur);
+          if (at1 < 0) return;
+          scriptBox.value = scriptBox.value.slice(0, at1) + ed.value
+            + scriptBox.value.slice(at1 + cur.length);
+          cur = ed.value;
+          txt.textContent = ed.value;
+        };
+        inner.appendChild(ed);
+      };
+      box.appendChild(inner);
+      body.appendChild(box);
+    });
+
+    /* --- how it was written -------------------------------------- */
+    const st = d.stats || {};
+    const known = ["temp", "heat", "turns", "chunks", "made", "seconds"];
+    if (Object.keys(st).length) {
+      wkReviewHead(body, "HOW IT WAS WRITTEN");
+      const paper = document.createElement("div");
+      wkReviewRow(paper, "temperature",
+                  st.temp === undefined ? "\u2014" : st.temp);
+      wkReviewRow(paper, "heat dial",
+                  st.heat === undefined ? "\u2014" : st.heat);
+      wkReviewRow(paper, "turns written",
+                  st.turns === undefined ? "\u2014" : st.turns);
+      wkReviewRow(paper, "lines cut",
+                  (st.made === undefined ? "?" : st.made) + " of "
+                  + (st.chunks === undefined ? "?" : st.chunks));
+      Object.keys(st).forEach((k) => {
+        if (known.indexOf(k) >= 0) return;
+        const v = st[k];
+        wkReviewRow(paper, k, (v && typeof v === "object")
+          ? JSON.stringify(v).slice(0, 220) : v);
+      });
+      body.appendChild(paper);
+    }
+
+    /* --- the script, and sending it back ------------------------- */
+    wkReviewHead(body,
+                 "THE SCRIPT AS WRITTEN \u2014 CHANGE IT AND SEND IT BACK");
+    scriptBox.value = String(d.script || "");
+    scriptBox.spellcheck = false;
+    scriptBox.title = "A: is the host, B: the co-host, C: the caller, "
+      + "D: the third seat, E: a second caller.";
+    scriptBox.style.cssText = "width:100%;min-height:170px;font-size:10px;"
+      + "line-height:1.55;background:#05090f;color:#cfe3f4;"
+      + "border:1px solid #24384a;border-radius:6px;padding:6px 8px;"
+      + "font-family:ui-monospace,Consolas,monospace";
+    body.appendChild(scriptBox);
+
+    const note = document.createElement("input");
+    note.placeholder = "why (kept on the round, and read by the desk if "
+      + "you ask for a rewrite)";
+    note.style.cssText = "width:100%;margin-top:4px;font-size:9.5px;"
+      + "padding:3px 6px;background:#05090f;color:#cfe3f4;"
+      + "border:1px solid #24384a;border-radius:5px";
+    body.appendChild(note);
+
+    const opts = document.createElement("label");
+    opts.style.cssText = "display:flex;gap:5px;align-items:flex-start;"
+      + "margin-top:5px;font-size:9.5px;opacity:.82;line-height:1.45";
+    const rw = document.createElement("input");
+    rw.type = "checkbox";
+    rw.style.cssText = "flex:none;margin-top:2px";
+    opts.appendChild(rw);
+    opts.appendChild(document.createTextNode(
+      "let the writing room have a pass over my version first \u2014 "
+      + "off means my words are recorded exactly as typed"));
+    body.appendChild(opts);
+
+    const send = document.createElement("button");
+    send.textContent = "\u270e record my version and stack it on top";
+    send.title = "Through the recording room, onto the shelf ABOVE the "
+      + "one it came from \u2014 so it is the one that goes out next.";
+    send.style.cssText = "margin-top:7px;font-size:10px;padding:4px 11px";
+    const watch = document.createElement("div");
+    watch.style.cssText = "font-size:9.5px;opacity:.78;margin-top:5px;"
+      + "line-height:1.5";
+    send.onclick = async () => {
+      send.disabled = true;
+      watch.textContent = "asking the desk\u2026";
+      let job = null;
+      try {
+        job = await api.post("/api/shelf/recast", {
+          id: id,
+          script: scriptBox.value,
+          note: note.value,
+          rewrite: rw.checked,
+          promote: true,
+        });
+      } catch (e) {
+        watch.textContent = "the desk refused that: "
+          + (e && e.message ? e.message : "no answer");
+        send.disabled = false;
+        return;
+      }
+      watch.textContent = "queued \u2014 it takes the spare engine slot "
+        + "in a quiet stretch, so the live round never waits on it";
+      const done = ["done", "refused", "failed", "gave up"];
+      const tick = async () => {
+        let s = null;
+        try {
+          s = await api.get("/api/schedule/segment/generate/"
+                            + encodeURIComponent(job.job));
+        } catch (e) {
+          watch.textContent = "the ticket could not be read";
+          send.disabled = false;
+          return;
+        }
+        watch.textContent = String(s.state || "?")
+          + (s.why ? " \u2014 " + s.why : "")
+          + (s.made ? " \u00b7 " + s.made + " stacked" : "");
+        if (done.indexOf(String(s.state)) < 0) {
+          setTimeout(tick, 2500);
+          return;
+        }
+        send.disabled = false;
+        if (String(s.state) === "done") {
+          watch.textContent = "recorded and stacked on top \u2014 it is "
+            + "the one that goes out next";
+        }
+      };
+      setTimeout(tick, 1500);
+    };
+    body.appendChild(send);
+    body.appendChild(watch);
+  }
 }
 
 /* The Works' own popups are plain divs, not the panel's — give them the
