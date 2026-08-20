@@ -17741,6 +17741,61 @@ async def larder_keeper() -> None:
             pass                       # the shelf refills next pass
 
 
+# #924: what the COMING HOUR still wants, as opposed to how many
+# banter rounds happen to be banked. These are the kinds a preparer can
+# actually make; the rest are named in CANNOT_PREPARE with the reason,
+# because "we have nothing for it" and "it can never be made early" are
+# very different answers and the glass was giving the first for both.
+CANNOT_PREPARE = {
+    "record": "a record is not a round — the needle just drops",
+    "recap": "a recap reads the hour that just happened, so it can only "
+             "be written at the end of it",
+    "deep": "a deep conversation reads the last stretch of the show, so "
+            "writing it early would be recapping something that has not "
+            "happened",
+    "news": "a bulletin goes stale — it is written close to the hour",
+}
+
+
+def hour_shortfall() -> dict[str, Any]:
+    """Which entries of the hour on air have material behind them.
+
+    The reserve target counts BANKED BANTER and nothing else, so a
+    station with three quarters of its running order unwritten could
+    report itself finished. This answers the question the operator was
+    actually asking of the glass."""
+    out = {"ready": [], "short": [], "cannot": [], "entries": 0}
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return out
+        name = schedule_preset_now(store)
+        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
+                 if s.get("enabled", True)]
+        board = {str(r.get("kind")): r for r in (prep_board() or [])}
+        seen: set[str] = set()
+        for slot in slots:
+            out["entries"] += 1
+            kind = str(slot.get("kind") or "")
+            label = str(slot.get("label") or kind)
+            if kind in CANNOT_PREPARE:
+                if kind not in seen:
+                    seen.add(kind)
+                    out["cannot"].append({"kind": kind, "label": label,
+                                          "why": CANNOT_PREPARE[kind]})
+                continue
+            prep = str(SCHED_PREP_KIND.get(kind) or kind)
+            row = board.get(prep) or {}
+            held = int(row.get("written") or 0)
+            if kind == "banter":
+                held = max(held, len(_LARDER))
+            tag = {"kind": kind, "label": label, "held": held}
+            (out["ready"] if held > 0 else out["short"]).append(tag)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def dialogue_flow_state() -> dict[str, Any]:
     """Explain the continuity pipeline without hiding the bottleneck."""
     dj = dj_settings()
@@ -17775,6 +17830,8 @@ def dialogue_flow_state() -> dict[str, Any]:
         # #886/#887: depth in ROUNDS says nothing about whether the
         # station can keep talking. These say it in seconds of finished
         # audio, which is the only number that answers the question.
+        # #924: the honest answer about the hour, beside the old count.
+        "hour": hour_shortfall(),
         "prepared": sum(1 for e in _LARDER if e.get("prepared")),
         "buffered_seconds": pantry_seconds(),
         "pantry_clips": len(_PANTRY),
@@ -20053,12 +20110,21 @@ def schedule_prompt_for(store: dict[str, Any],
 def _schedule_clause(preset: str, slot: dict[str, Any], text: str) -> str:
     """The entry's prompt, dressed as the instruction it is."""
     note = str(slot.get("notes") or "").strip()[:300]
-    return ("\n\nSCHEDULE (#843) — THIS ROUND IS THE \""
-            + str(slot.get("label") or slot.get("kind") or "")[:80]
+    named = str(slot.get("label") or slot.get("kind") or "")[:80]
+    # #924: the operator NAMES these entries — "Pine News Coverage", not
+    # "news" — and asked that the pair use that name on air. The clause
+    # carried the label already, but only as bookkeeping about which
+    # entry this is; it never told anyone what to CALL it out loud.
+    return ("\n\nSCHEDULE (#843) — THIS ROUND IS THE \"" + named
             + "\" ENTRY ON THE \"" + str(preset)[:60] + "\" SCHEDULE"
             + (", AND ITS STANDING INSTRUCTION GOVERNS IT: " + text[:2200]
                if text else ".")
             + (" The working note on this entry: " + note if note else "")
+            + " THE SEGMENT IS CALLED \"" + named + "\" — that is the name "
+            "the station gave it, so if either of you names this part of "
+            "the show out loud, call it that and nothing else. Do not "
+            "announce it as a schedule entry or read this instruction "
+            "aloud; just use the name the way a presenter would."
             + "\n")
 
 
