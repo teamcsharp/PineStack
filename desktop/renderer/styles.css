@@ -1508,3 +1508,69 @@ body.immersive main {
   padding-left: 8px;
   box-shadow: inset 0 0 0 1px #6b4a1f;
 }
+
+/* #975 — THE PURGE TABLE, and the checkbox that ate the row.
+ *
+ * The dialog rendered as three lonely checkboxes in a tall empty box
+ * with every label shoved off the right edge, wrapping one character
+ * per line. Measured in a headless render rather than guessed at:
+ *
+ *   c0[INPUT]  x=29  w=463   <- the checkbox
+ *   c1[SPAN]   x=499 w=0     <- the label, squeezed to nothing
+ *
+ * The cause is the blanket form rule far above — `textarea, input {
+ * width: 100%; padding: 10px }` — which catches type=checkbox too. With
+ * flex:0 0 auto the flex-basis resolves to that 100%, so one checkbox
+ * claimed the whole row and left the label zero pixels to wrap in.
+ * Checkboxes need their own rule; giving one a width is the fix.
+ */
+.wk-check[type="checkbox"] {
+  width: 13px;
+  min-width: 13px;
+  height: 13px;
+  padding: 0;
+  margin: 0;
+  flex: 0 0 auto;
+  border-radius: 3px;
+  accent-color: var(--cyan);
+}
+
+/* A tight table: fixed columns, one row per listing, nothing wrapping
+   except the one column that is allowed to. */
+.wk-tbl {
+  display: grid;
+  gap: 0 6px;
+  align-items: center;
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+.wk-tbl > * { min-width: 0; padding: 1px 0; }
+.wk-tbl .cel {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.wk-tbl .hd {
+  font-size: 8.5px;
+  letter-spacing: .05em;
+  opacity: .6;
+  border-bottom: 1px solid #24384a;
+  padding-bottom: 2px;
+  position: sticky;
+  top: 0;
+  background: #05090f;
+  z-index: 1;
+}
+.wk-tbl .rowline {
+  grid-column: 1 / -1;
+  height: 1px;
+  background: rgba(255, 255, 255, .05);
+}
+.wk-scroll {
+  max-height: 34vh;
+  overflow: auto;
+  border: 1px solid #24384a;
+  border-radius: 7px;
+  background: #05090f;
+  padding: 4px 7px;
+}

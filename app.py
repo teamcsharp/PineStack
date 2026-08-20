@@ -55057,10 +55057,40 @@ async def cache_purge_api(
     except Exception:  # noqa: BLE001
         payload = {}
     want = (payload or {}).get("areas")
+    # #975: ...or a list of individual pantry KEYS. The operator asked to
+    # see every listing and act on it, and "tick three takes and drop
+    # them" is a different thing from "empty the whole shelf". Same
+    # shape as the store room's purge: nothing goes unnamed.
+    keys = (payload or {}).get("keys")
+    if isinstance(keys, list) and keys:
+        gone = 0
+        freed_keys = 0
+        try:
+            protected = _protected_media_keys()
+        except Exception:  # noqa: BLE001
+            protected = set()
+        for one in [str(x) for x in keys[:4000]]:
+            if one in protected or one not in _PANTRY:
+                continue
+            try:
+                freed_keys += _pantry_bytes_of(_PANTRY[one])
+            except Exception:  # noqa: BLE001
+                pass
+            del _PANTRY[one]
+            gone += 1
+        try:
+            _pantry_save(True)
+        except Exception:  # noqa: BLE001
+            pass
+        note_action(f"🧹 {gone} take(s) dropped from the pantry "
+                    f"— {freed_keys // (1 << 20)} MB freed")
+        return {"ok": True, "dropped": {"takes": gone},
+                "freed": freed_keys, "state": cache_state()}
     if not isinstance(want, list) or not want:
         raise HTTPException(
             status_code=400,
-            detail="Name the areas to purge, e.g. {\"areas\": [\"pantry\"]}")
+            detail="Name the areas to purge, e.g. {\"areas\": [\"pantry\"]}, "
+                   "or the takes, e.g. {\"keys\": [\"...\"]}")
     want = [str(x) for x in want if str(x) in CACHE_AREAS]
     if not want:
         raise HTTPException(status_code=400, detail="No such cache area")

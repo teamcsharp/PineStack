@@ -3223,9 +3223,15 @@ function wkEntryGrab(row, hour, s, gone) {
  *     its own protections. Nothing here is deleted without being named.
  * =================================================================== */
 function wkMB(bytes) {
+  /* #975: a single take is a couple of hundred KB, and rounding it to
+     megabytes printed "0 MB" against every row in the table - a column
+     of zeroes that says nothing. Scale to the number. */
   const n = Number(bytes) || 0;
   if (n >= (1 << 30)) return (n / (1 << 30)).toFixed(2) + " GB";
-  return Math.round(n / (1 << 20)) + " MB";
+  if (n >= 10 * (1 << 20)) return Math.round(n / (1 << 20)) + " MB";
+  if (n >= (1 << 20)) return (n / (1 << 20)).toFixed(1) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n ? n + " B" : "—";
 }
 
 function wkCacheBadge() {
@@ -3285,135 +3291,318 @@ function wkPurgePop(anchor) {
   };
   const pop = mk("div", "works-pop");
   pop.id = "wkPurgePop";
-  pop.style.width = "min(520px,94vw)";
-  pop.style.maxHeight = "82vh";
+  pop.style.width = "min(860px,96vw)";
+  pop.style.maxHeight = "88vh";
   pop.style.overflow = "auto";
   try {
     const at = anchor.getBoundingClientRect();
-    pop.style.left = Math.max(8, Math.min(window.innerWidth - 540,
-                                          at.left - 240)) + "px";
+    pop.style.left = Math.max(8, Math.min(window.innerWidth - 880,
+                                          at.left - 420)) + "px";
     pop.style.top = (at.bottom + 8) + "px";
   } catch (e) {
-    pop.style.left = "60px";
-    pop.style.top = "90px";
+    pop.style.left = "40px";
+    pop.style.top = "70px";
   }
   pop.onclick = (e) => e.stopPropagation();
+
   const head = mk("div", "wk-head");
-  head.appendChild(mk("b", "", "🧹 purge the cache"));
-  head.appendChild(mk("span", "wk-sub", "choose exactly what to let go of"));
+  head.appendChild(mk("b", "", "🧹 the cache"));
+  const sub = mk("span", "wk-sub", "every listing — play it, keep it, "
+    + "read it, or let it go");
+  head.appendChild(sub);
   const x = mk("button", "wk-x", "✕");
   x.onclick = () => pop.remove();
   head.appendChild(x);
   pop.appendChild(head);
-  pop.appendChild(mk("div", "wk-sub",
-    "Nothing goes that is not ticked. Everything here is material the "
-    + "station made and can make again — emptying the live shelves is "
-    + "what starts the coordinator queueing work for the hour again."));
+
   const body = mk("div", "");
-  body.style.marginTop = "6px";
+  body.style.marginTop = "5px";
   pop.appendChild(body);
+
   const foot = mk("div", "");
   foot.style.cssText = "display:flex;align-items:center;gap:8px;"
-    + "margin-top:9px;padding-top:8px;border-top:1px solid #24384a";
-  const note = mk("span", "wk-sub", "");
+    + "margin-top:9px;padding-top:8px;border-top:1px solid #24384a;"
+    + "position:sticky;bottom:0;background:var(--panel,#0f1620)";
   const go = mk("button", "", "purge what is ticked");
   go.style.cssText = "padding:4px 11px;border-radius:7px;font-size:11px;"
     + "border:1px solid #6b4a1f;background:#221709;color:#ffb35e;"
     + "cursor:pointer";
+  const note = mk("span", "wk-sub", "nothing ticked");
+  note.style.fontSize = "9.5px";
   foot.appendChild(go);
   foot.appendChild(note);
   pop.appendChild(foot);
   document.body.appendChild(pop);
   try { wkDraggable(pop); } catch (e) { /* it still opens */ }
 
-  const ticked = { live: {}, disk: {} };
-  const section = (title, blurb) => {
-    const h = mk("div", "wk-note", title);
+  /* What is ticked, in three registers that purge three different ways:
+     whole live shelves, individual takes by key, and disk areas. */
+  const tick = { live: {}, keys: {}, disk: {} };
+  const count = () => Object.keys(tick.live).length
+    + Object.keys(tick.keys).length + Object.keys(tick.disk).length;
+  const retally = () => {
+    const n = count();
+    note.textContent = n ? n + " ticked" : "nothing ticked";
+  };
+
+  const cap = (text, hint) => {
+    const h = mk("div", "wk-note", text);
     h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:8px 0 2px;"
       + "opacity:.8";
     body.appendChild(h);
-    if (blurb) {
-      const b = mk("div", "wk-sub", blurb);
-      b.style.cssText = "font-size:9.5px;line-height:1.5;margin-bottom:3px";
+    if (hint) {
+      const b = mk("div", "wk-sub", hint);
+      b.style.cssText = "font-size:9px;line-height:1.5;margin-bottom:3px";
       body.appendChild(b);
     }
-    const box = mk("div", "");
-    box.style.cssText = "border:1px solid #24384a;border-radius:7px;"
-      + "background:#05090f;padding:4px 7px";
-    body.appendChild(box);
-    return box;
   };
-  const tickRow = (box, bag, key, label, right, title) => {
-    const row = mk("label", "");
-    row.style.cssText = "display:flex;align-items:center;gap:7px;"
-      + "font-size:10.5px;line-height:1.6;padding:2px 0;cursor:pointer";
-    if (title) row.title = title;
-    const cb = mk("input", "");
+
+  const check = (bag, key) => {
+    const cb = mk("input", "wk-check");
     cb.type = "checkbox";
-    cb.style.cssText = "flex:0 0 auto;margin:0";
     cb.onchange = () => {
       if (cb.checked) bag[key] = 1; else delete bag[key];
+      retally();
     };
-    row.appendChild(cb);
-    const nm = mk("span", "", label);
-    nm.style.cssText = "flex:1 1 auto;min-width:0;color:#c8d6e4";
-    row.appendChild(nm);
-    const fig = mk("span", "", right);
-    fig.style.cssText = "flex:0 0 auto;color:#6d8199;font-size:9.5px";
-    row.appendChild(fig);
-    box.appendChild(row);
+    return cb;
+  };
+
+  /* One table. `cols` is the grid template; `heads` label them. */
+  const table = (host, cols, heads) => {
+    const wrap = mk("div", "wk-scroll");
+    const grid = mk("div", "wk-tbl");
+    grid.style.gridTemplateColumns = cols;
+    heads.forEach((h) => {
+      const c = mk("div", "hd", h);
+      grid.appendChild(c);
+    });
+    wrap.appendChild(grid);
+    host.appendChild(wrap);
+    return grid;
+  };
+
+  const play = (row) => {
+    const b = mk("button", "wk-ico", "▶");
+    b.title = "Play this take";
+    let audio = null;
+    b.onclick = (ev) => {
+      ev.stopPropagation();
+      if (audio) {
+        try { audio.pause(); } catch (e) {}
+        audio = null; b.textContent = "▶"; return;
+      }
+      if (!(row.media && row.sig)) { b.textContent = "✗"; return; }
+      try {
+        audio = new Audio(desktopMusicUrl("/media/"
+          + encodeURIComponent(row.media) + "?t="
+          + encodeURIComponent(row.sig)));
+        audio.onended = () => { audio = null; b.textContent = "▶"; };
+        audio.onerror = () => { audio = null; b.textContent = "✗"; };
+        audio.play();
+        b.textContent = "⏹";
+      } catch (e) { audio = null; }
+    };
+    return b;
+  };
+
+  const keep = (row) => {
+    const b = mk("button", "wk-ico", "⬇");
+    b.title = "Download this take";
+    b.onclick = (ev) => {
+      ev.stopPropagation();
+      if (!(row.media && row.sig)) return;
+      const url = desktopMusicUrl("/media/" + encodeURIComponent(row.media)
+        + "?t=" + encodeURIComponent(row.sig));
+      wkSaveBlob(url, wkFileName((row.name || row.who || "take") + " "
+        + (row.text || ""), String(row.media).split(".").pop() || "wav"), b);
+    };
+    return b;
+  };
+
+  const read = (row) => {
+    const b = mk("button", "wk-ico", "📄");
+    b.title = "Read the whole line";
+    b.onclick = (ev) => { ev.stopPropagation(); wkTakeText(row); };
+    return b;
   };
 
   const load = async () => {
     body.textContent = "";
     let live = null;
     let disk = null;
+    let pantry = null;
     try { live = await api.get("/api/cache/state"); } catch (e) { live = null; }
+    try { pantry = await api.get("/api/pantry/table?most=400"); }
+    catch (e) { pantry = null; }
     try { disk = await api.get("/api/storage"); } catch (e) { disk = null; }
+
+    if (live) {
+      sub.textContent = wkMB(live.bytes) + " of " + wkMB(live.cap_bytes)
+        + " · every listing, play / keep / read / let go";
+    }
+
+    /* --- the live shelves, one row each --------------------------- */
     if (live && live.areas) {
-      const box = section("THE LIVE SHELVES",
-        "In memory. Emptying these is what makes the coordinator start "
-        + "queueing the hour's work again.");
+      cap("THE LIVE SHELVES",
+          "In memory. Emptying one is what makes the coordinator start "
+          + "queueing the hour's work again.");
+      const g = table(body, "16px 1fr 70px 70px 80px",
+                      ["", "shelf", "rows", "airtime", "size"]);
       live.areas.forEach((a) => {
-        tickRow(box, ticked.live, a.key,
-          a.key + " — " + a.label,
-          (a.rows || 0) + " row(s)"
-          + (a.bytes ? " · " + wkMB(a.bytes) : "")
-          + (a.seconds ? " · " + Math.round(a.seconds) + "s" : ""),
-          a.label);
+        g.appendChild(check(tick.live, a.key));
+        const nm = mk("div", "cel", a.key + " — " + a.label);
+        nm.title = a.label;
+        g.appendChild(nm);
+        g.appendChild(mk("div", "cel", String(a.rows || 0)));
+        g.appendChild(mk("div", "cel",
+          a.seconds ? Math.round(a.seconds) + "s" : "—"));
+        g.appendChild(mk("div", "cel", a.bytes ? wkMB(a.bytes) : "—"));
       });
     }
-    // The register calls it `purgeable`, not `purge` — an area that is
-    // kept says so in `why_kept` and must never be offered here.
+
+    /* --- EVERY TAKE, the thing that was actually asked for --------- */
+    if (pantry && (pantry.rows || []).length) {
+      cap("EVERY TAKE ON THE SHELF",
+          pantry.shown + " of " + pantry.takes + " · "
+          + Math.round((pantry.seconds || 0) / 60) + " min · "
+          + pantry.loose + " loose (nothing is holding them — those "
+          + "roll off first)");
+      const bar = mk("div", "");
+      bar.style.cssText = "display:flex;gap:6px;align-items:center;"
+        + "margin-bottom:3px";
+      const find = mk("input", "");
+      find.type = "text";
+      find.placeholder = "filter by what it says, who says it, or kind…";
+      find.style.cssText = "flex:1 1 auto;min-width:0;font-size:9.5px;"
+        + "padding:3px 7px;border-radius:6px";
+      bar.appendChild(find);
+      const looseOnly = mk("label", "");
+      looseOnly.style.cssText = "display:flex;align-items:center;gap:4px;"
+        + "font-size:9.5px;flex:0 0 auto;cursor:pointer";
+      const lcb = mk("input", "wk-check");
+      lcb.type = "checkbox";
+      looseOnly.appendChild(lcb);
+      looseOnly.appendChild(mk("span", "", "loose only"));
+      bar.appendChild(looseOnly);
+      const all = mk("button", "wk-pill", "tick shown");
+      all.title = "Tick every take currently listed";
+      bar.appendChild(all);
+      body.appendChild(bar);
+
+      const g = table(body,
+        "16px 58px 1fr 44px 60px 52px 74px 78px",
+        ["", "who", "what it says", "len", "size", "age", "held by",
+         "play keep read"]);
+      const draw = () => {
+        while (g.children.length > 8) g.removeChild(g.lastChild);
+        const q = String(find.value || "").toLowerCase().trim();
+        let shown = 0;
+        (pantry.rows || []).forEach((r) => {
+          if (lcb.checked && !r.loose) return;
+          if (q) {
+            const hay = ((r.text || "") + " " + (r.name || "") + " "
+              + (r.who || "") + " " + (r.label || "")).toLowerCase();
+            if (hay.indexOf(q) < 0) return;
+          }
+          shown += 1;
+          g.appendChild(check(tick.keys, r.key));
+          const who = mk("div", "cel", r.name || r.who || "—");
+          who.style.color = "#7ce8a9";
+          g.appendChild(who);
+          const said = mk("div", "cel", r.text || "(no words kept)");
+          said.title = r.text || "";
+          said.style.color = r.text ? "#c8d6e4" : "#6d8199";
+          g.appendChild(said);
+          g.appendChild(mk("div", "cel",
+            r.seconds ? Math.round(r.seconds) + "s" : "—"));
+          g.appendChild(mk("div", "cel", wkMB(r.bytes)));
+          g.appendChild(mk("div", "cel",
+            r.age_minutes >= 60
+              ? (r.age_minutes / 60).toFixed(1) + "h"
+              : Math.round(r.age_minutes) + "m"));
+          const held = mk("div", "cel", r.held_by || "loose");
+          held.style.color = r.held_by ? "#8ba0b5" : "#f0a35e";
+          held.title = r.held_by
+            ? "held by " + r.held_by
+            : "nothing is holding this one — the horizon rolls it "
+              + "off first";
+          g.appendChild(held);
+          const acts = mk("div", "");
+          acts.style.cssText = "display:flex;gap:3px";
+          acts.appendChild(play(r));
+          acts.appendChild(keep(r));
+          acts.appendChild(read(r));
+          g.appendChild(acts);
+        });
+        if (!shown) {
+          const none = mk("div", "cel", "nothing matches that");
+          none.style.cssText = "grid-column:1/-1;opacity:.6;padding:4px 0";
+          g.appendChild(none);
+        }
+      };
+      let t = 0;
+      find.oninput = () => { clearTimeout(t); t = setTimeout(draw, 140); };
+      lcb.onchange = draw;
+      all.onclick = () => {
+        const q = String(find.value || "").toLowerCase().trim();
+        (pantry.rows || []).forEach((r) => {
+          if (lcb.checked && !r.loose) return;
+          if (q) {
+            const hay = ((r.text || "") + " " + (r.name || "") + " "
+              + (r.who || "") + " " + (r.label || "")).toLowerCase();
+            if (hay.indexOf(q) < 0) return;
+          }
+          tick.keys[r.key] = 1;
+        });
+        draw();
+        // re-check the boxes the redraw just made
+        Array.prototype.forEach.call(
+          g.querySelectorAll("input.wk-check"), (cb) => { cb.checked = true; });
+        retally();
+      };
+      draw();
+    }
+
+    /* --- the store room, on disk ---------------------------------- */
     const areas = ((disk && disk.areas) || []).filter((a) => a.purgeable
       && Number(a.bytes || 0) > 0);
     if (areas.length) {
-      const box = section("THE STORE ROOM — on disk",
-        "Ticking one empties that folder. Anything still being played "
-        + "out, and anything written in the last few minutes, is kept.");
+      cap("THE STORE ROOM — on disk",
+          "Ticking one empties that folder. Anything still playing out, "
+          + "and anything written in the last few minutes, is kept.");
       areas.sort((a, b) => Number(b.bytes || 0) - Number(a.bytes || 0));
-      areas.slice(0, 24).forEach((a) => {
-        tickRow(box, ticked.disk, a.key,
-          String(a.label || a.key),
-          (a.files || 0) + " file(s) · " + wkMB(a.bytes),
-          String(a.holds || ""));
+      const g = table(body, "16px 1fr 70px 80px", ["", "area", "files", "size"]);
+      areas.slice(0, 30).forEach((a) => {
+        g.appendChild(check(tick.disk, a.key));
+        const nm = mk("div", "cel", String(a.label || a.key));
+        nm.title = String(a.holds || "");
+        g.appendChild(nm);
+        g.appendChild(mk("div", "cel", String(a.files || 0)));
+        g.appendChild(mk("div", "cel", wkMB(a.bytes)));
       });
     }
+
     if (!body.firstChild) {
       body.appendChild(mk("div", "wk-note",
                           "nothing is cached and nothing is stored"));
     }
+    retally();
   };
   load();
 
   go.onclick = async () => {
-    const liveKeys = Object.keys(ticked.live);
-    const diskKeys = Object.keys(ticked.disk);
-    if (!liveKeys.length && !diskKeys.length) {
+    const liveKeys = Object.keys(tick.live);
+    const takeKeys = Object.keys(tick.keys);
+    const diskKeys = Object.keys(tick.disk);
+    if (!liveKeys.length && !takeKeys.length && !diskKeys.length) {
       note.textContent = "nothing is ticked";
       return;
     }
-    if (!window.confirm("Purge " + (liveKeys.concat(diskKeys)).join(", ")
+    const what = [];
+    if (liveKeys.length) what.push(liveKeys.join(", "));
+    if (takeKeys.length) what.push(takeKeys.length + " take(s)");
+    if (diskKeys.length) what.push(diskKeys.join(", "));
+    if (!window.confirm("Purge " + what.join(" + ")
                         + "? The station makes this material again.")) return;
     go.disabled = true;
     note.textContent = "purging…";
@@ -3423,8 +3612,13 @@ function wkPurgePop(anchor) {
       if (liveKeys.length) {
         const r = await api.post("/api/cache/purge", {areas: liveKeys});
         freed += Number((r && r.freed) || 0);
-        said.push(Object.keys((r && r.dropped) || {})
-          .map((k) => k + " " + r.dropped[k]).join(", "));
+        Object.keys((r && r.dropped) || {}).forEach((k) =>
+          said.push(k + " " + r.dropped[k]));
+      }
+      if (takeKeys.length) {
+        const r = await api.post("/api/cache/purge", {keys: takeKeys});
+        freed += Number((r && r.freed) || 0);
+        said.push(((r && r.dropped && r.dropped.takes) || 0) + " take(s)");
       }
       for (let i = 0; i < diskKeys.length; i += 1) {
         const r = await api.post(
@@ -3434,8 +3628,8 @@ function wkPurgePop(anchor) {
         if (r && r.count) said.push(diskKeys[i] + " " + r.count + " file(s)");
       }
       note.textContent = "purged — " + wkMB(freed) + " freed"
-        + (said.filter(Boolean).length
-           ? " (" + said.filter(Boolean).join("; ") + ")" : "");
+        + (said.length ? " (" + said.join("; ") + ")" : "");
+      tick.live = {}; tick.keys = {}; tick.disk = {};
       load();
     } catch (e) {
       note.textContent = "purge failed: " + ((e && e.message) || String(e));
@@ -3443,6 +3637,7 @@ function wkPurgePop(anchor) {
     go.disabled = false;
   };
 }
+
 
 /* #964 — THE LAST LINE THE ROOM MADE, on one line.
  *
