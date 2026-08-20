@@ -15942,6 +15942,52 @@ async def prep_one(kind: str) -> bool:
 _PREP_ROTA = ("ad", "station_id", "manager", "caller")
 _PREP_AT = [0]
 
+# #855: which schedule entries can be recorded before they are wanted.
+# `record` is not a round. `news` is a bulletin and goes stale. `deep`
+# and `recap` both read the last hour of the station's own log when they
+# are written, so preparing them early would have them recapping an hour
+# that has not happened.
+SCHED_PREP_KIND = {
+    "ad": "ad",
+    "manager": "manager",
+    "caller": "caller",
+    "banter_caller": "caller",
+    "bombshell": "ad",          # a short written read, same shelf shape
+}
+
+
+def schedule_prep_order(most: int = 6) -> list[str]:
+    """#855: the roads the running order is about to want, soonest first.
+
+    Reads the same sheet and the same clock schedule_take() uses, walks
+    forward over the entries still to come, and returns the prep kinds
+    behind them. Empty when no schedule is running, which is what makes
+    this additive — the keeper then works its old rotation."""
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return []
+        name = schedule_preset_now(store)
+        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
+                 if s.get("enabled", True)]
+        if not slots:
+            return []
+        pos = _RADIO.get("sched_pos") or {}
+        at = int(pos.get("index") or 0)
+        if not 0 <= at < len(slots):
+            at = 0
+        out: list[str] = []
+        for step in range(1, len(slots) + 1):
+            slot = slots[(at + step) % len(slots)]
+            kind = SCHED_PREP_KIND.get(str(slot.get("kind") or ""))
+            if kind and kind not in out:
+                out.append(kind)
+            if len(out) >= most:
+                break
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
 
 def pantry_window() -> str:
     """When it is cheap to build ahead: a record with room left on it, or
@@ -16056,14 +16102,31 @@ async def pantry_keeper() -> None:
             # the memos from upstairs, the phone calls. One item per pass,
             # in rotation, so the shelf fills evenly rather than filling
             # with whichever road happened to be cheapest.
-            for _ in range(len(_PREP_ROTA)):
+            # #855: THE RUNNING ORDER DECIDES WHO GOES IN. The entries
+            # the sheet is about to call for come first, soonest first,
+            # and the old rotation follows to keep the rest of the board
+            # stocked. With no schedule running the list is empty and
+            # this is exactly the old round-robin.
+            _coming = schedule_prep_order()
+            _board = list(_PREP_ROTA)
+            _queue = _coming + [k for k in _board if k not in _coming]
+            if _coming:
+                pipeline_log("lookahead", "the running order wants "
+                             + ", ".join(_coming[:4])
+                             + " — recording those first (#855)")
+            for _slot_at in range(len(_queue)):
                 if pantry_window() != window:
                     break
                 if (pantry_seconds() >= target
                         or pantry_bytes() >= PANTRY_MAX_BYTES):
                     break
-                _PREP_AT[0] = (_PREP_AT[0] + 1) % len(_PREP_ROTA)
-                _kind = _PREP_ROTA[_PREP_AT[0]]
+                if _coming:
+                    _kind = _queue[_slot_at]
+                else:
+                    # No sheet: keep the old rotation's memory so the
+                    # board still fills evenly across visits.
+                    _PREP_AT[0] = (_PREP_AT[0] + 1) % len(_PREP_ROTA)
+                    _kind = _PREP_ROTA[_PREP_AT[0]]
                 if shelf_full(_kind):
                     continue
                 # Writing is a MODEL visit, and live work outranks it. A
