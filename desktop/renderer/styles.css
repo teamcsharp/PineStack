@@ -1596,13 +1596,24 @@ body.immersive main {
   margin: 2px 0 8px;
 }
 .stream-routes label {
+  /* #981: name, where it goes, how loud it is - one row each. */
   display: grid;
-  grid-template-columns: 54px 1fr;
+  grid-template-columns: 54px minmax(0, 1fr) minmax(56px, 1fr);
   align-items: center;
   gap: 6px;
   font-size: 11px;
   color: var(--muted);
 }
+.stream-routes .stream-vol {
+  width: 100%;
+  min-width: 0;
+  height: 18px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--cyan);
+}
+.stream-routes label.away .stream-vol { accent-color: var(--amber); }
+.stream-routes label.hushed .stream-vol { accent-color: #6d8199; }
 .stream-routes select {
   height: 26px;
   padding: 0 6px;

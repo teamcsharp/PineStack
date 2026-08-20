@@ -13931,6 +13931,10 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
                 "ts": int(time.time() * 1000),
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": line,
+                # #981: a reply is not a DJ line, and the app holds the
+                # two at their own volumes. Nothing else reads this, so
+                # an older panel simply ignores it.
+                "kind": "reply",
             })
             del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         # And onto the box — if it is stalling right now, the ack waits on
@@ -68222,7 +68226,7 @@ searched for, newest first — click one to run it again">🕘</button>
               title="What is playing"></span>
         <button class="tbtn" onclick="djCall('prev')"
                 title="Previous song">⏮</button>
-        <audio id="musicPlayer" data-pine-live="1" controls playsinline></audio>
+        <audio id="musicPlayer" data-pine-live="music" controls playsinline></audio>
         <button class="tbtn" id="musicDownload" onclick="downloadTrack()"
                 title="Download the track that is playing">⤓</button>
         <button class="tbtn" onclick="djCall('next')"
@@ -85902,7 +85906,11 @@ function djVoiceEl(slot) {
     // #789: the desktop's booth-monitor switch mutes LIVE broadcast audio
     // only — everything tagged pine-live. Tapes, benchmarks and any player
     // you deliberately press play on stay audible in the app.
-    a.dataset.pineLive = "1";
+    // #981: and it names WHICH stream it is, so the app can hold the
+    // three at three different volumes. Re-stamped per clip in
+    // djVoicePlay, because one element carries both the DJs and the
+    // replies — they share this feed.
+    a.dataset.pineLive = "voice";
     document.body.appendChild(a);
     djVoiceEls[slot] = a;
   }
@@ -85922,6 +85930,14 @@ function djVoiceNext() {
     return;
   }
   const player = djVoiceEl(djVoiceSlot);
+  // #981: the DJs and the replies come down one feed, so the element is
+  // re-stamped for the clip it is about to carry. The desktop reads this
+  // to hold the two at different volumes; anything that cannot tell is
+  // treated as the booth, which is what it was before.
+  try {
+    player.dataset.pineLive = (String(clip.kind || "") === "reply")
+      ? "reply" : "voice";
+  } catch (e) { /* the clip still plays */ }
   djVoiceSlot = 1 - djVoiceSlot;
   djVoiceBusy = true;
   const broadcastAt = Number(clip.broadcastAt || Date.now());

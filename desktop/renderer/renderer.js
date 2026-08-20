@@ -146,6 +146,8 @@ function appVolumeScript(audible = true) {
   return `(() => {
     const volume = ${JSON.stringify(appVolume)};
     const audible = ${JSON.stringify(audible)};
+    // #981: how loud each stream is, as a proportion of app volume.
+    const streams = ${JSON.stringify(streamVolumes)};
     window.__pineDesktopVolume = audible ? volume : 0;
     window.__pineDesktopAudible = audible;
     const apply = () => {
@@ -158,11 +160,18 @@ function appVolumeScript(audible = true) {
         // (elements tagged data-pine-live: the music player + booth voice
         // lines). Tapes from the cache and anything you deliberately press
         // play on stay audible at app volume, always.
-        const live = !!(node.dataset && node.dataset.pineLive);
+        const tag = (node.dataset && node.dataset.pineLive) || "";
+        const live = !!tag;
         const nodeAudible = live ? audible : true;
-        const nextVolume = nodeAudible ? volume : 0;
+        // #981: a live element is scaled by ITS stream. Anything tagged
+        // but unnamed (an older panel writes "1") counts as the booth,
+        // which is what every one of them was before.
+        const share = live
+          ? (streams[tag === "1" ? "voice" : tag] ?? 1)
+          : 1;
+        const nextVolume = nodeAudible ? volume * share : 0;
         if (Math.abs(node.volume - nextVolume) > 0.001) node.volume = nextVolume;
-        const muted = !nodeAudible || volume <= 0;
+        const muted = !nodeAudible || nextVolume <= 0;
         if (node.muted !== muted) node.muted = muted;
       });
     };
@@ -199,6 +208,67 @@ function appVolumeScript(audible = true) {
 const STREAM_ROUTE_IDS = {
   music: "routeMusic", voice: "routeVoice", reply: "routeReply",
 };
+
+/* #981 - A VOLUME PER STREAM.
+ *
+ * App volume is the master and stays exactly what it was. These are
+ * proportions of it, so pulling the music down to a bed under the DJs is
+ * one drag and does not touch anything else. The panel tags each live
+ * audio element with the stream it is carrying, and the reply feed is
+ * re-stamped per clip because the DJs and the replies come down one
+ * feed - which is why this could not simply be done by element id. */
+const STREAM_VOL_IDS = {
+  music: "vol_music", voice: "vol_voice", reply: "vol_reply",
+};
+let streamVolumes = {music: 1, voice: 1, reply: 1};
+try {
+  const saved = JSON.parse(localStorage.getItem("pineStreamVolumes") || "null");
+  if (saved && typeof saved === "object") {
+    ["music", "voice", "reply"].forEach((k) => {
+      const v = Number(saved[k]);
+      if (Number.isFinite(v) && v >= 0 && v <= 1) streamVolumes[k] = v;
+    });
+  }
+} catch (err) { /* first run */ }
+
+function setStreamVolume(stream, fraction, persist = true) {
+  const v = Math.max(0, Math.min(1, Number(fraction) || 0));
+  streamVolumes[stream] = v;
+  const slider = $(STREAM_VOL_IDS[stream]);
+  if (slider && Math.abs(Number(slider.value) / 100 - v) > 0.005) {
+    slider.value = Math.round(v * 100);
+  }
+  const label = slider && slider.parentElement;
+  if (label) label.classList.toggle("hushed", v <= 0);
+  if (persist) {
+    try {
+      localStorage.setItem("pineStreamVolumes", JSON.stringify(streamVolumes));
+    } catch (err) { /* private mode: it still works this session */ }
+  }
+  applyAppVolume();
+  // The shell's own music player follows the music slider too, on the
+  // routes where it is the one playing the record.
+  try {
+    const player = $("desktopRadioPlayer");
+    if (player && stream === "music") {
+      player.volume = appVolume * v;
+      player.muted = appVolume * v <= 0;
+    }
+  } catch (err) { /* the slider still moved */ }
+}
+
+function initStreamVolumes() {
+  Object.keys(STREAM_VOL_IDS).forEach((stream) => {
+    const slider = $(STREAM_VOL_IDS[stream]);
+    if (!slider || slider.dataset.wired) return;
+    slider.dataset.wired = "1";
+    slider.value = Math.round((streamVolumes[stream] ?? 1) * 100);
+    slider.oninput = (ev) =>
+      setStreamVolume(stream, Number(ev.target.value) / 100);
+  });
+  ["music", "voice", "reply"].forEach(
+    (k) => setStreamVolume(k, streamVolumes[k], false));
+}
 
 /* Paint the three pickers from what the SERVER says, never from what
  * this app last asked for - the routing is shared between clients and
@@ -612,6 +682,7 @@ async function refresh() {
     lastRouting = status.routing || null;
     paintStreamRoutes(status.routing);
     initStreamRoutes();
+    initStreamVolumes();
     applyAppVolume();
     renderChecks(status);
   } catch (err) {

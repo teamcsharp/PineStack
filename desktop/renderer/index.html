@@ -47,6 +47,9 @@
             <option value="both">Both</option>
             <option value="off">Off</option>
           </select>
+          <input id="vol_music" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100"
+                 data-stream="music" title="Volume for this stream">
         </label>
         <label for="routeVoice"><span>DJs</span>
           <select id="routeVoice" data-stream="voice">
@@ -55,6 +58,9 @@
             <option value="both">Both</option>
             <option value="off">Off</option>
           </select>
+          <input id="vol_voice" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100"
+                 data-stream="voice" title="Volume for this stream">
         </label>
         <label for="routeReply"><span>Replies</span>
           <select id="routeReply" data-stream="reply">
@@ -63,6 +69,9 @@
             <option value="both">Both</option>
             <option value="off">Off</option>
           </select>
+          <input id="vol_reply" class="stream-vol" type="range"
+                 min="0" max="100" step="1" value="100"
+                 data-stream="reply" title="Volume for this stream">
         </label>
       </div>
       <label class="volume-row" for="appVolume">
