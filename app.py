@@ -1119,7 +1119,16 @@ def validate_settings(data: Any) -> dict[str, Any]:
             if isinstance(m, dict)
             and re.sub(r"[^a-z0-9_-]", "", str(m.get("id") or "").lower())
             not in ("", "main")
-        ][:12],
+        # #868: was [:12] — and a crystal built from a catalogue opens ONE
+        # MIND PER ALBUM (#832). Allen Interface asked for sixty-two. The
+        # cap kept the first twelve and dropped the rest on the floor with
+        # no error anywhere: mind_id() resolved the missing ids to "main",
+        # _mind_song's #829 guard rightly refused to write album lyrics into
+        # the operator's own shelf, and 1,221 already-ripped lyric pages
+        # never entered a mind. The number was a sanity bound on a
+        # hand-edited settings file, not a product limit, so it is now big
+        # enough for a large catalogue and still refuses an endless list.
+        ][:512],
         "speakbox_mind": re.sub(
             r"[^a-z0-9_-]", "",
             str(raw_dj.get("speakbox_mind") or "main").lower())[:40] or "main",
@@ -8501,6 +8510,12 @@ def take_note(who: str, voice: str, engine: str, text: str,
             "how": how,
         })
         del _TAKES[:-TAKES_MAX]
+        # #872: and into the task-cost ledger. The recording room already
+        # measured this line; the scheduler needs the same number to size
+        # a round it has not started yet. A shelf hit costs nothing and
+        # is not a measurement of the engine.
+        if how == "live" and int(ms or 0) > 0:
+            task_note("render_line", float(ms) / 1000.0, secs, True)
     except Exception:  # noqa: BLE001
         pass
 
@@ -8613,6 +8628,15 @@ def live_rendering() -> int:
 
 def engine_live_enter() -> None:
     """A live render begins. Never blocks — the air does not queue."""
+    # #872: THE FORCED INTERJECTION. Every live render in the station
+    # comes through here, so this is the one place that catches all of
+    # them: the moment the air wants the engine, preparation stands down
+    # at its very next line and keeps whatever it had finished. It is a
+    # flag, not a lock - nothing here can ever make a live line wait.
+    try:
+        prep_yield("a live line went to the engine")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         _ENGINE_LIVE[0] = max(0, int(_ENGINE_LIVE[0])) + 1
     except Exception:  # noqa: BLE001
@@ -8694,6 +8718,7 @@ def pantry_put(key: str, clip: dict[str, Any]) -> None:
     if not (clip or {}).get("path"):
         return
     _PANTRY[key] = {"clip": dict(clip), "at": time.time(), "used": 0}
+    _pantry_save()                                          # #915
     if len(_PANTRY) > PANTRY_MAX:
         for old in sorted(_PANTRY,
                           key=lambda k: float(_PANTRY[k].get("at") or 0)
@@ -8715,6 +8740,11 @@ def pantry_put(key: str, clip: dict[str, Any]) -> None:
                          "allowance — oldest takes shed (#894)")
     except Exception:  # noqa: BLE001
         pass
+
+
+def pantry_saved_note() -> None:
+    """Called after a take lands; throttled inside."""
+    _pantry_save()
 
 
 def pantry_seconds() -> float:
@@ -8846,6 +8876,635 @@ def prepare_target_seconds() -> float:
     except Exception:  # noqa: BLE001
         hours = 1.0
     return max(0.25, min(24.0, hours)) * 3600.0
+
+
+# --- The task-cost ledger (#872) --------------------------------------
+# "I want us analysing and keeping track of HOW LONG IT TAKES to complete
+# each task and our rounds of dialogue, so we can intelligently
+# rationalise how to set things up... that we're not tying up the room so
+# long that we're not able to process things in the immediate."
+#
+# One row per TASK TYPE, and every number in it is MEASURED. The preparer
+# times the work it does and writes down two things: what the task COST
+# (seconds the room was tied up) and what it BOUGHT (seconds of finished
+# audio that appeared in the pantry while it ran). Every scheduling
+# decision below is derived from that pair. There is no hand-ranked list
+# of "cheap" and "heavy" tasks anywhere in here - the ledger decides
+# which is which, on this box, tonight.
+#
+# It survives restarts, because a station that re-learns the cost of a
+# station ID after every deploy spends its first hour guessing.
+TASK_LEDGER_PATH = data_path("task_costs.json")
+TASK_LEDGER_KEEP = 60                   # samples kept per task type
+TASK_LEDGER_SAVE_EVERY = 120.0          # seconds between writes to disk
+TASK_LEDGER_TRUST = 3                   # samples before we believe them
+_TASK_LEDGER: dict[str, dict[str, Any]] = {}
+_TASK_LEDGER_LOADED = [False]
+_TASK_LEDGER_SAVED = [0.0]
+
+# BOOTSTRAP ONLY. Until a task type has TASK_LEDGER_TRUST real samples
+# these stand in, and they are deliberately PESSIMISTIC - guessing a task
+# cheap and finding it dear is exactly how the room gets tied up. Every
+# one of them is replaced by measurement within a few passes of going on
+# air, and nothing consults them again after that.
+TASK_SEED_COST = {
+    "station_id": 14.0, "ad": 24.0, "track_talk": 30.0,
+    "manager": 60.0, "caller": 80.0, "banter": 80.0,
+    "write": 14.0, "render_line": 7.0,
+}
+TASK_SEED_GAIN = {
+    "station_id": 6.0, "ad": 18.0, "track_talk": 20.0,
+    "manager": 45.0, "caller": 65.0, "banter": 65.0,
+    "write": 0.0, "render_line": 6.0,
+}
+TASK_LABEL = {
+    "station_id": "a station ID", "ad": "an advert",
+    "track_talk": "a record's own intro or send-off",
+    "manager": "a memo from upstairs", "caller": "a phone call",
+    "banter": "a banter round", "write": "one model visit",
+    "render_line": "one line rendered",
+}
+# The board the preparer picks from. Which of these is "cheapest" is a
+# question for the ledger, never a constant: prep_cheapest() reads the
+# measured costs and takes the real minimum.
+PREP_BOARD = ("ad", "station_id", "manager", "caller", "track_talk")
+
+
+def task_ledger_load() -> None:
+    """Read the measured costs back off disk, once."""
+    if _TASK_LEDGER_LOADED[0]:
+        return
+    _TASK_LEDGER_LOADED[0] = True
+    try:
+        rows = json.loads(TASK_LEDGER_PATH.read_text())
+        if not isinstance(rows, dict):
+            return
+        for kind, row in rows.items():
+            if not isinstance(row, dict):
+                continue
+            _TASK_LEDGER[str(kind)[:32]] = {
+                "kind": str(kind)[:32],
+                "count": int(row.get("count") or 0),
+                "fail": int(row.get("fail") or 0),
+                "secs": [float(x) for x in (row.get("secs") or [])
+                         ][-TASK_LEDGER_KEEP:],
+                "gain": [float(x) for x in (row.get("gain") or [])
+                         ][-TASK_LEDGER_KEEP:],
+                "last": (float(row["last"])
+                         if row.get("last") is not None else None),
+                "last_at": float(row.get("last_at") or 0),
+            }
+    except Exception:  # noqa: BLE001
+        pass                            # an unreadable ledger measures afresh
+
+
+def task_ledger_save(force: bool = False) -> None:
+    try:
+        if (not force and time.time() - _TASK_LEDGER_SAVED[0]
+                < TASK_LEDGER_SAVE_EVERY):
+            return
+        _TASK_LEDGER_SAVED[0] = time.time()
+        TASK_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        TASK_LEDGER_PATH.write_text(json.dumps(_TASK_LEDGER, default=str))
+    except Exception:  # noqa: BLE001
+        pass                            # a lost ledger never stops the show
+
+
+def task_note(kind: str, seconds: float, gain: float = 0.0,
+              ok: bool = True) -> None:
+    """One task done, and what it cost.
+
+    `seconds` is ROOM TIME - the wall clock the preparing room was tied
+    up for. `gain` is the finished audio that appeared while it ran."""
+    try:
+        task_ledger_load()
+        kind = str(kind or "")[:32]
+        seconds = max(0.0, float(seconds or 0))
+        # A zero is not a measurement and an hour is not a task; either
+        # would poison the p90 the whole policy is built on.
+        if not kind or seconds <= 0.05 or seconds > 3600.0:
+            return
+        row = _TASK_LEDGER.setdefault(kind, {
+            "kind": kind, "count": 0, "fail": 0,
+            "secs": [], "gain": [], "last": None, "last_at": 0.0})
+        row["count"] = int(row.get("count") or 0) + 1
+        if not ok:
+            row["fail"] = int(row.get("fail") or 0) + 1
+        row["secs"].append(round(seconds, 2))
+        row["gain"].append(round(max(0.0, float(gain or 0)), 2))
+        del row["secs"][:-TASK_LEDGER_KEEP]
+        del row["gain"][:-TASK_LEDGER_KEEP]
+        row["last"] = round(seconds, 2)
+        row["last_at"] = time.time()
+        task_ledger_save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _task_p90(rows: list[float]) -> float:
+    """The 90th percentile of a small sample, without importing a stats
+    library for it. Judge a task by its bad days, not its good ones."""
+    got = sorted(float(x) for x in rows if x is not None)
+    if not got:
+        return 0.0
+    at = int((len(got) - 1) * 0.9 + 0.9999)
+    return float(got[max(0, min(len(got) - 1, at))])
+
+
+def task_cost(kind: str) -> float:
+    """The number the scheduler PLANS with: the measured p90.
+
+    The seed stands in only until this box has measured the task for
+    itself, which takes TASK_LEDGER_TRUST goes."""
+    try:
+        task_ledger_load()
+        secs = [float(x) for x in
+                ((_TASK_LEDGER.get(str(kind)) or {}).get("secs") or [])]
+        if len(secs) >= TASK_LEDGER_TRUST:
+            return max(1.0, _task_p90(secs))
+    except Exception:  # noqa: BLE001
+        pass
+    return float(TASK_SEED_COST.get(str(kind), 45.0))
+
+
+def task_gain(kind: str) -> float:
+    """The finished audio one of these has actually been worth."""
+    try:
+        task_ledger_load()
+        gain = [float(x) for x in
+                ((_TASK_LEDGER.get(str(kind)) or {}).get("gain") or [])]
+        good = [g for g in gain if g > 0]
+        if len(good) >= TASK_LEDGER_TRUST:
+            return max(0.1, sum(good) / len(good))
+    except Exception:  # noqa: BLE001
+        pass
+    return float(TASK_SEED_GAIN.get(str(kind), 20.0))
+
+
+def task_rate(kind: str) -> float:
+    """Seconds of AIRTIME bought per second the room is tied up.
+
+    THE cheap-first number. A station ID is not preferred because
+    somebody wrote "station ID" at the top of a list - it is preferred
+    when, measured, it buys cover faster than anything else on the
+    board."""
+    cost = task_cost(kind)
+    return round(task_gain(kind) / cost, 3) if cost > 0 else 0.0
+
+
+def task_stat(kind: str) -> dict[str, Any]:
+    """One ledger row, as the operator reads it."""
+    try:
+        task_ledger_load()
+        row = _TASK_LEDGER.get(str(kind)) or {}
+        secs = [float(x) for x in (row.get("secs") or [])]
+        gain = [float(x) for x in (row.get("gain") or [])]
+        cost = task_cost(kind)
+        bought = task_gain(kind)
+        return {
+            "kind": str(kind),
+            "label": TASK_LABEL.get(str(kind), str(kind)),
+            "count": int(row.get("count") or 0),
+            "fail": int(row.get("fail") or 0),
+            "mean": round(sum(secs) / len(secs), 2) if secs else None,
+            "p90": round(_task_p90(secs), 2) if secs else None,
+            "last": row.get("last"),
+            "last_at": round(float(row.get("last_at") or 0), 1),
+            "gain_mean": round(sum(gain) / len(gain), 2) if gain else None,
+            "cost": round(cost, 1),
+            "airtime": round(bought, 1),
+            "rate": task_rate(kind),
+            "measured": len(secs) >= TASK_LEDGER_TRUST,
+        }
+    except Exception:  # noqa: BLE001
+        return {"kind": str(kind), "count": 0, "measured": False}
+
+
+def task_ledger_state() -> dict[str, Any]:
+    """The whole ledger - what every kind of work on this station has
+    cost, and what it bought."""
+    try:
+        task_ledger_load()
+        order = list(PREP_BOARD) + ["banter", "write", "render_line"]
+        order += [k for k in _TASK_LEDGER if k not in order]
+        return {
+            "tasks": [task_stat(k) for k in order],
+            "thin_seconds": round(prep_thin_seconds(), 1),
+            "deep_seconds": round(prep_deep_seconds(), 1),
+            "cheapest": prep_cheapest()[0],
+            "trust_after": TASK_LEDGER_TRUST,
+            "path": str(TASK_LEDGER_PATH),
+        }
+    except Exception:  # noqa: BLE001
+        return {"tasks": []}
+
+
+async def prep_measure(kind: str, work: Any) -> bool:
+    """Run one preparation task and write down what it cost and what it
+    bought. This is the ONLY thing that feeds the per-task ledger, so
+    every number the scheduler uses came off a task it really ran."""
+    t0 = time.monotonic()
+    try:
+        before = pantry_seconds()
+    except Exception:  # noqa: BLE001
+        before = 0.0
+    ok = False
+    try:
+        ok = bool(await work)
+    except Exception:  # noqa: BLE001
+        ok = False
+    try:
+        task_note(kind, time.monotonic() - t0,
+                  max(0.0, pantry_seconds() - before), ok)
+    except Exception:  # noqa: BLE001
+        pass
+    return ok
+
+
+# --- The forced interjection (#872) -----------------------------------
+# "That we always are scheduling things in a way where we're able to
+# FORCE AN INTERJECTION if needed for a current take that needs something
+# done... Dead air is the enemy."
+#
+# Preparation already stood down BETWEEN items. That is not enough: a
+# banter round is a dozen renders long, and standing down after the
+# twelfth is standing down a minute late. prep_yield() is the live road's
+# hand on the shoulder, and prep_should_stop() is asked between every
+# single LINE - so the longest anything can hold the room after the show
+# calls is one line, and whatever was finished before that is kept.
+PREP_YIELD_HOLD = 8.0                   # how long one shout stands preparation down
+_PREP_YIELD = [0.0]
+_PREP_YIELD_WHY = [""]
+_PREP_YIELD_COUNT = [0]
+# When the CURRENT task must be finished by. Absolute time; 0 is no
+# deadline. Set by pantry_keeper from the measured cost of the task it
+# chose and the room actually left in the window.
+_PREP_DEADLINE = [0.0]
+
+
+def prep_yield(why: str = "the live road wants the room") -> None:
+    """THE INTERJECTION. Any live road may call this, from anywhere, and
+    preparation stands down at the very next line rather than at the end
+    of whatever it is half way through."""
+    try:
+        _PREP_YIELD[0] = time.time()
+        _PREP_YIELD_WHY[0] = str(why or "")[:120]
+        _PREP_YIELD_COUNT[0] = int(_PREP_YIELD_COUNT[0]) + 1
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def prep_yielding() -> bool:
+    try:
+        return time.time() - float(_PREP_YIELD[0]) < PREP_YIELD_HOLD
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def prep_should_stop() -> str:
+    """'' to carry on; anything else is the reason to stop THIS INSTANT
+    and keep whatever is already finished.
+
+    Asked between every line, not merely between items."""
+    try:
+        if prep_yielding():
+            return _PREP_YIELD_WHY[0] or "a forced interjection"
+        if live_rendering():
+            return "a live line is on the engine"
+        if render_relief():
+            return "the engine is in relief"
+        if _SPEAKING[0]:
+            return "somebody is talking"
+        due = float(_PREP_DEADLINE[0] or 0)
+        if due and time.time() > due:
+            return "this task has used the room it was given"
+    except Exception:  # noqa: BLE001
+        return ""                       # never stop on a broken check
+    return ""
+
+
+# --- What we can AFFORD right now (#872) ------------------------------
+def prep_room_left() -> float:
+    """Seconds of BUILDING ROOM left in the window that is open now.
+
+    The same two shapes pantry_window() recognises, answered in seconds:
+    an ad break runs three minutes, and a record leaves whatever is left
+    of it minus the twenty-five seconds pantry_window() already insists
+    on keeping clear at the end. Zero means start nothing."""
+    try:
+        if not pantry_window():
+            return 0.0
+        ad = _RADIO.get("ad_now") or {}
+        if ad:
+            since = time.time() - float(ad.get("at") or 0)
+            if since < 180:
+                return max(0.0, 180.0 - since)
+        track = _RADIO.get("now") or {}
+        left = float(track.get("seconds") or 0) - (
+            time.time() - float(_RADIO.get("started") or 0))
+        return max(0.0, left - 25.0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def prep_cheapest(board: tuple[str, ...] = PREP_BOARD) -> tuple[str, float]:
+    """The shortest road on the board, by measurement."""
+    best, cost = "", 0.0
+    try:
+        for kind in board:
+            got = task_cost(kind)
+            if not best or got < cost:
+                best, cost = kind, got
+    except Exception:  # noqa: BLE001
+        return "station_id", 20.0
+    return best, (cost or 20.0)
+
+
+def prep_thin_seconds() -> float:
+    """The depth below which ONLY the cheapest work is allowed.
+
+    DERIVED, not chosen: four times the measured p90 of the cheapest
+    thing this station can make. Four, because the reserve has to survive
+    one attempt at restocking that fails, one that has to be retried, and
+    still have cover left over while the third runs. If the cheapest task
+    on this box measures thirty seconds then "thin" is two minutes here -
+    which is where the owner put it by eye - and if the engine slows down
+    tonight the floor rises with it, which is the whole point of taking it
+    off the ledger rather than out of a constant."""
+    try:
+        return max(90.0, min(600.0, 4.0 * prep_cheapest()[1]))
+    except Exception:  # noqa: BLE001
+        return 120.0
+
+
+def prep_deep_seconds() -> float:
+    """...and the depth above which the heavy roads open up outright."""
+    try:
+        return max(prep_thin_seconds() * 5.0,
+                   0.15 * prepare_target_seconds())
+    except Exception:  # noqa: BLE001
+        return 900.0
+
+
+def prep_need(kind: str) -> float:
+    """How BARE this road's shelf is: 0 is full, 1 is empty.
+
+    What the reserve NEEDS, as against what it can afford. It is what
+    keeps the old rotation's one good property (#842: "the shelf fills
+    evenly rather than filling with whichever road happened to be
+    cheapest") now that the rotation itself is gone."""
+    try:
+        if kind == "track_talk":
+            return track_talk_need()
+        cap = max(1, int(shelf_cap(kind)))
+        return max(0.0, min(1.0, 1.0 - len(shelf_rows(kind)) / float(cap)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def prep_tier(cover: float = -1.0) -> str:
+    """bare / steady / deep - how much cover the reserve is holding."""
+    try:
+        if cover < 0:
+            cover = pantry_seconds()
+        if cover < prep_thin_seconds():
+            return "bare"
+        if cover < prep_deep_seconds():
+            return "steady"
+    except Exception:  # noqa: BLE001
+        return "bare"
+    return "deep"
+
+
+def prep_budget(tier: str = "", room: float = -1.0,
+                cover: float = -1.0) -> float:
+    """The longest ONE task may tie the room up for, right now.
+
+    Two ceilings, both read off measurements. The ROOM - what is left of
+    this window - because a task still running when the record ends is a
+    task being made while somebody is waiting. And the COVER - never
+    spend longer making something than the finished audio standing by to
+    cover the spend, because that is precisely how a reserve becomes dead
+    air. The cheapest task on the board is always affordable, or a bare
+    pantry could never refill itself at all."""
+    try:
+        if room < 0:
+            room = prep_room_left()
+        if cover < 0:
+            cover = pantry_seconds()
+        cheap = prep_cheapest()[1]
+        tier = tier or prep_tier(cover)
+        if tier == "bare":
+            allow = cheap * 1.6         # the cheap end of the board, only
+        elif tier == "steady":
+            allow = cover * 0.5         # half the reserve on one task, never more
+        else:
+            allow = cover               # deep enough to cover the whole spend
+        return max(0.0, min(room, max(cheap, allow)))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+_PREP_LAST: dict[str, Any] = {}
+_PREP_LOG_AT = [0.0]
+_PREP_LOG_KEY = [""]
+
+
+def prep_plan(skip: Any = None) -> dict[str, Any]:
+    """WHAT to prepare next and WHY - the whole decision, in one place,
+    written down so the operator can read the reasoning.
+
+    "Initially we need to begin stacking up SHORTER takes and building a
+    reserve of very small things to get through the immediate moment.
+    Then as we build more time reserves we can begin delegating time to
+    weightier tasks that prepare us further into the future."
+
+    So: when the reserve is BARE the board is ordered by measured RATE -
+    seconds of airtime bought per second of room time - and the fastest
+    cover wins outright; the running order waits, because a running order
+    is no use to a station that has gone quiet. Once there is cover to
+    lead with, the running order leads again (#855) and the ledger's only
+    remaining job is to refuse anything that will not fit."""
+    skip = set(skip or ())
+    out: dict[str, Any] = {
+        "at": time.time(), "kind": "", "why": "", "tier": "bare",
+        "room": 0.0, "cover": 0.0, "budget": 0.0, "thin": 0.0,
+        "deep": 0.0, "forced": False, "critical": False,
+        "candidates": []}
+    try:
+        room = prep_room_left()
+        cover = pantry_seconds()
+        tier = prep_tier(cover)
+        budget = prep_budget(tier, room, cover)
+        out.update({"room": round(room, 1), "cover": round(cover, 1),
+                    "tier": tier, "budget": round(budget, 1),
+                    "thin": round(prep_thin_seconds(), 1),
+                    "deep": round(prep_deep_seconds(), 1)})
+        sheet = [k for k in schedule_prep_order() if k in PREP_BOARD]
+        order = list(sheet) + [k for k in PREP_BOARD if k not in sheet]
+        rows: list[dict[str, Any]] = []
+        for kind in order:
+            if kind in skip:
+                continue
+            if kind == "track_talk":
+                if track_talk_full():
+                    continue
+            elif shelf_full(kind):
+                continue
+            cost = task_cost(kind)
+            rows.append({"kind": kind,
+                         "label": TASK_LABEL.get(kind, kind),
+                         "cost": round(cost, 1),
+                         "airtime": round(task_gain(kind), 1),
+                         "rate": task_rate(kind),
+                         "need": round(prep_need(kind), 2),
+                         "measured": task_stat(kind).get("measured", False),
+                         "wanted": kind in sheet,
+                         "fits": cost <= budget})
+        out["candidates"] = rows
+        if room <= 0:
+            out["why"] = "no window is open - nothing may be built now"
+            return out
+        if not rows:
+            out["why"] = ("every road on the board has already been tried "
+                          "this pass" if skip
+                          else "every shelf on the board is full")
+            return out
+        fits = [r for r in rows if r["fits"]]
+        if not fits:
+            # #872 rule three: refuse the task rather than run it past
+            # the window, and take the SHORT thing instead.
+            cheapest = min(rows, key=lambda r: r["cost"])
+            if cheapest["cost"] <= room:
+                out.update({
+                    "kind": cheapest["kind"], "forced": True,
+                    "why": (f"the reserve is {int(cover)}s deep and nothing "
+                            f"on the board fits a {int(budget)}s budget - "
+                            f"taking the shortest task there is, "
+                            f"{cheapest['label']} at about "
+                            f"{int(cheapest['cost'])}s")})
+                return out
+            out["why"] = (f"nothing fits: the shortest task on the board "
+                          f"measures {int(cheapest['cost'])}s and only "
+                          f"{int(room)}s of this window is left - waiting "
+                          f"for a window that can hold it")
+            return out
+        if tier == "bare":
+            shortest = min(r["cost"] for r in fits)
+            if cover < shortest:
+                # Dead air is nearer than the END of the shortest task
+                # there is. Nothing matters now except how soon the next
+                # finished clip lands, so take the outright quickest -
+                # NOT the best rate, which may still be recording when
+                # the reserve runs out. "Get through the immediate
+                # moment" first; get efficient afterwards.
+                pick = min(fits, key=lambda r: (r["cost"], -r["rate"]))
+                out["critical"] = True
+                out["why"] = (
+                    f"the reserve is {int(cover)}s and the shortest task on "
+                    f"the board runs {int(shortest)}s - there is not enough "
+                    f"cover to outlast anything longer, so {pick['label']}: "
+                    f"the quickest finished audio there is")
+            else:
+                pick = max(fits, key=lambda r: (r["rate"], r["need"],
+                                                -r["cost"]))
+                out["why"] = (
+                    f"the reserve is {int(cover)}s, under the "
+                    f"{int(out['thin'])}s floor - cheapest first: "
+                    f"{pick['label']} buys {pick['rate']}s of air for every "
+                    f"second of room, the best rate on the board, at about "
+                    f"{int(pick['cost'])}s a go")
+        else:
+            # There is cover to lead with, so the running order leads
+            # (#855) - and where the sheet is silent, the emptiest shelf
+            # wins, which is what keeps the board filling evenly.
+            wanted = [r for r in fits if r.get("wanted")]
+            pick = (wanted[0] if wanted
+                    else max(fits, key=lambda r: (r["need"], -r["cost"])))
+            out["why"] = (
+                f"the reserve is {int(cover)}s ({tier}) and a {int(budget)}s "
+                f"budget covers {pick['label']} at about "
+                f"{int(pick['cost'])}s - "
+                + ("the running order wants it next (#855)"
+                   if pick.get("wanted") else
+                   f"its shelf is the barest on the board "
+                   f"({int(pick['need'] * 100)}% empty)"))
+        out["kind"] = pick["kind"]
+        return out
+    except Exception:  # noqa: BLE001
+        return out                      # a broken plan builds nothing, safely
+    finally:
+        try:
+            _PREP_LAST.clear()
+            _PREP_LAST.update(out)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def prep_log_plan(plan: dict[str, Any]) -> None:
+    """Put the choice and its reasoning behind the glass, not only in a
+    JSON field. Throttled: the same decision restated every six seconds
+    is noise, and noise is how a log stops being read."""
+    try:
+        _PREP_LAST.clear()
+        _PREP_LAST.update(plan or {})
+        kind = str((plan or {}).get("kind") or "")
+        tier = str((plan or {}).get("tier") or "")
+        key = f"{kind}|{tier}|{bool((plan or {}).get('forced'))}"
+        if key == _PREP_LOG_KEY[0] and time.time() - _PREP_LOG_AT[0] < 60.0:
+            return
+        _PREP_LOG_KEY[0] = key
+        _PREP_LOG_AT[0] = time.time()
+        why = str((plan or {}).get("why") or "")
+        head = (f"next up: {TASK_LABEL.get(kind, kind)} - {why}"
+                if kind else f"building nothing - {why}")
+        detail = "\n".join(
+            f"{r.get('label')}: about {r.get('cost')}s of room buys "
+            f"{r.get('airtime')}s of air ({r.get('rate')}x), shelf "
+            f"{int(float(r.get('need') or 0) * 100)}% empty"
+            + ("" if r.get("measured") else "  [seeded, not measured yet]")
+            + ("" if r.get("fits") else "  [over budget - refused]")
+            + ("  [the running order wants it]" if r.get("wanted") else "")
+            for r in ((plan or {}).get("candidates") or []))
+        pipeline_log(
+            "lookahead", head,
+            extra=("WHY THIS TASK AND NOT ANOTHER (#872)\n"
+                   f"reserve standing by: {(plan or {}).get('cover')}s\n"
+                   f"tier: {tier}  (bare under "
+                   f"{(plan or {}).get('thin')}s, deep over "
+                   f"{(plan or {}).get('deep')}s - both off the ledger)\n"
+                   f"room left in this window: {(plan or {}).get('room')}s\n"
+                   f"budget for ONE task: {(plan or {}).get('budget')}s\n\n"
+                   + detail))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def prep_state() -> dict[str, Any]:
+    """#872 telemetry: the ledger, the last decision and its reasoning,
+    and what the room is allowed to do right now."""
+    try:
+        cover = pantry_seconds()
+        return {
+            "ledger": task_ledger_state(),
+            "chose": dict(_PREP_LAST),
+            "tier": prep_tier(cover),
+            "cover": cover,
+            "room": round(prep_room_left(), 1),
+            "budget": round(prep_budget(), 1),
+            "thin": round(prep_thin_seconds(), 1),
+            "deep": round(prep_deep_seconds(), 1),
+            "deadline_in": (round(max(0.0, float(_PREP_DEADLINE[0])
+                                      - time.time()), 1)
+                            if _PREP_DEADLINE[0] else None),
+            "yielding": prep_yielding(),
+            "yields": int(_PREP_YIELD_COUNT[0]),
+            "yield_why": _PREP_YIELD_WHY[0],
+            "yield_age": (round(time.time() - _PREP_YIELD[0], 1)
+                          if _PREP_YIELD[0] else None),
+        }
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def pantry_burn() -> int:
@@ -14242,10 +14901,34 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
     if dj["lyrics_talk"] and not track.get("tape"):
         fire_and_forget(track_lyrics(track))
 
+    # #869: this record's introduction may already exist - written and
+    # read during a record that played an hour ago, keyed to THIS one.
+    # It named the song when it was written (it was written WITH the
+    # track, unlike a banked banter round), so it drops straight into the
+    # road below: dj_speak keys the pantry on exactly the spoken text it
+    # is handed, finds the clip already made, and the introduction costs
+    # the air neither a model visit nor a render. A request keeps the
+    # live road - a request line announces the person who asked for it.
+    _ahead_intro = None
+    try:
+        if (track_talk_on() and not track.get("tape")
+                and not track.get("requested")):
+            _ahead_intro = track_talk_get(track, "intro", take=True)
+    except Exception:  # noqa: BLE001
+        _ahead_intro = None
     if track.get("tape"):
         try:
             await dj_mixtape_intro(track)
         except Exception:
+            pass
+    elif _ahead_intro and str(_ahead_intro.get("text") or ""):
+        try:
+            pipeline_log("lookahead", "this record was introduced before it "
+                         "started - the words and the voice were both made "
+                         "during an earlier record (#869)")
+            await dj_speak("intro", track,
+                           line=str(_ahead_intro.get("text") or ""))
+        except Exception:  # noqa: BLE001
             pass
     else:
         await dj_speak(
@@ -14265,6 +14948,31 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
             await asyncio.sleep(0.8)
         except Exception:
             pass
+
+    # #869: and the record just gone gets its send-off, over the record
+    # now turning. PREPARED ONLY: this never writes and never renders on
+    # the air path, so a record with nothing ready is silently the show
+    # exactly as it is today. The co-host says it, so the pair have the
+    # dialogue "before and after every track" the owner asked for.
+    try:
+        if track_talk_on():
+            _gone = _RADIO.get("now") or {}
+            if str(_gone.get("id") or "") == str(track.get("id") or ""):
+                # Under records-first the needle is already down on THIS
+                # record, so the one just gone is the top of the history.
+                _gone = ((_RADIO.get("history") or []) or [{}])[-1]
+            _back = (track_talk_get(_gone, "outro", take=True)
+                     if (_gone or {}).get("id") else None)
+            if _back and str(_back.get("text") or ""):
+                pipeline_log("lookahead", "the record just gone gets the "
+                             "send-off written for it during an earlier "
+                             "record (#869)")
+                await dj_speak("interject", None,
+                               line=str(_back.get("text") or ""),
+                               who=str(_back.get("who") or "cohost"))
+                await asyncio.sleep(0.8)
+    except Exception:  # noqa: BLE001
+        pass
 
     # …and the station ID, over the top rather than in a hole.
     if _RADIO.pop("station_id_next", False):
@@ -15474,6 +16182,95 @@ def _larder_current(entry: dict[str, Any]) -> bool:
     return str(entry.get("profile") or "") == _larder_profile_signature()
 
 
+# #915: the finished audio outlives the process. The clips are already
+# on disk in the media directory — it was only the shelf that knew about
+# them that died on every restart, taking five to fifteen minutes of
+# prepared radio with it, five times an hour.
+PANTRY_PATH = data_path("pantry.json")
+SHELF_PATH = data_path("prep_shelf.json")
+SCHED_POS_PATH = data_path("sched_pos.json")
+_PANTRY_SAVED = [0.0]
+
+
+def _pantry_save(force: bool = False) -> None:
+    """Write the shelf down. Throttled — this runs after every take."""
+    if not force and time.time() - _PANTRY_SAVED[0] < 20:
+        return
+    _PANTRY_SAVED[0] = time.time()
+    try:
+        PANTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PANTRY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(
+            {k: {"clip": v.get("clip"), "at": v.get("at"),
+                 "used": v.get("used"), "bytes": v.get("bytes")}
+             for k, v in list(_PANTRY.items())}, default=str))
+        tmp.replace(PANTRY_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        tmp = SHELF_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_SHELF, default=str))
+        tmp.replace(SHELF_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _pantry_load() -> None:
+    """Take the shelf back up, dropping anything whose audio has gone."""
+    if _PANTRY:
+        return
+    kept = gone = 0
+    try:
+        rows = json.loads(PANTRY_PATH.read_text())
+        if isinstance(rows, dict):
+            for key, row in rows.items():
+                clip = (row or {}).get("clip") or {}
+                name = str(clip.get("path") or "").rsplit("/", 1)[-1]
+                name = name.split("?")[0]
+                if not name or not (VOICE_MEDIA_DIR / name).exists():
+                    gone += 1
+                    continue        # the pruner took it; do not promise it
+                _PANTRY[str(key)] = {"clip": clip,
+                                     "at": float(row.get("at") or 0),
+                                     "used": int(row.get("used") or 0),
+                                     "bytes": row.get("bytes")}
+                kept += 1
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = json.loads(SHELF_PATH.read_text())
+        if isinstance(rows, dict):
+            _SHELF.update({str(k): list(v or []) for k, v in rows.items()})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pos = json.loads(SCHED_POS_PATH.read_text())
+        if isinstance(pos, dict) and pos.get("preset"):
+            # #915: and the running order picks up where it left off
+            # instead of restarting the hour at entry one every time.
+            _RADIO["sched_pos"] = pos
+    except Exception:  # noqa: BLE001
+        pass
+    if kept or gone:
+        pipeline_log("lookahead", f"the pantry came back from disk — "
+                     f"{kept} take(s) still on the shelf"
+                     + (f", {gone} whose audio had been pruned" if gone
+                        else "") + " (#915)")
+
+
+def _sched_pos_save() -> None:
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        if not pos:
+            return
+        SCHED_POS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SCHED_POS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(pos, default=str))
+        tmp.replace(SCHED_POS_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _larder_save() -> None:
     try:
         LARDER_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -15691,10 +16488,29 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             if engine in ("xtts", "f5") and \
                     not await clone_engine_ready(engine):
                 break                   # the engine is busy or down; later
-            # #890: yield the moment the live road wants the engine. The
-            # buffer is worth nothing if building it is what made the
-            # station late.
-            if render_relief() or live_rendering():
+            # #890/#872: yield the moment the live road wants the engine.
+            # The buffer is worth nothing if building it is what made the
+            # station late. #872 widens this from "is a render in flight"
+            # to the whole stand-down question - a forced interjection, a
+            # relief, somebody talking, or this task having used up the
+            # room it was given - and it is asked HERE, between every
+            # single line, so the most the room can be held after the show
+            # calls for it is one line.
+            #
+            # Nothing is thrown away by stopping. entry["made"] and
+            # entry["seconds"] were written after each line above, the
+            # script is frozen, and the pantry is content-addressed - so
+            # the next pass picks up at the line this one stopped on and
+            # every line already recorded is still there to be found.
+            _stop = prep_should_stop()
+            if _stop:
+                entry["yielded"] = str(_stop)[:120]
+                entry["yielded_at"] = time.time()
+                if made:
+                    pipeline_log("lookahead",
+                                 f"stood down mid-round - {_stop} - "
+                                 f"{made} of {len(plan)} lines are made and "
+                                 "kept; the rest come next pass (#872)")
                 break
             # The same effects the live road would have drawn for this
             # seat — a real random draw, baked in now instead of then.
@@ -15727,7 +16543,12 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
                 float(entry.get("seconds") or 0)
                 + float((clip or {}).get("seconds") or 0), 1)
         entry["prepared"] = made >= len(plan)
+        # #872: a half-made round is PROGRESS, not a failure. Saying so
+        # here is what lets the keeper come back to it and the panel show
+        # it as partly recorded rather than as nothing at all.
+        entry["partial"] = bool(made) and not entry["prepared"]
         if entry["prepared"]:
+            entry.pop("yielded", None)
             pipeline_log("lookahead", f"a round is READY to air - "
                          f"{made} lines, {entry.get('seconds')}s of finished "
                          "audio waiting (#886)")
@@ -15796,9 +16617,11 @@ async def prep_render_line(text: str, who: str,
                 "seconds": float((ready or {}).get("seconds") or 0)}
     if engine in ("xtts", "f5") and not await clone_engine_ready(engine):
         return None                     # the engine is busy or down; later
-    # #890: yield the moment the live road wants the engine. A buffer is
-    # worth nothing if building it is what made the station late.
-    if render_relief() or live_rendering():
+    # #890/#872: yield the moment the live road wants the engine. A
+    # buffer is worth nothing if building it is what made the station
+    # late. The caller keeps the WORDS when this refuses (#904), so the
+    # model visit is never spent twice.
+    if prep_should_stop():
         return None
     fx = dict(voice_effect_pick())
     vec = performance_vector(who, voice)
@@ -15811,12 +16634,22 @@ async def prep_render_line(text: str, who: str,
     # #904: one engine budget, taken only if it is free right now.
     if not engine_prep_take():
         return None                     # the engine is busy; next pass
+    _t0 = time.monotonic()
     try:
         clip = await voice_render_any(text, voice, engine, fx=fx, who=who)
     except Exception:  # noqa: BLE001
         clip = None
     finally:
         engine_prep_give()
+    # #872: what a PREPARED line costs, measured on the same road the
+    # live one is measured on. Every estimate for a multi-line task is
+    # built out of these.
+    try:
+        task_note("render_line", time.monotonic() - _t0,
+                  float((clip or {}).get("seconds") or 0),
+                  bool((clip or {}).get("path")))
+    except Exception:  # noqa: BLE001
+        pass
     if not (clip or {}).get("path"):
         return None
     pantry_put(key, clip)
@@ -15939,10 +16772,256 @@ async def prep_round(kind: str) -> bool:
     return True
 
 
+# --- #869: the ten-track lookahead ------------------------------------
+# "I want a system that sets up the queue for the next 10 tracks that's
+# playing, and then the writing desk generates the dialogue for the DJs
+# to have before and after every track. We build that up into queue and
+# stack it in the reserve, record it in the writing room, put it in the
+# pantry, and then play it on air."
+#
+# The queue is already decided: requests jump it, then the queue itself,
+# exactly as dj_next_track() will read them. So the words for a record
+# can be written and read an hour before its needle drops - and, unlike a
+# banked banter round, they are written WITH the track in front of the
+# writer. A banked round is written with track=None and told NOT to name
+# a song, because it may end up airing over any record at all; this one
+# is keyed to ONE record and is used only when that record plays, so it
+# can and should name it.
+TRACK_TALK_AHEAD = 10                   # how many records deep to write
+TRACK_TALK_MAX = 60                     # rows held; they are only text
+_TRACK_TALK: dict[str, dict[str, Any]] = {}
+
+
+def track_talk_ahead() -> int:
+    try:
+        got = int(dj_settings().get("track_talk_ahead")
+                  or TRACK_TALK_AHEAD)
+    except Exception:  # noqa: BLE001
+        got = TRACK_TALK_AHEAD
+    return max(1, min(30, got))
+
+
+def track_talk_on() -> bool:
+    """Off by an operator switch; on by default."""
+    try:
+        return bool(dj_settings().get("track_talk", True))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def track_lookahead(most: int = 0) -> list[dict[str, Any]]:
+    """#869: the next records, soonest first.
+
+    The same line the panel shows as "upcoming" and the same one
+    dj_next_track() will walk: whatever is being introduced right now,
+    then the requests that jump the queue, then the queue. A mixtape slot
+    can still cut in ahead of all of it - that is a MISS, and a miss is
+    only ever a line written live, which is today's show."""
+    most = most or track_talk_ahead()
+    out: list[dict[str, Any]] = []
+    try:
+        coming = _RADIO.get("coming") or {}
+        line = (([coming] if coming.get("id") else [])
+                + list(_RADIO.get("requests") or [])
+                + list(_RADIO.get("queue") or []))
+        seen: set[str] = set()
+        for row in line:
+            tid = str((row or {}).get("id") or "")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            out.append(row)
+            if len(out) >= most:
+                break
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def track_talk_get(track: dict[str, Any] | None, part: str,
+                   take: bool = False) -> dict[str, Any] | None:
+    """The words prepared for one record, or None.
+
+    `take` removes it: a send-off is said once. The AUDIO is looked up
+    separately, by dj_speak, off the pantry key its own spoken text
+    computes - so a clip that has been pruned costs a live render and
+    nothing else, and the model visit is still saved."""
+    try:
+        tid = str((track or {}).get("id") or "")
+        if not tid:
+            return None
+        row = _TRACK_TALK.get(tid) or {}
+        got = row.get(part) or {}
+        if not str(got.get("text") or ""):
+            return None
+        if time.time() - float(got.get("at") or 0) > PANTRY_BURN_SECONDS:
+            return None
+        if take:
+            row.pop(part, None)
+            if not (row.get("intro") or row.get("outro")):
+                _TRACK_TALK.pop(tid, None)
+        return dict(got)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def track_talk_full() -> bool:
+    """Is there anything left to write for the records coming up?"""
+    try:
+        if not track_talk_on():
+            return True
+        for track in track_lookahead():
+            if track.get("tape"):
+                continue            # the mail has its own intro road
+            if not (track_talk_get(track, "intro")
+                    and track_talk_get(track, "outro")):
+                return False
+    except Exception:  # noqa: BLE001
+        return True
+    return True
+
+
+def track_talk_need() -> float:
+    """How much of the lookahead has no words yet: 0 is every upcoming
+    record written both sides, 1 is none of them."""
+    try:
+        if not track_talk_on():
+            return 0.0
+        line = [t for t in track_lookahead() if not t.get("tape")]
+        if not line:
+            return 0.0
+        got = sum(1 for t in line for part in ("intro", "outro")
+                  if track_talk_get(t, part))
+        return max(0.0, min(1.0, 1.0 - got / float(2 * len(line))))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def track_talk_state(most: int = 0) -> dict[str, Any]:
+    """#869 telemetry: the next N records and what is ready for each."""
+    rows: list[dict[str, Any]] = []
+    try:
+        for at, track in enumerate(track_lookahead(most)):
+            intro = track_talk_get(track, "intro")
+            outro = track_talk_get(track, "outro")
+            rows.append({
+                "at": at,
+                "id": str(track.get("id") or ""),
+                "title": str(track.get("title") or "")[:120],
+                "artist": str(track.get("artist") or "")[:120],
+                "seconds": float(track.get("seconds") or 0),
+                "tape": bool(track.get("tape")),
+                "intro": ("ready" if (intro or {}).get("key")
+                          else "written" if intro else ""),
+                "outro": ("ready" if (outro or {}).get("key")
+                          else "written" if outro else ""),
+                "intro_text": str((intro or {}).get("text") or "")[:300],
+                "outro_text": str((outro or {}).get("text") or "")[:300],
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ahead": track_talk_ahead(), "on": track_talk_on(),
+            "held": len(_TRACK_TALK), "tracks": rows}
+
+
+def _track_talk_prune() -> None:
+    """Drop what has gone stale, and what has fallen off the end."""
+    try:
+        now = time.time()
+        for tid in [k for k, r in list(_TRACK_TALK.items())
+                    if now - float((r or {}).get("at") or 0)
+                    > PANTRY_BURN_SECONDS]:
+            _TRACK_TALK.pop(tid, None)
+        while len(_TRACK_TALK) > TRACK_TALK_MAX:
+            oldest = min(_TRACK_TALK,
+                         key=lambda k: float(
+                             (_TRACK_TALK.get(k) or {}).get("at") or 0))
+            _TRACK_TALK.pop(oldest, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def prep_track_talk() -> bool:
+    """#869: one half of the dialogue around one upcoming record.
+
+    The host's introduction BEFORE it, and the co-host's send-off AFTER
+    it. One part per visit, so this behaves like every other road on the
+    board and the ledger can measure what one of them costs.
+
+    The intro drops straight into the intro road in _record_talk: it is
+    handed to dj_speak as a finished line, dj_speak keys the pantry on
+    exactly that spoken text, and the clip made an hour ago answers. The
+    record's introduction then costs the air road neither a model visit
+    nor a render."""
+    if not track_talk_on():
+        return False
+    try:
+        want: tuple[dict[str, Any], str] | None = None
+        for track in track_lookahead():
+            if track.get("tape") or not track.get("id"):
+                continue            # the mail writes its own introduction
+            for part in ("intro", "outro"):
+                if not track_talk_get(track, part):
+                    want = (track, part)
+                    break
+            if want:
+                break
+        if not want:
+            return False
+        track, part = want
+        if part == "intro":
+            # WITH the track. This is the whole difference from a banked
+            # round: it may name the song, because it will only ever be
+            # said over this song.
+            raw = await dj_line("intro", track)
+            kind = "intro"
+            who = "dj"
+        else:
+            raw = await dj_line(
+                "interject", track,
+                extra="that record has just finished playing - see it off: "
+                      "say what you made of it, name it once, and hand over "
+                      "to whatever is coming next")
+            kind = "interject"
+            who = "cohost"
+        text = prep_air_text(raw, kind)
+        if len(text) < 20:
+            return False
+        try:
+            voice = str((await session_voices()).get(who) or "")
+        except Exception:  # noqa: BLE001
+            voice = ""
+        made = await prep_render_line(text, who, voice)
+        row = _TRACK_TALK.setdefault(str(track.get("id")), {
+            "id": str(track.get("id")),
+            "title": str(track.get("title") or "")[:160],
+            "artist": str(track.get("artist") or "")[:160],
+            "at": time.time()})
+        row["at"] = time.time()
+        # #904's lesson: the WRITE is already paid for. A refused render
+        # keeps the words, and the voice comes on a later pass or live.
+        row[part] = {"text": text, "who": who, "at": time.time(),
+                     **(made or {})}
+        _track_talk_prune()
+        pipeline_log(
+            "lookahead",
+            ("an introduction" if part == "intro" else "a send-off")
+            + " is ready for "
+            + (str(track.get("title") or "a record")[:60])
+            + (f" - {made.get('seconds')}s of finished audio waiting"
+               if made else " - written, waiting on a voice")
+            + " (#869)")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def prep_one(kind: str) -> bool:
     """Prepare exactly one item of one content type. Never raises: the
     station stays on air whatever the preparer runs into."""
     try:
+        if kind == "track_talk":
+            return await prep_track_talk()
         if kind == "ad":
             return await prep_ad()
         if kind == "station_id":
@@ -16053,6 +17132,10 @@ async def pantry_keeper() -> None:
         await asyncio.sleep(6)
         try:
             pantry_burn()               # the 24-hour ceiling, every pass
+            # #872: no task is running, so nothing is on the clock. A
+            # deadline left standing from a previous pass would read as
+            # "already overrun" and stand every future pass down.
+            _PREP_DEADLINE[0] = 0.0
             if not _RADIO.get("on"):
                 continue
             window = pantry_window()
@@ -16072,7 +17155,18 @@ async def pantry_keeper() -> None:
                     break               # the live road wants the engine
                 if _entry.get("prepared") or _entry.get("preparing"):
                     continue
-                if not await larder_prepare(_entry):
+                # #872: on the clock, and measured. The clock is the room
+                # left in this window - larder_prepare asks
+                # prep_should_stop() between every line, so an overrun
+                # ends at the next line boundary with everything made so
+                # far kept, rather than running on over the handover.
+                _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+                try:
+                    _ok = await prep_measure("banter",
+                                             larder_prepare(_entry))
+                finally:
+                    _PREP_DEADLINE[0] = 0.0
+                if not _ok:
                     break               # engine said no; try again later
             # #842: a segment already WRITTEN but not fully rendered gets
             # its remaining lines before anything new is written — half a
@@ -16130,28 +17224,57 @@ async def pantry_keeper() -> None:
                 pipeline_log("lookahead", "the running order wants "
                              + ", ".join(_coming[:4])
                              + " — recording those first (#855)")
-            for _slot_at in range(len(_queue)):
+            # #872: WHAT NEXT is a DECISION now, not a rotation.
+            #
+            # "Initially we need to begin stacking up SHORTER takes and
+            # building a reserve of very small things to get through the
+            # immediate moment. Then as we build more time reserves we can
+            # begin delegating time to weightier tasks."
+            #
+            # prep_plan() answers it from three measured facts: what the
+            # reserve is holding, how much of this window is left, and
+            # what each road on the board has actually COST and BOUGHT on
+            # this box (the ledger). Below the thin floor it takes the
+            # best RATE - the road that buys airtime fastest, which is a
+            # bumper or a one-line ad read - and buys immediate cover.
+            # Above it the running order leads again (#855) and the ledger
+            # only refuses what will not fit. _queue and _PREP_AT are left
+            # standing above as the plain rotation this degrades to.
+            _skipped: set[str] = set()
+            for _slot_at in range(len(_queue) + 1):
                 if pantry_window() != window:
                     break
                 if (pantry_seconds() >= target
                         or pantry_bytes() >= PANTRY_MAX_BYTES):
                     break
-                if _coming:
-                    _kind = _queue[_slot_at]
-                else:
-                    # No sheet: keep the old rotation's memory so the
-                    # board still fills evenly across visits.
-                    _PREP_AT[0] = (_PREP_AT[0] + 1) % len(_PREP_ROTA)
-                    _kind = _PREP_ROTA[_PREP_AT[0]]
-                if shelf_full(_kind):
-                    continue
+                try:
+                    _plan = prep_plan(_skipped)
+                except Exception:  # noqa: BLE001
+                    _plan = {}
+                _kind = str(_plan.get("kind") or "")
+                if not _kind:
+                    prep_log_plan(_plan)
+                    break               # nothing on the board fits; wait
                 # Writing is a MODEL visit, and live work outranks it. A
                 # bumper is exempt: its liners are brewed in the
                 # background and taken off a stack, not written here.
                 if _OLLAMA_GATE.locked() and _kind != "station_id":
+                    _skipped.add(_kind)
                     continue
-                if await prep_one(_kind):
+                prep_log_plan(_plan)
+                # #872 rule three: a budget, not a hope. The task is
+                # stood down at its next line boundary if it runs past
+                # what the plan said it could have, and every line it did
+                # finish stays on the shelf.
+                _PREP_DEADLINE[0] = time.time() + max(
+                    10.0, float(_plan.get("budget") or 0) * 1.5)
+                try:
+                    _did = await prep_measure(_kind, prep_one(_kind))
+                finally:
+                    _PREP_DEADLINE[0] = 0.0
+                if _did:
                     break               # one item a visit; come back soon
+                _skipped.add(_kind)     # that road had nothing; try another
         except Exception:  # noqa: BLE001
             pass
 
@@ -16271,6 +17394,12 @@ def dialogue_flow_state() -> dict[str, Any]:
         # sixty minutes, what was asked for, and whether this hour is
         # behind its pace. Rides /api/dj under "dialogue_flow" too.
         "quota": quota_state(),
+        # #872: HOW LONG THINGS TAKE, what the preparer chose to do next
+        # and WHY it chose that, and what it is allowed to spend right
+        # now. #869: the records coming up and the dialogue standing
+        # ready for each of them.
+        "prep": prep_state(),
+        "lookahead": track_talk_state(),
     }
 
 
@@ -16747,6 +17876,7 @@ def dj_start(station: str) -> dict[str, Any]:
     })
     _routing_save()
     _larder_load()                     # yesterday's shelf still feeds today
+    _pantry_load()                     # #915: and the AUDIO it already made
     _box_hold_load()                   # held dialogue outlives the deploy
     task = asyncio.create_task(dj_show())
     _RADIO_TASK.append(task)
@@ -18476,6 +19606,7 @@ def schedule_take() -> dict[str, Any]:
         _RADIO["sched_pos"] = {"preset": name, "index": idx,
                                "started": started,
                                "slot_id": str(slot.get("id") or "")}
+        _sched_pos_save()                                   # #915
         text = schedule_prompt_for(store, slot)
         _RADIO["sched_prompt"] = (
             _schedule_clause(name, slot, text)
@@ -21821,11 +22952,17 @@ MINDS_DIR = data_path("minds")
 def speakbox_minds() -> list[dict[str, Any]]:
     rows = [{"id": "main", "name": "The studio", "dir": str(SPEAKBOX_DIR),
              "blurb": "", "builtin": True}]
+    seen = {"main"}
     try:
         for row in (dj_settings().get("speakbox_minds") or []):
             rid = re.sub(r"[^a-z0-9_-]", "", str(row.get("id") or "").lower())
-            if not rid or rid == "main":
+            # #868: one row per id, now that the list is allowed to be long.
+            # The settings file is hand-editable and _mind_ensure appends, so
+            # a duplicate is two heads sharing one folder — mind_row() hands
+            # back whichever came first while both write the same shelf.
+            if not rid or rid in seen:
                 continue
+            seen.add(rid)
             rows.append({
                 "id": rid,
                 "name": str(row.get("name") or rid)[:60],
@@ -21969,14 +23106,44 @@ def speakbox_lines(text: str) -> list[str]:
         flat = _SPEAKBOX_STAMP.sub("", " ".join(para.split()))
         if not flat or flat.startswith(("#", "![", "|", "```")):
             continue
+        # #868: a sentence shorter than thirty characters used to be thrown
+        # away, and a LYRIC is made of nothing else — "No corners." "No
+        # shadows." "Just white swallowing white." Measured across the Allen
+        # Interface documents, 23.1% of the sayable text never reached the
+        # vector store and the worst song lost 54% of itself, which is why
+        # the crystal read as two sentences a song. Short sentences now run
+        # together until the carry is worth saying: nothing is discarded, and
+        # every line handed out is still a whole thought.
+        carry = ""
+        began = len(out)
         for sentence in re.split(r"(?<=[.!?])\s+", flat):
             # spoken_text is what takes out [Music], [ __ ] and the rest of
             # the transcriber's own annotations.
             said = spoken_text(sentence).strip(" -*>\"'")
-            if 30 <= len(said) <= 200:
-                out.append(said)
-            elif len(said) > 200:
+            if not said:
+                continue
+            if len(said) > 200:
+                if carry:
+                    out.append(carry)
+                    carry = ""
                 out.extend(_speakbox_runs(said))
+                continue
+            carry = f"{carry} {said}" if carry else said
+            if len(carry) >= 30:
+                if len(carry) <= 200:
+                    out.append(carry)
+                else:
+                    out.extend(_speakbox_runs(carry))
+                carry = ""
+        if carry:
+            # The tail of a paragraph, still short. It belongs on the end of
+            # the line before it rather than in the bin — but only a line out
+            # of the SAME paragraph, so a stray "Yeah." cannot glue itself to
+            # the end of the stanza above.
+            if len(out) > began and len(out[-1]) + len(carry) + 1 <= 200:
+                out[-1] = f"{out[-1]} {carry}"
+            elif " " in carry:
+                out.append(carry)
     return out
 
 
@@ -22523,7 +23690,13 @@ async def speakbox_reindex(force: bool = False,
         # enough to hold a whole document yet keeps ALL ~222 files inside
         # SPEAKBOX_VEC_MAX, so no file is dropped when the shelf fills — the
         # earlier 300 let a few giant files eat the budget and truncate the rest.
-        swaths = [s for s in speakbox_lines(text) if len(s) >= 24][:100]
+        # #868: a flat 100 is the wrong shape for an ALBUM mind of thirty
+        # songs, which has the whole budget to itself. Share SPEAKBOX_VEC_MAX
+        # out over the documents actually present and never go below the old
+        # hundred, so the studio's big shelf keeps its behaviour while a small
+        # mind stops losing the back half of a long document.
+        _per_doc = min(1200, max(100, SPEAKBOX_VEC_MAX // max(1, len(present))))
+        swaths = [s for s in speakbox_lines(text) if len(s) >= 24][:_per_doc]
         vecs = await _embed_texts(swaths) if swaths else []
         for swath, vec in zip(swaths, vecs):
             chunks.append({"file": name, "text": swath[:600], "vec": vec})
@@ -22584,11 +23757,25 @@ async def speakbox_search(query: str, k: int = 5, exclude: str = "",
         # on the store and rebuilt only when the chunk list changes.
         try:
             import numpy as _np
+            # #914: THE CACHE KEY WAS WRONG, and it took every caller
+            # round with it. The matrix is built from `chunks` — the
+            # exclude-FILTERED list — but was cached under the identity
+            # of store["chunks"], the UNFILTERED one. So a draw with an
+            # exclude cached a short matrix, and the next draw without
+            # one hit that cache and indexed off the end:
+            #   IndexError: index 21615 is out of bounds ... size 21615
+            # caller_clock swallows it as a drop line, so the call was
+            # simply lost — which is why the phones read 0 of 5 an hour.
+            # The key now carries what the matrix was actually built
+            # from.
+            _key = (id(store.get("chunks")),
+                    len(store.get("chunks") or []),
+                    len(chunks), str(exclude or ""))
             _mat = store.get("_np")
-            if not _mat or _mat[0] is not store.get("chunks"):
+            if not _mat or _mat[0] != _key:
                 _arr = _np.asarray([c["vec"] for c in chunks],
                                    dtype=_np.float32)
-                _mat = (store.get("chunks"), _arr)
+                _mat = (_key, _arr)
                 store["_np"] = _mat
             _scores = _mat[1] @ _np.asarray(q, dtype=_np.float32)
             rows = []
@@ -35702,6 +36889,13 @@ async def ask_model(prompt: str, limit: int = 300,
                          "sched": str(_RADIO.get("sched_prompt") or "")[:900],
                          "num_ctx": _ctx})
     del _MODEL_CALLS[:-40]
+    # #872: what a MODEL VISIT costs, into the task-cost ledger. Every
+    # written task on the board pays for at least one of these, so this
+    # is the floor under every estimate the scheduler makes.
+    try:
+        task_note("write", float(took) / 1000.0, 0.0, bool(kept))
+    except Exception:  # noqa: BLE001
+        pass
     return kept
 
 
@@ -39936,6 +41130,416 @@ async def speakbox_mind_sources(
             "sources": [{"file": f, **v} for f, v in seen.items()]}
 
 
+# --- The re-scan (#868) -----------------------------------------------------
+# "I am seeing a lot of songs only two sentences, which is incorrect because I
+# know that these songs are multiple minutes long."
+#
+# He was right, and nothing had failed to READ the songs. The lyric pages were
+# ripped and written; they were then refused at the door of the mind, because
+# validate_settings kept only twelve speakbox_minds and mind_id() resolves an
+# unknown id to "main" — so _mind_song's #829 guard (correctly) would not put
+# album lyrics into the operator's own shelf, and returned 0 for 1,221 pages.
+#
+# The ceiling is lifted where it lives. This is the repair road for the damage
+# it already did, and it is deliberately timid:
+#
+#   * nothing runs unless somebody asks — no startup hook, no clock;
+#   * a dry run is the DEFAULT, and says exactly what it would move;
+#   * a document is only ever ADDED where there is none;
+#   * refilling a truncated document takes `upgrade`, and even then the old
+#     bytes are kept beside it as "<name>.md.bak-<stamp>", a name the shelf's
+#     own *.md glob cannot see;
+#   * nothing is ever deleted.
+
+
+def _rescan_slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(text or "").lower())
+
+
+def _rescan_key(stem: str) -> str:
+    """One song, however its file is spelled. Pages carry a leading track
+    number from before #793 ("008 - kdimension01"), documents in a mind carry
+    the " - lyrics" tail, and safe_key() is what named both."""
+    text = re.sub(r"^\s*\d{1,4}\s*[-_.]\s*", "", str(stem or ""))
+    text = re.sub(r"\s*-\s*lyrics$", "", text, flags=re.I)
+    return safe_key(text)
+
+
+def _mind_album_dirs(rid: str) -> list[Path]:
+    """Every data/lyrics/<artist>/<album> folder whose pages belong to this
+    album mind.
+
+    #832 named the mind "<artist slug>-<album slug>" while the folder kept
+    safe_key()'s spelling, and runs before #832 left Title Cased folders
+    behind ("Archimedes D2"), so both are matched on the same normalised
+    form — and the album slug is cut to the same 24 characters the mind id
+    was, or "nsolvev1" would swallow "nsolvev11"."""
+    want = re.sub(r"[^a-z0-9_-]", "", str(rid or "").lower())
+    found: list[Path] = []
+    if not want:
+        return found
+    try:
+        for artist_dir in sorted(LYRICS_DIR.glob("*")):
+            if not artist_dir.is_dir():
+                continue
+            a = _rescan_slug(artist_dir.name)[:20] or "artist"
+            for album_dir in sorted(artist_dir.glob("*")):
+                if not album_dir.is_dir():
+                    continue
+                b = _rescan_slug(album_dir.name)[:24] or "single"
+                if f"{a}-{b}" == want:
+                    found.append(album_dir)
+    except OSError:
+        pass
+    return found
+
+
+def _mind_library_tracks(rid: str) -> list[dict[str, Any]]:
+    """The library tracks this album mind was extracted from, found by
+    rebuilding the name #832 gave it out of the artist and album."""
+    want = re.sub(r"[^a-z0-9_-]", "", str(rid or "").lower())
+    out: list[dict[str, Any]] = []
+    if not want:
+        return out
+    try:
+        for t in music_index():
+            a = _rescan_slug(t.get("artist"))[:20] or "artist"
+            b = _rescan_slug(t.get("album") or "single")[:24] or "single"
+            if f"{a}-{b}" == want:
+                out.append(t)
+    except Exception:  # noqa: BLE001 — a cold library is not a failure
+        pass
+    return out
+
+
+def _rescan_staging(raw: str) -> Path | None:
+    """An operator folder of finished lyric sheets to read from. It has to sit
+    under data/ — that is the only tree mounted into this container, so
+    anything else is a folder the DJs could never read anyway."""
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    try:
+        path = Path(text).expanduser()
+        if not path.is_absolute():
+            path = DATA_DIR / text
+        path = path.resolve()
+        root = DATA_DIR.resolve()
+        if root not in path.parents and path != root:
+            return None
+        return path if path.is_dir() else None
+    except (OSError, ValueError):
+        return None
+
+
+def _rescan_read(path: Path | None) -> str:
+    if path is None:
+        return ""
+    try:
+        return path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+
+
+def _rescan_title(text: str, fallback: str = "") -> str:
+    for line in str(text or "").splitlines():
+        if line.startswith("# "):
+            got = line[2:].strip()
+            if got:
+                return got[:120]
+        if line.strip():
+            break
+    return fallback
+
+
+def _rescan_body(title: str, track: dict[str, Any] | None,
+                 page_text: str, staged_text: str) -> tuple[str, str]:
+    """The fullest text on hand for one song, and where it came from.
+
+    Ranked the way #831/#832 ranked them — the artist's own sheet, then the
+    words the file itself ships in its tags, then a sheet out of the folder
+    the operator pointed at, then the page already read off the recording.
+    A better-trusted source that turns out MUCH SHORTER does not win: the
+    point of a re-scan is to fill songs in, never to trade a long capture for
+    a short one."""
+    picks: list[tuple[int, int, str, str]] = []
+
+    def offer(rank: int, note: str, text: Any, floor: int = 120) -> None:
+        clean = str(text or "").strip()
+        if len(clean) >= floor:
+            picks.append((rank, len(clean), note, clean))
+
+    try:
+        offer(3, "the artist's own Suno lyric sheet",
+              _lyric_from_suno(title, float((track or {}).get("seconds") or 0)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if (track or {}).get("path"):
+            offer(2, "lyrics from the file's own tags",
+                  _lyric_from_tags(Path(str(track["path"]))), floor=200)
+    except Exception:  # noqa: BLE001
+        pass
+    offer(2, "a lyric sheet from the staging folder", staged_text)
+    offer(1, "the page already read off the recording", page_text, floor=1)
+    if not picks:
+        return "", ""
+    picks.sort(key=lambda row: (-row[0], -row[1]))
+    best = picks[0]
+    longest = max(picks, key=lambda row: row[1])
+    if longest[1] > best[1] * 1.25 + 200:
+        best = longest
+    return best[3], best[2]
+
+
+async def _mind_rescan(rid: str, apply: bool = False, upgrade: bool = False,
+                       staging: str = "",
+                       index: bool = True) -> dict[str, Any]:
+    """Re-scan ONE album mind: find every song that belongs to it, stack the
+    fullest text on hand into its docs folder, and say exactly what moved."""
+    want = re.sub(r"[^a-z0-9_-]", "", str(rid or "").lower())[:40]
+    out: dict[str, Any] = {
+        "mind": want, "name": "", "registered": False, "opened": False,
+        "songs_found": 0, "docs_before": 0, "docs_after": 0,
+        "chunks_before": 0, "chunks_after": 0,
+        "adopted": [], "upgraded": [], "would_refill": [],
+        "already_full": 0, "nothing_sung": 0,
+        "sources": {}, "errors": [], "note": "",
+    }
+    if not want or want == "main":
+        out["note"] = ("the studio's own shelf is never rewritten by a "
+                       "re-scan (#829)")
+        return out
+
+    known = any(m["id"] == want for m in speakbox_minds())
+    if not known and apply:
+        # The whole fault: these were never registered, so every read of them
+        # quietly became a read of "main".
+        try:
+            _mind_ensure(want, want.replace("-", " ").strip()[:60] or want)
+            known = any(m["id"] == want for m in speakbox_minds())
+            out["opened"] = known
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"could not open the mind: {exc}"[:200])
+    if not known and not apply:
+        out["note"] = ("not registered — it would be opened by a run with "
+                       "apply=1 (#868)")
+    out["registered"] = known
+    if known:
+        out["name"] = mind_row(want)["name"]
+
+    # Every song this mind could hold, from all three roads at once.
+    pages: dict[str, Path] = {}
+    for album_dir in _mind_album_dirs(want):
+        try:
+            for page in sorted(album_dir.glob("*.md")):
+                if page.name.startswith("_"):
+                    continue                 # the artist digest, not a song
+                pages.setdefault(_rescan_key(page.stem), page)
+        except OSError:
+            continue
+    staged: dict[str, Path] = {}
+    staged_dir = _rescan_staging(staging)
+    if staged_dir is not None:
+        try:
+            for sheet in sorted(staged_dir.glob("*.md")):
+                staged.setdefault(_rescan_key(sheet.stem), sheet)
+        except OSError:
+            pass
+    tracks: dict[str, dict[str, Any]] = {}
+    for row in _mind_library_tracks(want):
+        tracks.setdefault(safe_key(str(row.get("title") or "")), row)
+
+    keys = sorted({*pages, *staged, *tracks} - {""})
+    out["songs_found"] = len(keys)
+
+    root: Path | None = speakbox_dir(want) if known else None
+    have: dict[str, Path] = {}
+    if root is not None:
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+            for doc in sorted(root.glob("*.md")):
+                have.setdefault(_rescan_key(doc.stem), doc)
+        except OSError as exc:
+            out["errors"].append(f"{exc}"[:200])
+    out["docs_before"] = len(have)
+    if known:
+        try:
+            out["chunks_before"] = len(
+                _load_vectors(want).get("chunks") or [])
+        except Exception:  # noqa: BLE001
+            pass
+
+    stamp = int(time.time())
+    for key in keys:
+        track = tracks.get(key)
+        page_text = _rescan_read(pages.get(key))
+        staged_text = _rescan_read(staged.get(key))
+        title = (str((track or {}).get("title") or "").strip()
+                 or _rescan_title(page_text)
+                 or _rescan_title(staged_text) or key)
+        body, note = _rescan_body(title, track, page_text, staged_text)
+        if not body or not _lyric_usable(body):
+            out["nothing_sung"] += 1
+            continue
+        out["sources"][note] = int(out["sources"].get(note) or 0) + 1
+        if not body.lstrip().startswith("# "):
+            body = (f"# {title}\n\n"
+                    f"- re-scanned {time.strftime('%Y-%m-%d %H:%M')} "
+                    f"\u2014 {note} (#868)\n\n" + body)
+        doc = have.get(key)
+        if doc is None:
+            name = f"{safe_key(title) or key} - lyrics.md"
+            out["adopted"].append(name)
+            if apply and root is not None:
+                try:
+                    (root / name).write_text(body, encoding="utf-8")
+                except OSError as exc:
+                    out["errors"].append(f"{name}: {exc}"[:200])
+            continue
+        old = _rescan_read(doc)
+        if len(body) <= len(old) * 1.25 + 200:
+            out["already_full"] += 1        # nothing better on hand
+            continue
+        out["would_refill"].append({"file": doc.name, "was": len(old),
+                                    "now": len(body), "from": note})
+        if not (apply and upgrade):
+            continue
+        try:
+            # HIS bytes are never destroyed: the old page is parked under a
+            # name the *.md shelf glob cannot see before the fuller one lands.
+            (doc.parent / f"{doc.name}.bak-{stamp}").write_text(
+                old, encoding="utf-8")
+            doc.write_text(body, encoding="utf-8")
+            out["upgraded"].append(doc.name)
+        except OSError as exc:
+            out["errors"].append(f"{doc.name}: {exc}"[:200])
+
+    if root is not None:
+        try:
+            out["docs_after"] = len(list(root.glob("*.md")))
+        except OSError:
+            out["docs_after"] = out["docs_before"]
+    out["chunks_after"] = out["chunks_before"]
+    if apply and known and index and (out["adopted"] or out["upgraded"]):
+        try:
+            stats = await speakbox_reindex(rid=want)
+            out["chunks_after"] = int(stats.get("chunks") or 0)
+        except Exception as exc:  # noqa: BLE001
+            out["errors"].append(f"reindex: {exc}"[:200])
+    return out
+
+
+@app.post("/api/speakbox/minds/{rid}/rescan")
+async def speakbox_mind_rescan_api(
+    rid: str,
+    apply: bool = False,
+    upgrade: bool = False,
+    staging: str = "",
+    index: bool = True,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#868: read one mind's songs again and stack what is missing into it.
+
+    A DRY RUN by default — it reports what it would move and touches nothing.
+    `apply=1` writes, opening the mind first if the twelve-mind ceiling ever
+    lost it. `upgrade=1` also refills documents that are thinner than the text
+    now on hand, keeping the old bytes beside them. `staging=<folder under
+    data/>` reads finished lyric sheets out of a folder of your own."""
+    require_auth(authorization)
+    out = await _mind_rescan(rid, apply=apply, upgrade=upgrade,
+                             staging=staging, index=index)
+    if apply and (out["adopted"] or out["upgraded"]):
+        note_action(
+            f"\U0001f4da re-scanned {out['mind']} \u2014 "
+            f"{len(out['adopted'])} documents added, "
+            f"{len(out['upgraded'])} refilled, chunks "
+            f"{out['chunks_before']} \u2192 {out['chunks_after']}")
+    return out
+
+
+@app.post("/api/crystals/{cid}/rescan")
+async def crystal_rescan_api(
+    cid: str,
+    apply: bool = False,
+    upgrade: bool = False,
+    staging: str = "",
+    index: bool = False,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#868: every mind this crystal names, re-scanned in turn.
+
+    Same rules as the per-mind road — dry by default, adds only, never
+    deletes. Re-embedding sixty albums is minutes of work, so by default the
+    files land at once and the vectors are rebuilt behind the request, one
+    mind at a time; watch /api/speakbox/minds for the chunk counts climbing,
+    or pass index=1 to wait for it."""
+    require_auth(authorization)
+    key = re.sub(r"[^a-z0-9_-]", "", str(cid or "").lower())[:40]
+    data = crystals_read()
+    row = data.get(key)
+    if not isinstance(row, dict):
+        raise HTTPException(status_code=404, detail="No such crystal")
+    ids = [str(m) for m in (row.get("minds") or []) if str(m or "").strip()]
+    minds: list[dict[str, Any]] = []
+    touched: list[str] = []
+    for one in ids:
+        got = await _mind_rescan(one, apply=apply, upgrade=upgrade,
+                                 staging=staging, index=bool(index))
+        minds.append(got)
+        if got["adopted"] or got["upgraded"]:
+            touched.append(got["mind"])
+        await asyncio.sleep(0)          # never hold the show's loop
+    # #868: "main" inside a crystal's mind list is not a mind of the
+    # crystal's — it is the operator's own studio shelf, and while it sat
+    # there every draw from this crystal could reach into his private
+    # documents. It was put there by an extraction from before #829/#832.
+    studio = "main" in ids
+    if studio and apply:
+        try:
+            data[key] = {**row, "minds": [m for m in ids if m != "main"]}
+            crystals_save(data)
+        except Exception as exc:  # noqa: BLE001
+            studio = f"could not drop it: {exc}"[:120]
+
+    async def _later() -> None:
+        for one in touched:
+            try:
+                await speakbox_reindex(rid=one)
+            except Exception:  # noqa: BLE001
+                continue
+        pipeline_log("speakbox", f"{key} \u2014 re-scan reindexed "
+                                 f"{len(touched)} minds (#868)")
+    if apply and touched and not index:
+        fire_and_forget(_later())
+    added = sum(len(m["adopted"]) for m in minds)
+    filled = sum(len(m["upgraded"]) for m in minds)
+    if apply and (added or filled):
+        note_action(f"\U0001f52e re-scanned the {row.get('name') or key} "
+                    f"crystal \u2014 {added} documents added across "
+                    f"{len(touched)} minds, {filled} refilled")
+    return {
+        "crystal": key, "name": str(row.get("name") or key),
+        "applied": bool(apply), "upgrade": bool(upgrade),
+        "minds": len(minds),
+        "minds_opened": sum(1 for m in minds if m["opened"]),
+        "minds_unregistered": [m["mind"] for m in minds
+                               if not m["registered"]],
+        "documents_added": added, "documents_refilled": filled,
+        "would_refill": sum(len(m["would_refill"]) for m in minds),
+        "songs_found": sum(m["songs_found"] for m in minds),
+        "docs_before": sum(m["docs_before"] for m in minds),
+        "docs_after": sum(m["docs_after"] for m in minds),
+        "chunks_before": sum(m["chunks_before"] for m in minds),
+        "chunks_after": sum(m["chunks_after"] for m in minds),
+        "reindex": ("waited" if index else
+                    ("running behind this request \u2014 watch "
+                     "/api/speakbox/minds" if (apply and touched) else "none")),
+        "studio_shelf_in_the_list": studio,
+        "detail": minds,
+    }
+
+
 @app.get("/api/crystals/influence")
 async def crystals_influence_api(
     authorization: str | None = Header(default=None),
@@ -43139,6 +44743,10 @@ async def dj_pending(
         "window": window,
         "building": bool(window),
         "target": int(dj_settings().get("dialogue_reserve_target") or 6),
+        # #872/#869: the cost ledger, the reasoning behind the task the
+        # keeper picked, and the next records with their prepared talk.
+        "prep": prep_state(),
+        "lookahead": track_talk_state(),
     }
 
 
