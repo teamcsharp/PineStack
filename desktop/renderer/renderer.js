@@ -1879,6 +1879,31 @@ function initWorksPopup() {
         };
         it.appendChild(b);
       });
+      /* #923: and put THIS one through, now. Pins the exact candidate
+       * so the shelf hands over the one that was pressed, then
+       * interjects a single round — the hour is not moved, so the
+       * running order carries on from where it was afterwards. */
+      try {
+        const ring = mk("button", "", "\u260e");
+        ring.title = "Put this one on the air now. The hour is not "
+          + "moved \u2014 it carries on from where it was afterwards.";
+        ring.style.cssText = "font-size:9px;padding:0 5px";
+        ring.onclick = async (ev) => {
+          ev.stopPropagation();
+          ring.disabled = true;
+          const was = ring.textContent;
+          ring.textContent = "\u2026";
+          try {
+            await api.post("/api/shelf/air", {kind: kind, id: c.id});
+            ring.textContent = "on air";
+          } catch (e2) { ring.textContent = "refused"; }
+          setTimeout(() => {
+            ring.textContent = was;
+            ring.disabled = false;
+          }, 5000);
+        };
+        it.appendChild(ring);
+      } catch (e) { /* still listed */ }
       /* #939: play the section, keep it, or open its transcript and
        * take any single line out of it. */
       try { wkTapeBar(it, kind, c.id); } catch (e) { /* still listed */ }
@@ -2936,22 +2961,79 @@ function worksSchedule(anchorPop) {
     body.textContent = "";
     if (!hour) { body.appendChild(mk("div", "wk-note", "reading…")); return; }
     label.textContent = hour.label + " · " + hour.date
-      + (hour.is_now ? "  (on air)" : "");
-    sub.textContent = hour.preset + (hour.overridden ? " · edited" : "");
+      + (hour.is_now ? "  (on air)" : hour.is_past ? "  (aired)" : "");
+    sub.textContent = hour.preset + (hour.overridden ? " · edited" : "")
+      + (hour.is_past ? " · aired, inert" : "");
     if (hour.overridden) {
       const rv = mk("button", "", "↺ back to the running order");
       rv.style.cssText = "font-size:10px;margin-bottom:6px;padding:2px 7px";
       rv.onclick = revert;
       body.appendChild(rv);
     }
+    /* #920: "I'm still able to modify them and schedule them for future
+     * tasks." A past hour is a running order that has already proved
+     * itself on air - this copies the whole of it onto a future hour,
+     * where it is an ordinary hour override and every tile is live
+     * again. Nothing about the past hour changes; it is a copy. */
+    if (hour.is_past) {
+      const fwd = mk("div", "wk-note", "");
+      fwd.style.cssText = "display:flex;gap:5px;align-items:center;"
+        + "flex-wrap:wrap;margin-bottom:6px;font-size:9.5px;opacity:.85";
+      fwd.appendChild(mk("span", "", "this hour has aired · send it"));
+      const num = mk("input", "");
+      num.type = "number";
+      num.value = "24";
+      num.min = "1";
+      num.max = "168";
+      num.style.cssText = "width:54px;font-size:10px";
+      fwd.appendChild(num);
+      fwd.appendChild(mk("span", "", "hours on"));
+      const go = mk("button", "", "\u21aa schedule it forward");
+      go.title = "Copy this whole running order onto a future hour, "
+        + "where it can actually be aired. The past hour is left alone.";
+      go.style.cssText = "font-size:9.5px;padding:1px 6px";
+      go.onclick = async (ev) => {
+        ev.stopPropagation();
+        const was = go.textContent;
+        go.disabled = true;
+        go.textContent = "\u2026";
+        try {
+          const key = hourKeyFrom(hour.key, Number(num.value) || 24);
+          await api.post("/api/schedule/hours",
+                         {key: key, slots: hour.slots || []});
+          go.textContent = "\u2713 " + key;
+        } catch (e) {
+          go.textContent = "could not";
+        }
+        setTimeout(() => { go.textContent = was; go.disabled = false; },
+                   4500);
+      };
+      fwd.appendChild(go);
+      body.appendChild(fwd);
+    }
     (hour.slots || []).forEach((s, i) => {
       const row = mk("div", "wk-stage");
+      /* #920: a half hour the clock has gone past is INERT. Greyed right
+       * down and desaturated so the sheet reads at a glance as "this has
+       * already happened" - and yet every control on it still works,
+       * because the operator asked to be able to modify a past tile and
+       * schedule it forward. The one thing it cannot do is go on air
+       * again, and that is the clock's decision rather than the panel's:
+       * `past` is stamped on the tile by schedule_hours_view.
+       *
+       * The entry ON AIR is never greyed even when the sheet's own clock
+       * has run past its minutes - the running order's walk is what says
+       * which entry owns the air, and greying out the thing the station
+       * is doing right now would be the sheet arguing with the booth. */
+      const gone = !!s.past && s.state !== "on air";
       // #890: room for the corner icon, and nothing runs under it.
       row.style.cssText = "position:relative;padding:5px 34px 5px 8px;"
         + "margin:0 0 4px;border-left:3px solid "
         + (s.state === "on air" ? "#7ce8a9"
+           : gone ? "#3a4553"
            : s.enabled === false ? "#44515f" : "#3f7fa8")
-        + ";opacity:" + (s.enabled === false ? ".5" : "1");
+        + ";opacity:" + (gone ? ".45" : s.enabled === false ? ".5" : "1")
+        + (gone ? ";filter:grayscale(.75)" : "");
       row.draggable = true;
       row.addEventListener("dragstart", () => { dragFrom = i; });
       row.addEventListener("dragover", (ev) => ev.preventDefault());
@@ -3109,6 +3191,62 @@ function worksSchedule(anchorPop) {
           };
           row.appendChild(grab);
         } catch (e) { /* the tile still draws */ }
+      }
+
+      /* #920: and the DOWNLOAD of what actually went out in this entry.
+       * Only a tile the clock has finished with has one. The server
+       * welds it out of the booth's own record of what aired inside this
+       * entry's span, keeps it for two hours and then deletes it - after
+       * which this says "deleted" rather than handing over the nearest
+       * thing to it and letting the operator find out on playback. */
+      if (gone) {
+        const tape = mk("div", "wk-note", "");
+        tape.style.cssText = "font-size:9px;margin-top:3px;display:flex;"
+          + "gap:5px;align-items:center;flex-wrap:wrap";
+        const inert = mk("span", "", "\u25cf inert · already aired");
+        inert.style.cssText = "color:#8fa2b6;opacity:.9";
+        tape.appendChild(inert);
+        const keep = mk("button", "", "\u2b07 keep what aired");
+        keep.title = "Download what actually went out in this entry, "
+          + "welded into one file. Kept for two hours after it airs, "
+          + "then deleted.";
+        keep.style.cssText = "font-size:9px;padding:1px 6px";
+        keep.onclick = async (ev) => {
+          ev.stopPropagation();
+          const was = keep.textContent;
+          keep.disabled = true;
+          keep.textContent = "\u2026";
+          let got = null;
+          try {
+            got = await api.get("/api/schedule/aired?hour="
+              + encodeURIComponent(hour.key) + "&slot="
+              + encodeURIComponent(s.id));
+          } catch (e) { got = null; }
+          if (!got || !got.ready) {
+            keep.textContent = got && got.pruned ? "deleted" : "nothing kept";
+            keep.title = (got && got.why)
+              || "the station could not be asked for this one";
+            setTimeout(() => {
+              keep.textContent = was;
+              keep.disabled = false;
+            }, 6000);
+            return;
+          }
+          keep.textContent = was;
+          keep.disabled = false;
+          await wkSaveBlob(
+            wkMediaUrl(got),
+            wkFileName(hour.date + " " + (s.starts_at || "") + " "
+                       + (s.label || s.kind),
+                       String(got.media || "x.wav").split(".").pop()),
+            keep);
+        };
+        tape.appendChild(keep);
+        const held = mk("span", "wk-note", "");
+        held.style.cssText = "font-size:9px;opacity:.55";
+        held.textContent = "kept 2h";
+        tape.appendChild(held);
+        row.appendChild(tape);
       }
 
       const gear = mk("button", "", "⚙ this entry, this hour");
@@ -3718,7 +3856,32 @@ function worksSchedule(anchorPop) {
            + "T" + p(d.getHours());
   }
 
-  prev.onclick = () => { offset = Math.max(0, offset - 1); load(); };
+  /* #920: n hours on from a NAMED hour rather than from now - what
+   * "schedule this one forward" needs. Built through a real Date so the
+   * clocks changing cannot hand the panel an hour that does not exist,
+   * exactly as _sched_hour_shift does at the other end. */
+  function hourKeyFrom(key, n) {
+    const bits = String(key || "").match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2})$/);
+    const d = bits
+      ? new Date(Number(bits[1]), Number(bits[2]) - 1, Number(bits[3]),
+                 Number(bits[4]), 0, 0, 0)
+      : new Date();
+    d.setMinutes(0, 0, 0);
+    d.setHours(d.getHours() + (Number(n) || 0));
+    const p = (v) => String(v).padStart(2, "0");
+    return d.getFullYear() + "-" + p(d.getMonth() + 1) + "-" + p(d.getDate())
+           + "T" + p(d.getHours());
+  }
+
+  /* #920: "Allow me to scroll back to previous half hour stretches."
+   * The ‹ button clamped at the hour on air, so there was nothing behind
+   * it to reach at all - which is the whole of what the operator was
+   * clicking in the screenshot. Twelve hours back is as far as it goes:
+   * the RECORDINGS only survive two of them, and past that the tiles are
+   * there to be read and copied forward, which is the other half of what
+   * was asked for. The five-second reload still only follows the hour on
+   * air, so a past sheet you are reading holds still. */
+  prev.onclick = () => { offset = Math.max(-12, offset - 1); load(); };
   next.onclick = () => { offset = Math.min(72, offset + 1); load(); };
   load();
   const tick = setInterval(() => { if (!offset) load(); }, 5000);

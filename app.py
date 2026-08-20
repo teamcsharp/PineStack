@@ -9357,12 +9357,23 @@ def shelf_full(kind: str) -> bool:
                 r for r in _news_rows
                 if time.time() - float((r.get("entry") or {}).get(
                     "prep_news_at") or 0) <= NEWS_PREP_LIFE]
-            if _news_rows:
-                return True             # one at a time, never a backlog
-            # ...and outside the short horizon a bulletin can survive,
-            # this road is "full" so the adaptive planner never picks a
-            # task that could only refuse itself. See prep_news().
-            return not (0.0 <= schedule_prep_eta("news") <= NEWS_PREP_AHEAD)
+            # #921: "ONE AT A TIME" WAS THE WHOLE TROUBLE. The News entry
+            # on the canonical hour owns four minutes and one bulletin is
+            # ninety seconds of it, so a shelf this function called FULL
+            # still left most of the segment to be written live — which
+            # is the silence the operator heard. Full now means the shelf
+            # covers the SECONDS the coming entry owns, measured the same
+            # way hour_needs() measures every other road of the hour.
+            _want = news_want_seconds()
+            if _want <= 0:
+                # Outside the short horizon a bulletin can survive, this
+                # road is "full" so the adaptive planner never picks a
+                # task that could only refuse itself. See prep_news().
+                return True
+            if len(_news_rows) >= NEWS_SHELF_MOST:
+                return True             # deep enough; never a backlog
+            return sum(float(r.get("seconds") or 0)
+                       for r in _news_rows) >= _want
     except Exception:  # noqa: BLE001
         return True
     return len(shelf_rows(kind)) >= shelf_cap(kind)
@@ -10349,6 +10360,19 @@ def _protected_media_keys() -> set[str]:
         key = path.rsplit("/", 1)[-1].split("?")[0]
         if key:
             keys.add(key)
+    # #920: and the two-hour archive of what actually went out. It is
+    # welded on demand and it is the only copy there is - letting the
+    # rolling media prune cycle it out would make the hour sheet's
+    # download button lie about what it is holding. _hour_tape_prune()
+    # deletes these itself the moment the two hours are up, which is what
+    # takes them back out of this set.
+    try:
+        for row in list(_HOUR_TAPE.values()):
+            key = str((row or {}).get("media") or "")
+            if key:
+                keys.add(key)
+    except Exception:  # noqa: BLE001
+        pass
     return keys
 
 
@@ -17978,16 +18002,120 @@ async def prep_gallery() -> bool:
 # is that the desk covers different stories rather than the same ones -
 # it can never go quiet over it, because news_selection's own fallback
 # reaches for the least recently covered when the page is exhausted.
-NEWS_PREP_AHEAD = 900.0                 # write one only this close to it
-NEWS_PREP_LIFE = 1200.0                 # and never air one older than this
+
+# --- #921 REVISITED THE HORIZON --------------------------------------
+#
+# "We should be scheduling and preparing these sections so they dont go
+#  out blank and run this like a studio."
+#
+# #855's reasoning above is still right and none of it is undone here.
+# What was wrong were its two NUMBERS, for two different reasons:
+#
+#   * ONE BULLETIN IS NOT A SEGMENT. The News entry on the canonical
+#     hour owns FOUR MINUTES. One prepared round is ninety seconds of
+#     that at best, so even a perfectly kept shelf left two and a half
+#     minutes of the entry to be written live — which is precisely the
+#     silence #921 is about. The shelf holds as many bulletins as the
+#     entry's own minutes call for now, and shelf_full() measures it in
+#     SECONDS against those minutes rather than counting to one.
+#   * FIFTEEN MINUTES IS ONE CHANCE. pantry_window() is shut while the
+#     engine is full and the keeper works a rota; one busy quarter of an
+#     hour was all it took for the entry to arrive bare. Measured on the
+#     live station at 08:14 while writing this — News coverage ON AIR
+#     with "the rooms hold 0 written, 0 recorded, 0 ready".
+#
+# So: TWENTY-FIVE MINUTES ahead, THIRTY MINUTES of life. Chosen against
+# the only clock that has a say here, which is the front page's own.
+# DRUDGE_TTL is ten minutes, so a bulletin is written off a page up to
+# ten minutes stale before anything else happens; thirty minutes of life
+# is three of those churns — a page that has moved a little, not a page
+# that has moved on. Past thirty it is still thrown away UNREAD and the
+# wire is read live, which is #855's guarantee exactly and is untouched.
+#
+# And the horizon is no longer a bare countdown. prep_news asks the
+# COORDINATOR when the News entry is due, how many minutes it owns and
+# whether anything is standing behind it — the three facts
+# coord_upcoming() already publishes for every coming entry — so a bare
+# news entry is worked in deadline order beside everything else instead
+# of on a private timer that knew nothing about the rest of the hour.
+NEWS_PREP_AHEAD = 1500.0                # write them only this close to it
+NEWS_PREP_LIFE = 1800.0                 # and never air one older than this
+NEWS_ROUND_SECONDS = 80.0               # what one bulletin is worth on air
+NEWS_SHELF_MOST = 6                     # never a backlog of yesterday
+_NEWS_WANT: dict[str, float] = {"at": 0.0, "secs": 0.0}
+
+
+def news_due() -> dict[str, Any]:
+    """#921: the next News entry — when it starts, how long it owns, and
+    whether anything is standing behind it.
+
+    Off the coordinator's own lookahead, which already answers all three
+    for every coming entry; falls back to schedule_prep_eta("news") when
+    the coordinator has nothing to say, and to "never" when neither does.
+    Never raises: a planner that cannot answer must not be the reason a
+    bulletin does not get written."""
+    try:
+        left = news_slot_left()
+        if left > 0:
+            # It owns the air THIS MINUTE — due in nothing, and what it
+            # still owns is what is left of it.
+            slot = _RADIO.get("sched_slot") or {}
+            return {"starts_in": 0.0, "owns": left,
+                    "bare": not shelf_rows("news"),
+                    "label": str(slot.get("label") or "News")}
+        for row in coord_upcoming():
+            if str(row.get("road") or "") != "news":
+                continue
+            return {"starts_in": float(row.get("starts_in") or 0),
+                    "owns": float(row.get("owns_seconds") or 0),
+                    "bare": bool(row.get("bare")),
+                    "label": str(row.get("label") or "News")}
+        eta = schedule_prep_eta("news")
+        if eta >= 0:
+            return {"starts_in": float(eta), "owns": 0.0,
+                    "bare": not shelf_rows("news"), "label": "News"}
+    except Exception:  # noqa: BLE001
+        return {"starts_in": -1.0, "owns": 0.0, "bare": False, "label": ""}
+    return {"starts_in": -1.0, "owns": 0.0, "bare": False, "label": ""}
+
+
+def news_want_seconds() -> float:
+    """#921: how many seconds of prepared bulletin the coming News entry
+    calls for — its OWN minutes, which is the unit hour_needs() already
+    measures every other road of the hour in. 0.0 means "not close
+    enough for a bulletin to survive the wait", which is what makes
+    shelf_full() answer FULL and keeps the planner off a task that could
+    only refuse itself.
+
+    Memoised for a few seconds because shelf_full() is asked often and
+    this reads the running order off disk."""
+    try:
+        now = time.time()
+        if now - float(_NEWS_WANT.get("at") or 0) < 5.0:
+            return float(_NEWS_WANT.get("secs") or 0.0)
+        due = news_due()
+        eta = float(due.get("starts_in") or -1.0)
+        want = 0.0
+        if 0.0 <= eta <= NEWS_PREP_AHEAD:
+            owns = float(due.get("owns") or 0.0)
+            if owns <= 0:
+                owns = NEWS_ROUND_SECONDS   # a sheet that will not say: one
+            want = max(NEWS_ROUND_SECONDS,
+                       min(owns, NEWS_ROUND_SECONDS * NEWS_SHELF_MOST))
+        _NEWS_WANT.update({"at": now, "secs": want})
+        return want
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 async def prep_news() -> bool:
-    """#855: one bulletin, written and recorded just before it is due."""
+    """#855/#921: bulletins written and recorded just before they are due
+    — and ENOUGH of them to cover the entry that is coming."""
     try:
-        if shelf_rows("news"):
-            return False                # one at a time; never a backlog
-        eta = schedule_prep_eta("news")
+        if shelf_full("news"):
+            return False                # stocked, or too far out to be safe
+        due = news_due()
+        eta = float(due.get("starts_in") or -1.0)
         if not 0.0 <= eta <= NEWS_PREP_AHEAD:
             # No running order, or the next news entry is too far off for
             # a bulletin to survive the wait. Not a failure: the live
@@ -18005,15 +18133,22 @@ async def prep_news() -> bool:
             pass
         shelf_put("news", {"entry": entry,
                            "seconds": float(entry.get("seconds") or 0)})
+        _rows = shelf_rows("news")
+        _held = sum(float(r.get("seconds") or 0) for r in _rows)
         pipeline_log(
             "lookahead",
             f"{SHELF_LABEL.get('news', 'a news bulletin')} is READY to "
             f"air - {entry.get('made') or 0} of {entry.get('chunks') or 0} "
             f"lines made, {entry.get('seconds') or 0}s of finished audio "
-            f"waiting, and the running order wants news in about "
-            f"{int(eta / 60)} minute(s). It carries the timestamp of the "
-            "page it was written from, and will be thrown away rather "
-            "than read out if that page has moved on (#855)")
+            f"waiting. {due.get('label') or 'the News entry'} starts in "
+            f"about {int(eta / 60)} minute(s) and owns "
+            f"{int(float(due.get('owns') or 0))}s of air"
+            + (" and is BARE" if due.get("bare") else "")
+            + f"; the shelf now holds {len(_rows)} bulletin(s), "
+            f"{int(_held)}s in all against {int(news_want_seconds())}s "
+            "wanted. Each carries the timestamp of the page it was "
+            "written from and is thrown away rather than read out if "
+            "that page has moved on (#855/#921)")
         return True
     except Exception:  # noqa: BLE001
         return False
@@ -19271,6 +19406,86 @@ def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
     return out
 
 
+# #922: how long a prepared item may sit unheard before it is retired
+# with its audio. Well inside the 24-hour ceiling, because a segment
+# nobody wanted in three hours is not going to be wanted in twenty-four,
+# and it is holding bytes and a place in the order the whole time.
+COORD_RETIRE_SECONDS = 3.0 * 3600.0
+COORD_PASSED_PUSH = 3                   # priority added per pass-over
+
+
+def coord_passed_over(road: str) -> int:
+    """#922: this road's entry came round, it had material, and
+    something else went out instead.
+
+    A prepared segment that is never used is not merely wasted disk —
+    it is a segment that cost a model visit and a render and was never
+    heard. Anything passed over is pushed UP the order so that the next
+    time its entry comes round it is the one that goes. Material earns
+    its way off the shelf by being used, which is the only ending that
+    is not a waste."""
+    moved = 0
+    try:
+        for row in list(_SHELF.get(str(road)) or []):
+            row["passed"] = int(row.get("passed") or 0) + 1
+            row["priority"] = int(row.get("priority") or 0) + COORD_PASSED_PUSH
+            moved += 1
+        if moved:
+            pipeline_log("lookahead",
+                         f"{moved} prepared {SHELF_LABEL.get(road, road)} "
+                         "were passed over and have been pushed up the "
+                         "order - they go next time that entry comes "
+                         "round (#922)")
+    except Exception:  # noqa: BLE001
+        pass
+    return moved
+
+
+def coord_retire() -> int:
+    """#922: let go of what genuinely will not be used, audio and all.
+
+    The horizon burn (#930/#932) deliberately never touches spoken-for
+    material — which is right, and which is exactly why this has to be
+    its own pass: nothing else in the station was ever going to let go
+    of a prepared round short of the 24-hour ceiling. It says what it
+    retires and why, because a shelf quietly emptying itself must never
+    be mistakeable for a shelf that was never filled."""
+    gone = 0
+    try:
+        now = time.time()
+        pinned = alt_pin_map().get("ids") or set()
+        for kind in list(_SHELF):
+            keep: list[dict[str, Any]] = []
+            dropped = 0
+            for row in (_SHELF.get(kind) or []):
+                aged = now - float(row.get("at") or now)
+                try:
+                    spoken_for = alt_sid_of(kind, row) in pinned
+                except Exception:  # noqa: BLE001
+                    spoken_for = False
+                if aged <= COORD_RETIRE_SECONDS or spoken_for:
+                    keep.append(row)
+                    continue
+                # Its clips go with it — they were only protected from
+                # the horizon burn because this row was holding them.
+                for key in _row_clip_keys(row):
+                    _PANTRY.pop(key, None)
+                dropped += 1
+            if dropped:
+                _SHELF[kind] = keep
+                gone += dropped
+                pipeline_log(
+                    "lookahead",
+                    f"{dropped} prepared {SHELF_LABEL.get(kind, kind)} "
+                    f"passed {COORD_RETIRE_SECONDS / 3600:.0f}h unheard "
+                    "and were retired with their audio - they were "
+                    "holding bytes and a place in the order for "
+                    "something that was never going to run (#922)")
+    except Exception:  # noqa: BLE001
+        pass
+    return gone
+
+
 def coord_bare_note(road: str) -> None:
     """#911: an entry took the air with nothing behind it. Remember it.
 
@@ -19609,6 +19824,10 @@ async def coordinator() -> None:
                 coord_save()
                 seen = here
             elif time.time() - since > 120:
+                try:
+                    coord_retire()
+                except Exception:  # noqa: BLE001
+                    pass
                 # Keep the order fresh inside the half hour too, so a
                 # road that empties at :10 is not ignored until :30.
                 since = time.time()
@@ -20034,6 +20253,21 @@ async def _torrent_talk() -> None:
                                 and not (_SHELF.get(_road) or [])
                                 and kind not in CANNOT_PREPARE):
                             coord_bare_note(_road)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    # #922: and the reverse — an entry whose road is NOT
+                    # the one going out, while that road has material
+                    # sitting on the shelf, has passed its own material
+                    # over. Push it up so it goes next time.
+                    try:
+                        for _other, _rows in list(_SHELF.items()):
+                            if (_rows and _other != str(
+                                    SCHED_PREP_KIND.get(kind) or kind)
+                                    and _other in ALT_PREP_KINDS
+                                    and any(r.get("carried")
+                                            for r in _rows)):
+                                coord_passed_over(_other)
+                                break   # one road per round, not a sweep
                     except Exception:  # noqa: BLE001
                         pass
                     pipeline_log(
@@ -24337,6 +24571,12 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
                           if str(s.get("id") or "") == live_id), None)
         out: list[dict[str, Any]] = []
         minutes = 0.0
+        # #920: the top of this hour on the WALL CLOCK, once - the times
+        # below are drawn off the same running total, so the panel and
+        # the archive can never disagree about which entry a moment
+        # belongs to. -1 is an hour key that will not parse, and every
+        # tile then simply carries no span, which reads as "not past".
+        hour_at = _sched_hour_epoch(key)
         for i, raw in enumerate(slots):
             row = _sched_slot(raw)
             # The running clock: each ENABLED entry pushes the next one on
@@ -24344,6 +24584,23 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
             # entry sits at the time the one after it starts and costs
             # nothing, which is what "disabled" means to the walk.
             row["starts_at"] = _sched_clock_at(key, minutes)
+            # #920: the same walk, on the wall clock, so the sheet can be
+            # scrolled BACKWARDS. A tile the clock has gone past is inert
+            # — it cannot be aired again — and it is the only kind of
+            # tile that has a recording of its own to hand over.
+            try:
+                _slot_mins = max(0.25, float(row.get("minutes") or 3))
+            except (TypeError, ValueError):
+                _slot_mins = 3.0
+            if hour_at >= 0:
+                _slot_from = hour_at + minutes * 60.0
+                row["starts_epoch"] = round(_slot_from, 3)
+                row["ends_epoch"] = round(_slot_from + _slot_mins * 60.0, 3)
+                row["past"] = bool(row["ends_epoch"] <= time.time())
+            else:
+                row["starts_epoch"] = 0.0
+                row["ends_epoch"] = 0.0
+                row["past"] = False
             if row.get("enabled", True):
                 try:
                     minutes += float(row.get("minutes") or 0)
@@ -24362,6 +24619,13 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
             "preset": name,
             "overridden": bool(overridden),
             "is_now": bool(is_now),
+            # #920: an hour entirely behind the wall clock. Its tiles are
+            # drawn greyed and inert, they stay editable so the operator
+            # can build a future hour out of them, and each one can hand
+            # over what actually went out in it for ARCHIVE_HOURS. The
+            # keys sort as they read, so this is a string compare.
+            "is_past": bool(str(key) < str(now_key)),
+            "archive_hours": ARCHIVE_HOURS,
             "slots": out,
             "now": {"index": index,
                     "slot_id": (live_id or None) if is_now else None,
@@ -24398,6 +24662,236 @@ async def schedule_hours_api(
     return schedule_hours_view(
         str(request.query_params.get("from") or ""),
         request.query_params.get("count") or 6)
+
+
+# --- #920: THE HOUR ARCHIVE ------------------------------------------
+#
+# "Allow me to scroll back to previous half hour stretches where it shows
+#  all of the scheduling tiles grayed out, but I'm still able to modify
+#  them and schedule them for future tasks, but they are basically inert
+#  and i am able to download the segments broadcasted from the previous
+#  hour for 2 hours until deletion."
+#
+# The hour sheet only ever walked FORWARD (#883): the panel's own back
+# button clamped at the hour on air, so there was nothing behind it to
+# look at. Two things make a past hour real. The sheet has to know which
+# entries the wall clock has gone past — schedule_hours_view() stamps
+# every tile with its own span now, so "inert" is a fact off the clock
+# rather than a guess in the renderer. And each of those entries has to
+# be able to hand over WHAT ACTUALLY WENT OUT IN IT.
+#
+# That recording is not a re-render and it is not the material that was
+# PREPARED for the entry — either of those would be handing over
+# something that never aired. It is the booth's own index of aired
+# moments (booth_index: the open episode's ledger, the staged files on
+# disk that survive a restart, and the sealed episodes' marks), clipped
+# to the entry's wall-clock span and welded with the same coalescer the
+# air road uses.
+#
+# WHAT IS NOT IN IT, said here rather than discovered on playback: the
+# records underneath. The station stages VOICE, so what comes down is
+# everything the pair, the callers and the board said inside that span —
+# the segment as the booth recorded it, which is the thing the operator
+# is pointing at when he points at a tile.
+#
+# Kept for exactly the two hours that were asked for, then the file is
+# deleted and this SAYS so, rather than welding the nearest thing and
+# passing it off as the segment.
+ARCHIVE_HOURS = 2.0
+ARCHIVE_PIECES_MOST = 160               # a welded segment stays bounded
+_HOUR_TAPE: dict[str, dict[str, Any]] = {}
+
+
+def _hour_tape_prune() -> int:
+    """Delete every archived segment past the two hours (#920)."""
+    gone = 0
+    try:
+        floor = time.time() - ARCHIVE_HOURS * 3600.0
+        for key, row in list(_HOUR_TAPE.items()):
+            if float((row or {}).get("until") or 0) >= floor:
+                continue
+            _HOUR_TAPE.pop(key, None)
+            gone += 1
+            try:
+                media = str((row or {}).get("media") or "")
+                if media and MEDIA_KEY_SHAPE.match(media):
+                    (VOICE_MEDIA_DIR / media).unlink(missing_ok=True)
+            except OSError:
+                pass
+    except Exception:  # noqa: BLE001
+        return gone
+    return gone
+
+
+def hour_slot_span(key: str, slot_id: str) -> dict[str, Any]:
+    """#920: ONE entry of ONE hour, as a wall-clock span.
+
+    The same walk schedule_hours_view() draws the tiles with — each
+    ENABLED entry pushes the next one on by its own minutes from the top
+    of the hour — so what comes back is the span the operator is looking
+    at on the sheet, not a second opinion about it."""
+    out: dict[str, Any] = {"ok": False, "from": 0.0, "until": 0.0,
+                           "label": "", "kind": "", "minutes": 0.0,
+                           "enabled": True, "why": ""}
+    try:
+        at = _sched_hour_epoch(str(key))
+        if at < 0:
+            out["why"] = "that is not an hour like 2026-08-20T07"
+            return out
+        _name, slots, _over = schedule_hour_slots(schedule_read(), str(key))
+        minutes = 0.0
+        for raw in slots:
+            row = _sched_slot(raw)
+            began = at + minutes * 60.0
+            span = max(0.25, float(row.get("minutes") or 3))
+            if row.get("enabled", True):
+                minutes += span
+            if str(row.get("id") or "") == str(slot_id):
+                out.update({"ok": True, "from": began,
+                            "until": began + span * 60.0,
+                            "label": str(row.get("label")
+                                         or row.get("kind") or ""),
+                            "kind": str(row.get("kind") or ""),
+                            "minutes": span,
+                            "enabled": bool(row.get("enabled", True))})
+                return out
+        out["why"] = "there is no entry with that id in that hour"
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"the hour could not be read: {exc}"[:140]
+    return out
+
+
+def _hour_tape_lines(t0: float, t1: float) -> list[dict[str, Any]]:
+    """What the booth wrote down inside the span, so the reply can say
+    what is on the recording rather than only how long it is (#920)."""
+    out: list[dict[str, Any]] = []
+    try:
+        for row in list(_RADIO.get("chat") or []):
+            when = float(row.get("air_at") or row.get("ts") or 0)
+            if not t0 <= when < t1:
+                continue
+            out.append({"at": round(when, 1),
+                        "who": str(row.get("who") or ""),
+                        "kind": str(row.get("kind") or ""),
+                        "text": str(row.get("text") or "")[:220]})
+            if len(out) >= 200:
+                break
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+@app.get("/api/schedule/aired")
+async def schedule_aired_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#920: WHAT ACTUALLY WENT OUT in one past entry — ?hour=&slot=
+
+    Welded out of the booth's index of aired moments, clipped to that
+    entry's wall-clock span. Kept for two hours and then deleted; once it
+    has been, this says so plainly instead of handing over something that
+    is not it. `probe=1` asks the same question without building
+    anything, which is how a tile can offer the button honestly."""
+    require_read_auth(authorization)
+    query = request.query_params
+    key = str(query.get("hour") or "").strip()
+    slot_id = str(query.get("slot") or "").strip()
+    probe = str(query.get("probe") or "").lower() in ("1", "true", "yes")
+    _hour_tape_prune()
+    span = hour_slot_span(key, slot_id)
+    if not span.get("ok"):
+        raise HTTPException(
+            status_code=404,
+            detail=str(span.get("why") or "no such entry"))
+    now = time.time()
+    t0 = float(span["from"])
+    t1 = float(span["until"])
+    keep_until = t1 + ARCHIVE_HOURS * 3600.0
+    base: dict[str, Any] = {
+        "hour": key, "slot": slot_id, "label": span["label"],
+        "kind": span["kind"], "minutes": span["minutes"],
+        "from": round(t0, 3), "until": round(t1, 3),
+        "keep_until": round(keep_until, 3),
+        "keep_for": round(max(0.0, keep_until - now), 1),
+        "archive_hours": ARCHIVE_HOURS,
+        "what": "every voice moment the booth staged inside this entry's "
+                "span, welded - the records playing underneath are not "
+                "in it",
+    }
+    if not span.get("enabled", True):
+        return {**base, "ready": False,
+                "why": "that entry was switched off for this hour, so "
+                       "nothing aired in it"}
+    if t1 > now:
+        return {**base, "ready": False,
+                "why": "this entry has not finished airing yet - it can "
+                       f"be kept in about {int(t1 - now)}s"}
+    if now > keep_until:
+        return {**base, "ready": False, "pruned": True,
+                "why": "what went out in this entry was kept for "
+                       f"{int(ARCHIVE_HOURS)} hours and has been deleted. "
+                       "There is nothing to hand over, and handing over "
+                       "the nearest thing to it would not be this segment"}
+    cache_key = key + "|" + slot_id
+    held = _HOUR_TAPE.get(cache_key)
+    if held and (VOICE_MEDIA_DIR / str(held.get("media") or "")).is_file():
+        return {**base, **held, "ready": True, "cached": True}
+    rows = await booth_index()
+    pieces: list[tuple[str, float, float]] = []
+    for began, ends, path, off in rows:
+        lo = max(float(began), t0)
+        hi = min(float(ends), t1)
+        if hi - lo <= 0.25:
+            continue                    # it did not really land in here
+        pieces.append((str(path),
+                       max(0.0, float(off) + (lo - float(began))),
+                       min(hi - lo, 900.0)))
+        if len(pieces) >= ARCHIVE_PIECES_MOST:
+            break
+    seconds = round(sum(p[2] for p in pieces), 1)
+    if probe:
+        return {**base, "ready": bool(pieces), "pieces": len(pieces),
+                "seconds": seconds,
+                "why": "" if pieces else "nothing the booth kept falls "
+                                         "inside this entry's span"}
+    if not pieces:
+        return {**base, "ready": False, "pieces": 0, "seconds": 0.0,
+                "why": "nothing the booth kept falls inside this entry's "
+                       "span - either it aired before the episode cache "
+                       "was last swept, or the entry ran under the "
+                       "records and nobody spoke in it"}
+    cut: list[str] = []
+    for path, start, dur in pieces:
+        made = await booth_cut(path, start, dur)
+        if made:
+            cut.append(made)
+    if not cut:
+        raise HTTPException(
+            status_code=500,
+            detail="the moments inside this entry could not be cut out "
+                   "of the episode they live in")
+    if len(cut) == 1:
+        blob = await asyncio.to_thread(lambda: Path(cut[0]).read_bytes())
+        clip = _store_media(blob, "mp3")
+    else:
+        made = await asyncio.to_thread(_call_concat_blocking, cut, False)
+        if not made:
+            raise HTTPException(status_code=500,
+                                detail="the segment could not be welded")
+        clip = _store_media(made, "wav")
+    row = {"media": str(clip["path"]).rsplit("/", 1)[-1],
+           "sig": clip["sig"], "bytes": clip["bytes"],
+           "pieces": len(cut), "seconds": seconds,
+           "until": t1, "at": now,
+           "lines": _hour_tape_lines(t0, t1)}
+    if len(_HOUR_TAPE) > 120:
+        _hour_tape_prune()
+    _HOUR_TAPE[cache_key] = dict(row)
+    note_action("\u2b07 kept what aired in " + key + " \u00b7 "
+                + str(span["label"]) + " \u2014 " + str(len(cut))
+                + " moment(s), " + str(int(seconds)) + "s (#920)")
+    return {**base, **row, "ready": True, "cached": False}
 
 
 @app.post("/api/schedule/hours")
@@ -25782,6 +26276,48 @@ async def regenerate_job(job: str, kind: str, sid: str, insanity: float,
             _PREP_DEADLINE[0] = 0.0
         except Exception:  # noqa: BLE001
             pass
+
+
+@app.post("/api/shelf/air")
+async def shelf_air_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#923: PUT THIS ONE THROUGH NOW — {"kind": "caller", "id": "..."}.
+
+    Pins that exact prepared item so the shelf hands it over, then
+    interjects ONE round of its kind. The hour resumes exactly where it
+    was afterwards: an interjection is a single round and never moves
+    the clock (#904), so a call put through by hand costs the running
+    order nothing."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    kind = str(payload.get("kind") or "").strip()[:24]
+    sid = str(payload.get("id") or "").strip()[:64]
+    row = _shelf_find(kind, sid) if sid else None
+    if sid and row is None:
+        raise HTTPException(status_code=404,
+                            detail=f"nothing on the {kind} shelf with that id")
+    # Straight to the front of its own shelf, so shelf_take hands over
+    # THIS one rather than whichever happens to be oldest.
+    if row is not None:
+        try:
+            row["priority"] = max(int(row.get("priority") or 0), 0) + 50
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        got = schedule_interject("", kind)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=409,
+            detail=f"the round could not be queued: {exc}"[:180]) from exc
+    note_action(f"\u260e {SHELF_LABEL.get(kind, kind)} was put through by "
+                "hand (#923)")
+    return {"ok": True, "kind": kind, "id": sid,
+            "label": SHELF_LABEL.get(kind, kind),
+            "queued": got if isinstance(got, dict) else {"queued": bool(got)}}
 
 
 @app.post("/api/shelf/regenerate")
@@ -35368,6 +35904,70 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
 DRUDGE_URL = os.getenv("DRUDGE_URL", "https://drudgereport.com")
 _DRUDGE_CACHE: dict[str, Any] = {"at": 0.0, "headlines": []}
 DRUDGE_TTL = 600.0                     # the front page churns; ten minutes
+
+# --- #921: EVERY STORY ON EVERY PAGE ---------------------------------
+#
+# "I want it checking all of the different news stories on the page and
+#  discussing them at random."
+#
+# It was not checking all of them, and the reason is one argument that
+# was never passed. #875 raised the ASK to eighty headlines - dj_news
+# calls drudge_headlines(80) - but drudge_parse kept its own default cap
+# of 24 and drudge_headlines called it bare, so the pool was truncated
+# to 24 before the cache ever saw it and the extra ask did nothing at
+# all. Measured against the live front page while writing this: 36
+# stories on the page, 24 reaching the desk. Twelve stories the pair
+# could not have discussed if they had wanted to, because nobody
+# fetched them.
+NEWS_PAGE_MOST = 200                    # the whole page, whatever it holds
+# ...and more than one page when the operator wants more than one:
+# comma-separated in NEWS_PAGES, with the Drudge page always first. One
+# page today; the sweep below does not care how many there are.
+NEWS_PAGES_ENV = os.getenv("NEWS_PAGES", "")
+
+
+def news_pages() -> list[str]:
+    """Every front page the desk reads, the configured one first (#921)."""
+    out: list[str] = []
+    try:
+        for raw in str(NEWS_PAGES_ENV or "").replace(";", ",").split(","):
+            page = raw.strip()
+            if page.lower().startswith("http") and page not in out:
+                out.append(page)
+    except Exception:  # noqa: BLE001
+        out = []
+    if DRUDGE_URL not in out:
+        out.insert(0, DRUDGE_URL)
+    return out[:8]
+
+
+# #921: the left-rail roll of mastheads and wire services. It always
+# leaked - "WALL STREET JOURNAL" and "SYDNEY MORNING HERALD" sat inside
+# the first 24 links on the page this morning - and it barely mattered
+# while the desk drew from the top of the page and rarely reached them.
+# Drawing at RANDOM from the WHOLE page, a masthead is a whole stretch
+# of the segment where the pair have nothing to discuss, so it is caught
+# here on two rules: the names, and the fact that a masthead links to a
+# site's FRONT DOOR while a story never does.
+_NEWS_MASTHEAD = re.compile(
+    r"^(?:agence france|deutsche presse|presse-agentur|xinhua|yonhap|"
+    r"kyodo|itar|tass|interfax|china (?:people|daily)|sydney morning|"
+    r"wall street journal|world newspapers|recent headlines|"
+    r"trump approval tracker|crazy days and nights|el nuevo)", re.I)
+
+
+def _news_furniture(text: str, href: str) -> bool:
+    """A link that is page furniture rather than a story (#921)."""
+    try:
+        if _NEWS_MASTHEAD.search(str(text or "")):
+            return True
+        bits = urlparse(str(href or ""))
+        # A story is never the front door of a site.
+        return (bits.path or "/").strip("/") == "" and not bits.query
+    except Exception:  # noqa: BLE001
+        return False
+
+
 # Link text that is furniture, not news.
 _DRUDGE_SKIP = re.compile(
     r"drudge|mailto:|privacy|contact|advertis|archives?$|^\W*$|"
@@ -35395,6 +35995,8 @@ def drudge_parse(html: str, limit: int = 24) -> list[dict[str, str]]:
             continue
         if not href.lower().startswith("http"):
             continue
+        if _news_furniture(text, href):
+            continue                    # #921: a masthead, not a story
         if text not in seen:
             seen.add(text)
             found.append({"title": text, "url": href})
@@ -35404,20 +36006,51 @@ def drudge_parse(html: str, limit: int = 24) -> list[dict[str, str]]:
 
 
 async def drudge_headlines(limit: int = 24) -> list[dict[str, str]]:
-    """Top stories with their links, cached so the pair cannot hammer the
-    site."""
+    """Every story on every configured page, cached so the pair cannot
+    hammer the sites (#921).
+
+    THE BUG THIS FIXES, plainly: drudge_parse's own default cap of 24 was
+    never passed through, so dj_news asking for eighty headlines got 24
+    and the rest of the page was never fetched. It is passed through now,
+    and the pages are swept together rather than one of them being the
+    whole world. Order is preserved page by page and duplicates are shed
+    on the title, so a story carried by two pages is one story.
+
+    A page that will not answer is skipped, not fatal: as long as ONE
+    page came back the desk has something to talk about, and if none of
+    them did the cache is served stale, which is this function's own
+    behaviour and is still better than a silent segment."""
     now = time.time()
     if now - _DRUDGE_CACHE["at"] < DRUDGE_TTL and _DRUDGE_CACHE["headlines"]:
         return _DRUDGE_CACHE["headlines"][:limit]
+    pages = news_pages()
+    got: list[Any] = []
     try:
-        async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
-            reply = await client.get(
-                DRUDGE_URL, headers={"User-Agent": "Mozilla/5.0"})
-        headlines = drudge_parse(reply.text)
-    except Exception:
+        async with httpx.AsyncClient(timeout=20,
+                                     follow_redirects=True) as client:
+            got = await asyncio.gather(
+                *[client.get(page, headers={"User-Agent": "Mozilla/5.0"})
+                  for page in pages],
+                return_exceptions=True)
+    except Exception:  # noqa: BLE001
+        got = []
+    headlines: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for reply in got:
+        if isinstance(reply, BaseException):
+            continue                    # that page is down; the rest are not
+        try:
+            rows = drudge_parse(reply.text, NEWS_PAGE_MOST)
+        except Exception:  # noqa: BLE001
+            continue
+        for story in rows:
+            if story["title"] in seen:
+                continue
+            seen.add(story["title"])
+            headlines.append(story)
+    if not headlines:
         return _DRUDGE_CACHE["headlines"][:limit]   # stale news beats no show
-    if headlines:
-        _DRUDGE_CACHE.update({"at": now, "headlines": headlines})
+    _DRUDGE_CACHE.update({"at": now, "headlines": headlines})
     return headlines[:limit]
 
 
@@ -35508,31 +36141,125 @@ def news_selection(headlines: list[dict[str, str]],
             break
         picks.append(random.choice(by_band[slot]))
     if not picks:
-        # #875: THIS IS WHERE THE SAME STORY CAME BACK SEVENTEEN TIMES.
-        #
-        # `covered` is newest-first, so a dict comprehension kept the
-        # LAST value seen for each title — the OLDEST coverage. Sorting
-        # ascending on that put the most-covered story first, every
-        # time: measured on the live ledger, one headline covered 17
-        # times with seven of those inside half an hour.
-        #
-        # Take the most RECENT coverage per title, so the fallback
-        # genuinely reaches for whatever has been left alone longest.
-        stamp: dict[str, float] = {}
-        for _r in covered:
-            _t = _r.get("title")
-            _ts = float(_r.get("ts") or 0)
-            if _t is not None and _ts > stamp.get(_t, 0.0):
-                stamp[_t] = _ts
-        # And a hard floor even here: a story said in the last
-        # NEWS_FLOOR_MINUTES is not said again, whatever else is on the
-        # page. Only if that leaves nothing at all does the desk fall
-        # back to the least-recently-covered.
-        _floor = time.time() - NEWS_FLOOR_MINUTES * 60.0
-        _cool = [h for h in headlines if stamp.get(h["title"], 0.0) < _floor]
-        picks = sorted(_cool or headlines,
-                       key=lambda h: stamp.get(h["title"], 0.0))[:want]
+        # #875 fixed the seventeen-repeat fault here; #921 moved the fixed
+        # road into _news_coolest() so the random draw below shares it
+        # rather than growing a second copy of the same reasoning.
+        picks = _news_coolest(headlines, want, covered)
     _news_note(picks)
+    return picks
+
+
+def _news_coolest(headlines: list[dict[str, str]], want: int,
+                  covered: list[dict[str, Any]] | None = None
+                  ) -> list[dict[str, str]]:
+    """The stories left alone longest — the road taken when every story
+    on the page is inside the cover window and the desk must say
+    something rather than go quiet.
+
+    #875: THIS IS WHERE THE SAME STORY CAME BACK SEVENTEEN TIMES.
+
+    `covered` is newest-first, so a dict comprehension kept the LAST
+    value seen for each title — the OLDEST coverage. Sorting ascending on
+    that put the most-covered story first, every time: measured on the
+    live ledger, one headline covered 17 times with seven of those inside
+    half an hour. Take the most RECENT coverage per title, so this
+    genuinely reaches for whatever has been left alone longest."""
+    rows = _news_covered() if covered is None else covered
+    stamp: dict[str, float] = {}
+    for _r in rows:
+        _t = _r.get("title")
+        _ts = float(_r.get("ts") or 0)
+        if _t is not None and _ts > stamp.get(_t, 0.0):
+            stamp[_t] = _ts
+    # And a hard floor even here: a story said in the last
+    # NEWS_FLOOR_MINUTES is not said again, whatever else is on the page.
+    # Only if that leaves nothing at all does the desk fall back to the
+    # least-recently-covered.
+    _floor = time.time() - NEWS_FLOOR_MINUTES * 60.0
+    _cool = [h for h in headlines if stamp.get(h["title"], 0.0) < _floor]
+    return sorted(_cool or headlines,
+                  key=lambda h: stamp.get(h["title"], 0.0))[:max(1, want)]
+
+
+def news_draw(headlines: list[dict[str, str]], want: int,
+              avoid: list[str] | None = None) -> list[dict[str, str]]:
+    """#921: WHICH STORIES THIS STRETCH TAKES — drawn at RANDOM from the
+    whole page rather than off the top of it.
+
+    "just picking news stories at random that's on these different pages
+     that we have."
+
+    news_selection() spreads its picks across BANDS of the page, which
+    keeps the lead in the lead — right for the bulletin on the hour and
+    wrong for a four-minute segment, where it meant every stretch opened
+    on the same masthead story. This draws uniformly out of everything
+    that is allowed, so the fifth story of the segment is as likely to be
+    the thirty-first link on the page as the second.
+
+    THREE gates, and deliberately not a fourth:
+
+      * `avoid` — the headlines this SEGMENT has already been through.
+        A stretch must never re-tell the one before it;
+      * the news desk's own cover ledger, which matches TOPICS by shared
+        keywords over three hours, so a story does not come back reworded;
+      * the station's repeat ledger — air_repeat_check() against
+        repeat_window(), the same three-to-five-hour gate every other
+        road on the station is held to since #901. That is the ledger
+        that already exists and this uses it rather than keeping a
+        fourth clock of its own.
+
+    When all three leave nothing, the desk reaches for what it has left
+    alone longest instead of going quiet — the same road news_selection()
+    takes, and the same hard floor under it. Two differences down there,
+    and both matter to a SEGMENT rather than a single bulletin: `avoid`
+    still holds, so a stretch cannot re-tell the one before it even on an
+    exhausted page; and the coolest band is shuffled rather than read off
+    in order, or a four-minute segment on a thin page would say the same
+    three stories in the same order stretch after stretch."""
+    if not headlines:
+        return []
+    want = max(1, int(want or 1))
+    said = {str(t) for t in (avoid or [])}
+    covered = _news_covered()
+    said_titles = {r.get("title") for r in covered}
+    said_keys = [set(r.get("keys") or []) for r in covered]
+
+    def is_repeat(story: dict[str, str]) -> bool:
+        title = story.get("title") or ""
+        if title in said or title in said_titles:
+            return True
+        keys = _news_keys(title)
+        if any(len(keys & seen) >= 2 for seen in said_keys):
+            return True
+        try:
+            # The station's own window, on the headline itself. Bookkeeping
+            # may never be the reason a segment is silent, so a ledger that
+            # cannot answer answers "not a repeat" — which is exactly what
+            # air_repeat_check() does on any fault of its own.
+            return bool(air_repeat_check(title, "host", "news").get("block"))
+        except Exception:  # noqa: BLE001
+            return False
+
+    fresh = [h for h in headlines if not is_repeat(h)]
+    if fresh:
+        random.shuffle(fresh)
+        picks = fresh[:want]
+    else:
+        pool = [h for h in headlines
+                if str(h.get("title") or "") not in said] or list(headlines)
+        band = _news_coolest(pool, want * 3, covered)
+        random.shuffle(band)
+        picks = band[:want]
+    _news_note(picks)
+    for story in picks:
+        try:
+            # ONE door for "this went out on air" (#901). The headline
+            # goes in as the host's own news line, which is what it is
+            # about to become, and the window then refuses it everywhere
+            # for as long as the operator has that window set.
+            air_remember(str(story.get("title") or ""), "host", "news")
+        except Exception:  # noqa: BLE001
+            pass
     return picks
 
 
@@ -35569,14 +36296,24 @@ async def drudge_story(url: str) -> str:
     return boiled
 
 
-async def dj_news(hourly: bool = False,
-                  bank_to: list[dict[str, Any]] | None = None) -> list[str]:
-    """The pair take a moment for what is happening in the world.
+async def _news_once(hourly: bool = False,
+                     bank_to: list[dict[str, Any]] | None = None,
+                     avoid: list[str] | None = None,
+                     more: int = 0) -> list[str]:
+    """ONE stretch of news — a bulletin, or one stretch of the segment.
 
     On the hour it is a bulletin — the lead plus a sample of the page; the
     between-tracks version is looser, stories drawn from anywhere on the
     page, reacted to organically and funnily, then back to the music (#228,
-    #229, #248)."""
+    #229, #248).
+
+    #921 split this out of dj_news(), which now runs it over and over for
+    as long as the News entry owns the air. `avoid` is the running list of
+    headlines this segment has already been through and every stretch
+    APPENDS to it, so the second stretch cannot re-tell the first. `more`
+    is how many stretches have already gone out in this segment, and it is
+    what makes a continuation sound like a continuation instead of a fresh
+    bulletin opening every ninety seconds."""
     # #875: "there are tons of news stories on the page and I need
     # different stories being covered" — 24 headlines against a bulletin
     # every few minutes exhausts the page in under an hour and forces
@@ -35616,6 +36353,18 @@ async def dj_news(hourly: bool = False,
                         })
                     except Exception:  # noqa: BLE001
                         pass
+                    try:
+                        # #921: what the prepared bulletin covered joins
+                        # the segment's own list, or the live stretch
+                        # after it would go straight back over the same
+                        # stories.
+                        if avoid is not None:
+                            avoid.extend(
+                                t.strip() for t in str(
+                                    _pn_entry.get("prep_news_titles") or ""
+                                ).split(" / ") if t.strip())
+                    except Exception:  # noqa: BLE001
+                        pass
                     return _pn_said
             else:
                 try:
@@ -35629,9 +36378,20 @@ async def dj_news(hourly: bool = False,
                         "which is this station's own behaviour (#855)")
                 except Exception:  # noqa: BLE001
                     pass
-    picks = news_selection(await drudge_headlines(80), hourly)
+    avoid = avoid if avoid is not None else []
+    # #921: the WHOLE page now, because drudge_parse's own cap no longer
+    # throws two thirds of it away before anybody looks at it.
+    _page = await drudge_headlines(NEWS_PAGE_MOST)
+    if hourly:
+        # The bulletin on the hour is untouched: the lead still leads it,
+        # spread across the bands of the page, exactly as #248 built it.
+        picks = news_selection(_page, True)
+    else:
+        picks = news_draw(_page, 3, avoid)
     if not picks:
         return []
+    _earlier = list(avoid)
+    avoid.extend(str(h["title"]) for h in picks)
     listed = "\n".join(f"- {h['title']}" for h in picks)
     # Go INTO one or two of them: the actual article, boiled down, so the
     # desk conveys real information instead of a headline said twice.
@@ -35651,6 +36411,27 @@ async def dj_news(hourly: bool = False,
             "the real details out of it. React like the pair of you, not "
             "like a wire service, then hand back to the music.\n\n"
             f"The top stories right now:\n{listed}{dug}"
+        )
+    elif more:
+        # #921: a CONTINUATION. The segment is still running and the pair
+        # are still at the desk — the one thing this must not do is open
+        # like a fresh bulletin, because the operator hears three of those
+        # in four minutes as three separate news breaks rather than one
+        # news segment.
+        _done = "; ".join(str(t)[:70] for t in _earlier[-8:])
+        angle = (
+            "THE NEWS SEGMENT IS STILL RUNNING and you are both still at "
+            f"the desk — this is stretch {more + 1} of it. Do NOT open like "
+            "a fresh bulletin, do NOT say good evening, and do NOT wrap up "
+            "and hand back to the music: carry straight on to the NEXT "
+            "stories off the wire. One of you reads them off the terminal "
+            "as they surface, the other reacts, argues, asks what happened "
+            "next and drags the real detail out of it. Get actual "
+            "information out of the FULL STORY below rather than saying "
+            "the headline twice.\n\n"
+            + (f"Already covered in this segment — do NOT go back over "
+               f"any of them: {_done}\n\n" if _done else "")
+            + f"Next off the wire:\n{listed}{dug}"
         )
     else:
         angle = (
@@ -35691,6 +36472,121 @@ async def dj_news(hourly: bool = False,
         except Exception:  # noqa: BLE001
             pass
     return _said
+
+
+# --- #921: THE NEWS SEGMENT, FOR THE WHOLE OF THE SEGMENT ------------
+NEWS_FILL_FLOOR = 40.0                  # too little left to start another
+NEWS_FILL_MOST = 8                      # and never more than this many
+
+
+def news_slot_left() -> float:
+    """Seconds left in the News entry that owns the air; 0.0 when news
+    does not own it (#921).
+
+    Deliberately reads _RADIO rather than calling schedule_take(): that
+    walk MUTATES the saved position and republishes sched_prompt, and a
+    segment asking how long it has got must not move the clock it is
+    asking about. The two keys are written together by schedule_take and
+    are only trusted while they still agree about which entry is on air —
+    the same guard _schedule_pin_record() uses, and for the same reason:
+    with the schedule switched off sched_pos is dropped and a stale slot
+    could otherwise claim minutes nobody scheduled."""
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        slot = _RADIO.get("sched_slot") or {}
+        if not slot or str(slot.get("id") or "") != str(
+                pos.get("slot_id") or ""):
+            return 0.0
+        if str(SCHED_PREP_KIND.get(str(slot.get("kind") or "")) or "") \
+                != "news":
+            return 0.0
+        started = float(pos.get("started") or 0)
+        if started <= 0:
+            return 0.0
+        owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+        return max(0.0, started + owns - time.time())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+async def dj_news(hourly: bool = False,
+                  bank_to: list[dict[str, Any]] | None = None) -> list[str]:
+    """THE NEWS SEGMENT — for as long as the segment lasts (#921).
+
+    "I'm listening to this news segment and there is no news being
+     discussed. Basically for these sections I want it taking place for
+     the entire section."
+
+    WHAT WAS ACTUALLY WRONG. This was ONE round. The News entry on the
+    canonical hour owns FOUR MINUTES; a round is six or seven lines and
+    runs ninety seconds at the outside, so the entry spent most of its
+    slot waiting for the torrent's next breath to come round to news
+    again — and with nothing on the news shelf that breath meant a live
+    page fetch, a model write and a full render before a word went out.
+    That gap is the silence the operator heard, and the screenshot he
+    sent says it in the station's own words: "0s banked of 240s this
+    entry owns", 84 seconds into the entry.
+
+    So the round became the SEGMENT. It keeps taking stretches — off the
+    shelf when a prepared bulletin is standing there, live when one is
+    not — for as long as the entry it belongs to still owns the air, and
+    every stretch draws DIFFERENT stories (news_draw, at random, across
+    the whole page, against the repeat ledger). The last stretch may run
+    a little past the boundary and that is deliberate: the pair still
+    talking as the segment ends is the thing being asked for, and
+    schedule_jammed() does not so much as notice until an entry is half
+    again over its minutes.
+
+    Nothing in here engages unless a News entry genuinely owns the air.
+    Every other road into this function — the bulletin on the hour, the
+    track-count road, prep_news banking one — gets exactly one stretch,
+    which is today's behaviour to the line."""
+    avoid: list[str] = []
+    said = await _news_once(hourly, bank_to, avoid)
+    if bank_to is not None:
+        return said                     # banking one, not airing a segment
+    left = news_slot_left()
+    if left <= NEWS_FILL_FLOOR:
+        return said                     # no News entry owns the air
+    try:
+        pipeline_log(
+            "air", "the news segment has " + str(int(left)) + "s left on "
+            "it - the pair stay at the desk and keep taking stories "
+            "rather than handing back to the music after one bulletin "
+            "(#921)")
+    except Exception:  # noqa: BLE001
+        pass
+    cut_at = _TALK_CUT[0]
+    rounds = 1
+    while rounds < NEWS_FILL_MOST:
+        if not _RADIO.get("on"):
+            break
+        if _TALK_CUT[0] != cut_at:
+            break                       # somebody cut the round; obey it
+        if news_slot_left() <= NEWS_FILL_FLOOR:
+            break
+        try:
+            got = await _news_once(False, None, avoid, rounds)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", "a news stretch failed - the segment ends "
+                                 "here rather than the station doing",
+                         extra=f"{type(exc).__name__}: {exc}"[:500])
+            break
+        if not got:
+            break                       # nothing left on the wire to say
+        said = list(said) + list(got)
+        rounds += 1
+        await asyncio.sleep(0.8)        # a breath between stretches, not a gap
+    try:
+        _over = news_slot_left()
+        pipeline_log(
+            "air", f"the news segment ran {rounds} stretch(es) over "
+            + str(len(avoid)) + " different stor(y/ies) - "
+            + (str(int(_over)) + "s of the entry left"
+               if _over > 0 else "the entry is over") + " (#921)")
+    except Exception:  # noqa: BLE001
+        pass
+    return said
 
 
 async def news_clock() -> None:
@@ -104151,6 +105047,77 @@ if __name__ == "__main__":
     assert all(h["url"].startswith("http") for h in _heads), (
         "every story keeps its link — the desk goes INTO the article now")
     assert drudge_parse("<html>nothing here</html>") == []
+
+    # #921: the page cap is passed through, the masthead roll is dropped,
+    # and the draw is RANDOM across everything rather than off the top.
+    _furn = """
+    <a href="https://x.example/9">A REAL STORY WITH ENOUGH WORDS IN IT</a>
+    <a href="https://wsj.example/">WALL STREET JOURNAL</a>
+    <a href="https://afp.example/en/timeline/">AGENCE FRANCE-PRESSE</a>
+    """
+    _f = drudge_parse(_furn)
+    assert len(_f) == 1 and _f[0]["title"].startswith("A REAL"), _f
+    _long = "".join(f'<a href="https://e.example/{n}">HEADLINE NUMBER {n} '
+                    "ON THE PAGE TODAY</a>" for n in range(40))
+    assert len(drudge_parse(_long)) == 24, (
+        "the default cap still stands where nobody raises it")
+    assert len(drudge_parse(_long, NEWS_PAGE_MOST)) == 40, (
+        "#921: drudge_headlines asks for the whole page, and the cap "
+        "that silently threw two thirds of it away is passed through")
+    # Forty stories that share ONE keyword and no more, so the topic
+    # ledger's own two-keyword rule does not call them all the same news.
+    _wide = [{"title": (chr(97 + n // 10) * 2
+                        + chr(97 + n % 10) * 3).upper() + " STORY",
+              "url": f"https://example.com/w{n}"} for n in range(40)]
+    _NEWS_COVERED_WAS = NEWS_COVERED_PATH
+    globals()["NEWS_COVERED_PATH"] = Path("/tmp/news-covered-selfcheck.json")
+    try:
+        _avoid: list[str] = []
+        _first = news_draw(_wide, 3, _avoid)
+        assert len(_first) == 3 and not _avoid, _first
+        _avoid.extend(h["title"] for h in _first)
+        _second = news_draw(_wide, 3, _avoid)
+        assert not ({h["title"] for h in _first}
+                    & {h["title"] for h in _second}), (
+            "#921: a stretch must never re-tell the one before it")
+        assert news_draw([], 3, []) == []
+        # It reaches the FAR END of the page, which is the whole
+        # complaint — "always leading with the same top story". Eighteen
+        # picks out of forty landing entirely in the front half is a
+        # one-in-a-billion draw, so this tests random without flaking.
+        _reach: set = set()
+        for _ in range(6):
+            _reach |= {h["title"] for h in news_draw(_wide, 3, [])}
+        assert _reach & {h["title"] for h in _wide[20:]}, sorted(_reach)
+        # And with the whole page covered it reaches for the coolest
+        # rather than going quiet — still never re-telling this segment.
+        for _ in range(20):
+            news_draw(_wide, 3, [])
+        _held = [h["title"] for h in _wide[:37]]
+        _last = news_draw(_wide, 3, list(_held))
+        assert _last, "an exhausted page must not silence the segment"
+        assert not ({h["title"] for h in _last} & set(_held)), (
+            "#921: the exhausted-page road must still honour `avoid`")
+    finally:
+        try:
+            Path("/tmp/news-covered-selfcheck.json").unlink()
+        except OSError:
+            pass
+        globals()["NEWS_COVERED_PATH"] = _NEWS_COVERED_WAS
+
+    # #920: the archive's span math is the sheet's own walk. A disabled
+    # entry costs the clock nothing and the ones after it do not move.
+    _hkey = _sched_hour_key()
+    _hview = schedule_hours_view(_hkey, 1)["hours"][0]
+    for _tile in _hview["slots"]:
+        assert "past" in _tile and "starts_epoch" in _tile, _tile
+        if _tile["starts_epoch"]:
+            assert _tile["ends_epoch"] > _tile["starts_epoch"], _tile
+            _sp = hour_slot_span(_hkey, _tile["id"])
+            assert _sp["ok"] and abs(_sp["from"]
+                                     - _tile["starts_epoch"]) < 0.01, _sp
+    assert not hour_slot_span("not-an-hour", "x")["ok"]
+    assert not hour_slot_span(_hkey, "no-such-slot")["ok"]
 
     # Every settings key the routes read must actually exist: renaming one
     # and missing a use site is a 500 that only shows up when you click it.
