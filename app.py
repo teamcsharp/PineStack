@@ -18539,6 +18539,116 @@ def hour_shortfall() -> dict[str, Any]:
     return out
 
 
+# #937: what the clock NAMED and what the booth actually did about
+# it. One row per named round, newest last, bounded. This is the only
+# record anywhere of whether the running order is being kept — the log
+# line it replaces scrolled out of the ring buffer within a minute.
+_SCHED_LOG: list[dict[str, Any]] = []
+SCHED_LOG_KEEP = 80
+
+
+def sched_named(index: int, kind: str, label: str, preset: str) -> dict[str, Any]:
+    """The clock has named an entry for this round."""
+    row = {"at": time.time(), "index": int(index), "kind": str(kind)[:24],
+           "label": str(label)[:60], "preset": str(preset)[:40],
+           "aired": None, "why": ""}
+    try:
+        _SCHED_LOG.append(row)
+        del _SCHED_LOG[:-SCHED_LOG_KEEP]
+    except Exception:  # noqa: BLE001
+        pass
+    return row
+
+
+def sched_result(row: dict[str, Any] | None, aired: bool,
+                 why: str = "") -> None:
+    """Whether the booth actually ran what the clock named."""
+    try:
+        if row is None:
+            return
+        row["aired"] = bool(aired)
+        row["why"] = str(why or "")[:120]
+        row["took"] = round(time.time() - float(row.get("at") or 0), 1)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def schedule_jammed() -> str:
+    """#938: the sheet is stuck on one entry, well past its minutes.
+
+    This is the condition #921 was written for — an entry that had
+    overrun its slot by 2.1x while the hour's quotas sat at zero. Half
+    again past the minutes it owns catches that comfortably and earlier,
+    and it is the ONLY circumstance in which a quota may now displace an
+    entry the running order has named. Returns the reason, or ""."""
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        started = float(pos.get("started") or 0)
+        if started <= 0:
+            return ""
+        slot = schedule_take()
+        if not slot:
+            return ""
+        owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+        over = (time.time() - started) / owns if owns else 0.0
+        if over > 1.5:
+            return (f"the sheet is jammed on {slot.get('label') or ''} - "
+                    f"{over:.1f}x its {int(owns)}s")
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def schedule_adherence() -> dict[str, Any]:
+    """Is the running order being kept, and how far into it are we.
+
+    #937: "the schedule is the law of how the studio is ran". A law
+    nobody measures is a suggestion, so this is the measurement: what
+    the clock has named recently, how much of it the booth actually
+    ran, and which entry owns the air this moment with its own clock
+    against it."""
+    out: dict[str, Any] = {"kept": 0, "missed": 0, "recent": [],
+                           "now": {}, "rate": None}
+    try:
+        rows = [r for r in _SCHED_LOG if r.get("aired") is not None]
+        out["kept"] = sum(1 for r in rows if r.get("aired"))
+        out["missed"] = sum(1 for r in rows if not r.get("aired"))
+        if rows:
+            out["rate"] = round(out["kept"] / len(rows), 3)
+        out["recent"] = [
+            {"at": round(float(r.get("at") or 0), 1),
+             "ago": round(time.time() - float(r.get("at") or 0), 1),
+             "kind": r.get("kind"), "label": r.get("label"),
+             "aired": r.get("aired"), "why": r.get("why"),
+             "took": r.get("took")}
+            for r in _SCHED_LOG[-14:]][::-1]
+        slot = schedule_take()
+        if slot:
+            pos = _RADIO.get("sched_pos") or {}
+            owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            through = max(0.0, time.time() - float(pos.get("started") or 0))
+            road = str(SCHED_PREP_KIND.get(str(slot.get("kind") or ""))
+                       or slot.get("kind") or "")
+            need = (hour_needs() or {}).get(road) or {}
+            out["now"] = {
+                "index": int(pos.get("index") or 0),
+                "slot_id": str(slot.get("id") or ""),
+                "kind": str(slot.get("kind") or ""),
+                "label": str(slot.get("label") or slot.get("kind") or ""),
+                "preset": str(pos.get("preset") or ""),
+                "owns_seconds": round(owns, 1),
+                "through_seconds": round(min(through, owns), 1),
+                "through": round(min(1.0, through / owns), 4) if owns else 0,
+                "started": float(pos.get("started") or 0),
+                "held_seconds": round(float(need.get("held") or 0), 1),
+                "owed_seconds": round(float(need.get("owed") or 0), 1),
+                "cannot": CANNOT_PREPARE.get(str(slot.get("kind") or "")) or "",
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def hour_needs() -> dict[str, dict[str, float]]:
     """Per preparing road: seconds the coming hours owe it, and seconds
     it is holding.
@@ -18665,6 +18775,9 @@ def dialogue_flow_state() -> dict[str, Any]:
         # prepared segments from an hour of already-aired renders.
         # #934: what the running order owes each road against what it
         # is holding, and which roads are bare.
+        # #937: is the running order actually being kept, and which
+        # entry owns the air this moment with its own clock against it.
+        "schedule": schedule_adherence(),
         "hour_needs": hour_needs(),
         "hour_short": hour_short_kinds(),
         "prepared_seconds": prepared_seconds(),
@@ -18854,6 +18967,7 @@ async def _torrent_talk() -> None:
             _RADIO["sched_prompt"] = ""
             _RADIO["sched_kind"] = ""              # #853
             _slot: dict[str, Any] = {}
+            _sched_row: dict[str, Any] | None = None   # #937
             if _chosen:
                 _want = str(SWITCH_KINDS.get(
                     str(_chosen.get("kind") or ""), {}).get("round") or "")
@@ -18886,6 +19000,12 @@ async def _torrent_talk() -> None:
                 kind = str(_slot.get("kind") or "")
                 if kind:
                     _pos = _RADIO.get("sched_pos") or {}
+                    # #937: written down, so "is the sheet being kept"
+                    # has an answer that outlives the log ring.
+                    _sched_row = sched_named(
+                        int(_pos.get("index") or 0), kind,
+                        str(_slot.get("label") or kind),
+                        str(_pos.get("preset") or ""))
                     pipeline_log(
                         "air",
                         "the schedule takes this round - "
@@ -18895,6 +19015,16 @@ async def _torrent_talk() -> None:
                         + " on " + str(_pos.get("preset") or "")
                         + ") (#843)")
                 else:
+                    # #937: the sheet had nothing to say for this round —
+                    # switched off, no entries enabled, or it would not
+                    # parse. Said out loud rather than silently drawn,
+                    # because a silent fall-through is exactly what "the
+                    # studio is not following the schedule" sounds like.
+                    _sched_row = sched_named(-1, "", "the sheet named "
+                                             "nothing", "")
+                    sched_result(_sched_row, False,
+                                 "the running order named no entry for "
+                                 "this round")
                     kind = random.choice(choices)
                 # #839/#841: BEHIND BEATS THE DICE. A missed opportunity
                 # in the record loop waits for the next modulo, which is
@@ -18905,23 +19035,31 @@ async def _torrent_talk() -> None:
                 # coin toss. Only the random road is overridden - an
                 # operator's switchboard choice above still wins outright.
                 try:
-                    # #921: the schedule no longer switches this OFF.
+                    # #938: THE RUNNING ORDER IS THE LAW. The quota is
+                    # its deputy and may only act when the law is silent
+                    # or jammed.
                     #
-                    # This read `() if _slot else (...)` — so the moment a
-                    # running order existed, the quota could never catch
-                    # up. Measured live: manager 0 of 4 and caller 0 of 5,
-                    # both "behind, due now", for the whole hour, while
-                    # the sheet sat on one entry that had overrun its slot
-                    # by 2.1x. Segments were being written and recorded
-                    # and then never called for.
+                    # #921 let the quota overrule the sheet whenever it
+                    # was behind its pace. On a station running five
+                    # calls and four memos an hour, something is behind
+                    # its pace nearly always — so the sheet was named and
+                    # overruled round after round, and News coverage,
+                    # Painting selling, Ad read and the memos never got
+                    # the air. The #937 ledger caught it on its first
+                    # recorded round: "MISS · News coverage · the hour
+                    # was behind quota and a caller round was taken".
                     #
-                    # The sheet still leads. It is only overruled when a
-                    # quota is BEHIND ITS PACE FOR THE HOUR *and* spaced
-                    # far enough from the last one — i.e. when the hour is
-                    # demonstrably not going to be delivered otherwise.
-                    # An operator's switchboard choice still wins outright
-                    # above this.
-                    for _q in ("caller", "manager"):
+                    # #921 was right for the station it was written on:
+                    # the clock had JAMMED, one entry overrunning its
+                    # slot by 2.1x while both quotas sat at zero for the
+                    # hour. It keeps exactly that power (schedule_jammed)
+                    # and no more — because with a clock that advances,
+                    # the sheet delivers the quota itself: the phone call
+                    # and the memo from upstairs are entries ON it.
+                    _jam = schedule_jammed() if kind else ""
+                    _may_override = (not kind) or bool(_jam)
+                    for _q in (("caller", "manager") if _may_override
+                               else ()):
                         if (_q in kinds and _q != last
                                 and quota_behind(_q, dj)
                                 and quota_due(_q, dj)):
@@ -18930,12 +19068,27 @@ async def _torrent_talk() -> None:
                                 "air", f"the torrent takes a {_q} round - "
                                        "the hour is behind quota "
                                        f"({quota_count(_q)} of "
-                                       f"{quota_target(_q, dj)}) "
-                                       "(#839/#841)")
+                                       f"{quota_target(_q, dj)})"
+                                       + (f" and {_jam}" if _jam else
+                                          " and the sheet named nothing")
+                                       + " (#839/#841/#938)")
                             break
                 except Exception:  # noqa: BLE001
                     pass        # the dice already chose; never fail here
             _RADIO["last_round_kind"] = kind
+            # #937: if the quota override above re-chose, the entry the
+            # clock named was NOT run — say so on its own row rather
+            # than letting it read as kept.
+            try:
+                if (_sched_row is not None
+                        and _sched_row.get("kind")
+                        and _sched_row.get("kind") != kind):
+                    sched_result(_sched_row, False,
+                                 "the hour was behind quota and a "
+                                 f"{kind} round was taken instead")
+                    _sched_row = None
+            except Exception:  # noqa: BLE001
+                pass
             aired = False
             # #843: the roads the SCHEDULE added on top of the torrent's
             # own rotation — dropping the needle, the ad break, a whole
@@ -18990,6 +19143,16 @@ async def _torrent_talk() -> None:
             except Exception as exc:
                 pipeline_log("drop", f"torrent round failed - {kind}",
                              extra=f"{type(exc).__name__}: {exc}"[:500])
+            # #937: the entry the clock named either ran or it did
+            # not, and the difference is the whole of "is the sheet
+            # being kept". Recorded BEFORE the forced-banter rescue
+            # below, because banter covering for a painting round is
+            # the station staying on air — it is not the running order
+            # being followed, and reporting it as such would make the
+            # adherence figure a lie.
+            sched_result(_sched_row, bool(aired),
+                         "" if aired else f"the {kind} road produced "
+                                          "nothing and banter covered")
             if not aired:
                 aired = await torrent_force_banter(
                     track, f"{kind} produced nothing")
