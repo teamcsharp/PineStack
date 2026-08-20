@@ -2116,6 +2116,143 @@ function worksSchedule(anchorPop) {
   let offset = 0;              // hours forward from now
   let hour = null;             // the hour being shown
   let dragFrom = null;
+  const segOpen = {};          // #927: which entries are open
+  const segBody = {};          // ...and their drawers, kept across paints
+  const segAt = {};            // when each was last filled
+
+  /* #927: fill one entry with what is stacked for it. Throttled, and it
+   * only rebuilds when the shelf actually changed — a drawer being read
+   * must hold still. */
+  async function segLoad(slot, drw, okey, force) {
+    if (!force && Date.now() - (segAt[okey] || 0) < 4000) return;
+    segAt[okey] = Date.now();
+    let d = null;
+    try {
+      d = await api.get("/api/schedule/segment?kind="
+        + encodeURIComponent(slot.kind) + "&hour="
+        + encodeURIComponent(hour.key) + "&slot="
+        + encodeURIComponent(slot.id));
+    } catch (e) {
+      if (!drw.childNodes.length) drw.textContent = "could not read that";
+      return;
+    }
+    const sig = JSON.stringify((d.candidates || []).map(
+      (c) => [c.id, c.priority, c.pinned, c.seconds, c.usable]))
+      + "|" + String(d.pinned_id) + "|" + ((d.generating || []).length);
+    if (drw.dataset.sig === sig) return;      // nothing moved; leave it be
+    drw.dataset.sig = sig;
+    drw.textContent = "";
+
+    if (!d.preparable) {
+      const w = mk("div", "wk-note", d.why || "this one is written live");
+      w.style.cssText = "font-size:9.5px;opacity:.6";
+      drw.appendChild(w);
+      return;
+    }
+    const c2 = d.counts || {};
+    const head = mk("div", "wk-note", "");
+    head.style.cssText = "font-size:9.5px;opacity:.7;margin-bottom:3px";
+    head.textContent = (c2.candidates || 0) + " stacked \u00b7 "
+      + (c2.usable || 0) + " usable \u00b7 "
+      + Math.round(c2.seconds || 0) + "s recorded \u00b7 shelf holds "
+      + (d.cap || 0);
+    drw.appendChild(head);
+
+    (d.candidates || []).forEach((c, ix) => {
+      const it = mk("div", "");
+      it.style.cssText = "border:1px solid "
+        + (c.pinned ? "rgba(120,220,140,.5)" : "#24384a")
+        + ";border-radius:6px;padding:4px 6px;margin-bottom:4px;"
+        + "background:rgba(255,255,255,.02);opacity:"
+        + (c.usable === false ? ".45" : "1");
+      const t1 = mk("div", "");
+      t1.style.cssText = "display:flex;gap:5px;align-items:center;"
+        + "font-size:10px";
+      const mark = mk("b", "", c.pinned ? "\ud83d\udccc"
+                       : ix === 0 ? "\u25b6" : String(ix + 1));
+      mark.style.color = c.pinned ? "#7ce8a9"
+                        : ix === 0 ? "#9fd8ff" : "#6d8199";
+      mark.title = c.pinned ? "pinned - this one goes out"
+                   : ix === 0 ? "next off the shelf" : "";
+      t1.appendChild(mark);
+      const ttl = mk("span", "", String(c.title || c.label || c.id));
+      ttl.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+        + "text-overflow:ellipsis;white-space:nowrap;color:#9fd8ff";
+      t1.appendChild(ttl);
+      const meta = mk("span", "wk-note", "");
+      meta.style.cssText = "font-size:9px;opacity:.7";
+      meta.textContent = (c.lines || 0) + "L \u00b7 "
+        + Math.round(c.seconds || 0) + "s"
+        + (c.burns_in ? " \u00b7 burns in "
+                        + Math.round(c.burns_in / 60) + "m" : "");
+      t1.appendChild(meta);
+      it.appendChild(t1);
+      const pv = mk("div", "wk-note", String(c.preview || "").slice(0, 150));
+      pv.style.cssText = "font-size:9px;line-height:1.45;opacity:.65;"
+        + "margin-top:2px";
+      it.appendChild(pv);
+      if (c.usable === false && c.why) {
+        const bad = mk("div", "wk-note", "\u26a0 " + c.why);
+        bad.style.cssText = "font-size:9px;color:#e88c8c;margin-top:2px";
+        it.appendChild(bad);
+      }
+      const acts = mk("div", "");
+      acts.style.cssText = "display:flex;gap:4px;margin-top:3px";
+      const bt = (txt, title, fn) => {
+        const b = mk("button", "", txt);
+        b.title = title;
+        b.style.cssText = "font-size:9px;padding:1px 6px";
+        b.onclick = async (ev) => {
+          ev.stopPropagation();
+          b.disabled = true;
+          try { await fn(); } catch (e) {}
+          segLoad(slot, drw, okey, true);
+        };
+        acts.appendChild(b);
+      };
+      bt(c.pinned ? "unpin" : "\ud83d\udccc use this one",
+         "Pin this candidate to this entry, this hour",
+         () => api.post("/api/schedule/segment/pin",
+                        {hour: hour.key, slot: slot.id,
+                         shelf_id: c.pinned ? null : c.id}));
+      bt("\u25b2", "Push it up the order",
+         () => api.post("/api/schedule/segment/priority",
+                        {shelf_id: c.id, priority: (c.priority || 0) + 1}));
+      bt("\u25bc", "Push it down the order",
+         () => api.post("/api/schedule/segment/priority",
+                        {shelf_id: c.id, priority: (c.priority || 0) - 1}));
+      bt("\u2715", "Throw this candidate away (the audio is left alone)",
+         () => api.del("/api/schedule/segment/" + encodeURIComponent(c.id)));
+      it.appendChild(acts);
+      drw.appendChild(it);
+    });
+
+    if (!(d.candidates || []).length) {
+      const none = mk("div", "wk-note", "nothing stacked for this entry yet");
+      none.style.cssText = "font-size:9.5px;opacity:.6;margin-bottom:3px";
+      drw.appendChild(none);
+    }
+    const gen = mk("button", "", "\u270e write another for this entry");
+    gen.style.cssText = "font-size:9.5px;padding:2px 7px";
+    gen.onclick = async (ev) => {
+      ev.stopPropagation();
+      gen.disabled = true;
+      gen.textContent = "asking the desk\u2026";
+      try {
+        await api.post("/api/schedule/segment/generate",
+                       {hour: hour.key, slot: slot.id, count: 1});
+        gen.textContent = "the desk is on it";
+      } catch (e) { gen.textContent = "the desk refused that"; }
+      setTimeout(() => segLoad(slot, drw, okey, true), 4000);
+    };
+    drw.appendChild(gen);
+    (d.generating || []).forEach((g) => {
+      const w = mk("div", "wk-note",
+                   "\u270e writing\u2026 " + (g.state || ""));
+      w.style.cssText = "font-size:9px;opacity:.7;margin-top:3px";
+      drw.appendChild(w);
+    });
+  }
 
   const save = async (slots) => {
     if (!hour) return;
@@ -2241,6 +2378,28 @@ function worksSchedule(anchorPop) {
       gear.style.cssText = "font-size:9.5px;margin-top:3px;padding:1px 6px";
       gear.onclick = (ev) => { ev.stopPropagation(); detail(s, i); };
       row.appendChild(gear);
+
+      /* #927: and the entry OPENS onto what is stacked for it. */
+      const okey = "seg:" + hour.key + ":" + s.id;
+      const tri = mk("button", "",
+                     (segOpen[okey] ? "\u25be" : "\u25b8")
+                     + " what is stacked");
+      tri.style.cssText = "font-size:9.5px;margin:3px 0 0 6px;padding:1px 6px";
+      const drw = segBody[okey] || mk("div", "");
+      segBody[okey] = drw;
+      drw.style.display = segOpen[okey] ? "block" : "none";
+      drw.style.marginTop = "4px";
+      tri.onclick = (ev) => {
+        ev.stopPropagation();
+        segOpen[okey] = !segOpen[okey];
+        tri.textContent = (segOpen[okey] ? "\u25be" : "\u25b8")
+                          + " what is stacked";
+        drw.style.display = segOpen[okey] ? "block" : "none";
+        if (segOpen[okey]) segLoad(s, drw, okey, true);
+      };
+      row.appendChild(tri);
+      row.appendChild(drw);
+      if (segOpen[okey]) segLoad(s, drw, okey);
       body.appendChild(row);
     });
   }

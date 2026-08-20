@@ -8929,8 +8929,22 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
         rows = shelf_rows(kind)
+        # #926: its stable id, written down now — before it joins the
+        # shelf, so the clash check behind alt_sid() can see the rows it
+        # has to be different from — so the owner has something to pin.
+        try:
+            alt_sid(kind, row)
+        except Exception:  # noqa: BLE001
+            pass
         rows.append(row)
-        del rows[:-max(1, shelf_cap(kind))]
+        # #926: the cap still holds and the oldest still goes first — but
+        # never a candidate the owner has pinned to a coming hour while an
+        # unpinned one is standing next to it. Falls back to the plain
+        # trim on any doubt at all.
+        try:
+            alt_shelf_trim(kind, rows)
+        except Exception:  # noqa: BLE001
+            del rows[:-max(1, shelf_cap(kind))]
     except Exception:  # noqa: BLE001
         pass
 
@@ -8944,7 +8958,11 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
     falls back to the live road it has always had."""
     try:
         rows = shelf_rows(kind)
-        for row in list(rows):
+        # #926: the pinned alternate first, then the owner's priority,
+        # then oldest. Nothing below this line changed — a stale pin
+        # fails the very same checks every other row is held to and the
+        # walk carries on, so a segment is never silent over one.
+        for row in alt_take_order(kind, rows):
             if time.time() - float(row.get("at") or 0) > PANTRY_BURN_SECONDS:
                 continue
             if voice and str(row.get("voice") or "") != str(voice):
@@ -8955,7 +8973,14 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             entry = row.get("entry")
             if isinstance(entry, dict) and not _larder_current(entry):
                 continue            # written against a contract that moved
-            rows.remove(row)
+            try:
+                # By IDENTITY (#926): the walk now comes off a sorted
+                # copy, and list.remove() would match the first row that
+                # merely COMPARES equal rather than the one being aired.
+                rows[:] = [r for r in rows if r is not row]
+            except Exception:  # noqa: BLE001
+                pass
+            alt_took(kind, row)                                # #926
             return row
         # Nothing usable: shed what is plainly dead so the shelf does not
         # grow a tail of rows nobody can ever take.
@@ -20107,6 +20132,13 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
     minutes = max(0.25, min(600.0, minutes))
     pid = row.get("prompt_id")
     pid = str(pid).strip()[:64] if pid not in (None, "") else None
+    # #926: the ALTERNATE chosen for this entry — one prepared candidate
+    # off that kind's shelf, named by its stable id. It lives on the SLOT
+    # and not on the material, because a pin is a fact about one entry of
+    # one hour ("use THAT painting pitch at ten o'clock"), not a fact
+    # about the pitch. Named here or it does not survive a save at all.
+    pin = row.get("pinned_id")
+    pin = str(pin).strip()[:64] if pin not in (None, "") else None
     return {
         "id": (str(row.get("id") or "").strip()[:48]
                or f"slot-{uuid.uuid4().hex[:10]}"),
@@ -20116,6 +20148,7 @@ def _sched_slot(raw: Any) -> dict[str, Any]:
         "minutes": round(minutes, 3),
         "prompt_id": pid or None,
         "notes": str(row.get("notes") or "")[:400],
+        "pinned_id": pin or None,                              # #926
     }
 
 
@@ -21305,6 +21338,1033 @@ async def schedule_hour_prompt_api(
     _RADIO["sched_prompt"] = ""
     note_action(f"🗓 hour {key} — {label[:40]} scripted and pinned (#883)")
     return schedule_hours_view(key, 1)
+
+
+# --- #926: THE ALTERNATES BEHIND ONE ENTRY OF THE HOUR ----------------
+#
+# "For each section we will have segments scheduled in advance that we
+# will be able to schedule, unschedule, generate, make alternates of,
+# reprioritize, deprioritize, disable, enable on the fly... with painting
+# selling, we can choose which of the painting selling pitches that we
+# have pre-generated that we want to have actually be used for that
+# segment for the hour."
+#
+# NOTHING HERE IS A SECOND CACHE. The candidates ARE the prepared shelf
+# (_SHELF) and the larder — the very rows shelf_take() and dj_banter()
+# already draw from, written by the very same prep_* roads. This adds
+# three facts to material that had none:
+#
+#   sid       a stable id, DERIVED from the kind and the moment the item
+#             was shelved rather than minted, so an item written down
+#             long before anything asked for its id still answers with
+#             the same id — which is what makes a pin survive a restart;
+#   priority  the owner's thumb on the scale, high first, then oldest;
+#   a PIN     which lives on the HOUR'S SLOT and not on the material,
+#             because "use THAT pitch at ten o'clock" is a fact about
+#             one entry of one hour, not about the pitch.
+#
+# THE RULE THAT OUTRANKS ALL OF IT: A PIN IS A PREFERENCE, NEVER A
+# PROMISE. Every road below hands straight back to the ordinary take the
+# instant anything is wrong — an id nobody recognises, a candidate that
+# burned after its twenty-four hours, a clip the media pruner took, a
+# round written against a writing contract that has since moved. A
+# segment going SILENT because a pin went stale would be a far worse
+# fault than airing the second-best advert, so it cannot happen: the pin
+# only ever reorders the candidates shelf_take() was going to walk
+# anyway, and every validity check it was already holding them to still
+# runs, unchanged, in the same order.
+ALT_KINDS = ("ad", "station_id", "manager", "caller",
+             "gallery", "news", "banter")
+ALT_PIN_TTL = 4.0                       # a pin read is cached this long
+ALT_GEN_MOST = 3                        # candidates per generate ticket
+ALT_GEN_WAIT = 900.0                    # how long one waits for a window
+ALT_GEN_LIVE = 3                        # tickets working at once
+ALT_PREVIEW = 240                       # characters of script in a card
+_ALT_PIN_CACHE: dict[str, Any] = {"at": 0.0, "by_slot": {}, "ids": set()}
+_ALT_JOBS: dict[str, dict[str, Any]] = {}
+
+
+def alt_sid_of(kind: str, row: Any) -> str:
+    """The stable id for one prepared item, WITHOUT writing it down.
+
+    Derived from the road and the moment it was shelved, and prefixed
+    with the road so a pin can never be handed to the wrong shelf: an id
+    beginning `gallery-` is meaningless to the advert take, and that
+    check costs nothing because it is in the id itself."""
+    try:
+        got = str((row or {}).get("sid") or "").strip()
+        if got:
+            return got[:64]
+        at = float((row or {}).get("at") or 0)
+        head = str(kind or "alt")[:12]
+        if at <= 0:
+            # Nothing to derive from — mint one. It is written down by
+            # alt_sid() the first time it is asked for, so it is stable
+            # from then on; only a row that never gets read twice in one
+            # process could see this twice, and nothing pins those.
+            return f"{head}-{uuid.uuid4().hex[:10]}"
+        raw = f"{head}\x00{at:.6f}"
+        return (head + "-"
+                + hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()[:10])
+    except Exception:  # noqa: BLE001
+        return f"alt-{uuid.uuid4().hex[:10]}"
+
+
+def alt_sid(kind: str, row: Any) -> str:
+    """The id, written onto the row the first time it is asked for — so
+    it goes to disk with the shelf and comes back after a restart."""
+    try:
+        got = str((row or {}).get("sid") or "").strip()
+        if got:
+            return got[:64]
+        got = alt_sid_of(kind, row)
+        # MEASURED: two items shelved inside the same tick of the wall
+        # clock derive the SAME id, because the clock is only so fine on
+        # some boxes — and two candidates answering to one id is exactly
+        # how a pin lands on the wrong pitch. The second one takes a
+        # discriminator, and it is written down like any other id, so it
+        # is just as stable from here on.
+        try:
+            taken = {str(r.get("sid") or "")
+                     for r in alt_candidates(kind) if r is not row}
+            while got in taken:
+                got = f"{alt_sid_of(kind, row)}{uuid.uuid4().hex[:3]}"
+        except Exception:  # noqa: BLE001
+            pass
+        row["sid"] = got
+        return got
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def alt_priority(row: Any) -> int:
+    """The owner's reprioritise/deprioritise. Zero is untouched."""
+    try:
+        return max(-9, min(9, int((row or {}).get("priority") or 0)))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def alt_prep_kind(kind: str) -> str:
+    """The PREPARING ROAD behind a running-order kind. `banter_caller`
+    is a call; `bombshell` is a short written read. The same map the prep
+    keeper uses, so this and the keeper never disagree."""
+    try:
+        got = str(kind or "").strip().lower()
+        if not got:
+            return ""
+        if got in SCHED_PREP_KIND:
+            return str(SCHED_PREP_KIND[got] or "")
+        return got if got in ALT_KINDS else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def alt_refusal(kind: str) -> str:
+    """Why this entry can have no alternates, in the owner's words. ''
+    when it can. The three roads with no preparing road at all are named
+    in CANNOT_PREPARE with the reason already written."""
+    try:
+        got = str(kind or "").strip().lower()
+        if got in CANNOT_PREPARE:
+            return str(CANNOT_PREPARE[got])
+        if not alt_prep_kind(got):
+            return (f"there is no preparing road behind "
+                    f"{got or 'that entry'} — it is written at the moment "
+                    "it is wanted, so there is nothing to choose between")
+        return ""
+    except Exception:  # noqa: BLE001
+        return "that entry cannot be prepared ahead"
+
+
+def alt_candidates(kind: str) -> list[dict[str, Any]]:
+    """Every prepared item standing behind one road. A booth round's
+    shelf IS the larder and has been since #349, so `banter` is answered
+    off the larder rather than off a shelf row that never existed."""
+    try:
+        if str(kind) == "banter":
+            return [e for e in list(_LARDER) if isinstance(e, dict)]
+        return [r for r in list(_SHELF.get(str(kind)) or [])
+                if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def alt_pin_map(fresh: bool = False) -> dict[str, Any]:
+    """Every pin the station is holding: {slot id: item id} for the hour
+    ON AIR, and the set of every id pinned anywhere in the hours to come.
+
+    CACHED. This is read on the air path, and reading schedule.json off
+    the disk once per segment is a cost the live round must never carry.
+    Bounded on both sides: at most a few seconds old, at most the next
+    forty-eight scheduled hours walked."""
+    now = time.time()
+    try:
+        if (not fresh
+                and now - float(_ALT_PIN_CACHE.get("at") or 0) < ALT_PIN_TTL):
+            return _ALT_PIN_CACHE
+        by_slot: dict[str, str] = {}
+        ids: set[str] = set()
+        store = schedule_read()
+        key = _sched_hour_key()
+        hours = store.get("hours") or {}
+        near = [k for k in sorted(str(x) for x in hours) if k >= key][:48]
+        for hkey in near:
+            for slot in ((hours.get(hkey) or {}).get("slots") or []):
+                pin = str((slot or {}).get("pinned_id") or "").strip()
+                if pin:
+                    ids.add(pin)
+        # The hour on air is resolved properly — override, or the plan it
+        # falls back to — because that is the list schedule_take() walks.
+        try:
+            _name, rows, _on = schedule_hour_slots(store, key)
+            for slot in rows:
+                pin = str((slot or {}).get("pinned_id") or "").strip()
+                if pin:
+                    ids.add(pin)
+                    by_slot[str((slot or {}).get("id") or "")] = pin
+        except Exception:  # noqa: BLE001
+            pass
+        _ALT_PIN_CACHE.update({"at": now, "by_slot": by_slot, "ids": ids})
+    except Exception:  # noqa: BLE001
+        _ALT_PIN_CACHE["at"] = now      # never hammer a broken read
+        _ALT_PIN_CACHE.setdefault("by_slot", {})
+        _ALT_PIN_CACHE.setdefault("ids", set())
+    return _ALT_PIN_CACHE
+
+
+def alt_pin_forget() -> None:
+    """The air road re-reads the pins at once, not in four seconds."""
+    try:
+        _ALT_PIN_CACHE["at"] = 0.0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def alt_pinned_id(kind: str) -> str:
+    """The item pinned to the entry ON AIR RIGHT NOW, when that entry's
+    road is this one. '' whenever anything at all is unclear — no
+    schedule running, no entry seated, a pin for a different road."""
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        slot_id = str(pos.get("slot_id") or "")
+        if not slot_id:
+            return ""                   # no running order is seated
+        want = str((alt_pin_map().get("by_slot") or {}).get(slot_id) or "")
+        if not want:
+            return ""
+        # The road is in the id itself, so a painting pitch pinned to a
+        # gallery entry can never be handed to the advert shelf.
+        return want if want.startswith(f"{str(kind)[:12]}-") else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def alt_take_order(kind: str, rows: Any) -> list[dict[str, Any]]:
+    """The order shelf_take() should CONSIDER prepared items in.
+
+    Pinned first, then the owner's priority, then oldest. With no pin and
+    no priorities set this is `list(rows)` exactly — insertion order,
+    oldest first, which is what the shelf has always done. This orders
+    only; it never removes and never validates, so every check in
+    shelf_take() still decides what actually airs."""
+    try:
+        got = [r for r in list(rows or []) if isinstance(r, dict)]
+        got.sort(key=lambda r: (-alt_priority(r), float(r.get("at") or 0)))
+        want = alt_pinned_id(kind)
+        if not want:
+            return got
+        head = [r for r in got if alt_sid(kind, r) == want]
+        if not head:
+            pipeline_log(
+                "lookahead",
+                "the alternate pinned to the "
+                f"{SHELF_LABEL.get(str(kind), str(kind))} on air is no "
+                "longer on the shelf — the best prepared one goes out "
+                "instead, and the segment is not silent (#926)")
+            return got
+        return head + [r for r in got if all(r is not h for h in head)]
+    except Exception:  # noqa: BLE001
+        return [r for r in list(rows or []) if isinstance(r, dict)]
+
+
+def alt_took(kind: str, row: Any) -> None:
+    """Say out loud when a pin was actually honoured — the owner asked
+    for that pitch and that pitch is what went out."""
+    try:
+        want = alt_pinned_id(kind)
+        if want and alt_sid(kind, row) == want:
+            pipeline_log(
+                "lookahead",
+                f"the {SHELF_LABEL.get(str(kind), str(kind))} the owner "
+                "pinned to this entry is the one going out (#926)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def alt_larder_index() -> int:
+    """WHICH banked booth round dj_banter should serve.
+
+    0 — the oldest, exactly as it always was — unless the entry on air
+    pins one, or the owner has put a priority on one. A pinned round
+    that has gone stale or was written to a contract that has moved is
+    NOT served: it hands back to the ordinary pick rather than putting a
+    round on air that _banter_air would have to throw away."""
+    try:
+        if not _LARDER:
+            return 0
+        want = alt_pinned_id("banter")
+        if want:
+            for i, entry in enumerate(_LARDER):
+                if alt_sid("banter", entry) != want:
+                    continue
+                fresh = (time.time() - float(entry.get("at") or 0)
+                         < larder_fresh())
+                if fresh and _larder_current(entry):
+                    return i
+                pipeline_log("lookahead",
+                             "the booth round pinned to this entry has gone "
+                             "stale — the shelf's own order stands (#926)")
+                break
+        best, best_pri, best_at = 0, None, 0.0
+        for i, entry in enumerate(_LARDER):
+            at = float(entry.get("at") or 0)
+            # A round the keeper has not swept up yet that is already
+            # stale or off-contract is not a candidate while a good one
+            # stands beside it — dj_banter would only drop it on the
+            # floor and write live. All of them bad answers 0, which is
+            # exactly what this road did before any of this shipped.
+            if (time.time() - at >= larder_fresh()
+                    or not _larder_current(entry)):
+                continue
+            pri = alt_priority(entry)
+            if (best_pri is None or pri > best_pri
+                    or (pri == best_pri and at < best_at)):
+                best, best_pri, best_at = i, pri, at
+        return best if 0 <= best < len(_LARDER) else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
+    """Hold the shelf's row limit, oldest out first — but never drop a
+    candidate the owner has pinned to a coming hour while an unpinned one
+    is standing beside it. A pin going stale is safe (the take falls
+    through), so this is courtesy rather than correctness: any doubt at
+    all and the plain trim runs instead."""
+    try:
+        cap = max(1, shelf_cap(kind))
+        over = len(rows) - cap
+        if over <= 0:
+            return
+        ids = alt_pin_map().get("ids") or set()
+        if ids:
+            drop: list[dict[str, Any]] = []
+            for row in rows:
+                if len(drop) >= over:
+                    break
+                if alt_sid(kind, row) in ids:
+                    continue            # spoken for; skip it
+                drop.append(row)
+            if len(drop) >= over:
+                rows[:] = [r for r in rows
+                           if all(r is not d for d in drop)]
+                return
+        del rows[:over]
+    except Exception:  # noqa: BLE001
+        try:
+            del rows[:-max(1, shelf_cap(kind))]
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def alt_lines_in(script: str) -> int:
+    try:
+        return sum(1 for line in str(script or "").splitlines()
+                   if line.strip())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def alt_preview(text: str) -> str:
+    try:
+        flat = " ".join(str(text or "").split())
+        return flat[:ALT_PREVIEW] + ("…" if len(flat) > ALT_PREVIEW else "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def alt_title(kind: str, row: Any, entry: Any) -> str:
+    """What this candidate is ABOUT, in a few words — the product being
+    sold, the paintings on the wall, the name on the phone. This is what
+    the owner picks between at a glance."""
+    try:
+        if str(kind) == "ad":
+            return str((row or {}).get("product") or "")[:80]
+        if isinstance(entry, dict):
+            if str(kind) == "gallery":
+                named = [str((art or {}).get("name") or "")[:40]
+                         for art in (entry.get("prep_gallery") or [])
+                         if (art or {}).get("name")]
+                if named:
+                    return ", ".join(named)[:120]
+            who = str(entry.get("caller_name") or "")
+            if who:
+                return who[:80]
+            return str(entry.get("seed_text")
+                       or entry.get("source") or "")[:80]
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def alt_row_view(kind: str, row: Any,
+                 pinned_id: str = "") -> dict[str, Any]:
+    """ONE CANDIDATE, as the picker needs it: a stable id, a preview of
+    the script, how many lines it is, how much finished audio it already
+    has, when it was written, and whether it is the pinned one."""
+    out: dict[str, Any] = {
+        "id": "", "kind": str(kind),
+        "label": SHELF_LABEL.get(str(kind), str(kind)),
+        "title": "", "preview": "", "text": "",
+        "lines": 0, "made": 0, "seconds": 0.0,
+        "written_at": 0.0, "age_seconds": 0.0, "burns_in": 0.0,
+        "rendered": False, "ready": False, "voice": "",
+        "priority": 0, "pinned": False, "usable": True, "why": ""}
+    try:
+        out["id"] = alt_sid(kind, row)
+        out["priority"] = alt_priority(row)
+        at = float((row or {}).get("at") or 0)
+        out["written_at"] = round(at, 3)
+        out["age_seconds"] = round(max(0.0, time.time() - at), 1)
+        out["burns_in"] = round(
+            max(0.0, at + PANTRY_BURN_SECONDS - time.time()), 1)
+        out["pinned"] = bool(pinned_id and out["id"] == str(pinned_id))
+        entry = (row or {}).get("entry")
+        if str(kind) == "banter" and not isinstance(entry, dict):
+            entry = row                 # the larder holds the round itself
+        if isinstance(entry, dict):
+            # A whole SEGMENT: a memo, a call, a painting round, a
+            # bulletin, a booth round. It counts in LINES, because a line
+            # is what a preparer actually makes.
+            script = str(entry.get("script") or "")
+            out["text"] = script[:4000]
+            out["preview"] = alt_preview(script)
+            out["lines"] = (int(entry.get("chunks") or 0)
+                            or alt_lines_in(script))
+            out["made"] = int(entry.get("made") or 0)
+            out["seconds"] = round(float(entry.get("seconds")
+                                         or (row or {}).get("seconds")
+                                         or 0), 1)
+            out["rendered"] = out["made"] > 0
+            out["ready"] = bool(entry.get("prepared"))
+            out["title"] = alt_title(kind, row, entry)
+            if not _larder_current(entry):
+                out["usable"] = False
+                out["why"] = ("written against a writing contract that has "
+                              "since moved — it would be thrown away "
+                              "rather than aired")
+        else:
+            # A one-line item: an advert read, a station ID. Its `key` is
+            # the whole of its audio, and #904 means the words alone are
+            # a perfectly good candidate — they read live.
+            text = str((row or {}).get("text") or "")
+            out["text"] = text[:4000]
+            out["preview"] = alt_preview(text)
+            out["lines"] = 1 if text.strip() else 0
+            out["voice"] = str((row or {}).get("voice") or "")
+            out["seconds"] = round(float((row or {}).get("seconds") or 0), 1)
+            key = str((row or {}).get("key") or "")
+            out["rendered"] = bool(key)
+            # Deliberately NOT pantry_get(): a listing must not count as
+            # a use, and must not prune anything out from under the air.
+            out["ready"] = bool(key and key in _PANTRY)
+            out["made"] = 1 if out["ready"] else 0
+            out["title"] = alt_title(kind, row, None)
+            if key and not out["ready"]:
+                out["usable"] = False
+                out["why"] = ("the recording has been pruned — the words "
+                              "stand, and are read live when it airs")
+        if out["burns_in"] <= 0:
+            out["usable"] = False
+            out["why"] = ("burned — twenty-four hours on the shelf without "
+                          "airing")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def alt_jobs_for(hour: str, slot_id: str) -> list[dict[str, Any]]:
+    try:
+        return [dict(j) for j in list(_ALT_JOBS.values())
+                if str(j.get("hour") or "") == str(hour)
+                and str(j.get("slot") or "") == str(slot_id)][-6:]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def alt_segment_view(hour: str = "", slot_id: str = "",
+                     kind: str = "") -> dict[str, Any]:
+    """EVERYTHING CANDIDATE FOR ONE SEGMENT — the whole answer behind the
+    triangle. The candidate list comes back IN AIR ORDER: the pinned one
+    first, then priority, then oldest, which is exactly the order
+    shelf_take() will consider them in when this entry comes round."""
+    key = str(hour or "").strip()
+    if not _sched_is_hour_key(key):
+        key = _sched_hour_key()
+    slot: dict[str, Any] = {}
+    overridden = False
+    try:
+        store = schedule_read()
+        _name, raw, overridden = schedule_hour_slots(store, key)
+        rows = [_sched_slot(s) for s in raw]
+    except Exception:  # noqa: BLE001
+        rows = []
+    want = str(slot_id or "").strip()[:48]
+    if want:
+        slot = next((s for s in rows
+                     if str(s.get("id") or "") == want), {})
+    slot_kind = str(slot.get("kind") or kind or "")
+    prep = alt_prep_kind(kind) or alt_prep_kind(slot_kind)
+    why = alt_refusal(slot_kind or kind)
+    pinned_id = str(slot.get("pinned_id") or "")
+    cards: list[dict[str, Any]] = []
+    if prep:
+        for row in alt_candidates(prep):
+            cards.append(alt_row_view(prep, row, pinned_id))
+        cards.sort(key=lambda c: (0 if c.get("pinned") else 1,
+                                  -int(c.get("priority") or 0),
+                                  float(c.get("written_at") or 0)))
+    on_air = False
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        on_air = bool(want and key == _sched_hour_key()
+                      and str(pos.get("slot_id") or "") == want)
+    except Exception:  # noqa: BLE001
+        on_air = False
+    try:
+        cap = _LARDER_MAX if prep == "banter" else shelf_cap(prep or "")
+    except Exception:  # noqa: BLE001
+        cap = 0
+    return {
+        "hour": key,
+        "overridden": bool(overridden),
+        "slot": slot or None,
+        "slot_id": want or None,
+        "slot_kind": slot_kind or None,
+        # The PREPARING road behind the entry, which is what the shelf is
+        # keyed by — `banter_caller` and `caller` share one shelf of calls.
+        "kind": prep or None,
+        "label": SHELF_LABEL.get(prep, prep or slot_kind or ""),
+        "on_air": on_air,
+        "preparable": bool(prep) and not why,
+        "why": why,
+        "cap": cap,
+        "pinned_id": pinned_id or None,
+        "pinned": next((c for c in cards if c.get("pinned")), None),
+        # True when the owner pinned something that is no longer there —
+        # the entry still airs, off the top of the list below.
+        "pin_stale": bool(pinned_id) and not any(c.get("pinned")
+                                                 for c in cards),
+        "counts": {
+            "candidates": len(cards),
+            "ready": sum(1 for c in cards if c.get("ready")),
+            "usable": sum(1 for c in cards if c.get("usable")),
+            "seconds": round(sum(float(c.get("seconds") or 0)
+                                 for c in cards), 1),
+        },
+        "prep": _sched_slot_prep(slot_kind or prep or "",
+                                 _sched_prep_snapshot()),
+        "generating": alt_jobs_for(key, want),
+        "candidates": cards,
+    }
+
+
+def alt_find(shelf_id: str) -> tuple[str, Any]:
+    """(road, the row itself) for one candidate id, wherever it is
+    standing. ('', None) when nothing answers to it."""
+    want = str(shelf_id or "").strip()[:64]
+    if not want:
+        return "", None
+    try:
+        for kind in ALT_KINDS:
+            for row in alt_candidates(kind):
+                if alt_sid(kind, row) == want:
+                    return kind, row
+    except Exception:  # noqa: BLE001
+        pass
+    return "", None
+
+
+def alt_slot_of(store: dict[str, Any], key: str,
+                slot_id: str) -> tuple[list[dict[str, Any]], Any]:
+    """One hour's entries, resolved and scrubbed, and the index of the
+    one asked for. Resolving the hour is what materialises it: an hour
+    nobody has touched still answers with the plan it is running."""
+    _name, resolved, _on = schedule_hour_slots(store, key)
+    rows = [_sched_slot(s) for s in resolved]
+    want = str(slot_id or "").strip()[:48]
+    at = next((i for i, s in enumerate(rows)
+               if str(s.get("id") or "") == want), None)
+    return rows, at
+
+
+def alt_hour_write(store: dict[str, Any], key: str,
+                   rows: list[dict[str, Any]]) -> None:
+    """Copy-on-write, exactly as scripting one entry's prompt does: from
+    here that hour keeps its own list."""
+    entry = dict((store.get("hours") or {}).get(key) or {})
+    entry["slots"] = rows
+    entry["at"] = round(time.time(), 3)
+    _sched_hours_put(store, key, entry)
+    schedule_write(store)
+
+
+# --- Generating alternates on demand ----------------------------------
+# "add additional new scripts to generate different segments that would
+# take the place of them."
+#
+# The SAME prep_* road the keeper uses, never a parallel writer — so an
+# alternate is made of exactly the same stuff, lands on exactly the same
+# shelf, is burned by the same twenty-four hours and is taken by the same
+# take. Three things keep it off the live path, and they are the three
+# the keeper already obeys:
+#
+#   * it only ever starts inside a WINDOW (alt_window / pantry_window) —
+#     a record with room left on it, an ad break, or a station that is
+#     not on air at all, which has no live round to get in the way of;
+#   * every LINE it renders goes through prep_render_line, which takes
+#     the spare engine slot with engine_prep_take() and never the last
+#     one, and answers None the moment prep_should_stop() says the live
+#     road wants the room;
+#   * it works on the CLOCK the window gives it (_PREP_DEADLINE), so an
+#     overrun ends at the next line boundary with everything made so far
+#     kept, rather than running on over the handover.
+#
+# And the ticket comes back AT ONCE. Writing and recording a painting
+# round is minutes of work; the request that asked for it does not wait,
+# the way /api/vision/reanalyse does not wait for the vision model.
+def alt_window() -> str:
+    """The stretch it is cheap to build in — pantry_window() exactly,
+    with one addition: a station that is NOT ON AIR has no live round to
+    stay out of the way of, so the door is open. The engine discipline
+    below is untouched either way."""
+    try:
+        if not _RADIO.get("on"):
+            return "the station is off air"
+        return pantry_window()
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def alt_bank_banter() -> bool:
+    """One more booth round on the larder shelf, written the way
+    larder_keeper writes them — and standing down if that keeper is
+    already at the desk."""
+    if _LARDER_WRITING[0]:
+        return False
+    before = len(_LARDER)
+    _LARDER_WRITING[0] = True
+    try:
+        await dj_banter(None, bank=True, render_stream=True)
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        _LARDER_WRITING[0] = False
+    return len(_LARDER) > before
+
+
+def alt_prep_road(kind: str) -> Any:
+    """The coroutine that writes ONE more of this kind. Nothing new —
+    these are the very roads prep_board() schedules."""
+    got = str(kind or "")
+    if got == "ad":
+        return prep_ad()
+    if got == "station_id":
+        return prep_station_id()
+    if got in ("manager", "caller"):
+        return prep_round(got)
+    if got == "gallery":
+        return prep_gallery()
+    if got == "news":
+        return prep_news()
+    if got == "banter":
+        return alt_bank_banter()
+    return None
+
+
+def alt_job_put(job: str, **more: Any) -> dict[str, Any]:
+    row = _ALT_JOBS.setdefault(str(job), {"job": str(job)})
+    try:
+        row.update(more)
+        row["at"] = round(time.time(), 3)
+        if len(_ALT_JOBS) > 40:
+            for old in list(_ALT_JOBS)[:len(_ALT_JOBS) - 40]:
+                _ALT_JOBS.pop(old, None)
+    except Exception:  # noqa: BLE001
+        pass
+    return row
+
+
+async def alt_generate_job(job: str, kind: str, count: int) -> None:
+    """Write N MORE candidates for one road, off the live path.
+
+    Never raises: the ticket carries the bad news instead. Every item is
+    counted honestly — `made` is what actually landed on the shelf, and a
+    road that politely refused (nothing to sell tonight, a bulletin
+    already standing by, the front page too far off) says so rather than
+    being counted as a success."""
+    made = 0
+    fresh: list[str] = []
+    started = time.time()
+    try:
+        for step in range(max(1, int(count))):
+            # Wait for a stretch where nobody is waiting on a voice.
+            while True:
+                window = alt_window()
+                if window and not prep_should_stop():
+                    break
+                if time.time() - started > ALT_GEN_WAIT:
+                    alt_job_put(job, state="gave up", made=made, new=fresh,
+                                why="no quiet stretch came free in fifteen "
+                                    "minutes — the live round had the room "
+                                    "the whole time")
+                    return
+                alt_job_put(job, state="waiting", made=made, new=fresh,
+                            why=(prep_should_stop()
+                                 or "waiting for a record or a break"))
+                await asyncio.sleep(3)
+            alt_job_put(job, state="writing", made=made, new=fresh,
+                        window=window, why="")
+            before = {alt_sid(kind, r) for r in alt_candidates(kind)}
+            # #872: on the clock, and measured on the same ledger every
+            # other preparation task is measured on.
+            _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+            try:
+                road = alt_prep_road(kind)
+                ok = bool(await prep_measure(kind, road)) if road else False
+            finally:
+                _PREP_DEADLINE[0] = 0.0
+            after = {alt_sid(kind, r) for r in alt_candidates(kind)}
+            new = sorted(after - before)
+            fresh.extend(new)
+            if ok or new:
+                made += 1
+                pipeline_log(
+                    "lookahead",
+                    f"an alternate {SHELF_LABEL.get(kind, kind)} was "
+                    f"written on request — {made} of {count} (#926)")
+            else:
+                alt_job_put(job, refused=int(
+                    (_ALT_JOBS.get(job) or {}).get("refused") or 0) + 1)
+        alt_job_put(job, state="done", made=made, new=fresh, why="")
+        note_action(f"🗓 {made} alternate(s) prepared: "
+                    + SHELF_LABEL.get(kind, kind) + " (#926)")
+    except Exception as exc:  # noqa: BLE001
+        alt_job_put(job, state="failed", made=made, new=fresh,
+                    why=f"{type(exc).__name__}: {exc}"[:180])
+        try:
+            _PREP_DEADLINE[0] = 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.get("/api/schedule/segment")
+async def schedule_segment_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#926: EVERYTHING STACKED UP BEHIND ONE ENTRY OF THE HOUR.
+
+        ?kind=<kind>&hour=YYYY-MM-DDTHH&slot=<slot id>
+
+    Name the entry (hour + slot) and this answers with every prepared
+    candidate that entry could air: a stable id, a preview of the script,
+    how many lines it is, how much finished audio it already has, when it
+    was written, and which one is PINNED. `kind` alone answers for a road
+    without naming an entry; hour defaults to the one on air.
+
+    The list comes back IN AIR ORDER — pinned, then priority, then oldest
+    — which is the order shelf_take() itself will consider them in."""
+    require_read_auth(authorization)
+    query = request.query_params
+    return alt_segment_view(
+        str(query.get("hour") or query.get("key") or ""),
+        str(query.get("slot") or query.get("slot_id") or ""),
+        str(query.get("kind") or ""))
+
+
+@app.post("/api/schedule/segment/pin")
+async def schedule_segment_pin_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#926: CHOOSE which prepared candidate this entry airs.
+
+    {"hour": "2026-08-19T22", "slot": "hour-03", "shelf_id": "gallery-…"}
+
+    The hour is materialised as its own orders in the same breath, the
+    way scripting an entry's prompt does — a pin is that hour's business
+    and nobody else's. Send "shelf_id": null to unpin.
+
+    A pin is a PREFERENCE, not a promise: if that candidate has burned,
+    been taken, or had its audio pruned by the time the entry comes
+    round, the ordinary take runs and the segment airs anyway."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    key = str(payload.get("hour") or payload.get("key")
+              or "").strip() or _sched_hour_key()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="hour must be a local hour like 2026-08-19T22")
+    slot_id = str(payload.get("slot") or payload.get("slot_id")
+                  or "").strip()[:48]
+    if not slot_id:
+        raise HTTPException(status_code=400, detail="slot is required")
+    raw = payload.get("shelf_id", payload.get("id"))
+    want = "" if raw in (None, "", False) else str(raw).strip()[:64]
+    with _SCHEDULE_LOCK:
+        store = schedule_read()
+        rows, at = alt_slot_of(store, key, slot_id)
+        if at is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No entry {slot_id!r} in the hour {key}")
+        prep = alt_prep_kind(str(rows[at].get("kind") or ""))
+        if want:
+            if not prep:
+                raise HTTPException(
+                    status_code=400,
+                    detail=alt_refusal(str(rows[at].get("kind") or "")))
+            found = next((r for r in alt_candidates(prep)
+                          if alt_sid(prep, r) == want), None)
+            if found is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"No prepared {SHELF_LABEL.get(prep, prep)} "
+                           f"called {want!r} — it may have aired, been "
+                           "discarded, or burned off the shelf")
+        rows[at]["pinned_id"] = want or None
+        alt_hour_write(store, key, rows)
+    alt_pin_forget()                    # the air road re-reads at once
+    label = str(rows[at].get("label") or prep or slot_id)
+    note_action("🗓 " + (f"alternate pinned: {label[:40]} — {key}"
+                         if want else
+                         f"alternate unpinned: {label[:40]} — {key}")
+                + " (#926)")
+    pipeline_log("lookahead",
+                 (f"{label[:40]} at {key[11:13]}:00 will air the alternate "
+                  f"{want} — unless it has burned by then, in which case "
+                  "the best prepared one goes out (#926)")
+                 if want else
+                 f"{label[:40]} at {key[11:13]}:00 is back on the ordinary "
+                 "take (#926)")
+    return alt_segment_view(key, slot_id)
+
+
+@app.post("/api/schedule/segment/generate")
+async def schedule_segment_generate_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#926: WRITE MORE CANDIDATES for this entry, right now.
+
+    {"hour": "2026-08-19T22", "slot": "hour-03", "count": 1..3}
+
+    Comes back AT ONCE with a ticket, because writing and recording a
+    painting round is minutes of work and the live round may never wait
+    on it. Poll GET /api/schedule/segment/generate/{job}, or just re-read
+    /api/schedule/segment and watch the candidates arrive.
+
+    It uses the very prep road the keeper uses, inside the same building
+    window, taking only the spare engine slot — so the show never queues
+    behind it. Entries with no preparing road at all (a record, the
+    recap, the deep dig) are refused with the reason."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    key = str(payload.get("hour") or payload.get("key")
+              or "").strip() or _sched_hour_key()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="hour must be a local hour like 2026-08-19T22")
+    slot_id = str(payload.get("slot") or payload.get("slot_id")
+                  or "").strip()[:48]
+    try:
+        count = max(1, min(ALT_GEN_MOST, int(payload.get("count") or 1)))
+    except (TypeError, ValueError):
+        count = 1
+    store = schedule_read()
+    rows, at = alt_slot_of(store, key, slot_id)
+    slot_kind = str(payload.get("kind") or "")
+    if at is not None:
+        slot_kind = str(rows[at].get("kind") or "")
+    elif slot_id:
+        raise HTTPException(status_code=404,
+                            detail=f"No entry {slot_id!r} in the hour {key}")
+    why = alt_refusal(slot_kind)
+    kind = alt_prep_kind(slot_kind)
+    if why or not kind:
+        raise HTTPException(
+            status_code=400,
+            detail=(why or "there is nothing that can be prepared ahead "
+                           "for that entry"))
+    live = sum(1 for j in _ALT_JOBS.values()
+               if str(j.get("state") or "") in ("queued", "waiting",
+                                                "writing"))
+    if live >= ALT_GEN_LIVE:
+        raise HTTPException(
+            status_code=409,
+            detail=f"{live} lots of alternates are already being written — "
+                   "let those land first, so the writing room is not the "
+                   "thing holding the show up")
+    job = "alt_" + uuid.uuid4().hex[:10]
+    row = alt_job_put(job, state="queued", hour=key, slot=slot_id,
+                      kind=kind, slot_kind=slot_kind,
+                      label=SHELF_LABEL.get(kind, kind), count=count,
+                      made=0, refused=0, new=[], why="",
+                      full=bool(shelf_full(kind)))
+
+    async def _more() -> None:
+        try:
+            await alt_generate_job(job, kind, count)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"the alternates task died: {exc}"[:200])
+
+    asyncio.create_task(_more())
+    note_action(f"🗓 writing {count} alternate(s): "
+                + SHELF_LABEL.get(kind, kind) + f" — {key} (#926)")
+    pipeline_log("lookahead",
+                 f"{count} alternate {SHELF_LABEL.get(kind, kind)}(s) "
+                 "asked for — they are written in the next quiet stretch, "
+                 "on the spare engine slot, so the live round never waits "
+                 "(#926)")
+    return dict(row)
+
+
+@app.get("/api/schedule/segment/generate/{job}")
+async def schedule_segment_generate_state(
+    job: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#926: where that lot of alternates got to — queued, waiting for a
+    quiet stretch, writing, done, gave up or failed, with the ids of the
+    candidates that landed."""
+    require_read_auth(authorization)
+    row = _ALT_JOBS.get(str(job))
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail="No such request — it may have aged off")
+    return dict(row)
+
+
+@app.post("/api/schedule/segment/priority")
+async def schedule_segment_priority_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#926: REPRIORITISE or DEPRIORITISE one prepared candidate.
+
+    {"shelf_id": "ad-1a2b3c4d5e", "priority": 3}
+
+    -9 to 9, zero being untouched. With nothing pinned, the take prefers
+    the highest priority and then the oldest — so this is how the owner
+    says "that one next" without nailing it to a particular hour."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    want = str(payload.get("shelf_id") or payload.get("id") or "").strip()
+    kind, row = alt_find(want)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No prepared item called {want!r} — it may have aired "
+                   "or burned off the shelf")
+    try:
+        priority = max(-9, min(9, int(payload.get("priority") or 0)))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400,
+                            detail="priority must be a whole number")
+    row["priority"] = priority
+    try:
+        if kind == "banter":
+            _larder_save()
+        else:
+            _pantry_save(True)
+    except Exception:  # noqa: BLE001
+        pass
+    note_action(f"🗓 {SHELF_LABEL.get(kind, kind)} priority {priority:+d} "
+                "(#926)")
+    return {"ok": True, "id": want, "kind": kind, "priority": priority,
+            "candidate": alt_row_view(kind, row, alt_pinned_id(kind))}
+
+
+@app.delete("/api/schedule/segment/{shelf_id}")
+async def schedule_segment_discard_api(
+    shelf_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#926: DISCARD one prepared candidate — a pitch the owner does not
+    want in the running.
+
+    ONLY the shelf row goes. THE AUDIO IS NOT DELETED: the media pruner
+    owns the files and it is the one that knows what is still queued to
+    play (_protected_media_keys) — a preparer unlinking a clip out from
+    under a queued line is exactly the fault #467 exists to prevent. The
+    clip stays in the pantry, keyed by its own text, and any other road
+    that says those words still gets it for free.
+
+    Any hour that had pinned this one is quietly unpinned, so nothing is
+    left pointing at material that has gone."""
+    require_auth(authorization)
+    want = str(shelf_id or "").strip()[:64]
+    kind, row = alt_find(want)
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No prepared item called {want!r} — it may have aired "
+                   "or burned off the shelf already")
+    left = 0
+    try:
+        shelf = _LARDER if kind == "banter" else shelf_rows(kind)
+        shelf[:] = [r for r in shelf if r is not row]
+        left = len(shelf)
+        if kind == "banter":
+            _larder_save()
+        else:
+            _pantry_save(True)
+    except Exception:  # noqa: BLE001
+        pass
+    unpinned: list[str] = []
+    try:
+        with _SCHEDULE_LOCK:
+            store = schedule_read()
+            hours = dict(store.get("hours") or {})
+            for hkey, blob in list(hours.items()):
+                for slot in ((blob or {}).get("slots") or []):
+                    if str((slot or {}).get("pinned_id") or "") == want:
+                        slot["pinned_id"] = None
+                        unpinned.append(str(hkey))
+            if unpinned:
+                store["hours"] = hours
+                schedule_write(store)
+        alt_pin_forget()
+    except Exception:  # noqa: BLE001
+        pass
+    note_action(f"🗓 {SHELF_LABEL.get(kind, kind)} discarded — the shelf "
+                "row only, the audio is the pruner's (#926)")
+    pipeline_log("lookahead",
+                 f"one prepared {SHELF_LABEL.get(kind, kind)} was discarded "
+                 f"by hand — {left} left on that shelf, and the recording "
+                 "is left where it is for the media prune (#926)")
+    return {"ok": True, "id": want, "kind": kind, "left": left,
+            "unpinned": unpinned}
 
 
 @app.get("/api/schedule/prompts")
@@ -35077,7 +36137,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # caller, the button) is written to order.
     if (not bank and not angle and not force_seed and not caller_name
             and _LARDER):
-        entry = _LARDER.pop(0)
+        entry = _LARDER.pop(alt_larder_index())            # #926
         _larder_save()
         if (time.time() - float(entry["at"]) < larder_fresh()
                 and _larder_current(entry)):
