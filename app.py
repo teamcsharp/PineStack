@@ -6567,6 +6567,35 @@ async def _wire_probe(host: str = "") -> str:
         return "dark"
 
 
+async def _wire_probe_one(host: str) -> str:
+    """#973: ONE address, with no fallback to the others.
+
+    _wire_probe deliberately tries every candidate, which is right when
+    the question is "is the box reachable at all" and wrong when the
+    question is "which address is it on" — asking about .161 there
+    answered "alive" on the strength of .205, which is exactly the kind
+    of quietly-wrong answer that caused this outage in the first place."""
+    def probe() -> str:
+        import socket as _socket
+        one = str(host or "").strip()
+        if not one:
+            return "dark"
+        for port in (6053, 80, 3232):
+            try:
+                c = _socket.create_connection((one, port), 3)
+                c.close()
+                return "alive"
+            except ConnectionRefusedError:
+                return "alive"
+            except OSError:
+                continue
+        return "dark"
+    try:
+        return await asyncio.to_thread(probe)
+    except Exception:  # noqa: BLE001
+        return "dark"
+
+
 async def nabu_wire_report() -> dict[str, Any]:
     """#973: which of the candidate addresses is actually answering.
 
@@ -6575,7 +6604,7 @@ async def nabu_wire_report() -> dict[str, Any]:
     out: dict[str, Any] = {"hosts": [], "alive": "", "configured":
                            NABU_PROBE_HOST}
     for one in nabu_probe_hosts():
-        state = await _wire_probe(one)
+        state = await _wire_probe_one(one)
         out["hosts"].append({"host": one, "state": state})
         if state == "alive" and not out["alive"]:
             out["alive"] = one
@@ -54633,6 +54662,60 @@ async def pinebox_status_api(
         "host": SATELLITE_HOST,
         "entity": diag.get("checks") and None,
     }
+
+
+@app.get("/api/pinebox/wire")
+async def pinebox_wire_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#973: WHICH ADDRESS IS THE BOX ANSWERING ON, and on which ports.
+
+    The 2026-08-20 outage was invisible for hours because nothing in the
+    station ever said which address it had asked. Everything reported
+    "the satellite is unavailable" and stood down; the box was alive the
+    whole time at an address the probe had never heard of.
+
+    The port shape is the diagnosis, so it is reported rather than
+    summarised: 6053 open is a healthy ESPHome device; 6053 refused with
+    the host answering at all means the IP stack is up and the firmware
+    is not, which no amount of restarting Home Assistant can reach; and
+    nothing answering anywhere means power or Wi-Fi."""
+    require_read_auth(authorization)
+    out = await nabu_wire_report()
+    out["mac"] = SATELLITE_MAC
+    out["ha_host"] = SATELLITE_HOST
+    ports: list[dict[str, Any]] = []
+    target = out.get("alive") or ""
+    if target:
+        def scan() -> list[dict[str, Any]]:
+            import socket as _socket
+            rows = []
+            for port in (6053, 80, 3232):
+                state = "timeout"
+                try:
+                    c = _socket.create_connection((target, port), 3)
+                    c.close()
+                    state = "open"
+                except ConnectionRefusedError:
+                    state = "refused"
+                except OSError:
+                    state = "timeout"
+                rows.append({"port": port, "state": state})
+            return rows
+        try:
+            ports = await asyncio.to_thread(scan)
+        except Exception:  # noqa: BLE001
+            ports = []
+    out["ports"] = ports
+    api_open = any(r.get("port") == 6053 and r.get("state") == "open"
+                   for r in ports)
+    out["reading"] = (
+        "no address answers — power or Wi-Fi" if not target
+        else "healthy — the ESPHome API is listening" if api_open
+        else "the IP stack answers but nothing is listening: the firmware "
+             "is not running, so Home Assistant has nothing to connect to "
+             "and only a power cycle of the device will fix it")
+    return out
 
 
 @app.get("/api/pinebox/diagnose")
