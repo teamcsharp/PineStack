@@ -625,6 +625,9 @@ DEFAULT_DJ = {
     # with music under it. The slider reaches 40 now if you want the mail
     # rarer still, and 0 stops it entirely.
     "mixtape_every": 8,
+    # #846: records play to the end. Turn this off to get the old
+    # "bumper" behaviour where a high talk dial truncates every song.
+    "records_whole": True,
     "mixtape_folder": "_music by me",
     # Let the active system prompt colour the pair's mood, so switching
     # prompts swings the disposition of the show. Off by default: the DJ
@@ -1272,6 +1275,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "mixtape_every": max(0, min(40, int(
             raw_dj.get("mixtape_every",
                        DEFAULT_DJ["mixtape_every"]) or 0))),
+        # #846: this dict is rebuilt wholesale on every save, so a key
+        # that is not clamped here is silently dropped.
+        "records_whole": bool(raw_dj.get(
+            "records_whole", DEFAULT_DJ["records_whole"])),
         "mixtape_folder": (str(raw_dj.get("mixtape_folder")
                                or DEFAULT_DJ["mixtape_folder"])
                            .strip().strip("/")[:200]),
@@ -13932,7 +13939,11 @@ _SEGMENT_TASK: list[Any] = []
 # nothing is playing (dead-air recovery must NEVER be blocked), or the
 # record is inside its run-out groove and was ending anyway. False means a
 # record is mid-play, the cut is refused, and the ledger says so.
-CUT_TAIL_SECONDS = 12.0
+# #846: two seconds, not twelve. Twelve seconds of a song is its outro
+# — audible, and the operator asked for tracks to play FULLY every time.
+# This is now only the race margin between "the record is ending" and
+# "the record has ended", not a licence to fade one out early.
+CUT_TAIL_SECONDS = 2.0
 
 
 def track_may_cut(reason: str) -> bool:
@@ -14535,7 +14546,22 @@ async def _dj_loop() -> None:
             # back to the desk, so the pair never stop for long. At 100
             # nothing runs past ~50 seconds. Tapes are sacred, play whole.
             talk = dj["talk_radio"]
-            if talk > 50 and not tape_slot:
+            # #846: THE RECORD PLAYS WHOLE. This is where the tracks were
+            # being cut, and it was deliberate: past the middle of the
+            # talk dial the records became "bumpers", and at 100 — where
+            # this station runs — the ceiling is fifty seconds. A
+            # six-minute record got fifty seconds of air. That is the
+            # "changing the track when it has not finished" the operator
+            # kept hearing, and no watchdog was involved.
+            #
+            # The premise was that talk and music compete for the hour.
+            # They do not: the pair talk OVER the record, which is what
+            # this station has always wanted. So the dial governs how
+            # much they TALK, not how much of the song you get to hear.
+            # Bumper mode is still there for anyone who wants it, behind
+            # records_whole=False.
+            if talk > 50 and not tape_slot and not dj.get(
+                    "records_whole", True):
                 ceiling = 300.0 - (talk - 50) * 5.0      # 300s → 50s at 100
                 length = min(length, max(50.0, ceiling))
             # #689: the needle went down at the top of the iteration, so the
@@ -18166,12 +18192,22 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
         # Not a round at all: the END of one. The needle goes down ONCE,
         # when this entry begins, and the rest of its minutes are the
         # record's — the pair keep quiet over their own scheduling.
+        # #846: and it NEVER cuts a record that is still playing. A
+        # "spin record" entry means let the record spin — the needle only
+        # goes down if there is nothing on it. This shipped without the
+        # guard in #843 and the operator heard it immediately: two record
+        # entries in the canonical hour, both cutting a live track.
         if _RADIO.get("sched_first"):
-            try:
-                dj_skip()
-            except Exception:                  # noqa: BLE001
-                pass
-            pipeline_log("air", "the schedule drops the needle (#843)")
+            if track_may_cut("the schedule's record entry"):
+                try:
+                    dj_skip()
+                except Exception:              # noqa: BLE001
+                    pass
+                pipeline_log("air", "the schedule drops the needle (#843)")
+            else:
+                pipeline_log("air", "the schedule's record entry came up "
+                             "while a record is still playing — letting it "
+                             "finish, which is what the entry means (#846)")
         await asyncio.sleep(8)
         return True
     if kind == "ad":
@@ -20674,17 +20710,50 @@ def face_candidate(path: Path) -> bool:
         return False
 
 
+GALLERY_TYPES = (".png", ".jpg", ".jpeg", ".webp")
+_GALLERY_CACHE: dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def gallery_files(most: int = 600) -> list[Path]:
+    """#847: every picture the wall may show, newest first.
+
+    THE one list. Non-art folders are skipped and duplicate basenames
+    are dropped keeping the newest, because the panel addresses art by
+    bare filename — two files sharing a name means the wall and the
+    server can disagree about which one it is, and a hole appears.
+    Whatever survives is pinned into the resolver cache, so a listed
+    name is servable by construction rather than by luck."""
+    now = time.time()
+    if _GALLERY_CACHE["rows"] and now - float(_GALLERY_CACHE["at"]) < 30:
+        return list(_GALLERY_CACHE["rows"])
+    try:
+        found = [q for q in COMFY_OUTPUT.rglob("*")
+                 if q.is_file() and q.suffix.lower() in GALLERY_TYPES
+                 and not any(part in _FACE_SKIP_DIRS for part in q.parts)]
+        found.sort(key=lambda q: q.stat().st_mtime, reverse=True)
+    except OSError:
+        return list(_GALLERY_CACHE["rows"])
+    rows: list[Path] = []
+    seen: set[str] = set()
+    for q in found:
+        if q.name in seen:
+            continue                    # newest wins; the older twin is
+        seen.add(q.name)                # unreachable by bare name anyway
+        rows.append(q)
+        _COMFY_FOUND[q.name] = q        # what we list is what resolves
+        if len(rows) >= most:
+            break
+    _GALLERY_CACHE["at"] = now
+    _GALLERY_CACHE["rows"] = rows
+    return list(rows)
+
+
 def gallery_sample(limit: int = 8) -> list[str]:
     """A random handful out of the WHOLE ComfyUI output — thirteen hundred
     images, not just the ones this agent ordered (#261). A filename is often
     the shortest description of the thing in it; the workflow prefix says
     what kind of machine painted it."""
-    try:
-        found = [p for p in COMFY_OUTPUT.rglob("*")
-                 if p.is_file() and p.suffix.lower() in
-                 (".png", ".jpg", ".jpeg", ".webp")]
-    except OSError:
-        return []
+    found = gallery_files()                                   # #847
     picks = random.sample(found, min(limit, len(found))) if found else []
     out = []
     for path in picks:
@@ -20703,9 +20772,10 @@ async def describe_gallery_image(want: str = "") -> tuple[str, str]:
     whatever the draw came up with. Returns (filename, description) or
     ("", "")."""
     try:
-        pool = [p for p in COMFY_OUTPUT.rglob("*")
-                if p.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")
-                and p.stat().st_size < 24_000_000]
+        # #847: the same list the wall shows, so the pair can never be
+        # handed a picture the room cannot see.
+        pool = [q for q in (await asyncio.to_thread(gallery_files))
+                if q.stat().st_size < 24_000_000]
         if not pool:
             return "", ""
         picked = None
@@ -40259,15 +40329,15 @@ async def dj_gallery_queue(
     twelve on screen. `after` names where the show currently is."""
     require_read_auth(authorization)
     limit = max(1, min(48, int(limit or 12)))
-    try:
-        files = sorted(
-            (p for p in COMFY_OUTPUT.rglob("*")
-             if p.is_file() and p.suffix.lower()
-             in (".png", ".jpg", ".jpeg", ".webp")),
-            key=lambda p: p.stat().st_mtime, reverse=True)[:400]
-    except OSError:
-        files = []
-    names = [p.name for p in files]
+    # #847: only pictures that are actually there. This walked the whole
+    # tree including the contact sheets and the video folder, and listed
+    # bare names that could resolve to a different file or to nothing —
+    # which is the hole the operator photographed.
+    # #847: OFF THE LOOP. This walks 1287 files over a bind-mounted
+    # share; doing it inline stalled every other request on the page for
+    # the length of the walk, which is why a gallery full of present
+    # files still drew as holes.
+    names = [q.name for q in (await asyncio.to_thread(gallery_files))[:400]]
     at = names.index(after) if after in names else -1
     upcoming = names[at + 1: at + 1 + limit]
     if len(upcoming) < limit:                 # the show wraps; so does this
