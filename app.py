@@ -8549,7 +8549,89 @@ PANTRY_MAX = 600
 # Counting clips says nothing about disk; this counts bytes and sheds
 # oldest-first the moment the shelf is over its allowance.
 PANTRY_MAX_BYTES = int(os.getenv("PANTRY_MAX_BYTES", str(6 * 1024 ** 3)))
-_PANTRY_GATE = asyncio.Semaphore(2)     # never crowd the live round
+# --- One engine budget for the whole station (#904) ------------------
+# The live road held _PREMAKE_GATE (two) and preparation held
+# _PANTRY_GATE (two), and the two allowances knew nothing about each
+# other — so FOUR renders could land on one XTTS server at once. Every
+# one of them then measured slower than it really was, render_cost_note
+# fed those inflated milliseconds to its eight-sample mean, the mean
+# crossed RENDER_COST_SLOW, and render_relief() latched — which shuts
+# the pantry window for two full minutes. Building the buffer was what
+# convinced the station it had no time to build the buffer.
+#
+# One budget now, counted in renders ACTUALLY IN FLIGHT:
+#   * the live road never waits on it. It takes its slot and goes;
+#     _PREMAKE_GATE is still the only limit on live work.
+#   * preparation takes a slot only if the engine is free THIS
+#     INSTANT, and otherwise skips and comes back next pass. A
+#     prepared take can never be the reason a live line is late.
+ENGINE_BUDGET = 2                       # renders in flight, both roads
+_ENGINE_LIVE = [0]                      # air renders in flight
+_ENGINE_PREP = [0]                      # preparation renders in flight
+
+
+def engine_inflight() -> int:
+    """Renders on the engine RIGHT NOW, both roads together."""
+    try:
+        return (max(0, int(_ENGINE_LIVE[0]))
+                + max(0, int(_ENGINE_PREP[0])))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def live_rendering() -> int:
+    """How many LIVE renders are in flight.
+
+    #904: everything used to ask _PREMAKE_GATE.locked() instead, and
+    that question could not be answered by a semaphore: speak_turns
+    creates a _premake task for EVERY line of the round in one burst
+    and each task takes the gate before it does anything at all, so
+    with two lines or more the gate reads saturated from the first
+    instant of a round until its last render lands. The window it
+    guarded was therefore almost never open. This counts the renders
+    that are genuinely happening."""
+    try:
+        return max(0, int(_ENGINE_LIVE[0]))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def engine_live_enter() -> None:
+    """A live render begins. Never blocks — the air does not queue."""
+    try:
+        _ENGINE_LIVE[0] = max(0, int(_ENGINE_LIVE[0])) + 1
+    except Exception:  # noqa: BLE001
+        _ENGINE_LIVE[0] = 1
+
+
+def engine_live_exit() -> None:
+    try:
+        _ENGINE_LIVE[0] = max(0, int(_ENGINE_LIVE[0]) - 1)
+    except Exception:  # noqa: BLE001
+        _ENGINE_LIVE[0] = 0
+
+
+def engine_prep_take() -> bool:
+    """A slot for PREPARATION — only if the engine is free right now.
+
+    Deliberately non-blocking, and deliberately strict: the engine
+    must be IDLE. Anything looser lets a prepared take sit alongside
+    a live one, and the pair of them push the next live line into a
+    queue — which is the one thing preparation may never do."""
+    try:
+        if engine_inflight() > max(0, int(ENGINE_BUDGET) - 2):
+            return False
+        _ENGINE_PREP[0] = max(0, int(_ENGINE_PREP[0])) + 1
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def engine_prep_give() -> None:
+    try:
+        _ENGINE_PREP[0] = max(0, int(_ENGINE_PREP[0]) - 1)
+    except Exception:  # noqa: BLE001
+        _ENGINE_PREP[0] = 0
 
 
 def pantry_key(text: str, voice: str, engine: str) -> str:
@@ -8660,8 +8742,29 @@ def shelf_rows(kind: str) -> list[dict[str, Any]]:
     return _SHELF.setdefault(str(kind), [])
 
 
+def shelf_cap(kind: str) -> int:
+    """How many of one content type to hold — off the hours dial.
+
+    #904: SHELF_CAPS was FIXED, so a station asked for a day of
+    material prepared the same eight adverts as one asked for an
+    hour. prepare_hours moved the target and nothing that decides how
+    much actually gets built moved with it. The caps scale with the
+    target now, in the same proportion; the real governors are
+    untouched — pantry_seconds() against prepare_target_seconds(),
+    and the six-gigabyte allowance underneath everything."""
+    base = int(SHELF_CAPS.get(str(kind), 6))
+    try:
+        hours = max(0.25, float(prepare_target_seconds()) / 3600.0)
+    except Exception:  # noqa: BLE001
+        hours = 1.0
+    # An hour behaves exactly as it always did; deeper dials stock
+    # proportionally more, and eight times the old cap is as far as
+    # one content type may ever go.
+    return max(1, base, min(base * 8, int(round(base * hours))))
+
+
 def shelf_full(kind: str) -> bool:
-    return len(shelf_rows(kind)) >= int(SHELF_CAPS.get(kind, 6))
+    return len(shelf_rows(kind)) >= shelf_cap(kind)
 
 
 def shelf_put(kind: str, row: dict[str, Any]) -> None:
@@ -8673,7 +8776,7 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         row["kind"] = str(kind)
         rows = shelf_rows(kind)
         rows.append(row)
-        del rows[:-int(SHELF_CAPS.get(kind, 6))]
+        del rows[:-max(1, shelf_cap(kind))]
     except Exception:  # noqa: BLE001
         pass
 
@@ -15286,13 +15389,31 @@ _LARDER: list[dict[str, Any]] = []
 # now honoured rather than clipped to six). A deeper shelf is what absorbs
 # that: a round written ahead goes out the instant it is wanted, so the
 # writing happens under the previous round instead of under silence.
-_LARDER_CAP = 6
+# #904: _LARDER_CAP = 6 stood here and was never once read — the cap
+# larder_keeper actually applies is computed from the reserve target.
 _LARDER_MAX = 14                       # the deep-backlog ceiling (#445)
-_LARDER_FRESH = 1200.0                 # twenty minutes, then it reads stale
+_LARDER_FRESH = 1200.0                 # the FLOOR; see larder_fresh()
 # The shelf survives restarts (#383): every deploy was costing the show
 # two silent minutes writing its first round from nothing.
 LARDER_PATH = data_path("larder.json")
 _LARDER_WRITING = [False]
+
+
+def larder_fresh() -> float:
+    """How long a PRE-WRITTEN round stays usable.
+
+    #904: this was a flat twenty minutes while pantry_life() keeps the
+    AUDIO made from those very scripts for ninety minutes and up — so
+    a script died four and a half times sooner than its own clips, and
+    the clips were stranded behind it as orphans nobody could ever ask
+    for, still holding their bytes against the six-gigabyte allowance.
+    The words keep exactly as long as the audio does now, which is
+    what makes a deep prepare_hours mean anything at all: material
+    built three hours ahead is still there in three hours."""
+    try:
+        return max(float(_LARDER_FRESH), float(pantry_life()))
+    except Exception:  # noqa: BLE001
+        return float(_LARDER_FRESH)
 
 
 def _larder_profile_signature() -> str:
@@ -15331,7 +15452,8 @@ def _larder_load() -> None:
     if isinstance(rows, list):
         _LARDER[:] = [r for r in rows if isinstance(r, dict)
                       and time.time() - float(r.get("at") or 0)
-                      < _LARDER_FRESH and _larder_current(r)][:_LARDER_MAX]
+                      < larder_fresh()
+                      and _larder_current(r)][:_LARDER_MAX]
 
 
 def clean_station_backlog() -> dict[str, int]:
@@ -15513,7 +15635,7 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             # #890: yield the moment the live road wants the engine. The
             # buffer is worth nothing if building it is what made the
             # station late.
-            if render_relief() or _PREMAKE_GATE.locked():
+            if render_relief() or live_rendering():
                 break
             # The same effects the live road would have drawn for this
             # seat — a real random draw, baked in now instead of then.
@@ -15523,12 +15645,20 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             strip = str(dj.get(f"strip_{who}") or "")
             if strip:
                 fx["strip"] = strip
+            # #904: ONE engine budget, and preparation never queues in
+            # front of the air. No slot free this instant means this
+            # line waits for the next pass rather than crowding the
+            # live road and slowing the very renders it is trying to
+            # get ahead of.
+            if not engine_prep_take():
+                break
             try:
-                async with _PANTRY_GATE:
-                    clip = await voice_render_any(text, voice, engine,
-                                                  fx=fx, who=who)
+                clip = await voice_render_any(text, voice, engine,
+                                              fx=fx, who=who)
             except Exception:  # noqa: BLE001
                 clip = None
+            finally:
+                engine_prep_give()
             if not (clip or {}).get("path"):
                 break
             pantry_put(key, clip)
@@ -15609,7 +15739,7 @@ async def prep_render_line(text: str, who: str,
         return None                     # the engine is busy or down; later
     # #890: yield the moment the live road wants the engine. A buffer is
     # worth nothing if building it is what made the station late.
-    if render_relief() or _PREMAKE_GATE.locked():
+    if render_relief() or live_rendering():
         return None
     fx = dict(voice_effect_pick())
     vec = performance_vector(who, voice)
@@ -15619,11 +15749,15 @@ async def prep_render_line(text: str, who: str,
         strip = str(dj_settings().get(f"strip_{who}") or "")
         if strip:
             fx["strip"] = strip
+    # #904: one engine budget, taken only if it is free right now.
+    if not engine_prep_take():
+        return None                     # the engine is busy; next pass
     try:
-        async with _PANTRY_GATE:
-            clip = await voice_render_any(text, voice, engine, fx=fx, who=who)
+        clip = await voice_render_any(text, voice, engine, fx=fx, who=who)
     except Exception:  # noqa: BLE001
         clip = None
+    finally:
+        engine_prep_give()
     if not (clip or {}).get("path"):
         return None
     pantry_put(key, clip)
@@ -15656,7 +15790,23 @@ async def prep_ad() -> bool:
         return False
     made = await prep_render_line(text, "dj")
     if not made:
-        return False
+        # #904: the WRITE is already paid for. A refused render — the
+        # engine busy, the live road wanting it — used to throw the
+        # whole script away with it. The shelf takes the TEXT instead:
+        # a written-but-unread advert still takes a model visit off
+        # the air path when the break comes round, and the read is
+        # made on a later keeper pass or live, exactly as it always
+        # would have been.
+        try:
+            shelf_put("ad", {"text": text,
+                             "product": str(product)[:160],
+                             "seconds": 0.0})
+            pipeline_log("lookahead", "an advert is WRITTEN and waiting "
+                         "on a voice - the read comes on a later pass "
+                         "(#904)")
+        except Exception:  # noqa: BLE001
+            return False
+        return True
     shelf_put("ad", {"text": text, "product": str(product)[:160], **made})
     pipeline_log("lookahead", "an advert is READY to air - written and read "
                  f"during a record, {made.get('seconds')}s of finished "
@@ -15683,7 +15833,20 @@ async def prep_station_id() -> bool:
         return False
     made = await prep_render_line(text, "drop", drop_voice)
     if not made:
-        return False
+        # #904: the words survive a refused render, as with prep_ad.
+        # The voice is written down beside them — shelf_take asks for
+        # a liner prepared for THIS drop voice, and a row without one
+        # could never be taken off the shelf at all.
+        try:
+            shelf_put("station_id", {"text": text,
+                                     "voice": drop_voice,
+                                     "seconds": 0.0})
+            pipeline_log("lookahead", "a station ID is WRITTEN and "
+                         "waiting on a voice - the SFX guy shouts it on "
+                         "a later pass (#904)")
+        except Exception:  # noqa: BLE001
+            return False
+        return True
     shelf_put("station_id", {"text": text, **made})
     pipeline_log("lookahead", "a station ID is READY to air - the SFX guy "
                  "recorded it during a record (#842)")
@@ -15748,8 +15911,14 @@ def pantry_window() -> str:
     would never be asked for."""
     if render_relief():
         return ""
-    if _PREMAKE_GATE.locked():
-        return ""                       # the live round has the engine
+    # #904: renders IN FLIGHT, not _PREMAKE_GATE.locked(). speak_turns
+    # fires a _premake task for every line of the round at once and
+    # each one takes the gate before doing anything, so the gate read
+    # saturated from the first instant of every round to its last
+    # render — and this window, which asked exactly that, was almost
+    # never open. Every other condition below is unchanged.
+    if engine_inflight():
+        return ""                       # a render is happening now
     if _RADIO.get("ad_now") and time.time() - float(
             (_RADIO.get("ad_now") or {}).get("at") or 0) < 180:
         return "an ad break"
@@ -15773,7 +15942,7 @@ async def pantry_keeper() -> None:
     then it IDLES. A full shelf is the goal; a busy GPU is not.
 
     pantry_window() is the whole of the courtesy to the live round — it
-    is empty under render_relief() and while _PREMAKE_GATE is saturated —
+    is empty under render_relief() and while a render is in flight —
     and it is re-asked between every single item, not once per pass."""
     while True:
         await asyncio.sleep(6)
@@ -15815,6 +15984,31 @@ async def pantry_keeper() -> None:
                         break
                     await larder_prepare(_shelved)
                     _row["seconds"] = float(_shelved.get("seconds") or 0)
+            # #904: an advert or a bumper WRITTEN while the engine said
+            # no is sitting on the shelf as words alone. Give it its
+            # voice now, while the window is open — the write is
+            # already paid for, and this is the pass that turns it
+            # into finished audio.
+            for _kind, _who in (("ad", "dj"), ("station_id", "drop")):
+                for _row in list(_SHELF.get(_kind) or []):
+                    if _row.get("key") or not str(_row.get("text") or ""):
+                        continue    # already made, or nothing to make
+                    if pantry_window() != window:
+                        break
+                    try:
+                        _late = await prep_render_line(
+                            str(_row.get("text") or ""), _who,
+                            str(_row.get("voice") or ""))
+                    except Exception:  # noqa: BLE001
+                        _late = None
+                    if not _late:
+                        break       # the engine said no; come back
+                    _row.update(_late)
+                    pipeline_log("lookahead",
+                                 f"{SHELF_LABEL.get(_kind, _kind)} that "
+                                 "was only written has its voice now - "
+                                 f"{_late.get('seconds')}s of finished "
+                                 "audio waiting (#904)")
             # #842: and then the rest of the board — the ads, the bumpers,
             # the memos from upstairs, the phone calls. One item per pass,
             # in rotation, so the shelf fills evenly rather than filling
@@ -15854,7 +16048,7 @@ async def larder_keeper() -> None:
         await asyncio.sleep(3)
         try:
             _LARDER[:] = [e for e in _LARDER
-                          if time.time() - e["at"] < _LARDER_FRESH
+                          if time.time() - e["at"] < larder_fresh()
                           and _larder_current(e)]
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
@@ -15869,7 +16063,17 @@ async def larder_keeper() -> None:
             # An advert is paid-for cover: use it to build a deeper continuity
             # reserve before the handoff back to the booth.
             target = max(target, 6 if ad_running else 0)
-            cap = min(_LARDER_MAX, 12 if box_down else target)
+            # #904: prepare_hours governs HOW MUCH is written ahead,
+            # not merely how long it keeps. At the one-hour default
+            # this is the reserve target exactly as before; a deeper
+            # dial stocks proportionally more rounds, and _LARDER_MAX
+            # is still the ceiling that actually bounds it.
+            try:
+                _hours = max(1.0, prepare_target_seconds() / 3600.0)
+            except Exception:  # noqa: BLE001
+                _hours = 1.0
+            _want = max(target, int(round(target * _hours)))
+            cap = min(_LARDER_MAX, 12 if box_down else _want)
             if len(_LARDER) >= cap or _LARDER_WRITING[0]:
                 continue
             # #823: "live work outranks stocking shelves" became
@@ -24785,10 +24989,21 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     if played_anywhere:
         sfx_note_play(key, sample.stem, who,
                       ms=int((time.monotonic() - _sting_started) * 1000))
+        # #905: THE SUCCESS BRANCH, which #903 left out — the row was
+        # stamped "airing" before the attempt and nothing ever took it
+        # down, so every sting that played kept shouting "going out right
+        # now" in red for the rest of the night.
+        try:
+            _sting_row["aired"] = "box" if to_box else "page"
+            _sting_row["air_at"] = time.time()
+        except Exception:  # noqa: BLE001
+            pass
     else:
         pipeline_log("drop", f"sting {sample.stem} never sounded (#738)")
-        try:                                   # #903 (#848)
-            _sting_row["aired"] = "never sounded"
+        try:                                   # #903/#905 (#848)
+            # "never" is the word the glass tests for; "never sounded"
+            # matched no branch and rendered as an ordinary row.
+            _sting_row["aired"] = "never"
         except Exception:  # noqa: BLE001
             pass
     # Sometimes the other presenter has FEELINGS about the sample (#292).
@@ -30323,9 +30538,19 @@ async def speak_turns(turns: list[tuple[str, str]],
                 pipeline_log("lookahead", "pre-rendering the next line - "
                              f"{engine} - {item['who']}")
             _t0 = time.monotonic()
-            _made = await voice_render_any(text, v, "" if cold else engine,
-                                           fx=_turn_fx(item),
-                                           who=item["who"])
+            # #904: the budget counts the render that is ACTUALLY
+            # happening, not the task waiting its turn on
+            # _PREMAKE_GATE — the whole round takes that gate at once,
+            # so it said "busy" for the length of a round and the
+            # pantry window never opened. The live road still never
+            # waits on this: it takes its slot and goes.
+            engine_live_enter()
+            try:
+                _made = await voice_render_any(
+                    text, v, "" if cold else engine,
+                    fx=_turn_fx(item), who=item["who"])
+            finally:
+                engine_live_exit()
             take_note(item["who"], v, engine, text, _made,
                       int((time.monotonic() - _t0) * 1000), "live")
             return _made
@@ -30346,6 +30571,13 @@ async def speak_turns(turns: list[tuple[str, str]],
     # hiccups between turns: it plays like a recording of a real call. Any
     # failure falls straight through to the turn-by-turn path below, so the
     # call is never lost (dry beats broken).
+    # #905: bound HERE, not inside the branch. They are read at function
+    # scope below (`recovering = bool(played_any and missed)`), so a round
+    # that does not take the coalesced road raised UnboundLocalError
+    # before a word aired — which is every round if stream_show is off,
+    # and every press of the booth's "say this round" button.
+    played_any = False
+    missed: list[int] = []              # #767: scheduled, never aired
     if render_stream and playlist:
         # #760: NOT here. This used to be `await asyncio.gather(*premade)`,
         # which waits for every turn in the round before a single one can be
@@ -30353,8 +30585,6 @@ async def speak_turns(turns: list[tuple[str, str]],
         # the five minutes of dead air. Each batch now awaits only its own
         # turns; the rest keep rendering in the background, which is what
         # the pre-render was always for.
-        played_any = False
-        missed: list[int] = []          # #767: scheduled, never aired
         # #760: the batch ladder. The first burst is small so the room hears
         # something almost at once; later ones widen so the joins stay rare.
         # 43 turns used to mean 43 renders before a single word.
@@ -31032,6 +31262,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # we edit it". A LIVE round asks for exactly what it always asked for;
     # only the banked ones stretch.
     _bank_rich = bool(bank)
+    # #904: the count a round is JUDGED by stays the live one. The
+    # extra four lines are a licence to write richer, not a harder
+    # exam — but substantial_radio_script was handed the inflated
+    # number, so a banked round faced a bar around half again as high
+    # as the identical round faces on air, failed it, and was binned.
+    # The model call was spent either way; the shelf just stayed empty.
+    _judge_lines = int(lines)
     if _bank_rich:
         lines = max(2, min(24, lines + 4))
     # A round off the larder shelf (#349, #351): written minutes ago while
@@ -31042,7 +31279,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             and _LARDER):
         entry = _LARDER.pop(0)
         _larder_save()
-        if (time.time() - float(entry["at"]) < _LARDER_FRESH
+        if (time.time() - float(entry["at"]) < larder_fresh()
                 and _larder_current(entry)):
             pipeline_log("model", "round served off the larder shelf "
                                   f"({len(_LARDER)} left)")
@@ -31752,8 +31989,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # own: the CALLER must be on it (three C: turns) and it must be a
     # conversation (six turns), not an essay.
     _needs_rewrite = False
-    if lines >= 8 and not caller_name:
-        _needs_rewrite = not substantial_radio_script(script, lines)
+    if _judge_lines >= 8 and not caller_name:
+        _needs_rewrite = not substantial_radio_script(script,
+                                                      _judge_lines)
     elif caller_name and lines >= 6:
         _c_turns = len(re.findall(r"(?m)^\s*C\s*:", script or ""))
         _all_turns = len(re.findall(r"(?m)^\s*[A-E]\s*:", script or ""))
@@ -31787,17 +32025,22 @@ async def dj_banter(track: dict[str, Any] | None = None,
                           and len(re.findall(r"(?m)^\s*[A-E]\s*:",
                                              rewritten or "")) >= 6)
             else:
-                _rw_ok = substantial_radio_script(rewritten, lines)
+                _rw_ok = substantial_radio_script(rewritten, _judge_lines)
             if _rw_ok:
                 script = rewritten
             else:
-                pipeline_log("model", "rewrite still thin — preserving the "
-                             "draft but withholding it from the larder")
-                if bank:
-                    return []
+                # #904: banked anyway. This draft is good enough to AIR
+                # — the live road puts the identical one out — so
+                # withholding it from the larder only threw away a
+                # model visit that had already been paid for, and left
+                # the shelf empty for the next round to write from
+                # nothing under silence.
+                pipeline_log("model", "rewrite still thin — banked "
+                             "anyway: the same draft airs on the live "
+                             "road, so binning it here would only spend "
+                             "a model visit for nothing (#904)")
         except Exception:
-            if bank:
-                return []
+            pass                    # the draft stands; bank it as written
 
     if seed.get("text"):
         # Mined means SAID (#404): a swath the model paraphrased away is
@@ -63862,6 +64105,15 @@ function djTalkRowInner(line) {
       on.style.cssText = "font-size:10px";
       said.appendChild(on);
       row.style.background = "rgba(255,95,95,.08)";
+    } else if (line.aired === "stream") {
+      /* #905: EVERY coalesced row carries this — the main road of the
+       * whole station — and the ladder had no branch for it, so all of
+       * it fell through to "rendered, not confirmed on the box". A clean
+       * round looked worse delivered than an interrupted one. */
+      const on = el("span", "", " 📻");
+      on.title = "Went out as part of a coalesced round on the box";
+      on.style.cssText = "font-size:10px;opacity:.75";
+      said.appendChild(on);
     } else if (line.aired === "held") {
       const off = el("span", "", " 🕐");
       off.title = "Held on the shelf — it replays the moment the box "
