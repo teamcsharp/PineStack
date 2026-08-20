@@ -1656,6 +1656,16 @@ function initWorksPopup() {
   function close() {
     if (poll) { clearInterval(poll); poll = 0; }
     if (pop) { pop.remove(); pop = null; }
+    /* #917: and the hour sheet with it. They are one window as far as
+     * the operator is concerned — leaving the sheet stranded also meant
+     * the next click opened a SECOND sheet on top of the orphan. */
+    try {
+      const sheet = document.getElementById("worksSched");
+      if (sheet) {
+        if (sheet.wkTick) clearInterval(sheet.wkTick);
+        sheet.remove();
+      }
+    } catch (e) { /* the flow still closes */ }
   }
 
   /* #864: every stage OPENS. The owner wants the writing desk's own
@@ -2640,8 +2650,11 @@ function initWorksPopup() {
     const body = mk("div", "wk-flow-wrap");
     pop.appendChild(body);
     document.body.appendChild(pop);
+    try { wkDraggable(pop); } catch (e) { /* #914 */ }
     load(body);
     poll = setInterval(() => load(body), 2500);
+    /* #917: the hour sheet is not a separate window, it is the other
+     * half of the director studio. Opened here, and closed with it. */
     try { worksSchedule(pop); } catch (e) { /* the flow still opens */ }
   }
 
@@ -2695,6 +2708,13 @@ function worksSchedule(anchorPop) {
   const x = mk("button", "wk-x", "✕");
   x.onclick = () => { clearInterval(tick); pop.remove(); };
   head.appendChild(x);
+  /* #917: so The Works can stop this window's clock when it closes the
+   * pair, rather than leaving an interval running against a removed
+   * element. #914: and this half drags by its blank space too. */
+  try {
+    pop.wkTick = tick;
+    wkDraggable(pop);
+  } catch (e) { /* the sheet still opens */ }
   pop.appendChild(head);
 
   const nav = mk("div", "wk-note", "");
@@ -2835,17 +2855,18 @@ function worksSchedule(anchorPop) {
       drw.appendChild(none);
     }
     const gen = mk("button", "", "\u270e write another for this entry");
+    gen.title = "Opens the system prompt this one will be WRITTEN with - "
+      + "edit it, send it up, and what comes back stands in for this "
+      + "entry this hour (#897)";
     gen.style.cssText = "font-size:9.5px;padding:2px 7px";
-    gen.onclick = async (ev) => {
+    /* #897: it no longer fires blind. The prompt that will write the
+     * candidate goes in front of the operator first, and what comes back
+     * is pinned as this entry's stand-in for the hour. */
+    gen.onclick = (ev) => {
       ev.stopPropagation();
-      gen.disabled = true;
-      gen.textContent = "asking the desk\u2026";
-      try {
-        await api.post("/api/schedule/segment/generate",
-                       {hour: hour.key, slot: slot.id, count: 1});
-        gen.textContent = "the desk is on it";
-      } catch (e) { gen.textContent = "the desk refused that"; }
-      setTimeout(() => segLoad(slot, drw, okey, true), 4000);
+      promptDesk(slot, null,
+                 {generate: true,
+                  after: () => segLoad(slot, drw, okey, true)});
     };
     drw.appendChild(gen);
     (d.generating || []).forEach((g) => {
@@ -3022,12 +3043,62 @@ function worksSchedule(anchorPop) {
         body.wkAir = f2;              // nudged in place between rebuilds
         body.wkAirNeed = need;
         body.wkAirClock = say;        // #940: and the words tick too
+        /* #910: and a download in the corner that takes what THIS entry
+         * is airing, welded, off the shelf where it is stored. Only the
+         * entry on air gets one — "the currently aired interaction" is
+         * something exactly one entry has at a time. */
+        try {
+          const grab = mk("button", "", "\u2b07");
+          grab.title = "Keep what this entry is airing right now, welded "
+            + "into one file from the shelf it is stored on";
+          grab.style.cssText = "position:absolute;right:5px;bottom:5px;"
+            + "width:20px;height:20px;padding:0;font-size:10px;"
+            + "line-height:18px;border-radius:5px";
+          grab.onclick = async (ev) => {
+            ev.stopPropagation();
+            grab.disabled = true;
+            const was = grab.textContent;
+            grab.textContent = "\u2026";
+            try {
+              const seg = await api.get("/api/schedule/segment?kind="
+                + encodeURIComponent(s.kind) + "&hour="
+                + encodeURIComponent(hour.key) + "&slot="
+                + encodeURIComponent(s.id));
+              const c = (seg.candidates || [])[0];
+              if (!c) throw new Error("nothing on this entry's shelf");
+              const got = await api.get("/api/shelf/bundle?kind="
+                + encodeURIComponent(c.kind || s.kind) + "&id="
+                + encodeURIComponent(c.id));
+              api.openExternal(wkMediaUrl(got));
+              grab.textContent = was;
+            } catch (e) {
+              grab.textContent = "\u2717";
+              grab.title = "nothing recorded on this entry yet";
+            }
+            setTimeout(() => {
+              grab.textContent = was;
+              grab.disabled = false;
+            }, 4000);
+          };
+          row.appendChild(grab);
+        } catch (e) { /* the tile still draws */ }
       }
 
       const gear = mk("button", "", "⚙ this entry, this hour");
       gear.style.cssText = "font-size:9.5px;margin-top:3px;padding:1px 6px";
       gear.onclick = (ev) => { ev.stopPropagation(); detail(s, i); };
       row.appendChild(gear);
+
+      /* #909: and the entry's SYSTEM PROMPT, one click away - which is
+       * the thing the operator was actually clicking when he asked for a
+       * pop-up he could edit, save and swap between. */
+      const prm = mk("button", "", "\ud83d\udcdd prompt");
+      prm.title = "Edit the system prompt this entry writes with, save it "
+        + "by name, and choose how long it runs for";
+      prm.style.cssText = "font-size:9.5px;margin:3px 0 0 6px;"
+        + "padding:1px 6px";
+      prm.onclick = (ev) => { ev.stopPropagation(); promptDesk(s, i, {}); };
+      row.appendChild(prm);
 
       /* #927: and the entry OPENS onto what is stacked for it. */
       const okey = "seg:" + hour.key + ":" + s.id;
@@ -3173,6 +3244,331 @@ function worksSchedule(anchorPop) {
     box.focus();
   }
 
+  /* #909/#897/#906 — THE PROMPT DESK for one entry of the hour.
+   *
+   * "When I click these, pop up a pop-up window allowing me to edit and
+   * adjust them and be able to save to preferences the modified system
+   * prompts... and I want to be able to jump between them and select
+   * which system prompts are being used based on the ones that we have
+   * saved."
+   *
+   * One window, two doors into it. The 📝 door edits the prompt this
+   * entry AIRS with; the ✎ door on the stacked drawer edits the prompt
+   * the next candidate is WRITTEN with and pins what comes back as the
+   * stand-in. Both read the same /api/schedule/segment/prompt, so what
+   * is in the box is what the writing room is actually handed - never a
+   * reconstruction of it.
+   */
+  function promptDesk(slot, i, opts) {
+    const how = opts || {};
+    const old = document.getElementById("worksPromptDesk");
+    if (old) old.remove();
+    const d = mk("div", "works-pop");
+    d.id = "worksPromptDesk";
+    const r = pop.getBoundingClientRect();
+    d.style.cssText = "position:fixed;z-index:404;width:min(520px,52vw);"
+      + "max-height:84vh;overflow:auto;left:"
+      + Math.max(8, Math.round(r.left - 100)) + "px;top:"
+      + Math.round(r.top + 26) + "px";
+    d.onclick = (e) => e.stopPropagation();
+
+    const h = mk("div", "wk-head");
+    h.appendChild(mk("b", "", (how.generate ? "\u270e " : "\ud83d\udcdd ")
+      + (slot.label || slot.kind)));
+    const cx = mk("button", "wk-x", "\u2715");
+    cx.onclick = () => d.remove();
+    h.appendChild(cx);
+    d.appendChild(h);
+
+    d.appendChild(mk("div", "wk-sub",
+      hour.label + " on " + hour.date + " \u00b7 "
+      + (how.generate
+         ? "this is the system prompt the next candidate is WRITTEN with"
+         : "this is the system prompt this entry goes on air with")));
+
+    const say = mk("div", "wk-note", "reading\u2026");
+    say.style.cssText = "font-size:9.5px;margin:4px 0 2px;opacity:.8";
+    d.appendChild(say);
+    const noteRow = mk("div", "wk-note", "");
+    noteRow.style.cssText = "font-size:9px;opacity:.6;margin-bottom:4px";
+    d.appendChild(noteRow);
+
+    /* THE LIBRARY. One click drops a saved prompt into the box below,
+     * which is what "jump between them" means from this end. */
+    d.appendChild(mk("div", "wk-note", "SAVED PROMPTS FOR THIS KIND"));
+    const shelf = mk("div", "");
+    shelf.style.cssText = "max-height:152px;overflow:auto;margin:2px 0 6px";
+    d.appendChild(shelf);
+
+    d.appendChild(mk("div", "wk-note", "THE SYSTEM PROMPT"));
+    const ta = mk("textarea", "");
+    ta.style.cssText = "width:100%;height:170px;font-size:10.5px;"
+      + "font-family:ui-monospace,Consolas,monospace";
+    d.appendChild(ta);
+
+    /* STORE IT. A name AND the scenario it suits, because that is the
+     * whole point of a library: you find it again by what it was FOR. */
+    const keep = mk("div", "");
+    keep.style.cssText = "display:flex;gap:4px;margin-top:5px";
+    const nameIn = mk("input", "");
+    nameIn.placeholder = "name it\u2026";
+    nameIn.style.cssText = "flex:1;min-width:0;font-size:10.5px";
+    const whenIn = mk("input", "");
+    whenIn.placeholder = "the scenario it suits\u2026";
+    whenIn.style.cssText = "flex:1.3;min-width:0;font-size:10.5px";
+    const keepB = mk("button", "", "\ud83d\udcbe save to the book");
+    keepB.style.cssText = "font-size:10px;padding:2px 7px;white-space:nowrap";
+    keep.appendChild(nameIn);
+    keep.appendChild(whenIn);
+    keep.appendChild(keepB);
+    d.appendChild(keep);
+
+    d.appendChild(mk("div", "wk-note", "PUT IT TO WORK"));
+    const acts = mk("div", "");
+    acts.style.cssText = "display:flex;flex-wrap:wrap;gap:5px;margin-top:3px";
+    d.appendChild(acts);
+    const note = mk("div", "wk-note", "");
+    note.style.cssText = "font-size:9.5px;margin-top:6px;min-height:12px;"
+      + "line-height:1.45";
+    d.appendChild(note);
+
+    let editing = null;        // the saved prompt being rewritten, if any
+    let first = true;
+
+    const drawBook = (rows, windows) => {
+      shelf.textContent = "";
+      (rows || []).slice(0, 40).forEach((row2) => {
+        const it = mk("div", "");
+        it.style.cssText = "display:flex;gap:4px;align-items:center;"
+          + "border:1px solid #24384a;border-radius:6px;padding:3px 5px;"
+          + "margin-bottom:3px;background:rgba(255,255,255,.02)";
+        const nm = mk("span", "", String(row2.name || "untitled"));
+        nm.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+          + "text-overflow:ellipsis;white-space:nowrap;font-size:10px;"
+          + "color:#9fd8ff";
+        nm.title = String(row2.text || "").slice(0, 400);
+        it.appendChild(nm);
+        if (row2.scenario) {
+          const sc = mk("span", "wk-note", String(row2.scenario));
+          sc.style.cssText = "flex:1.1;min-width:0;overflow:hidden;"
+            + "text-overflow:ellipsis;white-space:nowrap;font-size:9px;"
+            + "opacity:.65";
+          it.appendChild(sc);
+        }
+        const use = mk("button", "", "open");
+        use.title = "Put these words in the box below";
+        use.style.cssText = "font-size:9px;padding:1px 6px";
+        use.onclick = () => {
+          ta.value = String(row2.text || "");
+          nameIn.value = String(row2.name || "");
+          whenIn.value = String(row2.scenario || "");
+          editing = row2;
+          note.style.color = "";
+          note.textContent = "editing \u201c" + (row2.name || "")
+            + "\u201d \u2014 saving under the same name rewrites it, "
+            + "under a new name stores another";
+        };
+        it.appendChild(use);
+        const del = mk("button", "", "\u2715");
+        del.title = "Take it out of the book (nothing on air changes)";
+        del.style.cssText = "font-size:9px;padding:1px 5px";
+        del.onclick = async () => {
+          try {
+            await api.del("/api/schedule/promptbook/"
+                          + encodeURIComponent(row2.id));
+          } catch (e) { /* the shelf redraws either way */ }
+          if (editing && editing.id === row2.id) editing = null;
+          refresh();
+        };
+        it.appendChild(del);
+        shelf.appendChild(it);
+      });
+      if (!(rows || []).length) {
+        const none = mk("div", "wk-note",
+          "nothing saved for this kind yet \u2014 write one below, name "
+          + "it, and it is here for every " + (slot.kind || "segment")
+          + " entry from now on");
+        none.style.cssText = "font-size:9px;opacity:.6";
+        shelf.appendChild(none);
+      }
+      /* #906: a timed prompt holding this kind says so, with its clock
+       * running and the way to stop it early. */
+      const w = (windows || {})[slot.kind];
+      if (w) {
+        const wr = mk("div", "");
+        wr.style.cssText = "display:flex;gap:5px;align-items:center;"
+          + "border:1px solid rgba(124,232,169,.5);border-radius:6px;"
+          + "padding:3px 6px;margin-top:4px;"
+          + "background:rgba(124,232,169,.08)";
+        const wt = mk("span", "", "\u23f1 \u201c" + (w.name || "a prompt")
+          + "\u201d owns every " + slot.kind + " entry \u00b7 "
+          + (w.says || "") + " \u00b7 "
+          + Math.max(0, Math.round(w.minutes_left || 0)) + "m left");
+        wt.style.cssText = "flex:1;min-width:0;font-size:9px;color:#7ce8a9;"
+          + "line-height:1.4";
+        wr.appendChild(wt);
+        const stop = mk("button", "", "stop it");
+        stop.title = "Back to this entry's own standing instruction, now";
+        stop.style.cssText = "font-size:9px;padding:1px 6px";
+        stop.onclick = async () => {
+          try {
+            await api.del("/api/schedule/promptbook/window/"
+                          + encodeURIComponent(slot.kind));
+          } catch (e) { /* the banner redraws either way */ }
+          refresh();
+        };
+        wr.appendChild(stop);
+        shelf.appendChild(wr);
+      }
+    };
+
+    const refresh = async () => {
+      let got = null;
+      try {
+        got = await api.get("/api/schedule/segment/prompt?hour="
+          + encodeURIComponent(hour.key) + "&slot="
+          + encodeURIComponent(slot.id || "") + "&kind="
+          + encodeURIComponent(slot.kind || ""));
+      } catch (e) {
+        say.textContent = "the prompt desk is not available";
+        return;
+      }
+      say.textContent = "writing with: " + (got.source || "\u2014")
+        + ((got.variant && got.variant.name)
+           ? " \u00b7 \u201c" + got.variant.name + "\u201d" : "");
+      noteRow.textContent = got.notes
+        ? "the working note on this entry: " + got.notes : "";
+      /* The box is filled ONCE. A refresh while the operator is typing
+       * must never take the words out from under him. */
+      if (first) {
+        first = false;
+        ta.value = String(got.text || got.seed || "");
+        ta.placeholder = String(got.seed || "");
+      }
+      drawBook(got.book, got.windows);
+    };
+
+    /* Every action button behaves the same: it says what it did, or that
+     * the desk refused it, and never leaves itself stuck disabled. */
+    const button = (txt, title, fn) => {
+      const b = mk("button", "", txt);
+      b.title = title;
+      b.style.cssText = "font-size:10px;padding:2px 8px";
+      b.onclick = async () => {
+        const was = b.textContent;
+        b.disabled = true;
+        b.textContent = "\u2026";
+        try {
+          const msg = await fn();
+          note.style.color = "#7ce8a9";
+          note.textContent = msg || "done";
+        } catch (e) {
+          note.style.color = "#e88c8c";
+          note.textContent = "the desk refused that";
+        }
+        b.textContent = was;
+        b.disabled = false;
+        refresh();
+      };
+      acts.appendChild(b);
+      return b;
+    };
+
+    const apply = (scope, minutes) => api.post(
+      "/api/schedule/promptbook/apply",
+      {scope: scope, text: ta.value, name: nameIn.value || "",
+       hour: hour.key, slot: slot.id || "", kind: slot.kind || "",
+       minutes: minutes || 0, id: editing ? editing.id : ""});
+
+    if (how.generate) {
+      /* #897: send the edited brief back up, and what comes back is the
+       * stand-in for this position this hour. */
+      button("\u270e write another with this prompt",
+             "Write a new candidate using exactly these words, and pin "
+             + "what comes back as the stand-in for this entry this hour",
+             async () => {
+               await api.post("/api/schedule/segment/generate",
+                 {hour: hour.key, slot: slot.id, count: 1,
+                  prompt: ta.value, pin: true,
+                  save_as: nameIn.value || ""});
+               if (typeof how.after === "function") {
+                 setTimeout(how.after, 4000);
+               }
+               return "the desk is on it \u2014 what comes back is pinned "
+                 + "to this entry as the stand-in for " + hour.label;
+             });
+    }
+
+    button("this entry, this hour",
+           "Script this entry for " + hour.label + " and nothing else",
+           async () => {
+             await api.post("/api/schedule/hours/"
+                            + encodeURIComponent(hour.key) + "/prompt",
+                            {slot_id: slot.id, text: ta.value,
+                             name: nameIn.value
+                                   || (hour.label + " "
+                                       + (slot.label || slot.kind))});
+             load();
+             return "this entry runs it at " + hour.label
+               + " \u2014 that hour only";
+           });
+    button("\u2605 make it the default",
+           "This entry writes with it from now on \u2014 a permanent "
+           + "change to the running order",
+           async () => {
+             await apply("default");
+             return "it is this entry's standing instruction from now on";
+           });
+    button("\u25b6 the next segment",
+           "The very next " + (slot.kind || "") + " segment writes with "
+           + "it, then it lets go by itself",
+           async () => {
+             await apply("next_segment");
+             return "the next " + (slot.kind || "") + " segment runs it, "
+               + "then everything is back to normal";
+           });
+    button("\u23f1 the next 30 minutes",
+           "Every " + (slot.kind || "") + " entry in the next half hour",
+           async () => {
+             await apply("next_30", 30);
+             return "every " + (slot.kind || "") + " entry for the next "
+               + "thirty minutes runs it";
+           });
+    button("\u23f1\u23f1 the next hour",
+           "Both thirty-minute halves \u2014 every " + (slot.kind || "")
+           + " entry for the next sixty minutes",
+           async () => {
+             await apply("next_hour");
+             return "it runs for the next thirty minutes and then for the "
+               + "thirty minutes after that";
+           });
+
+    keepB.onclick = async () => {
+      keepB.disabled = true;
+      try {
+        await api.post("/api/schedule/promptbook",
+          {id: (editing && nameIn.value === editing.name) ? editing.id : "",
+           name: nameIn.value || (slot.label || slot.kind),
+           kind: slot.kind || "",
+           scenario: whenIn.value || "",
+           text: ta.value});
+        note.style.color = "#7ce8a9";
+        note.textContent = "saved to the book \u2014 it is on the shelf "
+          + "above for every " + (slot.kind || "segment") + " entry now";
+        editing = null;
+      } catch (e) {
+        note.style.color = "#e88c8c";
+        note.textContent = "that would not save";
+      }
+      keepB.disabled = false;
+      refresh();
+    };
+
+    document.body.appendChild(d);
+    try { pvFloatDesk(d); } catch (e) { /* it is still on screen */ }
+    refresh();
+  }
+
   function detail(slot, i) {
     const old = document.getElementById("worksSchedDetail");
     if (old) old.remove();
@@ -3222,6 +3618,16 @@ function worksSchedule(anchorPop) {
       const armed = vs[band.active || 0];
       ta.value = (pinned || armed || {}).text || "";
     }).catch(() => {});
+
+    /* #909/#906: the box above scripts THIS hour and nothing else. The
+     * book is where a prompt gets a name, gets kept, and gets handed a
+     * window of air - so the door to it is right here beside it. */
+    const bookB = mk("button", "",
+                     "\ud83d\udcdd the prompt book \u00b7 save, swap, "
+                     + "and how long it runs\u2026");
+    bookB.style.cssText = "font-size:10px;margin-top:5px;padding:2px 7px";
+    bookB.onclick = (ev) => { ev.stopPropagation(); promptDesk(slot, i, {}); };
+    d.appendChild(bookB);
 
     const acts = mk("div", "wk-note", "");
     acts.style.cssText = "display:flex;gap:6px;margin-top:6px";
@@ -3679,6 +4085,54 @@ function wkTapeBar(host, kind, id) {
 
 /* The Works' own popups are plain divs, not the panel's — give them the
  * same "stay on screen" courtesy (#877). */
+/* #914: move a popup by any BLANK part of itself.
+ *
+ * Only blank parts: a drag beginning on a button, an input, a select, a
+ * link or an audio player would steal the click from the control you
+ * were aiming at, and these windows are almost entirely controls. A
+ * drag that begins inside live selected text is left alone too — #883
+ * exists precisely because this window kept interrupting people who
+ * were reading it. */
+function wkDraggable(el2) {
+  try {
+    if (!el2 || el2.dataset.wkDrag) return;
+    el2.dataset.wkDrag = "1";
+    const CONTROLS = "button, input, select, textarea, a, audio, option, "
+      + "label, [contenteditable]";
+    let from = null;
+    el2.addEventListener("mousedown", (ev) => {
+      if (ev.button !== 0) return;
+      const t = ev.target;
+      if (t && t.closest && t.closest(CONTROLS)) return;
+      try {
+        const sel = window.getSelection();
+        if (sel && !sel.isCollapsed) return;   // they are selecting
+      } catch (e) { /* drag anyway */ }
+      const r = el2.getBoundingClientRect();
+      from = {x: ev.clientX, y: ev.clientY, left: r.left, top: r.top};
+      el2.style.position = "fixed";
+      el2.style.left = Math.round(r.left) + "px";
+      el2.style.top = Math.round(r.top) + "px";
+      el2.style.right = "auto";
+      el2.style.bottom = "auto";
+      ev.preventDefault();
+    });
+    const move = (ev) => {
+      if (!from) return;
+      el2.style.left = Math.round(from.left + ev.clientX - from.x) + "px";
+      el2.style.top = Math.round(from.top + ev.clientY - from.y) + "px";
+    };
+    const drop = () => {
+      if (!from) return;
+      from = null;
+      try { pvFloatDesk(el2); } catch (e) { /* it is where it is */ }
+    };
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", drop);
+    el2.style.cursor = el2.style.cursor || "default";
+  } catch (e) { /* the window still opens */ }
+}
+
 function pvFloatDesk(el2) {
   try {
     const r = el2.getBoundingClientRect();

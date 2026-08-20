@@ -21839,8 +21839,545 @@ def schedule_prompt_for(store: dict[str, Any],
     return str(variants[idx].get("text") or "").strip()
 
 
-def _schedule_clause(preset: str, slot: dict[str, Any], text: str) -> str:
-    """The entry's prompt, dressed as the instruction it is."""
+# --- #909/#906: THE PROMPT BOOK ---------------------------------------
+#
+# "Be able to save to preferences the modified system prompts that we're
+# using for these sections so they could be used in the future... I want
+# to be able to jump between them and select which system prompts are
+# being used based on the ones that we have saved. And I want to be able
+# to store them for the scenarios that we are dealing with."
+#
+# Two shelves in one small file, both of them the operator's:
+#
+#   * SAVED PROMPTS — named, reusable system prompts, each tagged with the
+#     kind of segment and the SCENARIO it was written for. Write one once,
+#     name it, and it is there for every entry of that kind from then on.
+#   * TIMED APPLICATIONS (#906) — a prompt that owns a stretch of air and
+#     then lets go by itself: the next segment of that kind, the next
+#     thirty minutes, or the next hour, which the operator said plainly
+#     means both thirty-minute halves.
+#
+# It is a shelf BESIDE the schedule rather than inside it. schedule.json is
+# the running order and half a dozen roads rewrite it wholesale — tearing
+# up an hour must not tear up the library. And nothing here is a second
+# prompt store for the air path to read: applying a saved prompt COPIES it
+# onto the same per-kind variant shelf /api/schedule/prompts has always
+# managed. The book is where you keep them; the shelf is what airs.
+#
+# Everything below falls back to "no book" rather than raising. This
+# station does not go off air over a prompt.
+PROMPT_BOOK_PATH = data_path("prompt_book.json")
+_PROMPT_LOCK = RLock()
+PROMPT_BOOK_MOST = 300                  # saved prompts kept
+PROMPT_WINDOW_CAP = 6 * 3600.0          # no window may outlive six hours
+PROMPT_SCOPES = ("next_segment", "next_30", "next_hour")
+PROMPT_SCOPE_SAYS = {
+    "next_segment": "the next segment of this kind, then it lets go",
+    "next_30": "the next thirty minutes",
+    "next_hour": "the next hour — both thirty-minute halves",
+}
+# Held in memory and written through. prompt_window_text() is asked on the
+# AIR path, once a round, and reading a file there is a cost the live
+# round must never carry.
+_PROMPT_BOOK: dict[str, Any] = {"prompts": [], "windows": {}, "at": 0.0}
+_PROMPT_BOOK_READ = [0.0]
+
+
+def _prompt_row(raw: Any) -> dict[str, Any]:
+    """One saved prompt, scrubbed. Anything unreadable comes back empty
+    and is dropped, never raised on."""
+    try:
+        row = raw if isinstance(raw, dict) else {}
+        text = str(row.get("text") or "")[:4000]
+        if not text.strip():
+            return {}
+        kind = str(row.get("kind") or "").strip().lower()[:40]
+        if kind and kind not in SCHEDULE_KIND_NAMES:
+            kind = ""              # "" means it suits any segment at all
+        try:
+            used = max(0, int(row.get("used") or 0))
+        except (TypeError, ValueError):
+            used = 0
+        try:
+            at = float(row.get("at") or 0) or time.time()
+        except (TypeError, ValueError):
+            at = time.time()
+        try:
+            used_at = float(row.get("used_at") or 0)
+        except (TypeError, ValueError):
+            used_at = 0.0
+        return {
+            "id": (str(row.get("id") or "").strip()[:64]
+                   or f"pb-{uuid.uuid4().hex[:10]}"),
+            "name": str(row.get("name") or "Untitled").strip()[:80],
+            "kind": kind,
+            "scenario": str(row.get("scenario") or "").strip()[:200],
+            "text": text,
+            "at": round(at, 3),
+            "used": used,
+            "used_at": round(used_at, 3),
+        }
+    except Exception:                          # noqa: BLE001
+        return {}
+
+
+def _prompt_window_row(raw: Any) -> dict[str, Any]:
+    """One timed application, scrubbed — and dropped outright once its
+    clock has run out, so a book that sat on disk overnight comes back
+    with no stale window in it."""
+    try:
+        row = raw if isinstance(raw, dict) else {}
+        text = str(row.get("text") or "")[:4000]
+        scope = str(row.get("scope") or "").strip()[:20]
+        if not text.strip() or scope not in PROMPT_SCOPES:
+            return {}
+        now = time.time()
+        try:
+            until = float(row.get("until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if until <= now or until > now + PROMPT_WINDOW_CAP + 60:
+            return {}
+
+        def _num(key: str) -> float:
+            try:
+                return float(row.get(key) or 0)
+            except (TypeError, ValueError):
+                return 0.0
+        return {
+            "scope": scope,
+            "kind": str(row.get("kind") or "")[:40],
+            "name": str(row.get("name") or "").strip()[:80],
+            "text": text,
+            "slot_id": str(row.get("slot_id") or "")[:48],
+            "label": str(row.get("label") or "")[:80],
+            "at": round(_num("at") or now, 3),
+            "until": round(until, 3),
+            # #906: which segment was ALREADY running when this was armed
+            # (so "the next segment" does not claim the one on air), and
+            # which segment has claimed it since.
+            "born": str(row.get("born") or "")[:96],
+            "stamp": str(row.get("stamp") or "")[:96],
+            "taken": round(_num("taken"), 3),
+        }
+    except Exception:                          # noqa: BLE001
+        return {}
+
+
+def prompt_book_read(fresh: bool = False) -> dict[str, Any]:
+    """The book — off disk once, held in memory after that."""
+    if not fresh and _PROMPT_BOOK_READ[0]:
+        return _PROMPT_BOOK
+    _PROMPT_BOOK_READ[0] = time.time()
+    rows: list[dict[str, Any]] = []
+    windows: dict[str, Any] = {}
+    try:
+        raw = json.loads(PROMPT_BOOK_PATH.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            for one in (raw.get("prompts") or []):
+                got = _prompt_row(one)
+                if got:
+                    rows.append(got)
+            for kind, blob in (raw.get("windows") or {}).items():
+                got = _prompt_window_row(blob)
+                if got:
+                    windows[str(kind)[:40]] = got
+    except Exception:                          # noqa: BLE001
+        rows, windows = [], {}     # no book, or a broken one: an empty one
+    _PROMPT_BOOK["prompts"] = rows[-PROMPT_BOOK_MOST:]
+    _PROMPT_BOOK["windows"] = windows
+    return _PROMPT_BOOK
+
+
+def prompt_book_write(book: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Atomically, the way every other shelf in this file is written. A
+    write that will not land leaves the book standing in memory rather
+    than throwing, because the caller is often the air path."""
+    got = book if isinstance(book, dict) else _PROMPT_BOOK
+    with _PROMPT_LOCK:
+        try:
+            got["prompts"] = [r for r in (got.get("prompts") or [])
+                              if isinstance(r, dict)][-PROMPT_BOOK_MOST:]
+            got["at"] = round(time.time(), 3)
+            PROMPT_BOOK_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = PROMPT_BOOK_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(got, indent=1), encoding="utf-8")
+            tmp.replace(PROMPT_BOOK_PATH)
+        except Exception:                      # noqa: BLE001
+            pass
+    return got
+
+
+def prompt_book_find(pid: str) -> dict[str, Any]:
+    """One saved prompt by id, or {}."""
+    try:
+        want = str(pid or "").strip()[:64]
+        if not want:
+            return {}
+        for row in (prompt_book_read().get("prompts") or []):
+            if str((row or {}).get("id") or "") == want:
+                return row
+    except Exception:                          # noqa: BLE001
+        pass
+    return {}
+
+
+def prompt_book_put(raw: Any) -> dict[str, Any]:
+    """Save one prompt under its name, or rewrite the one it names."""
+    try:
+        row = _prompt_row(raw)
+        if not row:
+            return {}
+        book = prompt_book_read()
+        rows = [r for r in (book.get("prompts") or []) if isinstance(r, dict)]
+        want = str((raw if isinstance(raw, dict) else {}).get("id")
+                   or "").strip()[:64]
+        found = None
+        if want:
+            found = next((r for r in rows
+                          if str(r.get("id") or "") == want), None)
+        if found is not None:
+            # Rewriting keeps the tally: how often it has been put to work
+            # is a fact about the prompt, not about this edit of it.
+            row["id"] = str(found.get("id") or row["id"])
+            row["used"] = int(found.get("used") or 0)
+            row["used_at"] = float(found.get("used_at") or 0)
+            rows[rows.index(found)] = row
+        else:
+            rows.append(row)
+        book["prompts"] = rows
+        prompt_book_write()
+        return row
+    except Exception:                          # noqa: BLE001
+        return {}
+
+
+def prompt_book_drop(pid: str) -> bool:
+    """Take one out of the book. Nothing on air changes: an entry already
+    pinned to a variant made from it keeps that variant."""
+    try:
+        want = str(pid or "").strip()[:64]
+        book = prompt_book_read()
+        was = [r for r in (book.get("prompts") or []) if isinstance(r, dict)]
+        rows = [r for r in was if str(r.get("id") or "") != want]
+        if len(rows) == len(was):
+            return False
+        book["prompts"] = rows
+        prompt_book_write()
+        return True
+    except Exception:                          # noqa: BLE001
+        return False
+
+
+def prompt_book_used(pid: str) -> None:
+    """One more outing for a saved prompt — so the shelf can say which
+    ones actually get used."""
+    try:
+        row = prompt_book_find(pid)
+        if not row:
+            return
+        row["used"] = int(row.get("used") or 0) + 1
+        row["used_at"] = round(time.time(), 3)
+        prompt_book_write()
+    except Exception:                          # noqa: BLE001
+        pass
+
+
+def prompt_variant_put(store: dict[str, Any], kind: str, vid: str,
+                       name: str, text: str) -> str:
+    """Put one system prompt on a KIND's variant shelf under a stable id,
+    rewriting it in place if that id is already there.
+
+    The SAME shelf /api/schedule/prompts manages and the hour road writes
+    to. There is still exactly one prompt store the writing room reads;
+    the book is a library you copy FROM. Coming back and re-applying the
+    same saved prompt therefore rewrites its variant instead of piling up
+    a new one each time, exactly as scripting an hour does."""
+    prompts = dict(store.get("prompts") or {})
+    key = str(kind)[:40]
+    blob = dict(prompts.get(key) or {})
+    variants = [dict(v) for v in (blob.get("variants") or [])
+                if isinstance(v, dict)]
+    found = next((v for v in variants
+                  if str(v.get("id") or "") == vid), None)
+    if found is not None:
+        found["name"], found["text"] = name, text
+    else:
+        variants.append({"id": vid, "name": name, "text": text})
+        if len(variants) > 60:
+            # A read keeps the FIRST sixty a kind has. The book-sourced
+            # variants nothing points at any more are the ones that go;
+            # the station's own defaults and anything still pinned never
+            # do — the same rule the hour road follows for its own.
+            safe = _sched_pinned_prompt_ids(store)
+            safe.add(vid)
+            variants = [v for v in variants
+                        if not str(v.get("id") or "").startswith("bk-")
+                        or str(v.get("id") or "") in safe][:60]
+    blob["variants"] = variants
+    try:
+        blob["active"] = max(0, min(len(variants) - 1,
+                                    int(blob.get("active") or 0)))
+    except (TypeError, ValueError):
+        blob["active"] = 0
+    prompts[key] = blob
+    store["prompts"] = prompts
+    return vid
+
+
+def prompt_window_put(kind: str, scope: str, text: str, name: str = "",
+                      minutes: Any = 30, slot_id: str = "",
+                      label: str = "") -> dict[str, Any]:
+    """#906: hand one prompt a stretch of air.
+
+    "Offer a button to basically have this prompt take place for the next
+    section, for the next thirty minute section, or to go and take place
+    for the next hour. So it takes place twice. It takes place for the
+    next thirty minutes and then for the thirty minutes after that."
+
+    So `next_hour` is SIXTY MINUTES — the operator said what he meant by
+    it — and every entry of that kind inside the window writes with it.
+    `next_segment` is one firing and then gone. Every window carries a
+    hard stop as well, so an armed window can never quietly become the
+    way the station writes forever."""
+    now = time.time()
+    if scope == "next_segment":
+        span = 2 * 3600.0               # a safety stop, not the rule
+    elif scope == "next_hour":
+        span = 3600.0
+    else:
+        try:
+            span = max(1.0, min(720.0, float(minutes or 30))) * 60.0
+        except (TypeError, ValueError):
+            span = 30 * 60.0
+    born = ""
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        born = (str(pos.get("slot_id") or "") + "@"
+                + str(pos.get("started") or ""))
+    except Exception:                          # noqa: BLE001
+        born = ""
+    row = _prompt_window_row({
+        "scope": scope, "kind": kind, "name": name, "text": text,
+        "slot_id": slot_id, "label": label, "born": born,
+        "at": now, "until": now + min(span, PROMPT_WINDOW_CAP)})
+    if not row:
+        return {}
+    book = prompt_book_read()
+    windows = dict(book.get("windows") or {})
+    windows[str(kind)[:40]] = row
+    book["windows"] = windows
+    prompt_book_write()
+    # The entry on air re-reads its instruction on the very next round,
+    # not at the next restart.
+    _RADIO["sched_prompt"] = ""
+    says = PROMPT_SCOPE_SAYS.get(scope, scope)
+    pipeline_log(
+        "lookahead",
+        "\u201c" + (name or "a prompt") + "\u201d now speaks for every "
+        + str(kind) + " entry — " + says + ". Nothing in the running order "
+        "was edited to do it, so when it runs out the entry is simply "
+        "itself again (#906)")
+    note_action("📝 " + says + ": " + (name or str(kind)) + " (#906)")
+    return row
+
+
+def prompt_window_clear(kind: str = "", why: str = "") -> list[str]:
+    """Let a window go — because it ran out, because its one segment has
+    been and gone, or because the operator stopped it. There is nothing
+    to put back: a window never edited the running order."""
+    gone: list[str] = []
+    try:
+        book = prompt_book_read()
+        windows = dict(book.get("windows") or {})
+        for key in ([str(kind)] if kind else list(windows)):
+            if windows.pop(key, None) is not None:
+                gone.append(key)
+        if gone:
+            book["windows"] = windows
+            prompt_book_write()
+            _RADIO["sched_prompt"] = ""
+            pipeline_log(
+                "lookahead",
+                "the timed prompt on " + ", ".join(gone) + " is done — "
+                + (why or "its window closed")
+                + ". Those entries are back on their own standing "
+                  "instruction (#906)")
+    except Exception:                          # noqa: BLE001
+        pass
+    return gone
+
+
+def prompt_window_text(slot: dict[str, Any]) -> str:
+    """#906: the prompt that OWNS this entry right now because one was
+    applied for a window — or '' when none does.
+
+    Asked on the air path, so it never touches the disk to answer: the
+    book is held in memory and only a state CHANGE (a window claiming its
+    one segment, a window running out) writes anything down. Anything at
+    all going wrong answers '' and the entry writes with its own standing
+    instruction, which is exactly today's behaviour."""
+    try:
+        kind = str((slot or {}).get("kind") or "")
+        if not kind:
+            return ""
+        row = (prompt_book_read().get("windows") or {}).get(kind)
+        if not isinstance(row, dict):
+            return ""
+        now = time.time()
+        text = str(row.get("text") or "").strip()
+        try:
+            until = float(row.get("until") or 0)
+        except (TypeError, ValueError):
+            until = 0.0
+        if not text or (until and now >= until):
+            prompt_window_clear(kind, "its window closed")
+            return ""
+        if str(row.get("scope") or "") == "next_segment":
+            # ONE segment. The stamp is the entry plus the minute it began
+            # — the same shape #891 uses to put a pinned record up exactly
+            # once per segment. The segment that was ALREADY running when
+            # this was armed is not "the next" one, so it never claims it.
+            pos = _RADIO.get("sched_pos") or {}
+            stamp = (str((slot or {}).get("id") or "") + "@"
+                     + str(pos.get("started") or ""))
+            if stamp and stamp == str(row.get("born") or ""):
+                return ""
+            held = str(row.get("stamp") or "")
+            if not held:
+                row["stamp"] = stamp
+                row["taken"] = round(now, 3)
+                prompt_book_write()
+            elif held != stamp:
+                prompt_window_clear(kind,
+                                    "its one segment has been and gone")
+                return ""
+        return text
+    except Exception:                          # noqa: BLE001
+        return ""      # a timed prompt never takes the station off air
+
+
+def prompt_windows_view() -> dict[str, Any]:
+    """Every timed application running, with its clock in minutes."""
+    out: dict[str, Any] = {}
+    try:
+        now = time.time()
+        for kind, row in dict(prompt_book_read().get("windows")
+                              or {}).items():
+            try:
+                left = max(0.0, float(row.get("until") or 0) - now)
+            except (TypeError, ValueError):
+                left = 0.0
+            out[str(kind)] = dict(
+                row, seconds_left=round(left, 1),
+                minutes_left=round(left / 60.0, 1),
+                says=PROMPT_SCOPE_SAYS.get(str(row.get("scope") or ""), ""))
+    except Exception:                          # noqa: BLE001
+        pass
+    return out
+
+
+def prompt_book_view(kind: str = "") -> dict[str, Any]:
+    """The book as the picker needs it, newest first. Narrowing by kind
+    still returns the prompts saved for NO kind — those were written to
+    suit anything, and hiding them would make the shelf lie."""
+    try:
+        rows = [dict(r) for r in (prompt_book_read().get("prompts") or [])]
+    except Exception:                          # noqa: BLE001
+        rows = []
+    want = str(kind or "").strip().lower()
+    if want:
+        rows = [r for r in rows
+                if not r.get("kind") or str(r.get("kind")) == want]
+    try:
+        rows.sort(key=lambda r: -float(r.get("at") or 0))
+    except Exception:                          # noqa: BLE001
+        pass
+    return {"prompts": rows, "windows": prompt_windows_view(),
+            "kind": want or None,
+            "kinds": [dict(k) for k in SCHEDULE_KINDS],
+            "seeds": dict(SCHEDULE_PROMPT_SEED),
+            "cap": PROMPT_BOOK_MOST}
+
+
+# --- #897: THE BRIEF ONE WRITING TASK WAS GIVEN -----------------------
+#
+# "Show a pop-up window that allows me to modify and edit what the system
+# prompt is that we're using for generating that prompt. So I can send it
+# back up, have it written."
+#
+# The candidate is written by the very same prep road the keeper uses, and
+# that road picks its instruction up off the schedule — _RADIO's
+# sched_prompt, the entry currently ON AIR. So an edited brief cannot be a
+# global: the live round is being written out of that same drawer at that
+# same moment, and a station that started reading the operator's gallery
+# brief during a news round would be a fault you could hear.
+#
+# It is hung on the TASK instead — the generate ticket's own asyncio task
+# — and the writing room reads it only when the task asking IS that task.
+# Anything at all unclear (no loop, no task, an empty shelf) and it is
+# simply not there, which is today's behaviour exactly.
+_ALT_BRIEF: dict[int, str] = {}
+
+
+def alt_brief_set(text: str) -> None:
+    """Write under these words, in THIS task, until it is cleared."""
+    try:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        if str(text or "").strip():
+            _ALT_BRIEF[id(task)] = str(text)[:4000]
+        else:
+            _ALT_BRIEF.pop(id(task), None)
+    except Exception:                          # noqa: BLE001
+        pass
+
+
+def alt_brief_clear() -> None:
+    """Always in a finally: a brief that outlived its ticket would be a
+    leak with a voice."""
+    try:
+        task = asyncio.current_task()
+        if task is not None:
+            _ALT_BRIEF.pop(id(task), None)
+    except Exception:                          # noqa: BLE001
+        pass
+
+
+def alt_brief_now() -> str:
+    """The brief THIS task is writing under. '' on the live path, and ''
+    for free in the ordinary case where nobody has set one."""
+    try:
+        if not _ALT_BRIEF:
+            return ""
+        task = asyncio.current_task()
+        return str(_ALT_BRIEF.get(id(task)) or "") if task is not None else ""
+    except Exception:                          # noqa: BLE001
+        return ""
+
+
+def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
+                     timed: bool = True) -> str:
+    """The entry's prompt, dressed as the instruction it is.
+
+    #906: and a TIMED APPLICATION speaks first. If the operator has put a
+    prompt on the air for the next segment, the next thirty minutes or the
+    next hour, that is what this entry writes with until the window
+    closes — ahead of its own standing instruction, and without one line
+    of the running order being edited to do it.
+
+    Pass timed=False to dress a prompt WITHOUT that consult, which is what
+    #897's generate road wants: the words the operator has just typed into
+    the box must not be quietly swapped for a window's while he is looking
+    at them."""
+    if timed:
+        try:
+            window = prompt_window_text(slot)
+            if window:
+                text = window
+        except Exception:                      # noqa: BLE001
+            pass                # the entry's own prompt still governs it
     note = str(slot.get("notes") or "").strip()[:300]
     named = str(slot.get("label") or slot.get("kind") or "")[:80]
     # #924: the operator NAMES these entries — "Pine News Coverage", not
@@ -21863,8 +22400,15 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str) -> str:
 def _schedule_prompt_clause() -> str:
     """What the entry currently on air wants said. Empty whenever the
     schedule is not driving, which is what keeps an unscheduled station
-    writing exactly as it always did."""
+    writing exactly as it always did.
+
+    #897: unless THIS TASK is a generate ticket the operator handed an
+    edited brief to, in which case it writes with that and the live round
+    beside it still writes with the air's own."""
     try:
+        one = alt_brief_now()
+        if one:
+            return one
         return str(_RADIO.get("sched_prompt") or "")
     except Exception:                          # noqa: BLE001
         return ""
@@ -21954,9 +22498,15 @@ def schedule_take() -> dict[str, Any]:
                                "slot_id": str(slot.get("id") or "")}
         _sched_pos_save()                                   # #915
         text = schedule_prompt_for(store, slot)
+        # #906: an entry with no standing instruction of its own still
+        # gets one while a timed application owns its kind, so the
+        # question is asked HERE as well as inside the clause — otherwise
+        # a window applied to a bare entry would be built and thrown away
+        # in the same breath.
         _RADIO["sched_prompt"] = (
             _schedule_clause(name, slot, text)
-            if (text or slot.get("notes")) else "")
+            if (text or slot.get("notes") or prompt_window_text(slot))
+            else "")
         # #853: the writing room is told WHAT it is about to write, so it
         # can be given room and temperament to suit the job.
         _RADIO["sched_kind"] = str(slot.get("kind") or "")
@@ -23584,8 +24134,67 @@ def alt_job_put(job: str, **more: Any) -> dict[str, Any]:
     return row
 
 
-async def alt_generate_job(job: str, kind: str, count: int) -> None:
+def alt_pin_written(pin: dict[str, Any], kind: str, sid: str) -> bool:
+    """#897: the candidate just written BECOMES the stand-in.
+
+    "Make that the new stand-in for what will be in that position for the
+    hour as the first slot."
+
+    Two things, because a pin is a preference and not a promise (#926):
+    the entry in that hour is pinned to it, AND it is given the top
+    priority — so if the pin is ever torn up, or that hour's orders are,
+    it is still the first thing the take considers rather than the last.
+
+    Never raises. A pin that will not take simply leaves the entry on the
+    ordinary take, and the segment airs anyway."""
+    try:
+        key = str((pin or {}).get("hour") or "")
+        slot_id = str((pin or {}).get("slot") or "")
+        want = str(sid or "")
+        if not (want and slot_id and _sched_is_hour_key(key)):
+            return False
+        _road, row = alt_find(want)
+        if row is not None:
+            row["priority"] = 9
+            try:
+                if kind == "banter":
+                    _larder_save()
+                else:
+                    _pantry_save(True)
+            except Exception:  # noqa: BLE001
+                pass
+        with _SCHEDULE_LOCK:
+            store = schedule_read()
+            rows, at = alt_slot_of(store, key, slot_id)
+            if at is None:
+                return False
+            rows[at]["pinned_id"] = want
+            alt_hour_write(store, key, rows)
+        alt_pin_forget()                # the air road re-reads at once
+        named = str((pin or {}).get("label")
+                    or SHELF_LABEL.get(kind, kind))[:40]
+        note_action(f"🗓 {named} at {key[11:13]}:00 stands in with the one "
+                    "just written to order (#897)")
+        pipeline_log(
+            "lookahead",
+            f"the {SHELF_LABEL.get(kind, kind)} written to order is pinned "
+            f"to {named} at {key[11:13]}:00 — that is what the position "
+            "airs, and it stands at the top of the stack either way (#897)")
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def alt_generate_job(job: str, kind: str, count: int,
+                           brief: str = "",
+                           pin: dict[str, Any] | None = None) -> None:
     """Write N MORE candidates for one road, off the live path.
+
+    #897: `brief` is ONE edited system prompt, for this ticket alone. It
+    is hung on this task and nothing else — the live round being written
+    at the same moment reads the schedule's own instruction, exactly as it
+    always did. `pin` names the entry that asked for it, and the first
+    candidate that lands is made that entry's stand-in at once.
 
     Never raises: the ticket carries the bad news instead. Every item is
     counted honestly — `made` is what actually landed on the shelf, and a
@@ -23620,12 +24229,22 @@ async def alt_generate_job(job: str, kind: str, count: int) -> None:
             _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
             try:
                 road = alt_prep_road(kind)
+                if brief:
+                    alt_brief_set(brief)        # #897: THIS task only
                 ok = bool(await prep_measure(kind, road)) if road else False
             finally:
+                alt_brief_clear()               # #897: always, even on a raise
                 _PREP_DEADLINE[0] = 0.0
             after = {alt_sid(kind, r) for r in alt_candidates(kind)}
             new = sorted(after - before)
             fresh.extend(new)
+            # #897: the FIRST one that lands is pinned at once, so the
+            # entry has its stand-in even if the rest of the ticket is
+            # still writing — or never finishes at all. `fresh` was just
+            # extended, so it equalling `new` is what "the first" means
+            # here, without a flag to keep in step.
+            if new and pin and len(fresh) == len(new):
+                alt_pin_written(pin, kind, new[0])
             if ok or new:
                 made += 1
                 pipeline_log(
@@ -24210,15 +24829,55 @@ async def schedule_segment_generate_api(
                    "let those land first, so the writing room is not the "
                    "thing holding the show up")
     job = "alt_" + uuid.uuid4().hex[:10]
+    # #897: "modify and edit what the system prompt is that we're using
+    # for generating that prompt. So I can send it back up, have it
+    # written, and make that the new stand-in for what will be in that
+    # position for the hour as the first slot."
+    #
+    # The edited words are dressed exactly as the entry's own standing
+    # instruction would be dressed — same clause, same rules about naming
+    # the segment on air — and handed to THIS ticket alone. timed=False
+    # because what the operator has just typed must not be swapped for a
+    # timed application while he is looking at it (#906).
+    brief_raw = str(payload.get("prompt") or payload.get("brief") or "")[:4000]
+    brief = ""
+    if brief_raw.strip():
+        try:
+            preset, _hrows, _hon = schedule_hour_slots(store, key)
+            brief = _schedule_clause(
+                str(preset),
+                rows[at] if at is not None else {"kind": slot_kind},
+                brief_raw, timed=False)
+        except Exception:  # noqa: BLE001
+            brief = brief_raw       # undressed is still better than nothing
+        # A brief worth writing with once is worth having again (#909).
+        try:
+            keep = str(payload.get("save_as") or "").strip()[:80]
+            if keep:
+                prompt_book_put({"name": keep, "kind": slot_kind,
+                                 "text": brief_raw,
+                                 "scenario": f"written to order for {key}"})
+        except Exception:  # noqa: BLE001
+            pass
+    # And what comes back STANDS IN, unless told otherwise: the operator
+    # asked for the new one to be what that position airs, not to join the
+    # back of the queue behind whatever was already stacked. Send
+    # "pin": false to write one without touching the running order.
+    pin = None
+    if slot_id and bool(payload.get("pin", True)):
+        pin = {"hour": key, "slot": slot_id,
+               "label": (str(rows[at].get("label") or slot_kind)
+                         if at is not None else slot_kind)}
     row = alt_job_put(job, state="queued", hour=key, slot=slot_id,
                       kind=kind, slot_kind=slot_kind,
                       label=SHELF_LABEL.get(kind, kind), count=count,
                       made=0, refused=0, new=[], why="",
+                      brief=bool(brief), stands_in=bool(pin),
                       full=bool(shelf_full(kind)))
 
     async def _more() -> None:
         try:
-            await alt_generate_job(job, kind, count)
+            await alt_generate_job(job, kind, count, brief=brief, pin=pin)
         except Exception as exc:  # noqa: BLE001
             pipeline_log("drop", f"the alternates task died: {exc}"[:200])
 
@@ -24351,6 +25010,345 @@ async def schedule_segment_discard_api(
                  "is left where it is for the media prune (#926)")
     return {"ok": True, "id": want, "kind": kind, "left": left,
             "unpinned": unpinned}
+
+
+def schedule_segment_prompt(hour: str = "", slot_id: str = "",
+                            kind: str = "") -> dict[str, Any]:
+    """#909/#897: what ONE entry writes with, and everything it could.
+
+    Everything the editor popup needs in a single read: the words this
+    entry actually goes on air with and WHERE they came from, the whole
+    variant shelf for its kind, every prompt in the book that suits it,
+    any timed application currently holding it, and the dressed clause
+    exactly as the writing room receives it — so what the operator edits
+    is what goes out, not a guess at it."""
+    key = str(hour or "").strip()
+    if not _sched_is_hour_key(key):
+        key = _sched_hour_key()
+    store: dict[str, Any] = {}
+    rows: list[dict[str, Any]] = []
+    preset = ""
+    try:
+        store = schedule_read()
+        preset, raw, _on = schedule_hour_slots(store, key)
+        rows = [_sched_slot(s) for s in raw]
+    except Exception:                          # noqa: BLE001
+        store, rows, preset = schedule_defaults(), [], ""
+    want = str(slot_id or "").strip()[:48]
+    slot: dict[str, Any] = {}
+    if want:
+        slot = next((s for s in rows
+                     if str(s.get("id") or "") == want), {})
+    slot_kind = str(slot.get("kind") or kind or "banter")
+    if not slot:
+        # Asked by KIND without naming an entry — the picker still wants
+        # to see the shelf, so answer for a bare one of that kind.
+        slot = {"id": want, "kind": slot_kind, "label": slot_kind,
+                "notes": "", "prompt_id": None}
+    blob = (store.get("prompts") or {}).get(slot_kind) or {}
+    variants = [dict(v) for v in (blob.get("variants") or [])
+                if isinstance(v, dict)]
+    try:
+        active = (int(blob.get("active") or 0) % len(variants)) \
+            if variants else 0
+    except (TypeError, ValueError):
+        active = 0
+    pinned = next((v for v in variants
+                   if str(v.get("id") or "")
+                   == str(slot.get("prompt_id") or "")), None) \
+        if slot.get("prompt_id") else None
+    armed = variants[active] if variants else None
+    using = pinned or armed or {}
+    source = ("this entry is pinned to it" if pinned is not None else
+              f"it is the variant armed for every {slot_kind} entry"
+              if armed is not None else
+              "there is nothing on the shelf for this kind yet")
+    text = str(using.get("text") or "")
+    window = (prompt_windows_view() or {}).get(slot_kind)
+    if window:
+        # #906: a timed application is what this entry is REALLY writing
+        # with, so that is what the box shows.
+        text = str(window.get("text") or text)
+        source = ("a timed prompt owns every " + slot_kind + " entry — "
+                  + str(window.get("says") or ""))
+    try:
+        clause = _schedule_clause(str(preset), slot, text, timed=False)
+    except Exception:                          # noqa: BLE001
+        clause = ""
+    return {
+        "hour": key,
+        "preset": preset,
+        "slot_id": want or None,
+        "slot": slot or None,
+        "kind": slot_kind,
+        "label": str(slot.get("label") or slot_kind),
+        "notes": str(slot.get("notes") or ""),
+        "text": text,
+        "source": source,
+        "variant": ({"id": using.get("id"), "name": using.get("name")}
+                    if using else None),
+        "variants": variants,
+        "active": active,
+        "window": window or None,
+        "windows": prompt_windows_view(),
+        "book": (prompt_book_view(slot_kind) or {}).get("prompts") or [],
+        "seed": SCHEDULE_PROMPT_SEED.get(slot_kind, ""),
+        "blurb": next((str(k.get("blurb") or "") for k in SCHEDULE_KINDS
+                       if k.get("kind") == slot_kind), ""),
+        "clause": clause,
+        "preparable": bool(alt_prep_kind(slot_kind))
+                      and not alt_refusal(slot_kind),
+        "why": alt_refusal(slot_kind),
+        "scopes": dict(PROMPT_SCOPE_SAYS),
+    }
+
+
+@app.get("/api/schedule/segment/prompt")
+async def schedule_segment_prompt_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#909/#897: THE SYSTEM PROMPT BEHIND ONE ENTRY, OPENED OUT.
+
+        ?hour=YYYY-MM-DDTHH&slot=<slot id>&kind=<kind>
+
+    The hour defaults to the one on air. Naming a kind without an entry
+    answers for that kind in general, which is how the picker can be
+    opened from anywhere."""
+    require_read_auth(authorization)
+    query = request.query_params
+    return schedule_segment_prompt(
+        str(query.get("hour") or query.get("key") or ""),
+        str(query.get("slot") or query.get("slot_id") or ""),
+        str(query.get("kind") or ""))
+
+
+@app.get("/api/schedule/promptbook")
+async def prompt_book_list_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#909: THE PROMPT BOOK — every system prompt the operator has saved,
+    newest first, with whatever is running on a timer beside it.
+
+        ?kind=<segment kind>
+
+    narrows it to the prompts written for that kind. Prompts saved for no
+    particular kind always come back: they were written to suit anything,
+    and hiding them would make the shelf lie."""
+    require_read_auth(authorization)
+    return prompt_book_view(str(request.query_params.get("kind") or ""))
+
+
+@app.post("/api/schedule/promptbook")
+async def prompt_book_save_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#909: SAVE ONE PROMPT UNDER A NAME, or rewrite one already saved.
+
+    {"name": "Gallery — the hard sell", "kind": "gallery",
+     "scenario": "when the wall is full and nothing has sold tonight",
+     "text": "…", "id": "pb-…"}
+
+    Send an `id` to rewrite that one; leave it out and a new one is
+    minted. `kind` is the segment kind it was written for and may be
+    empty, which means "this suits anything". Saving changes NOTHING on
+    air — the book is the library, and putting one to work is
+    /api/schedule/promptbook/apply."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    if not str(payload.get("text") or "").strip():
+        raise HTTPException(
+            status_code=400,
+            detail="There is nothing to save — send `text`")
+    row = prompt_book_put(payload)
+    if not row:
+        raise HTTPException(status_code=400,
+                            detail="That prompt could not be read")
+    note_action(f"📝 saved to the prompt book: {row.get('name')} (#909)")
+    return {"ok": True, "prompt": row,
+            "book": prompt_book_view(str(row.get("kind") or ""))}
+
+
+@app.delete("/api/schedule/promptbook/window/{kind}")
+async def prompt_window_stop_api(
+    kind: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#906: STOP a timed application early — "all" stops every one.
+
+    Those entries are back on their own standing instruction on the very
+    next round. There is nothing to put back, because a window never
+    edited the running order in the first place."""
+    require_auth(authorization)
+    want = str(kind or "").strip().lower()[:40]
+    gone = prompt_window_clear("" if want in ("", "all") else want,
+                               "the operator stopped it")
+    if not gone:
+        raise HTTPException(
+            status_code=404,
+            detail="Nothing is running on a timer there")
+    note_action("📝 timed prompt stopped: " + ", ".join(gone) + " (#906)")
+    return {"ok": True, "stopped": gone, "windows": prompt_windows_view()}
+
+
+@app.delete("/api/schedule/promptbook/{pid}")
+async def prompt_book_delete_api(
+    pid: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#909: take one saved prompt out of the book.
+
+    Nothing on air changes. An entry already pinned to a variant made
+    from this prompt keeps that variant — the book is the library, never
+    the shelf the writing room reads."""
+    require_auth(authorization)
+    want = str(pid or "").strip()[:64]
+    row = prompt_book_find(want)
+    if not row:
+        raise HTTPException(status_code=404,
+                            detail=f"No saved prompt called {want!r}")
+    prompt_book_drop(want)
+    note_action(f"📝 dropped from the prompt book: {row.get('name')} (#909)")
+    return {"ok": True, "id": want, "prompt": dict(row),
+            "book": prompt_book_view()}
+
+
+@app.post("/api/schedule/promptbook/apply")
+async def prompt_book_apply_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#909/#906: PUT A PROMPT TO WORK — one road, four scopes.
+
+    {"text": "…"            the words, or "id": "pb-…" to take them
+                            straight off the book,
+     "scope": "default" | "next_segment" | "next_30" | "next_hour",
+     "hour": "2026-08-20T22", "slot": "hour-03", "kind": "gallery",
+     "minutes": 30, "name": "…"}
+
+      default       this entry writes with it FROM NOW ON. The words go
+                    onto the entry's kind as a named variant and the entry
+                    in the RUNNING ORDER is pinned to it, which is a
+                    permanent change to the plan — that is what "set as
+                    default" means. Name no entry and it arms the variant
+                    for every entry of that kind instead.
+      next_segment  the very next segment of that kind, then it lets go by
+                    itself. The segment already on air is not "the next"
+                    one and never claims it.
+      next_30       the next thirty minutes.
+      next_hour     the next hour — which the operator said plainly means
+                    both thirty-minute halves, so it is sixty minutes and
+                    every entry of that kind inside them.
+
+    THE THREE TIMED SCOPES CHANGE NOTHING IN THE RUNNING ORDER. They are a
+    note held beside it that the entry reads while it is there and stops
+    reading when it is not, so there is never anything to undo. Scripting
+    one entry for one particular hour is a different job and stays where
+    it was: POST /api/schedule/hours/{key}/prompt."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    scope = str(payload.get("scope") or "").strip().lower()[:20]
+    if scope not in ("default",) + PROMPT_SCOPES:
+        raise HTTPException(
+            status_code=400,
+            detail="scope must be one of: default, next_segment, next_30, "
+                   "next_hour")
+    text = str(payload.get("text") or "")[:4000]
+    name = str(payload.get("name") or "").strip()[:80]
+    saved = prompt_book_find(str(payload.get("id") or "").strip()[:64])
+    if saved and not text.strip():
+        text = str(saved.get("text") or "")
+        name = name or str(saved.get("name") or "")
+    if not text.strip():
+        raise HTTPException(
+            status_code=400,
+            detail="There is no prompt here to apply — send `text`, or the "
+                   "`id` of one saved in the book")
+    key = str(payload.get("hour") or payload.get("key")
+              or "").strip() or _sched_hour_key()
+    if not _sched_is_hour_key(key):
+        raise HTTPException(
+            status_code=400,
+            detail="hour must be a local hour like 2026-08-20T22")
+    slot_id = str(payload.get("slot") or payload.get("slot_id")
+                  or "").strip()[:48]
+    kind = str(payload.get("kind") or "").strip().lower()[:40]
+    label = ""
+    store = schedule_read()
+    rows, at = alt_slot_of(store, key, slot_id) if slot_id else ([], None)
+    if slot_id and at is None:
+        raise HTTPException(status_code=404,
+                            detail=f"No entry {slot_id!r} in the hour {key}")
+    if at is not None:
+        kind = str(rows[at].get("kind") or kind)
+        label = str(rows[at].get("label") or kind)
+    if kind not in SCHEDULE_KIND_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail="Which kind of segment is this prompt for? Name an entry "
+                   "with `slot`, or send `kind`")
+    name = name or f"{label or kind} · saved"
+    if saved:
+        prompt_book_used(str(saved.get("id") or ""))
+    if scope == "default":
+        # A stable variant id per saved prompt, so re-applying the same
+        # one rewrites its variant instead of piling up a new one.
+        vid = ("bk-" + (str(saved.get("id") or "") if saved
+                        else uuid.uuid4().hex[:10]))[:64]
+        armed = 0
+        with _SCHEDULE_LOCK:
+            store = schedule_read()
+            prompt_variant_put(store, kind, vid, name, text)
+            if slot_id:
+                # The entry itself, everywhere it stands in the plan —
+                # "the default for that entry from now on".
+                for _pname, prows in (store.get("presets") or {}).items():
+                    for prow in (prows or []):
+                        if str((prow or {}).get("id") or "") == slot_id:
+                            prow["prompt_id"] = vid
+                            armed += 1
+            else:
+                # No entry named: arm it for the KIND, which is what the
+                # prompt desk's own cycle does.
+                blob = dict((store.get("prompts") or {}).get(kind) or {})
+                ids = [str(v.get("id") or "")
+                       for v in (blob.get("variants") or [])]
+                if vid in ids:
+                    blob["active"] = ids.index(vid)
+                    store["prompts"][kind] = blob
+                    armed = 1
+            schedule_write(store)
+        _RADIO["sched_prompt"] = ""
+        note_action("📝 default prompt set: "
+                    + (label or kind) + f" — {name[:40]} (#906)")
+        pipeline_log(
+            "lookahead",
+            "\u201c" + name + "\u201d is now the standing instruction for "
+            + (f"the {label} entry" if slot_id else f"every {kind} entry")
+            + " — it is in the running order itself, so it survives a "
+              "restart and every hour from here (#906)")
+        return {"ok": True, "scope": scope, "kind": kind, "name": name,
+                "variant": vid, "entries": armed,
+                "says": "the standing instruction from now on",
+                "windows": prompt_windows_view()}
+    row = prompt_window_put(kind, scope, text, name=name,
+                            minutes=payload.get("minutes") or 30,
+                            slot_id=slot_id, label=label)
+    if not row:
+        raise HTTPException(
+            status_code=400,
+            detail="That window could not be armed — check the scope and "
+                   "that there are actually words in it")
+    return {"ok": True, "scope": scope, "kind": kind, "name": name,
+            "window": dict(row),
+            "says": PROMPT_SCOPE_SAYS.get(scope, scope),
+            "windows": prompt_windows_view()}
 
 
 @app.get("/api/schedule/prompts")
