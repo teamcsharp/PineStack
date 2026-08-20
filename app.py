@@ -9127,6 +9127,98 @@ def _row_clip_keys(row: Any, depth: int = 0) -> list[str]:
     return found
 
 
+# #941: what the round CURRENTLY BEING WRITTEN was written with.
+#
+# Keyed by the asyncio task rather than held in one global, because the
+# station writes a prepared round and a live round at the same time and
+# a single global would file one round's temperature against the
+# other's script. Bounded, and every access is wrapped: a paperwork
+# ledger may never be the thing that takes the show off air.
+_ROUND_MARK: dict[int, dict[str, Any]] = {}
+ROUND_MARK_MOST = 64
+
+
+def _mark_key() -> int:
+    try:
+        task = asyncio.current_task()
+        return id(task) if task is not None else 0
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def round_mark(**more: Any) -> None:
+    """Write down a fact about the round being written right now."""
+    try:
+        key = _mark_key()
+        row = _ROUND_MARK.setdefault(key, {"at": time.time()})
+        row.update(more)
+        if len(_ROUND_MARK) > ROUND_MARK_MOST:
+            old = sorted(_ROUND_MARK,
+                         key=lambda k: float(
+                             (_ROUND_MARK.get(k) or {}).get("at") or 0))
+            for k in old[:len(_ROUND_MARK) - ROUND_MARK_MOST]:
+                _ROUND_MARK.pop(k, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def round_stats_take() -> dict[str, Any]:
+    """Everything written down about this round, and clear the slate."""
+    try:
+        return dict(_ROUND_MARK.pop(_mark_key(), {}) or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def caller_heat(kind: str = "caller") -> float:
+    """#941: how hard to push THIS road's next round, 0.0 to 1.0.
+
+    Rises with how many are already stacked behind it: the first call
+    off an empty shelf is written exactly as it always was, the sixth is
+    written hot. A deep shelf is when a strange take is affordable —
+    there is finished audio standing behind it, so a round that comes
+    out wrong costs nothing but itself.
+
+    An operator can force it for one round (the regenerate button), and
+    a forced value always wins."""
+    try:
+        forced = (_ROUND_MARK.get(_mark_key()) or {}).get("heat_forced")
+        if forced is not None:
+            return max(0.0, min(1.0, float(forced)))
+        rows = len(_SHELF.get(str(kind)) or [])
+        cap = max(1, shelf_cap(str(kind)))
+        stacked = min(1.0, rows / cap)
+        # Compounded with the pantry's own depth: this road being full
+        # and the whole shelf being full are different facts and both
+        # argue for pushing further out.
+        return max(0.0, min(1.0, 0.65 * stacked + 0.35 * box_depth()))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def heat_clause(heat: float, kind: str = "caller") -> str:
+    """#941: told to the writer, in the writer's own terms.
+
+    Empty below a third, because "the initial entries can remain on the
+    goal" — the early rounds of an empty shelf are written straight."""
+    heat = max(0.0, min(1.0, float(heat or 0)))
+    if heat < 0.34:
+        return ""
+    band = ("stranger than usual" if heat < 0.55
+            else "genuinely peculiar" if heat < 0.78
+            else "unhinged")
+    return (
+        "\n\nTHE DIAL (#941) — there is a deep shelf of finished audio "
+        "standing behind this one, so this round can afford to be "
+        + band + ". Push it: take the odder angle, follow the tangent "
+        "rather than the obvious line, let the caller be more specific "
+        "and more peculiar about whatever they have fixed on, and let "
+        "the material out of the documents come out further from where "
+        "anyone would expect it. This is not permission to be random or "
+        "to break character, and it is not permission to leave English "
+        "— it is permission to be interesting.\n")
+
+
 def box_rate_now(rate: float) -> float:
     """The speakbox rate, lifted toward certain as the queue deepens.
 
@@ -17349,6 +17441,21 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             entry["seconds"] = round(
                 float(entry.get("seconds") or 0)
                 + float((clip or {}).get("seconds") or 0), 1)
+        # #941: the working, stamped onto the round itself. The
+        # model-call ledger holds the temperature but it is a ring of
+        # forty — a round prepared an hour ago has long since lost its
+        # paperwork, which is exactly the round the operator wants to
+        # look at.
+        try:
+            _st = round_stats_take()
+            _st.update({"chunks": len(plan), "made": made,
+                        "turns": int(entry.get("prep_turns") or 0),
+                        "seconds": round(float(entry.get("seconds") or 0), 1)})
+            _was = dict(entry.get("stats") or {})
+            _was.update({k: v for k, v in _st.items() if v not in (None, "")})
+            entry["stats"] = _was
+        except Exception:  # noqa: BLE001
+            pass
         entry["prepared"] = made >= len(plan)
         # #872: a half-made round is PROGRESS, not a failure. Saying so
         # here is what lets the keeper come back to it and the panel show
@@ -17557,6 +17664,12 @@ async def prep_round(kind: str) -> bool:
     on the request line — with every line of it rendered into the pantry
     by the same larder_prepare the banter rounds use."""
     pile: list[dict[str, Any]] = []
+    # #941: how hard to push this one, decided before a word is
+    # written so ask_model and speakbox_quote both see it.
+    try:
+        round_mark(heat=caller_heat(kind), heat_road=str(kind))
+    except Exception:  # noqa: BLE001
+        pass
     if kind == "manager":
         await dj_manager_note(None, bank_to=pile)
     else:
@@ -18313,8 +18426,16 @@ async def pantry_keeper() -> None:
             # break, but it says nothing about what is BARE — and a road
             # with nothing behind it at all is the one that puts a hole
             # in the hour, whenever its entry happens to fall.
-            _coming = hour_short_kinds() + [
-                k for k in schedule_prep_order() if k not in _hour_short]
+            # #942: THE COORDINATOR'S ORDER FIRST. Same list as #934's
+            # bare shortfall, but sharpened by what actually bled air
+            # last half hour rather than by need alone — a road that ran
+            # dry once will run dry again at the same depth, so it is
+            # asked for more than it strictly owes.
+            _order = coord_order()
+            _coming = ([k for k in _order if k in _hour_short]
+                       + [k for k in _hour_short if k not in _order]
+                       + [k for k in schedule_prep_order()
+                          if k not in _hour_short and k not in _order])
             _board = list(_PREP_ROTA)
             _queue = _coming + [k for k in _board if k not in _coming]
             if _coming:
@@ -18649,6 +18770,300 @@ def schedule_adherence() -> dict[str, Any]:
     return out
 
 
+# --- THE COORDINATOR (#942 / #905) -----------------------------------
+# Dead air, measured and remembered; the half hour audited; the next
+# half hour's work written down and handed to the keeper.
+COORD_TICK = 15.0                       # how often it looks at the air
+COORD_GAP_FLOOR = 12.0                  # shorter than this is a breath
+COORD_GAPS_KEEP = 400
+COORD_HALVES_KEEP = 24                  # twelve hours of half hours
+COORD_PATH = data_path("coordinator.json")
+
+_GAPS: list[dict[str, Any]] = []        # closed gaps, newest last
+_GAP_OPEN: dict[str, Any] = {}          # the one happening now, if any
+_HALVES: list[dict[str, Any]] = []      # closed half-hour reports
+_COORD_PLAN: dict[str, Any] = {}        # the work order for the next half
+
+
+def _half_key(at: float | None = None) -> str:
+    """The half hour something falls in, as a sortable local key."""
+    lt = time.localtime(at if at is not None else time.time())
+    return time.strftime("%Y-%m-%dT%H", lt) + (":30" if lt.tm_min >= 30
+                                               else ":00")
+
+
+def coord_save() -> None:
+    try:
+        COORD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = COORD_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({
+            "gaps": _GAPS[-COORD_GAPS_KEEP:],
+            "halves": _HALVES[-COORD_HALVES_KEEP:],
+            "plan": _COORD_PLAN}))
+        tmp.replace(COORD_PATH)
+    except Exception:  # noqa: BLE001
+        pass                            # bookkeeping never takes the air
+
+
+def coord_load() -> None:
+    """#942: the books survive a restart, or every deploy erases the
+    very history the next hour is supposed to be planned from."""
+    try:
+        got = json.loads(COORD_PATH.read_text())
+        if not isinstance(got, dict):
+            return
+        _GAPS[:] = list(got.get("gaps") or [])[-COORD_GAPS_KEEP:]
+        _HALVES[:] = list(got.get("halves") or [])[-COORD_HALVES_KEEP:]
+        _COORD_PLAN.clear()
+        _COORD_PLAN.update(got.get("plan") or {})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def coord_air_sample() -> None:
+    """One look at the air. Opens a gap, or closes one.
+
+    #942: `silent_for` is INSTANTANEOUS — it resets the moment anything
+    airs, so a station with twenty two-minute holes in an hour reads
+    "silent for 3 seconds" at every single sample of it. Nothing was
+    measuring dead air; this is the thing that does."""
+    try:
+        if not _RADIO.get("on"):
+            _GAP_OPEN.clear()
+            return
+        now = time.time()
+        quiet = float(now - _BOX_LAST_OK[0])
+        if quiet >= COORD_GAP_FLOOR:
+            if not _GAP_OPEN:
+                slot = {}
+                try:
+                    slot = schedule_take() or {}
+                except Exception:  # noqa: BLE001
+                    slot = {}
+                _GAP_OPEN.update({
+                    "at": now - quiet,
+                    "kind": str(slot.get("kind") or ""),
+                    "label": str(slot.get("label") or slot.get("kind") or ""),
+                })
+            _GAP_OPEN["seconds"] = round(quiet, 1)
+            return
+        if _GAP_OPEN:
+            row = dict(_GAP_OPEN)
+            _GAP_OPEN.clear()
+            row["closed"] = now
+            row["half"] = _half_key(float(row.get("at") or now))
+            _GAPS.append(row)
+            del _GAPS[:-COORD_GAPS_KEEP]
+    except Exception:  # noqa: BLE001
+        _GAP_OPEN.clear()
+
+
+def coord_dead_air(half: str = "") -> dict[str, Any]:
+    """Dead air in one half hour (default: the one we are in)."""
+    half = half or _half_key()
+    out = {"half": half, "seconds": 0.0, "gaps": 0, "longest": 0.0,
+           "by_entry": {}}
+    try:
+        rows = [g for g in _GAPS if str(g.get("half")) == half]
+        if _GAP_OPEN and _half_key(float(_GAP_OPEN.get("at") or 0)) == half:
+            rows = rows + [dict(_GAP_OPEN)]
+        for g in rows:
+            secs = float(g.get("seconds") or 0)
+            out["seconds"] += secs
+            out["gaps"] += 1
+            out["longest"] = max(out["longest"], secs)
+            name = str(g.get("label") or g.get("kind") or "unnamed")
+            out["by_entry"][name] = round(
+                float(out["by_entry"].get(name) or 0) + secs, 1)
+        out["seconds"] = round(out["seconds"], 1)
+        out["longest"] = round(out["longest"], 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def coord_close_half(half: str) -> dict[str, Any]:
+    """Audit a half hour that has just ended."""
+    sched = {}
+    try:
+        sched = schedule_adherence()
+    except Exception:  # noqa: BLE001
+        sched = {}
+    report = {
+        "half": half,
+        "at": time.time(),
+        "dead": coord_dead_air(half),
+        "kept": int(sched.get("kept") or 0),
+        "missed": int(sched.get("missed") or 0),
+        "rate": sched.get("rate"),
+        "short": [],
+    }
+    try:
+        report["short"] = hour_short_kinds()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _HALVES.append(report)
+        del _HALVES[:-COORD_HALVES_KEEP]
+    except Exception:  # noqa: BLE001
+        pass
+    return report
+
+
+def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
+    """#942: THE WORK ORDER for the next half hour.
+
+    Every road the coming entries call for, costed against what it
+    already holds, ordered by how badly it is needed — and a road that
+    BLED DEAD AIR in the half hour just gone is asked for more than its
+    bare need, because a road that ran dry once will run dry again at
+    the same depth. That is the whole of "ensuring that the next hour
+    goes more smoothly than the previous hour": the plan is not derived
+    from the schedule alone, it is derived from the schedule AND from
+    what actually went wrong."""
+    plan: dict[str, Any] = {"at": time.time(), "half": _half_key(),
+                            "tasks": [], "why": ""}
+    try:
+        report = report or (_HALVES[-1] if _HALVES else {})
+        bled = dict((report.get("dead") or {}).get("by_entry") or {})
+        needs = hour_needs() or {}
+        # Name -> road, so a bleeding ENTRY can be charged to the road
+        # that fills it.
+        by_label: dict[str, str] = {}
+        try:
+            store = schedule_read()
+            preset = schedule_preset_now(store)
+            for slot in ((store.get("presets") or {}).get(preset) or []):
+                road = str(SCHED_PREP_KIND.get(str(slot.get("kind") or ""))
+                           or slot.get("kind") or "")
+                by_label[str(slot.get("label")
+                             or slot.get("kind") or "")] = road
+        except Exception:  # noqa: BLE001
+            pass
+        hurt: dict[str, float] = {}
+        for name, secs in bled.items():
+            road = by_label.get(name) or ""
+            if road:
+                hurt[road] = float(hurt.get(road) or 0) + float(secs or 0)
+        for road, row in needs.items():
+            owed = float(row.get("owed") or 0)
+            held = float(row.get("held") or 0)
+            rows = float(row.get("rows") or 0)
+            cap = max(1.0, float(row.get("cap") or 1))
+            if rows >= cap:
+                continue                # full; wanting more is a loop
+            gap = owed - held
+            # A road that bled gets asked for the dead air back on top.
+            extra = float(hurt.get(road) or 0)
+            want = gap + extra
+            if want <= 0:
+                continue
+            cost = 0.0
+            try:
+                cost = float(task_cost(road) or 0)
+            except Exception:  # noqa: BLE001
+                cost = 0.0
+            plan["tasks"].append({
+                "road": road,
+                "label": SHELF_LABEL.get(road, road),
+                "want_seconds": round(want, 1),
+                "held_seconds": round(held, 1),
+                "owed_seconds": round(owed, 1),
+                "bled_seconds": round(extra, 1),
+                "estimate_seconds": round(cost, 1),
+                "why": ("it bled " + str(int(extra)) + "s of dead air last "
+                        "half hour and is still " + str(int(gap)) + "s short"
+                        if extra > 0 else
+                        "it is " + str(int(gap)) + "s short of what the "
+                        "coming entries call for"),
+            })
+        # Worst first: what bled, then what is shortest.
+        plan["tasks"].sort(key=lambda t: (-float(t["bled_seconds"]),
+                                          -float(t["want_seconds"])))
+        dead = (report.get("dead") or {})
+        plan["why"] = (
+            "last half hour lost " + str(int(float(dead.get("seconds") or 0)))
+            + "s of air across " + str(int(dead.get("gaps") or 0))
+            + " gap(s), longest " + str(int(float(dead.get("longest") or 0)))
+            + "s; the sheet kept " + str(int(report.get("kept") or 0))
+            + " and missed " + str(int(report.get("missed") or 0)))
+        _COORD_PLAN.clear()
+        _COORD_PLAN.update(plan)
+    except Exception:  # noqa: BLE001
+        pass
+    return plan
+
+
+def coord_order() -> list[str]:
+    """The roads the coordinator wants worked, in its order."""
+    try:
+        return [str(t.get("road")) for t in (_COORD_PLAN.get("tasks") or [])
+                if t.get("road")]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def coordinator_state() -> dict[str, Any]:
+    """Everything the coordinator knows, for the glass."""
+    out: dict[str, Any] = {}
+    try:
+        now = coord_dead_air()
+        out = {
+            "half": _half_key(),
+            "now": now,
+            "open_gap": (round(float(_GAP_OPEN.get("seconds") or 0), 1)
+                         if _GAP_OPEN else 0.0),
+            "plan": dict(_COORD_PLAN),
+            "halves": list(_HALVES[-6:])[::-1],
+            # The one number the operator asked for: how much of this
+            # half hour has been silence.
+            "dead_share": round(min(1.0, float(now.get("seconds") or 0)
+                                    / 1800.0), 4),
+        }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+async def coordinator() -> None:
+    """#942/#905: the living, breathing part.
+
+    Looks at the air every fifteen seconds, closes the books when a half
+    hour ends, and writes the next half hour's work order from what
+    actually happened rather than from the plan alone. Never raises: a
+    planner that can take the station off air is worse than no
+    planner."""
+    coord_load()
+    seen = _half_key()
+    since = time.time()
+    while True:
+        await asyncio.sleep(COORD_TICK)
+        try:
+            coord_air_sample()
+            here = _half_key()
+            if here != seen:
+                report = coord_close_half(seen)
+                plan = coord_plan(report)
+                pipeline_log(
+                    "lookahead",
+                    "the coordinator closed " + seen + " - "
+                    + str(plan.get("why") or "")
+                    + " - next: "
+                    + (", ".join(str(t.get("label"))
+                                 for t in (plan.get("tasks") or [])[:4])
+                       or "nothing outstanding") + " (#942)")
+                coord_save()
+                seen = here
+            elif time.time() - since > 120:
+                # Keep the order fresh inside the half hour too, so a
+                # road that empties at :10 is not ignored until :30.
+                since = time.time()
+                coord_plan(_HALVES[-1] if _HALVES else {})
+                coord_save()
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(5)      # the show never waits on the books
+
+
 def hour_needs() -> dict[str, dict[str, float]]:
     """Per preparing road: seconds the coming hours owe it, and seconds
     it is holding.
@@ -18778,6 +19193,9 @@ def dialogue_flow_state() -> dict[str, Any]:
         # #937: is the running order actually being kept, and which
         # entry owns the air this moment with its own clock against it.
         "schedule": schedule_adherence(),
+        # #942/#905: dead air measured and remembered, the half hour
+        # audited, and the next half hour's work order.
+        "coordinator": coordinator_state(),
         "hour_needs": hour_needs(),
         "hour_short": hour_short_kinds(),
         "prepared_seconds": prepared_seconds(),
@@ -19359,6 +19777,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(storage_keeper()))   # #836
     _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
     _RADIO_TASK.append(asyncio.create_task(pantry_keeper()))        # #886
+    _RADIO_TASK.append(asyncio.create_task(coordinator()))          # #942
     _RADIO_TASK.append(asyncio.create_task(tape_watch()))
     tape_warmer()                      # the shelf normalizes itself (#242)
     remember_radio(True, _RADIO["station"])
@@ -23192,6 +23611,10 @@ async def shelf_transcript(kind: str, sid: str) -> dict[str, Any]:
     out["script"] = str(entry.get("script") or "")
     out["caller_name"] = str(entry.get("caller_name") or "")
     out["turns"] = int(entry.get("prep_turns") or 0)
+    # #941: the four figures asked for at the top of every call —
+    # temperature, speakbox seeding, crystal tinting, chunks used — plus
+    # what they were derived from, so the number can be argued with.
+    out["stats"] = dict(entry.get("stats") or {})
     takes = list(entry.get("takes") or [])
     if takes:
         takes.sort(key=lambda t: int(t.get("i") or 0))
@@ -23279,6 +23702,111 @@ async def shelf_bundle_api(
         _BUNDLES.clear()
     _BUNDLES[kind + ":" + sid] = dict(row)
     return row
+
+
+async def regenerate_job(job: str, kind: str, sid: str, insanity: float,
+                         note: str, promote: bool) -> None:
+    """#941: write another of this section, hotter. Never raises."""
+    made = 0
+    fresh: list[str] = []
+    started = time.time()
+    try:
+        while True:
+            window = alt_window()
+            if window and not prep_should_stop():
+                break
+            if time.time() - started > ALT_GEN_WAIT:
+                alt_job_put(job, state="gave up", made=0, new=[],
+                            why="no quiet stretch came free — the live "
+                                "round had the room the whole time")
+                return
+            alt_job_put(job, state="waiting", made=0, new=[],
+                        why=(prep_should_stop()
+                             or "waiting for a record or a break"))
+            await asyncio.sleep(3)
+        alt_job_put(job, state="writing", made=0, new=[], window=window,
+                    why="")
+        before = {alt_sid(kind, r) for r in alt_candidates(kind)}
+        # The forced dial, for this write only. caller_heat() gives a
+        # forced value outright, and round_mark is keyed by THIS task, so
+        # nothing else being written at the same time is affected.
+        round_mark(heat=max(0.0, min(1.0, float(insanity))),
+                   heat_forced=max(0.0, min(1.0, float(insanity))),
+                   heat_road=str(kind), regenerated_from=str(sid),
+                   operator_note=str(note or "")[:400])
+        _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+        try:
+            road = alt_prep_road(kind)
+            ok = bool(await prep_measure(kind, road)) if road else False
+        finally:
+            _PREP_DEADLINE[0] = 0.0
+        after = {alt_sid(kind, r) for r in alt_candidates(kind)}
+        fresh = sorted(after - before)
+        made = 1 if (ok or fresh) else 0
+        # #941: "stacked higher, which means it is more likely to be
+        # used" — the new one goes ABOVE the one it was made from.
+        if promote and fresh:
+            try:
+                for row in list(_SHELF.get(kind) or []):
+                    if alt_sid_of(kind, row) in fresh:
+                        row["priority"] = int(row.get("priority") or 0) + 5
+            except Exception:  # noqa: BLE001
+                pass
+        alt_job_put(job, state="done" if made else "refused", made=made,
+                    new=fresh, why="" if made else "the road produced "
+                                                   "nothing this pass")
+        note_action(f"\U0001f501 a hotter {SHELF_LABEL.get(kind, kind)} "
+                    f"was written on request (#941)")
+    except Exception as exc:  # noqa: BLE001
+        alt_job_put(job, state="failed", made=made, new=fresh,
+                    why=f"{type(exc).__name__}: {exc}"[:180])
+        try:
+            _PREP_DEADLINE[0] = 0.0
+        except Exception:  # noqa: BLE001
+            pass
+
+
+@app.post("/api/shelf/regenerate")
+async def shelf_regenerate_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#941: SEND IT BACK FOR ANOTHER, HOTTER.
+
+    {"kind": "caller", "id": "caller-...", "insanity": 0.0..1.0,
+     "note": "...", "promote": true, "drop": false}
+
+    Writes another down the same road the keeper uses, with the dial
+    forced for that one write. `promote` stacks the new one above the
+    one it came from; `drop` throws the original away once the new one
+    lands is deliberately NOT offered — the operator can bin it by hand
+    after hearing both, and a regeneration that silently deleted its
+    own source would be the one thing that cannot be undone."""
+    require_auth(authorization)
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected an object")
+    kind = str(payload.get("kind") or "").strip()[:24]
+    if kind not in ALT_PREP_KINDS:
+        raise HTTPException(
+            status_code=400,
+            detail=(f"there is no preparing road for {kind!r} — "
+                    + (CANNOT_PREPARE.get(kind)
+                       or "nothing on the board writes that ahead")))
+    sid = str(payload.get("id") or "").strip()[:64]
+    try:
+        insanity = max(0.0, min(1.0, float(payload.get("insanity", 0.7))))
+    except (TypeError, ValueError):
+        insanity = 0.7
+    job = uuid.uuid4().hex[:12]
+    alt_job_put(job, kind=kind, count=1, state="queued", made=0, new=[],
+                why="", insanity=insanity, source=sid)
+    asyncio.create_task(regenerate_job(
+        job, kind, sid, insanity, str(payload.get("note") or ""),
+        bool(payload.get("promote", True))))
+    return {"job": job, "kind": kind, "insanity": insanity,
+            "label": SHELF_LABEL.get(kind, kind),
+            "watch": f"/api/schedule/segment/generate/{job}"}
 
 
 @app.get("/api/pantry/table")
@@ -27976,6 +28504,12 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                       if any(x["id"] == m for x in speakbox_minds())]
             if _minds and random.random() < _p:
                 rid = random.choice(_minds)
+                # #941: the tinting, written down — "crystal tinting" is
+                # one of the four figures the operator asked to see at
+                # the top of every call.
+                round_mark(crystal=str(_cr.get("name") or ""),
+                           crystal_strength=int(_cr.get("strength") or 0),
+                           crystal_mind=str(rid))
                 pipeline_log("speakbox", "the swath comes from the "
                              f"{_cr.get('name')} crystal ({rid}) — the "
                              "universe is tinted (#834)")
@@ -28078,6 +28612,13 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                         "marked heard and will not repeat until the "
                         "shelf runs dry."))
             _crystal_influence_note(key, doc.name, " ".join(lines))
+            # #941: which document, how many lines, and how hard the box
+            # was being pushed when this swath was drawn.
+            round_mark(seed_file=doc.name, seed_lines=len(lines),
+                       seed_chars=len(" ".join(lines)),
+                       seed_mind=str(key or ""),
+                       seed_depth=round(_depth, 3),
+                       seed_most=int(most), seed_cap=int(cap))
             return {"file": doc.name, "text": " ".join(lines),
                     "lines": lines, "mind": key}
         if exhausted is None and gems:
@@ -40887,9 +41428,26 @@ async def ask_model(prompt: str, limit: int = 300,
     # round that comes out odd costs nothing but itself. A cold shelf
     # gets none of this; the bonus is zero at zero depth.
     _hot = 0.30 * box_depth()
-    temperature = min(1.2, float(settings["temperature"])
+    # #941: and the road's own heat on top, so a sixth stacked caller is
+    # written looser than the first. Randomised inside the band rather
+    # than set to it — "randomizes the temperature of the customer on
+    # further calls" — so two hot rounds are not hot in the same way.
+    _heat = 0.0
+    try:
+        _heat = float((_ROUND_MARK.get(_mark_key()) or {}).get("heat") or 0)
+    except Exception:  # noqa: BLE001
+        _heat = 0.0
+    temperature = min(1.35, float(settings["temperature"])
                       + (random.uniform(0.0, spice) if spice else 0.0)
-                      + (random.uniform(0.0, _hot) if _hot > 0.02 else 0.0))
+                      + (random.uniform(0.0, _hot) if _hot > 0.02 else 0.0)
+                      + (random.uniform(0.0, 0.35 * _heat)
+                         if _heat > 0.02 else 0.0))
+    # #941: the paperwork, at the moment it is true.
+    round_mark(temperature=round(temperature, 3),
+               model=str(settings.get("model") or ""),
+               spice=round(float(spice or 0), 3),
+               box_depth=round(box_depth(), 3),
+               heat=round(_heat, 3))
     max_tokens = max(settings["max_tokens"], limit // 2 + 40)
     pipeline_log("model", f"{settings['model']} writing · "
                           f"budget {limit} chars · temp {temperature:.2f}",
@@ -40897,6 +41455,17 @@ async def ask_model(prompt: str, limit: int = 300,
                         f"temp {temperature:.2f} · {max_tokens} tokens · "
                         f"ctx {settings['num_ctx']} · "
                         f"top_p {settings['top_p']}:\n{prompt}"))
+    # #941: and the writer is TOLD. One place, so every road that
+    # writes ahead gets it — the caller, the memo, the painting round —
+    # rather than each having to remember. Only rounds a preparer has
+    # marked carry any heat at all, so nothing on the live path changes.
+    if _heat > 0.34:
+        try:
+            prompt = str(prompt) + heat_clause(_heat, str(
+                (_ROUND_MARK.get(_mark_key()) or {}).get("heat_road")
+                or "caller"))
+        except Exception:  # noqa: BLE001
+            pass
     result = await call_ollama(
         model=settings["model"],
         messages=[{"role": "user", "content": prompt}],
