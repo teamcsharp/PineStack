@@ -28,7 +28,15 @@ const ROUTES = {
   // re-point the core DEVICE at the retired pine satellite. They
   // leave voice_device alone; only box/nabu name a device.
   web: { label: "Web page", music: "here", voice: "here", reply: "here", box_talk: false },
-  app: { label: "Application", music: "off", voice: "here", reply: "here", box_talk: false },
+  // #979: APPLICATION MEANS ALL OF IT, HERE. music was "off" - the same
+  // literal the note below records as the reason the Nabu speaker "sat
+  // silent between rounds", left in place on this route. The app played
+  // music itself through its own clock-synced player, so the setting was
+  // survivable; but it also meant the STATION was producing no music for
+  // this route at all, and the moment anything relied on the page feed
+  // there was nothing in it. Application now asks for the whole
+  // broadcast - the music, the DJs and the replies - out of one place.
+  app: { label: "Application", music: "here", voice: "here", reply: "here", box_talk: false },
   // #786: Nabu is the CORE broadcast device — broadcasting to it means the
   // WHOLE station: music and the DJ voice both. music "off" here was why
   // the speaker sat silent between rounds.
@@ -38,7 +46,7 @@ const ROUTES = {
 const EMBEDDED_ROUTES = {
   box: { djOutput: "box", djVoiceOut: "box", djReplyOut: "box" },
   web: { djOutput: "here", djVoiceOut: "here", djReplyOut: "here" },
-  app: { djOutput: "off", djVoiceOut: "here", djReplyOut: "here" },
+  app: { djOutput: "here", djVoiceOut: "here", djReplyOut: "here" },  // #979
   nabu: { djOutput: "nabu", djVoiceOut: "nabu", djReplyOut: "nabu" }
 };
 
@@ -180,8 +188,27 @@ function appVolumeScript(audible = true) {
   })();`;
 }
 
+/* #979: is the broadcast being sent HERE, to this application? */
+function routeIsHere() {
+  const route = ROUTES[desiredBroadcast];
+  if (!route) return false;
+  return route.music === "here" || route.voice === "here"
+    || route.reply === "here";
+}
+
 function audibleFrame() {
-  if (!boothMonitor) return null;
+  /* #979: THE MONITOR SWITCH IS FOR LISTENING IN, NOT FOR LISTENING.
+   *
+   * "Tune booth audio" exists so you can hear the show while it is going
+   * out of the BOX - it is a monitor. But it gated the frame's live audio
+   * unconditionally, so choosing Application, which routes the whole
+   * broadcast to this app, still left the DJs muted until you separately
+   * ticked a monitor switch. The app was being asked to monitor itself.
+   *
+   * When the route sends audio HERE, this app is the broadcast and its
+   * frame is audible. The switch keeps its real job: hearing the booth
+   * while the show is on the box. */
+  if (!boothMonitor && !routeIsHere()) return null;
   return activeFrame() || ($("controlFrame")?.src ? $("controlFrame") : null)
     || ($("radioFrame")?.src ? $("radioFrame") : null);
 }
@@ -285,8 +312,9 @@ function routeKeyFromState(status) {
 
 function routeLabelFromState(routing) {
   if (!routing) return "unknown";
+  // #979: app no longer means "music off" — music here IS the app.
   const music = routing.music_to === "here" || (
-    routing.music_to === "off" && (desiredBroadcast === "nabu" || desiredBroadcast === "app")
+    routing.music_to === "off" && desiredBroadcast === "nabu"
   ) ? "app" : routing.music_to;
   const voice = (routing.voice_device === "nabu"
       || (!routing.voice_device && routing.voice_to === "box" && routing.music_to === "here"))
@@ -349,7 +377,12 @@ function syncEmbeddedBroadcast(key) {
 }
 
 function desktopPlayerEnabled() {
-  return desiredBroadcast === "nabu" || desiredBroadcast === "app";
+  /* #979: the shell's own clock-synced player is for routes where the
+   * page feed carries NO music - broadcasting to the box, and wanting to
+   * hear the record here anyway. Now that Application asks the station
+   * for music on the page feed, running this as well would play the
+   * record twice, a few hundred milliseconds apart. */
+  return desiredBroadcast === "nabu";
 }
 
 function desktopMusicUrl(url) {
@@ -808,6 +841,11 @@ async function setBroadcastTarget(key) {
   try {
     await api.post("/api/dj/output", route);
     syncEmbeddedBroadcast(key);
+    // #979: "immediately" - the frame's audio gate is derived from the
+    // route, so re-apply it now rather than leaving it until the next
+    // volume change or reload. Without this, choosing Application was
+    // silent until something else happened to nudge it.
+    try { applyAppVolume(); } catch (err) { /* the route still changed */ }
     if (key === "box" || key === "nabu") {
       await api.post("/api/pinebox/initialize", { speak: key === "box" });
     }
