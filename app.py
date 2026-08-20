@@ -5833,10 +5833,50 @@ async def ha_restart_container() -> bool:
 # DISTINCT from the stall path (#712): there the link is ALIVE and a
 # restart severs a live stream mid-clip — here the entity is unavailable,
 # nothing is streaming, and a restart severs nothing.
-# The Voice PE's real address — HA's esphome config entry says 10.89.1.161
-# (verified 2026-08-17; .205 is a DIFFERENT device that also pings, which
-# would have made the ladder call a dead Nabu "alive").
+# The Voice PE's address. This WAS a frozen literal, and freezing it is
+# what eventually took the station off the air (#973).
+#
+# The note that used to live here said HA's esphome config entry gave
+# 10.89.1.161, verified 2026-08-17, and warned that .205 was a different
+# device that also pings. On 2026-08-20 the station was silent for hours
+# with "selected satellite is unavailable", and the wire told a different
+# story: .161 answered nothing and had no ARP entry at all, while .205
+# answered with MAC b4:0e:cf:2a:89:5f — which is SATELLITE_MAC, the
+# station's own device. DHCP had moved it.
+#
+# The damage was not the wrong address; it was what the wrong address
+# MEANT. _wire_probe returning "dark" is the switch that separates
+# "session wedged, escalate" from "the operator turned the box off,
+# stand down" — so every rung of the self-healing ladder concluded the
+# box had been switched off deliberately and stood down. The station sat
+# there declining to fix itself, correctly, on a false premise.
+#
+# So the probe asks the wire about EVERY address the device might be at,
+# best first, and an answer from any of them is the device being alive.
+# The env var still wins when set, because an operator naming an address
+# is better evidence than anything guessed.
 NABU_PROBE_HOST = os.getenv("NABU_PROBE_HOST", "10.89.1.161")
+
+
+def nabu_probe_hosts() -> list[str]:
+    """#973: every address worth asking, best evidence first.
+
+    SATELLITE_HOST is whatever Home Assistant currently believes, which
+    is the closest thing to authority there is — it is the address HA is
+    actually trying to talk to. It is consulted lazily rather than at
+    import time because it is defined far below this point in the file."""
+    out: list[str] = []
+    for candidate in (os.getenv("NABU_PROBE_HOST", "").strip(),
+                      str(globals().get("SATELLITE_HOST") or "").strip(),
+                      NABU_PROBE_HOST):
+        one = str(candidate or "").strip()
+        # An HA host may carry a port or a scheme; the wire wants neither.
+        if "://" in one:
+            one = one.split("://", 1)[1]
+        one = one.split("/", 1)[0].split(":", 1)[0].strip()
+        if one and one not in out:
+            out.append(one)
+    return out
 NABU_LINK_ESCALATION = os.getenv(
     "NABU_LINK_ESCALATION", "1").lower() in ("1", "true", "yes", "on")
 REPAIR_STAMPS_PATH = data_path("repair_stamps.json")
@@ -5879,16 +5919,18 @@ async def nabu_device_alive() -> bool:
     switch that separates "session wedged, escalate" from "the operator
     turned the box off, stand down"."""
     def probe() -> bool:
+        # #973: every candidate address, not one frozen literal.
         import socket as _socket
-        for port in (6053, 80, 3232):
-            try:
-                s = _socket.create_connection((NABU_PROBE_HOST, port), 3)
-                s.close()
-                return True
-            except ConnectionRefusedError:
-                return True
-            except OSError:
-                continue
+        for one in nabu_probe_hosts():
+            for port in (6053, 80, 3232):
+                try:
+                    s = _socket.create_connection((one, port), 3)
+                    s.close()
+                    return True
+                except ConnectionRefusedError:
+                    return True
+                except OSError:
+                    continue
         return False
     try:
         return await asyncio.to_thread(probe)
@@ -6491,26 +6533,53 @@ async def _startup_onair_watchdog() -> None:
     fire_and_forget(onair_watchdog())
 
 
-async def _wire_probe(host: str) -> str:
+async def _wire_probe(host: str = "") -> str:
     """What the DEVICE ITSELF says on the wire: 'alive' (a port answered
     or refused — something is home), or 'dark' (nothing at all — power
-    or Wi-Fi, and no software can reach it)."""
+    or Wi-Fi, and no software can reach it).
+
+    #973: asks every address the device might be at rather than one
+    frozen literal. `host` is still honoured and still tried first, so
+    every existing call site behaves as it did whenever the address it
+    passes is right — it simply no longer says "dark" when the box has
+    only moved."""
     def probe() -> str:
         import socket as _socket
-        for port in (6053, 80, 3232):
-            try:
-                s = _socket.create_connection((host, port), 3)
-                s.close()
-                return "alive"
-            except ConnectionRefusedError:
-                return "alive"
-            except OSError:
+        tried: list[str] = []
+        for candidate in ([host] if host else []) + nabu_probe_hosts():
+            one = str(candidate or "").strip()
+            if not one or one in tried:
                 continue
+            tried.append(one)
+            for port in (6053, 80, 3232):
+                try:
+                    s = _socket.create_connection((one, port), 3)
+                    s.close()
+                    return "alive"
+                except ConnectionRefusedError:
+                    return "alive"
+                except OSError:
+                    continue
         return "dark"
     try:
         return await asyncio.to_thread(probe)
     except Exception:  # noqa: BLE001
         return "dark"
+
+
+async def nabu_wire_report() -> dict[str, Any]:
+    """#973: which of the candidate addresses is actually answering.
+
+    The outage this fixes was invisible precisely because nothing ever
+    said WHICH address had been asked. Now the panel and the log can."""
+    out: dict[str, Any] = {"hosts": [], "alive": "", "configured":
+                           NABU_PROBE_HOST}
+    for one in nabu_probe_hosts():
+        state = await _wire_probe(one)
+        out["hosts"].append({"host": one, "state": state})
+        if state == "alive" and not out["alive"]:
+            out["alive"] = one
+    return out
 
 
 _BOX_VIGIL_ON = [False]
