@@ -31135,8 +31135,22 @@ async def dj_hawk_round(names: list[str], moods: list[str],
         + (f" Somewhere in it one of you drops this, word for word, as "
            f"though it explains the art: \"{seed['text']}\"" if seed else ""))
     began = time.time()
+    # #977: the brief above says "the person on the other end is a real
+    # presence in this: they answer back", and then this call passed no
+    # caller_name - so there was no 'C: ...' marker in the format line and
+    # no third person in the round. The buyer is drawn and named, the same
+    # omission as the call-in road above.
+    _buyer = ""
+    _buyer_voice = ""
+    try:
+        _buyer = random.choice(caller_names())
+        _buyer_voice = await caller_line_voice(_buyer)
+    except Exception:  # noqa: BLE001
+        _buyer, _buyer_voice = "", ""
     lines = await dj_banter(None, angle=angle, lines=12,
-                            source=(seed or {}).get("file", ""))
+                            source=(seed or {}).get("file", ""),
+                            caller_name=_buyer,
+                            caller_voice=_buyer_voice)
     gallery_line_mark([n for n, _ in pieces], began)
     if lines and seed:
         speakbox_remember(seed)
@@ -36127,11 +36141,51 @@ def quota_stamp(kind: str) -> None:
         pass                    # a counter never takes the show down
 
 
+def quota_sheet_room(kind: str) -> int:
+    """#977: how many of this kind the RUNNING ORDER can actually supply.
+
+    The dial says how many an hour the operator wants. The sheet decides
+    how many the hour can hold, and the two had never been introduced:
+    caller_per_hour is 5 while the canonical hour carries four caller-road
+    entries (two `caller`, two `banter_caller`, which SCHED_PREP_KIND maps
+    onto the same road). So the fifth call had nowhere to happen, the
+    counter sat permanently behind, and being permanently behind is one of
+    the things that forces the preparer onto the dearest road on the
+    board — a deficit that could never be closed, spending real engine
+    time every hour trying.
+
+    Returns 0 when there is no sheet to read, which the caller treats as
+    "no opinion" rather than as "no room"."""
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return 0
+        name = schedule_preset_now(store)
+        slots = [x for x in ((store.get("presets") or {}).get(name) or [])
+                 if x.get("enabled", True)]
+        seen = 0
+        for slot in slots:
+            one = str(slot.get("kind") or "")
+            if str(SCHED_PREP_KIND.get(one) or one) == str(kind):
+                seen += 1
+        return seen
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 def quota_target(kind: str, dj: dict[str, Any] | None = None) -> int:
-    """How many an hour the operator has asked for. 0 = the dial is off."""
+    """How many an hour the operator has asked for. 0 = the dial is off.
+
+    #977: clamped to what the sheet can supply. A target the running order
+    cannot reach is not a target, it is a permanent deficit — and one that
+    the coordinator answers by forcing this road for ever. The dial itself
+    is untouched; quota_state reports both numbers so the panel can say
+    "5 asked, 4 on the sheet" rather than "behind" every hour of its life."""
     try:
         row = dj if isinstance(dj, dict) else dj_settings()
-        return max(0, min(12, int(row.get(f"{kind}_per_hour") or 0)))
+        want = max(0, min(12, int(row.get(f"{kind}_per_hour") or 0)))
+        room = quota_sheet_room(kind)
+        return min(want, room) if (want and room) else want
     except Exception:  # noqa: BLE001
         return 0
 
@@ -36211,9 +36265,15 @@ def quota_state() -> dict[str, Any]:
             ring = _quota_ring(kind)
             target = quota_target(kind, dj)
             last = float(ring[-1]) if ring else 0.0
+            # #977: both numbers, so a clamp is visible rather than felt.
+            _asked = max(0, min(12, int(dj.get(f"{kind}_per_hour") or 0)))
+            _room = quota_sheet_room(kind)
             out[str(kind)] = {
                 "aired": len(ring),
                 "target": target,
+                "asked": _asked,
+                "sheet_room": _room,
+                "clamped": bool(_asked and _room and _room < _asked),
                 "behind": quota_behind(kind, dj),
                 "due": quota_due(kind, dj),
                 "since": round(time.time() - last, 1) if last else None,
@@ -36514,7 +36574,28 @@ async def dj_callin(topic: str, caller: str = "") -> dict[str, Any]:
         "ts": int(time.time()), "who": "host", "kind": "callin",
         "text": f"Call-in: {topic}",
     })
-    lines = await dj_banter(_RADIO.get("now"), angle=angle, lines=5)
+    # #977: THIS ROAD ANNOUNCED A CALLER AND THEN WROTE A TWO-HANDER.
+    #
+    # It draws a line number, posts the banner, draws a hang-up rule and
+    # writes the ledger row - everything a call does - and then called
+    # dj_banter with no caller_name at all. With that empty, the FORMAT
+    # line never names the 'C: ...' marker and the whole COMPLETE PHONE
+    # CALL briefing collapses to an empty string, so the model is told in
+    # as many words that this round has two speakers and it writes two.
+    # The person who rang is talked ABOUT and never talked TO, which is
+    # the report exactly.
+    #
+    # Naming them fixes the voice for free: _turn_voice returns None for a
+    # nameless caller and degrades to the engine default, which is the
+    # host's own voice, and the #913 voice rescue is gated behind a
+    # non-empty caller_name so it never ran either.
+    _cvoice = ""
+    try:
+        _cvoice = await caller_line_voice(who)
+    except Exception:  # noqa: BLE001
+        _cvoice = ""
+    lines = await dj_banter(_RADIO.get("now"), angle=angle, lines=5,
+                            caller_name=who, caller_voice=_cvoice)
     call_ended(who, line_say, started, rule, len(lines or []))
     return {
         "lines": lines, "topic": topic, "caller": who,
@@ -39072,6 +39153,59 @@ def call_log_add(entry: dict[str, Any]) -> None:
     del ring[:-40]
 
 
+# #977: ONE LINE, ONE CALLER.
+#
+# There was no mutex anywhere on the call roads, and two calls being live
+# at once is not a rare race - it was measured on the air: Doreen was on
+# from 18:50:57 to 19:03:46 and William Bell from 18:51:56 to 18:58:52,
+# both live for 416 seconds. Every "caller" line a listener heard during
+# Doreen's first 453 seconds was actually William Bell answering a
+# question Doreen had not asked. That is precisely the report - "the
+# customers never talk or get queried into, so it is a conversation that
+# doesn't make sense" - and no amount of fixing the WRITING would have
+# touched it, because each call was written correctly and they were
+# simply interleaved on the way out.
+#
+# A timestamp rather than a bare flag, so a call road that dies without
+# reaching its hang-up cannot wedge the phone shut for ever. Nothing here
+# ever waits: a second call defers and comes back on the next pass, which
+# keeps the round supervisor free.
+_CALL_LIVE: dict[str, Any] = {"who": "", "at": 0.0}
+CALL_LINE_STALE = 900.0                 # a call cannot outlive this
+
+
+def call_line_busy() -> str:
+    """#977: who is on the line right now, or "" if the phone is free."""
+    try:
+        who = str(_CALL_LIVE.get("who") or "")
+        if not who:
+            return ""
+        if time.time() - float(_CALL_LIVE.get("at") or 0) > CALL_LINE_STALE:
+            _CALL_LIVE.update({"who": "", "at": 0.0})
+            return ""
+        return who
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def call_line_take(who: str) -> bool:
+    """Pick up the phone for `who`. False when somebody else already has."""
+    try:
+        if call_line_busy():
+            return False
+        _CALL_LIVE.update({"who": str(who or "a caller"), "at": time.time()})
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def call_line_free() -> None:
+    try:
+        _CALL_LIVE.update({"who": "", "at": 0.0})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def call_ended(name: str, line_say: str, started: float,
                rule: dict[str, Any], turns: int, state: str = "") -> None:
     """The end of a call, marked in the booth and written to the ledger
@@ -39079,6 +39213,10 @@ def call_ended(name: str, line_say: str, started: float,
     something that stops scrolling: it ends at a stated time, after a
     stated length, for a stated reason you can click."""
     ended = time.time()
+    # #977: the phone is free again the moment the call is over, whatever
+    # the outcome was. Every call road ends here, which is why the release
+    # lives here rather than in each of them.
+    call_line_free()
     ran = max(0.0, ended - started)
     outcome = str(rule.get("text") or "")
     short = " ".join(outcome.split())
@@ -40030,6 +40168,15 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     telephone crush — in a random state, driven by the DJs, who inquire, dig,
     joke, and land the caller happy or furious as the dice decide (#236,
     #237)."""
+    # #977: if somebody is already on the line, this call does not happen
+    # now. A return, never a wait - blocking here would hold the round
+    # supervisor open while the other call runs.
+    _busy = call_line_busy()
+    if _busy:
+        pipeline_log("call", f"a second call stood down — {_busy} is "
+                             "already on the line (#977)")
+        return {"caller": "", "lines": [], "state": "deferred",
+                "why": f"{_busy} is already on the line"}
     dj = dj_settings()
     rows = read_callers()
     # A NAMED ring still inside its 25-minute cooldown is demoted to a normal
@@ -40708,6 +40855,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         + approach_clause(approach_pick())                     # #752
     )
     call_started = time.time()
+    call_line_take(str(caller["name"]))               # #977: one line, one caller
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "call",
         "text": f"On {line_say}: {caller['name']}",
@@ -40741,7 +40889,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # laughter is a longer thing, and cramming it into nine is how you get
     # an arc that is announced rather than played.
     lines = await dj_banter(_RADIO.get("now"), angle=angle,
-                            lines=14 if hostile else 9,
+                            # #977: SIZED TO THE SLOT. This was a literal,
+                            # and it is the only length control this road
+                            # has - so its calls ran 1.5x to 2.9x the
+                            # minutes their entry owns (measured: 702s and
+                            # 433s against 240s; 446s against 300s). An
+                            # overrunning call does not just run long, it
+                            # eats the entry behind it, and the entry
+                            # behind a call is very often another call.
+                            # call_turns_for_slot is the same helper
+                            # dj_caller already uses; the floor of nine
+                            # keeps the seven-beat arc #750 argues for.
+                            lines=max(9, call_turns_for_slot() + (
+                                5 if hostile else 0)),
                             caller_name=caller["name"], caller_voice=third,
                             caller_fx=caller_fx,
                             caller2_name=duo_name, caller2_voice=duo_voice,
@@ -40789,6 +40949,22 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # #854: the book counts what AIRED, not what was written — a round
     # that came back empty must not be marked as a case that went out.
     if lines:
+        # #977: AND THE HOUR COUNTS IT. This road airs complete phone
+        # calls - it is what both "Call with banter" entries of the
+        # canonical hour run on, plus the phone clock, the theme ring and
+        # both ring endpoints - and in 780 lines it never once stamped the
+        # quota. Only dj_caller did, three lines like these away.
+        #
+        # Measured on the live station before this line existed: four
+        # call-road rounds aired in the hour (702s, 433s, 446s, 374s) and
+        # quota.caller read 2 of 5. The last stamp landed exactly at the
+        # end of the one `caller`-kind round; both banter_caller rounds
+        # finished after it and moved the counter by nothing. The station
+        # was taking calls and then reporting itself behind on calls,
+        # which is the whole of "they're not meeting the quota" - and
+        # being permanently behind is also what kept forcing the preparer
+        # onto the dearest road on the board.
+        quota_stamp("caller")
         case_aired(str(call_case.get("id") or ""))
     return {"caller": caller["name"], "lines": lines, "state": state,
             "voice": mangle, "hangup": str(outcome),
@@ -40845,6 +41021,7 @@ async def dj_call_scripted(name: str, script: list[str]) -> dict[str, Any]:
         + "Then back to the music. "
         f"Format the caller's lines as 'C: ...' — C is {name}.")
     started = time.time()
+    call_line_take(str(name))                         # #977: one line, one caller
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "call",
         "text": f"On {line_say}: {name}",
@@ -41877,9 +42054,21 @@ async def speak_turns(turns: list[tuple[str, str]],
         # through, and the coalesced stream (the default) never reaches
         # dj_speak at all. Skip THIS line, never break the round: a repeat is
         # one turn to drop, not a reason to take the station off the air.
+        # #977: THE GUARD BELOW WAS ONLY HALF APPLIED. The phrase gate a
+        # few lines down carries `not caller_name` for EVERY seat, and the
+        # comment above it says why in as many words - a swapped line
+        # mid-call answers the caller with unrelated shelf material, which
+        # is worse than a familiar phrase. This gate exempted only the
+        # CALLER's own seats, so the hosts' turns stayed swappable, and
+        # they were swapped: measured twice inside one call, in two
+        # different voices, for song lyrics - "Living off borrowed time,
+        # the clock tick faster" - answering a caller who had asked about
+        # something else entirely.
+        #
+        # Inside a call every seat is exempt. A repeat is let through or
+        # dropped; it is never answered with something off the shelf.
         _rerun = rerun_check(text, who,
-                             kind="call" if caller_name
-                             and who in ("caller", "caller2") else "",
+                             kind="call" if caller_name else "",
                              allow_repeat=allow_repeat)
         rerun_note(bool(_rerun["block"]))
         if _rerun["block"]:
@@ -43661,8 +43850,34 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _needs_rewrite = not substantial_radio_script(script,
                                                       _judge_lines)
     elif caller_name and lines >= 6:
-        _c_turns = len(re.findall(r"(?m)^\s*C\s*:", script or ""))
-        _all_turns = len(re.findall(r"(?m)^\s*[A-E]\s*:", script or ""))
+        # #977: COUNTED BY THE PARSER, NOT BY LINE.
+        #
+        # These were line-anchored regexes, and the model returns the whole
+        # exchange on ONE line - banter_turns' own docstring says exactly
+        # that, which is why it splits on markers wherever they appear
+        # rather than line by line. Measured on two banked calls: 3568 and
+        # 2406 characters, ZERO newlines in either, six C: markers apiece
+        # and not one of them at a line start. So _c_turns was 0 on both,
+        # _needs_rewrite was True, and it was True on essentially every
+        # call the station has ever written.
+        #
+        # The cost of that is not cosmetic. The rescue rewrite is then
+        # judged by the same line-anchored test below and thrown away, and
+        # #904 banks the original anyway - so every call paid for a second
+        # model visit (measured 25986 ms) that changed nothing. That
+        # doubled bill is what put task_cost("caller") at 268s, and
+        # prep_budget ends in min(room, ...) where the room left on a
+        # record is 150-230s. The caller road therefore measured
+        # permanently unaffordable and its shelf sat at zero while the ad
+        # and manager roads advanced - which is the starvation behind
+        # "they're not taking enough phone calls".
+        #
+        # The non-caller branch above already parses through
+        # substantial_radio_script and was never affected. This was the one
+        # place in the writing path that counted by line.
+        _turns_seen = banter_turns(script or "", caller_name, caller2_name)
+        _c_turns = sum(1 for _m, _t in _turns_seen if _m in ("C", "E"))
+        _all_turns = len(_turns_seen)
         _needs_rewrite = _c_turns < 3 or _all_turns < 6
     if _needs_rewrite:
         pipeline_log("model", "thin radio draft rejected — rewriting before air")
@@ -43688,10 +43903,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 num_ctx=16384,
             )
             if caller_name:
-                _rw_ok = (len(re.findall(r"(?m)^\s*C\s*:",
-                                         rewritten or "")) >= 3
-                          and len(re.findall(r"(?m)^\s*[A-E]\s*:",
-                                             rewritten or "")) >= 6)
+                # #977: judged by the parser that will actually air it,
+                # for the same reason the gate above is. Line-anchored,
+                # this test failed every one-line rewrite - so a good
+                # rescue was thrown away and #904 banked the original,
+                # which is how a call paid for two model visits and kept
+                # neither of them.
+                _rw_turns = banter_turns(rewritten or "", caller_name,
+                                         caller2_name)
+                _rw_ok = (sum(1 for _m, _t in _rw_turns
+                              if _m in ("C", "E")) >= 3
+                          and len(_rw_turns) >= 6)
             else:
                 _rw_ok = substantial_radio_script(rewritten, _judge_lines)
             if _rw_ok:
@@ -44095,6 +44317,18 @@ async def freshen_script(script: str, caller_name: str = "",
         before = 0
     fresh = await _freshen_script(script, caller_name, caller2_name, verbatim)
     if not before:
+        # #977: a call that arrived with NO caller turns is not a script
+        # this function can wave through - it is the fault itself. The
+        # guard could only ever refuse a regression, so the one case that
+        # matters, a call written badly in the first place, walked
+        # straight past it. Say so where it can be seen; the caller-turn
+        # count is checked again by the gate in dj_banter, which #977 also
+        # taught to count with the parser rather than by line.
+        if caller_name:
+            pipeline_log("model", f"the call for {caller_name} reached the "
+                                  "freshener with NO caller turns in it — "
+                                  "the fault is upstream of the rewrite "
+                                  "(#977)")
         return fresh
     try:
         after = sum(1 for m, _t in banter_turns(
@@ -44885,6 +45119,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
             try:
                 _prep_who = str(_prep_entry.get("caller_name") or "")
                 if _prep_who:
+                    call_line_take(_prep_who)     # #977
                     _RADIO["chat"].append(
                         {"ts": int(time.time()), "who": "host",
                          "kind": "call",
@@ -44973,6 +45208,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
         # posts nothing — nothing is airing yet; its card goes up when the
         # shelf row is taken, above.
         try:
+            call_line_take(_cname)                # #977
             _RADIO["chat"].append({"ts": int(time.time()), "who": "host",
                                    "kind": "call",
                                    "text": f"On {line_say}: {_cname}"})
