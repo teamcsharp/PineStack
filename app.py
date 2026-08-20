@@ -15469,6 +15469,11 @@ def dj_state() -> dict[str, Any]:
             if (_RADIO.get("ad_now")
                 and time.time() - _RADIO["ad_now"]["at"] < 180)
             else None),
+        # #900: …and WHICH PIECE that is. `ad_now` above is the words of the
+        # pitch; this is the identity behind them — the bare gallery filename
+        # the glass hangs on /api/generations/image/ — so the operator can
+        # actually SEE the media being sold instead of reading about it.
+        "selling_now": selling_now(),
         # Whether the box is actually carrying audio, so the booth/header can
         # show "not reaching the box" and a "the box is back" prompt (#490,
         # #498, #500, #507). down = breaker open OR lines piling up unplayed.
@@ -19685,11 +19690,21 @@ async def _torrent_talk() -> None:
             # next one.
             _RADIO["sched_prompt"] = ""
             _RADIO["sched_kind"] = ""              # #853
+            # #904: and the same for an INTERJECTED entry's instruction. It
+            # was queued for ONE round; cleared at the top of every round, it
+            # can never colour a second one.
+            _RADIO.pop("interject_prompt", None)
             _slot: dict[str, Any] = {}
             _sched_row: dict[str, Any] | None = None   # #937
             if _chosen:
-                _want = str(SWITCH_KINDS.get(
-                    str(_chosen.get("kind") or ""), {}).get("round") or "")
+                # #904: an INTERJECTED segment names its own round outright.
+                # The switchboard's own five roads still resolve through
+                # SWITCH_KINDS exactly as they did.
+                _inter = dict(_chosen.get("interject") or {})
+                _want = (str(_chosen.get("round") or "")
+                         or str(SWITCH_KINDS.get(
+                             str(_chosen.get("kind") or ""),
+                             {}).get("round") or ""))
                 _RADIO["switch_angle"] = str(_chosen.get("premise") or "")
                 if _want == "track":
                     # "drop the needle" is not a round — it is the end of
@@ -19702,7 +19717,40 @@ async def _torrent_talk() -> None:
                                  "the operator called for the record (#884)")
                     await asyncio.sleep(2)
                     continue
-                if _want and (_want in kinds or _want == "bombshell"):
+                if _inter and _want in SCHEDULE_KIND_NAMES:
+                    # #904: the entry's OWN standing instruction governs this
+                    # round, exactly as it would have if the clock had named
+                    # it — so an interjected segment sounds like that segment
+                    # and calls itself by its own name on air. `sched_pos` is
+                    # untouched: when this round ends the hour is still
+                    # standing precisely where it was.
+                    kind = _want
+                    # No switchboard ANGLE on an interjection. The five
+                    # switchboard roads carry a premise the operator picked
+                    # off a board; a segment carries its own instruction and
+                    # nothing else, so the rant road (say) still fetches its
+                    # own bombshell exactly as the schedule would have.
+                    _RADIO["switch_angle"] = ""
+                    _RADIO["interject_prompt"] = {
+                        "at": time.time(),
+                        "text": str(_inter.get("clause") or "")}
+                    _RADIO["sched_kind"] = kind    # #853: room and temper
+                    if kind == "record":
+                        # "spin a record" only drops the needle on the FIRST
+                        # round of its entry — and an interjection IS that
+                        # first round. (It still never cuts a live track:
+                        # track_may_cut() has the last word, per #846.)
+                        _RADIO["sched_first"] = True
+                    _sched_row = sched_named(
+                        -1, kind,
+                        str(_inter.get("label") or kind) + " (interjected)",
+                        str(_inter.get("preset") or ""))
+                    pipeline_log(
+                        "air", "the operator interjects "
+                        + str(_inter.get("label") or kind)
+                        + " - one round, then the hour carries on from "
+                          "where it was (#904)")
+                elif _want and (_want in kinds or _want == "bombshell"):
                     kind = _want
                 else:
                     kind = random.choice(choices)
@@ -21224,10 +21272,136 @@ def gallery_product() -> str:
             pick.get("request") or pick.get("tags") or "").split())[:90]
     if not subject:
         return ""
+    # #900: the piece this pitch is ABOUT, so the thumbnail beside it is the
+    # right one. A subject drawn from the generation ledger is a phrase and
+    # not a file, and resolves to "" - no picture rather than a wrong one.
+    ad_item_stamp(image=gallery_file_for(subject), title=subject, price=price)
     return (
         f'the original painting "{subject}", from the Pine Box gallery, '
         f"yours for {price} dollars"
     )
+
+
+# --- #900: WHAT IS BEING SOLD, AND WHICH PIECE IT IS -------------------------
+#
+# "For paintings that we are selling any time that we are selling a painting
+# or any piece of media, show a thumbnail of that piece off on the right so
+# that way we can see what media is being sold."
+#
+# Every selling road already knew the answer and then threw it away. The ad
+# roads take a `product` STRING - 'the original painting "x" ... 900 dollars'
+# - and a string cannot be held up. So the IDENTITY of the piece now rides
+# beside the pitch: stamped by whoever chose it, picked up when the spot goes
+# on air a moment later, and published on /api/dj as `selling_now` carrying
+# the bare gallery filename the glass hangs on /api/generations/image/.
+
+AD_ITEM_LIFE = 120.0        # a stamp older than this belongs to a past spot
+
+
+def gallery_file_for(subject: str) -> str:
+    """The gallery FILE behind a piece we are selling (#900).
+
+    gallery_product() sells a picture by its prettified stem - "a rainy
+    street" out of "a_rainy_street_00021_.png" - and a thumbnail needs the
+    real filename back. Reads ONLY the list gallery_files() has already
+    walked; it never starts a walk of its own, because this is reached from
+    the /api/dj poll and that output folder is a mounted share. Returns ""
+    whenever it cannot be sure, which means NO thumbnail rather than the
+    wrong one - a wrong picture beside a pitch is worse than none."""
+    want = " ".join(str(subject or "").split()).lower()
+    if not want:
+        return ""
+    try:
+        for path in list(_GALLERY_CACHE.get("rows") or []):
+            if path.name.lower() == want:
+                return path.name
+            stem = re.sub(r"[_\-]+", " ", path.stem)
+            stem = " ".join(re.sub(r"\b\d{4,}\b", "", stem).split()).lower()
+            if stem and stem[:80] == want[:80]:
+                return path.name
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def ad_item_stamp(image: str = "", title: str = "", price: int = 0) -> None:
+    """#900: WHICH piece the spot about to air is selling."""
+    try:
+        _RADIO["ad_item"] = {"image": str(image or "")[:200],
+                             "title": str(title or "")[:160],
+                             "price": int(price or 0),
+                             "at": time.time()}
+    except Exception:  # noqa: BLE001
+        pass            # a missing thumbnail never costs the station an ad
+
+
+def ad_now_set(product: str) -> None:
+    """#900: `ad_now`, with the identity of the thing being sold on it.
+
+    THE one place `ad_now` is written now, so every ad road - a fresh read, a
+    music-bed spot, a stored rerun - leaves the same evidence behind. A rerun
+    has no stamp of its own; the piece is named in the read itself, inside
+    the quotes gallery_product() and the ad break put it in, so that is read
+    back out and resolved to a file. Never raises."""
+    said = str(product or "")[:160]
+    item = _RADIO.get("ad_item") or {}
+    try:
+        fresh = time.time() - float(item.get("at") or 0) < AD_ITEM_LIFE
+    except (TypeError, ValueError):
+        fresh = False
+    image = str(item.get("image") or "") if fresh else ""
+    title = str(item.get("title") or "") if fresh else ""
+    price = int(item.get("price") or 0) if fresh else 0
+    if not image:
+        try:
+            found = re.search(r'painting "([^"]{2,120})"', said)
+            if found:
+                title = title or found.group(1)
+                image = gallery_file_for(found.group(1))
+        except Exception:  # noqa: BLE001
+            image = ""
+    _RADIO["ad_now"] = {"product": said, "at": time.time(),
+                        "image": image, "title": title, "price": price}
+
+
+def selling_now() -> dict[str, Any] | None:
+    """#900: the piece the station is SELLING this moment, or None.
+
+    Three roads sell things and each already knew what it put on air - the
+    sales floor (dj_hawk_round), the ad break, and the gallery press. This is
+    one answer for all three, freshest road first, so the glass has a single
+    thing to read. Wrapped end to end: a thumbnail is worth nothing beside
+    the booth keeping its state."""
+    try:
+        now = time.time()
+        hawk = hawking_now() or {}
+        names = [str(x) for x in (hawk.get("images") or []) if x]
+        if names:
+            return {"kind": "hawk", "why": "on the block right now",
+                    "image": names[0], "images": names[:3],
+                    "title": names[0], "price": int(hawk.get("price") or 0),
+                    "at": float(hawk.get("at") or now)}
+        ad = _RADIO.get("ad_now") or {}
+        if ad.get("image") and now - float(ad.get("at") or 0) < 180:
+            one = str(ad.get("image") or "")
+            return {"kind": "ad", "why": "the spot on air is selling it",
+                    "image": one, "images": [one],
+                    "title": str(ad.get("title") or one),
+                    "price": int(ad.get("price") or 0),
+                    "at": float(ad.get("at") or now)}
+        gal = _RADIO.get("gallery_now") or {}
+        rows = [r for r in (gal.get("images") or []) if isinstance(r, dict)]
+        if rows and now - float(gal.get("at") or 0) < 360:
+            shown = [str(r.get("name") or "") for r in rows if r.get("name")]
+            if shown:
+                return {"kind": "gallery",
+                        "why": "the pair have it up on air",
+                        "image": shown[0], "images": shown[:3],
+                        "title": shown[0], "price": 0,
+                        "at": float(gal.get("at") or now)}
+    except Exception:  # noqa: BLE001
+        return None
+    return None
 
 
 def spoken_units(text: str) -> str:
@@ -22550,6 +22724,19 @@ def _schedule_prompt_clause() -> str:
         one = alt_brief_now()
         if one:
             return one
+        # #904: an INTERJECTED segment's own instruction outranks the
+        # clock's, for the single round it owns — but not the #897 brief
+        # above, which belongs to one prep TASK and not to the air at all.
+        # It cannot simply live in `sched_prompt`: schedule_take() rewrites
+        # that key from the running order, and /api/dj reaches
+        # schedule_take() on every poll — so the instruction would be wiped
+        # out from under the round that asked for it, seconds before it was
+        # written. Its own key cannot be.
+        held = _RADIO.get("interject_prompt") or {}
+        if held and time.time() - float(held.get("at") or 0) < 300.0:
+            text = str(held.get("text") or "")
+            if text:
+                return text
         return str(_RADIO.get("sched_prompt") or "")
     except Exception:                          # noqa: BLE001
         return ""
@@ -22875,6 +23062,152 @@ def schedule_public(store: dict[str, Any] | None = None) -> dict[str, Any]:
         "tinting": schedule_tinting(),
         "speakbox": schedule_speakbox(),
     }
+
+
+# --- #904: JUMPING TO, AND INTERJECTING, A SEGMENT --------------------------
+#
+# "I want to be able to click on this option and have a drop down that lets me
+# choose which segment to jump to if I want to jump to a segment and introject
+# a segment into the hour additional that's able to just be done at that
+# moment instantly, but then it flows back to the regular hour schedule."
+#
+# An interjection is a ROUND, not a rewrite of the sheet — so it rides the
+# SWITCHBOARD queue (#884). That queue already wins outright over the running
+# order for exactly one round (#938) and pops itself when it is taken, so
+# nothing in here touches `sched_pos`: the clock keeps walking underneath, and
+# the entry the hour was on is still the entry the hour is on the moment the
+# interjected round finishes. Mutating the position would have moved the hour;
+# this only borrows one breath of it.
+
+
+def schedule_segments() -> dict[str, Any]:
+    """#904: the running order as the marquee's dropdown needs it.
+
+    The SAME sheet, the same preset-for-this-moment and the same hour
+    override schedule_take() walks, so "jump to that one" names the entry the
+    clock itself would have named. Never raises — an empty list simply means
+    the dropdown has nothing to offer and the marquee keeps its name."""
+    out: dict[str, Any] = {"enabled": False, "preset": "", "hour": "",
+                           "index": None, "slot_id": "", "slots": [],
+                           "kinds": []}
+    try:
+        store = schedule_read()
+        out["enabled"] = bool(store.get("enabled", True))
+        name = schedule_preset_now(store)
+        rows = list((store.get("presets") or {}).get(name) or [])
+        try:
+            picked, hour_rows, overridden = schedule_hour_slots(
+                store, _sched_hour_key())
+            if overridden and hour_rows:
+                name, rows = picked, hour_rows
+                out["hour"] = _sched_hour_key()
+        except Exception:                      # noqa: BLE001
+            pass                # an unreadable override runs the plain plan
+        slots = [s for s in rows if s.get("enabled", True)]
+        pos = _RADIO.get("sched_pos") or {}
+        here = str(pos.get("slot_id") or "")
+        same = str(pos.get("preset") or "") == name
+        labels = {k["kind"]: k["label"] for k in SCHEDULE_KINDS}
+        out["preset"] = name
+        out["slot_id"] = here if same else ""
+        for i, slot in enumerate(slots):
+            kind = str(slot.get("kind") or "")
+            sid = str(slot.get("id") or "")
+            on_air = bool(sid and same and sid == here)
+            if on_air:
+                out["index"] = i
+            try:
+                mins = round(max(0.25, float(slot.get("minutes") or 3)), 2)
+            except (TypeError, ValueError):
+                mins = 3.0
+            out["slots"].append({
+                "id": sid, "index": i, "kind": kind, "minutes": mins,
+                "label": str(slot.get("label") or labels.get(kind) or kind),
+                "now": on_air,
+            })
+        # Every road the station knows, so a segment the sheet does not run
+        # today can still be interjected — "introject a segment into the hour
+        # ADDITIONAL" is exactly that case.
+        out["kinds"] = [dict(k) for k in SCHEDULE_KINDS]
+    except Exception:                          # noqa: BLE001
+        pass
+    return out
+
+
+def schedule_interject(slot_id: str = "", kind: str = "") -> dict[str, Any]:
+    """#904: put ONE round of a named segment on the air next.
+
+    The hour is not touched. The queued instruction carries the round it
+    wants AND the entry's own standing instruction, so an interjected
+    "Painting selling" writes with the Painting-selling prompt and calls
+    itself by the name the station gave it — the same round the clock would
+    have produced, only sooner. Then it is gone, and the sheet carries on
+    from exactly where it was."""
+    try:
+        store = schedule_read()
+        name = schedule_preset_now(store)
+        rows = list((store.get("presets") or {}).get(name) or [])
+        try:
+            picked, hour_rows, overridden = schedule_hour_slots(
+                store, _sched_hour_key())
+            if overridden and hour_rows:
+                name, rows = picked, hour_rows
+        except Exception:                      # noqa: BLE001
+            pass
+        slots = [s for s in rows if s.get("enabled", True)]
+        want = str(slot_id or "").strip()
+        got_kind = str(kind or "").strip()
+        slot: dict[str, Any] = {}
+        if want:
+            slot = next((dict(s) for s in slots
+                         if str(s.get("id") or "") == want), {})
+        if not slot and got_kind:
+            slot = next((dict(s) for s in slots
+                         if str(s.get("kind") or "") == got_kind), {})
+        if not slot and got_kind in SCHEDULE_KIND_NAMES:
+            # A road the sheet is not running today: still a road the station
+            # knows how to walk, and the request was explicitly for one that
+            # is "additional" to the hour.
+            slot = {"id": "", "kind": got_kind, "minutes": 3,
+                    "label": next((k["label"] for k in SCHEDULE_KINDS
+                                   if k["kind"] == got_kind), got_kind)}
+        if not slot:
+            return {"ok": False, "why": "no such segment on the running order"}
+        road = str(slot.get("kind") or "")
+        if road not in SCHEDULE_KIND_NAMES:
+            return {"ok": False, "why": f"the station has no {road!r} road"}
+        label = str(slot.get("label") or road)
+        try:
+            clause = _schedule_clause(name, slot,
+                                      schedule_prompt_for(store, slot))
+        except Exception:                      # noqa: BLE001
+            clause = ""     # the round still runs; it just writes untinted
+        entry = {
+            "id": uuid.uuid4().hex[:10],
+            "kind": "interject",
+            "face": label,
+            "premise": f"the operator calls for {label}, right now",
+            # The round this instruction names OUTRIGHT. SWITCH_KINDS knows
+            # five roads and the sheet knows eleven, so "jump to Painting
+            # selling" cannot be said in that table and says itself here.
+            "round": road,
+            "interject": {"slot_id": str(slot.get("id") or ""),
+                          "label": label, "preset": name, "clause": clause},
+            "at": time.time(),
+        }
+        with _SWITCH_LOCK:
+            # The FRONT of the queue: "instantly" is the whole of the ask.
+            _SWITCH_QUEUE.insert(0, entry)
+            del _SWITCH_QUEUE[3:]              # a short queue, not a programme
+        pipeline_log("switchboard",
+                     f"the operator interjects {label} - one round, then the "
+                     "hour carries on from where it was (#904)")
+        return {"ok": True, "kind": road, "label": label,
+                "queued": len(_SWITCH_QUEUE)}
+    except Exception as exc:                   # noqa: BLE001
+        # Never raise at the operator: a refused jump is a message, not a
+        # dead endpoint, and certainly not a station off air.
+        return {"ok": False, "why": f"{type(exc).__name__}: {exc}"[:160]}
 
 
 def schedule_month_plan(start: str = "", days: int = 31) -> dict[str, Any]:
@@ -26185,7 +26518,7 @@ async def dj_ad(product: str, remember: bool = True,
     demand) always gets a sound effect mixed in and is kept a week (#464)."""
     # What is being SOLD right now (#668), so the booth can hold it up the
     # way it already holds up the paintings.
-    _RADIO["ad_now"] = {"product": str(product)[:160], "at": time.time()}
+    ad_now_set(product)                                   # #900
     # #842: `script` is a read WRITTEN AHEAD — and already rendered into
     # the pantry — so it is handed to dj_speak as the line itself: spoken
     # word for word, with its audio found rather than made. Empty means
@@ -27339,7 +27672,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     station's own music — swelling in, ducking for the read, swelling out.
     Renders the voice, mixes it with a random track, plays the one mixed
     clip. Any failure falls back to a plain read so an ad always airs."""
-    _RADIO["ad_now"] = {"product": str(product)[:160], "at": time.time()}
+    ad_now_set(product)                                   # #900
     _ad_at = time.time()                                          # #892
     line = spoken_text(await dj_line("ad", _RADIO.get("now"), extra=product))
     if not line:
@@ -27505,6 +27838,10 @@ async def dj_ad_break() -> str:
             product = (f'the original painting "{name}" — in it: {desc} '
                        f"— from the Pine Box gallery, {price} dollars, "
                        "first caller takes it")
+            # #900: the vision model has just LOOKED at this exact file -
+            # hold on to which one it was, so the glass shows the picture
+            # the read is describing and not the last one the wall drew.
+            ad_item_stamp(image=name, title=name, price=price)
         else:
             product = gallery_product()
             if product:
@@ -27582,8 +27919,7 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
     # #731: what is being SOLD right now, so the booth can light the tile of
     # the spot actually on air. A stored rerun never set this, which is why a
     # produced spot played silently past its own entry in the log.
-    _RADIO["ad_now"] = {"product": str(entry.get("product") or "")[:160],
-                        "at": time.time()}
+    ad_now_set(str(entry.get("product") or ""))            # #900
     ad_to = _RADIO.get("voice_to") or "box"
     box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                 or len(_BOX_HOLD) >= 6)
@@ -52036,6 +52372,35 @@ async def dj_paths_choose(
     fire_and_forget(switchboard_fill())
     return {"ok": True, "took": chosen.get("face"),
             "premise": chosen.get("premise"), "queued": len(_SWITCH_QUEUE)}
+
+
+@app.get("/api/dj/segments")
+async def dj_segments_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#904: the running order behind the marquee's segment name.
+
+    Read only when the dropdown OPENS, never on a timer — the sheet comes
+    off disk and there is no reason for the top of the app to be re-reading
+    it every couple of seconds."""
+    require_read_auth(authorization)
+    return schedule_segments()
+
+
+@app.post("/api/dj/segments/interject")
+async def dj_segments_interject_api(
+    body: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#904: jump to a segment NOW — one round, then the hour resumes.
+
+    Takes `slot_id` (an entry on the sheet) or `kind` (any road the station
+    knows, whether the sheet is running it today or not)."""
+    require_auth(authorization)
+    body = body if isinstance(body, dict) else {}
+    return schedule_interject(
+        str(body.get("slot_id") or body.get("id") or ""),
+        str(body.get("kind") or ""))
 
 
 @app.get("/api/dj/paths/learned")

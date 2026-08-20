@@ -72,6 +72,36 @@
   <div id="railResizer" class="rail-resizer" title="Resize sidebar"></div>
 
   <main>
+    <!-- #904: THE ON-AIR MARQUEE, across the very top of the app.
+           Left: the segment the running order has reached — a button that
+           drops open the whole sheet so any segment can be jumped to, or
+           interjected for a single round, after which the hour carries on
+           untouched. Middle: every line the station is saying, scrolling
+         past; click one and the systems that made it open as a three.js
+         infographic. Right (#900): the piece currently being SOLD.
+
+         Its own grid ROW of <main>, above the status strip — not a wrapped
+         line inside .top. That header is a flex row whose status strip is
+         flex:1/min-width:0, so a 100%-basis child does NOT get a line of
+         its own there: the strip has a hypothetical size of zero, rides up
+         beside it, and collapses to a vertical stack 11px wide. -->
+    <div id="dxMarquee" class="dx-marquee">
+      <button id="dxSegBtn" class="dx-seg"
+              title="The segment the running order has reached — click to jump to another, or interject one for a single round">
+        <em id="dxSegKind">—</em><b id="dxSegName">no schedule</b><i>▾</i>
+      </button>
+      <div id="dxSegMenu" class="dx-segmenu" style="display:none"></div>
+      <div id="dxTicker" class="dx-ticker"
+           title="Everything going out on air — click a line to see every system that made it">
+        <div id="dxTickerTrack" class="dx-track"></div>
+        <span id="dxIdle" class="dx-idle">the booth is quiet</span>
+      </div>
+      <button id="dxSelling" class="dx-selling" style="display:none"
+              title="What the station is selling right now — click to hold it up big">
+        <img id="dxSellingArt" alt="">
+        <span><b id="dxSellingName"></b><em id="dxSellingWhy"></em></span>
+      </button>
+    </div>
     <header class="top">
       <div class="status-strip">
         <div id="agentCell" class="agent-cell"
@@ -298,6 +328,9 @@
   <div id="sbTermPopup" style="display:none"></div>
   <div id="samplePopup" style="display:none"></div>
   <div id="crystalPopup" style="display:none"></div>
+  <!-- #904: the provenance window — built on a click and torn down on
+       close, so nothing here is ever rebuilt underneath you. -->
+  <div id="dxProvPopup" style="display:none"></div>
 
   <script src="./renderer.js"></script>
 </body>

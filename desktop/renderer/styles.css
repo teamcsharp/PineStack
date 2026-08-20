@@ -812,7 +812,9 @@ body.rail-narrow .desktop-radio { display: none; }
 
 /* auto, not 70px: when the header wraps on a narrow window, a fixed row
    painted its second line under the webview — invisible, not scrollable. */
-main { display: grid; grid-template-rows: auto 1fr; min-width: 0; min-height: 0; }
+/* #904: three rows now — the on-air marquee, the header, the view. Only
+   the ACTIVE view is displayed, so main really does have three children. */
+main { display: grid; grid-template-rows: auto auto 1fr; min-width: 0; min-height: 0; }
 .top {
   display: flex;
   flex-wrap: wrap;
@@ -1208,3 +1210,216 @@ body.immersive main {
   border-radius: 5px; }
 .works-pop { padding: 12px; }
 .works-pop .wk-stage { margin-right: 0; }
+
+
+/* ===================================================================
+   #904 THE ON-AIR MARQUEE + #900 THE PIECE BEING SOLD
+   ===================================================================
+   The bar is its OWN grid row of <main>, above the status strip, so it
+   spans the whole width and reads as the top of the application rather
+   than as another tile inside the header. */
+.dx-marquee {
+  position: relative;
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+  height: 34px;
+  padding: 0 10px 0 0;
+  background: #0c1117;
+  border-bottom: 1px solid var(--line);
+  min-width: 0;
+}
+
+/* The segment the clock has reached. The fill behind the name is how far
+   through its own minutes the entry is — the same figure the hour sheet
+   draws, so the two never disagree. */
+.dx-seg {
+  height: auto;
+  flex: 0 0 auto;
+  max-width: 34%;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 0;
+  border-right: 1px solid var(--line);
+  border-radius: 0;
+  padding: 0 11px;
+  background:
+    linear-gradient(to right, rgba(101, 199, 218, .22) 0%,
+                    rgba(101, 199, 218, .22) var(--dx-through, 0%),
+                    transparent var(--dx-through, 0%));
+  background-color: #121a22;
+  color: var(--text);
+  font-size: 12px;
+  min-width: 0;
+}
+.dx-seg:hover { border-color: var(--line); border-right-color: var(--cyan); }
+.dx-seg em {
+  font-style: normal; color: var(--muted); font-size: 10px;
+  letter-spacing: .06em; text-transform: uppercase; flex: 0 0 auto;
+}
+.dx-seg b {
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  min-width: 0; color: #d8ecf3;
+}
+.dx-seg i { font-style: normal; color: var(--muted); flex: 0 0 auto; }
+.dx-seg.open { background-color: #17222c; }
+
+/* The sheet, dropped open. Fetched and built only when it OPENS (#883:
+   nothing timer-driven may rebuild a list you are reading). */
+.dx-segmenu {
+  position: absolute; top: 100%; left: 0; z-index: 70;
+  width: min(420px, 70vw); max-height: 62vh; overflow: auto;
+  background: var(--panel); border: 1px solid var(--line);
+  border-top: 0; border-radius: 0 0 9px 9px;
+  box-shadow: 0 14px 40px rgba(0, 0, 0, .6);
+  padding: 6px; font-size: 12px;
+}
+.dx-segmenu h4 {
+  margin: 6px 6px 4px; font-size: 10px; font-weight: 600;
+  letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+}
+.dx-segrow {
+  display: grid; grid-template-columns: 1fr auto auto;
+  align-items: center; gap: 8px;
+  padding: 6px 8px; border-radius: 6px; cursor: pointer; color: #cfe0ea;
+}
+.dx-segrow:hover { background: #26333f; }
+.dx-segrow.now { background: rgba(101, 199, 218, .14); color: #d8ecf3; }
+.dx-segrow s { text-decoration: none; color: var(--muted); font-size: 10.5px; }
+.dx-segrow u { text-decoration: none; color: var(--muted); font-size: 10.5px; }
+.dx-segrow.now u { color: var(--cyan); }
+.dx-segfoot {
+  padding: 7px 8px 4px; color: var(--muted); font-size: 10.5px;
+  border-top: 1px solid var(--line); margin-top: 4px; line-height: 1.45;
+}
+.dx-segnote { padding: 5px 8px; color: var(--green); font-size: 11px; }
+.dx-segnote.bad { color: var(--red); }
+
+/* The belt itself. Items are only ever APPENDED to the tail and retired
+   off the head once they are clean past the left edge, so no text that is
+   on screen is ever rewritten (#883/#887). */
+.dx-ticker {
+  flex: 1 1 auto; min-width: 0; position: relative; overflow: hidden;
+}
+/* Absolute, with both edges pinned: the height is the lane's and the width
+   is shrink-to-fit, which is what lets the belt be measured and slid. */
+.dx-track {
+  position: absolute; top: 0; bottom: 0; left: 0;
+  display: flex; align-items: center; white-space: nowrap;
+  will-change: transform;
+}
+.dx-item {
+  display: inline-flex; align-items: baseline; gap: 7px;
+  padding: 0 20px 0 0; cursor: pointer; font-size: 12.5px;
+  color: #9db3c3;
+}
+.dx-item::after {
+  content: "•"; color: #33465a; padding-left: 20px; align-self: center;
+}
+.dx-item b { color: #65c7da; font-weight: 600; }
+.dx-item i { font-style: normal; }
+.dx-item:hover i { color: #edf3f5; text-decoration: underline dotted; }
+.dx-item.live b { color: #ffd7a1; }
+.dx-item.live i { color: #f3e6d2; }
+.dx-idle {
+  position: absolute; left: 4px; top: 50%; transform: translateY(-50%);
+  color: var(--muted); font-size: 12px;
+}
+
+/* #900: the piece being sold, held up on the right. */
+.dx-selling {
+  height: auto; flex: 0 0 auto; max-width: 30%;
+  display: flex; align-items: center; gap: 8px;
+  border: 0; border-left: 1px solid var(--line); border-radius: 0;
+  padding: 0 4px 0 10px; background: transparent; min-width: 0;
+}
+.dx-selling img {
+  width: 26px; height: 26px; object-fit: cover; border-radius: 4px;
+  border: 1px solid var(--line); background: #0a0e13;
+}
+.dx-selling span {
+  display: flex; flex-direction: column; align-items: flex-start;
+  min-width: 0; line-height: 1.15;
+}
+.dx-selling b {
+  font-size: 11px; color: #e8d7a8; max-width: 22ch;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.dx-selling em {
+  font-style: normal; font-size: 9.5px; color: var(--muted);
+  max-width: 22ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* Clicked: the same picture, big, pinned under the header on the right. */
+.dx-selling.big img {
+  position: fixed; top: 44px; right: 14px; z-index: 88;
+  width: min(340px, 34vw); height: auto; border-radius: 9px;
+  border: 1px solid #4a5c6b; box-shadow: 0 16px 48px rgba(0, 0, 0, .75);
+}
+
+/* #904: the provenance window — every system that made one line, as a
+   three.js infographic beside the readable ledger of the same thing. */
+#dxProvPopup {
+  position: fixed; left: 50%; top: 8%; transform: translate(-50%, 0);
+  z-index: 96; width: min(980px, calc(100vw - 32px));
+  height: min(660px, calc(100vh - 120px));
+  background: var(--panel); border: 1px solid #35506b; border-radius: 11px;
+  box-shadow: 0 18px 60px rgba(0, 0, 0, .8);
+  display: flex; flex-direction: column; font-size: 12.5px; overflow: hidden;
+}
+#dxProvPopup .dxp-head {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 10px 12px; border-bottom: 1px solid var(--line);
+  cursor: grab; user-select: none; flex: 0 0 auto;
+}
+#dxProvPopup .dxp-head b { color: #9fd8ff; }
+#dxProvPopup .dxp-who { color: #ffd7a1; }
+#dxProvPopup .dxp-x { margin-left: auto; width: 26px; height: 26px;
+  padding: 0; display: flex; align-items: center; justify-content: center; }
+#dxProvPopup .dxp-say {
+  padding: 9px 14px; color: #edf3f5; line-height: 1.5;
+  border-bottom: 1px solid var(--line); max-height: 96px; overflow: auto;
+  flex: 0 0 auto;
+}
+#dxProvPopup .dxp-body {
+  flex: 1 1 auto; min-height: 0; display: flex; gap: 0;
+}
+#dxProvPopup .dxp-stage {
+  flex: 1 1 auto; min-width: 0; position: relative;
+  background: radial-gradient(ellipse at 50% 35%, #0d1622, #05080d);
+}
+#dxProvPopup .dxp-stage canvas {
+  width: 100%; height: 100%; display: block;
+}
+#dxProvPopup .dxp-hint {
+  position: absolute; left: 10px; bottom: 8px; color: #4f6577;
+  font-size: 10.5px; pointer-events: none;
+}
+#dxProvPopup .dxp-side {
+  flex: 0 0 320px; max-width: 320px; overflow: auto;
+  border-left: 1px solid var(--line); padding: 8px;
+}
+#dxProvPopup .dxp-sys {
+  border: 1px solid var(--line); border-radius: 8px;
+  padding: 7px 9px; margin-bottom: 7px;
+}
+#dxProvPopup .dxp-sys.hot {
+  border-color: #65c7da; background: rgba(101, 199, 218, .10);
+}
+#dxProvPopup .dxp-sys h5 {
+  margin: 0 0 3px; font-size: 12px; display: flex; gap: 6px;
+  align-items: baseline;
+}
+#dxProvPopup .dxp-sys h5 s { text-decoration: none; margin-left: auto;
+  color: var(--muted); font-size: 10px; font-weight: 400; }
+#dxProvPopup .dxp-sys p {
+  margin: 2px 0; color: #a8bccb; font-size: 11.5px; line-height: 1.45;
+  word-break: break-word;
+}
+#dxProvPopup .dxp-leaf {
+  color: #8fa0ad; font-size: 11px; padding: 2px 0 2px 10px;
+  border-left: 1px solid #2b3a48; margin: 2px 0 2px 2px;
+  word-break: break-word;
+}
+#dxProvPopup .dxp-none { color: var(--muted); padding: 12px; }

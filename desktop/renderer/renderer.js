@@ -7011,6 +7011,784 @@ if (boothMonitorToggle) {
     applyAppVolume();
   };
 }
+/* #904: THE ON-AIR MARQUEE — the strip across the very top of the app.
+ *
+ * "anytime someone's saying anything, text will be scrolling by indicating
+ * who is saying it and what is being said. On the left side, I want it to
+ * say what segment in the scheduler that we're on ... click on this option
+ * and have a drop down that lets me choose which segment to jump to ...
+ * whenever I click the text, I want it to pop up with a window illustrating
+ * all the systems that contributed to making that piece of text possible in
+ * the form of a 3JS simulation."
+ *
+ * Nothing in here is rebuilt on a timer (#883/#887). The belt only ever has
+ * items APPENDED to its tail, and retires them off its head once they have
+ * scrolled clean past the left edge — text on screen is never rewritten and
+ * the container is never emptied. The segment sheet is fetched and built
+ * only when the dropdown OPENS. The provenance window is built once per
+ * click and torn down on close.
+ *
+ * It reads /api/dj, which the booth already serves: `chat` for the lines,
+ * `speaking_now` for which of them is sounding this second,
+ * `dialogue_flow.schedule.now` (#937) for the segment, and `selling_now`
+ * (#900) for the piece on the block.
+ */
+
+/* three.js is VENDORED — the agent serves it at /vendor/three.min.js and
+ * there is no CDN out here. Loaded once, on the first click that needs it. */
+let dxThreeP = null;
+function dxLoadThree() {
+  if (window.THREE) return Promise.resolve();
+  if (dxThreeP) return dxThreeP;
+  dxThreeP = new Promise((resolve, reject) => {
+    const tag = document.createElement("script");
+    tag.src = ((config && config.baseUrl) || "http://127.0.0.1:8096")
+      + "/vendor/three.min.js";
+    tag.onload = () => resolve();
+    tag.onerror = () => { dxThreeP = null; reject(new Error("no three.js")); };
+    document.head.appendChild(tag);
+  });
+  return dxThreeP;
+}
+
+/* The systems behind ONE line, read off /api/dj/provenance (#888/#889).
+ * That endpoint already gathers everything — the prompt as sent, the script
+ * that came back, the model, the material about him, the speakbox swaths,
+ * the vector hits, the crystal, the schedule entry, the armed system prompt,
+ * the voice, and whether the audio was prepared ahead or made live. This
+ * only shapes it into nodes; it invents nothing. */
+function dxProvSystems(p) {
+  const out = [];
+  const line = p.line || {};
+  const written = p.written || {};
+  const render = p.render || {};
+  const sched = p.schedule || {};
+  const system = p.system || {};
+  const add = (key, label, tone, head, rows, leaves) => {
+    const kept = (rows || []).filter(Boolean).map(String);
+    const kids = (leaves || []).filter(Boolean).map(String);
+    if (!head && !kept.length && !kids.length) return;
+    out.push({ key, label, tone, head: String(head || ""),
+               rows: kept, leaves: kids });
+  };
+
+  add("model", "The language model", 0x7fd4ff, written.model || p.model || "",
+      [written.temp != null ? "temperature " + written.temp : "",
+       written.num_ctx ? "context window " + written.num_ctx : "",
+       written.ms ? "wrote it in " + written.ms + "ms" : "",
+       written.chars ? written.chars + " characters came back" : "",
+       written.budget ? "budget " + written.budget : ""], []);
+
+  add("system", "The armed system prompt", 0xc98fe0,
+      system.name || "(none armed)",
+      [system.followed ? "the booth is following it"
+        : "the booth is not bound to it",
+       (system.text || "").slice(0, 220)], []);
+
+  add("schedule", "The running order", 0x8fe0b0,
+      sched.kind || sched.kind_now || "(no entry named this round)",
+      [(sched.prompt || sched.prompt_now || "").slice(0, 220)], []);
+
+  // The bodies of material below only earn a node when they actually put
+  // something in — an empty ring of "0 documents" nodes is a picture of
+  // nothing, and the point of the thing is what DID contribute.
+  const docs = p.documents || [];
+  if (docs.length) {
+    add("speakbox", "The speakbox", 0xe0c98f, "",
+        [docs.length + " document(s) reached this line"],
+        docs.map((d) => (d.quoted ? "quoted: " : "")
+          + (d.file || "") + " — " + (d.how || "")));
+  }
+  const vecs = p.vectors || [];
+  if (vecs.length) {
+    add("vectors", "The vector index", 0x9fb0ff, "",
+        [vecs.length + " search(es) around this line"],
+        vecs.map((v) => (v.file || v.query || "a search")
+          + (v.score != null ? " · " + v.score : "")));
+  }
+  const shards = p.crystal || [];
+  if (shards.length) {
+    add("crystal", "The crystal", 0xf2a0d0, "",
+        [shards.length + " shard(s) tinting the water"],
+        shards.map((c) => (c.in_prompt ? "in the prompt: " : "")
+          + (c.text || c.file || "")));
+  }
+  const mine = p.material || [];
+  if (mine.length) {
+    add("material", "His own material", 0xffd7a1, "",
+        [mine.length + " line(s) about him were in the prompt"],
+        mine.map((m) => (m.tally ? "a tally: " : "") + (m.text || "")));
+  }
+  const asks = p.requests || [];
+  if (asks.length) {
+    add("requests", "The request ledger", 0xd0e08f, "",
+        [asks.length + " standing request(s) were in view"],
+        asks.map((r) => (r.title || r.text || "a request")
+          + (r.count != null ? " ×" + r.count : "")));
+  }
+
+  add("voice", "The voice", 0x65d1a0,
+      (line.voice || "") + (line.engine ? " · " + line.engine : ""),
+      [render.ms ? "rendered in " + render.ms + "ms" : "",
+       line.seconds ? line.seconds + "s on air" : "",
+       render.how || ""], []);
+
+  add("room", "The recording room", 0xb0c4d4, p.prepared || "",
+      [p.burst ? "aired in a burst of " + p.burst : "",
+       line.kind ? "filed as a " + line.kind + " line" : "",
+       line.aired ? "went out " + line.aired : ""], []);
+
+  return out;
+}
+
+/* The infographic. One node per system on a ring around the LINE itself,
+ * each with its own contributions orbiting it, and a beam into the middle
+ * whose thickness is how much that system put in. */
+function dxProvScene(canvas, systems, centreText, onPick) {
+  const T = window.THREE;
+  const host = canvas.parentElement;
+  const W = Math.max(320, (host && host.clientWidth) || 560);
+  const H = Math.max(240, (host && host.clientHeight) || 400);
+  canvas.width = W;
+  canvas.height = H;
+  const renderer = new T.WebGLRenderer({ canvas, antialias: true,
+                                         alpha: true });
+  renderer.setSize(W, H, false);
+  const scene = new T.Scene();
+  scene.fog = new T.Fog(0x05080d, 110, 340);
+  const camera = new T.PerspectiveCamera(50, W / H, 0.1, 1400);
+  scene.add(new T.AmbientLight(0xffffff, 0.62));
+  const sun = new T.DirectionalLight(0x9fd8ff, 1.15);
+  sun.position.set(50, 110, 70);
+  scene.add(sun);
+  const world = new T.Group();
+  scene.add(world);
+  const floor = new T.GridHelper(190, 19, 0x1c2b3a, 0x111a24);
+  floor.position.y = -16;
+  world.add(floor);
+
+  const sprite = (text, colour) => {
+    const pad = 16;
+    const c = document.createElement("canvas");
+    let g = c.getContext("2d");
+    const font = "600 30px Inter, Segoe UI, sans-serif";
+    g.font = font;
+    const w = Math.min(620, Math.ceil(g.measureText(text).width) + pad * 2);
+    c.width = w;
+    c.height = 46;
+    g = c.getContext("2d");
+    g.font = font;
+    g.fillStyle = "rgba(6,10,16,.72)";
+    g.fillRect(0, 0, w, 46);
+    g.fillStyle = colour;
+    g.textBaseline = "middle";
+    g.fillText(text, pad, 24);
+    const mat = new T.SpriteMaterial({ map: new T.CanvasTexture(c),
+                                       transparent: true,
+                                       depthWrite: false });
+    const sp = new T.Sprite(mat);
+    sp.scale.set(w / 22, 46 / 22, 1);
+    return sp;
+  };
+
+  const beam = (from, to, thick, colour) => {
+    const dir = new T.Vector3().subVectors(to, from);
+    const len = dir.length() || 0.01;
+    const mesh = new T.Mesh(
+      new T.CylinderGeometry(thick, thick * 0.45, len, 8, 1, true),
+      new T.MeshBasicMaterial({ color: colour, transparent: true,
+                                opacity: 0.42 }));
+    mesh.position.copy(from).add(to).multiplyScalar(0.5);
+    mesh.quaternion.setFromUnitVectors(new T.Vector3(0, 1, 0),
+                                       dir.clone().normalize());
+    return mesh;
+  };
+
+  // THE LINE, in the middle. Everything else points at it.
+  const heart = new T.Mesh(
+    new T.IcosahedronGeometry(6.4, 1),
+    new T.MeshStandardMaterial({ color: 0xffd7a1, emissive: 0x774d18,
+                                 metalness: 0.35, roughness: 0.35 }));
+  world.add(heart);
+  const heartTag = sprite(centreText, "#ffe9c9");
+  heartTag.position.set(0, 12.5, 0);
+  world.add(heartTag);
+
+  const picks = [];
+  const ring = 46;
+  systems.forEach((sys, i) => {
+    const turn = (i / Math.max(1, systems.length)) * Math.PI * 2;
+    const lift = 2 + (i % 3) * 7;
+    const at = new T.Vector3(Math.cos(turn) * ring, lift,
+                             Math.sin(turn) * ring);
+    const weight = 1 + sys.leaves.length + sys.rows.length * 0.4;
+    const size = Math.max(2.4, Math.min(6.2, 2.2 + Math.log(weight + 1) * 1.5));
+    const node = new T.Mesh(
+      new T.SphereGeometry(size, 22, 16),
+      new T.MeshStandardMaterial({ color: sys.tone, emissive: sys.tone,
+                                   emissiveIntensity: 0.16,
+                                   metalness: 0.3, roughness: 0.42 }));
+    node.position.copy(at);
+    node.userData = { key: sys.key, label: sys.label, base: sys.tone };
+    world.add(node);
+    picks.push(node);
+    world.add(beam(at, new T.Vector3(0, 0, 0),
+                   Math.max(0.28, Math.min(1.5, 0.28 + weight * 0.09)),
+                   sys.tone));
+    const tag = sprite(sys.label, "#dfeaf2");
+    tag.position.set(at.x, at.y + size + 4.4, at.z);
+    world.add(tag);
+    // Its own contributions, orbiting it — one bead per document, per
+    // vector hit, per shard, per line of his material.
+    const beads = sys.leaves.slice(0, 14);
+    beads.forEach((_leaf, k) => {
+      const spin = (k / Math.max(1, beads.length)) * Math.PI * 2;
+      const rad = size + 5.5;
+      const where = new T.Vector3(
+        at.x + Math.cos(spin) * rad,
+        at.y + Math.sin(spin * 2) * 2.6,
+        at.z + Math.sin(spin) * rad);
+      const bead = new T.Mesh(
+        new T.SphereGeometry(0.95, 12, 10),
+        new T.MeshStandardMaterial({ color: sys.tone, emissive: sys.tone,
+                                     emissiveIntensity: 0.35,
+                                     roughness: 0.5 }));
+      bead.position.copy(where);
+      world.add(bead);
+      world.add(beam(where, at, 0.13, sys.tone));
+    });
+  });
+
+  const state = { yaw: 0.6, pitch: 0.42, dist: 152, auto: true, raf: 0,
+                  hot: null, dead: false };
+  const ray = new T.Raycaster();
+  const flat = new T.Vector2();
+
+  let drag = null;
+  canvas.style.touchAction = "none";
+  canvas.onpointerdown = (ev) => {
+    drag = { x: ev.clientX, y: ev.clientY, moved: 0 };
+    state.auto = false;
+    try { canvas.setPointerCapture(ev.pointerId); } catch (e) { /* old */ }
+  };
+  canvas.onpointermove = (ev) => {
+    const box = canvas.getBoundingClientRect();
+    flat.x = ((ev.clientX - box.left) / box.width) * 2 - 1;
+    flat.y = -((ev.clientY - box.top) / box.height) * 2 + 1;
+    if (drag) {
+      const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
+      drag.moved += Math.abs(dx) + Math.abs(dy);
+      drag.x = ev.clientX; drag.y = ev.clientY;
+      state.yaw += dx * 0.008;
+      state.pitch = Math.max(-0.35, Math.min(1.25, state.pitch + dy * 0.006));
+    }
+  };
+  canvas.onpointerup = (ev) => {
+    const quiet = drag && drag.moved < 5;
+    drag = null;
+    if (!quiet) return;
+    ray.setFromCamera(flat, camera);
+    const hit = ray.intersectObjects(picks, false)[0];
+    if (hit && typeof onPick === "function") onPick(hit.object.userData.key);
+  };
+  canvas.oncontextmenu = (ev) => ev.preventDefault();
+  canvas.onwheel = (ev) => {
+    ev.preventDefault();
+    state.auto = false;
+    state.dist = Math.max(52, Math.min(420,
+      state.dist * (ev.deltaY > 0 ? 1.11 : 0.9)));
+  };
+
+  (function spin() {
+    if (state.dead) return;
+    state.raf = requestAnimationFrame(spin);
+    if (state.auto) state.yaw += 0.0035;
+    heart.rotation.y += 0.006;
+    heart.rotation.x += 0.002;
+    // Whatever the pointer is over glows; everything else settles back.
+    ray.setFromCamera(flat, camera);
+    const over = ray.intersectObjects(picks, false)[0];
+    const under = over ? over.object.userData.key : null;
+    if (under !== state.hot) {
+      state.hot = under;
+      picks.forEach((m) => {
+        m.material.emissiveIntensity =
+          (m.userData.key === under) ? 0.75 : 0.16;
+      });
+      canvas.style.cursor = under ? "pointer" : "grab";
+    }
+    const cp = Math.cos(state.pitch) * state.dist;
+    camera.position.set(Math.sin(state.yaw) * cp,
+                        Math.sin(state.pitch) * state.dist + 12,
+                        Math.cos(state.yaw) * cp);
+    camera.lookAt(0, 4, 0);
+    renderer.render(scene, camera);
+  })();
+
+  return {
+    stop() {
+      state.dead = true;
+      try { cancelAnimationFrame(state.raf); } catch (e) { /* gone */ }
+      try { renderer.dispose(); } catch (e) { /* gone */ }
+    }
+  };
+}
+
+/* The window itself: the line, its systems as a readable ledger, and the
+ * same thing as the infographic beside it. Opened by a click, never by a
+ * timer, and torn right down on close. */
+let dxProvLive = null;
+async function dxProvOpen(lineId, who, said) {
+  const pop = $("dxProvPopup");
+  if (!pop || !lineId) return;
+  if (dxProvLive) { try { dxProvLive.stop(); } catch (e) { /* gone */ } }
+  dxProvLive = null;
+  pop.textContent = "";
+  pop.style.display = "flex";
+
+  const mk = (tag, cls, text) => {
+    const el = document.createElement(tag);
+    if (cls) el.className = cls;
+    if (text != null) el.textContent = String(text);
+    return el;
+  };
+
+  const head = mk("div", "dxp-head");
+  head.appendChild(mk("b", "", "What made this line"));
+  head.appendChild(mk("span", "dxp-who", who || ""));
+  const shut = mk("button", "dxp-x", "✕");
+  shut.title = "Close";
+  head.appendChild(shut);
+  pop.appendChild(head);
+  const say = mk("div", "dxp-say", said || "");
+  pop.appendChild(say);
+  const body = mk("div", "dxp-body");
+  const stage = mk("div", "dxp-stage");
+  const canvas = document.createElement("canvas");
+  stage.appendChild(canvas);
+  stage.appendChild(mk("div", "dxp-hint",
+    "drag to turn · wheel to zoom · click a node"));
+  const side = mk("div", "dxp-side");
+  body.appendChild(stage);
+  body.appendChild(side);
+  pop.appendChild(body);
+
+  const close = () => {
+    if (dxProvLive) { try { dxProvLive.stop(); } catch (e) { /* gone */ } }
+    dxProvLive = null;
+    pop.style.display = "none";
+    pop.textContent = "";
+    // Back to the middle. A window dragged off the edge of a big screen
+    // and reopened on a small one would otherwise be unreachable.
+    pop.style.left = "";
+    pop.style.top = "";
+    pop.style.transform = "";
+  };
+  shut.onclick = close;
+
+  // Drag it about by the head, like the crystal cabinet.
+  let grab = null;
+  head.onpointerdown = (ev) => {
+    if (ev.target === shut) return;
+    grab = { x: ev.clientX, y: ev.clientY,
+             left: pop.offsetLeft, top: pop.offsetTop };
+    pop.style.transform = "none";
+    pop.style.left = grab.left + "px";
+    pop.style.top = grab.top + "px";
+    try { head.setPointerCapture(ev.pointerId); } catch (e) { /* old */ }
+  };
+  head.onpointermove = (ev) => {
+    if (!grab) return;
+    pop.style.left = (grab.left + ev.clientX - grab.x) + "px";
+    pop.style.top = (grab.top + ev.clientY - grab.y) + "px";
+  };
+  head.onpointerup = () => { grab = null; };
+
+  let prov = null;
+  try {
+    prov = await api.get("/api/dj/provenance/" + encodeURIComponent(lineId));
+  } catch (err) {
+    side.appendChild(mk("div", "dxp-none",
+      "that line has scrolled out of the booth — its paperwork went with "
+      + "it (" + err.message + ")"));
+    return;
+  }
+  if (!prov || prov.ok === false) {
+    side.appendChild(mk("div", "dxp-none",
+      "nothing was written down for that line"));
+    return;
+  }
+  say.textContent = String((prov.line || {}).text || said || "");
+  head.querySelector(".dxp-who").textContent =
+    String((prov.line || {}).name || (prov.line || {}).who || who || "");
+
+  const systems = dxProvSystems(prov);
+  const cards = {};
+  systems.forEach((sys) => {
+    const card = mk("div", "dxp-sys");
+    const h = mk("h5", "");
+    const dot = mk("span", "", "●");
+    dot.style.color = "#" + sys.tone.toString(16).padStart(6, "0");
+    h.appendChild(dot);
+    h.appendChild(mk("span", "", sys.label));
+    if (sys.leaves.length) h.appendChild(mk("s", "", sys.leaves.length));
+    card.appendChild(h);
+    if (sys.head) card.appendChild(mk("p", "", sys.head));
+    sys.rows.forEach((row) => card.appendChild(mk("p", "", row)));
+    sys.leaves.slice(0, 14).forEach((leaf) =>
+      card.appendChild(mk("div", "dxp-leaf", leaf)));
+    side.appendChild(card);
+    cards[sys.key] = card;
+  });
+  if (!systems.length) {
+    side.appendChild(mk("div", "dxp-none",
+      "this line predates the provenance ledger"));
+  }
+
+  const highlight = (key) => {
+    Object.keys(cards).forEach((k) => cards[k].classList.toggle("hot",
+      k === key));
+    const card = cards[key];
+    if (card && card.scrollIntoView) {
+      card.scrollIntoView({ block: "nearest" });
+    }
+  };
+
+  try {
+    await dxLoadThree();
+  } catch (err) {
+    stage.appendChild(mk("div", "dxp-none",
+      "the infographic could not be drawn: " + err.message
+      + " — is the agent reachable? It serves three.js at "
+      + "/vendor/three.min.js."));
+    return;
+  }
+  try {
+    dxProvLive = dxProvScene(
+      canvas, systems,
+      String((prov.line || {}).name || (prov.line || {}).who || "this line"),
+      highlight);
+  } catch (err) {
+    stage.appendChild(mk("div", "dxp-none",
+      "the infographic could not be drawn: " + err.message));
+  }
+}
+
+function initAirMarquee() {
+  const bar = $("dxMarquee");
+  const lane = $("dxTicker");
+  const track = $("dxTickerTrack");
+  const idle = $("dxIdle");
+  const segBtn = $("dxSegBtn");
+  const segName = $("dxSegName");
+  const segKind = $("dxSegKind");
+  const segMenu = $("dxSegMenu");
+  const sell = $("dxSelling");
+  const sellArt = $("dxSellingArt");
+  const sellName = $("dxSellingName");
+  const sellWhy = $("dxSellingWhy");
+  if (!bar || !lane || !track || !segBtn || !segMenu) return;
+
+  const SPEED = 52;             // pixels a second — readable, not frantic
+  const KEEP = 60;              // lines kept for the loop
+  const pool = [];              // {id, name, text}
+  let seen = new Set();
+  let feedAt = 0;
+  let offset = 0;               // where the belt has slid to
+  let beltW = 0;                // total width of what is ON the belt
+  let paused = false;
+  let last = 0;
+  let liveId = "";
+  let segWas = "";
+  let slidTo = "";
+  let sellArtNow = "";
+
+  /* #883: never rewrite a node that already says the right thing. */
+  const put = (node, text) => {
+    const s = (text === undefined || text === null) ? "" : String(text);
+    if (node && node.textContent !== s) node.textContent = s;
+  };
+
+  function addToBelt(item) {
+    const el = document.createElement("span");
+    el.className = "dx-item";
+    el.dataset.lineId = item.id;
+    el.dataset.say = item.text;
+    el.dataset.name = item.name;
+    const who = document.createElement("b");
+    who.textContent = item.name;
+    const what = document.createElement("i");
+    what.textContent = item.text;
+    el.appendChild(who);
+    el.appendChild(what);
+    track.appendChild(el);
+    // ONE forced layout per item as it joins, and none per frame after.
+    el.dataset.w = String(el.offsetWidth);
+    beltW += el.offsetWidth;
+    if (item.id && item.id === liveId) el.classList.add("live");
+  }
+
+  /* Keep enough on the belt to cover the lane twice over. When the newest
+   * lines run out it loops the last dozen, so the marquee never sits still
+   * while the booth is between rounds. */
+  function fill() {
+    let guard = 0;
+    while (pool.length && guard < 12) {
+      guard += 1;
+      if (offset + beltW > lane.clientWidth * 1.8) break;
+      if (feedAt >= pool.length) {
+        feedAt = Math.max(0, pool.length - 12);
+      }
+      addToBelt(pool[feedAt]);
+      feedAt += 1;
+    }
+  }
+
+  function step(now) {
+    requestAnimationFrame(step);
+    // Clamped at both ends: a long stall (the window was hidden) must not
+    // teleport the belt, and a clock that ever went backwards must not
+    // wind it the wrong way.
+    const dt = last ? Math.max(0, Math.min(0.12, (now - last) / 1000)) : 0;
+    last = now;
+    fill();
+    if (!paused) offset -= SPEED * dt;
+    // Retire the head once it is clean past the left edge. Nothing on
+    // screen is ever touched — only what has already gone.
+    let head = track.firstElementChild;
+    while (head && offset + Number(head.dataset.w || 0) <= 0) {
+      offset += Number(head.dataset.w || 0);
+      beltW -= Number(head.dataset.w || 0);
+      track.removeChild(head);
+      head = track.firstElementChild;
+    }
+    if (!track.firstElementChild) {
+      offset = lane.clientWidth;
+      beltW = 0;
+    }
+    // Held on hover, so the same value is not written over and over.
+    const slid = "translateX(" + offset.toFixed(1) + "px)";
+    if (slid !== slidTo) {
+      slidTo = slid;
+      track.style.transform = slid;
+    }
+    if (idle) {
+      const want = track.firstElementChild ? "none" : "";
+      if (idle.style.display !== want) idle.style.display = want;
+    }
+  }
+
+  function markLive(id) {
+    if (id === liveId) return;
+    liveId = id;
+    const kids = track.children;
+    for (let i = 0; i < kids.length; i += 1) {
+      const on = Boolean(id) && kids[i].dataset.lineId === id;
+      if (kids[i].classList.contains("live") !== on) {
+        kids[i].classList.toggle("live", on);
+      }
+    }
+  }
+
+  function paintSegment(state) {
+    const now = ((state.dialogue_flow || {}).schedule || {}).now || {};
+    const label = String(now.label || "");
+    put(segName, label || "no schedule running");
+    put(segKind, now.kind || "—");
+    const through = Math.max(0, Math.min(1, Number(now.through) || 0));
+    const pct = (through * 100).toFixed(1) + "%";
+    if (segWas !== pct) {
+      segWas = pct;
+      segBtn.style.setProperty("--dx-through", pct);
+    }
+    segBtn.title = label
+      ? label + " — " + Math.round(Number(now.through_seconds) || 0) + "s of "
+        + Math.round(Number(now.owns_seconds) || 0) + "s. Click to jump to "
+        + "another segment, or interject one for a single round."
+      : "No running order is driving the show. Click to interject a "
+        + "segment anyway.";
+  }
+
+  /* #900: the piece being sold, held up on the right. `src` is only ever
+   * written when the FILE changes — re-setting it every poll would refetch
+   * the picture and flicker it. */
+  function paintSelling(state) {
+    if (!sell || !sellArt) return;
+    const it = state.selling_now || null;
+    if (!it || !it.image) {
+      if (sell.style.display !== "none") sell.style.display = "none";
+      sell.classList.remove("big");
+      sellArtNow = "";
+      return;
+    }
+    if (sell.style.display !== "flex") sell.style.display = "flex";
+    const name = String(it.image || "");
+    // The agent's address is part of the key: this can run before boot()
+    // has read the config, and a src built on an empty base would then be
+    // cached as "already correct" and never fixed.
+    const base = (config && config.baseUrl) || "";
+    const key = base + "|" + name;
+    if (base && key !== sellArtNow) {
+      sellArtNow = key;
+      sellArt.src = base + "/api/generations/image/"
+        + encodeURIComponent(name);
+    }
+    put(sellName, it.title || name);
+    put(sellWhy, (it.price ? "$" + it.price + " · " : "") + (it.why || ""));
+    sell.title = "Selling now: " + (it.title || name)
+      + (it.price ? " — " + it.price + " dollars" : "")
+      + " (" + (it.why || "") + "). Click to hold it up big.";
+  }
+
+  async function pull() {
+    let state = null;
+    try {
+      state = await api.get("/api/dj");
+    } catch (err) {
+      return;                   // the agent is quiet; the belt keeps rolling
+    }
+    if (!state) return;
+    try {
+      (state.chat || []).forEach((row) => {
+        const id = String(row.id || "");
+        const text = String(row.text || "").trim();
+        if (!id || !text || seen.has(id)) return;
+        seen.add(id);
+        pool.push({ id,
+                    name: String(row.name || row.who || "the booth"),
+                    text });
+      });
+      if (pool.length > KEEP) {
+        const cut = pool.length - KEEP;
+        pool.splice(0, cut);
+        feedAt = Math.max(0, feedAt - cut);
+      }
+      if (seen.size > 600) {
+        // Re-seed rather than grow for ever; anything still in the pool
+        // stays known, so nothing already shown can come round twice.
+        seen = new Set(pool.map((x) => x.id));
+      }
+      markLive(String((state.speaking_now || {}).id || ""));
+      paintSegment(state);
+      paintSelling(state);
+    } catch (err) { /* a bad frame never stops the marquee */ }
+  }
+
+  /* The sheet, dropped open. Fetched HERE — when it opens — so nothing is
+   * ever rebuilt under a finger that is reading it (#883/#887). */
+  async function openMenu() {
+    segMenu.textContent = "";
+    segMenu.style.display = "block";
+    segBtn.classList.add("open");
+    const mk = (tag, cls, text) => {
+      const el = document.createElement(tag);
+      if (cls) el.className = cls;
+      if (text != null) el.textContent = String(text);
+      return el;
+    };
+    const note = mk("div", "dx-segnote", "reading the running order…");
+    segMenu.appendChild(note);
+    let sheet = null;
+    try {
+      sheet = await api.get("/api/dj/segments");
+    } catch (err) {
+      note.className = "dx-segnote bad";
+      note.textContent = "the running order is unreachable: " + err.message;
+      return;
+    }
+    segMenu.textContent = "";
+    const send = async (body, label) => {
+      const said = mk("div", "dx-segnote", "putting " + label + " on air…");
+      segMenu.appendChild(said);
+      try {
+        const got = await api.post("/api/dj/segments/interject", body);
+        if (got && got.ok) {
+          said.textContent = label + " goes out next — then the hour picks "
+            + "up exactly where it left off.";
+          setTimeout(() => { closeMenu(); }, 1400);
+        } else {
+          said.className = "dx-segnote bad";
+          said.textContent = (got && got.why) || "that segment was refused";
+        }
+      } catch (err) {
+        said.className = "dx-segnote bad";
+        said.textContent = "the booth refused it: " + err.message;
+      }
+    };
+    const slots = (sheet && sheet.slots) || [];
+    if (slots.length) {
+      segMenu.appendChild(mk("h4", "",
+        "the hour — " + String((sheet && sheet.preset) || "")
+        + (sheet && sheet.enabled === false ? " (schedule off)" : "")));
+      slots.forEach((slot) => {
+        const row = mk("div", "dx-segrow" + (slot.now ? " now" : ""));
+        row.appendChild(mk("span", "", (slot.index + 1) + ". " + slot.label));
+        row.appendChild(mk("s", "", slot.kind));
+        row.appendChild(mk("u", "", slot.now ? "on air" : slot.minutes + "m"));
+        row.title = "Run " + slot.label + " now — one round, then back to "
+          + "the running order";
+        row.onclick = () => send({ slot_id: slot.id, kind: slot.kind },
+                                 slot.label);
+        segMenu.appendChild(row);
+      });
+    }
+    const kinds = (sheet && sheet.kinds) || [];
+    if (kinds.length) {
+      segMenu.appendChild(mk("h4", "", "or interject any segment the "
+        + "station knows"));
+      kinds.forEach((k) => {
+        const row = mk("div", "dx-segrow");
+        row.appendChild(mk("span", "", k.label));
+        row.appendChild(mk("s", "", k.kind));
+        row.appendChild(mk("u", "", ""));
+        row.title = k.blurb || "";
+        row.onclick = () => send({ kind: k.kind }, k.label);
+        segMenu.appendChild(row);
+      });
+    }
+    segMenu.appendChild(mk("div", "dx-segfoot",
+      "An interjection is ONE round. It goes out ahead of whatever the "
+      + "clock had lined up, and the hour then carries on from exactly "
+      + "where it was — nothing on the sheet moves."));
+  }
+
+  function closeMenu() {
+    segMenu.style.display = "none";
+    segBtn.classList.remove("open");
+  }
+
+  segBtn.onclick = (ev) => {
+    ev.stopPropagation();
+    if (segMenu.style.display === "block") closeMenu();
+    else openMenu();
+  };
+  document.addEventListener("click", (ev) => {
+    if (segMenu.style.display !== "block") return;
+    if (segMenu.contains(ev.target) || segBtn.contains(ev.target)) return;
+    closeMenu();
+  });
+
+  // Reading a line means stopping it: the belt holds while the pointer is
+  // over it, which is also what makes a moving line clickable.
+  lane.addEventListener("mouseenter", () => { paused = true; });
+  lane.addEventListener("mouseleave", () => { paused = false; });
+  track.addEventListener("click", (ev) => {
+    let el = ev.target;
+    while (el && el !== track && !el.dataset.lineId) el = el.parentElement;
+    if (!el || el === track || !el.dataset.lineId) return;
+    dxProvOpen(el.dataset.lineId, el.dataset.name, el.dataset.say);
+  });
+  if (sell) {
+    sell.onclick = () => { sell.classList.toggle("big"); };
+  }
+
+  offset = lane.clientWidth;
+  requestAnimationFrame(step);
+  pull();
+  setInterval(pull, 2500);
+}
+initAirMarquee();
+
 $("launchBtn").onclick = async () => { await saveConfig({ mode: "launch" }); await api.startBackend(); await refresh(); };
 $("attachBtn").onclick = async () => { await saveConfig({ mode: "attach" }); await refresh(); };
 $("stopBtn").onclick = async () => { await api.stopBackend(); await refresh(); };
