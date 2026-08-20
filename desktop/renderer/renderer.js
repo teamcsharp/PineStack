@@ -124,13 +124,27 @@ function initRailResizer() {
   handle.addEventListener("pointercancel", stop);
 }
 
+/* #982: what the shell's own music player should actually be sitting at.
+ *
+ * APP VOLUME IS THE MASTER - the level of the whole application - and
+ * the three stream sliders are the MIX inside the broadcast. The output
+ * of the music player is therefore the master times the music share, and
+ * that product is the ONLY thing that should ever be written to the
+ * element. Keeping it in one function is what stops the two ideas being
+ * confused again. */
+function desktopMusicGain() {
+  const share = (streamVolumes && Number.isFinite(streamVolumes.music))
+    ? streamVolumes.music : 1;
+  return Math.max(0, Math.min(1, appVolume * share));
+}
+
 function setAppVolume(value, persist = true) {
   const raw = Number(value);
   appVolume = Math.max(0, Math.min(1, Number.isFinite(raw) ? raw : 0.35));
   const player = $("desktopRadioPlayer");
   if (player) {
-    player.volume = appVolume;
-    player.muted = appVolume <= 0;
+    player.volume = desktopMusicGain();
+    player.muted = desktopMusicGain() <= 0;
   }
   const slider = $("appVolume");
   const label = $("appVolumeValue");
@@ -246,13 +260,15 @@ function setStreamVolume(stream, fraction, persist = true) {
     } catch (err) { /* private mode: it still works this session */ }
   }
   applyAppVolume();
-  // The shell's own music player follows the music slider too, on the
-  // routes where it is the one playing the record.
+  // #982: the shell's own music player follows the music slider, through
+  // the one function that knows what its level should be. It does NOT
+  // touch appVolume - the master is the operator's, and nothing in here
+  // is allowed to move it.
   try {
     const player = $("desktopRadioPlayer");
     if (player && stream === "music") {
-      player.volume = appVolume * v;
-      player.muted = appVolume * v <= 0;
+      player.volume = desktopMusicGain();
+      player.muted = desktopMusicGain() <= 0;
     }
   } catch (err) { /* the slider still moved */ }
 }
@@ -382,10 +398,26 @@ function initAppVolume() {
   const player = $("desktopRadioPlayer");
   if (player) {
     player.addEventListener("volumechange", () => {
-      if (Math.abs(player.volume - appVolume) > 0.01) {
-        setAppVolume(player.volume);
+      /* #982: THIS IS WHERE THE MASTER WAS BEING EATEN.
+       *
+       * The listener exists so that dragging the PLAYER's own volume
+       * control moves the app volume with it. It compared against
+       * appVolume - but once the music slider existed, the correct
+       * setting for this element is appVolume TIMES the music share, and
+       * every programmatic write of that product looked to this listener
+       * exactly like the operator dragging the player down. It answered
+       * by pulling the master down to the product, and the next drag
+       * multiplied again: measured spiralling to 1%.
+       *
+       * Compared against what the element SHOULD be at, a programmatic
+       * write is silent here and only a real drag moves the master. */
+      const want = desktopMusicGain();
+      if (Math.abs(player.volume - want) > 0.01) {
+        const share = (streamVolumes && streamVolumes.music > 0)
+          ? streamVolumes.music : 1;
+        setAppVolume(player.volume / share);
       }
-      if (player.muted && appVolume > 0) player.muted = false;
+      if (player.muted && desktopMusicGain() > 0) player.muted = false;
     });
   }
   const slider = $("appVolume");
@@ -563,8 +595,10 @@ function syncDesktopRadio(clock) {
   if (!Number.isFinite(target) || target < 0) target = 0;
   if (clock.seconds) target = Math.min(target, Number(clock.seconds) - 0.75);
   const nextUrl = desktopMusicUrl(clock.url);
-  player.volume = appVolume;
-  player.muted = appVolume <= 0;
+  // #982: the master TIMES the music share - this ran on every poll and
+  // would otherwise have wiped the music slider a second after it moved.
+  player.volume = desktopMusicGain();
+  player.muted = desktopMusicGain() <= 0;
   if (clock.id !== desktopTrackId || player.src !== nextUrl) {
     desktopTrackId = clock.id || "";
     player.src = nextUrl;
