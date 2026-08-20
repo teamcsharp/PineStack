@@ -1996,7 +1996,16 @@ function initWorksPopup() {
     const k = "arrow" + (++wkArrowN);
     if (!wkBox[k]) {
       wkBox[k] = mk("div", "wk-arrow", "\u25bc");
-      flow.appendChild(wkBox[k]);
+      /* #933: `host`, not `flow`. The flow is a const declared inside
+       * paint(); this function is its SIBLING, so `flow` was never in
+       * scope here and every call threw ReferenceError. It is called
+       * between the stages, unguarded, and the FIRST call comes
+       * straight after stage 1 \u2014 so paint died before drawing anything
+       * and the window reported itself unreachable while both of its
+       * endpoints were answering 200 with full payloads. Nothing a
+       * syntax check can see, which is why #933 also makes the window
+       * print the fault instead of blaming the network. */
+      host.appendChild(wkBox[k]);
     }
     return wkBox[k];
   }
@@ -2024,6 +2033,27 @@ function initWorksPopup() {
       }
       return block;
     } catch (e) { return null; }
+  }
+
+  /* #933: one stage failing must not take the other four with it. The
+   * fault is shown IN that stage, named, and the flow carries on. */
+  function stageSafe() {
+    const args = Array.prototype.slice.call(arguments);
+    try {
+      return stage.apply(null, args);
+    } catch (e) {
+      try {
+        const k = args[6] || ("t:" + args[1]);
+        const box = wkBox[k];
+        if (box && box.wkNote) {
+          box.wkNote.style.display = "";
+          box.wkNote.textContent = "this stage could not be drawn — "
+            + ((e && e.message) || String(e || ""));
+          box.wkNote.title = String((e && e.stack) || "");
+        }
+      } catch (e2) { /* the other stages still paint */ }
+      return null;
+    }
   }
 
   function stage(flow, title, num, note, cls, frac, key, fill_) {
@@ -2132,7 +2162,7 @@ function initWorksPopup() {
     const flow = wkFlow;
 
     // 1 — the writing desk  (#864: opens onto the paperwork)
-    stage(flow, "① the writing desk",
+    stageSafe(flow, "① the writing desk",
       (dj && dj.model) || "?",
       f.writing ? "writing a round now"
                 : "idle — the reserve is at its target",
@@ -2222,7 +2252,7 @@ function initWorksPopup() {
     // 2 — the reserve of written scripts  (#864: opens onto the rounds)
     const target = Number(f.target || 6);
     const have = Number(f.ready || 0);
-    stage(flow, "② the reserve — written scripts",
+    stageSafe(flow, "② the reserve — written scripts",
       have + " / " + target,
       rows.length
         ? rows.length + " round(s) banked and waiting for a slot"
@@ -2275,7 +2305,7 @@ function initWorksPopup() {
 
     // 3 — the recording room
     const cur = rendering[0] || null;
-    stage(flow, "③ the recording room",
+    stageSafe(flow, "③ the recording room",
       cur ? (cur.made + " / " + cur.chunks) : (f.window ? "open" : "waiting"),
       f.window
         ? ("building through " + f.window
@@ -2343,7 +2373,7 @@ function initWorksPopup() {
 
     // 4 — the pantry  (#876: opens onto what is actually on the shelf)
     const secs = Number(f.buffered_seconds || pend.buffered_seconds || 0);
-    stage(flow, "④ the pantry — finished audio",
+    stageSafe(flow, "④ the pantry — finished audio",
       mins(secs),
       (f.pantry_clips || pend.pantry_clips || 0) + " takes on the shelf"
       + (f.pantry_mb != null
@@ -2408,7 +2438,7 @@ function initWorksPopup() {
       ? ((sayingRaw.name ? sayingRaw.name + ": " : "")
          + String(sayingRaw.text || "")).trim()
       : String(sayingRaw || "");
-    stage(flow, "⑤ on air",
+    stageSafe(flow, "⑤ on air",
       dj && dj.speaking ? "talking" : "record",
       saying
         ? saying.slice(0, 160)
@@ -2466,16 +2496,57 @@ function initWorksPopup() {
       });
   }
 
+  /* #933: say WHICH thing broke, and never empty the window to say it. */
+  function wkFault(body, where, e) {
+    let note = body.wkFault;
+    if (!note || note.parentElement !== body) {
+      note = mk("div", "wk-note wk-stop");
+      note.style.cssText = "font-size:10px;line-height:1.5;margin:4px 0;"
+        + "padding:5px 7px;border-radius:6px;border:1px solid #6b2f2f;"
+        + "background:rgba(120,40,40,.14);white-space:pre-wrap";
+      body.insertBefore(note, body.firstChild);
+      body.wkFault = note;
+    }
+    const msg = (e && (e.message || e.detail)) || String(e || "");
+    const frame = String((e && e.stack) || "").split("\n")[1] || "";
+    note.textContent = where + " — " + msg
+      + (frame ? "\n" + frame.trim() : "");
+    note.title = String((e && e.stack) || msg);
+  }
+
+  function wkFaultClear(body) {
+    if (body.wkFault && body.wkFault.parentElement === body) {
+      body.removeChild(body.wkFault);
+    }
+    body.wkFault = null;
+  }
+
   async function load(body) {
+    let dj = null;
+    let pend = null;
     try {
-      const [dj, pend] = await Promise.all([
+      const got = await Promise.all([
         api.get("/api/dj"),
         api.get("/api/dj/pending"),
       ]);
-      paint(body, dj, pend);
+      dj = got[0];
+      pend = got[1];
     } catch (e) {
-      body.textContent = "";
-      body.appendChild(mk("div", "wk-note", "the works are unreachable"));
+      /* #933: THIS is unreachable — and it says what the transport said
+       * rather than leaving the operator to guess between a dead station
+       * and a bad key. The window is not emptied: the last good paint is
+       * better than a blank box. */
+      wkFault(body, "the station did not answer", e);
+      return;
+    }
+    try {
+      paint(body, dj, pend);
+      wkFaultClear(body);
+    } catch (e) {
+      /* #933: the endpoints answered and the DRAWING threw. Whatever
+       * painted stays on screen; the fault goes at the top with the
+       * message and the frame it came from. */
+      wkFault(body, "the flow could not be drawn", e);
     }
   }
 
