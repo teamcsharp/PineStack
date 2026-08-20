@@ -1588,3 +1588,26 @@ body.immersive main {
   background: #05090f;
   padding: 4px 7px;
 }
+
+/* #980 - the three streams, each on its own line, in the rail. */
+.stream-routes {
+  display: grid;
+  gap: 4px;
+  margin: 2px 0 8px;
+}
+.stream-routes label {
+  display: grid;
+  grid-template-columns: 54px 1fr;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+.stream-routes select {
+  height: 26px;
+  padding: 0 6px;
+  font-size: 11px;
+  min-width: 0;
+}
+.stream-routes label.away select { color: var(--amber); }
+body.rail-compact .stream-routes { display: none; }

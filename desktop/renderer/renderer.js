@@ -188,8 +188,82 @@ function appVolumeScript(audible = true) {
   })();`;
 }
 
+/* #980 - THE THREE STREAMS, EACH REDIRECTABLE ON ITS OWN.
+ *
+ * The Broadcast picker is a preset: it moves music, DJs and replies
+ * together. That is the common case and it stays. But the streams are
+ * independent on the server - /api/dj/output takes them separately - and
+ * there was no way to say "keep the music on the box, bring the DJs
+ * here" without editing the routing by hand.
+ */
+const STREAM_ROUTE_IDS = {
+  music: "routeMusic", voice: "routeVoice", reply: "routeReply",
+};
+
+/* Paint the three pickers from what the SERVER says, never from what
+ * this app last asked for - the routing is shared between clients and
+ * the box can change it underneath us. */
+function paintStreamRoutes(routing) {
+  if (!routing) return;
+  const now = {music: routing.music_to, voice: routing.voice_to,
+               reply: routing.reply_to};
+  Object.keys(STREAM_ROUTE_IDS).forEach((stream) => {
+    const select = $(STREAM_ROUTE_IDS[stream]);
+    if (!select) return;
+    const value = String(now[stream] || "");
+    if (value && select.value !== value
+        && document.activeElement !== select) {
+      select.value = value;
+    }
+    // Amber when this stream is NOT coming out of the app, so a silent
+    // application is legible at a glance instead of being a mystery.
+    const label = select.parentElement;
+    if (label) {
+      label.classList.toggle("away",
+        value !== "here" && value !== "both");
+    }
+  });
+}
+
+async function setStreamRoute(stream, value) {
+  const body = {};
+  body[stream] = value;
+  try {
+    await api.post("/api/dj/output", body);
+    noteRouteOk(stream + " \u2192 "
+      + (value === "here" ? "the app" : value === "box" ? "the Pine Box"
+         : value === "both" ? "both" : "off"));
+    // The preset picker no longer describes what is going on; say so by
+    // re-reading the server rather than guessing a label.
+    await refresh();
+    applyAppVolume();
+  } catch (err) {
+    noteRouteError(err.message);
+  }
+}
+
+function initStreamRoutes() {
+  Object.keys(STREAM_ROUTE_IDS).forEach((stream) => {
+    const select = $(STREAM_ROUTE_IDS[stream]);
+    if (!select || select.dataset.wired) return;
+    select.dataset.wired = "1";
+    select.onchange = (ev) => setStreamRoute(stream, ev.target.value);
+  });
+}
+
 /* #979: is the broadcast being sent HERE, to this application? */
+let lastRouting = null;                 // #980: what the server last said
+
 function routeIsHere() {
+  /* #980: ask the SERVER first. A stream moved on its own - "keep the
+   * music on the box, bring the DJs here" - has to make this app audible
+   * just as much as the preset does, and the preset would not know. */
+  if (lastRouting) {
+    const vals = [lastRouting.music_to, lastRouting.voice_to,
+                  lastRouting.reply_to];
+    if (vals.some((v) => v === "here" || v === "both")) return true;
+    if (vals.every((v) => v)) return false;   // the server was explicit
+  }
   const route = ROUTES[desiredBroadcast];
   if (!route) return false;
   return route.music === "here" || route.voice === "here"
@@ -338,6 +412,17 @@ function setDesiredBroadcast(key) {
   localStorage.setItem("pineDesktopBroadcast", key);
   const select = $("broadcastTarget");
   if (select && select.value !== key) select.value = key;
+  /* #980: AND RE-GATE THE AUDIO. audibleFrame() is derived from the
+   * route, and this is the one place the route ever changes - so it is
+   * the one place that can guarantee the gate agrees with it.
+   *
+   * Without this the app came up silent every single launch:
+   * applyDefaultBroadcast() adopts the server's routing at boot (#791,
+   * deliberately - the app does not overwrite what you set elsewhere),
+   * but it lands AFTER applyAppVolume() has already run against the
+   * default route of "nabu". routeIsHere() was false at that moment, the
+   * frame was muted, and nothing ever re-applied it. */
+  try { applyAppVolume(); } catch (err) { /* the route still changed */ }
 }
 
 function setFmUi(on) {
@@ -520,6 +605,14 @@ async function refresh() {
       setRouteUi(desiredBroadcast, routeLabelFromState(status.routing));
     }
     setFmUi(status.routing && status.routing.on);
+    /* #980: remember what the server said and paint the three stream
+       pickers from it, then re-gate - a stream moved from anywhere
+       (another client, the box, a spoken command) has to reach the
+       app's audio, not just a change made in this window. */
+    lastRouting = status.routing || null;
+    paintStreamRoutes(status.routing);
+    initStreamRoutes();
+    applyAppVolume();
     renderChecks(status);
   } catch (err) {
     setText("boxState", err.message);
