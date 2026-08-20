@@ -14209,15 +14209,49 @@ def active_prompt_text(limit: int = 1200) -> str:
         return ""
 
 
+def station_disposition_text(limit: int = 1200) -> str:
+    """#983: THE STATION'S OWN standing instructions — not the agent's.
+
+    "The system prompt for the pine agent should have nothing at all to do
+    with the dj system, phone calls or the disposition of anyone who is
+    involved with the radio station."
+
+    Quite right, and they were the same string. settings["prompts"]
+    [active_prompt] is the PINE AGENT's system prompt — the one on the
+    Agent screen, the one that governs the assistant you talk to — and
+    dj_disposition folded it straight into the pair's heads, from where
+    it reached the booth, the callers and the memos from upstairs. So
+    arming the agent with "curse excessively and talk in hip hop allegory
+    and rhyme" armed the radio station with it too, and the provenance
+    window said so out loud: "the armed system prompt: jerk4 · the booth
+    is following it".
+
+    The station has had its own layer all along — radio_prompt_overrides
+    ["station_system"], written on the radio prompt desk — and it was
+    being used only as an on/off switch for somebody else's text. It is
+    the text now. There is no fallback to the agent's prompt: an empty
+    station prompt means the pair are simply themselves, which is the
+    whole point of the separation."""
+    try:
+        text = str((dj_settings().get("radio_prompt_overrides") or {})
+                   .get("station_system") or "")
+        return " ".join(text.split())[:limit]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def dj_disposition() -> str:
-    """The active system prompt, folded into the pair's heads when you have
-    asked for it. Switching prompts then swings the mood of the show without
-    touching either persona — the prompt colours them, it does not replace
-    them or hand them a new job."""
+    """The STATION's standing instructions, folded into the pair's heads
+    when you have asked for it. Switching them swings the mood of the show
+    without touching either persona — they colour the pair, they do not
+    replace them or hand them a new job.
+
+    #983: drawn from the station's own prompt layer. It used to be the
+    Pine agent's system prompt; see station_disposition_text."""
     if not (dj_settings()["follow_prompt"]
             and radio_prompt_enabled("station_system")):
         return ""
-    text = active_prompt_text()
+    text = station_disposition_text()
     if not text:
         return ""
     return (
@@ -44875,7 +44909,10 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     # the shelf or file a phantom row in the crystal observatory for words
     # that never reached the air.
     _hot_memo = hot >= 70 and random.random() < 0.5
-    note = (active_prompt_text(800) + radio_prompt_instruction("manager")
+    # #983: the memo from upstairs is written by the STATION, not by the
+    # Pine agent. This read the agent's armed prompt, so whatever the
+    # assistant was told to be turned up in management's letters too.
+    note = (station_disposition_text(800) + radio_prompt_instruction("manager")
             + radio_prompt_instruction("workplace")).strip()
     if not _hot_memo and not note:
         return []               # nothing has come down from upstairs
@@ -54086,11 +54123,21 @@ async def dj_provenance_api(
             "kind_now": str(_RADIO.get("sched_kind") or ""),
             "prompt_now": str(_RADIO.get("sched_prompt") or "")[:900],
         },
+        # #983: TWO PROMPTS, REPORTED AS TWO. `entry` is the PINE
+        # AGENT's armed prompt; it governs the assistant and, since #983,
+        # nothing whatever about the booth. What the booth follows is the
+        # station's own disposition layer. Reporting the agent's prompt
+        # under "the booth is following it" is what made the coupling
+        # invisible for so long — it was true when it was written and
+        # became a lie the moment anyone looked.
         "system": {
             "name": str(written.get("armed") or entry.get("name") or ""),
             "armed_now": str(entry.get("name") or ""),
             "text": str(entry.get("prompt") or "")[:2400],
-            "followed": followed,
+            "followed": False,          # the agent's prompt never is
+            "station": station_disposition_text(2400),
+            "station_followed": followed and bool(
+                station_disposition_text(1)),
         },
         "burst": int(trace.get("burst") or 0),
         "requests": (request_history().get("top") or [])[:6],

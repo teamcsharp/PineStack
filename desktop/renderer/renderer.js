@@ -8961,11 +8961,21 @@ function dxProvSystems(p) {
        written.chars ? written.chars + " characters came back" : "",
        written.budget ? "budget " + written.budget : ""], []);
 
-  add("system", "The armed system prompt", 0xc98fe0,
+  /* #983: two prompts, drawn as two. The agent's armed prompt governs
+     the assistant you talk to and nothing about the booth; what the
+     booth follows is the station's own disposition layer. Showing the
+     first one under "the booth is following it" is exactly what hid the
+     coupling between them. */
+  add("system", "The agent's system prompt", 0xc98fe0,
       system.name || "(none armed)",
-      [system.followed ? "the booth is following it"
-        : "the booth is not bound to it",
+      ["governs the assistant, not the booth",
        (system.text || "").slice(0, 220)], []);
+
+  add("station", "The station's standing instructions", 0xe0c98f,
+      system.station_followed ? "the booth is following them"
+        : "the booth is not bound to any",
+      [(system.station || "(none set on the radio prompt desk)")
+        .slice(0, 220)], []);
 
   add("schedule", "The running order", 0x8fe0b0,
       sched.kind || sched.kind_now || "(no entry named this round)",
