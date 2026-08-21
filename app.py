@@ -18350,7 +18350,25 @@ def _round_chunks(turns: list[tuple[str, str]],
         # (banter_turns folds a bare "Caller:" label to C whatever the
         # caller_name is, so an ordinary booth round that picked one up
         # now loses that single turn instead of every turn it has.)
-        live_only = who in ("caller", "caller2") or not voice
+        # #1005: A CALLER WITH A KNOWN VOICE CAN BE RECORDED AHEAD.
+        #
+        # This read `who in ("caller", "caller2") or not voice`, and the
+        # note above it gave the reason: "the phone line is drawn per
+        # call". That was true when a call was written and aired in one
+        # breath. It is not true of a BANKED round: dj_banter stores
+        # caller_voice AND caller_fx on the entry, and _banter_air hands
+        # that very caller_fx back to speak_turns when the round airs
+        # (see the call at dj_caller's prepared road) - so the phone the
+        # clip is cut with is the phone the call goes out on.
+        #
+        # It mattered: calls are four of the twenty entries in the
+        # canonical hour, every caller turn was rendered LIVE ON AIR at
+        # about twice real time, and every remaining silence over thirty
+        # seconds in the flow measurements landed on a caller turn.
+        #
+        # A caller with no voice yet is still live-only, which is the
+        # other half of what this line always said.
+        live_only = not voice
         vec = {} if live_only else performance_vector(who, voice)
         for at, chunk in enumerate(
                 sentence_chunks(text, cap=cap,
@@ -18629,7 +18647,19 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         turns = banter_turns(str(entry.get("script") or ""),
                              str(entry.get("caller_name") or ""),
                              str(entry.get("caller2_name") or ""))
-        voices = await session_voices()
+        voices = dict(await session_voices())
+        # #1005: AND THE CALLER'S OWN VOICE, off the banked round.
+        #
+        # A caller's voice is drawn per call, so it is not in the session
+        # cast and _round_chunks had nothing to render their turns with.
+        # It IS on the entry - dj_banter banks caller_voice beside the
+        # script - so a banked round has always known who is on the phone;
+        # nobody had handed it to the preparer.
+        for _seat, _key in (("caller", "caller_voice"),
+                            ("caller2", "caller2_voice")):
+            _cv = str(entry.get(_key) or "")
+            if _cv:
+                voices[_seat] = _cv
         # #871: the caller's name goes in, so the plan accounts for the
         # hello speak_turns puts in front of a caller who never
         # introduces themselves — see _prep_intro_pad.
@@ -18795,6 +18825,16 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             strip = str(dj.get(f"strip_{who}") or "")
             if strip:
                 fx["strip"] = strip
+            # #1005: and the PHONE, for a seat that is on one. speak_turns
+            # merges the round's stored caller_fx exactly this way when it
+            # airs, so cutting it in now is what makes the prepared clip
+            # sound like the call it belongs to rather than like somebody
+            # in the room.
+            if who in ("caller", "caller2"):
+                try:
+                    fx.update(dict(entry.get("caller_fx") or {}))
+                except Exception:  # noqa: BLE001
+                    pass
             # #904: ONE engine budget, and preparation never queues in
             # front of the air. No slot free this instant means this
             # line waits for the next pass rather than crowding the
@@ -28092,7 +28132,17 @@ async def shelf_transcript(kind: str, sid: str) -> dict[str, Any]:
         turns = banter_turns(str(entry.get("script") or ""),
                              str(entry.get("caller_name") or ""),
                              str(entry.get("caller2_name") or ""))
-        plan = _round_chunks(turns, await session_voices(),
+        # #1005: the same caller-voice injection larder_prepare does, so
+        # this listing rederives the SAME plan the preparer and the air
+        # road build - including the caller's turns, which are now
+        # recorded ahead like everybody else's.
+        _voices = dict(await session_voices())
+        for _seat, _key in (("caller", "caller_voice"),
+                            ("caller2", "caller2_voice")):
+            _cv = str(entry.get(_key) or "")
+            if _cv:
+                _voices[_seat] = _cv
+        plan = _round_chunks(turns, _voices,
                              str(entry.get("caller_name") or ""))
         out["lines"] = [
             _line_row(i, who, text, voice,
