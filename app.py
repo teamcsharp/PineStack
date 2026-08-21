@@ -8993,7 +8993,23 @@ def pantry_life() -> float:
         want = 3600.0
     ceiling = float(globals().get("PANTRY_BURN_SECONDS") or 86400.0)
     return max(PANTRY_LIFE, min(ceiling, want + 1800.0))
-PANTRY_MAX = 600
+# #1004: the row ceiling follows the build-ahead dial, like everything
+# else that decides how much may be held. Six hundred rows was written
+# when the station prepared an hour; at ninety minutes with the deeper
+# tanks of #977 the pantry passes it easily, and every row shed past it
+# used to take a PREPARED segment down with it (see pantry_put).
+PANTRY_MAX_FLOOR = 600
+
+
+def pantry_max_rows() -> int:
+    try:
+        hours = max(0.25, float(prepare_target_seconds()) / 3600.0)
+    except Exception:  # noqa: BLE001
+        hours = 1.0
+    return int(max(PANTRY_MAX_FLOOR, min(4000, PANTRY_MAX_FLOOR * hours * 1.5)))
+
+
+PANTRY_MAX = PANTRY_MAX_FLOOR
 # #894/#832: "we never let our cache get over six gigabytes total".
 # Counting clips says nothing about disk; this counts bytes and sheds
 # oldest-first the moment the shelf is over its allowance.
@@ -9223,25 +9239,86 @@ def pantry_put(key: str, clip: dict[str, Any],
                     "who": str(who or "")[:24],
                     "kind": str(kind or "")[:24]}
     _pantry_save()                                          # #915
-    if len(_PANTRY) > PANTRY_MAX:
-        for old in sorted(_PANTRY,
-                          key=lambda k: float(_PANTRY[k].get("at") or 0)
-                          )[:len(_PANTRY) - PANTRY_MAX]:
+    # #1004: NEVER SHED A CLIP A PREPARED SEGMENT IS HOLDING.
+    #
+    # This dropped the OLDEST rows and asked nothing else - and the oldest
+    # rows are exactly the ones the recording room finished first, which
+    # is to say the prepared segments waiting their turn on the shelf.
+    # The FILE survived (the media prune has protected pantry clips since
+    # #886); it was the pantry ROW that went, and shelf_take then found
+    # `key and not pantry_get(key)`, called the row dead, and the segment
+    # was written and rendered LIVE ON AIR instead.
+    #
+    # Measured: "a station ID: 5 prepared row(s) on the shelf and not one
+    # of them could be taken - 5x clip gone", with 75% of all takes
+    # rendering live while the pantry held ninety-six minutes of finished
+    # audio. The station was preparing material and then deleting it to
+    # make room for more material it would also delete.
+    #
+    # pantry_spoken_for() already answers "what is a shelf row, a banked
+    # round or the hold shelf actually holding" - #930 wrote it for the
+    # horizon rule. It just was not asked here.
+    _ceiling = pantry_max_rows()
+    if len(_PANTRY) > _ceiling:
+        try:
+            _held = pantry_spoken_for()
+        except Exception:  # noqa: BLE001
+            _held = set()
+        _loose = sorted((k for k in _PANTRY if k not in _held),
+                        key=lambda k: float(_PANTRY[k].get("at") or 0))
+        _over = len(_PANTRY) - _ceiling
+        for old in _loose[:_over]:
             _PANTRY.pop(old, None)
+        # If every last row is spoken for, the ceiling still has to hold -
+        # an unbounded pantry is its own outage. Oldest first, and the
+        # glass says it, because at that point the station is preparing
+        # faster than it can air and that is worth knowing.
+        _over = len(_PANTRY) - _ceiling
+        if _over > 0:
+            for old in sorted(_PANTRY,
+                              key=lambda k: float(_PANTRY[k].get("at") or 0)
+                              )[:_over]:
+                _PANTRY.pop(old, None)
+            pipeline_log("lookahead",
+                         f"the pantry is at its {_ceiling}-take ceiling and "
+                         f"every take is spoken for - {_over} prepared "
+                         "take(s) had to go. The station is preparing "
+                         "faster than it airs (#1004)")
     # #894: and the six-gigabyte allowance. Oldest goes first, and only
     # the SHELF entry is dropped — the file itself is left to the normal
     # media prune, which knows what is still queued to air.
     try:
         held = pantry_bytes()
         if held > PANTRY_MAX_BYTES:
-            for old in sorted(_PANTRY,
-                              key=lambda k: float(_PANTRY[k].get("at") or 0)):
+            # #1004: the same rule as the row ceiling above. This shed the
+            # oldest rows outright, which is the same as shedding the
+            # earliest-prepared segments - loose cache first, and a
+            # spoken-for take is only given up when nothing else is left.
+            try:
+                _held_keys = pantry_spoken_for()
+            except Exception:  # noqa: BLE001
+                _held_keys = set()
+            _by_age = sorted(_PANTRY,
+                             key=lambda k: float(_PANTRY[k].get("at") or 0))
+            _gave_up = 0
+            for _pass in (0, 1):
+                for old in list(_by_age):
+                    if held <= PANTRY_MAX_BYTES:
+                        break
+                    if _pass == 0 and old in _held_keys:
+                        continue        # material, not spare capacity
+                    if old not in _PANTRY:
+                        continue
+                    if _pass == 1:
+                        _gave_up += 1
+                    held -= _pantry_bytes_of(_PANTRY[old])
+                    _PANTRY.pop(old, None)
                 if held <= PANTRY_MAX_BYTES:
                     break
-                held -= _pantry_bytes_of(_PANTRY[old])
-                _PANTRY.pop(old, None)
             pipeline_log("lookahead", "the pantry reached its six-gigabyte "
-                         "allowance — oldest takes shed (#894)")
+                         "allowance — loose takes shed first (#894/#1004)"
+                         + (f"; {_gave_up} PREPARED take(s) had to go too"
+                            if _gave_up else ""))
     except Exception:  # noqa: BLE001
         pass
 
@@ -9723,25 +9800,33 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         if str(kind) in SHELF_REUSABLE:
             _order.sort(key=lambda r: (1 if r.get("aired_at") else 0,
                                        float(r.get("aired_at") or 0)))
+        _why: list[str] = []                                   # #1003
         for row in _order:
             if time.time() - float(row.get("at") or 0) > PANTRY_BURN_SECONDS:
+                _why.append("burnt")
                 continue
             # #977: it has been out; has it rested long enough?
             _out_at = float(row.get("aired_at") or 0)
             if _out_at:
                 if str(kind) not in SHELF_REUSABLE:
+                    _why.append("already aired")
                     continue        # should not be here at all
                 if int(row.get("aired") or 0) >= SHELF_REUSE_MOST:
+                    _why.append("innings used")
                     continue        # it has had its innings
                 if time.time() - _out_at < SHELF_REUSE_REST:
+                    _why.append("resting")
                     continue        # still resting
             if voice and str(row.get("voice") or "") != str(voice):
+                _why.append("voice moved")
                 continue            # prepared for a seat that has changed
             key = str(row.get("key") or "")
             if key and not pantry_get(key):
+                _why.append("clip gone")
                 continue            # the clip went stale or was pruned
             entry = row.get("entry")
             if isinstance(entry, dict) and not _larder_current(entry):
+                _why.append("contract moved")
                 continue            # written against a contract that moved
             try:
                 if str(kind) in SHELF_REUSABLE:
@@ -9768,6 +9853,26 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 pass
             alt_took(kind, row)                                # #926
             return row
+        # #1003: SAY WHY. A road that has prepared rounds standing by and
+        # still writes a fresh one live is the single most expensive thing
+        # this station can do - every line of it then renders on air at
+        # about twice real time, with the listener waiting on each one.
+        # Until now that refusal was four bare `continue`s and the glass
+        # said nothing at all, so "the shelf is stocked and the air is
+        # live" had no explanation anywhere.
+        if _order and _why:
+            try:
+                import collections as _c
+                pipeline_log("lookahead",
+                             f"{SHELF_LABEL.get(kind, kind)}: "
+                             f"{len(_order)} prepared row(s) on the shelf and "
+                             "not one of them could be taken - "
+                             + ", ".join(f"{n}x {w}" for w, n
+                                         in _c.Counter(_why).most_common())
+                             + " - so this segment is being written live "
+                               "instead (#1003)")
+            except Exception:  # noqa: BLE001
+                pass
         # Nothing usable: shed what is plainly dead so the shelf does not
         # grow a tail of rows nobody can ever take.
         _SHELF[str(kind)] = [
@@ -27225,9 +27330,34 @@ def alt_larder_index() -> int:
                              "the booth round pinned to this entry has gone "
                              "stale — the shelf's own order stands (#926)")
                 break
-        best, best_pri, best_at = 0, None, 0.0
+        # #1002: A RECORDED ROUND BEATS AN OLDER ONE THAT IS ONLY WRITTEN.
+        #
+        # This ranked on priority, then OLDEST, and never once asked
+        # whether the round it was about to put on air had actually been
+        # recorded. So the air routinely took a written-but-unvoiced
+        # round while finished ones stood beside it - and every line of
+        # it was then rendered LIVE, at ~2x real time, with the listener
+        # waiting on each one.
+        #
+        # Measured before this changed: 118 takes, 30 off the shelf, 88
+        # rendered live on air - 75% - while the pantry held 390 clips
+        # and 96 minutes of finished audio and the flow read "continuity
+        # reserve is healthy". The gaps that produced were not small: a
+        # 157-second silence in a five-minute sample, and eight silences
+        # over thirty seconds, every one of them with ready=9 and nothing
+        # waiting. The station was not short of material. It was standing
+        # in front of the microphone reading the script cold.
+        #
+        # `prepared` is what larder_prepare sets when a round's every line
+        # is in the pantry, so it is exactly "this one costs nothing to
+        # air". It ranks under the operator's pin and under priority -
+        # both of those are deliberate choices about WHAT should air, and
+        # this is only about which of two equal choices is cheaper - and
+        # above age, which was never more than a tie-break.
+        best, best_pri, best_at, best_rdy = 0, None, 0.0, False
         for i, entry in enumerate(_LARDER):
             at = float(entry.get("at") or 0)
+            rdy = bool(entry.get("prepared"))
             # A round the keeper has not swept up yet that is already
             # stale or off-contract is not a candidate while a good one
             # stands beside it — dj_banter would only drop it on the
@@ -27237,9 +27367,12 @@ def alt_larder_index() -> int:
                     or not _larder_current(entry)):
                 continue
             pri = alt_priority(entry)
-            if (best_pri is None or pri > best_pri
-                    or (pri == best_pri and at < best_at)):
-                best, best_pri, best_at = i, pri, at
+            if (best_pri is None
+                    or pri > best_pri
+                    or (pri == best_pri and rdy and not best_rdy)
+                    or (pri == best_pri and rdy == best_rdy
+                        and at < best_at)):
+                best, best_pri, best_at, best_rdy = i, pri, at, rdy
         return best if 0 <= best < len(_LARDER) else 0
     except Exception:  # noqa: BLE001
         return 0
