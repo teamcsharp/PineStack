@@ -78983,6 +78983,43 @@ function djStreamCurrentId() {
 }
 /* #772: run the round's own clock rather than waiting to be told. Also
  * releases rows from "coming up" as they come up. */
+/* #1002: what one row is doing, measured against the broadcast clock.
+ * held is the only state that does not come off the clock: a line the box
+ * accepted and never played is not "coming up", it is a line nobody heard,
+ * and saying so is the whole point of the window. */
+function djRowState(row, line) {
+  try {
+    const st = row.querySelector("[data-state]");
+    if (!st) return;
+    if (line && line.aired === "held") {
+      st.textContent = "\u26a0 not heard";
+      st.style.color = "#e0a35c";
+      st.title = "The box accepted this line and played none of it. It is "
+        + "held and will go out when the box answers.";
+      return;
+    }
+    const at = Number(row.getAttribute("data-airat") || 0);
+    if (!at) { st.textContent = ""; return; }
+    const now = djStreamAt();
+    const live = window.djSpeakingEid
+      && row.getAttribute("data-eid") === window.djSpeakingEid;
+    if (live) {
+      st.textContent = "\u25cf on air";
+      st.style.color = "#7ce8a9";
+      st.title = "This is the line sounding right now";
+    } else if (at > now + 0.6) {
+      const wait = Math.round(at - now);
+      st.textContent = "\u25f7 in " + (wait > 99 ? "99+" : wait) + "s";
+      st.style.color = "#6d8199";
+      st.title = "Written and recorded; it has not been heard yet";
+    } else {
+      st.textContent = "\u2713 played";
+      st.style.color = "#5d7189";
+      st.title = "This line has gone out";
+    }
+  } catch (e) { /* the row still reads */ }
+}
+
 function djBoothTick() {
   const log = document.getElementById("djTalkLog");
   if (log) {
@@ -78994,6 +79031,14 @@ function djBoothTick() {
         const tag = r.querySelector("[data-comingtag]");
         if (tag) tag.remove();
       }
+    });
+  }
+  /* #1002: and every row's state, not only the ones crossing from
+   * "coming" to "gone" - a row painted after its air time never had the
+   * data-coming attribute and so was never revisited at all. */
+  if (log) {
+    log.querySelectorAll("[data-airat]").forEach((r) => {
+      djRowState(r, {aired: r.getAttribute("data-aired") || ""});
     });
   }
   const id = djStreamCurrentId();
@@ -81542,6 +81587,7 @@ function djTalkRowInner(line) {
      * id, and the jump fell through to "nothing is going out". */
     if (line.id) row.setAttribute("data-eid", line.id);
     row.setAttribute("data-who", line.who || "");
+    if (line.aired) row.setAttribute("data-aired", String(line.aired));
     /* #782: three seconds on any row and it tells you its whole life —
      * who wrote it and how long that took, what shaped it, which engine
      * said it and how far behind real time that ran, when it was due and
@@ -81562,6 +81608,31 @@ function djTalkRowInner(line) {
     if (_air && _air > djStreamAt() + 0.6) {
       row.setAttribute("data-coming", "1");
       row.style.opacity = ".45";
+    }
+    /* #1002: SAY WHAT THIS LINE IS DOING.
+     *
+     * "these lines in between and around them, I didn't hear them... I'm
+     * expecting the booth dialogue window to be accurate."
+     *
+     * The window was accurate about ORDER - the rows are in air order and
+     * carry measured per-turn windows off the coalesced clip (#748/#778),
+     * and a check of the live ring found none out of sequence. What it
+     * could not say is WHEN. A round is written into the booth in one
+     * batch as its audio is built, so the next two minutes are on screen
+     * before a word of it has sounded - and a line you have not heard YET
+     * looked exactly like one that had already gone out. Dimming told you
+     * "not yet", but nothing told you "done", and nothing told you "this
+     * one, right now" except a mark that only one row can wear.
+     *
+     * Every row says which it is, and djBoothTick keeps it true against
+     * the broadcast clock rather than against when the row was drawn. */
+    if (_air || line.aired === "held") {
+      const st = el("i", "", "");
+      st.setAttribute("data-state", "1");
+      st.style.cssText = "flex:0 0 auto;font-style:normal;font-size:9px;"
+        + "letter-spacing:.04em;opacity:.75;min-width:52px;text-align:right";
+      row.appendChild(st);
+      djRowState(row, line);
     }
     if (line.name) row.setAttribute("data-name", line.name);
     // #691: the call ended. A call used to just stop scrolling — no mark,
