@@ -30949,6 +30949,29 @@ def ad_booth_row(text: str, product: str = "", who: str = "dj",
             "voice": str(voice or ""),
             "aired": aired,
         }
+        # #1005: "the only thing that would make this ad even better for
+        # this painting ad would be to actually see the painting on the
+        # side in the chat in the booth dialogue window."
+        #
+        # The gallery ROUND already hangs its picture on the lines that
+        # discuss it (#702/#991) - the ad road never did, and a spot whose
+        # whole job is selling a painting is the place it is most wanted.
+        # ad_now_set has already resolved the file (from the stamp, or by
+        # reading the title back out of the read itself), so this is the
+        # same picture the marquee is holding up, on the line that is
+        # selling it. Empty when the spot is not selling a picture, which
+        # is no thumbnail rather than the wrong one.
+        try:
+            _sell = _RADIO.get("ad_now") or {}
+            _pic = str(_sell.get("image") or "")
+            if _pic and time.time() - float(_sell.get("at") or 0) < 300:
+                row["images"] = [_pic]
+                if _sell.get("title"):
+                    row["sold_title"] = str(_sell.get("title"))[:160]
+                if _sell.get("price"):
+                    row["sold_price"] = int(_sell.get("price") or 0)
+        except Exception:  # noqa: BLE001
+            pass
         if ad_id:
             row["ad_id"] = str(ad_id)
         if audio:
@@ -58867,6 +58890,174 @@ async def api_interject_progress(
     return interject_progress()
 
 
+# #946/#947: THE CALL SHEET.
+#
+# "So I'm looking at the rooms being backed up without the lines being
+# specified for them... the writing desk should be setting up scripts
+# that the reserve is extracting and coordinating to go with each
+# particular actor. So whenever they go into the recording room, they're
+# able to record all of their lines at once."
+#
+# The RECORDING half of that has been built since #858/#906: a round's
+# plan is regrouped by performer before a word of it is made, so an actor
+# runs everything they say in that round in one sitting rather than the
+# engine swapping speaker conditioning line by line down the script. It
+# is safe because the pantry is content-addressed - playback looks each
+# line up by its own text, so the order the takes were recorded in has no
+# bearing on the order they air. Nothing is spliced and no boundary is
+# guessed. #934 keeps each line's place in the SCRIPT beside it so the
+# transcript still reads in the order it is spoken.
+#
+# What was missing is exactly what the operator said he was looking at:
+# no way to SEE it. The rooms are full of work and nothing anywhere says
+# whose work it is, what it is for, or how much of it there is. So this
+# reads the reserve and the shelves, works out every line that has been
+# written and not yet recorded, and puts it under the person who has to
+# say it, with the segment it belongs to beside it.
+#
+# On the question of running one actor across MANY rounds in a single
+# sitting: measured on this box, grouping saves roughly a tenth of the
+# render time, and it would mean no round is finished until every actor
+# has been through - so on a station already short of material the first
+# airable round arrives much later. The round is the unit that can go on
+# the air, so the round stays the unit that gets finished.
+async def call_sheet(hours: float = 3.0) -> dict[str, Any]:
+    """#946/#947: who is wanted in the recording room, and for what."""
+    out: dict[str, Any] = {"at": time.time(), "hours": round(hours, 2),
+                           "actors": [], "rounds": 0, "lines": 0,
+                           "seconds": 0.0, "say": ""}
+    try:
+        voices = dict(await session_voices())
+    except Exception:  # noqa: BLE001
+        voices = {}
+    jobs: list[tuple[str, str, dict[str, Any]]] = []
+    try:
+        for entry in list(_LARDER):
+            if isinstance(entry, dict) and not entry.get("prepared"):
+                jobs.append(("banter", "the reserve", entry))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for kind, rows in list(_SHELF.items()):
+            for row in (rows or []):
+                ent = (row or {}).get("entry")
+                if isinstance(ent, dict) and not ent.get("prepared"):
+                    jobs.append((str(kind),
+                                 str(row.get("label")
+                                     or SHELF_LABEL.get(str(kind), str(kind))),
+                                 ent))
+    except Exception:  # noqa: BLE001
+        pass
+    seats: dict[str, dict[str, Any]] = {}
+    rounds = 0
+    for kind, label, entry in jobs:
+        try:
+            turns = banter_turns(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or ""))
+            if not turns:
+                continue
+            cast = dict(voices)
+            for _seat, _key in (("caller", "caller_voice"),
+                                ("caller2", "caller2_voice")):
+                _cv = str(entry.get(_key) or "")
+                if _cv:
+                    cast[_seat] = _cv
+            plan = _round_chunks(turns, cast,
+                                 str(entry.get("caller_name") or ""))
+        except Exception:  # noqa: BLE001
+            continue
+        if not plan:
+            continue
+        rounds += 1
+        for text, voice, who in plan:
+            if not voice:
+                continue
+            try:
+                if pantry_get(pantry_key(text, voice,
+                                         voice_engine_for(voice, who))):
+                    continue                # already recorded; not owed
+            except Exception:  # noqa: BLE001
+                pass
+            seat = seats.setdefault(str(voice), {
+                "voice": str(voice), "lines": 0, "chars": 0,
+                "seats": [], "for": [], "engine": ""})
+            seat["lines"] += 1
+            seat["chars"] += len(str(text or ""))
+            if who and who not in seat["seats"]:
+                seat["seats"].append(str(who))
+            _for = f"{label}"
+            if _for not in seat["for"]:
+                seat["for"].append(_for)
+    # SAY_CHARS_PER_SECOND is the same figure every other estimate on this
+    # station works in, so a call sheet and a coordinator board cannot
+    # disagree about how long a line runs.
+    per_second = 14.0
+    total_lines = 0
+    total_seconds = 0.0
+    actors: list[dict[str, Any]] = []
+    for vid, seat in seats.items():
+        try:
+            meta = voice_meta(vid) or {}
+        except Exception:  # noqa: BLE001
+            meta = {}
+        try:
+            engine = voice_engine_for(vid)
+        except Exception:  # noqa: BLE001
+            engine = ""
+        secs = round(float(seat["chars"]) / per_second, 1)
+        total_lines += int(seat["lines"])
+        total_seconds += secs
+        actors.append({
+            "voice": vid,
+            "name": str(meta.get("name") or vid),
+            "engine": engine,
+            "seats": seat["seats"][:4],
+            "lines": int(seat["lines"]),
+            "seconds": secs,
+            # what those lines are FOR - the operator's own words for
+            # what was missing.
+            "for": seat["for"][:6],
+        })
+    actors.sort(key=lambda a: -int(a.get("lines") or 0))
+    out["actors"] = actors
+    out["rounds"] = rounds
+    out["lines"] = total_lines
+    out["seconds"] = round(total_seconds, 1)
+    # And what that costs in room time, at the engine's measured rate -
+    # so "the rooms are backed up" has a number on it.
+    try:
+        rate = float(task_rate("render_line") or 0) or 0.35
+    except Exception:  # noqa: BLE001
+        rate = 0.35
+    out["room_seconds"] = round(total_seconds / max(0.05, rate), 1)
+    if not actors:
+        out["say"] = ("every line that has been written has been recorded - "
+                      "the rooms are clear and the desk is the only thing "
+                      "that can make more")
+    else:
+        top = actors[0]
+        out["say"] = (
+            f"{len(actors)} actor(s) are wanted for {total_lines} line(s) "
+            f"across {rounds} round(s) - about {int(total_seconds / 60)} min "
+            f"of air, which is roughly {int(out['room_seconds'] / 60)} min "
+            f"in the room. {top['name']} has the most at {top['lines']}"
+            + (f" ({', '.join(top['for'][:3])})" if top.get("for") else ""))
+    return out
+
+
+@app.get("/api/rooms/call-sheet")
+async def api_call_sheet(
+    hours: float = 3.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#946/#947: who is wanted in the recording room, for how many lines,
+    and which segments those lines belong to - so a backed-up room says
+    whose work it is holding rather than only that it is holding some."""
+    require_read_auth(authorization)
+    return await call_sheet(max(0.25, min(24.0, float(hours or 3.0))))
+
+
 @app.get("/api/schedule/brief-audit")
 async def api_brief_audit(
     authorization: str | None = Header(default=None),
@@ -82781,12 +82972,37 @@ function djTalkRowInner(line) {
          * viewer and the hawk menu on it - the listing simply never wore
          * one. Reused rather than rebuilt so a painting behaves the same
          * wherever it is shown. */
-        const _th = artThumb(_pics[0], 34);
-        if (_pics.length > 1) {
-          _th.title = "this line is about the round rather than one piece "
-            + "— " + _pics.length + " paintings in it";
-        }
-        row.appendChild(_th);
+        /* #1005: BIG ENOUGH TO ACTUALLY SEE, AND ON THE SIDE.
+         *
+         * "the only thing that would make this ad even better for this
+         * painting ad would be to actually see the painting on the side
+         * in the chat in the booth dialogue window."
+         *
+         * It was a 34-pixel marker on the left, which tells you WHICH
+         * piece and shows you none of it. The row is a flex line, so the
+         * picture goes on as the LAST child - the right-hand side the
+         * operator drew - at a size a painting can be judged at, with
+         * the text keeping the rest. artThumb (#830) already carries the
+         * fullscreen viewer and the hawk menu, so it behaves the same
+         * here as everywhere else the station shows a picture. */
+        const _big = artThumb(_pics[0], 112);
+        _big.style.flex = "0 0 auto";
+        _big.style.marginLeft = "8px";
+        _big.style.alignSelf = "flex-start";
+        _big.style.maxWidth = "40%";
+        /* The row is built text-last, so DOM order alone would put this
+         * back on the left where it started. `order` moves it to the end
+         * of the flex line without the builder having to be rearranged
+         * around it - and a row that is NOT a flex line simply ignores
+         * it and gets the picture where it always was. */
+        _big.style.order = "99";
+        _big.title = (_pics.length > 1
+          ? "this line is about the round rather than one piece — "
+            + _pics.length + " paintings in it"
+          : (line.sold_title || "the piece this line is about"))
+          + (line.sold_price ? " — " + line.sold_price + " dollars" : "")
+          + ". Click to hold it up full size.";
+        row.appendChild(_big);
       }
     } catch (e) { /* the line still draws */ }
     /* #748: identity FIRST, above every early return. The ad, sting,
