@@ -4367,7 +4367,65 @@ def _pine_render(items: list[dict[str, Any]]) -> str:
     return header + "\n".join(blocks) + ("\n" if blocks else "")
 
 
+# #1007: the body of a request WITHOUT its attachment blocks, which is
+# what makes two submissions "the same request" even when they carry
+# different screenshots.
+_PINE_ATTACH_RE = re.compile(
+    r"\n\nAttached (?:images|files):\n.*\Z", re.S)
+PINE_SAME_WINDOW = 1800.0               # half an hour
+
+
+def _pine_gist(text: str) -> str:
+    body = _PINE_ATTACH_RE.sub("", str(text or "")).strip()
+    return " ".join(body.lower().split())
+
+
+def _pine_attachments(text: str) -> str:
+    hit = _PINE_ATTACH_RE.search(str(text or ""))
+    return hit.group(0) if hit else ""
+
+
 async def pine_append(text: str) -> dict[str, Any]:
+    """#1007: A REPEAT JOINS THE REQUEST IT REPEATS.
+
+    The inbox was collecting the same ask several times over. Two roads
+    led there and neither is a bug in the sending: a double-click on Send
+    while the first POST is still in flight, and - the one that actually
+    happened - an operator with four screenshots to attach, pasting and
+    sending one at a time. Four requests, one sentence, one picture each:
+    #980, #981, #982 and #983 are the same paragraph four times.
+
+    Both are the same thing to a reader of the inbox: ONE request. So a
+    submission whose words match an open request from the last half hour
+    is folded into it, and its attachments are added to that request
+    rather than starting another. Nothing is dropped - the screenshots
+    all arrive, on the one item they belong to.
+
+    Only OPEN requests are joined: re-asking for something already
+    resolved is a new request, which is exactly what it means."""
+    gist = _pine_gist(text)
+    if gist:
+        async with _pine_lock:
+            items = pine_read()
+            now = time.time()
+            for it in items:
+                if str(it.get("status") or "") != "open":
+                    continue
+                if _pine_gist(it.get("text") or "") != gist:
+                    continue
+                try:
+                    when = time.mktime(time.strptime(
+                        str(it.get("when") or ""), "%Y-%m-%d %H:%M"))
+                except Exception:  # noqa: BLE001
+                    when = now
+                if now - when > PINE_SAME_WINDOW:
+                    continue
+                add = _pine_attachments(text)
+                if add and add not in str(it.get("text") or ""):
+                    it["text"] = (str(it.get("text") or "").rstrip()
+                                  + add).strip()
+                    PINE_REQUESTS_PATH.write_text(_pine_render(items))
+                return it
     async with _pine_lock:
         items = pine_read()
         item = {
@@ -104324,6 +104382,8 @@ function renderPineThumbs() {
   });
 }
 
+let pineSending = false;
+
 async function submitPine() {
   const ta = document.getElementById("pineInput");
   const text = ta.value.trim();
@@ -104331,6 +104391,13 @@ async function submitPine() {
   if (!text && !pinePasted.length && !pineFiles.length) {
     status.textContent = "Enter a request."; return;
   }
+  /* #1007: the button stayed live through the whole round trip, so a
+   * second click while the first POST was in flight filed the same ask
+   * twice. The server folds a repeat into the original now, but not
+   * sending it at all is better than un-sending it. */
+  if (pineSending) return;
+  pineSending = true;
+  status.textContent = "sending…";
   try {
     const r = await api("/api/pine-requests", {
       method: "POST",
@@ -104346,6 +104413,8 @@ async function submitPine() {
     loadPineInbox();
   } catch (e) {
     status.textContent = e.message;
+  } finally {
+    pineSending = false;                                       // #1007
   }
 }
 
