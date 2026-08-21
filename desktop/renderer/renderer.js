@@ -7237,6 +7237,230 @@ function wkDraggable(el2) {
   } catch (e) { /* the window still opens */ }
 }
 
+/* #988: THE ACTIVE SEGMENT, IN THE TOP BAR.
+ *
+ * The deck already carried this on its marquee button, but the marquee
+ * is one panel among six and the operator asked for it in the strip that
+ * is always on screen. Same figures as the hour view's entry card, so
+ * the two can never disagree: what the running order has reached, how far
+ * through its own minutes the clock is, and what the rooms are holding
+ * against the seconds it owns.
+ *
+ * The last frame is kept so the details window can be opened from the
+ * click without waiting for a poll. */
+let segCellNow = null;
+
+function paintSegCell(now) {
+  try {
+    const cell = document.getElementById("segCell");
+    if (!cell) return;
+    segCellNow = now && now.label ? now : null;
+    const name = document.getElementById("segCellName");
+    const sub = document.getElementById("segCellSub");
+    const fill = document.getElementById("segCellFill");
+    /* #957 owns this cell while a transition is running - the bar is
+     * the transition's, not the segment's, and the label says so. */
+    if (segMoveState && segMoveState.running) {
+      cell.classList.add("moving");
+      if (name) name.textContent = String(segMoveState.label || "changing");
+      if (sub) {
+        sub.textContent = String(segMoveState.say || "changing segment")
+          + " \u00b7 " + Math.round(Number(segMoveState.progress || 0) * 100)
+          + "%";
+      }
+      if (fill) {
+        fill.style.width = Math.max(2, Math.round(
+          Number(segMoveState.progress || 0) * 100)) + "%";
+      }
+      return;
+    }
+    cell.classList.remove("moving");
+    if (!segCellNow) {
+      if (name) name.textContent = "no schedule";
+      if (sub) sub.textContent = "nothing is driving the show";
+      if (fill) fill.style.width = "0%";
+      cell.title = "No running order is on. Click for what the station "
+        + "can still be asked to do.";
+      return;
+    }
+    const owns = Math.max(1, Number(now.owns_seconds) || 0);
+    const through = Math.max(0, Number(now.through_seconds) || 0);
+    const held = Math.max(0, Number(now.held_seconds) || 0);
+    const left = Math.max(0, Math.round(owns - through));
+    if (name) name.textContent = String(now.label || now.kind || "");
+    if (sub) {
+      sub.textContent = (now.cannot
+        ? "live only \u00b7 " + left + "s left"
+        : Math.round(held) + "s banked of " + Math.round(owns) + "s \u00b7 "
+          + left + "s left");
+    }
+    if (fill) {
+      const frac = Math.max(0, Math.min(1, through / owns));
+      fill.style.width = Math.max(2, Math.round(frac * 100)) + "%";
+      fill.style.background = (now.cannot || held >= owns - 1)
+        ? "#7ce8a9" : held <= 0 ? "#e0a35c" : "#9fd8ff";
+    }
+    cell.title = String(now.label || "") + " \u2014 entry "
+      + (Number(now.index || 0) + 1) + " on " + String(now.preset || "")
+      + ". " + Math.round(through) + "s of " + Math.round(owns)
+      + "s gone. Click for everything behind it.";
+  } catch (e) { /* the strip still reads */ }
+}
+
+/* #988: ...and everything behind it, on a click. */
+async function segCellOpen() {
+  const gone = document.getElementById("segDetail");
+  if (gone) { gone.remove(); return; }
+  const now = segCellNow || {};
+  const d = document.createElement("div");
+  d.id = "segDetail";
+  d.style.cssText = "position:fixed;left:50%;top:64px;"
+    + "transform:translateX(-50%);width:min(680px,94vw);max-height:80vh;"
+    + "overflow:auto;z-index:300;background:#070c12;border:1px solid "
+    + "#24384a;border-radius:10px;padding:12px 14px;box-shadow:0 20px "
+    + "60px #000c";
+  const mk = (tag, css, text) => {
+    const n = document.createElement(tag);
+    if (css) n.style.cssText = css;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const head = mk("div", "display:flex;gap:8px;align-items:baseline;"
+    + "margin-bottom:8px");
+  head.appendChild(mk("b", "flex:1;font-size:13px;color:#9fd8ff",
+    now.label ? "\u25b6 " + now.label : "no segment on air"));
+  const x = mk("button", "font-size:11px;padding:2px 8px;cursor:pointer",
+    "\u2715");
+  x.onclick = () => d.remove();
+  head.appendChild(x);
+  d.appendChild(head);
+  if (!now.label) {
+    d.appendChild(mk("div", "font-size:11px;opacity:.75;line-height:1.6",
+      "No running order is driving the show, so no entry owns the air. "
+      + "The deck's segment button still interjects any segment the "
+      + "station knows."));
+    document.body.appendChild(d);
+    try { pvFloatDesk(d); } catch (e) {}
+    return;
+  }
+  const chips = mk("div", "display:flex;flex-wrap:wrap;gap:5px;"
+    + "margin-bottom:9px");
+  const owns = Math.max(1, Number(now.owns_seconds) || 0);
+  const through = Math.max(0, Number(now.through_seconds) || 0);
+  [["kind", now.kind],
+   ["entry", (Number(now.index || 0) + 1) + " on " + (now.preset || "")],
+   ["owns", Math.round(owns) + "s"],
+   ["through", Math.round(through) + "s"],
+   ["banked", Math.round(Number(now.held_seconds) || 0) + "s"],
+   ["owed", Math.round(Number(now.owed_seconds) || 0) + "s"]
+  ].forEach((kv) => {
+    chips.appendChild(mk("span", "background:#0e1826;border:1px solid "
+      + "#24435f;border-radius:12px;padding:2px 9px;font-size:10px;"
+      + "color:#c8dcef", kv[0] + ": " + (kv[1] == null ? "\u2014" : kv[1])));
+  });
+  d.appendChild(chips);
+  if (now.cannot) {
+    d.appendChild(mk("div", "font-size:10.5px;color:#e0a35c;"
+      + "margin-bottom:8px", now.cannot));
+  }
+  const part = (title, body) => {
+    const text = String(body || "").trim();
+    if (!text) return;
+    d.appendChild(mk("div", "font-size:9px;letter-spacing:.06em;"
+      + "opacity:.75;margin:9px 0 3px;color:#7fb0c9", title));
+    d.appendChild(mk("pre", "white-space:pre-wrap;word-break:break-word;"
+      + "font-size:10.5px;line-height:1.5;margin:0;padding:7px 9px;"
+      + "background:#05090f;border:1px solid #1b2c3c;border-radius:6px;"
+      + "max-height:26vh;overflow:auto;color:#c8d6e4", text));
+  };
+  const loading = mk("div", "font-size:10px;opacity:.6",
+    "reading what the coordinator has on this road\u2026");
+  d.appendChild(loading);
+  document.body.appendChild(d);
+  try { pvFloatDesk(d); } catch (e) {}
+  /* Everything the coordinator knows about the road this entry runs on,
+   * in its own words - which is the same text the road report shows, so
+   * there is one explanation of a road on this station and not two. */
+  try {
+    const road = await api.get("/api/coordinator/road/"
+      + encodeURIComponent(String(now.kind || "")));
+    loading.remove();
+    const say = (road && road.doing) || [];
+    if (say.length) {
+      d.appendChild(mk("div", "font-size:9px;letter-spacing:.06em;"
+        + "opacity:.75;margin:9px 0 3px;color:#7fb0c9",
+        "WHAT THE COORDINATOR IS DOING ABOUT IT"));
+      say.forEach((row) => {
+        d.appendChild(mk("div", "font-size:10.5px;line-height:1.55;"
+          + "margin:0 0 4px;padding-left:11px;border-left:2px solid "
+          + (row.tag === "blocked" ? "#e07070"
+             : row.tag === "due" ? "#e0a35c"
+             : row.tag === "clear" ? "#7ce8a9" : "#4a6d8a"),
+          String(row.text || "")));
+      });
+    }
+    if (road && road.task) part("WHY IT IS BEING ASKED FOR", road.task.why);
+  } catch (err) {
+    loading.textContent = "the coordinator did not answer: " + err.message;
+  }
+  /* #1004: and the honest ceiling - what the sheet asks for against what
+   * this box can render in an hour. */
+  try {
+    const cap = await api.get("/api/coordinator/capacity");
+    if (cap && cap.say) part("THE SHEET AGAINST THE ENGINE", cap.say);
+  } catch (e) { /* the window still reads */ }
+}
+
+/* #957: THE TRANSITION BAR.
+ *
+ * "If I click to change segments, put a loading bar showing the progress
+ * of the transition from the current broadcast to playing the segment
+ * that I'm trying to transition to."
+ *
+ * Changing segment is never instant: the round on air finishes, then the
+ * new one is written by a model and recorded by a voice engine slower
+ * than real time - ninety seconds to four minutes on this box. The desk
+ * said "goes out next" and then nothing, which is indistinguishable from
+ * a dropped click.
+ *
+ * The server follows the whole thing through its own stages and this
+ * polls it into the top-bar cell, so the bar is watchable from anywhere
+ * in the app and does not vanish when the segment menu closes. */
+let segMoveState = null;
+let segMoveTimer = null;
+
+function segMoveWatch() {
+  if (segMoveTimer) return;
+  const tick = async () => {
+    let got = null;
+    try {
+      got = await api.get("/api/schedule/interject/progress");
+    } catch (err) {
+      got = null;
+    }
+    segMoveState = got && got.running ? got : null;
+    if (got && !got.running && got.stage) {
+      /* One last paint so the operator sees it land rather than the bar
+       * simply disappearing. */
+      const cell = document.getElementById("segCell");
+      const sub = document.getElementById("segCellSub");
+      if (cell && sub) {
+        sub.textContent = String(got.say || "");
+        setTimeout(() => { try { paintSegCell(segCellNow); } catch (e) {} },
+                   3500);
+      }
+    }
+    if (!segMoveState) {
+      clearInterval(segMoveTimer);
+      segMoveTimer = null;
+      return;
+    }
+    try { paintSegCell(segCellNow); } catch (e) {}
+  };
+  segMoveTimer = setInterval(tick, 1200);
+  tick();
+}
+
 function pvFloatDesk(el2) {
   try {
     const r = el2.getBoundingClientRect();
@@ -10244,6 +10468,7 @@ function initAirMarquee() {
       segWas = pct;
       segBtn.style.setProperty("--dx-through", pct);
     }
+    paintSegCell(now);                                        // #988
     segBtn.title = label
       ? label + " — " + Math.round(Number(now.through_seconds) || 0) + "s of "
         + Math.round(Number(now.owns_seconds) || 0) + "s. Click to jump to "
@@ -10358,7 +10583,33 @@ function initAirMarquee() {
         if (got && got.ok) {
           said.textContent = label + " goes out next — then the hour picks "
             + "up exactly where it left off.";
-          setTimeout(() => { closeMenu(); }, 1400);
+          /* #957: and the bar in the top strip follows it from here -
+           * queued behind the round on air, at the writing desk, in the
+           * recording room, on the air. It outlives this menu. */
+          try { segMoveWatch(); } catch (e) {}
+          const bar = mk("div", "");
+          bar.style.cssText = "height:4px;margin-top:6px;border-radius:2px;"
+            + "background:rgba(255,255,255,.14);overflow:hidden";
+          const fill = mk("div", "");
+          fill.style.cssText = "height:100%;width:2%;background:#9fd8ff;"
+            + "transition:width .35s linear";
+          bar.appendChild(fill);
+          segMenu.appendChild(bar);
+          const tick = setInterval(() => {
+            if (!document.body.contains(bar)) { clearInterval(tick); return; }
+            const st = segMoveState;
+            if (!st || !st.running) {
+              fill.style.width = "100%";
+              fill.style.background = "#7ce8a9";
+              clearInterval(tick);
+              return;
+            }
+            fill.style.width = Math.max(2, Math.round(
+              Number(st.progress || 0) * 100)) + "%";
+            said.textContent = String(st.say || label + " is on its way")
+              + " — " + Math.round(Number(st.progress || 0) * 100) + "%";
+          }, 900);
+          setTimeout(() => { closeMenu(); }, 4200);
         } else {
           said.className = "dx-segnote bad";
           said.textContent = (got && got.why) || "that segment was refused";

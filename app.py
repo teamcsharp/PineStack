@@ -22560,6 +22560,13 @@ async def _torrent_talk() -> None:
                         + str(_inter.get("label") or kind)
                         + " - one round, then the hour carries on from "
                           "where it was (#904)")
+                    # #957: the round is being made now; the bar follows
+                    # the desk's own breadcrumbs from here.
+                    try:
+                        interject_mark("writing",
+                                       id=str(_chosen.get("id") or ""))
+                    except Exception:  # noqa: BLE001
+                        pass
                 elif _want and (_want in kinds or _want == "bombshell"):
                     kind = _want
                 else:
@@ -22680,6 +22687,7 @@ async def _torrent_talk() -> None:
                 except Exception:  # noqa: BLE001
                     pass        # the dice already chose; never fail here
             _RADIO["last_round_kind"] = kind
+            _interjected = bool(_chosen and _chosen.get("interject"))   # #957
             # #937: if the quota override above re-chose, the entry the
             # clock named was NOT run — say so on its own row rather
             # than letting it read as kept.
@@ -22780,6 +22788,15 @@ async def _torrent_talk() -> None:
             except Exception as exc:
                 pipeline_log("drop", f"torrent round failed - {kind}",
                              extra=f"{type(exc).__name__}: {exc}"[:500])
+            # #957: the transition is over, one way or the other. Said
+            # here rather than at the top of the next round so a bar that
+            # reached the air stops at "on air" instead of hanging at 93%
+            # until something else happens.
+            try:
+                if _interjected:
+                    interject_mark("done" if aired else "lost")
+            except Exception:  # noqa: BLE001
+                pass
             # #937: the entry the clock named either ran or it did
             # not, and the difference is the whole of "is the sheet
             # being kept". Recorded BEFORE the forced-banter rescue
@@ -26531,6 +26548,40 @@ def schedule_interject(slot_id: str = "", kind: str = "") -> dict[str, Any]:
                                       schedule_prompt_for(store, slot))
         except Exception:                      # noqa: BLE001
             clause = ""     # the round still runs; it just writes untinted
+        # #958: SAY WHY THEY MOVED.
+        #
+        # "If I change the active broadcast that's happening at the moment
+        # by changing the segment, have the DJs and the people on the
+        # broadcast mention that we're changing segments because of a
+        # message received from upstairs from the management."
+        #
+        # The station already has an upstairs and the pair already have a
+        # relationship with it, so the operator's hand on the switchboard
+        # has an in-world cause ready made. It costs nothing - no extra
+        # model visit, no second round - because it rides in the
+        # instruction the interjected round was going to be written with
+        # anyway.
+        #
+        # Only when the segment ACTUALLY changes. Interjecting the kind
+        # that is already on the air would have them announce a change
+        # that the listener cannot hear, which is worse than saying
+        # nothing.
+        try:
+            _on_air = str((_RADIO.get("sched_slot") or {}).get("kind") or "")
+            if road and road != _on_air:
+                clause = (
+                    "A MESSAGE HAS JUST COME DOWN FROM UPSTAIRS AND IT "
+                    "CHANGES THE SHOW. Management want " + label + ", and "
+                    "they want it now. OPEN by acknowledging that: one of "
+                    "the pair has the memo, reads or relays the gist of "
+                    "it, and the other reacts to being moved mid-show - "
+                    "annoyed, relieved, suspicious, delighted, whatever "
+                    "they are tonight. Two or three lines on it AT MOST. "
+                    "Then they do as they are told and the round becomes "
+                    + label + " properly - the memo is the reason, not "
+                    "the subject.\n\n") + clause
+        except Exception:  # noqa: BLE001
+            pass
         entry = {
             "id": uuid.uuid4().hex[:10],
             "kind": "interject",
@@ -26548,6 +26599,23 @@ def schedule_interject(slot_id: str = "", kind: str = "") -> dict[str, Any]:
             # The FRONT of the queue: "instantly" is the whole of the ask.
             _SWITCH_QUEUE.insert(0, entry)
             del _SWITCH_QUEUE[3:]              # a short queue, not a programme
+        # #957: and the bar starts here, at the click.
+        try:
+            _INTERJECT_RUN.clear()
+            _INTERJECT_RUN.update({
+                "id": str(entry.get("id") or ""),
+                "label": label,
+                "road": str(SCHED_PREP_KIND.get(road) or road),
+                "kind": road,
+                "from": str((_RADIO.get("sched_slot") or {}).get("label")
+                            or ""),
+                "at": time.time(),
+                "stage": "queued",
+                "stage_at": time.time(),
+                "marks": [{"stage": "queued", "at": time.time()}],
+            })
+        except Exception:  # noqa: BLE001
+            pass
         pipeline_log("switchboard",
                      f"the operator interjects {label} - one round, then the "
                      "hour carries on from where it was (#904)")
@@ -33835,12 +33903,153 @@ def switchboard_live() -> list[dict[str, Any]]:
         return [dict(o) for o in _SWITCHBOARD]
 
 
+# #957: THE TRANSITION, WATCHED FROM THE CLICK TO THE AIR.
+#
+# "If I click to change segments, put a loading bar showing the progress
+# of the transition from the current broadcast to playing the segment
+# that I'm trying to transition to."
+#
+# Changing segment is not instant and never could be: the round on air
+# has to finish, then the new one is WRITTEN by a model and RECORDED by a
+# voice engine that runs slower than real time. On this box that is
+# ninety seconds to four minutes. Until now the desk said "goes out next"
+# and then nothing at all for three minutes, which is indistinguishable
+# from the click having been dropped.
+#
+# So the whole of it is followed. Nothing here is invented: the stages
+# are the station's own - queued behind the round on air, taken off the
+# switchboard, at the writing desk, in the recording room, speaking - and
+# the reading inside a stage is elapsed time against what the task ledger
+# has MEASURED that road to cost on this box. It is marked as an estimate
+# where it is one.
+_INTERJECT_RUN: dict[str, Any] = {}
+INTERJECT_STAGE_SHARE = {
+    "queued": (0.02, 0.12),
+    "starting": (0.12, 0.18),
+    "writing": (0.18, 0.48),
+    "recording": (0.48, 0.93),
+    "on air": (1.0, 1.0),
+    "done": (1.0, 1.0),
+    "lost": (0.0, 0.0),
+}
+
+
+def interject_mark(stage: str, **fields: Any) -> None:
+    """Move the tracked transition to a stage. Unknown ids are ignored, so
+    a round the operator never asked for cannot hijack the bar."""
+    try:
+        if not _INTERJECT_RUN:
+            return
+        if fields.get("id") and str(fields["id"]) != str(
+                _INTERJECT_RUN.get("id") or ""):
+            return
+        now = time.time()
+        if str(_INTERJECT_RUN.get("stage") or "") != str(stage):
+            _INTERJECT_RUN["stage"] = str(stage)
+            _INTERJECT_RUN["stage_at"] = now
+            _INTERJECT_RUN.setdefault("marks", []).append(
+                {"stage": str(stage), "at": now})
+            del _INTERJECT_RUN["marks"][:-8]
+        for key, value in fields.items():
+            if key != "id":
+                _INTERJECT_RUN[key] = value
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# How long a transition may run before the bar stops claiming to be
+# waiting for it. Four minutes is the measured p90 of the slowest road on
+# this box plus the round it has to wait behind.
+INTERJECT_GIVE_UP = 420.0
+
+
+def interject_progress() -> dict[str, Any]:
+    """#957: where the transition has got to, 0..1, and what it is doing.
+
+    The stage comes off the station's own breadcrumbs - _RADIO["activity"]
+    is stamped by the writing desk and the voice engine as they work
+    (#305) - so this reports rather than guesses. Only the position
+    WITHIN a stage is an estimate, and it is measured: elapsed seconds
+    against task_cost() for the road being built."""
+    out: dict[str, Any] = {"running": False, "progress": 0.0, "stage": "",
+                           "label": "", "say": "", "estimate": True}
+    try:
+        run = dict(_INTERJECT_RUN)
+        if not run:
+            return out
+        now = time.time()
+        stage = str(run.get("stage") or "queued")
+        began = float(run.get("at") or now)
+        if stage in ("done", "lost") or now - began > INTERJECT_GIVE_UP:
+            if stage not in ("done", "lost"):
+                stage = "lost"
+            out.update({
+                "running": False,
+                "stage": stage,
+                "label": str(run.get("label") or ""),
+                "progress": 1.0 if stage == "done" else 0.0,
+                "say": (f"{run.get('label')} is on the air"
+                        if stage == "done" else
+                        f"{run.get('label')} never made it to air - the "
+                        "booth was still working when the transition timed "
+                        "out"),
+                "elapsed": round(now - began, 1),
+            })
+            return out
+        # Follow the desk's own breadcrumbs while it works.
+        act = _RADIO.get("activity") or {}
+        act_stage = str(act.get("stage") or "")
+        if stage in ("starting", "writing", "recording"):
+            if act_stage == "writing":
+                stage = "writing"
+            elif act_stage in ("voicing", "recasting", "sting"):
+                stage = "recording"
+            elif act_stage == "speaking":
+                stage = "recording"
+        low, high = INTERJECT_STAGE_SHARE.get(stage, (0.0, 1.0))
+        road = str(run.get("road") or "")
+        try:
+            expect = max(20.0, float(task_cost(road) or 0) or 120.0)
+        except Exception:  # noqa: BLE001
+            expect = 120.0
+        into = max(0.0, now - float(run.get("stage_at") or began))
+        share = min(0.97, into / expect) if expect > 0 else 0.0
+        out.update({
+            "running": True,
+            "stage": stage,
+            "label": str(run.get("label") or ""),
+            "road": road,
+            "progress": round(low + (high - low) * share, 3),
+            "elapsed": round(now - began, 1),
+            "expect_seconds": round(expect, 1),
+            "queue": len(_SWITCH_QUEUE),
+            "detail": str(act.get("detail") or "")[:80],
+        })
+        out["say"] = {
+            "queued": (f"waiting for the round on air to finish, then "
+                       f"{out['label']} goes"),
+            "starting": f"the booth has taken {out['label']}",
+            "writing": f"{out['label']} is at the writing desk",
+            "recording": f"{out['label']} is in the recording room",
+        }.get(stage, f"{out['label']} is on its way")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def switchboard_take() -> dict[str, Any]:
     """The operator's next instruction, if they left one."""
     with _SWITCH_LOCK:
         if not _SWITCH_QUEUE:
             return {}
-        return _SWITCH_QUEUE.pop(0)
+        got = _SWITCH_QUEUE.pop(0)
+    # #957: it has left the queue and the booth has it. The bar stops
+    # saying "waiting" and starts following the work.
+    try:
+        interject_mark("starting", id=str(got.get("id") or ""))
+    except Exception:  # noqa: BLE001
+        pass
+    return got
 
 
 def _decision_vectors() -> dict[str, Any]:
@@ -58156,6 +58365,16 @@ async def api_coord_brief(
     wrong, in the order that matters, and what is being done about each."""
     require_read_auth(authorization)
     return coord_brief()
+
+
+@app.get("/api/schedule/interject/progress")
+async def api_interject_progress(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#957: how far the segment change has got - queued behind the round
+    on air, at the writing desk, in the recording room, or on the air."""
+    require_read_auth(authorization)
+    return interject_progress()
 
 
 @app.get("/api/coordinator/capacity")

@@ -188,6 +188,49 @@ body.resizing-rail .rail-resizer::before {
   white-space: nowrap;
 }
 
+/* #988: the active segment, in the strip. Sized like its neighbours
+   and never wider than a third of the bar - the label is elided rather
+   than allowed to push the Route and Now cells off the end. */
+.seg-cell {
+  position: relative;
+  cursor: pointer;
+  min-width: 0;
+  max-width: 34%;
+}
+.seg-cell:hover { background: rgba(159, 216, 255, .06); }
+.seg-cell > b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+}
+.seg-cell > em {
+  display: block;
+  font-style: normal;
+  font-size: 9px;
+  opacity: .62;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.seg-cell > i {
+  display: block;
+  height: 3px;
+  margin-top: 3px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, .13);
+  overflow: hidden;
+}
+.seg-cell > i > u {
+  display: block;
+  height: 100%;
+  width: 0;
+  text-decoration: none;
+  background: #7ce8a9;
+  transition: width .35s linear;
+}
+.seg-cell.moving > i > u { background: #9fd8ff; }
+
 /* #1007 */
 .stream-owner {
   display: flex;

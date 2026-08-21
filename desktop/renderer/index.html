@@ -178,6 +178,24 @@
             <i></i><i></i><i></i><i></i><em id="routeSpeakLabel"></em>
           </span>
         </div>
+        <!-- #988: "I also want to have the active segment moment
+             happening showing in the top bar. So it's basically a section
+             out of the itinerary that shows the active segment that's
+             going on, and then I want to be able to click on it and go in
+             and investigate the details of it."
+
+             The same figures the hour view puts on an entry card - what
+             it is, how far through its own minutes the clock is, and what
+             the rooms are holding against what it owns - in the strip
+             that is on screen whatever panel is open. #957 puts the
+             transition bar here too, so a segment change is watchable
+             from the moment it is clicked. -->
+        <div id="segCell" class="seg-cell"
+             title="The segment the running order has reached - click for everything behind it">
+          <span>Segment</span><b id="segCellName">no schedule</b>
+          <em id="segCellSub"></em>
+          <i id="segCellBar"><u id="segCellFill"></u></i>
+        </div>
         <div><span>Now</span><b id="nowState">quiet</b></div>
       </div>
       <div class="top-actions">
