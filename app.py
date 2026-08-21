@@ -12647,10 +12647,89 @@ async def speak(
 # them the way it reads gear manuals — no network, no model, just a lookup.
 
 
+# #998: "I want a folder for each topic encapsulating every file related
+# to each crystal in an organized folder."
+#
+# The library was a flat drop of one JSON per analysis, and a topic
+# routinely owns several of them - a long video is cut into parts, so
+# "neo-gotham-needs-him-again", its -part-000 and its -part-001 are three
+# files about one thing sitting in a heap with everything else.
+#
+# A crystal now lives in a folder named for its topic, and everything
+# about it - the analysis, its parts, and anything dropped beside it
+# later - goes in there together.
+_CRYSTAL_PART = re.compile(r"-part-\d{2,}$", re.I)
+
+
+def crystal_topic(slug: str) -> str:
+    """The folder a crystal belongs in: its slug with the part suffix
+    taken off, so every piece of one long thing lands together."""
+    base = safe_key(str(slug or ""))
+    return _CRYSTAL_PART.sub("", base) or base
+
+
+def crystal_home(slug: str) -> Path:
+    """Where this crystal's files live."""
+    return CRYSTALS_DIR / crystal_topic(slug)
+
+
+def crystal_file(slug: str) -> Path:
+    """The analysis itself, inside its topic folder. A file still sitting
+    flat in the old layout is answered where it is, so nothing has to be
+    migrated before it can be read or replaced."""
+    key = safe_key(str(slug or ""))
+    nested = crystal_home(slug) / f"{key}.json"
+    if nested.exists():
+        return nested
+    flat = CRYSTALS_DIR / f"{key}.json"
+    return flat if flat.exists() else nested
+
+
+def crystals_tidy() -> int:
+    """#998: put every loose crystal into its topic's folder.
+
+    Run once at startup and idempotent, so it costs a directory listing on
+    every boot after the first. It only ever MOVES a file into the folder
+    named by its own topic - nothing is renamed, merged or deleted - and
+    a file that cannot be moved is left exactly where it is and still
+    read, because read_crystals walks the tree rather than one level of
+    it.
+
+    This has to live in the agent rather than in a script run from a
+    workstation: data/ belongs to the container's own user, and a share
+    client cannot even create a directory in it."""
+    moved = 0
+    try:
+        if not CRYSTALS_DIR.is_dir():
+            return 0
+        for path in sorted(CRYSTALS_DIR.glob("*.json")):
+            if not path.is_file():
+                continue
+            home = CRYSTALS_DIR / crystal_topic(path.stem)
+            dest = home / path.name
+            if dest.exists() or home == path:
+                continue
+            try:
+                home.mkdir(parents=True, exist_ok=True)
+                path.replace(dest)
+                moved += 1
+            except Exception:  # noqa: BLE001
+                continue        # left where it is, and still readable
+        if moved:
+            pipeline_log("speakbox", f"{moved} crystal file(s) filed into "
+                         "their topic folders (#998)")
+    except Exception:  # noqa: BLE001
+        pass
+    return moved
+
+
 def read_crystals() -> list[dict[str, Any]]:
     crystals: list[dict[str, Any]] = []
     try:
-        for path in sorted(CRYSTALS_DIR.glob("*.json")):
+        # #998: rglob, so a crystal inside its topic folder is found. The
+        # flat layout still reads exactly as it did, which is what makes
+        # the migration safe to run at any time - or not at all.
+        for path in sorted(CRYSTALS_DIR.rglob("*.json")):
             try:
                 crystal = json.loads(path.read_text())
             except Exception:
@@ -22498,6 +22577,7 @@ def dj_start(station: str) -> dict[str, Any]:
     })
     _routing_save()
     _larder_load()                     # yesterday's shelf still feeds today
+    crystals_tidy()                    # #998: one folder per topic
     _pantry_load()                     # #915: and the AUDIO it already made
     _box_hold_load()                   # held dialogue outlives the deploy
     task = asyncio.create_task(dj_show())
@@ -53961,7 +54041,7 @@ async def crystal_get(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
-    path = CRYSTALS_DIR / f"{safe_key(slug)}.json"
+    path = crystal_file(slug)                                  # #998
     try:
         return crystal_with_track(json.loads(path.read_text()))
     except HTTPException:
@@ -53988,8 +54068,10 @@ async def crystal_put(
     if len(body) > 200_000:
         raise HTTPException(status_code=413, detail="Crystal too large")
 
-    CRYSTALS_DIR.mkdir(parents=True, exist_ok=True)
-    (CRYSTALS_DIR / f"{slug}.json").write_text(body + "\n")
+    # #998: into the topic's own folder, made on demand.
+    _home = crystal_home(slug)
+    _home.mkdir(parents=True, exist_ok=True)
+    (_home / f"{safe_key(slug)}.json").write_text(body + "\n")
     return {"ok": True, "slug": slug, "count": len(read_crystals())}
 
 
@@ -53999,6 +54081,8 @@ async def crystal_delete(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_auth(authorization)
+    # #998: wherever it actually is - nested, or still flat.
+    crystal_file(slug).unlink(missing_ok=True)
     (CRYSTALS_DIR / f"{safe_key(slug)}.json").unlink(missing_ok=True)
     return {"ok": True, "count": len(read_crystals())}
 
