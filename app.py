@@ -39840,6 +39840,37 @@ CALLER_SUCCESS_OUTCOMES = (
     "the caller solves the hosts' challenge, WINS the prize and leaves happy; "
     "the hosts congratulate them, confirm the win and send them back to the "
     "music with a proper goodbye",
+    # #1000: "People don't want to listen to a radio station where people
+    # just randomly disappear from the line and just hang up without
+    # winning prizes. Or coming up with trivia answers or stating fun
+    # facts or saying random stuff from the speaker box." Every one of
+    # those, written as an ENDING - the call arrives somewhere and then
+    # closes, rather than stopping.
+    "the hosts put a TRIVIA QUESTION to the caller before they go - "
+    "something absurd about this station, this town or the record just "
+    "played. The caller answers it, right or gloriously wrong, the hosts "
+    "rule on it, and the call ends on the verdict",
+    "the caller has one FUN FACT they have been sitting on the whole call "
+    "and finally gets it out - specific, checkable-sounding, and slightly "
+    "too much. The pair receive it properly, one of them is genuinely "
+    "delighted, and they let the caller go on that note",
+    "the caller signs off by reciting something they read somewhere, word "
+    "for word and entirely out of context, as though it settles the whole "
+    "conversation. The hosts sit with it for a beat, agree that it does, "
+    "and say goodnight",
+    "the hosts ask the caller for a RECOMMENDATION - a record, a place to "
+    "eat, a piece of advice for the listeners - and the caller gives one, "
+    "confidently and badly. The pair thank them for it sincerely and put "
+    "it on the air as though it were policy",
+    "the caller is made an HONORARY something of the station on the spot - "
+    "invent the title - and takes the honour extremely seriously. They "
+    "accept, make a short acceptance speech, and hang up satisfied",
+    "the caller and the hosts land on a genuine point of agreement they "
+    "did not expect, remark that it is a strange thing to agree on, and "
+    "part on good terms with the thing said plainly one last time",
+    "the caller asks for a DEDICATION and gets it: they name who it is "
+    "for and why, the hosts promise it on air, and the call closes on the "
+    "promise being made",
 )
 
 # #673: the switchboard is enormous and the line a caller comes in on is
@@ -39883,6 +39914,42 @@ def _hangup_seed() -> list[dict[str, Any]]:
             for text in (*CALLER_OUTCOMES, *CALLER_SUCCESS_OUTCOMES)]
 
 
+# #1000: the endings that stop rather than finish. #673 put three of
+# these in on purpose - "a call that simply stops reads as the writer
+# running out of road, but a call that stops and gets remarked on reads as
+# a thing that happened" - and that argument still holds. What did not
+# hold is the FREQUENCY: three of sixteen seeded outcomes, so about one
+# call in five just ended, which is what the operator kept hearing.
+#
+# They are damped rather than deleted, once, on the shelf the operator can
+# edit - so the texture survives at about one call in twenty and the
+# operator can still turn any of them back up by hand.
+_HANGUP_ABRUPT = ("hangs up abruptly", "goes silent mid-answer",
+                  "slams the phone down")
+HANGUP_ABRUPT_WEIGHT = 0.2
+
+
+def _hangup_damp_abrupt(rows: list[dict[str, Any]]) -> bool:
+    """Once: pull the just-stops endings down to a rare flavour. Marked on
+    the row so it is never done twice and an operator who turns one back
+    up keeps their setting."""
+    moved = False
+    for row in rows:
+        try:
+            if row.get("damped_1000"):
+                continue
+            text = str(row.get("text") or "").lower()
+            if not any(k in text for k in _HANGUP_ABRUPT):
+                continue
+            row["damped_1000"] = True
+            if float(row.get("weight") or 0) > HANGUP_ABRUPT_WEIGHT:
+                row["weight"] = HANGUP_ABRUPT_WEIGHT
+            moved = True
+        except Exception:  # noqa: BLE001
+            continue
+    return moved
+
+
 def hangup_rules() -> list[dict[str, Any]]:
     """The shelf, seeded from the built-in outcomes the first time it is
     asked for — so the house style is what you start editing, not an empty
@@ -39901,12 +39968,15 @@ def hangup_rules() -> list[dict[str, Any]]:
                                      "uses": 0, "last": 0,
                                      "added": int(time.time())})
                         added = True
+                if _hangup_damp_abrupt(rows):              # #1000
+                    added = True
                 if added:
                     _hangup_write(rows)
                 return rows
         except Exception:
             pass
         rows = _hangup_seed()
+        _hangup_damp_abrupt(rows)                              # #1000
         _hangup_write(rows)
         return rows
 
