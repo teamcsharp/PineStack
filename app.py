@@ -9494,13 +9494,20 @@ _SHELF: dict[str, list[dict[str, Any]]] = {}
 # How many of each to hold. The real governor is prepare_hours (TIME on
 # the shelf); these only stop one content type eating the whole
 # allowance while another starves.
-SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 4, "caller": 4,
+# #977: "I want to be able to store at least twenty of these in the tank
+# and be able to pull them out when needed." The real ceiling is
+# shelf_cap(kind) * SHELF_ROW_CEILING, so a manager cap of 7 banks 21 and
+# the gallery the same. Adverts already reach 24 at a cap of 8. The
+# seconds test in shelf_full() is still the ordinary governor - this only
+# moves the hard stop, so a road that is already covered does not write
+# more just because it may.
+SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 7, "caller": 4,
               # #855: the gallery press. Nine of the owner's sixty
               # canonical minutes, the DEAREST road on the board - up to
               # four vision passes before a word of it is written - and
               # the one thing on the board that cannot go stale, because
               # a painting pitch is as good in an hour as it is now.
-              "gallery": 3,
+              "gallery": 7,
               # #855: a bulletin, and ONE at a time. Deliberately not
               # stocked: news goes off, so prep_news() writes one only
               # when the running order is about to want it and never
@@ -9544,6 +9551,30 @@ def shelf_cap(kind: str) -> int:
     # one content type may ever go.
     return max(1, base, min(base * 8, int(round(base * hours))))
 
+
+# #977: THE ROADS THAT MAY BE AIRED MORE THAN ONCE.
+#
+# "gallery offerings and ad reads and manager messages can have double the
+# staying time and be able to be reused on a three hour schedule if
+# needed in order to ensure that they always have something to air."
+#
+# shelf_take() used to DESTROY the row it handed over, so every one of
+# these was written, recorded, aired once and thrown away - and a road
+# whose desk had fallen behind then had nothing at all, however much work
+# had already been paid for. The file already argued for this in the
+# gallery's own note: "the one thing on the board that cannot go stale,
+# because a painting pitch is as good in an hour as it is now."
+#
+# Deliberately NOT caller (a phone call replayed word for word is the one
+# repeat a listener would certainly catch) and NOT news (a bulletin goes
+# off; that is the whole reason its cap is 1).
+SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id")
+# How long an aired item rests before it may go out again. The operator
+# asked for three hours.
+SHELF_REUSE_REST = float(os.getenv("SHELF_REUSE_REST", "10800"))
+# ...and how many times one item may ever air, so a road that has stopped
+# being written does not become a loop of the same four messages.
+SHELF_REUSE_MOST = 3
 
 # #986: how many WRITTEN BUT UNVOICED rows a road may stack up before the
 # writing desk should stop feeding it.
@@ -9685,9 +9716,25 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         # then oldest. Nothing below this line changed — a stale pin
         # fails the very same checks every other row is held to and the
         # walk carries on, so a segment is never silent over one.
-        for row in alt_take_order(kind, rows):
+        # #977: FRESH FIRST, RESTED SECOND. A never-aired item always
+        # goes before one that has been out, so reuse is what happens when
+        # the desk is behind - never a substitute for writing.
+        _order = list(alt_take_order(kind, rows))
+        if str(kind) in SHELF_REUSABLE:
+            _order.sort(key=lambda r: (1 if r.get("aired_at") else 0,
+                                       float(r.get("aired_at") or 0)))
+        for row in _order:
             if time.time() - float(row.get("at") or 0) > PANTRY_BURN_SECONDS:
                 continue
+            # #977: it has been out; has it rested long enough?
+            _out_at = float(row.get("aired_at") or 0)
+            if _out_at:
+                if str(kind) not in SHELF_REUSABLE:
+                    continue        # should not be here at all
+                if int(row.get("aired") or 0) >= SHELF_REUSE_MOST:
+                    continue        # it has had its innings
+                if time.time() - _out_at < SHELF_REUSE_REST:
+                    continue        # still resting
             if voice and str(row.get("voice") or "") != str(voice):
                 continue            # prepared for a seat that has changed
             key = str(row.get("key") or "")
@@ -9697,10 +9744,26 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             if isinstance(entry, dict) and not _larder_current(entry):
                 continue            # written against a contract that moved
             try:
-                # By IDENTITY (#926): the walk now comes off a sorted
-                # copy, and list.remove() would match the first row that
-                # merely COMPARES equal rather than the one being aired.
-                rows[:] = [r for r in rows if r is not row]
+                if str(kind) in SHELF_REUSABLE:
+                    # #977: KEPT, not consumed. It goes to the back of the
+                    # shelf stamped with when it went out and how many
+                    # times, and the sort above will not offer it again
+                    # until every fresh item has gone and it has rested.
+                    row["aired_at"] = time.time()
+                    row["aired"] = int(row.get("aired") or 0) + 1
+                    rows[:] = ([r for r in rows if r is not row] + [row])
+                    if int(row["aired"]) > 1:
+                        pipeline_log("lookahead",
+                                     f"{SHELF_LABEL.get(kind, kind)} went "
+                                     f"out again - {row['aired']} airings, "
+                                     "the desk was behind and the tank "
+                                     "covered it (#977)")
+                else:
+                    # By IDENTITY (#926): the walk now comes off a sorted
+                    # copy, and list.remove() would match the first row
+                    # that merely COMPARES equal rather than the one being
+                    # aired.
+                    rows[:] = [r for r in rows if r is not row]
             except Exception:  # noqa: BLE001
                 pass
             alt_took(kind, row)                                # #926
@@ -9709,7 +9772,10 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         # grow a tail of rows nobody can ever take.
         _SHELF[str(kind)] = [
             r for r in rows
-            if time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS]
+            if time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
+            # #977: and an item that has had all its airings is done, even
+            # if the burn would still keep it.
+            and int(r.get("aired") or 0) < SHELF_REUSE_MOST]
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -10327,7 +10393,12 @@ _PREP_LOG_KEY = [""]
 # dear road (the gallery measures about 150s) can be written and voiced
 # before its entry arrives, short enough that it does not simply become
 # a second running order.
-PREP_DEADLINE_WINDOW = 900.0
+# #960: "I want the management orchestration system to prioritize having
+# the NEXT HALF HOUR filled out and already chock full of content." This
+# was fifteen minutes, so an entry twenty minutes out was not yet a
+# deadline to anybody and the ledger's cheapest-first ranking kept
+# winning. Half an hour, in the operator's own unit.
+PREP_DEADLINE_WINDOW = 1800.0
 # ...and the least window worth starting a deadline task in. Below this
 # the pass would write nothing before the record ends, so it waits for a
 # window it can actually make a line in.
@@ -20664,11 +20735,26 @@ def coord_close_half(half: str) -> dict[str, Any]:
     return report
 
 
-COORD_AHEAD_SECONDS = 2400.0            # forty minutes of lookahead
+# #979: the coordinator's own horizon, off the same build-ahead dial.
+# This was a fixed forty minutes - less than the ninety the operator had
+# asked to be covered for - so the very entry that "doesn't have any
+# segments cut for it" could sit outside the coordinator's view entirely,
+# and nothing was working towards it.
+COORD_AHEAD_FLOOR = 2400.0              # forty minutes, the old value
+
+
+def coord_ahead_seconds() -> float:
+    """How far the coordinator looks, never less than it used to."""
+    try:
+        return max(COORD_AHEAD_FLOOR, prepare_target_seconds())
+    except Exception:  # noqa: BLE001
+        return COORD_AHEAD_FLOOR
+
+
 _BARE_ARRIVALS: dict[str, int] = {}     # road -> times it arrived empty
 
 
-def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
+def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
     """#911: the entries about to take the air, and whether anything is
     ready for them.
 
@@ -20679,6 +20765,10 @@ def coord_upcoming(window: float = COORD_AHEAD_SECONDS) -> list[dict[str, Any]]:
     anybody move, and only the second one can be worked in deadline
     order."""
     out: list[dict[str, Any]] = []
+    # #979: resolved HERE rather than in the signature, because a default
+    # argument is evaluated once at import and could never follow a dial
+    # the operator turns while the station is running.
+    window = float(window or 0) or coord_ahead_seconds()
     try:
         store = schedule_read()
         if not store.get("enabled", True):
@@ -21437,7 +21527,22 @@ def hour_needs() -> dict[str, dict[str, float]]:
                                         "rows": 0.0, "cap": 0.0})
             row["owed"] += owed * hours
         for road in list(out):
-            rows = list(_SHELF.get(road) or [])
+            # #977: WHAT COULD ACTUALLY AIR RIGHT NOW.
+            #
+            # An aired item is kept on the shelf now instead of being
+            # destroyed, so a naive sum would count used stock as cover
+            # and the writing desk would stand down on the strength of a
+            # tank full of things that have just gone out - the exact
+            # shape of #930's fault, arriving by a new road.
+            #
+            # An item that has rested long enough IS cover, because it can
+            # genuinely be pulled; one still resting, or one that has had
+            # all its airings, is not.
+            rows = [r for r in (_SHELF.get(road) or [])
+                    if not r.get("aired_at")
+                    or (int(r.get("aired") or 0) < SHELF_REUSE_MOST
+                        and time.time() - float(r.get("aired_at") or 0)
+                        >= SHELF_REUSE_REST)]
             held = sum(float(r.get("seconds") or 0) for r in rows)
             if road == "banter":
                 rows = rows + [e for e in _LARDER if e.get("prepared")]
@@ -56988,6 +57093,12 @@ async def api_recording_room_rows(
         "yielding": bool(prep_yielding()),
         "unvoiced": shelf_unvoiced(kind),
         "unvoiced_most": SHELF_UNVOICED_MOST,
+        # #977: the tank.
+        "reusable": kind in SHELF_REUSABLE,
+        "cap": shelf_cap(kind),
+        "ceiling": shelf_cap(kind) * SHELF_ROW_CEILING,
+        "rest_seconds": SHELF_REUSE_REST,
+        "airings_allowed": SHELF_REUSE_MOST,
     }
     rows: list[dict[str, Any]] = []
     engines_seen: set[str] = set()
@@ -57000,6 +57111,14 @@ async def api_recording_room_rows(
             "voice_asked": str(row.get("voice") or ""),
             "key": str(row.get("key") or ""),
             "produced": bool(row.get("produced")),
+            # #977: has this one been out, how often, and may it go again?
+            "airings": int(row.get("aired") or 0),
+            "aired_ago": (round(time.time() - float(row["aired_at"]), 1)
+                          if row.get("aired_at") else None),
+            "resting": bool(
+                row.get("aired_at")
+                and time.time() - float(row.get("aired_at") or 0)
+                < SHELF_REUSE_REST),
         }
         if out["key"] or out["produced"]:
             out["verdict"] = "already has its audio"
