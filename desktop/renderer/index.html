@@ -79,9 +79,14 @@
         <b id="appVolumeValue">35%</b>
       </label>
       <input id="appVolume" type="range" min="0" max="100" step="1" value="35">
-      <label class="monitor-row" for="boothMonitor">
+      <!-- #997: this switch governs the shell's own music player now as
+           well as the booth feed, so it is no longer only about the
+           booth. Route says WHERE the broadcast goes; this says whether
+           you also hear it in here. -->
+      <label class="monitor-row" for="boothMonitor"
+             title="Hear the broadcast in this app even while it is going out to the Pine Box or the Nabu.">
         <input id="boothMonitor" type="checkbox">
-        <span>Tune booth audio</span>
+        <span>Monitor here</span>
       </label>
       <audio id="desktopRadioPlayer" class="desktop-radio" controls preload="auto"></audio>
     </section>

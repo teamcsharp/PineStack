@@ -175,8 +175,29 @@ function appVolumeScript(audible = true) {
     /* ...and the rAF latch is cleared, because a hidden or throttled
      * webview can leave it set for ever and every hook becomes a no-op. */
     window.__pineDesktopVolumePending = false;
-    window.__pineDesktopVolume = audible ? volume : 0;
-    window.__pineDesktopAudible = audible;
+    /* #997: TWO LINES USED TO SIT HERE AND THEY BROKE ALL OF IT.
+     *
+     *   window.__pineDesktopVolume = audible ? volume : 0;
+     *   window.__pineDesktopAudible = audible;
+     *
+     * 'volume' and 'audible' were consts at THIS scope until #988 moved
+     * them onto window. #988 replaced the declarations and left these two
+     * readers behind, so the first of them referenced an identifier that
+     * no longer existed anywhere in the injected scope - the 'const
+     * volume' inside apply() below is block-scoped to apply and is not
+     * it. Every injection therefore threw ReferenceError on line 19,
+     * BEFORE apply() ran, before the MutationObserver was installed,
+     * before the interval was set.
+     *
+     * Nothing in any webview has been muted or levelled since. That is
+     * the whole of "the audio still comes out of the application when
+     * everything is set to the Nabu", and the whole of "the sliders do
+     * not do anything" - one dead statement, silently swallowed by the
+     * .catch() at the call site (also fixed, see applyAppVolumeToFrame).
+     *
+     * They are simply gone: the three window writes above already say
+     * everything they were trying to say, and apply() reads the audible
+     * flag itself and zeroes the level when it is false. */
     const apply = () => {
       const volume = Number(window.__pineDesktopVolume) || 0;
       const audible = !!window.__pineDesktopAudible;
@@ -327,6 +348,19 @@ function paintStreamRoutes(routing) {
   });
 }
 
+/* #997: "I need this setup to basically reroute the audio instantly when
+ * I change these parameters."
+ *
+ * applyAppVolume() re-injects the webviews, but the shell's OWN player is
+ * only re-evaluated by syncDesktopRadio on the next clock poll - so
+ * moving music to the box left the record playing here until the poll
+ * came round. Every control that can change where audio goes calls this
+ * instead, and the local player is re-gated in the same tick. */
+function rerouteAudioNow() {
+  applyAppVolume();
+  try { pollDesktopRadio(); } catch (err) { /* the poll will catch up */ }
+}
+
 async function setStreamRoute(stream, value) {
   const body = {};
   body[stream] = value;
@@ -338,7 +372,7 @@ async function setStreamRoute(stream, value) {
     // The preset picker no longer describes what is going on; say so by
     // re-reading the server rather than guessing a label.
     await refresh();
-    applyAppVolume();
+    rerouteAudioNow();                                          // #997
   } catch (err) {
     noteRouteError(err.message);
   }
@@ -413,7 +447,21 @@ function applyAppVolumeToFrame(frame, audible = frame === audibleFrame()) {
     // #789: never hard-mute the whole webview for the monitor switch — that
     // silenced tape playback too. Only a zero app volume mutes everything.
     if (typeof frame.setAudioMuted === "function") frame.setAudioMuted(appVolume <= 0);
-    frame.executeJavaScript(appVolumeScript(audible)).catch(() => {});
+    /* #997: A FAILED INJECTION MUST NOT BE SILENT.
+     *
+     * This was `.catch(() => {})`. The injected script is the ONLY thing
+     * that mutes and levels audio inside a webview, so when it started
+     * throwing, every route and every slider stopped working and the app
+     * said nothing at all - for as long as it took someone to notice by
+     * ear. A navigating webview does legitimately reject here, which is
+     * what the empty catch was for, so that one stays quiet; anything
+     * else reaches the note line the operator can actually see. */
+    frame.executeJavaScript(appVolumeScript(audible)).catch((err) => {
+      const why = String((err && err.message) || err || "");
+      if (/destroyed|navigat|not attached|detached/i.test(why)) return;
+      noteRouteError("Audio routing script failed: " + why.slice(0, 120));
+      try { console.error("[pine] appVolumeScript failed", err); } catch {}
+    });
   } catch {
     /* The webview may still be navigating. dom-ready will apply it. */
   }
@@ -597,13 +645,49 @@ function syncEmbeddedBroadcast(key) {
   applyAppVolume();
 }
 
+/* #997: what a single stream is ACTUALLY routed to, right now.
+ *
+ * The server is the authority - the routing is shared between clients and
+ * the streams move independently of the preset - and the preset is only
+ * the fallback for before the first status lands. Same precedence
+ * routeIsHere() uses; this just answers about one stream instead of
+ * "any of them". */
+function streamRoute(stream) {
+  if (lastRouting) {
+    const v = lastRouting[stream + "_to"];
+    if (v) return String(v);
+  }
+  const route = ROUTES[desiredBroadcast];
+  return route ? String(route[stream] || "") : "";
+}
+
 function desktopPlayerEnabled() {
   /* #979: the shell's own clock-synced player is for routes where the
    * page feed carries NO music - broadcasting to the box, and wanting to
    * hear the record here anyway. Now that Application asks the station
    * for music on the page feed, running this as well would play the
-   * record twice, a few hundred milliseconds apart. */
-  return desiredBroadcast === "nabu";
+   * record twice, a few hundred milliseconds apart.
+   *
+   * #997: ...but it read `desiredBroadcast === "nabu"`, which is to say
+   * it played music out of this app EXACTLY WHEN the operator had sent
+   * the broadcast to the device. "Once I set it to go to the device, I
+   * need it to go to the device": choosing the Nabu was the one action
+   * guaranteed to start the local player.
+   *
+   * The preset name is the wrong question twice over - it also ignores
+   * the three per-stream pickers entirely, so moving music to the box on
+   * its own never stopped this. Ask the MUSIC ROUTE, and let the monitor
+   * switch mean here what it already means for the booth:
+   *
+   *   music is here/both -> the page feed carries the record and the
+   *                         webview is playing it; playing it again here
+   *                         is the double-play #979 warns about.
+   *   music is elsewhere -> silent, unless the operator has asked to
+   *                         monitor the broadcast in this app.
+   */
+  const music = streamRoute("music");
+  if (music === "here" || music === "both") return false;
+  return boothMonitor;
 }
 
 function desktopMusicUrl(url) {
@@ -8950,7 +9034,9 @@ if (boothMonitorToggle) {
   boothMonitorToggle.onchange = (event) => {
     boothMonitor = event.target.checked;
     localStorage.setItem("pineDesktopBoothMonitor", boothMonitor ? "1" : "0");
-    applyAppVolume();
+    // #997: the switch now governs the shell's own music player too, so
+    // it has to re-gate it and not only the webviews.
+    rerouteAudioNow();
   };
 }
 /* #904: THE ON-AIR MARQUEE — the strip across the very top of the app.
