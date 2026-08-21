@@ -20288,6 +20288,37 @@ CANNOT_PREPARE = {
 }
 
 
+def schedule_slots_now(store: dict[str, Any]) -> tuple[str, list]:
+    """#963/#960: THE HOUR THAT IS ACTUALLY RUNNING, overrides and all.
+
+    Two readers - hour_needs() and hour_shortfall() - reached into
+    store["presets"][name] directly, so they could only ever see the
+    PRESET. Every other reader of the sheet goes through
+    schedule_hour_slots(), which hands back the per-hour override when one
+    is stamped: schedule_take, coord_upcoming, schedule_prep_order and
+    schedule_hours_view all do.
+
+    So an hour the operator had EDITED was invisible to exactly the two
+    functions that decide what to prepare and what to report as short.
+    The preparer stocked the preset while the booth ran the override;
+    segments the edited hour asked for were never owed, never short, and
+    never made. That is the "organizational failure" of #960 seen from
+    the inside, and half of the grey in #963.
+
+    Falls back to the preset on anything at all going wrong, which is the
+    behaviour both callers had before."""
+    try:
+        picked, rows, _on = schedule_hour_slots(store)
+        slots = [x for x in (rows or []) if x.get("enabled", True)]
+        if slots:
+            return str(picked or schedule_preset_now(store)), slots
+    except Exception:  # noqa: BLE001
+        pass
+    name = schedule_preset_now(store)
+    return name, [x for x in ((store.get("presets") or {}).get(name) or [])
+                  if x.get("enabled", True)]
+
+
 def hour_shortfall() -> dict[str, Any]:
     """Which entries of the hour on air have material behind them.
 
@@ -20300,9 +20331,7 @@ def hour_shortfall() -> dict[str, Any]:
         store = schedule_read()
         if not store.get("enabled", True):
             return out
-        name = schedule_preset_now(store)
-        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
-                 if s.get("enabled", True)]
+        name, slots = schedule_slots_now(store)        # #963
         board = {str(r.get("kind")): r for r in (prep_board() or [])}
         seen: set[str] = set()
         for slot in slots:
@@ -21394,9 +21423,7 @@ def hour_needs() -> dict[str, dict[str, float]]:
         store = schedule_read()
         if not store.get("enabled", True):
             return out
-        name = schedule_preset_now(store)
-        slots = [s for s in ((store.get("presets") or {}).get(name) or [])
-                 if s.get("enabled", True)]
+        name, slots = schedule_slots_now(store)        # #963/#960
         hours = max(1.0, min(6.0, prepare_target_seconds() / 3600.0))
         for slot in slots:
             kind = str(slot.get("kind") or "")
@@ -25487,8 +25514,37 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
                 pipeline_log("air", "the schedule's record entry came up "
                              "while a record is still playing — letting it "
                              "finish, which is what the entry means (#846)")
-        await asyncio.sleep(8)
-        return True
+            await asyncio.sleep(8)
+            return True
+        # #962: "we're spinning records all the time, but during this
+        # record spinning segment, we want to spin the records WHILE
+        # BANTERING during the record play."
+        #
+        # The needle question belongs to the first breath of the entry and
+        # stays inside the guard above - #846 is emphatic that a "spin
+        # record" entry must never cut a record that is still turning, and
+        # that is untouched. What changed is every breath AFTER it: this
+        # used to sleep eight seconds and claim the round, on every pass,
+        # so a four-minute record entry was four minutes of no talk at
+        # all. The canonical hour already has an entry that describes the
+        # right behaviour in as many words - "They talk OVER the record,
+        # the way the pair do when the music is running underneath" - and
+        # this is the entry the record is actually spinning on.
+        #
+        # Returning None means "not one of mine", and the torrent's own
+        # chain then runs, which for a record entry is banter over the
+        # record. Gated on there being material to talk with: the engine
+        # runs at ~2.7x slower than real time, so a record entry must not
+        # become an order to WRITE from cold. With nothing banked it goes
+        # back to the quiet it had before.
+        try:
+            _have = prepared_by_kind().get("banter", 0)
+        except Exception:  # noqa: BLE001
+            _have = 0
+        if not _have and len(_LARDER) < 2:
+            await asyncio.sleep(8)
+            return True                 # nothing to say; let it spin
+        return None
     if kind == "ad":
         try:
             return bool(await dj_ad_break())
@@ -26160,11 +26216,41 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
                 _slot_from = hour_at + minutes * 60.0
                 row["starts_epoch"] = round(_slot_from, 3)
                 row["ends_epoch"] = round(_slot_from + _slot_mins * 60.0, 3)
-                row["past"] = bool(row["ends_epoch"] <= time.time())
             else:
                 row["starts_epoch"] = 0.0
                 row["ends_epoch"] = 0.0
-                row["past"] = False
+            # #963: INERT IS A FACT ABOUT THE BOOTH, NOT ABOUT THE CLOCK.
+            #
+            # "I don't know why all of these are inactive and grayed out...
+            # I don't want any segment skipped over, missed, or made
+            # inert." They were being greyed out by arithmetic, not by
+            # anything having happened.
+            #
+            # `past` was `ends_epoch <= time.time()`, and ends_epoch comes
+            # from a NOMINAL walk of the minutes from the top of the hour.
+            # The booth's real position is not anchored there at all -
+            # schedule_take seats the walk whenever it was last seated
+            # ("if fresh: idx, started = 0, now"), never to the hour
+            # boundary. So the two clocks drift apart, and once the
+            # nominal span of an entry has elapsed the tile goes grey and
+            # says "already aired" whether or not the booth ever reached
+            # it. Late in an hour that is EVERY remaining tile - which is
+            # exactly the screenful of grey.
+            #
+            # `index` is the entry the booth is actually on, and it is
+            # already trusted two lines below to set row["state"]. The two
+            # now agree instead of contradicting each other.
+            #
+            # starts_epoch/ends_epoch are deliberately unchanged: #920's
+            # archive and hour_slot_span() both walk these same nominal
+            # minutes and have to keep agreeing with one another.
+            if is_now:
+                row["past"] = bool(index is not None and i < index)
+            elif str(key) < str(now_key):
+                row["past"] = bool(hour_at >= 0
+                                   and row["ends_epoch"] <= time.time())
+            else:
+                row["past"] = False        # an hour that has not started
             if row.get("enabled", True):
                 try:
                     minutes += float(row.get("minutes") or 0)
@@ -41895,8 +41981,22 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         "called about. Never let them open on their topic; a caller who "
         "has not said their name yet has not been introduced. "
         "One of the hosts then greets them BY NAME. "
-        "Then take the call properly: ask what is going on, dig for "
-        "more — the pair drive the call, inquiring, riffing, making jokes "
+        # #969/#970: "I'm hearing the DJ talk to the customer and the
+        # customer never responds again and the DJ's just talking over the
+        # customer without the customer even getting a word in edgewise."
+        #
+        # This road writes half the calls in the canonical hour and told
+        # the model "the pair drive the call" with no share rule at all,
+        # while the OTHER call road asks for about half the turns. So the
+        # two roads disagreed, and this one produced exactly the call the
+        # operator described. The caller drives now; the hosts react.
+        "Then take the call properly: ask what is going on ONCE, and then "
+        "GET OUT OF THE WAY — the CALLER drives this call. They rant. "
+        "They have a thread of their own and they keep coming back to it "
+        "and winding it further up. When a host steers, questions or "
+        "changes the subject, the caller DISMISSES it - 'yeah, that's not "
+        "important', 'that doesn't matter' - and carries on with what "
+        "they were saying. The hosts riff and make jokes "
         f"without losing the person. {caller['name']} has REAL RESOLVE "
         "(#316): when the hosts dismiss or challenge them they PUSH BACK "
         "and hold their ground, in their own words — and the hosts push "
@@ -44736,8 +44836,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
             f"of you — {max(2, lines - 1)} to {lines} lines total, "
             + ("nobody speaking twice in a row and everyone getting a "
                "word in. " if third else
-               ("the hosts and caller take turns; no one speaks twice in a "
-                "row and the caller gets several full turns. " if caller_name
+               ("the hosts and caller take turns; no one speaks twice in "
+                "a row. THE CALLER HOLDS THE FLOOR: at least half of all "
+                "turns are the caller's, and the caller's turns are the "
+                "LONGEST ones in the call. The caller is not being "
+                "interviewed - they came on with something to say and they "
+                "say it. When a host tries to steer, the caller BRUSHES IT "
+                "OFF - 'yeah, that's not the point', 'that's not important' "
+                "- and carries straight on with their own thread, which "
+                "they keep returning to and escalating. The hosts get short "
+                "reactions, not speeches. " if caller_name
                else "strictly alternating. "))
             + "Each primary turn must be a developed four-to-seven-sentence "
             "thought, usually 60 to 100 words: specific, surprising, and "
@@ -44932,7 +45040,23 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _turns_seen = banter_turns(script or "", caller_name, caller2_name)
         _c_turns = sum(1 for _m, _t in _turns_seen if _m in ("C", "E"))
         _all_turns = len(_turns_seen)
-        _needs_rewrite = _c_turns < 3 or _all_turns < 6
+        # #969/#970: A FLOOR OF THREE IS NOT A SHARE.
+        #
+        # This accepted any call with three caller turns in it, so a
+        # twelve-turn call of nine host turns and three caller turns
+        # passed as correct - which is precisely the call the operator
+        # heard, the DJ talking and the caller never getting back in.
+        # Prose alone will not hold a small model to a balance; the gate
+        # has to count.
+        #
+        # Two fifths rather than a half, deliberately: a caller round
+        # legitimately opens with a host greeting and can close with one,
+        # so demanding a strict half would reject good calls and pay for a
+        # rewrite that cannot win - the #904 trap this same block was
+        # rescued from once already.
+        _c_share = (_c_turns / _all_turns) if _all_turns else 0.0
+        _needs_rewrite = (_c_turns < 3 or _all_turns < 6
+                          or _c_share < 0.4)
     if _needs_rewrite:
         pipeline_log("model", "thin radio draft rejected — rewriting before air")
         try:
