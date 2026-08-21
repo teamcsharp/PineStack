@@ -196,7 +196,13 @@
           <em id="segCellSub"></em>
           <i id="segCellBar"><u id="segCellFill"></u></i>
         </div>
-        <div><span>Now</span><b id="nowState">quiet</b></div>
+        <!-- #984: the record playing, and a way into the library from
+             it - the artist, the album, a search, and a corner of the
+             shelf put on for however long you say. -->
+        <div id="nowCell" class="now-cell"
+             title="What is playing - click for the artist, the album, and the request desk">
+          <span>Now</span><b id="nowState">quiet</b>
+        </div>
       </div>
       <div class="top-actions">
         <button id="reloadFrameBtn" title="Reload current panel">R</button>

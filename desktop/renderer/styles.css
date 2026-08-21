@@ -188,6 +188,16 @@ body.resizing-rail .rail-resizer::before {
   white-space: nowrap;
 }
 
+/* #984 */
+.now-cell { cursor: pointer; min-width: 0; max-width: 30%; }
+.now-cell:hover { background: rgba(159, 216, 255, .06); }
+.now-cell > b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+}
+
 /* #988: the active segment, in the strip. Sized like its neighbours
    and never wider than a third of the bar - the label is elided rather
    than allowed to push the Route and Now cells off the end. */

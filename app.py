@@ -9867,6 +9867,236 @@ def shelf_full(kind: str) -> bool:
     return len(shelf_rows(kind)) >= shelf_cap(kind)
 
 
+# #968: WHAT EACH SEGMENT PROMISED, AND WHETHER THE SCRIPT DELIVERS IT.
+#
+# "I need the orchestrator able to look over the scripts of these
+# sections, making sure that the thing that the section is about takes
+# place. For example, during this section, they're supposed to be
+# receiving an angry message from upstairs and then discussing it... But
+# according to the script, they didn't receive any angry message from
+# upstairs, so this shows that this might be scheduled improperly."
+#
+# The station has always had a way to say what a segment IS - the entry's
+# kind, its standing instruction, the road behind it - and no way at all
+# to say whether the words that came back are that thing. A small model
+# handed "write a message from upstairs" will sometimes write two people
+# chatting, and until now the round was banked, rendered, aired and
+# counted towards the hour's quota of memos with nobody the wiser.
+#
+# Deliberately NOT a model call. Asking an LLM whether an LLM did as it
+# was told costs a writing-desk visit per round on a box whose writing
+# desk is the bottleneck the whole station queues behind, and it would be
+# the same model marking its own homework. These are cheap, dumb,
+# explicable checks against the SHAPE of the thing: a call has somebody
+# on the phone line, a memo mentions upstairs, a gallery round mentions
+# the picture. They cannot judge quality and do not try to. They catch
+# the failure the operator photographed - the segment that is simply not
+# the segment - and they say which words they looked for, so a false
+# alarm is arguable rather than mysterious.
+SEGMENT_BRIEF: dict[str, dict[str, Any]] = {
+    "manager": {
+        "want": "a memo from upstairs, read out and reacted to",
+        "any": ("upstairs", "management", "memo", "head office",
+                "the office", "the boss", "the brass", "came down",
+                "a note from", "the suits", "corporate", "the front office",
+                "downstairs", "higher up"),
+    },
+    "caller": {
+        "want": "somebody on the phone line",
+        "marker": "C",
+        "any": ("on the line", "on line", "caller", "the phone",
+                "calling in", "you're on", "we've got", "hello?"),
+    },
+    "banter_caller": {
+        "want": "somebody on the phone line",
+        "marker": "C",
+        "any": ("on the line", "on line", "caller", "the phone",
+                "calling in", "you're on", "we've got", "hello?"),
+    },
+    "gallery": {
+        "want": "a painting described and put up for sale",
+        "any": ("painting", "canvas", "portrait", "brush", "oil",
+                "gallery", "the frame", "the picture", "dollars", "$",
+                "print", "the piece", "artist"),
+    },
+    "ad": {
+        "want": "a product named and sold",
+        "any": ("sponsor", "brought to you", "available at", "call now",
+                "dollars", "$", "%", "offer", "buy", "try ", "limited",
+                "the good people at", "our friends at", "in stores"),
+    },
+    "news": {
+        "want": "the story the wire carried",
+        "any": ("report", "reported", "according to", "the story",
+                "headline", "news", "officials", "said today", "this week",
+                "authorities", "announced", "the wire"),
+    },
+    "recap": {
+        "want": "the hour that just went out",
+        "any": ("earlier", "this hour", "we played", "we heard", "so far",
+                "the last hour", "who rang", "tonight we", "just gone"),
+    },
+}
+# A script shorter than this is not judged - there is nothing in it to
+# look for, and calling a two-line round off-brief would be noise.
+BRIEF_MIN_CHARS = 120
+
+
+def segment_audit(kind: str, script: str) -> dict[str, Any]:
+    """#968: does this script do the thing its entry is for?
+
+    Returns checked=False rather than a verdict for kinds with no brief
+    that can be read off the words alone - banter is two people talking
+    and there is nothing to look for, a record is not a script at all.
+    Saying "not checked" is the honest answer and it keeps the pass rate
+    meaningful."""
+    out: dict[str, Any] = {"kind": str(kind or ""), "checked": False,
+                           "ok": True, "want": "", "found": [], "why": ""}
+    try:
+        brief = SEGMENT_BRIEF.get(str(kind or ""))
+        text = str(script or "")
+        if not brief:
+            out["why"] = ("this kind has no brief that can be checked from "
+                          "the script alone")
+            return out
+        out["want"] = str(brief.get("want") or "")
+        if len(text.strip()) < BRIEF_MIN_CHARS:
+            out["why"] = "too short to judge"
+            return out
+        out["checked"] = True
+        low = " " + " ".join(text.lower().split()) + " "
+        found = [w for w in brief.get("any") or () if w in low]
+        marker = str(brief.get("marker") or "")
+        has_marker = bool(marker) and bool(
+            re.search(r"(?m)^\s*" + re.escape(marker) + r"\s*:", text))
+        out["found"] = found[:6]
+        out["marker"] = has_marker if marker else None
+        out["ok"] = bool(found or has_marker)
+        if out["ok"]:
+            out["why"] = ("the script does what the entry is for"
+                          + (" - the caller has turns of their own"
+                             if has_marker else ""))
+        else:
+            out["why"] = ("the script never gets to "
+                          + str(brief.get("want") or "what the entry is for")
+                          + (" - and nobody speaks on the phone line"
+                             if marker else ""))
+    except Exception:  # noqa: BLE001
+        out["checked"] = False
+        out["why"] = "the script could not be read"
+    return out
+
+
+# The last audits, so the glass can show a run of them rather than one.
+_BRIEF_LOG: list[dict[str, Any]] = []
+BRIEF_LOG_KEEP = 60
+
+
+def brief_note(kind: str, label: str, script: str,
+               where: str = "banked") -> dict[str, Any]:
+    """#968: audit one round and write the verdict down."""
+    got = segment_audit(kind, script)
+    try:
+        got["at"] = time.time()
+        got["label"] = str(label or "")[:60]
+        got["where"] = str(where)[:12]
+        _BRIEF_LOG.append(dict(got))
+        del _BRIEF_LOG[:-BRIEF_LOG_KEEP]
+        if got.get("checked") and not got.get("ok"):
+            # #968: and the likeliest CAUSE, named. "Off brief" on its
+            # own sends the operator looking at the model, when the answer
+            # is usually a dial they set themselves. At the top of its
+            # range the grounding slider is a GUARANTEE (#844): a round
+            # that came back without the speakbox passage has that passage
+            # pasted in verbatim as a spoken turn. A full swath can
+            # prepend three thousand characters of raw document ahead of
+            # the segment's own work. Both do exactly what they say;
+            # together they are how a memo from upstairs becomes four
+            # minutes of transcript with no memo in it.
+            _cause = ""
+            try:
+                _sbs = dj_settings()
+                _rate = float(_sbs.get("speakbox_rate") or 0)
+                _full = float(_sbs.get("speakbox_full_swath_rate") or 0)
+                _pre = float(_sbs.get("speakbox_prepend_rate") or 0)
+                _high = []
+                if _rate >= 0.95:
+                    _high.append(f"grounding at {int(_rate * 100)}% pastes "
+                                 "the passage in verbatim when the model "
+                                 "does not use it (#844)")
+                if _full >= 0.35:
+                    _high.append(
+                        "a full swath of up to "
+                        + str(int(_sbs.get("speakbox_full_swath_chars") or 0))
+                        + f" characters lands on {int(_full * 100)}% of "
+                        + "rounds")
+                elif _pre >= 0.7:
+                    _high.append("a swath is prepended to "
+                                 + str(int(_pre * 100)) + "% of rounds")
+                if _high:
+                    _cause = (" The speakbox dials are the likeliest cause: "
+                              + "; ".join(_high)
+                              + " - turn them down if the segment's own job "
+                                "matters more than the grounding does.")
+            except Exception:  # noqa: BLE001
+                _cause = ""
+            pipeline_log(
+                "lookahead",
+                f"OFF BRIEF - {got['label'] or kind}: {got['why']}. It was "
+                f"written for \u201c{got.get('want')}\u201d. It is pushed "
+                "down the shelf so anything that does do the job goes "
+                "first" + _cause + " (#968)")
+    except Exception:  # noqa: BLE001
+        pass
+    return got
+
+
+def brief_state() -> dict[str, Any]:
+    """#968: what is standing on the shelves, and how the roads are doing.
+
+    Reads the SHELVES first and the session log second. The verdict is
+    stamped on the row and travels with it to disk, so after a restart
+    the shelves know what they are holding while the log is empty - and
+    reporting "nothing checkable has been banked" on a station whose
+    shelves are full would be the most misleading answer available."""
+    rows: list[dict[str, Any]] = []
+    try:
+        for _kind, _shelf in _SHELF.items():
+            for _row in (_shelf or []):
+                _b = (_row or {}).get("brief")
+                if isinstance(_b, dict) and _b.get("kind"):
+                    rows.append({**_b, "where": "on the shelf"})
+    except Exception:  # noqa: BLE001
+        pass
+    _seen = {(r.get("kind"), r.get("label"), r.get("why")) for r in rows}
+    for _row in _BRIEF_LOG:
+        if (_row.get("kind"), _row.get("label"),
+                _row.get("why")) not in _seen:
+            rows.append(_row)
+    checked = [r for r in rows if r.get("checked")]
+    bad = [r for r in checked if not r.get("ok")]
+    per: dict[str, dict[str, int]] = {}
+    for row in checked:
+        seat = per.setdefault(str(row.get("kind") or ""),
+                              {"checked": 0, "off": 0})
+        seat["checked"] += 1
+        if not row.get("ok"):
+            seat["off"] += 1
+    return {
+        "checked": len(checked),
+        "off_brief": len(bad),
+        "roads": [{"kind": k, **v} for k, v in
+                  sorted(per.items(), key=lambda kv: -kv[1]["off"])],
+        "recent": list(reversed(rows))[:24],
+        "say": (f"{len(bad)} of the last {len(checked)} checked round(s) "
+                "did not do what their entry is for"
+                if bad else
+                f"every one of the last {len(checked)} checked round(s) "
+                "did what its entry is for") if checked else
+               "nothing checkable has been banked yet",
+    }
+
+
 def shelf_put(kind: str, row: dict[str, Any]) -> None:
     """Shelve one prepared item. The AUDIO is already in the pantry —
     this only writes down what was prepared and how to find it."""
@@ -9874,6 +10104,19 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         row = dict(row)
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
+        # #968: judged as it is shelved, while the script is right here.
+        try:
+            _entry = row.get("entry")
+            _script = str((_entry or {}).get("script") or "") \
+                if isinstance(_entry, dict) else ""
+            _brief = brief_note(str(kind), str(row.get("label")
+                                               or (_entry or {}).get("label")
+                                               or kind), _script)
+            row["brief"] = _brief
+            row["off_brief"] = bool(_brief.get("checked")
+                                    and not _brief.get("ok"))
+        except Exception:  # noqa: BLE001
+            row["off_brief"] = False
         rows = shelf_rows(kind)
         # #926: its stable id, written down now — before it joins the
         # shelf, so the clash check behind alt_sid() can see the rows it
@@ -9912,6 +10155,14 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         # goes before one that has been out, so reuse is what happens when
         # the desk is behind - never a substitute for writing.
         _order = list(alt_take_order(kind, rows))
+        # #968: ON BRIEF FIRST. A round that never gets to the thing its
+        # entry is for is still better than silence, so it is not thrown
+        # away - it goes to the BACK, and anything that does the job goes
+        # out ahead of it.
+        try:
+            _order.sort(key=lambda r: 1 if r.get("off_brief") else 0)
+        except Exception:  # noqa: BLE001
+            pass
         if str(kind) in SHELF_REUSABLE:
             _order.sort(key=lambda r: (1 if r.get("aired_at") else 0,
                                        float(r.get("aired_at") or 0)))
@@ -14442,6 +14693,123 @@ def inject_disfluencies(text: str, vec: dict[str, float],
     return " ".join(out)
 
 
+# #984: A CORNER OF THE LIBRARY, FOR A WHILE.
+#
+# "I want to be able to highlight an artist and have them on play for the
+# next hour, or an album and highlight it to have on play for the next
+# hour. So I want to be able to select a particular element and have that
+# be consistently played at random for the next hour. Or whatever time
+# range that I put."
+#
+# Not a queue and not a playlist: the rotation carries on being the
+# rotation - shuffled, thumbs-down still banned, loved still biased
+# forward - it is simply drawn from a smaller pool until the clock runs
+# out. That is what "consistently played at random for the next hour"
+# means, and it is one filter in radio_fill rather than a second music
+# system running beside the first.
+#
+# It NEVER takes the station off the air. A focus that matches nothing is
+# reported, logged and ignored; the full library comes back.
+_MUSIC_FOCUS: dict[str, Any] = {}
+MUSIC_FOCUS_MOST = 24 * 60.0            # a day, in minutes
+MUSIC_FOCUS_DEFAULT = 60.0
+
+
+def music_focus() -> dict[str, Any]:
+    """The corner in force, or {} - expiring itself as it is read."""
+    try:
+        if not _MUSIC_FOCUS:
+            return {}
+        until = float(_MUSIC_FOCUS.get("until") or 0)
+        if until and time.time() >= until:
+            gone = dict(_MUSIC_FOCUS)
+            _MUSIC_FOCUS.clear()
+            try:
+                pipeline_log("air", f"the {gone.get('kind')} hour is over - "
+                             f"{gone.get('value')} goes back into the "
+                             "rotation with everything else (#984)")
+                _RADIO["queue"] = []      # re-draw from the whole library
+            except Exception:  # noqa: BLE001
+                pass
+            return {}
+        out = dict(_MUSIC_FOCUS)
+        out["left_seconds"] = round(max(0.0, until - time.time()), 1)
+        return out
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def music_focus_match(track: dict[str, Any],
+                      focus: dict[str, Any] | None = None) -> bool:
+    """Is this track inside the corner? Case- and space-insensitive,
+    because an operator picks these off the screen rather than typing
+    them, and the tags in a library are never tidy."""
+    try:
+        focus = focus if focus is not None else music_focus()
+        if not focus:
+            return True
+        kind = str(focus.get("kind") or "")
+        want = " ".join(str(focus.get("value") or "").lower().split())
+        if not want:
+            return True
+        if kind == "artist":
+            return " ".join(str(track.get("artist") or "").lower().split()) \
+                == want
+        if kind == "album":
+            return " ".join(str(track.get("album") or "").lower().split()) \
+                == want
+        if kind == "station":
+            return " ".join(str(track.get("station") or "").lower().split()) \
+                == want
+        if kind == "track":
+            return str(track.get("id") or "") == str(focus.get("id") or "")
+        return True
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def music_focus_set(kind: str, value: str, minutes: float = 0.0,
+                    track_id: str = "") -> dict[str, Any]:
+    """Put a corner of the library on for a while. minutes<=0 clears it."""
+    try:
+        kind = str(kind or "").strip().lower()
+        value = str(value or "").strip()
+        mins = float(minutes or 0)
+        if kind not in ("artist", "album", "station", "track") or mins <= 0:
+            gone = dict(_MUSIC_FOCUS)
+            _MUSIC_FOCUS.clear()
+            if gone:
+                _RADIO["queue"] = []
+                pipeline_log("air", "the focus was lifted - the whole "
+                                    "library is back in the rotation (#984)")
+            return {"ok": True, "focus": {}, "matched": 0,
+                    "say": "the whole library is in the rotation"}
+        mins = max(1.0, min(MUSIC_FOCUS_MOST, mins))
+        want = {"kind": kind, "value": value, "id": str(track_id or ""),
+                "at": time.time(), "until": time.time() + mins * 60.0,
+                "minutes": round(mins, 1)}
+        matched = sum(1 for t in music_index() if music_focus_match(t, want))
+        if not matched:
+            return {"ok": False, "focus": music_focus(), "matched": 0,
+                    "say": f"nothing in the library matches that {kind} - "
+                           "the rotation is untouched"}
+        _MUSIC_FOCUS.clear()
+        _MUSIC_FOCUS.update(want)
+        # The queue already drawn is from the whole library; throw it away
+        # so the corner starts on the NEXT record rather than in ten.
+        _RADIO["queue"] = []
+        pipeline_log("air", f"{value} takes the rotation for "
+                     f"{int(mins)} min - {matched} track(s) in that "
+                     f"{kind}, drawn at random like any other shuffle "
+                     "(#984)")
+        return {"ok": True, "focus": music_focus(), "matched": matched,
+                "say": f"{value} for the next {int(mins)} minutes - "
+                       f"{matched} track(s)"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "focus": {}, "matched": 0,
+                "say": f"{type(exc).__name__}: {exc}"[:140]}
+
+
 def radio_fill(station: str) -> list[dict[str, Any]]:
     banned = banned_ids()                 # a thumbs down is permanent (#116)
     loved = loved_ids()                   # a thumbs up is a standing request
@@ -14461,6 +14829,19 @@ def radio_fill(station: str) -> list[dict[str, Any]]:
                     or w in str(t.get("album") or "").lower()
                     for w in avoid)
     ]
+    # #984: ...and narrowed to the corner the operator put on, if any.
+    # Applied AFTER the bans and the audiobook gate so a focus can never
+    # smuggle back something the station is not allowed to play, and
+    # ignored outright when it would leave nothing - the air comes first.
+    _focus = music_focus()
+    if _focus:
+        _inside = [t for t in tracks if music_focus_match(t, _focus)]
+        if _inside:
+            tracks = _inside
+        else:
+            pipeline_log("drop", f"nothing on this station matches "
+                         f"{_focus.get('value')} - the focus is ignored for "
+                         "now rather than taking the air off (#984)")
     random.shuffle(tracks)
     if loved:
         # Scaling a random sort key biases a loved track toward the front of
@@ -18294,6 +18675,37 @@ def _pantry_load() -> None:
                             _row.get("entry"), dict):
                         _unstrand(_row["entry"])
             _SHELF.update({str(k): list(v or []) for k, v in rows.items()})
+            # #968: a row that came back from disk never went through
+            # shelf_put, so it has never been judged. Judge it now -
+            # otherwise the audit reports "nothing checkable has been
+            # banked" on a station whose shelves are full, which is the
+            # most misleading answer it could give.
+            for _kind, _rows in _SHELF.items():
+                for _row in (_rows or []):
+                    try:
+                        if not isinstance(_row, dict):
+                            continue
+                        # A stored verdict that never actually REACHED one -
+                        # "too short to judge", or a shape this pass did not
+                        # know how to read - is re-tried, so a fix to the
+                        # audit reaches the rows already on the shelf.
+                        _old = _row.get("brief") or {}
+                        if _old and _old.get("checked"):
+                            continue
+                        _e = _row.get("entry")
+                        _sc = str((_e or {}).get("script") or "")                             if isinstance(_e, dict) else ""
+                        if not _sc:
+                            _sc = str(_row.get("text") or "")
+                        _b = brief_note(str(_kind),
+                                        str(_row.get("label")
+                                            or (_e or {}).get("label")
+                                            or _kind),
+                                        _sc, where="restored")
+                        _row["brief"] = _b
+                        _row["off_brief"] = bool(_b.get("checked")
+                                                 and not _b.get("ok"))
+                    except Exception:  # noqa: BLE001
+                        continue
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -21460,6 +21872,23 @@ def coord_brief() -> dict[str, Any]:
                                     "that buys the most air")
         except Exception:  # noqa: BLE001
             pass
+        # --- is what is being written the thing that was asked for -------
+        try:
+            _br = brief_state()
+            out["brief"] = {"checked": _br.get("checked"),
+                            "off_brief": _br.get("off_brief"),
+                            "say": _br.get("say")}
+            _bad = int(_br.get("off_brief") or 0)
+            _all = int(_br.get("checked") or 0)
+            if _bad and _all and _bad * 3 >= _all:
+                out["worries"].append(
+                    f"{_bad} of the last {_all} checked round(s) did not do "
+                    "what their entry is for")
+                out["doing"].append("those are pushed to the back of their "
+                                    "shelf so anything on brief airs first "
+                                    "(#968)")
+        except Exception:  # noqa: BLE001
+            pass
         # --- is the sheet even makeable ------------------------------------
         # #1004: last, because it is a standing condition rather than
         # something happening this minute - but ahead of the sentence, so
@@ -21686,6 +22115,28 @@ def _coord_road_doing(rep: dict[str, Any]) -> list[dict[str, str]]:
                 "It has arrived with nothing prepared " + str(misses)
                 + " time(s) this session, so the coordinator asks for more "
                 "of it than it strictly owes.")})
+        # #968: is what this road turns out actually the thing its
+        # entries are for? Counted off the audits, not asserted.
+        try:
+            _seen = [r for r in _BRIEF_LOG
+                     if r.get("checked")
+                     and str(SCHED_PREP_KIND.get(str(r.get("kind") or ""))
+                             or r.get("kind") or "") == road]
+            _off = [r for r in _seen if not r.get("ok")]
+            if _off:
+                say.append({"tag": "due", "text": (
+                    str(len(_off)) + " of the last " + str(len(_seen))
+                    + " round(s) checked on this road did NOT do what "
+                      "the entry is for - most recently: "
+                    + str(_off[-1].get("why") or "")
+                    + ". Those go to the back of the shelf, so anything "
+                      "that does the job airs first.")})
+            elif _seen:
+                say.append({"tag": "clear", "text": (
+                    "All " + str(len(_seen)) + " round(s) checked on this "
+                    "road did what the entry is for.")})
+        except Exception:  # noqa: BLE001
+            pass
         quota = rep.get("quota") or {}
         if quota.get("target"):
             say.append({"tag": ("due" if quota.get("behind") else "clear"),
@@ -55202,6 +55653,45 @@ async def music_browse(
     }
 
 
+@app.get("/api/music/focus")
+async def music_focus_get(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#984: the corner of the library the rotation is drawn from right
+    now, and how long is left on it."""
+    require_read_auth(authorization)
+    got = music_focus()
+    if not got:
+        return {"focus": {}, "matched": 0,
+                "say": "the whole library is in the rotation"}
+    matched = sum(1 for t in music_index() if music_focus_match(t, got))
+    return {"focus": got, "matched": matched,
+            "say": f"{got.get('value')} for another "
+                   f"{int(float(got.get('left_seconds') or 0) / 60)} min - "
+                   f"{matched} track(s)"}
+
+
+@app.post("/api/music/focus")
+async def music_focus_post(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#984: play one artist, album, station or track at random for a
+    while. {"kind": "artist", "value": "...", "minutes": 60}; minutes 0
+    (or no kind) puts the whole library back."""
+    require_auth(authorization)
+    body = await request.json()
+    body = body if isinstance(body, dict) else {}
+    try:
+        mins = float(body.get("minutes", MUSIC_FOCUS_DEFAULT) or 0)
+    except (TypeError, ValueError):
+        mins = MUSIC_FOCUS_DEFAULT
+    return music_focus_set(str(body.get("kind") or ""),
+                           str(body.get("value") or ""),
+                           mins,
+                           str(body.get("id") or ""))
+
+
 @app.post("/api/music/reindex")
 async def music_reindex(
     authorization: str | None = Header(default=None),
@@ -58375,6 +58865,17 @@ async def api_interject_progress(
     on air, at the writing desk, in the recording room, or on the air."""
     require_read_auth(authorization)
     return interject_progress()
+
+
+@app.get("/api/schedule/brief-audit")
+async def api_brief_audit(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#968: whether the scripts the rooms are turning out actually do
+    what their entries are for - which roads are drifting, and the last
+    two dozen verdicts with the words each one was judged on."""
+    require_read_auth(authorization)
+    return brief_state()
 
 
 @app.get("/api/coordinator/capacity")

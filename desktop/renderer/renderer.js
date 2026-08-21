@@ -384,6 +384,23 @@ function sendBoxMusicLevel(v) {
   }, 400);
 }
 
+/* #988/#984: the two new cells in the strip are buttons in everything
+ * but tag name. Wired on the status poll rather than at load, because
+ * the strip is rebuilt when the window reconnects. */
+function initSegCell() {
+  const cell = document.getElementById("segCell");
+  if (!cell || cell.dataset.wired) return;
+  cell.dataset.wired = "1";
+  cell.onclick = () => { segCellOpen(); };
+}
+
+function initNowCell() {
+  const cell = document.getElementById("nowCell");
+  if (!cell || cell.dataset.wired) return;
+  cell.dataset.wired = "1";
+  cell.onclick = () => { nowCellOpen(); };
+}
+
 function initStreamVolumes() {
   Object.keys(STREAM_VOL_IDS).forEach((stream) => {
     const slider = $(STREAM_VOL_IDS[stream]);
@@ -968,6 +985,9 @@ async function refresh() {
     paintStreamRoutes(status.routing);
     initStreamRoutes();
     initStreamVolumes();
+    initSegCell();                                          // #988
+    initNowCell();                                          // #984
+    nowCellTrack = status.now_playing || null;              // #984
     applyAppVolume();
     renderChecks(status);
   } catch (err) {
