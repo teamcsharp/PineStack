@@ -33318,6 +33318,17 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None
                                 "desc": str(p.get("desc") or "")}
                                for p in _prep_pics[:3]],
                 }
+                # #1005: and the lines of THIS round take them as each one
+                # is written - see gallery_pending_set. Bound to the round
+                # that is about them, so the next round's phone call does
+                # not inherit the painting.
+                try:
+                    _gp = _RADIO["gallery_now"]["images"]
+                    gallery_pending_set(
+                        [str((x or {}).get("name") or "") for x in _gp],
+                        [str((x or {}).get("desc") or "") for x in _gp])
+                except Exception:  # noqa: BLE001
+                    pass
             _prep_began = time.time()
             try:
                 _prep_said = await _banter_air(_prep_entry, None)
@@ -33368,6 +33379,17 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None
             "at": time.time(),
             "images": [{"name": n, "desc": d} for n, d in pieces],
         }
+        # #1005: and the lines of THIS round take them as each one
+        # is written - see gallery_pending_set. Bound to the round
+        # that is about them, so the next round's phone call does
+        # not inherit the painting.
+        try:
+            _gp = _RADIO["gallery_now"]["images"]
+            gallery_pending_set(
+                [str((x or {}).get("name") or "") for x in _gp],
+                [str((x or {}).get("desc") or "") for x in _gp])
+        except Exception:  # noqa: BLE001
+            pass
     seed = await speakbox_quote(most=5, cap=450)
     listing = " ".join(
         f"PAINTING {i + 1}: \"{desc}\""
@@ -33477,6 +33499,17 @@ async def dj_reanalysis_round(name: str, desc: str) -> list[str]:
         "at": time.time(),
         "images": [{"name": name, "desc": desc}],
     }
+    # #1005: and the lines of THIS round take them as each one
+    # is written - see gallery_pending_set. Bound to the round
+    # that is about them, so the next round's phone call does
+    # not inherit the painting.
+    try:
+        _gp = _RADIO["gallery_now"]["images"]
+        gallery_pending_set(
+            [str((x or {}).get("name") or "") for x in _gp],
+            [str((x or {}).get("desc") or "") for x in _gp])
+    except Exception:  # noqa: BLE001
+        pass
     try:
         seed = await speakbox_quote(most=4, cap=380)
     except Exception:                              # noqa: BLE001
@@ -33602,6 +33635,17 @@ async def dj_hawk_round(names: list[str], moods: list[str],
         "at": time.time(),
         "images": [{"name": n, "desc": d} for n, d in pieces],
     }
+    # #1005: and the lines of THIS round take them as each one
+    # is written - see gallery_pending_set. Bound to the round
+    # that is about them, so the next round's phone call does
+    # not inherit the painting.
+    try:
+        _gp = _RADIO["gallery_now"]["images"]
+        gallery_pending_set(
+            [str((x or {}).get("name") or "") for x in _gp],
+            [str((x or {}).get("desc") or "") for x in _gp])
+    except Exception:  # noqa: BLE001
+        pass
     _RADIO["hawking"] = {
         "at": time.time(),
         "images": [n for n, _ in pieces],
@@ -33705,6 +33749,82 @@ def _gallery_words(text: str) -> set[str]:
         return set()
 
 
+# #1005: THE PICTURES WAIT FOR THEIR LINES.
+#
+# gallery_line_mark is retroactive - it walks back through the booth log
+# and hangs the paintings on rows that are already there. That works for
+# a round written and aired in one breath, and measurably does not for
+# the road most rounds now take: a round PREPARED during an earlier
+# record airs through _banter_air, whose rows land as the audio is
+# queued, and the mark can run before some or all of them exist. Measured
+# on the live station: a gallery round aired with `selling_now` correctly
+# holding up Ernie-Image-Turbo_00121_, seventy-five rows in the booth
+# log, and NOT ONE of them carrying a picture.
+#
+# So the round leaves its pictures standing where the booth can reach
+# them, and every line written while they are still up takes the one it
+# is about - the same nouns-in-common scoring, applied forward instead of
+# backward. Retroactive marking is unchanged and still runs; this only
+# catches what it cannot reach.
+_GALLERY_PENDING: dict[str, Any] = {}
+GALLERY_PENDING_LIFE = 420.0
+
+
+def gallery_pending_set(names: list[str],
+                        descs: list[str] | None = None) -> None:
+    """The paintings a round now on air is about, left up for its lines."""
+    try:
+        keep = [str(n) for n in (names or []) if n][:3]
+        if not keep:
+            return
+        _GALLERY_PENDING.clear()
+        _GALLERY_PENDING.update({
+            "names": keep,
+            "bags": [_gallery_words(d) for d in (descs or [])],
+            "at": time.time()})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def gallery_pending_pick(text: str) -> list[str]:
+    """Which of the round's paintings this line is about, or [] when no
+    round is up. Same rule as the retroactive pass: two shared nouns is a
+    match, one is a coincidence in a round where everybody is talking
+    about pictures, and a line about none of them keeps the whole strip."""
+    try:
+        if not _GALLERY_PENDING:
+            # #1005: nothing is up. Deliberately NOT falling back to
+            # selling_now() here, which was tried and measured wrong: a
+            # phone call about a library book aired with a painting
+            # hanging beside every line of it, because an ad had sold one
+            # a minute earlier and "what is being held up" is a property
+            # of the STATION rather than of this round. Pictures are
+            # bound to the round that is about them - see the two setters
+            # above and the one in _banter_air.
+            return []
+        if time.time() - float(_GALLERY_PENDING.get("at") or 0) \
+                > GALLERY_PENDING_LIFE:
+            _GALLERY_PENDING.clear()
+            return []
+        names = list(_GALLERY_PENDING.get("names") or [])
+        bags = list(_GALLERY_PENDING.get("bags") or [])
+        if not names:
+            return []
+        best, score = None, 0
+        if len(bags) > 1:
+            said = _gallery_words(text or "")
+            if said:
+                for at, bag in enumerate(bags):
+                    if at >= len(names):
+                        break
+                    hit = len(said & bag)
+                    if hit > score:
+                        best, score = at, hit
+        return [names[best]] if best is not None and score >= 2 else names[:3]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def gallery_line_mark(names: list[str], since: float,
                       descs: list[str] | None = None) -> None:
     """Hang the paintings on the lines that discuss them (#702).
@@ -33730,7 +33850,11 @@ def gallery_line_mark(names: list[str], since: float,
     single-picture road is untouched."""
     if not names:
         return
+    # #1005: and leave them up for the lines that have not been written
+    # into the log yet - see gallery_pending_set.
+    gallery_pending_set(names, descs)
     bags = [_gallery_words(d) for d in (descs or [])]
+    marked = 0
     for entry in reversed(_RADIO.get("chat") or []):
         if float(entry.get("ts") or 0) < since:
             break
@@ -33750,6 +33874,18 @@ def gallery_line_mark(names: list[str], since: float,
         # round where everybody is talking about pictures.
         entry["images"] = ([names[best]] if best is not None and score >= 2
                            else names[:3])
+        marked += 1
+    # #1005: say how many the backward pass could actually reach. On the
+    # prepared road that number is routinely ZERO - the rows had not been
+    # written yet - and until it was printed nobody could tell the
+    # difference between "hung on every line" and "hung on nothing".
+    try:
+        pipeline_log("gallery", f"{len(names)} painting(s) hung on {marked} "
+                     "line(s) already in the booth"
+                     + ("; the rest of the round takes them as it is "
+                        "written (#1005)" if marked < 3 else " (#991)"))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def banter_pictures(limit: int = 6) -> str:
@@ -45602,6 +45738,14 @@ async def speak_turns(turns: list[tuple[str, str]],
                             "seconds": round(float(secs or 0), 2)}
                            if who == "board" else {}),
                         "text": chunk, "aired": "stream",
+                        # #1005: the painting this line is about, if a
+                        # gallery round is up. Attached as the row is
+                        # WRITTEN, which is the half gallery_line_mark
+                        # cannot reach on the prepared road.
+                        **({"images": _pics}
+                           if who in ("dj", "cohost", "third", "caller")
+                           and (_pics := gallery_pending_pick(chunk))
+                           else {}),
                         "name": booth_actor_name(
                             who, caller_name if who == "caller"
                             else caller2_name if who == "caller2" else ""),
@@ -47579,6 +47723,28 @@ async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
+    # #1005: THE PICTURES BELONG TO THE ROUND, NOT TO THE STATION.
+    #
+    # This is the one place every prepared round passes through on its way
+    # to the air, and the entry knows what it is about: a gallery round
+    # banked hours ago carries the paintings it was written from
+    # (prep_gallery, #855) so the vision passes are paid for exactly once.
+    # Setting the standing pictures HERE, and clearing them for a round
+    # that has none, is what stops the previous gallery round's painting
+    # from hanging beside the next round's phone call - which is exactly
+    # what happened when this was read off the station's own "what is
+    # being held up" instead.
+    try:
+        _pics = [str((p or {}).get("name") or "")
+                 for p in (entry.get("prep_gallery") or [])]
+        _descs = [str((p or {}).get("desc") or "")
+                  for p in (entry.get("prep_gallery") or [])]
+        if [p for p in _pics if p]:
+            gallery_pending_set([p for p in _pics if p], _descs)
+        else:
+            _GALLERY_PENDING.clear()
+    except Exception:  # noqa: BLE001
+        pass
     # A prewritten round is the station's continuity reserve. When another
     # segment is already holding the model gate, never queue this reserve
     # behind a rewrite: speak_turns still applies its line-level repetition
