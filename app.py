@@ -816,6 +816,24 @@ DEFAULT_DJ = {
     # media player as a real volume instead. Low by default because that
     # is what a record under a talk show is for.
     "music_box_level": 0.35,
+    # #1007: ...and WHETHER THE STATION IS ALLOWED TO SET IT AT ALL.
+    #
+    # "I do not want the device's volume affected when i set it on the
+    # device." #971 sent the level before every record, #993 cut that to
+    # once per change - but once per change is still once per RESTART,
+    # because what we last told the box lived only in memory. So a hand on
+    # the physical dial survived until the next time the service came up,
+    # which on a station under active work is often.
+    #
+    # There is no arrangement of "when to re-send it" that leaves a
+    # physical dial alone, because the station and the dial are two owners
+    # of one number and the last writer wins. The only honest fix is to
+    # decide WHICH ONE OWNS IT, and the operator has said: the device.
+    #
+    # So the station does not touch the box's volume unless this is
+    # switched on. Off, the Music slider still moves music playing in the
+    # app and the box plays records at whatever the dial on it says.
+    "box_volume_control": False,
     # Whisper the playing song so the pair can talk about its actual
     # lyrics (#451). Off by default — it is CPU on every new track.
     "lyrics_talk": True,
@@ -1396,6 +1414,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "music_box_level": max(0.0, min(1.0, float(
             raw_dj.get("music_box_level",
                        DEFAULT_DJ["music_box_level"]) or 0.0))),
+        "box_volume_control": bool(raw_dj.get(                 # #1007
+            "box_volume_control", DEFAULT_DJ["box_volume_control"])),
         "lyrics_talk": bool(raw_dj.get("lyrics_talk",
                                        DEFAULT_DJ["lyrics_talk"])),
         "perf": bool(raw_dj.get("perf", DEFAULT_DJ["perf"])),
@@ -9725,7 +9745,22 @@ def shelf_cap(kind: str) -> int:
 # Deliberately NOT caller (a phone call replayed word for word is the one
 # repeat a listener would certainly catch) and NOT news (a bulletin goes
 # off; that is the whole reason its cap is 1).
-SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id")
+# #961/#1004: "caller" joined this list on the evidence of the road's own
+# report - the phone bled 446 SECONDS OF DEAD AIR in half an hour, it had
+# arrived at its own entry with nothing prepared twice in one session, and
+# its shelf stood at zero rows against 2040s owed.
+#
+# The arithmetic behind that is not a bug anywhere; it is the box. One
+# phone call costs about 273s of room to build and buys about 96s of air -
+# a rate of 0.35, because every word of it is rendered by a clone engine
+# running near three times slower than real time. The canonical hour asks
+# for SEVENTEEN MINUTES of phone. Fresh, that is roughly forty-eight
+# minutes of room for one road out of eight, in an hour that has sixty.
+#
+# So a call segment cannot be filled with none but new calls, and the
+# choice is between a caller who rings back three hours later and four
+# minutes of silence. Nobody has ever complained about the first.
+SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id", "caller")
 # How long an aired item rests before it may go out again. The operator
 # asked for three hours.
 SHELF_REUSE_REST = float(os.getenv("SHELF_REUSE_REST", "10800"))
@@ -13555,6 +13590,11 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
     # the record plays at the level it always did.
     _music_entity = (NABU_MEDIA_PLAYER if player == NABU_SATELLITE
                      else player)
+    # #1007: unless the operator has handed the station that dial, we do
+    # not touch it - not before the first record, not after a restart,
+    # never. This is the whole fix; everything below it is the opt-in path.
+    if not box_volume_control():
+        _music_entity = ""
     if _music_entity.startswith("media_player."):
         _want = round(music_box_level(), 3)
         # #993: "Do not reset the volume that I set on the physical
@@ -13594,7 +13634,10 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
                 pipeline_log("voice", f"records set to {int(_want * 100)}% on "
                              f"{_music_entity.split('.')[-1]} once - the DJs "
                              "are not touched by it, and the dial on the "
-                             "device is left alone from here (#971/#993)")
+                             "device is left alone from here. Switch off "
+                             "\u201cstation sets the box volume\u201d if you "
+                             "want the physical dial to be the only owner "
+                             "(#971/#993/#1007)")
             else:
                 pipeline_log("drop", "could not set the record level on "
                              f"{_music_entity}: "
@@ -21209,6 +21252,104 @@ def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
     return out
 
 
+_COORD_CAPACITY: dict[str, Any] = {}
+COORD_CAPACITY_EVERY = 120.0
+
+
+def coord_capacity() -> dict[str, Any]:
+    """#1004: CAN THIS BOX MAKE WHAT THE SHEET ASKS FOR?
+
+    "I didn't hear enough phone calls happening in the segment. Make sure
+    that the coordinator is scheduling phone calls to happen inside a
+    phone call segment."
+
+    It was scheduling them. The canonical hour carries four phone
+    entries - seventeen minutes of an hour on the line - and the
+    coordinator named every one of them on time. What it could not do was
+    MAKE them, and nothing anywhere said so.
+
+    Every road has a measured rate in the task ledger: seconds of air
+    bought per second of room time. The phone measures 0.35, because a
+    call is rendered word by word through a clone engine running near
+    three times slower than real time. Seventeen minutes of phone at 0.35
+    is forty-eight minutes of room - for one road, in an hour that has
+    sixty and seven other roads in it.
+
+    So this multiplies each entry's own minutes by what its road costs,
+    sums the hour, and says the number out loud. A sheet that asks for
+    more than the box can render is not a fault to be fixed in code; it
+    is a decision for the operator - fewer entries, shorter ones, or
+    accept that rested material goes out again. What was wrong was that
+    nobody could see it."""
+    now = time.time()
+    if (now - float(_COORD_CAPACITY.get("at") or 0) < COORD_CAPACITY_EVERY
+            and _COORD_CAPACITY.get("say")):
+        return dict(_COORD_CAPACITY)
+    out: dict[str, Any] = {"at": now, "asks": 0.0, "room": 0.0,
+                           "hour": 3600.0, "over": 0.0, "roads": [],
+                           "say": ""}
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            out["say"] = "no running order is on, so nothing is being asked for"
+            _COORD_CAPACITY.clear()
+            _COORD_CAPACITY.update(out)
+            return dict(out)
+        name = schedule_preset_now(store)
+        rows = [r for r in ((store.get("presets") or {}).get(name) or [])
+                if r.get("enabled", True)]
+        per_road: dict[str, float] = {}
+        asks = 0.0
+        room = 0.0
+        for slot in rows:
+            kind = str(slot.get("kind") or "")
+            if kind in CANNOT_PREPARE and kind != "news":
+                continue                # a record is not written by anyone
+            mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            road = str(SCHED_PREP_KIND.get(kind) or kind)
+            rate = 0.0
+            try:
+                rate = float(task_rate(road) or 0)
+            except Exception:  # noqa: BLE001
+                rate = 0.0
+            if rate <= 0.01:
+                rate = 0.35        # the house rate on this engine
+            need = mins / rate
+            asks += mins
+            room += need
+            per_road[road] = per_road.get(road, 0.0) + need
+        out["asks"] = round(asks, 1)
+        out["room"] = round(room, 1)
+        out["over"] = round(room / 3600.0, 2)
+        out["roads"] = [
+            {"road": k, "label": SHELF_LABEL.get(k, k),
+             "room_seconds": round(v, 1)}
+            for k, v in sorted(per_road.items(), key=lambda kv: -kv[1])][:5]
+        if room <= 3600.0:
+            out["say"] = (f"the sheet asks for {int(asks / 60)} min of "
+                          f"written speech an hour and this box can render "
+                          f"it in about {int(room / 60)} min of room - it "
+                          "fits")
+        else:
+            worst = out["roads"][0] if out["roads"] else {}
+            out["say"] = (
+                f"the running order asks for {int(asks / 60)} min of "
+                f"written speech an hour; rendering all of it fresh would "
+                f"take about {int(room / 60)} min of room, and an hour has "
+                f"60. "
+                + (f"{worst.get('label') or worst.get('road')} alone wants "
+                   f"{int(float(worst.get('room_seconds') or 0) / 60)} min "
+                   "of it. " if worst else "")
+                + "Rested material goes out again to cover the difference; "
+                  "shorten those entries if you would rather everything "
+                  "were new")
+    except Exception:  # noqa: BLE001
+        out["say"] = "the sheet could not be measured against the engine"
+    _COORD_CAPACITY.clear()
+    _COORD_CAPACITY.update(out)
+    return dict(out)
+
+
 _COORD_BRIEF: dict[str, Any] = {}
 COORD_BRIEF_EVERY = 45.0
 
@@ -21317,6 +21458,23 @@ def coord_brief() -> dict[str, Any]:
                     f"{int(target / 60)} min the dial asks for")
                 out["doing"].append("the preparer is on the shortest road "
                                     "that buys the most air")
+        except Exception:  # noqa: BLE001
+            pass
+        # --- is the sheet even makeable ------------------------------------
+        # #1004: last, because it is a standing condition rather than
+        # something happening this minute - but ahead of the sentence, so
+        # a station that is quiet BECAUSE it was asked for more than it
+        # can render says so instead of listing symptoms.
+        try:
+            cap = coord_capacity()
+            out["capacity"] = {"asks": cap.get("asks"),
+                               "room": cap.get("room"),
+                               "over": cap.get("over"),
+                               "say": cap.get("say")}
+            if float(cap.get("over") or 0) > 1.0:
+                out["worries"].append(str(cap.get("say") or ""))
+                out["doing"].append("rested rounds are re-aired to cover "
+                                    "what cannot be written fresh (#977)")
         except Exception:  # noqa: BLE001
             pass
         # --- the sentence -------------------------------------------------
@@ -22552,6 +22710,39 @@ async def _torrent_talk() -> None:
                     aired = bool(_sched_aired)
                 elif kind == "caller":
                     aired = bool(await dj_caller(track))
+                    if not aired:
+                        # #1004: "Make sure that the coordinator is
+                        # scheduling phone calls to happen inside a phone
+                        # call segment."
+                        #
+                        # It was. The ROAD was giving up. dj_caller is the
+                        # request line - it rings about one of the
+                        # operator's own past requests - and it returns
+                        # nothing at all when there is no request material
+                        # to ring about ("nothing of his to call in about
+                        # yet"). Every other kind in this chain falls back
+                        # to banter when its own road comes up empty;
+                        # caller alone did not, so a four-minute Phone
+                        # call entry could air NOTHING, round after round,
+                        # and the sheet was blamed for it.
+                        #
+                        # The generated road first, because the entry
+                        # asked for a phone call and that road can always
+                        # make one - it invents the person on the line.
+                        try:
+                            _made = await dj_call_generated()
+                        except Exception:  # noqa: BLE001
+                            _made = {}
+                        aired = bool((_made or {}).get("lines"))
+                        if aired:
+                            pipeline_log(
+                                "call", "the request line had nothing of "
+                                "his to ring about, so a caller was put "
+                                "through instead - a phone-call entry "
+                                "gets a phone call (#1004)")
+                    if not aired:
+                        aired = bool(await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True))))
                 elif kind == "deep":
                     aired = bool(await dj_deep_round(track))
                     if not aired:
@@ -36280,6 +36471,22 @@ def music_box_level() -> float:
         return 0.35
 
 
+def box_volume_control() -> bool:
+    """#1007: may the station set the box's own volume?
+
+    Default NO. The physical dial on the device is the owner of that
+    number, and every scheme for "we set it, but politely" ends with the
+    station putting it back after a restart - which is exactly what the
+    operator kept hearing.
+
+    Switched on, #971/#993 behaviour returns in full: the level is sent
+    once per change, and a restart counts as a change."""
+    try:
+        return bool(dj_settings().get("box_volume_control", False))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _level_voice(raw: bytes) -> bytes:
     """Every spoken clip out the door at the same speech loudness (#306), the
     target scaled by the box-volume slider (#448). Applied to EVERY line now,
@@ -47249,25 +47456,120 @@ CALL_TURN_SECONDS = 35.0
 CALL_TOP_AND_TAIL = 25.0
 CALL_TURNS_MIN = 6
 CALL_TURNS_MAX = 12
+# #961: ...and the floor for a call that is filling the TAIL of a segment
+# rather than the whole of it. Four turns is a ring, what they want, one
+# dig at it and a goodbye - a short call, which is a real thing, and the
+# alternative in that slot is silence.
+CALL_TURNS_SHORT = 4
+# Below this much room left, a call is written as a short one.
+CALL_SEGMENT_WHOLE = 150.0
+# #961: the turn counts recent calls were actually written to, kept
+# beside the ledger's measured airtime for the same rounds so the two can
+# be divided. Short, because the engine's speed drifts.
+_CALL_TURNS_WRITTEN: list[int] = []
+
+
+def call_turn_seconds() -> float:
+    """#961: how long one turn of a phone call ACTUALLY runs on this box.
+
+    #960 derived 35s from a character count - "four to seven sentences,
+    60 to 100 words... call it five hundred characters". Nothing ever
+    checked that against the station, and the station disagrees: the task
+    ledger measures a whole prepared phone call at about 96 SECONDS of
+    air, and it is written to six turns. That is about 12s a turn, not 35.
+
+    The consequence was the operator's complaint word for word. A
+    four-minute Phone call entry asked call_turns_for_slot how long a
+    call could be; it answered six turns "because that fills 240s"; six
+    turns ran a minute and a half; and the remaining two and a half
+    minutes of a PHONE CALL SEGMENT had no phone call in it. "I didn't
+    hear enough phone calls happening in the segment."
+
+    task_gain is the ledger's mean airtime over recent calls and
+    _CALL_TURNS_WRITTEN the mean turn count of the same rounds, so their
+    ratio is what a turn buys. Clamped to no LONGER than the #960
+    estimate: erring long writes shorter calls, which is the failure we
+    are fixing, and erring short only writes more turns than needed,
+    which the segment can absorb."""
+    try:
+        made = float(task_gain("caller") or 0)
+        turns = [t for t in _CALL_TURNS_WRITTEN if t > 0]
+        if made > 0 and turns:
+            per = ((made - CALL_TOP_AND_TAIL)
+                   / max(1.0, sum(turns) / len(turns)))
+            if 3.0 <= per <= CALL_TURN_SECONDS:
+                return per
+    except Exception:  # noqa: BLE001
+        pass
+    return CALL_TURN_SECONDS
+
+
+def sched_entry_left() -> float:
+    """#961: seconds still owed to the entry that is on the air.
+
+    Read off the same saved position schedule_take() advances, so it
+    cannot disagree with the clock the show is running on. Zero when no
+    sheet is running, which is what makes every caller of this fall back
+    to its old behaviour."""
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        slot = _RADIO.get("sched_slot") or {}
+        started = float(pos.get("started") or 0)
+        if not started or not slot:
+            return 0.0
+        owns = max(0.25, float(slot.get("minutes") or 0)) * 60.0
+        return max(0.0, started + owns - time.time())
+    except Exception:  # noqa: BLE001
+        return 0.0
 
 
 def call_turns_for_slot() -> int:
     """#960: how many turns a call may be written to, so that it LANDS
     inside the entry it is going to air in.
 
-    The floor is six, because fewer than that is not a phone call. The
-    ceiling is the old twelve. Between them the running order decides,
-    and a station with no sheet at all behaves exactly as it did."""
+    #961: and so that the SECOND and THIRD call of a phone-call segment
+    are possible at all. "For the sections where they're taking phone
+    calls, I want them taking phone calls for the entire segment. So it's
+    back to back calls."
+
+    Two things stopped that. The turn was believed to run 35s when it
+    runs about 12 (see call_turn_seconds), so one call was written to
+    fill four minutes and filled ninety seconds of it. And the room a
+    call was measured against was always the WHOLE entry, so a call
+    starting with ninety seconds left on the clock was still commissioned
+    at full length and then beheaded by the segment reaper mid-sentence.
+
+    Now: if a phone-call entry is already on the air, the call is written
+    to what is LEFT of it, with a shorter floor - so calls chain, and the
+    last one in a segment is a short one that lands rather than a long one
+    that is cut off."""
     try:
         owns = 0.0
-        for ent in coord_upcoming(1800.0):
-            if str(ent.get("road") or "") == "caller":
-                owns = float(ent.get("owns_seconds") or 0)
-                break
+        # Already inside a phone-call segment: fill what is left of it.
+        try:
+            _slot = _RADIO.get("sched_slot") or {}
+            if (str(SCHED_PREP_KIND.get(str(_slot.get("kind") or "")) or "")
+                    == "caller"):
+                owns = sched_entry_left()
+        except Exception:  # noqa: BLE001
+            owns = 0.0
         if owns <= 0:
-            return random.randint(8, CALL_TURNS_MAX)
-        fits = int((owns - CALL_TOP_AND_TAIL) / CALL_TURN_SECONDS)
-        return max(CALL_TURNS_MIN, min(CALL_TURNS_MAX, fits))
+            for ent in coord_upcoming(1800.0):
+                if str(ent.get("road") or "") == "caller":
+                    owns = float(ent.get("owns_seconds") or 0)
+                    break
+        if owns <= 0:
+            got = random.randint(8, CALL_TURNS_MAX)
+            _CALL_TURNS_WRITTEN.append(got)
+            del _CALL_TURNS_WRITTEN[:-12]
+            return got
+        fits = int((owns - CALL_TOP_AND_TAIL) / max(1.0, call_turn_seconds()))
+        floor = (CALL_TURNS_MIN if owns >= CALL_SEGMENT_WHOLE
+                 else CALL_TURNS_SHORT)
+        got = max(floor, min(CALL_TURNS_MAX, fits))
+        _CALL_TURNS_WRITTEN.append(got)
+        del _CALL_TURNS_WRITTEN[:-12]
+        return got
     except Exception:  # noqa: BLE001
         return random.randint(8, CALL_TURNS_MAX)
 
@@ -55051,6 +55353,22 @@ async def dj_output_api(
     # operator pulled it down to a quarter and the Nabu kept playing at
     # full, because until now those sliders only scaled audio playing in
     # THIS app - see music_box_level().
+    # #1007: and whether we are allowed to send it at all.
+    if payload.get("music_control") is not None:
+        try:
+            _on = bool(payload.get("music_control"))
+            _s = load_settings()
+            _s.setdefault("dj", {})["box_volume_control"] = _on
+            save_settings(_s)
+            _MUSIC_LEVEL_SET.clear()      # a fresh decision, freshly sent
+            pipeline_log(
+                "voice",
+                "the station "
+                + ("may set the box's own volume again (#1007)" if _on else
+                   "will not touch the box's volume - the dial on the "
+                   "device owns it now (#1007)"))
+        except Exception:  # noqa: BLE001
+            pass
     if payload.get("music_level") is not None:
         try:
             _lvl = max(0.0, min(1.0, float(payload.get("music_level"))))
@@ -57333,6 +57651,8 @@ async def pinebox_status_api(
             "reply_to": _RADIO.get("reply_to") or "box",
             "box_talk": box_talk_ok(),
             "overridden": box_overridden(),
+            "music_level": round(music_box_level(), 3),        # #1007
+            "music_control": box_volume_control(),             # #1007
         },
         "delivery": {
             "held": len(_BOX_HOLD),
@@ -57836,6 +58156,16 @@ async def api_coord_brief(
     wrong, in the order that matters, and what is being done about each."""
     require_read_auth(authorization)
     return coord_brief()
+
+
+@app.get("/api/coordinator/capacity")
+async def api_coord_capacity(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1004: what the running order asks for, against what this box can
+    actually render in an hour - and which road is eating it."""
+    require_read_auth(authorization)
+    return coord_capacity()
 
 
 @app.get("/api/coordinator/road/{road}")

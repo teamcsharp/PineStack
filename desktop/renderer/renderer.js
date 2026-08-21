@@ -363,6 +363,13 @@ let boxLevelSent = null;
 function sendBoxMusicLevel(v) {
   const route = streamRoute("music");
   if (route !== "box" && route !== "both") return;
+  /* #1007: the level is still remembered - it is what gets sent if the
+   * operator ever hands the station that dial - but with the switch off
+   * we do not pretend the slider moved the box. */
+  if (!(lastRouting && lastRouting.music_control)) {
+    noteRouteOk("record level stored at " + Math.round(Number(v) * 100)
+      + "% \u2014 the dial on the device is still what the box plays at");
+  }
   if (boxLevelTimer) clearTimeout(boxLevelTimer);
   boxLevelTimer = setTimeout(() => {
     boxLevelTimer = null;
@@ -470,6 +477,46 @@ function initStreamRoutes() {
     select.dataset.wired = "1";
     select.onchange = (ev) => setStreamRoute(stream, ev.target.value);
   });
+}
+
+/* #1007: WHO OWNS THE BOX'S VOLUME KNOB.
+ *
+ * The station and the physical dial are two writers of one number, and
+ * the last writer wins. #971 wrote it before every record; #993 cut that
+ * to once per change - but "once per change" is still once per restart,
+ * because what we last sent lived in memory. A hand on the dial survived
+ * until the next time the service came up.
+ *
+ * There is no cadence that fixes that, so this decides the OWNER instead.
+ * Off - the default now - the station never calls volume_set and the
+ * device plays records at whatever its dial says. */
+function paintBoxVolumeOwner(routing) {
+  const box = document.getElementById("boxVolOwn");
+  if (!box) return;
+  if (!box.dataset.wired) {
+    box.dataset.wired = "1";
+    box.onchange = () => {
+      const on = !!box.checked;
+      api.post("/api/dj/output", {music_control: on})
+        .then(() => noteRouteOk(on
+          ? "the station may set the Pine Box's volume again"
+          : "the Pine Box's own dial owns its volume \u2014 the station "
+            + "will not move it"))
+        .catch((err) => { noteRouteError(err.message); box.checked = !on; });
+    };
+  }
+  if (document.activeElement === box) return;   // mid-click; leave it be
+  box.checked = !!(routing && routing.music_control);
+  const label = box.parentElement;
+  if (label) {
+    label.title = box.checked
+      ? "Records are set to the Music slider's level on the box, once per "
+        + "change. Turning the dial on the device itself will be undone the "
+        + "next time that level changes or the station restarts."
+      : "The station never sets the Pine Box's volume. Whatever you set on "
+        + "the device is what records play at. The Music slider still "
+        + "controls music playing in this app.";
+  }
 }
 
 /* #979: is the broadcast being sent HERE, to this application? */
@@ -917,6 +964,7 @@ async function refresh() {
        (another client, the box, a spoken command) has to reach the
        app's audio, not just a change made in this window. */
     lastRouting = status.routing || null;
+    paintBoxVolumeOwner(status.routing);                    // #1007
     paintStreamRoutes(status.routing);
     initStreamRoutes();
     initStreamVolumes();

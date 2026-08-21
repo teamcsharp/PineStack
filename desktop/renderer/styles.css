@@ -188,6 +188,18 @@ body.resizing-rail .rail-resizer::before {
   white-space: nowrap;
 }
 
+/* #1007 */
+.stream-owner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 6px 0 2px;
+  font-size: 11px;
+  opacity: .8;
+  cursor: pointer;
+}
+.stream-owner input { margin: 0; }
+
 .volume-row {
   display: flex;
   justify-content: space-between;

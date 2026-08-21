@@ -74,6 +74,13 @@
                  data-stream="reply" title="Volume for this stream">
         </label>
       </div>
+      <!-- #1007: "I do not want the device's volume affected when i set it
+           on the device." Off, the station never calls volume_set on the
+           box - the physical dial is the only owner of that number. -->
+      <label class="stream-owner" for="boxVolOwn">
+        <input id="boxVolOwn" type="checkbox">
+        <span>Let the station set the Pine Box's own volume</span>
+      </label>
       <label class="volume-row" for="appVolume">
         <span>App volume</span>
         <b id="appVolumeValue">35%</b>
