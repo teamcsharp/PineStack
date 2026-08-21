@@ -2849,9 +2849,13 @@ function initWorksPopup() {
             + ";padding-left:7px;margin:6px 0";
           const foldKey = "res:" + (r.id || i);
           let open = wkResOpen(foldKey);
-          const label = "#" + (i + 1) + " · " + r.state + " · "
+          /* #987: "list what these scripts are being written FOR."
+           * The reserve listed twelve rounds that all read the same. */
+          const label = "#" + (i + 1) + " · " + (r["for"] || "booth rounds")
+            + " · " + r.state + " · "
             + r.turns + " turns · " + r.made + "/" + r.chunks + " lines made"
-            + (r.seconds ? " · " + Math.round(r.seconds) + "s" : "");
+            + (r.seconds ? " · " + Math.round(r.seconds) + "s" : "")
+            + (r.edited ? " · edited by hand" : "");
           const nm = mk("div", "");
           nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff;"
             + "cursor:pointer;user-select:none";
@@ -2883,6 +2887,31 @@ function initWorksPopup() {
             l.appendChild(document.createTextNode(String(ln.text || "")));
             inner.appendChild(l);
           });
+          /* #987/#992: the paperwork, and the pencil. "inspect what the
+           * LLM was prompted with, what system prompt we use, what the
+           * result was" - and then "edit it... and forward it to the
+           * record room with my edits". */
+          const tools = mk("div", "");
+          tools.style.cssText = "display:flex;gap:5px;margin-top:5px";
+          const tbtn = (text, title) => {
+            const b = mk("button", "", text);
+            b.title = title;
+            b.style.cssText = "font-size:9px;padding:2px 7px;border-radius:5px;"
+              + "border:1px solid #24384a;background:#0b1520;color:#9fd8ff;"
+              + "cursor:pointer";
+            return b;
+          };
+          const paper = tbtn("\u2637 the paperwork",
+            "What was sent to the model, what was governing it, "
+            + "and what came back");
+          paper.onclick = (ev) => { ev.stopPropagation(); wkRoundPaper(r); };
+          tools.appendChild(paper);
+          const pencil = tbtn("\u270e edit + re-record",
+            "Rewrite this round in your own words and send it back "
+            + "to the recording room");
+          pencil.onclick = (ev) => { ev.stopPropagation(); wkRoundEdit(r); };
+          tools.appendChild(pencil);
+          inner.appendChild(tools);
           t.appendChild(inner);
           const flip = () => {
             open = !open;
@@ -5999,6 +6028,134 @@ function wkDeskShut() {
  * remembers which ones you SHUT. Same mechanism, opposite default,
  * because the desk holds a handful of calls and the reserve holds the
  * whole night's rounds. */
+/* #987: everything behind one banked round in one window - what it is
+ * for, the system prompt that was armed, the schedule's own instruction,
+ * the prompt as sent, and what came back. Empty sections are left out
+ * rather than shown as blanks. */
+function wkRoundPaper(r) {
+  const gone = document.getElementById("wkRoundPaper");
+  if (gone) gone.remove();
+  const d = document.createElement("div");
+  d.id = "wkRoundPaper";
+  d.style.cssText = "position:fixed;left:50%;top:50%;"
+    + "transform:translate(-50%,-50%);width:min(760px,94vw);max-height:86vh;"
+    + "overflow:auto;z-index:300;background:#070c12;border:1px solid #24384a;"
+    + "border-radius:10px;padding:12px 14px;box-shadow:0 20px 60px #000c";
+  const head = document.createElement("div");
+  head.style.cssText = "display:flex;gap:8px;align-items:baseline;margin-bottom:8px";
+  const h = document.createElement("b");
+  h.textContent = "how this round was written";
+  h.style.cssText = "flex:1;font-size:13px;color:#9fd8ff";
+  const x = document.createElement("button");
+  x.textContent = "\u2715";
+  x.style.cssText = "font-size:11px;padding:2px 8px;cursor:pointer";
+  x.onclick = () => d.remove();
+  head.appendChild(h); head.appendChild(x);
+  d.appendChild(head);
+  const desk = r.desk || {};
+  const chips = document.createElement("div");
+  chips.style.cssText = "display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px";
+  [["written for", r["for"] || "booth rounds"],
+   ["model", desk.model || "\u2014"],
+   ["took", desk.ms ? Math.round(desk.ms / 100) / 10 + "s" : "\u2014"],
+   ["temperature", desk.temp == null ? "\u2014" : String(desk.temp)],
+   ["context", desk.num_ctx ? String(desk.num_ctx) : "\u2014"]
+  ].forEach((kv) => {
+    const c = document.createElement("span");
+    c.style.cssText = "background:#0e1826;border:1px solid #24435f;"
+      + "border-radius:12px;padding:2px 9px;font-size:10px;color:#c8dcef";
+    c.textContent = kv[0] + ": " + kv[1];
+    chips.appendChild(c);
+  });
+  d.appendChild(chips);
+  const part = (title, body) => {
+    const text = String(body || "").trim();
+    if (!text) return;
+    const lab = document.createElement("div");
+    lab.textContent = title;
+    lab.style.cssText = "font-size:9px;letter-spacing:.06em;opacity:.75;"
+      + "margin:8px 0 3px;color:#7fb0c9";
+    d.appendChild(lab);
+    const pre = document.createElement("pre");
+    pre.textContent = text;
+    pre.style.cssText = "white-space:pre-wrap;word-break:break-word;"
+      + "font-size:10.5px;line-height:1.5;margin:0;padding:7px 9px;"
+      + "background:#05090f;border:1px solid #1b2c3c;border-radius:6px;"
+      + "max-height:34vh;overflow:auto;color:#c8d6e4";
+    d.appendChild(pre);
+  };
+  part("THE SYSTEM PROMPT THAT WAS ARMED", desk.armed);
+  part("WHAT THE SCHEDULE ASKED FOR", desk.sched);
+  part("THE PROMPT AS SENT", desk.prompt);
+  part("WHAT CAME BACK", desk.script || r.script);
+  if (!desk.prompt && !desk.armed) {
+    const none = document.createElement("div");
+    none.style.cssText = "font-size:10px;opacity:.6;margin-top:6px";
+    none.textContent = "This round was banked before its paperwork was kept "
+      + "with it, so only the script survives.";
+    d.appendChild(none);
+  }
+  document.body.appendChild(d);
+  try { pvFloatDesk(d); } catch (e) {}
+}
+
+/* #992: rewrite a banked round by hand and send it back to be cut. */
+function wkRoundEdit(r) {
+  const gone = document.getElementById("wkRoundEdit");
+  if (gone) gone.remove();
+  const d = document.createElement("div");
+  d.id = "wkRoundEdit";
+  d.style.cssText = "position:fixed;left:50%;top:50%;"
+    + "transform:translate(-50%,-50%);width:min(760px,94vw);z-index:300;"
+    + "background:#070c12;border:1px solid #24384a;border-radius:10px;"
+    + "padding:12px 14px;box-shadow:0 20px 60px #000c;display:flex;"
+    + "flex-direction:column;gap:8px";
+  const h = document.createElement("b");
+  h.textContent = "rewrite this " + (r["for"] || "round");
+  h.style.cssText = "font-size:13px;color:#9fd8ff";
+  d.appendChild(h);
+  const note = document.createElement("div");
+  note.style.cssText = "font-size:10px;opacity:.7;line-height:1.5";
+  note.textContent = "Saving gives up the audio already cut for this round "
+    + "and sends it back to the recording room to be made again in your "
+    + "words. The model is not asked to rewrite them.";
+  d.appendChild(note);
+  const ta = document.createElement("textarea");
+  ta.value = String(r.script || "");
+  ta.style.cssText = "width:100%;min-height:44vh;font-size:11px;"
+    + "line-height:1.55;background:#05090f;color:#dbe6f0;border:1px solid "
+    + "#1b2c3c;border-radius:6px;padding:8px 10px;resize:vertical";
+  d.appendChild(ta);
+  const row = document.createElement("div");
+  row.style.cssText = "display:flex;gap:6px;align-items:center";
+  const status = document.createElement("span");
+  status.style.cssText = "flex:1;font-size:10px;opacity:.75";
+  const save = document.createElement("button");
+  save.textContent = "\u21b3 send it back to be recorded";
+  save.style.cssText = "font-size:10px;padding:4px 10px;cursor:pointer";
+  save.onclick = async () => {
+    save.disabled = true;
+    status.textContent = "sending\u2026";
+    try {
+      await api.post("/api/dj/pending/" + encodeURIComponent(r.id) + "/script",
+                     {script: ta.value});
+      status.textContent = "sent \u2014 it will be cut again shortly";
+      setTimeout(() => d.remove(), 900);
+    } catch (err) {
+      status.textContent = err.message;
+      save.disabled = false;
+    }
+  };
+  const shut = document.createElement("button");
+  shut.textContent = "cancel";
+  shut.style.cssText = "font-size:10px;padding:4px 10px;cursor:pointer";
+  shut.onclick = () => d.remove();
+  row.appendChild(status); row.appendChild(shut); row.appendChild(save);
+  d.appendChild(row);
+  document.body.appendChild(d);
+  try { pvFloatDesk(d); } catch (e) {}
+}
+
 function wkResShown() {
   try {
     const raw = localStorage.getItem("wkResOpen");

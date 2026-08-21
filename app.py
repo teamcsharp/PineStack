@@ -44935,6 +44935,90 @@ def game_tip_angle() -> str:
         "mention files, JSON or a database.")
 
 
+def _desk_call_row(call: dict[str, Any], how: str) -> dict[str, Any]:
+    return {
+        "matched": how,
+        "at": float(call.get("at") or 0),
+        "model": str(call.get("model") or ""),
+        "ms": int(call.get("ms") or 0),
+        "temp": call.get("temp"),
+        "num_ctx": call.get("num_ctx"),
+        "kind": str(call.get("kind") or ""),
+        "armed": str(call.get("armed") or "")[:2000],
+        "sched": str(call.get("sched") or "")[:900],
+        "prompt": str(call.get("prompt") or "")[:6000],
+        "script": str(call.get("script") or "")[:6000],
+    }
+
+
+def _desk_paper(script: str, since: float = 0.0) -> dict[str, Any]:
+    """#987: the writing-desk call that produced this script.
+
+    Matched on the text where that works, and otherwise on RECENCY.
+
+    The text match alone was not enough and the first cut of this found
+    nothing at all: dj_banter rewrites the script after the model has
+    answered - #862's blend pass, and the speakbox passages stapled onto
+    the front and the back - so by the time the round is banked its
+    opening no longer matches what came back. Every round read "banked
+    before its paperwork was kept".
+
+    Recency is sound here because model calls are serialised by
+    _OLLAMA_GATE and the entry is built immediately after the one that
+    wrote it. `matched` says which road answered, so a reader can tell a
+    certain attribution from a probable one."""
+    try:
+        # The AUTHORING call: the first one made after the mark. Anything
+        # after it is a later pass over the same round.
+        if since > 0:
+            for call in _MODEL_CALLS:
+                if float(call.get("at") or 0) < since:
+                    continue
+                if str(call.get("prompt") or ""):
+                    return _desk_call_row(call, "authored")
+                break
+        head = " ".join(str(script or "")[:160].split())
+        for call in reversed(_MODEL_CALLS):
+            got = " ".join(str(call.get("script") or "")[:160].split())
+            if head and got and got == head:
+                return {
+                    "matched": "text",
+                    "at": float(call.get("at") or 0),
+                    "model": str(call.get("model") or ""),
+                    "ms": int(call.get("ms") or 0),
+                    "temp": call.get("temp"),
+                    "num_ctx": call.get("num_ctx"),
+                    "kind": str(call.get("kind") or ""),
+                    # what was GOVERNING it
+                    "armed": str(call.get("armed") or "")[:2000],
+                    "sched": str(call.get("sched") or "")[:900],
+                    # what was SENT, and what came back
+                    "prompt": str(call.get("prompt") or "")[:6000],
+                    "script": str(call.get("script") or "")[:6000],
+                }
+        # No text match: the round was reworked after the model answered.
+        # The most recent call is the one that wrote it.
+        for call in reversed(_MODEL_CALLS):
+            if not str(call.get("prompt") or ""):
+                continue
+            return {
+                "matched": "recent",
+                "at": float(call.get("at") or 0),
+                "model": str(call.get("model") or ""),
+                "ms": int(call.get("ms") or 0),
+                "temp": call.get("temp"),
+                "num_ctx": call.get("num_ctx"),
+                "kind": str(call.get("kind") or ""),
+                "armed": str(call.get("armed") or "")[:2000],
+                "sched": str(call.get("sched") or "")[:900],
+                "prompt": str(call.get("prompt") or "")[:6000],
+                "script": str(call.get("script") or "")[:6000],
+            }
+    except Exception:  # noqa: BLE001
+        pass
+    return {}
+
+
 async def dj_banter(track: dict[str, Any] | None = None,
                     angle: str = "", lines: int = 0,
                     also_name: str = "", force_seed: bool = False,
@@ -45013,6 +45097,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # for the LLM to get more lines or script the dialogue richer before
     # we edit it". A LIVE round asks for exactly what it always asked for;
     # only the banked ones stretch.
+    # #987: -1 until the authoring call is made, so a round that reaches
+    # the entry by some other road stamps no paperwork rather than raising
+    # on an unbound name.
+    _desk_at = 0.0
     _bank_rich = bool(bank)
     # #904: the count a round is JUDGED by stays the live one. The
     # extra four lines are a licence to write richer, not a harder
@@ -45560,6 +45648,18 @@ async def dj_banter(track: dict[str, Any] | None = None,
         participants = (f"the two hosts and {caller_name} on the phone"
                         if caller_name else
                         ("the three" if third else "the two"))
+        # #987: mark the desk before the AUTHORING call, so the round's
+        # paperwork is that call and not whatever ran after it. dj_banter
+        # makes several model visits - #862's blend pass in particular -
+        # and the blend is the LAST thing to rewrite the script, so both
+        # "the most recent call" and "the call whose output matches this
+        # script" find the blend rather than the writing.
+        #
+        # Marked by TIME, not by position: _MODEL_CALLS is trimmed to the
+        # last forty on every append, so an index captured beforehand
+        # stops pointing at the same row the moment the ring is full -
+        # which is why the index version silently never matched.
+        _desk_at = time.time()
         script = await ask_model(
             f"{radio_persona('host', dj['persona'])}"
             f"{radio_prompt_instruction('host')}"
@@ -46046,6 +46146,16 @@ async def dj_banter(track: dict[str, Any] | None = None,
 
         "feel": feel,                                          # #750
         "profile": _larder_profile_signature(),
+        # #987/#992: WHERE THIS SCRIPT CAME FROM, carried with it.
+        #
+        # The writing desk already records the whole exchange - the prompt
+        # as sent, the system prompt governing it, the schedule's own
+        # instruction, the model and what it cost - but it keeps the last
+        # FORTY calls in memory, so by the time a banked round reaches the
+        # air its own paperwork has long since scrolled off and does not
+        # survive a restart at all. A round that cannot say where it came
+        # from cannot be judged, and cannot be sent back.
+        "desk": _desk_paper(script, _desk_at),
     }
     if bank:
         # #842: a round written for a PARTICULAR segment — a memo from
@@ -53165,6 +53275,58 @@ async def _crystal_extract_launch(payload: dict[str, Any]) -> dict[str, Any]:
             "albums": len(groups), "tracks": len(tracks)}
 
 
+@app.post("/api/dj/pending/{row_id}/script")
+async def dj_pending_rewrite(
+    row_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#992: "maybe even edit it and reschedule it and send it back to the
+    writing desk or forward it to the record room with my edits."
+
+    This is the forward-to-the-record-room half, which is the one that
+    needs care. The words become the operator's: the round keeps its
+    place in the reserve and its segment, its finished audio is given up
+    because it no longer says what the round says, and it goes back to
+    the recording room to be cut again.
+
+    frozen and freshened are deliberately LEFT ON. They mean "the model
+    has been paid for and the text will not move under the audio" - and
+    an operator's own words are the strongest possible version of that.
+    Clearing them would invite freshen_script to rewrite what was just
+    typed, which is the opposite of the request."""
+    require_auth(authorization)
+    payload = await request.json()
+    text = str(payload.get("script") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Write something")
+    for entry in list(_LARDER):
+        try:
+            rid = hashlib.sha1(
+                str(entry.get("script") or "").encode("utf-8", "ignore")
+            ).hexdigest()[:10]
+        except Exception:  # noqa: BLE001
+            continue
+        if rid != str(row_id):
+            continue
+        entry["script"] = text
+        entry["edited"] = True
+        entry["frozen"] = True          # the operator's words are final
+        entry["freshened"] = True       # and the model is not asked again
+        # The audio no longer says what the round says.
+        for gone in ("takes", "keys", "made", "seconds", "prepared",
+                     "partial", "chunks", "prep_turns", "yielded",
+                     "yielded_at"):
+            entry.pop(gone, None)
+        entry["profile"] = _larder_profile_signature()
+        _larder_save()
+        pipeline_log("model", "a round was rewritten by hand - its audio is "
+                     "given up and it goes back to the recording room to be "
+                     "cut again in the operator's words (#992)")
+        return {"rewritten": rid, "chars": len(text)}
+    raise HTTPException(status_code=404, detail="No such round in the reserve")
+
+
 @app.get("/api/speakbox/minds/{rid}/chunks")
 async def speakbox_mind_chunks(
     rid: str,
@@ -57828,6 +57990,17 @@ async def dj_pending(
             "frozen": bool(entry.get("frozen")),
             "turns": len(turns),
             "lines": said,
+            # #987: WHAT THIS ONE IS FOR, in the operator's own words for
+            # it - the reserve listed twelve rounds that all read the same.
+            "kind": str(entry.get("prep_kind") or "banter"),
+            "for": SHELF_LABEL.get(str(entry.get("prep_kind") or ""),
+                                   "booth rounds"),
+            "script": str(entry.get("script") or "")[:12000],
+            # #987/#992: the paperwork - the prompt as sent, the system
+            # prompt governing it, the schedule's instruction, the model
+            # and what it cost.
+            "desk": entry.get("desk") or {},
+            "edited": bool(entry.get("edited")),
         })
     window = pantry_window()
     return {
