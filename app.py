@@ -13959,6 +13959,13 @@ def radio_state() -> dict[str, Any]:
         "station": _RADIO["station"],
         "playing": bool(now),
         "dj": _RADIO["dj"],
+        # #1008: the overlap setting, published on the state every page
+        # already polls. It used to reach the page ONLY through the DJ
+        # settings panel's paint function, so a page that had never opened
+        # that panel overlapped the pair by a third of a second whatever
+        # the saved value said - which is the whole of "the DJs are
+        # currently overlapping each other".
+        "overlap": int(dj_settings().get("overlap", 35) or 0),
         "now": now,
         "elapsed": round(elapsed, 1),
         # The two stamps every device retimes against (#631). `elapsed` is
@@ -16764,6 +16771,88 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
 _OUTPUT_BEFORE: dict[str, str] = {}
 
 _LISTENERS: dict[str, float] = {}
+# #1008: WHO IS PLAYING, AND WHICH ONE OF THEM OWNS THE AIR.
+#
+# "the DJs are currently overlapping each other. Make sure that there is
+# a scheduler making sure that they are not overlapping each other."
+#
+# The station has a scheduler for everything that decides WHAT to say and
+# WHEN - the running order, the independent clocks, the round supervisor -
+# and every one of them was working. What it had no scheduler for is how
+# many things are PLAYING the result. Measured at the moment of the
+# complaint: `listeners: 2`, with music, DJs and replies all routed to
+# "here". Two players on one broadcast, a few hundred milliseconds apart,
+# is exactly what two DJs talking over each other sounds like - and it is
+# not a fault in the show, it is two copies of a show that is fine.
+#
+# There is no way to fix that from the writing end, because nothing is
+# wrong at the writing end. So the air gets an OWNER: one listener may
+# play, and every other page mutes itself until it is released. The owner
+# is remembered by listener id, ages out with the listener, and defaults
+# to nobody - so a station with one player behaves exactly as it always
+# has.
+_LISTENER_SEEN: dict[str, dict[str, Any]] = {}
+_AUDIO_OWNER: dict[str, Any] = {}
+AUDIO_OWNER_LIFE = 90.0                 # an owner that stops polling frees it
+
+
+def audio_owner() -> str:
+    """The listener that owns the air, or "" when everybody may play."""
+    try:
+        who = str(_AUDIO_OWNER.get("who") or "")
+        if not who:
+            return ""
+        # An owner who has gone away must never gag the rest of the house.
+        seen = float((_LISTENER_SEEN.get(who) or {}).get("at") or 0)
+        if time.time() - seen > AUDIO_OWNER_LIFE:
+            _AUDIO_OWNER.clear()
+            pipeline_log("air", f"the listener holding the air ({who}) "
+                         "stopped polling - every player is unmuted again "
+                         "(#1008)")
+            return ""
+        return who
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def listener_note(who: str, addr: str = "", agent: str = "") -> None:
+    """Remember enough about a player to tell two of them apart."""
+    try:
+        if not who:
+            return
+        row = _LISTENER_SEEN.setdefault(who, {"first": time.time()})
+        row["at"] = time.time()
+        if addr:
+            row["addr"] = str(addr)[:60]
+        if agent:
+            row["agent"] = str(agent)[:120]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def listener_roster() -> list[dict[str, Any]]:
+    """#1008: every player on this broadcast, so two of them is a fact
+    rather than a mystery. The agent string is trimmed to the part that
+    tells an Electron shell from a browser tab."""
+    out: list[dict[str, Any]] = []
+    try:
+        now = time.time()
+        for who, when in sorted(_LISTENERS.items(), key=lambda kv: kv[1]):
+            row = _LISTENER_SEEN.get(who) or {}
+            agent = str(row.get("agent") or "")
+            short = ("the desktop app" if "Electron" in agent
+                     else "a browser tab" if agent else "unknown")
+            out.append({
+                "listener": who,
+                "seen": round(now - float(when or now), 1),
+                "since": round(now - float(row.get("first") or now), 1),
+                "addr": str(row.get("addr") or ""),
+                "what": short,
+                "owns_air": who == audio_owner(),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _radio_listeners(seen: str = "") -> int:
@@ -56002,6 +56091,7 @@ async def radio_next_api(
 
 @app.get("/api/radio/clock")
 async def radio_clock_api(
+    request: Request,
     listener: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
@@ -56014,6 +56104,17 @@ async def radio_clock_api(
     """
     require_read_auth(authorization)
     listeners = _radio_listeners(listener[:64] if listener else "")
+    # #1008: remember enough about each player to tell two of them apart,
+    # and hand back who owns the air so the ones that do not can mute
+    # themselves. This is polled every second and a half, so it must stay
+    # this cheap.
+    if listener:
+        try:
+            listener_note(listener[:64],
+                          str(getattr(request.client, "host", "") or ""),
+                          str(request.headers.get("user-agent") or ""))
+        except Exception:  # noqa: BLE001
+            pass
     track = _RADIO.get("now") or {}
     tid = str(track.get("id") or "")
     root = "/tape" if track.get("tape") else "/music"
@@ -56029,7 +56130,68 @@ async def radio_clock_api(
         "art": f"/music/{tid}/art?t={media_sign(tid)}"
                if tid and not track.get("tape") else "",
         "listeners": listeners,
+        # #1008: "" means everybody plays, which is the default and the
+        # old behaviour exactly. A listener id means only that one plays
+        # and every other page mutes itself.
+        "audio_owner": audio_owner(),
     }
+
+
+@app.get("/api/radio/listeners")
+async def radio_listeners_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1008: every player on this broadcast right now.
+
+    Two players on one broadcast, a few hundred milliseconds apart, is
+    what "the DJs are overlapping each other" sounds like when nothing is
+    wrong with the show at all. This is how you find out that is what is
+    happening."""
+    require_read_auth(authorization)
+    rows = listener_roster()
+    owner = audio_owner()
+    return {
+        "listeners": rows,
+        "audio_owner": owner,
+        "say": ("nobody is listening" if not rows else
+                (f"{len(rows)} players are on this broadcast"
+                 + (f" and {owner} owns the air - the rest are muted"
+                    if owner else
+                    " - if that is one machine, they will be playing over "
+                    "each other. Give one of them the air.")
+                 ) if len(rows) > 1 else "one player, no overlap possible"),
+    }
+
+
+@app.post("/api/radio/solo")
+async def radio_solo_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1008: give ONE player the air; every other page mutes itself.
+
+    {"listener": "<id>"} to hand it over, {"clear": true} to let everybody
+    play again. An owner that stops polling releases it on its own after
+    AUDIO_OWNER_LIFE, so this can never leave the house silent."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    if body.get("clear"):
+        _AUDIO_OWNER.clear()
+        pipeline_log("air", "every player may sound again (#1008)")
+        return {"audio_owner": "", "listeners": listener_roster()}
+    who = str(body.get("listener") or "")[:64]
+    if not who:
+        raise HTTPException(status_code=400,
+                            detail="name a listener, or pass clear")
+    _AUDIO_OWNER.clear()
+    _AUDIO_OWNER.update({"who": who, "at": time.time()})
+    pipeline_log("air", f"{who} has the air - every other player mutes "
+                 "itself, so one broadcast is heard once (#1008)")
+    return {"audio_owner": who, "listeners": listener_roster()}
 
 
 @app.get("/api/music/votes")
@@ -63385,6 +63547,92 @@ async def speakbox_mind_forget(
     return {"forgot": want}
 
 
+def speakbox_evicted_list() -> list[dict[str, Any]]:
+    """#1009: what housekeeping has taken OUT of the studio shelf.
+
+    "what happened to the documents i had seeded in ...\\data\\speakbox -
+    That was full of documents and now it is blank"
+
+    Two separate things, and only one of them is real.
+
+    THE FOLDER IS NOT BLANK. data/speakbox is its own mount inside the
+    container - which is why moving a file out of it raised EXDEV,
+    "invalid cross-device link", when this was first written. Over the
+    SMB share Windows sees the MOUNTPOINT, which is empty, rather than
+    the volume mounted on it. The station reads 265 documents out of that
+    folder this second. Nothing was lost.
+
+    WHAT DID MOVE, and it was small and on purpose: speakbox_evict_lyrics
+    (#995) takes documents whose name ends in " - lyrics" out of the
+    studio shelf, because extraction lyrics belong to their own crystal
+    and the pair had been putting "furielwrath62tidalwaveofrage - lyrics"
+    on air as studio material. They were MOVED, never deleted.
+
+    This says exactly which ones, and there is a door beside it to put
+    them back - because "what happened to my documents" deserves an
+    answer with an undo on it rather than an explanation."""
+    rows: list[dict[str, Any]] = []
+    try:
+        if not SPEAKBOX_EVICTED.exists():
+            return rows
+        for path in sorted(SPEAKBOX_EVICTED.glob("*.md")):
+            try:
+                rows.append({"name": path.name,
+                             "bytes": path.stat().st_size,
+                             "at": round(path.stat().st_mtime, 1)})
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
+@app.post("/api/speakbox/evicted/restore")
+async def speakbox_evicted_restore(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1009: put an evicted document back on the studio shelf.
+
+    {"name": "..."} for one, or {"all": true} for every one of them.
+    They go back exactly where they were and the next reindex pass picks
+    them up on its own."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    want = str(body.get("name") or "").strip()
+    every = bool(body.get("all"))
+    if not want and not every:
+        raise HTTPException(status_code=400,
+                            detail="name a document, or pass all")
+    moved: list[str] = []
+    for row in speakbox_evicted_list():
+        if not every and row["name"] != want:
+            continue
+        src = SPEAKBOX_EVICTED / row["name"]
+        dest = SPEAKBOX_DIR / row["name"]
+        try:
+            if dest.exists():
+                continue                # already back; never overwrite
+            src.replace(dest)
+            moved.append(row["name"])
+        except OSError:
+            try:
+                import shutil as _sh
+                _sh.move(str(src), str(dest))
+                moved.append(row["name"])
+            except Exception:  # noqa: BLE001
+                continue
+    if moved:
+        pipeline_log("speakbox", f"{len(moved)} document(s) put back on the "
+                     "studio shelf by hand - " + ", ".join(moved[:4])
+                     + " (#1009)")
+    return {"restored": moved, "left": speakbox_evicted_list()}
+
+
 @app.get("/api/speakbox")
 async def speakbox_list_api(
     mind: str = "",
@@ -63392,6 +63640,10 @@ async def speakbox_list_api(
 ) -> dict[str, Any]:
     """What is in the speakbox, and how hard each one is leaned on."""
     require_read_auth(authorization)
+    # #1009: and what has been taken OUT of it, with the folder the
+    # station is actually reading, so "the folder looks blank" can be
+    # answered without anybody having to guess.
+    _gone = speakbox_evicted_list()
     # Everything in the folder, weight and all. Listing only the ones in play
     # is what made a document you had switched off impossible to find again,
     # let alone switch back on (#221).
@@ -63414,6 +63666,13 @@ async def speakbox_list_api(
     except Exception:
         pass
     return {
+        # #1009: what has been taken out, and where the station is really
+        # reading from. Over the SMB share this folder is a MOUNTPOINT and
+        # Windows shows it empty; the station reads the volume mounted on
+        # it. Saying the count and the path here is what turns "it is
+        # blank" into an answer.
+        "evicted": _gone,
+        "evicted_folder": str(SPEAKBOX_EVICTED),
         "files": [{"name": p.name, "bytes": p.stat().st_size,
                    "weight": speakbox_weight(p.name, weights, key),
                    "uses": uses.get(p.name, 0),
@@ -89238,6 +89497,14 @@ async function rhetWordDetail(word) {
 
 function djRender(state) {
   djLastState = state;
+  /* #1008: the overlap setting reaches the page on every poll now, not
+   * only when the settings panel happens to be painted. */
+  try {
+    const _lap = Number(state.overlap);
+    if (Number.isFinite(_lap)) {
+      djOverlapLead = Math.max(0, Math.min(0.9, _lap / 100 * 0.9));
+    }
+  } catch (e) { /* the show goes on */ }
   onAirPaint(state);                  // #689 the header ON AIR light
   djRhetoricRender(state);            // #561 on-air rhetoric cloud
   // #786: pine-hardware controls have no business on a Nabu console —
@@ -89435,8 +89702,41 @@ async function radioClockPoll() {
     const clock = await api("/api/radio/clock?listener="
       + encodeURIComponent(pineListenerId()));
     djStateAt = Date.now();
+    pineSoloGate(clock);                                    // #1008
     djResync(clock);
   } catch (error) { /* the panel works without it */ }
+}
+
+
+/* #1008: ONE BROADCAST, HEARD ONCE.
+ *
+ * "the DJs are currently overlapping each other. Make sure that there is
+ * a scheduler making sure that they are not overlapping each other."
+ *
+ * Measured at the moment of the complaint: two listeners on this
+ * broadcast with music, DJs and replies all routed here. Two players a
+ * few hundred milliseconds apart is exactly what two DJs talking over
+ * each other sounds like - and nothing is wrong with the show at all.
+ *
+ * The server hands one listener the air. Every other page gags itself
+ * until it is released, and an owner that stops polling releases it on
+ * its own, so this can never leave the house silent. With no owner set,
+ * which is the default, nothing here does anything. */
+function pineSoloGate(clock) {
+  try {
+    const owner = String((clock && clock.audio_owner) || "");
+    const me = (typeof pineListenerId === "function") ? pineListenerId()
+             : (typeof ME === "string" ? ME : "");
+    const gagged = !!owner && !!me && owner !== me;
+    window.__pineGagged = gagged;
+    document.querySelectorAll("audio,video").forEach((el) => {
+      /* Only ever ADD the gag; releasing it restores whatever the page
+       * had, rather than unmuting something the operator muted. */
+      if (gagged) { el.muted = true; }
+      else if (el.dataset.pineGag === "1") { el.muted = false; }
+      el.dataset.pineGag = gagged ? "1" : "";
+    });
+  } catch (e) { /* the show goes on */ }
 }
 
 function pineListenerId() {
@@ -89901,7 +90201,28 @@ function djVoicePlay(clip) {
 // #185: two elements, alternating, because one cannot play two clips at
 // once. At overlap 0 the next line waits for "ended"; higher up it comes in
 // over the tail of the one before, which is what presenters actually do.
-let djOverlapLead = 0.35;                // seconds the next line comes in early
+/* #1008: THE DJs WERE OVERLAPPING BECAUSE THIS SAID SO.
+ *
+ * "the DJs are currently overlapping each other. Make sure that there is
+ * a scheduler making sure that they are not overlapping each other."
+ *
+ * There IS a scheduler and it was right. This is a deliberate feature -
+ * #185 starts the next line a fraction before the current one ends so
+ * two presenters tread on each other the way real ones do, which is what
+ * the two alternating voice elements exist for.
+ *
+ * The operator had already turned it off: dj.overlap reads 0 in the
+ * saved settings. But this module default was 0.35 and the saved value
+ * was applied ONLY inside the DJ settings panel's paint function - so
+ * until somebody opened that panel in this session, every page overlapped
+ * the pair by a third of a second no matter what the setting said. A page
+ * that has never shown the settings is the normal case.
+ *
+ * Two changes: the default is CLEAN TURNS, so an unread setting errs
+ * towards not doing it; and djRender applies dj.overlap on every state
+ * poll, so the saved value reaches the page whether or not anybody opens
+ * the panel. */
+let djOverlapLead = 0;                   // seconds the next line comes in early
 const djVoiceEls = [];
 let djVoiceSlot = 0;
 let djVoiceLive = 0;                     // clips actually sounding right now
@@ -109804,6 +110125,38 @@ function initRate() {
   setRate();
 }
 
+
+/* #1008: ONE BROADCAST, HEARD ONCE.
+ *
+ * "the DJs are currently overlapping each other. Make sure that there is
+ * a scheduler making sure that they are not overlapping each other."
+ *
+ * Measured at the moment of the complaint: two listeners on this
+ * broadcast with music, DJs and replies all routed here. Two players a
+ * few hundred milliseconds apart is exactly what two DJs talking over
+ * each other sounds like - and nothing is wrong with the show at all.
+ *
+ * The server hands one listener the air. Every other page gags itself
+ * until it is released, and an owner that stops polling releases it on
+ * its own, so this can never leave the house silent. With no owner set,
+ * which is the default, nothing here does anything. */
+function pineSoloGate(clock) {
+  try {
+    const owner = String((clock && clock.audio_owner) || "");
+    const me = (typeof pineListenerId === "function") ? pineListenerId()
+             : (typeof ME === "string" ? ME : "");
+    const gagged = !!owner && !!me && owner !== me;
+    window.__pineGagged = gagged;
+    document.querySelectorAll("audio,video").forEach((el) => {
+      /* Only ever ADD the gag; releasing it restores whatever the page
+       * had, rather than unmuting something the operator muted. */
+      if (gagged) { el.muted = true; }
+      else if (el.dataset.pineGag === "1") { el.muted = false; }
+      el.dataset.pineGag = gagged ? "1" : "";
+    });
+  } catch (e) { /* the show goes on */ }
+}
+
 function initLevels() {
   const m = document.getElementById("lvMusic");
   const v = document.getElementById("lvVoice");
@@ -109967,6 +110320,7 @@ async function clockPoll() {
   try {
     const c = await api("/api/radio/clock?listener=" + ME);
     stateAt = Date.now();
+    pineSoloGate(c);                                        // #1008
     if (c.playing && c.url) {
       retime({id: c.id, url: c.url}, c.server_ms, c.started_ms, c.seconds);
     }
