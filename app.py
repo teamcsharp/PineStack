@@ -4006,6 +4006,28 @@ async def reconcile_generations() -> dict[str, int]:
 
 
 @app.on_event("startup")
+async def _startup_tidy() -> None:
+    """#995/#998: the one-time housekeeping, on every boot rather than on
+    every radio start.
+
+    Both of these were hung off dj_start(), which only runs when the SHOW
+    is started - so on a restart with the radio already on they simply did
+    not happen, and #995's eviction reported nothing twice over. They are
+    idempotent and cost a directory listing, so the honest place for them
+    is the process coming up."""
+    for job in (crystals_tidy, speakbox_evict_lyrics):
+        try:
+            got = await asyncio.to_thread(job)
+            if got:
+                pipeline_log("speakbox", f"housekeeping: {job.__name__} "
+                             f"moved {got} (#995/#998)")
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"housekeeping {job.__name__} failed: "
+                                 f"{type(exc).__name__}: {exc}"[:180])
+            continue
+
+
+@app.on_event("startup")
 async def _startup_music() -> None:
     """Load the persisted index and kick a refresh in the background."""
     try:
@@ -22635,7 +22657,6 @@ def dj_start(station: str) -> dict[str, Any]:
     })
     _routing_save()
     _larder_load()                     # yesterday's shelf still feeds today
-    crystals_tidy()                    # #998: one folder per topic
     _pantry_load()                     # #915: and the AUDIO it already made
     _box_hold_load()                   # held dialogue outlives the deploy
     task = asyncio.create_task(dj_show())
@@ -33779,6 +33800,69 @@ def speakbox_vector_stats(rid: str = "") -> dict[str, Any]:
                          for f, n in per_file.items()),
                         key=lambda r: -r["chunks"]),
     }
+
+
+# #995: lyrics that landed in the STUDIO before #829 stopped them.
+#
+# INSIDE the studio folder, deliberately. data/speakbox is its own mount
+# on this box - moving a file out of it raises "Invalid cross-device
+# link" (Errno 18), measured - and a subfolder is on the same device by
+# construction. It is invisible to the draw anyway: speakbox_all globs
+# "*.md" one level deep, so nothing here is ever read, indexed or spoken.
+SPEAKBOX_EVICTED = SPEAKBOX_DIR / "_evicted"
+
+
+def speakbox_evict_lyrics() -> int:
+    """#995: "Allen interface lyrics are not part of speakerbox. They are
+    part of a separate data crystal similar to Doom."
+
+    They are, now - #829 saw this and stopped extraction writing into the
+    shared shelf, with the note "330 song files landed in the OPERATOR'S
+    OWN speakbox". What it did not do is take out the ones already there.
+    Three survived: the pair were drawing from them and putting
+    "furielwrath62tidalwaveofrage - lyrics" on air as studio material.
+
+    They are MOVED, not deleted - out of the studio into
+    data/speakbox_evicted, where nothing draws from them and the operator
+    can still get them back. The album minds keep their own copies
+    untouched; those are the crystal's, and that is where they belong.
+
+    speakbox_reindex already forgets a document that has left the folder,
+    so the vectors go with them on the next pass without anything else
+    being asked to happen."""
+    moved = 0
+    try:
+        for path in sorted(SPEAKBOX_DIR.glob("*.md")):
+            if not path.is_file():
+                continue
+            if not path.stem.lower().endswith(" - lyrics"):
+                continue
+            try:
+                SPEAKBOX_EVICTED.mkdir(parents=True, exist_ok=True)
+                dest = SPEAKBOX_EVICTED / path.name
+                if dest.exists():
+                    path.unlink(missing_ok=True)   # already rescued
+                else:
+                    try:
+                        path.replace(dest)
+                    except OSError:
+                        # Belt as well as braces: shutil copies across a
+                        # device boundary where rename cannot.
+                        import shutil as _sh
+                        _sh.move(str(path), str(dest))
+                moved += 1
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", f"could not evict {path.name}: "
+                                     f"{type(exc).__name__}: {exc}"[:160])
+                continue
+        if moved:
+            pipeline_log("speakbox", f"{moved} lyrics document(s) taken out "
+                         "of the studio shelf - extraction lyrics belong to "
+                         "their own crystal, not to the speakbox. They are "
+                         "in data/speakbox_evicted (#995)")
+    except Exception:  # noqa: BLE001
+        pass
+    return moved
 
 
 async def speakbox_reindex(force: bool = False,
