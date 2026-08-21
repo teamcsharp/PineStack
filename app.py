@@ -5282,25 +5282,64 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
                 forced_pieces.append(piece)
         pieces = [p for p in forced_pieces if p]
         if len(pieces) > 1:
+            # #993: JOIN THE FILES, NOT THE URLs.
+            #
+            # _store_media returns {"path": "/media/<key>"}, which is a
+            # SERVED path. Both rungs below took it for a filename: the
+            # concat handed "/media/x.wav" to ffmpeg, which cannot open
+            # it, and the fallback did Path("/media/x.wav").read_bytes(),
+            # which raises FileNotFoundError - an OSError - and returned
+            # None. So every line over VOICE_MAX_CHARS rendered all of
+            # its pieces, paid the engine in full for them, and then threw
+            # the audio away and reported failure.
+            #
+            # It was invisible because the log line below fired on `made`
+            # being non-empty, i.e. BEFORE either rung ran - the glass
+            # said "spoken in 2 and joined" on exactly the renders that
+            # were being lost. Measured: advert reads sat at 0 of 9 lines
+            # rendered for the whole session while station IDs, same loop,
+            # same engine, same voice, went 4 of 4 - the only difference
+            # between them is that an ad is ~1000 characters and an ID is
+            # ~60. Every road that writes long lost every long line.
             made: list[str] = []
+            secs = 0.0
             for piece in pieces:
                 part = await voice_render_any(piece, voice, engine,
                                               fx=fx, who=who)
                 if part and part.get("path"):
                     made.append(part["path"])
-            if made:
-                pipeline_log("voice", f"a {len(text)}-character line was too "
-                                      "long to render in one piece - spoken "
-                                      f"in {len(made)} and joined (#784)")
-                if len(made) > 1:
+                    secs += float(part.get("seconds") or 0)
+            files = [str(f) for f in (_media_file(m) for m in made) if f]
+            if files:
+                out: dict[str, Any] | None = None
+                if len(files) > 1:
                     joined = await asyncio.to_thread(
-                        _call_concat_blocking, made, False)
+                        _call_concat_blocking, files, False)
                     if joined:
-                        return _store_media(joined, "wav")
-                try:                # the join failed; the opening still airs
-                    return _store_media(Path(made[0]).read_bytes(), "wav")
-                except OSError:
-                    return None
+                        out = _store_media(joined, "wav")
+                if out is None:     # the join failed; keep what we can
+                    try:
+                        out = _store_media(
+                            Path(files[0]).read_bytes(), "wav")
+                    except OSError:
+                        out = None
+                if out is not None:
+                    # #993: and CARRY THE DURATION. _store_media reports
+                    # bytes, not seconds, so the joined clip came back
+                    # saying it was zero seconds long and every shelf that
+                    # banked one reported nothing on it.
+                    out.setdefault("seconds", round(secs, 2))
+                    pipeline_log("voice",
+                                 f"a {len(text)}-character line was too "
+                                 f"long to render in one piece - spoken in "
+                                 f"{len(files)} and joined, "
+                                 f"{out.get('seconds')}s (#784/#993)")
+                    return out
+            pipeline_log("drop", f"a {len(text)}-character line was cut into "
+                                 f"{len(pieces)} and {len(made)} came back, "
+                                 "but none of the audio could be found to "
+                                 "join (#993)")
+            return None
     # #794: "any voice listed is usable." An engine-prefixed pick
     # (voxcpm:vl_x, cosyvoice:vl_x…) is still a library CLONE — the raw
     # string just doesn't look like one, so the clone road never built its
@@ -9012,15 +9051,37 @@ def live_rendering() -> int:
 
 def engine_live_enter() -> None:
     """A live render begins. Never blocks — the air does not queue."""
-    # #872: THE FORCED INTERJECTION. Every live render in the station
-    # comes through here, so this is the one place that catches all of
-    # them: the moment the air wants the engine, preparation stands down
-    # at its very next line and keeps whatever it had finished. It is a
-    # flag, not a lock - nothing here can ever make a live line wait.
-    try:
-        prep_yield("a live line went to the engine")
-    except Exception:  # noqa: BLE001
-        pass
+    # #872 put a forced interjection here: the moment the air wants the
+    # engine, preparation stands down at its next line. The intent is
+    # right and the placement made it permanent.
+    #
+    # #989: THIS WAS THE DOMINANT BRAKE ON THE WHOLE STATION.
+    #
+    # speak_turns fires one _premake task PER LINE of the airing round,
+    # so an eighteen-line round calls this eighteen times, staggered
+    # across its own duration. Each call armed an 8-second hold
+    # (PREP_YIELD_HOLD). Measured inter-arrival of live renders: mean
+    # 5.5s, median 4.6s. 5.5 < 8.0, so the hold was refreshed before it
+    # could ever expire — `yielding` was true in 12 of 13 samples, with
+    # 264 yields on the counter.
+    #
+    # prep_should_stop() is asked between EVERY line of larder_prepare
+    # and answers `break`. A one-line road needs one clear check and got
+    # it: station IDs sat at 10 of 11 made. A round needs a clear check
+    # for every line, at roughly 8% availability — which is why gallery
+    # sat at 0 of 48 and nothing ever reached "ready". It was never
+    # relief and never the engine; it was this.
+    #
+    # Nothing is lost by removing it, because engine concurrency is
+    # already governed twice over and correctly: prep_should_stop()'s own
+    # `engine_inflight() > ENGINE_BUDGET - 1` test, and engine_prep_take()
+    # which never hands preparation the last slot. Those two say "the
+    # engine is busy right now". This said "an engine was busy in the
+    # last eight seconds", refreshed itself, and never stopped saying it.
+    #
+    # prep_yield() is kept for what its docstring actually describes — a
+    # forced interjection, the speakbox or the operator shouting — where
+    # a hold is armed once and genuinely expires.
     try:
         _ENGINE_LIVE[0] = max(0, int(_ENGINE_LIVE[0])) + 1
     except Exception:  # noqa: BLE001
@@ -10365,13 +10426,28 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     continue
             elif shelf_full(kind):
                 continue
-            elif shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST:
-                # #986: this road is not short of WORDS, it is short of a
-                # VOICE. Writing another would spend a model visit on
-                # something that cannot air, and take the window from a
-                # road that could have finished. See SHELF_UNVOICED_MOST.
-                continue
+            # #989 (B5): #986 was RIGHT that this road should not be
+            # WRITTEN to, and wrong to drop it from the board. `rows`
+            # becomes both out["candidates"] AND the map
+            # prep_deadline_pick chooses from, so `continue` here meant a
+            # road holding unvoiced reads could never be selected to be
+            # GIVEN A VOICE either - the very thing it is waiting for.
+            # Measured after #986 shipped: ad absent from candidates
+            # entirely, holding 7 written and 0 rendered, while the road
+            # report cheerfully said "they are given a voice the moment
+            # one is free".
+            #
+            # It stays on the board, flagged, and priced at what it
+            # actually needs: voicing only, at the measured cost of a
+            # rendered line, not the full write-and-render of the road.
+            _voice_only = shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST
             cost = task_cost(kind)
+            if _voice_only:
+                try:
+                    cost = max(1.0, float(task_cost("render_line"))
+                               * shelf_unvoiced(kind))
+                except Exception:  # noqa: BLE001
+                    pass
             rows.append({"kind": kind,
                          "label": TASK_LABEL.get(kind, kind),
                          "cost": round(cost, 1),
@@ -10379,6 +10455,10 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                          "rate": task_rate(kind),
                          "need": round(prep_need(kind), 2),
                          "measured": task_stat(kind).get("measured", False),
+                         # #989 (B5): words already written; this road
+                         # needs a voice, not another script.
+                         "write": not _voice_only,
+                         "unvoiced": shelf_unvoiced(kind),
                          "wanted": kind in sheet,
                          "fits": cost <= budget})
         out["candidates"] = rows
@@ -17984,10 +18064,21 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             # break, not continue: under relief the whole sitting is
             # unproductive. The words are already kept - #904's road comes
             # back and gives them a voice.
-            if render_relief() and engine in ("xtts", "f5"):
-                break
+            # #989 (B3): THE PANTRY IS ASKED FIRST. This refusal used to
+            # sit above the lookup, so under relief a round could not
+            # even harvest the lines it ALREADY HAD — and `made` is a
+            # pass-local counter, so a round whose every line was on the
+            # shelf still reported prepared=False and stayed unready with
+            # its audio sitting there. The sibling road, prep_render_line,
+            # has always done it the other way round, under a comment
+            # that says in as many words "THIS is where relief belongs".
+            # Two roads, opposite order; this is the one that was wrong.
+            # A hit costs nothing and spends no engine, which is the only
+            # thing relief is protecting.
             key = pantry_key(text, voice, engine)
             got = pantry_get(key)
+            if not got and render_relief() and engine in ("xtts", "f5"):
+                break
             if got:
                 # #978: A HIT IS A TAKE. This advanced `made` and wrote
                 # down nothing else, so a line the round is genuinely
@@ -18069,7 +18160,51 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
             finally:
                 engine_prep_give()
             if not (clip or {}).get("path"):
-                break
+                # #989 (B2): STEP OVER IT. This was a `break`, and every
+                # pass re-plans this round from row 0 - there is no
+                # stored index and no slice - so one line the engine
+                # will not produce capped the round at that index FOR
+                # EVER. entry["prepared"] is made >= len(plan), so such a
+                # round can never be ready again, and the ledger records
+                # it identically to a yield, which is why it was
+                # invisible.
+                #
+                # The sibling road is the one that is right: for the same
+                # condition prep_render_line abandons ONE LINE and comes
+                # back. The other four exits here are engine-wide - the
+                # engine is busy, or down, or the window closed - and
+                # `break` is correct for those. This one is about a
+                # single line's text, and it belongs to that line.
+                #
+                # A line that fails three times is passed to the stand-in
+                # engine, because a round that closes with one line in a
+                # fallback voice airs, and a round that can never close
+                # does not.
+                try:
+                    _bad = entry.setdefault("bad", {})
+                    _bad[key] = int(_bad.get(key) or 0) + 1
+                    _tries = _bad[key]
+                except Exception:  # noqa: BLE001
+                    _tries = 1
+                if _tries >= 3:
+                    try:
+                        _standin = _ready_standin_engine()
+                    except Exception:  # noqa: BLE001
+                        _standin = ""
+                    if _standin and _standin != engine:
+                        try:
+                            clip = await voice_render_any(
+                                text, voice, _standin, fx=fx, who=who)
+                        except Exception:  # noqa: BLE001
+                            clip = None
+                        if (clip or {}).get("path"):
+                            pipeline_log("voice", f"a line of this round "
+                                         f"refused {engine} three times — "
+                                         f"cut on {_standin} so the round "
+                                         "can close (#989)")
+                            key = pantry_key(text, voice, _standin)
+                if not (clip or {}).get("path"):
+                    continue
             pantry_put(key, clip, text=text, voice=voice, who=who,
                        kind=str(entry.get("prep_kind") or "banter"))
             # #932: WRITE THE KEY DOWN. The airing road re-derives it
@@ -18855,9 +18990,56 @@ async def prep_track_talk() -> bool:
         return False
 
 
+async def prep_voice_pending(kind: str) -> bool:
+    """#989 (B5): give a voice to the reads this road has already
+    written, instead of writing another one.
+
+    A road holding unvoiced reads is not short of scripts. #986 stopped
+    the desk writing more of them, correctly; this is the other half —
+    when the planner picks such a road, the work it wants doing is the
+    voicing. One line per call, so it takes its turn like everything
+    else and never holds the window."""
+    who = {"ad": "dj", "station_id": "drop"}.get(str(kind) or "")
+    if not who:
+        return False
+    for row in list(_SHELF.get(str(kind)) or []):
+        try:
+            if row.get("key") or row.get("produced"):
+                continue
+            text = str(row.get("text") or "")
+            if not text:
+                continue
+            made = await prep_render_line(text, who,
+                                          str(row.get("voice") or ""),
+                                          kind=str(kind))
+            if not made:
+                return False        # the engine said no; come back
+            row.update(made)
+            pipeline_log("lookahead",
+                         f"{SHELF_LABEL.get(kind, kind)} that was only "
+                         f"written has its voice now — "
+                         f"{made.get('seconds')}s ready (#989)")
+            return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
 async def prep_one(kind: str) -> bool:
     """Prepare exactly one item of one content type. Never raises: the
     station stays on air whatever the preparer runs into."""
+    # #989 (B5): if this road is sitting on written reads with no voice,
+    # that is what it needs — not another script. Same test the planner
+    # priced it with.
+    try:
+        if shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST:
+            prep_note(str(kind), "recording")
+            try:
+                return await prep_voice_pending(kind)
+            finally:
+                prep_note(str(kind), "stacked")
+    except Exception:  # noqa: BLE001
+        pass
     # #865: the writing-room door. This says who is at the model now;
     # larder_prepare takes the note over and starts naming actors and
     # lines the moment there is a script to record.
@@ -19152,6 +19334,174 @@ async def pantry_keeper() -> None:
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
+            # #990: FINISH WHAT IS ALREADY WRITTEN BEFORE WRITING MORE.
+            #
+            # These two blocks - the half-rendered rounds, and the reads
+            # that were written while the engine said no - used to sit
+            # BELOW the banter loop, and both of them open with
+            # `if not pantry_window(): break`. The banter loop spends the
+            # window: it walks every larder entry and renders lines until
+            # prep_should_stop() or the window closes. So by the time
+            # control arrived here the window was shut and both blocks
+            # broke on their first row, every pass.
+            #
+            # Measured live over five minutes after #989 went in: banter
+            # climbed 78 -> 80 rendered and then started a fresh round,
+            # while adverts held 0 of 6 lines, the memo road 4 of 36, the
+            # phone 0 of 9 and the painting round 0 of 48 - not one line
+            # moved on any of them. Those are exactly the segments the
+            # running order misses.
+            #
+            # #978 saw this and added _banter_wait, but that gate reads
+            # `"banter" not in _hour_short` and banter is a quota kind
+            # that is itself usually short, so the gate almost never
+            # fires. Ordering is the fix, not gating: this work is
+            # FINISHING, it is bounded by what is already on the shelf,
+            # and every second of it turns a paid-for write into audio
+            # that can actually air. New writing takes what is left.
+            # #991: THE CHEAP FINISHING GOES FIRST. This block renders
+            # ONE LINE per row; the rounds below render a whole round and
+            # can spend the entire window on it. Ordered the other way
+            # round, adverts stayed at 0 of 7 lines through six minutes of
+            # measurement while the memo road walked 4 -> 14. Seconds of
+            # work should not queue behind minutes of it.
+            # #904: an advert or a bumper WRITTEN while the engine said
+            # no is sitting on the shelf as words alone. Give it its
+            # voice now, while the window is open — the write is
+            # already paid for, and this is the pass that turns it
+            # into finished audio.
+            # #990 (B6): and a clock for the voicing pass too.
+            _PREP_DEADLINE[0] = time.time() + max(20.0, prep_room_left())
+            for _kind, _who in (("ad", "dj"), ("station_id", "drop")):
+                # #987: ONE BAD ROW MUST NOT JAM THE SHELF BEHIND IT.
+                #
+                # The refusal below used to break the whole kind on the
+                # first row that would not render, and this loop always
+                # starts at the head of the shelf - so a single row the
+                # engine will never accept (a text that survives the
+                # length guard but not the engine, a voice that no longer
+                # resolves) meant the eleven good reads behind it were
+                # never attempted, on any pass, for ever. Measured live:
+                # advert reads 11 written, 0 of 11 lines rendered, while
+                # station IDs - the very next kind in this same loop, the
+                # same function, the same clone engine - sat at 12 of 16.
+                # That asymmetry is the tell: it was never the engine.
+                #
+                # This is the same shape as #854 on the hold shelf, where
+                # "a genuinely unplayable head clip jams the shelf" was
+                # the whole outage. Two refusals in a row still means the
+                # engine is busy and the pass gives up, which is what the
+                # original break was for; a single one now moves on and
+                # the bad row is tried again next pass with the good ones
+                # already made.
+                _refused = 0
+                for _row in list(_SHELF.get(_kind) or []):
+                    # #916: a PRODUCED spot has no pantry `key` because its
+                    # audio is a durable mp3 under /ads-audio rather than a
+                    # pantry clip — it is finished, and rendering its script
+                    # as a dry read would spend the engine on something that
+                    # will never be spoken.
+                    if (_row.get("key") or _row.get("produced")
+                            or not str(_row.get("text") or "")):
+                        continue    # already made, or nothing to make
+                    if not pantry_window():   # #978: see the note above
+                        break
+                    try:
+                        _late = await prep_render_line(
+                            str(_row.get("text") or ""), _who,
+                            str(_row.get("voice") or ""),
+                            kind=str(_kind or ""))              # #978
+                    except Exception:  # noqa: BLE001
+                        _late = None
+                    if not _late:
+                        _refused += 1
+                        if _refused >= 2:
+                            break   # the engine really is saying no
+                        continue    # #987: try the ones behind it
+                    _refused = 0
+                    _row.update(_late)
+                    pipeline_log("lookahead",
+                                 f"{SHELF_LABEL.get(_kind, _kind)} that "
+                                 "was only written has its voice now - "
+                                 f"{_late.get('seconds')}s of finished "
+                                 "audio waiting (#904)")
+            _PREP_DEADLINE[0] = 0.0
+            # #842: a segment already WRITTEN but not fully rendered gets
+            # its remaining lines before anything new is written — half a
+            # call on the shelf is worth finishing first.
+            # #855: ...and a painting round or a bulletin, which are
+            # banked in exactly the same shape and are worth finishing
+            # for exactly the same reason.
+            # #991: THE ROUNDS TAKE TURNS. This walked the kinds in a
+            # fixed order and every row of a kind before moving on, so the
+            # memo road - always first in the tuple - held the window and
+            # the phone and the painting round were never reached. #990
+            # unblocked this whole block and the fault simply moved one
+            # level down: memos went 4 -> 14 of 36 rendered while callers
+            # sat at 0 of 9 and the gallery at 0 of 48, unmoved.
+            #
+            # One row per kind per lap, shortest road leading, and a SLICE
+            # of the window each rather than all of it - larder_prepare
+            # asks prep_should_stop() between every line, so a round that
+            # runs out of slice stops at a line boundary and keeps
+            # everything it made. Rounds accumulate across passes
+            # (entry["made"] is read back), so taking turns costs nobody
+            # their round; it only stops one road owning the room.
+            _rounds = ("manager", "caller", "gallery", "news")
+            _lead = [k for k in _hour_short if k in _rounds]
+            # (named apart from the coord_order() further down, which is
+            # a different list for a different block in the same scope)
+            _round_order = _lead + [k for k in _rounds if k not in _lead]
+            _waiting: list[tuple[str, dict]] = []
+            _lap = 0
+            while True:
+                _added = False
+                for _k in _round_order:
+                    _rows = list(_SHELF.get(_k) or [])
+                    if _lap < len(_rows):
+                        _waiting.append((_k, _rows[_lap]))
+                        _added = True
+                if not _added:
+                    break
+                _lap += 1
+            _slice = max(15.0, min(45.0, prep_room_left()
+                                   / max(1, len(_waiting))))
+            if _waiting:
+                for _kind, _row in _waiting:
+                    _shelved = _row.get("entry") or {}
+                    if _shelved.get("prepared") or _shelved.get("preparing"):
+                        continue
+                    # #871: THIS was the trap door. larder_prepare froze
+                    # a round before it knew whether anything in it could
+                    # be prepared, and a caller round could never have
+                    # anything (the old _round_chunks voided the whole
+                    # plan on the first caller marker), so every banked
+                    # call landed here as `frozen and chunks == 0` and
+                    # was never looked at again. The freeze is only given
+                    # now when there is audio to protect; a round that
+                    # has genuinely been SEEN says so with prep_turns,
+                    # and only that one is skipped — so a row banked by
+                    # the old code is picked back up rather than left to
+                    # burn with nothing in it.
+                    if (_shelved.get("frozen")
+                            and int(_shelved.get("prep_turns") or 0)
+                            and not int(_shelved.get("chunks") or 0)):
+                        continue        # nothing in it a preparer can make
+                    if not pantry_window():   # #978: see the note above
+                        break
+                    # #990 (B6): A CLOCK OF ITS OWN. _PREP_DEADLINE is a
+                    # single global and the banter loop clears it to 0.0
+                    # in its `finally`, so this block used to run with no
+                    # deadline at all - prep_should_stop()'s overrun test
+                    # reads `if due and ...`, and 0.0 is falsy, so a round
+                    # started here could run straight through the handover.
+                    # #991: and it is a SLICE, so the next road gets a turn.
+                    _PREP_DEADLINE[0] = time.time() + _slice
+                    try:
+                        await larder_prepare(_shelved)
+                    finally:
+                        _PREP_DEADLINE[0] = 0.0
+                    _row["seconds"] = float(_shelved.get("seconds") or 0)
             # #894/#832: while we have the room, record MORE than one.
             # Preparing a single round per window is what kept the buffer
             # shallow — the point of the visit is to come away with
@@ -19218,95 +19568,6 @@ async def pantry_keeper() -> None:
                     _PREP_DEADLINE[0] = 0.0
                 if not _ok and int(_entry.get("made") or 0) <= _before:
                     break               # engine said no; try again later
-            # #842: a segment already WRITTEN but not fully rendered gets
-            # its remaining lines before anything new is written — half a
-            # call on the shelf is worth finishing first.
-            # #855: ...and a painting round or a bulletin, which are
-            # banked in exactly the same shape and are worth finishing
-            # for exactly the same reason.
-            for _kind in ("manager", "caller", "gallery", "news"):
-                for _row in list(_SHELF.get(_kind) or []):
-                    _shelved = _row.get("entry") or {}
-                    if _shelved.get("prepared") or _shelved.get("preparing"):
-                        continue
-                    # #871: THIS was the trap door. larder_prepare froze
-                    # a round before it knew whether anything in it could
-                    # be prepared, and a caller round could never have
-                    # anything (the old _round_chunks voided the whole
-                    # plan on the first caller marker), so every banked
-                    # call landed here as `frozen and chunks == 0` and
-                    # was never looked at again. The freeze is only given
-                    # now when there is audio to protect; a round that
-                    # has genuinely been SEEN says so with prep_turns,
-                    # and only that one is skipped — so a row banked by
-                    # the old code is picked back up rather than left to
-                    # burn with nothing in it.
-                    if (_shelved.get("frozen")
-                            and int(_shelved.get("prep_turns") or 0)
-                            and not int(_shelved.get("chunks") or 0)):
-                        continue        # nothing in it a preparer can make
-                    if not pantry_window():   # #978: see the note above
-                        break
-                    await larder_prepare(_shelved)
-                    _row["seconds"] = float(_shelved.get("seconds") or 0)
-            # #904: an advert or a bumper WRITTEN while the engine said
-            # no is sitting on the shelf as words alone. Give it its
-            # voice now, while the window is open — the write is
-            # already paid for, and this is the pass that turns it
-            # into finished audio.
-            for _kind, _who in (("ad", "dj"), ("station_id", "drop")):
-                # #987: ONE BAD ROW MUST NOT JAM THE SHELF BEHIND IT.
-                #
-                # The refusal below used to break the whole kind on the
-                # first row that would not render, and this loop always
-                # starts at the head of the shelf - so a single row the
-                # engine will never accept (a text that survives the
-                # length guard but not the engine, a voice that no longer
-                # resolves) meant the eleven good reads behind it were
-                # never attempted, on any pass, for ever. Measured live:
-                # advert reads 11 written, 0 of 11 lines rendered, while
-                # station IDs - the very next kind in this same loop, the
-                # same function, the same clone engine - sat at 12 of 16.
-                # That asymmetry is the tell: it was never the engine.
-                #
-                # This is the same shape as #854 on the hold shelf, where
-                # "a genuinely unplayable head clip jams the shelf" was
-                # the whole outage. Two refusals in a row still means the
-                # engine is busy and the pass gives up, which is what the
-                # original break was for; a single one now moves on and
-                # the bad row is tried again next pass with the good ones
-                # already made.
-                _refused = 0
-                for _row in list(_SHELF.get(_kind) or []):
-                    # #916: a PRODUCED spot has no pantry `key` because its
-                    # audio is a durable mp3 under /ads-audio rather than a
-                    # pantry clip — it is finished, and rendering its script
-                    # as a dry read would spend the engine on something that
-                    # will never be spoken.
-                    if (_row.get("key") or _row.get("produced")
-                            or not str(_row.get("text") or "")):
-                        continue    # already made, or nothing to make
-                    if not pantry_window():   # #978: see the note above
-                        break
-                    try:
-                        _late = await prep_render_line(
-                            str(_row.get("text") or ""), _who,
-                            str(_row.get("voice") or ""),
-                            kind=str(_kind or ""))              # #978
-                    except Exception:  # noqa: BLE001
-                        _late = None
-                    if not _late:
-                        _refused += 1
-                        if _refused >= 2:
-                            break   # the engine really is saying no
-                        continue    # #987: try the ones behind it
-                    _refused = 0
-                    _row.update(_late)
-                    pipeline_log("lookahead",
-                                 f"{SHELF_LABEL.get(_kind, _kind)} that "
-                                 "was only written has its voice now - "
-                                 f"{_late.get('seconds')}s of finished "
-                                 "audio waiting (#904)")
             # #842: and then the rest of the board — the ads, the bumpers,
             # the memos from upstairs, the phone calls. One item per pass,
             # in rotation, so the shelf fills evenly rather than filling
@@ -28746,6 +29007,25 @@ def _store_media(audio: bytes, ext: str = "wav") -> dict[str, Any]:
     (VOICE_MEDIA_DIR / key).write_bytes(audio)
     _media_prune()
     return {"path": f"/media/{key}", "sig": media_sign(key), "bytes": len(audio)}
+
+
+def _media_file(path: str) -> Path | None:
+    """#993: the FILE behind a served clip path.
+
+    _store_media hands back {"path": "/media/<key>"} - a URL for the
+    page, not a filename - and several roads have to hand that audio to
+    ffmpeg or read its bytes. Written out longhand at each of them it was
+    got wrong at least once (see the note in voice_render_any), so it
+    lives here once. Returns None when the clip is not one of ours or is
+    no longer on disk, which every caller must treat as "no audio"."""
+    name = str(path or "").rsplit("/", 1)[-1].strip()
+    if not name or "\\" in name or name in (".", ".."):
+        return None
+    try:
+        fp = VOICE_MEDIA_DIR / name
+        return fp if fp.is_file() else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _siren_sample() -> str | None:
@@ -55703,6 +55983,93 @@ async def api_coord_road(
     it being behind. See coord_road_report()."""
     require_read_auth(authorization)
     return coord_road_report(road)
+
+
+@app.get("/api/recording-room/rows/{kind}")
+async def api_recording_room_rows(
+    kind: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#992: WHY IS THIS ROW NOT AUDIO YET.
+
+    The recording room counts rows and lines; when a road sits at zero
+    rendered while its neighbours in the same loop finish, the counts
+    say the road is stuck and nothing says why. This walks the shelf a
+    row at a time and answers for each one the same questions
+    prep_render_line asks, in the order it asks them, so the first
+    `false` in the row IS the reason. The station-wide gates are
+    reported once at the top for the same reason."""
+    require_read_auth(authorization)
+    kind = str(kind or "").strip()
+    if kind not in SHELF_LABEL:
+        raise HTTPException(status_code=404, detail="no such road")
+    who = {"ad": "dj", "station_id": "drop"}.get(kind) or "dj"
+    gates: dict[str, Any] = {
+        "relief": bool(render_relief()),
+        "prep_should_stop": prep_should_stop() or "",
+        "engine_inflight": engine_inflight(),
+        "engine_budget": int(ENGINE_BUDGET),
+        "yielding": bool(prep_yielding()),
+        "unvoiced": shelf_unvoiced(kind),
+        "unvoiced_most": SHELF_UNVOICED_MOST,
+    }
+    rows: list[dict[str, Any]] = []
+    engines_seen: set[str] = set()
+    for _i, row in enumerate(list(_SHELF.get(kind) or [])):
+        text = str(row.get("text") or "")
+        out: dict[str, Any] = {
+            "i": _i,
+            "chars": len(text),
+            "head": text[:90],
+            "voice_asked": str(row.get("voice") or ""),
+            "key": str(row.get("key") or ""),
+            "produced": bool(row.get("produced")),
+        }
+        if out["key"] or out["produced"]:
+            out["verdict"] = "already has its audio"
+            rows.append(out)
+            continue
+        if not text.strip():
+            out["verdict"] = "no words to say"
+            rows.append(out)
+            continue
+        try:
+            voice = configured_radio_voice(who, str(row.get("voice") or ""))                 or _event_voice("default")
+        except Exception as exc:  # noqa: BLE001
+            voice = ""
+            out["voice_error"] = str(exc)[:200]
+        out["voice_used"] = voice
+        if not voice:
+            out["verdict"] = "NO VOICE RESOLVES for this seat"
+            rows.append(out)
+            continue
+        try:
+            engine = voice_engine_for(voice)
+        except Exception as exc:  # noqa: BLE001
+            engine = ""
+            out["engine_error"] = str(exc)[:200]
+        out["engine"] = engine
+        if engine:
+            engines_seen.add(engine)
+        try:
+            pkey = pantry_key(text, voice, engine)
+            out["pantry_key"] = pkey
+            out["in_pantry"] = bool(pantry_get(pkey))
+        except Exception as exc:  # noqa: BLE001
+            out["pantry_error"] = str(exc)[:200]
+        if out.get("in_pantry"):
+            out["verdict"] = "the audio is in the pantry — row never took "                             "the key back"
+        else:
+            out["verdict"] = "waiting on the engine"
+        rows.append(out)
+    for _eng in sorted(engines_seen):
+        if _eng in ("xtts", "f5"):
+            try:
+                gates[f"{_eng}_ready"] = bool(await clone_engine_ready(_eng))
+            except Exception:  # noqa: BLE001
+                gates[f"{_eng}_ready"] = None
+    return {"kind": kind, "label": SHELF_LABEL.get(kind, kind),
+            "who": who, "gates": gates, "rows": rows}
 
 
 @app.get("/api/recording-room")
