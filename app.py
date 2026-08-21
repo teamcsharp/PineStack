@@ -27144,11 +27144,34 @@ async def schedule_aired_api(
                        "span - either it aired before the episode cache "
                        "was last swept, or the entry ran under the "
                        "records and nobody spoke in it"}
-    cut: list[str] = []
-    for path, start, dur in pieces:
-        made = await booth_cut(path, start, dur)
-        if made:
-            cut.append(made)
+    # #994: CUT THEM AT THE SAME TIME.
+    #
+    # "I'm clicking it and it's taking forever to download."
+    #
+    # This walked the pieces one at a time and awaited each, and a welded
+    # entry can hold up to ARCHIVE_PIECES_MOST of them - a hundred and
+    # sixty separate ffmpeg processes, spawned in series, on a box already
+    # running the TTS engine. The whole of that happened inside the
+    # request, so the browser sat on a spinner for the sum of them.
+    #
+    # Each cut is independent and already cached by (source, mtime, span),
+    # so they can simply run together. Bounded at four: the point is to
+    # stop paying process-spawn latency in series, not to hand the whole
+    # machine to ffmpeg while the station is trying to talk - the engine
+    # has to keep its slots.
+    _cut_gate = asyncio.Semaphore(4)
+
+    async def _one(path: str, start: float, dur: float) -> str:
+        async with _cut_gate:
+            try:
+                return await booth_cut(path, start, dur)
+            except Exception:  # noqa: BLE001
+                return ""
+
+    _made = await asyncio.gather(
+        *(_one(path, start, dur) for path, start, dur in pieces))
+    # In piece order, which is the order they aired - gather preserves it.
+    cut: list[str] = [m for m in _made if m]
     if not cut:
         raise HTTPException(
             status_code=500,
