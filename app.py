@@ -32284,8 +32284,13 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None
                 _prep_said = []
             if _prep_said:
                 try:
-                    gallery_line_mark([str(p.get("name") or "")
-                                       for p in _prep_pics], _prep_began)
+                    # #991: the prepared round banked the descriptions
+                    # with the pictures, so the match is available here
+                    # too - and this is the road most rounds now take.
+                    gallery_line_mark(
+                        [str(p.get("name") or "") for p in _prep_pics],
+                        _prep_began,
+                        [str(p.get("desc") or "") for p in _prep_pics])
                 except Exception:  # noqa: BLE001
                     pass
                 pipeline_log("air", "a painting round goes straight to air "
@@ -32361,7 +32366,9 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None
             pass
         return []
     # #702: the paintings ride the lines that are about them.
-    gallery_line_mark([n for n, _ in pieces], began)
+    # #991: ...and the RIGHT one does, matched on the description.
+    gallery_line_mark([n for n, _ in pieces], began,
+                      [d for _, d in pieces])
     if lines and seed:
         speakbox_remember(seed)
     return lines
@@ -32603,7 +32610,8 @@ async def dj_hawk_round(names: list[str], moods: list[str],
                             source=(seed or {}).get("file", ""),
                             caller_name=_buyer,
                             caller_voice=_buyer_voice)
-    gallery_line_mark([n for n, _ in pieces], began)
+    gallery_line_mark([n for n, _ in pieces], began,
+                      [d for _, d in pieces])                 # #991
     if lines and seed:
         speakbox_remember(seed)
     # What the round said about each piece decides nothing on its own — the
@@ -32630,20 +32638,77 @@ async def dj_hawk_round(names: list[str], moods: list[str],
     return lines
 
 
-def gallery_line_mark(names: list[str], since: float) -> None:
+# #991: the words worth matching on. A description and a line about it
+# share their NOUNS, not their glue - "the", "this", "picture", "painting"
+# turn up in every gallery line ever written and would make everything
+# match everything.
+_GALLERY_STOP = {
+    "the", "and", "this", "that", "with", "from", "into", "have", "just",
+    "like", "what", "when", "where", "there", "here", "they", "them",
+    "their", "your", "you", "for", "are", "was", "were", "been", "being",
+    "not", "but", "all", "one", "two", "its", "about", "over", "out",
+    "off", "some", "any", "who", "how", "why", "than", "then", "picture",
+    "painting", "paintings", "image", "images", "look", "looks", "looking",
+    "see", "seen", "seeing", "folks", "listen", "right", "something",
+    "really", "very", "much", "more", "most", "kind", "sort", "thing",
+    "things", "little", "called", "should", "would", "could", "gets",
+    "got", "get", "well", "yeah", "okay", "dollars", "caller", "first",
+}
+
+
+def _gallery_words(text: str) -> set[str]:
+    try:
+        return {w for w in re.findall(r"[a-z]{4,}", str(text or "").lower())
+                if w not in _GALLERY_STOP}
+    except Exception:  # noqa: BLE001
+        return set()
+
+
+def gallery_line_mark(names: list[str], since: float,
+                      descs: list[str] | None = None) -> None:
     """Hang the paintings on the lines that discuss them (#702).
 
-    The booth already held them up in a strip beside the dialogue, which
-    tells you WHAT is being sold but not WHICH line is about which picture.
-    Every line aired since the round began gets the round's images, so the
-    thumbnail sits with the words describing it."""
+    #991: ON THE LINE THAT IS ACTUALLY ABOUT IT.
+
+    This gave EVERY line of the round ALL THREE of the round's pictures -
+    its own docstring said as much - and the booth holds up the first of
+    them. So the pair could be describing two tabby cats in a hallway
+    while the panel showed a portrait of a woman, which is precisely what
+    the operator photographed: "the image isn't the image that's being
+    presented."
+
+    The round is written as PAINTING 1 / 2 / 3 out of the vision model's
+    own descriptions and the pair go through them one at a time, so a line
+    and the picture it is about share their nouns - the cats, the hallway,
+    the fur - and no other line in the round does. Each line is scored
+    against each description and keeps the one it matches best. A line
+    that is about none of them in particular - a price, an aside, a joke -
+    keeps the whole strip, which is what every line had before.
+
+    Called without descriptions this is exactly the old behaviour, so the
+    single-picture road is untouched."""
     if not names:
         return
+    bags = [_gallery_words(d) for d in (descs or [])]
     for entry in reversed(_RADIO.get("chat") or []):
         if float(entry.get("ts") or 0) < since:
             break
-        if entry.get("who") in ("dj", "cohost", "third", "caller"):
-            entry["images"] = names[:3]
+        if entry.get("who") not in ("dj", "cohost", "third", "caller"):
+            continue
+        best, score = None, 0
+        if len(bags) > 1:
+            said = _gallery_words(entry.get("text") or "")
+            if said:
+                for at, bag in enumerate(bags):
+                    if at >= len(names):
+                        break
+                    hit = len(said & bag)
+                    if hit > score:
+                        best, score = at, hit
+        # Two shared nouns is a real match; one is a coincidence in a
+        # round where everybody is talking about pictures.
+        entry["images"] = ([names[best]] if best is not None and score >= 2
+                           else names[:3])
 
 
 def banter_pictures(limit: int = 6) -> str:
@@ -80950,6 +81015,29 @@ function djTalkRowInner(line) {
     const row = el("div", "", "");
     row.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
       + "padding:3px 4px;border-radius:5px";
+    /* #991: "when someone's hawking a painting on air, I want to see a
+     * thumbnail of the painting on the left side of the listing."
+     *
+     * gallery_line_mark hangs the picture on the line that is about it,
+     * and since #991 that is the RIGHT picture rather than all three of
+     * the round's. The row is already a flex line, so the thumbnail is
+     * simply its first child. Only gallery lines carry `images`, so a
+     * sting, an ad or a plain banter row is untouched. */
+    try {
+      const _pics = (line && line.images) || [];
+      if (_pics.length) {
+        /* artThumb (#830) already is this square, with the fullscreen
+         * viewer and the hawk menu on it - the listing simply never wore
+         * one. Reused rather than rebuilt so a painting behaves the same
+         * wherever it is shown. */
+        const _th = artThumb(_pics[0], 34);
+        if (_pics.length > 1) {
+          _th.title = "this line is about the round rather than one piece "
+            + "— " + _pics.length + " paintings in it";
+        }
+        row.appendChild(_th);
+      }
+    } catch (e) { /* the line still draws */ }
     /* #748: identity FIRST, above every early return. The ad, sting,
      * hang-up and desk-marker branches all return before the old stamping
      * site, so a line the station was genuinely speaking — an ad read goes
