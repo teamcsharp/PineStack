@@ -16,7 +16,7 @@ import wave
 from html import unescape as html_unescape
 from html.parser import HTMLParser
 from pathlib import Path
-from threading import RLock, Thread
+from threading import BoundedSemaphore, RLock, Thread
 from typing import Any
 from urllib.parse import quote, urlparse
 
@@ -10442,17 +10442,39 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             # rendered line, not the full write-and-render of the road.
             _voice_only = shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST
             cost = task_cost(kind)
+            gain = task_gain(kind)
             if _voice_only:
+                # #996: PRICE THE TASK THAT WILL ACTUALLY RUN.
+                #
+                # #989 priced this at one render_line PER unvoiced row,
+                # on the reading that the road owes all of them. But
+                # prep_one hands a voice-only road to prep_voice_pending,
+                # which renders exactly ONE row and returns - so with
+                # eight reads waiting the board was quoting about 360s
+                # for a job that takes about 45s.
+                #
+                # That is not a cosmetic error. `fits` is `cost <=
+                # budget` and prep_budget ends in min(room, ...), so a
+                # 360s quote is over budget in every ordinary window, and
+                # `rate` is gain/cost, so it also ranked last on the
+                # efficiency path. The road stayed on the board and
+                # became unpickable - which is the exact failure #989
+                # existed to cure, moved from `continue` into the price.
+                #
+                # One line's cost, and one line's gain with it, or `rate`
+                # would read a whole road's airtime against a single
+                # line's work and swing just as far the other way.
                 try:
-                    cost = max(1.0, float(task_cost("render_line"))
-                               * shelf_unvoiced(kind))
+                    cost = max(1.0, float(task_cost("render_line")))
+                    gain = max(0.1, float(task_gain("render_line")))
                 except Exception:  # noqa: BLE001
                     pass
             rows.append({"kind": kind,
                          "label": TASK_LABEL.get(kind, kind),
                          "cost": round(cost, 1),
-                         "airtime": round(task_gain(kind), 1),
-                         "rate": task_rate(kind),
+                         "airtime": round(gain, 1),
+                         "rate": round(gain / max(0.1, cost), 3)
+                                 if _voice_only else task_rate(kind),
                          "need": round(prep_need(kind), 2),
                          "measured": task_stat(kind).get("measured", False),
                          # #989 (B5): words already written; this road
@@ -10825,6 +10847,192 @@ def _range_slice(header: str, total: int) -> tuple[int, int] | None:
     if start > end or start >= total:
         return (-1, -1)
     return (start, end)
+
+
+# --- Listener bitrate: cached low-rate copies of served clips (#999) -------
+#
+# A car on Tailscale cannot pull 384 kbit/s of raw PCM - which is what a
+# voice clip is; _xtts_synthesize returns 24 kHz mono s16 WAV and
+# MEDIA_TYPES has only wav and mp3 - while it is also pulling a record at
+# a median 321 kbit/s. The LISTENER picks a rate and gets a cached mp3 of
+# it.
+#
+# Two rules the shape of this code exists to keep. It is NEVER encoded on
+# the hot path of a clip that is about to air: a miss serves the original
+# and starts the encode for next time. And it is never encoded twice: the
+# rate is in the FILENAME, so every rate of every clip is computed once
+# and then only ever read.
+LOW_CACHE = VOICE_MEDIA_DIR / "lo"
+# A SUBDIRECTORY on purpose - and therefore invisible to _media_prune(),
+# which globs VOICE_MEDIA_DIR.glob("*.*") non-recursively. That is why
+# _low_sweep() below is mandatory rather than tidy: VOICE_KEEP_BYTES is
+# 3 GiB and the clip store already sits near it, so an unswept cache
+# would push real clips out.
+LOW_RATES = (32, 48, 64, 96, 128)      # the only rates the door admits
+LOW_KEEP_FILES = int(os.getenv("LOW_KEEP_FILES", "4000"))
+_LOW_JOBS: set[str] = set()
+_LOW_JOBS_LOCK = RLock()
+_LOW_SWEPT = [0.0]                      # last sweep; see _low_sweep
+# #999: WHICH RATES ANYONE IS ACTUALLY LISTENING AT. Encoding all five
+# rates of every clip would be four wasted encodes out of five; encoding
+# none until a clip is asked for loses the race every time (see
+# low_ready_soon). So we remember what listeners have asked for lately
+# and make exactly those, as soon as the audio exists.
+_LOW_WANTED: dict[int, float] = {}
+LOW_WANT_FRESH = 1800.0                 # a rate is "in use" for 30 min
+# ONE encoder in this process, ever, and niced. The box runs the TTS
+# engine on the same CPU at ~2.7x slower than real time; a clip that is
+# late because we were transcoding is worse than a clip that is large.
+_LOW_GATE = BoundedSemaphore(1)
+
+
+def low_rate(raw: Any) -> int:
+    """The one place a client number becomes a bitrate. 0 means "send the
+    original". A WHITELIST, not a clamp - an arbitrary integer would let
+    one listener mint an unbounded number of cache entries per clip."""
+    try:
+        want = int(raw or 0)
+    except (TypeError, ValueError):
+        return 0
+    return want if want in LOW_RATES else 0
+
+
+def low_path(key: str, rate: int) -> Path:
+    """<32 hex>-wav-64k.mp3 - the source key, ITS EXTENSION, and the rate.
+
+    The extension is in the name because MEDIA_KEY_SHAPE admits both wav
+    and mp3 and some clips are already mp3, so dropping it would let
+    <key>.wav and <key>.mp3 - two different recordings - collide on one
+    derivative. MEDIA_KEY_SHAPE admits no hyphen in the key itself, so
+    the 32-hex stem still splits back out cleanly in _low_sweep."""
+    stem, _, ext = str(key).rpartition(".")
+    return LOW_CACHE / f"{stem or key}-{ext or 'raw'}-{int(rate)}k.mp3"
+
+
+def _low_sweep(force: bool = False) -> None:
+    """The newest LOW_KEEP_FILES survive, and any derivative whose source
+    clip _media_prune has already cycled out dies with it.
+
+    THROTTLED, because this is a full O(n) walk of the clip store with a
+    stat per file and the store sits near its three-gigabyte ceiling -
+    _media_prune's own docstring already warns about paying that per
+    write. Once a minute is plenty for a cache bounded at thousands."""
+    if not force and time.time() - _LOW_SWEPT[0] < 60:
+        return
+    _LOW_SWEPT[0] = time.time()
+    try:
+        live = {q.stem for q in VOICE_MEDIA_DIR.glob("*.*") if q.is_file()}
+        files = sorted((q for q in LOW_CACHE.glob("*.mp3") if q.is_file()),
+                       key=lambda q: q.stat().st_mtime, reverse=True)
+        for at, one in enumerate(files):
+            if (at >= LOW_KEEP_FILES
+                    or one.stem.split("-", 1)[0] not in live):
+                one.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _low_encode_soon(source: Path, out: Path, rate: int) -> None:
+    """One background encode per (clip, rate), ever.
+
+    Modelled on _tape_transcode_soon: job-set dedupe under a lock, a
+    daemon thread, encode to .part and rename, so a reader never sees a
+    half-written file. Two additions that road does not need - the
+    one-wide gate and the nice() - because this shares a box with the
+    engine. Any failure at all leaves the original being served."""
+    with _LOW_JOBS_LOCK:
+        if str(out) in _LOW_JOBS:
+            return
+        _LOW_JOBS.add(str(out))
+
+    def run() -> None:
+        part = out.with_suffix(".part")
+        try:
+            import subprocess
+
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            LOW_CACHE.mkdir(parents=True, exist_ok=True)
+            extra: dict[str, Any] = {}
+            if hasattr(os, "nice"):     # Linux only; harmless elsewhere
+                extra["preexec_fn"] = lambda: os.nice(15)
+            with _LOW_GATE:
+                subprocess.run(
+                    [exe, "-nostdin", "-hide_banner", "-loglevel", "error",
+                     "-y", "-i", str(source),
+                     # The source IS 24 kHz mono. Resampling up would only
+                     # cost bytes; -ac 1 keeps a stereo clip in line too.
+                     "-vn", "-ac", "1", "-ar", "24000",
+                     "-codec:a", "libmp3lame", "-b:a", f"{int(rate)}k",
+                     # ".part" tells ffmpeg nothing, so the format has to
+                     # be named - the same trap the tape road hit.
+                     "-f", "mp3", str(part)],
+                    check=True, timeout=120, capture_output=True, **extra)
+            part.replace(out)       # atomic; no reader sees a half file
+            _low_sweep()
+        except Exception:  # noqa: BLE001
+            try:
+                part.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            with _LOW_JOBS_LOCK:
+                _LOW_JOBS.discard(str(out))
+
+    Thread(target=run, daemon=True).start()
+
+
+def low_note_rate(rate: Any) -> int:
+    """Remember that somebody is listening at this rate."""
+    got = low_rate(rate)
+    if got:
+        _LOW_WANTED[got] = time.time()
+    return got
+
+
+def low_rates_wanted() -> list[int]:
+    """The rates a listener has asked for recently, newest interest
+    first. Empty means nobody is on a metered link and nothing needs
+    encoding at all."""
+    now = time.time()
+    return [r for r, at in sorted(_LOW_WANTED.items(),
+                                  key=lambda kv: -kv[1])
+            if now - at < LOW_WANT_FRESH]
+
+
+def low_ready_soon(key: str) -> None:
+    """#999: ENCODE WHEN THE AUDIO IS MADE, NOT WHEN IT IS ASKED FOR.
+
+    This is the whole difference between a cache that works and one that
+    is written and never read.
+
+    The obvious place to start the encode is the moment the feed hands a
+    clip to the page - there is a VOICE_BROADCAST_LEAD_MS lead, so it
+    looks like free time. It is not: the page prefetches the instant it
+    is told, so the browser's request and the encode start TOGETHER, and
+    the encode has to spawn a thread, take the one-wide gate behind every
+    other clip of the same round, and run ffmpeg to completion before an
+    already-in-flight HTTP request arrives. It never wins. /media then
+    serves the original, and because a pantry key is unique per render
+    THAT CLIP IS NEVER REQUESTED AGAIN - so the derivative is made, filed,
+    and read by nobody, for every clip, for ever.
+
+    Called from _store_media instead, the encode starts when the audio
+    first hits the disk. For a live line that is the whole render-to-air
+    lead; for anything the recording room prepared ahead it can be
+    minutes or hours. By the time the page asks, the file is there."""
+    try:
+        if not MEDIA_KEY_SHAPE.match(str(key or "")):
+            return
+        src = VOICE_MEDIA_DIR / key
+        if not src.is_file():
+            return
+        for rate in low_rates_wanted():
+            out = low_path(key, rate)
+            if not out.is_file():
+                _low_encode_soon(src, out, rate)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- Voice library ---------------------------------------------------------
@@ -17597,6 +17805,15 @@ def _pantry_load() -> None:
     try:
         rows = json.loads(SHELF_PATH.read_text())
         if isinstance(rows, dict):
+            # #995: the shelf banks a round as row["entry"], the same
+            # shape the reserve holds, and pantry_keeper skips a
+            # `preparing` one by the same test. Same restart, same
+            # stranding, same cure.
+            for _rows in rows.values():
+                for _row in (_rows or []):
+                    if isinstance(_row, dict) and isinstance(
+                            _row.get("entry"), dict):
+                        _unstrand(_row["entry"])
             _SHELF.update({str(k): list(v or []) for k, v in rows.items()})
     except Exception:  # noqa: BLE001
         pass
@@ -17688,6 +17905,36 @@ def _larder_save() -> None:
         pass
 
 
+def _unstrand(entry: dict[str, Any]) -> dict[str, Any]:
+    """#995: NOTHING IS IN FLIGHT IN A PROCESS THAT HAS JUST STARTED.
+
+    larder_prepare sets entry["preparing"] = True on the way in and
+    clears it in a `finally`, which covers every exception and every
+    return - but not the process going away underneath it. _larder_save
+    writes the entry verbatim, so a restart during a recording (a deploy,
+    a crash, an operator restart) writes the flag to disk, and the loader
+    used to bring it straight back.
+
+    Three separate places then skip such an entry FOR EVER - the guard at
+    the top of larder_prepare itself, and the two blocks in pantry_keeper
+    that walk the reserve and the shelf - and nothing anywhere ever
+    clears it again. The round is not merely unfinished, it is
+    unreachable: it holds one of the fourteen reserve slots and takes its
+    unmade lines out of the hour with it.
+
+    Found live, not theorised: after a day of deploys the reserve held a
+    round at made=1 of chunks=22, preparing, thirty-three minutes old,
+    with twenty-one lines that could never be recorded.
+
+    Clearing it on load is safe in the one way that matters - a fresh
+    process has no task that could be holding the flag - and it costs
+    nothing when the flag was already false."""
+    if entry.get("preparing"):
+        entry["preparing"] = False
+        entry["partial"] = bool(entry.get("made"))
+    return entry
+
+
 def _larder_load() -> None:
     if _LARDER:
         return
@@ -17696,10 +17943,17 @@ def _larder_load() -> None:
     except Exception:
         return
     if isinstance(rows, list):
-        _LARDER[:] = [r for r in rows if isinstance(r, dict)
+        _stranded = sum(1 for r in rows
+                        if isinstance(r, dict) and r.get("preparing"))
+        _LARDER[:] = [_unstrand(r) for r in rows if isinstance(r, dict)
                       and time.time() - float(r.get("at") or 0)
                       < larder_fresh()
                       and _larder_current(r)][:_LARDER_MAX]
+        if _stranded:
+            pipeline_log("lookahead",
+                         f"{_stranded} round(s) were left mid-recording by "
+                         "the last restart and would never have been "
+                         "picked up again — put back on the board (#995)")
 
 
 def clean_station_backlog() -> dict[str, int]:
@@ -29006,6 +29260,11 @@ def _store_media(audio: bytes, ext: str = "wav") -> dict[str, Any]:
     VOICE_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
     (VOICE_MEDIA_DIR / key).write_bytes(audio)
     _media_prune()
+    # #999: the earliest instant this audio exists. If anyone is
+    # listening on a metered link, their copy starts encoding now - long
+    # before the page is ever told the clip exists. Costs nothing when
+    # every listener is on the original.
+    low_ready_soon(key)
     return {"path": f"/media/{key}", "sig": media_sign(key), "bytes": len(audio)}
 
 
@@ -52677,57 +52936,82 @@ async def media(
     if not (expected and hmac.compare_digest(signature, expected)):
         require_auth(authorization)
 
+    # #999: the listener's chosen rate. media_sign() HMACs the KEY ONLY,
+    # and this route reads no query parameter but "t", so &br= can
+    # neither alter nor invalidate the signature. Nothing about auth
+    # above this line changes.
+    rate = low_note_rate(request.query_params.get("br"))
+    served = VOICE_MEDIA_DIR / key
+    media_type = MEDIA_TYPES[ext]
+    missed = False
+    if rate:
+        small = low_path(key, rate)
+        if small.is_file():
+            # nosniff is set below, so the browser believes OUR type even
+            # though the key still ends .wav.
+            served, media_type = small, "audio/mpeg"
+        else:
+            # Not ready. Start it for next time and send the original
+            # NOW - a miss must cost the listener bytes, never delay.
+            missed = True
+            _low_encode_soon(VOICE_MEDIA_DIR / key, small, rate)
+
     try:
-        blob = (VOICE_MEDIA_DIR / key).read_bytes()
-    except Exception:
+        size = await asyncio.to_thread(lambda: served.stat().st_size)
+    except Exception:  # noqa: BLE001
         return Response(status_code=404)
 
     headers = {
         "X-Content-Type-Options": "nosniff",
         "Accept-Ranges": "bytes",
-        # Safe to cache forever: keys are random and never overwritten.
-        "Cache-Control": "private, max-age=31536000, immutable",
+        # A HIT is safe to cache forever: keys are random and never
+        # overwritten, and ?br= is part of the URI an HTTP cache keys on,
+        # so the wav and each mp3 are separate entries.
+        #
+        # #999: A MISS MUST NOT BE. On a miss this hands back the
+        # original WAV under a URL that promises an mp3 - and marking
+        # that `immutable, max-age=31536000` would make the miss
+        # PERMANENT for that listener, caching a year of wav against the
+        # very URL the encode is being prepared for.
+        "Cache-Control": ("private, no-store" if missed
+                          else "private, max-age=31536000, immutable"),
     }
-    window = _range_slice(str(request.headers.get("range") or ""), len(blob))
+    window = _range_slice(str(request.headers.get("range") or ""), size)
     if window == (-1, -1):
-        headers["Content-Range"] = f"bytes */{len(blob)}"
+        headers["Content-Range"] = f"bytes */{size}"
         return Response(status_code=416, headers=headers)
     if window:
+        # #999/#883: stream it off the disk. This route used to do
+        # `blob = (VOICE_MEDIA_DIR / key).read_bytes()` - a SYNCHRONOUS
+        # whole-file read inside an async def, which blocks the event
+        # loop for every listener at once - and then sliced the range out
+        # of memory. The music road was fixed for exactly this in #883;
+        # the voice road never was.
         start, end = window
-        headers["Content-Range"] = f"bytes {start}-{end}/{len(blob)}"
-        return Response(
-            blob[start:end + 1],
-            status_code=206,
-            headers=headers,
-            media_type=MEDIA_TYPES[ext],
-        )
-    return Response(blob, headers=headers, media_type=MEDIA_TYPES[ext])
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+        headers["Content-Length"] = str(end - start + 1)
+        return StreamingResponse(_range_stream(served, start, end),
+                                 status_code=206, headers=headers,
+                                 media_type=media_type)
+    return FileResponse(served, media_type=media_type, headers=headers)
 
 
-@app.get("/media/{key}/spec")
-async def media_spec(
-    key: str,
-    request: Request,
-    authorization: str | None = Header(default=None),
-) -> Response:
-    """A static spectrogram of a rendered clip, so the backlog shows the
-    shape of the audio without playing it (#455). Rendered once by ffmpeg's
-    showspectrumpic, then cached — same signed-URL auth as /media."""
-    if not MEDIA_KEY_SHAPE.match(key):
-        return Response(status_code=404)
-    signature = str(request.query_params.get("t") or "")
-    expected = media_sign(key)
-    if not (expected and hmac.compare_digest(signature, expected)):
-        require_read_auth(authorization)
-    src = VOICE_MEDIA_DIR / key
-    if not src.exists():
-        return Response(status_code=404)
-    out = SPEC_CACHE / f"clip-{key}.png"
-    if not out.exists():
-        if not await asyncio.to_thread(_render_spectrogram, src, out):
-            return Response(status_code=404)
-    return Response(out.read_bytes(), media_type="image/png",
-                    headers={"Cache-Control": "private, max-age=86400"})
+# #994: THE SECOND /media/{key}/spec IS GONE.
+#
+# It was declared twice: media_spectrogram (#696) and, here, media_spec
+# (#455). Starlette matches routes in REGISTRATION order and takes the
+# first hit, so #696 - declared several hundred lines earlier - served
+# every request and this one had never run since the day it was added.
+# Both did the same job, so nothing looked broken; the cost was that
+# edits made here were edits to nothing.
+#
+# #696 is the one kept, and it is the better of the two on both counts
+# that matter: it PRUNES its cache to the newest 400 pictures, where this
+# one grew without limit, and it answers with FileResponse rather than
+# reading the whole png into memory to send it.
+#
+# _render_spectrogram and SPEC_CACHE are NOT removed with it - the tape
+# road (see _tape_spec) and the voice-sample road still use both.
 
 
 def safe_key(key: str) -> str:
@@ -53430,11 +53714,20 @@ async def dj_drain_api(
 @app.get("/api/dj/voice")
 async def dj_voice_api(
     since: int = 0,
+    br: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """DJ lines as audio, for the browser to play over the track. In box
     mode the feed used to be empty by definition — now it carries the
-    diverted lines the box declined (#314), so speech never vanishes."""
+    diverted lines the box declined (#314), so speech never vanishes.
+
+    #999: `br` is the listener's chosen bitrate, and naming it HERE is
+    what keeps the encoder off the hot path. This is the moment a clip
+    becomes known to that listener, and its broadcast instant is
+    VOICE_BROADCAST_LEAD_MS in the future — so the encode gets the whole
+    lead to finish in, and the fetch that follows finds a file already
+    written. A rate we do not recognise, or an encoder that is missing,
+    simply means the original is served."""
     require_read_auth(authorization)
     server_ms = int(time.time() * 1000)
     clips = []
@@ -53443,6 +53736,15 @@ async def dj_voice_api(
             continue
         clips.append({**clip, "broadcast_ms": int(clip.get("broadcast_ms")
             or int(clip["ts"]) + VOICE_BROADCAST_LEAD_MS)})
+    # #999: `br` is declared a STRING and validated by low_rate, not by
+    # FastAPI. Typed `int`, a junk or empty value is a 422 on the
+    # listener's only route - and low_rate's whole job is to be the one
+    # place a client number becomes a bitrate.
+    #
+    # This no longer STARTS the encode (low_ready_soon does that, when
+    # the audio is made). It only records that somebody is listening at
+    # this rate, which is what tells the store-time hook what to make.
+    low_note_rate(br)
     return {"server_ms": server_ms, "clips": clips}
 
 
@@ -53466,15 +53768,56 @@ async def dj_monitor_api(
     return {"monitor": bool(_RADIO["monitor"])}
 
 
+# #1000: THE THIRD BANDWIDTH TERM, AND ON A BAD LINK THE LARGEST.
+#
+# The public radio page polls this every three seconds. Measured live:
+# 120,106 bytes a poll - 32 KB/s, about 261 kbit/s, which is comparable
+# to the entire audio stream it is meant to be describing. Nothing
+# compresses it; there is no gzip middleware anywhere in this file.
+#
+# Almost none of it is read. The page touches nine keys off `state`
+# (now, on, elapsed, listeners, station, server_ms, started_ms,
+# gallery_now, chat) and the rest is the panel's: chat alone is 75,657
+# bytes of a 240-row ring, of which patter() renders `.slice(-14)`, and
+# dialogue_flow, last_said, upcoming, activity_log, vector_access and
+# the rest add another 41 KB that the page has no code to look at.
+#
+# So the LISTENER asks for a lean payload. The panel is unchanged and
+# still gets everything - this is opt-in, by query parameter, and the
+# default is exactly what it always was.
+DJ_LEAN_DROP = ("dialogue_flow", "last_said", "upcoming", "activity_log",
+                "vector_access", "repair_log", "stream_now", "airtime",
+                "history", "pipeline")
+DJ_LEAN_CHAT = 20               # patter() renders 14; this is the margin
+
+
+def dj_state_lean(state: dict[str, Any]) -> dict[str, Any]:
+    """The same state with everything the radio page cannot read taken
+    out of it. Deliberately a DENY list, not an allow list: a new key
+    added upstairs keeps reaching the page, so this can never silently
+    starve it of something it has started using."""
+    lean = {k: v for k, v in state.items() if k not in DJ_LEAN_DROP}
+    chat = lean.get("chat")
+    if isinstance(chat, list) and len(chat) > DJ_LEAN_CHAT:
+        lean["chat"] = chat[-DJ_LEAN_CHAT:]
+    return lean
+
+
 @app.get("/api/dj")
 async def dj_status(
     listener: str = "",
+    lean: str = "",
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
     if listener:
         _radio_listeners(listener[:64])
-    return dj_state()
+    state = dj_state()
+    # A string, not a bool: FastAPI would 422 a listener who sent
+    # anything unexpected, and this is the page's only status route.
+    if str(lean or "").strip() not in ("", "0", "false", "no"):
+        return dj_state_lean(state)
+    return state
 
 
 @app.get("/radio", response_class=HTMLResponse)
@@ -64136,10 +64479,21 @@ _STORAGE_REGISTRY: tuple[dict[str, Any], ...] = (
               "store the whole show plays out of. Already rolls itself, but "
               "a ceiling here is the one that decides how deep the "
               "backlog goes."},
+    {"key": "listener_bitrates", "group": "Voice", "dir": "LOW_CACHE",
+     "purge": True, "label": "Listener low-bitrate copies",
+     "holds": "Compressed mp3 copies of rendered lines, one per bitrate a "
+              "listener has chosen, so a phone on a slow link is not sent "
+              "raw PCM. Rebuilt on demand; nothing here is a master. "
+              "(#999: it lives in a SUBDIRECTORY of the clip store, which "
+              "means the ordinary clip prune cannot see it \u2014 the same "
+              "reason the spectrogram caches are listed separately.)"},
     {"key": "clip_spectrograms", "group": "Voice", "dir": "SPEC_CACHE",
-     "purge": True, "label": "Clip waveform pictures",
-     "holds": "One spectrogram png per clip, so the backlog shows the shape "
-              "of the audio without playing it. Redrawn on demand."},
+     "purge": True, "label": "Tape and sample waveform pictures",
+     "holds": "Spectrograms of the mixtapes and of the voice-library "
+              "samples. Redrawn on demand. (#994: this area used to be "
+              "described as one picture per rendered clip, which was only "
+              "ever true of a duplicate route that never ran — the "
+              "line pictures live in Broadcast waveform pictures.)"},
     {"key": "tape_cache", "group": "Voice", "dir": "TAPE_CACHE",
      "purge": True, "label": "Mixtape transcodes",
      "holds": "Loudness-normalized copies of the MX tapes, made so every "
@@ -105957,6 +106311,23 @@ RADIO_PAGE_HTML = r"""<!doctype html>
              oninput="setLevels()" onchange="setLevels()">
       <span class="val" id="lvVoiceVal">100%</span>
     </div>
+    <!-- #999: the LISTENER's bitrate, not the station's. Two people on
+         two different links must be able to choose differently, so this
+         never becomes server state - it rides the clip URL as ?br= and
+         lives in this browser's localStorage, exactly like the two
+         sliders above it. -->
+    <div class="lev">
+      <label for="lvRate">📶 quality</label>
+      <select id="lvRate" onchange="setRate()">
+        <option value="96">Standard · 96k</option>
+        <option value="128">High · 128k</option>
+        <option value="64">Low · 64k</option>
+        <option value="48">Mobile · 48k</option>
+        <option value="32">Trickle · 32k</option>
+        <option value="0">Original · uncompressed</option>
+      </select>
+      <span class="val" id="lvRateVal"></span>
+    </div>
   </div>
 
   <div class="dial">
@@ -106081,6 +106452,51 @@ function setLevels(save) {
   applyLevels();
 }
 
+/* #999: THE LISTENER'S BITRATE.
+ *
+ * A voice clip is raw 24 kHz mono 16-bit PCM - 384 kbit/s - and the
+ * record alongside it averages another 321. That is what a car on a
+ * Tailscale link was being asked to pull. This picks a cached mp3 of the
+ * DJ audio instead: 96k is a quarter of the bytes and 32k still carries
+ * speech.
+ *
+ * It defaults to 96 rather than to the original deliberately. The
+ * complaint is that the DEFAULT stutters, and a toggle nobody finds
+ * fixes nothing; anyone on the same LAN who wants the uncompressed
+ * article can say so, and the choice sticks per browser.
+ *
+ * A miss is never a delay: the server serves the original and encodes in
+ * the background, so the worst case is today's byte count. */
+let voiceRate = 96;
+
+function clipUrl(url) {
+  const u = String(url || "");
+  if (!u || !voiceRate) return u;
+  return u + (u.indexOf("?") >= 0 ? "&" : "?") + "br=" + voiceRate;
+}
+
+function setRate(save) {
+  const r = document.getElementById("lvRate");
+  if (!r) return;
+  voiceRate = Number(r.value) || 0;
+  const label = document.getElementById("lvRateVal");
+  if (label) {
+    label.textContent = voiceRate ? voiceRate + "k" : "raw";
+  }
+  try { localStorage.pbfmRate = String(voiceRate); } catch (e) {}
+}
+
+function initRate() {
+  const r = document.getElementById("lvRate");
+  if (!r) return;
+  let saved = null;
+  try { saved = localStorage.pbfmRate; } catch (e) { saved = null; }
+  if (saved != null && r.querySelector('option[value="' + saved + '"]')) {
+    r.value = String(saved);
+  }
+  setRate();
+}
+
 function initLevels() {
   const m = document.getElementById("lvMusic");
   const v = document.getElementById("lvVoice");
@@ -106096,6 +106512,7 @@ function initLevels() {
     if (saved.pbfmVoice != null) v.value = saved.pbfmVoice;
   }
   setLevels();
+  initRate();                                                   // #999
 }
 
 // A shared tune-in link hands this page a TOKEN, not the key (#632). It
@@ -106204,6 +106621,30 @@ function retime(now, serverMs, startedMs, seconds) {
   }
   if (audio.paused && !audio.ended) audio.play().catch(() => {});
   const drift = audio.currentTime - target;
+  /* #998: DO NOT RE-SEEK A RECORD THAT IS MERELY BUFFERING.
+   *
+   * This is a self-feeding stall, and the server side of it is already
+   * documented in _range_stream(): "Every spurious client seek re-issued
+   * that same whole-file range, which is how one hiccup became the stall
+   * heard in the car." #883 fixed the server half; this is the client
+   * seek that triggers it.
+   *
+   * While the element is starved, currentTime FREEZES and target keeps
+   * running, so drift crosses 3.5 within four seconds of any stall - and
+   * the hard seek below then throws away whatever had been buffered and
+   * re-issues the range, which starves it again. A stall guaranteed a
+   * seek and a seek guaranteed a stall.
+   *
+   * readyState < HAVE_FUTURE_DATA means "cannot play on from here right
+   * now", which is exactly the state in which a seek is the wrong move:
+   * the drift is not a clock error, it is the download. Leave it alone
+   * and let it fill. Once it can play again, the ordinary nudge below
+   * closes whatever gap is left without discarding a byte. */
+  const starved = audio.readyState < 3;
+  if (starved) {
+    if (audio.playbackRate !== 1) audio.playbackRate = 1;
+    return;
+  }
   if (Math.abs(drift) > 3.5) {
     audio.currentTime = Math.max(0, target);   // too far gone to nudge
     audio.playbackRate = 1;
@@ -106265,7 +106706,9 @@ function patter(state) {
 
 async function poll() {
   try {
-    const state = await api("/api/dj?listener=" + ME);
+    // #1000: lean=1 - the nine keys this page actually reads, and the
+    // tail of the chat ring rather than all 240 rows of it.
+    const state = await api("/api/dj?lean=1&listener=" + ME);
     stateAt = Date.now();
     sync(state);
     renderGallery(state);
@@ -106275,12 +106718,24 @@ async function poll() {
   }
   if (!playing) return;
   try {
-    const data = await api("/api/dj/voice?since=" + voiceSeen);
+    // #999: tell the server the rate too, so it can start the encode
+    // during the broadcast lead rather than when the clip is asked for.
+    const data = await api("/api/dj/voice?since=" + voiceSeen
+                           + (voiceRate ? "&br=" + voiceRate : ""));
     const serverMs = Number(data.server_ms || Date.now());
     (data.clips || []).forEach((clip) => {
       voiceSeen = Math.max(voiceSeen, clip.ts);
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
-      if (clip.url) voiceQueue.push(clip);
+      if (clip.url) {
+        // #999: stamp the listener's rate on ONCE, here, so the prefetch
+        // and the play use the identical URL and the cache lines up.
+        clip.url = clipUrl(clip.url);
+        voiceQueue.push(clip);
+        // #998: START THE DOWNLOAD NOW, NOT AT AIR TIME. This is the
+        // earliest instant the clip is known to exist, which is what the
+        // seven-second broadcast lead was created to buy.
+        voicePrefetch(clip.url);
+      }
     });
     voiceNext();
   } catch (error) { /* the show goes on */ }
@@ -106291,19 +106746,76 @@ async function poll() {
 // last one. They queue and take their turn (#175, #208).
 const voiceQueue = [];
 let voiceBusy = false;
+let voiceTimer = null;
+
+/* #998: THE SEVEN-SECOND LEAD WAS BEING SPENT ASLEEP.
+ *
+ * VOICE_BROADCAST_LEAD_MS exists, in its own words, so that "a shared
+ * on-air instant gives each listener time to fetch a clip". This page
+ * never fetched anything during it: voiceNext() put the clip back and
+ * called setTimeout(voiceNext, waitForAir), and the network was not
+ * touched until `voice.src = clip.url` at the moment the line was
+ * already due. On a good link that is invisible. Over Tailscale from a
+ * car it is the whole complaint - the clip starts arriving exactly when
+ * it should already be playing, and the handler below then chopped its
+ * head off or threw it away for being late.
+ *
+ * So the bytes are pulled into a blob the instant the clip is announced,
+ * and at air time the element is handed something already in memory.
+ * One <audio> element still does the playing, which matters: the gain
+ * graph in listenerGain() is wired to it once and must not be rebuilt.
+ */
+const voiceCache = new Map();           // url -> Promise<objectURL|null>
+const VOICE_CACHE_MAX = 12;
+
+function voicePrefetch(url) {
+  if (!url) return null;
+  if (voiceCache.has(url)) return voiceCache.get(url);
+  const job = fetch(url, {credentials: "same-origin"})
+    .then((r) => (r.ok ? r.blob() : null))
+    .then((b) => (b ? URL.createObjectURL(b) : null))
+    .catch(() => null);
+  voiceCache.set(url, job);
+  // A listener left on all day must not accumulate blobs. The queue is
+  // only ever a few deep, so anything this far back has already aired.
+  while (voiceCache.size > VOICE_CACHE_MAX) {
+    const oldest = voiceCache.keys().next().value;
+    if (oldest === undefined) break;
+    voiceRelease(oldest);
+  }
+  return job;
+}
+
+function voiceRelease(url) {
+  const job = voiceCache.get(url);
+  if (!job) return;
+  voiceCache.delete(url);
+  Promise.resolve(job).then((obj) => {
+    if (obj) { try { URL.revokeObjectURL(obj); } catch (e) {} }
+  });
+}
 
 function voiceNext() {
   if (voiceBusy || !voiceQueue.length) return;
-  const clip = voiceQueue.shift();
-  voiceBusy = true;
+  // #998: PEEK. This used to shift the clip off and unshift it back on
+  // every time it was too early, and each pass armed another timer.
+  const clip = voiceQueue[0];
+  // Whatever is coming, start pulling it now - and warm the couple
+  // behind it too, because a banter round arrives as one poll.
+  voicePrefetch(clip.url);
+  for (let i = 1; i < Math.min(voiceQueue.length, 3); i += 1) {
+    voicePrefetch(voiceQueue[i].url);
+  }
   const broadcastAt = Number(clip.broadcastAt || Date.now());
   const waitForAir = broadcastAt - Date.now();
   if (waitForAir > 25) {
-    voiceQueue.unshift(clip);
-    voiceBusy = false;
-    setTimeout(voiceNext, waitForAir);
+    if (voiceTimer) clearTimeout(voiceTimer);
+    voiceTimer = setTimeout(() => { voiceTimer = null; voiceNext(); },
+                            waitForAir);
     return;
   }
+  voiceQueue.shift();
+  voiceBusy = true;
   // Duck the music under the DJ, exactly like a real one talking over it.
   // A flag, not a captured level: the old version read audio.volume before
   // the first clip of a run and wrote it back after, which meant a slider
@@ -106316,19 +106828,44 @@ function voiceNext() {
     ducking = false;
     applyLevels();
   };
-  voice.onended = done;
-  voice.onerror = done;
+  const finish = () => { voiceRelease(clip.url); done(); };
+  voice.onended = finish;
+  voice.onerror = finish;
   voice.onloadedmetadata = () => {
+    /* #998: A LATE LINE IS STILL A LINE.
+     *
+     * This handler used to DELETE any clip that arrived within 0.15s of
+     * its own length (done(); return) and chop the head off anything
+     * more than 0.12s late (voice.currentTime = lateBy). Both exist to
+     * hold the shared on-air instant, which is right for a room full of
+     * synchronised speakers and wrong for one person in a car: it turned
+     * "slightly late" into "started mid-syllable", and "late" into
+     * "never said at all". With the prefetch above, most lines are no
+     * longer late at all; when one still is, being a second behind the
+     * rest of the world is a far smaller loss than being decapitated.
+     *
+     * The seek is kept for a genuinely stale clip - one late by more
+     * than a second - and lands a quarter-second EARLY so a word never
+     * begins part-way through. A clip is only abandoned when there is
+     * honestly nothing of it left to play. */
     const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
-    if (isFinite(voice.duration) && lateBy >= voice.duration - 0.15) {
-      done(); return;
+    if (isFinite(voice.duration) && lateBy >= voice.duration) {
+      finish(); return;
     }
-    if (lateBy > 0.12 && isFinite(voice.duration)) {
-      try { voice.currentTime = lateBy; } catch (e) {}
+    if (lateBy > 1.0 && isFinite(voice.duration)) {
+      try { voice.currentTime = Math.max(0, lateBy - 0.25); } catch (e) {}
     }
   };
-  voice.src = clip.url;
-  voice.play().catch(done);
+  // #998: hand it bytes that are already here if the prefetch finished,
+  // and otherwise WAIT for it rather than issuing a second request for
+  // the same audio - the one in flight is already the fastest route.
+  Promise.resolve(voicePrefetch(clip.url)).then((obj) => {
+    voice.src = obj || clip.url;
+    voice.play().catch(finish);
+  }).catch(() => {
+    voice.src = clip.url;
+    voice.play().catch(finish);
+  });
 }
 
 function tune() {
