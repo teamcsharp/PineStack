@@ -13398,6 +13398,21 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
                      else player)
     if _music_entity.startswith("media_player."):
         _want = round(music_box_level(), 3)
+        # #993: "Do not reset the volume that I set on the physical
+        # device." #971 set this before EVERY record, which meant the
+        # operator could turn the knob on the Nabu itself and have the
+        # station put it back at the top of the next track - every three
+        # minutes, for ever.
+        #
+        # The station's level is a SETTING, and a setting only needs
+        # sending when it CHANGES. So this fires on the first record after
+        # a change and then leaves the device alone, and a hand on the
+        # physical dial stays where it was put. Moving the app's Music
+        # slider is what makes the station speak up again.
+        if (_MUSIC_LEVEL_SET.get("at") == _want
+                and _MUSIC_LEVEL_SET.get("ok")):
+            _music_entity = ""          # said once, and it took; hands off
+    if _music_entity.startswith("media_player."):
         try:
             async with httpx.AsyncClient(timeout=8.0) as _vc:
                 _vr = await _vc.post(
@@ -13411,13 +13426,16 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
             _MUSIC_LEVEL_SET["why"] = str(_ve)[:160]
         # Say it ONCE per change, not once per record - this runs on every
         # track and the glass would be nothing else.
-        if _MUSIC_LEVEL_SET.get("at") != _want or not _ok:
-            _MUSIC_LEVEL_SET["at"] = _want
-            _MUSIC_LEVEL_SET["ok"] = bool(_ok)
+        _said = (_MUSIC_LEVEL_SET.get("at") != _want
+                 or _MUSIC_LEVEL_SET.get("ok") != _ok)
+        _MUSIC_LEVEL_SET["at"] = _want
+        _MUSIC_LEVEL_SET["ok"] = bool(_ok)
+        if _said:
             if _ok:
                 pipeline_log("voice", f"records set to {int(_want * 100)}% on "
-                             f"{_music_entity.split('.')[-1]} - the DJs are "
-                             "not touched by it (#971)")
+                             f"{_music_entity.split('.')[-1]} once - the DJs "
+                             "are not touched by it, and the dial on the "
+                             "device is left alone from here (#971/#993)")
             else:
                 pipeline_log("drop", "could not set the record level on "
                              f"{_music_entity}: "
