@@ -56823,6 +56823,144 @@ async def api_coord_road(
     return coord_road_report(road)
 
 
+def _floor_marker_who(marker: str) -> str:
+    """The seat a round's turn marker belongs to - the same mapping
+    dj_pending uses, in one place so the two never drift."""
+    return ("caller" if marker == "C" else "caller2" if marker == "E"
+            else "dj" if marker == "A"
+            else "third" if marker == "D" else "cohost")
+
+
+def recording_floor(latest: int = 10) -> dict[str, Any]:
+    """#972/#959: WHO IS IN THE RECORDING ROOM, AND WHAT HAVE THEY JUST CUT.
+
+    Two questions the room could not answer about itself. It reported
+    totals per actor - takes, airtime, engine cost - and the one segment
+    at the microphone this instant, and nothing at all about who is
+    QUEUED: which actors have lines written and waiting, how many, and
+    for which segment. That is the sheet an operator reads to know
+    whether the room is about to be busy or idle.
+
+    Read-only and cheap: it re-parses the banked scripts the same way
+    dj_pending does and counts what is still owed against what each entry
+    has already recorded. No model call, no engine, nothing written."""
+    out: dict[str, Any] = {"now": {}, "cast": [], "latest": []}
+    try:
+        out["now"] = prep_now() or {}
+    except Exception:  # noqa: BLE001
+        out["now"] = {}
+    # --- who is queued, and what for ------------------------------------
+    by: dict[str, dict[str, Any]] = {}
+
+    def _want(who: str) -> dict[str, Any]:
+        return by.setdefault(who, {
+            "who": who, "name": booth_actor_name(who, ""),
+            "lines": 0, "rounds": 0, "roads": [], "peek": ""})
+
+    def _walk(entry: dict[str, Any], label: str) -> None:
+        try:
+            if entry.get("prepared"):
+                return
+            turns = banter_turns(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or ""))
+            if not turns:
+                return
+            done: dict[str, int] = {}
+            for t in (entry.get("takes") or []):
+                seat = str(t.get("who") or "")
+                done[seat] = done.get(seat, 0) + 1
+            owed: dict[str, int] = {}
+            for marker, _text in turns:
+                seat = _floor_marker_who(marker)
+                owed[seat] = owed.get(seat, 0) + 1
+            for seat, n in owed.items():
+                left = n - int(done.get(seat, 0))
+                if left <= 0:
+                    continue
+                row = _want(seat)
+                row["lines"] += left
+                row["rounds"] += 1
+                if label and label not in row["roads"]:
+                    row["roads"].append(label)
+                if not row["peek"]:
+                    for marker, text in turns:
+                        if _floor_marker_who(marker) == seat:
+                            row["peek"] = spoken_text(text)[:140]
+                            break
+        except Exception:  # noqa: BLE001
+            return
+
+    try:
+        for entry in list(_LARDER):
+            _walk(entry, SHELF_LABEL.get(
+                str(entry.get("prep_kind") or "banter"), "booth rounds"))
+        for kind in ("manager", "caller", "gallery", "news"):
+            for row in list(_SHELF.get(kind) or []):
+                held = row.get("entry")
+                if isinstance(held, dict):
+                    _walk(held, SHELF_LABEL.get(kind, kind))
+        # The one-line roads do not carry a script to parse; they are one
+        # read apiece, and the seat is fixed.
+        for kind, seat in (("ad", "dj"), ("station_id", "drop")):
+            waiting = shelf_unvoiced(kind)
+            if waiting:
+                row = _want(seat)
+                row["lines"] += waiting
+                lbl = SHELF_LABEL.get(kind, kind)
+                if lbl not in row["roads"]:
+                    row["roads"].append(lbl)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _now_who = str((out.get("now") or {}).get("who") or "")
+        for row in by.values():
+            row["at_the_mic"] = bool(_now_who and row["who"] == _now_who)
+        out["cast"] = sorted(by.values(), key=lambda r: -int(r["lines"]))
+    except Exception:  # noqa: BLE001
+        out["cast"] = list(by.values())
+    # --- and the last lines actually cut --------------------------------
+    try:
+        keep = max(1, min(50, int(latest or 10)))
+        for t in list(_TAKES)[-keep:][::-1]:
+            media = str(t.get("media") or "")
+            out["latest"].append({
+                "at": float(t.get("at") or 0),
+                "ago": round(time.time() - float(t.get("at") or 0), 1),
+                "who": str(t.get("who") or ""),
+                "name": str(t.get("name") or ""),
+                "voice": str(t.get("voice") or ""),
+                "engine": str(t.get("engine") or ""),
+                "text": str(t.get("text") or ""),
+                "seconds": float(t.get("seconds") or 0),
+                "how": str(t.get("how") or ""),
+                "cost": t.get("cost"),
+                # #964 put the audio's signed name on the ledger; this is
+                # what makes "download the line I just heard" possible.
+                # Named the way the panel's own take row already expects
+                # them, so #959's list reuses that row rather than growing
+                # a second one that would drift out of step with it.
+                "media": media,
+                "sig": str(t.get("sig") or ""),
+                "url": (f"/media/{media}?t={t.get('sig')}"
+                        if media and t.get("sig") else ""),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+@app.get("/api/recording-room/floor")
+async def api_recording_floor(
+    latest: int = 10,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#972/#959: who is in the recording room, who is queued for it, and
+    the last lines that came out of it - each with a link to its audio."""
+    require_read_auth(authorization)
+    return recording_floor(latest)
+
+
 @app.get("/api/recording-room/rows/{kind}")
 async def api_recording_room_rows(
     kind: str,

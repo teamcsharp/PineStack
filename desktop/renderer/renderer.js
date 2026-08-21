@@ -2511,6 +2511,66 @@ function initWorksPopup() {
     }
   }
 
+  /* #972 - WHO IS IN THE RECORDING ROOM, AS PEOPLE.
+   *
+   * "put silhouette icons of people here next to each other representing
+   * the amount of people in the recording room or who's in the recording
+   * room. And then when I hover over it, show me a pop up that tells me
+   * who's in a recording room and what lines that they're scheduled to
+   * record and what they're recording the lines for."
+   *
+   * One figure per actor who has lines written and waiting. The one
+   * actually at the microphone this instant is lit; the rest are queued.
+   * The count IS the row of figures, so "how busy is the room" is
+   * answerable without reading a number.
+   */
+  function wkCastMarks(flow) {
+    const cast = (wkFloor && wkFloor.cast) || [];
+    let box = wkBox["cast:marks"];
+    if (!box) {
+      box = mk("div", "");
+      box.style.cssText = "display:flex;gap:3px;align-items:center;"
+        + "margin:2px 0 0 2px;min-height:14px;font-size:12px;"
+        + "cursor:default";
+      wkBox["cast:marks"] = box;
+      flow.appendChild(box);
+    }
+    const sig = JSON.stringify(cast.map((c) => [c.who, c.lines, c.rounds,
+                                                c.at_the_mic]));
+    if (box.wkSig === sig) return;
+    box.wkSig = sig;
+    box.textContent = "";
+    if (!cast.length) {
+      const none = mk("span", "wk-note", "nobody is waiting to record");
+      none.style.cssText = "font-size:9.5px;opacity:.55";
+      box.appendChild(none);
+      return;
+    }
+    cast.forEach((c) => {
+      const who = mk("span", "", c.at_the_mic ? "\u{1F399}" : "\u{1F464}");
+      who.style.cssText = "line-height:1;filter:grayscale("
+        + (c.at_the_mic ? "0" : ".55") + ");opacity:"
+        + (c.at_the_mic ? "1" : ".8");
+      /* A native title is the popup here on purpose: it cannot be
+       * clipped by the flow's scroll box, it survives the 2.5-second
+       * repaint, and it costs no layout in a panel where #890 already
+       * had to fight for room. */
+      who.title = (c.name || c.who) + " \u2014 " + c.lines + " line(s) to "
+        + "record across " + c.rounds + " round(s)"
+        + (c.at_the_mic ? "\n\u25cf at the microphone now" : "")
+        + ((c.roads && c.roads.length)
+           ? "\n\nfor: " + c.roads.join(", ") : "")
+        + (c.peek ? "\n\nnext up:\n\u201c" + c.peek + "\u201d" : "");
+      box.appendChild(who);
+    });
+    const tally = mk("span", "wk-note", "");
+    tally.style.cssText = "font-size:9.5px;opacity:.6;margin-left:4px";
+    const lines = cast.reduce((n, c) => n + Number(c.lines || 0), 0);
+    tally.textContent = cast.length + " waiting \u00b7 " + lines + " line(s)";
+    tally.title = "Hover a figure for who they are and what they owe";
+    box.appendChild(tally);
+  }
+
   function stage(flow, title, num, note, cls, frac, key, fill_) {
     /* #883/#887: made once, keyed, and updated in place from then on.
      * The drawer is moved in ONCE - re-adopting it on every paint is what
@@ -2707,6 +2767,7 @@ function initWorksPopup() {
     // 2 — the reserve of written scripts  (#864: opens onto the rounds)
     const target = Number(f.target || 6);
     const have = Number(f.ready || 0);
+    wkCastMarks(flow);                                          // #972
     stageSafe(flow, "② the reserve — written scripts",
       have + " / " + target,
       rows.length
@@ -2862,6 +2923,27 @@ function initWorksPopup() {
           try {
             const last = ((rr && rr.recent) || [])[0] || null;
             if (last) wkLastLine(drawer, last);
+          } catch (e) { /* the rest of the room still draws */ }
+          /* #959: "list all of the latest lines that have been recorded
+           * and download individual lines that have just been recorded.
+           * In a list listing the last ten entries that have been
+           * captured." Same row as the one above it - play, save, read -
+           * so a line found here behaves exactly like the last one made. */
+          try {
+            const cut = (wkFloor && wkFloor.latest) || [];
+            if (cut.length) {
+              const lh = mk("div", "wk-note",
+                            "THE LAST " + cut.length + " LINES CAPTURED");
+              lh.style.cssText = "font-size:9px;letter-spacing:.05em;"
+                + "margin:7px 0 2px;opacity:.8";
+              drawer.appendChild(lh);
+              const list = mk("div", "");
+              list.style.cssText = "display:flex;flex-direction:column;gap:3px";
+              cut.forEach((t) => {
+                try { wkLastLine(list, t, ""); } catch (e) { /* next */ }
+              });
+              drawer.appendChild(list);
+            }
           } catch (e) { /* the rest of the room still draws */ }
           const acts = (rr && rr.actors) || [];
           if (acts.length) {
@@ -3071,6 +3153,11 @@ function initWorksPopup() {
     body.wkFault = null;
   }
 
+  /* #972/#959: the recording-room floor, refreshed with the rest of the
+   * flow and read by two stages - the silhouettes on the reserve and the
+   * last-lines list in the recording room. */
+  let wkFloor = null;
+
   async function load(body) {
     let dj = null;
     let pend = null;
@@ -3078,9 +3165,14 @@ function initWorksPopup() {
       const got = await Promise.all([
         api.get("/api/dj"),
         api.get("/api/dj/pending"),
+        /* #972/#959: who is queued for the recording room, and the last
+         * lines out of it. Caught on its own so an older station that
+         * does not serve this route still paints everything else. */
+        api.get("/api/recording-room/floor?latest=10").catch(() => null),
       ]);
       dj = got[0];
       pend = got[1];
+      wkFloor = got[2] || null;
     } catch (e) {
       /* #933: THIS is unreachable — and it says what the transport said
        * rather than leaving the operator to guess between a dead station
@@ -4089,17 +4181,23 @@ function wkPurgePop(anchor) {
  * you have just watched being cut, without leaving the window. The take
  * ledger carries the signed media name since #964, so this needs no
  * second round trip. */
-function wkLastLine(host, take) {
+function wkLastLine(host, take, head) {
   const mk = (tag, cls, text) => {
     const n = document.createElement(tag);
     if (cls) n.className = cls;
     if (text != null) n.textContent = text;
     return n;
   };
-  const h = mk("div", "wk-note", "THE LAST LINE MADE");
-  h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:7px 0 2px;"
-    + "opacity:.8";
-  host.appendChild(h);
+  /* #959: the heading is optional now, so the same row can be used once
+   * for "the last line made" and ten times for the list below it -
+   * rather than growing a second take row that would drift out of step
+   * with this one's play/save/transcript behaviour. */
+  if (head !== "") {
+    const h = mk("div", "wk-note", head || "THE LAST LINE MADE");
+    h.style.cssText = "font-size:9px;letter-spacing:.05em;margin:7px 0 2px;"
+      + "opacity:.8";
+    host.appendChild(h);
+  }
   const row = mk("div", "");
   row.style.cssText = "display:flex;align-items:center;gap:6px;"
     + "font-size:10px;line-height:1.5;padding:5px 7px;border-radius:6px;"
