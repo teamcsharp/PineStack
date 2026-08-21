@@ -59212,6 +59212,64 @@ async def call_sheet(hours: float = 3.0) -> dict[str, Any]:
     return out
 
 
+# #975: THE DOCUMENTS, READABLE BY WHATEVER IS WORKING ON THE STATION.
+#
+# "able to express and explain to any LLM how to utilize these systems and
+# expand on them" - which means the documents have to be reachable from
+# inside the station, not only from a checkout of the repository. They are
+# plain markdown in ./docs and this serves them read-only, by name, with
+# no path traversal: the name is matched against the directory listing
+# rather than joined onto it.
+DOCS_DIR = Path(__file__).resolve().parent / "docs"
+
+
+def docs_list() -> list[dict[str, Any]]:
+    try:
+        rows = []
+        for path in sorted(DOCS_DIR.glob("*.md")):
+            head = ""
+            try:
+                for line in path.read_text(encoding="utf-8").splitlines():
+                    if line.startswith("# "):
+                        head = line[2:].strip()
+                        break
+            except Exception:  # noqa: BLE001
+                head = ""
+            rows.append({"name": path.name, "title": head or path.stem,
+                         "bytes": path.stat().st_size})
+        return rows
+    except Exception:  # noqa: BLE001
+        return []
+
+
+@app.get("/api/docs")
+async def api_docs(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#975: the documents explaining how this station works."""
+    require_read_auth(authorization)
+    return {"documents": docs_list(), "where": str(DOCS_DIR)}
+
+
+@app.get("/api/docs/{name}")
+async def api_doc(
+    name: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#975: one document, whole."""
+    require_read_auth(authorization)
+    want = str(name or "").strip()
+    for row in docs_list():
+        if row["name"] == want:
+            try:
+                return {"name": want, "title": row["title"],
+                        "text": (DOCS_DIR / want).read_text(encoding="utf-8")}
+            except Exception as exc:  # noqa: BLE001
+                raise HTTPException(status_code=500,
+                                    detail=f"{type(exc).__name__}") from exc
+    raise HTTPException(status_code=404, detail="no such document")
+
+
 @app.get("/api/rooms/call-sheet")
 async def api_call_sheet(
     hours: float = 3.0,
