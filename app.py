@@ -21209,6 +21209,132 @@ def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
     return out
 
 
+_COORD_BRIEF: dict[str, Any] = {}
+COORD_BRIEF_EVERY = 45.0
+
+
+def coord_brief() -> dict[str, Any]:
+    """#999: THE CONDUCTOR'S READ OF THE BROADCAST.
+
+    "I want the orchestrator system to be aware of dead air... and to be
+    coming up with solutions for dealing with it on the fly. I want the
+    orchestrator to have his own agent that's helping it analyze and
+    manage the broadcast."
+
+    Awareness and reaction already existed and are good: coord_air_sample
+    measures real dead air rather than the instantaneous silent_for that
+    reads three seconds on a station full of holes (#942), and
+    coord_fill_gap puts a stacked spot into a hole, conservatively enough
+    that the worst it can do is one commercial every four minutes on a
+    station that is otherwise silent (#916d).
+
+    What was missing is the READING - a single place that says what is
+    wrong, why, and what is being done about it, in the order that
+    matters. The measurements were scattered across six endpoints and the
+    operator had to assemble the picture himself.
+
+    DELIBERATELY NOT A MODEL CALL. The engine on this box runs about 2.7x
+    slower than real time and the writing desk is the bottleneck the whole
+    station queues behind; an LLM ticking every minute to narrate the
+    station would be taking writing time away from the show it is
+    narrating in order to describe the show it is starving. Every fact
+    here is already measured, and the judgement is a handful of rules -
+    so it costs nothing and cannot itself become the fault."""
+    now = time.time()
+    cached = _COORD_BRIEF.get("at") or 0
+    if now - float(cached) < COORD_BRIEF_EVERY and _COORD_BRIEF.get("say"):
+        return dict(_COORD_BRIEF)
+    out: dict[str, Any] = {"at": now, "worries": [], "doing": [], "say": ""}
+    try:
+        # --- is the air moving RIGHT NOW ---------------------------------
+        gap = float(_GAP_OPEN.get("seconds") or 0) if _GAP_OPEN else 0.0
+        quiet = max(0.0, now - float(_BOX_LAST_OK[0] or now))
+        out["quiet_for"] = round(quiet, 1)
+        out["gap_open"] = round(gap, 1) if _GAP_OPEN else 0.0
+        if _GAP_OPEN and gap >= COORD_SPOT_AFTER:
+            out["worries"].append(
+                f"the air has been quiet {int(gap)}s during "
+                f"{_GAP_OPEN.get('label') or _GAP_OPEN.get('kind') or 'this entry'}")
+            out["doing"].append("a stacked spot goes in as soon as nothing "
+                                "is speaking or rendering")
+        # --- can the box actually take audio -----------------------------
+        try:
+            held = len(_BOX_HOLD)
+        except Exception:  # noqa: BLE001
+            held = 0
+        out["held"] = held
+        if held >= 3:
+            out["worries"].append(
+                f"{held} finished line(s) are held - the box is taking them "
+                "and playing none of them")
+            out["doing"].append("the page and the app carry the show while "
+                                "the box is wedged (#1006)")
+        # --- what is coming, and is anything made for it ------------------
+        bare: list[str] = []
+        soonest = None
+        try:
+            for up in coord_upcoming(1800.0):
+                if up.get("cannot") or up.get("covered"):
+                    continue
+                if soonest is None or float(up.get("starts_in") or 0) < soonest[0]:
+                    soonest = (float(up.get("starts_in") or 0), up)
+                if up.get("bare"):
+                    bare.append(str(up.get("label") or up.get("road") or ""))
+        except Exception:  # noqa: BLE001
+            pass
+        if soonest:
+            _in, _up = soonest
+            out["next_hole"] = {
+                "label": str(_up.get("label") or ""),
+                "in": round(_in, 1),
+                "owns": float(_up.get("owns_seconds") or 0),
+                "held": float(_up.get("held_seconds") or 0),
+            }
+            if _in < 300 and not float(_up.get("held_seconds") or 0):
+                out["worries"].append(
+                    f"{_up.get('label')} takes the air in {int(_in)}s with "
+                    "nothing recorded for it")
+                out["doing"].append(f"{_up.get('label')} is the deadline the "
+                                    "preparer is working to")
+        if bare:
+            out["bare"] = bare[:4]
+        # --- is the room able to work at all ------------------------------
+        try:
+            if render_relief():
+                out["worries"].append("the clone engine is running slow "
+                                      "enough that the pair are on Piper")
+                out["doing"].append("only cached lines are harvested until "
+                                    "it recovers")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            depth = prepared_seconds()
+            out["banked"] = round(depth, 1)
+            target = prepare_target_seconds()
+            if depth < target * 0.25:
+                out["worries"].append(
+                    f"only {int(depth / 60)} min is banked against the "
+                    f"{int(target / 60)} min the dial asks for")
+                out["doing"].append("the preparer is on the shortest road "
+                                    "that buys the most air")
+        except Exception:  # noqa: BLE001
+            pass
+        # --- the sentence -------------------------------------------------
+        if not out["worries"]:
+            out["say"] = ("the wheels are turning - the air is moving, the "
+                          "box is taking it, and everything coming up has "
+                          "something behind it")
+        else:
+            out["say"] = out["worries"][0]
+            if out["doing"]:
+                out["say"] += " — " + out["doing"][0]
+    except Exception:  # noqa: BLE001
+        out["say"] = "the coordinator could not read the broadcast"
+    _COORD_BRIEF.clear()
+    _COORD_BRIEF.update(out)
+    return dict(out)
+
+
 def coord_road_report(road: str) -> dict[str, Any]:
     """#958: "anytime they're behind, if I click on that, I want to see a
     pop up explaining what is being done."
@@ -57677,6 +57803,16 @@ async def cache_purge_api(
         pass
     return {"ok": True, "dropped": dropped, "freed": freed,
             "state": cache_state()}
+
+
+@app.get("/api/coordinator/brief")
+async def api_coord_brief(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#999: what the conductor makes of the broadcast right now - what is
+    wrong, in the order that matters, and what is being done about each."""
+    require_read_auth(authorization)
+    return coord_brief()
 
 
 @app.get("/api/coordinator/road/{road}")
