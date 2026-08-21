@@ -809,6 +809,13 @@ DEFAULT_DJ = {
     # announce playback, so the panel scales the amplitude we bake into
     # each clip instead. 1.0 = normal, up to 1.6 louder / 0.3 quieter.
     "box_volume": 1.0,
+    # #1001: and the MUSIC level on the box, separately. box_volume is
+    # baked into the amplitude of each spoken clip, which is why it can
+    # never touch the music: a record is not rendered by us, it is a file
+    # the box fetches and plays for itself. So this one is sent to the
+    # media player as a real volume instead. Low by default because that
+    # is what a record under a talk show is for.
+    "music_box_level": 0.35,
     # Whisper the playing song so the pair can talk about its actual
     # lyrics (#451). Off by default — it is CPU on every new track.
     "lyrics_talk": True,
@@ -1386,6 +1393,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
                        DEFAULT_DJ["reply_max_chars"]) or 2500))),
         "box_volume": max(0.3, min(1.6, float(
             raw_dj.get("box_volume", DEFAULT_DJ["box_volume"]) or 1.0))),
+        "music_box_level": max(0.0, min(1.0, float(
+            raw_dj.get("music_box_level",
+                       DEFAULT_DJ["music_box_level"]) or 0.0))),
         "lyrics_talk": bool(raw_dj.get("lyrics_talk",
                                        DEFAULT_DJ["lyrics_talk"])),
         "perf": bool(raw_dj.get("perf", DEFAULT_DJ["perf"])),
@@ -13203,6 +13213,41 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
     if not await satellite_ready():
         return ""                    # nothing to play it on
     url = music_url(track)
+    # #971: set the record's level BEFORE it starts, on the media player
+    # entity only, so the DJs - who go to the satellite by announce - are
+    # untouched. Best effort in every direction: an entity that does not
+    # support volume_set, an older HA, or no answer at all simply means
+    # the record plays at the level it always did.
+    _music_entity = (NABU_MEDIA_PLAYER if player == NABU_SATELLITE
+                     else player)
+    if _music_entity.startswith("media_player."):
+        _want = round(music_box_level(), 3)
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as _vc:
+                _vr = await _vc.post(
+                    f"{HA_URL}/api/services/media_player/volume_set",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json={"entity_id": _music_entity,
+                          "volume_level": _want})
+            _ok = 200 <= _vr.status_code < 300
+        except Exception as _ve:  # noqa: BLE001
+            _ok, _vr = False, None
+            _MUSIC_LEVEL_SET["why"] = str(_ve)[:160]
+        # Say it ONCE per change, not once per record - this runs on every
+        # track and the glass would be nothing else.
+        if _MUSIC_LEVEL_SET.get("at") != _want or not _ok:
+            _MUSIC_LEVEL_SET["at"] = _want
+            _MUSIC_LEVEL_SET["ok"] = bool(_ok)
+            if _ok:
+                pipeline_log("voice", f"records set to {int(_want * 100)}% on "
+                             f"{_music_entity.split('.')[-1]} - the DJs are "
+                             "not touched by it (#971)")
+            else:
+                pipeline_log("drop", "could not set the record level on "
+                             f"{_music_entity}: "
+                             + (f"HTTP {_vr.status_code}" if _vr is not None
+                                else _MUSIC_LEVEL_SET.get("why", "no answer"))
+                             + " - the record plays at its own level (#971)")
     if player == NABU_SATELLITE:
         service = "media_player/play_media"
         payload: dict[str, Any] = {
@@ -35086,6 +35131,37 @@ def box_gain() -> float:
         return 1.0
 
 
+# #971: what we last told the box, so the glass says it once per change
+# rather than once per record.
+_MUSIC_LEVEL_SET: dict[str, Any] = {}
+
+
+def music_box_level() -> float:
+    """#971: HOW LOUD A RECORD IS ON THE BOX, 0..1.
+
+    "the music is broadcasting at full volume from the box when really
+    the volume should be very low coming out of the Nabu device."
+
+    box_gain() cannot answer this. It is an amplitude multiplier baked
+    into clips WE render - _level_voice applies it to speech, and #573
+    extended it to stings and the phone bell - but a record is never
+    rendered by us. music_play_on_box hands the box a URL and the box
+    fetches and plays the file itself, at whatever level the file is;
+    that function's own note says so out loud: "no pause, seek or volume
+    on the box".
+
+    There is a volume, though, and the split between the two entities is
+    what makes it safe. Speech goes to the assist_satellite entity by
+    announce; music is redirected to the MEDIA PLAYER entity
+    (NABU_MEDIA_PLAYER) by play_media. So a volume set on the media
+    player moves the records and cannot touch the DJs."""
+    try:
+        return max(0.0, min(1.0, float(
+            dj_settings().get("music_box_level", 0.35))))
+    except Exception:  # noqa: BLE001
+        return 0.35
+
+
 def _level_voice(raw: bytes) -> bytes:
     """Every spoken clip out the door at the same speech loudness (#306), the
     target scaled by the box-volume slider (#448). Applied to EVERY line now,
@@ -53548,6 +53624,18 @@ async def dj_output_api(
     voice = str(payload.get("voice") or "").strip()
     reply = str(payload.get("reply") or "").strip()
     voice_device = str(payload.get("voice_device") or "").strip()
+    # #971: the Music slider, when the music is going to the box. The
+    # operator pulled it down to a quarter and the Nabu kept playing at
+    # full, because until now those sliders only scaled audio playing in
+    # THIS app - see music_box_level().
+    if payload.get("music_level") is not None:
+        try:
+            _lvl = max(0.0, min(1.0, float(payload.get("music_level"))))
+            _s = load_settings()
+            _s.setdefault("dj", {})["music_box_level"] = _lvl
+            save_settings(_s)
+        except Exception:  # noqa: BLE001
+            pass
     was = str(_RADIO.get("voice_to") or "box")
     for value in (music, voice, reply):
         if value and value not in valid:

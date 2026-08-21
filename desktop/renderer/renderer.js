@@ -308,6 +308,36 @@ function setStreamVolume(stream, fraction, persist = true) {
       player.muted = desktopMusicGain() <= 0;
     }
   } catch (err) { /* the slider still moved */ }
+  // #971: ...and when the music is going to the BOX, the slider has to
+  // reach the box, or it is a control that visibly does nothing. "The
+  // music is broadcasting at full volume from the box when really the
+  // volume should be very low coming out of the Nabu device" - measured
+  // with this very slider at a quarter. Sent to the server, which sets it
+  // on the media player entity before each record; the DJs go to the
+  // satellite by announce and are not touched by it.
+  if (stream === "music" && persist) sendBoxMusicLevel(v);
+}
+
+/* Debounced: this rides an oninput, so a drag would otherwise post on
+ * every pixel. The box only needs the level the slider LANDS on. */
+let boxLevelTimer = null;
+let boxLevelSent = null;
+
+function sendBoxMusicLevel(v) {
+  const route = streamRoute("music");
+  if (route !== "box" && route !== "both") return;
+  if (boxLevelTimer) clearTimeout(boxLevelTimer);
+  boxLevelTimer = setTimeout(() => {
+    boxLevelTimer = null;
+    const level = Math.max(0, Math.min(1, Number(v) || 0));
+    if (boxLevelSent !== null && Math.abs(boxLevelSent - level) < 0.005) return;
+    boxLevelSent = level;
+    api.post("/api/dj/output", {music_level: level})
+      .then(() => noteRouteOk("record level on the "
+        + (lastRouting && lastRouting.voice_device === "nabu"
+           ? "Nabu" : "Pine Box") + " \u2192 " + Math.round(level * 100) + "%"))
+      .catch((err) => noteRouteError(err.message));
+  }, 400);
 }
 
 function initStreamVolumes() {
@@ -328,6 +358,24 @@ function initStreamVolumes() {
  * the box can change it underneath us. */
 function paintStreamRoutes(routing) {
   if (!routing) return;
+  /* #967: "They are being broadcasted to the Nabu. These shouldn't say or
+   * even mention Pine box."
+   *
+   * The three per-stream options are value="box", and "box" here does not
+   * mean the pine satellite - it means THE BROADCAST DEVICE, whichever
+   * one is selected. The label was hardcoded "Pine Box", so with the
+   * device set to Nabu the app offered three pickers all naming a box
+   * that was not being broadcast to.
+   *
+   * (The Broadcast preset above is a different control and is left
+   * alone: there, Pine Box and Nabu really are two separate choices.) */
+  const deviceName = String(routing.voice_device || "") === "nabu"
+    ? "Nabu" : "Pine Box";
+  Object.keys(STREAM_ROUTE_IDS).forEach((stream) => {
+    const select = $(STREAM_ROUTE_IDS[stream]);
+    const opt = select && select.querySelector('option[value="box"]');
+    if (opt && opt.textContent !== deviceName) opt.textContent = deviceName;
+  });
   const now = {music: routing.music_to, voice: routing.voice_to,
                reply: routing.reply_to};
   Object.keys(STREAM_ROUTE_IDS).forEach((stream) => {
