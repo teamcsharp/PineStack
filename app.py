@@ -16061,12 +16061,50 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
         elif clip:
             box_hold(clip, spoken, who, line_id)                # #778
             entry["aired"] = "held"
+            # #1006: AND IT GOES OUT ON THE PAGE THIS INSTANT.
+            #
+            # The line below already knew a wedged box should end with "the
+            # page mirror taking over" - but only AFTER three silent holds
+            # had tripped the breaker and the self-heal had run. Until then
+            # every line went to the hold shelf and nowhere audible at all,
+            # which is the station going quiet while it works out that the
+            # speaker is lying to it.
+            #
+            # A box that accepts and plays nothing is the same fact as a
+            # box that declines, arriving by a quieter road, and #314
+            # settled what to do with a declined line years ago: "a line
+            # that EXISTS as a clip does not vanish - the clip goes out on
+            # the page feed instead". That road was wired for the noisy
+            # failure and not for this one.
+            #
+            # So the app and the browser carry the show from the FIRST
+            # silent line rather than the fourth, the clip is still held
+            # for the box, and nothing waits unheard while the breaker
+            # makes up its mind.
+            if not paged:
+                try:
+                    _RADIO["voice_clips"].append({
+                        "ts": int(time.time() * 1000),
+                        "url": f"{clip['path']}?t={clip['sig']}",
+                        "text": spoken, "engine": engine,
+                        "voice": forced or "",
+                    })
+                    del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+                    paged = True
+                except Exception:  # noqa: BLE001
+                    pass
             # A box that keeps silently ACCEPTING but playing 0% is WEDGED
             # (#559): the announce never errors, so the breaker never opens
             # on its own and clips pile up unheard. Count the silent holds and
             # trip the breaker after a few, so the self-heal fires and the page
             # mirror takes over instead of the show vanishing into a dead box.
             _SILENT_HOLD_STREAK[0] += 1
+            if _SILENT_HOLD_STREAK[0] == 1:
+                pipeline_log("drop", "the box accepted a line and played "
+                             "none of it - it is wedged, not absent. The "
+                             "page and the app carry the show from here "
+                             "and every line is still held for the box "
+                             "(#1006)")
             if _SILENT_HOLD_STREAK[0] >= 3:
                 _SILENT_HOLD_STREAK[0] = 0
                 _box_announce_failed()
