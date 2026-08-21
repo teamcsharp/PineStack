@@ -80237,6 +80237,34 @@ function pvFloat(pop) {
   try {
     if (!pop || pop.dataset.pvFloat) return;
     pop.dataset.pvFloat = "1";
+    /* #978/#1001: TAKE THE TRANSFORM OFF BEFORE TAKING OVER THE POSITION.
+     *
+     * Several panels centre themselves the CSS way - left:50%, top:50%,
+     * transform:translate(-50%,-50%) - and then hand themselves to
+     * pvFloat to be draggable. pvFloat positions in pixels, and the
+     * translate stayed on: so every left it wrote was shifted a further
+     * half-width to the left and half-height up, and fit() then measured
+     * the ALREADY-SHIFTED rect and shifted it again.
+     *
+     * The image-analysis dossier is 580px wide, so it opened 290px left
+     * of wherever it was put - hard against the edge, with its first
+     * character cut off. That is both of the operator's reports: "the
+     * pop-up came up clipped by off-screen elements" and "the pop-up is
+     * being clipped off the side of the screen, so I'm not able to see
+     * it."
+     *
+     * The rect is read FIRST, while the transform is still applied, and
+     * written back as plain pixels - so the panel does not jump when the
+     * centring is removed; it simply stops moving twice. */
+    try {
+      const seen = pop.getBoundingClientRect();
+      const style = window.getComputedStyle(pop);
+      if (style && style.transform && style.transform !== "none") {
+        pop.style.transform = "none";
+        pop.style.left = Math.round(seen.left) + "px";
+        pop.style.top = Math.round(seen.top) + "px";
+      }
+    } catch (e) { /* an un-transformed panel needs none of this */ }
     const fit = () => {
       const r = pop.getBoundingClientRect();
       const mw = window.innerWidth, mh = window.innerHeight;
