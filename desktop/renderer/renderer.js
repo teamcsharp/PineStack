@@ -4855,10 +4855,28 @@ function worksSchedule(anchorPop) {
        * row of columns filling up, and a hollow one is a segment with
        * nothing behind it. The entry ON AIR gets a second, brighter bar
        * showing how far through its own slot the clock is. */
+      /* #965: "If a segment has all of the entries it needs to play, I
+       * want to see that one."
+       *
+       * `p` is the per-KIND shelf, so three Painting-selling entries all
+       * drew the same bar off the one gallery shelf and the second and
+       * third read as stocked while nothing had been made for them.
+       * `slot_prep` is the per-ENTRY figure, with the shelf spent down
+       * across the entries ahead of it - the coordinator has computed it
+       * correctly all along and it was simply never drawn here. */
+      const sp = s.slot_prep || null;
       const need = Math.max(1, Number(s.minutes || 1) * 60);
       row.dataset.kind = String(s.kind || "");
-      const have = Number(p.seconds || 0);
+      const have = sp ? Number(sp.held || 0) : Number(p.seconds || 0);
       const frac = Math.max(0, Math.min(1, have / need));
+      /* #966: "When a segment is a hundred percent ready and able to be
+       * played, I want an animation effect happening over that tile every
+       * three to four seconds just showing that that tile is prepared and
+       * slated." A sheen that crosses the tile, not a flash - twenty
+       * tiles blinking at once would be unreadable. */
+      const slated = !!(sp ? sp.covered : frac >= 0.999)
+        && !gone && s.enabled !== false && !CANNOT_SAY[s.kind];
+      if (slated) row.classList.add("slated");
       const bar = mk("div", "wk-bar");
       /* #940: an empty fill on a dark ground reads as NO BAR. The track
        * is drawn explicitly so an empty segment looks empty rather than
@@ -4876,7 +4894,14 @@ function worksSchedule(anchorPop) {
       cap.textContent = CANNOT_SAY[s.kind]
         ? CANNOT_SAY[s.kind]
         : Math.round(have) + "s banked of " + Math.round(need)
-          + "s this entry owns";
+          + "s this entry owns"
+          // #965: say WHICH entry it is when the shelf is shared, so
+          // "covered" on the first and "bare" on the third reads as the
+          // truth about the running order rather than a contradiction.
+          + (sp ? (sp.covered ? " · ready to play"
+                   : sp.bare ? " · nothing behind it yet"
+                   : " · short by " + Math.round(Math.max(0, need - have))
+                     + "s") : "");
       row.appendChild(cap);
       if (s.state === "on air" && hour.now && hour.now.started) {
         const started = Number(hour.now.started);

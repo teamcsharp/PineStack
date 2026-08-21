@@ -26189,6 +26189,30 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
         if is_now and live_id:
             index = next((i for i, s in enumerate(slots)
                           if str(s.get("id") or "") == live_id), None)
+        # #965: "If a segment has all of the entries it needs to play, I
+        # want to see that one."
+        #
+        # The bar under each tile comes from _sched_slot_prep(), whose own
+        # docstring warns the figures are "per KIND, never per slot
+        # instance" - so the canonical hour's three Painting-selling
+        # entries all draw the identical bar off the one gallery shelf,
+        # and the second and third read as stocked while nothing at all
+        # has been made for them.
+        #
+        # The correct per-ENTRY answer already exists and is already
+        # right: coord_upcoming() walks the running order forward and
+        # SPENDS the shelf down as it goes ("this entry eats its share").
+        # It was simply never wired to the sheet. Keyed by the slot index
+        # it already reports, so the two cannot drift apart.
+        _per_entry: dict[int, dict[str, Any]] = {}
+        if is_now:
+            try:
+                for _up in coord_upcoming(3600.0):
+                    _at = _up.get("index")
+                    if isinstance(_at, int) and _at not in _per_entry:
+                        _per_entry[_at] = _up
+            except Exception:  # noqa: BLE001
+                _per_entry = {}
         out: list[dict[str, Any]] = []
         minutes = 0.0
         # #920: the top of this hour on the WALL CLOCK, once - the times
@@ -26261,6 +26285,24 @@ def schedule_hours_view(start: str = "", count: Any = 6) -> dict[str, Any]:
                 row["state"] = ("on air" if i == index
                                 else "done" if i < index else "coming")
             row["prep"] = _sched_slot_prep(str(row.get("kind") or ""), board)
+            # #965/#966: and what THIS entry, specifically, is holding.
+            # `slot_prep` is per-instance where `prep` is per-kind; the
+            # panel prefers it when it is there and falls back to the
+            # per-kind figure for entries beyond the coordinator's window.
+            _mine = _per_entry.get(i)
+            if _mine:
+                _owns = float(_mine.get("owns_seconds") or 0)
+                _held = float(_mine.get("held_seconds") or 0)
+                row["slot_prep"] = {
+                    "owns": round(_owns, 1),
+                    "held": round(_held, 1),
+                    "rows": int(_mine.get("rows") or 0),
+                    "covered": bool(_mine.get("covered")),
+                    "bare": bool(_mine.get("bare")),
+                    "cannot": str(_mine.get("cannot") or ""),
+                    "share": round(_held / _owns, 3) if _owns > 0 else 0.0,
+                    "starts_in": float(_mine.get("starts_in") or 0),
+                }
             out.append(row)
         rows.append({
             "key": key,

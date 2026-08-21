@@ -1622,3 +1622,39 @@ body.immersive main {
 }
 .stream-routes label.away select { color: var(--amber); }
 body.rail-compact .stream-routes { display: none; }
+
+/* #966 - A SEGMENT THAT IS READY SAYS SO, EVERY FEW SECONDS.
+ *
+ * "When a segment is a hundred percent ready and able to be played, I
+ * want an animation effect happening over that tile every three to four
+ * seconds just showing that that tile is prepared and slated."
+ *
+ * A glow rather than a sliding sheen: the tile carries a corner icon that
+ * #890 deliberately kept clear, and clipping a sheen to the row would
+ * need overflow:hidden and would cut it off. This adds nothing to the
+ * box model at all - it cannot move the layout of a twenty-tile hour.
+ *
+ * 3.6s, and mostly dark: it pulses once per cycle rather than throbbing,
+ * because a whole hour of ready tiles all breathing at once is noise
+ * rather than information. .slated is set in renderer.js only when the
+ * entry's OWN coverage is complete (#965's per-entry figure), never on a
+ * spent, disabled, or unpreparable tile.
+ */
+@keyframes pineSlated {
+  0%, 68%, 100% { box-shadow: 0 0 0 0 rgba(124, 232, 169, 0); }
+  80% {
+    box-shadow: 0 0 0 2px rgba(124, 232, 169, .5),
+                0 0 11px 1px rgba(124, 232, 169, .32);
+  }
+}
+
+.slated { animation: pineSlated 3.6s ease-in-out infinite; }
+
+/* An operator who has asked the machine to stop moving gets a steady
+ * ring instead, which still says "ready" without the motion. */
+@media (prefers-reduced-motion: reduce) {
+  .slated {
+    animation: none;
+    box-shadow: 0 0 0 1px rgba(124, 232, 169, .45);
+  }
+}
