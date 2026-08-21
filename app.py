@@ -18244,6 +18244,181 @@ def round_line_plan(turns: list[tuple[str, str]],
     return out
 
 
+# --- #974: THE RECAST. Send the new actor back in; keep everyone else --
+#
+# "If I change out the host, then I want to queue up and send the host
+# back into the recording room to re-record his or her lines, but still
+# keep the co-host lines if the co-host hasn't changed."
+#
+# Today a recast is INVISIBLE to preparation. _larder_profile_signature()
+# covers the reply budget, the banter line counts, the swath, the crystal
+# tint and the plot act - and not one voice - so _larder_current() stays
+# True across a recast and nothing is invalidated.
+#
+# What that costs is subtle and worse than it sounds. pantry_key() hashes
+# the VOICE into the key, so at air time the round misses every line of
+# the recast seat and pays a live render for each one, at ~2.7x real
+# time, while the co-host's lines still hit. A round that reports
+# prepared=True then renders half of itself live, on air.
+#
+# The tempting fix - put the voices in the profile signature - is the
+# wrong one, and would do the opposite of what was asked.
+# _larder_current() is consulted in four places that all DISCARD the row,
+# so it would throw away the co-host's finished audio AND every script.
+#
+# So the round is reopened IN PLACE. entry["takes"] already records `who`
+# and `voice` for every line, which makes a stale take one whose voice is
+# no longer the voice for that seat. Drop those, keep the rest, and let
+# the ordinary machinery do the work: larder_prepare re-plans against the
+# new cast, harvests every surviving line for free through the pantry-hit
+# path, and sends only the recast seat to the engine.
+#
+# It is a STATE COMPARISON, not an event, and that is deliberate. An
+# endpoint hook would miss set_guest() (which writes third_voice and
+# saves directly), a settings file edited on disk, and a restart part-way
+# through. Comparing what a take WAS recorded in against who is in the
+# seat now cannot miss any of those.
+
+
+async def _seat_cast() -> dict[str, str]:
+    """Who is in each seat right now - the same map larder_prepare hands
+    to _round_chunks, plus the SFX guy's drop seat."""
+    cast: dict[str, str] = {}
+    try:
+        cast.update({str(k): str(v) for k, v in
+                     (await session_voices()).items() if v})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        drop = str(dj_settings().get("drop_voice") or "")
+        if drop:
+            cast["drop"] = drop
+    except Exception:  # noqa: BLE001
+        pass
+    return cast
+
+
+def _recast_round(entry: dict[str, Any], cast: dict[str, str]) -> int:
+    """Reopen one banked round for the seats that have changed hands.
+
+    Pure dict surgery: no awaits, no engine, and idempotent - it returns
+    0 and changes nothing when the cast still matches, which is what
+    makes it safe on every keeper pass."""
+    try:
+        takes = list(entry.get("takes") or [])
+        if not takes:
+            return 0
+        stale = [t for t in takes
+                 if cast.get(str(t.get("who") or ""))
+                 and cast.get(str(t.get("who") or "")) != str(t.get("voice") or "")]
+        if not stale:
+            return 0
+        dead = {str(t.get("key") or "") for t in stale}
+        kept = [t for t in takes if t not in stale]
+        entry["takes"] = kept
+        entry["keys"] = [k for k in (entry.get("keys") or []) if k not in dead]
+        entry["made"] = len(kept)
+        entry["seconds"] = round(
+            sum(float(t.get("seconds") or 0) for t in kept), 1)
+        entry["prepared"] = False
+        entry["partial"] = bool(kept)
+        entry.pop("yielded", None)
+        entry.pop("yielded_at", None)
+        entry["recast_seats"] = sorted({str(t.get("who") or "") for t in stale})
+        entry["recast_at"] = time.time()
+        # DELIBERATELY UNTOUCHED: script, frozen, freshened, profile, at,
+        # chunks, prep_turns, prep_kind, caller_name.
+        #   frozen stays True because the co-host takes we just kept are
+        #     keyed to that exact frozen text - unfreezing lets
+        #     freshen_script move the words and orphans every one of them.
+        #   freshened stays True so the model is not paid a second time.
+        #   chunks stays non-zero or the round falls into pantry_keeper's
+        #     permanent `frozen and prep_turns and not chunks` skip - the
+        #     #871 trap door.
+        # The dead pantry rows are NOT deleted: another round may hold the
+        # same line verbatim. The ordinary shedding reclaims them once
+        # nothing points at them.
+        return len(stale)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _recast_line_row(row: dict[str, Any], who: str,
+                     cast: dict[str, str]) -> int:
+    """Reopen one single-line shelf row - an advert read or a station ID.
+
+    Its text survives; only the audio is given up. The cheap #904 keeper
+    block skips a row that has a key, so a row with text and no key is
+    re-voiced next pass, one line at a time, in the cheapest block there
+    is."""
+    try:
+        if row.get("produced"):
+            return 0        # a finished mp3 under /ads-audio, not ours
+        want = cast.get(str(who) or "")
+        if not want or want == str(row.get("voice") or ""):
+            return 0
+        if not str(row.get("text") or ""):
+            return 0
+        for gone in ("key", "engine", "seconds"):
+            row.pop(gone, None)
+        # Re-voiced to the NEW seat rather than blanked: shelf_take
+        # filters on `voice`, so a blank one would be untakeable until
+        # the keeper came round.
+        row["voice"] = want
+        return 1
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+async def recast_sweep() -> dict[str, int]:
+    """Find every line banked in a voice that is no longer in its seat,
+    and put just those lines back in the queue to be recorded."""
+    out = {"rounds": 0, "lines": 0, "rows": 0}
+    try:
+        cast = await _seat_cast()
+        if not cast:
+            return out
+        for entry in list(_LARDER):
+            if entry.get("preparing"):
+                continue        # larder_prepare is mid-flight on it
+            got = _recast_round(entry, cast)
+            if got:
+                out["rounds"] += 1
+                out["lines"] += got
+        for kind in ("manager", "caller", "gallery", "news"):
+            for row in list(_SHELF.get(kind) or []):
+                held = row.get("entry")
+                if not isinstance(held, dict) or held.get("preparing"):
+                    continue
+                got = _recast_round(held, cast)
+                if got:
+                    out["rounds"] += 1
+                    out["lines"] += got
+                    row["seconds"] = float(held.get("seconds") or 0)
+        for kind, who in (("ad", "dj"), ("station_id", "drop")):
+            for row in list(_SHELF.get(kind) or []):
+                out["rows"] += _recast_line_row(row, who, cast)
+        if out["rounds"] or out["rows"]:
+            try:
+                _larder_save()
+                _pantry_save(True)
+            except Exception:  # noqa: BLE001
+                pass
+            seats = sorted({s for e in list(_LARDER)
+                            for s in (e.get("recast_seats") or [])})
+            pipeline_log("voice", "the cast changed — "
+                         + (", ".join(seats) if seats else "a seat")
+                         + f" goes back in to re-record {out['lines']} line(s)"
+                         + (f" and {out['rows']} read(s)" if out["rows"] else "")
+                         + "; everybody else keeps what they already did "
+                           "(#974)")
+            note_action("a recast sent one actor back to the microphone",
+                        f"{out['rounds']} round(s), {out['lines']} line(s)")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 async def larder_prepare(entry: dict[str, Any]) -> bool:
     """#886: make a banked round's AUDIO, before anybody wants it."""
     if entry.get("prepared") or entry.get("preparing"):
@@ -19595,6 +19770,14 @@ async def pantry_keeper() -> None:
         await asyncio.sleep(6)
         try:
             pantry_burn()               # the 24-hour ceiling, every pass
+            # #974: and before anything is planned, find any line banked
+            # in a voice that is no longer in its seat. Wrapped, because
+            # _seat_cast can reach the voice catalogue on a cold draw and
+            # a raise here would cost the whole keeper pass.
+            try:
+                await recast_sweep()
+            except Exception:  # noqa: BLE001
+                pass
             # #872: no task is running, so nothing is on the clock. A
             # deadline left standing from a previous pass would read as
             # "already overrun" and stand every future pass down.
@@ -33140,6 +33323,13 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
     # chunk enters weighted by strength, so a switched-on crystal really
     # bends what the pair reach for.
     for _cr in crystal_active():
+        # #973: and the same rule on THIS road. Filtering only the #834
+        # swath would have been half a fix: this block appends the
+        # crystal minds' best chunks at score*strength and re-sorts, so a
+        # tint-only crystal at high strength would still win the seed and
+        # its text would arrive by the other door.
+        if not crystal_sources(_cr):
+            continue
         _w = max(5, min(100, int(_cr.get("strength") or 50))) / 100.0
         for _rid in (_cr.get("minds") or []):
             if mind_id(_rid) == key:
@@ -33360,7 +33550,20 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # airs, not about which mind it comes from, so a crystal never takes
     # those draws away from the studio library.
     if not rid and not only and tinted:
-        _crs = crystal_active()
+        # #973: only crystals that are allowed to lend their WORDS get to
+        # redirect the draw. The rest still tint the prompt through
+        # crystal_clause(); they simply stop taking the swath away from
+        # the studio library.
+        _crs = [c for c in crystal_active() if crystal_sources(c)]
+        _tint_only = [c for c in crystal_active() if not crystal_sources(c)]
+        if _tint_only and not _crs:
+            _to = _tint_only[0]
+            round_mark(crystal=str(_to.get("name") or ""),
+                       crystal_strength=int(_to.get("strength") or 0),
+                       crystal_mind="")
+            pipeline_log("speakbox", f"the {_to.get('name')} crystal is "
+                         "tinting the writing, but the swath stayed in the "
+                         "speakerbox (#973)")
         if _crs:
             _cr = random.choice(_crs)
             _p = max(5, min(100, int(_cr.get("strength") or 50))) / 100.0
@@ -34220,8 +34423,15 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             _cr0 = random.choice(_crs0)
             _tinted = (" Let a little of this flavor bleed in: "
                        f"{str(_cr0.get('tint') or _cr0.get('name'))[:120]}.")
+            # #973: the flavour bleeds in either way (that is the tint,
+            # which is what was asked for); the crystal's actual WORDS
+            # only reach him if it is a crystal allowed to source. #820
+            # argued "material beats instruction on a small model", and
+            # that is exactly why this has to follow the same rule - a
+            # tint-only crystal supplying his shard would be the whole
+            # behaviour arriving through the side door.
             _minds0 = [m for m in (_cr0.get("minds") or [])
-                       if any(x["id"] == m for x in speakbox_minds())]
+                       if any(x["id"] == m for x in speakbox_minds())]                 if crystal_sources(_cr0) else []
             if _minds0:
                 try:
                     _rid0 = random.choice(_minds0)
@@ -51764,6 +51974,29 @@ def crystal_active() -> list[dict[str, Any]]:
     return [c for c in crystals_read().values() if c.get("on")]
 
 
+def crystal_sources(c: dict[str, Any]) -> bool:
+    """#973: does this crystal supply the WORDS, or only the colour?
+
+    "when i say speakerbox I refer to non-crystal documents. I want the
+    tinting of the crystal but I still want chunks pulled from the
+    speakerbox."
+
+    A switched-on crystal does two quite separate things, and they were
+    fused. It tints the PROMPT, through crystal_clause() - that is the
+    part the operator wants. And, in #834 and #815, it also REPLACES the
+    mind the swath is drawn from, at probability strength/100 - so at 70%
+    the actual passages stop coming out of the speakerbox seven times in
+    ten. That is the part he does not.
+
+    They are separable now, per crystal. The default is tint-only,
+    because that is what was asked for; a crystal set to "crystal" goes
+    back to lending its own material as well."""
+    try:
+        return str(c.get("source") or "speakbox") == "crystal"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def crystal_clause() -> str:
     """The world-tint. Every crystal switched ON leans the show's writing
     toward its subject matter — hosts, callers, ads, the town itself."""
@@ -51851,6 +52084,14 @@ async def crystals_upsert(
         "strength": max(0, min(100, int(payload.get(
             "strength", prev.get("strength", 50)) or 0))),
         "on": bool(payload.get("on", prev.get("on", False))),
+        # #973: does this crystal lend its WORDS as well as its colour?
+        # "speakbox" (the default) means tint only - the prompt leans, and
+        # the passages keep coming out of the speakerbox. "crystal"
+        # restores the older behaviour where the crystal's own minds also
+        # supply the swath. See crystal_sources().
+        "source": ("crystal" if str(payload.get(
+            "source", prev.get("source", "speakbox"))) == "crystal"
+            else "speakbox"),
         "built": prev.get("built") or int(time.time()),
     }
     crystals_save(data)

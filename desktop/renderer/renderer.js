@@ -2731,17 +2731,49 @@ function initWorksPopup() {
           drawer.appendChild(mk("div", "wk-note", "the shelf is empty"));
           return;
         }
+        /* #964: "have all the scripts underneath collapsed and then have a
+         * triangle where I can expand each script to read what's going on
+         * inside of it."
+         *
+         * Twelve banked rounds of fourteen turns each poured every line
+         * into one drawer, so opening the reserve to see WHAT was banked
+         * meant scrolling past everything that already was. Each round
+         * folds now, and starts folded, with the head still carrying the
+         * numbers so a shut row is still worth reading. Same triangle and
+         * the same remembered-open behaviour as the writing desk (#885),
+         * with the default the other way round: the desk holds a handful
+         * of calls, the reserve holds the whole night. */
         rows.forEach((r, i) => {
           const t = mk("div", "");
           t.style.cssText = "border-left:2px solid "
             + (r.state === "ready" ? "#7ce8a9" : "#3f7fa8")
             + ";padding-left:7px;margin:6px 0";
-          const nm = mk("div", "");
-          nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff";
-          nm.textContent = "#" + (i + 1) + " · " + r.state + " · "
+          const foldKey = "res:" + (r.id || i);
+          let open = wkResOpen(foldKey);
+          const label = "#" + (i + 1) + " · " + r.state + " · "
             + r.turns + " turns · " + r.made + "/" + r.chunks + " lines made"
             + (r.seconds ? " · " + Math.round(r.seconds) + "s" : "");
+          const nm = mk("div", "");
+          nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff;"
+            + "cursor:pointer;user-select:none";
+          nm.textContent = (open ? "▾ " : "▸ ") + label;
+          nm.title = "Click to read this round";
           t.appendChild(nm);
+          /* A shut row still says something: the first thing anybody says
+           * in it is what tells one round from another - #984's lesson,
+           * learned on the writing desk. */
+          const peek = mk("div", "");
+          peek.style.cssText = "font-size:9.5px;line-height:1.45;opacity:.6;"
+            + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
+            + "cursor:pointer;margin-top:1px";
+          const lead = (r.lines || [])[0];
+          peek.textContent = lead
+            ? (lead.name || lead.who) + ": " + String(lead.text || "")
+            : "(nothing written in it yet)";
+          peek.style.display = open ? "none" : "block";
+          t.appendChild(peek);
+          const inner = mk("div", "");
+          inner.style.display = open ? "block" : "none";
           (r.lines || []).forEach((ln) => {
             const l = mk("div", "");
             l.style.cssText = "font-size:10px;line-height:1.45;margin-top:2px;"
@@ -2750,8 +2782,18 @@ function initWorksPopup() {
             w.style.color = "#7ce8a9";
             l.appendChild(w);
             l.appendChild(document.createTextNode(String(ln.text || "")));
-            t.appendChild(l);
+            inner.appendChild(l);
           });
+          t.appendChild(inner);
+          const flip = () => {
+            open = !open;
+            wkResFold(foldKey, open);
+            nm.textContent = (open ? "▾ " : "▸ ") + label;
+            inner.style.display = open ? "block" : "none";
+            peek.style.display = open ? "none" : "block";
+          };
+          nm.onclick = flip;
+          peek.onclick = flip;
           drawer.appendChild(t);
         });
         });
@@ -5776,6 +5818,30 @@ function wkDeskEntry(id, c) {
 function wkDeskShut() {
   try { return JSON.parse(localStorage.getItem("wkDeskShut") || "{}") || {}; }
   catch (e) { return {}; }
+}
+
+/* #964: the reserve remembers which rounds you OPENED, where the desk
+ * remembers which ones you SHUT. Same mechanism, opposite default,
+ * because the desk holds a handful of calls and the reserve holds the
+ * whole night's rounds. */
+function wkResShown() {
+  try {
+    const raw = localStorage.getItem("wkResOpen");
+    const all = raw ? JSON.parse(raw) : {};
+    return all && typeof all === "object" ? all : {};
+  } catch (e) { return {}; }
+}
+
+function wkResOpen(key) {
+  try { return wkResShown()[key] === true; } catch (e) { return false; }
+}
+
+function wkResFold(key, want) {
+  try {
+    const all = wkResShown();
+    if (want) all[key] = true; else delete all[key];
+    localStorage.setItem("wkResOpen", JSON.stringify(all));
+  } catch (e) { /* private mode: it still folds for this session */ }
 }
 
 function wkDeskOpen(key) {
