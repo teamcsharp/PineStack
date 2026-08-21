@@ -3342,12 +3342,48 @@ function initWorksPopup() {
     try { head.appendChild(wkCacheBadge()); }
     catch (e) { /* the flow still opens */ }
     const x = mk("button", "wk-x", "✕");
-    x.onclick = close;
+    x.onclick = () => {
+      try { if (pop.wkBriefPoll) clearInterval(pop.wkBriefPoll); } catch (e) {}
+      close();
+    };
     head.appendChild(x);
     pop.appendChild(head);
     pop.appendChild(mk("div", "wk-sub",
       "Every round is written, banked, recorded and stacked before it "
       + "goes out. This is where each one is right now."));
+    /* #999: THE CONDUCTOR'S LINE. What is wrong with the broadcast right
+     * now, in the order that matters, and what is being done about it -
+     * so the orchestrator's reading is visible rather than only its
+     * actions. Green when the wheels are turning, amber when it is
+     * working on something. */
+    const brief = mk("div", "");
+    brief.style.cssText = "font-size:10px;line-height:1.5;margin:2px 0 6px;"
+      + "padding:5px 8px;border-radius:6px;background:#05090f;"
+      + "border:1px solid #1b2c3c;cursor:default";
+    brief.textContent = "reading the broadcast…";
+    pop.appendChild(brief);
+    const briefTick = () => {
+      api.get("/api/coordinator/brief").then((b) => {
+        if (!b) return;
+        const bad = (b.worries || []).length;
+        brief.style.borderColor = bad ? "#5a4520" : "#1e4433";
+        brief.style.color = bad ? "#e0b874" : "#8fd8b4";
+        brief.textContent = "♫ the conductor — " + (b.say || "");
+        const more = [];
+        (b.worries || []).slice(1).forEach((w, i) => {
+          more.push("• " + w
+                    + ((b.doing || [])[i + 1] ? "  → " + b.doing[i + 1] : ""));
+        });
+        if ((b.bare || []).length) {
+          more.push("nothing behind: " + b.bare.join(", "));
+        }
+        brief.title = more.length ? more.join(String.fromCharCode(10))
+          : "Hover shows anything else it is watching";
+      }).catch(() => {});
+    };
+    briefTick();
+    const briefPoll = setInterval(briefTick, 5000);
+    pop.wkBriefPoll = briefPoll;
     const body = mk("div", "wk-flow-wrap");
     pop.appendChild(body);
     document.body.appendChild(pop);
