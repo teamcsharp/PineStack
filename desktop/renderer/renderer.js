@@ -22,6 +22,43 @@ let rebuildRelaunching = false;
 
 const $ = (id) => document.getElementById(id);
 
+/* #990: COPY, BY WHICHEVER ROAD IS OPEN.
+ *
+ * navigator.clipboard is undefined on file://, which is where this window
+ * is loaded from, so every copy button in here was calling a method that
+ * does not exist and swallowing the error. Electron's own clipboard is
+ * exposed through the preload and has no secure-context rule; the web API
+ * is kept as a second try for when this page is served over http, and a
+ * hidden textarea with execCommand is the last resort. Returns whether it
+ * actually worked, so a caller can SAY so instead of looking broken. */
+async function pineCopy(text) {
+  const v = String(text == null ? "" : text);
+  if (!v) return false;
+  try {
+    if (window.pineDesktop && window.pineDesktop.copyText
+        && window.pineDesktop.copyText(v)) return true;
+  } catch (err) { /* try the next road */ }
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(v);
+      return true;
+    }
+  } catch (err) { /* try the next road */ }
+  try {
+    const pad = document.createElement("textarea");
+    pad.value = v;
+    pad.setAttribute("readonly", "");
+    pad.style.cssText = "position:fixed;top:-1000px;opacity:0";
+    document.body.appendChild(pad);
+    pad.select();
+    const ok = document.execCommand("copy");
+    pad.remove();
+    return !!ok;
+  } catch (err) {
+    return false;
+  }
+}
+
 const ROUTES = {
   box: { label: "Pine Box", music: "box", voice: "box", reply: "box", voice_device: "pine", box_talk: true },
   // #814: web/app route audio to the PAGE — they must not silently
@@ -1670,11 +1707,12 @@ function initStationDrawer() {
     const lamp = document.body.classList.contains("fm-on");
     return lamp;
   }
-  $("pubCopy").addEventListener("click", () => {
+  $("pubCopy").addEventListener("click", async () => {
     const v = $("pubLink").value;
-    if (v) navigator.clipboard.writeText(v).then(
-      () => setText("pubStatus", "link copied — paste it anywhere"),
-      () => {});
+    if (!v) return;
+    setText("pubStatus", (await pineCopy(v))
+      ? "link copied — paste it anywhere"
+      : "could not reach the clipboard — the link is selected, press Ctrl+C");
   });
   $("pubOpen").addEventListener("click", () => {
     const v = $("pubLink").value;
@@ -5862,6 +5900,20 @@ function worksSchedule(anchorPop) {
    * air, so a past sheet you are reading holds still. */
   prev.onclick = () => { offset = Math.max(-12, offset - 1); load(); };
   next.onclick = () => { offset = Math.min(72, offset + 1); load(); };
+  /* #986: "If I double click this, jump back to the active hour."
+   *
+   * The arrows walk twelve hours back and seventy-two forward, so it is
+   * easy to end up a long way from the hour that is actually on air and
+   * a nuisance to click your way home. Double-clicking the hour label
+   * puts the cursor back on now. Single click is left alone - the label
+   * sits between the two arrows and a stray click should not move you. */
+  label.title = "Double-click to jump back to the hour on air";
+  label.style.cursor = "pointer";
+  label.ondblclick = () => {
+    if (!offset) return;                  // already home
+    offset = 0;
+    load();
+  };
   load();
   const tick = setInterval(() => { if (!offset) load(); }, 5000);
 }
@@ -7508,7 +7560,7 @@ function initStatusBar() {
           && made.urls[0].url) || "";
         if (link) {
           localStorage.setItem("pineLiveShareUrl", link);
-          try { await navigator.clipboard.writeText(link); } catch {}
+          await pineCopy(link);                              // #990
         }
       }
     } catch (err) { liveBtn.title = err.message; }
