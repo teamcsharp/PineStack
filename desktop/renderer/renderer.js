@@ -6279,6 +6279,67 @@ function wkRoundPaper(r) {
   part("WHAT THE SCHEDULE ASKED FOR", desk.sched);
   part("THE PROMPT AS SENT", desk.prompt);
   part("WHAT CAME BACK", desk.script || r.script);
+
+  /* THE BEFORE AND AFTER, in the window the operator is already in.
+   *
+   * The two thumbs on the reserve row are the way to CHOOSE; this is the
+   * way to READ. "How this round was written" is not finished at the
+   * first pass when there was a second one, and putting the comparison
+   * anywhere other than the paperwork means looking in two places to
+   * answer one question.
+   *
+   * Side by side where the window is wide enough, stacked where it is
+   * not, with the two scripts scrolling together. */
+  if (r.script_plain && r.script_tinted) {
+    const lab = document.createElement("div");
+    lab.textContent = "BEFORE AND AFTER THE TINT"
+      + (r.tint && r.tint.world ? " — " + r.tint.world : "");
+    lab.style.cssText = "font-size:9px;letter-spacing:.06em;opacity:.75;"
+      + "margin:12px 0 3px;color:#7fb0c9";
+    d.appendChild(lab);
+    const pair = document.createElement("div");
+    pair.style.cssText = "display:flex;gap:8px;flex-wrap:wrap";
+    [["as written", r.script_plain, "plain", "#4a6d8a"],
+     ["tinted", r.script_tinted, "tinted", "#c8a6ff"]].forEach((col) => {
+      const side = document.createElement("div");
+      side.style.cssText = "flex:1 1 300px;min-width:0";
+      const h = document.createElement("div");
+      const on = String(r.use || "tinted") === col[2];
+      h.textContent = col[0] + (on ? "  ✓ this one goes out" : "");
+      h.style.cssText = "font-size:9.5px;margin-bottom:3px;color:"
+        + (on ? "#7ce8a9" : "#8ba0b5");
+      side.appendChild(h);
+      const pre = document.createElement("pre");
+      pre.textContent = String(col[1] || "");
+      pre.style.cssText = "white-space:pre-wrap;word-break:break-word;"
+        + "font-size:10.5px;line-height:1.5;margin:0;padding:7px 9px;"
+        + "background:#05090f;border:1px solid " + col[3]
+        + ";border-radius:6px;max-height:40vh;overflow:auto;color:#c8d6e4";
+      side.appendChild(pre);
+      const use = document.createElement("button");
+      use.textContent = on ? "in use" : "✓ use this one";
+      use.disabled = on;
+      use.style.cssText = "margin-top:5px;font-size:9.5px;padding:3px 9px;"
+        + "border-radius:5px;cursor:" + (on ? "default" : "pointer")
+        + ";border:1px solid #24384a;background:#0b1520;color:"
+        + (on ? "#5d7189" : "#9fd8ff");
+      use.onclick = () => { wkVersionUse(r, col[2]); d.remove(); };
+      side.appendChild(use);
+      pair.appendChild(side);
+    });
+    d.appendChild(pair);
+    if (r.tint) {
+      (r.tint.chunks || []).forEach((c, i) => {
+        part("PASSAGE " + (i + 1) + " OF THE CRYSTAL'S OWN WORDS, SENT WITH IT"
+             + (c.file ? " — " + c.file : ""), c.text);
+      });
+      part("THE TINTING SYSTEM PROMPT", r.tint.armed);
+      if (!r.tint.ok && r.tint.why) part("WHY THE TINT DID NOT TAKE",
+                                         r.tint.why);
+    }
+  } else if (r.tint && r.tint.why && !r.tint.ok) {
+    part("THE TINTING PASS DID NOT TAKE", r.tint.why);
+  }
   if (!desk.prompt && !desk.armed) {
     const none = document.createElement("div");
     none.style.cssText = "font-size:10px;opacity:.6;margin-top:6px";
@@ -7760,13 +7821,117 @@ function pineTipsInstall() {
 
 function pvFloatDesk(el2) {
   try {
+    /* THE TRANSFORM HAS TO GO FIRST.
+     *
+     * Every window here is opened centred with
+     * `left:50%;top:50%;transform:translate(-50%,-50%)`, and
+     * getBoundingClientRect() reports the VISUAL box - the one the
+     * transform has already moved. Writing that rect back into
+     * left/top while the transform is still on the element applies the
+     * shift a second time, so the window jumps up and left by half its
+     * own size and a large one lands off the top-left corner of the
+     * screen. That is the paperwork popup opening off-screen.
+     *
+     * Measure, clear the transform, then pin the measured box. */
     const r = el2.getBoundingClientRect();
     const mw = window.innerWidth, mh = window.innerHeight;
+    el2.style.transform = "none";
+    el2.style.right = "auto";
+    el2.style.bottom = "auto";
     el2.style.left = Math.round(Math.min(Math.max(8, r.left),
                                          Math.max(8, mw - r.width - 8))) + "px";
     el2.style.top = Math.round(Math.min(Math.max(8, r.top),
                                         Math.max(8, mh - r.height - 8))) + "px";
+    /* ...and a window taller than the screen is clamped to it rather
+     * than being pinned at 8px and running off the bottom. */
+    if (r.height > mh - 16) el2.style.maxHeight = (mh - 16) + "px";
+    if (r.width > mw - 16) el2.style.width = (mw - 16) + "px";
+    el2.style.overflow = el2.style.overflow || "auto";
+    pvFloatGrab(el2);
   } catch (e) {}
+}
+
+/* A window you cannot reach is a window you cannot close.
+ *
+ * "When these pop-ups get stuck off screen, I'm not able to close them
+ * or reposition them."
+ *
+ * Two ways out, and they are put HERE rather than on each window because
+ * every floating panel in this app goes through pvFloatDesk - so the
+ * paperwork, the rewrite box, the version reader and the segment details
+ * all get both, and so does anything added later.
+ *
+ * DRAG anywhere on the window that is not something you might be trying
+ * to use. Buttons, inputs, textareas, links and the <pre> blocks holding
+ * the scripts are excluded, because dragging the window while trying to
+ * select a line of a script would be its own small hell.
+ *
+ * ESCAPE closes the topmost one, whether or not its ✕ is on screen.
+ *
+ * And a drag is clamped so at least a corner stays reachable, which is
+ * what stops this happening again by hand. */
+const pvFloats = [];
+
+function pvFloatGrab(el2) {
+  if (!el2 || el2.dataset.pvGrab === "1") return;
+  el2.dataset.pvGrab = "1";
+  pvFloats.push(el2);
+  const skip = "button,input,textarea,select,a,pre,label,option";
+  let sx = 0, sy = 0, ox = 0, oy = 0, on = false;
+  el2.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
+    if (ev.target && ev.target.closest && ev.target.closest(skip)) return;
+    on = true;
+    sx = ev.clientX; sy = ev.clientY;
+    ox = parseInt(el2.style.left, 10) || el2.getBoundingClientRect().left;
+    oy = parseInt(el2.style.top, 10) || el2.getBoundingClientRect().top;
+    el2.style.cursor = "grabbing";
+    ev.preventDefault();
+  });
+  const move = (ev) => {
+    if (!on) return;
+    const w = el2.offsetWidth, h = el2.offsetHeight;
+    /* Never further out than leaves a 90x28 handle on screen. */
+    const x = Math.min(window.innerWidth - 90,
+                       Math.max(90 - w, ox + ev.clientX - sx));
+    const y = Math.min(window.innerHeight - 28, Math.max(0, oy + ev.clientY - sy));
+    el2.style.left = Math.round(x) + "px";
+    el2.style.top = Math.round(y) + "px";
+  };
+  const up = () => {
+    if (!on) return;
+    on = false;
+    el2.style.cursor = "";
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+  el2.pvRelease = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+  };
+}
+
+function pvFloatEscape() {
+  for (let i = pvFloats.length - 1; i >= 0; i--) {
+    const el2 = pvFloats[i];
+    if (!el2 || !document.body.contains(el2)) { pvFloats.splice(i, 1); continue; }
+    try { if (el2.pvRelease) el2.pvRelease(); } catch (e) {}
+    el2.remove();
+    pvFloats.splice(i, 1);
+    return true;
+  }
+  return false;
+}
+
+if (!window.__pvFloatKeys) {
+  window.__pvFloatKeys = true;
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Escape") return;
+    /* Not while somebody is typing into the rewrite box. */
+    const a = document.activeElement;
+    if (a && a.closest && a.closest("textarea,input")) return;
+    if (pvFloatEscape()) ev.stopPropagation();
+  }, true);
 }
 
 /* #799: the status bar — the machine's own ticker tape. Left: the newest

@@ -867,8 +867,8 @@ DEFAULT_DJ = {
     # operator asked to be able to adjust: "I want to be able to see the
     # influence and adjust how we inject chunks for reference in the 2nd
     # LLM prompting to get the desired results."
-    "crystal_tint_chunks": 3,
-    "crystal_tint_chars": 700,
+    "crystal_tint_chunks": 5,
+    "crystal_tint_chars": 900,
     # Whisper the playing song so the pair can talk about its actual
     # lyrics (#451). Off by default — it is CPU on every new track.
     "lyrics_talk": True,
@@ -36837,12 +36837,12 @@ async def _sfxguy_news_fill() -> None:
         picks = news_selection(await drudge_headlines(24), False)
         if picks:
             story = picks[0]
+            # #1018: the crystal's own lines ride along, not just its
+            # description - see crystal_style_note.
             _ntint = ""
             _ncrs = crystal_active()
             if _ncrs:
-                _ncr = random.choice(_ncrs)
-                _ntint = (" Let a little of this flavor bleed in: "
-                          f"{str(_ncr.get('tint') or _ncr.get('name'))[:120]}.")
+                _ntint = crystal_tint_note(random.choice(_ncrs))
             take = await ask_model(
                 "You are a thick-accented, NASCAR-loving country boy in "
                 f"a radio booth. Headline: {story.get('title')}. Give ONE "
@@ -36879,8 +36879,13 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
         _crs0 = crystal_active()
         if _crs0:
             _cr0 = random.choice(_crs0)
-            _tinted = (" Let a little of this flavor bleed in: "
-                       f"{str(_cr0.get('tint') or _cr0.get('name'))[:120]}.")
+            # #1018: and the crystal's OWN LINES with it. This used to be
+            # the description alone unless the crystal was allowed to
+            # source, which is why a saying tinted through DOOM came back
+            # with comic-book nouns in it and nothing that sounded like
+            # the man. The gate below still governs the SWATH; this is
+            # style reference, which is a different thing.
+            _tinted = crystal_tint_note(_cr0)
             # #973: the flavour bleeds in either way (that is the tint,
             # which is what was asked for); the crystal's actual WORDS
             # only reach him if it is a crystal allowed to source. #820
@@ -47930,8 +47935,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # only possible for a round that is waiting in the reserve.
     if bank and crystal_tint_two_pass():
         try:
-            _tint = await crystal_tint(script, str(entry.get("prep_kind")
-                                                   or ""))
+            _tint = await crystal_tint(script,
+                                       str(entry.get("prep_kind") or ""),
+                                       entry.get("verbatim"))
             entry["script_plain"] = script
             entry["tint"] = {
                 "ok": bool(_tint.get("ok")),
@@ -48645,14 +48651,21 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
         # ...and the world-tint in HIS mouth specifically. dj_banter folds
         # crystal_clause() into every prompt already; this is the same
         # nudge the SFX guy's brews carry (#820), aimed at upstairs.
-        _mcrs = crystal_active()
+        # #1018: ...and it stands aside when the tint is a SECOND PASS,
+        # exactly as crystal_clause() does. Under two-pass the round is
+        # written plain on purpose - that is what makes the "before" of
+        # the before-and-after an actual before - and the crystal's own
+        # lines reach it in crystal_tint() instead.
+        _mcrs = [] if crystal_tint_two_pass() else crystal_active()
         if _mcrs:
             _mcr = random.choice(_mcrs)
             flavour += (" Upstairs has fallen into it as hard as the rest "
                         "of the town: let this flavour run through the "
                         "memo's own wording and through how they read it "
                         "out - "
-                        f"{str(_mcr.get('tint') or _mcr.get('name'))[:120]}.")
+                        f"{str(_mcr.get('tint') or _mcr.get('name'))[:120]}."
+                        # #1018: with the world's own lines to work from.
+                        + crystal_style_note())
     except Exception:  # noqa: BLE001
         pass
     if _hot_memo:
@@ -54917,6 +54930,11 @@ def crystal_clause() -> str:
             "Topics bend toward its subject matter. The higher the "
             "percentage, the deeper the town has fallen into it; never "
             "NAME the crystal on air (#803).")
+        # #1018: and the world's own lines, so the model has something
+        # to imitate rather than a description to interpret.
+        _lines = crystal_style_note()
+        if _lines:
+            parts.append(_lines)
         if strength >= 75:
             parts.append(
                 "AT THIS DEPTH THE TINT IS TOTAL: diction itself warps — "
@@ -54938,7 +54956,8 @@ def crystal_tint_two_pass() -> bool:
         return False
 
 
-def crystal_material(most: int = 3, cap: int = 700) -> list[dict[str, Any]]:
+def crystal_material(most: int = 3, cap: int = 700,
+                     ceiling: int = 12) -> list[dict[str, Any]]:
     """#1006: passages out of the crystal's own minds, for the SECOND
     system prompt.
 
@@ -54951,19 +54970,33 @@ def crystal_material(most: int = 3, cap: int = 700) -> list[dict[str, Any]]:
     better sample of that world than the nearest neighbour."""
     out: list[dict[str, Any]] = []
     try:
-        most = max(0, min(12, int(most)))
+        # #1018: the ceiling used to be a flat 12, which was right for a
+        # PROMPT - nobody wants two hundred passages in a system prompt -
+        # and silently wrong for building a POOL to sample from later.
+        # crystal_lines asked for 240 and got twelve, so every tint on
+        # the station was drawing from the same dozen fragments of a mind
+        # holding 21,637 of them. Measured: "pool: 12".
+        most = max(0, min(max(1, int(ceiling)), int(most)))
         cap = max(120, min(4000, int(cap)))
         if not most:
             return out
+        # And SAMPLED rather than walked. A crystal this size has tens of
+        # thousands of chunks; materialising all of them to shuffle is
+        # work nobody needs, and a random slice of each mind is just as
+        # good a sample of how the world talks.
         pool: list[dict[str, Any]] = []
+        want_each = max(most * 4, 64)
         for c in crystal_active():
             for rid in (c.get("minds") or []):
                 try:
-                    rows = list(_load_vectors(mind_id(rid)).get("chunks")
-                                or [])
+                    rows = _load_vectors(mind_id(rid)).get("chunks") or []
                 except Exception:  # noqa: BLE001
                     continue
-                for row in rows:
+                if not rows:
+                    continue
+                take = (random.sample(rows, k=min(want_each, len(rows)))
+                        if len(rows) > want_each else list(rows))
+                for row in take:
                     text = str((row or {}).get("text") or "").strip()
                     if len(text) < 40:
                         continue
@@ -54988,6 +55021,99 @@ def crystal_material(most: int = 3, cap: int = 700) -> list[dict[str, Any]]:
     return out
 
 
+# #1018: THE CRYSTAL'S OWN WORDS GO WITH EVERY TINT.
+#
+# "when sending stuff to 'tint'. Also send a chunk of lyrics from the
+# crystal for it to internalize, absorb and attempt to work into the
+# rhetoric. I need them talking like the crystal when it is 'tinted'."
+#
+# Every tint site was sending the crystal's DESCRIPTION - "the world of
+# MF DOOM: supervillain logic, mask mythology, comic-book vengeance,
+# food-as-metaphor, dense internal rhyme" - and nothing else. That is a
+# label for a style, not the style, and a small model handed a label
+# writes what it already thought the label meant. The operator
+# photographed exactly that: a saying tinted through DOOM that came back
+# "I once rode from Venom to Carnage on fumes and a prayer and a bag of
+# stolen souls" - comic-book nouns swapped in, and not one thing about
+# it that sounds like the man.
+#
+# #820 said it out loud four hundred requests ago: material beats
+# instruction on a small model. So the lines go too.
+#
+# ON THE #973 GATE, deliberately not applied here. #973 stopped a
+# tint-only crystal from supplying the SWATH - the passage a round is
+# ABOUT - because "I still want chunks pulled from the speakerbox". That
+# is about SUBJECT, and it stands: the speakbox still says what the show
+# talks about. This is about STYLE, which is a different use of the same
+# words, and it is framed that way in the prompt - here is how this world
+# talks, do not quote it and do not mention it.
+_CRYSTAL_POOL: dict[str, Any] = {"at": 0.0, "rows": []}
+CRYSTAL_POOL_LIFE = 300.0
+CRYSTAL_STYLE_MOST = 3
+# Long enough to hear a cadence in. The stored chunks run to 600
+# characters; 260 was cutting most of them mid-thought, and half a line
+# is a worse model of how somebody talks than no line at all.
+CRYSTAL_STYLE_CAP = 420
+
+
+def crystal_lines(most: int = 0, cap: int = 0) -> list[dict[str, Any]]:
+    """#1018: a few of the crystal's own lines, cheaply.
+
+    crystal_material() walks every chunk of every mind, which is fine for
+    the once-per-round tinting pass and much too dear for the clauses
+    that ride EVERY prompt. The pool is built at most every five minutes
+    and sampled from after that."""
+    most = most or CRYSTAL_STYLE_MOST
+    cap = cap or CRYSTAL_STYLE_CAP
+    try:
+        now = time.time()
+        if now - float(_CRYSTAL_POOL.get("at") or 0) > CRYSTAL_POOL_LIFE:
+            _CRYSTAL_POOL["rows"] = crystal_material(240, cap, ceiling=240)
+            _CRYSTAL_POOL["at"] = now
+        rows = list(_CRYSTAL_POOL.get("rows") or [])
+        if not rows:
+            return []
+        return random.sample(rows, k=min(int(most), len(rows)))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def crystal_style_note(most: int = 0, cap: int = 0) -> str:
+    """#1018: the crystal's own lines, framed as a STYLE reference.
+
+    Empty when no crystal is on, or when its minds have not been indexed
+    yet - in which case every caller of this falls back to exactly the
+    tint description it was sending before."""
+    rows = crystal_lines(most, cap)
+    if not rows:
+        return ""
+    said = "\n".join('"' + str(r.get("text") or "").strip() + '"'
+                      for r in rows if r.get("text"))
+    if not said:
+        return ""
+    return (" HERE IS HOW THAT WORLD ACTUALLY TALKS - its own lines, word "
+            "for word. Read them, take in the rhythm, the vocabulary, the "
+            "way images are built and the way sentences turn, and let that "
+            "come through in what you write. Do NOT quote them, do not "
+            "repeat their phrases whole, and never mention where they came "
+            "from:\n" + said + "\n")
+
+
+def crystal_tint_note(crystal: dict[str, Any] | None = None,
+                      most: int = 0, cap: int = 0) -> str:
+    """#1018: the whole tint - the description AND the words - in the one
+    form every brew and clause on the station now uses."""
+    try:
+        c = crystal or (crystal_active() or [None])[0]
+        if not c:
+            return ""
+        label = str(c.get("tint") or c.get("name") or "")[:200]
+        return (" Let this flavour bleed all the way through it: "
+                + label + "." + crystal_style_note(most, cap))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def crystal_world_prompt() -> str:
     """#1006: the crystal's own world prompt, for the second pass."""
     parts = []
@@ -54999,7 +55125,8 @@ def crystal_world_prompt() -> str:
     return "; ".join(parts)
 
 
-async def crystal_tint(script: str, kind: str = "") -> dict[str, Any]:
+async def crystal_tint(script: str, kind: str = "",
+                       verbatim: Any = None) -> dict[str, Any]:
     """#1006: THE SECOND PASS. Take a finished, untinted conversation and
     move it into the crystal's world.
 
@@ -55025,37 +55152,88 @@ async def crystal_tint(script: str, kind: str = "") -> dict[str, Any]:
             out["why"] = "no crystal is on, so nothing tints it"
             return out
         dj = dj_settings()
-        chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 3),
-                                  int(dj.get("crystal_tint_chars") or 700))
+        chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
+                                  int(dj.get("crystal_tint_chars") or 900))
+        # #1018: the passages the round is NOT allowed to reword.
+        #
+        # #838 keeps the operator's own material word for word - it is
+        # quoted, and it is read out as a quotation. A rewrite pass with
+        # nothing said to it will happily reword those too, and measured
+        # on the live station that is most of what it did: a round came
+        # back with the swath tidied into sentences and not one word of
+        # the show's own dialogue changed. Naming them protects the
+        # quotation AND stops the model spending its whole effort there.
+        keep: list[str] = []
+        try:
+            for row in (verbatim or []):
+                text = ""
+                if isinstance(row, (list, tuple)) and len(row) > 1:
+                    text = str(row[1] or "")
+                elif isinstance(row, str):
+                    text = row
+                text = " ".join(text.split())
+                if len(text) > 30:
+                    keep.append(text[:600])
+            del keep[:-4]
+        except Exception:  # noqa: BLE001
+            keep = []
+        out["keep"] = list(keep)
         world = crystal_world_prompt()
         out["world"] = world
         out["chunks"] = chunks
         armed = (
-            "YOU ARE THE TINTING PASS. A conversation has already been "
-            "written for this radio station and it is finished: the beats "
-            "are right, the people are right, the order is right. Your only "
-            "job is to move it INTO A WORLD.\n\n"
+            "YOU ARE A REWRITE PASS AND YOUR JOB IS TO CHANGE HOW IT "
+            "SOUNDS.\n\n"
+            "A conversation has already been written for this radio "
+            "station. The beats are right, the people are right, the order "
+            "is right. What is wrong is that it does not sound like the "
+            "world it is supposed to be coming out of. Put it in that "
+            "world's mouth.\n\n"
             f"THE WORLD: {world}\n\n"
-            + ("HOW THAT WORLD TALKS - passages out of its own material, "
-               "which is the only description of it that counts:\n"
+            + ("HOW THAT WORLD ACTUALLY TALKS - its own lines, word for "
+               "word. This is the only description of it that counts. Read "
+               "them properly before you write anything: the rhythm, the "
+               "slang, the way images are built, the way a sentence turns "
+               "and lands, the things it reaches for as comparisons, its "
+               "particular kind of wit. You are imitating THIS:\n"
                + "\n\n".join(f"[{c['file']}] {c['text']}" for c in chunks)
                + "\n\n" if chunks else "")
-            + "WHAT TO CHANGE: the vocabulary, the imagery, the cadence, "
-              "the turns of phrase, the things people reach for as "
-              "comparisons. Let the world's diction fall out of ordinary "
-              "mouths.\n"
+            + "WHAT YOU MUST DO TO EVERY SINGLE TURN: reword it in that "
+              "world's diction. Different vocabulary, different images, "
+              "different comparisons, its cadence. The speaker keeps their "
+              "point; they stop making it in their own words and start "
+              "making it in that world's.\n\n"
+              "For instance, in a world of supervillain logic and food "
+              "metaphor, a flat line such as \"that sounds expensive\" "
+              "comes back rebuilt out of that world's own furniture "
+              "rather than merely repunctuated. THAT is the SIZE of the "
+              "change wanted. Do not copy this example or any phrase from "
+              "it - it is here to show you how far to go, not what to "
+              "say.\n\n"
+              "YOU HAVE FAILED IF a turn comes back word for word the "
+              "same, or if all you did was fix the punctuation and the "
+              "capitals. Tidying is not tinting. Every turn must READ "
+              "differently.\n\n"
               "WHAT NOT TO CHANGE: the speaker markers and their order; "
-              "the NUMBER of turns; who says what; every fact, name, "
-              "record, price and decision in it. Do not add turns and do "
-              "not remove any. Never name the world or the crystal out "
-              "loud.\n"
-              "Return ONLY the rewritten conversation, in exactly the same "
+              "the NUMBER of turns; who says what; and the SUBSTANCE - "
+              "every fact, name, record, price and decision stays true. Do "
+              "not add turns and do not remove any. Never name the world "
+              "out loud.\n"
+            + (("LEAVE THESE PASSAGES EXACTLY AS THEY ARE - they are "
+                "quoted material and they are read out word for word:\n"
+                + "\n".join('"' + v + '"' for v in keep) + "\n\n")
+               if keep else "")
+            + "Return ONLY the rewritten conversation, in exactly the same "
               "marker format it came in.")
         out["armed"] = armed
         prompt = armed + "\n\nTHE CONVERSATION:\n" + text
         out["prompt"] = prompt
         began = time.monotonic()
-        got = await ask_model(prompt, limit=max(600, len(text) + 400))
+        # #1018: with some spice. A rewrite asked for at the default
+        # temperature comes back as the input with the commas fixed,
+        # which is what "tidying is not tinting" was written about.
+        got = await ask_model(prompt, limit=max(600, len(text) + 400),
+                              spice=0.55)
         out["ms"] = int((time.monotonic() - began) * 1000)
         tinted = str(got or "").strip()
         # A pass that came back empty, or that lost most of the round, is
@@ -55068,6 +55246,30 @@ async def crystal_tint(script: str, kind: str = "") -> dict[str, Any]:
             out["why"] = (f"the tinting pass came back {len(tinted)} chars "
                           f"against {len(text)} - too much of the round was "
                           "lost, so the plain one stands")
+            return out
+        # #1018: ...and a pass that handed the round straight back is not a
+        # tint either. Measured on the live station: one round of 3501
+        # characters came back byte-identical after 23 seconds of model
+        # time, and was then offered in the reserve as "the tinted
+        # version" beside an original it was a copy of. Two versions that
+        # are the same version is worse than one, because it makes the
+        # comparison meaningless and hides that the pass did nothing.
+        _a = " ".join(text.split())
+        _b = " ".join(tinted.split())
+        if _a == _b:
+            out["why"] = ("the tinting pass handed the round back unchanged "
+                          "- nothing was tinted, so there is one version of "
+                          "it and not two")
+            return out
+        _same = 0
+        for _x, _y in zip(_a, _b):
+            if _x != _y:
+                break
+            _same += 1
+        if _same >= len(_a) * 0.9:
+            out["why"] = (f"the tinting pass changed nothing until character "
+                          f"{_same} of {len(_a)} - that is not a tint, so the "
+                          "plain one stands")
             return out
         out["ok"] = True
         out["script"] = tinted
@@ -60485,6 +60687,15 @@ async def api_tint_state(
                         for c in ons],
         "chunks": int(dj.get("crystal_tint_chunks") or 0),
         "chars": int(dj.get("crystal_tint_chars") or 0),
+        # #1018: what every OTHER tint site is now sending - the crystal's
+        # own lines, not just its description. Shown here because the
+        # operator's complaint was that the tint had a label in it and
+        # nothing to imitate, and the only way to know that is fixed is
+        # to look at what actually goes.
+        "style_note": crystal_style_note(),
+        "style_lines": [str(r.get("text") or "")[:200]
+                        for r in crystal_lines(4)],
+        "pool": len(_CRYSTAL_POOL.get("rows") or []),
         "stages": [
             {"n": 1, "name": "the foundation",
              "what": "the station's own system prompt and radio prompts, "
@@ -60536,6 +60747,71 @@ async def api_tint_state(
                 ("no crystal is on, so nothing is tinted"
                  if not ons else
                  "the tint rides in the first prompt as a clause")),
+    }
+
+
+@app.post("/api/tint/try")
+async def api_tint_try(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1006/#1018: run the tinting pass on a piece of text, right now,
+    and hand back the before, the after, and everything that was sent.
+
+    "I want to be able to see the influence and adjust how we inject
+    chunks for reference in the 2nd LLM prompting to get the desired
+    results." You cannot tune a dial whose effect you can only observe
+    twenty minutes later on a round that happened to be banked. This is
+    the same code path the real pass takes - crystal_tint, the same
+    passages, the same system prompt - on text you choose.
+
+    With no text it uses the most recent round in the reserve, which is
+    usually what you want to ask about anyway."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    text = str(body.get("script") or "").strip()
+    keep: Any = body.get("verbatim")
+    if not text:
+        for entry in reversed(list(_LARDER)):
+            got = str((entry or {}).get("script_plain")
+                      or (entry or {}).get("script") or "").strip()
+            if got:
+                text = got
+                keep = entry.get("verbatim")
+                break
+    if not text:
+        raise HTTPException(status_code=400,
+                            detail="give me a script, or bank a round first")
+    began = time.monotonic()
+    got = await crystal_tint(text, str(body.get("kind") or ""), keep)
+    # How much of it actually moved - the only honest measure of whether
+    # a dial did anything.
+    plain = " ".join(text.split())
+    made = " ".join(str(got.get("script") or "").split())
+    same = 0
+    for a, b in zip(plain, made):
+        if a != b:
+            break
+        same += 1
+    return {
+        "ok": bool(got.get("ok")),
+        "why": str(got.get("why") or ""),
+        "world": str(got.get("world") or ""),
+        "ms": int(got.get("ms") or 0),
+        "took": round(time.monotonic() - began, 2),
+        "before": text,
+        "after": str(got.get("script") or ""),
+        "passages": list(got.get("chunks") or []),
+        "kept_verbatim": list(got.get("keep") or []),
+        "armed": str(got.get("armed") or ""),
+        "identical_for": same,
+        "say": (f"{len(plain)} chars in, {len(made)} out, identical for the "
+                f"first {same} - {round(100.0 * same / max(1, len(plain)))}%"
+                if got.get("ok") else str(got.get("why") or "it did not take")),
     }
 
 
