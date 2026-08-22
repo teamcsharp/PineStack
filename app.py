@@ -15890,9 +15890,15 @@ async def speakbox_flavor() -> str:
               f"\"{s['text']}\"\n")
 
 
+# #1040: "draw one" - the DEFAULT for dj_line's seed. None still means
+# "no speakbox on this line" for a caller that means it; the difference
+# is that not passing anything no longer silently means that.
+_SEED_DRAW = object()
+
+
 async def dj_line(kind: str, track: dict[str, Any] | None = None,
-                  extra: str = "", seed: dict[str, str] | None = None,
-                  direct: str = "") -> str:
+                  extra: str = "", seed: Any = _SEED_DRAW,
+                  direct: str = "", room: int = 1) -> str:
     """One spoken line. The phrase bank is the fallback AND the style guide:
     the model is asked to riff in the same register, so a broken or slow model
     degrades to a phrase rather than to silence.
@@ -16008,6 +16014,15 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
     # upstairs, because every kind dj_speak handles (ad, station_id,
     # interject, media, reply) draws through here.
     aside = ""
+    # #1040: `seed` used to default to None, and None means "no
+    # speakbox" - so every caller that did not think to hand in a dict
+    # wrote its line with no grounding at all. Measured: prepared track
+    # talk passes nothing, so every prepared intro and outro on the
+    # station was written blind. The sentinel keeps the explicit opt-out
+    # (pass None and mean it) while making the DEFAULT what the slider
+    # says it is.
+    if seed is _SEED_DRAW:
+        seed = {}
     if seed is not None and random.random() < box_rate_now(
             dj["speakbox_rate"]):
         seed.update(await speakbox_quote())
@@ -16067,7 +16082,16 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
             if answer and not looks_english(answer):
                 answer = ""
         if answer:
-            return answer
+            # #1038: THE SECOND PASS, on the road that writes most of the
+            # station. The note above puts the crystal in the prompt; a
+            # model asked to write an advert in a voice writes an
+            # advert. This takes the advert and does one job on it.
+            #
+            # One visit by default because this road is often live. The
+            # prepared roads - track talk, the ad brews - hand it more,
+            # and with room it goes sentence by sentence with the rhymes
+            # chained, which is what turns a radio link into a verse.
+            return await crystal_line(answer, f"a {kind} line", room)
     except Exception:
         pass
     if seed is not None:
@@ -20671,12 +20695,12 @@ async def prep_track_talk() -> bool:
             # WITH the track. This is the whole difference from a banked
             # round: it may name the song, because it will only ever be
             # said over this song.
-            raw = await dj_line("intro", track)
+            raw = await dj_line("intro", track, room=6)          # #1038
             kind = "intro"
             who = "dj"
         else:
             raw = await dj_line(
-                "interject", track,
+                "interject", track, room=6,                          # #1038
                 extra="that record has just finished playing - see it off: "
                       "say what you made of it, name it once, and hand over "
                       "to whatever is coming next")
@@ -31813,6 +31837,9 @@ async def dj_upstairs_write() -> dict[str, Any]:
         text = ""
     if not text:
         return {}
+    # #1038: banked as a memo and read out later, so it can be built
+    # sentence by sentence.
+    text = await crystal_line(text, "the manager's own voice", 5)
     row = upstairs_save(text, gripe, context)
     if seed:
         speakbox_remember(seed)
@@ -34931,7 +34958,12 @@ def speakbox_remember(quote: dict[str, Any]) -> None:
 # as it stood when they were found, so editing it in the panel throws them out
 # and the next round goes back to the document.
 SPEAKBOX_GEMS = data_path("speakbox_gems.json")
-SPEAKBOX_GEM_WINDOW = 1500         # characters of transcript read at a time
+# #1039: was 1500, against documents that run to 240KB - one pass saw
+# six-tenths of one percent of a big file, and what it saw is the entire
+# pool the round is written from. Measured: 41% of draws had six lines
+# or fewer to choose between. The repair model is given 8k of context
+# for this, so the window was never the constraint; 1500 was.
+SPEAKBOX_GEM_WINDOW = 5000         # characters of transcript read at a time
 
 
 def _gem_cache(rid: str = "") -> dict[str, Any]:
@@ -34997,7 +35029,7 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
             "phrase you can. Do not summarise it, do not tidy up the "
             "language, do not add anything of your own and do not comment on "
             "it. Give back the repaired text and nothing else.\n\n"
-            + body, limit=1800)
+            + body, limit=5200)                              # #1039
     except Exception:
         return []
 
@@ -35009,7 +35041,9 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
     # reading "1 unused lines on the shelf" — and an exhausted document is
     # served from its oldest lines again, verbatim, upstream of every gate.
     # Forty deep and ACCUMULATED means a document keeps giving.
-    gems = [gem for gem in speakbox_lines(found) if " " in gem][:40]
+    # #1039: was [:40]. A wider window is no use if the shelf still
+    # only keeps forty lines of it.
+    gems = [gem for gem in speakbox_lines(found) if " " in gem][:120]
     if gems:
         with _SPEAKBOX_LOCK:
             cache = _gem_cache(rid)
@@ -36316,23 +36350,40 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # horizon is covered. The oldest documents are where the obscure
     # material is; they are only rarely worth the risk when the show is
     # living hand to mouth, and always worth it when it is not.
+    # #1039: A BAND, NOT THE ONE FILE. Both of these used to assign the
+    # single extreme - THE oldest document, THE newest - and both wrote
+    # `first` directly, walking past the unrepeated() rotation that
+    # exists to stop one document owning the show. At rest they fire on
+    # 0.25 + 0.75 * 0.32 = 49% of draws, so half the night came out of
+    # two files: measured, one document took 55 of 133 draws while 68
+    # others split the rest two apiece. Reaching into the oldest sixth
+    # (or newest sixth) keeps both dives doing exactly what they were
+    # for and gives the rotation its documents back.
+    def _band(pool: list[Any], oldest_end: bool) -> str:
+        ranked = sorted(pool, key=lambda q: q.stat().st_mtime
+                        if q.exists() else 0)
+        wide = max(2, min(len(ranked), round(len(ranked) / 6) or 2))
+        band = ranked[:wide] if oldest_end else ranked[-wide:]
+        return random.choice(band).name
+
     if len(files) > 2 and random.random() < (0.25 + 0.30 * _depth):
-        oldest = min(files, key=lambda p: p.stat().st_mtime
-                     if p.exists() else 0)
-        first = oldest.name
+        first = _band(files, True)
     elif len(files) > 2 and random.random() < 0.32:
         # Freshly-added documents get scoured PROMPTLY (#547): lead with the
         # newest so anything just dropped in the folder is in their mouths
         # soon, not lost behind the weighted rotation.
-        newest = max(files, key=lambda p: p.stat().st_mtime
-                     if p.exists() else 0)
-        first = newest.name
+        # #1039: ...the newest SIXTH. See _band above.
+        first = _band(files, False)
     order = ([p for p in files if p.name == first]
              + random.sample([p for p in files if p.name != first],
                              len(files) - 1))
     said = {r.get("text") for r in speakbox_heard(key)}
     exhausted: tuple[str, list[str]] | None = None
-    for doc in order[:3]:               # a doc of pure headings is not fatal
+    # #1039: was order[:3] - and since the first document holding a
+    # single unused line ends the search, "three were mined" was almost
+    # always "one was mined". Six, so an exhausted document costs a look
+    # rather than the whole draw.
+    for doc in order[:6]:               # a doc of pure headings is not fatal
         gems = speakbox_gems(doc, key)
         fresh = [line for line in gems
                      if line not in said and looks_english(line)]
@@ -36439,9 +36490,17 @@ def speakbox_swath_lines(pool: list[str], most: int = 9,
         return []
     cap = cap or SPEAKBOX_SWATH_MAX
     deep = max(0.0, min(1.0, float(deep or 0.0)))
-    floor = int(len(pool) * 0.55 * deep)        # 0 at rest — unchanged
-    start = (random.randrange(min(floor, max(0, len(pool) - 1)), len(pool))
-             if floor else random.randrange(len(pool)))
+    # #1041: THE LAST START AT WHICH A FULL SWATH STILL FITS. Drawing
+    # the start across the whole pool means every start in the last
+    # `most` positions returns a short swath - measured, a 2600-character
+    # setting delivering 939 at its best and one line at its worst - and
+    # `deep` made it worse by design, since it exists to push the start
+    # toward the back where the fewest lines remain. A pool smaller than
+    # the ask is unchanged: it had one honest answer already.
+    last = max(1, len(pool) - max(1, int(most)) + 1)
+    floor = int(last * 0.55 * deep)             # 0 at rest — unchanged
+    start = (random.randrange(min(floor, last - 1), last)
+             if floor else random.randrange(last))
     swath = [pool[start]]
     for line in pool[start + 1:start + most]:
         if len(" ".join(swath)) + len(line) + 1 > cap:
@@ -37069,6 +37128,9 @@ async def _sfxguy_news_fill() -> None:
                 mark={"kind": "sfx news",
                       "for": "the SFX guy's take on a headline"})
             take = str(take or "").strip().strip('"').strip()[:180]
+            # #1038: a brew that runs well ahead of air - it can afford
+            # to be built properly.
+            take = await crystal_line(take, "an SFX guy news take", 2)
             if take and looks_english(take):
                 _SFXGUY_NEWS.append({
                     "title": str(story.get("title") or "")[:140],
@@ -37113,8 +37175,9 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             # that is exactly why this has to follow the same rule - a
             # tint-only crystal supplying his shard would be the whole
             # behaviour arriving through the side door.
-            _minds0 = [m for m in (_cr0.get("minds") or [])
-                       if any(x["id"] == m for x in speakbox_minds())]                 if crystal_sources(_cr0) else []
+            _minds0 = ([m for m in (_cr0.get("minds") or [])
+                        if any(x["id"] == m for x in speakbox_minds())]
+                       if crystal_sources(_cr0) else [])
             if _minds0:
                 try:
                     _rid0 = random.choice(_minds0)
@@ -37127,6 +37190,25 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                             _sw0["text"], "sfxguy")
                 except Exception:  # noqa: BLE001
                     _shard = ""
+        # #1040: ...and when no crystal lent him one, the STUDIO shelf
+        # does. Every one of his four roads carried a style note and no
+        # material of any kind - he is the only voice on the station
+        # that was asked to be funny about nothing in particular. The
+        # crystal's shard still wins when there is one; this is the
+        # floor underneath it, on the same slider as everybody else.
+        if not _shard:
+            try:
+                if random.random() < box_rate_now(
+                        dj_settings().get("speakbox_rate", 1.0)):
+                    _sw1 = await speakbox_quote(most=2, cap=180)
+                    if _sw1 and _sw1.get("text"):
+                        _shard = (" Fold a shard of this into it: "
+                                  f"\"{str(_sw1['text'])[:180]}\".")
+                        _crystal_influence_note(
+                            _sw1.get("mind", ""), _sw1.get("file", ""),
+                            _sw1["text"], "sfxguy")
+            except Exception:  # noqa: BLE001
+                _shard = ""
         # #804: when a line just aired, half his inventions REACT to it —
         # engaged with the conversation, not shouted past it.
         _react_words = sfx_words()                                # #1034
@@ -37146,6 +37228,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                       "for": "the SFX guy reacting to a line that just "
                              "aired"})
             line = str(out or "").strip().strip('"').strip()
+            line = await crystal_line(line, "an SFX guy reaction", 2)  # #1038
             if 8 <= len(line) <= 200 and looks_english(line) \
                     and "\n" not in line:
                 _SFXGUY_WARPED.append(line)
@@ -38533,6 +38616,13 @@ async def drop_liner_brew(want: int = 6) -> None:
         fresh.append(line)
     if not fresh:
         return
+    # #1038: a brew, banked in _DROP_FRESH and said over the next hour.
+    # Each is one short line, so one ask each.
+    try:
+        fresh = [await crystal_line(f, "a drop", 1) for f in fresh]
+        fresh = [f for f in fresh if 4 < len(f) <= 240]
+    except Exception:  # noqa: BLE001
+        pass
     _DROP_FRESH.extend(fresh)
     del _DROP_FRESH[24:]
     if seed:
@@ -38759,6 +38849,8 @@ async def _sfx_verdict(about: str) -> None:
             # one did not, so the same man came back untinted whenever he
             # was asked for a verdict.
             "directions." + crystal_tint_note(), 120)
+        # #1038: he is answering something that just aired, so one ask.
+        line = await crystal_line(str(line or ""), "an SFX guy verdict", 1)
         if line:
             await asyncio.sleep(0.6)
             await dj_speak("reply", None, line=line, who="drop",
@@ -44022,6 +44114,18 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
         return []
     pipeline_log("model", "deep conversation round — expanded context, both "
                           "co-workers simulated in full (#496)")
+    # #1038: the deep round goes STRAIGHT to air - twelve to sixteen
+    # turns, no reserve, no second look. The whole-round path is one ask,
+    # which is what this road can afford.
+    if crystal_tint_two_pass():
+        try:
+            _dt = await crystal_tint(script, "deep round", whole_only=True)
+            if _dt.get("ok") and _dt.get("script"):
+                script = str(_dt["script"])
+                pipeline_log("crystal", "the deep round was tinted whole "
+                                        f"({_dt.get('ms')}ms) (#1038)")
+        except Exception:  # noqa: BLE001
+            pass
     return await speak_turns(banter_turns(script), track, 16,
                              render_stream=bool(dj.get("call_stream", True)))
 
@@ -47341,9 +47445,18 @@ async def dj_banter(track: dict[str, Any] | None = None,
             seed = {"file": pushed.get("doc") or "a pushed note",
                     "text": pushed["text"],
                     "lines": speakbox_lines(pushed["text"]) or [pushed["text"]]}
-    if not angle and not seed and (force_seed
-                                   or random.random() < box_rate_now(
-                                       dj["speakbox_rate"])):
+    # #1039: `not angle` used to lead this, and it is why only 2 of 17
+    # measured rounds had a seed. An ANGLE is what the round is about; a
+    # SEED is the material it is built out of. They are not alternatives
+    # - a round about the transmitter saga still wants something real in
+    # its mouth - and gating one on the other turned the speakbox off
+    # for the gallery, the hawk, the news, the recap, the ads, the
+    # storyline and every caller road, which between them are most
+    # rounds. The slider decides how often a seed is drawn; nothing else
+    # should.
+    if not seed and (force_seed
+                     or random.random() < box_rate_now(
+                         dj["speakbox_rate"])):
         # Best-of-two off the shelf (#418): the rounds open with the
         # more intriguing swath, same scoring the callers use (#359).
         # Pull fuller swaths so they quote entire phrases at each other, not
@@ -48178,11 +48291,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # cannot afford one - and the whole point of keeping both versions is
     # that somebody gets to look at them before they go out, which is
     # only possible for a round that is waiting in the reserve.
-    if bank and crystal_tint_two_pass():
+    # #1038: ...and it is no longer only the banked road. "I need the
+    # crystal tinting everything." A live round cannot afford twelve
+    # model visits, so it gets ONE - the whole round in a single ask -
+    # while a banked round is still built turn by turn with the rhymes
+    # chained. Both are the second pass; what differs is the budget.
+    if crystal_tint_two_pass():
         try:
             _tint = await crystal_tint(script,
                                        str(entry.get("prep_kind") or ""),
-                                       entry.get("verbatim"))
+                                       entry.get("verbatim"),
+                                       whole_only=not bank)
             entry["script_plain"] = script
             entry["tint"] = {
                 "ok": bool(_tint.get("ok")),
@@ -55231,7 +55350,12 @@ def crystal_clause(bank: bool = False) -> str:
         # advert, every station ID and every track link went out
         # untinted. A round with no second pass coming has no
         # before-and-after to protect.
-        if bank and bool(dj_settings().get("crystal_tint_pass", True)):
+        # #1038: `bank` no longer decides it, because the second pass
+        # is no longer only on the banked road - dj_line, the deep
+        # round, the manager, the SFX guy, the drops and the live
+        # banter round all get it now. So the rule goes back to what
+        # #1006 wrote: if a rewrite is coming, write this one plain.
+        if bool(dj_settings().get("crystal_tint_pass", True)):
             return ""
     except Exception:  # noqa: BLE001
         pass
@@ -55453,6 +55577,14 @@ def crystal_tint_note(crystal: dict[str, Any] | None = None,
     """#1018: the whole tint - the description AND the words - in the one
     form every brew and clause on the station now uses."""
     try:
+        # #1038: and so does the note - same reason. Every road that
+        # carries this now has a second pass behind it, and the second
+        # pass is shown the same lyrics. Twice is not stronger; twice is
+        # a model splitting its attention between imitating a style and
+        # writing an advert, which is how the first pass got its
+        # reputation.
+        if bool(dj_settings().get("crystal_tint_pass", True)):
+            return ""
         c = crystal or (crystal_active() or [None])[0]
         if not c:
             return ""
@@ -55729,8 +55861,110 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     return out
 
 
+async def crystal_line(text: str, why: str = "", room: int = 6,
+                       keep: list[str] | None = None) -> str:
+    """#1038: THE SECOND PASS, on one piece of speech, for every road.
+
+    The banked round has had this since #1006. Nothing else did - not
+    the adverts, not the station IDs, not the track intros, not the SFX
+    guy, not the manager, not the drops. They carried a DESCRIPTION of
+    the crystal in their first prompt, which is the thing the operator
+    ruled worthless: a model asked to write an advert in a voice writes
+    an advert. This takes the advert it wrote and does one job on it.
+
+    `room` is how many model visits this road can afford:
+
+      0    don't. The caller knows there is no time.
+      1    one ask, the whole piece at once. Live roads.
+      2+   sentence by sentence with the rhymes CHAINED, up to `room`
+           pieces - each bar written knowing the one before it, which
+           is the difference between a verse and a list of lines.
+
+    Never raises and never returns empty: a road that cannot be tinted
+    airs exactly what it would have aired before."""
+    said = str(text or "").strip()
+    if not said or room < 1:
+        return said
+    try:
+        if not crystal_tint_two_pass() or not crystal_active():
+            return said
+        if len(said) < TINT_TURN_FLOOR:
+            return said
+        # Something is waiting on the desk. The tint is the one thing on
+        # the station that can always be skipped - what it protects is
+        # style, and dead air is not a style.
+        if tint_should_stop():
+            return said
+        dj = dj_settings()
+        chunks = crystal_stanzas(2, CRYSTAL_STANZA_LINES)
+        if not chunks:
+            chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
+                                      int(dj.get("crystal_tint_chars") or 900))
+        if not chunks:
+            return said            # nothing to be tinted BY
+        world = crystal_world_prompt()
+        started = time.monotonic()
+        # #1038: the tint owns its own deadline, exactly as crystal_tint
+        # does. Without this the preparer's window closes underneath it
+        # and a half-tinted line is what airs.
+        _room_was = _PREP_DEADLINE[0]
+        _per = (45.0 if str(dj.get("crystal_tint_model") or "")
+                else TINT_TURN_SECONDS)
+        try:
+            _PREP_DEADLINE[0] = time.time() + max(60.0, _per * room + 30.0)
+            if room < 2:
+                out = await crystal_turn(said, world, chunks, keep=keep)
+            else:
+                # Sentence by sentence, each one written knowing the last.
+                bits = [b.strip() for b in
+                        re.split(r"(?<=[.!?])\s+", said) if b.strip()]
+                if len(bits) > room:
+                    # Too many to take one at a time: fold the tail into
+                    # the last piece rather than leaving it untinted.
+                    bits = bits[:room - 1] + [" ".join(bits[room - 1:])]
+                if len(bits) < 2:
+                    out = await crystal_turn(said, world, chunks, keep=keep)
+                else:
+                    done: list[str] = []
+                    for bit in bits:
+                        if tint_should_stop():
+                            # Out of time: the rest goes out as written.
+                            done.append(bit)
+                            continue
+                        got = await crystal_turn(
+                            bit, world, chunks,
+                            answering=(done[-1] if done else ""),
+                            keep=keep)
+                        done.append(str(got or bit).strip())
+                    out = " ".join(d for d in done if d).strip()
+        finally:
+            _PREP_DEADLINE[0] = _room_was
+        out = " ".join(str(out or "").split()).strip()
+        if len(out) < TINT_TURN_FLOOR // 2:
+            return said
+        if out == said:
+            return said                 # it did nothing; say so by silence
+        pipeline_log(
+            "crystal",
+            f"tinted {why or 'a line'} "
+            f"({int((time.monotonic() - started) * 1000)}ms, "
+            f"{len(said)}->{len(out)} chars) (#1038)",
+            extra=("THE SECOND PASS, OFF THE BANKED ROAD (#1038)\n\n"
+                   f"road: {why or 'unnamed'}\nroom: {room} model "
+                   f"visit(s)\ncrystal: {world}\n\n"
+                   "AS WRITTEN:\n" + said[:1200]
+                   + "\n\nAS TINTED:\n" + out[:1200]
+                   + "\n\nTHE PASSAGE IT WAS SHOWN:\n"
+                   + "\n\n---\n\n".join(
+                       str(c.get("text") or "")[:600] for c in chunks)))
+        return out
+    except Exception:  # noqa: BLE001
+        return said
+
+
 async def crystal_tint(script: str, kind: str = "",
-                       verbatim: Any = None) -> dict[str, Any]:
+                       verbatim: Any = None,
+                       whole_only: bool = False) -> dict[str, Any]:
     """#1006: THE SECOND PASS. Take a finished, untinted conversation and
     move it into the crystal's world.
 
@@ -55848,7 +56082,11 @@ async def crystal_tint(script: str, kind: str = "",
             turns = list(banter_turns(text) or [])
         except Exception:  # noqa: BLE001
             turns = []
-        if turns and len(turns) <= TINT_TURNS_MOST:
+        # #1038: `whole_only` is how a LIVE road affords this at all.
+        # Turn by turn is the better tint and it is twelve model visits;
+        # in front of a listener that is not a tint, it is dead air. One
+        # ask for the whole round is what the live roads get.
+        if turns and len(turns) <= TINT_TURNS_MOST and not whole_only:
             began = time.monotonic()
             done: list[str] = []
             answering = ""
