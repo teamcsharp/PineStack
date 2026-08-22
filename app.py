@@ -10028,7 +10028,15 @@ def shelf_repeat_ready(kind: str, row: dict[str, Any]) -> bool:
     try:
         if not shelf_is_repeat(kind, row):
             return False
-        if time.time() - float(row.get("aired_at") or 0)                 < shelf_reuse_rest():                             # #1059
+        # #1089: ...unless the operator has said to raid the cupboard.
+        # shelf_take has honoured repeats_hard since #1059 and this
+        # readiness test did not, so the glass reported "0 of 27 ready"
+        # while the shelf was handing the same gallery round out for
+        # the eighth time. Three places asked this question and only
+        # one of them had the answer.
+        if (time.time() - float(row.get("aired_at") or 0)
+                < shelf_reuse_rest()
+                and not orch_policy("repeats_hard")):
             return False
         key = str(row.get("key") or "")
         return not key or bool(pantry_get(key))
@@ -10509,7 +10517,16 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                                        else float(r.get("at") or 0)))
         _why: list[str] = []                                   # #1003
         for row in _order:
-            if time.time() - float(row.get("at") or 0) > PANTRY_BURN_SECONDS:
+            # #1089: ...unless it is a repeat, which the cupboard holds
+            # for REPEAT_KEEP_SECONDS. slot_supply has exempted these
+            # all along and this did not, so a repeat between 25 and 72
+            # hours old was COUNTED as supply by the board and REFUSED
+            # here - the board planning around material the shelf would
+            # not hand over.
+            _old = time.time() - float(row.get("at") or 0)
+            if _old > PANTRY_BURN_SECONDS and not (
+                    shelf_is_repeat(kind, row)
+                    and _old <= REPEAT_KEEP_SECONDS):
                 _why.append("burnt")
                 continue
             # #977: it has been out; has it rested long enough?
@@ -21671,6 +21688,14 @@ _PREP_AT = [0]
 #   `news`    is prepared, but never an hour early - see prep_news() for
 #             the short horizon and the staleness stamp that guard it.
 SCHED_PREP_KIND = {
+    # #1089: TRACK TALK, which the preparer has always built and the
+    # running order has never been able to ask for. Measured over 31
+    # goes with ZERO failures it is the best value on the board - 1.43
+    # seconds of room per second of speech against banter's 3.28 - and
+    # it rides a record, which is pure ballast. Trading one banter
+    # entry for a record with track talk over it saves 689 s/h, which
+    # is 113% of the hour's whole deficit.
+    "track_talk": "track_talk",
     "ad": "ad",
     "manager": "manager",
     "caller": "caller",
@@ -22647,8 +22672,18 @@ def slot_supply() -> dict[str, list[float]]:
                     if not shelf_is_repeat(kind, row):
                         continue                # aired and not reusable
                     # In the cupboard. Free when it has finished resting.
-                    when.append(max(0.0, out_at              # #1059
-                                    + shelf_reuse_rest() - now))
+                    # #1089: ...and if the operator has said to raid
+                    # the cupboard, it is free NOW. shelf_take has
+                    # honoured repeats_hard since #1059 and this did
+                    # not, so the board read a shortage the shelf did
+                    # not have - which is why the repeats view reported
+                    # "0 of 27 ready" while one gallery round had aired
+                    # eight times in under ten hours.
+                    if orch_policy("repeats_hard"):
+                        when.append(0.0)
+                    else:
+                        when.append(max(0.0, out_at          # #1059
+                                        + shelf_reuse_rest() - now))
                 except Exception:  # noqa: BLE001
                     continue
             if when:
