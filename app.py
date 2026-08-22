@@ -842,6 +842,30 @@ DEFAULT_DJ = {
     # rest; below about 400ms it is the native behaviour again, and 0
     # switches them off entirely.
     "tip_delay_ms": 3000,
+    # #1006: TINTING AS A SECOND PASS, not as a line in the first prompt.
+    #
+    # "On the base level we affect things with the system prompts... Then
+    # we insert speakerbox texts and phrases and generate conversations
+    # based on it. Generally that would be the conversation we would send
+    # through to the reserve but since we are 'tinting' it, we need to
+    # then run it through the LLM again, this time with a system prompt
+    # referencing a chunk of the content from the crystal selected and
+    # the world prompt from the crystal, and then we tell the LLM to tint
+    # the conversation fitting in our language and theme to tint."
+    #
+    # On, a round is written UNTINTED first - the station's own prompts,
+    # the segment's brief, the speakbox material - and then rewritten
+    # through the crystal. Both versions are kept so they can be compared
+    # and either one chosen (#1016). Off, the tint rides in the first
+    # prompt as a clause, which is what it has always done.
+    "crystal_tint_pass": True,
+    # How much of the crystal's own material goes into the SECOND system
+    # prompt, and how long each piece may be. This is the dial the
+    # operator asked to be able to adjust: "I want to be able to see the
+    # influence and adjust how we inject chunks for reference in the 2nd
+    # LLM prompting to get the desired results."
+    "crystal_tint_chunks": 3,
+    "crystal_tint_chars": 700,
     # Whisper the playing song so the pair can talk about its actual
     # lyrics (#451). Off by default — it is CPU on every new track.
     "lyrics_talk": True,
@@ -1426,6 +1450,14 @@ def validate_settings(data: Any) -> dict[str, Any]:
             "box_volume_control", DEFAULT_DJ["box_volume_control"])),
         "tip_delay_ms": max(0, min(10000, int(float(          # #1011/#1012
             raw_dj.get("tip_delay_ms", DEFAULT_DJ["tip_delay_ms"]) or 0)))),
+        "crystal_tint_pass": bool(raw_dj.get(                       # #1006
+            "crystal_tint_pass", DEFAULT_DJ["crystal_tint_pass"])),
+        "crystal_tint_chunks": max(0, min(12, int(float(            # #1006
+            raw_dj.get("crystal_tint_chunks",
+                       DEFAULT_DJ["crystal_tint_chunks"]) or 0)))),
+        "crystal_tint_chars": max(120, min(4000, int(float(         # #1006
+            raw_dj.get("crystal_tint_chars",
+                       DEFAULT_DJ["crystal_tint_chars"]) or 700)))),
         "lyrics_talk": bool(raw_dj.get("lyrics_talk",
                                        DEFAULT_DJ["lyrics_talk"])),
         "perf": bool(raw_dj.get("perf", DEFAULT_DJ["perf"])),
@@ -47674,6 +47706,39 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # from cannot be judged, and cannot be sent back.
         "desk": _desk_paper(script, _desk_at),
     }
+    # #1006/#1016: THE SECOND PASS, and both versions kept.
+    #
+    # Only on the BANKING road. Rewriting on the air path would put a
+    # second model visit in front of the listener on the one road that
+    # cannot afford one - and the whole point of keeping both versions is
+    # that somebody gets to look at them before they go out, which is
+    # only possible for a round that is waiting in the reserve.
+    if bank and crystal_tint_two_pass():
+        try:
+            _tint = await crystal_tint(script, str(entry.get("prep_kind")
+                                                   or ""))
+            entry["script_plain"] = script
+            entry["tint"] = {
+                "ok": bool(_tint.get("ok")),
+                "why": str(_tint.get("why") or ""),
+                "world": str(_tint.get("world") or ""),
+                "ms": int(_tint.get("ms") or 0),
+                "armed": str(_tint.get("armed") or "")[:6000],
+                "prompt": str(_tint.get("prompt") or "")[:8000],
+                "chunks": list(_tint.get("chunks") or []),
+            }
+            if _tint.get("ok"):
+                entry["script_tinted"] = str(_tint.get("script") or "")
+                # #1016: "I want it to default to using the tinted
+                # version, but if I happen to like the original version
+                # better, I want to be able to right click it and mark
+                # that as the version to use."
+                entry["use"] = "tinted"
+                entry["script"] = entry["script_tinted"]
+        except Exception as _tx:  # noqa: BLE001
+            pipeline_log("drop", "the tinting pass failed - the plain "
+                         "round stands",
+                         extra=f"{type(_tx).__name__}: {_tx}"[:300])
     if bank:
         # #842: a round written for a PARTICULAR segment — a memo from
         # upstairs, a call on the request line — is handed back to its
@@ -54610,10 +54675,20 @@ def crystal_sources(c: dict[str, Any]) -> bool:
 
 def crystal_clause() -> str:
     """The world-tint. Every crystal switched ON leans the show's writing
-    toward its subject matter — hosts, callers, ads, the town itself."""
+    toward its subject matter — hosts, callers, ads, the town itself.
+
+    #1006: ...unless the tint is a SECOND PASS now, in which case this
+    says nothing and the first prompt writes the round plain. Tinting in
+    both places would tint it twice, and it would also make the "before"
+    of the before-and-after not actually be a before."""
     ons = crystal_active()
     if not ons:
         return ""
+    try:
+        if bool(dj_settings().get("crystal_tint_pass", True)):
+            return ""
+    except Exception:  # noqa: BLE001
+        pass
     parts = []
     for c in ons:
         strength = max(5, min(100, int(c.get("strength") or 50)))
@@ -54636,6 +54711,159 @@ def crystal_clause() -> str:
                 "through its world, and even the complaints sound like "
                 "its verses (#809).")
     return "\n" + " ".join(parts) + "\n"
+
+
+def crystal_tint_two_pass() -> bool:
+    """#1006: is the tint a second pass rather than a clause?"""
+    try:
+        if not crystal_active():
+            return False
+        return bool(dj_settings().get("crystal_tint_pass", True))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def crystal_material(most: int = 3, cap: int = 700) -> list[dict[str, Any]]:
+    """#1006: passages out of the crystal's own minds, for the SECOND
+    system prompt.
+
+    Drawn from the vector store the crystal's minds are already indexed
+    into - the same chunks the speakbox draws from, only from the
+    crystal's shelf rather than the studio's. Random rather than
+    similarity-matched, on purpose: the second pass is not looking for
+    the passage that matches the conversation, it is looking for the
+    world the conversation is being moved into, and a spread of it is a
+    better sample of that world than the nearest neighbour."""
+    out: list[dict[str, Any]] = []
+    try:
+        most = max(0, min(12, int(most)))
+        cap = max(120, min(4000, int(cap)))
+        if not most:
+            return out
+        pool: list[dict[str, Any]] = []
+        for c in crystal_active():
+            for rid in (c.get("minds") or []):
+                try:
+                    rows = list(_load_vectors(mind_id(rid)).get("chunks")
+                                or [])
+                except Exception:  # noqa: BLE001
+                    continue
+                for row in rows:
+                    text = str((row or {}).get("text") or "").strip()
+                    if len(text) < 40:
+                        continue
+                    pool.append({"crystal": str(c.get("name") or ""),
+                                 "mind": str(rid),
+                                 "file": str(row.get("file") or ""),
+                                 "text": text[:cap]})
+        if not pool:
+            return out
+        random.shuffle(pool)
+        seen: set[str] = set()
+        for row in pool:
+            key = row["text"][:80]
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(row)
+            if len(out) >= most:
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def crystal_world_prompt() -> str:
+    """#1006: the crystal's own world prompt, for the second pass."""
+    parts = []
+    for c in crystal_active():
+        name = str(c.get("name") or "the crystal")
+        tint = str(c.get("tint") or "").strip()
+        strength = max(5, min(100, int(c.get("strength") or 50)))
+        parts.append(f"{name} ({strength}%){': ' + tint if tint else ''}")
+    return "; ".join(parts)
+
+
+async def crystal_tint(script: str, kind: str = "") -> dict[str, Any]:
+    """#1006: THE SECOND PASS. Take a finished, untinted conversation and
+    move it into the crystal's world.
+
+    Returns the tinted script and the whole of its paperwork - the system
+    prompt that was armed, the chunks that were injected, the prompt as
+    sent, what came back and what it cost - because the operator asked to
+    "see this process in full" and a rewrite you cannot inspect is a
+    rewrite you cannot tune.
+
+    The STRUCTURE is preserved on purpose: the same speaker markers, the
+    same number of turns, the same beats in the same order. Anything else
+    and the two versions are not comparable, and #1016's whole point is
+    choosing between them."""
+    out: dict[str, Any] = {"ok": False, "script": "", "why": "",
+                           "armed": "", "prompt": "", "chunks": [],
+                           "world": "", "ms": 0}
+    try:
+        text = str(script or "").strip()
+        if not text:
+            out["why"] = "there was nothing to tint"
+            return out
+        if not crystal_active():
+            out["why"] = "no crystal is on, so nothing tints it"
+            return out
+        dj = dj_settings()
+        chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 3),
+                                  int(dj.get("crystal_tint_chars") or 700))
+        world = crystal_world_prompt()
+        out["world"] = world
+        out["chunks"] = chunks
+        armed = (
+            "YOU ARE THE TINTING PASS. A conversation has already been "
+            "written for this radio station and it is finished: the beats "
+            "are right, the people are right, the order is right. Your only "
+            "job is to move it INTO A WORLD.\n\n"
+            f"THE WORLD: {world}\n\n"
+            + ("HOW THAT WORLD TALKS - passages out of its own material, "
+               "which is the only description of it that counts:\n"
+               + "\n\n".join(f"[{c['file']}] {c['text']}" for c in chunks)
+               + "\n\n" if chunks else "")
+            + "WHAT TO CHANGE: the vocabulary, the imagery, the cadence, "
+              "the turns of phrase, the things people reach for as "
+              "comparisons. Let the world's diction fall out of ordinary "
+              "mouths.\n"
+              "WHAT NOT TO CHANGE: the speaker markers and their order; "
+              "the NUMBER of turns; who says what; every fact, name, "
+              "record, price and decision in it. Do not add turns and do "
+              "not remove any. Never name the world or the crystal out "
+              "loud.\n"
+              "Return ONLY the rewritten conversation, in exactly the same "
+              "marker format it came in.")
+        out["armed"] = armed
+        prompt = armed + "\n\nTHE CONVERSATION:\n" + text
+        out["prompt"] = prompt
+        began = time.monotonic()
+        got = await ask_model(prompt, limit=max(600, len(text) + 400))
+        out["ms"] = int((time.monotonic() - began) * 1000)
+        tinted = str(got or "").strip()
+        # A pass that came back empty, or that lost most of the round, is
+        # a failed pass and the untinted script stands. Better a plain
+        # round on the air than half a tinted one.
+        if not tinted:
+            out["why"] = "the tinting pass came back empty"
+            return out
+        if len(tinted) < len(text) * 0.45:
+            out["why"] = (f"the tinting pass came back {len(tinted)} chars "
+                          f"against {len(text)} - too much of the round was "
+                          "lost, so the plain one stands")
+            return out
+        out["ok"] = True
+        out["script"] = tinted
+        pipeline_log("speakbox",
+                     f"a round was tinted through {world or 'the crystal'} - "
+                     f"{len(chunks)} passage(s) of its own material in the "
+                     f"second prompt, {out['ms']}ms, {len(text)} chars in "
+                     f"and {len(tinted)} out. Both versions are kept (#1006)")
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"{type(exc).__name__}: {exc}"[:160]
+    return out
 
 
 def votes_read() -> dict[str, Any]:
@@ -54907,6 +55135,73 @@ async def _crystal_extract_launch(payload: dict[str, Any]) -> dict[str, Any]:
     crystals_save(data)
     return {"job": job_id, "crystal": cid, "minds": minds,
             "albums": len(groups), "tracks": len(tracks)}
+
+
+@app.post("/api/dj/pending/{row_id}/use")
+async def dj_pending_use(
+    row_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1016: choose which version of a tinted round actually goes out.
+
+    {"which": "tinted"} or {"which": "plain"}. Tinted is the default the
+    moment a round is tinted; this is the override for "if I happen to
+    like the original version better".
+
+    The audio is given up on a change, for the same reason #992 gives it
+    up on an edit: it no longer says what the round says. Choosing the
+    version already in use is a no-op and keeps the audio.
+    """
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    which = str(payload.get("which") or "").strip().lower()
+    if which not in ("tinted", "plain"):
+        raise HTTPException(status_code=400, detail="tinted or plain")
+    for entry in list(_LARDER):
+        try:
+            rid = hashlib.sha1(
+                str(entry.get("script") or "").encode("utf-8", "ignore")
+            ).hexdigest()[:10]
+        except Exception:  # noqa: BLE001
+            continue
+        if rid != str(row_id):
+            continue
+        plain = str(entry.get("script_plain") or "")
+        tinted = str(entry.get("script_tinted") or "")
+        if not (plain and tinted):
+            raise HTTPException(
+                status_code=409,
+                detail="this round has only one version - it was written "
+                       "with no crystal on, or the tinting pass did not "
+                       "come back")
+        want = tinted if which == "tinted" else plain
+        if str(entry.get("script") or "") == want:
+            return {"which": which, "changed": False,
+                    "say": f"the {which} version was already the one in use"}
+        entry["script"] = want
+        entry["use"] = which
+        # The audio was cut for the other words.
+        for gone in ("takes", "keys", "made", "seconds", "prepared",
+                     "partial", "chunks", "prep_turns", "yielded",
+                     "yielded_at"):
+            entry.pop(gone, None)
+        entry["frozen"] = True          # the choice is final
+        entry["freshened"] = True       # and the model is not asked again
+        entry["profile"] = _larder_profile_signature()
+        _larder_save()
+        pipeline_log("speakbox", f"the {which} version of a round was "
+                     "chosen - its audio is given up and the recording "
+                     "room cuts the words that are actually going out "
+                     "(#1016)")
+        return {"which": which, "changed": True,
+                "say": f"the {which} version goes out - it is being "
+                       "recorded again now"}
+    raise HTTPException(status_code=404, detail="no such round in the reserve")
 
 
 @app.post("/api/dj/pending/{row_id}/script")
@@ -59719,6 +60014,136 @@ async def api_doc(
     raise HTTPException(status_code=404, detail="no such document")
 
 
+@app.get("/api/tint")
+async def api_tint_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1006: THE WHOLE PROCESS, said in order.
+
+    "I want to be able to see this process in full that takes the pine
+    box FM settings and utilizes them to build the foundation that we
+    inject with speakerbox text to generate, that we then generate using
+    the tinting of the crystal to then get the desired result."
+
+    So: the stages, in the order they happen, with what each one is
+    drawing on right now and the dials that govern it."""
+    require_read_auth(authorization)
+    dj = dj_settings()
+    ons = crystal_active()
+    two = crystal_tint_two_pass()
+    try:
+        armed = load_settings()
+        armed_name = str((armed["prompts"][armed["active_prompt"]]
+                          or {}).get("name") or "")
+    except Exception:  # noqa: BLE001
+        armed_name = ""
+    return {
+        "two_pass": two,
+        "crystals_on": [{"name": str(c.get("name") or ""),
+                         "strength": int(c.get("strength") or 0),
+                         "tint": str(c.get("tint") or ""),
+                         "minds": list(c.get("minds") or []),
+                         "sources_words": crystal_sources(c)}
+                        for c in ons],
+        "chunks": int(dj.get("crystal_tint_chunks") or 0),
+        "chars": int(dj.get("crystal_tint_chars") or 0),
+        "stages": [
+            {"n": 1, "name": "the foundation",
+             "what": "the station's own system prompt and radio prompts, "
+                     "plus the segment's standing instruction",
+             "now": armed_name or "the armed prompt",
+             "dials": ["the prompt desk", "the schedule's per-entry prompt"]},
+            {"n": 2, "name": "the speakbox injection",
+             "what": "passages out of your own documents, folded into the "
+                     "prompt as material rather than instruction",
+             "now": f"{int(float(dj.get('speakbox_rate') or 0) * 100)}% "
+                    "grounding, prepend "
+                    f"{int(float(dj.get('speakbox_prepend_rate') or 0) * 100)}"
+                    "%, full swath "
+                    f"{int(float(dj.get('speakbox_full_swath_rate') or 0) * 100)}"
+                    f"% up to {int(dj.get('speakbox_full_swath_chars') or 0)} "
+                    "chars",
+             "dials": ["speakbox_rate", "speakbox_prepend_rate",
+                       "speakbox_append_rate", "speakbox_full_swath_rate",
+                       "speakbox_full_swath_chars"]},
+            {"n": 3, "name": "the conversation",
+             "what": "the model writes the round from 1 and 2. With the "
+                     "second pass on, this is written UNTINTED and is what "
+                     "the reserve keeps as the original",
+             "now": "untinted" if two else "tinted in this same pass",
+             "dials": ["talk_radio", "the segment's line count",
+                       "temperature and spice"]},
+            {"n": 4, "name": "the tinting pass",
+             "what": "the finished conversation is sent back through the "
+                     "model with the crystal's world prompt and passages "
+                     "of the crystal's OWN material as the system prompt, "
+                     "and told to move it into that world without changing "
+                     "the structure or the facts",
+             "now": (f"{len(ons)} crystal(s) on, "
+                     f"{int(dj.get('crystal_tint_chunks') or 0)} passage(s) "
+                     f"of up to {int(dj.get('crystal_tint_chars') or 0)} "
+                     "chars injected" if two else
+                     "off - the tint rides in stage 1 as a clause instead"),
+             "dials": ["crystal_tint_pass", "crystal_tint_chunks",
+                       "crystal_tint_chars", "each crystal's strength"]},
+            {"n": 5, "name": "the choice",
+             "what": "both versions are kept on the round. Tinted is used "
+                     "by default; either one can be chosen in the reserve",
+             "now": "tinted by default" if two else "one version only",
+             "dials": ["the two thumbs on a reserve round (#1016)"]},
+        ],
+        "say": (("the tint is a second pass: rounds are written plain, then "
+                 "rewritten through " + crystal_world_prompt())
+                if two else
+                ("no crystal is on, so nothing is tinted"
+                 if not ons else
+                 "the tint rides in the first prompt as a clause")),
+    }
+
+
+@app.post("/api/prefs/tint")
+async def api_tint_prefs(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1006: the dials on the tinting pass - whether it happens at all,
+    how many passages of the crystal's own material go into the second
+    system prompt, and how long each of them may be."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    store = load_settings()
+    seat = store.setdefault("dj", {})
+    if body.get("two_pass") is not None:
+        seat["crystal_tint_pass"] = bool(body.get("two_pass"))
+    if body.get("chunks") is not None:
+        try:
+            seat["crystal_tint_chunks"] = max(0, min(12, int(
+                float(body.get("chunks") or 0))))
+        except (TypeError, ValueError):
+            pass
+    if body.get("chars") is not None:
+        try:
+            seat["crystal_tint_chars"] = max(120, min(4000, int(
+                float(body.get("chars") or 700))))
+        except (TypeError, ValueError):
+            pass
+    save_settings(store)
+    dj = dj_settings()
+    return {"two_pass": bool(dj.get("crystal_tint_pass")),
+            "chunks": int(dj.get("crystal_tint_chunks") or 0),
+            "chars": int(dj.get("crystal_tint_chars") or 0),
+            "say": ("the tint is a second pass over the finished round, with "
+                    f"{int(dj.get('crystal_tint_chunks') or 0)} passage(s) of "
+                    f"up to {int(dj.get('crystal_tint_chars') or 0)} chars "
+                    "of the crystal's own material in the system prompt"
+                    if dj.get("crystal_tint_pass") else
+                    "the tint rides in the first prompt as a clause")}
+
+
 @app.post("/api/prefs/tip-delay")
 async def api_tip_delay(
     request: Request,
@@ -60212,6 +60637,24 @@ async def dj_pending(
             # and what it cost.
             "desk": entry.get("desk") or {},
             "edited": bool(entry.get("edited")),
+            # #1006/#1016: BOTH VERSIONS, and which one is going out.
+            # `use` is "" for a round that was never tinted, which is how
+            # the reserve knows to draw one thumb rather than two.
+            "use": str(entry.get("use") or ""),
+            "script_plain": str(entry.get("script_plain") or "")[:12000],
+            "script_tinted": str(entry.get("script_tinted") or "")[:12000],
+            "tint": {
+                "ok": bool((entry.get("tint") or {}).get("ok")),
+                "why": str((entry.get("tint") or {}).get("why") or ""),
+                "world": str((entry.get("tint") or {}).get("world") or ""),
+                "ms": int((entry.get("tint") or {}).get("ms") or 0),
+                "armed": str((entry.get("tint") or {}).get("armed")
+                             or "")[:6000],
+                "prompt": str((entry.get("tint") or {}).get("prompt")
+                              or "")[:8000],
+                "chunks": list((entry.get("tint") or {}).get("chunks")
+                               or [])[:12],
+            } if entry.get("tint") else {},
         })
     window = pantry_window()
     return {

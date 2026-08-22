@@ -2995,6 +2995,57 @@ function initWorksPopup() {
               + "cursor:pointer";
             return b;
           };
+          /* #1016: TWO THUMBS - what was written, and what the crystal
+           * made of it. Only on a round that actually has both; a round
+           * written with no crystal on has one version and drawing an
+           * empty second thumb beside it would be a lie about the
+           * process. Left click reads one, right click chooses it. */
+          if (r.script_plain && r.script_tinted) {
+            const thumbs = mk("div", "");
+            thumbs.style.cssText = "display:flex;gap:6px;margin-top:6px";
+            [["plain", "\u2460 as written", r.script_plain,
+              "The conversation the station wrote from its own prompts and "
+              + "the speakbox material, before any crystal touched it"],
+             ["tinted", "\u2461 tinted", r.script_tinted,
+              "The same conversation run through the crystal a second time "
+              + "- its world prompt and passages of its own material in the "
+              + "system prompt"]
+            ].forEach((row) => {
+              const on = String(r.use || "tinted") === row[0];
+              const th = mk("button", "", row[1] + (on ? " \u2713" : ""));
+              th.title = row[3] + ".\n\nClick to read it. Right-click to "
+                + "make it the version that goes out.";
+              th.style.cssText = "flex:1 1 0;min-width:0;font-size:9px;"
+                + "padding:5px 6px;border-radius:6px;cursor:pointer;"
+                + "text-align:left;line-height:1.35;overflow:hidden;"
+                + "text-overflow:ellipsis;white-space:nowrap;"
+                + "border:1px solid " + (on ? "#7ce8a9" : "#24384a")
+                + ";background:" + (on ? "rgba(124,232,169,.10)" : "#0b1520")
+                + ";color:" + (on ? "#bff3d6" : "#9fd8ff");
+              th.onclick = (ev) => {
+                ev.stopPropagation();
+                wkVersionRead(r, row[0], row[1], row[2]);
+              };
+              th.oncontextmenu = (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                wkVersionUse(r, row[0]);
+              };
+              thumbs.appendChild(th);
+            });
+            inner.appendChild(thumbs);
+            if (r.tint && r.tint.world) {
+              const note = mk("div", "",
+                "tinted through " + r.tint.world
+                + (r.tint.chunks && r.tint.chunks.length
+                   ? " \u00b7 " + r.tint.chunks.length + " passage(s) of its "
+                     + "own material in the second prompt" : "")
+                + (r.tint.ms ? " \u00b7 " + Math.round(r.tint.ms / 100) / 10
+                               + "s" : ""));
+              note.style.cssText = "font-size:9px;opacity:.62;margin-top:3px";
+              inner.appendChild(note);
+            }
+          }
           const paper = tbtn("\u2637 the paperwork",
             "What was sent to the model, what was governing it, "
             + "and what came back");
@@ -6237,6 +6288,88 @@ function wkRoundPaper(r) {
   }
   document.body.appendChild(d);
   try { pvFloatDesk(d); } catch (e) {}
+}
+
+/* #1016: read one version of a tinted round, whole. */
+function wkVersionRead(r, which, label, text) {
+  const gone = document.getElementById("wkVersion");
+  if (gone) gone.remove();
+  const d = document.createElement("div");
+  d.id = "wkVersion";
+  d.style.cssText = "position:fixed;left:50%;top:50%;"
+    + "transform:translate(-50%,-50%);width:min(760px,94vw);max-height:86vh;"
+    + "overflow:auto;z-index:300;background:#070c12;border:1px solid #24384a;"
+    + "border-radius:10px;padding:12px 14px;box-shadow:0 20px 60px #000c";
+  const mk2 = (tag, css, t) => {
+    const n = document.createElement(tag);
+    if (css) n.style.cssText = css;
+    if (t != null) n.textContent = String(t);
+    return n;
+  };
+  const head = mk2("div", "display:flex;gap:8px;align-items:baseline;"
+    + "margin-bottom:8px");
+  head.appendChild(mk2("b", "flex:1;font-size:13px;color:#9fd8ff",
+    label + " \u2014 " + (r["for"] || "a round")));
+  const x = mk2("button", "font-size:11px;padding:2px 8px;cursor:pointer",
+    "\u2715");
+  x.onclick = () => d.remove();
+  head.appendChild(x);
+  d.appendChild(head);
+  const on = String(r.use || "tinted") === which;
+  const state = mk2("div", "font-size:10px;margin-bottom:8px;color:"
+    + (on ? "#7ce8a9" : "#8ba0b5"),
+    on ? "This is the version that goes out."
+       : "This is NOT the version going out. Use the button below to make "
+         + "it the one, or right-click its thumb in the reserve.");
+  d.appendChild(state);
+  d.appendChild(mk2("pre", "white-space:pre-wrap;word-break:break-word;"
+    + "font-size:11px;line-height:1.55;margin:0;padding:8px 10px;"
+    + "background:#05090f;border:1px solid #1b2c3c;border-radius:6px;"
+    + "max-height:52vh;overflow:auto;color:#dbe6f0", text || ""));
+  if (!on) {
+    const use = mk2("button", "margin-top:9px;font-size:10px;padding:4px 10px;"
+      + "cursor:pointer", "\u2713 use this one");
+    use.onclick = () => { d.remove(); wkVersionUse(r, which); };
+    d.appendChild(use);
+  }
+  /* #1006: "I want to see a meticulous breakdown for the initial prompt
+   * and how it comes together." The tinted side shows the whole of its
+   * second pass - the world, the chunks that were injected, and the
+   * prompt exactly as it was sent. */
+  if (which === "tinted" && r.tint) {
+    const part = (title, body) => {
+      const t = String(body || "").trim();
+      if (!t) return;
+      d.appendChild(mk2("div", "font-size:9px;letter-spacing:.06em;"
+        + "opacity:.75;margin:10px 0 3px;color:#7fb0c9", title));
+      d.appendChild(mk2("pre", "white-space:pre-wrap;word-break:break-word;"
+        + "font-size:10px;line-height:1.5;margin:0;padding:7px 9px;"
+        + "background:#05090f;border:1px solid #1b2c3c;border-radius:6px;"
+        + "max-height:28vh;overflow:auto;color:#c8d6e4", t));
+    };
+    part("THE WORLD IT WAS TINTED THROUGH", r.tint.world);
+    (r.tint.chunks || []).forEach((c, i) => {
+      part("PASSAGE " + (i + 1) + " INJECTED FOR REFERENCE \u2014 "
+           + (c.file || c.mind || ""), c.text);
+    });
+    part("THE SECOND SYSTEM PROMPT, AS ARMED", r.tint.armed);
+    part("THE SECOND PROMPT, AS SENT", r.tint.prompt);
+    if (!r.tint.ok && r.tint.why) part("WHY IT DID NOT TAKE", r.tint.why);
+  }
+  document.body.appendChild(d);
+  try { pvFloatDesk(d); } catch (e) {}
+}
+
+/* #1016: make one version the one that goes out. */
+function wkVersionUse(r, which) {
+  api.post("/api/dj/pending/" + encodeURIComponent(r.id) + "/use",
+           {which: which})
+    .then((got) => {
+      try { noteRouteOk(String((got && got.say) || "")); } catch (e) {}
+    })
+    .catch((err) => {
+      try { noteRouteError(err.message); } catch (e) {}
+    });
 }
 
 /* #992: rewrite a banked round by hand and send it back to be cut. */
