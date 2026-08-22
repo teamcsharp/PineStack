@@ -873,6 +873,10 @@ DEFAULT_DJ = {
     # resting the coldest airs anyway, because a station that would
     # rather go quiet than repeat itself is not a station.
     "chunk_cool_seconds": 3600,
+    # #1045: the ONE context size every model call loads at. Changing it
+    # rebuilds both runners once; leaving it alone is what stops them
+    # rebuilding sixty times an hour.
+    "model_ctx": 65536,
     # How much of the crystal's own material goes into the SECOND system
     # prompt, and how long each piece may be. This is the dial the
     # operator asked to be able to adjust: "I want to be able to see the
@@ -1475,6 +1479,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "chunk_cool_seconds": max(0, min(86400, int(               # #1042
             raw_dj.get("chunk_cool_seconds",
                        DEFAULT_DJ["chunk_cool_seconds"]) or 0))),
+        "model_ctx": max(2048, min(131072, int(                    # #1045
+            raw_dj.get("model_ctx", DEFAULT_DJ["model_ctx"]) or 0)
+            or DEFAULT_DJ["model_ctx"])),
         "crystal_tint_chunks": max(0, min(12, int(float(            # #1006
             raw_dj.get("crystal_tint_chunks",
                        DEFAULT_DJ["crystal_tint_chunks"]) or 0)))),
@@ -20707,12 +20714,14 @@ async def prep_track_talk() -> bool:
             # WITH the track. This is the whole difference from a banked
             # round: it may name the song, because it will only ever be
             # said over this song.
-            raw = await dj_line("intro", track, room=6)          # #1038
+            # #1045: was room=6 - up to six model visits, eighteen with
+            # retries, for one radio link, fifteen times an hour. One.
+            raw = await dj_line("intro", track, room=1)          # #1038
             kind = "intro"
             who = "dj"
         else:
             raw = await dj_line(
-                "interject", track, room=6,                          # #1038
+                "interject", track, room=1,                          # #1045
                 extra="that record has just finished playing - see it off: "
                       "say what you made of it, name it once, and hand over "
                       "to whatever is coming next")
@@ -21430,8 +21439,21 @@ async def pantry_keeper() -> None:
                 # selling entry three minutes out still has nothing
                 # behind it. Same reasoning as the outer stand-down
                 # above, which #934 already taught this lesson to.
-                if (pantry_seconds() >= target and not _call_owed
+                # #1046: prepared_seconds, NOT pantry_seconds. The latter
+                # counts the whole render cache including everything
+                # already broadcast - measured, 7806s of it against a
+                # 7200s target, so this ceiling was satisfied by audio
+                # the listener had already heard while the airable
+                # reserve was zero. #930 fixed the outer stand-down for
+                # exactly this reason and these two sites kept the old
+                # call.
+                if (prepared_seconds() >= target and not _call_owed
                         and not _hour_short):
+                    pipeline_log("lookahead",
+                                 "standing down - "
+                                 f"{int(prepared_seconds())}s is already "
+                                 f"prepared against a {int(target)}s "
+                                 "target (#1046)")
                     break
                 try:
                     _plan = prep_plan(_skipped)
@@ -21480,7 +21502,7 @@ async def pantry_keeper() -> None:
                                if quota_behind("caller") else "")
                             + " (#871)")
                         _kind = "caller"
-                    elif pantry_seconds() >= target:
+                    elif prepared_seconds() >= target:               # #1046
                         # Past the depth ceiling, and a call will not fit
                         # this window. Build nothing rather than spend
                         # the room on something the hour has not asked
@@ -21494,6 +21516,16 @@ async def pantry_keeper() -> None:
                 # bumper is exempt: its liners are brewed in the
                 # background and taken off a stack, not written here.
                 if _OLLAMA_GATE.locked() and _kind != "station_id":
+                    # #1046: and it SAYS SO. This skip, the depth ceiling
+                    # above and the bare except below were the three ways
+                    # a pass could build nothing, and none of them logged
+                    # anything - which is why an empty reserve read as a
+                    # mystery rather than as a measurement.
+                    if _kind not in _skipped:
+                        pipeline_log("lookahead",
+                                     f"{_kind} skipped - both model slots "
+                                     "are busy and live work outranks "
+                                     "preparing (#1046)")
                     _skipped.add(_kind)
                     continue
                 prep_log_plan(_plan)
@@ -21518,7 +21550,17 @@ async def pantry_keeper() -> None:
                 if _did:
                     break               # one item a visit; come back soon
                 _skipped.add(_kind)     # that road had nothing; try another
-        except Exception:  # noqa: BLE001
+        except Exception as _exc:  # noqa: BLE001
+            # #1046: a preparation pass that dies used to die in total
+            # silence, and the only symptom was a reserve that never
+            # filled. It still must not take the keeper down with it.
+            try:
+                pipeline_log("lookahead",
+                             "the preparation pass fell over: "
+                             f"{type(_exc).__name__}: {_exc}"[:200]
+                             + " (#1046)")
+            except Exception:  # noqa: BLE001
+                pass
             pass
 
 
@@ -38838,13 +38880,18 @@ async def drop_liner_brew(want: int = 6) -> None:
         fresh.append(line)
     if not fresh:
         return
-    # #1038: a brew, banked in _DROP_FRESH and said over the next hour.
-    # Each is one short line, so one ask each.
-    try:
-        fresh = [await crystal_line(f, "a drop", 1) for f in fresh]
-        fresh = [f for f in fresh if 4 < len(f) <= 240]
-    except Exception:  # noqa: BLE001
-        pass
+    # #1046: THE DROPS LOSE THEIR TINT, and the reason is not about
+    # drops. pantry_keeper exempts one road from the "the model is busy,
+    # skip this" rule - the bumper - because "its liners are brewed in
+    # the background and taken off a stack, not written here". #1038 put
+    # a model visit inside this brew, one per line and six lines a brew,
+    # which made that comment false: prep_one("station_id") began
+    # waiting on the same saturated gate as everything it was exempt
+    # from, and the last road that could still bank anything stopped.
+    #
+    # These are four-to-ninety-character quips, the shortest thing the
+    # station says. They are the cheapest thing to give up and the
+    # exemption is worth more than they are.
     _DROP_FRESH.extend(fresh)
     del _DROP_FRESH[24:]
     if seed:
@@ -51394,6 +51441,32 @@ def whole_sentences(text: str) -> str:
 # cache on a GPU the voices are also using, so it is spent where it buys
 # something — a recap has to hold the hour it is recapping; a sting does
 # not. Temperature follows the job rather than one house setting.
+# #1045: THE ONE CONTEXT SIZE THE STATION LOADS ITS MODELS AT.
+#
+# num_ctx is a load-time parameter. Every distinct value is a separate
+# runner build, and this station was asking for five of them by segment
+# kind - 61.3 forced rebuilds an hour, 1,470 seconds of gate time an
+# hour, a fifth of everything the box can do, spent loading rather than
+# writing. Pinned, the runners load once and stay.
+#
+# 65536 because it is what the busiest roads (banter, callers) asked
+# for and it holds every prompt the station builds with room to spare.
+MODEL_CTX = 65536
+
+
+def model_ctx() -> int:
+    """The context size for every model call, whoever asked."""
+    try:
+        got = int(dj_settings().get("model_ctx") or 0)
+    except Exception:  # noqa: BLE001
+        got = 0
+    return max(2048, min(131072, got or MODEL_CTX))
+
+
+# #1045: the num_ctx column here NO LONGER APPLIES - see model_ctx. It
+# is left in place because it records what each kind was thought to
+# need, and that is worth knowing if the pinning is ever revisited.
+# `spice` still applies: it is a creative dial and costs nothing.
 WRITING_PROFILES: dict[str, dict[str, float]] = {
     "recap":         {"num_ctx": 131072, "spice": 0.45},
     "deep":          {"num_ctx": 131072, "spice": 0.60},
@@ -51546,9 +51619,11 @@ async def ask_model(prompt: str, limit: int = 300,
         # in. The setting still governs; this only stops clamping it.
         # #853: the caller's own argument wins; then the brief for this
         # segment; then the operator's setting.
-        num_ctx=max(2048, min(131072, num_ctx
-                              or int(writing_profile().get("num_ctx") or 0)
-                              or settings["num_ctx"])),
+        # #1045: PINNED. The caller's argument and the segment brief are
+        # both ignored on purpose - see model_ctx. Every value they
+        # could supply is another runner rebuild, and the rebuild costs
+        # more than the extra room was ever worth.
+        num_ctx=model_ctx(),
     )
     answer = ((result.get("message") or {}).get("content") or "").strip()
     answer = re.sub(r"<think>.*?</think>", " ", answer, flags=re.S)
@@ -51581,9 +51656,7 @@ async def ask_model(prompt: str, limit: int = 300,
                 "name") or "")
         except Exception:  # noqa: BLE001
             _armed = ""
-        _ctx = max(2048, min(131072, num_ctx
-                             or int(writing_profile().get("num_ctx") or 0)
-                             or settings["num_ctx"]))
+        _ctx = model_ctx()                                       # #1045
     except Exception:  # noqa: BLE001
         _armed, _ctx = "", 0
     # #1019: WAS THE CRYSTAL IN THIS PROMPT, AND HOW.
@@ -55982,6 +56055,49 @@ def _looks_meta(said: str) -> bool:
         return False
 
 
+def tint_pressure() -> str:
+    """#1045: is the station in no state to afford a rewrite?
+
+    tint_should_stop used to ask one question - is a forced interjection
+    waiting - and argued in its own docstring that the tint "runs over a
+    different gate entirely". It does not. crystal_turn calls ask_model
+    calls the same _OLLAMA_GATE as every other road on the station, and
+    measured, the tint is FIFTY-EIGHT PERCENT of all model load.
+
+    So in the exact state where it had to stand down - reserve empty,
+    gate jammed, the desk unable to get a word written - it ran flat
+    out, and the thing it was starving was the writing that gives it
+    something to tint.
+
+    #1047: and the brake is the RESERVE, not the gate. A full gate is
+    the normal state of a working station - measured, 99.6% of the time
+    - so braking on it is an off switch, not a brake. How much finished
+    radio is waiting is the honest question."""
+    try:
+        if render_relief():
+            return "the rooms are calling for relief"
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        depth = float(box_depth())
+    except Exception:  # noqa: BLE001
+        return ""                       # cannot tell; do not stand in the way
+    # Living hand to mouth. Every model second belongs to getting words
+    # written, and a rewrite is the most postponable thing on the
+    # station. 0.35 rather than something smaller because the reserve
+    # sat at 0.22-0.29 for the whole outage this was written for.
+    if depth < 0.35:
+        return "the reserve is too thin to spend a rewrite on"
+    # Comfortable but not deep: the rewrite happens, and it gets out of
+    # the way the moment both slots are wanted by somebody else.
+    try:
+        if depth < 0.60 and _OLLAMA_GATE.locked():
+            return "both model slots are wanted and the reserve is not deep"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def tint_should_stop() -> str:
     """#1018: may the tinting pass carry on?
 
@@ -55999,7 +56115,7 @@ def tint_should_stop() -> str:
             return _PREP_YIELD_WHY[0] or "a forced interjection"
     except Exception:  # noqa: BLE001
         return ""
-    return ""
+    return tint_pressure()                                       # #1045
 
 
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
@@ -56108,6 +56224,8 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 "properly this time - different words, their images, "
                 "their rhyme - keeping only the facts.",
                 limit=_may + 120, spice=0.75,                    # #1035
+                model=str(dj_settings().get(                      # #1045
+                    "crystal_tint_model") or ""),
                 mark={"kind": "tint turn", "for": "the same turn, asked "
                                                   "again after it came "
                                                   "back unchanged"})
@@ -56173,41 +56291,45 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
             return said            # nothing to be tinted BY
         world = crystal_world_prompt()
         started = time.monotonic()
-        # #1038: the tint owns its own deadline, exactly as crystal_tint
-        # does. Without this the preparer's window closes underneath it
-        # and a half-tinted line is what airs.
-        _room_was = _PREP_DEADLINE[0]
-        _per = (45.0 if str(dj.get("crystal_tint_model") or "")
-                else TINT_TURN_SECONDS)
-        try:
-            _PREP_DEADLINE[0] = time.time() + max(60.0, _per * room + 30.0)
-            if room < 2:
+        # #1045: IT NO LONGER TOUCHES _PREP_DEADLINE. #1038 pushed the
+        # preparer's deadline out by up to three hundred seconds so the
+        # tint could finish - which disabled prep_should_stop's "used the
+        # room it was given" check for five minutes, and that check is
+        # the one budget mechanism that would have stopped the tint
+        # eating the station. A road that cannot afford the rewrite
+        # should lose the rewrite, not the budget.
+        #
+        # It could not have been correct as written in any case: a bare
+        # global saved and restored around an await, with several of
+        # these in flight at once, restores whatever the last one to
+        # finish happened to have saved - and a stale absolute deadline
+        # already in the past makes prep_should_stop refuse everything
+        # until the next pass clears it.
+        if room < 2:
+            out = await crystal_turn(said, world, chunks, keep=keep)
+        else:
+            # Sentence by sentence, each one written knowing the last.
+            bits = [b.strip() for b in
+                    re.split(r"(?<=[.!?])\s+", said) if b.strip()]
+            if len(bits) > room:
+                # Too many to take one at a time: fold the tail into
+                # the last piece rather than leaving it untinted.
+                bits = bits[:room - 1] + [" ".join(bits[room - 1:])]
+            if len(bits) < 2:
                 out = await crystal_turn(said, world, chunks, keep=keep)
             else:
-                # Sentence by sentence, each one written knowing the last.
-                bits = [b.strip() for b in
-                        re.split(r"(?<=[.!?])\s+", said) if b.strip()]
-                if len(bits) > room:
-                    # Too many to take one at a time: fold the tail into
-                    # the last piece rather than leaving it untinted.
-                    bits = bits[:room - 1] + [" ".join(bits[room - 1:])]
-                if len(bits) < 2:
-                    out = await crystal_turn(said, world, chunks, keep=keep)
-                else:
-                    done: list[str] = []
-                    for bit in bits:
-                        if tint_should_stop():
-                            # Out of time: the rest goes out as written.
-                            done.append(bit)
-                            continue
-                        got = await crystal_turn(
-                            bit, world, chunks,
-                            answering=(done[-1] if done else ""),
-                            keep=keep)
-                        done.append(str(got or bit).strip())
-                    out = " ".join(d for d in done if d).strip()
-        finally:
-            _PREP_DEADLINE[0] = _room_was
+                done: list[str] = []
+                for bit in bits:
+                    if tint_should_stop():
+                        # Out of time: the rest goes out as written.
+                        done.append(bit)
+                        continue
+                    got = await crystal_turn(
+                        bit, world, chunks,
+                        answering=(done[-1] if done else ""),
+                        keep=keep)
+                    done.append(str(got or bit).strip())
+                out = " ".join(d for d in done if d).strip()
         out = " ".join(str(out or "").split()).strip()
         if len(out) < TINT_TURN_FLOOR // 2:
             return said
