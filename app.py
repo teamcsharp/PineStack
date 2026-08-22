@@ -60014,6 +60014,174 @@ async def api_doc(
     raise HTTPException(status_code=404, detail="no such document")
 
 
+# #980: GLYPHY, THE CONDUCTOR.
+#
+# "I want him integrated into the project animated and reflecting the
+# 'conductor' manager system keeping the clips rendering and making sure
+# the trains run on time... have him anxious, pleased, watching, angry,
+# rushing and thinking as modes to cycle between telling me how the
+# orchestrator is doing at large."
+#
+# He comes from monk_3, where he is an ASCII avatar - a <pre> of
+# monospaced glyph rows that animates through named states - so the
+# character carries over exactly rather than being reinterpreted: the
+# same 24x6 face, the same technique, animated in the panel.
+#
+# WHAT MAKES HIM MOVE. Nothing here is decorative and nothing is a guess.
+# Every mood is a reading of a measurement the coordinator already takes,
+# in the order that matters, and he says WHICH measurement put him in it.
+# A face that pulls a worried expression at random is worse than no face;
+# a face that is worried because News coverage takes the air in ninety
+# seconds with nothing recorded is a glance-able instrument.
+GLYPHY_MOODS = ("angry", "anxious", "rushing", "thinking", "watching",
+                "pleased")
+
+
+def glyphy_state() -> dict[str, Any]:
+    """#980: how the conductor is doing, and why."""
+    out: dict[str, Any] = {"at": time.time(), "mood": "watching",
+                           "say": "", "why": "", "console": []}
+    try:
+        brief = coord_brief()
+    except Exception:  # noqa: BLE001
+        brief = {}
+    try:
+        # --- the readings, cheapest first --------------------------------
+        gap = 0.0
+        try:
+            gap = float(_GAP_OPEN.get("seconds") or 0) if _GAP_OPEN else 0.0
+        except Exception:  # noqa: BLE001
+            gap = 0.0
+        held = 0
+        try:
+            held = len(_BOX_HOLD)
+        except Exception:  # noqa: BLE001
+            held = 0
+        writing = False
+        try:
+            writing = bool(_LARDER_WRITING[0] or _OLLAMA_GATE.locked())
+        except Exception:  # noqa: BLE001
+            writing = False
+        recording = str((_RADIO.get("activity") or {}).get("stage") or "")
+        banked = 0.0
+        target = 1.0
+        try:
+            banked = float(prepared_seconds())
+            target = max(1.0, float(prepare_target_seconds()))
+        except Exception:  # noqa: BLE001
+            pass
+        soon = None
+        bare = 0
+        try:
+            for up in coord_upcoming(900.0):
+                if up.get("cannot") or up.get("covered"):
+                    continue
+                if up.get("bare"):
+                    bare += 1
+                if soon is None or float(up.get("starts_in") or 0) < float(
+                        soon.get("starts_in") or 1e9):
+                    soon = up
+        except Exception:  # noqa: BLE001
+            pass
+        relief = False
+        try:
+            relief = bool(render_relief())
+        except Exception:  # noqa: BLE001
+            relief = False
+
+        # --- the mood, in the order that matters -------------------------
+        mood, why, say = "watching", "", ""
+        if gap >= COORD_SPOT_AFTER or held >= 3:
+            mood = "angry"
+            why = (f"the air has been quiet {int(gap)}s" if gap else
+                   f"{held} finished line(s) are held and none are playing")
+            say = ("Something is wrong with the AIR, not with the work. "
+                   + why + ".")
+        elif soon is not None and float(soon.get("starts_in") or 0) < 180 \
+                and not float(soon.get("held_seconds") or 0):
+            mood = "anxious"
+            why = (f"{soon.get('label')} takes the air in "
+                   f"{int(float(soon.get('starts_in') or 0))}s with nothing "
+                   "recorded for it")
+            say = why[0].upper() + why[1:] + ". I am on it."
+        elif relief or banked < target * 0.25:
+            mood = "rushing"
+            why = ("the clone engine is in relief, so only cached lines "
+                   "are being harvested" if relief else
+                   f"only {int(banked / 60)} min is banked against the "
+                   f"{int(target / 60)} min the dial asks for")
+            say = "Behind, and moving. " + why[0].upper() + why[1:] + "."
+        elif writing:
+            mood = "thinking"
+            why = "the writing desk has a round on the go"
+            say = "Writing the next one."
+        elif recording in ("voicing", "recasting"):
+            mood = "rushing"
+            why = "somebody is at the microphone"
+            say = "In the room, cutting lines."
+        elif bare:
+            mood = "watching"
+            _one = bare == 1
+            why = (f"{bare} coming entry has nothing behind it" if _one
+                   else f"{bare} coming entries have nothing behind them")
+            say = ("Keeping an eye on one that is still bare." if _one
+                   else f"Keeping an eye on {bare} that are still bare.")
+        elif banked >= target * 0.9:
+            mood = "pleased"
+            why = (f"{int(banked / 60)} min banked against the "
+                   f"{int(target / 60)} min asked for, and nothing coming "
+                   "up is bare")
+            say = "The trains are running on time."
+        else:
+            mood = "watching"
+            why = (f"{int(banked / 60)} min banked, nothing on fire")
+            say = "Watching the board."
+        out["mood"] = mood
+        out["why"] = why
+        out["say"] = say
+        out["banked_minutes"] = round(banked / 60.0, 1)
+        out["target_minutes"] = round(target / 60.0, 1)
+        out["bare"] = bare
+        out["brief"] = str(brief.get("say") or "")
+        if soon is not None:
+            out["next"] = {
+                "label": str(soon.get("label") or ""),
+                "in": round(float(soon.get("starts_in") or 0), 1),
+                "held": round(float(soon.get("held_seconds") or 0), 1),
+                "owns": round(float(soon.get("owns_seconds") or 0), 1)}
+    except Exception:  # noqa: BLE001
+        out["say"] = "the conductor could not read the board"
+    # --- the console: what the coordinator has actually DONE -------------
+    #
+    # "Anything carried out by the coordinator / constructor needs to be
+    # reflected by glyphy." These are the kinds the preparer, the
+    # coordinator and the rooms write to, so the slider is the conductor's
+    # own commentary and not a general log.
+    try:
+        want = ("lookahead", "air", "speakbox", "drop", "call", "model",
+                "switchboard", "gallery", "voice")
+        rows = [e for e in (_RADIO.get("pipeline") or [])
+                if str(e.get("kind") or "") in want]
+        out["console"] = [{"ts": int(e.get("ts") or 0),
+                           "kind": str(e.get("kind") or ""),
+                           "text": str(e.get("text") or "")[:200]}
+                          for e in rows[-40:]]
+    except Exception:  # noqa: BLE001
+        out["console"] = []
+    return out
+
+
+@app.get("/api/glyphy")
+async def api_glyphy(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#980: the conductor's face - which of the six moods he is in, the
+    measurement that put him in it, and the running console of everything
+    the coordinator and the rooms are carrying out."""
+    require_read_auth(authorization)
+    return glyphy_state()
+
+
 @app.get("/api/tint")
 async def api_tint_state(
     authorization: str | None = Header(default=None),
@@ -90721,6 +90889,296 @@ function pineTipsInstall() {
   window.addEventListener("blur", pineTipHide);
 }
 
+/* #980: GLYPHY, THE CONDUCTOR — the ASCII avatar from monk_3, mounted
+ * here and driven by the coordinator instead of by an app kernel.
+ *
+ * "I want him integrated into the project animated and reflecting the
+ * 'conductor' manager system keeping the clips rendering and making sure
+ * the trains run on time... anxious, pleased, watching, angry, rushing
+ * and thinking as modes to cycle between... When I click on the avatar I
+ * want a 4 console line slider out showing the console output of every
+ * command / staging the conductor is doing."
+ *
+ * He is a <pre> of monospaced glyph rows animating through named states,
+ * which is exactly what he is in monk - the character carries over
+ * rather than being reinterpreted. The face below is his: 24 columns,
+ * six rows, the same eyes and the same mouth. What is new is the six
+ * moods, built the way his originals were built - one base face with
+ * single rows substituted.
+ *
+ * NOTHING HERE IS DECORATIVE. The mood is chosen on the server from the
+ * coordinator's own measurements and he says which one put him in it. A
+ * face that pulls a worried expression at random is worse than no face.
+ */
+const GLYPHY_W = 24;
+
+function glyRow(s) {
+  const t = String(s === undefined ? "" : s);
+  return (t + "                        ").slice(0, GLYPHY_W);
+}
+
+/* His face, from monk_3's sampleAvatar.ts, unchanged. */
+const GLY_FACE = [
+  "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584         ",
+  "    \u2588\u2588        \u2588\u2588       ",
+  "    \u2588  \u25cf    \u25cf  \u2588       ",
+  "    \u2588     v     \u2588      ",
+  "    \u2588\u2588   ___   \u2588\u2588      ",
+  "      \u2580\u2580\u2588\u2588\u2588\u2588\u2580\u2580         ",
+];
+
+function glyWith(rows) {
+  const out = GLY_FACE.map(glyRow);
+  Object.keys(rows || {}).forEach((k) => {
+    out[Number(k)] = glyRow(rows[k]);
+  });
+  return out;
+}
+
+/* Eyes on row 2, mouth on row 4, and a row 0 for anything above his
+ * head - which is how the original did its tool-calling spinner. */
+const GLY_STATES = {
+  /* Watching: his idle. Open for twenty-two frames, a blink for two. */
+  watching: {
+    fps: 12,
+    frames: (function () {
+      const f = [];
+      for (let i = 0; i < 24; i++) {
+        f.push(i === 11 || i === 12
+          ? glyWith({2: "    \u2588  \u2500    \u2500  \u2588       "})
+          : glyWith({}));
+      }
+      return f;
+    }()),
+  },
+  /* Thinking: the dot cycle beside the face, exactly as monk had it. */
+  thinking: {
+    fps: 6,
+    frames: [".", "..", "...", "....", "...", "..", ".", ""].map((d) =>
+      glyWith({3: "    \u2588     v     \u2588   " + (d + "   ").slice(0, 3)})),
+  },
+  /* Pleased: the eyes close upward and the mouth turns up. */
+  pleased: {
+    fps: 5,
+    frames: [
+      glyWith({2: "    \u2588  ^    ^  \u2588       ",
+               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
+      glyWith({2: "    \u2588  ^    ^  \u2588       ",
+               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
+      glyWith({2: "    \u2588  \u25cf    \u25cf  \u2588       ",
+               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
+      glyWith({2: "    \u2588  ^    ^  \u2588       ",
+               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
+    ],
+  },
+  /* Anxious: the eyes dart, and a bead of sweat comes off the temple. */
+  anxious: {
+    fps: 7,
+    frames: [
+      glyWith({0: "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584  \u02da      ",
+               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
+               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
+      glyWith({0: "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584   \u02da     ",
+               2: "    \u2588   \u25cf    \u25cf \u2588       ",
+               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
+      glyWith({0: "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584    \u02da    ",
+               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
+               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
+      glyWith({2: "    \u2588 \u25cf    \u25cf   \u2588       ",
+               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
+    ],
+  },
+  /* Angry: brows down, mouth set, and the whole face shifts a column. */
+  angry: {
+    fps: 8,
+    frames: [
+      glyWith({1: "    \u2588\u2588\u2572      \u2571\u2588\u2588       ",
+               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
+               4: "    \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588      "}),
+      glyWith({1: "     \u2588\u2588\u2572      \u2571\u2588\u2588      ",
+               2: "     \u2588  \u25cf    \u25cf  \u2588      ",
+               4: "     \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588     "}),
+      glyWith({1: "    \u2588\u2588\u2572      \u2571\u2588\u2588       ",
+               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
+               4: "    \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588      "}),
+      glyWith({1: "   \u2588\u2588\u2572      \u2571\u2588\u2588        ",
+               2: "   \u2588  \u25cf    \u25cf  \u2588        ",
+               4: "   \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588       "}),
+    ],
+  },
+  /* Rushing: the spinner over his head, from monk's tool_calling. */
+  rushing: {
+    fps: 10,
+    frames: ["|", "/", "\u2500", "\\"].map((c) =>
+      glyWith({0: "             " + c + "          ",
+               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
+               4: "    \u2588\u2588   \u2500o\u2500   \u2588\u2588      "})),
+  },
+};
+
+const GLY_COLOUR = {
+  angry: "#e07070", anxious: "#e0a35c", rushing: "#9fd8ff",
+  thinking: "#c8a6ff", watching: "#8ba0b5", pleased: "#7ce8a9",
+};
+
+let glyMood = "watching";
+let glyFrame = 0;
+let glyAnimTimer = null;
+let glyPollTimer = null;
+let glyLast = null;
+let glyConsoleOpen = false;
+
+function glyphyMount() {
+  if (document.getElementById("glyphy")) return;
+  const box = document.createElement("div");
+  box.id = "glyphy";
+  /* The area the operator outlined: top-left of the panel's own content,
+   * clear of the sidebar. Draggable from there and remembered, because
+   * in monk he "lives wherever the user wants him to live". */
+  let left = 18;
+  let top = 16;
+  try {
+    const saved = JSON.parse(localStorage.getItem("glyphyAt") || "null");
+    if (saved && Number.isFinite(saved.x)) { left = saved.x; top = saved.y; }
+  } catch (e) { /* first run */ }
+  box.style.cssText = "position:fixed;left:" + left + "px;top:" + top
+    + "px;z-index:180;background:#070c12e8;border:1px solid #1b2c3c;"
+    + "border-radius:9px;padding:7px 9px 6px;cursor:pointer;"
+    + "box-shadow:0 10px 30px #0009;user-select:none;min-width:196px";
+  const pre = document.createElement("pre");
+  pre.id = "glyphyFace";
+  pre.style.cssText = "margin:0;font-family:ui-monospace,Consolas,"
+    + "'DejaVu Sans Mono',monospace;font-size:11px;line-height:1.02;"
+    + "letter-spacing:.5px;white-space:pre;color:#8ba0b5;"
+    + "transition:color .4s linear";
+  box.appendChild(pre);
+  const mood = document.createElement("div");
+  mood.id = "glyphyMood";
+  mood.style.cssText = "font-size:9px;letter-spacing:.09em;margin-top:3px;"
+    + "text-transform:uppercase;opacity:.85";
+  box.appendChild(mood);
+  const say = document.createElement("div");
+  say.id = "glyphySay";
+  say.style.cssText = "font-size:10px;line-height:1.4;margin-top:2px;"
+    + "color:#c8d6e4;max-width:230px";
+  box.appendChild(say);
+  /* The four-line console, slid out on a click. */
+  const con = document.createElement("div");
+  con.id = "glyphyConsole";
+  con.style.cssText = "display:none;margin-top:6px;padding-top:5px;"
+    + "border-top:1px solid #1b2c3c;font-family:ui-monospace,Consolas,"
+    + "monospace;font-size:9.5px;line-height:1.45;color:#9db4c8;"
+    + "width:min(560px,46vw);max-height:76px;overflow:hidden";
+  box.appendChild(con);
+  box.title = "Glyphy, the conductor \u2014 click for the console of "
+    + "everything the coordinator is carrying out. Drag to move him.";
+  box.onclick = (ev) => {
+    if (box.dataset.dragged === "1") { box.dataset.dragged = ""; return; }
+    ev.stopPropagation();
+    glyConsoleOpen = !glyConsoleOpen;
+    con.style.display = glyConsoleOpen ? "block" : "none";
+    glyphyPaint(glyLast);
+  };
+  /* Drag, remembered. */
+  let sx = 0, sy = 0, ox = 0, oy = 0, down = false;
+  box.onmousedown = (ev) => {
+    down = true; sx = ev.clientX; sy = ev.clientY;
+    ox = parseInt(box.style.left, 10) || 0;
+    oy = parseInt(box.style.top, 10) || 0;
+  };
+  document.addEventListener("mousemove", (ev) => {
+    if (!down) return;
+    const dx = ev.clientX - sx;
+    const dy = ev.clientY - sy;
+    if (Math.abs(dx) + Math.abs(dy) > 3) box.dataset.dragged = "1";
+    box.style.left = Math.max(0, ox + dx) + "px";
+    box.style.top = Math.max(0, oy + dy) + "px";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!down) return;
+    down = false;
+    try {
+      localStorage.setItem("glyphyAt", JSON.stringify({
+        x: parseInt(box.style.left, 10) || 0,
+        y: parseInt(box.style.top, 10) || 0}));
+    } catch (e) { /* he still sits where he was put, for now */ }
+  });
+  document.body.appendChild(box);
+  glyphyTick();
+  glyphyPoll();
+}
+
+function glyphyTick() {
+  if (glyAnimTimer) clearInterval(glyAnimTimer);
+  const st = GLY_STATES[glyMood] || GLY_STATES.watching;
+  glyFrame = 0;
+  glyAnimTimer = setInterval(() => {
+    const pre = document.getElementById("glyphyFace");
+    if (!pre) { clearInterval(glyAnimTimer); glyAnimTimer = null; return; }
+    const frames = st.frames;
+    pre.textContent = frames[glyFrame % frames.length].join("\n");
+    glyFrame += 1;
+  }, Math.max(60, 1000 / (st.fps || 8)));
+}
+
+function glyphyPaint(got) {
+  glyLast = got || glyLast;
+  const g = glyLast || {};
+  const mood = GLY_STATES[String(g.mood || "")] ? String(g.mood) : "watching";
+  if (mood !== glyMood) { glyMood = mood; glyphyTick(); }
+  const pre = document.getElementById("glyphyFace");
+  const md = document.getElementById("glyphyMood");
+  const sy = document.getElementById("glyphySay");
+  const con = document.getElementById("glyphyConsole");
+  const col = GLY_COLOUR[glyMood] || "#8ba0b5";
+  if (pre) pre.style.color = col;
+  if (md) {
+    md.textContent = glyMood;
+    md.style.color = col;
+  }
+  if (sy) {
+    sy.textContent = String(g.say || "");
+    sy.title = String(g.why || "");
+  }
+  const box = document.getElementById("glyphy");
+  if (box) {
+    box.style.borderColor = glyMood === "watching" ? "#1b2c3c" : col + "66";
+    box.title = "Glyphy, the conductor \u2014 " + glyMood
+      + (g.why ? ": " + g.why : "")
+      + ".\nClick for the console of everything the coordinator is "
+      + "carrying out. Drag to move him.";
+  }
+  if (con && glyConsoleOpen) {
+    /* FOUR LINES, as asked. Newest last, so it reads like a terminal. */
+    const rows = (g.console || []).slice(-4);
+    con.textContent = "";
+    rows.forEach((r) => {
+      const line = document.createElement("div");
+      line.style.cssText = "white-space:nowrap;overflow:hidden;"
+        + "text-overflow:ellipsis";
+      const when = new Date(Number(r.ts) || Date.now());
+      const hh = String(when.getHours()).padStart(2, "0");
+      const mm = String(when.getMinutes()).padStart(2, "0");
+      const ss = String(when.getSeconds()).padStart(2, "0");
+      line.textContent = hh + ":" + mm + ":" + ss + "  "
+        + String(r.kind || "").padEnd(11, " ").slice(0, 11) + "  "
+        + String(r.text || "");
+      line.title = String(r.text || "");
+      con.appendChild(line);
+    });
+    if (!rows.length) con.textContent = "the conductor has said nothing yet";
+  }
+}
+
+async function glyphyPoll() {
+  if (glyPollTimer) clearTimeout(glyPollTimer);
+  try {
+    const got = await api("/api/glyphy");
+    glyphyPaint(got);
+  } catch (e) { /* he keeps the face he had */ }
+  glyPollTimer = setTimeout(glyphyPoll, glyConsoleOpen ? 2500 : 5000);
+}
+
 function pineListenerId() {
   let me = sessionStorage.pbfmListener;
   if (!me) {
@@ -110812,6 +111270,7 @@ initGutter();
 sparkShowInit();
 mpxInit();
 musicVolumeRemember();               // #695
+try { glyphyMount(); } catch (e) {}  // #980 the conductor's face
 // Reads are open, so the panel + live dashboard populate on any computer,
 // with or without a key. The key is only needed to CHANGE things.
 connect();
