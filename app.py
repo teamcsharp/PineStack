@@ -55678,7 +55678,7 @@ def crystal_material(most: int = 3, cap: int = 700,
                         if len(rows) > want_each else list(rows))
                 for row in take:
                     text = str((row or {}).get("text") or "").strip()
-                    if len(text) < 40:
+                    if len(text) < 40 or crystal_noise(text):    # #1044
                         continue
                     pool.append({"crystal": str(c.get("name") or ""),
                                  "mind": str(rid),
@@ -55831,6 +55831,26 @@ _CRYSTAL_STANZA: dict[str, Any] = {"at": 0.0, "runs": [], "key": ""}
 CRYSTAL_STANZA_LIFE = 300.0
 
 
+# #1044: lines that are a scraper's bookkeeping rather than anything
+# anybody wrote. Deliberately a short, literal list - anything cleverer
+# would eventually throw away a real lyric, and a real lyric thrown away
+# is a worse fault than a stray URL kept.
+_CRYSTAL_NOISE = ("source:", "http://", "https://", "www.",
+                  "[verse", "[chorus", "[intro", "[outro", "[bridge",
+                  "[hook", "[produced by", "embed")
+
+
+def crystal_noise(text: str) -> bool:
+    """Is this line the file talking about itself?"""
+    try:
+        flat = " ".join(str(text or "").split()).strip().lower()
+        if not flat:
+            return True
+        return flat.startswith(_CRYSTAL_NOISE)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def crystal_stanzas(most: int = 2, lines: int = 0) -> list[dict[str, Any]]:
     """#1032: whole passages of the crystal's own writing.
 
@@ -55866,7 +55886,12 @@ def crystal_stanzas(most: int = 2, lines: int = 0) -> list[dict[str, Any]]:
                     for row in rows:
                         f = str((row or {}).get("file") or "")
                         t = str((row or {}).get("text") or "").strip()
-                        if f and len(t) > 20:
+                        # #1044: not the provenance line. See crystal_noise
+                        # - 813 of the DOOM crystal's 36,628 chunks were
+                        # "source: huggingartists/mf-doom", one at the top
+                        # of every file, and the window starts always
+                        # include zero.
+                        if f and len(t) > 20 and not crystal_noise(t):
                             by_file.setdefault(f, []).append(t)
                     for f, got in by_file.items():
                         if len(got) >= lines:
