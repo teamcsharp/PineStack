@@ -9751,6 +9751,12 @@ def box_rate_now(rate: float) -> float:
 # point of it.
 SEGMENT_LIVELY_CEILING = 720.0
 PANTRY_BURN_SECONDS = float(os.getenv("PANTRY_BURN_SECONDS", "86400"))
+# #1052: how long a REPEAT is kept - the pre-rolled stock that buys the
+# writing room. Deliberately far longer than the staleness ceiling for
+# fresh material: a package that may air a dozen times at three hours
+# apart needs to survive thirty-six hours of resting to do it, and an
+# advert does not go off.
+REPEAT_KEEP_SECONDS = float(os.getenv("REPEAT_KEEP_SECONDS", "259200"))
 _SHELF: dict[str, list[dict[str, Any]]] = {}
 # How many of each to hold. The real governor is prepare_hours (TIME on
 # the shelf); these only stop one content type eating the whole
@@ -9851,6 +9857,78 @@ SHELF_REUSE_REST = float(os.getenv("SHELF_REUSE_REST", "10800"))
 # ...and how many times one item may ever air, so a road that has stopped
 # being written does not become a loop of the same four messages.
 SHELF_REUSE_MOST = 3
+# #1052: ...except for the EVERGREEN kinds. An advert and a painting
+# read name a product and a picture, not an hour - they are as true on
+# their sixth airing as their first, which is exactly what a pre-rolled
+# package is for. A phone call and a memo from upstairs are not: they
+# refer to a moment, and three is right for them.
+#
+# Three innings against a three-hour rest is one airing a shift, which
+# is not a cupboard, it is a souvenir.
+SHELF_REUSE_EVERGREEN = ("ad", "gallery", "station_id")
+SHELF_REUSE_MOST_EVERGREEN = 12
+
+
+def shelf_innings(kind: str) -> int:
+    """How many times one item of this kind may ever go out."""
+    return (SHELF_REUSE_MOST_EVERGREEN
+            if str(kind) in SHELF_REUSE_EVERGREEN else SHELF_REUSE_MOST)
+
+
+def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
+    """#1052: is this row IN THE CUPBOARD - aired, reusable, and with
+    airings left in it? These are the station's pre-rolled stock and
+    nothing may throw them away for being old."""
+    try:
+        if str(kind) not in SHELF_REUSABLE:
+            return False
+        if not float(row.get("aired_at") or 0):
+            return False
+        return int(row.get("aired") or 0) < shelf_innings(kind)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def shelf_repeat_ready(kind: str, row: dict[str, Any]) -> bool:
+    """...and has it rested long enough to go out again?"""
+    try:
+        if not shelf_is_repeat(kind, row):
+            return False
+        if time.time() - float(row.get("aired_at") or 0) < SHELF_REUSE_REST:
+            return False
+        key = str(row.get("key") or "")
+        return not key or bool(pantry_get(key))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def shelf_repeats(kind: str = "") -> list[dict[str, Any]]:
+    """The cupboard: every repeat the station is holding, per kind, with
+    what is left in it and when it next comes free."""
+    out: list[dict[str, Any]] = []
+    try:
+        for one in ([str(kind)] if kind else list(_SHELF)):
+            for row in (_SHELF.get(one) or []):
+                if not shelf_is_repeat(one, row):
+                    continue
+                rest = max(0.0, SHELF_REUSE_REST
+                           - (time.time() - float(row.get("aired_at") or 0)))
+                out.append({
+                    "kind": one,
+                    "label": SHELF_LABEL.get(one, one),
+                    "aired": int(row.get("aired") or 0),
+                    "of": shelf_innings(one),
+                    "left": max(0, shelf_innings(one)
+                                - int(row.get("aired") or 0)),
+                    "rest": round(rest, 1),
+                    "ready": shelf_repeat_ready(one, row),
+                    "at": float(row.get("at") or 0),
+                    "aired_at": float(row.get("aired_at") or 0),
+                    "text": str(row.get("text") or "")[:180],
+                })
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 # #986: how many WRITTEN BUT UNVOICED rows a road may stack up before the
 # writing desk should stop feeding it.
@@ -10261,8 +10339,8 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 if str(kind) not in SHELF_REUSABLE:
                     _why.append("already aired")
                     continue        # should not be here at all
-                if int(row.get("aired") or 0) >= SHELF_REUSE_MOST:
-                    _why.append("innings used")
+                if int(row.get("aired") or 0) >= shelf_innings(kind):
+                    _why.append("innings used")   # #1052
                     continue        # it has had its innings
                 if time.time() - _out_at < SHELF_REUSE_REST:
                     _why.append("resting")
@@ -11489,8 +11567,15 @@ def pantry_burn() -> int:
     try:
         for kind in list(_SHELF):
             rows = _SHELF.get(kind) or []
+            # #1052: the cupboard keeps to its own horizon here too -
+            # burning a repeat at the staleness ceiling would empty the
+            # shelf the moment it became useful, which is the same
+            # mistake coord_retire was making.
             keep = [r for r in rows
-                    if now - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS]
+                    if (now - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
+                        or (shelf_is_repeat(kind, r)
+                            and now - float(r.get("at") or 0)
+                            <= REPEAT_KEEP_SECONDS))]
             if len(keep) != len(rows):
                 burned[str(kind)] = len(rows) - len(keep)
                 _SHELF[kind] = keep
@@ -21799,20 +21884,63 @@ def slot_manifest(idx: int) -> list[dict[str, Any]]:
     return out
 
 
-def slot_stock() -> dict[str, int]:
-    """What is PREPARED and ready to air, per road.
+def slot_supply() -> dict[str, list[float]]:
+    """#1053: what can be taken, and WHEN - per road, a sorted list of
+    the moments each takeable item comes free.
 
-    Read off the same board the recording room shows, so the slot desk
-    and the glass can never disagree about how much there is."""
-    stock: dict[str, int] = {}
+    0.0 means now: anything fresh and rendered, and any repeat that has
+    already sat out its rest. A repeat still resting carries the moment
+    its rest ends, so a slot forty minutes out can count on something
+    that frees up in twenty and a slot ten minutes out cannot.
+
+    prep_board's `ready` cannot answer this - it is every row on the
+    shelf, aired or not, rested or not - and "is it here" is a different
+    question from "is it here WHEN THE SLOT OPENS", which is the only
+    question this desk asks."""
+    out: dict[str, list[float]] = {}
+    now = time.time()
     try:
-        for row in (prep_board() or []):
-            kind = str(row.get("kind") or "")
-            if kind:
-                stock[kind] = max(0, int(row.get("ready") or 0))
+        for kind in list(_SHELF):
+            when: list[float] = []
+            for row in (_SHELF.get(kind) or []):
+                try:
+                    if now - float(row.get("at") or 0) > PANTRY_BURN_SECONDS \
+                            and not shelf_is_repeat(kind, row):
+                        continue                # burnt
+                    key = str(row.get("key") or "")
+                    if key and not pantry_get(key):
+                        continue                # its audio has gone
+                    out_at = float(row.get("aired_at") or 0)
+                    if not out_at:
+                        when.append(0.0)        # never been out: ready now
+                        continue
+                    if not shelf_is_repeat(kind, row):
+                        continue                # aired and not reusable
+                    # In the cupboard. Free when it has finished resting.
+                    when.append(max(0.0, out_at + SHELF_REUSE_REST - now))
+                except Exception:  # noqa: BLE001
+                    continue
+            if when:
+                out[str(kind)] = sorted(when)
+        # The larder is the banter shelf and keeps no aired copies.
+        try:
+            out.setdefault("banter", [])
+            out["banter"] = sorted(
+                out["banter"]
+                + [0.0] * sum(1 for e in list(_LARDER)
+                              if isinstance(e, dict) and e.get("prepared")))
+        except Exception:  # noqa: BLE001
+            pass
     except Exception:  # noqa: BLE001
         pass
-    return stock
+    return out
+
+
+def slot_stock() -> dict[str, int]:
+    """How many of each road could be taken RIGHT NOW - the headline
+    figure, for readers that do not care when."""
+    return {k: sum(1 for w in v if w <= 0.0)
+            for k, v in (slot_supply() or {}).items()}
 
 
 def slot_read(idx: int, stock: dict[str, int] | None = None
@@ -21832,7 +21960,7 @@ def slot_read(idx: int, stock: dict[str, int] | None = None
         "verdict": "covered", "why": "", "giving_up": [],
     }
     try:
-        have = stock if isinstance(stock, dict) else slot_stock()
+        have = stock if isinstance(stock, dict) else slot_supply()
         manifest = slot_manifest(idx)
         if not manifest:
             out["why"] = "the running order has nothing in this slot"
@@ -21850,10 +21978,23 @@ def slot_read(idx: int, stock: dict[str, int] | None = None
                 continue
             out["owes"].append(row)
             want[row["prep"]] = want.get(row["prep"], 0) + 1
-        # Allocate the shelf, nearest slot first.
+        # #1053: allocate BY THE CLOCK, nearest slot first. An item is
+        # this slot's only if it is free by the time the slot opens -
+        # which is what lets a repeat still resting be counted on by a
+        # later slot and not by an earlier one.
+        _by = max(0.0, (end if out["current"] else start) - now)
+        _repeats = 0
         for prep, need in sorted(want.items()):
-            got = min(need, int(have.get(prep) or 0))
-            have[prep] = int(have.get(prep) or 0) - got
+            pool = have.get(prep)
+            if not isinstance(pool, list):
+                pool = []
+                have[prep] = pool
+            free = [w for w in pool if w <= _by]
+            got = min(need, len(free))
+            for _w in free[:got]:
+                pool.remove(_w)
+                if _w > 0:
+                    _repeats += 1
             if got < need:
                 miss = need - got
                 each = float(task_cost(prep) or 45.0)
@@ -21861,10 +22002,12 @@ def slot_read(idx: int, stock: dict[str, int] | None = None
                     "prep": prep, "need": need, "have": got,
                     "short": miss, "each": round(each, 1),
                     "cost": round(each * miss, 1)})
+        out["from_cupboard"] = _repeats
         out["cost"] = round(sum(r["cost"] for r in out["short"]), 1)
         if not out["short"]:
             out["why"] = ("every entry in this slot has something behind "
-                          "it")
+                          "it" + (f", {_repeats} of them out of the "
+                                  "cupboard (#1052)" if _repeats else ""))
             return out
         # THE NEGOTIATION. Does the shortfall fit in the room left?
         if out["cost"] <= out["room"] * 0.6:
@@ -21916,11 +22059,17 @@ def slot_board(ahead: int = 3) -> dict[str, Any]:
     out: dict[str, Any] = {"at": time.time(), "slots": [],
                            "duty": SLOT_DUTY, "behind": False, "say": ""}
     try:
-        have = slot_stock()
-        out["stock"] = dict(have)
+        have = slot_supply()
+        out["stock"] = {k: len(v) for k, v in have.items()}
+        out["ready_now"] = {k: sum(1 for w in v if w <= 0)
+                            for k, v in have.items()}
         first = slot_index()
         for step in range(max(1, min(8, int(ahead) + 1))):
             out["slots"].append(slot_read(first + step, have))
+        try:
+            out["hour"] = hour_ballast()               # #1054
+        except Exception:  # noqa: BLE001
+            out["hour"] = {}
         bad = [r for r in out["slots"]
                if r["verdict"] in ("at risk", "cannot")]
         out["behind"] = bool(bad)
@@ -21982,6 +22131,88 @@ def slot_needs() -> list[dict[str, Any]]:
                            "why": (out[0]["why"] if out else "")})
     except Exception:  # noqa: BLE001
         return []
+    return out
+
+
+def hour_ballast() -> dict[str, Any]:
+    """#1054: what the hour COSTS to make against what it gives back.
+
+    "we need to have segments that give room for this gallery content to
+    be created."
+
+    Every entry on the sheet is either BALLAST - airtime that costs
+    nothing to produce, because it is a record or a repeat out of the
+    cupboard - or DEBT, airtime somebody has to write first. An hour is
+    only makeable if the ballast covers the debt, and this says by how
+    much it does or does not.
+
+    Measured on the canonical hour when this was written: 3,600s of
+    clock, 240s of it record, and 4,084s of writing owed. Fifty-six of
+    the sixty minutes were talk that had to be written, and the writing
+    cost more than the hour lasted. No amount of scheduling fixes that
+    - only airtime that costs nothing to make."""
+    out: dict[str, Any] = {"clock": 0.0, "ballast": 0.0, "debt": 0.0,
+                           "cupboard": 0.0, "need": 0.0, "rows": [],
+                           "say": "", "makeable": True}
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            out["say"] = "the running order is off"
+            return out
+        _name, rows, _on = schedule_hour_slots(store)
+        slots = [x for x in (rows or []) if x.get("enabled", True)]
+        supply = slot_supply()
+        seen: dict[str, int] = {}
+        for row in slots:
+            kind = str(row.get("kind") or "")
+            mins = float(row.get("minutes") or 0)
+            out["clock"] += mins * 60.0
+            prep = str(SCHED_PREP_KIND.get(kind) or kind)
+            # A record is pure ballast: the needle drops and the room is
+            # free for the whole of it.
+            if kind in CANNOT_PREPARE and kind == "record":
+                out["ballast"] += mins * 60.0
+                out["rows"].append({"kind": kind, "minutes": mins,
+                                    "cost": 0.0, "source": "record"})
+                continue
+            # Anything live-written costs its model time at air.
+            cost = float(task_cost(prep) or 0)
+            # ...unless the cupboard can cover it. Count each repeat once.
+            pool = list(supply.get(prep) or [])
+            used = seen.get(prep, 0)
+            covered = used < len(pool)
+            if covered:
+                seen[prep] = used + 1
+                out["cupboard"] += cost
+                out["ballast"] += mins * 60.0
+                out["rows"].append({"kind": kind, "minutes": mins,
+                                    "cost": 0.0, "source": "cupboard",
+                                    "saved": round(cost, 1)})
+                continue
+            out["debt"] += cost
+            out["rows"].append({"kind": kind, "minutes": mins,
+                                "cost": round(cost, 1), "source": "write"})
+        out["need"] = round(max(0.0, out["debt"] - out["ballast"]), 1)
+        out["makeable"] = out["need"] <= 0
+        for key in ("clock", "ballast", "debt", "cupboard"):
+            out[key] = round(out[key], 1)
+        if out["makeable"]:
+            out["say"] = (
+                f"the hour owes {int(out['debt'])}s of writing and has "
+                f"{int(out['ballast'])}s of airtime that costs nothing to "
+                "make - it is makeable")
+        else:
+            out["say"] = (
+                f"the hour owes {int(out['debt'])}s of writing against "
+                f"{int(out['ballast'])}s of free airtime: it is short "
+                f"{int(out['need'])}s, about {int(out['need'] / 60)} "
+                "minutes more of records or repeats than the sheet "
+                "carries")
+        if out["cupboard"]:
+            out["say"] += (f" (the cupboard is already saving "
+                           f"{int(out['cupboard'])}s of it)")
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -23126,6 +23357,18 @@ def coord_retire() -> int:
                 except Exception:  # noqa: BLE001
                     spoken_for = False
                 if aged <= COORD_RETIRE_SECONDS or spoken_for:
+                    keep.append(row)
+                    continue
+                # #1052: THE CUPBOARD IS SPARED. This pass exists to let
+                # go of what genuinely will not be used, and a rested
+                # repeat with innings left is the definition of what
+                # WILL be. Measured before this: COORD_RETIRE_SECONDS
+                # and SHELF_REUSE_REST are both three hours and this
+                # test reads `at` - when the row was MADE - so a repeat
+                # became eligible and was deleted at the same moment,
+                # every time, and the ad road wrote live while holding
+                # a shelf it was not allowed to open.
+                if shelf_is_repeat(kind, row) and aged <= REPEAT_KEEP_SECONDS:
                     keep.append(row)
                     continue
                 # Its clips go with it — they were only protected from
@@ -62970,6 +63213,48 @@ async def api_chunks(
         # next opens up without walking every row.
         "next_free": round(min([r["left"] for r in resting] or [0.0]), 1),
         "answered": sum(1 for r in rows if r.get("answers")),
+    }
+
+
+@app.get("/api/repeats")
+async def api_repeats() -> dict[str, Any]:
+    """#1052: THE REPEATS CUPBOARD - the pre-rolled stock that buys the
+    writing room.
+
+    "we need to store a collection of ads and gallery reads and painting
+    reads that we can use and reuse to buy time"
+
+    Per item: which road, how many airings it has had and of how many,
+    how long until it may go out again, and whether it is ready now.
+    The head carries what the cupboard is worth in preparation seconds
+    saved - every repeat ready to air is one segment nobody has to
+    write."""
+    rows = shelf_repeats()
+    ready = [r for r in rows if r.get("ready")]
+    saved = 0.0
+    by_kind: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        k = str(row.get("kind") or "?")
+        seat = by_kind.setdefault(k, {"kind": k, "held": 0, "ready": 0,
+                                      "label": row.get("label") or k})
+        seat["held"] += 1
+        if row.get("ready"):
+            seat["ready"] += 1
+            saved += float(task_cost(k) or 0)
+    return {
+        "at": time.time(),
+        "rows": sorted(rows, key=lambda r: (not r.get("ready"),
+                                            float(r.get("rest") or 0))),
+        "held": len(rows), "ready": len(ready),
+        "by_kind": sorted(by_kind.values(), key=lambda r: -r["held"]),
+        "rest_seconds": SHELF_REUSE_REST,
+        "keep_seconds": REPEAT_KEEP_SECONDS,
+        # What the cupboard is worth: the preparation nobody has to do
+        # because these already exist.
+        "saves_seconds": round(saved, 1),
+        "say": (f"{len(ready)} of {len(rows)} repeats are ready to air, "
+                f"worth {int(saved)}s of writing nobody has to do"
+                if rows else "the cupboard is empty"),
     }
 
 
