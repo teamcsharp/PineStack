@@ -4098,6 +4098,19 @@ async def reconcile_generations() -> dict[str, int]:
 
 
 @app.on_event("startup")
+async def _startup_name_clash() -> None:
+    """#1070: look, once, for two functions sharing a name.
+
+    Three separate outages today came from exactly that and every one
+    was found by reading a stack trace or a live symptom rather than by
+    anything the station said. It costs one read of this file."""
+    try:
+        name_clash_warn()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.on_event("startup")
 async def _startup_tidy() -> None:
     """#995/#998: the one-time housekeeping, on every boot rather than on
     every radio start.
@@ -11106,6 +11119,29 @@ def prep_need(kind: str) -> float:
 
 
 def prep_tier(cover: float = -1.0) -> str:
+    # #1069: "deep" meant cover above a fixed 15% of the target, and
+    # the station has run at 42% of target all day - so it was in its
+    # RICHEST tier, permanently, while 100% of its half hours were
+    # reported at risk and the desk said nothing was covered. The tier
+    # is what the planner branches on, so the branch that reasons about
+    # a thin reserve has never once executed.
+    #
+    # Depth is not enough on its own. A reserve is only deep if it also
+    # covers what is actually coming, so a sheet that cannot fill its
+    # next segments is never "deep" however many seconds are banked.
+    try:
+        if cover < 0:
+            cover = prepared_seconds()
+        short = [r for r in commit_board()
+                 if r.get("commit") in ("prerecord", "cut", "tight")]
+        if len(short) >= 3:
+            return "bare" if cover < prep_thin_seconds() else "steady"
+    except Exception:  # noqa: BLE001
+        pass
+    return _prep_tier_depth(cover)
+
+
+def _prep_tier_depth(cover: float = -1.0) -> str:
     """bare / steady / deep - how much cover the reserve is holding."""
     try:
         if cover < 0:
@@ -11466,6 +11502,15 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             # It stays on the board, flagged, and priced at what it
             # actually needs: voicing only, at the measured cost of a
             # rendered line, not the full write-and-render of the road.
+            # #1069: a moment the call sheet has already committed to a
+            # repeat is not worth writing for. This is the saving the
+            # whole sheet exists to make: the room that would have gone
+            # into a round that could not finish goes into one that can.
+            try:
+                if commit_for(kind) == "prerecord":
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
             _voice_only = shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST
             cost = task_cost(kind)
             gain = task_gain(kind)
@@ -22133,6 +22178,18 @@ async def pantry_keeper() -> None:
                 # Writing is a MODEL visit, and live work outranks it. A
                 # bumper is exempt: its liners are brewed in the
                 # background and taken off a stack, not written here.
+                # #1068: THE PLAN IS ON THE RECORD BEFORE ANYTHING CAN
+                # REFUSE IT. prep_log_plan sat below the gate check, and
+                # the gate check `continue`s - so every pick the model
+                # gate threw away was invisible to the operator's glass
+                # while station_id, the one gate-exempt road, logged
+                # every time. Measured: the 17 sampled plans chose a
+                # DEAR road 57% of the time, while the pipeline log
+                # showed station IDs 84% of the time. The station has
+                # been choosing phone calls, bulletins and adverts all
+                # day and having them thrown away, and the one window
+                # built to show that showed the opposite.
+                prep_log_plan(_plan)
                 if _OLLAMA_GATE.locked() and _kind != "station_id":
                     # #1046: and it SAYS SO. This skip, the depth ceiling
                     # above and the bare except below were the three ways
@@ -22146,7 +22203,6 @@ async def pantry_keeper() -> None:
                                      "preparing (#1046)")
                     _skipped.add(_kind)
                     continue
-                prep_log_plan(_plan)
                 # #872 rule three: a budget, not a hope. The task is
                 # stood down at its next line boundary if it runs past
                 # what the plan said it could have, and every line it did
@@ -23661,6 +23717,299 @@ def pipe_detail(kind: str = "", at: float = 0.0, find: str = ""
     return out
 
 
+_RETINT_SAID = [0.0]
+
+
+async def retint_one() -> str:
+    """#1068: rewrite one banked round that went out plain.
+
+    The station has been telling itself "it is tinted properly on a
+    later pass" on every round the rewrite refused - twelve of twelve,
+    twenty-five minutes of finished radio, every one of them plain -
+    and there was no later pass. Nothing re-tinted a banked round.
+
+    This is the cheapest work there is: the words already exist and
+    nothing needs re-rendering until the round is actually taken. It
+    runs only when the share allows and there is nothing more urgent,
+    so a reserve that used to fill with plain radio now improves while
+    it waits."""
+    try:
+        # #1068b: IT SAYS WHY IT DECLINED. Every early return in this
+        # file's tinting code has been silent, and every time that has
+        # cost hours: a road that never runs looks exactly like one
+        # nobody asked. Throttled to once a minute so it is a signal,
+        # not a stream.
+        def _say(why: str) -> str:
+            try:
+                if time.time() - float(_RETINT_SAID[0] or 0) > 60:
+                    _RETINT_SAID[0] = time.time()
+                    pipeline_log("crystal",
+                                 f"(#1068) the later pass stood down: {why}")
+            except Exception:  # noqa: BLE001
+                pass
+            return ""
+        if not crystal_tint_two_pass():
+            return _say("the second pass is switched off")
+        if not crystal_active():
+            return _say("no crystal is on")
+        _hold = tint_should_stop()
+        if _hold:
+            return _say(_hold)
+        want = None
+        for entry in list(_LARDER):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("script_tinted") or ""):
+                continue                # already has one
+            if not str(entry.get("script") or ""):
+                continue
+            got = entry.get("tint")
+            if isinstance(got, dict) and got.get("ok"):
+                continue
+            want = entry
+            break                       # oldest first: _LARDER is in order
+        if want is None:
+            return _say(f"nothing in the reserve needs it "
+                        f"({len(_LARDER)} round(s) banked)")
+        _got = await crystal_tint(str(want.get("script") or ""),
+                                  str(want.get("prep_kind") or ""),
+                                  want.get("verbatim"))
+        want["tint"] = {
+            "ok": bool(_got.get("ok")), "why": str(_got.get("why") or ""),
+            "world": str(_got.get("world") or ""),
+            "ms": int(_got.get("ms") or 0),
+            "prompt": str(_got.get("prompt") or "")[:8000],
+            "chunks": list(_got.get("chunks") or []),
+            "later": True,
+        }
+        if not _got.get("ok"):
+            return ""
+        want.setdefault("script_plain", str(want.get("script") or ""))
+        want["script_tinted"] = str(_got.get("script") or "")
+        want["script"] = str(_got.get("script") or "")
+        want["use"] = "tinted"
+        pipeline_log("crystal",
+                     "(#1068) a banked round that went out plain has been "
+                     f"rewritten on a later pass - {_got.get('ms')}ms",
+                     extra=("THE LATER PASS (#1068)\n\nThe station has "
+                            "been promising this on every round the "
+                            "rewrite refused. Until now nothing did it.\n\n"
+                            "AS BANKED:\n"
+                            + str(want.get("script_plain") or "")[:1500]
+                            + "\n\nAS REWRITTEN:\n"
+                            + str(_got.get("script") or "")[:1500]))
+        return str(want.get("prep_kind") or "a round")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# --- THE CALL SHEET (#1069) -------------------------------------------
+# Every coming segment, committed in advance to how it will be filled.
+# See the note at the top of the #1069 change. The whole point is that a
+# hole is DECIDED, hours early and in daylight, rather than discovered
+# at the moment the running order asks for something nobody made.
+_COMMITS: dict[str, Any] = {"at": 0.0, "rows": []}
+COMMIT_LIFE = 20.0
+# How much of the room a task may be quoted at before the sheet stops
+# believing it will finish. p90 is already a pessimistic measure; this
+# is the margin on top, because a segment that arrives half-written is
+# worth less than one that was always going to be a repeat.
+COMMIT_MARGIN = 1.25
+
+
+def commit_board(ahead: int = 10, fresh: bool = False) -> list[dict[str, Any]]:
+    """#1069: the next `ahead` entries, each committed to a way of being
+    filled, decided now.
+
+    Everything in here is measured. Cost is the task ledger's own p90,
+    which improves with every task the station runs; room is the real
+    airtime between now and the entry, minus what the entries ahead of
+    it have already claimed. As the box gets faster the same code
+    commits more moments to FRESH, without anybody changing a number."""
+    now = time.time()
+    if (not fresh and _COMMITS.get("rows")
+            and now - float(_COMMITS.get("at") or 0) < COMMIT_LIFE):
+        return list(_COMMITS["rows"])
+    rows: list[dict[str, Any]] = []
+    try:
+        coming = coord_upcoming() or []
+        supply = slot_supply()
+        # What the writing room can actually get through between now and
+        # each entry. Claimed as we walk, so the third gallery round in
+        # an hour is not promised the same minutes as the first.
+        claimed = 0.0
+        for one in coming[:max(1, min(24, int(ahead)))]:
+            kind = str(one.get("kind") or "")
+            if not kind:
+                continue
+            # coord_upcoming already resolves the road; `starts_in` is
+            # its own name for how far off the entry is.
+            prep = str(one.get("road")
+                       or SCHED_PREP_KIND.get(kind) or kind)
+            due = max(0.0, float(one.get("starts_in") or 0))
+            cost = float(task_cost(prep) or 0)
+            # Anything already made and free by then is the cheapest
+            # answer there is, and it is not a compromise.
+            pool = [w for w in (supply.get(prep) or []) if w <= due]
+            row: dict[str, Any] = {
+                "kind": kind, "prep": prep,
+                "label": str(one.get("label") or kind),
+                "in_seconds": round(due, 1),
+                "cost": round(cost, 1),
+                "room": 0.0, "commit": "fresh", "why": "",
+                "stock": len(pool),
+            }
+            if kind in CANNOT_PREPARE:
+                row["commit"] = "live"
+                row["why"] = str(CANNOT_PREPARE.get(kind) or
+                                 "this one can only be done live")
+                rows.append(row)
+                continue
+            room = max(0.0, (due - claimed) * SLOT_DUTY)
+            row["room"] = round(room, 1)
+            if pool:
+                # Something is ready. Take it and spend no room at all.
+                row["commit"] = "ready"
+                row["why"] = (f"{len(pool)} already made and free by then "
+                              "- nothing to write")
+                try:
+                    supply[prep].remove(pool[0])
+                except Exception:  # noqa: BLE001
+                    pass
+                rows.append(row)
+                continue
+            if cost * COMMIT_MARGIN <= room:
+                row["commit"] = "fresh"
+                row["why"] = (f"{int(room)}s of writing room before it airs "
+                              f"against about {int(cost)}s of work")
+                claimed += cost
+                rows.append(row)
+                continue
+            if cost <= room:
+                row["commit"] = "tight"
+                row["why"] = (f"{int(cost)}s of work into {int(room)}s of "
+                              "room - it will be close, so it goes first")
+                claimed += cost
+                rows.append(row)
+                continue
+            # Not enough time. Is there anything in the cupboard at all,
+            # rested or not?
+            held = len(supply.get(prep) or [])
+            if held:
+                row["commit"] = "prerecord"
+                row["why"] = (f"no time to write it - {int(cost)}s of work "
+                              f"against {int(room)}s of room - so this "
+                              "moment is committed to a repeat")
+                try:
+                    supply[prep].pop(0)
+                except Exception:  # noqa: BLE001
+                    pass
+            else:
+                row["commit"] = "cut"
+                row["why"] = (f"no time ({int(cost)}s of work against "
+                              f"{int(room)}s) and nothing on the shelf - "
+                              "the record runs on instead")
+            rows.append(row)
+        _COMMITS.update({"at": now, "rows": rows})
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
+def commit_for(kind: str) -> str:
+    """#1069: what the sheet has committed the NEXT entry of this kind
+    to - "fresh", "tight", "ready", "prerecord", "cut" or "".
+
+    The preparer asks this before it spends room on a road: a moment
+    already committed to a repeat is not worth writing for, and that is
+    the whole saving."""
+    try:
+        for row in commit_board():
+            if str(row.get("prep") or "") == str(kind):
+                return str(row.get("commit") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def commit_state() -> dict[str, Any]:
+    """The sheet, for reading, with its own arithmetic at the top."""
+    rows = commit_board()
+    tally: dict[str, int] = {}
+    for row in rows:
+        tally[str(row.get("commit"))] = tally.get(
+            str(row.get("commit")), 0) + 1
+    late = [r for r in rows if r.get("commit") in ("prerecord", "cut")]
+    return {
+        "at": time.time(), "rows": rows, "tally": tally,
+        "margin": COMMIT_MARGIN, "duty": SLOT_DUTY,
+        "say": ((f"{len(late)} of the next {len(rows)} segments cannot be "
+                 "written in the time before they air - "
+                 + ", ".join(f"{r['label']} ({r['commit']})"
+                             for r in late[:4]))
+                if late else
+                (f"all {len(rows)} of the next segments can be written in "
+                 "time" if rows else "nothing is coming up")),
+    }
+
+
+def name_clashes() -> list[dict[str, Any]]:
+    """#1070: top-level functions this file defines more than once.
+
+    Reads its own source. In a file this size a name collision is a
+    certainty rather than a typo, and Python makes it silent: the later
+    definition wins and the earlier one simply stops existing. Three
+    separate outages today came from exactly that, each found only by
+    reading a stack trace or a live symptom.
+
+    Never raises, never refuses to start. It looks, and it says."""
+    out: list[dict[str, Any]] = []
+    try:
+        seen: dict[str, list[int]] = {}
+        here = Path(__file__)
+        for n, line in enumerate(
+                here.read_text(errors="replace").split("\n"), 1):
+            got = re.match(r"^(async )?def ([A-Za-z_][A-Za-z_0-9]*)\(",
+                           line)
+            if got:
+                seen.setdefault(got.group(2), []).append(n)
+        for name, lines in sorted(seen.items()):
+            if len(lines) > 1:
+                out.append({"name": name, "lines": lines,
+                            "wins": lines[-1]})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def name_clash_warn() -> None:
+    """Say what was found, once, at startup."""
+    try:
+        got = name_clashes()
+        if not got:
+            return
+        pipeline_log(
+            "repair",
+            f"(#1070) {len(got)} function name(s) are defined more than "
+            "once - the LAST definition wins and the earlier ones do not "
+            "exist",
+            extra=("TWO FUNCTIONS, ONE NAME (#1070)\n\n"
+                   "Python resolves this silently: whichever `def` runs "
+                   "last is the one every caller gets, and the earlier "
+                   "one is unreachable. Three outages today came from "
+                   "this - chunk_key took out both material draws, "
+                   "call_sheet returned a coroutine to everything that "
+                   "called it.\n\nSome of these are harmless. Any of "
+                   "them that is not will fail in a way that looks like "
+                   "something else.\n\n"
+                   + "\n".join(
+                       f"  {row['name']}  lines {row['lines']} "
+                       f"- line {row['wins']} wins"
+                       for row in got)))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def hour_shortfall() -> dict[str, Any]:
     """Which entries of the hour on air have material behind them.
 
@@ -25139,6 +25488,10 @@ async def coordinator() -> None:
                     pass
                 try:
                     cupboard_rotate()                             # #1057
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    await retint_one()                            # #1068
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -58159,11 +58512,18 @@ def tint_pressure() -> str:
     the normal state of a working station - measured, 99.6% of the time
     - so braking on it is an off switch, not a brake. How much finished
     radio is waiting is the honest question."""
-    try:
-        if render_relief():
-            return "the rooms are calling for relief"
-    except Exception:  # noqa: BLE001
-        pass
+    # #1068: render_relief() is NOT consulted here any more. Its own
+    # docstring says what it is - "is the station currently borrowing
+    # the fast engine" - a VOICE-side latch meaning the clone engine is
+    # slow and lines are going to Piper for two minutes. The rewrite is
+    # a MODEL operation on the SCRIPT, before a word is rendered.
+    # Standing it down while the TTS queue is deep frees no render
+    # capacity at all; it only stops the station rhyming until the
+    # voice engine catches up.
+    #
+    # #1045 reached for every "under pressure" signal it could find
+    # without asking which resource each one protects. The hourly share
+    # governs model time, which is the thing this actually spends.
     # #1063: THE BUDGET, NOT A THRESHOLD. The reserve-depth test that
     # used to be here read below its threshold in 153 of 153 measured
     # samples - it never cleared once and it never would, because the
@@ -64873,6 +65233,34 @@ async def api_pipe_detail(
     this road and where its output goes, the road written out step by
     step, and which step the work is standing on right now."""
     return pipe_detail(str(kind or ""), float(at or 0), str(find or ""))
+
+
+@app.get("/api/name-clashes")
+async def api_name_clashes() -> dict[str, Any]:
+    """#1070: functions this file defines more than once.
+
+    The later definition wins and the earlier one does not exist. Three
+    separate outages today came from exactly this."""
+    got = name_clashes()
+    return {"at": time.time(), "found": len(got), "rows": got,
+            "say": (f"{len(got)} name(s) defined more than once - the "
+                    "last definition wins in every case"
+                    if got else "no function name is defined twice")}
+
+
+@app.get("/api/commitments")
+async def api_commit_board() -> dict[str, Any]:
+    """#1069: every coming segment, committed in advance.
+
+    "I want to see segments in advance being dictated and specified
+    that this moment's gonna have a pre-recorded segment because there
+    just isn't enough time for it."
+
+    Per entry: when it airs, what it measures, how much writing room
+    there is before it once everything ahead has taken its share, and
+    the commitment - ready, fresh, tight, prerecord, cut or live - with
+    the arithmetic that decided it."""
+    return commit_state()
 
 
 @app.get("/api/slots")
