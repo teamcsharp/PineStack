@@ -11269,7 +11269,12 @@ _PREP_LOG_KEY = [""]
 # was fifteen minutes, so an entry twenty minutes out was not yet a
 # deadline to anybody and the ledger's cheapest-first ranking kept
 # winning. Half an hour, in the operator's own unit.
-PREP_DEADLINE_WINDOW = 1800.0
+# #1085: was 1800 - half an hour - so nothing was ever begun earlier
+# than thirty minutes before it aired. A painting round measures 362s
+# and fits only nine percent of the windows that open; half an hour is
+# not enough warning to catch nine percent of anything. The operator
+# asked for forty-five, which is half as many chances again.
+PREP_DEADLINE_WINDOW = 2700.0
 # ...and the least window worth starting a deadline task in. Below this
 # the pass would write nothing before the record ends, so it waits for a
 # window it can actually make a line in.
@@ -22815,6 +22820,22 @@ def slot_needs() -> list[dict[str, Any]]:
             return list(_SLOT_WANT.get("needs") or [])
         _SLOT_WANT.update({"at": time.time(), "kind": "", "why": "",
                            "needs": []})
+        # #1085: WHAT THE HOUR OWES, which the scheduler has been
+        # computing for the panel and the preparer has never read. It
+        # goes below arrears - a road already covered by a repeat is a
+        # debt already incurred - and above the cupboard floor, because
+        # an hour that will go silent outranks a shelf that is merely
+        # thin.
+        for _owes in hour_owes():
+            out.append({
+                "prep": str(_owes["kind"]),
+                "short": int(_owes.get("entries") or 1),
+                "each": float(task_cost(_owes["kind"]) or 45.0),
+                "face": "the hour",
+                "verdict": "owed this hour",
+                "why": (f"{_owes['label']}: {_owes['entries']} of "
+                        f"{_owes['owns']} entries this hour have nothing "
+                        "written behind them (#1085)")})
         # #1073: ARREARS FIRST OF ALL. A road that had to be covered by
         # a repeat is owed a fresh one, and it is owed it BEFORE the
         # running order comes round to it again - otherwise the same
@@ -24746,6 +24767,48 @@ def surplus() -> float:
     return round(min(1.0, (depth - SURPLUS_FROM) / (1.0 - SURPLUS_FROM)), 3)
 
 
+def surplus_topic() -> dict[str, Any]:
+    """#1084: a topic out of the operator's own bank, when there is room
+    to do it justice.
+
+    The bank has been reached for on a coin flip and only on rounds
+    with neither an angle nor a seed - and since #1039 a seed arrives on
+    nearly every round, so the improvement that made the speakbox
+    reliable quietly locked the operator's own material out. Above the
+    surplus line it comes out."""
+    try:
+        got = surplus()
+        if got <= 0.02:
+            return {}
+        # From a coin flip up to nearly always, as the room allows.
+        if random.random() > (0.35 + 0.6 * got):
+            return {}
+        return drop_bombshell() or {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def surplus_caller_clause() -> str:
+    """#1084: the callers played to the back of the room.
+
+    A caller already carries a temper and a disposition. This asks them
+    to ARRIVE mid-feeling rather than build to one, which is the
+    difference between a character and a person doing an impression of
+    one - and it only happens when the station can afford the round."""
+    got = surplus()
+    if got <= 0.15:
+        return ""
+    hard = got > 0.55
+    return (
+        " PLAY THIS ONE TO THE BACK OF THE ROOM. They do not work up to "
+        "the feeling, they arrive already in it - mid-sentence, mid-"
+        "grievance, mid-delight - and the presenters are the reasonable "
+        "ones in the exchange."
+        + (" Let them overshare something nobody asked about, contradict "
+           "themselves inside one breath, and refuse to be talked down. "
+           "Nothing they say is small." if hard else ""))
+
+
 def surplus_state() -> dict[str, Any]:
     """What the surplus is currently buying."""
     got = surplus()
@@ -24755,6 +24818,10 @@ def surplus_state() -> dict[str, Any]:
         "stanzas": 2 + int(round(got * 2)),
         "tint_share": round(TINT_SHARE + 0.25 * got, 3),
         "spice_lift": round(0.10 * got, 3),
+        "topic_chance": round(min(0.95, 0.35 + 0.6 * got), 2) if got else 0,
+        "callers_loud": got > 0.15,
+        "callers_unhinged": got > 0.55,
+        "topics_held": len(read_bombshells() or []),
         "say": (f"the station is {int(got * 100)}% into its surplus - "
                 f"{int((1.0 + 0.8 * got - 1) * 100)}% more material per "
                 f"swath, {2 + int(round(got * 2))} crystal passages, "
@@ -24765,6 +24832,61 @@ def surplus_state() -> dict[str, Any]:
                 f"{int(SURPLUS_FROM * 100)}% line, so the show is written "
                 "exactly as it always is"),
     }
+
+
+def hour_owes() -> list[dict[str, Any]]:
+    """#1085: what this hour still owes, worst first - as a SHARE.
+
+    The scheduler has been computing exactly this for the panel and the
+    preparer has never read it. Live at the time of writing: gallery 0
+    of 1080 seconds owed, ad 226 of 720, news 346 of 960 - and the
+    planner had no idea.
+
+    Ranked by share rather than by seconds on purpose. Absolute seconds
+    would put banter first every hour, because banter owns the most
+    minutes of any hour and is nearly always PARTLY covered. Share puts
+    the EMPTY road first, which is the one that will actually go
+    silent."""
+    out: list[dict[str, Any]] = []
+    try:
+        # #1086: the REAL shape. hour_shortfall builds
+        # {"kind", "label", "held"} and puts a row in `short` when held
+        # is ZERO - nothing written for that entry at all. There is no
+        # `owed` field; the version of this that looked for one returned
+        # an empty list on every call and reported it as good news.
+        got = hour_shortfall() or {}
+        tally: dict[str, dict[str, Any]] = {}
+        for row in (got.get("short") or []):
+            kind = str(row.get("kind") or "")
+            if not kind or kind in CANNOT_PREPARE:
+                continue
+            prep = str(SCHED_PREP_KIND.get(kind) or kind)
+            seat = tally.setdefault(prep, {
+                "kind": prep, "label": str(row.get("label") or kind),
+                "entries": 0, "held": 0})
+            seat["entries"] += 1
+        # How many entries of that kind the hour holds in total, so
+        # "two of two unmade" reads differently from "one of six".
+        try:
+            for row in ((got.get("ready") or []) + (got.get("short") or [])):
+                prep = str(SCHED_PREP_KIND.get(str(row.get("kind") or ""))
+                           or row.get("kind") or "")
+                if prep in tally:
+                    tally[prep]["owns"] = int(
+                        tally[prep].get("owns") or 0) + 1
+        except Exception:  # noqa: BLE001
+            pass
+        for seat in tally.values():
+            owns = max(1, int(seat.get("owns") or seat["entries"]))
+            seat["owns"] = owns
+            seat["share"] = round(seat["entries"] / float(owns), 3)
+            seat["cost"] = round(float(task_cost(seat["kind"]) or 0), 1)
+            out.append(seat)
+        # The road with nothing behind the most of its entries first.
+        out.sort(key=lambda r: (-float(r["share"]), -int(r["entries"])))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def hour_shortfall() -> dict[str, Any]:
@@ -25191,7 +25313,9 @@ def coord_close_half(half: str) -> dict[str, Any]:
 # asked to be covered for - so the very entry that "doesn't have any
 # segments cut for it" could sit outside the coordinator's view entirely,
 # and nothing was working towards it.
-COORD_AHEAD_FLOOR = 2400.0              # forty minutes, the old value
+# #1085: forty-five, to match the deadline window - the coordinator
+# should never see less far than the branch that acts on it.
+COORD_AHEAD_FLOOR = 2700.0
 
 
 def coord_ahead_seconds() -> float:
@@ -48301,6 +48425,17 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     temper_bit = ""
     if dj_settings().get("dice_callers"):
         temper = random.choice(CALLER_TEMPERS)
+        # #1084: and in surplus they play it to the back of the room,
+        # and bring something out of the operator's own bank with them.
+        try:
+            temper += surplus_caller_clause()
+            _hot = surplus_topic()
+            if _hot.get("text"):
+                temper += (" They are ringing in ABOUT THIS, and they "
+                           "will not be moved off it: \""
+                           + str(_hot["text"])[:240] + "\"")
+        except Exception:  # noqa: BLE001
+            pass
         temper_bit = (f" TONIGHT THIS CALLER IS {temper.upper()} — it is in "
                       "their pacing, their word choice and how they take "
                       "being interrupted. Perform it; never name it.")
@@ -50971,6 +51106,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
                        key=lambda s: swath_intrigue(s.get("text", "")))
     dropped = {} if (angle or seed) else (
         drop_bombshell() if random.random() < 0.6 else {})
+    # #1084: ...AND IN SURPLUS, EVEN WHEN THERE IS A SEED. The line
+    # above locks the operator's own topics bank out of any round that
+    # has material - which since #1039 is nearly every round, so the
+    # fix that made the speakbox reliable quietly silenced the bank.
+    #
+    # A topic and a seed are not alternatives. One is a subject, the
+    # other is what you discuss it WITH - the same confusion #1078
+    # fixed between an angle and a seed. Above the surplus line the
+    # pair get both, which is what "richer banter on the topics" is.
+    if not dropped and not angle:
+        dropped = surplus_topic()
     comeback: dict[str, Any] = {}
     jab: dict[str, Any] = {}
     if angle and seed and str(seed.get("text") or ""):
@@ -66403,6 +66549,22 @@ async def api_stopgap_set(
     pipeline_log("lookahead",
                  f"(#1080) the operator set the stop-gap to {want}")
     return speed_state()
+
+
+@app.get("/api/hour-owes")
+async def api_hour_owes() -> dict[str, Any]:
+    """#1085: what this hour still owes, worst first, as a share of what
+    each road owns - which is what the preparer now builds against."""
+    rows = hour_owes()
+    return {
+        "at": time.time(), "rows": rows, "acting_on": len(rows),
+        "horizon_minutes": int(PREP_DEADLINE_WINDOW / 60),
+        "say": ((f"{len(rows)} road(s) have entries with nothing written: "
+                 + ", ".join(f"{r['label']} {r['entries']}/{r['owns']}"
+                             for r in rows[:5]))
+                if rows else "every entry this hour has something behind "
+                             "it"),
+    }
 
 
 @app.get("/api/fallbacks")
