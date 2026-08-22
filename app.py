@@ -10350,6 +10350,10 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         row = dict(row)
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
+        try:
+            arrears_paid(str(kind))                               # #1073
+        except Exception:  # noqa: BLE001
+            pass
         # #1057: WHO WAS ON THE MICROPHONES. Footage is audio, not
         # words - a recast makes every banked second the wrong person,
         # and nothing in the station checked.
@@ -22695,6 +22699,22 @@ def slot_needs() -> list[dict[str, Any]]:
             return list(_SLOT_WANT.get("needs") or [])
         _SLOT_WANT.update({"at": time.time(), "kind": "", "why": "",
                            "needs": []})
+        # #1073: ARREARS FIRST OF ALL. A road that had to be covered by
+        # a repeat is owed a fresh one, and it is owed it BEFORE the
+        # running order comes round to it again - otherwise the same
+        # entry arrives empty every time it appears, which is what the
+        # operator has been watching happen.
+        for _owed in arrears_owed():
+            _road = str(_owed.get("road") or "")
+            if not _road:
+                continue
+            out.append({
+                "prep": _road, "short": int(_owed.get("owed") or 1),
+                "each": float(task_cost(_road) or 45.0),
+                "face": "arrears", "verdict": "owed",
+                "why": (f"{SHELF_LABEL.get(_road, _road)} had to be "
+                        f"covered {_owed.get('owed')}x - a fresh one is "
+                        "owed before the order asks again (#1073)")})
         # #1057: THE FLOOR FIRST. Five variants of every road at all
         # times is a debt the station carries until it is paid, and a
         # road below it outranks anything the ledger would rather
@@ -24008,6 +24028,222 @@ def name_clash_warn() -> None:
                        for row in got)))
     except Exception:  # noqa: BLE001
         pass
+
+
+# --- THE TRAIL (#1072) ------------------------------------------------
+# One durable record per tinted moment: the material that went in, the
+# line that came out, the passage it was shown, and whether the operator
+# liked it. The pipeline holds all of this for about four minutes and
+# then loses it; this survives restarts and can be pointed at.
+TRAIL_PATH = data_path("trail.json")
+TRAIL_KEEP = 600
+_TRAIL: list[dict[str, Any]] = []
+_TRAIL_READ = [False]
+_TRAIL_LOCK = RLock()
+
+
+def trail_load() -> list[dict[str, Any]]:
+    if not _TRAIL_READ[0]:
+        with _TRAIL_LOCK:
+            if not _TRAIL_READ[0]:
+                try:
+                    got = json.loads(TRAIL_PATH.read_text())
+                    if isinstance(got, list):
+                        _TRAIL.extend(r for r in got if isinstance(r, dict))
+                except Exception:  # noqa: BLE001
+                    pass
+                _TRAIL_READ[0] = True
+    return _TRAIL
+
+
+def trail_save() -> None:
+    try:
+        del _TRAIL[:-TRAIL_KEEP]
+        TRAIL_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TRAIL_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_TRAIL, indent=1, default=str))
+        tmp.replace(TRAIL_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def trail_note(road: str, plain: str, tinted: str,
+               passages: list[dict[str, Any]] | None = None,
+               swath: dict[str, Any] | None = None,
+               ms: int = 0) -> str:
+    """#1072: write down one moment of the process, whole.
+
+    Called where the rewrite finishes, because that is the only place
+    that holds the material AND the result at the same time."""
+    try:
+        was = " ".join(str(plain or "").split())
+        now = " ".join(str(tinted or "").split())
+        if len(now) < 8:
+            return ""
+        row = {
+            "id": uuid.uuid4().hex[:10],
+            "at": time.time(),
+            "road": str(road or "")[:60],
+            "plain": was[:2400],
+            "tinted": now[:2400],
+            "ms": int(ms or 0),
+            "liked": False,
+            # The crystal passages it was shown, and where they came from.
+            "passages": [{"file": str(c.get("file") or ""),
+                          "crystal": str(c.get("crystal") or ""),
+                          "text": str(c.get("text") or "")[:900]}
+                         for c in (passages or [])[:3]],
+            # And the studio material the PLAIN line was built out of.
+            "swath": {"file": str((swath or {}).get("file") or ""),
+                      "mind": str((swath or {}).get("mind") or ""),
+                      "text": str((swath or {}).get("text") or "")[:900]},
+        }
+        with _TRAIL_LOCK:
+            trail_load()
+            _TRAIL.append(row)
+            trail_save()
+        return str(row["id"])
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def trail_like(row_id: str, liked: bool = True) -> dict[str, Any]:
+    """#1072: the operator liked this one - and a like CHANGES THINGS.
+
+    The passage that produced it goes to the front of the draw instead
+    of the back and stops resting, because "rest this so we hear
+    something else" is the opposite of what a like means. A favourite
+    that only decorates a list is a survey; this is the operator
+    teaching the station what good looks like in the one currency it
+    understands, which is what gets drawn next."""
+    out: dict[str, Any] = {"ok": False, "did": []}
+    try:
+        with _TRAIL_LOCK:
+            trail_load()
+            row = next((r for r in _TRAIL
+                        if str(r.get("id")) == str(row_id)), None)
+            if not row:
+                out["why"] = "no such moment on the trail"
+                return out
+            row["liked"] = bool(liked)
+            trail_save()
+        # The material behind it, marked in the chunk ledger so the draw
+        # can see it.
+        marks = [str((row.get("swath") or {}).get("text") or "")]
+        marks += [str(c.get("text") or "") for c in (row.get("passages") or [])]
+        with _CHUNK_LOCK:
+            rows = _chunk_all()
+            for text in marks:
+                key = chunk_ledger_key(text)
+                seat = rows.get(key)
+                if not seat:
+                    continue
+                seat["liked"] = bool(liked)
+                out["did"].append(
+                    f"{'favoured' if liked else 'unfavoured'} "
+                    f"{seat.get('file') or 'a passage'}")
+            _chunk_save()
+        out["ok"] = True
+        pipeline_log("crystal",
+                     ("(#1072) the operator liked that one - "
+                      + "; ".join(out["did"])[:150])
+                     if liked else "(#1072) a favourite was cleared")
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"{type(exc).__name__}: {exc}"[:120]
+    return out
+
+
+def trail_rows(most: int = 60, liked_only: bool = False
+               ) -> list[dict[str, Any]]:
+    rows = list(reversed(trail_load()))
+    if liked_only:
+        rows = [r for r in rows if r.get("liked")]
+    return rows[:max(1, min(400, int(most)))]
+
+
+# --- ARREARS (#1073) --------------------------------------------------
+# Roads that had to be covered by a repeat because there was no time to
+# write one. The preparer treats these as owed BEFORE the running order
+# asks again, which is the only way "so that doesn't happen next time"
+# is a mechanism rather than a hope.
+#
+# Self-clearing on purpose: the mark is paid the moment a fresh one is
+# banked for that road. A debt that outlives its own repayment is a
+# grudge, and a scheduler with grudges starves whatever it is angry at.
+_ARREARS: dict[str, dict[str, Any]] = {}
+
+
+def arrears_note(road: str, why: str = "") -> None:
+    """This road had to be covered. Owe it one."""
+    try:
+        road = str(road or "")
+        if not road:
+            return
+        seat = _ARREARS.setdefault(road, {"road": road, "owed": 0,
+                                          "at": 0.0, "why": ""})
+        seat["owed"] = int(seat.get("owed") or 0) + 1
+        seat["at"] = time.time()
+        seat["why"] = str(why or "")[:180]
+        pipeline_log("lookahead",
+                     f"(#1073) {SHELF_LABEL.get(road, road)} had to be "
+                     f"covered - owed {seat['owed']} now, and it goes "
+                     "before the running order asks again")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def arrears_paid(road: str) -> None:
+    """A fresh one was banked. The debt is settled."""
+    try:
+        seat = _ARREARS.get(str(road))
+        if not seat:
+            return
+        seat["owed"] = max(0, int(seat.get("owed") or 0) - 1)
+        if seat["owed"] <= 0:
+            _ARREARS.pop(str(road), None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def arrears_owed() -> list[dict[str, Any]]:
+    """What is owed, worst first."""
+    try:
+        return sorted((dict(v) for v in _ARREARS.values()
+                       if int(v.get("owed") or 0) > 0),
+                      key=lambda r: -int(r.get("owed") or 0))
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def cover_now(road: str, why: str = "") -> bool:
+    """#1073: there is no time to write it - put a repeat in the slot
+    NOW and owe the road a fresh one.
+
+    A repeat decided thirty-five seconds early is a segment. The same
+    repeat decided at zero is a hole with something dropped into it."""
+    try:
+        road = str(road or "")
+        if not road:
+            return False
+        arrears_note(road, why)
+        # Is there anything at all to cover it with?
+        try:
+            got = [w for w in (slot_supply().get(road) or []) if w <= 0]
+        except Exception:  # noqa: BLE001
+            got = []
+        if got:
+            pipeline_log("lookahead",
+                         f"(#1073) {SHELF_LABEL.get(road, road)}: no time "
+                         "to write one, so a prepared take covers it and a "
+                         "fresh one is queued for next time")
+            return True
+        pipeline_log("lookahead",
+                     f"(#1073) {SHELF_LABEL.get(road, road)}: no time to "
+                     "write one AND nothing on the shelf - the record runs "
+                     "on. It is first in the queue from here")
+        return False
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def hour_shortfall() -> dict[str, Any]:
@@ -37393,6 +37629,15 @@ def _chunk_save() -> None:
         pass                            # a forgetful shelf still serves
 
 
+def chunk_liked(text: str) -> bool:
+    """#1072: has the operator marked this material as good?"""
+    try:
+        return bool((_chunk_all().get(chunk_ledger_key(text))
+                     or {}).get("liked"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def chunk_cooling(text: str) -> float:
     """Seconds left on this chunk's rest. Zero means it is free, and a
     chunk nobody has ever served is free by definition - which is what
@@ -37403,6 +37648,10 @@ def chunk_cooling(text: str) -> float:
             return 0.0
         row = _chunk_all().get(chunk_ledger_key(text))
         if not row:
+            return 0.0
+        # #1072: a favourite does not rest. "Rest this so we hear
+        # something else" is the opposite of what a like means.
+        if row.get("liked"):
             return 0.0
         left = cool - (time.time() - float(row.get("last") or 0))
         return max(0.0, left)
@@ -37484,7 +37733,13 @@ def chunk_rank(items: list[Any], text_of: Any) -> list[Any]:
     whatever has been resting longest. Ties keep their incoming (random)
     order, so this SORTS the randomness rather than replacing it."""
     try:
-        return sorted(items, key=lambda it: chunk_cooling(text_of(it)))
+        # #1072: favourites first, then never-served, then coldest. The
+        # operator marking something good is the strongest signal the
+        # station has about what to reach for, and it should outrank
+        # "we have not used this one yet".
+        return sorted(items, key=lambda it: (
+            0 if chunk_liked(text_of(it)) else 1,
+            chunk_cooling(text_of(it))))
     except Exception:  # noqa: BLE001
         return list(items)
 
@@ -58803,6 +59058,13 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         # #1042: the answer, filed against the passage that caused it.
         for _c in chunks:
             chunk_answer(str(_c.get("text") or ""), out, why or "a line")
+        # #1072: ...and the whole moment on the trail, where it can be
+        # read back, linked to, and liked.
+        try:
+            trail_note(why or "a line", said, out, chunks,
+                       None, int((time.monotonic() - started) * 1000))
+        except Exception:  # noqa: BLE001
+            pass
         pipeline_log(
             "crystal",
             f"tinted {why or 'a line'} "
@@ -59139,6 +59401,11 @@ async def crystal_tint(script: str, kind: str = "",
         for _c in chunks:
             chunk_answer(str(_c.get("text") or ""), tinted,
                          kind or "a banked round")
+        try:
+            trail_note(kind or "a banked round", text, tinted,   # #1072
+                       chunks, None, int(out.get("ms") or 0))
+        except Exception:  # noqa: BLE001
+            pass
         # #1063: the tag LEADS. Pipeline text is cut at 200 characters
         # and the world description ran long, so "(#1006)" was always
         # truncated away - which made the events invisible to anyone
@@ -64540,10 +64807,36 @@ def glyphy_state() -> dict[str, Any]:
         elif soon is not None and float(soon.get("starts_in") or 0) < 180 \
                 and not float(soon.get("held_seconds") or 0):
             mood = "anxious"
+            _left = float(soon.get("starts_in") or 0)
+            _road = str(soon.get("road") or soon.get("kind") or "")
             why = (f"{soon.get('label')} takes the air in "
-                   f"{int(float(soon.get('starts_in') or 0))}s with nothing "
+                   f"{int(_left)}s with nothing "
                    "recorded for it")
-            say = why[0].upper() + why[1:] + ". I am on it."
+            # #1073: "I am on it" was a promise the station had already
+            # measured it could not keep. A painting round costs 362s on
+            # this box; it is not on it in thirty-five seconds, and every
+            # second spent trying is a second the NEXT entry does not
+            # get - which is how the same message comes round again.
+            try:
+                _need = float(task_cost(_road) or 0)
+            except Exception:  # noqa: BLE001
+                _need = 0.0
+            if _need and _need > _left:
+                try:
+                    _held = len([w for w in (slot_supply().get(_road) or [])
+                                 if w <= 0])
+                except Exception:  # noqa: BLE001
+                    _held = 0
+                say = (why[0].upper() + why[1:]
+                       + f". There is no time - it measures about "
+                         f"{int(_need)}s. "
+                       + ("A prepared take covers it, and a fresh one is "
+                          "queued so this does not come round again."
+                          if _held else
+                          "Nothing is on the shelf either, so the record "
+                          "runs on. It is first in the queue from here."))
+            else:
+                say = why[0].upper() + why[1:] + ". I am on it."
         elif relief or banked < target * 0.25:
             mood = "rushing"
             why = ("the clone engine is in relief, so only cached lines "
@@ -65209,7 +65502,7 @@ async def api_repeats() -> dict[str, Any]:
                                             float(r.get("rest") or 0))),
         "held": len(rows), "ready": len(ready),
         "by_kind": sorted(by_kind.values(), key=lambda r: -r["held"]),
-        "rest_seconds": SHELF_REUSE_REST,
+        "rest_seconds": shelf_reuse_rest(),   # #1059: the one in force
         "keep_seconds": REPEAT_KEEP_SECONDS,
         # What the cupboard is worth: the preparation nobody has to do
         # because these already exist.
@@ -65246,6 +65539,50 @@ async def api_name_clashes() -> dict[str, Any]:
             "say": (f"{len(got)} name(s) defined more than once - the "
                     "last definition wins in every case"
                     if got else "no function name is defined twice")}
+
+
+@app.get("/api/trail")
+async def api_trail(limit: int = 60, liked: int = 0) -> dict[str, Any]:
+    """#1072: what the station took, what it made of it, and what you
+    liked.
+
+    One record per tinted moment: the plain line, the rewritten line,
+    the crystal passages it was shown and the studio swath the plain
+    line was built out of. Durable - the pipeline holds this for about
+    four minutes and then loses it."""
+    rows = trail_rows(limit, bool(int(liked or 0)))
+    all_rows = trail_load()
+    return {
+        "at": time.time(), "rows": rows,
+        "held": len(all_rows),
+        "liked": sum(1 for r in all_rows if r.get("liked")),
+        "say": (f"{len(all_rows)} moment(s) on the trail, "
+                f"{sum(1 for r in all_rows if r.get('liked'))} of them "
+                "marked good - and the material behind those is drawn "
+                "first and never rested"
+                if all_rows else "nothing on the trail yet"),
+    }
+
+
+@app.post("/api/trail/{row_id}/like")
+async def api_trail_like(
+    row_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1072: mark a moment good, or clear it. {"liked": true}
+
+    A like is not a bookmark: the material behind it goes to the FRONT
+    of the draw and stops resting, so what worked once is reached for
+    again."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    liked = bool((payload if isinstance(payload, dict) else {})
+                 .get("liked", True))
+    return trail_like(str(row_id), liked)
 
 
 @app.get("/api/commitments")
@@ -65470,7 +65807,7 @@ async def api_recording_room_rows(
         "reusable": kind in SHELF_REUSABLE,
         "cap": shelf_cap(kind),
         "ceiling": shelf_cap(kind) * SHELF_ROW_CEILING,
-        "rest_seconds": SHELF_REUSE_REST,
+        "rest_seconds": shelf_reuse_rest(),   # #1059: the one in force
         "airings_allowed": SHELF_REUSE_MOST,
     }
     rows: list[dict[str, Any]] = []
@@ -65491,7 +65828,7 @@ async def api_recording_room_rows(
             "resting": bool(
                 row.get("aired_at")
                 and time.time() - float(row.get("aired_at") or 0)
-                < SHELF_REUSE_REST),
+                < shelf_reuse_rest()),   # #1059
         }
         if out["key"] or out["produced"]:
             out["verdict"] = "already has its audio"
@@ -74963,6 +75300,40 @@ main.swap > aside     { order: 1; }
   border-radius: 2px;
   transition: background .15s ease;
 }
+/* #1074: TEXT DOES NOT COLLAPSE TO ONE WORD WIDE.
+ *
+ * A flex item's min-width defaults to `auto`, which for a paragraph
+ * resolves to the width of its longest WORD - so a text child will
+ * shrink to about eight characters and hand everything to its
+ * siblings. Pictures do not shrink that way: an img has an intrinsic
+ * width, and against a text sibling that has volunteered to be sixty
+ * pixels the picture simply wins. Measured in the booth: a line of
+ * dialogue rendering one word per line with the panel empty beside it.
+ *
+ * Two rules. The text may shrink to the CONTAINER rather than to its
+ * longest word, and keeps a readable floor in `ch`; and the pictures
+ * are capped so an intrinsic width cannot outbid a sibling with none.
+ *
+ * Here rather than in the six renderers that build these rows: one
+ * place to look when it drifts, and it reaches the views nobody has
+ * noticed yet. */
+#djTalkLog, #djTalkLog > *, .pvRound, .pvRound > * { min-width: 0; }
+#djTalkLog p, #djTalkLog .pvSaid, #djTalkLog .cx-reply,
+.pvRound .pvSaid, .pvRound p {
+  min-width: 22ch;
+  flex: 1 1 auto;
+  overflow-wrap: anywhere;
+}
+/* A picture beside dialogue is furniture, not the subject. */
+#djTalkLog img, .pvRound img {
+  max-width: 30%;
+  flex: 0 1 auto;
+  height: auto;
+  object-fit: cover;
+}
+/* A stack of small portraits is a stack, not a column of the row. */
+#djTalkLog img[width], #djTalkLog img[height] { max-width: 72px; }
+
 #gutter:hover::before, #gutter.dragging::before { background: var(--accent); }
 .panel {
   background: var(--panel);
