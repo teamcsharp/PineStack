@@ -868,6 +868,11 @@ DEFAULT_DJ = {
     # named artist's voice is exactly the kind of work a small model
     # cannot do at any temperature with any prompt.
     "crystal_tint_model": "",
+    # #1042: how long a chunk of either shelf rests before it may be
+    # drawn again. A preference, never a gag - if everything is still
+    # resting the coldest airs anyway, because a station that would
+    # rather go quiet than repeat itself is not a station.
+    "chunk_cool_seconds": 3600,
     # How much of the crystal's own material goes into the SECOND system
     # prompt, and how long each piece may be. This is the dial the
     # operator asked to be able to adjust: "I want to be able to see the
@@ -1467,6 +1472,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "crystal_tint_model": str(raw_dj.get(                       # #1036
             "crystal_tint_model",
             DEFAULT_DJ["crystal_tint_model"]) or "")[:80],
+        "chunk_cool_seconds": max(0, min(86400, int(               # #1042
+            raw_dj.get("chunk_cool_seconds",
+                       DEFAULT_DJ["chunk_cool_seconds"]) or 0))),
         "crystal_tint_chunks": max(0, min(12, int(float(            # #1006
             raw_dj.get("crystal_tint_chunks",
                        DEFAULT_DJ["crystal_tint_chunks"]) or 0)))),
@@ -15480,7 +15488,11 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                        ("speakbox_prepend_rate", "Opening passage rate", "range", 0, 100, 1),
                        ("speakbox_append_rate", "Closing passage rate", "range", 0, 100, 1),
                        ("speakbox_full_swath_rate", "Uninterrupted swath rate", "range", 0, 100, 1),
-                       ("speakbox_full_swath_chars", "Uninterrupted swath length", "number", 300, 6000, 100)],
+                       ("speakbox_full_swath_chars", "Uninterrupted swath length", "number", 300, 6000, 100),
+                       # #1042: how long a passage rests before either
+                       # shelf may hand it out again. Zero turns the
+                       # cooldown off entirely.
+                       ("chunk_cool_seconds", "Chunk cooldown (seconds)", "number", 0, 86400, 300)],
         "gallery": [("gallery_ads", "Gallery segments enabled", "checkbox", 0, 0, 0),
                     ("ad_price_low", "Gallery price floor", "number", 0, 10000, 10),
                     ("ad_price_high", "Gallery price ceiling", "number", 0, 10000, 10)],
@@ -34913,6 +34925,206 @@ SPEAKBOX_HEARD_MAX = 12000   # #824: ~30h at measured churn
 _SPEAKBOX_LOCK = RLock()
 
 
+# --- THE CHUNK LEDGER (#1042) ----------------------------------------
+# One record of every passage either shelf has handed out: what it was,
+# where it came from, which road asked for it, how often it has been
+# used, and what the cast made of it. It is the cooldown AND it is the
+# window on the cooldown - the operator asked to see what is resting,
+# how long is left, how much it has been used and how it was answered,
+# and all four of those are the same four facts.
+CHUNK_LEDGER_PATH = data_path("chunk_ledger.json")
+CHUNK_LEDGER_MAX = 4000
+_CHUNK_LOCK = RLock()
+_CHUNK_LEDGER: dict[str, dict[str, Any]] = {}
+_CHUNK_READ = [False]
+
+
+def chunk_cool_seconds() -> float:
+    """How long a chunk rests before it may be drawn again."""
+    try:
+        return max(0.0, float(dj_settings().get("chunk_cool_seconds") or 0))
+    except Exception:  # noqa: BLE001
+        return 3600.0
+
+
+def chunk_ledger_key(text: str) -> str:
+    """The words, stripped of the punctuation that drifts between one
+    telling and the next. Deliberately the same shape as _bin_key so a
+    chunk and the line it became can be reasoned about together.
+
+    #1043: NOT `chunk_key`. That name was already taken, by a
+    two-argument sha1 defined further down the file - so the ledger's
+    calls landed on it and raised, which took out both draws."""
+    flat = " ".join(re.sub(r"[^\w\s]", " ",
+                           str(text or "").lower()).split())
+    return flat[:400]
+
+
+def _chunk_all() -> dict[str, dict[str, Any]]:
+    """The ledger, read from disk once and held."""
+    if not _CHUNK_READ[0]:
+        with _CHUNK_LOCK:
+            if not _CHUNK_READ[0]:
+                try:
+                    rows = json.loads(CHUNK_LEDGER_PATH.read_text())
+                    if isinstance(rows, list):
+                        for row in rows:
+                            k = str((row or {}).get("key") or "")
+                            if k:
+                                _CHUNK_LEDGER[k] = row
+                except Exception:  # noqa: BLE001
+                    pass
+                _CHUNK_READ[0] = True
+    return _CHUNK_LEDGER
+
+
+def _chunk_save() -> None:
+    try:
+        rows = sorted(_CHUNK_LEDGER.values(),
+                      key=lambda r: -float(r.get("last") or 0))
+        del rows[CHUNK_LEDGER_MAX:]
+        for gone in [k for k, v in _CHUNK_LEDGER.items() if v not in rows]:
+            _CHUNK_LEDGER.pop(gone, None)
+        CHUNK_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CHUNK_LEDGER_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows, indent=1))
+        tmp.replace(CHUNK_LEDGER_PATH)
+    except Exception:  # noqa: BLE001
+        pass                            # a forgetful shelf still serves
+
+
+def chunk_cooling(text: str) -> float:
+    """Seconds left on this chunk's rest. Zero means it is free, and a
+    chunk nobody has ever served is free by definition - which is what
+    makes "things they never said" the front of the queue."""
+    try:
+        cool = chunk_cool_seconds()
+        if cool <= 0:
+            return 0.0
+        row = _chunk_all().get(chunk_ledger_key(text))
+        if not row:
+            return 0.0
+        left = cool - (time.time() - float(row.get("last") or 0))
+        return max(0.0, left)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def chunk_serve(shelf: str, text: str, file: str = "", mind: str = "",
+                road: str = "", crystal: str = "") -> str:
+    """Stamp a chunk on its way out and return its key."""
+    # #1043: EVERYTHING inside the try, key included. This line used to
+    # sit above it, so a fault in the bookkeeping propagated into the
+    # caller - and both callers are draws that then returned nothing.
+    # The ledger is a record of the show; it is never a reason the show
+    # does not happen.
+    key = ""
+    try:
+        key = chunk_ledger_key(text)
+        if not key:
+            return ""
+        with _CHUNK_LOCK:
+            rows = _chunk_all()
+            row = rows.get(key) or {
+                "key": key, "shelf": str(shelf or ""),
+                "text": str(text or "")[:600],
+                "file": str(file or ""), "mind": str(mind or ""),
+                "crystal": str(crystal or ""),
+                "first": time.time(), "used": 0, "roads": [],
+                "answers": [],
+            }
+            row["used"] = int(row.get("used") or 0) + 1
+            row["last"] = time.time()
+            row["shelf"] = str(shelf or row.get("shelf") or "")
+            if file:
+                row["file"] = str(file)
+            if crystal:
+                row["crystal"] = str(crystal)
+            if road:
+                roads = [r for r in (row.get("roads") or []) if r != road]
+                roads.insert(0, str(road))
+                row["roads"] = roads[:6]
+            rows[key] = row
+            _chunk_save()
+    except Exception:  # noqa: BLE001
+        pass
+    return key
+
+
+def chunk_answer(text: str, said: str, road: str = "") -> None:
+    """What the cast MADE of this chunk.
+
+    The operator asked to see "how it was responded to", and the honest
+    answer is the line that actually came back - not a score, not a
+    verdict, the words. Kept newest-first, a handful deep, so one
+    passage shows its whole history of being answered differently."""
+    try:
+        key = chunk_ledger_key(text)
+        got = " ".join(str(said or "").split())[:400]
+        if not key or len(got) < 8:
+            return
+        with _CHUNK_LOCK:
+            row = _chunk_all().get(key)
+            if not row:
+                return
+            answers = [a for a in (row.get("answers") or [])
+                       if str((a or {}).get("said") or "") != got]
+            answers.insert(0, {"at": time.time(), "said": got,
+                               "road": str(road or "")})
+            row["answers"] = answers[:5]
+            _chunk_save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def chunk_rank(items: list[Any], text_of: Any) -> list[Any]:
+    """Reorder so the freshest material leads.
+
+    Never served first - "everyone saying things they never said" - then
+    whatever has been resting longest. Ties keep their incoming (random)
+    order, so this SORTS the randomness rather than replacing it."""
+    try:
+        return sorted(items, key=lambda it: chunk_cooling(text_of(it)))
+    except Exception:  # noqa: BLE001
+        return list(items)
+
+
+def chunk_rows(most: int = 200, shelf: str = "",
+               cooling_only: bool = False) -> list[dict[str, Any]]:
+    """The ledger for the panel: what is resting, how long is left, how
+    often it has been used, and what came back."""
+    out: list[dict[str, Any]] = []
+    try:
+        cool = chunk_cool_seconds()
+        now = time.time()
+        for row in _chunk_all().values():
+            if shelf and str(row.get("shelf") or "") != shelf:
+                continue
+            left = max(0.0, cool - (now - float(row.get("last") or 0)))
+            if cooling_only and left <= 0:
+                continue
+            out.append({
+                "key": str(row.get("key") or "")[:120],
+                "shelf": str(row.get("shelf") or ""),
+                "crystal": str(row.get("crystal") or ""),
+                "file": str(row.get("file") or ""),
+                "mind": str(row.get("mind") or ""),
+                "text": str(row.get("text") or "")[:600],
+                "used": int(row.get("used") or 0),
+                "last": float(row.get("last") or 0),
+                "first": float(row.get("first") or 0),
+                "left": round(left, 1),
+                "cooling": left > 0,
+                "roads": list(row.get("roads") or [])[:6],
+                "answers": list(row.get("answers") or [])[:5],
+            })
+        out.sort(key=lambda r: (-r["left"], -r["used"]))
+        del out[max(1, int(most)):]
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def speakbox_heard(rid: str = "") -> list[dict[str, Any]]:
     try:
         rows = json.loads(mind_state(rid, "heard").read_text())
@@ -36396,8 +36608,18 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
             fresh = [line for line in gems
                      if line not in said and looks_english(line)]
         if fresh:
+            # #1042: among lines that have never aired, the ones resting
+            # longest lead. The no-repeat set above answers "has this
+            # ever been said"; this answers "and how long ago", which is
+            # the question that keeps a shelf moving rather than just
+            # keeping it honest. Adjacency still decides the swath - this
+            # only chooses where in the document to stand.
+            fresh = chunk_rank(fresh, lambda ln: ln)
             lines = speakbox_swath_lines(fresh, most=most, cap=cap,
                                          deep=_depth)
+            for _ln in lines:
+                chunk_serve("speakbox", _ln, file=doc.name,
+                            mind=str(key or ""), road="seed")
             pipeline_log("speakbox",
                          f"mined {doc.name} — {len(fresh)} unused lines "
                          f"on the shelf, swath of {len(lines)} taken",
@@ -55655,14 +55877,36 @@ def crystal_stanzas(most: int = 2, lines: int = 0) -> list[dict[str, Any]]:
         runs = list(_CRYSTAL_STANZA.get("runs") or [])
         if not runs:
             return out
-        for pick in random.sample(runs, k=min(most, len(runs))):
-            got = pick["lines"]
-            start = random.randrange(0, max(1, len(got) - lines))
-            out.append({
-                "crystal": pick["crystal"], "mind": pick["mind"],
-                "file": pick["file"],
-                "text": "\n".join(got[start:start + lines]),
-            })
+        # #1042: CANDIDATE WINDOWS, not files. This used to sample a file
+        # and then pick a start inside the winner - so the thing it chose
+        # and the thing it served were different objects and there was
+        # nothing a cooldown could attach to. The same passage could come
+        # back twice running, and on a crystal with a few long files it
+        # frequently did.
+        #
+        # Several windows per file, shuffled, then ordered by how long
+        # each has rested. The shuffle decides among equals and an
+        # untouched crystal is ALL equals, so this behaves exactly as it
+        # used to until something has actually been said.
+        cands: list[dict[str, Any]] = []
+        for run in runs:
+            got = run["lines"]
+            span = max(1, len(got) - lines)
+            # Windows stepped a third of a stanza apart, so a long file
+            # offers many distinct passages instead of one lucky start.
+            step = max(1, lines // 3)
+            starts = list(range(0, span, step))[:24] or [0]
+            for st in starts:
+                cands.append({"crystal": run["crystal"], "mind": run["mind"],
+                              "file": run["file"], "start": st,
+                              "text": "\n".join(got[st:st + lines])})
+        random.shuffle(cands)
+        for pick in chunk_rank(cands, lambda c: c["text"])[:most]:
+            chunk_serve("crystal", pick["text"], file=pick["file"],
+                        mind=pick["mind"], road="tint",
+                        crystal=pick["crystal"])
+            out.append({k: pick[k] for k in
+                        ("crystal", "mind", "file", "text")})
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -55944,6 +56188,9 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
             return said
         if out == said:
             return said                 # it did nothing; say so by silence
+        # #1042: the answer, filed against the passage that caused it.
+        for _c in chunks:
+            chunk_answer(str(_c.get("text") or ""), out, why or "a line")
         pipeline_log(
             "crystal",
             f"tinted {why or 'a line'} "
@@ -56255,6 +56502,10 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         out["ok"] = True
         out["script"] = tinted
+        # #1042: what the round MADE of each passage it was shown.
+        for _c in chunks:
+            chunk_answer(str(_c.get("text") or ""), tinted,
+                         kind or "a banked round")
         pipeline_log("speakbox",
                      f"a round was tinted through {world or 'the crystal'} - "
                      f"{len(chunks)} passage(s) of its own material in the "
@@ -62183,6 +62434,46 @@ async def api_brief_audit(
     two dozen verdicts with the words each one was judged on."""
     require_read_auth(authorization)
     return brief_state()
+
+
+@app.get("/api/chunks")
+async def api_chunks(
+    shelf: str = "",
+    cooling: int = 0,
+    limit: int = 200,
+) -> dict[str, Any]:
+    """#1042: THE CHUNK LEDGER, for reading.
+
+    "i want to see what chunks are cooling down and how long are left
+    and see how much was used and how it was responded to."
+
+    Four facts per row and they are the four that were asked for: what
+    it is and which shelf it came off, how many seconds of rest are
+    left, how many times it has been used, and the lines the cast
+    actually made of it. `shelf` narrows to "crystal" or "speakbox";
+    `cooling=1` shows only what is still resting."""
+    rows = chunk_rows(most=max(1, min(1000, int(limit or 200))),
+                      shelf=str(shelf or ""),
+                      cooling_only=bool(int(cooling or 0)))
+    cool = chunk_cool_seconds()
+    resting = [r for r in rows if r.get("cooling")]
+    by_shelf: dict[str, int] = {}
+    for r in rows:
+        k = str(r.get("shelf") or "?")
+        by_shelf[k] = by_shelf.get(k, 0) + 1
+    return {
+        "at": time.time(),
+        "cool_seconds": cool,
+        "rows": rows,
+        "held": len(rows),
+        "resting": len(resting),
+        "free": len(rows) - len(resting),
+        "by_shelf": by_shelf,
+        # The longest rest left, so the panel can say when the shelf
+        # next opens up without walking every row.
+        "next_free": round(min([r["left"] for r in resting] or [0.0]), 1),
+        "answered": sum(1 for r in rows if r.get("answers")),
+    }
 
 
 @app.get("/api/coordinator/capacity")
@@ -75516,6 +75807,7 @@ const PINE_3JS = [
   {key: "topology", label: "🪐 Mind Topology",   open: () => mindTopologyOpen()},
   {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
+  {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
   {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
@@ -79158,6 +79450,7 @@ async function boothOpen() {
     {name: "🧠 Dialogue Mind", open: () => mindOpen()},
     {name: "🕸 The machine", open: () => djGraphPanel()},
     {name: "💠 Data crystal", open: () => crystalOpen()},
+    {name: "❄️ The shelf", open: () => chunkOpen()},
   ];
   let viewIdx = Number(localStorage.booth3jsIdx || 0);
   const viewBtn = el("button", "", "🧠 3JS Views ⟳");
@@ -106145,6 +106438,187 @@ function crystalNameSprite(THREE, text, rgb) {
   sp.scale.set(canvas.width * 0.04, canvas.height * 0.04, 1);
   return sp;
 }
+
+// #1042: THE SHELF - what is resting, how long is left, how often it
+// has been used, and what came back from it. Over BOTH shelves, because
+// the cast draws from both and "everyone saying things they never said"
+// is one question, not two.
+let chunkBox = null;
+let chunkTimer = null;
+let chunkShelf = "";
+let chunkRestingOnly = false;
+
+function chunkClose() {
+  if (chunkTimer) { clearInterval(chunkTimer); chunkTimer = null; }
+  if (chunkBox) { chunkBox.remove(); chunkBox = null; }
+}
+
+function chunkLeftText(secs) {
+  if (!(secs > 0)) return "free";
+  const m = Math.floor(secs / 60), sec = Math.floor(secs % 60);
+  if (m >= 60) return Math.floor(m / 60) + "h " + (m % 60) + "m left";
+  return m ? (m + "m " + sec + "s left") : (sec + "s left");
+}
+
+async function chunkPaint() {
+  if (!chunkBox) return;
+  const body = chunkBox.querySelector("#chunkBody");
+  const head = chunkBox.querySelector("#chunkCount");
+  let data;
+  try {
+    data = await (await fetch("/api/chunks?limit=300"
+      + (chunkShelf ? "&shelf=" + encodeURIComponent(chunkShelf) : "")
+      + (chunkRestingOnly ? "&cooling=1" : ""))).json();
+  } catch (err) { return; }
+  if (!chunkBox) return;
+  const rows = data.rows || [];
+  head.textContent = data.held + " held \u00b7 " + data.resting
+    + " resting \u00b7 " + data.free + " free \u00b7 "
+    + data.answered + " answered \u00b7 rest "
+    + Math.round((data.cool_seconds || 0) / 60) + "m"
+    + (data.resting ? " \u00b7 next free in "
+       + chunkLeftText(data.next_free) : "");
+  body.textContent = "";
+  if (!rows.length) {
+    body.appendChild(el("div", "muted",
+      "Nothing has been drawn off either shelf yet."));
+    return;
+  }
+  rows.forEach((row) => {
+    const card = el("div", "", "");
+    card.style.cssText = "border:1px solid rgba(255,255,255,.09);"
+      + "border-radius:7px;padding:7px 9px;margin-bottom:6px;"
+      + (row.cooling ? "background:rgba(255,180,60,.06)" : "");
+    const top = el("div", "", "");
+    top.style.cssText = "display:flex;gap:7px;align-items:center;"
+      + "font-size:11px;margin-bottom:4px";
+    top.appendChild(el("span", "",
+      row.shelf === "crystal" ? "\ud83d\udc8e" : "\ud83d\udcda"));
+    const where = el("span", "muted", row.file || row.mind || "\u2014");
+    where.style.cssText = "flex:1;overflow:hidden;text-overflow:ellipsis;"
+      + "white-space:nowrap";
+    top.appendChild(where);
+    const used = el("span", "", "used " + row.used + "\u00d7");
+    used.style.cssText = "opacity:.8";
+    top.appendChild(used);
+    const left = el("span", "", chunkLeftText(row.left));
+    left.style.cssText = "font-weight:600;color:"
+      + (row.cooling ? "#ffb43c" : "#6fdc8c");
+    top.appendChild(left);
+    card.appendChild(top);
+
+    const text = el("div", "", row.text || "");
+    text.style.cssText = "font-size:12px;line-height:1.45;white-space:"
+      + "pre-wrap;max-height:76px;overflow:hidden;cursor:pointer";
+    text.title = "click to expand";
+    text.onclick = () => {
+      text.style.maxHeight = text.style.maxHeight === "none" ? "76px" : "none";
+    };
+    card.appendChild(text);
+
+    if (row.roads && row.roads.length) {
+      const roads = el("div", "muted", "\u2192 " + row.roads.join(", "));
+      roads.style.cssText = "font-size:10px;margin-top:3px";
+      card.appendChild(roads);
+    }
+    if (row.answers && row.answers.length) {
+      const more = el("div", "", "");
+      more.style.cssText = "margin-top:5px;border-top:1px dashed "
+        + "rgba(255,255,255,.12);padding-top:5px";
+      const cap = el("div", "muted",
+        "what came back (" + row.answers.length + ")");
+      cap.style.cssText = "font-size:10px;margin-bottom:3px";
+      more.appendChild(cap);
+      row.answers.forEach((ans) => {
+        const line = el("div", "", "\u201c" + (ans.said || "") + "\u201d");
+        line.style.cssText = "font-size:11px;line-height:1.4;opacity:.85;"
+          + "margin-bottom:3px";
+        more.appendChild(line);
+      });
+      card.appendChild(more);
+    }
+    body.appendChild(card);
+  });
+}
+
+async function chunkOpen() {
+  if (chunkBox) { chunkClose(); return; }
+  const box = el("div", "panel", "");
+  box.id = "chunkBoxEl";
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.chunkBox || "null") || { left: 140, top: 90 });
+  box.style.cssText = "position:fixed;z-index:147;width:min(620px,95vw);"
+    + "height:min(560px,80vh);display:flex;flex-direction:column;"
+    + "padding:10px 12px;box-shadow:0 20px 60px rgba(0,0,0,.65);"
+    + "resize:both;overflow:hidden;"
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "cursor:grab;margin-bottom:6px";
+  head.appendChild(el("b", "", "\u2744\ufe0f The shelf"));
+  const count = el("span", "muted", "reading\u2026");
+  count.id = "chunkCount";
+  count.style.cssText = "flex:1;font-size:11px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(count);
+  const shut = el("button", "", "\u2715");
+  shut.onclick = chunkClose;
+  head.appendChild(shut);
+  box.appendChild(head);
+
+  const bar = el("div", "", "");
+  bar.style.cssText = "display:flex;gap:5px;margin-bottom:7px;"
+    + "flex-wrap:wrap";
+  [["", "both shelves"], ["crystal", "\ud83d\udc8e crystal"],
+   ["speakbox", "\ud83d\udcda speakbox"]].forEach(([val, face]) => {
+    const b = el("button", "", face);
+    b.style.fontSize = "11px";
+    b.onclick = () => { chunkShelf = val; chunkPaint(); };
+    bar.appendChild(b);
+  });
+  const only = el("button", "", "resting only");
+  only.style.fontSize = "11px";
+  only.onclick = () => {
+    chunkRestingOnly = !chunkRestingOnly;
+    only.style.opacity = chunkRestingOnly ? "1" : ".55";
+    chunkPaint();
+  };
+  only.style.opacity = ".55";
+  bar.appendChild(only);
+  box.appendChild(bar);
+
+  const body = el("div", "", "");
+  body.id = "chunkBody";
+  body.style.cssText = "flex:1;overflow:auto;padding-right:3px";
+  box.appendChild(body);
+
+  head.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    const from = {x: event.clientX, y: event.clientY,
+                  left: box.offsetLeft, top: box.offsetTop};
+    head.setPointerCapture(event.pointerId);
+    const move = (e) => {
+      box.style.left = Math.max(0, from.left + e.clientX - from.x) + "px";
+      box.style.top = Math.max(0, from.top + e.clientY - from.y) + "px";
+    };
+    head.addEventListener("pointermove", move);
+    head.addEventListener("pointerup", () => {
+      head.removeEventListener("pointermove", move);
+      try {
+        localStorage.chunkBox = JSON.stringify(
+          {left: box.offsetLeft, top: box.offsetTop});
+      } catch (err) {}
+    }, {once: true});
+  });
+
+  document.body.appendChild(box);
+  chunkBox = box;
+  await chunkPaint();
+  // The clock is the point of the view, so it ticks.
+  chunkTimer = setInterval(chunkPaint, 5000);
+}
+
 
 async function crystalOpen() {
   if (crystal) { crystalClose(); return; }
