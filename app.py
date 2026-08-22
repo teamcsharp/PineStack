@@ -862,6 +862,12 @@ DEFAULT_DJ = {
     # and either one chosen (#1016). Off, the tint rides in the first
     # prompt as a clause, which is what it has always done.
     "crystal_tint_pass": True,
+    # #1036: the model the TINTING pass uses. Empty means the station's
+    # own. It runs on the banking road, never on the live path, so it can
+    # afford a far better model than the show can - and rewriting in a
+    # named artist's voice is exactly the kind of work a small model
+    # cannot do at any temperature with any prompt.
+    "crystal_tint_model": "",
     # How much of the crystal's own material goes into the SECOND system
     # prompt, and how long each piece may be. This is the dial the
     # operator asked to be able to adjust: "I want to be able to see the
@@ -1458,6 +1464,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
             DEFAULT_DJ["speakbox_evict_lyrics"])),
         "crystal_tint_pass": bool(raw_dj.get(                       # #1006
             "crystal_tint_pass", DEFAULT_DJ["crystal_tint_pass"])),
+        "crystal_tint_model": str(raw_dj.get(                       # #1036
+            "crystal_tint_model",
+            DEFAULT_DJ["crystal_tint_model"]) or "")[:80],
         "crystal_tint_chunks": max(0, min(12, int(float(            # #1006
             raw_dj.get("crystal_tint_chunks",
                        DEFAULT_DJ["crystal_tint_chunks"]) or 0)))),
@@ -36961,6 +36970,7 @@ async def _sfxguy_news_fill() -> None:
             story = picks[0]
             # #1018: the crystal's own lines ride along, not just its
             # description - see crystal_style_note.
+            _news_words = sfx_words()                             # #1034
             _ntint = ""
             _ncrs = crystal_active()
             if _ncrs:
@@ -36968,8 +36978,10 @@ async def _sfxguy_news_fill() -> None:
             take = await ask_model(
                 "You are a thick-accented, NASCAR-loving country boy in "
                 f"a radio booth. Headline: {story.get('title')}. Give ONE "
-                "spicy, funny one-line take on it, under 22 words, no "
-                f"quotes, no explanation.{_ntint}", limit=140, spice=0.85,
+                f"spicy, funny take on it, under {_news_words} words, no "
+                "quotes, no explanation. Make it RHYME - internal rhyme, "
+                f"not just on the end.{_ntint}",
+                limit=max(200, _news_words * 9), spice=0.85,
                 # #1022: his own brew, not whatever entry is on air.
                 mark={"kind": "sfx news",
                       "for": "the SFX guy's take on a headline"})
@@ -37034,15 +37046,17 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                     _shard = ""
         # #804: when a line just aired, half his inventions REACT to it —
         # engaged with the conversation, not shouted past it.
+        _react_words = sfx_words()                                # #1034
         if context and random.random() < 0.5:
             out = await ask_model(
                 "You are a thick-accented country boy in a radio booth. "
                 f"Someone on air just said: \"{context}\". Fire back ONE "
                 "short reaction that actually engages with what was said "
                 "— heckle it, one-up it, or agree way too hard — in your "
-                f"backcountry voice.{_tinted}{_shard} Under 22 words, "
-                "no quotes.",
-                limit=150, spice=0.85,
+                f"backcountry voice.{_tinted}{_shard} Under {_react_words} "
+                "words, no quotes. Make it RHYME - internal rhyme, not "
+                "just on the end.",
+                limit=max(200, _react_words * 9), spice=0.85,
                 # #1022: his own brew. It runs whenever there is room, so
                 # whatever entry is on air had nothing to do with it.
                 mark={"kind": "sfx react",
@@ -37055,6 +37069,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                 pipeline_log("air", "the SFX guy engages: "
                              f"{line[:70]} (#804)")
             return
+        _warp_words = sfx_words()                                 # #1034
         recipe = random.choice((
             "say it confidently but get it WRONG in a way that makes "
             "no sense",
@@ -37071,8 +37086,9 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             "You are a thick-accented country boy in a radio booth. "
             f"Take these sayings: {' / '.join(picks)} — and {recipe}."
             f"{_tinted}{_shard} Answer with the ONE new saying only, "
-            "under 25 words, no quotes, no explanation.",
-            limit=160, spice=0.9,
+            f"under {_warp_words} words, no quotes, no explanation. Make "
+            "it RHYME - internal rhyme, not just on the end.",
+            limit=max(200, _warp_words * 9), spice=0.9,
             # #1022: the invention shed. Nothing to do with the round on
             # air, and it must stop claiming that round's instruction.
             mark={"kind": "sfx warp",
@@ -50991,13 +51007,21 @@ TINT_MARK_FLAVOUR = "Let this flavour bleed all the way through it"
 
 async def ask_model(prompt: str, limit: int = 300,
                     spice: float = 0.0, num_ctx: int = 0,
-                    mark: dict[str, Any] | None = None) -> str:
+                    mark: dict[str, Any] | None = None,
+                    model: str = "") -> str:
     """A plain model call for the agent's own voice lines — no web search, no
     gear manuals, no technical feed, and nothing written to history. Routing
     an internal prompt through generate_answer makes it look like something
     the user asked, which is how "ACKNOWLEDGE THIS REQUEST…" ended up on the
     Pine Box screen."""
     settings = load_settings()
+    # #1036: a caller may name its own model. The station runs a small
+    # fast one because it has to keep up with a live show; a road that
+    # does NOT have to keep up - the tinting pass runs on rounds that
+    # will not air for twenty minutes - can afford a better one.
+    if model:
+        settings = dict(settings)
+        settings["model"] = str(model)
     started = time.monotonic()
     # Never let a reply exceed the operator's ceiling (#599) — the slider's
     # sweet spot that keeps every statement inside the box's size limit.
@@ -55150,6 +55174,22 @@ def crystal_clause(bank: bool = False) -> str:
     return "\n" + " ".join(parts) + "\n"
 
 
+def sfx_words() -> int:
+    """#1034: how long one of the SFX guy's lines may run, drawn fresh.
+
+    "give the sfx guy a random limit from 25 words to 50 words so he is
+    able to actually rhyme."
+
+    Twenty-two words is one clause, and a rhyme needs two things to rhyme
+    WITH - so he was being asked for a bar and given room for half of
+    one. Drawn per line rather than fixed, because a shelf of quips that
+    all run the same length reads as a shelf of quips."""
+    try:
+        return random.randint(25, 50)
+    except Exception:  # noqa: BLE001
+        return 32
+
+
 def crystal_tint_two_pass() -> bool:
     """#1006: is the tint a second pass rather than a clause?"""
     try:
@@ -55326,11 +55366,84 @@ def crystal_tint_note(crystal: dict[str, Any] | None = None,
         c = crystal or (crystal_active() or [None])[0]
         if not c:
             return ""
-        label = str(c.get("tint") or c.get("name") or "")[:200]
-        return (" Let this flavour bleed all the way through it: "
-                + label + "." + crystal_style_note(most, cap))
+        # #1034: the crystal's DESCRIPTION used to lead this - "the world
+        # of MF DOOM: supervillain logic, mask mythology..." - sitting
+        # directly above the crystal's own lines. A description of a
+        # style and the style itself in the same prompt is not two
+        # helpings of the same thing: the description is the easier one
+        # to obey, so it is what gets obeyed, and what comes back is the
+        # label's nouns rather than the writing. Only the lines now.
+        return crystal_style_note(most, cap)
     except Exception:  # noqa: BLE001
         return ""
+
+
+# #1032: how many consecutive lines make a stanza the model can read a
+# rhyme scheme out of. Below about six there is not enough for a scheme
+# to be visible; much above twelve and the dialogue is outweighed by the
+# example.
+CRYSTAL_STANZA_LINES = 10
+_CRYSTAL_STANZA: dict[str, Any] = {"at": 0.0, "runs": [], "key": ""}
+CRYSTAL_STANZA_LIFE = 300.0
+
+
+def crystal_stanzas(most: int = 2, lines: int = 0) -> list[dict[str, Any]]:
+    """#1032: whole passages of the crystal's own writing.
+
+    Chunks are stored per file in document order by speakbox_reindex, so
+    a CONTIGUOUS run out of one file is a real stanza - the lines in the
+    order they were written, with the rhymes landing where they land.
+    Random chunks from across the whole crystal show what the world is
+    ABOUT; only a run shows how a bar is BUILT, and the second is what a
+    rewrite pass has to imitate.
+
+    Two stanzas by default: one is a single voice on a single subject and
+    can read as a fluke, two shows what is constant between them."""
+    out: list[dict[str, Any]] = []
+    try:
+        lines = max(4, min(24, int(lines) or CRYSTAL_STANZA_LINES))
+        most = max(1, min(4, int(most)))
+        now = time.time()
+        key = "|".join(sorted(str(c.get("name") or "")
+                              for c in crystal_active()))
+        if (str(_CRYSTAL_STANZA.get("key") or "") != key
+                or now - float(_CRYSTAL_STANZA.get("at") or 0)
+                > CRYSTAL_STANZA_LIFE):
+            # Build the index of runs once per crystal per five minutes:
+            # every file that has enough consecutive lines to be a stanza.
+            runs: list[dict[str, Any]] = []
+            for c in crystal_active():
+                for rid in (c.get("minds") or []):
+                    try:
+                        rows = _load_vectors(mind_id(rid)).get("chunks") or []
+                    except Exception:  # noqa: BLE001
+                        continue
+                    by_file: dict[str, list[str]] = {}
+                    for row in rows:
+                        f = str((row or {}).get("file") or "")
+                        t = str((row or {}).get("text") or "").strip()
+                        if f and len(t) > 20:
+                            by_file.setdefault(f, []).append(t)
+                    for f, got in by_file.items():
+                        if len(got) >= lines:
+                            runs.append({"crystal": str(c.get("name") or ""),
+                                         "mind": str(rid), "file": f,
+                                         "lines": got})
+            _CRYSTAL_STANZA.update({"at": now, "key": key, "runs": runs})
+        runs = list(_CRYSTAL_STANZA.get("runs") or [])
+        if not runs:
+            return out
+        for pick in random.sample(runs, k=min(most, len(runs))):
+            got = pick["lines"]
+            start = random.randrange(0, max(1, len(got) - lines))
+            out.append({
+                "crystal": pick["crystal"], "mind": pick["mind"],
+                "file": pick["file"],
+                "text": "\n".join(got[start:start + lines]),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def crystal_world_prompt() -> str:
@@ -55409,6 +55522,14 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     difference between two people rapping at each other and two people
     each doing a bar alone."""
     said = str(text or "").strip()
+    # #1035: the room this line is allowed to take, drawn fresh. See the
+    # note at the top of this change - without it the only move a model
+    # has is swapping one word for another of the same length.
+    try:
+        _room = random.uniform(1.5, 2.5)
+    except Exception:  # noqa: BLE001
+        _room = 2.0
+    _may = max(90, int(len(said) * _room))
     if len(said) < TINT_TURN_FLOOR:
         return said                     # nothing in it to find
     for held in (keep or []):
@@ -55417,22 +55538,33 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
         if held and held[:60] in said:
             return said
     prompt = (
-        "Rewrite ONE line of radio dialogue so that it is in the LEXICON, "
-        "STYLE, FORM and RHYMING STYLE of the lines of lyrics provided.\n\n"
-        + ("THE LYRICS - base the rewrite on these:\n"
-           + "\n".join(str(c.get("text") or "").strip() for c in chunks)
+        "This person says what they have to say. Keep WHAT they say and "
+        "change HOW they say it, so the line reads as though the writer "
+        "of the lyrics below had written it.\n\n"
+        + ("HOW THAT WRITER WRITES - a passage of it, in order, as "
+           "written. Study the rhymes and where they fall:\n\n"
+           + "\n\n---\n\n".join(str(c.get("text") or "").strip()
+                                for c in chunks)
            + "\n\n" if chunks else "")
-        + "Take from them: the LYRICAL CADENCE (metre, breath length, "
-          "where the stress falls); the LEXICAL CONTENT (their vocabulary "
-          "and slang); the STYLE and RHETORIC (their attitude, wit, and "
-          "how they argue or dismiss); the ALLEGORY AND SIMILE LEVEL (how "
-          "far they say one thing to mean another - match it); and the "
-          "RHYME STYLE (if they rhyme, YOURS RHYMES, the same way).\n\n"
-        + (f"THE LINE BEFORE THIS ONE, already rewritten - come back on "
-           f"it and answer its rhyme:\n{answering}\n\n" if answering else "")
-        + "Keep the speaker's point and every fact, name and number in it. "
-          "Do not quote the lyrics. Do not answer the line, do not "
-          "continue it, do not add a second line - rewrite THIS line:\n"
+        + "Come back with ONE bar written that way. Take from the "
+          "passage: its LEXICON and VOCABULARY (the words that writer "
+          "uses, and the ones they never would); its SPEAKING STYLE (how "
+          "a sentence runs, breaks and lands); its BUILDUP (how a thing "
+          "is set up and paid off); and its DELIVERY (the rhythm it "
+          "would be said with). IT RHYMES the way those lines rhyme - "
+          "inside the line, not only on the end - and it says a thing "
+          "sideways as often as they do.\n\n"
+        + (f"THE LINE BEFORE THIS ONE, already rewritten - answer its "
+           f"rhyme:\n{answering}\n\n" if answering else "")
+        + f"IT MAY RUN LONGER THAN THE ORIGINAL - up to about "
+          f"{_may} characters, which is roughly "
+          f"{int(round(_room * 10)) / 10}x what you are given. USE that "
+          "room: a bar needs the syllables to set a thing up, turn it, "
+          "and land the rhyme, and a line squeezed into the same space "
+          "as the original can only swap one word for another.\n\n"
+          "Keep every fact, name and number. Do not quote the lyrics or "
+          "lift their phrases. Do not answer the line, do not continue "
+          "it, do not add a second - rewrite THIS line:\n"
         + said
         + "\n\nReturn ONLY the rewritten line. No speaker label, no "
           "quotes, no explanation.")
@@ -55443,8 +55575,10 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     if seen is not None and not seen:
         seen.append(prompt)
     try:
-        got = await ask_model(prompt, limit=max(120, len(said) * 2),
+        got = await ask_model(prompt, limit=_may + 120,           # #1035
                               spice=0.5,
+                              model=str(dj_settings().get(       # #1036
+                                  "crystal_tint_model") or ""),
                               mark={"kind": "tint turn",
                                     "for": "one turn put in the crystal's "
                                            "mouth"})
@@ -55463,7 +55597,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 f"ask for anything - return the rewritten line and "
                 f"nothing else.\n\nTHE VOICE: {world}\n\nTHE LINE:\n"
                 + said,
-                limit=max(120, len(said) * 2), spice=0.6,
+                limit=_may + 120, spice=0.6,                     # #1035
                 mark={"kind": "tint turn",
                       "for": "the same turn, asked again after the model "
                              "answered the prompt instead of the line"})
@@ -55482,7 +55616,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 "is the one thing you were told not to do. Rewrite it "
                 "properly this time - different words, their images, "
                 "their rhyme - keeping only the facts.",
-                limit=max(120, len(said) * 2), spice=0.75,
+                limit=_may + 120, spice=0.75,                    # #1035
                 mark={"kind": "tint turn", "for": "the same turn, asked "
                                                   "again after it came "
                                                   "back unchanged"})
@@ -55497,8 +55631,11 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     if not out or len(out) < TINT_TURN_FLOOR // 2:
         return said
     # Runaway: a small model asked for one line sometimes writes a verse.
-    if len(out) > max(400, len(said) * 3):
-        out = out[:max(400, len(said) * 3)].rsplit(" ", 1)[0]
+    # #1035: the runaway guard moves with the allowance, or it would cut
+    # off the very room that was just granted.
+    _cap = max(400, _may + 200)
+    if len(out) > _cap:
+        out = out[:_cap].rsplit(" ", 1)[0]
     return out
 
 
@@ -55529,8 +55666,14 @@ async def crystal_tint(script: str, kind: str = "",
             out["why"] = "no crystal is on, so nothing tints it"
             return out
         dj = dj_settings()
-        chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
-                                  int(dj.get("crystal_tint_chars") or 900))
+        # #1032: STANZAS, not scattered fragments. See crystal_stanzas.
+        chunks = crystal_stanzas(2, CRYSTAL_STANZA_LINES)
+        if not chunks:
+            # No file in the crystal is long enough to cut a stanza out
+            # of; fall back to the old scatter rather than tinting with
+            # nothing at all.
+            chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
+                                      int(dj.get("crystal_tint_chars") or 900))
         # #1018: the passages the round is NOT allowed to reword.
         #
         # #838 keeps the operator's own material word for word - it is
@@ -55570,33 +55713,37 @@ async def crystal_tint(script: str, kind: str = "",
         out["world"] = world
         out["chunks"] = chunks
         armed = (
-            "Rewrite the dialogue below so that it is in the LEXICON, "
-            "STYLE, FORM and RHYMING STYLE of the lines of lyrics "
-            "provided.\n\n"
-            "That is the whole job. The dialogue already says what it "
-            "needs to say; you are converting HOW it says it.\n\n"
-            + ("THE LYRICS - base the rewrite on these:\n"
-               + "\n".join(str(c.get("text") or "").strip()
-                           for c in chunks)
+            "The people below say what they have to say. Keep every word "
+            "of WHAT they say, and change HOW they say it so that it "
+            "reads as though the writer of the lyrics below had written "
+            "it.\n\n"
+            + ("HOW THAT WRITER WRITES - a passage of it, in order, as "
+               "written. This is your only guide; study the rhymes, where "
+               "they fall, how a line runs on, the words reached for:\n\n"
+               + "\n\n---\n\n".join(str(c.get("text") or "").strip()
+                                    for c in chunks)
                + "\n\n" if chunks else "")
-            + "Take from them:\n"
-              "  LYRICAL CADENCE - the metre, the length of a breath, "
-              "where the stress falls, how a line lands.\n"
-              "  LEXICAL CONTENT - their vocabulary and their slang; the "
-              "kind of nouns they reach for.\n"
-              "  STYLE - the attitude and the wit; how a thought is set "
-              "up and paid off.\n"
-              "  RHETORIC - how they argue, boast, dismiss or agree.\n"
-              "  ALLEGORY AND SIMILE - how far they say one thing to mean "
-              "another, and how long they run a figure before dropping "
-              "it. Match that level.\n"
-              "  RHYME STYLE - if they rhyme, YOURS RHYMES, the same way: "
-              "internal rhyme mid-line, multi-syllable rhyme, however "
-              "many to a breath they use.\n\n"
+            + "TAKE SIX THINGS OFF THAT PASSAGE AND PUT THEM ON THE "
+              "DIALOGUE:\n"
+              "  LEXICON - the words that writer uses.\n"
+              "  VOCABULARY - the range they draw from, and what they "
+              "never reach for.\n"
+              "  SPEAKING STYLE - how a sentence runs, breaks and lands.\n"
+              "  STANZA STYLE - how a RUN of lines is shaped: how long a "
+              "thought is held, where it turns, how the rhymes chain "
+              "from one line into the next.\n"
+              "  BUILDUP METHODS - how they set a thing up and pay it "
+              "off; what they hold back and when they spend it.\n"
+              "  DELIVERY - the rhythm it would be said with, and the "
+              "attitude behind it.\n\n"
+              "So every turn comes back as BARS. It rhymes the way those "
+              "lines rhyme - INSIDE the line, not only on the end. It "
+              "says a thing sideways as often as they do.\n\n"
               "Keep: the speaker markers and their order, the number of "
               "turns, who says what, and every fact, name, number and "
-              "decision. Do not quote the lyrics, do not repeat their "
-              "phrases, and never name where they came from.\n"
+              "decision. Do not quote the lyrics and do not lift their "
+              "phrases - write NEW lines the same way. Never mention the "
+              "lyrics, the writer, or that anything was rewritten.\n"
             + (("Leave these passages exactly as they are - they are "
                 "quoted material, read out word for word:\n"
                 + "\n".join('"' + v + '"' for v in keep) + "\n")
@@ -55619,8 +55766,15 @@ async def crystal_tint(script: str, kind: str = "",
             # this had 45 seconds for a round that takes three to five a
             # turn - it could never finish one, which is exactly how the
             # booth filled up with half-tinted rounds.
+            # #1036: a named model is a deliberate choice to spend time
+            # on this, and a 31B takes about thirty seconds a turn where
+            # the 2B takes six. A deadline built for the small one throws
+            # away every round the big one writes - measured: 121s of
+            # work discarded against a 54s deadline.
+            _per = (45.0 if str(dj.get("crystal_tint_model") or "")
+                    else TINT_TURN_SECONDS)
             _tint_due = time.monotonic() + max(
-                60.0, TINT_TURN_SECONDS * len(turns) + 30.0)
+                90.0, _per * len(turns) + 45.0)
             # #1018: AND THE ROOM'S OWN CLOCK IS EXTENDED TO MATCH.
             #
             # prep_should_stop() reads _PREP_DEADLINE, which the preparer
@@ -55639,11 +55793,12 @@ async def crystal_tint(script: str, kind: str = "",
             _first_prompt: list[str] = []
             _room_was = _PREP_DEADLINE[0]
             _PREP_DEADLINE[0] = time.time() + max(
-                60.0, TINT_TURN_SECONDS * len(turns) + 30.0)
+                90.0, _per * len(turns) + 45.0)
             _gave_up = ""
             for marker, said in turns:
                 if time.monotonic() > _tint_due:
-                    _gave_up = (f"the tint ran past its {int(TINT_TURN_SECONDS * len(turns) + 30)}s "
+                    _gave_up = ("the tint ran past its "
+                                f"{int(max(90.0, _per * len(turns) + 45.0))}s "
                                 "deadline")
                     break
                 _stop = tint_should_stop()                       # #1018
@@ -55698,6 +55853,7 @@ async def crystal_tint(script: str, kind: str = "",
         # which is what "tidying is not tinting" was written about.
         got = await ask_model(
             prompt, limit=max(600, len(text) + 400), spice=0.55,
+            model=str(dj.get("crystal_tint_model") or ""),        # #1036
             # #1019: everything the desk listing needs to open this call
             # out into "what the tinting did to this particular prompt".
             mark={"purpose": "tint",
@@ -61417,8 +61573,26 @@ async def api_tint_try(
     if not text:
         raise HTTPException(status_code=400,
                             detail="give me a script, or bank a round first")
+    # #1036: try a model WITHOUT committing to it. Comparing two
+    # candidates on the same script is the only honest way to pick one,
+    # and doing that by editing the setting between attempts would mean
+    # the live show ran on whichever was being tried at the time.
+    _was_model = None
+    if body.get("model"):
+        _s = load_settings()
+        _was_model = str((_s.get("dj") or {}).get("crystal_tint_model")
+                         or "")
+        _s.setdefault("dj", {})["crystal_tint_model"] = str(
+            body.get("model"))[:80]
+        save_settings(_s)
     began = time.monotonic()
-    got = await crystal_tint(text, str(body.get("kind") or ""), keep)
+    try:
+        got = await crystal_tint(text, str(body.get("kind") or ""), keep)
+    finally:
+        if _was_model is not None:
+            _s2 = load_settings()
+            _s2.setdefault("dj", {})["crystal_tint_model"] = _was_model
+            save_settings(_s2)
     # How much of it actually moved - the only honest measure of whether
     # a dial did anything.
     plain = " ".join(text.split())
@@ -61440,6 +61614,9 @@ async def api_tint_try(
         "kept_verbatim": list(got.get("keep") or []),
         "armed": str(got.get("armed") or ""),
         "identical_for": same,
+        "model": str(body.get("model")
+                     or dj_settings().get("crystal_tint_model")
+                     or load_settings().get("model") or ""),       # #1036
         "say": (f"{len(plain)} chars in, {len(made)} out, identical for the "
                 f"first {same} - {round(100.0 * same / max(1, len(plain)))}%"
                 if got.get("ok") else str(got.get("why") or "it did not take")),
@@ -61470,6 +61647,9 @@ async def api_tint_prefs(
                 float(body.get("chunks") or 0))))
         except (TypeError, ValueError):
             pass
+    if body.get("model") is not None:
+        # #1036: which model the tinting pass uses. Empty = the station's.
+        seat["crystal_tint_model"] = str(body.get("model") or "")[:80]
     if body.get("chars") is not None:
         try:
             seat["crystal_tint_chars"] = max(120, min(4000, int(
@@ -61481,6 +61661,7 @@ async def api_tint_prefs(
     return {"two_pass": bool(dj.get("crystal_tint_pass")),
             "chunks": int(dj.get("crystal_tint_chunks") or 0),
             "chars": int(dj.get("crystal_tint_chars") or 0),
+            "model": str(dj.get("crystal_tint_model") or ""),      # #1036
             "say": ("the tint is a second pass over the finished round, with "
                     f"{int(dj.get('crystal_tint_chunks') or 0)} passage(s) of "
                     f"up to {int(dj.get('crystal_tint_chars') or 0)} chars "
