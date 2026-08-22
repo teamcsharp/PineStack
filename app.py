@@ -10397,7 +10397,19 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         try:
             alt_shelf_trim(kind, rows)
         except Exception:  # noqa: BLE001
-            del rows[:-max(1, shelf_cap(kind))]
+            # #1075: the cap trims the OLDEST, which is exactly where
+            # the unheard and the last-resort fallbacks live. Anything
+            # protected is lifted out of the trim rather than counted
+            # against it.
+            try:
+                _rk = resort_keys(kind)
+                _safe = [r for r in rows
+                         if not resort_may_drop(kind, r, _rk)]
+                _rest = [r for r in rows if r not in _safe]
+                del _rest[:-max(1, shelf_cap(kind) - len(_safe))]
+                rows[:] = _safe + _rest
+            except Exception:  # noqa: BLE001
+                del rows[:-max(1, shelf_cap(kind))]
     except Exception:  # noqa: BLE001
         pass
 
@@ -11789,11 +11801,15 @@ def pantry_burn() -> int:
             # burning a repeat at the staleness ceiling would empty the
             # shelf the moment it became useful, which is the same
             # mistake coord_retire was making.
+            # #1075: ...and nothing unheard, and never the road's last
+            # three-to-five fallbacks, whatever their age.
+            _rk = resort_keys(kind)
             keep = [r for r in rows
                     if (now - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
                         or (shelf_is_repeat(kind, r)
                             and now - float(r.get("at") or 0)
-                            <= REPEAT_KEEP_SECONDS))]
+                            <= REPEAT_KEEP_SECONDS)
+                        or not resort_may_drop(kind, r, _rk))]
             if len(keep) != len(rows):
                 burned[str(kind)] = len(rows) - len(keep)
                 _SHELF[kind] = keep
@@ -22398,7 +22414,15 @@ def slot_postpone() -> tuple[str, ...]:
     order = list(SLOT_POSTPONE)
     try:
         keep = str(orch_policy("prefer_road") or "")
-        if keep and keep in order:
+        # #1076: banter is not ON this ladder - it is deliberately
+        # exempt - so "protect banter hardest", which is the option the
+        # operator is actually offered when a half hour is at risk, used
+        # to remove nothing and mean nothing. A road already exempt is
+        # honoured by protecting the NEXT one down instead, which is the
+        # only thing "harder than never stood down" can mean.
+        if keep and keep not in order and order:
+            order.remove(order[-1])
+        elif keep and keep in order:
             order.remove(keep)
         first = str(orch_policy("postpone_first") or "")
         if first and first in order:
@@ -23485,6 +23509,7 @@ def cupboard_rotate() -> dict[str, Any]:
             if kind not in SHELF_REUSABLE:
                 continue
             rows = _SHELF.get(kind) or []
+            _rk = resort_keys(kind)                                # #1075
             fresh = [r for r in rows
                      if not shelf_cast_stale(r)
                      and now - float(r.get("at") or 0) <= horizon]
@@ -23495,6 +23520,13 @@ def cupboard_rotate() -> dict[str, Any]:
                 # Only let go while what is left still covers the floor.
                 if len(fresh) + len(drop) - len(drop) < floor \
                         and len(fresh) < floor:
+                    out["kept"] += 1
+                    continue
+                # #1075: and never something unheard, nor one of
+                # the road's last-resort fallbacks. "Any segment
+                # that is stored needs to be played and ran on the
+                # air before it's deleted."
+                if not resort_may_drop(kind, row, _rk):
                     out["kept"] += 1
                     continue
                 drop.append(row)
@@ -24244,6 +24276,121 @@ async def cover_now(road: str, why: str = "") -> bool:
         return False
     except Exception:  # noqa: BLE001
         return False
+
+
+# --- THE RESERVE OF LAST RESORT (#1075) -------------------------------
+# Three per road minimum, five where they exist, protected against every
+# deletion path there is. "Even if they're older" is the point: a stale
+# fallback that airs beats a fresh silence.
+RESORT_MIN = 3
+RESORT_MOST = 5
+
+
+def resort_want() -> int:
+    """How many fallbacks to hold. The operator's standing answer to the
+    stocking question raises it; it never goes below the floor."""
+    try:
+        got = orch_policy("stock_depth")
+        if got is not None:
+            return max(RESORT_MIN, min(RESORT_MOST, int(got)))
+    except Exception:  # noqa: BLE001
+        pass
+    return RESORT_MOST
+
+
+def row_unaired(row: dict[str, Any]) -> bool:
+    """#1075: has this never been on the air?
+
+    "any segment that is stored needs to be played and ran on the air
+    before it's deleted. That's the purpose of saving it." An unaired
+    row is not eligible for deletion by anything - if it is old, that is
+    an argument for AIRING it, and shelf_take already puts never-aired
+    items first."""
+    try:
+        return not (float(row.get("aired_at") or 0)
+                    or int(row.get("aired") or 0))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def resort_keys(kind: str) -> set[int]:
+    """The rows of this road that nothing may delete - by identity, so a
+    row that merely compares equal to a protected one is not spared.
+
+    The newest usable ones, cast-matching first, because a fallback that
+    can air without a re-render is worth more than one that cannot."""
+    keep: set[int] = set()
+    try:
+        rows = list(_SHELF.get(str(kind)) or [])
+        if not rows:
+            return keep
+        want = resort_want()
+
+        def _rank(r: dict[str, Any]) -> tuple:
+            return (1 if shelf_cast_stale(r) else 0,
+                    -float(r.get("at") or 0))
+        for row in sorted(rows, key=_rank)[:want]:
+            keep.add(id(row))
+    except Exception:  # noqa: BLE001
+        pass
+    return keep
+
+
+def resort_may_drop(kind: str, row: dict[str, Any],
+                    keep: set[int] | None = None) -> bool:
+    """May this row be let go of at all?
+
+    Two rules, and either one alone is enough to save it: it has never
+    aired, or it is one of the road's last-resort fallbacks."""
+    try:
+        if row_unaired(row):
+            return False
+        if id(row) in (keep if keep is not None else resort_keys(kind)):
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+def resort_state() -> dict[str, Any]:
+    """What is being held against deletion, and why."""
+    out: list[dict[str, Any]] = []
+    try:
+        for kind in sorted(_SHELF):
+            rows = list(_SHELF.get(kind) or [])
+            if not rows:
+                continue
+            keep = resort_keys(kind)
+            unaired = [r for r in rows if row_unaired(r)]
+            stale = [r for r in rows
+                     if id(r) in keep and shelf_cast_stale(r)]
+            out.append({
+                "kind": kind,
+                "label": SHELF_LABEL.get(kind, kind),
+                "rows": len(rows),
+                "protected": len(keep),
+                "want": resort_want(),
+                "unaired": len(unaired),
+                "recast": len(stale),
+                "short": max(0, resort_want() - len(keep)),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    thin = [r for r in out if r["short"]]
+    waiting = sum(r["unaired"] for r in out)
+    return {
+        "at": time.time(), "rows": out,
+        "min": RESORT_MIN, "want": resort_want(),
+        "say": ((f"{len(thin)} road(s) hold fewer than "
+                 f"{resort_want()} fallbacks: "
+                 + ", ".join(f"{r['label']} ({r['protected']})"
+                             for r in thin[:5]))
+                if thin else
+                (f"every road holds its {resort_want()} fallbacks"
+                 if out else "nothing is on the shelves yet"))
+        + (f" \u00b7 {waiting} segment(s) are stored and have never aired"
+           if waiting else ""),
+    }
 
 
 def hour_shortfall() -> dict[str, Any]:
@@ -25338,6 +25485,7 @@ def coord_retire() -> int:
         pinned = alt_pin_map().get("ids") or set()
         for kind in list(_SHELF):
             keep: list[dict[str, Any]] = []
+            _resort_keep = resort_keys(kind)                       # #1075
             dropped = 0
             for row in (_SHELF.get(kind) or []):
                 aged = now - float(row.get("at") or now)
@@ -25358,6 +25506,18 @@ def coord_retire() -> int:
                 # every time, and the ad road wrote live while holding
                 # a shelf it was not allowed to open.
                 if shelf_is_repeat(kind, row) and aged <= REPEAT_KEEP_SECONDS:
+                    keep.append(row)
+                    continue
+                # #1075: AND NOTHING UNHEARD IS BINNED. This sweep's own
+                # log says it retires rows "passed 3h UNHEARD" - by
+                # name, the segments that have never aired. Each cost a
+                # model visit and a render; the station spent them, held
+                # them three hours, and threw them away without ever
+                # letting a listener hear one. A segment that has not
+                # run is not proof that it never will; it is proof that
+                # nothing made it. Nor may the road's last-resort
+                # fallbacks go, however old they are.
+                if not resort_may_drop(kind, row, _resort_keep):
                     keep.append(row)
                     continue
                 # Its clips go with it — they were only protected from
@@ -31670,7 +31830,19 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
         del rows[:over]
     except Exception:  # noqa: BLE001
         try:
-            del rows[:-max(1, shelf_cap(kind))]
+            # #1075: the cap trims the OLDEST, which is exactly where
+            # the unheard and the last-resort fallbacks live. Anything
+            # protected is lifted out of the trim rather than counted
+            # against it.
+            try:
+                _rk = resort_keys(kind)
+                _safe = [r for r in rows
+                         if not resort_may_drop(kind, r, _rk)]
+                _rest = [r for r in rows if r not in _safe]
+                del _rest[:-max(1, shelf_cap(kind) - len(_safe))]
+                rows[:] = _safe + _rest
+            except Exception:  # noqa: BLE001
+                del rows[:-max(1, shelf_cap(kind))]
         except Exception:  # noqa: BLE001
             pass
 
@@ -64827,6 +64999,15 @@ def glyphy_state() -> dict[str, Any]:
                                  if w <= 0])
                 except Exception:  # noqa: BLE001
                     _held = 0
+                # #1076: AND IT ACTS. cover_now() was written in #1073
+                # to do exactly this and never called once - the whole
+                # arrears ledger behind it returned an empty list for
+                # its entire life. A mechanism nobody invokes is a
+                # comment with a function signature.
+                try:
+                    fire_and_forget(cover_now(_road, why))
+                except Exception:  # noqa: BLE001
+                    pass
                 say = (why[0].upper() + why[1:]
                        + f". There is no time - it measures about "
                          f"{int(_need)}s. "
@@ -65583,6 +65764,17 @@ async def api_trail_like(
     liked = bool((payload if isinstance(payload, dict) else {})
                  .get("liked", True))
     return trail_like(str(row_id), liked)
+
+
+@app.get("/api/fallbacks")
+async def api_fallbacks() -> dict[str, Any]:
+    """#1075: the reserve of last resort.
+
+    Three per road minimum, five where they exist, held against every
+    deletion path - and nothing that has never aired is deletable at
+    all, because airing it once is the entire purpose of having saved
+    it."""
+    return resort_state()
 
 
 @app.get("/api/commitments")
