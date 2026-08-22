@@ -6208,6 +6208,29 @@ function wkDeskEntry(id, c) {
   inner.style.display = open ? "block" : "none";
   t.wkInner = inner;
   try {
+    /* #1022: WHAT THIS CALL WAS FOR.
+     *
+     * "Why is the SFX guy talking on the manager's prompt?" He was not.
+     * Every call used to be stamped with the entry that owned the air at
+     * the moment it was made, so a background brew - the SFX guy warping
+     * a saying, a tinting turn - was labelled with whatever round the
+     * clock happened to be running and shown as GOVERNED BY that round's
+     * standing instruction, which had no part in writing it.
+     *
+     * A call that knows its own purpose says so now, and the schedule's
+     * instruction is dropped rather than borrowed. This block says
+     * which, so a background brew reads as one instead of as a
+     * mislabelled round. */
+    if (c["for"]) {
+      wkPutInto(inner, "WHAT THIS CALL WAS FOR",
+        String(c["for"])
+        + (c.ambient_kind
+           ? "\n\nThis is not the round the clock was running. “"
+             + c.ambient_kind + "” owned the air at the time, and its "
+             + "standing instruction did NOT govern this prompt - so it "
+             + "is not shown below."
+           : ""));
+    }
     wkPutInto(inner, "GOVERNED BY",
       (c.armed ? "system prompt: " + c.armed : "")
       + (c.sched ? (c.armed ? "\n\n" : "") + c.sched : ""));

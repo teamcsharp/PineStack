@@ -36847,7 +36847,10 @@ async def _sfxguy_news_fill() -> None:
                 "You are a thick-accented, NASCAR-loving country boy in "
                 f"a radio booth. Headline: {story.get('title')}. Give ONE "
                 "spicy, funny one-line take on it, under 22 words, no "
-                f"quotes, no explanation.{_ntint}", limit=140, spice=0.85)
+                f"quotes, no explanation.{_ntint}", limit=140, spice=0.85,
+                # #1022: his own brew, not whatever entry is on air.
+                mark={"kind": "sfx news",
+                      "for": "the SFX guy's take on a headline"})
             take = str(take or "").strip().strip('"').strip()[:180]
             if take and looks_english(take):
                 _SFXGUY_NEWS.append({
@@ -36917,7 +36920,12 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                 "— heckle it, one-up it, or agree way too hard — in your "
                 f"backcountry voice.{_tinted}{_shard} Under 22 words, "
                 "no quotes.",
-                limit=150, spice=0.85)
+                limit=150, spice=0.85,
+                # #1022: his own brew. It runs whenever there is room, so
+                # whatever entry is on air had nothing to do with it.
+                mark={"kind": "sfx react",
+                      "for": "the SFX guy reacting to a line that just "
+                             "aired"})
             line = str(out or "").strip().strip('"').strip()
             if 8 <= len(line) <= 200 and looks_english(line) \
                     and "\n" not in line:
@@ -36942,7 +36950,11 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             f"Take these sayings: {' / '.join(picks)} — and {recipe}."
             f"{_tinted}{_shard} Answer with the ONE new saying only, "
             "under 25 words, no quotes, no explanation.",
-            limit=160, spice=0.9)
+            limit=160, spice=0.9,
+            # #1022: the invention shed. Nothing to do with the round on
+            # air, and it must stop claiming that round's instruction.
+            mark={"kind": "sfx warp",
+                  "for": "the SFX guy warping a saying off his shelf"})
         line = str(out or "").strip().strip('"').strip()
         if 12 <= len(line) <= 200 and looks_english(line)                 and "\n" not in line:
             _SFXGUY_WARPED.append(line)
@@ -51001,20 +51013,37 @@ async def ask_model(prompt: str, limit: int = 300,
             _tinted = "flavour"        # the description only
     except Exception:  # noqa: BLE001
         _tinted = ""
-    _MODEL_CALLS.append({"at": time.time(), "model": settings["model"],
-                         "tinted": _tinted,
-                         **(dict(mark or {})),
-                         "ms": took, "chars": len(kept),
-                         "temp": round(temperature, 2),
-                         "budget": limit, "text": kept[:400],
-                         # #861 — the whole exchange
-                         "prompt": str(prompt)[:6000],
-                         "script": kept[:6000],
-                         "kind": str(_RADIO.get("sched_kind") or ""),
-                         "armed": _armed,
-                         "sched": str(_RADIO.get("sched_prompt") or "")[:900],
-                         "num_ctx": _ctx})
-    del _MODEL_CALLS[:-40]
+    _row = {"at": time.time(), "model": settings["model"],
+            "tinted": _tinted,
+            "ms": took, "chars": len(kept),
+            "temp": round(temperature, 2),
+            "budget": limit, "text": kept[:400],
+            # #861 — the whole exchange
+            "prompt": str(prompt)[:6000],
+            "script": kept[:6000],
+            "kind": str(_RADIO.get("sched_kind") or ""),
+            "armed": _armed,
+            "sched": str(_RADIO.get("sched_prompt") or "")[:900],
+            "num_ctx": _ctx}
+    # #1022: A CALL THAT KNOWS WHAT IT IS FOR SAYS SO, and the schedule's
+    # instruction is DROPPED rather than borrowed - it did not govern
+    # this prompt, and GOVERNED BY is a claim, not a decoration. The
+    # ambient stamp is right for the round the clock asked for and wrong
+    # for every background brew that happens to run while it is on air.
+    try:
+        _mark = dict(mark or {})
+        if _mark.get("kind"):
+            _row["sched"] = ""
+            _row["ambient_kind"] = str(_RADIO.get("sched_kind") or "")
+        _row.update(_mark)
+    except Exception:  # noqa: BLE001
+        pass
+    _MODEL_CALLS.append(_row)
+    # #1022: a per-turn tint (#1021) writes one row per turn, so a single
+    # sixteen-turn round used to push every other call off a forty-row
+    # ring - the desk would show nothing but the tint. Eighty rows costs
+    # about a megabyte and keeps the rest of the evening visible.
+    del _MODEL_CALLS[:-80]
     # #872: what a MODEL VISIT costs, into the task-cost ledger. Every
     # written task on the board pays for at least one of these, so this
     # is the floor under every estimate the scheduler makes.
@@ -55156,6 +55185,109 @@ def crystal_world_prompt() -> str:
     return "; ".join(parts)
 
 
+# #1021: a round longer than this is tinted whole rather than turn by
+# turn. Twenty short calls is fine; sixty is the preparer's whole window.
+TINT_TURNS_MOST = 22
+# ...and how long a turn has to be before it is worth a model visit. An
+# interjection of three words has no rhyme in it to find.
+TINT_TURN_FLOOR = 24
+
+
+async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
+                       answering: str = "", keep: list[str] | None = None
+                       ) -> str:
+    """#1021: one turn, put in the world's mouth.
+
+    Short prompt, short answer, one thing to do. `answering` is the
+    previous turn AS ALREADY TINTED, so the pair land on each other's
+    rhymes instead of each being rewritten in isolation - which is the
+    difference between two people rapping at each other and two people
+    each doing a bar alone."""
+    said = str(text or "").strip()
+    if len(said) < TINT_TURN_FLOOR:
+        return said                     # nothing in it to find
+    for held in (keep or []):
+        # #838: quoted material is read out word for word. Not ours to
+        # rewrite, and a turn that IS one is handed straight back.
+        if held and held[:60] in said:
+            return said
+    prompt = (
+        "Rewrite ONE line of radio dialogue so it sounds like it came out "
+        "of this world's mouth.\n\n"
+        f"THE WORLD: {world}\n\n"
+        + ("HOW IT TALKS - its own lines, word for word. This is the "
+           "specification:\n"
+           + "\n\n".join(str(c.get("text") or "") for c in chunks[:4])
+           + "\n\n" if chunks else "")
+        + "MATCH THE FORM, NOT JUST THE WORDS. If those lines rhyme, YOUR "
+          "LINE RHYMES - internal rhyme inside the line, multi-syllable "
+          "rhyme, two or three to a breath, however they do it. If they "
+          "talk in figures - naming one thing to mean another and letting "
+          "the image carry the point - so does yours.\n\n"
+          "AND STAY IN THEIR REGISTER. Rhyme is not a register. Use the "
+          "KIND of words those lines use: if they are street and concrete "
+          "and full of real objects, yours is street and concrete and "
+          "full of real objects. Do NOT drift into ornate, archaic or "
+          "poetical English - no 'doth', no 'spectral', no 'nectar', no "
+          "'forth' - unless those lines themselves talk that way. Their "
+          "nouns, their slang, their jokes.\n\n"
+        + (f"THE LINE BEFORE THIS ONE, already rewritten - come back ON "
+           f"it, answer its rhyme:\n{answering}\n\n" if answering else "")
+        + "KEEP EVERY FACT. Whoever is named is still named, whatever "
+          "was decided is still decided, every number and object is still "
+          "there. A line that sounds right and has lost what it was "
+          "SAYING has taken the wrong half - the point is the same "
+          "argument in a different mouth, not a different argument.\n\n"
+          "AND REWRITE IT. YOU HAVE FAILED IF the line comes back the "
+          "same, or nearly the same, or with only the punctuation moved. "
+          "Every word of it is yours to change except the facts. If you "
+          "cannot see how to rhyme it, change the images and the "
+          "vocabulary and the way the sentence turns - but it does not "
+          "come back untouched.\n\n"
+          "Do not answer it, do not continue it, do not add a second "
+          "line - REWRITE THIS ONE LINE:\n"
+        + said
+        + "\n\nReturn ONLY the rewritten line. No speaker label, no "
+          "quotes, no explanation.")
+    try:
+        got = await ask_model(prompt, limit=max(120, len(said) * 2),
+                              spice=0.5,
+                              mark={"kind": "tint turn",
+                                    "for": "one turn put in the crystal's "
+                                           "mouth"})
+    except Exception:  # noqa: BLE001
+        return said
+    out = " ".join(str(got or "").split()).strip().strip('"')
+    if " ".join(out.split()).lower() == " ".join(said.split()).lower():
+        # #1021: it handed the line straight back. One more ask, told
+        # plainly what it just did - cheaper than a round that is tinted
+        # in half its turns, which reads worse than one tinted in none.
+        try:
+            got = await ask_model(
+                prompt + "\n\nYOU JUST RETURNED THIS LINE UNCHANGED. That "
+                "is the one thing you were told not to do. Rewrite it "
+                "properly this time - different words, their images, "
+                "their rhyme - keeping only the facts.",
+                limit=max(120, len(said) * 2), spice=0.75,
+                mark={"kind": "tint turn", "for": "the same turn, asked "
+                                                  "again after it came "
+                                                  "back unchanged"})
+            out = " ".join(str(got or "").split()).strip().strip('"')
+        except Exception:  # noqa: BLE001
+            pass
+    # A model that answered instead of rewriting, or that returned the
+    # label with it, is corrected rather than trusted.
+    for lead in ("A:", "B:", "C:", "D:", "E:"):
+        if out.startswith(lead):
+            out = out[len(lead):].strip()
+    if not out or len(out) < TINT_TURN_FLOOR // 2:
+        return said
+    # Runaway: a small model asked for one line sometimes writes a verse.
+    if len(out) > max(400, len(said) * 3):
+        out = out[:max(400, len(said) * 3)].rsplit(" ", 1)[0]
+    return out
+
+
 async def crystal_tint(script: str, kind: str = "",
                        verbatim: Any = None) -> dict[str, Any]:
     """#1006: THE SECOND PASS. Take a finished, untinted conversation and
@@ -55213,43 +55345,64 @@ async def crystal_tint(script: str, kind: str = "",
         out["world"] = world
         out["chunks"] = chunks
         armed = (
-            "YOU ARE A REWRITE PASS AND YOUR JOB IS TO CHANGE HOW IT "
-            "SOUNDS.\n\n"
-            "A conversation has already been written for this radio "
-            "station. The beats are right, the people are right, the order "
-            "is right. What is wrong is that it does not sound like the "
-            "world it is supposed to be coming out of. Put it in that "
-            "world's mouth.\n\n"
+            "YOU ARE A REWRITE PASS. A conversation has already been "
+            "written for this radio station and the SUBSTANCE of it is "
+            "finished - the beats, the people, the facts, the order. Your "
+            "job is to put that substance into another mouth entirely, "
+            "and that means matching HOW that mouth builds language, not "
+            "merely which words it picks.\n\n"
             f"THE WORLD: {world}\n\n"
             + ("HOW THAT WORLD ACTUALLY TALKS - its own lines, word for "
-               "word. This is the only description of it that counts. Read "
-               "them properly before you write anything: the rhythm, the "
-               "slang, the way images are built, the way a sentence turns "
-               "and lands, the things it reaches for as comparisons, its "
-               "particular kind of wit. You are imitating THIS:\n"
+               "word. These are not a description of the style, they ARE "
+               "the style, and they are the specification you are working "
+               "to. Study them before you write anything:\n"
                + "\n\n".join(f"[{c['file']}] {c['text']}" for c in chunks)
-               + "\n\n" if chunks else "")
-            + "WHAT YOU MUST DO TO EVERY SINGLE TURN: reword it in that "
-              "world's diction. Different vocabulary, different images, "
-              "different comparisons, its cadence. The speaker keeps their "
-              "point; they stop making it in their own words and start "
-              "making it in that world's.\n\n"
-              "For instance, in a world of supervillain logic and food "
-              "metaphor, a flat line such as \"that sounds expensive\" "
-              "comes back rebuilt out of that world's own furniture "
-              "rather than merely repunctuated. THAT is the SIZE of the "
-              "change wanted. Do not copy this example or any phrase from "
-              "it - it is here to show you how far to go, not what to "
-              "say.\n\n"
+               + "\n\n"
+               "TAKE THE LEXICAL, VOCAL AND STYLISTIC CHOICES OFF THOSE "
+               "LINES AND MAKE THEM YOURS. Read the FORM first - the "
+               "vocabulary is the easy part and the part every attempt "
+               "stops at.\n\n"
+               "1. VOCAL - DO THEY RHYME? If they rhyme, YOUR OUTPUT MUST "
+               "RHYME, "
+               "the same way theirs does - internal rhyme buried "
+               "mid-line, multi-syllable rhyme, rhymes stacked two and "
+               "three to a breath, whatever it is they actually do. If "
+               "they scan to a beat, yours scans to that beat. If they "
+               "run clauses together and land hard on the last word, so "
+               "do you. Copy the MACHINERY: rhyme, metre, line length, "
+               "where the stress falls, how a thought is set up and paid "
+               "off.\n\n"
+               "2. STYLISTIC - DO THEY SAY THINGS SIDEWAYS? If they work in allegory "
+               "- naming one thing to mean another, running a figure "
+               "several lines past where an ordinary speaker would drop "
+               "it, letting the metaphor carry the argument instead of "
+               "decorating it - then yours does that too. Do not state "
+               "the point plainly and hang an image off it; make the "
+               "image BE the point, the way they do.\n\n"
+               "3. LEXICAL - their vocabulary, their slang, the "
+               "things they reach for as comparisons, their particular "
+               "wit.\n\n"
+               if chunks else "")
+            + "SO: every turn keeps its point and its facts, and is "
+              "rebuilt in that world's form. The speaker is still making "
+              "the same argument; they are making it the way those lines "
+              "are written. If those lines are rapped, the pair are "
+              "rapping - in a radio booth, to each other, still sounding "
+              "like two people talking rather than performing a verse at "
+              "the listener, but rhyming and speaking in figures as they "
+              "do it.\n\n"
               "YOU HAVE FAILED IF a turn comes back word for word the "
-              "same, or if all you did was fix the punctuation and the "
-              "capitals. Tidying is not tinting. Every turn must READ "
-              "differently.\n\n"
+              "same; if all you did was fix the punctuation and the "
+              "capitals; if the passages above rhyme and your version "
+              "does not; or if the passages talk in figures and your "
+              "version says everything flat and straight. Swapping in a "
+              "few of that world's nouns is NOT the job - that is a "
+              "costume, and the operator can hear the difference.\n\n"
               "WHAT NOT TO CHANGE: the speaker markers and their order; "
               "the NUMBER of turns; who says what; and the SUBSTANCE - "
-              "every fact, name, record, price and decision stays true. Do "
-              "not add turns and do not remove any. Never name the world "
-              "out loud.\n"
+              "every fact, name, record, price and decision stays true. "
+              "Do not add turns and do not remove any. Never name the "
+              "world out loud.\n"
             + (("LEAVE THESE PASSAGES EXACTLY AS THEY ARE - they are "
                 "quoted material and they are read out word for word:\n"
                 + "\n".join('"' + v + '"' for v in keep) + "\n\n")
@@ -55257,6 +55410,52 @@ async def crystal_tint(script: str, kind: str = "",
             + "Return ONLY the rewritten conversation, in exactly the same "
               "marker format it came in.")
         out["armed"] = armed
+        # #1021: TURN BY TURN, which is the only way a small model holds
+        # rhyme. See crystal_turn for why the whole-round pass could not.
+        turns = []
+        try:
+            turns = list(banter_turns(text) or [])
+        except Exception:  # noqa: BLE001
+            turns = []
+        if turns and len(turns) <= TINT_TURNS_MOST:
+            began = time.monotonic()
+            done: list[str] = []
+            answering = ""
+            for marker, said in turns:
+                if prep_should_stop():
+                    # The room wants the engine back; keep what is made
+                    # and hand the rest over untinted rather than half a
+                    # round.
+                    done.extend(f"{m}: {t}" for m, t in
+                                turns[len(done):])
+                    out["why"] = ("the room was wanted back part way "
+                                  "through - the rest of it is untinted")
+                    break
+                fresh = await crystal_turn(str(said or ""), world, chunks,
+                                           answering, keep)
+                done.append(f"{marker}: {fresh}")
+                answering = fresh
+            out["ms"] = int((time.monotonic() - began) * 1000)
+            out["turns"] = len(turns)
+            out["per_turn"] = True
+            tinted = "\n".join(done).strip()
+            out["prompt"] = ("turn by turn - " + str(len(turns))
+                             + " calls, each one line. The system prompt "
+                               "each of them carried:\n\n" + armed)
+            if tinted and " ".join(tinted.split()) != " ".join(text.split()):
+                out["ok"] = True
+                out["script"] = tinted
+                pipeline_log(
+                    "speakbox",
+                    f"a round was tinted through {world or 'the crystal'} "
+                    f"one turn at a time - {len(turns)} turns, "
+                    f"{len(chunks)} passage(s) of its own material in "
+                    f"front of each, {out['ms']}ms. Both versions are "
+                    "kept (#1006/#1021)")
+                return out
+            out["why"] = out.get("why") or ("the turn-by-turn pass changed "
+                                            "nothing")
+            return out
         prompt = armed + "\n\nTHE CONVERSATION:\n" + text
         out["prompt"] = prompt
         began = time.monotonic()
@@ -55268,6 +55467,8 @@ async def crystal_tint(script: str, kind: str = "",
             # #1019: everything the desk listing needs to open this call
             # out into "what the tinting did to this particular prompt".
             mark={"purpose": "tint",
+                  "kind": "tint round",
+                  "for": "a finished round put in the crystal's mouth",
                   "tint_world": world,
                   "tint_before": text[:6000],
                   "tint_passages": [{"file": str(c.get("file") or ""),
