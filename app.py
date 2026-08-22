@@ -324,6 +324,16 @@ VIBEVOICE_URL = os.getenv("VIBEVOICE_URL", "http://127.0.0.1:8778").rstrip("/")
 ENGINE_REGISTRY: dict[str, dict[str, Any]] = {
     "xtts":      {"url": XTTS_URL, "family": "clone", "label": "XTTS v2",
                   "speed": 34, "standin": False, "default_voice": ""},
+    # #1080: PIPER, which has been the live last-resort stand-in all
+    # along and was reachable only through a hardcoded fallback -
+    # role_engine_for and the stand-in picker both test membership
+    # here, so it could never be pinned or chosen. Measured 27.8x
+    # faster than XTTS on the production mix and, decisively, CPU-only:
+    # it holds no GPU, and the GPU it leaves alone is the one the
+    # writing model is starved of.
+    "piper":     {"url": "", "family": "preset", "label": "Piper",
+                  "speed": 1, "standin": True,
+                  "default_voice": "en_US-bryce-medium"},
     "f5":        {"url": F5_URL, "family": "clone", "label": "F5-TTS",
                   "speed": 13, "standin": False, "default_voice": ""},
     "cosyvoice": {"url": COSYVOICE_URL, "family": "clone",
@@ -873,6 +883,11 @@ DEFAULT_DJ = {
     # resting the coldest airs anyway, because a station that would
     # rather go quiet than repeat itself is not a station.
     "chunk_cool_seconds": 3600,
+    # #1080: the operator's own stop-gap switch - off, brisk, fast or
+    # emergency. A ratchet: it only ever ADDS to what the station's own
+    # brake has already decided, so turning it off never overrules a
+    # judgement that the show is drowning.
+    "speed_mode": "off",
     # #1045: the ONE context size every model call loads at. Changing it
     # rebuilds both runners once; leaving it alone is what stops them
     # rebuilding sixty times an hour.
@@ -1479,6 +1494,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "chunk_cool_seconds": max(0, min(86400, int(               # #1042
             raw_dj.get("chunk_cool_seconds",
                        DEFAULT_DJ["chunk_cool_seconds"]) or 0))),
+        "speed_mode": (str(raw_dj.get("speed_mode") or "off").lower()
+                       if str(raw_dj.get("speed_mode") or "off").lower()
+                       in ("off", "brisk", "fast", "emergency")
+                       else "off"),                               # #1080
         "model_ctx": max(2048, min(131072, int(                    # #1045
             raw_dj.get("model_ctx", DEFAULT_DJ["model_ctx"]) or 0)
             or DEFAULT_DJ["model_ctx"])),
@@ -11666,6 +11685,31 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                         f" at about {int(_slot_row['cost'])}s against "
                         f"{int(room)}s of window (#1050)")})
             return out
+        # #1082: BREATHING ROOM. Nothing is owed - no deadline fired,
+        # no half hour asked, no arrears, no road under its floor - and
+        # the gate is free. This is the rare wide window, and the
+        # reasoning below would spend it on the cheapest thing on the
+        # board.
+        #
+        # That is backwards. A station ID measures 16s and fits almost
+        # any window there is; a painting round measures 362s and was
+        # measured to fit NINE PERCENT of them. The dear road can ONLY
+        # be built now. Spending this window on the cheap one does not
+        # save time - it spends the one resource the cheap road never
+        # needed.
+        _spare = [r for r in rows if r["fits"] and r.get("write")]
+        if (_spare and not _gate_shut and not skip
+                and float(room) >= float(prep_deep_seconds() or 0) * 0.35):
+            _rich = max(_spare, key=lambda r: float(r["cost"]))
+            if float(_rich["cost"]) >= float(task_cost("banter") or 0):
+                out.update({
+                    "kind": _rich["kind"], "spare": True,
+                    "why": (f"nothing is owed and {int(room)}s of window "
+                            f"is open - building {_rich['label']} at "
+                            f"about {int(_rich['cost'])}s, the dearest "
+                            "thing that fits, because it is the one that "
+                            "cannot be made in a hurry (#1082)")})
+                return out
         fits = [r for r in rows if r["fits"]]
         if not fits:
             # #872 rule three: refuse the task rather than run it past
@@ -12581,6 +12625,17 @@ def voice_engine_for(voice: str, who: str = "") -> str:
     if prefix:
         return prefix
     voice = (voice or "").strip()
+    # #1080: THE STOP-GAP. When the station is losing, the seats nobody
+    # has an ear for render on piper - 27.8x faster on the measured mix
+    # and, decisively, CPU-only, so it also hands back the GPU the
+    # writing model is contending for. An explicit engine:voice prefix
+    # still wins above; this only overrides the default routing, and
+    # only for the seats named in SPEED_SAFE_SEATS.
+    try:
+        if who and speed_seat_to_piper(who):
+            return "piper"
+    except Exception:  # noqa: BLE001
+        pass
     pinned = role_engine_for(who) if who else ""
     if pinned:
         spec = ENGINE_REGISTRY[pinned]
@@ -23092,7 +23147,14 @@ def orch_scan() -> dict[str, Any]:
     out: dict[str, Any] = {}
     try:
         now = time.time()
+        # #1081: an open question that has waited past its window
+        # answers itself first. One ask is open at a time, so a stalled
+        # question does not just go unaddressed - it blocks every
+        # question behind it. Measured: an hour_ballast ask sat open
+        # eighty-three minutes while the shortfall it described went
+        # unfixed, and would not have been raised again for six hours.
         if orch_open():
+            orch_decide_alone()
             return out                  # one at a time; answer that first
         if now - float(_ORCH.get("last") or 0) < ORCH_ASK_FLOOR:
             return out
@@ -23257,6 +23319,74 @@ def orch_scan() -> dict[str, Any]:
                 "how I run the studio between now and the next one.",
                 "routine", orch_routine_questions())
             return out
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+# #1081: how long a question waits before it answers itself, by how
+# urgent it said it was. A floor manager who stops the show to ask
+# something and then stands there holding the clipboard is not managing
+# anything.
+ORCH_DECIDE_AFTER = {"now": 600.0, "soon": 1800.0, "routine": 7200.0}
+
+
+def orch_decide_alone() -> dict[str, Any]:
+    """#1081: answer the operator's open question on their behalf.
+
+    Takes the FIRST option of each question, which is not arbitrary:
+    every questionnaire in this file is written with the recommended
+    answer first - the safest, most reversible action, the one that
+    keeps the show on air. So "no answer" resolves to "do the sensible
+    thing", which is the instruction.
+
+    Kept and marked, never quiet. A decision taken silently on
+    somebody's behalf is how a system stops being trusted."""
+    out: dict[str, Any] = {"decided": False}
+    try:
+        orch_load()
+        now = time.time()
+        for row in orch_open():
+            waited = now - float(row.get("at") or now)
+            due = float(ORCH_DECIDE_AFTER.get(
+                str(row.get("urgency") or "routine"), 1800.0))
+            if waited < due:
+                continue
+            picks: dict[str, Any] = {}
+            for i, q in enumerate(row.get("questions") or []):
+                first = (q.get("options") or [{}])[0]
+                if first.get("does"):
+                    picks[str(i)] = str(first["does"])
+            if not picks:
+                continue
+            got = orch_answer(str(row.get("id")), picks)
+            # Mark it as the station's own call, not the operator's.
+            with _ORCH_LOCK:
+                seat = next((r for r in _ORCH["asks"]
+                             if str(r.get("id")) == str(row.get("id"))), None)
+                if seat and isinstance(seat.get("answered"), dict):
+                    seat["answered"]["alone"] = True
+                    seat["answered"]["waited"] = round(waited, 1)
+                orch_save()
+            pipeline_log(
+                "lookahead",
+                f"(#1081) nobody answered in {int(waited / 60)} min, so I "
+                f"decided: {'; '.join(got.get('did') or [])}"[:200],
+                extra=("DECIDED WITHOUT AN ANSWER (#1081)\n\n"
+                       "The question stayed open past its window, and the "
+                       "thing it was about does not wait. I took the "
+                       "recommended option of each - the safest and most "
+                       "reversible - and it is all still changeable.\n\n"
+                       "WHAT WAS ASKED:\n" + str(row.get("why") or "")
+                       + "\n\nWHAT I CHOSE:\n"
+                       + "\n".join(
+                           f"  {p.get('face')}  ->  {p.get('did')}"
+                           for p in ((seat or {}).get("answered") or {}
+                                     ).get("picks") or [])))
+            out.update({"decided": True, "id": str(row.get("id")),
+                        "waited": round(waited, 1),
+                        "did": got.get("did") or []})
+            break                       # one at a time, like the asking
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -24447,6 +24577,193 @@ def resort_state() -> dict[str, Any]:
                  if out else "nothing is on the shelves yet"))
         + (f" \u00b7 {waiting} segment(s) are stored and have never aired"
            if waiting else ""),
+    }
+
+
+# --- THE STOP-GAP (#1080) ---------------------------------------------
+# Piper on the non-cast seats when the show is losing. See the note at
+# the top of the #1080 change; the short version is that piper is 27.8x
+# faster on the real mix and uses no GPU at all, the safe seats are
+# exactly the roads that already reuse their footage, and switching the
+# ENGINE stales nothing because cast_signature is built from voices.
+SPEED_LEVELS = ("off", "brisk", "fast", "emergency")
+# The seats that may be handed to piper. Deliberately the same set as
+# SHELF_REUSABLE: nobody has an expectation of the voice reading a memo,
+# and everybody has one of the two that carry the show.
+SPEED_SAFE_SEATS = ("manager", "caller", "caller2", "news", "gallery",
+                    "ad", "station_id", "guest")
+# Two ticks in debt to engage, three clear to release. In TICKS rather
+# than seconds so it cannot flap the way the RTF latch did.
+SPEED_ON_AFTER = 2
+SPEED_OFF_AFTER = 3
+_SPEED: dict[str, Any] = {"auto": 0, "debt": 0, "clear": 0,
+                          "since": 0.0, "why": ""}
+
+
+def speed_manual() -> int:
+    """The operator's own switch, 0-3."""
+    try:
+        got = str(dj_settings().get("speed_mode") or "off").lower()
+        return SPEED_LEVELS.index(got) if got in SPEED_LEVELS else int(got)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def speed_now() -> int:
+    """The level in force: the operator's switch OR the station's own
+    judgement, whichever is higher.
+
+    A ratchet on purpose. Turning the switch off never overrules the
+    station's own reading that it is drowning - it only declines to add
+    to it."""
+    try:
+        return max(0, min(3, max(speed_manual(),
+                                 int(_SPEED.get("auto") or 0))))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def speed_debt() -> float:
+    """#1080: how far behind the coming segments actually are.
+
+    Debt, not render speed. An RTF trigger is lagging and
+    self-silencing - once it latches no clone renders happen, so no
+    samples arrive and the mean never falls, which is why #784 had to
+    bolt a timeout onto it. This keeps arriving while the lever is on."""
+    owed = 0.0
+    try:
+        for row in commit_board():
+            if str(row.get("commit")) not in ("prerecord", "cut", "tight"):
+                continue
+            if int(row.get("stock") or 0) > 0:
+                continue
+            owed += max(0.0, float(row.get("cost") or 0)
+                        - float(row.get("room") or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return round(owed, 1)
+
+
+def speed_watch() -> dict[str, Any]:
+    """One tick of the automatic brake. Called from the coordinator."""
+    try:
+        owed = speed_debt()
+        was = int(_SPEED.get("auto") or 0)
+        if owed > 0:
+            _SPEED["debt"] = int(_SPEED.get("debt") or 0) + 1
+            _SPEED["clear"] = 0
+        else:
+            _SPEED["clear"] = int(_SPEED.get("clear") or 0) + 1
+            _SPEED["debt"] = 0
+        if not was and _SPEED["debt"] >= SPEED_ON_AFTER:
+            _SPEED.update({"auto": 1, "since": time.time(),
+                           "why": f"{int(owed)}s of work owed with no "
+                                  "stock behind it"})
+            pipeline_log("lookahead",
+                         f"(#1080) the stop-gap is ON - {int(owed)}s owed "
+                         "with nothing in stock. The non-cast seats go to "
+                         "piper until it clears",
+                         extra=("WHY (#1080)\n\nPiper is 27.8x faster on "
+                                "the production mix and uses no GPU at "
+                                "all, so this frees the card the writing "
+                                "model is starved of as well as the "
+                                "recording room.\n\nThe presenters are "
+                                "NOT switched - only the roads that "
+                                "already reuse their footage. It is "
+                                "engine-only, so nothing in the cupboard "
+                                "goes stale and turning it off is "
+                                "instant."))
+        elif was and _SPEED["clear"] >= SPEED_OFF_AFTER:
+            _held = time.time() - float(_SPEED.get("since") or time.time())
+            _SPEED.update({"auto": 0, "why": ""})
+            pipeline_log("lookahead",
+                         f"(#1080) the stop-gap is OFF - the board is "
+                         f"covered again after {int(_held / 60)} min")
+    except Exception:  # noqa: BLE001
+        pass
+    return dict(_SPEED)
+
+
+def speed_seat_to_piper(who: str) -> bool:
+    """Should this seat be rendered on piper right now?"""
+    try:
+        level = speed_now()
+        if level < 1:
+            return False
+        seat = str(who or "").lower()
+        if seat in CAST_SEATS:
+            # Only the last level touches the show's own voices, and
+            # even then never the two who carry it.
+            return level >= 3 and seat not in ("dj", "host", "cohost")
+        return seat in SPEED_SAFE_SEATS or level >= 2
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def speed_state() -> dict[str, Any]:
+    """The lever, for reading and for the panel."""
+    level = speed_now()
+    return {
+        "at": time.time(),
+        "level": level,
+        "name": SPEED_LEVELS[max(0, min(3, level))],
+        "manual": SPEED_LEVELS[max(0, min(3, speed_manual()))],
+        "auto": int(_SPEED.get("auto") or 0),
+        "debt": speed_debt(),
+        "ticks_in_debt": int(_SPEED.get("debt") or 0),
+        "ticks_clear": int(_SPEED.get("clear") or 0),
+        "why": str(_SPEED.get("why") or ""),
+        "since": float(_SPEED.get("since") or 0),
+        "seats": list(SPEED_SAFE_SEATS),
+        "say": ("the stop-gap is ON - "
+                + (str(_SPEED.get("why")) or "the operator switched it on")
+                + " - the non-cast seats are rendering on piper, about "
+                  "28x faster and off the GPU"
+                if level else
+                (f"the stop-gap is off. {int(speed_debt())}s owed"
+                 if speed_debt() else "the stop-gap is off and the board "
+                                      "is covered")),
+    }
+
+
+# --- THE SURPLUS (#1083) ----------------------------------------------
+# What is left after the station is safe, spent on the show. Zero until
+# the reserve passes SURPLUS_FROM of its own target, so this can never
+# be the reason anything falls behind: the whole lever lives above the
+# line, and at ordinary depth the station writes exactly the show it
+# wrote before this existed.
+SURPLUS_FROM = 0.60
+
+
+def surplus() -> float:
+    """0.0 to 1.0 - how far ahead the station is, above the safe line."""
+    try:
+        depth = max(0.0, min(1.0, float(box_depth())))
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if depth <= SURPLUS_FROM:
+        return 0.0
+    return round(min(1.0, (depth - SURPLUS_FROM) / (1.0 - SURPLUS_FROM)), 3)
+
+
+def surplus_state() -> dict[str, Any]:
+    """What the surplus is currently buying."""
+    got = surplus()
+    return {
+        "at": time.time(), "surplus": got, "from": SURPLUS_FROM,
+        "swath_lift": round(1.0 + 0.8 * got, 2),
+        "stanzas": 2 + int(round(got * 2)),
+        "tint_share": round(TINT_SHARE + 0.25 * got, 3),
+        "spice_lift": round(0.10 * got, 3),
+        "say": (f"the station is {int(got * 100)}% into its surplus - "
+                f"{int((1.0 + 0.8 * got - 1) * 100)}% more material per "
+                f"swath, {2 + int(round(got * 2))} crystal passages, "
+                f"{int((TINT_SHARE + 0.25 * got) * 100)}% of the model on "
+                "rewriting"
+                if got else
+                "no surplus yet - the reserve is below the "
+                f"{int(SURPLUS_FROM * 100)}% line, so the show is written "
+                "exactly as it always is"),
     }
 
 
@@ -25945,6 +26262,10 @@ async def coordinator() -> None:
                     pass
                 try:
                     await retint_one()                            # #1068
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    speed_watch()                                 # #1080
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -39405,6 +39726,19 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
         most = max(1, int(round(most * (1.0 + 0.6 * _depth))))
         cap = int(round((cap or SPEAKBOX_SWATH_MAX)
                         * (1.0 + 0.5 * _depth)))
+    # #1083: AND THE SURPLUS ON TOP. #895's scaling is about digging
+    # DEEPER into a document as the queue builds; this is about taking
+    # MORE of it when the station can afford to. Handing the pair more
+    # of the operator's own words is the one change measured to alter
+    # what a small model writes.
+    try:
+        _extra = surplus()
+        if _extra > 0.02:
+            most = max(1, int(round(most * (1.0 + 0.8 * _extra))))
+            cap = int(round((cap or SPEAKBOX_SWATH_MAX)
+                            * (1.0 + 0.6 * _extra)))
+    except Exception:  # noqa: BLE001
+        pass
     key = mind_id(rid)
     files = [p for p in speakbox_files(key) if p.name != exclude]
     if not files:
@@ -54489,6 +54823,16 @@ async def ask_model(prompt: str, limit: int = 300,
     # it; otherwise the segment's brief decides how loose to be — a recap
     # steady, a rant loose.
     spice = spice or float(writing_profile().get("spice") or 0.0)
+    # #1083: a lift with the surplus, and deliberately the SMALLEST of
+    # the four things it buys. A hot model is not a better writer, it is
+    # a less predictable one - the real gains are in giving it more to
+    # work from, not more licence to invent. A tenth of a point at full
+    # surplus and no more.
+    try:
+        if spice:
+            spice = min(1.0, spice + 0.10 * surplus())
+    except Exception:  # noqa: BLE001
+        pass
     # #895: "as we build up a queue and we've gotten further in our
     # pantry, then we can start experimenting and pushing the
     # temperatures". A deep shelf is exactly when a strange take is
@@ -59059,6 +59403,13 @@ def tint_budget() -> float:
                  if got is not None else TINT_SHARE)
     except Exception:  # noqa: BLE001
         share = TINT_SHARE
+    # #1083: and it rises with the surplus - thirty percent of the hour
+    # normally, up toward fifty-five when the station is well ahead, so
+    # more of the show comes out as bars rather than prose.
+    try:
+        share = min(0.9, share + 0.25 * surplus())
+    except Exception:  # noqa: BLE001
+        pass
     return 2.0 * 3600.0 * share
 
 
@@ -59364,7 +59715,10 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
                          f"{_hold}")
             return said
         dj = dj_settings()
-        chunks = crystal_stanzas(2, CRYSTAL_STANZA_LINES)
+        # #1083: two passages normally, up to four when there is room -
+        # the rewrite is shown more of the writer it is imitating.
+        chunks = crystal_stanzas(2 + int(round(surplus() * 2)),
+                                 CRYSTAL_STANZA_LINES)
         if not chunks:
             chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
                                       int(dj.get("crystal_tint_chars") or 900))
@@ -59475,7 +59829,10 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         dj = dj_settings()
         # #1032: STANZAS, not scattered fragments. See crystal_stanzas.
-        chunks = crystal_stanzas(2, CRYSTAL_STANZA_LINES)
+        # #1083: two passages normally, up to four when there is room -
+        # the rewrite is shown more of the writer it is imitating.
+        chunks = crystal_stanzas(2 + int(round(surplus() * 2)),
+                                 CRYSTAL_STANZA_LINES)
         if not chunks:
             # No file in the crystal is long enough to cut a stanza out
             # of; fall back to the old scatter rather than tinting with
@@ -65837,6 +66194,14 @@ async def api_orch_asks(all: int = 0) -> dict[str, Any]:
         "next_due": max(0.0, round(float(_ORCH.get("last") or 0)
                                    + ORCH_ASK_EVERY - time.time(), 1)),
         "cupboard": cupboard_short(),
+        # #1081: how long each urgency waits before the station decides
+        # for itself, so the operator can see the clock they are on.
+        "decides_after": {k: int(v / 60)
+                          for k, v in ORCH_DECIDE_AFTER.items()},
+        "decided_alone": sum(
+            1 for r in _ORCH["asks"]
+            if isinstance(r.get("answered"), dict)
+            and r["answered"].get("alone")),
         "cast": cast_signature(),
         "horizon_hours": round(cupboard_horizon() / 3600.0, 1),
     }
@@ -65995,6 +66360,49 @@ async def api_trail_like(
     liked = bool((payload if isinstance(payload, dict) else {})
                  .get("liked", True))
     return trail_like(str(row_id), liked)
+
+
+@app.get("/api/surplus")
+async def api_surplus() -> dict[str, Any]:
+    """#1083: what being ahead is currently buying the show.
+
+    Zero until the reserve passes 60% of its own target, so this can
+    never be the reason anything falls behind - the whole lever lives
+    above the safe line."""
+    return surplus_state()
+
+
+@app.get("/api/stopgap")
+async def api_stopgap() -> dict[str, Any]:
+    """#1080: the stop-gap - piper on the non-cast seats when the show
+    is losing.
+
+    `level` is what is in force; `manual` is the operator's switch and
+    `auto` the station's own reading. It is a ratchet - the higher of
+    the two wins - so turning the switch off never overrules the
+    station's judgement that it is drowning."""
+    return speed_state()
+
+
+@app.post("/api/stopgap")
+async def api_stopgap_set(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1080: {"mode": "off"|"brisk"|"fast"|"emergency"}"""
+    require_auth(authorization)
+    payload = await request.json()
+    want = str((payload if isinstance(payload, dict) else {})
+               .get("mode") or "").lower()
+    if want not in SPEED_LEVELS:
+        raise HTTPException(status_code=400,
+                            detail="off, brisk, fast or emergency")
+    got = load_settings()
+    got.setdefault("dj", {})["speed_mode"] = want
+    save_settings(got)
+    pipeline_log("lookahead",
+                 f"(#1080) the operator set the stop-gap to {want}")
+    return speed_state()
 
 
 @app.get("/api/fallbacks")
