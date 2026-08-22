@@ -10364,8 +10364,16 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         # #968: judged as it is shelved, while the script is right here.
         try:
             _entry = row.get("entry")
-            _script = str((_entry or {}).get("script") or "") \
-                if isinstance(_entry, dict) else ""
+            # #1077: ...or on row["text"] when there is no entry. An
+            # advert and a station ID are shelved as bare rows carrying
+            # `text`, so this judged the empty string and returned "too
+            # short to judge" on every one of them. The RESTORE path has
+            # carried this fallback all along; the shelve path never
+            # got it.
+            _script = (str((_entry or {}).get("script") or "")
+                       if isinstance(_entry, dict) else "")
+            if not _script:
+                _script = str(row.get("text") or "")
             _brief = brief_note(str(kind), str(row.get("label")
                                                or (_entry or {}).get("label")
                                                or kind), _script)
@@ -23597,8 +23605,13 @@ PIPE_ROADS: dict[str, dict[str, Any]] = {
                  ["a consecutive run is taken", "speakbox|swath"],
                  ["the cooldown is stamped", "speakbox|"],
                  ["it goes into the writing prompt", "model|writing"]],
-        "uses": ["banter", "ad", "caller"],
-        "goes": "into the first prompt, as material the pair must use",
+        # #1078: measured, not assumed. Gallery, the manager, station
+        # IDs and the SFX guy all seed too - and NEWS never seeds at
+        # all: it has no speakbox call anywhere in its own code.
+        "uses": ["banter", "ad", "caller", "gallery", "manager",
+                 "station_id", "the SFX guy"],
+        "goes": "into the first prompt, as material the pair must use "
+                "- except on the news road, which never seeds",
     },
     "crystal": {
         "face": "the second pass",
@@ -23815,6 +23828,8 @@ async def retint_one() -> str:
                 continue                # already has one
             if not str(entry.get("script") or ""):
                 continue
+            if entry.get("preparing"):
+                continue                # #1077: do not race the preparer
             got = entry.get("tint")
             if isinstance(got, dict) and got.get("ok"):
                 continue
@@ -23840,6 +23855,19 @@ async def retint_one() -> str:
         want["script_tinted"] = str(_got.get("script") or "")
         want["script"] = str(_got.get("script") or "")
         want["use"] = "tinted"
+        # #1077: AND THE OLD AUDIO GOES WITH IT. This is the one road
+        # where the rewrite happens AFTER the render, and it was
+        # swapping the words while keeping every key - so each line
+        # missed the pantry and re-rendered live on air while the log
+        # claimed "its audio was made during the last record". The
+        # manual toggle has done this correctly all along.
+        for _k in ("takes", "keys", "made", "seconds", "prepared",
+                   "chunks", "prep_turns", "frozen"):
+            want.pop(_k, None)
+        try:
+            want["profile"] = _larder_profile_signature()
+        except Exception:  # noqa: BLE001
+            pass
         pipeline_log("crystal",
                      "(#1068) a banked round that went out plain has been "
                      f"rewritten on a later pass - {_got.get('ms')}ms",
@@ -39224,6 +39252,9 @@ def _crystal_influence_note(mind: str, file: str, text: str,
         pass
 
 
+_NO_DOCS: dict[str, float] = {}
+
+
 async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                          rid: str = "", only: str = "",
                          tinted: bool = True) -> dict[str, Any]:
@@ -39341,6 +39372,24 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     if not files:
         files = speakbox_files(key)     # one document beats none
     if not files:
+        # #1078: AND IT SAYS SO. The crystal redirect above can point
+        # this at a mind whose folder holds no *.md at all - the glob
+        # is markdown only, so a folder of .txt is empty as far as the
+        # station is concerned. At a grounding rate of 1.0 the gate
+        # passes, this returns nothing, and the round goes out unseeded
+        # with no event of any kind. That was the only completely
+        # invisible way a fully-grounded round could lose its material.
+        try:
+            _seen = str(key or "the studio")
+            if time.time() - float(_NO_DOCS.get(_seen) or 0) > 300:
+                _NO_DOCS[_seen] = time.time()
+                pipeline_log("speakbox",
+                             f"(#1078) the {_seen} mind has no documents "
+                             "the station can read - this round goes out "
+                             "with no material. The speakbox reads *.md "
+                             "only")
+        except Exception:  # noqa: BLE001
+            pass
         return {}
     # #674: while a lock is on, every seed comes from that one document —
     # including the `exclude` case, because the point of the lock is that
@@ -50552,7 +50601,26 @@ async def dj_banter(track: dict[str, Any] | None = None,
         drop_bombshell() if random.random() < 0.6 else {})
     comeback: dict[str, Any] = {}
     jab: dict[str, Any] = {}
-    if angle:
+    if angle and seed and str(seed.get("text") or ""):
+        # #1078: ...BUT THE SEED STILL GOES IN. An angle is what a round
+        # is ABOUT; a seed is what it is built OUT OF, and choosing the
+        # first never meant giving up the second.
+        #
+        # Every angle road - news, gallery, the manager, callers, the
+        # deep round - drew a swath here, charged it against the
+        # shelf's cooldown, and then never built the clause that shows
+        # it to the model. It was stapled onto the finished script as a
+        # raw opening turn instead: a passage the pair were told not to
+        # paraphrase and were never given. They could not write around
+        # it because they never saw it.
+        #
+        # #1039 fixed this same confusion at the DRAW. This is the same
+        # mistake at the delivery.
+        try:
+            angle = str(angle) + speakbox_aside(seed, pair=True)
+        except Exception:  # noqa: BLE001
+            pass
+    elif angle:
         pass                            # you chose this one yourself
     elif seed and random.random() < 0.85:   # both trade doc lines (#360, #522)
         # An entire moment, recreated whole cloth, and the other one blown
@@ -51209,7 +51277,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
     if (not caller_name and random.random() < float(
             _sb.get("speakbox_full_swath_rate") or 0)):
         full_swath = await speakbox_quote(
-            most=30,
+            # #1078: was 30, and THIRTY LINES is what capped this, not
+            # the operator's dial. Gems are capped at 200 characters
+            # and floored near 30, so thirty of them is 930 to 6,000
+            # characters - and on a document of short lines it lands
+            # near the floor. Measured: a 2,600 setting delivering 939.
+            # The cap below is the real limit now.
+            most=90,
             cap=int(_sb.get("speakbox_full_swath_chars") or 2600),
         )
         if full_swath.get("text"):
@@ -51852,6 +51926,21 @@ async def _banter_air(entry: dict[str, Any],
         # path — the two things preparing it was for.
         pipeline_log("air", "a prepared round goes straight to air — its "
                      "audio was made during the last record (#886)")
+    elif str(entry.get("script_tinted") or ""):
+        # #1077: A TINTED ROUND IS NEVER FRESHENED. freshen_script has
+        # no crystal in it at all - #1025's words - and its fallback
+        # swaps stuck lines for raw speakbox material, so running it
+        # over a rewritten round airs neither the tinted version nor
+        # the plain one but a third, de-tinted text. larder_prepare was
+        # given this guard by #1025; this path never got it.
+        #
+        # The failure was INVERTED: the branch below only spared the
+        # tint when the model gate was busy, which is 99.6% of the
+        # time - so the rewrite was destroyed precisely when the
+        # station was calm enough to air a good round.
+        pipeline_log("air", "a tinted round goes to air as it was "
+                            "rewritten - freshening would undo the "
+                            "crystal (#1077)")
     elif _OLLAMA_GATE.locked():
         pipeline_log("air", "larder round bypasses model freshening while "
                      "the desk is still writing — keeping talk on air")
@@ -59132,6 +59221,24 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     return out
 
 
+_TINT_QUIET: dict[str, float] = {}
+
+
+def _tint_quiet(road: str, why: str, said: str) -> str:
+    """#1077: say why a line went out untinted, at most once a minute
+    per reason, and hand the line back unchanged."""
+    try:
+        mark = f"{road}|{why}"
+        if time.time() - float(_TINT_QUIET.get(mark) or 0) > 60:
+            _TINT_QUIET[mark] = time.time()
+            pipeline_log("crystal",
+                         f"(#1077) {road or 'a line'} went out untinted: "
+                         f"{why}")
+    except Exception:  # noqa: BLE001
+        pass
+    return said
+
+
 async def crystal_line(text: str, why: str = "", room: int = 6,
                        keep: list[str] | None = None) -> str:
     """#1038: THE SECOND PASS, on one piece of speech, for every road.
@@ -59157,10 +59264,16 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
     if not said or room < 1:
         return said
     try:
-        if not crystal_tint_two_pass() or not crystal_active():
-            return said
+        # #1077: #1063 said "all seven of this function's early returns
+        # were silent" and then gave a voice to one of them. These are
+        # the rest. A road that never tints looks exactly like one
+        # nobody asked, and that has cost hours twice today.
+        if not crystal_tint_two_pass():
+            return _tint_quiet(why, "the second pass is switched off", said)
+        if not crystal_active():
+            return _tint_quiet(why, "no crystal is on", said)
         if len(said) < TINT_TURN_FLOOR:
-            return said
+            return said            # too short to have a rhyme in it
         # Something is waiting on the desk. The tint is the one thing on
         # the station that can always be skipped - what it protects is
         # style, and dead air is not a style.
@@ -59179,7 +59292,8 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
             chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
                                       int(dj.get("crystal_tint_chars") or 900))
         if not chunks:
-            return said            # nothing to be tinted BY
+            return _tint_quiet(why, "the crystal has no passage long "
+                                    "enough to work from", said)
         world = crystal_world_prompt()
         started = time.monotonic()
         # #1045: IT NO LONGER TOUCHES _PREP_DEADLINE. #1038 pushed the
@@ -59465,6 +59579,23 @@ async def crystal_tint(script: str, kind: str = "",
                 return out
             out["turns"] = len(turns)
             out["per_turn"] = True
+            # #1077: AND IT PAYS. The whole-round path charges the
+            # budget, files the answer against its passages and writes
+            # the trail; this path - which every banked round takes, and
+            # which is the better tint - did none of it. Measured: the
+            # reserve held 3,904s of tint model time, 1.8x the entire
+            # hourly share, charged to nobody, while the ad and SFX
+            # roads were throttled by a budget the biggest consumer
+            # never paid into.
+            try:
+                tint_spend_note(float(out.get("ms") or 0) / 1000.0)
+                for _c in chunks:
+                    chunk_answer(str(_c.get("text") or ""), tinted,
+                                 kind or "a banked round")
+                trail_note(kind or "a banked round", text, tinted,
+                           chunks, None, int(out.get("ms") or 0))
+            except Exception:  # noqa: BLE001
+                pass
             tinted = "\n".join(done).strip()
             out["prompt"] = (
                 (f"TURN BY TURN - {len(turns)} calls, one per line of the "
@@ -59511,6 +59642,29 @@ async def crystal_tint(script: str, kind: str = "",
         # #1018: with some spice. A rewrite asked for at the default
         # temperature comes back as the input with the commas fixed,
         # which is what "tidying is not tinting" was written about.
+        # #1078: THE BUDGET GUARD ITS SIBLINGS HAVE. _freshen_script
+        # and blend_script have both checked since #862 whether the
+        # script plus its answer will exceed reply_max_chars, and skip
+        # rather than truncate. This did not - it asked for len+400,
+        # ask_model clamped that to the ceiling, and the answer was CUT
+        # AT THE LIMIT. With a survivor test of `len(tinted) < len(text)
+        # * 0.45`, a round could lose fifty-five percent of itself from
+        # the tail and still be installed as the version that airs -
+        # and a long round carrying a full swath is exactly the one
+        # most likely to hit it.
+        try:
+            _ceiling = int(dj_settings().get("reply_max_chars") or 6000)
+        except Exception:  # noqa: BLE001
+            _ceiling = 6000
+        if len(text) + 400 > _ceiling:
+            out["why"] = (f"the round is {len(text)} characters and the "
+                          f"reply ceiling is {_ceiling} - rewriting it "
+                          "whole would cut the tail off, so the plain "
+                          "one stands (#1078)")
+            pipeline_log("crystal", "(#1078) a round was too long to "
+                                    "rewrite whole without truncating it "
+                                    "- left plain")
+            return out
         got = await ask_model(
             prompt, limit=max(600, len(text) + 400), spice=0.55,
             model=str(dj.get("crystal_tint_model") or ""),        # #1036
