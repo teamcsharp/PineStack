@@ -10900,7 +10900,12 @@ def prep_tier(cover: float = -1.0) -> str:
     """bare / steady / deep - how much cover the reserve is holding."""
     try:
         if cover < 0:
-            cover = pantry_seconds()
+            # #1048: PREPARED, not cached. This turns a number into the
+            # word everything downstream branches on, and it was reading
+            # the whole render cache - 7,302s of mostly already-aired
+            # audio - so a station with nothing ready was told it was
+            # "deep", the one tier that means "there is plenty".
+            cover = prepared_seconds()
         if cover < prep_thin_seconds():
             return "bare"
         if cover < prep_deep_seconds():
@@ -10925,7 +10930,7 @@ def prep_budget(tier: str = "", room: float = -1.0,
         if room < 0:
             room = prep_room_left()
         if cover < 0:
-            cover = pantry_seconds()
+            cover = prepared_seconds()                            # #1048
         cheap = prep_cheapest()[1]
         tier = tier or prep_tier(cover)
         if tier == "bare":
@@ -11191,7 +11196,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         "candidates": []}
     try:
         room = prep_room_left()
-        cover = pantry_seconds()
+        cover = prepared_seconds()                                # #1048
         tier = prep_tier(cover)
         budget = prep_budget(tier, room, cover)
         out.update({"room": round(room, 1), "cover": round(cover, 1),
@@ -11300,6 +11305,36 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         if due:
             out.update({"kind": due["kind"], "forced": True,
                         "why": due["why"], "deadline": due["entry"]})
+            return out
+        # #1049: THE HALF-HOUR DESK, above the ledger and below the
+        # deadline. A deadline is measured in seconds and still goes
+        # first; a half hour that will OPEN incomplete is measured in
+        # minutes and is knowable long before any deadline fires, which
+        # is the entire reason for keeping a slot board.
+        #
+        # The reasoning below this ranks by RATE, so a road nobody has
+        # asked for outranks one the next half hour is short of simply
+        # by being cheap. That is efficient, and it is how a station
+        # arrives at a slot with nothing in it.
+        #
+        # The window still governs: a road that will not fit what is
+        # left of this window is not taken. It is taken next window -
+        # and the desk said so early enough that there is one.
+        # #1050: the WHOLE shortfall, dearest first, and the preparer
+        # takes the first one that fits the window that is open. #1049
+        # handed over only the dearest road; it almost never fitted, and
+        # the desk drove nothing at all.
+        for _need in slot_needs():
+            _slot_row = next((r for r in rows
+                              if r["kind"] == _need["prep"]), None)
+            if not _slot_row or float(_slot_row["cost"]) > room:
+                continue
+            out.update({
+                "kind": _slot_row["kind"], "forced": True,
+                "slot": _need["why"],
+                "why": (_need["why"] + f" - building {_slot_row['label']}"
+                        f" at about {int(_slot_row['cost'])}s against "
+                        f"{int(room)}s of window (#1050)")})
             return out
         fits = [r for r in rows if r["fits"]]
         if not fits:
@@ -11415,7 +11450,7 @@ def prep_state() -> dict[str, Any]:
     """#872 telemetry: the ledger, the last decision and its reasoning,
     and what the room is allowed to do right now."""
     try:
-        cover = pantry_seconds()
+        cover = prepared_seconds()                                # #1048
         return {
             "ledger": task_ledger_state(),
             "chose": dict(_PREP_LAST),
@@ -21676,6 +21711,321 @@ def schedule_slots_now(store: dict[str, Any]) -> tuple[str, list]:
                   if x.get("enabled", True)]
 
 
+# --- THE HALF-HOUR DESK (#1049) --------------------------------------
+# A board of half-hour slots, each one carrying what it owes, what is
+# prepared for it, what that leaves short, and whether the shortfall can
+# still be made before the slot opens. See the note at the top of the
+# #1049 change for the reasoning; the short version is that an hourly
+# view cannot answer "will the next thirty minutes be complete", because
+# it cannot tell two slots apart and it cannot allocate one prepared
+# advert to only one of them.
+SLOT_SECONDS = 1800.0
+
+# How much of the remaining time the preparer can realistically spend
+# WRITING. It shares the room with everything already on air, and a plan
+# that assumes otherwise promises slots it cannot keep. Measured duty on
+# this station sits near a half; two thirds is deliberately optimistic,
+# so "at risk" means genuinely at risk rather than merely busy.
+SLOT_DUTY = 0.66
+
+# What the station gives up FIRST when a slot cannot be completed, and
+# what it protects LONGEST. Colour goes before content, content goes
+# before promises, and the banter is last because it is the spine - a
+# half hour with no banter is not a thin show, it is a silent one.
+SLOT_POSTPONE = ("station_id", "track_talk", "gallery", "ad",
+                 "news", "manager", "caller", "banter")
+
+
+def slot_index(when: float = 0.0) -> int:
+    """Which half hour this instant falls in, counted off the epoch so
+    the number is stable across restarts and comparable between slots."""
+    try:
+        return int((when or time.time()) // SLOT_SECONDS)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def slot_bounds(idx: int) -> tuple[float, float]:
+    """(start, end) of a slot, in wall seconds."""
+    start = float(idx) * SLOT_SECONDS
+    return start, start + SLOT_SECONDS
+
+
+def slot_face(idx: int) -> str:
+    """The slot as a person would say it - "14:30-15:00"."""
+    try:
+        start, end = slot_bounds(idx)
+        return (time.strftime("%H:%M", time.localtime(start)) + "-"
+                + time.strftime("%H:%M", time.localtime(end)))
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def slot_manifest(idx: int) -> list[dict[str, Any]]:
+    """What this slot owes.
+
+    The sheet is a RUNNING ORDER, not a timetable - its entries have no
+    clock times - so the honest split is positional: the first half of
+    an hour's entries belong to its first half hour. An hour with an
+    override stamped on it reads the override, exactly as every other
+    reader of the sheet does (#963)."""
+    out: list[dict[str, Any]] = []
+    try:
+        store = schedule_read()
+        if not store.get("enabled", True):
+            return out
+        start, _end = slot_bounds(idx)
+        _name, rows, _on = schedule_hour_slots(store, "", start)
+        slots = [x for x in (rows or []) if x.get("enabled", True)]
+        if not slots:
+            return out
+        # First half of the hour or second, by position in the order.
+        half = time.localtime(start).tm_min >= 30
+        cut = (len(slots) + 1) // 2
+        mine = slots[cut:] if half else slots[:cut]
+        for row in mine:
+            kind = str(row.get("kind") or "")
+            if not kind:
+                continue
+            out.append({
+                "kind": kind,
+                "label": str(row.get("label") or kind),
+                "prep": str(SCHED_PREP_KIND.get(kind) or kind),
+                "live_only": kind in CANNOT_PREPARE,
+                "why_live": str(CANNOT_PREPARE.get(kind) or ""),
+            })
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def slot_stock() -> dict[str, int]:
+    """What is PREPARED and ready to air, per road.
+
+    Read off the same board the recording room shows, so the slot desk
+    and the glass can never disagree about how much there is."""
+    stock: dict[str, int] = {}
+    try:
+        for row in (prep_board() or []):
+            kind = str(row.get("kind") or "")
+            if kind:
+                stock[kind] = max(0, int(row.get("ready") or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    return stock
+
+
+def slot_read(idx: int, stock: dict[str, int] | None = None
+              ) -> dict[str, Any]:
+    """ONE slot, fully reasoned: what it owes, what it has, what is
+    missing, whether that can still be made, and what gives if not.
+
+    `stock` is consumed in place when it is handed in - that is how the
+    board stops counting the same prepared advert twice."""
+    now = time.time()
+    start, end = slot_bounds(idx)
+    out: dict[str, Any] = {
+        "idx": idx, "face": slot_face(idx), "start": start, "end": end,
+        "current": bool(start <= now < end),
+        "owes": [], "live_only": [], "short": [],
+        "cost": 0.0, "lead": 0.0, "room": 0.0,
+        "verdict": "covered", "why": "", "giving_up": [],
+    }
+    try:
+        have = stock if isinstance(stock, dict) else slot_stock()
+        manifest = slot_manifest(idx)
+        if not manifest:
+            out["why"] = "the running order has nothing in this slot"
+            return out
+        # Time available before this slot has to be ready. A slot already
+        # running can still be filled while it runs; one that has not
+        # opened yet must be ready when it does, which is the whole of
+        # "without anything ever falling behind".
+        out["lead"] = max(0.0, (end if out["current"] else start) - now)
+        out["room"] = round(out["lead"] * SLOT_DUTY, 1)
+        want: dict[str, int] = {}
+        for row in manifest:
+            if row["live_only"]:
+                out["live_only"].append(row)
+                continue
+            out["owes"].append(row)
+            want[row["prep"]] = want.get(row["prep"], 0) + 1
+        # Allocate the shelf, nearest slot first.
+        for prep, need in sorted(want.items()):
+            got = min(need, int(have.get(prep) or 0))
+            have[prep] = int(have.get(prep) or 0) - got
+            if got < need:
+                miss = need - got
+                each = float(task_cost(prep) or 45.0)
+                out["short"].append({
+                    "prep": prep, "need": need, "have": got,
+                    "short": miss, "each": round(each, 1),
+                    "cost": round(each * miss, 1)})
+        out["cost"] = round(sum(r["cost"] for r in out["short"]), 1)
+        if not out["short"]:
+            out["why"] = ("every entry in this slot has something behind "
+                          "it")
+            return out
+        # THE NEGOTIATION. Does the shortfall fit in the room left?
+        if out["cost"] <= out["room"] * 0.6:
+            out["verdict"] = "covered"
+            out["why"] = (f"{int(out['cost'])}s of work against "
+                          f"{int(out['room'])}s of room - comfortable")
+            return out
+        if out["cost"] <= out["room"]:
+            out["verdict"] = "tight"
+            out["why"] = (f"{int(out['cost'])}s of work against only "
+                          f"{int(out['room'])}s of room - it fits with "
+                          "nothing to spare")
+            return out
+        # It does not fit. Give things up in the order the station can
+        # most afford to lose them, and SAY WHICH.
+        left = float(out["cost"])
+        by_prep = {r["prep"]: r for r in out["short"]}
+        for prep in SLOT_POSTPONE:
+            if left <= out["room"]:
+                break
+            row = by_prep.get(prep)
+            if not row:
+                continue
+            out["giving_up"].append({
+                "prep": prep, "count": row["short"],
+                "frees": row["cost"]})
+            left -= row["cost"]
+        out["verdict"] = "at risk" if left <= out["room"] else "cannot"
+        _gave = ", ".join(f"{g['count']}x {g['prep']}"
+                          for g in out["giving_up"])
+        out["why"] = (
+            f"{int(out['cost'])}s of work against {int(out['room'])}s of "
+            f"room" + (f" - standing down {_gave} brings it to "
+                       f"{int(left)}s" if _gave else "")
+            + ("" if left <= out["room"] else
+               ", and it still does not fit: this slot cannot be "
+               "completed and will run on whatever is to hand"))
+    except Exception:  # noqa: BLE001
+        out["verdict"] = "unknown"
+        out["why"] = "the slot desk could not read this slot"
+    return out
+
+
+def slot_board(ahead: int = 3) -> dict[str, Any]:
+    """The slot on air and the next few, each reasoned in turn.
+
+    Stock is allocated as the board walks forward, so a later slot is
+    told what is genuinely left for it rather than what exists."""
+    out: dict[str, Any] = {"at": time.time(), "slots": [],
+                           "duty": SLOT_DUTY, "behind": False, "say": ""}
+    try:
+        have = slot_stock()
+        out["stock"] = dict(have)
+        first = slot_index()
+        for step in range(max(1, min(8, int(ahead) + 1))):
+            out["slots"].append(slot_read(first + step, have))
+        bad = [r for r in out["slots"]
+               if r["verdict"] in ("at risk", "cannot")]
+        out["behind"] = bool(bad)
+        if bad:
+            out["say"] = (f"{len(bad)} of the next {len(out['slots'])} "
+                          "half hours cannot be completed as written: "
+                          + "; ".join(f"{r['face']} {r['verdict']}"
+                                      for r in bad))
+        else:
+            out["say"] = (f"the next {len(out['slots'])} half hours all "
+                          "have material behind them")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+_SLOT_WANT: dict[str, Any] = {"at": 0.0, "kind": "", "why": "",
+                              "needs": []}
+SLOT_WANT_LIFE = 5.0
+
+
+def slot_needs() -> list[dict[str, Any]]:
+    """#1050: EVERYTHING the next two half hours are short of, in the
+    order the desk wants it built.
+
+    Nearest slot first, and within a slot the dearest first - the
+    expensive road is the one that will not fit if it is left until
+    last. The preparer walks this and takes the first entry that fits
+    the window that is actually open, which is the difference between
+    an instruction and a wish: #1049 handed over only the dearest road,
+    it almost never fitted, and the desk drove nothing at all.
+
+    Roads the slot has already decided to stand down are left out -
+    there is no sense building what the negotiation gave up."""
+    out: list[dict[str, Any]] = []
+    try:
+        if time.time() - float(_SLOT_WANT.get("at") or 0) < SLOT_WANT_LIFE:
+            return list(_SLOT_WANT.get("needs") or [])
+        _SLOT_WANT.update({"at": time.time(), "kind": "", "why": "",
+                           "needs": []})
+        for row in (slot_board(1).get("slots") or []):
+            short = list(row.get("short") or [])
+            if not short:
+                continue
+            giving = {g["prep"] for g in (row.get("giving_up") or [])}
+            keep = [r for r in short if r["prep"] not in giving] or short
+            for pick in sorted(keep, key=lambda r: -float(r.get("cost") or 0)):
+                out.append({
+                    "prep": str(pick["prep"]),
+                    "short": int(pick["short"]),
+                    "each": float(pick["each"]),
+                    "face": str(row.get("face") or ""),
+                    "verdict": str(row.get("verdict") or ""),
+                    "why": (f"the {row.get('face')} half hour is "
+                            f"{pick['short']} {pick['prep']} short and it "
+                            f"is {row.get('verdict')}")})
+        _SLOT_WANT.update({"at": time.time(), "needs": out,
+                           "kind": (out[0]["prep"] if out else ""),
+                           "why": (out[0]["why"] if out else "")})
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def slot_wants() -> tuple[str, str]:
+    """The road the NEAREST slot most needs, and why.
+
+    This is the slot desk's one instruction to the preparer: of
+    everything short across the next couple of half hours, which single
+    road should the next pass build. Nearest slot first, and within a
+    slot the most expensive thing short - because the expensive one is
+    what will not fit if it is left until last.
+
+    Returns ("", "") when nothing is short, which leaves the preparer
+    doing exactly what it did before the slot desk existed.
+
+    #1050: prefer slot_needs(). This returns only the head of that list
+    and is kept for readers that want one answer."""
+    try:
+        # prep_plan runs every six seconds and the board walks the whole
+        # pantry to build itself; five seconds of memory costs nothing
+        # and the answer cannot meaningfully change inside it.
+        if time.time() - float(_SLOT_WANT.get("at") or 0) < SLOT_WANT_LIFE:
+            return (str(_SLOT_WANT.get("kind") or ""),
+                    str(_SLOT_WANT.get("why") or ""))
+        _SLOT_WANT.update({"at": time.time(), "kind": "", "why": ""})
+        board = slot_board(1)
+        for row in board.get("slots") or []:
+            short = [r for r in (row.get("short") or [])]
+            if not short:
+                continue
+            # The ones being stood down are not worth building.
+            giving = {g["prep"] for g in (row.get("giving_up") or [])}
+            short = [r for r in short if r["prep"] not in giving] or short
+            pick = max(short, key=lambda r: float(r.get("cost") or 0))
+            _why = (f"the {row['face']} half hour is {pick['short']} "
+                    f"{pick['prep']} short and it is {row['verdict']}")
+            _SLOT_WANT.update({"at": time.time(),
+                               "kind": str(pick["prep"]), "why": _why})
+            return str(pick["prep"]), _why
+    except Exception:  # noqa: BLE001
+        pass
+    return "", ""
+
+
 def hour_shortfall() -> dict[str, Any]:
     """Which entries of the hour on air have material behind them.
 
@@ -23289,7 +23639,7 @@ def dialogue_flow_state() -> dict[str, Any]:
         # #924: the honest answer about the hour, beside the old count.
         "hour": hour_shortfall(),
         "prepared": sum(1 for e in _LARDER if e.get("prepared")),
-        "buffered_seconds": pantry_seconds(),
+        "buffered_seconds": prepared_seconds(),  # #1048
         "pantry_clips": len(_PANTRY),
         "pantry_mb": round(pantry_bytes() / 1048576, 1),
         "pantry_cap_mb": round(PANTRY_MAX_BYTES / 1048576),
@@ -23302,7 +23652,7 @@ def dialogue_flow_state() -> dict[str, Any]:
         # the only unit the operator asked in: hours of finished audio,
         # against the hours they asked for.
         "prepared_by_kind": prepared_by_kind(),
-        "hours_ready": round(pantry_seconds() / 3600.0, 2),
+        "hours_ready": round(prepared_seconds() / 3600.0, 2),  # #1048
         "target_hours": round(prepare_target_seconds() / 3600.0, 2),
         # #896/#895: the horizon dial itself, and how deep the digging
         # has got as a result — the glass sets the first and watches the
@@ -62623,6 +62973,23 @@ async def api_chunks(
     }
 
 
+@app.get("/api/slots")
+async def api_slots(ahead: int = 3) -> dict[str, Any]:
+    """#1049: THE HALF-HOUR BOARD.
+
+    "making sure everything is complete for each half hour slot on the
+    hour ... without anything ever falling behind."
+
+    Per slot: what the running order owes it, what is prepared and
+    ALLOCATED to it (nearest slot eats first), what that leaves short
+    and what the shortfall costs, how much room is left before the slot
+    opens, and the verdict - covered, tight, at risk, or cannot - with
+    the negotiation written out: which entries are being stood down, in
+    the order the station can most afford to lose them, and what that
+    frees."""
+    return slot_board(max(0, min(7, int(ahead or 3))))
+
+
 @app.get("/api/coordinator/capacity")
 async def api_coord_capacity(
     authorization: str | None = Header(default=None),
@@ -63004,7 +63371,7 @@ async def dj_pending(
     window = pantry_window()
     return {
         "pending": rows,
-        "buffered_seconds": pantry_seconds(),
+        "buffered_seconds": prepared_seconds(),  # #1048
         "pantry_clips": len(_PANTRY),
         "window": window,
         "building": bool(window),
@@ -75955,6 +76322,7 @@ const PINE_3JS = [
   {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
   {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
+  {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen()},
   {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
@@ -79598,6 +79966,7 @@ async function boothOpen() {
     {name: "🕸 The machine", open: () => djGraphPanel()},
     {name: "💠 Data crystal", open: () => crystalOpen()},
     {name: "❄️ The shelf", open: () => chunkOpen()},
+    {name: "⏱️ The half hours", open: () => slotOpen()},
   ];
   let viewIdx = Number(localStorage.booth3jsIdx || 0);
   const viewBtn = el("button", "", "🧠 3JS Views ⟳");
@@ -106687,6 +107056,179 @@ async function chunkPaint() {
     body.appendChild(card);
   });
 }
+
+// #1051: THE HALF-HOUR BOARD. One card per slot: what it owes, what
+// is short, how much room is left before it opens, and what the
+// negotiation is standing down to make it fit.
+let slotBox = null;
+let slotTimer = null;
+
+function slotClose() {
+  if (slotTimer) { clearInterval(slotTimer); slotTimer = null; }
+  if (slotBox) { slotBox.remove(); slotBox = null; }
+}
+
+function slotMins(secs) {
+  const s = Math.max(0, Math.round(Number(secs) || 0));
+  if (s < 90) return s + "s";
+  return Math.round(s / 60) + "m";
+}
+
+const SLOT_TONE = {
+  covered: ["#6fdc8c", "rgba(111,220,140,.07)"],
+  tight:   ["#ffd76f", "rgba(255,215,111,.07)"],
+  "at risk": ["#ff9b4a", "rgba(255,155,74,.09)"],
+  cannot:  ["#ff6b6b", "rgba(255,107,107,.10)"],
+  unknown: ["#9aa", "transparent"],
+};
+
+async function slotPaint() {
+  if (!slotBox) return;
+  const body = slotBox.querySelector("#slotBody");
+  const head = slotBox.querySelector("#slotCount");
+  let data;
+  try {
+    data = await (await fetch("/api/slots?ahead=4")).json();
+  } catch (err) { return; }
+  if (!slotBox) return;
+  head.textContent = data.say || "";
+  head.style.color = data.behind ? "#ff9b4a" : "#6fdc8c";
+  body.textContent = "";
+  (data.slots || []).forEach((row) => {
+    const tone = SLOT_TONE[row.verdict] || SLOT_TONE.unknown;
+    const card = el("div", "", "");
+    card.style.cssText = "border:1px solid " + tone[0] + "44;"
+      + "border-left:3px solid " + tone[0] + ";border-radius:7px;"
+      + "padding:8px 10px;margin-bottom:7px;background:" + tone[1];
+
+    const top = el("div", "", "");
+    top.style.cssText = "display:flex;gap:8px;align-items:baseline;"
+      + "margin-bottom:5px";
+    const face = el("b", "", row.face);
+    face.style.fontSize = "13px";
+    top.appendChild(face);
+    if (row.current) {
+      const on = el("span", "", "ON AIR");
+      on.style.cssText = "font-size:9px;letter-spacing:.08em;"
+        + "padding:1px 5px;border-radius:3px;background:" + tone[0]
+        + ";color:#111;font-weight:700";
+      top.appendChild(on);
+    }
+    const verdict = el("span", "", row.verdict);
+    verdict.style.cssText = "flex:1;text-align:right;font-weight:600;"
+      + "font-size:11px;color:" + tone[0];
+    top.appendChild(verdict);
+    card.appendChild(top);
+
+    const owes = (row.owes || []).map((o) => o.kind);
+    if (owes.length) {
+      const line = el("div", "muted", "owes " + owes.join(", "));
+      line.style.cssText = "font-size:10.5px;margin-bottom:4px";
+      card.appendChild(line);
+    }
+
+    (row.short || []).forEach((sh) => {
+      const line = el("div", "", "");
+      line.style.cssText = "font-size:11px;display:flex;gap:6px;"
+        + "margin-bottom:2px";
+      const nm = el("span", "", sh.short + "x " + sh.prep);
+      nm.style.cssText = "flex:1";
+      line.appendChild(nm);
+      line.appendChild(el("span", "muted",
+        "have " + sh.have + "/" + sh.need));
+      const c = el("span", "", slotMins(sh.cost));
+      c.style.cssText = "opacity:.85;min-width:34px;text-align:right";
+      line.appendChild(c);
+      card.appendChild(line);
+    });
+
+    const bar = el("div", "muted", "");
+    bar.style.cssText = "font-size:10.5px;margin-top:5px";
+    bar.textContent = slotMins(row.cost) + " of work \u00b7 "
+      + slotMins(row.room) + " of room \u00b7 opens in "
+      + slotMins(row.lead);
+    card.appendChild(bar);
+
+    if ((row.giving_up || []).length) {
+      const gave = el("div", "", "");
+      gave.style.cssText = "margin-top:6px;padding-top:5px;border-top:"
+        + "1px dashed " + tone[0] + "55;font-size:11px";
+      const cap = el("div", "", "standing down");
+      cap.style.cssText = "font-size:9.5px;letter-spacing:.06em;"
+        + "color:" + tone[0] + ";margin-bottom:3px";
+      gave.appendChild(cap);
+      gave.appendChild(el("div", "",
+        row.giving_up.map((g) => g.count + "x " + g.prep
+          + " (" + slotMins(g.frees) + ")").join(", ")));
+      card.appendChild(gave);
+    }
+
+    if (row.why) {
+      const why = el("div", "muted", row.why);
+      why.style.cssText = "font-size:10px;margin-top:5px;line-height:1.4";
+      card.appendChild(why);
+    }
+    body.appendChild(card);
+  });
+}
+
+async function slotOpen() {
+  if (slotBox) { slotClose(); return; }
+  const box = el("div", "panel", "");
+  box.id = "slotBoxEl";
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.slotBox || "null") || { left: 170, top: 100 });
+  box.style.cssText = "position:fixed;z-index:148;width:min(600px,95vw);"
+    + "height:min(600px,82vh);display:flex;flex-direction:column;"
+    + "padding:10px 12px;box-shadow:0 20px 60px rgba(0,0,0,.65);"
+    + "resize:both;overflow:hidden;"
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "cursor:grab;margin-bottom:2px";
+  head.appendChild(el("b", "", "\u23f1\ufe0f The half hours"));
+  const shut = el("button", "", "\u2715");
+  shut.onclick = slotClose;
+  shut.style.marginLeft = "auto";
+  head.appendChild(shut);
+  box.appendChild(head);
+
+  const count = el("div", "muted", "reading\u2026");
+  count.id = "slotCount";
+  count.style.cssText = "font-size:11px;margin-bottom:8px;line-height:1.4";
+  box.appendChild(count);
+
+  const body = el("div", "", "");
+  body.id = "slotBody";
+  body.style.cssText = "flex:1;overflow:auto;padding-right:3px";
+  box.appendChild(body);
+
+  head.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    const from = {x: event.clientX, y: event.clientY,
+                  left: box.offsetLeft, top: box.offsetTop};
+    head.setPointerCapture(event.pointerId);
+    const move = (e) => {
+      box.style.left = Math.max(0, from.left + e.clientX - from.x) + "px";
+      box.style.top = Math.max(0, from.top + e.clientY - from.y) + "px";
+    };
+    head.addEventListener("pointermove", move);
+    head.addEventListener("pointerup", () => {
+      head.removeEventListener("pointermove", move);
+      try {
+        localStorage.slotBox = JSON.stringify(
+          {left: box.offsetLeft, top: box.offsetTop});
+      } catch (err) {}
+    }, {once: true});
+  });
+
+  document.body.appendChild(box);
+  slotBox = box;
+  await slotPaint();
+  slotTimer = setInterval(slotPaint, 15000);
+}
+
 
 async function chunkOpen() {
   if (chunkBox) { chunkClose(); return; }
