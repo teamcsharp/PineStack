@@ -10837,15 +10837,42 @@ def task_gain(kind: str) -> float:
     return float(TASK_SEED_GAIN.get(str(kind), 20.0))
 
 
+def task_odds(kind: str) -> float:
+    """#1067: how often this road actually finishes what it starts.
+
+    task_note has been writing `fail` since it was written and nothing
+    has ever read it. Measured: banter has failed 795 of 1,170
+    attempts - 68% - and was priced exactly like a road that never
+    fails. Seeded optimistic so a road with no history is not
+    condemned before it has run."""
+    try:
+        task_ledger_load()
+        row = _TASK_LEDGER.get(str(kind)) or {}
+        went = int(row.get("count") or len(row.get("secs") or []))
+        lost = int(row.get("fail") or 0)
+        if went < TASK_LEDGER_TRUST:
+            return 1.0
+        return max(0.05, min(1.0, (went - lost) / float(max(1, went))))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
 def task_rate(kind: str) -> float:
     """Seconds of AIRTIME bought per second the room is tied up.
 
     THE cheap-first number. A station ID is not preferred because
     somebody wrote "station ID" at the top of a list - it is preferred
     when, measured, it buys cover faster than anything else on the
-    board."""
+    board.
+
+    #1067: and it is an EXPECTED value now. task_gain averages only the
+    samples that succeeded, so this used to be the return CONDITIONAL
+    ON SUCCESS - which is not a thing any scheduler should maximise. A
+    road that finishes a third of the time buys a third as much."""
     cost = task_cost(kind)
-    return round(task_gain(kind) / cost, 3) if cost > 0 else 0.0
+    if cost <= 0:
+        return 0.0
+    return round(task_gain(kind) * task_odds(kind) / cost, 3)
 
 
 def task_stat(kind: str) -> dict[str, Any]:
@@ -10901,7 +10928,12 @@ async def prep_measure(kind: str, work: Any) -> bool:
     every number the scheduler uses came off a task it really ran."""
     t0 = time.monotonic()
     try:
-        before = pantry_seconds()
+        # #1067: PREPARED seconds, not the whole render cache. This
+        # credited a task with every live render that happened to land
+        # while it ran - and `rate`, which the entire ledger policy
+        # rests on, is built out of it. #1048 fixed prep_tier and left
+        # this behind.
+        before = prepared_seconds()
     except Exception:  # noqa: BLE001
         before = 0.0
     ok = False
@@ -10911,7 +10943,7 @@ async def prep_measure(kind: str, work: Any) -> bool:
         ok = False
     try:
         task_note(kind, time.monotonic() - t0,
-                  max(0.0, pantry_seconds() - before), ok)
+                  max(0.0, prepared_seconds() - before), ok)   # #1067
     except Exception:  # noqa: BLE001
         pass
     return ok
@@ -11380,8 +11412,37 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     "tier": tier, "budget": round(budget, 1),
                     "thin": round(prep_thin_seconds(), 1),
                     "deep": round(prep_deep_seconds(), 1)})
+        # #1067: THE GATE IS AN INPUT NOW, not a verdict passed after
+        # the fact. It is checked at the execution site AFTER this
+        # function has priced the whole board and chosen - so measured,
+        # 86% of picks were thrown away and 22 passes in 51 minutes
+        # walked six roads that all need a model and built nothing.
+        #
+        # When both slots are busy the board is what can be done
+        # WITHOUT one: reads already written and waiting for a voice,
+        # and the sittings. That work is real, it is owed, and it is
+        # what a studio does while it waits for the writer.
+        _gate_shut = False
+        try:
+            _gate_shut = bool(_OLLAMA_GATE.locked())
+        except Exception:  # noqa: BLE001
+            _gate_shut = False
         sheet = [k for k in schedule_prep_order() if k in PREP_BOARD]
         order = list(sheet) + [k for k in PREP_BOARD if k not in sheet]
+        if _gate_shut:
+            _voiceable = [k for k in order
+                          if shelf_unvoiced(k) >= SHELF_UNVOICED_MOST
+                          or k == "station_id"]
+            if _voiceable:
+                order = _voiceable
+                out["gate_shut"] = True
+            else:
+                out["gate_shut"] = True
+                out["why"] = ("both model slots are busy and nothing on "
+                              "the board can be done without one - "
+                              "waiting rather than choosing work that "
+                              "would be refused (#1067)")
+                return out
         rows: list[dict[str, Any]] = []
         for kind in order:
             if kind in skip:
@@ -11562,6 +11623,13 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             # (#855) - and where the sheet is silent, the emptiest shelf
             # wins, which is what keeps the board filling evenly.
             wanted = [r for r in fits if r.get("wanted")]
+            # #1067: "the barest on the board" is a max() over whatever
+            # survived the walk, and by the time the deadline branch has
+            # eaten everything else that is one road - measured, a
+            # station ID shelf holding 23 of a cap of 24 was reported as
+            # the barest thing on the station. True arithmetic, false
+            # statement.
+            _alone = len(fits) < 2
             pick = (wanted[0] if wanted
                     else max(fits, key=lambda r: (r["need"], -r["cost"])))
             out["why"] = (
@@ -11570,8 +11638,10 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                 f"{int(pick['cost'])}s - "
                 + ("the running order wants it next (#855)"
                    if pick.get("wanted") else
-                   f"its shelf is the barest on the board "
-                   f"({int(pick['need'] * 100)}% empty)"))
+                   (f"it is the only road left this pass "
+                    f"({int(pick['need'] * 100)}% empty)" if _alone
+                    else f"its shelf is the barest on the board "
+                         f"({int(pick['need'] * 100)}% empty)")))
         out["kind"] = pick["kind"]
         return out
     except Exception:  # noqa: BLE001
@@ -22607,8 +22677,19 @@ def slot_needs() -> list[dict[str, Any]]:
             short = list(row.get("short") or [])
             if not short:
                 continue
+            # #1067: ...but not for ever. Every half hour has been "at
+            # risk" in 270 of 270 measured samples, so a road named in
+            # `giving_up` was being excluded from the desk's asks on
+            # EVERY pass - an answer meant for an occasional squeeze
+            # became a standing exclusion, and the measured result was
+            # gallery: not one round built in 67 minutes with a
+            # cupboard holding 1 of 5.
+            #
+            # A road stood down for THIS slot still goes on the list,
+            # last. The slot may not air it; the cupboard still needs it.
             giving = {g["prep"] for g in (row.get("giving_up") or [])}
-            keep = [r for r in short if r["prep"] not in giving] or short
+            keep = ([r for r in short if r["prep"] not in giving]
+                    + [r for r in short if r["prep"] in giving])
             for pick in sorted(keep, key=lambda r: -float(r.get("cost") or 0)):
                 out.append({
                     "prep": str(pick["prep"]),
