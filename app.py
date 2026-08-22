@@ -95381,6 +95381,8 @@ function djRender(state) {
   } catch (e) { /* the panel still reads */ }
   /* #1058: the orchestrator's bell. Silent until it has a question. */
   try { orchBell(); } catch (e) { /* the panel still reads */ }
+  /* #1071: ...and the CARD, which is the one that can be seen. */
+  try { orchToast(); } catch (e) { /* the panel still reads */ }
   /* #1008: the overlap setting reaches the page on every poll now, not
    * only when the settings panel happens to be painted. */
   try {
@@ -109539,6 +109541,356 @@ function orchClose() {
   if (orchBox) { orchBox.remove(); orchBox = null; }
   orchPicks = {};
 }
+
+/* #1071: THE CARD. A 44px bell on a panel this busy is a rumour, not a
+ * notification - the questionnaire that would have closed the hour's
+ * shortfall sat unanswered for hours behind one. This slides in, says
+ * what is wrong in the orchestrator's own words, and does not leave.
+ * Dismissing snoozes it for ten minutes, because the thing it asks
+ * about does not go away either. */
+let orchCard = null;
+let orchSnooze = 0;
+let orchPlex = null;
+
+function orchCardHide() {
+  if (orchCard) { orchCard.remove(); orchCard = null; }
+}
+
+async function orchToast() {
+  let data;
+  try {
+    data = await (await fetch("/api/orchestrator/asks")).json();
+  } catch (err) { return; }
+  const rows = data.rows || [];
+  if (!rows.length || Date.now() < orchSnooze) { orchCardHide(); return; }
+  const row = rows[0];
+  if (orchCard && orchCard.dataset.ask === String(row.id)) return;
+  orchCardHide();
+
+  const tone = row.urgency === "now" ? "#ff7a3c"
+    : (row.urgency === "soon" ? "#ffc94a" : "#5fd8a4");
+  const card = el("div", "", "");
+  card.dataset.ask = String(row.id);
+  card.style.cssText = "position:fixed;right:18px;bottom:18px;z-index:190;"
+    + "width:min(370px,92vw);border-radius:12px;padding:13px 15px;"
+    + "background:linear-gradient(150deg,rgba(18,20,28,.98),"
+    + "rgba(10,12,18,.98));border:1px solid " + tone + "66;"
+    + "border-left:4px solid " + tone + ";cursor:pointer;"
+    + "box-shadow:0 18px 50px rgba(0,0,0,.7),0 0 0 1px rgba(0,0,0,.4),"
+    + "0 0 26px " + tone + "22;"
+    + "transform:translateY(140%);transition:transform .45s cubic-bezier("
+    + ".2,.9,.25,1)";
+
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "margin-bottom:6px";
+  const dot = el("span", "", "");
+  dot.style.cssText = "width:9px;height:9px;border-radius:50%;flex:none;"
+    + "background:" + tone;
+  dot.animate([{opacity: 1}, {opacity: .25}, {opacity: 1}],
+              {duration: 1500, iterations: Infinity});
+  head.appendChild(dot);
+  const who = el("b", "", "The orchestrator has a question");
+  who.style.cssText = "font-size:12.5px;flex:1";
+  head.appendChild(who);
+  const tag = el("span", "", String(row.urgency || "").toUpperCase());
+  tag.style.cssText = "font-size:8.5px;letter-spacing:.11em;color:" + tone
+    + ";font-weight:800";
+  head.appendChild(tag);
+  card.appendChild(head);
+
+  const why = el("div", "", String(row.why || "").slice(0, 190)
+    + (String(row.why || "").length > 190 ? "…" : ""));
+  why.style.cssText = "font-size:11.5px;line-height:1.55;opacity:.88;"
+    + "margin-bottom:9px";
+  card.appendChild(why);
+
+  const foot = el("div", "", "");
+  foot.style.cssText = "display:flex;gap:7px;align-items:center";
+  const go = el("button", "", "Answer "
+    + ((row.questions || []).length) + " questions");
+  go.style.cssText = "flex:1;padding:7px;border-radius:7px;border:none;"
+    + "font-weight:700;font-size:11.5px;cursor:pointer;background:" + tone
+    + ";color:#0b0d12";
+  go.onclick = (e) => { e.stopPropagation(); orchPlexusOpen(); };
+  foot.appendChild(go);
+  const later = el("button", "", "later");
+  later.style.cssText = "padding:7px 10px;border-radius:7px;font-size:11px;"
+    + "cursor:pointer;opacity:.7";
+  later.onclick = (e) => {
+    e.stopPropagation();
+    orchSnooze = Date.now() + 600000;   /* ten minutes, not for ever */
+    orchCardHide();
+  };
+  foot.appendChild(later);
+  card.appendChild(foot);
+
+  card.onclick = () => orchPlexusOpen();
+  document.body.appendChild(card);
+  orchCard = card;
+  requestAnimationFrame(() => { card.style.transform = "translateY(0)"; });
+  if (row.urgency === "now") {
+    card.animate(
+      [{transform: "translateY(0)"}, {transform: "translateY(-7px)"},
+       {transform: "translateY(0)"}],
+      {duration: 900, iterations: 3, delay: 500});
+  }
+}
+
+function orchPlexusClose() {
+  if (!orchPlex) return;
+  try { cancelAnimationFrame(orchPlex.raf); } catch (e) {}
+  try {
+    orchPlex.renderer.dispose();
+    orchPlex.lines.geometry.dispose();
+    orchPlex.dots.geometry.dispose();
+  } catch (e) {}
+  try { orchPlex.shade.remove(); } catch (e) {}
+  window.removeEventListener("resize", orchPlex.onSize);
+  orchPlex = null;
+}
+
+async function orchPlexusOpen() {
+  if (orchPlex) { orchPlexusClose(); return; }
+  /* One WebGL context on this panel - the others yield, as they do to
+   * each other. */
+  if (typeof crystal !== "undefined" && crystal) crystalClose();
+  if (typeof djGraph !== "undefined" && djGraph) djGraphClose();
+  if (typeof djMind !== "undefined" && djMind) mindClose();
+  if (!window.THREE) {
+    const tag = document.createElement("script");
+    tag.src = "/vendor/three.min.js";
+    tag.onload = () => orchPlexusOpen();
+    tag.onerror = () => setStatus("three.min.js is missing from /vendor",
+                                  true);
+    document.head.appendChild(tag);
+    return;
+  }
+  let data;
+  try {
+    data = await (await fetch("/api/orchestrator/asks")).json();
+  } catch (err) { return; }
+  const row = (data.rows || [])[0];
+  if (!row) { setStatus("the orchestrator has nothing to ask"); return; }
+  orchCardHide();
+
+  const tone = row.urgency === "now" ? 0xff7a3c
+    : (row.urgency === "soon" ? 0xffc94a : 0x5fd8a4);
+  const toneCss = "#" + tone.toString(16).padStart(6, "0");
+
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:200;background:#05070c";
+  const canvasHost = el("div", "", "");
+  canvasHost.style.cssText = "position:absolute;inset:0";
+  shade.appendChild(canvasHost);
+  document.body.appendChild(shade);
+
+  const W = () => window.innerWidth;
+  const H = () => window.innerHeight;
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x05070c, 0.0085);
+  const camera = new THREE.PerspectiveCamera(58, W() / H(), 1, 900);
+  camera.position.set(0, 0, 150);
+  const renderer = new THREE.WebGLRenderer({antialias: true, alpha: false});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(W(), H());
+  renderer.setClearColor(0x05070c, 1);
+  canvasHost.appendChild(renderer.domElement);
+
+  /* THE FIELD. Node count is the size of the reserve; the wave speed
+   * rises with how far behind the station is. It is a mood, not a
+   * readout - it says how hard the station is breathing, which is the
+   * thing worth feeling before choosing between three options that all
+   * sound reasonable. */
+  const cupboard = (data.cupboard || []).length;
+  const COUNT = Math.max(70, Math.min(150, 150 - cupboard * 12));
+  const HURRY = row.urgency === "now" ? 1.7
+    : (row.urgency === "soon" ? 1.15 : 0.75);
+  const SPAN = 190, REACH = 34;
+  const pos = new Float32Array(COUNT * 3);
+  const vel = new Float32Array(COUNT * 3);
+  const phase = new Float32Array(COUNT);
+  for (let i = 0; i < COUNT; i++) {
+    pos[i * 3] = (Math.random() - 0.5) * SPAN;
+    pos[i * 3 + 1] = (Math.random() - 0.5) * SPAN * 0.62;
+    pos[i * 3 + 2] = (Math.random() - 0.5) * SPAN * 0.5;
+    vel[i * 3] = (Math.random() - 0.5) * 0.09;
+    vel[i * 3 + 1] = (Math.random() - 0.5) * 0.09;
+    vel[i * 3 + 2] = (Math.random() - 0.5) * 0.06;
+    phase[i] = Math.random() * Math.PI * 2;
+  }
+  const dotGeo = new THREE.BufferGeometry();
+  dotGeo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  const dots = new THREE.Points(dotGeo, new THREE.PointsMaterial({
+    color: tone, size: 2.1, sizeAttenuation: true,
+    transparent: true, opacity: 0.9}));
+  scene.add(dots);
+
+  const CAP = COUNT * 14;
+  const linePos = new Float32Array(CAP * 6);
+  const lineGeo = new THREE.BufferGeometry();
+  lineGeo.setAttribute("position", new THREE.BufferAttribute(linePos, 3));
+  const lines = new THREE.LineSegments(lineGeo, new THREE.LineBasicMaterial({
+    color: tone, transparent: true, opacity: 0.24}));
+  scene.add(lines);
+
+  let t = 0;
+  const step = () => {
+    t += 0.006 * HURRY;
+    for (let i = 0; i < COUNT; i++) {
+      const k = i * 3;
+      pos[k] += vel[k] * HURRY;
+      pos[k + 1] += vel[k + 1] * HURRY;
+      pos[k + 2] += vel[k + 2] * HURRY;
+      /* the undulation: a wave travelling across the field, so the
+       * whole thing breathes rather than jitters */
+      pos[k + 1] += Math.sin(t * 2.1 + pos[k] * 0.02 + phase[i]) * 0.16;
+      const lim = SPAN / 2;
+      if (pos[k] > lim || pos[k] < -lim) vel[k] *= -1;
+      if (pos[k + 1] > lim * 0.62 || pos[k + 1] < -lim * 0.62) {
+        vel[k + 1] *= -1;
+      }
+      if (pos[k + 2] > lim * 0.5 || pos[k + 2] < -lim * 0.5) vel[k + 2] *= -1;
+    }
+    dotGeo.attributes.position.needsUpdate = true;
+    let n = 0;
+    for (let i = 0; i < COUNT && n < CAP; i++) {
+      for (let j = i + 1; j < COUNT && n < CAP; j++) {
+        const dx = pos[i * 3] - pos[j * 3];
+        const dy = pos[i * 3 + 1] - pos[j * 3 + 1];
+        const dz = pos[i * 3 + 2] - pos[j * 3 + 2];
+        if (dx * dx + dy * dy + dz * dz > REACH * REACH) continue;
+        linePos[n * 6] = pos[i * 3];
+        linePos[n * 6 + 1] = pos[i * 3 + 1];
+        linePos[n * 6 + 2] = pos[i * 3 + 2];
+        linePos[n * 6 + 3] = pos[j * 3];
+        linePos[n * 6 + 4] = pos[j * 3 + 1];
+        linePos[n * 6 + 5] = pos[j * 3 + 2];
+        n++;
+      }
+    }
+    lineGeo.setDrawRange(0, n * 2);
+    lineGeo.attributes.position.needsUpdate = true;
+    scene.rotation.y = Math.sin(t * 0.32) * 0.16;
+    scene.rotation.x = Math.cos(t * 0.24) * 0.09;
+    renderer.render(scene, camera);
+    orchPlex.raf = requestAnimationFrame(step);
+  };
+
+  const onSize = () => {
+    camera.aspect = W() / H();
+    camera.updateProjectionMatrix();
+    renderer.setSize(W(), H());
+  };
+  window.addEventListener("resize", onSize);
+
+  /* THE GLASS. */
+  const sheet = el("div", "", "");
+  sheet.style.cssText = "position:absolute;inset:0;display:flex;"
+    + "align-items:center;justify-content:center;padding:22px;"
+    + "overflow:auto";
+  const glass = el("div", "", "");
+  glass.style.cssText = "width:min(620px,94vw);max-height:92vh;overflow:auto;"
+    + "border-radius:15px;padding:20px 22px;backdrop-filter:blur(13px);"
+    + "background:rgba(9,11,17,.74);border:1px solid " + toneCss + "44;"
+    + "box-shadow:0 24px 80px rgba(0,0,0,.75)";
+
+  const bar = el("div", "", "");
+  bar.style.cssText = "display:flex;align-items:center;gap:9px;"
+    + "margin-bottom:11px";
+  const tg = el("span", "", String(row.urgency || "").toUpperCase());
+  tg.style.cssText = "font-size:9px;letter-spacing:.12em;font-weight:800;"
+    + "color:" + toneCss;
+  bar.appendChild(tg);
+  const ttl = el("b", "", "The orchestrator asks");
+  ttl.style.cssText = "font-size:14px;flex:1";
+  bar.appendChild(ttl);
+  const x = el("button", "", "✕");
+  x.onclick = orchPlexusClose;
+  bar.appendChild(x);
+  glass.appendChild(bar);
+
+  const why = el("div", "", row.why || "");
+  why.style.cssText = "font-size:12.5px;line-height:1.6;padding:11px 13px;"
+    + "border-left:3px solid " + toneCss + ";border-radius:0 8px 8px 0;"
+    + "background:rgba(255,255,255,.045);margin-bottom:15px";
+  glass.appendChild(why);
+
+  const picks = {};
+  (row.questions || []).forEach((q, qi) => {
+    const box = el("div", "", "");
+    box.style.cssText = "margin-bottom:15px";
+    const ask = el("div", "", (qi + 1) + ". " + q.ask);
+    ask.style.cssText = "font-size:13px;font-weight:600;margin-bottom:7px;"
+      + "line-height:1.45";
+    box.appendChild(ask);
+    (q.options || []).forEach((o) => {
+      const b = el("button", "", "");
+      b.style.cssText = "display:block;width:100%;text-align:left;"
+        + "margin-bottom:5px;padding:9px 11px;border-radius:8px;"
+        + "font-size:12px;line-height:1.45;cursor:pointer;"
+        + "background:rgba(255,255,255,.04);border:1px solid "
+        + "rgba(255,255,255,.09)";
+      const f = el("div", "", o.face);
+      f.style.fontWeight = "600";
+      b.appendChild(f);
+      if (o.note) {
+        const nn = el("div", "muted", o.note);
+        nn.style.cssText = "font-size:11px;margin-top:3px";
+        b.appendChild(nn);
+      }
+      b.onclick = () => {
+        picks[String(qi)] = o.does;
+        Array.from(box.querySelectorAll("button")).forEach((z) => {
+          z.style.borderColor = "rgba(255,255,255,.09)";
+          z.style.background = "rgba(255,255,255,.04)";
+        });
+        b.style.borderColor = toneCss;
+        b.style.background = toneCss + "22";
+      };
+      box.appendChild(b);
+    });
+    glass.appendChild(box);
+  });
+
+  const send = el("button", "", "Answer the orchestrator");
+  send.style.cssText = "width:100%;padding:11px;border-radius:9px;border:none;"
+    + "font-weight:800;font-size:13px;cursor:pointer;background:" + toneCss
+    + ";color:#0b0d12";
+  send.onclick = async () => {
+    const want = (row.questions || []).length;
+    if (Object.keys(picks).length < want) {
+      send.textContent = "pick one for each of the " + want;
+      return;
+    }
+    send.disabled = true;
+    send.textContent = "applying…";
+    try {
+      const got = await api("/api/orchestrator/asks/"
+        + encodeURIComponent(row.id),
+        {method: "POST", body: JSON.stringify({picks: picks})});
+      send.textContent = "done · " + ((got.did || []).join("; "));
+      setTimeout(() => { orchPlexusClose(); orchToast(); }, 1700);
+    } catch (err) {
+      send.disabled = false;
+      send.textContent = "could not reach the orchestrator";
+    }
+  };
+  glass.appendChild(send);
+  sheet.appendChild(glass);
+  shade.appendChild(sheet);
+
+  shade.addEventListener("click", (e) => {
+    if (e.target === shade || e.target === sheet) orchPlexusClose();
+  });
+  orchPlex = {shade, renderer, lines, dots, onSize, raf: 0};
+  step();
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && orchPlex) orchPlexusClose();
+});
+
 
 async function orchBell() {
   let data;
