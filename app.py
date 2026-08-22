@@ -11578,8 +11578,14 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             # whole sheet exists to make: the room that would have gone
             # into a round that could not finish goes into one that can.
             try:
-                if commit_for(kind) == "prerecord":
+                _said = commit_for(kind)
+                if _said == "prerecord":
                     continue
+                # #1087: committed to an emergency take - price it as
+                # one, so the window it actually fits is the window it
+                # is offered.
+                if _said == "piper":
+                    cost = cost_on_piper(kind)
             except Exception:  # noqa: BLE001
                 pass
             _voice_only = shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST
@@ -12638,6 +12644,13 @@ def voice_engine_for(voice: str, who: str = "") -> str:
     # only for the seats named in SPEED_SAFE_SEATS.
     try:
         if who and speed_seat_to_piper(who):
+            return "piper"
+        # #1087: ...and a segment the board has COMMITTED to an
+        # emergency take renders on piper whatever the stop-gap says,
+        # because that commitment is the only reason it was attempted
+        # at all.
+        if who and commit_for(str(who)) == "piper" and may_take_on_piper(
+                str(who)):
             return "piper"
     except Exception:  # noqa: BLE001
         pass
@@ -24152,6 +24165,28 @@ def commit_board(ahead: int = 10, fresh: bool = False) -> list[dict[str, Any]]:
                 claimed += cost
                 rows.append(row)
                 continue
+            # #1087: BEFORE ANYTHING IS CUT - would it fit with piper
+            # voices? The stop-gap changes which engine a line renders
+            # on; it never changed what the station believes a segment
+            # COSTS, so a painting round priced at 362s refused to start
+            # in a 165s window and became a hole while the engine that
+            # could have made it sat idle.
+            #
+            # A repeat still wins if there is one: it was made properly.
+            # This is only ever measured against silence.
+            _rough = cost_on_piper(prep)
+            if (not (supply.get(prep) or []) and may_take_on_piper(prep)
+                    and _rough <= room):
+                row["commit"] = "piper"
+                row["cost"] = round(_rough, 1)
+                row["why"] = (f"no time for a proper take ({int(cost)}s) "
+                              f"and nothing on the shelf - but piper "
+                              f"voices bring it to about {int(_rough)}s, "
+                              f"which fits {int(room)}s. Not the best "
+                              "idea; better than no segment")
+                claimed += _rough
+                rows.append(row)
+                continue
             # Not enough time. Is there anything in the cupboard at all,
             # rested or not?
             held = len(supply.get(prep) or [])
@@ -24767,6 +24802,59 @@ def surplus() -> float:
     return round(min(1.0, (depth - SURPLUS_FROM) / (1.0 - SURPLUS_FROM)), 3)
 
 
+# --- THE EMERGENCY TAKE (#1087) ---------------------------------------
+# What a road costs when its lines are rendered on piper instead of a
+# clone. Deliberately conservative: the honest arithmetic suggests
+# nearer 0.40, but nothing on this box has ever built one on purpose,
+# so the first estimate leans pessimistic and every take made this way
+# is measured against its own ledger key until the guess is replaced.
+PIPER_COST_GUESS = 0.60
+
+
+def piper_key(kind: str) -> str:
+    """The ledger key an emergency take is measured against, so the
+    scheduler learns what one really costs instead of trusting me."""
+    return f"{str(kind)}:piper"
+
+
+def cost_on_piper(kind: str) -> float:
+    """What this road costs with piper voices - measured once there are
+    enough takes to trust, and an estimate off the clone cost until."""
+    try:
+        key = piper_key(kind)
+        task_ledger_load()
+        got = (_TASK_LEDGER.get(key) or {}).get("secs") or []
+        if len(got) >= TASK_LEDGER_TRUST:
+            return max(1.0, float(task_cost(key)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return max(1.0, float(task_cost(kind)) * PIPER_COST_GUESS)
+    except Exception:  # noqa: BLE001
+        return 45.0
+
+
+def piper_would_save(kind: str) -> float:
+    """Seconds an emergency take saves over a proper one."""
+    try:
+        return max(0.0, float(task_cost(kind)) - cost_on_piper(kind))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def may_take_on_piper(kind: str) -> bool:
+    """#1087: is an emergency take allowed for this road at all?
+
+    Only the seats nobody has an ear for - the same set the stop-gap
+    switches, which is the same set that already reuses its footage.
+    Never the presenters."""
+    try:
+        prep = str(kind or "")
+        return prep in SPEED_SAFE_SEATS or prep in SHELF_REUSABLE
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def surplus_topic() -> dict[str, Any]:
     """#1084: a topic out of the operator's own bank, when there is room
     to do it justice.
@@ -24822,6 +24910,16 @@ def surplus_state() -> dict[str, Any]:
         "callers_loud": got > 0.15,
         "callers_unhinged": got > 0.55,
         "topics_held": len(read_bombshells() or []),
+        # #1087: what an emergency take is currently believed to cost,
+        # and whether that is measured yet or still my arithmetic.
+        "piper_takes": {
+            k: {"clone": round(float(task_cost(k) or 0), 1),
+                "piper": round(cost_on_piper(k), 1),
+                "saves": round(piper_would_save(k), 1),
+                "measured": bool(
+                    len((_TASK_LEDGER.get(piper_key(k)) or {}).get("secs")
+                        or []) >= TASK_LEDGER_TRUST)}
+            for k in ("gallery", "ad", "manager", "news", "caller")},
         "say": (f"the station is {int(got * 100)}% into its surplus - "
                 f"{int((1.0 + 0.8 * got - 1) * 100)}% more material per "
                 f"swath, {2 + int(round(got * 2))} crystal passages, "
