@@ -57787,6 +57787,52 @@ def _looks_meta(said: str) -> bool:
         return False
 
 
+# #1063: THE TINT'S SHARE OF THE STATION'S MODEL TIME.
+#
+# Two permits on the gate is 7,200 model-seconds an hour. This is the
+# fraction of that the rewrite may spend. A budget rather than a
+# threshold because a threshold is either on or off and both are wrong:
+# measured, the depth threshold #1047 used was on 100% of the time.
+TINT_SHARE = 0.30
+_TINT_SPEND: list[float] = [0.0, 0.0]        # [hour mark, seconds spent]
+
+
+def tint_budget() -> float:
+    """Model-seconds the rewrite may spend in one hour."""
+    try:
+        got = orch_policy("tint_share")
+        share = (max(0.0, min(0.9, float(got)))
+                 if got is not None else TINT_SHARE)
+    except Exception:  # noqa: BLE001
+        share = TINT_SHARE
+    return 2.0 * 3600.0 * share
+
+
+def tint_spent() -> float:
+    """What it has spent this hour, resetting on the hour."""
+    mark = float(int(time.time() // 3600))
+    if _TINT_SPEND[0] != mark:
+        _TINT_SPEND[0] = mark
+        _TINT_SPEND[1] = 0.0
+    return _TINT_SPEND[1]
+
+
+def tint_spend_note(seconds: float) -> None:
+    """Charge the rewrite for what it just used."""
+    try:
+        tint_spent()
+        _TINT_SPEND[1] += max(0.0, float(seconds or 0))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tint_budget_left() -> float:
+    try:
+        return max(0.0, tint_budget() - tint_spent())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def tint_pressure() -> str:
     """#1045: is the station in no state to afford a rewrite?
 
@@ -57810,21 +57856,18 @@ def tint_pressure() -> str:
             return "the rooms are calling for relief"
     except Exception:  # noqa: BLE001
         pass
+    # #1063: THE BUDGET, NOT A THRESHOLD. The reserve-depth test that
+    # used to be here read below its threshold in 153 of 153 measured
+    # samples - it never cleared once and it never would, because the
+    # reserve is low for a structural reason the tint cannot fix. A
+    # share of the hour is never wholly on or wholly off: the rewrite
+    # cannot starve the desk because its ceiling is fixed, and it cannot
+    # be starved because that ceiling is also its floor.
     try:
-        depth = float(box_depth())
-    except Exception:  # noqa: BLE001
-        return ""                       # cannot tell; do not stand in the way
-    # Living hand to mouth. Every model second belongs to getting words
-    # written, and a rewrite is the most postponable thing on the
-    # station. 0.35 rather than something smaller because the reserve
-    # sat at 0.22-0.29 for the whole outage this was written for.
-    if depth < 0.35:
-        return "the reserve is too thin to spend a rewrite on"
-    # Comfortable but not deep: the rewrite happens, and it gets out of
-    # the way the moment both slots are wanted by somebody else.
-    try:
-        if depth < 0.60 and _OLLAMA_GATE.locked():
-            return "both model slots are wanted and the reserve is not deep"
+        left = tint_budget_left()
+        if left <= 0:
+            return (f"the rewrite has spent its {int(tint_budget())}s "
+                    "share of the hour")
     except Exception:  # noqa: BLE001
         pass
     return ""
@@ -58012,7 +58055,14 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         # Something is waiting on the desk. The tint is the one thing on
         # the station that can always be skipped - what it protects is
         # style, and dead air is not a style.
-        if tint_should_stop():
+        # #1063: ...and it SAYS SO. All seven of this function's early
+        # returns were silent, so a road that never tinted anything
+        # looked identical to one that was never asked.
+        _hold = tint_should_stop()
+        if _hold:
+            pipeline_log("crystal",
+                         f"(#1063) {why or 'a line'} went out untinted: "
+                         f"{_hold}")
             return said
         dj = dj_settings()
         chunks = crystal_stanzas(2, CRYSTAL_STANZA_LINES)
@@ -58062,6 +58112,7 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
                         keep=keep)
                     done.append(str(got or bit).strip())
                 out = " ".join(d for d in done if d).strip()
+        tint_spend_note(time.monotonic() - started)               # #1063
         out = " ".join(str(out or "").split()).strip()
         if len(out) < TINT_TURN_FLOOR // 2:
             return said
@@ -58208,6 +58259,21 @@ async def crystal_tint(script: str, kind: str = "",
             turns = list(banter_turns(text) or [])
         except Exception:  # noqa: BLE001
             turns = []
+        # #1063: THE PRESSURE CHECK, WHERE BOTH PATHS PASS THROUGH IT.
+        #
+        # It used to live inside the turn-by-turn branch below, so a
+        # whole-round tint fell straight past it to a single ask that
+        # checked nothing. The brake therefore stopped the CHEAP,
+        # high-quality, non-urgent banked rewrites and left the
+        # EXPENSIVE in-front-of-the-listener ones running - backwards
+        # from every word of its own reasoning. Measured: turn-by-turn
+        # 0/hour, whole-round 19.6/hour.
+        _hold = tint_should_stop()
+        if _hold:
+            out["why"] = f"{_hold} - the round stands as it was written"
+            pipeline_log("crystal", f"the rewrite stood down: {_hold} "
+                                    "(#1063)")
+            return out
         # #1038: `whole_only` is how a LIVE road affords this at all.
         # Turn by turn is the better tint and it is twelve model visits;
         # in front of a listener that is not a tint, it is dead air. One
@@ -58381,12 +58447,18 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         out["ok"] = True
         out["script"] = tinted
+        tint_spend_note(float(out.get("ms") or 0) / 1000.0)      # #1063
         # #1042: what the round MADE of each passage it was shown.
         for _c in chunks:
             chunk_answer(str(_c.get("text") or ""), tinted,
                          kind or "a banked round")
+        # #1063: the tag LEADS. Pipeline text is cut at 200 characters
+        # and the world description ran long, so "(#1006)" was always
+        # truncated away - which made the events invisible to anyone
+        # grepping for them, including me.
         pipeline_log("speakbox",
-                     f"a round was tinted through {world or 'the crystal'} - "
+                     f"(#1006) a round was tinted through "
+                     f"{world or 'the crystal'} - "
                      f"{len(chunks)} passage(s) of its own material in the "
                      f"second prompt, {out['ms']}ms, {len(text)} chars in "
                      f"and {len(tinted)} out. Both versions are kept (#1006)")
