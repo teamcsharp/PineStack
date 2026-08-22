@@ -34744,6 +34744,81 @@ def _speakbox_runs(said: str, words: int = 16) -> list[str]:
             if len(parts) - at >= 6]
 
 
+def _looks_like_verse(para: str) -> bool:
+    """#1037: is this paragraph written in LINES rather than sentences?
+
+    Narrow on purpose. Prose wrapped at eighty columns has short lines
+    too, but it punctuates: its lines end in commas and full stops
+    because they are pieces of sentences. Verse does not - a bar ends
+    where the bar ends. So: several lines, most of them short, and most
+    of them ending on a bare word.
+
+    Getting this wrong in the safe direction costs nothing: a verse
+    treated as prose is what happens today."""
+    try:
+        rows = [r.strip() for r in str(para or "").split("\n")]
+        rows = [r for r in rows if r]
+        if len(rows) < 3:
+            return False
+        # #1037: LENGTH IS THE DISCRIMINATOR, not shortness alone.
+        # Prose wrapped at eighty columns also has short unpunctuated
+        # lines - measured, a three-line wrapped paragraph passed the
+        # first version of this test. What separates them is that wrapped
+        # prose runs NEAR THE WRAP WIDTH on every line by construction,
+        # while a verse line ends where the bar ends and varies wildly.
+        # #1037: VARIANCE IS THE DISCRIMINATOR.
+        #
+        # Not shortness: prose wrapped at seventy columns has short lines
+        # too, and the first version of this test called it verse. Not
+        # punctuation either: "No corners. / No shadows. / Just white
+        # swallowing white." is the lyric #868 was written about, and
+        # every line of it ends in a full stop.
+        #
+        # What no wrapped prose can fake is IRREGULARITY. A wrapper fills
+        # to the same width every time by construction, so its lines
+        # cluster hard around the margin; a verse line ends where the bar
+        # ends and scatters. Measured on real samples: wrapped prose
+        # 0.02-0.05, transcripts 0.04, verse 0.24-0.39.
+        widths = [len(r) for r in rows]
+        mean = sum(widths) / len(widths)
+        if mean > 70 or mean < 4:
+            return False
+        if max(widths) > 200:
+            return False
+        spread = (sum((w - mean) ** 2 for w in widths) / len(widths)) ** 0.5
+        return (spread / mean) >= 0.15
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _verse_lines(para: str, most: int = 200) -> list[str]:
+    """#1037: the lines of a verse, kept whole and in order.
+
+    Very short lines are carried onto the next one - "Uh." on its own is
+    not worth saying and not worth embedding - but a carry NEVER crosses
+    more than one join, so a couplet stays a couplet and the rhyme still
+    lands at the end of what is stored."""
+    out: list[str] = []
+    carry = ""
+    for row in str(para or "").split("\n"):
+        said = spoken_text(row).strip(" -*>\"'")
+        if not said:
+            continue
+        if carry:
+            said = carry + " / " + said
+            carry = ""
+        if len(said) < 24:
+            carry = said
+            continue
+        out.append(said[:most])
+    if carry:
+        if out:
+            out[-1] = (out[-1] + " / " + carry)[:most]
+        elif len(carry) >= 12:
+            out.append(carry)
+    return out
+
+
 def speakbox_lines(text: str) -> list[str]:
     """Every sayable line in a document.
 
@@ -34751,6 +34826,14 @@ def speakbox_lines(text: str) -> list[str]:
     Headings, images and the transcript's own timestamps are not dialogue."""
     out: list[str] = []
     for para in str(text or "").split("\n\n"):
+        # #1037: VERSE KEEPS ITS LINES. The flatten below is right for
+        # prose and fatal for lyrics - see _looks_like_verse. A bar ends
+        # where the bar ends, and that is exactly where the rhyme is.
+        if _looks_like_verse(para):
+            got = _verse_lines(_SPEAKBOX_STAMP.sub("", para))
+            if got:
+                out.extend(got)
+                continue
         flat = _SPEAKBOX_STAMP.sub("", " ".join(para.split()))
         if not flat or flat.startswith(("#", "![", "|", "```")):
             continue
@@ -51001,8 +51084,15 @@ def writing_profile() -> dict[str, float]:
 # asked to be able to see which. Kept as constants because the strings
 # are written in two other places and a typo would silently stop the
 # highlighting rather than break anything loudly.
-TINT_MARK_LINES = "HOW THAT WORLD ACTUALLY TALKS"
-TINT_MARK_FLAVOUR = "Let this flavour bleed all the way through it"
+# #1037: these are matched against the prompt to colour the desk's
+# tinted column, and they had gone stale - every rewrite of the second
+# prompt left them behind, so EVERY second-pass call showed `tinted: ""`
+# in the operator's own instrumentation while the tint was running fine.
+# A marker matched against text that is edited often has to be a phrase
+# the text cannot lose, so it is the one line both prompts are built
+# around: the crystal's own writing.
+TINT_MARK_LINES = "HOW THAT WRITER WRITES"
+TINT_MARK_FLAVOUR = "HOW THAT WORLD ACTUALLY TALKS"
 
 
 async def ask_model(prompt: str, limit: int = 300,
@@ -55831,6 +55921,25 @@ async def crystal_tint(script: str, kind: str = "",
                  "them; the rest differ only in the line being rewritten "
                  "and the line before it.\n\n" + _first_prompt[0])
                 if _first_prompt else armed)
+            # #1037: and it has to have actually CHANGED something. Two
+            # rounds were sitting in the reserve flagged ok/use=tinted
+            # with all fifteen and all twelve of their turns byte
+            # identical to the plain version - a "tinted version" that is
+            # a copy of the original is worse than none, because it
+            # occupies the slot where a real one would go.
+            _moved = 0
+            try:
+                _a = [x.strip() for x in text.split("\n") if x.strip()]
+                _b = [x.strip() for x in tinted.split("\n") if x.strip()]
+                _moved = sum(1 for x, y in zip(_a, _b) if x != y)
+            except Exception:  # noqa: BLE001
+                _moved = 1
+            out["turns_changed"] = _moved
+            if not _moved:
+                out["why"] = ("every turn came back word for word - "
+                              "nothing was tinted, so there is one "
+                              "version of this round and not two")
+                return out
             if tinted and " ".join(tinted.split()) != " ".join(text.split()):
                 out["ok"] = True
                 out["script"] = tinted
@@ -61613,6 +61722,13 @@ async def api_tint_try(
         "passages": list(got.get("chunks") or []),
         "kept_verbatim": list(got.get("keep") or []),
         "armed": str(got.get("armed") or ""),
+        # #1037: THE PROMPT AS SENT. `armed` is the whole-round prompt,
+        # and the whole-round path is only taken for rounds over 22
+        # turns - which is almost none of them. So the tuning tool was
+        # showing a prompt the station does not send and omitting the one
+        # it does.
+        "prompt": str(got.get("prompt") or ""),
+        "per_turn": bool(got.get("per_turn")),
         "identical_for": same,
         "model": str(body.get("model")
                      or dj_settings().get("crystal_tint_model")
