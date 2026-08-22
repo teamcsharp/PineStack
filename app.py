@@ -842,6 +842,9 @@ DEFAULT_DJ = {
     # rest; below about 400ms it is the native behaviour again, and 0
     # switches them off entirely.
     "tip_delay_ms": 3000,
+    # #1017: the lyrics eviction (#995) is OFF unless it is switched on.
+    # See speakbox_evict_lyrics() for why.
+    "speakbox_evict_lyrics": False,
     # #1006: TINTING AS A SECOND PASS, not as a line in the first prompt.
     #
     # "On the base level we affect things with the system prompts... Then
@@ -1450,6 +1453,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
             "box_volume_control", DEFAULT_DJ["box_volume_control"])),
         "tip_delay_ms": max(0, min(10000, int(float(          # #1011/#1012
             raw_dj.get("tip_delay_ms", DEFAULT_DJ["tip_delay_ms"]) or 0)))),
+        "speakbox_evict_lyrics": bool(raw_dj.get(                   # #1017
+            "speakbox_evict_lyrics",
+            DEFAULT_DJ["speakbox_evict_lyrics"])),
         "crystal_tint_pass": bool(raw_dj.get(                       # #1006
             "crystal_tint_pass", DEFAULT_DJ["crystal_tint_pass"])),
         "crystal_tint_chunks": max(0, min(12, int(float(            # #1006
@@ -4077,6 +4083,18 @@ async def _startup_tidy() -> None:
     not happen, and #995's eviction reported nothing twice over. They are
     idempotent and cost a directory listing, so the honest place for them
     is the process coming up."""
+    # #1017: the vault first, and every time, so a restart is a backup
+    # rather than a risk. force=True because the timer means nothing on a
+    # process that has only just started.
+    try:
+        got = await asyncio.to_thread(speakbox_vault_sync, True)
+        pipeline_log("speakbox",
+                     f"the vault holds {speakbox_vault_state()['documents']} "
+                     f"speakbox document(s) at {SPEAKBOX_VAULT} - "
+                     f"{got.get('copied') or 0} copied this sweep, and "
+                     "nothing is ever removed from there (#1017)")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", f"the vault sweep failed: {type(exc).__name__}")
     for job in (crystals_tidy, speakbox_evict_lyrics):
         try:
             got = await asyncio.to_thread(job)
@@ -18614,6 +18632,16 @@ async def hold_shelf_groomer() -> None:
     deaf, and only its own restart button cures that."""
     while True:
         await asyncio.sleep(60)
+        # #1017: and the vault gets its sweep. It throttles itself to
+        # VAULT_EVERY, so asking every minute costs a clock comparison
+        # and means a document dropped into the folder is copied out of
+        # harm's way within ten minutes without anybody doing anything.
+        try:
+            got = await asyncio.to_thread(speakbox_vault_sync, False)
+            if got.get("copied"):
+                await speakbox_reindex()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             if _BOX_HOLD:
                 _hold_trim()
@@ -35314,6 +35342,27 @@ def speakbox_evict_lyrics() -> int:
     speakbox_reindex already forgets a document that has left the folder,
     so the vectors go with them on the next pass without anything else
     being asked to happen."""
+    # #1017: "I want you to make sure that the Pine box has a backup
+    # system ensuring that speakerbox documents are never deleted ever
+    # again."
+    #
+    # This pass is the only thing that has ever taken a document off that
+    # shelf, and it was asked for at #995 - but the operator has since
+    # reversed that plainly, twice, and has had the three files put back
+    # by hand. Leaving it armed would move them straight back out on the
+    # next restart, which is the exact failure the request is about.
+    #
+    # So it is OFF unless it is switched on. It is not deleted, because
+    # the reason for it was real: the pair were reading
+    # "furielwrath62tidalwaveofrage - lyrics" on air as studio material.
+    # If that starts happening again, `speakbox_evict_lyrics` in the
+    # settings turns it back on - and the vault below means even then
+    # nothing is ever actually lost.
+    try:
+        if not bool(dj_settings().get("speakbox_evict_lyrics", False)):
+            return 0
+    except Exception:  # noqa: BLE001
+        return 0
     moved = 0
     try:
         for path in sorted(SPEAKBOX_DIR.glob("*.md")):
@@ -35347,6 +35396,172 @@ def speakbox_evict_lyrics() -> int:
     except Exception:  # noqa: BLE001
         pass
     return moved
+
+
+# #1017: THE VAULT.
+#
+# "I need them examined, analyzed, assimilated into the crystal, and then
+# of course backed up to ensure that they are never deleted ever again."
+#
+# Deliberately OUTSIDE data/speakbox, and that is the whole design. That
+# folder is its own mount inside the container - which is why Explorer
+# shows it empty over the share and why the operator has twice believed
+# his documents were gone. The vault sits in data/ proper, on the share
+# the operator can actually see, so a copy of every document he has ever
+# put in the speakbox is visible from Windows without going through the
+# app at all.
+#
+# IT NEVER DELETES. A document that disappears from the shelf stays in
+# the vault and is marked missing, with the date it went. That is what
+# makes it a backup rather than a mirror: a mirror of a folder somebody
+# emptied is an empty folder.
+SPEAKBOX_VAULT = data_path("speakbox_vault")
+SPEAKBOX_VAULT_MANIFEST = SPEAKBOX_VAULT / "_manifest.json"
+VAULT_EVERY = 600.0                     # a sweep at most this often
+_VAULT_AT = [0.0]
+
+
+def _vault_manifest() -> dict[str, Any]:
+    try:
+        got = json.loads(SPEAKBOX_VAULT_MANIFEST.read_text(encoding="utf-8"))
+        if isinstance(got, dict):
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return {"documents": {}}
+
+
+def _vault_manifest_save(store: dict[str, Any]) -> None:
+    try:
+        SPEAKBOX_VAULT.mkdir(parents=True, exist_ok=True)
+        tmp = SPEAKBOX_VAULT_MANIFEST.with_suffix(".tmp")
+        tmp.write_text(json.dumps(store, indent=1), encoding="utf-8")
+        tmp.replace(SPEAKBOX_VAULT_MANIFEST)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def speakbox_vault_sync(force: bool = False) -> dict[str, Any]:
+    """#1017: copy anything new or changed into the vault. Never delete.
+
+    Runs on a timer and at startup. A copy rather than a move, and across
+    a device boundary on purpose - shutil.copy2 handles that where
+    rename cannot, which is the same EXDEV that made the eviction awkward
+    in the first place."""
+    out = {"at": time.time(), "copied": 0, "kept": 0, "missing": 0,
+           "bytes": 0, "why": ""}
+    try:
+        now = time.time()
+        if not force and now - float(_VAULT_AT[0] or 0) < VAULT_EVERY:
+            out["why"] = "swept recently"
+            return out
+        _VAULT_AT[0] = now
+        SPEAKBOX_VAULT.mkdir(parents=True, exist_ok=True)
+        store = _vault_manifest()
+        docs = store.setdefault("documents", {})
+        seen: set[str] = set()
+        import shutil as _sh
+        for path in sorted(SPEAKBOX_DIR.glob("*.md")):
+            if not path.is_file():
+                continue
+            name = path.name
+            seen.add(name)
+            try:
+                stat = path.stat()
+                raw = path.read_bytes()
+            except Exception:  # noqa: BLE001
+                continue
+            digest = hashlib.sha1(raw).hexdigest()
+            row = docs.setdefault(name, {"first": now})
+            out["bytes"] += len(raw)
+            if str(row.get("sha1") or "") == digest and (
+                    SPEAKBOX_VAULT / name).exists():
+                row["seen"] = now
+                row.pop("missing_since", None)
+                out["kept"] += 1
+                continue
+            try:
+                _sh.copy2(str(path), str(SPEAKBOX_VAULT / name))
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", f"could not vault {name}: "
+                                     f"{type(exc).__name__}"[:120])
+                continue
+            row.update({"sha1": digest, "bytes": int(stat.st_size),
+                        "seen": now, "copied": now})
+            row.pop("missing_since", None)
+            out["copied"] += 1
+        # Anything the vault knows that is no longer on the shelf.
+        for name, row in docs.items():
+            if name in seen:
+                continue
+            row.setdefault("missing_since", now)
+            out["missing"] += 1
+        store["at"] = now
+        store["folder"] = str(SPEAKBOX_DIR)
+        store["vault"] = str(SPEAKBOX_VAULT)
+        _vault_manifest_save(store)
+        if out["copied"]:
+            pipeline_log("speakbox",
+                         f"{out['copied']} speakbox document(s) copied into "
+                         f"the vault at {SPEAKBOX_VAULT} - nothing is ever "
+                         "removed from there, so a document put in the "
+                         "folder cannot be lost (#1017)")
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"{type(exc).__name__}: {exc}"[:160]
+    return out
+
+
+def speakbox_vault_state() -> dict[str, Any]:
+    """#1017: what the vault is holding, and what it is holding that the
+    shelf no longer has."""
+    store = _vault_manifest()
+    docs = store.get("documents") or {}
+    missing = [{"name": n, "since": float(r.get("missing_since") or 0),
+                "bytes": int(r.get("bytes") or 0)}
+               for n, r in docs.items() if r.get("missing_since")]
+    missing.sort(key=lambda r: -r["since"])
+    held = len(docs)
+    return {
+        "vault": str(SPEAKBOX_VAULT),
+        "folder": str(SPEAKBOX_DIR),
+        "documents": held,
+        "bytes": sum(int((r or {}).get("bytes") or 0) for r in docs.values()),
+        "missing": missing,
+        "swept": float(store.get("at") or 0),
+        "say": (f"{held} document(s) in the vault"
+                + (f", {len(missing)} of which are no longer on the shelf"
+                   if missing else " and every one of them is on the shelf")),
+    }
+
+
+def speakbox_vault_restore(names: list[str] | None = None) -> list[str]:
+    """#1017: put a vaulted document back on the shelf. Never overwrites
+    a document that is already there."""
+    back: list[str] = []
+    try:
+        import shutil as _sh
+        store = _vault_manifest()
+        docs = store.get("documents") or {}
+        want = set(names or []) or {n for n, r in docs.items()
+                                    if r.get("missing_since")}
+        for name in sorted(want):
+            src = SPEAKBOX_VAULT / name
+            dest = SPEAKBOX_DIR / name
+            if not src.is_file() or dest.exists():
+                continue
+            try:
+                _sh.copy2(str(src), str(dest))
+                back.append(name)
+                (docs.get(name) or {}).pop("missing_since", None)
+            except Exception:  # noqa: BLE001
+                continue
+        if back:
+            _vault_manifest_save(store)
+            pipeline_log("speakbox", f"{len(back)} document(s) put back on "
+                         "the studio shelf out of the vault (#1017)")
+    except Exception:  # noqa: BLE001
+        pass
+    return back
 
 
 async def speakbox_reindex(force: bool = False,
@@ -60169,6 +60384,61 @@ def glyphy_state() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         out["console"] = []
     return out
+
+
+@app.get("/api/speakbox/vault")
+async def api_vault_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1017: what the vault is holding, where it is, and anything it has
+    that the studio shelf no longer does."""
+    require_read_auth(authorization)
+    return speakbox_vault_state()
+
+
+@app.post("/api/speakbox/vault/sweep")
+async def api_vault_sweep(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1017: copy anything new or changed into the vault now, and put
+    what came in through the vector index so it is analysed as well as
+    kept. The sweep runs on its own timer as well."""
+    require_auth(authorization)
+    got = await asyncio.to_thread(speakbox_vault_sync, True)
+    # "examined, analyzed, assimilated" - a document that has just
+    # arrived is embedded so the show can actually draw on it, rather
+    # than sitting in a folder nobody has read.
+    if got.get("copied"):
+        try:
+            await speakbox_reindex()
+            got["reindexed"] = True
+        except Exception as exc:  # noqa: BLE001
+            got["reindexed"] = False
+            got["why"] = f"{type(exc).__name__}: {exc}"[:140]
+    return {**got, "state": speakbox_vault_state()}
+
+
+@app.post("/api/speakbox/vault/restore")
+async def api_vault_restore(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1017: put vaulted documents back on the studio shelf. With no
+    names, everything the vault holds that the shelf has lost."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    names = [str(n) for n in (body.get("names") or []) if n]
+    back = await asyncio.to_thread(speakbox_vault_restore, names)
+    if back:
+        try:
+            await speakbox_reindex()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"restored": back, "state": speakbox_vault_state()}
 
 
 @app.get("/api/glyphy")
