@@ -6290,127 +6290,180 @@ function wkRoundPaper(r) {
   const d = document.createElement("div");
   d.id = "wkRoundPaper";
   d.style.cssText = "position:fixed;left:50%;top:50%;"
-    + "transform:translate(-50%,-50%);width:min(760px,94vw);max-height:86vh;"
+    + "transform:translate(-50%,-50%);width:min(820px,94vw);max-height:86vh;"
     + "overflow:auto;z-index:300;background:#070c12;border:1px solid #24384a;"
     + "border-radius:10px;padding:12px 14px;box-shadow:0 20px 60px #000c";
-  const head = document.createElement("div");
-  head.style.cssText = "display:flex;gap:8px;align-items:baseline;margin-bottom:8px";
-  const h = document.createElement("b");
-  h.textContent = "how this round was written";
-  h.style.cssText = "flex:1;font-size:13px;color:#9fd8ff";
-  const x = document.createElement("button");
-  x.textContent = "\u2715";
-  x.style.cssText = "font-size:11px;padding:2px 8px;cursor:pointer";
+  const mk = (tag, css, text) => {
+    const n = document.createElement(tag);
+    if (css) n.style.cssText = css;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const head = mk("div", "display:flex;gap:8px;align-items:baseline;"
+    + "margin-bottom:8px");
+  head.appendChild(mk("b", "flex:1;font-size:13px;color:#9fd8ff",
+    "how this round was written"));
+  const x = mk("button", "font-size:11px;padding:2px 8px;cursor:pointer",
+    "✕");
   x.onclick = () => d.remove();
-  head.appendChild(h); head.appendChild(x);
+  head.appendChild(x);
   d.appendChild(head);
+
   const desk = r.desk || {};
-  const chips = document.createElement("div");
-  chips.style.cssText = "display:flex;flex-wrap:wrap;gap:5px;margin-bottom:8px";
+  const tint = r.tint || {};
+  const tinted = !!(r.script_plain && r.script_tinted);
+
+  /* The chips: what this round cost, whichever pass you are looking at. */
+  const chips = mk("div", "display:flex;flex-wrap:wrap;gap:5px;"
+    + "margin-bottom:8px");
   [["written for", r["for"] || "booth rounds"],
-   ["model", desk.model || "\u2014"],
-   ["took", desk.ms ? Math.round(desk.ms / 100) / 10 + "s" : "\u2014"],
-   ["temperature", desk.temp == null ? "\u2014" : String(desk.temp)],
-   ["context", desk.num_ctx ? String(desk.num_ctx) : "\u2014"]
+   ["model", desk.model || "—"],
+   ["first pass", desk.ms ? Math.round(desk.ms / 100) / 10 + "s" : "—"],
+   ["tinting pass", tint.ms ? Math.round(tint.ms / 100) / 10 + "s" : "—"],
+   ["temperature", desk.temp == null ? "—" : String(desk.temp)],
+   ["context", desk.num_ctx ? String(desk.num_ctx) : "—"]
   ].forEach((kv) => {
-    const c = document.createElement("span");
-    c.style.cssText = "background:#0e1826;border:1px solid #24435f;"
-      + "border-radius:12px;padding:2px 9px;font-size:10px;color:#c8dcef";
-    c.textContent = kv[0] + ": " + kv[1];
-    chips.appendChild(c);
+    chips.appendChild(mk("span", "background:#0e1826;border:1px solid "
+      + "#24435f;border-radius:12px;padding:2px 9px;font-size:10px;"
+      + "color:#c8dcef", kv[0] + ": " + kv[1]));
   });
   d.appendChild(chips);
-  const part = (title, body) => {
-    const text = String(body || "").trim();
-    if (!text) return;
-    const lab = document.createElement("div");
-    lab.textContent = title;
-    lab.style.cssText = "font-size:9px;letter-spacing:.06em;opacity:.75;"
-      + "margin:8px 0 3px;color:#7fb0c9";
-    d.appendChild(lab);
-    const pre = document.createElement("pre");
-    pre.textContent = text;
-    pre.style.cssText = "white-space:pre-wrap;word-break:break-word;"
-      + "font-size:10.5px;line-height:1.5;margin:0;padding:7px 9px;"
-      + "background:#05090f;border:1px solid #1b2c3c;border-radius:6px;"
-      + "max-height:34vh;overflow:auto;color:#c8d6e4";
-    d.appendChild(pre);
-  };
-  part("THE SYSTEM PROMPT THAT WAS ARMED", desk.armed);
-  part("WHAT THE SCHEDULE ASKED FOR", desk.sched);
-  part("THE PROMPT AS SENT", desk.prompt);
-  part("WHAT CAME BACK", desk.script || r.script);
 
-  /* THE BEFORE AND AFTER, in the window the operator is already in.
-   *
-   * The two thumbs on the reserve row are the way to CHOOSE; this is the
-   * way to READ. "How this round was written" is not finished at the
-   * first pass when there was a second one, and putting the comparison
-   * anywhere other than the paperwork means looking in two places to
-   * answer one question.
-   *
-   * Side by side where the window is wide enough, stacked where it is
-   * not, with the two scripts scrolling together. */
-  if (r.script_plain && r.script_tinted) {
-    const lab = document.createElement("div");
-    lab.textContent = "BEFORE AND AFTER THE TINT"
-      + (r.tint && r.tint.world ? " — " + r.tint.world : "");
-    lab.style.cssText = "font-size:9px;letter-spacing:.06em;opacity:.75;"
-      + "margin:12px 0 3px;color:#7fb0c9";
-    d.appendChild(lab);
-    const pair = document.createElement("div");
-    pair.style.cssText = "display:flex;gap:8px;flex-wrap:wrap";
-    [["as written", r.script_plain, "plain", "#4a6d8a"],
-     ["tinted", r.script_tinted, "tinted", "#c8a6ff"]].forEach((col) => {
-      const side = document.createElement("div");
-      side.style.cssText = "flex:1 1 300px;min-width:0";
-      const h = document.createElement("div");
-      const on = String(r.use || "tinted") === col[2];
-      h.textContent = col[0] + (on ? "  ✓ this one goes out" : "");
-      h.style.cssText = "font-size:9.5px;margin-bottom:3px;color:"
-        + (on ? "#7ce8a9" : "#8ba0b5");
-      side.appendChild(h);
-      const pre = document.createElement("pre");
-      pre.textContent = String(col[1] || "");
-      pre.style.cssText = "white-space:pre-wrap;word-break:break-word;"
-        + "font-size:10.5px;line-height:1.5;margin:0;padding:7px 9px;"
-        + "background:#05090f;border:1px solid " + col[3]
-        + ";border-radius:6px;max-height:40vh;overflow:auto;color:#c8d6e4";
-      side.appendChild(pre);
-      const use = document.createElement("button");
-      use.textContent = on ? "in use" : "✓ use this one";
-      use.disabled = on;
-      use.style.cssText = "margin-top:5px;font-size:9.5px;padding:3px 9px;"
-        + "border-radius:5px;cursor:" + (on ? "default" : "pointer")
-        + ";border:1px solid #24384a;background:#0b1520;color:"
-        + (on ? "#5d7189" : "#9fd8ff");
-      use.onclick = () => { wkVersionUse(r, col[2]); d.remove(); };
-      side.appendChild(use);
-      pair.appendChild(side);
-    });
-    d.appendChild(pair);
-    if (r.tint) {
-      (r.tint.chunks || []).forEach((c, i) => {
-        part("PASSAGE " + (i + 1) + " OF THE CRYSTAL'S OWN WORDS, SENT WITH IT"
-             + (c.file ? " — " + c.file : ""), c.text);
+  /* #1018: THE SLIDER. Three stops, and the panel below swaps. */
+  const STOPS = tinted
+    ? [["1", "the first prompt"], ["2", "the tinting prompt"],
+       ["\u25c6", "both, side by side"], ["3", "the result"]]
+    : [["1", "the first prompt"]];
+  const rail = mk("div", "display:flex;gap:0;margin:2px 0 10px;"
+    + "border:1px solid #24384a;border-radius:7px;overflow:hidden");
+  const body = mk("div", "");
+  let at = 0;
+
+  const part = (title, text, box) => {
+    const t = String(text || "").trim();
+    if (!t) return;
+    (box || body).appendChild(mk("div", "font-size:9px;letter-spacing:.06em;"
+      + "opacity:.75;margin:9px 0 3px;color:#7fb0c9", title));
+    (box || body).appendChild(mk("pre", "white-space:pre-wrap;"
+      + "word-break:break-word;font-size:10.5px;line-height:1.5;margin:0;"
+      + "padding:7px 9px;background:#05090f;border:1px solid #1b2c3c;"
+      + "border-radius:6px;max-height:38vh;overflow:auto;color:#c8d6e4", t));
+  };
+
+  const draw = () => {
+    body.textContent = "";
+    if (at === 0) {
+      body.appendChild(mk("div", "font-size:10px;opacity:.7;line-height:1.5",
+        "The station's own prompts and the speakbox material wrote this. "
+        + (tinted ? "No crystal was in it — that is the next pass."
+                  : "No crystal was on, so this is the whole of it.")));
+      part("THE SYSTEM PROMPT THAT WAS ARMED", desk.armed);
+      part("WHAT THE SCHEDULE ASKED FOR", desk.sched);
+      part("THE PROMPT AS SENT", desk.prompt);
+      part("THE DIALOGUE THAT CAME BACK",
+           r.script_plain || desk.script || r.script);
+      if (!desk.prompt && !desk.armed) {
+        body.appendChild(mk("div", "font-size:10px;opacity:.6;margin-top:6px",
+          "This round was banked before its paperwork was kept with it, "
+          + "so only the script survives."));
+      }
+    } else if (at === 1) {
+      body.appendChild(mk("div", "font-size:10px;opacity:.7;line-height:1.5",
+        "The dialogue above, sent back through the model with the "
+        + "crystal's own lyrics, to be put in that world's lexicon, style, "
+        + "form and rhyme. It changes nothing else."
+        + (tint.world ? "\n\nTHE WORLD: " + tint.world : "")));
+      (tint.chunks || []).forEach((c, i) => {
+        part("LYRIC LINE " + (i + 1) + (c.file ? " — " + c.file : ""),
+             c.text);
       });
-      part("THE TINTING SYSTEM PROMPT", r.tint.armed);
-      if (!r.tint.ok && r.tint.why) part("WHY THE TINT DID NOT TAKE",
-                                         r.tint.why);
+      part("THE REWRITE INSTRUCTION, AS ARMED", tint.armed);
+      part("THE TINTING PROMPT, AS SENT", tint.prompt);
+      part("THE DIALOGUE THAT CAME BACK", r.script_tinted);
+      if (tint.why) part("WHAT THE PASS REPORTED", tint.why);
+    } else if (at === 2) {
+      /* #1018: THE TWO PROMPTS, SIDE BY SIDE, WITH THEIR SIZES.
+       *
+       * The question this answers is whether the second prompt is
+       * carrying world-building it does not need. The counts underneath
+       * are the answer: the first prompt is the station's whole
+       * apparatus - persona, radio prompts, the schedule's instruction,
+       * the speakbox material - and the second should be three things
+       * only: the rewrite instruction, the lyrics, and the dialogue. */
+      const one = String(desk.prompt || "");
+      const two = String(tint.prompt || "");
+      const pair = mk("div", "display:flex;gap:8px;flex-wrap:wrap");
+      [["\u2460 the first prompt \u2014 writes the dialogue", one, "#4a6d8a"],
+       ["\u2461 the tinting prompt \u2014 only converts it", two, "#c8a6ff"]
+      ].forEach((col) => {
+        const side = mk("div", "flex:1 1 340px;min-width:0");
+        side.appendChild(mk("div", "font-size:9.5px;margin-bottom:3px;"
+          + "color:#8ba0b5", col[0] + "  \u00b7  "
+          + String(col[1] || "").length + " chars"));
+        side.appendChild(mk("pre", "white-space:pre-wrap;"
+          + "word-break:break-word;font-size:10px;line-height:1.5;margin:0;"
+          + "padding:7px 9px;background:#05090f;border:1px solid " + col[2]
+          + ";border-radius:6px;height:52vh;overflow:auto;color:#c8d6e4",
+          String(col[1] || "(nothing recorded)")));
+        pair.appendChild(side);
+      });
+      body.appendChild(pair);
+      const ratio = one.length
+        ? Math.round(100 * two.length / one.length) : 0;
+      body.appendChild(mk("div", "font-size:10px;opacity:.75;margin-top:8px;"
+        + "line-height:1.5",
+        "The tinting prompt is " + ratio + "% the size of the first. It "
+        + "should be carrying three things only \u2014 the rewrite "
+        + "instruction, four to six lines of the crystal's lyrics, and "
+        + "the dialogue itself. Anything else in it is world-building the "
+        + "first pass has already done, and it does not need to be paid "
+        + "for twice."));
+    } else {
+      const pair = mk("div", "display:flex;gap:8px;flex-wrap:wrap");
+      [["as written", r.script_plain, "plain", "#4a6d8a"],
+       ["tinted", r.script_tinted, "tinted", "#c8a6ff"]].forEach((col) => {
+        const side = mk("div", "flex:1 1 320px;min-width:0");
+        const on = String(r.use || "tinted") === col[2];
+        side.appendChild(mk("div", "font-size:9.5px;margin-bottom:3px;color:"
+          + (on ? "#7ce8a9" : "#8ba0b5"),
+          col[0] + (on ? "  ✓ this one goes out" : "")));
+        side.appendChild(mk("pre", "white-space:pre-wrap;"
+          + "word-break:break-word;font-size:10.5px;line-height:1.5;"
+          + "margin:0;padding:7px 9px;background:#05090f;border:1px solid "
+          + col[3] + ";border-radius:6px;max-height:44vh;overflow:auto;"
+          + "color:#c8d6e4", String(col[1] || "")));
+        const use = mk("button", "margin-top:5px;font-size:9.5px;"
+          + "padding:3px 9px;border-radius:5px;cursor:"
+          + (on ? "default" : "pointer") + ";border:1px solid #24384a;"
+          + "background:#0b1520;color:" + (on ? "#5d7189" : "#9fd8ff"),
+          on ? "in use" : "✓ use this one");
+        use.disabled = on;
+        use.onclick = () => { wkVersionUse(r, col[2]); d.remove(); };
+        side.appendChild(use);
+        pair.appendChild(side);
+      });
+      body.appendChild(pair);
     }
-  } else if (r.tint && r.tint.why && !r.tint.ok) {
-    part("THE TINTING PASS DID NOT TAKE", r.tint.why);
-  }
-  if (!desk.prompt && !desk.armed) {
-    const none = document.createElement("div");
-    none.style.cssText = "font-size:10px;opacity:.6;margin-top:6px";
-    none.textContent = "This round was banked before its paperwork was kept "
-      + "with it, so only the script survives.";
-    d.appendChild(none);
-  }
+    Array.prototype.forEach.call(rail.children, (b, i) => {
+      b.style.background = i === at ? "#16283a" : "#0b1520";
+      b.style.color = i === at ? "#bfe3ff" : "#6d8199";
+    });
+  };
+
+  STOPS.forEach((stop, i) => {
+    const b = mk("button", "flex:1;font-size:10px;padding:5px 8px;"
+      + "border:0;border-right:1px solid #24384a;cursor:pointer;"
+      + "text-align:center", stop[0] + "  " + stop[1]);
+    b.onclick = (ev) => { ev.stopPropagation(); at = i; draw(); };
+    rail.appendChild(b);
+  });
+  if (tinted) d.appendChild(rail);
+  d.appendChild(body);
+  draw();
   document.body.appendChild(d);
   try { pvFloatDesk(d); } catch (e) {}
 }
+
 
 /* #1016: read one version of a tinted round, whole. */
 function wkVersionRead(r, which, label, text) {

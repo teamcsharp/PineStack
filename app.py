@@ -49083,6 +49083,9 @@ CALL_TURNS_MAX = 12
 # dig at it and a goodbye - a short call, which is a real thing, and the
 # alternative in that slot is silence.
 CALL_TURNS_SHORT = 4
+# #1018: what one turn of tinting costs on this box, measured - three to
+# five seconds for a short line, and the deadline is built from it.
+TINT_TURN_SECONDS = 6.0
 # Below this much room left, a call is written as a short one.
 CALL_SEGMENT_WHOLE = 150.0
 # #961: the turn counts recent calls were actually written to, kept
@@ -55375,9 +55378,29 @@ def _looks_meta(said: str) -> bool:
         return False
 
 
+def tint_should_stop() -> str:
+    """#1018: may the tinting pass carry on?
+
+    NOT prep_should_stop(). That guards the RECORDING ROOM, and two of
+    its three conditions are about the voice engine - which the tint does
+    not use at all. It is a writing-desk task: one model call per turn,
+    over a different gate entirely. Stopping it because XTTS is rendering
+    is stopping a writer because the microphone is in use, and measured
+    on this station that is nearly always true, which is why the tint
+    never once finished a round.
+
+    What genuinely stops it: the operator forcing something through."""
+    try:
+        if prep_yielding():
+            return _PREP_YIELD_WHY[0] or "a forced interjection"
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
-                       answering: str = "", keep: list[str] | None = None
-                       ) -> str:
+                       answering: str = "", keep: list[str] | None = None,
+                       seen: list[str] | None = None) -> str:
     """#1021: one turn, put in the world's mouth.
 
     Short prompt, short answer, one thing to do. `answering` is the
@@ -55394,49 +55417,31 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
         if held and held[:60] in said:
             return said
     prompt = (
-        "Rewrite ONE line of radio dialogue so it sounds like it came out "
-        "of this world's mouth.\n\n"
-        f"THE WORLD: {world}\n\n"
-        + ("HOW IT TALKS - its own lines, word for word. This is the "
-           "specification:\n"
-           # #1025: was chunks[:4]. The turn-by-turn path is taken for
-           # every round of 22 turns or fewer, which is essentially all
-           # of them, so that slice WAS the setting: crystal_tint_chunks
-           # at its default of 5 sent 4, and at 12 still sent 4. Two
-           # thirds of the dial did nothing. The whole-round path, which
-           # honoured it, is only the fallback for very long rounds.
-           + "\n\n".join(str(c.get("text") or "") for c in chunks)
+        "Rewrite ONE line of radio dialogue so that it is in the LEXICON, "
+        "STYLE, FORM and RHYMING STYLE of the lines of lyrics provided.\n\n"
+        + ("THE LYRICS - base the rewrite on these:\n"
+           + "\n".join(str(c.get("text") or "").strip() for c in chunks)
            + "\n\n" if chunks else "")
-        + "MATCH THE FORM, NOT JUST THE WORDS. If those lines rhyme, YOUR "
-          "LINE RHYMES - internal rhyme inside the line, multi-syllable "
-          "rhyme, two or three to a breath, however they do it. If they "
-          "talk in figures - naming one thing to mean another and letting "
-          "the image carry the point - so does yours.\n\n"
-          "AND STAY IN THEIR REGISTER. Rhyme is not a register. Use the "
-          "KIND of words those lines use: if they are street and concrete "
-          "and full of real objects, yours is street and concrete and "
-          "full of real objects. Do NOT drift into ornate, archaic or "
-          "poetical English - no 'doth', no 'spectral', no 'nectar', no "
-          "'forth' - unless those lines themselves talk that way. Their "
-          "nouns, their slang, their jokes.\n\n"
-        + (f"THE LINE BEFORE THIS ONE, already rewritten - come back ON "
-           f"it, answer its rhyme:\n{answering}\n\n" if answering else "")
-        + "KEEP EVERY FACT. Whoever is named is still named, whatever "
-          "was decided is still decided, every number and object is still "
-          "there. A line that sounds right and has lost what it was "
-          "SAYING has taken the wrong half - the point is the same "
-          "argument in a different mouth, not a different argument.\n\n"
-          "AND REWRITE IT. YOU HAVE FAILED IF the line comes back the "
-          "same, or nearly the same, or with only the punctuation moved. "
-          "Every word of it is yours to change except the facts. If you "
-          "cannot see how to rhyme it, change the images and the "
-          "vocabulary and the way the sentence turns - but it does not "
-          "come back untouched.\n\n"
-          "Do not answer it, do not continue it, do not add a second "
-          "line - REWRITE THIS ONE LINE:\n"
+        + "Take from them: the LYRICAL CADENCE (metre, breath length, "
+          "where the stress falls); the LEXICAL CONTENT (their vocabulary "
+          "and slang); the STYLE and RHETORIC (their attitude, wit, and "
+          "how they argue or dismiss); the ALLEGORY AND SIMILE LEVEL (how "
+          "far they say one thing to mean another - match it); and the "
+          "RHYME STYLE (if they rhyme, YOURS RHYMES, the same way).\n\n"
+        + (f"THE LINE BEFORE THIS ONE, already rewritten - come back on "
+           f"it and answer its rhyme:\n{answering}\n\n" if answering else "")
+        + "Keep the speaker's point and every fact, name and number in it. "
+          "Do not quote the lyrics. Do not answer the line, do not "
+          "continue it, do not add a second line - rewrite THIS line:\n"
         + said
         + "\n\nReturn ONLY the rewritten line. No speaker label, no "
           "quotes, no explanation.")
+    # #1018: the REAL prompt, for the side-by-side comparison. A summary
+    # is not a prompt, and the question being asked of it - is the second
+    # pass carrying world-building it does not need - cannot be answered
+    # from a summary.
+    if seen is not None and not seen:
+        seen.append(prompt)
     try:
         got = await ask_model(prompt, limit=max(120, len(said) * 2),
                               spice=0.5,
@@ -55565,70 +55570,39 @@ async def crystal_tint(script: str, kind: str = "",
         out["world"] = world
         out["chunks"] = chunks
         armed = (
-            "YOU ARE A REWRITE PASS. A conversation has already been "
-            "written for this radio station and the SUBSTANCE of it is "
-            "finished - the beats, the people, the facts, the order. Your "
-            "job is to put that substance into another mouth entirely, "
-            "and that means matching HOW that mouth builds language, not "
-            "merely which words it picks.\n\n"
-            f"THE WORLD: {world}\n\n"
-            + ("HOW THAT WORLD ACTUALLY TALKS - its own lines, word for "
-               "word. These are not a description of the style, they ARE "
-               "the style, and they are the specification you are working "
-               "to. Study them before you write anything:\n"
-               + "\n\n".join(f"[{c['file']}] {c['text']}" for c in chunks)
-               + "\n\n"
-               "TAKE THE LEXICAL, VOCAL AND STYLISTIC CHOICES OFF THOSE "
-               "LINES AND MAKE THEM YOURS. Read the FORM first - the "
-               "vocabulary is the easy part and the part every attempt "
-               "stops at.\n\n"
-               "1. VOCAL - DO THEY RHYME? If they rhyme, YOUR OUTPUT MUST "
-               "RHYME, "
-               "the same way theirs does - internal rhyme buried "
-               "mid-line, multi-syllable rhyme, rhymes stacked two and "
-               "three to a breath, whatever it is they actually do. If "
-               "they scan to a beat, yours scans to that beat. If they "
-               "run clauses together and land hard on the last word, so "
-               "do you. Copy the MACHINERY: rhyme, metre, line length, "
-               "where the stress falls, how a thought is set up and paid "
-               "off.\n\n"
-               "2. STYLISTIC - DO THEY SAY THINGS SIDEWAYS? If they work in allegory "
-               "- naming one thing to mean another, running a figure "
-               "several lines past where an ordinary speaker would drop "
-               "it, letting the metaphor carry the argument instead of "
-               "decorating it - then yours does that too. Do not state "
-               "the point plainly and hang an image off it; make the "
-               "image BE the point, the way they do.\n\n"
-               "3. LEXICAL - their vocabulary, their slang, the "
-               "things they reach for as comparisons, their particular "
-               "wit.\n\n"
-               if chunks else "")
-            + "SO: every turn keeps its point and its facts, and is "
-              "rebuilt in that world's form. The speaker is still making "
-              "the same argument; they are making it the way those lines "
-              "are written. If those lines are rapped, the pair are "
-              "rapping - in a radio booth, to each other, still sounding "
-              "like two people talking rather than performing a verse at "
-              "the listener, but rhyming and speaking in figures as they "
-              "do it.\n\n"
-              "YOU HAVE FAILED IF a turn comes back word for word the "
-              "same; if all you did was fix the punctuation and the "
-              "capitals; if the passages above rhyme and your version "
-              "does not; or if the passages talk in figures and your "
-              "version says everything flat and straight. Swapping in a "
-              "few of that world's nouns is NOT the job - that is a "
-              "costume, and the operator can hear the difference.\n\n"
-              "WHAT NOT TO CHANGE: the speaker markers and their order; "
-              "the NUMBER of turns; who says what; and the SUBSTANCE - "
-              "every fact, name, record, price and decision stays true. "
-              "Do not add turns and do not remove any. Never name the "
-              "world out loud.\n"
-            + (("LEAVE THESE PASSAGES EXACTLY AS THEY ARE - they are "
-                "quoted material and they are read out word for word:\n"
-                + "\n".join('"' + v + '"' for v in keep) + "\n\n")
+            "Rewrite the dialogue below so that it is in the LEXICON, "
+            "STYLE, FORM and RHYMING STYLE of the lines of lyrics "
+            "provided.\n\n"
+            "That is the whole job. The dialogue already says what it "
+            "needs to say; you are converting HOW it says it.\n\n"
+            + ("THE LYRICS - base the rewrite on these:\n"
+               + "\n".join(str(c.get("text") or "").strip()
+                           for c in chunks)
+               + "\n\n" if chunks else "")
+            + "Take from them:\n"
+              "  LYRICAL CADENCE - the metre, the length of a breath, "
+              "where the stress falls, how a line lands.\n"
+              "  LEXICAL CONTENT - their vocabulary and their slang; the "
+              "kind of nouns they reach for.\n"
+              "  STYLE - the attitude and the wit; how a thought is set "
+              "up and paid off.\n"
+              "  RHETORIC - how they argue, boast, dismiss or agree.\n"
+              "  ALLEGORY AND SIMILE - how far they say one thing to mean "
+              "another, and how long they run a figure before dropping "
+              "it. Match that level.\n"
+              "  RHYME STYLE - if they rhyme, YOURS RHYMES, the same way: "
+              "internal rhyme mid-line, multi-syllable rhyme, however "
+              "many to a breath they use.\n\n"
+              "Keep: the speaker markers and their order, the number of "
+              "turns, who says what, and every fact, name, number and "
+              "decision. Do not quote the lyrics, do not repeat their "
+              "phrases, and never name where they came from.\n"
+            + (("Leave these passages exactly as they are - they are "
+                "quoted material, read out word for word:\n"
+                + "\n".join('"' + v + '"' for v in keep) + "\n")
                if keep else "")
-            + "Return ONLY the rewritten conversation, in exactly the same "
-              "marker format it came in.")
+            + "\nReturn ONLY the rewritten dialogue, in the same marker "
+              "format it came in.")
         out["armed"] = armed
         # #1021: TURN BY TURN, which is the only way a small model holds
         # rhyme. See crystal_turn for why the whole-round pass could not.
@@ -55641,27 +55615,67 @@ async def crystal_tint(script: str, kind: str = "",
             began = time.monotonic()
             done: list[str] = []
             answering = ""
+            # #1018: A DEADLINE OF ITS OWN. Left to the preparer's slice
+            # this had 45 seconds for a round that takes three to five a
+            # turn - it could never finish one, which is exactly how the
+            # booth filled up with half-tinted rounds.
+            _tint_due = time.monotonic() + max(
+                60.0, TINT_TURN_SECONDS * len(turns) + 30.0)
+            # #1018: AND THE ROOM'S OWN CLOCK IS EXTENDED TO MATCH.
+            #
+            # prep_should_stop() reads _PREP_DEADLINE, which the preparer
+            # sets to a 45-second slice. A tint is three to five seconds
+            # a turn, so on any round of more than about ten turns it
+            # blew that slice and bailed EVERY TIME - which is why the
+            # booth was full of rounds that had been "tinted" and were
+            # not. Measured after the throw-away fix: rounds kept coming
+            # back plain with "the room was wanted back part way
+            # through", one after another.
+            #
+            # The deadline is lent to the tint for its own duration and
+            # handed straight back. Everything else prep_should_stop()
+            # guards - a forced interjection, relief, a genuinely full
+            # engine - still stops it, because those are real.
+            _first_prompt: list[str] = []
+            _room_was = _PREP_DEADLINE[0]
+            _PREP_DEADLINE[0] = time.time() + max(
+                60.0, TINT_TURN_SECONDS * len(turns) + 30.0)
+            _gave_up = ""
             for marker, said in turns:
-                if prep_should_stop():
-                    # The room wants the engine back; keep what is made
-                    # and hand the rest over untinted rather than half a
-                    # round.
-                    done.extend(f"{m}: {t}" for m, t in
-                                turns[len(done):])
-                    out["why"] = ("the room was wanted back part way "
-                                  "through - the rest of it is untinted")
+                if time.monotonic() > _tint_due:
+                    _gave_up = (f"the tint ran past its {int(TINT_TURN_SECONDS * len(turns) + 30)}s "
+                                "deadline")
+                    break
+                _stop = tint_should_stop()                       # #1018
+                if _stop:
+                    _gave_up = _stop
                     break
                 fresh = await crystal_turn(str(said or ""), world, chunks,
-                                           answering, keep)
+                                           answering, keep, _first_prompt)
                 done.append(f"{marker}: {fresh}")
                 answering = fresh
+            _PREP_DEADLINE[0] = _room_was                        # #1018
             out["ms"] = int((time.monotonic() - began) * 1000)
+            if _gave_up:
+                # #1018: HALF A TINT IS WORSE THAN EITHER END OF IT. A
+                # round that is DOOM for three lines and plainly itself
+                # for the other three reads as untinted, because the ear
+                # notices the plain half. Throw the partial away, let the
+                # whole plain script stand, and leave it for a later pass.
+                out["why"] = (_gave_up + " - the partial tint was thrown "
+                              "away and the plain round stands, whole. It "
+                              "is tinted properly on a later pass")
+                out["partial_turns"] = len(done)
+                return out
             out["turns"] = len(turns)
             out["per_turn"] = True
             tinted = "\n".join(done).strip()
-            out["prompt"] = ("turn by turn - " + str(len(turns))
-                             + " calls, each one line. The system prompt "
-                               "each of them carried:\n\n" + armed)
+            out["prompt"] = (
+                (f"TURN BY TURN - {len(turns)} calls, one per line of the "
+                 "round. This is the prompt AS SENT for the first of "
+                 "them; the rest differ only in the line being rewritten "
+                 "and the line before it.\n\n" + _first_prompt[0])
+                if _first_prompt else armed)
             if tinted and " ".join(tinted.split()) != " ".join(text.split()):
                 out["ok"] = True
                 out["script"] = tinted
