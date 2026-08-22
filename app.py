@@ -10936,6 +10936,153 @@ def prep_deadline_pick(rows: list[dict[str, Any]],
     return {}
 
 
+# #1010: THE SITTING - one actor, every script waiting for them.
+#
+# "Make sure the orchestrator is cueing up the lines for the actors that
+# whenever they go in to record them, they're able to record an entire
+# swath of scripts, lines at the same time in order to provide the
+# content they need for multiple things that are requiring lines. So that
+# way everything is streaming and then the next person's able to go in
+# and they're able to do the lines for all of their scripts."
+#
+# #858/#906 already did this WITHIN a round. This does it ACROSS them:
+# the rounds waiting are pooled, every line still to be made is put under
+# the person who says it, and the room works through one performer's
+# whole swath - across every script - before the next one comes in.
+#
+# TWO THINGS KEEP IT HONEST, because the obvious version of this is worse
+# than what it replaces.
+#
+# 1. THE ROUND IS STILL THE UNIT THAT AIRS. Nothing can go out until all
+#    of its seats are made, so a naive sitting finishes nothing until the
+#    last actor has been through - on a station short of material that is
+#    a long silence bought with a small saving. So the actors are ordered
+#    by HOW MANY ROUNDS THEY FINISH: the performer who completes the most
+#    rounds goes first, and rounds fall out of the sitting ready to air as
+#    each seat is closed rather than all at the end.
+#
+# 2. THE POOL IS BOUNDED and taken in deadline order, so a sitting can
+#    never be the reason the next entry arrives bare.
+#
+# Measured on this box: staying on one performer saves about two and a
+# half seconds per voice change. A round has two changes in it; six
+# rounds pooled has two instead of twelve, so the saving is real but
+# small - about 1.5% of the render. The reason to do it is the operator's
+# reason, which is that the room works the way a room works.
+RECORDING_POOL_MOST = 6
+
+
+async def recording_sitting(entries: list[dict[str, Any]],
+                            slice_seconds: float = 45.0) -> dict[str, Any]:
+    """#1010: work the pooled scripts one performer at a time."""
+    out: dict[str, Any] = {"at": time.time(), "rounds": 0, "actors": [],
+                           "finished": 0, "say": ""}
+    pool = [e for e in (entries or [])
+            if isinstance(e, dict) and not e.get("prepared")]
+    del pool[RECORDING_POOL_MOST:]
+    if not pool:
+        out["say"] = "nothing is waiting to be recorded"
+        return out
+    out["rounds"] = len(pool)
+    # Who is wanted, and how many rounds each of them is the last seat of.
+    try:
+        cast = dict(await session_voices())
+    except Exception:  # noqa: BLE001
+        cast = {}
+    wanted: dict[str, int] = {}
+    closes: dict[str, int] = {}
+    for entry in pool:
+        try:
+            turns = banter_turns(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or ""))
+            seats = dict(cast)
+            for _s, _k in (("caller", "caller_voice"),
+                           ("caller2", "caller2_voice")):
+                _cv = str(entry.get(_k) or "")
+                if _cv:
+                    seats[_s] = _cv
+            plan = _round_chunks(turns, seats,
+                                 str(entry.get("caller_name") or ""))
+        except Exception:  # noqa: BLE001
+            continue
+        here: set[str] = set()
+        for _t, _v, _w in plan:
+            if not _v:
+                continue
+            wanted[_v] = wanted.get(_v, 0) + 1
+            here.add(str(_v))
+        # A round with ONE voice left in it is closed by that voice.
+        if len(here) == 1:
+            only = next(iter(here))
+            closes[only] = closes.get(only, 0) + 1
+    if not wanted:
+        out["say"] = "nothing in the pool has a voice to record it with"
+        return out
+    # Most rounds finished first, then most lines - so material starts
+    # falling out of the sitting early rather than all at the end.
+    order = sorted(wanted, key=lambda v: (-closes.get(v, 0), -wanted[v]))
+    for voice in order:
+        if prep_should_stop():
+            break
+        made_before = sum(1 for e in pool if e.get("prepared"))
+        _PREP_DEADLINE[0] = time.time() + max(15.0, float(slice_seconds))
+        try:
+            for entry in pool:
+                if entry.get("prepared") or prep_should_stop():
+                    continue
+                try:
+                    await larder_prepare(entry, only_voice=voice)
+                except Exception as exc:  # noqa: BLE001
+                    pipeline_log("drop", "a sitting failed on one script",
+                                 extra=f"{type(exc).__name__}: {exc}"[:300])
+                    continue
+        finally:
+            _PREP_DEADLINE[0] = 0.0
+        made_after = sum(1 for e in pool if e.get("prepared"))
+        try:
+            name = str((voice_meta(voice) or {}).get("name") or voice)
+        except Exception:  # noqa: BLE001
+            name = voice
+        out["actors"].append({"voice": voice, "name": name,
+                              "lines": int(wanted.get(voice, 0)),
+                              "finished": made_after - made_before})
+        pipeline_log("lookahead",
+                     f"{name} recorded their lines across {len(pool)} "
+                     f"script(s) in one sitting - "
+                     f"{made_after - made_before} round(s) finished on the "
+                     "way out (#1010)")
+    out["finished"] = sum(1 for e in pool if e.get("prepared"))
+    # #1010: and WHY, when nothing came out. A sitting that finishes
+    # nothing is usually not a fault - the room stood down for the live
+    # show, or the preparer already had those scripts in flight - and
+    # saying which is the difference between a diagnosis and a shrug.
+    if not out["finished"]:
+        why = []
+        _stop = ""
+        try:
+            _stop = prep_should_stop()
+        except Exception:  # noqa: BLE001
+            _stop = ""
+        if _stop:
+            why.append(_stop)
+        try:
+            _win = pantry_window()
+            if _win:
+                why.append(str(_win))
+        except Exception:  # noqa: BLE001
+            pass
+        if any(e.get("preparing") for e in pool):
+            why.append("the preparer already had these in the room")
+        out["why"] = "; ".join(why) or ("their lines are made but the "
+                                        "rounds still want other seats")
+    out["say"] = (f"{len(out['actors'])} actor(s) went in for "
+                  f"{out['rounds']} script(s); {out['finished']} round(s) "
+                  "came out finished"
+                  + (f" - {out['why']}" if out.get("why") else ""))
+    return out
+
+
 def prep_plan(skip: Any = None) -> dict[str, Any]:
     """WHAT to prepare next and WHY - the whole decision, in one place,
     written down so the operator can read the reasoning.
@@ -19372,8 +19519,17 @@ async def recast_sweep() -> dict[str, int]:
     return out
 
 
-async def larder_prepare(entry: dict[str, Any]) -> bool:
-    """#886: make a banked round's AUDIO, before anybody wants it."""
+async def larder_prepare(entry: dict[str, Any],
+                         only_voice: str = "") -> bool:
+    """#886: make a banked round's AUDIO, before anybody wants it.
+
+    #1010: `only_voice` records just that performer's lines and leaves
+    everybody else's for their own sitting. Safe for the same reason the
+    per-round regrouping is: a line already in the pantry counts as MADE
+    without being rendered again, so a round worked one actor at a time
+    completes on the pass that finishes its last seat, and `prepared` is
+    still `made >= len(plan)`. Nothing about the round's own bookkeeping
+    changes; it simply takes more than one visit."""
     if entry.get("prepared") or entry.get("preparing"):
         return False
     entry["preparing"] = True
@@ -19481,6 +19637,12 @@ async def larder_prepare(entry: dict[str, Any]) -> bool:
         except Exception:  # noqa: BLE001
             _script_ix = {}
         for text, voice, who in plan:
+            # #1010: ONE ACTOR, EVERY SCRIPT. When a sitting has been
+            # called for a particular performer, everybody else's lines
+            # are left where they are - their own sitting will find them,
+            # and a line already made is a pantry hit that costs nothing.
+            if only_voice and str(voice) != str(only_voice):
+                continue
             # #865: the recording room, live — which actor is at the
             # microphone this instant and how far through the section
             # of lines that was cut for them.
@@ -20923,6 +21085,34 @@ async def pantry_keeper() -> None:
                 _lap += 1
             _slice = max(15.0, min(45.0, prep_room_left()
                                    / max(1, len(_waiting))))
+            # #1010: ONE ACTOR, EVERY SCRIPT. The rows waiting are pooled
+            # and the room works through one performer's whole swath -
+            # across every script - before the next one comes in, ordered
+            # so that the actor who FINISHES the most rounds goes first
+            # and material starts falling out ready to air early rather
+            # than all at the end. It falls straight through to the
+            # one-round-at-a-time road below for anything it did not take.
+            if _waiting and pantry_window():
+                try:
+                    _pool = []
+                    for _kind, _row in _waiting:
+                        _e = _row.get("entry") or {}
+                        if _e.get("prepared") or _e.get("preparing"):
+                            continue
+                        if (_e.get("frozen")
+                                and int(_e.get("prep_turns") or 0)
+                                and not int(_e.get("chunks") or 0)):
+                            continue
+                        _pool.append((_row, _e))
+                    if len(_pool) > 1:
+                        await recording_sitting([e for _r, e in _pool],
+                                                _slice)
+                        for _r, _e in _pool:
+                            _r["seconds"] = float(_e.get("seconds") or 0)
+                except Exception as _sx:  # noqa: BLE001
+                    pipeline_log("drop", "the sitting failed - falling back "
+                                 "to one round at a time",
+                                 extra=f"{type(_sx).__name__}: {_sx}"[:300])
             if _waiting:
                 for _kind, _row in _waiting:
                     _shelved = _row.get("entry") or {}
@@ -59430,6 +59620,116 @@ async def api_doc(
                 raise HTTPException(status_code=500,
                                     detail=f"{type(exc).__name__}") from exc
     raise HTTPException(status_code=404, detail="no such document")
+
+
+@app.get("/api/rooms/sitting")
+async def api_rooms_sitting(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1010: the sitting as it would run right now - which actors are
+    wanted across the scripts waiting, in the order they will be called,
+    and how many rounds each of them finishes on the way out.
+
+    Reads only; it does not start one. The preparer runs a sitting on its
+    own whenever more than one script is waiting."""
+    require_read_auth(authorization)
+    pool: list[dict[str, Any]] = []
+    try:
+        for rows in _SHELF.values():
+            for row in (rows or []):
+                ent = (row or {}).get("entry")
+                if isinstance(ent, dict) and not ent.get("prepared"):
+                    pool.append(ent)
+        for ent in _LARDER:
+            if isinstance(ent, dict) and not ent.get("prepared"):
+                pool.append(ent)
+    except Exception:  # noqa: BLE001
+        pass
+    del pool[RECORDING_POOL_MOST:]
+    try:
+        cast = dict(await session_voices())
+    except Exception:  # noqa: BLE001
+        cast = {}
+    wanted: dict[str, int] = {}
+    closes: dict[str, int] = {}
+    for entry in pool:
+        try:
+            turns = banter_turns(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""),
+                                 str(entry.get("caller2_name") or ""))
+            seats = dict(cast)
+            for _s, _k in (("caller", "caller_voice"),
+                           ("caller2", "caller2_voice")):
+                _cv = str(entry.get(_k) or "")
+                if _cv:
+                    seats[_s] = _cv
+            plan = _round_chunks(turns, seats,
+                                 str(entry.get("caller_name") or ""))
+        except Exception:  # noqa: BLE001
+            continue
+        here: set[str] = set()
+        for _t, _v, _w in plan:
+            if not _v:
+                continue
+            wanted[_v] = wanted.get(_v, 0) + 1
+            here.add(str(_v))
+        if len(here) == 1:
+            only = next(iter(here))
+            closes[only] = closes.get(only, 0) + 1
+    order = sorted(wanted, key=lambda v: (-closes.get(v, 0), -wanted[v]))
+    rows = []
+    for voice in order:
+        try:
+            name = str((voice_meta(voice) or {}).get("name") or voice)
+        except Exception:  # noqa: BLE001
+            name = voice
+        rows.append({"voice": voice, "name": name,
+                     "lines": int(wanted.get(voice, 0)),
+                     "finishes": int(closes.get(voice, 0))})
+    return {
+        "scripts": len(pool),
+        "pool_cap": RECORDING_POOL_MOST,
+        "actors": rows,
+        "say": (f"{len(rows)} actor(s) for {len(pool)} script(s) - "
+                + ", ".join(f"{r['name']} ({r['lines']})" for r in rows[:4])
+                if rows else "nothing is waiting to be recorded"),
+    }
+
+
+@app.post("/api/rooms/sitting")
+async def api_rooms_sitting_run(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1010: call a sitting NOW on whatever is waiting.
+
+    The preparer runs one on its own whenever more than one script is
+    waiting; this is the door for calling one by hand - and for proving
+    the road works on a station whose rooms are, at that moment, clear."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        secs = max(10.0, min(300.0, float(body.get("seconds", 60) or 60)))
+    except (TypeError, ValueError):
+        secs = 60.0
+    pool: list[dict[str, Any]] = []
+    for rows in _SHELF.values():
+        for row in (rows or []):
+            ent = (row or {}).get("entry")
+            if isinstance(ent, dict) and not ent.get("prepared"):
+                pool.append(ent)
+    for ent in _LARDER:
+        if isinstance(ent, dict) and not ent.get("prepared"):
+            pool.append(ent)
+    if not pool:
+        return {"rounds": 0, "actors": [], "finished": 0,
+                "say": "nothing is waiting to be recorded - the rooms are "
+                       "clear and only the writing desk can make more"}
+    return await recording_sitting(pool, secs)
 
 
 @app.get("/api/rooms/call-sheet")
