@@ -10357,6 +10357,13 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
                                     and not _brief.get("ok"))
         except Exception:  # noqa: BLE001
             row["off_brief"] = False
+        # #1062: an advert that NAMES a record belongs to that record -
+        # it can introduce it next time, and the record can answer it.
+        if str(kind) == "ad":
+            try:
+                track_read_bind_ad(row)
+            except Exception:  # noqa: BLE001
+                pass
         rows = shelf_rows(kind)
         # #926: its stable id, written down now — before it joins the
         # shelf, so the clash check behind alt_sid() can see the rows it
@@ -20930,6 +20937,124 @@ def track_reads_state() -> dict[str, Any]:
                     if rows else "no record has a read on file yet")}
 
 
+# --- THE CALLBACK (#1062) ---------------------------------------------
+# Two words of context turn a repeat into the station remembering
+# itself. See the note at the top of the #1062 change.
+#
+# Stock phrases on purpose: the whole value of the library is that a
+# record already talked about costs nothing to talk about again, and a
+# model visit spent on the sentence that introduces the saving is a
+# poor trade.
+TRACK_CALLBACK_AFTER = (
+    "That was {title}. Here is what this station made of it the last "
+    "time it came round.",
+    "{title}, there. We have been here before, and this is what was "
+    "said about it.",
+    "That was {title} — and we had form on this one already. Listen to "
+    "what we said last time.",
+    "{title}. Pulling the tape on what this station said about that "
+    "record before.",
+)
+TRACK_CALLBACK_BEFORE = (
+    "Here is a song made by that advert.",
+    "And that advert was built round this record — so here it is.",
+    "You have heard the advert. This is the song it was written about.",
+)
+# How often a record that HAS been talked about before gets the callback
+# rather than a fresh look at it. Not every time: a station that only
+# ever quotes itself has stopped listening.
+TRACK_CALLBACK_RATE = 0.55
+
+
+def track_callback_rate() -> float:
+    try:
+        got = orch_policy("callback_rate")
+        if got is not None:
+            return max(0.0, min(1.0, float(got)))
+    except Exception:  # noqa: BLE001
+        pass
+    return TRACK_CALLBACK_RATE
+
+
+def track_callback(track: dict[str, Any] | None, part: str
+                   ) -> dict[str, Any] | None:
+    """#1062: this record has been talked about before - play it back,
+    framed so it lands as a look-back rather than a rerun.
+
+    Returns a read shaped exactly like a prepared one, with `text`
+    carrying the frame AND the stored words, so every road downstream
+    treats it as ordinary track talk. The audio key is deliberately NOT
+    carried over: the frame is new, so the line has to be rendered - one
+    render against a whole model visit and a vision pass saved."""
+    try:
+        tid = str((track or {}).get("id") or "")
+        if not tid:
+            return None
+        seat = (track_reads_load().get(tid) or {})
+        title = str(seat.get("title") or (track or {}).get("title") or "")
+        if random.random() > track_callback_rate():
+            return None
+        if str(part) == "outro":
+            # A send-off out of what was said the first time round.
+            held = seat.get("intro") or seat.get("ad") or {}
+            frame = random.choice(TRACK_CALLBACK_AFTER)
+        elif str(part) == "intro":
+            # The advert that was written about this record, and then
+            # the record - which is the joke, and only works because
+            # the two are filed together.
+            held = seat.get("ad") or {}
+            frame = ""
+        else:
+            return None
+        said = " ".join(str(held.get("text") or "").split())
+        if len(said) < 24:
+            return None
+        if str(part) == "intro":
+            body = said + " " + random.choice(TRACK_CALLBACK_BEFORE)
+        else:
+            body = frame.format(title=title or "that one") + " " + said
+        return {"text": body[:2400],
+                "voice": str(held.get("voice") or ""),
+                "at": time.time(),
+                "from_library": True,
+                "callback": str(part),
+                "aired": int(held.get("aired") or 0)}
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def track_read_bind_ad(row: dict[str, Any]) -> str:
+    """#1062: is this advert ABOUT a record? File it against that record.
+
+    The only test is whether its own words NAME the track. An advert
+    written while a song happens to be spinning is not about the song,
+    and treating it as though it were is how a station ends up
+    promising a callback it cannot make."""
+    try:
+        said = " ".join(str(row.get("text") or "").split()).lower()
+        if len(said) < 24:
+            return ""
+        now = _RADIO.get("now") or {}
+        seen: list[dict[str, Any]] = [now] if now.get("id") else []
+        for was in (_RADIO.get("history") or [])[:6]:
+            if was.get("id"):
+                seen.append(was)
+        for track in seen:
+            title = " ".join(str(track.get("title") or "").split()).lower()
+            if len(title) < 4 or title not in said:
+                continue
+            track_read_keep(track, "ad", row)
+            pipeline_log(
+                "lookahead",
+                f"that advert names \"{track.get('title')}\" - filed "
+                "against the record so it can introduce it next time "
+                "(#1062)")
+            return str(track.get("id") or "")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def track_talk_ahead() -> int:
     try:
         got = int(dj_settings().get("track_talk_ahead")
@@ -20997,6 +21122,12 @@ def track_talk_get(track: dict[str, Any] | None, part: str,
             held = track_read_take(track, part)
             if held:
                 return held
+            # #1062: nothing filed for THIS part - but the record may
+            # have been talked about in another. A frame turns that into
+            # a callback rather than a rerun.
+            back = track_callback(track, part)
+            if back:
+                return back
             return None
         if time.time() - float(got.get("at") or 0) > PANTRY_BURN_SECONDS:
             return None
