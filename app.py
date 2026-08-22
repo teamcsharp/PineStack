@@ -61944,6 +61944,7 @@ async def dj_pending(
         except Exception:  # noqa: BLE001
             turns = []
         said = []
+        _cast: dict[str, dict[str, Any]] = {}                    # #1030
         for marker, text in turns[:14]:
             who = ("caller" if marker == "C" else "caller2" if marker == "E"
                    else "dj" if marker == "A"
@@ -61953,12 +61954,38 @@ async def dj_pending(
                 said.append({"who": who,
                              "name": booth_actor_name(who, ""),
                              "text": clean[:400]})
+                # #1030: and WHO is in this round, counted off the same
+                # walk. The seat was already being worked out here and
+                # thrown away after the preview.
+                _seat = _cast.setdefault(who, {"who": who, "turns": 0})
+                _seat["turns"] += 1
         chunks = int(entry.get("chunks") or 0)
         made = int(entry.get("made") or 0)
         state = ("ready" if entry.get("prepared")
                  else "rendering" if entry.get("preparing")
                  else "written")
+        # #1030: names and voices onto the seats, and the live ones
+        # marked - a caller's phone line is drawn per call, so those
+        # turns cannot be recorded ahead and the listing should say so
+        # rather than leaving the operator to wonder why a round is
+        # never finished.
+        try:
+            for _who, _seat in _cast.items():
+                _seat["name"] = booth_actor_name(
+                    _who,
+                    str(entry.get("caller_name") or "") if _who == "caller"
+                    else str(entry.get("caller2_name") or "")
+                    if _who == "caller2" else "")
+                _seat["voice"] = str(
+                    entry.get("caller_voice") or "") if _who == "caller" \
+                    else str(entry.get("caller2_voice") or "") \
+                    if _who == "caller2" else ""
+                _seat["live"] = _who in ("caller", "caller2")
+        except Exception:  # noqa: BLE001
+            pass
         rows.append({
+            "cast": sorted(_cast.values(),
+                           key=lambda c: -int(c.get("turns") or 0)),
             "id": hashlib.sha1(
                 str(entry.get("script") or "").encode("utf-8", "ignore")
             ).hexdigest()[:10],

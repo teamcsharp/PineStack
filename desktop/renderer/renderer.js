@@ -2945,6 +2945,11 @@ function initWorksPopup() {
           let open = wkResOpen(foldKey);
           /* #987: "list what these scripts are being written FOR."
            * The reserve listed twelve rounds that all read the same. */
+          /* #1030: the members in this round, before anything else on
+           * the row - who is being managed and queued up. */
+          try {
+            if (r.cast && r.cast.length) inner.appendChild(wkCastRow(r.cast));
+          } catch (e) { /* the row still reads */ }
           const label = "#" + (i + 1) + " · " + (r["for"] || "booth rounds")
             + " · " + r.state + " · "
             + r.turns + " turns · " + r.made + "/" + r.chunks + " lines made"
