@@ -16022,7 +16022,15 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
                 f"use markdown, emoji, URLs or stage directions. Refer to "
                 f"the station as "
                 f"{dj['station_name']}.{context}{aside}{show_memory()}"
-                f"{avoid_reruns()}\n\n"
+                f"{avoid_reruns()}"
+                # #1027: THE CRYSTAL, ON THE ROAD THAT WRITES MOST OF THE
+                # STATION. dj_line writes every advert, every station ID,
+                # every track intro and outro, the request
+                # announcements, the interjects and the replies - and it
+                # had no crystal token in it of any kind. None of its
+                # output is ever banked, so the second pass can never
+                # reach it either: this is its only chance to be tinted.
+                f"{crystal_tint_note()}\n\n"
                 f"The earlier sentence count is superseded: use SIX to TEN "
                 f"developed spoken sentences so this radio link has room to "
                 f"build an argument, detail it, and land it.\n\n"
@@ -19622,6 +19630,25 @@ async def larder_prepare(entry: dict[str, Any],
         # never looked at again. Split, the visit still happens once and
         # the freeze is only given when there is audio to protect.
         _pkind = str(entry.get("prep_kind") or "banter")
+        # #1025: A TINTED ROUND IS NOT FRESHENED.
+        #
+        # The banking order is: write, staple the verbatim passages,
+        # blend, TINT, bank. larder_prepare then ran freshen_script on
+        # the banked entry - and freshen_script has no crystal in it at
+        # all. Its rewrite asks for "different words, different images, a
+        # different angle" and its fallback swaps stuck lines for raw
+        # speakbox material, so a round's rhyme and register could be
+        # written straight back out again between banking and air. Its
+        # own docstring says it runs TWICE on a banked call.
+        #
+        # `freshened` means "the model visit has been paid for", which is
+        # exactly true of a round that has just been through a second
+        # model pass, so this is the honest flag rather than a new one.
+        if entry.get("script_tinted") and not entry.get("freshened"):
+            entry["freshened"] = True
+            pipeline_log("speakbox", "a tinted round skips the freshener - "
+                         "it has already been through a second pass, and "
+                         "freshening has no crystal in it (#1025)")
         if not (entry.get("freshened") or entry.get("frozen")):
             prep_note(_pkind, "writing")
             try:
@@ -31761,7 +31788,12 @@ async def dj_upstairs_write() -> dict[str, Any]:
         "Reference the actual thing happening downstairs. Escalate to some "
         "threat that is out of all proportion — equipment being removed, "
         "somebody being replaced, a policy nobody has heard of. Four to "
-        "seven sentences. No markdown, no emoji, no lists.")
+        "seven sentences. No markdown, no emoji, no lists."
+        # #1027: the manager's MEMO road is tinted and his own voice was
+        # not - the same man talking two different ways depending on
+        # which road wrote him. Upstairs has fallen into it like the rest
+        # of the town.
+        + crystal_tint_note())
     try:
         text = spoken_text(await ask_model(prompt, limit=700))
     except Exception:
@@ -38377,6 +38409,10 @@ async def drop_liner_brew(want: int = 6) -> None:
     if seed:
         ask += ("\n\nTake your colour from this material, without "
                 f"quoting it directly:\n{seed[:400]}")
+    # #1027: the liners the station drops between records. Never
+    # banked, never through dj_banter, so nothing else was ever going to
+    # tint them.
+    ask += crystal_tint_note()
     try:
         raw = await ask_model(ask, limit=40 * max(1, want), spice=0.9)
     except Exception:  # noqa: BLE001
@@ -38616,7 +38652,10 @@ async def _sfx_verdict(about: str) -> None:
             "presenters just appealed to you for approval about this: "
             f"\"{about[:300]}\" Write your ONE short deadpan line — firm "
             "agreement or blunt argument, nothing more. No stage "
-            "directions.", 120)
+            # #1027: his warps and his news takes carry the crystal; this
+            # one did not, so the same man came back untinted whenever he
+            # was asked for a verdict.
+            "directions." + crystal_tint_note(), 120)
         if line:
             await asyncio.sleep(0.6)
             await dj_speak("reply", None, line=line, who="drop",
@@ -43861,7 +43900,10 @@ async def dj_deep_round(track: dict[str, Any] | None = None) -> list[str]:
         # overused phrases, no overdwelt subjects, no lines-already-said. It
         # was writing with no memory of the show at all beyond fourteen chat
         # rows, which on the coalesced road is three or four turns.
-        + avoid_reruns() + approach_clause(approach_pick()))
+        + avoid_reruns() + approach_clause(approach_pick())
+        # #1027: the long-form round is never banked, so the second pass
+        # can never reach it. This is its only chance to be tinted.
+        + crystal_tint_note())
     try:
         script = await ask_model(
             prompt,
@@ -47650,7 +47692,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
             + f".{playing}{only_song}{aside}{show_memory()}{call_flow}"
-            f"{crystal_clause()}{avoid_reruns()}{approach_clause(_approach)}\n\n"
+            f"{crystal_clause(bank)}{avoid_reruns()}"
+            f"{approach_clause(_approach)}\n\n"
             # #842: the banked round is told it is being PRE-RECORDED, so
             # the model spends the room it has been given on more lines
             # rather than on a tighter version of the same six.
@@ -47984,7 +48027,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # any doubt at all.
     if bank and not caller_name and _verbatim:
         try:
-            _blended = await blend_script(script, _verbatim, caller_name)
+            _blended = await blend_script(script, _verbatim, caller_name,
+                                          bank)                   # #1027
             if _blended and _blended != script:
                 script = _blended
                 # The blend may answer a passage with a turn of its own,
@@ -48083,7 +48127,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
 
 
 async def blend_script(script: str, verbatim: list[Any] | None = None,
-                       caller_name: str = "") -> str:
+                       caller_name: str = "", bank: bool = False) -> str:
     """#862: THE REPROCESS PASS - the stage that was missing.
 
     A round is built in three movements that never met. The model WRITES
@@ -48156,7 +48200,7 @@ async def blend_script(script: str, verbatim: list[Any] | None = None,
             "turns, keep the subject and the energy. No markdown, no "
             "stage directions, no commentary about the rewrite, no "
             "preamble - return the script and nothing else."
-            + crystal_clause()
+            + crystal_clause(bank)                              # #1027
             + f"\n\nTHE PASSAGES:\n{quoted}\n\nTHE SCRIPT:\n{script}",
             limit=min(budget, max(900, len(script) + 300)),
             spice=0.3, num_ctx=16384)
@@ -55047,7 +55091,7 @@ def crystal_sources(c: dict[str, Any]) -> bool:
         return False
 
 
-def crystal_clause() -> str:
+def crystal_clause(bank: bool = False) -> str:
     """The world-tint. Every crystal switched ON leans the show's writing
     toward its subject matter — hosts, callers, ads, the town itself.
 
@@ -55059,7 +55103,14 @@ def crystal_clause() -> str:
     if not ons:
         return ""
     try:
-        if bool(dj_settings().get("crystal_tint_pass", True)):
+        # #1027: ...only for a round that is actually going to BE
+        # rewritten. This used to stand aside for every prompt on the
+        # station whenever the two-pass was on, and the two-pass only
+        # ever runs on banked rounds - so the entire live show, every
+        # advert, every station ID and every track link went out
+        # untinted. A round with no second pass coming has no
+        # before-and-after to protect.
+        if bank and bool(dj_settings().get("crystal_tint_pass", True)):
             return ""
     except Exception:  # noqa: BLE001
         pass
@@ -55195,6 +55246,11 @@ def crystal_material(most: int = 3, cap: int = 700,
 # talks, do not quote it and do not mention it.
 _CRYSTAL_POOL: dict[str, Any] = {"at": 0.0, "rows": []}
 CRYSTAL_POOL_LIFE = 300.0
+# #1025: the stored chunks are NOT 600 characters. speakbox_lines caps
+# every line it emits at 200 before speakbox_reindex ever stores it, so
+# crystal_tint_chars does nothing at all above about 200 and the comment
+# that used to sit here reasoned from a length the indexer never
+# delivers. Left at a value that cannot cut, so the passages arrive whole.
 CRYSTAL_STYLE_MOST = 3
 # Long enough to hear a cadence in. The stored chunks run to 600
 # characters; 260 was cutting most of them mid-thought, and half a line
@@ -55213,7 +55269,17 @@ def crystal_lines(most: int = 0, cap: int = 0) -> list[dict[str, Any]]:
     cap = cap or CRYSTAL_STYLE_CAP
     try:
         now = time.time()
+        # #1025: KEYED BY WHICH CRYSTAL IS ON. The pool was one global
+        # refreshed every five minutes, so switching crystals served the
+        # PREVIOUS one's lines for up to five minutes afterwards - the
+        # tint would be labelled with the new world and imitating the old
+        # one, which is the worst of both.
+        _key = "|".join(sorted(str(c.get("name") or "")
+                               for c in crystal_active()))
+        if str(_CRYSTAL_POOL.get("key") or "") != _key:
+            _CRYSTAL_POOL["at"] = 0.0
         if now - float(_CRYSTAL_POOL.get("at") or 0) > CRYSTAL_POOL_LIFE:
+            _CRYSTAL_POOL["key"] = _key
             _CRYSTAL_POOL["rows"] = crystal_material(240, cap, ceiling=240)
             _CRYSTAL_POOL["at"] = now
         rows = list(_CRYSTAL_POOL.get("rows") or [])
@@ -55279,6 +55345,32 @@ TINT_TURNS_MOST = 22
 TINT_TURN_FLOOR = 24
 
 
+# #1026: phrases that only ever appear when the model is talking about
+# the job rather than doing it. Deliberately narrow - every one of these
+# is about PROMPTS and REWRITING, which a line of radio dialogue has no
+# reason to mention. "line" and "rewrite" alone would be too broad; the
+# pair of them together is not.
+_META_TELLS = (
+    "you haven't provided", "you have not provided", "you didn't provide",
+    "the specific line", "the line you want", "you want me to rewrite",
+    "want me to rewrite", "please provide", "provide the line",
+    "as an ai", "i cannot rewrite", "i can't rewrite", "i need the line",
+    "the setup you gave", "you gave me for", "here is the rewritten",
+    "here's the rewritten", "rewritten line:", "sure, here",
+    "i'm ready when you", "im ready when you", "let me know the line",
+)
+
+
+def _looks_meta(said: str) -> bool:
+    """#1026: is this the model talking about the task instead of doing
+    it? A line of radio dialogue never mentions prompts or rewriting."""
+    try:
+        low = " ".join(str(said or "").lower().split())
+        return any(tell in low for tell in _META_TELLS)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                        answering: str = "", keep: list[str] | None = None
                        ) -> str:
@@ -55303,7 +55395,13 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
         f"THE WORLD: {world}\n\n"
         + ("HOW IT TALKS - its own lines, word for word. This is the "
            "specification:\n"
-           + "\n\n".join(str(c.get("text") or "") for c in chunks[:4])
+           # #1025: was chunks[:4]. The turn-by-turn path is taken for
+           # every round of 22 turns or fewer, which is essentially all
+           # of them, so that slice WAS the setting: crystal_tint_chunks
+           # at its default of 5 sent 4, and at 12 still sent 4. Two
+           # thirds of the dial did nothing. The whole-round path, which
+           # honoured it, is only the fallback for very long rounds.
+           + "\n\n".join(str(c.get("text") or "") for c in chunks)
            + "\n\n" if chunks else "")
         + "MATCH THE FORM, NOT JUST THE WORDS. If those lines rhyme, YOUR "
           "LINE RHYMES - internal rhyme inside the line, multi-syllable "
@@ -55344,6 +55442,27 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     except Exception:  # noqa: BLE001
         return said
     out = " ".join(str(got or "").split()).strip().strip('"')
+    if _looks_meta(out):
+        # #1026: it answered the prompt. Ask once more, plainly, and if
+        # it does it again the original line stands - an untinted turn is
+        # a small loss, a host explaining that he was not given a line to
+        # rewrite is the show breaking.
+        try:
+            got = await ask_model(
+                "Rewrite this ONE line of radio dialogue in the voice "
+                f"described below. Do not comment, do not explain, do not "
+                f"ask for anything - return the rewritten line and "
+                f"nothing else.\n\nTHE VOICE: {world}\n\nTHE LINE:\n"
+                + said,
+                limit=max(120, len(said) * 2), spice=0.6,
+                mark={"kind": "tint turn",
+                      "for": "the same turn, asked again after the model "
+                             "answered the prompt instead of the line"})
+            out = " ".join(str(got or "").split()).strip().strip('"')
+        except Exception:  # noqa: BLE001
+            out = said
+        if _looks_meta(out):
+            return said
     if " ".join(out.split()).lower() == " ".join(said.split()).lower():
         # #1021: it handed the line straight back. One more ask, told
         # plainly what it just did - cheaper than a round that is tinted
@@ -55415,17 +55534,28 @@ async def crystal_tint(script: str, kind: str = "",
         keep: list[str] = []
         try:
             for row in (verbatim or []):
-                text = ""
+                # #1024: `held`, NOT `text`. `text` is the round, and
+                # this loop used to overwrite it with the last quoted
+                # passage - see the note at the top of this change.
+                held = ""
                 if isinstance(row, (list, tuple)) and len(row) > 1:
-                    text = str(row[1] or "")
+                    held = str(row[1] or "")
                 elif isinstance(row, str):
-                    text = row
-                text = " ".join(text.split())
-                if len(text) > 30:
-                    keep.append(text[:600])
+                    held = row
+                held = " ".join(held.split())
+                if len(held) > 30:
+                    keep.append(held[:600])
             del keep[:-4]
         except Exception:  # noqa: BLE001
             keep = []
+        # #1024: and it is now impossible for that loop to have eaten the
+        # round without this being loud about it. A tint that has lost
+        # its own input is worse than no tint, because it replaces the
+        # banked round with whatever came back.
+        if not text or text != str(script or "").strip():
+            out["why"] = ("the round was lost before the tint could run - "
+                          "refusing rather than rewriting the wrong text")
+            return out
         out["keep"] = list(keep)
         world = crystal_world_prompt()
         out["world"] = world
@@ -55581,6 +55711,10 @@ async def crystal_tint(script: str, kind: str = "",
         # version" beside an original it was a copy of. Two versions that
         # are the same version is worse than one, because it makes the
         # comparison meaningless and hides that the pass did nothing.
+        if _looks_meta(tinted):                                  # #1026
+            out["why"] = ("the pass answered the prompt instead of "
+                          "rewriting the round, so the plain one stands")
+            return out
         _a = " ".join(text.split())
         _b = " ".join(tinted.split())
         if _a == _b:
