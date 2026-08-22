@@ -6142,19 +6142,47 @@ function wkDeskEntry(id, c) {
   const t = mk2("div", "wkDeskEntry");
   t.wkId = id;
   t.wkKey = key;
-  t.style.cssText = "border-left:2px solid #3f7fa8;padding-left:7px;"
-    + "margin:6px 0";
-  const label = (c.kind || "a round") + " \u00b7 " + (c.ms || 0)
+  /* #1019: "Highlight the entries that are tinted."
+   *
+   * Two kinds, and the difference is worth seeing at a glance because it
+   * is exactly what #1018 was about:
+   *
+   *   lines   - the crystal's OWN WORDS went into the prompt. This is a
+   *             real tint and the round should come back sounding like
+   *             the world.
+   *   flavour - only the crystal's DESCRIPTION went. That is a label for
+   *             a style rather than the style, and a round tinted this
+   *             way is the thing the operator photographed.
+   *
+   * The left rule and the name carry the colour so a tinted call is
+   * findable in a list of forty without opening anything. */
+  const tint = String(c.tinted || "");
+  const tintCol = tint === "lines" ? "#c8a6ff"
+                : tint === "flavour" ? "#8f7fb8" : "";
+  t.style.cssText = "border-left:2px solid " + (tintCol || "#3f7fa8")
+    + ";padding-left:7px;margin:6px 0"
+    + (tint ? ";background:rgba(200,166,255,.05)" : "");
+  const label = (tint === "lines" ? "\u25c8 " : tint ? "\u25c7 " : "")
+    + (c.kind || "a round") + " \u00b7 " + (c.ms || 0)
     + " ms \u00b7 " + (c.chars || 0) + " chars \u00b7 ctx "
     + (c.num_ctx || "?") + " \u00b7 temp "
     + (c.temp != null ? c.temp : "?");
   t.wkLabel = label;
   const nm = mk2("div", "");
-  nm.style.cssText = "font-size:10.5px;font-weight:700;color:#9fd8ff;"
-    + "cursor:pointer;user-select:none";
+  nm.style.cssText = "font-size:10.5px;font-weight:700;color:"
+    + (tintCol || "#9fd8ff") + ";cursor:pointer;user-select:none";
   nm.textContent = (open ? "\u25be " : "\u25b8 ") + label;
   nm.title = "Click to open this call \u2014 the prompt as sent, "
-    + "what was governing it, and the script that came back";
+    + "what was governing it, and the script that came back"
+    + (tint === "lines"
+       ? "\n\n\u25c8 TINTED: the crystal's own lines went into this "
+         + "prompt, so this call was asked to talk like that world "
+         + "rather than to be told about it."
+       : tint === "flavour"
+       ? "\n\n\u25c7 TINTED BY DESCRIPTION ONLY: the crystal's summary "
+         + "went in, but none of its actual words. That is a label for a "
+         + "style rather than the style."
+       : "");
   t.wkHead = nm;
   t.appendChild(nm);
   /* #984: A ROW SAYS SOMETHING WHEN IT IS SHUT.
@@ -6183,6 +6211,16 @@ function wkDeskEntry(id, c) {
     wkPutInto(inner, "GOVERNED BY",
       (c.armed ? "system prompt: " + c.armed : "")
       + (c.sched ? (c.armed ? "\n\n" : "") + c.sched : ""));
+    /* #1019: "when I expand those I want to see what is being done as
+     * far as the tinting process for that particular prompt."
+     *
+     * Put ABOVE the prompt on purpose. On a tinting call the prompt is
+     * mostly the conversation being rewritten, and burying the thing
+     * that makes this call different underneath three thousand
+     * characters of it is how you look at a window and learn nothing. */
+    if (tint) {
+      wkDeskTint(inner, c, tint);
+    }
     wkPutInto(inner, "WHAT WE SENT", c.prompt, true);
     wkPutInto(inner, "WHAT CAME BACK", c.script || c.text, true);
   } catch (e) { /* an entry with no paperwork still lists */ }
@@ -6539,6 +6577,78 @@ function wkDeskForget(id) {
     delete all["desk:" + id];
     localStorage.setItem("wkDeskOpened", JSON.stringify(all));
   } catch (e) { /* nothing here is worth the drawer */ }
+}
+
+/* #1019: what the tint did to THIS prompt.
+ *
+ * The two-pass rewrite hands over its whole working - the world, the
+ * passages of the crystal's own material that were injected, the
+ * passages it was told to leave alone, and the text going in - so this
+ * can show the before and the after of that one call. Every other tinted
+ * call carries only the fact that it was tinted, and says so plainly
+ * rather than drawing an empty frame. */
+function wkDeskTint(box, c, tint) {
+  const mk3 = (tag, css, text) => {
+    const n = document.createElement(tag);
+    if (css) n.style.cssText = css;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const head = mk3("div", "font-size:9px;letter-spacing:.06em;margin:8px 0 "
+    + "3px;color:#c8a6ff",
+    tint === "lines" ? "\u25c8 THE TINTING ON THIS PROMPT"
+                     : "\u25c7 TINTED BY DESCRIPTION ONLY");
+  box.appendChild(head);
+  const world = String(c.tint_world || "");
+  const before = String(c.tint_before || "");
+  const passages = c.tint_passages || [];
+  const keep = c.tint_keep || [];
+  const line = (text) => {
+    box.appendChild(mk3("div", "font-size:10px;line-height:1.5;"
+      + "margin:0 0 4px;padding-left:9px;border-left:2px solid #4a3d66;"
+      + "color:#c8d6e4", text));
+  };
+  if (world) line("the world: " + world);
+  if (tint === "lines" && !passages.length) {
+    line("the crystal's own lines went into this prompt as a style "
+         + "reference \u2014 look for \u201cHOW THAT WORLD ACTUALLY "
+         + "TALKS\u201d in what we sent, below.");
+  }
+  if (tint === "flavour") {
+    line("only the crystal's description went in, not its words. A "
+         + "round tinted this way tends to come back with the world's "
+         + "NOUNS in it and none of its voice.");
+  }
+  if (c.purpose === "tint") {
+    line("this call IS the tinting pass \u2014 a finished round going "
+         + "back through the model to be moved into that world. What "
+         + "came back is the tinted version; the original is below.");
+  }
+  passages.forEach((pz, i) => {
+    wkPutInto(box, "PASSAGE " + (i + 1) + " OF THE CRYSTAL'S OWN WORDS"
+      + (pz.file ? " \u2014 " + pz.file : ""), pz.text, true);
+  });
+  (keep || []).forEach((v, i) => {
+    wkPutInto(box, "LEFT WORD FOR WORD " + (i + 1)
+      + " (quoted material)", v, true);
+  });
+  if (before) {
+    wkPutInto(box, "THE ROUND BEFORE THE TINT", before, true);
+    /* How much of it actually moved. A tint you cannot measure is a tint
+     * you cannot tell from a tidy-up, which is the fault #1018 found. */
+    try {
+      const a = before.replace(/\s+/g, " ").trim();
+      const b = String(c.script || c.text || "").replace(/\s+/g, " ").trim();
+      let same = 0;
+      while (same < a.length && same < b.length && a[same] === b[same]) same++;
+      line(a.length + " chars in, " + b.length + " out \u2014 identical for "
+           + "the first " + same + " ("
+           + Math.round(100 * same / Math.max(1, a.length)) + "%). "
+           + (same > a.length * 0.5
+              ? "That is a tidy-up, not a tint."
+              : "That is a real rewrite."));
+    } catch (e) { /* the block still reads */ }
+  }
 }
 
 /* One labelled block inside an entry - the same look as wkPut. */

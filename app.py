@@ -50831,8 +50831,18 @@ def writing_profile() -> dict[str, float]:
         return {}
 
 
+# #1019: the two marks the desk listing colours a row by. A prompt
+# carrying either of these has had the crystal in it, and the operator
+# asked to be able to see which. Kept as constants because the strings
+# are written in two other places and a typo would silently stop the
+# highlighting rather than break anything loudly.
+TINT_MARK_LINES = "HOW THAT WORLD ACTUALLY TALKS"
+TINT_MARK_FLAVOUR = "Let this flavour bleed all the way through it"
+
+
 async def ask_model(prompt: str, limit: int = 300,
-                    spice: float = 0.0, num_ctx: int = 0) -> str:
+                    spice: float = 0.0, num_ctx: int = 0,
+                    mark: dict[str, Any] | None = None) -> str:
     """A plain model call for the agent's own voice lines — no web search, no
     gear manuals, no technical feed, and nothing written to history. Routing
     an internal prompt through generate_answer makes it look like something
@@ -50972,7 +50982,28 @@ async def ask_model(prompt: str, limit: int = 300,
                              or settings["num_ctx"]))
     except Exception:  # noqa: BLE001
         _armed, _ctx = "", 0
+    # #1019: WAS THE CRYSTAL IN THIS PROMPT, AND HOW.
+    #
+    # Detected from the prompt rather than declared at each site, so
+    # every road that tints - the two-pass rewrite, the SFX guy's warps
+    # and news takes, the memo from upstairs, and the clause that rides
+    # ordinary rounds when the second pass is off - lights up in the desk
+    # listing without any of them having to be told to. `mark` is the
+    # richer half: crystal_tint hands over the world, the passages and
+    # the text going in, because a tint you can see but not inspect is
+    # only half of what was asked for.
+    _tinted = ""
+    try:
+        _p = str(prompt or "")
+        if TINT_MARK_LINES in _p:
+            _tinted = "lines"          # the crystal's own words went too
+        elif TINT_MARK_FLAVOUR in _p or "CRYSTAL IS ON" in _p:
+            _tinted = "flavour"        # the description only
+    except Exception:  # noqa: BLE001
+        _tinted = ""
     _MODEL_CALLS.append({"at": time.time(), "model": settings["model"],
+                         "tinted": _tinted,
+                         **(dict(mark or {})),
                          "ms": took, "chars": len(kept),
                          "temp": round(temperature, 2),
                          "budget": limit, "text": kept[:400],
@@ -55232,8 +55263,17 @@ async def crystal_tint(script: str, kind: str = "",
         # #1018: with some spice. A rewrite asked for at the default
         # temperature comes back as the input with the commas fixed,
         # which is what "tidying is not tinting" was written about.
-        got = await ask_model(prompt, limit=max(600, len(text) + 400),
-                              spice=0.55)
+        got = await ask_model(
+            prompt, limit=max(600, len(text) + 400), spice=0.55,
+            # #1019: everything the desk listing needs to open this call
+            # out into "what the tinting did to this particular prompt".
+            mark={"purpose": "tint",
+                  "tint_world": world,
+                  "tint_before": text[:6000],
+                  "tint_passages": [{"file": str(c.get("file") or ""),
+                                     "text": str(c.get("text") or "")[:900]}
+                                    for c in chunks],
+                  "tint_keep": list(keep)})
         out["ms"] = int((time.monotonic() - began) * 1000)
         tinted = str(got or "").strip()
         # A pass that came back empty, or that lost most of the round, is
