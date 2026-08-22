@@ -9768,13 +9768,17 @@ _SHELF: dict[str, list[dict[str, Any]]] = {}
 # seconds test in shelf_full() is still the ordinary governor - this only
 # moves the hard stop, so a road that is already covered does not write
 # more just because it may.
-SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 7, "caller": 4,
+# #1055: "whenever there is spare room, up to 8 per kind." Callers go
+# 4 -> 8 and the gallery 7 -> 8; the adverts were already there. Eight
+# items at twelve airings is ninety-six goes, which at three an hour is
+# thirty-two hours before anything is heard twice.
+SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 8, "caller": 8,
               # #855: the gallery press. Nine of the owner's sixty
               # canonical minutes, the DEAREST road on the board - up to
               # four vision passes before a word of it is written - and
               # the one thing on the board that cannot go stale, because
               # a painting pitch is as good in an hour as it is now.
-              "gallery": 7,
+              "gallery": 8,          # #1055
               # #855: a bulletin, and ONE at a time. Deliberately not
               # stocked: news goes off, so prep_news() writes one only
               # when the running order is about to want it and never
@@ -9854,6 +9858,10 @@ SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id", "caller")
 # How long an aired item rests before it may go out again. The operator
 # asked for three hours.
 SHELF_REUSE_REST = float(os.getenv("SHELF_REUSE_REST", "10800"))
+# #1060: who is on the microphones, kept across restarts. See
+# session_voices - the cupboard's footage goes off when the cast
+# changes, so the cast may not change just because the process did.
+CAST_PATH = data_path("cast.json")
 # ...and how many times one item may ever air, so a road that has stopped
 # being written does not become a loop of the same four messages.
 SHELF_REUSE_MOST = 3
@@ -9865,14 +9873,75 @@ SHELF_REUSE_MOST = 3
 #
 # Three innings against a three-hour rest is one airing a shift, which
 # is not a cupboard, it is a souvenir.
-SHELF_REUSE_EVERGREEN = ("ad", "gallery", "station_id")
+# #1055: ...and the calls, which were the biggest single debt left in
+# the hour. Guarded by repeat_safe below - a call that names tonight,
+# or the record that just played, is not evergreen however cheap it is.
+SHELF_REUSE_EVERGREEN = ("ad", "gallery", "station_id",
+                         "caller", "manager")
+
+# #1055: words that tie a segment to the moment it was made. A repeat
+# carrying any of these cannot come back three hours later without
+# giving the game away.
+#
+# Deliberately blunt and deliberately over-broad: keeping a re-airable
+# call OUT of the cupboard costs a little room, and letting a
+# time-bound one back IN costs the illusion, which is the whole product.
+_REPEAT_STALE = re.compile(
+    r"\b(tonight|today|this morning|this afternoon|this evening|"
+    r"right now|just now|a moment ago|earlier|last hour|this hour|"
+    r"just played|just heard|just went out|coming up next|up next|"
+    r"o.?clock|minutes? past|half past|quarter (to|past)|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"yesterday|tomorrow|breaking|live)\b", re.I)
+
+
+def repeat_safe(kind: str, row: dict[str, Any]) -> bool:
+    """#1055: may this segment be heard again in three hours?
+
+    An advert names a product and a painting read names a picture -
+    both as true later as now. A phone call may name the record that
+    just played. Only the time-bound kinds are actually tested; the
+    evergreen ones are evergreen by their nature."""
+    try:
+        if str(kind) not in ("caller", "manager"):
+            return True
+        said = str(row.get("text") or "")
+        if not said:
+            entry = row.get("entry")
+            if isinstance(entry, dict):
+                said = str(entry.get("script")
+                           or entry.get("script_plain") or "")
+        if not said:
+            return True             # nothing to judge; the row is short
+        return not _REPEAT_STALE.search(said[:4000])
+    except Exception:  # noqa: BLE001
+        return True
 SHELF_REUSE_MOST_EVERGREEN = 12
 
 
 def shelf_innings(kind: str) -> int:
-    """How many times one item of this kind may ever go out."""
-    return (SHELF_REUSE_MOST_EVERGREEN
+    """How many times one item of this kind may ever go out.
+
+    #1059: plus whatever the operator answered to "how often should a
+    repeat be allowed back on air"."""
+    base = (SHELF_REUSE_MOST_EVERGREEN
             if str(kind) in SHELF_REUSE_EVERGREEN else SHELF_REUSE_MOST)
+    try:
+        return max(1, min(60, base + int(orch_policy("innings_bonus") or 0)))
+    except Exception:  # noqa: BLE001
+        return base
+
+
+def shelf_reuse_rest() -> float:
+    """#1059: how long a repeat rests before it may go out again -
+    the operator's standing answer, or the default."""
+    try:
+        got = orch_policy("reuse_rest")
+        if got is not None:
+            return max(600.0, min(86400.0, float(got)))
+    except Exception:  # noqa: BLE001
+        pass
+    return SHELF_REUSE_REST
 
 
 def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
@@ -9884,6 +9953,8 @@ def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
             return False
         if not float(row.get("aired_at") or 0):
             return False
+        if not repeat_safe(kind, row):                            # #1055
+            return False
         return int(row.get("aired") or 0) < shelf_innings(kind)
     except Exception:  # noqa: BLE001
         return False
@@ -9894,7 +9965,7 @@ def shelf_repeat_ready(kind: str, row: dict[str, Any]) -> bool:
     try:
         if not shelf_is_repeat(kind, row):
             return False
-        if time.time() - float(row.get("aired_at") or 0) < SHELF_REUSE_REST:
+        if time.time() - float(row.get("aired_at") or 0)                 < shelf_reuse_rest():                             # #1059
             return False
         key = str(row.get("key") or "")
         return not key or bool(pantry_get(key))
@@ -9911,7 +9982,7 @@ def shelf_repeats(kind: str = "") -> list[dict[str, Any]]:
             for row in (_SHELF.get(one) or []):
                 if not shelf_is_repeat(one, row):
                     continue
-                rest = max(0.0, SHELF_REUSE_REST
+                rest = max(0.0, shelf_reuse_rest()          # #1059
                            - (time.time() - float(row.get("aired_at") or 0)))
                 out.append({
                     "kind": one,
@@ -10266,6 +10337,13 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         row = dict(row)
         row.setdefault("at", time.time())
         row["kind"] = str(kind)
+        # #1057: WHO WAS ON THE MICROPHONES. Footage is audio, not
+        # words - a recast makes every banked second the wrong person,
+        # and nothing in the station checked.
+        try:
+            row.setdefault("cast", cast_signature())
+        except Exception:  # noqa: BLE001
+            pass
         # #968: judged as it is shelved, while the script is right here.
         try:
             _entry = row.get("entry")
@@ -10326,8 +10404,15 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         except Exception:  # noqa: BLE001
             pass
         if str(kind) in SHELF_REUSABLE:
+            # #1055: fresh first, then rested repeats - but AT RANDOM
+            # among the rested rather than strictly oldest-first, which
+            # deals the same rotation every time. The operator asked for
+            # the choice to be random; a cupboard that always deals off
+            # the top of the deck is a rota.
             _order.sort(key=lambda r: (1 if r.get("aired_at") else 0,
-                                       float(r.get("aired_at") or 0)))
+                                       int(r.get("aired") or 0),
+                                       random.random() if r.get("aired_at")
+                                       else float(r.get("at") or 0)))
         _why: list[str] = []                                   # #1003
         for row in _order:
             if time.time() - float(row.get("at") or 0) > PANTRY_BURN_SECONDS:
@@ -10342,12 +10427,19 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 if int(row.get("aired") or 0) >= shelf_innings(kind):
                     _why.append("innings used")   # #1052
                     continue        # it has had its innings
-                if time.time() - _out_at < SHELF_REUSE_REST:
+                # #1059: ...unless the operator has said to raid the
+                # cupboard regardless. "Fill the gaps from the cupboard"
+                # is an answer about exactly this moment.
+                if (time.time() - _out_at < shelf_reuse_rest()
+                        and not orch_policy("repeats_hard")):
                     _why.append("resting")
                     continue        # still resting
             if voice and str(row.get("voice") or "") != str(voice):
                 _why.append("voice moved")
                 continue            # prepared for a seat that has changed
+            if shelf_cast_stale(row):                             # #1057
+                _why.append("recast")
+                continue            # made by a cast that has since changed
             key = str(row.get("key") or "")
             if key and not pantry_get(key):
                 _why.append("clip gone")
@@ -20653,6 +20745,191 @@ TRACK_TALK_MAX = 60                     # rows held; they are only text
 _TRACK_TALK: dict[str, dict[str, Any]] = {}
 
 
+# --- THE TRACK LIBRARY (#1061) ----------------------------------------
+# A read written about a specific record is filed against that record
+# and offered again the next time it is cued. See the note at the top of
+# the #1061 change: an intro for a song is not perishable like a
+# bulletin, it is durable like an advert, and it can only ever be used
+# in one place.
+TRACK_READS_PATH = data_path("track_reads.json")
+# How long a read is kept for a record nobody has favourited. A
+# favourite is kept for ever.
+TRACK_READ_KEEP = float(os.getenv("TRACK_READ_KEEP", str(90 * 86400)))
+TRACK_READ_MAX = 4000
+_TRACK_READS: dict[str, dict[str, Any]] = {}
+_TRACK_READ_LOCK = RLock()
+_TRACK_READ_ON = [False]
+
+
+def track_reads_load() -> dict[str, dict[str, Any]]:
+    if not _TRACK_READ_ON[0]:
+        with _TRACK_READ_LOCK:
+            if not _TRACK_READ_ON[0]:
+                try:
+                    got = json.loads(TRACK_READS_PATH.read_text())
+                    if isinstance(got, dict):
+                        _TRACK_READS.update(
+                            {k: v for k, v in got.items()
+                             if isinstance(v, dict)})
+                except Exception:  # noqa: BLE001
+                    pass
+                _TRACK_READ_ON[0] = True
+    return _TRACK_READS
+
+
+def track_reads_save() -> None:
+    try:
+        TRACK_READS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TRACK_READS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_TRACK_READS, indent=1, default=str))
+        tmp.replace(TRACK_READS_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def track_loved(tid: str) -> bool:
+    """Has the operator favourited this record?"""
+    try:
+        want = str(tid or "")
+        for row in loved_tracks(400):
+            if str(row.get("id") or "") == want:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+def track_read_keep(track: dict[str, Any] | None, part: str,
+                    row: dict[str, Any] | None) -> None:
+    """#1061: file a read against its record, rather than losing it.
+
+    Called where the read would otherwise be consumed. The words are
+    what matter; the audio key rides along and is used if the pantry
+    still has it when the record next comes round."""
+    try:
+        tid = str((track or {}).get("id") or "")
+        said = str((row or {}).get("text") or "")
+        if not tid or len(said) < 12:
+            return
+        with _TRACK_READ_LOCK:
+            reads = track_reads_load()
+            seat = reads.setdefault(tid, {
+                "id": tid,
+                "title": str((track or {}).get("title") or "")[:200],
+                "artist": str((track or {}).get("artist") or "")[:140],
+            })
+            seat["title"] = (str((track or {}).get("title") or "")[:200]
+                             or seat.get("title") or "")
+            seat[str(part)] = {
+                "text": said[:4000],
+                "key": str((row or {}).get("key") or ""),
+                "voice": str((row or {}).get("voice") or ""),
+                "cast": cast_signature(),
+                "at": float((row or {}).get("at") or time.time()),
+                "aired": int(((seat.get(part) or {}).get("aired") or 0)) + 1,
+            }
+            seat["last"] = time.time()
+            track_reads_save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def track_read_take(track: dict[str, Any] | None, part: str
+                    ) -> dict[str, Any] | None:
+    """#1061: the read this record already has, if there is one.
+
+    The WORDS survive a recast; only the recording does not. So a read
+    whose cast has changed comes back without its audio key - one render
+    rather than a whole model visit, which is the saving that matters."""
+    try:
+        tid = str((track or {}).get("id") or "")
+        if not tid:
+            return None
+        seat = (track_reads_load().get(tid) or {})
+        got = seat.get(str(part)) or {}
+        said = str(got.get("text") or "")
+        if len(said) < 12:
+            return None
+        if not track_loved(tid):
+            if time.time() - float(got.get("at") or 0) > TRACK_READ_KEEP:
+                return None
+        out = {"text": said, "voice": str(got.get("voice") or ""),
+               "at": float(got.get("at") or 0),
+               "from_library": True,
+               "aired": int(got.get("aired") or 0)}
+        # The recording only survives if the cast has not moved and the
+        # pantry still holds it.
+        key = str(got.get("key") or "")
+        if (key and str(got.get("cast") or "") == cast_signature()
+                and pantry_get(key)):
+            out["key"] = key
+        return out
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def track_reads_trim() -> int:
+    """Let go of reads for records nobody has favourited and nobody has
+    played in a long time. A favourite is never trimmed."""
+    gone = 0
+    try:
+        with _TRACK_READ_LOCK:
+            reads = track_reads_load()
+            now = time.time()
+            for tid in list(reads):
+                seat = reads.get(tid) or {}
+                if track_loved(tid):
+                    continue
+                if now - float(seat.get("last") or 0) <= TRACK_READ_KEEP:
+                    continue
+                reads.pop(tid, None)
+                gone += 1
+            if len(reads) > TRACK_READ_MAX:
+                for tid in sorted(
+                        reads, key=lambda k: float(
+                            (reads.get(k) or {}).get("last") or 0)
+                )[:len(reads) - TRACK_READ_MAX]:
+                    if not track_loved(tid):
+                        reads.pop(tid, None)
+                        gone += 1
+            if gone:
+                track_reads_save()
+    except Exception:  # noqa: BLE001
+        pass
+    return gone
+
+
+def track_reads_state() -> dict[str, Any]:
+    """The library, for reading."""
+    reads = track_reads_load()
+    rows = []
+    try:
+        for tid, seat in reads.items():
+            parts = {p: {"aired": int((seat.get(p) or {}).get("aired") or 0),
+                         "text": str((seat.get(p) or {}).get("text")
+                                     or "")[:200]}
+                     for p in ("intro", "outro", "ad")
+                     if (seat.get(p) or {}).get("text")}
+            if not parts:
+                continue
+            rows.append({"id": tid,
+                         "title": str(seat.get("title") or "")[:120],
+                         "artist": str(seat.get("artist") or "")[:90],
+                         "loved": track_loved(tid),
+                         "last": float(seat.get("last") or 0),
+                         "parts": parts})
+        rows.sort(key=lambda r: (not r["loved"], -float(r["last"] or 0)))
+    except Exception:  # noqa: BLE001
+        pass
+    return {"at": time.time(), "held": len(rows), "rows": rows[:300],
+            "loved": sum(1 for r in rows if r["loved"]),
+            "keep_days": round(TRACK_READ_KEEP / 86400.0, 1),
+            "say": (f"{len(rows)} record(s) have a read on file, "
+                    f"{sum(1 for r in rows if r['loved'])} of them "
+                    "favourites which are kept for ever"
+                    if rows else "no record has a read on file yet")}
+
+
 def track_talk_ahead() -> int:
     try:
         got = int(dj_settings().get("track_talk_ahead")
@@ -20714,10 +20991,24 @@ def track_talk_get(track: dict[str, Any] | None, part: str,
         row = _TRACK_TALK.get(tid) or {}
         got = row.get(part) or {}
         if not str(got.get("text") or ""):
+            # #1061: nothing prepared for this record THIS time - but it
+            # may have been talked about before. A read belongs to its
+            # record, so the library answers before anybody writes.
+            held = track_read_take(track, part)
+            if held:
+                return held
             return None
         if time.time() - float(got.get("at") or 0) > PANTRY_BURN_SECONDS:
             return None
         if take:
+            # #1061: FILED, not lost. "A send-off is said once" is right
+            # about this hour and wrong about this record - the words
+            # are as true the next time it is cued, and they cost a
+            # model visit and a vision pass to write.
+            try:
+                track_read_keep(track, part, got)
+            except Exception:  # noqa: BLE001
+                pass
             row.pop(part, None)
             if not (row.get("intro") or row.get("outro")):
                 _TRACK_TALK.pop(tid, None)
@@ -21817,8 +22108,38 @@ SLOT_DUTY = 0.66
 # what it protects LONGEST. Colour goes before content, content goes
 # before promises, and the banter is last because it is the spine - a
 # half hour with no banter is not a thin show, it is a silent one.
-SLOT_POSTPONE = ("station_id", "track_talk", "gallery", "ad",
-                 "news", "manager", "caller", "banter")
+# #1055: the operator's own order. Gallery goes first because the
+# cupboard covers it and it is the dearest thing on the board; then the
+# furniture; then news, ad, manager, caller.
+#
+# BANTER IS NOT ON THIS LIST AT ALL. It was last on it before, which is
+# not the same thing - a list can be walked to its end, and a half hour
+# that has stood down its banter has stood down the show. If the sum
+# still does not fit with everything else given up, the slot is
+# reported as "cannot" and the banter still gets made.
+SLOT_POSTPONE = ("gallery", "station_id", "track_talk",
+                 "news", "ad", "manager", "caller")
+
+
+def slot_postpone() -> tuple[str, ...]:
+    """#1059: the stand-down ladder, as the operator last answered it.
+
+    "Which road should I protect hardest" takes a road OFF the ladder
+    altogether - the same standing banter has. "And which should give
+    way first" puts one at the front. Everything unmentioned keeps its
+    place, so one answer does not silently reorder the whole show."""
+    order = list(SLOT_POSTPONE)
+    try:
+        keep = str(orch_policy("prefer_road") or "")
+        if keep and keep in order:
+            order.remove(keep)
+        first = str(orch_policy("postpone_first") or "")
+        if first and first in order:
+            order.remove(first)
+            order.insert(0, first)
+    except Exception:  # noqa: BLE001
+        return tuple(SLOT_POSTPONE)
+    return tuple(order)
 
 
 def slot_index(when: float = 0.0) -> int:
@@ -21917,7 +22238,8 @@ def slot_supply() -> dict[str, list[float]]:
                     if not shelf_is_repeat(kind, row):
                         continue                # aired and not reusable
                     # In the cupboard. Free when it has finished resting.
-                    when.append(max(0.0, out_at + SHELF_REUSE_REST - now))
+                    when.append(max(0.0, out_at              # #1059
+                                    + shelf_reuse_rest() - now))
                 except Exception:  # noqa: BLE001
                     continue
             if when:
@@ -22025,7 +22347,7 @@ def slot_read(idx: int, stock: dict[str, int] | None = None
         # most afford to lose them, and SAY WHICH.
         left = float(out["cost"])
         by_prep = {r["prep"]: r for r in out["short"]}
-        for prep in SLOT_POSTPONE:
+        for prep in slot_postpone():                          # #1059
             if left <= out["room"]:
                 break
             row = by_prep.get(prep)
@@ -22110,6 +22432,40 @@ def slot_needs() -> list[dict[str, Any]]:
             return list(_SLOT_WANT.get("needs") or [])
         _SLOT_WANT.update({"at": time.time(), "kind": "", "why": "",
                            "needs": []})
+        # #1057: THE FLOOR FIRST. Five variants of every road at all
+        # times is a debt the station carries until it is paid, and a
+        # road below it outranks anything the ledger would rather
+        # build - including the next slot's shortfall, because a slot
+        # short of an advert can take a repeat while a cupboard below
+        # its floor has nothing to lend anybody.
+        # #1059: the road the operator said to protect hardest is
+        # built before anything else that is short.
+        try:
+            _keep = str(orch_policy("prefer_road") or "")
+        except Exception:  # noqa: BLE001
+            _keep = ""
+        if _keep:
+            _low_keep = next((r for r in cupboard_short()
+                              if r["kind"] == _keep), None)
+            if _low_keep:
+                out.append({
+                    "prep": _keep, "short": int(_low_keep["short"]),
+                    "each": float(task_cost(_keep) or 45.0),
+                    "face": "the cupboard", "verdict": "protected",
+                    "why": (f"you asked me to protect "
+                            f"{_low_keep['label']} hardest, and the "
+                            f"cupboard holds {_low_keep['have']} of "
+                            f"{_low_keep['floor']}")})
+        for _low in cupboard_short():
+            out.append({
+                "prep": str(_low["kind"]),
+                "short": int(_low["short"]),
+                "each": float(task_cost(_low["kind"]) or 45.0),
+                "face": "the cupboard",
+                "verdict": "below floor",
+                "why": (f"the cupboard holds {_low['have']} "
+                        f"{_low['label']} against a floor of "
+                        f"{_low['floor']}")})
         for row in (slot_board(1).get("slots") or []):
             short = list(row.get("short") or [])
             if not short:
@@ -22255,6 +22611,627 @@ def slot_wants() -> tuple[str, str]:
     except Exception:  # noqa: BLE001
         pass
     return "", ""
+
+
+# --- THE ORCHESTRATOR'S QUESTIONNAIRE (#1056) -------------------------
+# Three questions, three answers each, every answer an action. Raised
+# when the orchestrator sees something it cannot decide alone, and
+# raised anyway once every six hours so the operator is not only ever
+# spoken to in a crisis. See the note at the top of the #1056 change.
+ORCH_ASK_PATH = data_path("orchestrator_asks.json")
+ORCH_POLICY_PATH = data_path("orchestrator_policy.json")
+# "at least once every six hours, just randomly."
+ORCH_ASK_EVERY = 6.0 * 3600.0
+# Never more often than this, however much is wrong - a questionnaire
+# every five minutes is a station nobody can run.
+ORCH_ASK_FLOOR = 20.0 * 60.0
+ORCH_ASK_KEEP = 40
+_ORCH: dict[str, Any] = {"asks": [], "policy": {}, "read": False,
+                         "last": 0.0}
+_ORCH_LOCK = RLock()
+
+
+def orch_load() -> None:
+    """Both stores, read once and held."""
+    if _ORCH.get("read"):
+        return
+    with _ORCH_LOCK:
+        if _ORCH.get("read"):
+            return
+        try:
+            rows = json.loads(ORCH_ASK_PATH.read_text())
+            if isinstance(rows, list):
+                _ORCH["asks"] = [r for r in rows if isinstance(r, dict)]
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            got = json.loads(ORCH_POLICY_PATH.read_text())
+            if isinstance(got, dict):
+                _ORCH["policy"] = got
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            _ORCH["last"] = max([float(r.get("at") or 0)
+                                 for r in _ORCH["asks"]] or [0.0])
+        except Exception:  # noqa: BLE001
+            _ORCH["last"] = 0.0
+        _ORCH["read"] = True
+
+
+def orch_save() -> None:
+    try:
+        del _ORCH["asks"][ORCH_ASK_KEEP:]
+        for path, rows in ((ORCH_ASK_PATH, _ORCH["asks"]),
+                           (ORCH_POLICY_PATH, _ORCH["policy"])):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows, indent=1, default=str))
+            tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass                            # a forgetful desk still asks
+
+
+def orch_policy(key: str, fallback: Any = None) -> Any:
+    """What the operator has already decided about this."""
+    orch_load()
+    try:
+        return (_ORCH["policy"].get(str(key)) or {}).get("value", fallback)
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def orch_open() -> list[dict[str, Any]]:
+    """The questionnaires waiting to be answered."""
+    orch_load()
+    return [r for r in _ORCH["asks"] if not r.get("answered")]
+
+
+def _orch_recent(topic: str, within: float = 43200.0) -> bool:
+    """Has this been asked lately? A question the operator has already
+    answered must not come straight back with the same evidence."""
+    orch_load()
+    now = time.time()
+    for row in _ORCH["asks"]:
+        if str(row.get("topic") or "") != str(topic):
+            continue
+        if now - float(row.get("at") or 0) < within:
+            return True
+    return False
+
+
+def orch_raise(topic: str, why: str, urgency: str,
+               questions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Put a questionnaire on the board."""
+    orch_load()
+    row = {
+        "id": uuid.uuid4().hex[:10],
+        "at": time.time(),
+        "topic": str(topic),
+        "why": str(why)[:900],
+        "urgency": str(urgency or "routine"),
+        "questions": questions[:3],
+        "answered": None,
+    }
+    with _ORCH_LOCK:
+        _ORCH["asks"].insert(0, row)
+        _ORCH["last"] = row["at"]
+        orch_save()
+    pipeline_log("lookahead",
+                 f"the orchestrator has a question: {topic} "
+                 f"({urgency}) (#1056)",
+                 extra="WHY IT IS ASKING\n\n" + str(why)[:1200])
+    return row
+
+
+def _opt(face: str, does: str, note: str = "") -> dict[str, Any]:
+    return {"face": face, "does": does, "note": note}
+
+
+def orch_scan() -> dict[str, Any]:
+    """#1056: look at the studio and decide whether to ask something.
+
+    One questionnaire at a time, never more often than the floor, and
+    never the same topic twice inside half a day. Returns the ask it
+    raised, or {}."""
+    orch_load()
+    out: dict[str, Any] = {}
+    try:
+        now = time.time()
+        if orch_open():
+            return out                  # one at a time; answer that first
+        if now - float(_ORCH.get("last") or 0) < ORCH_ASK_FLOOR:
+            return out
+        board = slot_board(2)
+        hour = board.get("hour") or {}
+        bad = [r for r in (board.get("slots") or [])
+               if r.get("verdict") in ("at risk", "cannot")]
+
+        # 1. A HALF HOUR THAT CANNOT BE COMPLETED.
+        if bad and not _orch_recent("slot_at_risk"):
+            row = bad[0]
+            short = ", ".join(f"{x['short']}x {x['prep']}"
+                              for x in (row.get("short") or [])[:4])
+            gave = ", ".join(f"{g['count']}x {g['prep']}"
+                             for g in (row.get("giving_up") or [])[:4])
+            out = orch_raise(
+                "slot_at_risk",
+                f"The {row['face']} half hour is {row['verdict']}. It is "
+                f"short of {short or 'material'}, which measures "
+                f"{int(row.get('cost') or 0)}s of writing against "
+                f"{int(row.get('room') or 0)}s of room before it opens. "
+                + (f"To make it fit I am standing down {gave}. "
+                   if gave else "")
+                + "That is a judgement I would rather you made.",
+                "now" if row.get("current") else "soon",
+                [
+                    {"ask": "This half hour will open short. What should "
+                            "it do?",
+                     "options": [
+                         _opt("Fill the gaps from the cupboard",
+                              "repeats:hard",
+                              "Air rested repeats even if they are under-"
+                              "rested, so the running order is honoured."),
+                         _opt("Stand down what does not fit",
+                              "postpone:keep",
+                              "Drop the entries at the top of the ladder "
+                              "and run a shorter hour."),
+                         _opt("Put records on instead",
+                              "ballast:+6",
+                              "Add six minutes of music to this hour to "
+                              "buy the room back."),
+                     ]},
+                    {"ask": "Which road should I protect hardest when "
+                            "this happens again?",
+                     "options": [
+                         _opt("Banter - the spine", "prefer:banter"),
+                         _opt("Phone calls", "prefer:caller"),
+                         _opt("Ad reads and news", "prefer:ad"),
+                     ]},
+                    {"ask": "And which should give way first?",
+                     "options": [
+                         _opt("The gallery - the cupboard covers it",
+                              "postpone:gallery"),
+                         _opt("Memos from upstairs",
+                              "postpone:manager"),
+                         _opt("Track talk and station IDs",
+                              "postpone:station_id"),
+                     ]},
+                ])
+            return out
+
+        # 2. THE HOUR IS NOT MAKEABLE AT ALL.
+        if (hour and not hour.get("makeable")
+                and float(hour.get("need") or 0) > 600
+                and not _orch_recent("hour_ballast", 21600.0)):
+            need = int(float(hour.get("need") or 0) / 60)
+            out = orch_raise(
+                "hour_ballast",
+                f"{hour.get('say')} Every minute of the running order "
+                "that is not a record or a repeat has to be written "
+                "first, and at the moment the writing costs more than "
+                "the hour lasts.",
+                "soon",
+                [
+                    {"ask": f"The hour is about {need} minutes short of "
+                            "airtime that costs nothing to make. Where "
+                            "should it come from?",
+                     "options": [
+                         _opt("More records", f"ballast:+{max(3, need)}"),
+                         _opt("Deeper cupboard - reuse more",
+                              "innings:+6",
+                              "Let repeats air more times before they "
+                              "retire."),
+                         _opt("Fewer of the dearest segments",
+                              "thin:gallery"),
+                     ]},
+                    {"ask": "When the cupboard is what keeps the hour "
+                            "running, how fresh should it stay?",
+                     "options": [
+                         _opt("Rest three hours, as now",
+                              "rest:10800"),
+                         _opt("Rest ninety minutes - more reuse",
+                              "rest:5400"),
+                         _opt("Rest six hours - less repetition",
+                              "rest:21600"),
+                     ]},
+                    {"ask": "And should I build stock when the studio is "
+                            "quiet?",
+                     "options": [
+                         _opt("Yes, up to eight of each", "stock:8"),
+                         _opt("Only what the next hour needs", "stock:3"),
+                         _opt("Leave the room for live work", "stock:0"),
+                     ]},
+                ])
+            return out
+
+        # 3. A ROAD WITH NOTHING BEHIND IT AT ALL.
+        empty = []
+        try:
+            supply = slot_supply()
+            for kind in ("ad", "gallery", "caller", "manager", "news"):
+                if not [w for w in (supply.get(kind) or []) if w <= 0]:
+                    empty.append(kind)
+        except Exception:  # noqa: BLE001
+            empty = []
+        if empty and not _orch_recent("road_empty", 21600.0):
+            names = ", ".join(SHELF_LABEL.get(k, k) for k in empty[:4])
+            out = orch_raise(
+                "road_empty",
+                f"Nothing is ready on these roads: {names}. When the "
+                "running order reaches one of them it will be written "
+                "live, in front of the listener, or the entry will pass "
+                "with nothing in it.",
+                "soon",
+                [
+                    {"ask": f"{names} have nothing ready. What should "
+                            "happen when their entry comes round?",
+                     "options": [
+                         _opt("Take a repeat, even a tired one",
+                              "repeats:hard"),
+                         _opt("Write it live and let the record run on",
+                              "live:allow"),
+                         _opt("Skip the entry and move on",
+                              "skip:allow"),
+                     ]},
+                    {"ask": "Should I build these ahead of everything "
+                            "else until they have stock?",
+                     "options": [
+                         _opt("Yes - empty roads first",
+                              "prefer:" + empty[0]),
+                         _opt("No - keep the running order's order",
+                              "noop"),
+                         _opt("Only the ones the next hour wants",
+                              "prefer:slot"),
+                     ]},
+                    {"ask": "How deep should a road be stocked before I "
+                            "move on to another?",
+                     "options": [
+                         _opt("Two of each, then move on", "stock:2"),
+                         _opt("Four of each", "stock:4"),
+                         _opt("Fill it to eight", "stock:8"),
+                     ]},
+                ])
+            return out
+
+        # 4. NOTHING IS WRONG - but six hours is six hours.
+        if now - float(_ORCH.get("last") or 0) >= ORCH_ASK_EVERY:
+            out = orch_raise(
+                "routine",
+                "Nothing is falling behind. This is the standing "
+                "six-hourly check - the answers become policy and shape "
+                "how I run the studio between now and the next one.",
+                "routine", orch_routine_questions())
+            return out
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def orch_routine_questions() -> list[dict[str, Any]]:
+    """#1056: the six-hourly check. Drawn at random so it is not the
+    same three every time, and every option is still a real action."""
+    bank = [
+        {"ask": "How should the show sound for the next stretch?",
+         "options": [
+             _opt("More talk, fewer records", "ballast:-3"),
+             _opt("As it is", "noop"),
+             _opt("More music, lighter on the talk", "ballast:+3"),
+         ]},
+        {"ask": "The crystal's second pass rewrites every line into its "
+                "world. It is the most expensive thing on the station.",
+         "options": [
+             _opt("Keep it on everything", "tint:full"),
+             _opt("Only when the reserve is deep", "tint:easy"),
+             _opt("Off for now", "tint:off"),
+         ]},
+        {"ask": "How often should a repeat be allowed back on air?",
+         "options": [
+             _opt("Every ninety minutes", "rest:5400"),
+             _opt("Every three hours", "rest:10800"),
+             _opt("Every six hours", "rest:21600"),
+         ]},
+        {"ask": "When a phone call is due and none is prepared?",
+         "options": [
+             _opt("Re-run an old one", "repeats:hard"),
+             _opt("Write one live", "live:allow"),
+             _opt("Let the record run instead", "skip:allow"),
+         ]},
+        {"ask": "Which road would you like more of?",
+         "options": [
+             _opt("Banter between the pair", "prefer:banter"),
+             _opt("Phone calls", "prefer:caller"),
+             _opt("Memos from upstairs", "prefer:manager"),
+         ]},
+        {"ask": "How much should I build ahead when the studio is idle?",
+         "options": [
+             _opt("As deep as the shelves go", "stock:8"),
+             _opt("An hour or two", "stock:4"),
+             _opt("Only what is owed", "stock:2"),
+         ]},
+    ]
+    try:
+        return random.sample(bank, 3)
+    except Exception:  # noqa: BLE001
+        return bank[:3]
+
+
+def orch_apply(does: str) -> str:
+    """#1056: do what the answer said, and say what was done.
+
+    Small vocabulary on purpose - every action here is something the
+    station already knows how to do. An orchestrator that could invent
+    new powers by asking about them would be worse than one that
+    drifts."""
+    orch_load()
+    said = ""
+    try:
+        verb, _, arg = str(does or "").partition(":")
+        dj = load_settings()
+        dj.setdefault("dj", {})
+        if verb == "noop":
+            return "left as it is"
+        if verb == "ballast":
+            mins = int(float(arg or 0))
+            _ORCH["policy"]["ballast_minutes"] = {
+                "value": mins, "at": time.time()}
+            said = (f"{abs(mins)} minutes {'more' if mins > 0 else 'less'} "
+                    "record time is wanted in the hour")
+        elif verb == "innings":
+            add = int(float(str(arg).lstrip("+") or 0))
+            _ORCH["policy"]["innings_bonus"] = {
+                "value": add, "at": time.time()}
+            said = f"repeats may air {add} more times"
+        elif verb == "rest":
+            _ORCH["policy"]["reuse_rest"] = {
+                "value": max(600.0, float(arg or 10800)), "at": time.time()}
+            said = (f"a repeat now rests "
+                    f"{int(float(arg or 10800) / 60)} minutes")
+        elif verb == "stock":
+            _ORCH["policy"]["stock_depth"] = {
+                "value": max(0, int(float(arg or 0))), "at": time.time()}
+            said = f"shelves are stocked to {int(float(arg or 0))}"
+        elif verb == "prefer":
+            _ORCH["policy"]["prefer_road"] = {
+                "value": str(arg), "at": time.time()}
+            said = f"{SHELF_LABEL.get(str(arg), str(arg))} is protected first"
+        elif verb == "postpone":
+            _ORCH["policy"]["postpone_first"] = {
+                "value": str(arg), "at": time.time()}
+            said = (f"{SHELF_LABEL.get(str(arg), str(arg))} gives way first"
+                    if arg != "keep" else "the ladder is unchanged")
+        elif verb == "repeats":
+            _ORCH["policy"]["repeats_hard"] = {
+                "value": str(arg) == "hard", "at": time.time()}
+            said = ("the cupboard may be raided under-rested"
+                    if arg == "hard" else "the cupboard keeps its rest")
+        elif verb in ("live", "skip"):
+            _ORCH["policy"]["when_empty"] = {
+                "value": verb, "at": time.time()}
+            said = ("an empty entry is written live"
+                    if verb == "live" else "an empty entry is skipped")
+        elif verb == "tint":
+            want = {"full": True, "easy": True, "off": False}.get(arg, True)
+            dj["dj"]["crystal_tint_pass"] = bool(want)
+            if arg == "easy":
+                dj["dj"]["crystal_tint_model"] = ""
+            save_settings(dj)
+            said = {"full": "the crystal tints everything",
+                    "easy": "the crystal tints on the fast model",
+                    "off": "the second pass is off"}.get(arg, "")
+        elif verb == "thin":
+            _ORCH["policy"]["thin_road"] = {
+                "value": str(arg), "at": time.time()}
+            said = f"fewer {SHELF_LABEL.get(str(arg), str(arg))} per hour"
+        orch_save()
+    except Exception:  # noqa: BLE001
+        said = said or "noted"
+    return said or "noted"
+
+
+def orch_answer(ask_id: str, picks: dict[str, Any]) -> dict[str, Any]:
+    """#1056: the operator has answered. Apply every choice and remember
+    it, so the same question does not come back with the same evidence."""
+    orch_load()
+    out: dict[str, Any] = {"ok": False, "did": []}
+    with _ORCH_LOCK:
+        row = next((r for r in _ORCH["asks"]
+                    if str(r.get("id")) == str(ask_id)), None)
+        if not row:
+            out["why"] = "no such questionnaire"
+            return out
+        chosen: list[dict[str, Any]] = []
+        for i, q in enumerate(row.get("questions") or []):
+            key = str(picks.get(str(i), picks.get(i, "")))
+            opt = None
+            for cand in (q.get("options") or []):
+                if str(cand.get("does")) == key or str(cand.get("face")) == key:
+                    opt = cand
+                    break
+            if not opt:
+                continue
+            did = orch_apply(str(opt.get("does") or ""))
+            chosen.append({"ask": q.get("ask"), "face": opt.get("face"),
+                           "does": opt.get("does"), "did": did})
+            out["did"].append(did)
+        row["answered"] = {"at": time.time(), "picks": chosen}
+        orch_save()
+        out["ok"] = True
+    pipeline_log("lookahead",
+                 "the operator answered the orchestrator: "
+                 + "; ".join(out["did"])[:180] + " (#1056)",
+                 extra="WHAT WAS ASKED AND WHAT WAS CHOSEN\n\n"
+                       + json.dumps(row.get("answered"), indent=1,
+                                    default=str)[:2000])
+    return out
+
+
+# --- THE CUPBOARD'S FRESHNESS (#1057) ---------------------------------
+# Five variants of every road at all times, footage that goes off when
+# the cast changes, and a rotation that runs as fast as the studio can
+# afford to replace what it throws away.
+CUPBOARD_FLOOR = 5
+# How old footage may get before it is rotated out, at the two ends of
+# the station's capacity. Deep reserve: be fresh, there is room to
+# re-make what goes. Bare: keep it, because old footage beats silence.
+CUPBOARD_FRESH_HOURS = 6.0
+CUPBOARD_STALE_HOURS = 48.0
+
+
+def cupboard_floor() -> int:
+    """How many variants of each road to hold. The operator's standing
+    answer to the six-hourly check overrides the default."""
+    try:
+        got = orch_policy("stock_depth")
+        if got is not None:
+            return max(0, min(12, int(got)))
+    except Exception:  # noqa: BLE001
+        pass
+    return CUPBOARD_FLOOR
+
+
+def cast_signature() -> str:
+    """#1057: WHO IS ON THE MICROPHONES, as one comparable string.
+
+    A repeat is a recording of a specific voice. The larder's writing
+    contract (#862) deliberately leaves the cast out - a round is words
+    and the words survive a recast - but cupboard footage is AUDIO, and
+    audio does not."""
+    try:
+        seats = dict(_RADIO.get("voices") or {})
+        dj = dj_settings()
+        for seat in ("drop_voice", "manager_voice", "news_voice"):
+            got = str(dj.get(seat) or "")
+            if got:
+                seats[seat] = got
+        return "|".join(f"{k}={seats[k]}" for k in sorted(seats))[:300]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def shelf_cast_stale(row: dict[str, Any]) -> bool:
+    """Was this footage made by a cast that has since changed?
+
+    A row made before this shipped carries no stamp; those are given the
+    benefit of the doubt rather than thrown away on the first restart."""
+    try:
+        was = str(row.get("cast") or "")
+        if not was:
+            return False                # made before the stamp existed
+        return was != cast_signature()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def cupboard_horizon() -> float:
+    """#1057: how old footage may get, in seconds - moving with how much
+    room the station has to replace what it rotates out.
+
+    "rotating this cupboard footage out on a basis of hours depending on
+    how much of a time budget allowance that we have of leniency." Deep
+    reserve, short horizon: be fresh. Bare reserve, long horizon: keep
+    it, because old footage beats silence."""
+    try:
+        depth = max(0.0, min(1.0, float(box_depth())))
+    except Exception:  # noqa: BLE001
+        depth = 0.0
+    hours = CUPBOARD_STALE_HOURS - depth * (CUPBOARD_STALE_HOURS
+                                            - CUPBOARD_FRESH_HOURS)
+    return float(hours) * 3600.0
+
+
+def cupboard_short() -> list[dict[str, Any]]:
+    """#1057: which roads are below the floor, worst first.
+
+    Counts only footage that is actually usable - right cast, still
+    within its horizon, audio present. This is the debt the station
+    carries until it is paid."""
+    out: list[dict[str, Any]] = []
+    try:
+        floor = cupboard_floor()
+        if floor <= 0:
+            return out
+        horizon = cupboard_horizon()
+        now = time.time()
+        for kind in SHELF_REUSABLE:
+            good = 0
+            for row in (_SHELF.get(kind) or []):
+                if shelf_cast_stale(row):
+                    continue
+                if now - float(row.get("at") or 0) > horizon:
+                    continue
+                key = str(row.get("key") or "")
+                if key and not pantry_get(key):
+                    continue
+                good += 1
+            if good < floor:
+                out.append({"kind": kind,
+                            "label": SHELF_LABEL.get(kind, kind),
+                            "have": good, "floor": floor,
+                            "short": floor - good})
+        out.sort(key=lambda r: -r["short"])
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def cupboard_rotate() -> dict[str, Any]:
+    """#1057: throw out what has gone off, so the floor pulls fresh
+    footage in behind it.
+
+    Two reasons to go: the cast changed, or the horizon passed. Both are
+    only acted on when there is something to replace it WITH - a station
+    that empties its own cupboard while it is behind has made its
+    problem worse, and old footage beats silence every time."""
+    out = {"recast": 0, "aged": 0, "kept": 0}
+    try:
+        horizon = cupboard_horizon()
+        now = time.time()
+        floor = cupboard_floor()
+        for kind in list(_SHELF):
+            if kind not in SHELF_REUSABLE:
+                continue
+            rows = _SHELF.get(kind) or []
+            fresh = [r for r in rows
+                     if not shelf_cast_stale(r)
+                     and now - float(r.get("at") or 0) <= horizon]
+            drop: list[dict[str, Any]] = []
+            for row in rows:
+                if row in fresh:
+                    continue
+                # Only let go while what is left still covers the floor.
+                if len(fresh) + len(drop) - len(drop) < floor \
+                        and len(fresh) < floor:
+                    out["kept"] += 1
+                    continue
+                drop.append(row)
+            if not drop:
+                continue
+            for row in drop:
+                if shelf_cast_stale(row):
+                    out["recast"] += 1
+                else:
+                    out["aged"] += 1
+                for key in _row_clip_keys(row):
+                    _PANTRY.pop(key, None)
+            _SHELF[kind] = [r for r in rows if r not in drop]
+        if out["recast"] or out["aged"]:
+            pipeline_log(
+                "lookahead",
+                f"cupboard rotated: {out['recast']} recast, "
+                f"{out['aged']} aged out past "
+                f"{int(horizon / 3600)}h (#1057)",
+                extra=("WHY (#1057)\n\nFootage is a recording of a "
+                       "specific voice. When the cast changes it is the "
+                       "wrong person, however good the writing was; and "
+                       "footage ages out on a horizon that moves with "
+                       "how much room the studio has to replace it - "
+                       f"{int(CUPBOARD_FRESH_HOURS)}h when the reserve is "
+                       f"deep, {int(CUPBOARD_STALE_HOURS)}h when it is "
+                       "bare, because old footage beats silence.\n\n"
+                       f"cast now: {cast_signature()}"))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def hour_shortfall() -> dict[str, Any]:
@@ -23731,6 +24708,14 @@ async def coordinator() -> None:
             elif time.time() - since > 120:
                 try:
                     coord_retire()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    cupboard_rotate()                             # #1057
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    orch_scan()                                   # #1056
                 except Exception:  # noqa: BLE001
                     pass
                 # Keep the order fresh inside the half hour too, so a
@@ -37687,11 +38672,34 @@ async def session_voices() -> dict[str, str]:
     voice in the page are the same one."""
     dj = dj_settings()
     fixed = _RADIO.get("voices") or {}
+    # #1060: THE CAST SURVIVES A RESTART. It was drawn on the first line
+    # and held in memory only, so every restart recast the show - which
+    # was merely surprising until #1057 made cupboard footage go off
+    # when the cast changes. A cupboard binned on every deploy is not a
+    # cupboard, and "if the host changes actors" has to mean somebody
+    # changed them, not that the process came back up.
+    if not fixed:
+        try:
+            got = json.loads(CAST_PATH.read_text())
+            if isinstance(got, dict) and got.get("dj") and got.get("cohost"):
+                fixed = {k: str(v) for k, v in got.items() if v}
+                _RADIO["voices"] = fixed
+        except Exception:  # noqa: BLE001
+            fixed = {}
     if not fixed:
         female, male = await banter_voices()
         fixed = ({"dj": female, "cohost": male} if random.random() < 0.5
                  else {"dj": male, "cohost": female})
         _RADIO["voices"] = fixed
+        try:
+            CAST_PATH.parent.mkdir(parents=True, exist_ok=True)
+            CAST_PATH.write_text(json.dumps(fixed, indent=1))
+            pipeline_log("lookahead",
+                         "the cast was drawn and written down - "
+                         + ", ".join(f"{k}: {v}" for k, v in fixed.items())
+                         + " (#1060)")
+        except Exception:  # noqa: BLE001
+            pass
     voices = {
         "dj": dj["voice"] or fixed.get("dj", ""),
         # Some older/direct station paths call the host "host" while the
@@ -63216,6 +64224,70 @@ async def api_chunks(
     }
 
 
+@app.get("/api/orchestrator/asks")
+async def api_orch_asks(all: int = 0) -> dict[str, Any]:
+    """#1056: what the orchestrator wants decided.
+
+    The badge reads `open`; the popup reads `rows`. Every option names
+    the action it takes, because a multiple choice whose answers do
+    nothing is a survey, not an orchestrator."""
+    orch_load()
+    rows = list(_ORCH["asks"]) if int(all or 0) else orch_open()
+    return {
+        "at": time.time(),
+        "open": len(orch_open()),
+        "rows": rows[:12],
+        "policy": dict(_ORCH.get("policy") or {}),
+        "every_hours": round(ORCH_ASK_EVERY / 3600.0, 1),
+        "next_due": max(0.0, round(float(_ORCH.get("last") or 0)
+                                   + ORCH_ASK_EVERY - time.time(), 1)),
+        "cupboard": cupboard_short(),
+        "cast": cast_signature(),
+        "horizon_hours": round(cupboard_horizon() / 3600.0, 1),
+    }
+
+
+@app.post("/api/orchestrator/asks/{ask_id}")
+async def api_orch_answer(
+    ask_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1056: answer one questionnaire. {"picks": {"0": "<does>", ...}}
+
+    Every pick is APPLIED - the answers are policy, not advice."""
+    require_auth(authorization)
+    payload = await request.json()
+    picks = payload.get("picks")
+    if not isinstance(picks, dict):
+        raise HTTPException(status_code=400, detail="picks: {index: does}")
+    return orch_answer(str(ask_id), picks)
+
+
+@app.post("/api/orchestrator/scan")
+async def api_orch_scan(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1056: look now rather than waiting for the sweep."""
+    require_auth(authorization)
+    got = orch_scan()
+    return {"raised": bool(got), "ask": got, "open": len(orch_open())}
+
+
+@app.get("/api/track-reads")
+async def api_track_reads() -> dict[str, Any]:
+    """#1061: THE TRACK LIBRARY - which records have a read on file.
+
+    "if there's an ad that was created using a particular song, I want
+    to store that ad and reuse it in the future before playing that
+    song."
+
+    Favourites first, then whatever was heard most recently. A
+    favourite's read is kept for ever; everything else keeps to the
+    horizon."""
+    return track_reads_state()
+
+
 @app.get("/api/repeats")
 async def api_repeats() -> dict[str, Any]:
     """#1052: THE REPEATS CUPBOARD - the pre-rolled stock that buys the
@@ -76608,6 +77680,7 @@ const PINE_3JS = [
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
   {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
   {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen()},
+  {key: "asks",     label: "🎛️ The orchestrator asks", open: () => orchOpen()},
   {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
@@ -80252,6 +81325,7 @@ async function boothOpen() {
     {name: "💠 Data crystal", open: () => crystalOpen()},
     {name: "❄️ The shelf", open: () => chunkOpen()},
     {name: "⏱️ The half hours", open: () => slotOpen()},
+    {name: "🎛️ The orchestrator asks", open: () => orchOpen()},
   ];
   let viewIdx = Number(localStorage.booth3jsIdx || 0);
   const viewBtn = el("button", "", "🧠 3JS Views ⟳");
@@ -93372,6 +94446,8 @@ function djRender(state) {
     pineTipsInstall();
     pineTipSetDelay(Number(state.tip_delay_ms));
   } catch (e) { /* the panel still reads */ }
+  /* #1058: the orchestrator's bell. Silent until it has a question. */
+  try { orchBell(); } catch (e) { /* the panel still reads */ }
   /* #1008: the overlap setting reaches the page on every poll now, not
    * only when the settings panel happens to be painted. */
   try {
@@ -107512,6 +108588,239 @@ async function slotOpen() {
   slotBox = box;
   await slotPaint();
   slotTimer = setInterval(slotPaint, 15000);
+}
+
+
+// #1058: THE ORCHESTRATOR'S BELL. Nothing at all until it has a
+// question; a count when it does. The popup shows the evidence that
+// raised it, then the three questions, with each option's real action
+// under its face - the answers are policy, and the operator should see
+// that before choosing rather than after.
+let orchBox = null;
+let orchTimer = null;
+let orchPicks = {};
+let orchLastOpen = -1;
+
+function orchClose() {
+  if (orchTimer) { clearInterval(orchTimer); orchTimer = null; }
+  if (orchBox) { orchBox.remove(); orchBox = null; }
+  orchPicks = {};
+}
+
+async function orchBell() {
+  let data;
+  try {
+    data = await (await fetch("/api/orchestrator/asks")).json();
+  } catch (err) { return; }
+  const open = Number(data.open || 0);
+  let bell = document.getElementById("orchBell");
+  if (!bell) {
+    bell = el("button", "", "");
+    bell.id = "orchBell";
+    bell.title = "the orchestrator has something to ask";
+    bell.style.cssText = "position:fixed;right:14px;bottom:14px;z-index:150;"
+      + "width:44px;height:44px;border-radius:50%;font-size:19px;"
+      + "display:flex;align-items:center;justify-content:center;"
+      + "box-shadow:0 6px 22px rgba(0,0,0,.5);cursor:pointer;padding:0";
+    bell.onclick = orchOpen;
+    document.body.appendChild(bell);
+  }
+  bell.textContent = open ? "\ud83d\udd14" : "\ud83d\udd15";
+  bell.style.display = open ? "flex" : "none";
+  bell.style.background = open ? "#ffb43c" : "transparent";
+  bell.style.border = open ? "1px solid #ffd76f" : "1px solid transparent";
+  if (open && open !== orchLastOpen) {
+    bell.animate(
+      [{transform: "scale(1)"}, {transform: "scale(1.25)"},
+       {transform: "scale(1)"}], {duration: 520, iterations: 3});
+  }
+  orchLastOpen = open;
+  let dot = document.getElementById("orchBellCount");
+  if (open > 1) {
+    if (!dot) {
+      dot = el("span", "", "");
+      dot.id = "orchBellCount";
+      dot.style.cssText = "position:absolute;top:-3px;right:-3px;"
+        + "min-width:17px;height:17px;border-radius:9px;background:#ff5a5a;"
+        + "color:#fff;font-size:10px;font-weight:700;display:flex;"
+        + "align-items:center;justify-content:center;padding:0 4px";
+      bell.style.position = "fixed";
+      bell.appendChild(dot);
+    }
+    dot.textContent = String(open);
+  } else if (dot) { dot.remove(); }
+}
+
+async function orchPaint() {
+  if (!orchBox) return;
+  const body = orchBox.querySelector("#orchBody");
+  let data;
+  try {
+    data = await (await fetch("/api/orchestrator/asks")).json();
+  } catch (err) { return; }
+  if (!orchBox) return;
+  const rows = data.rows || [];
+  body.textContent = "";
+  const head = orchBox.querySelector("#orchHead");
+  head.textContent = rows.length
+    ? (rows.length + " waiting \u00b7 next standing check in "
+       + Math.round(Number(data.next_due || 0) / 3600) + "h")
+    : ("nothing to decide \u00b7 next standing check in "
+       + Math.round(Number(data.next_due || 0) / 3600) + "h");
+  if (!rows.length) {
+    const done = el("div", "muted",
+      "The orchestrator has nothing it cannot decide for itself.");
+    done.style.cssText = "font-size:12px;line-height:1.5;padding:8px 0";
+    body.appendChild(done);
+    (data.cupboard || []).forEach((c) => {
+      const line = el("div", "muted",
+        "cupboard: " + c.have + " of " + c.floor + " " + c.label);
+      line.style.cssText = "font-size:11px;margin-top:3px";
+      body.appendChild(line);
+    });
+    return;
+  }
+  const row = rows[0];
+  const tone = row.urgency === "now" ? "#ff9b4a"
+    : (row.urgency === "soon" ? "#ffd76f" : "#6fdc8c");
+
+  const tag = el("div", "", row.urgency.toUpperCase());
+  tag.style.cssText = "font-size:9px;letter-spacing:.1em;color:" + tone
+    + ";font-weight:700;margin-bottom:5px";
+  body.appendChild(tag);
+
+  const why = el("div", "", row.why || "");
+  why.style.cssText = "font-size:12px;line-height:1.55;padding:9px 11px;"
+    + "border-left:3px solid " + tone + ";background:rgba(255,255,255,.04);"
+    + "border-radius:0 6px 6px 0;margin-bottom:12px";
+  body.appendChild(why);
+
+  (row.questions || []).forEach((q, qi) => {
+    const box = el("div", "", "");
+    box.style.cssText = "margin-bottom:13px";
+    const ask = el("div", "", (qi + 1) + ". " + q.ask);
+    ask.style.cssText = "font-size:12.5px;font-weight:600;margin-bottom:6px;"
+      + "line-height:1.4";
+    box.appendChild(ask);
+    (q.options || []).forEach((o) => {
+      const pick = el("button", "", "");
+      pick.style.cssText = "display:block;width:100%;text-align:left;"
+        + "margin-bottom:4px;padding:7px 9px;border-radius:6px;"
+        + "font-size:11.5px;line-height:1.4;cursor:pointer";
+      const face = el("div", "", o.face);
+      face.style.fontWeight = "600";
+      pick.appendChild(face);
+      if (o.note) {
+        const note = el("div", "muted", o.note);
+        note.style.cssText = "font-size:10.5px;margin-top:2px";
+        pick.appendChild(note);
+      }
+      const does = el("div", "muted", "\u2192 " + o.does);
+      does.style.cssText = "font-size:9.5px;margin-top:2px;opacity:.6;"
+        + "font-family:ui-monospace,monospace";
+      pick.appendChild(does);
+      const mark = () => {
+        orchPicks[String(qi)] = o.does;
+        Array.from(box.querySelectorAll("button")).forEach((b) => {
+          b.style.outline = "";
+          b.style.background = "";
+        });
+        pick.style.outline = "2px solid " + tone;
+        pick.style.background = "rgba(255,255,255,.06)";
+      };
+      pick.onclick = mark;
+      if (orchPicks[String(qi)] === o.does) mark();
+      box.appendChild(pick);
+    });
+    body.appendChild(box);
+  });
+
+  const send = el("button", "", "Answer the orchestrator");
+  send.style.cssText = "width:100%;padding:9px;border-radius:7px;"
+    + "font-weight:700;font-size:12.5px;cursor:pointer;background:" + tone
+    + ";color:#111;border:none;margin-top:4px";
+  send.onclick = async () => {
+    const want = (row.questions || []).length;
+    if (Object.keys(orchPicks).length < want) {
+      send.textContent = "pick one for each of the "
+        + want + " questions";
+      return;
+    }
+    send.disabled = true;
+    send.textContent = "applying\u2026";
+    try {
+      /* the panel's own helper - it carries the operator's key and
+       * throws on a bad answer rather than returning one. */
+      const got = await api(
+        "/api/orchestrator/asks/" + encodeURIComponent(row.id),
+        {method: "POST", body: JSON.stringify({picks: orchPicks})});
+      send.textContent = got && got.ok
+        ? ("done \u00b7 " + (got.did || []).join("; ")).slice(0, 90)
+        : "the orchestrator could not apply that";
+    } catch (err) {
+      send.textContent = "could not reach the orchestrator";
+    }
+    orchPicks = {};
+    setTimeout(() => { orchPaint(); orchBell(); }, 1200);
+  };
+  body.appendChild(send);
+}
+
+async function orchOpen() {
+  if (orchBox) { orchClose(); return; }
+  const box = el("div", "panel", "");
+  box.id = "orchBoxEl";
+  const saved = clampBoxToViewport(
+    JSON.parse(localStorage.orchBox || "null") || { left: 200, top: 80 });
+  box.style.cssText = "position:fixed;z-index:151;width:min(560px,95vw);"
+    + "height:min(640px,86vh);display:flex;flex-direction:column;"
+    + "padding:11px 13px;box-shadow:0 20px 60px rgba(0,0,0,.7);"
+    + "resize:both;overflow:hidden;"
+    + "left:" + saved.left + "px;top:" + saved.top + "px";
+
+  const bar = el("div", "", "");
+  bar.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "cursor:grab;margin-bottom:2px";
+  bar.appendChild(el("b", "", "\ud83c\udf9b\ufe0f The orchestrator asks"));
+  const shut = el("button", "", "\u2715");
+  shut.onclick = orchClose;
+  shut.style.marginLeft = "auto";
+  bar.appendChild(shut);
+  box.appendChild(bar);
+
+  const head = el("div", "muted", "reading\u2026");
+  head.id = "orchHead";
+  head.style.cssText = "font-size:11px;margin-bottom:9px";
+  box.appendChild(head);
+
+  const body = el("div", "", "");
+  body.id = "orchBody";
+  body.style.cssText = "flex:1;overflow:auto;padding-right:4px";
+  box.appendChild(body);
+
+  bar.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    const from = {x: event.clientX, y: event.clientY,
+                  left: box.offsetLeft, top: box.offsetTop};
+    bar.setPointerCapture(event.pointerId);
+    const move = (e) => {
+      box.style.left = Math.max(0, from.left + e.clientX - from.x) + "px";
+      box.style.top = Math.max(0, from.top + e.clientY - from.y) + "px";
+    };
+    bar.addEventListener("pointermove", move);
+    bar.addEventListener("pointerup", () => {
+      bar.removeEventListener("pointermove", move);
+      try {
+        localStorage.orchBox = JSON.stringify(
+          {left: box.offsetLeft, top: box.offsetTop});
+      } catch (err) {}
+    }, {once: true});
+  });
+
+  document.body.appendChild(box);
+  orchBox = box;
+  await orchPaint();
+  orchTimer = setInterval(orchPaint, 20000);
 }
 
 
