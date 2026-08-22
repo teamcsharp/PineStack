@@ -16990,6 +16990,10 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
 _OUTPUT_BEFORE: dict[str, str] = {}
 
 _LISTENERS: dict[str, float] = {}
+# #1029: the last forty times the broadcast was moved, and by whom.
+_ROUTING_MOVES: list[dict[str, Any]] = []
+
+
 # #1008: WHO IS PLAYING, AND WHICH ONE OF THEM OWNS THE AIR.
 #
 # "the DJs are currently overlapping each other. Make sure that there is
@@ -57884,6 +57888,29 @@ async def dj_output_api(
         except Exception:  # noqa: BLE001
             pass
     was = str(_RADIO.get("voice_to") or "box")
+    # #1029: WHO IS MOVING THE BROADCAST. Recorded before anything is
+    # applied, and only said out loud when something actually changes -
+    # every open surface polls and re-posts, so logging no-ops would bury
+    # the one that matters.
+    try:
+        _before = {k: str(_RADIO.get(k) or "") for k in
+                   ("music_to", "voice_to", "reply_to")}
+        _who = str(getattr(request.client, "host", "") or "?")
+        _agent = str(request.headers.get("user-agent") or "")
+        _what = ("the desktop app" if "Electron" in _agent
+                 else "a browser tab" if _agent else "something unnamed")
+        _asked = {"music_to": music, "voice_to": voice, "reply_to": reply}
+        _moves = [f"{k.replace('_to', '')} {_before[k]} -> {v}"
+                  for k, v in _asked.items() if v and v != _before[k]]
+        if _moves:
+            pipeline_log("air", f"{_what} at {_who} moved the broadcast: "
+                         + ", ".join(_moves) + " (#1029)")
+            _ROUTING_MOVES.append({
+                "at": time.time(), "addr": _who, "what": _what,
+                "agent": _agent[:120], "moves": _moves})
+            del _ROUTING_MOVES[:-40]
+    except Exception:  # noqa: BLE001
+        pass
     for value in (music, voice, reply):
         if value and value not in valid:
             raise HTTPException(status_code=400,
@@ -60177,6 +60204,125 @@ async def pinebox_status_api(
         "host": SATELLITE_HOST,
         "entity": diag.get("checks") and None,
     }
+
+
+@app.get("/api/routing/moves")
+async def api_routing_moves(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1029: who has been moving the broadcast, and to where.
+
+    Three surfaces each hold a remembered preset - the control panel, the
+    desktop shell, and any browser tab - and every one of them can post a
+    route. When the show comes off the box on its own, this is the thing
+    that says which of them did it."""
+    require_read_auth(authorization)
+    rows = list(reversed(_ROUTING_MOVES))
+    return {
+        "moves": rows,
+        "now": {k: str(_RADIO.get(k) or "") for k in
+                ("music_to", "voice_to", "reply_to", "voice_device")},
+        "box_talk": bool(_RADIO.get("box_talk")),
+        "say": (f"the broadcast has been moved {len(rows)} time(s) since "
+                f"this process started; the last was by "
+                f"{rows[0].get('what')} at {rows[0].get('addr')} - "
+                + ", ".join(rows[0].get("moves") or [])
+                if rows else
+                "nothing has moved the broadcast since this process "
+                "started"),
+    }
+
+
+@app.get("/api/pinebox/speaker")
+async def api_pinebox_speaker(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1028: what the speaker itself says - state, volume, mute, and
+    what it believes it is playing.
+
+    The gap this fills: the station can tell you the satellite is alive,
+    the switch is on and the route is right, and still not tell you why
+    nothing is audible. Since #1007 the station does not own the device's
+    volume, so the device is the only thing that knows it."""
+    require_read_auth(authorization)
+    out: dict[str, Any] = {"entities": [], "say": ""}
+    # #1028: THE ADDRESS THE DEVICE IS TOLD TO FETCH FROM.
+    #
+    # Every clip and every record is handed to Home Assistant as a URL
+    # built on VOICE_PUBLIC_URL, and the DEVICE is what resolves it - not
+    # this process. If that is left at its default of 127.0.0.1 then the
+    # station is telling a speaker on another machine to fetch the audio
+    # from its OWN loopback, where nothing is listening. Home Assistant
+    # accepts the call either way, the media player goes to "playing",
+    # and no sound is ever made.
+    out["fetch_from"] = VOICE_PUBLIC_URL
+    try:
+        _host = str(VOICE_PUBLIC_URL).split("//")[-1].split(":")[0]
+        out["fetch_is_loopback"] = _host in ("127.0.0.1", "localhost",
+                                             "0.0.0.0", "::1")
+    except Exception:  # noqa: BLE001
+        out["fetch_is_loopback"] = False
+    token, _player = _ha_creds()
+    if not token:
+        out["say"] = "no Home Assistant token, so the device cannot be asked"
+        return out
+    want = [e for e in (NABU_MEDIA_PLAYER, NABU_SATELLITE,
+                        PINEVOICE_SATELLITE) if e]
+    quiet: list[str] = []
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            for entity in want:
+                row: dict[str, Any] = {"entity_id": entity}
+                try:
+                    got = await client.get(
+                        f"{HA_URL}/api/states/{entity}",
+                        headers={"Authorization": f"Bearer {token}"})
+                    if got.status_code != 200:
+                        row["state"] = f"HTTP {got.status_code}"
+                        out["entities"].append(row)
+                        continue
+                    body = got.json() or {}
+                    attrs = body.get("attributes") or {}
+                    row["state"] = str(body.get("state") or "")
+                    row["name"] = str(attrs.get("friendly_name") or "")
+                    # The three that decide whether anything is audible.
+                    if "volume_level" in attrs:
+                        lvl = attrs.get("volume_level")
+                        row["volume_level"] = lvl
+                        row["volume_percent"] = (round(float(lvl) * 100)
+                                                 if lvl is not None else None)
+                    if "is_volume_muted" in attrs:
+                        row["muted"] = bool(attrs.get("is_volume_muted"))
+                    for k in ("media_title", "media_content_id",
+                              "media_position", "media_duration",
+                              "source", "supported_features"):
+                        if k in attrs:
+                            row[k] = attrs.get(k)
+                except Exception as exc:  # noqa: BLE001
+                    row["state"] = f"{type(exc).__name__}"
+                out["entities"].append(row)
+    except Exception as exc:  # noqa: BLE001
+        out["say"] = f"{type(exc).__name__}: {exc}"[:160]
+        return out
+    # The reading, in the order that decides whether you hear anything.
+    for row in out["entities"]:
+        if row.get("muted"):
+            quiet.append(f"{row['entity_id']} is MUTED")
+        lvl = row.get("volume_percent")
+        if lvl is not None and lvl <= 12:
+            quiet.append(f"{row['entity_id']} is at {lvl}% volume")
+        if str(row.get("state") or "") in ("unavailable", "unknown"):
+            quiet.append(f"{row['entity_id']} is {row['state']}")
+    if out.get("fetch_is_loopback"):
+        quiet.insert(0, "the station tells the speaker to fetch its audio "
+                        f"from {VOICE_PUBLIC_URL} - that is the SPEAKER'S "
+                        "own loopback, not this machine, so it can never "
+                        "reach the file. Set VOICE_PUBLIC_URL to this "
+                        "host's address on the network")
+    out["say"] = ("; ".join(quiet) if quiet else
+                  "nothing on the device explains silence - it is not "
+                  "muted, its volume is up, and it is reachable")
+    return out
 
 
 @app.get("/api/pinebox/wire")
