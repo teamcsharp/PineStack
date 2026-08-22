@@ -888,6 +888,11 @@ DEFAULT_DJ = {
     # brake has already decided, so turning it off never overrules a
     # judgement that the show is drowning.
     "speed_mode": "off",
+    # #1088: how long the pair may be quiet before somebody covers.
+    # Measured p90 between lines is 64s, so this sits above the show's
+    # ordinary rhythm and below the three-minute holes that are the
+    # fault.
+    "talk_quiet_most": 95,
     # #1045: the ONE context size every model call loads at. Changing it
     # rebuilds both runners once; leaving it alone is what stops them
     # rebuilding sixty times an hour.
@@ -1498,6 +1503,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
                        if str(raw_dj.get("speed_mode") or "off").lower()
                        in ("off", "brisk", "fast", "emergency")
                        else "off"),                               # #1080
+        "talk_quiet_most": max(30, min(600, int(                  # #1088
+            raw_dj.get("talk_quiet_most",
+                       DEFAULT_DJ["talk_quiet_most"]) or 95))),
         "model_ctx": max(2048, min(131072, int(                    # #1045
             raw_dj.get("model_ctx", DEFAULT_DJ["model_ctx"]) or 0)
             or DEFAULT_DJ["model_ctx"])),
@@ -24445,7 +24453,37 @@ def trail_rows(most: int = 60, liked_only: bool = False
 # Self-clearing on purpose: the mark is paid the moment a fresh one is
 # banked for that road. A debt that outlives its own repayment is a
 # grudge, and a scheduler with grudges starves whatever it is angry at.
+# #1088: ...ON DISK. This is the ledger that makes "so it does not
+# happen next time" mean something, and it lived in memory on a station
+# measured at NINETY RESTARTS IN TWENTY-FOUR HOURS - one every sixteen
+# minutes. Every debt the station incurred was erased before it could
+# be repaid.
+ARREARS_PATH = data_path("arrears.json")
 _ARREARS: dict[str, dict[str, Any]] = {}
+_ARREARS_READ = [False]
+
+
+def arrears_load() -> dict[str, dict[str, Any]]:
+    if not _ARREARS_READ[0]:
+        _ARREARS_READ[0] = True
+        try:
+            got = json.loads(ARREARS_PATH.read_text())
+            if isinstance(got, dict):
+                _ARREARS.update({k: v for k, v in got.items()
+                                 if isinstance(v, dict)})
+        except Exception:  # noqa: BLE001
+            pass
+    return _ARREARS
+
+
+def arrears_save() -> None:
+    try:
+        ARREARS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = ARREARS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_ARREARS, indent=1, default=str))
+        tmp.replace(ARREARS_PATH)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def arrears_note(road: str, why: str = "") -> None:
@@ -24454,11 +24492,13 @@ def arrears_note(road: str, why: str = "") -> None:
         road = str(road or "")
         if not road:
             return
+        arrears_load()                                        # #1088
         seat = _ARREARS.setdefault(road, {"road": road, "owed": 0,
                                           "at": 0.0, "why": ""})
         seat["owed"] = int(seat.get("owed") or 0) + 1
         seat["at"] = time.time()
         seat["why"] = str(why or "")[:180]
+        arrears_save()                                            # #1088
         pipeline_log("lookahead",
                      f"(#1073) {SHELF_LABEL.get(road, road)} had to be "
                      f"covered - owed {seat['owed']} now, and it goes "
@@ -24470,12 +24510,14 @@ def arrears_note(road: str, why: str = "") -> None:
 def arrears_paid(road: str) -> None:
     """A fresh one was banked. The debt is settled."""
     try:
+        arrears_load()                                            # #1088
         seat = _ARREARS.get(str(road))
         if not seat:
             return
         seat["owed"] = max(0, int(seat.get("owed") or 0) - 1)
         if seat["owed"] <= 0:
             _ARREARS.pop(str(road), None)
+        arrears_save()
     except Exception:  # noqa: BLE001
         pass
 
@@ -24483,6 +24525,7 @@ def arrears_paid(road: str) -> None:
 def arrears_owed() -> list[dict[str, Any]]:
     """What is owed, worst first."""
     try:
+        arrears_load()                                            # #1088
         return sorted((dict(v) for v in _ARREARS.values()
                        if int(v.get("owed") or 0) > 0),
                       key=lambda r: -int(r.get("owed") or 0))
@@ -27370,6 +27413,12 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(mx_ad_clock()))
     _RADIO_TASK.append(asyncio.create_task(ad_studio_clock()))      # #916
     _RADIO_TASK.append(asyncio.create_task(dead_air_watch()))
+    # #1088: ...and the one that watches the TALK. dead_air_watch
+    # resets its strikes on a spinning record, so it has never once
+    # seen the pair go quiet. Measured: three-minute holes about
+    # twice an hour, worst case seven minutes, every one of them
+    # covered by music and none of them recorded.
+    _RADIO_TASK.append(asyncio.create_task(talk_watch()))
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
@@ -43042,6 +43091,12 @@ def print_penalise(key: str) -> None:
 
 
 def air_remember(text: str, who: str = "", kind: str = "") -> None:
+    # #1088: the stamp the talk watchdog measures from. Here because
+    # this is the one place every aired line passes through.
+    try:
+        talk_said_now()
+    except Exception:  # noqa: BLE001
+        pass
     """ONE door for "this went out on air" (#901).
 
     Three ledgers back the anti-repeat engine — the line prints the GATE
@@ -43521,6 +43576,89 @@ def cover_speaker(blocked: str = "") -> tuple[str, str]:
             if who != blocked and str(v or "").strip()]
     fast = [(w, v) for w, v in live if not VOICE_ID_SHAPE.match(v)]
     return (fast or live or [("cohost", "")])[0]
+
+
+# --- THE TALK WATCHDOG (#1088) ----------------------------------------
+# Seconds since a CAST LINE aired - not since "air", which a spinning
+# record satisfies. This is the measurement the station did not have,
+# and the absence of it is why the presenters could go quiet for three
+# minutes twice an hour without anything noticing.
+_LAST_SAID = [0.0]
+# How long the pair may be quiet before somebody covers. The measured
+# p90 between lines is 64s, so this sits above the ordinary rhythm of
+# the show and below the three-minute holes that are the fault.
+TALK_QUIET_MOST = 95.0
+TALK_WATCH_TICK = 15.0
+
+
+def talk_said_now() -> None:
+    """A cast line just went out."""
+    try:
+        _LAST_SAID[0] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def talk_quiet_for() -> float:
+    """#1088: how long since anybody actually SPOKE.
+
+    air_quiet_for() answers a different question - it counts a spinning
+    record as air, which is right for "are we broadcasting" and useless
+    for "is anyone talking". Both existing watchdogs are gated on it,
+    which is why neither has ever seen this."""
+    try:
+        if not _LAST_SAID[0]:
+            return 0.0                  # nothing has aired yet this run
+        return max(0.0, time.time() - float(_LAST_SAID[0]))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def talk_quiet_limit() -> float:
+    try:
+        got = float(dj_settings().get("talk_quiet_most") or 0)
+        return max(30.0, min(600.0, got or TALK_QUIET_MOST))
+    except Exception:  # noqa: BLE001
+        return TALK_QUIET_MOST
+
+
+async def talk_watch() -> None:
+    """#1088: the loop that keeps the pair talking.
+
+    Conservative on purpose. It never speaks over anybody, never fires
+    inside cover_the_gap's own window, and stands down while a round is
+    playing out - a pause between two turns of a conversation is not a
+    hole. What it catches is nothing coming at all."""
+    await asyncio.sleep(45)
+    while True:
+        await asyncio.sleep(TALK_WATCH_TICK)
+        try:
+            if not _RADIO.get("on"):
+                continue
+            if _SPEAKING[0]:
+                continue                # somebody has the floor
+            quiet = talk_quiet_for()
+            if quiet < talk_quiet_limit():
+                continue
+            went = await cover_the_gap(
+                "dj", f"nobody has said anything for {int(quiet)}s")
+            if went:
+                pipeline_log(
+                    "air",
+                    f"(#1088) the pair had been quiet {int(quiet)}s - "
+                    "somebody covered",
+                    extra=("THE TALK WATCHDOG (#1088)\n\nThis measures "
+                           "time since a CAST LINE aired, not since "
+                           "'air' - a spinning record satisfies the "
+                           "second and not the first, which is why the "
+                           "two existing watchdogs never saw a hole "
+                           "like this.\n\nMeasured before this "
+                           "existed: the presenters went quiet for over "
+                           "three minutes about twice an hour, worst "
+                           "case seven minutes, and the music covered "
+                           "every one of them."))
+        except Exception:  # noqa: BLE001
+            continue                    # a watchdog may never take the show
 
 
 async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
