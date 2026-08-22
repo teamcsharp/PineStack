@@ -21813,6 +21813,78 @@ def coord_load() -> None:
         pass
 
 
+def air_last_heard() -> float:
+    """#1023: the last moment a LISTENER could hear anything, on any road.
+
+    Read from state the station already keeps rather than by stamping a
+    clock at every publish site, because there are a dozen of those and
+    the one that gets missed is the one that produces this bug again.
+    Whichever road is carrying the broadcast, its own evidence counts:
+
+      the box      _BOX_LAST_OK - a verified playout on the device
+      the page     the newest clip on the voice feed, which is what the
+                   panel and the desktop app play
+      a stream     _STREAM_NOW, a coalesced round in flight
+      the mouth    _SPEAKING / _LAST_SYNTH - something being said this
+                   second, which is audible before any of the above have
+                   caught up with it
+
+    A RECORD IS AIR TOO, and deliberately so: if a track is playing, the
+    air is not dead, whatever the talk is doing. The old measure could
+    not see that either - it would call an hour of uninterrupted music
+    an hour of dead air if the DJs were quiet through it.
+    """
+    best = 0.0
+    now = time.time()
+    try:
+        best = max(best, float(_BOX_LAST_OK[0] or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        rows = _RADIO.get("voice_clips") or []
+        if rows:
+            # the feed stamps in milliseconds
+            best = max(best, float(rows[-1].get("ts") or 0) / 1000.0)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if _STREAM_NOW:
+            began = float(_STREAM_NOW.get("at") or 0)
+            length = float(_STREAM_NOW.get("length") or 0)
+            if began:
+                best = max(best, min(now, began + max(0.0, length)))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if _SPEAKING[0]:
+            best = now
+        else:
+            best = max(best, float(_LAST_SYNTH[0] or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        # A track playing right now. `started` is when the needle went
+        # down and `seconds` is its length; inside that window there is
+        # music on the air.
+        track = _RADIO.get("now") or {}
+        started = float(_RADIO.get("started") or 0)
+        secs = float(track.get("seconds") or 0)
+        if _RADIO.get("on") and track and started:
+            if not secs or now - started <= secs + 5.0:
+                best = now
+    except Exception:  # noqa: BLE001
+        pass
+    return best or now
+
+
+def air_quiet_for() -> float:
+    """#1023: how long the air has ACTUALLY been quiet, in seconds."""
+    try:
+        return max(0.0, time.time() - air_last_heard())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def coord_air_sample() -> None:
     """One look at the air. Opens a gap, or closes one.
 
@@ -21825,7 +21897,9 @@ def coord_air_sample() -> None:
             _GAP_OPEN.clear()
             return
         now = time.time()
-        quiet = float(now - _BOX_LAST_OK[0])
+        # #1023: on whatever road is carrying the broadcast, not on the
+        # box the broadcast may not be going to. See air_last_heard.
+        quiet = air_quiet_for()
         if quiet >= COORD_GAP_FLOOR:
             if not _GAP_OPEN:
                 slot = {}
@@ -22154,7 +22228,8 @@ def coord_brief() -> dict[str, Any]:
     try:
         # --- is the air moving RIGHT NOW ---------------------------------
         gap = float(_GAP_OPEN.get("seconds") or 0) if _GAP_OPEN else 0.0
-        quiet = max(0.0, now - float(_BOX_LAST_OK[0] or now))
+        # #1023: on whatever road carries the broadcast, not on the box.
+        quiet = air_quiet_for()
         out["quiet_for"] = round(quiet, 1)
         out["gap_open"] = round(gap, 1) if _GAP_OPEN else 0.0
         if _GAP_OPEN and gap >= COORD_SPOT_AFTER:
@@ -22169,7 +22244,18 @@ def coord_brief() -> dict[str, Any]:
         except Exception:  # noqa: BLE001
             held = 0
         out["held"] = held
-        if held >= 3:
+        # #1023: the hold shelf is the BOX's queue. With the broadcast
+        # routed to the app it is either empty or stale, and warning
+        # about it points the operator at a device that is not in the
+        # path - which is the same fault as measuring silence there.
+        _box_is_a_road = False
+        try:
+            _box_is_a_road = (box_talk_ok() and any(
+                str(_RADIO.get(k) or "") in ("box", "both")
+                for k in ("voice_to", "music_to", "reply_to")))
+        except Exception:  # noqa: BLE001
+            _box_is_a_road = False
+        if held >= 3 and _box_is_a_road:
             out["worries"].append(
                 f"{held} finished line(s) are held - the box is taking them "
                 "and playing none of them")
@@ -60749,7 +60835,17 @@ def glyphy_state() -> dict[str, Any]:
 
         # --- the mood, in the order that matters -------------------------
         mood, why, say = "watching", "", ""
-        if gap >= COORD_SPOT_AFTER or held >= 3:
+        # #1023: the hold shelf is the BOX's queue; with the broadcast
+        # routed elsewhere it is stale, and being angry about it points
+        # at a device that is not in the path.
+        _box_is_a_road = False
+        try:
+            _box_is_a_road = (box_talk_ok() and any(
+                str(_RADIO.get(k) or "") in ("box", "both")
+                for k in ("voice_to", "music_to", "reply_to")))
+        except Exception:  # noqa: BLE001
+            _box_is_a_road = False
+        if gap >= COORD_SPOT_AFTER or (held >= 3 and _box_is_a_road):
             mood = "angry"
             why = (f"the air has been quiet {int(gap)}s" if gap else
                    f"{held} finished line(s) are held and none are playing")
