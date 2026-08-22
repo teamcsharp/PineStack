@@ -5901,6 +5901,29 @@ _SYNTH_TRIED = [0.0]              # #852: attempted, as distinct from done
 # goes through this gate, because the show's clocks stacking unbounded
 # concurrent calls is exactly what wedged the chat queue server-side.
 _OLLAMA_GATE = asyncio.Semaphore(2)
+# #1079: ...AND ONE PERMIT PER MODEL BEHIND IT.
+#
+# Every llama-server runner on this box is launched `-np 1`, so ollama
+# serialises requests per model. Measured: two simultaneous 31b calls
+# span 35.24s against 31.5s of summed compute - the second spent 18.35s
+# purely queued, and throughput was identical to running them in turn.
+# CROSS-model overlap is different and genuinely free: 31b held 4.2
+# tok/s while e2b simultaneously ran at 31-66, because e2b's second of
+# compute slots into 31b's fourteen.
+#
+# A single semaphore of two permits the useless case and does not
+# guarantee the useful one. This gives exactly the overlap that pays.
+_OLLAMA_ONE: dict[str, asyncio.Semaphore] = {}
+
+
+def _ollama_lane(model: str) -> asyncio.Semaphore:
+    """One permit for each model, made on first use."""
+    key = str(model or "")
+    lane = _OLLAMA_ONE.get(key)
+    if lane is None:
+        lane = asyncio.Semaphore(1)
+        _OLLAMA_ONE[key] = lane
+    return lane
 _OUR_VOICE_FOR = 4.0
 
 
@@ -12453,7 +12476,13 @@ _RENDER_COST: list[float] = []
 # the pantry's building window (#890), starving the very buffer that
 # makes relief unnecessary. Piper is now the answer to a SICK engine,
 # not a busy one. Continuity is the pantry's job.
-RENDER_COST_SLOW = 4.5          # sustained ratio at which we borrow Piper
+# #1079: was 4.5, and the rolling-8 mean it is compared against has a
+# MEDIAN of 4.55 - so the trigger sat exactly on its own operating point
+# and latched on and off about once every twelve minutes, which is the
+# flapping #892 and #895 were both written to stop. The operating point
+# drifted back up to it. 7.0 clears p90 on the short-line mix that
+# render_cost_note actually samples.
+RENDER_COST_SLOW = 7.0          # sustained ratio at which we borrow Piper
 RENDER_COST_OK = 3.4            # ...and the ratio at which the clones return
 _RENDER_RELIEF = [False]
 _RENDER_RELIEF_AT = [0.0]        # when it latched on (#784)
@@ -36442,6 +36471,15 @@ async def describe_gallery_image(want: str = "",
                     "stream": False,
                     "think": False,
                     "keep_alive": "30m",
+                    # #1079: THE SAME CONTEXT THE WRITER USES. This
+                    # call sent no num_ctx, so ollama loaded the shared
+                    # gemma4:e2b runner at its daemon default of 32768
+                    # and the next writing call rebuilt it at 65536 -
+                    # measured, 1,420 runner starts in a day with the
+                    # two sizes EXACTLY PAIRED per hour, at 6.85s a
+                    # rebuild. #1045 pinned the context and this one
+                    # line unpinned it.
+                    "options": {"num_ctx": model_ctx()},
                     # #901: a seed, and a jittered temperature. What
                     # this call writes is the SEED of the gallery round
                     # — the pair talk about what it says — and with a
@@ -54534,6 +54572,30 @@ async def ask_model(prompt: str, limit: int = 300,
         # more than the extra room was ever worth.
         num_ctx=model_ctx(),
     )
+    # #1079: THE DECOMPOSITION, WHICH WAS ARRIVING AND BEING DISCARDED.
+    # Ollama returns total/load/prompt_eval/eval durations on every
+    # response and this read only the content. `ms` is therefore wall
+    # clock measured around the gate and cannot tell waiting from
+    # working - measured, a 31b tint turn's 53s median is 16.7s of
+    # compute and 36s of queue, and the ledger has been pricing that
+    # contention as if it were the work.
+    _spent: dict[str, float] = {}
+    try:
+        for _k in ("total_duration", "load_duration",
+                   "prompt_eval_duration", "eval_duration"):
+            _v = result.get(_k)
+            if _v:
+                _spent[_k[:-9]] = round(float(_v) / 1e9, 3)
+        for _k in ("prompt_eval_count", "eval_count"):
+            if result.get(_k):
+                _spent[_k[7:] if _k.startswith("prompt_") else _k] = int(
+                    result[_k])
+        if _spent:
+            _spent["service"] = round(
+                _spent.get("load", 0.0) + _spent.get("prompt_eval", 0.0)
+                + _spent.get("eval", 0.0), 3)
+    except Exception:  # noqa: BLE001
+        _spent = {}
     answer = ((result.get("message") or {}).get("content") or "").strip()
     answer = re.sub(r"<think>.*?</think>", " ", answer, flags=re.S)
     kept = whole_sentences(" ".join(answer.split())[:limit])
@@ -54548,8 +54610,17 @@ async def ask_model(prompt: str, limit: int = 300,
         pipeline_log("model", f"fragment binned after {took} ms — "
                               "the fallback speaks instead (#264)")
         return ""
+    # #1079: and it SAYS how much of that was waiting.
+    _wait = ""
+    try:
+        if _spent.get("service"):
+            _q = max(0.0, took / 1000.0 - float(_spent["service"]))
+            _wait = (f" · {int(_spent['service'] * 1000)} ms working, "
+                     f"{int(_q * 1000)} ms waiting")
+    except Exception:  # noqa: BLE001
+        _wait = ""
     pipeline_log("model", f"{settings['model']} answered · {took} ms · "
-                          f"{len(kept)} chars",
+                          f"{len(kept)} chars{_wait}",
                  extra=f"RESULT:\n{kept}")
     # #782: the writing half of a line's story. A spoken line knows which
     # model made it but never how long it waited to be written, and "why was
@@ -54655,7 +54726,13 @@ async def call_ollama(
         options["repeat_penalty"] = float(repeat_penalty)
     # ponytail: two in flight, ollama 0.30.6's chat queue wedged solid when
     # the show's clocks stacked unbounded 300s calls on top of each other.
-    async with _OLLAMA_GATE, httpx.AsyncClient(timeout=180) as client:
+    # #1079: ITS OWN LANE FIRST, then the global cap. Every runner
+    # is launched -np 1 so ollama serialises per model - two 31b
+    # calls at once measured 35.24s span against 31.5s of summed
+    # compute, the second spending 18.35s purely queued. Overlap
+    # across DIFFERENT models is free and is what this preserves.
+    async with _ollama_lane(model), _OLLAMA_GATE, \
+            httpx.AsyncClient(timeout=180) as client:
         response = await client.post(
             f"{OLLAMA_URL}/api/chat",
             json={
@@ -74297,6 +74374,9 @@ async def art_prompt_api(
             answer = await client.post(
                 f"{OLLAMA_URL}/api/chat",
                 json={"model": VISION_MODEL,
+                      # #1079: and this one too - same runner, same
+                      # rebuild.
+                      "options": {"num_ctx": model_ctx()},
                       "messages": [{
                           "role": "user",
                           "content": (
