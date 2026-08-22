@@ -14757,7 +14757,13 @@ def pipeline_log(kind: str, text: str, extra: str = "") -> None:
     entry = {"ts": int(time.time() * 1000), "kind": kind,
              "text": str(text)[:200]}
     if extra:
-        entry["extra"] = str(extra)[:2000]
+        # #1066: was 2000, and the second pass's own record is a
+        # 3600-character triple - what was written, what came back, and
+        # THE PASSAGE IT WAS SHOWN. The passage is the field that proves
+        # what the model was looking at, it sits last, and it was
+        # truncated away in eleven of eleven captured samples. The one
+        # surface built for auditing the tint could not hold the tint.
+        entry["extra"] = str(extra)[:8000]
     log.append(entry)
     del log[:-240]
 
@@ -23360,6 +23366,215 @@ def cupboard_rotate() -> dict[str, Any]:
                        f"deep, {int(CUPBOARD_STALE_HOURS)}h when it is "
                        "bare, because old footage beats silence.\n\n"
                        f"cast now: {cast_signature()}"))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+# --- WHAT ONE LINE OF THE CONSOLE ACTUALLY MEANS (#1064) --------------
+# The road each kind of event travels, stated by hand, each step paired
+# with the evidence that proves it happened ("kind|text fragment").
+PIPE_ROADS: dict[str, dict[str, Any]] = {
+    "model": {
+        "face": "the writing desk",
+        "does": "a visit to the language model - somebody asked for words",
+        "flow": [["the desk decides what to write", "lookahead|"],
+                 ["the prompt is built", "model|writing"],
+                 ["waiting at the gate - two permits", "model|writing"],
+                 ["the model answers", "model|answered"],
+                 ["trimmed to a finished thought", "model|binned"],
+                 ["the road has its script", "voice|"]],
+        "uses": ["banter", "ad", "news", "gallery", "caller", "manager"],
+        "goes": "into a script, which becomes lines, which become audio",
+    },
+    "voice": {
+        "face": "the recording room",
+        "does": "one line rendered into audio",
+        "flow": [["a finished line of script", "model|answered"],
+                 ["the engine takes it", "voice|xtts"],
+                 ["rendered", "voice|done"],
+                 ["effects, then filed in the pantry", "voice|done"],
+                 ["a shelf row holds the key", "lookahead|READY"],
+                 ["it goes out", "air|"]],
+        "uses": ["render_line", "track_talk", "banter"],
+        "goes": "into the pantry, then onto a shelf row, then to air",
+    },
+    "speakbox": {
+        "face": "the studio shelf",
+        "does": "material drawn out of the operator's own documents",
+        "flow": [["a document wins the weighted draw", "speakbox|mined"],
+                 ["its lines are cut", "speakbox|mined"],
+                 ["the coldest lead (#1042)", "speakbox|mined"],
+                 ["a consecutive run is taken", "speakbox|swath"],
+                 ["the cooldown is stamped", "speakbox|"],
+                 ["it goes into the writing prompt", "model|writing"]],
+        "uses": ["banter", "ad", "caller"],
+        "goes": "into the first prompt, as material the pair must use",
+    },
+    "crystal": {
+        "face": "the second pass",
+        "does": "a finished line rewritten in the crystal's voice",
+        "flow": [["a finished plain line", "model|answered"],
+                 ["a contiguous passage is drawn", "speakbox|"],
+                 ["the rewrite runs, one visit a line", "crystal|tinted"],
+                 ["or it stands down on its share", "crystal|stood down"],
+                 ["both versions kept", "crystal|tinted"]],
+        "uses": ["banter", "ad", "manager"],
+        "goes": "replaces the plain line, or is thrown away whole",
+    },
+    "air": {
+        "face": "the transmitter",
+        "does": "something reached, or failed to reach, the listener",
+        "flow": [["a rendered clip and its routing", "voice|done"],
+                 ["the box is offered it", "air|box"],
+                 ["the page is fed it", "air|"],
+                 ["the airtime ledger records it", "air|"]],
+        "uses": ["every road that speaks"],
+        "goes": "to the listener, and to the repeat cupboard afterwards",
+    },
+    "lookahead": {
+        "face": "the orchestrator",
+        "does": "a decision about what to build next, or not to",
+        "flow": [["the keeper wakes, every six seconds", "lookahead|wants"],
+                 ["the board is priced", "lookahead|next up"],
+                 ["a deadline outranks the ledger", "lookahead|deadline"],
+                 ["the half-hour desk (#1050)", "lookahead|half hour"],
+                 ["the cupboard floor (#1057)", "lookahead|cupboard"],
+                 ["one thing is built", "lookahead|READY"]],
+        "uses": ["banter", "ad", "caller", "gallery", "news"],
+        "goes": "into the reserve, which is what keeps the station ahead",
+    },
+    "drop": {
+        "face": "the drops and stings",
+        "does": "a short piece of furniture between the talk",
+        "flow": [["six written in one visit", "model|writing"],
+                 ["they stack up", "drop|"],
+                 ["one goes out as a bumper", "air|"]],
+        "uses": ["station_id"],
+        "goes": "straight to air, and to the cupboard afterwards",
+    },
+    "repair": {
+        "face": "the engineer",
+        "does": "something broke and the station tried to fix it itself",
+        "flow": [["a check failed", "repair|"],
+                 ["a remedy is chosen", "repair|"],
+                 ["it worked, or it did not", "repair|"]],
+        "uses": ["the watchdogs"],
+        "goes": "back into service, or to the operator as a worry",
+    },
+}
+
+
+def pipe_detail(kind: str = "", at: float = 0.0, find: str = ""
+                ) -> dict[str, Any]:
+    """#1064: everything the station knows about one line of the console."""
+    out: dict[str, Any] = {"at": time.time(), "kind": str(kind or "")}
+    try:
+        now = time.time()
+        want = str(kind or "")
+        every = list(reversed(_RADIO.get("pipeline") or []))
+        rows = [r for r in every
+                if not want or str(r.get("kind") or "") == want]
+        found = None
+        for row in rows:
+            if at and abs(float(row.get("ts") or 0) - float(at)) > 2500:
+                continue
+            if find and str(find)[:50] not in str(row.get("text") or ""):
+                continue
+            found = row
+            break
+        out["event"] = dict(found) if found else (dict(rows[0]) if rows
+                                                  else {})
+        out["road"] = dict(PIPE_ROADS.get(want) or {})
+
+        # HISTORY - every other time this happened.
+        out["history"] = [
+            {"ts": float(r.get("ts") or 0),
+             "text": str(r.get("text") or "")[:220],
+             "has_extra": bool(r.get("extra"))}
+            for r in rows[:40]]
+        out["seen"] = len(rows)
+
+        # THE ACTIVITY CHART - this kind, per minute, over the last hour.
+        buckets = [0] * 60
+        for r in rows:
+            age = now - float(r.get("ts") or 0) / 1000.0
+            slot = int(age // 60)
+            if 0 <= slot < 60:
+                buckets[59 - slot] += 1
+        out["chart"] = buckets
+        out["per_hour"] = sum(buckets)
+
+        # WHERE THE WORK IS RIGHT NOW. Each step of the road carries the
+        # most recent evidence that it happened, so the lit stage walks
+        # down the list as the work moves. This follows the ROAD, not one
+        # item - nothing here carries a correlation id from prompt to
+        # air, and pretending otherwise would be a prettier lie.
+        stages: list[dict[str, Any]] = []
+        newest = 0.0
+        for step in (out["road"].get("flow") or []):
+            label, mark = (list(step) + ["", ""])[:2]
+            want_kind, _, want_text = str(mark).partition("|")
+            hit = None
+            for r in every:
+                if want_kind and str(r.get("kind") or "") != want_kind:
+                    continue
+                if want_text and want_text.lower() not in str(
+                        r.get("text") or "").lower():
+                    continue
+                hit = r
+                break
+            ts = float((hit or {}).get("ts") or 0)
+            newest = max(newest, ts)
+            stages.append({
+                "label": str(label), "seen": bool(hit), "ts": ts,
+                "ago": (round(max(0.0, now - ts / 1000.0), 1)
+                        if ts else None),
+                "text": str((hit or {}).get("text") or "")[:150]})
+        for st in stages:
+            st["live"] = bool(st["ts"] and st["ts"] == newest)
+        out["stages"] = stages
+        try:
+            out["writing_now"] = bool(_LARDER_WRITING[0]
+                                      or _OLLAMA_GATE.locked())
+        except Exception:  # noqa: BLE001
+            out["writing_now"] = False
+
+        # THE SYSTEM PROMPTS - the desk's paperwork around this moment.
+        papers: list[dict[str, Any]] = []
+        try:
+            for call in list(reversed(_MODEL_CALLS))[:80]:
+                if at and abs(float(call.get("at") or 0) * 1000.0
+                              - float(at)) > 180000:
+                    continue
+                papers.append({
+                    "at": float(call.get("at") or 0),
+                    "model": str(call.get("model") or ""),
+                    "ms": int(call.get("ms") or 0),
+                    "kind": str(call.get("kind") or ""),
+                    "armed": str(call.get("armed") or "")[:4000],
+                    "prompt": str(call.get("prompt") or "")[:8000],
+                    "sched": str(call.get("sched") or "")[:600],
+                    "tinted": str(call.get("tinted") or "")[:300],
+                    "num_ctx": call.get("num_ctx"),
+                    "text": str(call.get("text") or "")[:3000],
+                })
+                if len(papers) >= 3:
+                    break
+        except Exception:  # noqa: BLE001
+            papers = []
+        out["prompts"] = papers
+
+        # WHAT IT COSTS - the ledger's own measurement of these roads.
+        cost: dict[str, Any] = {}
+        try:
+            for road in (out["road"].get("uses") or [])[:8]:
+                got = task_stat(str(road))
+                if got and got.get("measured"):
+                    cost[str(road)] = got
+        except Exception:  # noqa: BLE001
+            cost = {}
+        out["cost"] = cost
     except Exception:  # noqa: BLE001
         pass
     return out
@@ -39117,8 +39332,7 @@ async def _sfxguy_news_fill() -> None:
                 "You are a thick-accented, NASCAR-loving country boy in "
                 f"a radio booth. Headline: {story.get('title')}. Give ONE "
                 f"spicy, funny take on it, under {_news_words} words, no "
-                "quotes, no explanation. Make it RHYME - internal rhyme, "
-                f"not just on the end.{_ntint}",
+                f"quotes, no explanation.{_ntint}",               # #1066
                 limit=max(200, _news_words * 9), spice=0.85,
                 # #1022: his own brew, not whatever entry is on air.
                 mark={"kind": "sfx news",
@@ -39215,8 +39429,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
                 "short reaction that actually engages with what was said "
                 "— heckle it, one-up it, or agree way too hard — in your "
                 f"backcountry voice.{_tinted}{_shard} Under {_react_words} "
-                "words, no quotes. Make it RHYME - internal rhyme, not "
-                "just on the end.",
+                "words, no quotes.",                          # #1066
                 limit=max(200, _react_words * 9), spice=0.85,
                 # #1022: his own brew. It runs whenever there is room, so
                 # whatever entry is on air had nothing to do with it.
@@ -39248,8 +39461,14 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
             "You are a thick-accented country boy in a radio booth. "
             f"Take these sayings: {' / '.join(picks)} — and {recipe}."
             f"{_tinted}{_shard} Answer with the ONE new saying only, "
-            f"under {_warp_words} words, no quotes, no explanation. Make "
-            "it RHYME - internal rhyme, not just on the end.",
+            f"under {_warp_words} words, no quotes, no explanation.",
+            # #1066: the rhyme order is GONE from the first pass. A
+            # small model obeys it with cheap monosyllabic couplets,
+            # the second pass then faithfully preserves them, and the
+            # measured result was the highest raw rhyme density on the
+            # station with the LOWEST construction - 3.4% multisyllabic
+            # against 13.7% everywhere else. Let him say a thing; the
+            # tint is what makes it a bar.
             limit=max(200, _warp_words * 9), spice=0.9,
             # #1022: the invention shed. Nothing to do with the round on
             # air, and it must stop claiming that round's instruction.
@@ -50302,7 +50521,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
             _tint = await crystal_tint(script,
                                        str(entry.get("prep_kind") or ""),
                                        entry.get("verbatim"),
-                                       whole_only=not bank)
+                                       # #1066: NOT `not bank`. The
+                                       # one-ask road measured 1.9%
+                                       # rhyme against 8.0% turn by
+                                       # turn - indistinguishable from
+                                       # not tinting. #1063's hourly
+                                       # share is the governor now, so
+                                       # the live road no longer needs
+                                       # a cheaper path to run down.
+                                       whole_only=False)
             entry["script_plain"] = script
             entry["tint"] = {
                 "ok": bool(_tint.get("ok")),
@@ -57929,13 +58156,27 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                                 for c in chunks)
            + "\n\n" if chunks else "")
         + "Come back with ONE bar written that way. Take from the "
-          "passage: its LEXICON and VOCABULARY (the words that writer "
-          "uses, and the ones they never would); its SPEAKING STYLE (how "
-          "a sentence runs, breaks and lands); its BUILDUP (how a thing "
-          "is set up and paid off); and its DELIVERY (the rhythm it "
-          "would be said with). IT RHYMES the way those lines rhyme - "
-          "inside the line, not only on the end - and it says a thing "
-          "sideways as often as they do.\n\n"
+          "passage: its LEXICON and VOCABULARY (reuse their actual "
+          "WORDS - that is what a lexicon is; do not lift whole "
+          "PHRASES); its SPEAKING STYLE (how a sentence runs, breaks "
+          "and lands); its BUILDUP (how a thing is set up and paid "
+          "off); and its DELIVERY (the rhythm it would be said "
+          "with).\n\n"
+          # #1066: the device, named. Measured against the source, the
+          # tint end-rhymed 31% MORE and rhymed internally 17% LESS,
+          # and leaned on matched word-endings 2.1x as often. "Inside
+          # the line, not only on the end" is satisfied by one cheap
+          # monosyllabic pair; none of the rest was ever asked for.
+          "HOW IT MUST RHYME - this is the whole job:\n"
+          "  MOST of the rhyming happens INSIDE the line. A bar that "
+          "only rhymes at its end has failed.\n"
+          "  CHAIN one sound three or more times before you drop it.\n"
+          "  Reach for MULTISYLLABIC rhymes - two and three syllables "
+          "answering each other, not single beats.\n"
+          "  Matching a word ENDING is not rhyming. -ing with -ing, "
+          "-tion with -tion, -ly with -ly are all refused: the vowel "
+          "before the ending has to answer too.\n"
+          "  Say a thing sideways as often as they do.\n\n"
         + (f"THE LINE BEFORE THIS ONE, already rewritten - answer its "
            f"rhyme:\n{answering}\n\n" if answering else "")
         + f"IT MAY RUN LONGER THAN THE ORIGINAL - up to about "
@@ -58237,8 +58478,13 @@ async def crystal_tint(script: str, kind: str = "",
               "off; what they hold back and when they spend it.\n"
               "  DELIVERY - the rhythm it would be said with, and the "
               "attitude behind it.\n\n"
-              "So every turn comes back as BARS. It rhymes the way those "
-              "lines rhyme - INSIDE the line, not only on the end. It "
+              "So every turn comes back as BARS. MOST of the rhyming "
+              "happens INSIDE the line - a bar that only rhymes at its "
+              "end has failed. CHAIN one sound three or more times. "
+              "Reach for MULTISYLLABIC rhymes, two and three syllables "
+              "answering each other. Matching a word ENDING is NOT "
+              "rhyming: -ing with -ing is refused, the vowel before it "
+              "has to answer too. It "
               "says a thing sideways as often as they do.\n\n"
               "Keep: the speaker markers and their order, the number of "
               "turns, who says what, and every fact, name, number and "
@@ -64531,6 +64777,21 @@ async def api_repeats() -> dict[str, Any]:
                 f"worth {int(saved)}s of writing nobody has to do"
                 if rows else "the cupboard is empty"),
     }
+
+
+@app.get("/api/pipeline/detail")
+async def api_pipe_detail(
+    kind: str = "",
+    at: float = 0.0,
+    find: str = "",
+) -> dict[str, Any]:
+    """#1064: everything the station knows about one console line.
+
+    The system prompt that armed it and the prompt as sent, every other
+    time this happened, a per-minute chart of the last hour, what uses
+    this road and where its output goes, the road written out step by
+    step, and which step the work is standing on right now."""
+    return pipe_detail(str(kind or ""), float(at or 0), str(find or ""))
 
 
 @app.get("/api/slots")
@@ -115252,6 +115513,257 @@ async function pollActivityFeed() {
    with a payload (the actual prompt, the actual reply) expands on click. */
 let pipelineSeenTs = 0;
 
+/* #1065: THE PAPERWORK BEHIND ONE CONSOLE LINE. Six things: the road
+ * it travelled with the live stage lit, the system prompt and the
+ * prompt as sent, what uses this road and where its output goes, a
+ * chart of the last hour, what it costs, and every other time it
+ * happened. Refreshes while open so the work is watched moving. */
+let pipeBox = null;
+let pipeTimer = null;
+let pipeAsk = null;
+
+function pipeClose() {
+  if (pipeTimer) { clearInterval(pipeTimer); pipeTimer = null; }
+  if (pipeBox) { pipeBox.remove(); pipeBox = null; }
+  pipeAsk = null;
+}
+
+function pipeAgo(secs) {
+  if (secs === null || secs === undefined) return "never today";
+  const s = Math.round(Number(secs));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.round(s / 60) + "m ago";
+  return Math.round(s / 3600) + "h ago";
+}
+
+function pipeSection(body, title) {
+  const cap = document.createElement("div");
+  cap.textContent = title;
+  cap.style.cssText = "font-size:9.5px;letter-spacing:.11em;opacity:.55;"
+    + "margin:13px 0 5px;text-transform:uppercase";
+  body.appendChild(cap);
+  return cap;
+}
+
+async function pipePaintDetail() {
+  if (!pipeBox || !pipeAsk) return;
+  let d;
+  try {
+    d = await (await fetch("/api/pipeline/detail?kind="
+      + encodeURIComponent(pipeAsk.kind) + "&at=" + (pipeAsk.at || 0)
+      + "&find=" + encodeURIComponent(pipeAsk.find || ""))).json();
+  } catch (err) { return; }
+  if (!pipeBox) return;
+  const body = pipeBox.querySelector("#pipeBody");
+  const road = d.road || {};
+  body.textContent = "";
+
+  const face = document.createElement("div");
+  face.style.cssText = "font-size:12.5px;line-height:1.5";
+  face.innerHTML = "";
+  const b = document.createElement("b");
+  b.textContent = road.face || d.kind || "this road";
+  face.appendChild(b);
+  if (road.does) {
+    const t = document.createElement("span");
+    t.textContent = " \u2014 " + road.does;
+    t.style.opacity = ".8";
+    face.appendChild(t);
+  }
+  body.appendChild(face);
+
+  /* THE ROAD, with the live stage lit. */
+  pipeSection(body, "the road it travels \u00b7 live");
+  (d.stages || []).forEach((st, i) => {
+    const row = document.createElement("div");
+    row.style.cssText = "display:flex;gap:8px;align-items:baseline;"
+      + "font-size:11.5px;padding:3px 6px;border-radius:5px;margin-bottom:2px;"
+      + (st.live ? "background:rgba(255,180,60,.14);" : "")
+      + (st.seen ? "" : "opacity:.35;");
+    const dot = document.createElement("span");
+    dot.textContent = st.live ? "\u25c9" : (st.seen ? "\u25cf" : "\u25cb");
+    dot.style.color = st.live ? "#ffb43c" : (st.seen ? "#6fdc8c" : "#888");
+    row.appendChild(dot);
+    const lab = document.createElement("span");
+    lab.textContent = (i + 1) + ". " + st.label;
+    lab.style.flex = "1";
+    if (st.live) lab.style.fontWeight = "700";
+    row.appendChild(lab);
+    const ago = document.createElement("span");
+    ago.textContent = pipeAgo(st.ago);
+    ago.style.cssText = "opacity:.6;font-size:10px;white-space:nowrap";
+    row.appendChild(ago);
+    row.title = st.text || "";
+    body.appendChild(row);
+  });
+  if (d.writing_now) {
+    const w = document.createElement("div");
+    w.textContent = "\u25cf the desk is writing right now";
+    w.style.cssText = "font-size:10.5px;color:#ffb43c;margin-top:4px";
+    body.appendChild(w);
+  }
+
+  /* WHAT USES IT AND WHERE IT GOES. */
+  if (road.uses || road.goes) {
+    pipeSection(body, "what uses this, and where it goes");
+    const u = document.createElement("div");
+    u.style.cssText = "font-size:11.5px;line-height:1.55";
+    u.textContent = "used by: " + ((road.uses || []).join(", ") || "\u2014");
+    body.appendChild(u);
+    const g = document.createElement("div");
+    g.style.cssText = "font-size:11.5px;line-height:1.55;opacity:.85";
+    g.textContent = "goes to: " + (road.goes || "\u2014");
+    body.appendChild(g);
+  }
+
+  /* THE CHART. */
+  pipeSection(body, "the last hour \u00b7 " + (d.per_hour || 0) + " so far");
+  const chart = document.createElement("div");
+  chart.style.cssText = "display:flex;align-items:flex-end;gap:1px;"
+    + "height:44px;padding:3px 0";
+  const top = Math.max(1, ...(d.chart || [0]));
+  (d.chart || []).forEach((n) => {
+    const bar = document.createElement("div");
+    bar.style.cssText = "flex:1;background:" + (n ? "#6fdc8c" : "#3a3a3a")
+      + ";height:" + Math.max(2, Math.round((n / top) * 40)) + "px;"
+      + "border-radius:1px";
+    bar.title = n + " in that minute";
+    chart.appendChild(bar);
+  });
+  body.appendChild(chart);
+
+  /* WHAT IT COSTS. */
+  const cost = d.cost || {};
+  if (Object.keys(cost).length) {
+    pipeSection(body, "what these roads measure");
+    Object.keys(cost).forEach((k) => {
+      const c = cost[k] || {};
+      const row = document.createElement("div");
+      row.style.cssText = "font-size:11px;display:flex;gap:8px";
+      const n = document.createElement("span");
+      n.textContent = k;
+      n.style.flex = "1";
+      row.appendChild(n);
+      const v = document.createElement("span");
+      v.textContent = Math.round(Number(c.p90 || c.mean || 0)) + "s";
+      v.style.opacity = ".8";
+      row.appendChild(v);
+      body.appendChild(row);
+    });
+  }
+
+  /* THE SYSTEM PROMPTS. */
+  const papers = d.prompts || [];
+  if (papers.length) {
+    pipeSection(body, "the paperwork around this moment");
+    papers.forEach((pp) => {
+      const wrap = document.createElement("div");
+      wrap.style.cssText = "border:1px solid rgba(255,255,255,.1);"
+        + "border-radius:6px;padding:7px 9px;margin-bottom:6px";
+      const head = document.createElement("div");
+      head.style.cssText = "font-size:10.5px;opacity:.7;margin-bottom:4px";
+      head.textContent = (pp.model || "?") + " \u00b7 " + (pp.ms || 0)
+        + "ms \u00b7 ctx " + (pp.num_ctx || "?")
+        + (pp.kind ? " \u00b7 for " + pp.kind : "")
+        + (pp.tinted ? " \u00b7 TINTED" : "");
+      wrap.appendChild(head);
+      [["system prompt", pp.armed], ["prompt as sent", pp.prompt],
+       ["the schedule said", pp.sched], ["what came back", pp.text]
+      ].forEach(([name, val]) => {
+        if (!val) return;
+        const t = document.createElement("details");
+        const sm = document.createElement("summary");
+        sm.textContent = name + " (" + String(val).length + " chars)";
+        sm.style.cssText = "font-size:10.5px;cursor:pointer;opacity:.8";
+        t.appendChild(sm);
+        const pre = document.createElement("div");
+        pre.textContent = val;
+        pre.style.cssText = "white-space:pre-wrap;font-size:10.5px;"
+          + "max-height:230px;overflow:auto;margin-top:4px;opacity:.9;"
+          + "border-left:2px solid rgba(255,255,255,.15);padding-left:7px";
+        t.appendChild(pre);
+        wrap.appendChild(t);
+      });
+      body.appendChild(wrap);
+    });
+  }
+
+  /* THE AUDIT LOG. */
+  pipeSection(body, "every other time this happened \u00b7 " + (d.seen || 0));
+  (d.history || []).forEach((h) => {
+    const row = document.createElement("div");
+    row.style.cssText = "font-size:10.5px;display:flex;gap:7px;"
+      + "padding:2px 0;opacity:.85";
+    const t = document.createElement("span");
+    t.textContent = new Date(h.ts).toLocaleTimeString();
+    t.style.cssText = "opacity:.6;white-space:nowrap";
+    row.appendChild(t);
+    const x = document.createElement("span");
+    x.textContent = h.text;
+    x.style.flex = "1";
+    row.appendChild(x);
+    body.appendChild(row);
+  });
+}
+
+async function pipeOpen(ev) {
+  pipeClose();
+  pipeAsk = {kind: String(ev.kind || ""), at: Number(ev.ts || 0),
+             find: String(ev.text || "").slice(0, 50)};
+  const box = document.createElement("div");
+  box.className = "panel";
+  box.id = "pipeBoxEl";
+  box.style.cssText = "position:fixed;z-index:152;width:min(640px,96vw);"
+    + "height:min(680px,88vh);display:flex;flex-direction:column;"
+    + "padding:11px 13px;box-shadow:0 20px 60px rgba(0,0,0,.7);"
+    + "resize:both;overflow:hidden;left:120px;top:70px";
+
+  const bar = document.createElement("div");
+  bar.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "cursor:grab;margin-bottom:3px";
+  const ttl = document.createElement("b");
+  ttl.textContent = "\ud83d\udd2c " + String(ev.text || "").slice(0, 60);
+  ttl.style.fontSize = "12px";
+  bar.appendChild(ttl);
+  const shut = document.createElement("button");
+  shut.textContent = "\u2715";
+  shut.onclick = pipeClose;
+  shut.style.marginLeft = "auto";
+  bar.appendChild(shut);
+  box.appendChild(bar);
+
+  const body = document.createElement("div");
+  body.id = "pipeBody";
+  body.style.cssText = "flex:1;overflow:auto;padding-right:4px";
+  box.appendChild(body);
+
+  bar.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    const from = {x: event.clientX, y: event.clientY,
+                  left: box.offsetLeft, top: box.offsetTop};
+    bar.setPointerCapture(event.pointerId);
+    const move = (e) => {
+      box.style.left = Math.max(0, from.left + e.clientX - from.x) + "px";
+      box.style.top = Math.max(0, from.top + e.clientY - from.y) + "px";
+    };
+    bar.addEventListener("pointermove", move);
+    bar.addEventListener("pointerup", () => {
+      bar.removeEventListener("pointermove", move);
+    }, {once: true});
+  });
+
+  document.body.appendChild(box);
+  pipeBox = box;
+  await pipePaintDetail();
+  /* it refreshes while open, so the lit stage walks the road */
+  pipeTimer = setInterval(pipePaintDetail, 3000);
+}
+
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && pipeBox) pipeClose();
+});
+
+
 function consoleAddPipeline(ev) {
   const feed = document.getElementById("consoleFeed");
   if (!feed) return;
@@ -115275,6 +115787,15 @@ function consoleAddPipeline(ev) {
   body.className = "cx-reply";
   body.textContent = (ev.text || "") + (ev.extra ? "  ⤵" : "");
   entry.appendChild(body);
+  /* #1065: the whole entry opens its paperwork. The `extra` still
+   * expands in place on its own click below - this is the deeper
+   * read, and it sits on the HEAD so the two do not fight. */
+  head.style.cursor = "zoom-in";
+  head.title = "open the paperwork behind this line";
+  head.addEventListener("click", (clickEvent) => {
+    clickEvent.stopPropagation();
+    pipeOpen(ev);
+  });
   if (ev.extra) {
     // #833: an entry the reader opened STAYS open. The expansion is held
     // against the event's own key rather than against the element, so a
