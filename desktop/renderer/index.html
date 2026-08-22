@@ -79,7 +79,16 @@
            box - the physical dial is the only owner of that number. -->
       <label class="stream-owner" for="boxVolOwn">
         <input id="boxVolOwn" type="checkbox">
-        <span>Let the station set the Pine Box's own volume</span>
+        <span>Keep the record level applied on the box</span>
+      </label>
+      <!-- #1011/#1012: how long you have to rest on something before it
+           explains itself. Shared with the control panel through the
+           station's own settings, so the two cannot disagree. -->
+      <label class="stream-owner" for="tipDelay">
+        <span style="flex:1">Tooltips appear after</span>
+        <input id="tipDelay" type="number" min="0" max="10" step="0.5"
+               style="width:56px" value="3">
+        <span>s</span>
       </label>
       <label class="volume-row" for="appVolume">
         <span>App volume</span>

@@ -363,13 +363,13 @@ let boxLevelSent = null;
 function sendBoxMusicLevel(v) {
   const route = streamRoute("music");
   if (route !== "box" && route !== "both") return;
-  /* #1007: the level is still remembered - it is what gets sent if the
-   * operator ever hands the station that dial - but with the switch off
-   * we do not pretend the slider moved the box. */
-  if (!(lastRouting && lastRouting.music_control)) {
-    noteRouteOk("record level stored at " + Math.round(Number(v) * 100)
-      + "% \u2014 the dial on the device is still what the box plays at");
-  }
+  /* #1014: the level goes to the device the MOMENT you move this,
+   * whether or not the station has standing permission to set that
+   * number on its own. #1007 refused the station ASSERTING a level
+   * nobody asked for - before every record, and again after every
+   * restart, undoing the dial on the device. Moving the control IS
+   * asking, and a control that visibly does nothing is worse than
+   * either. */
   if (boxLevelTimer) clearTimeout(boxLevelTimer);
   boxLevelTimer = setTimeout(() => {
     boxLevelTimer = null;
@@ -392,6 +392,28 @@ function initSegCell() {
   if (!cell || cell.dataset.wired) return;
   cell.dataset.wired = "1";
   cell.onclick = () => { segCellOpen(); };
+}
+
+/* #1012: the tooltip rest, as a preference. 0 switches them off; under
+ * 0.4s hands them back to the browser's own timing. */
+function initTipDelay(ms) {
+  const box = document.getElementById("tipDelay");
+  if (!box) return;
+  if (!box.dataset.wired) {
+    box.dataset.wired = "1";
+    box.onchange = () => {
+      const want = Math.max(0, Math.min(10, Number(box.value) || 0));
+      api.post("/api/prefs/tip-delay", {ms: Math.round(want * 1000)})
+        .then((got) => {
+          pineTipSetDelay(Number(got && got.tip_delay_ms));
+          noteRouteOk(String((got && got.say) || ""));
+        })
+        .catch((err) => noteRouteError(err.message));
+    };
+  }
+  if (document.activeElement === box) return;
+  const secs = Math.max(0, Number(ms) || 0) / 1000;
+  if (Number(box.value) !== secs) box.value = String(secs);
 }
 
 function initNowCell() {
@@ -516,9 +538,9 @@ function paintBoxVolumeOwner(routing) {
       const on = !!box.checked;
       api.post("/api/dj/output", {music_control: on})
         .then(() => noteRouteOk(on
-          ? "the station may set the Pine Box's volume again"
-          : "the Pine Box's own dial owns its volume \u2014 the station "
-            + "will not move it"))
+          ? "the record level is re-applied before each record"
+          : "the record level is sent only when you move the slider "
+            + "— the dial on the device owns it the rest of the time"))
         .catch((err) => { noteRouteError(err.message); box.checked = !on; });
     };
   }
@@ -527,12 +549,13 @@ function paintBoxVolumeOwner(routing) {
   const label = box.parentElement;
   if (label) {
     label.title = box.checked
-      ? "Records are set to the Music slider's level on the box, once per "
-        + "change. Turning the dial on the device itself will be undone the "
-        + "next time that level changes or the station restarts."
-      : "The station never sets the Pine Box's volume. Whatever you set on "
-        + "the device is what records play at. The Music slider still "
-        + "controls music playing in this app.";
+      ? "The Music slider's level is re-applied to the box before "
+        + "records, so a hand on the physical dial gets undone. Use "
+        + "this when the station should own that number."
+      : "The Music slider still sets the box the moment you move it "
+        + "— that is you asking. Off, the station never touches "
+        + "that number at any other time, so the dial on the device "
+        + "keeps whatever you set on it, through restarts.";
   }
 }
 
@@ -986,6 +1009,9 @@ async function refresh() {
     initStreamRoutes();
     initStreamVolumes();
     initSegCell();                                          // #988
+    pineTipsInstall();                                      // #1011
+    pineTipSetDelay(Number(status.tip_delay_ms));            // #1012
+    initTipDelay(status.tip_delay_ms);                      // #1012
     initNowCell();                                          // #984
     nowCellTrack = status.now_playing || null;              // #984
     applyAppVolume();
@@ -6123,8 +6149,18 @@ function wkDeskEntry(id, c) {
  * it always did, and only the ones you CLOSE are remembered - so this
  * never grows. It is kept apart from wkOpen, which the five stages own
  * and rewrite wholesale. */
-function wkDeskShut() {
-  try { return JSON.parse(localStorage.getItem("wkDeskShut") || "{}") || {}; }
+/* #1015: "When I expand the writing desk, have all the categories
+ * inside collapsed by default until I expand them."
+ *
+ * This remembered which entries you had SHUT, so everything the desk had
+ * written arrived open - twenty-six calls, each with its prompt, its
+ * system prompt and its result, all unfolded the moment the drawer was
+ * touched. It remembers which ones you have OPENED now, which is the
+ * same mechanism with the opposite default, and it is a NEW key so an
+ * existing store of "shut" entries cannot be read as "opened" and invert
+ * the very thing being fixed. */
+function wkDeskOpened() {
+  try { return JSON.parse(localStorage.getItem("wkDeskOpened") || "{}") || {}; }
   catch (e) { return {}; }
 }
 
@@ -6281,16 +6317,16 @@ function wkResFold(key, want) {
 }
 
 function wkDeskOpen(key) {
-  try { return wkDeskShut()[key] !== true; } catch (e) { return true; }
+  try { return wkDeskOpened()[key] === true; } catch (e) { return false; }
 }
 
 function wkDeskFold(t, want) {
   try {
     if (!t || !t.wkKey) return;
-    const all = wkDeskShut();
-    if (want) delete all[t.wkKey];
-    else all[t.wkKey] = true;
-    try { localStorage.setItem("wkDeskShut", JSON.stringify(all)); }
+    const all = wkDeskOpened();
+    if (want) all[t.wkKey] = true;
+    else delete all[t.wkKey];
+    try { localStorage.setItem("wkDeskOpened", JSON.stringify(all)); }
     catch (e) { /* private mode: it still works for this session */ }
     t.wkHead.textContent = (want ? "\u25be " : "\u25b8 ") + t.wkLabel;
     t.wkInner.style.display = want ? "block" : "none";
@@ -6304,10 +6340,10 @@ function wkDeskFold(t, want) {
 function wkDeskForget(id) {
   try {
     if (!id) return;
-    const all = wkDeskShut();
+    const all = wkDeskOpened();
     if (all["desk:" + id] === undefined) return;
     delete all["desk:" + id];
-    localStorage.setItem("wkDeskShut", JSON.stringify(all));
+    localStorage.setItem("wkDeskOpened", JSON.stringify(all));
   } catch (e) { /* nothing here is worth the drawer */ }
 }
 
@@ -7479,6 +7515,114 @@ function segMoveWatch() {
   };
   segMoveTimer = setInterval(tick, 1200);
   tick();
+}
+
+/* #1011/#1012: TOOLTIPS THAT WAIT UNTIL YOU MEAN IT.
+ *
+ * "Only show tool tips in the application after I've been hovering over
+ * the element for three seconds at least." / "I want to be able to adjust
+ * the time for the tool tip to pop up in the preferences."
+ *
+ * The browser's own tooltip fires at about a second and its delay cannot
+ * be changed from a page. On a panel where nearly every control carries
+ * an explanation, that means prose appearing all over the screen while
+ * you are simply moving the mouse across it.
+ *
+ * So the native tip is taken away and given back on OUR clock: `title` is
+ * moved to `data-tip` the first time an element is hovered - which is
+ * what stops the browser drawing its own - and a bubble is drawn after
+ * the rest the operator has asked for. Moving `title` lazily, on hover,
+ * rather than sweeping the document means this costs nothing on a page
+ * with four thousand elements on it and works for anything drawn later.
+ *
+ * 0 switches them off entirely. Under 400ms it stops taking `title` away
+ * at all, so the native behaviour comes straight back.
+ */
+let pineTipDelay = 3000;
+let pineTipTimer = null;
+let pineTipEl = null;
+
+function pineTipSetDelay(ms) {
+  const want = Math.max(0, Math.min(10000, Number(ms) || 0));
+  if (want === pineTipDelay) return;
+  pineTipDelay = want;
+  if (want < 400) pineTipHide();
+}
+
+function pineTipBubble() {
+  if (pineTipEl && document.body.contains(pineTipEl)) return pineTipEl;
+  const b = document.createElement("div");
+  b.id = "pineTip";
+  b.style.cssText = "position:fixed;z-index:2147483000;pointer-events:none;"
+    + "max-width:min(420px,60vw);padding:6px 9px;border-radius:6px;"
+    + "background:#0b1520f2;border:1px solid #2a4257;color:#dbe6f0;"
+    + "font-size:11.5px;line-height:1.45;box-shadow:0 10px 30px #000a;"
+    + "white-space:pre-wrap;opacity:0;transition:opacity .12s linear";
+  document.body.appendChild(b);
+  pineTipEl = b;
+  return b;
+}
+
+function pineTipHide() {
+  if (pineTipTimer) { clearTimeout(pineTipTimer); pineTipTimer = null; }
+  if (pineTipEl) pineTipEl.style.opacity = "0";
+}
+
+function pineTipShow(el, text) {
+  const b = pineTipBubble();
+  b.textContent = text;
+  b.style.opacity = "0";
+  /* Measure, then place: below and left-aligned if there is room, above
+   * if there is not, and never off the right edge. */
+  const r = el.getBoundingClientRect();
+  b.style.left = "0px";
+  b.style.top = "0px";
+  const w = b.offsetWidth;
+  const h = b.offsetHeight;
+  let x = Math.round(r.left);
+  let y = Math.round(r.bottom + 7);
+  if (x + w > window.innerWidth - 8) x = Math.max(8, window.innerWidth - w - 8);
+  if (y + h > window.innerHeight - 8) y = Math.max(8, Math.round(r.top - h - 7));
+  b.style.left = x + "px";
+  b.style.top = y + "px";
+  b.style.opacity = "1";
+}
+
+function pineTipsInstall() {
+  if (window.__pineTipsOn) return;
+  window.__pineTipsOn = true;
+  const enter = (ev) => {
+    pineTipHide();
+    if (pineTipDelay <= 0) return;
+    const target = ev.target && ev.target.closest
+      ? ev.target.closest("[title],[data-tip]") : null;
+    if (!target) return;
+    /* Take the native tip away the first time we see this element. Under
+     * 400ms we leave `title` alone and the browser does its own thing. */
+    if (pineTipDelay >= 400 && target.hasAttribute("title")) {
+      const t = target.getAttribute("title");
+      if (t) {
+        target.setAttribute("data-tip", t);
+        target.removeAttribute("title");
+      }
+    }
+    const text = target.getAttribute("data-tip")
+      || target.getAttribute("title") || "";
+    if (!text) return;
+    pineTipTimer = setTimeout(() => {
+      pineTipTimer = null;
+      /* Still under the pointer? A timer that fires after the mouse has
+       * gone is exactly the behaviour being complained about. */
+      if (!target.matches(":hover")) return;
+      pineTipShow(target, text);
+    }, pineTipDelay);
+  };
+  document.addEventListener("mouseover", enter, true);
+  document.addEventListener("mouseout", pineTipHide, true);
+  document.addEventListener("mousedown", pineTipHide, true);
+  document.addEventListener("wheel", pineTipHide, {capture: true, passive: true});
+  document.addEventListener("keydown", pineTipHide, true);
+  window.addEventListener("blur", pineTipHide);
 }
 
 function pvFloatDesk(el2) {

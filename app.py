@@ -834,6 +834,14 @@ DEFAULT_DJ = {
     # switched on. Off, the Music slider still moves music playing in the
     # app and the box plays records at whatever the dial on it says.
     "box_volume_control": False,
+    # #1011/#1012: how long you have to rest on something before it
+    # explains itself. The browser's own tooltip fires at about a second
+    # and cannot be changed, which on a panel where nearly every control
+    # carries an explanation means the screen fills with prose while you
+    # are simply moving the mouse across it. Three seconds is deliberate
+    # rest; below about 400ms it is the native behaviour again, and 0
+    # switches them off entirely.
+    "tip_delay_ms": 3000,
     # Whisper the playing song so the pair can talk about its actual
     # lyrics (#451). Off by default — it is CPU on every new track.
     "lyrics_talk": True,
@@ -1416,6 +1424,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
                        DEFAULT_DJ["music_box_level"]) or 0.0))),
         "box_volume_control": bool(raw_dj.get(                 # #1007
             "box_volume_control", DEFAULT_DJ["box_volume_control"])),
+        "tip_delay_ms": max(0, min(10000, int(float(          # #1011/#1012
+            raw_dj.get("tip_delay_ms", DEFAULT_DJ["tip_delay_ms"]) or 0)))),
         "lyrics_talk": bool(raw_dj.get("lyrics_talk",
                                        DEFAULT_DJ["lyrics_talk"])),
         "perf": bool(raw_dj.get("perf", DEFAULT_DJ["perf"])),
@@ -14113,6 +14123,10 @@ def radio_state() -> dict[str, Any]:
         # the saved value said - which is the whole of "the DJs are
         # currently overlapping each other".
         "overlap": int(dj_settings().get("overlap", 35) or 0),
+        # #1011/#1012: and the tooltip rest, on the same state every page
+        # already polls, so the panel and the desktop app cannot disagree
+        # about it and neither needs its own copy.
+        "tip_delay_ms": int(dj_settings().get("tip_delay_ms", 3000) or 0),
         "now": now,
         "elapsed": round(elapsed, 1),
         # The two stamps every device retimes against (#631). `elapsed` is
@@ -37569,6 +37583,47 @@ def music_box_level() -> float:
         return 0.35
 
 
+async def box_level_send(level: float) -> dict[str, Any]:
+    """#1014: put a level on the box's own volume, NOW.
+
+    "Make sure that these settings are affecting the box in real time as
+    I'm adjusting them."
+
+    #1007 and this look like opposites and are not. What #1007 refused is
+    the station ASSERTING a level nobody asked for - before every record,
+    and again after every restart, undoing the dial on the device. What
+    this is, is the operator moving the slider: an explicit instruction,
+    obeyed at once. The station still never touches that number on its
+    own; it touches it when it is told to, which is what a control is."""
+    out: dict[str, Any] = {"ok": False, "why": "", "entity": ""}
+    try:
+        token, player = _ha_creds()
+        if not (token and player):
+            out["why"] = "no Home Assistant credentials"
+            return out
+        entity = (NABU_MEDIA_PLAYER if player == NABU_SATELLITE else player)
+        out["entity"] = entity
+        if not entity.startswith("media_player."):
+            out["why"] = ("the DJs go to the satellite by announce, which "
+                          "has no volume of its own - the level is baked "
+                          "into each clip instead")
+            return out
+        want = max(0.0, min(1.0, round(float(level), 3)))
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            reply = await client.post(
+                f"{HA_URL}/api/services/media_player/volume_set",
+                headers={"Authorization": f"Bearer {token}"},
+                json={"entity_id": entity, "volume_level": want})
+        out["ok"] = 200 <= reply.status_code < 300
+        if not out["ok"]:
+            out["why"] = f"HTTP {reply.status_code}"
+        else:
+            _MUSIC_LEVEL_SET.update({"at": want, "ok": True})
+    except Exception as exc:  # noqa: BLE001
+        out["why"] = f"{type(exc).__name__}: {exc}"[:140]
+    return out
+
+
 def box_volume_control() -> bool:
     """#1007: may the station set the box's own volume?
 
@@ -56615,6 +56670,44 @@ async def dj_output_api(
             _s = load_settings()
             _s.setdefault("dj", {})["music_box_level"] = _lvl
             save_settings(_s)
+            # #1014: "Make sure that these settings are affecting the box
+            # in real time as I'm adjusting them." This IS the operator
+            # moving the slider, so it goes to the device NOW - whether or
+            # not the station has standing permission to set that number
+            # on its own. #1007 refused the station ASSERTING a level
+            # nobody asked for; an explicit move of the control is the
+            # opposite of that, and refusing it would make the slider a
+            # control that visibly does nothing.
+            if str(_RADIO.get("music_to") or "") in ("box", "both"):
+                _sent = await box_level_send(_lvl)
+                if _sent.get("ok"):
+                    pipeline_log("voice", f"records set to {int(_lvl * 100)}%"
+                                 " on the box now - you moved the slider "
+                                 "(#1014)")
+                elif _sent.get("why"):
+                    pipeline_log("drop", "could not set the record level on "
+                                 f"the box: {_sent.get('why')} (#1014)")
+        except Exception:  # noqa: BLE001
+            pass
+    # #1014: and the DJs' own level. Speech goes to the satellite by
+    # announce, which has no volume of its own - the loudness is BAKED
+    # into each clip as it is rendered (box_gain, #448/#573). So this
+    # takes effect on every line made from now on, and cannot change one
+    # already recorded. Said plainly rather than pretending otherwise.
+    if payload.get("voice_level") is not None:
+        try:
+            _v = max(0.0, min(1.0, float(payload.get("voice_level"))))
+            # 0..1 across the slider maps onto the 0.3..1.6 the amplitude
+            # multiplier is clamped to, so the ends of the control are the
+            # ends of what the station can actually do.
+            _gain = round(0.3 + _v * 1.3, 3)
+            _s2 = load_settings()
+            _s2.setdefault("dj", {})["box_volume"] = _gain
+            save_settings(_s2)
+            pipeline_log("voice", f"the DJs are rendered at {_gain}x from "
+                         "here - speech goes to the satellite by announce, "
+                         "so the level is baked into each clip and this "
+                         "reaches every line made from now on (#1014)")
         except Exception:  # noqa: BLE001
             pass
     was = str(_RADIO.get("voice_to") or "box")
@@ -58894,6 +58987,10 @@ async def pinebox_status_api(
             "music_level": round(music_box_level(), 3),        # #1007
             "music_control": box_volume_control(),             # #1007
         },
+        # #1011/#1012: the tooltip rest, on the poll the desktop shell
+        # already makes, so the shell and the panel share one setting
+        # rather than each keeping its own copy.
+        "tip_delay_ms": int(dj_settings().get("tip_delay_ms", 3000) or 0),
         "delivery": {
             "held": len(_BOX_HOLD),
             "silent_for": (int(time.time() - _BOX_LAST_OK[0])
@@ -59620,6 +59717,34 @@ async def api_doc(
                 raise HTTPException(status_code=500,
                                     detail=f"{type(exc).__name__}") from exc
     raise HTTPException(status_code=404, detail="no such document")
+
+
+@app.post("/api/prefs/tip-delay")
+async def api_tip_delay(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1012: how long you have to rest on something before it explains
+    itself, in milliseconds. 0 switches tooltips off; under 400 hands
+    them back to the browser's own timing."""
+    require_auth(authorization)
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    body = body if isinstance(body, dict) else {}
+    try:
+        ms = max(0, min(10000, int(float(body.get("ms", 3000) or 0))))
+    except (TypeError, ValueError):
+        ms = 3000
+    store = load_settings()
+    store.setdefault("dj", {})["tip_delay_ms"] = ms
+    save_settings(store)
+    return {"tip_delay_ms": ms,
+            "say": ("tooltips are off" if ms <= 0 else
+                    "tooltips use the browser's own timing" if ms < 400 else
+                    f"tooltips appear after {ms / 1000:g}s of resting on "
+                    "something")}
 
 
 @app.get("/api/rooms/sitting")
@@ -89797,6 +89922,12 @@ async function rhetWordDetail(word) {
 
 function djRender(state) {
   djLastState = state;
+  /* #1011/#1012: tooltips wait until you mean it, on the delay the
+   * operator has set, shared with the desktop app through the state. */
+  try {
+    pineTipsInstall();
+    pineTipSetDelay(Number(state.tip_delay_ms));
+  } catch (e) { /* the panel still reads */ }
   /* #1008: the overlap setting reaches the page on every poll now, not
    * only when the settings panel happens to be painted. */
   try {
@@ -90037,6 +90168,114 @@ function pineSoloGate(clock) {
       el.dataset.pineGag = gagged ? "1" : "";
     });
   } catch (e) { /* the show goes on */ }
+}
+
+/* #1011/#1012: TOOLTIPS THAT WAIT UNTIL YOU MEAN IT.
+ *
+ * "Only show tool tips in the application after I've been hovering over
+ * the element for three seconds at least." / "I want to be able to adjust
+ * the time for the tool tip to pop up in the preferences."
+ *
+ * The browser's own tooltip fires at about a second and its delay cannot
+ * be changed from a page. On a panel where nearly every control carries
+ * an explanation, that means prose appearing all over the screen while
+ * you are simply moving the mouse across it.
+ *
+ * So the native tip is taken away and given back on OUR clock: `title` is
+ * moved to `data-tip` the first time an element is hovered - which is
+ * what stops the browser drawing its own - and a bubble is drawn after
+ * the rest the operator has asked for. Moving `title` lazily, on hover,
+ * rather than sweeping the document means this costs nothing on a page
+ * with four thousand elements on it and works for anything drawn later.
+ *
+ * 0 switches them off entirely. Under 400ms it stops taking `title` away
+ * at all, so the native behaviour comes straight back.
+ */
+let pineTipDelay = 3000;
+let pineTipTimer = null;
+let pineTipEl = null;
+
+function pineTipSetDelay(ms) {
+  const want = Math.max(0, Math.min(10000, Number(ms) || 0));
+  if (want === pineTipDelay) return;
+  pineTipDelay = want;
+  if (want < 400) pineTipHide();
+}
+
+function pineTipBubble() {
+  if (pineTipEl && document.body.contains(pineTipEl)) return pineTipEl;
+  const b = document.createElement("div");
+  b.id = "pineTip";
+  b.style.cssText = "position:fixed;z-index:2147483000;pointer-events:none;"
+    + "max-width:min(420px,60vw);padding:6px 9px;border-radius:6px;"
+    + "background:#0b1520f2;border:1px solid #2a4257;color:#dbe6f0;"
+    + "font-size:11.5px;line-height:1.45;box-shadow:0 10px 30px #000a;"
+    + "white-space:pre-wrap;opacity:0;transition:opacity .12s linear";
+  document.body.appendChild(b);
+  pineTipEl = b;
+  return b;
+}
+
+function pineTipHide() {
+  if (pineTipTimer) { clearTimeout(pineTipTimer); pineTipTimer = null; }
+  if (pineTipEl) pineTipEl.style.opacity = "0";
+}
+
+function pineTipShow(el, text) {
+  const b = pineTipBubble();
+  b.textContent = text;
+  b.style.opacity = "0";
+  /* Measure, then place: below and left-aligned if there is room, above
+   * if there is not, and never off the right edge. */
+  const r = el.getBoundingClientRect();
+  b.style.left = "0px";
+  b.style.top = "0px";
+  const w = b.offsetWidth;
+  const h = b.offsetHeight;
+  let x = Math.round(r.left);
+  let y = Math.round(r.bottom + 7);
+  if (x + w > window.innerWidth - 8) x = Math.max(8, window.innerWidth - w - 8);
+  if (y + h > window.innerHeight - 8) y = Math.max(8, Math.round(r.top - h - 7));
+  b.style.left = x + "px";
+  b.style.top = y + "px";
+  b.style.opacity = "1";
+}
+
+function pineTipsInstall() {
+  if (window.__pineTipsOn) return;
+  window.__pineTipsOn = true;
+  const enter = (ev) => {
+    pineTipHide();
+    if (pineTipDelay <= 0) return;
+    const target = ev.target && ev.target.closest
+      ? ev.target.closest("[title],[data-tip]") : null;
+    if (!target) return;
+    /* Take the native tip away the first time we see this element. Under
+     * 400ms we leave `title` alone and the browser does its own thing. */
+    if (pineTipDelay >= 400 && target.hasAttribute("title")) {
+      const t = target.getAttribute("title");
+      if (t) {
+        target.setAttribute("data-tip", t);
+        target.removeAttribute("title");
+      }
+    }
+    const text = target.getAttribute("data-tip")
+      || target.getAttribute("title") || "";
+    if (!text) return;
+    pineTipTimer = setTimeout(() => {
+      pineTipTimer = null;
+      /* Still under the pointer? A timer that fires after the mouse has
+       * gone is exactly the behaviour being complained about. */
+      if (!target.matches(":hover")) return;
+      pineTipShow(target, text);
+    }, pineTipDelay);
+  };
+  document.addEventListener("mouseover", enter, true);
+  document.addEventListener("mouseout", pineTipHide, true);
+  document.addEventListener("mousedown", pineTipHide, true);
+  document.addEventListener("wheel", pineTipHide, {capture: true, passive: true});
+  document.addEventListener("keydown", pineTipHide, true);
+  window.addEventListener("blur", pineTipHide);
 }
 
 function pineListenerId() {
