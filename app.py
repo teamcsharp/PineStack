@@ -20433,6 +20433,10 @@ async def recast_sweep() -> dict[str, int]:
 
 # #1106: how much of a round has to exist before it may air as itself.
 # Below this it is a fragment; at or above it, it is a shorter segment.
+# #1119: how long a rewrite that failed waits before it is tried
+# again. Measured attempts run eight to sixteen minutes, so retrying one
+# immediately is the most expensive loop on the station.
+TINT_RETRY_REST = 1800.0
 LARDER_PART_SECONDS = 75.0
 LARDER_PART_SHARE = 0.45
 
@@ -24635,6 +24639,22 @@ _RETINT_SAID = [0.0]
 # the coverage gap is, so it cannot be the one that only runs when
 # nothing else wants doing.
 _RETINT_TURN = [False]
+# #1119: one rewrite in flight at a time, and never on the coordinator's
+# own thread of control.
+_RETINT_BUSY = [False]
+
+
+async def _retint_turn() -> None:
+    """#1119: run one later-pass, off the coordinator's tick."""
+    if _RETINT_BUSY[0]:
+        return
+    _RETINT_BUSY[0] = True
+    try:
+        await retint_one()
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _RETINT_BUSY[0] = False
 
 
 # --- THE LATER PASS, FOR EVERY ROAD (#1104) ---------------------------
@@ -24680,6 +24700,16 @@ def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
                         continue
                     if row.get("tint_ok") or row.get("tinted"):
                         continue        # already carries one
+                    # #1119: AND A FAILURE RESTS. `tint_tried` was
+                    # written by #1104 and read by nothing - one grep,
+                    # one hit - so a round that blew its deadline came
+                    # straight back on the next tick and blew it again,
+                    # for eight to sixteen minutes a go. It gets its
+                    # turn back after the rest, behind everything that
+                    # has not been tried.
+                    if (time.time() - float(row.get("tint_tried") or 0)
+                            < TINT_RETRY_REST):
+                        continue
                     if not str(row.get("text") or "").strip():
                         continue        # nothing to rewrite
                     if row.get("aired_at"):
@@ -27642,8 +27672,18 @@ async def coordinator() -> None:
             # It carries its own brakes (tint_should_stop, and the
             # hourly share in tint_budget), so the tick decides only how
             # often it may ASK, never how much it may spend.
+            # #1119: NOT AWAITED. #1104 put this on the fifteen-second
+            # tick and waited for it, and measured attempts run eight to
+            # SIXTEEN MINUTES - so a fifteen-second coordinator became a
+            # sixteen-minute one, with coord_air_sample, coord_fill_gap,
+            # cover_sweep, tint_autotune, piper_probe, coord_retire and
+            # cupboard_rotate all queued behind a rewrite that was going
+            # to discard its own work. That is why the scheduler "never
+            # satiates": it was not refusing to build, it was not being
+            # asked. One at a time, and off the tick.
             try:
-                await retint_one()                                # #1068
+                if not _RETINT_BUSY[0]:
+                    fire_and_forget(_retint_turn())                # #1068
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -61637,7 +61677,8 @@ def tint_should_stop() -> str:
 
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                        answering: str = "", keep: list[str] | None = None,
-                       seen: list[str] | None = None) -> str:
+                       seen: list[str] | None = None,
+                       kind: str = "") -> str:
     """#1021: one turn, put in the world's mouth.
 
     Short prompt, short answer, one thing to do. `answering` is the
@@ -61715,8 +61756,16 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     try:
         got = await ask_model(prompt, limit=_may + 120,           # #1035
                               spice=0.5,
-                              model=str(dj_settings().get(       # #1036
-                                  "crystal_tint_model") or ""),
+                              # #1119: THROUGH THE CHOOSER. This read the
+                              # setting directly, so tint_model_for() -
+                              # the whole of #1110's "the pair deeply,
+                              # rest lightly" - had ONE caller, the
+                              # whole-round path, and never touched the
+                              # turn-by-turn road that every banked round
+                              # takes. The big model stayed on regardless
+                              # of what the budget could afford, which is
+                              # what blew the deadline.
+                              model=tint_model_for(kind),   # #1036/#1119
                               mark={"kind": "tint turn",
                                     "for": "one turn put in the crystal's "
                                            "mouth"})
@@ -61755,8 +61804,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 "properly this time - different words, their images, "
                 "their rhyme - keeping only the facts.",
                 limit=_may + 120, spice=0.75,                    # #1035
-                model=str(dj_settings().get(                      # #1045
-                    "crystal_tint_model") or ""),
+                model=tint_model_for(kind),               # #1045/#1119
                 mark={"kind": "tint turn", "for": "the same turn, asked "
                                                   "again after it came "
                                                   "back unchanged"})
@@ -62090,7 +62138,17 @@ async def crystal_tint(script: str, kind: str = "",
             # the 2B takes six. A deadline built for the small one throws
             # away every round the big one writes - measured: 121s of
             # work discarded against a 54s deadline.
-            _per = (45.0 if str(dj.get("crystal_tint_model") or "")
+            # #1119: from the LEDGER where there is one. 45s was a
+            # guess against tint_model_now()'s own measured "mean of
+            # 29.6s and a worst of 95.8s" - nineteen turns of it made a
+            # 900s deadline that was blown at 994. The station measures
+            # every other task it runs; this one can read its own p90.
+            try:
+                _measured = float(task_cost("tint:turn") or 0)
+            except Exception:  # noqa: BLE001
+                _measured = 0.0
+            _per = (max(20.0, _measured) if _measured > 0 else
+                    45.0 if str(dj.get("crystal_tint_model") or "")
                     else TINT_TURN_SECONDS)
             _tint_due = time.monotonic() + max(
                 90.0, _per * len(turns) + 45.0)
@@ -62124,13 +62182,36 @@ async def crystal_tint(script: str, kind: str = "",
                 if _stop:
                     _gave_up = _stop
                     break
+                # #1119: TIMED. The deadline above reads
+                # task_cost("tint:turn") and nothing was writing it -
+                # every other task on this station measures itself and
+                # this one, the most expensive of them, did not.
+                _turn_t0 = time.monotonic()
                 fresh = await crystal_turn(str(said or ""), world, chunks,
-                                           answering, keep, _first_prompt)
+                                           answering, keep, _first_prompt,
+                                           kind)                   # #1119
+                try:
+                    task_note("tint:turn", time.monotonic() - _turn_t0,
+                              0.0, bool(fresh))
+                except Exception:  # noqa: BLE001
+                    pass
                 done.append(f"{marker}: {fresh}")
                 answering = fresh
             _PREP_DEADLINE[0] = _room_was                        # #1018
             out["ms"] = int((time.monotonic() - began) * 1000)
             if _gave_up:
+                # #1119: AND IT PAYS FOR WHAT IT BURNED. tint_spend_note
+                # was on the success paths only, so the most expensive
+                # thing the station does was invisible to the only
+                # budget that governs it - measured, eight to sixteen
+                # minutes a round charged to nobody. That kept the
+                # budget full, which kept tint_model_now() on the big
+                # model, which is what blew the deadline. The loop
+                # closed on itself.
+                try:
+                    tint_spend_note(float(out.get("ms") or 0) / 1000.0)
+                except Exception:  # noqa: BLE001
+                    pass
                 # #1018: HALF A TINT IS WORSE THAN EITHER END OF IT. A
                 # round that is DOOM for three lines and plainly itself
                 # for the other three reads as untinted, because the ear
