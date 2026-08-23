@@ -28663,19 +28663,80 @@ async def resume_radio() -> None:
 
 
 async def _fm_off_offload() -> None:
-    """#810: OFF means OFF — the writer model is released from memory at
-    once (keep_alive 0); the TTS engines' own idle clocks and the
-    pressure valve take everything else down as it goes quiet."""
+    """#810/#1113: OFF means OFF — everything the station was holding is
+    handed back, now.
+
+    #810 named this correctly and released ONE model: the writer, out of
+    load_settings()["model"]. Measured with the station on air:
+
+        XTTS               23.00 GB
+        gemma4:31b         18.80 GB   <- the crystal's tint model
+        gemma4:e2b          2.10 GB   <- the only thing OFF released
+        nomic-embed-text     0.30 GB
+
+    Two gigabytes of forty-four, and the tint model - the biggest single
+    thing on the box - left resident indefinitely, because the station
+    only ever loads it and the #825 eviction fires when XTTS wants room
+    rather than when the operator says stop. The rest was left to idle
+    clocks, and XTTS_IDLE_UNLOAD is thirty minutes measured from the
+    last render, not from the switch.
+
+    The trade is a cold start when the station comes back: XTTS reloads
+    on the first render, the writer on the first line. That is what off
+    meaning off costs. No durable state is touched - the shelves, the
+    larder, the pantry and the cupboard are on disk and a switch does
+    not clear them."""
+    freed: list[str] = []
+    # Every model Ollama actually has resident, not the one the settings
+    # happen to name. /api/ps answers this and #825 already walks it.
     try:
-        model = str(load_settings().get("model") or "")
-        if model:
+        async with httpx.AsyncClient(timeout=30) as client:
+            ps = (await client.get(f"{OLLAMA_URL}/api/ps")).json() or {}
+            for row in (ps.get("models") or []):
+                name = str(row.get("name") or row.get("model") or "")
+                if not name:
+                    continue
+                try:
+                    _gb = float(row.get("size_vram")
+                                or row.get("size") or 0) / 1e9
+                except Exception:  # noqa: BLE001
+                    _gb = 0.0
+                try:
+                    await client.post(
+                        f"{OLLAMA_URL}/api/generate",
+                        json={"model": name, "prompt": "", "keep_alive": 0})
+                    freed.append(f"{name} {_gb:.1f}G"
+                                 if _gb else str(name))
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    # XTTS outright, rather than waiting out a thirty-minute idle clock
+    # that is measured from the last render instead of from the switch.
+    try:
+        if (await engine_health("xtts")).get("ready"):
             async with httpx.AsyncClient(timeout=30) as client:
-                await client.post(f"{OLLAMA_URL}/api/generate",
-                                  json={"model": model, "prompt": "",
-                                        "keep_alive": 0})
-            pipeline_log("repair", f"FM off — {model} released from "
-                         "memory; idle clocks will shed the engines "
-                         "(#810)")
+                await client.post(
+                    f"{VOICE_DIRECTOR_URL}/director/engine/xtts/terminate")
+            freed.append("XTTS ~23G")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=20) as client:
+            await client.post(f"{COMFYUI_URL}/free",
+                              json={"unload_models": True,
+                                    "free_memory": True})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        pipeline_log("repair",
+                     ("FM off — handed back " + ", ".join(freed)
+                      + ". The station comes back cold: XTTS reloads on "
+                        "the first render, the writer on the first line "
+                        "(#810/#1113)")
+                     if freed else
+                     "FM off — nothing was resident to hand back "
+                     "(#810/#1113)")
     except Exception:  # noqa: BLE001
         pass
 
