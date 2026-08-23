@@ -19731,6 +19731,7 @@ _LARDER_FRESH = 1200.0                 # the FLOOR; see larder_fresh()
 # two silent minutes writing its first round from nothing.
 LARDER_PATH = data_path("larder.json")
 _LARDER_WRITING = [False]
+_LARDER_SAID = [0.0]                    # #1123: throttle for the above
 # #1098: [last checked, standing down]. larder_keeper turns every three
 # seconds and hour_short_kinds() reads the uncached hour_needs(), so the
 # question is asked every fifteen and the answer kept in between.
@@ -20500,6 +20501,12 @@ async def recast_sweep() -> dict[str, int]:
 # again. Measured attempts run eight to sixteen minutes, so retrying one
 # immediately is the most expensive loop on the station.
 TINT_RETRY_REST = 1800.0
+# #1123: how many half-made shelf rounds one pass may finish before the
+# booth's own rounds get a turn. Renders run thirty to eighty seconds
+# and there are routinely forty rows waiting, so an unbounded loop here
+# is an unbounded loop: measured, the banter loop below it was never
+# reached once in five minutes of sampling.
+WAITING_VISITS_MOST = 3
 LARDER_PART_SECONDS = 75.0
 LARDER_PART_SHARE = 0.45
 
@@ -20544,6 +20551,11 @@ async def larder_prepare(entry: dict[str, Any],
     changes; it simply takes more than one visit."""
     if entry.get("prepared") or entry.get("preparing"):
         return False
+    # #1122: this whole body is one `try: ... except Exception: return
+    # False` with no log, so a raise before `entry["chunks"] = len(plan)`
+    # is indistinguishable from a legitimate refusal. That is why the
+    # banter road being silently dead took an agent to find rather than
+    # a grep. The handler at the bottom says so now.
     entry["preparing"] = True
     try:
         # The freshening model call comes OFF the critical path — it is
@@ -20930,7 +20942,22 @@ async def larder_prepare(entry: dict[str, Any],
                          f"{made} lines, {entry.get('seconds')}s of finished "
                          "audio waiting (#886)")
         return bool(entry["prepared"])
-    except Exception:  # noqa: BLE001
+    except Exception as _lx:  # noqa: BLE001
+        # #1123: SAY IT. The whole body was one bare handler with no
+        # log, so any raise before entry["chunks"] = len(plan) was
+        # indistinguishable from a legitimate refusal - which is why the
+        # banter road being silently dead cost three wrong guesses and
+        # an agent to find, rather than one grep. Throttled, because a
+        # repeating fault would otherwise fill the ring.
+        try:
+            if time.time() - float(_LARDER_SAID[0] or 0) > 60:
+                _LARDER_SAID[0] = time.time()
+                pipeline_log(
+                    "drop",
+                    "(#1123) a booth round could not be prepared: "
+                    f"{type(_lx).__name__}: {_lx}"[:300])
+        except Exception:  # noqa: BLE001
+            pass
         return False
     finally:
         entry["preparing"] = False
@@ -22605,7 +22632,26 @@ async def pantry_keeper() -> None:
                                  "to one round at a time",
                                  extra=f"{type(_sx).__name__}: {_sx}"[:300])
             if _waiting:
+                # #1123: BOUNDED, SO THE BOOTH IS REACHED AT ALL. This
+                # walked EVERY waiting row - measured, forty-one of them
+                # across manager, caller and gallery - and each one is a
+                # real render of thirty to eighty seconds against a
+                # fifteen-to-forty-five-second slice. The window is gone
+                # long before the loop ends, so the banter loop below it
+                # was never reached: five minutes of sampling showed
+                # `preparing` cycling gallery, caller, manager,
+                # track_talk and NEVER ONCE banter, while banter sat at
+                # `written 8, lines 0` for hours.
+                #
+                # Banter rounds are the same thing these rows are -
+                # written and not yet voiced - so #990's "finish what is
+                # already written before writing more" applies to them
+                # equally. They were simply queued behind everybody
+                # else's finishing, for ever.
+                _fin = 0
                 for _kind, _row in _waiting:
+                    if _fin >= WAITING_VISITS_MOST:
+                        break           # the booth gets the rest
                     _shelved = _row.get("entry") or {}
                     if _shelved.get("prepared") or _shelved.get("preparing"):
                         continue
@@ -22639,6 +22685,7 @@ async def pantry_keeper() -> None:
                         await larder_prepare(_shelved)
                     finally:
                         _PREP_DEADLINE[0] = 0.0
+                    _fin += 1                                  # #1123
                     _row["seconds"] = float(_shelved.get("seconds") or 0)
             # #894/#832: while we have the room, record MORE than one.
             # Preparing a single round per window is what kept the buffer
@@ -22703,6 +22750,7 @@ async def pantry_keeper() -> None:
                              "hour is short of "
                              + ", ".join(_hour_short[:3])
                              + " — those go first (#978/#1091)")
+            _refused = 0                                       # #1122
             for _entry in ([] if _banter_wait else list(_LARDER)):
                 # #978: IS A WINDOW OPEN - not "is it the same REASON a
                 # window was open when this pass began". `window` is a
@@ -22747,8 +22795,24 @@ async def pantry_keeper() -> None:
                                              larder_prepare(_entry))
                 finally:
                     _PREP_DEADLINE[0] = 0.0
+                # #1122: ONE REFUSED ROUND MUST NOT JAM THE ONES BEHIND
+                # IT. This broke at index ZERO - so a single head entry
+                # whose chunks had just been wiped stopped all seven
+                # good rounds behind it being planned, which is why
+                # EVERY entry read chunks 0 rather than only the one
+                # being rewritten. #987 fixed this exact shape for the
+                # ad shelf ("ONE BAD ROW MUST NOT JAM THE SHELF BEHIND
+                # IT") and the shelf loop below still has no such break,
+                # which is precisely why manager, caller and gallery
+                # kept their line counts while banter lost all of them.
+                #
+                # Two refusals in a pass still means the engine is
+                # genuinely saying no, and the pass ends.
                 if not _ok and int(_entry.get("made") or 0) <= _before:
-                    break               # engine said no; try again later
+                    _refused += 1
+                    if _refused >= 2:
+                        break           # the engine really is saying no
+                    continue            # this one; the rest may be fine
             # #842: and then the rest of the board — the ads, the bumpers,
             # the memos from upstairs, the phone calls. One item per pass,
             # in rotation, so the shelf fills evenly rather than filling
@@ -24939,6 +25003,15 @@ async def retint_one() -> str:
             got = entry.get("tint")
             if isinstance(got, dict) and got.get("ok"):
                 continue
+            # #1122: ...AND A FAILED ONE RESTS. #1119 gave the shelf
+            # this and left the larder walking straight back onto the
+            # same round every turn. Four entries currently carry
+            # deadlines blown at 540, 585 and 675 seconds and are being
+            # retried for ever at that price.
+            if isinstance(got, dict) and (
+                    time.time() - float(entry.get("tint_tried") or 0)
+                    < TINT_RETRY_REST):
+                continue
             want = entry
             break                       # oldest first: _LARDER is in order
         if want is None:
@@ -24957,6 +25030,24 @@ async def retint_one() -> str:
         _got = await crystal_tint(str(want.get("script") or ""),
                                   str(want.get("prep_kind") or ""),
                                   want.get("verbatim"))
+        # #1122: AND THE GUARD IS CHECKED AGAIN, HERE. The test above -
+        # "#1077: do not race the preparer" - runs BEFORE an await
+        # measured at 245 seconds, and at 540 to 675 on other entries.
+        # larder_prepare sets preparing=True, plans the round, writes
+        # `chunks`, then sits in a thirty-to-eighty-second render:
+        # squarely inside that window. The wipe below then drops
+        # `chunks` off a round that is being built, and prep_board sums
+        # `chunks` to report the road's lines - which is why banter read
+        # `written 8, lines 0` for hours while every other road banked.
+        #
+        # Awaited, these two could never overlap. #1119 made this
+        # fire-and-forget so it would stop stalling the coordinator for
+        # sixteen minutes - right in itself, and it turned a guard that
+        # had never been exercised into one that is wrong nearly every
+        # time. Identity, not equality: `in` on a list of dicts is a
+        # deep compare and would match the wrong entry.
+        if want.get("preparing") or not any(e is want for e in _LARDER):
+            return ""
         want["tint"] = {
             "ok": bool(_got.get("ok")), "why": str(_got.get("why") or ""),
             "world": str(_got.get("world") or ""),
@@ -24966,6 +25057,7 @@ async def retint_one() -> str:
             "later": True,
         }
         if not _got.get("ok"):
+            want["tint_tried"] = time.time()                   # #1122
             return ""
         want.setdefault("script_plain", str(want.get("script") or ""))
         want["script_tinted"] = str(_got.get("script") or "")
