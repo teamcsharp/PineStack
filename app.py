@@ -9115,10 +9115,27 @@ def _take_media_sig(clip: dict[str, Any] | None) -> str:
         return ""
 
 
+# #1109: takes counted by engine, so a task can be asked afterwards
+# which engine actually did its work. take_note has received `engine`
+# all along and the ledger has never seen it - which is why the piper
+# lane could never be priced off measurement.
+_TAKE_ENGINES: dict[str, int] = {}
+
+
+def take_engine_tally() -> dict[str, int]:
+    return dict(_TAKE_ENGINES)
+
+
 def take_note(who: str, voice: str, engine: str, text: str,
               clip: dict[str, Any] | None, ms: int, how: str) -> None:
     """One line recorded, or one served off the shelf. `how` is
     "shelf" when the pantry answered and "live" when the engine did."""
+    try:
+        if str(how or "") == "live":
+            _key = str(engine or "?")[:12]
+            _TAKE_ENGINES[_key] = int(_TAKE_ENGINES.get(_key) or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
     try:
         secs = float((clip or {}).get("seconds") or 0)
         _TAKES.append({
@@ -11111,6 +11128,7 @@ async def prep_measure(kind: str, work: Any) -> bool:
     bought. This is the ONLY thing that feeds the per-task ledger, so
     every number the scheduler uses came off a task it really ran."""
     t0 = time.monotonic()
+    _eng0 = take_engine_tally()                                  # #1109
     try:
         # #1067: PREPARED seconds, not the whole render cache. This
         # credited a task with every live render that happened to land
@@ -11125,9 +11143,33 @@ async def prep_measure(kind: str, work: Any) -> bool:
         ok = bool(await work)
     except Exception:  # noqa: BLE001
         ok = False
+    _cost = time.monotonic() - t0
     try:
-        task_note(kind, time.monotonic() - t0,
-                  max(0.0, prepared_seconds() - before), ok)   # #1067
+        _gain = max(0.0, prepared_seconds() - before)
+    except Exception:  # noqa: BLE001
+        _gain = 0.0
+    try:
+        task_note(kind, _cost, _gain, ok)                      # #1067
+    except Exception:  # noqa: BLE001
+        pass
+    # #1109: ...AND UNDER THE PIPER KEY WHEN PIPER DID THE WORK. #1087
+    # promised "every emergency take is recorded against its OWN ledger
+    # key, so within a few goes the scheduler is pricing it off
+    # measurement rather than off my arithmetic". Nothing ever wrote
+    # that key, so cost_on_piper has read PIPER_COST_GUESS for its whole
+    # life and every row of the piper table says "measured": false.
+    #
+    # Only when EVERY line this task rendered went to piper - a mixed
+    # task says nothing about what piper costs. The road's own key is
+    # written exactly as before; this is a separate row that only
+    # cost_on_piper reads, so nothing is double-counted.
+    try:
+        _now = take_engine_tally()
+        _new = {k: int(_now.get(k) or 0) - int(_eng0.get(k) or 0)
+                for k in set(_now) | set(_eng0)}
+        _made = {k: v for k, v in _new.items() if v > 0}
+        if _made and set(_made) == {"piper"}:
+            task_note(piper_key(kind), _cost, _gain, ok)
     except Exception:  # noqa: BLE001
         pass
     return ok
@@ -25678,14 +25720,106 @@ def piper_would_save(kind: str) -> float:
         return 0.0
 
 
+# #1109: the roads worth measuring on piper - the same seats the
+# stop-gap switches, which are the ones nobody has an ear for. Never a
+# presenter.
+PIPER_PROBE_ROADS = ("gallery", "news", "ad", "manager", "caller")
+_PIPER_PROBE_SAID: list[Any] = [0.0, False]
+
+
+def piper_probe() -> str:
+    """#1109: let the station find out what a piper take really costs.
+
+    While a safe road has fewer than TASK_LEDGER_TRUST samples on its
+    piper key it is authorised for piper. Once they all have enough this
+    stops authorising anything and says what was learned - so it is a
+    measurement with an end, not a policy."""
+    try:
+        want = []
+        for road in PIPER_PROBE_ROADS:
+            try:
+                got = (_TASK_LEDGER.get(piper_key(road)) or {}).get("secs")
+                if len(got or []) < TASK_LEDGER_TRUST:
+                    want.append(road)
+            except Exception:  # noqa: BLE001
+                continue
+        if not want:
+            # Everything measured. Say it once, then never again.
+            if _PIPER_PROBE_SAID[1] is not True:
+                _PIPER_PROBE_SAID[1] = True
+                try:
+                    _say = ", ".join(
+                        f"{SHELF_LABEL.get(r, r)} "
+                        f"{int(task_cost(r))}s -> {int(cost_on_piper(r))}s"
+                        for r in PIPER_PROBE_ROADS)
+                    pipeline_log(
+                        "lookahead",
+                        "(#1109) piper is measured now, not guessed: "
+                        + _say + ". The board prices it off this from "
+                        "here instead of off an estimate")
+                except Exception:  # noqa: BLE001
+                    pass
+            return ""
+        for road in want:
+            piper_authorise(road, 1800.0)
+        # #1109b: IT SAYS SO. Every early return in this file's history
+        # that stayed quiet has cost hours - a road that never runs looks
+        # exactly like one nobody asked for. Throttled to once every ten
+        # minutes so it is a signal rather than a stream.
+        try:
+            if time.time() - float(_PIPER_PROBE_SAID[0] or 0) > 600:
+                _PIPER_PROBE_SAID[0] = time.time()
+                pipeline_log(
+                    "lookahead",
+                    "(#1109) measuring what piper really costs on "
+                    + ", ".join(SHELF_LABEL.get(r, r) for r in want)
+                    + " - the board has been pricing it off a guess of "
+                    + str(PIPER_COST_GUESS) + " that nothing ever "
+                    "replaced, because nothing ever wrote the ledger key "
+                    "it reads")
+        except Exception:  # noqa: BLE001
+            pass
+        return ",".join(want)
+    except Exception as _e:  # noqa: BLE001
+        try:
+            pipeline_log("lookahead",
+                         f"(#1109) the piper probe could not run: {_e}")
+        except Exception:  # noqa: BLE001
+            pass
+        return ""
+
+
+# #1109b: the seats a listener would notice. Banter and deep rounds are
+# the pair themselves; a caller is a guest voice and may be swapped, but
+# the hosts may never be. Named explicitly rather than inferred from
+# SHELF_REUSABLE, which stopped being a safe proxy the moment #1106 made
+# banter re-airable.
+PIPER_NEVER = ("banter", "banter_caller", "deep", "recap")
+
+
 def may_take_on_piper(kind: str) -> bool:
     """#1087: is an emergency take allowed for this road at all?
 
     Only the seats nobody has an ear for - the same set the stop-gap
     switches, which is the same set that already reuses its footage.
-    Never the presenters."""
+    Never the presenters.
+
+    #1109b: AND "NEVER THE PRESENTERS" IS NOW SAID OUT LOUD RATHER THAN
+    IMPLIED. This read `prep in SHELF_REUSABLE` as a proxy for "nobody
+    has an ear for it", which held right up until #1106 made banter
+    reusable so a good round could be aired twice. That change is right
+    on its own terms and it silently made the HOSTS eligible for an
+    emergency piper take - caught live, with `banter` sitting in the
+    authorised list beside the five roads that belong there.
+
+    A proxy is only as good as the reason it stands in for. The reason
+    here is "would a listener notice this voice change", and the answer
+    for the pair is always yes, whatever else becomes true about how
+    their rounds are stored."""
     try:
         prep = str(kind or "")
+        if prep in PIPER_NEVER:
+            return False
         return prep in SPEED_SAFE_SEATS or prep in SHELF_REUSABLE
     except Exception:  # noqa: BLE001
         return False
@@ -27377,6 +27511,10 @@ async def coordinator() -> None:
                 pass
             try:
                 tint_autotune()                                   # #1105
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                piper_probe()                                     # #1109
             except Exception:  # noqa: BLE001
                 pass
             # #916d: and the moment a hole is measured, something already
