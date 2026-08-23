@@ -11818,6 +11818,13 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                           if shelf_unvoiced(k) >= SHELF_UNVOICED_MOST
                           or k == "station_id"]
             if _voiceable:
+                # #1128: and the roads the shut gate excluded. A road
+                # with NOTHING written can never satisfy "holds unvoiced
+                # reads", so while both model slots are busy it is
+                # invisible - which is correct in the moment and looks
+                # identical to being unwanted for ever.
+                out["gate_excluded"] = [k for k in order
+                                        if k not in _voiceable]
                 order = _voiceable
                 out["gate_shut"] = True
             else:
@@ -11828,13 +11835,24 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                               "would be refused (#1067)")
                 return out
         rows: list[dict[str, Any]] = []
+        # #1128: AND IT SAYS WHO IT LEFT OFF, AND WHY. Three roads can be
+        # dropped here without a word - skipped, track-talk-full, or
+        # shelf-full - and a road that is never on the board looks
+        # exactly like a road nobody wants. That has now cost four
+        # separate investigations into why track_talk reads zero, each
+        # ending in a guess. The board answers for itself from here.
+        _off: dict[str, str] = {}
         for kind in order:
             if kind in skip:
+                _off[kind] = "already tried this pass"
                 continue
             if kind == "track_talk":
                 if track_talk_full():
+                    _off[kind] = ("every record in the lookahead already "
+                                  "has both sides written")
                     continue
             elif shelf_full(kind):
+                _off[kind] = "its shelf is full"
                 continue
             # #989 (B5): #986 was RIGHT that this road should not be
             # WRITTEN to, and wrong to drop it from the board. `rows`
@@ -11908,6 +11926,7 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                          "unvoiced": shelf_unvoiced(kind),
                          "wanted": kind in sheet,
                          "fits": cost <= budget})
+        out["off_board"] = dict(_off)          # #1128
         out["candidates"] = rows
         if room <= 0:
             out["why"] = "no window is open - nothing may be built now"
@@ -11961,6 +11980,47 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         # takes the first one that fits the window that is open. #1049
         # handed over only the dearest road; it almost never fitted, and
         # the desk drove nothing at all.
+        # #1129: A ROAD WITH NOTHING AT ALL OUTRANKS THE LEDGER.
+        #
+        # track_talk sat at zero written for a whole day while every
+        # other road filled. It was never blocked: it is on the board,
+        # its lookahead holds ten records with both sides unwritten, and
+        # it fits the window comfortably. It simply never WON. Its
+        # measured cost has climbed to 266s and its rate to 0.171 - the
+        # worst on the board - so the ledger prefers something else on
+        # every single pass, and its next entry is 2,799s away, outside
+        # the deadline window that would otherwise force it.
+        #
+        # That is the ledger working exactly as designed and producing a
+        # road that is never made. A rate is a tie-break between things
+        # that all exist; it is the wrong instrument for choosing
+        # between something and nothing. An entry on the sheet with NO
+        # material is not an optimisation problem.
+        #
+        # Bounded deliberately: only roads the hour actually owes, only
+        # when they hold nothing whatever, and it still has to fit the
+        # window. The moment the road has anything at all it goes back
+        # to competing on merit like everything else.
+        try:
+            _bare = [r for r in rows
+                     if r.get("write")
+                     and float(r.get("cost") or 0) <= room
+                     and not int(shelf_rows(str(r["kind"])) and 1 or 0)
+                     and str(r["kind"]) in {
+                         str(o.get("kind")) for o in (hour_owes() or [])}]
+            if _bare:
+                _pick = min(_bare, key=lambda r: float(r["cost"]))
+                out.update({
+                    "kind": _pick["kind"], "forced": True,
+                    "slot": "the hour owes it and it holds nothing",
+                    "why": (f"{_pick['label']} has an entry on the sheet "
+                            "and NOTHING made for it - that outranks the "
+                            f"ledger, which had it priced worst on the "
+                            f"board at {int(float(_pick['cost']))}s "
+                            "(#1129)")})
+                return out
+        except Exception:  # noqa: BLE001
+            pass
         _asked: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for _need in slot_needs():
             _slot_row = next((r for r in rows
@@ -28064,15 +28124,26 @@ def hour_needs() -> dict[str, dict[str, float]]:
             # than no bulletin. What changes is that the OWED figure
             # stops asking for material the station is not allowed to
             # keep.
-            if road == "news":
-                try:
-                    owed = min(owed, float(shelf_cap("news"))
-                               * NEWS_ROUND_SECONDS)
-                except Exception:  # noqa: BLE001
-                    pass
             row = out.setdefault(road, {"owed": 0.0, "held": 0.0,
                                         "rows": 0.0, "cap": 0.0})
             row["owed"] += owed * hours
+        # #1128: ...AND NEWS IS NOT OWED WHAT IT CANNOT KEEP. #1125 put
+        # this clamp inside the slot loop, where it capped ONE entry's
+        # 240 seconds against a 480-second ceiling and did nothing at
+        # all - the total still came out at 1,440 and the road still
+        # read permanently short, which is what the operator was still
+        # seeing. It belongs on the ROAD's total, which is what it was
+        # always about: a bulletin costs ~680s to make and lives three
+        # hours, and the shelf holds what shelf_cap says, so asking for
+        # more than the shelf can physically hold is asking for a number
+        # no amount of work can reach.
+        try:
+            if "news" in out:
+                out["news"]["owed"] = min(
+                    float(out["news"]["owed"]),
+                    float(shelf_cap("news")) * NEWS_ROUND_SECONDS)
+        except Exception:  # noqa: BLE001
+            pass
         for road in list(out):
             # #977: WHAT COULD ACTUALLY AIR RIGHT NOW.
             #
