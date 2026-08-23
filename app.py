@@ -13469,6 +13469,24 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
                        replay: bool = False) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
     still plays it even when Home Assistant is unreachable."""
+    # #1117: OFF AIR, THE STATION DOES NOT REACH THE SPEAKER.
+    #
+    # #1115 shut the door music takes and #1116 stopped the record that
+    # was already running, and the operator still heard VOICES - because
+    # dj_speak's early return is one road of several, and speak_turns,
+    # the drop, the sting and the hold-shelf drain all arrive here
+    # without passing it. This is the door every station CLIP takes to
+    # the box, so gating the callers was always going to miss one.
+    #
+    # `reply` is the boundary the file already draws (#647): reply=True
+    # is the assistant ANSWERING YOU and must keep working with the
+    # broadcast off - that is the whole point of the pause being
+    # narrower than the FM switch. Only the station is stopped.
+    try:
+        if radio_paused() and not reply:
+            return {"skipped": "the broadcast is paused", "paused": True}
+    except Exception:  # noqa: BLE001
+        pass
     if not box_talk_ok(reply=reply):
         note_activity("held", "Pine Box switched off — kept for the page")
         return ""                    # the existing "box declined" contract
@@ -64662,6 +64680,21 @@ async def dj_voice_api(
     written. A rate we do not recognise, or an encoder that is missing,
     simply means the original is served."""
     require_read_auth(authorization)
+    # #1117: OFF AIR, THE PAGE IS HANDED NOTHING TO PLAY. This is the
+    # feed the desktop app and the public listener page pull station
+    # voice from, and it is a second broadcast path entirely - gating
+    # _play_on_box silences the Nabu and does nothing about the app,
+    # which is exactly what the operator heard.
+    #
+    # The clips are NOT discarded: they stay in _RADIO["voice_clips"]
+    # with their timestamps, so a listener who tunes in after the
+    # broadcast resumes picks up from there. Off air simply means
+    # nothing new is offered.
+    if radio_paused():
+        return {"clips": [], "server_ms": int(time.time() * 1000),
+                "paused": True, "off_air": True,
+                "say": "the broadcast is paused - the booth is still "
+                       "recording and this picks up when it returns"}
     server_ms = int(time.time() * 1000)
     clips = []
     for clip in _RADIO["voice_clips"]:
