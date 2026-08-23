@@ -9440,12 +9440,42 @@ def pantry_key(text: str, voice: str, engine: str) -> str:
     return hashlib.sha1(raw.encode("utf-8", "ignore")).hexdigest()
 
 
+_SPOKEN_CACHE: list[Any] = [0.0, set()]
+SPOKEN_CACHE_TTL = 15.0
+
+
+def pantry_spoken_now() -> set[str]:
+    """#1106: pantry_spoken_for(), cached. It walks every shelf, and
+    pantry_get is called far too often to pay that each time."""
+    try:
+        now = time.time()
+        if now - float(_SPOKEN_CACHE[0] or 0) > SPOKEN_CACHE_TTL:
+            _SPOKEN_CACHE[0] = now
+            _SPOKEN_CACHE[1] = pantry_spoken_for()
+        return _SPOKEN_CACHE[1] or set()
+    except Exception:  # noqa: BLE001
+        return set()
+
+
 def pantry_get(key: str) -> dict[str, Any] | None:
     """A ready clip, if it is still on the shelf AND still on disk."""
     row = _PANTRY.get(key)
     if not row:
         return None
-    if time.time() - float(row.get("at") or 0) > pantry_life():
+    # #1106: A CLIP SOMETHING IS STILL HOLDING DOES NOT EXPIRE. This
+    # dropped clips at pantry_life() - 3.5 hours - while the shelf keeps
+    # its rows for PANTRY_BURN_SECONDS (24h) and repeats for
+    # REPEAT_KEEP_SECONDS (72h). For twenty of those hours a row pointed
+    # at a clip the cache had already deleted and shelf_take refused it
+    # as "clip gone".
+    #
+    # Measured: all 24 station_id rows carried a key, NONE of those keys
+    # were in the pantry, and the 24 rows were four distinct texts - so
+    # twenty of them were re-renders of something this station had
+    # already made. Neither cap was near binding (572 rows of 1,800;
+    # 422 MB of 6 GB). Expiry alone did it.
+    if time.time() - float(row.get("at") or 0) > pantry_life() \
+            and key not in pantry_spoken_now():
         _PANTRY.pop(key, None)
         return None
     clip = row.get("clip") or {}
@@ -9925,7 +9955,15 @@ def shelf_cap(kind: str) -> int:
 # So a call segment cannot be filled with none but new calls, and the
 # choice is between a caller who rings back three hours later and four
 # minutes of silence. Nobody has ever complained about the first.
-SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id", "caller")
+# #1106: BANTER IS REUSABLE. Measured over 1,304 attempts it fails 891
+# times - 68% - for about 490 seconds an hour that buys nothing, and it
+# owns fifteen of the hour's sixty minutes. It was the one major road
+# that could never be re-aired, so every round that DID come off was
+# thrown away after one hearing. A banter round that worked is worth
+# hearing twice far more than a banter round that failed is worth
+# attempting again.
+SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id", "caller",
+                  "banter")
 # How long an aired item rests before it may go out again. The operator
 # asked for three hours.
 SHELF_REUSE_REST = float(os.getenv("SHELF_REUSE_REST", "10800"))
@@ -10752,7 +10790,17 @@ def prep_board() -> list[dict[str, Any]]:
                 # it is RECORDED even though it holds no pantry key.
                 row["rendered"] = sum(1 for x in ones
                                       if x.get("key") or x.get("produced"))
-                row["ready"] = row["rendered"]
+                # #1106: READY MEANS THE CLIP IS STILL THERE. This was
+                # `= row["rendered"]`, which counts rows that merely HAVE
+                # a key and never asks whether the audio survived - so
+                # the board told the operator station_id had 24 ready
+                # while slot_supply, which does ask, said 1. No room is
+                # recovered by fixing it; a false all-clear is removed,
+                # which is worth more.
+                row["ready"] = sum(
+                    1 for x in ones
+                    if x.get("produced")
+                    or (x.get("key") and pantry_get(str(x.get("key")))))
                 row["seconds"] = round(sum(float(x.get("seconds") or 0)
                                            for x in ones), 1)
             if held:
@@ -19576,8 +19624,18 @@ def _pantry_save(force: bool = False) -> None:
         PANTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = PANTRY_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(
+            # #1106: ...AND THE WORDS. This kept clip/at/used/bytes and
+            # dropped the text, voice, who and kind that pantry_put
+            # deliberately stores - #894's own note says "the words are
+            # cheap to keep and are the entire content of the table this
+            # exists to serve". Measured: 0 of 512 saved rows carried
+            # text or kind, so the pantry table was empty across every
+            # restart and nothing could ever match on the words.
             {k: {"clip": v.get("clip"), "at": v.get("at"),
-                 "used": v.get("used"), "bytes": v.get("bytes")}
+                 "used": v.get("used"), "bytes": v.get("bytes"),
+                 "text": str(v.get("text") or "")[:1200],
+                 "voice": v.get("voice"), "who": v.get("who"),
+                 "kind": v.get("kind")}
              for k, v in list(_PANTRY.items())}, default=str))
         tmp.replace(PANTRY_PATH)
     except Exception:  # noqa: BLE001
@@ -20233,6 +20291,39 @@ async def recast_sweep() -> dict[str, int]:
     return out
 
 
+# #1106: how much of a round has to exist before it may air as itself.
+# Below this it is a fragment; at or above it, it is a shorter segment.
+LARDER_PART_SECONDS = 75.0
+LARDER_PART_SHARE = 0.45
+
+
+def larder_part_ok(entry: dict[str, Any], want: int, made: int) -> bool:
+    """#1106: is what got recorded a segment, or the start of one?
+
+    Three conditions, all of them required. It must be a CONTIGUOUS RUN
+    FROM THE FIRST LINE - takes carry their index in the script, so a
+    round that rendered lines 4, 9 and 12 is a fragment and is refused.
+    It must be long enough to stand as a segment. And it must be a real
+    share of what was written, so a two-line opening of a forty-line
+    round is not passed off as the round."""
+    try:
+        if made <= 0 or want <= 0 or made >= want:
+            return False
+        if float(entry.get("seconds") or 0) < LARDER_PART_SECONDS:
+            return False
+        if (made / float(want)) < LARDER_PART_SHARE:
+            return False
+        takes = [t for t in (entry.get("takes") or [])
+                 if isinstance(t, dict)]
+        if len(takes) < made:
+            return False
+        seen = sorted(int(t.get("i") or 0) for t in takes)
+        # A run from the top: 0,1,2,... with nothing skipped.
+        return seen == list(range(len(seen)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def larder_prepare(entry: dict[str, Any],
                          only_voice: str = "") -> bool:
     """#886: make a banked round's AUDIO, before anybody wants it.
@@ -20595,6 +20686,33 @@ async def larder_prepare(entry: dict[str, Any],
         except Exception:  # noqa: BLE001
             pass
         entry["prepared"] = made >= len(plan)
+        # #1106: ...OR ENOUGH OF ONE TO AIR. Measured on the live board,
+        # twice: caller 33 of 158 lines rendered, banter 29 of 76,
+        # manager 9 of 36, gallery 5 of 37 - and READY was zero on every
+        # road, with 1,346 seconds of finished audio sitting unairable
+        # because the rest of each round was missing. `partial` has been
+        # set since #872 and read as an airing gate by nothing.
+        #
+        # What was made only counts if it is a genuine OPENING - a
+        # contiguous run from the first line, long enough to stand as a
+        # segment. A conversation that stops early sounds like a
+        # conversation that stopped early; one that starts in the middle
+        # sounds broken, and this will not do that.
+        if not entry["prepared"] and made:
+            try:
+                if larder_part_ok(entry, len(plan), made):
+                    entry["prepared"] = True
+                    entry["part_of"] = int(len(plan))
+                    entry["part_made"] = int(made)
+                    pipeline_log(
+                        "lookahead",
+                        f"(#1106) a round is airing as the "
+                        f"{made} of {len(plan)} lines that got made - "
+                        f"{int(float(entry.get('seconds') or 0))}s of "
+                        "finished audio that would otherwise have waited "
+                        "for lines nobody had room to record")
+            except Exception:  # noqa: BLE001
+                pass
         # #872: a half-made round is PROGRESS, not a failure. Saying so
         # here is what lets the keeper come back to it and the panel show
         # it as partly recorded rather than as nothing at all.
