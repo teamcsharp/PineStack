@@ -100286,7 +100286,7 @@ async function djGo() {
 // must, pick a station that has tracks, open the lines. Off stops the show,
 // the banter and whatever this page is still playing, so "off" means silence
 // rather than "no new tracks".
-async /* #1108: OFF AIR, WHICH IS NOT OFF. The FM switch stops the station and
+/* #1108: OFF AIR, WHICH IS NOT OFF. The FM switch stops the station and
  * every service under it. This shuts only the door to the air - the
  * writing desk, the recording room and the crystal keep working, and
  * everything they make is banked. An hour off air is roughly 1,500
@@ -100333,7 +100333,7 @@ async function airPause() {
 setInterval(airPauseState, 15000);
 setTimeout(airPauseState, 1200);
 
-function djPower() {
+async function djPower() {
   const box = document.getElementById("djPower");
   const status = document.getElementById("musicStatus");
   const on = box.checked;
