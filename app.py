@@ -26259,7 +26259,18 @@ def coord_brief() -> dict[str, Any]:
                 out["doing"].append(f"{_up.get('label')} is the deadline the "
                                     "preparer is working to")
         if bare:
+            # #1101: THE LIST IS TRUNCATED AND THE COUNT IS NOT. Reading
+            # len() off the published list gives 4 whether five entries
+            # are empty or fifty, so the gauge sits pinned at its own
+            # ceiling while the situation improves and only begins to
+            # move once fewer than four are left. Measured today: this
+            # read 4 through eleven changes while the real figure went
+            # from seven roads to two. A truncated list is a display
+            # decision; reporting its length as a quantity is a
+            # measurement error.
             out["bare"] = bare[:4]
+            out["bare_count"] = len(bare)
+            out["bare_shown"] = len(bare[:4])
         # --- is the room able to work at all ------------------------------
         try:
             if render_relief():
