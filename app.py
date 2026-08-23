@@ -24535,6 +24535,10 @@ def pipe_detail(kind: str = "", at: float = 0.0, find: str = ""
 
 
 _RETINT_SAID = [0.0]
+# #1110: which pile the later pass looks at this time. The shelf is where
+# the coverage gap is, so it cannot be the one that only runs when
+# nothing else wants doing.
+_RETINT_TURN = [False]
 
 
 # --- THE LATER PASS, FOR EVERY ROAD (#1104) ---------------------------
@@ -24547,10 +24551,29 @@ _RETINT_SAID = [0.0]
 def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
     """The next shelved row that wants the crystal.
 
-    Words-without-a-voice first: #904 banks a script whose render was
-    refused, so those rows cost a model call and throw NOTHING away.
-    A recorded row costs its recording too, because the words stop
-    matching the audio, so it is only taken when the station is ahead."""
+    Three kinds of row, in the order they are worth doing:
+
+    A ROW THAT HAS AIRED AND WILL AIR AGAIN. The operator's instruction
+    is "bank it, tint it before it airs again", and a repeat goes out
+    byte-identical to how it was banked because nothing re-tints one. It
+    rests three hours between airings and a rewrite takes tens of
+    seconds, so that rest is an enormous tinting window - the tint lands
+    while it waits rather than in front of anybody.
+
+    #1104 SKIPPED THESE ENTIRELY - `if row.get("aired_at"): continue`,
+    written on the idea that an aired row was spent. It is the opposite:
+    an aired row is the one that is certainly coming round again. That
+    single line is most of why 39 scripts were standing by with none of
+    them tinted.
+
+    A ROW WITH NO VOICE YET, which is free: #904 banks a script whose
+    render was refused, so rewriting it costs a model call and throws
+    nothing away.
+
+    A ROW THAT IS RECORDED AND HAS NEVER AIRED, which costs its
+    recording too - the words stop matching the audio - so it is taken
+    last and only when the station is ahead."""
+    again: tuple[str, dict[str, Any]] | None = None
     free: tuple[str, dict[str, Any]] | None = None
     made: tuple[str, dict[str, Any]] | None = None
     try:
@@ -24564,17 +24587,24 @@ def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
                     if not str(row.get("text") or "").strip():
                         continue        # nothing to rewrite
                     if row.get("aired_at"):
-                        continue        # it has been out; leave it be
+                        # It has been out, so it is coming round again -
+                        # and it is resting, which is the window.
+                        if again is None and shelf_is_repeat(kind, row):
+                            again = (kind, row)
+                        continue
                     _key = str(row.get("key") or "")
                     if _key and pantry_get(_key):
                         if made is None:
                             made = (kind, row)
                         continue
-                    return (kind, row, True)      # free: no audio yet
+                    if free is None:
+                        free = (kind, row)
                 except Exception:  # noqa: BLE001
                     continue
     except Exception:  # noqa: BLE001
         pass
+    if again:
+        return (again[0], again[1], True)   # resting: its audio is stale
     if free:
         return (free[0], free[1], True)
     if made:
@@ -24663,6 +24693,17 @@ async def retint_one() -> str:
         _hold = tint_should_stop()
         if _hold:
             return _say(_hold)
+        # #1110: THE SHELF GETS ITS OWN TURN, not the leftovers. This
+        # walked the larder and only fell through to the shelf when the
+        # larder wanted nothing - and the larder is banter, which is
+        # always cycling, so the fallthrough almost never happened. The
+        # shelf is where the coverage gap is: ads, news, the gallery,
+        # memos and liners have never had a path to the rewrite at all.
+        _RETINT_TURN[0] = not _RETINT_TURN[0]
+        if _RETINT_TURN[0]:
+            _did = await retint_shelf()
+            if _did:
+                return _did
         want = None
         for entry in list(_LARDER):
             if not isinstance(entry, dict):
@@ -28332,6 +28373,84 @@ async def needle_watch() -> None:
             pass                  # a watchdog never takes the show down
 
 
+# --- THE SPEAKER THAT STOPPED LISTENING (#1112) -----------------------
+# Home Assistant restarted and left the satellite's config entry stale.
+# The station went on sending it lines for FIVE HOURS and the satellite
+# went on not playing them, while /api/pinebox/diagnose failed the one
+# check that would have said so and the one-button repair for it had
+# existed since #134. The measurement and the mechanism were both there;
+# nothing carried one to the other.
+BOX_DEAF_AFTER = 240.0                  # speech this far past a playout
+BOX_HEAL_REST = 900.0                   # and at most one repair per this
+BOX_WATCH_TICK = 60.0
+_BOX_HEALED_AT = [0.0]
+
+
+def box_gone_deaf() -> float:
+    """Seconds of speech the box has not been heard to play.
+
+    Two clocks the station already keeps: when a CAST LINE last aired,
+    and when the box last VERIFIED it played something. A line airing
+    well after the last verified playout means the station is talking
+    and the speaker is not. A quiet stretch cannot look like this - no
+    lines aired means no gap between the clocks."""
+    try:
+        said = float(_LAST_SAID[0] or 0)
+        out = float(_LAST_PLAYOUT.get("at") or 0)
+        if not said or not out:
+            return 0.0
+        return max(0.0, said - out)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+async def box_delivery_watch() -> None:
+    """#1112: notice that nobody can hear us, and do the thing that fixes
+    it."""
+    await asyncio.sleep(90)             # let a restart settle first
+    while True:
+        await asyncio.sleep(BOX_WATCH_TICK)
+        try:
+            if not _RADIO.get("on"):
+                continue
+            if radio_paused():
+                continue                # nothing playing is the point
+            if not box_worth_healing():
+                continue                # the show is not on the box
+            behind = box_gone_deaf()
+            if behind < BOX_DEAF_AFTER:
+                continue
+            if time.time() - float(_BOX_HEALED_AT[0] or 0) < BOX_HEAL_REST:
+                continue                # already tried; give it room
+            _BOX_HEALED_AT[0] = time.time()
+            pipeline_log(
+                "air",
+                f"(#1112) the box has not been heard to play anything for "
+                f"{int(behind)}s of speech - reloading the satellite",
+                extra=("THE SPEAKER THAT STOPPED LISTENING (#1112)\n\n"
+                       "Home Assistant restarts, and an assist satellite "
+                       "left with a stale config entry accepts every "
+                       "announce and plays none of them. The station has "
+                       "no way to hear that it is not being heard - what "
+                       "it has is two clocks: when a cast line last "
+                       "aired, and when the box last verified it played "
+                       "something. When the first runs away from the "
+                       "second, nobody is listening.\n\nMeasured once: "
+                       "five hours of broadcasting into a dead speaker, "
+                       "with the failing check sitting in "
+                       "/api/pinebox/diagnose the whole time and the "
+                       "one-button repair for it available since "
+                       "#134.\n\nThe repair is transport maintenance "
+                       "only - the show and every pending clip stay on "
+                       "their durable shelves."))
+            try:
+                await pinebox_recover(restart_agent=False)
+            except Exception:  # noqa: BLE001
+                pass
+        except Exception:  # noqa: BLE001
+            continue                    # a watchdog may never take the show
+
+
 async def dead_air_watch() -> None:
     """The silence ceiling (#338, #340). Nothing playing and nobody
     talking for longer than the slider allows → kick the show forward.
@@ -28476,6 +28595,10 @@ def dj_start(station: str) -> dict[str, Any]:
     # twice an hour, worst case seven minutes, every one of them
     # covered by music and none of them recorded.
     _RADIO_TASK.append(asyncio.create_task(talk_watch()))
+    # #1112: and something that notices when the box has stopped playing
+    # what it is sent. The station broadcast into a dead speaker for five
+    # hours with the evidence on its own diagnostics page.
+    _RADIO_TASK.append(asyncio.create_task(box_delivery_watch()))
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
@@ -43690,8 +43813,33 @@ async def drop_liner(station: str) -> str:
             pass
         return line
     naming = [ln for ln in DROP_LINES if "{station}" in ln] or list(DROP_LINES)
-    return unrepeated([ln.format(station=station) for ln in naming],
-                      "drop_fallback", keep=3)
+    _plain = unrepeated([ln.format(station=station) for ln in naming],
+                        "drop_fallback", keep=3)
+    # #1111: AND THE FALLBACK GETS THE CRYSTAL, WITH THE NAME HELD.
+    #
+    # An audit found all twenty-three liners in the cupboard were four
+    # hardcoded strings scoring 2.3% on rhyme density - BELOW the 3.4%
+    # baseline for untinted speech, because they are not written at all.
+    # drop_liner_brew does write proper ones and does tint them, but it
+    # is fired and forgotten, so whoever triggered it falls through to
+    # here and prep_station_id banks the constant.
+    #
+    # `keep` is how quoted material survives a rewrite, and the
+    # station's own name goes in it: the crystal may do what it likes
+    # with the rest of the line, and "Big Apple's Little Pine Box FM
+    # Station" comes out spelled the way it went in. A station that
+    # renames itself on air twice an hour is worse than a plain one.
+    #
+    # Never blocks the sting: any failure returns the plain line.
+    try:
+        if crystal_tint_two_pass():
+            _lit = await crystal_line(_plain, "a station ID", 1,
+                                      [str(station)])
+            if _lit and len(str(_lit).strip()) > 4:
+                return str(_lit).strip()
+    except Exception:  # noqa: BLE001
+        pass
+    return _plain
 
 
 _SFX_POOL_CACHE: list[Path] = []
@@ -61113,6 +61261,28 @@ def tint_budget_left() -> float:
         return 0.0
 
 
+# #1110: the roads that get the GOOD rewrite. "The pair deeply, rest
+# lightly" - banter and the phone are the pair themselves and are what
+# the operator listens to; an advert or a bulletin carries the crystal
+# perfectly well off the fast model. Measured, the big model is 29.6s a
+# turn against 14.4s, and the budget is charged in wall clock, so this is
+# close to half the cost across two thirds of the board. That is what
+# pays for the deep one.
+TINT_DEEP_ROADS = ("banter", "banter_caller", "caller", "caller2", "deep")
+
+
+def tint_model_for(kind: str = "") -> str:
+    """#1110: the model this road's rewrite deserves."""
+    try:
+        if str(kind or "") in TINT_DEEP_ROADS:
+            return tint_model_now()
+        fast = str(dj_settings().get("model_fast")
+                   or dj_settings().get("model") or "")
+        return fast or tint_model_now()
+    except Exception:  # noqa: BLE001
+        return tint_model_now()
+
+
 def tint_model_now() -> str:
     """#1105: the big model while there is headroom, the fast one when
     there is not.
@@ -61860,7 +62030,7 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         got = await ask_model(
             prompt, limit=max(600, len(text) + 400), spice=0.55,
-            model=tint_model_now(),                       # #1036/#1105
+            model=tint_model_for(kind),           # #1036/#1105/#1110
             # #1019: everything the desk listing needs to open this call
             # out into "what the tinting did to this particular prompt".
             mark={"purpose": "tint",
