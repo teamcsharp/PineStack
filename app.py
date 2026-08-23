@@ -28662,6 +28662,30 @@ async def resume_radio() -> None:
         pass
 
 
+def radio_owned_models() -> list[str]:
+    """#1114: the models the STATION loads, named from its own settings.
+
+    NOT everything Ollama is holding. #1113 swept /api/ps, which is the
+    right instinct and the wrong boundary: a model another application
+    put there is not the radio's to unload, and the sweep would have
+    taken nomic-embed-text - which open-webui shares - out with it.
+
+    Measured, the station names exactly two and they are the two that
+    matter: the writer at 2.1 GB and the crystal's tint model at 18.8."""
+    want: list[str] = []
+    try:
+        got = load_settings()
+        dj = got.get("dj") or {}
+        for one in (got.get("model"), dj.get("crystal_tint_model"),
+                    dj.get("model_fast"), got.get("model_fast")):
+            name = str(one or "").strip()
+            if name and name not in want:
+                want.append(name)
+    except Exception:  # noqa: BLE001
+        pass
+    return want
+
+
 async def _fm_off_offload() -> None:
     """#810/#1113: OFF means OFF — everything the station was holding is
     handed back, now.
@@ -28687,26 +28711,34 @@ async def _fm_off_offload() -> None:
     larder, the pantry and the cupboard are on disk and a switch does
     not clear them."""
     freed: list[str] = []
-    # Every model Ollama actually has resident, not the one the settings
-    # happen to name. /api/ps answers this and #825 already walks it.
+    # #1114: THE MODELS THE RADIO OWNS, not everything Ollama is holding.
+    # /api/ps is still what says how big each one actually is - the names
+    # come from the station's settings and the sizes from the runner, so
+    # a model belonging to another application is neither unloaded nor
+    # reported.
+    mine = radio_owned_models()
     try:
         async with httpx.AsyncClient(timeout=30) as client:
-            ps = (await client.get(f"{OLLAMA_URL}/api/ps")).json() or {}
-            for row in (ps.get("models") or []):
-                name = str(row.get("name") or row.get("model") or "")
-                if not name:
-                    continue
-                try:
-                    _gb = float(row.get("size_vram")
-                                or row.get("size") or 0) / 1e9
-                except Exception:  # noqa: BLE001
-                    _gb = 0.0
+            size: dict[str, float] = {}
+            try:
+                ps = (await client.get(f"{OLLAMA_URL}/api/ps")).json() or {}
+                for row in (ps.get("models") or []):
+                    _n = str(row.get("name") or row.get("model") or "")
+                    if _n:
+                        size[_n] = float(row.get("size_vram")
+                                         or row.get("size") or 0) / 1e9
+            except Exception:  # noqa: BLE001
+                pass
+            for name in mine:
+                if name not in size and not any(
+                        k.split(":")[0] == name.split(":")[0] for k in size):
+                    continue            # not resident; nothing to hand back
                 try:
                     await client.post(
                         f"{OLLAMA_URL}/api/generate",
                         json={"model": name, "prompt": "", "keep_alive": 0})
-                    freed.append(f"{name} {_gb:.1f}G"
-                                 if _gb else str(name))
+                    _gb = float(size.get(name) or 0)
+                    freed.append(f"{name} {_gb:.1f}G" if _gb else str(name))
                 except Exception:  # noqa: BLE001
                     continue
     except Exception:  # noqa: BLE001
@@ -28729,14 +28761,35 @@ async def _fm_off_offload() -> None:
     except Exception:  # noqa: BLE001
         pass
     try:
-        pipeline_log("repair",
-                     ("FM off — handed back " + ", ".join(freed)
-                      + ". The station comes back cold: XTTS reloads on "
-                        "the first render, the writer on the first line "
-                        "(#810/#1113)")
-                     if freed else
-                     "FM off — nothing was resident to hand back "
-                     "(#810/#1113)")
+        pipeline_log(
+            "repair",
+            ("FM off — the radio handed back " + ", ".join(freed)
+             + ". The Pine Box is untouched and still answers you: Home "
+               "Assistant, whisper and piper are its own services and "
+               "the microphone road never used the radio's memory. The "
+               "station comes back cold — XTTS on the first render, the "
+               "writer on the first line (#810/#1113/#1114)")
+            if freed else
+            "FM off — the radio was holding nothing to hand back. The "
+            "Pine Box is untouched and still answers you (#1114)",
+            extra=("WHAT STOPS AND WHAT STAYS (#1114)\n\n"
+                   "THE RADIO OWNS, and these are released:\n"
+                   "  the writer model\n"
+                   "  the crystal's tint model\n"
+                   "  XTTS, the cloned DJ voices (~23G)\n\n"
+                   "THE PINE BOX OWNS, and these are left alone:\n"
+                   "  Home Assistant - the Assist pipeline itself\n"
+                   "  wyoming-whisper - hearing you\n"
+                   "  wyoming-piper - answering you\n"
+                   "  the satellite - the microphone and the speaker\n\n"
+                   "pinebox_listen() opens the satellite's microphone "
+                   "and runs HOME ASSISTANT's pipeline. Nothing on that "
+                   "road passes through the writer, the tint model or "
+                   "XTTS, so the assistant loses nothing when the radio "
+                   "stops - which is why #647 governs it by the reply "
+                   "routing and not by the station switch.\n\n"
+                   "Nothing durable is cleared: the shelves, the larder, "
+                   "the pantry and the cupboard are on disk."))
     except Exception:  # noqa: BLE001
         pass
 
