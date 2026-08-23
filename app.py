@@ -19480,6 +19480,10 @@ _LARDER_FRESH = 1200.0                 # the FLOOR; see larder_fresh()
 # two silent minutes writing its first round from nothing.
 LARDER_PATH = data_path("larder.json")
 _LARDER_WRITING = [False]
+# #1098: [last checked, standing down]. larder_keeper turns every three
+# seconds and hour_short_kinds() reads the uncached hour_needs(), so the
+# question is asked every fifteen and the answer kept in between.
+_LARDER_YIELD: list[Any] = [0.0, False]
 
 
 def larder_fresh() -> float:
@@ -22548,6 +22552,51 @@ async def larder_keeper() -> None:
             cap = min(_LARDER_MAX, 12 if box_down else _want)
             if len(_LARDER) >= cap or _LARDER_WRITING[0]:
                 continue
+            # #1098: ...AND ABOVE ITS FLOOR BANTER YIELDS, HERE TOO.
+            #
+            # #1091 fixed the equivalent gate in pantry_keeper and I took
+            # that for the whole problem. It was half of it: banter is
+            # written by TWO loops, and this one - which turns every
+            # three seconds and stocks twelve rounds - had no idea the
+            # hour existed. Its only concession to anything else was to
+            # skip while the model was locked AND the larder held two.
+            # With the model free it wrote banter whatever else had
+            # nothing.
+            #
+            # The station's own brief: "the running order asks for 53
+            # min of written speech an hour... banter alone wants 42 min
+            # of it." Forty-two of sixty, and everything else on the
+            # sheet divides the rest.
+            #
+            # THE FLOOR IS ABSOLUTE - below it this never stands down,
+            # whatever is short, because a quiet pair is the one fault
+            # this station may not have. A DOWN BOX still wins outright,
+            # since nothing is airing and nothing else needs the room.
+            # And with nothing else short it still fills to twelve, so
+            # stacking work in idle time is untouched.
+            try:
+                if not box_down and len(_LARDER) >= larder_floor():
+                    _now = time.time()
+                    if _now - float(_LARDER_YIELD[0] or 0) > 15.0:
+                        _LARDER_YIELD[0] = _now
+                        _was = bool(_LARDER_YIELD[1])
+                        _shorts = [k for k in (hour_short_kinds() or [])
+                                   if k != "banter"]
+                        _LARDER_YIELD[1] = bool(_shorts)
+                        if _shorts and not _was:
+                            pipeline_log(
+                                "lookahead",
+                                f"the larder holds {len(_LARDER)} round(s) "
+                                f"against a floor of {larder_floor()}, so "
+                                "the pair stop writing ahead while "
+                                + ", ".join(_shorts[:3])
+                                + " have nothing (#1098)")
+                    if _LARDER_YIELD[1]:
+                        continue
+                else:
+                    _LARDER_YIELD[1] = False
+            except Exception:  # noqa: BLE001
+                pass
             # #823: "live work outranks stocking shelves" became
             # STARVATION once the desk stopped being idle — the gate is
             # locked all show long, the shelf never refills, and every
