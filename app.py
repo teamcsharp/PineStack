@@ -13465,6 +13465,39 @@ async def _deaf_box_restart() -> None:
         pass
 
 
+def page_carries_live(voice_to: str, to_box: bool = False,
+                      box_down: bool = False) -> bool:
+    """#1118: does the PAGE get this clip live, as well as the box?
+
+    "both" used to mean SIMULTANEOUSLY, and that is two broadcasts: the
+    box has clips pushed and plays them on arrival, the page pulls them
+    and schedules each against its own broadcast_ms. Two clocks, one
+    source, and a slow render on either side is a lead of tens of
+    seconds on the other - which is an operator hearing two different
+    voices talking about two different things in the same room.
+
+    One destination at a time. The picker names it; `both` now means the
+    box with the page as RESCUE, which is what `box` has meant since
+    #314.
+
+    Every rescue is kept, because each exists so a line is never lost:
+    a box that is down or declining, a master switch that is off, and
+    MONITOR (#825) - which is the one switch that genuinely does mean
+    "let me hear it here as well"."""
+    try:
+        if _RADIO.get("monitor"):
+            return True                 # deliberately hearing both
+        if str(voice_to or "box") == "here":
+            return True                 # the page IS the destination
+        if to_box and box_down:
+            return True                 # rescue: the box cannot take it
+        if not box_talk_ok():
+            return True                 # rescue: the switch is off
+    except Exception:  # noqa: BLE001
+        return True                     # any doubt: do not lose the line
+    return False
+
+
 async def _play_on_box(path: str, sig: str, reply: bool = False,
                        replay: bool = False) -> str:
     """Hand a finished clip to the Pine Box speaker. Best effort — the panel
@@ -17297,8 +17330,7 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # cannot be clobbered by another task.
     _line_started = time.time()
     paged = False
-    if (voice_to in ("here", "both") or (to_box and box_down)
-            or _RADIO.get("monitor")):     # #825
+    if page_carries_live(voice_to, to_box, box_down):          # #1118
         if clip:
             _RADIO["voice_clips"].append({
                 "ts": int(time.time() * 1000),
@@ -17452,8 +17484,8 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # The browser copy already went out the moment the clip was rendered
     # (above) so the page never waits on the box; this only catches a late
     # clip that the early append missed.
-    if clip and not paged and (voice_to != "box"
-                               or _RADIO.get("monitor")):     # #825
+    if clip and not paged and page_carries_live(               # #1118
+            voice_to, to_box, box_down):
         _RADIO["voice_clips"].append({
             "ts": int(time.time() * 1000),
             "url": f"{clip['path']}?t={clip['sig']}",
@@ -37656,7 +37688,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     ad_to = _RADIO.get("voice_to") or "box"
     if ad_to in ("box", "both"):
         await _play_on_box(play["path"], play["sig"])
-    if ad_to in ("here", "both"):
+    if page_carries_live(ad_to, ad_to in ("box", "both")):     # #1118
         _RADIO["voice_clips"].append({
             "ts": int(time.time() * 1000),
             "url": f"{play['path']}?t={play['sig']}",
@@ -37881,7 +37913,8 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
     ad_to = _RADIO.get("voice_to") or "box"
     box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                 or len(_BOX_HOLD) >= 6)
-    if ad_to in ("here", "both") or (ad_to in ("box", "both") and box_down):
+    if page_carries_live(ad_to, ad_to in ("box", "both"),      # #1118
+                         box_down):
         _RADIO["voice_clips"].append({
             "ts": int(time.time() * 1000),
             "url": f"{path}?t={sig}", "text": label,
@@ -52263,9 +52296,8 @@ async def speak_turns(turns: list[tuple[str, str]],
                             or len(_BOX_HOLD) >= 6)
                 stream_label = ("☎ " + caller_name if caller_name
                                 else "🎙 a conversation")
-                stream_paged = (vto in ("here", "both")
-                                or (to_box and box_down)
-                                or bool(_RADIO.get("monitor")))   # #825
+                stream_paged = page_carries_live(              # #1118
+                    vto, to_box, box_down)
                 if stream_paged:
                     _RADIO["voice_clips"].append({
                         "ts": int(time.time() * 1000),
