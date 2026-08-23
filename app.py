@@ -24283,6 +24283,97 @@ def pipe_detail(kind: str = "", at: float = 0.0, find: str = ""
 _RETINT_SAID = [0.0]
 
 
+# --- THE LATER PASS, FOR EVERY ROAD (#1104) ---------------------------
+# crystal_tint() has five call sites in this file and three of them are
+# banter or deep rounds. Adverts, news, the gallery, phone calls, memos
+# and station IDs have never had any path to the second pass - they get
+# the prompt clause and nothing else. The operator asked for "the
+# crystal tenting everything... ads, managers, sfx guys, guests,
+# callers, banter, all of it" and it has only ever been banter.
+def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
+    """The next shelved row that wants the crystal.
+
+    Words-without-a-voice first: #904 banks a script whose render was
+    refused, so those rows cost a model call and throw NOTHING away.
+    A recorded row costs its recording too, because the words stop
+    matching the audio, so it is only taken when the station is ahead."""
+    free: tuple[str, dict[str, Any]] | None = None
+    made: tuple[str, dict[str, Any]] | None = None
+    try:
+        for kind in list(_SHELF):
+            for row in list(_SHELF.get(kind) or []):
+                try:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("tint_ok") or row.get("tinted"):
+                        continue        # already carries one
+                    if not str(row.get("text") or "").strip():
+                        continue        # nothing to rewrite
+                    if row.get("aired_at"):
+                        continue        # it has been out; leave it be
+                    _key = str(row.get("key") or "")
+                    if _key and pantry_get(_key):
+                        if made is None:
+                            made = (kind, row)
+                        continue
+                    return (kind, row, True)      # free: no audio yet
+                except Exception:  # noqa: BLE001
+                    continue
+    except Exception:  # noqa: BLE001
+        pass
+    if free:
+        return (free[0], free[1], True)
+    if made:
+        return (made[0], made[1], False)
+    return ("", None, False)
+
+
+async def retint_shelf() -> str:
+    """#1104: tint one shelved segment - any road, not just banter."""
+    try:
+        kind, row, free = retint_row_pick()
+        if row is None:
+            return ""
+        # A recorded row costs its render as well. Only when ahead.
+        if not free and surplus() <= 0:
+            return ""
+        _was = str(row.get("text") or "")
+        _got = await crystal_tint(_was, str(kind), row.get("verbatim"))
+        row["tint"] = {"ok": bool(_got.get("ok")),
+                       "why": str(_got.get("why") or ""),
+                       "world": str(_got.get("world") or ""),
+                       "ms": int(_got.get("ms") or 0),
+                       "later": True}
+        if not _got.get("ok"):
+            row["tint_tried"] = time.time()
+            return ""
+        row.setdefault("text_plain", _was)
+        row["text"] = str(_got.get("script") or _was)
+        row["tint_ok"] = True
+        if not free:
+            # #1077: the words changed, so the recording is stale. Drop
+            # the keys and let it be made again rather than airing the
+            # old audio under the new script.
+            for _k in ("key", "keys", "seconds", "made", "takes"):
+                row.pop(_k, None)
+        pipeline_log(
+            "crystal",
+            f"(#1104) {SHELF_LABEL.get(kind, kind)} has been put through "
+            f"the crystal - {_got.get('ms')}ms"
+            + ("" if free else ", and its old recording was dropped so the "
+                              "voice matches the new words"),
+            extra=("THE LATER PASS, FOR EVERY ROAD (#1104)\n\n"
+                   "Until this, the second pass only ever reached banter "
+                   "and deep rounds - adverts, news, the gallery, phone "
+                   "calls, memos and station IDs had no path to it at "
+                   "all.\n\nAS WRITTEN:\n" + _was[:1400]
+                   + "\n\nAS THE CRYSTAL HAS IT:\n"
+                   + str(_got.get("script") or "")[:1400]))
+        return str(kind)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 async def retint_one() -> str:
     """#1068: rewrite one banked round that went out plain.
 
@@ -24334,7 +24425,17 @@ async def retint_one() -> str:
             want = entry
             break                       # oldest first: _LARDER is in order
         if want is None:
-            return _say(f"nothing in the reserve needs it "
+            # #1104: ...THEN THE REST OF THE STATION. This used to stop
+            # here, and _LARDER is banter, so the only road that could
+            # ever be caught up was the only road that was tinted in the
+            # first place. #1098/#1100 then stopped banter writing ahead
+            # while other roads were short - correct for the schedule,
+            # and it throttled the one tinted road on the station, which
+            # is what the operator heard.
+            _did = await retint_shelf()
+            if _did:
+                return _did
+            return _say(f"nothing in the reserve or on the shelf needs it "
                         f"({len(_LARDER)} round(s) banked)")
         _got = await crystal_tint(str(want.get("script") or ""),
                                   str(want.get("prep_kind") or ""),
@@ -25285,10 +25386,39 @@ def speed_state() -> dict[str, Any]:
 SURPLUS_FROM = 0.60
 
 
-def surplus() -> float:
-    """0.0 to 1.0 - how far ahead the station is, above the safe line."""
+# #1103: the horizon SURPLUS is measured against - one hour from here,
+# NOT the stacking goal. "Are we far enough ahead to spend room on
+# something richer?" is a question about the next hour, and the answer
+# must not get worse because the operator raised their long-term
+# ambition from two hours of reserve to three.
+SURPLUS_HOUR = 3600.0
+
+
+def surplus_depth() -> float:
+    """How far ahead of THE NEXT HOUR the station is, 0.0 to 1.0."""
     try:
-        depth = max(0.0, min(1.0, float(box_depth())))
+        made = float(prepared_seconds())
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return max(0.0, min(1.0, made / SURPLUS_HOUR))
+
+
+def surplus() -> float:
+    """0.0 to 1.0 - how far ahead the station is, above the safe line.
+
+    #1103: AGAINST AN HOUR, NOT AGAINST THE STACKING GOAL. This read
+    box_depth(), which is prepared_seconds() over prepare_target_seconds()
+    - the goal. So raising the goal from two hours to three made every
+    second already banked worth a third less and pushed surplus further
+    away, meaning "stack more deeply" switched OFF the alleviation that
+    stacking deeply is meant to buy. One number was answering two
+    questions, which is the same fault #1100 fixed in the larder.
+
+    box_depth() is deliberately left alone: a dozen other readers want
+    it for the question it genuinely answers, which is how far along the
+    stocking goal we have come."""
+    try:
+        depth = surplus_depth()
     except Exception:  # noqa: BLE001
         return 0.0
     if depth <= SURPLUS_FROM:
@@ -25404,6 +25534,22 @@ def surplus_state() -> dict[str, Any]:
         "callers_loud": got > 0.15,
         "callers_unhinged": got > 0.55,
         "topics_held": len(read_bombshells() or []),
+        # #1103: the two horizons, side by side, so "why is surplus 0
+        # when the shelf is deep" has an answer on the page.
+        "ahead_of_hour": round(surplus_depth(), 3),
+        # #1104: how much of what is standing by has actually been
+        # through the crystal. "All dialogue needs to go through the
+        # tinting pass" - this is the number that says whether it has.
+        "tinted": (lambda rows: {
+            "on": bool(crystal_tint_two_pass()),
+            "rows": len(rows),
+            "done": sum(1 for r in rows if r.get("tint_ok")),
+            "share": (round(sum(1 for r in rows if r.get("tint_ok"))
+                            / float(len(rows)), 3) if rows else 0.0),
+        })([r for k in list(_SHELF) for r in (_SHELF.get(k) or [])
+            if isinstance(r, dict) and str(r.get("text") or "")]),
+        "toward_goal": round(box_depth(), 3),
+        "goal_hours": round(prepare_target_seconds() / 3600.0, 2),
         # #1094: the stand-down ladder as it actually stands, and
         # whether one answer has quietly cancelled another.
         # #1099: whether the pair are standing down from writing
@@ -27002,6 +27148,21 @@ async def coordinator() -> None:
         await asyncio.sleep(COORD_TICK)
         try:
             coord_air_sample()
+            # #1104: THE CRYSTAL GETS THE FAST TICK. retint_one sat in
+            # the two-minute housekeeping block below doing ONE item,
+            # which is an hour to walk a thirty-row shelf - far too slow
+            # for "all dialogue needs to go through the tinting pass".
+            # It carries its own brakes (tint_should_stop, and the
+            # hourly share in tint_budget), so the tick decides only how
+            # often it may ASK, never how much it may spend.
+            try:
+                await retint_one()                                # #1068
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                tint_autotune()                                   # #1105
+            except Exception:  # noqa: BLE001
+                pass
             # #916d: and the moment a hole is measured, something already
             # made goes into it. Measuring dead air and doing nothing
             # about it is a report, not a coordinator.
@@ -27030,10 +27191,6 @@ async def coordinator() -> None:
                     pass
                 try:
                     cupboard_rotate()                             # #1057
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    await retint_one()                            # #1068
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -60511,7 +60668,17 @@ def _looks_meta(said: str) -> bool:
 # fraction of that the rewrite may spend. A budget rather than a
 # threshold because a threshold is either on or off and both are wrong:
 # measured, the depth threshold #1047 used was on 100% of the time.
-TINT_SHARE = 0.30
+# #1105: was 0.30, and measured burn is 5,223 s/hour against the 2,160
+# that bought - two point four times over, exhausted at minute 24. The
+# cost side is fixed by tint_model_now() choosing the cheaper model when
+# the bucket is low; this is the other half. It is a SHARE of the hour's
+# model time, so it can never take the desk's own work away entirely.
+TINT_SHARE = 0.50
+TINT_SHARE_MOST = 0.75                  # the autotune's ceiling
+# How many refusals-for-money before the orchestrator raises the share
+# itself. Six is a few minutes of it, not one unlucky moment.
+_TINT_STARVED = [0]
+TINT_STARVED_MOST = 6
 _TINT_SPEND: list[float] = [0.0, 0.0]        # [hour mark, seconds spent]
 
 
@@ -60519,6 +60686,8 @@ def tint_budget() -> float:
     """Model-seconds the rewrite may spend in one hour."""
     try:
         got = orch_policy("tint_share")
+        if got is None:                                          # #1105
+            got = orch_policy("tint_share_auto")
         share = (max(0.0, min(0.9, float(got)))
                  if got is not None else TINT_SHARE)
     except Exception:  # noqa: BLE001
@@ -60534,12 +60703,29 @@ def tint_budget() -> float:
 
 
 def tint_spent() -> float:
-    """What it has spent this hour, resetting on the hour."""
-    mark = float(int(time.time() // 3600))
-    if _TINT_SPEND[0] != mark:
-        _TINT_SPEND[0] = mark
-        _TINT_SPEND[1] = 0.0
-    return _TINT_SPEND[1]
+    """#1105: what it owes RIGHT NOW - a leaky bucket, not an hourly tot.
+
+    This reset on the hour and nothing paced it in between, so the whole
+    allowance went in one burst at the top of the hour and the station
+    aired plain for the rest. Measured: exhausted at minute 24.3, and
+    #1063's own comment claims a share "is never wholly on or wholly
+    off" - which an hourly total spent greedily is exactly.
+
+    The bucket drains continuously at the rate the share allows, so the
+    same average spend is paced across the hour and there is always some
+    left. `_TINT_SPEND` is [last drained at, level]."""
+    now = time.time()
+    try:
+        was = float(_TINT_SPEND[0] or 0)
+        if not was or now - was > 7200:
+            _TINT_SPEND[0] = now
+            return max(0.0, float(_TINT_SPEND[1] or 0))
+        gone = (now - was) * (tint_budget() / 3600.0)
+        _TINT_SPEND[0] = now
+        _TINT_SPEND[1] = max(0.0, float(_TINT_SPEND[1] or 0) - gone)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    return float(_TINT_SPEND[1] or 0)
 
 
 def tint_spend_note(seconds: float) -> None:
@@ -60556,6 +60742,75 @@ def tint_budget_left() -> float:
         return max(0.0, tint_budget() - tint_spent())
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def tint_model_now() -> str:
+    """#1105: the big model while there is headroom, the fast one when
+    there is not.
+
+    Measured: 20/20 turns on gemma4:31b at a mean of 29.6s and a worst
+    of 95.8s, against the station's own e2b at 14.4s - and the budget is
+    charged in WALL CLOCK, so a model swap and a queue are billed to the
+    crystal too. Running the dear model until the money runs out buys an
+    excellent tint on two fifths of the hour and none on the rest. This
+    buys a good one on all of it, and still runs the excellent one
+    whenever it is genuinely affordable."""
+    try:
+        want = str(dj_settings().get("crystal_tint_model") or "")
+        if not want:
+            return ""
+        if tint_budget_left() > tint_budget() * 0.5:
+            return want                 # plenty left: the better tint
+        fast = str(dj_settings().get("model_fast")
+                   or dj_settings().get("model") or "")
+        return fast or want
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def tint_autotune() -> str:
+    """#1105: the orchestrator's hand on the crystal's allowance.
+
+    "I need the orchestrator having at his disposal all of the tools and
+     means to make these changes... no matter what."
+
+    If the rewrite keeps standing down for want of money, the share goes
+    up - bounded, so the crystal can never starve the writing desk that
+    gives it something to tint - and the cheaper model is tried BEFORE
+    any rise. An explicit answer from the operator is never overridden."""
+    try:
+        if not crystal_tint_two_pass():
+            return ""
+        if _TINT_STARVED[0] < TINT_STARVED_MOST:
+            return ""
+        _TINT_STARVED[0] = 0
+        try:
+            if orch_policy("tint_share") is not None:
+                return ""               # the operator has answered
+        except Exception:  # noqa: BLE001
+            pass
+        now = float(TINT_SHARE)
+        try:
+            got = _ORCH["policy"].get("tint_share_auto") or {}
+            now = float(got.get("value") or TINT_SHARE)
+        except Exception:  # noqa: BLE001
+            pass
+        if now >= TINT_SHARE_MOST:
+            return ""
+        want = round(min(TINT_SHARE_MOST, now + 0.10), 3)
+        orch_load()
+        _ORCH["policy"]["tint_share_auto"] = {"value": want,
+                                              "at": time.time()}
+        orch_save()
+        pipeline_log("crystal",
+                     f"(#1105) the crystal kept running out of money, so "
+                     f"its share of the hour goes {int(now * 100)}% -> "
+                     f"{int(want * 100)}%. It drops to the faster model "
+                     "before it asks for more, and it can never take more "
+                     f"than {int(TINT_SHARE_MOST * 100)}%")
+        return f"tint share {want}"
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def tint_pressure() -> str:
@@ -60598,6 +60853,12 @@ def tint_pressure() -> str:
     try:
         left = tint_budget_left()
         if left <= 0:
+            # #1105: counted, so tint_autotune can see that this is the
+            # normal state rather than a bad minute.
+            try:
+                _TINT_STARVED[0] = int(_TINT_STARVED[0]) + 1
+            except Exception:  # noqa: BLE001
+                pass
             return (f"the rewrite has spent its {int(tint_budget())}s "
                     "share of the hour")
     except Exception:  # noqa: BLE001
@@ -61141,6 +61402,16 @@ async def crystal_tint(script: str, kind: str = "",
             # hourly share, charged to nobody, while the ad and SFX
             # roads were throttled by a budget the biggest consumer
             # never paid into.
+            # #1105: BOUND BEFORE IT IS READ. This sat four lines
+            # BELOW, so `tinted` did not exist when chunk_answer and
+            # trail_note asked for it - both raised UnboundLocalError
+            # into the bare except below and were swallowed, while
+            # tint_spend_note ran first and survived. The budget was
+            # charged and the spend was invisible: of 175 trail rows
+            # only 2 were banked rounds, and both arrived by the other
+            # path. This is the better tint, and it has been filing
+            # nothing on every round it has ever done.
+            tinted = "\n".join(done).strip()
             try:
                 tint_spend_note(float(out.get("ms") or 0) / 1000.0)
                 for _c in chunks:
@@ -61150,7 +61421,6 @@ async def crystal_tint(script: str, kind: str = "",
                            chunks, None, int(out.get("ms") or 0))
             except Exception:  # noqa: BLE001
                 pass
-            tinted = "\n".join(done).strip()
             out["prompt"] = (
                 (f"TURN BY TURN - {len(turns)} calls, one per line of the "
                  "round. This is the prompt AS SENT for the first of "
@@ -61221,7 +61491,7 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         got = await ask_model(
             prompt, limit=max(600, len(text) + 400), spice=0.55,
-            model=str(dj.get("crystal_tint_model") or ""),        # #1036
+            model=tint_model_now(),                       # #1036/#1105
             # #1019: everything the desk listing needs to open this call
             # out into "what the tinting did to this particular prompt".
             mark={"purpose": "tint",
@@ -91650,8 +91920,13 @@ function boothRowAudio(row, line) {
 function djTalkRowInner(line) {
   {
     const row = el("div", "", "");
-    row.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
-      + "padding:3px 4px;border-radius:5px";
+    /* #1102: it WRAPS. Without this, three children compete for one
+     * line and the words - the only child with min-width:0 - pay for
+     * both the picture and the bubbles. On a narrow panel one column
+     * below another beats two columns of nothing. */
+    row.style.cssText = "display:flex;flex-wrap:wrap;gap:4px 8px;"
+      + "align-items:flex-start;padding:5px 7px;border-radius:8px;"
+      + "margin:3px 0;border:1px solid rgba(255,255,255,.06)";
     /* #991: "when someone's hawking a painting on air, I want to see a
      * thumbnail of the painting on the left side of the listing."
      *
@@ -91680,11 +91955,17 @@ function djTalkRowInner(line) {
          * the text keeping the rest. artThumb (#830) already carries the
          * fullscreen viewer and the hawk menu, so it behaves the same
          * here as everywhere else the station shows a picture. */
-        const _big = artThumb(_pics[0], 112);
+        /* #1102: marked, so the bubble column below can take it in
+         * and the two stop being separate claims on the row's width.
+         * It stays appended to the row here because the ad, sting and
+         * upstairs branches return before the bubbles are ever built -
+         * those rows keep the picture exactly where it was. */
+        const _big = artThumb(_pics[0], 132);
+        _big.dataset.boothPic = "1";
         _big.style.flex = "0 0 auto";
-        _big.style.marginLeft = "8px";
+        _big.style.marginLeft = "auto";
         _big.style.alignSelf = "flex-start";
-        _big.style.maxWidth = "40%";
+        _big.style.maxWidth = "42%";
         /* The row is built text-last, so DOM order alone would put this
          * back on the left where it started. `order` moves it to the end
          * of the flex line without the builder having to be rearranged
@@ -92299,7 +92580,15 @@ function djTalkRowInner(line) {
       return row;
     }
     const said = el("div", "", "");
-    said.style.cssText = "flex:1;min-width:0;cursor:pointer";
+    /* #1102: A FLOOR UNDER THE WORDS. `min-width:0` means "you may be
+     * squeezed to nothing", and with a picture and a bubble column each
+     * entitled to 40% beside it, that is what happened - about a
+     * hundred pixels, one word to a line. This says the words are never
+     * narrower than roughly fourteen characters of their own size, and
+     * if the picture will not fit alongside then the PICTURE wraps
+     * below, which is the right way round. */
+    said.style.cssText = "flex:1 1 auto;min-width:min(100%,14em);"
+      + "cursor:pointer;font-size:11.5px;line-height:1.5";
     said.title = "Say this again out of the Pine Box";
     /* #677: this said "DJ" for anybody whose name had not come through —
      * including callers, which is how a customer on the phone ended up
@@ -92530,10 +92819,27 @@ function djTalkRowInner(line) {
       said.appendChild(ban);
     }
     // The bubbles down the right: who said it, and what drove it.
+    /* #1102: ...AND THE PICTURE ABOVE THEM, IN THE SAME COLUMN. These
+     * were two separate children each entitled to 40% of the row, so
+     * together they could take eighty and leave the words a hundred
+     * pixels - and each reserved its width whether or not it held
+     * anything, which is the empty panel on the right. One column, one
+     * width, picture on top, bubbles under it. */
     const tags = el("div", "", "");
-    tags.style.cssText = "flex:0 0 auto;max-width:40%;display:flex;"
-      + "flex-direction:column;align-items:flex-end;gap:2px";
+    tags.style.cssText = "flex:0 0 auto;width:136px;max-width:42%;"
+      + "display:flex;flex-direction:column;align-items:stretch;gap:3px;"
+      + "margin-left:auto;order:99";
     row.appendChild(tags);
+    try {
+      const _pic = row.querySelector('[data-booth-pic="1"]');
+      if (_pic && _pic.parentNode === row) {
+        _pic.style.marginLeft = "0";
+        _pic.style.maxWidth = "100%";
+        _pic.style.width = "100%";
+        _pic.style.alignSelf = "stretch";
+        tags.insertBefore(_pic, tags.firstChild);
+      }
+    } catch (e) { /* the row still draws */ }
     const bubble = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;"
       + "max-width:100%;font-size:10px;padding:1px 6px;border-radius:9px;"
       + "cursor:pointer;border:1px solid var(--border);";
