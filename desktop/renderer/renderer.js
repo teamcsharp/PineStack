@@ -1372,6 +1372,48 @@ async function applyDefaultBroadcast() {
   }
 }
 
+/* OFF AIR, WHICH IS NOT OFF. setFm below stops the station and every
+ * service under it; this shuts only the door to the air. The booth keeps
+ * recording and everything it makes is banked - measured, roughly 1,500
+ * seconds of finished audio per hour spent off air, which is the only
+ * time the station ever gets to build faster than it spends. */
+let airPausedNow = false;
+
+function airPaintBtn(state) {
+  const b = document.getElementById("airPauseBtn");
+  if (!b || !state) return;
+  const off = !!state.paused;
+  airPausedNow = off;
+  const banked = Math.round((state.banked_seconds || 0) / 60);
+  const mins = Math.round((state.for_seconds || 0) / 60);
+  b.classList.toggle("off-air", off);
+  b.innerHTML = off
+    ? "\u25b6<span class='banked'>" + banked + "m</span>"
+    : "\u23f8";
+  b.title = off
+    ? "Back on air. The booth has been recording the whole time \u2014 "
+      + banked + " minutes standing by, " + mins + " minutes off air."
+    : "Go off air without stopping the booth. The desk, the recording "
+      + "room and the crystal keep working and everything they make is "
+      + "banked for when you come back. This is not the FM switch.";
+}
+
+async function airPauseState() {
+  try { airPaintBtn(await api.get("/api/radio/pause")); } catch (err) { /* later */ }
+}
+
+async function airPauseToggle() {
+  const b = document.getElementById("airPauseBtn");
+  if (b) b.disabled = true;
+  try {
+    airPaintBtn(await api.post("/api/radio/pause", {paused: !airPausedNow}));
+  } catch (err) {
+    noteRouteError(err.message);
+  } finally {
+    if (b) b.disabled = false;
+  }
+}
+
 async function setFm(on) {
   setFmUi(on);
   try {
@@ -10435,6 +10477,11 @@ broadcastTarget.value = desiredBroadcast;
 broadcastTarget.oninput = (event) => setDesiredBroadcast(event.target.value);
 broadcastTarget.onchange = (event) => setBroadcastTarget(event.target.value);
 $("fmSwitch").onchange = (event) => setFm(event.target.checked);
+if ($("airPauseBtn")) {
+  $("airPauseBtn").onclick = airPauseToggle;
+  setTimeout(airPauseState, 1500);
+  setInterval(airPauseState, 20000);
+}
 const boothMonitorToggle = $("boothMonitor");
 if (boothMonitorToggle) {
   boothMonitorToggle.checked = boothMonitor;

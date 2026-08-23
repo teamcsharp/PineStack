@@ -20,6 +20,13 @@
         <h1>Pine Box</h1>
         <p id="connLine">checking agent...</p>
       </div>
+      <!-- OFF AIR, WHICH IS NOT OFF. The FM switch below stops the
+           station and every service under it. This shuts only the door
+           to the air: the writing desk, the recording room and the
+           crystal keep working, and everything they make is banked for
+           when you come back. -->
+      <button id="airPauseBtn" class="air-pause"
+              title="Go off air without stopping the booth">&#9208;</button>
     </div>
     <section class="route-panel">
       <label class="fm-row" for="fmSwitch">
@@ -132,6 +139,24 @@
     <div id="wakePopup" class="wake-popup" style="display:none"></div>
     <div id="routeHistory" class="route-history" style="display:none"></div>
   </aside>
+  <style>
+    /* Sits with the Pine Box mark, hard right of the brand block, so it
+       reads as part of the station's identity rather than as one more
+       control in the route panel. */
+    .brand { position: relative; }
+    .air-pause {
+      position: absolute; top: 0; right: 0;
+      background: rgba(255,255,255,.06); color: #cfd8e3;
+      border: 1px solid rgba(255,255,255,.16); border-radius: 8px;
+      font-size: 13px; line-height: 1; padding: 5px 8px; cursor: pointer;
+    }
+    .air-pause:hover { background: rgba(255,255,255,.12); }
+    .air-pause.off-air {
+      background: rgba(255,183,77,.18); color: #ffb74d;
+      border-color: rgba(255,183,77,.45);
+    }
+    .air-pause .banked { font-size: 10px; opacity: .85; margin-left: 4px; }
+  </style>
   <div id="railResizer" class="rail-resizer" title="Resize sidebar"></div>
 
   <main>
