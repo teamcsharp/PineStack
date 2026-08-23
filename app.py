@@ -24669,6 +24669,19 @@ def trail_rows(most: int = 60, liked_only: bool = False
 # minutes. Every debt the station incurred was erased before it could
 # be repaid.
 ARREARS_PATH = data_path("arrears.json")
+# #1097: A DEBT IS A COUNT OF SEGMENTS TO MAKE UP, and four is already a
+# lot. Beyond that the number stops carrying information and becomes a
+# permanent first place on the desk's list. It is also the only defence
+# against a counting fault: #1091 found cover_now being fired by a
+# five-second browser poll, and by the time it was fixed the ledger -
+# which #1088 had just made survive restarts - held gallery at 102,
+# manager at 69 and caller at 57. Not a hundred and two missed
+# segments; a hundred and two page views, steering slot_needs().
+ARREARS_MOST = 4
+# And a debt goes stale. Six hours on, for a road that has aired several
+# times since, nothing is owed. Ninety minutes is longer than any
+# entry's turn on the sheet and shorter than a shift.
+ARREARS_LIFE = 5400.0
 _ARREARS: dict[str, dict[str, Any]] = {}
 _ARREARS_READ = [False]
 
@@ -24683,6 +24696,23 @@ def arrears_load() -> dict[str, dict[str, Any]]:
                                  if isinstance(v, dict)})
         except Exception:  # noqa: BLE001
             pass
+    # #1097: THE CLAMP RUNS ON EVERY READ, so a file written by the
+    # poll-driven version heals itself the first time it is looked at
+    # rather than needing a hand-edit, and a debt nobody worked off just
+    # goes quiet instead of sitting at the top of the desk for ever.
+    try:
+        now = time.time()
+        for road in list(_ARREARS):
+            seat = _ARREARS.get(road) or {}
+            owed = int(seat.get("owed") or 0)
+            when = float(seat.get("at") or 0)
+            if owed <= 0 or (when and now - when > ARREARS_LIFE):
+                _ARREARS.pop(road, None)
+                continue
+            if owed > ARREARS_MOST:
+                seat["owed"] = ARREARS_MOST
+    except Exception:  # noqa: BLE001
+        pass
     return _ARREARS
 
 
@@ -24705,7 +24735,8 @@ def arrears_note(road: str, why: str = "") -> None:
         arrears_load()                                        # #1088
         seat = _ARREARS.setdefault(road, {"road": road, "owed": 0,
                                           "at": 0.0, "why": ""})
-        seat["owed"] = int(seat.get("owed") or 0) + 1
+        seat["owed"] = min(ARREARS_MOST,                      # #1097
+                           int(seat.get("owed") or 0) + 1)
         seat["at"] = time.time()
         seat["why"] = str(why or "")[:180]
         arrears_save()                                            # #1088
