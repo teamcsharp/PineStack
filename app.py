@@ -14719,6 +14719,21 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
     ponytail: no pause, seek or volume on the box; the panel player has all
     three. Wire a real media_player entity in Home Assistant if you want
     transport control from the box itself."""
+    # #1115: OFF AIR MEANS NO SOUND. #1108 shut the door on SPEECH -
+    # dj_speak returns before it does anything - and left the records
+    # running, because the music road never asked. Measured live: the
+    # operator paused, and twenty-one minutes later a track was still
+    # playing out of the box with the station banking happily behind it.
+    #
+    # Gated HERE rather than at the nine call sites, because "which
+    # caller did I miss" is exactly the question #1108 got wrong. This
+    # is the one door music takes to the speaker.
+    #
+    # NOT home_assistant_say: that is the ASSISTANT's voice, and #647
+    # deliberately keeps it answering with the show off the box. Pausing
+    # the broadcast must never stop the Pine Box replying to you.
+    if radio_paused():
+        return ""
     if not box_talk_ok():
         return ""                    # switched off at the top (#638)
     token, player = _ha_creds()
@@ -15804,6 +15819,13 @@ async def _radio_loop() -> None:
     so the box can drift a few seconds either way on untagged files."""
     try:
         while _RADIO["station"]:
+            # #1116: off air, the queue does not walk. Without this the
+            # loop keeps advancing through records nobody can hear, so
+            # coming back on lands in the middle of a run the operator
+            # never heard the start of.
+            if radio_paused():
+                await asyncio.sleep(5)
+                continue
             track = radio_next_track()
             if not track:
                 break
@@ -18572,11 +18594,23 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
 
 async def _dj_loop() -> None:
     """The show. Talk, play, sometimes talk over it, repeat."""
+    # #1116: off air, the show's own record road holds as well. #1115
+    # shut the door music takes to the speaker; this stops the loop
+    # walking the queue and burning records nobody can hear.
+    async def _dj_hold() -> None:
+        while radio_paused():
+            await asyncio.sleep(5)
     skip = asyncio.Event()
     _DJ_SKIP.append(skip)
     played = 0
     try:
         while _RADIO["on"]:
+            # #1116: off air, the record road holds. Without this the show
+            # keeps pulling tracks and walking the queue while nothing can
+            # be heard, so coming back on lands mid-run.
+            await _dj_hold()
+            if not _RADIO["on"]:
+                break
             track = dj_next_track()
             if not track:
                 break
@@ -22090,6 +22124,18 @@ def radio_pause_set(on: bool) -> bool:
     try:
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = time.time() if on else 0.0
+        # #1116: AND WHAT IS ALREADY SOUNDING STOPS. #1115 shut the door
+        # music takes to the speaker, which stops the NEXT track and does
+        # nothing about the one already handed over - the box holds the
+        # file and plays it to the end. Measured: the operator paused and
+        # was still hearing records twenty-one minutes later.
+        if on:
+            try:
+                fire_and_forget(stop_speaking())
+            except Exception:  # noqa: BLE001
+                pass
+            _RADIO["now"] = None
+            _RADIO["started"] = 0.0
         try:
             PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
             PAUSE_PATH.write_text(json.dumps(
