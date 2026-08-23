@@ -13517,7 +13517,21 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
     # narrower than the FM switch. Only the station is stopped.
     try:
         if radio_paused() and not reply:
-            return {"skipped": "the broadcast is paused", "paused": True}
+            # #1120: "" - NOT a dict. This function is declared -> str,
+            # every other return in it is "" or a URL, and two callers
+            # use that emptiness AS THE VERDICT: speak_turns says so in
+            # its own comment ("a non-empty return IS the verdict") and
+            # _replay_held tests `if not await _play_on_box(...)`. A
+            # non-empty dict is truthy, so #1117 told both of them the
+            # clip had been DELIVERED - box_hold() never ran, the hold
+            # shelf never took it, and the round was destroyed rather
+            # than kept.
+            #
+            # Measured while the operator was paused: 167 seconds of
+            # finished, rendered, mixed dialogue coalesced into streams
+            # and then simply gone, with delivery.held at 0. An hour off
+            # air was emptying the cupboard the pause exists to fill.
+            return ""
     except Exception:  # noqa: BLE001
         pass
     if not box_talk_ok(reply=reply):
@@ -22178,6 +22192,19 @@ def radio_pause_set(on: bool) -> bool:
     try:
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = time.time() if on else 0.0
+        # #1120: coming back, the talk clocks start from NOW. _LAST_SAID
+        # advances during a pause (air_remember burns on roads that
+        # never reach a speaker) while _LAST_PLAYOUT freezes, so on
+        # resume box_gone_deaf() reads the whole pause as a gap and
+        # reloads a perfectly healthy satellite - and talk_watch reads
+        # it the opposite way and misses a real hole. One line, both
+        # directions.
+        if not on:
+            try:
+                _LAST_SAID[0] = time.time()
+                _LAST_PLAYOUT["at"] = time.time()
+            except Exception:  # noqa: BLE001
+                pass
         # #1116: AND WHAT IS ALREADY SOUNDING STOPS. #1115 shut the door
         # music takes to the speaker, which stops the NEXT track and does
         # nothing about the one already handed over - the box holds the
@@ -26285,6 +26312,15 @@ def clock_may_air(kind: str) -> str:
         # Silence outranks everything. Covering the air is the whole job
         # and a segment heard late is better than a segment heard over
         # nothing at all.
+        # #1120: off air, no clock may put anything up. The rule below
+        # reads _BOX_LAST_OK, which is written only inside _play_on_box
+        # past the pause gate - so twenty-five seconds into a pause it
+        # is permanently stale and every clock this governs gets an
+        # unconditional green light for the rest of the pause. The
+        # pause was removing the clocks' only restraint.
+        if radio_paused():
+            _CLOCK_HELD.pop(kind, None)
+            return "the station is off air"
         if time.time() - _BOX_LAST_OK[0] > CLOCK_QUIET_FLOOR:
             _CLOCK_HELD.pop(kind, None)
             return "the air is quiet"
@@ -28063,6 +28099,16 @@ async def _torrent_talk() -> None:
     sharing a countdown."""
     while _RADIO.get("on"):
         try:
+            # #1120: OFF AIR, THE TORRENT STOPS. It fires a round every
+            # 3.6-8.0 seconds and each POPS an entry off _LARDER (#926)
+            # and persists the removal - so a pause was spending the
+            # bank at eight rounds a minute while larder_keeper filled
+            # it, and paying a second model call to freshen each one on
+            # its way out to nowhere. Measured: prepared_by_kind.banter
+            # 0, with eight rounds banked and not one of them voiced.
+            if radio_paused():
+                await asyncio.sleep(5)
+                continue
             dj = dj_settings()
             if not dj.get("talk_radio_mode"):
                 await asyncio.sleep(5)
