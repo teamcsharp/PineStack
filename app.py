@@ -19483,7 +19483,11 @@ _LARDER_WRITING = [False]
 # #1098: [last checked, standing down]. larder_keeper turns every three
 # seconds and hour_short_kinds() reads the uncached hour_needs(), so the
 # question is asked every fifteen and the answer kept in between.
-_LARDER_YIELD: list[Any] = [0.0, False]
+# #1099: [last checked, standing down, last said, what for]. The
+# reason the pair stopped writing ahead must be answerable while it is
+# happening, not only at the instant it began.
+_LARDER_YIELD: list[Any] = [0.0, False, 0.0, []]
+LARDER_YIELD_SAY_EVERY = 600.0
 
 
 def larder_fresh() -> float:
@@ -22583,7 +22587,16 @@ async def larder_keeper() -> None:
                         _shorts = [k for k in (hour_short_kinds() or [])
                                    if k != "banter"]
                         _LARDER_YIELD[1] = bool(_shorts)
-                        if _shorts and not _was:
+                        _LARDER_YIELD[3] = list(_shorts)
+                        # #1099: on the way in, and again every ten
+                        # minutes while it lasts. A single line at the
+                        # transition scrolls out of a forty-row ring on
+                        # a busy station, and "why did the pair stop
+                        # writing" is asked long after that.
+                        if _shorts and (not _was or _now - float(
+                                _LARDER_YIELD[2] or 0)
+                                > LARDER_YIELD_SAY_EVERY):
+                            _LARDER_YIELD[2] = _now
                             pipeline_log(
                                 "lookahead",
                                 f"the larder holds {len(_LARDER)} round(s) "
@@ -22595,6 +22608,7 @@ async def larder_keeper() -> None:
                         continue
                 else:
                     _LARDER_YIELD[1] = False
+                    _LARDER_YIELD[3] = []
             except Exception:  # noqa: BLE001
                 pass
             # #823: "live work outranks stocking shelves" became
@@ -25368,6 +25382,22 @@ def surplus_state() -> dict[str, Any]:
         "topics_held": len(read_bombshells() or []),
         # #1094: the stand-down ladder as it actually stands, and
         # whether one answer has quietly cancelled another.
+        # #1099: whether the pair are standing down from writing
+        # ahead, and what for - answerable now, not only from the log.
+        "larder": {
+            "holds": len(_LARDER),
+            "floor": larder_floor(),
+            "cap": _LARDER_MAX,
+            "standing_down": bool(_LARDER_YIELD[1]),
+            "for": list(_LARDER_YIELD[3] or []),
+            "say": (("the pair are writing ahead normally")
+                    if not _LARDER_YIELD[1] else
+                    (f"the pair hold {len(_LARDER)} round(s) against a "
+                     f"floor of {larder_floor()} and have stopped writing "
+                     "ahead so "
+                     + ", ".join(str(x) for x in
+                                 (_LARDER_YIELD[3] or [])[:3])
+                     + " can be recorded (#1098)"))},
         "ladder": list(slot_postpone()),
         "ladder_note": slot_ladder_note(),
         "larder_floor": larder_floor(),
