@@ -4133,6 +4133,16 @@ async def reconcile_generations() -> dict[str, int]:
 
 
 @app.on_event("startup")
+async def _startup_paused() -> None:
+    """#1108: a station left off air overnight stays off air. Coming back
+    on by itself is the opposite of what the switch is for."""
+    try:
+        radio_pause_load()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.on_event("startup")
 async def _startup_name_clash() -> None:
     """#1070: look, once, for two functions sharing a name.
 
@@ -16877,6 +16887,10 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
     # nothing. Lines handed in (speak_turns, replays) arrive with their
     # stumbles already in place — only a line WE write here gets injected,
     # so nothing is ever stumbled twice.
+    # #1108: OFF AIR. Before any work at all - the writing, the render
+    # and the pipeline noise all belong to a line that is not going out.
+    if radio_paused() and not by_hand:
+        return ""
     vec = performance_vector(who, voice or "")
     if vec and (vec.get("_macro") or random.random() < 0.2):
         # Behind the glass, the DELIVERY machinery explains itself (#402):
@@ -22008,6 +22022,74 @@ def schedule_prep_eta(kind: str) -> float:
         return -1.0
 
 
+# --- OFF AIR, AND WORKING HARDER FOR IT (#1108) -----------------------
+# The FM switch stops the station and every service under it. This is
+# narrower and the difference is the whole point: the rooms keep working
+# and only the door to the air is shut, so an hour spent off air is an
+# hour of the cupboard filling instead of an hour of the cupboard being
+# eaten. Measured, the station needs about 65% of its airtime to come
+# from material that already exists and manages 15% - it is not short of
+# ability, it is short of time, and this is the only way it ever gets any.
+PAUSE_PATH = data_path("paused.json")
+
+
+def radio_paused() -> bool:
+    """Is the station off air but still working?"""
+    try:
+        return bool(_RADIO.get("paused"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def radio_pause_set(on: bool) -> bool:
+    """Go off air, or come back. Written down: a station left off air
+    overnight that came back by itself would be the opposite of the
+    ask."""
+    try:
+        _RADIO["paused"] = bool(on)
+        _RADIO["paused_at"] = time.time() if on else 0.0
+        try:
+            PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            PAUSE_PATH.write_text(json.dumps(
+                {"paused": bool(on), "at": _RADIO.get("paused_at") or 0}))
+        except Exception:  # noqa: BLE001
+            pass
+        pipeline_log(
+            "air",
+            ("(#1108) OFF AIR - the rooms keep working. Every second of "
+             "the model and the recording room goes into the cupboard "
+             "now instead of onto the air, and the watchdogs stand down "
+             "because nobody is speaking on purpose")
+            if on else
+            ("(#1108) BACK ON AIR after "
+             + str(int(radio_paused_for() / 60)) + " minutes off - "
+             + str(int(prepared_seconds())) + "s of finished audio "
+             "standing by"))
+        return bool(on)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def radio_pause_load() -> None:
+    try:
+        got = json.loads(PAUSE_PATH.read_text())
+        if isinstance(got, dict) and got.get("paused"):
+            _RADIO["paused"] = True
+            _RADIO["paused_at"] = float(got.get("at") or time.time())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def radio_paused_for() -> float:
+    """How long the station has been off air."""
+    try:
+        if not radio_paused():
+            return 0.0
+        return max(0.0, time.time() - float(_RADIO.get("paused_at") or 0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def pantry_window() -> str:
     """When it is cheap to build ahead: a record with room left on it, or
     an ad break. Both are stretches where nobody is waiting on a voice.
@@ -22025,6 +22107,13 @@ def pantry_window() -> str:
     # writing room under relief shuts it exactly when it is most needed.
     # A written round means the live moment pays only for a voice, not
     # for a writer, and that is the expensive half.
+    # #1108: OFF AIR, EVERY STRETCH IS A WINDOW. This function asks
+    # "is there a stretch where nobody is waiting on a voice" - and
+    # paused, nobody is waiting on anything. Answered before relief,
+    # because relief is about the LIVE road being behind and there is no
+    # live road.
+    if radio_paused():
+        return "the station is off air - everything is a window (#1108)"
     if render_relief():
         return "the engine is in relief - writing only"
     # #904: renders IN FLIGHT, not _PREMAKE_GATE.locked(). speak_turns
@@ -22651,8 +22740,13 @@ async def larder_keeper() -> None:
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
             # more rounds than the idle default.
+            # #1108: ...OR OFF AIR, which is the same condition seen
+            # from the other side - #445 built this for "the pair keep
+            # writing into the backlog while nothing airs", and a paused
+            # station is exactly that, on purpose.
             box_down = (time.time() < float(_BOX_DOWN["until"])
-                        or len(_BOX_HOLD) >= 3)
+                        or len(_BOX_HOLD) >= 3
+                        or radio_paused())
             if not dj_settings().get("dialogue_prefill", True):
                 continue
             ad_running = bool(_RADIO.get("ad_now") and time.time()
@@ -27180,6 +27274,10 @@ async def coord_fill_gap() -> bool:
     which is what a station that is otherwise silent should be doing. It
     stamps _RADIO['last_ad'], which is the same clock ad_clock() and the
     record loop read, so it can never double up with them either."""
+    # #1108: and it refuses while the station is off air, where a hole in
+    # the sound is the point rather than a problem to be filled.
+    if radio_paused():
+        return False
     try:
         if not _RADIO.get("on"):
             return False
@@ -28110,6 +28208,15 @@ async def dead_air_watch() -> None:
     # itself in a storm without ever airing a line.
     heard = time.time()
     while _RADIO.get("on"):
+        # #1108: off air, silence is the intention rather than the fault.
+        # Left running through a pause this would strike every tick and
+        # restart the show over and over against a station deliberately
+        # not speaking.
+        if radio_paused():
+            heard = time.time()
+            strikes = 0
+            await asyncio.sleep(5)
+            continue
         await asyncio.sleep(20)
         try:
             limit = dj_settings()["dead_air_seconds"]
@@ -44647,6 +44754,12 @@ async def talk_watch() -> None:
         await asyncio.sleep(TALK_WATCH_TICK)
         try:
             if not _RADIO.get("on"):
+                continue
+            # #1108: off air nobody is speaking ON PURPOSE. A watchdog
+            # that cannot tell that from a hole would spend the whole
+            # pause covering silence that is not a fault, burning the
+            # very room the pause exists to bank.
+            if radio_paused():
                 continue
             if _SPEAKING[0]:
                 continue                # somebody has the floor
@@ -63390,6 +63503,47 @@ async def radio_status(
     return radio_state()
 
 
+@app.post("/api/radio/pause")
+async def radio_pause_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1108: go off air without stopping the rooms.
+
+    The FM switch stops the station and every service under it. This
+    shuts only the door to the air: the writing desk, the recording room
+    and the crystal keep working, and everything they make goes into the
+    cupboard instead of onto the air."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    want = payload.get("paused")
+    if want is None:
+        want = not radio_paused()               # a plain toggle
+    radio_pause_set(bool(want))
+    return {"paused": radio_paused(),
+            "for_seconds": round(radio_paused_for(), 1),
+            "banked_seconds": round(prepared_seconds(), 1),
+            "say": ("off air - the booth keeps recording, and everything "
+                    "it makes is banked for when you come back"
+                    if radio_paused() else
+                    "back on air with "
+                    + str(int(prepared_seconds())) + "s standing by")}
+
+
+@app.get("/api/radio/pause")
+async def radio_pause_state_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_read_auth(authorization)
+    return {"paused": radio_paused(),
+            "for_seconds": round(radio_paused_for(), 1),
+            "banked_seconds": round(prepared_seconds(), 1),
+            "larder": len(_LARDER)}
+
+
 @app.post("/api/radio/tune")
 async def radio_tune_api(
     request: Request,
@@ -63425,6 +63579,14 @@ async def radio_next_api(
     """What the panel player pulls when a track ends, so the browser can run
     the same station without the box being involved."""
     require_read_auth(authorization)
+    # #1108: OFF AIR. The rooms are still working; the air is not. Said
+    # plainly so the player holds instead of pulling the next track and
+    # walking the queue forward through a pause.
+    if radio_paused():
+        return {"paused": True, "off_air": True,
+                "for_seconds": round(radio_paused_for(), 1),
+                "say": "the station is off air - the booth is still "
+                       "recording, and this picks up where it left off"}
     # While the DJ is on air he owns the running order. A browser asking for
     # "next" here would consume a second track and the show would appear to
     # skip — so hand back what is actually playing instead (#122).
@@ -67163,12 +67325,23 @@ def glyphy_state() -> dict[str, Any]:
     # coordinator and the rooms write to, so the slider is the conductor's
     # own commentary and not a general log.
     try:
+        # #1107: THE CRYSTAL WAS NOT ON THIS LIST. The operator asked
+        # to "see the tinting pass done by the orchestrator" and the
+        # conductor's console filtered the `crystal` channel out
+        # entirely - so every rewrite, every stand-down and every
+        # before/after was invisible here however long anybody watched.
+        # It is also why I read "zero crystal rows" off this endpoint
+        # earlier and drew the wrong conclusion twice: the rows were
+        # never eligible, quite apart from the forty-row cut.
         want = ("lookahead", "air", "speakbox", "drop", "call", "model",
-                "switchboard", "gallery", "voice")
+                "switchboard", "gallery", "voice", "crystal")
         rows = [e for e in (_RADIO.get("pipeline") or [])
                 if str(e.get("kind") or "") in want]
         out["console"] = [{"ts": int(e.get("ts") or 0),
                            "kind": str(e.get("kind") or ""),
+                           # #1107: so the row can say it has paperwork
+                           # worth opening before anybody clicks it.
+                           "has_extra": bool(e.get("extra")),
                            "text": str(e.get("text") or "")[:200]}
                           for e in rows[-40:]]
     except Exception:  # noqa: BLE001
@@ -81080,6 +81253,16 @@ station and the banter; on puts it on air and you can tune in."
           <span></span>
           <em>🎧 FM</em>
         </label>
+        <!-- #1108: OFF AIR, which is not OFF. The FM switch beside this
+             stops the station and everything under it; this shuts only
+             the door to the air and leaves the rooms working, so a pause
+             fills the cupboard instead of emptying it. -->
+        <button id="pauseAir" onclick="event.stopPropagation();airPause()"
+                title="Go off air without stopping the booth — the desk,
+the recording room and the crystal keep working and everything they make
+is banked for when you come back. This is not the FM switch."
+                style="float:right;margin-right:8px;font-size:11px;
+                       padding:2px 9px;border-radius:11px">⏸ on air</button>
       </h2>
       <p style="margin:0 0 8px;color:#9ba6b7;font-size:13px">
         Everything under the library roots. Say <em>"play Marsh Pipe"</em> to
@@ -98759,7 +98942,8 @@ function glyphyPaint(got) {
     rows.forEach((r) => {
       const line = document.createElement("div");
       line.style.cssText = "white-space:nowrap;overflow:hidden;"
-        + "text-overflow:ellipsis";
+        + "text-overflow:ellipsis;cursor:zoom-in;border-radius:3px;"
+        + "padding:0 2px";
       const when = new Date(Number(r.ts) || Date.now());
       const hh = String(when.getHours()).padStart(2, "0");
       const mm = String(when.getMinutes()).padStart(2, "0");
@@ -98767,7 +98951,30 @@ function glyphyPaint(got) {
       line.textContent = hh + ":" + mm + ":" + ss + "  "
         + String(r.kind || "").padEnd(11, " ").slice(0, 11) + "  "
         + String(r.text || "");
-      line.title = String(r.text || "");
+      /* #1107: EVERY LINE IS A DOOR. pipeOpen (#1065) builds the whole
+       * paperwork - prompt, model, timings, before and after - off
+       * nothing but {kind, ts, text}, and the pipeline feed and the
+       * booth rows have both called it since. The conductor's own
+       * console, which is the readout the operator actually watches,
+       * was plain divs with no handler.
+       *
+       * It also needs it most: these lines are nowrap/ellipsis, so
+       * anything longer than the box is cut off mid-sentence. One click
+       * answers the truncation and the paperwork together. */
+      line.title = String(r.text || "")
+        + "\n\nClick to open the paperwork behind this line.";
+      line.addEventListener("mouseenter", () => {
+        line.style.background = "rgba(255,255,255,.07)";
+      });
+      line.addEventListener("mouseleave", () => {
+        line.style.background = "";
+      });
+      line.addEventListener("click", (clickEvent) => {
+        clickEvent.stopPropagation();     // the box itself drags/toggles
+        try {
+          pipeOpen({kind: r.kind, ts: r.ts, text: r.text, extra: r.extra});
+        } catch (e) { /* the console keeps running */ }
+      });
       con.appendChild(line);
     });
     if (!rows.length) con.textContent = "the conductor has said nothing yet";
@@ -99771,7 +99978,54 @@ async function djGo() {
 // must, pick a station that has tracks, open the lines. Off stops the show,
 // the banter and whatever this page is still playing, so "off" means silence
 // rather than "no new tracks".
-async function djPower() {
+async /* #1108: OFF AIR, WHICH IS NOT OFF. The FM switch stops the station and
+ * every service under it. This shuts only the door to the air - the
+ * writing desk, the recording room and the crystal keep working, and
+ * everything they make is banked. An hour off air is roughly 1,500
+ * seconds of finished audio put away rather than eaten. */
+async function airPaint(got) {
+  const b = document.getElementById("pauseAir");
+  if (!b || !got) return;
+  const off = !!got.paused;
+  const mins = Math.round((got.for_seconds || 0) / 60);
+  const banked = Math.round((got.banked_seconds || 0) / 60);
+  b.textContent = off
+    ? "▶ off air · " + mins + "m · " + banked + "m banked"
+    : "⏸ on air";
+  b.style.background = off ? "rgba(255,183,77,.18)" : "";
+  b.style.color = off ? "#ffb74d" : "";
+  b.style.borderColor = off ? "#ffb74d55" : "";
+  b.title = off
+    ? "Back on air. The booth has been recording the whole time — "
+      + banked + " minutes are standing by."
+    : "Go off air without stopping the booth — the desk, the recording "
+      + "room and the crystal keep working and everything they make is "
+      + "banked for when you come back. This is not the FM switch.";
+}
+
+async function airPauseState() {
+  try { airPaint(await api("/api/radio/pause")); } catch (e) { /* later */ }
+}
+
+async function airPause() {
+  const b = document.getElementById("pauseAir");
+  if (b) b.disabled = true;
+  try {
+    const got = await api("/api/radio/pause", {method: "POST",
+                                               body: JSON.stringify({})});
+    airPaint(got);
+    setStatus(got.say || "");
+  } catch (error) {
+    setStatus(error.message, true);
+  } finally {
+    if (b) b.disabled = false;
+  }
+}
+
+setInterval(airPauseState, 15000);
+setTimeout(airPauseState, 1200);
+
+function djPower() {
   const box = document.getElementById("djPower");
   const status = document.getElementById("musicStatus");
   const on = box.checked;
@@ -119368,6 +119622,19 @@ function consoleAddPipeline(ev) {
   body.className = "cx-reply";
   body.textContent = (ev.text || "") + (ev.extra ? "  ⤵" : "");
   entry.appendChild(body);
+  /* #1107: ...AND THE BODY OPENS IT TOO WHEN THERE IS NO EXPANSION.
+   * #1065 put the paperwork on the HEAD because the `extra` expansion
+   * below owns the body. True when there IS an extra - and most lines
+   * have none, so on most rows the body looked exactly like the head
+   * and did nothing at all when clicked. */
+  if (!ev.extra) {
+    body.style.cursor = "zoom-in";
+    body.title = "open the paperwork behind this line";
+    body.addEventListener("click", (clickEvent) => {
+      clickEvent.stopPropagation();
+      pipeOpen(ev);
+    });
+  }
   /* #1065: the whole entry opens its paperwork. The `extra` still
    * expands in place on its own click below - this is the deeper
    * read, and it sits on the HEAD so the two do not fight. */
