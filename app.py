@@ -9930,6 +9930,38 @@ def shelf_rows(kind: str) -> list[dict[str, Any]]:
     return _SHELF.setdefault(str(kind), [])
 
 
+def build_lift() -> float:
+    """#1121: how much deeper the station may stock while it is BUILDING
+    rather than spending.
+
+    Off air there is no listener competing for the engine and no live
+    road eating the reserve, so every ceiling sized for a spending
+    station is the wrong number. Surplus counts for something too - being
+    an hour ahead on air is a smaller version of the same condition.
+
+    The real governors are untouched: the pantry's six-gigabyte allowance
+    and prepared_seconds() against the target still bound everything."""
+    try:
+        if radio_paused():
+            return 3.0
+        return 1.0 + 0.5 * float(surplus() or 0)
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def larder_cap() -> int:
+    """#1121: how many banter rounds may be banked.
+
+    _LARDER_MAX was a flat 14 and larder_keeper caps at 12 when the box
+    is down - which paused counts as - so an hour off air stopped
+    banking banter at twelve rounds and did nothing with the rest of the
+    hour."""
+    try:
+        return int(max(1, round(_LARDER_MAX * build_lift())))
+    except Exception:  # noqa: BLE001
+        return _LARDER_MAX
+
+
 def shelf_cap(kind: str) -> int:
     """How many of one content type to hold — off the hours dial.
 
@@ -9948,7 +9980,24 @@ def shelf_cap(kind: str) -> int:
     # An hour behaves exactly as it always did; deeper dials stock
     # proportionally more, and eight times the old cap is as far as
     # one content type may ever go.
-    return max(1, base, min(base * 8, int(round(base * hours))))
+    want = max(1, base, min(base * 8, int(round(base * hours))))
+    # #1121: and deeper again while the station is BUILDING rather than
+    # spending. News is deliberately exempt from most of it: its cap of
+    # one is an EDITORIAL decision, not a resource one - a bulletin goes
+    # stale and a backlog of yesterday's front page is worse than no
+    # backlog - so it gets a small lift and no more, and it will stay
+    # short of its owed seconds off air. That is correct and should stay
+    # visible rather than be papered over.
+    try:
+        lift = build_lift()
+        if lift > 1.0:
+            if str(kind) == "news":
+                want = max(want, min(3, int(round(want * min(2.0, lift)))))
+            else:
+                want = int(round(want * lift))
+    except Exception:  # noqa: BLE001
+        pass
+    return max(1, want)
 
 
 # #977: THE ROADS THAT MAY BE AIRED MORE THAN ONCE.
@@ -22634,8 +22683,19 @@ async def pantry_keeper() -> None:
                 _larder_floor = larder_floor()
             except Exception:  # noqa: BLE001
                 _larder_floor = 4
-            _banter_wait = bool(_hour_short) and "banter" not in _hour_short \
-                and len(_LARDER) >= _larder_floor
+            # #1121: ...AND NOT WHILE THE STATION IS OFF AIR. This gate
+            # protects the LIVE road from banter monopolising the engine.
+            # Off air there is no live road - nothing to protect, nothing
+            # to yield to, and yielding is just refusing to work.
+            #
+            # Measured: seventy-seven minutes paused, eight rounds banked
+            # and prepared_by_kind.banter NOUGHT, because
+            # hour_short_kinds() names caller, gallery, news and ad on
+            # every pass and the larder is always at its floor, so this
+            # was permanently true and larder_prepare was never reached.
+            _banter_wait = (bool(_hour_short) and not radio_paused()
+                            and "banter" not in _hour_short
+                            and len(_LARDER) >= _larder_floor)
             if _banter_wait:
                 pipeline_log("lookahead",
                              f"the larder holds {len(_LARDER)} round(s) "
@@ -22934,7 +22994,14 @@ async def larder_keeper() -> None:
             except Exception:  # noqa: BLE001
                 _hours = 1.0
             _want = max(target, int(round(target * _hours)))
-            cap = min(_LARDER_MAX, 12 if box_down else _want)
+            # #1121: the ceiling lifts while the station is building.
+            # This capped at TWELVE when the box is down - which paused
+            # counts as - so an hour off air stopped banking banter at
+            # twelve rounds and spent the rest of the hour doing nothing
+            # with it.
+            cap = min(larder_cap(),
+                      (12 if box_down and not radio_paused() else _want)
+                      if not radio_paused() else larder_cap())
             if len(_LARDER) >= cap or _LARDER_WRITING[0]:
                 continue
             # #1098: ...AND ABOVE ITS FLOOR BANTER YIELDS, HERE TOO.
@@ -24772,7 +24839,9 @@ async def retint_shelf() -> str:
         if row is None:
             return ""
         # A recorded row costs its render as well. Only when ahead.
-        if not free and surplus() <= 0:
+        # #1121: ...or the station is off air, where a stale recording
+        # costs nothing to re-cut because nothing is waiting on it.
+        if not free and surplus() <= 0 and not radio_paused():
             return ""
         _was = str(row.get("text") or "")
         _got = await crystal_tint(_was, str(kind), row.get("verbatim"))
@@ -61503,6 +61572,11 @@ def tint_budget() -> float:
             got = orch_policy("tint_share_auto")
         share = (max(0.0, min(0.9, float(got)))
                  if got is not None else TINT_SHARE)
+        # #1121: off air, the rewrite is competing with nothing. The
+        # share exists to stop it starving the writing desk in front of
+        # a listener; with no listener there is no desk to starve.
+        if radio_paused():
+            share = max(share, 0.90)
     except Exception:  # noqa: BLE001
         share = TINT_SHARE
     # #1083: and it rises with the surplus - thirty percent of the hour
