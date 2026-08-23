@@ -10163,7 +10163,21 @@ def shelf_full(kind: str) -> bool:
         _need = (hour_needs_now() or {}).get(str(kind)) or {}
         _owed = float(_need.get("owed") or 0)
         if _owed > 0:
-            if len(shelf_rows(kind)) >= shelf_cap(kind) * SHELF_ROW_CEILING:
+            # #1095: ...COUNTING ROWS THAT COULD ACTUALLY AIR. This read
+            # shelf_rows(), which is the raw list with no checks at all,
+            # so a road was declared full on a count that included every
+            # row whose clip had been pruned - and being checked first,
+            # it short-circuited the seconds test #1091 had just
+            # corrected. That is the line the audit caught live: "24
+            # prepared row(s) on the shelf and not one of them could be
+            # taken - 24x clip gone", against a ceiling of exactly 24.
+            #
+            # hour_needs() already publishes the count after the pantry,
+            # innings and rest checks. The ceiling's purpose - one road
+            # may not hoard the allowance - is untouched: a row nobody
+            # can take was never hoarding anything.
+            _rows = float(_need.get("rows") or 0)
+            if _rows >= shelf_cap(kind) * SHELF_ROW_CEILING:
                 return True             # deep enough; never a hoard
             return float(_need.get("held") or 0) >= _owed
     except Exception:  # noqa: BLE001
@@ -11513,6 +11527,16 @@ async def recording_sitting(entries: list[dict[str, Any]],
     return out
 
 
+# #1094: how many passes running the slot desk may ask for something
+# and be told nothing fits before the window stops governing. One
+# refusal is a coincidence; three is a window that is never big enough,
+# and "it is taken next window" is then a refusal with a comforting
+# name. Lives in pantry_keeper's loop, which is a background task -
+# nothing a browser can turn.
+_SLOT_STARVED = [0]
+SLOT_STARVED_MOST = 3
+
+
 def prep_plan(skip: Any = None) -> dict[str, Any]:
     """WHAT to prepare next and WHY - the whole decision, in one place,
     written down so the operator can read the reasoning.
@@ -11709,11 +11733,16 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         # takes the first one that fits the window that is open. #1049
         # handed over only the dearest road; it almost never fitted, and
         # the desk drove nothing at all.
+        _asked: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for _need in slot_needs():
             _slot_row = next((r for r in rows
                               if r["kind"] == _need["prep"]), None)
-            if not _slot_row or float(_slot_row["cost"]) > room:
+            if not _slot_row:
                 continue
+            _asked.append((_need, _slot_row))
+            if float(_slot_row["cost"]) > room:
+                continue
+            _SLOT_STARVED[0] = 0
             out.update({
                 "kind": _slot_row["kind"], "forced": True,
                 "slot": _need["why"],
@@ -11721,6 +11750,36 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                         f" at about {int(_slot_row['cost'])}s against "
                         f"{int(room)}s of window (#1050)")})
             return out
+        # #1094: THE DESK ASKED AND NOTHING FITTED. The window governing
+        # is right and it is kept - but a window that is NEVER big enough
+        # turns "it is taken next window" into a refusal with a
+        # comforting name. Measured: the desk wanted manager 219s, caller
+        # 308s, gallery 362s and news 246s against 52s of room, and the
+        # only thing that fitted was a 16s station ID. #1082 already
+        # records that a painting round fits NINE PERCENT of windows.
+        #
+        # So after three refusals running the cheapest road it asked for
+        # goes anyway. The overrun is bounded by machinery that already
+        # exists: larder_prepare asks prep_should_stop() between every
+        # line, and a round left written but unvoiced is picked up by the
+        # voice pass rather than lost.
+        if _asked:
+            _SLOT_STARVED[0] += 1
+            if _SLOT_STARVED[0] >= SLOT_STARVED_MOST:
+                _SLOT_STARVED[0] = 0
+                _need, _slot_row = min(
+                    _asked, key=lambda pair: float(pair[1]["cost"]))
+                out.update({
+                    "kind": _slot_row["kind"], "forced": True,
+                    "slot": _need["why"],
+                    "why": (_need["why"] + " - the desk has asked "
+                            f"{SLOT_STARVED_MOST} passes running and "
+                            "nothing has fitted, so "
+                            f"{_slot_row['label']} goes anyway at about "
+                            f"{int(_slot_row['cost'])}s against "
+                            f"{int(room)}s of window. It stops between "
+                            "lines if the room is wanted (#1094)")})
+                return out
         # #1082: BREATHING ROOM. Nothing is owed - no deadline fired,
         # no half hour asked, no arrears, no road under its floor - and
         # the gate is free. This is the rare wide window, and the
@@ -22175,9 +22234,12 @@ async def pantry_keeper() -> None:
             # stand down while the station's overall reserve was deep
             # and the larder itself empty, and a quiet pair is the one
             # fault this station is not allowed to have.
+            # #1094: ...and deeper still when the operator has said to
+            # protect banter hardest, which is the one place that answer
+            # can land - banter is exempt from the stand-down ladder
+            # already, so there is nothing there to protect harder.
             try:
-                _larder_floor = max(1, int(
-                    dj_settings().get("dialogue_reserve_target") or 4))
+                _larder_floor = larder_floor()
             except Exception:  # noqa: BLE001
                 _larder_floor = 4
             _banter_wait = bool(_hour_short) and "banter" not in _hour_short \
@@ -22592,15 +22654,24 @@ def slot_postpone() -> tuple[str, ...]:
     order = list(SLOT_POSTPONE)
     try:
         keep = str(orch_policy("prefer_road") or "")
-        # #1076: banter is not ON this ladder - it is deliberately
-        # exempt - so "protect banter hardest", which is the option the
-        # operator is actually offered when a half hour is at risk, used
-        # to remove nothing and mean nothing. A road already exempt is
-        # honoured by protecting the NEXT one down instead, which is the
-        # only thing "harder than never stood down" can mean.
-        if keep and keep not in order and order:
-            order.remove(order[-1])
-        elif keep and keep in order:
+        # #1094: ...AND A ROAD THAT IS NOT ON THE LADDER IS LEFT ALONE.
+        # #1076 made this remove order[-1] when the named road was not
+        # on the ladder, reasoning that protecting the next one down is
+        # the only thing "harder than never stood down" can mean.
+        # order[-1] is `caller`. So "Banter - the spine" - the option the
+        # operator is offered when a half hour is at risk - had the
+        # actual effect "phone calls are never stood down": it protected
+        # a road nobody named and did nothing for the road they did.
+        #
+        # The same branch fired for prefer:slot, whose argument is not a
+        # road at all - it is "Only the ones the next hour wants" from a
+        # different question entirely.
+        #
+        # A road already exempt is already maximally protected. There is
+        # nothing above "never stands down". The answer is applied in
+        # larder_floor() instead, where banter's supply is actually
+        # decided - see #1091.
+        if keep and keep in order:
             order.remove(keep)
         first = str(orch_policy("postpone_first") or "")
         if first and first in order:
@@ -22609,6 +22680,56 @@ def slot_postpone() -> tuple[str, ...]:
     except Exception:  # noqa: BLE001
         return tuple(SLOT_POSTPONE)
     return tuple(order)
+
+
+def slot_ladder_note() -> str:
+    """#1094: has one answer quietly cancelled another?
+
+    slot_postpone removes `keep` from the ladder before it applies
+    `first`, so answering "protect gallery hardest" after "gallery gives
+    way first" leaves the earlier answer with nothing to act on. The
+    later answer winning is right. Saying nothing about it is not - the
+    operator cannot see that a decision they made is no longer in
+    force."""
+    try:
+        keep = str(orch_policy("prefer_road") or "")
+        first = str(orch_policy("postpone_first") or "")
+        if keep and first and keep == first:
+            return (f"{SHELF_LABEL.get(keep, keep)} is both protected "
+                    "hardest and first to give way - the protection wins "
+                    "and the earlier answer no longer applies")
+        if first and first not in slot_postpone():
+            return (f"{SHELF_LABEL.get(first, first)} was told to give way "
+                    "first, but it is not on the ladder any more - that "
+                    "answer is not in force")
+        if keep and keep not in SLOT_POSTPONE:
+            return (f"{SHELF_LABEL.get(keep, keep)} never stands down "
+                    "anyway, so protecting it hardest raises the larder "
+                    "floor instead (#1094)")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def larder_floor() -> int:
+    """#1091/#1094: how many banter rounds must be in hand before banter
+    stands down for a road the hour is short of.
+
+    The operator's `dialogue_reserve_target`, and DEEPER when they have
+    said to protect banter hardest - which is the one place that answer
+    can mean anything, banter being exempt from the stand-down ladder
+    already."""
+    try:
+        floor = max(1, int(
+            dj_settings().get("dialogue_reserve_target") or 4))
+    except Exception:  # noqa: BLE001
+        floor = 4
+    try:
+        if str(orch_policy("prefer_road") or "") == "banter":
+            floor = min(_LARDER_MAX, floor + 4)
+    except Exception:  # noqa: BLE001
+        pass
+    return floor
 
 
 def slot_index(when: float = 0.0) -> int:
@@ -25146,6 +25267,11 @@ def surplus_state() -> dict[str, Any]:
         "callers_loud": got > 0.15,
         "callers_unhinged": got > 0.55,
         "topics_held": len(read_bombshells() or []),
+        # #1094: the stand-down ladder as it actually stands, and
+        # whether one answer has quietly cancelled another.
+        "ladder": list(slot_postpone()),
+        "ladder_note": slot_ladder_note(),
+        "larder_floor": larder_floor(),
         # #1093: what the hour has given back to the records, and what
         # is left to give.
         "ballast": {
