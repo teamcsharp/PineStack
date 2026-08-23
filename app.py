@@ -22782,25 +22782,49 @@ def slot_ladder_note() -> str:
     return ""
 
 
-def larder_floor() -> int:
-    """#1091/#1094: how many banter rounds must be in hand before banter
-    stands down for a road the hour is short of.
+# #1100: HOW MANY ROUNDS IS ENOUGH TO BE GOING ON WITH - which is not
+# the same question as how deep to bank, and must not be answered with
+# the same number. larder_keeper has carried the station's own opinion
+# about this since #823: `if _OLLAMA_GATE.locked() and len(_LARDER) >= 2`
+# - two rounds is enough to coast on while the model is busy elsewhere.
+# This is that, with one to spare.
+LARDER_YIELD_FLOOR = 3
 
-    The operator's `dialogue_reserve_target`, and DEEPER when they have
-    said to protect banter hardest - which is the one place that answer
-    can mean anything, banter being exempt from the stand-down ladder
-    already."""
+
+def larder_floor() -> int:
+    """#1091/#1094/#1100: how many banter rounds must be in hand before
+    banter stands down for a road the hour is short of.
+
+    NOT the reserve target. That is a STOCKING GOAL - how deep to bank
+    ahead - and this is a SAFETY MARGIN - how much is enough to be going
+    on with while somebody else uses the room. #1098 used the target for
+    both, and since rounds air about as fast as they are written the
+    reserve sat permanently one short of it: measured at 5 against a
+    floor of 6 on every sample for nine minutes, with four entries bare
+    throughout. The gate never opened in the very condition it exists
+    for.
+
+    Bounded above by the operator's own target, so an operator who wants
+    a shallower reserve than three is never held to more than they
+    asked for. Below this nothing changes - the floor is absolute, and
+    cover_the_gap and the #1088 watchdog remain the real backstops
+    against a quiet pair."""
     try:
-        floor = max(1, int(
+        want = max(1, int(
             dj_settings().get("dialogue_reserve_target") or 4))
     except Exception:  # noqa: BLE001
-        floor = 4
+        want = 4
+    floor = min(want, LARDER_YIELD_FLOOR)
     try:
+        # "Protect banter hardest": write to the full reserve target
+        # before standing down. Capped AT the target, not past it - the
+        # previous +4 produced ten against a larder only ever stocked to
+        # six, which is this same bug from the other side.
         if str(orch_policy("prefer_road") or "") == "banter":
-            floor = min(_LARDER_MAX, floor + 4)
+            floor = want
     except Exception:  # noqa: BLE001
         pass
-    return floor
+    return max(1, min(_LARDER_MAX, floor))
 
 
 def slot_index(when: float = 0.0) -> int:

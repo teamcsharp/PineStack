@@ -258,6 +258,47 @@ a certainty, and Python resolves it silently: the later definition wins
 and the earlier one stops existing. This has caused three separate
 outages. There is a startup check now; keep it.
 
+**Correct, called, running, and changing nothing.** This is the one
+that cost the most, and it is the first thing to check. A whole day was
+spent asking "why is the orchestrator falling behind" while its desks
+were reasoning correctly and none of their conclusions reached
+anything. Ask three questions of every mechanism, in this order: **is it
+CALLED, does it RUN, does it CHANGE ANYTHING?** Most of what looked like
+bad judgement was a gate wired to nothing. The shapes it takes:
+
+- *Two variables with one name, in different units.* `target` is a count
+  of rounds in one function and a number of seconds in another. A line
+  copied between them compared 14 against 7,200 and was false for the
+  station's entire life — and it was the gate that decided whether the
+  main preparer ran at all. This is the same fault as two functions with
+  one name and it is harder to see, because nothing collides and nothing
+  raises.
+- *A decision fired from a panel read.* The "there is no time, cover it"
+  call lived inside a status function polled every five seconds by the
+  browser. It fired twenty times a minute with a tab open and never
+  without one. **Anything a page can poll must be free of side effects**
+  — no counters, no budgets, no queued work. If a decision belongs to
+  the station, put it on the station's own timer.
+- *A guarantee inside `except`.* The protection for "nothing is deleted
+  before it airs" sat in the error path of the function that deletes
+  things. It held only when the code crashed.
+- *A key with one end wired.* Three policy answers were written by the
+  questionnaire and read by nothing; one was read with no writer
+  anywhere. The operator could answer, the answer was stored, and
+  nothing happened. **Grep both directions for every setting.**
+
+**Fixing the gate reveals the next one.** Banter starving the board was
+two loops, not one. The first fix made the second visible, and the
+second was where the time actually went — 42 minutes of an hour by the
+station's own arithmetic. Expect the first fix to uncover rather than
+resolve, and re-measure before declaring victory.
+
+**A ledger with no ceiling cannot recover from a counting fault.** Debts
+were added one per event and paid off one per segment made. When a poll
+bug added a hundred of them, the road needed ten hours of writing to
+clear a debt that never existed — and sat at the top of the planner
+until then. Cap anything that accumulates, and expire it.
+
 **Words and footage age differently.** A script is durable — it says the
 same thing next week. A recording is not: it is one voice, and the cast
 can change. Anything that keeps material must know which of the two it
@@ -286,6 +327,13 @@ An honest handover names what is not working.
   station cannot yet say "this model is failing you" with evidence.
 - **Settings changes are not journalled**, so the system cannot reason
   about what the operator just did.
+- **The larder floor is absolute, and consumption can pin the reserve
+  just under it.** Banter yields to a starved road only above its floor,
+  because a quiet pair is the one fault this station may not have. If
+  rounds air as fast as they are written the reserve sits below the
+  floor and banter never yields at all. Watch `standing_down` on
+  `/api/surplus`: if it is false for long stretches while roads are
+  bare, the floor is too high for the consumption rate, not too low.
 
 ---
 
