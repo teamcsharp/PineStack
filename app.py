@@ -29509,6 +29509,14 @@ SCHEDULE_KINDS: list[dict[str, str]] = [
      "blurb": "The pair take the wire — headlines pulled live, the lead "
               "story dug into and reacted to rather than read out "
               "(dj_news)."},
+    {"kind": "track_talk", "label": "Talk over the record",
+     "blurb": "The record has the air and the pair talk it in and out - "
+              "an intro written for THIS song, and a send-off after it. "
+              "Measured the cheapest and most reliable road on the "
+              "station: 1.43 seconds of room per second of speech "
+              "against banter's 3.28, and no failures in 31 goes. It "
+              "rides a record, so most of the entry is free airtime "
+              "(prep_track_talk)."},
     {"kind": "record", "label": "Spin a record",
      "blurb": "Not a round — the END of one. The needle goes down, the "
               "talk stops, and the record has the air for the rest of "
