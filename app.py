@@ -11312,6 +11312,28 @@ def prep_room_left() -> float:
     try:
         if not pantry_window():
             return 0.0
+        # #1125: OFF AIR, THE WINDOW HAS A LENGTH. #1108 gave
+        # pantry_window() its off-air branch and this, which sits
+        # directly on top of it, kept measuring the room from the record
+        # that is playing - and off air there is no record, so `left`
+        # came out hugely negative and this returned 0.0. The window was
+        # open and the room was nothing, which zeroes prep_budget and
+        # makes prep_plan answer "no window is open" on every pass.
+        #
+        # Measured: three hours paused and not ONE segment written on
+        # any road. `written` was flat or falling everywhere - ad 24->23,
+        # station_id 31->28 - while `rendered` climbed, because the room
+        # was voicing a backlog written before the pause. news and
+        # track_talk only stood out because they had no backlog to hide
+        # behind.
+        #
+        # Sized off the deep-work figure so every road on the board fits
+        # with margin: the dearest is a bulletin at about 680s.
+        if radio_paused():
+            try:
+                return max(900.0, float(prep_deep_seconds() or 0))
+            except Exception:  # noqa: BLE001
+                return 900.0
         ad = _RADIO.get("ad_now") or {}
         if ad:
             since = time.time() - float(ad.get("at") or 0)
@@ -26720,6 +26742,19 @@ def coord_air_sample() -> None:
         if not _RADIO.get("on"):
             _GAP_OPEN.clear()
             return
+        # #1125: OFF AIR, THE SHEET DOES NOT WALK. This is the one
+        # sibling with no pause guard - _dj_loop, _torrent_talk,
+        # clock_may_air, coord_fill_gap and the dead-air watchdog all
+        # have one. Off air it sees permanent quiet, opens a gap, and
+        # calls schedule_take(), which MUTATES the saved position.
+        # Proven: sched_pos.started 130 seconds old on a station paused
+        # for 10,863 - so the running order marched past entries it
+        # could not air, booking 531 seconds of deliberate silence per
+        # half hour as LOST AIR and accruing arrears for it. The exact
+        # opposite of what the pause is for.
+        if radio_paused():
+            _GAP_OPEN.clear()
+            return
         now = time.time()
         # #1023: on whatever road is carrying the broadcast, not on the
         # box the broadcast may not be going to. See air_last_heard.
@@ -27968,6 +28003,25 @@ def hour_needs() -> dict[str, dict[str, float]]:
             if road not in ALT_PREP_KINDS:
                 continue
             owed = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+            # #1125: ...EXCEPT NEWS, WHICH CANNOT BANK WHAT IT IS OWED.
+            # A bulletin costs about 680s to make, lives 1800s at most
+            # (and is born up to DRUDGE_TTL old), and the shelf holds
+            # three - so at best 265 seconds can exist at once against
+            # 1,440 owed over a three-hour horizon. The road therefore
+            # reported permanently short however well the scheduler
+            # worked, which is most of what the operator was reading as
+            # "scant".
+            #
+            # The cap is deliberate and stays: a stale bulletin is worse
+            # than no bulletin. What changes is that the OWED figure
+            # stops asking for material the station is not allowed to
+            # keep.
+            if road == "news":
+                try:
+                    owed = min(owed, float(shelf_cap("news"))
+                               * NEWS_ROUND_SECONDS)
+                except Exception:  # noqa: BLE001
+                    pass
             row = out.setdefault(road, {"owed": 0.0, "held": 0.0,
                                         "rows": 0.0, "cap": 0.0})
             row["owed"] += owed * hours
@@ -28019,6 +28073,16 @@ def hour_needs() -> dict[str, dict[str, float]]:
                 rows = rows + [e for e in _LARDER if e.get("prepared")]
                 held += sum(float(e.get("seconds") or 0)
                             for e in _LARDER if e.get("prepared"))
+            # #1125: track talk keeps its sides in _TRACK_TALK, not on
+            # the shelf, so held read 0 however much had been written.
+            if road == "track_talk":
+                try:
+                    _tt = [t for t in _TRACK_TALK.values()
+                           if isinstance(t, dict)]
+                    rows = rows + _tt
+                    held += sum(float(t.get("seconds") or 0) for t in _tt)
+                except Exception:  # noqa: BLE001
+                    pass
             out[road]["held"] = round(held, 1)
             out[road]["rows"] = float(len(rows))
             out[road]["cap"] = float(shelf_cap(road))
@@ -34652,8 +34716,14 @@ def alt_prep_road(kind: str) -> Any:
 # #893: which roads alt_prep_road knows, as a plain set. Asking it
 # directly BUILDS the coroutine, so a caller that only wants to know
 # whether a road exists leaves an un-awaited one behind every time.
+# #1125: ...AND TRACK TALK. It has been on SCHED_PREP_KIND since #1089
+# and on the sheet as a three-minute entry, and hour_needs() filters on
+# this tuple - so it reported owed 0 / held 0 / cap 0 while slot_needs()
+# called it short in the same breath. Its material lives in _TRACK_TALK
+# rather than _SHELF, so hour_needs needs the same special case banter
+# already has, below.
 ALT_PREP_KINDS = ("ad", "station_id", "manager", "caller", "gallery",
-                  "news", "banter")
+                  "news", "banter", "track_talk")
 
 
 def alt_job_put(job: str, **more: Any) -> dict[str, Any]:
