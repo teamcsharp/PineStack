@@ -22147,13 +22147,42 @@ async def pantry_keeper() -> None:
             # at rendered 1. The larder still gets its floor - a reserve
             # under target is a silence risk - but a full one waits its
             # turn behind whatever the running order is missing.
+            # #1091: ...AGAINST THE ROUND COUNT, NOT THE SECONDS TARGET.
+            # There are two variables named `target` in this file. In
+            # larder_keeper it is dialogue_reserve_target - a count of
+            # rounds, default six - and this comparison is right there.
+            # Here in pantry_keeper it is prepare_target_seconds(), and
+            # on a two-hour dial that is 7,200. _LARDER_MAX is 14. This
+            # gate asked whether fourteen was greater than seven
+            # thousand two hundred, every pass, for its whole life.
+            #
+            # So banter NEVER stood down, the banter loop spent every
+            # window, and the board loop below - which opens with
+            # `if pantry_window() != window: break` - exited on its
+            # first statement. prep_plan(), which holds the commitment
+            # board, the deadline picker and the slot desk, ran FOUR
+            # TIMES IN TWENTY-FOUR MINUTES. Every desk the orchestrator
+            # has is inside it.
+            #
+            # Deliberately NOT prepared_seconds() >= target, which is
+            # what the neighbouring lines do: that would let banter
+            # stand down while the station's overall reserve was deep
+            # and the larder itself empty, and a quiet pair is the one
+            # fault this station is not allowed to have.
+            try:
+                _larder_floor = max(1, int(
+                    dj_settings().get("dialogue_reserve_target") or 4))
+            except Exception:  # noqa: BLE001
+                _larder_floor = 4
             _banter_wait = bool(_hour_short) and "banter" not in _hour_short \
-                and len(_LARDER) >= target
+                and len(_LARDER) >= _larder_floor
             if _banter_wait:
-                pipeline_log("lookahead", "the larder is deep enough and "
-                             "the hour is short of "
+                pipeline_log("lookahead",
+                             f"the larder holds {len(_LARDER)} round(s) "
+                             f"against a floor of {_larder_floor} and the "
+                             "hour is short of "
                              + ", ".join(_hour_short[:3])
-                             + " — those go first (#978)")
+                             + " — those go first (#978/#1091)")
             for _entry in ([] if _banter_wait else list(_LARDER)):
                 # #978: IS A WINDOW OPEN - not "is it the same REASON a
                 # window was open when this pass began". `window` is a
@@ -24599,6 +24628,51 @@ async def cover_now(road: str, why: str = "") -> bool:
         return False
 
 
+# --- COVERAGE ON A TIMER, NOT A PAGE VIEW (#1091) ---------------------
+# cover_now() was called from glyphy_state(), which is a PANEL function
+# polled every five seconds per open browser tab. So the station's "there
+# is no time, cover it" decision fired twelve to twenty-four times a
+# minute with a tab open and NOT AT ALL without one - whether the station
+# noticed it was about to have a hole depended on whether somebody was
+# looking at it. It also filled the arrears ledger with page views and
+# took a quarter of the pipeline ring.
+_COVER_LAST: dict[str, float] = {}
+COVER_AGAIN_AFTER = 300.0
+
+
+async def cover_sweep() -> None:
+    """#1091: is anything arriving with nothing for it, and is there
+    still time to do something about that?
+
+    Once per approach, not once per repaint: a road that has been
+    covered stays quiet for COVER_AGAIN_AFTER, which is longer than any
+    single segment takes to arrive."""
+    try:
+        now = time.time()
+        for soon in (coord_upcoming() or [])[:4]:
+            try:
+                road = str(soon.get("road") or soon.get("kind") or "")
+                if not road or road in CANNOT_PREPARE:
+                    continue
+                left = float(soon.get("starts_in") or 0)
+                if left <= 0 or left > PREP_DEADLINE_WINDOW:
+                    continue
+                need = float(task_cost(road) or 0)
+                if not need or need <= left:
+                    continue            # there is time; nothing to cover
+                if now - float(_COVER_LAST.get(road) or 0) \
+                        < COVER_AGAIN_AFTER:
+                    continue            # already covered this approach
+                _COVER_LAST[road] = now
+                await cover_now(
+                    road, f"{soon.get('label') or road} takes the air in "
+                          f"{int(left)}s with nothing recorded for it")
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+
+
 # --- THE RESERVE OF LAST RESORT (#1075) -------------------------------
 # Three per road minimum, five where they exist, protected against every
 # deletion path there is. "Even if they're older" is the point: a stale
@@ -26572,6 +26646,10 @@ async def coordinator() -> None:
                     orch_scan()                                   # #1056
                 except Exception:  # noqa: BLE001
                     pass
+                try:
+                    await cover_sweep()                           # #1091
+                except Exception:  # noqa: BLE001
+                    pass
                 # Keep the order fresh inside the half hour too, so a
                 # road that empties at :10 is not ignored until :30.
                 since = time.time()
@@ -26622,11 +26700,37 @@ def hour_needs() -> dict[str, dict[str, float]]:
             # An item that has rested long enough IS cover, because it can
             # genuinely be pulled; one still resting, or one that has had
             # all its airings, is not.
-            rows = [r for r in (_SHELF.get(road) or [])
-                    if not r.get("aired_at")
-                    or (int(r.get("aired") or 0) < SHELF_REUSE_MOST
-                        and time.time() - float(r.get("aired_at") or 0)
-                        >= SHELF_REUSE_REST)]
+            # #1091: ...AND ITS AUDIO HAS TO STILL EXIST. This summed
+            # rows off the shelf without asking whether the clips were
+            # still there, while all three of its siblings check -
+            # slot_supply, cupboard_short and shelf_take all carry
+            # `if key and not pantry_get(key): continue`. Proven live:
+            # "a station ID: 24 prepared row(s) on the shelf and not one
+            # of them could be taken - 24x clip gone". Twenty-four rows
+            # counted as cover by the gate that decides whether to build
+            # more, and shelf_full() strikes roads off the board on the
+            # strength of this number before any desk is consulted.
+            #
+            # And it priced repeats off the flat constants while the
+            # take uses the operator's answers - eighteen innings
+            # against three, a six-fold disagreement about whether the
+            # same row is usable. Aligned to the take: a board that
+            # counts supply the shelf will refuse is what #1089 was.
+            rows = []
+            for r in (_SHELF.get(road) or []):
+                try:
+                    _k = str(r.get("key") or "")
+                    if _k and not pantry_get(_k):
+                        continue                 # its audio has gone
+                    if not r.get("aired_at"):
+                        rows.append(r)           # never been out
+                        continue
+                    if (int(r.get("aired") or 0) < shelf_innings(road)
+                            and time.time() - float(r.get("aired_at") or 0)
+                            >= shelf_reuse_rest()):
+                        rows.append(r)           # rested and has innings
+                except Exception:  # noqa: BLE001
+                    continue
             held = sum(float(r.get("seconds") or 0) for r in rows)
             if road == "banter":
                 rows = rows + [e for e in _LARDER if e.get("prepared")]
@@ -32506,20 +32610,37 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
         over = len(rows) - cap
         if over <= 0:
             return
+        # #1091: THE PROTECTION BELONGS ON THE PATH THAT RUNS.
+        # #1075 built resort_keys/resort_may_drop so that "any segment
+        # that is stored needs to be played and ran on the air before
+        # it's deleted" - the operator's words - and put them inside
+        # this function's `except Exception:` block. The two paths that
+        # actually execute, the pin sweep and `del rows[:over]`, never
+        # consulted them. The guarantee held only when the trim crashed.
         ids = alt_pin_map().get("ids") or set()
-        if ids:
-            drop: list[dict[str, Any]] = []
-            for row in rows:
-                if len(drop) >= over:
-                    break
-                if alt_sid(kind, row) in ids:
-                    continue            # spoken for; skip it
-                drop.append(row)
+        try:
+            _rk = resort_keys(kind)
+        except Exception:  # noqa: BLE001
+            _rk = None
+        drop: list[dict[str, Any]] = []
+        for row in rows:
             if len(drop) >= over:
-                rows[:] = [r for r in rows
-                           if all(r is not d for d in drop)]
-                return
-        del rows[:over]
+                break
+            try:
+                if ids and alt_sid(kind, row) in ids:
+                    continue            # spoken for; skip it
+                if _rk is not None and not resort_may_drop(kind, row, _rk):
+                    continue            # never aired, or a last resort
+            except Exception:  # noqa: BLE001
+                pass
+            drop.append(row)
+        if drop:
+            rows[:] = [r for r in rows if all(r is not d for d in drop)]
+        # If what must be kept still busts the cap, run over rather than
+        # destroy something nobody has heard - bounded at double, so a
+        # protected shelf can never grow without end.
+        if len(rows) > cap * 2:
+            del rows[:len(rows) - cap * 2]
     except Exception:  # noqa: BLE001
         try:
             # #1075: the cap trims the OLDEST, which is exactly where
@@ -66012,15 +66133,10 @@ def glyphy_state() -> dict[str, Any]:
                                  if w <= 0])
                 except Exception:  # noqa: BLE001
                     _held = 0
-                # #1076: AND IT ACTS. cover_now() was written in #1073
-                # to do exactly this and never called once - the whole
-                # arrears ledger behind it returned an empty list for
-                # its entire life. A mechanism nobody invokes is a
-                # comment with a function signature.
-                try:
-                    fire_and_forget(cover_now(_road, why))
-                except Exception:  # noqa: BLE001
-                    pass
+                # #1076 called cover_now() from here, which fixed it
+                # being dead and made it a browser poll instead - see
+                # #1091. This function REPORTS; the coordinator's own
+                # tick decides. Nothing is fired from a panel read.
                 say = (why[0].upper() + why[1:]
                        + f". There is no time - it measures about "
                          f"{int(_need)}s. "
