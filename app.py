@@ -12677,6 +12677,12 @@ def voice_engine_for(voice: str, who: str = "") -> str:
         if who and commit_for(str(who)) == "piper" and may_take_on_piper(
                 str(who)):
             return "piper"
+        # #1092: ...and so does an authorisation granted by cover_now,
+        # which is the one place that knows a hole is otherwise certain
+        # and has no way to tell the commitment board about it.
+        if who and piper_authorised(str(who)) and may_take_on_piper(
+                str(who)):
+            return "piper"
     except Exception:  # noqa: BLE001
         pass
     pinned = role_engine_for(who) if who else ""
@@ -24613,19 +24619,97 @@ async def cover_now(road: str, why: str = "") -> bool:
             got = [w for w in (slot_supply().get(road) or []) if w <= 0]
         except Exception:  # noqa: BLE001
             got = []
+        # #1092: AND THE WORK IS ACTUALLY QUEUED. Both branches below
+        # used to say a fresh one was on its way and neither queued
+        # anything, so the road that came up short at ten past came up
+        # short at twenty past for the same reason. This does not save
+        # the segment that is ARRIVING - a painting round measures 362s
+        # and it is a couple of minutes away, and pretending otherwise
+        # is what #1073 was written to stop. It saves the next one.
+        #
+        # Never at the expense of live work: if the writing desk is
+        # already saturated this stays a note in the arrears ledger and
+        # the slot desk picks it up when there is genuinely room. A
+        # segment arriving in three minutes must not be made late by one
+        # arriving in thirty.
+        _queued = ""
+        try:
+            if not _OLLAMA_GATE.locked():
+                if not got and may_take_on_piper(road):
+                    # Nothing to fall back on at all. An emergency take
+                    # is worth authorising: about 0.6 of the clone cost
+                    # on the measured mix, which is the difference
+                    # between landing late and not landing.
+                    piper_authorise(road)
+                    _queued = (" A fresh one is on its way now with piper "
+                               "voices - not the best idea, better than no "
+                               "segment.")
+                else:
+                    _queued = " A fresh one is on its way now."
+                fire_and_forget(prep_one(road))
+            else:
+                _queued = (" The writing desk is busy, so it is owed "
+                           "rather than started - live work comes first.")
+        except Exception:  # noqa: BLE001
+            _queued = ""
         if got:
             pipeline_log("lookahead",
-                         f"(#1073) {SHELF_LABEL.get(road, road)}: no time "
-                         "to write one, so a prepared take covers it and a "
-                         "fresh one is queued for next time")
+                         f"(#1073/#1092) {SHELF_LABEL.get(road, road)}: no "
+                         "time to write one, so a prepared take covers it."
+                         + _queued)
             return True
         pipeline_log("lookahead",
-                     f"(#1073) {SHELF_LABEL.get(road, road)}: no time to "
-                     "write one AND nothing on the shelf - the record runs "
-                     "on. It is first in the queue from here")
+                     f"(#1073/#1092) {SHELF_LABEL.get(road, road)}: no time "
+                     "to write one AND nothing on the shelf - the record "
+                     "runs on." + _queued)
         return False
     except Exception:  # noqa: BLE001
         return False
+
+
+# --- AUTHORISING AN EMERGENCY TAKE (#1092) ----------------------------
+# #1087 routes a line to piper when the COMMITMENT BOARD has committed
+# the segment to an emergency take. That is the right mechanism for work
+# the board planned, and it is unreachable from cover_now, which is the
+# one place that knows a segment is about to arrive with nothing for it
+# and no time to make one properly.
+#
+# So: an explicit authorisation, by road, that expires. Granted only
+# where a hole is otherwise certain, and only for the seats nobody has
+# an ear for - never the presenters.
+_PIPER_OK: dict[str, float] = {}
+PIPER_OK_FOR = 900.0
+
+
+def piper_authorise(road: str, secs: float = PIPER_OK_FOR) -> None:
+    """This road may render on piper for a while - a hole is the
+    alternative."""
+    try:
+        _PIPER_OK[str(road)] = time.time() + max(60.0, float(secs))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def piper_authorised(who: str) -> bool:
+    """Is this seat covered by a live authorisation?
+
+    By ROAD, matched to a seat by prefix, so authorising `caller` covers
+    the `caller2` chair without a second table to keep in step - which
+    is the seat-versus-road mismatch #1087 carries."""
+    try:
+        now = time.time()
+        seat = str(who or "")
+        if not seat:
+            return False
+        for road, until in list(_PIPER_OK.items()):
+            if float(until or 0) <= now:
+                _PIPER_OK.pop(road, None)
+                continue
+            if seat == road or seat.startswith(road):
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
 
 
 # --- COVERAGE ON A TIMER, NOT A PAGE VIEW (#1091) ---------------------
@@ -25062,6 +25146,12 @@ def surplus_state() -> dict[str, Any]:
         "callers_loud": got > 0.15,
         "callers_unhinged": got > 0.55,
         "topics_held": len(read_bombshells() or []),
+        # #1092: roads currently cleared for an emergency take, and how
+        # much longer each clearance lasts.
+        "piper_authorised": {
+            k: round(max(0.0, float(v) - time.time()), 1)
+            for k, v in sorted(_PIPER_OK.items())
+            if float(v or 0) > time.time()},
         # #1087: what an emergency take is currently believed to cost,
         # and whether that is measured yet or still my arithmetic.
         "piper_takes": {
