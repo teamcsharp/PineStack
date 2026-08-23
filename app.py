@@ -45833,6 +45833,16 @@ def quota_behind(kind: str, dj: dict[str, Any] | None = None) -> bool:
     never smaller than the count inside the current clock hour, so this
     can only under-report being behind. It will not invent a deficit."""
     try:
+        # #1124: A STATION THAT IS NOT AIRING IS NOT BEHIND. This counts
+        # AIRINGS against the hour's pace, and off air nothing airs by
+        # design - so every road read "behind, due now" through a
+        # deliberate pause while the cupboard held twenty-three minutes
+        # of finished manager audio and twenty-nine of caller. The
+        # operator read that as the scheduler being scant; it was the
+        # scheduler reporting a shortage of BROADCASTS, correctly, in
+        # the one situation where that is the intended state.
+        if radio_paused():
+            return False
         target = quota_target(kind, dj)
         if target <= 0:
             return False
@@ -45846,6 +45856,10 @@ def quota_behind(kind: str, dj: dict[str, Any] | None = None) -> bool:
 def quota_due(kind: str, dj: dict[str, Any] | None = None) -> bool:
     """Is one of these OWED right now?
 
+    #1124: never while the station is off air - nothing can be owed a
+    slot that is not going to happen, and saying otherwise made a paused
+    station report every road as due.
+
     Due when the rolling hour is short of its target AND enough time has
     passed since the last one. Target spacing is 3600/target seconds with
     tolerance, because opportunities are DISCRETE: records end when they
@@ -45854,6 +45868,8 @@ def quota_due(kind: str, dj: dict[str, Any] | None = None) -> bool:
     behind pace the spacing requirement collapses to a third (never below
     QUOTA_MIN_GAP), which is the catch-up the modulo never had."""
     try:
+        if radio_paused():
+            return False                  # #1124
         target = quota_target(kind, dj)
         if target <= 0:
             return False        # dial off: the old counter owns this road
@@ -45898,6 +45914,10 @@ def quota_state() -> dict[str, Any]:
                 "clamped": bool(_asked and _room and _room < _asked),
                 "behind": quota_behind(kind, dj),
                 "due": quota_due(kind, dj),
+                # #1124: so the panel can say WHY the count is nought
+                # instead of leaving the operator to read a full
+                # cupboard as an empty one.
+                "off_air": bool(radio_paused()),
                 "since": round(time.time() - last, 1) if last else None,
                 "spacing": round(3600.0 / target) if target else 0,
             }
