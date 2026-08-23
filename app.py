@@ -533,6 +533,11 @@ DEFAULT_DJ = {
     # records and adverts rather than in the silence after them.
     "dialogue_prefill": True,
     "dialogue_reserve_target": 6,   # #786: was 4 — deeper written lookahead
+    # #1096: how many records deep track talk is written. track_talk_ahead()
+    # has read this since it was written and it was never in the settings,
+    # so the constant always won. It became a dial worth having when #1090
+    # made track talk schedulable - the cheapest road on the board.
+    "track_talk_ahead": 10,
     # #842: how many HOURS of finished audio to keep standing by. Depth in
     # ROUNDS says nothing about whether the station can keep talking; this
     # is the number the operator actually asked in — "an hour, 2 hours or
@@ -1294,6 +1299,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         **_dj_range(raw_dj, "banter_min_lines", "banter_max_lines", 2, 20),
         "dialogue_prefill": bool(raw_dj.get(
             "dialogue_prefill", DEFAULT_DJ["dialogue_prefill"])),
+        "track_talk_ahead": max(1, min(40, int(                  # #1096
+            raw_dj.get("track_talk_ahead",
+                       DEFAULT_DJ["track_talk_ahead"]) or 10))),
         "dialogue_reserve_target": max(1, min(12, int(
             raw_dj.get("dialogue_reserve_target",
                        DEFAULT_DJ["dialogue_reserve_target"]) or 1))),
@@ -23733,6 +23741,17 @@ def orch_apply(does: str) -> str:
             if arg == "easy":
                 dj["dj"]["crystal_tint_model"] = ""
             save_settings(dj)
+            # #1096: ...AND THE BUDGET. tint_budget() has read
+            # orch_policy("tint_share") since it was written and nothing
+            # has ever written that key, so the share was the 0.30
+            # constant whatever anybody answered. "Keep it on
+            # everything" now means the rewrite may spend up to 45% of
+            # the hour's model time; "off" means none.
+            _share = {"full": 0.45, "easy": TINT_SHARE,
+                      "off": 0.0}.get(arg)
+            if _share is not None:
+                _ORCH["policy"]["tint_share"] = {
+                    "value": float(_share), "at": time.time()}
             said = {"full": "the crystal tints everything",
                     "easy": "the crystal tints on the fast model",
                     "off": "the second pass is off"}.get(arg, "")
@@ -25339,6 +25358,16 @@ def hour_owes() -> list[dict[str, Any]]:
                 "kind": prep, "label": str(row.get("label") or kind),
                 "entries": 0, "held": 0})
             seat["entries"] += 1
+            # #1096: and the seconds actually behind that road. This was
+            # created as 0 and never written again - the same shape as
+            # the bug #1086 fixed in this very function. The number has
+            # been in hour_needs_now() all along.
+            try:
+                seat["held"] = round(float(
+                    ((hour_needs_now() or {}).get(prep)
+                     or {}).get("held") or 0), 1)
+            except Exception:  # noqa: BLE001
+                pass
         # How many entries of that kind the hour holds in total, so
         # "two of two unmade" reads differently from "one of six".
         try:
