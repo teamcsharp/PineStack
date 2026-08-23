@@ -25146,6 +25146,14 @@ def surplus_state() -> dict[str, Any]:
         "callers_loud": got > 0.15,
         "callers_unhinged": got > 0.55,
         "topics_held": len(read_bombshells() or []),
+        # #1093: what the hour has given back to the records, and what
+        # is left to give.
+        "ballast": {
+            "budget_minutes": round(ballast_budget(), 1),
+            "spent_minutes": round(ballast_spent(_sched_hour_key()), 1),
+            "swaps": [{"kind": v.get("kind"), "why": v.get("why"),
+                       "minutes": v.get("minutes")}
+                      for v in _BALLAST_DONE.values() if v.get("swap")][-6:]},
         # #1092: roads currently cleared for an emergency take, and how
         # much longer each clearance lasts.
         "piper_authorised": {
@@ -30721,6 +30729,166 @@ def _schedule_prompt_clause() -> str:
         return ""
 
 
+# --- GIVING AIRTIME BACK TO THE RECORDS (#1093) -----------------------
+# The actuator behind `ballast_minutes`, `thin_road` and `when_empty` -
+# three keys the questionnaire has been writing since #1056 that nothing
+# has ever read. They answer the worst condition the station can be in,
+# and orch_decide_alone's default answer to that condition was a write
+# to a dead key.
+#
+# The decision is RECORDED PER ENTRY, not recomputed: schedule_take() is
+# read by the panel poll and the coordinator as well as by the show, so
+# anything that spent a budget in there would have it spent by people
+# looking at the station. That is the fault #1091 took out of cover_now,
+# and it would have arrived here by a different road.
+_BALLAST_DONE: dict[str, dict[str, Any]] = {}
+BALLAST_CAP_MINUTES = 9.0               # three ordinary entries
+BALLAST_NEVER = ("record", "recap", "banter", "banter_caller")
+
+
+def ballast_budget() -> float:
+    """Minutes of the hour that may be given back to records."""
+    try:
+        got = orch_policy("ballast_minutes")
+        if got is not None:
+            mins = float(got)
+            if mins > 0:
+                return max(0.0, min(30.0, mins))
+            if mins < 0:
+                return 0.0              # the operator wants LESS record
+    except Exception:  # noqa: BLE001
+        pass
+    return BALLAST_CAP_MINUTES
+
+
+def ballast_spent(hour: str) -> float:
+    """Minutes already given back this hour."""
+    try:
+        return sum(float(v.get("minutes") or 0)
+                   for k, v in _BALLAST_DONE.items()
+                   if v.get("swap") and str(v.get("hour")) == str(hour))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def ballast_swap(slot: dict[str, Any], hour: str,
+                 idx: int) -> dict[str, Any]:
+    """#1093: does this entry give its airtime back to a record?
+
+    Answered ONCE per entry per hour and remembered, so a panel poll
+    cannot spend the hour's ballast by asking."""
+    try:
+        kind = str(slot.get("kind") or "")
+        key = f"{hour}:{idx}:{slot.get('id') or kind}"
+        done = _BALLAST_DONE.get(key)
+        if done is not None:
+            return dict(done.get("slot") or {}) if done.get("swap") else {}
+
+        def remember(swap: bool, why: str = "",
+                     made: dict[str, Any] | None = None) -> dict[str, Any]:
+            _BALLAST_DONE[key] = {"swap": swap, "why": why, "hour": hour,
+                                  "at": time.time(), "kind": kind,
+                                  "minutes": (float(slot.get("minutes") or 0)
+                                              if swap else 0.0),
+                                  "slot": made or {}}
+            if len(_BALLAST_DONE) > 400:        # a walk, not a leak
+                for old in list(_BALLAST_DONE)[:200]:
+                    _BALLAST_DONE.pop(old, None)
+            return dict(made or {}) if swap else {}
+
+        # The master switch. `live` is exactly the behaviour that shipped
+        # before this: an empty entry is written live whatever the clock
+        # says.
+        if str(orch_policy("when_empty") or "") == "live":
+            return remember(False, "the operator writes empty entries live")
+        if kind in BALLAST_NEVER or kind in CANNOT_PREPARE:
+            return remember(False, "the spine does not give way")
+        road = str(SCHED_PREP_KIND.get(kind) or kind)
+        if road not in ALT_PREP_KINDS:
+            return remember(False, "not a road that can be prepared")
+        try:
+            if str(orch_policy("prefer_road") or "") in (kind, road):
+                return remember(False, "the operator protects this road")
+        except Exception:  # noqa: BLE001
+            pass
+        # Is anything actually ready for it? An entry with material airs
+        # its material - converting one that had something would throw
+        # the something away.
+        try:
+            ready = len([w for w in (slot_supply().get(road) or [])
+                         if w <= 0])
+        except Exception:  # noqa: BLE001
+            ready = 1                   # any doubt: leave the entry alone
+        if ready:
+            return remember(False, f"{ready} ready - it airs")
+        # Is the hour actually in trouble?
+        try:
+            short = float((hour_ballast() or {}).get("need") or 0)
+        except Exception:  # noqa: BLE001
+            short = 0.0
+        try:
+            asked = float(orch_policy("ballast_minutes") or 0)
+        except Exception:  # noqa: BLE001
+            asked = 0.0
+        if short <= 0 and asked <= 0:
+            return remember(False, "the hour is makeable as it stands")
+        # thin_road names who gives way first; anyone may if it is unset.
+        try:
+            thin = str(orch_policy("thin_road") or "")
+        except Exception:  # noqa: BLE001
+            thin = ""
+        if thin and thin not in (kind, road):
+            return remember(False, f"{thin} gives way before this one")
+        mins = max(0.25, float(slot.get("minutes") or 3))
+        budget = ballast_budget()
+        used = ballast_spent(hour)
+        if used + mins > budget:
+            return remember(False, f"the hour's {int(budget)} minutes of "
+                                   "ballast are spent")
+        # It gives way. Queue the work so the entry that stood down this
+        # hour has something ready the next - degrading, not decaying.
+        try:
+            if not _OLLAMA_GATE.locked():
+                fire_and_forget(prep_one(road))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            arrears_note(road, "gave its airtime back to a record - the "
+                               "hour could not be made")
+        except Exception:  # noqa: BLE001
+            pass
+        made = dict(slot)
+        made["kind"] = "record"
+        made["label"] = (f"{slot.get('label') or kind} — a record instead "
+                         "(nothing ready, the hour is over)")
+        made.pop("prompt_id", None)
+        made["ballast_for"] = road
+        pipeline_log(
+            "lookahead",
+            f"(#1093) {SHELF_LABEL.get(road, road)} has nothing ready and "
+            f"the hour is {int(short)}s over — it gives its "
+            f"{int(mins)} minutes back to a record, and a fresh one is "
+            f"queued. {int(budget - used - mins)} minutes of ballast left "
+            "this hour",
+            extra=("GIVING AIRTIME BACK TO THE RECORDS (#1093)\n\n"
+                   "An hour is only makeable if the airtime that costs "
+                   "nothing to produce covers the airtime somebody has "
+                   "to write first. This hour's does not, and no amount "
+                   "of scheduling fixes that - only airtime that costs "
+                   "nothing to make.\n\nThis entry had nothing ready "
+                   "and no repeat to fall back on, so rather than "
+                   "scramble a live write that would arrive late and "
+                   "make the NEXT entry late too, the record keeps the "
+                   "air and the segment is queued properly for next "
+                   "time.\n\nBounded: at most " + str(int(budget))
+                   + " minutes an hour, never banter, never a road the "
+                   "operator has protected, and never an entry that had "
+                   "something to air."))
+        return remember(True, "gave way to a record", made)
+    except Exception:  # noqa: BLE001
+        return {}                       # any doubt: the sheet stands
+
+
 def schedule_take() -> dict[str, Any]:
     """The entry that owns the air right now — and the round it names.
 
@@ -30800,6 +30968,22 @@ def schedule_take() -> dict[str, Any]:
             else:
                 idx, started = 0, now
         slot = dict(slots[idx])
+        # #1093: ...unless the hour cannot be made and this entry has
+        # nothing to air, in which case it gives its airtime back to a
+        # record and the segment is queued for next time. Answered once
+        # per entry and remembered - this function is read by the panel
+        # poll too, and a decision recomputed on every read would be a
+        # decision made by whoever happened to be looking.
+        #
+        # The POSITION is deliberately left alone: the hour keeps its
+        # shape, the entry comes round again next hour, and only this
+        # airing of it stands down.
+        try:
+            _ball = ballast_swap(slot, stamp or _sched_hour_key(), idx)
+            if _ball:
+                slot = _ball
+        except Exception:  # noqa: BLE001
+            pass
         # Whether this is the FIRST round of this entry — the needle road
         # drops one record when its entry begins, not one every breath.
         _RADIO["sched_first"] = (
