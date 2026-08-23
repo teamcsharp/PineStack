@@ -9911,7 +9911,12 @@ SHELF_CAPS = {"ad": 8, "station_id": 12, "manager": 8, "caller": 8,
               # stocked: news goes off, so prep_news() writes one only
               # when the running order is about to want it and never
               # builds a backlog of yesterday's page.
-              "news": 1}
+              # #1126: six, to hold what NEWS_FRESH_EVERY produces across
+              # a three-hour life. It was ONE because a bulletin died at
+              # thirty minutes and a backlog was yesterday's front page;
+              # with a three-hour life the cap is what binds, and #1125's
+              # owed-clamp reads this cap, so the two stay consistent.
+              "news": 6}
 # #957: how far past the row cap a road may stock when the running
 # order genuinely owes it that much airtime. The cap stops one content
 # type eating the allowance; this says the cap is a CEILING, not the
@@ -10038,8 +10043,13 @@ def shelf_cap(kind: str) -> int:
 # thrown away after one hearing. A banter round that worked is worth
 # hearing twice far more than a banter round that failed is worth
 # attempting again.
+# #1126: ...AND NEWS, now that a bulletin lives three hours and is
+# re-topped on the way out. "Repeat only if nothing fresher" is exactly
+# what this buys: shelf_take already sorts unaired rows first, so an
+# aged bulletin is reached only when there is no new one - which is the
+# alternative to a hole, and the operator's own words.
 SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id", "caller",
-                  "banter")
+                  "banter", "news")
 # How long an aired item rests before it may go out again. The operator
 # asked for three hours.
 SHELF_REUSE_REST = float(os.getenv("SHELF_REUSE_REST", "10800"))
@@ -10078,6 +10088,45 @@ _REPEAT_STALE = re.compile(
     r"o.?clock|minutes? past|half past|quarter (to|past)|"
     r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
     r"yesterday|tomorrow|breaking|live)\b", re.I)
+
+
+async def news_retop(text: str) -> str:
+    """#1126: an aged bulletin, told the truth about its own age.
+
+    A three-hour-old bulletin says "breaking" and "this morning", and
+    repeat_safe() rejects precisely those words - which is why news
+    could not simply be added to SHELF_REUSABLE. This rewrites the time
+    references on the way out and nothing else: the facts, the names and
+    the order of the stories are left exactly as they were.
+
+    One small model call, on the cheap model, because it is a handful of
+    substitutions rather than a piece of writing. Any failure returns the
+    text unchanged - a bulletin that sounds slightly stale is a bulletin;
+    a bulletin that does not arrive is a hole."""
+    said = str(text or "").strip()
+    if not said:
+        return said
+    try:
+        got = await ask_model(
+            "This news copy was written a while ago and is about to be "
+            "read again. Rewrite ONLY its references to time so it is "
+            "true now: 'breaking' and 'just in' become 'earlier', 'this "
+            "morning' becomes 'earlier today', a named weekday becomes "
+            "'recently', and anything implying it happened moments ago "
+            "is softened. Change NOTHING else - keep every fact, name, "
+            "number and story in the same order, and keep the same "
+            "voice.\n\nReturn ONLY the rewritten copy.\n\n" + said[:2400],
+            limit=len(said) + 200, spice=0.2,
+            model=str(dj_settings().get("model_fast")
+                      or dj_settings().get("model") or ""),
+            mark={"kind": "news re-top",
+                  "for": "an aged bulletin going out again (#1126)"})
+        out = " ".join(str(got or "").split()).strip()
+        if out and len(out) > len(said) * 0.5:
+            return out
+    except Exception:  # noqa: BLE001
+        pass
+    return said
 
 
 def repeat_safe(kind: str, row: dict[str, Any]) -> bool:
@@ -14855,21 +14904,19 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
     ponytail: no pause, seek or volume on the box; the panel player has all
     three. Wire a real media_player entity in Home Assistant if you want
     transport control from the box itself."""
-    # #1115: OFF AIR MEANS NO SOUND. #1108 shut the door on SPEECH -
-    # dj_speak returns before it does anything - and left the records
-    # running, because the music road never asked. Measured live: the
-    # operator paused, and twenty-one minutes later a track was still
-    # playing out of the box with the station banking happily behind it.
+    # #1127: AND MUSIC PLAYS WHILE PAUSED. #1115 shut this door too,
+    # which made a paused station completely silent - and what was asked
+    # for is a station that plays records and does not TALK. The pause
+    # is a silenced booth, not a silenced station.
     #
-    # Gated HERE rather than at the nine call sites, because "which
-    # caller did I miss" is exactly the question #1108 got wrong. This
-    # is the one door music takes to the speaker.
+    # The two roads never touch: this posts media_player/play_media to
+    # Home Assistant itself, while every voice clip goes through
+    # _play_on_box, which is where the pause belongs and stays.
     #
-    # NOT home_assistant_say: that is the ASSISTANT's voice, and #647
-    # deliberately keeps it answering with the show off the box. Pausing
-    # the broadcast must never stop the Pine Box replying to you.
-    if radio_paused():
-        return ""
+    # It is also the better answer for the orchestrator: a record is the
+    # cheapest airtime on the station and the only kind that costs
+    # nothing to produce, so a paused station that keeps spinning them
+    # is covering its own air for free while the booth banks.
     if not box_talk_ok():
         return ""                    # switched off at the top (#638)
     token, player = _ha_creds()
@@ -15955,13 +16002,8 @@ async def _radio_loop() -> None:
     so the box can drift a few seconds either way on untagged files."""
     try:
         while _RADIO["station"]:
-            # #1116: off air, the queue does not walk. Without this the
-            # loop keeps advancing through records nobody can hear, so
-            # coming back on lands in the middle of a run the operator
-            # never heard the start of.
-            if radio_paused():
-                await asyncio.sleep(5)
-                continue
+            # #1127: the queue walks while paused, because the records
+            # are what is still being broadcast. Only the booth is quiet.
             track = radio_next_track()
             if not track:
                 break
@@ -18729,12 +18771,11 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
 
 async def _dj_loop() -> None:
     """The show. Talk, play, sometimes talk over it, repeat."""
-    # #1116: off air, the show's own record road holds as well. #1115
-    # shut the door music takes to the speaker; this stops the loop
-    # walking the queue and burning records nobody can hear.
+    # #1127: the show's record road turns while paused. #1116 parked it
+    # on the reading that a paused station is silent; it is not - it
+    # plays records and does not talk.
     async def _dj_hold() -> None:
-        while radio_paused():
-            await asyncio.sleep(5)
+        return
     skip = asyncio.Event()
     _DJ_SKIP.append(skip)
     played = 0
@@ -21348,7 +21389,16 @@ async def prep_gallery() -> bool:
 # news entry is worked in deadline order beside everything else instead
 # of on a private timer that knew nothing about the rest of the hour.
 NEWS_PREP_AHEAD = 1500.0                # write them only this close to it
-NEWS_PREP_LIFE = 1800.0                 # and never air one older than this
+# #1126: THREE HOURS, at the operator's instruction. Thirty minutes made
+# news the most expensive road on the station - 3,721 seconds of room an
+# hour that could never be repeated, against an hour that holds 3,600.
+# A bulletin that lives three hours and is re-topped on the way out is
+# the single change that makes the running order affordable.
+NEWS_PREP_LIFE = 10800.0                # and never air one older than this
+# How often a genuinely NEW bulletin is written. The front page churns
+# every DRUDGE_TTL (ten minutes), so six across the three-hour window is
+# well inside what the wire can supply.
+NEWS_FRESH_EVERY = 1800.0
 NEWS_ROUND_SECONDS = 80.0               # what one bulletin is worth on air
 NEWS_SHELF_MOST = 6                     # never a backlog of yesterday
 _NEWS_WANT: dict[str, float] = {"at": 0.0, "secs": 0.0}
@@ -22303,18 +22353,16 @@ def radio_pause_set(on: bool) -> bool:
                 _LAST_PLAYOUT["at"] = time.time()
             except Exception:  # noqa: BLE001
                 pass
-        # #1116: AND WHAT IS ALREADY SOUNDING STOPS. #1115 shut the door
-        # music takes to the speaker, which stops the NEXT track and does
-        # nothing about the one already handed over - the box holds the
-        # file and plays it to the end. Measured: the operator paused and
-        # was still hearing records twenty-one minutes later.
+        # #1127: pausing stops the LINE that is mid-announce - which is
+        # the thing being paused - and leaves the record alone. #1116
+        # cleared _RADIO["now"] as well, on the reading that a paused
+        # station is silent; under the corrected rule that record is
+        # exactly what should keep playing.
         if on:
             try:
                 fire_and_forget(stop_speaking())
             except Exception:  # noqa: BLE001
                 pass
-            _RADIO["now"] = None
-            _RADIO["started"] = 0.0
         try:
             PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
             PAUSE_PATH.write_text(json.dumps(
@@ -64480,14 +64528,8 @@ async def radio_next_api(
     """What the panel player pulls when a track ends, so the browser can run
     the same station without the box being involved."""
     require_read_auth(authorization)
-    # #1108: OFF AIR. The rooms are still working; the air is not. Said
-    # plainly so the player holds instead of pulling the next track and
-    # walking the queue forward through a pause.
-    if radio_paused():
-        return {"paused": True, "off_air": True,
-                "for_seconds": round(radio_paused_for(), 1),
-                "say": "the station is off air - the booth is still "
-                       "recording, and this picks up where it left off"}
+    # #1127: the app is fed its music while paused. Only the BOOTH is
+    # off - /api/dj/voice is what goes empty, and it still does.
     # While the DJ is on air he owns the running order. A browser asking for
     # "next" here would consume a second track and the show would appear to
     # skip — so hand back what is actually playing instead (#122).
