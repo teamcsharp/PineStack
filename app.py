@@ -6777,6 +6777,13 @@ async def dialogue_watchdog() -> None:
         try:
             if not _RADIO.get("on") or not box_talk_ok():
                 continue
+            # #1131: off air, nobody has said a host line ON PURPOSE. A
+            # paused station always reads "quiet seven minutes", so this
+            # ran the deep repair - which presses the box's restart
+            # button - twice in one pause, then drove writes and renders
+            # into a box that declined every one.
+            if radio_paused():
+                continue
             if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
                 continue                     # the box is not the audience
             now = time.time()
@@ -6821,6 +6828,12 @@ async def onair_watchdog() -> None:
             if not (_RADIO.get("on") and box_talk_ok()
                     and (_RADIO.get("voice_to") or "box") in ("box",
                                                               "both")):
+                continue
+            # #1131: same stand-down as the dialogue watchdog. "FM ON
+            # means AUDIBLE" is the right rule for a broadcasting
+            # station; a paused one is inaudible by instruction, and
+            # this one's ladder ends at the device's restart button.
+            if radio_paused():
                 continue
             quiet = time.time() - _BOX_LAST_OK[0]
             if quiet < 600:
@@ -12118,6 +12131,20 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
         # separate investigations into why track_talk reads zero, each
         # ending in a guess. The board answers for itself from here.
         _off: dict[str, str] = {}
+        # #1131: the roads the HOUR is short of, asked once per pass. The
+        # four-hour commitment sheet walks the schedule clock, and off
+        # air that clock is FROZEN - so once its window reads "assigned"
+        # it refuses every write for the whole pause, while
+        # hour_short_kinds() names the starving roads every six seconds.
+        # Measured: the engine and the model both idle 54% of a
+        # 32-minute banking window, zero ledger attempts on every board
+        # road but one. Off air, the hour's own shortfall outranks a
+        # frozen sheet; on air the commitment ledger keeps its authority.
+        try:
+            _short_now = (set(hour_short_kinds() or ())
+                          if radio_paused() else set())
+        except Exception:  # noqa: BLE001
+            _short_now = set()
         for kind in order:
             if kind in skip:
                 _off[kind] = "already tried this pass"
@@ -12127,6 +12154,8 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                 _needs_script = commitment_write_needed(kind)
                 _can_finish_here = (kind in ("ad", "station_id", "track_talk")
                                     and bool(_assigned_unready))
+                if kind in _short_now:
+                    _needs_script = True        # #1131: the hour says so
                 if not _needs_script and not _can_finish_here:
                     _off[kind] = ("every second owed in the next four hours "
                                   "is already assigned to FIFO stock")
@@ -19880,6 +19909,14 @@ async def _replay_held(clip: dict[str, Any]) -> bool:
                           "replay", str(clip.get("text") or ""),
                           "", "", "held")
     try:
+        # #1131: OFF AIR, THE KNOCK WAITS. The #1117 gate makes
+        # _play_on_box return "" while paused, so every knock below
+        # counted as a FAILED TRY and #854 released the clip after
+        # three - eleven finished renders destroyed in thirty minutes by
+        # two correct rules interacting. A held clip is exactly the
+        # material the pause exists to keep; it plays on resume.
+        if radio_paused():
+            return False
         _rt0 = time.time()
         if not await _play_on_box(clip["path"], clip["sig"], replay=True):
             # #854: THREE TRIES, then the head clip stops being the
@@ -24163,8 +24200,17 @@ async def pantry_keeper() -> None:
                 # banter is nearly free.
                 _before = int(_entry.get("made") or 0)
                 try:
-                    _ok = await prep_measure("banter",
-                                             larder_prepare(_entry))
+                    # #1131: A VISIT THAT MADE PROGRESS IS NOT A FAILURE.
+                    # larder_prepare returns True only when the WHOLE
+                    # round finished, and a partial round is the normal
+                    # outcome (#978's own words) - so the ledger booked
+                    # 1,927 "failures" in 2,390 banter attempts, 80.6%,
+                    # and the planner prices the road off that number.
+                    async def _banter_work(_e=_entry, _b=_before):
+                        _full = await larder_prepare(_e)
+                        return bool(_full
+                                    or int(_e.get("made") or 0) > _b)
+                    _ok = await prep_measure("banter", _banter_work())
                 finally:
                     _PREP_DEADLINE[0] = 0.0
                 # #1122: ONE REFUSED ROUND MUST NOT JAM THE ONES BEHIND
@@ -30618,6 +30664,30 @@ def hour_needs() -> dict[str, dict[str, float]]:
                     _durations = _entry_seconds * max(1, int(round(hours)))
                     held = sum(_durations[:len(_pairs)])
                     rows = [dict(p.get("row") or {}) for p in _pairs]
+                except Exception:  # noqa: BLE001
+                    pass
+            # #1132: TWO INVENTORIES HAD LEARNED TO DISAGREE. Another
+            # session built dialogue_stock_items() as the common FIFO
+            # inventory - its own docstring: "none of those systems may
+            # count or work a different pile any more" - and moved the
+            # ad, gallery and news stock into shapes this function's raw
+            # _SHELF walk no longer recognises. Measured: the recording
+            # room held ad 166s, gallery 472s and news mid-recording
+            # while this read held=0 rows=0 on all three - so the
+            # operator's scheduler panel cried famine over a stocked
+            # cupboard, and the #1130 ordering chased roads that were
+            # already covered.
+            #
+            # The common inventory is consulted as the FALLBACK when the
+            # old walk finds nothing, so the roads it already counts
+            # correctly (caller, manager, banter) are untouched.
+            if not rows:
+                try:
+                    _items = dialogue_stock_items(road, True)
+                    rows = list(_items)
+                    held = sum(float(i.get("audio_seconds")
+                                     or i.get("seconds") or 0)
+                               for i in _items if i.get("ready"))
                 except Exception:  # noqa: BLE001
                     pass
             out[road]["held"] = round(held, 1)
