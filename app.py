@@ -547,7 +547,7 @@ DEFAULT_DJ = {
     # #896: an hour and a half, in the operator's words, and the
     # horizon BURNS — material past it is not merely un-built, it is
     # rolled off oldest-first as new material lands. See pantry_burn.
-    "prepare_hours": 1.5,
+    "prepare_hours": 4.0,
     # How much of the talk comes out of the speakbox documents, 0 to 1.
     # Raised with the gallery governor (#646): the wall was eating the show,
     # and the documents are what it is supposed to be made of.
@@ -877,6 +877,10 @@ DEFAULT_DJ = {
     # and either one chosen (#1016). Off, the tint rides in the first
     # prompt as a clause, which is what it has always done.
     "crystal_tint_pass": True,
+    # The schedule-critical second pass uses this smaller writer so the
+    # coming horizon can be completed before optional cupboard polish uses
+    # the expensive model below. Empty falls back to the station writer.
+    "model_fast": "",
     # #1036: the model the TINTING pass uses. Empty means the station's
     # own. It runs on the banking road, never on the live path, so it can
     # afford a far better model than the show can - and rewriting in a
@@ -1501,6 +1505,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             DEFAULT_DJ["speakbox_evict_lyrics"])),
         "crystal_tint_pass": bool(raw_dj.get(                       # #1006
             "crystal_tint_pass", DEFAULT_DJ["crystal_tint_pass"])),
+        "model_fast": str(raw_dj.get(
+            "model_fast", DEFAULT_DJ["model_fast"]) or "")[:80],
         "crystal_tint_model": str(raw_dj.get(                       # #1036
             "crystal_tint_model",
             DEFAULT_DJ["crystal_tint_model"]) or "")[:80],
@@ -4254,7 +4260,7 @@ async def comfy_idle_clock() -> None:
 
 
 @app.on_event("startup")
-async def _startup_sfx_pool() -> None:
+async def _startup_sfx_prime() -> None:
     """#862: fill the sample pool at boot. It used to fill only on the
     first sting_due that found the cache stale, so the opening stretch
     of every session had no stings at all — and when the share was
@@ -9674,6 +9680,145 @@ def box_depth() -> float:
         return 0.0
 
 
+def _pantry_key_ready(key: str) -> bool:
+    """A referenced take still exists, without mutating its use counter.
+
+    pantry_get() is deliberately stateful and calls pantry_spoken_now() as
+    part of expiry. Readiness is itself used to calculate what is spoken
+    for, so using pantry_get here would recurse and would make opening a
+    status panel consume a take. A shelf reference protects a clip from
+    age expiry; only the row and the file have to still exist.
+    """
+    try:
+        row = _PANTRY.get(str(key or "")) or {}
+        if not row:
+            return False
+        clip = row.get("clip") or {}
+        name = str(clip.get("path") or "").rsplit("/", 1)[-1]
+        name = name.split("?", 1)[0]
+        return bool(name and (VOICE_MEDIA_DIR / name).exists())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def dialogue_entry(row: Any) -> dict[str, Any] | None:
+    """Return the conversation carried by either shelf-row shape."""
+    if not isinstance(row, dict):
+        return None
+    got = row.get("entry")
+    if isinstance(got, dict):
+        return got
+    if "script" in row and ("prep_kind" in row or "prep_turns" in row
+                            or "script_tinted" in row):
+        return row
+    return None
+
+
+def dialogue_tint_required() -> bool:
+    """Whether the operator's second pass is part of READY."""
+    try:
+        return bool(crystal_tint_two_pass())
+    except Exception:  # noqa: BLE001
+        return bool(dj_settings().get("crystal_tint_pass", True))
+
+
+def dialogue_tint_ready(kind: str, row: Any) -> bool:
+    """The active words have completed the second pass.
+
+    A stored alternative is not enough: if the plain version is active,
+    audio cut for it is not a tinted take. Quoted/very short turns are
+    deliberately preserved inside crystal_tint; completion is recorded on
+    the whole script once every eligible line has passed.
+    """
+    if not dialogue_tint_required():
+        return True
+    if not isinstance(row, dict):
+        return False
+    entry = dialogue_entry(row)
+    if entry is not None:
+        tinted = str(entry.get("script_tinted") or "").strip()
+        active = str(entry.get("script") or "").strip()
+        return bool(tinted and active == tinted
+                    and str(entry.get("use") or "tinted") == "tinted")
+    return bool(row.get("tint_ok") and str(row.get("text") or "").strip())
+
+
+def dialogue_audio_ready(kind: str, row: Any) -> bool:
+    """Every planned line has durable audio, not merely a useful opening."""
+    if not isinstance(row, dict):
+        return False
+    entry = dialogue_entry(row)
+    if entry is None:
+        if row.get("produced"):
+            return True
+        key = str(row.get("key") or "")
+        return bool(key and _pantry_key_ready(key))
+    try:
+        want = int(entry.get("chunks") or 0)
+        made = int(entry.get("made") or 0)
+        if want <= 0 or made < want or entry.get("partial"):
+            return False
+        keys = [str(k) for k in (entry.get("keys") or []) if str(k)]
+        keys += [str(t.get("key") or "") for t in (entry.get("takes") or [])
+                 if isinstance(t, dict) and str(t.get("key") or "")]
+        return bool(keys and all(_pantry_key_ready(k) for k in set(keys)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def dialogue_row_ready(kind: str, row: Any) -> bool:
+    """One authoritative zero-work-to-air predicate for scheduled stock."""
+    try:
+        if not isinstance(row, dict) or row.get("off_brief"):
+            return False
+        entry = dialogue_entry(row)
+        if entry is not None:
+            if entry.get("off_brief"):
+                return False
+            if not _larder_current(entry):
+                return False
+            # Phone calls are single-use performances, not generic dialogue.
+            # A legacy row without the persisted conversation/novelty grade
+            # must not slip through merely because its audio exists. The
+            # callable lookup keeps early module-load restoration safe: the
+            # call contract is defined later in this large module, before the
+            # service starts accepting work.
+            _call_gate = globals().get("call_entry_contract")
+            if (str(kind) == "caller" and callable(_call_gate)
+                    and not _call_gate(entry)):
+                return False
+        return (dialogue_tint_ready(kind, row)
+                and dialogue_audio_ready(kind, row))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def dialogue_row_viable(kind: str, row: Any) -> bool:
+    """Whether stored dialogue can still become READY without a rewrite.
+
+    Work that is merely waiting for tint or audio remains viable and counts
+    against a stocking cap. A failed segment brief or an obsolete writing
+    contract does not: those words may stay visible for diagnosis, but must
+    never prevent the scheduler from writing their replacement.
+    """
+    try:
+        if not isinstance(row, dict) or row.get("off_brief"):
+            return False
+        entry = dialogue_entry(row)
+        if entry is not None:
+            if entry.get("off_brief") or not _larder_current(entry):
+                return False
+            _call_gate = globals().get("call_entry_contract")
+            if (str(kind) == "caller" and callable(_call_gate)
+                    and not _call_gate(entry)):
+                return False
+            return bool(str(entry.get("script_plain")
+                            or entry.get("script") or "").strip())
+        return bool(str(row.get("text_plain") or row.get("text") or "").strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def pantry_spoken_for() -> set[str]:
     """Every pantry clip something is actually holding.
 
@@ -9685,16 +9830,63 @@ def pantry_spoken_for() -> set[str]:
     means when the horizon rolls."""
     held: set[str] = set()
     try:
-        for rows in _SHELF.values():
+        for kind, rows in _SHELF.items():
             for row in (rows or []):
-                held.update(_row_clip_keys(row))
+                # A viable partial recording is still paid-for material and
+                # must survive long enough for the remaining lines to finish.
+                # It does not count as COVER; prepared_seconds applies the
+                # stricter predicate below.
+                if dialogue_row_viable(str(kind), row):
+                    held.update(_row_clip_keys(row))
         for entry in list(_LARDER):
-            held.update(_row_clip_keys(entry))
+            if dialogue_row_viable("banter", entry):
+                held.update(_row_clip_keys(entry))
+        # Track links live beside the exact records they introduce rather
+        # than on _SHELF. Omitting them here made every successfully cut
+        # intro/send-off look like a loose render: horizon cleanup could
+        # discard it, prepared_seconds() credited the task with zero gain,
+        # and a restart brought back the WAV without the queue ownership.
+        # A written side is viable paid-for work even while its voice is
+        # unfinished, just like a partial round on the ordinary shelves.
+        for record in list((globals().get("_TRACK_TALK") or {}).values()):
+            if not isinstance(record, dict):
+                continue
+            for side in (record.get("intro"), record.get("outro")):
+                if (isinstance(side, dict)
+                        and str(side.get("text") or "").strip()):
+                    held.update(_row_clip_keys(side))
         for row in list(_BOX_HOLD):
             held.update(_row_clip_keys(row))
     except Exception:  # noqa: BLE001
         pass
     return held
+
+
+def pantry_ready_for() -> set[str]:
+    """Pantry keys attached to zero-work-to-air dialogue only."""
+    ready: set[str] = set()
+    try:
+        for kind, rows in _SHELF.items():
+            for row in (rows or []):
+                if dialogue_row_ready(str(kind), row):
+                    ready.update(_row_clip_keys(row))
+        for entry in list(_LARDER):
+            if dialogue_row_ready("banter", entry):
+                ready.update(_row_clip_keys(entry))
+        for record in list((globals().get("_TRACK_TALK") or {}).values()):
+            if not isinstance(record, dict):
+                continue
+            for side in (record.get("intro"), record.get("outro")):
+                try:
+                    if track_talk_part_ready(side):
+                        ready.update(_row_clip_keys(side))
+                except Exception:  # noqa: BLE001
+                    continue
+        for row in list(_BOX_HOLD):
+            ready.update(_row_clip_keys(row))
+    except Exception:  # noqa: BLE001
+        pass
+    return ready
 
 
 def prepared_seconds() -> float:
@@ -9707,7 +9899,7 @@ def prepared_seconds() -> float:
     holding."""
     total = 0.0
     try:
-        for key in pantry_spoken_for():
+        for key in pantry_ready_for():
             row = _PANTRY.get(key) or {}
             total += float((row.get("clip") or {}).get("seconds") or 0)
     except Exception:  # noqa: BLE001
@@ -9954,6 +10146,23 @@ def build_lift() -> float:
         return 1.0
 
 
+SCHEDULE_HORIZON_FLOOR_HOURS = 4.0
+
+
+def schedule_horizon_hours() -> float:
+    """Hours of exact schedule obligations the autonomous rooms must bank.
+
+    Four hours is the station guarantee. A larger operator setting is
+    honoured, but an older settings file carrying the former 1.5/3-hour
+    default cannot silently shrink the new scheduler after deployment.
+    """
+    try:
+        asked = float(dj_settings().get("prepare_hours") or 0)
+    except Exception:  # noqa: BLE001
+        asked = 0.0
+    return max(SCHEDULE_HORIZON_FLOOR_HOURS, min(24.0, asked))
+
+
 def larder_cap() -> int:
     """#1121: how many banter rounds may be banked.
 
@@ -9962,7 +10171,14 @@ def larder_cap() -> int:
     banking banter at twelve rounds and did nothing with the rest of the
     hour."""
     try:
-        return int(max(1, round(_LARDER_MAX * build_lift())))
+        # The hours dial is a storage promise as well as a work target. A
+        # three-hour reserve cannot survive in the old fourteen-row box:
+        # the first append after resume used to cut a paused 42-row build
+        # straight back to fourteen. Keep enough physical rows for the
+        # requested horizon whether the station is currently paused or on
+        # air; build_lift may still grant idle time extra headroom.
+        hours = max(1.0, prepare_target_seconds() / 3600.0)
+        return int(max(1, round(_LARDER_MAX * max(build_lift(), hours))))
     except Exception:  # noqa: BLE001
         return _LARDER_MAX
 
@@ -10021,10 +10237,10 @@ def shelf_cap(kind: str) -> int:
 # Deliberately NOT caller (a phone call replayed word for word is the one
 # repeat a listener would certainly catch) and NOT news (a bulletin goes
 # off; that is the whole reason its cap is 1).
-# #961/#1004: "caller" joined this list on the evidence of the road's own
-# report - the phone bled 446 SECONDS OF DEAD AIR in half an hour, it had
-# arrived at its own entry with nothing prepared twice in one session, and
-# its shelf stood at zero rows against 2040s owed.
+# #961/#1004 once put `caller` in this list to cover measured phone-segment
+# holes. The complete-call database makes that unacceptable: an identical
+# caller cannot ring back word for word without breaking the illusion, so the
+# orchestrator must solve phone debt by writing ahead, never by replaying it.
 #
 # The arithmetic behind that is not a bug anywhere; it is the box. One
 # phone call costs about 273s of room to build and buys about 96s of air -
@@ -10033,9 +10249,10 @@ def shelf_cap(kind: str) -> int:
 # for SEVENTEEN MINUTES of phone. Fresh, that is roughly forty-eight
 # minutes of room for one road out of eight, in an hour that has sixty.
 #
-# So a call segment cannot be filled with none but new calls, and the
-# choice is between a caller who rings back three hours later and four
-# minutes of silence. Nobody has ever complained about the first.
+# This makes the schedule physically overcommitted on one cloning room; it
+# does not make replaying a caller honest. Phone debt is paid ahead during
+# pause and reported as capacity debt when the room cannot make it. Other
+# explicitly reusable roads may cover themselves; calls remain single-use.
 # #1106: BANTER IS REUSABLE. Measured over 1,304 attempts it fails 891
 # times - 68% - for about 490 seconds an hour that buys nothing, and it
 # owns fifteen of the hour's sixty minutes. It was the one major road
@@ -10048,7 +10265,7 @@ def shelf_cap(kind: str) -> int:
 # what this buys: shelf_take already sorts unaired rows first, so an
 # aged bulletin is reached only when there is no new one - which is the
 # alternative to a hole, and the operator's own words.
-SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id", "caller",
+SHELF_REUSABLE = ("manager", "gallery", "ad", "station_id",
                   "banter", "news")
 # How long an aired item rests before it may go out again. The operator
 # asked for three hours.
@@ -10063,16 +10280,12 @@ SHELF_REUSE_MOST = 3
 # #1052: ...except for the EVERGREEN kinds. An advert and a painting
 # read name a product and a picture, not an hour - they are as true on
 # their sixth airing as their first, which is exactly what a pre-rolled
-# package is for. A phone call and a memo from upstairs are not: they
-# refer to a moment, and three is right for them.
+# package is for. A phone call is deliberately absent: it is a unique event,
+# not evergreen inventory. A memo from upstairs retains the ordinary limit.
 #
 # Three innings against a three-hour rest is one airing a shift, which
 # is not a cupboard, it is a souvenir.
-# #1055: ...and the calls, which were the biggest single debt left in
-# the hour. Guarded by repeat_safe below - a call that names tonight,
-# or the record that just played, is not evergreen however cheap it is.
-SHELF_REUSE_EVERGREEN = ("ad", "gallery", "station_id",
-                         "caller", "manager")
+SHELF_REUSE_EVERGREEN = ("ad", "gallery", "station_id", "manager")
 
 # #1055: words that tie a segment to the moment it was made. A repeat
 # carrying any of these cannot come back three hours later without
@@ -10270,6 +10483,8 @@ def shelf_unvoiced(kind: str) -> int:
     out = 0
     for row in rows:
         try:
+            if not dialogue_row_viable(str(kind), row):
+                continue
             if row.get("key") or row.get("produced"):
                 continue                # it has its audio
             if str(row.get("text") or ""):
@@ -10290,7 +10505,8 @@ def shelf_full(kind: str) -> bool:
             # A booth round's shelf IS the larder, and has been since
             # #349. The sheet can name `banter` now, so the question is
             # answered off the depth that genuinely exists.
-            return len(_LARDER) >= _LARDER_MAX
+            return sum(1 for e in _LARDER
+                       if dialogue_row_viable("banter", e)) >= larder_cap()
         if str(kind) == "news":
             _news_rows = shelf_rows("news")
             # A bulletin whose front page has moved on is dead weight:
@@ -10299,7 +10515,8 @@ def shelf_full(kind: str) -> bool:
             _news_rows[:] = [
                 r for r in _news_rows
                 if time.time() - float((r.get("entry") or {}).get(
-                    "prep_news_at") or 0) <= NEWS_PREP_LIFE]
+                    "prep_news_at") or 0) <= NEWS_PREP_LIFE
+                and dialogue_row_viable("news", r)]
             # #921: "ONE AT A TIME" WAS THE WHOLE TROUBLE. The News entry
             # on the canonical hour owns four minutes and one bulletin is
             # ninety seconds of it, so a shelf this function called FULL
@@ -10313,7 +10530,7 @@ def shelf_full(kind: str) -> bool:
                 # road is "full" so the adaptive planner never picks a
                 # task that could only refuse itself. See prep_news().
                 return True
-            if len(_news_rows) >= NEWS_SHELF_MOST:
+            if len(_news_rows) >= news_shelf_most():
                 return True             # deep enough; never a backlog
             return sum(float(r.get("seconds") or 0)
                        for r in _news_rows) >= _want
@@ -10353,7 +10570,8 @@ def shelf_full(kind: str) -> bool:
             return float(_need.get("held") or 0) >= _owed
     except Exception:  # noqa: BLE001
         return True
-    return len(shelf_rows(kind)) >= shelf_cap(kind)
+    return sum(1 for r in shelf_rows(kind)
+               if dialogue_row_viable(str(kind), r)) >= shelf_cap(kind)
 
 
 # #968: WHAT EACH SEGMENT PROMISED, AND WHETHER THE SCRIPT DELIVERS IT.
@@ -10641,6 +10859,11 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         except Exception:  # noqa: BLE001
             pass
         rows.append(row)
+        try:
+            _INVENTORY_PLAN["at"] = 0.0
+            _COMMITS["at"] = 0.0
+        except Exception:  # noqa: BLE001
+            pass
         # #926: the cap still holds and the oldest still goes first — but
         # never a candidate the owner has pinned to a coming hour while an
         # unpinned one is standing next to it. Falls back to the plain
@@ -10661,6 +10884,12 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
                 rows[:] = _safe + _rest
             except Exception:  # noqa: BLE001
                 del rows[:-max(1, shelf_cap(kind))]
+        # A newly accepted segment is a durable queue item, not merely
+        # process memory. larder_prepare saves its takes before this row
+        # exists; without a save here the shelf file remained one call behind
+        # until some unrelated later write, so a restart could lose the most
+        # recently completed call while the API had already called it READY.
+        _pantry_save(True)
     except Exception:  # noqa: BLE001
         pass
 
@@ -10681,25 +10910,21 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         # #977: FRESH FIRST, RESTED SECOND. A never-aired item always
         # goes before one that has been out, so reuse is what happens when
         # the desk is behind - never a substitute for writing.
-        _order = list(alt_take_order(kind, rows))
+        # A phone queue is a switchboard, not a picker. Calls air in the exact
+        # order the orchestrator accepted and stored them; pins and editorial
+        # priorities remain useful for every other candidate shelf but may not
+        # let a newer caller jump an older one.
+        if str(kind) == "caller":
+            _order = [row for _i, row in sorted(
+                enumerate(rows),
+                key=lambda pair: (float((pair[1] or {}).get("at") or 0),
+                                  pair[0]))]
+        else:
+            _order = list(alt_take_order(kind, rows))
         # #968: ON BRIEF FIRST. A round that never gets to the thing its
         # entry is for is still better than silence, so it is not thrown
         # away - it goes to the BACK, and anything that does the job goes
         # out ahead of it.
-        try:
-            _order.sort(key=lambda r: 1 if r.get("off_brief") else 0)
-        except Exception:  # noqa: BLE001
-            pass
-        if str(kind) in SHELF_REUSABLE:
-            # #1055: fresh first, then rested repeats - but AT RANDOM
-            # among the rested rather than strictly oldest-first, which
-            # deals the same rotation every time. The operator asked for
-            # the choice to be random; a cupboard that always deals off
-            # the top of the deck is a rota.
-            _order.sort(key=lambda r: (1 if r.get("aired_at") else 0,
-                                       int(r.get("aired") or 0),
-                                       random.random() if r.get("aired_at")
-                                       else float(r.get("at") or 0)))
         _why: list[str] = []                                   # #1003
         for row in _order:
             # #1089: ...unless it is a repeat, which the cupboard holds
@@ -10736,6 +10961,9 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             if shelf_cast_stale(row):                             # #1057
                 _why.append("recast")
                 continue            # made by a cast that has since changed
+            if not dialogue_row_ready(str(kind), row):
+                _why.append("not fully tinted and recorded")
+                continue
             key = str(row.get("key") or "")
             if key and not pantry_get(key):
                 _why.append("clip gone")
@@ -10745,7 +10973,8 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 _why.append("contract moved")
                 continue            # written against a contract that moved
             try:
-                if str(kind) in SHELF_REUSABLE:
+                if (str(kind) in SHELF_REUSABLE
+                        and repeat_safe(str(kind), row)):
                     # #977: KEPT, not consumed. It goes to the back of the
                     # shelf stamped with when it went out and how many
                     # times, and the sort above will not offer it again
@@ -10768,6 +10997,11 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             except Exception:  # noqa: BLE001
                 pass
             alt_took(kind, row)                                # #926
+            try:
+                _INVENTORY_PLAN["at"] = 0.0
+                _COMMITS["at"] = 0.0
+            except Exception:  # noqa: BLE001
+                pass
             return row
         # #1003: SAY WHY. A road that has prepared rounds standing by and
         # still writes a fresh one live is the single most expensive thing
@@ -10796,7 +11030,12 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             if time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
             # #977: and an item that has had all its airings is done, even
             # if the burn would still keep it.
-            and int(r.get("aired") or 0) < SHELF_REUSE_MOST]
+            and int(r.get("aired") or 0) < SHELF_REUSE_MOST
+            # A completed phone call is history, never stock.  Once-aired
+            # non-reusable rows left behind by an older build cannot occupy
+            # the queue or be offered as a "new" call after restart.
+            and (not float(r.get("aired_at") or 0)
+                 or str(kind) in SHELF_REUSABLE)]
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -10806,9 +11045,17 @@ def prepared_by_kind() -> dict[str, int]:
     """What is standing by, BY CONTENT TYPE — the answer to "what have we
     actually got ready", which one depth number never gave."""
     out: dict[str, int] = {
-        "banter": sum(1 for e in _LARDER if e.get("prepared"))}
+        "banter": sum(1 for e in _LARDER
+                      if dialogue_row_ready("banter", e))}
     for kind in SHELF_CAPS:
-        out[kind] = len(_SHELF.get(kind) or [])
+        out[kind] = sum(1 for row in (_SHELF.get(kind) or [])
+                        if dialogue_row_ready(str(kind), row))
+    # Track-talk is record-bound rather than shelf-bound. Leaving it out made
+    # every control surface call the road bare even while its exact upcoming
+    # records had durable, tinted bookends in the pantry.
+    out["track_talk"] = sum(
+        1 for record in _TRACK_TALK.values()
+        if track_talk_pair_ready(record))
     return out
 
 
@@ -10885,7 +11132,7 @@ def prep_board() -> list[dict[str, Any]]:
             ones: list[dict[str, Any]] = []      # one-line items
             if kind == "banter":
                 held = [e for e in list(_LARDER) if isinstance(e, dict)]
-                row["cap"] = _LARDER_MAX
+                row["cap"] = larder_cap()
             elif kind in ("manager", "caller", "gallery", "news"):
                 # #855: a painting round and a bulletin are whole
                 # SEGMENTS, so they count in lines like a memo or a
@@ -10924,15 +11171,16 @@ def prep_board() -> list[dict[str, Any]]:
                 # which is worth more.
                 row["ready"] = sum(
                     1 for x in ones
-                    if x.get("produced")
-                    or (x.get("key") and pantry_get(str(x.get("key")))))
+                    if (track_talk_part_ready(x) if kind == "track_talk"
+                        else dialogue_row_ready(str(kind), x)))
                 row["seconds"] = round(sum(float(x.get("seconds") or 0)
                                            for x in ones), 1)
             if held:
                 row["written"] = len(held)
                 row["lines"] = sum(int(e.get("chunks") or 0) for e in held)
                 row["rendered"] = sum(int(e.get("made") or 0) for e in held)
-                row["ready"] = sum(1 for e in held if e.get("prepared"))
+                row["ready"] = sum(1 for e in held
+                                   if dialogue_row_ready(str(kind), e))
                 row["recording"] = sum(1 for e in held if e.get("preparing"))
                 row["seconds"] = round(sum(float(e.get("seconds") or 0)
                                            for e in held), 1)
@@ -10953,11 +11201,7 @@ def prep_board() -> list[dict[str, Any]]:
 def prepare_target_seconds() -> float:
     """How much finished audio to keep standing by, in SECONDS, off the
     operator's hours dial — "an hour, 2 hours or even a day worth"."""
-    try:
-        hours = float(dj_settings().get("prepare_hours") or 1.0)
-    except Exception:  # noqa: BLE001
-        hours = 1.0
-    return max(0.25, min(24.0, hours)) * 3600.0
+    return schedule_horizon_hours() * 3600.0
 
 
 # --- The task-cost ledger (#872) --------------------------------------
@@ -11092,6 +11336,12 @@ def task_note(kind: str, seconds: float, gain: float = 0.0,
         row["last"] = round(seconds, 2)
         row["last_at"] = time.time()
         task_ledger_save()
+        # The task ledger learns how expensive each job is. The hourly
+        # controller also needs to know WHICH broadcast hour paid that cost,
+        # or a faster/slower hour can never change the next one's work order.
+        _hour_note = globals().get("coord_task_note")
+        if callable(_hour_note):
+            _hour_note(kind, seconds, gain, ok)
     except Exception:  # noqa: BLE001
         pass
 
@@ -11649,8 +11899,13 @@ async def recording_sitting(entries: list[dict[str, Any]],
     """#1010: work the pooled scripts one performer at a time."""
     out: dict[str, Any] = {"at": time.time(), "rounds": 0, "actors": [],
                            "finished": 0, "say": ""}
+    # A sitting is a VOICE operation, never a back door around the second
+    # pass. The ordinary preparer tints before pooling; the hand-operated
+    # endpoint did not, so enforce the invariant at the room's own door too.
     pool = [e for e in (entries or [])
-            if isinstance(e, dict) and not e.get("prepared")]
+            if isinstance(e, dict) and not e.get("prepared")
+            and dialogue_row_viable(str(e.get("prep_kind") or "banter"), e)
+            and dialogue_tint_ready(str(e.get("prep_kind") or "banter"), e)]
     del pool[RECORDING_POOL_MOST:]
     if not pool:
         out["say"] = "nothing is waiting to be recorded"
@@ -11813,6 +12068,27 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             _gate_shut = False
         sheet = [k for k in schedule_prep_order() if k in PREP_BOARD]
         order = list(sheet) + [k for k in PREP_BOARD if k not in sheet]
+        # #1130: OFF AIR, THE BOARD CHASES THE PANEL. The sheet order
+        # ranks by which entry the clock is nearest, and off air the
+        # clock is parked - so "nearest" is meaningless and the preparer
+        # kept polishing covered roads while the operator's scheduler
+        # panel showed news 1,531s short and ad 1,274s. That panel reads
+        # hour_needs() owed-minus-held, so satiation has exactly one
+        # definition and this is it: largest shortfall first, the sheet
+        # as tiebreak, and a road the operator (or the orchestrator's
+        # own judgment call) has said to DRIVE goes to the very front.
+        if radio_paused():
+            try:
+                _needs = hour_needs_now() or {}
+                def _short_of(k: str) -> float:
+                    row = _needs.get(k) or {}
+                    return max(0.0, float(row.get("owed") or 0)
+                               - float(row.get("held") or 0))
+                _driven = str(orch_policy("drive_road") or "")
+                order.sort(key=lambda k: (0 if k == _driven else 1,
+                                          -_short_of(k)))
+            except Exception:  # noqa: BLE001
+                pass
         if _gate_shut:
             _voiceable = [k for k in order
                           if shelf_unvoiced(k) >= SHELF_UNVOICED_MOST
@@ -11846,6 +12122,18 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
             if kind in skip:
                 _off[kind] = "already tried this pass"
                 continue
+            try:
+                _assigned_unready = committed_stock_ids(kind, ready=False)
+                _needs_script = commitment_write_needed(kind)
+                _can_finish_here = (kind in ("ad", "station_id", "track_talk")
+                                    and bool(_assigned_unready))
+                if not _needs_script and not _can_finish_here:
+                    _off[kind] = ("every second owed in the next four hours "
+                                  "is already assigned to FIFO stock")
+                    continue
+            except Exception:  # noqa: BLE001
+                _off[kind] = "the four-hour commitment ledger was unavailable"
+                continue
             if kind == "track_talk":
                 if track_talk_full():
                     _off[kind] = ("every record in the lookahead already "
@@ -11876,13 +12164,8 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                 _said = commit_for(kind)
                 if _said == "prerecord":
                     continue
-                # #1087: committed to an emergency take - price it as
-                # one, so the window it actually fits is the window it
-                # is offered.
-                if _said == "piper":
-                    cost = cost_on_piper(kind)
             except Exception:  # noqa: BLE001
-                pass
+                _said = ""
             _voice_only = shelf_unvoiced(kind) >= SHELF_UNVOICED_MOST
             cost = task_cost(kind)
             gain = task_gain(kind)
@@ -11912,13 +12195,36 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     gain = max(0.1, float(task_gain("render_line")))
                 except Exception:  # noqa: BLE001
                     pass
+            # #1087: committed to an emergency take - price the work as
+            # the engine it will really use. This must follow the normal and
+            # voice-only prices; the old placement assigned the Piper price
+            # and immediately overwrote it with task_cost(kind).
+            if _said == "piper":
+                try:
+                    cost = max(1.0, float(cost_on_piper(kind)))
+                except Exception:  # noqa: BLE001
+                    pass
+            # A miss in a closed broadcast hour raises this road's bounded
+            # learning weight. It influences efficiency/need ordering only;
+            # deadlines and the running order remain the law and no target is
+            # silently reduced to make a score look better.
+            _learning = 1.0
+            try:
+                _factor = globals().get("coord_learning_factor")
+                if callable(_factor):
+                    _learning = max(1.0, float(_factor(kind) or 1.0))
+            except Exception:  # noqa: BLE001
+                _learning = 1.0
+            _base_rate = (round(gain / max(0.1, cost), 3)
+                          if _voice_only else task_rate(kind))
             rows.append({"kind": kind,
                          "label": TASK_LABEL.get(kind, kind),
                          "cost": round(cost, 1),
                          "airtime": round(gain, 1),
-                         "rate": round(gain / max(0.1, cost), 3)
-                                 if _voice_only else task_rate(kind),
-                         "need": round(prep_need(kind), 2),
+                         "rate": round(_base_rate * _learning, 3),
+                         "base_rate": round(_base_rate, 3),
+                         "learning_factor": round(_learning, 3),
+                         "need": round(prep_need(kind) * _learning, 2),
                          "measured": task_stat(kind).get("measured", False),
                          # #989 (B5): words already written; this road
                          # needs a voice, not another script.
@@ -16845,7 +17151,8 @@ _SEED_DRAW = object()
 
 async def dj_line(kind: str, track: dict[str, Any] | None = None,
                   extra: str = "", seed: Any = _SEED_DRAW,
-                  direct: str = "", room: int = 1) -> str:
+                  direct: str = "", room: int = 1,
+                  tint: bool = True) -> str:
     """One spoken line. The phrase bank is the fallback AND the style guide:
     the model is asked to riff in the same register, so a broken or slow model
     degrades to a phrase rather than to silence.
@@ -17038,7 +17345,8 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
             # prepared roads - track talk, the ad brews - hand it more,
             # and with room it goes sentence by sentence with the rhymes
             # chained, which is what turns a radio link into a verse.
-            return await crystal_line(answer, f"a {kind} line", room)
+            return (await crystal_line(answer, f"a {kind} line", room)
+                    if tint else answer)
     except Exception:
         pass
     if seed is not None:
@@ -18471,6 +18779,23 @@ def dj_next_track() -> dict[str, Any] | None:
     talking about songs that are not playing" (#176, #178). The track goes on
     air in dj_on_air, when the audio actually starts."""
     dj = dj_settings()
+    # Paused air still carries music, but it must not spend a record whose
+    # exact intro/outro is being banked for the booth. If the pause landed
+    # after such a record was already selected, put it back first; the helper
+    # restores the complete paid-for FIFO order. Unowned records farther
+    # down the shuffle remain available as the pause's music bed.
+    if radio_paused():
+        try:
+            current = _RADIO.get("now") or {}
+            current_id = str(current.get("id") or "")
+            queue_ids = {str((row or {}).get("id") or "")
+                         for row in (_RADIO.get("queue") or [])}
+            if (current_id and current_id in _TRACK_TALK
+                    and current_id not in queue_ids):
+                _RADIO["queue"].append(current)
+                track_talk_restore_queue()
+        except Exception:  # noqa: BLE001
+            pass
     # Every Nth song the mail arrives: the next thing on air is a tape from
     # the mysterious Ehm Eckx, not whatever the queue had in mind (#239).
     if (dj["mixtape_every"]
@@ -18486,9 +18811,23 @@ def dj_next_track() -> dict[str, Any] | None:
     else:
         if not _RADIO["queue"]:
             _RADIO["queue"] = radio_fill(_RADIO["station"])
+            # A very long-running show can eventually refill its shuffle.
+            # Preserve the already-paid record links across that boundary in
+            # the same way dj_start does across a service restart.
+            track_talk_restore_queue()
         if not _RADIO["queue"]:
             return None
-        track = _RADIO["queue"].pop(0)
+        take_at = 0
+        if radio_paused() and _TRACK_TALK:
+            # Never consume paid dialogue on a silent booth pass. There are
+            # thousands of unowned records behind a four-hour bank, so music
+            # keeps moving while every owned record stays in exact order.
+            take_at = next((at for at, row in enumerate(_RADIO["queue"])
+                            if str((row or {}).get("id") or "")
+                            not in _TRACK_TALK), -1)
+            if take_at < 0:
+                return None
+        track = _RADIO["queue"].pop(take_at)
     _RADIO["coming"] = track
     if not track.get("tape"):
         _RADIO["since_tape"] = _RADIO.get("since_tape", 0) + 1
@@ -18598,7 +18937,7 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
     # live road - a request line announces the person who asked for it.
     _ahead_intro = None
     try:
-        if (track_talk_on() and not track.get("tape")
+        if (track_talk_on() and not radio_paused() and not track.get("tape")
                 and not track.get("requested")):
             _ahead_intro = track_talk_get(track, "intro", take=True)
     except Exception:  # noqa: BLE001
@@ -18642,7 +18981,7 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
     # exactly as it is today. The co-host says it, so the pair have the
     # dialogue "before and after every track" the owner asked for.
     try:
-        if track_talk_on():
+        if track_talk_on() and not radio_paused():
             _gone = _RADIO.get("now") or {}
             if str(_gone.get("id") or "") == str(track.get("id") or ""):
                 # Under records-first the needle is already down on THIS
@@ -18924,6 +19263,29 @@ async def _dj_loop() -> None:
                     "air", "needle down first — "
                     f"{track.get('title') or 'the record'} is turning while "
                     "the pair work up the intro (#689)")
+
+            # #1108/#1127: PAUSE THE BOOTH, NOT THE MUSIC. The old path
+            # continued below and spawned _record_talk, web research, calls,
+            # ads and interjections. dj_speak eventually suppressed their
+            # output, but track_talk_get had already removed paid FIFO rows
+            # and the live work still occupied the model and recording room.
+            # During a pause this loop only waits out the unowned music record;
+            # pantry_keeper owns every model/render cycle.
+            if radio_paused():
+                length = max(20.0, float(track.get("seconds") or 210))
+                spent = max(0.0, time.time()
+                            - float(_RADIO.get("started") or time.time()))
+                try:
+                    await asyncio.wait_for(
+                        skip.wait(), timeout=max(0.0, length - spent) + 1.5)
+                    skip.clear()
+                except asyncio.TimeoutError:
+                    pass
+                _RADIO["record_over_at"] = time.time()
+                if track.get("tape"):
+                    _RADIO["tape_outro_due"] = True
+                    _RADIO["tape_last"] = track
+                continue
 
             # --- the talk for this record ---------------------------------
             # #689, second cut. Putting the needle down first was right; what
@@ -19993,7 +20355,17 @@ def _pantry_load() -> None:
                 _PANTRY[str(key)] = {"clip": clip,
                                      "at": float(row.get("at") or 0),
                                      "used": int(row.get("used") or 0),
-                                     "bytes": row.get("bytes")}
+                                     "bytes": row.get("bytes"),
+                                     # The save path has persisted these
+                                     # fields since #1106; restore them too.
+                                     # Dropping them on load made the pantry
+                                     # database unreadable after every deploy
+                                     # and severed kind/text diagnostics from
+                                     # otherwise healthy durable audio.
+                                     "text": str(row.get("text") or "")[:1200],
+                                     "voice": str(row.get("voice") or "")[:64],
+                                     "who": str(row.get("who") or "")[:24],
+                                     "kind": str(row.get("kind") or "")[:24]}
                 kept += 1
     except Exception:  # noqa: BLE001
         pass
@@ -20172,9 +20544,12 @@ def _larder_load() -> None:
         _stranded = sum(1 for r in rows
                         if isinstance(r, dict) and r.get("preparing"))
         _LARDER[:] = [_unstrand(r) for r in rows if isinstance(r, dict)
-                      and time.time() - float(r.get("at") or 0)
-                      < larder_fresh()
-                      and _larder_current(r)][:_LARDER_MAX]
+                      and (time.time() - float(r.get("at") or 0)
+                           < larder_fresh()
+                           or (shelf_is_repeat("banter", r)
+                               and time.time() - float(r.get("at") or 0)
+                               <= REPEAT_KEEP_SECONDS))
+                      and _larder_current(r)][:larder_cap()]
         if _stranded:
             pipeline_log("lookahead",
                          f"{_stranded} round(s) were left mid-recording by "
@@ -20661,6 +21036,238 @@ def larder_part_ok(entry: dict[str, Any], want: int, made: int) -> bool:
         return False
 
 
+def _dialogue_audio_drop(row: dict[str, Any]) -> None:
+    """Invalidate every audio field when the active words change."""
+    for key in ("key", "keys", "seconds", "made", "takes", "prepared",
+                "partial", "part_of", "part_made", "chunks", "prep_turns",
+                "frozen", "yielded", "yielded_at", "produced", "audio"):
+        row.pop(key, None)
+
+
+def _tint_paper(got: dict[str, Any], later: bool = False) -> dict[str, Any]:
+    return {"ok": bool(got.get("ok")),
+            "why": str(got.get("why") or ""),
+            "world": str(got.get("world") or ""),
+            "ms": int(got.get("ms") or 0),
+            "armed": str(got.get("armed") or "")[:6000],
+            "prompt": str(got.get("prompt") or "")[:8000],
+            "chunks": list(got.get("chunks") or []),
+            "later": bool(later)}
+
+
+async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
+                              critical: bool = True) -> bool:
+    """Finish and activate the second pass before a conversation is voiced."""
+    if not dialogue_tint_required():
+        return True
+    _owns_tint = False
+    try:
+        if entry.get("tinting"):
+            return False
+        if not entry.get("preparing"):
+            entry["tinting"] = True
+            _owns_tint = True
+        tinted = str(entry.get("script_tinted") or "").strip()
+        active = str(entry.get("script") or "").strip()
+        # A tinted version written under today's contract can be activated
+        # immediately. If the profile is stale (different crystal, cast,
+        # turn contract or plot), keeping its old tint would make it fail
+        # readiness forever while the preparer repeatedly claimed success;
+        # run the original words through the current pass below instead.
+        if tinted and _larder_current(entry):
+            changed = False
+            call_ok = True
+            if active != tinted or str(entry.get("use") or "") != "tinted":
+                _dialogue_audio_drop(entry)
+                entry["script"] = tinted
+                entry["use"] = "tinted"
+                entry["freshened"] = True
+                changed = True
+            if not isinstance(entry.get("brief"), dict) or changed:
+                try:
+                    verdict = brief_note(str(kind),
+                                         str(entry.get("label") or kind),
+                                         tinted, where="tinted")
+                    entry["brief"] = verdict
+                    entry["off_brief"] = bool(verdict.get("checked")
+                                              and not verdict.get("ok"))
+                    changed = True
+                except Exception:  # noqa: BLE001
+                    pass
+            _regrade = globals().get("call_entry_regrade")
+            if (entry.get("caller_name") and callable(_regrade)):
+                report = _regrade(entry)
+                changed = True
+                if not report.get("ok"):
+                    call_ok = False
+                    pipeline_log(
+                        "call", "the activated tint failed the final phone "
+                        "contract and will not be recorded",
+                        extra="; ".join(report.get("faults") or [])[:1000])
+            if changed:
+                _pantry_save(True)
+                _larder_save()
+            return call_ok
+        plain = str(entry.get("script_plain") or active).strip()
+        if not plain:
+            return False
+        protected = list(entry.get("verbatim") or [])
+        if entry.get("caller_name"):
+            speakerbox = str((entry.get("call") or {}).get(
+                "speakerbox_text") or "").strip()
+            if speakerbox and not any(
+                    isinstance(row, (list, tuple)) and len(row) > 1
+                    and str(row[1]).strip() == speakerbox
+                    for row in protected):
+                protected.append(["phone-call Speakerbox source", speakerbox])
+        got = await crystal_tint(
+            plain, str(kind or entry.get("prep_kind") or "banter"),
+            protected, progress=entry.get("tint_progress"),
+            critical=critical)
+        entry["tint"] = _tint_paper(got, later=bool(entry.get("at")))
+        progress = dict(got.get("progress") or {})
+        if progress:
+            entry["tint_progress"] = progress
+        if not got.get("ok"):
+            entry["tint_tried"] = time.time()
+            _pantry_save(True)
+            _larder_save()
+            return False
+        fresh = str(got.get("script") or "").strip()
+        if not fresh:
+            return False
+        entry.setdefault("script_plain", plain)
+        _dialogue_audio_drop(entry)
+        entry["script_tinted"] = fresh
+        entry["script"] = fresh
+        entry["use"] = "tinted"
+        entry["freshened"] = True
+        entry["profile"] = _larder_profile_signature()
+        entry.pop("tint_progress", None)
+        try:
+            verdict = brief_note(str(kind), str(entry.get("label") or kind),
+                                 fresh, where="tinted")
+            entry["brief"] = verdict
+            entry["off_brief"] = bool(verdict.get("checked")
+                                      and not verdict.get("ok"))
+        except Exception:  # noqa: BLE001
+            pass
+        call_ok = True
+        _regrade = globals().get("call_entry_regrade")
+        if entry.get("caller_name") and callable(_regrade):
+            report = _regrade(entry)
+            if not report.get("ok"):
+                call_ok = False
+                pipeline_log(
+                    "call", "the completed tint failed the final phone "
+                    "contract and will not be recorded",
+                    extra="; ".join(report.get("faults") or [])[:1000])
+        _pantry_save(True)
+        _larder_save()
+        return call_ok
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "the required tint could not be completed",
+                     extra=f"{type(exc).__name__}: {exc}"[:300])
+        return False
+    finally:
+        if _owns_tint:
+            entry.pop("tinting", None)
+
+
+async def ensure_shelf_row_tinted(kind: str, row: dict[str, Any],
+                                  critical: bool = True) -> bool:
+    """Second-pass either shelf shape, preserving resumable paperwork."""
+    entry = dialogue_entry(row)
+    if entry is not None:
+        return await ensure_entry_tinted(entry, kind, critical)
+    if not dialogue_tint_required() or row.get("tint_ok"):
+        return True
+    text = str(row.get("text_plain") or row.get("text") or "").strip()
+    if not text:
+        return False
+    if row.get("tinting"):
+        return False
+    row["tinting"] = True
+    try:
+        got = await crystal_tint(
+            text, str(kind), row.get("verbatim"), whole_only=True,
+            progress=row.get("tint_progress"), critical=critical)
+        row["tint"] = _tint_paper(got, later=bool(row.get("at")))
+        progress = dict(got.get("progress") or {})
+        if progress:
+            row["tint_progress"] = progress
+        if not got.get("ok"):
+            row["tint_tried"] = time.time()
+            _pantry_save(True)
+            return False
+        row.setdefault("text_plain", text)
+        _dialogue_audio_drop(row)
+        row["text"] = str(got.get("script") or text)
+        row["tint_ok"] = True
+        row.pop("tint_progress", None)
+        try:
+            verdict = brief_note(str(kind), str(row.get("label") or kind),
+                                 str(row.get("text") or ""), where="tinted")
+            row["brief"] = verdict
+            row["off_brief"] = bool(verdict.get("checked")
+                                    and not verdict.get("ok"))
+        except Exception:  # noqa: BLE001
+            pass
+        _pantry_save(True)
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+    finally:
+        row.pop("tinting", None)
+
+
+def retire_rejected_call_entry(entry: dict[str, Any]) -> bool:
+    """Immediately discard a call whose completed tint failed its contract.
+
+    An unfinished tint is useful resumable work. A completed tint with a
+    failed final grade is not inventory and can never air, so retaining it as
+    diagnostic evidence wastes a FIFO slot and contradicts the cupboard's
+    single-use promise. Remove its row and only those takes no other retained
+    item owns; the pipeline event already preserves the rejection reason.
+    """
+    try:
+        if (str(entry.get("prep_kind") or "") != "caller"
+                or not entry.get("caller_name")):
+            return False
+        tinted = str(entry.get("script_tinted") or "").strip()
+        active = str(entry.get("script") or "").strip()
+        quality = ((entry.get("call") or {}).get("quality") or {})
+        if (not tinted or active != tinted
+                or not isinstance(quality, dict) or quality.get("ok")):
+            return False
+        removed: list[dict[str, Any]] = []
+        kept: list[dict[str, Any]] = []
+        for row in list(_SHELF.get("caller") or []):
+            if dialogue_entry(row) is entry:
+                removed.append(row)
+            else:
+                kept.append(row)
+        _SHELF["caller"] = kept
+        keys = {key for row in (removed or [entry])
+                for key in _row_clip_keys(row)}
+        still_held = pantry_spoken_for()
+        clips = 0
+        for key in keys - still_held:
+            if key in _PANTRY:
+                _PANTRY.pop(key, None)
+                clips += 1
+        entry["discarded"] = True
+        _pantry_save(True)
+        pipeline_log(
+            "call", "a rejected tinted call was discarded instead of "
+            "being stored as unusable dialogue",
+            extra=("; ".join(quality.get("faults") or [])[:1000]
+                   + (f"; {clips} unshared take(s) removed" if clips else "")))
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def larder_prepare(entry: dict[str, Any],
                          only_voice: str = "") -> bool:
     """#886: make a banked round's AUDIO, before anybody wants it.
@@ -20672,7 +21279,10 @@ async def larder_prepare(entry: dict[str, Any],
     completes on the pass that finishes its last seat, and `prepared` is
     still `made >= len(plan)`. Nothing about the round's own bookkeeping
     changes; it simply takes more than one visit."""
-    if entry.get("prepared") or entry.get("preparing"):
+    _pkind = str(entry.get("prep_kind") or "banter")
+    if entry.get("preparing") or entry.get("tinting"):
+        return False
+    if entry.get("prepared") and dialogue_row_ready(_pkind, entry):
         return False
     # #1122: this whole body is one `try: ... except Exception: return
     # False` with no log, so a raise before `entry["chunks"] = len(plan)`
@@ -20694,7 +21304,21 @@ async def larder_prepare(entry: dict[str, Any],
         # call, whose plan was always empty, was written once and then
         # never looked at again. Split, the visit still happens once and
         # the freeze is only given when there is audio to protect.
-        _pkind = str(entry.get("prep_kind") or "banter")
+        # The immutable order is WRITE -> TINT -> VOICE. A plain round is
+        # kept, with resumable tint progress, but never sent to the engine.
+        if not await ensure_entry_tinted(entry, _pkind, critical=True):
+            if retire_rejected_call_entry(entry):
+                prep_note(_pkind, "rejected and discarded")
+                return False
+            prep_note(_pkind, "waiting for tint")
+            return False
+        if entry.get("off_brief"):
+            prep_note(_pkind, "rejected off brief")
+            pipeline_log("lookahead", f"{SHELF_LABEL.get(_pkind, _pkind)} "
+                         "was tinted but failed its segment brief; it will "
+                         "not be voiced or counted, and a replacement may "
+                         "be written")
+            return False
         # #1025: A TINTED ROUND IS NOT FRESHENED.
         #
         # The banking order is: write, staple the verbatim passages,
@@ -21227,6 +21851,10 @@ async def prep_ad() -> bool:
     text = str(_mk.get("text") or "")
     if len(text) < 20:
         return False
+    _row = {"text": text, "text_plain": str(_mk.get("text_plain") or ""),
+            "tint_ok": bool(_mk.get("tint_ok")),
+            "tint": dict(_mk.get("tint") or {}),
+            "product": str(product)[:160]}
     made = await prep_render_line(text, "dj", kind="ad")   # #978
     if not made:
         # #904: the WRITE is already paid for. A refused render — the
@@ -21237,16 +21865,14 @@ async def prep_ad() -> bool:
         # made on a later keeper pass or live, exactly as it always
         # would have been.
         try:
-            shelf_put("ad", {"text": text,
-                             "product": str(product)[:160],
-                             "seconds": 0.0})
+            shelf_put("ad", {**_row, "seconds": 0.0})
             pipeline_log("lookahead", "an advert is WRITTEN and waiting "
                          "on a voice - the read comes on a later pass "
                          "(#904)")
         except Exception:  # noqa: BLE001
             return False
         return True
-    shelf_put("ad", {"text": text, "product": str(product)[:160], **made})
+    shelf_put("ad", {**_row, **made})
     pipeline_log("lookahead", "an advert is READY to air - written and read "
                  f"during a record, {made.get('seconds')}s of finished "
                  "audio waiting, off "
@@ -21273,6 +21899,14 @@ async def prep_station_id() -> bool:
     text = prep_air_text(line, "station_id")
     if not text:
         return False
+    _row = {"text": text, "voice": drop_voice, "seconds": 0.0}
+    if not await ensure_shelf_row_tinted("station_id", _row,
+                                         critical=True):
+        shelf_put("station_id", _row)
+        pipeline_log("lookahead", "a station ID is WRITTEN and waiting "
+                     "for its required tint before the SFX guy records it")
+        return True
+    text = str(_row.get("text") or text)
     made = await prep_render_line(text, "drop", drop_voice,
                                   kind="station_id")       # #978
     if not made:
@@ -21281,16 +21915,14 @@ async def prep_station_id() -> bool:
         # a liner prepared for THIS drop voice, and a row without one
         # could never be taken off the shelf at all.
         try:
-            shelf_put("station_id", {"text": text,
-                                     "voice": drop_voice,
-                                     "seconds": 0.0})
+            shelf_put("station_id", _row)
             pipeline_log("lookahead", "a station ID is WRITTEN and "
                          "waiting on a voice - the SFX guy shouts it on "
                          "a later pass (#904)")
         except Exception:  # noqa: BLE001
             return False
         return True
-    shelf_put("station_id", {"text": text, **made})
+    shelf_put("station_id", {**_row, **made})
     pipeline_log("lookahead", "a station ID is READY to air - the SFX guy "
                  "recorded it during a record (#842)")
     return True
@@ -21319,21 +21951,25 @@ async def prep_round(kind: str) -> bool:
     # it on a later visit, and any line that never got made simply
     # renders on air the way it always would have.
     await larder_prepare(entry)
+    if kind == "caller" and entry.get("discarded"):
+        return False
     shelf_put(kind, {"entry": entry,
                      "seconds": float(entry.get("seconds") or 0)})
-    # #871: and a CALL says plainly what was prepared and what was not.
-    # The hosts' halves are cut here; the caller's own turns ride the
-    # live road, because their phone line is drawn once per call and
-    # cannot be baked in hours early.
+    # Say plainly what is genuinely zero-work-to-air. Caller voices and their
+    # phone rack are bound on the entry, so every side of a call can now be
+    # recorded ahead; a partially tinted or recorded row is retained for its
+    # assigned horizon but must never be advertised as READY.
+    _ready = dialogue_row_ready(str(kind), {"entry": entry})
     pipeline_log("lookahead",
-                 f"{SHELF_LABEL.get(kind, kind)} is READY to air - "
+                 f"{SHELF_LABEL.get(kind, kind)} is "
+                 + ("READY to air" if _ready else
+                    "written and retained for tint/recording") + " - "
                  f"{entry.get('made') or 0} of {entry.get('chunks') or 0} "
                  f"lines made, {entry.get('seconds') or 0}s of finished "
                  "audio waiting (#842)"
-                 + (f" - the hosts' halves of "
-                    f"{entry.get('prep_turns') or 0} turns are recorded; "
-                    "the caller's own turns ride the live phone line "
-                    "(#871)" if kind == "caller" else ""))
+                 + (f" - all {entry.get('prep_turns') or 0} turns are bound "
+                    "to their stored host/caller voices (#871/#1005)"
+                    if kind == "caller" else ""))
     return True
 
 
@@ -21448,7 +22084,7 @@ async def prep_gallery() -> bool:
 # coord_upcoming() already publishes for every coming entry — so a bare
 # news entry is worked in deadline order beside everything else instead
 # of on a private timer that knew nothing about the rest of the hour.
-NEWS_PREP_AHEAD = 1500.0                # write them only this close to it
+NEWS_PREP_AHEAD = 10800.0               # the configured three-hour horizon
 # #1126: THREE HOURS, at the operator's instruction. Thirty minutes made
 # news the most expensive road on the station - 3,721 seconds of room an
 # hour that could never be repeated, against an hour that holds 3,600.
@@ -21462,6 +22098,23 @@ NEWS_FRESH_EVERY = 1800.0
 NEWS_ROUND_SECONDS = 80.0               # what one bulletin is worth on air
 NEWS_SHELF_MOST = 6                     # never a backlog of yesterday
 _NEWS_WANT: dict[str, float] = {"at": 0.0, "secs": 0.0}
+
+
+def news_prep_ahead() -> float:
+    """The useful news horizon, bounded by the bulletin's own lifetime."""
+    try:
+        return min(NEWS_PREP_LIFE,
+                   max(1500.0, float(prepare_target_seconds())))
+    except Exception:  # noqa: BLE001
+        return NEWS_PREP_AHEAD
+
+
+def news_shelf_most() -> int:
+    """Enough individual stretches to cover every news slot in the horizon."""
+    try:
+        return max(NEWS_SHELF_MOST, int(shelf_cap("news")))
+    except Exception:  # noqa: BLE001
+        return NEWS_SHELF_MOST
 
 
 def news_due() -> dict[str, Any]:
@@ -21515,12 +22168,20 @@ def news_want_seconds() -> float:
         due = news_due()
         eta = float(due.get("starts_in") or -1.0)
         want = 0.0
-        if 0.0 <= eta <= NEWS_PREP_AHEAD:
-            owns = float(due.get("owns") or 0.0)
+        if 0.0 <= eta <= news_prep_ahead():
+            # This is stock for the HORIZON, not merely the first bulletin.
+            # The old `due.owns` stopped at one four-minute slot, so the next
+            # five news entries in a three-hour build were never owed here.
+            hours = max(1.0, prepare_target_seconds() / 3600.0)
+            _name, slots = schedule_slots_now(schedule_read())
+            owns = sum(max(0.25, float(s.get("minutes") or 3)) * 60.0
+                       for s in slots
+                       if str(SCHED_PREP_KIND.get(str(s.get("kind") or ""))
+                              or str(s.get("kind") or "")) == "news") * hours
             if owns <= 0:
-                owns = NEWS_ROUND_SECONDS   # a sheet that will not say: one
-            want = max(NEWS_ROUND_SECONDS,
-                       min(owns, NEWS_ROUND_SECONDS * NEWS_SHELF_MOST))
+                owns = float(due.get("owns") or NEWS_ROUND_SECONDS)
+            want = max(NEWS_ROUND_SECONDS, min(
+                owns, NEWS_ROUND_SECONDS * news_shelf_most()))
         _NEWS_WANT.update({"at": now, "secs": want})
         return want
     except Exception:  # noqa: BLE001
@@ -21535,13 +22196,21 @@ async def prep_news() -> bool:
             return False                # stocked, or too far out to be safe
         due = news_due()
         eta = float(due.get("starts_in") or -1.0)
-        if not 0.0 <= eta <= NEWS_PREP_AHEAD:
+        if not 0.0 <= eta <= news_prep_ahead():
             # No running order, or the next news entry is too far off for
             # a bulletin to survive the wait. Not a failure: the live
             # road reads the wire when the entry comes round, as now.
             return False
         pile: list[dict[str, Any]] = []
-        await dj_news(bank_to=pile)
+        # Keep successive banked stretches on different stories while the
+        # same cached front page is feeding the full three-hour build.
+        avoid: list[str] = []
+        for held in shelf_rows("news"):
+            for title in str((held.get("entry") or {}).get(
+                    "prep_news_titles") or "").split(" / "):
+                if title.strip():
+                    avoid.append(title.strip())
+        await dj_news(bank_to=pile, avoid=avoid)
         if not pile:
             return False                # nothing on the wire to cover
         entry = pile[0]
@@ -21554,10 +22223,12 @@ async def prep_news() -> bool:
                            "seconds": float(entry.get("seconds") or 0)})
         _rows = shelf_rows("news")
         _held = sum(float(r.get("seconds") or 0) for r in _rows)
+        ready = dialogue_row_ready("news", {"entry": entry})
         pipeline_log(
             "lookahead",
-            f"{SHELF_LABEL.get('news', 'a news bulletin')} is READY to "
-            f"air - {entry.get('made') or 0} of {entry.get('chunks') or 0} "
+            f"{SHELF_LABEL.get('news', 'a news bulletin')} is "
+            + ("READY to air" if ready else "stored but not ready yet")
+            + f" - {entry.get('made') or 0} of {entry.get('chunks') or 0} "
             f"lines made, {entry.get('seconds') or 0}s of finished audio "
             f"waiting. {due.get('label') or 'the News entry'} starts in "
             f"about {int(eta / 60)} minute(s) and owns "
@@ -21589,8 +22260,158 @@ async def prep_news() -> bool:
 # is keyed to ONE record and is used only when that record plays, so it
 # can and should name it.
 TRACK_TALK_AHEAD = 10                   # how many records deep to write
-TRACK_TALK_MAX = 60                     # rows held; they are only text
+TRACK_TALK_MAX = 120                    # exact queued records, at most 4h+
 _TRACK_TALK: dict[str, dict[str, Any]] = {}
+TRACK_TALK_PATH = data_path("track_talk_queue.json")
+_TRACK_TALK_LOADED = [False]
+_TRACK_TALK_SAVED = [0.0]
+
+
+def track_talk_save(force: bool = False) -> None:
+    """Persist the exact record queue and its tinted recorded sides."""
+    try:
+        if not force and time.time() - _TRACK_TALK_SAVED[0] < 10.0:
+            return
+        _TRACK_TALK_SAVED[0] = time.time()
+        TRACK_TALK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = TRACK_TALK_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_TRACK_TALK, default=str))
+        tmp.replace(TRACK_TALK_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def track_talk_track_snapshot(track: dict[str, Any]) -> dict[str, Any]:
+    """The stable identity needed to audit a paid-for record link."""
+    return {
+        key: track.get(key)
+        for key in ("id", "title", "artist", "album", "station", "seconds",
+                    "ext", "mtime", "size")
+        if track.get(key) not in (None, "")
+    }
+
+
+def track_talk_restore_queue() -> int:
+    """Put paid-for record links back on the front of a rebuilt shuffle.
+
+    ``radio_fill`` deliberately shuffles on every start.  The dialogue bank,
+    however, owns particular records in a particular FIFO order.  Rebinding
+    those records before pruning makes a restart resume that paid-for order
+    instead of throwing the words away.  A record absent from the freshly
+    filtered station is intentionally not resurrected: bans, station changes,
+    and a new operator focus still win.
+    """
+    try:
+        queue = list(_RADIO.get("queue") or [])
+        if not queue or not _TRACK_TALK:
+            return 0
+        available: dict[str, dict[str, Any]] = {}
+        for track in queue:
+            tid = str((track or {}).get("id") or "")
+            if tid and tid not in available:
+                available[tid] = track
+
+        rebound: list[dict[str, Any]] = []
+        kept: dict[str, dict[str, Any]] = {}
+        changed = False
+        for tid, row in _TRACK_TALK.items():
+            live = available.get(str(tid))
+            if not live:
+                changed = True
+                continue
+            snapshot = track_talk_track_snapshot(live)
+            if row.get("track") != snapshot:
+                row["track"] = snapshot
+                changed = True
+            kept[str(tid)] = row
+            rebound.append(live)
+
+        if len(kept) != len(_TRACK_TALK):
+            _TRACK_TALK.clear()
+            _TRACK_TALK.update(kept)
+        owned = set(kept)
+        _RADIO["queue"] = rebound + [
+            track for track in queue
+            if str((track or {}).get("id") or "") not in owned
+        ]
+        if changed:
+            track_talk_save(True)
+        if rebound:
+            pipeline_log(
+                "lookahead", f"{len(rebound)} paid-for record link(s) "
+                "restored to the front of the exact FIFO queue")
+        return len(rebound)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def track_talk_load() -> None:
+    """Restore record-bound dialogue without promising missing audio.
+
+    Text survives even when a clip has been pruned: the ordinary preparation
+    pass can voice that exact tinted side again, avoiding a second model visit.
+    Readiness still goes through track_talk_part_ready and therefore requires
+    both the pantry row and the durable file.
+    """
+    if _TRACK_TALK_LOADED[0]:
+        return
+    _TRACK_TALK_LOADED[0] = True
+    try:
+        got = json.loads(TRACK_TALK_PATH.read_text())
+        if not isinstance(got, dict):
+            return
+        now = time.time()
+        rejected = 0
+        for key, row in got.items():
+            if (not isinstance(row, dict)
+                    or now - float(row.get("at") or 0) > PANTRY_BURN_SECONDS):
+                continue
+            restored = dict(row)
+            for part in ("intro", "outro"):
+                side = restored.get(part)
+                if not isinstance(side, dict) or not str(side.get("text") or ""):
+                    continue
+                _plain = str(side.get("text_plain") or "")
+                if _plain and side.get("tint_ok"):
+                    _governed, report = track_talk_tint_govern(
+                        side.get("text"), restored, part, _plain)
+                    side["text"] = _governed
+                else:
+                    report = track_talk_text_report(
+                        side.get("text"), restored, part)
+                # The clean writer's draft is paid-for work too. If an older
+                # persisted tint contains prompt/style debris, retain the
+                # valid clean link and send only its tint back through the
+                # room; never discard and rewrite good record-specific copy.
+                if not report.get("ok") and _plain:
+                    clean_report = track_talk_text_report(
+                        _plain, restored, part)
+                    if clean_report.get("ok"):
+                        side["text"] = _plain
+                        side["tint_ok"] = False
+                        side["tint"] = {
+                            "ok": False,
+                            "why": "persisted tint rejected; clean draft retained",
+                        }
+                        for stale in ("key", "seconds", "made",
+                                      "tint_progress"):
+                            side.pop(stale, None)
+                        report = clean_report
+                        rejected += 1
+                side["brief"] = report
+                side["off_brief"] = not bool(report.get("ok"))
+                # Rejected dialogue is not useful inventory. It stays out of
+                # the exact queue and its now-unowned audio is reclaimed by
+                # the normal pantry/media pruning pass.
+                if side.get("off_brief"):
+                    restored.pop(part, None)
+                    rejected += 1
+            if restored.get("intro") or restored.get("outro"):
+                _TRACK_TALK[str(key)] = restored
+        if rejected:
+            track_talk_save(True)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # --- THE TRACK LIBRARY (#1061) ----------------------------------------
@@ -21902,7 +22723,33 @@ def track_talk_ahead() -> int:
                   or TRACK_TALK_AHEAD)
     except Exception:  # noqa: BLE001
         got = TRACK_TALK_AHEAD
-    return max(1, min(30, got))
+    # The operator's number remains the minimum. In BUILDING mode the exact
+    # four-hour promise is stronger: bank enough of the already-decided music
+    # queue to span that horizon, not merely ten arbitrary rows. The queue is
+    # finite and this is capped, so the writer never invents speculative
+    # records beyond what dj_next_track can actually take.
+    need = 0
+    try:
+        horizon = max(900.0, float(prepare_target_seconds() or 0))
+        elapsed = 0.0
+        # A request is introduced live for the requester, and a `coming`
+        # record has already left the future queue. Neither can own a new
+        # advance link. Counting only the ordinary queue makes the horizon
+        # describe records that the bank can still reserve and actually use.
+        line = list(_RADIO.get("queue") or [])
+        seen: set[str] = set()
+        for track in line:
+            tid = str((track or {}).get("id") or "")
+            if not tid or tid in seen:
+                continue
+            seen.add(tid)
+            need += 1
+            elapsed += max(60.0, float((track or {}).get("seconds") or 240.0))
+            if elapsed >= horizon:
+                break
+    except Exception:  # noqa: BLE001
+        need = 0
+    return max(1, min(120, max(got, need)))
 
 
 def track_talk_on() -> bool:
@@ -21916,18 +22763,14 @@ def track_talk_on() -> bool:
 def track_lookahead(most: int = 0) -> list[dict[str, Any]]:
     """#869: the next records, soonest first.
 
-    The same line the panel shows as "upcoming" and the same one
-    dj_next_track() will walk: whatever is being introduced right now,
-    then the requests that jump the queue, then the queue. A mixtape slot
-    can still cut in ahead of all of it - that is a MISS, and a miss is
-    only ever a line written live, which is today's show."""
+    This is the ordinary queue only. A request owns a live requester intro,
+    and a `coming` record has already crossed the point where a new advance
+    recording could reliably precede it. Excluding both prevents paid words
+    that the playout contract can never use."""
     most = most or track_talk_ahead()
     out: list[dict[str, Any]] = []
     try:
-        coming = _RADIO.get("coming") or {}
-        line = (([coming] if coming.get("id") else [])
-                + list(_RADIO.get("requests") or [])
-                + list(_RADIO.get("queue") or []))
+        line = list(_RADIO.get("queue") or [])
         seen: set[str] = set()
         for row in line:
             tid = str((row or {}).get("id") or "")
@@ -21984,9 +22827,188 @@ def track_talk_get(track: dict[str, Any] | None, part: str,
             row.pop(part, None)
             if not (row.get("intro") or row.get("outro")):
                 _TRACK_TALK.pop(tid, None)
+            track_talk_save(True)
         return dict(got)
     except Exception:  # noqa: BLE001
         return None
+
+
+def track_talk_text_report(text: Any, track: Any,
+                           part: str = "intro") -> dict[str, Any]:
+    """Cheap, explicit acceptance contract for one record-bound link.
+
+    A tint can improve voice without making unrelated prose relevant.  The
+    finished line therefore has to name its exact record, remain a compact
+    radio link, and not contain transcript/lyrics/model debris.  This is kept
+    deterministic because sending every result back to the writing model to
+    mark its own work would add pressure to the station's bottleneck.
+    """
+    faults: list[str] = []
+    raw = str(text or "").strip()
+    words = re.findall(r"[A-Za-z0-9']+", raw)
+
+    def _flat(value: Any) -> str:
+        return " ".join(re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()
+                           ).split())
+
+    flat = _flat(raw)
+    title = _flat((track or {}).get("title") if isinstance(track, dict) else "")
+    artist = _flat((track or {}).get("artist") if isinstance(track, dict) else "")
+    anchors = [anchor for anchor in (title, artist) if len(anchor) >= 2]
+    if len(words) < 12:
+        faults.append("fewer than twelve spoken words")
+    if len(words) > 90:
+        faults.append("more than ninety spoken words")
+    if not anchors:
+        faults.append("the queued record has no usable title or artist")
+    elif not any(anchor in flat for anchor in anchors):
+        faults.append("the line does not name its exact title or artist")
+    flattened_table = bool(
+        re.search(r"\|\s*(?:speaker|transcript|narrator|-{3,})\s*\|",
+                  raw, re.I)
+        or raw.count("|") >= 6
+        or re.search(r"\b(?:speaker|transcript|narrator)\s*:", raw, re.I)
+    )
+    if (len(raw.splitlines()) > 5
+            or re.search(r"(?m)^\s*[A-E]\s*:", raw)
+            or flattened_table):
+        faults.append("the line looks like a transcript instead of one link")
+    if re.search(r"\b(as an ai|system prompt|instruction(?:s)?|verse\s*\d*|"
+                 r"chorus\s*:|full lyrics|lyrics follow)\b", flat):
+        faults.append("the line contains model or lyric scaffolding")
+    if re.search(r"^(?:the\s+world\s+of|style\s+direction|"
+                 r"in\s+the\s+style\s+of)\b", flat):
+        faults.append("the line repeats tint direction instead of presenter speech")
+    return {"checked": True, "ok": not faults, "part": str(part),
+            "words": len(words), "named": bool(anchors and any(
+                anchor in flat for anchor in anchors)),
+            "faults": faults, "title": str((track or {}).get("title") or "")[:160]
+            if isinstance(track, dict) else "",
+            "artist": str((track or {}).get("artist") or "")[:160]
+            if isinstance(track, dict) else ""}
+
+
+TRACK_TALK_CONTENT_STOP = {
+    "about", "after", "again", "along", "around", "because", "before",
+    "being", "bring", "coming", "could", "exact", "from", "give", "have",
+    "into", "itself", "keep", "make", "moves", "next", "record", "right",
+    "says", "still", "station", "take", "that", "their", "there", "these",
+    "they", "this", "through", "under", "what", "when", "where", "which",
+    "while", "with", "would", "your",
+}
+
+
+def track_talk_content_terms(text: Any, track: Any = None) -> set[str]:
+    identity = " "
+    if isinstance(track, dict):
+        identity = (str(track.get("title") or "") + " "
+                    + str(track.get("artist") or ""))
+    names = set(re.findall(r"[a-z0-9']{3,}", identity.lower()))
+    return {word for word in re.findall(r"[a-z0-9']{4,}",
+                                         str(text or "").lower())
+            if word not in TRACK_TALK_CONTENT_STOP and word not in names}
+
+
+def track_talk_tint_fidelity(source: Any, candidate: Any,
+                             track: Any = None) -> dict[str, Any]:
+    """Did the style pass preserve the clean link's concrete observation?"""
+    original = track_talk_content_terms(source, track)
+    result = track_talk_content_terms(candidate, track)
+    shared = sorted(original & result)
+    need = min(3, max(1, len(original) // 4)) if original else 0
+    faults: list[str] = []
+    if need and len(shared) < need:
+        faults.append("the tint lost the clean link's concrete observation")
+    if str(source or "").strip() and " ".join(str(source).split()).lower() \
+            == " ".join(str(candidate or "").split()).lower():
+        faults.append("the tint returned the clean link unchanged")
+    if str(candidate or "").count("/") > 1:
+        faults.append("the tint reads like copied bars rather than radio speech")
+    return {"ok": not faults, "needed_terms": need,
+            "shared_terms": shared[:12], "source_terms": sorted(original)[:20],
+            "faults": faults}
+
+
+def track_talk_tint_govern(text: Any, track: Any, part: str = "intro",
+                           source: Any = "", direction: Any = ""
+                           ) -> tuple[str, dict[str, Any]]:
+    """Keep a successful style pass compact and factually record-bound.
+
+    The crystal is allowed to change diction, never the identity of the music.
+    A small model occasionally drops that proper noun or expands a short link
+    into a verse. Restore the exact identity as a presenter sentence and cap
+    the already-tinted body, instead of discarding the entire paid-for pass and
+    sending the same work through the room forever.
+    """
+    candidate = " ".join(str(text or "").split()).strip()
+    direction_line = " ".join(str(direction or "").split()).strip()
+    direction_echo = bool(
+        direction_line and candidate.casefold().startswith(
+            direction_line.casefold()))
+    if direction_echo:
+        candidate = candidate[len(direction_line):].lstrip(" -:;,.|")
+    report = track_talk_text_report(candidate, track, part)
+    title = str((track or {}).get("title") or "").strip() \
+        if isinstance(track, dict) else ""
+    artist = str((track or {}).get("artist") or "").strip() \
+        if isinstance(track, dict) else ""
+    anchor = (title if title and not title_unreadable(title) else artist)
+    changed = direction_echo
+    if anchor and not report.get("named"):
+        candidate = f"{anchor} stays at the center of this record. {candidate}"
+        changed = True
+    words = candidate.split()
+    if len(words) > 90:
+        candidate = " ".join(words[:88]).rstrip(" ,;:-") + "."
+        changed = True
+    report = track_talk_text_report(candidate, track, part)
+    if str(source or "").strip():
+        fidelity = track_talk_tint_fidelity(source, candidate, track)
+        report["fidelity"] = fidelity
+        if not fidelity.get("ok"):
+            report["ok"] = False
+            report["faults"] = (list(report.get("faults") or [])
+                                + list(fidelity.get("faults") or []))
+    report["governed"] = changed
+    return candidate, report
+
+
+def track_talk_part_ready(part: Any) -> bool:
+    """A track side is tinted and has a durable voice take."""
+    try:
+        if (not isinstance(part, dict) or not str(part.get("text") or "")
+                or part.get("off_brief")):
+            return False
+        if dialogue_tint_required() and not part.get("tint_ok"):
+            return False
+        key = str(part.get("key") or "")
+        return bool(key and _pantry_key_ready(key))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def track_talk_pair_tint_ready(record: Any) -> bool:
+    """Both exact bookends for one queued record passed the active tint."""
+    try:
+        if not isinstance(record, dict):
+            return False
+        sides = (record.get("intro"), record.get("outro"))
+        return all(isinstance(side, dict)
+                   and str(side.get("text") or "").strip()
+                   and (not dialogue_tint_required() or side.get("tint_ok"))
+                   for side in sides)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def track_talk_pair_ready(record: Any) -> bool:
+    """One music carrier is release-ready only with both durable bookends."""
+    try:
+        return bool(isinstance(record, dict)
+                    and track_talk_part_ready(record.get("intro"))
+                    and track_talk_part_ready(record.get("outro")))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def track_talk_full() -> bool:
@@ -21997,8 +23019,8 @@ def track_talk_full() -> bool:
         for track in track_lookahead():
             if track.get("tape"):
                 continue            # the mail has its own intro road
-            if not (track_talk_get(track, "intro")
-                    and track_talk_get(track, "outro")):
+            if not (track_talk_part_ready(track_talk_get(track, "intro"))
+                    and track_talk_part_ready(track_talk_get(track, "outro"))):
                 return False
     except Exception:  # noqa: BLE001
         return True
@@ -22015,7 +23037,7 @@ def track_talk_need() -> float:
         if not line:
             return 0.0
         got = sum(1 for t in line for part in ("intro", "outro")
-                  if track_talk_get(t, part))
+                  if track_talk_part_ready(track_talk_get(t, part)))
         return max(0.0, min(1.0, 1.0 - got / float(2 * len(line))))
     except Exception:  # noqa: BLE001
         return 0.0
@@ -22035,9 +23057,9 @@ def track_talk_state(most: int = 0) -> dict[str, Any]:
                 "artist": str(track.get("artist") or "")[:120],
                 "seconds": float(track.get("seconds") or 0),
                 "tape": bool(track.get("tape")),
-                "intro": ("ready" if (intro or {}).get("key")
+                "intro": ("ready" if track_talk_part_ready(intro)
                           else "written" if intro else ""),
-                "outro": ("ready" if (outro or {}).get("key")
+                "outro": ("ready" if track_talk_part_ready(outro)
                           else "written" if outro else ""),
                 "intro_text": str((intro or {}).get("text") or "")[:300],
                 "outro_text": str((outro or {}).get("text") or "")[:300],
@@ -22048,21 +23070,111 @@ def track_talk_state(most: int = 0) -> dict[str, Any]:
             "held": len(_TRACK_TALK), "tracks": rows}
 
 
-def _track_talk_prune() -> None:
-    """Drop what has gone stale, and what has fallen off the end."""
+def _track_talk_prune() -> int:
+    """Drop stale dialogue and records no longer on the exact music queue."""
+    removed = 0
     try:
         now = time.time()
-        for tid in [k for k, r in list(_TRACK_TALK.items())
-                    if now - float((r or {}).get("at") or 0)
-                    > PANTRY_BURN_SECONDS]:
+        allowed = {str(t.get("id") or "") for t in track_lookahead(
+            TRACK_TALK_MAX) if str(t.get("id") or "")}
+        current = str((_RADIO.get("now") or {}).get("id") or "")
+        if current:
+            allowed.add(current)        # its send-off has not aired yet
+        coming = str((_RADIO.get("coming") or {}).get("id") or "")
+        if coming:
+            allowed.add(coming)         # selected, but not on the needle yet
+        stale = [k for k, r in list(_TRACK_TALK.items())
+                 if now - float((r or {}).get("at") or 0)
+                 > PANTRY_BURN_SECONDS]
+        # Do not turn a temporarily empty queue into a destructive sweep.
+        if allowed:
+            stale += [k for k in list(_TRACK_TALK) if k not in allowed]
+        for tid in set(stale):
             _TRACK_TALK.pop(tid, None)
+            removed += 1
         while len(_TRACK_TALK) > TRACK_TALK_MAX:
             oldest = min(_TRACK_TALK,
                          key=lambda k: float(
                              (_TRACK_TALK.get(k) or {}).get("at") or 0))
             _TRACK_TALK.pop(oldest, None)
+            removed += 1
+        if removed:
+            track_talk_save(True)
     except Exception:  # noqa: BLE001
         pass
+    return removed
+
+
+async def track_talk_write(track: dict[str, Any], part: str) -> str:
+    """Write one bounded record link without borrowing the live-round prompt.
+
+    dj_line is intentionally expansive for live radio: it adds the current
+    schedule clause, mandatory Speakerbox passages, show memory and a final
+    six-to-ten-sentence order.  A record-bound cache item needs the opposite:
+    one exact identity and a small, context-independent link that can still be
+    tinted.  Keeping this writer separate prevents a paused call segment from
+    leaking into a future record intro and prevents rejected monologues from
+    consuming the room on every retry.
+    """
+    title = str(track.get("title") or "").strip()
+    artist = str(track.get("artist") or "").strip()
+    identity = (f"{title} by {artist}" if title and artist
+                else title or artist or "this record")
+    job = ("bring the record in over its opening" if part == "intro" else
+           "give the record a closing observation and a clean handover")
+    prompt = (
+        "Write ONE pre-recorded radio link for one exact music record. "
+        f"The record is {identity}. Your job is to {job}. "
+        "Use 2 to 4 natural spoken sentences and 12 to 70 words. Name the "
+        "exact title or artist at least once. Make one specific observation "
+        "about the sound, mood, performance, or transition. Do not quote or "
+        "invent lyrics. Do not mention a schedule, prompt, database, cache, "
+        "future time, current news, caller, or unrelated topic. No speaker "
+        "labels, markdown, transcript, list, stage direction, preamble, or "
+        "explanation. Return only the words the presenter says."
+    )
+    answer = ""
+    try:
+        answer = prep_air_text(await ask_model(prompt, limit=620, spice=0.15),
+                               "intro" if part == "intro" else "interject")
+    except Exception:  # noqa: BLE001
+        answer = ""
+    if track_talk_text_report(answer, track, part).get("ok"):
+        return answer
+    # A deterministic, exact fallback stops one badly behaved model response
+    # from turning the paused room into an infinite reject/rewrite loop. It is
+    # still passed through the active tint below and remains track-specific.
+    if part == "intro":
+        return (f"{identity} is coming into focus now. Listen for the shape "
+                "of the arrangement as it opens, and let the record take the "
+                "room from here.")
+    return (f"That was {identity}, holding its character all the way through. "
+            "Keep that last turn in mind while the station moves cleanly into "
+            "what comes next.")
+
+
+async def track_talk_tint_repair(source: str, track: dict[str, Any],
+                                 part: str) -> str:
+    """One conservative retry when a broad crystal pass loses the record."""
+    title = str(track.get("title") or "").strip()
+    artist = str(track.get("artist") or "").strip()
+    identity = title if title and not title_unreadable(title) else artist
+    anchors = sorted(track_talk_content_terms(source, track))[:8]
+    prompt = (
+        "Conservatively tint this ONE pre-recorded music-radio link. Change "
+        "cadence, diction and internal rhyme, but preserve its exact meaning, "
+        "its concrete observation, and its intro/closing job. Keep the "
+        f"record identity {identity!r} exactly. Retain at least two of these "
+        f"content words exactly: {', '.join(anchors) or 'sound, mood'}. "
+        "Use 2 to 4 natural spoken sentences and 12 to 80 words. Do not quote "
+        "or imitate a lyric phrase, add a person or fact, use slashes, speaker "
+        "labels, markdown, transcript, or explanation. Return only the line."
+        + "\n\nCLEAN LINK:\n" + source)
+    try:
+        return prep_air_text(await ask_model(prompt, limit=680, spice=0.2),
+                             "intro" if part == "intro" else "interject")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 async def prep_track_talk() -> bool:
@@ -22080,38 +23192,92 @@ async def prep_track_talk() -> bool:
     if not track_talk_on():
         return False
     try:
-        want: tuple[dict[str, Any], str] | None = None
+        want: tuple[dict[str, Any], str, dict[str, Any] | None] | None = None
         for track in track_lookahead():
             if track.get("tape") or not track.get("id"):
                 continue            # the mail writes its own introduction
             for part in ("intro", "outro"):
-                if not track_talk_get(track, part):
-                    want = (track, part)
+                held = track_talk_get(track, part)
+                if not track_talk_part_ready(held):
+                    want = (track, part, held)
                     break
             if want:
                 break
         if not want:
             return False
-        track, part = want
-        if part == "intro":
-            # WITH the track. This is the whole difference from a banked
-            # round: it may name the song, because it will only ever be
-            # said over this song.
-            # #1045: was room=6 - up to six model visits, eighteen with
-            # retries, for one radio link, fifteen times an hour. One.
-            raw = await dj_line("intro", track, room=1)          # #1038
-            kind = "intro"
-            who = "dj"
-        else:
-            raw = await dj_line(
-                "interject", track, room=1,                          # #1045
-                extra="that record has just finished playing - see it off: "
-                      "say what you made of it, name it once, and hand over "
-                      "to whatever is coming next")
-            kind = "interject"
-            who = "cohost"
-        text = prep_air_text(raw, kind)
+        track, part, held = want
+        row = _TRACK_TALK.setdefault(str(track.get("id")), {
+            "id": str(track.get("id")),
+            "title": str(track.get("title") or "")[:160],
+            "artist": str(track.get("artist") or "")[:160],
+            "at": time.time(), "queued_at": time.time(),
+            "track": track_talk_track_snapshot(track)})
+        row["at"] = time.time()
+        row["track"] = track_talk_track_snapshot(track)
+        side = dict(row.get(part) or held or {})
+        who = "dj" if part == "intro" else "cohost"
+        kind = "intro" if part == "intro" else "interject"
+        text = str(side.get("text") or "").strip()
+        if not text:
+            # WITH the track. Unlike a banked round it may name this record,
+            # and unlike dj_line it receives no live schedule/Speakerbox debt.
+            text = await track_talk_write(track, part)
         if len(text) < 20:
+            return False
+        side.update({"text": text, "who": who,
+                     "at": float(side.get("at") or time.time())})
+        row[part] = side                    # keep the paid-for write on refusal
+        track_talk_save(True)              # resumable across a deploy
+        if dialogue_tint_required() and not side.get("tint_ok"):
+            tinted = await crystal_tint(
+                text, "track_talk", whole_only=True,
+                progress=side.get("tint_progress"), critical=True)
+            side["tint"] = {"ok": bool(tinted.get("ok")),
+                            "why": str(tinted.get("why") or ""),
+                            "ms": int(tinted.get("ms") or 0)}
+            side["tint_progress"] = dict(tinted.get("progress") or {})
+            if not tinted.get("ok"):
+                track_talk_save(True)
+                return False
+            side.setdefault("text_plain", text)
+            governed, governed_report = track_talk_tint_govern(
+                str(tinted.get("script") or text), track, part, text,
+                str(tinted.get("world") or ""))
+            if not governed_report.get("ok"):
+                repaired = await track_talk_tint_repair(text, track, part)
+                governed, governed_report = track_talk_tint_govern(
+                    repaired, track, part, text,
+                    str(tinted.get("world") or ""))
+                side["tint"]["fidelity_retry"] = True
+            if not governed_report.get("ok"):
+                side["tint"]["why"] = (
+                    "final fidelity refusal: "
+                    + "; ".join(governed_report.get("faults") or []))[:700]
+                track_talk_save(True)
+                return False
+            side["text"] = governed
+            side["brief"] = governed_report
+            side["tint"]["governed"] = bool(governed_report.get("governed"))
+            side["tint_ok"] = True
+            side.pop("tint_progress", None)
+            # A previous take, if any, says the pre-tint words.
+            for stale in ("key", "seconds", "made"):
+                side.pop(stale, None)
+            track_talk_save(True)
+        text = str(side.get("text") or text)
+        report = track_talk_text_report(text, track, part)
+        side["brief"] = report
+        side["off_brief"] = not bool(report.get("ok"))
+        if side["off_brief"]:
+            row.pop(part, None)
+            if not (row.get("intro") or row.get("outro")):
+                _TRACK_TALK.pop(str(track.get("id") or ""), None)
+            track_talk_save(True)
+            pipeline_log(
+                "drop", "a record-bound link failed its final contract and "
+                        "was discarded before recording",
+                extra=(f"{track.get('artist', '')} - {track.get('title', '')}: "
+                       + "; ".join(report.get("faults") or []))[:700])
             return False
         try:
             voice = str((await session_voices()).get(who) or "")
@@ -22119,26 +23285,25 @@ async def prep_track_talk() -> bool:
             voice = ""
         made = await prep_render_line(text, who, voice,
                                       kind="track_talk")   # #978
-        row = _TRACK_TALK.setdefault(str(track.get("id")), {
-            "id": str(track.get("id")),
-            "title": str(track.get("title") or "")[:160],
-            "artist": str(track.get("artist") or "")[:160],
-            "at": time.time()})
-        row["at"] = time.time()
         # #904's lesson: the WRITE is already paid for. A refused render
         # keeps the words, and the voice comes on a later pass or live.
-        row[part] = {"text": text, "who": who, "at": time.time(),
-                     **(made or {})}
+        side.update(made or {})
+        side["at"] = time.time()
+        row[part] = side
         _track_talk_prune()
+        track_talk_save(True)
         pipeline_log(
             "lookahead",
             ("an introduction" if part == "intro" else "a send-off")
             + " is ready for "
             + (str(track.get("title") or "a record")[:60])
-            + (f" - {made.get('seconds')}s of finished audio waiting"
-               if made else " - written, waiting on a voice")
+            + (f" - {(made or {}).get('seconds')}s of tinted audio waiting"
+               if made else " - tinted, waiting on a voice")
             + " (#869)")
-        return True
+        # A model write without a durable take is unfinished work, not a
+        # successful task. Reporting True here produced nominal successes
+        # while the queue still held zero credited track-talk.
+        return track_talk_part_ready(side)
     except Exception:  # noqa: BLE001
         return False
 
@@ -22155,13 +23320,24 @@ async def prep_voice_pending(kind: str) -> bool:
     who = {"ad": "dj", "station_id": "drop"}.get(str(kind) or "")
     if not who:
         return False
+    wanted = committed_stock_ids(str(kind), ready=False)
+    if not wanted:
+        return False
     for row in list(_SHELF.get(str(kind)) or []):
         try:
-            if row.get("key") or row.get("produced"):
+            if alt_sid(str(kind), row) not in wanted:
+                continue                # not owed inside the active horizon
+            if dialogue_row_ready(str(kind), row):
                 continue
             text = str(row.get("text") or "")
             if not text:
                 continue
+            if not await ensure_shelf_row_tinted(
+                    str(kind), row, critical=True):
+                return False
+            if row.get("off_brief"):
+                continue
+            text = str(row.get("text") or "")
             made = await prep_render_line(text, who,
                                           str(row.get("voice") or ""),
                                           kind=str(kind))
@@ -22193,6 +23369,18 @@ async def prep_one(kind: str) -> bool:
                 prep_note(str(kind), "stacked")
     except Exception:  # noqa: BLE001
         pass
+    # Commission no speculative script. Existing assigned work is finished by
+    # the tint/recording passes; a new model visit is allowed only when the
+    # next four-hour schedule still owns seconds with no stored row behind it.
+    try:
+        _new_script = commitment_write_needed(str(kind))
+        _assigned_unready = committed_stock_ids(str(kind), ready=False)
+        if (not _new_script
+                and not (str(kind) == "track_talk" and _assigned_unready)):
+            prep_note(str(kind), "four-hour obligations assigned")
+            return False
+    except Exception:  # noqa: BLE001
+        return False
     # #865: the writing-room door. This says who is at the model now;
     # larder_prepare takes the note over and starts naming actors and
     # lines the moment there is a script to record.
@@ -22398,8 +23586,30 @@ def radio_pause_set(on: bool) -> bool:
     overnight that came back by itself would be the opposite of the
     ask."""
     try:
+        now = time.time()
+        pos = _RADIO.get("sched_pos") or {}
+        if on and not radio_paused():
+            try:
+                elapsed = max(0.0, now - float(pos.get("started") or now))
+                slot = _RADIO.get("sched_slot") or {}
+                owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+                _RADIO["paused_sched_elapsed"] = min(elapsed, owns - 0.001)
+            except Exception:  # noqa: BLE001
+                _RADIO["paused_sched_elapsed"] = 0.0
+        if not on and radio_paused():
+            # Resume at the exact spoken point that was frozen. The wall
+            # clock may have moved for hours; the running order did not.
+            try:
+                elapsed = max(0.0, float(
+                    _RADIO.get("paused_sched_elapsed") or 0))
+                if pos:
+                    pos["started"] = now - elapsed
+                    _RADIO["sched_pos"] = pos
+                    _sched_pos_save()
+            except Exception:  # noqa: BLE001
+                pass
         _RADIO["paused"] = bool(on)
-        _RADIO["paused_at"] = time.time() if on else 0.0
+        _RADIO["paused_at"] = now if on else 0.0
         # #1120: coming back, the talk clocks start from NOW. _LAST_SAID
         # advances during a pause (air_remember burns on roads that
         # never reach a speaker) while _LAST_PLAYOUT freezes, so on
@@ -22426,7 +23636,9 @@ def radio_pause_set(on: bool) -> bool:
         try:
             PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
             PAUSE_PATH.write_text(json.dumps(
-                {"paused": bool(on), "at": _RADIO.get("paused_at") or 0}))
+                {"paused": bool(on), "at": _RADIO.get("paused_at") or 0,
+                 "sched_elapsed": float(
+                     _RADIO.get("paused_sched_elapsed") or 0)}))
         except Exception:  # noqa: BLE001
             pass
         pipeline_log(
@@ -22451,6 +23663,8 @@ def radio_pause_load() -> None:
         if isinstance(got, dict) and got.get("paused"):
             _RADIO["paused"] = True
             _RADIO["paused_at"] = float(got.get("at") or time.time())
+            _RADIO["paused_sched_elapsed"] = max(
+                0.0, float(got.get("sched_elapsed") or 0))
     except Exception:  # noqa: BLE001
         pass
 
@@ -22601,6 +23815,11 @@ async def pantry_keeper() -> None:
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
+            # One bounded work set for this pass. The rooms may finish only
+            # rows that the next four hours have actually selected; surplus
+            # cupboard material is neither tinted nor recorded merely because
+            # it happens to exist.
+            _committed_unready = committed_stock_ids(ready=False)
             # #990: FINISH WHAT IS ALREADY WRITTEN BEFORE WRITING MORE.
             #
             # These two blocks - the half-rendered rounds, and the reads
@@ -22663,16 +23882,24 @@ async def pantry_keeper() -> None:
                 # already made.
                 _refused = 0
                 for _row in list(_SHELF.get(_kind) or []):
+                    if alt_sid(_kind, _row) not in _committed_unready:
+                        continue
                     # #916: a PRODUCED spot has no pantry `key` because its
                     # audio is a durable mp3 under /ads-audio rather than a
                     # pantry clip — it is finished, and rendering its script
                     # as a dry read would spend the engine on something that
                     # will never be spoken.
-                    if (_row.get("key") or _row.get("produced")
-                            or not str(_row.get("text") or "")):
-                        continue    # already made, or nothing to make
+                    if not str(_row.get("text") or ""):
+                        continue
+                    if dialogue_row_ready(_kind, _row):
+                        continue
                     if not pantry_window():   # #978: see the note above
                         break
+                    if not await ensure_shelf_row_tinted(
+                            _kind, _row, critical=True):
+                        continue              # words kept; tint resumes later
+                    if _row.get("off_brief"):
+                        continue              # curate/replace; never voice junk
                     try:
                         _late = await prep_render_line(
                             str(_row.get("text") or ""), _who,
@@ -22745,8 +23972,14 @@ async def pantry_keeper() -> None:
                     _pool = []
                     for _kind, _row in _waiting:
                         _e = _row.get("entry") or {}
-                        if _e.get("prepared") or _e.get("preparing"):
+                        if alt_sid(_kind, _row) not in _committed_unready:
                             continue
+                        if (_e.get("preparing")
+                                or dialogue_row_ready(_kind, _e)):
+                            continue
+                        if (not dialogue_row_viable(_kind, _e)
+                                or not dialogue_tint_ready(_kind, _e)):
+                            continue           # larder_prepare tints it first
                         if (_e.get("frozen")
                                 and int(_e.get("prep_turns") or 0)
                                 and not int(_e.get("chunks") or 0)):
@@ -22780,10 +24013,13 @@ async def pantry_keeper() -> None:
                 # else's finishing, for ever.
                 _fin = 0
                 for _kind, _row in _waiting:
+                    if alt_sid(_kind, _row) not in _committed_unready:
+                        continue
                     if _fin >= WAITING_VISITS_MOST:
                         break           # the booth gets the rest
                     _shelved = _row.get("entry") or {}
-                    if _shelved.get("prepared") or _shelved.get("preparing"):
+                    if (_shelved.get("preparing")
+                            or dialogue_row_ready(_kind, _shelved)):
                         continue
                     # #871: THIS was the trap door. larder_prepare froze
                     # a round before it knew whether anything in it could
@@ -22870,18 +24106,23 @@ async def pantry_keeper() -> None:
             # hour_short_kinds() names caller, gallery, news and ad on
             # every pass and the larder is always at its floor, so this
             # was permanently true and larder_prepare was never reached.
+            _larder_usable = sum(1 for e in _LARDER
+                                  if dialogue_row_viable("banter", e))
             _banter_wait = (bool(_hour_short) and not radio_paused()
                             and "banter" not in _hour_short
-                            and len(_LARDER) >= _larder_floor)
+                            and _larder_usable >= _larder_floor)
             if _banter_wait:
                 pipeline_log("lookahead",
-                             f"the larder holds {len(_LARDER)} round(s) "
+                             f"the larder holds {_larder_usable} usable "
+                             "round(s) "
                              f"against a floor of {_larder_floor} and the "
                              "hour is short of "
                              + ", ".join(_hour_short[:3])
                              + " — those go first (#978/#1091)")
             _refused = 0                                       # #1122
             for _entry in ([] if _banter_wait else list(_LARDER)):
+                if alt_sid("banter", _entry) not in _committed_unready:
+                    continue
                 # #978: IS A WINDOW OPEN - not "is it the same REASON a
                 # window was open when this pass began". `window` is a
                 # reason string captured once at the top of the pass, and
@@ -22895,7 +24136,8 @@ async def pantry_keeper() -> None:
                 # rendered 1 while seven ads waited written.
                 if not pantry_window():
                     break               # the live road wants the engine
-                if _entry.get("prepared") or _entry.get("preparing"):
+                if (_entry.get("preparing")
+                        or dialogue_row_ready("banter", _entry)):
                     continue
                 # #872: on the clock, and measured. The clock is the room
                 # left in this window - larder_prepare asks
@@ -23158,7 +24400,10 @@ async def larder_keeper() -> None:
         await asyncio.sleep(3)
         try:
             _LARDER[:] = [e for e in _LARDER
-                          if time.time() - e["at"] < larder_fresh()
+                          if (time.time() - e["at"] < larder_fresh()
+                              or (shelf_is_repeat("banter", e)
+                                  and time.time() - float(e.get("at") or 0)
+                                  <= REPEAT_KEEP_SECONDS))
                           and _larder_current(e)]
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
@@ -23196,7 +24441,14 @@ async def larder_keeper() -> None:
             cap = min(larder_cap(),
                       (12 if box_down and not radio_paused() else _want)
                       if not radio_paused() else larder_cap())
-            if len(_LARDER) >= cap or _LARDER_WRITING[0]:
+            _stocked = sum(1 for e in _LARDER
+                           if dialogue_row_viable("banter", e))
+            if _stocked >= cap or _LARDER_WRITING[0]:
+                continue
+            # The reserve is not a speculative archive. If concrete FIFO
+            # rows already cover every banter second in the active horizon,
+            # the writer stands down even while the physical shelf has room.
+            if not commitment_write_needed("banter"):
                 continue
             # #1098: ...AND ABOVE ITS FLOOR BANTER YIELDS, HERE TOO.
             #
@@ -23221,7 +24473,7 @@ async def larder_keeper() -> None:
             # And with nothing else short it still fills to twelve, so
             # stacking work in idle time is untouched.
             try:
-                if not box_down and len(_LARDER) >= larder_floor():
+                if not box_down and _stocked >= larder_floor():
                     _now = time.time()
                     if _now - float(_LARDER_YIELD[0] or 0) > 15.0:
                         _LARDER_YIELD[0] = _now
@@ -23241,7 +24493,7 @@ async def larder_keeper() -> None:
                             _LARDER_YIELD[2] = _now
                             pipeline_log(
                                 "lookahead",
-                                f"the larder holds {len(_LARDER)} round(s) "
+                                f"the larder holds {_stocked} usable round(s) "
                                 f"against a floor of {larder_floor()}, so "
                                 "the pair stop writing ahead while "
                                 + ", ".join(_shorts[:3])
@@ -23260,7 +24512,7 @@ async def larder_keeper() -> None:
             # shelf queues its write anyway: it runs the moment the
             # live write finishes, which is the back-to-back cadence
             # the operator expects.
-            if _OLLAMA_GATE.locked() and len(_LARDER) >= 2:
+            if _OLLAMA_GATE.locked() and _stocked >= 2:
                 continue
             _LARDER_WRITING[0] = True
             try:
@@ -23555,6 +24807,8 @@ def slot_supply() -> dict[str, list[float]]:
                     if now - float(row.get("at") or 0) > PANTRY_BURN_SECONDS \
                             and not shelf_is_repeat(kind, row):
                         continue                # burnt
+                    if not dialogue_row_ready(str(kind), row):
+                        continue                # written/partial/plain is not airable
                     key = str(row.get("key") or "")
                     if key and not pantry_get(key):
                         continue                # its audio has gone
@@ -23587,12 +24841,485 @@ def slot_supply() -> dict[str, list[float]]:
             out["banter"] = sorted(
                 out["banter"]
                 + [0.0] * sum(1 for e in list(_LARDER)
-                              if isinstance(e, dict) and e.get("prepared")))
+                              if dialogue_row_ready("banter", e)))
         except Exception:  # noqa: BLE001
             pass
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+_INVENTORY_PLAN: dict[str, Any] = {"at": 0.0, "hours": 0.0, "plan": {}}
+INVENTORY_PLAN_LIFE = 5.0
+
+
+def dialogue_stock_seconds(kind: str, row: Any,
+                           projected: bool = False) -> float:
+    """How many seconds one stored item buys when it is finished.
+
+    READY stock is priced from the clips that still exist, not from a row
+    count or a stale estimate. For written/tinting/recording work, `projected`
+    estimates the finished script so the orchestrator reserves that work for
+    one future obligation instead of commissioning duplicates while its first
+    copy is still moving through the rooms.
+    """
+    try:
+        if not isinstance(row, dict):
+            return 0.0
+        keys = list(dict.fromkeys(_row_clip_keys(row)))
+        actual = sum(float(((_PANTRY.get(key) or {}).get("clip") or {}).get(
+            "seconds") or 0) for key in keys)
+        if not keys and row.get("produced"):
+            actual = float(row.get("seconds") or 0)
+        if not projected:
+            return round(max(0.0, actual), 3)
+        target = dialogue_entry(row) or row
+        script = str(target.get("script_tinted") or target.get("script")
+                     or target.get("text") or "")
+        # The call-sheet and the render ledger both use fourteen written
+        # characters per second. Keep a measured per-road gain as the floor:
+        # a terse script should not be mistaken for a two-second segment.
+        estimate = len(script) / 14.0 if script else 0.0
+        try:
+            estimate = max(estimate, float(task_gain(str(kind)) or 0))
+        except Exception:  # noqa: BLE001
+            pass
+        return round(max(actual, min(900.0, estimate)), 3)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def dialogue_stock_items(kind: str, include_unready: bool = True,
+                         profile: str | None = None,
+                         tint_required: bool | None = None
+                         ) -> list[dict[str, Any]]:
+    """The actual FIFO queue for one preparation road.
+
+    Each result names the concrete retained row, its stable id, actual READY
+    seconds, projected finished seconds and when it may next air. This is the
+    common inventory used by scheduling, tinting, recording and retirement;
+    none of those systems may count or work a different pile any more.
+    """
+    out: list[dict[str, Any]] = []
+    now = time.time()
+    try:
+        road = str(kind or "")
+        # One contract/tint read for the whole queue. Calling the public
+        # predicates independently for every row re-read settings, crystals
+        # and plot state hundreds of times per five-second planning pass.
+        if profile is None:
+            profile = _larder_profile_signature()
+        if tint_required is None:
+            tint_required = dialogue_tint_required()
+
+        def _viable(row: dict[str, Any]) -> bool:
+            if row.get("off_brief"):
+                return False
+            entry = dialogue_entry(row)
+            if entry is not None:
+                basic = bool(not entry.get("off_brief")
+                             and str(entry.get("profile") or "") == profile
+                             and str(entry.get("script_plain")
+                                     or entry.get("script") or "").strip())
+                if not basic:
+                    return False
+                # This planner-fast predicate is also the common inventory
+                # used by commitment and retirement. Keep its phone judgment
+                # identical to dialogue_row_viable(): otherwise an ungraded
+                # legacy call gets assigned to the horizon, blocks its
+                # replacement, and is protected from the unused-row sweep.
+                _call_gate = globals().get("call_entry_contract")
+                if (road == "caller" and callable(_call_gate)
+                        and not _call_gate(entry)):
+                    return False
+                return True
+            return bool(str(row.get("text_plain")
+                            or row.get("text") or "").strip())
+
+        def _tinted(row: dict[str, Any]) -> bool:
+            if not tint_required:
+                return True
+            entry = dialogue_entry(row)
+            if entry is not None:
+                tinted = str(entry.get("script_tinted") or "").strip()
+                return bool(tinted
+                            and str(entry.get("script") or "").strip() == tinted
+                            and str(entry.get("use") or "tinted") == "tinted")
+            return bool(row.get("tint_ok")
+                        and str(row.get("text") or "").strip())
+
+        def _audio(row: dict[str, Any]) -> bool:
+            """Planner-fast audio check over the already validated pantry.
+
+            _pantry_load admits a key only after its file exists, and
+            pantry_put admits it only after a render succeeds. Re-statting
+            every referenced WAV for every road on every five-second plan is
+            thousands of filesystem calls and can make the orchestrator take
+            longer to read its board than to act on it. Playback retains the
+            strict disk check in dialogue_row_ready/pantry_get.
+            """
+            entry = dialogue_entry(row)
+            if entry is None:
+                return bool(row.get("produced")
+                            or str(row.get("key") or "") in _PANTRY)
+            try:
+                want = int(entry.get("chunks") or 0)
+                made = int(entry.get("made") or 0)
+                if want <= 0 or made < want or entry.get("partial"):
+                    return False
+                keys = [str(k) for k in (entry.get("keys") or []) if str(k)]
+                keys += [str(t.get("key") or "")
+                         for t in (entry.get("takes") or [])
+                         if isinstance(t, dict) and str(t.get("key") or "")]
+                return bool(keys and all(k in _PANTRY for k in set(keys)))
+            except Exception:  # noqa: BLE001
+                return False
+
+        if road == "track_talk":
+            # One scheduled "talk over the record" entry is a MUSIC carrier
+            # with two exact bookends, not 180 seconds of uninterrupted
+            # speech. Keep the unit as one queued record so nine unrelated
+            # intros can never be assigned to a single three-minute entry.
+            # track_lookahead supplies the same FIFO dj_next_track consumes.
+            for track in track_lookahead(TRACK_TALK_MAX):
+                track_id = str(track.get("id") or "")
+                record = _TRACK_TALK.get(track_id) or {}
+                if not track_id or not isinstance(record, dict):
+                    continue
+                sides = [record.get("intro"), record.get("outro")]
+                viable = any(isinstance(side, dict)
+                             and str(side.get("text") or "").strip()
+                             for side in sides)
+                ready = bool(track_talk_pair_ready(record))
+                if not ready and (not include_unready or not viable):
+                    continue
+                audio = sum(float((side or {}).get("seconds") or 0)
+                            for side in sides
+                            if isinstance(side, dict)
+                            and track_talk_part_ready(side))
+                remaining = sum(1 for side in sides
+                                if not track_talk_part_ready(side))
+                out.append({
+                    "id": f"track_talk:{track_id}",
+                    "kind": road, "row": record, "entry": record,
+                    "ready": ready, "seconds": round(audio, 3),
+                    "audio_seconds": round(audio, 3),
+                    # commitment_inventory_plan expands this single exact
+                    # carrier over the wall-clock entry it owns.
+                    "projected_seconds": 1.0, "fills_entry": True,
+                    "remaining_tasks": remaining, "available": 0.0,
+                })
+            return out
+
+        source = list(_LARDER) if road == "banter" else list(
+            _SHELF.get(road) or [])
+        for row in source:
+            if not isinstance(row, dict):
+                continue
+            viable = _viable(row)
+            ready = bool(viable and _tinted(row) and _audio(row))
+            if not ready and (not include_unready or not viable):
+                continue
+            available = 0.0
+            if ready and row.get("aired_at"):
+                if not shelf_is_repeat(road, row):
+                    continue
+                if not orch_policy("repeats_hard"):
+                    available = max(0.0, float(row.get("aired_at") or 0)
+                                    + shelf_reuse_rest() - now)
+            actual = dialogue_stock_seconds(road, row, False) if ready else 0.0
+            # Once audio exists its duration is a fact. The measured average
+            # yield is only a forecast for unfinished paper; applying it to a
+            # short finished clip made (for example) 98 seconds of adverts
+            # claim all 120 seconds of a break with nothing behind the tail.
+            projected = (actual if ready else
+                         dialogue_stock_seconds(road, row, True))
+            if ready and actual <= 0:
+                continue
+            out.append({
+                "id": alt_sid(road, row), "kind": road,
+                "row": row, "entry": dialogue_entry(row) or row,
+                "ready": ready, "seconds": round(actual, 3),
+                "projected_seconds": round(max(actual, projected), 3),
+                "available": round(available, 3),
+                "remaining_airings": (max(1, shelf_innings(road)
+                                           - int(row.get("aired") or 0))
+                                       if road in SHELF_REUSABLE
+                                       and repeat_safe(road, row) else 1),
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def schedule_demand_entries(hours: float = 0.0) -> list[dict[str, Any]]:
+    """Current remainder plus the exact preparable share inside a horizon.
+
+    A segment beginning on the last minute of a horizon contributes one
+    minute, not its whole duration. Without that clipping every three/four
+    hour contract quietly owed one extra boundary segment and could never be
+    satisfied even by a perfect cupboard.
+    """
+    try:
+        if hours <= 0:
+            hours = prepare_target_seconds() / 3600.0
+        hours = max(0.25, min(24.0, float(hours)))
+    except Exception:  # noqa: BLE001
+        hours = 4.0
+    horizon = hours * 3600.0
+    out: list[dict[str, Any]] = []
+    try:
+        slot = dict(_RADIO.get("sched_slot") or {})
+        pos = dict(_RADIO.get("sched_pos") or {})
+        kind = str(slot.get("kind") or "")
+        road = str(SCHED_PREP_KIND.get(kind) or kind)
+        left = float(sched_entry_left() or 0)
+        if (kind and road in ALT_PREP_KINDS and kind not in CANNOT_PREPARE
+                and left > 1.0):
+            share = min(left, horizon)
+            out.append({
+                "index": int(pos.get("index") or 0), "kind": kind,
+                "road": road, "label": str(slot.get("label") or kind),
+                "starts_in": 0.0, "due_at": time.time(),
+                "owns_seconds": round(share, 1),
+                "commit_id": (f"current:{pos.get('started') or 0}:"
+                              f"{slot.get('id') or pos.get('index') or 0}"),
+                "current": True,
+            })
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for seq, row in enumerate(coord_upcoming(hours * 3600.0,
+                                                 measure=False)):
+            if row.get("cannot"):
+                continue
+            one = dict(row)
+            starts = max(0.0, float(one.get("starts_in") or 0))
+            share = min(max(0.0, float(one.get("owns_seconds") or 0)),
+                        max(0.0, horizon - starts))
+            if share <= 1.0:
+                continue
+            one["owns_seconds"] = round(share, 1)
+            one.setdefault("commit_id", f"future:{seq}:{one.get('index')}")
+            one["current"] = False
+            out.append(one)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def commitment_inventory_plan(hours: float = 0.0,
+                              fresh: bool = False) -> dict[str, Any]:
+    """Bind concrete FIFO stock to the exact seconds the horizon owes.
+
+    A row is consumed once in the simulation, even when several same-kind
+    entries appear in the hour. A 55-second call therefore cannot claim to
+    cover a four-minute phone segment; further calls are assigned until the
+    segment is full, and the remaining seconds stay visibly short.
+    """
+    try:
+        if hours <= 0:
+            hours = prepare_target_seconds() / 3600.0
+        hours = max(0.25, min(24.0, float(hours)))
+    except Exception:  # noqa: BLE001
+        hours = 4.0
+    now = time.time()
+    if (not fresh and _INVENTORY_PLAN.get("plan")
+            and abs(float(_INVENTORY_PLAN.get("hours") or 0) - hours) < 0.001
+            and now - float(_INVENTORY_PLAN.get("at") or 0)
+            < INVENTORY_PLAN_LIFE):
+        return dict(_INVENTORY_PLAN["plan"])
+    result: dict[str, Any] = {
+        "at": now, "hours": round(hours, 2), "slots": [], "roads": {},
+        "selected": [], "selected_ids": [], "owed_seconds": 0.0,
+        "ready_seconds": 0.0, "planned_seconds": 0.0,
+        "short_seconds": 0.0,
+    }
+    try:
+        demand = schedule_demand_entries(hours)
+        roads = {str(row.get("road") or "") for row in demand
+                 if str(row.get("road") or "")}
+        profile = _larder_profile_signature()
+        tint_required = dialogue_tint_required()
+        pools = {road: dialogue_stock_items(
+            road, True, profile, tint_required) for road in roads}
+        selected_ids: set[str] = set()
+        for seq, due in enumerate(demand):
+            road = str(due.get("road") or "")
+            owns = max(0.0, float(due.get("owns_seconds") or 0))
+            starts = max(0.0, float(due.get("starts_in") or 0))
+            remaining = owns
+            assigned: list[dict[str, Any]] = []
+            pool = pools.setdefault(road, [])
+            while remaining > 1.0:
+                at = next((i for i, item in enumerate(pool)
+                           if float(item.get("available") or 0) <= starts), -1)
+                if at < 0:
+                    break
+                item = pool.pop(at)
+                fills_entry = bool(item.get("fills_entry"))
+                projected = (remaining if fills_entry else max(0.0, float(
+                    item.get("projected_seconds") or 0)))
+                if projected <= 0:
+                    continue
+                allocated = min(remaining, projected)
+                ready_seconds = ((allocated if fills_entry else min(
+                    allocated, float(item.get("seconds") or 0)))
+                                 if item.get("ready") else 0.0)
+                public = {
+                    "id": str(item.get("id") or ""),
+                    "ready": bool(item.get("ready")),
+                    "seconds": round(float(item.get("seconds") or 0), 1),
+                    "projected_seconds": round(projected, 1),
+                    "allocated_seconds": round(allocated, 1),
+                    "ready_seconds": round(ready_seconds, 1),
+                    "audio_seconds": round(float(
+                        item.get("audio_seconds")
+                        if item.get("audio_seconds") is not None
+                        else item.get("seconds") or 0), 1),
+                    "fills_entry": fills_entry,
+                    "remaining_tasks": int(item.get("remaining_tasks") or 0),
+                }
+                assigned.append(public)
+                # A safe pre-roll remains in the retained queue after airing.
+                # Model that future use now, at the tail and only after its
+                # rest, so the four-hour ledger exploits the cupboard without
+                # pretending one clip can fill two simultaneous slots.
+                airings = int(item.get("remaining_airings") or 1)
+                if item.get("ready") and airings > 1:
+                    repeat = dict(item)
+                    repeat["remaining_airings"] = airings - 1
+                    repeat["available"] = (starts if orch_policy(
+                        "repeats_hard") else starts + shelf_reuse_rest())
+                    pool.append(repeat)
+                if public["id"] not in selected_ids:
+                    selected_ids.add(public["id"])
+                    result["selected"].append({**public, "kind": road,
+                                               "row": item.get("row"),
+                                               "entry": item.get("entry")})
+                remaining -= allocated
+            ready = sum(float(x.get("ready_seconds") or 0) for x in assigned)
+            planned = sum(float(x.get("allocated_seconds") or 0)
+                          for x in assigned)
+            slot_row = {
+                "sequence": seq, "commit_id": str(due.get("commit_id") or ""),
+                "kind": str(due.get("kind") or ""), "road": road,
+                "label": str(due.get("label") or road),
+                "in_seconds": round(starts, 1), "owns_seconds": round(owns, 1),
+                "ready_seconds": round(ready, 1),
+                "planned_seconds": round(planned, 1),
+                "short_seconds": round(max(0.0, owns - planned), 1),
+                "recording_seconds": round(max(0.0, planned - ready), 1),
+                "stock": assigned, "current": bool(due.get("current")),
+            }
+            result["slots"].append(slot_row)
+            state = result["roads"].setdefault(road, {
+                "owed_seconds": 0.0, "ready_seconds": 0.0,
+                "planned_seconds": 0.0, "short_seconds": 0.0,
+                "items": 0, "unready_items": 0,
+            })
+            state["owed_seconds"] += owns
+            state["ready_seconds"] += ready
+            state["planned_seconds"] += planned
+            state["short_seconds"] += max(0.0, owns - planned)
+            state["items"] += len(assigned)
+            state["unready_items"] += sum(1 for x in assigned
+                                           if not x.get("ready"))
+        for state in result["roads"].values():
+            for key in ("owed_seconds", "ready_seconds", "planned_seconds",
+                        "short_seconds"):
+                state[key] = round(float(state[key]), 1)
+        result["selected_ids"] = list(selected_ids)
+        result["owed_seconds"] = round(sum(
+            float(s.get("owns_seconds") or 0) for s in result["slots"]), 1)
+        result["ready_seconds"] = round(sum(
+            float(s.get("ready_seconds") or 0) for s in result["slots"]), 1)
+        result["planned_seconds"] = round(sum(
+            float(s.get("planned_seconds") or 0) for s in result["slots"]), 1)
+        result["short_seconds"] = round(sum(
+            float(s.get("short_seconds") or 0) for s in result["slots"]), 1)
+        assigned_room = 0.0
+        new_room = 0.0
+        for road, state in result["roads"].items():
+            # A written row is not free merely because the ledger has bound
+            # it to a slot. Until its current tint and every take exist, it
+            # still occupies the studio. Charge each concrete selected row
+            # once here; otherwise a cupboard full of unfinished scripts can
+            # make a catastrophically loaded room report zero pressure.
+            assigned = sum(
+                float(task_cost(road) or 0) * max(
+                    1, int(item.get("remaining_tasks") or 0))
+                for item in result["selected"]
+                if str(item.get("kind") or "") == road
+                and not item.get("ready")
+            )
+            short = float(state.get("short_seconds") or 0)
+            gain = max(1.0, float(task_gain(road) or 1.0))
+            if road == "track_talk":
+                # Each unassigned carrier needs exactly one record pair and
+                # each new pair takes two independently measured side tasks.
+                count = sum(1 for slot in result["slots"]
+                            if str(slot.get("road") or "") == road
+                            and float(slot.get("short_seconds") or 0) > 1.0)
+                new_tasks = count * 2
+            else:
+                count = int((short + gain - 0.001) // gain) if short else 0
+                new_tasks = count
+            state["new_items"] = count
+            state["new_tasks"] = new_tasks
+            state["assigned_room_seconds"] = round(assigned, 1)
+            state["new_room_seconds"] = round(new_tasks * float(
+                task_cost(road) or 0), 1)
+            state["room_seconds"] = round(
+                assigned + float(state["new_room_seconds"]), 1)
+            assigned_room += assigned
+            new_room += float(state["new_room_seconds"])
+        capacity = max(1.0, hours * 3600.0 * SLOT_DUTY)
+        result["assigned_room_seconds"] = round(assigned_room, 1)
+        result["new_room_seconds"] = round(new_room, 1)
+        result["room_seconds"] = round(assigned_room + new_room, 1)
+        result["room_capacity"] = round(capacity, 1)
+        result["pressure"] = round(result["room_seconds"] / capacity, 3)
+        result["say"] = (
+            f"{int(result['ready_seconds'] / 60)} min of schedule release-ready and "
+            f"{int((result['planned_seconds'] - result['ready_seconds']) / 60)} "
+            f"min assigned in FIFO order against {int(result['owed_seconds'] / 60)} "
+            f"min owed; {int(result['short_seconds'] / 60)} min still needs "
+            f"a script. Finishing assigned and missing work costs about "
+            f"{int(result['room_seconds'] / 60)} room-min "
+            f"({int(result['pressure'] * 100)}% of safe capacity)")
+    except Exception:  # noqa: BLE001
+        result["say"] = "the commitment inventory could not be reconciled"
+    _INVENTORY_PLAN.update({"at": now, "hours": hours, "plan": result})
+    return dict(result)
+
+
+def committed_stock_ids(kind: str = "", hours: float = 0.0,
+                        ready: bool | None = None) -> set[str]:
+    """Concrete rows selected for the horizon, optionally by readiness."""
+    out: set[str] = set()
+    try:
+        for item in commitment_inventory_plan(hours).get("selected") or []:
+            if kind and str(item.get("kind") or "") != str(kind):
+                continue
+            if ready is not None and bool(item.get("ready")) != bool(ready):
+                continue
+            sid = str(item.get("id") or "")
+            if sid:
+                out.add(sid)
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def commitment_write_needed(kind: str, hours: float = 0.0) -> bool:
+    """Whether another script of this road has an unassigned obligation."""
+    try:
+        state = (commitment_inventory_plan(hours).get("roads") or {}).get(
+            str(kind)) or {}
+        return float(state.get("short_seconds") or 0) > 1.0
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def slot_stock() -> dict[str, int]:
@@ -24128,6 +25855,50 @@ def orch_scan() -> dict[str, Any]:
             return out                  # one at a time; answer that first
         if now - float(_ORCH.get("last") or 0) < ORCH_ASK_FLOOR:
             return out
+        # #1130: OFF AIR, THE QUESTION IS THE STOCKING. The orchestrator
+        # had made eleven judgment calls alone and asked nothing for
+        # hours. While the station banks, the question that matters is
+        # the one on the operator's own panel: which road is furthest
+        # behind the three-hour goal, and how hard may it be pushed.
+        # The first option is the default, so an unanswered ask becomes
+        # the push - the operator's standing instruction.
+        if radio_paused() and not _orch_recent("offline_stock"):
+            try:
+                _needs = hour_needs_now() or {}
+                _shorts = sorted(
+                    ((max(0.0, float(v.get("owed") or 0)
+                          - float(v.get("held") or 0)), k)
+                     for k, v in _needs.items()),
+                    reverse=True)
+                if _shorts and _shorts[0][0] > 300.0:
+                    _gap, _road = _shorts[0]
+                    _name = SHELF_LABEL.get(_road, _road)
+                    out = orch_raise(
+                        "offline_stock",
+                        f"The station is off air and banking. {_name} is "
+                        f"furthest behind the three-hour goal - "
+                        f"{int(_gap)}s short of the "
+                        f"{int(float((_needs.get(_road) or {}).get('owed') or 0))}s "
+                        "the hours owe it. I can push it hardest, put "
+                        "piper voices on it as well, or leave it short. "
+                        "If you do not answer I will push.",
+                        "routine",
+                        [
+                            {"ask": f"{_name} is the furthest behind "
+                                    "while we bank. What should I do?",
+                             "options": [
+                                 _opt(f"Build {_name} first until covered",
+                                      f"drive:{_road}"),
+                                 _opt("Let piper voices record it too",
+                                      f"piperok:{_road}"),
+                                 _opt("Leave it short for now",
+                                      "drive:none"),
+                             ]},
+                        ])
+                    if out:
+                        return out
+            except Exception:  # noqa: BLE001
+                pass
         board = slot_board(2)
         hour = board.get("hour") or {}
         bad = [r for r in (board.get("slots") or [])
@@ -24484,6 +26255,19 @@ def orch_apply(does: str) -> str:
             said = {"full": "the crystal tints everything",
                     "easy": "the crystal tints on the fast model",
                     "off": "the second pass is off"}.get(arg, "")
+        elif verb == "drive":
+            _ORCH["policy"]["drive_road"] = {
+                "value": str(arg), "at": time.time()}
+            said = (f"{SHELF_LABEL.get(str(arg), str(arg))} is built first "
+                    "until it is covered"
+                    if arg and arg != "none" else "no road is pinned")
+        elif verb == "piperok":
+            try:
+                piper_authorise(str(arg), 3600.0)
+                said = (f"piper voices may record "
+                        f"{SHELF_LABEL.get(str(arg), str(arg))} for an hour")
+            except Exception:  # noqa: BLE001
+                said = "noted"
         elif verb == "thin":
             _ORCH["policy"]["thin_road"] = {
                 "value": str(arg), "at": time.time()}
@@ -24981,13 +26765,19 @@ def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
     free: tuple[str, dict[str, Any]] | None = None
     made: tuple[str, dict[str, Any]] | None = None
     try:
+        wanted = committed_stock_ids(ready=False)
         for kind in list(_SHELF):
             for row in list(_SHELF.get(kind) or []):
                 try:
                     if not isinstance(row, dict):
                         continue
-                    if row.get("tint_ok") or row.get("tinted"):
-                        continue        # already carries one
+                    if alt_sid(str(kind), row) not in wanted:
+                        continue        # unused stock is retired, not polished
+                    target = dialogue_entry(row) or row
+                    if dialogue_tint_ready(str(kind), row):
+                        continue        # active words already carry it
+                    if target.get("preparing"):
+                        continue
                     # #1119: AND A FAILURE RESTS. `tint_tried` was
                     # written by #1104 and read by nothing - one grep,
                     # one hit - so a round that blew its deadline came
@@ -24995,10 +26785,12 @@ def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
                     # for eight to sixteen minutes a go. It gets its
                     # turn back after the rest, behind everything that
                     # has not been tried.
-                    if (time.time() - float(row.get("tint_tried") or 0)
+                    if (time.time() - float(target.get("tint_tried") or 0)
                             < TINT_RETRY_REST):
                         continue
-                    if not str(row.get("text") or "").strip():
+                    text = str(target.get("script") or target.get("text")
+                               or "").strip()
+                    if not text:
                         continue        # nothing to rewrite
                     if row.get("aired_at"):
                         # It has been out, so it is coming round again -
@@ -25006,8 +26798,8 @@ def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
                         if again is None and shelf_is_repeat(kind, row):
                             again = (kind, row)
                         continue
-                    _key = str(row.get("key") or "")
-                    if _key and pantry_get(_key):
+                    _has_audio = bool(_row_clip_keys(row) or row.get("produced"))
+                    if _has_audio:
                         if made is None:
                             made = (kind, row)
                         continue
@@ -25037,29 +26829,15 @@ async def retint_shelf() -> str:
         # costs nothing to re-cut because nothing is waiting on it.
         if not free and surplus() <= 0 and not radio_paused():
             return ""
-        _was = str(row.get("text") or "")
-        _got = await crystal_tint(_was, str(kind), row.get("verbatim"))
-        row["tint"] = {"ok": bool(_got.get("ok")),
-                       "why": str(_got.get("why") or ""),
-                       "world": str(_got.get("world") or ""),
-                       "ms": int(_got.get("ms") or 0),
-                       "later": True}
-        if not _got.get("ok"):
-            row["tint_tried"] = time.time()
+        target = dialogue_entry(row) or row
+        _was = str(target.get("script") or target.get("text") or "")
+        if not await ensure_shelf_row_tinted(str(kind), row, critical=False):
             return ""
-        row.setdefault("text_plain", _was)
-        row["text"] = str(_got.get("script") or _was)
-        row["tint_ok"] = True
-        if not free:
-            # #1077: the words changed, so the recording is stale. Drop
-            # the keys and let it be made again rather than airing the
-            # old audio under the new script.
-            for _k in ("key", "keys", "seconds", "made", "takes"):
-                row.pop(_k, None)
+        target = dialogue_entry(row) or row
         pipeline_log(
             "crystal",
             f"(#1104) {SHELF_LABEL.get(kind, kind)} has been put through "
-            f"the crystal - {_got.get('ms')}ms"
+            f"the crystal - {int((target.get('tint') or {}).get('ms') or 0)}ms"
             + ("" if free else ", and its old recording was dropped so the "
                               "voice matches the new words"),
             extra=("THE LATER PASS, FOR EVERY ROAD (#1104)\n\n"
@@ -25068,7 +26846,8 @@ async def retint_shelf() -> str:
                    "calls, memos and station IDs had no path to it at "
                    "all.\n\nAS WRITTEN:\n" + _was[:1400]
                    + "\n\nAS THE CRYSTAL HAS IT:\n"
-                   + str(_got.get("script") or "")[:1400]))
+                   + str(target.get("script") or target.get("text")
+                         or "")[:1400]))
         return str(kind)
     except Exception:  # noqa: BLE001
         return ""
@@ -25106,6 +26885,15 @@ async def retint_one() -> str:
             return _say("the second pass is switched off")
         if not crystal_active():
             return _say("no crystal is on")
+        try:
+            urgent = [r for r in coord_upcoming(1800.0)
+                      if not r.get("cannot")
+                      and float(r.get("short_seconds") or 0) > 0]
+        except Exception:  # noqa: BLE001
+            urgent = []
+        if urgent:
+            return _say("the next 30 minutes still need schedule-critical "
+                        "tinted audio; cupboard polish waits")
         _hold = tint_should_stop()
         if _hold:
             return _say(_hold)
@@ -25121,14 +26909,17 @@ async def retint_one() -> str:
             if _did:
                 return _did
         want = None
+        wanted = committed_stock_ids("banter", ready=False)
         for entry in list(_LARDER):
             if not isinstance(entry, dict):
                 continue
+            if alt_sid("banter", entry) not in wanted:
+                continue                # no future obligation owns this round
             if str(entry.get("script_tinted") or ""):
                 continue                # already has one
             if not str(entry.get("script") or ""):
                 continue
-            if entry.get("preparing"):
+            if entry.get("preparing") or entry.get("tinting"):
                 continue                # #1077: do not race the preparer
             got = entry.get("tint")
             if isinstance(got, dict) and got.get("ok"):
@@ -25157,65 +26948,22 @@ async def retint_one() -> str:
                 return _did
             return _say(f"nothing in the reserve or on the shelf needs it "
                         f"({len(_LARDER)} round(s) banked)")
-        _got = await crystal_tint(str(want.get("script") or ""),
-                                  str(want.get("prep_kind") or ""),
-                                  want.get("verbatim"))
-        # #1122: AND THE GUARD IS CHECKED AGAIN, HERE. The test above -
-        # "#1077: do not race the preparer" - runs BEFORE an await
-        # measured at 245 seconds, and at 540 to 675 on other entries.
-        # larder_prepare sets preparing=True, plans the round, writes
-        # `chunks`, then sits in a thirty-to-eighty-second render:
-        # squarely inside that window. The wipe below then drops
-        # `chunks` off a round that is being built, and prep_board sums
-        # `chunks` to report the road's lines - which is why banter read
-        # `written 8, lines 0` for hours while every other road banked.
-        #
-        # Awaited, these two could never overlap. #1119 made this
-        # fire-and-forget so it would stop stalling the coordinator for
-        # sixteen minutes - right in itself, and it turned a guard that
-        # had never been exercised into one that is wrong nearly every
-        # time. Identity, not equality: `in` on a list of dicts is a
-        # deep compare and would match the wrong entry.
-        if want.get("preparing") or not any(e is want for e in _LARDER):
+        _was = str(want.get("script") or "")
+        if not await ensure_entry_tinted(
+                want, str(want.get("prep_kind") or "banter"),
+                critical=False):
             return ""
-        want["tint"] = {
-            "ok": bool(_got.get("ok")), "why": str(_got.get("why") or ""),
-            "world": str(_got.get("world") or ""),
-            "ms": int(_got.get("ms") or 0),
-            "prompt": str(_got.get("prompt") or "")[:8000],
-            "chunks": list(_got.get("chunks") or []),
-            "later": True,
-        }
-        if not _got.get("ok"):
-            want["tint_tried"] = time.time()                   # #1122
-            return ""
-        want.setdefault("script_plain", str(want.get("script") or ""))
-        want["script_tinted"] = str(_got.get("script") or "")
-        want["script"] = str(_got.get("script") or "")
-        want["use"] = "tinted"
-        # #1077: AND THE OLD AUDIO GOES WITH IT. This is the one road
-        # where the rewrite happens AFTER the render, and it was
-        # swapping the words while keeping every key - so each line
-        # missed the pantry and re-rendered live on air while the log
-        # claimed "its audio was made during the last record". The
-        # manual toggle has done this correctly all along.
-        for _k in ("takes", "keys", "made", "seconds", "prepared",
-                   "chunks", "prep_turns", "frozen"):
-            want.pop(_k, None)
-        try:
-            want["profile"] = _larder_profile_signature()
-        except Exception:  # noqa: BLE001
-            pass
         pipeline_log("crystal",
                      "(#1068) a banked round that went out plain has been "
-                     f"rewritten on a later pass - {_got.get('ms')}ms",
+                     "rewritten on a resumable later pass - "
+                     f"{int((want.get('tint') or {}).get('ms') or 0)}ms",
                      extra=("THE LATER PASS (#1068)\n\nThe station has "
                             "been promising this on every round the "
                             "rewrite refused. Until now nothing did it.\n\n"
                             "AS BANKED:\n"
-                            + str(want.get("script_plain") or "")[:1500]
+                            + str(want.get("script_plain") or _was)[:1500]
                             + "\n\nAS REWRITTEN:\n"
-                            + str(_got.get("script") or "")[:1500]))
+                            + str(want.get("script") or "")[:1500]))
         return str(want.get("prep_kind") or "a round")
     except Exception:  # noqa: BLE001
         return ""
@@ -25250,105 +26998,91 @@ def commit_board(ahead: int = 10, fresh: bool = False) -> list[dict[str, Any]]:
         return list(_COMMITS["rows"])
     rows: list[dict[str, Any]] = []
     try:
-        coming = coord_upcoming() or []
-        supply = slot_supply()
-        # What the writing room can actually get through between now and
-        # each entry. Claimed as we walk, so the third gallery round in
-        # an hour is not promised the same minutes as the first.
+        plan = commitment_inventory_plan(fresh=fresh)
         claimed = 0.0
-        for one in coming[:max(1, min(24, int(ahead)))]:
-            kind = str(one.get("kind") or "")
-            if not kind:
-                continue
-            # coord_upcoming already resolves the road; `starts_in` is
-            # its own name for how far off the entry is.
-            prep = str(one.get("road")
-                       or SCHED_PREP_KIND.get(kind) or kind)
-            due = max(0.0, float(one.get("starts_in") or 0))
-            cost = float(task_cost(prep) or 0)
-            # Anything already made and free by then is the cheapest
-            # answer there is, and it is not a compromise.
-            pool = [w for w in (supply.get(prep) or []) if w <= due]
+        for one in (plan.get("slots") or [])[:max(1, min(200, int(ahead)))]:
+            prep = str(one.get("road") or "")
+            due = max(0.0, float(one.get("in_seconds") or 0))
+            owns = max(0.0, float(one.get("owns_seconds") or 0))
+            ready = max(0.0, float(one.get("ready_seconds") or 0))
+            planned = max(0.0, float(one.get("planned_seconds") or 0))
+            short = max(0.0, float(one.get("short_seconds") or 0))
+            gain = max(1.0, float(task_gain(prep) or 1.0))
+            tasks = (1 if prep == "track_talk" and short > 1.0 else
+                     int((short + gain - 0.001) // gain) if short else 0)
+            stock = list(one.get("stock") or [])
+            unfinished = sum(1 for item in stock if not item.get("ready"))
+            each_cost = float(task_cost(prep) or 0)
+            assigned_tasks = sum(
+                max(1, int(item.get("remaining_tasks") or 0))
+                for item in stock if not item.get("ready"))
+            new_tasks = tasks * (2 if prep == "track_talk" else 1)
+            assigned_cost = each_cost * assigned_tasks
+            new_cost = each_cost * new_tasks
+            cost = assigned_cost + new_cost
+            # `claimed` is already studio seconds. Applying the duty fraction
+            # to it a second time understated earlier commitments and let
+            # downstream slots promise the same room.
+            room = max(0.0, due * SLOT_DUTY - claimed)
             row: dict[str, Any] = {
-                "kind": kind, "prep": prep,
-                "label": str(one.get("label") or kind),
-                "in_seconds": round(due, 1),
-                "cost": round(cost, 1),
-                "room": 0.0, "commit": "fresh", "why": "",
-                "stock": len(pool),
+                "commit_id": str(one.get("commit_id") or ""),
+                "sequence": int(one.get("sequence") or 0),
+                "kind": str(one.get("kind") or ""), "prep": prep,
+                "label": str(one.get("label") or prep),
+                "in_seconds": round(due, 1), "owns_seconds": round(owns, 1),
+                "ready_seconds": round(ready, 1),
+                "planned_seconds": round(planned, 1),
+                "short_seconds": round(short, 1),
+                "cost": round(cost, 1), "room": round(room, 1),
+                "stock": len(stock), "unfinished_stock": unfinished,
+                "unfinished_tasks": assigned_tasks,
+                "new_tasks": new_tasks,
+                "stock_ids": [str(x.get("id") or "")
+                              for x in stock],
+                "commit": "fresh", "why": "",
             }
-            if kind in CANNOT_PREPARE:
-                row["commit"] = "live"
-                row["why"] = str(CANNOT_PREPARE.get(kind) or
-                                 "this one can only be done live")
-                rows.append(row)
-                continue
-            room = max(0.0, (due - claimed) * SLOT_DUTY)
-            row["room"] = round(room, 1)
-            if pool:
-                # Something is ready. Take it and spend no room at all.
+            if ready >= owns - 1.0:
                 row["commit"] = "ready"
-                row["why"] = (f"{len(pool)} already made and free by then "
-                              "- nothing to write")
-                try:
-                    supply[prep].remove(pool[0])
-                except Exception:  # noqa: BLE001
-                    pass
-                rows.append(row)
-                continue
-            if cost * COMMIT_MARGIN <= room:
-                row["commit"] = "fresh"
-                row["why"] = (f"{int(room)}s of writing room before it airs "
-                              f"against about {int(cost)}s of work")
+                row["why"] = (("one exact queued record has both tinted "
+                               "recorded bookends; its music carries all "
+                               f"{int(owns)}s this entry owns")
+                              if prep == "track_talk" else
+                              (f"{int(ready)}s of tinted recorded FIFO stock "
+                               f"is bound to all {int(owns)}s this entry owns"))
+            elif cost * COMMIT_MARGIN <= room:
+                row["commit"] = ("recording" if short <= 1.0 else "fresh")
+                row["why"] = (
+                    f"{unfinished} assigned FIFO row(s) and {tasks} new "
+                    f"item(s) ({assigned_tasks + new_tasks} task(s)) need "
+                    f"about {int(cost)}s of studio work, which "
+                    f"fits the {int(room)}s room before air")
                 claimed += cost
-                rows.append(row)
-                continue
-            if cost <= room:
+            elif cost <= room:
                 row["commit"] = "tight"
-                row["why"] = (f"{int(cost)}s of work into {int(room)}s of "
-                              "room - it will be close, so it goes first")
+                row["why"] = (
+                    f"finishing {unfinished} assigned row(s) and writing "
+                    f"{tasks} missing item(s) ({assigned_tasks + new_tasks} "
+                    f"task(s)) needs {int(cost)}s and only "
+                    f"just fits {int(room)}s of room")
                 claimed += cost
-                rows.append(row)
-                continue
-            # #1087: BEFORE ANYTHING IS CUT - would it fit with piper
-            # voices? The stop-gap changes which engine a line renders
-            # on; it never changed what the station believes a segment
-            # COSTS, so a painting round priced at 362s refused to start
-            # in a 165s window and became a hole while the engine that
-            # could have made it sat idle.
-            #
-            # A repeat still wins if there is one: it was made properly.
-            # This is only ever measured against silence.
-            _rough = cost_on_piper(prep)
-            if (not (supply.get(prep) or []) and may_take_on_piper(prep)
-                    and _rough <= room):
-                row["commit"] = "piper"
-                row["cost"] = round(_rough, 1)
-                row["why"] = (f"no time for a proper take ({int(cost)}s) "
-                              f"and nothing on the shelf - but piper "
-                              f"voices bring it to about {int(_rough)}s, "
-                              f"which fits {int(room)}s. Not the best "
-                              "idea; better than no segment")
-                claimed += _rough
-                rows.append(row)
-                continue
-            # Not enough time. Is there anything in the cupboard at all,
-            # rested or not?
-            held = len(supply.get(prep) or [])
-            if held:
-                row["commit"] = "prerecord"
-                row["why"] = (f"no time to write it - {int(cost)}s of work "
-                              f"against {int(room)}s of room - so this "
-                              "moment is committed to a repeat")
-                try:
-                    supply[prep].pop(0)
-                except Exception:  # noqa: BLE001
-                    pass
             else:
-                row["commit"] = "cut"
-                row["why"] = (f"no time ({int(cost)}s of work against "
-                              f"{int(room)}s) and nothing on the shelf - "
-                              "the record runs on instead")
+                rough_each = float(cost_on_piper(prep) or 0)
+                rough = rough_each * (assigned_tasks + new_tasks)
+                if (assigned_tasks + new_tasks and may_take_on_piper(prep)
+                        and rough <= room):
+                    row["commit"] = "piper"
+                    row["cost"] = round(rough, 1)
+                    row["why"] = (
+                        f"{unfinished} assigned row(s) and {tasks} new item(s) "
+                        f"need {int(cost)}s in the proper room; Piper brings "
+                        f"that to {int(rough)}s")
+                    claimed += rough
+                else:
+                    row["commit"] = "cut"
+                    row["why"] = (
+                        f"the assigned and missing work needs {int(cost)}s but "
+                        f"only {int(room)}s remains; unfinished dialogue cannot "
+                        "be promised and music must carry the uncovered tail")
             rows.append(row)
         _COMMITS.update({"at": now, "rows": rows})
     except Exception:  # noqa: BLE001
@@ -25375,6 +27109,7 @@ def commit_for(kind: str) -> str:
 def commit_state() -> dict[str, Any]:
     """The sheet, for reading, with its own arithmetic at the top."""
     rows = commit_board()
+    plan = commitment_inventory_plan()
     tally: dict[str, int] = {}
     for row in rows:
         tally[str(row.get("commit"))] = tally.get(
@@ -25383,6 +27118,22 @@ def commit_state() -> dict[str, Any]:
     return {
         "at": time.time(), "rows": rows, "tally": tally,
         "margin": COMMIT_MARGIN, "duty": SLOT_DUTY,
+        "horizon": {
+            "hours": plan.get("hours"),
+            "slots": len(plan.get("slots") or []),
+            "selected_rows": len(plan.get("selected_ids") or []),
+            "owed_seconds": plan.get("owed_seconds"),
+            "ready_seconds": plan.get("ready_seconds"),
+            "planned_seconds": plan.get("planned_seconds"),
+            "short_seconds": plan.get("short_seconds"),
+            "assigned_room_seconds": plan.get("assigned_room_seconds"),
+            "new_room_seconds": plan.get("new_room_seconds"),
+            "room_seconds": plan.get("room_seconds"),
+            "room_capacity": plan.get("room_capacity"),
+            "pressure": plan.get("pressure"),
+            "roads": plan.get("roads") or {},
+            "say": plan.get("say") or "",
+        },
         "say": ((f"{len(late)} of the next {len(rows)} segments cannot be "
                  "written in the time before they air - "
                  + ", ".join(f"{r['label']} ({r['commit']})"
@@ -26352,6 +28103,40 @@ def surplus_caller_clause() -> str:
            "Nothing they say is small." if hard else ""))
 
 
+def tint_stock_state() -> dict[str, Any]:
+    """Tint coverage across every persisted dialogue shape."""
+    rows: list[tuple[str, Any]] = []
+    try:
+        for kind, shelf in _SHELF.items():
+            for row in (shelf or []):
+                target = dialogue_entry(row) or row
+                if str(target.get("script") or target.get("text") or ""):
+                    rows.append((str(kind), row))
+        rows.extend(("banter", e) for e in _LARDER
+                    if isinstance(e, dict) and str(e.get("script") or ""))
+        for record in _TRACK_TALK.values():
+            for side in ((record or {}).get("intro"),
+                         (record or {}).get("outro")):
+                if isinstance(side, dict) and str(side.get("text") or ""):
+                    rows.append(("track_talk", side))
+    except Exception:  # noqa: BLE001
+        pass
+    by: dict[str, dict[str, int]] = {}
+    done = 0
+    for kind, row in rows:
+        ok = (bool(row.get("tint_ok")) if kind == "track_talk"
+              else dialogue_tint_ready(kind, row))
+        seat = by.setdefault(kind, {"rows": 0, "done": 0})
+        seat["rows"] += 1
+        if ok:
+            seat["done"] += 1
+            done += 1
+    return {"on": bool(dialogue_tint_required()), "rows": len(rows),
+            "done": done,
+            "share": round(done / float(len(rows)), 3) if rows else 0.0,
+            "by_kind": by}
+
+
 def surplus_state() -> dict[str, Any]:
     """What the surplus is currently buying."""
     got = surplus()
@@ -26371,14 +28156,7 @@ def surplus_state() -> dict[str, Any]:
         # #1104: how much of what is standing by has actually been
         # through the crystal. "All dialogue needs to go through the
         # tinting pass" - this is the number that says whether it has.
-        "tinted": (lambda rows: {
-            "on": bool(crystal_tint_two_pass()),
-            "rows": len(rows),
-            "done": sum(1 for r in rows if r.get("tint_ok")),
-            "share": (round(sum(1 for r in rows if r.get("tint_ok"))
-                            / float(len(rows)), 3) if rows else 0.0),
-        })([r for k in list(_SHELF) for r in (_SHELF.get(k) or [])
-            if isinstance(r, dict) and str(r.get("text") or "")]),
+        "tinted": tint_stock_state(),
         "toward_goal": round(box_depth(), 3),
         "goal_hours": round(prepare_target_seconds() / 3600.0, 2),
         # #1094: the stand-down ladder as it actually stands, and
@@ -26386,9 +28164,10 @@ def surplus_state() -> dict[str, Any]:
         # #1099: whether the pair are standing down from writing
         # ahead, and what for - answerable now, not only from the log.
         "larder": {
-            "holds": len(_LARDER),
+            "holds": sum(1 for e in _LARDER
+                         if dialogue_row_viable("banter", e)),
             "floor": larder_floor(),
-            "cap": _LARDER_MAX,
+            "cap": larder_cap(),
             "standing_down": bool(_LARDER_YIELD[1]),
             "for": list(_LARDER_YIELD[3] or []),
             "say": (("the pair are writing ahead normally")
@@ -26530,9 +28309,7 @@ def hour_shortfall() -> dict[str, Any]:
                 continue
             prep = str(SCHED_PREP_KIND.get(kind) or kind)
             row = board.get(prep) or {}
-            held = int(row.get("written") or 0)
-            if kind == "banter":
-                held = max(held, len(_LARDER))
+            held = int(prepared_by_kind().get(prep) or 0)
             tag = {"kind": kind, "label": label, "held": held}
             (out["ready"] if held > 0 else out["short"]).append(tag)
     except Exception:  # noqa: BLE001
@@ -26570,6 +28347,9 @@ def sched_result(row: dict[str, Any] | None, aired: bool,
         row["aired"] = bool(aired)
         row["why"] = str(why or "")[:120]
         row["took"] = round(time.time() - float(row.get("at") or 0), 1)
+        _hour_note = globals().get("coord_schedule_note")
+        if callable(_hour_note):
+            _hour_note(row, bool(aired), why)
     except Exception:  # noqa: BLE001
         pass
 
@@ -26611,7 +28391,13 @@ def clock_may_air(kind: str) -> str:
         # pause was removing the clocks' only restraint.
         if radio_paused():
             _CLOCK_HELD.pop(kind, None)
-            return "the station is off air"
+            # This function's contract is "truthy means put it on air".
+            # Returning the explanatory sentence here did the exact opposite
+            # of the comment: every independent clock treated pause as an
+            # unconditional permission and generated content live into a
+            # closed output. The rooms have their own preparation loop; a
+            # clock's only correct answer while paused is defer.
+            return ""
         if time.time() - _BOX_LAST_OK[0] > CLOCK_QUIET_FLOOR:
             _CLOCK_HELD.pop(kind, None)
             return "the air is quiet"
@@ -26724,12 +28510,19 @@ COORD_TICK = 15.0                       # how often it looks at the air
 COORD_GAP_FLOOR = 12.0                  # shorter than this is a breath
 COORD_GAPS_KEEP = 400
 COORD_HALVES_KEEP = 24                  # twelve hours of half hours
+COORD_HOURS_KEEP = 168                  # one week of broadcast hours
 COORD_PATH = data_path("coordinator.json")
 
 _GAPS: list[dict[str, Any]] = []        # closed gaps, newest last
 _GAP_OPEN: dict[str, Any] = {}          # the one happening now, if any
 _HALVES: list[dict[str, Any]] = []      # closed half-hour reports
 _COORD_PLAN: dict[str, Any] = {}        # the work order for the next half
+_HOURS: list[dict[str, Any]] = []       # attributable closed-hour scorecards
+_HOUR_ACTIVE: dict[str, Any] = {}       # contract following active airtime
+_HOUR_LEARNING: dict[str, dict[str, Any]] = {}  # persistent road feedback
+_HOUR_VIEW: dict[str, Any] = {}         # cheap glass cache
+_HOUR_SAVED = [0.0]                     # bound active-contract crash loss
+HOUR_VIEW_EVERY = 30.0
 
 
 def _half_key(at: float | None = None) -> str:
@@ -26746,7 +28539,15 @@ def coord_save() -> None:
         tmp.write_text(json.dumps({
             "gaps": _GAPS[-COORD_GAPS_KEEP:],
             "halves": _HALVES[-COORD_HALVES_KEEP:],
-            "plan": _COORD_PLAN}))
+            "plan": _COORD_PLAN,
+            # #1131: all of the facts the controller claims to have learned
+            # survive a deploy. Previously bare arrivals and schedule results
+            # vanished at restart even though the UI called them learning.
+            "bare_arrivals": _BARE_ARRIVALS,
+            "schedule": _SCHED_LOG[-SCHED_LOG_KEEP:],
+            "hours": _HOURS[-COORD_HOURS_KEEP:],
+            "hour_active": _HOUR_ACTIVE,
+            "hour_learning": _HOUR_LEARNING}))
         tmp.replace(COORD_PATH)
     except Exception:  # noqa: BLE001
         pass                            # bookkeeping never takes the air
@@ -26763,8 +28564,527 @@ def coord_load() -> None:
         _HALVES[:] = list(got.get("halves") or [])[-COORD_HALVES_KEEP:]
         _COORD_PLAN.clear()
         _COORD_PLAN.update(got.get("plan") or {})
+        _BARE_ARRIVALS.clear()
+        _BARE_ARRIVALS.update({str(k): int(v or 0) for k, v in
+                               (got.get("bare_arrivals") or {}).items()})
+        _SCHED_LOG[:] = list(got.get("schedule") or [])[-SCHED_LOG_KEEP:]
+        _HOURS[:] = list(got.get("hours") or [])[-COORD_HOURS_KEEP:]
+        _HOUR_ACTIVE.clear()
+        _HOUR_ACTIVE.update(got.get("hour_active") or {})
+        # Downtime is neither broadcast time nor a missed requirement. Start
+        # the elapsed clock at load rather than billing a restart to the hour.
+        if _HOUR_ACTIVE:
+            _HOUR_ACTIVE["last_tick"] = time.time()
+        _HOUR_LEARNING.clear()
+        for road, row in (got.get("hour_learning") or {}).items():
+            if isinstance(row, dict):
+                _HOUR_LEARNING[str(road)] = dict(row)
     except Exception:  # noqa: BLE001
         pass
+
+
+# --- #1131: the closed-loop broadcast-hour controller -------------------
+#
+# The old coordinator could say what the sheet wanted and what a task cost,
+# but it never opened a contract for one broadcast hour, attributed outcomes
+# to that contract, scored it, or let the miss change the next plan. These
+# books follow ACTIVE AIRTIME: pause freezes the deadline/score clock while
+# the writing and recording rooms continue improving release readiness.
+
+
+def coord_road(kind: str = "") -> str:
+    """Normalise an air/schedule kind to the preparation road it satisfies."""
+    raw = str(kind or "")
+    road = str(SCHED_PREP_KIND.get(raw) or raw)
+    if road in ALT_PREP_KINDS:
+        return road
+    try:
+        on = str((_RADIO.get("sched_slot") or {}).get("kind")
+                 or _RADIO.get("sched_kind") or "")
+        road = str(SCHED_PREP_KIND.get(on) or on)
+        return road if road in ALT_PREP_KINDS else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def coord_learning_factor(road: str) -> float:
+    """Bounded feedback weight earned by misses in closed broadcast hours."""
+    try:
+        return max(1.0, min(3.0, float(
+            (_HOUR_LEARNING.get(str(road)) or {}).get("factor") or 1.0)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def coord_hour_inventory(fresh: bool = False) -> dict[str, Any]:
+    """Public, serialisable readiness for the next exact broadcast hour."""
+    now = time.time()
+    if (not fresh and _HOUR_VIEW.get("at")
+            and now - float(_HOUR_VIEW.get("at") or 0) < HOUR_VIEW_EVERY):
+        return dict(_HOUR_VIEW)
+    out: dict[str, Any] = {
+        "at": now, "owed_seconds": 0.0, "ready_seconds": 0.0,
+        "planned_seconds": 0.0, "recording_seconds": 0.0,
+        "short_seconds": 0.0, "selected": 0, "tint_ready": 0,
+        "tint_ratio": 0.0, "ready_ratio": 0.0,
+        "planned_ratio": 0.0, "release_ready": False, "roads": {},
+        "pressure": 0.0, "room_seconds": 0.0, "room_capacity": 0.0,
+    }
+    try:
+        plan = commitment_inventory_plan(1.0, fresh=fresh)
+        for key in ("owed_seconds", "ready_seconds", "planned_seconds",
+                    "short_seconds", "pressure", "room_seconds",
+                    "room_capacity"):
+            out[key] = round(float(plan.get(key) or 0), 3)
+        out["recording_seconds"] = round(max(
+            0.0, out["planned_seconds"] - out["ready_seconds"]), 3)
+        out["selected"] = len(plan.get("selected") or [])
+        tint_ready = 0
+        tint_by: dict[str, dict[str, int]] = {}
+        for item in plan.get("selected") or []:
+            road = str(item.get("kind") or "")
+            tint_state = tint_by.setdefault(road, {"selected": 0,
+                                                   "tint_ready": 0})
+            tint_state["selected"] += 1
+            try:
+                target = item.get("entry") or item.get("row") or {}
+                tinted = (track_talk_pair_tint_ready(target)
+                          if road == "track_talk"
+                          else dialogue_tint_ready(road, target))
+                if tinted:
+                    tint_ready += 1
+                    tint_state["tint_ready"] += 1
+            except Exception:  # noqa: BLE001
+                pass
+        out["tint_ready"] = tint_ready
+        out["tint_ratio"] = round(
+            tint_ready / max(1, int(out["selected"])), 4)
+        owed = max(0.0, float(out["owed_seconds"]))
+        out["ready_ratio"] = round(min(1.0, float(
+            out["ready_seconds"]) / owed), 4) if owed else 1.0
+        out["planned_ratio"] = round(min(1.0, float(
+            out["planned_seconds"]) / owed), 4) if owed else 1.0
+        out["release_ready"] = bool(
+            float(out["short_seconds"]) <= 1.0
+            and float(out["recording_seconds"]) <= 1.0
+            and (not out["selected"] or tint_ready == out["selected"]))
+        roads: dict[str, dict[str, Any]] = {}
+        slots = list(plan.get("slots") or [])
+        for road, state in (plan.get("roads") or {}).items():
+            public = {k: state.get(k) for k in (
+                "owed_seconds", "ready_seconds", "planned_seconds",
+                "short_seconds", "items", "unready_items", "new_items",
+                "unfinished_tasks", "new_tasks",
+                "assigned_room_seconds", "new_room_seconds", "room_seconds")}
+            public["entries"] = sum(1 for slot in slots
+                                    if str(slot.get("road") or "") == str(road))
+            public.update(tint_by.get(str(road)) or {
+                "selected": 0, "tint_ready": 0})
+            public["tint_ratio"] = round(
+                int(public["tint_ready"]) / max(1, int(public["selected"])),
+                4)
+            roads[str(road)] = public
+        out["roads"] = roads
+    except Exception:  # noqa: BLE001
+        out["why"] = "the exact one-hour inventory could not be reconciled"
+    _HOUR_VIEW.clear()
+    _HOUR_VIEW.update(out)
+    return dict(out)
+
+
+def coord_hour_start(at: float | None = None) -> dict[str, Any]:
+    """Open an immutable requirement contract for 3,600 active seconds."""
+    now = float(at if at is not None else time.time())
+    inventory = coord_hour_inventory(fresh=True)
+    targets = {str(road): round(float((row or {}).get("owed_seconds") or 0), 1)
+               for road, row in (inventory.get("roads") or {}).items()
+               if float((row or {}).get("owed_seconds") or 0) > 0}
+    entries = {str(road): int((row or {}).get("entries") or 0)
+               for road, row in (inventory.get("roads") or {}).items()
+               if str(road) in targets}
+    paused = bool(radio_paused())
+    active = {
+        "id": f"{int(now)}-{uuid.uuid4().hex[:8]}",
+        "started_at": now, "last_tick": now, "active_seconds": 0.0,
+        "targets": targets, "target_entries": entries,
+        "target_seconds": round(sum(targets.values()), 1),
+        "aired": {}, "schedule": {}, "tasks": {}, "production": {},
+        "seen_lines": {}, "retired_rows": 0, "retired_clips": 0,
+        "baseline": inventory, "was_paused": paused,
+        "pause_started": now if paused else 0.0,
+        "pause_start": inventory if paused else {},
+        "pause_total": 0.0, "pauses": [],
+    }
+    _HOUR_ACTIVE.clear()
+    _HOUR_ACTIVE.update(active)
+    _HOUR_VIEW.clear()
+    return dict(_HOUR_ACTIVE)
+
+
+def coord_task_note(kind: str, seconds: float, gain: float = 0.0,
+                    ok: bool = True) -> None:
+    """Attribute measured room work to the open broadcast hour."""
+    try:
+        if not _HOUR_ACTIVE:
+            return
+        raw = str(kind or "")[:32]
+        tasks = _HOUR_ACTIVE.setdefault("tasks", {})
+        row = tasks.setdefault(raw, {"attempts": 0, "failed": 0,
+                                     "seconds": 0.0, "gain": 0.0})
+        row["attempts"] += 1
+        row["failed"] += 0 if ok else 1
+        row["seconds"] = round(float(row.get("seconds") or 0)
+                               + max(0.0, float(seconds or 0)), 2)
+        row["gain"] = round(float(row.get("gain") or 0)
+                            + max(0.0, float(gain or 0)), 2)
+        # Only an explicitly named preparation road receives road credit.
+        # Generic render/tint work remains visible under tasks without being
+        # guessed onto whichever segment happens to be on air.
+        road = str(SCHED_PREP_KIND.get(raw) or raw)
+        if road in ALT_PREP_KINDS:
+            made = _HOUR_ACTIVE.setdefault("production", {}).setdefault(
+                road, {"attempts": 0, "failed": 0,
+                       "seconds": 0.0, "gain": 0.0})
+            made["attempts"] = int(made.get("attempts") or 0) + 1
+            made["failed"] = int(made.get("failed") or 0) + (0 if ok else 1)
+            made["seconds"] = round(float(made.get("seconds") or 0)
+                                    + max(0.0, float(seconds or 0)), 2)
+            made["gain"] = round(float(made.get("gain") or 0)
+                                 + max(0.0, float(gain or 0)), 2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def coord_air_note(text: str, who: str = "", kind: str = "") -> None:
+    """Credit one unique aired line to its active-hour road."""
+    try:
+        if not _HOUR_ACTIVE or radio_paused():
+            return
+        body = " ".join(str(text or "").split())
+        road = coord_road(kind)
+        if len(body) < 12 or not road:
+            return
+        now = time.time()
+        key = hashlib.sha1(
+            f"{road}|{who}|{body}".encode("utf-8", "ignore")).hexdigest()[:20]
+        seen = _HOUR_ACTIVE.setdefault("seen_lines", {})
+        if now - float(seen.get(key) or 0) < 5.0:
+            return                         # two ledgers saw the same playout
+        seen[key] = now
+        if len(seen) > 240:
+            for old, _stamp in sorted(seen.items(), key=lambda pair: pair[1])[:-200]:
+                seen.pop(old, None)
+        seconds = max(0.5, len(body) / 14.0)  # same measured estimate as stock
+        aired = _HOUR_ACTIVE.setdefault("aired", {})
+        aired[road] = round(float(aired.get(road) or 0) + seconds, 2)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def coord_schedule_note(row: dict[str, Any], aired: bool,
+                        why: str = "") -> None:
+    """Attribute one named schedule result to the active hour and road."""
+    try:
+        if not _HOUR_ACTIVE or radio_paused():
+            return
+        road = coord_road(str((row or {}).get("kind") or "")) or "other"
+        state = _HOUR_ACTIVE.setdefault("schedule", {}).setdefault(
+            road, {"kept": 0, "missed": 0, "reasons": []})
+        state["kept" if aired else "missed"] += 1
+        if aired and road == "track_talk":
+            # The deliverable is a music carrier with exact recorded
+            # bookends. Credit its wall-clock slot once, not the handful of
+            # spoken seconds on every torrent pass through that same slot.
+            pos = _RADIO.get("sched_pos") or {}
+            carrier_id = "|".join((
+                str(pos.get("preset") or ""), str(pos.get("index") or 0),
+                str(pos.get("slot_id") or ""),
+                f"{float(pos.get('started') or 0):.3f}"))
+            seen = _HOUR_ACTIVE.setdefault("carrier_seen", {})
+            if carrier_id and carrier_id not in seen:
+                slot = _RADIO.get("sched_slot") or {}
+                owns = max(0.25, float(slot.get("minutes") or 3.0)) * 60.0
+                delivered = _HOUR_ACTIVE.setdefault("aired", {})
+                delivered[road] = round(float(delivered.get(road) or 0)
+                                        + owns, 2)
+                seen[carrier_id] = time.time()
+        if not aired and why:
+            state["reasons"] = (list(state.get("reasons") or [])
+                                + [str(why)[:120]])[-8:]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def coord_waste_note(rows: int = 0, clips: int = 0) -> None:
+    """Make speculative production retired during an hour auditable waste."""
+    try:
+        if _HOUR_ACTIVE:
+            _HOUR_ACTIVE["retired_rows"] = int(
+                _HOUR_ACTIVE.get("retired_rows") or 0) + max(0, int(rows or 0))
+            _HOUR_ACTIVE["retired_clips"] = int(
+                _HOUR_ACTIVE.get("retired_clips") or 0) + max(0, int(clips or 0))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def coord_hour_close(at: float | None = None) -> dict[str, Any]:
+    """Close, score, learn from, and persist one active-airtime contract."""
+    if not _HOUR_ACTIVE:
+        coord_hour_start(at)
+    now = float(at if at is not None else time.time())
+    active = dict(_HOUR_ACTIVE)
+    targets = dict(active.get("targets") or {})
+    aired = dict(active.get("aired") or {})
+    schedule = dict(active.get("schedule") or {})
+    target_total = sum(float(v or 0) for v in targets.values())
+    delivered = sum(min(float(targets.get(road) or 0),
+                        float(aired.get(road) or 0)) for road in targets)
+    delivery = min(1.0, delivered / target_total) if target_total else 1.0
+    kept = sum(int((row or {}).get("kept") or 0) for row in schedule.values())
+    missed = sum(int((row or {}).get("missed") or 0) for row in schedule.values())
+    adherence = kept / (kept + missed) if kept + missed else None
+    audits = [r for r in _BRIEF_LOG
+              if r.get("checked")
+              and float(r.get("at") or 0) >= float(active.get("started_at") or 0)]
+    quality = (sum(1 for r in audits if r.get("ok")) / len(audits)
+               if audits else None)
+    # Missing instrumentation does not receive a free perfect score; delivery
+    # carries that weight until adherence/quality have actual observations.
+    score = 100.0 * (0.85 * delivery
+                     + 0.10 * (adherence if adherence is not None else delivery)
+                     + 0.05 * (quality if quality is not None else delivery))
+    prior_score = (float(_HOURS[-1].get("score") or 0) if _HOURS else None)
+    roads: dict[str, dict[str, Any]] = {}
+    decisions: list[dict[str, Any]] = []
+    all_met = True
+    for road, target_value in targets.items():
+        target = max(0.0, float(target_value or 0))
+        got = max(0.0, float(aired.get(road) or 0))
+        sched = schedule.get(road) or {}
+        road_missed = int(sched.get("missed") or 0)
+        attainment = min(1.0, got / target) if target else 1.0
+        met = attainment >= 0.98 and road_missed == 0
+        all_met = all_met and met
+        learned = _HOUR_LEARNING.setdefault(road, {
+            "factor": 1.0, "hours": 0, "miss_streak": 0,
+            "success_streak": 0, "attainment_ema": attainment})
+        old_factor = coord_learning_factor(road)
+        if met:
+            factor = max(1.0, old_factor * 0.90)
+            learned["success_streak"] = int(learned.get("success_streak") or 0) + 1
+            learned["miss_streak"] = 0
+            action = "hold the requirement; decay the recovery premium"
+        else:
+            severity = max(0.0, 1.0 - attainment) + min(0.5, road_missed * 0.1)
+            factor = min(3.0, max(1.05,
+                old_factor * (1.0 + 0.25 * severity) + 0.05))
+            learned["miss_streak"] = int(learned.get("miss_streak") or 0) + 1
+            learned["success_streak"] = 0
+            emergency = False
+            try:
+                if may_take_on_piper(road):
+                    piper_authorise(road, 3600.0)
+                    emergency = True
+            except Exception:  # noqa: BLE001
+                pass
+            action = ("raise preparation priority and authorize emergency voice"
+                      if emergency else
+                      "raise preparation priority; reserve or cut before the deadline")
+        previous_ema = float(learned.get("attainment_ema") or attainment)
+        learned.update({
+            "factor": round(factor, 3),
+            "hours": int(learned.get("hours") or 0) + 1,
+            "attainment_ema": round(0.65 * previous_ema + 0.35 * attainment, 4),
+            "last_attainment": round(attainment, 4),
+            "last_target_seconds": round(target, 1),
+            "last_aired_seconds": round(got, 1),
+            "last_missed": road_missed, "last_at": now,
+        })
+        roads[road] = {
+            "target_seconds": round(target, 1),
+            "aired_seconds": round(got, 1),
+            "attainment": round(attainment, 4),
+            "kept": int(sched.get("kept") or 0), "missed": road_missed,
+            "met": met, "learning_before": round(old_factor, 3),
+            "learning_after": round(factor, 3),
+            "production": dict((active.get("production") or {}).get(road) or {}),
+        }
+        decisions.append({"road": road, "met": met,
+                          "factor": round(factor, 3), "action": action})
+    end_inventory = coord_hour_inventory(fresh=True)
+    report = {
+        "id": active.get("id"), "started_at": active.get("started_at"),
+        "closed_at": now, "active_seconds": round(float(
+            active.get("active_seconds") or 0), 1),
+        "wall_seconds": round(max(0.0, now - float(
+            active.get("started_at") or now)), 1),
+        "paused_seconds": round(float(active.get("pause_total") or 0), 1),
+        "target_seconds": round(target_total, 1),
+        "delivered_seconds": round(delivered, 1),
+        "delivery": round(delivery, 4), "kept": kept, "missed": missed,
+        "adherence": round(adherence, 4) if adherence is not None else None,
+        "quality": round(quality, 4) if quality is not None else None,
+        "quality_checks": len(audits), "score": round(score, 2),
+        "score_delta": (round(score - prior_score, 2)
+                        if prior_score is not None else None),
+        "improved": (score > prior_score if prior_score is not None else None),
+        "all_requirements_met": all_met,
+        "retired_rows": int(active.get("retired_rows") or 0),
+        "retired_clips": int(active.get("retired_clips") or 0),
+        "baseline": active.get("baseline") or {}, "ending": end_inventory,
+        "roads": roads, "tasks": active.get("tasks") or {},
+        "decisions": decisions, "pauses": active.get("pauses") or [],
+    }
+    _HOURS.append(report)
+    del _HOURS[:-COORD_HOURS_KEEP]
+    _HOUR_ACTIVE.clear()
+    coord_hour_start(now)
+    coord_save()
+    try:
+        pipeline_log(
+            "lookahead", f"broadcast hour closed at {score:.1f}% - "
+            f"{int(delivered)}s of {int(target_total)}s delivered, sheet "
+            f"kept {kept} and missed {missed}; "
+            + (f"{score - prior_score:+.1f} points from the prior hour; "
+               if prior_score is not None else "first attributable hour; ")
+            + "the next work order carries each road's learned correction "
+              "(#1131)")
+    except Exception:  # noqa: BLE001
+        pass
+    return report
+
+
+def coord_hour_tick(at: float | None = None) -> dict[str, Any] | None:
+    """Advance only on-air time; record what every paused interval bought."""
+    now = float(at if at is not None else time.time())
+    if not _HOUR_ACTIVE:
+        coord_hour_start(now)
+        coord_save()
+        return None
+    paused = bool(radio_paused())
+    was_paused = bool(_HOUR_ACTIVE.get("was_paused"))
+    transitioned = paused != was_paused
+    if transitioned:
+        inventory = coord_hour_inventory(fresh=True)
+        if paused:
+            _HOUR_ACTIVE["pause_started"] = now
+            _HOUR_ACTIVE["pause_start"] = inventory
+        else:
+            start = _HOUR_ACTIVE.get("pause_start") or {}
+            elapsed = max(0.0, now - float(
+                _HOUR_ACTIVE.get("pause_started") or now))
+            session = {
+                "started_at": _HOUR_ACTIVE.get("pause_started"),
+                "ended_at": now, "seconds": round(elapsed, 1),
+                "ready_gain": round(float(inventory.get("ready_seconds") or 0)
+                                    - float(start.get("ready_seconds") or 0), 1),
+                "tint_gain": int(inventory.get("tint_ready") or 0)
+                             - int(start.get("tint_ready") or 0),
+                "short_reduced": round(float(start.get("short_seconds") or 0)
+                                       - float(inventory.get("short_seconds") or 0), 1),
+                "release_ready": bool(inventory.get("release_ready")),
+            }
+            _HOUR_ACTIVE.setdefault("pauses", []).append(session)
+            _HOUR_ACTIVE["pauses"] = _HOUR_ACTIVE["pauses"][-12:]
+            _HOUR_ACTIVE["pause_total"] = round(float(
+                _HOUR_ACTIVE.get("pause_total") or 0) + elapsed, 1)
+            _HOUR_ACTIVE["pause_started"] = 0.0
+            _HOUR_ACTIVE["pause_start"] = {}
+            pipeline_log(
+                "lookahead", f"pause bought {int(session['ready_gain'])}s of "
+                f"release-ready dialogue and {session['tint_gain']} newly "
+                "tinted committed row(s); the broadcast-hour clock stayed "
+                "frozen (#1131)")
+        _HOUR_ACTIVE["was_paused"] = paused
+        # The interval since the previous tick belongs to the state that just
+        # ended; without event timestamps it cannot be split truthfully, so do
+        # not bill any of it to active airtime at the transition boundary.
+        _HOUR_ACTIVE["last_tick"] = now
+        coord_save()
+    last = float(_HOUR_ACTIVE.get("last_tick") or now)
+    _HOUR_ACTIVE["last_tick"] = now
+    if not paused:
+        _HOUR_ACTIVE["active_seconds"] = max(0.0, float(
+            _HOUR_ACTIVE.get("active_seconds") or 0) + max(0.0, now - last))
+        if float(_HOUR_ACTIVE["active_seconds"]) >= 3600.0:
+            return coord_hour_close(now)
+    if now - float(_HOUR_SAVED[0] or 0) >= 60.0:
+        coord_save()
+        _HOUR_SAVED[0] = now
+    return None
+
+
+def coordinator_hourly_state(refresh: bool = False) -> dict[str, Any]:
+    """The current contract, pause yield, trajectory and learned decisions."""
+    if not _HOUR_ACTIVE:
+        coord_hour_start()
+    inventory = coord_hour_inventory(fresh=refresh)
+    active = _HOUR_ACTIVE
+    elapsed = max(0.0, float(active.get("active_seconds") or 0))
+    left = max(0.0, 3600.0 - elapsed)
+    targets = dict(active.get("targets") or {})
+    aired = dict(active.get("aired") or {})
+    roads: dict[str, Any] = {}
+    for road, value in targets.items():
+        target = max(0.0, float(value or 0))
+        got = max(0.0, float(aired.get(road) or 0))
+        roads[road] = {
+            "target_seconds": round(target, 1),
+            "aired_seconds": round(got, 1),
+            "remaining_seconds": round(max(0.0, target - got), 1),
+            "attainment": round(min(1.0, got / target), 4) if target else 1.0,
+            "required_pace": round(max(0.0, target - got) / max(1.0, left), 4),
+            "learning_factor": round(coord_learning_factor(road), 3),
+            "learning": dict(_HOUR_LEARNING.get(road) or {}),
+            "schedule": dict((active.get("schedule") or {}).get(road) or {}),
+        }
+    current_pause: dict[str, Any] = {}
+    if radio_paused() and active.get("pause_started"):
+        start = active.get("pause_start") or {}
+        current_pause = {
+            "started_at": active.get("pause_started"),
+            "seconds": round(max(0.0, time.time() - float(
+                active.get("pause_started") or time.time())), 1),
+            "ready_gain": round(float(inventory.get("ready_seconds") or 0)
+                                - float(start.get("ready_seconds") or 0), 1),
+            "tint_gain": int(inventory.get("tint_ready") or 0)
+                         - int(start.get("tint_ready") or 0),
+            "short_reduced": round(float(start.get("short_seconds") or 0)
+                                   - float(inventory.get("short_seconds") or 0), 1),
+        }
+    latest = list(_HOURS[-12:])[::-1]
+    trajectory = None
+    if len(_HOURS) >= 2:
+        trajectory = round(float(_HOURS[-1].get("score") or 0)
+                           - float(_HOURS[-2].get("score") or 0), 2)
+    decisions: list[str] = []
+    if inventory.get("release_ready"):
+        decisions.append("the next exact hour is tinted, recorded and release-ready")
+    else:
+        decisions.append(
+            f"finish {int(float(inventory.get('recording_seconds') or 0))}s "
+            f"already assigned, then write {int(float(inventory.get('short_seconds') or 0))}s missing")
+    if float(inventory.get("pressure") or 0) > 1.0:
+        decisions.append(
+            "fresh production exceeds safe room capacity; learned priority, "
+            "rested repeats, emergency voices and early cuts must absorb it")
+    if radio_paused():
+        decisions.append("freeze playout and spend the pause only on committed FIFO work")
+    return {
+        "at": time.time(), "id": active.get("id"),
+        "paused": bool(radio_paused()), "active_seconds": round(elapsed, 1),
+        "seconds_left": round(left, 1), "target_seconds": active.get("target_seconds"),
+        "targets": targets, "roads": roads, "inventory": inventory,
+        "pause": current_pause, "pauses": active.get("pauses") or [],
+        "tasks": active.get("tasks") or {},
+        "retired_rows": int(active.get("retired_rows") or 0),
+        "retired_clips": int(active.get("retired_clips") or 0),
+        "decisions": decisions, "learning": dict(_HOUR_LEARNING),
+        "trajectory": trajectory, "latest": latest,
+        "measurement": ("requirements and readiness use exact schedule/audio "
+                        "seconds; aired dialogue is estimated at 14 characters "
+                        "per second and reported as an estimate"),
+    }
 
 
 def air_last_heard() -> float:
@@ -26921,6 +29241,16 @@ def coord_close_half(half: str) -> dict[str, Any]:
     sched = {}
     try:
         sched = schedule_adherence()
+        # schedule_adherence is a live/session view. A closed half must contain
+        # only results named inside that half or every later report repeats the
+        # entire session and cannot teach the next work order what just failed.
+        rows = [r for r in _SCHED_LOG
+                if r.get("aired") is not None
+                and _half_key(float(r.get("at") or 0)) == str(half)]
+        sched["kept"] = sum(1 for r in rows if r.get("aired"))
+        sched["missed"] = sum(1 for r in rows if not r.get("aired"))
+        sched["rate"] = (round(float(sched["kept"]) / len(rows), 3)
+                         if rows else None)
     except Exception:  # noqa: BLE001
         sched = {}
     report = {
@@ -26965,7 +29295,8 @@ def coord_ahead_seconds() -> float:
 _BARE_ARRIVALS: dict[str, int] = {}     # road -> times it arrived empty
 
 
-def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
+def coord_upcoming(window: float = 0.0,
+                   measure: bool = True) -> list[dict[str, Any]]:
     """#911: the entries about to take the air, and whether anything is
     ready for them.
 
@@ -27000,9 +29331,15 @@ def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
         pos = _RADIO.get("sched_pos") or {}
         idx = int(pos.get("index") or 0)
         started = float(pos.get("started") or time.time())
+        if radio_paused():
+            # Pause freezes the playhead, not merely the speaker. Re-anchor
+            # the virtual start to now so every coming deadline is measured
+            # from resume while the rooms continue banking against it.
+            started = time.time() - max(0.0, float(
+                _RADIO.get("paused_sched_elapsed") or 0))
         if not 0 <= idx < len(slots):
             idx, started = 0, time.time()
-        needs = hour_needs_now() or {}
+        needs = (hour_needs_now() or {}) if measure else {}
         # #957: ONE SHELF, MANY ENTRIES. The seconds a road is holding
         # are not held for each of its entries separately — the canonical
         # hour has three Painting selling entries and one gallery shelf
@@ -27014,12 +29351,18 @@ def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
         # happens on air.
         left = {k: float((v or {}).get("held") or 0)
                 for k, v in needs.items()}
+        track_carriers = (dialogue_stock_items(
+            "track_talk", include_unready=False) if measure else [])
         # The entry on air still has time left on it; everything after
         # begins when the one before it ends.
         owns = max(0.25, float(slots[idx].get("minutes") or 3)) * 60.0
         at = started + owns
         step = 0
-        while at - time.time() <= window and step < len(slots) * 3:
+        # Three fixed laps silently capped a four-hour dial at three hours.
+        # Derive the bound from the requested wall-time horizon; the time
+        # condition remains authoritative and this is only the spin guard.
+        most_steps = len(slots) * max(2, int((window + 3599.0) // 3600.0) + 1)
+        while at - time.time() <= window and step < most_steps:
             step += 1
             idx = (idx + 1) % len(slots)
             slot = slots[idx]
@@ -27027,16 +29370,34 @@ def coord_upcoming(window: float = 0.0) -> list[dict[str, Any]]:
             mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
             road = str(SCHED_PREP_KIND.get(kind) or kind)
             cannot = CANNOT_PREPARE.get(kind) or ""
-            held = max(0.0, float(left.get(road, 0.0)))
-            left[road] = held - mins        # this entry eats its share
-            held = min(held, mins)          # ...and only its share counts
-            rows_held = int((needs.get(road) or {}).get("rows") or 0)
+            if road == "track_talk" and measure:
+                # A track-talk entry is one exact queued MUSIC carrier with
+                # two bookends. One ready pair covers one entry regardless of
+                # whether those links total 28 or 48 seconds; the record owns
+                # the remainder. Consume carriers FIFO, one per occurrence.
+                held = mins if track_carriers else 0.0
+                if track_carriers:
+                    track_carriers.pop(0)
+                rows_held = int(len(track_carriers) + (1 if held else 0))
+            else:
+                held = max(0.0, float(left.get(road, 0.0)))
+                left[road] = held - mins    # this entry eats its share
+                held = min(held, mins)      # ...and only its share counts
+                rows_held = int((needs.get(road) or {}).get("rows") or 0)
+            due_at = float(at)
+            slot_id = str(slot.get("id") or f"index-{idx}")
             out.append({
                 "index": idx,
+                "slot_id": slot_id,
                 "kind": kind,
                 "road": road,
                 "label": str(slot.get("label") or kind),
                 "starts_in": round(at - time.time(), 1),
+                "due_at": round(due_at, 3),
+                # Same slot id appears every lap; its due moment makes each
+                # occurrence a separate, stable commitment.
+                "commit_id": f"{slot_id}@{int(due_at)}",
+                "sequence": step - 1,
                 "owns_seconds": round(mins, 1),
                 "held_seconds": round(held, 1),
                 "rows": rows_held,
@@ -27093,7 +29454,8 @@ def coord_capacity() -> dict[str, Any]:
     if (now - float(_COORD_CAPACITY.get("at") or 0) < COORD_CAPACITY_EVERY
             and _COORD_CAPACITY.get("say")):
         return dict(_COORD_CAPACITY)
-    out: dict[str, Any] = {"at": now, "asks": 0.0, "room": 0.0,
+    out: dict[str, Any] = {"at": now, "asks": 0.0, "carrier_seconds": 0.0,
+                           "room": 0.0,
                            "hour": 3600.0, "over": 0.0, "roads": [],
                            "say": ""}
     try:
@@ -27108,6 +29470,7 @@ def coord_capacity() -> dict[str, Any]:
                 if r.get("enabled", True)]
         per_road: dict[str, float] = {}
         asks = 0.0
+        carrier = 0.0
         room = 0.0
         for slot in rows:
             kind = str(slot.get("kind") or "")
@@ -27115,6 +29478,20 @@ def coord_capacity() -> dict[str, Any]:
                 continue                # a record is not written by anyone
             mins = max(0.25, float(slot.get("minutes") or 3)) * 60.0
             road = str(SCHED_PREP_KIND.get(kind) or kind)
+            if road == "track_talk":
+                # A track-talk slot is not wall-to-wall generated speech.
+                # It is one exact record, two short links, and music for the
+                # remaining wall time. Price the two side tasks explicitly;
+                # treating all three minutes as prose invented nine links and
+                # overstated both demand and failure by the same factor.
+                spoken = min(mins, max(12.0, 2.0 * float(
+                    task_gain("track_talk") or 20.0)))
+                need = 2.0 * float(task_cost("track_talk") or 30.0)
+                asks += spoken
+                carrier += mins
+                room += need
+                per_road[road] = per_road.get(road, 0.0) + need
+                continue
             rate = 0.0
             try:
                 rate = float(task_rate(road) or 0)
@@ -27127,6 +29504,7 @@ def coord_capacity() -> dict[str, Any]:
             room += need
             per_road[road] = per_road.get(road, 0.0) + need
         out["asks"] = round(asks, 1)
+        out["carrier_seconds"] = round(carrier, 1)
         out["room"] = round(room, 1)
         out["over"] = round(room / 3600.0, 2)
         out["roads"] = [
@@ -27137,7 +29515,10 @@ def coord_capacity() -> dict[str, Any]:
             out["say"] = (f"the sheet asks for {int(asks / 60)} min of "
                           f"written speech an hour and this box can render "
                           f"it in about {int(room / 60)} min of room - it "
-                          "fits")
+                          "fits"
+                          + (f"; {int(carrier / 60)} min of track-talk is "
+                             "music carried by exact tinted bookends"
+                             if carrier else ""))
         else:
             worst = out["roads"][0] if out["roads"] else {}
             out["say"] = (
@@ -27148,6 +29529,9 @@ def coord_capacity() -> dict[str, Any]:
                 + (f"{worst.get('label') or worst.get('road')} alone wants "
                    f"{int(float(worst.get('room_seconds') or 0) / 60)} min "
                    "of it. " if worst else "")
+                + (f"The {int(carrier / 60)} min of track-talk carrier is "
+                   "music with two exact tinted bookends per entry, not "
+                   "continuous generated speech. " if carrier else "")
                 + "Rested material goes out again to cover the difference; "
                   "shorten those entries if you would rather everything "
                   "were new")
@@ -27616,70 +30000,70 @@ def coord_passed_over(road: str) -> int:
 
 
 def coord_retire() -> int:
-    """#922: let go of what genuinely will not be used, audio and all.
+    """Retain exactly the dialogue assigned to the active horizon.
 
-    The horizon burn (#930/#932) deliberately never touches spoken-for
-    material — which is right, and which is exactly why this has to be
-    its own pass: nothing else in the station was ever going to let go
-    of a prepared round short of the 24-hour ceiling. It says what it
-    retires and why, because a shelf quietly emptying itself must never
-    be mistakeable for a shelf that was never filled."""
+    Age cannot answer whether a take will be used. The commitment inventory
+    can: it walks the real running order, consumes actual seconds and binds
+    concrete FIFO rows. Anything outside that bounded set is speculative
+    storage and is retired with its unshared audio, whether heard or unheard.
+    In-flight work and explicit operator pins are left alone until the next
+    sweep; a schedule read that returns no obligations never purges anything.
+    """
     gone = 0
     try:
-        now = time.time()
-        pinned = alt_pin_map().get("ids") or set()
+        plan = commitment_inventory_plan(fresh=True)
+        if not plan.get("slots"):
+            return 0
+        keep_ids = set(plan.get("selected_ids") or [])
+        keep_ids.update(alt_pin_map().get("ids") or set())
+        removed_keys: set[str] = set()
+        per_kind: dict[str, int] = {}
         for kind in list(_SHELF):
-            keep: list[dict[str, Any]] = []
-            _resort_keep = resort_keys(kind)                       # #1075
-            dropped = 0
-            for row in (_SHELF.get(kind) or []):
-                aged = now - float(row.get("at") or now)
-                try:
-                    spoken_for = alt_sid_of(kind, row) in pinned
-                except Exception:  # noqa: BLE001
-                    spoken_for = False
-                if aged <= COORD_RETIRE_SECONDS or spoken_for:
-                    keep.append(row)
+            kept: list[dict[str, Any]] = []
+            for row in list(_SHELF.get(kind) or []):
+                target = dialogue_entry(row) or row
+                sid = alt_sid(str(kind), row)
+                if (sid in keep_ids or target.get("preparing")
+                        or target.get("tinting")):
+                    kept.append(row)
                     continue
-                # #1052: THE CUPBOARD IS SPARED. This pass exists to let
-                # go of what genuinely will not be used, and a rested
-                # repeat with innings left is the definition of what
-                # WILL be. Measured before this: COORD_RETIRE_SECONDS
-                # and SHELF_REUSE_REST are both three hours and this
-                # test reads `at` - when the row was MADE - so a repeat
-                # became eligible and was deleted at the same moment,
-                # every time, and the ad road wrote live while holding
-                # a shelf it was not allowed to open.
-                if shelf_is_repeat(kind, row) and aged <= REPEAT_KEEP_SECONDS:
-                    keep.append(row)
-                    continue
-                # #1075: AND NOTHING UNHEARD IS BINNED. This sweep's own
-                # log says it retires rows "passed 3h UNHEARD" - by
-                # name, the segments that have never aired. Each cost a
-                # model visit and a render; the station spent them, held
-                # them three hours, and threw them away without ever
-                # letting a listener hear one. A segment that has not
-                # run is not proof that it never will; it is proof that
-                # nothing made it. Nor may the road's last-resort
-                # fallbacks go, however old they are.
-                if not resort_may_drop(kind, row, _resort_keep):
-                    keep.append(row)
-                    continue
-                # Its clips go with it — they were only protected from
-                # the horizon burn because this row was holding them.
-                for key in _row_clip_keys(row):
+                removed_keys.update(_row_clip_keys(row))
+                per_kind[str(kind)] = per_kind.get(str(kind), 0) + 1
+                gone += 1
+            _SHELF[str(kind)] = kept
+        larder: list[dict[str, Any]] = []
+        for entry in list(_LARDER):
+            sid = alt_sid("banter", entry)
+            if (sid in keep_ids or entry.get("preparing")
+                    or entry.get("tinting")):
+                larder.append(entry)
+                continue
+            removed_keys.update(_row_clip_keys(entry))
+            per_kind["banter"] = per_kind.get("banter", 0) + 1
+            gone += 1
+        if len(larder) != len(_LARDER):
+            _LARDER[:] = larder
+            _larder_save()
+        if gone:
+            # Content-addressed clips may be shared. Recompute protection
+            # after removing rows and delete only keys nobody still owns.
+            still_held = pantry_spoken_for()
+            clips = 0
+            for key in removed_keys - still_held:
+                if key in _PANTRY:
                     _PANTRY.pop(key, None)
-                dropped += 1
-            if dropped:
-                _SHELF[kind] = keep
-                gone += dropped
-                pipeline_log(
-                    "lookahead",
-                    f"{dropped} prepared {SHELF_LABEL.get(kind, kind)} "
-                    f"passed {COORD_RETIRE_SECONDS / 3600:.0f}h unheard "
-                    "and were retired with their audio - they were "
-                    "holding bytes and a place in the order for "
-                    "something that was never going to run (#922)")
+                    clips += 1
+            coord_waste_note(gone, clips)
+            _pantry_save(True)
+            _INVENTORY_PLAN["at"] = 0.0
+            _COMMITS["at"] = 0.0
+            pipeline_log(
+                "lookahead",
+                f"retired {gone} unused dialogue row(s) and {clips} unshared "
+                "take(s): only exact FIFO stock assigned to the next "
+                f"{plan.get('hours') or 4} hours is retained ("
+                + ", ".join(f"{k} {v}" for k, v in sorted(per_kind.items()))
+                + ")")
     except Exception:  # noqa: BLE001
         pass
     return gone
@@ -27697,6 +30081,7 @@ def coord_bare_note(road: str) -> None:
         if not road:
             return
         _BARE_ARRIVALS[road] = int(_BARE_ARRIVALS.get(road) or 0) + 1
+        coord_save()
         pipeline_log("lookahead",
                      f"the coordinator noted a BARE ARRIVAL - "
                      f"{SHELF_LABEL.get(road, road)} took the air with "
@@ -27834,9 +30219,18 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
                 task["why"] = (task["why"] + "; it has arrived bare "
                                + str(misses) + " time(s), so it is asked "
                                "for more")
+            learned = coord_learning_factor(road)
+            task["learning_factor"] = round(learned, 3)
+            if learned > 1.001:
+                task["want_seconds"] = round(
+                    float(task["want_seconds"]) * learned, 1)
+                task["why"] = (task["why"] + f"; its closed-hour miss "
+                               f"premium is {learned:.2f}x until it proves "
+                               "the requirement can be held")
         plan["tasks"].sort(key=lambda t: (
             0 if t.get("bare") else 1,          # bare and coming: first
             float(t.get("due_in") or 1e9),      # then by deadline
+            -float(t.get("learning_factor") or 1.0),
             -float(t["bled_seconds"]),          # then #942's ordering
             -float(t["want_seconds"])))
         plan["upcoming"] = coord_upcoming()[:10]
@@ -27976,6 +30370,9 @@ def coordinator_state() -> dict[str, Any]:
             "open_gap": (round(float(_GAP_OPEN.get("seconds") or 0), 1)
                          if _GAP_OPEN else 0.0),
             "plan": dict(_COORD_PLAN),
+            # #1131: the exact active-hour contract, its pause yield and the
+            # bounded corrections learned from prior closed hours.
+            "hourly": coordinator_hourly_state(),
             # #911: what is COMING and whether anything is ready for it.
             "upcoming": coord_upcoming()[:10],
             "bare_arrivals": dict(_BARE_ARRIVALS),
@@ -28005,6 +30402,13 @@ async def coordinator() -> None:
         await asyncio.sleep(COORD_TICK)
         try:
             coord_air_sample()
+            # Pause freezes this clock while all preparation work below keeps
+            # moving. At 3,600 active seconds it closes an attributable
+            # scorecard and feeds every miss into the next work order.
+            try:
+                coord_hour_tick()
+            except Exception:  # noqa: BLE001
+                pass
             # #1104: THE CRYSTAL GETS THE FAST TICK. retint_one sat in
             # the two-minute housekeeping block below doing ONE item,
             # which is an hour to walk a thirty-row shelf - far too slow
@@ -28175,6 +30579,8 @@ def hour_needs() -> dict[str, dict[str, float]]:
             rows = []
             for r in (_SHELF.get(road) or []):
                 try:
+                    if not dialogue_row_ready(str(road), r):
+                        continue
                     _k = str(r.get("key") or "")
                     if _k and not pantry_get(_k):
                         continue                 # its audio has gone
@@ -28189,17 +30595,29 @@ def hour_needs() -> dict[str, dict[str, float]]:
                     continue
             held = sum(float(r.get("seconds") or 0) for r in rows)
             if road == "banter":
-                rows = rows + [e for e in _LARDER if e.get("prepared")]
+                _ready_larder = [e for e in _LARDER
+                                 if dialogue_row_ready("banter", e)]
+                rows = rows + _ready_larder
                 held += sum(float(e.get("seconds") or 0)
-                            for e in _LARDER if e.get("prepared"))
+                            for e in _ready_larder)
             # #1125: track talk keeps its sides in _TRACK_TALK, not on
             # the shelf, so held read 0 however much had been written.
             if road == "track_talk":
                 try:
-                    _tt = [t for t in _TRACK_TALK.values()
-                           if isinstance(t, dict)]
-                    rows = rows + _tt
-                    held += sum(float(t.get("seconds") or 0) for t in _tt)
+                    _pairs = dialogue_stock_items(
+                        "track_talk", include_unready=False)
+                    # Allocate one pair to one occurrence, in schedule order.
+                    # The published held unit remains schedule seconds, the
+                    # same unit as owed; actual spoken seconds stay on each
+                    # stock item as audio_seconds.
+                    _entry_seconds = [
+                        max(0.25, float(slot.get("minutes") or 3)) * 60.0
+                        for slot in slots
+                        if str(SCHED_PREP_KIND.get(str(slot.get("kind") or ""))
+                               or slot.get("kind") or "") == "track_talk"]
+                    _durations = _entry_seconds * max(1, int(round(hours)))
+                    held = sum(_durations[:len(_pairs)])
+                    rows = [dict(p.get("row") or {}) for p in _pairs]
                 except Exception:  # noqa: BLE001
                     pass
             out[road]["held"] = round(held, 1)
@@ -28243,8 +30661,6 @@ def hour_short_kinds() -> list[str]:
     short: list[tuple[float, str]] = []
     try:
         for road, row in hour_needs().items():
-            if row.get("rows", 0) >= max(1.0, row.get("cap") or 1.0):
-                continue                # full — not short, just full
             gap = float(row.get("owed") or 0) - float(row.get("held") or 0)
             if gap > 0:
                 short.append((-gap, road))
@@ -28258,7 +30674,8 @@ def dialogue_flow_state() -> dict[str, Any]:
     """Explain the continuity pipeline without hiding the bottleneck."""
     dj = dj_settings()
     target = int(dj.get("dialogue_reserve_target") or 4)
-    ready = len(_LARDER)
+    ready = sum(1 for e in _LARDER
+                if dialogue_row_ready("banter", e))
     ad_running = bool(_RADIO.get("ad_now") and time.time()
                       - float(_RADIO["ad_now"].get("at") or 0) < 180)
     writing = bool(_LARDER_WRITING[0] or _OLLAMA_GATE.locked())
@@ -28290,7 +30707,7 @@ def dialogue_flow_state() -> dict[str, Any]:
         # audio, which is the only number that answers the question.
         # #924: the honest answer about the hour, beside the old count.
         "hour": hour_shortfall(),
-        "prepared": sum(1 for e in _LARDER if e.get("prepared")),
+        "prepared": ready,
         "buffered_seconds": prepared_seconds(),  # #1048
         "pantry_clips": len(_PANTRY),
         "pantry_mb": round(pantry_bytes() / 1048576, 1),
@@ -28617,7 +31034,7 @@ async def _torrent_talk() -> None:
                     try:
                         _road = str(SCHED_PREP_KIND.get(kind) or kind)
                         if (_road in ALT_PREP_KINDS
-                                and not (_SHELF.get(_road) or [])
+                                and not int(prepared_by_kind().get(_road) or 0)
                                 and kind not in CANNOT_PREPARE):
                             coord_bare_note(_road)
                     except Exception:  # noqa: BLE001
@@ -29099,6 +31516,9 @@ def dj_start(station: str) -> dict[str, Any]:
     _routing_save()
     _larder_load()                     # yesterday's shelf still feeds today
     _pantry_load()                     # #915: and the AUDIO it already made
+    track_talk_load()                  # record-bound tinted links survive too
+    track_talk_restore_queue()         # and keep their paid-for FIFO order
+    _track_talk_prune()
     _box_hold_load()                   # held dialogue outlives the deploy
     task = asyncio.create_task(dj_show())
     _RADIO_TASK.append(task)
@@ -30637,17 +33057,34 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
             direct += speakbox_aside(seed, pair=False)
         direct += ad_avoid_note()
         try:
-            raw = await dj_line("ad", None, extra=product, direct=direct)
+            raw = await dj_line("ad", None, extra=product, direct=direct,
+                                tint=False)
         except Exception:  # noqa: BLE001
             raw = ""
         text = prep_air_text(raw, "ad")
         if len(text) < 40:
             continue
+        plain = text
+        tint_paper: dict[str, Any] = {}
+        if dialogue_tint_required():
+            tinted = await crystal_tint(text, "ad", whole_only=True,
+                                         critical=True)
+            tint_paper = _tint_paper(tinted)
+            if not tinted.get("ok"):
+                pipeline_log("crystal", "an advert is kept off the shelf "
+                             "until its required tint completes - "
+                             + str(tinted.get("why") or "refused")[:120])
+                continue
+            text = str(tinted.get("script") or text)
         # The last attempt drops the station-wide phrase leg — see
         # ad_repeat_check(). The ad-book legs never stand down.
         verdict = ad_repeat_check(text, phrases=attempt < tries - 1)
         if not verdict.get("block"):
-            return {"text": text, "product": product, "seed": seed}
+            return {"text": text, "text_plain": plain,
+                    "tint_ok": bool(not dialogue_tint_required()
+                                    or text != plain),
+                    "tint": tint_paper,
+                    "product": product, "seed": seed}
         out = {}
         pipeline_log(
             "drop", "an advert repeated an earlier advert - "
@@ -30703,6 +33140,9 @@ async def ad_studio_build() -> bool:
     if prep_should_stop() or not engine_prep_take():
         try:
             shelf_put("ad", {"text": text,
+                             "text_plain": str(written.get("text_plain") or ""),
+                             "tint_ok": bool(written.get("tint_ok")),
+                             "tint": dict(written.get("tint") or {}),
                              "product": str(product)[:160],
                              "seconds": 0.0})
             pipeline_log("lookahead", "the ads desk has WRITTEN a spot and "
@@ -30736,6 +33176,9 @@ async def ad_studio_build() -> bool:
             "produced": str(made.get("id") or ""),
             "product": str(product)[:160],
             "text": text,
+            "text_plain": str(written.get("text_plain") or ""),
+            "tint_ok": bool(written.get("tint_ok")),
+            "tint": dict(written.get("tint") or {}),
             "audio": str(made.get("audio") or ""),
             "seconds": float(made.get("seconds") or 0.0),
         })
@@ -32519,6 +34962,9 @@ def schedule_take() -> dict[str, Any]:
         pos = _RADIO.get("sched_pos") or {}
         idx = int(pos.get("index") or 0)
         started = float(pos.get("started") or 0)
+        if radio_paused() and started > 0:
+            started = now - max(0.0, float(
+                _RADIO.get("paused_sched_elapsed") or 0))
         fresh = (str(pos.get("preset") or "") != name
                  or str(pos.get("hour") or "") != stamp
                  or not 0 <= idx < len(slots)
@@ -32702,6 +35148,56 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
 
     Returns None for "not one of mine", and the torrent's existing chain
     then runs exactly as it always has."""
+    if kind == "track_talk":
+        # This used to fall through to generic banter and was nevertheless
+        # logged as a kept track-talk entry. Consume only a pre-recorded line
+        # bound to the record that is actually turning. One exact link starts
+        # the carrier; the music owns the rest of the scheduled wall time.
+        current = track or _RADIO.get("now") or {}
+        track_id = str(current.get("id") or "")
+        pos = _RADIO.get("sched_pos") or {}
+        interjected = _RADIO.get("interject_prompt") or {}
+        stamp = "|".join((
+            str(pos.get("preset") or ""), str(pos.get("index") or 0),
+            str(pos.get("slot_id") or ""),
+            f"{float(pos.get('started') or 0):.3f}",
+            f"{float(interjected.get('at') or 0):.3f}"))
+        done = _RADIO.get("sched_track_talk") or {}
+        if (track_id and str(done.get("stamp") or "") == stamp
+                and str(done.get("track_id") or "") == track_id):
+            await asyncio.sleep(8)
+            return True
+        if not track_id:
+            return False
+        for part in ("intro", "outro"):
+            held = track_talk_get(current, part)
+            if not track_talk_part_ready(held):
+                continue
+            who = str((held or {}).get("who")
+                      or ("dj" if part == "intro" else "cohost"))
+            try:
+                said = await dj_speak(
+                    "intro" if part == "intro" else "interject", current,
+                    line=str((held or {}).get("text") or ""), who=who)
+            except Exception as exc:  # noqa: BLE001
+                pipeline_log("drop", "the exact scheduled record link failed",
+                             extra=f"{type(exc).__name__}: {exc}"[:500])
+                return False
+            if not said:
+                return False
+            # Consume only after audible success. A render/player refusal must
+            # leave the exact line available for the next attempt.
+            track_talk_get(current, part, take=True)
+            _RADIO["sched_track_talk"] = {
+                "stamp": stamp, "track_id": track_id, "part": part,
+                "at": time.time()}
+            coord_air_note(str(said), who, "track_talk")
+            pipeline_log(
+                "air", "the schedule used the tinted link bound to the "
+                       "record actually on air",
+                extra=f"{current.get('artist', '')} - {current.get('title', '')}")
+            return True
+        return False
     if kind == "record":
         # Not a round at all: the END of one. The needle goes down ONCE,
         # when this entry begins, and the rest of its minutes are the
@@ -32755,7 +35251,8 @@ async def schedule_extra_round(kind: str, track: dict[str, Any] | None,
             _have = prepared_by_kind().get("banter", 0)
         except Exception:  # noqa: BLE001
             _have = 0
-        if not _have and len(_LARDER) < 2:
+        if not _have and sum(1 for e in _LARDER
+                             if dialogue_row_viable("banter", e)) < 2:
             await asyncio.sleep(8)
             return True                 # nothing to say; let it spin
         return None
@@ -34343,31 +36840,14 @@ def alt_pinned_id(kind: str) -> str:
 
 
 def alt_take_order(kind: str, rows: Any) -> list[dict[str, Any]]:
-    """The order shelf_take() should CONSIDER prepared items in.
+    """Return usable candidates in the exact order they were retained.
 
-    Pinned first, then the owner's priority, then oldest. With no pin and
-    no priorities set this is `list(rows)` exactly — insertion order,
-    oldest first, which is what the shelf has always done. This orders
-    only; it never removes and never validates, so every check in
-    shelf_take() still decides what actually airs."""
-    try:
-        got = [r for r in list(rows or []) if isinstance(r, dict)]
-        got.sort(key=lambda r: (-alt_priority(r), float(r.get("at") or 0)))
-        want = alt_pinned_id(kind)
-        if not want:
-            return got
-        head = [r for r in got if alt_sid(kind, r) == want]
-        if not head:
-            pipeline_log(
-                "lookahead",
-                "the alternate pinned to the "
-                f"{SHELF_LABEL.get(str(kind), str(kind))} on air is no "
-                "longer on the shelf — the best prepared one goes out "
-                "instead, and the segment is not silent (#926)")
-            return got
-        return head + [r for r in got if all(r is not h for h in head)]
-    except Exception:  # noqa: BLE001
-        return [r for r in list(rows or []) if isinstance(r, dict)]
+    The cache is a playout queue, not a bag of alternatives. Automatic
+    priority, pass-over nudges, pins and random repeat rotation used to make
+    the generated order differ from the stored order. Validation remains
+    shelf_take()'s job, so a bad or resting head row cannot jam the road; two
+    usable rows, however, can never leapfrog one another."""
+    return [r for r in list(rows or []) if isinstance(r, dict)]
 
 
 def alt_took(kind: str, row: Any) -> None:
@@ -34385,73 +36865,28 @@ def alt_took(kind: str, row: Any) -> None:
 
 
 def alt_larder_index() -> int:
-    """WHICH banked booth round dj_banter should serve.
-
-    0 — the oldest, exactly as it always was — unless the entry on air
-    pins one, or the owner has put a priority on one. A pinned round
-    that has gone stale or was written to a contract that has moved is
-    NOT served: it hands back to the ordinary pick rather than putting a
-    round on air that _banter_air would have to throw away."""
+    """The first READY, current booth round in retained FIFO order."""
     try:
         if not _LARDER:
             return 0
-        want = alt_pinned_id("banter")
-        if want:
-            for i, entry in enumerate(_LARDER):
-                if alt_sid("banter", entry) != want:
-                    continue
-                fresh = (time.time() - float(entry.get("at") or 0)
-                         < larder_fresh())
-                if fresh and _larder_current(entry):
-                    return i
-                pipeline_log("lookahead",
-                             "the booth round pinned to this entry has gone "
-                             "stale — the shelf's own order stands (#926)")
-                break
-        # #1002: A RECORDED ROUND BEATS AN OLDER ONE THAT IS ONLY WRITTEN.
-        #
-        # This ranked on priority, then OLDEST, and never once asked
-        # whether the round it was about to put on air had actually been
-        # recorded. So the air routinely took a written-but-unvoiced
-        # round while finished ones stood beside it - and every line of
-        # it was then rendered LIVE, at ~2x real time, with the listener
-        # waiting on each one.
-        #
-        # Measured before this changed: 118 takes, 30 off the shelf, 88
-        # rendered live on air - 75% - while the pantry held 390 clips
-        # and 96 minutes of finished audio and the flow read "continuity
-        # reserve is healthy". The gaps that produced were not small: a
-        # 157-second silence in a five-minute sample, and eight silences
-        # over thirty seconds, every one of them with ready=9 and nothing
-        # waiting. The station was not short of material. It was standing
-        # in front of the microphone reading the script cold.
-        #
-        # `prepared` is what larder_prepare sets when a round's every line
-        # is in the pantry, so it is exactly "this one costs nothing to
-        # air". It ranks under the operator's pin and under priority -
-        # both of those are deliberate choices about WHAT should air, and
-        # this is only about which of two equal choices is cheaper - and
-        # above age, which was never more than a tie-break.
-        best, best_pri, best_at, best_rdy = 0, None, 0.0, False
         for i, entry in enumerate(_LARDER):
+            if not dialogue_row_ready("banter", entry):
+                continue
+            if entry.get("aired_at") and not shelf_repeat_ready(
+                    "banter", entry):
+                continue
             at = float(entry.get("at") or 0)
-            rdy = bool(entry.get("prepared"))
             # A round the keeper has not swept up yet that is already
             # stale or off-contract is not a candidate while a good one
             # stands beside it — dj_banter would only drop it on the
             # floor and write live. All of them bad answers 0, which is
             # exactly what this road did before any of this shipped.
-            if (time.time() - at >= larder_fresh()
+            if ((time.time() - at >= larder_fresh()
+                 and not shelf_is_repeat("banter", entry))
                     or not _larder_current(entry)):
                 continue
-            pri = alt_priority(entry)
-            if (best_pri is None
-                    or pri > best_pri
-                    or (pri == best_pri and rdy and not best_rdy)
-                    or (pri == best_pri and rdy == best_rdy
-                        and at < best_at)):
-                best, best_pri, best_at, best_rdy = i, pri, at, rdy
-        return best if 0 <= best < len(_LARDER) else 0
+            return i
+        return 0
     except Exception:  # noqa: BLE001
         return 0
 
@@ -34467,6 +36902,19 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
         over = len(rows) - cap
         if over <= 0:
             return
+        # Rejected or off-contract material is diagnostic evidence, not
+        # scheduled stock. Prefer it for eviction even if it was pinned or
+        # never aired: dialogue_row_ready deliberately refuses it, so
+        # protecting it here would let an unusable row permanently block a
+        # replacement that can satisfy the hour.
+        rejected = [r for r in rows
+                    if not dialogue_row_viable(str(kind), r)]
+        if rejected:
+            gone = rejected[:over]
+            rows[:] = [r for r in rows if all(r is not d for d in gone)]
+            over = len(rows) - cap
+            if over <= 0:
+                return
         # #1091: THE PROTECTION BELONGS ON THE PATH THAT RUNS.
         # #1075 built resort_keys/resort_may_drop so that "any segment
         # that is stored needs to be played and ran on the air before
@@ -34569,7 +37017,8 @@ def alt_row_view(kind: str, row: Any,
         "lines": 0, "made": 0, "seconds": 0.0,
         "written_at": 0.0, "age_seconds": 0.0, "burns_in": 0.0,
         "rendered": False, "ready": False, "voice": "",
-        "priority": 0, "pinned": False, "usable": True, "why": ""}
+        "priority": 0, "pinned": False, "viable": True,
+        "usable": True, "why": ""}
     try:
         out["id"] = alt_sid(kind, row)
         out["priority"] = alt_priority(row)
@@ -34596,13 +37045,63 @@ def alt_row_view(kind: str, row: Any,
                                          or (row or {}).get("seconds")
                                          or 0), 1)
             out["rendered"] = out["made"] > 0
-            out["ready"] = bool(entry.get("prepared"))
+            # `prepared` only means that an older worker once finished the
+            # audio. Readiness is today's complete contract: current writing,
+            # tint, every take, and (for calls) the topic/flow/novelty grade.
+            # Using the authoritative predicate here keeps the picker from
+            # advertising material that shelf_take() will correctly refuse.
+            out["ready"] = dialogue_row_ready(str(kind), row)
+            out["usable"] = out["ready"]
             out["title"] = alt_title(kind, row, entry)
+            if str(kind) == "caller":
+                # Put the acceptance proof on the candidate card itself.  The
+                # scheduler UI/API can now show which database theme this call
+                # serves and whether the exact final script passed the flow and
+                # novelty contract, instead of reducing all of that to a
+                # potentially stale `prepared` boolean.
+                meta = entry.get("call") or {}
+                quality = meta.get("quality") or {}
+                novelty = quality.get("novelty") or {}
+                out["call"] = {
+                    "contract_version": int(meta.get("contract_version") or 0),
+                    "topic": str(meta.get("topic") or "")[:500],
+                    "theme": str(meta.get("theme") or "")[:160],
+                    "fingerprint": str(meta.get("fingerprint") or ""),
+                    "speakerbox_source": str(meta.get("source") or "")[:240],
+                    "speakerbox_text": str(
+                        meta.get("speakerbox_text") or "")[:500],
+                    "speakerbox_ok": bool(
+                        (quality.get("speakerbox") or {}).get("ok")),
+                    "speakerbox_novel": bool(
+                        (quality.get("speakerbox_novelty") or {}).get("ok")),
+                    "quality_ok": bool(quality.get("ok")),
+                    "quality_faults": list(quality.get("faults") or [])[:12],
+                    "novelty_score": float(novelty.get("similarity") or 0),
+                    "matched_call_id": str(novelty.get("matched_id") or ""),
+                    "tint_ready": dialogue_tint_ready(str(kind), row),
+                    "audio_ready": dialogue_audio_ready(str(kind), row),
+                    "deployment_ready": out["ready"],
+                }
             if not _larder_current(entry):
+                out["viable"] = False
                 out["usable"] = False
                 out["why"] = ("written against a writing contract that has "
                               "since moved — it would be thrown away "
                               "rather than aired")
+            elif not dialogue_row_viable(str(kind), row):
+                out["viable"] = False
+                out["usable"] = False
+                out["why"] = (
+                    "does not satisfy the active dialogue contract — it is "
+                    "diagnostic evidence, not material that can be aired")
+            elif not out["ready"]:
+                waiting = []
+                if not dialogue_tint_ready(str(kind), row):
+                    waiting.append("tint")
+                if not dialogue_audio_ready(str(kind), row):
+                    waiting.append("recording")
+                out["why"] = ("assigned to the active horizon and waiting "
+                              "for " + " and ".join(waiting or ["completion"]))
         else:
             # A one-line item: an advert read, a station ID. Its `key` is
             # the whole of its audio, and #904 means the words alone are
@@ -34621,10 +37120,12 @@ def alt_row_view(kind: str, row: Any,
             out["made"] = 1 if out["ready"] else 0
             out["title"] = alt_title(kind, row, None)
             if key and not out["ready"]:
+                out["viable"] = False
                 out["usable"] = False
                 out["why"] = ("the recording has been pruned — the words "
                               "stand, and are read live when it airs")
         if out["burns_in"] <= 0:
+            out["viable"] = False
             out["usable"] = False
             out["why"] = ("burned — twenty-four hours on the shelf without "
                           "airing")
@@ -34682,7 +37183,7 @@ def alt_segment_view(hour: str = "", slot_id: str = "",
     except Exception:  # noqa: BLE001
         on_air = False
     try:
-        cap = _LARDER_MAX if prep == "banter" else shelf_cap(prep or "")
+        cap = larder_cap() if prep == "banter" else shelf_cap(prep or "")
     except Exception:  # noqa: BLE001
         cap = 0
     return {
@@ -34802,7 +37303,8 @@ async def alt_bank_banter() -> bool:
     already at the desk."""
     if _LARDER_WRITING[0]:
         return False
-    before = len(_LARDER)
+    before = sum(1 for e in _LARDER
+                 if dialogue_row_viable("banter", e))
     _LARDER_WRITING[0] = True
     try:
         await dj_banter(None, bank=True, render_stream=True)
@@ -34810,7 +37312,8 @@ async def alt_bank_banter() -> bool:
         return False
     finally:
         _LARDER_WRITING[0] = False
-    return len(_LARDER) > before
+    return sum(1 for e in _LARDER
+               if dialogue_row_viable("banter", e)) > before
 
 
 def alt_prep_road(kind: str) -> Any:
@@ -34829,6 +37332,8 @@ def alt_prep_road(kind: str) -> Any:
         return prep_news()
     if got == "banter":
         return alt_bank_banter()
+    if got == "track_talk":
+        return prep_track_talk()
     return None
 
 
@@ -35018,6 +37523,15 @@ def pantry_table(kind: str = "", most: int = 0) -> dict[str, Any]:
         for entry in list(_LARDER):
             for k in _row_clip_keys(entry):
                 by.setdefault(k, "a banked round")
+        for record in list(_TRACK_TALK.values()):
+            if not isinstance(record, dict):
+                continue
+            title = str(record.get("title") or "a queued record")[:80]
+            for side in (record.get("intro"), record.get("outro")):
+                if not isinstance(side, dict):
+                    continue
+                for k in _row_clip_keys(side):
+                    by.setdefault(k, f"record talk for {title}")
     except Exception:  # noqa: BLE001
         pass
     out: list[dict[str, Any]] = []
@@ -35541,8 +38055,11 @@ async def recast_job(job: str, kind: str, sid: str, script: str,
         lift = max(-9, min(9, alt_priority(source) + (5 if promote else 0)))
         if str(kind) == "banter":
             entry["priority"] = lift
-            _LARDER.append(entry)
-            del _LARDER[:-_LARDER_MAX]     # the same trim dj_banter uses
+            if dialogue_row_viable("banter", entry):
+                _LARDER[:] = [e for e in _LARDER
+                              if dialogue_row_viable("banter", e)]
+                _LARDER.append(entry)
+                del _LARDER[:-larder_cap()]
             try:
                 _larder_save()
             except Exception:  # noqa: BLE001
@@ -37644,37 +40161,72 @@ def _music_log_rows(lo: float, hi: float) -> list[dict[str, Any]]:
 
 
 def _cache_call_recording(wav_bytes: bytes,
-                          transcript: list[tuple[str, str]],
-                          name: str) -> None:
+                          transcript: list[Any],
+                          name: str,
+                          call_id: str = "") -> None:
     """Keep a finished call as an mp3 + transcript for focused replay (#548).
     Best effort — a failed cache never affects the on-air call."""
     try:
         import subprocess
 
-        import imageio_ffmpeg
         calls = RADIO_CACHE / "calls"
         calls.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y-%m-%d_%H%M%S")
         safe = re.sub(r"[^\w-]+", "_", name or "caller")[:40]
-        base = calls / f"{stamp}_{safe}"
-        exe = imageio_ffmpeg.get_ffmpeg_exe()
-        subprocess.run(
-            [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-             "-f", "wav", "-i", "pipe:0",
-             "-codec:a", "libmp3lame", "-b:a", "96k", str(base) + ".mp3"],
-            input=wav_bytes, capture_output=True, timeout=120)
+        unique = re.sub(r"[^a-zA-Z0-9]+", "", str(call_id or ""))[:12] \
+            or uuid.uuid4().hex[:8]
+        base = calls / f"{stamp}_{safe}_{unique}"
         (Path(str(base) + ".md")).write_text(
             f"# Phone call — {name or 'a caller'} — {stamp}\n\n"
-            + "\n\n".join(f"**{w}:** {t}" for w, t in transcript),
+            + f"Call ID: `{unique}`\n\n"
+            + "\n\n".join(
+                f"**{str(row.get('name') or row.get('who') or 'Caller')}:** "
+                f"{str(row.get('text') or '')}"
+                if isinstance(row, dict) else
+                f"**{str(row[0])}:** {str(row[1])}"
+                for row in transcript
+                if ((isinstance(row, dict) and row.get('text'))
+                    or (isinstance(row, (list, tuple)) and len(row) >= 2))),
             encoding="utf-8")
+        # Transcript durability does not depend on the encoder. If ffmpeg is
+        # temporarily unavailable the database still keeps the conversation;
+        # audio failure remains best-effort as promised by this function.
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            subprocess.run(
+                [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-f", "wav", "-i", "pipe:0", "-codec:a", "libmp3lame",
+                 "-b:a", "96k", str(base) + ".mp3"], input=wav_bytes,
+                capture_output=True, timeout=120)
+        except Exception:
+            pass
         # Bounded: keep the newest ~200 calls.
         keep = sorted(calls.glob("*.mp3"), key=lambda p: p.stat().st_mtime)
-        for old in keep[:-200]:
+        for old in keep[:-5000]:
             for ext in (".mp3", ".md"):
                 try:
                     old.with_suffix(ext).unlink()
                 except OSError:
                     pass
+    except Exception:
+        pass
+
+
+def _cache_call_recording_parts(parts: list[str], transcript: list[Any],
+                                name: str, call_id: str = "") -> None:
+    """Archive one complete call assembled from streamed playout bursts."""
+    try:
+        files = [str(p) for p in parts if p and Path(str(p)).is_file()]
+        if not files:
+            return
+        if len(files) == 1:
+            blob = Path(files[0]).read_bytes()
+        else:
+            blob = _call_concat_blocking(
+                files, False, [0.02 for _ in files]) or b""
+        if blob:
+            _cache_call_recording(blob, transcript, name, call_id)
     except Exception:
         pass
 
@@ -41731,9 +44283,60 @@ def _vector_access_log(query: str, hit: dict[str, Any], ms: int,
         row["file"] = hit.get("file", "")
 
 
+_SPEAKBOX_TOPIC_STOP = {
+    "about", "active", "after", "again", "all", "and", "are", "around",
+    "because", "before",
+    "being", "caller", "calling", "could", "dialogue", "does", "from",
+    "have", "into", "just", "line", "people", "radio", "runs", "show",
+    "station", "story", "subject", "that", "the", "their", "theme", "thing",
+    "things", "this", "those", "through", "very", "what", "when", "where",
+    "which", "while", "with", "would",
+}
+
+
+def speakbox_topic_relevance(topic: str, text: str) -> dict[str, Any]:
+    """Cheap proof that a semantic Speakerbox hit serves the named topic.
+
+    Vector similarity alone is intentionally broad and can retrieve a vivid
+    but unrelated passage.  That is useful for free banter and destructive
+    for a scheduled call whose database topic is a contract.  Calls use this
+    lexical cross-check after the vector search: one concrete topic term must
+    actually occur in the passage before it can become their source material.
+    """
+    def _terms(value: str) -> set[str]:
+        return {w for w in re.findall(r"[a-z0-9]+", str(value or "").lower())
+                if len(w) > 2 and w not in _SPEAKBOX_TOPIC_STOP}
+
+    asked = _terms(topic)
+    found = _terms(text)
+    if asked & {"heat", "hot"}:
+        asked.update({"burning", "heater", "temperature", "thermal", "warm"})
+    if asked & {"computer", "dgx", "machine", "spark"}:
+        asked.update({"device", "electricity", "engine", "fan", "power"})
+    shared = sorted(asked & found)
+    flat = " ".join(str(text or "").split()).strip()
+    words = re.findall(r"[a-z0-9']+", flat.lower())
+    # Vector chunks are sometimes cut at an arbitrary token boundary.  A
+    # dangling half-sentence is not source material a caller can naturally
+    # bring to a conversation, however good its embedding score may be.
+    complete = bool(len(words) >= 5 and re.search(r"[.!?\u2026][\"')\]]*$",
+                                                flat))
+    return {
+        "ok": bool(shared and complete),
+        "shared": shared[:20],
+        "topic_terms": len(asked),
+        "text_terms": len(found),
+        "coverage": round(len(shared) / max(1, len(asked)), 3),
+        "complete": complete,
+    }
+
+
 async def speakbox_semantic_seed(query: str, exclude: str = "",
                                  who: str = "",
-                                 rid: str = "") -> dict[str, Any]:
+                                 rid: str = "",
+                                 require_overlap: bool = False,
+                                 avoid_files: set[str] | None = None,
+                                 ) -> dict[str, Any]:
     """A seed dict shaped like speakbox_quote's, but drawn by MEANING off the
     vector index (#566) — so a round can be steered toward what is being talked
     about instead of a blind random pull. {} when the index is cold. Logs the
@@ -41748,7 +44351,11 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
     pins = _RADIO.get("seed_pins") or {}
     blocks = set(_RADIO.get("seed_blocks") or [])
     pin = str(pins.get(who) or "")
-    k = 8                       # #824: always fetch a shelf to sample from
+    # Topic-bound calls need a wider shelf because the lexical relevance and
+    # complete-sentence gates intentionally throw broad vector matches away.
+    # The cosine scan is paid once either way; only the small returned shelf
+    # grows here.
+    k = 32 if require_overlap else 8
     hits = await speakbox_search(query, k=k, exclude=exclude, rid=key)
     # #815: crystals that are ON compete in the draw — their minds' best
     # chunk enters weighted by strength, so a switched-on crystal really
@@ -41785,6 +44392,21 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
                 drawn = random.choice(chunks)
                 hits = [{"file": pin, "text": str(drawn.get("text") or ""),
                          "score": 1.0}]
+    # A caller batch reserves its sources without marking them as aired.
+    # An explicit operator pin still wins; otherwise keep the semantic draw
+    # out of documents already attached to calls waiting in the FIFO queue.
+    if avoid_files and not pin:
+        avoided = {str(name or "") for name in avoid_files if str(name or "")}
+        hits = [hit for hit in hits
+                if str(hit.get("file") or "") not in avoided]
+    if require_overlap:
+        relevant: list[dict[str, Any]] = []
+        for hit in hits:
+            proof = speakbox_topic_relevance(
+                query, str(hit.get("text") or ""))
+            if proof.get("ok"):
+                relevant.append({**hit, "topic_relevance": proof})
+        hits = relevant
     if not hits:
         return {}
     # #824: argmax was DETERMINISTIC — the same winner every round until
@@ -41809,6 +44431,8 @@ async def speakbox_semantic_seed(query: str, exclude: str = "",
     _vector_access_log(query, hits[0], int((time.time() - t0) * 1000),
                        len((_load_vectors(key).get("chunks") or [])), who=who)
     return {"file": hits[0]["file"], "text": text, "mind": key,
+            "score": float(hits[0].get("score") or 0),
+            "topic_relevance": dict(hits[0].get("topic_relevance") or {}),
             "lines": speakbox_lines(text) or [text]}
 
 
@@ -44581,7 +47205,7 @@ async def sfx_keeper() -> None:
 
 
 @app.on_event("startup")
-async def _startup_sfx_pool() -> None:
+async def _startup_sfx_keeper() -> None:
     fire_and_forget(_sfx_pool_refresh())
     fire_and_forget(sfx_keeper())       # #835
 
@@ -45185,6 +47809,7 @@ def air_remember(text: str, who: str = "", kind: str = "") -> None:
         body = " ".join(str(text or "").split())
         if len(body) < 12:
             return                      # "yeah", "okay" — noise, not a line
+        coord_air_note(body, who, kind)
         print_remember(body, who, kind)
         if who in ("dj", "cohost", "third", "caller", "caller2", "host"):
             said_remember(body)
@@ -47048,7 +49673,8 @@ def news_slot_left() -> float:
 
 
 async def dj_news(hourly: bool = False,
-                  bank_to: list[dict[str, Any]] | None = None) -> list[str]:
+                  bank_to: list[dict[str, Any]] | None = None,
+                  avoid: list[str] | None = None) -> list[str]:
     """THE NEWS SEGMENT — for as long as the segment lasts (#921).
 
     "I'm listening to this news segment and there is no news being
@@ -47079,7 +49705,7 @@ async def dj_news(hourly: bool = False,
     Every other road into this function — the bulletin on the hour, the
     track-count road, prep_news banking one — gets exactly one stretch,
     which is today's behaviour to the line."""
-    avoid: list[str] = []
+    avoid = avoid if avoid is not None else []
     said = await _news_once(hourly, bank_to, avoid)
     if bank_to is not None:
         return said                     # banking one, not airing a segment
@@ -47705,55 +50331,99 @@ CALLER_BEHAVIORS = {
 }
 
 
-def _fallback_call_script(caller_name: str, topic: str = "") -> str:
+def _fallback_call_script(caller_name: str, topic: str = "",
+                          speakerbox_text: str = "",
+                          line: str = "") -> str:
     """#805: the guarantee behind every rung phone — when the model's call
     write dies (exception or fragment-bin), this minimal script airs
     instead of silence. Short, honest, and it completes: intro, the point,
     the wrap."""
     about = " ".join(str(topic or "").split())[:160]
-    # #824: this script aired BYTE-IDENTICAL 13 times in 8.5 hours — the
-    # worst offender on the whole repetition ledger. Four voicings now,
-    # rotated by caller and quarter-day, so even the safety net performs.
-    _v = int(hashlib.sha1((str(caller_name)
-                           + str(int(time.time()) // 21600)).encode()
-                          ).hexdigest(), 16) % 4
-    _opens = [
-        f"A: Phones are lit — {caller_name}, you're on Pine Box FM.",
-        f"A: Line's blinking. {caller_name}, talk to the town.",
-        f"A: We've got {caller_name} on the line — go ahead, you're on.",
-        f"A: Caller — {caller_name}, right? The air is yours."]
-    _mids = [
-        "A: Then say your piece — the air is yours.",
-        "B: Don't dress it up. Just tell us.",
-        "A: We're listening. All of us.",
-        "B: Say it plain — that's what this line is for."]
-    _bodies = [
-        "C: I'll keep it short. This station got me through a week I "
-        "didn't think I'd get through. That's the call. That's all of it.",
-        "C: I just wanted to say it out loud where somebody could hear "
-        "it: this station is the only thing in this town that answers.",
-        "C: No question, no request. I wanted the room to know somebody "
-        "out here is listening, every night, all the way through.",
-        "C: You played something last week that fixed a thing in me I "
-        "didn't know was broken. That's the whole call."]
-    _closes = [
-        f"B: That's the whole reason the lights are on in here.\n"
-        f"A: Thank you, {caller_name} — stay with us; this next one's "
-        "yours.",
-        f"B: That's the realest thing anyone's said all hour.\n"
-        f"A: {caller_name}, don't be a stranger. Stay tuned.",
-        f"A: The town heard you, {caller_name}. That's what the tower "
-        "is for.",
-        f"B: And THAT is why the phones exist.\n"
-        f"A: Thank you, {caller_name}. This one goes out to you."]
+    focus = (about[:90].rstrip(" ,.;:-")
+             or "what the station has been talking about")
+    texture = " ".join(str(speakerbox_text or "").split()).strip(' "')
+    texture = re.split(r"(?<=[.!?])\s+", texture, maxsplit=1)[0][:120]
+    # This is a safety net, but it still has to sound like a call. The old
+    # version had a host announce the caller's name before the caller had
+    # introduced themselves, then reused the same kitchen-light story on
+    # every failure. A stable hash spreads callers over independent places,
+    # incidents, objects and landings while the final novelty gate remains the
+    # authority that prevents an exact or structural repeat.
+    seed = int(hashlib.sha1(
+        f"{caller_name}|{about}|{texture}".encode("utf-8", "ignore")
+    ).hexdigest(), 16)
+    places = (
+        "the all-night laundromat while the dryers shake the wall",
+        "a parked car behind the grocery store with rain on the roof",
+        "the loading dock at work while the last truck idles",
+        "a kitchen with the refrigerator clicking on and off",
+        "the bus shelter by the courthouse under a broken light",
+        "a garage where an old box fan keeps changing speed",
+        "the apartment stairwell because everybody else is asleep",
+        "a motel walkway with the ice machine grinding behind me",
+    )
+    incidents = (
+        "the metal table got warm enough that my paper receipt curled",
+        "the dashboard display blinked twice and the radio lost its clock",
+        "a stack of shipping labels lifted as if the room had taken a breath",
+        "the magnets slid down the refrigerator door one by one",
+        "the light above me dimmed whenever the warm air rolled through",
+        "the fan changed pitch and pushed a hot-paper smell across the room",
+        "the handrail felt warm even though nobody had touched it",
+        "the ice machine stopped, coughed once, and started blowing warm air",
+    )
+    objects = ("curled receipt", "blinking clock", "loose labels",
+               "sliding magnets", "dimming light", "box fan",
+               "warm handrail", "broken ice machine")
+    landings = (
+        "I wanted somebody else to hear the detail before I talked myself out of it",
+        "I needed to know whether that sounds ordinary from inside your booth",
+        "I called because the little physical detail is harder to dismiss than a theory",
+        "I figured the station discussing it should have one report from outside the room",
+        "I wanted the story on the record while I could still describe it exactly",
+        "I needed a human voice to tell me whether to laugh or unplug something",
+        "I thought you might recognize the pattern before it happens somewhere else",
+        "I called because hearing it repeated back makes it either real or ridiculous",
+    )
+    at = seed % len(places)
+    incident_at = (seed // len(places)) % len(incidents)
+    incident = incidents[incident_at]
+    # The follow-up question must pick up the evidence the caller actually
+    # supplied. Selecting these independently created a dashboard incident
+    # followed by a host inexplicably asking about a warm handrail.
+    obj = objects[incident_at]
+    landing = landings[(seed // 17) % len(landings)]
+    # The exact switchboard number remains in call metadata and the archive.
+    # Putting numeric digits in the fallback's spoken opener made the tint
+    # spell them out, after which the number-preservation gate correctly
+    # refused turn one forever. "The request line" is natural on air and
+    # leaves cadence free to change without falsifying the routing record.
+    line_ref = "The request line"
+    source_turn = (
+        f'B: You also brought us this line: "{texture}" Why did that land '
+        f'on the same nerve as the {obj}?\n' if texture else
+        f"B: The {obj} is the part I cannot shake. What did it make you "
+        "think was happening?\n")
     return (
-        _opens[_v] + "\n"
-        f"C: Hey — it's {caller_name}. Longtime listener."
-        + (f" I'm calling about {about}" if about else
-           " I had to call about what you were just playing.") + "\n"
-        + _mids[_v] + "\n"
-        + _bodies[_v] + "\n"
-        + _closes[_v])
+        f"A: {line_ref} is ringing. Pine Box FM, you're live; go ahead.\n"
+        f"C: Hi, this is {caller_name}, calling from {places[at]}.\n"
+        f"B: {caller_name}, good to have you. What made you call about "
+        f"{focus} tonight?\n"
+        f"C: It stopped being an abstract topic when {incident}. That was "
+        f"the moment {focus} became something happening in my own room.\n"
+        f"A: When you noticed the {obj}, what did you do next, and what "
+        "changed after that?\n"
+        f"C: I moved closer, checked it twice, and wrote down the time. "
+        f"Nothing dramatic happened after that, which made the {obj} feel "
+        "more specific rather than less.\n"
+        + source_turn
+        + f"C: It gave the detail a sentence I could hold onto. {landing}, "
+        f"and now I want people listening for the {obj}.\n"
+        f"B: That is useful, not just strange: a place, a time, and the "
+        f"{obj}. We'll keep those three together when we talk about "
+        f"{focus} again.\n"
+        f"A: Thank you for calling, {caller_name}. Stay with Pine Box FM; "
+        "we're taking that detail back to the music.")
 
 
 def caller_behavior_draw() -> tuple[str, str]:
@@ -48023,7 +50693,525 @@ def call_line_say(number: int) -> str:
 HANGUPS_PATH = data_path("hangup_rules.json")
 CALL_LOG_PATH = data_path("call_log.json")
 _HANGUP_LOCK = RLock()
-CALL_LOG_KEPT = 120
+# A call is continuity data, not a rolling UI buffer.  Five thousand complete
+# calls is years of useful novelty memory at the default rate while remaining a
+# small JSON file.  The old 120-row cap forgot a premise in roughly a day.
+CALL_LOG_KEPT = max(120, int(os.getenv("CALL_LOG_KEPT", "5000")))
+CALL_NOVELTY_LOOKBACK = 240
+CALL_NOVELTY_MAX_SIMILARITY = 0.48
+CALL_CONTRACT_VERSION = 7
+
+# Function words and the unavoidable furniture of a radio call carry no
+# novelty.  Comparing them made every good call resemble every other merely
+# because somebody said "you're on the air" and "thanks for calling".
+_CALL_NOVELTY_STOP = {
+    "a", "about", "after", "again", "all", "am", "an", "and", "are",
+    "as", "at", "b", "be", "because", "been", "before", "being", "but",
+    "by", "c", "call", "called", "caller", "calling", "can", "did", "do",
+    "does", "for", "from", "go", "got", "had", "has", "have", "he",
+    "hello", "hey", "host", "hosts", "i", "if", "in", "into", "is", "it",
+    "just", "line", "me", "my", "no", "not", "now", "of", "oh", "on",
+    "one", "or", "our", "out", "radio", "right", "said", "say", "she",
+    "so", "station", "that", "the", "their", "them", "then", "there",
+    "they", "this", "to", "us", "was", "we", "were", "what", "when",
+    "who", "why", "with", "you", "your", "youre",
+}
+
+
+def call_script_text(script: Any) -> str:
+    """A stable, speaker-labelled transcript string from any stored shape."""
+    if isinstance(script, list):
+        rows: list[str] = []
+        for row in script:
+            if isinstance(row, dict):
+                who = str(row.get("marker") or row.get("who") or "").strip()
+                said = str(row.get("text") or "").strip()
+            elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                who, said = str(row[0]).strip(), str(row[1]).strip()
+            else:
+                continue
+            if said:
+                who = {"dj": "A", "host": "A", "cohost": "B",
+                       "caller": "C", "third": "D", "caller2": "E"}.get(
+                           who.lower(), who)
+                rows.append(f"{who}: {said}" if who else said)
+        return "\n".join(rows)
+    return str(script or "")
+
+
+def call_fingerprint(script: Any) -> str:
+    """Exact-dialogue identity, insensitive to labels and punctuation."""
+    flat = re.sub(r"(?:^|\s)[ABCDE]\s*:\s*", " ",
+                  call_script_text(script), flags=re.I)
+    flat = re.sub(r"[^a-z0-9']+", " ", flat.lower())
+    flat = " ".join(flat.split())
+    return hashlib.sha256(flat.encode("utf-8")).hexdigest() if flat else ""
+
+
+def _call_novelty_terms(script: Any) -> list[str]:
+    words = re.findall(r"[a-z0-9']+", call_script_text(script).lower())
+    return [w for w in words if len(w) > 2 and w not in _CALL_NOVELTY_STOP]
+
+
+def _call_novelty_grams(script: Any, width: int = 3) -> set[str]:
+    words = _call_novelty_terms(script)
+    if not words:
+        return set()
+    if len(words) < width:
+        return {" ".join(words)}
+    return {" ".join(words[i:i + width])
+            for i in range(len(words) - width + 1)}
+
+
+def _call_history_scripts(include_shelf: bool = True,
+                          exclude_entry: Any = None
+                          ) -> list[dict[str, Any]]:
+    """Completed calls plus calls already committed to the recording queue."""
+    out: list[dict[str, Any]] = []
+    for row in call_log_read()[-CALL_NOVELTY_LOOKBACK:]:
+        text = call_script_text(row.get("transcript") or row.get("script"))
+        if text:
+            out.append({"id": str(row.get("id") or ""),
+                        "name": str(row.get("name") or ""),
+                        "topic": str(row.get("topic") or ""),
+                        "source": str(row.get("source") or ""),
+                        "speakerbox_text": str(
+                            row.get("speakerbox_text") or ""),
+                        "script": text})
+    if include_shelf:
+        try:
+            for kind, rows in list(_SHELF.items()):
+                for row in rows or []:
+                    entry = (row or {}).get("entry") or {}
+                    if exclude_entry is not None and entry is exclude_entry:
+                        continue
+                    if not entry.get("caller_name"):
+                        continue
+                    text = call_script_text(entry.get("script"))
+                    if text:
+                        meta = entry.get("call") or {}
+                        out.append({"id": str(meta.get("id") or "queued"),
+                                    "name": str(entry.get("caller_name") or ""),
+                                    "topic": str(meta.get("topic") or ""),
+                                    "source": str(meta.get("source") or ""),
+                                    "speakerbox_text": str(
+                                        meta.get("speakerbox_text") or ""),
+                                    "script": text})
+        except Exception:  # noqa: BLE001
+            pass
+    return out[-CALL_NOVELTY_LOOKBACK:]
+
+
+def call_novelty(script: Any, include_shelf: bool = True,
+                 exclude_entry: Any = None) -> dict[str, Any]:
+    """Exact and structural comparison against calls the station remembers."""
+    text = call_script_text(script)
+    fingerprint = call_fingerprint(text)
+    grams = _call_novelty_grams(text)
+    best = 0.0
+    matched: dict[str, Any] = {}
+    exact = False
+    for row in _call_history_scripts(include_shelf, exclude_entry):
+        other = str(row.get("script") or "")
+        other_fp = call_fingerprint(other)
+        if fingerprint and other_fp == fingerprint:
+            exact, best, matched = True, 1.0, row
+            break
+        theirs = _call_novelty_grams(other)
+        if not grams or not theirs:
+            continue
+        score = len(grams & theirs) / max(1, len(grams | theirs))
+        if score > best:
+            best, matched = score, row
+    return {
+        "ok": bool(fingerprint and not exact
+                   and best < CALL_NOVELTY_MAX_SIMILARITY),
+        "fingerprint": fingerprint,
+        "exact": exact,
+        "similarity": round(best, 3),
+        "limit": CALL_NOVELTY_MAX_SIMILARITY,
+        "matched_id": str(matched.get("id") or ""),
+        "matched_name": str(matched.get("name") or ""),
+        "matched_topic": str(matched.get("topic") or "")[:240],
+    }
+
+
+def _call_topic_terms(value: Any) -> set[str]:
+    return {w for w in _call_novelty_terms(value)
+            if w not in _SPEAKBOX_TOPIC_STOP}
+
+
+def call_topic_report(script: Any, topic: str = "") -> dict[str, Any]:
+    """Prove that the database topic is carried by both sides of the call."""
+    terms = _call_topic_terms(topic)
+    if not terms:
+        return {"ok": True, "terms": [], "shared": [], "turns": [],
+                "host": True, "caller": True}
+    turns = banter_turns(call_script_text(script))
+    hit_rows: list[int] = []
+    shared: set[str] = set()
+    host = False
+    caller = False
+    for at, (marker, said) in enumerate(turns):
+        found = terms & _call_topic_terms(said)
+        if not found:
+            continue
+        hit_rows.append(at)
+        shared.update(found)
+        host = host or marker in ("A", "B", "D")
+        caller = caller or marker in ("C", "E")
+    return {
+        "ok": bool(len(hit_rows) >= 2 and host and caller),
+        "terms": sorted(terms)[:30], "shared": sorted(shared)[:30],
+        "turns": hit_rows[:30], "host": host, "caller": caller,
+    }
+
+
+def call_speakerbox_report(script: Any, speakerbox_text: str = "",
+                           topic: str = "") -> dict[str, Any]:
+    """Prove that a selected Speakerbox source made it into the dialogue."""
+    texture = _call_topic_terms(speakerbox_text)
+    if not texture:
+        return {"ok": True, "required": False, "shared": []}
+    # Prefer a term that is not merely the database subject: that is evidence
+    # that the source passage contributed texture, not just that both mention
+    # the same theme.  A very short passage may have no such term, in which
+    # case an anchored topic term is the honest available proof.
+    distinctive = texture - _call_topic_terms(topic)
+    wanted = distinctive or texture
+    shared = wanted & _call_topic_terms(script)
+    return {"ok": bool(shared), "required": True,
+            "shared": sorted(shared)[:30],
+            "wanted": sorted(wanted)[:30]}
+
+
+def call_speakerbox_novelty(speakerbox_text: str = "",
+                            include_shelf: bool = True,
+                            exclude_entry: Any = None) -> dict[str, Any]:
+    """Do not assign the same Speakerbox seed to two calls in one queue."""
+    flat = " ".join(str(speakerbox_text or "").lower().split())
+    if not flat:
+        return {"ok": True, "required": False, "matched_id": "",
+                "matched_name": ""}
+    for row in _call_history_scripts(include_shelf, exclude_entry):
+        other = " ".join(str(row.get("speakerbox_text") or "")
+                         .lower().split())
+        if other and other == flat:
+            return {"ok": False, "required": True,
+                    "matched_id": str(row.get("id") or ""),
+                    "matched_name": str(row.get("name") or "")}
+    return {"ok": True, "required": True, "matched_id": "",
+            "matched_name": ""}
+
+
+def call_tint_report(plain: Any, tinted: Any,
+                     required_names: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Reject a stylish tint that changed the call's meaning or structure."""
+    before = banter_turns(call_script_text(plain))
+    after = banter_turns(call_script_text(tinted))
+    faults: list[str] = []
+    if not before:
+        return {"ok": True, "checked": False, "faults": []}
+    if len(before) != len(after):
+        faults.append("the tint changed the number of turns")
+    if [m for m, _ in before] != [m for m, _ in after]:
+        faults.append("the tint changed the speaker order")
+    for at, ((marker, source), (_marker, result)) in enumerate(
+            zip(before, after)):
+        src_terms = _call_topic_terms(source)
+        out_terms = _call_topic_terms(result)
+        if len(src_terms) >= 3:
+            kept = len(src_terms & out_terms) / max(1, len(src_terms))
+            # A tint may replace connective language and cadence; it may not
+            # replace the content. The old 15% floor let a six-noun line keep
+            # one generic noun and invent the rest. A 45% floor then rejected
+            # faithful question paraphrases such as noticed→saw and
+            # changed→shifted even while their exact concrete object, proper
+            # names, numbers and question role survived the hard gates below.
+            if kept < 0.35:
+                faults.append(f"tint turn {at + 1} lost its subject")
+        if "?" in source and "?" not in result:
+            faults.append(f"tint turn {at + 1} turned a question into a statement")
+        if (re.search(r"\b(thank|thanks|appreciate|goodbye|goodnight|take care)\b",
+                      source.lower())
+                and not re.search(
+                    r"\b(thank|thanks|appreciate|goodbye|goodnight|take care)\b",
+                    result.lower())):
+            faults.append(f"tint turn {at + 1} lost the spoken sign-off")
+        numbers = set(re.findall(r"\b\d+(?:[.,]\d+)*\b", source))
+        if numbers - set(re.findall(r"\b\d+(?:[.,]\d+)*\b", result)):
+            faults.append(f"tint turn {at + 1} lost a number")
+        names = {n.lower() for full in required_names for n in full.split()
+                 if n and re.search(rf"\b{re.escape(n)}\b", source, re.I)}
+        for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9'_-]*\b", source):
+            word = match.group(0)
+            if word.isupper() and len(word) > 1:
+                names.add(word.lower())
+                continue
+            # A title-cased token in the middle of a sentence is probably a
+            # person/place/product; a title-cased sentence opener is grammar,
+            # not a name (the previous version falsely treated every "What"
+            # and "Longtime" as an entity).
+            prior = source[:match.start()].rstrip()
+            if (prior and prior[-1] not in ".!?;:\n"
+                    and word[:1].isupper() and len(word) > 2):
+                names.add(word.lower())
+        out_words = set(re.findall(r"[a-z0-9'_-]+", result.lower()))
+        if names - out_words:
+            faults.append(f"tint turn {at + 1} lost a name")
+        intro = re.search(
+            r"\b(?:i am|i'm|im|this is|it is|it's|its)\s+([a-z0-9'_-]+)\b",
+            source.lower())
+        if intro and not re.search(
+                rf"\b(?:i am|i'm|im|this is|it is|it's|its)\s+"
+                rf"{re.escape(intro.group(1))}\b", result.lower()):
+            faults.append(f"tint turn {at + 1} lost the self-introduction")
+        if at:
+            prior = " ".join(after[at - 1][1].lower().split())
+            current = " ".join(result.lower().split())
+            prior_words = prior.split()
+            if len(prior_words) >= 5:
+                lead = " ".join(prior_words[:5])
+                if lead and lead in current:
+                    faults.append(f"tint turn {at + 1} copied the prior turn")
+    return {"ok": not faults, "checked": True,
+            "turns_before": len(before), "turns_after": len(after),
+            "faults": faults[:30]}
+
+
+def call_flow_report(script: Any, caller_name: str = "",
+                     caller2_name: str = "",
+                     include_shelf: bool = True,
+                     topic: str = "", source_script: Any = "",
+                     speakerbox_text: str = "",
+                     exclude_entry: Any = None) -> dict[str, Any]:
+    """Machine-check conversation, theme, tint fidelity and novelty."""
+    turns = banter_turns(call_script_text(script), caller_name, caller2_name)
+    caller_at = [i for i, (m, _t) in enumerate(turns) if m in ("C", "E")]
+    host_at = [i for i, (m, _t) in enumerate(turns) if m in ("A", "B", "D")]
+    first_caller = caller_at[0] if caller_at else -1
+    first_text = turns[first_caller][1] if first_caller >= 0 else ""
+    first_name = str(caller_name or "").split()[0].lower() if caller_name else ""
+    first_clean = re.sub(r"[^a-z0-9' ]+", " ", first_text.lower())
+    first_clean = " ".join(first_clean.split())
+    introduced = bool(not first_name or re.search(
+        rf"\b(?:i am|i'm|im|this is|it is|it's|its)\s+{re.escape(first_name)}\b"
+        rf"|\b{re.escape(first_name)}\s+(?:here|calling|from)\b",
+        first_clean))
+    questions = 0
+    answered = 0
+    grounded_questions = 0
+    links = 0
+    for i in range(len(turns) - 1):
+        marker, said = turns[i]
+        nxt, answer = turns[i + 1]
+        if marker in ("A", "B", "D") and "?" in said:
+            questions += 1
+            if nxt in ("C", "E"):
+                answered += 1
+            if i and turns[i - 1][0] in ("C", "E"):
+                ignore = (_call_topic_terms(topic)
+                          | _call_topic_terms(caller_name)
+                          | _call_topic_terms(caller2_name))
+                asked_terms = set(_call_novelty_terms(said)) - ignore
+                supplied = set(_call_novelty_terms(turns[i - 1][1])) - ignore
+                if asked_terms & supplied:
+                    grounded_questions += 1
+        # A concrete lexical callback is strong evidence of response; a
+        # question immediately answered by the caller is the other natural
+        # form.  This is diagnostic, not a semantic oracle.
+        left = set(_call_novelty_terms(said))
+        right = set(_call_novelty_terms(answer))
+        if left & right or ("?" in said and nxt in ("C", "E")):
+            links += 1
+    share = len(caller_at) / max(1, len(turns))
+    novelty = call_novelty(script, include_shelf=include_shelf,
+                           exclude_entry=exclude_entry)
+    topic_grade = call_topic_report(script, topic)
+    speakerbox_grade = call_speakerbox_report(
+        script, speakerbox_text, topic)
+    speakerbox_novelty = call_speakerbox_novelty(
+        speakerbox_text, include_shelf, exclude_entry)
+    tint_grade = call_tint_report(
+        source_script, script,
+        tuple(n for n in (caller_name, caller2_name) if n))
+    close_text = turns[-1][1].lower() if turns else ""
+    closed = bool(turns and turns[-1][0] in ("A", "B", "D")
+                  and re.search(r"\b(thank|thanks|goodbye|goodnight|"
+                                r"appreciate|take care)\b", close_text))
+    # A real request-line call has an observable protocol, not merely three
+    # C-labelled speeches inside banter: a host answers a ringing line without
+    # already knowing the stranger's name; the caller introduces themselves;
+    # the next host greets that person and starts the interview.
+    opening_marker, opening_text = turns[0] if turns else ("", "")
+    opening_flat = " ".join(opening_text.lower().split())
+    answered_line = bool(
+        opening_marker in ("A", "B", "D")
+        and re.search(r"\b(call|phone|phones|line|request line)\b",
+                      opening_flat)
+        and re.search(r"\b(ring|ringing|live|on air|go ahead|hello|pine box)\b",
+                      opening_flat))
+    host_knew_name = bool(first_name and re.search(
+        rf"\b{re.escape(first_name)}\b", opening_flat))
+    first_words = re.findall(r"[a-z0-9']+", first_text.lower())
+    first_topic = _call_topic_terms(first_text) & _call_topic_terms(topic)
+    # A caller may naturally identify the place they are calling from.  One
+    # incidental theme word in that location (for example ``ice machine``
+    # while the subject is the DGX machine) is still a brief introduction;
+    # requiring zero overlap rejected a perfectly normal request-line hello.
+    # Two or more subject terms is enough evidence that the caller has begun
+    # the story before the host has greeted them, and remains a hard failure.
+    intro_only = bool(first_text and len(first_words) <= 30
+                      and len(first_topic) <= 1)
+    greeted = False
+    if first_caller >= 0 and first_caller + 1 < len(turns):
+        greet_marker, greet_text = turns[first_caller + 1]
+        greeted = bool(
+            greet_marker in ("A", "B", "D")
+            and first_name
+            and re.search(rf"\b{re.escape(first_name)}\b",
+                          greet_text.lower()))
+    faults: list[str] = []
+    if len(turns) < 6:
+        faults.append("fewer than six complete turns")
+    if len(caller_at) < 3:
+        faults.append("the caller has fewer than three turns")
+    if caller_at and not 0.35 <= share <= 0.72:
+        faults.append("the caller/host turn share is out of balance")
+    if first_caller < 0 or first_caller > 1:
+        faults.append("the caller is not heard immediately after the host answers")
+    if not answered_line:
+        faults.append("the opening host does not audibly answer a ringing line")
+    if host_knew_name:
+        faults.append("the host says the stranger's name before they introduce themselves")
+    if not introduced:
+        faults.append("the caller does not introduce themselves")
+    if not intro_only:
+        faults.append("the caller's first turn is not a brief introduction")
+    if not greeted:
+        faults.append("a host does not greet the caller by name after the introduction")
+    if not closed:
+        faults.append("a host does not give the call a clear spoken sign-off")
+    if questions < 2 or answered < 2:
+        faults.append("fewer than two natural host questions are answered by "
+                      "the caller")
+    if grounded_questions < 2:
+        faults.append("fewer than two host questions pick up a concrete "
+                      "detail from the caller's prior answer")
+    if len(turns) >= 6 and links / max(1, len(turns) - 1) < 0.2:
+        faults.append("too few adjacent turns visibly connect")
+    if not novelty["ok"]:
+        faults.append("the premise or dialogue is too similar to a stored call")
+    if not topic_grade["ok"]:
+        faults.append("the database topic is not carried by both caller and hosts")
+    if not speakerbox_grade["ok"]:
+        faults.append("the selected Speakerbox source never enters the dialogue")
+    if not speakerbox_novelty["ok"]:
+        faults.append("the selected Speakerbox source is already assigned "
+                      "to another call")
+    faults.extend(tint_grade.get("faults") or [])
+    return {
+        "ok": not faults, "turns": len(turns),
+        "caller_turns": len(caller_at), "host_turns": len(host_at),
+        "caller_share": round(share, 3), "first_caller": first_caller,
+        "answered_line": answered_line, "host_knew_name": host_knew_name,
+        "introduced": introduced, "intro_only": intro_only,
+        "intro_topic_terms": sorted(first_topic),
+        "greeted": greeted, "closed": closed, "questions": questions,
+        "answered_questions": answered,
+        "grounded_questions": grounded_questions,
+        "linked_turns": links, "faults": faults, "novelty": novelty,
+        "topic": topic_grade, "speakerbox": speakerbox_grade,
+        "speakerbox_novelty": speakerbox_novelty,
+        "tint": tint_grade,
+    }
+
+
+def call_entry_contract(entry: Any) -> bool:
+    """Whether a banked call was explicitly accepted by today's contract.
+
+    We deliberately do not auto-bless older cupboard rows here. They were
+    written before complete transcripts, topics and novelty fingerprints were
+    retained, so their quality cannot be established without pretending. A
+    paused station will replace them with graded calls; their orphaned audio is
+    then eligible for ordinary pantry cleanup instead of being aired or kept.
+    """
+    try:
+        if not isinstance(entry, dict) or not entry.get("caller_name"):
+            return False
+        meta = entry.get("call") or {}
+        quality = meta.get("quality") or {}
+        script = str(entry.get("script") or "").strip()
+        fingerprint = str(meta.get("fingerprint") or "")
+        return bool(
+            int(meta.get("contract_version") or 0) == CALL_CONTRACT_VERSION
+            and str(meta.get("topic") or "").strip()
+            and quality.get("ok")
+            and fingerprint
+            and fingerprint == call_fingerprint(script)
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def call_entry_regrade(entry: dict[str, Any],
+                       include_shelf: bool = True) -> dict[str, Any]:
+    """Bind the phone contract to the words that would air right now.
+
+    Tinting is allowed to change cadence and diction, which necessarily
+    changes the exact fingerprint.  The former pipeline graded the plain
+    draft, activated a later tint, and left the old fingerprint attached;
+    every successfully tinted call then failed readiness forever.  Regrading
+    at each activation also catches a stylish tint that damaged the phone
+    protocol, theme, Speakerbox evidence or semantic fidelity.
+    """
+    if not isinstance(entry, dict):
+        return {"ok": False, "faults": ["there is no call entry"]}
+    meta = entry.setdefault("call", {})
+    caller_name = str(entry.get("caller_name") or "")
+    caller2_name = str(entry.get("caller2_name") or "")
+    active = str(entry.get("script") or "")
+    source = (str(entry.get("script_plain") or "")
+              if entry.get("use") == "tinted" else "")
+    report = call_flow_report(
+        active, caller_name, caller2_name,
+        include_shelf=include_shelf,
+        topic=str(meta.get("topic") or ""), source_script=source,
+        speakerbox_text=str(meta.get("speakerbox_text") or ""),
+        exclude_entry=entry)
+    turns = banter_turns(active, caller_name, caller2_name)
+    premise = next((said for marker, said in turns
+                    if marker in ("C", "E")), "")
+    meta.update({
+        "contract_version": CALL_CONTRACT_VERSION,
+        "fingerprint": str((report.get("novelty") or {}).get(
+            "fingerprint") or ""),
+        "premise": str(premise)[:700],
+        "quality": report,
+    })
+    return report
+
+
+def call_novelty_prompt() -> str:
+    """A compact memory of recent openings/topics for the writing prompt."""
+    rows = _call_history_scripts()[-12:]
+    if not rows:
+        return ""
+    seen: list[str] = []
+    for row in reversed(rows):
+        turns = banter_turns(str(row.get("script") or ""),
+                             str(row.get("name") or ""))
+        caller_line = next((t for m, t in turns if m in ("C", "E")), "")
+        topic = str(row.get("topic") or "").strip()
+        sample = " / ".join(x for x in (topic, caller_line[:150]) if x)
+        if sample and sample not in seen:
+            seen.append(sample)
+    if not seen:
+        return ""
+    return ("\n\nCALL MEMORY - these are recently used premises/opening moves. "
+            "Do not paraphrase, reskin, or revisit any of them; choose a "
+            "different concrete situation, conflict, questions and landing:\n- "
+            + "\n- ".join(seen[:10]))
 
 
 def _hangup_seed() -> list[dict[str, Any]]:
@@ -48861,10 +52049,10 @@ def case_for_call(case_id: str = "", heat: int | None = None) -> dict[str, Any]:
     try:
         if case_id or heat is not None:
             return case_pick(case_id=case_id, heat=heat)   # asked for by hand
-        if theme_owns_air():
-            # #775's rule, applied to the book: a subject the OPERATOR has
-            # named outranks the station's own material, and a case is
-            # exactly that kind of material.
+        if active_theme():
+            # The active database subject owns every phone call. Cases are
+            # alternative subjects, so they stand down even when the active
+            # subject is the station's seeded default.
             return {}
         rate = max(0, min(100, int(
             dj_settings().get("caller_case_rate", 55) or 0)))
@@ -49039,6 +52227,14 @@ def call_log_read() -> list[dict[str, Any]]:
 def call_log_add(entry: dict[str, Any]) -> None:
     """One finished call, written down: who, how long, and which rule ended
     it. Kept on disk so the ledger survives a restart."""
+    entry = dict(entry or {})
+    transcript = list(entry.get("transcript") or [])
+    if transcript:
+        entry.setdefault("fingerprint", call_fingerprint(transcript))
+        entry.setdefault("flow", call_flow_report(
+            transcript, str(entry.get("name") or ""), include_shelf=False,
+            topic=str(entry.get("topic") or "")))
+    entry.setdefault("id", uuid.uuid4().hex[:12])
     with _HANGUP_LOCK:
         rows = call_log_read()
         rows.append(entry)
@@ -49071,7 +52267,8 @@ def call_log_add(entry: dict[str, Any]) -> None:
 # reaching its hang-up cannot wedge the phone shut for ever. Nothing here
 # ever waits: a second call defers and comes back on the next pass, which
 # keeps the round supervisor free.
-_CALL_LIVE: dict[str, Any] = {"who": "", "at": 0.0}
+_CALL_LIVE: dict[str, Any] = {
+    "who": "", "at": 0.0, "id": "", "meta": {}, "transcript": []}
 # Every road reaches call_ended on its normal path - checked, each of them
 # has exactly one return and the hang-up always precedes it - so the only
 # way the line leaks is an exception between the banner and the hang-up.
@@ -49091,7 +52288,8 @@ def call_line_busy() -> str:
         if time.time() - float(_CALL_LIVE.get("at") or 0) > CALL_LINE_STALE:
             # A leak is a fault, not routine housekeeping: say so, because
             # a silently self-healing bug is one nobody ever fixes.
-            _CALL_LIVE.update({"who": "", "at": 0.0})
+            _CALL_LIVE.update({"who": "", "at": 0.0, "id": "", "meta": {},
+                               "transcript": []})
             try:
                 pipeline_log("call", f"the line was still showing {who} "
                              f"after {int(CALL_LINE_STALE)}s — a call road "
@@ -49105,20 +52303,67 @@ def call_line_busy() -> str:
         return ""
 
 
-def call_line_take(who: str) -> bool:
+def call_line_take(who: str, meta: dict[str, Any] | None = None) -> bool:
     """Pick up the phone for `who`. False when somebody else already has."""
     try:
         if call_line_busy():
             return False
-        _CALL_LIVE.update({"who": str(who or "a caller"), "at": time.time()})
+        _CALL_LIVE.update({
+            "who": str(who or "a caller"), "at": time.time(),
+            "id": uuid.uuid4().hex[:12], "meta": dict(meta or {}),
+            "transcript": [],
+        })
         return True
     except Exception:  # noqa: BLE001
         return True
 
 
+def call_line_context(**fields: Any) -> None:
+    """Add facts learned after pickup to the current call's durable record."""
+    try:
+        if not call_line_busy():
+            return
+        meta = _CALL_LIVE.setdefault("meta", {})
+        for key, value in fields.items():
+            if value not in (None, "", [], {}):
+                meta[str(key)] = value
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def call_line_transcript(turns: list[dict[str, Any]]) -> None:
+    """Capture the accepted turn plan once, before synthesis can fragment it."""
+    try:
+        if not call_line_busy() or not turns:
+            return
+        clean: list[dict[str, str]] = []
+        for row in turns:
+            who = str(row.get("who") or "")
+            text = spoken_text(str(row.get("text") or ""))
+            if who and text:
+                clean.append({"who": who,
+                              "name": str(row.get("name") or ""),
+                              "text": text})
+        if clean:
+            _CALL_LIVE["transcript"] = clean
+            meta = _CALL_LIVE.setdefault("meta", {})
+            premise = next((r["text"] for r in clean
+                            if r.get("who") in ("caller", "caller2")), "")
+            if premise:
+                meta.setdefault("premise", premise[:700])
+            meta["fingerprint"] = call_fingerprint(clean)
+            meta["flow"] = call_flow_report(
+                clean, str(_CALL_LIVE.get("who") or ""),
+                include_shelf=False, topic=str(meta.get("topic") or ""),
+                speakerbox_text=str(meta.get("speakerbox_text") or ""))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def call_line_free() -> None:
     try:
-        _CALL_LIVE.update({"who": "", "at": 0.0})
+        _CALL_LIVE.update({"who": "", "at": 0.0, "id": "", "meta": {},
+                           "transcript": []})
     except Exception:  # noqa: BLE001
         pass
 
@@ -49130,6 +52375,14 @@ def call_ended(name: str, line_say: str, started: float,
     something that stops scrolling: it ends at a stated time, after a
     stated length, for a stated reason you can click."""
     ended = time.time()
+    # Snapshot before freeing the line.  This is the complete conversation
+    # database record assembled by pickup, writing and the accepted playout
+    # plan; older builds discarded all of it except name/duration/outcome.
+    live = {
+        "id": str(_CALL_LIVE.get("id") or uuid.uuid4().hex[:12]),
+        "meta": dict(_CALL_LIVE.get("meta") or {}),
+        "transcript": list(_CALL_LIVE.get("transcript") or []),
+    }
     # #977: the phone is free again the moment the call is over, whatever
     # the outcome was. Every call road ends here, which is why the release
     # lives here rather than in each of them.
@@ -49156,10 +52409,12 @@ def call_ended(name: str, line_say: str, started: float,
         })
         del _RADIO["chat"][:-240]
         call_log_add({
+            "id": live["id"],
             "ts": int(ended), "name": name, "line": line_say,
             "seconds": round(ran, 1), "turns": 0,
             "rule_id": str(rule.get("id") or ""), "rule": outcome,
             "state": "never_aired",
+            **live["meta"], "transcript": live["transcript"],
         })
         return
     _RADIO["chat"].append({
@@ -49176,10 +52431,12 @@ def call_ended(name: str, line_say: str, started: float,
     })
     del _RADIO["chat"][:-240]
     call_log_add({
+        "id": live["id"],
         "ts": int(ended), "name": name, "line": line_say,
         "seconds": round(ran, 1), "turns": int(turns),
         "rule_id": str(rule.get("id") or ""), "rule": outcome,
         "state": state,
+        **live["meta"], "transcript": live["transcript"],
     })
     pipeline_log("call", f"{name} hung up after {int(ran)}s — {short}")
 
@@ -49859,11 +53116,13 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
     """What tonight's caller is on about: a diatribe out of the speakbox,
     something completely unhinged (#358), a news story, or one of your
     planted topics — biased toward tonight's theme when one is set (#680)."""
-    # #680: the theme wins its share of the calls and leaves the rest to the
-    # usual mix, so the phone line still sounds like a phone line.
+    # The database theme is the PHONE DESK'S umbrella, not another weighted
+    # flavour. Individual callers still bring different stories, positions,
+    # evidence and temperaments, but every call belongs to the subject the
+    # operator put in force. The old strength roll quietly sent 36% of calls
+    # somewhere else at the live 64% setting.
     theme = active_theme()
-    if theme and random.random() < max(0, min(100, int(
-            themes_read().get("strength") or 70))) / 100:
+    if theme:
         # #686: the theme call is not a polite enquiry. Pull real material
         # out of the shelf and make them RIFF on it — a caller who only
         # states their topic is a survey response, not radio.
@@ -50100,6 +53359,21 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     telephone crush — in a random state, driven by the DJs, who inquire, dig,
     joke, and land the caller happy or furious as the dice decide (#236,
     #237)."""
+    # Pause is a hard air boundary. Independent clocks and API/theme triggers
+    # can all reach this function, so enforce it at the call road itself as
+    # well as at each caller: ask the ordinary commitment-aware preparer for a
+    # banked call and return immediately without taking the line, ringing,
+    # rendering a live stream, stamping quota, or writing a fake hangup.
+    if radio_paused():
+        try:
+            fire_and_forget(prep_one("caller"))
+            pipeline_log("call", "a generated phone call was requested while "
+                         "off air — it was sent to the writing/recording rooms "
+                         "for the cupboard instead of opened live")
+        except Exception:  # noqa: BLE001
+            pass
+        return {"caller": "", "lines": [], "state": "banking",
+                "why": "the station is paused; a banked call was requested"}
     # #977: if somebody is already on the line, this call does not happen
     # now. A return, never a wait - blocking here would hold the round
     # supervisor open while the other call runs.
@@ -50764,6 +54038,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     behavior_key, behavior_bit = caller_behavior_draw()
     if behavior_key != "plain":
         state = f"{state} [deck: {behavior_key}]"
+    _theme_now = active_theme()
+    _call_meta = {
+        "mode": "generated",
+        "topic": str((_theme_now or {}).get("text") or topic)[:700],
+        "theme": str((_theme_now or {}).get("name") or ""),
+        "theme_text": str((_theme_now or {}).get("text") or "")[:700],
+        "behavior": behavior_key,
+        "case_id": str(call_case.get("id") or ""),
+        "case": str(call_case.get("title") or ""),
+        "source": str((seed or {}).get("file") or ""),
+        "hostile": bool(hostile),
+        "duo": bool(duo_name),
+    }
     angle = (
         f"The request line rings and {caller['name']} is on {line_say}, "
         f"{state}.{temper_bit}{behavior_bit}"
@@ -50793,13 +54080,13 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         # while the OTHER call road asks for about half the turns. So the
         # two roads disagreed, and this one produced exactly the call the
         # operator described. The caller drives now; the hosts react.
-        "Then take the call properly: ask what is going on ONCE, and then "
-        "GET OUT OF THE WAY — the CALLER drives this call. They rant. "
-        "They have a thread of their own and they keep coming back to it "
-        "and winding it further up. When a host steers, questions or "
-        "changes the subject, the caller DISMISSES it - 'yeah, that's not "
-        "important', 'that doesn't matter' - and carries on with what "
-        "they were saying. The hosts riff and make jokes "
+        "Then take the call properly: invite the caller's reason, listen for "
+        "the particular detail inside it, and ask responsive follow-ups that "
+        "the caller ACTUALLY answers. The caller has a thread of their own, "
+        "but what the hosts say changes how they tell it; what the caller "
+        "reveals changes the hosts' next question or joke. Build rapport "
+        "through callbacks and mutual disclosure, not generic sympathy. "
+        "The hosts riff and make jokes "
         f"without losing the person. {caller['name']} has REAL RESOLVE "
         "(#316): when the hosts dismiss or challenge them they PUSH BACK "
         "and hold their ground, in their own words — and the hosts push "
@@ -50812,7 +54099,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         + approach_clause(approach_pick())                     # #752
     )
     call_started = time.time()
-    call_line_take(str(caller["name"]))               # #977: one line, one caller
+    call_line_take(str(caller["name"]), _call_meta)    # one line, one caller
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "call",
         "text": f"On {line_say}: {caller['name']}",
@@ -50863,7 +54150,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
                             caller_fx=caller_fx,
                             caller2_name=duo_name, caller2_voice=duo_voice,
                             render_stream=bool(dj.get("call_stream", True)),
-                            feel=hostile)                          # #750
+                            feel=hostile, call_meta=_call_meta)    # #750
     if caller.get("id"):
         with _CALLERS_LOCK:
             for row in rows:
@@ -50977,8 +54264,12 @@ async def dj_call_scripted(name: str, script: list[str]) -> dict[str, Any]:
         + (f"By the end, {rule['text']}. " if rule.get("text") else "")
         + "Then back to the music. "
         f"Format the caller's lines as 'C: ...' — C is {name}.")
+    _active = active_theme()
+    call_meta = {"mode": "scripted", "topic": " ".join(script)[:700],
+                 "theme": str((_active or {}).get("name") or ""),
+                 "theme_text": str((_active or {}).get("text") or "")[:700]}
     started = time.time()
-    call_line_take(str(name))                         # #977: one line, one caller
+    call_line_take(str(name), call_meta)              # one line, one caller
     _RADIO["chat"].append({
         "ts": int(time.time()), "who": "host", "kind": "call",
         "text": f"On {line_say}: {name}",
@@ -50989,6 +54280,7 @@ async def dj_call_scripted(name: str, script: list[str]) -> dict[str, Any]:
     lines = await dj_banter(
         _RADIO.get("now"), angle=angle, lines=max(6, len(script) * 2),
         caller_name=name, caller_voice=third, caller_fx=caller_fx,
+        call_meta=call_meta,
         render_stream=bool(dj_settings().get("call_stream", True)))
     call_ended(name, line_say, started, rule, len(lines or []), "scripted")
     return {"caller": name, "lines": lines,
@@ -52313,6 +55605,25 @@ async def speak_turns(turns: list[tuple[str, str]],
     # first line is already playing — and playback just walks the finished
     # files. No thinking-room between turns; a phone call sounds like a
     # phone call.
+    # Persist the accepted conversational plan before synthesis divides long
+    # turns into chunks or streaming divides the call into transport bursts.
+    _call_archive_parts: list[str] = []
+    _call_archive_transcript: list[dict[str, str]] = []
+    if caller_name:
+        for item in playlist:
+            text = str(item.get("turn_text") or "").strip()
+            if not text:
+                continue
+            who = str(item.get("who") or "")
+            _call_archive_transcript.append({
+                "who": who,
+                "name": booth_actor_name(
+                    who, caller_name if who == "caller"
+                    else caller2_name if who == "caller2" else ""),
+                "text": text,
+            })
+        call_line_transcript(_call_archive_transcript)
+
     premade = [asyncio.create_task(_premake(item)) for item in playlist]
 
     # --- The whole call as ONE seamless stream (#530, #535) -----------------
@@ -52560,12 +55871,12 @@ async def speak_turns(turns: list[tuple[str, str]],
                 pipeline_log("voice", "call coalesced into one stream — "
                                       f"{len(transcript)} turns · {length:.0f}s "
                                       "(#535)")
-                # Keep the whole call as a compressed mp3 + transcript for focused
-                # replay in the radio cache (#548) — only when it IS a call.
+                # A call may span several transport bursts. Keep every part
+                # until the final burst, then archive one complete call.
                 if caller_name:
-                    asyncio.create_task(asyncio.to_thread(
-                        _cache_call_recording, mixed, list(transcript),
-                        caller_name))
+                    _call_archive_parts.append(
+                        str(VOICE_MEDIA_DIR
+                            / one["path"].rsplit("/", 1)[-1]))
                 # The call belongs in the rolling episode too (its per-turn chat
                 # entries bypass dj_speak's capture) (#548).
                 _episode_stage(one["path"],
@@ -52822,6 +56133,12 @@ async def speak_turns(turns: list[tuple[str, str]],
                 # is what made the whole conversation one clip.
                 played_any = True
                 if last_batch and not missed:
+                    if caller_name and _call_archive_parts:
+                        asyncio.create_task(asyncio.to_thread(
+                            _cache_call_recording_parts,
+                            list(_call_archive_parts),
+                            list(_call_archive_transcript), caller_name,
+                            str(_CALL_LIVE.get("id") or "")))
                     return spoken
                 if last_batch:
                     pipeline_log("drop", f"{len(missed)} scheduled turn(s) "
@@ -52840,6 +56157,12 @@ async def speak_turns(turns: list[tuple[str, str]],
                 missed.extend(range(_lo, _hi))
                 continue
         if played_any and not missed:
+            if caller_name and _call_archive_parts:
+                asyncio.create_task(asyncio.to_thread(
+                    _cache_call_recording_parts,
+                    list(_call_archive_parts),
+                    list(_call_archive_transcript), caller_name,
+                    str(_CALL_LIVE.get("id") or "")))
             return spoken                # all of it aired; do not repeat it
         # concat failed — fall through to the turn-by-turn path.
 
@@ -53100,6 +56423,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     bank_to: list[dict[str, Any]] | None = None,
                     whole: bool = False,           # #859: a message, not
                                                    # a conversation
+                    call_meta: dict[str, Any] | None = None,
                     ) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
 
@@ -53183,10 +56507,40 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # random rounds shop here — anything with its own subject (an angle, a
     # caller, the button) is written to order.
     if (not bank and not angle and not force_seed and not caller_name
-            and _LARDER):
-        entry = _LARDER.pop(alt_larder_index())            # #926
+            and any(dialogue_row_ready("banter", e)
+                    and (not e.get("aired_at")
+                         or shelf_repeat_ready("banter", e))
+                    for e in _LARDER)):
+        _take_at = alt_larder_index()
+        if (not dialogue_row_ready("banter", _LARDER[_take_at])
+                or (_LARDER[_take_at].get("aired_at")
+                    and not shelf_repeat_ready("banter",
+                                               _LARDER[_take_at]))):
+            _take_at = next(i for i, e in enumerate(_LARDER)
+                            if dialogue_row_ready("banter", e)
+                            and (not e.get("aired_at")
+                                 or shelf_repeat_ready("banter", e)))
+        entry = _LARDER[_take_at]
+        if repeat_safe("banter", entry):
+            entry["aired_at"] = time.time()
+            entry["aired"] = int(entry.get("aired") or 0) + 1
+            if int(entry["aired"]) < shelf_innings("banter"):
+                _LARDER[:] = (_LARDER[:_take_at]
+                              + _LARDER[_take_at + 1:] + [entry])
+            else:
+                _LARDER.pop(_take_at)
+        else:
+            _LARDER.pop(_take_at)
+        try:
+            _INVENTORY_PLAN["at"] = 0.0
+            _COMMITS["at"] = 0.0
+        except Exception:  # noqa: BLE001
+            pass
         _larder_save()
-        if (time.time() - float(entry["at"]) < larder_fresh()
+        if ((time.time() - float(entry["at"]) < larder_fresh()
+             or (shelf_is_repeat("banter", entry)
+                 and time.time() - float(entry["at"])
+                 <= REPEAT_KEEP_SECONDS))
                 and _larder_current(entry)):
             pipeline_log("model", "round served off the larder shelf "
                                   f"({len(_LARDER)} left)")
@@ -53405,9 +56759,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # storyline and every caller road, which between them are most
     # rounds. The slider decides how often a seed is drawn; nothing else
     # should.
-    if not seed and (force_seed
-                     or random.random() < box_rate_now(
-                         dj["speakbox_rate"])):
+    if not caller_name and not seed and (force_seed
+                                         or random.random() < box_rate_now(
+                                             dj["speakbox_rate"])):
         # Best-of-two off the shelf (#418): the rounds open with the
         # more intriguing swath, same scoring the callers use (#359).
         # Pull fuller swaths so they quote entire phrases at each other, not
@@ -53735,19 +57089,26 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _pers = (dj_disposition()
                  if not seed and random.random() < float(
                      dj.get("personality") or 0.7) else "")
-        call_flow = (f"\n\nTHIS IS A COMPLETE PHONE CALL WITH {caller_name}. "
-                     "Use a coherent sequence: ring and answer; C introduces "
-                     "themselves; C states a concrete premise or grievance; a "
-                     "host responds directly; C gets one or more complete turns "
-                     "to develop or finish the rant; the hosts joke, disagree or "
-                     "negotiate with what C ACTUALLY said; then resolve the stated "
-                     "outcome. End with C's completed final sentence, a clear "
-                     "goodbye or acknowledged loss/win, and a host closing the "
-                     "call. Every C turn is a finished thought ending in normal "
-                     "punctuation. Never interrupt, cut off, talk over, abandon, "
-                     "or change the subject away from C before C has answered. "
-                     "Hosts may disagree sharply, but they must let C finish and "
-                     "respond to the substance of C's last line.\n"
+        call_flow = (f"\n\nTHIS IS A COMPLETE, NATURAL PHONE CALL WITH "
+                     f"{caller_name}. Give it these conversational beats without "
+                     "announcing the structure: (1) ring, answer and a short "
+                     "self-introduction; (2) the caller gives a particular reason "
+                     "for phoning, with a concrete person/place/object at stake; "
+                     "(3) a host responds to that exact detail and asks a natural "
+                     "open follow-up; (4) C ANSWERS the question before adding new "
+                     "detail; (5) rapport develops through a callback, shared joke, "
+                     "empathetic recognition or earned disagreement; (6) the hosts "
+                     "bring in one relevant Speakerbox image or phrase as texture "
+                     "and C makes it their own; (7) the promised outcome lands; "
+                     "(8) C finishes their thought and a host gives an unmistakable "
+                     "sign-off. Ask at least TWO responsive questions across the "
+                     "call, each based on something C has just revealed, and let C "
+                     "answer each. It must not become an interrogation or a caller "
+                     "monologue: all three people listen, answer and influence where "
+                     "the conversation goes. Every turn reacts to a specific prior "
+                     "detail. Never abandon C, discuss C in the third person while "
+                     "they are present, or cut away before the goodbye.\n"
+                     + call_novelty_prompt()
                      if caller_name else "")
         if caller_name:
             call_flow += radio_prompt_instruction("caller")
@@ -53786,15 +57147,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + ("nobody speaking twice in a row and everyone getting a "
                "word in. " if third else
                ("the hosts and caller take turns; no one speaks twice in "
-                "a row. THE CALLER HOLDS THE FLOOR: at least half of all "
-                "turns are the caller's, and the caller's turns are the "
-                "LONGEST ones in the call. The caller is not being "
-                "interviewed - they came on with something to say and they "
-                "say it. When a host tries to steer, the caller BRUSHES IT "
-                "OFF - 'yeah, that's not the point', 'that's not important' "
-                "- and carries straight on with their own thread, which "
-                "they keep returning to and escalating. The hosts get short "
-                "reactions, not speeches. " if caller_name
+                "a row. Give C roughly two turns out of every five, with enough "
+                "room to tell the story and answer the hosts. The hosts do more "
+                "than react: they listen for a concrete detail, ask a useful "
+                "follow-up, disclose or joke in return, and let C's answer change "
+                "their next move. Nobody conducts a questionnaire and nobody "
+                "delivers an unrelated speech. " if caller_name
                else "strictly alternating. "))
             + "Each primary turn must be a developed four-to-seven-sentence "
             "thought, usually 60 to 100 words: specific, surprising, and "
@@ -53940,14 +57298,20 @@ async def dj_banter(track: dict[str, Any] | None = None,
                         if caller_name else ""))
         if not caller_name:
             return []
-        script = _fallback_call_script(caller_name, str(angle)[:220])
+        script = _fallback_call_script(
+            caller_name, str((call_meta or {}).get("topic") or angle)[:320],
+            str((call_meta or {}).get("speakerbox_text") or ""),
+            str((call_meta or {}).get("line") or ""))
 
     # #805: ask_model returns "" when the reply fragment-binned — not an
     # exception, and previously not a call either. Same guarantee.
     if caller_name and not spoken_text(script or ""):
         pipeline_log("call", f"fragment-binned call write — built-in "
                      f"fallback script carries {caller_name} (#805)")
-        script = _fallback_call_script(caller_name, str(angle)[:220])
+        script = _fallback_call_script(
+            caller_name, str((call_meta or {}).get("topic") or angle)[:320],
+            str((call_meta or {}).get("speakerbox_text") or ""),
+            str((call_meta or {}).get("line") or ""))
 
     # Do not bank or air an exchange that ignored the long-form contract.
     # This is deliberately after the first generation so the correction can
@@ -53958,6 +57322,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # own: the CALLER must be on it (three C: turns) and it must be a
     # conversation (six turns), not an essay.
     _needs_rewrite = False
+    _call_report: dict[str, Any] = {}
     if _judge_lines >= 8 and not caller_name:
         _needs_rewrite = not substantial_radio_script(script,
                                                       _judge_lines)
@@ -54005,10 +57370,18 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # rewrite that cannot win - the #904 trap this same block was
         # rescued from once already.
         _c_share = (_c_turns / _all_turns) if _all_turns else 0.0
-        _needs_rewrite = (_c_turns < 3 or _all_turns < 6
-                          or _c_share < 0.4)
+        _call_report = call_flow_report(
+            script, caller_name, caller2_name,
+            topic=str((call_meta or {}).get("topic") or ""),
+            speakerbox_text=str(
+                (call_meta or {}).get("speakerbox_text") or ""))
+        _needs_rewrite = not bool(_call_report.get("ok"))
     if _needs_rewrite:
-        pipeline_log("model", "thin radio draft rejected — rewriting before air")
+        pipeline_log(
+            "model", "phone/radio draft failed its conversational contract - "
+            "rewriting before air",
+            extra=("; ".join(_call_report.get("faults") or [])[:900]
+                   if caller_name else ""))
         try:
             rewritten = await ask_model(
                 "Rewrite the following Pine Box FM draft as a coherent, "
@@ -54019,11 +57392,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "turn. Each speaker must respond directly to the prior turn, "
                 "develop an idea with concrete detail, and finish a complete "
                 "thought. Do not use one-line reactions or stage directions."
-                + (f"\nThis is a LIVE PHONE CALL: 'C:' is {caller_name} on "
-                   "the line — keep them on at least a third of the turns, "
-                   "keep their name and what they called about, and end "
-                   "with the host wrapping the call."
-                   if caller_name else "") + "\n\n"
+                 + (f"\nThis is a LIVE PHONE CALL: 'C:' is {caller_name} on "
+                    "the line. Give C 35-60% of the turns. A host asks at "
+                    "least two natural follow-up questions grounded in exact "
+                    "details C just revealed; C answers each. Build one earned "
+                    "rapport callback, carry the database theme throughout, "
+                    "and end with C finishing and a host clearly signing off. "
+                    "Do not reuse any recent premise, conflict or landing."
+                    + call_novelty_prompt()
+                    if caller_name else "") + "\n\n"
                 + script,
                 limit=min(int(dj.get("reply_max_chars") or 6000),
                           max(4200, 500 * min(lines, 11))),
@@ -54039,29 +57416,44 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 # neither of them.
                 _rw_turns = banter_turns(rewritten or "", caller_name,
                                          caller2_name)
-                _rw_ok = (sum(1 for _m, _t in _rw_turns
-                              if _m in ("C", "E")) >= 3
-                          and len(_rw_turns) >= 6)
+                _rw_report = call_flow_report(
+                    rewritten, caller_name, caller2_name,
+                    topic=str((call_meta or {}).get("topic") or ""),
+                    speakerbox_text=str(
+                        (call_meta or {}).get("speakerbox_text") or ""))
+                _rw_ok = bool(_rw_report.get("ok"))
             else:
                 _rw_ok = substantial_radio_script(rewritten, _judge_lines)
             if _rw_ok:
                 script = rewritten
             else:
-                # #904: banked anyway. This draft is good enough to AIR
-                # — the live road puts the identical one out — so
-                # withholding it from the larder only threw away a
-                # model visit that had already been paid for, and left
-                # the shelf empty for the next round to write from
-                # nothing under silence.
-                pipeline_log("model", "rewrite still thin — banked "
-                             "anyway: the same draft airs on the live "
-                             "road, so binning it here would only spend "
-                             "a model visit for nothing (#904)")
+                if caller_name:
+                    # A phone call is not salvageable as unrelated/thin
+                    # dialogue: the person on the line and the response arc
+                    # are the product. Move to the deterministic complete-call
+                    # safety script BEFORE tint so even the fallback receives
+                    # the same second pass and final machine grade.
+                    script = _fallback_call_script(
+                        caller_name,
+                        str((call_meta or {}).get("topic") or angle)[:320],
+                        str((call_meta or {}).get("speakerbox_text") or ""),
+                        str((call_meta or {}).get("line") or ""))
+                    pipeline_log(
+                        "call", "the rewritten phone call still failed its "
+                        "conversation contract — the complete-call fallback "
+                        "was sent through tint instead")
+                else:
+                    # #904: non-call radio can keep a usable original when a
+                    # richness rewrite fails. The final call gate below is
+                    # intentionally stricter because a broken call is not a
+                    # different style of call.
+                    pipeline_log("model", "rewrite still thin — the original "
+                                 "radio draft stands (#904)")
         except Exception:
             pass                    # the draft stands; bank it as written
 
     _seed_forced = False                                    # #862
-    if seed.get("text"):
+    if not caller_name and seed.get("text"):
         # Mined means SAID (#404): a swath the model paraphrased away is
         # put back as the round's opening line, verbatim.
         probe = " ".join(seed["text"].split()).lower()[:60]
@@ -54245,6 +57637,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             pass                        # the assembled round stands
     entry = {
         "script": script, "lines": lines, "vouched": vouched,
+        # The road identity has to exist BEFORE tint and brief audit.  The
+        # outer prep_round used to stamp `caller` only after dj_banter
+        # returned, which meant every call was actually tinted and audited as
+        # generic banter; phone-specific fidelity instructions were dead code.
+        "prep_kind": "caller" if caller_name else "banter",
         "source": source or seed.get("file", ""),
         "seed_text": seed.get("text", ""),
         # #838: the passages the rewrite may not touch, carried with the
@@ -54255,6 +57652,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         "caller_name": caller_name, "caller_voice": caller_voice,
         "caller_fx": caller_fx, "at": time.time(),
         "caller2_name": caller2_name, "caller2_voice": caller2_voice,
+        "call": dict(call_meta or {}),
         "render_stream": render_stream,
         "whole": bool(whole),                  # #859
 
@@ -54271,6 +57669,25 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # from cannot be judged, and cannot be sent back.
         "desk": _desk_paper(script, _desk_at),
     }
+    if caller_name:
+        # The introduction is phone protocol, so guarantee it before the
+        # second pass. Injecting it after tint created one deliberately plain
+        # line inside an otherwise tinted call and shifted every audio key.
+        _intro_turns = _caller_introduces(
+            banter_turns(str(entry.get("script") or ""), caller_name,
+                         caller2_name), caller_name)
+        if _intro_turns:
+            script = "\n".join(
+                f"{marker}: {said}" for marker, said in _intro_turns)
+            entry["script"] = script
+        # Speakerbox material is the call's evidence, not prose the tint may
+        # replace. Preserve it word-for-word while the surrounding turn and
+        # every other eligible line take the active crystal.
+        _call_source = str((entry.get("call") or {}).get(
+            "speakerbox_text") or "").strip()
+        if _call_source:
+            entry.setdefault("verbatim", []).append(
+                ["phone-call Speakerbox source", _call_source])
     # #1006/#1016: THE SECOND PASS, and both versions kept.
     #
     # Only on the BANKING road. Rewriting on the air path would put a
@@ -54296,7 +57713,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                                        # share is the governor now, so
                                        # the live road no longer needs
                                        # a cheaper path to run down.
-                                       whole_only=False)
+                                       whole_only=False,
+                                       critical=bool(bank))
             entry["script_plain"] = script
             entry["tint"] = {
                 "ok": bool(_tint.get("ok")),
@@ -54307,6 +57725,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 "prompt": str(_tint.get("prompt") or "")[:8000],
                 "chunks": list(_tint.get("chunks") or []),
             }
+            if _tint.get("progress"):
+                entry["tint_progress"] = dict(_tint.get("progress") or {})
             if _tint.get("ok"):
                 entry["script_tinted"] = str(_tint.get("script") or "")
                 # #1016: "I want it to default to using the tinted
@@ -54315,23 +57735,81 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 # that as the version to use."
                 entry["use"] = "tinted"
                 entry["script"] = entry["script_tinted"]
+                entry.pop("tint_progress", None)
+                try:
+                    _brief = brief_note(
+                        str(entry.get("prep_kind") or "banter"),
+                        str(entry.get("label") or
+                            entry.get("prep_kind") or "banter"),
+                        str(entry.get("script") or ""), where="tinted")
+                    entry["brief"] = _brief
+                    entry["off_brief"] = bool(_brief.get("checked")
+                                              and not _brief.get("ok"))
+                except Exception:  # noqa: BLE001
+                    pass
         except Exception as _tx:  # noqa: BLE001
             pipeline_log("drop", "the tinting pass failed - the plain "
                          "round stands",
                          extra=f"{type(_tx).__name__}: {_tx}"[:300])
+    if caller_name:
+        # Grade the FINAL active version (including tint), not merely the
+        # model's first draft.
+        # A failing banked call is visible for diagnosis but cannot consume a
+        # usable shelf slot or reach the recording room.
+        _final_report = call_entry_regrade(entry)
+        if not _final_report.get("ok"):
+            entry["off_brief"] = True
+            pipeline_log(
+                "call", "a phone call failed the final flow/novelty contract "
+                "and was refused before recording or live synthesis",
+                extra="; ".join(_final_report.get("faults") or [])[:1000])
     if bank:
         # #842: a round written for a PARTICULAR segment — a memo from
         # upstairs, a call on the request line — is handed back to its
         # preparer instead of joining the general banter shelf, where the
         # next plain round would simply have eaten it.
         if bank_to is not None:
-            bank_to.append(entry)
+            if dialogue_row_viable(str(entry.get("prep_kind") or "caller"),
+                                   entry):
+                bank_to.append(entry)
+            else:
+                _why: list[str] = []
+                if entry.get("off_brief"):
+                    _why.append("off brief: "
+                                + str((entry.get("brief") or {}).get("why")
+                                      or "unspecified"))
+                if not call_entry_contract(entry):
+                    _why.append("final call contract/fingerprint failed")
+                if not dialogue_tint_ready("caller", entry):
+                    _why.append("the complete tinted version is not active")
+                if not _larder_current(entry):
+                    _why.append("the writing profile moved")
+                pipeline_log(
+                    "call", "the failed phone-call contract was not sent to "
+                    "the recording room",
+                    extra="; ".join(_why or ["the viability gate refused it"]))
             return []
-        _LARDER.append(entry)
-        del _LARDER[:-_LARDER_MAX]      # a deep backlog is allowed (#445)
+        _stored = dialogue_row_viable("banter", entry)
+        if _stored:
+            _LARDER[:] = [e for e in _LARDER
+                          if dialogue_row_viable("banter", e)]
+            _LARDER.append(entry)
+            del _LARDER[:-larder_cap()]
+            try:
+                _INVENTORY_PLAN["at"] = 0.0
+                _COMMITS["at"] = 0.0
+            except Exception:  # noqa: BLE001
+                pass
         _larder_save()
-        pipeline_log("model", f"round banked for later "
-                              f"({len(_LARDER)} on the shelf)")
+        if _stored:
+            pipeline_log("model", f"round banked for later "
+                                  f"({len(_LARDER)} on the shelf)")
+        else:
+            pipeline_log("lookahead", "the tinted round failed its segment "
+                         "brief and was rejected before it could occupy a "
+                         "reserve slot")
+        return []
+    if caller_name and entry.get("off_brief"):
         return []
     try:
         return await _banter_air(entry, track)
@@ -55252,7 +58730,7 @@ async def call_line_caller() -> tuple[str, str, dict[str, Any]]:
     return name, voice, fx
 
 
-async def call_plot_clause() -> tuple[str, dict[str, Any]]:
+async def call_plot_clause(topic: str = "") -> tuple[str, dict[str, Any]]:
     """#913: the random plot out of the speakbox the caller rings IN with.
 
     "This is supposed to be a phone call where the customer calls in with a
@@ -55279,7 +58757,20 @@ async def call_plot_clause() -> tuple[str, dict[str, Any]]:
     except Exception:  # noqa: BLE001
         pass
     try:
-        swath = await speakbox_quote(most=3, cap=420) or {}
+        # A theme-aware semantic draw gives the caller rhetoric that can
+        # actually support tonight's subject. There is deliberately no blind
+        # random fallback on a call: a vivid unrelated passage is not texture,
+        # it is the conversation abandoning its database theme.
+        reserved_sources = {
+            str((((row or {}).get("entry") or {}).get("call") or {})
+                .get("source") or "")
+            for row in list(_SHELF.get("caller") or [])
+        }
+        reserved_sources.discard("")
+        swath = (await speakbox_semantic_seed(
+                    str(topic or "caller story grievance evidence"),
+                    who="caller", require_overlap=True,
+                    avoid_files=reserved_sources) or {})
     except Exception:  # noqa: BLE001
         return "", {}
     text = str((swath or {}).get("text") or "").strip()
@@ -55371,6 +58862,9 @@ def sched_entry_left() -> float:
         if not started or not slot:
             return 0.0
         owns = max(0.25, float(slot.get("minutes") or 0)) * 60.0
+        if radio_paused():
+            return max(0.0, owns - max(0.0, float(
+                _RADIO.get("paused_sched_elapsed") or 0)))
         return max(0.0, started + owns - time.time())
     except Exception:  # noqa: BLE001
         return 0.0
@@ -55457,7 +58951,8 @@ async def dj_caller(track: dict[str, Any] | None = None,
             try:
                 _prep_who = str(_prep_entry.get("caller_name") or "")
                 if _prep_who:
-                    call_line_take(_prep_who)     # #977
+                    call_line_take(_prep_who,
+                                   dict(_prep_entry.get("call") or {}))
                     _RADIO["chat"].append(
                         {"ts": int(time.time()), "who": "host",
                          "kind": "call",
@@ -55503,14 +58998,14 @@ async def dj_caller(track: dict[str, Any] | None = None,
     # (caller_every) while the theme-aware road rings off callin_per_hour -
     # so the road that could not hear the theme was ringing more often than
     # the road that could.
-    _themed = theme_owns_air()
+    _themed = active_theme()
     heat_call = hot >= 62 and random.random() < 0.45 and not _themed
     wants = [] if heat_call else [
         line.lstrip("- ").strip()
         for line in banter_material().splitlines()
         if len(line.strip()) > 6
     ]
-    if not heat_call and not wants:
+    if not heat_call and not wants and not _themed:
         return []                      # nothing of his to call in about yet
     # #854: the case, drawn only on the road that can use it — the heat
     # road below is already about a subject of its own and a second one
@@ -55541,12 +59036,23 @@ async def dj_caller(track: dict[str, Any] | None = None,
     # leave to the live road, and the call aired as two hosts talking ABOUT
     # a caller who was never written. See the note at the top of #913.
     _cname, _cvoice, _cfx = await call_line_caller()
+    _call_meta = {
+        "mode": "scheduled",
+        "line": line_say,
+        "topic": str((_themed or {}).get("text")
+                     or ("the heat in the station" if heat_call else
+                         (wants[0] if wants else "the request line")))[:700],
+        "theme": str((_themed or {}).get("name") or ""),
+        "theme_text": str((_themed or {}).get("text") or "")[:700],
+        "case_id": str(_case.get("id") or ""),
+        "case": str(_case.get("title") or ""),
+    }
     if bank_to is None and _cname:
         # #673/#703: the booth says who is on which line. The banked road
         # posts nothing — nothing is airing yet; its card goes up when the
         # shelf row is taken, above.
         try:
-            call_line_take(_cname)                # #977
+            call_line_take(_cname, _call_meta)    # one line, one caller
             _RADIO["chat"].append({"ts": int(time.time()), "who": "host",
                                    "kind": "call",
                                    "text": f"On {line_say}: {_cname}"})
@@ -55568,6 +59074,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
                                      render_stream=bool(
                                          dj_settings().get(
                                              "call_stream", True)),
+                                     call_meta=_call_meta,
                                      angle=(
             f"{_cname} has got through on {line_say} and is calling about "
             "the HEAT. "
@@ -55610,12 +59117,25 @@ async def dj_caller(track: dict[str, Any] | None = None,
             # old modulo miscounted as "done" and then skipped.
             quota_stamp("caller")
         return heat_lines
-    want = random.choice(wants)[:160]
+    want = (random.choice(wants)[:160] if wants else
+            str((_themed or {}).get("text") or "the active subject")[:160])
     # #913: the random plot out of the speakbox that the caller rings IN
     # with. dj_banter only draws its own box seed when there is nobody on
     # the line, so now that there is somebody the swath is drawn here and
     # given to THEM — see call_plot_clause.
-    _plot, _swath = await call_plot_clause()
+    _plot, _swath = await call_plot_clause(
+        str((_themed or {}).get("text") or want))
+    if _swath:
+        _call_meta["source"] = str(_swath.get("file") or "")
+        _call_meta["speakerbox_text"] = str(
+            _swath.get("text") or "")[:1200]
+        _call_meta["speakerbox_relevance"] = dict(
+            _swath.get("topic_relevance") or {})
+        if bank_to is None:
+            call_line_context(
+                source=_call_meta["source"],
+                speakerbox_text=_call_meta["speakerbox_text"],
+                speakerbox_relevance=_call_meta["speakerbox_relevance"])
     # #879: EIGHT to TWELVE turns, not four — a call should be a
     # conversation with a shape, and the outcome is drawn FIRST so the
     # exchange has somewhere to arrive rather than simply stopping.
@@ -55651,6 +59171,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
                             # what splices the ring in front of it (#535).
                             render_stream=bool(
                                 dj_settings().get("call_stream", True)),
+                            call_meta=_call_meta,
                             angle=(
         f"The request line rings and {_cname} is on {line_say}. "
         "It OPENS with the phone RINGING and one of the hosts hearing it out "
@@ -61942,13 +65463,23 @@ def tint_budget_left() -> float:
 TINT_DEEP_ROADS = ("banter", "banter_caller", "caller", "caller2", "deep")
 
 
+def tint_fast_model() -> str:
+    """The throughput model for schedule-critical tint work."""
+    try:
+        dj = dj_settings()
+        return str(dj.get("model_fast")
+                   or load_settings().get("model")
+                   or dj.get("model") or "")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def tint_model_for(kind: str = "") -> str:
     """#1110: the model this road's rewrite deserves."""
     try:
         if str(kind or "") in TINT_DEEP_ROADS:
             return tint_model_now()
-        fast = str(dj_settings().get("model_fast")
-                   or dj_settings().get("model") or "")
+        fast = tint_fast_model()
         return fast or tint_model_now()
     except Exception:  # noqa: BLE001
         return tint_model_now()
@@ -61971,8 +65502,7 @@ def tint_model_now() -> str:
             return ""
         if tint_budget_left() > tint_budget() * 0.5:
             return want                 # plenty left: the better tint
-        fast = str(dj_settings().get("model_fast")
-                   or dj_settings().get("model") or "")
+        fast = tint_fast_model()
         return fast or want
     except Exception:  # noqa: BLE001
         return ""
@@ -62076,7 +65606,7 @@ def tint_pressure() -> str:
     return ""
 
 
-def tint_should_stop() -> str:
+def tint_should_stop(critical: bool = False) -> str:
     """#1018: may the tinting pass carry on?
 
     NOT prep_should_stop(). That guards the RECORDING ROOM, and two of
@@ -62093,13 +65623,20 @@ def tint_should_stop() -> str:
             return _PREP_YIELD_WHY[0] or "a forced interjection"
     except Exception:  # noqa: BLE001
         return ""
+    # Off air, the explicit job is to complete the coming schedule. That
+    # work may finish its current script even when the optional hourly
+    # cupboard-polish allowance is spent. It still yields instantly to an
+    # operator interjection above. On air, the ordinary budget remains the
+    # guard so tint cannot crowd out the live writer.
+    if critical and radio_paused():
+        return ""
     return tint_pressure()                                       # #1045
 
 
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                        answering: str = "", keep: list[str] | None = None,
                        seen: list[str] | None = None,
-                       kind: str = "") -> str:
+                       kind: str = "", model: str = "") -> str:
     """#1021: one turn, put in the world's mouth.
 
     Short prompt, short answer, one thing to do. `answering` is the
@@ -62108,6 +65645,13 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     difference between two people rapping at each other and two people
     each doing a bar alone."""
     said = str(text or "").strip()
+    _call_fidelity = (
+        "THIS IS ONE TURN IN A PHONE CALL. Preserve the exact proposition "
+        "and its conversational job. If it is a question, the rewrite must "
+        "still be a question. Keep every person, product, place, number and "
+        "concrete object exactly; introduce no new names. Do not copy, quote "
+        "or continue the prior speaker's sentence. Style may change, meaning "
+        "may not.\n\n" if str(kind or "") == "caller" else "")
     # #1035: the room this line is allowed to take, drawn fresh. See the
     # note at the top of this change - without it the only move a model
     # has is swapping one word for another of the same length.
@@ -62124,7 +65668,8 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
         if held and held[:60] in said:
             return said
     prompt = (
-        "This person says what they have to say. Keep WHAT they say and "
+        _call_fidelity
+        + "This person says what they have to say. Keep WHAT they say and "
         "change HOW they say it, so the line reads as though the writer "
         "of the lyrics below had written it.\n\n"
         + ("HOW THAT WRITER WRITES - a passage of it, in order, as "
@@ -62155,7 +65700,8 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
           "before the ending has to answer too.\n"
           "  Say a thing sideways as often as they do.\n\n"
         + (f"THE LINE BEFORE THIS ONE, already rewritten - answer its "
-           f"rhyme:\n{answering}\n\n" if answering else "")
+           f"rhyme:\n{answering}\n\n"
+           if answering and str(kind or "") != "caller" else "")
         + f"IT MAY RUN LONGER THAN THE ORIGINAL - up to about "
           f"{_may} characters, which is roughly "
           f"{int(round(_room * 10)) / 10}x what you are given. USE that "
@@ -62186,7 +65732,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                               # takes. The big model stayed on regardless
                               # of what the budget could afford, which is
                               # what blew the deadline.
-                              model=tint_model_for(kind),   # #1036/#1119
+                              model=(model or tint_model_for(kind)),
                               mark={"kind": "tint turn",
                                     "for": "one turn put in the crystal's "
                                            "mouth"})
@@ -62206,6 +65752,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 f"nothing else.\n\nTHE VOICE: {world}\n\nTHE LINE:\n"
                 + said,
                 limit=_may + 120, spice=0.6,                     # #1035
+                model=(model or tint_model_for(kind)),
                 mark={"kind": "tint turn",
                       "for": "the same turn, asked again after the model "
                              "answered the prompt instead of the line"})
@@ -62225,7 +65772,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 "properly this time - different words, their images, "
                 "their rhyme - keeping only the facts.",
                 limit=_may + 120, spice=0.75,                    # #1035
-                model=tint_model_for(kind),               # #1045/#1119
+                model=(model or tint_model_for(kind)),
                 mark={"kind": "tint turn", "for": "the same turn, asked "
                                                   "again after it came "
                                                   "back unchanged"})
@@ -62239,6 +65786,88 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
             out = out[len(lead):].strip()
     if not out or len(out) < TINT_TURN_FLOOR // 2:
         return said
+    if str(kind or "") == "caller":
+        def _faithful(candidate: str) -> bool:
+            own = call_tint_report(f"A: {said}", f"A: {candidate}")
+            if not own.get("ok"):
+                return False
+            if answering:
+                echo = call_tint_report(
+                    f"A: {answering}\nB: {said}",
+                    f"A: {answering}\nB: {candidate}")
+                if not echo.get("ok"):
+                    return False
+            return True
+
+        if not _faithful(out):
+            # The broad style prompt can tempt a small fast model to answer
+            # the prior turn, invent a rapper's name, or carry the prior bar
+            # wholesale into this one.  One conservative retry keeps the
+            # crystal's cadence while making factual identity non-negotiable.
+            sample = "\n\n".join(
+                str(c.get("text") or "").strip()[:450]
+                for c in chunks[:2] if str(c.get("text") or "").strip())
+            try:
+                retry = await ask_model(
+                    "Conservatively tint this ONE phone-call line. Keep its "
+                    "exact meaning, question-or-statement role, every proper "
+                    "name, product, place, number and concrete object. Do not "
+                    "answer it, add a person, copy the prior speaker, or add a "
+                    "new fact. Change cadence, diction and internal rhyme, "
+                    "but retain at least half of its concrete content words. "
+                    "Return only the rewritten line, with no speaker label."
+                    + ("\n\nSTYLE SAMPLE:\n" + sample if sample else "")
+                    + "\n\nORIGINAL LINE:\n" + said,
+                    limit=_may + 120, spice=0.25,
+                    model=(model or tint_model_for(kind)),
+                    mark={"kind": "tint turn", "for": "a phone-call turn "
+                          "retried after the first tint failed fidelity"})
+                retry = " ".join(str(retry or "").split()).strip().strip('"')
+                for lead in ("A:", "B:", "C:", "D:", "E:"):
+                    if retry.startswith(lead):
+                        retry = retry[len(lead):].strip()
+                if (retry and _faithful(retry)
+                        and " ".join(retry.split()).lower()
+                        != " ".join(said.split()).lower()):
+                    out = retry
+                else:
+                    # Last, narrow attempt: make the lexical contract visible
+                    # to the model. Requiring every anchor word exactly leaves
+                    # it cadence and connective language to tint, but no room
+                    # to replace the call's facts with a different bar. This
+                    # is cheaper than returning to the same unfinished turn on
+                    # every coordinator pass and is still judged by _faithful.
+                    anchors = sorted(_call_topic_terms(said))[:20]
+                    minimal = await ask_model(
+                        "Minimally tint this one phone-call line through the "
+                        "style sample. Keep every anchor word below exactly "
+                        "as written and keep the same meaning and question "
+                        "or statement role. Change at least two other words "
+                        "or the sentence cadence, add no fact or name, and "
+                        "return only the line with no speaker label.\n\n"
+                        + ("STYLE SAMPLE:\n" + sample + "\n\n"
+                           if sample else "")
+                        + "ANCHOR WORDS (all mandatory): "
+                        + ", ".join(anchors)
+                        + "\n\nORIGINAL LINE:\n" + said,
+                        limit=_may + 120, spice=0.15,
+                        model=(model or tint_model_for(kind)),
+                        mark={"kind": "tint turn", "for":
+                              "a phone-call turn minimally tinted after two "
+                              "broader rewrites failed fidelity"})
+                    minimal = " ".join(
+                        str(minimal or "").split()).strip().strip('"')
+                    for lead in ("A:", "B:", "C:", "D:", "E:"):
+                        if minimal.startswith(lead):
+                            minimal = minimal[len(lead):].strip()
+                    if (minimal and _faithful(minimal)
+                            and " ".join(minimal.split()).lower()
+                            != " ".join(said.split()).lower()):
+                        out = minimal
+                    else:
+                        return said
+            except Exception:  # noqa: BLE001
+                return said
     # Runaway: a small model asked for one line sometimes writes a verse.
     # #1035: the runaway guard moves with the allowance, or it would cut
     # off the very room that was just granted.
@@ -62401,7 +66030,9 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
 
 async def crystal_tint(script: str, kind: str = "",
                        verbatim: Any = None,
-                       whole_only: bool = False) -> dict[str, Any]:
+                       whole_only: bool = False,
+                       progress: Any = None,
+                       critical: bool = False) -> dict[str, Any]:
     """#1006: THE SECOND PASS. Take a finished, untinted conversation and
     move it into the crystal's world.
 
@@ -62417,7 +66048,7 @@ async def crystal_tint(script: str, kind: str = "",
     choosing between them."""
     out: dict[str, Any] = {"ok": False, "script": "", "why": "",
                            "armed": "", "prompt": "", "chunks": [],
-                           "world": "", "ms": 0}
+                           "world": "", "ms": 0, "progress": {}}
     try:
         text = str(script or "").strip()
         if not text:
@@ -62426,12 +66057,18 @@ async def crystal_tint(script: str, kind: str = "",
         if not crystal_active():
             out["why"] = "no crystal is on, so nothing tints it"
             return out
+        source = hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
+        resume = dict(progress) if isinstance(progress, dict) else {}
+        if str(resume.get("source") or "") != source:
+            resume = {}                 # the words changed; start honestly
         dj = dj_settings()
         # #1032: STANZAS, not scattered fragments. See crystal_stanzas.
         # #1083: two passages normally, up to four when there is room -
         # the rewrite is shown more of the writer it is imitating.
-        chunks = crystal_stanzas(2 + int(round(surplus() * 2)),
-                                 CRYSTAL_STANZA_LINES)
+        chunks = list(resume.get("chunks") or [])
+        if not chunks:
+            chunks = crystal_stanzas(2 + int(round(surplus() * 2)),
+                                     CRYSTAL_STANZA_LINES)
         if not chunks:
             # No file in the crystal is long enough to cut a stanza out
             # of; fall back to the old scatter rather than tinting with
@@ -62459,7 +66096,7 @@ async def crystal_tint(script: str, kind: str = "",
                 elif isinstance(row, str):
                     held = row
                 held = " ".join(held.split())
-                if len(held) > 30:
+                if len(held) >= 12:
                     keep.append(held[:600])
             del keep[:-4]
         except Exception:  # noqa: BLE001
@@ -62473,9 +66110,11 @@ async def crystal_tint(script: str, kind: str = "",
                           "refusing rather than rewriting the wrong text")
             return out
         out["keep"] = list(keep)
-        world = crystal_world_prompt()
+        world = str(resume.get("world") or crystal_world_prompt())
         out["world"] = world
         out["chunks"] = chunks
+        _tint_model = (tint_fast_model() if critical
+                       else tint_model_for(kind))
         armed = (
             "The people below say what they have to say. Keep every word "
             "of WHAT they say, and change HOW they say it so that it "
@@ -62536,7 +66175,7 @@ async def crystal_tint(script: str, kind: str = "",
         # EXPENSIVE in-front-of-the-listener ones running - backwards
         # from every word of its own reasoning. Measured: turn-by-turn
         # 0/hour, whole-round 19.6/hour.
-        _hold = tint_should_stop()
+        _hold = tint_should_stop(critical)
         if _hold:
             out["why"] = f"{_hold} - the round stands as it was written"
             pipeline_log("crystal", f"the rewrite stood down: {_hold} "
@@ -62550,6 +66189,9 @@ async def crystal_tint(script: str, kind: str = "",
             began = time.monotonic()
             done: list[str] = []
             answering = ""
+            _resume_turns = [r for r in (resume.get("turns") or [])
+                             if isinstance(r, dict)]
+            _progress_turns: list[dict[str, Any]] = []
             # #1018: A DEADLINE OF ITS OWN. Left to the preparer's slice
             # this had 45 seconds for a round that takes three to five a
             # turn - it could never finish one, which is exactly how the
@@ -62571,8 +66213,9 @@ async def crystal_tint(script: str, kind: str = "",
             _per = (max(20.0, _measured) if _measured > 0 else
                     45.0 if str(dj.get("crystal_tint_model") or "")
                     else TINT_TURN_SECONDS)
+            _remaining = max(1, len(turns) - len(_resume_turns))
             _tint_due = time.monotonic() + max(
-                90.0, _per * len(turns) + 45.0)
+                90.0, _per * _remaining + 45.0)
             # #1018: AND THE ROOM'S OWN CLOCK IS EXTENDED TO MATCH.
             #
             # prep_should_stop() reads _PREP_DEADLINE, which the preparer
@@ -62591,15 +66234,33 @@ async def crystal_tint(script: str, kind: str = "",
             _first_prompt: list[str] = []
             _room_was = _PREP_DEADLINE[0]
             _PREP_DEADLINE[0] = time.time() + max(
-                90.0, _per * len(turns) + 45.0)
+                90.0, _per * _remaining + 45.0)
             _gave_up = ""
-            for marker, said in turns:
+            for _turn_at, (marker, said) in enumerate(turns):
+                _said = str(said or "")
+                _said_hash = hashlib.sha1(
+                    _said.encode("utf-8", "ignore")).hexdigest()
+                _protected = any(str(v or "")[:60] in _said
+                                 for v in keep if str(v or "")[:60])
+                _eligible = (len(_said.strip()) >= TINT_TURN_FLOOR
+                             and not _protected)
+                _prior = (_resume_turns[_turn_at]
+                          if _turn_at < len(_resume_turns) else {})
+                if (_prior and str(_prior.get("marker") or "") == marker
+                        and str(_prior.get("source") or "") == _said_hash):
+                    fresh = str(_prior.get("text") or "")
+                    if fresh and (not _eligible or " ".join(fresh.split())
+                                  != " ".join(_said.split())):
+                        done.append(f"{marker}: {fresh}")
+                        answering = fresh
+                        _progress_turns.append(dict(_prior))
+                        continue
                 if time.monotonic() > _tint_due:
                     _gave_up = ("the tint ran past its "
-                                f"{int(max(90.0, _per * len(turns) + 45.0))}s "
+                                f"{int(max(90.0, _per * _remaining + 45.0))}s "
                                 "deadline")
                     break
-                _stop = tint_should_stop()                       # #1018
+                _stop = tint_should_stop(critical)               # #1018
                 if _stop:
                     _gave_up = _stop
                     break
@@ -62608,18 +66269,29 @@ async def crystal_tint(script: str, kind: str = "",
                 # every other task on this station measures itself and
                 # this one, the most expensive of them, did not.
                 _turn_t0 = time.monotonic()
-                fresh = await crystal_turn(str(said or ""), world, chunks,
+                fresh = await crystal_turn(_said, world, chunks,
                                            answering, keep, _first_prompt,
-                                           kind)                   # #1119
+                                           kind, _tint_model)      # #1119
                 try:
                     task_note("tint:turn", time.monotonic() - _turn_t0,
                               0.0, bool(fresh))
                 except Exception:  # noqa: BLE001
                     pass
+                if (_eligible and " ".join(str(fresh or "").split())
+                        == " ".join(_said.split())):
+                    _gave_up = (f"turn {_turn_at + 1} came back unchanged; "
+                                "every eligible line must pass")
+                    break
                 done.append(f"{marker}: {fresh}")
                 answering = fresh
+                _progress_turns.append({
+                    "marker": marker, "source": _said_hash,
+                    "text": str(fresh or _said)})
             _PREP_DEADLINE[0] = _room_was                        # #1018
             out["ms"] = int((time.monotonic() - began) * 1000)
+            out["progress"] = {"source": source, "world": world,
+                               "chunks": chunks,
+                               "turns": _progress_turns}
             if _gave_up:
                 # #1119: AND IT PAYS FOR WHAT IT BURNED. tint_spend_note
                 # was on the success paths only, so the most expensive
@@ -62633,14 +66305,12 @@ async def crystal_tint(script: str, kind: str = "",
                     tint_spend_note(float(out.get("ms") or 0) / 1000.0)
                 except Exception:  # noqa: BLE001
                     pass
-                # #1018: HALF A TINT IS WORSE THAN EITHER END OF IT. A
-                # round that is DOOM for three lines and plainly itself
-                # for the other three reads as untinted, because the ear
-                # notices the plain half. Throw the partial away, let the
-                # whole plain script stand, and leave it for a later pass.
-                out["why"] = (_gave_up + " - the partial tint was thrown "
-                              "away and the plain round stands, whole. It "
-                              "is tinted properly on a later pass")
+                # The active script remains plain until the pass is whole,
+                # but completed turns are durable and resume at the first
+                # unfinished line. Expensive work is never thrown away.
+                out["why"] = (_gave_up + " - the plain round remains active; "
+                              f"{len(done)} completed tint turn(s) are kept "
+                              "for the next pass")
                 out["partial_turns"] = len(done)
                 return out
             out["turns"] = len(turns)
@@ -62742,7 +66412,7 @@ async def crystal_tint(script: str, kind: str = "",
             return out
         got = await ask_model(
             prompt, limit=max(600, len(text) + 400), spice=0.55,
-            model=tint_model_for(kind),           # #1036/#1105/#1110
+            model=_tint_model,                    # schedule fast / cupboard deep
             # #1019: everything the desk listing needs to open this call
             # out into "what the tinting did to this particular prompt".
             mark={"purpose": "tint",
@@ -62835,7 +66505,7 @@ def chunk_key(file: str, text: str) -> str:
 
 
 @app.get("/api/crystals")
-async def crystals_list(
+async def tint_crystals_list(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     require_read_auth(authorization)
@@ -64279,8 +67949,8 @@ def crystal_with_track(
     return row
 
 
-@app.get("/api/crystals")
-async def crystals_list(
+@app.get("/api/song-crystals")
+async def song_crystals_list(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """The SongSight library, newest analysis first."""
@@ -64294,7 +67964,7 @@ async def crystals_list(
     return {"crystals": rows, "count": len(rows)}
 
 
-@app.get("/api/crystals/{slug}")
+@app.get("/api/song-crystals/{slug}")
 async def crystal_get(
     slug: str,
     authorization: str | None = Header(default=None),
@@ -64309,7 +67979,7 @@ async def crystal_get(
         raise HTTPException(status_code=404, detail="No such crystal")
 
 
-@app.post("/api/crystals")
+@app.post("/api/song-crystals")
 async def crystal_put(
     request: Request,
     authorization: str | None = Header(default=None),
@@ -64334,7 +68004,7 @@ async def crystal_put(
     return {"ok": True, "slug": slug, "count": len(read_crystals())}
 
 
-@app.delete("/api/crystals/{slug}")
+@app.delete("/api/song-crystals/{slug}")
 async def crystal_delete(
     slug: str,
     authorization: str | None = Header(default=None),
@@ -65594,6 +69264,40 @@ async def dj_hangups_list(
     }
 
 
+@app.get("/api/dj/calls")
+async def dj_calls_database(
+    limit: int = 100,
+    full: bool = False,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The durable call database and the novelty/flow health of its rows."""
+    require_read_auth(authorization)
+    rows = list(reversed(await asyncio.to_thread(call_log_read)))
+    fingerprints = [str(r.get("fingerprint") or "") for r in rows
+                    if str(r.get("fingerprint") or "")]
+    duplicate_fingerprints = len(fingerprints) - len(set(fingerprints))
+    with_transcript = sum(1 for r in rows if r.get("transcript"))
+    with_topic = sum(1 for r in rows if str(r.get("topic") or "").strip())
+    passing = sum(1 for r in rows if (r.get("flow") or {}).get("ok"))
+    take = rows[:max(1, min(500, int(limit or 100)))]
+    if not full:
+        take = [{k: v for k, v in row.items() if k != "transcript"}
+                | {"transcript_turns": len(row.get("transcript") or [])}
+                for row in take]
+    return {
+        "calls": take,
+        "summary": {
+            "kept": len(rows), "capacity": CALL_LOG_KEPT,
+            "with_transcript": with_transcript, "with_topic": with_topic,
+            "with_fingerprint": len(fingerprints),
+            "exact_duplicate_fingerprints": duplicate_fingerprints,
+            "flow_passing": passing,
+            "single_use_playback": "caller" not in SHELF_REUSABLE,
+            "novelty_similarity_limit": CALL_NOVELTY_MAX_SIMILARITY,
+        },
+    }
+
+
 @app.post("/api/dj/hangups")
 async def dj_hangups_save(
     request: Request,
@@ -65779,9 +69483,13 @@ async def dj_caller_card(
                   "media": c.get("media", ""), "sig": c.get("sig", "")}
                  for c in said[-8:]],
         "last_call": ({"seconds": ended.get("seconds"),
-                       "turns": ended.get("turns"),
-                       "rule": str(ended.get("rule") or ""),
-                       "ts": ended.get("ts")} if ended else None),
+                        "turns": ended.get("turns"),
+                        "rule": str(ended.get("rule") or ""),
+                        "topic": str(ended.get("topic") or ""),
+                        "theme": str(ended.get("theme") or ""),
+                        "fingerprint": str(ended.get("fingerprint") or ""),
+                        "flow": dict(ended.get("flow") or {}),
+                        "ts": ended.get("ts")} if ended else None),
         "on_air_now": bool(said and time.time() - float(
             said[-1].get("ts") or 0) < 90),
     }
@@ -67810,7 +71518,7 @@ def cache_state() -> dict[str, Any]:
             {"key": "larder", "rows": len(_LARDER), "bytes": 0,
              "seconds": round(sum(float(e.get("seconds") or 0)
                                   for e in _LARDER), 1),
-             "cap_bytes": 0, "cap_rows": _LARDER_MAX},
+             "cap_bytes": 0, "cap_rows": larder_cap()},
             {"key": "takes", "rows": len(_TAKES), "bytes": 0,
              "seconds": 0.0, "cap_bytes": 0},
         ]
@@ -67987,7 +71695,7 @@ async def api_interject_progress(
 # has been through - so on a station already short of material the first
 # airable round arrives much later. The round is the unit that can go on
 # the air, so the round stays the unit that gets finished.
-async def call_sheet(hours: float = 3.0) -> dict[str, Any]:
+async def call_sheet(hours: float = 4.0) -> dict[str, Any]:
     """#946/#947: who is wanted in the recording room, and for what."""
     out: dict[str, Any] = {"at": time.time(), "hours": round(hours, 2),
                            "actors": [], "rounds": 0, "lines": 0,
@@ -67997,21 +71705,36 @@ async def call_sheet(hours: float = 3.0) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         voices = {}
     jobs: list[tuple[str, str, dict[str, Any]]] = []
+    obligations = commitment_inventory_plan(hours, fresh=True)
+    wanted = set(obligations.get("selected_ids") or [])
+    waiting_tint = 0
     try:
         for entry in list(_LARDER):
-            if isinstance(entry, dict) and not entry.get("prepared"):
-                jobs.append(("banter", "the reserve", entry))
+            if not isinstance(entry, dict) or entry.get("prepared"):
+                continue
+            if alt_sid("banter", entry) not in wanted:
+                continue
+            if not dialogue_tint_ready("banter", entry):
+                waiting_tint += 1
+                continue
+            jobs.append(("banter", "the reserve", entry))
     except Exception:  # noqa: BLE001
         pass
     try:
         for kind, rows in list(_SHELF.items()):
             for row in (rows or []):
                 ent = (row or {}).get("entry")
-                if isinstance(ent, dict) and not ent.get("prepared"):
-                    jobs.append((str(kind),
-                                 str(row.get("label")
-                                     or SHELF_LABEL.get(str(kind), str(kind))),
-                                 ent))
+                if not isinstance(ent, dict) or ent.get("prepared"):
+                    continue
+                if alt_sid(str(kind), row) not in wanted:
+                    continue
+                if not dialogue_tint_ready(str(kind), row):
+                    waiting_tint += 1
+                    continue
+                jobs.append((str(kind),
+                             str(row.get("label")
+                                 or SHELF_LABEL.get(str(kind), str(kind))),
+                             ent))
     except Exception:  # noqa: BLE001
         pass
     seats: dict[str, dict[str, Any]] = {}
@@ -68097,17 +71820,31 @@ async def call_sheet(hours: float = 3.0) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         rate = 0.35
     out["room_seconds"] = round(total_seconds / max(0.05, rate), 1)
+    out["room_capacity"] = round(max(1.0, float(hours) * 3600.0 * SLOT_DUTY), 1)
+    out["pressure"] = round(out["room_seconds"] / out["room_capacity"], 3)
+    out["waiting_tint"] = waiting_tint
+    out["obligations"] = {
+        "owed_seconds": obligations.get("owed_seconds", 0.0),
+        "ready_seconds": obligations.get("ready_seconds", 0.0),
+        "planned_seconds": obligations.get("planned_seconds", 0.0),
+        "short_seconds": obligations.get("short_seconds", 0.0),
+        "selected_rows": len(wanted),
+    }
     if not actors:
-        out["say"] = ("every line that has been written has been recorded - "
-                      "the rooms are clear and the desk is the only thing "
-                      "that can make more")
+        out["say"] = ("every tinted line selected by the next four hours has "
+                      "been recorded - unused cupboard rows are not on this "
+                      "sheet"
+                      + (f"; {waiting_tint} selected row(s) are still at the "
+                         "tint desk" if waiting_tint else ""))
     else:
         top = actors[0]
         out["say"] = (
             f"{len(actors)} actor(s) are wanted for {total_lines} line(s) "
             f"across {rounds} round(s) - about {int(total_seconds / 60)} min "
             f"of air, which is roughly {int(out['room_seconds'] / 60)} min "
-            f"in the room. {top['name']} has the most at {top['lines']}"
+            f"in the room ({int(out['pressure'] * 100)}% of the horizon's "
+            f"safe room capacity). {top['name']} has the most at "
+            f"{top['lines']}"
             + (f" ({', '.join(top['for'][:3])})" if top.get("for") else ""))
     return out
 
@@ -68803,13 +72540,18 @@ async def api_rooms_sitting_run(
     except (TypeError, ValueError):
         secs = 60.0
     pool: list[dict[str, Any]] = []
-    for rows in _SHELF.values():
+    wanted = committed_stock_ids(ready=False)
+    for kind, rows in _SHELF.items():
         for row in (rows or []):
             ent = (row or {}).get("entry")
-            if isinstance(ent, dict) and not ent.get("prepared"):
+            if (isinstance(ent, dict) and not ent.get("prepared")
+                    and alt_sid(str(kind), row) in wanted
+                    and dialogue_tint_ready(str(kind), row)):
                 pool.append(ent)
     for ent in _LARDER:
-        if isinstance(ent, dict) and not ent.get("prepared"):
+        if (isinstance(ent, dict) and not ent.get("prepared")
+                and alt_sid("banter", ent) in wanted
+                and dialogue_tint_ready("banter", ent)):
             pool.append(ent)
     if not pool:
         return {"rounds": 0, "actors": [], "finished": 0,
@@ -68820,14 +72562,14 @@ async def api_rooms_sitting_run(
 
 @app.get("/api/rooms/call-sheet")
 async def api_call_sheet(
-    hours: float = 3.0,
+    hours: float = 4.0,
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
     """#946/#947: who is wanted in the recording room, for how many lines,
     and which segments those lines belong to - so a backed-up room says
     whose work it is holding rather than only that it is holding some."""
     require_read_auth(authorization)
-    return await call_sheet(max(0.25, min(24.0, float(hours or 3.0))))
+    return await call_sheet(max(0.25, min(24.0, float(hours or 4.0))))
 
 
 @app.get("/api/schedule/brief-audit")
@@ -69177,6 +72919,21 @@ async def api_coord_capacity(
     actually render in an hour - and which road is eating it."""
     require_read_auth(authorization)
     return coord_capacity()
+
+
+@app.get("/api/coordinator/hourly")
+async def api_coord_hourly(
+    refresh: bool = False,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1131: active requirement contract, scorecards and learned corrections.
+
+    `refresh` reconciles the exact one-hour FIFO inventory immediately; the
+    ordinary view is cached briefly so polling the glass does not steal a
+    writing/recording window from the broadcast it is measuring.
+    """
+    require_read_auth(authorization)
+    return coordinator_hourly_state(bool(refresh))
 
 
 @app.get("/api/coordinator/road/{road}")
@@ -84785,7 +88542,7 @@ async function cloudPulse() {
 async function loadCrystals() {
   const host = document.getElementById("crystalsOutput");
   try {
-    const data = await api("/api/crystals");
+    const data = await api("/api/song-crystals");
     const crystals = data.crystals || [];
     if (!crystals.length) {
       host.textContent = "No crystals yet. Build them with "
@@ -85228,7 +88985,7 @@ async function crystalDetailOpen(slug) {
   crystalDetailClose();
   let crystal;
   try {
-    crystal = await api("/api/crystals/" + encodeURIComponent(slug));
+    crystal = await api("/api/song-crystals/" + encodeURIComponent(slug));
   } catch (error) {
     alert(error.message);
     return;
