@@ -70856,6 +70856,19 @@ _NEAR = r".{0,28}"
 # The station by name — no bare "music", which belongs to song requests.
 _NAMED = r"(station|pine\s?box\s?fm|pine\s?fm|radio|broadcast|the\s+show)"
 INTENT_PATTERNS: tuple[tuple[str, str], ...] = (
+    # #1133 — "pause the radio" / "unpause the radio", spoken to the box.
+    # First in the order on purpose: "resume the radio" must not fall
+    # through to a weaker match, and both verbs are unambiguous.
+    ("pause", "|".join((
+        r"\b(pause|freeze|suspend)\b" + _NEAR + _NAMED,
+        _NAMED + _NEAR + r"\bon\s+hold\b",
+        r"\btake\b" + _NEAR + _NAMED + _NEAR + r"\boff\s+(the\s+)?air\b",
+    ))),
+    ("unpause", "|".join((
+        r"\b(unpause|un-pause|resume)\b" + _NEAR + _NAMED,
+        _NAMED + _NEAR + r"\bback\s+on\s+(the\s+)?air\b",
+        r"\bput\b" + _NEAR + _NAMED + _NEAR + r"\bback\s+on\b",
+    ))),
     # #761 — "I can't hear the station", and the ways people say it.
     ("cant_hear", "|".join((
         r"\b(can'?t|cannot|can not)\s+hear\b" + _NEAR + _SUBJ,
@@ -71015,7 +71028,36 @@ async def station_intent_reply(intent: str, said: str) -> str:
     if intent == "status":
         return station_status_words()
 
+    # #1133: the spoken pause. The reply is the whole interface, so it
+    # says what the pause actually does - the operator's word for it is
+    # "cache the broadcast" - and answers with the bank on the way back.
+    if intent == "pause":
+        if radio_paused():
+            return ("The broadcast is already paused - the records are "
+                    "playing and the booth is banking. Say resume the "
+                    "radio when you want the show back.")
+        radio_pause_set(True)
+        return ("Going off air. The records keep playing, the booth "
+                "keeps recording and tinting, and everything it makes "
+                "is cached for when you bring the broadcast back.")
+    if intent == "unpause":
+        if not radio_paused():
+            return "The broadcast is already on air."
+        _banked = int(prepared_seconds() / 60)
+        radio_pause_set(False)
+        return (f"Back on air, with about {_banked} minutes of prepared "
+                "material standing by.")
+
     ok, why = station_health_words()
+    # #1133: a paused station is not a broken one. "Turn the radio back
+    # on" used to run the repair ladder - and its test announce - against
+    # a box that was silent on purpose. Paused, every one of these three
+    # means "bring the show back", so that is what it does.
+    if intent in ("cant_hear", "why_silent", "start") and radio_paused():
+        _banked = int(prepared_seconds() / 60)
+        radio_pause_set(False)
+        return ("The broadcast was paused, not broken - bringing it "
+                f"back now with about {_banked} minutes banked.")
     if intent in ("cant_hear", "why_silent", "start"):
         if ok and intent != "start":
             # Nothing in memory is wrong, so the fault is at the far end.
