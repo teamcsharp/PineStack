@@ -33004,6 +33004,13 @@ AD_REPEAT_CONTAIN = 0.70
 AD_REPEAT_AGAINST = 200
 ADS_PER_HOUR = 2                # produced spots BUILT every hour (#916a)
 AD_STUDIO_TICK = 300.0          # how often the desk looks at the hour
+AD_STUDIO_RETRY = 60.0          # #1136: the walk back after yielding
+# #1136: the share of commercial breaks handed straight to the PRODUCED
+# cupboard before a prepared dry read is consumed. The operator's ask is
+# to HEAR the produced spots often; the ledger showed 131 finished spots
+# in the book and five airings all day, because the shelf's dry reads
+# always went first.
+AD_PRODUCED_BREAK_SHARE = 0.5
 AD_STUDIO_TRIES = 3             # rewrites before an advert is given up on
 AD_HOUSE_TAT = (
     "the Pine Box FM commemorative lighthouse plate",
@@ -33415,10 +33422,10 @@ async def ad_studio_clock() -> None:
     booth or an engine with no spare slot all mean "come back later",
     because a desk that makes the station late is worse than a thin
     cupboard."""
-    first = True
+    wait = 45.0
     while _RADIO.get("on"):
-        await asyncio.sleep(45.0 if first else AD_STUDIO_TICK)
-        first = False
+        await asyncio.sleep(wait)
+        wait = AD_STUDIO_TICK
         try:
             if not _RADIO.get("on"):
                 continue
@@ -33427,10 +33434,20 @@ async def ad_studio_clock() -> None:
                 continue                # the hour has its spots
             if shelf_full("ad") or ad_shelf_produced() >= ADS_PER_HOUR:
                 continue                # stacked deep enough already
+            # #1136: A BLOCKED DESK COMES BACK SOONER. Yielding to the
+            # live show is right; sleeping the full five-minute tick
+            # after yielding is how "two spots an hour" became one spot
+            # in six hours - on a station whose writer is nearly always
+            # busy, a 300-second sampling of a gate that opens and shuts
+            # between rounds misses almost every opening. The yield is
+            # unchanged; only the walk back to the door is shorter, and
+            # only while the hour is still owed its spots.
             if _SPEAKING[0] or _OLLAMA_GATE.locked():
-                continue                # the live show owns the writer
+                wait = AD_STUDIO_RETRY  # the live show owns the writer
+                continue
             if prep_should_stop():
-                continue                # the engine is full, or in relief
+                wait = AD_STUDIO_RETRY  # the engine is full, or in relief
+                continue
             await ad_studio_build()
         except asyncio.CancelledError:
             raise
@@ -40938,6 +40955,32 @@ async def dj_ad_break() -> str:
     dj = dj_settings()
     stored = ad_pick()
 
+    # #1136: THE PRODUCED CUPBOARD GETS A REAL SHARE OF THE BREAKS. The
+    # shelf's prepared dry reads used to be consumed first on every
+    # single break, so a book of 131 finished spots - voice, bed, vocode
+    # and sting already mixed - aired five times in a day while the
+    # station read fresh dry copy over them. Half the breaks now go to
+    # the least-used produced spot outright; the dry read keeps its slot
+    # on the other half, and it stays on the shelf meanwhile, so nothing
+    # prepared is wasted. Costs this break nothing at all: the audio is
+    # already cut.
+    try:
+        if random.random() < AD_PRODUCED_BREAK_SHARE:
+            _cupboard = [r for r in ad_list() if r.get("audio")]
+            if _cupboard:
+                _few = min(int(r.get("uses") or 0) for r in _cupboard)
+                _spot = random.choice([r for r in _cupboard
+                                       if int(r.get("uses") or 0) == _few])
+                await _air_produced_ad(_spot)
+                ad_update(str(_spot.get("id") or ""),
+                          uses=int(_spot.get("uses") or 0) + 1)
+                pipeline_log("air", "the break went to the produced "
+                             "cupboard - least-used spot first, "
+                             f"{len(_cupboard)} on the shelf (#1136)")
+                return str(_spot.get("text") or "")
+    except Exception:  # noqa: BLE001
+        pass                           # the ordinary roads below still run
+
     # #842: a spot WRITTEN AND READ during an earlier record. The words
     # and the audio both exist already, so this break costs the model and
     # the voice engine nothing at all — which is the whole point of the
@@ -41143,6 +41186,18 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
     # it sits down to write the next one. `also_said` is on: the read is
     # the pair's own speech even though a file played it.
     ad_remember(str(entry.get("text") or ""))
+    # #1136: ...AND THE HOUR CONTRACT IS CREDITED. Every SPOKEN ad rides
+    # air_remember -> coord_air_note and counts toward the ad road's
+    # hourly target, but a produced spot plays as a file and touched
+    # neither - so the more the operator heard the produced cupboard,
+    # the worse the scorecard said the ad road was doing, and the
+    # closed-loop controller would have "corrected" a road that was
+    # delivering. The spot's text is the same estimate every spoken
+    # line is credited by.
+    try:
+        coord_air_note(str(entry.get("text") or ""), "dj", "ad")
+    except Exception:  # noqa: BLE001
+        pass
     # The speakbox document a stacked spot was written off is credited at
     # the moment it airs rather than at the moment it was cut, so a swath
     # sitting unheard on the shelf is not retired early (#916c).
@@ -75581,6 +75636,20 @@ def _staging_rows() -> dict[str, Any]:
     rows: list[dict[str, Any]] = []
     total = free = 0
     now = time.time()
+    # #1136: ONE walk of the sample folders, not one per sting row.
+    # sfx_by_id() walks every sample folder - 3,400+ files on a CIFS
+    # mount - per call, and the loop below called it once per staged
+    # sting. Measured live: three straight 15-second timeouts on this
+    # desk while every sibling endpoint answered, which is the one
+    # control an operator experiences as simply broken.
+    _sfx_names: dict[str, str] = {}
+    try:
+        _made = (list(SFX_MADE_DIR.glob("*.wav"))
+                 if SFX_MADE_DIR.is_dir() else [])
+        for _p in sfx_all() + _made:
+            _sfx_names.setdefault(sfx_id(_p), _p.stem)
+    except Exception:  # noqa: BLE001
+        pass
     try:
         entries = sorted(_EPISODE_STAGE.iterdir())
     except OSError:
@@ -75599,11 +75668,8 @@ def _staging_rows() -> dict[str, Any]:
         sting = "." not in stem
         label = ""
         if sting:
-            try:
-                found = sfx_by_id(stem)
-                label = f"[sfx] {found.stem}" if found else "[sfx]"
-            except Exception:
-                label = "[sfx]"
+            _found = _sfx_names.get(stem)          # #1136: map, not a walk
+            label = f"[sfx] {_found}" if _found else "[sfx]"
         # A hardlink shares its bytes with /media: deleting it frees nothing
         # until the original goes too. st_nlink == 1 means this IS the last
         # copy, and those bytes are the honest saving.
@@ -80014,8 +80080,21 @@ async def dj_sfx_list(
     folders = []
     for folder in await asyncio.to_thread(sfx_folders):
         samples = await asyncio.to_thread(sfx_list, folder)
+        # #1136: #839 added folders under the writable LOCAL root
+        # (data/samples), which is not under /samples - relative_to
+        # raised ValueError on the first local folder and the whole
+        # endpoint 500d, taking the panel's Stingers list with it.
+        # The label is the same relative NAME sfx_folders() resolves,
+        # whichever root it lives under.
+        try:
+            _label = str(folder.relative_to(SFX_ROOT))
+        except ValueError:
+            try:
+                _label = str(folder.relative_to(SFX_LOCAL_ROOT))
+            except ValueError:
+                _label = folder.name
         folders.append({
-            "folder": str(folder.relative_to(SFX_ROOT)),
+            "folder": _label,
             "count": len(samples),
             "samples": [
                 {"name": p.stem, "id": sfx_id(p), "sig": media_sign(sfx_id(p))}
@@ -116456,12 +116535,38 @@ async function loadEngineVoices() {
 async function voiceDeskOpen() {
   const open = document.getElementById("voiceDeskModal");
   if (open) { open.remove(); return; }
+  /* #1136: the desk OPENS FIRST and says what it is doing. It used to
+   * await settings + the engine probe (measured: 15s+ when an engine is
+   * slow to answer) before drawing anything, inside `catch { return; }`
+   * — so the button did nothing for tens of seconds, and on a failed
+   * probe it did nothing forever, with no message at all. The Studio
+   * button beside it already opens-then-reports; this is the same
+   * manner. */
+  const wait = el("div", "", "");
+  wait.id = "voiceDeskModal";
+  wait.style.cssText = "position:fixed;inset:0;background:#020409e6;"
+    + "z-index:175;display:flex;align-items:center;justify-content:center";
+  const waitCard = el("div", "panel", "");
+  waitCard.style.cssText = "max-width:560px;width:94%;margin:0";
+  waitCard.appendChild(el("h2", "", "🔈 The voice desk"));
+  waitCard.appendChild(el("div", "muted",
+    "Reading the voice catalogue and probing the engines…"));
+  wait.appendChild(waitCard);
+  wait.onclick = (event) => { if (event.target === wait) wait.remove(); };
+  document.body.appendChild(wait);
   let settings = null, engines = null;
   try {
     await loadCloneVoices();
     settings = await api("/api/settings");
     engines = await api("/api/voice/engines");
-  } catch (error) { return; }
+  } catch (error) {
+    waitCard.appendChild(el("div", "muted",
+      "The desk could not load: " + error.message
+      + " — close this and try again."));
+    return;
+  }
+  if (!document.getElementById("voiceDeskModal")) return;  // closed early
+  wait.remove();
   if (settings.voice_out) delete settings.voice_out.ha_token;
 
   const shade = el("div", "", "");
