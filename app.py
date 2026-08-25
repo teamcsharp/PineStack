@@ -71058,11 +71058,17 @@ INTENT_PATTERNS: tuple[tuple[str, str], ...] = (
     # through to a weaker match, and both verbs are unambiguous.
     ("pause", "|".join((
         r"\b(pause|freeze|suspend)\b" + _NEAR + _NAMED,
+        # #1137: SUBJECT FIRST, the way the operator actually says it -
+        # "I want the radio paused", "the radio on pause". #1133 only
+        # heard verb-then-subject, so the polite form fell through to
+        # the model and nothing moved the switch.
+        _NAMED + _NEAR + r"\b(paused?|on\s+pause)\b",
         _NAMED + _NEAR + r"\bon\s+hold\b",
         r"\btake\b" + _NEAR + _NAMED + _NEAR + r"\boff\s+(the\s+)?air\b",
     ))),
     ("unpause", "|".join((
         r"\b(unpause|un-pause|resume)\b" + _NEAR + _NAMED,
+        _NAMED + _NEAR + r"\b(unpaused?|resumed?)\b",       # #1137
         _NAMED + _NEAR + r"\bback\s+on\s+(the\s+)?air\b",
         r"\bput\b" + _NEAR + _NAMED + _NEAR + r"\bback\s+on\b",
     ))),
@@ -71119,8 +71125,16 @@ def station_intent(text: str) -> str:
     if len(said) < 6:
         return ""
     low = said.lower()
+    # #1137: the widened pause net must not catch QUESTIONS. "why is the
+    # radio paused" names the subject and the verb in the same breath,
+    # but it is asking, not asking-for - a leading question word sends
+    # it past the pause intents to the ones built for questions.
+    _question = bool(re.match(
+        r"\s*(why|what|how|when|is|was|are|did|does)\b", low))
     for name, pattern in INTENT_PATTERNS:
         if re.search(pattern, low, re.I):
+            if _question and name in ("pause", "unpause"):
+                continue
             return name
     return ""
 
