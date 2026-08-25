@@ -23412,6 +23412,16 @@ async def prep_one(kind: str) -> bool:
     try:
         _new_script = commitment_write_needed(str(kind))
         _assigned_unready = committed_stock_ids(str(kind), ready=False)
+        # #1134: THE OTHER HALF OF #1131. Off air the schedule clock is
+        # frozen, so the commitment sheet reads "assigned" for the whole
+        # pause - #1131 taught prep_plan to put the hour-short roads on
+        # the board anyway, and then THIS door re-asked the same frozen
+        # sheet and refused the very pick the board had just made. The
+        # board and the door now apply one rule: while the station banks,
+        # the hour's own shortfall outranks a frozen sheet.
+        if (not _new_script and radio_paused()
+                and str(kind) in (hour_short_kinds() or [])):
+            _new_script = True
         if (not _new_script
                 and not (str(kind) == "track_talk" and _assigned_unready)):
             prep_note(str(kind), "four-hour obligations assigned")
@@ -28957,6 +28967,41 @@ def coord_hour_close(at: float | None = None) -> dict[str, Any]:
         }
         decisions.append({"road": road, "met": met,
                           "factor": round(factor, 3), "action": action})
+    # #1134: THE LADDER MAY NOT CONTRADICT THE SCORECARD. Measured live:
+    # the policy board said drive_road=gallery ("build it first until it
+    # is covered") AND postpone_first=gallery ("it gives way first") at
+    # the same time, so every second the pantry spent on the road, the
+    # air stood down - gallery closed its hour at 21% attainment while
+    # news delivered 145%. Both answers were the station's own defaults
+    # from different asks, hours apart. When the road told to give way
+    # first has just MISSED its hour contract, the stand-down moves to
+    # the road with the most surplus, and the log says so plainly.
+    try:
+        _first = str(orch_policy("postpone_first") or "")
+        _missed = {r for r, row in roads.items() if not row.get("met")}
+        if _first and _first in _missed:
+            _surplus = sorted(
+                ((float((roads.get(r) or {}).get("aired_seconds") or 0)
+                  / max(1.0, float((roads.get(r) or {}).get(
+                      "target_seconds") or 0)), r)
+                 for r in roads
+                 if r not in _missed and r in SLOT_POSTPONE
+                 and r != str(orch_policy("prefer_road") or "")),
+                reverse=True)
+            _to = _surplus[0][1] if _surplus else "keep"
+            orch_apply(f"postpone:{_to}")
+            pipeline_log(
+                "lookahead",
+                f"{SHELF_LABEL.get(_first, _first)} was first to give way "
+                "and just missed its hour at "
+                f"{int(100 * float((roads.get(_first) or {}).get('attainment') or 0))}% - "
+                + (f"{SHELF_LABEL.get(_to, _to)} takes the front of the "
+                   "stand-down ladder instead"
+                   if _to != "keep" else
+                   "the ladder returns to its standing order")
+                + " (#1134)")
+    except Exception:  # noqa: BLE001
+        pass
     end_inventory = coord_hour_inventory(fresh=True)
     report = {
         "id": active.get("id"), "started_at": active.get("started_at"),
@@ -30740,6 +30785,28 @@ def hour_short_kinds() -> list[str]:
     return [road for _gap, road in short]
 
 
+def _hour_needs_with_cover() -> dict[str, dict[str, float]]:
+    """#1134: hour_needs(), with the commitment desk's verdict beside it.
+
+    The scheduler panel reads owed-minus-held and has been crying famine
+    in red over hours the four-hour FIFO desk had fully bound - repeats
+    are how a 2.35x oversubscribed running order stays on air, and the
+    desk models them while the raw walk counts each clip's seconds once.
+    Both numbers are true and they answer different questions, so the
+    glass gets both: `uncovered` is the desk's short_seconds - seconds
+    of entries with NO stock behind them at all - which is the figure
+    that means a hole in the air rather than a repeat."""
+    rows = hour_needs()
+    try:
+        desk = (commitment_inventory_plan().get("roads") or {})
+        for road, row in rows.items():
+            row["uncovered"] = round(float(
+                (desk.get(road) or {}).get("short_seconds") or 0), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    return rows
+
+
 def dialogue_flow_state() -> dict[str, Any]:
     """Explain the continuity pipeline without hiding the bottleneck."""
     dj = dj_settings()
@@ -30809,7 +30876,7 @@ def dialogue_flow_state() -> dict[str, Any]:
         # #942/#905: dead air measured and remembered, the half hour
         # audited, and the next half hour's work order.
         "coordinator": coordinator_state(),
-        "hour_needs": hour_needs(),
+        "hour_needs": _hour_needs_with_cover(),
         "hour_short": hour_short_kinds(),
         "prepared_seconds": prepared_seconds(),
         "prepared_hours": round(prepared_seconds() / 3600.0, 2),
@@ -33116,6 +33183,7 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
     falls through to the road it has always had when it comes back
     empty, so a refused advert is never dead air."""
     out: dict[str, Any] = {}
+    _lesson = ""                        # #1134: what the last draft got wrong
     for attempt in range(max(1, int(tries))):
         seed: dict[str, Any] = {}
         try:
@@ -33125,7 +33193,7 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
         direct = ""
         if seed.get("text"):
             direct += speakbox_aside(seed, pair=False)
-        direct += ad_avoid_note()
+        direct += ad_avoid_note() + _lesson
         try:
             raw = await dj_line("ad", None, extra=product, direct=direct,
                                 tint=False)
@@ -33137,8 +33205,19 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
         plain = text
         tint_paper: dict[str, Any] = {}
         if dialogue_tint_required():
-            tinted = await crystal_tint(text, "ad", whole_only=True,
-                                         critical=True)
+            # #1134: the crystal is allowed to change diction, never the
+            # identity - and the identity of an advert is the product.
+            # Measured before this: 6 of the last 8 checked adverts
+            # failed "a product named and sold", and the audit runs on
+            # the TINTED words, so the rewrite was quietly stripping the
+            # sale out of scripts that had it. The product rides the
+            # verbatim rail through the tint, the same protection a
+            # phone call's speakerbox passage has always had.
+            tinted = await crystal_tint(
+                text, "ad",
+                [["the product being sold - it must stay named and sold",
+                  str(product)]],
+                whole_only=True, critical=True)
             tint_paper = _tint_paper(tinted)
             if not tinted.get("ok"):
                 pipeline_log("crystal", "an advert is kept off the shelf "
@@ -33146,6 +33225,21 @@ async def ad_write_fresh(product: str, tries: int = AD_STUDIO_TRIES
                              + str(tinted.get("why") or "refused")[:120])
                 continue
             text = str(tinted.get("script") or text)
+        # #1134: THE SALE SURVIVES OR THE DRAFT DIES HERE. Each off-brief
+        # advert used to cost a model visit and a render, get banked,
+        # then be demoted by the very same check at shelf_put - a wasted
+        # row on the cheapest anti-dead-air road on the board. The check
+        # runs now, while a rewrite costs one more attempt, and the next
+        # attempt is told exactly what the last one got wrong.
+        _aud = segment_audit("ad", text)
+        if _aud.get("checked") and not _aud.get("ok"):
+            _lesson = (" The previous attempt never named or sold the "
+                       f"product. Name {product} outright and SELL it - "
+                       "a price or an offer, and where to get it.")
+            pipeline_log("drop", "the advert lost the sale in the writing "
+                         "or the tint - rewriting it (#1134)",
+                         extra=text[:300])
+            continue
         # The last attempt drops the station-wide phrase leg — see
         # ad_repeat_check(). The ad-book legs never stand down.
         verdict = ad_repeat_check(text, phrases=attempt < tries - 1)
@@ -110162,6 +110256,14 @@ function djFlowPhases(host, flow, line) {
           const owed = Number(n.owed || 0);
           const held = Number(n.held || 0);
           const short = Math.max(0, owed - held);
+          /* #1134: two different questions on one line. `short` is the
+           * fresh-stock gap (each clip's seconds counted once) and the
+           * four-hour desk covers most of it with repeats by design -
+           * the running order asks for more speech than the room can
+           * write fresh. `uncovered` is the desk's own verdict: seconds
+           * of entries with NO stock behind them at all. Only that one
+           * means a hole in the air, and only that one reads as late. */
+          const unc = Number(n.uncovered || 0);
           const say = q.target
             ? ((q.aired || 0) + " of " + (q.target || 0) + " this hour"
                + (q.behind ? " — behind" : " — on pace")
@@ -110170,12 +110272,16 @@ function djFlowPhases(host, flow, line) {
             : (owed
                ? (Math.round(held) + "s of " + Math.round(owed)
                   + "s the hours owe it"
-                  + (short > 0 ? " — " + Math.round(short) + "s short"
-                               : " — covered"))
+                  + (short > 0
+                     ? (" — " + Math.round(short) + "s short of fresh"
+                        + (unc > 0
+                           ? " · " + Math.round(unc) + "s has NO stock"
+                           : " · every entry bound, repeats cover the rest"))
+                     : " — covered"))
                : "nothing scheduled for it");
           const v = pvKV(g, k, say);
           try {
-            const late = !!q.behind || short > 0;
+            const late = !!q.behind || unc > 0;
             v.style.cursor = "pointer";
             v.style.textDecoration = "underline dotted";
             v.style.textUnderlineOffset = "2px";
