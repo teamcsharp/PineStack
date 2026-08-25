@@ -24597,6 +24597,12 @@ CANNOT_PREPARE = {
     # horizon — written only inside the quarter hour before its entry,
     # stamped with the front page it was written from, and discarded
     # rather than aired if the wire has moved on.
+    # #1135: a guest interview is live by nature - it is with whoever is
+    # in the studio at that moment, and a banked round would come back
+    # in yesterday's guest's voice the day the chair changes hands.
+    "guest": "an interview is with whoever is in the studio at that "
+             "moment - banking one ahead would strand it in the wrong "
+             "guest's voice",
 }
 
 
@@ -31345,6 +31351,37 @@ async def _torrent_talk() -> None:
                     if not aired:
                         aired = bool(await dj_banter(track, render_stream=bool(
                             dj.get("stream_show", True))))
+                elif kind == "guest":
+                    # #1135: a Studio guest entry is the INTERVIEW, not a
+                    # coincidence. The third seat already carries the
+                    # guest in every round while guest mode is on (#568);
+                    # this entry points a whole round AT them, and an
+                    # empty chair degrades to plain banter rather than
+                    # costing the hour anything.
+                    _g = active_guest()
+                    if _g:
+                        _gname = str(_g.get("name") or "the guest")
+                        _gangle = (
+                            f"THIS ENTRY IS {_gname}'S INTERVIEW. They "
+                            "are in the studio right now, live in the "
+                            "room. Make the whole round about them: "
+                            f"welcome them properly, ask {_gname} who "
+                            "they are and why they came, dig into their "
+                            "answers rather than moving on, and let them "
+                            f"steer at least once. {_gname} speaks as "
+                            "themselves, in their own words, and gets "
+                            "real room to answer.")
+                        aired = bool(await dj_banter(
+                            track, angle=_gangle,
+                            render_stream=bool(dj.get("stream_show",
+                                                      True))))
+                    else:
+                        pipeline_log(
+                            "air", "a Studio guest entry came round with "
+                            "nobody in the studio - plain banter covers "
+                            "it (#1135)")
+                        aired = bool(await dj_banter(track, render_stream=bool(
+                            dj.get("stream_show", True))))
                 elif kind == "bombshell":
                     # #884: an operator-chosen rant carries its own
                     # premise; otherwise the station picks its own.
@@ -33942,6 +33979,12 @@ SCHEDULE_KINDS: list[dict[str, str]] = [
     {"kind": "bombshell", "label": "Side rant",
      "blurb": "Something off the shelf sets one of them off and the whole "
               "round becomes the rant (drop_bombshell into dj_banter)."},
+    {"kind": "guest", "label": "Studio guest",
+     "blurb": "The hosts interview the studio guest in the third seat - "
+              "welcomed in, drawn out, riffed with (#568 guest via "
+              "dj_banter, #1135). With nobody in the studio the entry "
+              "falls back to plain banter, so an empty chair never "
+              "costs the hour."},
 ]
 SCHEDULE_KIND_NAMES = tuple(k["kind"] for k in SCHEDULE_KINDS)
 
@@ -33984,6 +34027,11 @@ SCHEDULE_PROMPT_SEED: dict[str, str] = {
             "topic-hopping — dig.",
     "bombshell": "Something has set one of you off. Let the rant run, "
                  "and let the other one try and fail to steer it back.",
+    "guest": "There is a guest IN THE ROOM. This entry is their "
+             "interview: welcome them in properly, find out who they "
+             "are and why they came, dig into the one thing only they "
+             "could talk about, and let them push back. They speak as "
+             "themselves, and nobody talks over them.",
 }
 
 # The owner's own hour, in the owner's own order (#843). Twenty entries,
