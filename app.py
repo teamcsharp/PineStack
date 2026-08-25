@@ -71096,6 +71096,20 @@ INTENT_PATTERNS: tuple[tuple[str, str], ...] = (
         _NAMED + _NEAR + r"\bback\s+on\s+(the\s+)?air\b",
         r"\bput\b" + _NEAR + _NAMED + _NEAR + r"\bback\s+on\b",
     ))),
+    # #1139 - "turn off the radio" means the whole SERVICE ends, and
+    # stays ended until "turn on the radio". Distinct from pause on
+    # purpose: a pause banks and comes back; off is off. "stop/kill/end"
+    # must sit ADJACENT to the subject ("stop the radio") - with the
+    # loose window, "stop playing that song on the radio" would have
+    # shut the station down over a song complaint.
+    ("off", "|".join((
+        r"\b(turn|switch|shut|power)\s+(off|down)\b" + _NEAR + _NAMED,
+        r"\b(turn|switch|shut|power)\b" + _NEAR + _NAMED + _NEAR
+        + r"\b(off|down)\b",
+        r"\b(stop|kill|end)\s+(the\s+)?" + _NAMED
+        + r"(\s+service)?\b",
+        _NAMED + r"\s+service\s+off\b",
+    ))),
     # #761 — "I can't hear the station", and the ways people say it.
     ("cant_hear", "|".join((
         r"\b(can'?t|cannot|can not)\s+hear\b" + _NEAR + _SUBJ,
@@ -71157,7 +71171,7 @@ def station_intent(text: str) -> str:
         r"\s*(why|what|how|when|is|was|are|did|does)\b", low))
     for name, pattern in INTENT_PATTERNS:
         if re.search(pattern, low, re.I):
-            if _question and name in ("pause", "unpause"):
+            if _question and name in ("pause", "unpause", "off"):
                 continue
             return name
     return ""
@@ -71245,8 +71259,18 @@ async def station_repair_now() -> str:
         _routing_save()
     if not _RADIO.get("on"):
         try:
-            await dj_start(dj_best_station(""))
+            # #1139: dj_start is synchronous. The old `await dj_start(...)`
+            # DID start the station (the call runs before the await) and
+            # then raised TypeError awaiting the returned dict - swallowed
+            # here - so the reply never said the biggest thing it did.
+            dj_start(dj_best_station(""))
             fixed.append("started the station")
+            # ...and a service turned back on is meant to be HEARD. A
+            # pause left standing from before the stop would keep the
+            # fresh service silent, which reads as "turn on did nothing".
+            if radio_paused():
+                radio_pause_set(False)
+                fixed.append("released the pause")
         except Exception:
             pass
     return ", ".join(fixed)
@@ -71266,6 +71290,20 @@ async def station_intent_reply(intent: str, said: str) -> str:
     # #1133: the spoken pause. The reply is the whole interface, so it
     # says what the pause actually does - the operator's word for it is
     # "cache the broadcast" - and answers with the bank on the way back.
+    # #1139: OFF is off - the whole service ends until it is asked back.
+    # Deliberately not the pause: nothing banks, nothing spins, and the
+    # start intent below is the only spoken way back.
+    if intent == "off":
+        if not _RADIO.get("on"):
+            return ("The radio service is already off. Say turn on the "
+                    "radio when you want it back.")
+        try:
+            dj_stop()
+        except Exception:  # noqa: BLE001
+            return ("The radio service would not shut down cleanly - "
+                    "check the panel.")
+        return ("The radio service is off - records, DJs, the lot. "
+                "Nothing plays until you say turn on the radio.")
     if intent == "pause":
         if radio_paused():
             return ("The broadcast is already paused and silent - the "
@@ -71277,6 +71315,13 @@ async def station_intent_reply(intent: str, said: str) -> str:
                 "recording and tinting, and everything it makes is "
                 "cached for when you bring the broadcast back.")
     if intent == "unpause":
+        # #1139: "put the station back on" resolves here, and with the
+        # SERVICE off the old answer was "already on air" - warm words,
+        # dead speaker. Off means start it.
+        if not _RADIO.get("on"):
+            did = await station_repair_now()
+            return ("The radio service was off - I have "
+                    + (did or "started it") + ".")
         if not radio_paused():
             return "The broadcast is already on air."
         _banked = int(prepared_seconds() / 60)
@@ -71289,7 +71334,13 @@ async def station_intent_reply(intent: str, said: str) -> str:
     # on" used to run the repair ladder - and its test announce - against
     # a box that was silent on purpose. Paused, every one of these three
     # means "bring the show back", so that is what it does.
-    if intent in ("cant_hear", "why_silent", "start") and radio_paused():
+    # #1139: ...and only while the service is actually ON. Off AND paused
+    # used to release the pause here and return - leaving the service
+    # itself off, so "turn on the radio" answered warmly and played
+    # nothing. Off falls through to station_repair_now, which starts the
+    # service and releases the pause in one move.
+    if (intent in ("cant_hear", "why_silent", "start")
+            and radio_paused() and _RADIO.get("on")):
         _banked = int(prepared_seconds() / 60)
         radio_pause_set(False)
         return ("The broadcast was paused, not broken - bringing it "
