@@ -12606,8 +12606,16 @@ def pantry_burn() -> int:
             if len(keep) != len(rows):
                 burned[str(kind)] = len(rows) - len(keep)
                 _SHELF[kind] = keep
+        # #1141: ...AND THE AUDIO UNDER A KEPT ROW SURVIVES WITH IT. The
+        # row sweep above protects unaired rows and 72-hour repeats, but
+        # this clip sweep popped EVERY take at render-age 24h - so a
+        # protected row quietly became "clip gone" dead weight overnight
+        # and alt_shelf_trim evicted it as non-viable. A take something
+        # on a shelf still owns ages with its row, not with the clock.
+        _held = pantry_spoken_for()
         for key in [k for k, r in list(_PANTRY.items())
-                    if now - float(r.get("at") or 0) > PANTRY_BURN_SECONDS]:
+                    if k not in _held
+                    and now - float(r.get("at") or 0) > PANTRY_BURN_SECONDS]:
             _PANTRY.pop(key, None)
             burned["clips"] = int(burned.get("clips") or 0) + 1
     except Exception:  # noqa: BLE001
@@ -23870,6 +23878,28 @@ async def pantry_keeper() -> None:
             # bucket every time and the advert, the memo, the painting
             # round and the bulletin were never reached at all.
             _hour_short = hour_short_kinds()
+            # #1141: THE SECOND VOICE ENGINE JOINS THE BANKING SHIFT ON
+            # ITS OWN. Every path that authorizes piper was dead during
+            # a pause - cover_now needs an on-air deadline, the hour
+            # close needs an hour clock the pause freezes, speed_watch
+            # reads rooms that are frozen-generous off air, and the
+            # offline ask's "let piper record it too" is option two of
+            # a question the station answers alone with option one. The
+            # roads still short while banking get the cheap engine for
+            # half an hour at a time, renewed while they stay short.
+            if radio_paused() and _hour_short:
+                for _road in _hour_short[:2]:
+                    try:
+                        if (may_take_on_piper(_road)
+                                and not piper_authorised(_road)):
+                            piper_authorise(_road, 1800.0)
+                            pipeline_log(
+                                "lookahead",
+                                f"piper voices may record {_road} while "
+                                "the station banks - the clone engine "
+                                "alone cannot close its debt (#1141)")
+                    except Exception:  # noqa: BLE001
+                        pass
             # #930: PREPARED seconds. This one line is the whole of the
             # "how is the writing desk idle and the reserve at target
             # while the entire hour's segments aren't prepared" fault:
@@ -26126,9 +26156,15 @@ def orch_scan() -> dict[str, Any]:
                     {"ask": "How deep should a road be stocked before I "
                             "move on to another?",
                      "options": [
-                         _opt("Two of each, then move on", "stock:2"),
-                         _opt("Four of each", "stock:4"),
+                         # #1141: the FIRST option is what the station
+                         # picks when nobody answers, and "two of each"
+                         # had the unanswered question SHRINKING the
+                         # cupboard mid-banking-window - measured live,
+                         # stock_depth written to 2 while the operator's
+                         # standing order is a full stacked cupboard.
                          _opt("Fill it to eight", "stock:8"),
+                         _opt("Four of each", "stock:4"),
+                         _opt("Two of each, then move on", "stock:2"),
                      ]},
                 ])
             return out
@@ -30026,9 +30062,26 @@ def _coord_road_doing(rep: dict[str, Any]) -> list[dict[str, str]]:
                 + str(int(float(nxt.get("owns_seconds") or 0)))
                 + "s it owns. That is the hole being worked towards.")})
         elif ents:
-            say.append({"tag": "clear", "text": (
+            # #1141: THE CLEAR LINE NAMES ITS HORIZON. This sentence is
+            # computed over the truncated near lookahead (~70 minutes)
+            # while the four-hour desk can still be thousands of seconds
+            # short - measured: "every phone calls entry has enough" two
+            # fields away from a 2,813s uncovered debt. The operator
+            # reads the sentence, not the fields.
+            _far_short = 0.0
+            try:
+                _far_short = float(
+                    ((commitment_inventory_plan().get("roads") or {})
+                     .get(str(road)) or {}).get("short_seconds") or 0)
+            except Exception:  # noqa: BLE001
+                _far_short = 0.0
+            say.append({"tag": "clear" if _far_short <= 1.0 else "due",
+                        "text": (
                 "Every " + label + " entry inside the lookahead has enough "
-                "standing by to fill it.")})
+                "standing by to fill it."
+                + (f" The four-hour desk still wants {int(_far_short)}s "
+                   "more written beyond it."
+                   if _far_short > 1.0 else ""))})
         misses = int(rep.get("bare_arrivals") or 0)
         if misses:
             say.append({"tag": "due", "text": (
@@ -30135,13 +30188,28 @@ def coord_retire() -> int:
         keep_ids.update(alt_pin_map().get("ids") or set())
         removed_keys: set[str] = set()
         per_kind: dict[str, int] = {}
+        # #1141: THE STACKED CUPBOARD SURVIVES THE DESK. "Retain exactly
+        # the horizon" deleted every banked row the 4-hour plan did not
+        # select - whether heard or unheard, every fifteen seconds - so
+        # the keeper's surplus was shredded within the minute it was
+        # made and prepared_seconds could never close on its target.
+        # The operator's standing order is the opposite: "stack up these
+        # broadcasts to the point that we have a full and stacked
+        # cupboard." So this sweep keeps the #1075 rule every other
+        # sweeper already obeys: NOTHING UNHEARD IS RETIRED, and the
+        # road's last-resort fallbacks stay whatever their age. Spent
+        # rows past the plan still go, which is all the bloat control
+        # the layered ceilings (row caps, the 24h burn, the byte shed)
+        # actually need from this desk.
         for kind in list(_SHELF):
             kept: list[dict[str, Any]] = []
+            _rk = resort_keys(str(kind))
             for row in list(_SHELF.get(kind) or []):
                 target = dialogue_entry(row) or row
                 sid = alt_sid(str(kind), row)
                 if (sid in keep_ids or target.get("preparing")
-                        or target.get("tinting")):
+                        or target.get("tinting")
+                        or not resort_may_drop(str(kind), row, _rk)):
                     kept.append(row)
                     continue
                 removed_keys.update(_row_clip_keys(row))
@@ -30152,7 +30220,8 @@ def coord_retire() -> int:
         for entry in list(_LARDER):
             sid = alt_sid("banter", entry)
             if (sid in keep_ids or entry.get("preparing")
-                    or entry.get("tinting")):
+                    or entry.get("tinting")
+                    or row_unaired(entry)):        # #1141: never unheard
                 larder.append(entry)
                 continue
             removed_keys.update(_row_clip_keys(entry))
@@ -59054,10 +59123,42 @@ async def call_plot_clause(topic: str = "") -> tuple[str, dict[str, Any]]:
             for row in list(_SHELF.get("caller") or [])
         }
         reserved_sources.discard("")
-        swath = (await speakbox_semantic_seed(
-                    str(topic or "caller story grievance evidence"),
-                    who="caller", require_overlap=True,
-                    avoid_files=reserved_sources) or {})
+        # #1141: THE DRAW IS VALIDATED WITH THE GATE'S OWN PREDICATE.
+        # Selection avoided only the FILES of rows on the caller shelf,
+        # while the final call contract refuses on TEXT against the
+        # shelf AND the last 240 logged calls - so a swath matching an
+        # already-aired call passed selection here and guaranteed a
+        # refusal at the END of a 47-273 second attempt. Measured live
+        # during a banking pause: six finished caller rounds refused in
+        # forty minutes, five of them for this one fault, zero banked -
+        # and the near-argmax semantic draw re-picked the same doomed
+        # swath every time, because a swath only retires when it AIRS
+        # and a paused station airs nothing. Three draws, each adding
+        # the colliding source to the avoid set; if they all collide, a
+        # call with no plot beats a doomed call.
+        swath: dict[str, Any] = {}
+        _avoid = set(reserved_sources)
+        for _draw in range(3):
+            _got = (await speakbox_semantic_seed(
+                        str(topic or "caller story grievance evidence"),
+                        who="caller", require_overlap=True,
+                        avoid_files=_avoid) or {})
+            _t = str((_got or {}).get("text") or "").strip()
+            if not _t:
+                return "", {}
+            if call_speakerbox_novelty(_t).get("ok", True):
+                swath = _got
+                break
+            _file = str((_got or {}).get("file") or "")
+            pipeline_log("call", "the drawn swath already belongs to a "
+                         "logged call - redrawing before a word is "
+                         "written (#1141)",
+                         extra=_t[:160])
+            if not _file:
+                return "", {}
+            _avoid.add(_file)
+        if not swath:
+            return "", {}
     except Exception:  # noqa: BLE001
         return "", {}
     text = str((swath or {}).get("text") or "").strip()
@@ -65684,8 +65785,21 @@ def tint_budget() -> float:
         # #1121: off air, the rewrite is competing with nothing. The
         # share exists to stop it starving the writing desk in front of
         # a listener; with no listener there is no desk to starve.
+        # #1141: ...EXCEPT THE CUPBOARD. #1121 predates #1130/#1131
+        # making the pause the BANKING window, and 0.90 handed the model
+        # to the retint loop exactly when the writing desk had roads to
+        # fill - measured, the tint was 58% of all model load while
+        # caller sat 2,800s uncovered. While anything on the board is
+        # still short, the pause bonus stands down and the writing desk
+        # keeps its share; once the hours are covered, the crystal gets
+        # the whole quiet stretch exactly as #1121 intended.
         if radio_paused():
-            share = max(share, 0.90)
+            try:
+                _covered = not hour_short_kinds()
+            except Exception:  # noqa: BLE001
+                _covered = True
+            if _covered:
+                share = max(share, 0.90)
     except Exception:  # noqa: BLE001
         share = TINT_SHARE
     # #1083: and it rises with the surplus - thirty percent of the hour
