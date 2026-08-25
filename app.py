@@ -71351,6 +71351,17 @@ async def station_intent_reply(intent: str, said: str) -> str:
             _fire_and_forget_init()
             return (why + " I will check the speaker itself and say "
                     "something when I have.")
+        # #1140: "start the radio" with the radio already started and
+        # playing is a statement of fact, not a fault report. It used to
+        # fall into the repair road, promise "let me work through it and
+        # I will say something when it is fixed" over a healthy station,
+        # and run the full ladder with its audible test behind the
+        # answer. Every OTHER state does what the operator means by
+        # start: off -> the service starts, paused -> the broadcast
+        # resumes (both above); this is the one where there is nothing
+        # left to start.
+        if ok and intent == "start":
+            return why + " It is already playing."
         did = await station_repair_now()
         _fire_and_forget_init()
         if did:
