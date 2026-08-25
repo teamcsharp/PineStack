@@ -15299,19 +15299,17 @@ async def music_play_on_box(track: dict[str, Any]) -> str:
     ponytail: no pause, seek or volume on the box; the panel player has all
     three. Wire a real media_player entity in Home Assistant if you want
     transport control from the box itself."""
-    # #1127: AND MUSIC PLAYS WHILE PAUSED. #1115 shut this door too,
-    # which made a paused station completely silent - and what was asked
-    # for is a station that plays records and does not TALK. The pause
-    # is a silenced booth, not a silenced station.
-    #
-    # The two roads never touch: this posts media_player/play_media to
-    # Home Assistant itself, while every voice clip goes through
-    # _play_on_box, which is where the pause belongs and stays.
-    #
-    # It is also the better answer for the orchestrator: a record is the
-    # cheapest airtime on the station and the only kind that costs
-    # nothing to produce, so a paused station that keeps spinning them
-    # is covering its own air for free while the booth banks.
+    # #1138: PAUSED IS SILENT NOW - the decree has moved twice. #1115
+    # shut this door; #1127 reopened it ("a silenced booth, not a
+    # silenced station"); on 2026-08-25 the operator said the opposite
+    # in as many words: "I pause the radio. Playback needs to stop
+    # immediately." So the door is shut again, on purpose, and the pair
+    # of one-shot moves in radio_pause_set (stop the stream on pause,
+    # drop a fresh needle on resume) are what make it feel immediate -
+    # this gate is what makes it STAY quiet past the next track
+    # boundary.
+    if radio_paused():
+        return ""                    # a paused radio is a silent radio
     if not box_talk_ok():
         return ""                    # switched off at the top (#638)
     token, player = _ha_creds()
@@ -23657,6 +23655,16 @@ def radio_pause_set(on: bool) -> bool:
                 pass
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = now if on else 0.0
+        # #1138: the record was stopped the moment the pause began, so
+        # the return needs a needle drop - the same fresh-record kick
+        # the music_kick action uses. After the flag flips, so nothing
+        # in dj_skip's path still reads the station as paused.
+        if not on:
+            try:
+                _RADIO["fast_skip"] = True
+                dj_skip()
+            except Exception:  # noqa: BLE001
+                pass
         # #1120: coming back, the talk clocks start from NOW. _LAST_SAID
         # advances during a pause (air_remember burns on roads that
         # never reach a speaker) while _LAST_PLAYOUT freezes, so on
@@ -23678,6 +23686,18 @@ def radio_pause_set(on: bool) -> bool:
         if on:
             try:
                 fire_and_forget(stop_speaking())
+            except Exception:  # noqa: BLE001
+                pass
+            # #1138: "I pause the radio. Playback needs to stop
+            # immediately." The #1127 rule left the record spinning
+            # through a pause; the operator has now said the opposite -
+            # a paused radio is a SILENT radio. The box stream is
+            # stopped at once; the page and app players stop off the
+            # clock (radio_clock_api reports playing=false while
+            # paused, and every follower pauses on it).
+            try:
+                if (_RADIO.get("music_to") or "here") in ("box", "both"):
+                    fire_and_forget(music_box_stop_now())
             except Exception:  # noqa: BLE001
                 pass
         try:
@@ -68598,7 +68618,11 @@ async def radio_clock_api(
         "server_ms": int(time.time() * 1000),
         "started_ms": int(float(_RADIO.get("started") or 0) * 1000),
         "on": bool(_RADIO.get("on")),
-        "playing": bool(track),
+        # #1138: a paused radio is a SILENT radio now. Every player in
+        # the house follows this clock, so "not playing" here is what
+        # stops the page, the app shell and the tune page at once.
+        "playing": bool(track) and not radio_paused(),
+        "paused": radio_paused(),
         "id": tid,
         "title": str(track.get("title") or ""),
         "seconds": float(track.get("seconds") or 0),
@@ -71244,13 +71268,14 @@ async def station_intent_reply(intent: str, said: str) -> str:
     # "cache the broadcast" - and answers with the bank on the way back.
     if intent == "pause":
         if radio_paused():
-            return ("The broadcast is already paused - the records are "
-                    "playing and the booth is banking. Say resume the "
-                    "radio when you want the show back.")
+            return ("The broadcast is already paused and silent - the "
+                    "booth is banking. Say resume the radio when you "
+                    "want the show back.")
         radio_pause_set(True)
-        return ("Going off air. The records keep playing, the booth "
-                "keeps recording and tinting, and everything it makes "
-                "is cached for when you bring the broadcast back.")
+        # #1138: playback stops with the pause now - say so.
+        return ("Going off air - playback stops now. The booth keeps "
+                "recording and tinting, and everything it makes is "
+                "cached for when you bring the broadcast back.")
     if intent == "unpause":
         if not radio_paused():
             return "The broadcast is already on air."
@@ -103630,6 +103655,15 @@ function djResync(clock) {
   if (djPinned && djPinned !== clock.id) return;   // a hand-picked record
   const player = document.getElementById("musicPlayer");
   if (!player) return;
+  /* #1138: a paused radio is silent HERE too. The clock says paused,
+   * this page stops the record now rather than letting the loaded track
+   * play itself out; djLastTrack clears so the resume re-joins cleanly. */
+  if (clock.paused) {
+    if (!player.paused) player.pause();
+    djLastTrack = "";
+    radioFollowing = false;
+    return;
+  }
   const age = djStateAt ? (Date.now() - djStateAt) / 1000 : 0;
   let target = (clock.server_ms - clock.started_ms) / 1000 + age;
   if (!isFinite(target) || target < 0) target = 0;
@@ -126001,7 +126035,10 @@ async function clockPoll() {
     const c = await api("/api/radio/clock?listener=" + ME);
     stateAt = Date.now();
     pineSoloGate(c);                                        // #1008
-    if (c.playing && c.url) {
+    /* #1138: the station is paused - this listener goes quiet with it. */
+    if (c.paused) {
+      if (audio && !audio.paused) audio.pause();
+    } else if (c.playing && c.url) {
       retime({id: c.id, url: c.url}, c.server_ms, c.started_ms, c.seconds);
     }
   } catch (error) { /* the show goes on */ }
