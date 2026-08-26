@@ -911,6 +911,15 @@ function syncDesktopRadio(clock) {
     mutedNoteAt = Date.now();
     noteRouteError("App volume is at 0 — slide it up to hear the music");
   }
+  /* #1143: do not re-seek a record that is merely buffering — same guard
+   * as the page followers (#998). While the element is starved,
+   * currentTime freezes and target runs on; the hard seek below would
+   * discard the buffer, re-issue the range and starve it again, heard
+   * as the record jumping back and repeating itself. */
+  if (player.readyState < 3) {
+    if (player.playbackRate !== 1) player.playbackRate = 1;
+    return;
+  }
   const drift = player.currentTime - target;
   if (Math.abs(drift) > 3.5) {
     player.currentTime = Math.max(0, target);

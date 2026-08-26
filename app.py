@@ -103934,6 +103934,17 @@ function djResync(clock) {
   }
   radioFollowing = true;
   if (player.paused && !player.ended) playOrPrompt(player);   // #735
+  /* #1143: DO NOT RE-SEEK A RECORD THAT IS MERELY BUFFERING. The #998
+   * guard went into the tune page's follower and never into this one,
+   * so any stall here still fed the loop it documents: currentTime
+   * freezes while target runs, drift crosses 3.5 within seconds, and
+   * the hard seek below throws away the buffer and re-issues the range
+   * — which starves it again. Heard as the record jumping back and
+   * playing the same stretch in repeats. */
+  if (player.readyState < 3) {
+    if (player.playbackRate !== 1) player.playbackRate = 1;
+    return;
+  }
   const drift = player.currentTime - target;
   if (Math.abs(drift) > 3.5) {
     player.currentTime = Math.max(0, target);
