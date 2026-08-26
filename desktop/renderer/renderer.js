@@ -1411,11 +1411,32 @@ async function airPauseState() {
   try { airPaintBtn(await api.get("/api/radio/pause")); } catch (err) { /* later */ }
 }
 
+/* #1144: reach into the embedded pages and act NOW, on the click itself.
+ * The webviews only learn about a pause or an FM off from their next
+ * clock poll, up to a second and a half later - and the booth's voice
+ * elements never learned at all. The bridge closes that gap; the polls
+ * remain the reconciler if a frame missed the call. */
+function pineFramesRun(code) {
+  ["controlFrame", "radioFrame"].forEach((id) => {
+    const frame = $(id);
+    if (frame && frame.src && typeof frame.executeJavaScript === "function") {
+      frame.executeJavaScript(code).catch(() => {});
+    }
+  });
+}
+
 async function airPauseToggle() {
   const b = document.getElementById("airPauseBtn");
   if (b) b.disabled = true;
+  const want = !airPausedNow;
+  // #1144: silence (or resume) the instant of the press - the shell's own
+  // player and both embedded pages - then make it true on the server.
+  const shellPlayer = $("desktopRadioPlayer");
+  if (want && shellPlayer && !shellPlayer.paused) shellPlayer.pause();
+  pineFramesRun("typeof pineAirPause === 'function' && pineAirPause("
+    + (want ? "true" : "false") + ")");
   try {
-    airPaintBtn(await api.post("/api/radio/pause", {paused: !airPausedNow}));
+    airPaintBtn(await api.post("/api/radio/pause", {paused: want}));
   } catch (err) {
     noteRouteError(err.message);
   } finally {
@@ -1425,6 +1446,14 @@ async function airPauseToggle() {
 
 async function setFm(on) {
   setFmUi(on);
+  // #1144: OFF means silence on the click, not at the end of the record.
+  // The panel's own FM switch has always stopped its page immediately
+  // (djPower); the app's switch now does the same through the bridge.
+  if (!on) {
+    const shellPlayer = $("desktopRadioPlayer");
+    if (shellPlayer && !shellPlayer.paused) shellPlayer.pause();
+    pineFramesRun("typeof pineFmOff === 'function' && pineFmOff()");
+  }
   try {
     await api.post(on ? "/api/dj/start" : "/api/dj/stop", {});
     await pollDesktopRadio();

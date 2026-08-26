@@ -103897,8 +103897,71 @@ let djStateAt = 0;
 let djLastClockId = "";
 let radioFollowing = false;
 
+/* #1144: "when I pause the FM station, make sure that it is paused
+ * immediately." #1138 stopped the RECORD on pause, but the booth is a
+ * separate road: the two voice elements and their queue kept talking,
+ * and a coalesced round can carry minutes of speech past the button.
+ * This silences the record AND the booth in one move. The app shell
+ * calls it on the button press itself, so the silence does not wait
+ * for the next clock poll; the clock's paused flag reconciles every
+ * follower within a poll either way. A held line resumes where it
+ * stopped when the pause lifts — pausing is not deleting. */
+let pineAirPaused = false;
+function pineAirPause(on) {
+  pineAirPaused = !!on;
+  const player = document.getElementById("musicPlayer");
+  if (on) {
+    if (player && !player.paused) player.pause();
+    djLastTrack = "";
+    radioFollowing = false;
+    (djVoiceEls || []).forEach((a) => {
+      if (a && !a.paused && !a.ended && a.currentTime > 0) {
+        try { a.pause(); a.dataset.pineHeld = "1"; } catch (e) {}
+      }
+    });
+  } else {
+    let resumed = 0;
+    (djVoiceEls || []).forEach((a) => {
+      if (a && a.dataset.pineHeld === "1") {
+        a.dataset.pineHeld = "";
+        if (!a.ended && a.src) { resumed += 1; a.play().catch(() => {}); }
+      }
+    });
+    if (!resumed) { try { djVoiceNext(); } catch (e) {} }
+  }
+}
+
+/* #1144: the app's FM switch, arriving over the shell bridge. The panel's
+ * own switch (djPower) has always silenced this page on the click; the
+ * app's switch had no local half at all, so the record and the booth
+ * played on until the next poll or the end of the line. Same silence,
+ * minus the pause bookkeeping — off is off, nothing is held for later. */
+function pineFmOff() {
+  musicRadioOn = false;
+  const player = document.getElementById("musicPlayer");
+  if (player) player.pause();
+  djLastTrack = "";
+  radioFollowing = false;
+  djVoiceQueue.length = 0;
+  (djVoiceEls || []).forEach((a) => { if (a) { a.pause(); a.src = ""; } });
+  djVoiceLive = 0;
+  djVoiceBusy = false;
+  djSpeaking = false;
+  try { djApplyGain(); } catch (e) {}
+}
+
 function djResync(clock) {
   if (!clock || !clock.id || !clock.url || (!clock.on && !clock.playing)) {
+    /* #1144: FM OFF stops the record here too. This branch used to stop
+     * FOLLOWING and let the loaded track play itself out — "turn off the
+     * radio means OFF" (#1139) never reached the page player. Only a
+     * record we were following is touched: a track the operator queued
+     * themselves is the page being its own, and stays theirs. */
+    if (radioFollowing) {
+      const p = document.getElementById("musicPlayer");
+      if (p && !p.paused) p.pause();
+      djLastTrack = "";
+    }
     radioFollowing = false;      // nothing to follow; the page is its own
     return;
   }
@@ -103910,13 +103973,13 @@ function djResync(clock) {
   if (!player) return;
   /* #1138: a paused radio is silent HERE too. The clock says paused,
    * this page stops the record now rather than letting the loaded track
-   * play itself out; djLastTrack clears so the resume re-joins cleanly. */
+   * play itself out; djLastTrack clears so the resume re-joins cleanly.
+   * #1144: the booth goes silent with it, through the same one door. */
   if (clock.paused) {
-    if (!player.paused) player.pause();
-    djLastTrack = "";
-    radioFollowing = false;
+    if (!pineAirPaused) pineAirPause(true);
     return;
   }
+  if (pineAirPaused) pineAirPause(false);   // the pause lifted (#1144)
   const age = djStateAt ? (Date.now() - djStateAt) / 1000 : 0;
   let target = (clock.server_ms - clock.started_ms) / 1000 + age;
   if (!isFinite(target) || target < 0) target = 0;
@@ -105141,6 +105204,11 @@ function djVoiceNext() {
   // A recording is playing in the cache popup and the mute switch is on:
   // hold the live talk (queue intact) so the DJs don't overlap the episode.
   if (window.cacheHold) return;
+  /* #1144: a paused station starts nothing. A held line finishing at the
+   * exact moment of the pause would otherwise chain the next clip into
+   * the silence; the queue stands intact and pineAirPause(false) kicks
+   * this chain again when the pause lifts. */
+  if (pineAirPaused) return;
   if (djVoiceBusy) return;
   const clip = djVoiceQueue.shift();
   if (!clip) {
@@ -105414,10 +105482,13 @@ async function djGo() {
  * writing desk, the recording room and the crystal keep working, and
  * everything they make is banked. An hour off air is roughly 1,500
  * seconds of finished audio put away rather than eaten. */
+let airPausedPaint = false;      // the last paused state this page saw (#1144)
+
 async function airPaint(got) {
   const b = document.getElementById("pauseAir");
   if (!b || !got) return;
   const off = !!got.paused;
+  airPausedPaint = off;
   const mins = Math.round((got.for_seconds || 0) / 60);
   const banked = Math.round((got.banked_seconds || 0) / 60);
   b.textContent = off
@@ -105441,10 +105512,16 @@ async function airPauseState() {
 async function airPause() {
   const b = document.getElementById("pauseAir");
   if (b) b.disabled = true;
+  /* #1144: the ear first. This is a toggle, so the direction is whatever
+   * the button was showing; the silence (or the resume) lands on the
+   * click, the POST makes it true on the server, and the reply — or the
+   * next clock poll — corrects this page if they ever disagree. */
+  try { pineAirPause(!airPausedPaint); } catch (e) {}
   try {
     const got = await api("/api/radio/pause", {method: "POST",
                                                body: JSON.stringify({})});
     airPaint(got);
+    if (!!got.paused !== pineAirPaused) pineAirPause(!!got.paused);
     setStatus(got.say || "");
   } catch (error) {
     setStatus(error.message, true);
