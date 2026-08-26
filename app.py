@@ -9693,6 +9693,26 @@ def box_depth() -> float:
         return 0.0
 
 
+# #1142: readiness sweeps run per row from every polling surface, and each
+# key used to cost a Path.exists() against a 4,500-file directory — measured
+# (py-spy, while /healthz sat deaf) as one of the stalls that starved the
+# event loop until the host watchdog restarted the station. One scandir
+# snapshot answers the same question for every key in the sweep.
+_VOICE_MEDIA_SNAP: dict[str, Any] = {"at": 0.0, "names": frozenset()}
+
+
+def _voice_media_names() -> frozenset:
+    now = time.time()
+    if now - float(_VOICE_MEDIA_SNAP["at"]) < 5.0:
+        return _VOICE_MEDIA_SNAP["names"]
+    try:
+        names = frozenset(e.name for e in os.scandir(VOICE_MEDIA_DIR))
+    except OSError:
+        names = frozenset()
+    _VOICE_MEDIA_SNAP.update({"at": now, "names": names})
+    return names
+
+
 def _pantry_key_ready(key: str) -> bool:
     """A referenced take still exists, without mutating its use counter.
 
@@ -9709,7 +9729,7 @@ def _pantry_key_ready(key: str) -> bool:
         clip = row.get("clip") or {}
         name = str(clip.get("path") or "").rsplit("/", 1)[-1]
         name = name.split("?", 1)[0]
-        return bool(name and (VOICE_MEDIA_DIR / name).exists())
+        return bool(name and name in _voice_media_names())
     except Exception:  # noqa: BLE001
         return False
 
@@ -9875,8 +9895,27 @@ def pantry_spoken_for() -> set[str]:
     return held
 
 
+# #1142: this full-cupboard walk is asked for by every polling surface —
+# dj_state, the pause button's state, surplus_depth, the preparer — several
+# times a second between them. The verdicts move on the pace of renders and
+# airings, not polls; a five-second memory serves every surface the same
+# numbers and returns the event loop to the show. pantry_spoken_for stays
+# uncached on purpose: horizon cleanup deletes off that answer.
+_PANTRY_READY_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
 def pantry_ready_for() -> set[str]:
     """Pantry keys attached to zero-work-to-air dialogue only."""
+    _now = time.time()
+    if (_PANTRY_READY_MEMO["value"] is not None
+            and _now - float(_PANTRY_READY_MEMO["at"]) < 5.0):
+        return _PANTRY_READY_MEMO["value"]
+    ready = _pantry_ready_for_now()
+    _PANTRY_READY_MEMO.update({"at": _now, "value": ready})
+    return ready
+
+
+def _pantry_ready_for_now() -> set[str]:
     ready: set[str] = set()
     try:
         for kind, rows in _SHELF.items():
@@ -11054,9 +11093,19 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
     return None
 
 
+# #1142: asked for by hour_shortfall/hour_owes/slot_needs from every panel
+# poll and every preparer pass at once — the same three-second memory the
+# other readiness aggregates keep, for the same event-loop reason.
+_PREPARED_KIND_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
 def prepared_by_kind() -> dict[str, int]:
     """What is standing by, BY CONTENT TYPE — the answer to "what have we
     actually got ready", which one depth number never gave."""
+    _now = time.time()
+    if (_PREPARED_KIND_MEMO["value"] is not None
+            and _now - float(_PREPARED_KIND_MEMO["at"]) < 3.0):
+        return dict(_PREPARED_KIND_MEMO["value"])
     out: dict[str, int] = {
         "banter": sum(1 for e in _LARDER
                       if dialogue_row_ready("banter", e))}
@@ -11069,6 +11118,7 @@ def prepared_by_kind() -> dict[str, int]:
     out["track_talk"] = sum(
         1 for record in _TRACK_TALK.values()
         if track_talk_pair_ready(record))
+    _PREPARED_KIND_MEMO.update({"at": _now, "value": dict(out)})
     return out
 
 
@@ -20287,8 +20337,18 @@ def larder_fresh() -> float:
         return float(_LARDER_FRESH)
 
 
+# #1142: the signature only moves when the operator moves a dial (settings,
+# crystal, plot) — computing it per shelf row per poll (json.dumps plus the
+# crystal and plot lookups every time) was a measured event-loop stall. A
+# three-second memory keeps a dial change effectively immediate.
+_LARDER_SIG_MEMO: dict[str, Any] = {"at": 0.0, "value": ""}
+
+
 def _larder_profile_signature() -> str:
     """Writing settings that determine whether a prewritten round is usable."""
+    _now = time.time()
+    if _now - float(_LARDER_SIG_MEMO["at"]) < 3.0:
+        return _LARDER_SIG_MEMO["value"]
     dj = dj_settings()
     profile = {
         "reply": int(dj.get("reply_max_chars") or 0),
@@ -20329,7 +20389,9 @@ def _larder_profile_signature() -> str:
                             int(plot_act_now(_plot)[1])] if _plot else [])
     except Exception:  # noqa: BLE001
         profile["plot"] = []
-    return json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    made = json.dumps(profile, sort_keys=True, separators=(",", ":"))
+    _LARDER_SIG_MEMO.update({"at": _now, "value": made})
+    return made
 
 
 def _larder_current(entry: dict[str, Any]) -> bool:
@@ -51095,13 +51157,28 @@ def call_script_text(script: Any) -> str:
     return str(script or "")
 
 
+# #1142: call_entry_contract re-verifies the fingerprint on every readiness
+# sweep, from every polling surface — two regex passes and a sha256 over the
+# whole script per caller row, measured (py-spy) grinding the event loop
+# while /healthz sat deaf. The text is the entire identity, so the digest is
+# memoized on it; the stored-vs-recomputed comparison keeps its meaning.
+_CALL_FP_MEMO: dict[int, tuple[str, str]] = {}
+
+
 def call_fingerprint(script: Any) -> str:
     """Exact-dialogue identity, insensitive to labels and punctuation."""
-    flat = re.sub(r"(?:^|\s)[ABCDE]\s*:\s*", " ",
-                  call_script_text(script), flags=re.I)
+    text = call_script_text(script)
+    hit = _CALL_FP_MEMO.get(hash(text))
+    if hit is not None and hit[0] == text:
+        return hit[1]
+    flat = re.sub(r"(?:^|\s)[ABCDE]\s*:\s*", " ", text, flags=re.I)
     flat = re.sub(r"[^a-z0-9']+", " ", flat.lower())
     flat = " ".join(flat.split())
-    return hashlib.sha256(flat.encode("utf-8")).hexdigest() if flat else ""
+    made = hashlib.sha256(flat.encode("utf-8")).hexdigest() if flat else ""
+    if len(_CALL_FP_MEMO) > 512:
+        _CALL_FP_MEMO.clear()
+    _CALL_FP_MEMO[hash(text)] = (text, made)
+    return made
 
 
 def _call_novelty_terms(script: Any) -> list[str]:
