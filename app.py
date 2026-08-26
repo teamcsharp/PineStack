@@ -10121,7 +10121,13 @@ def box_rate_now(rate: float) -> float:
 # seconds. A four-minute call plus its ring and its hang-up needs the
 # room, and losing the last ten seconds of a call is losing the whole
 # point of it.
-SEGMENT_LIVELY_CEILING = 720.0
+# #1146: raised 720 -> 1500. The 720 was sized when a round APPENDED its
+# audio and returned in seconds; the pacing pass now keeps the task
+# alive for build time PLUS real airtime (a 36-line round is ~15 minutes
+# of engine alone), so a healthy paced call crossed the old ceiling
+# mid-sentence. 1500 matches FLOOR_STALE_SECONDS, so a genuinely stuck
+# round loses its watchdog immunity and its task in the same breath.
+SEGMENT_LIVELY_CEILING = 1500.0
 PANTRY_BURN_SECONDS = float(os.getenv("PANTRY_BURN_SECONDS", "86400"))
 # #1052: how long a REPEAT is kept - the pre-rolled stock that buys the
 # writing room. Deliberately far longer than the staleness ceiling for
@@ -13802,6 +13808,109 @@ _ANNOUNCE_LOCK = asyncio.Lock()
 _ANNOUNCE_LAST: dict[str, Any] = {"error": ""}
 # The announce circuit breaker (#394): two hangs in a row = down for 90s.
 _BOX_DOWN: dict[str, float] = {"until": 0.0, "fails": 0}
+
+# #1146: THE FLOOR - the round-level speak gate the station never had.
+#
+# _ANNOUNCE_LOCK serialises CLIPS; nothing ever serialised CONVERSATIONS.
+# Between one burst of a round and the next, the announce lock is free,
+# and every other producer - a second call, a silence cover, the hold
+# shelf's drain - walked straight into the gap. Measured on the live
+# station (2026-08-26, 15:23): three phone calls' lines interleaved
+# nearly one-for-one on air, a caller's hello sounding the same second as
+# the previous caller's hello, the "your call is ringing" line airing
+# AFTER the cohost had already greeted the caller. People stop making
+# sense when their lines shuffle; this is the mechanism that stops it.
+#
+# One task holds the floor for one whole round. Re-entrant per task, so
+# the turn-by-turn recovery inside speak_turns can call dj_speak without
+# deadlocking itself. Assistant replies and operator-fired lines
+# deliberately do NOT take it - a person outranks the show (#206).
+_FLOOR_LOCK = asyncio.Lock()
+_FLOOR_OWNER: dict[str, Any] = {"task": None, "at": 0.0, "label": ""}
+
+
+async def _floor_take(label: str = "") -> bool:
+    """Hold the air for one round. Returns whether THIS frame took it -
+    hand that to _floor_drop, so a re-entrant inner call never releases
+    its outer round's hold."""
+    cur = asyncio.current_task()
+    if _FLOOR_OWNER.get("task") is cur:
+        return False
+    await _FLOOR_LOCK.acquire()
+    _FLOOR_OWNER.update({"task": cur, "at": time.time(),
+                         "label": str(label)[:120]})
+    return True
+
+
+def _floor_drop(owned: bool) -> None:
+    if not owned:
+        return
+    _FLOOR_OWNER.update({"task": None, "at": 0.0, "label": ""})
+    # The quiet clock starts from the moment the floor frees, not from
+    # the last per-line announce - otherwise the cover watchdog reads a
+    # whole coalesced round as one long silence and speaks straight over
+    # the next one.
+    try:
+        _SPOKE_AT[0] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+    if _FLOOR_LOCK.locked():
+        _FLOOR_LOCK.release()
+
+
+# #1146 review: a wedged round must not blind the watchdogs forever.
+# Past this, _floor_busy() stops answering True - the lock itself stays
+# held (only the owner's finally may release it), but the covers, the
+# drains and the dead-air watch re-arm, and the #960 reaper (whose
+# lively ceiling matches this number) is free to cancel the stuck task,
+# whose finally then frees the lock for real. Sized for the slowest
+# HEALTHY round: a 36-line banter round is ~15 minutes of engine.
+FLOOR_STALE_SECONDS = 1500.0
+
+
+def _floor_busy() -> bool:
+    """Somebody is mid-conversation on the air - and provably alive."""
+    if not _FLOOR_LOCK.locked():
+        return False
+    held = time.time() - float(_FLOOR_OWNER.get("at") or 0)
+    return held < FLOOR_STALE_SECONDS
+
+
+# #1146 review: how far ahead of its own air moment a paced burst may be
+# ANNOUNCED. The clip carries its true broadcast instant either way; the
+# early window exists so a remote listener has more than the seven-second
+# lead to pull a multi-megabyte burst WAV down a slow link - the exact
+# complaint #998 documents. Air time stays exact; only the download
+# window widens.
+PAGED_ANNOUNCE_EARLY = 38.0
+
+
+async def _paged_settle(until: float) -> None:
+    """#1146: the page road pays for its airtime before the floor frees.
+
+    A fully-banked round used to hit the page feed at append speed - a
+    116-second call 'aired' in nine seconds, the task returned, the quota
+    stamped, and the next call launched while the last one had barely
+    begun to sound (three calls in ninety seconds, measured live). This
+    sleep runs only while audio ALREADY delivered is still provably
+    playing, so it cannot add a moment of dead air - #776's scar stands.
+    It loops to its deadline in short steps and stands down the moment
+    the station pauses: a paused station has nobody listening, and
+    holding the floor against phantom playback would only delay the
+    resume."""
+    try:
+        lead = VOICE_BROADCAST_LEAD_MS / 1000.0
+    except Exception:  # noqa: BLE001
+        lead = 7.0
+    slept = 0.0
+    wait = float(until or 0) - lead - time.time()
+    while wait > 0 and slept < 600.0:
+        if radio_paused():
+            return
+        step = min(wait, 5.0)
+        await asyncio.sleep(step)
+        slept += step
+        wait = float(until or 0) - lead - time.time()
 
 # The delivery meter (#423): how much of each clip the box actually
 # carried. HA's announce returns when playback finishes, so a 20-second
@@ -17576,6 +17685,38 @@ async def dj_speak(kind: str, track: dict[str, Any] | None = None,
                    clip: dict[str, Any] | None = None,
                    sting: bool = True, note: str = "",
                    checked: bool = False) -> str:
+    """#1146: the floor door for single lines. A cover, a news line or an
+    interjection waits for the round that has the air instead of landing
+    in the middle of it. Re-entrant: the recovery road inside a round is
+    the same task and passes straight through. A reply or an
+    operator-fired line skips the wait - a person outranks the show
+    (#206)."""
+    if kind == "reply" or by_hand:
+        return await _dj_speak_floorless(
+            kind, track, extra=extra, line=line, who=who, voice=voice,
+            source=source, by_hand=by_hand, fx=fx, name=name,
+            source_text=source_text, clip=clip, sting=sting, note=note,
+            checked=checked)
+    _owned = await _floor_take(f"a {kind} line from {who}")
+    try:
+        return await _dj_speak_floorless(
+            kind, track, extra=extra, line=line, who=who, voice=voice,
+            source=source, by_hand=by_hand, fx=fx, name=name,
+            source_text=source_text, clip=clip, sting=sting, note=note,
+            checked=checked)
+    finally:
+        _floor_drop(_owned)
+
+
+async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
+                   extra: str = "", line: str = "",
+                   who: str = "dj", voice: str | None = None,
+                   source: str = "", by_hand: bool = False,
+                   fx: dict[str, float] | None = None,
+                   name: str = "", source_text: str = "",
+                   clip: dict[str, Any] | None = None,
+                   sting: bool = True, note: str = "",
+                   checked: bool = False) -> str:
     """Say it, log it to the chat channel so the panel can show the patter.
     `who` is "dj" or "cohost" — the co-host has his own voice so the two are
     told apart by ear, not only by the transcript. `source` is the speakbox
@@ -19452,6 +19593,7 @@ async def _dj_loop() -> None:
                     over = time.time() - float(
                         _RADIO.get("record_over_at") or time.time())
                     lively = (_SPEAKING[0] > 0
+                              or _floor_busy()                  # #1146
                               or time.time() - _LAST_SYNTH[0] < 120
                               or time.time() - _SPOKE_AT[0] < 25)
                     # #960: THE FIVE MINUTES IS NOT UNCONDITIONAL ANY
@@ -20215,8 +20357,14 @@ async def box_hold_watch() -> None:
                 continue
             if await satellite_busy():
                 continue
-            if _ANNOUNCE_LOCK.locked():
-                continue                # the live show has the floor
+            if _ANNOUNCE_LOCK.locked() or _floor_busy():    # #1146
+                continue                # the live show has the floor -
+                                        # including the render gap BETWEEN
+                                        # two bursts of one round, where
+                                        # the announce lock is briefly
+                                        # free and this drain used to
+                                        # inject twelve old clips into
+                                        # the middle of a conversation
             first = _BOX_HOLD[0]
             # #805: a drain against an UNAVAILABLE satellite is a hammer,
             # not a delivery — 237 play attempts hit a missing player in
@@ -21167,6 +21315,53 @@ def _tint_paper(got: dict[str, Any], later: bool = False) -> dict[str, Any]:
             "later": bool(later)}
 
 
+# #1146: how many completed-but-rejected tints one call may survive before
+# the row is genuinely retired. Each strike reverts to the graded plain
+# words and carries the faults forward as a lesson for the next pass.
+CALL_TINT_STRIKES_MOST = 3
+
+
+def _call_tint_strike(entry: dict[str, Any],
+                      faults: list[str]) -> dict[str, Any]:
+    """#1146: strike a failed tint and stand the plain call back up.
+
+    A completed tint that failed the phone contract used to be a death
+    sentence for the whole row - roughly 273 seconds of build for zero air
+    (#1141's arithmetic). The failure is the REWRITE's, not the call's:
+    drop the tinted version, restore the plain words, regrade them so the
+    contract binds to what would actually air, and carry the graded faults
+    forward in `tint_lesson` so the next pass knows what killed the last
+    one. The row becomes 'waiting for tint' - exactly the resumable state
+    retire_rejected_call_entry's own docstring calls useful work."""
+    plain = str(entry.get("script_plain") or "").strip()
+    if not plain:
+        return {"ok": False, "faults": ["no plain version to fall back on"]}
+    _dialogue_audio_drop(entry)
+    entry["script"] = plain
+    entry["use"] = "plain"
+    entry.pop("script_tinted", None)
+    entry.pop("tint_progress", None)
+    entry.pop("brief", None)            # it graded the struck version
+    entry["tint_fails"] = int(entry.get("tint_fails") or 0) + 1
+    # Review: a struck row must REST like any other failed rewrite. The
+    # #1119/#1122 TINT_RETRY_REST gates read tint_tried; without this
+    # stamp the keeper re-ran the most expensive loop on the station
+    # (8-16 minutes a round) on its very next pass, back to back, until
+    # the strike cap retired the call.
+    entry["tint_tried"] = time.time()
+    entry["tint_lesson"] = (
+        "; ".join(str(f) for f in (faults or []))[:400]
+        + ". Keep every proper name, number, question mark and spoken "
+          "sign-off, and keep each turn's concrete subject words while "
+          "restyling around them.")
+    _regrade = globals().get("call_entry_regrade")
+    if not callable(_regrade):
+        return {"ok": False, "faults": ["the call contract is unavailable"]}
+    report = _regrade(entry)
+    entry["off_brief"] = not bool(report.get("ok"))
+    return report
+
+
 async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                               critical: bool = True) -> bool:
     """Finish and activate the second pass before a conversation is voiced."""
@@ -21216,6 +21411,10 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                         "call", "the activated tint failed the final phone "
                         "contract and will not be recorded",
                         extra="; ".join(report.get("faults") or [])[:1000])
+                else:
+                    # #1146: the lesson worked; it must not haunt later
+                    # passes with faults that are already fixed.
+                    entry.pop("tint_lesson", None)
             if changed:
                 _pantry_save(True)
                 _larder_save()
@@ -21235,7 +21434,9 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
         got = await crystal_tint(
             plain, str(kind or entry.get("prep_kind") or "banter"),
             protected, progress=entry.get("tint_progress"),
-            critical=critical)
+            critical=critical,
+            # #1146: a struck attempt's graded faults ride the retry.
+            lesson=str(entry.get("tint_lesson") or ""))
         entry["tint"] = _tint_paper(got, later=bool(entry.get("at")))
         progress = dict(got.get("progress") or {})
         if progress:
@@ -21274,6 +21475,8 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                     "call", "the completed tint failed the final phone "
                     "contract and will not be recorded",
                     extra="; ".join(report.get("faults") or [])[:1000])
+            else:
+                entry.pop("tint_lesson", None)      # #1146: lesson learned
         _pantry_save(True)
         _larder_save()
         return call_ok
@@ -21352,6 +21555,27 @@ def retire_rejected_call_entry(entry: dict[str, Any]) -> bool:
         if (not tinted or active != tinted
                 or not isinstance(quality, dict) or quality.get("ok")):
             return False
+        # #1146: STRIKE-AND-RETRY BEFORE THE AXE. Up to
+        # CALL_TINT_STRIKES_MOST completed-but-failed tints are the
+        # crystal's fault, not the call's: revert to the plain words
+        # (regraded, so the contract binds to what would air), carry the
+        # graded faults as a lesson into the next pass, and keep the row.
+        # Only a call that keeps failing - or whose plain version no
+        # longer passes its own contract - is actually retired.
+        if int(entry.get("tint_fails") or 0) < CALL_TINT_STRIKES_MOST:
+            _report = _call_tint_strike(
+                entry, list(quality.get("faults") or []))
+            if _report.get("ok"):
+                _pantry_save(True)
+                _larder_save()
+                pipeline_log(
+                    "call", "the failed tint was struck and the plain call "
+                    "stands - the next pass carries the graded faults as "
+                    "a lesson (#1146)",
+                    extra="; ".join(
+                        [str(f) for f in (quality.get("faults") or [])]
+                        [:6])[:400])
+                return False
         removed: list[dict[str, Any]] = []
         kept: list[dict[str, Any]] = []
         for row in list(_SHELF.get("caller") or []):
@@ -22067,6 +22291,21 @@ async def prep_round(kind: str) -> bool:
         return False
     shelf_put(kind, {"entry": entry,
                      "seconds": float(entry.get("seconds") or 0)})
+    if kind == "manager":
+        # #1146: every memo the road writes lands in the memo book the
+        # moment it is banked - the shelf may burn it later; the book
+        # keeps it. Off the event loop (a whole-file rewrite on an SMB
+        # share - the #1142 lesson), and the row remembers its book id
+        # so the tinted version that eventually AIRS updates this entry
+        # instead of filing a twin.
+        try:
+            _mrow = await asyncio.to_thread(
+                manager_memo_save, str(entry.get("script") or ""),
+                "banked")
+            if _mrow:
+                entry["memo_id"] = str(_mrow.get("id") or "")
+        except Exception:  # noqa: BLE001
+            pass
     # Say plainly what is genuinely zero-work-to-air. Caller voices and their
     # phone rack are bound on the entry, so every side of a call can now be
     # recorded ahead; a partially tinted or recorded row is retained for its
@@ -23730,6 +23969,15 @@ def radio_pause_set(on: bool) -> bool:
                     _sched_pos_save()
             except Exception:  # noqa: BLE001
                 pass
+            # #1146: resume is a FRESH START on the voice feed too. #1138
+            # drops a fresh record on resume; the page feed used to hand
+            # every clip banked before the pause to the first poll after
+            # it, where the player dropped them one by one for being
+            # hours "late" - a resume that opened with a graveyard of
+            # stale conversation. The clips stay in the list for the
+            # booth's history (#1117); they are simply never OFFERED to a
+            # player again.
+            _RADIO["voice_cut_ms"] = int(now * 1000)
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = now if on else 0.0
         # #1138: the record was stopped the moment the pause began, so
@@ -29352,7 +29600,11 @@ def air_last_heard() -> float:
     except Exception:  # noqa: BLE001
         pass
     try:
-        if _SPEAKING[0]:
+        # #1146: a round holding the floor IS somebody talking, even in
+        # the render gap between two of its bursts - the cover watchdog
+        # used to read that gap as a 106-second silence and speak into
+        # the middle of a live conversation.
+        if _SPEAKING[0] or _floor_busy():
             best = now
         else:
             best = max(best, float(_LAST_SYNTH[0] or 0))
@@ -30576,7 +30828,8 @@ async def coord_fill_gap() -> bool:
             return False                # a breath, not a hole
         if time.time() - _COORD_SPOT_AT[0] < COORD_SPOT_GAP:
             return False
-        if _SPEAKING[0] or time.time() - _LAST_SYNTH[0] < 12.0:
+        if (_SPEAKING[0] or _floor_busy()                       # #1146
+                or time.time() - _LAST_SYNTH[0] < 12.0):
             return False                # somebody is talking, or about to
         if _BOX_HOLD:
             return False                # the box is already behind
@@ -31766,7 +32019,7 @@ async def dead_air_watch() -> None:
                 "box", "both")
             if ((now_really_playing() and (_room_gets_music
                                            or not _voice_boxed))
-                    or _SPEAKING[0]
+                    or _SPEAKING[0] or _floor_busy()            # #1146
                     or time.time() - _LAST_SYNTH[0] < 45.0):
                 strikes = 0
                 heard = time.time()
@@ -37042,8 +37295,13 @@ async def schedule_hour_prompt_api(
 ALT_KINDS = ("ad", "station_id", "manager", "caller",
              "gallery", "news", "banter")
 ALT_PIN_TTL = 4.0                       # a pin read is cached this long
-ALT_GEN_MOST = 3                        # candidates per generate ticket
-ALT_GEN_WAIT = 900.0                    # how long one waits for a window
+# #1146: was 3. The operator wants memos and calls writable in real
+# batches ("stored en masse"); the ticket is operator-fired, so a higher
+# ceiling spends nothing until somebody asks for it.
+ALT_GEN_MOST = 8                        # candidates per generate ticket
+ALT_GEN_WAIT = 1800.0                   # how long one waits for a window
+                                        # (#1146: sized for 8-candidate
+                                        # tickets, not 3)
 ALT_GEN_LIVE = 3                        # tickets working at once
 ALT_PREVIEW = 240                       # characters of script in a card
 _ALT_PIN_CACHE: dict[str, Any] = {"at": 0.0, "by_slot": {}, "ids": set()}
@@ -40161,6 +40419,121 @@ def upstairs_delete(page_id: str) -> None:
             except OSError:
                 pass
         _upstairs_write([r for r in rows if r.get("id") != page_id])
+
+
+# #1146: THE MEMO BOOK. The operator reads the manager's memos for fun and
+# asked for them "stored en masse" - so every memo the quota road writes or
+# airs is kept here for good, the way the intercom keeps its pages (#749).
+# The shelf stays working inventory (it is consumed, recast and burned);
+# this is the archive that road never had: banked memos land at write time,
+# live ones as they air, and airing a banked one stamps the original's
+# ledger instead of writing a twin.
+MANAGER_MEMOS_PATH = data_path("manager_memos.json")
+_MANAGER_MEMOS_LOCK = RLock()
+MANAGER_MEMOS_KEEP = 1000
+
+
+def _manager_memo_print(text: str) -> str:
+    """Marker/punctuation-insensitive identity for one memo's dialogue.
+
+    A banked script says "A: ..."; the same memo aired live says
+    "dj: ..." - both label shapes are shed so the aired twin stamps the
+    banked original's ledger instead of writing a second row."""
+    flat = re.sub(r"^[a-z0-9_' ]{1,20}:\s*", "",
+                  str(text or "").lower(), flags=re.M)
+    flat = re.sub(r"[^a-z0-9']+", " ", flat)
+    return hashlib.sha1(
+        " ".join(flat.split()).encode("utf-8", "ignore")).hexdigest()
+
+
+def _manager_memos_read() -> list[dict[str, Any]] | None:
+    """The book, or None when it EXISTS but cannot be read right now.
+
+    Review: this path lives on a slow SMB share. A transient read fault
+    answered [] used to feed the next save, which then rewrote the whole
+    book as one row - the permanent archive wiped by a hiccup. None is
+    the writers' signal to stand down rather than clobber."""
+    try:
+        if not MANAGER_MEMOS_PATH.exists():
+            return []
+        rows = json.loads(MANAGER_MEMOS_PATH.read_text())
+        return [r for r in rows if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def manager_memos_list() -> list[dict[str, Any]]:
+    return _manager_memos_read() or []
+
+
+def _manager_memos_write(rows: list[dict[str, Any]]) -> None:
+    with _MANAGER_MEMOS_LOCK:
+        try:
+            MANAGER_MEMOS_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = MANAGER_MEMOS_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows[-MANAGER_MEMOS_KEEP:], indent=1)
+                           + chr(10))
+            tmp.replace(MANAGER_MEMOS_PATH)
+        except OSError:
+            pass
+
+
+def manager_memo_save(text: str, how: str = "",
+                      aired: bool = False,
+                      memo_id: str = "") -> dict[str, Any] | None:
+    """Keep one memo, once - a twin only stamps the original's ledger.
+
+    `memo_id` is the banked row's claim on its own book entry: a memo
+    banked plain and tinted later airs with DIFFERENT words, so the
+    print alone would file the aired version as a second memo. The
+    shelf row carries the id it was booked under, and airing it updates
+    that one row - words and ledger together."""
+    script = str(text or "").strip()
+    if not script:
+        return None
+    with _MANAGER_MEMOS_LOCK:
+        rows = _manager_memos_read()
+        if rows is None:
+            return None                 # never clobber an unreadable book
+        print_ = _manager_memo_print(script)
+        if memo_id:
+            for row in rows:
+                if str(row.get("id") or "") == str(memo_id):
+                    row["text"] = script[:6000]
+                    row["print"] = print_
+                    if aired:
+                        row["uses"] = int(row.get("uses") or 0) + 1
+                        row["last"] = int(time.time())
+                    _manager_memos_write(rows)
+                    return row
+        for row in rows:
+            if str(row.get("print") or "") == print_:
+                if aired:
+                    row["uses"] = int(row.get("uses") or 0) + 1
+                    row["last"] = int(time.time())
+                    _manager_memos_write(rows)
+                return row
+        entry = {"id": uuid.uuid4().hex[:12], "ts": int(time.time()),
+                 "text": script[:6000], "print": print_,
+                 "how": str(how)[:40],
+                 "uses": 1 if aired else 0,
+                 "last": int(time.time()) if aired else 0}
+        rows.append(entry)
+        _manager_memos_write(rows)
+        return entry
+
+
+def manager_memo_delete(memo_id: str) -> int | None:
+    """Remove one memo. None = book unreadable, -1 = no such memo."""
+    with _MANAGER_MEMOS_LOCK:
+        rows = _manager_memos_read()
+        if rows is None:
+            return None
+        kept = [r for r in rows if str(r.get("id")) != str(memo_id)]
+        if len(kept) == len(rows):
+            return -1
+        _manager_memos_write(kept)
+        return len(kept)
 
 
 def upstairs_context() -> str:
@@ -48744,7 +49117,7 @@ async def talk_watch() -> None:
             # very room the pause exists to bank.
             if radio_paused():
                 continue
-            if _SPEAKING[0]:
+            if _SPEAKING[0] or _floor_busy():      # #1146
                 continue                # somebody has the floor
             quiet = talk_quiet_for()
             if quiet < talk_quiet_limit():
@@ -48786,7 +49159,7 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
     Returns whether anything went out."""
     if time.time() - _COVER_AT[0] < 20:
         return False                    # a cover, not a filibuster
-    if _SPEAKING[0]:
+    if _SPEAKING[0] or _floor_busy():   # #1146
         return False                    # somebody already has the floor
     line = fresh_pool_take()
     text = str(line.get("text") or "").strip()
@@ -55659,6 +56032,52 @@ async def speak_turns(turns: list[tuple[str, str]],
                       render_stream: bool = False,
                       feel: bool = False,
                       allow_repeat: bool = False) -> list[str]:
+    """#1146: the floor door. One round holds the air from its first line
+    to its last; a second round queues behind it instead of interleaving
+    with it. The body lives in _speak_turns_floorless, unchanged - this
+    wrapper only takes and releases the floor, airtight against every
+    return path and against cancellation."""
+    if by_hand:
+        # #206/#1146: a person outranks the show. An operator-fired
+        # round ("put one on air now") does not queue behind the floor -
+        # the same exemption dj_speak gives a by-hand line.
+        return await _speak_turns_floorless(
+            turns, track, limit, vouched=vouched, source=source,
+            by_hand=by_hand, whole=whole, caller_name=caller_name,
+            caller_voice=caller_voice, caller_fx=caller_fx,
+            source_text=source_text, caller2_name=caller2_name,
+            caller2_voice=caller2_voice, render_stream=render_stream,
+            feel=feel, allow_repeat=allow_repeat)
+    _owned = await _floor_take(("a call from " + caller_name)
+                               if caller_name else "a booth round")
+    try:
+        return await _speak_turns_floorless(
+            turns, track, limit, vouched=vouched, source=source,
+            by_hand=by_hand, whole=whole, caller_name=caller_name,
+            caller_voice=caller_voice, caller_fx=caller_fx,
+            source_text=source_text, caller2_name=caller2_name,
+            caller2_voice=caller2_voice, render_stream=render_stream,
+            feel=feel, allow_repeat=allow_repeat)
+    finally:
+        _floor_drop(_owned)
+
+
+async def _speak_turns_floorless(turns: list[tuple[str, str]],
+                      track: dict[str, Any] | None, limit: int,
+                      vouched: list[str] | None = None,
+                      source: str = "", by_hand: bool = False,
+                      whole: bool = False,      # #859: a message, not a
+                                                # conversation - never cut
+
+                      caller_name: str = "",
+                      caller_voice: str = "",
+                      caller_fx: dict[str, Any] | None = None,
+                      source_text: str = "",
+                      caller2_name: str = "",
+                      caller2_voice: str = "",
+                      render_stream: bool = False,
+                      feel: bool = False,
+                      allow_repeat: bool = False) -> list[str]:
     """Put an exchange on air, turn by turn, in the two session voices.
 
     Shared by the written exchange and the generated one, so an approved bit
@@ -56080,6 +56499,9 @@ async def speak_turns(turns: list[tuple[str, str]],
     # and every press of the booth's "say this round" button.
     played_any = False
     missed: list[int] = []              # #767: scheduled, never aired
+    # #1146: the wall-clock moment the page-road audio this round has
+    # already appended will finish sounding. 0.0 until the first append.
+    _paged_until = 0.0
     if render_stream and playlist:
         # #760: NOT here. This used to be `await asyncio.gather(*premade)`,
         # which waits for every turn in the round before a single one can be
@@ -56506,14 +56928,37 @@ async def speak_turns(turns: list[tuple[str, str]],
                 stream_paged = page_carries_live(              # #1118
                     vto, to_box, box_down)
                 if stream_paged:
+                    # #1146: the page road pays for its airtime, per burst.
+                    # Appending at render speed let a banked round flood
+                    # the feed in seconds and hand the air to the next
+                    # round while this one was still sounding. The wait
+                    # below runs only while audio already appended is
+                    # still provably playing - it can never add dead air
+                    # (#776's scar stands), it only stops the stampede.
+                    # Review notes folded in: the burst is ANNOUNCED up to
+                    # PAGED_ANNOUNCE_EARLY before its air moment (the
+                    # #998 download window), carries its own honest
+                    # broadcast_ms (the client waits for it), the wait
+                    # loops in short steps, and a paused station is never
+                    # paced - its clips die to the resume cut unheard.
+                    _plead = VOICE_BROADCAST_LEAD_MS / 1000.0
+                    _pstart = max(time.time() + _plead, _paged_until)
+                    _pwait = (_pstart - _plead - PAGED_ANNOUNCE_EARLY
+                              - time.time())
+                    while _pwait > 0 and not radio_paused():
+                        await asyncio.sleep(min(_pwait, 5.0))
+                        _pwait = (_pstart - _plead - PAGED_ANNOUNCE_EARLY
+                                  - time.time())
                     _RADIO["voice_clips"].append({
                         "ts": int(time.time() * 1000),
+                        "broadcast_ms": int(_pstart * 1000),
                         "url": f"{one['path']}?t={one['sig']}",
                         "text": stream_label,
                         "voice": caller_voice or "",
                         "stream": {"length": length, "rows": rows},
                     })
                     del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+                    _paged_until = _pstart + max(0.0, float(length or 0))
                 # #748: start the server clock only when the box is the thing
                 # actually carrying the stream. Page-routed streams start their
                 # booth clock in djVoiceNext.onplaying, because a browser queue
@@ -56579,11 +57024,13 @@ async def speak_turns(turns: list[tuple[str, str]],
                             list(_call_archive_parts),
                             list(_call_archive_transcript), caller_name,
                             str(_CALL_LIVE.get("id") or "")))
+                    await _paged_settle(_paged_until)      # #1146
                     return spoken
                 if last_batch:
                     pipeline_log("drop", f"{len(missed)} scheduled turn(s) "
                                       "still owed after the final stream burst "
-                                      "- replaying them one by one")
+                                      "- handing them to the in-order tail "
+                                      "rule (#1146)")
                     break
                 continue
             # This burst could not be built. If earlier ones already went
@@ -56603,6 +57050,7 @@ async def speak_turns(turns: list[tuple[str, str]],
                     list(_call_archive_parts),
                     list(_call_archive_transcript), caller_name,
                     str(_CALL_LIVE.get("id") or "")))
+            await _paged_settle(_paged_until)              # #1146
             return spoken                # all of it aired; do not repeat it
         # concat failed — fall through to the turn-by-turn path.
 
@@ -56611,10 +57059,34 @@ async def speak_turns(turns: list[tuple[str, str]],
     # made a burst — every scheduled line lands exactly once.
     order = list(range(len(playlist)))
     recovering = bool(played_any and missed)
+    _missed_all: list[int] = []
     if recovering:
-        order = sorted({i for i in missed if 0 <= i < len(playlist)})
-        pipeline_log("drop", f"{len(order)} scheduled turn(s) never made it "
-                             "into a burst — airing them one by one (#767)")
+        # #1146 review: pay for the audio the bursts already appended
+        # BEFORE the tail airs. The tail's clips are stamped 'now'; a
+        # client still draining the burst backlog would read them as
+        # late, drop them, and the server would book lines aired that
+        # nobody heard.
+        await _paged_settle(_paged_until)
+        _missed_all = sorted({i for i in missed if 0 <= i < len(playlist)})
+        # #1146: NEVER air line i after line j>i. The old recovery replayed
+        # every missed chunk AFTER the rest of the round had gone out, so
+        # turn 3 of a conversation sounded after turn 24 and the people
+        # stopped making sense. Only the round's un-aired TAIL still
+        # follows in sequence; a mid-round hole missed its moment, and a
+        # hole reads better than a scramble.
+        _aired_ix = [i for i in range(len(playlist))
+                     if i not in set(_missed_all)]
+        _tail_from = (max(_aired_ix) + 1) if _aired_ix else 0
+        _holes = [i for i in _missed_all if i < _tail_from]
+        order = [i for i in _missed_all if i >= _tail_from]
+        if _holes:
+            pipeline_log("drop", f"{len(_holes)} mid-round turn(s) missed "
+                         "their moment and are dropped rather than re-aired "
+                         "out of order (#1146)")
+        if order:
+            pipeline_log("drop", f"{len(order)} scheduled turn(s) never "
+                         "made it into a burst — airing the round's tail "
+                         "in sequence (#767/#1146)")
     reached: set[int] = set()
     consumed = 0
     # A normal booth round may yield between turns. A live caller has a
@@ -56691,9 +57163,12 @@ async def speak_turns(turns: list[tuple[str, str]],
     if recovering:
         # #767: only the recovered turns were in play here; everything else
         # already aired in a burst and must not be shelved a second time.
-        for _i in order:
+        # #1146: sweep the WHOLE missed set - a dropped mid-round hole's
+        # render must be cancelled too, not only the tail's.
+        for _i in (_missed_all or order):
             if _i not in reached and not premade[_i].done():
                 premade[_i].cancel()
+        await _paged_settle(_paged_until)              # #1146
         return spoken
     for item, leftover in zip(playlist[consumed:], premade[consumed:]):
         # A cut round leaves clips rendered and unplayed. A FINISHED one —
@@ -58197,6 +58672,62 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # A failing banked call is visible for diagnosis but cannot consume a
         # usable shelf slot or reach the recording room.
         _final_report = call_entry_regrade(entry)
+        # #1146: a failed tint gets ONE immediate second try with the
+        # graded faults in its hand - the same lesson loop the ad studio
+        # runs (#1134) - and if that also fails, the tint is struck and
+        # the graded plain call banks instead. The failure is the
+        # rewrite's; the call it was rewriting does not die for it.
+        if (not _final_report.get("ok")
+                and str(entry.get("use") or "") == "tinted"
+                and str(entry.get("script_plain") or "").strip()):
+            try:
+                _lesson = (
+                    "; ".join(_final_report.get("faults") or [])[:400]
+                    + ". Keep every proper name, number, question mark "
+                      "and spoken sign-off, and keep each turn's concrete "
+                      "subject words while restyling around them.")
+                _again = await crystal_tint(
+                    str(entry.get("script_plain") or ""),
+                    str(entry.get("prep_kind") or ""),
+                    entry.get("verbatim"), whole_only=False,
+                    critical=bool(bank), lesson=_lesson)
+                if (_again.get("ok")
+                        and str(_again.get("script") or "").strip()):
+                    # Review: the same bookkeeping every other activation
+                    # site performs - stale audio keys die with the old
+                    # words, and the paperwork shows the attempt that
+                    # actually stands, not the one that failed.
+                    _dialogue_audio_drop(entry)
+                    entry["script_tinted"] = str(_again.get("script") or "")
+                    entry["script"] = entry["script_tinted"]
+                    entry["use"] = "tinted"
+                    entry["tint"] = {
+                        "ok": True,
+                        "why": str(_again.get("why") or ""),
+                        "world": str(_again.get("world") or ""),
+                        "ms": int(_again.get("ms") or 0),
+                        "armed": str(_again.get("armed") or "")[:6000],
+                        "prompt": str(_again.get("prompt") or "")[:8000],
+                        "chunks": list(_again.get("chunks") or []),
+                    }
+                    entry.pop("brief", None)    # it graded the old words
+                    _final_report = call_entry_regrade(entry)
+                    if _final_report.get("ok"):
+                        entry["off_brief"] = False
+                        pipeline_log(
+                            "call", "the retinted call passed the phone "
+                            "contract on the second try - the lesson "
+                            "loop paid (#1146)")
+            except Exception:  # noqa: BLE001
+                pass
+            if not _final_report.get("ok"):
+                _final_report = _call_tint_strike(
+                    entry, list(_final_report.get("faults") or []))
+                if _final_report.get("ok"):
+                    pipeline_log(
+                        "call", "the tint failed twice and was struck - "
+                        "the graded plain call banks, and the next pass "
+                        "carries the lesson (#1146)")
         if not _final_report.get("ok"):
             entry["off_brief"] = True
             pipeline_log(
@@ -58899,6 +59430,16 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
                 _prep_said = []
             if _prep_said:
                 quota_stamp("manager")     # #841: the hour counts it
+                try:                       # #1146: stamp the book's ledger
+                    _pentry = _prep_memo.get("entry") or {}
+                    await asyncio.to_thread(
+                        manager_memo_save,
+                        str(_pentry.get("script") or "")
+                        or "\n".join(_prep_said),
+                        "banked", True,
+                        str(_pentry.get("memo_id") or ""))
+                except Exception:  # noqa: BLE001
+                    pass
                 return _prep_said
     # When the machine runs hot, the memo is about the HEAT (#375): the
     # manager upstairs feels the same air the computer makes.
@@ -58974,6 +59515,11 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
         if _hot_said:
             # #841: stamped where it AIRED, not where it was scheduled.
             quota_stamp("manager")
+            try:                           # #1146: the book keeps it
+                await asyncio.to_thread(
+                    manager_memo_save, "\n".join(_hot_said), "live", True)
+            except Exception:  # noqa: BLE001
+                pass
         return _hot_said
     # `note` and its guard now live at the top of the function, above the
     # material draw (#841).
@@ -58991,6 +59537,11 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     ))
     if _said:
         quota_stamp("manager")             # #841: the hour counts it
+        try:                               # #1146: the book keeps it
+            await asyncio.to_thread(
+                manager_memo_save, "\n".join(_said), "live", True)
+        except Exception:  # noqa: BLE001
+            pass
     return _said
 
 
@@ -66121,7 +66672,8 @@ def tint_should_stop(critical: bool = False) -> str:
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                        answering: str = "", keep: list[str] | None = None,
                        seen: list[str] | None = None,
-                       kind: str = "", model: str = "") -> str:
+                       kind: str = "", model: str = "",
+                       lesson: str = "") -> str:
     """#1021: one turn, put in the world's mouth.
 
     Short prompt, short answer, one thing to do. `answering` is the
@@ -66193,7 +66745,11 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
           "room: a bar needs the syllables to set a thing up, turn it, "
           "and land the rhyme, and a line squeezed into the same space "
           "as the original can only swap one word for another.\n\n"
-          "Keep every fact, name and number. Do not quote the lyrics or "
+        # #1146: the rejected attempt's graded faults, carried per turn.
+        + (("A PREVIOUS REWRITE OF THIS CONVERSATION WAS REJECTED - do "
+            "not repeat its faults: " + str(lesson)[:400] + "\n\n")
+           if str(lesson or "").strip() else "")
+        + "Keep every fact, name and number. Do not quote the lyrics or "
           "lift their phrases. Do not answer the line, do not continue "
           "it, do not add a second - rewrite THIS line:\n"
         + said
@@ -66517,7 +67073,8 @@ async def crystal_tint(script: str, kind: str = "",
                        verbatim: Any = None,
                        whole_only: bool = False,
                        progress: Any = None,
-                       critical: bool = False) -> dict[str, Any]:
+                       critical: bool = False,
+                       lesson: str = "") -> dict[str, Any]:
     """#1006: THE SECOND PASS. Take a finished, untinted conversation and
     move it into the crystal's world.
 
@@ -66641,6 +67198,11 @@ async def crystal_tint(script: str, kind: str = "",
                 "quoted material, read out word for word:\n"
                 + "\n".join('"' + v + '"' for v in keep) + "\n")
                if keep else "")
+            # #1146: the graded faults of a rejected attempt ride the next
+            # one - the same lesson loop the ad studio runs (#1134).
+            + (("\nA PREVIOUS REWRITE OF THIS DIALOGUE WAS REJECTED - do "
+                "not repeat its faults: " + str(lesson)[:400] + "\n")
+               if str(lesson or "").strip() else "")
             + "\nReturn ONLY the rewritten dialogue, in the same marker "
               "format it came in.")
         out["armed"] = armed
@@ -66756,7 +67318,8 @@ async def crystal_tint(script: str, kind: str = "",
                 _turn_t0 = time.monotonic()
                 fresh = await crystal_turn(_said, world, chunks,
                                            answering, keep, _first_prompt,
-                                           kind, _tint_model)      # #1119
+                                           kind, _tint_model,      # #1119
+                                           lesson=lesson)          # #1146
                 try:
                     task_note("tint:turn", time.monotonic() - _turn_t0,
                               0.0, bool(fresh))
@@ -69384,8 +69947,13 @@ async def dj_voice_api(
                        "recording and this picks up when it returns"}
     server_ms = int(time.time() * 1000)
     clips = []
+    # #1146: everything appended before the last unpause is history, not
+    # programme - see radio_pause_set's resume branch.
+    _cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
     for clip in _RADIO["voice_clips"]:
         if int(clip.get("ts") or 0) <= int(since):
+            continue
+        if int(clip.get("ts") or 0) <= _cut_ms:
             continue
         clips.append({**clip, "broadcast_ms": int(clip.get("broadcast_ms")
             or int(clip["ts"]) + VOICE_BROADCAST_LEAD_MS)})
@@ -78101,6 +78669,63 @@ async def upstairs_archive_md(
         headers={"Content-Disposition":
                  f'attachment; filename="{station_slug()}-upstairs-'
                  f'{stamp}.md"'})
+
+
+@app.get("/api/manager/memos")
+async def manager_memos_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1146: the memo book - every memo the manager road has ever
+    written or aired, newest first, with its airing ledger."""
+    require_read_auth(authorization)
+    rows = sorted(await asyncio.to_thread(manager_memos_list),
+                  key=lambda r: -int(r.get("ts") or 0))
+    return {"memos": rows, "count": len(rows),
+            "per_hour": dj_settings().get("manager_per_hour")}
+
+
+@app.get("/api/manager/memos/archive.md", response_class=PlainTextResponse)
+async def manager_memos_archive_md(
+    authorization: str | None = Header(default=None),
+) -> PlainTextResponse:
+    """The whole memo book as one readable file (#1146) - the same shape
+    as the upstairs archive, because it is the same boss."""
+    require_read_auth(authorization)
+    rows = sorted(await asyncio.to_thread(manager_memos_list),
+                  key=lambda r: -int(r.get("ts") or 0))
+    lines = [f"# {dj_settings()['station_name']} — memos from the manager",
+             "", f"{len(rows)} memos, newest first.", ""]
+    for row in rows:
+        when = time.strftime("%Y-%m-%d %H:%M",
+                             time.localtime(float(row.get("ts") or 0)))
+        lines.append(f"## memo · {when}")
+        lines.append(f"*aired {int(row.get('uses') or 0)}x · "
+                     f"{row.get('how') or 'written'}*")
+        lines.append("")
+        lines.append(str(row.get("text") or "").strip())
+        lines.append("")
+    stamp = time.strftime("%Y-%m-%d")
+    return PlainTextResponse(
+        "\n".join(lines), media_type="text/markdown; charset=utf-8",
+        headers={"Content-Disposition":
+                 f'attachment; filename="{station_slug()}-manager-memos-'
+                 f'{stamp}.md"'})
+
+
+@app.delete("/api/manager/memos/{memo_id}")
+async def manager_memo_delete_api(
+    memo_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Strike one memo from the book (#1146)."""
+    require_auth(authorization)
+    got = await asyncio.to_thread(manager_memo_delete, memo_id)
+    if got is None:
+        raise HTTPException(status_code=503,
+                            detail="the memo book cannot be read right now")
+    if got < 0:
+        raise HTTPException(status_code=404, detail="No such memo")
+    return {"ok": True, "count": got}
 
 
 @app.post("/api/dj/upstairs")
@@ -104949,11 +105574,32 @@ let djVoiceSeen = 0;
 let djVoicePrimed = false;
 const djVoiceQueue = [];
 let djVoiceBusy = false;
+let djVoicePollLive = 0;                 // #1146: one poll in flight
+                                         // (timestamp: a hung fetch may
+                                         // block the feed 20s, not forever)
 
 // A banter round lands as several clips in one poll. Setting src once per clip
 // meant every line but the last was thrown away mid-load, which is why the
 // pair only ever half-arrived in the page (#175). Queue them and play in turn.
+/* #1146: one feed, and a clip enters the queue ONCE. Two polls in flight
+ * with the same `since` (the interval fires faster than a slow response
+ * returns) used to enqueue the same clips twice - the queue became
+ * 1,2,3,1,2,3 and the conversation repeated itself out of order. The
+ * mark is ts+url so two different clips stamped in the same millisecond
+ * both still play. retry() re-queues through djVoiceQueue directly, so a
+ * legitimately owed clip is never blocked by its own mark. */
+const djVoiceMarks = new Set();
 function djVoicePlay(clip) {
+  const mark = String(clip.ts || "") + "|" + String(clip.url || "");
+  if (djVoiceMarks.has(mark)) return;
+  djVoiceMarks.add(mark);
+  if (djVoiceMarks.size > 800) {
+    let n = 0;
+    for (const k of djVoiceMarks) {
+      djVoiceMarks.delete(k);
+      if (++n >= 300) break;
+    }
+  }
   djVoiceQueue.push(clip);
   djVoiceNext();
 }
@@ -105278,6 +105924,27 @@ function djVoiceNext() {
     if (clip.stream) { djStreamNow = null; djStreamLiveId = ""; }
     clip.retry = Math.min(8, Number(clip.retry || 0) + 1);
     const delay = Math.min(15000, 750 * (2 ** (clip.retry - 1)));
+    /* #1146: a CONVERSATION clip retries IN PLACE. Pushing it to the tail
+     * put turn 3 of a call behind turn 8 on the first transport hiccup -
+     * the exact out-of-order dialogue the floor exists to prevent. Four
+     * tries at the head, then the round moves on without it: a hole
+     * reads better than a scramble. Single lines keep the old
+     * behind-ready-work behaviour, where order matters less than flow. */
+    if (clip.stream) {
+      if (clip.retry <= 4) {
+        /* Head NOW, synchronously - during the old timer-armed backoff
+         * the clip was in neither the queue nor the busy slot, so the
+         * next burst could start first and the retried turn aired out
+         * of order anyway. The backoff delays the next ATTEMPT, never
+         * the clip's place in line. */
+        djVoiceQueue.unshift(clip);
+        setTimeout(djVoiceNext, delay);
+      } else {
+        setTimeout(djVoiceNext, 200);
+      }
+      djTalkMarkLive();
+      return;
+    }
     setTimeout(() => { djVoiceQueue.push(clip); djVoiceNext(); }, delay);
     djTalkMarkLive();
   };
@@ -105325,12 +105992,18 @@ function djVoiceNext() {
     if (!handed && !started) retry();    // it never began — keep it owed
   }, 25000);
   player.onloadedmetadata = () => {
+    /* #1146: #998 parity with the tune page - a slightly late line is
+     * still a line. This handler used to delete any clip within 0.15s of
+     * its own length and chop the head off anything 0.12s late; with the
+     * server now pacing the feed to real airtime, lateness is rare, and
+     * when it happens a second behind the world beats a decapitated
+     * word. Only a clip with honestly nothing left to play is dropped. */
     const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
-    if (isFinite(player.duration) && lateBy >= player.duration - 0.15) {
+    if (isFinite(player.duration) && lateBy >= player.duration) {
       done(); return;
     }
-    if (lateBy > 0.12 && isFinite(player.duration)) {
-      try { player.currentTime = lateBy; } catch (e) {}
+    if (lateBy > 1.0 && isFinite(player.duration)) {
+      try { player.currentTime = Math.max(0, lateBy - 0.25); } catch (e) {}
     }
     // Two presenters tread on each other; a sting does not tread on the line
     // it is punctuating. If the next clip up is a sample, wait for the end
@@ -105426,6 +106099,13 @@ async function djVoicePoll(immediate) {
   const rerouted = !!(djLastState && djLastState.box
                       && djLastState.box.overridden);
   if (vt === "box" && !boxDown && !rerouted) return;
+  /* #1146: one poll in flight at a time. The 4s interval outrunning a
+   * slow response put two requests out with the same `since`, and their
+   * overlapping answers doubled and reordered the queue. The guard is a
+   * timestamp so a fetch that hangs (api() has no timeout) costs the
+   * feed twenty seconds, never the rest of the night. */
+  if (djVoicePollLive && Date.now() - djVoicePollLive < 20000) return;
+  djVoicePollLive = Date.now();
   try {
     const data = await api("/api/dj/voice?since=" + djVoiceSeen);
     const clips = data.clips || [];
@@ -105454,7 +106134,8 @@ async function djVoicePoll(immediate) {
       return;
     }
     clips.forEach((clip) => { if (clip.url) djVoicePlay(clip); });
-  } catch (error) { /* the show goes on */ }
+  } catch (error) { /* the show goes on */
+  } finally { djVoicePollLive = 0; }
 }
 
 async function djGo() {
@@ -126438,7 +127119,20 @@ function patter(state) {
   host.scrollTop = host.scrollHeight;
 }
 
+/* #1146: one poll in flight at a time, and a clip enters the queue once.
+ * The 3s interval outrunning a slow response used to put two requests out
+ * with the same `since`; their overlapping answers doubled and reordered
+ * the queue, which is dialogue playing out of sequence. */
+let pollLive = 0;    // timestamp: a hung fetch stalls 20s, not forever
+const voiceMarks = new Set();
+
 async function poll() {
+  if (pollLive && Date.now() - pollLive < 20000) return;
+  pollLive = Date.now();
+  try { await pollOnce(); } finally { pollLive = 0; }
+}
+
+async function pollOnce() {
   try {
     // #1000: lean=1 - the nine keys this page actually reads, and the
     // tail of the chat ring rather than all 240 rows of it.
@@ -126461,6 +127155,18 @@ async function poll() {
       voiceSeen = Math.max(voiceSeen, clip.ts);
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
       if (clip.url) {
+        // #1146: ts+url, so two clips stamped the same millisecond both
+        // still play while a re-delivered twin does not.
+        const mark = String(clip.ts || "") + "|" + String(clip.url);
+        if (voiceMarks.has(mark)) return;
+        voiceMarks.add(mark);
+        if (voiceMarks.size > 800) {
+          let n = 0;
+          for (const k of voiceMarks) {
+            voiceMarks.delete(k);
+            if (++n >= 300) break;
+          }
+        }
         // #999: stamp the listener's rate on ONCE, here, so the prefetch
         // and the play use the identical URL and the cache lines up.
         clip.url = clipUrl(clip.url);
