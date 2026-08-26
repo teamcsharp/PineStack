@@ -15499,7 +15499,14 @@ def radio_state() -> dict[str, Any]:
     elapsed = time.time() - _RADIO["started"] if now else 0.0
     return {
         "station": _RADIO["station"],
-        "playing": bool(now),
+        # #1145: the STATE road is pause-honest, exactly as the clock has
+        # been since #1138. It said "playing" straight through a pause,
+        # and djRender feeds this into the same follower the clock feeds
+        # - so every state poll restarted the frozen record for the
+        # second and a half until the next clock poll paused it again:
+        # "i paused the broadcast yet its still playing occasionally".
+        "playing": bool(now) and not radio_paused(),
+        "paused": radio_paused(),
         "dj": _RADIO["dj"],
         # #1008: the overlap setting, published on the state every page
         # already polls. It used to reach the page ONLY through the DJ
@@ -103800,8 +103807,12 @@ function djRender(state) {
   djNowId = now.id || "";
   djNowTrack = now;
   if (now.url) rememberSig(now.url);
-  djResync({on: state.on, playing: state.playing, id: now.id,
-            url: now.url, seconds: now.seconds,
+  /* #1145: paused rides along. This synthetic clock carried everything
+   * BUT the pause flag, so during a pause the state poll restarted the
+   * frozen record every four seconds and the real clock poll paused it
+   * again - music in bursts through a silence the operator asked for. */
+  djResync({on: state.on, playing: state.playing, paused: state.paused,
+            id: now.id, url: now.url, seconds: now.seconds,
             server_ms: state.server_ms, started_ms: state.started_ms});
   const power = document.getElementById("djPower");
   if (power && power.checked !== djOn) power.checked = djOn;
@@ -103979,6 +103990,10 @@ function djResync(clock) {
     if (!pineAirPaused) pineAirPause(true);
     return;
   }
+  /* #1145: only an explicit false lifts the pause. A caller that never
+   * carried the flag at all must not read as "back on air" - that
+   * omission is precisely how the state poll restarted the record. */
+  if (clock.paused === undefined && pineAirPaused) return;
   if (pineAirPaused) pineAirPause(false);   // the pause lifted (#1144)
   const age = djStateAt ? (Date.now() - djStateAt) / 1000 : 0;
   let target = (clock.server_ms - clock.started_ms) / 1000 + age;
