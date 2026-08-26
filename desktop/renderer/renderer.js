@@ -259,8 +259,30 @@ function appVolumeScript(audible = true) {
           : 1;
         const nextVolume = nodeAudible ? volume * share : 0;
         if (Math.abs(node.volume - nextVolume) > 0.001) node.volume = nextVolume;
-        const muted = !nodeAudible || nextVolume <= 0;
-        if (node.muted !== muted) node.muted = muted;
+        /* #1147: MUTE ONLY, NEVER FORCE-UNMUTE. The page's solo gate
+         * (#1008 pineSoloGate) gags this surface when another listener
+         * owns the air; the old unconditional write ripped that gag off
+         * within a second, surfacing a SECOND copy of the broadcast in
+         * 0.5-1.5s bursts - "different clips mixed together for a
+         * second, then normal". The shell may only ever ADD silence; a
+         * mute the page (or the operator) set stays set. */
+        const gagged = !!window.__pineGagged
+          || !!(node.dataset && node.dataset.pineGag === "1");
+        const muted = gagged || !nodeAudible || nextVolume <= 0;
+        if (live) {
+          if (node.muted !== muted) node.muted = muted;
+        } else if (muted) {
+          /* An untagged element (a tape, a preview) may be silenced by
+           * the shell, but only a SHELL mute is the shell's to lift -
+           * the marker keeps a page/operator mute untouched forever. */
+          if (!node.muted) {
+            node.muted = true;
+            if (node.dataset) node.dataset.pineShellMuted = "1";
+          }
+        } else if (node.dataset && node.dataset.pineShellMuted === "1") {
+          node.dataset.pineShellMuted = "";
+          node.muted = false;
+        }
       });
     };
     const schedule = () => {
@@ -978,6 +1000,9 @@ function renderPipeline(data) {
   });
 }
 
+let agentDownStreak = 0;       // #1147: consecutive failed healthz probes
+let lastFrameReload = 0;       // #1147: reload-once-per-outage cooldown
+
 async function refresh() {
   try {
     const health = await fetch(`${config.baseUrl}/healthz`);
@@ -985,12 +1010,38 @@ async function refresh() {
     setText("connLine", config.baseUrl);
     // The compact rail hides #connLine — the PB mark's ring carries the
     // connection state instead, so no width ever hides whether we're up.
+    const wasDown = document.body.classList.contains("agent-down");
     document.body.classList.toggle("agent-down", !health.ok);
+    /* #1147: a server that went away and came back is a DEPLOY BOUNDARY.
+     * The webviews fetch their pages once at launch, so a container
+     * restart left the app running the OLD panel code against the new
+     * server indefinitely - stale players, stale queue rules, and the
+     * post-reboot garble regenerating inside the app while the server
+     * looked healthy. One reload per REAL outage: at least two failed
+     * probes in a row (a single dropped fetch is a network blip, not a
+     * restart) and never more than once a minute, so a flapping link
+     * cannot reload-loop the operator's open work. */
+    if (health.ok) {
+      if (wasDown && agentDownStreak >= 2
+          && Date.now() - lastFrameReload > 60000) {
+        lastFrameReload = Date.now();
+        ["controlFrame", "radioFrame", "guideFrame"].forEach((id) => {
+          try {
+            const f = $(id);
+            if (f && typeof f.reload === "function") f.reload();
+          } catch { /* the frame reloads on the next outage instead */ }
+        });
+      }
+      agentDownStreak = 0;
+    } else {
+      agentDownStreak += 1;
+    }
   } catch {
     setText("agentState", "offline");
     setText("boxState", "unknown");
     setText("routeState", "unknown");
     document.body.classList.add("agent-down");
+    agentDownStreak += 1;      // #1147: this is a failed probe too
     return;
   }
 

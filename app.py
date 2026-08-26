@@ -4146,6 +4146,46 @@ async def _startup_paused() -> None:
         radio_pause_load()
     except Exception:  # noqa: BLE001
         pass
+    # #1147: A REBOOT IS A FRESH START ON THE VOICE FEED, exactly like a
+    # resume (#1146). The old process had sold air up to 45 seconds ahead
+    # of the moment it died; a client that stayed open still holds that
+    # tail. Without this stamp the two schedules straddle and the client
+    # drains a run of past-due clips - the measured post-reboot garble.
+    try:
+        _RADIO["voice_cut_ms"] = int(time.time() * 1000)
+        _PAGE_AIR_UNTIL[0] = 0.0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.on_event("startup")
+async def _startup_low_rates() -> None:
+    """#1147: remember which bitrates listeners used before the restart.
+
+    _LOW_WANTED is in-memory, so a reboot forgot every listener's rate:
+    between boot and their next &br= poll, every stored clip skipped its
+    pre-encode and the first fetches all hit the miss path - transcodes
+    racing the very clips they were for. The cache filenames carry the
+    rates; one directory scan restores the memory."""
+    def _scan() -> set[int]:
+        rates: set[int] = set()
+        try:
+            for q in LOW_CACHE.glob("*.mp3"):
+                tail = q.stem.rsplit("-", 1)[-1]
+                if tail.endswith("k"):
+                    try:
+                        rates.add(int(tail[:-1]))
+                    except ValueError:
+                        pass
+        except Exception:  # noqa: BLE001
+            pass
+        return rates
+    try:
+        for rate in await asyncio.to_thread(_scan):
+            if rate in LOW_RATES:
+                _LOW_WANTED[rate] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 @app.on_event("startup")
@@ -5776,12 +5816,10 @@ async def render_backlog_drain() -> None:
                     fire_and_forget(_box_hold_drain_soon())
                 except Exception:  # noqa: BLE001
                     pass
-            _RADIO["voice_clips"].append({
-                "ts": int(time.time() * 1000),
+            page_feed_append({          # #1147: honest broadcast stamp
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": held.get("text", ""), "voice": held.get("voice", ""),
             })
-            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             for row in reversed(_RADIO.get("chat") or []):
                 if row.get("id") == held.get("id"):
                     row["aired"] = "page"
@@ -12874,6 +12912,10 @@ _LOW_SWEPT = [0.0]                      # last sweep; see _low_sweep
 # and make exactly those, as soon as the audio exists.
 _LOW_WANTED: dict[int, float] = {}
 LOW_WANT_FRESH = 1800.0                 # a rate is "in use" for 30 min
+# #1147: (key|rate) pairs that served the ORIGINAL bytes - the URL keeps
+# serving the original for a while so a playback session never sees its
+# bytes change encoding mid-life. See the /media handler.
+_LOW_MISSED: dict[str, float] = {}
 # ONE encoder in this process, ever, and niced. The box runs the TTS
 # engine on the same CPU at ~2.7x slower than real time; a clip that is
 # late because we were transcoding is worse than a clip that is large.
@@ -15602,6 +15644,45 @@ VOICE_CLIP_FEED_KEEP = int(os.getenv("VOICE_CLIP_FEED_KEEP", "2000"))
 # into the exact same point if its network delivery was late.
 VOICE_BROADCAST_LEAD_MS = int(os.getenv("VOICE_BROADCAST_LEAD_MS", "7000"))
 
+# #1147: how far ahead the page's air is SOLD, across every producer.
+# The paced burst road (#1146) kept this knowledge in a local variable,
+# so every other page append - a reply, a sting, a page from upstairs,
+# the SFX button - stamped itself due at now+7s, which with bursts
+# announced up to 45s early was a moment INSIDE audio already promised:
+# the clip was late before it was ever fetched, and late clips are what
+# the players garble or drop.
+_PAGE_AIR_UNTIL = [0.0]
+
+
+def page_feed_append(clip: dict[str, Any]) -> None:
+    """#1147: THE one door onto the page voice feed.
+
+    Stamps an honest broadcast_ms - never earlier than the moment the
+    page's already-promised audio finishes - and trims the ring. A clip
+    that arrives with its own broadcast_ms (the paced burst road) keeps
+    it."""
+    try:
+        lead = VOICE_BROADCAST_LEAD_MS / 1000.0
+        clip.setdefault("ts", int(time.time() * 1000))
+        if not clip.get("broadcast_ms"):
+            clip["broadcast_ms"] = int(max(
+                time.time() + lead, float(_PAGE_AIR_UNTIL[0] or 0)) * 1000)
+            # #1147 review: a run of back-to-back plain appends must
+            # CHAIN, or every clip after the first shares one air moment
+            # and the staleness rules eat the tail. The length is not
+            # known here, so it is estimated from the words (~14 chars a
+            # second of speech, clamped) - honest enough to keep stamps
+            # ordered, small enough never to starve the feed.
+            _est = min(40.0, max(2.5,
+                                 len(str(clip.get("text") or "")) / 14.0))
+            _PAGE_AIR_UNTIL[0] = max(
+                float(_PAGE_AIR_UNTIL[0] or 0),
+                clip["broadcast_ms"] / 1000.0 + _est)
+        _RADIO["voice_clips"].append(clip)
+        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
+    except Exception:  # noqa: BLE001
+        pass
+
 
 def radio_state() -> dict[str, Any]:
     now = _RADIO.get("now")
@@ -16756,8 +16837,13 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
         # show's lock and used to arrive minutes late or not at all.
         clip = await voice_generate(line, "", "piper")
         if reply_to in ("here", "both"):
-            _RADIO.setdefault("voice_clips", []).append({
-                "ts": int(time.time() * 1000),
+            # #1147: through the one door, but stamped NOW - an ack is a
+            # person being answered and never waits out the page-air
+            # ledger; the clients bump kind=="reply" to the queue head.
+            page_feed_append({
+                "broadcast_ms": int(
+                    (time.time() + VOICE_BROADCAST_LEAD_MS / 1000.0)
+                    * 1000),
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": line,
                 # #981: a reply is not a DJ line, and the app holds the
@@ -16765,7 +16851,6 @@ async def pine_speak_ack(request_text: str, phrase: str) -> None:
                 # an older panel simply ignores it.
                 "kind": "reply",
             })
-            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         # And onto the box — if it is stalling right now, the ack waits on
         # the hold shelf and plays the moment the box recovers, so the
         # spoken "got your request" is never simply lost (#436).
@@ -17921,13 +18006,11 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # the box was stuck). Carry it to the page live, still held for
             # the box.
             if voice_to == "both":
-                _RADIO["voice_clips"].append({
-                    "ts": int(time.time() * 1000),
+                page_feed_append({      # #1147: honest broadcast stamp
                     "url": f"{clip['path']}?t={clip['sig']}",
                     "text": spoken, "engine": voice_engine_for(forced or ""),
                     "voice": forced or "",
                 })
-                del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             _RADIO["chat"].append({
                 "ts": int(time.time()), "who": who, "kind": kind,
                 "text": spoken, "voice": forced or "",
@@ -18060,12 +18143,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     paged = False
     if page_carries_live(voice_to, to_box, box_down):          # #1118
         if clip:
-            _RADIO["voice_clips"].append({
-                "ts": int(time.time() * 1000),
+            page_feed_append({          # #1147: honest broadcast stamp
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             paged = True
         elif voice_to in ("here", "both"):
             # A line that rendered to nothing must show the gap, not vanish
@@ -18214,12 +18295,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # clip that the early append missed.
     if clip and not paged and page_carries_live(               # #1118
             voice_to, to_box, box_down):
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{clip['path']}?t={clip['sig']}",
             "text": spoken, "engine": engine, "voice": forced or "",
         })
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         paged = True
 
     # A sting off the end of it, now and then (#208). After the line, never
@@ -18255,12 +18334,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         if voice_to == "box" and not paged:
             note_drop(who, spoken,
                       f"box declined — page + held for the box: {why}"[:200])
-            _RADIO["voice_clips"].append({
-                "ts": int(time.time() * 1000),
+            page_feed_append({          # #1147: honest broadcast stamp
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         else:
             note_drop(who, spoken,
                       f"box declined — held for the box: {why}"[:200])
@@ -18416,13 +18493,11 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # makes up its mind.
             if not paged:
                 try:
-                    _RADIO["voice_clips"].append({
-                        "ts": int(time.time() * 1000),
+                    page_feed_append({  # #1147: honest broadcast stamp
                         "url": f"{clip['path']}?t={clip['sig']}",
                         "text": spoken, "engine": engine,
                         "voice": forced or "",
                     })
-                    del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
                     paged = True
                 except Exception:  # noqa: BLE001
                     pass
@@ -18461,12 +18536,10 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # one of them. The ladder ends at Piper's own default voice.
             clip = await voice_render_any(spoken, forced, fx=fx, who=who)
         if clip and clip.get("path"):
-            _RADIO["voice_clips"].append({
-                "ts": int(time.time() * 1000),
+            page_feed_append({          # #1147: honest broadcast stamp
                 "url": f"{clip['path']}?t={clip['sig']}",
                 "text": spoken, "engine": engine, "voice": forced or "",
             })
-            del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
             entry["aired"] = "page"
         else:
             # #784: "There should never be dialogue not being played." If
@@ -23978,6 +24051,12 @@ def radio_pause_set(on: bool) -> bool:
             # booth's history (#1117); they are simply never OFFERED to a
             # player again.
             _RADIO["voice_cut_ms"] = int(now * 1000)
+            # #1147: the page-air ledger resets with the cut - the air it
+            # had sold was flushed with the clips.
+            try:
+                _PAGE_AIR_UNTIL[0] = 0.0
+            except Exception:  # noqa: BLE001
+                pass
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = now if on else 0.0
         # #1138: the record was stopped the moment the pause began, so
@@ -40301,11 +40380,9 @@ async def dj_police_outside(text: str) -> None:
     if to in ("box", "both"):
         await _play_on_box(play["path"], play["sig"])
     if to in ("here", "both") or not box_talk_ok():
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{play['path']}?t={play['sig']}",
             "text": label, "voice": voice})
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     _episode_stage(f"{play['path']}?t={play['sig']}", label)
     pipeline_log("air", f"megaphone outside — {character} vocode, "
                         f"sirens behind (#636)")
@@ -40724,11 +40801,9 @@ async def dj_upstairs_page(row: dict[str, Any] | None = None) -> bool:
     if to in ("box", "both"):
         await _play_on_box(path, sig)
     if to in ("here", "both") or not box_talk_ok():
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{path}?t={sig}", "text": label,
             "voice": str(made.get("voice") or "")})
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     _episode_stage(f"{path}?t={sig}", label)
     upstairs_update(str(made.get("id") or ""),
                     uses=int(made.get("uses") or 0) + 1,
@@ -41437,11 +41512,9 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     if ad_to in ("box", "both"):
         await _play_on_box(play["path"], play["sig"])
     if page_carries_live(ad_to, ad_to in ("box", "both")):     # #1118
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{play['path']}?t={play['sig']}",
             "text": line, "engine": engine, "voice": forced or ""})
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     entry = ad_save(product, line, kind="music") if remember else None
     # #892: THE ROAD THAT LEFT NO TRACE. A music-bedded spot never goes
     # through dj_speak, so nothing ever wrote it a booth row — and the
@@ -41689,11 +41762,9 @@ async def _air_produced_ad(entry: dict[str, Any]) -> None:
                 or len(_BOX_HOLD) >= 6)
     if page_carries_live(ad_to, ad_to in ("box", "both"),      # #1118
                          box_down):
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"{path}?t={sig}", "text": label,
             "voice": entry.get("voice") or ""})
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     if ad_to in ("box", "both"):
         await _play_on_box(path, sig)
     _episode_stage(f"{path}?t={sig}", label)
@@ -48208,12 +48279,10 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
                      or len(_BOX_HOLD) >= 6)
     if ((_RADIO.get("voice_to") or "box") != "box" or _sfx_box_down
             or _RADIO.get("monitor")):     # #825
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
         })
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     # A sting is MEANT to land over the DJ's own line it punctuates, so the
     # show's own just-finished announce tail must not block it (#559: "the
     # sound effects aren't coming through"). Same own-tail carve-out as the
@@ -48239,12 +48308,10 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
         # exactly "it was queued and it never sounded". Send it to the
         # page instead: heard in the wrong room beats not heard, and
         # say so rather than logging a play that never happened.
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": sample.stem,
         })
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
         played_anywhere = True
         pipeline_log("air", f"sting {sample.stem} could not go to the "
                             "box (satellite busy) — sent to the page "
@@ -55580,12 +55647,17 @@ def _call_concat_blocking(paths: list[str],
     fd, tmp = tempfile.mkstemp(suffix=".wav")
     os.close(fd)
     try:
-        subprocess.run(
+        _proc = subprocess.run(
             [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
              *ins, "-filter_complex", graph, "-map", "[out]",
              "-ac", "1", "-ar", "24000", "-sample_fmt", "s16", tmp],
             capture_output=True, timeout=180)
-        blob = Path(tmp).read_bytes()
+        # #1147: a non-zero exit after writing >4000 bytes used to serve a
+        # partial WAV with an unfinalised RIFF header - the browser got
+        # garbage to decode and _clip_seconds read 0, which collapsed the
+        # #1146 pacing (every burst scheduled at the same air moment).
+        # A failed concat falls through to the turn-by-turn road instead.
+        blob = Path(tmp).read_bytes() if _proc.returncode == 0 else b""
     except Exception:
         blob = b""
     finally:
@@ -55639,12 +55711,10 @@ async def play_phone_ring() -> None:
     _ring_box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                       or len(_BOX_HOLD) >= 6)
     if (_RADIO.get("voice_to") or "box") != "box" or _ring_box_down:
-        _RADIO["voice_clips"].append({
-            "ts": int(time.time() * 1000),
+        page_feed_append({              # #1147: honest broadcast stamp
             "url": f"/sfx/{key}?t={signature}",
             "text": "", "sting": "phone-ring",
         })
-        del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     if (_RADIO.get("voice_to") or "box") in ("box", "both") and (
             not await satellite_busy()):
         try:
@@ -56730,6 +56800,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             if mixed:
                 one = _store_media(mixed, "wav")
                 length = _clip_seconds(one["path"]) or 0.0
+                if length <= 0.5:
+                    # #1147: a burst whose header will not measure is not
+                    # airworthy, and a zero length would collapse the
+                    # #1146 pacing into an append-speed flood. Treat the
+                    # burst as failed; the per-turn road below still airs
+                    # every line.
+                    pipeline_log("drop", "a coalesced burst measured "
+                                 f"{length:.2f}s - refusing the mix and "
+                                 "falling back to turn-by-turn (#1147)")
+                    if played_any:
+                        missed.extend(range(_lo, _hi))
+                        continue
+                    break
                 pipeline_log("voice", "call coalesced into one stream — "
                                       f"{len(transcript)} turns · {length:.0f}s "
                                       "(#535)")
@@ -56942,7 +57025,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     # loops in short steps, and a paused station is never
                     # paced - its clips die to the resume cut unheard.
                     _plead = VOICE_BROADCAST_LEAD_MS / 1000.0
-                    _pstart = max(time.time() + _plead, _paged_until)
+                    # #1147 review: consult the GLOBAL ledger too - a
+                    # by-hand round (floor-exempt) or any concurrent
+                    # producer may have sold air this round's local
+                    # clock knows nothing about.
+                    _pstart = max(time.time() + _plead, _paged_until,
+                                  float(_PAGE_AIR_UNTIL[0] or 0))
                     _pwait = (_pstart - _plead - PAGED_ANNOUNCE_EARLY
                               - time.time())
                     while _pwait > 0 and not radio_paused():
@@ -56959,6 +57047,11 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     })
                     del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
                     _paged_until = _pstart + max(0.0, float(length or 0))
+                    # #1147: publish how far the air is sold, so every
+                    # OTHER page producer (replies, stings, upstairs)
+                    # stamps itself after this round instead of inside it.
+                    _PAGE_AIR_UNTIL[0] = max(
+                        float(_PAGE_AIR_UNTIL[0] or 0), _paged_until)
                 # #748: start the server clock only when the box is the thing
                 # actually carrying the stream. Page-routed streams start their
                 # booth clock in djVoiceNext.onplaying, because a browser queue
@@ -68895,7 +68988,16 @@ async def media(
     missed = False
     if rate:
         small = low_path(key, rate)
-        if small.is_file():
+        # #1147: A MISS IS STICKY. One URL used to serve WAV bytes on the
+        # miss and MP3 bytes seconds later when the encode landed - a
+        # playback session spanning the flip (a Range continuation on a
+        # slow link) got MP3 frames where it expected PCM: a second of
+        # digital garbage. Once a (key, rate) has served the original, it
+        # keeps serving the original for a while; the derivative waits
+        # for the next clip.
+        _mk = f"{key}|{rate}"
+        _held = time.time() - float(_LOW_MISSED.get(_mk) or 0) < 900.0
+        if small.is_file() and not _held:
             # nosniff is set below, so the browser believes OUR type even
             # though the key still ends .wav.
             served, media_type = small, "audio/mpeg"
@@ -68903,7 +69005,17 @@ async def media(
             # Not ready. Start it for next time and send the original
             # NOW - a miss must cost the listener bytes, never delay.
             missed = True
-            _low_encode_soon(VOICE_MEDIA_DIR / key, small, rate)
+            if not small.is_file():
+                _low_encode_soon(VOICE_MEDIA_DIR / key, small, rate)
+            # Review: a SLIDING window - refreshed on every held serve,
+            # so an active session never crosses the flip moment while
+            # it is still pulling bytes.
+            _LOW_MISSED[_mk] = time.time()
+            if len(_LOW_MISSED) > 4000:
+                _now = time.time()
+                for _k in [k for k, v in _LOW_MISSED.items()
+                           if _now - v > 900.0]:
+                    _LOW_MISSED.pop(_k, None)
 
     try:
         size = await asyncio.to_thread(lambda: served.stat().st_size)
@@ -69948,15 +70060,34 @@ async def dj_voice_api(
     server_ms = int(time.time() * 1000)
     clips = []
     # #1146: everything appended before the last unpause is history, not
-    # programme - see radio_pause_set's resume branch.
+    # programme - see radio_pause_set's resume branch. #1147: and a boot
+    # stamps the same cut, so a reboot cannot straddle two schedules.
     _cut_ms = int(_RADIO.get("voice_cut_ms") or 0)
     for clip in _RADIO["voice_clips"]:
         if int(clip.get("ts") or 0) <= int(since):
             continue
         if int(clip.get("ts") or 0) <= _cut_ms:
             continue
-        clips.append({**clip, "broadcast_ms": int(clip.get("broadcast_ms")
-            or int(clip["ts"]) + VOICE_BROADCAST_LEAD_MS)})
+        _bm = int(clip.get("broadcast_ms")
+                  or int(clip["ts"]) + VOICE_BROADCAST_LEAD_MS)
+        # #1147: never OFFER a clip that can no longer be played sanely.
+        # The server knows each clip's honest air moment and, for a
+        # stream, its exact length; handing a client a run of past-due
+        # clips is the cascade its players then garble. They stay in the
+        # list for the booth's history, exactly as the pause road (#1117)
+        # keeps them - off the air simply means nothing is offered.
+        try:
+            _slen = float((clip.get("stream") or {}).get("length") or 0)
+        except Exception:  # noqa: BLE001
+            _slen = 0.0
+        # #1147 review: a sting is punctuation (5s of grace), a stream
+        # gets its own length, and a plain line gets 20s - matching the
+        # clients' own staleness rules with room to spare.
+        _grace = (int(_slen * 1000) if _slen > 0
+                  else 5000 if clip.get("sting") else 20000)
+        if server_ms > _bm + _grace:
+            continue
+        clips.append({**clip, "broadcast_ms": _bm})
     # #999: `br` is declared a STRING and validated by low_rate, not by
     # FastAPI. Typed `int`, a junk or empty value is a 422 on the
     # listener's only route - and low_rate's whole job is to be the one
@@ -69966,7 +70097,10 @@ async def dj_voice_api(
     # the audio is made). It only records that somebody is listening at
     # this rate, which is what tells the store-time hook what to make.
     low_note_rate(br)
-    return {"server_ms": server_ms, "clips": clips}
+    # #1147: the cut rides the response so an OPEN page can flush what it
+    # banked from a dead process - the server-side filter alone cannot
+    # reach clips already sitting in a browser's queue.
+    return {"server_ms": server_ms, "cut_ms": _cut_ms, "clips": clips}
 
 
 @app.post("/api/dj/monitor")
@@ -81042,11 +81176,10 @@ async def dj_sfx_play(
         raise HTTPException(status_code=404, detail="No such sample")
     key = sfx_id(path)
     signature = media_sign(key)
-    _RADIO["voice_clips"].append({
-        "ts": int(time.time() * 1000), "url": f"/sfx/{key}?t={signature}",
+    page_feed_append({                  # #1147: honest broadcast stamp
+        "url": f"/sfx/{key}?t={signature}",
         "text": "", "sting": path.stem,
     })
-    del _RADIO["voice_clips"][:-VOICE_CLIP_FEED_KEEP]
     played = ""
     if (_RADIO.get("voice_to") or "box") in ("box", "both"):
         played = await _play_on_box(f"/sfx/{key}", signature)
@@ -99579,7 +99712,13 @@ function djApplyGain() {
   // was dead). Element volume caps at 1.0; the clips are already RMS-leveled
   // so 100% is the intended loudness.
   const vlvl = Math.max(0, Math.min(1, level.voice));
-  if (typeof djVoiceEls !== "undefined") {
+  /* #1147: inside the desktop app the SHELL owns live element volume
+   * (#789/#981 - its injected script rewrites .volume within a second),
+   * so writing here only made the level flutter twice per clip and the
+   * panel slider look dead. One owner: the shell when present, this
+   * slider in a plain browser. */
+  if (typeof djVoiceEls !== "undefined"
+      && window.__pineDesktopVolume === undefined) {
     djVoiceEls.forEach((a) => { if (a) a.volume = vlvl; });
   }
 }
@@ -104550,17 +104689,28 @@ function pineAirPause(on) {
     if (player && !player.paused) player.pause();
     djLastTrack = "";
     radioFollowing = false;
+    /* #1147: pause EVERY element carrying a src - a clip whose play()
+     * was still pending (currentTime 0, data loading) used to escape
+     * the pause entirely and start sounding into the silence. Only an
+     * element that had audibly begun is marked for resume. */
     (djVoiceEls || []).forEach((a) => {
-      if (a && !a.paused && !a.ended && a.currentTime > 0) {
-        try { a.pause(); a.dataset.pineHeld = "1"; } catch (e) {}
+      if (a && a.src && !a.ended) {
+        try {
+          if (a.currentTime > 0 && !a.paused) a.dataset.pineHeld = "1";
+          a.pause();
+        } catch (e) {}
       }
     });
   } else {
+    /* #1147: resume ONE element. Playing every held element at once put
+     * two different clips on the air the moment the pause lifted. */
     let resumed = 0;
     (djVoiceEls || []).forEach((a) => {
       if (a && a.dataset.pineHeld === "1") {
         a.dataset.pineHeld = "";
-        if (!a.ended && a.src) { resumed += 1; a.play().catch(() => {}); }
+        if (!resumed && !a.ended && a.src) {
+          resumed += 1; a.play().catch(() => {});
+        }
       }
     });
     if (!resumed) { try { djVoiceNext(); } catch (e) {} }
@@ -104579,6 +104729,7 @@ function pineFmOff() {
   djLastTrack = "";
   radioFollowing = false;
   djVoiceQueue.length = 0;
+  djVoiceEpoch += 1;             // #1147: orphan in-flight closures too
   (djVoiceEls || []).forEach((a) => { if (a) { a.pause(); a.src = ""; } });
   djVoiceLive = 0;
   djVoiceBusy = false;
@@ -105577,6 +105728,17 @@ let djVoiceBusy = false;
 let djVoicePollLive = 0;                 // #1146: one poll in flight
                                          // (timestamp: a hung fetch may
                                          // block the feed 20s, not forever)
+let djVoiceTimer = null;                 // #1147: ONE deduped hold timer
+let djVoiceCut = 0;                      // #1147: server feed epoch - clips
+                                         // older than this are history
+/* #1147 review: the PLAYER epoch. A cut flush (or FM-off) silences the
+ * elements, but the in-flight clip's closure still owns armed timers
+ * (startGuard/stallGuard) and a pending play() promise - firing later,
+ * they clobbered state a fresh clip owned and started old audio over
+ * live programme. Bumping this number orphans every older closure: its
+ * guards and handlers see a stale epoch and neutralise themselves
+ * without touching shared state. */
+let djVoiceEpoch = 0;
 
 // A banter round lands as several clips in one poll. Setting src once per clip
 // meant every line but the last was thrown away mid-load, which is why the
@@ -105600,7 +105762,14 @@ function djVoicePlay(clip) {
       if (++n >= 300) break;
     }
   }
-  djVoiceQueue.push(clip);
+  /* #1147: a REPLY is a person being answered and outranks the queue -
+   * it goes to the head (the same #206 rule the floor honours), so an
+   * ack never waits out a 45-second announce hold behind a burst. */
+  if (String(clip.kind || "") === "reply") {
+    djVoiceQueue.unshift(clip);
+  } else {
+    djVoiceQueue.push(clip);
+  }
   djVoiceNext();
 }
 
@@ -105871,13 +106040,49 @@ function djVoiceNext() {
    * this chain again when the pause lifts. */
   if (pineAirPaused) return;
   if (djVoiceBusy) return;
-  const clip = djVoiceQueue.shift();
+  /* #1147: PEEK, judge, and only then shift - the tune page's shape.
+   * The old path shifted, flipped the slot, then unshifted a not-yet-due
+   * head, so every pass while a paced burst waited (a) armed ANOTHER
+   * full-length timer with no dedupe and (b) flipped djVoiceSlot without
+   * playing - randomising which element the next clip landed on,
+   * sometimes the one still sounding. */
+  let clip = djVoiceQueue[0];
+  /* #1147: hopeless clips die HERE, before any element is touched. A run
+   * of past-due clips (a reboot outage, a throttled tab) used to drain
+   * through the metadata drop path with each clip's play() already
+   * pending - up to two abandoned elements audibly sounding at once,
+   * which is the mixed-clips-for-a-second garble. A stream carries its
+   * own length; a sting is ~1s of punctuation; a plain line 8+ seconds
+   * dead is history, not programme. */
+  while (clip) {
+    const lateNow = (Date.now() - Number(clip.broadcastAt || Date.now())) / 1000;
+    const streamLen = clip.stream ? Number(clip.stream.length || 0) : 0;
+    const hopeless =
+      (streamLen > 0 && lateNow >= streamLen)
+      || (clip.sting && lateNow > 3)
+      || (!clip.stream && !clip.sting && lateNow > 15);
+    if (!hopeless) break;
+    djVoiceQueue.shift();
+    clip = djVoiceQueue[0];
+  }
   if (!clip) {
     // Ducking is released only once nothing is sounding, so a track change
     // mid-sentence cannot strand the music at 25%.
     if (!djVoiceLive) { djSpeaking = false; djApplyGain(); }
     return;
   }
+  const broadcastAt = Number(clip.broadcastAt || Date.now());
+  const waitForAir = broadcastAt - Date.now();
+  if (waitForAir > 25) {
+    /* #1147: one deduped timer, no queue mutation, no slot flip - and
+     * the music is not held ducked through a 45-second announce lead. */
+    if (djVoiceTimer) clearTimeout(djVoiceTimer);
+    djVoiceTimer = setTimeout(() => { djVoiceTimer = null; djVoiceNext(); },
+                              waitForAir);
+    if (!djVoiceLive && djSpeaking) { djSpeaking = false; djApplyGain(); }
+    return;
+  }
+  djVoiceQueue.shift();
   const player = djVoiceEl(djVoiceSlot);
   // #981: the DJs and the replies come down one feed, so the element is
   // re-stamped for the clip it is about to carry. The desktop reads this
@@ -105889,21 +106094,25 @@ function djVoiceNext() {
   } catch (e) { /* the clip still plays */ }
   djVoiceSlot = 1 - djVoiceSlot;
   djVoiceBusy = true;
-  const broadcastAt = Number(clip.broadcastAt || Date.now());
-  const waitForAir = broadcastAt - Date.now();
-  if (waitForAir > 25) {
-    djVoiceQueue.unshift(clip);
-    djVoiceBusy = false;
-    setTimeout(djVoiceNext, waitForAir);
-    return;
-  }
 
   let handed = false;
   let started = false;
   let startGuard = 0;
   let stallGuard = 0;
+  /* #1147: this closure belongs to ONE epoch. If the epoch moved (a cut
+   * flush, FM-off), every late-firing guard, promise rejection and
+   * handler of this clip must go quiet WITHOUT touching the shared flags
+   * a fresh clip now owns. */
+  const clipEpoch = djVoiceEpoch;
+  const staleEpoch = () => clipEpoch !== djVoiceEpoch;
+  const disarm = () => {
+    handed = true;
+    if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
+    if (stallGuard) { clearTimeout(stallGuard); stallGuard = 0; }
+  };
   const release = () => {
     if (handed) return false;
+    if (staleEpoch()) { disarm(); return false; }
     handed = true;
     if (startGuard) { clearTimeout(startGuard); startGuard = 0; }
     if (stallGuard) { clearTimeout(stallGuard); stallGuard = 0; }
@@ -105945,11 +106154,23 @@ function djVoiceNext() {
       djTalkMarkLive();
       return;
     }
-    setTimeout(() => { djVoiceQueue.push(clip); djVoiceNext(); }, delay);
+    setTimeout(() => {
+      /* #1147: a single line that died during an outage and is now 15+
+       * seconds past its air moment is history, not programme -
+       * re-queueing it forever built the very backlog the drop-run then
+       * garbled. */
+      if (Date.now() - Number(clip.broadcastAt || 0) > 15000
+          || Number(clip.ts || 0) <= djVoiceCut) {
+        djVoiceNext();
+        return;
+      }
+      djVoiceQueue.push(clip); djVoiceNext();
+    }, delay);
     djTalkMarkLive();
   };
   const done = () => {
     if (handed) return;
+    if (staleEpoch()) { disarm(); return; }    // #1147
     djVoiceLive = Math.max(0, djVoiceLive - 1);
     hand();
     if (!djVoiceLive && !djVoiceQueue.length) {
@@ -105968,6 +106189,9 @@ function djVoiceNext() {
    * true forever and every later line piled up unheard - which is exactly
    * "the broadcast stops talking at certain points" and never resumes. */
   player.onplaying = () => {
+    /* #1147: a clip already handed off (dropped for lateness) or from a
+     * flushed epoch must not stamp the booth clock with a dead round. */
+    if (handed || staleEpoch()) return;
     started = true;
     if (clip.stream && Array.isArray(clip.stream.rows)) {
       djStreamNow = {
@@ -106000,6 +106224,11 @@ function djVoiceNext() {
      * word. Only a clip with honestly nothing left to play is dropped. */
     const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
     if (isFinite(player.duration) && lateBy >= player.duration) {
+      /* #1147: SILENCE the element before advancing. done() alone left
+       * the pending play() to fire - the "dropped" clip kept sounding
+       * under the next one and the one after, the literal mixed-clips
+       * garble. Mirror retry()'s cleanup exactly. */
+      try { player.pause(); player.removeAttribute("src"); player.load(); } catch (e) {}
       done(); return;
     }
     if (lateBy > 1.0 && isFinite(player.duration)) {
@@ -106110,6 +106339,40 @@ async function djVoicePoll(immediate) {
     const data = await api("/api/dj/voice?since=" + djVoiceSeen);
     const clips = data.clips || [];
     const serverMs = Number(data.server_ms || Date.now());
+    /* #1147: the server's feed epoch. It advances on a resume AND on a
+     * reboot; everything this page banked from before it is a dead
+     * process's schedule - flush the queue and stop a stale clip that is
+     * still sounding, or the two schedules garble over each other. */
+    const cutMs = Number(data.cut_ms || 0);
+    if (cutMs && cutMs > djVoiceCut) {
+      djVoiceCut = cutMs;
+      for (let i = djVoiceQueue.length - 1; i >= 0; i -= 1) {
+        if (Number(djVoiceQueue[i].ts || 0) <= cutMs) {
+          djVoiceQueue.splice(i, 1);
+        }
+      }
+      if (djVoiceNow && Number(djVoiceNow.ts || 0) <= cutMs) {
+        /* #1147 review: orphan the in-flight closure FIRST - its armed
+         * guards and pending play() promise otherwise fire minutes
+         * later into the fresh show, clobbering flags a live clip owns
+         * and restarting dead audio: the very garble being flushed. */
+        djVoiceEpoch += 1;
+        (djVoiceEls || []).forEach((a) => {
+          if (a && a.src) {
+            try { a.pause(); a.removeAttribute("src"); a.load(); } catch (e) {}
+          }
+        });
+        djVoiceBusy = false;
+        djVoiceLive = 0;
+        djVoiceNow = null;
+        djStreamNow = null;
+        djStreamLiveId = "";
+        djSpeaking = false;
+        djApplyGain();
+        djTalkMarkLive();
+        setTimeout(djVoiceNext, 50);   // the fresh backlog must not wait
+      }
+    }
     clips.forEach((clip) => {
       djVoiceSeen = Math.max(djVoiceSeen, clip.ts);
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
@@ -127073,9 +127336,22 @@ async function clockPoll() {
     stateAt = Date.now();
     pineSoloGate(c);                                        // #1008
     /* #1138: the station is paused - this listener goes quiet with it. */
+    stationPaused = !!c.paused;          // #1147: voiceNext reads this
     if (c.paused) {
       if (audio && !audio.paused) audio.pause();
+      /* #1147: the BOOTH goes quiet too - this path silenced only the
+       * record while the voice element played on through the pause.
+       * The single-element road has no held/resume bookkeeping, so a
+       * paused clip is simply over: reset the pipeline rather than
+       * wedging voiceBusy true forever (review catch). */
+      if (voice && !voice.paused) {
+        try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
+        voiceBusy = false;
+        voiceNowTs = 0;
+        if (ducking) { ducking = false; applyLevels(); }
+      }
     } else if (c.playing && c.url) {
+      if (!stationPaused) { try { voiceNext(); } catch (e) {} }
       retime({id: c.id, url: c.url}, c.server_ms, c.started_ms, c.seconds);
     }
   } catch (error) { /* the show goes on */ }
@@ -127124,6 +127400,9 @@ function patter(state) {
  * with the same `since`; their overlapping answers doubled and reordered
  * the queue, which is dialogue playing out of sequence. */
 let pollLive = 0;    // timestamp: a hung fetch stalls 20s, not forever
+let voiceCut = 0;    // #1147: server feed epoch - older clips are history
+let voiceNowTs = 0;  // #1147: ts of the clip sounding right now (0 = none)
+let stationPaused = false;   // #1147: mirrors the clock's paused flag
 const voiceMarks = new Set();
 
 async function poll() {
@@ -127151,6 +127430,28 @@ async function pollOnce() {
     const data = await api("/api/dj/voice?since=" + voiceSeen
                            + (voiceRate ? "&br=" + voiceRate : ""));
     const serverMs = Number(data.server_ms || Date.now());
+    /* #1147: the server's feed epoch advanced (a resume or a reboot) -
+     * everything banked before it belongs to a dead schedule. */
+    const cutMs = Number(data.cut_ms || 0);
+    if (cutMs && cutMs > voiceCut) {
+      voiceCut = cutMs;
+      for (let i = voiceQueue.length - 1; i >= 0; i -= 1) {
+        if (Number(voiceQueue[i].ts || 0) <= cutMs) {
+          voiceRelease(voiceQueue[i].url);
+          voiceQueue.splice(i, 1);
+        }
+      }
+      /* #1147 review: stop a STALE clip still sounding, or a dead
+       * process's multi-minute burst plays out over the new schedule
+       * while every fresh clip queues behind it and goes stale. */
+      if (voiceNowTs && voiceNowTs <= cutMs) {
+        try { voice.pause(); voice.removeAttribute("src"); voice.load(); } catch (e) {}
+        voiceBusy = false;
+        voiceNowTs = 0;
+        if (ducking) { ducking = false; applyLevels(); }
+        voiceNext();
+      }
+    }
     (data.clips || []).forEach((clip) => {
       voiceSeen = Math.max(voiceSeen, clip.ts);
       clip.broadcastAt = Date.now() + Number(clip.broadcast_ms || clip.ts) - serverMs;
@@ -127170,7 +127471,12 @@ async function pollOnce() {
         // #999: stamp the listener's rate on ONCE, here, so the prefetch
         // and the play use the identical URL and the cache lines up.
         clip.url = clipUrl(clip.url);
-        voiceQueue.push(clip);
+        // #1147: a reply outranks the queue (#206) - see the panel twin.
+        if (String(clip.kind || "") === "reply") {
+          voiceQueue.unshift(clip);
+        } else {
+          voiceQueue.push(clip);
+        }
         // #998: START THE DOWNLOAD NOW, NOT AT AIR TIME. This is the
         // earliest instant the clip is known to exist, which is what the
         // seven-second broadcast lead was created to buy.
@@ -127236,10 +127542,33 @@ function voiceRelease(url) {
 }
 
 function voiceNext() {
+  if (stationPaused) return;   // #1147: a paused station starts nothing
   if (voiceBusy || !voiceQueue.length) return;
   // #998: PEEK. This used to shift the clip off and unshift it back on
   // every time it was too early, and each pass armed another timer.
-  const clip = voiceQueue[0];
+  let clip = voiceQueue[0];
+  /* #1147: hopeless clips die before the element is touched - a stream
+   * later than its own length, a sting later than punctuation can bear,
+   * a single line 8+ seconds dead. A backlog of them (a reboot outage,
+   * a sleeping phone) used to drain as one-second garbled fragments. */
+  while (clip) {
+    const lateNow = (Date.now() - Number(clip.broadcastAt || Date.now())) / 1000;
+    const streamLen = clip.stream ? Number(clip.stream.length || 0) : 0;
+    const hopeless =
+      (streamLen > 0 && lateNow >= streamLen)
+      || (clip.sting && lateNow > 3)
+      || (!clip.stream && !clip.sting && lateNow > 15);
+    if (!hopeless) break;
+    voiceQueue.shift();
+    voiceRelease(clip.url);
+    clip = voiceQueue[0];
+  }
+  if (!clip) {
+    /* #1147 review: an emptied queue must release the duck, or a phone
+     * that slept through a round wakes to music stuck at 25%. */
+    if (ducking && !voiceBusy) { ducking = false; applyLevels(); }
+    return;
+  }
   // Whatever is coming, start pulling it now - and warm the couple
   // behind it too, because a banter round arrives as one poll.
   voicePrefetch(clip.url);
@@ -127252,23 +127581,39 @@ function voiceNext() {
     if (voiceTimer) clearTimeout(voiceTimer);
     voiceTimer = setTimeout(() => { voiceTimer = null; voiceNext(); },
                             waitForAir);
+    /* #1147: a 45-second announce lead must not hold the music ducked
+     * with nothing sounding. The clip's own start re-ducks at air time. */
+    if (ducking) { ducking = false; applyLevels(); }
     return;
   }
   voiceQueue.shift();
   voiceBusy = true;
+  voiceNowTs = Number(clip.ts || 0);     // #1147: for the cut flush
   // Duck the music under the DJ, exactly like a real one talking over it.
   // A flag, not a captured level: the old version read audio.volume before
   // the first clip of a run and wrote it back after, which meant a slider
   // moved mid-round was undone the moment the DJ stopped talking.
   ducking = true;
   applyLevels();
+  /* #1147 review: finish is reachable twice for one clip - once from
+   * the metadata drop branch, again when pausing rejects the pending
+   * play() promise into .catch(finish). The second call used to clear
+   * voiceBusy under the successor clip and re-enter voiceNext, killing
+   * it mid-load - a fragment cascade. Once means once. */
+  let finished = false;
   const done = () => {
     voiceBusy = false;
+    voiceNowTs = 0;
     if (voiceQueue.length) { voiceNext(); return; }
     ducking = false;
     applyLevels();
   };
-  const finish = () => { voiceRelease(clip.url); done(); };
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    voiceRelease(clip.url);
+    done();
+  };
   voice.onended = finish;
   voice.onerror = finish;
   voice.onloadedmetadata = () => {
@@ -127290,6 +127635,9 @@ function voiceNext() {
      * honestly nothing of it left to play. */
     const lateBy = Math.max(0, (Date.now() - broadcastAt) / 1000);
     if (isFinite(voice.duration) && lateBy >= voice.duration) {
+      /* #1147: stop the element before advancing - the pending play()
+       * otherwise sounds the dropped clip under the next one. */
+      try { voice.pause(); } catch (e) {}
       finish(); return;
     }
     if (lateBy > 1.0 && isFinite(voice.duration)) {
@@ -127314,6 +127662,20 @@ function tune() {
   if (!audio) {
     audio = new Audio(); audio.preload = "auto";
     voice = new Audio(); voice.preload = "auto";
+    /* #1147: STAMPED and IN THE DOCUMENT, so the desktop's per-stream
+     * volume gating (#789/#981) and the #1008 solo gate can see these
+     * two - both discover elements via querySelectorAll, which never
+     * reaches a detached Audio object (review catch). Untagged and
+     * detached, a background Radio tab was a permanently-audible second
+     * copy of the whole broadcast that no control could silence. */
+    try {
+      audio.dataset.pineLive = "music";
+      voice.dataset.pineLive = "voice";
+      audio.style.display = "none";
+      voice.style.display = "none";
+      document.body.appendChild(audio);
+      document.body.appendChild(voice);
+    } catch (e) {}
     // Establish and unlock the gain graph inside the listener's tap. This is
     // the moment mobile browsers permit Web Audio to alter playback levels.
     listenerGain(audio); listenerGain(voice);

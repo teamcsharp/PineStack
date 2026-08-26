@@ -741,6 +741,21 @@ app.on("session-created", (sess) => {
 
 app.on("web-contents-created", (event, contents) => {
   if (contents.getType() !== "webview") return;
+  // #1147: a popup from a webview is a separate BrowserWindow that no
+  // volume, mute, pause or FM-off logic ever reaches - one click on the
+  // panel's open-the-station link made an ungoverned third copy of the
+  // broadcast playing behind the main window. Links open in the system
+  // browser; the app's own windows stay the app's.
+  contents.setWindowOpenHandler(({ url }) => {
+    const u = String(url || "");
+    // An empty/about:blank popup is page-authored content (the PDF
+    // export writes into one) - it plays no broadcast and stays.
+    if (!u || u === "about:blank") return { action: "allow" };
+    try {
+      if (/^https?:/i.test(u)) shell.openExternal(u);
+    } catch { /* a link that will not open is still not a rogue player */ }
+    return { action: "deny" };
+  });
   contents.on("before-input-event", (ev, input) => {
     if (input.type === "keyDown" && input.key === "F5") {
       ev.preventDefault();
