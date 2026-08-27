@@ -12338,16 +12338,28 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                     _learning = max(1.0, float(_factor(kind) or 1.0))
             except Exception:  # noqa: BLE001
                 _learning = 1.0
+            # #1150: ...and the OPERATOR's standing judgment, the weight
+            # earned by what they have told the orchestrator is valuable.
+            # Same contract as the learning factor: ordering only.
+            _judged = 1.0
+            try:
+                _jf = globals().get("coord_judgment_factor")
+                if callable(_jf):
+                    _judged = float(_jf(kind) or 1.0)
+            except Exception:  # noqa: BLE001
+                _judged = 1.0
             _base_rate = (round(gain / max(0.1, cost), 3)
                           if _voice_only else task_rate(kind))
             rows.append({"kind": kind,
                          "label": TASK_LABEL.get(kind, kind),
                          "cost": round(cost, 1),
                          "airtime": round(gain, 1),
-                         "rate": round(_base_rate * _learning, 3),
+                         "rate": round(_base_rate * _learning * _judged, 3),
                          "base_rate": round(_base_rate, 3),
                          "learning_factor": round(_learning, 3),
-                         "need": round(prep_need(kind) * _learning, 2),
+                         "judgment_factor": round(_judged, 3),
+                         "need": round(prep_need(kind) * _learning
+                                       * _judged, 2),
                          "measured": task_stat(kind).get("measured", False),
                          # #989 (B5): words already written; this road
                          # needs a voice, not another script.
@@ -24131,6 +24143,26 @@ def radio_pause_set(on: bool) -> bool:
                 _PAGE_AIR_UNTIL[0] = 0.0
             except Exception:  # noqa: BLE001
                 pass
+            # #1150: FRESHNESS COUNTS AIR TIME. Every round and bulletin
+            # spent the pause unheard, so its clock steps forward by the
+            # length of the sleep - without this, a two-hour pause aged
+            # two hours of freshness off stock that never got its chance,
+            # and the larder bled ~24s of banter a minute while the
+            # operator watched a paused station "fall behind".
+            try:
+                slept = max(0.0, now - float(_RADIO.get("paused_at") or now))
+                if slept > 60:
+                    for _e in _LARDER:
+                        if isinstance(_e, dict) and _e.get("at"):
+                            _e["at"] = float(_e["at"]) + slept
+                    for _row in (_SHELF.get("news") or []):
+                        if isinstance(_row, dict) \
+                                and _row.get("prep_news_at"):
+                            _row["prep_news_at"] = (
+                                float(_row["prep_news_at"]) + slept)
+                    _larder_save()
+            except Exception:  # noqa: BLE001
+                pass
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = now if on else 0.0
         # #1138: the record was stopped the moment the pause began, so
@@ -24975,11 +25007,23 @@ async def larder_keeper() -> None:
         # empty long after a model slot became available.
         await asyncio.sleep(3)
         try:
+            # #1150: A PAUSED STATION MAY NOT EAT ITS OWN LARDER. This
+            # prune ages rounds by WALL clock, and a pause is exactly
+            # the stretch in which nothing airs to justify the eating -
+            # measured live, banter bled ~24s of held stock a minute
+            # across a pause as rows crossed larder_fresh() unheard,
+            # which is the operator's "the orchestrator is falling
+            # behind when the station is paused". Off air, an UNAIRED
+            # round is kept whatever its age (the resume path then ages
+            # every stamp by the length of the sleep, so freshness
+            # counts air time, not kitchen time).
+            _paused_hold = radio_paused()
             _LARDER[:] = [e for e in _LARDER
                           if (time.time() - e["at"] < larder_fresh()
                               or (shelf_is_repeat("banter", e)
                                   and time.time() - float(e.get("at") or 0)
-                                  <= REPEAT_KEEP_SECONDS))
+                                  <= REPEAT_KEEP_SECONDS)
+                              or (_paused_hold and row_unaired(e)))
                           and _larder_current(e)]
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
@@ -25977,6 +26021,20 @@ def slot_read(idx: int, stock: dict[str, int] | None = None
                           "it" + (f", {_repeats} of them out of the "
                                   "cupboard (#1052)" if _repeats else ""))
             return out
+        # #1150: THE CLOCK IS STOPPED. This desk was the one place in
+        # the demand system whose deadline denominator ran on the wall
+        # clock with no pause branch - room drained second by second
+        # against a constant cost, the verdict walked covered → tight →
+        # at risk → cannot, and the operator watched a PAUSED station
+        # "fall behind" while it was burning nothing. The shortfall list
+        # above stays honest (it is what the workshop works from); only
+        # the time panic is suspended, because a slot cannot open until
+        # the operator resumes - the pause itself is the room.
+        if radio_paused():
+            out["verdict"] = "banking"
+            out["why"] = (f"{int(out['cost'])}s of work to bank and the "
+                          "clock is stopped - the pause is the room")
+            return out
         # THE NEGOTIATION. Does the shortfall fit in the room left?
         if out["cost"] <= out["room"] * 0.6:
             out["verdict"] = "covered"
@@ -26688,7 +26746,7 @@ def orch_decide_alone() -> dict[str, Any]:
                     picks[str(i)] = str(first["does"])
             if not picks:
                 continue
-            got = orch_answer(str(row.get("id")), picks)
+            got = orch_answer(str(row.get("id")), picks, alone=True)
             # Mark it as the station's own call, not the operator's.
             with _ORCH_LOCK:
                 seat = next((r for r in _ORCH["asks"]
@@ -26719,6 +26777,281 @@ def orch_decide_alone() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+# --- THE JUDGMENT BOOK (#1150) ----------------------------------------
+# The orchestrator has asked questions since #1056 and thrown the
+# reasoning away: an answer became one enum on the policy board and the
+# WHY - the situation, the choice, whose call it was - vanished. The
+# book keeps all of it, and distils it into two things the machinery
+# can actually hold: a bounded per-road FACTOR (what the operator has
+# said is valuable, weighed beside the closed-hour learning factor at
+# the same two planning sites) and a one-line LESSON per road (the
+# operator's words, carried into regenerate prompts the way tint_lesson
+# rides the crystal). The station's own unanswered-guess decisions land
+# in the same book marked alone=True - those are the rows most worth
+# correcting, and the hour that disproves a judgment raises a targeted
+# question quoting it, with the evidence.
+JUDGMENT_PATH = data_path("judgment_ledger.json")
+JUDGMENT_KEEP = 400
+_JUDGMENT_LOCK = RLock()
+_JUDGMENT: dict[str, Any] = {"rows": [], "roads": {}, "read": False}
+
+
+def _judgment_load() -> None:
+    if _JUDGMENT.get("read"):
+        return
+    with _JUDGMENT_LOCK:
+        if _JUDGMENT.get("read"):
+            return
+        try:
+            if JUDGMENT_PATH.exists():
+                got = json.loads(JUDGMENT_PATH.read_text())
+                if isinstance(got, dict):
+                    _JUDGMENT["rows"] = [r for r in (got.get("rows") or [])
+                                         if isinstance(r, dict)]
+                    _JUDGMENT["roads"] = {
+                        str(k): dict(v) for k, v in
+                        (got.get("roads") or {}).items()
+                        if isinstance(v, dict)}
+        except Exception:  # noqa: BLE001
+            pass            # an unreadable book is never clobbered blank
+        _JUDGMENT["read"] = True
+
+
+def _judgment_save() -> None:
+    try:
+        with _JUDGMENT_LOCK:
+            del _JUDGMENT["rows"][JUDGMENT_KEEP:]
+            JUDGMENT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = JUDGMENT_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(
+                {"rows": _JUDGMENT["rows"],
+                 "roads": _JUDGMENT["roads"]}, indent=1, default=str))
+            tmp.replace(JUDGMENT_PATH)
+    except Exception:  # noqa: BLE001
+        pass                            # a forgetful book still judges
+
+
+def coord_judgment_factor(road: str) -> float:
+    """The operator's standing weight on this road. 1.0 = no opinion;
+    bounded both ways because a judgment is a thumb on the scale, not a
+    replacement for the deadline law."""
+    _judgment_load()
+    try:
+        return max(0.5, min(2.0, float(
+            (_JUDGMENT["roads"].get(str(road)) or {}).get("factor")
+            or 1.0)))
+    except Exception:  # noqa: BLE001
+        return 1.0
+
+
+def judgment_lesson(road: str) -> str:
+    """The operator's most recent words about this road, for a prompt."""
+    _judgment_load()
+    try:
+        return str((_JUDGMENT["roads"].get(str(road)) or {}).get("lesson")
+                   or "")[:400]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+_JUDGMENT_ROAD_VERBS = {
+    # verb -> (factor multiplier, is an endorsement)
+    "drive": (1.20, True), "prefer": (1.15, True),
+    "thin": (0.85, False), "postpone": (0.90, False),
+}
+
+
+def judgment_note(topic: str, ask: str, face: str, does: str, why: str,
+                  alone: bool) -> None:
+    """One answered question into the book, and its road weight moved.
+
+    A choice the operator made moves the weight; a choice the station
+    took alone (#1081) moves it HALF as far - a guess is a lighter
+    thumb than an instruction, and the graph shows which was which."""
+    _judgment_load()
+    try:
+        verb, _, arg = str(does or "").partition(":")
+        road = str(arg or "").split(":")[-1] if arg else ""
+        row = {
+            "at": time.time(), "topic": str(topic)[:60],
+            "ask": str(ask or "")[:300], "face": str(face or "")[:200],
+            "does": str(does or "")[:80], "why": str(why or "")[:600],
+            "alone": bool(alone),
+            "context": {"paused": radio_paused(),
+                        "short": hour_short_kinds()[:6]},
+        }
+        with _JUDGMENT_LOCK:
+            _JUDGMENT["rows"].insert(0, row)
+            move = _JUDGMENT_ROAD_VERBS.get(verb)
+            if move and road and road not in ("keep", "none"):
+                mult, endorse = move
+                if alone:
+                    mult = 1.0 + (mult - 1.0) * 0.5
+                seat = _JUDGMENT["roads"].setdefault(road, {"factor": 1.0})
+                seat["factor"] = round(
+                    max(0.5, min(2.0, float(seat.get("factor") or 1.0)
+                                 * mult)), 3)
+                seat["at"] = time.time()
+                seat["alone"] = bool(alone)
+                if endorse and not alone:
+                    seat["lesson"] = (str(face or "")[:180]
+                                      + (" - " + str(why or "")[:180]
+                                         if why else ""))
+        _judgment_save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def judgment_move(road: str, move: str, who: str = "operator") -> str:
+    """#1150: the graph's dial - value a road more, less, or let it go.
+    Direct operator judgment, same bounded weight, written in the book."""
+    _judgment_load()
+    road = str(road or "")
+    said = ""
+    try:
+        with _JUDGMENT_LOCK:
+            seat = _JUDGMENT["roads"].setdefault(road, {"factor": 1.0})
+            factor = float(seat.get("factor") or 1.0)
+            if move == "more":
+                factor = min(2.0, factor * 1.2)
+                said = f"{SHELF_LABEL.get(road, road)} is valued higher"
+            elif move == "less":
+                factor = max(0.5, factor * 0.8)
+                said = f"{SHELF_LABEL.get(road, road)} is valued lower"
+            elif move == "ease":
+                factor = factor + (1.0 - factor) * 0.5
+                said = (f"{SHELF_LABEL.get(road, road)}'s judgment eases "
+                        "toward level")
+            else:
+                factor = 1.0
+                seat.pop("lesson", None)
+                said = f"{SHELF_LABEL.get(road, road)} returns to level"
+            seat["factor"] = round(factor, 3)
+            seat["at"] = time.time()
+            seat["alone"] = False
+            _JUDGMENT["rows"].insert(0, {
+                "at": time.time(), "topic": "dial",
+                "ask": f"the {who} turned the dial on {road}",
+                "face": said, "does": f"judgment:{move}:{road}",
+                "why": "", "alone": False,
+                "context": {"paused": radio_paused(),
+                            "short": hour_short_kinds()[:6]}})
+        _judgment_save()
+    except Exception:  # noqa: BLE001
+        pass
+    return said or "noted"
+
+
+def judgment_hour_close(road: str, met: bool, attainment: float) -> None:
+    """A met hour decays the judgment toward level, exactly as the
+    learning factor decays its premium - a standing instruction that has
+    been satisfied stops shouting."""
+    _judgment_load()
+    try:
+        with _JUDGMENT_LOCK:
+            seat = _JUDGMENT["roads"].get(str(road))
+            if not seat:
+                return
+            factor = float(seat.get("factor") or 1.0)
+            if met and abs(factor - 1.0) > 0.001:
+                seat["factor"] = round(factor + (1.0 - factor) * 0.10, 3)
+                seat["last_attainment"] = round(float(attainment), 4)
+        _judgment_save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def judgment_reask(roads: dict[str, Any]) -> None:
+    """#1150: a judgment the hour just disproved comes back as a
+    QUESTION carrying the evidence - the #1134 precedent, aimed at the
+    operator instead of the ladder. This is the loop the operator asked
+    for: judgment -> applied -> measured -> re-examined, out loud."""
+    _judgment_load()
+    try:
+        for road, row in roads.items():
+            seat = _JUDGMENT["roads"].get(str(road)) or {}
+            factor = float(seat.get("factor") or 1.0)
+            attainment = float(row.get("attainment") or 0)
+            if factor <= 1.15 or attainment >= 0.6 or row.get("met"):
+                continue
+            topic = f"judgment_{road}"
+            if _orch_recent(topic):
+                continue
+            label = SHELF_LABEL.get(str(road), str(road))
+            orch_raise(
+                topic,
+                f"You told me {label} is worth {factor:.2f}x the usual "
+                f"push{' (my own standing guess)' if seat.get('alone') else ''}"
+                f" - and it still closed its hour at "
+                f"{int(attainment * 100)}%. The judgment and the result "
+                "disagree; which one gives?",
+                "soon",
+                [{"ask": f"Hold the {label} judgment?",
+                  "options": [
+                      _opt("Keep pushing it", f"judgment:more:{road}",
+                           "the shortfall is the reason to push harder"),
+                      _opt("Ease it toward level", f"judgment:ease:{road}",
+                           "let the deadlines speak for themselves"),
+                      _opt("Drop the judgment", f"judgment:drop:{road}",
+                           "the hour is the better witness"),
+                  ]}])
+            break                       # one at a time, like the asking
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- THE PAUSE WORKSHOP (#1150) ---------------------------------------
+# "if anything, it should be making and enhancing content and making
+# the banter better and better." Off air and COVERED, once every half
+# hour the station takes its oldest owned banter round and commissions
+# a hotter rewrite of it (#941's regenerate road, which had no
+# automatic driver), carrying the operator's standing judgment about
+# banter as the note the writer reads. Short roads always outrank
+# polish - the workshop only runs when nothing is short.
+_WORKSHOP_LAST = [0.0]
+
+
+async def workshop_tick() -> None:
+    try:
+        if not radio_paused() or not _RADIO.get("on"):
+            return
+        if hour_short_kinds():
+            return                      # bank first; polish after
+        if time.time() - _WORKSHOP_LAST[0] < 1800:
+            return
+        if _LARDER_WRITING[0] or _OLLAMA_GATE.locked():
+            return
+        wanted = committed_stock_ids("banter", ready=False)
+        oldest = None
+        for entry in _LARDER:
+            if not isinstance(entry, dict):
+                continue
+            if alt_sid("banter", entry) in wanted:
+                oldest = entry
+                break                   # _LARDER is in order: oldest first
+        if oldest is None:
+            return
+        _WORKSHOP_LAST[0] = time.time()
+        sid = alt_sid("banter", oldest)
+        note = judgment_lesson("banter") or (
+            "make it better than the round it replaces - sharper, "
+            "funnier, more itself")
+        job = "wk" + uuid.uuid4().hex[:8]
+        fire_and_forget(regenerate_job(job, "banter", sid, 0.6, note, True))
+        pipeline_log(
+            "lookahead",
+            "(#1150) the pause workshop commissioned a hotter rewrite of "
+            "the oldest banked round"
+            + (" carrying the operator's standing judgment"
+               if judgment_lesson("banter") else ""),
+            extra="THE WORKSHOP (#1150)\n\nOff air and covered, the "
+                  "station spends the quiet making the banter better "
+                  "rather than standing still. Note handed to the "
+                  "writer:\n\n" + note)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def orch_routine_questions() -> list[dict[str, Any]]:
@@ -26860,13 +27193,20 @@ def orch_apply(does: str) -> str:
             _ORCH["policy"]["thin_road"] = {
                 "value": str(arg), "at": time.time()}
             said = f"fewer {SHELF_LABEL.get(str(arg), str(arg))} per hour"
+        elif verb == "judgment":
+            # #1150: the judgment book's own dial - "judgment:more:banter",
+            # ease, less, drop. Raised by the evidence re-ask and by the
+            # logic graph's controls.
+            move, _, road = str(arg).partition(":")
+            said = judgment_move(str(road), str(move))
         orch_save()
     except Exception:  # noqa: BLE001
         said = said or "noted"
     return said or "noted"
 
 
-def orch_answer(ask_id: str, picks: dict[str, Any]) -> dict[str, Any]:
+def orch_answer(ask_id: str, picks: dict[str, Any],
+                alone: bool = False) -> dict[str, Any]:
     """#1056: the operator has answered. Apply every choice and remember
     it, so the same question does not come back with the same evidence."""
     orch_load()
@@ -26891,6 +27231,14 @@ def orch_answer(ask_id: str, picks: dict[str, Any]) -> dict[str, Any]:
             chosen.append({"ask": q.get("ask"), "face": opt.get("face"),
                            "does": opt.get("does"), "did": did})
             out["did"].append(did)
+            # #1150: the reasoning goes in the judgment book, not the
+            # bin - the situation, the words, and whose call it was.
+            judgment_note(topic=str(row.get("topic") or ""),
+                          ask=str(q.get("ask") or ""),
+                          face=str(opt.get("face") or ""),
+                          does=str(opt.get("does") or ""),
+                          why=str(row.get("why") or ""),
+                          alone=bool(alone))
         row["answered"] = {"at": time.time(), "picks": chosen}
         orch_save()
         out["ok"] = True
@@ -27052,14 +27400,21 @@ def cupboard_rotate() -> dict[str, Any]:
                 drop.append(row)
             if not drop:
                 continue
+            removed_keys: set[str] = set()
             for row in drop:
                 if shelf_cast_stale(row):
                     out["recast"] += 1
                 else:
                     out["aged"] += 1
-                for key in _row_clip_keys(row):
-                    _PANTRY.pop(key, None)
+                removed_keys.update(_row_clip_keys(row))
             _SHELF[kind] = [r for r in rows if r not in drop]
+            # #1150: content-addressed clips may be shared - the same
+            # guard coord_retire uses (#1141). This pop skipped it, so
+            # rotating one row could delete a take another row still
+            # counted on, and prepared_seconds fell with nothing airing.
+            still_held = pantry_spoken_for()
+            for key in removed_keys - still_held:
+                _PANTRY.pop(key, None)
         if out["recast"] or out["aged"]:
             pipeline_log(
                 "lookahead",
@@ -27417,6 +27772,13 @@ async def retint_shelf() -> str:
         # costs nothing to re-cut because nothing is waiting on it.
         if not free and surplus() <= 0 and not radio_paused():
             return ""
+        # #1150: ...but the later pass must not eat a SHORT road's
+        # finished audio. A paused station funds the crystal at 0.90 and
+        # the re-render trails by minutes, so polishing a road that is
+        # the hole turned the workshop into the leak. Covered roads
+        # polish; short ones bank.
+        if not free and str(kind) in hour_short_kinds():
+            return ""
         target = dialogue_entry(row) or row
         _was = str(target.get("script") or target.get("text") or "")
         if not await ensure_shelf_row_tinted(str(kind), row, critical=False):
@@ -27509,6 +27871,12 @@ async def retint_one() -> str:
                 continue
             if entry.get("preparing") or entry.get("tinting"):
                 continue                # #1077: do not race the preparer
+            # #1150: same rule as the shelf - while banter is short, only
+            # a round with no finished audio may take the crystal, or the
+            # tint wipes the very render the hour is short of.
+            if (dialogue_audio_ready("banter", entry)
+                    and "banter" in hour_short_kinds()):
+                continue
             got = entry.get("tint")
             if isinstance(got, dict) and got.get("ok"):
                 continue
@@ -29024,6 +29392,11 @@ def schedule_jammed() -> str:
     and it is the ONLY circumstance in which a quota may now displace an
     entry the running order has named. Returns the reason, or ""."""
     try:
+        # #1150: a paused sheet is not jammed - the playhead is frozen
+        # on purpose, and this read had no pause branch, so it reported
+        # a jam after 1.5x owns of ANY pause.
+        if radio_paused():
+            return ""
         pos = _RADIO.get("sched_pos") or {}
         started = float(pos.get("started") or 0)
         if started <= 0:
@@ -29068,7 +29441,15 @@ def schedule_adherence() -> dict[str, Any]:
         if slot:
             pos = _RADIO.get("sched_pos") or {}
             owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
-            through = max(0.0, time.time() - float(pos.get("started") or 0))
+            # #1150: while paused the playhead is frozen (#1108); wall
+            # time is not "through" anything. This read was only saved
+            # by schedule_take() incidentally rewriting sched_pos on
+            # every poll - honour the freeze directly.
+            through = (max(0.0, float(
+                           _RADIO.get("paused_sched_elapsed") or 0))
+                       if radio_paused()
+                       else max(0.0, time.time()
+                                - float(pos.get("started") or 0)))
             road = str(SCHED_PREP_KIND.get(str(slot.get("kind") or ""))
                        or slot.get("kind") or "")
             need = (hour_needs() or {}).get(road) or {}
@@ -29499,6 +29880,8 @@ def coord_hour_close(at: float | None = None) -> dict[str, Any]:
         }
         decisions.append({"road": road, "met": met,
                           "factor": round(factor, 3), "action": action})
+        # #1150: a satisfied hour lets the operator's judgment ease too.
+        judgment_hour_close(road, met, attainment)
     # #1134: THE LADDER MAY NOT CONTRADICT THE SCORECARD. Measured live:
     # the policy board said drive_road=gallery ("build it first until it
     # is covered") AND postpone_first=gallery ("it gives way first") at
@@ -29534,6 +29917,9 @@ def coord_hour_close(at: float | None = None) -> dict[str, Any]:
                 + " (#1134)")
     except Exception:  # noqa: BLE001
         pass
+    # #1150: a judgment the hour just disproved comes back as a question
+    # carrying the evidence - the loop that makes an answer a lesson.
+    judgment_reask(roads)
     end_inventory = coord_hour_inventory(fresh=True)
     report = {
         "id": active.get("id"), "started_at": active.get("started_at"),
@@ -30887,10 +31273,21 @@ def coord_plan(report: dict[str, Any] | None = None) -> dict[str, Any]:
                 task["why"] = (task["why"] + f"; its closed-hour miss "
                                f"premium is {learned:.2f}x until it proves "
                                "the requirement can be held")
+            # #1150: and the OPERATOR's standing judgment - the weight
+            # their answers earned in the judgment book, bounded both
+            # ways. Deadlines stay the law; this is the thumb.
+            judged = coord_judgment_factor(road)
+            task["judgment_factor"] = round(judged, 3)
+            if abs(judged - 1.0) > 0.001:
+                task["want_seconds"] = round(
+                    float(task["want_seconds"]) * judged, 1)
+                task["why"] = (task["why"] + f"; the operator's standing "
+                               f"judgment weighs it {judged:.2f}x")
         plan["tasks"].sort(key=lambda t: (
             0 if t.get("bare") else 1,          # bare and coming: first
             float(t.get("due_in") or 1e9),      # then by deadline
             -float(t.get("learning_factor") or 1.0),
+            -float(t.get("judgment_factor") or 1.0),   # #1150
             -float(t["bled_seconds"]),          # then #942's ordering
             -float(t["want_seconds"])))
         plan["upcoming"] = coord_upcoming()[:10]
@@ -31135,6 +31532,13 @@ async def coordinator() -> None:
                     pass
                 try:
                     orch_scan()                                   # #1056
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    # #1150: off air and covered, the quiet is spent
+                    # making the banter better rather than standing by.
+                    if radio_paused():
+                        fire_and_forget(workshop_tick())
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -74153,6 +74557,93 @@ async def api_orch_scan(
     return {"raised": bool(got), "ask": got, "open": len(orch_open())}
 
 
+@app.get("/api/orchestrator/logic")
+async def api_orch_logic(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1150: the orchestrator's whole reasoning, composed for the graph.
+
+    Pure composition of state that already exists - demand, stock,
+    learning, the operator's judgments, the plan, the execution order
+    and the last closed hour - so the panel can draw the logic as a
+    directed flow and the operator can see exactly how the station
+    keeps ahead of demand, and turn the dials that steer it."""
+    require_read_auth(authorization)
+    _judgment_load()
+    orch_load()
+    needs = _hour_needs_with_cover()
+    tasks = {str(t.get("road")): t
+             for t in (_COORD_PLAN.get("tasks") or [])}
+    roads: dict[str, Any] = {}
+    for road, row in needs.items():
+        judged = _JUDGMENT["roads"].get(road) or {}
+        roads[road] = {
+            "label": SHELF_LABEL.get(road, road),
+            "owed": round(float(row.get("owed") or 0), 1),
+            "held": round(float(row.get("held") or 0), 1),
+            "uncovered": round(float(row.get("uncovered") or 0), 1),
+            "cost": round(float(task_cost(road) or 0), 1),
+            "learning": dict(_HOUR_LEARNING.get(road) or {}),
+            "judgment": {
+                "factor": coord_judgment_factor(road),
+                "lesson": str(judged.get("lesson") or ""),
+                "at": float(judged.get("at") or 0),
+                "alone": bool(judged.get("alone")),
+            },
+            "task": ({k: tasks[road].get(k) for k in
+                      ("want_seconds", "held_seconds", "due_in", "bare",
+                       "learning_factor", "judgment_factor", "why")}
+                     if road in tasks else None),
+        }
+    board = slot_board(2)
+    hour = dict(_HOURS[-1]) if _HOURS else {}
+    return {
+        "at": time.time(),
+        "on": bool(_RADIO.get("on")), "paused": radio_paused(),
+        "hours_ready": round(prepared_seconds() / 3600.0, 2),
+        "target_hours": round(prepare_target_seconds() / 3600.0, 2),
+        "roads": roads,
+        "order": coord_order(),
+        "policy": dict(_ORCH.get("policy") or {}),
+        "ask": (orch_open() or [None])[0],
+        "book": _JUDGMENT["rows"][:12],
+        "alone_count": sum(1 for r in _JUDGMENT["rows"] if r.get("alone")),
+        "slots": {"behind": bool(board.get("behind")),
+                  "verdicts": [{"face": s.get("face"),
+                                "verdict": s.get("verdict"),
+                                "cost": s.get("cost")}
+                               for s in (board.get("slots") or [])]},
+        "hour": {"score": hour.get("score"),
+                 "closed_at": hour.get("closed_at"),
+                 "roads": {k: {"attainment": (v or {}).get("attainment"),
+                               "met": (v or {}).get("met")}
+                           for k, v in (hour.get("roads") or {}).items()}},
+        "workshop": {"last": _WORKSHOP_LAST[0],
+                     "paused_for": round(radio_paused_for(), 1)},
+        "plan_why": str(_COORD_PLAN.get("why") or ""),
+    }
+
+
+@app.post("/api/orchestrator/judgment")
+async def api_orch_judgment(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1150: the graph's dial - {"road": "banter", "move": "more"}.
+    more / less / ease / drop. Every turn lands in the judgment book."""
+    require_auth(authorization)
+    payload = await request.json()
+    road = str(payload.get("road") or "")
+    move = str(payload.get("move") or "")
+    if not road or move not in ("more", "less", "ease", "drop"):
+        raise HTTPException(status_code=400,
+                            detail="road and move (more|less|ease|drop)")
+    said = judgment_move(road, move)
+    return {"ok": True, "said": said,
+            "factor": coord_judgment_factor(road),
+            "lesson": judgment_lesson(road)}
+
+
 @app.get("/api/track-reads")
 async def api_track_reads() -> dict[str, Any]:
     """#1061: THE TRACK LIBRARY - which records have a read on file.
@@ -88260,6 +88751,7 @@ const PINE_3JS = [
   {key: "mind",     label: "🧠 Dialogue Mind",   open: () => mindOpen()},
   {key: "topology", label: "🪐 Mind Topology",   open: () => mindTopologyOpen()},
   {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
+  {key: "orchlogic", label: "🕸 Orchestrator",   open: () => orchLogicPanel()},
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
   {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
   {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen()},
@@ -119725,6 +120217,353 @@ async function orchToast() {
        {transform: "translateY(0)"}],
       {duration: 900, iterations: 3, delay: 500});
   }
+}
+
+/* ---- #1150: THE ORCHESTRATOR'S LOGIC, DRAWN ------------------------
+ * The plexus popup is a mood; this is the readout. Every road runs a
+ * lane left to right through the columns the coordinator actually
+ * reasons in - DEMAND -> STOCK -> JUDGMENT -> LEARNING -> PLAN ->
+ * LAST HOUR - with live numbers, and clicking any node opens it in the
+ * rail, where the operator's judgment dial lives. What the operator
+ * answers, the station keeps (the judgment book) and applies at the
+ * two planning sites the learning factor already uses; this graph is
+ * where those weights are seen, questioned and turned. */
+let orchLogic = null;
+let orchLogicTimer = null;
+
+function orchLogicClose() {
+  if (orchLogicTimer) { clearInterval(orchLogicTimer); orchLogicTimer = null; }
+  if (!orchLogic) return;
+  try { orchLogic.stop(); } catch (e) {}
+  try { orchLogic.host.remove(); } catch (e) {}
+  orchLogic = null;
+}
+
+async function orchLogicPanel() {
+  if (orchLogic) { orchLogicClose(); return; }
+  try { orchPlexusClose(); } catch (e) {}
+  try { crystalClose(); } catch (e) {}
+  try { djGraphClose(); } catch (e) {}
+  try { mindClose(); } catch (e) {}
+  if (!window.THREE) {
+    const tag = document.createElement("script");
+    tag.src = "/vendor/three.min.js";
+    tag.onload = () => orchLogicPanel();
+    document.head.appendChild(tag);
+    return;
+  }
+  let data = null;
+  try { data = await api("/api/orchestrator/logic"); }
+  catch (e) { setStatus("the logic desk did not answer: " + e.message, true); return; }
+
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:340;display:flex;"
+    + "background:rgba(2,4,9,.94)";
+  const stage = el("div", "", "");
+  stage.style.cssText = "flex:1;min-width:0;position:relative";
+  const rail = el("div", "", "");
+  rail.style.cssText = "flex:0 0 360px;overflow:auto;padding:14px 16px;"
+    + "background:#0a0f16;border-left:1px solid #22304a;font-size:12px;"
+    + "line-height:1.55";
+  shade.appendChild(stage); shade.appendChild(rail);
+  document.body.appendChild(shade);
+
+  const close = el("button", "", "✕");
+  close.style.cssText = "position:absolute;top:10px;right:10px;z-index:2";
+  close.onclick = orchLogicClose;
+  stage.appendChild(close);
+
+  const canvas = document.createElement("canvas");
+  canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%";
+  stage.appendChild(canvas);
+  const W = () => stage.clientWidth || 800;
+  const H = () => stage.clientHeight || 600;
+  const renderer = new THREE.WebGLRenderer({canvas, antialias: true});
+  renderer.setSize(W(), H(), false);
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04070c);
+  const camera = new THREE.PerspectiveCamera(50, W() / H(), 1, 400);
+  camera.position.set(0, 0, 46);
+  scene.add(new THREE.AmbientLight(0xffffff, .75));
+  const sun = new THREE.DirectionalLight(0xffffff, .8);
+  sun.position.set(8, 14, 20);
+  scene.add(sun);
+
+  const label = (text, size) => {
+    const c = document.createElement("canvas");
+    const x = c.getContext("2d");
+    const px = 42;
+    x.font = "600 " + px + "px system-ui, sans-serif";
+    c.width = Math.ceil(x.measureText(text).width) + 16;
+    c.height = px + 18;
+    x.font = "600 " + px + "px system-ui, sans-serif";
+    x.fillStyle = "rgba(200,224,255,.92)";
+    x.textBaseline = "middle";
+    x.fillText(text, 8, c.height / 2);
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial(
+      {map: new THREE.CanvasTexture(c), transparent: true}));
+    sp.scale.set((size || 3) * (c.width / c.height), size || 3, 1);
+    return sp;
+  };
+
+  const COLS = [
+    {key: "demand",   face: "DEMAND"},
+    {key: "stock",    face: "STOCK"},
+    {key: "judgment", face: "JUDGMENT"},
+    {key: "learning", face: "LEARNING"},
+    {key: "plan",     face: "PLAN"},
+    {key: "hour",     face: "LAST HOUR"},
+  ];
+  const X0 = -25, XSTEP = 10, Y0 = 10.5, YSTEP = -3.4;
+  const nodes = [];          // {mesh, road, col, base}
+  const group = new THREE.Group();
+  scene.add(group);
+  COLS.forEach((c, i) => {
+    const head = label(c.face, 1.7);
+    head.position.set(X0 + i * XSTEP, Y0 + 3.2, 0);
+    group.add(head);
+  });
+
+  const roadRows = Object.keys(data.roads || {});
+  roadRows.forEach((road, ri) => {
+    const y = Y0 + ri * YSTEP;
+    const name = label(data.roads[road].label || road, 1.5);
+    name.position.set(X0 - 7.2, y, 0);
+    group.add(name);
+    const lineGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(X0, y, 0),
+      new THREE.Vector3(X0 + (COLS.length - 1) * XSTEP, y, 0)]);
+    group.add(new THREE.Line(lineGeo, new THREE.LineBasicMaterial(
+      {color: 0x22304a, transparent: true, opacity: .55})));
+    COLS.forEach((c, ci) => {
+      const mesh = new THREE.Mesh(
+        new THREE.SphereGeometry(1, 20, 16),
+        new THREE.MeshStandardMaterial(
+          {color: 0x35486a, emissive: 0x0a1220, roughness: .45}));
+      mesh.position.set(X0 + ci * XSTEP, y, 0);
+      group.add(mesh);
+      nodes.push({mesh, road, col: c.key, phase: Math.random() * 6.28});
+    });
+  });
+
+  const tone = {
+    good: new THREE.Color(0x2ee08a), warn: new THREE.Color(0xffb454),
+    bad: new THREE.Color(0xff6a5e), idle: new THREE.Color(0x35486a),
+    judge: new THREE.Color(0xb48cff), learn: new THREE.Color(0xff8b6a),
+  };
+  const paint = (d) => {
+    nodes.forEach((n) => {
+      const r = (d.roads || {})[n.road] || {};
+      let color = tone.idle, size = 0.8;
+      if (n.col === "demand") {
+        color = new THREE.Color(0x4bb3ff);
+        size = 0.6 + Math.min(1.6, (r.owed || 0) / 3600);
+      } else if (n.col === "stock") {
+        const frac = r.owed ? Math.min(1.5, (r.held || 0) / r.owed) : 1;
+        color = frac >= 1 ? tone.good : (frac >= .6 ? tone.warn : tone.bad);
+        size = 0.5 + Math.min(1.7, (r.held || 0) / 3600);
+      } else if (n.col === "judgment") {
+        const f = (r.judgment || {}).factor || 1;
+        color = Math.abs(f - 1) < .01 ? tone.idle : tone.judge;
+        size = 0.55 + Math.min(1.4, Math.abs(f - 1) * 2.2);
+      } else if (n.col === "learning") {
+        const f = (r.learning || {}).factor || 1;
+        color = f <= 1.01 ? tone.idle : tone.learn;
+        size = 0.55 + Math.min(1.4, (f - 1) * 1.4);
+      } else if (n.col === "plan") {
+        const t = r.task;
+        color = t ? (t.bare ? tone.bad : tone.warn) : tone.idle;
+        size = t ? 0.7 + Math.min(1.6, (t.want_seconds || 0) / 1800) : 0.45;
+      } else if (n.col === "hour") {
+        const h = ((d.hour || {}).roads || {})[n.road];
+        color = !h ? tone.idle : (h.met ? tone.good
+          : ((h.attainment || 0) >= .6 ? tone.warn : tone.bad));
+        size = 0.6 + (h ? (h.attainment || 0) : 0);
+      }
+      n.mesh.material.color.copy(color);
+      n.mesh.material.emissive.copy(color).multiplyScalar(.25);
+      n.target = size;
+    });
+  };
+  paint(data);
+
+  /* THE RAIL. */
+  const railHead = el("div", "", "");
+  railHead.style.cssText = "font-weight:700;font-size:14px;margin-bottom:6px";
+  const railSub = el("div", "muted", "");
+  railSub.style.cssText = "font-size:11px;margin-bottom:10px";
+  const railBody = el("div", "", "Click a node to open it.");
+  rail.appendChild(railHead); rail.appendChild(railSub);
+  rail.appendChild(railBody);
+  let picked = "";
+  const dial = (road) => {
+    const box = el("div", "", "");
+    box.style.cssText = "display:flex;gap:5px;margin:8px 0;flex-wrap:wrap";
+    [["⬆ value it more", "more"], ["⬇ less", "less"],
+     ["↔ ease", "ease"], ["✕ drop", "drop"]].forEach(([face, move]) => {
+      const b = el("button", "", face);
+      b.style.cssText = "font-size:11px;padding:5px 8px";
+      b.onclick = async () => {
+        try {
+          const got = await api("/api/orchestrator/judgment",
+            {method: "POST",
+             body: JSON.stringify({road, move})});
+          setStatus(got.said || "noted");
+          refresh();
+        } catch (e) { setStatus(e.message, true); }
+      };
+      box.appendChild(b);
+    });
+    return box;
+  };
+  const showRoad = (d, road) => {
+    const r = (d.roads || {})[road] || {};
+    picked = road;
+    railHead.textContent = r.label || road;
+    railSub.textContent = "";
+    railBody.textContent = "";
+    const j = r.judgment || {}, l = r.learning || {};
+    const facts = el("div", "", "");
+    facts.style.cssText = "font-size:12px";
+    const line = (k, v) => {
+      const row = el("div", "", "");
+      row.style.cssText = "display:flex;justify-content:space-between;"
+        + "gap:8px;padding:2px 0;border-bottom:1px dotted #1d2b3d";
+      row.appendChild(el("span", "muted", k));
+      row.appendChild(el("b", "", String(v)));
+      facts.appendChild(row);
+    };
+    line("owed / held", Math.round(r.owed || 0) + "s / "
+                        + Math.round(r.held || 0) + "s");
+    line("uncovered", Math.round(r.uncovered || 0) + "s");
+    line("judgment factor", (j.factor || 1).toFixed(2)
+         + (j.alone ? " (the station's own guess)" : ""));
+    line("learning factor", ((l.factor || 1)).toFixed(2)
+         + (l.miss_streak ? " · " + l.miss_streak + " missed hour(s)" : ""));
+    if (l.attainment_ema != null) {
+      line("attainment ema", Math.round(l.attainment_ema * 100) + "%");
+    }
+    if (r.task) {
+      line("plan wants", Math.round(r.task.want_seconds || 0) + "s"
+           + (r.task.bare ? " · BARE" : ""));
+    }
+    railBody.appendChild(facts);
+    if (j.lesson) {
+      const les = el("div", "", "“" + j.lesson + "”");
+      les.style.cssText = "margin:8px 0;padding:7px 9px;font-size:11.5px;"
+        + "border-left:3px solid #b48cff;background:rgba(180,140,255,.07);"
+        + "border-radius:0 6px 6px 0";
+      railBody.appendChild(les);
+    }
+    const dialLab = el("div", "muted", "THE DIAL — what your answers "
+      + "teach it, turned by hand:");
+    dialLab.style.cssText = "font-size:10px;letter-spacing:.08em;margin-top:9px";
+    railBody.appendChild(dialLab);
+    railBody.appendChild(dial(road));
+    if (r.task && r.task.why) {
+      const why = el("div", "muted", r.task.why);
+      why.style.cssText = "font-size:10.5px;margin-top:7px;line-height:1.5";
+      railBody.appendChild(why);
+    }
+  };
+  const showOverview = (d) => {
+    railHead.textContent = "The orchestrator";
+    railSub.textContent = (d.paused ? "off air — the workshop has the room"
+      : (d.on ? "on air" : "the station is off"))
+      + " · " + (d.hours_ready || 0).toFixed(2) + "h ready of "
+      + (d.target_hours || 0).toFixed(1) + "h";
+    railBody.textContent = "";
+    if (d.ask) {
+      const a = el("div", "", "");
+      a.style.cssText = "margin-bottom:9px;padding:8px 10px;font-size:11.5px;"
+        + "border-left:3px solid #ffd76f;background:rgba(255,215,111,.06);"
+        + "border-radius:0 6px 6px 0";
+      a.appendChild(el("b", "", "It has a question — "));
+      a.appendChild(document.createTextNode(String(d.ask.why || "")
+        .slice(0, 220)));
+      const go = el("button", "", "Answer it");
+      go.style.cssText = "display:block;margin-top:6px;font-size:11px";
+      go.onclick = () => { orchLogicClose(); orchPlexusOpen(); };
+      a.appendChild(go);
+      railBody.appendChild(a);
+    }
+    if (d.plan_why) {
+      const w = el("div", "muted", d.plan_why);
+      w.style.cssText = "font-size:11px;margin-bottom:9px;line-height:1.5";
+      railBody.appendChild(w);
+    }
+    const bookLab = el("div", "muted",
+      "THE JUDGMENT BOOK — what it has been told, and what it decided "
+      + "alone (🤖):");
+    bookLab.style.cssText = "font-size:10px;letter-spacing:.08em;margin:6px 0";
+    railBody.appendChild(bookLab);
+    (d.book || []).forEach((row) => {
+      const r = el("div", "", "");
+      r.style.cssText = "padding:5px 0;border-bottom:1px dotted #1d2b3d;"
+        + "font-size:11px;line-height:1.45";
+      r.appendChild(el("b", "", (row.alone ? "🤖 " : "🧑 ")
+        + (row.face || row.does || "")));
+      if (row.ask) {
+        const q = el("div", "muted", row.ask);
+        q.style.fontSize = "10px";
+        r.appendChild(q);
+      }
+      railBody.appendChild(r);
+    });
+    railBody.appendChild(el("div", "muted",
+      "Click any node for its lane — the dial on each road is how you "
+      + "tell it what is valuable."));
+  };
+  showOverview(data);
+
+  const caster = new THREE.Raycaster();
+  const mouse = new THREE.Vector2();
+  canvas.addEventListener("click", (ev) => {
+    const r = canvas.getBoundingClientRect();
+    mouse.x = ((ev.clientX - r.left) / r.width) * 2 - 1;
+    mouse.y = -((ev.clientY - r.top) / r.height) * 2 + 1;
+    caster.setFromCamera(mouse, camera);
+    const hit = caster.intersectObjects(nodes.map((n) => n.mesh))[0];
+    if (hit) {
+      const n = nodes.find((q) => q.mesh === hit.object);
+      if (n) showRoad(data, n.road);
+    } else { showOverview(data); }
+  });
+
+  const refresh = async () => {
+    try {
+      data = await api("/api/orchestrator/logic");
+      paint(data);
+      if (picked && data.roads && data.roads[picked]) showRoad(data, picked);
+      else if (!picked) showOverview(data);
+    } catch (e) { /* the graph keeps its last truth */ }
+  };
+  orchLogicTimer = setInterval(refresh, 5000);
+
+  let alive = true;
+  (function tick(now) {
+    if (!alive) return;
+    requestAnimationFrame(tick);
+    const t = (now || 0) / 1000;
+    nodes.forEach((n) => {
+      const want = n.target || 0.8;
+      const s = n.mesh.scale.x + (want - n.mesh.scale.x) * .08;
+      n.mesh.scale.set(s, s, s);
+      n.mesh.position.z = Math.sin(t * 1.1 + n.phase) * .5;
+    });
+    group.rotation.y = Math.sin(t / 9) * .05;
+    renderer.render(scene, camera);
+  })(0);
+
+  const onKey = (ev) => { if (ev.key === "Escape") orchLogicClose(); };
+  document.addEventListener("keydown", onKey);
+  shade.onclick = (ev) => { if (ev.target === shade) orchLogicClose(); };
+  orchLogic = {host: shade, stop: () => {
+    alive = false;
+    document.removeEventListener("keydown", onKey);
+    try { renderer.dispose(); } catch (e) {}
+  }};
 }
 
 function orchPlexusClose() {
