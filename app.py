@@ -13036,6 +13036,80 @@ def low_rates_wanted() -> list[int]:
             if now - at < LOW_WANT_FRESH]
 
 
+# --- #1149: the RECORD gets the same road. #999 halved the voice term
+# and left the bigger, continuous one alone: /music served the library
+# file as it sits - a median 321 kbit/s, FLAC and WAV admitted - off a
+# CIFS mount, over a funnel, to a car. The derivative cache below is the
+# voice machinery re-aimed at tracks: encoded in the background off the
+# hot path, named by (track, rate) so it is computed once, swept by
+# count, and - a bonus the voice road never needed - it lives on LOCAL
+# disk, so a 96k listener never waits on a cold CIFS open again.
+MUSIC_LOW_DIR = data_path("music_lo")
+MUSIC_LOW_KEEP = int(os.getenv("MUSIC_LOW_KEEP", "400"))
+
+
+def _music_low_path(track_id: str, rate: int) -> Path:
+    return MUSIC_LOW_DIR / f"{track_id}-{int(rate)}k.mp3"
+
+
+def _music_low_sweep() -> None:
+    """Newest MUSIC_LOW_KEEP survive. No source-liveness check: a track
+    leaving the library just lets its derivative age off the end."""
+    try:
+        files = sorted((q for q in MUSIC_LOW_DIR.glob("*.mp3")
+                        if q.is_file()),
+                       key=lambda q: q.stat().st_mtime, reverse=True)
+        for one in files[MUSIC_LOW_KEEP:]:
+            one.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _music_low_encode_soon(source: Path, out: Path, rate: int) -> None:
+    """One background encode per (track, rate) - the _low_encode_soon
+    recipe with music arguments: stereo kept, a universal 44.1k sample
+    rate (libmp3lame refuses hi-res FLAC rates), and a longer leash,
+    because the source can be a 90MB file on the far side of CIFS.
+    Shares _LOW_JOBS and the one-wide _LOW_GATE with the voice encoder:
+    ONE ffmpeg in this process, ever, and niced."""
+    with _LOW_JOBS_LOCK:
+        if str(out) in _LOW_JOBS:
+            return
+        _LOW_JOBS.add(str(out))
+
+    def run() -> None:
+        part = out.with_suffix(".part")
+        try:
+            import subprocess
+
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+            MUSIC_LOW_DIR.mkdir(parents=True, exist_ok=True)
+            extra: dict[str, Any] = {}
+            if hasattr(os, "nice"):
+                extra["preexec_fn"] = lambda: os.nice(15)
+            with _LOW_GATE:
+                subprocess.run(
+                    [exe, "-nostdin", "-hide_banner", "-loglevel", "error",
+                     "-y", "-i", str(source),
+                     "-vn", "-ac", "2", "-ar", "44100",
+                     "-codec:a", "libmp3lame", "-b:a", f"{int(rate)}k",
+                     "-f", "mp3", str(part)],
+                    check=True, timeout=300, capture_output=True, **extra)
+            part.replace(out)
+            _music_low_sweep()
+        except Exception:  # noqa: BLE001
+            try:
+                part.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            with _LOW_JOBS_LOCK:
+                _LOW_JOBS.discard(str(out))
+
+    Thread(target=run, daemon=True).start()
+
+
 def low_ready_soon(key: str) -> None:
     """#999: ENCODE WHEN THE AUDIO IS MADE, NOT WHEN IT IS ASKED FOR.
 
@@ -31304,7 +31378,27 @@ def _hour_needs_with_cover() -> dict[str, dict[str, float]]:
 
 
 def dialogue_flow_state() -> dict[str, Any]:
-    """Explain the continuity pipeline without hiding the bottleneck."""
+    """Explain the continuity pipeline without hiding the bottleneck.
+
+    #1149: memoized 3s. Every /api/dj poll from every open panel, app
+    and tune page paid this walk - schedule_adherence, hour_needs,
+    dialogue_stock_items, track_lookahead, the whole cupboard - ON the
+    event loop, and the stall hunter caught it mid-poll repeatedly
+    (healthz 3-8s). Same #1142 class, same medicine: a status card may
+    be three seconds stale; the loop may not be three seconds deaf."""
+    now = time.time()
+    if now - _FLOW_MEMO["at"] < 3.0 and _FLOW_MEMO["value"] is not None:
+        return _FLOW_MEMO["value"]
+    got = _dialogue_flow_state_fresh()
+    _FLOW_MEMO["at"] = time.time()
+    _FLOW_MEMO["value"] = got
+    return got
+
+
+_FLOW_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _dialogue_flow_state_fresh() -> dict[str, Any]:
     dj = dj_settings()
     target = int(dj.get("dialogue_reserve_target") or 4)
     ready = sum(1 for e in _LARDER
@@ -43893,17 +43987,40 @@ def _chunk_all() -> dict[str, dict[str, Any]]:
     return _CHUNK_LEDGER
 
 
+_CHUNK_WRITE_LOCK = RLock()
+
+
 def _chunk_save() -> None:
+    """#1149: the trim stays here; the WRITE leaves the event loop.
+
+    Serialising 4000 rows and writing them to disk ran synchronously
+    inside the prep chain (chunk_serve -> speakbox_quote -> dj_banter),
+    which runs ON the loop under pantry_keeper - the stall hunter caught
+    this exact frame holding healthz for 8s, twice, which is every
+    remote listener's polls frozen with it. The rows are shallow-copied
+    before the thread, so a draw mutating a row mid-dump cannot garble
+    the file; the write lock keeps two saves from interleaving on the
+    same tmp path."""
     try:
         rows = sorted(_CHUNK_LEDGER.values(),
                       key=lambda r: -float(r.get("last") or 0))
         del rows[CHUNK_LEDGER_MAX:]
         for gone in [k for k, v in _CHUNK_LEDGER.items() if v not in rows]:
             _CHUNK_LEDGER.pop(gone, None)
-        CHUNK_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = CHUNK_LEDGER_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(rows, indent=1))
-        tmp.replace(CHUNK_LEDGER_PATH)
+        snapshot = [dict(r) for r in rows]
+
+        def write() -> None:
+            try:
+                with _CHUNK_WRITE_LOCK:
+                    CHUNK_LEDGER_PATH.parent.mkdir(parents=True,
+                                                   exist_ok=True)
+                    tmp = CHUNK_LEDGER_PATH.with_suffix(".tmp")
+                    tmp.write_text(json.dumps(snapshot, indent=1))
+                    tmp.replace(CHUNK_LEDGER_PATH)
+            except Exception:  # noqa: BLE001
+                pass            # a forgetful shelf still serves
+
+        Thread(target=write, daemon=True).start()
     except Exception:  # noqa: BLE001
         pass                            # a forgetful shelf still serves
 
@@ -69394,6 +69511,32 @@ async def radio_pause_state_api(
             "larder": len(_LARDER)}
 
 
+@app.post("/api/radio/unpause")
+async def radio_unpause_listener_api(
+    t: str = "",
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1149: an inert station is not a dead end for a guest.
+
+    Anyone holding a live tune-in link who arrives at a PAUSED broadcast
+    can set it playing again - the whole resume road (schedule restore,
+    cut_ms stamp, needle drop) runs exactly as if the operator pressed
+    the button. Deliberately one-way: a listener can only ever wake the
+    station, never silence it, and the FM switch stays the operator's.
+    On the public door this rides the allowlist like shout and vote."""
+    require_listen_auth(t, authorization)
+    was = radio_paused()
+    if was:
+        radio_pause_set(False)
+        pipeline_log("air", "unpaused from a tune-in link - a listener "
+                            "pressed play on an idle station")
+    return {"paused": radio_paused(), "was_paused": was,
+            "on": bool(_RADIO.get("on")),
+            "say": ("the record is dropping - the booth banked material "
+                    "through the pause, so there is something to say"
+                    if was else "the broadcast was already rolling")}
+
+
 @app.post("/api/radio/tune")
 async def radio_tune_api(
     request: Request,
@@ -75510,19 +75653,15 @@ async def tape_file(
         return Response(status_code=416, headers=headers)
     if window:
         start, end = window
-
-        def _slice() -> bytes:
-            with path.open("rb") as handle:
-                handle.seek(start)
-                return handle.read(end - start + 1)
-
-        try:
-            chunk = await asyncio.to_thread(_slice)
-        except Exception:
-            return Response(status_code=404)
+        # #1149: stream it, like /music (#883). This branch read the
+        # whole requested window into memory before the first byte
+        # moved, and a phone OPENS with `Range: bytes=0-` - on a 100MB
+        # tape that is the whole file in RAM and a listener stalled.
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(chunk, status_code=206, headers=headers,
-                        media_type=media_type)
+        headers["Content-Length"] = str(end - start + 1)
+        return StreamingResponse(_range_stream(path, start, end),
+                                 status_code=206, headers=headers,
+                                 media_type=media_type)
     return FileResponse(path, media_type=media_type, headers=headers)
 
 
@@ -77496,7 +77635,10 @@ _PUBLIC_GET = {"/healthz", "/api/dj", "/api/dj/voice", "/api/dj/reacts",
                "/api/radio/clock"}
 _PUBLIC_GET_PREFIX = ("/tune/", "/media/", "/music/", "/data/vendor/")
 _PUBLIC_POST = {"/api/dj/join", "/api/dj/request", "/api/dj/shout",
-                "/api/music/vote"}
+                "/api/music/vote",
+                # #1149: wake-only - the route refuses to pause anything,
+                # and it still demands a live listen token inside.
+                "/api/radio/unpause"}
 
 
 def _public_allows(method: str, path: str) -> bool:
@@ -77543,7 +77685,11 @@ async def _startup_public_door() -> None:
         import uvicorn
         config = uvicorn.Config(PublicListenerGate(app), host="0.0.0.0",
                                 port=PUBLIC_PORT, log_level="warning",
-                                access_log=False)
+                                access_log=False,
+                                # #1149: a car polls every 1.5-3s; the 5s
+                                # default dropped the connection between
+                                # polls and paid a fresh handshake each.
+                                timeout_keep_alive=75)
         server = uvicorn.Server(config)
         server.install_signal_handlers = lambda: None   # the main one owns these
         asyncio.create_task(server.serve())
@@ -81402,6 +81548,35 @@ async def music_file(
         return Response(status_code=404)
     path = Path(track["path"])
     media_type = MUSIC_TYPES.get(track["ext"], "application/octet-stream")
+
+    # #1149: the listener's bitrate, for the RECORD. Same contract as
+    # /media: a hit serves the cached mp3; a miss serves the original
+    # NOW, starts the encode for next time, and then STAYS the original
+    # for 900s of continued access (#1147's sticky-miss - a Range
+    # continuation must never get mp3 frames where it expected the
+    # library file). While one track streams, the up-next is warmed at
+    # the same rate, so by the time the record turns over its small copy
+    # is already on local disk.
+    missed = False
+    rate = low_note_rate(request.query_params.get("br"))
+    if rate:
+        small = _music_low_path(track_id, rate)
+        _mk = f"music:{track_id}|{rate}"
+        _held = time.time() - float(_LOW_MISSED.get(_mk) or 0) < 900.0
+        if small.is_file() and not _held:
+            path, media_type = small, "audio/mpeg"
+        else:
+            missed = True
+            if not small.is_file():
+                _music_low_encode_soon(path, small, rate)
+            _LOW_MISSED[_mk] = time.time()
+        for nxt in ([_RADIO.get("coming") or {}]
+                    + (_RADIO.get("requests") or [])[:1]
+                    + (_RADIO.get("queue") or [])[:1]):
+            nid, npath = str(nxt.get("id") or ""), nxt.get("path")
+            if nid and npath and not _music_low_path(nid, rate).is_file():
+                _music_low_encode_soon(Path(npath),
+                                       _music_low_path(nid, rate), rate)
     try:
         size = await asyncio.to_thread(lambda: path.stat().st_size)
     except Exception:
@@ -81410,7 +81585,11 @@ async def music_file(
     headers = {
         "X-Content-Type-Options": "nosniff",
         "Accept-Ranges": "bytes",
-        "Cache-Control": "private, max-age=3600",
+        # A missed rate must not be cached: the same URL flips to the
+        # mp3 once the hold lapses, and a cached original would pin a
+        # listener to the very bytes the encode exists to replace.
+        "Cache-Control": ("private, no-store" if missed
+                          else "private, max-age=3600"),
     }
     if request.query_params.get("download"):
         # "Artist - Title.mp3", with a plain-ASCII fallback for clients that
@@ -81484,19 +81663,15 @@ async def sfx_file(
         return Response(status_code=416, headers=headers)
     if window:
         start, end = window
-
-        def _slice() -> bytes:
-            with path.open("rb") as handle:
-                handle.seek(start)
-                return handle.read(end - start + 1)
-
-        try:
-            chunk = await asyncio.to_thread(_slice)
-        except Exception:
-            return Response(status_code=404)
+        # #1149: stream it, like /music (#883). This branch read the
+        # whole requested window into memory before the first byte
+        # moved, and a phone OPENS with `Range: bytes=0-` - on a 100MB
+        # tape that is the whole file in RAM and a listener stalled.
         headers["Content-Range"] = f"bytes {start}-{end}/{size}"
-        return Response(chunk, status_code=206, headers=headers,
-                        media_type=media_type)
+        headers["Content-Length"] = str(end - start + 1)
+        return StreamingResponse(_range_stream(path, start, end),
+                                 status_code=206, headers=headers,
+                                 media_type=media_type)
     return FileResponse(path, media_type=media_type, headers=headers)
 
 
@@ -127333,9 +127508,11 @@ RADIO_PAGE_HTML = r"""<!doctype html>
          two different links must be able to choose differently, so this
          never becomes server state - it rides the clip URL as ?br= and
          lives in this browser's localStorage, exactly like the two
-         sliders above it. -->
+         sliders above it. #1149: it governs the RECORD too - the music
+         was the bigger stream and the selector never touched it. -->
     <div class="lev">
-      <label for="lvRate">📶 quality</label>
+      <label for="lvRate" title="Voice and record both — Original sends
+the library files untouched">📶 quality</label>
       <select id="lvRate" onchange="setRate()">
         <option value="96">Standard · 96k</option>
         <option value="128">High · 128k</option>
@@ -127367,6 +127544,14 @@ RADIO_PAGE_HTML = r"""<!doctype html>
   </div>
 
   <button class="big" id="tune" onclick="tune()">Tune in</button>
+
+  <!-- #1149: an inert station is not a dead end. Anyone with a live link
+       who arrives at a PAUSED broadcast can set it playing again; the
+       button exists only while the clock says paused, and the server
+       road behind it can only ever wake, never silence. -->
+  <button class="big" id="wake" onclick="wake()" style="display:none;
+          margin-top:8px;background:#2f7d52;border-color:#3fbf7f">
+    ▶ Unpause the broadcast</button>
 
   <div class="row" style="margin-top:12px">
     <button onclick="save()" title="Download this track">⤓</button>
@@ -127640,13 +127825,52 @@ function sync(state) {
   document.getElementById("of").textContent = clock(now.seconds);
   document.getElementById("fill").style.width =
     now.seconds ? Math.min(100, (state.elapsed / now.seconds) * 100) + "%" : "0";
+  /* #1149: a PAUSED station used to render as fully live - green dot,
+   * title, listener count - with silent audio and no explanation; and
+   * because this road never read `paused`, retime() below restarted the
+   * frozen record every 3s for clockPoll to pause 1.5s later: music in
+   * random 1.5-second bursts, which is the "playing stochastically"
+   * heard in the car. The pause is now shown, honoured, and OPENABLE -
+   * any listener can press play on an inert station. */
   document.getElementById("sub").textContent = state.on
-    ? state.listeners + (state.listeners === 1 ? " listener" : " listeners")
-      + " · " + (state.station || "")
+    ? (state.paused
+        ? "The broadcast is paused. Press the green button and it picks "
+          + "up right where the booth left off."
+        : state.listeners + (state.listeners === 1 ? " listener" : " listeners")
+          + " · " + (state.station || ""))
     : "The station is off air. Start it from the Pine Box panel.";
+  paintPaused(!!state.on && !!state.paused);
 
   if (!playing || !state.on || !now.url) return;
+  if (state.paused) return;
   retime(now, state.server_ms, state.started_ms, now.seconds);
+}
+
+/* #1149: the wake road. The button only exists while the clock says
+ * paused, and the endpoint behind it can only ever unpause - so the
+ * worst a shared link can do to the show is start it. */
+function paintPaused(paused) {
+  const b = document.getElementById("wake");
+  if (!b) return;
+  b.style.display = paused ? "block" : "none";
+  if (!paused && b.disabled) {
+    b.disabled = false;
+    b.textContent = "▶ Unpause the broadcast";
+  }
+}
+
+async function wake() {
+  const b = document.getElementById("wake");
+  if (b) { b.disabled = true; b.textContent = "▶ waking the booth…"; }
+  try {
+    const got = await api("/api/radio/unpause", {method: "POST", body: "{}"});
+    const note = document.getElementById("note");
+    if (note) note.textContent = got.say || "the record is dropping…";
+  } catch (e) {
+    const note = document.getElementById("note");
+    if (note) note.textContent = e.message;
+    if (b) { b.disabled = false; b.textContent = "▶ Unpause the broadcast"; }
+  }
 }
 
 // Where the record actually is, right now, on this machine (#631): the two
@@ -127654,16 +127878,35 @@ function sync(state) {
 // day, and stateAt covers the wait since the answer landed.
 let stateAt = 0;
 
+/* #1149: THE ANCHOR. Each clock answer implies "this record hit position
+ * zero at local instant A" (A = the answer's landing time minus the
+ * position it reported). Transit delay only ever makes A read LATER than
+ * the truth, so the SMALLEST recent A is the closest to it - and a
+ * target derived from that window minimum is immune to per-response
+ * network jitter. The old code fed each response's jitter straight into
+ * `target`, and on a cellular link a few hundred ms of wobble flapped
+ * the playbackRate nudge up to once a second and fired hard seeks off
+ * bufferbloat spikes: the "jerky, stochastic" record in the car. */
+let anchors = [];
+let anchorKey = "";
+let lastHardSeek = 0;
+
 function retime(now, serverMs, startedMs, seconds) {
   if (!audio || !now || !now.url || !serverMs) return;
-  const age = stateAt ? (Date.now() - stateAt) / 1000 : 0;
-  let target = (serverMs - startedMs) / 1000 + age;
+  if (stationPaused) return;   // #1149: NO road restarts a paused record
+  const key = String(now.id || "") + "|" + String(startedMs || 0);
+  if (key !== anchorKey) { anchorKey = key; anchors = []; }
+  anchors.push((stateAt || Date.now()) - (serverMs - startedMs));
+  if (anchors.length > 8) anchors.shift();
+  let target = (Date.now() - Math.min.apply(null, anchors)) / 1000;
   if (!isFinite(target) || target < 0) target = 0;
   if (seconds) target = Math.min(target, seconds - 0.75);
   if (now.id !== trackId) {
     trackId = now.id;
     trackUrl = now.url;
-    audio.src = now.url;
+    // #1149: the record obeys the 📶 selector too - it was the bigger
+    // stream, served raw off the library while only the voice shrank.
+    audio.src = clipUrl(now.url);
     audio.currentTime = Math.max(0, target);
     audio.playbackRate = 1;
     audio.play().catch(() => {});
@@ -127695,9 +127938,32 @@ function retime(now, serverMs, startedMs, seconds) {
     if (audio.playbackRate !== 1) audio.playbackRate = 1;
     return;
   }
+  /* #1149: the #998 guard held the seek only WHILE starved; the first
+   * poll after recovery saw the whole stall as drift and seeked anyway,
+   * throwing the fresh buffer away - throttled, not closed. A hard seek
+   * is a range re-issue over the slow link, so it is now the last
+   * resort: at most one per 8s, and only into audio the element already
+   * HOLDS - or a truly lost cause past 20s. Anything else is chased at
+   * a rate nudge, which never costs a byte. */
+  const canReach = (t) => {
+    try {
+      for (let i = 0; i < audio.buffered.length; i += 1) {
+        if (audio.buffered.start(i) <= t && t < audio.buffered.end(i)) {
+          return true;
+        }
+      }
+    } catch (e) { /* no ranges yet */ }
+    return false;
+  };
   if (Math.abs(drift) > 3.5) {
-    audio.currentTime = Math.max(0, target);   // too far gone to nudge
-    audio.playbackRate = 1;
+    if ((canReach(target + 1) || Math.abs(drift) > 20)
+        && Date.now() - lastHardSeek > 8000) {
+      lastHardSeek = Date.now();
+      audio.currentTime = Math.max(0, target);
+      audio.playbackRate = 1;
+    } else {
+      audio.playbackRate = drift > 0 ? 0.94 : 1.06;   // close it bytelessly
+    }
   } else if (Math.abs(drift) > 0.4) {
     audio.playbackRate = drift > 0 ? 0.97 : 1.03;   // 3%: inaudible
   } else if (audio.playbackRate !== 1) {
@@ -127705,10 +127971,22 @@ function retime(now, serverMs, startedMs, seconds) {
   }
 }
 
+/* #1149: ONE clock request in flight, and only the newest answer wins.
+ * A bare 1.5s interval on a link where the request takes 4s had three in
+ * flight, and whichever landed LAST won - an old answer arriving after a
+ * newer one set the clock seconds backward, and the record jumped back
+ * and replayed a stretch already heard. */
+let clockLive = 0;
+let clockSeq = 0;
+
 async function clockPoll() {
   if (!playing) return;
+  if (clockLive && Date.now() - clockLive < 10000) return;
+  clockLive = Date.now();
+  const mine = ++clockSeq;
   try {
     const c = await api("/api/radio/clock?listener=" + ME);
+    if (mine !== clockSeq) return;      // a newer request superseded this
     stateAt = Date.now();
     pineSoloGate(c);                                        // #1008
     /* #1138: the station is paused - this listener goes quiet with it. */
@@ -127731,6 +128009,7 @@ async function clockPoll() {
       retime({id: c.id, url: c.url}, c.server_ms, c.started_ms, c.seconds);
     }
   } catch (error) { /* the show goes on */ }
+  finally { if (mine === clockSeq) clockLive = 0; }
 }
 
 let galleryNames = [], galleryIndex = 0, galleryTimer = 0;
@@ -127783,8 +128062,13 @@ const voiceMarks = new Set();
 
 async function poll() {
   if (pollLive && Date.now() - pollLive < 20000) return;
-  pollLive = Date.now();
-  try { await pollOnce(); } finally { pollLive = 0; }
+  /* #1149: only the poll that OWNS the latch may clear it. The old
+   * finally cleared it unconditionally, so a poll hung past 20s freed
+   * the latch under its successor and the overlap was back. */
+  const mine = Date.now();
+  pollLive = mine;
+  try { await pollOnce(); }
+  finally { if (pollLive === mine) pollLive = 0; }
 }
 
 async function pollOnce() {
@@ -127893,10 +128177,22 @@ const VOICE_CACHE_MAX = 12;
 function voicePrefetch(url) {
   if (!url) return null;
   if (voiceCache.has(url)) return voiceCache.get(url);
-  const job = fetch(url, {credentials: "same-origin"})
+  /* #1149: a deadline. This fetch had none, and on a dead cellular hop
+   * it hung forever - voiceNext had already set voiceBusy and the duck
+   * before awaiting it, so the whole voice road wedged with the music
+   * held at 30%. 20s covers any clip the grace rules would still air. */
+  const ctl = (typeof AbortController === "function")
+    ? new AbortController() : null;
+  const bomb = ctl ? setTimeout(() => {
+    try { ctl.abort(); } catch (e) {}
+  }, 20000) : null;
+  const job = fetch(url, ctl
+      ? {credentials: "same-origin", signal: ctl.signal}
+      : {credentials: "same-origin"})
     .then((r) => (r.ok ? r.blob() : null))
     .then((b) => (b ? URL.createObjectURL(b) : null))
-    .catch(() => null);
+    .catch(() => null)
+    .then((v) => { if (bomb) clearTimeout(bomb); return v; });
   voiceCache.set(url, job);
   // A listener left on all day must not accumulate blobs. The queue is
   // only ever a few deep, so anything this far back has already aired.
@@ -128023,12 +128319,24 @@ function voiceNext() {
   // #998: hand it bytes that are already here if the prefetch finished,
   // and otherwise WAIT for it rather than issuing a second request for
   // the same audio - the one in flight is already the fastest route.
+  // #1149: ... but never wait past 8s. The element can STREAM the
+  // network URL and start sounding on partial data, which a blob cannot;
+  // on a slow link the stream road airs a line the blob road would have
+  // aged into hopeless. The prefetch keeps filling for the next clip.
+  let handed = false;
+  const hand = (src) => {
+    if (handed) return;
+    handed = true;
+    voice.src = src || clip.url;
+    voice.play().catch(finish);
+  };
+  const impatience = setTimeout(() => hand(clip.url), 8000);
   Promise.resolve(voicePrefetch(clip.url)).then((obj) => {
-    voice.src = obj || clip.url;
-    voice.play().catch(finish);
+    clearTimeout(impatience);
+    hand(obj || clip.url);
   }).catch(() => {
-    voice.src = clip.url;
-    voice.play().catch(finish);
+    clearTimeout(impatience);
+    hand(clip.url);
   });
 }
 
