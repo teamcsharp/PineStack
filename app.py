@@ -62651,8 +62651,12 @@ async def generate_answer(
         )
     elif system_used:
         feature_meta["system_status_used"] = True
+        # #1149: system_stats() shells out to nvidia-smi - off the loop,
+        # like the pinebox status road already does (the stall hunter
+        # caught this frame holding healthz).
         messages.append(
-            {"role": "system", "content": format_system_context(system_stats())}
+            {"role": "system", "content": format_system_context(
+                await asyncio.to_thread(system_stats))}
         )
     elif tune_requested:
         feature_meta["tune_requested"] = True
@@ -82539,7 +82543,8 @@ async def health_details(
     return {
         "services": services,
         "ops": ops,
-        "stats_text": system_stats(),
+        # #1149: nvidia-smi off the loop (see the chat road's twin).
+        "stats_text": await asyncio.to_thread(system_stats),
         "ram": {"total_kb": total, "available_kb": avail},
         "gpu": gpu,
         "marquee": marquee[:16],
