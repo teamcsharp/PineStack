@@ -751,6 +751,24 @@ app.on("web-contents-created", (event, contents) => {
     // An empty/about:blank popup is page-authored content (the PDF
     // export writes into one) - it plays no broadcast and stays.
     if (!u || u === "about:blank") return { action: "allow" };
+    // #1148: the kit-export window is the app's own page - a progress
+    // view (plexus clouds + a loading bar) that plays no broadcast, so
+    // it lives as an app window. Everything else keeps the #1147 rule.
+    try {
+      const base = new URL(readConfig().baseUrl || "");
+      const target = new URL(u);
+      if (target.origin === base.origin
+          && target.pathname === "/export/kit") {
+        return {
+          action: "allow",
+          overrideBrowserWindowOptions: {
+            width: 940, height: 640, autoHideMenuBar: true,
+            backgroundColor: "#04060b",
+            title: "Pine Box - packing the kit",
+          },
+        };
+      }
+    } catch { /* not a parseable URL - treat it as a plain link */ }
     try {
       if (/^https?:/i.test(u)) shell.openExternal(u);
     } catch { /* a link that will not open is still not a rogue player */ }

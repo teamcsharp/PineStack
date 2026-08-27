@@ -80353,6 +80353,268 @@ ipcRenderer.on("svc", (_e, s) => {
 </script></body></html>
 """
 
+# --- The export window (#1148) ---------------------------------------------
+# Packing the kit takes a minute or two — the voices are most of it — and
+# what the operator used to watch was a blank white popup pointed straight
+# at the zip. The build now narrates itself into _KIT_PROGRESS, and
+# /export/kit is a page that draws it: three plexus clouds — the app,
+# everything you made, the voices — each threading itself tighter as its
+# shelf lands in the box, over a bar that counts real bytes. Signed like
+# media (media_sign), because a popup window cannot send an Authorization
+# header; the panel mints the link.
+
+_KIT_LOCK = RLock()
+_KIT_PROGRESS: dict[str, Any] = {"state": "idle"}
+
+
+def _kit_note(act: str, label: str, size: int) -> None:
+    """One file landed in the zip: advance the bar, and that act's cloud."""
+    with _KIT_LOCK:
+        p = _KIT_PROGRESS
+        p["bytes_done"] = int(p.get("bytes_done") or 0) + max(int(size), 0)
+        p["files_done"] = int(p.get("files_done") or 0) + 1
+        total = int(p.get("bytes_total") or 0)
+        p["pct"] = (min(99.0, 100.0 * p["bytes_done"] / total)
+                    if total else 0.0)
+        slot = (p.get("acts") or {}).get(act)
+        if slot:
+            slot["done"] = int(slot.get("done") or 0) + max(int(size), 0)
+        p["file"] = label
+
+
+KIT_EXPORT_PAGE = r"""<!doctype html><html><head><meta charset="utf-8">
+<title>Pine Box FM — packing the kit</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:#04060b; color:#dfe7f2; min-height:100vh;
+         font:14px/1.6 system-ui,-apple-system,Segoe UI,sans-serif;
+         display:flex; flex-direction:column; align-items:center;
+         justify-content:center; padding:24px; }
+  h1 { font-size:19px; letter-spacing:.18em; font-weight:600;
+       margin:0 0 5px; text-align:center; }
+  .sub { color:#7f8ea3; font-size:12.5px; margin-bottom:20px;
+         text-align:center; max-width:640px; }
+  .acts { display:flex; gap:14px; width:100%; max-width:880px; }
+  .act { flex:1; min-width:0; background:#0b0f16; border:1px solid #22304a;
+         border-radius:14px; overflow:hidden; position:relative;
+         transition:border-color .6s; }
+  .act canvas { display:block; width:100%; height:210px; }
+  .act .lab { position:absolute; left:0; right:0; bottom:9px;
+              text-align:center; font-size:11px; letter-spacing:.12em;
+              color:#7f8ea3; text-transform:uppercase; }
+  .act.done { border-color:#2f7d52; }
+  .act.done .lab { color:#9fe0bb; }
+  .barwrap { width:100%; max-width:880px; margin-top:18px; }
+  .bar { height:12px; border-radius:7px; background:#0b0f16;
+         border:1px solid #22304a; overflow:hidden; }
+  .bar i { display:block; height:100%; width:0%;
+           background:linear-gradient(90deg,#1d6fa5,#4bb3ff);
+           transition:width .45s ease; }
+  .bar.ok i { background:linear-gradient(90deg,#2f7d52,#3fbf7f); }
+  .meta { display:flex; justify-content:space-between; gap:14px;
+          color:#7f8ea3; font-size:12px; margin-top:8px; }
+  #file { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis;
+          white-space:nowrap; text-align:center; }
+  #state.err { color:#f0a0a0; }
+  #state a { color:#7fd1ff; }
+  @media (max-width:640px) { .acts { flex-direction:column; } }
+</style></head><body>
+<h1>PACKING THE STATION KIT</h1>
+<div class="sub">A runnable copy of the whole station, for whoever you are
+  handing it to. Each cloud threads itself together as its shelf goes into
+  the box; the kit downloads from here the moment the lid is on.</div>
+<div class="acts">
+  <div class="act" id="act-app"><canvas></canvas>
+    <div class="lab">the app</div></div>
+  <div class="act" id="act-data"><canvas></canvas>
+    <div class="lab">everything you made</div></div>
+  <div class="act" id="act-voices"><canvas></canvas>
+    <div class="lab">the voices</div></div>
+</div>
+<div class="barwrap">
+  <div class="bar" id="bar"><i id="fill"></i></div>
+  <div class="meta">
+    <span id="state">waiting for the packing to start…</span>
+    <span id="file"></span>
+    <span id="nums"></span>
+  </div>
+</div>
+<script src="/vendor/three.min.js"></script>
+<script>
+var TOKEN = new URLSearchParams(location.search).get("t") || "";
+var TINT = {app: 0x4bb3ff, data: 0xb48cff, voices: 0xffb35e};
+var DONE_TINT = 0x3fbf7f;
+var clouds = {};
+
+/* One plexus per act (#1148): a cloud of drifting, breathing points with
+ * lines threaded between near neighbours. Progress pulls it together —
+ * more links, brighter points — and completion settles it green. */
+function plexus(canvas, tintHex) {
+  if (!window.THREE) return {set: function () {}};
+  var W = Math.max(canvas.clientWidth, 60),
+      H = Math.max(canvas.clientHeight, 60);
+  var r = new THREE.WebGLRenderer({canvas: canvas, antialias: true,
+                                   alpha: true});
+  r.setSize(W, H, false);
+  r.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  var sc = new THREE.Scene();
+  var cam = new THREE.PerspectiveCamera(55, W / H, 1, 500);
+  cam.position.z = 120;
+  var N = 90;
+  var basePos = new Float32Array(N * 3), pos = new Float32Array(N * 3);
+  var vel = [], phase = [];
+  for (var i = 0; i < N; i++) {
+    basePos[i*3]   = (Math.random() - .5) * 150;
+    basePos[i*3+1] = (Math.random() - .5) * 95;
+    basePos[i*3+2] = (Math.random() - .5) * 90;
+    vel.push([(Math.random() - .5) * .16, (Math.random() - .5) * .16,
+              (Math.random() - .5) * .16]);
+    phase.push(Math.random() * Math.PI * 2);
+  }
+  var g = new THREE.BufferGeometry();
+  g.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  var pm = new THREE.PointsMaterial({color: tintHex, size: 2.4,
+                                     transparent: true, opacity: .5});
+  sc.add(new THREE.Points(g, pm));
+  var MAXSEG = N * 14;
+  var la = new Float32Array(MAXSEG * 6);
+  var lg = new THREE.BufferGeometry();
+  lg.setAttribute("position", new THREE.BufferAttribute(la, 3));
+  var lm = new THREE.LineBasicMaterial({color: tintHex, transparent: true,
+                                        opacity: .12});
+  sc.add(new THREE.LineSegments(lg, lm));
+  var tint = new THREE.Color(tintHex), done = new THREE.Color(DONE_TINT);
+  var target = 0, frac = 0;
+  (function tick(now) {
+    requestAnimationFrame(tick);
+    frac += (target - frac) * .06;
+    var t = (now || 0) / 1000;
+    for (var i = 0; i < N; i++) {
+      for (var a = 0; a < 3; a++) {
+        basePos[i*3+a] += vel[i][a];
+        var lim = a === 0 ? 80 : a === 1 ? 50 : 48;
+        if (Math.abs(basePos[i*3+a]) > lim) vel[i][a] *= -1;
+      }
+      /* the undulation: every point breathes on its own phase */
+      pos[i*3]   = basePos[i*3] + Math.sin(t * 1.4 + phase[i]) * 2.2;
+      pos[i*3+1] = basePos[i*3+1]
+                 + Math.sin(t * .9 + phase[i] * 1.7) * 5.5;
+      pos[i*3+2] = basePos[i*3+2] + Math.cos(t * 1.1 + phase[i]) * 3;
+    }
+    var reach = 260 + frac * 640;   // squared — links grow with progress
+    var k = 0;
+    for (var i = 0; i < N && k < MAXSEG; i++) {
+      for (var j = i + 1; j < N && k < MAXSEG; j++) {
+        var dx = pos[i*3]-pos[j*3], dy = pos[i*3+1]-pos[j*3+1],
+            dz = pos[i*3+2]-pos[j*3+2];
+        if (dx*dx + dy*dy + dz*dz < reach) {
+          la.set([pos[i*3], pos[i*3+1], pos[i*3+2],
+                  pos[j*3], pos[j*3+1], pos[j*3+2]], k * 6);
+          k++;
+        }
+      }
+    }
+    lg.setDrawRange(0, k * 2);
+    lg.attributes.position.needsUpdate = true;
+    g.attributes.position.needsUpdate = true;
+    pm.color.copy(tint).lerp(done, frac);
+    lm.color.copy(tint).lerp(done, frac * .9);
+    pm.opacity = .5 + frac * .45;
+    lm.opacity = .12 + frac * .3;
+    sc.rotation.y += .0016 + frac * .0012;
+    r.render(sc, cam);
+  })(0);
+  return {set: function (f) { target = Math.max(0, Math.min(1, f)); }};
+}
+
+["app", "data", "voices"].forEach(function (key) {
+  clouds[key] = plexus(
+    document.querySelector("#act-" + key + " canvas"), TINT[key]);
+});
+
+var stateEl = document.getElementById("state"),
+    fileEl = document.getElementById("file"),
+    numsEl = document.getElementById("nums"),
+    fillEl = document.getElementById("fill"),
+    barEl = document.getElementById("bar");
+var finished = false, failedHard = false;
+
+function mb(n) { return (Math.max(n, 0) / 1e6).toFixed(1); }
+
+function draw(p) {
+  var acts = p.acts || {};
+  var labels = {app: "packing the app…",
+                data: "packing everything you made…",
+                voices: "packing the voices…"};
+  var current = "";
+  ["app", "data", "voices"].forEach(function (key) {
+    var a = acts[key] || {};
+    var f = p.state === "done" ? 1
+          : a.total ? (a.done || 0) / a.total : 0;
+    clouds[key].set(f);
+    document.getElementById("act-" + key)
+      .classList.toggle("done", f >= .999);
+    if (!current && f < .999 && a.total) current = labels[key];
+  });
+  fillEl.style.width = (p.state === "done" ? 100 : (p.pct || 0)) + "%";
+  fileEl.textContent = p.file || "";
+  fileEl.title = p.file || "";
+  if (p.bytes_total) {
+    numsEl.textContent = mb(p.bytes_done) + " / " + mb(p.bytes_total)
+      + " MB · " + (p.files_done || 0) + "/" + (p.files_total || 0)
+      + " files";
+  }
+  stateEl.className = "";
+  if (p.state === "error") {
+    stateEl.className = "err";
+    stateEl.textContent = "the packing failed — " + (p.error || "unknown");
+    fileEl.textContent = "";
+  } else if (p.state === "done") {
+    barEl.className = "bar ok";
+    stateEl.textContent = "kit sealed — " + mb(p.zip_bytes || 0) + " MB · ";
+    var again = document.createElement("a");
+    again.href = p.url || "#";
+    again.textContent = "download it again";
+    stateEl.appendChild(again);
+    if (!finished) {
+      finished = true;
+      var f = document.createElement("iframe");
+      f.style.display = "none";
+      f.src = p.url;
+      document.body.appendChild(f);
+    }
+  } else if (p.state === "packing") {
+    stateEl.textContent = current || "sealing the box…";
+  } else {
+    stateEl.textContent =
+      "waiting for the packing to start — kick it off from the panel";
+  }
+}
+
+(function poll() {
+  fetch("/api/export/kit/progress?t=" + encodeURIComponent(TOKEN))
+    .then(function (r) {
+      if (r.status === 403) {
+        failedHard = true;
+        throw new Error("this window's pass is no longer good — "
+                        + "export again from the panel");
+      }
+      if (!r.ok) throw new Error("the station answered " + r.status);
+      return r.json();
+    })
+    .then(draw)
+    .catch(function (e) {
+      stateEl.className = "err";
+      stateEl.textContent = e.message;
+    })
+    .then(function () {
+      if (!failedHard && !finished) setTimeout(poll, 650);
+    });
+})();
+</script></body></html>
+"""
+
 
 def _kit_build() -> Path:
     import zipfile
@@ -80360,59 +80622,127 @@ def _kit_build() -> Path:
     out = KIT_DIR / "pinebox-station-kit.zip"
     tmp = out.with_suffix(".part")
     base = DATA_DIR
-    keep = ["speakbox", "voices", "vendor", "callers.json", "settings.json",
+    # "voices" packs LAST (#1148) so the export window's three clouds
+    # complete left to right: the app, then everything made, then the
+    # voices — the zip itself does not care about the order.
+    keep = ["speakbox", "vendor", "callers.json", "settings.json",
             "banter_topics.json", "banter_saved.json", "ad_reads.json",
             "crystal_notes.json", "said_lines.json", "speakbox_gems.json",
-            "sfx_bans.json", "title_translations.json"]
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-        zf.write("/app/app.py", "app/app.py")
-        zf.write("/app/requirements.txt", "app/requirements.txt")
-        for name in keep:
-            path = base / name
-            if path.is_file():
-                if name == "settings.json":
-                    # Secrets never travel (#398), and the shipped model is
-                    # the LAPTOP default, not this box's 23 GB one (audit:
-                    # a fresh install requested a model never pulled and
-                    # every LLM feature silently failed).
-                    try:
-                        cfg = json.loads(path.read_text())
-                        (cfg.get("voice_out") or {}).pop("ha_token", None)
-                        cfg["model"] = "qwen3:14b"
-                        cfg["num_ctx"] = min(int(cfg.get("num_ctx") or 8192),
-                                             8192)
-                        zf.writestr("data/settings.json",
-                                    json.dumps(cfg, indent=1))
-                        continue
-                    except Exception:
-                        continue
-                zf.write(path, f"data/{name}")
-            elif path.is_dir():
-                for sub in sorted(path.rglob("*")):
-                    if sub.is_file() and sub.stat().st_size < 40_000_000:
-                        zf.write(sub,
-                                 f"data/{name}/{sub.relative_to(path)}")
-        zf.writestr("windows/docker-compose.yml", KIT_COMPOSE)
-        zf.writestr("windows/start.bat", KIT_START)
-        zf.writestr("windows/stop.bat",
-                    '@echo off\r\ncd /d "%~dp0"\r\n'
-                    "docker compose down\r\n"
-                    "echo The station is off.\r\npause\r\n")
+            "sfx_bans.json", "title_translations.json", "voices"]
+    # The manifest first (#1148): every file that will land in the zip,
+    # sized and sorted into its act, so the export window's bar divides
+    # by real bytes rather than guesses.
+    wrap = [
+        ("windows/docker-compose.yml", KIT_COMPOSE),
+        ("windows/start.bat", KIT_START),
+        ("windows/stop.bat",
+         '@echo off\r\ncd /d "%~dp0"\r\n'
+         "docker compose down\r\n"
+         "echo The station is off.\r\npause\r\n"),
         # The guided setup (#628): the first thing a new operator opens.
-        zf.writestr("setup/setup.html", KIT_SETUP)
-        zf.writestr("SETUP.bat",
-                    '@echo off\r\nstart "" "%~dp0setup\\setup.html"\r\n')
-        # The Electron shell stays, but it is now OPTIONAL — start.bat opens
-        # the browser instead, so the kit needs no Node at all (#628).
-        zf.writestr("electron/package.json", KIT_PKG)
-        zf.writestr("electron/main.js", KIT_MAIN)
-        zf.writestr("electron/boot.html", KIT_BOOT)
-        zf.writestr("music/put-your-music-here.txt",
-                    "Drop mp3 / flac / m4a files or folders in here — the "
-                    "station indexes everything recursively.\n")
-        zf.writestr("README.md", KIT_README)
+        ("setup/setup.html", KIT_SETUP),
+        ("SETUP.bat", '@echo off\r\nstart "" "%~dp0setup\\setup.html"\r\n'),
+        # The Electron shell stays, but it is now OPTIONAL — start.bat
+        # opens the browser instead, so the kit needs no Node at all (#628).
+        ("electron/package.json", KIT_PKG),
+        ("electron/main.js", KIT_MAIN),
+        ("electron/boot.html", KIT_BOOT),
+        ("music/put-your-music-here.txt",
+         "Drop mp3 / flac / m4a files or folders in here — the "
+         "station indexes everything recursively.\n"),
+        ("README.md", KIT_README),
+    ]
+    # The app act writes FIRST — the two source files and the wrap — so
+    # its cloud settles green while the shelves are still going in, and
+    # the stage label under the bar never lies about what is packing.
+    app_files: list[tuple[Path, str, int]] = []
+    for src, arc in ((Path("/app/app.py"), "app/app.py"),
+                     (Path("/app/requirements.txt"),
+                      "app/requirements.txt")):
+        try:
+            app_files.append((src, arc, src.stat().st_size))
+        except OSError:
+            pass
+    entries: list[tuple[str, Path, str, str, int]] = []
+    for name in keep:
+        act = "voices" if name == "voices" else "data"
+        path = base / name
+        if path.is_file():
+            entries.append((act, path, f"data/{name}", name,
+                            path.stat().st_size))
+        elif path.is_dir():
+            for sub in sorted(path.rglob("*")):
+                if sub.is_file() and sub.stat().st_size < 40_000_000:
+                    rel = sub.relative_to(path)
+                    entries.append((act, sub, f"data/{name}/{rel}",
+                                    f"{name}/{rel}", sub.stat().st_size))
+    act_total = {"app": 0, "data": 0, "voices": 0}
+    for act, _src, _arc, _label, size in entries:
+        act_total[act] += size
+    act_total["app"] += sum(size for _src, _arc, size in app_files)
+    act_total["app"] += sum(len(text.encode()) for _arc, text in wrap)
+    with _KIT_LOCK:
+        _KIT_PROGRESS.clear()
+        _KIT_PROGRESS.update({
+            "state": "packing", "pct": 0.0, "file": "", "error": "",
+            "started": time.time(), "bytes_done": 0, "files_done": 0,
+            "bytes_total": sum(act_total.values()),
+            "files_total": len(app_files) + len(entries) + len(wrap),
+            "acts": {k: {"done": 0, "total": v}
+                     for k, v in act_total.items()},
+        })
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+        for src, arc, size in app_files:
+            zf.write(src, arc)
+            _kit_note("app", arc, size)
+        for arc, text in wrap:
+            zf.writestr(arc, text)
+            _kit_note("app", arc, len(text.encode()))
+        for act, src, arc, label, size in entries:
+            if arc == "data/settings.json":
+                # Secrets never travel (#398), and the shipped model is
+                # the LAPTOP default, not this box's 23 GB one (audit:
+                # a fresh install requested a model never pulled and
+                # every LLM feature silently failed).
+                try:
+                    cfg = json.loads(src.read_text())
+                    (cfg.get("voice_out") or {}).pop("ha_token", None)
+                    cfg["model"] = "qwen3:14b"
+                    cfg["num_ctx"] = min(int(cfg.get("num_ctx") or 8192),
+                                         8192)
+                    zf.writestr("data/settings.json",
+                                json.dumps(cfg, indent=1))
+                except Exception:
+                    pass
+                _kit_note(act, label, size)
+                continue
+            zf.write(src, arc)
+            _kit_note(act, label, size)
     tmp.replace(out)
+    with _KIT_LOCK:
+        _KIT_PROGRESS.update({"state": "done", "pct": 100.0, "file": "",
+                              "zip_bytes": out.stat().st_size})
     return out
+
+
+def _kit_build_tracked() -> Path:
+    """_kit_build, with the export window told how it ended (#1148)."""
+    try:
+        return _kit_build()
+    except Exception as e:
+        with _KIT_LOCK:
+            _KIT_PROGRESS.update({"state": "error",
+                                  "error": str(e) or type(e).__name__})
+        raise
+
+
+def _kit_thread() -> None:
+    try:
+        path = _kit_build_tracked()
+        pipeline_log("air", f"station kit exported · "
+                            f"{path.stat().st_size / 1e6:.1f} MB")
+    except Exception:
+        pass  # the window carries the error; nothing waits on this thread
 
 
 @app.post("/api/export/kit")
@@ -80421,11 +80751,53 @@ async def export_kit_api(
 ) -> dict[str, Any]:
     """Pack the station into a portable kit (#398)."""
     require_auth(authorization)
-    path = await asyncio.to_thread(_kit_build)
+    path = await asyncio.to_thread(_kit_build_tracked)
     pipeline_log("air", f"station kit exported · "
                         f"{path.stat().st_size / 1e6:.1f} MB")
     return {"url": f"/export/kit.zip?t={media_sign('kit.zip')}",
             "bytes": path.stat().st_size}
+
+
+@app.post("/api/export/kit/start")
+async def export_kit_start(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Kick the packing off and hand back the window that watches it
+    (#1148). The build runs in a worker thread; the page polls it."""
+    require_auth(authorization)
+    with _KIT_LOCK:
+        already = _KIT_PROGRESS.get("state") == "packing"
+        if not already:
+            _KIT_PROGRESS.clear()
+            _KIT_PROGRESS.update({"state": "packing", "pct": 0.0,
+                                  "file": "counting the shelves…",
+                                  "started": time.time()})
+            Thread(target=_kit_thread, name="kit-export",
+                   daemon=True).start()
+    return {"page": f"/export/kit?t={media_sign('kit.page')}",
+            "already": already}
+
+
+@app.get("/export/kit", response_class=HTMLResponse)
+async def export_kit_page(t: str = "") -> str:
+    """The export window (#1148): the packing, watched. Signed because a
+    popup carries no Authorization header — the panel mints the link."""
+    if not hmac.compare_digest(t, media_sign("kit.page")):
+        raise HTTPException(status_code=403, detail="Bad signature")
+    return KIT_EXPORT_PAGE
+
+
+@app.get("/api/export/kit/progress")
+async def export_kit_progress(t: str = "") -> dict[str, Any]:
+    """What the export window draws — and, once the lid is on, the
+    signed download itself."""
+    if not hmac.compare_digest(t, media_sign("kit.page")):
+        raise HTTPException(status_code=403, detail="Bad signature")
+    with _KIT_LOCK:
+        snap = json.loads(json.dumps(_KIT_PROGRESS))   # a settled copy
+    if snap.get("state") == "done":
+        snap["url"] = f"/export/kit.zip?t={media_sign('kit.zip')}"
+    return snap
 
 
 @app.get("/export/kit.zip")
@@ -110341,16 +110713,20 @@ async function deleteAd(id) {
   }
 }
 
-/* Pack the station into a kit a friend can run (#398). */
+/* Pack the station into a kit a friend can run (#398). The window it
+ * opens (#1148) IS the export: three plexus clouds threading themselves
+ * together over a byte-honest bar, and the download once the lid is on —
+ * in place of the blank white popup this used to point at the zip. */
 async function djExportKit() {
   const status = document.getElementById("djStatus");
   status.textContent = "📦 Packing the station kit — the voices make it "
     + "a minute or two…";
   try {
-    const got = await api("/api/export/kit", {method: "POST", body: "{}"});
-    status.textContent = "📦 Kit ready — " + (got.bytes / 1e6).toFixed(1)
-      + " MB. Downloading; the README inside covers Windows setup.";
-    window.open(got.url, "_blank");
+    const got = await api("/api/export/kit/start",
+                          {method: "POST", body: "{}"});
+    window.open(got.page, "_blank");
+    status.textContent = "📦 Packing — the export window is watching it "
+      + "happen; the kit downloads there once it is sealed.";
   } catch (error) {
     status.textContent = "Export failed: " + error.message;
   }
