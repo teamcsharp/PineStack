@@ -43987,42 +43987,57 @@ def _chunk_all() -> dict[str, dict[str, Any]]:
     return _CHUNK_LEDGER
 
 
-_CHUNK_WRITE_LOCK = RLock()
+_CHUNK_DIRTY = [0.0]      # when a save was last ASKED for; 0 = clean
+_CHUNK_FLUSHER = [False]  # one flusher thread, ever
 
 
 def _chunk_save() -> None:
-    """#1149: the trim stays here; the WRITE leaves the event loop.
+    """#1149, second pass: a draw only ASKS for a save; one flusher does it.
 
-    Serialising 4000 rows and writing them to disk ran synchronously
-    inside the prep chain (chunk_serve -> speakbox_quote -> dj_banter),
-    which runs ON the loop under pantry_keeper - the stall hunter caught
-    this exact frame holding healthz for 8s, twice, which is every
-    remote listener's polls frozen with it. The rows are shallow-copied
-    before the thread, so a draw mutating a row mid-dump cannot garble
-    the file; the write lock keeps two saves from interleaving on the
-    same tmp path."""
+    The first pass moved the disk write off the loop and left the sort,
+    the trim and a fresh thread PER DRAW on it - and chunk_serve calls
+    this on EVERY draw, dozens back to back in a prep round, so the
+    hunter caught the very same frame again (the trim's `v not in rows`
+    was also a deep-equality scan over 4000 dicts). Now the hot path is
+    two assignments; a single daemon flusher wakes every few seconds,
+    coalesces the burst, and does the sort, an O(n) key-set trim, the
+    serialise and the write on ITS clock, holding the lock only for the
+    copy. The ledger is a cooldown record - losing the last three
+    seconds of counters at a crash is nothing; freezing every remote
+    listener's polls per draw was the show."""
+    _CHUNK_DIRTY[0] = time.time()
+    with _CHUNK_LOCK:
+        if _CHUNK_FLUSHER[0]:
+            return
+        _CHUNK_FLUSHER[0] = True
+    Thread(target=_chunk_flush_worker, daemon=True).start()
+
+
+def _chunk_flush_worker() -> None:
     try:
-        rows = sorted(_CHUNK_LEDGER.values(),
-                      key=lambda r: -float(r.get("last") or 0))
-        del rows[CHUNK_LEDGER_MAX:]
-        for gone in [k for k, v in _CHUNK_LEDGER.items() if v not in rows]:
-            _CHUNK_LEDGER.pop(gone, None)
-        snapshot = [dict(r) for r in rows]
-
-        def write() -> None:
+        while _CHUNK_DIRTY[0]:
+            _CHUNK_DIRTY[0] = 0.0
+            time.sleep(3.0)         # gather the burst into one write
+            with _CHUNK_LOCK:
+                rows = sorted(_CHUNK_LEDGER.values(),
+                              key=lambda r: -float(r.get("last") or 0))
+                del rows[CHUNK_LEDGER_MAX:]
+                keep = {str(r.get("key") or "") for r in rows}
+                for gone in [k for k in _CHUNK_LEDGER if k not in keep]:
+                    _CHUNK_LEDGER.pop(gone, None)
+                snapshot = [dict(r) for r in rows]
             try:
-                with _CHUNK_WRITE_LOCK:
-                    CHUNK_LEDGER_PATH.parent.mkdir(parents=True,
-                                                   exist_ok=True)
-                    tmp = CHUNK_LEDGER_PATH.with_suffix(".tmp")
-                    tmp.write_text(json.dumps(snapshot, indent=1))
-                    tmp.replace(CHUNK_LEDGER_PATH)
+                CHUNK_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = CHUNK_LEDGER_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps(snapshot, indent=1))
+                tmp.replace(CHUNK_LEDGER_PATH)
             except Exception:  # noqa: BLE001
                 pass            # a forgetful shelf still serves
-
-        Thread(target=write, daemon=True).start()
-    except Exception:  # noqa: BLE001
-        pass                            # a forgetful shelf still serves
+    finally:
+        with _CHUNK_LOCK:
+            _CHUNK_FLUSHER[0] = False
+        if _CHUNK_DIRTY[0]:
+            _chunk_save()       # a request raced the shutdown - respawn
 
 
 def chunk_liked(text: str) -> bool:
