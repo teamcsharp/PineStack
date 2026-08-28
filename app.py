@@ -11022,6 +11022,7 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         # away - it goes to the BACK, and anything that does the job goes
         # out ahead of it.
         _why: list[str] = []                                   # #1003
+        _rk = resort_keys(str(kind))                           # #1151
         for row in _order:
             # #1089: ...unless it is a repeat, which the cupboard holds
             # for REPEAT_KEEP_SECONDS. slot_supply has exempted these
@@ -11029,10 +11030,20 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             # hours old was COUNTED as supply by the board and REFUSED
             # here - the board planning around material the shelf would
             # not hand over.
+            # #1151: AND AN UNAIRED ROW IS NEVER "BURNT". Callers are
+            # not in SHELF_REUSABLE, so a banked call could never claim
+            # the repeat exemption - after a days-long pause every one
+            # crossed 24h, was refused here, and the trim below then
+            # deleted the whole shelf: 84 calls, 6253s of finished
+            # radio, gone in one take, and the station wrote the next
+            # call LIVE on air. If an unheard row is old, that is an
+            # argument for AIRING it (#1075) - which is what this
+            # function is for.
             _old = time.time() - float(row.get("at") or 0)
-            if _old > PANTRY_BURN_SECONDS and not (
-                    shelf_is_repeat(kind, row)
-                    and _old <= REPEAT_KEEP_SECONDS):
+            if (_old > PANTRY_BURN_SECONDS
+                    and resort_may_drop(str(kind), row, _rk)
+                    and not (shelf_is_repeat(kind, row)
+                             and _old <= REPEAT_KEEP_SECONDS)):
                 _why.append("burnt")
                 continue
             # #977: it has been out; has it rested long enough?
@@ -11121,17 +11132,24 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 pass
         # Nothing usable: shed what is plainly dead so the shelf does not
         # grow a tail of rows nobody can ever take.
+        # #1151: ...but "plainly dead" NEVER includes unheard radio. This
+        # was the only one of the five _SHELF rebinds in the file that
+        # ignored #1075's rule ("any segment that is stored needs to be
+        # played and ran on the air before it's deleted"), and it is the
+        # line that erased the caller shelf after a long pause.
         _SHELF[str(kind)] = [
             r for r in rows
-            if time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
-            # #977: and an item that has had all its airings is done, even
-            # if the burn would still keep it.
-            and int(r.get("aired") or 0) < SHELF_REUSE_MOST
-            # A completed phone call is history, never stock.  Once-aired
-            # non-reusable rows left behind by an older build cannot occupy
-            # the queue or be offered as a "new" call after restart.
-            and (not float(r.get("aired_at") or 0)
-                 or str(kind) in SHELF_REUSABLE)]
+            if not resort_may_drop(str(kind), r, _rk)
+            or (time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
+                # #977: and an item that has had all its airings is done,
+                # even if the burn would still keep it.
+                and int(r.get("aired") or 0) < SHELF_REUSE_MOST
+                # A completed phone call is history, never stock. Once-
+                # aired non-reusable rows left behind by an older build
+                # cannot occupy the queue or be offered as a "new" call
+                # after restart.
+                and (not float(r.get("aired_at") or 0)
+                     or str(kind) in SHELF_REUSABLE))]
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -12815,6 +12833,15 @@ def _protected_media_keys() -> set[str]:
             key = str((row or {}).get("media") or "")
             if key:
                 keys.add(key)
+    except Exception:  # noqa: BLE001
+        pass
+    # #1151: and the resume reel - welded during a pause for the moment
+    # the operator presses play. Pruning it during the very pause it was
+    # built for would make the unpause open onto nothing again.
+    try:
+        key = str(_REEL.get("media") or "")
+        if key:
+            keys.add(key)
     except Exception:  # noqa: BLE001
         pass
     return keys
@@ -21099,7 +21126,8 @@ def _prep_intro_pad(turns: list[tuple[str, str]],
             if first and first in words:
                 return turns            # they introduce themselves already
             return (list(turns[:at])
-                    + [("C", CALLER_HELLOS[0].format(name=caller_name))]
+                    + [("C", caller_hello_for(caller_name).format(
+                        name=caller_name))]
                     + list(turns[at:]))
     except Exception:  # noqa: BLE001
         pass                            # a miss here is only a cache miss
@@ -24152,14 +24180,19 @@ def radio_pause_set(on: bool) -> bool:
             try:
                 slept = max(0.0, now - float(_RADIO.get("paused_at") or now))
                 if slept > 60:
+                    # #1151: CLAMPED to now. The #1150 shift was
+                    # unconditional, so a round written DURING the pause
+                    # (which is the whole point of #1108) got its stamp
+                    # pushed past the wall clock - "made in the future",
+                    # permanently unburnable, and every countdown wrong.
                     for _e in _LARDER:
                         if isinstance(_e, dict) and _e.get("at"):
-                            _e["at"] = float(_e["at"]) + slept
+                            _e["at"] = min(now, float(_e["at"]) + slept)
                     for _row in (_SHELF.get("news") or []):
                         if isinstance(_row, dict) \
                                 and _row.get("prep_news_at"):
-                            _row["prep_news_at"] = (
-                                float(_row["prep_news_at"]) + slept)
+                            _row["prep_news_at"] = min(
+                                now, float(_row["prep_news_at"]) + slept)
                     _larder_save()
             except Exception:  # noqa: BLE001
                 pass
@@ -24184,8 +24217,28 @@ def radio_pause_set(on: bool) -> bool:
         # directions.
         if not on:
             try:
-                _LAST_SAID[0] = time.time()
+                # #1151: the playout clock restarts from NOW (#1120 - or
+                # box_gone_deaf reads the pause as a delivery failure),
+                # but the TALK clock is seeded most of a quiet-limit
+                # back. Re-armed to zero, talk_watch could not cover the
+                # first 95-110s after an unpause - which was measured as
+                # exactly the ~100s holes between rounds. Seeded, a
+                # cover can land ~20s in if the first round is slow, and
+                # real speech re-stamps the clock the moment it airs.
                 _LAST_PLAYOUT["at"] = time.time()
+                _LAST_SAID[0] = time.time() - max(
+                    0.0, talk_quiet_limit() - 20.0)
+                # ...and the record road owes talk on the FIRST record
+                # rather than a freshly drawn 3-5 minute gap.
+                _RADIO["banter_due"] = 0.0
+            except Exception:  # noqa: BLE001
+                pass
+            # #1151: the reel drops the moment the operator presses
+            # play - one welded clip, cut during the pause, airing
+            # whole while the desks warm behind it. Scheduled as a
+            # task, so it runs after the paused flag flips below.
+            try:
+                fire_and_forget(reel_open())
             except Exception:  # noqa: BLE001
                 pass
         # #1127: pausing stops the LINE that is mid-announce - which is
@@ -24196,6 +24249,15 @@ def radio_pause_set(on: bool) -> bool:
         if on:
             try:
                 fire_and_forget(stop_speaking())
+            except Exception:  # noqa: BLE001
+                pass
+            # #1151: pause means silence on the PAGE too. The cut is
+            # stamped going INTO the pause, so every open player flushes
+            # its queue now rather than draining 45s of announced clips
+            # into the quiet; the resume stamps a fresh cut of its own.
+            try:
+                _RADIO["voice_cut_ms"] = int(now * 1000)
+                _PAGE_AIR_UNTIL[0] = 0.0
             except Exception:  # noqa: BLE001
                 pass
             # #1138: "I pause the radio. Playback needs to stop
@@ -25018,13 +25080,19 @@ async def larder_keeper() -> None:
             # every stamp by the length of the sleep, so freshness
             # counts air time, not kitchen time).
             _paused_hold = radio_paused()
+            # #1151: the SAME protection on the contract clause. #1150
+            # shielded unheard rounds from the AGE prune while paused and
+            # left _larder_current unconditional - so a dial moved, a
+            # crystal flipped or a plot act rolling over mid-pause still
+            # deleted every unheard round on the next 3s tick.
             _LARDER[:] = [e for e in _LARDER
                           if (time.time() - e["at"] < larder_fresh()
                               or (shelf_is_repeat("banter", e)
                                   and time.time() - float(e.get("at") or 0)
                                   <= REPEAT_KEEP_SECONDS)
                               or (_paused_hold and row_unaired(e)))
-                          and _larder_current(e)]
+                          and (_larder_current(e)
+                               or (_paused_hold and row_unaired(e)))]
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
             # more rounds than the idle default.
@@ -27050,6 +27118,195 @@ async def workshop_tick() -> None:
                   "station spends the quiet making the banter better "
                   "rather than standing still. Note handed to the "
                   "writer:\n\n" + note)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# --- THE RESUME REEL (#1151) ------------------------------------------
+# "It should basically have a full broadcast together that's able to
+# just drop on me gracefully." Unpause used to open onto nothing: the
+# feed freshly flushed, the first round written and rendered from
+# scratch, and the talk watchdog re-armed to zero - a guaranteed ~100s
+# hole followed by page-boundary dead air. The reel is the answer: while
+# the station is paused, the readiest fully-rendered banked round is
+# welded into ONE continuous clip (no model call - only ffmpeg over
+# takes that already exist) and parked; the instant of unpause airs it
+# whole. One file, one append, no batch ladder, no render race - and
+# its stream length buys the normal pipeline the minutes it needs to
+# warm behind it.
+_REEL: dict[str, Any] = {}
+_REEL_BUSY = [False]
+
+
+async def reel_tick() -> None:
+    """Build (or keep) the reel while paused. Cheap and idempotent."""
+    try:
+        if not radio_paused() or not _RADIO.get("on"):
+            return
+        if _REEL_BUSY[0]:
+            return
+        if _REEL.get("media") \
+                and (VOICE_MEDIA_DIR / str(_REEL["media"])).is_file():
+            return                      # one reel standing by is enough
+        _REEL_BUSY[0] = True
+        try:
+            picked = None
+            for entry in list(_LARDER):
+                if not isinstance(entry, dict):
+                    continue
+                if not (entry.get("takes") and entry.get("frozen")):
+                    continue
+                if not dialogue_row_viable("banter", entry):
+                    continue
+                if not row_unaired(entry):
+                    continue
+                picked = entry
+                break                   # _LARDER is in order: oldest first
+            if picked is None:
+                return
+            takes = sorted((t for t in (picked.get("takes") or [])
+                            if isinstance(t, dict)),
+                           key=lambda t: int(t.get("i") or 0))
+            paths: list[str] = []
+            lines: list[dict[str, Any]] = []
+            spoken = 0.0
+            for t in takes:
+                clip = pantry_get(str(t.get("key") or ""))
+                if not clip:
+                    continue            # a hole reads better than a wait
+                name = str((clip.get("path") or "")).rsplit(
+                    "/", 1)[-1].split("?")[0]
+                if not name or not (VOICE_MEDIA_DIR / name).is_file():
+                    continue
+                secs = float(t.get("seconds") or clip.get("seconds")
+                             or (len(str(t.get("text") or "")) / 14.0))
+                if spoken + secs > 150.0:
+                    break               # airworthy on either road (<180s)
+                spoken += secs
+                paths.append(str(VOICE_MEDIA_DIR / name))
+                lines.append({"who": str(t.get("who") or "dj"),
+                              "text": str(t.get("text") or ""),
+                              "seconds": secs})
+            if len(paths) < 2:
+                return
+            beats = concat_beats(len(paths))
+            mixed = await asyncio.to_thread(
+                _call_concat_blocking, paths,
+                bool(dj_settings().get("stream_texture")), beats)
+            if not mixed:
+                return
+            one = _store_media(mixed, "wav")
+            length = float(_clip_seconds(one["path"]) or 0)
+            if length <= 0.5:
+                return                  # #1147: a zero-length clip is poison
+            offset = 0.0
+            rows: list[dict[str, Any]] = []
+            for at, ln in enumerate(lines):
+                real = concat_real_seconds(
+                    ln["seconds"], beats[at] if at < len(beats) else 0.0)
+                rows.append({"id": uuid.uuid4().hex[:6],
+                             "who": ln["who"], "kind": "banter",
+                             "text": ln["text"],
+                             "name": booth_actor_name(ln["who"], ""),
+                             "from": round(offset, 2),
+                             "until": round(offset + real, 2)})
+                offset += real
+            if offset > 0:
+                scale = length / offset
+                for r in rows:
+                    r["from"] = round(r["from"] * scale, 2)
+                    r["until"] = round(r["until"] * scale, 2)
+            _REEL.clear()
+            _REEL.update({
+                "media": str(one["path"]).rsplit("/", 1)[-1].split("?")[0],
+                "path": one["path"], "sig": one["sig"],
+                "length": length, "rows": rows,
+                "sid": alt_sid("banter", picked),
+                "at": time.time(), "turns": len(rows)})
+            pipeline_log(
+                "lookahead",
+                f"(#1151) the resume reel is cut: {len(rows)} turn(s), "
+                f"{int(length)}s of finished radio standing by for the "
+                "moment the operator presses play")
+        finally:
+            _REEL_BUSY[0] = False
+    except Exception:  # noqa: BLE001
+        _REEL_BUSY[0] = False
+
+
+async def reel_open() -> None:
+    """#1151: unpause airs the reel - one clip, no ladder, no waiting."""
+    try:
+        if radio_paused() or not _RADIO.get("on"):
+            return
+        media = str(_REEL.get("media") or "")
+        if not media or not (VOICE_MEDIA_DIR / media).is_file():
+            return
+        path, sig = str(_REEL["path"]), str(_REEL["sig"])
+        length = float(_REEL.get("length") or 0)
+        rows = list(_REEL.get("rows") or [])
+        vto = _RADIO.get("voice_to") or "box"
+        try:
+            if not box_talk_ok() and vto in ("box", "both"):
+                vto = "here"
+        except Exception:  # noqa: BLE001
+            pass
+        to_box = vto in ("box", "both")
+        box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
+                    or len(_BOX_HOLD) >= 6)
+        t0 = time.time() + VOICE_BROADCAST_LEAD_MS / 1000.0
+        if page_carries_live(vto, to_box, box_down):
+            page_feed_append({
+                "ts": int(time.time() * 1000),
+                "broadcast_ms": int(t0 * 1000),
+                "url": f"{path}?t={sig}",
+                "text": "back on the air - picking up where we left off",
+                "voice": "",
+                "stream": {"length": length, "rows": rows}})
+            _PAGE_AIR_UNTIL[0] = max(
+                float(_PAGE_AIR_UNTIL[0] or 0), t0 + length)
+        if to_box and not box_down:
+            try:
+                _stream_now_set(rows, length)
+                await _play_on_box(path, sig)
+            except Exception:  # noqa: BLE001
+                try:
+                    box_hold({"path": path, "sig": sig},
+                             "the resume reel", "dj",
+                             rows=rows, length=length)
+                except Exception:  # noqa: BLE001
+                    pass
+        for r in rows:
+            try:
+                _RADIO["chat"].append({
+                    "id": r["id"], "who": r["who"], "kind": "banter",
+                    "text": r["text"], "name": r.get("name") or "",
+                    "ts": int(time.time()),
+                    "air_at": t0 + float(r.get("from") or 0),
+                    "aired": "stream", "source": "reel",
+                    "clip_media": media, "clip_sig": sig,
+                    "clip_from": r.get("from"), "clip_until": r.get("until"),
+                })
+                air_remember(str(r.get("text") or ""),
+                             str(r.get("who") or ""), "banter")
+            except Exception:  # noqa: BLE001
+                pass
+        talk_said_now()
+        sid = str(_REEL.get("sid") or "")
+        if sid:
+            _LARDER[:] = [e for e in _LARDER
+                          if alt_sid("banter", e) != sid]
+            _larder_save()
+        try:
+            _episode_stage(path, "🎙 the resume reel")
+        except Exception:  # noqa: BLE001
+            pass
+        pipeline_log(
+            "air",
+            f"(#1151) BACK ON AIR WITH THE REEL - {len(rows)} turn(s), "
+            f"{int(length)}s welded and airing as one piece while the "
+            "desks warm behind it")
+        _REEL.clear()
     except Exception:  # noqa: BLE001
         pass
 
@@ -31537,8 +31794,11 @@ async def coordinator() -> None:
                 try:
                     # #1150: off air and covered, the quiet is spent
                     # making the banter better rather than standing by.
+                    # #1151: ...and keeping the resume reel cut, so the
+                    # unpause opens onto finished radio.
                     if radio_paused():
                         fire_and_forget(workshop_tick())
+                        fire_and_forget(reel_tick())
                 except Exception:  # noqa: BLE001
                     pass
                 try:
@@ -56593,6 +56853,24 @@ CALLER_HELLOS = (
 )
 
 
+def caller_hello_for(name: str) -> str:
+    """#1151: prep and air MUST draw the same hello. Prep rendered
+    CALLER_HELLOS[0] while air drew from the unrepeated rotation, so a
+    prepared call's first caller turn re-keyed out of the pantry every
+    time and rendered LIVE at air - the listener heard somebody say
+    their name and stop talking while the next 30-40s of render caught
+    up. Deterministic BY CALLER: stable across prep and air, varied
+    across the roster, and a given caller always opens the same way,
+    which reads as character rather than repetition."""
+    rows = list(CALLER_HELLOS)
+    try:
+        pick = int(hashlib.sha1(
+            str(name or "").strip().lower().encode()).hexdigest(), 16)
+        return rows[pick % len(rows)]
+    except Exception:  # noqa: BLE001
+        return rows[0]
+
+
 def _caller_introduces(turns: list[tuple[str, str]],
                        caller_name: str) -> list[tuple[str, str]]:
     """Guarantee the caller says their own name in their first breath.
@@ -56616,8 +56894,10 @@ def _caller_introduces(turns: list[tuple[str, str]],
         words = re.sub(r"[^a-z0-9 ]+", " ", str(said).lower())
         if first and first in words.split():
             return turns                       # they already did
-        hello = unrepeated(list(CALLER_HELLOS), "caller-hello").format(
-            name=caller_name)
+        # #1151: the SAME deterministic draw prep renders with - see
+        # caller_hello_for. The unrepeated rotation here guaranteed a
+        # pantry miss on every prepared call's opening line.
+        hello = caller_hello_for(caller_name).format(name=caller_name)
         return list(turns[:at]) + [("C", hello)] + list(turns[at:])
     return turns
 
@@ -57128,6 +57408,37 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             return out
 
         spans = _batches(len(playlist))
+        # #1151: A FULLY-BANKED ROUND AIRS IN ONE PIECE. The ladder
+        # exists to get first sound out while later turns render; when
+        # every turn is already on the pantry shelf there is nothing to
+        # wait for, and every extra page is only an extra join for the
+        # #1146 pacing to space apart. Dead air at a boundary is
+        # max(0, render_time - spoken_time); all hits makes render_time
+        # ~concat only, so one page means zero boundaries. Capped by
+        # spoken seconds so a monster round still splits under the box's
+        # 180s announce budget, in pages of 8 whose boundaries are
+        # zero-gap anyway.
+        try:
+            _est_secs = 0.0
+            _all_hit = bool(playlist)
+            for _item in playlist:
+                _pv = _turn_voice(_item) or ""
+                _pc = pantry_get(pantry_key(
+                    spoken_text(_item["chunk"]), _pv,
+                    voice_engine_for(_pv)))
+                if not _pc:
+                    _all_hit = False
+                    break
+                _est_secs += float(_pc.get("seconds")
+                                   or (len(str(_item.get("chunk") or ""))
+                                       / 14.0))
+            if _all_hit and _est_secs <= 150.0:
+                spans = [(0, len(playlist))]
+            elif _all_hit:
+                spans = [(_i, min(len(playlist), _i + 8))
+                         for _i in range(0, len(playlist), 8)]
+        except Exception:  # noqa: BLE001
+            pass
         for _bi, (_lo, _hi) in enumerate(spans):
             first_batch = _bi == 0
             last_batch = _bi == len(spans) - 1
@@ -59876,12 +60187,24 @@ async def _banter_air(entry: dict[str, Any],
     # them live, and its #784 ladder takes a Piper stand-in if the clone
     # engine is cold. The dialogue never stops.
     if str(entry.get("caller_name") or ""):
-        try:
-            entry["caller_voice"] = await caller_line_voice(
-                str(entry.get("caller_name") or ""),
-                str(entry.get("caller_voice") or ""))
-        except Exception:  # noqa: BLE001
-            pass
+        # #1151: ...UNLESS THE CALL IS ALREADY RENDERED IN THAT VOICE.
+        # Playing a finished WAV needs no engine, so the #913 health
+        # redraw must not fire for a banked call - a transient engine
+        # nap at air time used to swap the caller's voice, which re-keyed
+        # every prepared take out of the pantry (voice is IN pantry_key):
+        # the hosts hit the shelf, the caller rendered live, and the
+        # listener heard somebody say their name and stop talking.
+        _held_cv = str(entry.get("caller_voice") or "")
+        _cv_taken = bool(_held_cv and any(
+            str(t.get("voice") or "") == _held_cv
+            for t in (entry.get("takes") or [])))
+        if not _cv_taken:
+            try:
+                entry["caller_voice"] = await caller_line_voice(
+                    str(entry.get("caller_name") or ""),
+                    str(entry.get("caller_voice") or ""))
+            except Exception:  # noqa: BLE001
+                pass
     spoken = await speak_turns(banter_turns(entry["script"],
                                             entry.get("caller_name", ""),
                                             entry.get("caller2_name", "")),
@@ -70619,7 +70942,12 @@ async def dj_voice_api(
     # broadcast resumes picks up from there. Off air simply means
     # nothing new is offered.
     if radio_paused():
+        # #1151: the cut rides the paused answer too. Without it an open
+        # page kept draining clips announced up to 45s ahead INTO the
+        # pause (the record was pause-honest since #1145; the voice
+        # queue was not), and the resume flush then landed mid-word.
         return {"clips": [], "server_ms": int(time.time() * 1000),
+                "cut_ms": int(_RADIO.get("voice_cut_ms") or 0),
                 "paused": True, "off_air": True,
                 "say": "the broadcast is paused - the booth is still "
                        "recording and this picks up when it returns"}
