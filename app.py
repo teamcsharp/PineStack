@@ -4266,6 +4266,204 @@ _COMFY_LAST_USED = [0.0]
 COMFY_IDLE_UNLOAD = float(os.getenv("COMFY_IDLE_UNLOAD", "900"))  # 15 min
 
 
+# --- THE COMFY DOCTOR (#1152) -----------------------------------------
+# "I want to be able to say what's going on with ComfyUI and have it run
+# a comprehensive troubleshooter in the background, showing me a console
+# of what it's doing to repair any services it's restoring." The engine
+# runs on the HOST (a venv process, not a container), so the doctor's
+# wrench is the systemd bridge installed beside it: comfyui.service
+# supervises the process, and comfyui-kick.path watches data/comfy_kick
+# - the one file this container can touch that makes the host restart
+# the engine. Every step lands in a ledger the panel tails as a live
+# console, and in the pipeline log.
+_COMFY_DOCTOR: dict[str, Any] = {"running": False, "steps": [],
+                                 "verdict": "", "started": 0.0,
+                                 "finished": 0.0, "runs": 0, "reason": ""}
+_COMFY_DOCTOR_LOCK = RLock()
+_COMFY_AUTO_AT = [0.0]
+COMFY_KICK_PATH = data_path("comfy_kick")
+
+
+def _comfy_say(line: str) -> None:
+    """One console line: the ledger the panel tails, and the pipeline."""
+    with _COMFY_DOCTOR_LOCK:
+        _COMFY_DOCTOR["steps"].append(
+            {"at": time.time(), "line": str(line)[:300]})
+        del _COMFY_DOCTOR["steps"][:-120]
+    pipeline_log("model", f"comfy doctor: {line}"[:220])
+
+
+async def comfy_doctor(reason: str = "", deep: bool = False,
+                       auto: bool = False) -> None:
+    """#1152: the comprehensive ComfyUI troubleshooter.
+
+    Knock on the engine; if it answers, read its vitals and its queue;
+    if it does not, restart it through the host bridge and wait out the
+    cold start (pytorch + a model scan is a minute, honestly). `deep`
+    additionally proves the whole road with a real test render. `auto`
+    is the self-heal path a failed render fires - throttled, so one bad
+    afternoon is one repair attempt every ten minutes, not a storm."""
+    if auto and time.time() - _COMFY_AUTO_AT[0] < 600:
+        return
+    with _COMFY_DOCTOR_LOCK:
+        if _COMFY_DOCTOR["running"]:
+            return
+        _COMFY_DOCTOR.update({
+            "running": True, "steps": [], "verdict": "",
+            "started": time.time(), "finished": 0.0,
+            "runs": int(_COMFY_DOCTOR["runs"] or 0) + 1,
+            "reason": str(reason or "a routine check")[:120]})
+    if auto:
+        _COMFY_AUTO_AT[0] = time.time()
+    try:
+        _comfy_say(f"doctor on duty — {reason or 'a routine check'}")
+        _comfy_say(f"knocking on {COMFYUI_URL} …")
+        stats = await _comfy_system_stats()
+        repaired = False
+        if not stats:
+            _comfy_say("no answer — the image engine is DOWN")
+            _comfy_say("asking the host supervisor to restart it "
+                       "(writing the comfy_kick flag; systemd's "
+                       "comfyui-kick.path fires `systemctl restart "
+                       "comfyui` the moment it appears)")
+            try:
+                COMFY_KICK_PATH.write_text(str(time.time()))
+            except Exception as exc:  # noqa: BLE001
+                _comfy_say(f"could not write the kick flag: {exc}")
+            kicked_again = False
+            waited = 0
+            while waited < 180:
+                await asyncio.sleep(5)
+                waited += 5
+                stats = await _comfy_system_stats()
+                if stats:
+                    _comfy_say(f"it answered after {waited}s")
+                    repaired = True
+                    break
+                if waited in (35, 95):
+                    _comfy_say(f"still quiet after {waited}s — waiting "
+                               "(a cold start loads pytorch and scans "
+                               "every model; a minute or two is normal)")
+                if waited >= 95 and not kicked_again:
+                    kicked_again = True
+                    _comfy_say("kicking once more in case the first "
+                               "restart raced the supervisor")
+                    try:
+                        COMFY_KICK_PATH.write_text(str(time.time()))
+                    except Exception:  # noqa: BLE001
+                        pass
+            if not stats:
+                verdict = ("DOWN — the restart bridge could not raise it "
+                           "in 3 minutes. The service is crashing on "
+                           "start (a bad update or a missing package): "
+                           "on the host, `journalctl -u comfyui` and "
+                           "`tail ~/comfyui.log` name the error.")
+                _comfy_say(verdict)
+                with _COMFY_DOCTOR_LOCK:
+                    _COMFY_DOCTOR["verdict"] = verdict
+                try:
+                    repair_note("comfy doctor: the image engine would not "
+                                "come back — it is crashing on start; the "
+                                "host's journalctl -u comfyui has the "
+                                "traceback (#1152)")
+                except Exception:  # noqa: BLE001
+                    pass
+                return
+        vitals = _summarize_system_stats(stats)
+        _comfy_say("engine up — ComfyUI "
+                   + str(vitals.get("comfyui_version") or "?")
+                   + (f" on {vitals.get('device')}"
+                      if vitals.get("device") else ""))
+        if vitals.get("ram_total_gb"):
+            _comfy_say(f"memory: {vitals.get('ram_used_gb')} of "
+                       f"{vitals.get('ram_total_gb')} GB in use")
+        try:
+            async with httpx.AsyncClient(timeout=6) as client:
+                queue = (await client.get(f"{COMFYUI_URL}/queue")
+                         ).json() or {}
+            running = len(queue.get("queue_running") or [])
+            pending = len(queue.get("queue_pending") or [])
+            _comfy_say(f"queue: {running} rendering, {pending} waiting")
+        except Exception as exc:  # noqa: BLE001
+            _comfy_say(f"the queue would not answer: {exc} — the engine "
+                       "may be mid-collapse; watch the next knock")
+        if _load_workflow_override(data_path("comfy_workflow.json")):
+            _comfy_say("renders use the operator's workflow override "
+                       "(data/comfy_workflow.json)")
+        else:
+            _comfy_say(f"renders use the default graph with checkpoint "
+                       f"{COMFYUI_CHECKPOINT}")
+        if deep or repaired:
+            _comfy_say("proving the road with a real test render …")
+            try:
+                t0 = time.time()
+                workflow = _comfy_workflow(
+                    "pine box fm test card, retro radio studio, warm "
+                    "lamplight, dust motes")
+                async with httpx.AsyncClient(timeout=15) as client:
+                    got = await client.post(f"{COMFYUI_URL}/prompt",
+                                            json={"prompt": workflow})
+                    got.raise_for_status()
+                    pid = str((got.json() or {}).get("prompt_id") or "")
+                _COMFY_LAST_USED[0] = time.time()
+                done = False
+                while pid and time.time() - t0 < 240:
+                    await asyncio.sleep(5)
+                    async with httpx.AsyncClient(timeout=8) as client:
+                        hist = (await client.get(
+                            f"{COMFYUI_URL}/history/{pid}")).json() or {}
+                    if hist.get(pid):
+                        done = True
+                        break
+                if done:
+                    _comfy_say(f"test render landed in "
+                               f"{int(time.time() - t0)}s — the whole "
+                               "road works")
+                else:
+                    _comfy_say("test render did not land inside 4 "
+                               "minutes — the engine answers but is not "
+                               "finishing work; its log has the story")
+            except Exception as exc:  # noqa: BLE001
+                _comfy_say(f"test render failed to submit: {exc}")
+        verdict = (("REPAIRED — restarted through the host bridge and "
+                    "verified" if repaired else "HEALTHY")
+                   + f" · ComfyUI {vitals.get('comfyui_version') or '?'}")
+        with _COMFY_DOCTOR_LOCK:
+            _COMFY_DOCTOR["verdict"] = verdict
+        _comfy_say(verdict)
+        if repaired:
+            try:
+                repair_note("comfy doctor: the image engine was down and "
+                            "was restarted through the host bridge; it "
+                            "answers again (#1152)")
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception as exc:  # noqa: BLE001
+        with _COMFY_DOCTOR_LOCK:
+            _COMFY_DOCTOR["verdict"] = f"the doctor itself tripped: {exc}"
+        _comfy_say(f"the doctor itself tripped: {exc}")
+    finally:
+        with _COMFY_DOCTOR_LOCK:
+            _COMFY_DOCTOR["running"] = False
+            _COMFY_DOCTOR["finished"] = time.time()
+
+
+def is_comfy_status_query(text: str) -> bool:
+    """#1152: 'what's going on with ComfyUI' and every cousin of it."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return False
+    comfy = re.search(r"\bcomfy\s*ui\b|\bcomfyui\b|\bcomfy\b|"
+                      r"\bimage (engine|server|generator)\b", lowered)
+    if not comfy:
+        return False
+    asking = re.search(
+        r"what('s| is) (going on|happening|up|wrong)|status|running|"
+        r"\b(is|check( on)?|fix|repair|restart|troubleshoot|diagnos)\b|"
+        r"\b(down|broken|dead|working|alive|ok|okay)\b", lowered)
+    return bool(asking)
+
+
 async def comfy_idle_clock() -> None:
     """Unload ComfyUI's model cache after a quiet spell. The next render
     pays a one-time reload of its checkpoint; every other service on the
@@ -4796,12 +4994,22 @@ async def comfyui_generate(
             prompt, user_text, kind
         )
     except Exception as exc:
+        # #1152: a failed render is the doctor's page. Self-heal in the
+        # background (throttled inside), and SAY so - the operator's
+        # complaint was an error with nobody doing anything about it.
+        fire_and_forget(comfy_doctor(
+            reason=f"a {kind} render failed to submit", auto=True))
         if direct:
             return (f"That {kind} could not be generated — ComfyUI is "
-                    f"unavailable or misconfigured ({exc}).")
+                    f"unavailable or misconfigured ({exc}). The Comfy "
+                    "Doctor is on it in the background; the console on "
+                    "the panel shows the repair.")
         return (
             f"Tell the user the {kind} could not be generated because ComfyUI "
-            f"is unavailable or misconfigured. Technical error: {exc}"
+            f"is unavailable or misconfigured (technical error: {exc}), and "
+            "that the station's Comfy Doctor has already started a "
+            "background repair - its console on the panel shows each step, "
+            "and the render can be asked for again in a minute or two."
         )
     # The order goes through the DJ desk (#354): a commission placed at
     # the box while the show is on becomes an ad read on air — processed
@@ -18963,6 +19171,11 @@ def dj_state() -> dict[str, Any]:
                            f"?t={media_sign(upnext['id'])}"}
                    if upnext else None),
         "on": bool(_RADIO["on"]),
+        # #1152: the doctor's pulse, so the panel can open its console
+        # the moment a run starts (survives lean - deny list).
+        "comfy_doctor": {"running": bool(_COMFY_DOCTOR.get("running")),
+                         "started": float(_COMFY_DOCTOR.get("started") or 0),
+                         "verdict": str(_COMFY_DOCTOR.get("verdict") or "")},
         "station_name": dj_settings()["station_name"],
         # Who is in the studio (#668): the booth glass shows the room and
         # lights whoever currently has the mic. The names were only ever
@@ -63166,20 +63379,30 @@ async def generate_answer(
     )
 
     system_used = (not memory_command) and is_system_query(user_text)
+    # #1152: "what's going on with ComfyUI" outranks "render an image" -
+    # a question about the engine must never be handed TO the engine.
+    comfy_status = (
+        not memory_command
+        and not system_used
+        and is_comfy_status_query(user_text)
+    )
     tune_requested = (
         not is_music_request(user_text)
         and
-        not memory_command and not system_used and is_tune_request(user_text)
+        not memory_command and not system_used and not comfy_status
+        and is_tune_request(user_text)
     )
     video_requested = (
         not memory_command
         and not system_used
+        and not comfy_status
         and not tune_requested
         and is_video_request(user_text)
     )
     image_requested = (
         not memory_command
         and not system_used
+        and not comfy_status
         and not tune_requested
         and not video_requested
         and is_image_request(user_text)
@@ -63416,6 +63639,29 @@ async def generate_answer(
             return reply, {**feature_meta, "model": "comfyui"}
         outcome = await comfyui_generate(user_text, settings, kind="video")
         messages.append({"role": "system", "content": outcome})
+    elif comfy_status:
+        # #1152: fire the full troubleshooter in the background, answer
+        # NOW with what a live knock found, and point at the console.
+        feature_meta["comfy_doctor"] = True
+        fire_and_forget(comfy_doctor(reason="the operator asked"))
+        probe = await _comfy_system_stats()
+        state_line = (
+            "answering right now (ComfyUI "
+            + str((_summarize_system_stats(probe) or {}).get(
+                "comfyui_version") or "?") + ")"
+            if probe else "NOT answering - it is down")
+        messages.append({"role": "system", "content": (
+            "The user asked what is going on with ComfyUI, the image "
+            f"engine. A live probe this second found it {state_line} at "
+            f"{COMFYUI_URL}. The comprehensive troubleshooter is already "
+            "running in the background: it knocks on the engine, reads "
+            "its memory and queue, and if it is down it restarts the "
+            "service through the host bridge and waits out the cold "
+            "start, then verifies with a test render. Every step it "
+            "takes is streaming live to the Comfy Doctor console on the "
+            "Pine Box panel (the \U0001fa7a card - it opens itself while "
+            "the doctor works). Tell the user what the probe found and "
+            "that the doctor is on it; brief and spoken.")})
     elif image_requested:
         feature_meta["image_requested"] = True
         if _RADIO.get("on") or _OLLAMA_GATE.locked():
@@ -83999,6 +84245,36 @@ async def api_generate(
     return {"prompt_id": prompt_id, "model": model_name, "tags": prompt[:2000]}
 
 
+@app.get("/api/comfy/doctor")
+async def api_comfy_doctor_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1152: the doctor's console, tailed by the panel."""
+    require_read_auth(authorization)
+    with _COMFY_DOCTOR_LOCK:
+        return json.loads(json.dumps(_COMFY_DOCTOR, default=str))
+
+
+@app.post("/api/comfy/doctor")
+async def api_comfy_doctor_run(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1152: run the troubleshooter now. {"deep": true} proves the whole
+    road with a real test render as well."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    already = bool(_COMFY_DOCTOR.get("running"))
+    if not already:
+        fire_and_forget(comfy_doctor(
+            reason="the operator pressed the button",
+            deep=bool(payload.get("deep"))))
+    return {"started": not already, "already": already}
+
+
 @app.get("/api/art/prompt")
 async def art_prompt_api(
     name: str,
@@ -89080,6 +89356,7 @@ const PINE_3JS = [
   {key: "topology", label: "🪐 Mind Topology",   open: () => mindTopologyOpen()},
   {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
   {key: "orchlogic", label: "🕸 Orchestrator",   open: () => orchLogicPanel()},
+  {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel()},
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
   {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
   {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen()},
@@ -106048,6 +106325,7 @@ async function pollDJ() {
     }
     pineActivityPaint(state);
     djRepairBanner(state.repairing, state.repair_log || []);
+    comfyDoctorWatch(state);                              // #1152
   } catch (error) { /* the panel works without it */ }
 }
 
@@ -120556,6 +120834,108 @@ async function orchToast() {
  * answers, the station keeps (the judgment book) and applies at the
  * two planning sites the learning factor already uses; this graph is
  * where those weights are seen, questioned and turned. */
+/* ---- #1152: THE COMFY DOCTOR'S CONSOLE ------------------------------
+ * "Show me a console output on the Pine Box agent explaining what it's
+ * doing to repair any services." A terminal that tails the doctor's
+ * ledger live: every knock, every restart through the host bridge,
+ * every verdict. Opens itself when a run starts (the chat road and the
+ * failed-render self-heal both fire runs), and can be run by hand. */
+let comfyDoc = null;
+let comfyDocTimer = null;
+let comfyDocSeen = 0;
+
+function comfyDoctorClose() {
+  if (comfyDocTimer) { clearInterval(comfyDocTimer); comfyDocTimer = null; }
+  if (comfyDoc) { try { comfyDoc.remove(); } catch (e) {} comfyDoc = null; }
+}
+
+function comfyDoctorWatch(state) {
+  /* pollDJ calls this: a fresh run auto-opens the console once. */
+  try {
+    const d = state && state.comfy_doctor;
+    if (d && d.running && Number(d.started) > comfyDocSeen) {
+      comfyDocSeen = Number(d.started);
+      if (!comfyDoc) comfyDoctorPanel();
+    }
+  } catch (e) { /* the panel works without it */ }
+}
+
+async function comfyDoctorPanel() {
+  if (comfyDoc) { comfyDoctorClose(); return; }
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:350;display:flex;"
+    + "align-items:center;justify-content:center;background:rgba(2,4,9,.8)";
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(760px,94vw);max-height:82vh;display:flex;"
+    + "flex-direction:column;background:#05080d;border:1px solid #22304a;"
+    + "border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);"
+    + "overflow:hidden";
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:9px;"
+    + "padding:10px 14px;border-bottom:1px solid #1b2735";
+  head.appendChild(el("b", "", "🩺 The Comfy Doctor"));
+  const verdict = el("span", "muted", "");
+  verdict.style.cssText = "font-size:11px;flex:1;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(verdict);
+  const run = el("button", "", "Run");
+  run.title = "Knock, read the vitals, repair if it is down";
+  run.onclick = async () => {
+    try { await api("/api/comfy/doctor", {method: "POST", body: "{}"}); }
+    catch (e) { setStatus(e.message, true); }
+  };
+  const deep = el("button", "", "Deep");
+  deep.title = "…and prove the whole road with a real test render";
+  deep.onclick = async () => {
+    try {
+      await api("/api/comfy/doctor",
+        {method: "POST", body: JSON.stringify({deep: true})});
+    } catch (e) { setStatus(e.message, true); }
+  };
+  const x = el("button", "", "✕");
+  x.onclick = comfyDoctorClose;
+  head.appendChild(run); head.appendChild(deep); head.appendChild(x);
+  box.appendChild(head);
+  const term = el("div", "", "");
+  term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
+    + "font:12px/1.7 ui-monospace,Consolas,monospace;color:#9fd0a6;"
+    + "background:#04070b;white-space:pre-wrap;min-height:220px";
+  term.textContent = "connecting to the doctor…";
+  box.appendChild(term);
+  shade.appendChild(box);
+  shade.onclick = (ev) => { if (ev.target === shade) comfyDoctorClose(); };
+  document.body.appendChild(shade);
+  comfyDoc = shade;
+
+  let lastCount = -1;
+  const paint = (d) => {
+    verdict.textContent = d.running
+      ? "working — " + (d.reason || "")
+      : (d.verdict || "idle — press Run");
+    const steps = d.steps || [];
+    if (steps.length === lastCount) return;
+    lastCount = steps.length;
+    const stamp = (t) => {
+      const w = new Date(t * 1000);
+      return String(w.getHours()).padStart(2, "0") + ":"
+        + String(w.getMinutes()).padStart(2, "0") + ":"
+        + String(w.getSeconds()).padStart(2, "0");
+    };
+    term.textContent = steps.length
+      ? steps.map((s) => stamp(s.at) + "  " + s.line).join("\n")
+        + (d.running ? "\n▋" : "")
+      : "no run yet — press Run, or just ask the box what's going on "
+        + "with ComfyUI.";
+    term.scrollTop = term.scrollHeight;
+  };
+  const poll = async () => {
+    try { paint(await api("/api/comfy/doctor")); }
+    catch (e) { /* the console keeps its last lines */ }
+  };
+  poll();
+  comfyDocTimer = setInterval(poll, 2000);
+}
+
 let orchLogic = null;
 let orchLogicTimer = null;
 
