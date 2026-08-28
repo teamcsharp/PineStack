@@ -19176,6 +19176,10 @@ def dj_state() -> dict[str, Any]:
         "comfy_doctor": {"running": bool(_COMFY_DOCTOR.get("running")),
                          "started": float(_COMFY_DOCTOR.get("started") or 0),
                          "verdict": str(_COMFY_DOCTOR.get("verdict") or "")},
+        # #1153: and the steward's.
+        "steward": {"running": bool(_STEWARD.get("running")),
+                    "started": float(_STEWARD.get("started") or 0),
+                    "verdict": str(_STEWARD.get("verdict") or "")},
         "station_name": dj_settings()["station_name"],
         # Who is in the studio (#668): the booth glass shows the room and
         # lights whoever currently has the mic. The names were only ever
@@ -63379,11 +63383,24 @@ async def generate_answer(
     )
 
     system_used = (not memory_command) and is_system_query(user_text)
+    # #1153: "restart <service>" is a COMMAND - it outranks every status
+    # question, including the comfy one ("restart comfyui" must act, not
+    # diagnose). And "how are the services doing" is the census question.
+    service_command_name = ("" if memory_command
+                            else parse_service_command(user_text))
+    services_query = (
+        not memory_command
+        and not system_used
+        and not service_command_name
+        and is_services_query(user_text)
+    )
     # #1152: "what's going on with ComfyUI" outranks "render an image" -
     # a question about the engine must never be handed TO the engine.
     comfy_status = (
         not memory_command
         and not system_used
+        and not service_command_name
+        and not services_query
         and is_comfy_status_query(user_text)
     )
     tune_requested = (
@@ -63639,6 +63656,49 @@ async def generate_answer(
             return reply, {**feature_meta, "model": "comfyui"}
         outcome = await comfyui_generate(user_text, settings, kind="video")
         messages.append({"role": "system", "content": outcome})
+    elif service_command_name:
+        # #1153: a spoken wrench. Do it, say what was done, done.
+        feature_meta["service_command"] = True
+        did, said = await steward_restart_one(service_command_name)
+        _steward_say(f"spoken command: {said}")
+        return ((said + (" — give it a moment and ask me how the "
+                         "services are doing to confirm.") if did
+                 else said),
+                {**feature_meta, "model": "steward"})
+    elif services_query:
+        # #1153: the census, taken live, answered in plain words - and if
+        # anything is sick the steward starts repairs before the reply
+        # is even spoken.
+        feature_meta["services_query"] = True
+        census = await services_census()
+        text, sick = services_text(census)
+        fixable = [s for s in sick if service_has_wrench(s)]
+        handless = [s for s in sick if not service_has_wrench(s)]
+        if fixable:
+            fire_and_forget(service_steward(
+                reason="the operator asked after the services", fix=True))
+        messages.append({"role": "system", "content": (
+            "The user asked how the services are doing. A live census "
+            "was just taken across the whole DGX Spark stack:\n\n" + text
+            + "\n\n"
+            + ("Every service is answering. Tell the user plainly that "
+               "everything is running fine, with a highlight or two "
+               "(the LLM, search, voices, images)."
+               if not sick else
+               ((("The down ones with a wired wrench ("
+                  + ", ".join(SERVICE_LABELS.get(s, s) for s in fixable)
+                  + ") are being repaired RIGHT NOW - the steward has "
+                  "already begun restarts in the background, and its "
+                  "console on the panel (🏥 Services) shows every step "
+                  "live; suggest asking again in a minute. ")
+                 if fixable else "")
+                + (("These need a hand on the host and cannot be "
+                    "restarted from here: "
+                    + ", ".join(SERVICE_LABELS.get(s, s)
+                                for s in handless)
+                    + " - say so honestly. ")
+                   if handless else "")))
+            + " Keep it brief and spoken.")})
     elif comfy_status:
         # #1152: fire the full troubleshooter in the background, answer
         # NOW with what a live knock found, and point at the console.
@@ -83325,6 +83385,13 @@ async def health_details(
     """Everything the health popup shows: per-service state, loaded models,
     system stats, and recent operation timings."""
     require_read_auth(authorization)
+    return await services_census()
+
+
+async def services_census() -> dict[str, Any]:
+    """#1153: THE CENSUS - every service the station stands on, probed
+    live. The health popup, the chat's "how are the services doing", and
+    the steward's repair runs all read this one truth."""
     services: dict[str, Any] = {}
     token, _player = _ha_creds()
 
@@ -83510,6 +83577,98 @@ async def health_details(
             can("comfyui", (("painting — " + qf[0]) if qf else "ready to paint"))
         except Exception:
             pass
+
+    # #1153: the rest of the stack the popup never showed - the voice
+    # engines, the speech pair, the search-and-download road, and the
+    # vector guides the LLM reads. Same shape, same census.
+    async def _tcp_ok(host: str, port: int) -> tuple[bool, str]:
+        try:
+            _r, _w = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=4)
+            _w.close()
+            try:
+                await _w.wait_closed()
+            except Exception:  # noqa: BLE001
+                pass
+            return True, "answering"
+        except Exception as exc:  # noqa: BLE001
+            return False, str(exc)[:80] or "unreachable"
+    try:
+        _pok, _pdetail = await _tcp_ok(PIPER_HOST, int(PIPER_PORT))
+        services["wyoming-piper"] = {
+            "ok": _pok, "detail": _pdetail,
+            "url": f"{PIPER_HOST}:{PIPER_PORT}",
+            "facts": ["the guaranteed voice - every broadcast line can "
+                      "fall back to it"]}
+        _wok, _wdetail = await _tcp_ok(WHISPER_HOST, int(WHISPER_PORT))
+        services["wyoming-whisper"] = {
+            "ok": _wok, "detail": _wdetail,
+            "url": f"{WHISPER_HOST}:{WHISPER_PORT}",
+            "facts": ["speech in - browser call-in and transcription"]}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            _vl = await client.get("http://127.0.0.1:8771/health")
+            _vj = _vl.json() if _vl.status_code == 200 else {}
+            services["voice-lab"] = {
+                "ok": _vl.status_code == 200,
+                "detail": f"HTTP {_vl.status_code}",
+                "url": "http://127.0.0.1:8771",
+                "facts": [f"yt-dlp {_vj.get('ytdlp') or '?'} - the "
+                          "download-and-listen road",
+                          f"js runtime: {_vj.get('js_runtime') or '?'}"]}
+    except Exception as exc:  # noqa: BLE001
+        services["voice-lab"] = {"ok": False, "detail": str(exc)[:80],
+                                 "url": "http://127.0.0.1:8771",
+                                 "facts": []}
+    try:
+        _bok, _bdetail = await _tcp_ok("127.0.0.1", 4416)
+        services["bgutil-pot"] = {
+            "ok": _bok, "detail": _bdetail, "url": "127.0.0.1:4416",
+            "facts": ["proof-of-origin tokens - keeps yt-dlp past the "
+                      "age gates"]}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _xh = await xtts_health(force=True)
+        services["xtts"] = {
+            "ok": bool(_xh.get("ready")),
+            "detail": str(_xh.get("detail") or
+                          ("ready" if _xh.get("ready") else "not ready")),
+            "url": XTTS_URL,
+            "facts": ["the clone voices - every vl_ id renders here; "
+                      "repairable via the reachy gateway's autofix"]}
+        _fh = await f5_health(force=True)
+        services["f5"] = {
+            "ok": bool(_fh.get("ready")),
+            "detail": str(_fh.get("detail") or
+                          ("ready" if _fh.get("ready") else "not ready")),
+            "url": F5_URL,
+            "facts": ["the second clone engine - optional; Piper and "
+                      "XTTS carry the show without it"]}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _tags = ((results.get("ollama").json() or {})
+                 if results.get("ollama") else {})
+        _installed = []
+        async with httpx.AsyncClient(timeout=6) as client:
+            _tj = (await client.get(f"{OLLAMA_URL}/api/tags")).json() or {}
+            _installed = [str(m.get("name") or "")
+                          for m in (_tj.get("models") or [])]
+        _has_embed = any(EMBED_MODEL in m for m in _installed)
+        services["vector guides"] = {
+            "ok": _has_embed and bool(services.get("ollama", {}).get("ok")),
+            "detail": (f"{EMBED_MODEL} installed" if _has_embed
+                       else f"{EMBED_MODEL} NOT installed - the guides "
+                            "cannot be searched"),
+            "url": f"{OLLAMA_URL} · {EMBED_MODEL}",
+            "virtual": True,
+            "facts": [f"{len(te_devices())} manuals chunked and cached",
+                      "the crystal reads and chunks through this road"]}
+    except Exception:  # noqa: BLE001
+        pass
 
     gens = _read_all_generations()
     services["spark-agent"] = {
@@ -83767,6 +83926,7 @@ SERVICE_CONTAINERS = {
     "wyoming-piper": "wyoming-piper",
     "wyoming-whisper": "wyoming-whisper",
     "voice-lab": "voice-lab",
+    "bgutil-pot": "bgutil-pot",                              # #1153
 }
 
 
@@ -83816,6 +83976,262 @@ async def service_restart(
             status_code=502,
             detail=f"the proxy refused the restart (HTTP {reply.status_code})")
     return {"restarting": name, "container": container}
+
+
+# --- THE SERVICES STEWARD (#1153) -------------------------------------
+# "I want to be able to ask how the services are doing... and to reboot,
+# relaunch, reinitialize services just by giving commands to the Pine
+# Box." The census (services_census) is the eyes; this is the hands: a
+# wrench per service - compose containers through the restarts-only
+# proxy, ComfyUI and Ollama through the host kick bridges, XTTS through
+# the reachy gateway's autofix - a repair run that fixes everything
+# sick and proves it, and a console the panel tails like the Comfy
+# Doctor's. The chat road drives all of it in plain words.
+_STEWARD: dict[str, Any] = {"running": False, "steps": [], "verdict": "",
+                            "started": 0.0, "finished": 0.0, "runs": 0,
+                            "reason": ""}
+_STEWARD_LOCK = RLock()
+HOSTSVC_KICK_PATH = data_path("hostsvc_kick")
+
+SERVICE_ALIASES = {
+    "ollama": "ollama", "the llm": "ollama", "llm": "ollama",
+    "language model": "ollama",
+    "comfyui": "comfyui", "comfy ui": "comfyui", "comfy": "comfyui",
+    "image engine": "comfyui", "image server": "comfyui",
+    "searxng": "searxng", "searx": "searxng", "web search": "searxng",
+    "search engine": "searxng", "the search": "searxng",
+    "home assistant": "home-assistant", "homeassistant": "home-assistant",
+    "whisper": "wyoming-whisper", "wyoming whisper": "wyoming-whisper",
+    "piper": "wyoming-piper", "wyoming piper": "wyoming-piper",
+    "voice lab": "voice-lab", "voice-lab": "voice-lab",
+    "open webui": "open-webui", "openwebui": "open-webui",
+    "xtts": "xtts", "clone server": "xtts", "the clones": "xtts",
+    "voice clone": "xtts",
+    "bgutil": "bgutil-pot", "pot provider": "bgutil-pot",
+    "spark agent": "spark-agent", "pine box agent": "spark-agent",
+    "the agent": "spark-agent", "yourself": "spark-agent",
+}
+
+SERVICE_LABELS = {
+    "ollama": "Ollama (the LLM)", "comfyui": "ComfyUI (images)",
+    "searxng": "SearXNG (web search)", "home-assistant": "Home Assistant",
+    "wyoming-piper": "Piper (voice out)",
+    "wyoming-whisper": "Whisper (speech in)",
+    "voice-lab": "voice-lab (downloads)", "open-webui": "Open WebUI",
+    "xtts": "XTTS (clone voices)", "f5": "F5-TTS (second clone engine)",
+    "bgutil-pot": "bgutil (yt tokens)", "spark-agent": "the Pine Box agent",
+    "voice chain": "the voice chain", "pine box fm": "Pine Box FM",
+    "vector guides": "the vector guides",
+}
+
+
+def service_has_wrench(name: str) -> bool:
+    """Can the steward actually restart this one from here?"""
+    return (name in ("comfyui", "ollama", "xtts")
+            or name in SERVICE_CONTAINERS)
+
+
+def _steward_say(line: str) -> None:
+    with _STEWARD_LOCK:
+        _STEWARD["steps"].append({"at": time.time(),
+                                  "line": str(line)[:300]})
+        del _STEWARD["steps"][:-160]
+    pipeline_log("model", f"steward: {line}"[:220])
+
+
+def services_text(census: dict[str, Any]) -> tuple[str, list[str]]:
+    """The census as plain lines, and the names of the sick."""
+    lines: list[str] = []
+    sick: list[str] = []
+    for name, row in (census.get("services") or {}).items():
+        ok = bool((row or {}).get("ok"))
+        label = SERVICE_LABELS.get(name, name)
+        lines.append(("OK   " if ok else "DOWN ") + label + " - "
+                     + str((row or {}).get("detail") or "")[:90])
+        if not ok:
+            sick.append(name)
+    gpu = census.get("gpu") or {}
+    ram = census.get("ram") or {}
+    if ram.get("total_kb"):
+        lines.append(
+            f"host: {round((ram['total_kb'] - (ram.get('available_kb') or 0)) / 1e6, 1)}"
+            f"/{round(ram['total_kb'] / 1e6, 1)} GB RAM in use"
+            + (f" · {gpu.get('temp_c')}°C" if gpu.get("temp_c") else ""))
+    return "\n".join(lines), sick
+
+
+async def steward_restart_one(name: str) -> tuple[bool, str]:
+    """One wrench, by service name. Returns (kicked, what-was-done)."""
+    label = SERVICE_LABELS.get(name, name)
+    try:
+        if name == "spark-agent":
+            return (False, f"{label} is this very process - restart it "
+                           "from the panel's health popup so nothing is "
+                           "mid-sentence when it goes")
+        if name == "comfyui":
+            COMFY_KICK_PATH.write_text(str(time.time()))
+            return (True, f"{label}: kicked the host supervisor "
+                          "(systemd restart)")
+        if name == "ollama":
+            HOSTSVC_KICK_PATH.write_text("ollama")
+            return (True, f"{label}: kicked the host supervisor "
+                          "(systemd restart; the model reloads on the "
+                          "next request)")
+        if name == "xtts":
+            async with httpx.AsyncClient(timeout=150) as client:
+                got = await client.post(
+                    f"{REACHY_GATEWAY_URL}/api/speech/autofix")
+            return (got.status_code < 400,
+                    f"{label}: asked the reachy gateway's autofix to "
+                    f"relaunch the clone server (HTTP {got.status_code})")
+        if name == "f5":
+            return (False, f"{label} has no wired wrench yet - it is "
+                           "optional and the voice ladder covers it; it "
+                           "needs a hand on the host to relaunch")
+        container = SERVICE_CONTAINERS.get(name)
+        if container:
+            async with httpx.AsyncClient(timeout=90) as client:
+                reply = await client.post(
+                    "http://127.0.0.1:2375/containers/"
+                    f"{container}/restart?t=10")
+            ok = reply.status_code in (204, 304)
+            return (ok, f"{label}: container restart through the proxy "
+                        + ("done" if ok else f"refused (HTTP "
+                                             f"{reply.status_code})"))
+        return (False, f"{label} has no wrench wired - it can be probed "
+                       "but not restarted from here")
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"{label}: the wrench slipped - {exc}")
+
+
+async def service_steward(reason: str = "", fix: bool = True) -> None:
+    """#1153: census, repair everything sick, census again, verdict."""
+    with _STEWARD_LOCK:
+        if _STEWARD["running"]:
+            return
+        _STEWARD.update({"running": True, "steps": [], "verdict": "",
+                         "started": time.time(), "finished": 0.0,
+                         "runs": int(_STEWARD["runs"] or 0) + 1,
+                         "reason": str(reason or "a check-in")[:120]})
+    try:
+        _steward_say(f"steward on duty - {reason or 'a check-in'}")
+        _steward_say("taking the census - every service, probed live …")
+        census = await services_census()
+        text, sick = services_text(census)
+        for line in text.splitlines():
+            _steward_say(line)
+        if not sick:
+            verdict = "ALL WELL - every service is answering"
+            _steward_say(verdict)
+            with _STEWARD_LOCK:
+                _STEWARD["verdict"] = verdict
+            return
+        _steward_say(f"{len(sick)} sick: "
+                     + ", ".join(SERVICE_LABELS.get(s, s) for s in sick))
+        if not fix:
+            verdict = ("REPORTED - " + str(len(sick)) + " down, repairs "
+                       "not asked for")
+            with _STEWARD_LOCK:
+                _STEWARD["verdict"] = verdict
+            return
+        kicked: list[str] = []
+        for name in sick:
+            did, said = await steward_restart_one(name)
+            _steward_say(said)
+            if did:
+                kicked.append(name)
+        if kicked:
+            wait = 90 if "comfyui" in kicked else 30
+            _steward_say(f"waiting {wait}s for the restarts to settle …")
+            await asyncio.sleep(wait)
+            _steward_say("second census - did the repairs take?")
+            census = await services_census()
+            _text2, sick2 = services_text(census)
+            healed = [s for s in sick if s not in sick2]
+            still = [s for s in sick if s in sick2]
+            for s in healed:
+                _steward_say("recovered: " + SERVICE_LABELS.get(s, s))
+            for s in still:
+                _steward_say("STILL DOWN: " + SERVICE_LABELS.get(s, s))
+            verdict = (("REPAIRED - all " + str(len(healed))
+                        + " recovered") if not still else
+                       (f"PARTIAL - {len(healed)} recovered, "
+                        f"{len(still)} still down: "
+                        + ", ".join(SERVICE_LABELS.get(s, s)
+                                    for s in still)))
+        else:
+            verdict = ("HANDS TIED - nothing sick had a wired wrench; "
+                       "the census above says what needs a hand")
+        _steward_say(verdict)
+        with _STEWARD_LOCK:
+            _STEWARD["verdict"] = verdict
+        try:
+            repair_note(f"steward: {verdict} (#1153)")
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as exc:  # noqa: BLE001
+        with _STEWARD_LOCK:
+            _STEWARD["verdict"] = f"the steward tripped: {exc}"
+        _steward_say(f"the steward tripped: {exc}")
+    finally:
+        with _STEWARD_LOCK:
+            _STEWARD["running"] = False
+            _STEWARD["finished"] = time.time()
+
+
+def is_services_query(text: str) -> bool:
+    """#1153: 'how are the services doing' and its cousins."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return False
+    return bool(re.search(
+        r"how (are|is) (the |all (of )?the |my )?(services|home services|"
+        r"stack|containers)|status of (the |all )?(services|stack)|"
+        r"check (in )?on (the |my )?(services|stack)|"
+        r"(are|is) (the |all (of )?the |my )?(services|stack|containers) "
+        r"(running|ok|okay|up|fine|healthy|good)|service status|"
+        r"services (doing|status|report)", lowered))
+
+
+def parse_service_command(text: str) -> str:
+    """#1153: 'restart <service>' in plain words -> a census name, or ''."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not re.search(r"\b(restart|reboot|relaunch|re-?initiali[sz]e|"
+                     r"bounce|bring back|revive|kick)\b", lowered):
+        return ""
+    for alias in sorted(SERVICE_ALIASES, key=len, reverse=True):
+        if alias in lowered:
+            return SERVICE_ALIASES[alias]
+    return ""
+
+
+@app.get("/api/steward")
+async def api_steward_state(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1153: the steward's console, tailed by the panel."""
+    require_read_auth(authorization)
+    with _STEWARD_LOCK:
+        return json.loads(json.dumps(_STEWARD, default=str))
+
+
+@app.post("/api/steward")
+async def api_steward_run(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1153: run the steward. {"fix": false} takes the census only."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    already = bool(_STEWARD.get("running"))
+    if not already:
+        fire_and_forget(service_steward(
+            reason="the operator pressed the button",
+            fix=bool(payload.get("fix", True))))
+    return {"started": not already, "already": already}
 
 
 @app.get("/api/ha/voices")
@@ -89357,6 +89773,7 @@ const PINE_3JS = [
   {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
   {key: "orchlogic", label: "🕸 Orchestrator",   open: () => orchLogicPanel()},
   {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel()},
+  {key: "steward",  label: "🏥 Services",        open: () => stewardPanel()},
   {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
   {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
   {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen()},
@@ -106326,6 +106743,7 @@ async function pollDJ() {
     pineActivityPaint(state);
     djRepairBanner(state.repairing, state.repair_log || []);
     comfyDoctorWatch(state);                              // #1152
+    stewardWatch(state);                                  // #1153
   } catch (error) { /* the panel works without it */ }
 }
 
@@ -120934,6 +121352,107 @@ async function comfyDoctorPanel() {
   };
   poll();
   comfyDocTimer = setInterval(poll, 2000);
+}
+
+/* ---- #1153: THE STEWARD'S CONSOLE -----------------------------------
+ * The Comfy Doctor's pattern, widened to the whole stack: a terminal
+ * tailing the steward's census-and-repair runs. "Check" takes the
+ * census only; "Fix" repairs everything sick and proves it. Opens
+ * itself when a run starts (the chat's "how are the services doing"
+ * fires one whenever anything is down). */
+let stewardBox = null;
+let stewardTimer = null;
+let stewardSeen = 0;
+
+function stewardClose() {
+  if (stewardTimer) { clearInterval(stewardTimer); stewardTimer = null; }
+  if (stewardBox) { try { stewardBox.remove(); } catch (e) {} stewardBox = null; }
+}
+
+function stewardWatch(state) {
+  try {
+    const d = state && state.steward;
+    if (d && d.running && Number(d.started) > stewardSeen) {
+      stewardSeen = Number(d.started);
+      if (!stewardBox) stewardPanel();
+    }
+  } catch (e) { /* the panel works without it */ }
+}
+
+async function stewardPanel() {
+  if (stewardBox) { stewardClose(); return; }
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:350;display:flex;"
+    + "align-items:center;justify-content:center;background:rgba(2,4,9,.8)";
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(780px,94vw);max-height:82vh;display:flex;"
+    + "flex-direction:column;background:#05080d;border:1px solid #22304a;"
+    + "border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);"
+    + "overflow:hidden";
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:9px;"
+    + "padding:10px 14px;border-bottom:1px solid #1b2735";
+  head.appendChild(el("b", "", "🏥 The Services Steward"));
+  const verdict = el("span", "muted", "");
+  verdict.style.cssText = "font-size:11px;flex:1;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(verdict);
+  const check = el("button", "", "Check");
+  check.title = "Census only — probe every service, repair nothing";
+  check.onclick = async () => {
+    try {
+      await api("/api/steward",
+        {method: "POST", body: JSON.stringify({fix: false})});
+    } catch (e) { setStatus(e.message, true); }
+  };
+  const fix = el("button", "", "Fix");
+  fix.title = "Census, restart everything sick, census again";
+  fix.onclick = async () => {
+    try { await api("/api/steward", {method: "POST", body: "{}"}); }
+    catch (e) { setStatus(e.message, true); }
+  };
+  const x = el("button", "", "✕");
+  x.onclick = stewardClose;
+  head.appendChild(check); head.appendChild(fix); head.appendChild(x);
+  box.appendChild(head);
+  const term = el("div", "", "");
+  term.style.cssText = "flex:1;overflow:auto;padding:12px 14px;"
+    + "font:12px/1.7 ui-monospace,Consolas,monospace;color:#9fd0a6;"
+    + "background:#04070b;white-space:pre-wrap;min-height:240px";
+  term.textContent = "connecting to the steward…";
+  box.appendChild(term);
+  shade.appendChild(box);
+  shade.onclick = (ev) => { if (ev.target === shade) stewardClose(); };
+  document.body.appendChild(shade);
+  stewardBox = shade;
+
+  let lastCount = -1;
+  const paint = (d) => {
+    verdict.textContent = d.running
+      ? "working — " + (d.reason || "")
+      : (d.verdict || "idle — Check probes, Fix repairs");
+    const steps = d.steps || [];
+    if (steps.length === lastCount) return;
+    lastCount = steps.length;
+    const stamp = (t) => {
+      const w = new Date(t * 1000);
+      return String(w.getHours()).padStart(2, "0") + ":"
+        + String(w.getMinutes()).padStart(2, "0") + ":"
+        + String(w.getSeconds()).padStart(2, "0");
+    };
+    term.textContent = steps.length
+      ? steps.map((s) => stamp(s.at) + "  " + s.line).join("\n")
+        + (d.running ? "\n▋" : "")
+      : "no run yet — press Check, or just ask the box how the "
+        + "services are doing.";
+    term.scrollTop = term.scrollHeight;
+  };
+  const poll = async () => {
+    try { paint(await api("/api/steward")); }
+    catch (e) { /* the console keeps its last lines */ }
+  };
+  poll();
+  stewardTimer = setInterval(poll, 2000);
 }
 
 let orchLogic = null;
