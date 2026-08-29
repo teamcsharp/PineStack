@@ -63388,6 +63388,10 @@ async def generate_answer(
     # diagnose). And "how are the services doing" is the census question.
     service_command_name = ("" if memory_command
                             else parse_service_command(user_text))
+    # #1153b: "broadcast to the Nabu" / "broadcast locally to the app" -
+    # the routing selectors, spoken. A command, so it outranks status.
+    broadcast_cmd = (None if (memory_command or service_command_name)
+                     else parse_broadcast_command(user_text))
     services_query = (
         not memory_command
         and not system_used
@@ -63665,6 +63669,27 @@ async def generate_answer(
                          "services are doing to confirm.") if did
                  else said),
                 {**feature_meta, "model": "steward"})
+    elif broadcast_cmd:
+        # #1153b: drive the very door the panel's selectors use, so
+        # every side effect rides along - the record moves NOW, the
+        # page feed clears on a hand-to-box, the box wakes.
+        feature_meta["broadcast_command"] = True
+        _said = str(broadcast_cmd.pop("_said", "the broadcast moved"))
+        try:
+            async with httpx.AsyncClient(timeout=20) as _c:
+                _r = await _c.post(
+                    f"http://127.0.0.1:{STATION_PORT}/api/dj/output",
+                    json=broadcast_cmd,
+                    headers={"Authorization":
+                             f"Bearer {SPARK_AGENT_API_KEY}"})
+                _r.raise_for_status()
+            pipeline_log("air", f"spoken routing: {_said} (#1153b)")
+            return (f"Done — {_said}. The switch is immediate; the "
+                    "current record and the next lines follow it.",
+                    {**feature_meta, "model": "steward"})
+        except Exception as exc:  # noqa: BLE001
+            return (f"The routing door refused that: {exc}",
+                    {**feature_meta, "model": "steward"})
     elif services_query:
         # #1153: the census, taken live, answered in plain words - and if
         # anything is sick the steward starts repairs before the reply
@@ -84023,6 +84048,65 @@ SERVICE_LABELS = {
     "voice chain": "the voice chain", "pine box fm": "Pine Box FM",
     "vector guides": "the vector guides",
 }
+
+
+_BROADCAST_DESTS = (
+    # pattern -> (route, voice_device, spoken name). Order matters: the
+    # specific names go before the generic ones.
+    (r"\bnabu\b", ("nabu", "", "the Nabu")),
+    (r"\bpine ?box\b|\bthe box\b|\bbox speaker\b",
+     ("box", "pine", "the Pine Box speaker")),
+    (r"\bboth\b", ("both", "", "the box and the page together")),
+    (r"\b(the )?app(lication)?\b|\blocal(ly)?\b|\bhere\b",
+     ("here", "", "the app")),
+    (r"\bweb ?page\b|\bbrowser\b|\bthis page\b|\bthe page\b|\bpanel\b",
+     ("here", "", "the page")),
+    (r"\boff\b|\bnowhere\b|\bsilent\b", ("off", "", "off")),
+)
+
+
+def parse_broadcast_command(text: str) -> dict[str, Any] | None:
+    """#1153b: 'broadcast to the Nabu', 'broadcast locally to the app',
+    'send the music to the pine box', 'route replies here' - the same
+    door the panel's selectors drive, in plain words. Returns the
+    /api/dj/output payload plus a spoken description, or None."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return None
+    # The verb-or-object gate: something must actually say ROUTING -
+    # never steal "play <song>" from the music road.
+    if not re.search(
+            r"\bbroadcast\b|\b(route|send|move|switch|put) (the )?"
+            r"(broadcast|show|audio|music|sound|radio|station|voice|"
+            r"replies|responses|everything)\b|\boutput\b", lowered):
+        return None
+    dest = None
+    for pattern, row in _BROADCAST_DESTS:
+        if re.search(pattern, lowered):
+            dest = row
+            break
+    if not dest:
+        return None
+    route, device, spoken = dest
+    # Scope: a named stream moves alone; otherwise the whole broadcast.
+    payload: dict[str, Any] = {}
+    scoped = []
+    if re.search(r"\bmusic\b|\brecords?\b", lowered):
+        payload["music"] = route
+        scoped.append("music")
+    if re.search(r"\b(dj )?voices?\b|\bthe djs\b|\btalk\b", lowered):
+        payload["voice"] = route
+        scoped.append("the voices")
+    if re.search(r"\brepl(y|ies)\b|\bresponses\b", lowered):
+        payload["reply"] = route
+        scoped.append("replies")
+    if not payload:
+        payload = {"music": route, "voice": route, "reply": route}
+        scoped = ["music, voices and replies"]
+    if device:
+        payload["voice_device"] = device
+    payload["_said"] = (" and ".join(scoped) + " → " + spoken)
+    return payload
 
 
 def service_has_wrench(name: str) -> bool:
