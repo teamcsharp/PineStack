@@ -24346,10 +24346,14 @@ def radio_paused() -> bool:
         return False
 
 
-def radio_pause_set(on: bool) -> bool:
+def radio_pause_set(on: bool, why: str = "") -> bool:
     """Go off air, or come back. Written down: a station left off air
     overnight that came back by itself would be the opposite of the
-    ask."""
+    ask.
+
+    #1154: `why` names WHO asked - the panel button, a spoken command
+    (with the transcript), a listener's wake, a repair. A pause that
+    cannot say whose it was cost hours of "why is the music off"."""
     try:
         now = time.time()
         pos = _RADIO.get("sched_pos") or {}
@@ -24493,21 +24497,23 @@ def radio_pause_set(on: bool) -> bool:
             PAUSE_PATH.parent.mkdir(parents=True, exist_ok=True)
             PAUSE_PATH.write_text(json.dumps(
                 {"paused": bool(on), "at": _RADIO.get("paused_at") or 0,
+                 "why": str(why or "")[:160],                    # #1154
                  "sched_elapsed": float(
                      _RADIO.get("paused_sched_elapsed") or 0)}))
         except Exception:  # noqa: BLE001
             pass
+        _who = (" · asked by: " + str(why)[:140]) if why else ""
         pipeline_log(
             "air",
-            ("(#1108) OFF AIR - the rooms keep working. Every second of "
-             "the model and the recording room goes into the cupboard "
-             "now instead of onto the air, and the watchdogs stand down "
-             "because nobody is speaking on purpose")
+            (("(#1108) OFF AIR - the rooms keep working. Every second of "
+              "the model and the recording room goes into the cupboard "
+              "now instead of onto the air, and the watchdogs stand down "
+              "because nobody is speaking on purpose") + _who)
             if on else
-            ("(#1108) BACK ON AIR after "
-             + str(int(radio_paused_for() / 60)) + " minutes off - "
-             + str(int(prepared_seconds())) + "s of finished audio "
-             "standing by"))
+            (("(#1108) BACK ON AIR after "
+              + str(int(radio_paused_for() / 60)) + " minutes off - "
+              + str(int(prepared_seconds())) + "s of finished audio "
+              "standing by") + _who))
         return bool(on)
     except Exception:  # noqa: BLE001
         return False
@@ -70566,7 +70572,7 @@ async def radio_pause_api(
     want = payload.get("paused")
     if want is None:
         want = not radio_paused()               # a plain toggle
-    radio_pause_set(bool(want))
+    radio_pause_set(bool(want), why="the pause control (panel/API)")
     return {"paused": radio_paused(),
             "for_seconds": round(radio_paused_for(), 1),
             "banked_seconds": round(prepared_seconds(), 1),
@@ -70604,7 +70610,7 @@ async def radio_unpause_listener_api(
     require_listen_auth(t, authorization)
     was = radio_paused()
     if was:
-        radio_pause_set(False)
+        radio_pause_set(False, why="a tune-in listener pressed play")
         pipeline_log("air", "unpaused from a tune-in link - a listener "
                             "pressed play on an idle station")
     return {"paused": radio_paused(), "was_paused": was,
@@ -73295,9 +73301,37 @@ def station_intent(text: str) -> str:
     _question = bool(re.match(
         r"\s*(why|what|how|when|is|was|are|did|does)\b", low))
     for name, pattern in INTENT_PATTERNS:
-        if re.search(pattern, low, re.I):
+        got = re.search(pattern, low, re.I)
+        if got:
             if _question and name in ("pause", "unpause", "off"):
                 continue
+            # #1154: a DESTRUCTIVE spoken command must BE the sentence,
+            # not merely appear in one. The satellite's transcripts
+            # stitch ambient speech onto command-shaped phrases -
+            # "Pause the radio. This is the beauty of bigger power when
+            # it comes to marketing." and "Pause the radio. Yeah. Push
+            # it." both silenced the station for hours, and neither was
+            # the operator asking for anything (the second half is the
+            # BROADCAST, fed back through the mic). Once the matched
+            # phrase and the pleasantries are removed, a real command
+            # has nothing left to say; a recording does. Only the
+            # silencing intents are held to this - a spurious START is
+            # the direction the operator wants ("music plays 24/7").
+            if name in ("pause", "off"):
+                _residue = (low[:got.start()] + " " + low[got.end():])
+                _residue = re.sub(r"[^a-z ]+", " ", _residue)
+                _filler = {"please", "now", "ok", "okay", "yeah", "yes",
+                           "thanks", "thank", "you", "for", "me", "a",
+                           "the", "moment", "bit", "would", "could",
+                           "can", "will", "just", "hey", "pine", "box"}
+                _left = [w for w in _residue.split() if w not in _filler]
+                if _left:
+                    pipeline_log(
+                        "air",
+                        "a spoken '" + name + "' was REFUSED - the "
+                        "command came wrapped in a recording (#1154): "
+                        + said[:120])
+                    continue
             return name
     return ""
 
@@ -73394,7 +73428,8 @@ async def station_repair_now() -> str:
             # pause left standing from before the stop would keep the
             # fresh service silent, which reads as "turn on did nothing".
             if radio_paused():
-                radio_pause_set(False)
+                radio_pause_set(False,
+                                why="turn-on released a standing pause")
                 fixed.append("released the pause")
         except Exception:
             pass
@@ -73434,7 +73469,7 @@ async def station_intent_reply(intent: str, said: str) -> str:
             return ("The broadcast is already paused and silent - the "
                     "booth is banking. Say resume the radio when you "
                     "want the show back.")
-        radio_pause_set(True)
+        radio_pause_set(True, why=f"spoken: {said[:90]}")
         # #1138: playback stops with the pause now - say so.
         return ("Going off air - playback stops now. The booth keeps "
                 "recording and tinting, and everything it makes is "
@@ -73450,7 +73485,7 @@ async def station_intent_reply(intent: str, said: str) -> str:
         if not radio_paused():
             return "The broadcast is already on air."
         _banked = int(prepared_seconds() / 60)
-        radio_pause_set(False)
+        radio_pause_set(False, why=f"spoken: {said[:90]}")
         return (f"Back on air, with about {_banked} minutes of prepared "
                 "material standing by.")
 
@@ -73467,7 +73502,7 @@ async def station_intent_reply(intent: str, said: str) -> str:
     if (intent in ("cant_hear", "why_silent", "start")
             and radio_paused() and _RADIO.get("on")):
         _banked = int(prepared_seconds() / 60)
-        radio_pause_set(False)
+        radio_pause_set(False, why=f"spoken: {said[:90]}")
         return ("The broadcast was paused, not broken - bringing it "
                 f"back now with about {_banked} minutes banked.")
     if intent in ("cant_hear", "why_silent", "start"):
