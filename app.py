@@ -19889,6 +19889,29 @@ async def _dj_loop() -> None:
             # meant introduced into silence, and a tape slot was the
             # last place a 96-second gap could still open up.
             spin_first = bool(dj.get("records_first", True))
+            # #1155: TALK RADIO KEEPS THE RECORDS TURNING UNDERNEATH.
+            # With Records-first OFF this loop awaited _record_talk on its
+            # own critical path - intro, memo, call, news AND banter, with
+            # _room() answering 1e9 - while _torrent_talk ran rounds on a
+            # clock of its own. Two producers on one floor, and the needle
+            # waited for both: measured 62 minutes past the end of a
+            # 254-second record, four tasks queued at _floor_take, the
+            # operator asking why a radio station was not playing music.
+            # In talk-radio mode "talk first, then the record" has no
+            # meaning - the talk never stops - so the needle drops first
+            # and the torrent owns the rounds, exactly as the spawned
+            # branch below already arranged (intro_only=torrent).
+            if (not spin_first and bool(dj.get("talk_radio_mode"))
+                    and not tape_slot):
+                spin_first = True
+                try:
+                    if _floor_busy() or _SPEAKING[0] > 0:
+                        pipeline_log(
+                            "air", "talk radio keeps the records turning - "
+                            "the needle drops now rather than waiting on "
+                            "the floor, Records-first or not (#1155)")
+                except Exception:  # noqa: BLE001
+                    pass
             if spin_first:
                 if skip.is_set():
                     skip.clear()
@@ -24410,10 +24433,19 @@ def radio_pause_set(on: bool, why: str = "") -> bool:
                         if isinstance(_e, dict) and _e.get("at"):
                             _e["at"] = min(now, float(_e["at"]) + slept)
                     for _row in (_SHELF.get("news") or []):
-                        if isinstance(_row, dict) \
-                                and _row.get("prep_news_at"):
-                            _row["prep_news_at"] = min(
-                                now, float(_row["prep_news_at"]) + slept)
+                        if not isinstance(_row, dict):
+                            continue
+                        # #1155: the stamp lives on the ENTRY (prep_news
+                        # writes bank_to[-1]["prep_news_at"]; the row is
+                        # {"entry", "seconds"}) - this shift looked on
+                        # the row, found nothing, and every bulletin aged
+                        # through the pause in wall time.
+                        for _holder in (_row, _row.get("entry")):
+                            if (isinstance(_holder, dict)
+                                    and _holder.get("prep_news_at")):
+                                _holder["prep_news_at"] = min(
+                                    now, float(_holder["prep_news_at"])
+                                    + slept)
                     _larder_save()
             except Exception:  # noqa: BLE001
                 pass
@@ -24616,6 +24648,79 @@ def pantry_window() -> str:
     return "a record" if left > 25 else ""
 
 
+_PAUSE_FINISH_SAID = [0.0]
+_PAUSE_UNFINISHED_MEMO: dict[str, Any] = {"at": 0.0, "n": 0}
+
+
+def _news_row_alive(row: Any) -> bool:
+    """#1155: is this banked bulletin still inside NEWS_PREP_LIFE?
+
+    The stamp lives on the ENTRY (prep_news writes
+    bank_to[-1]["prep_news_at"]; the shelf row is {"entry", "seconds"}).
+    A row with no stamp at all gets the benefit of the doubt, which is
+    what shelf_full() already gives it. Age is AIR time: radio_pause_set
+    steps the stamp forward by the sleep on resume."""
+    try:
+        _e = row.get("entry") if isinstance(row, dict) else None
+        _src = _e if isinstance(_e, dict) else (
+            row if isinstance(row, dict) else {})
+        _at = float(_src.get("prep_news_at") or 0)
+        if not _at:
+            return True
+        return time.time() - _at <= NEWS_PREP_LIFE
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _pause_unfinished_rows() -> int:
+    """#1155: how many WRITTEN rounds are still waiting for their audio
+    (or their tint) while the station is off air.
+
+    Measured over a 30-hour pause (2026-08-31 -> 09-01): the engine
+    rendered for the first five hours and then nothing at all for
+    twenty-four, while 125 written phone calls, 43 painting rounds and
+    36 memos sat on the shelf without their audio. The four-hour desk
+    had bound finished rows to every entry it could see and so had
+    nothing to ask the finishing rooms for - and the keeper idles on the
+    desk's word. Off air nobody is waiting on a voice; this is the count
+    that keeps the rooms working. Five-second memo: it walks the whole
+    cupboard and is asked every keeper pass (#1142)."""
+    try:
+        if not radio_paused():
+            return 0
+        _now = time.time()
+        if _now - float(_PAUSE_UNFINISHED_MEMO.get("at") or 0) < 5.0:
+            return int(_PAUSE_UNFINISHED_MEMO.get("n") or 0)
+        n = 0
+        for _k in ("manager", "caller", "gallery", "news"):
+            for _r in list(_SHELF.get(_k) or []):
+                _e = _r.get("entry") if isinstance(_r, dict) else None
+                if not isinstance(_e, dict) or _e.get("preparing"):
+                    continue
+                if _k == "news" and not _news_row_alive(_r):
+                    continue            # dead bulletins are not work
+                if dialogue_row_ready(_k, _r):
+                    continue
+                if not dialogue_row_viable(_k, _e):
+                    continue
+                if (_e.get("frozen") and int(_e.get("prep_turns") or 0)
+                        and not int(_e.get("chunks") or 0)):
+                    continue            # nothing in it a preparer can make
+                n += 1
+        for _e in list(_LARDER):
+            if not isinstance(_e, dict) or _e.get("preparing"):
+                continue
+            if dialogue_row_ready("banter", _e):
+                continue
+            if not dialogue_row_viable("banter", _e):
+                continue
+            n += 1
+        _PAUSE_UNFINISHED_MEMO.update({"at": _now, "n": n})
+        return n
+    except Exception:  # noqa: BLE001
+        return 0
+
+
 async def pantry_keeper() -> None:
     """#886/#842: use the records and the ad breaks to build the buffer.
 
@@ -24694,8 +24799,13 @@ async def pantry_keeper() -> None:
             # which a station that talks continuously fills all by
             # itself, and standing down on the strength of it. An hour
             # of already-aired banter is not an hour of cover.
+            # #1155: OFF AIR, "COVERED" IS NOT A REASON TO STOP. See
+            # _pause_unfinished_rows: a paused station holding written
+            # rounds without their audio finishes them before it stands
+            # still, whatever the desk says about the next four hours.
+            _finish_all = bool(radio_paused() and _pause_unfinished_rows())
             if (prepared_seconds() >= target and not _calls_short
-                    and not _hour_short):
+                    and not _hour_short and not _finish_all):
                 continue                # the hours asked for are covered
             if pantry_bytes() >= PANTRY_MAX_BYTES:
                 continue                # the allowance is spent (#894)
@@ -24704,6 +24814,18 @@ async def pantry_keeper() -> None:
             # cupboard material is neither tinted nor recorded merely because
             # it happens to exist.
             _committed_unready = committed_stock_ids(ready=False)
+            # #1155: paused, the finishing rooms take EVERY written row,
+            # not only the desk's picks - the desk binds the finished
+            # ones and forgets the rest exist.
+            _bank_all = bool(_finish_all)
+            if _bank_all and time.time() - _PAUSE_FINISH_SAID[0] > 600:
+                _PAUSE_FINISH_SAID[0] = time.time()
+                pipeline_log(
+                    "lookahead",
+                    f"(#1155) off air with {_pause_unfinished_rows()} "
+                    "written round(s) still waiting for tint or audio - "
+                    "the rooms finish all of them while nobody is "
+                    "listening, not only the four-hour desk's picks")
             # #990: FINISH WHAT IS ALREADY WRITTEN BEFORE WRITING MORE.
             #
             # These two blocks - the half-rendered rounds, and the reads
@@ -24766,7 +24888,8 @@ async def pantry_keeper() -> None:
                 # already made.
                 _refused = 0
                 for _row in list(_SHELF.get(_kind) or []):
-                    if alt_sid(_kind, _row) not in _committed_unready:
+                    if (not _bank_all and alt_sid(_kind, _row)
+                            not in _committed_unready):
                         continue
                     # #916: a PRODUCED spot has no pantry `key` because its
                     # audio is a durable mp3 under /ads-audio rather than a
@@ -24836,6 +24959,8 @@ async def pantry_keeper() -> None:
                 _added = False
                 for _k in _round_order:
                     _rows = list(_SHELF.get(_k) or [])
+                    if _k == "news":
+                        _rows = [r for r in _rows if _news_row_alive(r)]
                     if _lap < len(_rows):
                         _waiting.append((_k, _rows[_lap]))
                         _added = True
@@ -24844,6 +24969,14 @@ async def pantry_keeper() -> None:
                 _lap += 1
             _slice = max(15.0, min(45.0, prep_room_left()
                                    / max(1, len(_waiting))))
+            # #1155: off air the slice is not rationed against the record.
+            # The controlled pause test measured 3240s of room split over
+            # 212 waiting rows = a 15-second slice, one 30-second line per
+            # visit, "1 of 26 lines made; the rest come next pass" - a
+            # round took ~26 passes of tint checks and chunking to finish.
+            # Nobody is waiting on a voice: give each visit two minutes.
+            if radio_paused():
+                _slice = max(_slice, 120.0)
             # #1010: ONE ACTOR, EVERY SCRIPT. The rows waiting are pooled
             # and the room works through one performer's whole swath -
             # across every script - before the next one comes in, ordered
@@ -24856,7 +24989,8 @@ async def pantry_keeper() -> None:
                     _pool = []
                     for _kind, _row in _waiting:
                         _e = _row.get("entry") or {}
-                        if alt_sid(_kind, _row) not in _committed_unready:
+                        if (not _bank_all and alt_sid(_kind, _row)
+                                not in _committed_unready):
                             continue
                         if (_e.get("preparing")
                                 or dialogue_row_ready(_kind, _e)):
@@ -24897,7 +25031,8 @@ async def pantry_keeper() -> None:
                 # else's finishing, for ever.
                 _fin = 0
                 for _kind, _row in _waiting:
-                    if alt_sid(_kind, _row) not in _committed_unready:
+                    if (not _bank_all and alt_sid(_kind, _row)
+                            not in _committed_unready):
                         continue
                     if _fin >= WAITING_VISITS_MOST:
                         break           # the booth gets the rest
@@ -25005,7 +25140,8 @@ async def pantry_keeper() -> None:
                              + " — those go first (#978/#1091)")
             _refused = 0                                       # #1122
             for _entry in ([] if _banter_wait else list(_LARDER)):
-                if alt_sid("banter", _entry) not in _committed_unready:
+                if (not _bank_all and alt_sid("banter", _entry)
+                        not in _committed_unready):
                     continue
                 # #978: IS A WINDOW OPEN - not "is it the same REASON a
                 # window was open when this pass began". `window` is a
@@ -25360,7 +25496,19 @@ async def larder_keeper() -> None:
             # rows already cover every banter second in the active horizon,
             # the writer stands down even while the physical shelf has room.
             if not commitment_write_needed("banter"):
-                continue
+                # #1155: OFF AIR THE RESERVE FILLS TO THE OPERATOR'S DIAL.
+                # The desk binds aired repeats as stock, so with five
+                # already-heard rounds and one fresh one it answered
+                # "assigned" for a whole 30-hour pause - and the station
+                # came back with ONE unaired banter round. prep_one got
+                # its paused bypass in #1131/#1134; this writer never
+                # did. Paused, it writes until the UNAIRED rounds reach
+                # _want (reserve target x prepare hours), under larder_cap.
+                _fresh = sum(1 for e in _LARDER
+                             if dialogue_row_viable("banter", e)
+                             and row_unaired(e))
+                if not (_paused_hold and _fresh < _want):
+                    continue
             # #1098: ...AND ABOVE ITS FLOOR BANTER YIELDS, HERE TOO.
             #
             # #1091 fixed the equivalent gate in pantry_keeper and I took
@@ -27310,6 +27458,8 @@ async def workshop_tick() -> None:
             return
         if hour_short_kinds():
             return                      # bank first; polish after
+        if _pause_unfinished_rows():
+            return                      # #1155: finish before polishing
         if time.time() - _WORKSHOP_LAST[0] < 1800:
             return
         if _LARDER_WRITING[0] or _OLLAMA_GATE.locked():
@@ -32127,6 +32277,8 @@ def hour_needs() -> dict[str, dict[str, float]]:
             rows = []
             for r in (_SHELF.get(road) or []):
                 try:
+                    if road == "news" and not _news_row_alive(r):
+                        continue        # #1155: a dead bulletin is not cover
                     if not dialogue_row_ready(str(road), r):
                         continue
                     _k = str(r.get("key") or "")
@@ -32497,6 +32649,15 @@ async def _torrent_talk() -> None:
             await asyncio.sleep(_breath)
             _RADIO.pop("talk_next_at", None)
             if not _RADIO.get("on") or not dj_settings().get("talk_radio_mode"):
+                continue
+            if radio_paused():
+                # #1155: the pause landed during the breath. Without this
+                # the round below was still taken - the controlled pause
+                # test caught a banked painting round going "to air" 11
+                # seconds INTO the pause, shelf_take marking it aired,
+                # nobody hearing a word of it (the #1151 class: stock
+                # burned unheard). Back to the top, where the paused
+                # branch sleeps.
                 continue
             # Never two rounds at once: the per-record intro is its own
             # task and this must not talk over it. But it does NOT wait
@@ -56372,7 +56533,26 @@ async def caller_clock() -> None:
             if not clock_may_air("caller"):
                 continue
             try:
-                await dj_call_generated()
+                # #1155: THE BANK FIRST. This clock rang twelve times an
+                # hour and every ring was a live write and a live render,
+                # while 82 finished calls stood on a shelf that only the
+                # running order's phone entry ever touched. The recording
+                # room measured it: 216 of 228 cohost takes in the hour
+                # after a resume were rendered live. A call recorded
+                # earlier answers first; the generated road stays the
+                # fallback it always was.
+                _banked: list[str] = []
+                try:
+                    _banked = list(await dj_caller(_RADIO.get("now"),
+                                                   shelf_only=True) or [])
+                except Exception:  # noqa: BLE001
+                    _banked = []
+                if _banked:
+                    pipeline_log("call", "the phone clock rang and a call "
+                                 "recorded earlier answered - no live "
+                                 "write, no live render (#1155)")
+                else:
+                    await dj_call_generated()
             except Exception as exc:
                 # The next call comes round regardless — but a phone that
                 # keeps failing must say so behind the glass (#365), not
@@ -61122,7 +61302,8 @@ def call_turns_for_slot() -> int:
 async def dj_caller(track: dict[str, Any] | None = None,
                     bank_to: list[dict[str, Any]] | None = None,
                     case_id: str = "",
-                    heat: int | None = None
+                    heat: int | None = None,
+                    shelf_only: bool = False
                     ) -> list[str]:
     """A call gets through on the request line.
 
@@ -61188,6 +61369,8 @@ async def dj_caller(track: dict[str, Any] | None = None,
                     pass
                 quota_stamp("caller")      # #839: the hour counts it
                 return _prep_said
+    if shelf_only:
+        return []                       # #1155: the phone clock wants the bank only
     hot = booth_hot()
     # When the building is genuinely cooking, some callers ring in about
     # THAT instead, and they compete at it (#644).
