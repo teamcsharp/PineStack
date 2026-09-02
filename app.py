@@ -6588,6 +6588,22 @@ REPAIR_SEED = [
      "why": "a model that returns zero characters times out every "
             "round; swap to one benchmarked to answer",
      "wins": 1, "losses": 0},
+    # #1156 (2026-09-02)
+    {"fp": "device:firmware_down|device:unreachable",
+     "cure": "route_around_box",
+     "why": "the Voice PE's IP stack answers but no port listens: the "
+            "firmware is not running and only its power cord reaches it; "
+            "the show rides the app until the vigil sees the API listen",
+     "wins": 1, "losses": 0},
+    {"fp": "library:slow", "cure": "hot_records",
+     "why": "the music share crawls over the host's Wi-Fi hop (38s for "
+            "2MB measured); records are copied to local disk ahead of "
+            "the needle and the picker prefers what is already there",
+     "wins": 1, "losses": 0},
+    {"fp": "pulse:stalled", "cure": "name_the_blocker",
+     "why": "the event loop stalled on a sync call; the pulse ledger "
+            "names the frame and the fix is code, not a restart",
+     "wins": 0, "losses": 0},
 ]
 
 
@@ -6597,6 +6613,15 @@ def repair_learned() -> list[dict[str, Any]]:
         try:
             rows = json.loads(REPAIR_LEARNED_PATH.read_text())
             if isinstance(rows, list) and rows:
+                # #1156: a seed row added AFTER the ledger existed never
+                # entered it - the file only seeded when empty.
+                have = {(str(r.get("fp")), str(r.get("cure")))
+                        for r in rows if isinstance(r, dict)}
+                added = [dict(r) for r in REPAIR_SEED
+                         if (r["fp"], r["cure"]) not in have]
+                if added:
+                    rows.extend(added)
+                    repair_learned_save(rows)
                 return rows
         except Exception:  # noqa: BLE001
             pass
@@ -6639,6 +6664,21 @@ async def repair_fingerprint() -> str:
         # and fingerprinting it as a symptom had the repair reaching for
         # the reboot button at a station that was working.
         marks.append("device:accepts")
+    # #1156: the shape of the silence on the wire, and the station's own
+    # two new faults - a crawling library and a stalling loop.
+    if not _online:
+        try:
+            if nabu_firmware_down(await _wire_probe_detail(NABU_PROBE_HOST)):
+                marks.append("device:firmware_down")
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        if (await library_speed()).get("slow"):
+            marks.append("library:slow")
+    except Exception:  # noqa: BLE001
+        pass
+    if not pulse_report(600).get("ok"):
+        marks.append("pulse:stalled")
     # Only the engine the cast actually renders on counts. Under the
     # cast lock the other one is deliberately unloaded (#866) — calling
     # that a fault would have the ledger curing the design.
@@ -6682,7 +6722,8 @@ def repair_suggest(fingerprint: str) -> list[dict[str, Any]]:
     if not (marks & {"audio:none", "shelf:jammed", "device:unreachable",
                      "device:breaker", "director:dark", "library:empty",
                      "routing:drifted", "memory:cache_starved",
-                     "writer:silent"}) and not any(
+                     "writer:silent", "device:firmware_down",
+                     "library:slow", "pulse:stalled"}) and not any(
                          m.endswith("_dark") for m in marks):
         return []
     scored: list[tuple[float, dict[str, Any]]] = []
@@ -6780,6 +6821,24 @@ async def _run_cure(cure: str) -> bool:
             return True
         if cure == "piper_restart":
             return await _lifeboat_restart("wyoming-piper")
+        if cure == "route_around_box":
+            got = await _route_around_box("the remembered cure (#1156)")
+            fire_and_forget(_box_vigil())
+            _page_operator_power_cycle()
+            return bool(got.get("moved")) or bool(_FAILOVER)
+        if cure == "hot_records":
+            _records_warm_now("the remembered cure (#1156)")
+            return True
+        if cure == "name_the_blocker":
+            _pr = pulse_report(600)
+            pipeline_log("repair", "the loop's blockers, named: "
+                         + ("; ".join(
+                             f"{t['frame']} {t['n']}x worst "
+                             f"{float(t['worst']):.1f}s"
+                             for t in (_pr.get("top") or [])[:4])
+                            or "none in the last 10 min")
+                         + " — that is a code fix, not a restart (#1156)")
+            return False
         if cure in ("drop_caches", "remount_shares", "switch_writer"):
             # These need root on the host or an operator decision; the
             # station says so plainly rather than pretending it acted.
@@ -6828,6 +6887,14 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                     continue
                 await asyncio.sleep(12)
                 healed = time.time() - _BOX_LAST_OK[0] < 90
+                # #1156: routing around a dead box is judged by the road
+                # it opened, not by a speaker that cannot answer.
+                if cure == "route_around_box":
+                    healed = ((_RADIO.get("voice_to") or "box")
+                              in ("both", "here"))
+                elif cure == "hot_records":
+                    healed = bool(music_hot_file(
+                        _RADIO.get("coming") or _RADIO.get("now") or {}))
                 repair_record(fp, cure, healed)
                 mark("the remembered cure",
                      "it worked — audio is verified again" if healed
@@ -6835,6 +6902,11 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
                      cure)
                 if healed:
                     _REPAIR_LIVE["verdict"] = (
+                        ("the Nabu's firmware is not running — the show "
+                         "rides the app/page until its power is pulled; "
+                         "the vigil brings the routing home when the API "
+                         "listens again (#1156)")
+                        if cure == "route_around_box" else
                         f"fixed from memory — {cure} (the station has "
                         f"seen {fp} before)")
                     return dict(_REPAIR_LIVE)
@@ -6927,7 +6999,15 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
         quiet = time.time() - _BOX_LAST_OK[0]
         routed = ((_RADIO.get("music_to") or "here") in ("box", "both")
                   or (_RADIO.get("voice_to") or "box") in ("box", "both"))
-        if _RADIO.get("on") and routed and box_talk_ok() and quiet > 120:
+        _fw_down = (nabu_firmware_down(_WIRE_LAST)
+                    if time.time() - float(_WIRE_LAST.get("at") or 0) < 300
+                    else False)
+        if _fw_down:
+            mark("the device", "its firmware is not running (every port "
+                 "refuses) — the restart button cannot reach it and a "
+                 "fresh needle would play to nobody; the show rides the "
+                 "app until its power is pulled (#1156)")
+        elif _RADIO.get("on") and routed and box_talk_ok() and quiet > 120:
             mark("the deaf-device rung",
                  f"nothing VERIFIED audible for {int(quiet)}s — after a "
                  "reboot the entities can all answer while the speaker "
@@ -6977,6 +7057,11 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
             _REPAIR_LIVE["verdict"] = (
                 "ON AIR and VERIFIED AUDIBLE — the speaker carried "
                 f"sound {int(fresh)}s ago")
+        elif _fw_down:
+            _REPAIR_LIVE["verdict"] = (
+                "the Nabu's firmware is not running — pull its power for "
+                "ten seconds; the show rides the app meanwhile and the "
+                "routing comes home on its own (#1156)")
         else:
             _REPAIR_LIVE["verdict"] = (
                 "everything restartable was restarted, but no playout "
@@ -7001,6 +7086,398 @@ async def _deep_repair(reason: str = "") -> dict[str, Any]:
         return dict(_REPAIR_LIVE)
     finally:
         _REPAIR_LIVE["busy"] = False
+
+
+
+# --- #1156: THE STATION'S OWN PULSE ------------------------------------
+# The host watchdog restarts this process when /healthz goes deaf for
+# three probes, and every restart is three to four minutes of silence
+# (2026-09-02: seven restarts in one night). Until now nothing in the
+# process could say WHAT it was doing while it was deaf - py-spy over
+# SSH was the only witness. A heartbeat task stamps the clock twice a
+# second; a daemon thread watches the stamp, and the moment the loop is
+# more than a beat and a half late it reads the main thread's frames and
+# keeps the app.py names: the blocker, named, in a ledger, in the census,
+# in the diagnosis, and in the DJs' mouths when someone asks how the
+# station is doing.
+_PULSE: dict[str, Any] = {"at": 0.0, "main_tid": 0, "loop": None,
+                          "stalls": [], "by_frame": {}, "worst": 0.0,
+                          "last": None, "open": None}
+_PULSE_LOCK = RLock()
+PULSE_STALL_S = float(os.getenv("PULSE_STALL_S", "1.5"))
+PULSE_LEDGER_PATH = data_path("loop_stalls.json")
+PULSE_KEEP = 120
+
+
+def _pulse_frames() -> list[str]:
+    """The main thread's app.py frames, innermost first."""
+    import sys as _sys
+    tid = int(_PULSE.get("main_tid") or 0)
+    frame = _sys._current_frames().get(tid)          # noqa: SLF001
+    out: list[str] = []
+    while frame is not None and len(out) < 8:
+        code = frame.f_code
+        if code.co_filename.endswith("app.py"):
+            out.append(f"{code.co_name} (app.py:{frame.f_lineno})")
+        frame = frame.f_back
+    return out
+
+
+def _pulse_watch() -> None:
+    """The daemon thread. It only ever READS the loop's world."""
+    while True:
+        time.sleep(0.5)
+        try:
+            at = float(_PULSE.get("at") or 0)
+            if not at:
+                continue
+            late = time.time() - at
+            open_stall = _PULSE.get("open")
+            if late > PULSE_STALL_S:
+                frames = _pulse_frames()
+                if open_stall is None:
+                    open_stall = {"at": at, "seen": [], "seconds": 0.0}
+                    _PULSE["open"] = open_stall
+                if frames and frames not in open_stall["seen"][-3:]:
+                    open_stall["seen"].append(frames)
+                    del open_stall["seen"][:-6]
+                open_stall["seconds"] = round(late, 2)
+                continue
+            if open_stall is None:
+                continue
+            _PULSE["open"] = None
+            secs = float(open_stall.get("seconds") or 0)
+            seen = [fr for fr in (open_stall.get("seen") or []) if fr]
+            top = seen[0][0] if seen else ""
+            row = {"at": float(open_stall.get("at") or 0),
+                   "seconds": secs, "top": top,
+                   "frames": (seen[0] if seen else [])[:8],
+                   "samples": len(seen)}
+            with _PULSE_LOCK:
+                stalls = _PULSE.setdefault("stalls", [])
+                stalls.append(row)
+                del stalls[:-PULSE_KEEP]
+                by = _PULSE.setdefault("by_frame", {})
+                key = (top.split(" (")[0] if top else "outside app.py")
+                agg = by.setdefault(key, {"n": 0, "seconds": 0.0,
+                                          "worst": 0.0, "at": 0.0})
+                agg["n"] += 1
+                agg["seconds"] = round(float(agg["seconds"]) + secs, 2)
+                agg["worst"] = max(float(agg["worst"]), secs)
+                agg["at"] = row["at"]
+                _PULSE["worst"] = max(float(_PULSE.get("worst") or 0), secs)
+                _PULSE["last"] = row
+                snapshot = {"stalls": list(stalls), "by_frame": dict(by)}
+            try:
+                PULSE_LEDGER_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = PULSE_LEDGER_PATH.with_suffix(".tmp")
+                tmp.write_text(json.dumps(snapshot, indent=1))
+                tmp.replace(PULSE_LEDGER_PATH)
+            except Exception:  # noqa: BLE001
+                pass
+            if secs >= 3.0:
+                loop = _PULSE.get("loop")
+                if loop is not None:
+                    try:
+                        loop.call_soon_threadsafe(
+                            pipeline_log, "pulse",
+                            f"the loop stalled {secs:.1f}s in "
+                            f"{top or 'a frame outside app.py'} (#1156)",
+                            "\n".join(row["frames"]))
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            continue
+
+
+async def _pulse_beat() -> None:
+    import threading as _threading
+    _PULSE["main_tid"] = _threading.get_ident()
+    _PULSE["loop"] = asyncio.get_running_loop()
+    _PULSE["at"] = time.time()
+    Thread(target=_pulse_watch, name="pulse-watch", daemon=True).start()
+    while True:
+        _PULSE["at"] = time.time()
+        await asyncio.sleep(0.5)
+
+
+@app.on_event("startup")
+async def _startup_pulse() -> None:
+    fire_and_forget(_pulse_beat())
+
+
+def pulse_report(window: float = 600.0) -> dict[str, Any]:
+    """What the loop has been stuck in lately, worst first. `ok` is
+    false once a stall reached the host watchdog's own probe timeout."""
+    now = time.time()
+    with _PULSE_LOCK:
+        recent = [r for r in (_PULSE.get("stalls") or [])
+                  if now - float(r.get("at") or 0) <= window]
+        by = {k: dict(v) for k, v in (_PULSE.get("by_frame") or {}).items()}
+    worst = max((float(r.get("seconds") or 0) for r in recent), default=0.0)
+    total = round(sum(float(r.get("seconds") or 0) for r in recent), 1)
+    top = sorted(((k, v) for k, v in by.items()
+                  if now - float(v.get("at") or 0) <= window),
+                 key=lambda kv: -float(kv[1].get("seconds") or 0))[:6]
+    open_stall = _PULSE.get("open")
+    ok = worst < 8.0
+    if not recent and not open_stall:
+        reading = (f"steady - no stall over {PULSE_STALL_S:g}s in the last "
+                   f"{int(window // 60)} min")
+    else:
+        lead = top[0] if top else None
+        reading = (f"{len(recent)} stall(s) in the last {int(window // 60)} "
+                   f"min, worst {worst:.1f}s"
+                   + (f" - mostly {lead[0]} ({lead[1].get('n')}x, "
+                      f"{float(lead[1].get('seconds') or 0):.1f}s)" if lead
+                      else "")
+                   + (f"; stalling NOW for "
+                      f"{float(open_stall.get('seconds') or 0):.1f}s"
+                      if open_stall else ""))
+        if not ok:
+            reading += (" - past the host watchdog's 8s probe; this is "
+                        "what restarts the station")
+    return {"window_s": window, "stalls": len(recent),
+            "worst_s": round(worst, 2), "stalled_s": total,
+            "recent": recent[-12:],
+            "top": [{"frame": k, **v} for k, v in top],
+            "stalling_now": (dict(open_stall) if open_stall else None),
+            "ok": ok, "reading": reading}
+
+
+# --- #1156: THE LIBRARY ROAD -------------------------------------------
+# The music library is a CIFS share on exbox, reached over the host's
+# Wi-Fi hop. 2026-09-02 it measured 38s for 2MB and 28s for a stat - a
+# record could not stream from it on ANY speaker, and every sync touch
+# of it on the loop was a deaf window. The road now: records are copied
+# onto local disk ahead of the needle (the hot shelf), /music serves the
+# local copy when there is one, the speed of the share is measured and
+# reported, and when it crawls the picker prefers what is already here.
+MUSIC_HOT_DIR = data_path("music_hot")
+MUSIC_HOT_KEEP = int(os.getenv("MUSIC_HOT_KEEP", "40"))
+LIBRARY_SLOW_KBPS = float(os.getenv("LIBRARY_SLOW_KBPS", "300"))
+_HOT_JOBS: set[str] = set()
+_HOT_LOCK = RLock()
+_HOT_GATE = BoundedSemaphore(1)
+_LIBRARY: dict[str, Any] = {"at": 0.0, "kbps": 0.0, "probe_s": 0.0,
+                            "slow": False, "reading": "not measured yet",
+                            "path": ""}
+
+
+def _music_hot_path(track: dict[str, Any]) -> Path:
+    return MUSIC_HOT_DIR / f"{track.get('id')}{track.get('ext') or ''}"
+
+
+def music_hot_file(track: dict[str, Any] | None) -> Path | None:
+    """The local copy of this record, or None. Local disk - cheap."""
+    try:
+        if not track or not track.get("id") or track.get("tape"):
+            return None
+        p = _music_hot_path(track)
+        return p if p.is_file() and p.stat().st_size > 0 else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _library_note_speed(nbytes: int, seconds: float, src: str = "") -> None:
+    kbps = (nbytes / 1024.0) / max(seconds, 0.001)
+    slow = kbps < LIBRARY_SLOW_KBPS
+    _LIBRARY.update({
+        "at": time.time(), "kbps": round(kbps, 1),
+        "probe_s": round(seconds, 2), "slow": slow,
+        "path": src or _LIBRARY.get("path") or "",
+        "reading": (f"crawling - {kbps:.0f} KB/s off the share "
+                    f"({nbytes >> 10} KB in {seconds:.1f}s); records play "
+                    "from the local shelf" if slow else
+                    f"{kbps:.0f} KB/s off the share ({seconds:.2f}s for "
+                    f"{nbytes >> 10} KB)")})
+
+
+def library_reading(max_age: float = 180.0) -> dict[str, Any]:
+    """The last reading, never a wait: stale readings kick a fresh probe
+    off-loop and say so. The diagnose and the census both poll."""
+    out = dict(_LIBRARY)
+    age = time.time() - float(out.get("at") or 0)
+    out["age_s"] = round(age) if out.get("at") else None
+    if age > max_age:
+        out["measuring"] = True
+        try:
+            fire_and_forget(library_speed())
+        except Exception:  # noqa: BLE001
+            pass
+        if not out.get("at"):
+            out["reading"] = "measuring the share now"
+    return out
+
+
+def _music_hot_sweep() -> None:
+    """Keep the newest MUSIC_HOT_KEEP records; never the ones on air."""
+    try:
+        keep_ids = {str((_RADIO.get(k) or {}).get("id") or "")
+                    for k in ("now", "coming")}
+        files = [p for p in MUSIC_HOT_DIR.iterdir() if p.is_file()]
+        for p in files:
+            if p.suffix == ".part" and time.time() - p.stat().st_mtime > 7200:
+                p.unlink(missing_ok=True)
+        files = [p for p in files if p.suffix != ".part"]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        for p in files[MUSIC_HOT_KEEP:]:
+            if p.stem not in keep_ids:
+                p.unlink(missing_ok=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _music_hot_warm(track: dict[str, Any] | None, why: str = "") -> bool:
+    """Copy one record off the share onto local disk - on a thread, one
+    at a time, and the copy's own timing feeds the speed reading."""
+    if not track or not track.get("id") or not track.get("path") \
+            or track.get("tape"):
+        return False
+    tid = str(track.get("id"))
+    src = str(track.get("path"))
+    dest = _music_hot_path(track)
+    if dest.is_file():
+        return False
+    with _HOT_LOCK:
+        if tid in _HOT_JOBS:
+            return False
+        _HOT_JOBS.add(tid)
+    part = dest.with_name(dest.name + ".part")
+
+    def run() -> None:
+        try:
+            with _HOT_GATE:
+                if dest.is_file():
+                    return
+                MUSIC_HOT_DIR.mkdir(parents=True, exist_ok=True)
+                started = time.time()
+                copied = 0
+                with open(src, "rb") as fin, open(part, "wb") as fout:
+                    while True:
+                        block = fin.read(1 << 20)
+                        if not block:
+                            break
+                        fout.write(block)
+                        copied += len(block)
+                part.replace(dest)
+                took = time.time() - started
+                if copied:
+                    _library_note_speed(copied, took, src)
+                _music_hot_sweep()
+        except Exception:  # noqa: BLE001
+            try:
+                part.unlink(missing_ok=True)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            with _HOT_LOCK:
+                _HOT_JOBS.discard(tid)
+    Thread(target=run, name=f"hot-{tid}", daemon=True).start()
+    return True
+
+
+def _records_warm_now(why: str = "") -> int:
+    """Warm what is about to play: the up-next, the request line's head,
+    and the top of the queue."""
+    rows = ([_RADIO.get("coming") or {}]
+            + list((_RADIO.get("requests") or [])[:2])
+            + list((_RADIO.get("queue") or [])[:2]))
+    n = 0
+    for row in rows:
+        if row and not music_hot_file(row) and _music_hot_warm(row, why):
+            n += 1
+    return n
+
+
+def _hot_shelf_pick() -> dict[str, Any] | None:
+    """A record already on the local shelf that has not aired lately."""
+    try:
+        recent = {str(r.get("id") or "") for r in read_played()[:40]}
+        now_id = str((_RADIO.get("now") or {}).get("id") or "")
+        picks = []
+        for p in MUSIC_HOT_DIR.iterdir():
+            if not p.is_file() or p.suffix == ".part":
+                continue
+            tid = p.stem
+            if tid == now_id or tid in recent or tid in _TRACK_TALK:
+                continue
+            track = music_track(tid)
+            if track:
+                picks.append(track)
+        return random.choice(picks) if picks else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def library_probe() -> dict[str, Any]:
+    """Read half a megabyte off the share and time it. Thread only."""
+    src = ""
+    for cand in (_RADIO.get("now") or {}, _RADIO.get("coming") or {}):
+        p = str(cand.get("path") or "")
+        if p and not cand.get("tape"):
+            src = p
+            break
+    if not src:
+        tracks = music_index()
+        if tracks:
+            src = str(random.choice(tracks[:3000]).get("path") or "")
+    if not src:
+        return dict(_LIBRARY)
+    started = time.time()
+    n = 0
+    try:
+        with open(src, "rb") as fh:
+            while n < (512 << 10):
+                block = fh.read(128 << 10)
+                if not block:
+                    break
+                n += len(block)
+    except Exception as exc:  # noqa: BLE001
+        _LIBRARY.update({"at": time.time(), "kbps": 0.0,
+                         "probe_s": round(time.time() - started, 2),
+                         "slow": True, "path": src,
+                         "reading": f"the library did not answer: {exc}"[:160]})
+        return dict(_LIBRARY)
+    _library_note_speed(n, time.time() - started, src)
+    return dict(_LIBRARY)
+
+
+async def library_speed(max_age: float = 90.0) -> dict[str, Any]:
+    """The share's speed, remembered for a minute and a half."""
+    if time.time() - float(_LIBRARY.get("at") or 0) < max_age:
+        return dict(_LIBRARY)
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(library_probe), 25)
+    except asyncio.TimeoutError:
+        _LIBRARY.update({"at": time.time(), "kbps": 0.0, "probe_s": 25.0,
+                         "slow": True,
+                         "reading": "crawling - a 512 KB read did not finish "
+                                    "in 25s; records play from the local "
+                                    "shelf"})
+        return dict(_LIBRARY)
+    except Exception:  # noqa: BLE001
+        return dict(_LIBRARY)
+
+
+async def records_warmer() -> None:
+    """Every half minute while the show is on: the up-next onto local
+    disk, and a fresh speed reading every two minutes."""
+    await asyncio.sleep(20)
+    while True:
+        try:
+            if _RADIO.get("on"):
+                _records_warm_now("the warmer")
+                if time.time() - float(_LIBRARY.get("at") or 0) > 120:
+                    await library_speed()
+        except Exception:  # noqa: BLE001
+            pass
+        await asyncio.sleep(30)
+
+
+@app.on_event("startup")
+async def _startup_records_warmer() -> None:
+    fire_and_forget(records_warmer())
 
 
 DIALOGUE_QUIET_LIMIT = float(os.getenv("DIALOGUE_QUIET_LIMIT", "420"))
@@ -7030,6 +7507,8 @@ async def dialogue_watchdog() -> None:
             # into a box that declined every one.
             if radio_paused():
                 continue
+            if _FAILOVER:
+                continue        # #1156: routed around a dead box on purpose
             if (_RADIO.get("voice_to") or "box") not in ("box", "both"):
                 continue                     # the box is not the audience
             now = time.time()
@@ -7081,6 +7560,8 @@ async def onair_watchdog() -> None:
             # this one's ladder ends at the device's restart button.
             if radio_paused():
                 continue
+            if _FAILOVER:
+                continue        # #1156: routed around a dead box on purpose
             quiet = time.time() - _BOX_LAST_OK[0]
             if quiet < 600:
                 continue
@@ -7110,6 +7591,170 @@ async def onair_watchdog() -> None:
 @app.on_event("startup")
 async def _startup_onair_watchdog() -> None:
     fire_and_forget(onair_watchdog())
+
+
+_WIRE_LAST: dict[str, Any] = {"at": 0.0, "state": "", "host": "",
+                              "ports": {}, "listening": False}
+_FAILOVER: dict[str, Any] = {}
+_POWER_PAGED_AT = [0.0]
+
+
+async def _wire_probe_detail(host: str = "") -> dict[str, Any]:
+    """#1156: the wire WITH the port shape. Three readings, not two:
+    'dark' (nothing answers - power or Wi-Fi), 'alive' with the ESPHome
+    API listening on 6053 (healthy), and 'alive' with every port refusing
+    - the IP stack is up and the firmware is not, which is the state the
+    old two-state probe called "alive" and then climbed a ladder of Home
+    Assistant restarts that could never reach it (2026-09-02: four
+    restarts, the whole day's budget, for nothing).
+
+    Home Assistant's own address for the device is asked first and its
+    answer is final; the other candidates only count when the API is
+    OPEN on them - a stranger refusing ports at a stale address is not
+    evidence of anything (the .161 trap, the other way round)."""
+    def scan(one: str) -> dict[str, str]:
+        import socket as _socket
+        ports: dict[str, str] = {}
+        for port in (6053, 80, 3232):
+            try:
+                c = _socket.create_connection((one, port), 3)
+                c.close()
+                ports[str(port)] = "open"
+            except ConnectionRefusedError:
+                ports[str(port)] = "refused"
+            except OSError:
+                ports[str(port)] = "timeout"
+        return ports
+
+    def probe() -> dict[str, Any]:
+        first = str(globals().get("SATELLITE_HOST") or "").strip()
+        if "://" in first:
+            first = first.split("://", 1)[1]
+        first = first.split("/", 1)[0].split(":", 1)[0].strip()
+        order = [h for h in ([first] if first else [])
+                 + ([host] if host else []) + nabu_probe_hosts() if h]
+        seen: list[str] = []
+        verdict: dict[str, Any] | None = None
+        for one in order:
+            if one in seen:
+                continue
+            seen.append(one)
+            ports = scan(one)
+            answered = any(v in ("open", "refused") for v in ports.values())
+            listening = ports.get("6053") == "open"
+            if listening:
+                return {"state": "alive", "host": one, "ports": ports,
+                        "listening": True}
+            if answered and verdict is None and (one == first or not first):
+                verdict = {"state": "alive", "host": one, "ports": ports,
+                           "listening": False}
+        return verdict or {"state": "dark", "host": "", "ports": {},
+                           "listening": False}
+    try:
+        out = await asyncio.to_thread(probe)
+    except Exception:  # noqa: BLE001
+        out = {"state": "dark", "host": "", "ports": {}, "listening": False}
+    out["at"] = time.time()
+    _WIRE_LAST.update(out)
+    return out
+
+
+def nabu_firmware_down(detail: dict[str, Any] | None) -> bool:
+    """Alive on the wire with nothing listening = the firmware is not
+    running. No restart of Home Assistant, no press of the device's own
+    button, reaches that; only its power cord does."""
+    d = detail or {}
+    return d.get("state") == "alive" and not d.get("listening")
+
+
+def wire_reading(detail: dict[str, Any] | None) -> str:
+    d = detail or {}
+    if not d or not d.get("state"):
+        return "not probed yet"
+    if d.get("state") == "dark":
+        return "dark - nothing answers on any port: power or Wi-Fi"
+    if d.get("listening"):
+        return f"alive at {d.get('host')} - the ESPHome API is listening"
+    return (f"answers the network at {d.get('host')} but nothing is "
+            "listening on it (6053/80/3232 refused): the firmware is not "
+            "running - no Home Assistant restart or button press can reach "
+            "it; it needs its power pulled for ten seconds")
+
+
+async def _route_around_box(why: str = "") -> dict[str, Any]:
+    """#1156: the show must be audible SOMEWHERE. The DJ voice rides
+    'both'; and when the box was the ONLY music road, the records ride
+    'both' too - remembered, so the vigil brings them home the moment
+    the box's API listens again. #855 still stands for blips: this runs
+    only on a confirmed hard-down, never on a flap."""
+    payload: dict[str, Any] = {"system": True}
+    voice_was = str(_RADIO.get("voice_to") or "box")
+    music_was = str(_RADIO.get("music_to") or "here")
+    if voice_was not in ("both", "here"):
+        payload["voice"] = "both"
+    music_moved = music_was == "box"
+    if music_moved:
+        payload["music"] = "both"
+    if len(payload) == 1:
+        return {"moved": False}
+    if not _FAILOVER:
+        _FAILOVER.update({"at": time.time(), "voice_was": voice_was,
+                          "music_was": music_was,
+                          "music_moved": music_moved, "why": why})
+    try:
+        _api_key = os.getenv("SPARK_AGENT_API_KEY", "")
+        async with httpx.AsyncClient(timeout=10) as client:
+            await client.post(
+                "http://127.0.0.1:8096/api/dj/output",
+                headers={"Authorization": f"Bearer {_api_key}"},
+                json=payload)
+    except Exception:  # noqa: BLE001
+        return {"moved": False}
+    try:
+        _SPEAK_LAST.update({"why": "the Nabu's firmware is not running - "
+                                   "the show rides the app until its "
+                                   "power is pulled", "at": time.time()})
+    except Exception:  # noqa: BLE001
+        pass
+    pipeline_log("repair", "routed the show around the box: "
+                 + ", ".join(f"{k} -> {v}" for k, v in payload.items()
+                             if k != "system")
+                 + f" - {why} (#1156)")
+    return {"moved": True, **payload}
+
+
+def _page_operator_power_cycle(speak: bool = False) -> None:
+    """#1156: say it ONCE, everywhere the operator looks - the action
+    log, the bell, and (when asked) the air - and not again for half an
+    hour."""
+    if time.time() - _POWER_PAGED_AT[0] < 1800:
+        return
+    _POWER_PAGED_AT[0] = time.time()
+    note_action("🔌 the Nabu needs a power cycle - every port refuses, "
+                "its firmware is not running; pull its plug for ten "
+                "seconds. The show rides the app until it rejoins")
+    try:
+        NOTIFICATIONS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        lines: list[str] = []
+        if NOTIFICATIONS_PATH.exists():
+            lines = NOTIFICATIONS_PATH.read_text().splitlines()[-399:]
+        lines.append(json.dumps({
+            "ts": int(time.time()), "kind": "repair",
+            "title": "The Nabu needs a power cycle",
+            "subtitle": "Its firmware is not running (every port refuses). "
+                        "Pull its plug for ten seconds; the show rides the "
+                        "app meanwhile and the routing comes home on its own.",
+            "ref": {"guide": "/guide/pinebox"}}))
+        NOTIFICATIONS_PATH.write_text("\n".join(lines) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+    if speak and _RADIO.get("on") and not radio_paused():
+        fire_and_forget(dj_banter(None, lines=2, angle=(
+            "STATION NOTICE, mid-show: the Nabu speaker is on the network "
+            "but its firmware has stopped - nothing the station can press "
+            "reaches it; it needs its power pulled for ten seconds. Tell "
+            "the room plainly, in character, that the show is riding the "
+            "app until somebody does that.")))
 
 
 async def _wire_probe(host: str = "") -> str:
@@ -7194,51 +7839,83 @@ _BOX_VIGIL_ON = [False]
 
 
 async def _box_vigil() -> None:
-    """#814: the tree's last rung — while the device is off the network,
-    watch the wire once a minute; the moment ANYTHING answers, run the
-    recovery and tell the room. The show rides the page/app meanwhile."""
+    """#814: the tree's last rung - while the device is off the network,
+    watch the wire once a minute; the moment the device is BACK, run the
+    recovery and tell the room. The show rides the page/app meanwhile.
+
+    #1156: "back" means the ESPHome API is LISTENING, not merely that the
+    IP stack answers. A refused port used to count as a return, and the
+    vigil handed the show straight back to a box whose firmware was not
+    running."""
     if _BOX_VIGIL_ON[0]:
         return
     _BOX_VIGIL_ON[0] = True
     pipeline_log("repair", "vigil: watching the wire for the Pine Box "
-                 "to rejoin — the show rides the page/app until it "
+                 "to rejoin - the show rides the page/app until it "
                  "does (#814)")
     try:
         while True:
             await asyncio.sleep(60)
-            if await _wire_probe(NABU_PROBE_HOST) == "alive":
-                pipeline_log("repair", "vigil: the Pine Box ANSWERED the "
-                             "wire — running recovery (#814)")
+            _wd = await _wire_probe_detail(NABU_PROBE_HOST)
+            if _wd.get("state") != "alive":
+                continue
+            if not _wd.get("listening"):
+                continue                 # an IP stack is not a speaker
+            pipeline_log("repair", "vigil: the Pine Box's API is LISTENING "
+                         "again - running recovery (#814/#1156)")
+            # Give Home Assistant a minute to pick the entity back up
+            # before the routing goes home, or the first lines land on
+            # the shelf instead of the speaker.
+            for _ in range(12):
+                _SAT_ALIVE["checked"] = 0.0
                 try:
-                    await satellite_selfheal()
+                    if bool((await satellite_status()).get("online")):
+                        break
                 except Exception:  # noqa: BLE001
                     pass
-                # #818: the failover was TEMPORARY — the operator's
-                # remembered routing comes back with the box.
-                ledger = _operator_routing_read()
-                if ledger:
-                    try:
-                        _api_key = os.getenv("SPARK_AGENT_API_KEY", "")
-                        async with httpx.AsyncClient(timeout=10) as client:
-                            await client.post(
-                                "http://127.0.0.1:8096/api/dj/output",
-                                headers={"Authorization":
-                                         f"Bearer {_api_key}"},
-                                json={**{k: v for k, v in ledger.items()
-                                         if k != "music"},
-                                      "system": True})
-                        pipeline_log("repair", "vigil: operator routing "
-                                     f"restored — {ledger} (music left "
-                                     "alone, #855)")
-                    except Exception:  # noqa: BLE001
-                        pass
-                if _RADIO.get("on"):
-                    fire_and_forget(dj_banter(None, lines=3, angle=(
-                        "NEWS FROM THE BACK ROOM, mid-show: the box "
-                        "speaker just rejoined the network after being "
-                        "dark — welcome it back on air, in character, "
-                        "and carry on.")))
-                return
+                await asyncio.sleep(10)
+            try:
+                await satellite_selfheal()
+            except Exception:  # noqa: BLE001
+                pass
+            # #818: the failover was TEMPORARY - the operator's
+            # remembered routing comes back with the box. #1156: and so
+            # do the records, when the failover was what moved them.
+            payload: dict[str, Any] = {}
+            ledger = _operator_routing_read()
+            _fo = dict(_FAILOVER)
+            if ledger:
+                payload.update({k: v for k, v in ledger.items()
+                                if k != "music"})
+            elif _fo.get("voice_was"):
+                payload["voice"] = _fo["voice_was"]
+            if _fo.get("music_moved") and _fo.get("music_was"):
+                payload["music"] = _fo["music_was"]
+            _FAILOVER.clear()
+            if payload:
+                try:
+                    _api_key = os.getenv("SPARK_AGENT_API_KEY", "")
+                    async with httpx.AsyncClient(timeout=10) as client:
+                        await client.post(
+                            "http://127.0.0.1:8096/api/dj/output",
+                            headers={"Authorization":
+                                     f"Bearer {_api_key}"},
+                            json={**payload, "system": True})
+                    pipeline_log("repair", "vigil: routing restored - "
+                                 f"{payload} (#818/#1156)")
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                _SPEAK_LAST.update({"why": "", "at": time.time()})
+            except Exception:  # noqa: BLE001
+                pass
+            if _RADIO.get("on"):
+                fire_and_forget(dj_banter(None, lines=3, angle=(
+                    "NEWS FROM THE BACK ROOM, mid-show: the box "
+                    "speaker just rejoined the network after being "
+                    "dark - welcome it back on air, in character, "
+                    "and carry on.")))
+            return
     finally:
         _BOX_VIGIL_ON[0] = False
 
@@ -7346,8 +8023,29 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
         note("the music library", "mounted and populated")
 
     # 4. the device, on the wire — the truth no entity can fake
-    wire = await _wire_probe(NABU_PROBE_HOST)
-    if wire == "alive" and not link.get("online"):
+    wire_detail = await _wire_probe_detail(NABU_PROBE_HOST)
+    wire = str(wire_detail.get("state") or "dark")
+    firmware_down = nabu_firmware_down(wire_detail) and not link.get("online")
+    if firmware_down:
+        # #1156: the third shape. Alive on the wire, nothing listening:
+        # the firmware is not running, and the ladder below (reload,
+        # Home Assistant restart, the device's own button) cannot reach
+        # a device whose API is not there. Route around it, stand
+        # vigil for the API to LISTEN, and say plainly what it needs.
+        note("the device", "answers the network but nothing is listening "
+             "on it (6053/80/3232 all refused) — the firmware is not "
+             "running. No Home Assistant restart or restart-button press "
+             "can reach it; it needs its power pulled for ten seconds",
+             "routing the show around it + standing vigil + paging the "
+             "operator" if fix else "")
+        if fix:
+            await _route_around_box("the Nabu's firmware is down (#1156)")
+            fire_and_forget(_box_vigil())
+            _page_operator_power_cycle()
+            repair_record("device:firmware_down|device:unreachable",
+                          "route_around_box", True,
+                          "the show rides the app until the API listens")
+    elif wire == "alive" and not link.get("online"):
         note("the device", "alive on the wire but the entity is dead — "
              "a session wedge, not hardware",
              "climbing the link ladder" if fix else "")
@@ -7455,7 +8153,9 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
     verdict = ("the station is ON AIR — " + (
         "everything is healthy" if wire == "alive" and ha_ok
         and link.get("online")
-        else "riding the page/app while the box is dark"
+        else "riding the page/app until the Nabu is power-cycled — its "
+             "firmware is not running"
+        if firmware_down else "riding the page/app while the box is dark"
         if wire == "dark" else "repairs are climbing"))         if _RADIO.get("on") else "the FM switch is off"
     pipeline_log("repair", f"triage verdict: {verdict} (#814)")
 
@@ -7472,7 +8172,7 @@ async def box_triage(fix: bool = True) -> dict[str, Any]:
             "was done — like engineers who also happen to be on air. "
             "Do not invent findings that are not listed.")))
     return {"steps": steps, "verdict": verdict, "wire": wire,
-            "ha": ha_ok, "entity": ent}
+            "firmware_down": firmware_down, "ha": ha_ok, "entity": ent}
 
 
 # #844: what each engine costs to keep resident, in GB. The GB10 has
@@ -7815,6 +8515,24 @@ async def _nabu_link_ladder(reason: str) -> dict[str, Any]:
         repair_note("Nabu is off the network entirely — that is a power "
                     "switch, not a software wedge; not restarting anything")
         return {"ran": True, "rungs": ["device absent — stood down"],
+                "fixed": False}
+    # #1156: alive on the wire is not the same as running. When every
+    # port refuses, the IP stack is up and the firmware is not (the
+    # 2026-09-02 state), and restarting Home Assistant for it burned the
+    # whole day's budget, severed live streams, and fixed nothing.
+    _wd = await _wire_probe_detail(NABU_PROBE_HOST)
+    if nabu_firmware_down(_wd):
+        repair_note("Nabu answers the network but nothing listens on it — "
+                    "the firmware is not running. Home Assistant cannot "
+                    "reach that; it needs a power cycle. Standing down and "
+                    "routing the show around it (#1156)")
+        await _route_around_box("the link ladder found the firmware down "
+                                "(#1156)")
+        fire_and_forget(_box_vigil())
+        _page_operator_power_cycle(speak=True)
+        return {"ran": True, "rungs": rungs + ["firmware not running — "
+                                               "stood down; show routed "
+                                               "around the box"],
                 "fixed": False}
     rungs.append("entity still unavailable · hardware answers the network")
     # Rung 1 — restart Home Assistant, on a persistent budget.
@@ -13055,7 +13773,29 @@ def _protected_media_keys() -> set[str]:
     return keys
 
 
+_PRUNE_AT = [0.0]
+_PRUNE_BUSY = [False]
+
+
 def _media_prune() -> None:
+    """#1156: ask for a prune; a sweeper thread does it, at most every
+    30s. The sort below stat()s every one of ~4,500 clips and ran on the
+    loop after every clip written - the pulse caught it mid-round."""
+    now = time.time()
+    if _PRUNE_BUSY[0] or now - _PRUNE_AT[0] < 30:
+        return
+    _PRUNE_BUSY[0] = True
+    _PRUNE_AT[0] = now
+
+    def run() -> None:
+        try:
+            _media_prune_now()
+        finally:
+            _PRUNE_BUSY[0] = False
+    Thread(target=run, name="media-prune", daemon=True).start()
+
+
+def _media_prune_now() -> None:
     """Keep a rolling ~VOICE_KEEP_BYTES buffer of the newest clips (#473),
     but never delete audio still waiting to play out of the box (#467).
     Bounded by size AND a high file count; cycles oldest-out only past the
@@ -16068,6 +16808,7 @@ _DWELL_CACHE: dict[str, Any] = {"at": 0.0, "subjects": []}
 # The last few normalized lines actually aired, to catch a line that repeats
 # one it just said (#494) before it goes out again.
 _RECENT_SPOKEN: list[str] = []
+_SAID_MEMO: dict[str, Any] = {}
 
 
 def said_rows() -> list[dict[str, Any]]:
@@ -16077,6 +16818,15 @@ def said_rows() -> list[dict[str, Any]]:
     an hour" cannot be answered by a ring of bare strings. Older files hold
     plain strings and are read as timestamp 0 — undated, never inside any
     window, still perfectly good for phrase mining."""
+    # #1156: a 1MB json.loads per call, on the loop, from every writing
+    # road; now re-read only when the file changes.
+    try:
+        _st = SAID_LINES_PATH.stat()
+        _stamp = (_st.st_mtime_ns, _st.st_size)
+    except OSError:
+        return []
+    if _SAID_MEMO.get("stamp") == _stamp:
+        return list(_SAID_MEMO.get("rows") or [])
     try:
         rows = json.loads(SAID_LINES_PATH.read_text())
     except Exception:
@@ -16089,7 +16839,8 @@ def said_rows() -> list[dict[str, Any]]:
             out.append({"t": str(row["t"])[:300], "at": int(row.get("at") or 0)})
         elif isinstance(row, str) and row:
             out.append({"t": row[:300], "at": 0})
-    return out
+    _SAID_MEMO.update({"stamp": _stamp, "rows": out})
+    return list(out)
 
 
 def said_texts(most: int = 400) -> list[str]:
@@ -16237,11 +16988,25 @@ BANNED_WORDS_PATH = data_path("banned_words.json")
 _BANNED_LOCK = RLock()
 
 
+_BANNED_MEMO: dict[str, Any] = {}
+
+
 def banned_words(active: bool = True) -> list[dict[str, Any]]:
+    # #1156: read the file only when it changes (strip_banned runs this
+    # per line written).
     try:
-        rows = json.loads(BANNED_WORDS_PATH.read_text())
-    except Exception:
+        _st = BANNED_WORDS_PATH.stat()
+        _stamp = (_st.st_mtime_ns, _st.st_size)
+    except OSError:
         return []
+    if _BANNED_MEMO.get("stamp") == _stamp:
+        rows = _BANNED_MEMO.get("rows") or []
+    else:
+        try:
+            rows = json.loads(BANNED_WORDS_PATH.read_text())
+        except Exception:
+            return []
+        _BANNED_MEMO.update({"stamp": _stamp, "rows": rows})
     if not isinstance(rows, list):
         return []
     now = time.time()
@@ -19261,7 +20026,16 @@ def dj_state() -> dict[str, Any]:
             # "routed to here" is true and useless when you just chose box.
             "overridden": box_overridden(),
             "healed_at": satellite_healed_at(),
+            # #1156: the wire's own reading, so the app can say WHICH
+            # kind of unavailable.
+            "wire": (wire_reading(_WIRE_LAST) if _WIRE_LAST.get("at")
+                     else ""),
+            "firmware_down": bool(nabu_firmware_down(_WIRE_LAST)
+                                  if _WIRE_LAST.get("at") else False),
         },
+        # #1156: the station's own pulse and the library road.
+        "pulse": str(pulse_report(600).get("reading") or ""),
+        "library": str(_LIBRARY.get("reading") or ""),
         # The desk's pulse (#305): current stage plus the recent trail the
         # panel paints as a spectrograph of DJ activity.
         "activity": _RADIO.get("activity") or {},
@@ -19464,7 +20238,32 @@ def dj_next_track() -> dict[str, Any] | None:
             if take_at < 0:
                 return None
         track = _RADIO["queue"].pop(take_at)
+        # #1156: when the share crawls, a record already on the local
+        # shelf outranks one that is not - unless this one owns banked
+        # talk, which was written for it and would be stranded.
+        try:
+            if (_LIBRARY.get("slow") and not music_hot_file(track)
+                    and str(track.get("id") or "") not in _TRACK_TALK):
+                _alt_at = next(
+                    (at for at, row in enumerate(_RADIO["queue"])
+                     if music_hot_file(row)
+                     and str((row or {}).get("id") or "") not in _TRACK_TALK),
+                    -1)
+                _alt = (_RADIO["queue"].pop(_alt_at) if _alt_at >= 0
+                        else _hot_shelf_pick())
+                if _alt:
+                    _RADIO["queue"].insert(0, track)
+                    pipeline_log(
+                        "air", "the library is crawling "
+                        f"({_LIBRARY.get('reading') or 'slow'}) - "
+                        f"{_alt.get('title') or 'a record'} plays from "
+                        f"the local shelf; {track.get('title') or 'the pick'} "
+                        "goes back to the top (#1156)")
+                    track = _alt
+        except Exception:  # noqa: BLE001
+            pass
     _RADIO["coming"] = track
+    _music_hot_warm(track, "coming")
     if not track.get("tape"):
         _RADIO["since_tape"] = _RADIO.get("since_tape", 0) + 1
     return track
@@ -20990,37 +21789,80 @@ SCHED_POS_PATH = data_path("sched_pos.json")
 _PANTRY_SAVED = [0.0]
 
 
+_PANTRY_DIRTY = [0.0]
+_PANTRY_FLUSHER = [False]
+_PANTRY_FLUSH_LOCK = RLock()
+
+
+def _pantry_rows() -> dict[str, Any]:
+    # #1106: ...AND THE WORDS. This once kept clip/at/used/bytes and
+    # dropped the text, voice, who and kind that pantry_put deliberately
+    # stores - the words are cheap to keep and are the entire content of
+    # the table this exists to serve.
+    return {k: {"clip": v.get("clip"), "at": v.get("at"),
+                "used": v.get("used"), "bytes": v.get("bytes"),
+                "text": str(v.get("text") or "")[:1200],
+                "voice": v.get("voice"), "who": v.get("who"),
+                "kind": v.get("kind")}
+            for k, v in list(_PANTRY.items())}
+
+
+def _pantry_flush_worker() -> None:
+    """#1156: one flusher thread does the serialise and the write."""
+    try:
+        while _PANTRY_DIRTY[0]:
+            _PANTRY_DIRTY[0] = 0.0
+            time.sleep(1.5)                     # gather the burst
+            text_p = text_s = ""
+            for _attempt in range(4):
+                try:
+                    text_p = json.dumps(_pantry_rows(), default=str)
+                    text_s = json.dumps(
+                        {k: list(v) for k, v in list(_SHELF.items())},
+                        default=str)
+                    break
+                except RuntimeError:            # a dict changed mid-dump
+                    time.sleep(0.25)
+            if not text_p:
+                continue
+            try:
+                PANTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = PANTRY_PATH.with_suffix(".tmp")
+                tmp.write_text(text_p)
+                tmp.replace(PANTRY_PATH)
+            except Exception:  # noqa: BLE001
+                pass
+            if text_s:
+                try:
+                    tmp = SHELF_PATH.with_suffix(".tmp")
+                    tmp.write_text(text_s)
+                    tmp.replace(SHELF_PATH)
+                except Exception:  # noqa: BLE001
+                    pass
+    finally:
+        with _PANTRY_FLUSH_LOCK:
+            _PANTRY_FLUSHER[0] = False
+        if _PANTRY_DIRTY[0]:
+            _pantry_save(True)
+
+
 def _pantry_save(force: bool = False) -> None:
-    """Write the shelf down. Throttled — this runs after every take."""
+    """Write the shelf down. Throttled — this runs after every take.
+
+    #1156: a take only ASKS; the flusher thread serialises and writes.
+    This ran on the event loop, and the shelf alone is a 13.5MB
+    json.dumps - the pulse caught it as the single largest blocker of
+    the 2026-09-02 restart storm."""
     if not force and time.time() - _PANTRY_SAVED[0] < 20:
         return
     _PANTRY_SAVED[0] = time.time()
-    try:
-        PANTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = PANTRY_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(
-            # #1106: ...AND THE WORDS. This kept clip/at/used/bytes and
-            # dropped the text, voice, who and kind that pantry_put
-            # deliberately stores - #894's own note says "the words are
-            # cheap to keep and are the entire content of the table this
-            # exists to serve". Measured: 0 of 512 saved rows carried
-            # text or kind, so the pantry table was empty across every
-            # restart and nothing could ever match on the words.
-            {k: {"clip": v.get("clip"), "at": v.get("at"),
-                 "used": v.get("used"), "bytes": v.get("bytes"),
-                 "text": str(v.get("text") or "")[:1200],
-                 "voice": v.get("voice"), "who": v.get("who"),
-                 "kind": v.get("kind")}
-             for k, v in list(_PANTRY.items())}, default=str))
-        tmp.replace(PANTRY_PATH)
-    except Exception:  # noqa: BLE001
-        pass
-    try:
-        tmp = SHELF_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_SHELF, default=str))
-        tmp.replace(SHELF_PATH)
-    except Exception:  # noqa: BLE001
-        pass
+    _PANTRY_DIRTY[0] = time.time()
+    with _PANTRY_FLUSH_LOCK:
+        if _PANTRY_FLUSHER[0]:
+            return
+        _PANTRY_FLUSHER[0] = True
+    Thread(target=_pantry_flush_worker, name="pantry-flush",
+           daemon=True).start()
 
 
 def _pantry_load() -> None:
@@ -21181,12 +22023,49 @@ def _sched_pos_restore() -> None:
         pass                            # no saved hour: start it, as before
 
 
-def _larder_save() -> None:
+_LARDER_DIRTY = [0.0]
+_LARDER_FLUSHER = [False]
+_LARDER_FLUSH_LOCK = RLock()
+
+
+def _larder_flush_worker() -> None:
     try:
-        LARDER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        LARDER_PATH.write_text(json.dumps(_LARDER, default=str))
-    except Exception:
-        pass
+        while _LARDER_DIRTY[0]:
+            _LARDER_DIRTY[0] = 0.0
+            time.sleep(1.0)
+            text = ""
+            for _attempt in range(4):
+                try:
+                    text = json.dumps(list(_LARDER), default=str)
+                    break
+                except RuntimeError:
+                    time.sleep(0.25)
+            if not text:
+                continue
+            try:
+                LARDER_PATH.parent.mkdir(parents=True, exist_ok=True)
+                tmp = LARDER_PATH.with_suffix(".tmp")
+                tmp.write_text(text)
+                tmp.replace(LARDER_PATH)
+            except Exception:  # noqa: BLE001
+                pass
+    finally:
+        with _LARDER_FLUSH_LOCK:
+            _LARDER_FLUSHER[0] = False
+        if _LARDER_DIRTY[0]:
+            _larder_save()
+
+
+def _larder_save() -> None:
+    """#1156: ask; the flusher writes (this was a 1.7MB json.dumps and a
+    write on the loop, from seventeen call sites)."""
+    _LARDER_DIRTY[0] = time.time()
+    with _LARDER_FLUSH_LOCK:
+        if _LARDER_FLUSHER[0]:
+            return
+        _LARDER_FLUSHER[0] = True
+    Thread(target=_larder_flush_worker, name="larder-flush",
+           daemon=True).start()
 
 
 def _unstrand(entry: dict[str, Any]) -> dict[str, Any]:
@@ -34421,6 +35300,30 @@ def track_tags(path: Path) -> dict[str, str]:
     return out
 
 
+_TAGS_MEMO: dict[str, tuple[float, dict[str, str]]] = {}
+
+
+async def _track_tags_cached(path: Path) -> dict[str, str]:
+    """#1156: the tag sheet, off the loop and remembered. The panel asks
+    for it on every record, the file lives on a Wi-Fi CIFS share, and
+    one mutagen open measured 29s ON THE LOOP tonight - the deaf window
+    that had the host watchdog restarting the station."""
+    key = str(path)
+    now = time.time()
+    held = _TAGS_MEMO.get(key)
+    if held and now - held[0] < (1800 if held[1] else 120):
+        return dict(held[1])
+    try:
+        tags = await asyncio.wait_for(asyncio.to_thread(track_tags, path), 12)
+    except Exception:  # noqa: BLE001
+        tags = {}
+    _TAGS_MEMO[key] = (now, dict(tags))
+    if len(_TAGS_MEMO) > 400:
+        for _k in sorted(_TAGS_MEMO, key=lambda k: _TAGS_MEMO[k][0])[:100]:
+            _TAGS_MEMO.pop(_k, None)
+    return tags
+
+
 def library_stats(artist: str, album: str) -> dict[str, Any]:
     """How much of this artist and album the library actually holds."""
     artist_key = (artist or "").strip().lower()
@@ -45835,7 +46738,109 @@ def _load_vectors(rid: str = "") -> dict[str, Any]:
             pass
         data["loaded"] = True
         _VEC_CACHE[key] = data
-        return data
+    # #1156: a cold load is the expensive moment; leave the sidecar behind
+    # so the next process never needs to repeat it for a count.
+    try:
+        if not _vector_meta_path(key).is_file():
+            _vector_meta_write(key, data)
+    except Exception:  # noqa: BLE001
+        pass
+    return data
+
+
+def _vector_meta_path(key: str) -> Path:
+    store = mind_state(key, "vectors")
+    return store.with_name(store.stem + ".meta.json")
+
+
+def _vector_meta_from(held: dict[str, Any]) -> dict[str, Any]:
+    chunks = held.get("chunks") or []
+    per_file: dict[str, int] = {}
+    for c in chunks:
+        f = str((c or {}).get("file") or "?")
+        per_file[f] = per_file.get(f, 0) + 1
+    dim = 0
+    for c in chunks:
+        if (c or {}).get("vec"):
+            dim = len(c["vec"])
+            break
+    return {"model": held.get("model") or EMBED_MODEL,
+            "mtimes": dict(held.get("mtimes") or {}),
+            "chunks": len(chunks), "per_file": per_file, "dim": dim,
+            "at": time.time()}
+
+
+def _vector_meta_write(key: str, held: dict[str, Any]) -> None:
+    """#1156: the sidecar - counts, files and mtimes, a few KB. The
+    `doom` mind's store is 625MB; parsing it for a chunk COUNT froze the
+    loop 11.4s (the pulse caught it at boot under /api/crystals), and the
+    C decoder holds the GIL so a thread does not help. Anything that only
+    needs to know what is IN the store reads this instead."""
+    try:
+        meta = _vector_meta_from(held)
+        path = _vector_meta_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(meta))
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _vector_meta(rid: str = "") -> dict[str, Any] | None:
+    """The sidecar if there is one (None when it has never been written
+    - the next full load or save writes it)."""
+    key = mind_id(rid)
+    try:
+        path = _vector_meta_path(key)
+        if not path.is_file():
+            return None
+        meta = json.loads(path.read_text())
+        return meta if isinstance(meta, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _vector_loaded(rid: str = "") -> dict[str, Any] | None:
+    """The warm store, or None - never a load."""
+    with _VEC_LOCK:
+        held = _VEC_CACHE.get(mind_id(rid))
+        return held if isinstance(held, dict) and held.get("loaded") else None
+
+
+_VEC_WARMING: set[str] = set()
+
+
+def _vector_warm_soon(rid: str = "") -> None:
+    """Load a store on a thread (the GIL still holds the loop for the
+    parse, but off the request path and once) and write its sidecar."""
+    key = mind_id(rid)
+    with _VEC_LOCK:
+        if key in _VEC_WARMING or (_VEC_CACHE.get(key) or {}).get("loaded"):
+            return
+        _VEC_WARMING.add(key)
+
+    def run() -> None:
+        try:
+            _load_vectors(key)
+        finally:
+            with _VEC_LOCK:
+                _VEC_WARMING.discard(key)
+    Thread(target=run, name=f"vec-warm-{key}", daemon=True).start()
+
+
+def _vector_chunks_n(rid: str = "") -> int:
+    """How many chunks a mind holds, WITHOUT parsing its store: the warm
+    cache, else the sidecar (kicking a background warm when there is
+    neither, so the number is right on the next ask)."""
+    held = _vector_loaded(rid)
+    if held is not None:
+        return len(held.get("chunks") or [])
+    meta = _vector_meta(rid)
+    if meta is not None:
+        return int(meta.get("chunks") or 0)
+    _vector_warm_soon(rid)
+    return 0
 
 
 def _save_vectors(rid: str = "") -> None:
@@ -45854,6 +46859,7 @@ def _save_vectors(rid: str = "") -> None:
         tmp.replace(store)
     except Exception:
         pass
+    _vector_meta_write(key, payload)                 # #1156
 
 
 def speakbox_vector_stats(rid: str = "") -> dict[str, Any]:
@@ -45861,11 +46867,24 @@ def speakbox_vector_stats(rid: str = "") -> dict[str, Any]:
     Carries per-file USAGE (`uses`) and RECENCY (`last`) drawn from the said-
     memory, so the sphere can pull recently-used documents toward the core and
     scale them by how hard they are leaned on (#586)."""
-    store = _load_vectors(rid)
-    chunks = store.get("chunks") or []
-    per_file: dict[str, int] = {}
-    for c in chunks:
-        per_file[c.get("file", "?")] = per_file.get(c.get("file", "?"), 0) + 1
+    # #1156: cold store + sidecar = answer from the sidecar; the parse of
+    # a giant store is never the price of a status line.
+    _meta = None if _vector_loaded(rid) is not None else _vector_meta(rid)
+    if _meta is not None:
+        store = {"model": _meta.get("model"), "chunks": []}
+        chunks = []
+        per_file = {str(k): int(v) for k, v in
+                    (_meta.get("per_file") or {}).items()}
+        _dim = int(_meta.get("dim") or 0)
+        _n = int(_meta.get("chunks") or 0)
+    else:
+        store = _load_vectors(rid)
+        chunks = store.get("chunks") or []
+        per_file = {}
+        for c in chunks:
+            per_file[c.get("file", "?")] = per_file.get(c.get("file", "?"), 0) + 1
+        _dim = len(chunks[0]["vec"]) if chunks and chunks[0].get("vec") else 0
+        _n = len(chunks)
     # Aggregate the said-memory to a per-document use count + last-used stamp.
     uses: dict[str, int] = {}
     last: dict[str, int] = {}
@@ -45878,8 +46897,8 @@ def speakbox_vector_stats(rid: str = "") -> dict[str, Any]:
     return {
         "model": store.get("model") or EMBED_MODEL,
         "documents": len(per_file),
-        "chunks": len(chunks),
-        "dim": len(chunks[0]["vec"]) if chunks and chunks[0].get("vec") else 0,
+        "chunks": _n,
+        "dim": _dim,
         "now": int(time.time()),
         "files": sorted(({"file": f, "chunks": n,
                           "uses": uses.get(f, 0), "last": last.get(f, 0)}
@@ -46145,8 +47164,28 @@ async def speakbox_reindex(force: bool = False,
     a file dropped in the speakbox folder is in the DJs' heads on the next pass
     with nobody clicking anything. Per mind (#627)."""
     key = mind_id(rid)
-    store = _load_vectors(key)
-    present = {p.name: p for p in speakbox_all(key)}
+    # #1156: the cold load is a json.loads of a vector store that can run
+    # to hundreds of MB (625MB for one mind), and the C decoder holds the
+    # GIL for all of it - so the clock, which walks every mind at boot,
+    # asks the SIDECAR first: same files, same mtimes, nothing to do, no
+    # parse. The store is only loaded when a document changed or when
+    # somebody actually searches the mind.
+    present = await asyncio.to_thread(
+        lambda: {p.name: p for p in speakbox_all(key)})
+    if not force and _vector_loaded(key) is None:
+        meta = _vector_meta(key)
+        if meta is not None:
+            _mt = {str(k): int(v) for k, v in
+                   (meta.get("mtimes") or {}).items()}
+            _now = {}
+            for name, path in present.items():
+                try:
+                    _now[name] = int(path.stat().st_mtime)
+                except OSError:
+                    continue
+            if _now == _mt:
+                return speakbox_vector_stats(key)     # in step, unparsed
+    store = await asyncio.to_thread(_load_vectors, key)
     mtimes = dict(store.get("mtimes") or {})
     chunks = [c for c in (store.get("chunks") or [])
               if c.get("file") in present]          # forget deleted files
@@ -62386,6 +63425,30 @@ async def pinebox_diagnose() -> dict[str, Any]:
     except Exception as exc:  # noqa: BLE001
         add("Services the station leans on", None, str(exc)[:120])
 
+    # #1156: the station's own pulse and the library road, before the
+    # device — a loop that stalls or a share that crawls silences the
+    # show on every speaker at once.
+    try:
+        _pr = pulse_report(600)
+        add("The station's own pulse", bool(_pr.get("ok")),
+            str(_pr.get("reading") or ""))
+    except Exception as exc:  # noqa: BLE001
+        add("The station's own pulse", None, str(exc)[:120])
+    try:
+        _ls = library_reading()
+        _coming_id = str((_RADIO.get("coming") or {}).get("id") or "")
+        _covered = bool(music_hot_file(_RADIO.get("coming") or {})
+                        or (_coming_id and _coming_id in _HOT_JOBS)
+                        or not _RADIO.get("on"))
+        add("The music library",
+            (None if _ls.get("measuring") and not _ls.get("at") else
+             True if not _ls.get("slow") else None if _covered else False),
+            str(_ls.get("reading") or "")
+            + (" — the up-next record is already on the local shelf"
+               if _ls.get("slow") and _covered else ""))
+    except Exception as exc:  # noqa: BLE001
+        add("The music library", None, str(exc)[:120])
+
     token, player = _ha_creds()
     add("Home Assistant token", bool(token),
         "configured" if token else "missing — set it in the Speak panel")
@@ -62410,6 +63473,24 @@ async def pinebox_diagnose() -> dict[str, Any]:
         }
         add("Selected speaker transport", reachable,
             "Home Assistant manages this ESPHome satellite")
+        if not reachable:
+            # #1156: WHICH kind of unavailable - the wire, with ports.
+            # Never a wait here: the status endpoint polls this.
+            _wd = dict(_WIRE_LAST)
+            if time.time() - float(_wd.get("at") or 0) > 120:
+                fire_and_forget(_wire_probe_detail(NABU_PROBE_HOST))
+                if not _wd.get("at"):
+                    _wd = {}
+            _fw = nabu_firmware_down(_wd)
+            add("The device on the wire",
+                (False if _fw else None if _wd.get("state") != "alive"
+                 else True),
+                wire_reading(_wd) if _wd else "probing the wire now")
+            probe = {"state": ("refused" if _fw else "timeout"
+                               if _wd.get("state") == "dark" else "ok"
+                               if _wd.get("listening") else "unset"),
+                     "detail": (wire_reading(_wd) if _wd else
+                                "selected satellite is unavailable")}
     else:
         probe = await satellite_probe()
         reachable = probe["state"] == "ok"
@@ -62604,6 +63685,18 @@ async def pinebox_diagnose() -> dict[str, Any]:
                  "Check the serial console — see section 5 of the guide.",
                  "Re-flash the firmware if it persists."]
 
+    if ha_satellite and not link["online"] and probe.get("state") == "refused":
+        steps = [
+            "Pull the Nabu's power for ten seconds and plug it back in — "
+            "it rejoins in about a minute and the station brings the "
+            "routing home by itself.",
+            "Until then the show rides the app/page: the station routes "
+            "the DJs and the records 'both' on its own while the box is "
+            "down (#1156).",
+            "lilspark reaches both the Nabu and the music share over its "
+            "Wi-Fi hop (its Ethernet port enP7s7 is unplugged); that hop's "
+            "retries are what make both flap.",
+        ]
     return {
         "online": link["online"],
         # #757: "online" is one entity's state string and was being read as
@@ -68462,11 +69555,15 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         dj = dj_settings()
         # #1083: two passages normally, up to four when there is room -
         # the rewrite is shown more of the writer it is imitating.
-        chunks = crystal_stanzas(2 + int(round(surplus() * 2)),
-                                 CRYSTAL_STANZA_LINES)
+        # #1156: the stanza index walks 36k chunks in Python and cold-loads
+        # the store; off the loop (the pulse caught 6.8s of it at boot).
+        chunks = await asyncio.to_thread(
+            crystal_stanzas, 2 + int(round(surplus() * 2)),
+            CRYSTAL_STANZA_LINES)
         if not chunks:
-            chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
-                                      int(dj.get("crystal_tint_chars") or 900))
+            chunks = await asyncio.to_thread(
+                crystal_material, int(dj.get("crystal_tint_chunks") or 5),
+                int(dj.get("crystal_tint_chars") or 900))
         if not chunks:
             return _tint_quiet(why, "the crystal has no passage long "
                                     "enough to work from", said)
@@ -68585,8 +69682,9 @@ async def crystal_tint(script: str, kind: str = "",
         # the rewrite is shown more of the writer it is imitating.
         chunks = list(resume.get("chunks") or [])
         if not chunks:
-            chunks = crystal_stanzas(2 + int(round(surplus() * 2)),
-                                     CRYSTAL_STANZA_LINES)
+            chunks = await asyncio.to_thread(          # #1156: off the loop
+                crystal_stanzas, 2 + int(round(surplus() * 2)),
+                CRYSTAL_STANZA_LINES)
         if not chunks:
             # No file in the crystal is long enough to cut a stanza out
             # of; fall back to the old scatter rather than tinting with
@@ -69043,7 +70141,7 @@ async def tint_crystals_list(
     for cid, c in crystals_read().items():
         counts = {}
         for rid in c.get("minds") or []:
-            counts[rid] = len(_load_vectors(mind_id(rid)).get("chunks") or [])
+            counts[rid] = _vector_chunks_n(rid)          # #1156: no parse
         out.append({**c, "id": cid, "chunks": counts})
     return {"crystals": out, "extractions": jobs}
 
@@ -73940,6 +75038,17 @@ async def pinebox_wire_api(
     out["ha_host"] = SATELLITE_HOST
     ports: list[dict[str, Any]] = []
     target = out.get("alive") or ""
+    # #1156: a LISTENING API outranks the first address that merely
+    # answers. The box rebooted onto .161 tonight while a stranger kept
+    # refusing ports at .205, and this read the stranger as "firmware
+    # not running" over a box that was healthy.
+    try:
+        _detail = await _wire_probe_detail()
+        if _detail.get("listening") and _detail.get("host"):
+            target = str(_detail.get("host"))
+            out["alive"] = target
+    except Exception:  # noqa: BLE001
+        pass
     if target:
         def scan() -> list[dict[str, Any]]:
             import socket as _socket
@@ -73970,6 +75079,47 @@ async def pinebox_wire_api(
              "is not running, so Home Assistant has nothing to connect to "
              "and only a power cycle of the device will fix it")
     return out
+
+
+@app.get("/api/pulse")
+async def pulse_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1156: what the event loop has been stuck in."""
+    require_read_auth(authorization)
+    return pulse_report(600)
+
+
+@app.get("/api/library")
+async def library_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1156: the share's speed and the local shelf."""
+    require_read_auth(authorization)
+    speed = await library_speed()
+    hot: list[dict[str, Any]] = []
+    try:
+        for p in sorted(MUSIC_HOT_DIR.iterdir(),
+                        key=lambda p: p.stat().st_mtime, reverse=True):
+            if p.is_file() and p.suffix != ".part":
+                t = music_track(p.stem) or {}
+                hot.append({"id": p.stem, "title": t.get("title"),
+                            "artist": t.get("artist"),
+                            "mb": round(p.stat().st_size / 1048576, 1)})
+    except Exception:  # noqa: BLE001
+        pass
+    return {"speed": speed, "hot": hot, "warming": sorted(_HOT_JOBS),
+            "coming_hot": bool(music_hot_file(_RADIO.get("coming") or {})),
+            "now_hot": bool(music_hot_file(_RADIO.get("now") or {}))}
+
+
+@app.post("/api/library/warm")
+async def library_warm_api(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    n = _records_warm_now("the operator")
+    return {"started": n, "warming": sorted(_HOT_JOBS)}
 
 
 @app.get("/api/pinebox/diagnose")
@@ -79707,7 +80857,7 @@ async def dj_graph_api(
                 or {"pulls": 0, "last": 0, "file": ""})},
         ],
         "vectors": {
-            "chunks": len((_load_vectors().get("chunks") or [])),
+            "chunks": _vector_chunks_n(),                # #1156: no parse
             "model": EMBED_MODEL,
             "recent": (_RADIO.get("vector_access") or [])[:8],
         },
@@ -79827,7 +80977,7 @@ async def speakbox_minds_api(
         out.append({
             **{k: v for k, v in row.items() if k != "weights"},
             "docs": len(docs),
-            "chunks": len((_load_vectors(row["id"]).get("chunks") or [])),
+            "chunks": _vector_chunks_n(row["id"]),      # #1156: no parse
             "lines_used": len(heard),
             "active": row["id"] == active,
         })
@@ -82871,8 +84021,11 @@ async def music_track_api(
         "url": f"/music/{track_id}?t={media_sign(track_id)}",
         "art": f"/music/{track_id}/art?t={media_sign(track_id)}",
         "vote": (votes.get(track_id) or {}).get("vote", 0),
-        "tags": track_tags(Path(track["path"])),
-        "stats": library_stats(track["artist"], track["album"]),
+        "tags": await _track_tags_cached(
+            (await asyncio.to_thread(music_hot_file, track))
+            or Path(track["path"])),
+        "stats": await asyncio.to_thread(
+            library_stats, track["artist"], track["album"]),
     }
 
 
@@ -82935,6 +84088,12 @@ async def music_file(
         return Response(status_code=404)
     path = Path(track["path"])
     media_type = MUSIC_TYPES.get(track["ext"], "application/octet-stream")
+    # #1156: the local shelf first. The library is a CIFS share over the
+    # host's Wi-Fi hop and measured 38s for 2MB tonight; a record copied
+    # onto local disk ahead of the needle plays from here instead.
+    _hot = await asyncio.to_thread(music_hot_file, track)
+    if _hot is not None:
+        path = _hot
 
     # #1149: the listener's bitrate, for the RECORD. Same contract as
     # /media: a hit serves the cached mp3; a miss serves the original
@@ -83892,6 +85051,44 @@ async def services_census() -> dict[str, Any]:
                       "XTTS carry the show without it"]}
     except Exception:  # noqa: BLE001
         pass
+    # #1156: the station's own pulse and the library road, in the same
+    # census the steward and the chat read.
+    try:
+        _pr = pulse_report(600)
+        services["station-pulse"] = {
+            "ok": bool(_pr.get("ok")),
+            "detail": str(_pr.get("reading") or "")[:160],
+            "url": "/api/pulse",
+            "facts": ([f"{t['frame']}: {t['n']}x, worst "
+                       f"{float(t['worst']):.1f}s"
+                       for t in (_pr.get("top") or [])[:3]]
+                      or ["no stalls over the beat in the last 10 min"])}
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _ls = library_reading()
+        _hot_n = 0
+        try:
+            _hot_n = len([p for p in MUSIC_HOT_DIR.iterdir()
+                          if p.is_file() and p.suffix != ".part"])
+        except Exception:  # noqa: BLE001
+            _hot_n = 0
+        _coming_id = str((_RADIO.get("coming") or {}).get("id") or "")
+        _covered = bool(music_hot_file(_RADIO.get("coming") or {})
+                        or (_coming_id and _coming_id in _HOT_JOBS))
+        services["music-library"] = {
+            "ok": bool(not _ls.get("slow") or _covered or not _ls.get("at")
+                       or not _RADIO.get("on")),
+            "detail": str(_ls.get("reading") or "")[:160]
+            + (f" (measured {int(_ls.get('age_s') or 0)}s ago)"
+               if _ls.get("at") else ""),
+            "url": "/api/library",
+            "facts": [f"{_hot_n} record(s) on the local shelf"
+                      + ("; the up-next is one of them" if _covered
+                         else ""),
+                      "the share rides lilspark's Wi-Fi hop to exbox"]}
+    except Exception:  # noqa: BLE001
+        pass
     try:
         _tags = ((results.get("ollama").json() or {})
                  if results.get("ollama") else {})
@@ -84265,6 +85462,7 @@ SERVICE_LABELS = {
     "bgutil-pot": "bgutil (yt tokens)", "spark-agent": "the Pine Box agent",
     "voice chain": "the voice chain", "pine box fm": "Pine Box FM",
     "vector guides": "the vector guides",
+    "station-pulse": "the station's pulse", "music-library": "the music library",
 }
 
 
@@ -84390,6 +85588,21 @@ async def steward_restart_one(name: str) -> tuple[bool, str]:
             return (False, f"{label} has no wired wrench yet - it is "
                            "optional and the voice ladder covers it; it "
                            "needs a hand on the host to relaunch")
+        if name == "station-pulse":
+            _pr = pulse_report(600)
+            _named = "; ".join(
+                f"{t['frame']} ({t['n']}x, worst {float(t['worst']):.1f}s)"
+                for t in (_pr.get("top") or [])[:3])
+            return (False, f"{label}: the blockers are named - "
+                           f"{_named or 'none in the last ten minutes'}. "
+                           "That is a code fix, not a restart; the host "
+                           "watchdog restarts the station on its own when "
+                           "it goes deaf")
+        if name == "music-library":
+            _n = _records_warm_now("the steward")
+            return (True, f"{label}: copying the up-next records onto "
+                          f"local disk ({_n} started) - the show plays "
+                          "from the local shelf while the share crawls")
         container = SERVICE_CONTAINERS.get(name)
         if container:
             async with httpx.AsyncClient(timeout=90) as client:
