@@ -8,6 +8,7 @@ import io
 import json
 import os
 import random
+import shutil
 import re
 import time
 import traceback
@@ -19945,6 +19946,8 @@ def dj_state() -> dict[str, Any]:
         "steward": {"running": bool(_STEWARD.get("running")),
                     "started": float(_STEWARD.get("started") or 0),
                     "verdict": str(_STEWARD.get("verdict") or "")},
+        # #1019: and the Gazette's - memory only, never a disk read.
+        "paper": paper_pulse(),
         "station_name": dj_settings()["station_name"],
         # Who is in the studio (#668): the booth glass shows the room and
         # lights whoever currently has the mic. The names were only ever
@@ -37848,7 +37851,9 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
            if played else "")
         + (f"\n\nWhat went out on air: {'; '.join(beats)}." if beats else "")
         + (f"\n\nCalls taken tonight: {int(stats.get('calls') or 0)}."
-           if stats.get("calls") else ""))
+           if stats.get("calls") else "")
+        # #1019: the Gazette's front page on this hour, if it has printed.
+        + paper_recap_clause())
     return await dj_banter(track, angle=angle, lines=6,
                            render_stream=bool(
                                dj_settings().get("stream_show", True)))
@@ -64674,6 +64679,12 @@ async def generate_answer(
     # the routing selectors, spoken. A command, so it outranks status.
     broadcast_cmd = (None if (memory_command or service_command_name)
                      else parse_broadcast_command(user_text))
+    # #1019: "print the paper" / "read me the front page" - the Gazette,
+    # by name. A command, so it outranks the tune, video and image roads
+    # below ("make a newspaper" is not a render request).
+    paper_cmd = ("" if (memory_command or service_command_name
+                        or broadcast_cmd)
+                 else parse_paper_command(user_text))
     services_query = (
         not memory_command
         and not system_used
@@ -64926,6 +64937,26 @@ async def generate_answer(
             {"role": "system", "content": format_system_context(
                 await asyncio.to_thread(system_stats))}
         )
+    elif paper_cmd == "print":
+        # #1019: press an extra, say so, done. The press runs in the
+        # background; the 📰 on the panel lights while it is on.
+        feature_meta["paper_command"] = True
+        _already = bool(_PAPER.get("running"))
+        if not _already:
+            fire_and_forget(paper_print(reason="the operator asked",
+                                        kind="extra"))
+        return (("The press is already running - give it a minute, then "
+                 "ask me to read the front page." if _already else
+                 "Printing an extra edition of the Gazette now, on the last "
+                 "hour of the show. Give the desks a minute or two, then open "
+                 "the paper on the panel or ask me to read the front page."),
+                {**feature_meta, "model": "gazette"})
+    elif paper_cmd == "read":
+        feature_meta["paper_command"] = True
+        _front = paper_front_words()
+        return ((_front or "There is no edition on the shelf yet. Say print "
+                 "the paper and I will press one."),
+                {**feature_meta, "model": "gazette"})
     elif tune_requested:
         feature_meta["tune_requested"] = True
         messages.append(
@@ -86176,6 +86207,1963 @@ async def api_generate(
     return {"prompt_id": prompt_id, "model": model_name, "tags": prompt[:2000]}
 
 
+# --- #1019: THE PINE BOX GAZETTE -------------------------------------------
+#
+# "Next to the Pine Box voice cloud, I want an icon that shows a live
+#  newspaper feed that is being generated for every segment every hour on
+#  the hour that I am able to scroll through and store."
+#
+# The hermes-paper-agent contract (github.com/vaelkeep/hermes-paper-agent),
+# brought in-process. An EDITION is a folder of markdown stories with YAML
+# frontmatter, written by DESKS in order: data desks by code and never a
+# model (the records board, the adverts, the weather, the engineering
+# room), prose desks by the station's own writer (the phones, the wire,
+# the gallery, upstairs, what the pair talked about), and the LEAD DESK
+# last, which sees every other story and writes the front page - the hour
+# that just went out, in the order it happened. Then the edition is
+# CHECKED against the upstream vael-paper-check codes (yaml_parse,
+# no_headline, unknown_section, bad_chart, unsafe_source, table_wide,
+# cell_long, story_short/long, headline_long, deck_long, no_lead), FIXED
+# by code, and only then printed. The paper refuses to publish on red.
+#
+# The material is the station's own hour - one story per kind of segment
+# that actually aired - so the paper is the FM's record of itself, and the
+# recap on the hour reads its front page back. Editions live under
+# data/paper/editions/<id>/ (articles/NN-slug.md, edition.json,
+# edition.html); the hourly one is stamped by the hour it covers and an
+# extra pressed on demand carries the minute. Upstream the Vael Paper
+# engine typesets the folder; here paper_render_html does, as a broadsheet
+# the 📰 window on the panel scrolls through.
+
+PAPER_DIR = data_path("paper")
+PAPER_EDITIONS_DIR = PAPER_DIR / "editions"
+PAPER_MASTHEAD_PATH = PAPER_DIR / "paper.json"
+PAPER_KEEP = int(os.getenv("PAPER_KEEP", "336"))        # two weeks of hours
+PAPER_MODEL = os.getenv("PAPER_MODEL", "")               # "" = the station's
+PAPER_SECTIONS: list[dict[str, str]] = [
+    {"id": "front", "name": "Front Page"},
+    {"id": "air", "name": "On Air"},
+    {"id": "records", "name": "The Records"},
+    {"id": "phones", "name": "The Phones"},
+    {"id": "wire", "name": "The Wire"},
+    {"id": "gallery", "name": "The Gallery"},
+    {"id": "studio", "name": "In the Studio"},
+    {"id": "upstairs", "name": "From Upstairs"},
+    {"id": "adverts", "name": "The Adverts"},
+    {"id": "weather", "name": "Weather"},
+    {"id": "engineering", "name": "Engineering"},
+]
+PAPER_SECTION_IDS = tuple(s["id"] for s in PAPER_SECTIONS)
+# The upstream contract's numbers: headline and deck caps, the story band,
+# the table shape.
+PAPER_HEADLINE_MAX = 90
+PAPER_DECK_MAX = 160
+PAPER_STORY_MIN_WORDS = 60
+PAPER_STORY_MAX_WORDS = 900
+PAPER_TABLE_COLS = 4
+PAPER_CELL_MAX = 26
+PAPER_MARKS = ("yaml_parse", "no_headline", "unknown_section", "bad_chart",
+               "no_lead", "missing_image", "bad_image")
+
+_PAPER: dict[str, Any] = {"running": False, "started": 0.0, "reason": "",
+                          "steps": [], "latest": "", "verdict": "",
+                          "geo": None}
+_PAPER_LOCK = RLock()
+
+
+def _paper_say(line: str) -> None:
+    """The desk console the panel tails, and the 🔬 window's copy."""
+    with _PAPER_LOCK:
+        _PAPER["steps"].append({"at": time.time(), "line": str(line)[:300]})
+        del _PAPER["steps"][:-120]
+    pipeline_log("model", f"gazette: {line}"[:220])
+
+
+def paper_masthead() -> dict[str, Any]:
+    """editions/paper.json upstream: the paper's identity and the section
+    order. The owner's file wins when one exists; the station's name is
+    the default masthead."""
+    station = str(dj_settings().get("station_name") or PINE_BOX_FM).strip()
+    # "The Big Apple's Little Pine Box FM Station" already carries its
+    # article; do not print "The The".
+    base = {
+        "masthead": (station if station.lower().startswith("the ")
+                     else "The " + station) + " Gazette",
+        "motto": "Printed on the hour, for whoever is listening",
+        "founded": "2026-09-04",
+        "sections": list(PAPER_SECTIONS),
+    }
+    try:
+        if PAPER_MASTHEAD_PATH.exists():
+            got = json.loads(PAPER_MASTHEAD_PATH.read_text())
+            if isinstance(got, dict):
+                for k in ("masthead", "motto", "founded"):
+                    if got.get(k):
+                        base[k] = str(got[k])
+    except Exception:  # noqa: BLE001
+        pass
+    return base
+
+
+def _paper_masthead_seed() -> None:
+    """Write the owner's paper.json once, so it exists to be edited."""
+    try:
+        if not PAPER_MASTHEAD_PATH.exists():
+            PAPER_DIR.mkdir(parents=True, exist_ok=True)
+            PAPER_MASTHEAD_PATH.write_text(json.dumps(
+                paper_masthead(), indent=2) + "\n")
+    except OSError:
+        pass
+
+
+# --- frontmatter: the writer's half and the reader's half -----------------
+
+def _fm_scalar(value: Any) -> str:
+    s = str(value if value is not None else "")
+    if s == "":
+        return '""'
+    needs = (": " in s or s[0] in "[{\"'#&*!|>%@`-" or s.endswith(":")
+             or "#" in s or "\n" in s)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return s
+    if needs:
+        return '"' + s.replace("\\", "\\\\").replace('"', '\\"').replace(
+            "\n", " ") + '"'
+    return s
+
+
+def _fm_dump(meta: dict[str, Any]) -> str:
+    lines: list[str] = ["---"]
+    for key, value in meta.items():
+        if value is None or value == "" or value == [] or value == {}:
+            continue
+        if isinstance(value, dict):
+            lines.append(f"{key}:")
+            for k2, v2 in value.items():
+                if isinstance(v2, list):
+                    lines.append(f"  {k2}: [" + ", ".join(
+                        _fm_scalar(x) for x in v2) + "]")
+                else:
+                    lines.append(f"  {k2}: {_fm_scalar(v2)}")
+        elif isinstance(value, list):
+            if value and isinstance(value[0], dict):
+                lines.append(f"{key}:")
+                for row in value:
+                    first = True
+                    for k2, v2 in row.items():
+                        lines.append(("  - " if first else "    ")
+                                     + f"{k2}: {_fm_scalar(v2)}")
+                        first = False
+            else:
+                lines.append(f"{key}: [" + ", ".join(
+                    _fm_scalar(x) for x in value) + "]")
+        else:
+            lines.append(f"{key}: {_fm_scalar(value)}")
+    lines.append("---")
+    return "\n".join(lines) + "\n"
+
+
+def _fm_unquote(raw: str) -> Any:
+    s = raw.strip()
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
+        inner = s[1:-1]
+        if s[0] == '"':
+            inner = inner.replace('\\"', '"').replace("\\\\", "\\")
+        return inner
+    if s.startswith("[") and s.endswith("]"):
+        inner = s[1:-1].strip()
+        if not inner:
+            return []
+        return [_fm_unquote(x) for x in re.split(r",\s*", inner)]
+    if s.lower() in ("true", "yes"):
+        return True
+    if s.lower() in ("false", "no"):
+        return False
+    if re.fullmatch(r"-?\d+", s):
+        return int(s)
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        return float(s)
+    return s
+
+
+def _fm_load(text: str) -> tuple[dict[str, Any], str, str]:
+    """(meta, body, error). The error string is the yaml_parse mark."""
+    text = str(text or "")
+    if not text.startswith("---"):
+        return {}, text, ""
+    end = text.find("\n---", 3)
+    if end < 0:
+        return {}, text, "frontmatter never closes"
+    head = text[3:end].strip("\n")
+    body = text[end + 4:]
+    if body.startswith("\n"):
+        body = body[1:]
+    meta: dict[str, Any] = {}
+    current_key = ""
+    current_list_row: dict[str, Any] | None = None
+    for n, line in enumerate(head.split("\n"), start=2):
+        if not line.strip() or line.strip().startswith("#"):
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        try:
+            if indent == 0:
+                current_list_row = None
+                if ":" not in stripped:
+                    return meta, body, f"line {n}: no colon"
+                key, _, rest = stripped.partition(":")
+                key = key.strip()
+                if not re.fullmatch(r"[A-Za-z_][\w-]*", key):
+                    return meta, body, f"line {n}: bad key {key!r}"
+                current_key = key
+                if rest.strip() == "":
+                    meta[key] = {}
+                else:
+                    meta[key] = _fm_unquote(rest)
+            else:
+                if not current_key:
+                    return meta, body, f"line {n}: indented before a key"
+                holder = meta.get(current_key)
+                if stripped.startswith("- "):
+                    if not isinstance(holder, list):
+                        holder = meta[current_key] = []
+                    item = stripped[2:].strip()
+                    if ":" in item and not item.startswith(("\"", "'", "[")):
+                        k2, _, v2 = item.partition(":")
+                        current_list_row = {k2.strip(): _fm_unquote(v2)}
+                        holder.append(current_list_row)
+                    else:
+                        current_list_row = None
+                        holder.append(_fm_unquote(item))
+                elif current_list_row is not None and indent >= 4:
+                    k2, _, v2 = stripped.partition(":")
+                    current_list_row[k2.strip()] = _fm_unquote(v2)
+                else:
+                    if not isinstance(holder, dict):
+                        holder = meta[current_key] = {}
+                    k2, _, v2 = stripped.partition(":")
+                    holder[k2.strip()] = _fm_unquote(v2)
+        except Exception as exc:  # noqa: BLE001
+            return meta, body, f"line {n}: {exc}"
+    return meta, body, ""
+
+
+# --- markdown, the small subset the desks write ---------------------------
+
+def _paper_esc(s: Any) -> str:
+    return (str(s if s is not None else "").replace("&", "&amp;")
+            .replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _md_inline(s: str) -> str:
+    out = _paper_esc(s)
+    out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
+    out = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", out)
+    out = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        lambda m: f'<a href="{m.group(2)}" target="_blank" rel="noopener">'
+                  f"{m.group(1)}</a>", out)
+    return out
+
+
+def _md_html(body: str) -> str:
+    """Paragraphs, ### heads, | tables |, - lists, > pull quotes. Nothing
+    else - the desks are told what they may write."""
+    html: list[str] = []
+    para: list[str] = []
+    table: list[str] = []
+    bullets: list[str] = []
+    quote: list[str] = []
+
+    def flush() -> None:
+        nonlocal para, table, bullets, quote
+        if para:
+            html.append("<p>" + _md_inline(" ".join(para)) + "</p>")
+            para = []
+        if table:
+            rows = [r for r in table if not re.fullmatch(r"\|?[\s:|-]+\|?", r)]
+            cells = [[c.strip() for c in r.strip().strip("|").split("|")]
+                     for r in rows]
+            if cells:
+                head = "".join(f"<th>{_md_inline(c)}</th>" for c in cells[0])
+                tail = "".join(
+                    "<tr>" + "".join(
+                        f"<td>{_md_inline(c)}</td>" for c in r) + "</tr>"
+                    for r in cells[1:])
+                html.append(f"<table class=\"agate\"><thead><tr>{head}</tr>"
+                            f"</thead><tbody>{tail}</tbody></table>")
+            table = []
+        if bullets:
+            html.append("<ul>" + "".join(
+                f"<li>{_md_inline(b)}</li>" for b in bullets) + "</ul>")
+            bullets = []
+        if quote:
+            html.append("<blockquote class=\"pull\">"
+                        + _md_inline(" ".join(quote)) + "</blockquote>")
+            quote = []
+
+    for raw in str(body or "").split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            flush()
+            continue
+        if line.startswith("|"):
+            if para or bullets or quote:
+                flush()
+            table.append(line)
+            continue
+        if table:
+            flush()
+        m = re.match(r"^(#{1,3})\s+(.*)$", line)
+        if m:
+            flush()
+            level = min(4, len(m.group(1)) + 1)
+            html.append(f"<h{level}>{_md_inline(m.group(2))}</h{level}>")
+            continue
+        if line.lstrip().startswith(("- ", "* ")):
+            if para or quote:
+                flush()
+            bullets.append(line.lstrip()[2:])
+            continue
+        if line.startswith(">"):
+            if para or bullets:
+                flush()
+            quote.append(line.lstrip("> "))
+            continue
+        if bullets or quote:
+            flush()
+        para.append(line.strip())
+    flush()
+    return "\n".join(html)
+
+
+# --- the check: upstream's codes, in-process ------------------------------
+
+def _paper_words(body: str) -> int:
+    prose = "\n".join(l for l in str(body or "").split("\n")
+                      if not l.startswith(("|", "#")))
+    return len(re.findall(r"[A-Za-z0-9'’]+", prose))
+
+
+def paper_check(articles: list[dict[str, Any]]) -> dict[str, Any]:
+    """vael-paper-check, the report shape: marks stop the press, lint
+    prints but flags. Each finding names the file and the code."""
+    marks: list[dict[str, str]] = []
+    lint: list[dict[str, str]] = []
+    leads = 0
+    for art in articles:
+        f = str(art.get("file") or "")
+        meta = art.get("meta") or {}
+        body = str(art.get("body") or "")
+        if art.get("error"):
+            marks.append({"file": f, "code": "yaml_parse",
+                          "detail": str(art["error"])})
+            continue
+        headline = str(meta.get("headline") or meta.get("title") or "")
+        if not headline and not re.match(r"^#\s+\S", body):
+            marks.append({"file": f, "code": "no_headline", "detail": ""})
+        if str(meta.get("section") or "front") not in PAPER_SECTION_IDS:
+            marks.append({"file": f, "code": "unknown_section",
+                          "detail": str(meta.get("section"))})
+        chart = meta.get("chart")
+        if chart is not None:
+            ok = isinstance(chart, dict)
+            if ok:
+                vals = chart.get("values")
+                kind = str(chart.get("kind") or "")
+                labels = chart.get("labels") or []
+                try:
+                    nums = [float(v) for v in (vals or [])]
+                except (TypeError, ValueError):
+                    nums = []
+                ok = (kind in ("line", "bars") and len(nums) >= 2
+                      and (not labels or len(labels) == len(nums))
+                      and all(len(str(x)) <= 12 for x in labels)
+                      and ("min" not in chart or "max" not in chart
+                           or float(chart["min"]) < float(chart["max"])))
+            if not ok:
+                marks.append({"file": f, "code": "bad_chart", "detail": ""})
+        for src in (meta.get("sources") or []):
+            url = str((src or {}).get("url") or "") if isinstance(src, dict) \
+                else ""
+            if url and not url.startswith(("http://", "https://")):
+                lint.append({"file": f, "code": "unsafe_source",
+                             "detail": url[:80]})
+        image = str(meta.get("image") or meta.get("photo") or "")
+        if image and not re.match(r"^https?://|^/api/", image):
+            marks.append({"file": f, "code": "missing_image", "detail": image})
+        if int(meta.get("priority") or 0) == 1:
+            leads += 1
+        for line in body.split("\n"):
+            if line.startswith("|") and not re.fullmatch(r"\|?[\s:|-]+\|?",
+                                                          line):
+                cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                if len(cells) > PAPER_TABLE_COLS:
+                    lint.append({"file": f, "code": "table_wide",
+                                 "detail": f"{len(cells)} columns"})
+                for c in cells:
+                    if len(c) > PAPER_CELL_MAX:
+                        lint.append({"file": f, "code": "cell_long",
+                                     "detail": c[:40]})
+                    elif c.endswith("…"):
+                        lint.append({"file": f, "code": "cell_truncated",
+                                     "detail": c[:40]})
+        words = _paper_words(body)
+        if words < PAPER_STORY_MIN_WORDS:
+            lint.append({"file": f, "code": "story_short",
+                         "detail": f"{words} words"})
+        elif words > PAPER_STORY_MAX_WORDS:
+            lint.append({"file": f, "code": "story_long",
+                         "detail": f"{words} words"})
+        if len(headline) > PAPER_HEADLINE_MAX:
+            lint.append({"file": f, "code": "headline_long",
+                         "detail": f"{len(headline)} chars"})
+        if len(str(meta.get("deck") or "")) > PAPER_DECK_MAX:
+            lint.append({"file": f, "code": "deck_long",
+                         "detail": f"{len(str(meta.get('deck')))} chars"})
+    if leads != 1 and articles:
+        marks.append({"file": "", "code": "no_lead",
+                      "detail": f"{leads} stories carry priority 1"})
+    return {"ok": not marks, "clean": not marks and not lint,
+            "marks": marks, "lint": lint, "stories": len(articles)}
+
+
+def _paper_shorten(s: str, most: int) -> str:
+    """Cut in words, never with a dangling ellipsis (cell_truncated)."""
+    s = " ".join(str(s or "").split())
+    if len(s) <= most:
+        return s
+    words = s.split()
+    out = ""
+    for w in words:
+        if len(out) + len(w) + (1 if out else 0) > most:
+            break
+        out = (out + " " + w) if out else w
+    return out or s[:most].rstrip()
+
+
+def paper_fix(articles: list[dict[str, Any]],
+              report: dict[str, Any]) -> int:
+    """Fix by code, the way the skill's table says to. Returns how many
+    findings were acted on; the caller re-checks."""
+    by_file = {str(a.get("file") or ""): a for a in articles}
+    done = 0
+    for finding in list(report.get("marks") or []) + list(report.get("lint") or []):
+        code = finding.get("code")
+        art = by_file.get(str(finding.get("file") or ""))
+        if code == "no_lead":
+            for a in articles:
+                (a.setdefault("meta", {}))["priority"] = max(
+                    2, int(a["meta"].get("priority") or 3))
+            front = next((a for a in articles
+                          if a.get("meta", {}).get("section") == "front"),
+                         articles[0] if articles else None)
+            if front is not None:
+                front["meta"]["priority"] = 1
+                done += 1
+            continue
+        if art is None:
+            continue
+        meta = art.setdefault("meta", {})
+        if code == "yaml_parse":
+            meta.clear()
+            meta.update({"headline": _paper_shorten(
+                str(art.get("headline_hint") or "Untitled"), PAPER_HEADLINE_MAX),
+                "section": "air", "priority": 3})
+            art["error"] = ""
+            done += 1
+        elif code == "no_headline":
+            meta["headline"] = _paper_shorten(
+                str(art.get("headline_hint") or "Untitled"), PAPER_HEADLINE_MAX)
+            done += 1
+        elif code == "unknown_section":
+            meta["section"] = "air"
+            done += 1
+        elif code == "bad_chart":
+            meta.pop("chart", None)
+            done += 1
+        elif code in ("missing_image", "bad_image"):
+            meta.pop("image", None)
+            meta.pop("photo", None)
+            done += 1
+        elif code == "unsafe_source":
+            meta["sources"] = [s for s in (meta.get("sources") or [])
+                               if str((s or {}).get("url") or "").startswith(
+                                   ("http://", "https://"))]
+            done += 1
+        elif code == "headline_long":
+            meta["headline"] = _paper_shorten(
+                str(meta.get("headline") or ""), PAPER_HEADLINE_MAX)
+            done += 1
+        elif code == "deck_long":
+            meta["deck"] = _paper_shorten(str(meta.get("deck") or ""),
+                                          PAPER_DECK_MAX)
+            done += 1
+        elif code in ("cell_long", "cell_truncated", "table_wide"):
+            lines = []
+            for line in str(art.get("body") or "").split("\n"):
+                if line.startswith("|") and not re.fullmatch(
+                        r"\|?[\s:|-]+\|?", line):
+                    cells = [c.strip() for c in line.strip().strip("|").split("|")]
+                    cells = [_paper_shorten(c.rstrip("…"), PAPER_CELL_MAX)
+                             for c in cells][:PAPER_TABLE_COLS]
+                    line = "| " + " | ".join(cells) + " |"
+                elif line.startswith("|"):
+                    cells = line.strip().strip("|").split("|")[:PAPER_TABLE_COLS]
+                    line = "|" + "|".join(cells) + "|"
+                lines.append(line)
+            art["body"] = "\n".join(lines)
+            done += 1
+        elif code == "story_long":
+            paras = [p for p in str(art.get("body") or "").split("\n\n")]
+            kept: list[str] = []
+            words = 0
+            for p in paras:
+                w = _paper_words(p)
+                if words + w > PAPER_STORY_MAX_WORDS and kept:
+                    break
+                kept.append(p)
+                words += w
+            art["body"] = "\n\n".join(kept)
+            done += 1
+        # story_short is left standing: a short board is still a board,
+        # and the skill's fix ("fold into another") is an editor's call.
+    return done
+
+
+# --- material: the station's own hour -------------------------------------
+
+def _paper_clock(ts: float) -> str:
+    return time.strftime("%I:%M %p", time.localtime(ts)).lstrip("0")
+
+
+def _paper_hour_words(ts: float) -> str:
+    return time.strftime("%I %p", time.localtime(ts)).lstrip("0")
+
+
+def _paper_strip_labels(text: str) -> str:
+    """A: / B: / dj: labels off a memo or a script."""
+    return " ".join(re.sub(r"^[A-Za-z0-9_' ]{1,20}:\s*", "", str(text or ""),
+                           flags=re.M).split())
+
+
+def paper_material(since: float, until: float) -> dict[str, Any]:
+    """Everything the desks read, gathered once. Every source is a ledger
+    the station already keeps; nothing here is invented."""
+    m: dict[str, Any] = {"since": since, "until": until}
+    dj = dj_settings()
+    m["station"] = str(dj.get("station_name") or PINE_BOX_FM)
+    m["host"] = booth_actor_name("dj")
+    m["cohost"] = booth_actor_name("cohost")
+    m["on"] = bool(_RADIO.get("on"))
+    # The records that turned, off the played ledger (it survives a
+    # restart, unlike _RADIO["history"]).
+    records: list[dict[str, Any]] = []
+    try:
+        rows = json.loads(PLAYED_PATH.read_text())
+        for r in rows if isinstance(rows, list) else []:
+            at = float(r.get("at") or 0)
+            if since <= at < until:
+                records.append({"at": at, "title": str(r.get("title") or ""),
+                                "artist": str(r.get("artist") or ""),
+                                "album": str(r.get("album") or ""),
+                                "seconds": float(r.get("seconds") or 0),
+                                "id": str(r.get("id") or "")})
+    except Exception:  # noqa: BLE001
+        records = []
+    records.sort(key=lambda r: r["at"])
+    m["records"] = records
+    # What the pair said, by kind.
+    said: dict[str, list[dict[str, Any]]] = {}
+    for row in list(_RADIO.get("chat") or []):
+        ts = float(row.get("ts") or 0)
+        if not since <= ts < until:
+            continue
+        text = " ".join(str(row.get("text") or "").split())
+        if not text:
+            continue
+        kind = str(row.get("kind") or "banter")
+        said.setdefault(kind, []).append({
+            "ts": ts, "who": str(row.get("name") or row.get("who") or ""),
+            "text": text[:400]})
+    m["said"] = said
+    calls: list[dict[str, Any]] = []
+    for row in call_log_read():
+        ts = float(row.get("ts") or 0)
+        if since <= ts < until:
+            calls.append({
+                "ts": ts, "name": str(row.get("name") or "a caller"),
+                "topic": str(row.get("theme") or row.get("topic") or ""),
+                "seconds": float(row.get("seconds") or 0),
+                "turns": int(float(row.get("turns") or 0)),
+                "ended": str(row.get("rule") or ""),
+                "premise": str(row.get("premise") or "")[:200]})
+    m["calls"] = calls
+    ads: list[dict[str, Any]] = []
+    for row in ad_airings():
+        ts = float(row.get("ts") or 0)
+        if since <= ts < until:
+            ads.append({"ts": ts, "product": str(row.get("product") or ""),
+                        "words": int(row.get("words") or 0),
+                        "where": str(row.get("where") or "")})
+    m["ads"] = ads
+    wire: list[str] = []
+    try:
+        for row in _news_covered():
+            ts = float(row.get("ts") or 0)
+            if since <= ts < until:
+                t = str(row.get("title") or "").strip()
+                if t and t not in wire:
+                    wire.append(t)
+    except Exception:  # noqa: BLE001
+        wire = []
+    m["wire"] = wire
+    memos: list[dict[str, Any]] = []
+    try:
+        for row in (_manager_memos_read() or []):
+            ts = float(row.get("ts") or 0)
+            if since <= ts < until:
+                memos.append({"ts": ts,
+                              "text": _paper_strip_labels(row.get("text"))[:600]})
+    except Exception:  # noqa: BLE001
+        memos = []
+    m["memos"] = memos
+    try:
+        m["guest"] = dict(active_guest() or {})
+    except Exception:  # noqa: BLE001
+        m["guest"] = {}
+    hours = [h for h in list(_HOURS)
+             if since <= float(h.get("closed_at") or 0) < until + 900]
+    m["scorecard"] = hours[-1] if hours else {}
+    try:
+        m["airtime"] = airtime_summary()
+    except Exception:  # noqa: BLE001
+        m["airtime"] = {}
+    m["stats"] = dict(_RADIO.get("session_stats") or {})
+    try:
+        slot = schedule_take() or {}
+        m["on_air_now"] = str(slot.get("label") or slot.get("kind") or "")
+    except Exception:  # noqa: BLE001
+        m["on_air_now"] = ""
+    coming: list[str] = []
+    try:
+        store = schedule_read()
+        name = schedule_preset_now(store)
+        for row in list((store.get("presets") or {}).get(name) or []):
+            if row.get("enabled", True):
+                coming.append(str(row.get("label") or row.get("kind") or ""))
+    except Exception:  # noqa: BLE001
+        coming = []
+    m["coming"] = [c for c in coming if c][:14]
+    m["now"] = dict(_RADIO.get("now") or {})
+    return m
+
+
+# --- the writer ------------------------------------------------------------
+
+async def paper_write(desk: str, brief: str, material: str,
+                      words: tuple[int, int] = (140, 260)) -> dict[str, str]:
+    """One prose desk's call to the station's writer. Returns {} when the
+    model cannot answer, and the desk falls back to a templated story so
+    the edition is never held for a model."""
+    settings = load_settings()
+    model = PAPER_MODEL or str(settings.get("model") or "")
+    if not model:
+        return {}
+    system = (
+        "You are a desk writer on a small newspaper printed every hour by "
+        "a radio station about its own broadcast. Plain, specific, "
+        "unhurried. No exclamation marks, no questions as headlines, no "
+        "hype. Third person; second person only for the listener. Use only "
+        "the material you are given - never invent a record, a caller, a "
+        "price or a headline that is not in it. Do not write a table.\n\n"
+        "Answer in EXACTLY this shape and nothing else:\n"
+        "HEADLINE: <one line, under 80 characters>\n"
+        "DECK: <one line, under 140 characters>\n"
+        "PULL: <one sentence from the story worth setting large, or ->\n"
+        "BODY:\n<" + f"{words[0]} to {words[1]}" + " words in two to four "
+        "paragraphs separated by blank lines>")
+    user = f"DESK: {desk}\n\nBRIEF: {brief}\n\nMATERIAL:\n{material}"
+    started = time.monotonic()
+    try:
+        result = await call_ollama(
+            model=model,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": user}],
+            temperature=round(random.uniform(0.55, 0.8), 3),
+            max_tokens=max(400, int(words[1] * 2.2)),
+            top_p=0.92,
+            num_ctx=model_ctx(),
+            seed=random.randint(1, 2_000_000_000),
+            repeat_penalty=1.1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _paper_say(f"{desk}: the writer did not answer ({type(exc).__name__}) "
+                   "- templated story instead")
+        return {}
+    answer = ((result.get("message") or {}).get("content") or "").strip()
+    answer = re.sub(r"<think>.*?</think>", " ", answer, flags=re.S).strip()
+    out: dict[str, str] = {}
+    m = re.search(r"HEADLINE:\s*(.+)", answer)
+    if m:
+        out["headline"] = _paper_shorten(m.group(1).strip().strip("*# "),
+                                         PAPER_HEADLINE_MAX)
+    m = re.search(r"DECK:\s*(.+)", answer)
+    if m:
+        out["deck"] = _paper_shorten(m.group(1).strip().strip("*# "),
+                                     PAPER_DECK_MAX)
+    m = re.search(r"PULL:\s*(.+)", answer)
+    if m:
+        pull = m.group(1).strip().strip("*# ")
+        if pull and pull != "-" and len(pull) > 20:
+            out["pull"] = pull[:240]
+    m = re.search(r"BODY:\s*\n?(.*)", answer, flags=re.S)
+    body = (m.group(1) if m else answer).strip()
+    body = re.sub(r"^(HEADLINE|DECK|PULL):.*$", "", body, flags=re.M).strip()
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    body = "\n\n".join(" ".join(p.split()) for p in body.split("\n\n")
+                       if p.strip() and not p.strip().startswith("|"))
+    if not out.get("headline") or _paper_words(body) < 40:
+        _paper_say(f"{desk}: the writer's answer did not hold the shape "
+                   "- templated story instead")
+        return {}
+    out["body"] = body
+    _paper_say(f"{desk}: written in {int((time.monotonic() - started))}s "
+               f"- \"{out['headline']}\"")
+    return out
+
+
+# --- the desks -------------------------------------------------------------
+
+def _paper_article(n: int, slug: str, meta: dict[str, Any],
+                   body: str) -> dict[str, Any]:
+    meta = {k: v for k, v in meta.items() if v not in (None, "", [], {})}
+    return {"file": f"{n:02d}-{slug}.md", "n": n, "slug": slug,
+            "meta": meta, "body": body.strip() + "\n",
+            "headline_hint": str(meta.get("headline") or slug)}
+
+
+def _desk_records(m: dict[str, Any]) -> dict[str, Any] | None:
+    """Data desk: the records board, by code."""
+    records = list(m.get("records") or [])
+    if not records:
+        return None
+    seen: list[dict[str, Any]] = []
+    for r in records:
+        seen.append(r)
+    total = sum(float(r.get("seconds") or 0) for r in seen)
+    rows = "\n".join(
+        f"| {_paper_clock(r['at'])} | {_paper_shorten(r['title'] or 'untitled', 24)} | "
+        f"{_paper_shorten(r['artist'] or '-', 22)} | "
+        f"{max(1, int(round(float(r.get('seconds') or 0) / 60)))} |"
+        for r in seen[:24])
+    longest = max(seen, key=lambda r: float(r.get("seconds") or 0))
+    artists = {r["artist"] for r in seen if r.get("artist")}
+    values = [max(1, int(round(float(r.get("seconds") or 0) / 60)))
+              for r in seen[:12]]
+    labels = [_paper_shorten((r.get("title") or "?").split(" (")[0], 11 if len(seen) <= 6 else 7)
+              or "?" for r in seen[:12]]
+    body = (
+        f"{len(seen)} records turned between {_paper_clock(m['since'])} and "
+        f"{_paper_clock(m['until'])}, about {int(total // 60)} minutes of music "
+        f"from {len(artists) or 1} artist{'s' if len(artists) != 1 else ''}. "
+        f"The longest side was {longest.get('title') or 'untitled'}"
+        + (f" by {longest['artist']}" if longest.get("artist") else "")
+        + f", at {max(1, int(round(float(longest.get('seconds') or 0) / 60)))} "
+        "minutes. The first needle of the hour went down on "
+        f"{seen[0].get('title') or 'an untitled record'} and the last on "
+        f"{seen[-1].get('title') or 'an untitled record'}. "
+        "Every line below is what the station's own played ledger says "
+        "went out; the reading above it is this desk's.\n\n"
+        "### The board\n\n"
+        "| Time | Record | Artist | Min |\n|:---|:---|:---|---:|\n" + rows)
+    meta = {
+        "headline": f"{len(seen)} Records in the {_paper_hour_words(m['since'])} Hour",
+        "deck": f"{int(total // 60)} minutes of music; the longest side was "
+                + _paper_shorten(longest.get("title") or "untitled", 60),
+        "section": "records", "priority": 2, "byline": "The Records Desk",
+        "chart": {"kind": "bars", "values": values, "labels": labels,
+                  "show_values": True, "min": 0},
+        "caption": "Minutes each record held the air, in the order it played.",
+    }
+    return {"slug": "the-records", "meta": meta, "body": body}
+
+
+def _desk_adverts(m: dict[str, Any]) -> dict[str, Any] | None:
+    ads = list(m.get("ads") or [])
+    if not ads:
+        return None
+    rows = "\n".join(
+        f"| {_paper_clock(a['ts'])} | {_paper_shorten(a['product'].split(',')[0], 26)} | "
+        f"{a['words']} | {a['where'] or '-'} |" for a in ads[:20])
+    words = sum(a["words"] for a in ads)
+    body = (
+        f"The station read {len(ads)} spot{'s' if len(ads) != 1 else ''} this "
+        f"hour, {words} words of copy in all"
+        + (f", the first at {_paper_clock(ads[0]['ts'])}" if ads else "")
+        + ". The sponsors, in the order they aired: "
+        + "; ".join(_paper_shorten(a["product"], 70) for a in ads[:8])
+        + ". A spot marked box went out over the Pine Box itself; page means "
+        "it reached the listener page only. The ledger this is read from is "
+        "written at the moment a read finishes, so an advert that was "
+        "prepared and never aired is not counted here.\n\n"
+        "### The log\n\n| Time | Sponsor | Words | Where |\n|:---|:---|---:|:---|\n"
+        + rows)
+    meta = {"headline": f"{len(ads)} Spot{'s' if len(ads) != 1 else ''} Read, {words} Words of Copy",
+            "deck": "The hour's commercial breaks, off the airing ledger",
+            "section": "adverts", "priority": 4, "byline": "The Adverts Desk"}
+    return {"slug": "the-adverts", "meta": meta, "body": body}
+
+
+def _desk_engineering(m: dict[str, Any], stats_text: str) -> dict[str, Any] | None:
+    card = dict(m.get("scorecard") or {})
+    air = dict(m.get("airtime") or {})
+    parts: list[str] = []
+    if card:
+        parts.append(
+            f"The hour contract closed at {int(round(float(card.get('delivery') or 0) * 100))}% "
+            f"delivery, {int(round(float(card.get('score') or 0)))} on the "
+            "scorecard"
+            + (f" ({'up' if card.get('improved') else 'down'} "
+               f"{abs(float(card.get('score_delta') or 0)):.0f} on the hour before)"
+               if card.get("score_delta") is not None else "")
+            + f", {int(card.get('kept') or 0)} entries kept and "
+            f"{int(card.get('missed') or 0)} missed"
+            + (" - every road met its requirement."
+               if card.get("all_requirements_met") else ".")
+        )
+    if air.get("avg_ratio") is not None:
+        parts.append(
+            f"The last few lines played out at {int(round(float(air['avg_ratio']) * 100))}% "
+            "of their length on the box.")
+    stats = dict(m.get("stats") or {})
+    if stats.get("calls") or stats.get("rounds"):
+        parts.append(f"Session to date: {int(stats.get('calls') or 0)} calls, "
+                     f"{int(stats.get('rounds') or 0)} rounds.")
+    for sentence in re.split(r"(?<=\.)\s+", str(stats_text or "")):
+        s = sentence.strip()
+        if s and s.split(":")[0] in ("Memory", "CPU", "Disk", "Uptime",
+                                     "Board temperature", "GPU"):
+            parts.append(s)
+    if not parts:
+        return None
+    body = " ".join(parts)
+    roads = dict(card.get("roads") or {})
+    meta: dict[str, Any] = {
+        "headline": ("The Hour Closed at "
+                     f"{int(round(float(card.get('delivery') or 0) * 100))}% Delivery"
+                     if card else "The Engineering Room, Read Off the Board"),
+        "deck": ("What the coordinator's scorecard and the host's own sensors say"),
+        "section": "engineering", "priority": 4, "byline": "The Engineering Desk",
+    }
+    if roads:
+        keys = list(roads.keys())[:8]
+        meta["chart"] = {
+            "kind": "bars",
+            "values": [int(round(float((roads[k] or {}).get("attainment") or 0) * 100))
+                       for k in keys],
+            "labels": [_paper_shorten(k.replace("_", " "), 11) for k in keys],
+            "show_values": True, "min": 0, "max": 110}
+        meta["caption"] = ("Attainment by road, percent of the seconds each "
+                           "road owed the hour.")
+        body += ("\n\n### The roads\n\n| Road | Owed | Aired | Met |\n"
+                 "|:---|---:|---:|:---|\n" + "\n".join(
+                     f"| {_paper_shorten(k.replace('_', ' '), 16)} | "
+                     f"{int(float((roads[k] or {}).get('target_seconds') or 0))}s | "
+                     f"{int(float((roads[k] or {}).get('aired_seconds') or 0))}s | "
+                     f"{'yes' if (roads[k] or {}).get('met') else 'no'} |"
+                     for k in keys))
+    return {"slug": "engineering", "meta": meta, "body": body}
+
+
+async def _desk_weather(m: dict[str, Any]) -> dict[str, Any] | None:
+    """Data desk, live feed: the week ahead from Open-Meteo. No network,
+    no story - a forecast is never invented."""
+    geo = _PAPER.get("geo")
+    if not geo:
+        lat = lon = None
+        label = ""
+        place = WEATHER_DEFAULT_LOCATION
+        try:
+            if place:
+                async with httpx.AsyncClient(timeout=10) as client:
+                    for candidate in (place, place.split(",")[0].strip()):
+                        r = await client.get(
+                            "https://geocoding-api.open-meteo.com/v1/search",
+                            params={"name": candidate, "count": 1})
+                        hits = (r.json() or {}).get("results") or []
+                        if hits:
+                            lat, lon = hits[0]["latitude"], hits[0]["longitude"]
+                            label = str(hits[0].get("name") or candidate)
+                            break
+            if lat is None:
+                home = await ha_home_location()
+                if home:
+                    lat, lon, label = home
+        except Exception:  # noqa: BLE001
+            lat = None
+        if lat is None:
+            return None
+        geo = _PAPER["geo"] = (float(lat), float(lon), label or "home")
+    lat, lon, label = geo
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            r = await client.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={"latitude": lat, "longitude": lon,
+                        "current": "temperature_2m,weather_code,wind_speed_10m",
+                        "daily": ("weather_code,temperature_2m_max,"
+                                  "temperature_2m_min,"
+                                  "precipitation_probability_max"),
+                        "temperature_unit": "fahrenheit",
+                        "wind_speed_unit": "mph",
+                        "forecast_days": 7, "timezone": "auto"})
+            r.raise_for_status()
+            data = r.json()
+    except Exception as exc:  # noqa: BLE001
+        _paper_say(f"weather: the feed did not answer ({type(exc).__name__}) "
+                   "- no forecast printed")
+        return None
+    d = data.get("daily") or {}
+    days = list(d.get("time") or [])
+    hi = [int(round(float(x))) for x in (d.get("temperature_2m_max") or [])]
+    lo = [int(round(float(x))) for x in (d.get("temperature_2m_min") or [])]
+    rain = [int(x or 0) for x in (d.get("precipitation_probability_max") or [])]
+    codes = list(d.get("weather_code") or [])
+    if len(days) < 2 or len(hi) != len(days):
+        return None
+    labels = []
+    for t in days:
+        try:
+            labels.append(time.strftime("%a", time.strptime(t, "%Y-%m-%d")))
+        except ValueError:
+            labels.append("-")
+    peak = max(hi)
+    peak_day = labels[hi.index(peak)]
+    rain_max = max(rain) if rain else 0
+    rain_day = labels[rain.index(rain_max)] if rain else "-"
+    floor = max(0, (min(hi) // 10) * 10 - 5)
+    cur = data.get("current") or {}
+    now_line = ""
+    if cur.get("temperature_2m") is not None:
+        now_line = (f"Right now it is {int(round(float(cur['temperature_2m'])))}°F "
+                    f"and {WMO_CODES.get(cur.get('weather_code'), 'unsettled')}"
+                    + (f", wind {int(round(float(cur.get('wind_speed_10m') or 0)))} mph"
+                       if cur.get("wind_speed_10m") is not None else "")
+                    + ". ")
+    rows = "\n".join(
+        f"| {labels[i]} | {hi[i]}° | {lo[i]}° | {rain[i] if i < len(rain) else 0}% |"
+        for i in range(len(days)))
+    body = (
+        now_line
+        + f"Highs in {label} run from {min(hi)}°F to {peak}°F over the week. The "
+        f"peak is {peak_day}; the coolest nights stay near {min(lo)}°F. Rain is "
+        f"likeliest {rain_day}, at a {rain_max}% chance, and the rest of the "
+        "week is drier. None of this is a reason to change the running "
+        "order; it is a reason for the pair to know which day the listeners "
+        "are indoors.\n\n"
+        "### The board\n\n| Day | High | Low | Rain |\n|:---|---:|---:|---:|\n"
+        + rows
+        + f"\n\nThe forecast is for {label} and comes from Open-Meteo, fetched "
+        "when this edition went to press. The sky words: "
+        + ", ".join(f"{labels[i]} {WMO_CODES.get(codes[i], '-')}"
+                    for i in range(min(len(days), 7)) if i < len(codes))
+        + ".")
+    meta = {
+        "headline": "Weather for the Week",
+        "deck": f"The warmest day is {peak_day}; keep the umbrella for {rain_day}",
+        "section": "weather", "priority": 3, "byline": "The Weather Desk",
+        "chart": {"kind": "line", "values": hi, "labels": labels,
+                  "show_values": True, "min": floor},
+        "caption": (f"Daily highs for the week in {label}, °F. The warmest "
+                    f"day is {peak_day}, at {peak}°F; the wettest is "
+                    f"{rain_day}, a {rain_max}% chance of rain."),
+    }
+    return {"slug": "weather", "meta": meta, "body": body}
+
+
+def _paper_lines(rows: list[dict[str, Any]], most: int = 18,
+                 each: int = 220) -> str:
+    return "\n".join(f"- {_paper_clock(r['ts'])} {r.get('who') or ''}: "
+                     f"{str(r.get('text') or '')[:each]}" for r in rows[-most:])
+
+
+async def _desk_phones(m: dict[str, Any]) -> dict[str, Any] | None:
+    calls = list(m.get("calls") or [])
+    said = list((m.get("said") or {}).get("caller") or []) + list(
+        (m.get("said") or {}).get("call") or []) + list(
+        (m.get("said") or {}).get("banter_caller") or [])
+    if not calls and not said:
+        return None
+    material = ""
+    if calls:
+        material += "CALLS TAKEN:\n" + "\n".join(
+            f"- {_paper_clock(c['ts'])}: {c['name']} rang about "
+            f"{c['topic'] or 'nothing in particular'}; {int(c['seconds'] // 60)}m"
+            f"{int(c['seconds'] % 60):02d}s, {c['turns']} turns; the call ended "
+            f"when {c['ended'] or 'it ended'}."
+            + (f" Opening: {c['premise']}" if c.get("premise") else "")
+            for c in calls[:8]) + "\n\n"
+    if said:
+        said.sort(key=lambda r: r["ts"])
+        material += "FROM THE AIR:\n" + _paper_lines(said, 16)
+    got = await paper_write(
+        "The Phones",
+        f"Report the hour's request line on {m['station']}: who rang, what "
+        "they wanted, how each call ended. Hosts are "
+        f"{m['host']} and {m['cohost']}. Name the callers as given.",
+        material)
+    body = got.get("body") or ""
+    if not body:
+        body = (
+            f"The request line rang {len(calls)} time{'s' if len(calls) != 1 else ''} "
+            f"between {_paper_clock(m['since'])} and {_paper_clock(m['until'])}. "
+            + " ".join(
+                f"{c['name']} rang at {_paper_clock(c['ts'])} about "
+                f"{c['topic'] or 'nothing in particular'} and stayed "
+                f"{int(c['seconds'] // 60)} minutes; the call ended when "
+                f"{c['ended'] or 'it ended'}." for c in calls[:6])
+            + " Every call is written down by the call log the moment it "
+            "ends, which is where this desk reads it.")
+    if calls:
+        body += ("\n\n### The log\n\n| Time | Caller | Topic | Min |\n"
+                 "|:---|:---|:---|---:|\n" + "\n".join(
+                     f"| {_paper_clock(c['ts'])} | {_paper_shorten(c['name'], 18)} | "
+                     f"{_paper_shorten(c['topic'] or '-', 26)} | "
+                     f"{max(1, int(round(c['seconds'] / 60)))} |"
+                     for c in calls[:12]))
+    meta = {
+        "headline": got.get("headline") or
+        f"{len(calls) or len(said)} on the Line This Hour",
+        "deck": got.get("deck") or "The request line, as it was answered",
+        "section": "phones", "priority": 2, "byline": "The Phones Desk",
+        "pull": got.get("pull") or "",
+    }
+    return {"slug": "the-phones", "meta": meta, "body": body}
+
+
+async def _desk_wire(m: dict[str, Any]) -> dict[str, Any] | None:
+    wire = list(m.get("wire") or [])
+    said = list((m.get("said") or {}).get("news") or [])
+    if not wire and not said:
+        return None
+    material = ""
+    if wire:
+        material += "HEADLINES THE DESK COVERED:\n" + "\n".join(
+            f"- {t}" for t in wire[:14]) + "\n\n"
+    if said:
+        material += "WHAT WAS SAID ON AIR:\n" + _paper_lines(said, 14)
+    got = await paper_write(
+        "The Wire",
+        "Report what the news desk covered this hour - the stories by their "
+        "headlines and how the pair took them. Do not add facts the "
+        "headlines do not carry; this desk reports the coverage, not the "
+        "world.", material)
+    body = got.get("body") or ""
+    if not body:
+        body = (
+            f"The desk took {len(wire)} stor{'y' if len(wire) == 1 else 'ies'} off the wire this hour: "
+            + "; ".join(_paper_shorten(t.rstrip("."), 80) for t in wire[:8])
+            + ". Headlines are drawn at random across the whole front page "
+            "against a three-hour repeat ledger, so the bulletin at the top of "
+            "the hour and the stretches between records rarely cross.")
+    if wire:
+        body += "\n\n### Covered\n\n" + "\n".join(
+            f"- {_paper_shorten(t, 120)}" for t in wire[:14])
+    meta = {
+        "headline": got.get("headline") or
+        f"{len(wire)} Stor{'y' if len(wire) == 1 else 'ies'} Off the Wire",
+        "deck": got.get("deck") or "What the news desk read and how the pair took it",
+        "section": "wire", "priority": 3, "byline": "The Wire Desk",
+        "pull": got.get("pull") or "",
+    }
+    return {"slug": "the-wire", "meta": meta, "body": body}
+
+
+async def _desk_gallery(m: dict[str, Any]) -> dict[str, Any] | None:
+    said = list((m.get("said") or {}).get("gallery") or [])
+    if not said:
+        return None
+    got = await paper_write(
+        "The Gallery",
+        "The station's gallery press: paintings described, argued over and "
+        "priced on air. Report which pieces were shown, what was said about "
+        "them and the prices named. Treat the prices as the station's joke, "
+        "not the market's.", _paper_lines(said, 18, 260))
+    body = got.get("body") or (
+        f"The gallery had the air {len(said)} times this hour. "
+        + " ".join(_paper_shorten(r["text"], 160).rstrip(".") + "." for r in said[:5])
+        + " The pictures are the render machine's own, described from their "
+        "pixels rather than from the prompts that made them.")
+    image = ""
+    try:
+        gal = _RADIO.get("gallery_now") or {}
+        if float(gal.get("at") or 0) >= m["since"]:
+            images = list(gal.get("images") or [])
+            if images and images[0].get("name"):
+                image = "/api/generations/image/" + str(images[0]["name"])
+    except Exception:  # noqa: BLE001
+        image = ""
+    meta = {
+        "headline": got.get("headline") or "The Gallery, Argued Over and Priced",
+        "deck": got.get("deck") or "What hung on the wall this hour",
+        "section": "gallery", "priority": 3, "byline": "The Gallery Desk",
+        "pull": got.get("pull") or "", "image": image, "focus": "center",
+    }
+    return {"slug": "the-gallery", "meta": meta, "body": body}
+
+
+async def _desk_upstairs(m: dict[str, Any]) -> dict[str, Any] | None:
+    memos = list(m.get("memos") or [])
+    said = list((m.get("said") or {}).get("manager") or [])
+    if not memos and not said:
+        return None
+    material = ""
+    if memos:
+        material += "MEMOS THAT CAME DOWN:\n" + "\n".join(
+            f"- {_paper_clock(x['ts'])}: {x['text'][:400]}" for x in memos[:6]) + "\n\n"
+    if said:
+        material += "READ OUT ON AIR:\n" + _paper_lines(said, 10)
+    got = await paper_write(
+        "From Upstairs",
+        "The memos the manager sent down this hour and how the pair took "
+        "them on air. Keep the manager's tone in quotation where it is "
+        "quotable.", material)
+    body = got.get("body") or (
+        f"{len(memos) or len(said)} memo{'s' if (len(memos) or len(said)) != 1 else ''} "
+        "came down from upstairs this hour. "
+        + " ".join(_paper_shorten(x["text"], 200).rstrip(".") + "." for x in memos[:3]))
+    meta = {
+        "headline": got.get("headline") or "A Memo From Upstairs",
+        "deck": got.get("deck") or "What the manager sent down, and what was said back",
+        "section": "upstairs", "priority": 3, "byline": "The Upstairs Desk",
+        "pull": got.get("pull") or "",
+    }
+    return {"slug": "from-upstairs", "meta": meta, "body": body}
+
+
+async def _desk_studio(m: dict[str, Any]) -> dict[str, Any] | None:
+    guest = dict(m.get("guest") or {})
+    said = list((m.get("said") or {}).get("guest") or [])
+    if not guest and not said:
+        return None
+    material = ""
+    if guest:
+        material += (f"THE GUEST: {guest.get('name') or 'a guest'} - "
+                     f"{guest.get('who') or ''}. Why they came: "
+                     f"{guest.get('why') or ''}\n\n")
+    if said:
+        material += "FROM THE INTERVIEW:\n" + _paper_lines(said, 16)
+    got = await paper_write(
+        "In the Studio",
+        "The studio guest in the third seat: who they are, why they came, "
+        "and what came out of the interview.", material)
+    body = got.get("body") or (
+        f"{guest.get('name') or 'A guest'} sat in the third seat this hour: "
+        f"{str(guest.get('who') or 'a visitor').rstrip('. ')}. "
+        f"{str(guest.get('why') or '').strip()}")
+    meta = {
+        "headline": got.get("headline") or
+        f"{guest.get('name') or 'A Guest'} in the Third Seat",
+        "deck": got.get("deck") or str(guest.get("who") or "The studio guest").rstrip(". "),
+        "section": "studio", "priority": 3, "byline": "The Studio Desk",
+        "pull": got.get("pull") or "",
+    }
+    return {"slug": "in-the-studio", "meta": meta, "body": body}
+
+
+async def _desk_air(m: dict[str, Any]) -> dict[str, Any] | None:
+    """What the pair actually talked about between everything else."""
+    said = m.get("said") or {}
+    rows: list[dict[str, Any]] = []
+    for kind in ("banter", "track_talk", "deep", "bombshell", "recap",
+                 "record", "station_id", "chat", "reply"):
+        rows.extend(said.get(kind) or [])
+    if len(rows) < 3:
+        return None
+    rows.sort(key=lambda r: r["ts"])
+    got = await paper_write(
+        "On Air",
+        f"What {m['host']} and {m['cohost']} talked about on {m['station']} "
+        "this hour between the records - the subjects, the running jokes, "
+        "the moment worth remembering. Quote a line or two exactly.",
+        _paper_lines(rows, 28, 200), words=(160, 300))
+    body = got.get("body") or (
+        f"The pair had the air {len(rows)} times this hour. "
+        + " ".join(f"{r.get('who') or 'One of them'}: \""
+                   f"{_paper_shorten(r['text'], 140)}\"" for r in rows[:5]))
+    meta = {
+        "headline": got.get("headline") or "Between the Records",
+        "deck": got.get("deck") or "What the pair talked about this hour",
+        "section": "air", "priority": 2, "byline": "The Air Desk",
+        "pull": got.get("pull") or "",
+    }
+    return {"slug": "on-air", "meta": meta, "body": body}
+
+
+async def _desk_lead(m: dict[str, Any],
+                     others: list[dict[str, Any]]) -> dict[str, Any]:
+    """The lead desk, last: sees every story and writes the front page -
+    the hour in the order it happened, and what the next one holds."""
+    timeline: list[tuple[float, str, str]] = []
+    for r in m.get("records") or []:
+        timeline.append((r["at"], "record", str(r["title"] or "an untitled record")
+                         + (f" by {r['artist']}" if r.get("artist") else "")))
+    for c in m.get("calls") or []:
+        timeline.append((c["ts"], "call",
+                         f"{c['name']} about {c['topic'] or 'nothing in particular'}"))
+    for a in m.get("ads") or []:
+        timeline.append((a["ts"], "advert", _paper_shorten(a["product"], 60)))
+    for x in m.get("memos") or []:
+        timeline.append((x["ts"], "memo", _paper_shorten(x["text"], 90)))
+    for kind, rows in (m.get("said") or {}).items():
+        if kind in ("news", "gallery", "guest", "recap", "deep", "bombshell"):
+            for r in rows[:3]:
+                timeline.append((r["ts"], kind, _paper_shorten(r["text"], 90)))
+    timeline.sort(key=lambda t: t[0])
+    _prose = {"record": "the record {}", "call": "a call from {}",
+              "advert": "an advert for {}", "memo": "a memo from upstairs: {}",
+              "news": "the news desk, {}", "gallery": "the gallery: {}",
+              "guest": "the guest, {}", "recap": "the recap: {}",
+              "deep": "the deep dig: {}", "bombshell": "a rant: {}"}
+
+    def _said(kind: str, what: str) -> str:
+        return _prose.get(kind, "{}").format(what.rstrip(". "))
+
+    material = "THE HOUR, IN ORDER:\n" + "\n".join(
+        f"- {_paper_clock(ts)} {kind}: {what}" for ts, kind, what in timeline[:40])
+    if others:
+        material += "\n\nTHE REST OF THE PAPER:\n" + "\n".join(
+            f"- [{a['meta'].get('section')}] {a['meta'].get('headline')} - "
+            f"{a['meta'].get('deck') or ''}" for a in others)
+    if m.get("coming"):
+        material += "\n\nTHE NEXT HOUR'S RUNNING ORDER: " + ", ".join(m["coming"])
+    if m.get("on_air_now"):
+        material += f"\n\nON AIR AS WE PRINT: {m['on_air_now']}"
+    quiet = not timeline
+    got: dict[str, str] = {}
+    if not quiet:
+        got = await paper_write(
+            "The Lead Desk",
+            f"Write the front page of the {_paper_hour_words(m['since'])} hour "
+            f"on {m['station']}: the hour in the order it happened, tying the "
+            "records to the calls to the rest of the paper, and close with "
+            "what the next hour holds. This is the only story a listener "
+            "may read; it has to stand alone.", material, words=(200, 340))
+    body = got.get("body") or ""
+    if not body:
+        if quiet:
+            body = (
+                f"{m['station']} was quiet between {_paper_clock(m['since'])} and "
+                f"{_paper_clock(m['until'])}: no record turned, nobody rang, "
+                "nothing came down from upstairs. "
+                + ("The station is on the air as this edition goes to press."
+                   if m.get("on") else
+                   "The station was off the air, or paused, for the whole hour.")
+                + " The rest of the paper carries what does not need a "
+                "broadcast to exist: the weather outside, the engineering "
+                "room, and the wire."
+                + (" The next hour's running order: " + ", ".join(m["coming"][:8]) + "."
+                   if m.get("coming") else ""))
+        else:
+            body = (
+                f"The hour opened at {_paper_clock(timeline[0][0])} with "
+                f"{_said(timeline[0][1], timeline[0][2])} and closed at "
+                f"{_paper_clock(timeline[-1][0])} on "
+                f"{_said(timeline[-1][1], timeline[-1][2])}. "
+                + " ".join(f"At {_paper_clock(ts)}, {_said(kind, what)}."
+                           for ts, kind, what in timeline[1:-1][:9])
+                + (" The next hour holds " + ", ".join(m["coming"][:8]) + "."
+                   if m.get("coming") else ""))
+    records = m.get("records") or []
+    calls = m.get("calls") or []
+    meta = {
+        "headline": got.get("headline") or (
+            f"A Quiet {_paper_hour_words(m['since'])} Hour" if quiet else
+            f"{len(records)} Records, {len(calls)} Call{'s' if len(calls) != 1 else ''}, "
+            f"and the {_paper_hour_words(m['since'])} Hour in Order"),
+        "deck": got.get("deck") or (
+            f"{m['station']}, {_paper_clock(m['since'])} to {_paper_clock(m['until'])}, "
+            "arranged in the order it happened"),
+        "section": "front", "priority": 1, "byline": "The Lead Desk",
+        "span": "full", "pull": got.get("pull") or "",
+    }
+    return {"slug": "the-hour", "meta": meta, "body": body}
+
+
+# --- the press -------------------------------------------------------------
+
+def paper_edition_dir(edition_id: str) -> Path:
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}-\d{2}(x\d{4})?", edition_id):
+        raise ValueError("bad edition id")
+    return PAPER_EDITIONS_DIR / edition_id
+
+
+def paper_edition_read(edition_id: str) -> dict[str, Any] | None:
+    """The edition off disk: edition.json plus every article parsed."""
+    try:
+        where = paper_edition_dir(edition_id)
+    except ValueError:
+        return None
+    meta_path = where / "edition.json"
+    if not meta_path.exists():
+        return None
+    try:
+        ed = json.loads(meta_path.read_text())
+    except Exception:  # noqa: BLE001
+        return None
+    articles: list[dict[str, Any]] = []
+    for path in sorted((where / "articles").glob("*.md")):
+        try:
+            meta, body, err = _fm_load(path.read_text())
+        except OSError:
+            continue
+        articles.append({"file": path.name, "meta": meta, "body": body,
+                         "error": err, "headline_hint": path.stem[3:]})
+    ed["articles"] = articles
+    return ed
+
+
+def paper_editions() -> list[dict[str, Any]]:
+    """Newest first, the shelf the panel scrolls."""
+    out: list[dict[str, Any]] = []
+    try:
+        for where in PAPER_EDITIONS_DIR.iterdir():
+            meta_path = where / "edition.json"
+            if not meta_path.is_file():
+                continue
+            try:
+                ed = json.loads(meta_path.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+            out.append({k: ed.get(k) for k in (
+                "id", "at", "since", "until", "kind", "headline", "deck",
+                "stories", "ok", "clean", "masthead")})
+    except OSError:
+        return []
+    out.sort(key=lambda e: str(e.get("id") or ""), reverse=True)
+    return out
+
+
+def _paper_prune() -> None:
+    try:
+        rows = paper_editions()
+        for old in rows[PAPER_KEEP:]:
+            shutil.rmtree(paper_edition_dir(str(old["id"])), ignore_errors=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def paper_window(kind: str, at: float | None = None) -> tuple[float, float, str]:
+    """(since, until, id). The hourly edition covers the hour that just
+    closed; an extra covers the last sixty minutes and carries the minute."""
+    now = float(at if at is not None else time.time())
+    lt = time.localtime(now)
+    top = now - lt.tm_min * 60 - lt.tm_sec
+    if kind == "hourly":
+        since, until = top - 3600.0, top
+        return since, until, time.strftime("%Y-%m-%d-%H", time.localtime(since))
+    since, until = now - 3600.0, now
+    return since, until, (time.strftime("%Y-%m-%d-%H", time.localtime(since))
+                          + time.strftime("x%H%M", lt))
+
+
+async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
+    """Run the desks, check, fix, print. One press at a time."""
+    with _PAPER_LOCK:
+        if _PAPER.get("running"):
+            return {"started": False, "already": True}
+        _PAPER.update({"running": True, "started": time.time(),
+                       "reason": reason, "steps": [], "verdict": ""})
+    since, until, edition_id = paper_window(kind)
+    try:
+        _paper_masthead_seed()
+        _paper_say(f"press on - {reason or 'an edition'} · the "
+                   f"{_paper_hour_words(since)} hour"
+                   + (" (extra)" if kind != "hourly" else ""))
+        m = paper_material(since, until)
+        _paper_say(f"material: {len(m['records'])} records, {len(m['calls'])} "
+                   f"calls, {len(m['ads'])} adverts, {len(m['wire'])} wire, "
+                   f"{len(m['memos'])} memos, "
+                   f"{sum(len(v) for v in m['said'].values())} lines said")
+        stories: list[dict[str, Any]] = []
+        # Data desks first - code, never a model.
+        for name, desk in (("records", _desk_records), ("adverts", _desk_adverts)):
+            try:
+                got = desk(m)
+            except Exception as exc:  # noqa: BLE001
+                _paper_say(f"{name} desk tripped: {exc}"[:160])
+                got = None
+            if got:
+                stories.append(got)
+                _paper_say(f"{name} desk: \"{got['meta']['headline']}\"")
+        try:
+            stats_text = await asyncio.to_thread(system_stats)
+        except Exception:  # noqa: BLE001
+            stats_text = ""
+        try:
+            got = _desk_engineering(m, stats_text)
+            if got:
+                stories.append(got)
+                _paper_say(f"engineering desk: \"{got['meta']['headline']}\"")
+        except Exception as exc:  # noqa: BLE001
+            _paper_say(f"engineering desk tripped: {exc}"[:160])
+        try:
+            got = await _desk_weather(m)
+            if got:
+                stories.append(got)
+                _paper_say(f"weather desk: \"{got['meta']['headline']}\"")
+        except Exception as exc:  # noqa: BLE001
+            _paper_say(f"weather desk tripped: {exc}"[:160])
+        # Prose desks: the writer, with a templated fallback each.
+        for name, desk in (("phones", _desk_phones), ("wire", _desk_wire),
+                           ("gallery", _desk_gallery), ("upstairs", _desk_upstairs),
+                           ("studio", _desk_studio), ("air", _desk_air)):
+            try:
+                got = await desk(m)
+            except Exception as exc:  # noqa: BLE001
+                _paper_say(f"{name} desk tripped: {exc}"[:160])
+                got = None
+            if got:
+                stories.append(got)
+        # The lead desk, last.
+        lead = await _desk_lead(m, stories)
+        order = [lead] + sorted(
+            stories, key=lambda s: (int(s["meta"].get("priority") or 5),
+                                    PAPER_SECTION_IDS.index(s["meta"]["section"])
+                                    if s["meta"]["section"] in PAPER_SECTION_IDS
+                                    else 99))
+        articles = [_paper_article(n, s["slug"], s["meta"], s["body"])
+                    for n, s in enumerate(order, start=1)]
+        # Check, fix, repeat - until ok, and clean when it can be.
+        report = paper_check(articles)
+        rounds = 0
+        while (report["marks"] or report["lint"]) and rounds < 4:
+            fixed = paper_fix(articles, report)
+            rounds += 1
+            report = paper_check(articles)
+            if not fixed:
+                break
+        _paper_say("check: " + ("clean" if report["clean"] else
+                                "ok" if report["ok"] else "RED")
+                   + f" - {len(report['marks'])} marks, {len(report['lint'])} lint"
+                   + (" (" + ", ".join(
+                       f"{x['code']}" for x in report["lint"][:5]) + ")"
+                      if report["lint"] else ""))
+        if not report["ok"]:
+            _paper_say("the paper refuses to publish on red: "
+                       + "; ".join(f"{x['file']} {x['code']} {x['detail']}"
+                                   for x in report["marks"][:6]))
+            with _PAPER_LOCK:
+                _PAPER["verdict"] = "red - not published"
+            return {"started": True, "ok": False, "report": report}
+        where = paper_edition_dir(edition_id)
+        art_dir = where / "articles"
+        if where.exists():
+            shutil.rmtree(where, ignore_errors=True)
+        art_dir.mkdir(parents=True, exist_ok=True)
+        for art in articles:
+            (art_dir / art["file"]).write_text(
+                _fm_dump(art["meta"]) + "\n" + art["body"], encoding="utf-8")
+        head = paper_masthead()
+        edition = {
+            "id": edition_id, "at": time.time(), "since": since, "until": until,
+            "kind": kind, "reason": reason,
+            "masthead": head["masthead"], "motto": head["motto"],
+            "headline": str(lead["meta"].get("headline") or ""),
+            "deck": str(lead["meta"].get("deck") or ""),
+            "stories": len(articles), "ok": report["ok"], "clean": report["clean"],
+            "report": report, "station": m["station"],
+            "on_air_now": m.get("on_air_now") or "",
+            "now": {k: v for k, v in (m.get("now") or {}).items()
+                    if k in ("title", "artist")},
+        }
+        (where / "edition.json").write_text(json.dumps(edition, indent=1),
+                                            encoding="utf-8")
+        edition["articles"] = articles
+        try:
+            (where / "edition.html").write_text(paper_render_html(edition),
+                                                encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001
+            _paper_say(f"the typesetter tripped ({exc}); the page renders on demand")
+        with _PAPER_LOCK:
+            _PAPER["latest"] = edition_id
+            _PAPER["headline"] = edition["headline"]
+            _PAPER["verdict"] = (f"printed {edition_id} - {len(articles)} stories"
+                                 + ("" if report["clean"] else ", lint standing"))
+        _paper_say(f"printed: {edition_id} - {len(articles)} stories - "
+                   f"\"{edition['headline']}\"")
+        note_action(f"📰 the Gazette printed the {_paper_hour_words(since)} hour"
+                    + (" (extra)" if kind != "hourly" else ""))
+        _paper_prune()
+        return {"started": True, "ok": True, "id": edition_id,
+                "stories": len(articles)}
+    except Exception as exc:  # noqa: BLE001
+        _paper_say(f"the press jammed: {type(exc).__name__}: {exc}"[:220])
+        with _PAPER_LOCK:
+            _PAPER["verdict"] = f"jammed: {type(exc).__name__}"
+        return {"started": True, "ok": False, "error": str(exc)[:200]}
+    finally:
+        with _PAPER_LOCK:
+            _PAPER["running"] = False
+
+
+def paper_latest_id() -> str:
+    """The newest edition on the shelf. One disk scan after a deploy,
+    then memory: the press writes _PAPER["latest"] itself."""
+    if _PAPER.get("scanned") and not _PAPER.get("latest"):
+        return ""
+    if _PAPER.get("latest"):
+        return str(_PAPER["latest"])
+    rows = paper_editions()
+    _PAPER["scanned"] = True
+    if rows:
+        _PAPER["latest"] = str(rows[0]["id"])
+        _PAPER["headline"] = str(rows[0].get("headline") or "")
+        return str(rows[0]["id"])
+    return ""
+
+
+def paper_pulse() -> dict[str, Any]:
+    """For the /api/dj poll: enough for the 📰 to light and the window to
+    notice a fresh edition. Memory only - the poll runs every two seconds."""
+    latest = paper_latest_id()
+    return {"running": bool(_PAPER.get("running")),
+            "started": float(_PAPER.get("started") or 0),
+            "latest": latest, "headline": str(_PAPER.get("headline") or ""),
+            "verdict": str(_PAPER.get("verdict") or "")}
+
+
+def paper_front_words() -> str:
+    """The front page, read aloud: headline, deck, first paragraph."""
+    latest = paper_latest_id()
+    ed = paper_edition_read(latest) if latest else None
+    if not ed:
+        return ""
+    lead = next((a for a in ed.get("articles") or []
+                 if int((a.get("meta") or {}).get("priority") or 0) == 1),
+                (ed.get("articles") or [None])[0])
+    if not lead:
+        return ""
+    meta = lead.get("meta") or {}
+    first = next((p for p in str(lead.get("body") or "").split("\n\n")
+                  if p.strip() and not p.startswith(("|", "#"))), "")
+    hour = _paper_hour_words(float(ed.get("since") or time.time()))
+    return (f"{ed.get('masthead') or 'The Gazette'}, the {hour} hour. "
+            f"{meta.get('headline') or ''}. {meta.get('deck') or ''}. "
+            + " ".join(first.split())[:600])
+
+
+def paper_recap_clause() -> str:
+    """One line for the recap on the hour: the paper's own front page, so
+    the pair read the station's record of itself rather than invent one."""
+    try:
+        latest = paper_latest_id()
+        if not latest:
+            return ""
+        ed = json.loads((paper_edition_dir(latest) / "edition.json").read_text())
+        if time.time() - float(ed.get("at") or 0) > 5400:
+            return ""
+        return (f"\n\n{ed.get('masthead') or 'The Gazette'} just printed its "
+                f"front page on this hour: \"{ed.get('headline') or ''}\" - "
+                f"{ed.get('deck') or ''}. Mention the paper once, as the "
+                "station's own, and take the headline as read.")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def parse_paper_command(text: str) -> str:
+    """'print the paper' / 'read me the front page' -> print | read | ''."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return ""
+    subject = (r"(the |an? |this hour'?s |today'?s |tonight'?s |the latest )?"
+               r"(newspaper|gazette|front page|headlines?|extra edition|"
+               r"edition|paper)\b")
+    if re.search(r"\b(print|press|make|generate|publish|write|produce|run|"
+                 r"put out|push out)\b.{0,30}" + subject, lowered) \
+            or re.search(subject + r".{0,20}\b(now|please|again)\b", lowered) \
+            and re.search(r"\b(print|press|generate|publish)\b", lowered):
+        if not re.search(r"\b(toilet|paper (towel|plane|airplane|clip))\b",
+                         lowered):
+            return "print"
+    if re.search(r"\b(read|what'?s in|what is in|what'?s on|what is on|tell me|"
+                 r"give me|open|show me|what'?s the|what is the|what are the)"
+                 r"\b.{0,30}" + subject, lowered):
+        if not re.search(r"\b(toilet|paper (towel|plane|airplane|clip))\b",
+                         lowered):
+            return "read"
+    return ""
+
+
+async def paper_clock() -> None:
+    """The press runs on the hour, every hour, on its own clock - the
+    station's switch does not gate it, because the weather, the wire and
+    the engineering room exist whether or not anything aired. After a
+    deploy it catches up the hour just gone if that edition is missing."""
+    await asyncio.sleep(75)
+    try:
+        since, until, want = paper_window("hourly")
+        if (not (paper_edition_dir(want) / "edition.json").exists()
+                and time.time() - until < 3000 and not _PAPER.get("running")):
+            await paper_print(reason="catching up the hour just gone",
+                              kind="hourly")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", f"the gazette's catch-up tripped: {exc}"[:200])
+    while True:
+        now = time.time()
+        lt = time.localtime(now)
+        top = now - lt.tm_min * 60 - lt.tm_sec + 3600.0 + 20.0
+        await asyncio.sleep(max(5.0, top - now))
+        try:
+            if not _PAPER.get("running"):
+                await paper_print(reason="the hour", kind="hourly")
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"the gazette missed the hour: {exc}"[:200])
+
+
+@app.on_event("startup")
+async def _paper_clock_start() -> None:
+    fire_and_forget(paper_clock())
+
+
+# --- the typesetter --------------------------------------------------------
+
+def _paper_svg_chart(chart: dict[str, Any]) -> str:
+    try:
+        values = [float(v) for v in (chart.get("values") or [])]
+    except (TypeError, ValueError):
+        return ""
+    if len(values) < 2:
+        return ""
+    labels = [str(x) for x in (chart.get("labels") or [])]
+    kind = str(chart.get("kind") or "line")
+    lo = float(chart.get("min")) if chart.get("min") is not None else min(values)
+    hi = float(chart.get("max")) if chart.get("max") is not None else max(values)
+    if hi <= lo:
+        hi = lo + 1.0
+    W, H, pad_l, pad_r, pad_t, pad_b = 600, 240, 44, 10, 22, 34
+    iw, ih = W - pad_l - pad_r, H - pad_t - pad_b
+    n = len(values)
+    show = bool(chart.get("show_values"))
+    lab_cls = "lab" if n <= 6 else "lab small"
+    every = 1 if n <= 8 else 2
+
+    def y(v: float) -> float:
+        return pad_t + ih - (max(lo, min(hi, v)) - lo) / (hi - lo) * ih
+
+    parts = [f'<svg class="chart" viewBox="0 0 {W} {H}" '
+             'xmlns="http://www.w3.org/2000/svg" role="img">']
+    for k in range(5):
+        gy = pad_t + ih * k / 4
+        parts.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{W - pad_r}" '
+                     f'y2="{gy:.1f}" class="grid"/>')
+        val = hi - (hi - lo) * k / 4
+        parts.append(f'<text x="{pad_l - 6}" y="{gy + 4:.1f}" class="tick" '
+                     f'text-anchor="end">{val:.0f}</text>')
+    if kind == "bars":
+        slot = iw / n
+        bw = slot * 0.62
+        for i, v in enumerate(values):
+            x = pad_l + slot * i + (slot - bw) / 2
+            top = y(v)
+            parts.append(f'<rect x="{x:.1f}" y="{top:.1f}" width="{bw:.1f}" '
+                         f'height="{max(0.0, pad_t + ih - top):.1f}" class="bar"/>')
+            if show:
+                parts.append(f'<text x="{x + bw / 2:.1f}" y="{top - 4:.1f}" '
+                             f'class="val" text-anchor="middle">{v:.0f}</text>')
+            if i < len(labels) and i % every == 0:
+                parts.append(f'<text x="{x + bw / 2:.1f}" y="{H - 8}" '
+                             f'class="{lab_cls}" text-anchor="middle">'
+                             f'{_paper_esc(labels[i])}</text>')
+    else:
+        step = iw / (n - 1)
+        pts = [(pad_l + step * i, y(v)) for i, v in enumerate(values)]
+        parts.append('<polyline class="line" points="'
+                     + " ".join(f"{x:.1f},{yy:.1f}" for x, yy in pts) + '"/>')
+        for i, (x, yy) in enumerate(pts):
+            parts.append(f'<circle cx="{x:.1f}" cy="{yy:.1f}" r="3.2" class="dot"/>')
+            if show:
+                parts.append(f'<text x="{x:.1f}" y="{yy - 8:.1f}" class="val" '
+                             f'text-anchor="middle">{values[i]:.0f}</text>')
+            if i < len(labels) and i % every == 0:
+                parts.append(f'<text x="{x:.1f}" y="{H - 8}" class="{lab_cls}" '
+                             f'text-anchor="middle">{_paper_esc(labels[i])}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+_PAPER_CSS = r"""
+:root{--ink:#1b1a17;--ink2:#4a4741;--rule:#1b1a17;--paper:#f4efe3;--paper2:#ece5d4;--accent:#8b1a1a;--faint:#9c9686}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--paper2)}
+body{color:var(--ink);font-family:Georgia,"Times New Roman","Liberation Serif",serif;font-size:15px;line-height:1.45}
+.sheet{max-width:1180px;margin:0 auto;background:var(--paper);padding:26px 34px 40px;box-shadow:0 10px 40px rgba(0,0,0,.25)}
+.ears{display:flex;justify-content:space-between;gap:16px;font-size:11.5px;color:var(--ink2);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);padding:5px 0;text-transform:uppercase;letter-spacing:.06em}
+.ears b{color:var(--ink)}
+h1.masthead{font-family:"Old English Text MT","UnifrakturMaguntia","Blackmoor LET",Georgia,serif;font-weight:400;text-align:center;font-size:64px;letter-spacing:.01em;margin:14px 0 4px;line-height:1}
+.motto{text-align:center;font-style:italic;color:var(--ink2);font-size:13px;margin:0 0 8px}
+.dateline{display:flex;justify-content:space-between;border-top:3px double var(--rule);border-bottom:1px solid var(--rule);padding:5px 0;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+.lead{padding:18px 0 14px;border-bottom:3px double var(--rule);margin-bottom:14px}
+.lead h2{font-size:44px;line-height:1.05;margin:0 0 8px;font-weight:700;letter-spacing:-.01em}
+.lead .deck{font-size:19px;font-style:italic;color:var(--ink2);margin:0 0 10px;line-height:1.3}
+.byline{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink2);margin:0 0 10px}
+.byline .sec{color:var(--accent)}
+.lead .body{column-count:3;column-gap:28px;column-rule:1px solid #d9d2c1}
+.lead .body p:first-of-type::first-letter{float:left;font-size:64px;line-height:.82;padding:6px 8px 0 0;font-weight:700}
+p{margin:0 0 10px;text-align:justify;hyphens:auto}
+h3,h4{margin:8px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.08em}
+.section{border-top:1px solid var(--rule);margin:8px 0 8px;padding-top:3px;font-size:12px;text-transform:uppercase;letter-spacing:.16em;font-weight:700}
+.flow{column-count:3;column-gap:28px;column-rule:1px solid #d9d2c1}
+@media (max-width:980px){.flow,.lead .body{column-count:2}h1.masthead{font-size:46px}.lead h2{font-size:32px}}
+@media (max-width:640px){.flow,.lead .body{column-count:1}.sheet{padding:16px}h1.masthead{font-size:36px}.lead h2{font-size:26px}}
+.story{break-inside:avoid-column;page-break-inside:avoid;margin:0 0 18px;padding:0 0 10px;border-bottom:1px solid #d9d2c1}
+.story h2{font-size:22px;line-height:1.12;margin:0 0 5px;font-weight:700}
+.story .deck{font-size:14.5px;font-style:italic;color:var(--ink2);margin:0 0 6px;line-height:1.3}
+.story.span{column-span:all;border-top:1px solid var(--rule);padding-top:10px}
+.story.span .body{column-count:2;column-gap:28px}
+blockquote.pull{margin:10px 0;padding:8px 0;border-top:2px solid var(--rule);border-bottom:2px solid var(--rule);font-size:19px;line-height:1.25;font-style:italic;text-align:center}
+table.agate{width:100%;border-collapse:collapse;font-size:11.5px;margin:6px 0 10px;font-family:"Helvetica Neue",Arial,sans-serif}
+table.agate th{border-bottom:1px solid var(--rule);text-align:left;padding:3px 4px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:10px}
+table.agate td{padding:3px 4px;border-bottom:1px dotted #c8c0ad;vertical-align:top}
+table.agate td:last-child,table.agate th:last-child{text-align:right}
+table.agate td:first-child,table.agate th:first-child{white-space:nowrap}
+svg.chart{width:100%;height:auto;display:block;margin:6px 0 2px}
+svg.chart .grid{stroke:#d3cbb8;stroke-width:1}
+svg.chart .tick,svg.chart .lab,svg.chart .val{font-family:"Helvetica Neue",Arial,sans-serif;font-size:17px;fill:var(--ink2)}
+svg.chart .val{fill:var(--ink);font-weight:700}
+svg.chart .small{font-size:12px}
+svg.chart .bar{fill:var(--ink)}
+svg.chart .line{fill:none;stroke:var(--accent);stroke-width:2.2}
+svg.chart .dot{fill:var(--paper);stroke:var(--accent);stroke-width:2}
+.caption{font-size:11.5px;color:var(--ink2);font-style:italic;margin:0 0 8px}
+figure.plate{margin:0 0 10px;break-inside:avoid}
+figure.plate img{width:100%;display:block;filter:grayscale(.15) contrast(1.05);border:1px solid #cfc7b3}
+.sources{font-size:11px;color:var(--ink2);margin:6px 0 0}
+.sources a{color:var(--accent)}
+ul{margin:0 0 10px;padding-left:18px}
+li{margin:0 0 3px}
+a{color:var(--accent)}
+.colophon{border-top:3px double var(--rule);margin-top:24px;padding-top:8px;font-size:11px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+@media print{body{background:#fff}.sheet{box-shadow:none;max-width:none}}
+"""
+
+
+def paper_render_html(ed: dict[str, Any]) -> str:
+    """The broadsheet. The lead across the top under the masthead, then
+    every other story flowed through the columns under its section head,
+    in the paper's section order."""
+    articles = [a for a in (ed.get("articles") or []) if not a.get("error")]
+    head = paper_masthead()
+    section_name = {s["id"]: s["name"] for s in head["sections"]}
+    lead = next((a for a in articles
+                 if int((a.get("meta") or {}).get("priority") or 0) == 1), None)
+    rest = [a for a in articles if a is not lead]
+    order = {s["id"]: i for i, s in enumerate(head["sections"])}
+    rest.sort(key=lambda a: (order.get(str(a["meta"].get("section")), 99),
+                             int(a["meta"].get("priority") or 5)))
+    since = float(ed.get("since") or time.time())
+    at = float(ed.get("at") or time.time())
+    number = 1
+    try:
+        founded = time.mktime(time.strptime(str(head.get("founded") or "2026-09-04"),
+                                            "%Y-%m-%d"))
+        number = max(1, int((since - founded) // 3600) + 1)
+    except Exception:  # noqa: BLE001
+        number = 1
+
+    def story_html(a: dict[str, Any], is_lead: bool, kicker: str = "") -> str:
+        meta = a.get("meta") or {}
+        sec = str(meta.get("section") or "front")
+        bits: list[str] = [kicker] if kicker else []
+        headline = str(meta.get("headline") or meta.get("title") or "")
+        bits.append(f"<h2>{_paper_esc(headline)}</h2>")
+        if meta.get("deck"):
+            bits.append(f'<p class="deck">{_paper_esc(meta["deck"])}</p>')
+        bits.append('<p class="byline"><span class="sec">'
+                    f'{_paper_esc(section_name.get(sec, sec))}</span>'
+                    + (f' · {_paper_esc(meta["byline"])}' if meta.get("byline") else "")
+                    + "</p>")
+        image = str(meta.get("image") or meta.get("photo") or "")
+        if image:
+            bits.append(f'<figure class="plate"><img src="{_paper_esc(image)}" '
+                        f'alt="{_paper_esc(headline)}" loading="lazy" '
+                        'onerror="this.parentNode.remove()"></figure>')
+        chart = meta.get("chart")
+        if isinstance(chart, dict):
+            svg = _paper_svg_chart(chart)
+            if svg:
+                bits.append(svg)
+                if meta.get("caption"):
+                    bits.append(f'<p class="caption">{_paper_esc(meta["caption"])}</p>')
+        body_html = _md_html(str(a.get("body") or ""))
+        pull = str(meta.get("pull") or "")
+        if pull and not is_lead:
+            body_html = body_html.replace(
+                "</p>", "</p><blockquote class=\"pull\">" + _md_inline(pull)
+                + "</blockquote>", 1)
+        elif pull:
+            bits.append(f'<blockquote class="pull">{_md_inline(pull)}</blockquote>')
+        bits.append(f'<div class="body">{body_html}</div>')
+        srcs = [s for s in (meta.get("sources") or []) if isinstance(s, dict)]
+        if srcs:
+            bits.append('<p class="sources">Sources: ' + "; ".join(
+                (f'<a href="{_paper_esc(s["url"])}" target="_blank" rel="noopener">'
+                 f'{_paper_esc(s.get("name") or s["url"])}</a>')
+                if str(s.get("url") or "").startswith(("http://", "https://"))
+                else _paper_esc(s.get("name") or "") for s in srcs) + "</p>")
+        cls = "lead" if is_lead else (
+            "story span" if str(meta.get("span") or "") == "full" else "story")
+        return f'<article class="{cls}">' + "".join(bits) + "</article>"
+
+    flow: list[str] = []
+    current = ""
+    for a in rest:
+        sec = str(a["meta"].get("section") or "")
+        kicker = ""
+        if sec != current:
+            # Inside the story, not before it: a head of its own could sit
+            # at the foot of one column with its story atop the next.
+            kicker = f'<div class="section">{_paper_esc(section_name.get(sec, sec))}</div>'
+            current = sec
+        flow.append(story_html(a, False, kicker))
+    now = ed.get("now") or {}
+    on_air = str(ed.get("on_air_now") or "")
+    report = ed.get("report") or {}
+    when = time.strftime("%A, %B %d, %Y", time.localtime(since)).replace(" 0", " ")
+    title = f"{head['masthead']} · {_paper_hour_words(since)} hour"
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        f"<title>{_paper_esc(title)}</title>"
+        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+        f"<style>{_PAPER_CSS}</style></head><body><div class=\"sheet\">"
+        "<div class=\"ears\"><span>"
+        + (f"On air as we print: <b>{_paper_esc(on_air)}</b>" if on_air else
+           f"<b>{_paper_esc(ed.get('station') or '')}</b>")
+        + "</span><span>"
+        + (f"Turning: <b>{_paper_esc(now.get('title') or '')}</b>"
+           + (f" · {_paper_esc(now.get('artist'))}" if now.get("artist") else "")
+           if now.get("title") else "Printed on the hour")
+        + "</span></div>"
+        f"<h1 class=\"masthead\">{_paper_esc(head['masthead'])}</h1>"
+        f"<p class=\"motto\">{_paper_esc(head['motto'])}</p>"
+        "<div class=\"dateline\">"
+        f"<span>Vol. 1 · No. {number}</span>"
+        f"<span>{_paper_esc(when)} · the {_paper_hour_words(since)} hour"
+        + (" · extra" if str(ed.get("kind")) != "hourly" else "")
+        + "</span>"
+        f"<span>Printed {_paper_clock(at)}</span></div>"
+        + (story_html(lead, True) if lead else "")
+        + "<div class=\"flow\">" + "".join(flow) + "</div>"
+        "<div class=\"colophon\">"
+        f"<span>{_paper_esc(head['masthead'])} · set by the desks of "
+        f"{_paper_esc(ed.get('station') or PINE_BOX_FM)} · {ed.get('stories') or len(articles)} stories</span>"
+        "<span>checks: "
+        + ("clean" if report.get("clean") else
+           f"ok, {len(report.get('lint') or [])} lint" if report.get("ok") else "red")
+        + f" · edition {_paper_esc(ed.get('id') or '')}</span></div>"
+        "</div></body></html>")
+
+
+# --- the doors -------------------------------------------------------------
+
+@app.get("/api/paper")
+async def api_paper_shelf(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1019: the shelf the 📰 window scrolls, plus the press's console."""
+    require_read_auth(authorization)
+    with _PAPER_LOCK:
+        steps = list(_PAPER["steps"])
+        state = {"running": bool(_PAPER.get("running")),
+                 "started": float(_PAPER.get("started") or 0),
+                 "reason": str(_PAPER.get("reason") or ""),
+                 "verdict": str(_PAPER.get("verdict") or "")}
+    return {**state, "steps": steps, "latest": paper_latest_id(),
+            "editions": paper_editions()[:PAPER_KEEP],
+            "masthead": paper_masthead()}
+
+
+@app.post("/api/paper/print")
+async def api_paper_print(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """Press an extra now. {"kind": "hourly"} reprints the hour just gone."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    kind = "hourly" if str((payload or {}).get("kind") or "") == "hourly" else "extra"
+    already = bool(_PAPER.get("running"))
+    if not already:
+        fire_and_forget(paper_print(
+            reason=str((payload or {}).get("reason") or "the operator pressed the button"),
+            kind=kind))
+    return {"started": not already, "already": already}
+
+
+@app.get("/api/paper/{edition_id}")
+async def api_paper_edition(
+    edition_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The edition as data: edition.json and every article's frontmatter
+    and markdown - the folder contract, over HTTP."""
+    require_read_auth(authorization)
+    ed = paper_edition_read(edition_id)
+    if not ed:
+        raise HTTPException(status_code=404, detail="No such edition")
+    return ed
+
+
+@app.get("/api/paper/{edition_id}/html")
+async def api_paper_html(
+    edition_id: str,
+    authorization: str | None = Header(default=None),
+) -> HTMLResponse:
+    """The typeset page."""
+    require_read_auth(authorization)
+    try:
+        where = paper_edition_dir(edition_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad edition id") from None
+    cached = where / "edition.html"
+    if cached.is_file():
+        return HTMLResponse(cached.read_text(encoding="utf-8"))
+    ed = paper_edition_read(edition_id)
+    if not ed:
+        raise HTTPException(status_code=404, detail="No such edition")
+    html = paper_render_html(ed)
+    try:
+        cached.write_text(html, encoding="utf-8")
+    except OSError:
+        pass
+    return HTMLResponse(html)
+
+
+@app.delete("/api/paper/{edition_id}")
+async def api_paper_delete(
+    edition_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    try:
+        where = paper_edition_dir(edition_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad edition id") from None
+    if not (where / "edition.json").exists():
+        raise HTTPException(status_code=404, detail="No such edition")
+    shutil.rmtree(where, ignore_errors=True)
+    if _PAPER.get("latest") == edition_id:
+        _PAPER["latest"] = ""
+        _PAPER["headline"] = ""
+        _PAPER["scanned"] = False
+    return {"deleted": edition_id}
+
+
 @app.get("/api/comfy/doctor")
 async def api_comfy_doctor_state(
     authorization: str | None = Header(default=None),
@@ -89643,6 +91631,9 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
     <button id="livePineConsole" class="act-refresh pine-live-console"
             title="Detect a USB-connected Pine Box and open its live serial console"
             onclick="usbConsole()">Open USB Console</button>
+    <button id="paperBarBtn" class="act-refresh"
+            title="The Pine Box Gazette — the hour's newspaper, printed on the hour"
+            onclick="paperOpen()">📰</button>
     <button id="cloudBarBtn" class="act-refresh"
             title="Word cloud — half the gallery, live"
             onclick="cloudDockToggle()">☁</button>
@@ -91295,6 +93286,7 @@ const PINE_3JS = [
   {key: "asks",     label: "🎛️ The orchestrator asks", open: () => orchOpen()},
   {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
+  {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen()},
   {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
   {key: "vectors",  label: "🌳 Vector Tree",     open: () => rhetVecToggle()},
   {key: "stage",    label: "💿 Album Stage",     open: () => stageStart()},
@@ -91357,6 +93349,7 @@ function pine3JSAllOff() {
   try { if (window.rhetSphere) rhetSphereStop(); } catch (e) {}
   try { if (window.rhetVec) rhetVecStop(); } catch (e) {}
   try { skinStop(); } catch (e) {}
+  try { paperClose(); } catch (e) {}
   const rm = document.getElementById("remoteModal");
   if (rm) rm.remove();
   const dock = document.getElementById("cloudDock");
@@ -108259,6 +110252,7 @@ async function pollDJ() {
     djRepairBanner(state.repairing, state.repair_log || []);
     comfyDoctorWatch(state);                              // #1152
     stewardWatch(state);                                  // #1153
+    paperWatch(state);                                    // #1019
   } catch (error) { /* the panel works without it */ }
 }
 
@@ -122867,6 +124861,250 @@ async function comfyDoctorPanel() {
   };
   poll();
   comfyDocTimer = setInterval(poll, 2000);
+}
+
+/* ---- #1019: THE PINE BOX GAZETTE ------------------------------------
+ * The 📰 beside the word cloud. A window that shows the hour's paper -
+ * typeset by the server, one edition per hour on the hour, an extra
+ * whenever "Print now" is pressed or the box is asked to print one -
+ * and a shelf of every stored edition to scroll through, newest first.
+ * The desks' console runs along the bottom while a press is on. */
+let paperBox = null;
+let paperTimer = null;
+let paperSeen = "";
+let paperCur = "";
+let paperList = [];
+let paperFrame = null;
+let paperShelf = null;
+let paperConsole = null;
+let paperTitle = null;
+
+function paperClose() {
+  if (paperTimer) { clearInterval(paperTimer); paperTimer = null; }
+  if (paperBox) { try { paperBox.remove(); } catch (e) {} paperBox = null; }
+  paperFrame = paperShelf = paperConsole = paperTitle = null;
+  document.removeEventListener("keydown", paperKeys);
+}
+
+function paperKeys(ev) {
+  if (!paperBox) return;
+  if (ev.key === "Escape") { paperClose(); return; }
+  if (ev.key === "ArrowLeft") paperStep(1);      // older
+  if (ev.key === "ArrowRight") paperStep(-1);    // newer
+}
+
+function paperStep(delta) {
+  const i = paperList.findIndex((e) => e.id === paperCur);
+  const next = paperList[i + delta];
+  if (next) paperShow(next.id);
+}
+
+function paperWhen(e) {
+  const d = new Date((e.since || e.at || 0) * 1000);
+  const h = d.getHours();
+  const hour = ((h % 12) || 12) + (h < 12 ? " AM" : " PM");
+  const day = d.toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric"});
+  return day + " · " + hour + (String(e.id || "").includes("x") ? " extra" : "");
+}
+
+function paperWatch(state) {
+  try {
+    const d = state && state.paper;
+    if (!d) return;
+    const btn = document.getElementById("paperBarBtn");
+    if (btn) {
+      btn.style.outline = d.running ? "2px solid var(--accent)" : "";
+      btn.title = d.running
+        ? "The Gazette — the press is on"
+        : (d.headline ? "The Gazette — " + d.headline : "The Pine Box Gazette — the hour's newspaper");
+    }
+    if (paperBox && !d.running && d.latest && d.latest !== paperSeen) {
+      paperSeen = d.latest;
+      paperRefresh(true);
+    }
+  } catch (e) { /* the panel works without it */ }
+}
+
+async function paperOpen() {
+  if (paperBox) { paperClose(); return; }
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:350;display:flex;"
+    + "align-items:center;justify-content:center;background:rgba(2,4,9,.82)";
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(1240px,97vw);height:min(920px,94vh);display:flex;"
+    + "flex-direction:column;background:#05080d;border:1px solid #22304a;"
+    + "border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden";
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "padding:9px 12px;border-bottom:1px solid #1b2735;flex-wrap:wrap";
+  head.appendChild(el("b", "", "📰 The Gazette"));
+  paperTitle = el("span", "muted", "");
+  paperTitle.style.cssText = "font-size:11px;flex:1;min-width:120px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(paperTitle);
+  const older = el("button", "", "◀");
+  older.title = "Older edition (←)";
+  older.onclick = () => paperStep(1);
+  const newer = el("button", "", "▶");
+  newer.title = "Newer edition (→)";
+  newer.onclick = () => paperStep(-1);
+  const print = el("button", "", "Print now");
+  print.title = "Press an extra edition of the last sixty minutes, right now";
+  print.onclick = async () => {
+    try {
+      await api("/api/paper/print", {method: "POST",
+        body: JSON.stringify({reason: "the operator pressed Print now"})});
+      if (paperConsole) paperConsole.style.display = "";
+    } catch (e) { setStatus(e.message, true); }
+  };
+  const open = el("button", "", "Open ↗");
+  open.title = "The page on its own, for printing or saving";
+  open.onclick = () => {
+    if (paperCur) window.open("/api/paper/" + encodeURIComponent(paperCur) + "/html", "_blank");
+  };
+  const bin = el("button", "", "🗑");
+  bin.title = "Remove this edition from the shelf";
+  bin.onclick = async () => {
+    if (!paperCur || !confirm("Remove edition " + paperCur + " from the shelf?")) return;
+    try {
+      await api("/api/paper/" + encodeURIComponent(paperCur), {method: "DELETE"});
+      paperCur = "";
+      paperRefresh(true);
+    } catch (e) { setStatus(e.message, true); }
+  };
+  const x = el("button", "", "✕");
+  x.onclick = paperClose;
+  [older, newer, print, open, bin, x].forEach((b) => head.appendChild(b));
+  box.appendChild(head);
+
+  paperShelf = el("div", "", "");
+  paperShelf.style.cssText = "display:flex;gap:6px;padding:6px 10px;overflow-x:auto;"
+    + "border-bottom:1px solid #1b2735;background:#070b12;flex:none;"
+    + "scrollbar-width:thin";
+  box.appendChild(paperShelf);
+
+  paperFrame = document.createElement("iframe");
+  paperFrame.style.cssText = "flex:1;min-height:0;width:100%;border:0;background:#ece5d4";
+  paperFrame.setAttribute("title", "The Gazette");
+  box.appendChild(paperFrame);
+
+  paperConsole = el("div", "", "");
+  paperConsole.style.cssText = "flex:none;max-height:96px;overflow:auto;padding:6px 12px;"
+    + "font:11px/1.6 ui-monospace,Consolas,monospace;color:#9fd0a6;"
+    + "background:#04070b;border-top:1px solid #1b2735;white-space:pre-wrap;display:none";
+  box.appendChild(paperConsole);
+
+  shade.appendChild(box);
+  shade.onclick = (ev) => { if (ev.target === shade) paperClose(); };
+  document.body.appendChild(shade);
+  paperBox = shade;
+  document.addEventListener("keydown", paperKeys);
+  await paperRefresh(true);
+  paperTimer = setInterval(paperPoll, 2500);
+}
+
+function paperPaintShelf() {
+  if (!paperShelf) return;
+  paperShelf.innerHTML = "";
+  if (!paperList.length) {
+    const none = el("span", "muted", "No editions yet — press Print now, or wait for the hour.");
+    none.style.fontSize = "12px";
+    paperShelf.appendChild(none);
+    return;
+  }
+  paperList.forEach((e) => {
+    const chip = el("button", "", "");
+    chip.style.cssText = "flex:none;display:flex;flex-direction:column;align-items:flex-start;"
+      + "gap:1px;padding:4px 9px;font-size:11px;line-height:1.25;max-width:230px;"
+      + "border:1px solid " + (e.id === paperCur ? "var(--accent)" : "#22304a") + ";"
+      + "background:" + (e.id === paperCur ? "rgba(32,185,232,.12)" : "#0b1018") + ";";
+    const when = el("b", "", paperWhen(e));
+    const head = el("span", "muted", e.headline || "(untitled)");
+    head.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:210px";
+    chip.appendChild(when);
+    chip.appendChild(head);
+    chip.title = (e.headline || "") + "\n" + (e.deck || "") + "\n" + (e.stories || 0) + " stories";
+    chip.onclick = () => paperShow(e.id);
+    paperShelf.appendChild(chip);
+  });
+}
+
+async function paperShow(id) {
+  if (!paperFrame || !id) return;
+  paperCur = id;
+  paperPaintShelf();
+  const e = paperList.find((x) => x.id === id) || {};
+  if (paperTitle) paperTitle.textContent = paperWhen(e) + (e.headline ? " — " + e.headline : "");
+  try {
+    const r = await fetch("/api/paper/" + encodeURIComponent(id) + "/html",
+      {headers: {"Authorization": "Bearer " + key()}});
+    if (!r.ok) throw new Error("edition " + id + " did not load (" + r.status + ")");
+    paperFrame.srcdoc = await r.text();
+  } catch (err) {
+    paperFrame.srcdoc = "<p style='font:14px Georgia;padding:20px'>" + String(err.message || err) + "</p>";
+  }
+  try {
+    const chip = Array.from(paperShelf.children).find((c) => c.title && c.title.startsWith((e.headline || "") + "\n"));
+    if (chip && chip.scrollIntoView) chip.scrollIntoView({inline: "nearest", block: "nearest"});
+  } catch (err) { /* cosmetic */ }
+}
+
+async function paperRefresh(jumpLatest) {
+  let d;
+  try { d = await api("/api/paper"); }
+  catch (e) { if (paperTitle) paperTitle.textContent = e.message; return; }
+  paperList = d.editions || [];
+  paperPaintConsole(d);
+  if (jumpLatest || !paperList.find((e) => e.id === paperCur)) {
+    paperCur = (paperList[0] || {}).id || "";
+  }
+  paperPaintShelf();
+  if (paperCur) await paperShow(paperCur);
+  else if (paperFrame) {
+    paperFrame.srcdoc = "<div style='font:15px Georgia,serif;padding:40px;max-width:640px'>"
+      + "<h2 style='font-size:34px;margin:0 0 8px'>Nothing on the shelf yet</h2>"
+      + "<p>The press runs on the hour, every hour, and files the hour just gone. "
+      + "Press <b>Print now</b> for an extra on the last sixty minutes, or say "
+      + "<i>print the paper</i> to the box.</p></div>";
+    if (paperTitle) paperTitle.textContent = "";
+  }
+}
+
+function paperPaintConsole(d) {
+  if (!paperConsole) return;
+  const steps = d.steps || [];
+  const stamp = (t) => {
+    const w = new Date(t * 1000);
+    return String(w.getHours()).padStart(2, "0") + ":"
+      + String(w.getMinutes()).padStart(2, "0") + ":"
+      + String(w.getSeconds()).padStart(2, "0");
+  };
+  if (d.running) {
+    paperConsole.style.display = "";
+    paperConsole.textContent = steps.slice(-8).map((s) => stamp(s.at) + "  " + s.line).join("\n") + "\n▋";
+    paperConsole.scrollTop = paperConsole.scrollHeight;
+  } else if (paperConsole.style.display !== "none") {
+    paperConsole.textContent = steps.slice(-8).map((s) => stamp(s.at) + "  " + s.line).join("\n")
+      + (d.verdict ? "\n— " + d.verdict : "");
+    paperConsole.scrollTop = paperConsole.scrollHeight;
+  }
+}
+
+async function paperPoll() {
+  if (!paperBox) return;
+  let d;
+  try { d = await api("/api/paper"); } catch (e) { return; }
+  paperPaintConsole(d);
+  const ids = (d.editions || []).map((e) => e.id).join(",");
+  if (ids !== paperList.map((e) => e.id).join(",")) {
+    const wasLatest = !paperCur || paperCur === (paperList[0] || {}).id;
+    paperList = d.editions || [];
+    paperPaintShelf();
+    if (wasLatest && !d.running && paperList[0] && paperList[0].id !== paperCur) {
+      paperSeen = paperList[0].id;
+      await paperShow(paperList[0].id);
+    }
+  }
 }
 
 /* ---- #1153: THE STEWARD'S CONSOLE -----------------------------------
