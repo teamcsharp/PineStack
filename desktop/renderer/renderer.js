@@ -1321,9 +1321,41 @@ async function panicRecover() {
   const route = ROUTES[key] || ROUTES.nabu;
   button.disabled = true;
   button.textContent = "...";
-  setText("connLine", "collapsing and rebuilding...");
+  setText("connLine", "deploying the latest Pine Box...");
   showRebuildOverlay();
   selectView("logs");
+  /* #1044: DEPLOY THE BOX FIRST, THEN REBUILD THE APP AROUND IT.
+   *
+   * The rebuild below always took the newest desktop source off the share;
+   * the AGENT was left on whatever app.py its container booted with, so a
+   * click rebuilt a new app around an old box. The restart is what makes the
+   * app.py on the share live (the container bind-mounts it and uvicorn runs
+   * without --reload), so it goes first, every click, unconditionally. A box
+   * that does not come back in two minutes does not cancel the rebuild - the
+   * app still relaunches, and the log says what happened. */
+  updateRebuildProgress({ stage: "deploy", pct: 4,
+                          detail: "restarting the agent on the newest app.py" });
+  appendLog("[deploy] restarting spark-agent so the newest app.py is live\n");
+  try {
+    await api.post("/api/service/restart", { name: "spark-agent" });
+    const backUp = await waitForAgent(120000);
+    appendLog(backUp
+      ? "[deploy] the box is back, running the newest code\n"
+      : "[deploy] the box did not answer within two minutes; rebuilding anyway\n");
+    updateRebuildProgress({ stage: "deploy", pct: 6,
+                            detail: backUp ? "agent back on the newest code"
+                                           : "agent slow to answer; carrying on" });
+  } catch (err) {
+    appendLog(`[deploy] restart failed: ${err.message}\n`);
+  }
+  /* ...and every webview drops its cached copy of the panel, so the app is
+   * never showing yesterday's HTML against today's agent. */
+  try {
+    document.querySelectorAll("webview").forEach((view) => {
+      try { view.reloadIgnoringCache(); } catch (e) {}
+    });
+  } catch (err) { /* the relaunch below reloads them anyway */ }
+  setText("connLine", "collapsing and rebuilding...");
   if (typeof api.reconstituteDesktop === "function") {
     try {
       const result = await api.reconstituteDesktop();

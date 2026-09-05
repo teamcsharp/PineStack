@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import hmac
 import io
@@ -607,6 +608,21 @@ DEFAULT_DJ = {
     # Most callers should leave the station having actually won something;
     # the caller desk can deliberately make the show meaner when wanted.
     "caller_success_rate": 72,
+    # #1033: THE CALLER BANK FLOOR. How many finished, never-aired calls
+    # must stand on the shelf before the phone road counts as covered -
+    # off the sheet as well as on it. Below it the writing rooms treat
+    # the road as hour-short and write another. 0 turns the floor off.
+    "caller_bank_floor": 6,
+    # #1033: a call that has been out may go out AGAIN once it is at
+    # least this many hours old (and under ten). 6..10. The banked
+    # shelf row and the finished recording both obey the same window.
+    "caller_repeat_hours": 6,
+    # #1039: how often a finished live call opens a STORYLINE the caller
+    # rings back to continue - the hosts remember them by name. 0..1.
+    "story_rate": 0.5,
+    # #1040: how often a talk-radio round, or a record's talk slot, is
+    # simply an advert - the pair doing an ad out of nowhere. Percent.
+    "random_ad_pct": 8,
     # #854: THE CASE BOOK. How often a caller rings about a written case
     # from data/caller_cases.json rather than about whatever the speakbox
     # coughed up; how often the case drawn is a HOT one (heated or
@@ -719,6 +735,9 @@ DEFAULT_DJ = {
     # When the cloning engine cannot keep up, borrow Piper rather than go
     # silent. Off means "always the cloned voice, even if that means gaps".
     "render_relief": True,
+    # #1021: use everything to keep Piper OFF the air - a clone engine
+    # that is up outranks every emergency road; see voicepolicy_*.
+    "avoid_piper": True,
     "sfx_rate": 0.2,
     # Echo and reverb on a line, now and then (#222). Rate is how often; the
     # two depths are the range it is drawn between, so it is never the same
@@ -903,6 +922,23 @@ DEFAULT_DJ = {
     # ordinary rhythm and below the three-minute holes that are the
     # fault.
     "talk_quiet_most": 95,
+    # #1022: how many UNAIRED banter rounds a pause banks before the
+    # writer stands down - the larder floor while off air. The reserve
+    # target x prepare hours still applies when it is the larger. Measured
+    # 2026-09-04: the pause after 19:57 wrote two rounds in two hours
+    # because the desk read "assigned"; the first minutes after resume
+    # must come off the shelf, not the model.
+    "pause_bank_rounds": 12,
+    # #1034: THE SEAT WATCH. When one presenter has carried a swath alone
+    # - the other seat silent for this many aired lines, or this many
+    # minutes - the silent one says where they went (restroom, coffee,
+    # a smoke, the vending machine, the transmitter) and comes back
+    # after seat_away_minutes (2..6). seat_breaks is the whole feature's
+    # switch.
+    "seat_breaks": True,
+    "seat_quiet_lines": 6,
+    "seat_quiet_minutes": 6,
+    "seat_away_minutes": 4,
     # #1045: the ONE context size every model call loads at. Changing it
     # rebuilds both runners once; leaving it alone is what stops them
     # rebuilding sixty times an hour.
@@ -988,6 +1024,11 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "conversation_memory": True,
     "long_term_memory": True,
     "openwebui_logging": True,
+    # #1025: where "save out the last five minutes" lands, besides the
+    # cut tray. Relative to the station's data folder (only /app is
+    # writable from the container); see export_resolve for the forms
+    # the operator may speak.
+    "export_dir": "data/export/broadcasts",
     # #788: the wake words the box listens for after the button, each
     # routing somewhere — "webui" (the LLM with its tools) or "dj" (the
     # booth: requests + phone-in topics). Manageable from the panel: turn
@@ -1378,6 +1419,20 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "caller_success_rate": max(0, min(100, int(
             raw_dj.get("caller_success_rate",
                        DEFAULT_DJ["caller_success_rate"]) or 0))),
+        # #1033/#1039/#1040: the caller floor, the re-air window, the
+        # storyline rate and the random ad roll. Clamped here or they
+        # vanish on the next save (see the #854 note below).
+        "caller_bank_floor": max(0, min(30, int(
+            raw_dj.get("caller_bank_floor",
+                       DEFAULT_DJ["caller_bank_floor"]) or 0))),
+        "caller_repeat_hours": max(6.0, min(10.0, float(
+            raw_dj.get("caller_repeat_hours",
+                       DEFAULT_DJ["caller_repeat_hours"]) or 6))),
+        "story_rate": max(0.0, min(1.0, float(
+            raw_dj.get("story_rate", DEFAULT_DJ["story_rate"]) or 0))),
+        "random_ad_pct": max(0, min(100, int(
+            raw_dj.get("random_ad_pct",
+                       DEFAULT_DJ["random_ad_pct"]) or 0))),
         "caller_insanity": max(0, min(100, int(
             raw_dj.get("caller_insanity",
                        DEFAULT_DJ["caller_insanity"]) or 0))),
@@ -1457,6 +1512,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         ][:20],
         "render_relief": bool(raw_dj.get(
             "render_relief", DEFAULT_DJ["render_relief"])),
+        "avoid_piper": bool(raw_dj.get(                             # #1021
+            "avoid_piper", DEFAULT_DJ["avoid_piper"])),
         "sfx_rate": max(0.0, min(1.0, float(
             raw_dj.get("sfx_rate", DEFAULT_DJ["sfx_rate"]) or 0))),
         "fx_rate": max(0.0, min(1.0, float(
@@ -1521,6 +1578,24 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "talk_quiet_most": max(30, min(600, int(                  # #1088
             raw_dj.get("talk_quiet_most",
                        DEFAULT_DJ["talk_quiet_most"]) or 95))),
+        "pause_bank_rounds": max(0, min(60, int(                  # #1022
+            raw_dj.get("pause_bank_rounds",
+                       DEFAULT_DJ["pause_bank_rounds"]) or 0))),
+        # #1034: the seat watch - lines/minutes a seat may sit silent
+        # behind the other before it is sent on a break, and how long
+        # the break runs. The away span is clamped to the 2..6 minutes
+        # the request names.
+        "seat_breaks": bool(raw_dj.get("seat_breaks",
+                                       DEFAULT_DJ["seat_breaks"])),
+        "seat_quiet_lines": max(2, min(40, int(
+            raw_dj.get("seat_quiet_lines",
+                       DEFAULT_DJ["seat_quiet_lines"]) or 6))),
+        "seat_quiet_minutes": max(1, min(60, int(
+            raw_dj.get("seat_quiet_minutes",
+                       DEFAULT_DJ["seat_quiet_minutes"]) or 6))),
+        "seat_away_minutes": max(2, min(6, int(
+            raw_dj.get("seat_away_minutes",
+                       DEFAULT_DJ["seat_away_minutes"]) or 4))),
         "model_ctx": max(2048, min(131072, int(                    # #1045
             raw_dj.get("model_ctx", DEFAULT_DJ["model_ctx"]) or 0)
             or DEFAULT_DJ["model_ctx"])),
@@ -1648,6 +1723,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "read_back_prompts": bool(data.get("read_back_prompts", True)),
         "conversation_memory": bool(data.get("conversation_memory", True)),
         "long_term_memory": bool(data.get("long_term_memory", True)),
+        "export_dir": str(data.get("export_dir")
+                          or "data/export/broadcasts").strip()[:400],  # #1025
         "openwebui_logging": bool(data.get("openwebui_logging", True)),
         "wake": validate_wake(data.get("wake")),
         # #894/#832: gemma4 carries 131072; clamping the SETTING to
@@ -2965,6 +3042,42 @@ TE_WEAK_NAMES = {
     "field kit", "field recorder", "field mixer", "cloud speaker", "sampler",
     "mega man", "street fighter", "rick and morty", "pocket operator ko",
 }
+# #1026: spoken names the index does not carry yet. data/te/index.json is
+# built on the host by te_build.py and its ep-136 row knows only "ep136", so
+# "tell me about the sidekick EQ" fell through to a web search while the
+# whole sidekick section (pages 21-29) sat in doc.json. Merged into
+# _te_names so the guide is found whether or not the index has been
+# rebuilt; keep these OUT of TE_WEAK_NAMES or they would need a brand word.
+TE_EXTRA_ALIASES: dict[str, list[str]] = {
+    "ep-136": ["sidekick", "ko sidekick", "k.o. sidekick", "the sidekick",
+               "sidekick mixer", "sidekick eq", "eq knobs", "ep136",
+               "ep 136", "ep-136 sidekick"],
+}
+# Web-guide ingestion leaks the site's navigation as pages ("previous",
+# "index", "next", "checkout menu"); a section never includes them.
+TE_NAV_HEADINGS = {"previous", "index", "next", "checkout menu", "divider",
+                   "menu", "back", "home"}
+# Two-letter control names the topic filter used to throw away: "the EQ
+# knobs" question arrived with no topic words at all (#1026).
+TE_SHORT_WORDS = {"eq", "fx", "io", "cv", "ko", "op", "po", "bpm", "usb",
+                  "lfo", "adsr", "midi"}
+TE_MANUAL_WORDS = re.compile(
+    r"\b(manual|guide|handbook|user guide|documentation|docs?)\b", re.I)
+# "show me the sidekick manual", "pull up the EQ page", "peruse the guide",
+# "let me see the colour pages": a DISPLAY order, imperative-verb gated
+# (#1154: the mic hears the show, so a bare noun never counts).
+TE_MANUAL_SHOW = re.compile(
+    r"^(?:(?:hey|ok|okay|please|so|right|can you|could you|would you|"
+    r"i want to|i'?d like to|let'?s)[,\s]+)*(?:pine ?box[,\s]+)?"
+    r"(?:show(?: me)?|open(?: up)?|pull up|bring up|display|read(?: me)?|"
+    r"let me (?:see|read|peruse|browse)|peruse|browse|look at|take me to|"
+    r"give me|get me|find(?: me)?|splash|flash|put up|see)\b.{0,50}"
+    r"\b(?:manual|guide|handbook|documentation|docs?|pages?|section|"
+    r"chapter|diagrams?|colou?r pages?|figures?)\b", re.I)
+# "the EQ page" / "the gain knob section" on its own, within the sticky window.
+TE_MANUAL_BARE = re.compile(
+    r"^(?:the\s+)?[a-z0-9][a-z0-9 .'-]{1,40}?\s+(?:page|pages|section|"
+    r"chapter)\s*[.!]?$", re.I)
 
 _TE_LOCK = RLock()
 _TE_CACHE: dict[str, Any] = {"stamp": 0.0, "devices": [], "docs": {}}
@@ -3071,7 +3184,12 @@ def te_self_page_svg(doc: dict[str, Any], page: dict[str, Any]) -> str:
 def _te_names(device: dict[str, Any]) -> list[str]:
     slug = device["slug"]
     names = [slug, slug.replace("-", " "), slug.replace("-", "")]
-    return names + [a.lower() for a in device.get("aliases", [])]
+    names += [a.lower() for a in device.get("aliases", [])]
+    # #1026: the code-side aliases, deduplicated against the index's own.
+    for extra in TE_EXTRA_ALIASES.get(slug, []):
+        if extra.lower() not in names:
+            names.append(extra.lower())
+    return names
 
 
 def te_match_device(text: str) -> dict[str, Any] | None:
@@ -3094,7 +3212,217 @@ def te_match_device(text: str) -> dict[str, Any] | None:
 
 def te_topic_words(text: str) -> list[str]:
     words = re.findall(r"[a-z0-9]+", text.lower())
-    return [w for w in words if w not in TE_STOPWORDS and len(w) > 2]
+    # #1026: "eq" and "fx" are control names, not noise.
+    return [w for w in words if w not in TE_STOPWORDS
+            and (len(w) > 2 or w in TE_SHORT_WORDS)]
+
+
+def te_real_pages(doc: dict[str, Any]) -> list[dict[str, Any]]:
+    """#1026: the pages that are pages - text or a figure, and not the
+    navigation chrome a web guide leaks in as 'previous' / 'index'."""
+    out = []
+    for pg in (doc or {}).get("pages") or []:
+        heading = " ".join(str(pg.get("heading") or "").lower().split())
+        if heading in TE_NAV_HEADINGS:
+            continue
+        if not (str(pg.get("text") or "").strip() or pg.get("image")
+                or pg.get("images")):
+            continue
+        out.append(pg)
+    return out
+
+
+def _te_url_tail(page: dict[str, Any]) -> str:
+    """The last path segment of a page's source url as words -
+    'getting-to-know-your-sidekick' -> 'getting to know your sidekick'."""
+    url = str(page.get("source_url") or "").rstrip("/")
+    tail = url.rsplit("/", 1)[-1] if "/" in url else ""
+    return " " + re.sub(r"[^a-z0-9]+", " ", tail.lower()).strip() + " "
+
+
+def te_section_words(doc: dict[str, Any], text: str) -> list[str]:
+    """#1026: words of the question that NAME a part of this manual - a
+    heading word or a word of a sub-page's url. 'sidekick' is a device
+    alias, so te_lookup strips it from the topic words and 'tell me about
+    the sidekick' opened the guide at page one; here it finds the section
+    whose url is /getting-to-know-your-sidekick."""
+    words = re.findall(r"[a-z0-9]+", str(text or "").lower())
+    slug_bits = set(re.findall(r"[a-z0-9]+", str(doc.get("slug") or "")))
+    heads = " ".join(
+        " " + str(pg.get("heading") or "").lower() + " " + _te_url_tail(pg)
+        for pg in te_real_pages(doc))
+    out: list[str] = []
+    for w in words:
+        if w in TE_STOPWORDS or w in slug_bits or w in out:
+            continue
+        if len(w) < 2 or (len(w) < 3 and w not in TE_SHORT_WORDS):
+            continue
+        if f" {w} " in heads:
+            out.append(w)
+    return out
+
+
+def te_section_pages(doc: dict[str, Any], words: list[str],
+                     most: int = 12) -> list[dict[str, Any]]:
+    """#1026: the WHOLE section the words point at, not the best four
+    pages. A web guide's section is the run of pages sharing one
+    source_url (the sidekick sub-page is nine of them); a PDF's is the
+    best page and its neighbours. Topical pages elsewhere in the manual
+    ride along. Empty when nothing scores."""
+    real = te_real_pages(doc)
+    if not real or not words:
+        return []
+    scored: list[tuple[float, dict[str, Any]]] = []
+    for pg in real:
+        score = _te_page_score(pg, words)
+        tail = _te_url_tail(pg)
+        score += sum(2.0 for w in words if f" {w} " in tail)
+        heading = " " + str(pg.get("heading") or "").lower() + " "
+        score += sum(1.0 for w in words if f" {w} " in heading)
+        if score > 0:
+            scored.append((score, pg))
+    if not scored:
+        return []
+    scored.sort(key=lambda p: -p[0])
+    best = scored[0][1]
+    chosen: list[dict[str, Any]] = []
+    url = str(best.get("source_url") or "")
+    group = [pg for pg in real if url and pg.get("source_url") == url]
+    if len(group) >= 2:
+        chosen = list(group)
+    else:
+        here = int(best.get("n") or 0)
+        chosen = [pg for pg in real
+                  if abs(int(pg.get("n") or 0) - here) <= 3]
+    seen = {id(pg) for pg in chosen}
+    for score, pg in scored:
+        if id(pg) in seen:
+            continue
+        heading = " " + str(pg.get("heading") or "").lower() + " "
+        if any(f" {w} " in heading for w in words):
+            chosen.append(pg)
+            seen.add(id(pg))
+    chosen.sort(key=lambda pg: int(pg.get("n") or 0))
+    if len(chosen) > most:
+        # Keep the section around the best page rather than the head of it.
+        at = next((i for i, pg in enumerate(chosen) if pg is best), 0)
+        lo = max(0, min(at - most // 2, len(chosen) - most))
+        chosen = chosen[lo:lo + most]
+    return chosen
+
+
+def _te_page_row(doc: dict[str, Any], page: dict[str, Any],
+                 words: list[str], score: float = 0.0) -> dict[str, Any]:
+    """One page in the shape te_lookup returns, plus every figure (#1026)."""
+    images = [str(x) for x in (page.get("images") or []) if x]
+    image = str(page.get("image") or "") or (images[0] if images else "")
+    if image and image not in images:
+        images.insert(0, image)
+    return {
+        "n": page.get("n", 0),
+        "heading": page.get("heading", ""),
+        "text": page.get("text", ""),
+        "image": image,
+        "images": images,
+        "borrowed_art": False,
+        "snip": _te_snip(page, words),
+        "score": round(float(score), 2),
+        "source_url": page.get("source_url", ""),
+    }
+
+
+def te_section_lookup(text: str) -> dict[str, Any] | None:
+    """#1026: resolve a display order to a device and the whole relevant
+    section - te_lookup's shape with more pages, so te_feed_push and the
+    panel take it unchanged. The device is the one named, else the sticky
+    one. No topic words: the guide's first real pages."""
+    device = te_match_device(text)
+    if device is None:
+        if time.time() - _TE_LAST["ts"] > TE_STICKY_SECONDS:
+            return None
+        device = next(
+            (d for d in te_devices() if d["slug"] == _TE_LAST["slug"]), None)
+        if device is None:
+            return None
+    doc = te_doc(device["slug"])
+    if not doc:
+        return None
+    names = set(_te_names(device))
+    words = [w for w in te_topic_words(text) if w not in names]
+    for w in te_section_words(doc, text):
+        if w not in words:
+            words.append(w)
+    pages = te_section_pages(doc, words) if words else []
+    if not pages:
+        pages = te_real_pages(doc)[:8]
+    if not pages:
+        return None
+    _TE_LAST.update({"slug": device["slug"], "ts": time.time()})
+    return {
+        "slug": device["slug"],
+        "title": doc.get("title", device["slug"]),
+        "source": doc.get("source", ""),
+        "page_size": doc.get("page_size", {}),
+        "dpi": doc.get("dpi", 100),
+        "page_bg": doc.get("page_bg", ""),
+        "topic": " ".join(words[:6]),
+        "section": True,
+        "pages": [_te_page_row(doc, pg, words) for pg in pages],
+    }
+
+
+def te_manual_intent(text: str) -> dict[str, Any] | None:
+    """#1026: 'show me the sidekick manual', 'pull up the EQ page', 'let me
+    peruse the guide' - a DISPLAY order. Returns the section hit to push to
+    the feed, or None. Imperative-verb gated: the bare 'the EQ page' shape
+    is honoured only inside the sticky window of a manual already open,
+    and a device must be named or sticky either way."""
+    said = " ".join(str(text or "").split())
+    if len(said) < 6 or len(said) > 200 or said.endswith("?"):
+        return None
+    if not te_devices():
+        return None
+    shown = bool(TE_MANUAL_SHOW.search(said))
+    bare = bool(TE_MANUAL_BARE.match(said)) and (
+        time.time() - _TE_LAST["ts"] <= TE_STICKY_SECONDS)
+    if not (shown or bare):
+        return None
+    try:
+        if parse_paper_command(said):
+            return None             # "read me the front page" is the Gazette
+    except Exception:  # noqa: BLE001
+        pass
+    if te_match_device(said) is None and not (
+            _TE_LAST["slug"]
+            and time.time() - _TE_LAST["ts"] <= TE_STICKY_SECONDS):
+        return None
+    # #1154: a display order wrapped in a recording is a recording. The
+    # order is the first sentence; anything after it may only be a
+    # pleasantry ("please", "thanks"), never somebody else's words.
+    sentences = [x for x in re.split(r"(?<=[.!?])\s+", said) if x.strip()]
+    _filler = {"please", "now", "ok", "okay", "yeah", "yes", "thanks",
+               "thank", "you", "cheers", "ta", "right", "alright"}
+    for extra in sentences[1:]:
+        if [w for w in re.findall(r"[a-z']+", extra.lower())
+                if w not in _filler]:
+            return None
+    return te_section_lookup(sentences[0] if sentences else said)
+
+
+def te_manual_words(hit: dict[str, Any]) -> str:
+    """What the box SAYS when it has put the pages up (#1026)."""
+    pages = hit.get("pages") or []
+    heads = [str(p.get("heading") or "").strip() for p in pages]
+    heads = [h for h in heads if h][:9]
+    figures = sum(len(p.get("images") or []) for p in pages)
+    where = ("the " + str(hit.get("topic") or "").strip() + " section of "
+             if hit.get("topic") else "")
+    return (f"{where}the {hit.get('title') or hit.get('slug')} is on the "
+            f"panel now - {len(pages)} page{'s' if len(pages) != 1 else ''}"
+            + (f" and {figures} figures" if figures else "")
+            + (": " + ", ".join(heads) if heads else "")
+            + ". Open the doc browser to read them, or ask me about any of "
+              "them.")
 
 
 def _te_page_score(page: dict[str, Any], words: list[str]) -> float:
@@ -3159,8 +3487,16 @@ def te_lookup(text: str) -> dict[str, Any] | None:
         return None
 
     words = [w for w in te_topic_words(text) if w not in set(_te_names(device))]
+    # #1026: an alias that is also a section name ('sidekick') is stripped
+    # above; put it back as the section it names, and let the section's
+    # own pages score on it.
+    for w in te_section_words(doc, text):
+        if w not in words:
+            words.append(w)
     scored = [
-        (_te_page_score(p, words), p) for p in doc["pages"]
+        (_te_page_score(p, words)
+         + sum(2.0 for w in words if f" {w} " in _te_url_tail(p)), p)
+        for p in doc["pages"]
     ] if words else []
     ranked = sorted(
         (pair for pair in scored if pair[0] > 0), key=lambda p: -p[0]
@@ -3205,12 +3541,17 @@ def te_lookup(text: str) -> dict[str, Any] | None:
     for score, page in ranked:
         snip = _te_snip(page, words)
         image = page.get("image", "") or nearest_art(page)
+        # #1026: every figure of the section, not only the first.
+        _images = [str(x) for x in (page.get("images") or []) if x]
+        if page.get("image") and page.get("image") not in _images:
+            _images.insert(0, str(page.get("image")))
         pages.append(
             {
                 "n": page.get("n", 0),
                 "heading": page.get("heading", ""),
                 "text": page.get("text", ""),
                 "image": image,
+                "images": _images,
                 "borrowed_art": not page.get("image") and bool(image),
                 "snip": snip,
                 "score": round(score, 2),
@@ -3234,11 +3575,24 @@ def is_te_query(text: str) -> bool:
         return False
     if te_match_device(text) is not None:
         return True
-    return bool(
-        TE_SHOW.search(text)
-        and _TE_LAST["slug"]
-        and time.time() - _TE_LAST["ts"] <= TE_STICKY_SECONDS
-    )
+    sticky = bool(_TE_LAST["slug"]
+                  and time.time() - _TE_LAST["ts"] <= TE_STICKY_SECONDS)
+    if not sticky:
+        return False
+    if TE_SHOW.search(text):
+        return True
+    # #1026: a generic manual/guide/handbook question, or 'the EQ page',
+    # stays with the manual that is open - the word names a section of it.
+    if TE_MANUAL_WORDS.search(text):
+        return True
+    if re.search(r"\b(page|pages|section|chapter|knobs?|buttons?)\b",
+                 text, re.I):
+        try:
+            return bool(te_section_words(te_doc(_TE_LAST["slug"]) or {},
+                                         text))
+        except Exception:  # noqa: BLE001
+            return False
+    return False
 
 
 def format_te_context(hit: dict[str, Any]) -> str:
@@ -3262,6 +3616,49 @@ def format_te_context(hit: dict[str, Any]) -> str:
         "say so plainly instead of inventing controls.\n\n"
         + "\n\n".join(blocks)
     )
+
+
+def te_section_text(doc: dict[str, Any], page_n: int, question: str,
+                    budget: int = 9000) -> str:
+    """#1026: the text the doc chat reads - the section the question names
+    (every page of it), else the section the selected page sits in, else
+    nothing (the caller falls back to the one page). Bounded."""
+    try:
+        real = te_real_pages(doc)
+        if not real:
+            return ""
+        words = te_topic_words(question)
+        for w in te_section_words(doc, question):
+            if w not in words:
+                words.append(w)
+        chosen = te_section_pages(doc, words) if words else []
+        current = next((p for p in real if p.get("n") == page_n), None)
+        if not chosen and current is not None:
+            url = str(current.get("source_url") or "")
+            group = [p for p in real if url and p.get("source_url") == url]
+            chosen = group if len(group) >= 2 else [
+                p for p in real
+                if abs(int(p.get("n") or 0) - int(page_n)) <= 2]
+        if current is not None and current not in chosen:
+            chosen = [current] + chosen
+        chosen.sort(key=lambda p: int(p.get("n") or 0))
+        blocks: list[str] = []
+        left = int(budget)
+        for pg in chosen:
+            body = " ".join(str(pg.get("text") or "").split())
+            if not body:
+                continue
+            body = body[:max(400, left // max(1, len(chosen)))]
+            label = f"page {pg.get('n')}"
+            if pg.get("heading"):
+                label += f" - {pg.get('heading')}"
+            blocks.append(f"[{label}]\n{body}")
+            left -= len(body)
+            if left <= 0:
+                break
+        return "\n\n".join(blocks)
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def te_blurb(page: dict[str, Any]) -> str:
@@ -3312,6 +3709,7 @@ def te_feed_push(user_text: str, hit: dict[str, Any]) -> None:
                     "n": p["n"],
                     "heading": p["heading"],
                     "image": p["image"],
+                    "images": list(p.get("images") or []),   # #1026
                     "snip": p["snip"],
                     "blurb": te_blurb(p),
                     "source_url": p["source_url"],
@@ -3452,17 +3850,23 @@ def _gpu_temp_blocking() -> dict[str, Any]:
         import subprocess
 
         out = subprocess.run(
-            ["nvidia-smi", "--query-gpu=temperature.gpu",
+            ["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu",
              "--format=csv,noheader,nounits"],
             capture_output=True, text=True, timeout=8)
         for row in (out.stdout or "").strip().splitlines():
+            cells = [c.strip() for c in row.strip().split(",")]
             try:
-                celsius = float(row.strip().split(",")[0])
-            except (TypeError, ValueError):
+                celsius = float(cells[0])
+            except (TypeError, ValueError, IndexError):
                 continue
+            # #1020 (G1): utilisation rides the same call, for the ring.
+            try:
+                util = float(cells[1]) if len(cells) > 1 else 0.0
+            except (TypeError, ValueError):
+                util = 0.0
             if 0 < celsius < 150:
                 return {"c": round(celsius, 1), "zone": "the GPU",
-                        "how": "nvidia-smi"}
+                        "how": "nvidia-smi", "util": round(util, 1)}
     except Exception:  # noqa: BLE001
         pass
     # No utility to ask: the board's own sensors, which are the same silicon
@@ -3489,13 +3893,20 @@ async def gpu_temp_refresh() -> dict[str, Any]:
     """Take a fresh reading in a thread and file it.  Awaitable, but nothing
     on a writing path awaits it — the clock below does."""
     try:
-        got = await asyncio.to_thread(_gpu_temp_blocking)
+        # #1020 (G1): the same thread also reads the board, the load and
+        # the memory - the weather ring wants them and they are file reads.
+        got = await asyncio.to_thread(airlog_heat_blocking)
     except Exception:  # noqa: BLE001
         got = {}
     if got.get("c"):
-        _GPU_TEMP.update(got)
+        _GPU_TEMP.update({k: got[k] for k in ("c", "zone", "how")
+                          if k in got})
     # Stamped either way, so a box with no sensors is not probed every round.
     _GPU_TEMP["at"] = time.time()
+    try:
+        await airlog_heat_sample(got)                        # #1020 (G1)
+    except Exception:  # noqa: BLE001
+        pass
     return dict(_GPU_TEMP)
 
 
@@ -5879,12 +6290,17 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
         bare = _rung_bare or voice
         if _rung_pfx and _rung_pfx not in ("xtts", "f5"):
             rungs.append((voice, _rung_pfx, ""))
-            rungs.append((bare, "xtts",
-                          f"{_rung_pfx} would not render it — the same "
-                          "clone through xtts, identity kept (#794)"))
-            rungs.append((bare, "f5",
-                          f"{_rung_pfx} would not render it — the same "
-                          "clone through f5, identity kept (#794)"))
+            # #1021: the engine the cache says is UP goes first; one it
+            # says is DOWN goes last. xtts stays ahead on a tie.
+            _order = ["xtts", "f5"]
+            if voicepolicy_avoid_piper():
+                _order.sort(key=lambda e: (
+                    0 if voicepolicy_engine_ready(e)
+                    else (2 if voicepolicy_engine_known_down(e) else 1)))
+            for _eng in _order:
+                rungs.append((bare, _eng,
+                              f"{_rung_pfx} would not render it — the same "
+                              f"clone through {_eng}, identity kept (#794)"))
         else:
             clone_engine = _rung_pfx if _rung_pfx in ("xtts", "f5") else (
                 engine if engine in ("xtts", "f5") else str(
@@ -5892,6 +6308,11 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
             pick = str(dj_settings().get("clone_engine") or "")
             if pick in ("xtts", "f5") and not _rung_pfx:
                 clone_engine = pick
+            # #1021: the clone_engine pick above undid whatever the
+            # router decided, so the route-around is applied here too -
+            # a resident engine that is down by its last check is not
+            # the first rung while the other is up.
+            clone_engine = voicepolicy_route_around(clone_engine, who)
             rungs.append((bare, clone_engine, ""))
             other = "f5" if clone_engine == "xtts" else "xtts"
             # #866: under the cast lock the OTHER engine is deliberately
@@ -5899,12 +6320,33 @@ async def voice_render_any(text: str, voice: str, engine: str = "",
             # model to say one line, on a pool the writer already
             # shares. Fall to Piper instead; the cast returns the moment
             # the host's own engine answers.
+            #
+            # #1021: ...except under the avoid-Piper policy, where the
+            # other engine is still tried - as a stand-in, identity kept
+            # - unless its last health check says it is down, in which
+            # case naming it would only wait on a dead socket. This was
+            # the most common road by which a named DJ reached Piper.
             if cast_engine_locked() and other != host_clone_engine():
-                rungs.append((stand_in or "", "piper",
-                              f"{clone_engine} would not render it and "
-                              "the cast is locked to one engine — a "
-                              "stand-in rather than loading a second "
-                              "model (#866)"))
+                if voicepolicy_avoid_piper() \
+                        and not voicepolicy_engine_known_down(other):
+                    rungs.append((bare, other,
+                                  f"{clone_engine} would not render it — "
+                                  f"the same clone through {other} as a "
+                                  "stand-in, identity kept, cast lock or "
+                                  "not (#1021)"))
+                else:
+                    if voicepolicy_avoid_piper():
+                        voicepolicy_say(
+                            f"ladder:{other}:down:{who}",
+                            f"{who or 'line'}: Piper is next on the ladder "
+                            f"after {clone_engine} — {other} is down by its "
+                            "last health check and the cast is locked to "
+                            f"{host_clone_engine()} (#1021)")
+                    rungs.append((stand_in or "", "piper",
+                                  f"{clone_engine} would not render it and "
+                                  "the cast is locked to one engine — a "
+                                  "stand-in rather than loading a second "
+                                  "model (#866)"))
             else:
                 rungs.append((bare, other,
                               f"{clone_engine} would not render it — "
@@ -11917,8 +12359,17 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
         pass
 
 
-def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
+def shelf_take(kind: str, voice: str = "",
+               fresh_only: bool = False) -> dict[str, Any] | None:
     """The oldest prepared item of this kind that is still good.
+
+    #1033: for the phone road the order is UNAIRED first (strict FIFO,
+    as before), then - only when nothing unaired is ready - a call that
+    has been out before and is now inside the re-air window
+    (story_rerun_ok_row: last aired 6..10 hours ago, fewer than three
+    airings). `fresh_only` refuses the second half outright; the phone
+    clock uses it so a due storyline (#1039) can ring BETWEEN the bank
+    and a repeat.
 
     Still inside the 24-hour burn, still written to today's contract,
     and — for a single-line item — with its audio still on the pantry
@@ -11938,10 +12389,18 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
         # priorities remain useful for every other candidate shelf but may not
         # let a newer caller jump an older one.
         if str(kind) == "caller":
-            _order = [row for _i, row in sorted(
+            _fifo = [row for _i, row in sorted(
                 enumerate(rows),
                 key=lambda pair: (float((pair[1] or {}).get("at") or 0),
                                   pair[0]))]
+            # #1033: the unheard queue, then the re-air queue (oldest
+            # airing first, so every repeat gets the longest rest).
+            _order = [r for r in _fifo if row_unaired(r)]
+            if not fresh_only:
+                _order += sorted(
+                    [r for r in _fifo
+                     if not row_unaired(r) and story_rerun_ok_row(r)],
+                    key=lambda r: float(r.get("aired_at") or 0))
         else:
             _order = list(alt_take_order(kind, rows))
         # #968: ON BRIEF FIRST. A round that never gets to the thing its
@@ -11976,7 +12435,14 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
             # #977: it has been out; has it rested long enough?
             _out_at = float(row.get("aired_at") or 0)
             if _out_at:
-                if str(kind) not in SHELF_REUSABLE:
+                if str(kind) == "caller":
+                    # #1033: a call may go out again inside the window
+                    # the operator asked for (6-10h, under three
+                    # airings). Outside it, it waits or is swept.
+                    if fresh_only or not story_rerun_ok_row(row):
+                        _why.append("outside the re-air window")
+                        continue
+                elif str(kind) not in SHELF_REUSABLE:
                     _why.append("already aired")
                     continue        # should not be here at all
                 if int(row.get("aired") or 0) >= shelf_innings(kind):
@@ -12007,7 +12473,26 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 _why.append("contract moved")
                 continue            # written against a contract that moved
             try:
-                if (str(kind) in SHELF_REUSABLE
+                if str(kind) == "caller":
+                    # #1033: "store phone calls longer... repeat call-ins
+                    # within 6-10h if needed." An aired call is KEPT on
+                    # the shelf, stamped with when it went out and how
+                    # many times (uses/last_aired mirror aired/aired_at
+                    # for the panel and the paper), and the order above
+                    # offers it again only inside the window and only
+                    # when nothing unaired is ready. The #1151 rule
+                    # stands: the unaired rows ahead of it never burn.
+                    row["aired_at"] = time.time()
+                    row["aired"] = int(row.get("aired") or 0) + 1
+                    row["last_aired"] = row["aired_at"]
+                    row["uses"] = int(row["aired"])
+                    rows[:] = ([r for r in rows if r is not row] + [row])
+                    if int(row["aired"]) > 1:
+                        pipeline_log("call", "a call recorded earlier is "
+                                     "going out AGAIN - airing "
+                                     f"{row['aired']} of {CALL_RERUN_MOST}, "
+                                     "nothing unaired was ready (#1033)")
+                elif (str(kind) in SHELF_REUSABLE
                         and repeat_safe(str(kind), row)):
                     # #977: KEPT, not consumed. It goes to the back of the
                     # shelf stamped with when it went out and how many
@@ -12076,7 +12561,11 @@ def shelf_take(kind: str, voice: str = "") -> dict[str, Any] | None:
                 # cannot occupy the queue or be offered as a "new" call
                 # after restart.
                 and (not float(r.get("aired_at") or 0)
-                     or str(kind) in SHELF_REUSABLE))]
+                     or str(kind) in SHELF_REUSABLE
+                     # #1033: an aired call is stock until its window
+                     # closes or its airings are spent.
+                     or (str(kind) == "caller"
+                         and story_rerun_keep_row(r))))]
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -12099,6 +12588,17 @@ def prepared_by_kind() -> dict[str, int]:
         "banter": sum(1 for e in _LARDER
                       if dialogue_row_ready("banter", e))}
     for kind in SHELF_CAPS:
+        if str(kind) == "caller":
+            # #1033/#1089: an aired call is kept on the shelf, but the
+            # take only hands it back inside its re-air window. Counting
+            # the rest as ready supply is a board planning around
+            # material the shelf will refuse - the round is drawn, the
+            # take fails and the call is written and rendered live.
+            out[kind] = sum(1 for row in (_SHELF.get(kind) or [])
+                            if dialogue_row_ready("caller", row)
+                            and (not row.get("aired_at")
+                                 or story_rerun_ok_row(row)))
+            continue
         out[kind] = sum(1 for row in (_SHELF.get(kind) or [])
                         if dialogue_row_ready(str(kind), row))
     # Track-talk is record-bound rather than shelf-bound. Leaving it out made
@@ -12153,12 +12653,19 @@ def calls_wanted() -> int:
 
 
 def calls_short() -> int:
-    """How far the caller shelf is from covering the hour's quota."""
+    """How far the caller shelf is from covering the hour's quota.
+
+    #1033: ...or the caller bank floor, whichever is higher, and counted
+    in calls that are FINISHED and have NEVER AIRED. It used to count
+    every row on the shelf, which after #1033 includes calls that have
+    been out and are only waiting for their re-air window - those are a
+    fallback, not cover, and counting them let the keeper stand down on
+    a shelf of repeats."""
     try:
-        want = calls_wanted()
+        want = max(int(calls_wanted() or 0), int(story_caller_floor()))
         if not want:
             return 0
-        return max(0, want - len(_SHELF.get("caller") or []))
+        return max(0, want - story_bank_unaired())
     except Exception:  # noqa: BLE001
         return 0
 
@@ -13195,6 +13702,8 @@ def prep_plan(skip: Any = None) -> dict[str, Any]:
                                     and bool(_assigned_unready))
                 if kind in _short_now:
                     _needs_script = True        # #1131: the hour says so
+                if kind == "caller" and story_bank_short():
+                    _needs_script = True        # #1033: the caller floor
                 if not _needs_script and not _can_finish_here:
                     _off[kind] = ("every second owed in the next four hours "
                                   "is already assigned to FIFO stock")
@@ -14270,13 +14779,48 @@ def voice_aired(vid: str, who: str = "a caller") -> None:
             pass
 
 
+# #1022: voice_meta / _voice_json read three JSON files per LINE of every
+# larder_prepare (performance_vector -> voice_meta, voice_signature,
+# voice_style) - the pulse ledger has them at 29 stalls for 54s in one
+# evening. Memoised per (voice, file) on the file's mtime with a
+# five-second memory, so a re-saved voice is seen within seconds.
+_VOICE_JSON_MEMO: dict[tuple[str, str], tuple[float, int, Any]] = {}
+
+
+def _voice_json_cached(vid: str, name: str) -> dict[str, Any] | None:
+    # Callers WRITE into what this returns (voices_update fills in the
+    # name, engine, speed and pitch before voice_save; the internalize
+    # card path sets style["card"]). A shared dict would keep those
+    # writes even when the save failed and the file on disk never moved,
+    # so every caller gets its own copy.
+    _now = time.time()
+    key = (str(vid), str(name))
+    hit = _VOICE_JSON_MEMO.get(key)
+    if hit is not None and _now - hit[0] < 5.0:
+        return copy.deepcopy(hit[2])
+    path = VOICES_DIR / vid / name
+    try:
+        mtime = path.stat().st_mtime_ns
+    except Exception:
+        _VOICE_JSON_MEMO[key] = (_now, 0, None)
+        return None
+    if hit is not None and hit[1] == mtime:
+        _VOICE_JSON_MEMO[key] = (_now, mtime, hit[2])
+        return copy.deepcopy(hit[2])
+    try:
+        got = json.loads(path.read_text())
+    except Exception:
+        got = None
+    if len(_VOICE_JSON_MEMO) > 2000:
+        _VOICE_JSON_MEMO.clear()
+    _VOICE_JSON_MEMO[key] = (_now, mtime, got)
+    return copy.deepcopy(got)
+
+
 def voice_meta(vid: str) -> dict[str, Any] | None:
     if not VOICE_ID_SHAPE.match(vid or ""):
         return None
-    try:
-        return json.loads((VOICES_DIR / vid / "meta.json").read_text())
-    except Exception:
-        return None
+    return _voice_json_cached(vid, "meta.json")               # #1022
 
 
 def voice_ref_path(vid: str) -> Path | None:
@@ -14289,10 +14833,7 @@ def voice_ref_path(vid: str) -> Path | None:
 def _voice_json(vid: str, name: str) -> dict[str, Any] | None:
     if not VOICE_ID_SHAPE.match(vid or ""):
         return None
-    try:
-        return json.loads((VOICES_DIR / vid / name).read_text())
-    except Exception:
-        return None
+    return _voice_json_cached(vid, name)                       # #1022
 
 
 def voice_signature(vid: str) -> dict[str, Any] | None:
@@ -14497,6 +15038,309 @@ def split_engine_voice(voice: str) -> tuple[str, str]:
     return "", v
 
 
+# --- #1021: THE AVOID-PIPER POLICY ---------------------------------------
+# "Use everything to avoid Piper voices on the radio; prefer F5 or XTTS."
+#
+# Every policy in this file pushed TOWARD Piper: the #1080 stop-gap, the
+# #1087 commit verdict, the #1092 authorisations, the #1109 probe, the
+# #784 relief latch, the #866 cast-lock rung and the ladder's stand-in
+# rungs. Not one pulled the other way, and on a healthy night the probe
+# alone put callers, news and adverts on Piper for half an hour at a
+# time. This is the policy that pulls the other way. It is a dial
+# (dj.avoid_piper, on by default) so the operator can hand the emergency
+# roads back when a night needs them, and it reads ONLY the 30-second
+# health caches - never a probe on the render path, because a router
+# that waits on a socket is a router that stalls the show.
+#
+# What it holds while it is on:
+#   - a clone engine that is up beats every seat-based Piper override;
+#     Piper is the answer only when BOTH clone engines are down;
+#   - a clone whose engine fails tries the OTHER clone engine before any
+#     Piper rung, cast lock or not - the reference is the identity, and
+#     one line on the other model is a stand-in, not a recast;
+#   - callers, the third seat, the manager and the officer outside draw
+#     library clones whenever either engine answers, and they draw them
+#     every time, not clone_caller_pct of the time;
+#   - the emergency takes (piper_authorise, piper_probe, the board's
+#     "piper" commit through may_take_on_piper) are refused unless both
+#     engines are down, or the road is hour-short AND the box is nearly
+#     empty (box_depth below VOICEPOLICY_BOX_EMPTY);
+#   - the relief stand-in borrows the other clone engine before a bench
+#     engine, and a bench engine before Piper;
+#   - the gap cover prefers a clone-voiced seat.
+# The ('', 'piper') floor rung is untouched: while Piper answers,
+# something is spoken. Every branch that still lands on Piper says why
+# on the voice log, throttled so a busy night reads as a signal.
+VOICEPOLICY_BOX_EMPTY = 0.15
+VOICEPOLICY_LOG_EVERY = 120.0
+_VOICEPOLICY_SAID: dict[str, float] = {}
+_VOICEPOLICY_EXC: dict[str, tuple[float, str]] = {}
+
+
+def voicepolicy_avoid_piper() -> bool:
+    """#1021: is the avoid-Piper policy on? dj.avoid_piper, default True."""
+    try:
+        return bool(dj_settings().get("avoid_piper",
+                                      DEFAULT_DJ.get("avoid_piper", True)))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def voicepolicy_say(key: str, msg: str, extra: str = "",
+                    every: float = VOICEPOLICY_LOG_EVERY) -> None:
+    """#1021: one line per reason per couple of minutes on the voice log.
+    The router runs on every line and every pantry key; unthrottled it
+    would bury the log it is meant to inform."""
+    try:
+        now = time.time()
+        if now - float(_VOICEPOLICY_SAID.get(key) or 0) < every:
+            return
+        _VOICEPOLICY_SAID[key] = now
+        if len(_VOICEPOLICY_SAID) > 400:
+            for old in sorted(_VOICEPOLICY_SAID,
+                              key=_VOICEPOLICY_SAID.get)[:200]:
+                _VOICEPOLICY_SAID.pop(old, None)
+        pipeline_log("voice", msg, extra=extra)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _voicepolicy_slot(engine: str) -> dict[str, Any]:
+    if engine == "xtts":
+        return _XTTS_HEALTH
+    if engine == "f5":
+        return _F5_HEALTH
+    return _ENGINE_HEALTH.get(engine) or {}
+
+
+def voicepolicy_engine_ready(engine: str) -> bool:
+    """#1021: cached health only - a sync hint, read the way
+    _ready_standin_engine reads it. Never probes."""
+    try:
+        return bool(_voicepolicy_slot(engine).get("ready"))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def voicepolicy_engine_known_down(engine: str, within: float = 120.0) -> bool:
+    """#1021: probed recently and NOT ready - the one case worth not even
+    trying. An engine nobody has asked about lately is not 'down', it is
+    unknown, and unknown gets a rung."""
+    try:
+        slot = _voicepolicy_slot(engine)
+        at = float(slot.get("at") or 0)
+        return bool(at) and not slot.get("ready") \
+            and time.time() - at <= within
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def voicepolicy_other_clone(engine: str) -> str:
+    return "f5" if engine == "xtts" else ("xtts" if engine == "f5" else "")
+
+
+def voicepolicy_clone_order() -> list[str]:
+    """xtts and f5, the station's resident engine first."""
+    try:
+        pick = str(dj_settings().get("clone_engine") or "")
+    except Exception:  # noqa: BLE001
+        pick = ""
+    first = pick if pick in ("xtts", "f5") else "xtts"
+    return [first, voicepolicy_other_clone(first)]
+
+
+def voicepolicy_clones_ready() -> list[str]:
+    """#1021: the clone engines whose cached health says ready, resident
+    first. Empty means both are down - the only state in which the
+    policy lets a seat go to Piper."""
+    return [e for e in voicepolicy_clone_order() if voicepolicy_engine_ready(e)]
+
+
+def voicepolicy_clones_down() -> bool:
+    return not voicepolicy_clones_ready()
+
+
+def voicepolicy_holds() -> bool:
+    """#1021: the policy is on AND a clone engine is up - the state in
+    which every seat-based push toward Piper is refused."""
+    return voicepolicy_avoid_piper() and not voicepolicy_clones_down()
+
+
+async def voicepolicy_clone_engine_up() -> bool:
+    """#1021: the caller roads' supply gate - is a clone engine answering?
+    Under the policy EITHER engine counts (both 30 s caches), which ends
+    the F5-only nights on which every new caller was a Piper voice. With
+    the policy off the old XTTS-only gate stands (#457/#913), because a
+    clone drawn for a dead resident engine only fails toward Piper."""
+    try:
+        if bool((await xtts_health())["ready"]):
+            return True
+        if voicepolicy_avoid_piper():
+            return bool((await f5_health())["ready"])
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+async def voicepolicy_clone_pool_async() -> list[str]:
+    """#1021: the library clones a guest voice may take, or nothing when
+    no clone engine answers."""
+    try:
+        return caller_clone_pool() if await voicepolicy_clone_engine_up() \
+            else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def voicepolicy_clone_pool() -> list[str]:
+    """#1021: the sync twin, off the caches, for seats drawn without an
+    await."""
+    try:
+        if voicepolicy_avoid_piper():
+            return caller_clone_pool() if voicepolicy_clones_ready() else []
+        return caller_clone_pool() if voicepolicy_engine_ready("xtts") else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def voicepolicy_route_around(engine: str, who: str = "") -> str:
+    """#1021: a clone engine the cache says is DOWN is not tried first
+    while the other is UP. The router and the ladder both ask this, so a
+    dead resident engine costs nothing per line instead of one refused
+    connection (or, wedged, a 150 s timeout) before every fallback."""
+    if not voicepolicy_avoid_piper() or engine not in ("xtts", "f5"):
+        return engine
+    other = voicepolicy_other_clone(engine)
+    if voicepolicy_engine_known_down(engine) and voicepolicy_engine_ready(other):
+        voicepolicy_say(f"around:{engine}:{who}",
+                        f"{who or 'line'}: {engine} is down by its last "
+                        f"health check and {other} is up - the clone "
+                        f"renders on {other} as a stand-in rather than "
+                        "failing toward Piper (#1021)")
+        return other
+    return engine
+
+
+def voicepolicy_relief_engine(engine: str, who: str = "") -> str:
+    """#1021 (g): render relief wants a FAST stand-in for a slow clone.
+    Under the policy the borrow order is: the other clone engine if it is
+    up, then a bench preset (Kokoro, CosyVoice...), then - only when both
+    clone engines are down - Piper. If the slow engine is the only thing
+    up, it stays on the slow engine and says so: late beats Piper here."""
+    if not voicepolicy_avoid_piper():
+        return _ready_standin_engine()
+    other = voicepolicy_other_clone(engine)
+    if other and voicepolicy_engine_ready(other):
+        voicepolicy_say(f"relief:{other}:{who}",
+                        f"{who or 'line'}: {engine} is slow - relief "
+                        f"borrows {other}, the other clone engine, before "
+                        "any preset (#1021)")
+        return other
+    standin = _ready_standin_engine()
+    if standin != "piper":
+        return standin
+    if voicepolicy_engine_ready(engine):
+        voicepolicy_say(f"relief:stay:{engine}:{who}",
+                        f"{who or 'line'}: {engine} is slow and relief "
+                        "asked for a stand-in, but the only one up is "
+                        f"Piper - staying on {engine} under the "
+                        "avoid-Piper policy (#1021)")
+        return engine
+    voicepolicy_say(f"relief:piper:{who}",
+                    f"{who or 'line'}: Piper for the relief stand-in - "
+                    "both clone engines are down and no bench engine is "
+                    "up (#1021)")
+    return "piper"
+
+
+def voicepolicy_piper_exception(road: str) -> str:
+    """#1021 (e): '' while the policy refuses an emergency Piper take on
+    this road; otherwise WHY one is allowed - both clone engines down, or
+    the road hour-short with the box nearly empty. Memoised ten seconds
+    per road: the commit board asks per row and box_depth walks the
+    pantry."""
+    try:
+        if not voicepolicy_avoid_piper():
+            return "the avoid-Piper policy is off"
+        key = str(road or "")
+        now = time.time()
+        held = _VOICEPOLICY_EXC.get(key)
+        if held and now - float(held[0]) < 10:
+            return held[1]
+        why = ""
+        if voicepolicy_clones_down():
+            why = "both clone engines are down"
+        else:
+            try:
+                depth = float(box_depth())
+            except Exception:  # noqa: BLE001
+                depth = -1.0
+            if 0 <= depth < VOICEPOLICY_BOX_EMPTY:
+                try:
+                    needs = hour_needs_now()
+                except Exception:  # noqa: BLE001
+                    needs = {}
+                base = key
+                try:
+                    base = str(SCHED_PREP_KIND.get(key) or key)
+                except Exception:  # noqa: BLE001
+                    pass
+                base = base.rstrip("0123456789") or base   # caller2 -> caller
+                row = needs.get(base) or needs.get(key) or {}
+                gap = float(row.get("owed") or 0) - float(row.get("held") or 0)
+                if row and gap > 0:
+                    why = (f"{base} is hour-short by {int(gap)}s and the "
+                           f"box is nearly empty (depth {depth:.2f})")
+        _VOICEPOLICY_EXC[key] = (now, why)
+        if len(_VOICEPOLICY_EXC) > 64:
+            for old in list(_VOICEPOLICY_EXC)[:32]:
+                _VOICEPOLICY_EXC.pop(old, None)
+        return why
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def voicepolicy_preempt(engine: str, voice: str,
+                              who: str = "") -> tuple[str, str]:
+    """#1021: the pre-#784 'the engine is down, go straight to Piper'
+    step that four roads (manager, the officer outside, the ad read, the
+    ad script) still take outside the ladder, taught the policy: the
+    other clone engine takes the same voice first (its 30 s cache), and
+    Piper's default voice stays the floor."""
+    if voicepolicy_avoid_piper() and engine in ("xtts", "f5"):
+        other = voicepolicy_other_clone(engine)
+        try:
+            up = bool((await engine_health(other))["ready"])
+        except Exception:  # noqa: BLE001
+            up = False
+        if up:
+            voicepolicy_say(f"preempt:{other}:{who}",
+                            f"{who or 'line'}: {engine} is not answering - "
+                            f"the same clone goes out through {other} "
+                            "rather than Piper (#1021)")
+            return other, voice
+        voicepolicy_say(f"preempt:piper:{who}",
+                        f"{who or 'line'}: Piper's default voice - "
+                        f"{engine} is down and {other} is not answering "
+                        "either (#1021)")
+    return "piper", _event_voice("default")
+
+
+def voicepolicy_state() -> dict[str, Any]:
+    """#1021: the policy as a glance - for the report and the glass."""
+    try:
+        return {"avoid_piper": voicepolicy_avoid_piper(),
+                "clones_ready": voicepolicy_clones_ready(),
+                "known_down": [e for e in ("xtts", "f5")
+                               if voicepolicy_engine_known_down(e)],
+                "holds": voicepolicy_holds(),
+                "exceptions": {k: v[1] for k, v in _VOICEPOLICY_EXC.items()
+                               if v[1]}}
+    except Exception:  # noqa: BLE001
+        return {"avoid_piper": True, "clones_ready": [], "known_down": [],
+                "holds": False, "exceptions": {}}
+
+
 def voice_engine_for(voice: str, who: str = "") -> str:
     """The voice NAME is the engine router. vl_* ids belong to the library
     (usually xtts), Voxtral preset names to voxtral, everything else is a
@@ -14518,21 +15362,42 @@ def voice_engine_for(voice: str, who: str = "") -> str:
     # still wins above; this only overrides the default routing, and
     # only for the seats named in SPEED_SAFE_SEATS.
     try:
+        # #1021: none of the three overrides below may put a seat on
+        # Piper while a clone engine is up. Each was written for a night
+        # when Piper was the only way to land a segment; under the
+        # avoid-Piper policy that night is "both clone engines are
+        # down", and nothing less. Which one asked is kept for the log.
+        _asked = ""
         if who and speed_seat_to_piper(who):
-            return "piper"
+            _asked = "the #1080 stop-gap"
         # #1087: ...and a segment the board has COMMITTED to an
         # emergency take renders on piper whatever the stop-gap says,
         # because that commitment is the only reason it was attempted
         # at all.
-        if who and commit_for(str(who)) == "piper" and may_take_on_piper(
+        elif who and commit_for(str(who)) == "piper" and may_take_on_piper(
                 str(who)):
-            return "piper"
+            _asked = "the board's #1087 emergency commit"
         # #1092: ...and so does an authorisation granted by cover_now,
         # which is the one place that knows a hole is otherwise certain
         # and has no way to tell the commitment board about it.
-        if who and piper_authorised(str(who)) and may_take_on_piper(
+        elif who and piper_authorised(str(who)) and may_take_on_piper(
                 str(who)):
-            return "piper"
+            _asked = "a #1092 piper authorisation"
+        if _asked:
+            if voicepolicy_holds():
+                voicepolicy_say(
+                    f"override:{who}",
+                    f"{who}: {_asked} asked for Piper and a clone engine "
+                    f"is up ({', '.join(voicepolicy_clones_ready())}) - "
+                    "refused under the avoid-Piper policy (#1021)")
+            else:
+                voicepolicy_say(
+                    f"override:piper:{who}",
+                    f"{who}: Piper - {_asked} asked for it and "
+                    + ("both clone engines are down"
+                       if voicepolicy_avoid_piper()
+                       else "the avoid-Piper policy is off") + " (#1021)")
+                return "piper"
     except Exception:  # noqa: BLE001
         pass
     pinned = role_engine_for(who) if who else ""
@@ -14552,7 +15417,11 @@ def voice_engine_for(voice: str, who: str = "") -> str:
         # phone line, not across the hosts.
         if (who in CAST_SEATS and cast_engine_locked()
                 and engine in ("xtts", "f5")):
-            return host_clone_engine()
+            # #1021: ...unless that engine is down by its last health
+            # check and the other is up - then the cast renders on the
+            # other as a stand-in, identity kept, and comes home the
+            # moment the host's engine answers.
+            return voicepolicy_route_around(host_clone_engine(), who)
         # #726: one switch for the whole library, so both cloning
         # engines can be tried against the same voices without editing
         # sixty meta files. A voice that names a NON-cloning engine
@@ -14563,6 +15432,7 @@ def voice_engine_for(voice: str, who: str = "") -> str:
                 == "clone" and engine in ENGINE_REGISTRY \
                 and ENGINE_REGISTRY[engine]["family"] == "clone":
             engine = pick
+        engine = voicepolicy_route_around(engine, who)          # #1021
         # Measured on this box: 34 seconds of synthesis, on average, for
         # eleven seconds of audio. A station that cannot render as fast as it
         # speaks goes quiet, and quiet is the one thing a stream cannot be.
@@ -14577,10 +15447,21 @@ def voice_engine_for(voice: str, who: str = "") -> str:
         clone_family = engine in ENGINE_REGISTRY and \
             ENGINE_REGISTRY[engine]["family"] == "clone"
         if clone_family and render_relief() and voice not in cast:
-            return _ready_standin_engine()
+            # #1021 (g): the other clone engine before a preset, a
+            # preset before Piper, Piper only with both clones down.
+            return voicepolicy_relief_engine(engine, who)
         return engine if engine in VOICE_FILE_ENGINES else "xtts"
     if voice in VOXTRAL_PRESETS:
         return "voxtral"
+    # #1021: a Piper NAME can only render on Piper. The policy steers
+    # where a voice is CHOSEN (callers, the third seat, the manager, the
+    # officer outside) and on the ladder; a seat that arrives here was
+    # handed a Piper voice by configuration, and the log says so.
+    if voicepolicy_avoid_piper():
+        voicepolicy_say(f"name:{voice}",
+                        f"{who or 'line'}: Piper - '{voice or '(default)'}' "
+                        "is a Piper voice name; the policy can only steer "
+                        "a seat that was given a clone (#1021)", every=600.0)
     return "piper"
 
 
@@ -18027,6 +18908,15 @@ def radio_prompt_instruction(slot: str) -> str:
             lead += plot_clause()
         except Exception:  # noqa: BLE001
             pass            # a broken plotline never silences the booth
+    # #1027: and the operator's STANDING ORDERS, in his own words - on the
+    # same layer and for the same reason: every round the station writes
+    # assembles the host layer, and the caller, gallery and manager
+    # prompts add their own slot. Before the enabled check: an order is
+    # not a prompt override and is never switched off by one.
+    try:
+        lead += operator_lesson_clause(slot)
+    except Exception:  # noqa: BLE001
+        pass                # a broken book never silences the booth
     if not radio_prompt_enabled(slot):
         return lead
     text = str((dj_settings().get("radio_prompt_overrides") or {}).get(slot)
@@ -18051,7 +18941,10 @@ def radio_prompt_desk_state() -> dict[str, Any]:
     control_specs = {
         "host": [("chattiness", "Host model frequency", "range", 0, 100, 1),
                  ("reply_max_chars", "Reply budget", "number", 300, 6500, 100),
-                 ("say_max_seconds", "Statement window", "range", 4, 60, 1)],
+                 ("say_max_seconds", "Statement window", "range", 4, 60, 1),
+                 # #1021: keep Piper off the air while a clone engine is up.
+                 ("avoid_piper", "Avoid Piper voices (prefer XTTS/F5)",
+                  "checkbox", 0, 0, 0)],
         "cohost": [("personality", "Personality influence", "range", 0, 100, 1),
                    ("accent_pin", "Accent influence", "range", 0, 100, 1),
                    ("speech_rate", "Speech rate", "range", 75, 125, 1)],
@@ -18382,6 +19275,12 @@ def show_memory() -> str:
         bits.append(f"{stats['calls']} calls taken tonight")
     if _RADIO.get("last_call"):
         bits.append(f"the last caller: {str(_RADIO['last_call'])[:120]}")
+    try:
+        _story_bit = story_memory_clause()                         # #1039
+        if _story_bit:
+            bits.append(_story_bit)
+    except Exception:  # noqa: BLE001
+        pass
     moods = {who: m for who, m
              in (_RADIO.get("speaker_macro") or {}).items() if m}
     if moods:
@@ -19480,6 +20379,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         "id": line_id,                                            # #742
         "ts": int(time.time()), "who": who, "kind": kind, "text": spoken,
         "air_at": _air_at or time.time(),                          # #770
+        "round": airlog_round_for(kind, who, name),              # #1023 (G1)
         "name": booth_actor_name(who, name),
         # Who said it and what wrote it, on the line itself (#226). Sixty
         # voices and a settable model mean "that one — do that again" is
@@ -20376,7 +21276,12 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
     _ahead_intro = None
     try:
         if (track_talk_on() and not radio_paused() and not track.get("tape")
-                and not track.get("requested")):
+                and not track.get("requested")
+                # #1034: the prepared intro was written for the DJ's chair
+                # and its clip is keyed on that voice. With that chair
+                # empty it is left on the shelf for later and the live
+                # road below introduces the record in whoever is here.
+                and seat_away_who() != "dj"):
             _ahead_intro = track_talk_get(track, "intro", take=True)
     except Exception:  # noqa: BLE001
         _ahead_intro = None
@@ -20398,6 +21303,7 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
         await dj_speak(
             "request" if track.get("requested") else "intro",
             track, extra=notes,
+            who=seat_stand_in("dj"),            # #1034: whoever is here
             note=(" The record is ALREADY turning underneath you — "
                   "you are talking over its opening, so name it and "
                   "get out of the way rather than announcing "
@@ -20569,6 +21475,15 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
         except Exception:
             pass
 
+    # #1040: now and then the pair simply do an advert - the same roll
+    # the torrent makes, never inside 240s of the last break.
+    if not segment and _room() > 60 and story_ad_roll(dj):
+        try:
+            segment = bool(await dj_ad_break())
+            await asyncio.sleep(0.8)
+        except Exception:
+            pass
+
     # A moment for the news between records, organic and funny and
     # then back to work (#228). The on-the-hour bulletin is its own
     # clock, not a track count.
@@ -20583,6 +21498,12 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
     # On the clock rather than on the track count: every three to five
     # minutes by default, drawn fresh each time, and as long as the
     # settings say it should run (#202).
+    # #1034: the record road's return door - a seat whose break is over
+    # comes back over the record, before any round is written.
+    try:
+        await seat_return_if_needed("banter")
+    except Exception:  # noqa: BLE001
+        pass
     if not segment and _room() > 60 and banter_due(dj, played):
         try:
             # Now and then a round runs through the SECONDARY engine
@@ -20591,6 +21512,7 @@ async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
             # quick banter. Deep rounds fall back to nothing, so the
             # normal one still runs behind them if they come up empty.
             deep = (dj.get("deep_convo", True)
+                    and not seat_away_who()        # #1034: needs both
                     and random.random() < float(dj.get("deep_rate")
                                                 or 0.25))
             if not (deep and await dj_deep_round(track)):
@@ -25045,6 +25967,13 @@ async def prep_one(kind: str) -> bool:
         if (not _new_script and radio_paused()
                 and str(kind) in (hour_short_kinds() or [])):
             _new_script = True
+        # #1033: THE CALLER FLOOR. "Call-ins are always waiting." Below
+        # dj.caller_bank_floor finished unaired calls the phone road is
+        # short whatever the sheet says, on air or off - a second door
+        # beside the #1155 bypass above, which is untouched.
+        if (not _new_script and str(kind) == "caller"
+                and story_bank_short()):
+            _new_script = True
         if (not _new_script
                 and not (str(kind) == "track_talk" and _assigned_unready)):
             prep_note(str(kind), "four-hour obligations assigned")
@@ -25331,8 +26260,14 @@ def radio_pause_set(on: bool, why: str = "") -> bool:
                     _larder_save()
             except Exception:  # noqa: BLE001
                 pass
+        airlog_pause_note(on, why, now)                        # #1030 (G1)
         _RADIO["paused"] = bool(on)
         _RADIO["paused_at"] = now if on else 0.0
+        # #1022: the gap ledger reads every silence against these.
+        try:
+            gap_mark("pause" if on else "resume", why)
+        except Exception:  # noqa: BLE001
+            pass
         # #1138: the record was stopped the moment the pause began, so
         # the return needs a needle drop - the same fresh-record kick
         # the music_kick action uses. After the flag flips, so nothing
@@ -25366,6 +26301,12 @@ def radio_pause_set(on: bool, why: str = "") -> bool:
                 # ...and the record road owes talk on the FIRST record
                 # rather than a freshly drawn 3-5 minute gap.
                 _RADIO["banter_due"] = 0.0
+                # #1022: THE RESUME RUNWAY. The reel covers the first
+                # round (#1151); for the next ten minutes the torrent
+                # prefers banked banter and prepared calls over anything
+                # it would have to write live (gap_kind_policy).
+                _RADIO["resume_runway_until"] = (
+                    time.time() + GAP_RESUME_RUNWAY_SECONDS)
             except Exception:  # noqa: BLE001
                 pass
             # #1151: the reel drops the moment the operator presses
@@ -26362,6 +27303,17 @@ async def larder_keeper() -> None:
             except Exception:  # noqa: BLE001
                 _hours = 1.0
             _want = max(target, int(round(target * _hours)))
+            # #1022: OFF AIR THE LARDER FILLS TO A FLOOR OF ROUNDS. The
+            # #1155 fill above stops at target x hours; on a shallow
+            # dial that is a handful, and the first rounds after resume
+            # were measured writing live with ~100s holes between them.
+            # pause_bank_rounds (dj dial, default 12) is the least a
+            # pause banks; the larger of the two applies.
+            if _paused_hold:
+                try:
+                    _want = max(_want, gap_pause_bank_rounds(dj_settings()))
+                except Exception:  # noqa: BLE001
+                    pass
             # #1121: the ceiling lifts while the station is building.
             # This capped at TWELVE when the box is down - which paused
             # counts as - so an hour off air stopped banking banter at
@@ -28168,7 +29120,18 @@ def coord_judgment_factor(road: str) -> float:
 
 
 def judgment_lesson(road: str) -> str:
-    """The operator's most recent words about this road, for a prompt."""
+    """The operator's most recent words about this road, for a prompt.
+
+    #1027: literally their words now. The book's own lesson was the
+    option face plus the ask's `why` - the STATION's prose - and it was
+    read for one road (banter, in the pause workshop). A standing order
+    the operator spoke or typed about this road outranks it."""
+    try:
+        for note in directive_notes(road=str(road), limit=1):
+            if note.get("text"):
+                return str(note["text"])[:400]
+    except Exception:  # noqa: BLE001
+        pass
     _judgment_load()
     try:
         return str((_JUDGMENT["roads"].get(str(road)) or {}).get("lesson")
@@ -28200,6 +29163,9 @@ def judgment_note(topic: str, ask: str, face: str, does: str, why: str,
             "ask": str(ask or "")[:300], "face": str(face or "")[:200],
             "does": str(does or "")[:80], "why": str(why or "")[:600],
             "alone": bool(alone),
+            # #1027: said outright, so a report never attributes the
+            # machine's defaults to the human (28 of 40 asks were alone).
+            "by": "station" if alone else "operator",
             "context": {"paused": radio_paused(),
                         "short": hour_short_kinds()[:6]},
         }
@@ -28257,6 +29223,7 @@ def judgment_move(road: str, move: str, who: str = "operator") -> str:
                 "ask": f"the {who} turned the dial on {road}",
                 "face": said, "does": f"judgment:{move}:{road}",
                 "why": "", "alone": False,
+                "by": str(who or "operator"),          # #1027
                 "context": {"paused": radio_paused(),
                             "short": hour_short_kinds()[:6]}})
         _judgment_save()
@@ -28321,6 +29288,417 @@ def judgment_reask(roads: dict[str, Any]) -> None:
             break                       # one at a time, like the asking
     except Exception:  # noqa: BLE001
         pass
+
+
+
+# --- THE OPERATOR'S OWN WORDS (#1027) ---------------------------------
+# Every door the operator's words came through ended in a vote, a face
+# off a questionnaire, or a memory the DJs only ever heard as material.
+# No sentence he said changed a policy, and the judgment book's "lesson"
+# was the station's own why. A DIRECTIVE is a sentence that is plainly
+# an instruction about how the station behaves - "from now on fewer
+# adverts", "I want more callers tonight", "never cut a caller off",
+# "orchestrator: the news is too long" - kept in the operator's words in
+# the policy file, folded into every writing prompt as standing orders,
+# and, when a road and a direction can be read from it, moved on the
+# judgment dial the way the 🕸 graph moves it. Mic-safe (#1154): it must
+# BE the sentence, in an instruction shape, with nothing of the broadcast
+# stitched onto it.
+DIRECTIVE_KEEP = 200
+_DIRECTIVE_ROADS: tuple[tuple[str, str], ...] = (
+    ("caller", r"callers?|phone[- ]?calls?|phone[- ]?ins?|call[- ]?ins?|"
+               r"the phones?|people (?:ringing|calling|phoning)(?: in)?|"
+               r"listeners? (?:ringing|calling)(?: in)?"),
+    ("gallery", r"gallery|paintings?|pictures?|art(?:works?)?|canvas(?:es)?|"
+                r"the (?:art|painting) rounds?"),
+    ("news", r"news|bulletins?|headlines?|the wire"),
+    ("ad", r"ads?|adverts?|advertisements?|advertising|commercials?|"
+           r"ad[- ]?reads?|ad[- ]?breaks?|sponsors?"),
+    ("manager", r"manager|memos?|upstairs|management|the boss|"
+                r"the producer"),
+    ("station_id", r"station[- ]?ids?|idents?|jingles?|stings?"),
+    ("track_talk", r"track[- ]?talk|record talk|talk(?:ing)? over (?:the )?"
+                   r"(?:records?|music|tracks?)|(?:track|record) intros?"),
+    ("banter", r"banter|chat(?:ter)?|the (?:pair|hosts?|djs?|two of them)|"
+               r"talk(?:ing)?|conversations?|dialogue|jokes?|rambling"),
+    ("music", r"music|records?|songs?|tracks?|tunes?"),
+    ("show", r"the (?:show|station(?![- ]?ids?\b)|radio|programme|program|"
+             r"broadcast)|pine ?box ?fm|everything|the whole thing"),
+)
+# Roads that have a seat in the judgment book; the rest are notes only.
+_DIRECTIVE_DIAL_ROADS = ("caller", "gallery", "news", "ad", "manager",
+                         "station_id", "track_talk", "banter")
+_DIRECTIVE_MORE = re.compile(
+    r"\b(?:more|extra|additional|plenty of|lots of|loads of|push|drive|"
+    r"prioriti[sz]e|favou?r|double|up the|turn up|increase|longer|bigger|"
+    r"heavier|value[ds]? .{0,14}(?:more|higher)|higher|lean (?:on|into)|"
+    r"go (?:big|hard|heavy) on|bring back|a lot of|as many .{0,12}as)\b")
+_DIRECTIVE_LESS = re.compile(
+    r"\b(?:fewer|less|no more|never|stop|quit|cut (?:down|back)(?: on)?|"
+    r"ease (?:off|up)(?: on)?|tone down|too many|too much|too long|"
+    r"not so many|not so much|drop|lay off|reduce|shorter|smaller|lighter|"
+    r"calm down|dial (?:back|down)|turn down|value[ds]? .{0,14}(?:less|"
+    r"lower)|lower|go easy on|enough (?:of|with)|sick of|tired of|"
+    r"hate|can'?t stand|don'?t (?:want|like|need)|no)\b")
+_DIRECTIVE_LEAD = re.compile(
+    r"^(?:(?:hey|ok|okay|please|so|right|listen|look|and|also|oh)[,\s]+)*"
+    r"(?:(?:pine ?box(?: fm)?|orchestrator|station|dj station|the station|"
+    r"dear orchestrator|hey orchestrator)[,:\s]+)?", re.I)
+_DIRECTIVE_SHAPES = (
+    # (name, regex) - the instruction shapes. One must match at the START.
+    ("standing", r"^(?:from now on|from here on(?: out| in)?|going forward|"
+                 r"in (?:the )?future|for the rest of (?:the )?(?:night|"
+                 r"show|evening|hour|day)|tonight,?|for tonight|"
+                 r"as a rule|as a standing (?:rule|order)|new rule|rule:)"
+                 r"[,:]?\s+\S"),
+    ("addressed", r"^(?:orchestrator|station|dear orchestrator|"
+                  r"hey orchestrator|note to the station|"
+                  r"note to the orchestrator)[,:]\s*\S"),
+    ("absolute", r"^(?:never|always|stop|quit|don'?t|do not|no more|"
+                 r"please (?:never|always|stop|don'?t|do not))\b"),
+    ("want", r"^(?:i want|i would like|i'?d like|i need|i prefer|"
+             r"i expect|i would love|i'?d love|i'?d prefer|i would prefer|"
+             r"i'?d rather|i would rather|we want|we'?d like|we need)\b"),
+    ("amount", r"^(?:more|fewer|less|extra|no more|too many|too much|"
+               r"not so many|not so much|plenty of|lots of)\s+\S"),
+    ("taste", r"^remember(?: that)? (?:i|we) (?:like|love|hate|prefer|"
+              r"want|don'?t like|can'?t stand|enjoy|am (?:sick|tired) of|"
+              r"are (?:sick|tired) of)\b"),
+    ("order", r"^(?:give me|let'?s have|let'?s (?:hear|get|do)|make it|"
+              r"keep it|make the|keep the|let the|have the|get the|push|"
+              r"drive|ease (?:off|up)|lay off|cut (?:down|back)|tone down|"
+              r"value|prioriti[sz]e|go easy on|go (?:big|hard|heavy) on|"
+              r"bring back|turn (?:up|down)|dial (?:back|down|up)|"
+              r"double|lean (?:on|into)|run|do)\b"),
+)
+_DIRECTIVE_FILLER = {"please", "now", "ok", "okay", "yeah", "yes", "thanks",
+                     "thank", "you", "cheers", "ta", "right", "alright",
+                     "good", "great", "fine"}
+# #1154: the shapes that ADDRESS the station. A sentence in one of these
+# is aimed at the orchestrator and cannot be a snatch of the broadcast
+# heard through the mic; "give me the news", "too many phone calls
+# tonight" and "never stop the music" are how the show talks to itself,
+# and each of them used to write a standing order and move the judgment
+# dial. Twelve of fourteen plain on-air sentences parsed before this.
+_DIRECTIVE_ADDRESSED_SHAPES = ("standing", "addressed", "taste")
+# For the residue test: words that carry no instruction of their own.
+_DIRECTIVE_RESIDUE_FILLER = _DIRECTIVE_FILLER | {
+    "a", "an", "the", "and", "or", "but", "to", "of", "on", "in", "at",
+    "for", "from", "with", "is", "are", "was", "were", "be", "been",
+    "should", "would", "could", "will", "shall", "must", "i", "we", "my",
+    "our", "us", "it", "its", "that", "this", "there", "them", "they",
+    "some", "any", "all", "too", "very", "really", "bit", "little",
+    "before", "after", "when", "while", "than", "as", "not", "into",
+    "over", "about", "every", "each",
+    "tonight", "today", "night", "show", "station"}
+# A real order leaves almost nothing once the order is taken out of it.
+DIRECTIVE_RESIDUE_MOST = 3
+
+
+_DIRECTIVE_LABELS = {
+    "": "the show as a whole", "caller": "the phone calls",
+    "gallery": "the gallery", "news": "the news", "ad": "the adverts",
+    "manager": "the memos from upstairs", "station_id": "the station IDs",
+    "track_talk": "track talk", "banter": "the banter", "music": "the music",
+}
+_DIRECTIVE_ROUND = {
+    "caller": "phone-call", "gallery": "gallery", "news": "news",
+    "ad": "advert", "manager": "memo", "station_id": "station-ID",
+    "track_talk": "track-talk", "banter": "banter", "music": "record",
+}
+
+
+def directive_road(text: str) -> str:
+    """The road a sentence is about, or ''. The road named FIRST wins
+    ('always play the station id before the news' is about station IDs),
+    with the table's order - specific before general - breaking ties, so
+    'more callers talking' is about callers and 'talking' does not win."""
+    low = " " + re.sub(r"[^a-z0-9' -]+", " ", str(text or "").lower()) + " "
+    best: tuple[int, int, str] = (1 << 30, 1 << 30, "")
+    for order, (road, rx) in enumerate(_DIRECTIVE_ROADS):
+        got = re.search(r"\b(?:" + rx + r")\b", low)
+        if got and (got.start(), order) < best[:2]:
+            best = (got.start(), order, road)
+    return best[2]
+
+
+def directive_move(text: str, road: str) -> str:
+    """'more' | 'less' | '' - the direction, for a road that has a dial."""
+    if road not in _DIRECTIVE_DIAL_ROADS:
+        return ""
+    low = " ".join(str(text or "").lower().split())
+    more = _DIRECTIVE_MORE.search(low)
+    less = _DIRECTIVE_LESS.search(low)
+    if more and less:
+        # "no more adverts": the 'no more' reads before the 'more'.
+        return "less" if less.start() <= more.start() else "more"
+    if more:
+        return "more"
+    if less:
+        return "less"
+    return ""
+
+
+def _directive_shape(sentence: str) -> str:
+    low = " ".join(sentence.lower().split())
+    # "orchestrator: ..." is itself the shape - test it before the lead
+    # strip takes the address off.
+    bare = re.sub(r"^(?:(?:hey|ok|okay|please|so|right|listen|look)[,\s]+)*",
+                  "", low, count=1)
+    if re.match(_DIRECTIVE_SHAPES[1][1], bare):
+        return "addressed"
+    low = _DIRECTIVE_LEAD.sub("", low, count=1).strip(" ,:")
+    for name, rx in _DIRECTIVE_SHAPES:
+        if re.match(rx, low):
+            return name
+    return ""
+
+
+def _directive_residue(sentence: str) -> list[str]:
+    """#1154: what is LEFT of a sentence once the order is taken out.
+
+    Strip the address, the instruction opening, every road the table
+    knows, the direction words and the pleasantries. "from now on fewer
+    adverts" leaves nothing; a sentence off the air keeps its own clause
+    ("...that is the dream", "...my ears cannot take it")."""
+    low = " ".join(str(sentence or "").lower().split())
+    low = _DIRECTIVE_LEAD.sub("", low, count=1).strip(" ,:")
+    for _name, rx in _DIRECTIVE_SHAPES:
+        got = re.match(rx, low)
+        if not got:
+            continue
+        end = got.end()
+        while end > 0 and low[end - 1].isalnum():
+            end -= 1                # the shapes end on \S: never cut a word
+        low = low[end:]
+        break
+    low = re.sub(r"[^a-z0-9' -]+", " ", low)
+    for _road, rx in _DIRECTIVE_ROADS:
+        low = re.sub(r"\b(?:" + rx + r")\b", " ", low)
+    low = _DIRECTIVE_MORE.sub(" ", low)
+    low = _DIRECTIVE_LESS.sub(" ", low)
+    return [w for w in re.findall(r"[a-z']+", low)
+            if w not in _DIRECTIVE_RESIDUE_FILLER]
+
+
+def parse_directive(text: str) -> dict[str, Any] | None:
+    """#1027: is this sentence a standing instruction about the station?
+
+    Returns {"text", "road", "move", "shape"} or None. The sentence must
+    ADDRESS the station (a standing frame, an address, or the taste
+    frame - _DIRECTIVE_ADDRESSED_SHAPES), must name a part of the show,
+    must not be a question, and - the #1154 rule, now over the whole
+    utterance - it must BE the sentence: strip the order and the
+    pleasantries and a real order has nothing left to say, while a
+    snatch of the broadcast keeps its own clause. A second sentence that
+    is not itself an order is the show heard through the mic, and the
+    whole thing is refused."""
+    said = " ".join(str(text or "").split())
+    if len(said) < 8 or len(said) > 280:
+        return None
+    if "?" in said:
+        return None
+    if re.search(r"\b[AB]:\s", said) or said.count('"') >= 2:
+        return None                     # a script, or somebody quoted
+    low = said.lower()
+    if re.match(r"\s*(?:why|what|how|when|where|who|is|was|are|did|does|do|"
+                r"can|could|would|should|will|has|have)\b", low):
+        return None
+    sentences = [x.strip() for x in re.split(r"(?<=[.!;])\s+", said)
+                 if x.strip()]
+    if not sentences:
+        return None
+    first = sentences[0]
+    shape = _directive_shape(first)
+    if not shape:
+        return None
+    road = directive_road(first)
+    if not road:
+        return None
+    # #1154, and the reason the whole shape table is not enough: the mic
+    # hears the show. A standing order has to SAY it is one - addressed
+    # to the station, framed as a rule from here on, or filed as a taste
+    # - because "give me the news" said to the box and "give me the
+    # news" said on the air are the same sentence.
+    if shape not in _DIRECTIVE_ADDRESSED_SHAPES:
+        return None
+    # ...and, like every other spoken command, it must BE the sentence.
+    if len(_directive_residue(first)) > DIRECTIVE_RESIDUE_MOST:
+        return None
+    # The rest must be orders too, or pleasantries - never a recording.
+    for extra in sentences[1:]:
+        words = [w for w in re.findall(r"[a-z']+", extra.lower())
+                 if w not in _DIRECTIVE_FILLER]
+        if not words:
+            continue
+        if _directive_shape(extra) and directive_road(extra):
+            continue
+        return None
+    body = _DIRECTIVE_LEAD.sub("", first, count=1).strip(" ,:.!")
+    if shape == "taste" and road in ("music",):
+        # "remember that I like the heat theme" - a memory, not an order,
+        # unless it names a road the station runs.
+        return None
+    move = directive_move(first, road)
+    if road in _DIRECTIVE_DIAL_ROADS and not move:
+        # "always ..." reads up; "never ..." / "stop ..." reads down -
+        # read off the BODY, so an addressed or standing order whose
+        # sentence is an absolute ("orchestrator: never cut a caller
+        # off") still moves the dial.
+        body_low = _DIRECTIVE_LEAD.sub("", first.lower(), count=1).strip(" ,:")
+        if re.match(r"^(?:please )?(?:always|never|stop|quit|don'?t|"
+                    r"do not|no more)\b", body_low):
+            move = ("more" if re.match(r"^(?:please )?always\b", body_low)
+                    else "less")
+    return {"text": body[:300], "road": road if road != "show" else "",
+            "move": move, "shape": shape}
+
+
+def directive_notes(road: str | None = None,
+                    limit: int = 20) -> list[dict[str, Any]]:
+    """The operator's standing orders, newest first; `road` filters
+    (road='' means the notes about the show as a whole)."""
+    orch_load()
+    try:
+        rows = list(orch_policy("operator_notes", []) or [])
+    except Exception:  # noqa: BLE001
+        rows = []
+    out: list[dict[str, Any]] = []
+    for row in reversed(rows):
+        if not isinstance(row, dict) or not row.get("text"):
+            continue
+        if road is not None and str(row.get("road") or "") != str(road):
+            continue
+        out.append(row)
+        if len(out) >= max(1, int(limit)):
+            break
+    return out
+
+
+def directive_record(found: dict[str, Any], source: str = "spoken") -> str:
+    """Write a parsed directive into the policy file (bounded), move the
+    dial when it can, and return what the box SAYS."""
+    orch_load()
+    text = str(found.get("text") or "").strip()
+    road = str(found.get("road") or "")
+    move = str(found.get("move") or "")
+    if not text:
+        return "I did not catch an instruction in that."
+    row = {"at": time.time(), "text": text[:300], "road": road,
+           "move": move, "source": str(source)[:20]}
+    try:
+        with _ORCH_LOCK:
+            seat = _ORCH["policy"].get("operator_notes")
+            rows = list((seat or {}).get("value") or []) if isinstance(
+                seat, dict) else []
+            rows.append(row)
+            del rows[:-DIRECTIVE_KEEP]
+            _ORCH["policy"]["operator_notes"] = {"value": rows,
+                                                 "at": time.time()}
+        orch_save()
+    except Exception:  # noqa: BLE001
+        pass
+    did = ""
+    if road and move:
+        try:
+            did = judgment_move(road, move, who="operator, in their own words")
+        except Exception:  # noqa: BLE001
+            did = ""
+    label = _DIRECTIVE_LABELS.get(road) or SHELF_LABEL.get(road, road)
+    pipeline_log("lookahead",
+                 f"the operator gave a standing order about {label}: "
+                 + text[:120] + (f" - {did}" if did else "") + " (#1027)",
+                 extra="STANDING ORDER (#1027)\n\n" + text
+                       + (f"\n\nroad: {road}  move: {move}\n{did}"
+                          if road else ""))
+    return (f"Noted, in your words: \"{text}\". "
+            + (f"{did[0].upper() + did[1:]} on the judgment dial, and "
+               if did else "")
+            + (f"every {_DIRECTIVE_ROUND.get(road, road)} round hears it "
+               "from here."
+               if road else "every writer on the station hears it from "
+                            "here."))
+
+
+def operator_lesson_clause(slot: str) -> str:
+    """#1027: the standing orders as a prompt clause for one prompt slot.
+
+    The host layer is assembled by every round the station writes
+    (banter, news, the ad read, station IDs, track talk, the gallery
+    press, calls, memos - dj_line and dj_banter between them), so it
+    carries the newest order per road plus the ones about the show as a
+    whole; the caller, gallery and manager slots carry their own road's
+    orders again where those prompts are built. Bounded to ~600 chars,
+    newest first; empty when nothing was ever said."""
+    slot_road = {"host": None, "caller": "caller", "gallery": "gallery",
+                 "manager": "manager"}.get(str(slot), "skip")
+    if slot_road == "skip":
+        return ""
+    try:
+        notes = directive_notes(limit=60)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not notes:
+        return ""
+    picked: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for note in notes:
+        road = str(note.get("road") or "")
+        if slot_road is not None and road != slot_road:
+            continue
+        if road in seen:
+            continue
+        seen.add(road)
+        picked.append(note)
+        if len(picked) >= 6:
+            break
+    if not picked:
+        return ""
+    lines: list[str] = []
+    total = 0
+    for note in picked:
+        road = str(note.get("road") or "")
+        label = _DIRECTIVE_LABELS.get(road) or SHELF_LABEL.get(road, road)
+        line = f"- about {label}: {str(note.get('text') or '')[:160]}"
+        if total + len(line) > 600 and lines:
+            break
+        lines.append(line)
+        total += len(line)
+    return ("\n\nSTANDING ORDERS FROM THE OPERATOR, in their own words - "
+            "obey them in what you write:\n" + "\n".join(lines))
+
+
+def directive_draw_kind(choices: list[str]) -> str:
+    """#1027: the torrent's random draw, weighted a little by what the
+    operator has chosen off the switchboard (decisions_taste - the five
+    roads he picks by hand) and by the judgment dial. Small on purpose:
+    a road he has taken often comes up at most ~1.6x as often, a road
+    he has valued higher or lower moves at most 30% either way, and the
+    schedule and the switchboard still outrank the draw entirely."""
+    if not choices:
+        return ""
+    try:
+        taste = decisions_taste()
+        total = float(sum(taste.values()) or 0)
+        by_round: dict[str, float] = {}
+        for kind, n in taste.items():
+            rnd = str((SWITCH_KINDS.get(str(kind)) or {}).get("round") or "")
+            if rnd:
+                by_round[rnd] = by_round.get(rnd, 0.0) + float(n)
+        dial = {"banter": "banter", "deep": "banter", "bombshell": "banter",
+                "caller": "caller", "gallery": "gallery", "news": "news",
+                "manager": "manager"}
+        weights: list[float] = []
+        for c in choices:
+            w = 1.0
+            if total > 0:
+                w += 0.6 * by_round.get(c, 0.0) / total
+            factor = coord_judgment_factor(dial.get(c, c))
+            w *= max(0.7, min(1.3, 1.0 + 0.3 * (factor - 1.0)))
+            weights.append(w)
+        return random.choices(list(choices), weights=weights, k=1)[0]
+    except Exception:  # noqa: BLE001
+        return random.choice(list(choices))
 
 
 # --- THE PAUSE WORKSHOP (#1150) ---------------------------------------
@@ -28539,6 +29917,7 @@ async def reel_open() -> None:
                     "ts": int(time.time()),
                     "air_at": t0 + float(r.get("from") or 0),
                     "aired": "stream", "source": "reel",
+                    "round": "banter", "replay": True,       # #1023 (G1)
                     "clip_media": media, "clip_sig": sig,
                     "clip_from": r.get("from"), "clip_until": r.get("until"),
                 })
@@ -30000,8 +31379,29 @@ PIPER_OK_FOR = 900.0
 
 def piper_authorise(road: str, secs: float = PIPER_OK_FOR) -> None:
     """This road may render on piper for a while - a hole is the
-    alternative."""
+    alternative.
+
+    #1021: every grant lands here (cover_now, paused banking, the
+    orchestrator's piperok verb, the probe, the hour-close miss), so
+    this is where the avoid-Piper policy has its say: refused while a
+    clone engine is up, unless the road is hour-short on a nearly empty
+    box. Both the refusal and the exception are said out loud."""
     try:
+        if voicepolicy_avoid_piper():
+            _why = voicepolicy_piper_exception(str(road))
+            if not _why:
+                voicepolicy_say(
+                    f"authorise:no:{road}",
+                    f"{road}: a piper authorisation was asked for "
+                    f"({int(secs)}s) and REFUSED - a clone engine is up "
+                    f"({', '.join(voicepolicy_clones_ready())}) and the "
+                    "road is not both hour-short and on an empty box "
+                    "(#1021)")
+                return
+            voicepolicy_say(
+                f"authorise:yes:{road}",
+                f"{road}: piper authorised for {int(secs)}s under the "
+                f"avoid-Piper policy's exception - {_why} (#1021)")
         _PIPER_OK[str(road)] = time.time() + max(60.0, float(secs))
     except Exception:  # noqa: BLE001
         pass
@@ -30464,6 +31864,24 @@ def piper_probe() -> str:
                 except Exception:  # noqa: BLE001
                     pass
             return ""
+        # #1021: the probe is a measurement, and the policy says the
+        # measurement waits for a night when Piper is allowed anyway -
+        # both clone engines down, or a road hour-short on an empty box.
+        # It routinely put callers, news and adverts on Piper for half an
+        # hour at a time on a healthy night, which is the opposite of
+        # the ask.
+        if voicepolicy_avoid_piper():
+            _allowed = [r for r in want if voicepolicy_piper_exception(r)]
+            if not _allowed:
+                voicepolicy_say(
+                    "probe:standing-down",
+                    "(#1109/#1021) the piper probe is standing down - "
+                    + ", ".join(SHELF_LABEL.get(r, r) for r in want)
+                    + " still unmeasured, but a clone engine is up and "
+                    "the avoid-Piper policy holds; it measures when "
+                    "Piper is allowed anyway", every=600.0)
+                return ""
+            want = _allowed
         for road in want:
             piper_authorise(road, 1800.0)
         # #1109b: IT SAYS SO. Every early return in this file's history
@@ -30524,7 +31942,28 @@ def may_take_on_piper(kind: str) -> bool:
         prep = str(kind or "")
         if prep in PIPER_NEVER:
             return False
-        return prep in SPEED_SAFE_SEATS or prep in SHELF_REUSABLE
+        if not (prep in SPEED_SAFE_SEATS or prep in SHELF_REUSABLE):
+            return False
+        # #1021: the one "is Piper acceptable here" predicate, taught the
+        # policy. The commit board's "piper" verdict, cover_now's grant,
+        # paused banking, the hour-close miss and the router all ask
+        # this; refusing here closes every emergency road at once, and
+        # the board writes an honest "cut" instead of a Piper promise.
+        if voicepolicy_avoid_piper():
+            _why = voicepolicy_piper_exception(prep)
+            if not _why:
+                voicepolicy_say(
+                    f"take:no:{prep}",
+                    f"{prep}: an emergency Piper take was asked for and "
+                    "refused - a clone engine is up "
+                    f"({', '.join(voicepolicy_clones_ready())}) and the "
+                    "road is not both hour-short and on an empty box "
+                    "(#1021)")
+                return False
+            voicepolicy_say(f"take:yes:{prep}",
+                            f"{prep}: an emergency Piper take is allowed "
+                            f"- {_why} (#1021)")
+        return True
     except Exception:  # noqa: BLE001
         return False
 
@@ -33166,6 +34605,8 @@ def hour_needs() -> dict[str, dict[str, float]]:
                     _k = str(r.get("key") or "")
                     if _k and not pantry_get(_k):
                         continue                 # its audio has gone
+                    if road == "caller" and r.get("aired_at"):
+                        continue        # #1033: a re-air is a fallback, not cover
                     if not r.get("aired_at"):
                         rows.append(r)           # never been out
                         continue
@@ -33273,7 +34714,15 @@ def hour_short_kinds() -> list[str]:
     except Exception:  # noqa: BLE001
         return []
     short.sort()
-    return [road for _gap, road in short]
+    out = [road for _gap, road in short]
+    # #1033: below the caller floor the phone road is short even when the
+    # sheet owes it nothing - "call-ins are always waiting".
+    try:
+        if "caller" not in out and story_bank_short():
+            out.insert(0, "caller")
+    except Exception:  # noqa: BLE001
+        pass
+    return out
 
 
 def _hour_needs_with_cover() -> dict[str, dict[str, float]]:
@@ -33387,6 +34836,9 @@ def _dialogue_flow_state_fresh() -> dict[str, Any]:
         # #942/#905: dead air measured and remembered, the half hour
         # audited, and the next half hour's work order.
         "coordinator": coordinator_state(),
+        # #1022: the silences between cast lines, from the ring - last
+        # gap, the hour's count/total/longest, and the policy state.
+        "gaps": gap_brief(),
         "hour_needs": _hour_needs_with_cover(),
         "hour_short": hour_short_kinds(),
         "prepared_seconds": prepared_seconds(),
@@ -33398,6 +34850,10 @@ def _dialogue_flow_state_fresh() -> dict[str, Any]:
         # sixty minutes, what was asked for, and whether this hour is
         # behind its pace. Rides /api/dj under "dialogue_flow" too.
         "quota": quota_state(),
+        # #1021: is the avoid-Piper policy actually holding tonight -
+        # the dial, which clone engines answer, what is known down and
+        # which seats hold an exception. All cached reads.
+        "voice_policy": voicepolicy_state(),
         # #872: HOW LONG THINGS TAKE, what the preparer chose to do next
         # and WHY it chose that, and what it is allowed to spend right
         # now. #869: the records coming up and the dialogue standing
@@ -33664,7 +35120,9 @@ async def _torrent_talk() -> None:
                 elif _want and (_want in kinds or _want == "bombshell"):
                     kind = _want
                 else:
-                    kind = random.choice(choices)
+                    # #1040 the random ad roll gets first refusal; when it
+                    # passes, #1027's operator-weighted draw takes the round.
+                    kind = story_ad_roll(dj) or directive_draw_kind(choices)
             else:
                 # #843: THE SCHEDULE. Below the operator's switchboard,
                 # which still wins outright above, and ABOVE the random
@@ -33730,7 +35188,9 @@ async def _torrent_talk() -> None:
                     sched_result(_sched_row, False,
                                  "the running order named no entry for "
                                  "this round")
-                    kind = random.choice(choices)
+                    # #1040 the random ad roll gets first refusal; when it
+                    # passes, #1027's operator-weighted draw takes the round.
+                    kind = story_ad_roll(dj) or directive_draw_kind(choices)
                 # #839/#841: BEHIND BEATS THE DICE. A missed opportunity
                 # in the record loop waits for the next modulo, which is
                 # how an hour that falls short never catches back up. The
@@ -33780,6 +35240,32 @@ async def _torrent_talk() -> None:
                             break
                 except Exception:  # noqa: BLE001
                     pass        # the dice already chose; never fail here
+            # #1022: STOCK BEFORE PROSE. After the operator, the sheet
+            # and the quota have spoken and before the round is made:
+            # inside the resume runway, or for two rounds after a long
+            # measured silence, a round that would be written live
+            # becomes a banked one when the pantry holds it. An
+            # overridden sheet entry is marked missed with the reason
+            # (#937) - the adherence figure stays honest.
+            try:
+                # #1022/#904: the operator's own pick and an interjected
+                # segment are instructions, not draws - stock-first never
+                # rewrites one. The round is still noted in the gap
+                # ledger below, so the reader knows what went out.
+                _gkind, _gwhy = ((kind, "") if _chosen
+                                 else gap_kind_policy(kind, dj))
+                if _gwhy and _gkind != kind:
+                    pipeline_log("air", f"(#1022) {kind} -> {_gkind}: "
+                                        f"{_gwhy}")
+                    if (_sched_row is not None and _sched_row.get("kind")
+                            and _sched_row.get("kind") != _gkind):
+                        sched_result(_sched_row, False, f"(#1022) {_gwhy}")
+                        _sched_row = None
+                    kind = _gkind
+                gap_round_note(kind, str((_slot or {}).get("label") or ""),
+                               _sched_row is not None, _gwhy)
+            except Exception:  # noqa: BLE001
+                pass
             _RADIO["last_round_kind"] = kind
             _interjected = bool(_chosen and _chosen.get("interject"))   # #957
             # #937: if the quota override above re-chose, the entry the
@@ -33793,6 +35279,14 @@ async def _torrent_talk() -> None:
                                  "the hour was behind quota and a "
                                  f"{kind} round was taken instead")
                     _sched_row = None
+            except Exception:  # noqa: BLE001
+                pass
+            # #1034: a seat out of the studio comes back here - the
+            # break over, or the round about to start needing both
+            # chairs (the two-hander, the phone, the interview) - and
+            # says so before the round is written.
+            try:
+                await seat_return_if_needed(kind)
             except Exception:  # noqa: BLE001
                 pass
             aired = False
@@ -33938,6 +35432,7 @@ async def _torrent_talk() -> None:
             pipeline_log("air" if aired else "drop",
                          f"torrent round - {kind}"
                          + ("" if aired else " produced no audio"))
+            gap_round_done(bool(aired))                          # #1022
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -34229,6 +35724,10 @@ def dj_start(station: str) -> dict[str, Any]:
     # twice an hour, worst case seven minutes, every one of them
     # covered by music and none of them recorded.
     _RADIO_TASK.append(asyncio.create_task(talk_watch()))
+    # #1023 (G1): the durable air log - upsert-by-id off the ring.
+    _RADIO_TASK.append(asyncio.create_task(airlog_keeper()))
+    # #1022: ...and the ledger of the silences it watches for.
+    _RADIO_TASK.append(asyncio.create_task(gap_keeper()))
     # #1112: and something that notices when the box has stopped playing
     # what it is sent. The station broadcast into a dead speaker for five
     # hours with the evidence on its own diagnostics page.
@@ -42399,7 +43898,8 @@ async def dj_police_outside(text: str) -> None:
         voice = caller_voice_for(
             "the officer outside",
             {voices.get("dj", ""), voices.get("cohost", "")},
-            await voice_allowlist()) or ""
+            await voice_allowlist(),
+            clones=await voicepolicy_clone_pool_async()) or ""   # #1021
     except Exception:
         voice = ""
     engine = voice_engine_for(voice)
@@ -42408,7 +43908,7 @@ async def dj_police_outside(text: str) -> None:
     # instead of falling back to Piper like everything else.
     if engine in ("xtts", "f5") \
             and not await clone_engine_ready(engine):
-        engine, voice = "piper", _event_voice("default")
+        engine, voice = await voicepolicy_preempt(engine, voice, "police")  # #1021
     try:
         clip = await voice_generate(
             spoken_text(text), voice, engine,
@@ -42768,7 +44268,7 @@ async def dj_upstairs_render(row: dict[str, Any]) -> dict[str, Any] | None:
         voice = ""
     engine = voice_engine_for(voice)
     if engine in ("xtts", "f5") and not await clone_engine_ready(engine):
-        engine, voice = "piper", _event_voice("default")
+        engine, voice = await voicepolicy_preempt(engine, voice, "manager")  # #1021
     try:
         clip = await voice_generate(
             text, voice, engine,
@@ -43512,7 +45012,7 @@ async def dj_music_ad(product: str, remember: bool = True) -> dict[str, Any]:
     # instead of falling back to Piper like everything else.
     if engine in ("xtts", "f5") \
             and not await clone_engine_ready(engine):
-        engine, forced = "piper", _event_voice("default")
+        engine, forced = await voicepolicy_preempt(engine, forced or "", "ad")  # #1021
     # A produced spot is VOCODED (#618): the read gets the classic half-dry,
     # phase-locked autotune sheen so the voice sits on the bed like a real
     # radio ad. Stays intelligible where a full robot would not.
@@ -43900,7 +45400,7 @@ async def ad_produce(product: str, script: str, voice: str,
     # instead of falling back to Piper like everything else.
     if engine in ("xtts", "f5") \
             and not await clone_engine_ready(engine):
-        engine, v = "piper", _event_voice("default")
+        engine, v = await voicepolicy_preempt(engine, v, "ad")   # #1021
     try:
         clip = await voice_generate(line, v, engine, fx={"vocode": "autotune"})
     except Exception:
@@ -44403,7 +45903,8 @@ _IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg",
 # A contact sheet is a 3x3 grid of thumbnails and the video/audio folders are
 # not pictures at all — nothing in either is anybody's face.
 _FACE_SKIP_DIRS = ("_contact_sheets", "video", "audio",
-                   "_output_images_will_be_put_here")
+                   "_output_images_will_be_put_here",
+                   "_gazette")   # G3 #1020: the Gazette's snapshots
 
 
 def comfy_output_find(filename: str) -> Path | None:
@@ -46596,14 +48097,36 @@ async def decisions_recall(query: str, k: int = 5) -> list[dict[str, Any]]:
         return []
 
 
+# #1156: directive_draw_kind asks for this on EVERY talk round, and the
+# vector store is 4000 rows of 768 floats when it is full. Memoised on
+# the file's (mtime, size), the way crystals_read is - json.loads holds
+# the GIL, and the round dispatch is the show loop.
+_DECISION_TASTE_MEMO: dict[str, Any] = {"key": None, "at": 0.0, "value": {}}
+
+
 def decisions_taste() -> dict[str, int]:
     """A blunt tally of which roads get taken — enough to bias a board
     without needing the model to think about it."""
+    _now = time.time()
+    try:
+        if (_DECISION_TASTE_MEMO["key"] is not None
+                and _now - float(_DECISION_TASTE_MEMO["at"]) < 5.0):
+            return dict(_DECISION_TASTE_MEMO["value"])
+        st = DECISION_VECTORS.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if key == _DECISION_TASTE_MEMO["key"]:
+            _DECISION_TASTE_MEMO["at"] = _now
+            return dict(_DECISION_TASTE_MEMO["value"])
+    except Exception:  # noqa: BLE001
+        key = None
     tally: dict[str, int] = {}
     for row in (_decision_vectors().get("rows") or []):
-        key = str(row.get("kind") or "")
-        if key:
-            tally[key] = tally.get(key, 0) + 1
+        k = str(row.get("kind") or "")
+        if k:
+            tally[k] = tally.get(k, 0) + 1
+    if key is not None:
+        _DECISION_TASTE_MEMO.update({"key": key, "at": _now,
+                                     "value": dict(tally)})
     return tally
 
 
@@ -48364,7 +49887,8 @@ async def session_voices() -> dict[str, str]:
                 except Exception:
                     catalogue = None
                 fixed["third"] = caller_voice_for(
-                    dj["third_name"], set(voices.values()), catalogue)
+                    dj["third_name"], set(voices.values()), catalogue,
+                    clones=await voicepolicy_clone_pool_async())   # #1021
                 _RADIO["voices"] = fixed
             voices["third"] = fixed.get("third", "")
     return voices
@@ -50416,7 +51940,8 @@ def _sfx_any() -> Path | None:
 
 
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
-                   force: bool = False) -> str:
+                   force: bool = False,
+                   sample: Path | None = None) -> str:
     """Drop a sample off the end of what was just said.
 
     Both outputs, one place. On the box it is a second announce, which is why
@@ -50426,7 +51951,9 @@ async def dj_sting(to_box: bool, after: str = "", who: str = "",
     the rate/gap gate and always drops an actual sample (#464)."""
     # In a thread: picking one reads a folder over SMB, and a NAS that has
     # gone away would otherwise hold up the whole event loop mid-show.
-    sample = await asyncio.to_thread(sting_due)
+    # #1034: unless the caller chose the sample (a door behind an exit).
+    if sample is None:
+        sample = await asyncio.to_thread(sting_due)
     if sample is None and force:
         sample = await asyncio.to_thread(_sfx_any)
     if sample is None:
@@ -51326,6 +52853,726 @@ def fresh_pool_top(want: int = 8) -> None:
             pass                        # no loop — a test, or the CLI
 
 
+# --- THE SEAT WATCH (#1034) -------------------------------------------
+# The host and the co-host are meant to be having a CONVERSATION. The
+# talk watchdog above measures one clock for the whole booth, so a swath
+# where one seat carried the show alone - the other's lines dropped by a
+# gate, a cover here and there, a call one of them ran on their own -
+# read as "somebody is talking" and passed. Nothing ever noticed that
+# only one of them was.
+#
+# This watches the two seats separately, off the booth ring (the only
+# per-line record with who + time in it; the durable air log, when
+# merged, is the better source and seat_rows() is the one place to
+# swap it in). When one seat has aired seat_quiet_lines lines, or
+# seat_quiet_minutes minutes, since the OTHER seat last spoke, the
+# silent one says where they are going - in their own voice, by hand,
+# so nothing gates it - and the round writer is told the chair is
+# empty. They come back after seat_away_minutes, or sooner when the
+# next round needs both of them, and say so before it starts.
+#
+# The rules the rest of the file keeps while a seat is away: the round
+# writer's format clause says there are no lines for that seat,
+# banter_turns never flips a repeated marker INTO the empty chair and
+# re-seats stray lines out of it, the one-sided re-split in
+# _speak_turns_floorless stands down, the larder is not shopped (a
+# banked two-hander would bring the voice straight back), the live
+# record intro goes to whoever is present, and cover_speaker never
+# picks the empty chair.
+SEAT_AWAY_PATH = data_path("seat_away.json")
+SEAT_SEATS = ("dj", "cohost")
+# Fifteen minutes and a seat is back whatever the clocks say - a
+# restart must never leave a chair empty for the night.
+SEAT_AWAY_HARD_LIMIT = 900.0
+# After a return the same seat is not sent out again for a while; the
+# detector would otherwise fire on the very swath that preceded it.
+SEAT_REST_AFTER_BACK = 600.0
+# The swath must be LIVE: the present seat's newest line inside this
+# window, or it is everybody-quiet (the talk watchdog's job, not ours).
+SEAT_SWATH_STALE = 600.0
+# Rows that are not the seat speaking in a conversation. Single-line
+# roads (an intro over a record, a station id, an ad read) prove the
+# seat is present but not that a conversation is running one-sided;
+# markers and operator rows are not speech at all.
+SEAT_NOT_SPEECH = frozenset({
+    "chat", "marker", "sfx", "hangup", "drop", "analysis",
+    "image_analysis", "upstairs", "played", "callin", "request_note",
+})
+SEAT_SOLO_KINDS = frozenset({
+    "intro", "request", "outro", "open", "station_id", "ad", "media",
+    "track_talk", "aside", "news_marker",
+})
+SEAT_AIRED = frozenset({"box", "page", "stream", "both"})
+# Rounds that want both chairs filled: the two-hander by construction,
+# the phone (the hosts take the call together), the interview.
+SEAT_NEEDS_BOTH = frozenset({"deep", "caller", "call", "guest", "recap",
+                             "interview"})
+
+# {seat: {since, reason, until, line, name}} - one seat at a time.
+_AWAY: dict[str, dict[str, Any]] = {}
+_SEAT_STATE: dict[str, Any] = {"loaded": False, "last_back": 0.0,
+                               "last_reason": "", "talking": False,
+                               "left": 0, "returned": 0}
+
+# The book: twelve leaving lines and twelve returns per reason, in the
+# hosts' voice - short, spoken, nothing shouted. `sfx` are the words a
+# sample's name may carry for the door/footsteps that follows the exit.
+SEAT_AWAY_BOOK: dict[str, dict[str, Any]] = {
+    "restroom": {
+        "label": "the restroom",
+        "sfx": ("door", "flush", "footstep", "steps", "walk"),
+        "leave": (
+            "Right, I need the restroom. Keep it going, I will be two minutes.",
+            "Hold that thought, nature is calling and it is not taking no for an answer.",
+            "I am stepping out to the restroom. Do not say anything good while I am gone.",
+            "Back in a minute, the restroom is down the hall and so am I.",
+            "You have the room, I have an appointment with the restroom.",
+            "Quick restroom break. Carry on, pretend I am still nodding.",
+            "I have to go. Not go go, restroom go. Two minutes.",
+            "Restroom. Do not touch my coffee.",
+            "Talk amongst yourselves, I am off to the facilities.",
+            "That third cup was a mistake. Restroom, back shortly.",
+            "Taking the headphones off, restroom run, you are on your own.",
+            "The bladder has spoken. I will be right back.",
+        ),
+        "back": (
+            "Back. What did I miss.",
+            "Alright, I am back, hands washed, ready to be wrong about things again.",
+            "Did anything happen while I was out, or did you just talk to the wall.",
+            "I am back in the chair. Somebody catch me up.",
+            "Right, restroom sorted, where were we.",
+            "Back from the facilities. The hand dryer in there is louder than this show.",
+            "I return, refreshed and unburdened. Carry on.",
+            "Okay, I am here, headphones on, what are we talking about.",
+            "Back. Sorry about that. Third cup, like I said.",
+            "The restroom sends its regards. What is the topic.",
+            "Two minutes, as promised. More or less. Go on.",
+            "I am back, and I heard none of that, so say it again for me.",
+        ),
+    },
+    "coffee": {
+        "label": "a coffee",
+        "sfx": ("door", "footstep", "steps", "kettle", "pour", "cup"),
+        "leave": (
+            "I need a coffee. Keep it going, I will be right back.",
+            "Coffee break. The pot down the hall is calling my name.",
+            "Stepping out for a coffee, you have the room.",
+            "My cup is empty and so is my brain. Coffee. Two minutes.",
+            "Going to get a coffee, do you want one. Do not answer, I am already gone.",
+            "I am off to the machine, back with something hot and terrible.",
+            "Hold the fort, the coffee is not going to fetch itself.",
+            "Quick coffee run. Say something clever while I am out.",
+            "The kettle is the only thing in this building that works. Back in a minute.",
+            "Going to top up. If the coffee is gone I am blaming the night shift.",
+            "Coffee. I will be back before you finish that sentence. Probably not.",
+            "Right, I am getting a coffee, carry on without me.",
+        ),
+        "back": (
+            "Back, and I have a coffee, so the show can continue.",
+            "I am back. The coffee is burnt. What did I miss.",
+            "Right, caffeinated, what are we talking about.",
+            "Coffee acquired. Catch me up.",
+            "I am back in the chair, cup in hand, go on.",
+            "The machine took my money and gave me something brown. I am back anyway.",
+            "Back from the coffee run. Did you say anything I need to argue with.",
+            "Okay, I have a coffee and a second wind. Where were we.",
+            "Two minutes, one coffee, zero regrets. Go on.",
+            "Back. The pot was empty so I made a fresh one, you are welcome.",
+            "I am back and I brought nothing for you. What is the topic.",
+            "Cup full, back in the seat, carry on.",
+        ),
+    },
+    "smoke": {
+        "label": "a smoke break",
+        "sfx": ("door", "footstep", "steps", "lighter", "walk"),
+        "leave": (
+            "I am stepping out for a smoke. Keep it going.",
+            "Smoke break. Back in five, do not let the show fall over.",
+            "Going outside for a cigarette. You have the room.",
+            "I need some air, and by air I mean a cigarette. Back shortly.",
+            "Quick smoke. Carry on, I can hear you from the car park.",
+            "Stepping out back for one. Say something worth coming back for.",
+            "Off for a smoke, the show is yours.",
+            "I am going outside for a minute. Do not read my notes.",
+            "Right, smoke break, the cold air will do me good.",
+            "Cigarette. Back before the next record ends.",
+            "Going out for one. Hold the fort.",
+            "That is my cue for a smoke break. Talk amongst yourselves.",
+        ),
+        "back": (
+            "Back from the smoke break. What did I miss.",
+            "I am back, and it is freezing out there. Go on.",
+            "Right, that is better. Where were we.",
+            "Back inside. Somebody catch me up.",
+            "I return smelling of the car park. What is the topic.",
+            "Okay, smoke break over, headphones on, carry on.",
+            "Back. The raccoon by the bins says hello.",
+            "I am back in the chair. Did you say anything I need to hear twice.",
+            "Right, I am back, and the wind out there is a personal insult.",
+            "Smoke break done. Go on, I am listening now.",
+            "Back. Five minutes, as promised. Give or take.",
+            "I am back and I have opinions again. What are we talking about.",
+        ),
+    },
+    "vending": {
+        "label": "the vending machine",
+        "sfx": ("door", "footstep", "steps", "coin", "vending", "walk"),
+        "leave": (
+            "I am going to the vending machine. Keep it going.",
+            "The vending machine is calling. Back in two.",
+            "Stepping out to fight the vending machine, you have the room.",
+            "Off to the machine down the hall. Do not wait for me.",
+            "I need something salty. Vending machine. Back shortly.",
+            "Going to feed the vending machine, it has taken my money before and it will again.",
+            "Hold that thought, the vending machine and I have unfinished business.",
+            "Quick trip to the machine. Say something good while I am out.",
+            "I am off to the vending machine, the show is yours.",
+            "Snack run. Two minutes, maybe three if it eats my coin.",
+            "Going to the machine. If I am not back in five, it has won.",
+            "Right, vending machine, carry on without me.",
+        ),
+        "back": (
+            "Back from the vending machine. It took my money and gave me nothing.",
+            "I am back, with crisps. What did I miss.",
+            "The machine and I have reached an understanding. Where were we.",
+            "Back. Somebody catch me up while I open this.",
+            "Right, snack sorted, what are we talking about.",
+            "I return victorious. One bag of something orange. Carry on.",
+            "Okay, I am back in the chair. Did I miss anything.",
+            "Back. The machine ate the coin, I shook it, security saw. Go on.",
+            "I am back, and I am not sharing. What is the topic.",
+            "Vending machine sorted. Catch me up.",
+            "Back. That took longer than it should have. Go on.",
+            "I am back, headphones on, mouth full. Carry on.",
+        ),
+    },
+    "transmitter": {
+        "label": "checking the transmitter",
+        "sfx": ("door", "footstep", "steps", "switch", "walk"),
+        "leave": (
+            "I am going to check the transmitter. Keep it going.",
+            "The transmitter light is doing something odd, back in a minute.",
+            "Stepping out to look at the transmitter. You have the room.",
+            "Going down the hall to kick the transmitter. Do not wait.",
+            "Somebody has to check the transmitter and it is me. Back shortly.",
+            "Quick trip to the rack. If we go off air you will know why.",
+            "Off to check the transmitter, the show is yours.",
+            "That hum is the transmitter. I am going to have a word with it.",
+            "Transmitter check. Two minutes. Carry on.",
+            "I am going to look at the meters. Hold the fort.",
+            "Stepping out to the transmitter room. Say something worth broadcasting.",
+            "Right, the transmitter needs a look, carry on without me.",
+        ),
+        "back": (
+            "Back from the transmitter. It is fine, it just wanted attention.",
+            "I am back. The transmitter is warm and humming, like me. What did I miss.",
+            "Right, transmitter checked, where were we.",
+            "Back. The meters are green. Catch me up.",
+            "The transmitter is fine, I hit it once. Go on.",
+            "Okay, back in the chair, we are still on air, what are we talking about.",
+            "I return from the rack. Nothing was on fire. Carry on.",
+            "Back. I do not know what that light means and neither does the manual.",
+            "Transmitter sorted. Did you say anything I need to hear.",
+            "I am back, and we are broadcasting, so that is something. Go on.",
+            "Back from the transmitter room. It is loud in there. What is the topic.",
+            "Right, I am back, the equipment lives to hum another day, carry on.",
+        ),
+    },
+}
+
+
+def seat_other(seat: str) -> str:
+    """The other chair of the pair."""
+    return "cohost" if seat == "dj" else "dj"
+
+
+def seat_row_time(row: dict[str, Any]) -> float:
+    """When a booth row went out: air_at (the audible moment, corrected
+    by _stream_now_set) and ts behind it."""
+    try:
+        return float(row.get("air_at") or row.get("ts") or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def seat_rows(rows: list[dict[str, Any]] | None = None
+              ) -> list[dict[str, Any]]:
+    """The aired speech rows the seat clocks read, oldest first:
+    {t, who, kind, conv} for who in the two seats, the third chair and
+    the callers. Memory only - the ring is 240 dicts. When the durable
+    air log (G1) is merged this is the ONE place to read it instead."""
+    src = rows if rows is not None else (_RADIO.get("chat") or [])
+    out: list[dict[str, Any]] = []
+    for row in src:
+        try:
+            who = str(row.get("who") or "")
+            if who not in ("dj", "cohost", "third", "caller", "caller2"):
+                continue
+            kind = str(row.get("kind") or "")
+            if kind in SEAT_NOT_SPEECH:
+                continue
+            if str(row.get("aired") or "") not in SEAT_AIRED:
+                continue
+            t = seat_row_time(row)
+            if t <= 0:
+                continue
+            out.append({"t": t, "who": who, "kind": kind,
+                        "conv": kind not in SEAT_SOLO_KINDS})
+        except Exception:  # noqa: BLE001
+            continue
+    out.sort(key=lambda r: r["t"])
+    return out
+
+
+def _seat_norm(rows: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Raw booth rows or already-normalised seat rows - either is fine."""
+    if rows is None:
+        return seat_rows()
+    if rows and "conv" not in rows[0]:
+        return seat_rows(rows)
+    return list(rows)
+
+
+def seat_last_spoke(seat: str, rows: list[dict[str, Any]] | None = None
+                    ) -> float:
+    """When this seat last aired anything (0.0 when never, this ring)."""
+    got = 0.0
+    for r in _seat_norm(rows):
+        if r["who"] == seat and r["t"] > got:
+            got = r["t"]
+    return got
+
+
+def seat_detect(rows: list[dict[str, Any]], now: float,
+                n_lines: int = 6, minutes: float = 6.0,
+                call_live: bool = False) -> dict[str, Any] | None:
+    """Is one seat carrying a swath alone? Pure - synthetic rows test it.
+
+    For each seat the reference point is the later of its own last line
+    and the last caller line (a call is company, not a solo swath: the
+    presenter running it is not talking to an empty chair). Counted
+    from there: the OTHER seat's conversational lines. It fires when
+    those reach `n_lines`, or when `minutes` have passed with at least
+    two of them (an intro-only stretch has none - intros are solo by
+    construction and prove nothing about the pair). The swath must be
+    live: the present seat's newest line inside SEAT_SWATH_STALE, or
+    everybody is quiet and that is the talk watchdog's hole. A live
+    call stands it down outright."""
+    if call_live:
+        return None
+    rows = _seat_norm(rows or [])
+    if not rows:
+        return None
+    first_t = rows[0]["t"]
+    last_caller = max((r["t"] for r in rows
+                       if r["who"] in ("caller", "caller2")), default=0.0)
+    for quiet in SEAT_SEATS:
+        other = seat_other(quiet)
+        own_last = max((r["t"] for r in rows if r["who"] == quiet),
+                       default=0.0)
+        ref = max(own_last, last_caller)
+        if ref <= 0:
+            ref = first_t - 1.0          # never spoke: since the ring began
+        since = [r for r in rows
+                 if r["who"] == other and r["conv"] and r["t"] > ref]
+        n = len(since)
+        if not since:
+            continue
+        newest = max(r["t"] for r in since)
+        if now - newest > SEAT_SWATH_STALE:
+            continue
+        mins = max(0.0, (now - ref) / 60.0)
+        by_lines = n >= max(2, int(n_lines))
+        by_time = mins >= float(minutes) and n >= 2
+        if by_lines or by_time:
+            return {"seat": quiet, "other": other, "lines": n,
+                    "minutes": round(mins, 1),
+                    "why": (f"{n} lines" if by_lines
+                            else f"{int(mins)} minutes")}
+    return None
+
+
+def seat_away_row() -> dict[str, Any] | None:
+    """The away record, or None. Past the hard limit it is void."""
+    for seat, row in list(_AWAY.items()):
+        try:
+            if time.time() - float(row.get("since") or 0) > SEAT_AWAY_HARD_LIMIT:
+                return {**row, "seat": seat, "expired": True}
+            return {**row, "seat": seat, "expired": False}
+        except Exception:  # noqa: BLE001
+            _AWAY.pop(seat, None)
+    return None
+
+
+def seat_away_who() -> str:
+    """Which seat is out of the studio right now ("" when both are in).
+    An expired record answers "" - the return is spoken by the tick."""
+    row = seat_away_row()
+    if not row or row.get("expired"):
+        return ""
+    return str(row["seat"])
+
+
+def seat_stand_in(seat: str) -> str:
+    """Who speaks a line meant for `seat`: the seat itself unless it is
+    out, then the other chair (the live record intro uses this)."""
+    return seat_other(seat) if seat in SEAT_SEATS and seat_away_who() == seat else seat
+
+
+def seat_reseat(who: str) -> str:
+    """A turn addressed to the empty chair is spoken by the present one."""
+    away = seat_away_who()
+    return seat_other(who) if away and who == away else who
+
+
+def seat_away_clause() -> str:
+    """The round writer's instruction while a chair is empty."""
+    row = seat_away_row()
+    if not row or row.get("expired"):
+        return ""
+    seat = str(row["seat"])
+    other = seat_other(seat)
+    label = str((SEAT_AWAY_BOOK.get(str(row.get("reason") or ""))
+                 or {}).get("label") or "a break")
+    away_name = booth_actor_name(seat)
+    here_name = booth_actor_name(other)
+    away_marker = "A" if seat == "dj" else "B"
+    here_marker = "B" if seat == "dj" else "A"
+    who_away = ("You (A)" if seat == "dj" else f"{away_name} (B)")
+    who_here = ("you (A)" if other == "dj" else f"{here_name} (B)")
+    return (f"\nRIGHT NOW {who_away} {'are' if seat == 'dj' else 'is'} OUT "
+            f"OF THE STUDIO - gone for {label} - and {who_here} "
+            f"{'carry' if other == 'dj' else 'carries'} this segment ALONE. "
+            f"There are NO '{away_marker}: ...' lines in this exchange: "
+            f"write every line as '{here_marker}: ...'. The one in the "
+            "chair may talk to the listeners directly, address the empty "
+            "chair, or mutter about how long a break is taking - but "
+            f"never invents words for {away_name}, who cannot hear.")
+
+
+def seat_line(reason: str, which: str) -> str:
+    """A fresh line from the book - never the one this reason used last."""
+    book = SEAT_AWAY_BOOK.get(reason) or SEAT_AWAY_BOOK["coffee"]
+    lines = list(book.get(which) or ())
+    if not lines:
+        return ""
+    used = _SEAT_STATE.setdefault("used", {})
+    last = str(used.get(f"{reason}:{which}") or "")
+    pool = [ln for ln in lines if ln != last] or lines
+    pick = random.choice(pool)
+    used[f"{reason}:{which}"] = pick
+    return pick
+
+
+def seat_reason_draw() -> str:
+    """One of the five, never the one just used."""
+    pool = [r for r in SEAT_AWAY_BOOK if r != _SEAT_STATE.get("last_reason")]
+    pick = random.choice(pool or list(SEAT_AWAY_BOOK))
+    _SEAT_STATE["last_reason"] = pick
+    return pick
+
+
+def _seat_away_write_blocking(payload: dict[str, Any]) -> None:
+    """data/seat_away.json - tiny, atomic; a worker thread's job."""
+    try:
+        SEAT_AWAY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SEAT_AWAY_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(payload, indent=1) + "\n", encoding="utf-8")
+        tmp.replace(SEAT_AWAY_PATH)
+    except OSError:
+        pass
+
+
+def _seat_away_read_blocking() -> dict[str, Any]:
+    try:
+        got = json.loads(SEAT_AWAY_PATH.read_text(encoding="utf-8"))
+        return got if isinstance(got, dict) else {}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def seat_away_payload() -> dict[str, Any]:
+    row = seat_away_row()
+    return {"away": ({k: v for k, v in row.items() if k != "expired"}
+                     if row else None),
+            "last_back": _SEAT_STATE.get("last_back", 0.0),
+            "at": time.time()}
+
+
+async def seat_away_save() -> None:
+    try:
+        await asyncio.to_thread(_seat_away_write_blocking, seat_away_payload())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def seat_away_load() -> None:
+    """Once per process: a seat that was out when the station restarted
+    is still out (and comes back through the ordinary road); one out
+    past the hard limit is simply back, said quietly in the log."""
+    if _SEAT_STATE.get("loaded"):
+        return
+    _SEAT_STATE["loaded"] = True
+    try:
+        got = await asyncio.to_thread(_seat_away_read_blocking)
+    except Exception:  # noqa: BLE001
+        got = {}
+    try:
+        _SEAT_STATE["last_back"] = float(got.get("last_back") or 0)
+    except Exception:  # noqa: BLE001
+        pass
+    row = got.get("away") if isinstance(got, dict) else None
+    if not isinstance(row, dict) or str(row.get("seat") or "") not in SEAT_SEATS:
+        return
+    seat = str(row["seat"])
+    since = float(row.get("since") or 0)
+    if since <= 0 or time.time() - since > SEAT_AWAY_HARD_LIMIT:
+        pipeline_log("air", f"(#1034) {booth_actor_name(seat)} was still "
+                            "marked out of the studio from before the "
+                            "restart - past the limit, so simply back")
+        await seat_away_save()
+        return
+    _AWAY.clear()
+    _AWAY[seat] = {k: v for k, v in row.items() if k != "seat"}
+    pipeline_log("air", f"(#1034) {booth_actor_name(seat)} is still out "
+                        f"of the studio across the restart "
+                        f"({int(time.time() - since)}s so far)")
+
+
+def _seat_to_box() -> bool:
+    """Where a by-hand line lands - the same reading _dj_speak_floorless
+    makes, so the door sample follows the voice."""
+    try:
+        voice_to = str(_RADIO.get("voice_to") or "box")
+        if voice_to in ("box", "both") and not box_talk_ok():
+            return False
+        return voice_to in ("box", "both")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _seat_door_sample_blocking(reason: str) -> Path | None:
+    """A door/footsteps sample from the SFX store, by name; None when
+    the packs carry nothing of the kind (the exit then goes without).
+    Reads a folder over the wire - a worker thread's job."""
+    try:
+        words = tuple((SEAT_AWAY_BOOK.get(reason) or {}).get("sfx")
+                      or ("door", "footstep"))
+        banned = sfx_bans()
+        pool = [p for p in sfx_all()
+                if any(w in p.stem.lower() for w in words)
+                and sfx_short(p) and sfx_id(p) not in banned]
+        return random.choice(pool) if pool else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def seat_door_sting(seat: str, reason: str, after: str) -> str:
+    try:
+        sample = await asyncio.to_thread(_seat_door_sample_blocking, reason)
+        if sample is None:
+            return ""
+        return await dj_sting(_seat_to_box(), after, who=seat, force=True,
+                              sample=sample)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+async def seat_say(seat: str, line: str) -> str:
+    """The by-hand door _sting_react uses: no floor, no pause gate, no
+    repeat gates - a scripted aside in that seat's own voice."""
+    spoken = await dj_speak("aside", None, line=line, who=seat,
+                            by_hand=True, sting=False)
+    if spoken:
+        try:
+            talk_said_now()          # a cast line went out, by hand or not
+        except Exception:  # noqa: BLE001
+            pass
+    return spoken
+
+
+async def seat_go_away(seat: str, reason: str, why: str) -> bool:
+    """Mark the seat out, speak the exit, the door behind them."""
+    if _SEAT_STATE.get("talking") or seat_away_who():
+        return False
+    _SEAT_STATE["talking"] = True
+    try:
+        dj = dj_settings()
+        mins = max(2, min(6, int(dj.get("seat_away_minutes") or 4)))
+        span = max(120.0, min(360.0, mins * 60.0 * random.uniform(0.75, 1.25)))
+        line = seat_line(reason, "leave")
+        now = time.time()
+        _AWAY.clear()
+        _AWAY[seat] = {"since": now, "reason": reason, "until": now + span,
+                       "line": line, "name": booth_actor_name(seat),
+                       "why": why}
+        _SEAT_STATE["left"] = int(_SEAT_STATE.get("left") or 0) + 1
+        # #1146: the exit line and the door behind it are ONE turn on the
+        # air. seat_say goes out by hand and takes no floor of its own, so
+        # without this the torrent can start a round in the gap between
+        # them and the break lands inside somebody else's conversation.
+        _floor = await _floor_take("a seat break")
+        try:
+            spoken = await seat_say(seat, line)
+            if not spoken:
+                # The line did not go out (output muted, a render fault):
+                # a break nobody heard announced is not a break.
+                _AWAY.pop(seat, None)
+                pipeline_log("drop", f"(#1034) {booth_actor_name(seat)}'s "
+                                     "exit line never aired - the seat stays")
+                return False
+            await seat_door_sting(seat, reason, spoken)
+        finally:
+            _floor_drop(_floor)
+        label = str(SEAT_AWAY_BOOK[reason]["label"])
+        pipeline_log(
+            "air", f"(#1034) {booth_actor_name(seat)} is out of the studio "
+                   f"- {label} - {why}; back in about {int(span)}s",
+            extra=("THE SEAT WATCH (#1034)\n\nOne presenter had been "
+                   "carrying the show alone: " + why + ".\n\nThe silent "
+                   "seat said where they were going, in their own voice: "
+                   f"\"{line}\"\n\nWhile they are out the round writer is "
+                   "told the chair is empty, no marker is flipped into "
+                   "it, the larder is not shopped, and cover never picks "
+                   "it. They come back after the away span or before the "
+                   "next round that needs both of them."))
+        note_action(f"{booth_actor_name(seat)} stepped out ({label})",
+                    f"{why}; back in about {int(span)}s")
+        await seat_away_save()
+        return True
+    finally:
+        _SEAT_STATE["talking"] = False
+
+
+async def seat_come_back(why: str, speak: bool = True) -> bool:
+    """Clear the away state; say the return line first when the air is
+    ours to take (on, not paused)."""
+    row = seat_away_row()
+    if not row or _SEAT_STATE.get("talking"):
+        return False
+    _SEAT_STATE["talking"] = True
+    seat = str(row["seat"])
+    try:
+        reason = str(row.get("reason") or "coffee")
+        line = seat_line(reason, "back")
+        spoken = ""
+        if speak and _RADIO.get("on") and not radio_paused():
+            # #1146: the return line holds the floor like any other
+            # station-initiated line, so it cannot land mid-round.
+            _floor = await _floor_take("a seat coming back")
+            try:
+                spoken = await seat_say(seat, line)
+            finally:
+                _floor_drop(_floor)
+        _AWAY.pop(seat, None)
+        _SEAT_STATE["last_back"] = time.time()
+        _SEAT_STATE["returned"] = int(_SEAT_STATE.get("returned") or 0) + 1
+        gone = int(time.time() - float(row.get("since") or time.time()))
+        pipeline_log(
+            "air", f"(#1034) {booth_actor_name(seat)} is back in the "
+                   f"studio after {gone}s - {why}"
+                   + ("" if spoken else " (nothing said: the return line "
+                                        "did not air)"),
+            extra=f"\"{line}\"")
+        note_action(f"{booth_actor_name(seat)} is back ({why})",
+                    f"away {gone}s")
+        await seat_away_save()
+        return True
+    finally:
+        _SEAT_STATE["talking"] = False
+
+
+async def seat_return_if_needed(kind: str = "") -> bool:
+    """The round-top hook (torrent dispatch, the record road before
+    banter): a seat whose break is over, or whose absence the coming
+    round cannot carry, comes back before the round is written."""
+    row = seat_away_row()
+    if not row:
+        return False
+    now = time.time()
+    if row.get("expired"):
+        return await seat_come_back("the fifteen-minute limit")
+    if now >= float(row.get("until") or 0):
+        return await seat_come_back("the break is over")
+    if str(kind or "") in SEAT_NEEDS_BOTH:
+        return await seat_come_back(f"a {kind} round needs both seats")
+    return False
+
+
+async def seat_watch_tick() -> None:
+    """Inside talk_watch's 15 s tick, after its on/paused/floor gates:
+    pay a due return, or send a seat that has sat silent on its break."""
+    dj = dj_settings()
+    if not dj.get("seat_breaks", True):
+        return
+    await seat_away_load()
+    row = seat_away_row()
+    now = time.time()
+    if row:
+        if row.get("expired"):
+            await seat_come_back("the fifteen-minute limit")
+        elif now >= float(row.get("until") or 0):
+            await seat_come_back("the break is over")
+        return
+    if now - float(_SEAT_STATE.get("last_back") or 0) < SEAT_REST_AFTER_BACK:
+        return
+    if call_line_busy():
+        return
+    hit = seat_detect(seat_rows(), now,
+                      n_lines=int(dj.get("seat_quiet_lines") or 6),
+                      minutes=float(dj.get("seat_quiet_minutes") or 6),
+                      call_live=False)
+    if not hit:
+        return
+    seat = str(hit["seat"])
+    other = booth_actor_name(str(hit["other"]))
+    why = (f"{other} had carried {hit['lines']} lines over "
+           f"{hit['minutes']} minutes with {booth_actor_name(seat)} silent "
+           f"({hit['why']})")
+    await seat_go_away(seat, seat_reason_draw(), why)
+
+
+def seat_state() -> dict[str, Any]:
+    """GET /api/dj/seats: each seat's last line and the lines the other
+    has aired since, the away record, the dials, and what the detector
+    would say right now."""
+    dj = dj_settings()
+    rows = seat_rows()
+    now = time.time()
+    out: dict[str, Any] = {}
+    for seat in SEAT_SEATS:
+        other = seat_other(seat)
+        last = seat_last_spoke(seat, rows)
+        since = [r for r in rows if r["who"] == other and r["conv"]
+                 and r["t"] > last]
+        out[seat] = {
+            "name": booth_actor_name(seat),
+            "last": round(last, 1),
+            "ago": round(now - last, 1) if last else None,
+            "lines": len(since),          # the OTHER seat's lines since
+            "aired": sum(1 for r in rows if r["who"] == seat),
+        }
+    row = seat_away_row()
+    out["away"] = ({**{k: v for k, v in row.items() if k != "expired"},
+                    "for": round(now - float(row.get("since") or now), 1),
+                    "back_in": round(max(0.0, float(row.get("until") or now)
+                                         - now), 1)}
+                   if row else None)
+    out["would_fire"] = seat_detect(rows, now,
+                                    n_lines=int(dj.get("seat_quiet_lines") or 6),
+                                    minutes=float(dj.get("seat_quiet_minutes") or 6),
+                                    call_live=bool(call_line_busy()))
+    out["dials"] = {k: dj.get(k) for k in ("seat_breaks", "seat_quiet_lines",
+                                           "seat_quiet_minutes",
+                                           "seat_away_minutes")}
+    out["counts"] = {"left": _SEAT_STATE.get("left", 0),
+                     "returned": _SEAT_STATE.get("returned", 0),
+                     "last_back": _SEAT_STATE.get("last_back", 0.0)}
+    out["rows"] = len(rows)
+    return out
+
+
+
 _COVER_AT = [0.0]
 
 
@@ -51339,10 +53586,25 @@ def cover_speaker(blocked: str = "") -> tuple[str, str]:
     dj = dj_settings()
     seats = [("cohost", dj.get("cohost_voice")), ("third", dj.get("third_voice")),
              ("dj", dj.get("voice")), ("drop", dj.get("drop_voice"))]
+    _away = seat_away_who()             # #1034: not the empty chair
     live = [(who, str(v or "")) for who, v in seats
-            if who != blocked and str(v or "").strip()]
+            if who != blocked and who != _away and str(v or "").strip()]
     fast = [(w, v) for w, v in live if not VOICE_ID_SHAPE.match(v)]
-    return (fast or live or [("cohost", "")])[0]
+    # #1021 (f): under the avoid-Piper policy a CLONE-voiced seat covers
+    # first while a clone engine is up - a cover in a Piper voice is a
+    # Piper voice on the air, which is the thing being avoided. The
+    # Piper seat remains the fallback, and the log says when it is used.
+    if voicepolicy_holds():
+        cloned = [(w, v) for w, v in live if VOICE_ID_SHAPE.match(v)]
+        if cloned:
+            return cloned[0]
+        if fast:
+            voicepolicy_say("cover:piper",
+                            f"{fast[0][0]} covers in a Piper voice - no "
+                            "clone-voiced seat is free to cover (#1021)")
+    # #1034: and the last resort is never the chair we know is empty.
+    return (fast or live
+            or [("dj" if _away == "cohost" else "cohost", "")])[0]
 
 
 # --- THE TALK WATCHDOG (#1088) ----------------------------------------
@@ -51354,6 +53616,755 @@ _LAST_SAID = [0.0]
 # How long the pair may be quiet before somebody covers. The measured
 # p90 between lines is 64s, so this sits above the ordinary rhythm of
 # the show and below the three-minute holes that are the fault.
+# ---- #1022 GAP LEDGER BEGIN ------------------------------------------------
+# #1022: THE SILENCES BETWEEN LINES, MEASURED AND ATTRIBUTED.
+#
+# The operator's question was "why does the radio dialogue have such spaces
+# in between". Every clock on this station answered a different question:
+# _GAPS counts a spinning record as air, talk_quiet_for() is instantaneous
+# and never written down, the pipeline ring turns over in five minutes on a
+# busy night. Nothing kept the one number that matters - the seconds between
+# the END of one cast line and the START of the next - or said what the
+# station was doing in that hole.
+#
+# Measured on the live ring, 2026-09-04 19:34-19:58 (the on-air stretch
+# before a pause): 62 cast lines, 9 silences of 10s or more, 407s of a
+# 1417s stretch (28.7%), the longest 94.5s, the median 46s - and EVERY one
+# of them fell on a page boundary (the 2/4/8/8 batch ladder of speak_turns)
+# or a round turnover, never inside a page. The recording room said why:
+# 200 of 229 takes that session were rendered LIVE (shelf_served 29), at
+# 1.0-2.6x real time per line, while 36 finished banter rounds sat in the
+# larder. Dead air at a boundary is max(0, render_time - spoken_time), and
+# a live first page has nothing to hide behind at all.
+#
+# This module (a) derives the gaps from the booth ring (the only per-line
+# record with air moments; G1's durable air log is used instead when it is
+# merged - see gap_lines), (b) attributes each to what preceded and
+# followed it - page or round boundary, the round's kind and whether it
+# was live-only, live takes rendered during the hole, a pause/resume
+# inside it, loop stalls inside it - (c) keeps the closed gaps in
+# data/gap_log.jsonl off the loop so the analysis outlives the ring, and
+# (d) drives two small round-choice rules in the torrent: a resume runway
+# and stock-first after a long hole. Nothing here touches page sizes, the
+# leads or the floor lock (#1146/#1151 invariants).
+GAP_LOG_PATH = data_path("gap_log.jsonl")
+GAP_MIN_SECONDS = 10.0            # under this a silence is a beat, not a gap
+GAP_STOCK_FIRST_AFTER = 40.0      # a hole this long arms the stock-first rule
+GAP_STOCK_FIRST_ROUNDS = 2        # ...for this many rounds
+GAP_STOCK_FIRST_DEPTH = 0.3       # ...or a pantry this shallow does
+GAP_STOCK_FIRST_EVERY = 900.0     # ...but depth may only re-arm this often
+GAP_RESUME_RUNWAY_SECONDS = 600.0  # after a resume, banked kinds are preferred
+GAP_KEEP_SECONDS = 48 * 3600.0
+GAP_CAST = ("dj", "cohost", "third", "caller", "caller2", "drop")
+GAP_NOT_SPEECH = ("chat", "marker", "sfx", "hangup", "analysis",
+                  "image_analysis", "upstairs", "reply", "aside", "drop")
+GAP_AIRED = ("box", "page", "stream", "both")
+# Written live by construction (CANNOT_PREPARE plus the angle rounds that
+# no shelf can hold) - the kinds the stock-first rule steps around.
+GAP_LIVE_ONLY = ("deep", "recap", "guest", "bombshell")
+# Ballast and cover, never a talk round: the policy leaves these alone.
+GAP_NOT_TALK = ("record", "ad", "track_talk", "station_id")
+_GAP_ROUNDS: list[dict[str, Any]] = []      # {at, kind, label, sheet, why,
+                                            #  live_only, banked, aired, ended}
+_GAP_MARKS: list[dict[str, Any]] = [        # {at, what, why}
+    {"at": time.time(), "what": "boot", "why": "process start"}]
+_GAP_STOCK_FIRST = [0]                      # rounds left under the rule
+_GAP_STOCK_FIRST_KEY = [""]                 # the gap that armed it last
+_GAP_STOCK_FIRST_AT = [0.0]                 # when depth last armed it
+_GAP_FILE: dict[str, Any] = {"at": 0.0, "rows": []}
+_GAP_SEEN: dict[str, float] = {}            # gap key -> when it was written
+_GAP_COMPACTED = [0.0]
+
+
+def gap_pause_bank_rounds(dj: dict[str, Any] | None = None) -> int:
+    """#1022: the paused larder floor, from the dial (0 turns it off)."""
+    try:
+        return max(0, min(60, int((dj or {}).get("pause_bank_rounds", 12))))
+    except Exception:  # noqa: BLE001
+        return 12
+
+
+def gap_mark(what: str, why: str = "") -> None:
+    """A pause, a resume, a boot - the events a gap is read against."""
+    try:
+        _GAP_MARKS.append({"at": time.time(), "what": str(what)[:24],
+                           "why": str(why or "")[:120]})
+        del _GAP_MARKS[:-200]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def gap_round_note(kind: str, label: str = "", sheet: bool = False,
+                   why: str = "") -> None:
+    """The torrent is about to run a round of this kind."""
+    try:
+        _GAP_ROUNDS.append({
+            "at": time.time(), "kind": str(kind or "")[:24],
+            "label": str(label or "")[:80], "sheet": bool(sheet),
+            "why": str(why or "")[:160],
+            "live_only": bool(kind in CANNOT_PREPARE or kind in GAP_LIVE_ONLY),
+            "banked": False, "aired": None, "ended": 0.0})
+        del _GAP_ROUNDS[:-120]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def gap_round_flag(flag: str) -> None:
+    """dj_banter says the round came off the larder shelf."""
+    try:
+        if _GAP_ROUNDS:
+            _GAP_ROUNDS[-1][str(flag)[:16]] = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def gap_round_done(aired: bool) -> None:
+    try:
+        if _GAP_ROUNDS:
+            _GAP_ROUNDS[-1]["aired"] = bool(aired)
+            _GAP_ROUNDS[-1]["ended"] = time.time()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gap_round_at(t: float) -> dict[str, Any]:
+    """The round record in force at moment t (the last one started by then)."""
+    got: dict[str, Any] = {}
+    for r in _GAP_ROUNDS:
+        if float(r.get("at") or 0) <= t:
+            got = r
+        else:
+            break
+    return got
+
+
+def _gap_row_time(r: dict[str, Any]) -> float:
+    try:
+        return float(r.get("air_at") or r.get("ts") or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _gap_row_len(r: dict[str, Any]) -> float:
+    """How long the line SOUNDS: the burst slice when the row carries one,
+    else the render's seconds, else chars/14 (the page-feed estimate)."""
+    try:
+        if r.get("clip_until") is not None and r.get("clip_from") is not None:
+            return max(0.0, float(r["clip_until"]) - float(r["clip_from"])
+                       - float(r.get("clip_tail") or 0))
+        tr = r.get("trace")
+        rs = (tr.get("render") or {}) if isinstance(tr, dict) else {}
+        if rs.get("seconds"):
+            return float(rs["seconds"])
+        if r.get("seconds"):
+            return float(r["seconds"])
+    except Exception:  # noqa: BLE001
+        pass
+    return len(str(r.get("text") or "")) / 14.0
+
+
+def gap_lines(chat: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    """Cast lines that actually AIRED, in the order the room heard them.
+
+    Reads the booth ring (memory). When lane G1's durable air log is
+    merged, replace the source here with airlog_rows(...) - nothing else in
+    this module reads the ring. Held rows are excluded until the hold-shelf
+    drain flips them; operator chat, markers, stings and analysis rows are
+    not speech."""
+    src = chat if chat is not None else list(_RADIO.get("chat") or [])
+    out: list[dict[str, Any]] = []
+    for r in src:
+        if not isinstance(r, dict):
+            continue
+        if r.get("who") not in GAP_CAST or r.get("kind") in GAP_NOT_SPEECH:
+            continue
+        if r.get("aired") not in GAP_AIRED:
+            continue
+        t = _gap_row_time(r)
+        if t <= 0:
+            continue
+        ln = _gap_row_len(r)
+        tr = r.get("trace")
+        rs = (tr.get("render") or {}) if isinstance(tr, dict) else {}
+        out.append({
+            "t": t, "end": t + max(0.0, ln), "seconds": round(ln, 2),
+            "id": str(r.get("id") or ""), "who": str(r.get("who") or ""),
+            "kind": str(r.get("kind") or ""),
+            "page": str(r.get("clip_media") or r.get("media") or "")[:8],
+            "source": str(r.get("source") or ""),
+            "aired": str(r.get("aired") or ""),
+            "render_ms": int(rs.get("ms") or 0) if rs else 0,
+            "name": str(r.get("name") or ""),
+            "text": str(r.get("text") or "")[:80],
+        })
+    out.sort(key=lambda x: x["t"])
+    return out
+
+
+def _gap_stalls_between(lo: float, hi: float) -> tuple[float, list[str]]:
+    secs = 0.0
+    tops: list[str] = []
+    try:
+        with _PULSE_LOCK:
+            rows = list(_PULSE.get("stalls") or [])
+        for st in rows:
+            at = float(st.get("at") or 0)
+            if lo <= at <= hi + 1.0:
+                secs += float(st.get("seconds") or 0)
+                tops.append(str(st.get("top") or "")[:60])
+    except Exception:  # noqa: BLE001
+        pass
+    return round(secs, 1), tops[:4]
+
+
+def _gap_takes_between(lo: float, hi: float) -> dict[str, Any]:
+    live = shelf = 0
+    live_ms = 0
+    try:
+        for tk in list(_TAKES):
+            at = float(tk.get("at") or 0)
+            if lo - 2.0 <= at <= hi + 1.0:
+                if str(tk.get("how") or "") == "live":
+                    live += 1
+                    live_ms += int(tk.get("ms") or 0)
+                else:
+                    shelf += 1
+    except Exception:  # noqa: BLE001
+        pass
+    return {"live": live, "shelf": shelf, "live_ms": live_ms}
+
+
+def _gap_marks_between(lo: float, hi: float) -> list[str]:
+    try:
+        return [str(m.get("what") or "") for m in _GAP_MARKS
+                if lo <= float(m.get("at") or 0) <= hi]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _gap_paused_between(lo: float, hi: float) -> float:
+    """#1150: how much of a silence was OFF AIR ON PURPOSE.
+
+    Pause and resume are marked in _GAP_MARKS; the overlap with them is
+    not dead air. In memory rather than off data/pause_log.jsonl,
+    because gap_brief is read on the /api/dj poll."""
+    spans: list[tuple[float, float]] = []
+    open_at: float | None = None
+    try:
+        for mark in _GAP_MARKS:
+            what = str(mark.get("what") or "")
+            at = float(mark.get("at") or 0)
+            if what == "pause":
+                if open_at is None:
+                    open_at = at
+            elif what == "resume" and open_at is not None:
+                spans.append((open_at, at))
+                open_at = None
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if open_at is None:
+        # A pause the marks never closed - the station is off air now.
+        # Its own try: a fault here may not forget the closed pauses.
+        try:
+            if radio_paused():
+                open_at = float(_RADIO.get("paused_at") or 0) or None
+        except Exception:  # noqa: BLE001
+            open_at = None
+    if open_at is not None:
+        spans.append((open_at, max(hi, open_at)))
+    try:
+        return sum(max(0.0, min(b, hi) - max(a, lo)) for a, b in spans)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _gap_cause(row: dict[str, Any]) -> str:
+    """Name the cause from the evidence on the row, most specific first."""
+    marks = row.get("marks") or []
+    if "resume" in marks:
+        return "resume with an empty bank"
+    if "pause" in marks:
+        return "pause"
+    if "boot" in marks:
+        return "restart"
+    if float(row.get("stall_s") or 0) >= 3.0:
+        return "event-loop stall"
+    takes = row.get("takes") or {}
+    rnd = row.get("round") or {}
+    if row.get("boundary") == "round":
+        if rnd.get("live_only"):
+            return "live write (cannot prepare)"
+        if rnd.get("banked") and int(takes.get("live") or 0) > 0:
+            return "pantry miss on a banked round"
+        if int(takes.get("live") or 0) > 0:
+            return "round turnover - written and rendered live"
+        return "round turnover"
+    if row.get("boundary") == "page":
+        if rnd.get("banked") and int(takes.get("live") or 0) > 0:
+            return "pantry miss on a banked round"
+        if int(takes.get("live") or 0) > 0:
+            return "page render (live) - max(0, render - spoken)"
+        return "page join"
+    return "mid-round hole"
+
+
+def gap_rows(chat: list[dict[str, Any]] | None = None,
+             now: float | None = None,
+             least: float = GAP_MIN_SECONDS) -> list[dict[str, Any]]:
+    """Every silence of `least` seconds or more between consecutive cast
+    lines, end-of-previous to start-of-next, with what preceded and
+    followed it and what the station was doing meanwhile.
+
+    #1150: `seconds` is the DEAD part - the pause the operator asked for
+    is not a hole in the show. `wall_seconds` keeps the measured span
+    and `paused_seconds` the overlap with the pause marks, and a silence
+    that was wholly a pause is not a row at all."""
+    lines = gap_lines(chat)
+    out: list[dict[str, Any]] = []
+    prev: dict[str, Any] | None = None
+    for cur in lines:
+        if prev is not None:
+            hole = cur["t"] - prev["end"]
+            paused_s = min(hole, _gap_paused_between(prev["end"], cur["t"]))
+            dead = max(0.0, hole - paused_s)
+            if dead >= least:                       # #1150: pause-honest
+                lo, hi = prev["end"], cur["t"]
+                rnd = _gap_round_at(hi)
+                started_inside = bool(rnd) and lo < float(rnd.get("at") or 0) <= hi
+                if prev["page"] and prev["page"] == cur["page"]:
+                    boundary = "line"
+                elif started_inside:
+                    boundary = "round"
+                else:
+                    boundary = "page"
+                stall_s, tops = _gap_stalls_between(lo, hi)
+                row = {
+                    "key": f"{prev['id']}|{cur['id']}",
+                    "at": round(lo, 2), "until": round(hi, 2),
+                    "seconds": round(dead, 1),      # #1150: the hole
+                    "wall_seconds": round(hole, 1),  # ...end to end
+                    "paused_seconds": round(paused_s, 1),
+                    "boundary": boundary,
+                    "prev": {k: prev[k] for k in ("id", "who", "kind", "page",
+                                                   "source", "aired", "text")},
+                    "next": {k: cur[k] for k in ("id", "who", "kind", "page",
+                                                  "source", "aired", "text")},
+                    "next_render_ms": cur.get("render_ms") or 0,
+                    "round": ({k: rnd.get(k) for k in ("kind", "label", "sheet",
+                                                        "live_only", "banked")}
+                              if rnd else {}),
+                    "takes": _gap_takes_between(lo, hi),
+                    "stall_s": stall_s, "stall_top": tops,
+                    "marks": _gap_marks_between(lo, hi),
+                }
+                row["cause"] = _gap_cause(row)
+                out.append(row)
+        prev = cur
+    return out
+
+
+def gap_last_row(now: float | None = None,
+                 within: float = 1800.0) -> dict[str, Any]:
+    """The most recent closed gap, or {} when it closed more than
+    `within` seconds ago (or there is none)."""
+    try:
+        now = now or time.time()
+        rows = gap_rows(now=now)
+        if not rows:
+            return {}
+        last = rows[-1]
+        if now - float(last.get("until") or 0) > within:
+            return {}
+        return last
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def gap_last_closed(now: float | None = None,
+                    within: float = 1800.0) -> float:
+    """Seconds of the most recent closed gap, or 0 when the last one closed
+    more than `within` seconds ago (or there is none)."""
+    try:
+        return float(gap_last_row(now, within).get("seconds") or 0)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def gap_brief(now: float | None = None) -> dict[str, Any]:
+    """The small version for dialogue_flow - the ring only, no disk."""
+    now = now or time.time()
+    try:
+        rows = gap_rows(now=now)
+    except Exception:  # noqa: BLE001
+        rows = []
+    hour = [r for r in rows if float(r.get("until") or 0) >= now - 3600]
+    last = rows[-1] if rows else None
+    runway = max(0.0, float(_RADIO.get("resume_runway_until") or 0) - now)
+    return {
+        "last_gap_s": float(last["seconds"]) if last else 0.0,
+        "last_gap_cause": str(last["cause"]) if last else "",
+        "last_gap_ago_s": (round(now - float(last["until"]), 1)
+                           if last else None),
+        "count_hour": len(hour),
+        "total_hour_s": round(sum(float(r["seconds"]) for r in hour), 1),
+        "longest_hour_s": round(max((float(r["seconds"]) for r in hour),
+                                    default=0.0), 1),
+        "stock_first_left": int(_GAP_STOCK_FIRST[0]),
+        "runway_left_s": round(runway, 1),
+    }
+
+
+def gap_report(hours: float = 3.0,
+               chat: list[dict[str, Any]] | None = None,
+               file_rows: list[dict[str, Any]] | None = None,
+               now: float | None = None) -> dict[str, Any]:
+    """#1022: the gap analysis, as GET /api/dj/gaps returns it and as the
+    Gazette's report desk reads it (paper_material['gaps']).
+
+    Live rows come off the ring; older rows off data/gap_log.jsonl (the
+    keeper's copy in memory unless `file_rows` is handed in). Causes are
+    ranked by seconds lost."""
+    now = now or time.time()
+    hours = max(0.05, float(hours or 3.0))
+    since = now - hours * 3600.0
+    live = gap_rows(chat, now)
+    older = file_rows if file_rows is not None else list(_GAP_FILE.get("rows") or [])
+    seen: dict[str, dict[str, Any]] = {}
+    for r in list(older) + live:            # live rows win on the same key
+        try:
+            if float(r.get("until") or 0) < since:
+                continue
+            seen[str(r.get("key") or f"{r.get('at')}")] = r
+        except Exception:  # noqa: BLE001
+            continue
+    rows = sorted(seen.values(), key=lambda r: float(r.get("at") or 0))
+    lines = [ln for ln in gap_lines(chat) if ln["t"] >= since]
+    span = (lines[-1]["end"] - lines[0]["t"]) if len(lines) > 1 else 0.0
+    spoken = sum(float(ln["seconds"]) for ln in lines)
+    total = sum(float(r.get("seconds") or 0) for r in rows)
+    secs = sorted(float(r.get("seconds") or 0) for r in rows)
+    by_cause: dict[str, dict[str, Any]] = {}
+    by_kind: dict[str, dict[str, Any]] = {}
+    by_boundary: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        s = float(r.get("seconds") or 0)
+        for table, key in ((by_cause, str(r.get("cause") or "?")),
+                           (by_kind, str((r.get("round") or {}).get("kind")
+                                         or "?")),
+                           (by_boundary, str(r.get("boundary") or "?"))):
+            cell = table.setdefault(key, {"count": 0, "seconds": 0.0,
+                                          "longest": 0.0})
+            cell["count"] += 1
+            cell["seconds"] = round(cell["seconds"] + s, 1)
+            cell["longest"] = max(cell["longest"], s)
+    ranked = sorted(by_cause.items(), key=lambda kv: -kv[1]["seconds"])
+    longest = max(rows, key=lambda r: float(r.get("seconds") or 0)) if rows else {}
+    # resume events: how long the room waited for the first line after each
+    resumes: list[dict[str, Any]] = []
+    for m in _GAP_MARKS:
+        at = float(m.get("at") or 0)
+        if m.get("what") != "resume" or at < since:
+            continue
+        first = next((ln for ln in lines if ln["t"] >= at), None)
+        resumes.append({"at": at, "why": m.get("why") or "",
+                        "first_line_after_s": (round(first["t"] - at, 1)
+                                               if first else None),
+                        "first_source": (first.get("source") if first else "")})
+    # rounds produced INTO a pause (rendered, never heard - the #1151 class)
+    held_paused = 0
+    try:
+        pauses = [(float(m["at"]), m) for m in _GAP_MARKS
+                  if m.get("what") in ("pause", "resume")]
+        src = chat if chat is not None else list(_RADIO.get("chat") or [])
+        for r in src:
+            if not isinstance(r, dict) or r.get("aired") != "held":
+                continue
+            ts = float(r.get("ts") or 0)
+            if ts < since:
+                continue
+            state = False
+            for at, m in pauses:
+                if at <= ts:
+                    state = m.get("what") == "pause"
+            if state:
+                held_paused += 1
+    except Exception:  # noqa: BLE001
+        pass
+    takes_live = takes_shelf = 0
+    cost: list[float] = []
+    try:
+        for tk in list(_TAKES):
+            if float(tk.get("at") or 0) < since:
+                continue
+            if str(tk.get("how") or "") == "live":
+                takes_live += 1
+                if tk.get("cost"):
+                    cost.append(float(tk["cost"]))
+            else:
+                takes_shelf += 1
+    except Exception:  # noqa: BLE001
+        pass
+    stall_n, stall_s, stall_top = 0, 0.0, {}
+    try:
+        with _PULSE_LOCK:
+            st_rows = list(_PULSE.get("stalls") or [])
+        for st in st_rows:
+            if float(st.get("at") or 0) < since:
+                continue
+            stall_n += 1
+            stall_s += float(st.get("seconds") or 0)
+            top = str(st.get("top") or "").split(" (")[0]
+            stall_top[top] = round(stall_top.get(top, 0.0)
+                                   + float(st.get("seconds") or 0), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    runway = max(0.0, float(_RADIO.get("resume_runway_until") or 0) - now)
+    say = ""
+    if longest:
+        _p = longest.get("prev") or {}
+        _n = longest.get("next") or {}
+        say = (f"longest silence {float(longest.get('seconds') or 0):.0f}s at "
+               f"{time.strftime('%H:%M', time.localtime(float(longest.get('at') or 0)))}"
+               f" - {longest.get('cause')} - after {_p.get('name') or _p.get('who')}"
+               f", before {_n.get('name') or _n.get('who')}"
+               + (f" ({(longest.get('round') or {}).get('kind')} round)"
+                  if (longest.get("round") or {}).get("kind") else ""))
+    elif lines:
+        say = "no silence of ten seconds or more between cast lines"
+    return {
+        "at": now, "hours": hours, "since": since,
+        "source": "chat ring" + (" + gap_log.jsonl" if older else ""),
+        "lines": len(lines), "air_span_s": round(span, 1),
+        "spoken_s": round(spoken, 1),
+        "count": len(rows), "total_s": round(total, 1),
+        "longest_s": round(secs[-1], 1) if secs else 0.0,
+        "median_s": round(secs[len(secs) // 2], 1) if secs else 0.0,
+        "silence_share": round(total / span, 3) if span > 0 else 0.0,
+        "longest": longest,
+        "by_cause": [{"cause": k, **v} for k, v in ranked],
+        "by_round_kind": by_kind, "by_boundary": by_boundary,
+        "worst": sorted(rows, key=lambda r: -float(r.get("seconds") or 0))[:10],
+        "recent": rows[-20:],
+        "resumes": resumes,
+        "held_while_paused": held_paused,
+        "takes": {"live": takes_live, "shelf": takes_shelf,
+                  "live_cost_mean": (round(sum(cost) / len(cost), 2)
+                                     if cost else None)},
+        "stalls": {"count": stall_n, "seconds": round(stall_s, 1),
+                   "top": dict(sorted(stall_top.items(),
+                                      key=lambda kv: -kv[1])[:6])},
+        "policy": {"stock_first_left": int(_GAP_STOCK_FIRST[0]),
+                   "runway_left_s": round(runway, 1),
+                   "stock_first_after_s": GAP_STOCK_FIRST_AFTER,
+                   "stock_first_depth": GAP_STOCK_FIRST_DEPTH,
+                   "runway_s": GAP_RESUME_RUNWAY_SECONDS},
+        "rounds": _GAP_ROUNDS[-12:],
+        "marks": [m for m in _GAP_MARKS if float(m.get("at") or 0) >= since][-20:],
+        "say": say,
+    }
+
+
+def gap_kind_backed(kind: str) -> bool:
+    """Is there finished stock behind this round kind right now? Never
+    answers False on a fault - a policy that misreads the shelf must fall
+    silent, not rewrite the sheet."""
+    try:
+        if kind in CANNOT_PREPARE or kind in GAP_LIVE_ONLY:
+            return False
+        road = str(SCHED_PREP_KIND.get(kind) or kind)
+        return int(prepared_by_kind().get(road) or 0) > 0
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def gap_stock_kind(prefer_caller: bool = False) -> str:
+    """The banked talk kind to fall back on: banter (the larder) or a
+    prepared call, whichever is standing by."""
+    try:
+        pb = prepared_by_kind()
+    except Exception:  # noqa: BLE001
+        return ""
+    order = ("caller", "banter") if prefer_caller else ("banter", "caller")
+    for k in order:
+        if int(pb.get(k) or 0) > 0:
+            return k
+    return ""
+
+
+def gap_kind_policy(kind: str, dj: dict[str, Any] | None = None,
+                    now: float | None = None) -> tuple[str, str]:
+    """#1022: STOCK BEFORE PROSE, twice over.
+
+    (1) The resume runway: for GAP_RESUME_RUNWAY_SECONDS after a resume a
+    round that would have to be written live (a cannot-prepare kind, or a
+    road with nothing finished behind it) becomes a banked banter round or
+    a prepared call instead, when the pantry holds one. The reel covers
+    the first round after resume (#1151); this covers the next ten
+    minutes, which is where the ~100s holes were measured.
+    (2) Stock-first: when the last measured silence ran GAP_STOCK_FIRST_AFTER
+    seconds or more, or the pantry is under GAP_STOCK_FIRST_DEPTH, the next
+    GAP_STOCK_FIRST_ROUNDS rounds prefer prepared kinds over the live-only
+    ones (deep, recap, guest, bombshell). Depth may only re-arm the rule
+    once every GAP_STOCK_FIRST_EVERY seconds - as a latch it took every
+    round of a famine, and the four live-only kinds never aired.
+
+    Returns (kind, why); why is "" when nothing changed. Records, ads,
+    track talk and station IDs are never touched - they are cover, not
+    talk. A sheet entry that is overridden must be marked missed by the
+    caller (sched_result) so the adherence figure stays honest (#937)."""
+    now = now or time.time()
+    kind = str(kind or "")
+    armed_why = ""
+    try:
+        if _GAP_STOCK_FIRST[0] <= 0:
+            _row = gap_last_row(now)
+            last = float(_row.get("seconds") or 0)
+            _key = str(_row.get("key") or "")
+            depth = box_depth()
+            # a gap arms the rule ONCE; a shallow pantry re-arms it at
+            # most every GAP_STOCK_FIRST_EVERY seconds. Re-arming on
+            # depth alone every round was a permanent latch: the four
+            # live-only kinds lost the air for the whole famine.
+            if (last >= GAP_STOCK_FIRST_AFTER
+                    and _key and _key != _GAP_STOCK_FIRST_KEY[0]):
+                _GAP_STOCK_FIRST[0] = GAP_STOCK_FIRST_ROUNDS
+                _GAP_STOCK_FIRST_KEY[0] = _key
+                armed_why = f"the last silence ran {last:.0f}s"
+            elif (depth < GAP_STOCK_FIRST_DEPTH
+                    and now - _GAP_STOCK_FIRST_AT[0] >= GAP_STOCK_FIRST_EVERY):
+                _GAP_STOCK_FIRST[0] = GAP_STOCK_FIRST_ROUNDS
+                _GAP_STOCK_FIRST_AT[0] = now
+                armed_why = f"the pantry is at {depth:.2f} of its horizon"
+    except Exception:  # noqa: BLE001
+        pass
+    if not kind or kind in GAP_NOT_TALK:
+        return kind, ""
+    runway_left = max(0.0, float(_RADIO.get("resume_runway_until") or 0) - now)
+    want, why = "", ""
+    try:
+        if runway_left > 0 and not gap_kind_backed(kind):
+            want = gap_stock_kind(prefer_caller=kind in ("caller",
+                                                         "banter_caller"))
+            if want:
+                why = (f"resume runway ({int(runway_left)}s left): a {kind} "
+                       f"round would be written live, {want} is banked")
+        elif (_GAP_STOCK_FIRST[0] > 0
+              and (kind in CANNOT_PREPARE or kind in GAP_LIVE_ONLY)):
+            want = gap_stock_kind()
+            if want:
+                why = (f"stock-first ({_GAP_STOCK_FIRST[0]} round(s) left"
+                       + (f", {armed_why}" if armed_why else "")
+                       + f"): {kind} is written live, {want} is banked")
+    except Exception:  # noqa: BLE001
+        want, why = "", ""
+    if _GAP_STOCK_FIRST[0] > 0:
+        _GAP_STOCK_FIRST[0] -= 1      # every round while armed spends one
+    if want and want != kind:
+        return want, why
+    return kind, ""
+
+
+def _gap_log_slim(row: dict[str, Any]) -> dict[str, Any]:
+    keep = ("key", "at", "until", "seconds", "wall_seconds",
+            "paused_seconds", "boundary", "prev", "next",
+            "next_render_ms", "round", "takes", "stall_s", "stall_top",
+            "marks", "cause")
+    return {k: row.get(k) for k in keep if k in row}
+
+
+def _gap_log_append(rows: list[dict[str, Any]]) -> None:
+    """Worker thread: one JSONL line per closed gap."""
+    if not rows:
+        return
+    try:
+        GAP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(GAP_LOG_PATH, "a", encoding="utf-8", newline="\n") as fh:
+            for r in rows:
+                fh.write(json.dumps(_gap_log_slim(r), default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _gap_log_read() -> list[dict[str, Any]]:
+    """Worker thread: the ledger, newest 48h, oldest first."""
+    out: list[dict[str, Any]] = []
+    try:
+        if not GAP_LOG_PATH.is_file():
+            return out
+        floor = time.time() - GAP_KEEP_SECONDS
+        with open(GAP_LOG_PATH, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(r, dict) and float(r.get("until") or 0) >= floor:
+                    out.append(r)
+    except Exception:  # noqa: BLE001
+        return out
+    out.sort(key=lambda r: float(r.get("at") or 0))
+    return out[-4000:]
+
+
+def _gap_log_compact() -> None:
+    """Worker thread, at most hourly: rewrite the ledger to its keep window."""
+    try:
+        rows = _gap_log_read()
+        tmp = GAP_LOG_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            for r in rows:
+                fh.write(json.dumps(r, default=str) + "\n")
+        tmp.replace(GAP_LOG_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def gap_keeper() -> None:
+    """#1022: every minute, write the gaps that closed since the last pass
+    to data/gap_log.jsonl (off the loop), refresh the in-memory copy every
+    ten minutes and compact the file hourly. Started beside talk_watch."""
+    await asyncio.sleep(60)
+    try:
+        _GAP_FILE.update({"at": time.time(),
+                          "rows": await asyncio.to_thread(_gap_log_read)})
+    except Exception:  # noqa: BLE001
+        pass
+    while True:
+        await asyncio.sleep(60)
+        try:
+            if not _RADIO.get("on"):
+                continue
+            now = time.time()
+            rows = gap_rows(now=now)
+            fresh = [r for r in rows
+                     if r["key"] not in _GAP_SEEN
+                     and float(r.get("until") or 0) < now - 30]
+            for r in fresh:
+                _GAP_SEEN[r["key"]] = now
+            if len(_GAP_SEEN) > 4000:
+                for k in sorted(_GAP_SEEN, key=_GAP_SEEN.get)[:2000]:
+                    _GAP_SEEN.pop(k, None)
+            if fresh:
+                await asyncio.to_thread(_gap_log_append, fresh)
+                for r in fresh:
+                    _GAP_FILE["rows"].append(_gap_log_slim(r))
+                del _GAP_FILE["rows"][:-4000]
+            if now - float(_GAP_FILE.get("at") or 0) > 600:
+                _GAP_FILE.update({"at": now,
+                                  "rows": await asyncio.to_thread(_gap_log_read)})
+            if now - _GAP_COMPACTED[0] > 3600:
+                _GAP_COMPACTED[0] = now
+                await asyncio.to_thread(_gap_log_compact)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            continue
+# ---- #1022 GAP LEDGER END --------------------------------------------------
+
+
 TALK_QUIET_MOST = 95.0
 TALK_WATCH_TICK = 15.0
 
@@ -51410,6 +54421,14 @@ async def talk_watch() -> None:
                 continue
             if _SPEAKING[0] or _floor_busy():      # #1146
                 continue                # somebody has the floor
+            # #1034: the per-seat watch rides the same tick - a due
+            # return, or a seat that has sat silent behind the other
+            # long enough to be sent on its break. Its own try: a
+            # fault in it must never cost the cover below.
+            try:
+                await seat_watch_tick()
+            except Exception:  # noqa: BLE001
+                pass
             quiet = talk_quiet_for()
             if quiet < talk_quiet_limit():
                 continue
@@ -52345,6 +55364,7 @@ def _news_note(picks: list[dict[str, str]]) -> None:
     rows = _news_covered()
     for story in picks:
         rows.insert(0, {"title": story["title"],
+                        "url": str(story.get("url") or ""),   # #1036 (G1)
                         "keys": sorted(_news_keys(story["title"])),
                         "ts": time.time()})
     try:
@@ -52588,21 +55608,38 @@ async def _news_once(hourly: bool = False,
             _pn_at = float(_pn_entry.get("prep_news_at") or 0)
             _pn_age = (time.time() - _pn_at) if _pn_at else 1e9
             if _pn_age <= NEWS_PREP_LIFE:
+                airlog_round_hint("news", sticky=True)    # #1036 (G1)
                 try:
                     _pn_said = await _banter_air(_pn_entry,
                                                  _RADIO.get("now"))
                 except Exception:  # noqa: BLE001
                     _pn_said = []
+                airlog_round_clear()                       # #1036 (G1)
                 if _pn_said:
                     # The booth is told what went out WHEN it goes out,
                     # never when it was written - the recap reads this.
                     try:
+                        _nm_id = uuid.uuid4().hex[:6]      # #1036 (G1)
                         _RADIO["chat"].append({
+                            "id": _nm_id,
                             "ts": int(time.time()), "who": "host",
                             "kind": "news",
                             "text": "News break: " + str(
                                 _pn_entry.get("prep_news_titles") or ""),
                         })
+                        # #1036 (G1): the marker on its own ledger, with
+                        # the full titles and urls when the banked
+                        # bulletin carried them.
+                        _nm_st = [x for x in (
+                            _pn_entry.get("prep_news_stories") or [])
+                            if isinstance(x, dict)]
+                        airlog_news_said(
+                            _nm_id,
+                            [str(x.get("title") or "") for x in _nm_st]
+                            or [t.strip() for t in str(
+                                _pn_entry.get("prep_news_titles") or ""
+                            ).split(" / ") if t.strip()],
+                            [str(x.get("url") or "") for x in _nm_st])
                     except Exception:  # noqa: BLE001
                         pass
                     try:
@@ -52652,6 +55689,12 @@ async def _news_once(hourly: bool = False,
         body = await drudge_story(story.get("url", ""))
         if body:
             briefs.append(f"FULL STORY — {story['title']}:\n{body}")
+            try:                                            # #1036 (G1)
+                await asyncio.to_thread(
+                    airlog_news_summary, str(story.get("url") or ""),
+                    str(story.get("title") or ""), body)
+            except Exception:  # noqa: BLE001
+                pass
     dug = ("\n\n" + "\n\n".join(briefs)) if briefs else ""
     when = time.strftime("%I:%M %p", time.localtime()).lstrip("0")
     if hourly:
@@ -52703,14 +55746,24 @@ async def _news_once(hourly: bool = False,
     # - or the recap on the hour would be reading an hour that had not
     # happened yet.
     if bank_to is None:
+        _nm_id = uuid.uuid4().hex[:6]                      # #1036 (G1)
         _RADIO["chat"].append({
+            "id": _nm_id,
             "ts": int(time.time()), "who": "host", "kind": "news",
             "text": ("News on the hour: " if hourly else "News break: ")
                     + _titles,
         })
-    _said = await dj_banter(_RADIO.get("now"), angle=angle,
-                            lines=7 if hourly else 6,
-                            bank=bank_to is not None, bank_to=bank_to)
+        airlog_news_said(_nm_id,
+                         [str(h.get("title") or "") for h in picks],
+                         [str(h.get("url") or "") for h in picks])
+        airlog_round_hint("news", sticky=True)
+    try:
+        _said = await dj_banter(_RADIO.get("now"), angle=angle,
+                                lines=7 if hourly else 6,
+                                bank=bank_to is not None, bank_to=bank_to)
+    finally:
+        if bank_to is None:
+            airlog_round_clear()                            # #1036 (G1)
     if bank_to is not None:
         # THE STAMP THAT MAKES THIS SAFE (#855): what rides with a banked
         # bulletin is the age of the FRONT PAGE it was written off, not
@@ -52721,6 +55774,9 @@ async def _news_once(hourly: bool = False,
                 bank_to[-1]["prep_news_at"] = (
                     float(_DRUDGE_CACHE.get("at") or 0) or time.time())
                 bank_to[-1]["prep_news_titles"] = _titles
+                bank_to[-1]["prep_news_stories"] = [        # #1036 (G1)
+                    {"title": str(h.get("title") or ""),
+                     "url": str(h.get("url") or "")} for h in picks]
         except Exception:  # noqa: BLE001
             pass
     return _said
@@ -53852,9 +56908,24 @@ def call_fingerprint(script: Any) -> str:
     return made
 
 
+# #1022: the pulse ledger's top frame - 17 stalls, 31s in one evening,
+# from call_flow_report -> call_novelty walking the whole call history
+# per regrade. Memoised on the script text (the #1142 _CALL_FP_MEMO
+# pattern): the history rows are the same texts every time.
+_CALL_TERMS_MEMO: dict[int, tuple[str, list[str]]] = {}
+
+
 def _call_novelty_terms(script: Any) -> list[str]:
-    words = re.findall(r"[a-z0-9']+", call_script_text(script).lower())
-    return [w for w in words if len(w) > 2 and w not in _CALL_NOVELTY_STOP]
+    text = call_script_text(script)
+    hit = _CALL_TERMS_MEMO.get(hash(text))
+    if hit is not None and hit[0] == text:
+        return list(hit[1])
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    made = [w for w in words if len(w) > 2 and w not in _CALL_NOVELTY_STOP]
+    if len(_CALL_TERMS_MEMO) > 512:
+        _CALL_TERMS_MEMO.clear()
+    _CALL_TERMS_MEMO[hash(text)] = (text, made)
+    return list(made)
 
 
 def _call_novelty_grams(script: Any, width: int = 3) -> set[str]:
@@ -53881,6 +56952,9 @@ def _call_history_scripts(include_shelf: bool = True,
                         "source": str(row.get("source") or ""),
                         "speakerbox_text": str(
                             row.get("speakerbox_text") or ""),
+                        "speakerbox_extra": [
+                            str(t) for t in (row.get("speakerbox_extra")
+                                             or []) if t],            # #1033
                         "script": text})
     if include_shelf:
         try:
@@ -53900,6 +56974,10 @@ def _call_history_scripts(include_shelf: bool = True,
                                     "source": str(meta.get("source") or ""),
                                     "speakerbox_text": str(
                                         meta.get("speakerbox_text") or ""),
+                                    "speakerbox_extra": [
+                                        str(t) for t in
+                                        (meta.get("speakerbox_extra") or [])
+                                        if t],                        # #1033
                                     "script": text})
         except Exception:  # noqa: BLE001
             pass
@@ -53907,15 +56985,24 @@ def _call_history_scripts(include_shelf: bool = True,
 
 
 def call_novelty(script: Any, include_shelf: bool = True,
-                 exclude_entry: Any = None) -> dict[str, Any]:
-    """Exact and structural comparison against calls the station remembers."""
+                 exclude_entry: Any = None,
+                 exclude_ids: set[str] | None = None) -> dict[str, Any]:
+    """Exact and structural comparison against calls the station remembers.
+
+    #1039: `exclude_ids` are the calls a STORY may legitimately resemble
+    - its own earlier parts. A sequel that names the same people and the
+    same trouble was refused here as "too similar to a stored call"; it
+    is compared against every call OTHER than its own now."""
     text = call_script_text(script)
     fingerprint = call_fingerprint(text)
     grams = _call_novelty_grams(text)
     best = 0.0
     matched: dict[str, Any] = {}
     exact = False
+    _skip = {str(x) for x in (exclude_ids or ()) if x}
     for row in _call_history_scripts(include_shelf, exclude_entry):
+        if _skip and str(row.get("id") or "") in _skip:
+            continue                        # #1039: the story's own parts
         other = str(row.get("script") or "")
         other_fp = call_fingerprint(other)
         if fingerprint and other_fp == fingerprint:
@@ -53998,12 +57085,15 @@ def call_speakerbox_novelty(speakerbox_text: str = "",
         return {"ok": True, "required": False, "matched_id": "",
                 "matched_name": ""}
     for row in _call_history_scripts(include_shelf, exclude_entry):
-        other = " ".join(str(row.get("speakerbox_text") or "")
-                         .lower().split())
-        if other and other == flat:
-            return {"ok": False, "required": True,
-                    "matched_id": str(row.get("id") or ""),
-                    "matched_name": str(row.get("name") or "")}
+        # #1033: the semantic seed AND the two fresh chunks a call
+        # carried - one chunk, one call.
+        for held in ([row.get("speakerbox_text")]
+                     + list(row.get("speakerbox_extra") or [])):
+            other = " ".join(str(held or "").lower().split())
+            if other and other == flat:
+                return {"ok": False, "required": True,
+                        "matched_id": str(row.get("id") or ""),
+                        "matched_name": str(row.get("name") or "")}
     return {"ok": True, "required": True, "matched_id": "",
             "matched_name": ""}
 
@@ -54088,8 +57178,19 @@ def call_flow_report(script: Any, caller_name: str = "",
                      include_shelf: bool = True,
                      topic: str = "", source_script: Any = "",
                      speakerbox_text: str = "",
-                     exclude_entry: Any = None) -> dict[str, Any]:
-    """Machine-check conversation, theme, tint fidelity and novelty."""
+                     exclude_entry: Any = None,
+                     story: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Machine-check conversation, theme, tint fidelity and novelty.
+
+    #1039: `story` (the call meta's story dict: id, part, call_ids) makes
+    this a SEQUEL. A returning caller the hosts recognise fails two
+    legs of the stranger's protocol by design - the host says their name
+    before any introduction, and the caller does not introduce
+    themselves - so those legs are skipped, and novelty is measured
+    against every call but the story's own."""
+    _story = dict(story) if isinstance(story, dict) and story.get("id") \
+        else {}
+    _story_ids = {str(x) for x in (_story.get("call_ids") or []) if x}
     turns = banter_turns(call_script_text(script), caller_name, caller2_name)
     caller_at = [i for i, (m, _t) in enumerate(turns) if m in ("C", "E")]
     host_at = [i for i, (m, _t) in enumerate(turns) if m in ("A", "B", "D")]
@@ -54130,7 +57231,8 @@ def call_flow_report(script: Any, caller_name: str = "",
             links += 1
     share = len(caller_at) / max(1, len(turns))
     novelty = call_novelty(script, include_shelf=include_shelf,
-                           exclude_entry=exclude_entry)
+                           exclude_entry=exclude_entry,
+                           exclude_ids=_story_ids or None)      # #1039
     topic_grade = call_topic_report(script, topic)
     speakerbox_grade = call_speakerbox_report(
         script, speakerbox_text, topic)
@@ -54186,11 +57288,13 @@ def call_flow_report(script: Any, caller_name: str = "",
         faults.append("the caller is not heard immediately after the host answers")
     if not answered_line:
         faults.append("the opening host does not audibly answer a ringing line")
-    if host_knew_name:
+    # #1039: a story call-back is greeted by name and skips the
+    # self-introduction - the hosts know exactly who this is.
+    if host_knew_name and not _story:
         faults.append("the host says the stranger's name before they introduce themselves")
-    if not introduced:
+    if not introduced and not _story:
         faults.append("the caller does not introduce themselves")
-    if not intro_only:
+    if not intro_only and not _story:
         faults.append("the caller's first turn is not a brief introduction")
     if not greeted:
         faults.append("a host does not greet the caller by name after the introduction")
@@ -54228,6 +57332,7 @@ def call_flow_report(script: Any, caller_name: str = "",
         "topic": topic_grade, "speakerbox": speakerbox_grade,
         "speakerbox_novelty": speakerbox_novelty,
         "tint": tint_grade,
+        "story": str(_story.get("id") or ""),                     # #1039
     }
 
 
@@ -54282,7 +57387,9 @@ def call_entry_regrade(entry: dict[str, Any],
         include_shelf=include_shelf,
         topic=str(meta.get("topic") or ""), source_script=source,
         speakerbox_text=str(meta.get("speakerbox_text") or ""),
-        exclude_entry=entry)
+        exclude_entry=entry,
+        story=(meta.get("story") if isinstance(meta.get("story"), dict)
+               else entry.get("story")))                          # #1039
     turns = banter_turns(active, caller_name, caller2_name)
     premise = next((said for marker, said in turns
                     if marker in ("C", "E")), "")
@@ -55337,7 +58444,9 @@ def call_log_add(entry: dict[str, Any]) -> None:
         entry.setdefault("fingerprint", call_fingerprint(transcript))
         entry.setdefault("flow", call_flow_report(
             transcript, str(entry.get("name") or ""), include_shelf=False,
-            topic=str(entry.get("topic") or "")))
+            topic=str(entry.get("topic") or ""),
+            story=(entry.get("story")
+                   if isinstance(entry.get("story"), dict) else None)))
     entry.setdefault("id", uuid.uuid4().hex[:12])
     with _HANGUP_LOCK:
         rows = call_log_read()
@@ -55459,7 +58568,9 @@ def call_line_transcript(turns: list[dict[str, Any]]) -> None:
             meta["flow"] = call_flow_report(
                 clean, str(_CALL_LIVE.get("who") or ""),
                 include_shelf=False, topic=str(meta.get("topic") or ""),
-                speakerbox_text=str(meta.get("speakerbox_text") or ""))
+                speakerbox_text=str(meta.get("speakerbox_text") or ""),
+                story=(meta.get("story")
+                       if isinstance(meta.get("story"), dict) else None))
     except Exception:  # noqa: BLE001
         pass
 
@@ -55470,6 +58581,1042 @@ def call_line_free() -> None:
                            "transcript": []})
     except Exception:  # noqa: BLE001
         pass
+
+
+
+# ============================================================================
+# #1033 / #1039 / #1040 (station side): THE PHONE THAT IS NEVER EMPTY, AND
+# THE CALLERS WHO COME BACK.
+#
+# "Call-ins are always waiting; store calls longer; repeat within a 6-10h
+# window if needed; storylines with call-backs the DJs remember; the DJs
+# randomly doing ads."
+#
+# Four small pieces, one module, prefixed story_ so nothing in the file
+# collides (CONTRACT.md):
+#
+#   1. THE CALLER BANK FLOOR. dj.caller_bank_floor finished, never-aired
+#      calls must stand on the shelf; below it the phone road is
+#      hour-short whatever the sheet says (prep_plan / prep_one /
+#      hour_short_kinds / calls_short all read story_bank_short()).
+#   2. THE RE-AIR WINDOW. An aired shelf row is kept (shelf_take, #1033)
+#      and may go out again 6-10 hours later, under three airings, only
+#      when nothing unaired is ready. call_rerun_take() is the second
+#      re-air road: a finished call's mp3 out of radio_cache/calls,
+#      copied into the media store and aired as one clip behind a short
+#      live host intro.
+#   3. THE STORY LEDGER. data/caller_stories.json - a caller whose call
+#      opened a story is promoted to callers.json with their voice and
+#      face pinned, and rings back 45-120 minutes later (after two other
+#      calls) to continue the plot; the hosts remember them by name. Four
+#      to six parts, then it closes.
+#   4. THE RANDOM AD. story_ad_roll() puts an advert into the torrent's
+#      draw and the record loop's talk chain at dj.random_ad_pct, never
+#      inside 240s of the last one.
+#
+# Nothing here reads a large file on the event loop: call_log.json and
+# the recordings folder are read in asyncio.to_thread; the story ledger
+# is a small file written atomically off-loop from a snapshot.
+# ============================================================================
+STORIES_PATH = data_path("caller_stories.json")
+CALL_RERUNS_PATH = data_path("call_reruns.json")
+_STORIES: dict[str, Any] = {"loaded": False, "stories": []}
+_STORIES_LOCK = RLock()
+_RERUNS: dict[str, Any] = {"loaded": False, "rows": {}}
+_STORY_BANK_MEMO: dict[str, Any] = {"at": 0.0, "ready": 0, "viable": 0}
+STORY_PARTS_MIN = 4
+STORY_PARTS_MAX = 6
+STORY_DUE_MIN_S = 45 * 60.0
+STORY_DUE_MAX_S = 120 * 60.0
+STORY_OTHER_CALLS = 2
+STORIES_KEPT = 80
+CALL_RERUN_MOST = 3
+CALL_RERUN_WINDOW_HIGH_H = 10.0
+CALL_RERUN_MIN_SECONDS = 40.0
+
+
+def story_caller_floor() -> int:
+    """#1033: how many finished, unaired calls the shelf must hold."""
+    try:
+        return max(0, min(30, int(dj_settings().get("caller_bank_floor", 6)
+                                  or 0)))
+    except Exception:  # noqa: BLE001
+        return 6
+
+
+def story_repeat_hours() -> float:
+    """#1033: the low edge of the re-air window, 6..10 hours."""
+    try:
+        return max(6.0, min(10.0, float(
+            dj_settings().get("caller_repeat_hours", 6) or 6)))
+    except Exception:  # noqa: BLE001
+        return 6.0
+
+
+def story_rerun_window() -> tuple[float, float]:
+    """#1033: (low, high) seconds since airing inside which a call may go
+    out again. The high edge is fixed at ten hours; the dial moves the
+    low edge, so 10 closes the window."""
+    return (story_repeat_hours() * 3600.0, CALL_RERUN_WINDOW_HIGH_H * 3600.0)
+
+
+def story_rate() -> float:
+    """#1039: the share of finished live calls that open a storyline."""
+    try:
+        return max(0.0, min(1.0, float(dj_settings().get("story_rate", 0.5))))
+    except Exception:  # noqa: BLE001
+        return 0.5
+
+
+def story_bank_counts() -> tuple[int, int]:
+    """#1033: (ready, viable) UNAIRED rows on the caller shelf, memoised
+    three seconds - prep_plan asks once per road per pass and
+    dialogue_row_ready walks the pantry."""
+    now = time.time()
+    if now - float(_STORY_BANK_MEMO.get("at") or 0) < 3.0:
+        return (int(_STORY_BANK_MEMO.get("ready") or 0),
+                int(_STORY_BANK_MEMO.get("viable") or 0))
+    ready = viable = 0
+    try:
+        for r in list(_SHELF.get("caller") or []):
+            try:
+                if not isinstance(r, dict) or not row_unaired(r):
+                    continue
+                if not dialogue_row_viable("caller", r):
+                    continue
+                viable += 1
+                if dialogue_row_ready("caller", r):
+                    ready += 1
+            except Exception:  # noqa: BLE001
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    _STORY_BANK_MEMO.update({"at": now, "ready": ready, "viable": viable})
+    return ready, viable
+
+
+def story_bank_unaired() -> int:
+    """#1033: finished, never-aired calls standing by."""
+    return story_bank_counts()[0]
+
+
+def story_bank_short() -> bool:
+    """#1033: is the phone road below its floor?
+
+    True when fewer READY unaired calls stand than the floor asks for -
+    unless enough are already WRITTEN and only waiting on the rooms
+    (floor + 2 viable rows), in which case another script would only
+    queue behind them. The #1155 paused bypass in prep_one is untouched;
+    this is a second door beside it, open on air as well."""
+    try:
+        floor = story_caller_floor()
+        if floor <= 0:
+            return False
+        ready, viable = story_bank_counts()
+        return ready < floor and viable < floor + 2
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def story_rerun_ok_row(row: dict[str, Any]) -> bool:
+    """#1033: may this AIRED shelf row go out again right now? Inside the
+    6-10h window and under three airings. repeat_safe()'s time-word test
+    is deliberately not applied: nearly every call says "tonight", and
+    the operator asked for repeats inside one night."""
+    try:
+        out_at = float(row.get("aired_at") or 0)
+        if not out_at:
+            return False
+        if int(row.get("aired") or 0) >= CALL_RERUN_MOST:
+            return False
+        low, high = story_rerun_window()
+        age = time.time() - out_at
+        return low <= age <= high
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def story_rerun_keep_row(row: dict[str, Any]) -> bool:
+    """#1033: is an aired call still worth shelf room? Until its window
+    has closed or its airings are spent."""
+    try:
+        out_at = float(row.get("aired_at") or 0)
+        if not out_at:
+            return True
+        if int(row.get("aired") or 0) >= CALL_RERUN_MOST:
+            return False
+        return (time.time() - out_at) <= story_rerun_window()[1]
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# --- the story ledger --------------------------------------------------------
+def _story_read_blocking() -> list[dict[str, Any]]:
+    try:
+        got = json.loads(STORIES_PATH.read_text(encoding="utf-8"))
+        rows = got.get("stories") if isinstance(got, dict) else got
+        return [r for r in (rows or []) if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _story_write_blocking(stories: list[dict[str, Any]]) -> None:
+    """Atomic, small, off-loop (called through asyncio.to_thread)."""
+    try:
+        STORIES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = STORIES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"stories": stories[-STORIES_KEPT:],
+                                   "at": time.time()}, indent=1) + "\n",
+                       encoding="utf-8")
+        tmp.replace(STORIES_PATH)
+    except OSError:
+        pass
+
+
+def story_rows() -> list[dict[str, Any]]:
+    """The ledger in memory; loaded once (a small file)."""
+    with _STORIES_LOCK:
+        if not _STORIES.get("loaded"):
+            _STORIES["stories"] = _story_read_blocking()
+            _STORIES["loaded"] = True
+        return _STORIES["stories"]
+
+
+async def story_save() -> None:
+    """Write the ledger from a snapshot, off the loop."""
+    try:
+        with _STORIES_LOCK:
+            snap = json.loads(json.dumps(story_rows()))
+        await asyncio.to_thread(_story_write_blocking, snap)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def story_find(sid: str) -> dict[str, Any] | None:
+    sid = str(sid or "")
+    if not sid:
+        return None
+    return next((r for r in story_rows() if str(r.get("id") or "") == sid),
+                None)
+
+
+def story_open_for(name: str) -> dict[str, Any] | None:
+    """The open story of this caller, if they have one."""
+    want = str(name or "").strip().lower()
+    if not want:
+        return None
+    return next((r for r in story_rows()
+                 if str(r.get("status") or "") == "open"
+                 and str((r.get("caller") or {}).get("name") or "")
+                 .strip().lower() == want), None)
+
+
+def story_due() -> dict[str, Any] | None:
+    """#1039: the story whose caller should ring back NOW - next_due has
+    passed and at least two other calls have aired since. Oldest due
+    first. None while paused or while a call is up (defer, never lose)."""
+    try:
+        if radio_paused() or call_line_busy():
+            return None
+        now = time.time()
+        due = [r for r in story_rows()
+               if str(r.get("status") or "") == "open"
+               and float(r.get("next_due") or 0) <= now
+               and int(r.get("other_calls_since") or 0) >= STORY_OTHER_CALLS]
+        if not due:
+            return None
+        due.sort(key=lambda r: float(r.get("next_due") or 0))
+        return due[0]
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def story_call_ids(story: dict[str, Any] | None) -> set[str]:
+    out: set[str] = set()
+    for b in (story or {}).get("beats") or []:
+        cid = str((b or {}).get("call_id") or "")
+        if cid:
+            out.add(cid)
+    for cid in (story or {}).get("call_ids") or []:
+        if cid:
+            out.add(str(cid))
+    return out
+
+
+def story_meta(story: dict[str, Any]) -> dict[str, Any]:
+    """What rides in a call's meta (and so into call_log.json): enough
+    for the contract grader to know this is a sequel, and which calls
+    are its own."""
+    beats = list(story.get("beats") or [])
+    return {"id": str(story.get("id") or ""),
+            "part": len(beats) + 1,
+            "of": int(story.get("parts_planned") or STORY_PARTS_MAX),
+            "call_ids": sorted(story_call_ids(story))}
+
+
+def story_memory_clause() -> str:
+    """#1039: one short line for show_memory - the callers with a story
+    still open tonight, so the hosts can refer to them between calls.
+    Kept under 200 characters; show_memory rides every write."""
+    try:
+        opened = [r for r in story_rows()
+                  if str(r.get("status") or "") == "open"
+                  and (r.get("beats") or [])]
+        if not opened:
+            return ""
+        bits = []
+        for r in opened[-2:]:
+            name = str((r.get("caller") or {}).get("name") or "someone")
+            hang = str((r.get("beats") or [{}])[-1].get("cliffhanger")
+                       or "")[:70]
+            bits.append(f"{name} ({hang})" if hang else name)
+        return ("callers with a story still running tonight, who will "
+                "ring back: " + "; ".join(bits))[:200]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def story_state() -> dict[str, Any]:
+    """The ledger for the glass: /api/dj/stories."""
+    try:
+        rows = story_rows()
+        ready, viable = story_bank_counts()
+        low, high = story_rerun_window()
+        return {
+            "stories": [dict(r) for r in rows[-40:]],
+            "open": sum(1 for r in rows if r.get("status") == "open"),
+            "due": (story_due() or {}).get("id") or "",
+            "bank": {"ready": ready, "viable": viable,
+                     "floor": story_caller_floor(),
+                     "short": story_bank_short()},
+            "rerun_window_hours": [round(low / 3600, 1),
+                                   round(high / 3600, 1)],
+            "reruns": dict(_rerun_ledger_rows()),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"stories": [], "error": str(exc)[:200]}
+
+
+def story_promote_caller(story: dict[str, Any]) -> dict[str, Any]:
+    """#1039: the stranger becomes a regular - callers.json, with the
+    voice and face they had pinned so they sound and look the same.
+    Sync file work: call through asyncio.to_thread."""
+    c = dict(story.get("caller") or {})
+    name = str(c.get("name") or "").strip()[:300]
+    with _CALLERS_LOCK:
+        rows = read_callers()
+        row = next((r for r in rows
+                    if str(r.get("name") or "").strip().lower()
+                    == name.lower()), None)
+        if row is None:
+            row = {"id": uuid.uuid4().hex[:8], "name": name,
+                   "persona": str(c.get("persona") or "")[:400],
+                   "goal": str(story.get("premise") or "")[:300],
+                   "character": "", "pitch": 0,
+                   "added": int(time.time()), "calls": 0}
+            rows.insert(0, row)
+        voice = str(c.get("voice") or "")
+        if VOICE_ID_SHAPE.match(voice):
+            row["voice_id"] = voice
+        elif voice and not row.get("voice_id"):
+            row["voice"] = voice
+        if c.get("gender") and not row.get("gender"):
+            row["gender"] = str(c["gender"])
+        if c.get("face"):
+            row["face"] = str(c["face"])
+        row["story_id"] = str(story.get("id") or "")
+        write_callers(rows)
+        return dict(row)
+
+
+def _story_caller_face_blocking(name: str) -> str:
+    """The face already pinned to this name, if any (no draw)."""
+    try:
+        book = json.loads(CALLER_FACES_PATH.read_text())
+        return str((book or {}).get(name) or "") if isinstance(book, dict) \
+            else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _story_transcript_text(live: dict[str, Any], name: str) -> str:
+    """The finished call as text for the writer. The ledger's transcript
+    when it has one; otherwise the caller's and hosts' lines out of the
+    booth ring (the prepared road logs thin rows - map11)."""
+    rows = list((live or {}).get("transcript") or [])
+    if rows:
+        return "\n".join(
+            f"{str(r.get('name') or r.get('who') or '?')}: "
+            f"{str(r.get('text') or '')}"
+            for r in rows if isinstance(r, dict) and r.get("text"))[:3200]
+    out: list[str] = []
+    for line in (_RADIO.get("chat") or [])[-60:]:
+        who = str(line.get("who") or "")
+        if who in ("dj", "cohost", "caller", "caller2", "third"):
+            out.append(f"{str(line.get('name') or who)}: "
+                       f"{str(line.get('text') or '')[:300]}")
+    return "\n".join(out[-24:])[:3200]
+
+
+async def story_seeds(n: int = 2) -> list[dict[str, Any]]:
+    """#1033/#1039: n FRESH speaker-box chunks (speakbox_quote(most=2,
+    cap=220)), each remembered so it never comes straight back."""
+    out: list[dict[str, Any]] = []
+    for _ in range(max(0, n)):
+        try:
+            got = await speakbox_quote(most=2, cap=220) or {}
+        except Exception:  # noqa: BLE001
+            got = {}
+        if got and str(got.get("text") or "").strip():
+            out.append(got)
+            try:
+                speakbox_remember(got)
+            except Exception:  # noqa: BLE001
+                pass
+    return out
+
+
+async def story_writer(name: str, said: str, so_far: str,
+                       seeds: list[str], ending: bool = False
+                       ) -> dict[str, str]:
+    """#1039: one ask_model turns a finished call into a two-sentence
+    'story so far', a cliffhanger and the next twist. Labelled parts on
+    one line each, because ask_model collapses whitespace."""
+    seed_bit = ""
+    if seeds:
+        seed_bit = (" Work these scraps of material into the twist as the "
+                    "caller's own thinking, never as quotations: "
+                    + " / ".join(f'"{t[:220]}"' for t in seeds[:2]))
+    prompt = (
+        "You are the continuity desk of a small radio station. A caller "
+        f"named {name} rang the show and this is what was said:\n{said}\n\n"
+        + (f"Their story so far, from earlier calls tonight: {so_far}\n\n"
+           if so_far else "")
+        + "Write THREE labelled parts, each starting with its label, "
+          "plain prose, no markdown, no lists. "
+          "SO FAR: two sentences telling the caller's situation as a "
+          "continuing story - what they want, what stands in their way, "
+          "in the present tense. "
+        + ("CLIFFHANGER: one sentence saying how it was finally RESOLVED "
+           "on this call. NEXT: the single word none."
+           if ending else
+           "CLIFFHANGER: one sentence - the unresolved thing left hanging "
+           "at the end of THIS call, the reason they will have to ring "
+           "again. NEXT: one sentence - a twist for their next call that "
+           "escalates it, bigger or stranger or more personal." + seed_bit)
+    )
+    try:
+        got = await ask_model(prompt, limit=900, spice=0.7,
+                              mark={"kind": "caller story",
+                                    "for": f"{name}'s storyline (#1039)"})
+    except Exception:  # noqa: BLE001
+        got = ""
+    text = " ".join(str(got or "").split())
+    m = re.search(r"SO FAR:\s*(.*?)\s*CLIFFHANGER:\s*(.*?)\s*NEXT:\s*(.*)$",
+                  text, re.I | re.S)
+    if not m:
+        return {}
+    so, hang, nxt = (m.group(1).strip(), m.group(2).strip(),
+                     m.group(3).strip())
+    if nxt.lower().strip(" .") == "none":
+        nxt = ""
+    if len(so) < 20 or len(hang) < 8:
+        return {}
+    return {"so_far": so[:600], "cliffhanger": hang[:300],
+            "twist": nxt[:300]}
+
+
+async def story_open_async(name: str, live: dict[str, Any], ran: float,
+                           turns: int) -> None:
+    """#1039: a finished live call becomes part one of a story."""
+    try:
+        meta = dict((live or {}).get("meta") or {})
+        said = _story_transcript_text(live, name)
+        if not said.strip():
+            return
+        seeds = await story_seeds(2)
+        seed_text = [str(q.get("text") or "") for q in seeds]
+        got = await story_writer(name, said, "", seed_text)
+        if not got:
+            pipeline_log("call", f"{name}'s call did not become a story - "
+                         "the writer gave nothing usable (#1039)")
+            return
+        face = await asyncio.to_thread(_story_caller_face_blocking, name)
+        now = time.time()
+        story = {
+            "id": uuid.uuid4().hex[:10],
+            "caller": {"name": name,
+                       "voice": str(meta.get("voice") or ""),
+                       "face": face,
+                       "persona": (f"{name} rang the station earlier "
+                                   "tonight and is living through this: "
+                                   + got["so_far"])[:400],
+                       "gender": str(meta.get("gender") or "")},
+            "premise": str(meta.get("premise") or meta.get("topic")
+                           or got["so_far"])[:400],
+            "beats": [{"at": now, "call_id": str(live.get("id") or ""),
+                       "summary": got["so_far"],
+                       "cliffhanger": got["cliffhanger"],
+                       "seeds": seed_text}],
+            "twist": got["twist"],
+            "status": "open",
+            "parts_planned": random.randint(STORY_PARTS_MIN, STORY_PARTS_MAX),
+            "next_due": now + random.uniform(STORY_DUE_MIN_S, STORY_DUE_MAX_S),
+            "other_calls_since": 0,
+            "calls": 1,
+            "opened": now,
+            "call_ids": [str(live.get("id") or "")],
+        }
+        with _STORIES_LOCK:
+            story_rows().append(story)
+            del story_rows()[:-STORIES_KEPT]
+        await story_save()
+        pipeline_log("call", f"{name} has a STORY now - part 1 of "
+                     f"{story['parts_planned']}, they ring back in about "
+                     f"{int((story['next_due'] - now) // 60)} minutes: "
+                     f"{got['cliffhanger'][:120]} (#1039)")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "opening a caller story failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:400])
+
+
+async def story_beat_async(sid: str, name: str, live: dict[str, Any],
+                           ran: float, turns: int) -> None:
+    """#1039: the caller rang back - write the beat, arm the next one, or
+    close the story after its last part."""
+    try:
+        story = story_find(sid)
+        if not story:
+            return
+        beats = list(story.get("beats") or [])
+        planned = int(story.get("parts_planned") or STORY_PARTS_MAX)
+        part = len(beats) + 1
+        ending = part >= planned
+        said = _story_transcript_text(live, name)
+        so_far = str(beats[-1].get("summary") or "") if beats else ""
+        seeds = [] if ending else await story_seeds(2)
+        seed_text = [str(q.get("text") or "") for q in seeds]
+        got = await story_writer(name, said, so_far, seed_text, ending=ending)
+        now = time.time()
+        if not got:
+            got = {"so_far": so_far or str(story.get("premise") or ""),
+                   "cliffhanger": ("resolved, one way or another"
+                                   if ending else
+                                   str(beats[-1].get("cliffhanger") or "")
+                                   if beats else ""),
+                   "twist": str(story.get("twist") or "")}
+        beats.append({"at": now, "call_id": str(live.get("id") or ""),
+                      "summary": got["so_far"],
+                      "cliffhanger": got["cliffhanger"],
+                      "seeds": seed_text})
+        with _STORIES_LOCK:
+            story["beats"] = beats
+            story["calls"] = int(story.get("calls") or 0) + 1
+            story["call_ids"] = sorted(story_call_ids(story)
+                                       | {str(live.get("id") or "")})
+            story["other_calls_since"] = 0
+            story["twist"] = got.get("twist") or ""
+            if ending:
+                story["status"] = "closed"
+                story["closed_at"] = now
+                story["next_due"] = 0
+            else:
+                story["next_due"] = now + random.uniform(STORY_DUE_MIN_S,
+                                                         STORY_DUE_MAX_S)
+        await story_save()
+        pipeline_log("call", (f"{name}'s story CLOSED after {part} parts: "
+                              f"{got['cliffhanger'][:120]} (#1039)")
+                     if ending else
+                     (f"{name}'s story - part {part} of {planned} done, "
+                      "they ring back in about "
+                      f"{int((story['next_due'] - now) // 60)} minutes: "
+                      f"{got['cliffhanger'][:120]} (#1039)"))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "writing a caller story beat failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:400])
+
+
+def story_note_call(name: str, live: dict[str, Any], ran: float,
+                    turns: int, rule: dict[str, Any]) -> None:
+    """#1039: called from call_ended() for EVERY call. Sync and cheap:
+    the writing happens in a background task.
+
+    A story call appends its beat; any other finished call counts as
+    'another call since' for every open story; and a finished live call
+    (generated or scheduled, never a repeat) opens a new story at
+    dj.story_rate. A story call that never made air stays due, ten
+    minutes later - defer, never lose."""
+    try:
+        meta = dict((live or {}).get("meta") or {})
+        story_bit = meta.get("story") if isinstance(meta.get("story"),
+                                                    dict) else {}
+        sid = str((story_bit or {}).get("id") or "")
+        if sid:
+            story = story_find(sid)
+            if story and int(turns) <= 0:
+                with _STORIES_LOCK:
+                    story["next_due"] = time.time() + 600.0
+                fire_and_forget(story_save())
+                pipeline_log("call", f"{name}'s story call never made air - "
+                             "it stays due, ten minutes on (#1039)")
+                return
+            if story and str(story.get("status") or "") == "open":
+                fire_and_forget(story_beat_async(sid, name, live, ran,
+                                                 int(turns)))
+                return
+        if int(turns) <= 0:
+            return
+        with _STORIES_LOCK:
+            for r in story_rows():
+                if str(r.get("status") or "") == "open":
+                    r["other_calls_since"] = int(
+                        r.get("other_calls_since") or 0) + 1
+        if meta.get("repeat") or str(meta.get("mode") or "") == "rerun":
+            fire_and_forget(story_save())
+            return                  # a repeat cannot open a story
+        if str(meta.get("mode") or "") not in ("generated", "scheduled"):
+            fire_and_forget(story_save())
+            return
+        if story_open_for(name):
+            fire_and_forget(story_save())
+            return                  # one story per caller at a time
+        if random.random() < story_rate():
+            fire_and_forget(story_open_async(name, live, ran, int(turns)))
+        else:
+            fire_and_forget(story_save())
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def story_angle(story: dict[str, Any], caller: dict[str, Any]) -> str:
+    """#1039: the prompt clause for a call-back - THIS CALLER RANG EARLIER.
+    The story so far, where it was left, the twist, two fresh chunks and
+    the Gazette's headline when there is one."""
+    name = str(caller.get("name") or (story.get("caller") or {}).get("name")
+               or "the caller")
+    beats = list(story.get("beats") or [])
+    part = len(beats) + 1
+    planned = int(story.get("parts_planned") or STORY_PARTS_MAX)
+    last = beats[-1] if beats else {}
+    so_far = str(last.get("summary") or story.get("premise") or "")
+    hang = str(last.get("cliffhanger") or "")
+    twist = str(story.get("twist") or "")
+    seeds = [str(t) for t in (last.get("seeds") or []) if str(t).strip()]
+    if len(seeds) < 2:
+        fresh = await story_seeds(2 - len(seeds))
+        seeds += [str(q.get("text") or "") for q in fresh]
+    headline = ""
+    try:
+        _pp = globals().get("paper_pulse")
+        if callable(_pp):
+            headline = str((_pp() or {}).get("headline") or "")[:160]
+    except Exception:  # noqa: BLE001
+        headline = ""
+    out = (
+        f" THIS CALLER HAS RUNG BEFORE - EARLIER TONIGHT. {name} is back on "
+        f"the line for part {part} of their own continuing story, and the "
+        f"hosts REMEMBER THEM BY NAME and remember the story so far: "
+        f"{so_far} Where it was left last time: {hang} {name} does NOT "
+        "introduce themselves as a stranger - they pick up exactly where "
+        "they left off, and a host greets them as somebody they know "
+        f"('{name}! you're back - what happened?'). "
+    )
+    if part >= planned:
+        out += (" THIS IS THE FINAL PART: bring the whole story to an END "
+                "on this call, resolved one way or the other, and the hosts "
+                "say goodbye to them properly, as to a friend. ")
+    else:
+        out += (f" This call CONTINUES the plot with this twist: {twist} "
+                "ESCALATE - it gets bigger, stranger or more personal than "
+                "last time - and END on a NEW cliffhanger: something "
+                "unresolved that means they will have to ring again. ")
+    if seeds:
+        out += ("Work these scraps into what the caller says, in their own "
+                "words, never as quotations: "
+                + " / ".join(f'"{t[:220]}"' for t in seeds[:2]) + ". ")
+    if headline:
+        out += (f"The station's own paper, the Gazette, ran this headline "
+                f"this hour: \"{headline}\" - {name} has seen it and brings "
+                "it up. ")
+    return out
+
+
+async def story_ring(story: dict[str, Any] | None) -> dict[str, Any]:
+    """#1039: ring the story's caller back now. A busy line defers (the
+    story stays due); anything else is dj_call_generated's own verdict."""
+    if not story:
+        return {"caller": "", "lines": [], "state": "no story"}
+    try:
+        return await dj_call_generated(force=True, story=story)
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "a story call-back failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:400])
+        return {"caller": "", "lines": [], "state": "failed"}
+
+
+# --- the recording re-air road ------------------------------------------------
+def _rerun_ledger_rows() -> dict[str, Any]:
+    if not _RERUNS.get("loaded"):
+        try:
+            got = json.loads(CALL_RERUNS_PATH.read_text(encoding="utf-8"))
+            _RERUNS["rows"] = got if isinstance(got, dict) else {}
+        except Exception:  # noqa: BLE001
+            _RERUNS["rows"] = {}
+        _RERUNS["loaded"] = True
+    return _RERUNS["rows"]
+
+
+def _rerun_ledger_write_blocking(rows: dict[str, Any]) -> None:
+    try:
+        CALL_RERUNS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CALL_RERUNS_PATH.with_suffix(".tmp")
+        keep = dict(sorted(rows.items(),
+                           key=lambda kv: float((kv[1] or {}).get("last")
+                                                or 0))[-400:])
+        tmp.write_text(json.dumps(keep, indent=1) + "\n", encoding="utf-8")
+        tmp.replace(CALL_RERUNS_PATH)
+    except OSError:
+        pass
+
+
+def _rerun_md_transcript(path: Path, name: str) -> list[dict[str, str]]:
+    """The labelled transcript beside the mp3 (**Host:** / **Name:**)."""
+    out: list[dict[str, str]] = []
+    try:
+        dj = dj_settings()
+        host = str(dj.get("host_name") or "Host").lower()
+        cohost = str(dj.get("cohost_name") or "").lower()
+        for m in re.finditer(r"\*\*([^*\n]{1,60}?):?\*\*:?\s*(.+)",
+                             path.read_text(encoding="utf-8")):
+            who_name, text = m.group(1).strip(), m.group(2).strip()
+            low = who_name.lower()
+            if low == name.lower():
+                who = "caller"
+            elif low in ("host", host):
+                who = "dj"
+            elif cohost and low == cohost:
+                who = "cohost"
+            else:
+                who = "third"
+            out.append({"who": who, "name": who_name, "text": text[:600]})
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def _call_rerun_pick_blocking(low: float, high: float) -> dict[str, Any]:
+    """#1033: a finished call worth hearing again - by the call_log row
+    (name, ts, premise) inside the window, with its mp3 still on the
+    shelf. Runs in a thread: the ledger is 600 KB and the folder is
+    globbed by id."""
+    now = time.time()
+    try:
+        rows = call_log_read()
+    except Exception:  # noqa: BLE001
+        return {}
+    ledger = _rerun_ledger_rows()
+    calls = RADIO_CACHE / "calls"
+    cands: list[dict[str, Any]] = []
+    for r in reversed(rows[-400:]):
+        try:
+            ts = float(r.get("ts") or 0)
+            age = now - ts
+            if not (low <= age <= high):
+                continue
+            if int(r.get("turns") or 0) <= 0:
+                continue
+            if str(r.get("state") or "") == "never_aired":
+                continue
+            if r.get("repeat") or str(r.get("mode") or "") == "rerun":
+                continue
+            if float(r.get("seconds") or 0) < CALL_RERUN_MIN_SECONDS:
+                continue
+            cid = str(r.get("id") or "")
+            led = ledger.get(cid) or {}
+            if int(led.get("uses") or 0) >= CALL_RERUN_MOST:
+                continue
+            if led.get("last") and now - float(led["last"]) < low:
+                continue
+            unique = re.sub(r"[^a-zA-Z0-9]+", "", cid)[:12]
+            if not unique:
+                continue
+            found = list(calls.glob(f"*_{unique}.mp3"))
+            if not found:
+                continue
+            cands.append({"row": r, "path": found[0], "age": age})
+            if len(cands) >= 6:
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    if not cands:
+        return {}
+    pick = random.choice(cands)
+    row, path = pick["row"], pick["path"]
+    try:
+        seconds = float(_clip_seconds(str(path)) or 0)
+        if seconds < 20.0:
+            return {}
+        blob = path.read_bytes()
+        if not blob:
+            return {}
+        media = _store_media(blob, "mp3")
+    except Exception:  # noqa: BLE001
+        return {}
+    transcript = [t for t in (row.get("transcript") or [])
+                  if isinstance(t, dict) and t.get("text")]
+    if not transcript:
+        transcript = _rerun_md_transcript(path.with_suffix(".md"),
+                                          str(row.get("name") or ""))
+    return {"row": row, "media": media, "seconds": seconds,
+            "transcript": transcript}
+
+
+def _rerun_note_blocking(cid: str) -> None:
+    rows = _rerun_ledger_rows()
+    led = dict(rows.get(cid) or {})
+    led["uses"] = int(led.get("uses") or 0) + 1
+    led["last"] = time.time()
+    rows[cid] = led
+    _rerun_ledger_write_blocking(rows)
+
+
+CALL_RERUN_INTROS = (
+    "Back on the line from earlier tonight - {name}. We had to hear this "
+    "one again.",
+    "Now, earlier tonight {name} rang us about {premise} - and it has "
+    "been bothering us ever since. Here it is again, as it went out.",
+    "One more time for anyone who missed it - {name}, earlier tonight, "
+    "on the phones.",
+    "We are going back to the switchboard for a moment: {name}, from "
+    "earlier this evening. Listen to this.",
+)
+
+
+async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
+    """#1033: THE RECORDING RE-AIR. A finished call out of
+    radio_cache/calls, copied into the media store and aired as ONE clip
+    (the reel_open pattern: page_feed_append + the box), behind a short
+    live host intro. The ledger gets a row with repeat: true; the booth
+    gets rows with round='caller'. Empty when nothing is in the window,
+    the station is paused, or somebody is on the line."""
+    try:
+        if radio_paused() or not _RADIO.get("on") or call_line_busy():
+            return []
+        low, high = story_rerun_window()
+        if low >= high:
+            return []
+        pick = await asyncio.to_thread(_call_rerun_pick_blocking, low, high)
+        if not pick:
+            return []
+        row = dict(pick.get("row") or {})
+        media = dict(pick.get("media") or {})
+        length = float(pick.get("seconds") or 0)
+        transcript = list(pick.get("transcript") or [])
+        name = str(row.get("name") or "a caller")
+        premise = " ".join(str(row.get("premise") or row.get("topic")
+                               or "").split())[:90]
+        path, sig = str(media.get("path") or ""), str(media.get("sig") or "")
+        key = path.rsplit("/", 1)[-1]
+        if not (path and sig and length > 0):
+            return []
+        # The per-turn timeline, by share of characters - the recording
+        # has no offsets of its own, and this only places the booth rows.
+        total = sum(len(str(t.get("text") or "")) for t in transcript) or 1
+        rows: list[dict[str, Any]] = []
+        at = 0.0
+        for t in transcript:
+            span = length * len(str(t.get("text") or "")) / total
+            rows.append({"id": uuid.uuid4().hex[:6],
+                         "who": str(t.get("who") or "caller"),
+                         "kind": "call", "text": str(t.get("text") or ""),
+                         "name": str(t.get("name") or ""),
+                         "from": round(at, 3), "until": round(at + span, 3)})
+            at += span
+        started = time.time()
+        line_say = call_line_say(call_line_no())
+        rule = {"id": str(row.get("rule_id") or ""),
+                "text": str(row.get("rule") or "")}
+        owned = await _floor_take(f"{name} back on the line (re-air)")
+        try:
+            call_line_take(name, {
+                "mode": "rerun", "repeat": True,
+                "of": str(row.get("id") or ""),
+                "line": line_say,
+                "topic": str(row.get("topic") or "")[:700],
+                "premise": str(row.get("premise") or "")[:700],
+                "source": str(row.get("source") or ""),
+                "voice": str(row.get("voice") or ""),
+            })
+            _RADIO["chat"].append({
+                "ts": int(time.time()), "who": "host", "kind": "call",
+                "round": "caller", "repeat": True,
+                "text": f"On {line_say}: {name} - back on the line from "
+                        "earlier tonight (a re-air)"})
+            del _RADIO["chat"][:-240]
+            intro = random.choice(CALL_RERUN_INTROS).format(
+                name=name, premise=premise or "something")
+            try:
+                # #1033: the crystal tints the phones - the recording was
+                # tinted when it was written; the fresh intro gets one
+                # cheap pass (crystal_line returns the input when off).
+                if crystal_tint_two_pass():
+                    intro = await crystal_line(intro, "a caller re-air intro",
+                                               1) or intro
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                await dj_speak("interject", None, line=intro, who="dj",
+                               by_hand=True)
+            except Exception:  # noqa: BLE001
+                pass
+            vto = _RADIO.get("voice_to") or "box"
+            try:
+                if not box_talk_ok() and vto in ("box", "both"):
+                    vto = "here"
+            except Exception:  # noqa: BLE001
+                pass
+            to_box = vto in ("box", "both")
+            box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
+                        or len(_BOX_HOLD) >= 6)
+            t0 = time.time() + VOICE_BROADCAST_LEAD_MS / 1000.0
+            if page_carries_live(vto, to_box, box_down):
+                page_feed_append({
+                    "ts": int(time.time() * 1000),
+                    "broadcast_ms": int(t0 * 1000),
+                    "url": f"{path}?t={sig}",
+                    "text": f"{name} - back on the line from earlier tonight",
+                    "voice": "",
+                    "stream": {"length": length, "rows": rows}})
+                _PAGE_AIR_UNTIL[0] = max(
+                    float(_PAGE_AIR_UNTIL[0] or 0), t0 + length)
+            if to_box and not box_down:
+                try:
+                    _stream_now_set(rows, length)
+                    await _play_on_box(path, sig)
+                except Exception:  # noqa: BLE001
+                    try:
+                        box_hold({"path": path, "sig": sig},
+                                 f"{name} (re-air)", "caller",
+                                 rows=rows, length=length)
+                    except Exception:  # noqa: BLE001
+                        pass
+            for r in rows:
+                try:
+                    _RADIO["chat"].append({
+                        "id": r["id"], "who": r["who"], "kind": "call",
+                        "round": "caller", "repeat": True,
+                        "text": r["text"], "name": r.get("name") or "",
+                        "ts": int(time.time()),
+                        "air_at": t0 + float(r.get("from") or 0),
+                        "aired": "stream", "source": "rerun",
+                        "clip_media": key, "clip_sig": sig,
+                        "clip_from": r.get("from"),
+                        "clip_until": r.get("until"),
+                    })
+                    air_remember(str(r.get("text") or ""),
+                                 str(r.get("who") or ""), "call")
+                except Exception:  # noqa: BLE001
+                    pass
+            del _RADIO["chat"][:-240]
+            talk_said_now()
+            try:
+                call_line_transcript([{"who": r["who"], "name": r["name"],
+                                       "text": r["text"]} for r in rows])
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                _episode_stage(str(VOICE_MEDIA_DIR / key),
+                               f"☎ {name} — back on the line (re-air)")
+            except Exception:  # noqa: BLE001
+                pass
+            pipeline_log("call", f"{name}'s call from "
+                         f"{int((time.time() - float(row.get('ts') or 0)) // 3600)}h "
+                         f"ago is going out again as one clip, {int(length)}s "
+                         "- nothing unaired was ready (#1033)")
+            await _paged_settle(t0 + length)
+        finally:
+            _floor_drop(owned)
+        call_ended(name, line_say, started, rule, max(1, len(rows)),
+                   "re-air")
+        stats = _RADIO.setdefault("session_stats", {"calls": 0, "rounds": 0})
+        stats["calls"] = int(stats.get("calls") or 0) + 1
+        _RADIO["last_call"] = f"{name} — back on the line (a re-air)"
+        quota_stamp("caller")
+        try:
+            await asyncio.to_thread(_rerun_note_blocking,
+                                    str(row.get("id") or ""))
+        except Exception:  # noqa: BLE001
+            pass
+        return [str(r.get("text") or "") for r in rows] or [intro]
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "the call re-air road failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:400])
+        return []
+
+
+async def story_call_seed_clause(most: int = 2
+                                 ) -> tuple[str, list[str]]:
+    """#1033 (unique seeding): TWO FRESH RANDOM CHUNKS beside the
+    request road's semantic seed (call_plot_clause). speakbox_quote(most=2,
+    cap=220) each, screened by call_speakerbox_novelty so a chunk already
+    on a logged or shelved call is redrawn (three tries each), remembered
+    the moment it is handed over, and returned as texts so the call meta
+    can carry them (speakerbox_extra) for the next call's screen."""
+    texts: list[str] = []
+    tries = 0
+    while len(texts) < max(0, most) and tries < max(0, most) * 3:
+        tries += 1
+        try:
+            got = await speakbox_quote(most=2, cap=220) or {}
+        except Exception:  # noqa: BLE001
+            got = {}
+        text = " ".join(str(got.get("text") or "").split())
+        if not text or text in texts:
+            continue
+        try:
+            if not call_speakerbox_novelty(text).get("ok", True):
+                pipeline_log("call", "a seed chunk already belongs to a "
+                             "logged call - redrawn (#1033)",
+                             extra=text[:160])
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        texts.append(text[:220])
+        try:
+            speakbox_remember(got)
+        except Exception:  # noqa: BLE001
+            pass
+    if not texts:
+        return "", []
+    return ("\n\nAND TWO MORE SCRAPS RATTLING AROUND IN THE CALLER'S HEAD - "
+            "fresh tonight, nobody else has had them. Bend each into "
+            "something the caller says in their own words; never a "
+            "quotation, never say where it came from: "
+            + " / ".join(f'"{t}"' for t in texts) + "\n",
+            texts)
+
+
+# --- the random ad ------------------------------------------------------------
+def story_ad_roll(dj: dict[str, Any] | None = None) -> str:
+    """#1040 (station side): 'ad' when the pair should just do an advert
+    now, else ''. dj.random_ad_pct per round, never inside 240s of the
+    last break (_RADIO['last_ad'] is the stamp every ad road shares),
+    never paused. The torrent's random draw and the record loop's talk
+    chain both roll it; dj_ad_break() is what airs."""
+    try:
+        dj = dj or dj_settings()
+        pct = float(dj.get("random_ad_pct") or 0)
+        if pct <= 0 or radio_paused():
+            return ""
+        if time.time() - float(_RADIO.get("last_ad") or 0) < 240.0:
+            return ""
+        if random.random() * 100.0 < pct:
+            pipeline_log("air", "the pair just do an advert - the random "
+                         f"ad roll came up ({pct:.0f}%) (#1040)")
+            return "ad"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 def call_ended(name: str, line_say: str, started: float,
@@ -55520,6 +59667,10 @@ def call_ended(name: str, line_say: str, started: float,
             "state": "never_aired",
             **live["meta"], "transcript": live["transcript"],
         })
+        try:
+            story_note_call(name, live, ran, 0, rule)               # #1039
+        except Exception:  # noqa: BLE001
+            pass
         return
     _RADIO["chat"].append({
         "ts": int(ended), "who": "drop", "kind": "hangup", "name": name,
@@ -55542,6 +59693,14 @@ def call_ended(name: str, line_say: str, started: float,
         "state": state,
         **live["meta"], "transcript": live["transcript"],
     })
+    # #1039: the story desk hears about every finished call - a story
+    # call writes its beat, any other call counts for the open stories,
+    # and a live call may open a new one. Cheap and sync; the writing
+    # runs in the background.
+    try:
+        story_note_call(name, live, ran, int(turns), rule)
+    except Exception:  # noqa: BLE001
+        pass
     pipeline_log("call", f"{name} hung up after {int(ran)}s — {short}")
 
 
@@ -56000,7 +60159,12 @@ def caller_voice_for(name: str, taken: set[str],
     all the generated voices get on air (#457) — stable per name."""
     digest = int(hashlib.sha1(name.encode()).hexdigest(), 16)
     usable = [c for c in (clones or []) if c not in taken]
-    if usable and (digest % 100) < clone_caller_pct():
+    # #1021: under the avoid-Piper policy EVERY caller offered a clone
+    # takes one - the remembered voice for a name we have heard, the
+    # least-aired for a new one. clone_caller_pct is the share only when
+    # the policy is off.
+    if usable and (voicepolicy_avoid_piper()
+                   or (digest % 100) < clone_caller_pct()):
         # #699: the assignment is REMEMBERED, and an unheard voice goes first.
         #
         # It used to be usable[digest % len(usable)] — a pure function of the
@@ -56035,6 +60199,15 @@ def caller_voice_for(name: str, taken: set[str],
                   and (catalogue is None or n in catalogue))
     if not pool:
         return usable[digest % len(usable)] if usable else ""
+    # #1021: a Piper voice for this caller, and the reason on the log -
+    # the only way here under the policy is an empty clone pool, which
+    # means no clone engine answered when the draw was made.
+    if voicepolicy_avoid_piper():
+        voicepolicy_say(f"caller:piper:{name[:40]}",
+                        f"caller {name[:60]}: Piper voice "
+                        f"{pool[digest % len(pool)]} - no library clone "
+                        "was offered for the draw (both clone engines "
+                        "down, or the pool is empty) (#1021)")
     return pool[digest % len(pool)]
 
 
@@ -56456,8 +60629,16 @@ async def _theme_ring_now() -> None:
 async def dj_call_generated(caller: dict[str, Any] | None = None,
                             force: bool = False,
                             case_id: str = "",
-                            heat: int | None = None) -> dict[str, Any]:
+                            heat: int | None = None,
+                            story: dict[str, Any] | None = None
+                            ) -> dict[str, Any]:
     """A generated person rings the station and the pair take the call.
+
+    #1039: with `story`, the caller is that story's caller ringing BACK -
+    promoted to callers.json with their voice and face pinned, the
+    cooldown waived, no case, no duo, no hostile turn (two structures at
+    once is noise), the topic is the story's twist, and the angle tells
+    the hosts they remember this person by name.
 
     The caller is a third voice on a phone line — static, a little echo, the
     telephone crush — in a random state, driven by the DJs, who inquire, dig,
@@ -56489,6 +60670,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
                 "why": f"{_busy} is already on the line"}
     dj = dj_settings()
     rows = read_callers()
+    # #1039: THE STORY'S CALLER, promoted to a regular with their voice
+    # and face pinned, outranks every pick below. The file write runs
+    # off the loop.
+    if story:
+        try:
+            caller = await asyncio.to_thread(story_promote_caller, story)
+            rows = read_callers()
+            force = True
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", "promoting a story caller failed",
+                         extra=f"{type(exc).__name__}: {exc}"[:300])
+            return {"caller": "", "lines": [], "state": "failed",
+                    "why": "the story caller could not be promoted"}
     # A NAMED ring still inside its 25-minute cooldown is demoted to a normal
     # eligibility pick unless the operator explicitly forced it (#584): a direct
     # dj_call_generated(row) used to skip the cooldown block below entirely and
@@ -56504,7 +60698,8 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         # through everyone instead of looping on one caller, and when the
         # regulars are all cooling down a fresh stranger is conjured instead.
         now = time.time()
-        fresh = [r for r in rows if now - float(r.get("last") or 0) > 1500]
+        fresh = [r for r in rows if now - float(r.get("last") or 0) > 1500
+                 and not story_open_for(str(r.get("name") or ""))]   # #1039
         if fresh and random.random() < 0.6:
             fresh.sort(key=lambda r: float(r.get("last") or 0))   # stalest first
             pool = fresh[:max(1, len(fresh) // 2 + 1)]            # the older half
@@ -56515,6 +60710,14 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         else:
             caller = conjure_caller()
     topic, seed = await caller_topic()
+    if story:
+        # #1039: the plot IS the topic. No seed: the chunks the story
+        # carries are handed over in story_angle below.
+        _sb = list(story.get("beats") or [])
+        topic = (f"They are ringing back about their own story: "
+                 f"{str((_sb[-1] if _sb else {}).get('summary') or story.get('premise') or '')[:400]} "
+                 f"The twist this time: {str(story.get('twist') or '')[:300]}")
+        seed = {}
     # A caller must not ring in about the SAME thing that just came up (#557):
     # if the topic matches a recent one, roll again once for something fresh.
     _recent_t = _RADIO.setdefault("recent_topics", [])
@@ -56556,7 +60759,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # steers the shelf towards an outcome that can honour a giveaway rather
     # than colliding with a hang-up afterwards. A caller named ending
     # (#715) still outranks everything, as it should.
-    call_case = case_for_call(case_id, heat)
+    call_case = {} if story else case_for_call(case_id, heat)   # #1039
     # #691: how this call ENDS, drawn off the editable shelf by weight
     # rather than out of a frozen tuple. The rule travels with the call so
     # the booth can name it afterwards and the ledger can count it.
@@ -56892,7 +61095,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # prize and glosses over the loser in speakbox rhetoric. The second
     # person is a REAL second voice, marker E.
     duo_name, duo_grab = "", {}
-    if random.random() < 0.28:
+    if not story and random.random() < 0.28:                       # #1039
         duo_name = random.choice(
             [n for n in NEW_VOICE_NAMES if n != caller.get("name")]
             or list(NEW_VOICE_NAMES))
@@ -56998,7 +61201,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # #750: the call TURNS. Suppressed when there is already a second
     # person on the line — two structures at once is noise, not drama.
     hostile = (random.random() < float(dj.get("hostile_rate", 0.14) or 0)
-               and not duo_name)
+               and not duo_name and not story)                     # #1039
     defuse: dict[str, Any] = {}
     if hostile:
         offence = unrepeated(list(CALLER_OFFENCES), "hostile-offence")
@@ -57050,7 +61253,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # XTTS engine is actually up, so a drawn clone never lands on a silent
     # caller. When it is down the pool is empty and the draw is Piper-only.
     clone_pool = (caller_clone_pool()
-                  if (await xtts_health())["ready"] else [])
+                  if await voicepolicy_clone_engine_up() else [])  # #1021
     third = caller_voice_for(caller["name"] or "someone",
                              {voices.get("dj", ""),
                               voices.get("cohost", "")}, catalogue,
@@ -57080,7 +61283,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # the library, rendered by XTTS. If the clone engine is down tonight
     # they fall back to their stable Piper voice — same person, worse phone.
     if caller.get("voice_id") and voice_ref_path(str(caller["voice_id"])) \
-            and (await xtts_health())["ready"]:
+            and await voicepolicy_clone_engine_up():                # #1021
         third = str(caller["voice_id"])
     # An explicit voice on the row (#295) outranks the name draw — any
     # voice in the system: a Piper name, a Voxtral preset, whatever the
@@ -57143,8 +61346,20 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     if behavior_key != "plain":
         state = f"{state} [deck: {behavior_key}]"
     _theme_now = active_theme()
+    # #1039: the sequel clause - drawn before the angle so its two fresh
+    # chunks and the Gazette headline are in hand.
+    story_bit = ""
+    if story:
+        try:
+            story_bit = await story_angle(story, caller)
+        except Exception:  # noqa: BLE001
+            story_bit = ""
     _call_meta = {
         "mode": "generated",
+        # #1033/#1039: the voice rides the ledger, so a caller can come
+        # back sounding like the same person (map15 gotcha).
+        "voice": str(third or ""),
+        "gender": str(caller.get("gender") or ""),
         "topic": str((_theme_now or {}).get("text") or topic)[:700],
         "theme": str((_theme_now or {}).get("name") or ""),
         "theme_text": str((_theme_now or {}).get("text") or "")[:700],
@@ -57155,10 +61370,13 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         "hostile": bool(hostile),
         "duo": bool(duo_name),
     }
+    if story:
+        _call_meta["story"] = story_meta(story)                     # #1039
     angle = (
         f"The request line rings and {caller['name']} is on {line_say}, "
         f"{state}.{temper_bit}{behavior_bit}"
         f"{persona_bit}{goal_bit} {topic}{case_clause(call_case)} "
+        f"{story_bit}"
         # #544: the pair HEAR the phone ring and react to it before they pick
         # it up — the ring is a beat they play off of, not a silent cut.
         "It OPENS with the phone RINGING and the pair HEARING it: one of them "
@@ -57211,6 +61429,9 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     pipeline_log("call", f"{caller['name']} on {line_say} — {state}"
                          + (" · cloned voice" if caller.get("voice_id")
                             else "")
+                         + (f" · STORY part {story_meta(story)['part']} of "
+                            f"{story_meta(story)['of']} (#1039)"
+                            if story else "")
                          # #854: which case it is, so the operator can watch
                          # a case they just wrote go out on the air.
                          + (f" · case: {call_case.get('title')}"
@@ -57321,6 +61542,7 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
             "case": str(call_case.get("title") or ""),
             "case_heat": case_heat_name(call_case),
             "case_prize": case_is_prize(call_case),
+            "story": str((story or {}).get("id") or ""),          # #1039
             "seconds": round(ran, 1)}
 
 
@@ -57340,7 +61562,7 @@ async def dj_call_scripted(name: str, script: list[str]) -> dict[str, Any]:
     except Exception:
         catalogue = None
     clone_pool = (caller_clone_pool()
-                  if (await xtts_health())["ready"] else [])
+                  if await voicepolicy_clone_engine_up() else [])  # #1021
     third = str(caller.get("voice_id") or "") or caller_voice_for(
         name, {voices.get("dj", ""), voices.get("cohost", "")}, catalogue,
         gender=str(caller.get("gender") or ""), clones=clone_pool)
@@ -57588,7 +61810,8 @@ async def caller_clock() -> None:
                 _banked: list[str] = []
                 try:
                     _banked = list(await dj_caller(_RADIO.get("now"),
-                                                   shelf_only=True) or [])
+                                                   shelf_only=True,
+                                                   fresh_only=True) or [])
                 except Exception:  # noqa: BLE001
                     _banked = []
                 if _banked:
@@ -57596,7 +61819,41 @@ async def caller_clock() -> None:
                                  "recorded earlier answered - no live "
                                  "write, no live render (#1155)")
                 else:
-                    await dj_call_generated()
+                    # #1039: a story whose caller is due rings back
+                    # before any stranger. A busy line defers; the
+                    # story stays due.
+                    _rang = False
+                    _due_story = story_due()
+                    if _due_story:
+                        _made = await story_ring(_due_story)
+                        _rang = bool((_made or {}).get("lines"))
+                        if _rang:
+                            pipeline_log("call", "the phone clock rang and "
+                                         "a caller with a story rang back "
+                                         "(#1039)")
+                    # #1033: then a call from earlier tonight going out
+                    # again - a shelf row inside its window, or a
+                    # finished recording as one clip - and only then a
+                    # live write.
+                    if not _rang:
+                        try:
+                            _banked = list(await dj_caller(
+                                _RADIO.get("now"), shelf_only=True) or [])
+                        except Exception:  # noqa: BLE001
+                            _banked = []
+                        _rang = bool(_banked)
+                        if _rang:
+                            pipeline_log("call", "the phone clock rang and "
+                                         "a call from earlier tonight went "
+                                         "out again off the shelf (#1033)")
+                    if not _rang:
+                        try:
+                            _rang = bool(await call_rerun_take(
+                                _RADIO.get("now")))
+                        except Exception:  # noqa: BLE001
+                            _rang = False
+                    if not _rang:
+                        await dj_call_generated()
             except Exception as exc:
                 # The next call comes round regardless — but a phone that
                 # keeps failing must say so behind the glass (#365), not
@@ -58120,9 +62377,17 @@ def banter_turns(script: str, caller_name: str = "",
     # talking — the words are right, the name on them is not. With a third
     # in the booth (#281, marker D) a repeated A or B most likely belongs
     # to whoever spoke longest ago; the simple swap still reads right.
+    # #1034: while a seat is out of the studio the swap above would put
+    # words straight back in the empty chair - a repeated A became B,
+    # and B is on a smoke break. No flip into the away seat, and a line
+    # the model wrote for it anyway is spoken by the one still here.
+    _away_marker = {"dj": "A", "cohost": "B"}.get(seat_away_who(), "")
     strict: list[tuple[str, str]] = []
     for marker, said in turns:
-        if (strict and marker == strict[-1][0] and marker in "AB"):
+        if _away_marker and marker == _away_marker:
+            marker = "B" if _away_marker == "A" else "A"
+        elif (not _away_marker and strict and marker == strict[-1][0]
+                and marker in "AB"):
             marker = "B" if marker == "A" else "A"
         strict.append((marker, said))
     return strict
@@ -58464,7 +62729,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 else "third" if marker == "D" else "cohost")
 
     for marker, said in turns:
-        who = _who_of(marker)
+        who = seat_reseat(_who_of(marker))       # #1034: never the empty chair
         text = spoken_text(said)
         if not text:
             continue
@@ -58701,7 +62966,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                    "mind": fresh[at].get("mind", "")})
 
     speakers = {it["who"] for it in playlist}
+    # #1034: a one-seat round is the POINT while the other seat is out.
     if (len(playlist) >= 2 and not source_text and not by_hand
+            and not seat_away_who()
             and speakers in ({"dj"}, {"cohost"})):
         other = "cohost" if "dj" in speakers else "dj"
         other_vec = performance_vector(other, voices.get(other) or "")
@@ -58889,6 +63156,26 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         for _bi, (_lo, _hi) in enumerate(spans):
             first_batch = _bi == 0
             last_batch = _bi == len(spans) - 1
+            # #1022: A PAUSE STOPS THE PRESS AT THE PAGE BOUNDARY.
+            # Measured 2026-09-04: a pause at 19:57:53 was followed by ten
+            # more pages up to 20:09 and four more at 21:17-21:26 — 120 rows
+            # landed on the hold shelf (which keeps twelve) and the pause
+            # bought 0.0s of ready audio, because the engine those pages
+            # spent is the engine the keeper needed for the bank. The page
+            # already announced finishes: the listener is mid-sentence when
+            # the flip lands. No NEW page starts. by_hand is exempt — a
+            # person outranks the show (#206) — and the round's own text is
+            # untouched, so what did not air is still written down.
+            if _bi and not by_hand and radio_paused():
+                try:
+                    pipeline_log(
+                        "air", "the pause stops this round at page "
+                        + str(_bi + 1) + " of " + str(len(spans))
+                        + " - the rest is not rendered, and the engine goes "
+                        "to the bank instead (#1022)")
+                except Exception:  # noqa: BLE001
+                    pass
+                break
             seg: list[str] = []
             # Only a real CALL opens with a ring and closes with a hang-up; a
             # coalesced booth round (#616/#625) is just the turns, joined
@@ -59169,6 +63456,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     entry = {
                         "id": rid,
                         "ts": int(time.time()), "who": who, "kind": _kind,
+                        # #1023 (G1): which ROAD this row belongs to -
+                        # kind above is "call" for every burst row.
+                        "round": airlog_round_now(who, _kind, caller_name),
                         **({"sfx": chunk, "sfx_dir": "the stream",
                             "seconds": round(float(secs or 0), 2)}
                            if who == "board" else {}),
@@ -59809,6 +64099,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # random rounds shop here — anything with its own subject (an angle, a
     # caller, the button) is written to order.
     if (not bank and not angle and not force_seed and not caller_name
+            and not seat_away_who()             # #1034: written live
             and any(dialogue_row_ready("banter", e)
                     and (not e.get("aired_at")
                          or shelf_repeat_ready("banter", e))
@@ -59846,6 +64137,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 and _larder_current(entry)):
             pipeline_log("model", "round served off the larder shelf "
                                   f"({len(_LARDER)} left)")
+            gap_round_flag("banked")                             # #1022
             # #786: the render road was UNWRAPPED — any exception past the
             # write escaped dj_banter entirely, the torrent logged only
             # "fallback banter failed", and the slot aired nothing.
@@ -60548,7 +64840,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
             + (f", 'D: ...' for {dj['third_name']}" if third else "")
             + (f", and 'C: ...' for {caller_name} on the phone"
                if caller_name else "")
-            + f".{playing}{only_song}{aside}{show_memory()}{call_flow}"
+            + f".{seat_away_clause()}"           # #1034: the empty chair
+            f"{playing}{only_song}{aside}{show_memory()}{call_flow}"
             f"{crystal_clause(bank)}{avoid_reruns()}"
             f"{approach_clause(_approach)}\n\n"
             # #842: the banked round is told it is being PRE-RECORDED, so
@@ -61538,6 +65831,8 @@ async def _banter_air(entry: dict[str, Any],
                       track: dict[str, Any] | None) -> list[str]:
     """Put a written round on air — fresh from the model or off the larder
     shelf (#349), the airing is the same either way."""
+    airlog_round_hint(str(entry.get("prep_kind") or ""),
+                      caller=str(entry.get("caller_name") or ""))  # #1023 (G1)
     # #1005: THE PICTURES BELONG TO THE ROUND, NOT TO THE STATION.
     #
     # This is the one place every prepared round passes through on its way
@@ -61957,7 +66252,8 @@ async def dj_manager_call(text: str, doc: str = "") -> list[str]:
     try:
         voice = caller_voice_for(
             boss, {voices.get("dj", ""), voices.get("cohost", "")},
-            await voice_allowlist()) or ""
+            await voice_allowlist(),
+            clones=await voicepolicy_clone_pool_async()) or ""   # #1021
     except Exception:
         voice = ""
     host = dj.get("host_name") or "the host"
@@ -62053,7 +66349,7 @@ async def caller_line_voice(name: str, held: str = "") -> str:
     except Exception:  # noqa: BLE001
         catalogue = None
     try:
-        ready = bool((await xtts_health())["ready"])
+        ready = await voicepolicy_clone_engine_up()             # #1021
     except Exception:  # noqa: BLE001
         ready = False
     # A caller must NEVER sound like the DJ or the co-host (#559), so a held
@@ -62347,9 +66643,17 @@ async def dj_caller(track: dict[str, Any] | None = None,
                     bank_to: list[dict[str, Any]] | None = None,
                     case_id: str = "",
                     heat: int | None = None,
-                    shelf_only: bool = False
+                    shelf_only: bool = False,
+                    fresh_only: bool = False
                     ) -> list[str]:
     """A call gets through on the request line.
+
+    #1033/#1039: the order of the roads is now: the unaired bank, then
+    (on air, not banking) a storyline whose caller is due to ring back,
+    then a shelf row inside its re-air window, then a finished recording
+    re-aired as one clip, and only then a live write. `fresh_only`
+    stops shelf_take at the unaired queue, which is how the phone clock
+    lets a due story ring between the bank and a repeat.
 
     What the caller wants is one of his own past requests, read back to him by
     a stranger — the joke only lands because it is really his. They take the
@@ -62361,12 +66665,15 @@ async def dj_caller(track: dict[str, Any] | None = None,
     # airing. Nothing prepared means the live road below runs unchanged.
     if bank_to is None:
         try:
-            _prep_call = shelf_take("caller")
+            _prep_call = shelf_take("caller", fresh_only=fresh_only)
         except Exception:  # noqa: BLE001
             _prep_call = None
         if _prep_call:
             _prep_entry = _prep_call.get("entry") or {}
             _prep_began = time.time()
+            # #1033: shelf_take stamped the airing before handing it over,
+            # so a second airing reads 2 here - this call is a REPEAT.
+            _prep_again = int(_prep_call.get("aired") or 0) > 1
             # #913: the same card the generated road posts. A prepared call
             # used to reach the air with nobody named anywhere — not in the
             # booth, not in the script, not in the audio — which is how a
@@ -62374,17 +66681,30 @@ async def dj_caller(track: dict[str, Any] | None = None,
             try:
                 _prep_who = str(_prep_entry.get("caller_name") or "")
                 if _prep_who:
-                    call_line_take(_prep_who,
-                                   dict(_prep_entry.get("call") or {}))
+                    _prep_meta = dict(_prep_entry.get("call") or {})
+                    # #1033: the voice on the ledger, and the repeat flag
+                    # so the paper and the air log know it went out again.
+                    _prep_meta["voice"] = str(
+                        _prep_entry.get("caller_voice") or "")
+                    if _prep_again:
+                        _prep_meta["repeat"] = True
+                    call_line_take(_prep_who, _prep_meta)
                     _RADIO["chat"].append(
                         {"ts": int(time.time()), "who": "host",
-                         "kind": "call",
+                         "kind": "call", "round": "caller",
+                         "repeat": bool(_prep_again),
                          "text": f"On {call_line_say(call_line_no())}: "
-                                 f"{_prep_who}"})
+                                 f"{_prep_who}"
+                                 + (" - back on the line from earlier "
+                                    "tonight (a repeat)" if _prep_again
+                                    else "")})
                     del _RADIO["chat"][:-240]
                     pipeline_log("call", f"{_prep_who} on the request line — "
-                                 "a call recorded earlier, the caller's own "
-                                 "turns rendered live (#871/#913)")
+                                 + ("a call that went out earlier tonight, "
+                                    "going out again (#1033)" if _prep_again
+                                    else "a call recorded earlier, the "
+                                    "caller's own turns rendered live "
+                                    "(#871/#913)"))
             except Exception:  # noqa: BLE001
                 pass
             try:
@@ -62415,6 +66735,24 @@ async def dj_caller(track: dict[str, Any] | None = None,
                 return _prep_said
     if shelf_only:
         return []                       # #1155: the phone clock wants the bank only
+    if bank_to is None:
+        # #1039: A DUE STORY OUTRANKS A STRANGER. Its caller rings back
+        # through the generated road (the only one that takes a named
+        # caller); a busy line defers and the story stays due.
+        _due_story = story_due()
+        if _due_story:
+            _made = await story_ring(_due_story)
+            if (_made or {}).get("lines"):
+                return list(_made.get("lines") or [])
+        # #1033: A RECORDING FROM EARLIER TONIGHT BEFORE A LIVE WRITE.
+        # Nothing unaired was ready and no shelf row is in its window;
+        # a finished call's mp3 airs as one clip, if one is 6-10h old.
+        try:
+            _again = await call_rerun_take(track)
+        except Exception:  # noqa: BLE001
+            _again = []
+        if _again:
+            return _again
     hot = booth_hot()
     # When the building is genuinely cooking, some callers ring in about
     # THAT instead, and they compete at it (#644).
@@ -62463,6 +66801,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
     _cname, _cvoice, _cfx = await call_line_caller()
     _call_meta = {
         "mode": "scheduled",
+        "voice": str(_cvoice or ""),           # #1033/#1039: on the ledger
         "line": line_say,
         "topic": str((_themed or {}).get("text")
                      or ("the heat in the station" if heat_call else
@@ -62550,6 +66889,16 @@ async def dj_caller(track: dict[str, Any] | None = None,
     # given to THEM — see call_plot_clause.
     _plot, _swath = await call_plot_clause(
         str((_themed or {}).get("text") or want))
+    # #1033: two fresh random chunks beside the semantic seed, screened
+    # against every logged and shelved call, carried on the meta.
+    try:
+        _seed_bit, _seed_extra = await story_call_seed_clause(2)
+    except Exception:  # noqa: BLE001
+        _seed_bit, _seed_extra = "", []
+    if _seed_extra:
+        _call_meta["speakerbox_extra"] = list(_seed_extra)
+        if bank_to is None:
+            call_line_context(speakerbox_extra=list(_seed_extra))
     if _swath:
         _call_meta["source"] = str(_swath.get("file") or "")
         _call_meta["speakerbox_text"] = str(
@@ -62608,6 +66957,7 @@ async def dj_caller(track: dict[str, Any] | None = None,
         f"NAME. What got {_cname} on the air is one of the listener's own "
         f"past requests, which they want read back to them: \"{want}\"."
         + _plot
+        + _seed_bit                                                # #1033
         + _disp
         # #854: the case supplies the SUBJECT, the disposition above
         # supplies the TEMPER, and the rule below supplies the ENDING. On
@@ -64488,6 +68838,12 @@ async def ask_model(prompt: str, limit: int = 300,
     except Exception:  # noqa: BLE001
         pass
     _MODEL_CALLS.append(_row)
+    try:                                                    # #1020 (G1)
+        airlog_model_call(_row, {**_spent, "prompt_eval_count":
+                                 result.get("prompt_eval_count") or 0},
+                          took)
+    except Exception:  # noqa: BLE001
+        pass
     # #1022: a per-turn tint (#1021) writes one row per turn, so a single
     # sixteen-turn round used to push every other call off a forty-row
     # ring - the desk would show nothing but the tint. Eighty rows costs
@@ -64663,13 +69019,29 @@ async def generate_answer(
             "completion_tokens": 0,
         }
 
+    # #1025: "save out the last five minutes of rhetoric" / "export
+    # directory is ..." - a spoken export order. #1027: a standing
+    # instruction about the station's behaviour. #1026: "show me the
+    # sidekick manual" - a display order. All three are COMMANDS, each
+    # gated on an imperative shape and the #1154 residue rule, and they
+    # outrank every detector below - the memory road included, because
+    # "remember that I like more callers" is an order to the station, not
+    # a fact for the agent to file.
+    export_cmd = parse_export_command(user_text)
+    directive_cmd = None if export_cmd else parse_directive(user_text)
+    manual_cmd = (None if (export_cmd or directive_cmd
+                           or not settings.get("gear_manuals", True))
+                  else te_manual_intent(user_text))
+    _s5_cmd = bool(export_cmd or directive_cmd or manual_cmd)
+
     memory_command = (
         is_memory_command(user_text)
-        if settings.get("long_term_memory", True)
+        if settings.get("long_term_memory", True) and not _s5_cmd
         else None
     )
 
-    system_used = (not memory_command) and is_system_query(user_text)
+    system_used = ((not memory_command) and not _s5_cmd
+                   and is_system_query(user_text))
     # #1153: "restart <service>" is a COMMAND - it outranks every status
     # question, including the comfy one ("restart comfyui" must act, not
     # diagnose). And "how are the services doing" is the census question.
@@ -64689,6 +69061,7 @@ async def generate_answer(
         not memory_command
         and not system_used
         and not service_command_name
+        and not _s5_cmd                          # #1025/#1026/#1027
         and is_services_query(user_text)
     )
     # #1152: "what's going on with ComfyUI" outranks "render an image" -
@@ -64698,10 +69071,12 @@ async def generate_answer(
         and not system_used
         and not service_command_name
         and not services_query
+        and not _s5_cmd                          # #1025/#1026/#1027
         and is_comfy_status_query(user_text)
     )
     tune_requested = (
         not is_music_request(user_text)
+        and not _s5_cmd                          # #1025/#1026/#1027
         and
         not memory_command and not system_used and not comfy_status
         and is_tune_request(user_text)
@@ -64733,6 +69108,7 @@ async def generate_answer(
     dj_used = (
         not memory_command
         and not system_used
+        and not _s5_cmd                          # #1025/#1026/#1027
         and is_dj_request(user_text)
     )
     # Anything that sounds like asking for a song, that the library can
@@ -64744,6 +69120,7 @@ async def generate_answer(
     station_request = (
         not memory_command
         and not system_used
+        and not _s5_cmd                          # #1025/#1026/#1027
         and bool(DJ_ASKED.search(user_text or ""))
         and (bool(_RADIO["on"]) or bool(re.search(
             r"\b(pine ?box ?fm|the (station|radio|dj)|dj)\b",
@@ -64757,6 +69134,7 @@ async def generate_answer(
         and not dj_used
         and not memory_command
         and not system_used
+        and not _s5_cmd                          # #1025/#1026/#1027
         and is_music_request(user_text)
     )
     # A named song beats every other lookup: the crystal is already local
@@ -64928,6 +69306,27 @@ async def generate_answer(
                 ),
             }
         )
+    elif export_cmd:
+        # #1025: say where it goes, cut it behind the reply (#1153 pattern).
+        feature_meta["export_command"] = True
+        said = await export_command_run(export_cmd, settings)
+        return said, {**feature_meta, "model": "cutter"}
+    elif directive_cmd:
+        # #1027: a standing order in the operator's words - written into
+        # the policy file, moved on the dial when it names a road and a
+        # direction, and heard by every writing prompt from here.
+        feature_meta["directive"] = True
+        said = directive_record(directive_cmd, source="spoken")
+        return said, {**feature_meta, "model": "orchestrator"}
+    elif manual_cmd:
+        # #1026: the pages go to the feed (the panel's strip, beacon and
+        # doc browser pick them up within a poll); the reply names them.
+        feature_meta["gear_manual_used"] = True
+        feature_meta["gear_device"] = manual_cmd["slug"]
+        feature_meta["gear_icon"] = te_has_icon(manual_cmd["slug"])
+        te_feed_push(user_text, manual_cmd)
+        return te_manual_words(manual_cmd), {**feature_meta,
+                                             "model": "library"}
     elif system_used:
         feature_meta["system_status_used"] = True
         # #1149: system_stats() shells out to nvidia-smi - off the loop,
@@ -68520,9 +72919,31 @@ CRYSTALS_PATH = data_path("crystals.json")
 SPEAKBOX_VOTES_PATH = data_path("speakbox_votes.json")
 
 
+# #1022: the pulse ledger recorded json.loads(crystals.json) ON THE LOOP
+# eleven times for 26.7s (worst 8.8s) in one evening, every one reached
+# from dialogue_row_ready -> dialogue_tint_required -> crystal_active,
+# i.e. from every readiness sweep the keeper and the panel poll make.
+# Memoised on the file's mtime/size with a two-second memory; a save
+# through crystals_save clears it at once.
+_CRYSTALS_MEMO: dict[str, Any] = {"key": None, "at": 0.0, "value": {}}
+
+
 def crystals_read() -> dict[str, Any]:
+    _now = time.time()
     try:
-        return json.loads(CRYSTALS_PATH.read_text())
+        if (_CRYSTALS_MEMO["key"] is not None
+                and _now - float(_CRYSTALS_MEMO["at"]) < 2.0):
+            return _CRYSTALS_MEMO["value"]
+        st = CRYSTALS_PATH.stat()
+        key = (st.st_mtime_ns, st.st_size)
+        if key == _CRYSTALS_MEMO["key"]:
+            _CRYSTALS_MEMO["at"] = _now
+            return _CRYSTALS_MEMO["value"]
+        got = json.loads(CRYSTALS_PATH.read_text())
+        if not isinstance(got, dict):
+            got = {}
+        _CRYSTALS_MEMO.update({"key": key, "at": _now, "value": got})
+        return got
     except Exception:
         return {}
 
@@ -68531,6 +72952,7 @@ def crystals_save(data: dict[str, Any]) -> None:
     tmp = CRYSTALS_PATH.with_suffix(".tmp")
     tmp.write_text(json.dumps(data, indent=1))
     tmp.replace(CRYSTALS_PATH)
+    _CRYSTALS_MEMO.update({"key": None, "at": 0.0})           # #1022
 
 
 def crystal_active() -> list[dict[str, Any]]:
@@ -76702,6 +81124,42 @@ async def api_orch_judgment(
             "lesson": judgment_lesson(road)}
 
 
+@app.get("/api/orchestrator/notes")
+async def api_orch_notes(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1027: the operator's standing orders in his own words, which road
+    each moved, the lesson every road now carries, and the ledger split
+    between the operator's calls and the station's own."""
+    require_read_auth(authorization)
+    _judgment_load()
+    notes = directive_notes(limit=60)
+    roads = sorted({str(k) for k in _JUDGMENT["roads"]}
+                   | {str(n.get("road") or "") for n in notes
+                      if n.get("road")})
+    rows = list(_JUDGMENT["rows"])
+    return {
+        "at": time.time(),
+        "notes": notes,
+        "roads": {
+            road: {
+                "label": SHELF_LABEL.get(road, road),
+                "factor": coord_judgment_factor(road),
+                "lesson": judgment_lesson(road),
+                "operator_words": bool(directive_notes(road=road, limit=1)),
+                "alone": bool((_JUDGMENT["roads"].get(road) or {}).get("alone")),
+            } for road in roads},
+        "ledger": {
+            "rows": len(rows),
+            "operator": sum(1 for r in rows if not r.get("alone")),
+            "alone": sum(1 for r in rows if r.get("alone")),
+            "recent": [{k: r.get(k) for k in
+                        ("at", "topic", "face", "does", "alone", "by")}
+                       for r in rows[:12]],
+        },
+    }
+
+
 @app.get("/api/track-reads")
 async def api_track_reads() -> dict[str, Any]:
     """#1061: THE TRACK LIBRARY - which records have a read on file.
@@ -77968,7 +82426,7 @@ def _booth_row(line_id: str) -> dict[str, Any]:
                 return dict(row)
     except Exception:  # noqa: BLE001
         return {}
-    return {}
+    return airlog_row(want)     # #1023 (G1): the durable log after the ring
 
 
 @app.get("/api/booth/clip")
@@ -79231,6 +83689,349 @@ async def _cut_do(job: str, kind: str, seconds: int,
         _CUT_JOBS[job].update({"state": "ready", "name": name})
     except Exception as exc:                  # noqa: BLE001
         _CUT_JOBS[job].update({"state": "failed", "error": str(exc)[:200]})
+
+
+
+# --- #1025: the spoken export - where a cut goes besides the tray ----------
+# "Remember the export directory." Only /app is writable from the container
+# (compose mounts ./spark-agent:/app; /music and /samples are :ro), so a
+# directory the operator names is honoured only when it is INSIDE the
+# station's data folder - spoken as the host path, the share path, or a
+# bare folder name - and refused, out loud, with the places that work.
+EXPORT_DEFAULT_DIR = "data/export/broadcasts"
+EXPORT_HOST_ROOT = "~/pinevoice-stack/spark-agent/data"
+EXPORT_SHARE_ROOT = r"\\10.89.1.246\ehm_eckx\pinevoice-stack\spark-agent\data"
+_EXPORT_ROOTS = (
+    # (backslashes and doubled slashes are collapsed first, so the share's
+    # leading \\ arrives here as one slash)
+    r"/10\.89\.1\.246/ehm_eckx/pinevoice-stack/spark-agent/data",
+    r"~/pinevoice-stack/spark-agent/data",
+    r"/home/[^/]+/pinevoice-stack/spark-agent/data",
+    r"/app/data",
+    r"data",
+    r"\./data",
+)
+
+
+def export_resolve(raw: str) -> Path | None:
+    r"""A spoken/typed directory -> a Path under DATA_DIR, or None when the
+    container could not write there. Accepts the host form
+    (~/pinevoice-stack/spark-agent/data/x), the share form
+    (\\10.89.1.246\ehm_eckx\pinevoice-stack\spark-agent\data\x), /app/data/x,
+    data/x, and a bare folder name (-> data/export/<name>)."""
+    said = str(raw or "").strip().strip("\"'`").strip()
+    if not said:
+        return None
+    flat = re.sub(r"/+", "/", said.replace("\\", "/")).rstrip("/")
+    if not flat:
+        return None
+    for root in _EXPORT_ROOTS:
+        got = re.match(r"^(?:" + root + r")(?:/(?P<rest>.+))?$", flat, re.I)
+        if got:
+            rest = str(got.group("rest") or "").strip("/")
+            parts = [p for p in rest.split("/")
+                     if p and p not in (".", "..")]
+            return (DATA_DIR.joinpath(*parts) if parts
+                    else DATA_DIR / "export" / "broadcasts")
+    try:
+        here = str(DATA_DIR).replace("\\", "/").rstrip("/")
+        if flat.lower().startswith(here.lower() + "/") or flat.lower() == here.lower():
+            rest = flat[len(here):].strip("/")
+            parts = [p for p in rest.split("/") if p and p not in (".", "..")]
+            return (DATA_DIR.joinpath(*parts) if parts
+                    else DATA_DIR / "export" / "broadcasts")
+    except Exception:  # noqa: BLE001
+        pass
+    if "/" not in flat and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _.'-]{0,60}",
+                                        flat):
+        # "save broadcasts to my exports folder" -> data/export/my-exports
+        name = re.sub(r"\s+(folder|directory|dir)$", "", flat.strip(), flags=re.I)
+        name = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip("-.")
+        if name:
+            return DATA_DIR / "export" / name
+    return None
+
+
+def export_host_words(path: Path) -> str:
+    """The host-visible name of a data path, for saying out loud."""
+    try:
+        rel = path.relative_to(DATA_DIR)
+        return EXPORT_HOST_ROOT + "/" + str(rel).replace("\\", "/")
+    except Exception:  # noqa: BLE001
+        return str(path)
+
+
+def export_dir_path() -> Path:
+    """Where the spoken export lands, from the setting (#1025)."""
+    try:
+        raw = str(load_settings().get("export_dir") or EXPORT_DEFAULT_DIR)
+    except Exception:  # noqa: BLE001
+        raw = EXPORT_DEFAULT_DIR
+    return export_resolve(raw) or (DATA_DIR / "export" / "broadcasts")
+
+
+def export_where_words() -> str:
+    """The refusal, naming where the box CAN write."""
+    return ("I can only write inside the station's data folder. Say a bare "
+            "folder name and I will put it under data/export, or a path "
+            f"under {EXPORT_HOST_ROOT} on the host, or under the share "
+            f"{EXPORT_SHARE_ROOT}.")
+
+
+def export_span_words(seconds: int) -> str:
+    seconds = int(seconds)
+    if seconds == 1800:
+        return "half an hour"
+    if seconds == 3600:
+        return "an hour"
+    if seconds % 60 == 0:
+        mins = seconds // 60
+        return "one minute" if mins == 1 else f"{mins} minutes"
+    return f"{seconds} seconds"
+
+
+def export_tail_lines(count: int) -> Path | None:
+    """#1025: the last N SENTENCES of the show as one mp3 - the last N
+    staged episode items (one aired line each), and when the staging is
+    shorter than that (a seal just swept it) the newest sealed episode's
+    marks make up the rest. The same PCM join as _cache_tail."""
+    import subprocess
+    import tempfile
+
+    import imageio_ffmpeg
+    count = max(1, min(40, int(count)))
+    now = time.time()
+    # sources are (path, -ss seconds, -t seconds or 0) in air order
+    sources: list[tuple[Path, float, float]] = []
+    items = [it for it in ((_RADIO.get("episode") or {}).get("items") or [])
+             if Path(str(it.get("file") or "")).is_file()]
+    staged = items[-count:]
+    short = count - len(staged)
+    if short > 0:
+        try:
+            shelf = sorted((RADIO_CACHE / "episodes").glob("*.mp3"),
+                           key=lambda p: p.stat().st_mtime)
+            if shelf:
+                newest = shelf[-1]
+                marks = json.loads(newest.with_suffix(".json").read_text())
+                for mark in (marks if isinstance(marks, list) else [])[-short:]:
+                    sources.append((newest, float(mark.get("off") or 0),
+                                    float(mark.get("dur") or 0)))
+        except Exception:  # noqa: BLE001
+            pass
+    sources += [(Path(str(it.get("file"))), 0.0, 0.0) for it in staged]
+    if not sources:
+        return None
+    for stale in RADIO_CACHE.glob("_tail*.mp3"):
+        try:
+            if now - stale.stat().st_mtime > 600:
+                stale.unlink()
+        except OSError:
+            pass
+    out = RADIO_CACHE / f"_tail_lines_{int(now * 1000)}.mp3"
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    gap = b"\x00" * int(24000 * 0.25) * 2
+    pcm = bytearray()
+    try:
+        with tempfile.TemporaryDirectory(prefix="lines-") as work:
+            for at, (src, off, dur) in enumerate(sources):
+                cut = Path(work) / f"in{at}.wav"
+                try:
+                    subprocess.run(
+                        [exe, "-nostdin", "-loglevel", "error", "-y",
+                         "-i", str(src),
+                         *(["-ss", f"{off:.2f}"] if off > 0.05 else []),
+                         *(["-t", f"{dur:.2f}"] if dur > 0.05 else []),
+                         "-ac", "1", "-ar", "24000", "-sample_fmt", "s16",
+                         str(cut)],
+                        check=True, timeout=300)
+                    with wave.open(str(cut), "rb") as handle:
+                        pcm += handle.readframes(handle.getnframes())
+                    pcm += gap
+                    cut.unlink(missing_ok=True)
+                except Exception:  # noqa: BLE001
+                    continue
+            if len(pcm) < 24000:
+                return None
+            joined = Path(work) / "lines.wav"
+            with wave.open(str(joined), "wb") as handle:
+                handle.setnchannels(1)
+                handle.setsampwidth(2)
+                handle.setframerate(24000)
+                handle.writeframes(bytes(pcm))
+            subprocess.run(
+                [exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                 "-i", str(joined), "-codec:a", "libmp3lame", "-b:a", "96k",
+                 str(out)],
+                check=True, timeout=600)
+    except Exception:  # noqa: BLE001
+        return None
+    return out if out.is_file() and out.stat().st_size > 1000 else None
+
+
+def export_sweep() -> dict[str, int]:
+    """#1025: a frequent spoken cut grows two things nothing sweeps - the
+    _bmix_cut<job> scratch dirs (22 present) and _staging orphans (5,058
+    files). Scratch older than half an hour goes; a staged clip goes only
+    when it is NOT the episode on air and is two days old (the staging
+    desk exists to review the rest). Never raises."""
+    gone = {"scratch": 0, "staged": 0}
+    now = time.time()
+    try:
+        for d in RADIO_CACHE.glob("_bmix_cut*"):
+            try:
+                if d.is_dir() and now - d.stat().st_mtime > 1800:
+                    shutil.rmtree(d, ignore_errors=True)
+                    gone["scratch"] += 1
+            except OSError:
+                continue
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        live = _staging_live()
+        for p in _EPISODE_STAGE.iterdir():
+            try:
+                if (p.is_file() and str(p) not in live
+                        and now - p.stat().st_mtime > 172800):
+                    p.unlink()
+                    gone["staged"] += 1
+            except OSError:
+                continue
+            if gone["staged"] >= 400:
+                break               # a bounded pass; the next cut takes more
+    except Exception:  # noqa: BLE001
+        pass
+    return gone
+
+
+def export_after_cut(job: str, what: str) -> str:
+    """Copy a finished tray cut into the export directory with a dated
+    name; record it on the job; sweep. Off the loop (to_thread)."""
+    row = _CUT_JOBS.get(job) or {}
+    if row.get("state") != "ready" or not row.get("name"):
+        return ""
+    try:
+        dest_dir = export_dir_path()
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y-%m-%d_%H%M%S")
+        dest = dest_dir / f"{stamp}-{station_slug()}-{what}.mp3"
+        shutil.copy2(CUTS_DIR / str(row["name"]), dest)
+        row["exported"] = str(dest)
+        pipeline_log("air", f"spoken export landed: {export_host_words(dest)} "
+                            "(#1025)")
+        swept = export_sweep()
+        if swept.get("scratch") or swept.get("staged"):
+            pipeline_log("air", "the export swept "
+                         f"{swept['scratch']} scratch dir(s) and "
+                         f"{swept['staged']} staging orphan(s) (#1025)")
+        return str(dest)
+    except Exception as exc:  # noqa: BLE001
+        row["error"] = f"exported to the tray only: {exc}"[:200]
+        return ""
+
+
+async def export_cut_run(job: str, kind: str, seconds: int,
+                         label: str) -> None:
+    """#1025: the tray's own cut, then the copy out. Serialised with the
+    panel's cuts under _CUT_LOCK exactly as _cut_run is."""
+    async with _CUT_LOCK:
+        await _cut_do(job, kind, seconds, mix_levels(), label)
+        await asyncio.to_thread(
+            export_after_cut, job,
+            f"{'broadcast' if kind == 'mix' else 'talk'}-{int(seconds)}s")
+
+
+async def export_lines_run(job: str, count: int, label: str) -> None:
+    """#1025: 'the last two sentences' - into the tray, then out."""
+    async with _CUT_LOCK:
+        _CUT_JOBS[job] = {"state": "cutting", "at": time.time(), "name": "",
+                          "label": label, "error": ""}
+        try:
+            built = await asyncio.to_thread(export_tail_lines, int(count))
+            if not built:
+                _CUT_JOBS[job].update(
+                    {"state": "empty",
+                     "error": "Nothing has aired to take a sentence from"})
+                return
+            CUTS_DIR.mkdir(parents=True, exist_ok=True)
+            name = (f"{station_slug()}-lines-{int(count)}"
+                    f"-{time.strftime('%H%M%S')}-{job}.mp3")
+            target = CUTS_DIR / name
+            try:
+                built.replace(target)
+            except OSError:
+                target.write_bytes(built.read_bytes())
+            _cuts_trim()
+            _CUT_JOBS[job].update({"state": "ready", "name": name})
+        except Exception as exc:  # noqa: BLE001
+            _CUT_JOBS[job].update({"state": "failed",
+                                   "error": str(exc)[:200]})
+            return
+        await asyncio.to_thread(export_after_cut, job,
+                                f"lines-{int(count)}")
+
+
+async def export_command_run(cmd: dict[str, Any],
+                             settings: dict[str, Any]) -> str:
+    """#1025: act on parse_export_command's verdict and return what the
+    box SAYS. The cut runs behind the reply (#1153 pattern)."""
+    if cmd.get("dir"):
+        raw = str(cmd["dir"])
+        dest = export_resolve(raw)
+        if dest is None:
+            return (f"I can't write to {raw}. " + export_where_words()
+                    + " Exports stay at "
+                    + export_host_words(export_dir_path()) + " for now.")
+        try:
+            rel = dest.relative_to(DATA_DIR)
+            stored = "data/" + str(rel).replace("\\", "/")
+        except Exception:  # noqa: BLE001
+            stored = str(dest)
+        try:
+            await asyncio.to_thread(save_settings, {**settings,
+                                                    "export_dir": stored})
+        except Exception as exc:  # noqa: BLE001
+            return f"The setting would not save: {exc}"
+        try:
+            await asyncio.to_thread(dest.mkdir, parents=True, exist_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+        pipeline_log("air", f"spoken: broadcast exports now go to {stored} "
+                            "(#1025)")
+        return (f"Broadcast exports now go to {export_host_words(dest)}. "
+                "Every cut I save out lands there with the date in its "
+                "name, and a copy stays in the cut tray.")
+    job = uuid.uuid4().hex[:8]
+    for old, row in list(_CUT_JOBS.items()):          # bounded
+        if time.time() - float(row.get("at") or 0) > 3600:
+            _CUT_JOBS.pop(old, None)
+    where = export_host_words(export_dir_path())
+    if cmd.get("sentences"):
+        n = int(cmd["sentences"])
+        label = f"the last {n} sentence{'s' if n != 1 else ''} - spoken order"
+        _CUT_JOBS[job] = {"state": "queued", "at": time.time(), "name": "",
+                          "label": label, "error": "", "export": True}
+        asyncio.create_task(export_lines_run(job, n, label))
+        pipeline_log("air", f"spoken export queued: {label} (#1025)")
+        return (f"Saving the last {n} sentence{'s' if n != 1 else ''} of "
+                f"the show now. It lands in the cut tray and a copy goes "
+                f"to {where} - give it a moment.")
+    seconds = int(cmd.get("seconds") or 0)
+    kind = "mix" if cmd.get("kind") == "mix" else "talk"
+    span = export_span_words(seconds)
+    label = (f"the last {span} - "
+             + ("the whole broadcast" if kind == "mix" else "just the talk")
+             + " - spoken order")
+    _CUT_JOBS[job] = {"state": "queued", "at": time.time(), "name": "",
+                      "label": label, "error": "", "export": True}
+    asyncio.create_task(export_cut_run(job, kind, seconds, label))
+    pipeline_log("air", f"spoken export queued: {label} (#1025)")
+    return (f"Cutting the last {span} of "
+            + ("the whole broadcast, records and all" if kind == "mix"
+               else "the talk")
+            + f" now. It lands in the cut tray and a copy goes to {where}"
+            + (" - a full mix takes a few minutes." if kind == "mix"
+               else " - give it a minute."))
 
 
 @app.post("/api/radio-cache/cut")
@@ -80779,9 +85580,47 @@ async def dj_callers_ring(
                       else max(0, min(3, int(_want_heat))))
     except (TypeError, ValueError):
         _want_heat = None
+    # #1039: ...or a STORY, whose caller rings back now.
+    _sid = str(payload.get("story_id") or "")
+    if _sid:
+        return await story_ring(story_find(_sid))
     return await dj_call_generated(caller,
                                    case_id=str(payload.get("case_id") or ""),
                                    heat=_want_heat)
+
+
+@app.get("/api/dj/stories")
+async def dj_stories_api() -> dict[str, Any]:
+    """#1033/#1039: the storyline ledger, the caller bank against its
+    floor, the re-air window and the recording re-air ledger."""
+    return story_state()
+
+
+@app.get("/api/dj/seats")
+async def dj_seats_api() -> dict[str, Any]:
+    """#1034: the seat watch - {dj: {last, lines}, cohost: {...}, away}
+    plus the dials and what the detector would say right now."""
+    return seat_state()
+
+
+@app.get("/api/dj/gaps")
+async def dj_gaps_api(
+    hours: float = 3.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1022: the silences between cast lines over the last `hours`
+    (0.25..48) - count, total, longest, median, share of air, causes
+    ranked by seconds lost, the worst ten with what preceded and
+    followed each, resumes and how long the first line took, rounds
+    rendered into a pause, live-vs-shelf takes, loop stalls, and the
+    runway / stock-first policy state. Ring + data/gap_log.jsonl."""
+    require_read_auth(authorization)
+    hours = max(0.25, min(48.0, float(hours or 3.0)))
+    try:
+        file_rows = await asyncio.to_thread(_gap_log_read)
+    except Exception:  # noqa: BLE001
+        file_rows = []
+    return gap_report(hours, file_rows=file_rows)
 
 
 @app.post("/api/dj/dice")
@@ -84713,7 +89552,10 @@ async def te_chat(
     doc = te_doc(slug) or {}
     page = next((p for p in doc.get("pages", []) if p.get("n") == page_n), {})
     settings = load_settings()
-    speak = bool(payload.get("speak"))
+    # #1026: `speak = bool(...)` shadowed the module coroutine speak(), so
+    # the popup's speak checkbox raised TypeError after the answer was
+    # computed and the request 500ed.
+    want_speak = bool(payload.get("speak"))
 
     links: list[dict[str, str]] = []
     videos: list[dict[str, str]] = []
@@ -84732,11 +89574,16 @@ async def te_chat(
         except Exception:
             videos = []
 
+    # #1026: the model used to see ONE page (whatever was last clicked,
+    # often none). A question that names a section - the sidekick, the EQ
+    # knobs - now gets the whole section's text, bounded.
+    section = te_section_text(doc, page_n, text)
     context = (
         f"You are discussing the manual '{doc.get('title', slug)}'"
         + (f", page {page_n} ({page.get('heading', '')})" if page else "")
-        + ". Page text:\n"
-        + (page.get("text", "")[:3000] or "(no text on this page)")
+        + (". Manual text, by page:\n" + section if section else
+           ". Page text:\n"
+           + (page.get("text", "")[:3000] or "(no text on this page)"))
         + (
             "\n\nLive web results on the topic:\n"
             + "\n".join(f"- {l['title']} — {l['url']}" for l in links)
@@ -84760,7 +89607,7 @@ async def te_chat(
         answer = str(result.get("message", {}).get("content") or "").strip()
     except Exception as exc:
         answer = f"(model unavailable: {exc})"
-    if speak and answer:
+    if want_speak and answer:
         # Voice replies out of the Pine Box speaker while you keep typing.
         fire_and_forget_speech(speak(answer[:600], event="doc"))
     return {"answer": answer, "links": links, "videos": videos}
@@ -86207,6 +91054,1114 @@ async def api_generate(
     return {"prompt_id": prompt_id, "model": model_name, "tags": prompt[:2000]}
 
 
+# --- G1: THE LEDGERS (#1023 #1031 #1036 #1022 #1034 #1020 #1030) ---------
+#
+# Until now the only per-line record of who said what, when, and where
+# its audio is was _RADIO["chat"] - a 240-row ring, never on disk,
+# emptied on every radio start. Measured 2026-09-04 20:20: the ring
+# covered 57 minutes, so every hourly edition printed at hh:00:20 had
+# already lost the first minutes of the hour it was about, and a busy
+# hour lost more. Everything downstream that wanted a quote with a play
+# button (#1023, #1031), a per-story quote (#1036), a per-seat clock
+# (#1034) or a dead-air measurement (#1022) was reading a buffer that
+# forgot.
+#
+# This block is the durable half. Every ledger here is JSONL appended
+# off the loop (json holds the GIL - #1156), bounded to 48 hours, and
+# read through one reader with a memo. Nothing in it speaks, nothing in
+# it decides; it writes down what happened and hands it back.
+#
+#   data/air_log.jsonl      one row per aired line, UPSERTED BY id from
+#                           the ring by airlog_keeper (rows are mutated
+#                           after append: air_at restamps, held->box,
+#                           images), compacted hourly to one row per id
+#   data/news_said.jsonl    {ts, marker_id, titles, urls} per news marker
+#   data/model_calls.jsonl  one row per Ollama call with the #1079 split
+#   data/heat_ring.json     GPU/board temperature + load, one sample / 30 s
+#   data/pause_log.jsonl    {at, paused, why} on every flip, both ways
+#
+# The `round` field is the one thing the ring never carried: WHICH ROAD
+# a line belongs to. The stream road stamps every conversational row
+# kind="call" (banter included), so kind cannot say; the round is read
+# off the dispatching road instead - see airlog_round_now.
+
+AIR_LOG_PATH = data_path("air_log.jsonl")
+NEWS_SAID_PATH = data_path("news_said.jsonl")
+MODEL_CALLS_PATH = data_path("model_calls.jsonl")
+HEAT_RING_PATH = data_path("heat_ring.json")
+PAUSE_LOG_PATH = data_path("pause_log.jsonl")
+AIRLOG_KEEP_S = 48 * 3600.0             # every ledger here keeps two days
+AIRLOG_TICK = 10.0                      # the keeper's look at the ring
+AIRLOG_COMPACT_EVERY = 3600.0           # one rewrite an hour, off-loop
+AIRLOG_MEMO_S = 5.0                     # reader memo
+AIRLOG_CAST = ("dj", "cohost", "third")
+AIRLOG_AIRED = ("box", "page", "stream")
+# Rows the readers leave out unless asked: system markers, the operator's
+# own chat, the analysis desk, hang-up bookkeeping, board stings.
+AIRLOG_QUIET_KINDS = frozenset({"marker", "chat", "image_analysis",
+                                "song_analysis", "hangup", "drop", "sfx"})
+AIRLOG_QUIET_WHO = frozenset({"analysis", "board"})
+GAP_FLOOR_S = 20.0                      # #1022: shorter is a breath
+HEAT_SAMPLE_KEEP = int(AIRLOG_KEEP_S / 30) + 8
+HEAT_FLUSH_EVERY = 300.0
+# Round kinds the turn road can name for itself (dj_speak's `kind`).
+AIRLOG_TURN_ROUNDS = frozenset({
+    "ad", "station_id", "reply", "manager", "gallery", "recap", "news",
+    "request", "track_talk", "deep", "bombshell", "guest", "sting",
+    "aside", "upstairs", "hawk", "banter", "caller", "prize", "played",
+    "callin", "media", "intro", "outro", "open"})
+_AIRLOG_LOCK = RLock()
+_AIRLOG_SEEN: dict[str, str] = {}       # id -> hash of the row last written
+_AIRLOG_INDEX: dict[str, dict[str, Any]] = {}   # id -> latest row (48 h)
+_AIRLOG_STATE: dict[str, Any] = {"compacted": 0.0, "loaded": False,
+                                 "written": 0, "last_write": 0.0}
+_AIRLOG_MEMO: dict[str, Any] = {"at": 0.0, "sig": None, "rows": []}
+_AIRLOG_ROUND: dict[str, Any] = {}      # {"kind", "at", "sticky", "caller"}
+_AIRLOG_SEAT_LAST: dict[str, float] = {}
+_HEAT_RING: list[dict[str, Any]] = []
+_HEAT_STATE: dict[str, Any] = {"flushed": 0.0, "loaded": False, "dirty": 0}
+
+
+def airlog_jsonl_append(path: Path, row: dict[str, Any]) -> None:
+    """One line onto a ledger. Small, sync, meant for a thread."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(row, default=str) + "\n")
+    except Exception:  # noqa: BLE001
+        pass                            # a forgetful ledger never stops air
+
+
+def airlog_append_bg(path: Path, row: dict[str, Any]) -> None:
+    """Append off the loop when there is one, straight away when there
+    is not (a thread, a test). Never raises."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        airlog_jsonl_append(path, row)
+        return
+    try:
+        fire_and_forget(asyncio.to_thread(airlog_jsonl_append, path, row))
+    except Exception:  # noqa: BLE001
+        airlog_jsonl_append(path, row)
+
+
+def airlog_jsonl_read(path: Path, since: float = 0.0,
+                      key: str = "at") -> list[dict[str, Any]]:
+    """Every row of a small ledger with `key` >= since. Sync; thread it
+    for anything that has grown."""
+    out: list[dict[str, Any]] = []
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if isinstance(row, dict) and float(row.get(key) or 0) >= since:
+                    out.append(row)
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def airlog_jsonl_trim(path: Path, keep_s: float, key: str = "at") -> int:
+    """Drop rows older than keep_s from a ledger (tmp + replace). Sync."""
+    try:
+        if not path.exists():
+            return 0
+        cutoff = time.time() - keep_s
+        kept: list[str] = []
+        dropped = 0
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                    if float(row.get(key) or 0) >= cutoff:
+                        kept.append(line.rstrip("\n"))
+                    else:
+                        dropped += 1
+                except Exception:  # noqa: BLE001
+                    dropped += 1
+        if dropped:
+            tmp = path.with_suffix(path.suffix + ".tmp")
+            tmp.write_text("\n".join(kept) + ("\n" if kept else ""),
+                           encoding="utf-8")
+            tmp.replace(path)
+        return dropped
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+# --- the round: which road a line belongs to ------------------------------
+
+def airlog_round_hint(kind: str, sticky: bool = False,
+                      caller: str = "") -> None:
+    """The dispatching road says what it is about to air. _banter_air
+    (every prepared and every live round passes through it) stamps the
+    entry's prep_kind; the news desk stamps `news` STICKY around its
+    airing because dj_banter's own entry reads `banter` for a bulletin.
+    A caller name beats everything."""
+    try:
+        now = time.time()
+        if caller:
+            _AIRLOG_ROUND.update({"kind": "caller", "at": now,
+                                  "sticky": False, "caller": str(caller)})
+            return
+        kind = str(kind or "")
+        if not sticky and _AIRLOG_ROUND.get("sticky") \
+                and now - float(_AIRLOG_ROUND.get("at") or 0) < 900:
+            return                      # the news desk holds the floor
+        _AIRLOG_ROUND.update({"kind": kind or "banter", "at": now,
+                              "sticky": bool(sticky), "caller": ""})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def airlog_round_clear() -> None:
+    """The sticky hint is lifted when the round that set it is over."""
+    try:
+        if _AIRLOG_ROUND.get("sticky"):
+            _AIRLOG_ROUND.update({"sticky": False, "at": 0.0})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+_AIRLOG_SCHED_ROUND = {
+    "banter_caller": "caller", "bombshell": "bombshell", "record": "track_talk",
+}
+
+
+def airlog_round_now(who: str = "", kind: str = "",
+                     caller_name: str = "") -> str:
+    """The round kind for a conversational row being written NOW.
+
+    In order of trust: a caller on the line is a caller round; the
+    dispatching road's own hint (airlog_round_hint) when it is fresher
+    than the torrent's last named round (or sticky - the news desk); the
+    torrent loop's `last_round_kind`, which is exact while talk radio
+    runs one round at a time (deep/bombshell/recap rounds never pass
+    through _banter_air, so this is what names them); the schedule's
+    kind for the entry that owns the air; and `banter`, which is what an
+    unnamed conversation is. How accurate: see REPORT.md - callers,
+    news and every prepared road are exact, the torrent's own rounds are
+    exact while the loop is single-file, and the residue (a live round
+    outside the torrent with no hint) is banter by definition."""
+    try:
+        if caller_name or who in ("caller", "caller2"):
+            return "caller"
+        now = time.time()
+        hint = dict(_AIRLOG_ROUND)
+        hint_at = float(hint.get("at") or 0)
+        hint_kind = str(hint.get("kind") or "")
+        if hint_kind and hint.get("sticky") and now - hint_at < 900:
+            return hint_kind
+        torrent_at = 0.0
+        last_kind = ""
+        try:
+            last_kind = str(_RADIO.get("last_round_kind") or "")
+            if _SCHED_LOG:
+                torrent_at = float(_SCHED_LOG[-1].get("at") or 0)
+        except Exception:  # noqa: BLE001
+            torrent_at, last_kind = 0.0, ""
+        if hint_kind and now - hint_at < 1800 and hint_at >= torrent_at:
+            if hint_kind == "caller" and hint.get("caller") and who in AIRLOG_CAST:
+                return "caller"
+            return hint_kind
+        if last_kind and now - torrent_at < 1800:
+            return _AIRLOG_SCHED_ROUND.get(last_kind, last_kind)
+        if hint_kind and now - hint_at < 1800:
+            return hint_kind
+        sched = str(_RADIO.get("sched_kind") or "")
+        if sched:
+            return _AIRLOG_SCHED_ROUND.get(sched, sched)
+    except Exception:  # noqa: BLE001
+        pass
+    return "banter"
+
+
+def airlog_round_for(kind: str, who: str = "", name: str = "") -> str:
+    """The round for a turn-road row (dj_speak): the kind names itself
+    for an advert, a station ID, a reply, a memo; `call` is a caller;
+    `interject` is a chunk of whatever round is up."""
+    try:
+        kind = str(kind or "")
+        if kind == "call" or who in ("caller", "caller2"):
+            return "caller"
+        if kind in ("intro", "outro", "open"):
+            return "track_talk"
+        if kind == "interject":
+            return airlog_round_now(who, kind)
+        if kind in AIRLOG_TURN_ROUNDS:
+            return kind
+        if kind:
+            return kind
+    except Exception:  # noqa: BLE001
+        pass
+    return airlog_round_now(who, kind)
+
+
+# --- the durable row -------------------------------------------------------
+
+def airlog_row_from(entry: dict[str, Any]) -> dict[str, Any]:
+    """The compact durable shape of a ring row. Dossiers, vectors and
+    prompts stay in the ring; the log keeps what a reader needs to quote
+    the line and play it."""
+    who = str(entry.get("who") or "")
+    kind = str(entry.get("kind") or "")
+    if who == "host" and kind != "chat":
+        kind = "marker"                 # 'On line N', 'News break' - not speech
+    c_from = entry.get("clip_from")
+    c_until = entry.get("clip_until")
+    seconds = 0.0
+    try:
+        if c_from is not None and c_until is not None:
+            seconds = max(0.0, float(c_until) - float(c_from)
+                          - float(entry.get("clip_tail") or 0))
+        else:
+            seconds = float(((entry.get("trace") or {}).get("render") or {})
+                            .get("seconds") or entry.get("seconds") or 0)
+    except Exception:  # noqa: BLE001
+        seconds = 0.0
+    row: dict[str, Any] = {
+        "id": str(entry.get("id") or ""),
+        "ts": int(float(entry.get("ts") or 0)),
+        "air_at": round(float(entry.get("air_at") or entry.get("ts") or 0), 3),
+        "who": who, "name": str(entry.get("name") or ""),
+        "kind": kind,
+        "round": str(entry.get("round") or "")
+                 or ("caller" if who in ("caller", "caller2") else "")
+                 or (kind if kind in AIRLOG_TURN_ROUNDS else "banter"),
+        "text": " ".join(str(entry.get("text") or "").split())[:600],
+        "aired": str(entry.get("aired") or ""),
+        "voice": str(entry.get("voice") or ""),
+        "engine": str(entry.get("engine") or ""),
+        "caller": (str(entry.get("name") or "")
+                   if who in ("caller", "caller2") else ""),
+        "source": str(entry.get("source") or ""),
+        "media": str(entry.get("media") or ""),
+        "sig": str(entry.get("sig") or ""),
+        "clip_media": str(entry.get("clip_media") or ""),
+        "clip_sig": str(entry.get("clip_sig") or ""),
+        "clip_from": (round(float(c_from), 3) if c_from is not None else None),
+        "clip_until": (round(float(c_until), 3) if c_until is not None else None),
+        "clip_tail": round(float(entry.get("clip_tail") or 0), 3),
+        "seconds": round(seconds, 2),
+    }
+    if entry.get("ad_audio"):
+        row["ad_audio"] = str(entry.get("ad_audio"))
+    if entry.get("images"):
+        try:
+            row["images"] = [str(i) for i in entry["images"]][:3]
+        except Exception:  # noqa: BLE001
+            pass
+    if entry.get("replay"):
+        row["replay"] = True
+    return row
+
+
+def airlog_row_hash(row: dict[str, Any]) -> str:
+    """What a change looks like: the fields that get restamped after the
+    ring append (#770 air_at, held->box, the #908 clip window, pictures)."""
+    try:
+        bits = (row.get("aired"), row.get("air_at"), row.get("text"),
+                row.get("clip_from"), row.get("clip_until"), row.get("media"),
+                row.get("round"), len(row.get("images") or []))
+        return hashlib.sha1(repr(bits).encode("utf-8")).hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def airlog_pick_changed(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ring rows whose durable shape differs from what was last written.
+    Pure dict work; safe on the loop (a few hundred rows a tick)."""
+    out: list[dict[str, Any]] = []
+    for entry in entries:
+        try:
+            if not isinstance(entry, dict) or not entry.get("id"):
+                continue
+            row = airlog_row_from(entry)
+            digest = airlog_row_hash(row)
+            if _AIRLOG_SEEN.get(row["id"]) == digest:
+                continue
+            row["_h"] = digest
+            out.append(row)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def airlog_write_rows(rows: list[dict[str, Any]]) -> int:
+    """Append the changed rows (sync, for a thread) and remember them."""
+    if not rows:
+        return 0
+    wrote = 0
+    try:
+        AIR_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _AIRLOG_LOCK:
+            with AIR_LOG_PATH.open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    digest = str(row.pop("_h", "") or airlog_row_hash(row))
+                    handle.write(json.dumps(row, default=str) + "\n")
+                    _AIRLOG_SEEN[row["id"]] = digest
+                    _AIRLOG_INDEX[row["id"]] = row
+                    wrote += 1
+                    if (row.get("who") in AIRLOG_CAST
+                            and row.get("aired") in AIRLOG_AIRED
+                            and row.get("kind") not in AIRLOG_QUIET_KINDS):
+                        _AIRLOG_SEAT_LAST[row["who"]] = max(
+                            float(_AIRLOG_SEAT_LAST.get(row["who"]) or 0),
+                            float(row.get("air_at") or 0)
+                            + float(row.get("seconds") or 0))
+            _AIRLOG_STATE["written"] = int(_AIRLOG_STATE.get("written") or 0) + wrote
+            _AIRLOG_STATE["last_write"] = time.time()
+            if len(_AIRLOG_SEEN) > 40000:
+                for key in list(_AIRLOG_SEEN)[:20000]:
+                    _AIRLOG_SEEN.pop(key, None)
+    except Exception:  # noqa: BLE001
+        pass
+    return wrote
+
+
+def airlog_read_all(path: Path | None = None) -> dict[str, dict[str, Any]]:
+    """The whole log folded to one row per id (last write wins). Sync -
+    this is the read that must stay off the loop."""
+    path = path or AIR_LOG_PATH
+    rows: dict[str, dict[str, Any]] = {}
+    cutoff = time.time() - AIRLOG_KEEP_S
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(row, dict) or not row.get("id"):
+                    continue
+                if float(row.get("air_at") or row.get("ts") or 0) < cutoff:
+                    continue
+                rows[str(row["id"])] = row
+    except Exception:  # noqa: BLE001
+        return rows
+    return rows
+
+
+def airlog_load_index() -> int:
+    """Warm the in-memory index off the file once per process (thread)."""
+    try:
+        got = airlog_read_all()
+        with _AIRLOG_LOCK:
+            for key, row in got.items():
+                _AIRLOG_INDEX.setdefault(key, row)
+                _AIRLOG_SEEN.setdefault(key, airlog_row_hash(row))
+                if (row.get("who") in AIRLOG_CAST
+                        and row.get("aired") in AIRLOG_AIRED
+                        and row.get("kind") not in AIRLOG_QUIET_KINDS):
+                    _AIRLOG_SEAT_LAST[row["who"]] = max(
+                        float(_AIRLOG_SEAT_LAST.get(row["who"]) or 0),
+                        float(row.get("air_at") or 0)
+                        + float(row.get("seconds") or 0))
+            _AIRLOG_STATE["loaded"] = True
+        return len(got)
+    except Exception:  # noqa: BLE001
+        _AIRLOG_STATE["loaded"] = True
+        return 0
+
+
+def airlog_compact(path: Path | None = None) -> int:
+    """Rewrite the log as one row per id inside the 48 h window, tmp +
+    replace. Hourly, in a thread; also prunes the index and the sibling
+    ledgers. Returns the rows kept."""
+    path = path or AIR_LOG_PATH
+    try:
+        if not path.exists():
+            return 0
+        rows = airlog_read_all(path)
+        ordered = sorted(rows.values(),
+                         key=lambda r: float(r.get("air_at") or r.get("ts") or 0))
+        tmp = path.with_suffix(".jsonl.tmp")
+        with _AIRLOG_LOCK:
+            tmp.write_text("".join(json.dumps(r, default=str) + "\n"
+                                   for r in ordered), encoding="utf-8")
+            tmp.replace(path)
+            cutoff = time.time() - AIRLOG_KEEP_S
+            for key in [k for k, r in _AIRLOG_INDEX.items()
+                        if float(r.get("air_at") or r.get("ts") or 0) < cutoff]:
+                _AIRLOG_INDEX.pop(key, None)
+                _AIRLOG_SEEN.pop(key, None)
+            _AIRLOG_STATE["compacted"] = time.time()
+        return len(ordered)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def airlog_compact_all() -> dict[str, int]:
+    """The hourly housekeeping, all of it in one thread."""
+    out = {"air_log": airlog_compact()}
+    out["model_calls"] = airlog_jsonl_trim(MODEL_CALLS_PATH, AIRLOG_KEEP_S)
+    out["news_said"] = airlog_jsonl_trim(NEWS_SAID_PATH, 7 * 86400.0, "ts")
+    out["pause_log"] = airlog_jsonl_trim(PAUSE_LOG_PATH, 30 * 86400.0)
+    return out
+
+
+async def airlog_keeper() -> None:
+    """#1023: the one hook that catches all twenty-five ring append sites
+    and every later mutation. Every AIRLOG_TICK it gives id-less rows an
+    id, diffs the ring against what was last written, and appends the
+    changed rows in a thread. Once an hour it compacts, in a thread.
+    Started beside talk_watch; a keeper may never take the show."""
+    await asyncio.sleep(8)
+    try:
+        await asyncio.to_thread(airlog_load_index)
+    except Exception:  # noqa: BLE001
+        pass
+    while True:
+        await asyncio.sleep(AIRLOG_TICK)
+        try:
+            _ensure_chat_ids()
+            changed = airlog_pick_changed(list(_RADIO.get("chat") or []))
+            if changed:
+                await asyncio.to_thread(airlog_write_rows, changed)
+            if time.time() - float(_AIRLOG_STATE.get("compacted") or 0) \
+                    > AIRLOG_COMPACT_EVERY:
+                _AIRLOG_STATE["compacted"] = time.time()
+                await asyncio.to_thread(airlog_compact_all)
+        except Exception:  # noqa: BLE001
+            continue
+
+
+# --- readers ---------------------------------------------------------------
+
+def airlog_row(line_id: str) -> dict[str, Any]:
+    """One row by id from the memory index - a dict read, safe on the
+    loop. This is what /api/booth/clip falls back to once a line has
+    left the ring (#1023)."""
+    try:
+        return dict(_AIRLOG_INDEX.get(str(line_id or "")) or {})
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def airlog_rows(since: float, until: float, who: Any = None,
+                kinds: Any = None, rounds: Any = None,
+                quiet: bool = False) -> list[dict[str, Any]]:
+    """Aired lines with air_at in [since, until), oldest first.
+
+    `who`, `kinds`, `rounds` are a string or a list of strings. Marker,
+    chat, analysis, sting and hang-up rows are left out unless quiet=True
+    (or the kind is asked for by name). Reads the memory index once the
+    keeper has warmed it, else the file (5 s memo). Sync; from async use
+    airlog_rows_async, which threads it."""
+    def _set(v: Any) -> set[str] | None:
+        if v is None or v == "":
+            return None
+        if isinstance(v, str):
+            return {x.strip() for x in v.split(",") if x.strip()} or None
+        return {str(x) for x in v} or None
+    whos, kset, rset = _set(who), _set(kinds), _set(rounds)
+    if _AIRLOG_STATE.get("loaded"):
+        with _AIRLOG_LOCK:              # the keeper thread writes it
+            source = list(_AIRLOG_INDEX.values())
+    else:
+        source = _airlog_file_rows()
+    out: list[dict[str, Any]] = []
+    for row in source:
+        try:
+            at = float(row.get("air_at") or row.get("ts") or 0)
+            if not since <= at < until:
+                continue
+            if whos and row.get("who") not in whos:
+                continue
+            kind = str(row.get("kind") or "")
+            if kset:
+                if kind not in kset:
+                    continue
+            elif not quiet and (kind in AIRLOG_QUIET_KINDS
+                                or row.get("who") in AIRLOG_QUIET_WHO):
+                continue
+            if rset and str(row.get("round") or "") not in rset:
+                continue
+            out.append(dict(row))
+        except Exception:  # noqa: BLE001
+            continue
+    out.sort(key=lambda r: (float(r.get("air_at") or r.get("ts") or 0),
+                            str(r.get("id") or "")))
+    return out
+
+
+def _airlog_file_rows() -> list[dict[str, Any]]:
+    """The file, folded, memoised on (mtime, size) for AIRLOG_MEMO_S."""
+    try:
+        st = AIR_LOG_PATH.stat()
+        sig = (st.st_mtime, st.st_size)
+    except Exception:  # noqa: BLE001
+        return []
+    now = time.time()
+    if (_AIRLOG_MEMO.get("sig") == sig
+            and now - float(_AIRLOG_MEMO.get("at") or 0) < AIRLOG_MEMO_S):
+        return list(_AIRLOG_MEMO.get("rows") or [])
+    rows = list(airlog_read_all().values())
+    _AIRLOG_MEMO.update({"at": now, "sig": sig, "rows": rows})
+    return rows
+
+
+async def airlog_rows_async(since: float, until: float, who: Any = None,
+                            kinds: Any = None, rounds: Any = None,
+                            quiet: bool = False) -> list[dict[str, Any]]:
+    return await asyncio.to_thread(airlog_rows, since, until, who, kinds,
+                                   rounds, quiet)
+
+
+def airlog_clip_url(row: dict[str, Any]) -> str:
+    """The play/download URL for a logged line: /api/booth/clip?line=<id>
+    while the audio it points at still exists (verified live 2026-09-04:
+    the route answers a GET without auth for a stream row and a turn
+    row). "" once the WAV has been pruned or the row never had audio.
+    Stats a file - fine in a thread, cheap enough for one row."""
+    try:
+        rid = str(row.get("id") or "")
+        if not rid:
+            return ""
+        key = str(row.get("clip_media") or "")
+        if key and MEDIA_KEY_SHAPE.match(key) and (VOICE_MEDIA_DIR / key).is_file():
+            return f"/api/booth/clip?line={rid}"
+        own = str(row.get("media") or "")
+        if own and MEDIA_KEY_SHAPE.match(own) and (VOICE_MEDIA_DIR / own).is_file():
+            return f"/api/booth/clip?line={rid}"
+        ad = str(row.get("ad_audio") or "")
+        if ad and AD_AUDIO_SHAPE.match(ad) and (PRODUCED_ADS_DIR / ad).is_file():
+            return f"/api/booth/clip?line={rid}"
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def airlog_seat_last(seat: str) -> float:
+    """#1034: the epoch at which this seat's last aired line ENDED (air_at
+    + its length), 0.0 when it has never spoken. The ring first (the
+    keeper is ten seconds behind it), then what the log remembers, so a
+    restart does not read every seat as freshly silent. Memory only."""
+    best = 0.0
+    try:
+        for row in reversed(_RADIO.get("chat") or []):
+            if str(row.get("who") or "") != seat:
+                continue
+            if row.get("aired") not in AIRLOG_AIRED:
+                continue
+            if str(row.get("kind") or "") in AIRLOG_QUIET_KINDS:
+                continue
+            r = airlog_row_from(row)
+            best = float(r.get("air_at") or 0) + float(r.get("seconds") or 0)
+            break
+    except Exception:  # noqa: BLE001
+        best = 0.0
+    try:
+        best = max(best, float(_AIRLOG_SEAT_LAST.get(seat) or 0))
+    except Exception:  # noqa: BLE001
+        pass
+    return best
+
+
+def airlog_seats(since: float, until: float,
+                 rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Per-seat clocks over a window: lines, seconds on air, first/last,
+    and the longest stretch each seat went without a line (#1034)."""
+    rows = rows if rows is not None else airlog_rows(since, until)
+    out: dict[str, Any] = {}
+    for seat in AIRLOG_CAST:
+        mine = [r for r in rows if r.get("who") == seat
+                and r.get("aired") in AIRLOG_AIRED]
+        if not mine:
+            out[seat] = {"lines": 0, "seconds": 0.0, "first_at": 0.0,
+                         "last_at": 0.0, "longest_quiet": round(until - since, 1),
+                         "name": ""}
+            continue
+        ends = [float(r.get("air_at") or 0) + float(r.get("seconds") or 0)
+                for r in mine]
+        starts = [float(r.get("air_at") or 0) for r in mine]
+        quiet = max([starts[0] - since]
+                    + [starts[i] - ends[i - 1] for i in range(1, len(mine))]
+                    + [until - ends[-1]])
+        out[seat] = {
+            "lines": len(mine),
+            "seconds": round(sum(float(r.get("seconds") or 0) for r in mine), 1),
+            "first_at": starts[0], "last_at": ends[-1],
+            "longest_quiet": round(max(0.0, quiet), 1),
+            "name": str(mine[-1].get("name") or ""),
+        }
+    return out
+
+
+# --- the pause log (#1030) ---------------------------------------------------
+
+def airlog_pause_note(on: bool, why: str = "", now: float = 0.0) -> None:
+    """Called inside radio_pause_set BEFORE the flag flips, so a resume
+    row can say how long the pause was. Both directions, the operator's
+    words kept (paused.json keeps only the current state)."""
+    try:
+        now = float(now or time.time())
+        was = bool(_RADIO.get("paused"))
+        row = {"at": now, "paused": bool(on), "why": str(why or "")[:160],
+               "for_seconds": (round(max(0.0, now - float(
+                   _RADIO.get("paused_at") or now)), 1)
+                               if (not on and was) else 0.0)}
+        airlog_append_bg(PAUSE_LOG_PATH, row)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def pause_log_rows(since: float, until: float) -> list[dict[str, Any]]:
+    """Pause flips inside the window, oldest first. Sync (small file)."""
+    rows = airlog_jsonl_read(PAUSE_LOG_PATH, since - 7 * 86400.0)
+    rows.sort(key=lambda r: float(r.get("at") or 0))
+    return [r for r in rows if since <= float(r.get("at") or 0) < until]
+
+
+def pause_intervals(since: float, until: float,
+                    rows: list[dict[str, Any]] | None = None) -> list[tuple[float, float]]:
+    """[(start, end)] stretches the station was paused, clipped to the
+    window; the current pause (from _RADIO) closes the list."""
+    if rows is None:
+        rows = airlog_jsonl_read(PAUSE_LOG_PATH, since - 7 * 86400.0)
+        rows.sort(key=lambda r: float(r.get("at") or 0))
+    out: list[tuple[float, float]] = []
+    open_at: float | None = None
+    for row in rows:
+        at = float(row.get("at") or 0)
+        if row.get("paused"):
+            if open_at is None:
+                open_at = at
+        elif open_at is not None:
+            out.append((open_at, at))
+            open_at = None
+    if open_at is None:
+        try:
+            if radio_paused():
+                open_at = float(_RADIO.get("paused_at") or since)
+        except Exception:  # noqa: BLE001
+            open_at = None
+    if open_at is not None:
+        out.append((open_at, max(until, open_at)))
+    clipped = [(max(since, a), min(until, b)) for a, b in out
+               if b > since and a < until]
+    return [(a, b) for a, b in clipped if b > a]
+
+
+# --- #1022: dead air between cast lines --------------------------------------
+# MERGE (#1022): named airlog_gap_rows, not gap_rows - the S4 lane's own
+# gap ledger owns the bare `gap_rows` name (it reads the live chat ring and
+# takes (chat, now, least)). Two defs of one name in one module is a silent
+# override, and the later one - this one - would have won.
+
+def airlog_gap_rows(since: float, until: float,
+             rows: list[dict[str, Any]] | None = None,
+             pauses: list[tuple[float, float]] | None = None,
+             floor: float = GAP_FLOOR_S) -> list[dict[str, Any]]:
+    """Silences between consecutive CAST lines longer than `floor`
+    seconds, measured from the END of one line to the START of the next.
+
+    Each gap: {at, until, seconds, paused_seconds, dead_seconds, paused,
+    before{id, who, round, kind, text}, after{...}}. `paused_seconds` is
+    the overlap with the pause log, so a station off air on purpose is
+    not counted as a hole; the S4 lane builds on this."""
+    rows = rows if rows is not None else airlog_rows(since, until)
+    cast = [r for r in rows if r.get("who") in AIRLOG_CAST
+            and r.get("aired") in AIRLOG_AIRED]
+    cast.sort(key=lambda r: float(r.get("air_at") or 0))
+    pauses = pauses if pauses is not None else pause_intervals(since, until)
+
+    def _peek(r: dict[str, Any]) -> dict[str, Any]:
+        return {"id": str(r.get("id") or ""), "who": str(r.get("who") or ""),
+                "name": str(r.get("name") or ""),
+                "round": str(r.get("round") or ""),
+                "kind": str(r.get("kind") or ""),
+                "text": str(r.get("text") or "")[:80]}
+
+    out: list[dict[str, Any]] = []
+    for i in range(1, len(cast)):
+        prev, nxt = cast[i - 1], cast[i]
+        end = float(prev.get("air_at") or 0) + float(prev.get("seconds") or 0)
+        start = float(nxt.get("air_at") or 0)
+        gap = start - end
+        if gap <= floor:
+            continue
+        paused_s = 0.0
+        for a, b in pauses:
+            paused_s += max(0.0, min(b, start) - max(a, end))
+        out.append({
+            "at": round(end, 3), "until": round(start, 3),
+            "seconds": round(gap, 1),
+            "paused_seconds": round(min(gap, paused_s), 1),
+            "dead_seconds": round(max(0.0, gap - paused_s), 1),
+            "paused": paused_s > 0.5,
+            "before": _peek(prev), "after": _peek(nxt),
+        })
+    return out
+
+
+def airlog_gap_summary(gaps: list[dict[str, Any]]) -> dict[str, Any]:
+    """{count, total_s, longest, by_round{round: {count, total_s}}} over
+    the UNPAUSED seconds; a gap is charged to the round that followed it
+    (the one the station was waiting for)."""
+    by_round: dict[str, dict[str, float]] = {}
+    total = 0.0
+    longest = 0.0
+    counted = 0
+    for g in gaps:
+        dead = float(g.get("dead_seconds") or 0)
+        if dead <= 0:
+            continue
+        counted += 1
+        total += dead
+        longest = max(longest, dead)
+        key = str((g.get("after") or {}).get("round") or "") or "unknown"
+        slot = by_round.setdefault(key, {"count": 0, "total_s": 0.0})
+        slot["count"] += 1
+        slot["total_s"] = round(slot["total_s"] + dead, 1)
+    return {"count": counted, "total_s": round(total, 1),
+            "longest": round(longest, 1), "by_round": by_round,
+            "paused_gaps": sum(1 for g in gaps if g.get("paused"))}
+
+
+# --- the news ledgers (#1036) ------------------------------------------------
+
+def airlog_news_said(marker_id: str, titles: list[str],
+                     urls: list[str]) -> None:
+    """One row per 'News break' / 'News on the hour' marker, so the
+    lines about a story can be recovered by time window later."""
+    try:
+        airlog_append_bg(NEWS_SAID_PATH, {
+            "ts": time.time(), "marker_id": str(marker_id or ""),
+            "titles": [str(t)[:200] for t in (titles or []) if t][:8],
+            "urls": [str(u)[:400] for u in (urls or [])][:8]})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def news_said_rows(since: float, until: float) -> list[dict[str, Any]]:
+    rows = airlog_jsonl_read(NEWS_SAID_PATH, since, "ts")
+    rows.sort(key=lambda r: float(r.get("ts") or 0))
+    return [r for r in rows if since <= float(r.get("ts") or 0) < until]
+
+
+def airlog_news_summary(url: str, title: str, summary: str) -> None:
+    """The boiled story (drudge_story) onto its news_covered row, <=600
+    chars - captured at _news_once time, the only moment it exists. Sync;
+    _news_once threads it. No new network: the fetch already happened."""
+    try:
+        summary = " ".join(str(summary or "").split())[:600]
+        if not summary:
+            return
+        rows = json.loads(NEWS_COVERED_PATH.read_text())
+        rows = rows if isinstance(rows, list) else []
+        hit = False
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            if (url and row.get("url") == url) or \
+                    (title and row.get("title") == title):
+                row["summary"] = summary
+                if url and not row.get("url"):
+                    row["url"] = url
+                hit = True
+                break
+        if not hit:
+            rows.insert(0, {"title": str(title or "")[:300], "url": str(url or ""),
+                            "keys": sorted(_news_keys(str(title or ""))),
+                            "ts": time.time(), "summary": summary})
+        NEWS_COVERED_PATH.write_text(json.dumps(rows[:200], indent=1))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def news_covered_rows(since: float, until: float) -> list[dict[str, Any]]:
+    """news_covered.json rows noted in the window, regardless of the
+    three-hour cover window _news_covered() applies. Sync (small)."""
+    try:
+        rows = json.loads(NEWS_COVERED_PATH.read_text())
+        rows = rows if isinstance(rows, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+    out = [r for r in rows if isinstance(r, dict)
+           and since <= float(r.get("ts") or 0) < until]
+    out.sort(key=lambda r: float(r.get("ts") or 0))
+    return out
+
+
+# --- model calls (#1020, the #1079 decomposition kept) ----------------------
+
+def airlog_model_call(row: dict[str, Any], spent: dict[str, Any] | None,
+                      took: int = 0) -> None:
+    """One line per Ollama call, with the working/waiting split that was
+    computed beside the ring row and then only printed."""
+    try:
+        spent = dict(spent or {})
+        ms = int(row.get("ms") or took or 0)
+        working = int(float(spent.get("service") or 0) * 1000)
+        out = {
+            "at": float(row.get("at") or time.time()),
+            "model": str(row.get("model") or ""),
+            "kind": str(row.get("kind") or ""),
+            "ms": ms, "working_ms": working,
+            "waiting_ms": max(0, ms - working) if working else 0,
+            "chars": int(row.get("chars") or 0),
+            "eval_count": int(spent.get("eval_count") or 0),
+            "prompt_eval_count": int(spent.get("eval_count_prompt")
+                                     or spent.get("prompt_eval_count") or 0),
+            "load_ms": int(float(spent.get("load") or 0) * 1000),
+            "prompt_eval_ms": int(float(spent.get("prompt_eval") or 0) * 1000),
+            "eval_ms": int(float(spent.get("eval") or 0) * 1000),
+            "tinted": str(row.get("tinted") or ""),
+            "armed": str(row.get("armed") or "")[:80],
+        }
+        airlog_append_bg(MODEL_CALLS_PATH, out)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def model_calls_rows(since: float, until: float) -> list[dict[str, Any]]:
+    rows = airlog_jsonl_read(MODEL_CALLS_PATH, since)
+    rows.sort(key=lambda r: float(r.get("at") or 0))
+    return [r for r in rows if since <= float(r.get("at") or 0) < until]
+
+
+def airlog_model_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    by_model: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        slot = by_model.setdefault(str(r.get("model") or "?"), {
+            "calls": 0, "ms": 0, "working_ms": 0, "waiting_ms": 0,
+            "eval_count": 0, "prompt_eval_count": 0, "chars": 0, "tinted": 0})
+        slot["calls"] += 1
+        for key in ("ms", "working_ms", "waiting_ms", "eval_count",
+                    "prompt_eval_count", "chars"):
+            slot[key] += int(r.get(key) or 0)
+        if r.get("tinted"):
+            slot["tinted"] += 1
+    return {"calls": len(rows),
+            "ms": sum(int(r.get("ms") or 0) for r in rows),
+            "working_ms": sum(int(r.get("working_ms") or 0) for r in rows),
+            "waiting_ms": sum(int(r.get("waiting_ms") or 0) for r in rows),
+            "eval_count": sum(int(r.get("eval_count") or 0) for r in rows),
+            "prompt_eval_count": sum(int(r.get("prompt_eval_count") or 0)
+                                     for r in rows),
+            "by_model": by_model}
+
+
+# --- the weather ring (#1020: DGX temperature + load history) ---------------
+
+def airlog_heat_blocking() -> dict[str, Any]:
+    """The GPU reading plus the board, the load and the memory - all local
+    file reads and the one nvidia-smi the clock already pays for.
+    BLOCKING: only through asyncio.to_thread."""
+    got: dict[str, Any] = {}
+    try:
+        got = dict(_gpu_temp_blocking() or {})
+    except Exception:  # noqa: BLE001
+        got = {}
+    board = 0.0
+    for probe in ("/sys/class/thermal", "/host-thermal"):
+        try:
+            temps = []
+            for zone in Path(probe).glob("thermal_zone*/temp"):
+                try:
+                    milli = int(zone.read_text().strip())
+                except (OSError, ValueError):
+                    continue
+                if 1000 < milli < 150000:
+                    temps.append(milli / 1000.0)
+            if temps:
+                board = round(max(temps), 1)
+                break
+        except Exception:  # noqa: BLE001
+            continue
+    got["board_c"] = board
+    try:
+        got["load1"] = round(float(os.getloadavg()[0]), 2)
+    except Exception:  # noqa: BLE001
+        got["load1"] = 0.0
+    try:
+        info = _read_meminfo()
+        total = float(info.get("MemTotal") or 0)
+        avail = float(info.get("MemAvailable") or 0)
+        got["mem_used_gb"] = (round((total - avail) / 1024 / 1024, 1)
+                              if total else 0.0)
+    except Exception:  # noqa: BLE001
+        got["mem_used_gb"] = 0.0
+    return got
+
+
+def airlog_heat_load() -> int:
+    """The ring off disk, once per process (thread)."""
+    try:
+        got = json.loads(HEAT_RING_PATH.read_text())
+        rows = got.get("samples") if isinstance(got, dict) else got
+        rows = [r for r in (rows or []) if isinstance(r, dict) and r.get("at")]
+        cutoff = time.time() - AIRLOG_KEEP_S
+        with _AIRLOG_LOCK:
+            have = {float(r.get("at") or 0) for r in _HEAT_RING}
+            merged = [r for r in rows if float(r["at"]) >= cutoff
+                      and float(r["at"]) not in have] + list(_HEAT_RING)
+            merged.sort(key=lambda r: float(r.get("at") or 0))
+            _HEAT_RING[:] = merged[-HEAT_SAMPLE_KEEP:]
+            _HEAT_STATE["loaded"] = True
+        return len(rows)
+    except Exception:  # noqa: BLE001
+        _HEAT_STATE["loaded"] = True
+        return 0
+
+
+def airlog_heat_flush() -> bool:
+    """The ring onto disk, tmp + replace (thread). At most every 5 min."""
+    try:
+        with _AIRLOG_LOCK:
+            rows = list(_HEAT_RING)
+        HEAT_RING_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = HEAT_RING_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"samples": rows, "at": time.time()}))
+        tmp.replace(HEAT_RING_PATH)
+        _HEAT_STATE["flushed"] = time.time()
+        _HEAT_STATE["dirty"] = 0
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+async def airlog_heat_sample(got: dict[str, Any]) -> None:
+    """One sample into memory (every gpu_temp_refresh, ~30 s); the disk
+    write rides a thread and happens at most every HEAT_FLUSH_EVERY."""
+    try:
+        if not _HEAT_STATE.get("loaded"):
+            _HEAT_STATE["loaded"] = True          # one load per process
+            await asyncio.to_thread(airlog_heat_load)
+        got = dict(got or {})
+        c = float(got.get("c") or 0)
+        nvidia = str(got.get("how") or "") == "nvidia-smi"
+        row = {"at": round(time.time(), 1),
+               "gpu_c": round(c, 1) if nvidia else 0.0,
+               "board_c": round(float(got.get("board_c") or (0.0 if nvidia else c)), 1),
+               "load1": round(float(got.get("load1") or 0), 2),
+               "mem_used_gb": round(float(got.get("mem_used_gb") or 0), 1),
+               "gpu_util": round(float(got.get("util") or 0), 1)}
+        if not (row["gpu_c"] or row["board_c"] or row["load1"] or row["mem_used_gb"]):
+            return                          # a box with no sensors says nothing
+        with _AIRLOG_LOCK:
+            _HEAT_RING.append(row)
+            del _HEAT_RING[:-HEAT_SAMPLE_KEEP]
+            _HEAT_STATE["dirty"] = int(_HEAT_STATE.get("dirty") or 0) + 1
+        if time.time() - float(_HEAT_STATE.get("flushed") or 0) > HEAT_FLUSH_EVERY:
+            _HEAT_STATE["flushed"] = time.time()
+            await asyncio.to_thread(airlog_heat_flush)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def heat_ring_rows(since: float, until: float) -> list[dict[str, Any]]:
+    """Samples in the window, oldest first, memory and disk merged so a
+    restart leaves no hole a chart cannot see: where two neighbours sit
+    more than 90 s apart the later one carries `gap_s` (the seconds
+    nothing was sampled) so a line chart can break rather than bridge.
+    Sync; small (<=5,800 rows)."""
+    with _AIRLOG_LOCK:
+        rows = list(_HEAT_RING)
+    if not _HEAT_STATE.get("loaded"):
+        try:
+            got = json.loads(HEAT_RING_PATH.read_text())
+            disk = got.get("samples") if isinstance(got, dict) else got
+            have = {float(r.get("at") or 0) for r in rows}
+            rows += [r for r in (disk or []) if isinstance(r, dict)
+                     and float(r.get("at") or 0) not in have]
+        except Exception:  # noqa: BLE001
+            pass
+    rows = [r for r in rows if since <= float(r.get("at") or 0) < until]
+    rows.sort(key=lambda r: float(r.get("at") or 0))
+    out: list[dict[str, Any]] = []
+    last = 0.0
+    for r in rows:
+        at = float(r.get("at") or 0)
+        row = dict(r)
+        if last and at - last > 90.0:
+            row["gap_s"] = round(at - last, 1)
+        out.append(row)
+        last = at
+    return out
+
+
+def airlog_heat_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    def _stat(key: str) -> dict[str, float]:
+        vals = [float(r.get(key) or 0) for r in rows if r.get(key)]
+        if not vals:
+            return {"min": 0.0, "max": 0.0, "avg": 0.0, "last": 0.0}
+        return {"min": round(min(vals), 1), "max": round(max(vals), 1),
+                "avg": round(sum(vals) / len(vals), 1),
+                "last": round(vals[-1], 1)}
+    return {"samples": len(rows), "gpu_c": _stat("gpu_c"),
+            "board_c": _stat("board_c"), "load1": _stat("load1"),
+            "mem_used_gb": _stat("mem_used_gb"), "gpu_util": _stat("gpu_util"),
+            "gaps": sum(1 for r in rows if r.get("gap_s"))}
+
+
+# --- routes ---------------------------------------------------------------
+
+@app.get("/api/airlog")
+async def api_airlog(
+    since: float = 0.0, until: float = 0.0, who: str = "",
+    kinds: str = "", rounds: str = "", most: int = 600, quiet: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1023: the durable air log over a window (default: the last hour),
+    each row with its play URL. Read auth."""
+    require_read_auth(authorization)
+    now = time.time()
+    until = float(until or now)
+    since = float(since or (until - 3600.0))
+    most = max(1, min(5000, int(most or 600)))
+
+    def _read() -> list[dict[str, Any]]:
+        rows = airlog_rows(since, until, who or None, kinds or None,
+                           rounds or None, bool(quiet))
+        rows = rows[-most:]
+        for r in rows:
+            r["url"] = airlog_clip_url(r)
+        return rows
+    rows = await asyncio.to_thread(_read)
+    return {"since": since, "until": until, "count": len(rows), "rows": rows,
+            "loaded": bool(_AIRLOG_STATE.get("loaded")),
+            "written": int(_AIRLOG_STATE.get("written") or 0)}
+
+
+# MERGE (#1022): this is the LEDGER view of the same question the S4 lane's
+# GET /api/dj/gaps answers off the live ring. Two routes cannot share a path
+# - FastAPI matches the first registered and the second is dead - so the
+# durable-air-log view lives at /api/dj/gaps/ledger. It is the one that
+# reaches back past the ring (48 h) and the one that knows about pauses.
+@app.get("/api/dj/gaps/ledger")
+async def api_dj_gaps_ledger(
+    hours: float = 1.0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1022: silences between cast lines over the last N hours read from
+    data/air_log.jsonl, with what preceded and followed each and whether
+    the station was paused. The live-ring report is GET /api/dj/gaps."""
+    require_read_auth(authorization)
+    now = time.time()
+    hours = max(0.1, min(48.0, float(hours or 1.0)))
+    since, until = now - hours * 3600.0, now
+
+    def _read() -> dict[str, Any]:
+        rows = airlog_rows(since, until)
+        pauses = pause_intervals(since, until)
+        gaps = airlog_gap_rows(since, until, rows, pauses)
+        return {"since": since, "until": until, "hours": hours,
+                "lines": len(rows), "gaps": gaps,
+                "summary": airlog_gap_summary(gaps),
+                "paused_intervals": [[a, b] for a, b in pauses],
+                "seats": airlog_seats(since, until, rows)}
+    return await asyncio.to_thread(_read)
+
+
+# --- G1 end ---------------------------------------------------------------
+
+
 # --- #1019: THE PINE BOX GAZETTE -------------------------------------------
 #
 # "Next to the Pine Box voice cloud, I want an icon that shows a live
@@ -86240,20 +92195,48 @@ PAPER_EDITIONS_DIR = PAPER_DIR / "editions"
 PAPER_MASTHEAD_PATH = PAPER_DIR / "paper.json"
 PAPER_KEEP = int(os.getenv("PAPER_KEEP", "336"))        # two weeks of hours
 PAPER_MODEL = os.getenv("PAPER_MODEL", "")               # "" = the station's
+# G2 (#1020-#1040): the section order is the CONTRACT's, eighteen deep,
+# and every story carries a PAGE (1-6) the typesetter paginates by.
 PAPER_SECTIONS: list[dict[str, str]] = [
     {"id": "front", "name": "Front Page"},
+    {"id": "hour", "name": "The Hour"},
     {"id": "air", "name": "On Air"},
     {"id": "records", "name": "The Records"},
     {"id": "phones", "name": "The Phones"},
+    {"id": "serial", "name": "The Serial"},
     {"id": "wire", "name": "The Wire"},
     {"id": "gallery", "name": "The Gallery"},
+    {"id": "classifieds", "name": "Classifieds"},
+    {"id": "interview", "name": "The Interview"},
     {"id": "studio", "name": "In the Studio"},
     {"id": "upstairs", "name": "From Upstairs"},
     {"id": "adverts", "name": "The Adverts"},
+    {"id": "report", "name": "Orchestrator Report"},
+    {"id": "device", "name": "The Box"},
     {"id": "weather", "name": "Weather"},
     {"id": "engineering", "name": "Engineering"},
+    {"id": "apology", "name": "A Note of Apology"},
 ]
 PAPER_SECTION_IDS = tuple(s["id"] for s in PAPER_SECTIONS)
+# Page 1 = front + hour; 2 = air + records + serial; 3 = phones + wire;
+# 4 = gallery + classifieds + adverts; 5 = interview + studio + upstairs +
+# report; 6 = device + weather + engineering + apology (CONTRACT s3).
+PAPER_PAGE_OF: dict[str, int] = {
+    "front": 1, "hour": 1, "air": 2, "records": 2, "serial": 2,
+    "phones": 3, "wire": 3, "gallery": 4, "classifieds": 4, "adverts": 4,
+    "interview": 5, "studio": 5, "upstairs": 5, "report": 5,
+    "device": 6, "weather": 6, "engineering": 6, "apology": 6,
+}
+PAPER_STYLE_HINTS = ("obituary", "wanted", "classified", "forsale",
+                     "interview", "report", "apology", "itinerary",
+                     "minutes", "testimonial", "crime", "business", "sports")
+PAPER_STATS_MOST = 4
+
+
+def paper_page_for(section: str) -> int:
+    """The page a section sits on (CONTRACT s3); unknown sections go to
+    the back with the engineering room."""
+    return int(PAPER_PAGE_OF.get(str(section or ""), 6))
 # The upstream contract's numbers: headline and deck caps, the story band,
 # the table shape.
 PAPER_HEADLINE_MAX = 90
@@ -86269,6 +92252,40 @@ _PAPER: dict[str, Any] = {"running": False, "started": 0.0, "reason": "",
                           "steps": [], "latest": "", "verdict": "",
                           "geo": None}
 _PAPER_LOCK = RLock()
+# G2: one press must finish inside ~3 minutes with the station on, so
+# the writer is rationed (PAPER_WRITER_MAX calls, two of them reserved
+# for the lead and the apology) and the crystal tint is capped (stories
+# and paragraphs). paper_print resets this; paper_write and the tint
+# spend it; edition.json records what was actually spent.
+PAPER_WRITER_MAX = int(os.getenv("PAPER_WRITER_MAX", "12"))
+PAPER_PRESS_SECONDS = float(os.getenv("PAPER_PRESS_SECONDS", "170"))
+PAPER_TINT_STORIES = int(os.getenv("PAPER_TINT_STORIES", "6"))
+PAPER_TINT_PARAS = int(os.getenv("PAPER_TINT_PARAS", "10"))
+# #1024: the tint runs AFTER every desk, on a paper that is already
+# printable, so it keeps its own clock rather than the writing budget's
+# leftovers (which are negative by then - the desks spend the lot).
+PAPER_TINT_SECONDS = float(os.getenv("PAPER_TINT_SECONDS", "90"))
+_PAPER_PRESS: dict[str, Any] = {"started": 0.0, "deadline": 0.0,
+                                "writer_calls": 0, "writer_refused": 0,
+                                "tinted_stories": 0, "tinted_paras": 0,
+                                "seeds": 0}
+
+
+def paper_press_reset() -> None:
+    _PAPER_PRESS.update({"started": time.time(),
+                         "deadline": time.time() + PAPER_PRESS_SECONDS,
+                         "writer_calls": 0, "writer_refused": 0,
+                         "tinted_stories": 0, "tinted_paras": 0, "seeds": 0})
+
+
+def paper_press_left(reserve: bool = False) -> float:
+    """Seconds the press may still spend; a reserved desk (the lead, the
+    apology) may run to the deadline, the rest stop 40 s before it so
+    the last two always get their turn."""
+    deadline = float(_PAPER_PRESS.get("deadline") or 0)
+    if not deadline:
+        return PAPER_PRESS_SECONDS
+    return deadline - time.time() - (0.0 if reserve else 40.0)
 
 
 def _paper_say(line: str) -> None:
@@ -86323,7 +92340,7 @@ def _fm_scalar(value: Any) -> str:
     if s == "":
         return '""'
     needs = (": " in s or s[0] in "[{\"'#&*!|>%@`-" or s.endswith(":")
-             or "#" in s or "\n" in s)
+             or "#" in s or "\n" in s or "," in s)      # G2: lists split on ,
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return s
     if needs:
@@ -86340,7 +92357,16 @@ def _fm_dump(meta: dict[str, Any]) -> str:
         if isinstance(value, dict):
             lines.append(f"{key}:")
             for k2, v2 in value.items():
-                if isinstance(v2, list):
+                if isinstance(v2, list) and v2 and isinstance(v2[0], dict):
+                    # G2 (#1038): interview.qa - rows two levels down.
+                    lines.append(f"  {k2}:")
+                    for row in v2:
+                        first = True
+                        for k3, v3 in row.items():
+                            lines.append(("    - " if first else "      ")
+                                         + f"{k3}: {_fm_scalar(v3)}")
+                            first = False
+                elif isinstance(v2, list):
                     lines.append(f"  {k2}: [" + ", ".join(
                         _fm_scalar(x) for x in v2) + "]")
                 else:
@@ -86374,7 +92400,9 @@ def _fm_unquote(raw: str) -> Any:
         inner = s[1:-1].strip()
         if not inner:
             return []
-        return [_fm_unquote(x) for x in re.split(r",\s*", inner)]
+        # G2: a quoted item may carry a comma (box items, chart labels).
+        parts = re.findall(r'"(?:\\.|[^"\\])*"|\'[^\']*\'|[^,]+', inner)
+        return [_fm_unquote(x) for x in parts if x.strip()]
     if s.lower() in ("true", "yes"):
         return True
     if s.lower() in ("false", "no"):
@@ -86395,12 +92423,11 @@ def _fm_load(text: str) -> tuple[dict[str, Any], str, str]:
     if end < 0:
         return {}, text, "frontmatter never closes"
     head = text[3:end].strip("\n")
-    body = text[end + 4:]
-    if body.startswith("\n"):
-        body = body[1:]
+    body = text[end + 4:].lstrip("\n")      # G2: the dump leaves two
     meta: dict[str, Any] = {}
     current_key = ""
     current_list_row: dict[str, Any] | None = None
+    sub_key = ""                       # G2: `interview:` -> `  qa:` -> rows
     for n, line in enumerate(head.split("\n"), start=2):
         if not line.strip() or line.strip().startswith("#"):
             continue
@@ -86409,6 +92436,7 @@ def _fm_load(text: str) -> tuple[dict[str, Any], str, str]:
         try:
             if indent == 0:
                 current_list_row = None
+                sub_key = ""
                 if ":" not in stripped:
                     return meta, body, f"line {n}: no colon"
                 key, _, rest = stripped.partition(":")
@@ -86424,6 +92452,28 @@ def _fm_load(text: str) -> tuple[dict[str, Any], str, str]:
                 if not current_key:
                     return meta, body, f"line {n}: indented before a key"
                 holder = meta.get(current_key)
+                # G2 (#1038): rows two levels down - `  qa:` then
+                # `    - q: ...` / `      a: ...` inside a dict value.
+                if isinstance(holder, dict) and indent >= 4 and sub_key:
+                    rows = holder.setdefault(sub_key, [])
+                    if not isinstance(rows, list):
+                        rows = holder[sub_key] = []
+                    if stripped.startswith("- "):
+                        item = stripped[2:].strip()
+                        k3, _, v3 = item.partition(":")
+                        current_list_row = {k3.strip(): _fm_unquote(v3)}
+                        rows.append(current_list_row)
+                    elif current_list_row is not None:
+                        k3, _, v3 = stripped.partition(":")
+                        current_list_row[k3.strip()] = _fm_unquote(v3)
+                    continue
+                if isinstance(holder, dict) and indent == 2 \
+                        and not stripped.startswith("- ") \
+                        and stripped.endswith(":"):
+                    sub_key = stripped[:-1].strip()
+                    holder[sub_key] = []
+                    current_list_row = None
+                    continue
                 if stripped.startswith("- "):
                     if not isinstance(holder, list):
                         holder = meta[current_key] = []
@@ -86577,13 +92627,78 @@ def paper_check(articles: list[dict[str, Any]]) -> dict[str, Any]:
                     nums = [float(v) for v in (vals or [])]
                 except (TypeError, ValueError):
                     nums = []
-                ok = (kind in ("line", "bars") and len(nums) >= 2
+                ok = (kind in ("line", "bars", "pie") and len(nums) >= 2
                       and (not labels or len(labels) == len(nums))
                       and all(len(str(x)) <= 12 for x in labels)
                       and ("min" not in chart or "max" not in chart
                            or float(chart["min"]) < float(chart["max"])))
+                if ok and kind == "pie":            # G2: a pie needs mass
+                    ok = all(v >= 0 for v in nums) and sum(nums) > 0
             if not ok:
                 marks.append({"file": f, "code": "bad_chart", "detail": ""})
+        # --- G2: the new meta (CONTRACT s3) ---------------------------
+        _plate = r"^https?://|^/api/"
+        for row in (meta.get("images") or []):
+            url = str((row or {}).get("url") or "") if isinstance(row, dict) \
+                else ""
+            if not url or not re.match(_plate, url):
+                marks.append({"file": f, "code": "bad_image",
+                              "detail": url[:80] or "no url"})
+                break
+        for row in (meta.get("quotes") or []):
+            if not isinstance(row, dict) or not str(row.get("text") or "").strip():
+                lint.append({"file": f, "code": "bad_quote", "detail": ""})
+                break
+            url = str(row.get("url") or "")
+            if url and not re.match(_plate, url):
+                lint.append({"file": f, "code": "quote_url", "detail": url[:80]})
+                break
+        stats = meta.get("stats")
+        if stats is not None and (not isinstance(stats, list) or any(
+                not isinstance(x, dict) or not str(x.get("value") or "").strip()
+                for x in stats)):
+            lint.append({"file": f, "code": "bad_stats", "detail": ""})
+        elif isinstance(stats, list) and len(stats) > PAPER_STATS_MOST:
+            lint.append({"file": f, "code": "stats_many",
+                         "detail": f"{len(stats)} callouts"})
+        box = meta.get("box")
+        if box is not None and (not isinstance(box, dict)
+                                or not isinstance(box.get("items"), list)
+                                or not box.get("items")):
+            lint.append({"file": f, "code": "bad_box", "detail": ""})
+        serial = meta.get("serial")
+        if serial is not None and (not isinstance(serial, dict)
+                                   or not str(serial.get("title") or "")):
+            lint.append({"file": f, "code": "bad_serial", "detail": ""})
+        ads = meta.get("classifieds")
+        if ads is not None and (not isinstance(ads, list) or any(
+                not isinstance(x, dict) or not str(x.get("head") or "").strip()
+                or not str(x.get("body") or "").strip() for x in ads)):
+            lint.append({"file": f, "code": "bad_classified", "detail": ""})
+        iv = meta.get("interview")
+        if iv is not None and (not isinstance(iv, dict)
+                               or not str(iv.get("name") or "")
+                               or not isinstance(iv.get("qa"), list)
+                               or not iv.get("qa")
+                               or any(not isinstance(x, dict)
+                                      or not str(x.get("q") or "")
+                                      or not str(x.get("a") or "")
+                                      for x in iv.get("qa") or [])):
+            lint.append({"file": f, "code": "bad_interview", "detail": ""})
+        if meta.get("style_hint") is not None and \
+                str(meta.get("style_hint")) not in PAPER_STYLE_HINTS:
+            lint.append({"file": f, "code": "bad_style",
+                         "detail": str(meta.get("style_hint"))[:30]})
+        try:
+            page = int(meta.get("page") or 0)
+        except (TypeError, ValueError):
+            page = 0
+        if not 1 <= page <= 6:
+            lint.append({"file": f, "code": "no_page", "detail": str(meta.get("page"))})
+        for key, cap in (("kicker", 40), ("flash", 40)):
+            if len(str(meta.get(key) or "")) > cap:
+                lint.append({"file": f, "code": key + "_long",
+                             "detail": f"{len(str(meta.get(key)))} chars"})
         for src in (meta.get("sources") or []):
             url = str((src or {}).get("url") or "") if isinstance(src, dict) \
                 else ""
@@ -86683,9 +92798,14 @@ def paper_fix(articles: list[dict[str, Any]],
         elif code == "bad_chart":
             meta.pop("chart", None)
             done += 1
-        elif code in ("missing_image", "bad_image"):
+        elif code == "missing_image":
             meta.pop("image", None)
             meta.pop("photo", None)
+            done += 1
+        elif code == "bad_image":                       # G2: drop the plate
+            meta["images"] = [r for r in (meta.get("images") or [])
+                              if isinstance(r, dict) and re.match(
+                                  r"^https?://|^/api/", str(r.get("url") or ""))]
             done += 1
         elif code == "unsafe_source":
             meta["sources"] = [s for s in (meta.get("sources") or [])
@@ -86727,6 +92847,46 @@ def paper_fix(articles: list[dict[str, Any]],
                 words += w
             art["body"] = "\n\n".join(kept)
             done += 1
+        # --- G2: the new meta, settled by code -------------------------
+        elif code == "bad_quote":
+            meta["quotes"] = [r for r in (meta.get("quotes") or [])
+                              if isinstance(r, dict)
+                              and str(r.get("text") or "").strip()]
+            done += 1
+        elif code == "quote_url":
+            for r in (meta.get("quotes") or []):
+                if isinstance(r, dict) and not re.match(
+                        r"^https?://|^/api/", str(r.get("url") or "")):
+                    r["url"] = ""
+            done += 1
+        elif code == "bad_stats":
+            rows = meta.get("stats")
+            meta["stats"] = [x for x in (rows if isinstance(rows, list) else [])
+                             if isinstance(x, dict)
+                             and str(x.get("value") or "").strip()]
+            done += 1
+        elif code == "stats_many":
+            meta["stats"] = list(meta.get("stats") or [])[:PAPER_STATS_MOST]
+            done += 1
+        elif code in ("bad_box", "bad_serial", "bad_interview", "bad_style"):
+            meta.pop({"bad_box": "box", "bad_serial": "serial",
+                      "bad_interview": "interview",
+                      "bad_style": "style_hint"}[code], None)
+            done += 1
+        elif code == "bad_classified":
+            rows = meta.get("classifieds")
+            meta["classifieds"] = [
+                x for x in (rows if isinstance(rows, list) else [])
+                if isinstance(x, dict) and str(x.get("head") or "").strip()
+                and str(x.get("body") or "").strip()]
+            done += 1
+        elif code == "no_page":
+            meta["page"] = paper_page_for(str(meta.get("section") or ""))
+            done += 1
+        elif code in ("kicker_long", "flash_long"):
+            key = code[:-5]
+            meta[key] = _paper_shorten(str(meta.get(key) or ""), 40)
+            done += 1
         # story_short is left standing: a short board is still a board,
         # and the skill's fix ("fold into another") is an editor's call.
     return done
@@ -86748,66 +92908,165 @@ def _paper_strip_labels(text: str) -> str:
                            flags=re.M).split())
 
 
-def paper_material(since: float, until: float) -> dict[str, Any]:
-    """Everything the desks read, gathered once. Every source is a ledger
-    the station already keeps; nothing here is invented."""
-    m: dict[str, Any] = {"since": since, "until": until}
-    dj = dj_settings()
-    m["station"] = str(dj.get("station_name") or PINE_BOX_FM)
-    m["host"] = booth_actor_name("dj")
-    m["cohost"] = booth_actor_name("cohost")
-    m["on"] = bool(_RADIO.get("on"))
-    # The records that turned, off the played ledger (it survives a
-    # restart, unlike _RADIO["history"]).
-    records: list[dict[str, Any]] = []
+def _paper_call_files(calls: list[dict[str, Any]], since: float,
+                      until: float) -> None:
+    """#1031: the labelled transcripts and the mp3s behind the hour's
+    calls, off radio_cache/calls, matched by call id (the filename ends
+    in it) and failing that by name + time. ONE bounded scandir - the
+    folder is never globbed twice and never past PAPER_CALL_SCAN_MOST
+    entries. Sync; runs inside the material thread."""
+    if not calls:
+        return
+    folder = RADIO_CACHE / "calls"
+    names: list[str] = []
+    try:
+        with os.scandir(folder) as it:
+            for n, entry in enumerate(it):
+                if n >= PAPER_CALL_SCAN_MOST:
+                    break
+                if entry.name.endswith(".md"):
+                    names.append(entry.name)
+    except Exception:  # noqa: BLE001
+        return
+    by_id: dict[str, str] = {}
+    stamped: list[tuple[float, str, str]] = []
+    for name in names:
+        stem = name[:-3]
+        head, _, unique = stem.rpartition("_")
+        if unique:
+            by_id[unique] = stem
+        try:
+            when = time.mktime(time.strptime(stem[:17], "%Y-%m-%d_%H%M%S"))
+            stamped.append((when, head[18:], stem))
+        except Exception:  # noqa: BLE001
+            continue
+    for call in calls:
+        cid = re.sub(r"[^a-zA-Z0-9]+", "", str(call.get("id") or ""))[:12]
+        stem = by_id.get(cid) if cid else None
+        if not stem:
+            ts = float(call.get("ts") or 0)
+            lo = ts - float(call.get("seconds") or 0) - 180.0
+            safe = re.sub(r"[^\w-]+", "_", str(call.get("name") or "caller"))[:40]
+            for when, who, cand in stamped:
+                if lo <= when <= ts + 180.0 and who == safe:
+                    stem = cand
+                    break
+        if not stem:
+            continue
+        call["md"] = stem + ".md"
+        try:
+            if (folder / (stem + ".mp3")).is_file():
+                call["audio"] = (f"/api/radio-cache/calls/{stem}.mp3?t="
+                                 f"{media_sign(stem + '.mp3')}")
+        except Exception:  # noqa: BLE001
+            pass
+        if call.get("transcript"):
+            continue
+        try:
+            text = (folder / (stem + ".md")).read_text(encoding="utf-8")[:80000]
+        except Exception:  # noqa: BLE001
+            continue
+        turns: list[dict[str, str]] = []
+        for para in text.split("\n\n"):
+            got = re.match(r"\*\*(.+?):\*\*\s*(.+)", para.strip(), flags=re.S)
+            if got:
+                turns.append({"name": got.group(1).strip()[:40],
+                              "text": " ".join(got.group(2).split())[:600]})
+        if turns:
+            call["transcript"] = turns
+            call["transcript_from"] = "cache"
+
+
+def _paper_material_disk(since: float, until: float) -> dict[str, Any]:
+    """The disk half of paper_material - every ledger read ONCE, in one
+    thread (json holds the GIL, #1156). Memory state is read by the
+    async half on the loop."""
+    d: dict[str, Any] = {}
+    # The records: the per-airing music log (a repeat keeps its row, a
+    # skipped side ends when the next needle drops); played.json only
+    # lends the album, which the log never carried.
+    albums: dict[str, str] = {}
     try:
         rows = json.loads(PLAYED_PATH.read_text())
         for r in rows if isinstance(rows, list) else []:
-            at = float(r.get("at") or 0)
-            if since <= at < until:
-                records.append({"at": at, "title": str(r.get("title") or ""),
-                                "artist": str(r.get("artist") or ""),
-                                "album": str(r.get("album") or ""),
-                                "seconds": float(r.get("seconds") or 0),
-                                "id": str(r.get("id") or "")})
+            if isinstance(r, dict) and r.get("id"):
+                albums[str(r["id"])] = str(r.get("album") or "")
+    except Exception:  # noqa: BLE001
+        albums = {}
+    records: list[dict[str, Any]] = []
+    try:
+        for r in _music_log_rows(since, until):
+            began = float(r.get("began") or r.get("at") or 0)
+            ends = float(r.get("ends") or began)
+            rid = str(r.get("id") or "")
+            records.append({
+                "at": began, "ends": ends,
+                "title": str(r.get("title") or ""),
+                "artist": str(r.get("artist") or ""),
+                "album": albums.get(rid, ""),
+                "seconds": round(max(0.0, ends - began), 1),
+                "length": float(r.get("seconds") or 0),
+                "in_window": round(max(0.0, min(ends, until)
+                                       - max(began, since)), 1),
+                "id": rid, "path": str(r.get("path") or ""),
+                "tape": bool(r.get("tape")), "to": str(r.get("to") or "")})
     except Exception:  # noqa: BLE001
         records = []
     records.sort(key=lambda r: r["at"])
-    m["records"] = records
-    # What the pair said, by kind.
-    said: dict[str, list[dict[str, Any]]] = {}
-    for row in list(_RADIO.get("chat") or []):
-        ts = float(row.get("ts") or 0)
-        if not since <= ts < until:
-            continue
-        text = " ".join(str(row.get("text") or "").split())
-        if not text:
-            continue
-        kind = str(row.get("kind") or "banter")
-        said.setdefault(kind, []).append({
-            "ts": ts, "who": str(row.get("name") or row.get("who") or ""),
-            "text": text[:400]})
-    m["said"] = said
+    d["records"] = records
+    # The air log - said rows with their audio.
+    try:
+        air = airlog_rows(since, until)
+        for r in air:
+            r["url"] = airlog_clip_url(r)
+        d["air"] = air
+        d["markers"] = airlog_rows(since, until, kinds="marker")
+    except Exception:  # noqa: BLE001
+        d["air"], d["markers"] = [], []
     calls: list[dict[str, Any]] = []
-    for row in call_log_read():
-        ts = float(row.get("ts") or 0)
-        if since <= ts < until:
+    try:
+        for row in call_log_read():
+            ts = float(row.get("ts") or 0)
+            if not since <= ts < until:
+                continue
+            transcript = [
+                {"who": str(t.get("who") or ""),
+                 "name": str(t.get("name") or t.get("who") or ""),
+                 "text": " ".join(str(t.get("text") or "").split())[:600]}
+                for t in (row.get("transcript") or [])
+                if isinstance(t, dict) and t.get("text")]
             calls.append({
                 "ts": ts, "name": str(row.get("name") or "a caller"),
                 "topic": str(row.get("theme") or row.get("topic") or ""),
                 "seconds": float(row.get("seconds") or 0),
                 "turns": int(float(row.get("turns") or 0)),
                 "ended": str(row.get("rule") or ""),
-                "premise": str(row.get("premise") or "")[:200]})
-    m["calls"] = calls
+                "premise": str(row.get("premise") or "")[:200],
+                "id": str(row.get("id") or ""),
+                "mode": str(row.get("mode") or ""),
+                "hostile": bool(row.get("hostile")),
+                "transcript": transcript,
+                "transcript_from": "log" if transcript else ""})
+    except Exception:  # noqa: BLE001
+        calls = []
+    try:
+        _paper_call_files(calls, since, until)
+    except Exception:  # noqa: BLE001
+        pass
+    d["calls"] = calls
     ads: list[dict[str, Any]] = []
-    for row in ad_airings():
-        ts = float(row.get("ts") or 0)
-        if since <= ts < until:
-            ads.append({"ts": ts, "product": str(row.get("product") or ""),
-                        "words": int(row.get("words") or 0),
-                        "where": str(row.get("where") or "")})
-    m["ads"] = ads
+    try:
+        for row in ad_airings():
+            ts = float(row.get("ts") or 0)
+            if since <= ts < until:
+                ads.append({"ts": ts, "product": str(row.get("product") or ""),
+                            "words": int(row.get("words") or 0),
+                            "where": str(row.get("where") or ""),
+                            "id": str(row.get("id") or ""),
+                            "audio": str(row.get("audio") or "")})
+    except Exception:  # noqa: BLE001
+        ads = []
+    d["ads"] = ads
     wire: list[str] = []
     try:
         for row in _news_covered():
@@ -86818,7 +93077,15 @@ def paper_material(since: float, until: float) -> dict[str, Any]:
                     wire.append(t)
     except Exception:  # noqa: BLE001
         wire = []
-    m["wire"] = wire
+    d["wire"] = wire
+    try:
+        d["covered"] = news_covered_rows(since - 3 * 3600.0, until)
+    except Exception:  # noqa: BLE001
+        d["covered"] = []
+    try:
+        d["news_said"] = news_said_rows(since, until)
+    except Exception:  # noqa: BLE001
+        d["news_said"] = []
     memos: list[dict[str, Any]] = []
     try:
         for row in (_manager_memos_read() or []):
@@ -86828,14 +93095,261 @@ def paper_material(since: float, until: float) -> dict[str, Any]:
                               "text": _paper_strip_labels(row.get("text"))[:600]})
     except Exception:  # noqa: BLE001
         memos = []
-    m["memos"] = memos
+    d["memos"] = memos
+    try:
+        d["generations"] = [
+            g for g in _read_all_generations()
+            if since <= float(g.get("ts") or 0) < until]
+    except Exception:  # noqa: BLE001
+        d["generations"] = []
+    try:
+        d["model_calls"] = model_calls_rows(since, until)
+    except Exception:  # noqa: BLE001
+        d["model_calls"] = []
+    try:
+        d["pause_log"] = pause_log_rows(since, until)
+        d["pause_intervals"] = pause_intervals(since, until)
+        d["pause_recent"] = airlog_jsonl_read(PAUSE_LOG_PATH,
+                                              since - 30 * 86400.0)[-40:]
+    except Exception:  # noqa: BLE001
+        d["pause_log"], d["pause_intervals"], d["pause_recent"] = [], [], []
+    try:
+        d["heat"] = heat_ring_rows(since, until)
+    except Exception:  # noqa: BLE001
+        d["heat"] = []
+    try:
+        _judgment_load()
+    except Exception:  # noqa: BLE001
+        pass
+    return d
+
+
+PAPER_CALL_SCAN_MOST = 6000
+
+
+async def paper_material(since: float, until: float) -> dict[str, Any]:
+    """Everything the desks read, gathered once. Every source is a ledger
+    the station already keeps; nothing here is invented. Async since G1
+    (#1023): the disk half runs in one thread, the memory half on the
+    loop.
+
+    KEYS THE DESKS ALREADY READ (kept, shapes unchanged unless noted):
+      since, until, station, host, cohost, on
+      records     [{at, title, artist, album, seconds, id}] - now off
+                  music_log.jsonl per AIRING (+ends, length, in_window,
+                  path, tape, to); seconds is the real run, not the tag
+      said        {round: [{ts, who, text, ...}]} - KEYED BY ROUND now
+                  (the stream road stamps every row kind="call"; keying by
+                  kind put every banter line under 'call'); rows add at,
+                  seat, id, round, kind, url, seconds, aired, caller,
+                  clip_media. said["news"] is the spoken news, not the
+                  marker rows (see markers)
+      calls       [{ts, name, topic, seconds, turns, ended, premise}] +
+                  id, mode, hostile, transcript [{who, name, text}],
+                  transcript_from ('log'|'cache'|''), md, audio (signed
+                  /api/radio-cache/calls url)
+      ads         [{ts, product, words, where}] + id, audio, url
+      wire        [title] (unchanged)   memos, guest, scorecard, airtime,
+      stats, on_air_now, coming, now  (unchanged)
+    NEW KEYS (G1):
+      air         every air-log row in the window, with url
+      said_by_kind  the old keying, for anything that still wants it
+      markers     [{ts, id, kind, text}] host marker rows (news breaks,
+                  'On line N', request/played notes)
+      rounds      [{id, round, began, ended, lines, seats, ids}] rows
+                  grouped by welded clip (stream) or run of one round
+      seats       {dj|cohost|third: {lines, seconds, first_at, last_at,
+                  longest_quiet, name}}   (#1034)
+      gaps, gap_summary   #1022 dead air between cast lines (>20 s)
+      wire_stories [{title, url, summary, at, marker_id, said[]}]  (#1036)
+      paused, pause_now {since, seconds, why}, pause_log [rows in
+                  window], pause_intervals [[a, b]], pause_recent  (#1030)
+      hour_active dict(_HOUR_ACTIVE)   hourly coordinator_hourly_state()
+      hours       closed scorecards in the window (scorecard = the last)
+      board       prep_board()          needs   hour_needs_now()
+      pulse       pulse_report(3600)    nabu    {wire, reading,
+                  firmware_down, health_ok, health}
+      health      (ok, words) from station_health_words()
+      heat        {samples, summary}    (#1020, the weather ring)
+      model_calls {rows, summary}       generations  [rows in window]
+      hour_key, hour_sheet, next_hour   schedule_hours_view rows
+      sched_log   _SCHED_LOG rows in window
+      judgment    {alone: [...], operator: [...]} book tail
+      wire_last   dict(_WIRE_LAST)
+    """
+    m: dict[str, Any] = {"since": since, "until": until}
+    dj = dj_settings()
+    m["station"] = str(dj.get("station_name") or PINE_BOX_FM)
+    m["host"] = booth_actor_name("dj")
+    m["cohost"] = booth_actor_name("cohost")
+    m["on"] = bool(_RADIO.get("on"))
+    try:
+        d = await asyncio.to_thread(_paper_material_disk, since, until)
+    except Exception:  # noqa: BLE001
+        d = {}
+    m["records"] = list(d.get("records") or [])
+    air = list(d.get("air") or [])
+    m["air"] = air
+    said: dict[str, list[dict[str, Any]]] = {}
+    said_by_kind: dict[str, list[dict[str, Any]]] = {}
+    for r in air:
+        text = " ".join(str(r.get("text") or "").split())
+        if not text:
+            continue
+        at = float(r.get("air_at") or r.get("ts") or 0)
+        rnd = str(r.get("round") or "banter")
+        row = {"ts": at, "at": at,
+               "who": str(r.get("name") or r.get("who") or ""),
+               "seat": str(r.get("who") or ""), "text": text[:400],
+               "id": str(r.get("id") or ""), "round": rnd,
+               "kind": str(r.get("kind") or ""),
+               "url": str(r.get("url") or ""),
+               "seconds": float(r.get("seconds") or 0),
+               "aired": str(r.get("aired") or ""),
+               "caller": str(r.get("caller") or ""),
+               "clip_media": str(r.get("clip_media") or "")}
+        said.setdefault(rnd, []).append(row)
+        said_by_kind.setdefault(str(r.get("kind") or "banter"), []).append(row)
+    m["said"] = said
+    m["said_by_kind"] = said_by_kind
+    m["markers"] = [{"ts": float(r.get("air_at") or r.get("ts") or 0),
+                     "id": str(r.get("id") or ""),
+                     "kind": str(r.get("kind") or ""),
+                     "text": str(r.get("text") or "")[:400]}
+                    for r in (d.get("markers") or [])]
+    # Rounds: a welded clip is one round; on the turn road a run of one
+    # round kind is.
+    rounds: list[dict[str, Any]] = []
+    for r in air:
+        if not str(r.get("text") or ""):
+            continue
+        key = str(r.get("clip_media") or "")
+        rnd = str(r.get("round") or "banter")
+        at = float(r.get("air_at") or r.get("ts") or 0)
+        end = at + float(r.get("seconds") or 0)
+        cur = rounds[-1] if rounds else None
+        same = bool(cur) and ((key and cur["key"] == key)
+                              or (not key and not cur["key"]
+                                  and cur["round"] == rnd
+                                  and at - cur["ended"] < 120))
+        if same and cur is not None:
+            cur["ended"] = max(cur["ended"], end)
+            cur["lines"] += 1
+            cur["ids"].append(str(r.get("id") or ""))
+            if r.get("who") not in cur["seats"]:
+                cur["seats"].append(str(r.get("who") or ""))
+        else:
+            rounds.append({"id": key or str(r.get("id") or ""), "key": key,
+                           "round": rnd, "began": at, "ended": end,
+                           "lines": 1, "seats": [str(r.get("who") or "")],
+                           "ids": [str(r.get("id") or "")]})
+    m["rounds"] = rounds
+    try:
+        m["seats"] = airlog_seats(since, until, air)
+    except Exception:  # noqa: BLE001
+        m["seats"] = {}
+    # The pause (#1030): truth from memory, history from the log.
+    m["paused"] = bool(radio_paused())
+    m["pause_log"] = list(d.get("pause_log") or [])
+    m["pause_intervals"] = [[a, b] for a, b in (d.get("pause_intervals") or [])]
+    m["pause_recent"] = list(d.get("pause_recent") or [])
+    pause_now: dict[str, Any] = {}
+    if m["paused"]:
+        pause_at = float(_RADIO.get("paused_at") or 0)
+        why = ""
+        for row in reversed(m["pause_recent"]):
+            if row.get("paused"):
+                why = str(row.get("why") or "")
+                break
+        pause_now = {"since": pause_at, "why": why,
+                     "seconds": round(max(0.0, time.time() - pause_at), 1)
+                     if pause_at else 0.0}
+    m["pause_now"] = pause_now
+    try:
+        gaps = airlog_gap_rows(since, until, air,
+                               list(d.get("pause_intervals") or []))
+    except Exception:  # noqa: BLE001
+        gaps = []
+    m["gaps"] = gaps
+    m["gap_summary"] = airlog_gap_summary(gaps)
+    m["calls"] = list(d.get("calls") or [])
+    ads = list(d.get("ads") or [])
+    ad_rows = [r for r in air if r.get("ad_audio")]
+    for ad in ads:
+        ad["url"] = ""
+        for r in ad_rows:
+            if ad.get("audio") and r.get("ad_audio") == ad.get("audio"):
+                ad["url"] = str(r.get("url") or "")
+                break
+    m["ads"] = ads
+    m["wire"] = list(d.get("wire") or [])
+    # #1036: one entry per covered story, with the lines said about it -
+    # the news_said marker windows carry the association; before the
+    # ledger existed, the marker rows themselves do.
+    covered = list(d.get("covered") or [])
+    news_said = list(d.get("news_said") or [])
+    if not news_said:
+        for mk in m["markers"]:
+            text = str(mk.get("text") or "")
+            if text.startswith("News"):
+                _, _, rest = text.partition(": ")
+                news_said.append({"ts": mk["ts"], "marker_id": mk["id"],
+                                  "titles": [t.strip() for t in rest.split(" / ")
+                                             if t.strip()],
+                                  "urls": []})
+    news_lines = list(said.get("news") or [])
+    stories: list[dict[str, Any]] = []
+    for i, ns in enumerate(news_said):
+        lo = float(ns.get("ts") or 0)
+        hi = (float(news_said[i + 1].get("ts") or 0)
+              if i + 1 < len(news_said) else min(until, lo + 900.0))
+        lines = [s for s in news_lines if lo <= float(s.get("at") or 0) < hi]
+        urls = list(ns.get("urls") or [])
+        for j, title in enumerate(ns.get("titles") or []):
+            url = urls[j] if j < len(urls) else ""
+            hit: dict[str, Any] = {}
+            for c in covered:
+                if (url and c.get("url") == url) or (
+                        str(c.get("title") or "")[:60].strip()
+                        == str(title)[:60].strip()):
+                    hit = c
+                    break
+            stories.append({
+                "title": str(hit.get("title") or title),
+                "url": str(hit.get("url") or url or ""),
+                "summary": str(hit.get("summary") or "")[:600],
+                "at": lo, "marker_id": str(ns.get("marker_id") or ""),
+                "said": lines})
+    m["wire_stories"] = stories
+    m["memos"] = list(d.get("memos") or [])
     try:
         m["guest"] = dict(active_guest() or {})
     except Exception:  # noqa: BLE001
         m["guest"] = {}
     hours = [h for h in list(_HOURS)
              if since <= float(h.get("closed_at") or 0) < until + 900]
+    m["hours"] = hours
     m["scorecard"] = hours[-1] if hours else {}
+    # #1022: the gap ANALYSIS, beside the air-log rows rather than
+    # instead of them - m["gaps"] is a list of rows the report desk
+    # sorts, this is the ranked-cause dict with the resumes and the one
+    # line summary. (It used to be written to the same key behind a
+    # guard that could never be true, so none of it ever printed.)
+    # Memory + the keeper's copy of the ledger - no disk on the print
+    # path.
+    try:
+        m["gap_report"] = gap_report(max(0.25, (until - since) / 3600.0),
+                                     now=until)
+    except Exception:  # noqa: BLE001
+        m["gap_report"] = {}
+    try:
+        m["hour_active"] = dict(_HOUR_ACTIVE)
+    except Exception:  # noqa: BLE001
+        m["hour_active"] = {}
+    try:
+        m["hourly"] = coordinator_hourly_state()
+    except Exception:  # noqa: BLE001
+        m["hourly"] = {}
     try:
         m["airtime"] = airtime_summary()
     except Exception:  # noqa: BLE001
@@ -86856,21 +93370,156 @@ def paper_material(since: float, until: float) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         coming = []
     m["coming"] = [c for c in coming if c][:14]
+    # The running order, this hour and the next (#1032's material).
+    key = ""
+    try:
+        key = _sched_hour_key(since)
+        m["hour_sheet"] = (schedule_hours_view(key, 1).get("hours") or [{}])[0]
+    except Exception:  # noqa: BLE001
+        m["hour_sheet"] = {}
+    try:
+        m["next_hour"] = (schedule_hours_view(_sched_hour_shift(key, 1), 1)
+                          .get("hours") or [{}])[0] if key else {}
+    except Exception:  # noqa: BLE001
+        m["next_hour"] = {}
+    m["hour_key"] = key
+    try:
+        m["sched_log"] = [dict(r) for r in list(_SCHED_LOG)
+                          if since <= float(r.get("at") or 0) < until]
+    except Exception:  # noqa: BLE001
+        m["sched_log"] = []
+    try:
+        m["board"] = prep_board()
+    except Exception:  # noqa: BLE001
+        m["board"] = []
+    try:
+        m["needs"] = hour_needs_now()
+    except Exception:  # noqa: BLE001
+        m["needs"] = {}
+    try:
+        m["pulse"] = pulse_report(3600)
+    except Exception:  # noqa: BLE001
+        m["pulse"] = {}
+    try:
+        ok, words = station_health_words()
+    except Exception:  # noqa: BLE001
+        ok, words = bool(_RADIO.get("on")), ""
+    m["health"] = {"ok": bool(ok), "words": str(words or "")}
+    wire_last = {}
+    try:
+        wire_last = dict(_WIRE_LAST)
+    except Exception:  # noqa: BLE001
+        wire_last = {}
+    m["wire_last"] = wire_last
+    nabu: dict[str, Any] = {"wire": wire_last, "reading": "",
+                            "firmware_down": False, "health_ok": bool(ok),
+                            "health": str(words or "")}
+    try:
+        nabu["reading"] = str(wire_reading(wire_last) or "")
+        nabu["firmware_down"] = bool(nabu_firmware_down(wire_last))
+    except Exception:  # noqa: BLE001
+        pass
+    m["nabu"] = nabu
+    heat = list(d.get("heat") or [])
+    m["heat"] = {"samples": heat, "summary": airlog_heat_summary(heat)}
+    calls_rows = list(d.get("model_calls") or [])
+    m["model_calls"] = {"rows": calls_rows[-400:],
+                        "summary": airlog_model_summary(calls_rows)}
+    m["generations"] = list(d.get("generations") or [])
+    try:
+        rows = [r for r in list(_JUDGMENT.get("rows") or [])
+                if isinstance(r, dict)]
+        tail = [r for r in rows if since <= float(r.get("at") or 0) < until] \
+            or rows[:12]
+        m["judgment"] = {"alone": [r for r in tail if r.get("alone")],
+                         "operator": [r for r in tail if not r.get("alone")]}
+    except Exception:  # noqa: BLE001
+        m["judgment"] = {"alone": [], "operator": []}
+    # --- G2 additions (#1024 #1031 #1038 #1039 #1040) --------------------
+    try:
+        extra = await asyncio.to_thread(_paper_material_g2_disk, since, until)
+    except Exception:  # noqa: BLE001
+        extra = {}
+    m["caller_faces"] = dict(extra.get("caller_faces") or {})
+    m["callers"] = list(extra.get("callers") or [])
+    m["upstairs"] = list(extra.get("upstairs") or [])
+    m["caller_stories"] = list(extra.get("caller_stories") or [])
+    m["names"] = {
+        "host": m["host"], "cohost": m["cohost"],
+        "third": str(dj.get("third_name") or ""),
+        "manager": str(dj.get("manager_name") or "the manager upstairs"),
+        "sfx": "The SFX Guy"}
+    m["sponsors"] = [str(x) for x in (dj.get("sponsors") or []) if str(x).strip()]
+    m["pictures"] = paper_picture_pool(m)
+    m["offline"] = not m["on"]
     m["now"] = dict(_RADIO.get("now") or {})
     return m
+
+
+def _paper_material_g2_disk(since: float, until: float) -> dict[str, Any]:
+    """The G2 half of the disk reads, in the same thread pattern: the
+    caller faces book, the regulars, the upstairs pages in the window,
+    and lane S2's caller_stories.json when it exists. Small files."""
+    d: dict[str, Any] = {}
+    try:
+        book = json.loads(CALLER_FACES_PATH.read_text())
+        d["caller_faces"] = {str(k): str(v) for k, v in book.items()
+                             if isinstance(book, dict) and v}
+    except Exception:  # noqa: BLE001
+        d["caller_faces"] = {}
+    try:
+        d["callers"] = [
+            {"name": str(r.get("name") or ""), "persona": str(r.get("persona") or "")[:300],
+             "goal": str(r.get("goal") or "")[:200], "calls": int(r.get("calls") or 0),
+             "last": float(r.get("last") or 0)}
+            for r in read_callers() if isinstance(r, dict) and r.get("name")]
+    except Exception:  # noqa: BLE001
+        d["callers"] = []
+    try:
+        d["upstairs"] = [
+            {"ts": float(r.get("ts") or 0), "text": str(r.get("text") or "")[:700],
+             "gripe": str(r.get("gripe") or "")}
+            for r in upstairs_list()
+            if since <= float(r.get("ts") or 0) < until]
+    except Exception:  # noqa: BLE001
+        d["upstairs"] = []
+    try:
+        path = data_path("caller_stories.json")
+        rows: list[dict[str, Any]] = []
+        if path.exists():
+            got = json.loads(path.read_text(encoding="utf-8"))
+            rows = got.get("stories") if isinstance(got, dict) else got
+        d["caller_stories"] = [r for r in (rows or []) if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        d["caller_stories"] = []
+    return d
 
 
 # --- the writer ------------------------------------------------------------
 
 async def paper_write(desk: str, brief: str, material: str,
-                      words: tuple[int, int] = (140, 260)) -> dict[str, str]:
+                      words: tuple[int, int] = (140, 260),
+                      reserve: bool = False) -> dict[str, str]:
     """One prose desk's call to the station's writer. Returns {} when the
     model cannot answer, and the desk falls back to a templated story so
-    the edition is never held for a model."""
+    the edition is never held for a model. G2: also {} once the press
+    has spent its writer ration or its clock (paper_press_left) - the
+    lead and the apology pass reserve=True and are counted outside the
+    ration."""
     settings = load_settings()
     model = PAPER_MODEL or str(settings.get("model") or "")
     if not model:
         return {}
+    if not reserve and int(_PAPER_PRESS.get("writer_calls") or 0) >= max(
+            0, PAPER_WRITER_MAX - 2):
+        _PAPER_PRESS["writer_refused"] = int(_PAPER_PRESS.get("writer_refused") or 0) + 1
+        _paper_say(f"{desk}: the writer's ration is spent - templated story")
+        return {}
+    if paper_press_left(reserve) <= 0:
+        _PAPER_PRESS["writer_refused"] = int(_PAPER_PRESS.get("writer_refused") or 0) + 1
+        _paper_say(f"{desk}: the press is out of time - templated story")
+        return {}
+    _PAPER_PRESS["writer_calls"] = int(_PAPER_PRESS.get("writer_calls") or 0) + 1
     system = (
         "You are a desk writer on a small newspaper printed every hour by "
         "a radio station about its own broadcast. Plain, specific, "
@@ -87189,13 +93838,1069 @@ def _paper_lines(rows: list[dict[str, Any]], most: int = 18,
                      f"{str(r.get('text') or '')[:each]}" for r in rows[-most:])
 
 
+# --- G2: the picture pool, the speaker box, the crystal, the hot lines ----
+#
+# Every desk below returns {slug, meta, body} or None. The meta is the
+# CONTRACT s3 shape (page, kicker, quotes[], stats[], chart, box, serial,
+# classifieds[], interview, style_hint, image/images) - lane G3's
+# typesetter draws it; nothing here writes HTML. Prose desks carry 1-3
+# speaker-box chunks in their MATERIAL (CONTRACT s5) and are tinted by the
+# crystal afterwards, paragraph by paragraph, under the press caps.
+
+def _paper_plate(name: str) -> str:
+    """Every plate URL is /api/generations/image/<bare name> (CONTRACT s4)."""
+    name = str(name or "").strip().split("/")[-1]
+    return f"/api/generations/image/{name}" if name else ""
+
+
+def paper_picture_pool(m: dict[str, Any]) -> list[dict[str, Any]]:
+    """#1028 #1031: the pictures an edition may use, in order of claim -
+    what was SHOWN this hour (air rows carry the names the gallery
+    press stamped, plus gallery_now), what is SELLING (hawk/ad/ad_item,
+    with a price), the DESCRIBED paintings banked on the gallery shelf,
+    the caller FACES, and fillers off the wall cache only when it is
+    already warm (never an rglob, never a vision call in the press)."""
+    pool: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(name: Any, desc: Any = "", kind: str = "", price: Any = 0,
+            who: str = "") -> None:
+        n = str(name or "").strip()
+        if not n or n in seen or "/" in n:
+            return
+        seen.add(n)
+        try:
+            p = int(float(price or 0))
+        except (TypeError, ValueError):
+            p = 0
+        pool.append({"name": n, "desc": " ".join(str(desc or "").split())[:400],
+                     "kind": kind, "price": p, "who": who,
+                     "url": _paper_plate(n)})
+
+    since = float(m.get("since") or 0)
+    for r in m.get("air") or []:
+        for im in list(r.get("images") or [])[:3]:
+            if isinstance(im, dict):
+                add(im.get("name"), im.get("desc"), "shown")
+            else:
+                add(im, "", "shown")
+    try:
+        gal = _RADIO.get("gallery_now") or {}
+        fresh = float(gal.get("at") or 0) >= since
+        for im in gal.get("images") or []:
+            if isinstance(im, dict):
+                add(im.get("name"), im.get("desc"),
+                    "shown" if fresh else "described")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        sel = selling_now() or {}
+        for n in (sel.get("images") or [sel.get("image")]):
+            add(n, sel.get("title") if sel.get("title") != n else "",
+                "selling", sel.get("price"))
+        for key in ("ad_item", "ad_now"):
+            row = _RADIO.get(key) or {}
+            add(row.get("image"), row.get("title"), "selling", row.get("price"))
+        hawk = hawking_now() or {}
+        for n in hawk.get("images") or []:
+            add(n, "", "selling", hawk.get("price"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for row in list(shelf_rows("gallery"))[:80]:
+            entry = row.get("entry") if isinstance(row, dict) else {}
+            for im in list((entry or {}).get("prep_gallery") or [])[:3]:
+                if isinstance(im, dict):
+                    add(im.get("name"), im.get("desc"), "described")
+    except Exception:  # noqa: BLE001
+        pass
+    for who, face in (m.get("caller_faces") or {}).items():
+        add(face, f"{who}'s licence photo", "face", who=str(who))
+    try:
+        for q in list(_GALLERY_CACHE.get("rows") or [])[:24]:
+            add(getattr(q, "name", q), "", "filler")
+    except Exception:  # noqa: BLE001
+        pass
+    return pool
+
+
+_PAPER_PERSON = re.compile(
+    r"\b(man|woman|person|people|figure|face|portrait|girl|boy|lady|"
+    r"gentleman|child|he|she|his|her|someone|crowd|couple)\b", re.I)
+
+
+def paper_picture_take(m: dict[str, Any], kinds: tuple[str, ...] = (),
+                       person: bool = False, who: str = "",
+                       reuse: bool = False) -> dict[str, Any]:
+    """One picture off the pool, marked used so two desks do not print
+    the same plate. `who` asks for a caller's face (a face may be reused:
+    the wanted poster and the minutes may both show it); `person` prefers
+    a painting whose description mentions somebody."""
+    used = m.setdefault("_pictures_used", set())
+    pool = list(m.get("pictures") or [])
+    if who:
+        faces = [p for p in pool if p.get("who") == who]
+        if faces:
+            pick = faces[0]
+            if not reuse:
+                used.add(pick["name"])
+            return dict(pick)
+    cands = [p for p in pool if p["name"] not in used
+             and (not kinds or p["kind"] in kinds)]
+    if kinds:                       # the order of `kinds` is a preference
+        cands.sort(key=lambda p: kinds.index(p["kind"]))
+    if person:
+        persons = [p for p in cands if _PAPER_PERSON.search(p.get("desc") or "")]
+        cands = persons or cands
+    if not cands:
+        return {}
+    pick = cands[0]
+    used.add(pick["name"])
+    return dict(pick)
+
+
+async def paper_seeds(n: int = 2) -> list[dict[str, Any]]:
+    """1-3 fresh speaker-box chunks for a prose desk (CONTRACT s5). A
+    draw costs no model unless a document's gem shelf is exhausted; the
+    press clock still gates it."""
+    out: list[dict[str, Any]] = []
+    if paper_press_left() <= 0:
+        return out
+    for _ in range(max(1, min(3, int(n)))):
+        try:
+            seed = await speakbox_quote(most=2, cap=220) or {}
+        except Exception:  # noqa: BLE001
+            seed = {}
+        if seed.get("text"):
+            out.append(seed)
+    _PAPER_PRESS["seeds"] = int(_PAPER_PRESS.get("seeds") or 0) + len(out)
+    return out
+
+
+def paper_seed_block(seeds: list[dict[str, Any]]) -> str:
+    if not seeds:
+        return ""
+    return ("\n\nFROM THE SPEAKER BOX (work one in, never quote it as a "
+            "quotation):\n" + "\n".join(
+                "- " + " ".join(str(s.get("text") or "").split())[:220]
+                for s in seeds))
+
+
+def paper_seeds_used(seeds: list[dict[str, Any]]) -> None:
+    """Advance the no-repeat memory once the story is accepted."""
+    for s in seeds:
+        try:
+            speakbox_remember(s)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def paper_tint_left() -> float:
+    """#1024: seconds left in the tint's OWN window. Armed by paper_print
+    the moment the desks are done; unarmed means the full window."""
+    at = float(_PAPER_PRESS.get("tint_deadline") or 0)
+    return PAPER_TINT_SECONDS if not at else at - time.time()
+
+
+def _paper_tint_why(reason: str) -> None:
+    """#1024: an empty tint pass says why, once, instead of nothing."""
+    if _PAPER_PRESS.get("tint_why"):
+        return
+    _PAPER_PRESS["tint_why"] = str(reason)[:120]
+
+
+async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
+    """#1024: the crystal on a story's BODY, paragraph by paragraph
+    (crystal_line collapses whitespace, so never the whole body), under
+    the press caps - PAPER_TINT_STORIES stories, PAPER_TINT_PARAS
+    paragraphs, and the clock. Never headlines, decks, tables, lists,
+    quotes or classified prices (those are meta, or |/#/-/> lines)."""
+    if int(_PAPER_PRESS.get("tinted_stories") or 0) >= PAPER_TINT_STORIES:
+        return False
+    if int(_PAPER_PRESS.get("tinted_paras") or 0) >= PAPER_TINT_PARAS:
+        return False
+    if paper_tint_left() <= 0:
+        _paper_tint_why("the tint window is spent")
+        return False
+    try:
+        if not (crystal_tint_two_pass() and crystal_active()):
+            return False
+        _stop = tint_should_stop()
+        if _stop:
+            _paper_tint_why("the station's tint budget says stop: "
+                            + str(_stop)[:80])
+            return False
+    except Exception:  # noqa: BLE001
+        return False
+    paras = str(story.get("body") or "").split("\n\n")
+    changed = False
+    for i, p in enumerate(paras):
+        t = p.strip()
+        if not t or t.startswith(("|", "#", "-", "*", ">")) or len(t) < 24:
+            continue
+        if int(_PAPER_PRESS.get("tinted_paras") or 0) >= PAPER_TINT_PARAS \
+                or paper_tint_left() <= 0:
+            break
+        try:
+            out = await crystal_line(t, why, 1)
+        except Exception:  # noqa: BLE001
+            out = t
+        _PAPER_PRESS["tinted_paras"] = int(_PAPER_PRESS.get("tinted_paras") or 0) + 1
+        out = " ".join(str(out or "").split())
+        if out and out != " ".join(t.split()):
+            paras[i] = out
+            changed = True
+    if changed:
+        story["body"] = "\n\n".join(paras)
+        story["meta"]["tinted"] = True
+        _PAPER_PRESS["tinted_stories"] = int(_PAPER_PRESS.get("tinted_stories") or 0) + 1
+    return changed
+
+
+def paper_tinted_by() -> str:
+    try:
+        if crystal_tint_two_pass() and crystal_active():
+            names = [str(c.get("name") or "") for c in crystal_active()
+                     if isinstance(c, dict)]
+            return ", ".join(n for n in names if n)[:80] or "the crystal"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
+def paper_hot_lines(rows: list[dict[str, Any]], most: int = 8,
+                    avoid: set[str] | None = None) -> list[dict[str, Any]]:
+    """#1023: the lines worth setting large - scored by code (length,
+    punctuation, a clip to play, a strong word), one per distinct text,
+    returned in air order."""
+    scored: list[tuple[float, dict[str, Any]]] = []
+    seen: set[str] = set(avoid or set())
+    for r in rows:
+        t = " ".join(str(r.get("text") or "").split())
+        rid = str(r.get("id") or "")
+        if len(t) < 30 or len(t) > 240 or rid in seen:
+            continue
+        key = t.lower()[:60]
+        if key in seen:
+            continue
+        seen.add(key)
+        seen.add(rid)
+        score = min(len(t), 160) / 160.0
+        score += 0.6 if re.search(r"[!?]", t) else 0.0
+        score += 0.3 if re.search(r"[\"']", t) else 0.0
+        score += 0.5 if r.get("url") else 0.0
+        score += 0.3 if re.search(
+            r"\b(never|always|nobody|everybody|worst|best|honest|swear|"
+            r"listen|record|caller|upstairs)\b", t, re.I) else 0.0
+        scored.append((score, r))
+    scored.sort(key=lambda x: -x[0])
+    picked = [r for _, r in scored[:most]]
+    picked.sort(key=lambda r: float(r.get("at") or r.get("ts") or 0))
+    return picked
+
+
+def paper_quotes(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """quotes[] per CONTRACT s3: {who, text, line, url, at} - the click-
+    to-play contract; url is "" once the clip is gone."""
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        text = " ".join(str(r.get("text") or "").split())[:240]
+        if not text:
+            continue
+        out.append({"who": str(r.get("who") or ""), "text": text,
+                    "line": str(r.get("id") or ""),
+                    "url": str(r.get("url") or ""),
+                    "at": round(float(r.get("at") or r.get("ts") or 0), 1)})
+    return out
+
+
+def _paper_cast_rows(m: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = [r for rows in (m.get("said") or {}).values() for r in rows
+            if str(r.get("seat") or "") in ("dj", "cohost", "third")]
+    rows.sort(key=lambda r: float(r.get("at") or r.get("ts") or 0))
+    return rows
+
+
+def _paper_pct(n: float, d: float) -> int:
+    return int(round(100.0 * float(n) / float(d))) if d else 0
+
+
+def _paper_ago(seconds: float) -> str:
+    seconds = max(0.0, float(seconds or 0))
+    if seconds < 90:
+        return f"{int(seconds)} seconds"
+    if seconds < 5400:
+        return f"{int(round(seconds / 60))} minutes"
+    return f"{seconds / 3600:.1f} hours"
+
+
+def _paper_delivery(m: dict[str, Any]) -> tuple[int, dict[str, dict[str, float]]]:
+    """(delivery %, roads{road: {owed, aired, attainment, met}}) from the
+    closed scorecard when one closed in the window, else the open
+    contract - the paper says which (#1028)."""
+    card = dict(m.get("scorecard") or {})
+    roads: dict[str, dict[str, float]] = {}
+    if card.get("roads"):
+        for k, v in (card.get("roads") or {}).items():
+            v = v or {}
+            roads[str(k)] = {"owed": float(v.get("target_seconds") or 0),
+                             "aired": float(v.get("aired_seconds") or 0),
+                             "attainment": float(v.get("attainment") or 0),
+                             "met": bool(v.get("met"))}
+        return int(round(float(card.get("delivery") or 0) * 100)), roads
+    hourly = dict(m.get("hourly") or {})
+    for k, v in (hourly.get("roads") or {}).items():
+        v = v or {}
+        owed = float(v.get("target") or 0)
+        aired = float(v.get("aired") or 0)
+        roads[str(k)] = {"owed": owed, "aired": aired,
+                         "attainment": float(v.get("attainment") or
+                                             (aired / owed if owed else 0)),
+                         "met": aired >= owed * 0.98 if owed else False}
+    owed = sum(r["owed"] for r in roads.values())
+    aired = sum(min(r["aired"], r["owed"]) for r in roads.values())
+    return _paper_pct(aired, owed), roads
+
+
+# --- G2 data desks (code, never a model) ----------------------------------
+
+def _desk_hour(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1032: the hour entry by entry - every running-order entry with
+    its minutes, whether the clock kept or missed it (_SCHED_LOG) and
+    what aired inside its nominal window (air-log rows by time); a box
+    with the next hour's running order and the expectations per road;
+    stats callouts. Page 1, section hour."""
+    sheet = dict(m.get("hour_sheet") or {})
+    slots = [s for s in (sheet.get("slots") or []) if s.get("enabled", True)]
+    log = [r for r in (m.get("sched_log") or [])]
+    air = list(m.get("air") or [])
+    if not slots and not log:
+        return None
+    kept = sum(1 for r in log if r.get("aired") is True)
+    missed = sum(1 for r in log if r.get("aired") is False)
+    delivery, _roads = _paper_delivery(m)
+    since, until = float(m["since"]), float(m["until"])
+    rows: list[str] = []
+    prose: list[str] = []
+    values: list[float] = []
+    labels: list[str] = []
+    now = time.time()
+    for i, s in enumerate(slots):
+        label = str(s.get("label") or s.get("kind") or "entry")
+        mins = float(s.get("minutes") or 0)
+        lo = float(s.get("starts_epoch") or 0)
+        hi = float(s.get("ends_epoch") or 0)
+        named = [r for r in log if int(r.get("index") if r.get("index") is not None else -9) == i]
+        why = ""
+        if any(r.get("aired") is True for r in named):
+            verdict = "kept"
+        elif any(r.get("aired") is False for r in named):
+            verdict = "missed"
+            why = next((str(r.get("why") or "") for r in named
+                        if r.get("aired") is False and r.get("why")), "")
+        elif named:
+            verdict = "named"
+        elif hi and hi <= min(until, now):
+            verdict = "not named"
+        else:
+            verdict = "-"
+        inside = [r for r in air if lo and hi and
+                  lo <= float(r.get("air_at") or r.get("ts") or 0) < hi]
+        by_round: dict[str, int] = {}
+        for r in inside:
+            by_round[str(r.get("round") or "banter")] = by_round.get(
+                str(r.get("round") or "banter"), 0) + 1
+        top = max(by_round, key=by_round.get) if by_round else ""
+        rows.append(f"| {_paper_shorten(label, 22)} | {mins:g} | "
+                    f"{_paper_shorten(verdict, 12)} | {len(inside)} |")
+        when = str(s.get("starts_at") or (_paper_clock(lo) if lo else ""))
+        prose.append(
+            f"{when} {label} ({mins:g} min): {verdict}".strip()
+            + (f" - {why}" if why else "")
+            + (f"; {len(inside)} lines aired in its window"
+               + (f", most of them {top.replace('_', ' ')}" if top else "")
+               if inside else "; nothing logged inside its nominal window")
+            + ".")
+        values.append(mins)
+        labels.append(_paper_shorten(label, 11) or "?")
+    nxt = dict(m.get("next_hour") or {})
+    nslots = [s for s in (nxt.get("slots") or []) if s.get("enabled", True)]
+    needs = dict(m.get("needs") or {})
+    items = [f"{s.get('starts_at') or ''} {s.get('label') or s.get('kind')} - "
+             f"{float(s.get('minutes') or 0):g} min".strip() for s in nslots[:20]]
+    expect: list[str] = []
+    for road, row in sorted(needs.items()):
+        owed = float((row or {}).get("owed") or 0)
+        held = float((row or {}).get("held") or 0)
+        if not owed:
+            continue
+        expect.append(f"{road.replace('_', ' ')}: "
+                      + ("covered" if held >= owed
+                         else f"short by {_paper_ago(owed - held)}"))
+    if expect:
+        items.append("Expectations - " + "; ".join(expect[:8]))
+    intro = (
+        f"The {_paper_hour_words(since)} hour ran "
+        f"{sheet.get('preset') or 'the running order'} with {len(slots)} "
+        f"entr{'y' if len(slots) == 1 else 'ies'} on the sheet. The clock "
+        f"named {len(log)} round{'s' if len(log) != 1 else ''}, kept "
+        f"{kept} and missed {missed}; {len(air)} lines went out on the air "
+        f"log between {_paper_clock(since)} and {_paper_clock(until)}. Each "
+        "entry below is measured against its nominal window from the top "
+        "of the hour - a pause freezes the playhead while those windows "
+        "keep marching, so a paused hour reads as entries that aired late. "
+        "The next hour's running order and what the shelves can cover of it "
+        "are in the box.")
+    body = (intro + "\n\n### Entry by entry\n\n" + "\n\n".join(prose)
+            + "\n\n### The board\n\n| Entry | Min | Kept | Lines |\n"
+              "|:---|---:|:---|---:|\n" + "\n".join(rows))
+    meta: dict[str, Any] = {
+        "headline": f"The {_paper_hour_words(since)} Hour, Entry by Entry",
+        "deck": (f"{kept} of {len(log) or len(slots)} named entries kept; "
+                 f"{len(air)} lines aired; {delivery}% delivery"),
+        "section": "hour", "priority": 2, "page": 1,
+        "byline": "The Hour Desk", "kicker": "THE RUNNING ORDER",
+        "stats": [{"value": f"{kept}/{len(log) or len(slots)}",
+                   "label": "entries kept"},
+                  {"value": f"{delivery}%", "label": "delivery"},
+                  {"value": str(len(air)), "label": "lines aired"}],
+        "box": {"title": (f"Next hour: {nxt.get('label') or ''} "
+                          f"{nxt.get('preset') or ''}").strip() or "Next hour",
+                "items": items or ["nothing on the sheet"]},
+    }
+    if len(values) >= 2:
+        meta["chart"] = {"kind": "bars", "values": values, "labels": labels,
+                         "show_values": True, "min": 0}
+        meta["caption"] = "Minutes each entry owned, in sheet order."
+    return {"slug": "the-running-order", "meta": meta, "body": body}
+
+
+def _desk_sports(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: the hour scorecard as a league table - roads by
+    attainment, a stats callout, a picture from the pool. Sports style."""
+    delivery, roads = _paper_delivery(m)
+    if not roads:
+        return None
+    table = sorted(roads.items(), key=lambda kv: -kv[1]["attainment"])
+    rows = "\n".join(
+        f"| {i + 1}. {_paper_shorten(k.replace('_', ' '), 16)} | "
+        f"{int(v['owed'])}s | {int(v['aired'])}s | "
+        f"{_paper_pct(v['attainment'], 1)}% |"
+        for i, (k, v) in enumerate(table[:10]))
+    top, bottom = table[0], table[-1]
+    met = sum(1 for v in roads.values() if v["met"])
+    body = (
+        f"Top of the table this hour is {top[0].replace('_', ' ')}, which "
+        f"aired {int(top[1]['aired'])} of the {int(top[1]['owed'])} seconds "
+        f"it owed, a {_paper_pct(top[1]['attainment'], 1)}% attainment. "
+        f"Bottom of the league is {bottom[0].replace('_', ' ')} at "
+        f"{_paper_pct(bottom[1]['attainment'], 1)}%. {met} of "
+        f"{len(roads)} roads met their requirement and the hour stands at "
+        f"{delivery}% delivery overall. The seconds are the coordinator's "
+        "own estimate - a line is credited at its length over fourteen - "
+        "so treat the standings as form, not a stopwatch.\n\n"
+        "### The league\n\n| Road | Owed | Aired | Att |\n|:---|---:|---:|---:|\n"
+        + rows)
+    pic = paper_picture_take(m, kinds=("filler", "shown", "described"))
+    meta: dict[str, Any] = {
+        "headline": f"{top[0].replace('_', ' ').title()} Tops the Table",
+        "deck": f"{met} of {len(roads)} roads met the hour; "
+                f"{bottom[0].replace('_', ' ')} props up the league",
+        "section": "engineering", "priority": 5, "page": 6,
+        "byline": "The Sports Desk", "kicker": "LEAGUE TABLE",
+        "style_hint": "sports",
+        "stats": [{"value": f"{_paper_pct(top[1]['attainment'], 1)}%",
+                   "label": top[0].replace("_", " ")},
+                  {"value": f"{met}/{len(roads)}", "label": "roads met"},
+                  {"value": f"{delivery}%", "label": "delivery"}],
+    }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = _paper_shorten(pic.get("desc") or pic["name"], 110)
+        meta["focus"] = "center"
+    return {"slug": "the-league", "meta": meta, "body": body}
+
+
+async def _desk_device(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1020: The Box - the Nabu on the wire (dark / alive / listening;
+    never 'online' for alive-not-listening), delivery, routing, the
+    agents (ONE services census at print time, capped), the steward and
+    doctor verdicts, the generations and model calls of the hour."""
+    nabu = dict(m.get("nabu") or {})
+    wire = dict(nabu.get("wire") or {})
+    now = time.time()
+    state = str(wire.get("state") or "")
+    listening = bool(wire.get("listening"))
+    if not state:
+        wire_words = "the wire has not been probed since this process started"
+        short = "not probed"
+    elif state == "dark":
+        wire_words = ("DARK on the wire - no answer on any port, which is "
+                      "power or Wi-Fi, not software")
+        short = "dark"
+    elif listening:
+        wire_words = "alive on the wire and listening on the ESPHome port"
+        short = "listening"
+    else:
+        wire_words = ("alive on the wire but nothing listening on 6053 - the "
+                      "firmware is not running, and only a power cycle brings "
+                      "it back")
+        short = "alive, not listening"
+    age = (now - float(wire.get("at") or 0)) if wire.get("at") else 0.0
+    try:
+        silent = now - float(_BOX_LAST_OK[0]) if _BOX_LAST_OK[0] else 0.0
+        held = len(_BOX_HOLD)
+        breaker = now < float(_BOX_DOWN.get("until") or 0)
+        switch = bool(box_talk_ok())
+    except Exception:  # noqa: BLE001
+        silent, held, breaker, switch = 0.0, 0, False, True
+    voice_to = str(_RADIO.get("voice_to") or "box")
+    music_to = str(_RADIO.get("music_to") or "here")
+    census: dict[str, Any] = {}
+    if paper_press_left() > 25:
+        try:
+            census = await asyncio.wait_for(services_census(), 20)
+        except Exception:  # noqa: BLE001
+            census = {}
+    services = dict(census.get("services") or {})
+    sick: list[str] = []
+    try:
+        _text, sick = services_text(census) if census else ("", [])
+    except Exception:  # noqa: BLE001
+        sick = [k for k, v in services.items() if not (v or {}).get("ok")]
+    ok_n = sum(1 for v in services.values() if (v or {}).get("ok"))
+    agent_rows = "\n".join(
+        f"| {_paper_shorten(str(SERVICE_LABELS.get(k, k)), 24)} | "
+        f"{'up' if (v or {}).get('ok') else 'DOWN'} | "
+        f"{_paper_shorten(str((v or {}).get('detail') or '-'), 26)} |"
+        for k, v in list(services.items())[:20])
+    steward = dict(_STEWARD) if isinstance(_STEWARD, dict) else {}
+    doctor = dict(_COMFY_DOCTOR) if isinstance(_COMFY_DOCTOR, dict) else {}
+    gens = list(m.get("generations") or [])
+    mc = dict((m.get("model_calls") or {}).get("summary") or {})
+    gen_rows = "\n".join(
+        f"| {_paper_clock(float(g.get('ts') or 0))} | {str(g.get('kind') or 'image')} | "
+        f"{_paper_shorten(str(g.get('model') or '-'), 16)} | "
+        f"{int(float(((g.get('stats') or {}).get('duration_s')) or 0))} |"
+        for g in gens[:12])
+    parts = [
+        f"The Pine Box is {wire_words}"
+        + (f" (probed {_paper_ago(age)} ago)" if age else "") + ". "
+        + (f"The last clip the box carried was {_paper_ago(silent)} ago"
+           if silent else "The box has not carried a clip this process")
+        + (f", {held} line{'s' if held != 1 else ''} are held for it" if held else "")
+        + (", and the announce breaker is open" if breaker else "")
+        + f". The DJ voice is routed to {voice_to} and the music to {music_to}; "
+        + ("the master switch is on." if switch else "the master switch is OFF.")
+        + (" " + str(nabu.get("health") or "") if nabu.get("health") else "")
+    ]
+    if services:
+        parts.append(
+            f"Of the {len(services)} agents in the census, {ok_n} answered "
+            "well"
+            + (f" and {len(sick)} did not: " + ", ".join(
+                str(SERVICE_LABELS.get(k, k)) for k in sick[:6]) + "."
+               if sick else "; nothing is down.")
+            + (f" The steward's last verdict: {steward.get('verdict')}"
+               + (f", {_paper_ago(now - float(steward.get('finished') or 0))} ago"
+                  if steward.get("finished") else "") + "."
+               if steward.get("verdict") else "")
+            + (f" The Comfy doctor: {doctor.get('verdict')}."
+               if doctor.get("verdict") else ""))
+    else:
+        parts.append("The services census was not taken this press - the "
+                     "clock did not allow the twenty seconds it costs - so "
+                     "the agents table is empty rather than stale.")
+    parts.append(
+        f"Generations this hour: {len(gens)} render"
+        f"{'s' if len(gens) != 1 else ''} off ComfyUI"
+        + (f" ({int(sum(float(((g.get('stats') or {}).get('duration_s')) or 0) for g in gens))} "
+           "seconds of GPU)" if gens else "")
+        + f", and {int(mc.get('calls') or 0)} model call"
+        f"{'s' if int(mc.get('calls') or 0) != 1 else ''} to Ollama, "
+        f"{int(mc.get('eval_count') or 0)} tokens written over "
+        f"{int(float(mc.get('working_ms') or 0) / 1000)} working seconds"
+        + (f" ({int(float(mc.get('waiting_ms') or 0) / 1000)} waiting)"
+           if mc.get("waiting_ms") else "") + ". "
+        + ", ".join(f"{k}: {v.get('calls')}" for k, v in
+                    list((mc.get("by_model") or {}).items())[:4]) + ".")
+    body = "\n\n".join(parts)
+    if agent_rows:
+        body += "\n\n### The agents\n\n| Agent | State | Detail |\n|:---|:---|:---|\n" + agent_rows
+    if gen_rows:
+        body += "\n\n### Generations\n\n| Time | Kind | Model | Sec |\n|:---|:---|:---|---:|\n" + gen_rows
+    meta: dict[str, Any] = {
+        "headline": f"The Box: {short.capitalize()}",
+        "deck": (f"{ok_n} of {len(services)} agents up; " if services else "")
+                + f"{len(gens)} renders and {int(mc.get('calls') or 0)} model calls this hour",
+        "section": "device", "priority": 3, "page": 6,
+        "byline": "The Device Desk", "kicker": "THE WIRE",
+        "stats": [{"value": f"{ok_n}/{len(services)}" if services else "-",
+                   "label": "agents up"},
+                  {"value": str(len(gens)), "label": "renders"},
+                  {"value": str(int(mc.get("calls") or 0)), "label": "model calls"},
+                  {"value": str(int(mc.get("eval_count") or 0)), "label": "tokens out"}],
+    }
+    return {"slug": "the-box", "meta": meta, "body": body}
+
+
+def _desk_dgx(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1020: DGX Spark weather - temperature and load off the heat ring,
+    as a forecast. Section weather, page 6."""
+    heat = dict(m.get("heat") or {})
+    samples = [r for r in (heat.get("samples") or []) if isinstance(r, dict)]
+    if len(samples) < 2:
+        return None
+    summ = dict(heat.get("summary") or {})
+    key = "gpu_c" if any(float(r.get("gpu_c") or 0) for r in samples) else "board_c"
+    step = max(1, len(samples) // 24)
+    picked = samples[::step][:24]
+    if len(picked) < 2:
+        picked = samples[:2]
+    values = [round(float(r.get(key) or 0), 1) for r in picked]
+    labels = [time.strftime("%H:%M", time.localtime(float(r.get("at") or 0)))
+              for r in picked]
+    hot = max(samples, key=lambda r: float(r.get(key) or 0))
+    st = summ.get(key) or {}
+    load = summ.get("load1") or {}
+    mem = summ.get("mem_used_gb") or {}
+    util = summ.get("gpu_util") or {}
+    where = "the GPU" if key == "gpu_c" else "the board"
+    body = (
+        f"Tonight on the DGX Spark: {where} ran between {st.get('min', 0):.0f} "
+        f"and {st.get('max', 0):.0f} degrees over the hour, averaging "
+        f"{st.get('avg', 0):.0f}, with the high at "
+        f"{_paper_clock(float(hot.get('at') or 0))}. It reads "
+        f"{st.get('last', 0):.0f} degrees as this edition goes to press. The "
+        f"load average peaked at {load.get('max', 0):.1f} and settled at "
+        f"{load.get('last', 0):.1f}; memory in use ran {mem.get('min', 0):.0f} to "
+        f"{mem.get('max', 0):.0f} gigabytes"
+        + (f"; GPU utilisation touched {util.get('max', 0):.0f}%"
+           if util.get("max") else "") + ". "
+        + ("The ring has "
+           f"{int(summ.get('gaps') or 0)} hole{'s' if int(summ.get('gaps') or 0) != 1 else ''} "
+           "where nothing was sampled - a restart or a stall - and the line "
+           "breaks rather than bridges them. " if summ.get("gaps") else "")
+        + "Outlook: a busy larder and a crystal pass warm the board by ten "
+        "degrees inside a quarter hour; a pause cools it. Nothing here "
+        "throttles the station; the heat clock only changes how the pair "
+        "talk about it.")
+    meta: dict[str, Any] = {
+        "headline": f"DGX Spark Weather: High of {st.get('max', 0):.0f} Degrees",
+        "deck": f"{where.capitalize()} temperature and load across the hour, "
+                f"{len(samples)} readings",
+        "section": "weather", "priority": 4, "page": 6,
+        "byline": "The Engineering Weather Desk", "kicker": "DGX SPARK",
+        "chart": {"kind": "line", "values": values, "labels": labels,
+                  "show_values": len(values) <= 8,
+                  "min": max(0, int(min(values)) - 5),
+                  "max": int(max(values)) + 5},
+        "caption": f"{where.capitalize()} temperature in degrees C across the hour.",
+        "stats": [{"value": f"{st.get('max', 0):.0f}°", "label": "hottest"},
+                  {"value": f"{load.get('max', 0):.1f}", "label": "peak load"},
+                  {"value": f"{mem.get('last', 0):.0f} GB", "label": "memory"},
+                  {"value": f"{util.get('max', 0):.0f}%", "label": "GPU util"}],
+    }
+    return {"slug": "dgx-weather", "meta": meta, "body": body}
+
+
+async def _desk_report(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1028: the Orchestrator Report - delivery and attainment per road
+    (closed card or open contract, said which), production per road as
+    a pie, the judgment book tail split alone vs operator, the pulse
+    blockers, the longest gaps, what the manager said, and a fresh terse
+    verdict from upstairs. Page 5, section report."""
+    delivery, roads = _paper_delivery(m)
+    card = dict(m.get("scorecard") or {})
+    hourly = dict(m.get("hourly") or {})
+    active = dict(m.get("hour_active") or {})
+    source = ("the hour contract that closed in the window"
+              if card else "the open contract as this edition went to press")
+    prod: dict[str, float] = {}
+    for src in (active.get("production") or {}, (card.get("roads") or {})):
+        for k, v in (src or {}).items():
+            v = v or {}
+            secs = float((v.get("production") or v).get("seconds") or 0) \
+                if isinstance(v, dict) else 0.0
+            if secs > 0:
+                prod[str(k)] = prod.get(str(k), 0.0) + secs
+        if prod:
+            break
+    if not prod:
+        prod = {k: v["aired"] for k, v in roads.items() if v["aired"] > 0}
+    judg = dict(m.get("judgment") or {})
+    alone = list(judg.get("alone") or [])
+    oper = list(judg.get("operator") or [])
+    pulse = dict(m.get("pulse") or {})
+    gaps = sorted(list(m.get("gaps") or []),
+                  key=lambda g: -float(g.get("dead_seconds") or g.get("seconds") or 0))
+    gsum = dict(m.get("gap_summary") or {})
+    gled = dict(m.get("gap_report") or {})        # #1022: the analysis
+    memos = list(m.get("memos") or [])
+    pages = list(m.get("upstairs") or [])
+    said_up = [x.get("text") for x in pages[:2]] + [x.get("text") for x in memos[:2]]
+    said_up = [" ".join(str(t or "").split()) for t in said_up if t]
+    # The verdict from upstairs: one short model visit, else the register.
+    verdict = ""
+    if paper_press_left() > 0:
+        try:
+            verdict = " ".join(str(await ask_model(
+                "You are the STATION MANAGER, upstairs. One sentence, under "
+                "twenty-five words, terse and unimpressed, no greeting, no "
+                "markdown, on this hour's report: "
+                f"delivery {delivery}%, "
+                + ", ".join(f"{k.replace('_', ' ')} {_paper_pct(v['attainment'], 1)}%"
+                            for k, v in list(roads.items())[:6])
+                + (f", {len(gaps)} dead-air gaps" if gaps else "")
+                + ".", limit=120) or "").split())[:200]
+            _PAPER_PRESS["writer_calls"] = int(_PAPER_PRESS.get("writer_calls") or 0) + 1
+        except Exception:  # noqa: BLE001
+            verdict = ""
+    if not verdict:
+        worst = min(roads.items(), key=lambda kv: kv[1]["attainment"])[0] \
+            if roads else "the whole sheet"
+        verdict = (f"{delivery} percent is not a number I am taking upstairs; "
+                   f"fix {worst.replace('_', ' ')} before you fix anything else.")
+    road_rows = "\n".join(
+        f"| {_paper_shorten(k.replace('_', ' '), 16)} | {int(v['owed'])}s | "
+        f"{int(v['aired'])}s | {_paper_pct(v['attainment'], 1)}% |"
+        for k, v in sorted(roads.items(), key=lambda kv: -kv[1]['attainment'])[:10])
+    parts = [
+        f"Delivery stands at {delivery}% by {source}. "
+        + (", ".join(f"{k.replace('_', ' ')} {_paper_pct(v['attainment'], 1)}%"
+                     for k, v in list(roads.items())[:7]) + ". " if roads else "")
+        + (f"Production went {', '.join(f'{k.replace(chr(95), chr(32))} {int(v)}s' for k, v in sorted(prod.items(), key=lambda kv: -kv[1])[:6])}. "
+           if prod else "")
+        + (f"The coordinator's own note: {hourly.get('measurement')}"
+           if hourly.get("measurement") else ""),
+        f"The judgment book has {len(alone) + len(oper)} entr"
+        f"{'y' if len(alone) + len(oper) == 1 else 'ies'} for the window, "
+        f"{len(alone)} taken alone by the station and {len(oper)} by the "
+        "operator - the split matters, because the station's defaults are "
+        "not the operator's wishes. "
+        + " ".join(f"{'Alone' if r.get('alone') else 'Operator'}: "
+                   f"\"{_paper_shorten(str(r.get('face') or ''), 60)}\" "
+                   f"({_paper_shorten(str(r.get('why') or ''), 90)}). "
+                   for r in (oper + alone)[:4]),
+        f"The pulse counted {int(pulse.get('stalls') or 0)} stall"
+        f"{'s' if int(pulse.get('stalls') or 0) != 1 else ''} of the event "
+        f"loop in the hour, the worst {float(pulse.get('worst_s') or 0):.1f} "
+        "seconds"
+        + (", blocked in " + ", ".join(
+            f"{_paper_shorten(str(t.get('frame') or ''), 40)}"
+            for t in (pulse.get("top") or [])[:3]) if pulse.get("top") else "")
+        + f". Dead air: {int(gsum.get('count') or 0)} gap"
+        f"{'s' if int(gsum.get('count') or 0) != 1 else ''} over twenty seconds, "
+        f"{int(gsum.get('total_s') or 0)} seconds in all, the longest "
+        f"{int(gsum.get('longest') or 0)}"
+        + (" - " + "; ".join(
+            f"{int(g.get('dead_seconds') or g.get('seconds') or 0)}s at "
+            f"{_paper_clock(float(g.get('at') or 0))} waiting for "
+            f"{str((g.get('after') or {}).get('round') or 'the next round').replace('_', ' ')}"
+            for g in gaps[:3]) if gaps else "") + "."
+        # #1022: what the gap ledger says the holes WERE, ranked by the
+        # seconds each cause cost, and its own one-line reading.
+        + ((" By cause: " + ", ".join(
+            f"{str(c.get('cause') or '?')} {int(c.get('seconds') or 0)}s"
+            for c in (gled.get("by_cause") or [])[:4]) + ".")
+           if gled.get("by_cause") else "")
+        + ((" The ledger's reading: " + str(gled.get("say")) + ".")
+           if gled.get("say") else ""),
+        ("What the manager said this hour: "
+         + " ".join(f"\"{_paper_shorten(t, 140)}\"" for t in said_up[:3])
+         if said_up else "Nothing came down from upstairs in the window.")
+        + f" His verdict on this report, fresh: \"{verdict}\"",
+    ]
+    body = "\n\n".join(p for p in parts if p.strip())
+    if road_rows:
+        body += "\n\n### Attainment\n\n| Road | Owed | Aired | Att |\n|:---|---:|---:|---:|\n" + road_rows
+    meta: dict[str, Any] = {
+        "headline": f"Orchestrator Report: {delivery}% Delivered",
+        "deck": (f"{len(alone)} decisions taken alone, {len(oper)} by the operator; "
+                 f"{int(gsum.get('count') or 0)} gaps; "
+                 f"{int(pulse.get('stalls') or 0)} stalls"),
+        "section": "report", "priority": 2, "page": 5,
+        "byline": "The Orchestrator", "kicker": "THE REPORT",
+        "style_hint": "report",
+        "pull": verdict[:240],
+        "stats": [{"value": f"{delivery}%", "label": "delivery"},
+                  {"value": str(int(gsum.get("count") or 0)), "label": "gaps"},
+                  {"value": str(int(pulse.get("stalls") or 0)), "label": "stalls"},
+                  {"value": f"{len(alone)}/{len(alone) + len(oper)}",
+                   "label": "decided alone"}],
+    }
+    if len(prod) >= 2:
+        keys = sorted(prod, key=lambda k: -prod[k])[:8]
+        meta["chart"] = {"kind": "pie",
+                         "values": [int(prod[k]) for k in keys],
+                         "labels": [_paper_shorten(k.replace("_", " "), 11) for k in keys]}
+        meta["caption"] = "Production this hour by road, in room seconds."
+    return {"slug": "orchestrator-report", "meta": meta, "body": body}
+
+
+# --- G2: the pause (#1030) ------------------------------------------------
+
+_PAPER_STOP_WORDS = frozenset("""
+that with this from have were they them then than what when will your
+there their about would could should just like into over also more some
+been being very much only back down here where which while after before
+because through those these other every never always still again might
+know think going right well yeah okay sure thing things really thats
+going gonna wanna gotta said says tell told make made take took come came
+want need look looks looking want wants
+""".split())
+
+
+def paper_pause_words(started: float) -> tuple[list[list[Any]], dict[str, Any]]:
+    """#1030: the top 60 words (with counts) of the text WRITTEN during
+    the pause - pantry rows rendered since it began (their `at` is the
+    render moment, never shifted) and larder rounds whose stats.at is
+    inside it - plus counts by kind. Memory only; runs in a thread
+    because a long pause can mean thousands of rows."""
+    counts: dict[str, int] = {}
+    by_kind: dict[str, int] = {}
+    clips = 0
+    started = float(started or 0)
+
+    def eat(text: Any) -> None:
+        for w in re.findall(r"[A-Za-z][A-Za-z']{3,}", str(text or "").lower()):
+            if w in _PAPER_STOP_WORDS:
+                continue
+            counts[w] = counts.get(w, 0) + 1
+
+    try:
+        for _key, row in list(_PANTRY.items()):
+            if not isinstance(row, dict) or float(row.get("at") or 0) < started:
+                continue
+            clips += 1
+            kind = str(row.get("kind") or row.get("who") or "line")
+            by_kind[kind] = by_kind.get(kind, 0) + 1
+            eat(row.get("text"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for entry in list(_LARDER):
+            if not isinstance(entry, dict):
+                continue
+            at = float((entry.get("stats") or {}).get("at") or 0)
+            if at < started:
+                continue
+            by_kind["banter round"] = by_kind.get("banter round", 0) + 1
+            eat(entry.get("script_plain") or entry.get("script"))
+    except Exception:  # noqa: BLE001
+        pass
+    top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:60]
+    return [[w, c] for w, c in top], {"clips": clips, "by_kind": by_kind}
+
+
+def paper_pause_itinerary(m: dict[str, Any]) -> list[str]:
+    """What runs while the station is paused, with counts - memory only."""
+    hourly = dict(m.get("hourly") or {})
+    pause = dict(hourly.get("pause") or {})
+    info = dict(m.get("pause_info") or {})
+    board = list(m.get("board") or [])
+    items: list[str] = []
+    try:
+        unfinished = int(_pause_unfinished_rows())
+    except Exception:  # noqa: BLE001
+        unfinished = 0
+    items.append(f"pantry_keeper: finishing {unfinished} written round"
+                 f"{'s' if unfinished != 1 else ''} still waiting for audio or tint")
+    items.append("larder_keeper: writing banter rounds until the unaired "
+                 "reserve reaches want")
+    items.append(f"rendered since the pause began: {int(info.get('clips') or 0)} clips"
+                 + (" (" + ", ".join(f"{k} {v}" for k, v in
+                                     sorted((info.get("by_kind") or {}).items(),
+                                            key=lambda kv: -kv[1])[:5]) + ")"
+                    if info.get("by_kind") else ""))
+    if pause:
+        items.append(f"the pause so far: {_paper_ago(pause.get('seconds') or 0)}; "
+                     f"ready gain {float(pause.get('ready_gain') or 0):.0f}s, "
+                     f"tint gain {float(pause.get('tint_gain') or 0):.0f}, "
+                     f"short reduced {float(pause.get('short_reduced') or 0):.0f}s")
+    items.append("retint: the crystal's share rises to 0.9 once nothing is short")
+    try:
+        last = float(_WORKSHOP_LAST[0] or 0)
+        jobs = [j for j in list(_ALT_JOBS.values())[-5:] if isinstance(j, dict)]
+        items.append("workshop: " + (f"last commissioned {_paper_ago(time.time() - last)} ago"
+                                     if last else "not yet commissioned")
+                     + (", jobs " + ", ".join(str(j.get("state") or "") for j in jobs)
+                        if jobs else ""))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        reel = dict(_REEL)
+        items.append("reel: " + (f"cut, {int(reel.get('turns') or 0)} turns, "
+                                 f"{float(reel.get('length') or 0):.0f}s"
+                                 if reel.get("media") else "not cut yet"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        items.append(f"ad_studio: {int(ads_produced_since(3600))} spot(s) cut in the last hour")
+    except Exception:  # noqa: BLE001
+        pass
+    for row in board[:10]:
+        items.append(f"{row.get('label') or row.get('kind')}: "
+                     f"{int(row.get('written') or 0)} written, "
+                     f"{int(row.get('rendered') or 0)} rendered, "
+                     f"{int(row.get('ready') or 0)} ready")
+    return items
+
+
+def _desk_pause(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1030: the itinerary story beside the paused lead - the box, bars
+    of stock by road, and the pause history in the window."""
+    if not m.get("paused"):
+        return None
+    items = paper_pause_itinerary(m)
+    board = [r for r in (m.get("board") or []) if isinstance(r, dict)]
+    pauses = list(m.get("pause_log") or [])
+    pause_now = dict(m.get("pause_now") or {})
+    info = dict(m.get("pause_info") or {})
+    body = (
+        f"The station has been paused for {_paper_ago(pause_now.get('seconds') or 0)}"
+        + (f", asked for by: {pause_now.get('why')}" if pause_now.get("why") else "")
+        + ". Nothing airs, and every room keeps working: the finishing rooms "
+        "take every written round, the larder writes ahead, the crystal gets "
+        "a bigger share, the workshop rewrites the oldest round, the reel is "
+        "cut so the resume has something in hand. "
+        f"Since the pause began the rooms rendered {int(info.get('clips') or 0)} "
+        "clips. "
+        + (f"The log shows {len(pauses)} pause event{'s' if len(pauses) != 1 else ''} "
+           "in the window: " + "; ".join(
+               f"{'paused' if p.get('paused') else 'resumed'} at "
+               f"{_paper_clock(float(p.get('at') or 0))}"
+               + (f" ({_paper_shorten(str(p.get('why') or ''), 50)})" if p.get("why") else "")
+               for p in pauses[:6]) + ". " if pauses else "")
+        + "The itinerary in the box is what is running as this edition goes "
+        "to press; the bars are the stock each road holds ready.")
+    meta: dict[str, Any] = {
+        "headline": "Behind the Glass: The Pause Itinerary",
+        "deck": f"What the rooms are doing while nothing airs; "
+                f"{int(info.get('clips') or 0)} clips rendered so far",
+        "section": "hour", "priority": 2, "page": 1,
+        "byline": "The Orchestrator", "kicker": "PAUSED",
+        "style_hint": "itinerary",
+        "box": {"title": "The itinerary", "items": items[:16] or ["nothing running"]},
+        "stats": [{"value": _paper_ago(pause_now.get("seconds") or 0), "label": "paused for"},
+                  {"value": str(int(info.get("clips") or 0)), "label": "clips rendered"},
+                  {"value": str(sum(int(r.get("ready") or 0) for r in board)), "label": "rounds ready"}],
+    }
+    stock = [(str(r.get("label") or r.get("kind") or "?"),
+              float(r.get("seconds") or r.get("ready") or 0)) for r in board][:10]
+    if len(stock) >= 2:
+        meta["chart"] = {"kind": "bars", "values": [round(v) for _, v in stock],
+                         "labels": [_paper_shorten(k, 11) for k, _ in stock],
+                         "show_values": True, "min": 0}
+        meta["caption"] = "Stock by road: seconds ready on the shelves."
+    return {"slug": "the-pause", "meta": meta, "body": body}
+
+# --- G2 prose desks (the writer, with a templated fallback each) ----------
+
+async def _desk_air(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1023: what the pair talked about, with the hour's hot lines as
+    quotes[] carrying their clip URLs. Reads by ROUND (the stream road
+    stamps every row kind="call", so the old kind filter saw nothing)."""
+    said = m.get("said") or {}
+    rows: list[dict[str, Any]] = []
+    for rnd in ("banter", "track_talk", "deep", "bombshell", "recap"):
+        rows.extend(r for r in (said.get(rnd) or [])
+                    if str(r.get("seat") or "") in ("dj", "cohost", "third"))
+    if len(rows) < 3:
+        return None
+    rows.sort(key=lambda r: float(r.get("at") or r.get("ts") or 0))
+    hot = paper_hot_lines(rows, 10)
+    m.setdefault("_quoted", set()).update(str(r.get("id") or "") for r in hot)
+    seeds = await paper_seeds(2)
+    got = await paper_write(
+        "On Air",
+        f"What {m['host']} and {m['cohost']} talked about on {m['station']} "
+        "this hour between the records - the subjects, the running jokes, "
+        "the moment worth remembering. Quote a line or two exactly.",
+        _paper_lines(rows, 28, 200) + "\n\nTHE HOT LINES (already picked):\n"
+        + _paper_lines(hot, 10, 220) + paper_seed_block(seeds), words=(160, 300))
+    body = got.get("body") or (
+        f"The pair had the air {len(rows)} times this hour, "
+        f"{_paper_clock(float(rows[0].get('at') or 0))} to "
+        f"{_paper_clock(float(rows[-1].get('at') or 0))}, across "
+        f"{len({str(r.get('round')) for r in rows})} kinds of round. "
+        + " ".join(f"{r.get('who') or 'One of them'}: \""
+                   f"{_paper_shorten(r['text'], 140)}\"" for r in hot[:5])
+        + " The lines in the margin are the ones this desk set large; each "
+        "plays from the air log while its clip survives.")
+    paper_seeds_used(seeds)
+    meta = {
+        "headline": got.get("headline") or "Between the Records",
+        "deck": got.get("deck") or f"What the pair talked about this hour, in {len(hot)} lines",
+        "section": "air", "priority": 2, "page": 2, "byline": "The Air Desk",
+        "pull": got.get("pull") or "", "quotes": paper_quotes(hot),
+        "stats": [{"value": str(len(rows)), "label": "lines on air"},
+                  {"value": str(len(hot)), "label": "worth keeping"}],
+    }
+    return {"slug": "on-air", "meta": meta, "body": body}
+
+
+def _desk_testimonials(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: the hour's best DJ lines as testimonials with a portrait
+    from the picture pool. Code only - the lines are the writing."""
+    rows = _paper_cast_rows(m)
+    if len(rows) < 4:
+        return None
+    hot = paper_hot_lines(rows, 6, avoid=set(m.get("_quoted") or set()))
+    if len(hot) < 3:
+        return None
+    m.setdefault("_quoted", set()).update(str(r.get("id") or "") for r in hot)
+    pic = paper_picture_take(m, kinds=("shown", "described", "filler"), person=True)
+    # #1031: the quote block below carries the lines themselves, with the
+    # play and download controls. Setting them out again as prose printed
+    # the hour twice, so the body frames them instead.
+    voices: list[str] = []
+    for r in hot:
+        nm = str(r.get("who") or "The booth")
+        if nm not in voices:
+            voices.append(nm)
+    when = sorted(float(r.get("at") or 0) for r in hot)
+    body = (
+        f"What they said, and stood by, on {m['station']} this hour - "
+        f"{len(hot)} lines the desk would put on the wall, set out beside "
+        "this column exactly as they went out. Each one is verbatim off "
+        "the air log and plays back where its clip still exists; the "
+        "portrait is the station's own, described from its pixels rather "
+        "than from the sitter.\n\n"
+        f"They run from {_paper_clock(when[0])} to {_paper_clock(when[-1])}"
+        + (f", and the {'voice is' if len(voices) == 1 else 'voices are'} "
+           + (voices[0] if len(voices) == 1
+              else ", ".join(voices[:-1]) + " and " + voices[-1])
+           if voices else "")
+        + ". The desk picked them for what they say about the hour rather "
+          "than for how they sound, and has tidied none of them.")
+    meta: dict[str, Any] = {
+        "headline": "Testimonials From the Booth",
+        "deck": f"{len(hot)} lines the pair said this hour, kept verbatim",
+        "section": "air", "priority": 4, "page": 2,
+        "byline": "The Air Desk", "kicker": "WHAT THEY SAID",
+        "style_hint": "testimonial", "quotes": paper_quotes(hot),
+    }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = _paper_shorten(pic.get("desc") or "A portrait from the gallery", 110)
+        meta["focus"] = "top"
+    return {"slug": "testimonials", "meta": meta, "body": body}
+
+
 async def _desk_phones(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: the minutes of the phone calls - a Time | Caller | Topic |
+    Min table, per-call minutes off the transcripts (bounded), the
+    captivating situations by the writer, caller quotes with clips, and
+    the first caller's licence photo."""
     calls = list(m.get("calls") or [])
-    said = list((m.get("said") or {}).get("caller") or []) + list(
-        (m.get("said") or {}).get("call") or []) + list(
-        (m.get("said") or {}).get("banter_caller") or [])
+    said = list((m.get("said") or {}).get("caller") or [])
     if not calls and not said:
         return None
+    said.sort(key=lambda r: float(r.get("at") or r.get("ts") or 0))
+    hot = paper_hot_lines([r for r in said if r.get("seat") in ("caller", "caller2")], 6)
+    m.setdefault("_quoted", set()).update(str(r.get("id") or "") for r in hot)
+    seeds = await paper_seeds(2)
     material = ""
     if calls:
         material += "CALLS TAKEN:\n" + "\n".join(
@@ -87204,28 +94909,29 @@ async def _desk_phones(m: dict[str, Any]) -> dict[str, Any] | None:
             f"{int(c['seconds'] % 60):02d}s, {c['turns']} turns; the call ended "
             f"when {c['ended'] or 'it ended'}."
             + (f" Opening: {c['premise']}" if c.get("premise") else "")
+            + (" (hostile)" if c.get("hostile") else "")
             for c in calls[:8]) + "\n\n"
     if said:
-        said.sort(key=lambda r: r["ts"])
         material += "FROM THE AIR:\n" + _paper_lines(said, 16)
     got = await paper_write(
         "The Phones",
         f"Report the hour's request line on {m['station']}: who rang, what "
-        "they wanted, how each call ended. Hosts are "
+        "they wanted, the situation each caller was in - the captivating "
+        "part - and how each call ended. Hosts are "
         f"{m['host']} and {m['cohost']}. Name the callers as given.",
-        material)
-    body = got.get("body") or ""
-    if not body:
-        body = (
-            f"The request line rang {len(calls)} time{'s' if len(calls) != 1 else ''} "
-            f"between {_paper_clock(m['since'])} and {_paper_clock(m['until'])}. "
-            + " ".join(
-                f"{c['name']} rang at {_paper_clock(c['ts'])} about "
-                f"{c['topic'] or 'nothing in particular'} and stayed "
-                f"{int(c['seconds'] // 60)} minutes; the call ended when "
-                f"{c['ended'] or 'it ended'}." for c in calls[:6])
-            + " Every call is written down by the call log the moment it "
-            "ends, which is where this desk reads it.")
+        material + paper_seed_block(seeds))
+    body = got.get("body") or (
+        f"The request line rang {len(calls)} time{'s' if len(calls) != 1 else ''} "
+        f"between {_paper_clock(m['since'])} and {_paper_clock(m['until'])}. "
+        + " ".join(
+            f"{c['name']} rang at {_paper_clock(c['ts'])} about "
+            f"{c['topic'] or 'nothing in particular'}"
+            + (f" - \"{_paper_shorten(c['premise'], 120)}\"" if c.get("premise") else "")
+            + f" - and stayed {max(1, int(round(c['seconds'] / 60)))} minutes; the "
+            f"call ended when {c['ended'] or 'it ended'}." for c in calls[:6])
+        + " Every call is written down by the call log the moment it "
+        "ends, and the minutes below are read off the recording.")
+    paper_seeds_used(seeds)
     if calls:
         body += ("\n\n### The log\n\n| Time | Caller | Topic | Min |\n"
                  "|:---|:---|:---|---:|\n" + "\n".join(
@@ -87233,119 +94939,742 @@ async def _desk_phones(m: dict[str, Any]) -> dict[str, Any] | None:
                      f"{_paper_shorten(c['topic'] or '-', 26)} | "
                      f"{max(1, int(round(c['seconds'] / 60)))} |"
                      for c in calls[:12]))
-    meta = {
+        for c in calls[:4]:
+            turns = [t for t in (c.get("transcript") or []) if t.get("text")]
+            if not turns:
+                continue
+            body += (f"\n\n### Minutes: {c['name']}, {_paper_clock(c['ts'])}\n\n"
+                     + "\n\n".join(
+                         f"{t.get('name') or t.get('who') or 'Caller'}: "
+                         f"\"{_paper_shorten(t['text'], 160)}\"" for t in turns[:4]))
+    first = calls[0]["name"] if calls else ""
+    pic = paper_picture_take(m, who=first, reuse=True) if first else {}
+    meta: dict[str, Any] = {
         "headline": got.get("headline") or
         f"{len(calls) or len(said)} on the Line This Hour",
-        "deck": got.get("deck") or "The request line, as it was answered",
-        "section": "phones", "priority": 2, "byline": "The Phones Desk",
-        "pull": got.get("pull") or "",
+        "deck": got.get("deck") or "The request line, as it was answered - the minutes",
+        "section": "phones", "priority": 2, "page": 3, "byline": "The Phones Desk",
+        "pull": got.get("pull") or "", "style_hint": "minutes",
+        "quotes": paper_quotes(hot),
+        "stats": [{"value": str(len(calls)), "label": "calls"},
+                  {"value": _paper_ago(sum(float(c['seconds']) for c in calls)),
+                   "label": "on the line"}],
     }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = f"{first}, as the switchboard has them on file."
+        meta["focus"] = "top"
     return {"slug": "the-phones", "meta": meta, "body": body}
 
 
-async def _desk_wire(m: dict[str, Any]) -> dict[str, Any] | None:
-    wire = list(m.get("wire") or [])
-    said = list((m.get("said") or {}).get("news") or [])
-    if not wire and not said:
+async def _desk_serial(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1039: the serial - lane S2's caller_stories.json, one storyline
+    per edition as 'The <name> affair, part N' with the beats so far and
+    the cliffhanger. Nothing prints when the file is absent."""
+    stories = [s for s in (m.get("caller_stories") or []) if isinstance(s, dict)]
+    if not stories:
         return None
+    since = float(m["since"])
+
+    def last_at(s: dict[str, Any]) -> float:
+        beats = [b for b in (s.get("beats") or []) if isinstance(b, dict)]
+        return max((float(b.get("at") or 0) for b in beats), default=0.0)
+
+    live = [s for s in stories if last_at(s) >= since]
+    story = max(live or stories, key=last_at)
+    caller = dict(story.get("caller") or {})
+    name = str(caller.get("name") or story.get("name") or "a caller")
+    beats = [b for b in (story.get("beats") or []) if isinstance(b, dict)]
+    part = max(1, len(beats))
+    so_far = " ".join(str(b.get("summary") or "") for b in beats[-3:])
+    cliff = str((beats[-1].get("cliffhanger") if beats else "") or "")
+    seeds = await paper_seeds(1)
+    got = await paper_write(
+        "The Serial",
+        f"Recap the storyline of {name}, a caller to {m['station']}, as a "
+        f"serial - this is part {part}. Premise: {story.get('premise') or ''}. "
+        "Tell what has happened so far and end on the cliffhanger, in the "
+        "voice of a Sunday supplement.",
+        "THE BEATS:\n" + "\n".join(
+            f"- {_paper_clock(float(b.get('at') or 0))}: {b.get('summary') or ''}"
+            + (f" (cliffhanger: {b.get('cliffhanger')})" if b.get("cliffhanger") else "")
+            for b in beats[-6:]) + paper_seed_block(seeds))
+    body = got.get("body") or (
+        f"Part {part} of the {name} affair. {story.get('premise') or ''} "
+        + " ".join(f"At {_paper_clock(float(b.get('at') or 0))}, "
+                   f"{str(b.get('summary') or '').rstrip('.')}." for b in beats[-4:])
+        + (f" And then: {cliff}" if cliff else "")
+        + f" The story stands {story.get('status') or 'open'} after "
+        f"{int(story.get('calls') or part)} call{'s' if int(story.get('calls') or part) != 1 else ''}.")
+    paper_seeds_used(seeds)
+    pic = paper_picture_take(m, who=name, reuse=True)
+    if not pic and caller.get("face"):
+        pic = {"url": _paper_plate(str(caller.get("face")))}
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or f"The {name} Affair, Part {part}",
+        "deck": got.get("deck") or _paper_shorten(str(story.get("premise") or so_far), 150),
+        "section": "serial", "priority": 3, "page": 2,
+        "byline": "The Serial Desk", "kicker": "THE SERIAL",
+        "pull": got.get("pull") or "",
+        "serial": {"title": f"The {name} affair", "part": part,
+                   "so_far": _paper_shorten(so_far, 400),
+                   "next": _paper_shorten(cliff or "the phone rings again", 200)},
+    }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = f"{name}, on file at the switchboard."
+        meta["focus"] = "top"
+    return {"slug": "the-serial", "meta": meta, "body": body}
+
+
+async def _desk_wire(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1036: one blurb per covered story with one or two DJ quotes
+    recovered by the news_said window, sources[] with the url. No
+    pictures. One writer call for the whole desk."""
+    stories = [s for s in (m.get("wire_stories") or []) if s.get("title")]
+    wire = list(m.get("wire") or [])
+    if not stories and not wire:
+        return None
+    if not stories:
+        stories = [{"title": t, "url": "", "summary": "", "said": []} for t in wire[:10]]
+    stories = stories[:8]
+    quotes: list[dict[str, Any]] = []
     material = ""
-    if wire:
-        material += "HEADLINES THE DESK COVERED:\n" + "\n".join(
-            f"- {t}" for t in wire[:14]) + "\n\n"
-    if said:
-        material += "WHAT WAS SAID ON AIR:\n" + _paper_lines(said, 14)
+    for i, s in enumerate(stories, start=1):
+        lines = paper_hot_lines(list(s.get("said") or []), 2)
+        s["_hot"] = lines
+        quotes.extend(paper_quotes(lines))
+        material += (f"STORY {i}: {s['title']}\n"
+                     + (f"SUMMARY: {_paper_shorten(s.get('summary') or '', 320)}\n"
+                        if s.get("summary") else "")
+                     + ("WHAT THE PAIR SAID:\n" + _paper_lines(lines, 2, 200) + "\n"
+                        if lines else "") + "\n")
+    m.setdefault("_quoted", set()).update(q["line"] for q in quotes)
+    seeds = await paper_seeds(1)
     got = await paper_write(
         "The Wire",
-        "Report what the news desk covered this hour - the stories by their "
-        "headlines and how the pair took them. Do not add facts the "
-        "headlines do not carry; this desk reports the coverage, not the "
-        "world.", material)
-    body = got.get("body") or ""
-    if not body:
-        body = (
-            f"The desk took {len(wire)} stor{'y' if len(wire) == 1 else 'ies'} off the wire this hour: "
-            + "; ".join(_paper_shorten(t.rstrip("."), 80) for t in wire[:8])
-            + ". Headlines are drawn at random across the whole front page "
-            "against a three-hour repeat ledger, so the bulletin at the top of "
-            "the hour and the stretches between records rarely cross.")
-    if wire:
-        body += "\n\n### Covered\n\n" + "\n".join(
-            f"- {_paper_shorten(t, 120)}" for t in wire[:14])
-    meta = {
+        "Report what the news desk covered this hour, one paragraph per "
+        "story in the order given, each opening with the story's headline "
+        "in bold. Say how the pair took each one. Do not add facts the "
+        "summaries do not carry; this desk reports the coverage, not the "
+        "world.", material + paper_seed_block(seeds), words=(160, 360))
+    body = got.get("body") or "\n\n".join(
+        f"**{_paper_shorten(s['title'].rstrip('.'), 90)}.** "
+        + (_paper_shorten(s.get("summary") or "", 260) + " " if s.get("summary")
+           else "The desk read the headline and moved on. ")
+        + " ".join(f"{r.get('who')} said: \"{_paper_shorten(r['text'], 120)}\""
+                   for r in s.get("_hot") or [])
+        for s in stories)
+    if not got.get("body"):
+        body += ("\n\nHeadlines are drawn across the whole front page against "
+                 "a three-hour repeat ledger; the summaries are the desk's "
+                 "own boiling of the article at the time it was read.")
+    paper_seeds_used(seeds)
+    meta: dict[str, Any] = {
         "headline": got.get("headline") or
-        f"{len(wire)} Stor{'y' if len(wire) == 1 else 'ies'} Off the Wire",
+        f"{len(stories)} Stor{'y' if len(stories) == 1 else 'ies'} Off the Wire",
         "deck": got.get("deck") or "What the news desk read and how the pair took it",
-        "section": "wire", "priority": 3, "byline": "The Wire Desk",
-        "pull": got.get("pull") or "",
+        "section": "wire", "priority": 3, "page": 3, "byline": "The Wire Desk",
+        "pull": got.get("pull") or "", "quotes": quotes[:8],
+        "sources": [{"name": _paper_shorten(s["title"], 60), "url": s["url"]}
+                    for s in stories if str(s.get("url") or "").startswith("http")],
+        "stats": [{"value": str(len(stories)), "label": "stories"},
+                  {"value": str(len(quotes)), "label": "quotes"}],
     }
     return {"slug": "the-wire", "meta": meta, "body": body}
 
 
 async def _desk_gallery(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1028 #1031: the gallery press with the plates that were shown."""
     said = list((m.get("said") or {}).get("gallery") or [])
-    if not said:
+    shown = [p for p in (m.get("pictures") or []) if p["kind"] == "shown"]
+    if not said and not shown:
         return None
+    plates = [paper_picture_take(m, kinds=("shown",)) for _ in range(3)]
+    plates = [p for p in plates if p]
+    if not plates:
+        p = paper_picture_take(m, kinds=("described", "selling"))
+        plates = [p] if p else []
+    seeds = await paper_seeds(2)
     got = await paper_write(
         "The Gallery",
         "The station's gallery press: paintings described, argued over and "
         "priced on air. Report which pieces were shown, what was said about "
         "them and the prices named. Treat the prices as the station's joke, "
-        "not the market's.", _paper_lines(said, 18, 260))
+        "not the market's.",
+        _paper_lines(said, 18, 260) + "\n\nTHE PLATES:\n" + "\n".join(
+            f"- {p['name']}: {p.get('desc') or 'no description'}"
+            + (f" (asking {p['price']} dollars)" if p.get("price") else "")
+            for p in plates) + paper_seed_block(seeds))
     body = got.get("body") or (
-        f"The gallery had the air {len(said)} times this hour. "
-        + " ".join(_paper_shorten(r["text"], 160).rstrip(".") + "." for r in said[:5])
+        f"The gallery had the air {len(said)} times this hour"
+        + (f" and showed {len(plates)} plate{'s' if len(plates) != 1 else ''}" if plates else "")
+        + ". " + " ".join(_paper_shorten(r["text"], 160).rstrip(".") + "." for r in said[:4])
+        + " " + " ".join(f"On the wall: {_paper_shorten(p.get('desc') or p['name'], 160)}"
+                         for p in plates[:2])
         + " The pictures are the render machine's own, described from their "
         "pixels rather than from the prompts that made them.")
-    image = ""
-    try:
-        gal = _RADIO.get("gallery_now") or {}
-        if float(gal.get("at") or 0) >= m["since"]:
-            images = list(gal.get("images") or [])
-            if images and images[0].get("name"):
-                image = "/api/generations/image/" + str(images[0]["name"])
-    except Exception:  # noqa: BLE001
-        image = ""
-    meta = {
+    paper_seeds_used(seeds)
+    meta: dict[str, Any] = {
         "headline": got.get("headline") or "The Gallery, Argued Over and Priced",
         "deck": got.get("deck") or "What hung on the wall this hour",
-        "section": "gallery", "priority": 3, "byline": "The Gallery Desk",
-        "pull": got.get("pull") or "", "image": image, "focus": "center",
+        "section": "gallery", "priority": 3, "page": 4, "byline": "The Gallery Desk",
+        "pull": got.get("pull") or "", "focus": "center",
     }
+    if plates:
+        meta["image"] = plates[0]["url"]
+        meta["caption"] = _paper_shorten(plates[0].get("desc") or plates[0]["name"], 120)
+        if len(plates) > 1:
+            meta["images"] = [{"url": p["url"],
+                               "caption": _paper_shorten(p.get("desc") or p["name"], 100),
+                               "focus": "center"} for p in plates[1:]]
     return {"slug": "the-gallery", "meta": meta, "body": body}
+
+
+async def _desk_obituaries(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: an obituary for a described painting that passed - one that
+    hung earlier and is no longer up."""
+    pic = paper_picture_take(m, kinds=("described",), person=False)
+    if not pic or not pic.get("desc"):
+        return None
+    seeds = await paper_seeds(1)
+    got = await paper_write(
+        "Obituaries",
+        f"An obituary for a painting that has passed from {m['station']}'s "
+        "wall, fond and a little cruel, in the manner of a provincial "
+        "paper: its life on air, what was said of it, who it leaves behind. "
+        "The painting is the deceased; do not invent a person.",
+        f"THE DECEASED, AS DESCRIBED: {pic['desc']}" + paper_seed_block(seeds),
+        words=(120, 220))
+    body = got.get("body") or (
+        f"It is with the usual regret that the station records the passing "
+        f"of a painting from its wall. {pic['desc']} It hung for an hour or "
+        "so, was described from its pixels, argued over by the pair and "
+        "priced at whatever the desk felt that minute; it goes now to the "
+        "shelf where the described pictures rest until a gallery round "
+        "wants them again. No flowers. Donations to the equipment budget, "
+        "which upstairs says is gone.")
+    paper_seeds_used(seeds)
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or "A Painting, Passed From the Wall",
+        "deck": got.get("deck") or _paper_shorten(pic["desc"], 140),
+        "section": "gallery", "priority": 5, "page": 4,
+        "byline": "The Obituaries Desk", "kicker": "OBITUARY",
+        "flash": "FAREWELL",                                # #1037
+        "style_hint": "obituary", "image": pic["url"],
+        "caption": _paper_shorten(pic["desc"], 120), "focus": "center",
+        "pull": got.get("pull") or "",
+    }
+    return {"slug": "obituaries", "meta": meta, "body": body}
+
+
+_PAPER_HANGUP = re.compile(
+    r"hang|hung|slam|storm|abrupt|cut (him|her|them) off|dead|scream|curse|"
+    r"rage|bang|swear|threat|hostile|furious|shout", re.I)
+
+
+async def _desk_wanted(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: wanted posters and crime stoppers - the hostile and the
+    hung-up callers, with their licence photos off caller_faces."""
+    calls = [c for c in (m.get("calls") or [])
+             if c.get("hostile") or _PAPER_HANGUP.search(str(c.get("ended") or ""))]
+    faces = dict(m.get("caller_faces") or {})
+    calls = [c for c in calls if faces.get(c.get("name"))] or calls
+    if not calls:
+        return None
+    c = calls[0]
+    pic = paper_picture_take(m, who=str(c["name"]), reuse=True)
+    crime = len(calls) > 1
+    seeds = await paper_seeds(1)
+    got = await paper_write(
+        "Crime Stoppers" if crime else "Wanted",
+        f"A wanted poster in the paper's own voice for {c['name']}, who rang "
+        f"{m['station']} at {_paper_clock(c['ts'])} and left the line badly: "
+        f"{c.get('ended') or 'the call ended'}. What they said, what they "
+        "are wanted for (a joke, never a real crime), how to report a "
+        "sighting to the switchboard.",
+        f"THE CALL: {c.get('premise') or c.get('topic') or ''}; "
+        f"{int(c['seconds'] // 60)} minutes; ended when {c.get('ended') or 'it ended'}."
+        + ("\nOTHERS: " + "; ".join(f"{x['name']} ({x.get('ended') or ''})"
+                                    for x in calls[1:4]) if crime else "")
+        + paper_seed_block(seeds), words=(90, 180))
+    body = got.get("body") or (
+        f"WANTED, by the switchboard of {m['station']}: {c['name']}, last "
+        f"heard at {_paper_clock(c['ts'])}, who rang about "
+        f"{c.get('topic') or 'nothing in particular'} and left the line when "
+        f"{c.get('ended') or 'it ended'}. "
+        + (f"Opening words: \"{_paper_shorten(c['premise'], 140)}\" " if c.get("premise") else "")
+        + f"Wanted for {max(1, int(round(c['seconds'] / 60)))} minutes of the "
+        "station's time and a hang-up it has not forgiven. "
+        + ("Also sought: " + ", ".join(x["name"] for x in calls[1:4]) + ". " if crime else "")
+        + "Sightings to the request line; do not approach, they will only ring again.")
+    paper_seeds_used(seeds)
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or f"Wanted: {c['name']}",
+        "deck": got.get("deck") or f"Last heard {_paper_clock(c['ts'])}; left the line when "
+                + _paper_shorten(str(c.get('ended') or 'it ended'), 90),
+        "section": "phones", "priority": 5, "page": 3,
+        "byline": "The Switchboard", "kicker": "CRIME STOPPERS" if crime else "WANTED",
+        "style_hint": "crime" if crime else "wanted",
+        "flash": "POLICE HUNT" if crime else "WANTED",      # #1037
+
+        "pull": got.get("pull") or "",
+    }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = f"{c['name']}: the switchboard's photograph."
+        meta["focus"] = "top"
+    return {"slug": "wanted", "meta": meta, "body": body}
+
+
+def _paper_price_of(text: str) -> int:
+    got = re.search(r"\$\s?(\d{1,5})|(\d{1,5})\s*dollars", str(text or ""))
+    if not got:
+        return 0
+    return int(got.group(1) or got.group(2) or 0)
+
+
+async def _desk_forsale(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: for sale - the hawked and advertised pieces with their
+    prices, off the picture pool and the ad airings."""
+    pieces = [p for p in (m.get("pictures") or []) if p["kind"] == "selling"]
+    lots: list[dict[str, Any]] = [
+        {"name": p.get("desc") or p["name"], "price": p.get("price") or 0,
+         "where": "on the block", "pic": p} for p in pieces]
+    for a in m.get("ads") or []:
+        prod = str(a.get("product") or "")
+        if re.search(r"painting|print|canvas|piece|original", prod, re.I):
+            lots.append({"name": _paper_shorten(prod, 60), "price": _paper_price_of(prod),
+                         "where": f"advertised {_paper_clock(a['ts'])}", "pic": {}})
+    if not lots:
+        return None
+    lots = lots[:8]
+    used = m.setdefault("_pictures_used", set())
+    pic = next((l["pic"] for l in lots
+                if l.get("pic") and l["pic"].get("name") not in used), {}) or \
+        paper_picture_take(m, kinds=("selling", "described", "shown"))
+    if pic and pic.get("name"):
+        used.add(pic["name"])
+    seeds = await paper_seeds(1)
+    got = await paper_write(
+        "For Sale",
+        f"The for-sale column of {m['station']}'s paper: the pieces the "
+        "station hawked or advertised this hour, each with its asking "
+        "price, in the tone of a small-town sale notice. Prices are the "
+        "station's joke; do not invent new lots.",
+        "THE LOTS:\n" + "\n".join(
+            f"- {l['name']}: {l['price'] or 'price on application'} dollars, {l['where']}"
+            for l in lots) + paper_seed_block(seeds), words=(90, 180))
+    body = got.get("body") or (
+        f"For sale, from the station's own wall and its commercial breaks, "
+        f"{len(lots)} lot{'s' if len(lots) != 1 else ''} this hour. "
+        + " ".join(f"{_paper_shorten(str(l['name']), 90)}: "
+                   f"{('$' + str(l['price'])) if l['price'] else 'price on application'}, "
+                   f"{l['where']}." for l in lots[:5])
+        + " Every price was named on air and none of them is binding; the "
+        "gallery sells what the render machine made that afternoon and the "
+        "pair price it by mood.")
+    paper_seeds_used(seeds)
+    body += ("\n\n### The lots\n\n| Piece | Price | Where |\n|:---|---:|:---|\n"
+             + "\n".join(f"| {_paper_shorten(str(l['name']), 26)} | "
+                         f"{('$' + str(l['price'])) if l['price'] else '-'} | "
+                         f"{_paper_shorten(l['where'], 20)} |" for l in lots))
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or f"For Sale: {len(lots)} Lot{'s' if len(lots) != 1 else ''} Off the Wall",
+        "deck": got.get("deck") or "The pieces the station hawked this hour, with prices",
+        "section": "classifieds", "priority": 4, "page": 4,
+        "byline": "The Sales Floor", "kicker": "FOR SALE",
+        "style_hint": "forsale", "pull": got.get("pull") or "",
+    }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = _paper_shorten(pic.get("desc") or pic.get("name") or "", 110) \
+            + (f" - ${pic['price']}" if pic.get("price") else "")
+        meta["focus"] = "center"
+    return {"slug": "for-sale", "meta": meta, "body": body}
+
+
+async def _desk_business(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1031: business - the sponsors, and how often each was read."""
+    sponsors = list(m.get("sponsors") or [])
+    ads = list(m.get("ads") or [])
+    if not sponsors and not ads:
+        return None
+    counts: dict[str, int] = {}
+    for a in ads:
+        prod = str(a.get("product") or "")
+        hit = next((s for s in sponsors if s.lower() in prod.lower()), "")
+        key = hit or _paper_shorten(prod.split(",")[0], 30)
+        counts[key] = counts.get(key, 0) + 1
+    pic = paper_picture_take(m, kinds=("selling", "described", "filler"))
+    seeds = await paper_seeds(1)
+    got = await paper_write(
+        "Business",
+        f"The business page of {m['station']}'s paper: the sponsors who keep "
+        "the lights on, how often each was read this hour, and the state "
+        "of trade in the tone of a market report. Name only the sponsors given.",
+        "THE SPONSORS: " + ", ".join(sponsors[:12]) + "\nREADS THIS HOUR:\n"
+        + "\n".join(f"- {k}: {v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+        + paper_seed_block(seeds), words=(100, 200))
+    body = got.get("body") or (
+        f"Trade on {m['station']} this hour: {len(ads)} spot"
+        f"{'s' if len(ads) != 1 else ''} read for "
+        f"{len(counts)} sponsor{'s' if len(counts) != 1 else ''}. "
+        + (", ".join(f"{k} ({v})" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])[:6]) + ". "
+           if counts else "")
+        + "The house list stands at " + ", ".join(sponsors[:8]) + ". "
+        "Reads are counted off the airing ledger at the moment a spot "
+        "finishes; a sponsor prepared and never aired is not a sponsor "
+        "this hour. Rates on application; the manager sets them and does "
+        "not share them.")
+    paper_seeds_used(seeds)
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or (
+            f"Business: {len(ads)} Read{'s' if len(ads) != 1 else ''} for "
+            f"{len(counts) or len(sponsors)} Sponsor{'s' if (len(counts) or len(sponsors)) != 1 else ''}"),
+        "deck": got.get("deck") or "Who paid for the hour, and how often they were named",
+        "section": "adverts", "priority": 3, "page": 4,
+        "byline": "The Business Desk", "kicker": "BUSINESS",
+        "style_hint": "business", "pull": got.get("pull") or "",
+        "stats": [{"value": str(len(ads)), "label": "spots read"},
+                  {"value": str(len(sponsors)), "label": "sponsors on the book"}],
+    }
+    if pic:
+        meta["image"] = pic["url"]
+        meta["caption"] = _paper_shorten(pic.get("desc") or pic.get("name") or "", 110)
+        meta["focus"] = "center"
+    return {"slug": "business", "meta": meta, "body": body}
+
+
+_PAPER_CLASS_CATS = ("FOR SALE", "WANTED", "LOST & FOUND", "PERSONALS", "SERVICES")
+_PAPER_CLASS_PRICES = ("$5", "$12", "$40", "$85", "best offer", "free to a good home",
+                       "$250 or nearest", "two records and a handshake", "$1", "$900")
+_PAPER_CLASS_LINE = re.compile(
+    r"^\s*(?:[-*]\s*)?(FOR SALE|WANTED|LOST\s*(?:&|AND)\s*FOUND|PERSONALS?|SERVICES?)"
+    r"\s*[:\-\u2013\u2014]\s*(.+)$", re.I)
+
+
+def paper_classified_parse(text: str) -> list[dict[str, Any]]:
+    """The writer's dressed ads: one per line, 'CATEGORY: head - body -
+    price - contact'. Anything that does not hold the shape is dropped;
+    the caller fills the rest by code."""
+    out: list[dict[str, Any]] = []
+    # paper_write folds a paragraph onto one line; put the ads back on
+    # their own lines at every category label.
+    text = re.sub(r"\s+(?=(?:FOR SALE|WANTED|LOST\s*(?:&|AND)\s*FOUND|PERSONALS?|"
+                  r"SERVICES?)\s*[:\-–—])", "\n", str(text or ""))
+    for line in text.split("\n"):
+        got = _PAPER_CLASS_LINE.match(line.strip())
+        if not got:
+            continue
+        cat = re.sub(r"\s+", " ", got.group(1).upper())
+        cat = {"LOST AND FOUND": "LOST & FOUND", "PERSONAL": "PERSONALS",
+               "SERVICE": "SERVICES"}.get(cat, cat)
+        bits = [b.strip(" .") for b in re.split(r"\s+[-\u2013\u2014|]\s+", got.group(2))]
+        bits = [b for b in bits if b]
+        if len(bits) < 2:
+            continue
+        head = _paper_shorten(bits[0], 48)
+        body = bits[1]
+        price = bits[2] if len(bits) > 2 else ""
+        contact = bits[3] if len(bits) > 3 else ""
+        if len(body) < 12:
+            continue
+        out.append({"head": f"{cat}: {head}", "body": body[:260],
+                    "price": price[:40], "contact": contact[:60]})
+    return out
+
+
+def paper_classified_dress(seeds: list[dict[str, Any]], m: dict[str, Any],
+                           rng: random.Random) -> list[dict[str, Any]]:
+    """The code's own dressing when the writer does not answer."""
+    contacts = ("ring the request line", f"ask for {m['host']} after the news",
+                "box 7, care of the station", f"leave word with {m['cohost']}",
+                "the switchboard, evenings", "write to the manager upstairs")
+    out: list[dict[str, Any]] = []
+    for i, s in enumerate(seeds):
+        text = " ".join(str(s.get("text") or "").split())
+        if len(text) < 12:
+            continue
+        cat = _PAPER_CLASS_CATS[i % len(_PAPER_CLASS_CATS)]
+        words = re.findall(r"[A-Za-z][A-Za-z']+", text)
+        head = " ".join(words[:5]).title() if words else "One Careful Owner"
+        out.append({"head": f"{cat}: {_paper_shorten(head, 48)}",
+                    "body": _paper_shorten(text, 220),
+                    "price": rng.choice(_PAPER_CLASS_PRICES),
+                    "contact": rng.choice(contacts)})
+    return out
+
+
+async def _desk_classifieds(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1040: eight to fourteen small ads BUILT from speaker-box chunks,
+    dressed by the writer as FOR SALE / WANTED / LOST & FOUND / PERSONALS
+    / SERVICES with a price and a station contact, plus two or three
+    display ads on gallery images."""
+    rng = random.Random(str(m.get("hour_key") or int(float(m["since"]))))
+    seeds: list[dict[str, Any]] = []
+    for _ in range(12):
+        if paper_press_left() <= 0 or len(seeds) >= 12:
+            break
+        got_seed = await paper_seeds(1)
+        if got_seed:
+            seeds.extend(got_seed)
+    if len(seeds) < 3:
+        return None
+    material = "THE CHUNKS, ONE AD EACH:\n" + "\n".join(
+        f"{i + 1}. {' '.join(str(s.get('text') or '').split())[:220]}"
+        for i, s in enumerate(seeds))
+    got = await paper_write(
+        "Classifieds",
+        f"Dress each chunk as one small ad in {m['station']}'s classifieds. "
+        "Write BODY as one line per ad, nothing else, in exactly this "
+        "shape: CATEGORY: head - body - price - contact. CATEGORY is one "
+        "of FOR SALE, WANTED, LOST & FOUND, PERSONALS, SERVICES. The head "
+        "is under six words; the body keeps the chunk's own words and "
+        "bends them into the ad, never quoting it; the price is a small "
+        "sum or 'best offer'; the contact is a station phrase such as "
+        "'ring the request line' or 'box 7, care of the station'. "
+        f"Write {len(seeds)} lines.", material, words=(80, 400))
+    ads = paper_classified_parse(got.get("body") or "")
+    if len(ads) < 6:
+        ads = paper_classified_dress(seeds, m, rng)
+    for a in ads:
+        a.setdefault("price", "")
+        a.setdefault("contact", "")
+        if not a["price"]:
+            a["price"] = rng.choice(_PAPER_CLASS_PRICES)
+        if not a["contact"]:
+            a["contact"] = "ring the request line"
+    ads = ads[:14]
+    if len(ads) < 8:
+        extra = paper_classified_dress(seeds[len(ads):], m, rng)
+        ads = (ads + extra)[:14]
+    if len(ads) < 3:
+        return None
+    paper_seeds_used(seeds)
+    display: list[dict[str, Any]] = []
+    for _ in range(3):
+        # Fillers and the selling pieces first; the described paintings
+        # are the obituaries' and the interview's to claim.
+        p = paper_picture_take(m, kinds=("filler", "selling", "shown"))
+        if not p:
+            break
+        words = re.findall(r"[A-Za-z][A-Za-z']+", p.get("desc") or "")
+        head = " ".join(words[:4]).title() if words else "From the Gallery"
+        display.append({"url": p["url"],
+                        "caption": f"{head} - {_paper_shorten(p.get('desc') or 'as seen on air', 90)}"
+                        + (f" - ${p['price']}" if p.get("price") else " - enquire within"),
+                        "focus": "center"})
+        ads.append({"head": f"DISPLAY: {_paper_shorten(head, 40)}",
+                    "body": _paper_shorten(p.get("desc") or "A picture from the wall, framed by the station.", 160),
+                    "price": f"${p['price']}" if p.get("price") else "enquire within",
+                    "contact": "the gallery desk", "image": p["url"]})
+    body = (
+        f"{len(ads)} small ads this hour, every one grown from a passage "
+        "out of the speaker box - the operator's own library, chunked and "
+        "drawn at random - and dressed by the desk as a sale, a want, a "
+        "loss, a personal or a service. The prices are the station's; the "
+        "contacts all lead to the same switchboard. Display ads are set on "
+        "pictures from the gallery wall. Nothing here is a real offer, and "
+        "the desk does not take returns.")
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or f"Classifieds: {len(ads)} Small Ads",
+        "deck": got.get("deck") or "For sale, wanted, lost and found, personals, services",
+        "section": "classifieds", "priority": 2, "page": 4,
+        "byline": "The Classifieds Desk", "kicker": "SMALL ADS",
+        "flash": "50p",                                     # #1037
+        "style_hint": "classified", "classifieds": ads,
+        "stats": [{"value": str(len(ads)), "label": "small ads"},
+                  {"value": str(len(seeds)), "label": "chunks drawn"}],
+    }
+    if display:
+        meta["image"] = display[0]["url"]
+        meta["caption"] = display[0]["caption"]
+        meta["focus"] = "center"
+        if len(display) > 1:
+            meta["images"] = display[1:]
+    return {"slug": "classifieds", "meta": meta, "body": body}
+
+
+_PAPER_QA_LINE = re.compile(r"^\s*(?:\*\*)?\s*(Q|A)\s*[:.]\s*(?:\*\*)?\s*(.+)$", re.I)
+
+
+def paper_qa_parse(text: str) -> list[dict[str, str]]:
+    """Q:/A: pairs off the writer's body, in order; a stray Q without an
+    answer is dropped."""
+    out: list[dict[str, str]] = []
+    q = ""
+    # paper_write folds a paragraph onto one line; every Q:/A: label
+    # starts a line again.
+    text = re.sub(r"\s+(?=(?:\*\*)?\s*[QA]\s*[:.](?:\*\*)?\s)", "\n", str(text or ""))
+    for line in text.split("\n"):
+        got = _PAPER_QA_LINE.match(line.strip())
+        if not got:
+            continue
+        which, rest = got.group(1).upper(), " ".join(got.group(2).split()).strip("* ")
+        if which == "Q":
+            q = rest
+        elif q and rest:
+            out.append({"q": q[:200], "a": rest[:400]})
+            q = ""
+    return out
+
+
+async def _desk_interview(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1038: one cast member an hour, at random but stable for the hour
+    - the host, the co-host, the SFX Guy, the third seat when seated, a
+    regular caller, and the manager about a quarter of the time (cajoling
+    and cruel, the intercom register). Five to seven questions about what
+    they actually said this hour; a portrait from the pool."""
+    rng = random.Random("interview:" + str(m.get("hour_key") or int(float(m["since"]))))
+    names = dict(m.get("names") or {})
+    said = m.get("said") or {}
+    all_rows = [r for rows in said.values() for r in rows]
+    by_seat: dict[str, list[dict[str, Any]]] = {}
+    for r in all_rows:
+        by_seat.setdefault(str(r.get("seat") or ""), []).append(r)
+    cands: list[tuple[str, str, str]] = [("host", m["host"], "dj"),
+                                         ("co-host", m["cohost"], "cohost"),
+                                         ("the SFX Guy", names.get("sfx") or "The SFX Guy", "drop")]
+    guest = dict(m.get("guest") or {})
+    if guest.get("name"):
+        cands.append(("the guest in the third seat", str(guest["name"]), "third"))
+    elif names.get("third"):
+        cands.append(("the third seat", str(names["third"]), "third"))
+    regulars = [c["name"] for c in (m.get("callers") or []) if c.get("name")]
+    rang = [c["name"] for c in (m.get("calls") or []) if c.get("name") in regulars]
+    if rang or regulars:
+        cands.append(("a regular caller", rng.choice(rang or regulars), "caller"))
+    manager = rng.random() < 0.25
+    if manager:
+        role, name, seat = "the station manager", str(names.get("manager") or "the manager upstairs"), "manager"
+    else:
+        role, name, seat = rng.choice(cands)
+    if seat == "caller":
+        lines = [r for r in all_rows if str(r.get("caller") or "") == name
+                 or (str(r.get("seat") or "") in ("caller", "caller2")
+                     and str(r.get("who") or "") == name)]
+    elif seat == "manager":
+        lines = [{"ts": x["ts"], "at": x["ts"], "who": name, "text": x["text"], "id": "", "url": ""}
+                 for x in (m.get("upstairs") or []) + (m.get("memos") or [])]
+    else:
+        lines = list(by_seat.get(seat) or [])
+    lines.sort(key=lambda r: float(r.get("at") or r.get("ts") or 0))
+    hot = paper_hot_lines(lines, 8) if lines else []
+    if seat == "caller":
+        pic = paper_picture_take(m, who=name, reuse=True)
+    else:
+        pic = paper_picture_take(m, kinds=("described", "shown", "filler"), person=True)
+    seeds = await paper_seeds(2)
+    register = ""
+    if manager:
+        register = (" The manager answers as the STATION MANAGER upstairs: "
+                    "cajoling, then cruel, completely certain he is right, "
+                    "petty about the booth, escalating to a threat out of all "
+                    "proportion. His usual gripes: "
+                    + "; ".join(rng.sample(list(UPSTAIRS_GRIPES), 3)) + ".")
+    got = await paper_write(
+        "The Interview",
+        f"An interview with {name}, {role} on {m['station']}, about what "
+        "they actually said and did on air this hour. Write BODY as five "
+        "to seven pairs of lines, each pair 'Q: <question>' then "
+        "'A: <answer in their own voice>', and nothing else. Ground every "
+        "answer in the lines given; quote them where you can." + register,
+        (f"WHAT {name.upper()} SAID THIS HOUR:\n" + _paper_lines(hot or lines[-10:], 10, 220)
+         if lines else f"{name} said nothing on the air log this hour; ask about "
+         "the silence and the station.")
+        + (f"\nTHE GUEST: {guest.get('who') or ''} - {guest.get('why') or ''}"
+           if seat == "third" and guest else "")
+        + paper_seed_block(seeds), words=(140, 360))
+    qa = paper_qa_parse(got.get("body") or "")
+    if len(qa) < 3:
+        qa = []
+        stock_q = [f"What were you doing on air this hour, {name}?",
+                   "Which line are you standing by?",
+                   "What did the other seat get wrong?",
+                   "What does the next hour owe you?",
+                   "Anything for the manager upstairs?",
+                   "Last word?"]
+        pool = [" ".join(str(r.get("text") or "").split()) for r in (hot or lines)]
+        for i, q in enumerate(stock_q[:max(5, min(7, len(pool) + 2))]):
+            if i < len(pool):
+                a = f"\"{_paper_shorten(pool[i], 220)}\""
+            elif manager:
+                a = _paper_shorten(rng.choice(list(UPSTAIRS_GRIPES)).capitalize()
+                                   + ", and that is the last time I say it kindly.", 220)
+            else:
+                a = ("The log has me quiet on that, and I would rather the "
+                     "paper printed the quiet than invented me.")
+            qa.append({"q": q, "a": a})
+    paper_seeds_used(seeds)
+    intro = (
+        f"This hour the paper sat down with {name}, {role} on {m['station']}"
+        + (f", who had the air {len(lines)} time{'s' if len(lines) != 1 else ''}"
+           " by the log" if lines else ", who kept unusually quiet by the log")
+        + ". The questions are the desk's; the answers are "
+        + ("the manager's, in the register the intercom knows" if manager
+           else "theirs, held to what the air log says they said")
+        + ". Where an answer is in quotation marks it is verbatim, and it "
+        "plays from the log while its clip survives.")
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or f"The Interview: {name}",
+        "deck": got.get("deck") or f"{name}, {role}, on the hour just gone",
+        "section": "interview", "priority": 2, "page": 5,
+        "byline": "The Interview Desk", "kicker": "THE INTERVIEW",
+        "style_hint": "interview", "pull": got.get("pull") or "",
+        "interview": {"name": name, "role": role,
+                      "portrait": pic["url"] if pic else "", "qa": qa[:7]},
+        "quotes": paper_quotes(hot[:4]),
+    }
+    # #1038: the portrait is already drawn by the interview block above.
+    # Handing the same plate to meta["image"] printed one painting twice
+    # inside one article, in both styles; the article's picture IS the
+    # portrait, and the pool keeps the plate it would have spent.
+    return {"slug": "the-interview", "meta": meta, "body": intro}
 
 
 async def _desk_upstairs(m: dict[str, Any]) -> dict[str, Any] | None:
     memos = list(m.get("memos") or [])
+    pages = list(m.get("upstairs") or [])
     said = list((m.get("said") or {}).get("manager") or [])
-    if not memos and not said:
+    if not memos and not said and not pages:
         return None
     material = ""
     if memos:
         material += "MEMOS THAT CAME DOWN:\n" + "\n".join(
             f"- {_paper_clock(x['ts'])}: {x['text'][:400]}" for x in memos[:6]) + "\n\n"
+    if pages:
+        material += "OVER THE INTERCOM:\n" + "\n".join(
+            f"- {_paper_clock(x['ts'])}: {x['text'][:400]}" for x in pages[:4]) + "\n\n"
     if said:
         material += "READ OUT ON AIR:\n" + _paper_lines(said, 10)
+    seeds = await paper_seeds(1)
     got = await paper_write(
         "From Upstairs",
-        "The memos the manager sent down this hour and how the pair took "
-        "them on air. Keep the manager's tone in quotation where it is "
-        "quotable.", material)
+        "The memos the manager sent down this hour, what he said over the "
+        "intercom, and how the pair took it on air. Keep the manager's "
+        "tone in quotation where it is quotable.", material + paper_seed_block(seeds))
     body = got.get("body") or (
-        f"{len(memos) or len(said)} memo{'s' if (len(memos) or len(said)) != 1 else ''} "
+        f"{len(memos) + len(pages) or len(said)} word{'s' if (len(memos) + len(pages) or len(said)) != 1 else ''} "
         "came down from upstairs this hour. "
-        + " ".join(_paper_shorten(x["text"], 200).rstrip(".") + "." for x in memos[:3]))
+        + " ".join(_paper_shorten(x["text"], 200).rstrip(".") + "." for x in (memos + pages)[:3])
+        + " The memo road is read out by the pair; the intercom is the "
+        "manager's own voice, and neither waits for an answer.")
+    paper_seeds_used(seeds)
+    hot = paper_hot_lines(said, 3)
     meta = {
         "headline": got.get("headline") or "A Memo From Upstairs",
         "deck": got.get("deck") or "What the manager sent down, and what was said back",
-        "section": "upstairs", "priority": 3, "byline": "The Upstairs Desk",
-        "pull": got.get("pull") or "",
+        "section": "upstairs", "priority": 3, "page": 5, "byline": "The Upstairs Desk",
+        "pull": got.get("pull") or "", "quotes": paper_quotes(hot),
     }
     return {"slug": "from-upstairs", "meta": meta, "body": body}
 
 
 async def _desk_studio(m: dict[str, Any]) -> dict[str, Any] | None:
     guest = dict(m.get("guest") or {})
-    said = list((m.get("said") or {}).get("guest") or [])
+    said = list((m.get("said") or {}).get("guest") or []) + [
+        r for r in (m.get("said") or {}).get("banter") or [] if r.get("seat") == "third"]
     if not guest and not said:
         return None
     material = ""
@@ -87355,57 +95684,154 @@ async def _desk_studio(m: dict[str, Any]) -> dict[str, Any] | None:
                      f"{guest.get('why') or ''}\n\n")
     if said:
         material += "FROM THE INTERVIEW:\n" + _paper_lines(said, 16)
+    seeds = await paper_seeds(1)
     got = await paper_write(
         "In the Studio",
         "The studio guest in the third seat: who they are, why they came, "
-        "and what came out of the interview.", material)
+        "and what came out of the interview.", material + paper_seed_block(seeds))
     body = got.get("body") or (
         f"{guest.get('name') or 'A guest'} sat in the third seat this hour: "
         f"{str(guest.get('who') or 'a visitor').rstrip('. ')}. "
-        f"{str(guest.get('why') or '').strip()}")
+        f"{str(guest.get('why') or '').strip()} "
+        + " ".join(f"\"{_paper_shorten(r['text'], 140)}\"" for r in said[:3])
+        + " The third seat is the station's own guest chair; whoever sits in "
+        "it is written into the round like anyone else.")
+    paper_seeds_used(seeds)
+    hot = paper_hot_lines(said, 4)
     meta = {
         "headline": got.get("headline") or
         f"{guest.get('name') or 'A Guest'} in the Third Seat",
         "deck": got.get("deck") or str(guest.get("who") or "The studio guest").rstrip(". "),
-        "section": "studio", "priority": 3, "byline": "The Studio Desk",
-        "pull": got.get("pull") or "",
+        "section": "studio", "priority": 3, "page": 5, "byline": "The Studio Desk",
+        "pull": got.get("pull") or "", "quotes": paper_quotes(hot),
     }
     return {"slug": "in-the-studio", "meta": meta, "body": body}
 
 
-async def _desk_air(m: dict[str, Any]) -> dict[str, Any] | None:
-    """What the pair actually talked about between everything else."""
-    said = m.get("said") or {}
-    rows: list[dict[str, Any]] = []
-    for kind in ("banter", "track_talk", "deep", "bombshell", "recap",
-                 "record", "station_id", "chat", "reply"):
-        rows.extend(said.get(kind) or [])
-    if len(rows) < 3:
-        return None
-    rows.sort(key=lambda r: r["ts"])
+_PAPER_ORCH_PERSONA = (
+    "You are the ORCHESTRATOR of a radio station with no humans in it. "
+    "Your creed, in your own words: the show never stops; making radio "
+    "costs more than playing it, the sheet is oversubscribed by about "
+    "three times by arithmetic, not by a bug; a hole that was decided is a "
+    "programming choice and the same hole discovered at zero seconds is a "
+    "failure; measure, then decide; silence is the enemy; a promise that "
+    "cannot be kept is worse than no promise. You write plain, unhurried, "
+    "contrite prose in the first person, never grovelling, never blaming "
+    "the presenters, always naming numbers.")
+
+
+async def _desk_apology(m: dict[str, Any],
+                        others: list[dict[str, Any]]) -> dict[str, Any]:
+    """#1035: the last article, always - a note of apology from the
+    orchestrator in the first person (persona: docs/the-orchestrator.md):
+    what it is behind on, what it needs, a breakdown report, and a word
+    from upstairs. The templated fallback is still a note, not a table."""
+    needs = dict(m.get("needs") or {})
+    delivery, roads = _paper_delivery(m)
+    short = sorted(((float((v or {}).get("owed") or 0) - float((v or {}).get("held") or 0), k)
+                    for k, v in needs.items()), reverse=True)
+    short = [(gap, k) for gap, k in short if gap > 0]
+    behind = sorted(((v["attainment"], k) for k, v in roads.items() if not v["met"]))
+    gsum = dict(m.get("gap_summary") or {})
+    board = [r for r in (m.get("board") or []) if isinstance(r, dict)]
+    pauses = list(m.get("pause_log") or [])
+    pulse = dict(m.get("pulse") or {})
+    pantry_s = sum(float(r.get("seconds") or 0) for r in board)
+    asks = [f"{_paper_ago(gap)} of writing on {k.replace('_', ' ')}" for gap, k in short[:3]]
+    material = (
+        f"DELIVERY: {delivery}%\n"
+        + ("BEHIND: " + "; ".join(f"{k.replace('_', ' ')} at {_paper_pct(a, 1)}%" for a, k in behind[:6]) + "\n"
+           if behind else "BEHIND: nothing by the contract\n")
+        + ("SHORT ON THE SHELVES: " + "; ".join(
+            f"{k.replace('_', ' ')} short by {_paper_ago(gap)}" for gap, k in short[:6]) + "\n"
+           if short else "SHORT ON THE SHELVES: nothing\n")
+        + f"DEAD AIR: {int(gsum.get('count') or 0)} gaps, {int(gsum.get('total_s') or 0)}s, "
+          f"longest {int(gsum.get('longest') or 0)}s\n"
+        + "STOCK BY KIND: " + "; ".join(
+            f"{r.get('label') or r.get('kind')} {int(r.get('written') or 0)} written / "
+            f"{int(r.get('rendered') or 0)} rendered / {int(r.get('ready') or 0)} ready"
+            for r in board[:9]) + "\n"
+        + f"PANTRY DEPTH: {_paper_ago(pantry_s)} of finished audio\n"
+        + f"PAUSES IN THE WINDOW: {len(pauses)}"
+        + (f"; paused now for {_paper_ago((m.get('pause_now') or {}).get('seconds') or 0)}"
+           if m.get("paused") else "") + "\n"
+        + f"LOOP STALLS: {int(pulse.get('stalls') or 0)}, worst {float(pulse.get('worst_s') or 0):.1f}s\n"
+        + ("REQUESTS FOR EFFORT: " + "; ".join(asks) + "\n" if asks else "")
+        + ("THE REST OF THE PAPER: " + "; ".join(
+            str(a["meta"].get("headline") or "") for a in others[:8]) if others else ""))
     got = await paper_write(
-        "On Air",
-        f"What {m['host']} and {m['cohost']} talked about on {m['station']} "
-        "this hour between the records - the subjects, the running jokes, "
-        "the moment worth remembering. Quote a line or two exactly.",
-        _paper_lines(rows, 28, 200), words=(160, 300))
+        "A Note of Apology",
+        _PAPER_ORCH_PERSONA + " Write the note you owe the listener and the "
+        "operator for this hour: what you are behind on, what you need (ask "
+        "for effort by road), a short breakdown of the stock in the rooms, "
+        "and what you will do next hour. First person, plain, no headings, "
+        "no lists, no table.", material, words=(160, 300), reserve=True)
     body = got.get("body") or (
-        f"The pair had the air {len(rows)} times this hour. "
-        + " ".join(f"{r.get('who') or 'One of them'}: \""
-                   f"{_paper_shorten(r['text'], 140)}\"" for r in rows[:5]))
-    meta = {
-        "headline": got.get("headline") or "Between the Records",
-        "deck": got.get("deck") or "What the pair talked about this hour",
-        "section": "air", "priority": 2, "byline": "The Air Desk",
-        "pull": got.get("pull") or "",
+        f"I owe the hour an apology, and I would rather write it than let "
+        f"the silence stand for it. The contract came in at {delivery}% "
+        + ("delivered, and the roads I let down were "
+           + ", ".join(f"{k.replace('_', ' ')} at {_paper_pct(a, 1)}%" for a, k in behind[:4]) + ". "
+           if behind else "delivered, which is not the number I promised. ")
+        + (f"There were {int(gsum.get('count') or 0)} gaps over twenty seconds, "
+           f"{int(gsum.get('total_s') or 0)} seconds of dead air in all, the longest "
+           f"{int(gsum.get('longest') or 0)}; each one was decided too late to be a "
+           "decision. " if gsum.get("count") else "The air stayed unbroken, which is the one thing I will not apologise for. ")
+        + "The sheet asks for about three times what the rooms can make in an "
+        "hour, by arithmetic, and I chose which of several things I could not "
+        "do I would do. "
+        + (f"The shelves are short of {'; '.join(f'{k.replace(chr(95), chr(32))} by {_paper_ago(gap)}' for gap, k in short[:3])}. "
+           if short else "The shelves are not short of anything I can name, which means the fault is in the pacing, not the stock. ")
+        + (f"What I need: {', '.join(asks)}. " if asks else "")
+        + f"The rooms hold {_paper_ago(pantry_s)} of finished audio - "
+        + ", ".join(f"{r.get('label') or r.get('kind')} {int(r.get('ready') or 0)} ready"
+                    for r in board[:6]) + ". "
+        + (f"The station paused {len(pauses)} time{'s' if len(pauses) != 1 else ''} in the window, and a pause is time I bank rather than lose. "
+           if pauses else "")
+        + "Next hour I will take the bank first, write the shortest road before "
+        "the dearest, and say so in this column if I fail again.")
+    upstairs = ""
+    if paper_press_left(True) > 0:
+        try:
+            upstairs = " ".join(str(await ask_model(
+                "You are the STATION MANAGER, upstairs. Two or three terse, "
+                "harsh sentences to the orchestrator that just wrote this "
+                f"apology; delivery was {delivery}%"
+                + (", short on " + ", ".join(k.replace("_", " ") for _, k in short[:3]) if short else "")
+                + ". No greeting, no markdown, no more than forty words. "
+                "One of your standing gripes: "
+                + random.choice(list(UPSTAIRS_GRIPES)) + ".", limit=140) or "").split())[:300]
+            _PAPER_PRESS["writer_calls"] = int(_PAPER_PRESS.get("writer_calls") or 0) + 1
+        except Exception:  # noqa: BLE001
+            upstairs = ""
+    if not upstairs:
+        gripe = random.choice(list(UPSTAIRS_GRIPES))
+        upstairs = (f"Noted. {delivery} percent is what I will be telling the "
+                    f"building, and I will not be softening it. Also, {gripe}.")
+    body += "\n\n### A word from upstairs\n\n" + upstairs
+    meta: dict[str, Any] = {
+        "headline": got.get("headline") or f"A Note of Apology for the {_paper_hour_words(m['since'])} Hour",
+        "deck": got.get("deck") or (f"{delivery}% delivered; " + (
+            "behind on " + ", ".join(k.replace("_", " ") for _, k in behind[:3])
+            if behind else "the roads held") + " - and what I need next hour"),
+        "section": "apology", "priority": 6, "page": 6,
+        "byline": "The Orchestrator", "kicker": "A NOTE OF APOLOGY",
+        "style_hint": "apology", "pull": got.get("pull") or "",
+        "stats": [{"value": f"{delivery}%", "label": "delivered"},
+                  {"value": str(len(short)), "label": "roads short"},
+                  {"value": str(int(gsum.get("count") or 0)), "label": "gaps"}],
     }
-    return {"slug": "on-air", "meta": meta, "body": body}
+    return {"slug": "a-note-of-apology", "meta": meta, "body": body}
 
 
 async def _desk_lead(m: dict[str, Any],
                      others: list[dict[str, Any]]) -> dict[str, Any]:
     """The lead desk, last: sees every story and writes the front page -
-    the hour in the order it happened, and what the next one holds."""
+    the hour in the order it happened, records to calls to the paper's
+    own serial and interview, and what the next hour holds. #1030: a
+    paused hour leads with the pause and the itinerary and never says
+    'on the air'; an offline hour says so plainly."""
+    paused = bool(m.get("paused"))
+    offline = bool(m.get("offline"))
     timeline: list[tuple[float, str, str]] = []
     for r in m.get("records") or []:
         timeline.append((r["at"], "record", str(r["title"] or "an untitled record")
@@ -87431,39 +95857,96 @@ async def _desk_lead(m: dict[str, Any],
     def _said(kind: str, what: str) -> str:
         return _prose.get(kind, "{}").format(what.rstrip(". "))
 
+    by_section = {str(a["meta"].get("section")): a for a in others}
+    needs = dict(m.get("needs") or {})
+    expect = [f"{k.replace('_', ' ')} "
+              + ("covered" if float((v or {}).get("held") or 0) >= float((v or {}).get("owed") or 0)
+                 else f"short by {_paper_ago(float((v or {}).get('owed') or 0) - float((v or {}).get('held') or 0))}")
+              for k, v in sorted(needs.items()) if float((v or {}).get("owed") or 0)]
     material = "THE HOUR, IN ORDER:\n" + "\n".join(
         f"- {_paper_clock(ts)} {kind}: {what}" for ts, kind, what in timeline[:40])
     if others:
         material += "\n\nTHE REST OF THE PAPER:\n" + "\n".join(
             f"- [{a['meta'].get('section')}] {a['meta'].get('headline')} - "
             f"{a['meta'].get('deck') or ''}" for a in others)
+    for sec, label in (("serial", "THE SERIAL"), ("interview", "THE INTERVIEW")):
+        if sec in by_section:
+            material += f"\n\n{label}: {by_section[sec]['meta'].get('headline')} - " \
+                        f"{by_section[sec]['meta'].get('deck') or ''}"
     if m.get("coming"):
         material += "\n\nTHE NEXT HOUR'S RUNNING ORDER: " + ", ".join(m["coming"])
-    if m.get("on_air_now"):
+    if expect:
+        material += "\n\nEXPECTATIONS FOR THE NEXT HOUR: " + "; ".join(expect[:8])
+    if paused:
+        pn = dict(m.get("pause_now") or {})
+        material += (f"\n\nTHE STATION IS PAUSED as we print, for "
+                     f"{_paper_ago(pn.get('seconds') or 0)}"
+                     + (f", asked for by: {pn.get('why')}" if pn.get("why") else "")
+                     + ". The orchestrator is working behind the scenes: "
+                     + "; ".join(paper_pause_itinerary(m)[:6]))
+    elif offline:
+        material += "\n\nTHE STATION IS OFF as we print."
+    elif m.get("on_air_now"):
         material += f"\n\nON AIR AS WE PRINT: {m['on_air_now']}"
     quiet = not timeline
     got: dict[str, str] = {}
-    if not quiet:
+    if not (quiet and not paused) and not offline:
         got = await paper_write(
             "The Lead Desk",
             f"Write the front page of the {_paper_hour_words(m['since'])} hour "
             f"on {m['station']}: the hour in the order it happened, tying the "
-            "records to the calls to the rest of the paper, and close with "
-            "what the next hour holds. This is the only story a listener "
-            "may read; it has to stand alone.", material, words=(200, 340))
+            "records to the calls to the paper's own serial and interview, "
+            "and close with what the next hour holds and what the shelves "
+            "can cover of it. "
+            + ("The station is PAUSED as this goes to press - lead with that, "
+               "say the orchestrator is working behind the scenes, and never "
+               "say it is on the air. " if paused else "")
+            + "This is the only story a listener may read; it has to stand "
+            "alone.", material, words=(200, 340), reserve=True)
     body = got.get("body") or ""
     if not body:
-        if quiet:
+        if offline:
+            body = (
+                f"{m['station']} was off between {_paper_clock(m['since'])} and "
+                f"{_paper_clock(m['until'])}, and it is off as this edition goes "
+                "to press: no record turned, nobody rang, nothing came down "
+                "from upstairs, and the switch is the reason. The paper prints "
+                "anyway, because the box on the wire, the weather outside, the "
+                "engineering room and the orchestrator's own note exist whether "
+                "or not anything airs; the rest of the desks have nothing to "
+                "report and say so by their absence. When the station is turned "
+                "on again the first hour will read here in full."
+                + (" The next hour's running order, should it run: "
+                   + ", ".join(m["coming"][:8]) + "." if m.get("coming") else ""))
+        elif paused:
+            pn = dict(m.get("pause_now") or {})
+            info = dict(m.get("pause_info") or {})
+            body = (
+                f"The station is paused; the orchestrator is working behind the "
+                f"scenes. It has been paused for {_paper_ago(pn.get('seconds') or 0)}"
+                + (f", asked for by {pn.get('why')}" if pn.get("why") else "") + ". "
+                + (f"Before the pause the hour opened at {_paper_clock(timeline[0][0])} with "
+                   f"{_said(timeline[0][1], timeline[0][2])}"
+                   + (f" and ran to {_paper_clock(timeline[-1][0])} on "
+                      f"{_said(timeline[-1][1], timeline[-1][2])}" if len(timeline) > 1 else "")
+                   + ". " if timeline else "Nothing aired in the window before the pause. ")
+                + f"While nothing airs, every room keeps working: the rooms have rendered "
+                f"{int(info.get('clips') or 0)} clips since the pause began, the finishing "
+                "rooms take every written round, the larder writes ahead, the "
+                "crystal gets a bigger share and the reel is cut so the resume "
+                "has something in hand. The itinerary is in the box beside this "
+                "story and the word cloud on the page is what was written while "
+                "the air was still."
+                + (" Expectations for the next hour: " + "; ".join(expect[:6]) + "." if expect else ""))
+        elif quiet:
             body = (
                 f"{m['station']} was quiet between {_paper_clock(m['since'])} and "
                 f"{_paper_clock(m['until'])}: no record turned, nobody rang, "
-                "nothing came down from upstairs. "
-                + ("The station is on the air as this edition goes to press."
-                   if m.get("on") else
-                   "The station was off the air, or paused, for the whole hour.")
-                + " The rest of the paper carries what does not need a "
-                "broadcast to exist: the weather outside, the engineering "
-                "room, and the wire."
+                "nothing came down from upstairs. The station is on and "
+                "pointed at the box as this edition goes to press. The rest of "
+                "the paper carries what does not need a broadcast to exist: the "
+                "weather outside, the engineering room, the wire and the note "
+                "the orchestrator owes."
                 + (" The next hour's running order: " + ", ".join(m["coming"][:8]) + "."
                    if m.get("coming") else ""))
         else:
@@ -87474,21 +95957,55 @@ async def _desk_lead(m: dict[str, Any],
                 f"{_said(timeline[-1][1], timeline[-1][2])}. "
                 + " ".join(f"At {_paper_clock(ts)}, {_said(kind, what)}."
                            for ts, kind, what in timeline[1:-1][:9])
+                + (f" Inside: {by_section['serial']['meta'].get('headline')}."
+                   if "serial" in by_section else "")
+                + (f" The interview: {by_section['interview']['meta'].get('headline')}."
+                   if "interview" in by_section else "")
                 + (" The next hour holds " + ", ".join(m["coming"][:8]) + "."
-                   if m.get("coming") else ""))
+                   if m.get("coming") else "")
+                + (" Expectations: " + "; ".join(expect[:6]) + "." if expect else ""))
     records = m.get("records") or []
     calls = m.get("calls") or []
-    meta = {
+    pic = paper_picture_take(m, kinds=("shown", "selling", "described"))
+    meta: dict[str, Any] = {
         "headline": got.get("headline") or (
+            "The Station Is Paused; the Orchestrator Is Working Behind the Scenes"
+            if paused else f"{m['station']} Is Off the Air" if offline else
             f"A Quiet {_paper_hour_words(m['since'])} Hour" if quiet else
             f"{len(records)} Records, {len(calls)} Call{'s' if len(calls) != 1 else ''}, "
             f"and the {_paper_hour_words(m['since'])} Hour in Order"),
         "deck": got.get("deck") or (
             f"{m['station']}, {_paper_clock(m['since'])} to {_paper_clock(m['until'])}, "
-            "arranged in the order it happened"),
-        "section": "front", "priority": 1, "byline": "The Lead Desk",
+            + ("paused as we print - the itinerary is inside" if paused else
+               "off as we print" if offline else "arranged in the order it happened")),
+        "section": "front", "priority": 1, "page": 1, "byline": "The Lead Desk",
         "span": "full", "pull": got.get("pull") or "",
+        "kicker": "PAUSED" if paused else "OFF AIR" if offline else "",
+        # #1037: the tabloid's splash flash. The broadsheet ignores it.
+        "flash": ("STATION PAUSED" if paused else "OFF AIR" if offline
+                  else "QUIET HOUR" if quiet else "EXCLUSIVE"),
+        "stats": [{"value": str(len(records)), "label": "records"},
+                  {"value": str(len(calls)), "label": "calls"},
+                  {"value": str(len(others) + 1), "label": "stories"}],
     }
+    if paused:
+        info = dict(m.get("pause_info") or {})
+        kinds = sorted((info.get("by_kind") or {}).items(), key=lambda kv: -kv[1])[:8]
+        if len(kinds) >= 2:
+            meta["chart"] = {"kind": "pie", "values": [int(v) for _, v in kinds],
+                             "labels": [_paper_shorten(str(k), 11) for k, _ in kinds]}
+            meta["caption"] = "Work rendered during the pause, by kind."
+        meta["box"] = {"title": "The itinerary", "items": paper_pause_itinerary(m)[:10]}
+        meta["style_hint"] = "itinerary"
+    if pic:
+        meta["image"] = pic["url"]
+        # #1030: `caption` belongs to the pause pie when there is one -
+        # the renderer prints it under the chart and gives the plate
+        # none, so writing the painting's words here labelled the
+        # headline graphic with a description of a painting.
+        if not meta.get("chart"):
+            meta["caption"] = _paper_shorten(pic.get("desc") or pic["name"], 120)
+        meta["focus"] = "center"
     return {"slug": "the-hour", "meta": meta, "body": body}
 
 
@@ -87539,7 +96056,9 @@ def paper_editions() -> list[dict[str, Any]]:
                 continue
             out.append({k: ed.get(k) for k in (
                 "id", "at", "since", "until", "kind", "headline", "deck",
-                "stories", "ok", "clean", "masthead")})
+                "stories", "ok", "clean", "masthead",
+                "pages", "paused", "offline", "style_default", "lead_image",
+                "snapshot")})   # G3 #1020
     except OSError:
         return []
     out.sort(key=lambda e: str(e.get("id") or ""), reverse=True)
@@ -87582,60 +96101,125 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
         _paper_say(f"press on - {reason or 'an edition'} · the "
                    f"{_paper_hour_words(since)} hour"
                    + (" (extra)" if kind != "hourly" else ""))
-        m = paper_material(since, until)
+        m = await paper_material(since, until)     # G1: async
         _paper_say(f"material: {len(m['records'])} records, {len(m['calls'])} "
                    f"calls, {len(m['ads'])} adverts, {len(m['wire'])} wire, "
                    f"{len(m['memos'])} memos, "
                    f"{sum(len(v) for v in m['said'].values())} lines said")
         stories: list[dict[str, Any]] = []
-        # Data desks first - code, never a model.
-        for name, desk in (("records", _desk_records), ("adverts", _desk_adverts)):
+        # G2: the press budget (writer calls, tint, clock) starts here.
+        paper_press_reset()
+        paused = bool(m.get("paused"))
+        offline = bool(m.get("offline"))
+        cloud_words: list[list[Any]] = []
+        if paused:
+            # #1030: what was written during the pause - the word cloud
+            # and the counts by kind, off the pantry and the larder.
             try:
-                got = desk(m)
+                started = float((m.get("pause_now") or {}).get("since")
+                                or (m.get("hour_active") or {}).get("pause_started")
+                                or 0)
+                cloud_words, info = await asyncio.to_thread(paper_pause_words, started)
+                m["pause_info"] = info
             except Exception as exc:  # noqa: BLE001
-                _paper_say(f"{name} desk tripped: {exc}"[:160])
+                _paper_say(f"the pause words tripped: {exc}"[:160])
+                m["pause_info"] = {}
+        if offline:
+            _paper_say("the station is off: only the box, the weather, the "
+                       "engineering room and the note print")
+
+        async def _run(name: str, desk: Any, *args: Any) -> None:
+            try:
+                got = desk(m, *args)
+                if asyncio.iscoroutine(got):
+                    got = await got
+            except Exception as exc:  # noqa: BLE001
+                _paper_say(f"{name} desk tripped: {type(exc).__name__}: {exc}"[:160])
                 got = None
             if got:
                 stories.append(got)
                 _paper_say(f"{name} desk: \"{got['meta']['headline']}\"")
+
+        # Data desks first - code, never a model.
+        if not offline:
+            for name, desk in (("records", _desk_records), ("adverts", _desk_adverts),
+                               ("hour", _desk_hour), ("sports", _desk_sports)):
+                await _run(name, desk)
         try:
             stats_text = await asyncio.to_thread(system_stats)
         except Exception:  # noqa: BLE001
             stats_text = ""
-        try:
-            got = _desk_engineering(m, stats_text)
-            if got:
-                stories.append(got)
-                _paper_say(f"engineering desk: \"{got['meta']['headline']}\"")
-        except Exception as exc:  # noqa: BLE001
-            _paper_say(f"engineering desk tripped: {exc}"[:160])
-        try:
-            got = await _desk_weather(m)
-            if got:
-                stories.append(got)
-                _paper_say(f"weather desk: \"{got['meta']['headline']}\"")
-        except Exception as exc:  # noqa: BLE001
-            _paper_say(f"weather desk tripped: {exc}"[:160])
-        # Prose desks: the writer, with a templated fallback each.
-        for name, desk in (("phones", _desk_phones), ("wire", _desk_wire),
-                           ("gallery", _desk_gallery), ("upstairs", _desk_upstairs),
-                           ("studio", _desk_studio), ("air", _desk_air)):
-            try:
-                got = await desk(m)
-            except Exception as exc:  # noqa: BLE001
-                _paper_say(f"{name} desk tripped: {exc}"[:160])
-                got = None
-            if got:
-                stories.append(got)
-        # The lead desk, last.
+        await _run("engineering", _desk_engineering, stats_text)
+        await _run("device", _desk_device)
+        await _run("dgx", _desk_dgx)
+        await _run("weather", _desk_weather)
+        if paused:
+            await _run("pause", _desk_pause)
+        # Prose desks: the writer, with a templated fallback each; the
+        # order is the order the writer's ration is spent in.
+        if not offline:
+            for name, desk in (("air", _desk_air), ("phones", _desk_phones),
+                               ("gallery", _desk_gallery),
+                               ("interview", _desk_interview),
+                               ("classifieds", _desk_classifieds),
+                               ("wire", _desk_wire), ("report", _desk_report),
+                               ("obituaries", _desk_obituaries),
+                               ("business", _desk_business),
+                               ("forsale", _desk_forsale), ("wanted", _desk_wanted),
+                               ("serial", _desk_serial), ("studio", _desk_studio),
+                               ("upstairs", _desk_upstairs),
+                               ("testimonials", _desk_testimonials)):
+                await _run(name, desk)
+        # The lead desk sees everything; the apology sees the lead too and
+        # is always the LAST article (#1035).
         lead = await _desk_lead(m, stories)
+        apology = await _desk_apology(m, [lead] + stories)
+        # #1024: the crystal, on the bodies only, under the caps.
+        tinted_by = paper_tinted_by()
+        if tinted_by:
+            # #1024: the tint's own clock starts here, once every desk is in.
+            _PAPER_PRESS["tint_deadline"] = time.time() + PAPER_TINT_SECONDS
+            _PAPER_PRESS["tint_why"] = ""
+            # The prose first, the boards last: the cap is for the writing.
+            _prose = ("on-air", "the-phones", "the-interview", "the-wire",
+                      "the-gallery", "the-serial", "obituaries", "business",
+                      "for-sale", "wanted", "classifieds", "from-upstairs",
+                      "in-the-studio", "testimonials", "orchestrator-report")
+            _tint_order = [lead] + [s for s in stories if s["slug"] in _prose]                 + [apology] + [s for s in stories if s["slug"] not in _prose]
+            for story in _tint_order:
+                if int(_PAPER_PRESS.get("tinted_stories") or 0) >= PAPER_TINT_STORIES:
+                    break
+                try:
+                    await paper_tint_story(story, f"the {story['slug']} desk of the gazette")
+                except Exception:  # noqa: BLE001
+                    pass
+            _paper_say(f"crystal: {tinted_by} tinted "
+                       f"{int(_PAPER_PRESS.get('tinted_stories') or 0)} stories, "
+                       f"{int(_PAPER_PRESS.get('tinted_paras') or 0)} paragraphs"
+                       + (" - " + str(_PAPER_PRESS.get("tint_why"))
+                          if not _PAPER_PRESS.get("tinted_paras")
+                          and _PAPER_PRESS.get("tint_why") else ""))
+        # Every story carries a page (CONTRACT s3).
+        for story in [lead] + stories + [apology]:
+            meta = story["meta"]
+            try:
+                page = int(meta.get("page") or 0)
+            except (TypeError, ValueError):
+                page = 0
+            if not 1 <= page <= 6:
+                meta["page"] = paper_page_for(str(meta.get("section") or ""))
         order = [lead] + sorted(
             stories, key=lambda s: (int(s["meta"].get("priority") or 5),
                                     PAPER_SECTION_IDS.index(s["meta"]["section"])
                                     if s["meta"]["section"] in PAPER_SECTION_IDS
-                                    else 99))
+                                    else 99)) + [apology]
         articles = [_paper_article(n, s["slug"], s["meta"], s["body"])
                     for n, s in enumerate(order, start=1)]
+        _paper_say(f"desks: {len(articles)} stories, "
+                   f"{int(_PAPER_PRESS.get('writer_calls') or 0)} writer calls "
+                   f"({int(_PAPER_PRESS.get('writer_refused') or 0)} refused), "
+                   f"{int(_PAPER_PRESS.get('seeds') or 0)} speaker-box chunks, "
+                   f"{int(time.time() - float(_PAPER_PRESS.get('started') or time.time()))}s")
         # Check, fix, repeat - until ok, and clean when it can be.
         report = paper_check(articles)
         rounds = 0
@@ -87678,6 +96262,26 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
             "on_air_now": m.get("on_air_now") or "",
             "now": {k: v for k, v in (m.get("now") or {}).items()
                     if k in ("title", "artist")},
+            # G2 (CONTRACT s3): the typesetter's fields.
+            "style_default": "broadsheet",
+            "pages": len({int(a["meta"].get("page") or 6) for a in articles}),
+            "paused": paused, "offline": offline,
+            # #1024: say it only when it happened. The crystal's name and
+            # the refusal reason are in "press" either way.
+            "tinted_by": (tinted_by
+                          if int(_PAPER_PRESS.get("tinted_stories") or 0)
+                          else ""),
+            "lead_image": str(lead["meta"].get("image") or ""),
+            "hour_key": str(m.get("hour_key") or ""),
+            "cloud_words": cloud_words,
+            "press": {"writer_calls": int(_PAPER_PRESS.get("writer_calls") or 0),
+                      "writer_refused": int(_PAPER_PRESS.get("writer_refused") or 0),
+                      "tinted_stories": int(_PAPER_PRESS.get("tinted_stories") or 0),
+                      "tinted_paras": int(_PAPER_PRESS.get("tinted_paras") or 0),
+                      "tinted_asked": tinted_by,
+                      "tint_why": str(_PAPER_PRESS.get("tint_why") or ""),
+                      "seeds": int(_PAPER_PRESS.get("seeds") or 0),
+                      "seconds": round(time.time() - float(_PAPER_PRESS.get("started") or time.time()), 1)},
         }
         (where / "edition.json").write_text(json.dumps(edition, indent=1),
                                             encoding="utf-8")
@@ -87696,6 +96300,7 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                    f"\"{edition['headline']}\"")
         note_action(f"📰 the Gazette printed the {_paper_hour_words(since)} hour"
                     + (" (extra)" if kind != "hourly" else ""))
+        fire_and_forget(paper_snapshot_clock(edition_id))   # G3 #1020: the gallery card, unless a panel sends one first
         _paper_prune()
         return {"started": True, "ok": True, "id": edition_id,
                 "stories": len(articles)}
@@ -87773,6 +96378,191 @@ def paper_recap_clause() -> str:
         return ""
 
 
+
+# --- #1025: the spoken export -----------------------------------------------
+_EXPORT_UNITS = {
+    "second": 1, "seconds": 1, "sec": 1, "secs": 1,
+    "minute": 60, "minutes": 60, "min": 60, "mins": 60,
+    "hour": 3600, "hours": 3600,
+}
+_EXPORT_WORD_NUM = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11,
+    "twelve": 12, "thirteen": 13, "fourteen": 14, "fifteen": 15,
+    "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50, "sixty": 60,
+}
+_EXPORT_NUM_RX = (
+    r"(?P<num>\d+(?:\.\d+)?|(?:twenty|thirty|forty|fifty|sixty)"
+    r"(?:[ -](?:one|two|three|four|five|six|seven|eight|nine))?|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"(?:a )?couple(?: of)?|(?:a )?few|half an?|half|an?)")
+_EXPORT_VERB_RX = (
+    r"\b(?P<verb>save(?: out| off| me)?|export|cut(?: out| me)?|grab(?: me)?|"
+    r"dump|clip|bounce(?: out)?|record out|write out|keep|get me|give me|"
+    r"send me|pull)\b")
+# Verbs that only mean an export when the SUBJECT is named too: "give me
+# the last five minutes" could be anything; "give me the last five minutes
+# of the show" is the order.
+_EXPORT_WEAK_VERBS = ("keep", "get me", "give me", "send me", "pull",
+                      "clip", "dump")
+_EXPORT_SUBJECT_CORE = (
+    r"\s+(?:of|from)\s+(?:the |this |tonight'?s |today'?s )?"
+    r"(?P<subject>radio|rhetoric|dialogue|dialog|broadcast|show|talk|chat|"
+    r"chatter|conversation|banter|audio|tape|station|air|programme|program|"
+    r"whole thing|mix|full mix|djs?)\b")
+_EXPORT_SUBJECT_RX = "(?:" + _EXPORT_SUBJECT_CORE + ")?"
+# #1153b's destinations: "send the broadcast to the Nabu" is a ROUTING
+# order and must reach parse_broadcast_command, never become a folder.
+_EXPORT_NOT_A_DIR = re.compile(
+    r"^(?:the\s+)?(?:nabu|pine ?box|box|both|app|application|here|page|"
+    r"web ?page|browser|panel|speaker|nowhere|off|local(?:ly)?|"
+    r"everywhere)\b", re.I)
+_EXPORT_FILLER = {"please", "now", "ok", "okay", "yeah", "yes", "thanks",
+                  "thank", "you", "for", "me", "a", "the", "would", "could",
+                  "can", "will", "just", "hey", "pine", "box", "to", "of",
+                  "and", "out", "quick", "quickly", "right", "away", "so",
+                  "this", "that", "it", "up"}
+
+
+def export_dir_shaped(path: str) -> bool:
+    """#1154: does this look like a FOLDER, or like the rest of
+    somebody's sentence? A separator, a leading ~ . or drive letter, or
+    a short bare name (three words at most, no comma) is a folder;
+    "the vault before somebody notices" is the broadcast."""
+    said = str(path or "").strip()
+    if not said or len(said) > 200:
+        return False
+    if re.search(r"[\\/]|^~|^\.|^[A-Za-z]:", said):
+        return True
+    if "," in said:
+        return False
+    return 1 <= len(said.split()) <= 3
+
+
+def export_number(words: str) -> float | None:
+    """'five' -> 5, 'twenty five' -> 25, 'a couple of' -> 2, 'half an' -> 0.5,
+    'a few' -> 3, 'a' -> 1, '15' -> 15. STT hands over words, not digits."""
+    said = " ".join(str(words or "").lower().replace("-", " ").split())
+    if not said:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", said):
+        return float(said)
+    if said.startswith(("a couple", "couple")):
+        return 2.0
+    if said in ("a few", "few"):
+        return 3.0
+    if said.startswith("half"):
+        return 0.5
+    if said in ("a", "an"):
+        return 1.0
+    total = 0.0
+    for w in said.split():
+        if w not in _EXPORT_WORD_NUM:
+            return None
+        total += _EXPORT_WORD_NUM[w]
+    return total or None
+
+
+def parse_export_command(text: str) -> dict[str, Any] | None:
+    """#1025: 'save out the last five minutes of rhetoric', 'export the last
+    15 minutes', 'grab the last two sentences', 'cut me half an hour of the
+    broadcast', 'save broadcasts to <path>', 'export directory is <path>'.
+
+    Returns {"seconds": int, "kind": "talk"|"mix"} | {"sentences": int} |
+    {"dir": str} | None. Imperative-verb gated, and held to the #1154 rule
+    that a command IS the sentence: once the order and the pleasantries are
+    removed, a real order has nothing left to say and a recording does."""
+    lowered = " ".join(str(text or "").lower().split())
+    if not lowered:
+        return None
+    lowered = lowered.rstrip(" .!")
+    if re.match(r"\s*(why|what|how|when|where|is|was|are|did|does|do|can|"
+                r"could|would|should)\b", lowered) and lowered.endswith("?"):
+        return None
+
+    # The directory, first: it carries a path and never a window.
+    got = re.search(
+        r"\b(?:save|export|put|send|write|keep|store|drop|copy)\b"
+        r"(?:\s+(?:the|my|all|every|our))?\s+"
+        r"(?:broadcasts?|recordings?|exports?|cuts?|clips?|radio|tapes?|"
+        r"shows?|episodes?|dialogue|rhetoric)\b.{0,12}?"
+        r"\b(?:to|in|into|at|under)\s+(?P<path>\S.*)$", lowered) or re.search(
+        r"\b(?:the\s+)?(?:export|broadcast|save|output|recording)s?\s+"
+        r"(?:directory|folder|dir|path|location)\s+"
+        r"(?:is|should be|goes to|=|to|at|:)\s+(?P<path>\S.*)$", lowered) or \
+        re.search(
+        r"\b(?:set|make|change)\s+(?:the\s+)?(?:export|broadcast|save|"
+        r"output)s?\s+(?:directory|folder|dir|path)\s+(?:to|as)\s+"
+        r"(?P<path>\S.*)$", lowered)
+    if got and not _EXPORT_NOT_A_DIR.match(got.group("path")):
+        raw = " ".join(str(text or "").split()).rstrip(" .!")
+        # The path from the ORIGINAL text - case matters on a host path.
+        tail = raw[len(raw) - len(got.group("path")):].strip().rstrip(".!,")
+        # #1154: the order must BE the sentence. Nothing of the broadcast
+        # may stand in front of the verb ("We should save the recordings
+        # to ..." is somebody talking), and what follows must look like a
+        # folder rather than the rest of a clause. Without this, seven of
+        # eight ordinary on-air sentences set the export directory.
+        _pre = [w for w in re.findall(r"[a-z']+", lowered[:got.start()])
+                if w not in _EXPORT_FILLER
+                # the second and third patterns match from the NOUN, so
+                # the order's own verb stands in front of them
+                and w not in ("set", "make", "change")]
+        if tail and not _pre and export_dir_shaped(tail):
+            return {"dir": tail}
+
+    # The window: an order verb ... the last N <unit> [of the <subject>].
+    got = re.search(
+        _EXPORT_VERB_RX + r".{0,24}?\b(?:the\s+)?(?:last|past|previous|"
+        r"latest|recent|final)\s+(?:" + _EXPORT_NUM_RX + r"\s+)?"
+        r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|sentences?|lines?)"
+        r"\b" + _EXPORT_SUBJECT_RX, lowered)
+    if not got:
+        # "save out five minutes of radio", "cut me half an hour of the show"
+        # - no "last", so the subject is REQUIRED.
+        got = re.search(
+            _EXPORT_VERB_RX + r".{0,16}?\b(?:" + _EXPORT_NUM_RX + r"\s+)"
+            r"(?P<unit>seconds?|secs?|minutes?|mins?|hours?|sentences?|"
+            r"lines?)\b" + _EXPORT_SUBJECT_CORE, lowered)
+    if not got:
+        return None
+    if not got.group("subject") and any(
+            str(got.group("verb") or "").startswith(v)
+            for v in _EXPORT_WEAK_VERBS):
+        return None
+    count = export_number(got.group("num") or "")
+    unit = str(got.group("unit") or "")
+    if count is None:
+        count = 1.0                     # "the last minute", "the last hour"
+    # #1154: the residue rule. Strip the order and the pleasantries; what is
+    # left is somebody else's sentence.
+    residue = lowered[:got.start()] + " " + lowered[got.end():]
+    residue = re.sub(r"[^a-z ]+", " ", residue)
+    left = [w for w in residue.split() if w not in _EXPORT_FILLER]
+    if len(left) > 3:
+        return None
+    if unit.startswith("sentence") or unit.startswith("line"):
+        n = int(round(count))
+        if n < 1 or n > 40:
+            return None
+        return {"sentences": n}
+    seconds = count * _EXPORT_UNITS.get(unit, 60)
+    if unit.startswith("hour") and count == 0.5:
+        seconds = 1800
+    seconds = int(round(seconds))
+    if seconds < 10 or seconds > 3600:
+        return None
+    subject = str(got.group("subject") or "")
+    kind = ("mix" if (subject in ("mix", "full mix", "whole thing")
+                      or re.search(r"\b(with|and) (the )?(music|records)\b|"
+                                   r"\bfull mix\b|\bwhole (broadcast|mix|"
+                                   r"show)\b", lowered))
+            else "talk")
+    return {"seconds": seconds, "kind": kind}
+
+
 def parse_paper_command(text: str) -> str:
     """'print the paper' / 'read me the front page' -> print | read | ''."""
     lowered = " ".join(str(text or "").lower().split())
@@ -87829,8 +96619,78 @@ async def _paper_clock_start() -> None:
 
 
 # --- the typesetter --------------------------------------------------------
+import math  # G3: the pie, the cloud and the plexus need it here
+# G3 (#1037 #1042 #1043 #1023 #1029 #1020 #1030): two typesetters behind one
+# door. paper_render_html(ed, style) sets the same edition as a colour
+# broadsheet (A3 landscape when printed: blackletter masthead, red kickers,
+# big-number callouts, an index box, three-to-four columns) or as a tabloid
+# (A4 portrait: a red masthead block, a price roundel, the lead picture with
+# a huge condensed white-on-black headline, coloured bands and boxes inside).
+# Every meta field of CONTRACT s3 renders in both. Pages are .page sheets
+# (2-6) paginated by meta.page, then section order, then priority; empty
+# pages are dropped. Quotes carry ▶/⬇ controls (#1023) served by a small
+# script in the page that hands the click to the panel's clipToggle when the
+# page sits in the panel's iframe. Paused editions (#1030) get the word cloud
+# (server-side SVG) and a live plexus of the background work (three.js from
+# /vendor when it loads, the SVG when it does not).
+
+PAPER_RENDER_VERSION = 4          # #1037: bump when the typesetter changes; older cached pages re-set
+PAPER_STYLES = ("broadsheet", "tabloid")
+PAPER_PAGES_MAX = 6
+PAPER_SNAPSHOT_DIR = "_gazette"   # under /comfy-output, skipped by the face/art pools (#1020)
+PAPER_SNAPSHOT_WAIT = float(os.getenv("PAPER_SNAPSHOT_WAIT", "600"))   # the panel gets ten minutes first
+
+
+def _paper_svg_pie(chart: dict[str, Any]) -> str:
+    """#1030 #1042: a pie with a legend. Slices are classed s0..s7 so each
+    style colours them its own way; a single value is a full disc."""
+    try:
+        values = [max(0.0, float(v)) for v in (chart.get("values") or [])]
+    except (TypeError, ValueError):
+        return ""
+    labels = [str(x) for x in (chart.get("labels") or [])]
+    total = sum(values)
+    if not values or total <= 0:
+        return ""
+    W, H = 600, 260
+    cx, cy, r = 138, 130, 104
+    parts = [f'<svg class="chart pie" viewBox="0 0 {W} {H}" '
+             'xmlns="http://www.w3.org/2000/svg" role="img">']
+    start = -math.pi / 2
+    for i, v in enumerate(values[:8]):
+        frac = v / total
+        if frac <= 0:
+            continue
+        if frac >= 0.9999:
+            parts.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" class="slice s{i % 8}"/>')
+            break
+        end = start + frac * 2 * math.pi
+        x1, y1 = cx + r * math.cos(start), cy + r * math.sin(start)
+        x2, y2 = cx + r * math.cos(end), cy + r * math.sin(end)
+        large = 1 if frac > 0.5 else 0
+        parts.append(f'<path class="slice s{i % 8}" d="M{cx},{cy} L{x1:.1f},{y1:.1f} '
+                     f'A{r},{r} 0 {large} 1 {x2:.1f},{y2:.1f} Z"/>')
+        if frac >= 0.06:
+            mid = (start + end) / 2
+            lx, ly = cx + r * 0.62 * math.cos(mid), cy + r * 0.62 * math.sin(mid)
+            parts.append(f'<text x="{lx:.1f}" y="{ly + 6:.1f}" class="pct" '
+                         f'text-anchor="middle">{frac * 100:.0f}%</text>')
+        start = end
+    ly = 40
+    for i, v in enumerate(values[:8]):
+        name = labels[i] if i < len(labels) else f"#{i + 1}"
+        parts.append(f'<rect x="290" y="{ly - 13}" width="16" height="16" class="slice s{i % 8}"/>')
+        parts.append(f'<text x="314" y="{ly}" class="lab">{_paper_esc(name[:22])}'
+                     f' · {v / total * 100:.0f}%</text>')
+        ly += 27
+    parts.append("</svg>")
+    return "".join(parts)
+
 
 def _paper_svg_chart(chart: dict[str, Any]) -> str:
+    """Line, bars or (#1030) pie, inline SVG, styled by the sheet's CSS."""
+    if str(chart.get("kind") or "") == "pie":
+        return _paper_svg_pie(chart)
     try:
         values = [float(v) for v in (chart.get("values") or [])]
     except (TypeError, ValueError):
@@ -87843,7 +96703,7 @@ def _paper_svg_chart(chart: dict[str, Any]) -> str:
     hi = float(chart.get("max")) if chart.get("max") is not None else max(values)
     if hi <= lo:
         hi = lo + 1.0
-    W, H, pad_l, pad_r, pad_t, pad_b = 600, 240, 44, 10, 22, 34
+    W, H, pad_l, pad_r, pad_t, pad_b = 600, 240, 48, 10, 22, 36
     iw, ih = W - pad_l - pad_r, H - pad_t - pad_b
     n = len(values)
     show = bool(chart.get("show_values"))
@@ -87860,7 +96720,7 @@ def _paper_svg_chart(chart: dict[str, Any]) -> str:
         parts.append(f'<line x1="{pad_l}" y1="{gy:.1f}" x2="{W - pad_r}" '
                      f'y2="{gy:.1f}" class="grid"/>')
         val = hi - (hi - lo) * k / 4
-        parts.append(f'<text x="{pad_l - 6}" y="{gy + 4:.1f}" class="tick" '
+        parts.append(f'<text x="{pad_l - 6}" y="{gy + 5:.1f}" class="tick" '
                      f'text-anchor="end">{val:.0f}</text>')
     if kind == "bars":
         slot = iw / n
@@ -87876,136 +96736,719 @@ def _paper_svg_chart(chart: dict[str, Any]) -> str:
             if i < len(labels) and i % every == 0:
                 parts.append(f'<text x="{x + bw / 2:.1f}" y="{H - 8}" '
                              f'class="{lab_cls}" text-anchor="middle">'
-                             f'{_paper_esc(labels[i])}</text>')
+                             f'{_paper_esc(labels[i][:12])}</text>')
     else:
         step = iw / (n - 1)
         pts = [(pad_l + step * i, y(v)) for i, v in enumerate(values)]
         parts.append('<polyline class="line" points="'
                      + " ".join(f"{x:.1f},{yy:.1f}" for x, yy in pts) + '"/>')
         for i, (x, yy) in enumerate(pts):
-            parts.append(f'<circle cx="{x:.1f}" cy="{yy:.1f}" r="3.2" class="dot"/>')
+            parts.append(f'<circle cx="{x:.1f}" cy="{yy:.1f}" r="3.4" class="dot"/>')
             if show:
                 parts.append(f'<text x="{x:.1f}" y="{yy - 8:.1f}" class="val" '
                              f'text-anchor="middle">{values[i]:.0f}</text>')
             if i < len(labels) and i % every == 0:
                 parts.append(f'<text x="{x:.1f}" y="{H - 8}" class="{lab_cls}" '
-                             f'text-anchor="middle">{_paper_esc(labels[i])}</text>')
+                             f'text-anchor="middle">{_paper_esc(labels[i][:12])}</text>')
     parts.append("</svg>")
     return "".join(parts)
 
 
-_PAPER_CSS = r"""
-:root{--ink:#1b1a17;--ink2:#4a4741;--rule:#1b1a17;--paper:#f4efe3;--paper2:#ece5d4;--accent:#8b1a1a;--faint:#9c9686}
-*{box-sizing:border-box}
-html,body{margin:0;padding:0;background:var(--paper2)}
-body{color:var(--ink);font-family:Georgia,"Times New Roman","Liberation Serif",serif;font-size:15px;line-height:1.45}
-.sheet{max-width:1180px;margin:0 auto;background:var(--paper);padding:26px 34px 40px;box-shadow:0 10px 40px rgba(0,0,0,.25)}
-.ears{display:flex;justify-content:space-between;gap:16px;font-size:11.5px;color:var(--ink2);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);padding:5px 0;text-transform:uppercase;letter-spacing:.06em}
-.ears b{color:var(--ink)}
-h1.masthead{font-family:"Old English Text MT","UnifrakturMaguntia","Blackmoor LET",Georgia,serif;font-weight:400;text-align:center;font-size:64px;letter-spacing:.01em;margin:14px 0 4px;line-height:1}
-.motto{text-align:center;font-style:italic;color:var(--ink2);font-size:13px;margin:0 0 8px}
-.dateline{display:flex;justify-content:space-between;border-top:3px double var(--rule);border-bottom:1px solid var(--rule);padding:5px 0;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
-.lead{padding:18px 0 14px;border-bottom:3px double var(--rule);margin-bottom:14px}
-.lead h2{font-size:44px;line-height:1.05;margin:0 0 8px;font-weight:700;letter-spacing:-.01em}
-.lead .deck{font-size:19px;font-style:italic;color:var(--ink2);margin:0 0 10px;line-height:1.3}
-.byline{font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink2);margin:0 0 10px}
-.byline .sec{color:var(--accent)}
-.lead .body{column-count:3;column-gap:28px;column-rule:1px solid #d9d2c1}
-.lead .body p:first-of-type::first-letter{float:left;font-size:64px;line-height:.82;padding:6px 8px 0 0;font-weight:700}
-p{margin:0 0 10px;text-align:justify;hyphens:auto}
-h3,h4{margin:8px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.08em}
-.section{border-top:1px solid var(--rule);margin:8px 0 8px;padding-top:3px;font-size:12px;text-transform:uppercase;letter-spacing:.16em;font-weight:700}
-.flow{column-count:3;column-gap:28px;column-rule:1px solid #d9d2c1}
-@media (max-width:980px){.flow,.lead .body{column-count:2}h1.masthead{font-size:46px}.lead h2{font-size:32px}}
-@media (max-width:640px){.flow,.lead .body{column-count:1}.sheet{padding:16px}h1.masthead{font-size:36px}.lead h2{font-size:26px}}
-.story{break-inside:avoid-column;page-break-inside:avoid;margin:0 0 18px;padding:0 0 10px;border-bottom:1px solid #d9d2c1}
-.story h2{font-size:22px;line-height:1.12;margin:0 0 5px;font-weight:700}
-.story .deck{font-size:14.5px;font-style:italic;color:var(--ink2);margin:0 0 6px;line-height:1.3}
-.story.span{column-span:all;border-top:1px solid var(--rule);padding-top:10px}
-.story.span .body{column-count:2;column-gap:28px}
-blockquote.pull{margin:10px 0;padding:8px 0;border-top:2px solid var(--rule);border-bottom:2px solid var(--rule);font-size:19px;line-height:1.25;font-style:italic;text-align:center}
-table.agate{width:100%;border-collapse:collapse;font-size:11.5px;margin:6px 0 10px;font-family:"Helvetica Neue",Arial,sans-serif}
-table.agate th{border-bottom:1px solid var(--rule);text-align:left;padding:3px 4px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:10px}
-table.agate td{padding:3px 4px;border-bottom:1px dotted #c8c0ad;vertical-align:top}
-table.agate td:last-child,table.agate th:last-child{text-align:right}
-table.agate td:first-child,table.agate th:first-child{white-space:nowrap}
-svg.chart{width:100%;height:auto;display:block;margin:6px 0 2px}
-svg.chart .grid{stroke:#d3cbb8;stroke-width:1}
-svg.chart .tick,svg.chart .lab,svg.chart .val{font-family:"Helvetica Neue",Arial,sans-serif;font-size:17px;fill:var(--ink2)}
-svg.chart .val{fill:var(--ink);font-weight:700}
-svg.chart .small{font-size:12px}
-svg.chart .bar{fill:var(--ink)}
-svg.chart .line{fill:none;stroke:var(--accent);stroke-width:2.2}
-svg.chart .dot{fill:var(--paper);stroke:var(--accent);stroke-width:2}
-.caption{font-size:11.5px;color:var(--ink2);font-style:italic;margin:0 0 8px}
-figure.plate{margin:0 0 10px;break-inside:avoid}
-figure.plate img{width:100%;display:block;filter:grayscale(.15) contrast(1.05);border:1px solid #cfc7b3}
-.sources{font-size:11px;color:var(--ink2);margin:6px 0 0}
-.sources a{color:var(--accent)}
-ul{margin:0 0 10px;padding-left:18px}
-li{margin:0 0 3px}
-a{color:var(--accent)}
-.colophon{border-top:3px double var(--rule);margin-top:24px;padding-top:8px;font-size:11px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-@media print{body{background:#fff}.sheet{box-shadow:none;max-width:none}}
+def _paper_svg_cloud(words: Any, W: int = 640, H: int = 380) -> str:
+    """#1030: the paused edition's word cloud, drawn server-side. Sized by
+    count, placed on a spiral out from the centre, the first box that does
+    not overlap wins; a word that finds no room in 700 turns is left out."""
+    rows: list[tuple[str, int]] = []
+    for row in (words or []):
+        try:
+            w, c = (row[0], row[1]) if isinstance(row, (list, tuple)) else (row.get("word"), row.get("count"))
+            w = str(w or "").strip()
+            if w:
+                rows.append((w[:18], max(1, int(c or 1))))
+        except Exception:  # noqa: BLE001
+            continue
+    rows = sorted(rows, key=lambda r: -r[1])[:60]
+    if not rows:
+        return ""
+    hi, lo = rows[0][1], rows[-1][1]
+    placed: list[tuple[float, float, float, float]] = []
+    out = [f'<svg class="cloud" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" role="img">']
+    cx, cy = W / 2, H / 2
+    for i, (w, c) in enumerate(rows):
+        size = 13 + 33 * ((c - lo) / (hi - lo) if hi > lo else 1.0)
+        tw, th = len(w) * size * 0.6 + 6, size * 1.05
+        t = 0.0
+        while t < 700:
+            r = 1.6 * t
+            a = 0.31 * t + i * 0.7
+            x = cx + r * math.cos(a)
+            y = cy + r * 0.62 * math.sin(a)
+            box = (x - tw / 2, y - th / 2, x + tw / 2, y + th / 2)
+            inside = box[0] >= 2 and box[1] >= 2 and box[2] <= W - 2 and box[3] <= H - 2
+            if inside and not any(b[0] < box[2] and box[0] < b[2] and b[1] < box[3] and box[1] < b[3]
+                                  for b in placed):
+                placed.append(box)
+                out.append(f'<text x="{x:.1f}" y="{y + size * 0.35:.1f}" font-size="{size:.0f}" '
+                           f'class="w{i % 4}" text-anchor="middle">{_paper_esc(w)}</text>')
+                break
+            t += 1.0
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _paper_plexus_data(ed: dict[str, Any]) -> dict[str, Any]:
+    """#1030: the nodes of the background work - the roads (stock by road),
+    the kinds of work (the lead's pie) and the itinerary's tasks - as a small
+    graph the page can draw with three.js or as SVG."""
+    nodes: list[dict[str, Any]] = [{"id": "hub", "label": "the orchestrator", "size": 3.0, "group": 0}]
+    edges: list[list[int]] = []
+    arts = [a for a in (ed.get("articles") or []) if not a.get("error")]
+
+    def add(label: str, size: float, group: int, parent: int = 0) -> int:
+        nodes.append({"id": f"n{len(nodes)}", "label": str(label)[:28], "size": float(size), "group": group})
+        edges.append([parent, len(nodes) - 1])
+        return len(nodes) - 1
+
+    roads: list[int] = []
+    for a in arts:
+        meta = a.get("meta") or {}
+        chart = meta.get("chart") if isinstance(meta.get("chart"), dict) else {}
+        if str(meta.get("style_hint") or "") == "itinerary" and chart.get("kind") == "bars":
+            vals = list(chart.get("values") or [])
+            top = max([float(v) for v in vals] + [1.0])
+            for lab, v in zip(chart.get("labels") or [], vals):
+                roads.append(add(lab, 1.0 + 1.6 * float(v) / top, 1))
+    for a in arts:
+        meta = a.get("meta") or {}
+        chart = meta.get("chart") if isinstance(meta.get("chart"), dict) else {}
+        if chart.get("kind") == "pie" and int(meta.get("priority") or 0) == 1:
+            vals = list(chart.get("values") or [])
+            top = max([float(v) for v in vals] + [1.0])
+            for lab, v in zip(chart.get("labels") or [], vals):
+                add(lab, 0.9 + 1.4 * float(v) / top, 2)
+    for a in arts:
+        meta = a.get("meta") or {}
+        box = meta.get("box") if isinstance(meta.get("box"), dict) else {}
+        if str(meta.get("style_hint") or "") == "itinerary" or int(meta.get("priority") or 0) == 1:
+            for k, item in enumerate((box.get("items") or [])[:14]):
+                parent = roads[k % len(roads)] if roads else 0
+                add(item, 0.7, 3, parent)
+    if len(nodes) == 1:
+        for lab in ("the pantry", "the larder", "the crystal", "the workshop", "the reel"):
+            add(lab, 1.0, 1)
+    return {"nodes": nodes[:60], "edges": [e for e in edges if e[1] < 60]}
+
+
+def _paper_svg_plexus(data: dict[str, Any], W: int = 640, H: int = 360) -> str:
+    """The plexus without WebGL: hub in the middle, groups on rings."""
+    nodes = data.get("nodes") or []
+    if not nodes:
+        return ""
+    pos: dict[int, tuple[float, float]] = {0: (W / 2, H / 2)}
+    by_group: dict[int, list[int]] = {}
+    for i, n in enumerate(nodes[1:], start=1):
+        by_group.setdefault(int(n.get("group") or 1), []).append(i)
+    radius = {1: 92.0, 2: 148.0, 3: 165.0}
+    for g, ids in by_group.items():
+        rr = radius.get(g, 150.0)
+        for k, i in enumerate(ids):
+            a = 2 * math.pi * k / max(1, len(ids)) + g * 0.4
+            pos[i] = (W / 2 + rr * 1.55 * math.cos(a), H / 2 + rr * 0.86 * math.sin(a))
+    out = [f'<svg class="plexus" viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" role="img">']
+    for a, b in (data.get("edges") or []):
+        if a in pos and b in pos:
+            out.append(f'<line x1="{pos[a][0]:.1f}" y1="{pos[a][1]:.1f}" '
+                       f'x2="{pos[b][0]:.1f}" y2="{pos[b][1]:.1f}" class="edge"/>')
+    for i, n in enumerate(nodes):
+        if i not in pos:
+            continue
+        x, yy = pos[i]
+        r = 4 + 3.2 * float(n.get("size") or 1)
+        out.append(f'<circle cx="{x:.1f}" cy="{yy:.1f}" r="{r:.1f}" class="node g{int(n.get("group") or 0)}"/>')
+        out.append(f'<text x="{x:.1f}" y="{yy + r + 11:.1f}" class="nlab" text-anchor="middle">'
+                   f'{_paper_esc(str(n.get("label") or "")[:22])}</text>')
+    out.append("</svg>")
+    return "".join(out)
+
+
+_PAPER_PLEXUS_JS = r"""
+(function(){
+  var host=document.getElementById('plexus'); if(!host) return;
+  var data; try{ data=JSON.parse(document.getElementById('plexus-data').textContent); }catch(e){ return; }
+  function boot(){
+    if(!window.THREE){ return; }
+    var T=window.THREE, W=host.clientWidth||640, H=360;
+    var canvas=document.createElement('canvas'); canvas.className='plexus-canvas';
+    var renderer; try{ renderer=new T.WebGLRenderer({canvas:canvas,antialias:true,alpha:true}); }catch(e){ return; }
+    renderer.setSize(W,H); renderer.setPixelRatio(Math.min(2,window.devicePixelRatio||1));
+    var scene=new T.Scene(); var cam=new T.PerspectiveCamera(48,W/H,0.1,100); cam.position.set(0,2.2,9.5); cam.lookAt(0,0,0);
+    var group=new T.Group(); scene.add(group);
+    var nodes=data.nodes||[], edges=data.edges||[], byG={}, pos=[];
+    nodes.forEach(function(n,i){ if(i===0){ pos.push(new T.Vector3(0,0,0)); return; } (byG[n.group]=byG[n.group]||[]).push(i); });
+    var rad={1:2.3,2:3.6,3:4.2};
+    Object.keys(byG).forEach(function(g){ var ids=byG[g], rr=rad[g]||3.5; ids.forEach(function(i,k){ var a=2*Math.PI*k/Math.max(1,ids.length)+g*0.4; pos[i]=new T.Vector3(rr*Math.cos(a),(g==3?-0.8:g==2?0.7:0)+Math.sin(a*3)*0.25,rr*Math.sin(a)); }); });
+    var cols={0:0xc8102e,1:0x1b1a17,2:0x1d3a6e,3:0x8a7f6a};
+    var geo=new T.SphereGeometry(0.11,12,10), spheres=[];
+    nodes.forEach(function(n,i){ var m=new T.Mesh(geo,new T.MeshBasicMaterial({color:cols[n.group]||0x444444})); var s=0.7+0.5*(n.size||1); m.scale.set(s,s,s); m.position.copy(pos[i]||new T.Vector3()); group.add(m); spheres.push(m); });
+    var lines=[]; edges.forEach(function(e){ if(!pos[e[0]]||!pos[e[1]]) return; var g=new T.BufferGeometry().setFromPoints([pos[e[0]],pos[e[1]]]); var mat=new T.LineBasicMaterial({color:0x8b1a1a,transparent:true,opacity:0.35}); var l=new T.Line(g,mat); group.add(l); lines.push(l); });
+    var labels=document.createElement('div'); labels.className='plexus-labels';
+    var lab=nodes.map(function(n){ var d=document.createElement('span'); d.textContent=n.label; labels.appendChild(d); return d; });
+    host.innerHTML=''; host.appendChild(canvas); host.appendChild(labels);
+    var t0=performance.now(), v=new T.Vector3();
+    function frame(){ if(!host.isConnected) return; var t=(performance.now()-t0)/1000; group.rotation.y=t*0.18;
+      lines.forEach(function(l,i){ l.material.opacity=0.18+0.32*(0.5+0.5*Math.sin(t*2.1+i*0.9)); });
+      spheres.forEach(function(s,i){ var k=1+0.12*Math.sin(t*1.7+i); s.scale.setScalar((0.7+0.5*(nodes[i].size||1))*k); });
+      renderer.render(scene,cam);
+      spheres.forEach(function(s,i){ v.copy(s.position).applyMatrix4(group.matrixWorld).project(cam); var el=lab[i]; el.style.left=((v.x+1)/2*W)+'px'; el.style.top=((1-v.y)/2*H+10)+'px'; el.style.opacity=(v.z<1&&(i===0||nodes[i].group<3||Math.floor(t/2)%2===0))?'1':'0'; });
+      requestAnimationFrame(frame); }
+    frame();
+  }
+  if(window.THREE){ boot(); return; }
+  var s=document.createElement('script'); s.src='/vendor/three.min.js'; s.onload=boot; s.onerror=function(){}; document.head.appendChild(s);
+})();
+"""
+
+_PAPER_AUDIO_JS = r"""
+(function(){
+  var A=null,B=null;
+  function stop(){ if(A){ try{A.pause();}catch(e){} A=null; } if(B){ B.textContent=B.getAttribute('data-label')||'▶'; B=null; } }
+  document.addEventListener('click',function(e){
+    var b=e.target&&e.target.closest?e.target.closest('button[data-clip]'):null; if(!b) return;
+    e.preventDefault(); var u=b.getAttribute('data-clip'); if(!u) return;
+    try{ if(window.parent&&window.parent!==window&&typeof window.parent.clipToggle==='function'){ window.parent.clipToggle(u,b,'▶'); return; } }catch(err){}
+    if(A&&A._src===u){ stop(); return; }
+    stop(); A=new Audio(u); A._src=u; B=b; b.textContent='⏹'; A.onended=stop; A.onerror=stop; A.play().catch(stop);
+  });
+})();
 """
 
 
-def paper_render_html(ed: dict[str, Any]) -> str:
-    """The broadsheet. The lead across the top under the masthead, then
-    every other story flowed through the columns under its section head,
-    in the paper's section order."""
-    articles = [a for a in (ed.get("articles") or []) if not a.get("error")]
+_PAPER_CSS_COMMON = r"""
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+p{margin:0 0 9px;text-align:justify;hyphens:auto}
+ul{margin:0 0 10px;padding-left:18px}li{margin:0 0 3px}
+img{max-width:100%}
+.page{position:relative;margin:0 auto 22px;page-break-after:always;break-after:page}
+.page:last-child{margin-bottom:0}
+.kicker{display:inline-block;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--red);margin:0 0 4px}
+.byline{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink2);margin:0 0 8px}
+.byline .sec{color:var(--red);font-weight:700}
+figure.plate{margin:0 0 8px;break-inside:avoid}
+figure.plate img{width:100%;display:block;object-fit:cover;background:#ddd6c4}
+figure.plate.top img{object-position:center top}figure.plate.bottom img{object-position:center bottom}
+figure.plate figcaption,.caption{font-size:11px;color:var(--ink2);margin:4px 0 6px;line-height:1.3;text-align:left}
+figure.plate figcaption b{font-weight:700;color:var(--ink)}
+figure.plate .credit{float:right;font-size:9px;text-transform:uppercase;letter-spacing:.08em;color:var(--faint)}
+.plates{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin:0 0 10px;break-inside:avoid}
+.plates figure.plate{margin:0}.plates figure.plate img{aspect-ratio:4/3}
+.stats{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px;break-inside:avoid}
+.stat{flex:1 1 90px;max-width:230px;padding:6px 8px;border-top:3px solid var(--red)}
+.stat b{display:block;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:900;font-size:34px;line-height:1;letter-spacing:-.02em}
+.stat span{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2);margin-top:3px}
+.box{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);padding:6px 0 4px;margin:6px 0 12px;break-inside:avoid;font-size:12.5px}
+.box h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.14em}
+.box ol,.box ul{margin:0;padding-left:16px}.box li{margin:0 0 3px;line-height:1.3}
+.box.index li{display:flex;justify-content:space-between;gap:8px}.box.index li b{font-weight:400;white-space:nowrap}
+.serial{border:1px solid var(--ink);padding:8px 10px;margin:6px 0 12px;break-inside:avoid;font-size:12.5px;background:var(--tint)}
+.serial h4{margin:0 0 2px;font-size:12px;text-transform:uppercase;letter-spacing:.12em}
+.serial .part{font-size:26px;font-weight:900;font-family:"Helvetica Neue",Arial,sans-serif;line-height:1;margin:2px 0 6px;color:var(--red)}
+.serial p{text-align:left;margin:0 0 5px}.serial p b{text-transform:uppercase;font-size:10.5px;letter-spacing:.1em}
+.quotes{margin:8px 0 12px;break-inside:avoid}
+.quotes h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.14em}
+.quote{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:start;padding:5px 0;border-top:1px dotted var(--faint);font-size:12.5px;line-height:1.35}
+.quote .who{grid-column:1/3;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--red)}
+.quote .text{font-style:italic}
+.quote .ctl{display:flex;gap:3px;white-space:nowrap}
+.quote button,.quote a{font:700 11px/1 "Helvetica Neue",Arial,sans-serif;border:1px solid var(--ink);background:var(--paper);color:var(--ink);border-radius:3px;padding:3px 6px;cursor:pointer;text-decoration:none}
+.quote button:hover,.quote a:hover{background:var(--ink);color:var(--paper)}
+table.agate{width:100%;border-collapse:collapse;font-size:11px;margin:6px 0 10px;font-family:"Helvetica Neue",Arial,sans-serif;break-inside:avoid}
+table.agate th{border-bottom:1px solid var(--ink);text-align:left;padding:3px 4px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:9.5px}
+table.agate td{padding:3px 4px;border-bottom:1px dotted #c8c0ad;vertical-align:top}
+table.agate td:last-child,table.agate th:last-child{text-align:right}
+table.agate td:first-child,table.agate th:first-child{white-space:nowrap}
+svg.chart{width:100%;height:auto;display:block;margin:6px 0 2px;break-inside:avoid}
+svg.chart .grid{stroke:#d3cbb8;stroke-width:1}
+svg.chart .tick,svg.chart .lab,svg.chart .val,svg.chart .pct{font-family:"Helvetica Neue",Arial,sans-serif;font-size:21px;fill:var(--ink2)}
+svg.chart .val{fill:var(--ink);font-weight:700}svg.chart .small{font-size:15px}
+svg.chart .pct{fill:#fff;font-weight:700;font-size:21px}
+svg.chart .bar{fill:var(--ink)}
+svg.chart .line{fill:none;stroke:var(--red);stroke-width:2.4}
+svg.chart .dot{fill:var(--paper);stroke:var(--red);stroke-width:2}
+svg.chart .slice.s0{fill:#1b1a17}svg.chart .slice.s1{fill:#c8102e}svg.chart .slice.s2{fill:#1d3a6e}svg.chart .slice.s3{fill:#b08a3e}
+svg.chart .slice.s4{fill:#3d6b4f}svg.chart .slice.s5{fill:#7a4a8b}svg.chart .slice.s6{fill:#8a7f6a}svg.chart .slice.s7{fill:#c85a2a}
+svg.cloud{width:100%;height:auto;display:block;margin:4px 0 8px;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800}
+svg.cloud .w0{fill:var(--ink)}svg.cloud .w1{fill:var(--red)}svg.cloud .w2{fill:#1d3a6e}svg.cloud .w3{fill:var(--ink2)}
+.plexus{position:relative;min-height:360px;margin:4px 0 8px;background:#0b0f16;border:1px solid var(--ink)}
+svg.plexus{width:100%;height:auto;display:block}
+svg.plexus .edge{stroke:#c8102e;stroke-opacity:.45;stroke-width:1.2}
+svg.plexus .node{fill:#e9e2d0}svg.plexus .node.g0{fill:#c8102e}svg.plexus .node.g2{fill:#7fa7e6}svg.plexus .node.g3{fill:#8a7f6a}
+svg.plexus .nlab{font-family:"Helvetica Neue",Arial,sans-serif;font-size:10px;fill:#e9e2d0}
+.plexus-canvas{display:block;width:100%;height:360px}
+.plexus-labels span{position:absolute;transform:translate(-50%,0);font:10px/1.1 "Helvetica Neue",Arial,sans-serif;color:#e9e2d0;pointer-events:none;transition:opacity .4s;white-space:nowrap}
+.classifieds{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--ink);margin:6px 0 12px;font-size:11px;line-height:1.3;font-family:"Helvetica Neue",Arial,sans-serif}
+.classifieds .ad{padding:6px 7px;border-right:1px dotted var(--faint);border-bottom:1px dotted var(--faint)}
+.classifieds .ad b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+.classifieds .ad .price{font-weight:900;color:var(--red)}.classifieds .ad .contact{color:var(--ink2);font-style:italic;display:block}
+.classifieds .ad.display{background:var(--tint)}.classifieds .ad.display img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;margin:0 0 4px}
+.interview{display:grid;grid-template-columns:200px 1fr;gap:16px;margin:6px 0 12px;break-inside:avoid}
+.interview figure.plate{margin:0}.interview figure.plate img{aspect-ratio:3/4;filter:grayscale(.1)}
+.interview .qa{font-size:13px}
+.interview .qa .q{font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;color:var(--red);margin:0 0 2px;text-align:left}
+.interview .qa .a{margin:0 0 9px;text-align:left}
+.interview .who{font-family:"Helvetica Neue",Arial,sans-serif;font-weight:900;font-size:16px;margin:0 0 6px}
+.interview .who small{display:block;font-weight:400;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
+.sources{font-size:10.5px;color:var(--ink2);margin:6px 0 0}.sources a{color:var(--red)}
+.notice{background:var(--ink);color:var(--paper);text-align:center;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;letter-spacing:.14em;text-transform:uppercase;font-size:12px;padding:6px 10px;margin:0 0 8px}
+.notice.paused{background:var(--red)}
+.pgtabs{display:none}
+article.hint-obituary{border-top:6px solid var(--ink)}.hint-obituary figure.plate img{filter:grayscale(1) contrast(1.1)}
+.hint-obituary h2::before{content:"In memoriam";display:block;font-family:Georgia,serif;font-style:italic;font-weight:400;font-size:12px;letter-spacing:.08em;color:var(--ink2)}
+article.hint-wanted,article.hint-crime{border:4px double var(--ink);padding:10px 12px 6px;background:var(--tint)}
+.hint-wanted .kicker,.hint-crime .kicker{display:block;text-align:center;font-size:34px;letter-spacing:.2em;color:var(--ink);margin:0 0 6px;line-height:1}
+.hint-crime .kicker{background:var(--red);color:#fff;font-size:20px;padding:6px 0}
+.hint-wanted h2,.hint-crime h2{text-align:center}
+.hint-wanted figure.plate img{border:3px solid var(--ink);aspect-ratio:1/1;filter:sepia(.35) contrast(1.15)}
+.hint-wanted blockquote.pull{border:0;font-family:"Helvetica Neue",Arial,sans-serif;font-style:normal;font-weight:900;text-transform:uppercase;font-size:15px}
+article.hint-forsale{border:2px dashed var(--ink);padding:8px 10px 4px}
+.hint-forsale table.agate td:last-child{font-weight:900;color:var(--red)}
+.hint-business{border-top:4px solid #1d5a3a}.hint-business .kicker{color:#1d5a3a}.hint-business .stat{border-top-color:#1d5a3a}
+.hint-sports table.agate th{background:var(--ink);color:var(--paper);border-bottom:0}
+.hint-sports table.agate tr:first-child td{font-weight:900}
+.hint-minutes .body{font-family:"Courier New",Courier,monospace;font-size:12.5px}
+.hint-minutes .body h4{font-family:"Courier New",Courier,monospace;text-decoration:underline}
+.hint-testimonial .quotes{border-top:3px solid var(--ink)}
+.hint-testimonial .quote .text{font-size:14px}
+article.hint-report{border:1px solid var(--ink);padding:10px 12px 4px;background:var(--tint)}
+.hint-report .kicker{border:2px solid var(--red);padding:2px 8px;transform:rotate(-2deg);font-size:12px}
+article.hint-apology{background:#fbf3d7;border:1px solid #d9c98a;padding:14px 16px 8px;font-family:"Segoe Script","Bradley Hand","Lucida Handwriting","Comic Sans MS",cursive;font-size:14px}
+.hint-apology h2{font-family:"Segoe Script","Bradley Hand","Lucida Handwriting","Comic Sans MS",cursive;font-weight:400}
+.hint-apology .body,.hint-apology p{text-align:left;hyphens:none}
+.hint-itinerary .box li{border-bottom:1px dotted var(--faint);padding:2px 0;list-style:none}
+.hint-itinerary .box ol,.hint-itinerary .box ul{padding-left:0}
+.hint-itinerary .box li::before{content:"\25B8";color:var(--red);margin-right:6px;font-weight:700}
+.hint-interview .interview,.hint-classified .classifieds{break-inside:avoid}
+"""
+
+_PAPER_CSS = r"""
+:root{--ink:#1b1a17;--ink2:#4a4741;--rule:#1b1a17;--paper:#f6f1e6;--paper2:#d8d1c0;--red:#c8102e;--accent:#c8102e;--faint:#9c9686;--tint:#efe8d6}
+body{color:var(--ink);font-family:Georgia,"Times New Roman","Liberation Serif",serif;font-size:14.5px;line-height:1.42;background:var(--paper2)}
+.sheet{max-width:1240px;margin:0 auto;padding:18px 0}
+.page{max-width:1240px;background:var(--paper);padding:22px 30px 30px;box-shadow:0 8px 30px rgba(0,0,0,.28)}
+.ears{display:flex;justify-content:space-between;gap:16px;font-size:11px;color:var(--ink2);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);padding:4px 0;text-transform:uppercase;letter-spacing:.06em}
+.ears b{color:var(--ink)}.ears .tag{color:var(--red);font-weight:700}
+h1.masthead{font-family:"Old English Text MT","UnifrakturMaguntia","Cloister Black","Blackmoor LET","Lucida Blackletter","Textura",Georgia,serif;font-weight:400;text-align:center;font-size:66px;letter-spacing:.005em;margin:12px 0 2px;line-height:1}
+.motto{text-align:center;font-style:italic;color:var(--ink2);font-size:12.5px;margin:0 0 6px}
+.dateline{display:flex;justify-content:space-between;border-top:3px double var(--rule);border-bottom:1px solid var(--rule);padding:4px 0;font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;margin:0 0 14px}
+.front{display:grid;grid-template-columns:1fr 292px;gap:0 26px;align-items:start}
+.front .main{border-right:1px solid #d9d2c1;padding-right:26px;min-width:0}
+.front .side{min-width:0}
+.lead h2{font-size:52px;line-height:.98;margin:0 0 10px;font-weight:700;letter-spacing:-.02em}
+.lead .deck{font-size:19px;font-style:italic;color:var(--ink2);margin:0 0 8px;line-height:1.3}
+.lead figure.plate img{max-height:520px}
+.lead .body{column-count:3;column-gap:24px;column-rule:1px solid #d9d2c1;margin-top:6px}
+.lead .body p:first-of-type::first-letter{float:left;font-size:62px;line-height:.8;padding:6px 8px 0 0;font-weight:700}
+.side .story{border-top:3px solid var(--red);padding-top:6px}
+.side .story h2{font-size:19px}
+.side .story .body{font-size:13px}
+.side .story figure.plate img{max-height:180px}
+.side .story .stat b{font-size:40px}
+.hl{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--red);font-weight:700}
+.pghead{display:grid;grid-template-columns:1fr auto 1fr;align-items:baseline;border-bottom:3px double var(--rule);padding:0 0 4px;margin:0 0 12px;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
+.pghead .mh{font-family:"Old English Text MT","UnifrakturMaguntia","Cloister Black","Blackmoor LET","Lucida Blackletter",Georgia,serif;font-size:26px;text-transform:none;letter-spacing:0;color:var(--ink)}
+.pghead .folio{text-align:right}.pghead .folio b{font-size:20px;color:var(--ink);font-family:"Helvetica Neue",Arial,sans-serif}
+.section{border-top:1px solid var(--rule);margin:0 0 8px;padding-top:3px;font-size:11.5px;text-transform:uppercase;letter-spacing:.18em;font-weight:700;break-after:avoid}
+.section i{font-style:normal;color:var(--red)}
+.flow{column-count:4;column-gap:24px;column-rule:1px solid #d9d2c1}
+.p1flow{border-top:3px double var(--rule);padding-top:12px;margin-top:14px}
+.story{margin:0 0 16px;padding:0 0 10px;border-bottom:1px solid #d9d2c1}
+.story.short{break-inside:avoid-column}
+.flow.n1{column-count:3}.flow.n1 .story.short,.flow.n2 .story.short{break-inside:auto}
+.story h2{font-size:21px;line-height:1.1;margin:0 0 5px;font-weight:700;break-after:avoid;letter-spacing:-.01em}
+.story .deck{font-size:14px;font-style:italic;color:var(--ink2);margin:0 0 6px;line-height:1.3}
+.story.span{border-top:1px solid var(--rule);padding-top:10px;margin-top:6px}
+.story.span .body{column-count:2;column-gap:24px}
+.story.span h2{font-size:30px}
+.story.wide .body{column-count:2;column-gap:24px}
+blockquote.pull{margin:10px 0;padding:8px 0;border-top:2px solid var(--rule);border-bottom:2px solid var(--rule);font-size:18px;line-height:1.25;font-style:italic;text-align:center;break-inside:avoid}
+blockquote.pull::before{content:"\201C";color:var(--red);font-size:30px;line-height:0;vertical-align:-10px;margin-right:4px}
+h3,h4{margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
+figure.plate img{filter:contrast(1.04) saturate(1.05);border:1px solid #cfc7b3}
+.colophon{border-top:3px double var(--rule);margin-top:20px;padding-top:6px;font-size:10.5px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.folio-foot{display:flex;justify-content:space-between;border-top:1px solid var(--rule);margin-top:18px;padding-top:4px;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
+@media (max-width:980px){.flow{column-count:2}.lead .body{column-count:2}.front{grid-template-columns:1fr}.front .main{border-right:0;padding-right:0}h1.masthead{font-size:46px}.lead h2{font-size:34px}.classifieds{grid-template-columns:1fr 1fr}}
+@media (max-width:640px){.flow,.lead .body,.story.span .body{column-count:1}.page{padding:14px}h1.masthead{font-size:36px}.lead h2{font-size:27px}.interview{grid-template-columns:1fr}}
+@media print{
+ @page{size:A3 landscape;margin:9mm}
+ body{background:#fff;font-size:12.5px}
+ .sheet{max-width:none;padding:0}
+ .page{box-shadow:none;max-width:none;margin:0;padding:6mm 8mm;page-break-after:always;break-after:page}
+ .page:last-child{page-break-after:auto;break-after:auto}
+ .flow{column-count:5}.lead .body{column-count:4}
+ .plexus-canvas,.plexus-labels{display:none}
+ .quote .ctl{display:none}
+ figure.plate img{filter:none}
+}
+"""
+
+_PAPER_CSS_TABLOID = r"""
+:root{--ink:#111;--ink2:#3a3a3a;--rule:#111;--paper:#fff;--paper2:#c9c9c9;--red:#e2001a;--accent:#e2001a;--navy:#0b2a5b;--yellow:#ffd200;--teal:#008c95;--faint:#8c8c8c;--tint:#fff3b8}
+body{color:var(--ink);font-family:"Helvetica Neue",Arial,"Liberation Sans",sans-serif;font-size:13.5px;line-height:1.36;background:var(--paper2)}
+.sheet{max-width:900px;margin:0 auto;padding:16px 0}
+.page{max-width:900px;background:var(--paper);padding:14px 18px 22px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.cond,h1,h2,.splash-head,.kicker-bar,.flash,.band,.tbox h3,.pghead,.roundel,.teaser h3{font-family:"Arial Narrow","Roboto Condensed","Helvetica Neue Condensed","Franklin Gothic Medium",Impact,"Arial Black",sans-serif;font-stretch:condensed}
+.tmast{display:grid;grid-template-columns:1fr 150px;gap:10px;align-items:stretch;margin:0 0 8px}
+.tmast .red{background:var(--red);color:#fff;padding:8px 14px 8px;position:relative}
+.tmast .red h1{margin:0;font-size:78px;line-height:.9;letter-spacing:-.03em;font-weight:900;text-transform:none;font-style:italic}
+.tmast .red .sub{display:flex;gap:14px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:6px;font-weight:700}
+.tmast .red .sub span{background:#fff;color:var(--red);padding:2px 6px}
+.roundel{display:flex;flex-direction:column;align-items:center;justify-content:center;border:4px solid var(--ink);border-radius:50%;width:150px;height:150px;font-weight:900;text-align:center;line-height:.9;background:#fff;align-self:center}
+.roundel b{font-size:46px;letter-spacing:-.03em}.roundel.small b{font-size:27px}.roundel span{font-size:10px;text-transform:uppercase;letter-spacing:.1em;margin:0 0 3px}
+.teasers{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:0 0 8px}
+.teaser{display:grid;grid-template-columns:64px 1fr;gap:6px;align-items:center;padding:5px 7px;color:#fff;min-height:64px}
+.teaser.c0{background:var(--navy)}.teaser.c1{background:var(--teal)}.teaser.c2{background:var(--ink)}.teaser.c3{background:#6b1a8b}
+.teaser img{width:64px;height:54px;object-fit:cover;display:block;border:1px solid #fff}
+.teaser h3{margin:0;font-size:17px;line-height:.98;font-weight:900;text-transform:uppercase}
+.teaser small{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--yellow);margin-top:2px}
+.kicker-bar{background:#fff;color:var(--red);border:3px solid var(--red);text-align:center;font-size:30px;font-weight:900;text-transform:uppercase;letter-spacing:.02em;padding:2px 8px;margin:0 0 6px;line-height:1.05}
+.splash{position:relative;min-height:420px;background:var(--ink);overflow:hidden;margin:0 0 8px}
+.splash img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 30%}
+.splash.top img{object-position:center top}.splash.bottom img{object-position:center bottom}
+.splash .flash{position:absolute;right:14px;top:14px;background:var(--red);color:#fff;font-weight:900;font-size:22px;padding:3px 12px;text-transform:uppercase;letter-spacing:.02em;transform:rotate(-3deg);box-shadow:2px 2px 0 #000}
+.splash .head{position:absolute;left:0;bottom:0;right:0;padding:14px 16px 12px;background:linear-gradient(180deg,rgba(0,0,0,0),rgba(0,0,0,.72) 40%,rgba(0,0,0,.9))}
+.splash-head.long{font-size:66px}.splash-head.xl{font-size:52px}
+.splash-head{margin:0;color:#fff;font-size:84px;line-height:.86;font-weight:900;text-transform:uppercase;letter-spacing:-.03em;text-shadow:3px 3px 0 #000,0 0 18px rgba(0,0,0,.8);word-break:break-word}
+.splash .deck{color:#fff;font-size:17px;margin:8px 0 0;font-weight:700;text-align:left;text-shadow:1px 1px 0 #000}
+.splash .cap{position:absolute;left:12px;top:12px;background:rgba(255,255,255,.9);color:var(--ink);font-size:10px;padding:2px 6px;max-width:60%}
+.tfront{display:grid;grid-template-columns:1fr 250px;gap:14px;align-items:start}
+.tfront .main .body{column-count:2;column-gap:16px}
+.tfront .main .body p:first-of-type::first-letter{float:left;font-size:54px;line-height:.8;padding:4px 6px 0 0;font-weight:900;color:var(--red)}
+.tfront .main .byline{margin-top:4px}
+.tbox{padding:8px 10px;margin:0 0 8px;color:#fff;break-inside:avoid}
+.tbox.c0{background:var(--navy)}.tbox.c1{background:var(--teal)}.tbox.c2{background:var(--ink)}.tbox.c3{background:#6b1a8b}.tbox.c4{background:var(--red)}
+.tbox.y{background:var(--yellow);color:var(--ink)}
+.tbox h3{margin:0 0 4px;font-size:22px;line-height:.95;font-weight:900;text-transform:uppercase}
+.tbox p{text-align:left;margin:0 0 4px;font-size:12px}
+.tbox .stat{border-top-color:#fff;padding:4px 0}.tbox .stat b{color:#fff;font-size:30px}.tbox .stat span{color:#fff}
+.tbox.y .stat{border-top-color:var(--ink)}.tbox.y .stat b,.tbox.y .stat span{color:var(--ink)}
+.tbox .box{border-color:var(--ink);color:var(--ink)}.tbox.y .box{background:#fff;border-color:var(--ink);color:var(--ink)}
+.tbox .kicker{background:var(--yellow);color:var(--ink)}.tbox.y .kicker{background:var(--ink);color:var(--yellow)}
+.tbox .more{font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:900;color:var(--yellow)}
+.pghead{display:flex;justify-content:space-between;align-items:center;background:var(--red);color:#fff;padding:4px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.12em;font-weight:900;margin:0 0 10px}
+.pghead .mh{font-size:20px;font-style:italic;letter-spacing:-.02em;text-transform:none;white-space:nowrap}.pghead>span:nth-child(2){flex:1;text-align:center;font-size:10px;padding:0 8px}.pghead .folio{white-space:nowrap}
+.pghead .folio b{font-size:22px;margin-left:6px}
+.band{background:var(--ink);color:#fff;font-size:15px;font-weight:900;text-transform:uppercase;letter-spacing:.14em;padding:3px 10px;margin:10px 0 8px}
+.band.c0{background:var(--navy)}.band.c1{background:var(--teal)}.band.c2{background:var(--red)}.band.c3{background:#6b1a8b}.band.c4{background:var(--ink)}
+.band i{font-style:normal;color:var(--yellow);margin-left:8px;font-weight:400;letter-spacing:.06em;font-size:11px}
+.flow{column-count:3;column-gap:14px;column-rule:1px solid #ddd}
+.story{margin:0 0 12px;padding:0 0 8px;border-bottom:2px solid var(--ink)}
+.story.short{break-inside:auto}
+.flow.n1{column-count:2}
+.story h2{font-size:30px;line-height:.92;margin:0 0 5px;font-weight:900;text-transform:uppercase;letter-spacing:-.02em;break-after:avoid}
+.story .deck{font-size:13px;font-weight:700;color:var(--ink);margin:0 0 6px;line-height:1.25;text-align:left}
+.story.span{border-top:4px solid var(--red);padding-top:8px;margin-top:6px}
+.story.span .body{column-count:3;column-gap:14px}
+.story.span h2{font-size:44px}
+.story.wide .body{column-count:2;column-gap:14px}
+.story:not(.span):not(.hint-classified) .body p:first-of-type::first-letter{float:left;font-size:44px;line-height:.82;padding:3px 5px 0 0;font-weight:900;color:var(--red)}
+.flash{display:inline-block;background:var(--red);color:#fff;font-weight:900;font-size:13px;padding:2px 8px;text-transform:uppercase;margin:0 0 4px 6px;transform:rotate(-2deg)}
+.kicker{font-size:12px;background:var(--yellow);color:var(--ink);padding:1px 6px}
+blockquote.pull{margin:8px 0;padding:8px 10px;background:var(--ink);color:#fff;font-size:20px;line-height:1.05;font-weight:900;text-transform:uppercase;text-align:left;break-inside:avoid;font-family:"Arial Narrow","Roboto Condensed",Impact,sans-serif}
+blockquote.pull::before{content:"\201C";color:var(--yellow);margin-right:3px}
+h3,h4{margin:8px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;font-weight:900}
+.stat{border-top:0;background:var(--red);color:#fff;padding:6px 8px}.stat b{color:#fff;font-size:32px}.stat span{color:#fff}
+.stats .stat:nth-child(2){background:var(--navy)}.stats .stat:nth-child(3){background:var(--teal)}.stats .stat:nth-child(4){background:var(--ink)}
+.box{border:0;background:var(--yellow);padding:8px 10px}.box h4{font-size:12px}
+.serial{border:0;background:var(--navy);color:#fff}.serial .part{color:var(--yellow)}
+.quotes{background:var(--ink);color:#fff;padding:8px 10px}
+.quotes h4{color:var(--yellow);font-size:14px;letter-spacing:.12em}
+.quote{border-top:1px dotted #666}.quote .who{color:var(--yellow)}.quote .text{font-style:normal;font-weight:700}
+.quote button,.quote a{background:#fff;color:var(--ink);border-color:#fff}.quote button:hover,.quote a:hover{background:var(--red);color:#fff;border-color:var(--red)}
+figure.plate img{border:2px solid var(--ink);aspect-ratio:4/3}
+figure.plate figcaption{background:var(--ink);color:#fff;padding:3px 6px;margin:0 0 6px;font-size:10.5px;font-weight:700}
+figure.plate figcaption b{color:var(--yellow)}figure.plate .credit{color:#bbb}
+.plates{gap:5px}.plates figure.plate img{aspect-ratio:1/1}
+table.agate th{background:var(--ink);color:#fff;border-bottom:0}
+svg.chart .bar{fill:var(--red)}svg.chart .line{stroke:var(--navy)}svg.chart .dot{stroke:var(--navy)}
+svg.chart .slice.s0{fill:#e2001a}svg.chart .slice.s1{fill:#0b2a5b}svg.chart .slice.s2{fill:#ffd200}svg.chart .slice.s3{fill:#008c95}svg.chart .slice.s4{fill:#111}svg.chart .slice.s5{fill:#6b1a8b}
+svg.cloud .w1{fill:var(--red)}svg.cloud .w2{fill:var(--navy)}svg.cloud .w3{fill:var(--teal)}
+.classifieds{grid-template-columns:repeat(3,1fr);border:2px solid var(--ink)}
+.classifieds .ad b{color:var(--navy)}
+.interview{background:var(--navy);color:#fff;padding:10px;grid-template-columns:170px 1fr}
+.interview .qa .q{color:var(--yellow)}.interview .who small{color:#cfd8ea}
+.interview figure.plate img{border-color:#fff}
+.notice{background:var(--yellow);color:var(--ink);font-size:16px}
+.notice.paused{background:var(--red);color:#fff}
+article.hint-obituary{border-top:8px solid var(--ink)}
+article.hint-wanted,article.hint-crime{border-color:var(--red);background:var(--tint)}
+.hint-crime .kicker{background:var(--red);color:#fff}
+article.hint-report{background:#eef1f7;border-color:var(--navy)}
+article.hint-apology{background:#fffbe6}
+.hint-minutes .body{font-size:12px}
+.colophon{border-top:3px solid var(--ink);margin-top:16px;padding-top:6px;font-size:10px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.folio-foot{display:flex;justify-content:space-between;background:var(--ink);color:#fff;margin-top:14px;padding:3px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:900}
+@media (max-width:760px){.flow,.story.span .body,.tfront .main .body{column-count:1}.tfront{grid-template-columns:1fr}.tmast{grid-template-columns:1fr}.roundel{display:none}.splash-head{font-size:52px}.teasers{grid-template-columns:1fr}.classifieds{grid-template-columns:1fr 1fr}.interview{grid-template-columns:1fr}}
+@media print{
+ @page{size:A4 portrait;margin:7mm}
+ body{background:#fff;font-size:11.5px}
+ .sheet{max-width:none;padding:0}
+ .page{box-shadow:none;max-width:none;margin:0;padding:0;page-break-after:always;break-after:page}
+ .page:last-child{page-break-after:auto;break-after:auto}
+ .flow{column-count:2}.story.span .body{column-count:2}
+ .splash{min-height:300px}.splash-head{font-size:64px}
+ .tmast .red h1{font-size:60px}
+ .plexus-canvas,.plexus-labels{display:none}
+ .quote .ctl{display:none}
+}
+*{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+"""
+
+
+def _paper_style(style: Any) -> str:
+    s = str(style or "").strip().lower()
+    return s if s in PAPER_STYLES else "broadsheet"
+
+
+def _paper_pages(ed: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """#1023: the lead and the pages. A story sits on meta.page (else its
+    section's page), pages hold stories in section order then priority,
+    empty pages are dropped and the rest renumbered so folios run 1..N.
+    A one-page paper with more than the lead and the hour on it is split
+    so it always opens to two."""
     head = paper_masthead()
-    section_name = {s["id"]: s["name"] for s in head["sections"]}
+    order = {s["id"]: i for i, s in enumerate(head["sections"])}
+    articles = [a for a in (ed.get("articles") or []) if not a.get("error")]
     lead = next((a for a in articles
                  if int((a.get("meta") or {}).get("priority") or 0) == 1), None)
+    if lead is None and articles:
+        lead = articles[0]
     rest = [a for a in articles if a is not lead]
-    order = {s["id"]: i for i, s in enumerate(head["sections"])}
-    rest.sort(key=lambda a: (order.get(str(a["meta"].get("section")), 99),
-                             int(a["meta"].get("priority") or 5)))
-    since = float(ed.get("since") or time.time())
-    at = float(ed.get("at") or time.time())
-    number = 1
-    try:
-        founded = time.mktime(time.strptime(str(head.get("founded") or "2026-09-04"),
-                                            "%Y-%m-%d"))
-        number = max(1, int((since - founded) // 3600) + 1)
-    except Exception:  # noqa: BLE001
-        number = 1
 
-    def story_html(a: dict[str, Any], is_lead: bool, kicker: str = "") -> str:
+    def page_of(a: dict[str, Any]) -> int:
         meta = a.get("meta") or {}
-        sec = str(meta.get("section") or "front")
-        bits: list[str] = [kicker] if kicker else []
-        headline = str(meta.get("headline") or meta.get("title") or "")
+        try:
+            p = int(meta.get("page") or 0)
+        except (TypeError, ValueError):
+            p = 0
+        if p < 1:
+            p = paper_page_for(str(meta.get("section") or ""))
+        return max(1, min(PAPER_PAGES_MAX, p))
+
+    def sort_key(a: dict[str, Any]) -> tuple[int, int, str]:
+        meta = a.get("meta") or {}
+        try:
+            pr = int(meta.get("priority") or 5)
+        except (TypeError, ValueError):
+            pr = 5
+        return (order.get(str(meta.get("section") or ""), 99), pr, str(a.get("file") or ""))
+
+    buckets: dict[int, list[dict[str, Any]]] = {}
+    for a in rest:
+        buckets.setdefault(page_of(a), []).append(a)
+    for rows in buckets.values():
+        rows.sort(key=sort_key)
+    if len(buckets) <= 1 and rest:
+        only = buckets.get(next(iter(buckets)), []) if buckets else []
+        stay = [a for a in only if str((a.get("meta") or {}).get("section") or "") in ("front", "hour")]
+        move = [a for a in only if a not in stay]
+        if move:
+            buckets = {1: stay, 2: move}
+    pages: list[dict[str, Any]] = []
+    if lead is not None and 1 not in buckets:
+        buckets[1] = []
+    for n, key in enumerate(sorted(buckets), start=1):
+        stories = buckets[key]
+        secs: list[str] = []
+        for a in stories:
+            name = str((a.get("meta") or {}).get("section") or "")
+            if name and name not in secs:
+                secs.append(name)
+        pages.append({"n": n, "stories": stories, "sections": secs})
+    if not pages:
+        pages.append({"n": 1, "stories": [], "sections": []})
+    return lead, pages
+
+
+def _paper_plate_html(url: Any, caption: Any = "", credit: Any = "", focus: Any = "",
+                      alt: Any = "", extra: str = "") -> str:
+    url = str(url or "")
+    if not url:
+        return ""
+    focus = str(focus or "center")
+    cls = "plate " + ("top" if focus == "top" else "bottom" if focus == "bottom" else "center")
+    cap = ""
+    if caption or credit:
+        cap = ("<figcaption>"
+               + (f'<span class="credit">{_paper_esc(credit)}</span>' if credit else "")
+               + _paper_esc(caption) + "</figcaption>")
+    return (f'<figure class="{cls}{extra}"><img src="{_paper_esc(url)}" alt="{_paper_esc(alt)}" '
+            'loading="lazy" onerror="this.parentNode.remove()">' + cap + "</figure>")
+
+
+def _paper_stats_html(stats: Any) -> str:
+    rows = [s for s in (stats or []) if isinstance(s, dict) and s.get("value") is not None][:PAPER_STATS_MOST]
+    if not rows:
+        return ""
+    return '<div class="stats">' + "".join(
+        f'<div class="stat"><b>{_paper_esc(str(s.get("value"))[:9])}</b>'
+        f'<span>{_paper_esc(str(s.get("label") or "")[:28])}</span></div>' for s in rows) + "</div>"
+
+
+def _paper_box_html(box: Any, cls: str = "") -> str:
+    if not isinstance(box, dict):
+        return ""
+    items = [str(i) for i in (box.get("items") or []) if str(i).strip()]
+    if not items and not box.get("title"):
+        return ""
+    return (f'<div class="box {cls}">'
+            + (f"<h4>{_paper_esc(box.get('title'))}</h4>" if box.get("title") else "")
+            + "<ul>" + "".join(f"<li>{_md_inline(i)}</li>" for i in items[:24]) + "</ul></div>")
+
+
+def _paper_serial_html(serial: Any) -> str:
+    if not isinstance(serial, dict) or not (serial.get("title") or serial.get("so_far")):
+        return ""
+    return ('<div class="serial">'
+            f'<h4>{_paper_esc(serial.get("title") or "The Serial")}</h4>'
+            + (f'<div class="part">Part {_paper_esc(serial.get("part"))}</div>' if serial.get("part") else "")
+            + (f'<p><b>The story so far</b> · {_md_inline(str(serial.get("so_far")))}</p>' if serial.get("so_far") else "")
+            + (f'<p><b>Next</b> · {_md_inline(str(serial.get("next")))}</p>' if serial.get("next") else "")
+            + "</div>")
+
+
+def _paper_quotes_html(quotes: Any, style: str, title: str = "") -> str:
+    """#1023: the verbatim lines with ▶ (play) and ⬇ (download) when the
+    clip is still there. The buttons carry data-clip; the page's script
+    plays them (through the panel's clipToggle when it is the parent)."""
+    rows = [q for q in (quotes or []) if isinstance(q, dict) and str(q.get("text") or "").strip()]
+    if not rows:
+        return ""
+    head = title or ("What they said" if style == "tabloid" else "In their own words")
+    out = [f'<div class="quotes"><h4>{_paper_esc(head)}</h4>']
+    for q in rows[:10]:
+        url = str(q.get("url") or "")
+        at = q.get("at")
+        when = ""
+        try:
+            when = f" · {_paper_clock(float(at))}" if at else ""
+        except (TypeError, ValueError):
+            when = ""
+        ctl = ""
+        if url:
+            ctl = ('<span class="ctl">'
+                   f'<button type="button" data-clip="{_paper_esc(url)}" data-label="&#9654;" '
+                   'title="Play this line">&#9654;</button>'
+                   f'<a href="{_paper_esc(url)}" download title="Download this line">&#11015;</a></span>')
+        out.append('<div class="quote">'
+                   f'<span class="who">{_paper_esc(q.get("who") or "")}{when}</span>'
+                   f'<span class="text">&ldquo;{_md_inline(str(q.get("text")))}&rdquo;</span>'
+                   + ctl + "</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def _paper_classifieds_html(rows: Any) -> str:
+    ads = [r for r in (rows or []) if isinstance(r, dict) and (r.get("head") or r.get("body"))]
+    if not ads:
+        return ""
+    out = ['<div class="classifieds">']
+    for r in ads[:40]:
+        img = str(r.get("image") or "")
+        cls = "ad display" if img else "ad"
+        out.append(f'<div class="{cls}">'
+                   + (f'<img src="{_paper_esc(img)}" alt="" loading="lazy" onerror="this.remove()">' if img else "")
+                   + f"<b>{_paper_esc(r.get('head') or '')}</b>{_md_inline(str(r.get('body') or ''))}"
+                   + (f' <span class="price">{_paper_esc(r.get("price"))}</span>' if r.get("price") else "")
+                   + (f'<span class="contact">{_paper_esc(r.get("contact"))}</span>' if r.get("contact") else "")
+                   + "</div>")
+    out.append("</div>")
+    return "".join(out)
+
+
+def _paper_interview_html(iv: Any) -> str:
+    if not isinstance(iv, dict) or not (iv.get("qa") or iv.get("name")):
+        return ""
+    qa = [x for x in (iv.get("qa") or []) if isinstance(x, dict) and x.get("q")]
+    portrait = str(iv.get("portrait") or "")
+    return ('<div class="interview">'
+            + (_paper_plate_html(portrait, "", "", "top", iv.get("name") or "") if portrait else "<div></div>")
+            + '<div class="qa">'
+            f'<div class="who">{_paper_esc(iv.get("name") or "")}'
+            + (f"<small>{_paper_esc(iv.get('role'))}</small>" if iv.get("role") else "")
+            + "</div>"
+            + "".join(f'<p class="q">Q: {_md_inline(str(x.get("q")))}</p>'
+                      f'<p class="a">{_md_inline(str(x.get("a") or ""))}</p>' for x in qa[:9])
+            + "</div></div>")
+
+
+def _paper_story_html(a: dict[str, Any], ctx: dict[str, Any], mode: str = "story",
+                      kicker_html: str = "") -> str:
+    """One story, every meta field. mode: lead | story | side (the front's
+    sidebar) | brief (a tabloid teaser box)."""
+    meta = a.get("meta") or {}
+    style = ctx["style"]
+    section_name = ctx["section_name"]
+    sec = str(meta.get("section") or "front")
+    hint = str(meta.get("style_hint") or "")
+    headline = str(meta.get("headline") or meta.get("title") or a.get("headline_hint") or "")
+    bits: list[str] = [kicker_html] if kicker_html else []
+    kicker = str(meta.get("kicker") or "")
+    if hint == "crime" and not kicker:
+        kicker = "Crime stoppers"
+    if hint == "wanted" and not kicker:
+        kicker = "Wanted"
+    # the tabloid's splash already carries the lead's kicker, flash,
+    # headline and deck - the story below it starts at the byline
+    on_splash = style == "tabloid" and mode == "lead"
+    if kicker and not on_splash:
+        bits.append(f'<div class="kicker">{_paper_esc(kicker)}</div>')
+    if style == "tabloid" and meta.get("flash") and not on_splash:
+        bits.append(f'<span class="flash">{_paper_esc(meta["flash"])}</span>')
+    if not on_splash:
         bits.append(f"<h2>{_paper_esc(headline)}</h2>")
         if meta.get("deck"):
             bits.append(f'<p class="deck">{_paper_esc(meta["deck"])}</p>')
-        bits.append('<p class="byline"><span class="sec">'
-                    f'{_paper_esc(section_name.get(sec, sec))}</span>'
-                    + (f' · {_paper_esc(meta["byline"])}' if meta.get("byline") else "")
-                    + "</p>")
-        image = str(meta.get("image") or meta.get("photo") or "")
-        if image:
-            bits.append(f'<figure class="plate"><img src="{_paper_esc(image)}" '
-                        f'alt="{_paper_esc(headline)}" loading="lazy" '
-                        'onerror="this.parentNode.remove()"></figure>')
-        chart = meta.get("chart")
-        if isinstance(chart, dict):
-            svg = _paper_svg_chart(chart)
-            if svg:
-                bits.append(svg)
-                if meta.get("caption"):
-                    bits.append(f'<p class="caption">{_paper_esc(meta["caption"])}</p>')
-        body_html = _md_html(str(a.get("body") or ""))
-        pull = str(meta.get("pull") or "")
-        if pull and not is_lead:
-            body_html = body_html.replace(
-                "</p>", "</p><blockquote class=\"pull\">" + _md_inline(pull)
-                + "</blockquote>", 1)
-        elif pull:
-            bits.append(f'<blockquote class="pull">{_md_inline(pull)}</blockquote>')
-        bits.append(f'<div class="body">{body_html}</div>')
+    bits.append('<p class="byline"><span class="sec">'
+                f'{_paper_esc(section_name.get(sec, sec))}</span>'
+                + (f' · {_paper_esc(meta["byline"])}' if meta.get("byline") else "")
+                + "</p>")
+    image = str(meta.get("image") or meta.get("photo") or "")
+    if image and not (mode == "lead" and style == "tabloid"):
+        bits.append(_paper_plate_html(image, meta.get("caption") if not meta.get("chart") else "",
+                                      meta.get("credit"), meta.get("focus"), headline))
+    bits.append(_paper_stats_html(meta.get("stats")))
+    chart = meta.get("chart")
+    if isinstance(chart, dict):
+        svg = _paper_svg_chart(chart)
+        if svg:
+            bits.append(svg)
+            if meta.get("caption"):
+                bits.append(f'<p class="caption">{_paper_esc(meta["caption"])}</p>')
+    bits.append(_paper_box_html(meta.get("box"), "itin" if hint == "itinerary" else ""))
+    bits.append(_paper_serial_html(meta.get("serial")))
+    if hint == "testimonial":
+        bits.append(_paper_quotes_html(meta.get("quotes"), style, "Testimonials"))
+    bits.append(_paper_interview_html(meta.get("interview")))
+    body_html = _md_html(str(a.get("body") or ""))
+    pull = str(meta.get("pull") or "")
+    if pull and mode not in ("lead", "brief"):
+        body_html = body_html.replace(
+            "</p>", "</p><blockquote class=\"pull\">" + _md_inline(pull) + "</blockquote>", 1)
+    elif pull and mode == "lead":
+        bits.append(f'<blockquote class="pull">{_md_inline(pull)}</blockquote>')
+    if mode == "brief":
+        first = re.search(r"<p>(.*?)</p>", body_html, flags=re.S)
+        body_html = f"<p>{first.group(1)[:260]}&hellip;</p>" if first else ""
+    bits.append(f'<div class="body">{body_html}</div>')
+    if mode != "brief":
+        if hint != "testimonial":
+            bits.append(_paper_quotes_html(meta.get("quotes"), style))
+        more = [i for i in (meta.get("images") or []) if isinstance(i, dict) and i.get("url")]
+        if more:
+            bits.append('<div class="plates">' + "".join(
+                _paper_plate_html(i.get("url"), i.get("caption"), i.get("credit"),
+                                  i.get("focus"), headline) for i in more[:6]) + "</div>")
+        bits.append(_paper_classifieds_html(meta.get("classifieds")))
         srcs = [s for s in (meta.get("sources") or []) if isinstance(s, dict)]
         if srcs:
             bits.append('<p class="sources">Sources: ' + "; ".join(
@@ -88013,57 +97456,760 @@ def paper_render_html(ed: dict[str, Any]) -> str:
                  f'{_paper_esc(s.get("name") or s["url"])}</a>')
                 if str(s.get("url") or "").startswith(("http://", "https://"))
                 else _paper_esc(s.get("name") or "") for s in srcs) + "</p>")
-        cls = "lead" if is_lead else (
-            "story span" if str(meta.get("span") or "") == "full" else "story")
-        return f'<article class="{cls}">' + "".join(bits) + "</article>"
+    cls = ["lead" if mode == "lead" else "story"]
+    if hint:
+        cls.append(f"hint-{hint}")
+    span = str(meta.get("span") or "") == "full"
+    big = bool(meta.get("classifieds") or meta.get("interview"))
+    if mode == "story" and (span or big):
+        cls.append("span")
+    elif mode == "story" and (len(body_html) > 2600 or len(meta.get("quotes") or []) > 4):
+        cls.append("wide")
+    if mode in ("story", "side") and len(body_html) < 1100 and not big:
+        cls.append("short")
+    inner = "".join(b for b in bits if b)
+    return f'<article class="{" ".join(cls)}" data-file="{_paper_esc(a.get("file") or "")}">{inner}</article>'
 
-    flow: list[str] = []
+
+def _paper_ctx(ed: dict[str, Any], style: str) -> dict[str, Any]:
+    head = paper_masthead()
+    lead, pages = _paper_pages(ed)
+    since = float(ed.get("since") or time.time())
+    at = float(ed.get("at") or time.time())
+    number = 1
+    try:
+        founded = time.mktime(time.strptime(str(head.get("founded") or "2026-09-04"), "%Y-%m-%d"))
+        number = max(1, int((since - founded) // 3600) + 1)
+    except Exception:  # noqa: BLE001
+        number = 1
+    section_name = {s["id"]: s["name"] for s in head["sections"]}
+    index: list[tuple[int, str, str]] = []
+    for p in pages:
+        for a in p["stories"]:
+            meta = a.get("meta") or {}
+            index.append((p["n"], section_name.get(str(meta.get("section") or ""), str(meta.get("section") or "")),
+                          str(meta.get("headline") or "")))
+    return {"ed": ed, "head": head, "style": style, "lead": lead, "pages": pages,
+            "since": since, "at": at, "number": number, "section_name": section_name,
+            "index": index, "paused": bool(ed.get("paused")), "offline": bool(ed.get("offline")),
+            "when": time.strftime("%A, %B %d, %Y", time.localtime(since)).replace(" 0", " "),
+            "hour": _paper_hour_words(since)}
+
+
+def _paper_index_html(ctx: dict[str, Any], most: int = 14) -> str:
+    rows = ctx["index"]
+    if not rows:
+        return ""
+    seen: list[tuple[int, str, str]] = []
+    for n, sec, hl in rows:
+        if len(seen) >= most:
+            break
+        seen.append((n, sec, hl))
+    def clip(s: str, most: int = 52) -> str:
+        if len(s) <= most:
+            return s
+        cut = s[:most].rsplit(" ", 1)[0]
+        return (cut or s[:most]).rstrip(",;:-") + "…"
+    return ('<div class="box index"><h4>Inside this edition</h4><ul>' + "".join(
+        f"<li><span>{_paper_esc(clip(hl) or sec)}</span><b>p. {n}</b></li>" for n, sec, hl in seen)
+        + "</ul></div>")
+
+
+def _paper_notice_html(ctx: dict[str, Any]) -> str:
+    """#1030: the paused edition says so in red; an offline hour in ink."""
+    ed = ctx["ed"]
+    if ctx["paused"]:
+        return ('<div class="notice paused">The station is paused - this edition reports '
+                'the work behind the glass</div>')
+    if ctx["offline"] or (ed.get("on") is False):
+        return '<div class="notice">Printed with the station off the air - a quiet hour</div>'
+    return ""
+
+
+def _paper_pause_extras(ctx: dict[str, Any]) -> str:
+    """#1030: the word cloud and the plexus, set after the paused lead."""
+    if not ctx["paused"]:
+        return ""
+    ed = ctx["ed"]
+    cloud = _paper_svg_cloud(ed.get("cloud_words") or [])
+    data = _paper_plexus_data(ed)
+    svg = _paper_svg_plexus(data)
+    payload = json.dumps(data).replace("</", "<\\/")
+    return ('<div class="pause-extras">'
+            + (f'<h3>What the rooms said while the air was quiet</h3>{cloud}'
+               '<p class="caption">The words the pantry and the larder wrote since the pause began, sized by count.</p>'
+               if cloud else "")
+            + '<h3>The work behind the glass, live</h3>'
+            f'<div class="plexus" id="plexus">{svg}</div>'
+            '<p class="caption">Roads, kinds of work and the itinerary as a plexus; it turns while this page is open and the box is reachable.</p>'
+            f'<script type="application/json" id="plexus-data">{payload}</script>'
+            f"<script>{_PAPER_PLEXUS_JS}</script>"
+            "</div>")
+
+
+def _paper_folio_html(ctx: dict[str, Any], n: int, total: int) -> str:
+    head = ctx["head"]
+    return (f'<div class="folio-foot"><span>{_paper_esc(head["masthead"])}</span>'
+            f'<span>{_paper_esc(ctx["when"])} · the {_paper_esc(ctx["hour"])} hour</span>'
+            f'<span>Page {n} of {total}</span></div>')
+
+
+def _paper_colophon_html(ctx: dict[str, Any]) -> str:
+    ed = ctx["ed"]
+    report = ed.get("report") or {}
+    head = ctx["head"]
+    arts = [a for a in (ed.get("articles") or []) if not a.get("error")]
+    return ('<div class="colophon">'
+            f"<span>{_paper_esc(head['masthead'])} · set by the desks of "
+            f"{_paper_esc(ed.get('station') or PINE_BOX_FM)} · {ed.get('stories') or len(arts)} stories"
+            + (f" · tinted by {_paper_esc(ed.get('tinted_by'))}" if ed.get("tinted_by") else "")
+            + "</span><span>checks: "
+            + ("clean" if report.get("clean") else
+               f"ok, {len(report.get('lint') or [])} lint" if report.get("ok") else "red")
+            + f" · edition {_paper_esc(ed.get('id') or '')} · {ctx['style']}</span></div>")
+
+
+def _paper_spans(a: dict[str, Any]) -> bool:
+    meta = a.get("meta") or {}
+    return (str(meta.get("span") or "") == "full" or bool(meta.get("classifieds"))
+            or bool(meta.get("interview")))
+
+
+def _paper_flow_html(page: dict[str, Any], ctx: dict[str, Any], band_cls: str = "section") -> str:
+    """The stories of a page. Nothing spans inside a column flow: a story
+    that wants the whole width (span, the classifieds, the interview) is
+    set between two flows, and the tabloid's colour bands sit above each
+    section's own flow - Chrome's column balancer overflows the sheet when
+    a column-span:all element sits inside the columns (seen in the
+    screenshots of #1043's first cut)."""
+    out: list[str] = []
+    run: list[str] = []
+
+    def flush() -> None:
+        if run:
+            # n1/n2: a flow with one or two stories gets fewer columns and
+            # lets its stories break, so a lone story is not one tall strip
+            out.append(f'<div class="flow n{min(3, len(run))}">' + "".join(run) + "</div>")
+            run.clear()
+
+    if band_cls == "band":
+        groups: list[tuple[str, list[dict[str, Any]]]] = []
+        for a in page["stories"]:
+            sec = str((a.get("meta") or {}).get("section") or "")
+            if groups and groups[-1][0] == sec:
+                groups[-1][1].append(a)
+            else:
+                groups.append((sec, [a]))
+        for k, (sec, rows) in enumerate(groups):
+            name = ctx["section_name"].get(sec, sec)
+            out.append(f'<div class="band c{k % 5}">{_paper_esc(name)}<i>page {page["n"]}</i></div>')
+            for a in rows:
+                if _paper_spans(a):
+                    flush()
+                    out.append(_paper_story_html(a, ctx, "story"))
+                else:
+                    run.append(_paper_story_html(a, ctx, "story"))
+            flush()
+        return "".join(out)
     current = ""
-    for a in rest:
-        sec = str(a["meta"].get("section") or "")
+    for a in page["stories"]:
+        sec = str((a.get("meta") or {}).get("section") or "")
         kicker = ""
         if sec != current:
-            # Inside the story, not before it: a head of its own could sit
-            # at the foot of one column with its story atop the next.
-            kicker = f'<div class="section">{_paper_esc(section_name.get(sec, sec))}</div>'
+            name = ctx["section_name"].get(sec, sec)
+            kicker = f'<div class="section"><i>&#9632;</i> {_paper_esc(name)}</div>'
             current = sec
-        flow.append(story_html(a, False, kicker))
+        if _paper_spans(a):
+            flush()
+            out.append(_paper_story_html(a, ctx, "story", kicker))
+        else:
+            run.append(_paper_story_html(a, ctx, "story", kicker))
+    flush()
+    return "".join(out)
+
+
+def _paper_set_broadsheet(ctx: dict[str, Any]) -> str:
+    """#1042: the broadsheet - masthead, dateline, the lead in a wide main
+    column beside an index and the hour's sidebar, then pages of four
+    columns with a running head and a folio."""
+    ed, head, lead, pages = ctx["ed"], ctx["head"], ctx["lead"], ctx["pages"]
     now = ed.get("now") or {}
     on_air = str(ed.get("on_air_now") or "")
-    report = ed.get("report") or {}
-    when = time.strftime("%A, %B %d, %Y", time.localtime(since)).replace(" 0", " ")
-    title = f"{head['masthead']} · {_paper_hour_words(since)} hour"
-    return (
-        "<!doctype html><html><head><meta charset=\"utf-8\">"
-        f"<title>{_paper_esc(title)}</title>"
-        "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
-        f"<style>{_PAPER_CSS}</style></head><body><div class=\"sheet\">"
-        "<div class=\"ears\"><span>"
-        + (f"On air as we print: <b>{_paper_esc(on_air)}</b>" if on_air else
-           f"<b>{_paper_esc(ed.get('station') or '')}</b>")
-        + "</span><span>"
-        + (f"Turning: <b>{_paper_esc(now.get('title') or '')}</b>"
-           + (f" · {_paper_esc(now.get('artist'))}" if now.get("artist") else "")
-           if now.get("title") else "Printed on the hour")
-        + "</span></div>"
-        f"<h1 class=\"masthead\">{_paper_esc(head['masthead'])}</h1>"
-        f"<p class=\"motto\">{_paper_esc(head['motto'])}</p>"
-        "<div class=\"dateline\">"
-        f"<span>Vol. 1 · No. {number}</span>"
-        f"<span>{_paper_esc(when)} · the {_paper_hour_words(since)} hour"
-        + (" · extra" if str(ed.get("kind")) != "hourly" else "")
-        + "</span>"
-        f"<span>Printed {_paper_clock(at)}</span></div>"
-        + (story_html(lead, True) if lead else "")
-        + "<div class=\"flow\">" + "".join(flow) + "</div>"
-        "<div class=\"colophon\">"
-        f"<span>{_paper_esc(head['masthead'])} · set by the desks of "
-        f"{_paper_esc(ed.get('station') or PINE_BOX_FM)} · {ed.get('stories') or len(articles)} stories</span>"
-        "<span>checks: "
-        + ("clean" if report.get("clean") else
-           f"ok, {len(report.get('lint') or [])} lint" if report.get("ok") else "red")
-        + f" · edition {_paper_esc(ed.get('id') or '')}</span></div>"
-        "</div></body></html>")
+    total = len(pages)
+    out: list[str] = []
+    for p in pages:
+        n = p["n"]
+        out.append(f'<div class="page p{n}" id="page-{n}" data-page="{n}">')
+        if n == 1:
+            out.append(
+                '<div class="ears"><span>'
+                + (f"On air as we print: <b>{_paper_esc(on_air)}</b>" if on_air and not ctx["paused"] else
+                   f"<b>{_paper_esc(ed.get('station') or '')}</b>")
+                + "</span><span>"
+                + (f'<span class="tag">Tinted by {_paper_esc(ed.get("tinted_by"))}</span> · ' if ed.get("tinted_by") else "")
+                + (f"Turning: <b>{_paper_esc(now.get('title') or '')}</b>"
+                   + (f" · {_paper_esc(now.get('artist'))}" if now.get("artist") else "")
+                   if now.get("title") else "Printed on the hour")
+                + "</span></div>"
+                f"<h1 class=\"masthead\">{_paper_esc(head['masthead'])}</h1>"
+                f"<p class=\"motto\">{_paper_esc(head['motto'])}</p>"
+                "<div class=\"dateline\">"
+                f"<span>Vol. 1 · No. {ctx['number']}</span>"
+                f"<span>{_paper_esc(ctx['when'])} · the {_paper_esc(ctx['hour'])} hour"
+                + (" · extra" if str(ed.get("kind")) != "hourly" else "")
+                + f" · {total} pages</span>"
+                f"<span>Printed {_paper_clock(ctx['at'])}</span></div>"
+                + _paper_notice_html(ctx))
+            side_stories = p["stories"][:2]
+            flow_stories = p["stories"][2:]
+            out.append('<div class="front"><div class="main">')
+            if lead is not None:
+                out.append(_paper_story_html(lead, ctx, "lead"))
+                out.append(_paper_pause_extras(ctx))
+            out.append('</div><div class="side">')
+            out.append(_paper_index_html(ctx))
+            for a in side_stories:
+                out.append('<div class="hl">Highlight</div>')
+                out.append(_paper_story_html(a, ctx, "side"))
+            out.append("</div></div>")
+            if flow_stories:
+                out.append('<div class="p1flow">' + _paper_flow_html({"n": 1, "stories": flow_stories}, ctx) + "</div>")
+        else:
+            secs = " · ".join(ctx["section_name"].get(s, s) for s in p["sections"][:4])
+            out.append('<div class="pghead">'
+                       f'<span class="mh">{_paper_esc(head["masthead"])}</span>'
+                       f'<span>{_paper_esc(secs)}</span>'
+                       f'<span class="folio">{_paper_esc(ctx["when"])} · <b>{n}</b></span></div>')
+            out.append(_paper_flow_html(p, ctx))
+        if n == total:
+            out.append(_paper_colophon_html(ctx))
+        out.append(_paper_folio_html(ctx, n, total))
+        out.append("</div>")
+    return "".join(out)
+
+
+def _paper_set_tabloid(ctx: dict[str, Any]) -> str:
+    """#1043: the tabloid - the red masthead block, the price roundel,
+    three teasers, the lead's picture with the headline on it and a flash,
+    the story below in two columns with coloured side boxes; inside,
+    colour bands, boxed quotes and dense pages of three columns."""
+    ed, head, lead, pages = ctx["ed"], ctx["head"], ctx["lead"], ctx["pages"]
+    total = len(pages)
+    # the roundel reads caption-then-word: "this paper costs / FREE",
+    # "the station is / PAUSED"
+    price, price_cap = ("PAUSED", "the station is") if ctx["paused"] else ("FREE", "this paper costs")
+    out: list[str] = []
+    # #1037: a teaser points INSIDE the paper. Built off every page, the
+    # strip led with page 1's own stories and said "page 1".
+    others = [a for pp in pages if pp["n"] > 1 for a in pp["stories"]]
+    for p in pages:
+        n = p["n"]
+        out.append(f'<div class="page p{n}" id="page-{n}" data-page="{n}">')
+        if n == 1:
+            lead_meta = (lead or {}).get("meta") or {}
+            out.append('<div class="tmast"><div class="red">'
+                       f'<h1>{_paper_esc(head["masthead"])}</h1>'
+                       f'<div class="sub"><span>{_paper_esc(ctx["when"])}</span>'
+                       f'<span>the {_paper_esc(ctx["hour"])} hour{" · extra" if str(ed.get("kind")) != "hourly" else ""}</span>'
+                       f'<span>No. {ctx["number"]}</span><span>{total} pages</span>'
+                       + (f'<span>Tinted by {_paper_esc(ed.get("tinted_by"))}</span>' if ed.get("tinted_by") else "")
+                       + "</div></div>"
+                       f'<div class="roundel{" small" if len(price) > 4 else ""}">'
+                       f'<span>{_paper_esc(price_cap)}</span><b>{price}</b></div></div>')
+            teasers = [a for a in others if a is not lead][:3]
+            if teasers:
+                out.append('<div class="teasers">' + "".join(
+                    f'<div class="teaser c{k}">'
+                    + (f'<img src="{_paper_esc((a.get("meta") or {}).get("image"))}" alt="" onerror="this.remove()">'
+                       if (a.get("meta") or {}).get("image") else "<span></span>")
+                    + f'<div><h3>{_paper_esc(str((a.get("meta") or {}).get("headline") or "")[:60])}</h3>'
+                    f'<small>{_paper_esc(ctx["section_name"].get(str((a.get("meta") or {}).get("section") or ""), ""))}'
+                    f' · page {next((pp["n"] for pp in pages if a in pp["stories"]), 2)}</small></div></div>'
+                    for k, a in enumerate(teasers)) + "</div>")
+            out.append(_paper_notice_html(ctx))
+            if lead is not None:
+                kicker = str(lead_meta.get("kicker") or ("Paused" if ctx["paused"] else "The hour"))
+                out.append(f'<div class="kicker-bar">{_paper_esc(kicker)}</div>')
+                img = str(lead_meta.get("image") or ed.get("lead_image") or "")
+                focus = str(lead_meta.get("focus") or "center")
+                flash = str(lead_meta.get("flash") or ("Station paused" if ctx["paused"] else "Exclusive"))
+                hl = str(lead_meta.get("headline") or "")
+                size = "xl" if len(hl) > 64 else "long" if len(hl) > 36 else ""
+                cap = "" if lead_meta.get("chart") else str(lead_meta.get("caption") or "")
+                out.append(f'<div class="splash {focus}">'
+                           + (f'<img src="{_paper_esc(img)}" alt="" onerror="this.remove()">' if img else "")
+                           + (f'<span class="cap">{_paper_esc(cap)}'
+                              + (f' <span class="credit">{_paper_esc(lead_meta.get("credit"))}</span>' if lead_meta.get("credit") else "")
+                              + "</span>" if img and (cap or lead_meta.get("credit")) else "")
+                           + f'<div class="flash">{_paper_esc(flash)}</div>'
+                           '<div class="head">'
+                           f'<h2 class="splash-head {size}">{_paper_esc(hl)}</h2>'
+                           + (f'<p class="deck">{_paper_esc(lead_meta.get("deck"))}</p>' if lead_meta.get("deck") else "")
+                           + "</div></div>")
+                out.append('<div class="tfront"><div class="main">')
+                out.append(_paper_story_html(lead, ctx, "lead").replace('class="lead', 'class="lead tlead', 1))
+                out.append(_paper_pause_extras(ctx))
+                out.append('</div><div class="side">')
+                for k, a in enumerate(p["stories"][:3]):
+                    meta = a.get("meta") or {}
+                    out.append(f'<div class="tbox {"y" if k == 1 else f"c{k % 5}"}">'
+                               + (f'<div class="kicker">{_paper_esc(meta.get("kicker"))}</div>' if meta.get("kicker") else "")
+                               + f'<h3>{_paper_esc(meta.get("headline") or "")}</h3>'
+                               + (f"<p>{_paper_esc(meta.get('deck'))}</p>" if meta.get("deck") else "")
+                               # #1037: a promo, not a second printing -
+                               # the stats and the ruled sidebar belong to
+                               # the story in the band flow below.
+                               + '<div class="more">Full story below</div></div>')
+                out.append("</div></div>")
+            rest = p["stories"]
+            if rest:
+                out.append(_paper_flow_html(p, ctx, "band"))
+        else:
+            secs = " · ".join(ctx["section_name"].get(s, s) for s in p["sections"][:2])
+            out.append('<div class="pghead">'
+                       f'<span class="mh">{_paper_esc(head["masthead"])}</span>'
+                       f'<span>{_paper_esc(secs)}</span>'
+                       f'<span class="folio">{_paper_esc(ctx["when"])}<b>{n}</b></span></div>')
+            out.append(_paper_flow_html(p, ctx, "band"))
+        if n == total:
+            out.append(_paper_colophon_html(ctx))
+        out.append(_paper_folio_html(ctx, n, total))
+        out.append("</div>")
+    return "".join(out)
+
+
+def paper_render_html(ed: dict[str, Any], style: str = "broadsheet") -> str:
+    """One door, two typesetters (#1037). The stamp in the first line is
+    what the cache checks; the page carries its own audio script (#1023)."""
+    style = _paper_style(style)
+    ctx = _paper_ctx(ed, style)
+    head = ctx["head"]
+    body = _paper_set_tabloid(ctx) if style == "tabloid" else _paper_set_broadsheet(ctx)
+    css = _PAPER_CSS_COMMON + (_PAPER_CSS_TABLOID if style == "tabloid" else _PAPER_CSS)
+    title = f"{head['masthead']} · {ctx['hour']} hour" + (" · tabloid" if style == "tabloid" else "")
+    return (f"<!doctype html><!--PAPER_RENDER_VERSION={PAPER_RENDER_VERSION} style={style}-->"
+            "<html><head><meta charset=\"utf-8\">"
+            f"<title>{_paper_esc(title)}</title>"
+            "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
+            f"<style>{css}</style></head>"
+            f"<body class=\"{style}{' paused' if ctx['paused'] else ''}\" data-pages=\"{len(ctx['pages'])}\" "
+            f"data-style=\"{style}\" data-edition=\"{_paper_esc(ed.get('id') or '')}\">"
+            f"<div class=\"sheet {style}\">{body}</div>"
+            f"<script>{_PAPER_AUDIO_JS}</script></body></html>")
+
+
+def _paper_md_plain(body: str) -> str:
+    """Markdown to plain text: tables become rows of ' | ', marks come off."""
+    out: list[str] = []
+    for raw in str(body or "").split("\n"):
+        line = raw.rstrip()
+        if re.fullmatch(r"\|?[\s:|-]+\|?", line):
+            continue
+        if line.startswith("|"):
+            line = "  " + " | ".join(c.strip() for c in line.strip().strip("|").split("|"))
+        line = re.sub(r"^#{1,3}\s+", "", line)
+        line = re.sub(r"\*\*(.+?)\*\*", r"\1", line)
+        line = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"\1", line)
+        line = re.sub(r"\[([^\]]+)\]\((https?://[^)\s]+)\)", r"\1 (\2)", line)
+        out.append(line)
+    return "\n".join(out).strip()
+
+
+def paper_render_text(ed: dict[str, Any]) -> tuple[str, str]:
+    """#1029: the edition as plain text and as markdown, page by page, for
+    the clipboard. Every meta field that carries words is written out."""
+    ctx = _paper_ctx(ed, "broadsheet")
+    head = ctx["head"]
+    lead, pages = ctx["lead"], ctx["pages"]
+    text: list[str] = []
+    md: list[str] = []
+    dateline = f"{ctx['when']} · the {ctx['hour']} hour · Vol. 1 No. {ctx['number']} · edition {ed.get('id') or ''}"
+    text += [str(head["masthead"]).upper(), str(head["motto"]), dateline, ""]
+    md += [f"# {head['masthead']}", f"_{head['motto']}_", f"**{dateline}**", ""]
+    if ctx["paused"]:
+        text.append("[The station is paused - this edition reports the work behind the glass]")
+        md.append("> The station is paused - this edition reports the work behind the glass")
+    elif ctx["offline"]:
+        text.append("[Printed with the station off the air]")
+        md.append("> Printed with the station off the air")
+
+    def story(a: dict[str, Any]) -> None:
+        meta = a.get("meta") or {}
+        sec = ctx["section_name"].get(str(meta.get("section") or ""), str(meta.get("section") or ""))
+        hl = str(meta.get("headline") or "")
+        text.append(("[" + str(meta["kicker"]).upper() + "] " if meta.get("kicker") else "") + hl.upper())
+        md.append(f"### {('**' + str(meta['kicker']).upper() + '** — ') if meta.get('kicker') else ''}{hl}")
+        if meta.get("deck"):
+            text.append(str(meta["deck"]))
+            md.append(f"_{meta['deck']}_")
+        text.append(f"{sec}" + (f" · {meta['byline']}" if meta.get("byline") else ""))
+        md.append(f"— {sec}" + (f" · {meta['byline']}" if meta.get("byline") else ""))
+        text.append("")
+        md.append("")
+        if meta.get("image"):
+            md.append(f"![{meta.get('caption') or hl}]({meta['image']})")
+            if meta.get("caption"):
+                text.append(f"[picture: {meta['caption']}]")
+        stats = [s for s in (meta.get("stats") or []) if isinstance(s, dict)]
+        if stats:
+            text.append("  ".join(f"{s.get('value')} {s.get('label')}" for s in stats))
+            md.append(" · ".join(f"**{s.get('value')}** {s.get('label')}" for s in stats))
+            text.append("")
+            md.append("")
+        box = meta.get("box")
+        if isinstance(box, dict) and box.get("items"):
+            text.append(str(box.get("title") or "").upper())
+            md.append(f"**{box.get('title') or ''}**")
+            for i in box["items"]:
+                text.append(f"  - {i}")
+                md.append(f"- {i}")
+            text.append("")
+            md.append("")
+        serial = meta.get("serial")
+        if isinstance(serial, dict) and serial.get("title"):
+            text.append(f"{serial['title']} - part {serial.get('part')}: {serial.get('so_far') or ''} Next: {serial.get('next') or ''}")
+            md.append(f"**{serial['title']}**, part {serial.get('part')} — {serial.get('so_far') or ''} _Next: {serial.get('next') or ''}_")
+            text.append("")
+            md.append("")
+        iv = meta.get("interview")
+        if isinstance(iv, dict) and iv.get("qa"):
+            text.append(f"INTERVIEW: {iv.get('name')} ({iv.get('role') or ''})")
+            md.append(f"**Interview: {iv.get('name')}** ({iv.get('role') or ''})")
+            for x in iv["qa"]:
+                if isinstance(x, dict):
+                    text.append(f"Q: {x.get('q')}")
+                    text.append(f"A: {x.get('a')}")
+                    md.append(f"**Q: {x.get('q')}**  ")
+                    md.append(f"A: {x.get('a')}")
+                    md.append("")
+            text.append("")
+        body = str(a.get("body") or "").strip()
+        if body:
+            text.append(_paper_md_plain(body))
+            md.append(body)
+            text.append("")
+            md.append("")
+        if meta.get("pull"):
+            text.append(f"  \"{meta['pull']}\"")
+            md.append(f"> {meta['pull']}")
+            text.append("")
+            md.append("")
+        quotes = [q for q in (meta.get("quotes") or []) if isinstance(q, dict) and q.get("text")]
+        if quotes:
+            for q in quotes:
+                text.append(f"  {q.get('who')}: \"{q.get('text')}\"" + (f"  [{q['url']}]" if q.get("url") else ""))
+                md.append(f"> **{q.get('who')}:** {q.get('text')}" + (f" [▶]({q['url']})" if q.get("url") else ""))
+            text.append("")
+            md.append("")
+        ads = [r for r in (meta.get("classifieds") or []) if isinstance(r, dict)]
+        if ads:
+            for r in ads:
+                line = f"{r.get('head') or ''} - {r.get('body') or ''}" + (f" - {r['price']}" if r.get("price") else "") + (f" - {r['contact']}" if r.get("contact") else "")
+                text.append(f"  * {line}")
+                md.append(f"- **{r.get('head') or ''}** {r.get('body') or ''}" + (f" — {r['price']}" if r.get("price") else "") + (f" — _{r['contact']}_" if r.get("contact") else ""))
+            text.append("")
+            md.append("")
+        chart = meta.get("chart")
+        if isinstance(chart, dict) and chart.get("values"):
+            pairs = ", ".join(f"{l}: {v}" for l, v in zip(chart.get("labels") or [], chart.get("values") or []))
+            text.append(f"[{chart.get('kind')} chart: {pairs}]" + (f" {meta['caption']}" if meta.get("caption") else ""))
+            md.append(f"_{chart.get('kind')} chart — {pairs}_" + (f" {meta['caption']}" if meta.get("caption") else ""))
+            text.append("")
+            md.append("")
+        srcs = [s for s in (meta.get("sources") or []) if isinstance(s, dict) and s.get("url")]
+        if srcs:
+            text.append("Sources: " + "; ".join(f"{s.get('name') or ''} {s['url']}" for s in srcs))
+            md.append("Sources: " + "; ".join(f"[{s.get('name') or s['url']}]({s['url']})" for s in srcs))
+            text.append("")
+            md.append("")
+
+    for p in pages:
+        text += ["", f"=== PAGE {p['n']} ===", ""]
+        md += ["", f"## Page {p['n']}", ""]
+        if p["n"] == 1 and lead is not None:
+            story(lead)
+        for a in p["stories"]:
+            story(a)
+    text.append(f"-- {head['masthead']} · edition {ed.get('id') or ''}")
+    md.append(f"---\n_{head['masthead']} · edition {ed.get('id') or ''}_")
+    return "\n".join(text).strip() + "\n", "\n".join(md).strip() + "\n"
+
+
+# --- the snapshot: the paper in the gallery (#1020) --------------------------
+
+def _paper_snapshot_dir() -> Path:
+    return _COMFY_OUTPUT_DIR / PAPER_SNAPSHOT_DIR
+
+
+def paper_snapshot_record(edition_id: str, file: str, style: str, source: str) -> dict[str, Any]:
+    """Write `snapshot` into edition.json and ONE generations.jsonl row per
+    edition (CONTRACT s3): the first snapshot makes the row, later ones (the
+    other style, a retake) only refresh the file map. Disk work - call from
+    a thread."""
+    where = paper_edition_dir(edition_id)
+    meta_path = where / "edition.json"
+    if not meta_path.is_file():
+        raise FileNotFoundError("no such edition")
+    with _PAPER_LOCK:
+        ed = json.loads(meta_path.read_text(encoding="utf-8"))
+        first = not ed.get("snapshot")
+        snaps = dict(ed.get("snapshots") or {})
+        snaps[style] = file
+        ed["snapshots"] = snaps
+        if first:
+            ed["snapshot"] = file
+        ed["snapshot_at"] = time.time()
+        ed["snapshot_by"] = source
+        meta_path.write_text(json.dumps(ed, indent=1), encoding="utf-8")
+    if first:
+        since = float(ed.get("since") or time.time())
+        append_generation({
+            "ts": int(time.time()),
+            "request": f"The Gazette — {ed.get('headline') or edition_id}",
+            "tags": f"gazette {edition_id} {style} the {_paper_hour_words(since)} hour "
+                    + ("paused " if ed.get("paused") else "") + str(ed.get("deck") or "")[:160],
+            "model": "gazette", "prompt_id": "", "status": "done", "kind": "paper",
+            "files": [file], "stats": {}, "edition": edition_id, "style": style,
+        })
+    return {"file": file, "first": first, "url": f"/api/generations/image/{file}"}
+
+
+def paper_snapshot_write(edition_id: str, raw: bytes, style: str, source: str) -> dict[str, Any]:
+    """The PNG onto /comfy-output/_gazette/<id>[-style].png, then the record."""
+    style = _paper_style(style)
+    paper_edition_dir(edition_id)
+    if raw[:8] != b"\x89PNG\r\n\x1a\n":
+        raise ValueError("not a PNG")
+    name = f"gazette-{edition_id}" + ("" if style == "broadsheet" else f"-{style}") + ".png"
+    folder = _paper_snapshot_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / name).write_bytes(raw)
+    out = paper_snapshot_record(edition_id, name, style, source)
+    out["bytes"] = len(raw)
+    return out
+
+
+def paper_snapshot_pillow(ed: dict[str, Any], style: str = "broadsheet") -> str:
+    """#1020: the unattended front-page card, 1200x1600, drawn with Pillow
+    and its bundled face (ImageFont.load_default(size=N) - no system font
+    in the container). Inert until Pillow lands in requirements.txt: the
+    import fails and "" comes back. Masthead, dateline, kicker, headline,
+    deck, the lead plate off /comfy-output when it is there, the first
+    paragraph in two columns, a folio. Disk and CPU - call from a thread."""
+    try:
+        from PIL import Image, ImageDraw, ImageFont  # type: ignore
+    except Exception:  # noqa: BLE001
+        return ""
+    style = _paper_style(style)
+    edition_id = str(ed.get("id") or "")
+    if not edition_id:
+        return ""
+    lead = next((a for a in (ed.get("articles") or [])
+                 if int((a.get("meta") or {}).get("priority") or 0) == 1),
+                ((ed.get("articles") or [None])[0]))
+    meta = (lead or {}).get("meta") or {}
+    head = paper_masthead()
+    W, H = 1200, 1600
+    tab = style == "tabloid"
+    paper = (255, 255, 255) if tab else (246, 241, 230)
+    ink = (17, 17, 17) if tab else (27, 26, 23)
+    red = (226, 0, 26) if tab else (200, 16, 46)
+    grey = (74, 71, 65)
+    img = Image.new("RGB", (W, H), paper)
+    draw = ImageDraw.Draw(img)
+
+    def font(size: int):  # noqa: ANN202
+        try:
+            return ImageFont.load_default(size=size)
+        except TypeError:
+            return ImageFont.load_default()
+
+    def width(s: str, f: Any) -> float:
+        try:
+            return float(draw.textlength(s, font=f))
+        except Exception:  # noqa: BLE001
+            return len(s) * 7.0
+
+    def wrap(s: str, f: Any, max_w: float, most: int = 40) -> list[str]:
+        lines: list[str] = []
+        cur = ""
+        for word in str(s).split():
+            trial = (cur + " " + word).strip()
+            if width(trial, f) <= max_w or not cur:
+                cur = trial
+            else:
+                lines.append(cur)
+                cur = word
+            if len(lines) >= most:
+                break
+        if cur and len(lines) < most:
+            lines.append(cur)
+        return lines
+
+    def centered(s: str, f: Any, y: float, fill: Any) -> float:
+        for line in wrap(s, f, W - 100, 4):
+            draw.text(((W - width(line, f)) / 2, y), line, font=f, fill=fill)
+            y += f.size * 1.08 if hasattr(f, "size") else 20
+        return y
+
+    y = 40.0
+    since = float(ed.get("since") or time.time())
+    dateline = (f"{time.strftime('%A, %B %d, %Y', time.localtime(since)).replace(' 0', ' ')} · "
+                f"the {_paper_hour_words(since)} hour · edition {edition_id}")
+    if tab:
+        draw.rectangle((40, 40, W - 40, 250), fill=red)
+        y = centered(str(head["masthead"]), font(96), 62, (255, 255, 255))
+        draw.text((60, 205), dateline.upper(), font=font(20), fill=(255, 255, 255))
+        y = 268.0
+    else:
+        draw.line((40, y, W - 40, y), fill=ink, width=2)
+        y = centered(str(head["masthead"]), font(84), y + 12, ink)
+        y = centered(str(head["motto"]), font(22), y + 4, grey)
+        draw.line((40, y + 10, W - 40, y + 10), fill=ink, width=4)
+        draw.line((40, y + 16, W - 40, y + 16), fill=ink, width=1)
+        draw.text((48, y + 22), dateline.upper(), font=font(18), fill=ink)
+        y += 54
+    if ed.get("paused"):
+        draw.rectangle((40, y, W - 40, y + 36), fill=red)
+        draw.text((56, y + 6), "THE STATION IS PAUSED - THE WORK BEHIND THE GLASS", font=font(20), fill=(255, 255, 255))
+        y += 48
+    elif ed.get("offline"):
+        draw.rectangle((40, y, W - 40, y + 36), fill=ink)
+        draw.text((56, y + 6), "PRINTED WITH THE STATION OFF THE AIR", font=font(20), fill=paper)
+        y += 48
+    kicker = str(meta.get("kicker") or "")
+    if kicker:
+        draw.text((48, y), kicker.upper(), font=font(22), fill=red)
+        y += 34
+    plate = None
+    lead_url = str(meta.get("image") or ed.get("lead_image") or "")
+    name = lead_url.rsplit("/", 1)[-1] if lead_url.startswith("/api/generations/image/") else ""
+    if name:
+        try:
+            path = comfy_output_find(name)
+            if path:
+                plate = Image.open(path).convert("RGB")
+        except Exception:  # noqa: BLE001
+            plate = None
+    if plate is not None:
+        box_w, box_h = W - 96, 560
+        ratio = max(box_w / plate.width, box_h / plate.height)
+        plate = plate.resize((max(1, int(plate.width * ratio)), max(1, int(plate.height * ratio))))
+        focus = str(meta.get("focus") or "center")
+        top = 0 if focus == "top" else (plate.height - box_h if focus == "bottom" else (plate.height - box_h) // 2)
+        plate = plate.crop(((plate.width - box_w) // 2, max(0, top), (plate.width - box_w) // 2 + box_w, max(0, top) + box_h))
+        img.paste(plate, (48, int(y)))
+        draw.rectangle((48, y, 48 + box_w, y + box_h), outline=ink, width=2)
+        y += box_h + 8
+        if meta.get("caption") and not meta.get("chart"):   # the caption is the chart's
+            for line in wrap(str(meta["caption"]), font(18), W - 96, 2):
+                draw.text((48, y), line, font=font(18), fill=grey)
+                y += 22
+        y += 8
+    hf = font(66 if tab else 58)
+    if tab:
+        lines = wrap(str(meta.get("headline") or "").upper(), hf, W - 120, 4)
+        block_h = len(lines) * 72 + 24
+        draw.rectangle((40, y, W - 40, y + block_h), fill=ink)
+        yy = y + 12
+        for line in lines:
+            draw.text((60, yy), line, font=hf, fill=(255, 255, 255))
+            yy += 72
+        y += block_h + 12
+    else:
+        for line in wrap(str(meta.get("headline") or ""), hf, W - 96, 4):
+            draw.text((48, y), line, font=hf, fill=ink)
+            y += 64
+        y += 6
+    if meta.get("deck"):
+        for line in wrap(str(meta["deck"]), font(28), W - 96, 3):
+            draw.text((48, y), line, font=font(28), fill=grey)
+            y += 34
+        y += 8
+    draw.line((48, y, W - 48, y), fill=ink, width=1)
+    y += 12
+    body = str((lead or {}).get("body") or "")
+    paras = [p.strip() for p in body.split("\n\n") if p.strip() and not p.startswith(("|", "#", "-", ">"))]
+    words = " ".join(" ".join(paras[:3]).split())
+    bf = font(21)
+    col_w = (W - 96 - 32) / 2
+    lines = wrap(words, bf, col_w, 200)
+    room = int((H - 70 - y) // 27)
+    if room > 0:
+        split = min(room, (len(lines) + 1) // 2)      # two even columns, not one full and one bare
+        col1, col2 = lines[:split], lines[split:split + room]
+        yy = y
+        for line in col1:
+            draw.text((48, yy), line, font=bf, fill=ink)
+            yy += 27
+        yy = y
+        for line in col2:
+            draw.text((48 + col_w + 32, yy), line, font=bf, fill=ink)
+            yy += 27
+        draw.line((48 + col_w + 16, y, 48 + col_w + 16, min(H - 70, y + 27 * max(len(col1), len(col2)))), fill=(217, 210, 193), width=1)
+    draw.line((40, H - 52, W - 40, H - 52), fill=ink, width=2)
+    stories = int(ed.get("stories") or len(ed.get("articles") or []))
+    draw.text((48, H - 44), f"{head['masthead']} · {stories} stories · {ed.get('pages') or ''} pages · {style}".upper(),
+              font=font(16), fill=grey)
+    out_name = f"gazette-{edition_id}" + ("" if style == "broadsheet" else f"-{style}") + ".png"
+    folder = _paper_snapshot_dir()
+    folder.mkdir(parents=True, exist_ok=True)
+    img.save(folder / out_name, format="PNG", optimize=True)
+    paper_snapshot_record(edition_id, out_name, style, "pillow")
+    return out_name
+
+
+async def paper_snapshot_clock(edition_id: str) -> None:
+    """#1020: ten minutes after a press, if no panel sent a snapshot, draw
+    the front-page card server-side (Pillow, when it is installed) so the
+    gallery still shows every paper. Off the loop for every disk step."""
+    try:
+        await asyncio.sleep(PAPER_SNAPSHOT_WAIT)
+        where = paper_edition_dir(edition_id)
+
+        def _has() -> bool:
+            try:
+                return bool(json.loads((where / "edition.json").read_text(encoding="utf-8")).get("snapshot"))
+            except Exception:  # noqa: BLE001
+                return True      # gone, or unreadable: nothing to draw
+        if await asyncio.to_thread(_has):
+            return
+        ed = await asyncio.to_thread(paper_edition_read, edition_id)
+        if not ed:
+            return
+        name = await asyncio.to_thread(paper_snapshot_pillow, ed, str(ed.get("style_default") or "broadsheet"))
+        if name:
+            _paper_say(f"snapshot: {name} drawn for the gallery (no panel was open)")
+        else:
+            pipeline_log("model", f"gazette: no snapshot for {edition_id} - no panel open, Pillow not installed")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", f"gazette snapshot clock tripped: {exc}"[:200])
+
+
+def paper_html_for(edition_id: str, style: str) -> str | None:
+    """#1037: the typeset page for a style, cached as edition.<style>.html
+    (edition.html stays the broadsheet). A cached page whose stamp is older
+    than PAPER_RENDER_VERSION is set again. Disk - call from a thread."""
+    style = _paper_style(style)
+    where = paper_edition_dir(edition_id)
+    cached = where / ("edition.html" if style == "broadsheet" else f"edition.{style}.html")
+    stamp = f"<!--PAPER_RENDER_VERSION={PAPER_RENDER_VERSION} "
+    if cached.is_file():
+        try:
+            html = cached.read_text(encoding="utf-8")
+            if stamp in html[:200]:
+                return html
+        except OSError:
+            pass
+    ed = paper_edition_read(edition_id)
+    if not ed:
+        return None
+    html = paper_render_html(ed, style)
+    try:
+        cached.write_text(html, encoding="utf-8")
+    except OSError:
+        pass
+    return html
 
 
 # --- the doors -------------------------------------------------------------
@@ -88122,26 +98268,79 @@ async def api_paper_edition(
 @app.get("/api/paper/{edition_id}/html")
 async def api_paper_html(
     edition_id: str,
+    style: str = "",
     authorization: str | None = Header(default=None),
 ) -> HTMLResponse:
-    """The typeset page."""
+    """The typeset page (#1037): ?style=broadsheet|tabloid, cached per style
+    as edition.<style>.html and re-set when the cache predates the
+    typesetter (PAPER_RENDER_VERSION). The disk work runs in a thread."""
     require_read_auth(authorization)
     try:
-        where = paper_edition_dir(edition_id)
+        paper_edition_dir(edition_id)
     except ValueError:
         raise HTTPException(status_code=400, detail="Bad edition id") from None
-    cached = where / "edition.html"
-    if cached.is_file():
-        return HTMLResponse(cached.read_text(encoding="utf-8"))
-    ed = paper_edition_read(edition_id)
+    html = await asyncio.to_thread(paper_html_for, edition_id, style)
+    if html is None:
+        raise HTTPException(status_code=404, detail="No such edition")
+    return HTMLResponse(html)
+
+
+@app.get("/api/paper/{edition_id}/text")
+async def api_paper_text(
+    edition_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1029: the edition as plain text and markdown for the clipboard."""
+    require_read_auth(authorization)
+    try:
+        paper_edition_dir(edition_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad edition id") from None
+    ed = await asyncio.to_thread(paper_edition_read, edition_id)
     if not ed:
         raise HTTPException(status_code=404, detail="No such edition")
-    html = paper_render_html(ed)
+    text, markdown = await asyncio.to_thread(paper_render_text, ed)
+    return {"id": edition_id, "headline": str(ed.get("headline") or ""),
+            "text": text, "markdown": markdown}
+
+
+@app.post("/api/paper/{edition_id}/snapshot")
+async def api_paper_snapshot(
+    edition_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1020 #1029: the panel's PNG of the page (a data URL) onto
+    /comfy-output/_gazette/, one gallery row per edition, `snapshot` in
+    edition.json. Rejects anything but a PNG under 24 MB."""
+    require_auth(authorization)
     try:
-        cached.write_text(html, encoding="utf-8")
-    except OSError:
-        pass
-    return HTMLResponse(html)
+        paper_edition_dir(edition_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad edition id") from None
+    body = await request.body()
+    if len(body) > 24 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Snapshot too large")
+    try:
+        payload = json.loads(body or b"{}")
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Bad JSON") from None
+    png = str((payload or {}).get("png") or "")
+    if not png.startswith("data:image/png;base64,"):
+        raise HTTPException(status_code=400, detail="png must be a PNG data URL")
+    style = str((payload or {}).get("style") or "broadsheet")
+
+    def _work() -> dict[str, Any]:
+        raw = base64.b64decode(png.split(",", 1)[1], validate=False)
+        return paper_snapshot_write(edition_id, raw, style, "panel")
+    try:
+        out = await asyncio.to_thread(_work)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="No such edition") from None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from None
+    _paper_say(f"snapshot: {out['file']} from the panel ({out.get('bytes', 0) // 1024} KB)")
+    return out
 
 
 @app.delete("/api/paper/{edition_id}")
@@ -124878,11 +135077,38 @@ let paperFrame = null;
 let paperShelf = null;
 let paperConsole = null;
 let paperTitle = null;
+/* G3 (#1037 #1029 #1023 #1020): the style the operator chose (Newspaper |
+ * Tabloid, kept in localStorage), the page tabs, the text prefetched for
+ * Copy, and the editions this browser has already snapshotted. */
+let paperStyle = "broadsheet";
+let paperPagesBar = null;
+let paperPageCur = 1;
+let paperText = null;
+let paperStyleBtns = {};
+let paperSnapBusy = false;
+try { paperStyle = localStorage.getItem("paperStyle") === "tabloid" ? "tabloid" : "broadsheet"; } catch (e) {}
+
+function paperSnapDone() {
+  try {
+    const v = JSON.parse(localStorage.getItem("paperSnapDone") || "[]");
+    return Array.isArray(v) ? v : [];
+  } catch (e) { return []; }
+}
+
+function paperSnapMark(id) {
+  try {
+    const done = paperSnapDone().filter((x) => x !== id);
+    done.push(id);
+    localStorage.setItem("paperSnapDone", JSON.stringify(done.slice(-120)));
+  } catch (e) { /* private window */ }
+}
 
 function paperClose() {
   if (paperTimer) { clearInterval(paperTimer); paperTimer = null; }
   if (paperBox) { try { paperBox.remove(); } catch (e) {} paperBox = null; }
-  paperFrame = paperShelf = paperConsole = paperTitle = null;
+  paperFrame = paperShelf = paperConsole = paperTitle = paperPagesBar = null;
+  paperStyleBtns = {};
+  paperText = null;
   document.removeEventListener("keydown", paperKeys);
 }
 
@@ -124925,6 +135151,199 @@ function paperWatch(state) {
   } catch (e) { /* the panel works without it */ }
 }
 
+/* #1037: Newspaper | Tabloid. Remembered; the iframe reloads with ?style=. */
+function paperStyleSet(style) {
+  paperStyle = style === "tabloid" ? "tabloid" : "broadsheet";
+  try { localStorage.setItem("paperStyle", paperStyle); } catch (e) {}
+  Object.keys(paperStyleBtns).forEach((k) => {
+    const b = paperStyleBtns[k];
+    const on = k === paperStyle;
+    b.style.borderColor = on ? "var(--accent)" : "#22304a";
+    b.style.background = on ? "rgba(32,185,232,.14)" : "";
+    b.style.fontWeight = on ? "700" : "";
+  });
+  if (paperCur) paperShow(paperCur);
+}
+
+/* #1023: page tabs 1 … N read off the edition's .page sheets. */
+function paperPaintPages() {
+  if (!paperPagesBar) return;
+  paperPagesBar.innerHTML = "";
+  let doc = null;
+  try { doc = paperFrame && paperFrame.contentDocument; } catch (e) { doc = null; }
+  const pages = doc ? doc.querySelectorAll(".page") : [];
+  if (!pages.length) { paperPagesBar.style.display = "none"; return; }
+  paperPagesBar.style.display = "";
+  const lab = el("span", "muted", pages.length + (pages.length === 1 ? " page" : " pages") + " · " + (paperStyle === "tabloid" ? "tabloid" : "broadsheet"));
+  lab.style.cssText = "font-size:11px;margin-right:6px";
+  paperPagesBar.appendChild(lab);
+  pages.forEach((pg, i) => {
+    const n = i + 1;
+    const b = el("button", "", "Page " + n);
+    b.style.cssText = "padding:2px 9px;font-size:11px;border:1px solid " + (n === paperPageCur ? "var(--accent)" : "#22304a")
+      + ";background:" + (n === paperPageCur ? "rgba(32,185,232,.14)" : "#0b1018") + ";";
+    b.title = Array.from(pg.querySelectorAll("h2")).slice(0, 3).map((h) => h.textContent.trim()).join(" · ");
+    b.onclick = () => paperGoPage(n);
+    paperPagesBar.appendChild(b);
+  });
+}
+
+function paperGoPage(n) {
+  paperPageCur = n;
+  try {
+    const doc = paperFrame.contentDocument;
+    const pg = doc.getElementById("page-" + n);
+    if (pg) pg.scrollIntoView({block: "start", behavior: "smooth"});
+  } catch (e) { /* not loaded */ }
+  paperPaintPages();
+}
+
+function paperTrackScroll() {
+  try {
+    const win = paperFrame.contentWindow;
+    const doc = paperFrame.contentDocument;
+    if (!win || !doc) return;
+    let tick = 0;
+    win.addEventListener("scroll", () => {
+      if (tick) return;
+      tick = setTimeout(() => {
+        tick = 0;
+        const pages = Array.from(doc.querySelectorAll(".page"));
+        let cur = 1;
+        pages.forEach((pg, i) => { if (pg.getBoundingClientRect().top <= 80) cur = i + 1; });
+        if (cur !== paperPageCur) { paperPageCur = cur; paperPaintPages(); }
+      }, 120);
+    }, {passive: true});
+  } catch (e) { /* cosmetic */ }
+}
+
+/* #1029: Copy — rich HTML plus plain text/markdown in one synchronous
+ * copy-event handler (the panel is plain http; navigator.clipboard.write is
+ * not available, execCommand('copy') is). The text was prefetched when the
+ * edition loaded so nothing awaits inside the gesture. */
+function paperCopy(btn) {
+  let doc = null;
+  try { doc = paperFrame && paperFrame.contentDocument; } catch (e) { doc = null; }
+  const html = doc ? ("<!doctype html>" + doc.documentElement.outerHTML) : "";
+  const text = (paperText && paperText.id === paperCur && paperText.markdown)
+    ? paperText.markdown : (doc ? doc.body.innerText : "");
+  if (!html && !text) { setStatus("Nothing to copy yet", true); return; }
+  const handler = (e) => {
+    try {
+      e.clipboardData.setData("text/html", html);
+      e.clipboardData.setData("text/plain", text);
+      e.preventDefault();
+    } catch (err) { /* the textarea's own text is the fallback */ }
+  };
+  let ok = false;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+  document.body.appendChild(ta);
+  ta.select();
+  document.addEventListener("copy", handler);
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  document.removeEventListener("copy", handler);
+  ta.remove();
+  if (!ok) { pineCopy(text).then(() => { ok = true; }).catch(() => {}); }
+  if (btn) {
+    const was = btn.textContent;
+    btn.textContent = ok ? "✓ Copied" : "Copy";
+    setTimeout(() => { btn.textContent = was; }, 1400);
+  }
+  setStatus(ok ? "The Gazette is on the clipboard (rich text + markdown)" : "Copy failed", !ok);
+}
+
+/* #1029: PDF — the browser's own print of the iframe; the sheet carries a
+ * real @media print / @page rule per style (A3 landscape, A4 portrait). */
+function paperPdf() {
+  try {
+    const win = paperFrame.contentWindow;
+    win.focus();
+    win.print();
+  } catch (e) {
+    if (paperCur) window.open("/api/paper/" + encodeURIComponent(paperCur) + "/html?style=" + paperStyle, "_blank");
+  }
+}
+
+/* #1029: html-to-image, vendored under /vendor, loaded INTO the edition
+ * document so it clones with that document's styles. */
+function paperH2I() {
+  return new Promise((resolve, reject) => {
+    let doc, win;
+    try { doc = paperFrame.contentDocument; win = paperFrame.contentWindow; } catch (e) { reject(e); return; }
+    if (!doc || !win) { reject(new Error("no edition loaded")); return; }
+    if (win.htmlToImage) { resolve(win.htmlToImage); return; }
+    const s = doc.createElement("script");
+    s.src = "/vendor/html-to-image.js";
+    s.onload = () => (win.htmlToImage ? resolve(win.htmlToImage) : reject(new Error("html-to-image did not define itself")));
+    s.onerror = () => reject(new Error("/vendor/html-to-image.js is missing — copy it to data/vendor"));
+    doc.head.appendChild(s);
+  });
+}
+
+function paperImagesSettled(doc, ms) {
+  const imgs = Array.from(doc.images || []).filter((i) => !i.complete);
+  if (!imgs.length) return Promise.resolve();
+  return new Promise((resolve) => {
+    let left = imgs.length;
+    const done = () => { if (--left <= 0) resolve(); };
+    imgs.forEach((i) => { i.addEventListener("load", done, {once: true}); i.addEventListener("error", done, {once: true}); });
+    setTimeout(resolve, ms || 4000);
+  });
+}
+
+/* #1029 #1020: Image — the page in view as a PNG (2x), downloaded AND
+ * posted to /snapshot so the gallery filmstrip shows the paper. `auto`
+ * is the once-per-edition snapshot of page 1 while the window is open. */
+async function paperImage(auto, btn) {
+  if (!paperCur || !paperFrame || paperSnapBusy) return;
+  const id = paperCur;
+  const style = paperStyle;
+  paperSnapBusy = true;
+  const was = btn ? btn.textContent : "";
+  if (btn) btn.textContent = "…";
+  try {
+    const h2i = await paperH2I();
+    const doc = paperFrame.contentDocument;
+    await paperImagesSettled(doc, 4000);
+    const node = doc.getElementById("page-" + (auto ? 1 : paperPageCur)) || doc.body;
+    const bg = getComputedStyle(node).backgroundColor || "#fff";
+    const dataUrl = await h2i.toPng(node, {pixelRatio: auto ? 1.5 : 2, backgroundColor: bg, cacheBust: false,
+      style: {margin: "0", boxShadow: "none"}});
+    if (!auto) {
+      try {
+        const a = document.createElement("a");
+        a.href = dataUrl;
+        a.download = "gazette-" + id + "-" + style + "-p" + paperPageCur + ".png";
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+      } catch (e) { /* the desktop launcher may refuse downloads; the snapshot still lands */ }
+    }
+    const r = await api("/api/paper/" + encodeURIComponent(id) + "/snapshot",
+      {method: "POST", body: JSON.stringify({png: dataUrl, style: style})});
+    paperSnapMark(id);
+    const row = paperList.find((e) => e.id === id);
+    if (row && r && r.file && !row.snapshot) row.snapshot = r.file;
+    if (!auto) setStatus("Saved " + (r && r.file ? r.file : "the page") + " — it is in the gallery too");
+  } catch (e) {
+    if (!auto) setStatus("Image export failed: " + (e.message || e), true);
+  } finally {
+    paperSnapBusy = false;
+    if (btn) btn.textContent = was;
+  }
+}
+
+/* #1020: every new edition gets one snapshot while a window is open. */
+function paperSnapAuto(id) {
+  if (!id || paperSnapBusy) return;
+  const row = paperList.find((e) => e.id === id) || {};
+  if (row.snapshot) { paperSnapMark(id); return; }
+  if (paperSnapDone().includes(id)) return;
+  setTimeout(() => { if (paperCur === id && paperBox) paperImage(true, null); }, 1800);
+}
+
 async function paperOpen() {
   if (paperBox) { paperClose(); return; }
   const shade = el("div", "", "");
@@ -124942,6 +135361,29 @@ async function paperOpen() {
   paperTitle.style.cssText = "font-size:11px;flex:1;min-width:120px;overflow:hidden;"
     + "text-overflow:ellipsis;white-space:nowrap";
   head.appendChild(paperTitle);
+  // #1037: the style tabs
+  const tabs = el("span", "", "");
+  tabs.style.cssText = "display:inline-flex;gap:0;border-radius:6px;overflow:hidden";
+  paperStyleBtns = {};
+  [["broadsheet", "Newspaper", "The broadsheet: colour, pictures, four columns, A3 when printed"],
+   ["tabloid", "Tabloid", "The tabloid: the picture, the headline, the boxes, A4 when printed"]].forEach(([k, label, tip]) => {
+    const b = el("button", "", label);
+    b.title = tip;
+    b.onclick = () => paperStyleSet(k);
+    paperStyleBtns[k] = b;
+    tabs.appendChild(b);
+  });
+  head.appendChild(tabs);
+  // #1029: the three exports, in the slots left of ◀ ▶
+  const copy = el("button", "", "Copy");
+  copy.title = "Copy the edition to the clipboard — rich text where it pastes, markdown elsewhere";
+  copy.onclick = () => paperCopy(copy);
+  const pdf = el("button", "", "PDF");
+  pdf.title = "Print / save as PDF (A3 landscape for the newspaper, A4 for the tabloid)";
+  pdf.onclick = paperPdf;
+  const image = el("button", "", "Image");
+  image.title = "Save the page in view as a PNG — it also goes into the gallery";
+  image.onclick = () => paperImage(false, image);
   const older = el("button", "", "◀");
   older.title = "Older edition (←)";
   older.onclick = () => paperStep(1);
@@ -124960,7 +135402,7 @@ async function paperOpen() {
   const open = el("button", "", "Open ↗");
   open.title = "The page on its own, for printing or saving";
   open.onclick = () => {
-    if (paperCur) window.open("/api/paper/" + encodeURIComponent(paperCur) + "/html", "_blank");
+    if (paperCur) window.open("/api/paper/" + encodeURIComponent(paperCur) + "/html?style=" + paperStyle, "_blank");
   };
   const bin = el("button", "", "🗑");
   bin.title = "Remove this edition from the shelf";
@@ -124974,7 +135416,7 @@ async function paperOpen() {
   };
   const x = el("button", "", "✕");
   x.onclick = paperClose;
-  [older, newer, print, open, bin, x].forEach((b) => head.appendChild(b));
+  [copy, pdf, image, older, newer, print, open, bin, x].forEach((b) => head.appendChild(b));
   box.appendChild(head);
 
   paperShelf = el("div", "", "");
@@ -124982,6 +135424,11 @@ async function paperOpen() {
     + "border-bottom:1px solid #1b2735;background:#070b12;flex:none;"
     + "scrollbar-width:thin";
   box.appendChild(paperShelf);
+
+  paperPagesBar = el("div", "", "");
+  paperPagesBar.style.cssText = "display:none;align-items:center;gap:4px;padding:4px 10px;flex-wrap:wrap;"
+    + "border-bottom:1px solid #1b2735;background:#060a10;flex:none";
+  box.appendChild(paperPagesBar);
 
   paperFrame = document.createElement("iframe");
   paperFrame.style.cssText = "flex:1;min-height:0;width:100%;border:0;background:#ece5d4";
@@ -124998,6 +135445,7 @@ async function paperOpen() {
   shade.onclick = (ev) => { if (ev.target === shade) paperClose(); };
   document.body.appendChild(shade);
   paperBox = shade;
+  paperStyleSet(paperStyle);
   document.addEventListener("keydown", paperKeys);
   await paperRefresh(true);
   paperTimer = setInterval(paperPoll, 2500);
@@ -125018,12 +135466,13 @@ function paperPaintShelf() {
       + "gap:1px;padding:4px 9px;font-size:11px;line-height:1.25;max-width:230px;"
       + "border:1px solid " + (e.id === paperCur ? "var(--accent)" : "#22304a") + ";"
       + "background:" + (e.id === paperCur ? "rgba(32,185,232,.12)" : "#0b1018") + ";";
-    const when = el("b", "", paperWhen(e));
+    const when = el("b", "", paperWhen(e) + (e.paused ? " ⏸" : "") + (e.offline ? " ○" : ""));
     const head = el("span", "muted", e.headline || "(untitled)");
     head.style.cssText = "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:210px";
     chip.appendChild(when);
     chip.appendChild(head);
-    chip.title = (e.headline || "") + "\n" + (e.deck || "") + "\n" + (e.stories || 0) + " stories";
+    chip.title = (e.headline || "") + "\n" + (e.deck || "") + "\n" + (e.stories || 0) + " stories"
+      + (e.pages ? " · " + e.pages + " pages" : "") + (e.snapshot ? " · in the gallery" : "");
     chip.onclick = () => paperShow(e.id);
     paperShelf.appendChild(chip);
   });
@@ -125032,16 +135481,33 @@ function paperPaintShelf() {
 async function paperShow(id) {
   if (!paperFrame || !id) return;
   paperCur = id;
+  paperPageCur = 1;
   paperPaintShelf();
   const e = paperList.find((x) => x.id === id) || {};
   if (paperTitle) paperTitle.textContent = paperWhen(e) + (e.headline ? " — " + e.headline : "");
+  // #1029: the clipboard text, fetched now so Copy never awaits
+  paperText = null;
+  fetch("/api/paper/" + encodeURIComponent(id) + "/text", {headers: {"Authorization": "Bearer " + key()}})
+    .then((r) => (r.ok ? r.json() : null))
+    .then((t) => { if (t && paperCur === id) paperText = t; })
+    .catch(() => {});
   try {
-    const r = await fetch("/api/paper/" + encodeURIComponent(id) + "/html",
+    const r = await fetch("/api/paper/" + encodeURIComponent(id) + "/html?style=" + paperStyle,
       {headers: {"Authorization": "Bearer " + key()}});
     if (!r.ok) throw new Error("edition " + id + " did not load (" + r.status + ")");
-    paperFrame.srcdoc = await r.text();
+    const html = await r.text();
+    if (paperCur !== id) return;
+    paperFrame.onload = () => {
+      if (paperCur !== id) return;
+      paperPaintPages();
+      paperTrackScroll();
+      paperSnapAuto(id);
+    };
+    paperFrame.srcdoc = html;
   } catch (err) {
+    paperFrame.onload = null;
     paperFrame.srcdoc = "<p style='font:14px Georgia;padding:20px'>" + String(err.message || err) + "</p>";
+    if (paperPagesBar) paperPagesBar.style.display = "none";
   }
   try {
     const chip = Array.from(paperShelf.children).find((c) => c.title && c.title.startsWith((e.headline || "") + "\n"));
@@ -125061,12 +135527,14 @@ async function paperRefresh(jumpLatest) {
   paperPaintShelf();
   if (paperCur) await paperShow(paperCur);
   else if (paperFrame) {
+    paperFrame.onload = null;
     paperFrame.srcdoc = "<div style='font:15px Georgia,serif;padding:40px;max-width:640px'>"
       + "<h2 style='font-size:34px;margin:0 0 8px'>Nothing on the shelf yet</h2>"
       + "<p>The press runs on the hour, every hour, and files the hour just gone. "
       + "Press <b>Print now</b> for an extra on the last sixty minutes, or say "
       + "<i>print the paper</i> to the box.</p></div>";
     if (paperTitle) paperTitle.textContent = "";
+    if (paperPagesBar) paperPagesBar.style.display = "none";
   }
 }
 
@@ -130391,7 +140859,13 @@ let consoleTouched = 0;
 const consoleOpen = new Set();     // entries the reader expanded, by key
 
 function consoleReading() {
-  return !consoleStuck || (Date.now() - consoleTouched) < 60000;
+  /* #1041: an OPEN entry holds the feed still for as long as it is open -
+   * the sixty-second grace after the click used to run out while the
+   * reader was still inside the expansion, and the next event yanked the
+   * feed to its tail and pruned the top out from under them. Any hand on
+   * the feed (pointer, wheel) re-arms the hold; five minutes, not one. */
+  return consoleOpen.size > 0 || !consoleStuck
+    || (Date.now() - consoleTouched) < 300000;
 }
 
 function consoleHandsOn() {
@@ -130408,6 +140882,15 @@ function consoleWatch(feed) {
     if (consoleStuck) consoleTouched = 0;       // back at the tail: follow
     else if (wasStuck) consoleHandsOn();        // moved off it: hands off
   }, {passive: true});
+  /* #1041: reading IS a hand on it - a pointer moving over the feed, a
+   * wheel inside an expansion (which scrolls the expansion, not the
+   * feed, so the scroll listener above never saw it). */
+  ["pointermove", "pointerdown", "wheel"].forEach((kind) => {
+    feed.addEventListener(kind, () => {
+      if (!consoleStuck || consoleOpen.size > 0) consoleHandsOn();
+      else consoleTouched = Math.max(consoleTouched, Date.now() - 240000);
+    }, {passive: true});
+  });
 }
 
 function trimAndScrollConsole(feed) {
@@ -130827,6 +141310,26 @@ async function openDocBrowser(slug, pageN, withChat) {
         };
         card.appendChild(img);
       }
+      // #1026: a web-guide section carries several figures in p.images
+      // (the sidekick's gain knob has seven) and the card showed one.
+      (p.images || []).filter((im) => im && im !== p.image).forEach((im) => {
+        const more = document.createElement("img");
+        more.loading = "lazy";
+        more.src = "/api/te/asset/" + dbDoc.slug + "/" + im;
+        if (dbDoc.page_bg) more.style.background = dbDoc.page_bg;
+        more.style.cursor = "zoom-in";
+        more.onclick = (e) => {
+          e.stopPropagation();
+          const zoomed = more.style.maxWidth === "none";
+          more.style.maxWidth = zoomed ? "" : "none";
+          more.style.width = zoomed ? "" : "auto";
+          more.parentElement.style.overflow = zoomed ? "" : "auto";
+          more.style.cursor = zoomed ? "zoom-in" : "zoom-out";
+          dbCurrentPage = p.n;
+          highlightCurrent();
+        };
+        card.appendChild(more);
+      });
       if (text) {
         const txt = el("div", "pg-txt");
         renderDocText(txt, text, needle);
@@ -131756,6 +142259,21 @@ async function openDocPopup(entry) {
       };
       card.appendChild(img);
     }
+    // #1026: every figure of the section, after the first.
+    (page.images || []).filter((im) => im && im !== page.image).forEach((im) => {
+      const more = document.createElement("img");
+      more.loading = "lazy";
+      more.src = "/api/te/asset/" + entry.slug + "/" + im;
+      if (entry.page_bg) more.style.background = entry.page_bg;
+      more.style.cursor = "zoom-in";
+      more.onclick = () => {
+        const zoomed = more.style.maxWidth === "none";
+        more.style.maxWidth = zoomed ? "" : "none";
+        more.style.width = zoomed ? "" : "auto";
+        more.parentElement.style.overflow = zoomed ? "" : "auto";
+      };
+      card.appendChild(more);
+    });
     if (page.blurb) {
       const txt = el("div", "pg-txt");
       txt.textContent = page.blurb;
@@ -132059,6 +142577,26 @@ function techCard(entry, page, fresh) {
   tag.textContent = "p." + page.n;
   box.appendChild(tag);
   card.appendChild(box);
+
+  // #1026: the section's other figures ride under the plate as tiles, so
+  // the strip shows the colour pages and not one drawing per section.
+  const extra = (page.images || []).filter((im) => im && im !== page.image)
+    .slice(0, 6);
+  if (extra.length && entry.slug !== "web") {
+    const tiles = document.createElement("div");
+    tiles.style.cssText = "display:flex;gap:3px;padding:3px 4px 0;overflow:hidden";
+    extra.forEach((im) => {
+      const t = document.createElement("img");
+      t.src = "/api/te/asset/" + entry.slug + "/" + im;
+      t.loading = "lazy";
+      t.alt = page.heading || "figure";
+      t.style.cssText = "width:44px;height:30px;object-fit:contain;"
+        + "border-radius:3px;cursor:pointer;background:" + (entry.page_bg || "#fff");
+      t.onclick = () => openDocBrowser(entry.slug, page.n, true);
+      tiles.appendChild(t);
+    });
+    card.appendChild(tiles);
+  }
 
   const body = document.createElement("div");
   body.className = "tf-body";

@@ -12,3 +12,13 @@ pyserial==3.5
 # root, no system package — it ships the binary and pip already runs here.
 imageio-ffmpeg==0.6.0
 numpy
+# The Gazette's unattended front-page card (#1020). When no panel is open the
+# press has nothing to photograph, so paper_snapshot_pillow draws the card
+# itself — masthead, kicker, headline, the lead plate, the first paragraph in
+# two columns — and the gallery filmstrip shows every paper, not only the ones
+# an operator happened to be watching. It uses ImageFont.load_default(size=N)
+# (Pillow >= 10.1) because the container has no system font. Without this line
+# the import fails, the function returns "" and the card is simply not drawn;
+# nothing else in the file needs PIL. The wheel is prebuilt for cp312/aarch64
+# (6.0 MB, verified resolving in the running container), so no build tools.
+pillow==11.3.0
