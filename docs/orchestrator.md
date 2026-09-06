@@ -321,3 +321,14 @@ are rapped and tagged, only tagged takes serve while that crystal is on, and the
 eight fixed acknowledgments belong to the plain repertoire only). The newspaper
 already tints through `paper_tint_story`, and the meaning grade applies there
 too.
+
+**Meaning, measured (#1064, later the same evening).** With the hold on, 36 of
+38 refusals were "semantic preservation failed", and the commonest cause was the
+name rule calling a sentence start a name ("Relax," and "When" after a closing
+quote had to reappear word for word in the bar). A sentence-start capital is now
+a name only when the crystal's own vocabulary does not know it as an ordinary
+word, a word after a quote or bracket counts as a sentence start, and at full
+strength a bar may keep a third of the content words rather than half (a real
+bar scored 0.47; recited lyrics score 0.02 and still fail). The emergency
+continuity pair airs plain, labelled as a stopgap, only while its rapped version
+is still being recorded, so the hold can never leave dead air with no net.

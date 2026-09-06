@@ -57861,14 +57861,20 @@ def continuity_pick(who: str, voice: str, text: str) -> dict[str, Any] | None:
     continuity_load()
     engine = voice_engine_for(voice)
     crystal = continuity_crystal()                                  # #1064
-    row = _CONTINUITY_BANK.get(continuity_key(who, voice, engine, text, crystal)) or {}
-    clip = row.get("clip") or {}
-    name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
-    if (row.get("voice") == voice and row.get("engine") == engine
-            and str(row.get("plain") or row.get("text")) == text
-            and str(row.get("crystal") or "") == crystal
-            and name and (VOICE_MEDIA_DIR / name).is_file() and float(clip.get("seconds") or 0) > 0):
-        return {**row, "who": who}
+    for want in ((crystal, "") if crystal else ("",)):
+        row = _CONTINUITY_BANK.get(continuity_key(who, voice, engine, text, want)) or {}
+        clip = row.get("clip") or {}
+        name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
+        if (row.get("voice") == voice and row.get("engine") == engine
+                and str(row.get("plain") or row.get("text")) == text
+                and str(row.get("crystal") or "") == want
+                and name and (VOICE_MEDIA_DIR / name).is_file()
+                and float(clip.get("seconds") or 0) > 0):
+            if want != crystal:
+                # #1064: the rapped pair is still being recorded; dead air
+                # is worse than a plain emergency line, and it is labelled.
+                _CONTINUITY_STATE["stopgap"] = time.time()
+            return {**row, "who": who, "stopgap": want != crystal}
     return None
 
 
@@ -77862,8 +77868,20 @@ def tint_fast_model() -> str:
         return ""
 
 
+TINT_FAMINE_SECONDS = 600.0
+
+
 def tint_model_for(kind: str = "") -> str:
-    """#1110: the model this road's rewrite deserves."""
+    """#1110: the model this road's rewrite deserves.
+
+    #1064: ...unless the reserve is EMPTY under the hold. Then nothing airs
+    until it is rapped, and the fast model rapping every road beats the
+    deep one rapping the pair while the emergency host reads filler."""
+    try:
+        if crystal_tint_holds() and prepared_seconds() < TINT_FAMINE_SECONDS:
+            return tint_fast_model() or tint_model_now()
+    except Exception:  # noqa: BLE001
+        pass
     try:
         if str(kind or "") in TINT_DEEP_ROADS:
             return tint_model_now()
@@ -78260,15 +78278,28 @@ def tint_evaluate(source: Any, candidate: Any,
     anchor_overlap = len(src_set & dst_set) / max(1, len(src_set))
     numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", plain))
     names: set[str] = set()
+    # #1064: 36 of 38 live refusals were "semantic preservation failed",
+    # and the commonest cause was this rule calling a SENTENCE START a
+    # name - "Relax," and "When" (after a closing quote) had to appear
+    # word for word in the bar. A word after a quote or bracket is a
+    # sentence start too; a sentence-start capital is a name only when
+    # the crystal's own vocabulary does not know it as an ordinary word
+    # (so "Mara" stays a name and "Relax" does not).
+    _vocab = _crystal_vocab()
     for match in re.finditer(r"\b[A-Za-z][A-Za-z0-9'_-]*\b", plain):
         word = match.group(0)
-        prior = plain[:match.start()].rstrip()
-        if word.lower() in _TINT_EVAL_STOP:
+        prior = plain[:match.start()].rstrip().rstrip("\"'\u201d\u2019)]")
+        # #1064: "That's", "I've", "You're" are stopwords wearing an
+        # apostrophe, not names.
+        if (word.lower() in _TINT_EVAL_STOP
+                or word.lower().split("'")[0] in _TINT_EVAL_STOP):
             continue
         if ((word.isupper() and len(word) > 1)
                 or (prior and prior[-1] not in ".!?;:"
                     and word[:1].isupper() and len(word) > 2)
-                or (not prior and word[:1].isupper() and len(word) > 2
+                or ((not prior or prior[-1] in ".!?;:")
+                    and word[:1].isupper() and len(word) > 2
+                    and word.lower() not in _vocab
                     and word.lower() not in {
                         "yes", "thanks", "thank", "hello", "listen", "well",
                         "right", "okay", "keep", "please", "look", "then",
@@ -78282,8 +78313,13 @@ def tint_evaluate(source: Any, candidate: Any,
         r"\b(?:no|not|never|without|cannot|can't|won't)\b", made, re.I))
     entity_ok = numbers == set(re.findall(r"\b\d+(?:\.\d+)?\b", made)) \
         and all(re.search(rf"\b{re.escape(n)}\b", made, re.I) for n in names)
+    # #1064: at full strength a bar that keeps every name, number,
+    # question and negation may keep a third of the content words rather
+    # than half - a real bar measured 0.47 and was refused; the recited
+    # lyrics and prompt echoes measure 0.02 and still fail.
+    _anchor_floor = 0.35 if force >= 0.75 else 0.5
     semantic_ok = bool(made and question_ok and neg_ok and entity_ok
-                       and (anchor_overlap >= 0.5 or not src_set))
+                       and (anchor_overlap >= _anchor_floor or not src_set))
     if str(kind or "") == "caller":
         try:
             semantic_ok = semantic_ok and bool(call_tint_report(
@@ -78896,6 +78932,65 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         return said
 
 
+async def _crystal_round_first_pass(text: str, turns: list[tuple[str, str]],
+                                    armed: str, world: str,
+                                    chunks: list[dict[str, Any]],
+                                    keep: list[str] | None,
+                                    model: str) -> list[dict[str, Any]]:
+    """#1064: THE WHOLE ROUND IN ONE ASK, handed to the line-by-line pass
+    as resumable progress.
+
+    Measured under the hold: the lane rapped about three lines a minute
+    one ask at a time, the show needs five or more, and the reserve sat
+    empty behind the emergency host. One ask returns every bar of a
+    ten-turn round for the price of one queue wait; the pass beneath
+    grades each bar and only the refused lines cost a further ask."""
+    try:
+        if len(turns) < 2:
+            return []
+        try:
+            _ceiling = int(dj_settings().get("reply_max_chars") or 6000)
+        except Exception:  # noqa: BLE001
+            _ceiling = 6000
+        if len(text) + 400 > _ceiling:
+            return []
+        began = time.monotonic()
+        got = await ask_model(
+            armed + "\n\nTHE CONVERSATION:\n" + text,
+            limit=max(600, len(text) + 400), spice=0.55, model=model,
+            mark={"purpose": "tint", "kind": "tint round",
+                  "for": "the whole round in one ask, before the "
+                         "line-by-line pass (#1064)",
+                  "tint_world": world, "tint_before": text[:6000],
+                  "tint_keep": list(keep or [])})
+        tinted = str(got or "").strip()
+        if not tinted or _looks_meta(tinted):
+            return []
+        made = list(banter_turns(tinted) or [])
+        if [m for m, _s in made] != [m for m, _s in turns]:
+            pipeline_log("crystal", "(#1064) the whole-round ask changed the "
+                         f"speaker order or turn count ({len(made)} against "
+                         f"{len(turns)}) - line by line instead")
+            return []
+        try:
+            task_note("tint:round", time.monotonic() - began, 0.0, True)
+        except Exception:  # noqa: BLE001
+            pass
+        out: list[dict[str, Any]] = []
+        for (marker, said), (_m, candidate) in zip(turns, made):
+            out.append({"marker": marker,
+                        "source": hashlib.sha1(
+                            str(said or "").encode("utf-8", "ignore")).hexdigest(),
+                        "text": " ".join(str(candidate or "").split()),
+                        "selected": True, "evaluation": {}})
+        pipeline_log("crystal", "(#1064) the whole round came back in one ask "
+                     f"({int((time.monotonic() - began) * 1000)}ms, "
+                     f"{len(made)} turns) - grading it line by line")
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
 async def crystal_tint(script: str, kind: str = "",
                        verbatim: Any = None,
                        whole_only: bool = False,
@@ -79093,6 +79188,11 @@ async def crystal_tint(script: str, kind: str = "",
             answering = ""
             _resume_turns = [r for r in (resume.get("turns") or [])
                              if isinstance(r, dict)]
+            # #1064: a fresh round is asked for WHOLE first; the pass
+            # beneath grades every bar and re-asks only the refused ones.
+            if not _resume_turns and not tint_should_stop(critical):
+                _resume_turns = await _crystal_round_first_pass(
+                    text, turns, armed, world, chunks, keep, _tint_model)
             _progress_turns: list[dict[str, Any]] = []
             # #1018: A DEADLINE OF ITS OWN. Left to the preparer's slice
             # this had 45 seconds for a round that takes three to five a
@@ -79171,6 +79271,7 @@ async def crystal_tint(script: str, kind: str = "",
                             _evaluations.append({"turn": _turn_at + 1,
                                                  **_prior_eval})
                             _tint_output_note(fresh, _prior_eval)
+                            tint_seen("tinted")                     # #1064
                         _progress_turns.append(_saved)
                         continue
                 if not _selected:
