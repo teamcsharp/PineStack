@@ -743,6 +743,10 @@ DEFAULT_DJ = {
     # #1021: use everything to keep Piper OFF the air - a clone engine
     # that is up outranks every emergency road; see voicepolicy_*.
     "avoid_piper": True,
+    # #1051: the hourly press. Off stops the CLOCK, not the
+    # Gazette - "Print now", the chat command and the deploy
+    # catch-up all still work while it is off.
+    "paper_hourly": True,
     "sfx_rate": 0.2,
     # Echo and reverb on a line, now and then (#222). Rate is how often; the
     # two depths are the range it is drawn between, so it is never the same
@@ -1532,6 +1536,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             "render_relief", DEFAULT_DJ["render_relief"])),
         "avoid_piper": bool(raw_dj.get(                             # #1021
             "avoid_piper", DEFAULT_DJ["avoid_piper"])),
+        "paper_hourly": bool(raw_dj.get(                        # #1051
+            "paper_hourly", DEFAULT_DJ["paper_hourly"])),
         "sfx_rate": max(0.0, min(1.0, float(
             raw_dj.get("sfx_rate", DEFAULT_DJ["sfx_rate"]) or 0))),
         "fx_rate": max(0.0, min(1.0, float(
@@ -74709,7 +74715,12 @@ def tint_budget() -> float:
         share = min(0.9, share + 0.25 * surplus())
     except Exception:  # noqa: BLE001
         pass
-    return 2.0 * 3600.0 * share
+    # #1053: coverage is the other half of "every line". A crystal
+    # turned up asks for more of the hour, so a hard setting does not
+    # quietly run out halfway through and air the rest plain.
+    _force = crystal_force()
+    _lift = 1.0 + 0.6 * _force
+    return _lift * 2.0 * 3600.0 * share
 
 
 def tint_spent() -> float:
@@ -74736,6 +74747,39 @@ def tint_spent() -> float:
     except Exception:  # noqa: BLE001
         return 0.0
     return float(_TINT_SPEND[1] or 0)
+
+
+# #1053: coverage, counted. "Every line" is a claim that should be a
+# number: how many lines the tint actually rewrote against how many were
+# offered to it in this hour, published on /api/tint.
+_TINT_SEEN: dict[str, float] = {"hour": 0.0, "offered": 0.0, "tinted": 0.0,
+                                "refused": 0.0}
+
+
+def tint_seen(kind: str) -> None:
+    """One line offered to the tint, and what became of it."""
+    try:
+        hour = float(int(time.time() // 3600))
+        if hour != _TINT_SEEN["hour"]:
+            _TINT_SEEN.update({"hour": hour, "offered": 0.0, "tinted": 0.0,
+                               "refused": 0.0})
+        _TINT_SEEN["offered"] += 1.0
+        if kind == "tinted":
+            _TINT_SEEN["tinted"] += 1.0
+        elif kind == "refused":
+            _TINT_SEEN["refused"] += 1.0
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tint_coverage() -> dict[str, Any]:
+    """What share of the lines offered this hour came back rewritten."""
+    offered = float(_TINT_SEEN.get("offered") or 0)
+    tinted = float(_TINT_SEEN.get("tinted") or 0)
+    return {"offered": int(offered), "tinted": int(tinted),
+            "refused": int(_TINT_SEEN.get("refused") or 0),
+            "share": round(tinted / offered, 3) if offered else 0.0,
+            "force": round(crystal_force(), 2)}
 
 
 def tint_spend_note(seconds: float) -> None:
@@ -74934,6 +74978,51 @@ def tint_should_stop(critical: bool = False) -> str:
     return tint_pressure()                                       # #1045
 
 
+def crystal_force() -> float:
+    """#1053: how hard the tint should push, 0..1, from the STRENGTH of the
+    strongest crystal on air.
+
+    The dial existed and nothing downstream read it (measured: `strength`
+    reached the swath-redirect roll and a clause that is empty under
+    two-pass, and stopped there). Everything that follows scales off this:
+    the demand made of the rewrite, the room it may take, and the share of
+    the hour the tint is allowed to spend."""
+    try:
+        best = 0.0
+        for one in crystal_active():
+            if not isinstance(one, dict):
+                continue
+            best = max(best, float(one.get("strength") or 0) / 100.0)
+        return max(0.0, min(1.0, best))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def crystal_demand(force: float) -> str:
+    """The instruction that hardens with the dial (#1053)."""
+    if force >= 0.75:
+        return (
+            "HOW HARD: ALL THE WAY. This is not a colouring, it is a "
+            "REWRITE. Every line comes back as a hard bar in this "
+            "writer's own lexicon - their vocabulary, their cadence, "
+            "their way of turning a thing sideways. Use THEIR words, not "
+            "neutral English with a rhyme bolted on. A line that could "
+            "have been said by anybody has failed the job. Rhyme inside "
+            "the line, chain the sound, land it.\n\n")
+    if force >= 0.45:
+        return (
+            "HOW HARD: FIRMLY. Rewrite the line in that writer's lexicon "
+            "and cadence, not merely near it. Their vocabulary should be "
+            "audible in the result, and the rhyme should be doing real "
+            "work inside the line.\n\n")
+    if force > 0:
+        return (
+            "HOW HARD: LIGHTLY. Colour the line towards that writer - "
+            "a turn of phrase, a rhyme where one fits - without "
+            "repainting it.\n\n")
+    return ""
+
+
 async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                        answering: str = "", keep: list[str] | None = None,
                        seen: list[str] | None = None,
@@ -74957,8 +75046,15 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     # #1035: the room this line is allowed to take, drawn fresh. See the
     # note at the top of this change - without it the only move a model
     # has is swapping one word for another of the same length.
+    # #1053: the room a bar may take now rises with the dial - 1.5-2.5x at
+    # the bottom, up to about 3.4x at full, because a hard rewrite in
+    # somebody else's lexicon needs the syllables to set up, turn and land.
+    tint_seen("offered")                  # #1053
+    _force = crystal_force()
     try:
-        _room = random.uniform(1.5, 2.5)
+        _lo = 1.5 + 0.5 * _force
+        _hi = 2.5 + 0.9 * _force
+        _room = random.uniform(_lo, _hi)
     except Exception:  # noqa: BLE001
         _room = 2.0
     _may = max(90, int(len(said) * _room))
@@ -74971,6 +75067,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
             return said
     prompt = (
         _call_fidelity
+        + crystal_demand(_force)          # #1053: the dial, doing something
         + "This person says what they have to say. Keep WHAT they say and "
         "change HOW they say it, so the line reads as though the writer "
         "of the lyrics below had written it.\n\n"
@@ -75180,6 +75277,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     _cap = max(400, _may + 200)
     if len(out) > _cap:
         out = out[:_cap].rsplit(" ", 1)[0]
+    tint_seen("tinted")                   # #1053
     return out
 
 
@@ -81805,6 +81903,9 @@ async def api_tint_state(
         armed_name = ""
     return {
         "two_pass": two,
+        # #1053: the dial, and what share of the hour's lines it reached.
+        "force": round(crystal_force(), 2),
+        "coverage": tint_coverage(),
         "crystals_on": [{"name": str(c.get("name") or ""),
                          "strength": int(c.get("strength") or 0),
                          "tint": str(c.get("tint") or ""),
@@ -100897,6 +100998,11 @@ async def paper_clock() -> None:
         top = now - lt.tm_min * 60 - lt.tm_sec + 3600.0 + 20.0
         await asyncio.sleep(max(5.0, top - now))
         try:
+            # #1051: the operator's switch. Checked HERE rather than at the
+            # top of the loop so the clock keeps its place on the hour and
+            # starts printing again the moment it is turned back on.
+            if not dj_settings().get("paper_hourly", True):
+                continue
             if not _PAPER.get("running"):
                 await paper_print(reason="the hour", kind="hourly")
         except Exception as exc:  # noqa: BLE001
@@ -101594,6 +101700,12 @@ a.readable.head:hover{background:var(--tint);color:inherit;border-bottom-color:v
 .rdr .col .foot{margin:18px 0 0;padding-top:10px;border-top:1px solid var(--faint);font-family:"Helvetica Neue",Arial,sans-serif;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint)}
 .rdr .wait{display:flex;align-items:center;gap:12px;padding:40px 0;color:var(--ink2);font-family:"Helvetica Neue",Arial,sans-serif;font-size:13px}
 .rdr .wait i{width:20px;height:20px;flex:none;border:2px solid var(--faint);border-top-color:var(--red);border-radius:50%;animation:rdrspin 0.8s linear infinite}
+@keyframes paperBellPulse {
+  0%, 100% { box-shadow: 0 18px 60px rgba(0,0,0,.55),
+                          0 0 0 0 rgba(32,185,232,.55); }
+  50%      { box-shadow: 0 18px 60px rgba(0,0,0,.55),
+                          0 0 0 14px rgba(32,185,232,0); }
+}
 @keyframes rdrspin{to{transform:rotate(360deg)}}
 .rdr .oops{padding:26px 0 10px}
 .rdr .oops b{display:block;font-family:"Helvetica Neue",Arial,sans-serif;font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--red);margin:0 0 10px}
@@ -107946,6 +108058,252 @@ def _storage_purge(area: dict[str, Any], older_than_days: float | None,
             "label": area["label"]}
 
 
+# #1052b: the keep policy. Which shelves the age sweep may not touch, and
+# which ones keep longer than the line. Defaults are the operator's own
+# words - the produced spots and the manager's spots are spared "because
+# those might need a longer time to be reused" - extended to every shelf
+# that holds knowledge rather than recordings, where an age sweep is not
+# housekeeping but amnesia.
+STORAGE_KEEP_PATH = data_path("storage_keep.json")
+STORAGE_KEEP_LOCK = RLock()
+STORAGE_KEEP_DEFAULT: dict[str, dict[str, Any]] = {
+    # the ads, named by the operator
+    "ads_audio": {"spare": True, "keep_days": 180.0},
+    "upstairs_audio": {"spare": True, "keep_days": 180.0},
+    # the station's knowledge and made things, not its recordings
+    "voice_library": {"spare": True, "keep_days": 0.0},
+    "voice_characters": {"spare": True, "keep_days": 0.0},
+    "sfxguy_quips": {"spare": True, "keep_days": 0.0},
+    "sfx_made": {"spare": True, "keep_days": 0.0},
+    "sfx_specs": {"spare": True, "keep_days": 0.0},
+    "samples": {"spare": True, "keep_days": 0.0},
+    "mixtapes": {"spare": True, "keep_days": 0.0},
+    "gallery": {"spare": True, "keep_days": 0.0},
+    "speakbox": {"spare": True, "keep_days": 0.0},
+    "minds": {"spare": True, "keep_days": 0.0},
+    "decisions": {"spare": True, "keep_days": 0.0},
+    "crystals": {"spare": True, "keep_days": 0.0},
+    "gear_manuals": {"spare": True, "keep_days": 0.0},
+    "lyrics": {"spare": True, "keep_days": 0.0},
+    "cheats": {"spare": True, "keep_days": 0.0},
+    "export_kits": {"spare": True, "keep_days": 0.0},
+    "ledgers": {"spare": True, "keep_days": 0.0},
+    "vendor": {"spare": True, "keep_days": 0.0},
+    "pine_uploads": {"spare": True, "keep_days": 0.0},
+    # the cut tray is small and hand-made; the operator cut those on purpose
+    "cuts": {"spare": True, "keep_days": 0.0},
+}
+
+
+def storage_keep() -> dict[str, dict[str, Any]]:
+    """The keep policy: the defaults, with anything the operator has set on
+    top. A malformed file is ignored rather than obeyed - the safe failure
+    of a protection setting is to protect."""
+    out = {k: dict(v) for k, v in STORAGE_KEEP_DEFAULT.items()}
+    try:
+        raw = json.loads(STORAGE_KEEP_PATH.read_text())
+        if isinstance(raw, dict):
+            for key, row in raw.items():
+                if not isinstance(row, dict):
+                    continue
+                have = out.setdefault(str(key), {"spare": False,
+                                                 "keep_days": 0.0})
+                if "spare" in row:
+                    have["spare"] = bool(row.get("spare"))
+                if "keep_days" in row:
+                    try:
+                        have["keep_days"] = max(0.0, min(
+                            3650.0, float(row.get("keep_days") or 0)))
+                    except (TypeError, ValueError):
+                        pass
+    except FileNotFoundError:
+        pass
+    except Exception:  # noqa: BLE001
+        pass                              # a bad file keeps the defaults
+    return out
+
+
+def storage_keep_for(key: str) -> dict[str, Any]:
+    row = storage_keep().get(str(key)) or {}
+    return {"spare": bool(row.get("spare")),
+            "keep_days": float(row.get("keep_days") or 0.0)}
+
+
+def storage_keep_save(key: str, spare: Any = None,
+                      keep_days: Any = None) -> dict[str, Any]:
+    """Set one shelf's policy. Written whole, atomically, under the lock."""
+    with STORAGE_KEEP_LOCK:
+        try:
+            raw = json.loads(STORAGE_KEEP_PATH.read_text())
+            if not isinstance(raw, dict):
+                raw = {}
+        except Exception:  # noqa: BLE001
+            raw = {}
+        row = dict(raw.get(str(key)) or {})
+        if spare is not None:
+            row["spare"] = bool(spare)
+        if keep_days is not None:
+            try:
+                row["keep_days"] = max(0.0, min(3650.0, float(keep_days)))
+            except (TypeError, ValueError):
+                pass
+        raw[str(key)] = row
+        try:
+            STORAGE_KEEP_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = STORAGE_KEEP_PATH.with_suffix(".tmp")
+            tmp.write_text(json.dumps(raw, indent=1) + "\n")
+            tmp.replace(STORAGE_KEEP_PATH)
+        except OSError:
+            pass
+    _STORAGE_AGE_CACHE.update({"at": 0.0})
+    return storage_keep_for(key)
+
+
+# #1052: the age view. STORAGE_AGE_EDGES are the bucket walls in days —
+# the first day at four-hour resolution because that is where "is this
+# still airing" lives, then coarser as it recedes, because nobody purges
+# to the nearest hour at three weeks out.
+STORAGE_AGE_EDGES = (0.0, 0.25, 0.5, 1.0, 2.0, 3.0, 5.0, 7.0, 10.0, 14.0,
+                     21.0, 30.0, 60.0, 90.0, 180.0, 365.0)
+STORAGE_AGE_TTL = 60.0
+_STORAGE_AGE_CACHE: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def _storage_age_bucket(days: float) -> int:
+    """Which bucket an age falls in; the last bucket is open-ended."""
+    for i in range(len(STORAGE_AGE_EDGES) - 1, -1, -1):
+        if days >= STORAGE_AGE_EDGES[i]:
+            return i
+    return 0
+
+
+def _storage_ages() -> dict[str, Any]:
+    """Every purgeable area bucketed by age (#1052).
+
+    One walk per area through _storage_list — the same cheap scandir the
+    register uses — so this costs what a refresh of the store room costs
+    and no more. Protected files are counted separately and never appear
+    in a bucket's `free` figures: what the bar offers to delete is what
+    the sweep would actually delete.
+    """
+    now = time.time()
+    edges = list(STORAGE_AGE_EDGES)
+    areas: list[dict[str, Any]] = []
+    totals = [{"files": 0, "bytes": 0} for _ in edges]
+    files_all = 0
+    bytes_all = 0
+    oldest = 0.0
+    for area in _storage_areas():
+        if not area.get("purge"):
+            continue
+        try:
+            found = _storage_list(area)
+        except Exception:  # noqa: BLE001
+            continue                       # one unreadable area is not a fault
+        protected = _storage_protected(area["key"])
+        everything = "*" in protected
+        buckets = [{"files": 0, "bytes": 0} for _ in edges]
+        held = 0
+        held_bytes = 0
+        a_files = 0
+        a_bytes = 0
+        a_oldest = 0.0
+        for when, name, size in found:
+            days = max(0.0, (now - float(when)) / 86400.0)
+            a_files += 1
+            a_bytes += int(size)
+            a_oldest = max(a_oldest, days)
+            if everything or name.rsplit("/", 1)[-1] in protected \
+                    or (now - float(when)) <= STORAGE_FLOOR:
+                held += 1
+                held_bytes += int(size)
+                continue                   # never offered to the cutoff
+            i = _storage_age_bucket(days)
+            buckets[i]["files"] += 1
+            buckets[i]["bytes"] += int(size)
+            totals[i]["files"] += 1
+            totals[i]["bytes"] += int(size)
+        files_all += a_files
+        bytes_all += a_bytes
+        oldest = max(oldest, a_oldest)
+        _keep = storage_keep_for(area["key"])
+        areas.append({
+            "key": area["key"], "label": area["label"],
+            "group": area.get("group") or "",
+            "spare": _keep["spare"], "keep_days": _keep["keep_days"],
+            "files": a_files, "bytes": a_bytes,
+            "held": held, "held_bytes": held_bytes,
+            "oldest_days": round(a_oldest, 2),
+            "buckets": buckets,
+        })
+    areas.sort(key=lambda r: -r["bytes"])
+    return {"at": now, "edges": edges, "areas": areas, "totals": totals,
+            "files": files_all, "bytes": bytes_all,
+            "oldest_days": round(oldest, 2),
+            "floor_seconds": STORAGE_FLOOR,
+            "default_days": 7.0}
+
+
+async def storage_ages(refresh: bool = False) -> dict[str, Any]:
+    """The age view, cached like the register and walked off the loop."""
+    have = _STORAGE_AGE_CACHE.get("value")
+    if have and not refresh \
+            and time.time() - float(_STORAGE_AGE_CACHE["at"]) < STORAGE_AGE_TTL:
+        return have
+    async with _STORAGE_GATE:
+        have = _STORAGE_AGE_CACHE.get("value")
+        if have and not refresh \
+                and time.time() - float(_STORAGE_AGE_CACHE["at"]) < STORAGE_AGE_TTL:
+            return have
+        got = await asyncio.to_thread(_storage_ages)
+        _STORAGE_AGE_CACHE.update({"at": time.time(), "value": got})
+        return got
+
+
+def _storage_sweep_older(days: float, keys: list[str]) -> dict[str, Any]:
+    """One cutoff across the areas the operator ticked (#1052).
+
+    Every area still goes through _storage_purge, so every guard #836 put
+    in the way is still in the way; an area that refuses is REPORTED
+    rather than skipped in silence, because a sweep that quietly did
+    nothing to half its targets is worse than one that says so."""
+    done: list[dict[str, Any]] = []
+    refused: list[dict[str, Any]] = []
+    freed = 0
+    count = 0
+    for area in _storage_areas():
+        if area["key"] not in keys:
+            continue
+        if not area.get("purge"):
+            refused.append({"area": area["key"], "label": area["label"],
+                            "why": area.get("why_kept") or "kept, not cycled"})
+            continue
+        # #1052b: the shelf's own policy outranks the line. Spared shelves
+        # are never swept; a shelf with a floor keeps at least that long
+        # even when the line is drawn nearer.
+        keep = storage_keep_for(area["key"])
+        if keep["spare"]:
+            refused.append({"area": area["key"], "label": area["label"],
+                            "why": "spared - kept out of the age sweep"})
+            continue
+        area_days = max(float(days), float(keep["keep_days"] or 0.0))
+        try:
+            got = _storage_purge(area, area_days, None, None)
+        except Exception as exc:  # noqa: BLE001
+            refused.append({"area": area["key"], "label": area["label"],
+                            "why": f"{type(exc).__name__}: {exc}"[:120]})
+            continue
+        freed += int(got.get("freed") or 0)
+        count += int(got.get("count") or 0)
+        done.append({"area": area["key"], "label": area["label"],
+                     "days": area_days,
+                     "files": int(got.get("count") or 0),
+                     "freed": int(got.get("freed") or 0),
+                     "kept_protected": int(got.get("kept_protected") or 0)})
+    return {"older_than_days": days, "areas": done, "refused": refused,
+            "count": count, "freed": freed}
+
+
 def _storage_enforce() -> list[dict[str, Any]]:
     """Bring every CAPPED area back under its ceiling, oldest first. An area
     with no cap set is not looked at."""
@@ -108074,6 +108432,85 @@ async def storage_file_api(
     return FileResponse(
         path, headers=headers,
         media_type=_STORAGE_MIME.get(suffix, "application/octet-stream"))
+
+
+@app.post("/api/storage/{area}/keep")
+async def storage_keep_api(
+    area: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1052b: spare a shelf from the age sweep, or give it a floor of its
+    own. {spare: bool} and/or {keep_days: number}."""
+    require_auth(authorization)
+    row = _storage_area(area)
+    if row is None:
+        raise HTTPException(status_code=404, detail="No such area")
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    got = await asyncio.to_thread(
+        storage_keep_save, area, payload.get("spare"),
+        payload.get("keep_days"))
+    return {"area": area, "label": row["label"], **got}
+
+
+@app.get("/api/storage/ages")
+async def storage_ages_api(
+    refresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1052: every purgeable area bucketed by age. Read auth — looking at
+    the shape of the archive deletes nothing."""
+    require_read_auth(authorization)
+    return await storage_ages(refresh=bool(refresh))
+
+
+@app.post("/api/storage/purge-older")
+async def storage_purge_older_api(
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1052: one cutoff, across the areas named in the body.
+
+    Deliberately the same temperament as the per-area purge above: the
+    areas must be NAMED (there is no "all" shape and an empty list is a
+    400), the cutoff is required and clamped, and everything underneath
+    is #836's own purge with all of its guards. The only thing this adds
+    is that one gesture may cross several areas."""
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    try:
+        days = float(payload.get("older_than_days"))
+    except (TypeError, ValueError):
+        raise HTTPException(
+            status_code=400, detail="older_than_days is required") from None
+    days = max(0.5, min(3650.0, days))
+    keys = [str(x) for x in (payload.get("areas") or []) if str(x).strip()]
+    if not keys:
+        raise HTTPException(
+            status_code=400,
+            detail="Name the areas to sweep — there is no 'everything' shape")
+    got = await asyncio.to_thread(_storage_sweep_older, days, keys)
+    _STORAGE_CACHE.update({"at": 0.0})
+    _STORAGE_AGE_CACHE.update({"at": 0.0})
+    if got.get("count"):
+        note_action(
+            f"\U0001f5c4 store room: {got['count']} file(s) older than "
+            f"{days:g} day(s) purged from {len(got['areas'])} area(s) — "
+            f"{got['freed'] // (1 << 20)} MB freed (#1052)")
+        pipeline_log("air", f"store room: swept everything older than "
+                            f"{days:g} days — {got['count']} file(s), "
+                            f"{got['freed'] // (1 << 20)} MB (#1052)")
+    return got
 
 
 @app.post("/api/storage/{area}/purge")
@@ -133159,6 +133596,220 @@ function djPathsPanel(anchor) {
  *
  * Every path through here is wrapped: a store room that throws must not take
  * the panel down with it. */
+/* #1052: THE STORE ROOM BY AGE.
+ *
+ * One bar per age bucket, newest at the left, drawn from the server's own
+ * age walk. The cutoff line opens at seven days; everything to the right of
+ * it is tinted and counted, and the sweep deletes exactly that. The area
+ * list is ticked so the operator can spare a shelf ("all areas, but let me
+ * untick some") — an area the server refuses to purge is not offered at all.
+ *
+ * The figures are the server's `free` numbers, which already exclude clips
+ * queued to air, the live episode and anything younger than the floor, so
+ * what the bar says will go is what goes. */
+async function storeAgeDraw(host, note, size) {
+  host.dataset.drawn = "1";
+  host.textContent = "";
+  const wait = el("div", "muted", "walking the shelves by age\u2026");
+  wait.style.cssText = "font-size:10.5px;padding:6px 0";
+  host.appendChild(wait);
+  let d;
+  try {
+    d = await api("/api/storage/ages");
+  } catch (e) {
+    wait.textContent = "the age view would not open: " + e.message;
+    return;
+  }
+  host.textContent = "";
+  const edges = d.edges || [];
+  const totals = d.totals || [];
+  const areas = (d.areas || []).slice();
+  const picked = new Set(areas.map((a) => a.key));
+  let days = Number(d.default_days || 7);
+
+  const dayWord = (n) => (n >= 1 ? (Math.round(n * 10) / 10) + "d"
+                                 : Math.round(n * 24) + "h");
+
+  const sum = el("div", "", "");
+  sum.style.cssText = "font-size:10.5px;line-height:1.5;margin:2px 0 6px";
+  host.appendChild(sum);
+
+  /* the bar */
+  const chart = el("div", "", "");
+  chart.style.cssText = "display:flex;align-items:flex-end;gap:2px;height:96px;"
+    + "padding:4px 0 0;border-bottom:1px solid var(--border)";
+  host.appendChild(chart);
+  const scale = el("div", "", "");
+  scale.style.cssText = "display:flex;gap:2px;font-size:8.5px;color:var(--muted);"
+    + "margin:2px 0 6px";
+  host.appendChild(scale);
+
+  const most = Math.max(1, ...totals.map((t) => Number(t.bytes || 0)));
+  const bars = [];
+  totals.forEach((t, i) => {
+    const col = el("div", "", "");
+    col.style.cssText = "flex:1;min-width:0;display:flex;flex-direction:column;"
+      + "justify-content:flex-end;height:100%";
+    const bar = el("div", "", "");
+    const h = Math.max(Number(t.bytes) ? 2 : 0,
+                       Math.round(Number(t.bytes || 0) / most * 92));
+    bar.style.cssText = "height:" + h + "px;background:var(--accent);"
+      + "border-radius:1px 1px 0 0;transition:background .12s";
+    bar.title = dayWord(edges[i]) + " and older \u2014 "
+      + (t.files || 0) + " file(s), " + size(t.bytes || 0);
+    col.appendChild(bar);
+    chart.appendChild(col);
+    bars.push(bar);
+    const tick = el("div", "", dayWord(edges[i]));
+    tick.style.cssText = "flex:1;min-width:0;text-align:center;overflow:hidden";
+    scale.appendChild(tick);
+  });
+
+  /* the line you drag */
+  const slide = el("input", "", "");
+  slide.type = "range";
+  slide.min = "0";
+  slide.max = String(Math.max(1, edges.length - 1));
+  slide.step = "1";
+  slide.style.cssText = "width:100%;margin:0 0 4px";
+  let idx = edges.findIndex((e) => e >= days);
+  slide.value = String(idx < 0 ? edges.length - 1 : idx);
+  host.appendChild(slide);
+
+  const areaBox = el("div", "", "");
+  areaBox.style.cssText = "max-height:190px;overflow:auto;margin:4px 0 6px;"
+    + "border-top:1px solid var(--border);padding-top:4px";
+  host.appendChild(areaBox);
+
+  const rows = [];
+  areas.forEach((a) => {
+    const r = el("label", "", "");
+    r.style.cssText = "display:flex;gap:6px;align-items:center;padding:2px 0;"
+      + "font-size:10px;cursor:pointer";
+    const tick = el("input", "", "");
+    tick.type = "checkbox";
+    /* #1052b: a spared shelf comes up unticked and says so. */
+    tick.checked = !a.spare;
+    if (a.spare) picked.delete(a.key);
+    tick.onchange = () => {
+      if (tick.checked) picked.add(a.key); else picked.delete(a.key);
+      recount();
+    };
+    const lab = el("span", "", a.label);
+    lab.style.cssText = "flex:1;min-width:0;overflow:hidden;"
+      + "text-overflow:ellipsis;white-space:nowrap";
+    const fig = el("span", "muted", "");
+    fig.style.cssText = "font-size:9.5px;white-space:nowrap";
+    /* #1052b: the pin. Spared shelves are kept out of every sweep until
+     * this is turned off, and the state lives on the server, not here. */
+    const pin = el("button", "", a.spare ? "\ud83d\udccc" : "\u00b7");
+    pin.title = a.spare
+      ? "Spared - the age sweep never touches this shelf. Click to allow it."
+      : "Swept with the line. Click to spare it from every age sweep.";
+    pin.style.cssText = "font-size:9.5px;padding:0 5px;line-height:1.4;"
+      + "opacity:" + (a.spare ? "1" : ".45");
+    pin.onclick = async (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      try {
+        const got = await api("/api/storage/" + encodeURIComponent(a.key)
+          + "/keep", {method: "POST",
+                      body: JSON.stringify({spare: !a.spare})});
+        a.spare = !!got.spare;
+        pin.textContent = a.spare ? "\ud83d\udccc" : "\u00b7";
+        pin.style.opacity = a.spare ? "1" : ".45";
+        tick.checked = !a.spare;
+        if (a.spare) picked.delete(a.key); else picked.add(a.key);
+        recount();
+      } catch (err) { setStatus(err.message, true); }
+    };
+    r.appendChild(tick); r.appendChild(lab); r.appendChild(fig);
+    r.appendChild(pin);
+    areaBox.appendChild(r);
+    rows.push({a: a, fig: fig, tick: tick});
+  });
+
+  const go = el("button", "danger", "Purge everything older\u2026");
+  go.style.cssText = "font-size:10.5px;padding:2px 10px";
+  const out = el("div", "muted", "");
+  out.style.cssText = "font-size:10px;line-height:1.5;margin-top:5px";
+  const foot = el("div", "row", "");
+  foot.style.cssText = "gap:6px;align-items:center";
+  foot.appendChild(go);
+  host.appendChild(foot);
+  host.appendChild(out);
+
+  function doomedFor(a) {
+    let files = 0, bytes = 0;
+    (a.buckets || []).forEach((b, i) => {
+      if (edges[i] >= days) { files += Number(b.files || 0); bytes += Number(b.bytes || 0); }
+    });
+    return {files: files, bytes: bytes};
+  }
+
+  function recount() {
+    days = Number(edges[Number(slide.value)] || 0);
+    let files = 0, bytes = 0;
+    rows.forEach((r) => {
+      const got = doomedFor(r.a);
+      r.fig.textContent = r.tick.checked
+        ? (got.files ? got.files + " \u00b7 " + size(got.bytes) : "nothing")
+        : (r.a.spare ? "spared" : "skipped");
+      r.fig.style.opacity = r.tick.checked ? "1" : ".5";
+      if (r.tick.checked) { files += got.files; bytes += got.bytes; }
+    });
+    bars.forEach((bar, i) => {
+      bar.style.background = edges[i] >= days
+        ? "var(--danger)" : "var(--accent)";
+    });
+    sum.textContent = "Keeping the last " + dayWord(days) + ". "
+      + (files
+          ? files + " file(s), " + size(bytes) + " would go from "
+            + [...picked].length + " area(s)."
+          : "Nothing older than that is free to delete.")
+      + " The whole archive is " + (d.files || 0) + " file(s), "
+      + size(d.bytes || 0) + ", oldest " + dayWord(d.oldest_days || 0) + ".";
+    go.disabled = !files;
+    go.style.opacity = files ? "1" : ".5";
+    return {files: files, bytes: bytes};
+  }
+  slide.oninput = recount;
+  recount();
+
+  go.onclick = async () => {
+    const got = recount();
+    if (!got.files) return;
+    const ok = confirm(
+      "Delete " + got.files + " file(s), " + size(got.bytes)
+      + ", older than " + dayWord(days) + ", from "
+      + [...picked].length + " area(s)?\n\n"
+      + "Clips queued to air, the episode being recorded now, and anything "
+      + "written in the last few minutes are never touched.\n\n"
+      + "This cannot be undone.");
+    if (!ok) return;
+    go.disabled = true;
+    out.textContent = "sweeping\u2026";
+    try {
+      const res = await api("/api/storage/purge-older", {
+        method: "POST",
+        body: JSON.stringify({older_than_days: days, areas: [...picked]})
+      });
+      out.textContent = (res.count || 0) + " file(s) deleted, "
+        + size(res.freed || 0) + " freed"
+        + ((res.refused || []).length
+            ? " \u00b7 " + res.refused.length + " area(s) refused" : "")
+        + ". Reopen the tab to see the shelves again.";
+      host.dataset.drawn = "";
+      if (note) note.textContent = "the shelves have changed \u2014 "
+        + "press \u21bb to walk them again.";
+    } catch (e) {
+      out.textContent = "the sweep failed: " + e.message;
+      go.disabled = false;
+    }
+  };
+}
+
+
 function storagePanel(anchor) {
   try {
     const gone = document.getElementById("storagePanel");
@@ -133200,10 +133851,41 @@ function storagePanel(anchor) {
     const note = el("div", "muted", "reading the shelves\u2026");
     note.style.cssText = "font-size:10.5px;line-height:1.45;margin-bottom:4px";
     pop.appendChild(note);
+    /* #1052: two ways to read the same shelves. */
+    const tabs = el("div", "row", "");
+    tabs.style.cssText = "gap:4px;margin:0 0 6px 0";
+    const tabAreas = el("button", "", "By area");
+    const tabAge = el("button", "", "By age");
+    [tabAreas, tabAge].forEach((b) => {
+      b.style.cssText = "font-size:10.5px;padding:2px 10px";
+    });
+    tabs.appendChild(tabAreas);
+    tabs.appendChild(tabAge);
+    pop.appendChild(tabs);
+
     const body = el("div", "", "");
     pop.appendChild(body);
+    const ageHost = el("div", "", "");
+    ageHost.style.display = "none";
+    pop.appendChild(ageHost);
+
+    function tabTo(which) {
+      const onAge = which === "age";
+      body.style.display = onAge ? "none" : "";
+      ageHost.style.display = onAge ? "" : "none";
+      tabAreas.style.outline = onAge ? "" : "2px solid var(--accent)";
+      tabAge.style.outline = onAge ? "2px solid var(--accent)" : "";
+      try { localStorage.setItem("storeTab", which); } catch (e) {}
+      if (onAge && !ageHost.dataset.drawn) storeAgeDraw(ageHost, note, size);
+    }
+    tabAreas.onclick = () => tabTo("areas");
+    tabAge.onclick = () => tabTo("age");
+
     document.body.appendChild(pop);
   pvFloat(pop);                                             // #877
+    try {
+      tabTo(localStorage.getItem("storeTab") === "age" ? "age" : "areas");
+    } catch (e) { tabTo("areas"); }
 
     async function fillFiles(area, host, offset) {
       try {
@@ -145111,10 +145793,80 @@ function paperWhen(e) {
   return day + " · " + hour + (String(e.id || "").includes("x") ? " extra" : "");
 }
 
+/* #1051: THE PAPER ANNOUNCES ITSELF.
+ *
+ * A pulsing card in the middle of the panel when an issue the operator has
+ * not seen reaches the shelf. Click it to read that issue; dismiss it and it
+ * is marked seen. The last seen edition lives in localStorage so a reload
+ * does not re-announce it, and the FIRST edition a fresh browser sees is
+ * recorded silently - being greeted by a nag about an hour you were not here
+ * for is not news. */
+let paperBellSeen = null;
+let paperBellCard = null;
+
+function paperBellRead() {
+  if (paperBellSeen !== null) return paperBellSeen;
+  try { paperBellSeen = localStorage.getItem("paperBellSeen") || ""; }
+  catch (e) { paperBellSeen = ""; }
+  return paperBellSeen;
+}
+
+function paperBellMark(id) {
+  paperBellSeen = String(id || "");
+  try { localStorage.setItem("paperBellSeen", paperBellSeen); } catch (e) {}
+  if (paperBellCard) { paperBellCard.remove(); paperBellCard = null; }
+}
+
+function paperBellRing(id, headline) {
+  if (paperBellCard) paperBellCard.remove();
+  const card = el("div", "panel", "");
+  card.id = "paperBell";
+  card.style.cssText = "position:fixed;z-index:340;left:50%;top:44%;"
+    + "transform:translate(-50%,-50%);padding:14px 18px;cursor:pointer;"
+    + "display:flex;gap:12px;align-items:center;max-width:min(460px,92vw);"
+    + "box-shadow:0 18px 60px rgba(0,0,0,.55);animation:paperBellPulse 1.6s ease-in-out infinite";
+  const mark = el("div", "", "\ud83d\udcf0");
+  mark.style.cssText = "font-size:30px;line-height:1";
+  const words = el("div", "", "");
+  words.style.cssText = "min-width:0";
+  const top = el("b", "", "A new issue is off the press");
+  top.style.cssText = "display:block;font-size:12.5px";
+  const sub = el("div", "muted", String(headline || "").slice(0, 120));
+  sub.style.cssText = "font-size:11px;margin-top:2px;overflow:hidden;"
+    + "text-overflow:ellipsis;white-space:nowrap";
+  const hint = el("div", "muted", "click to read it");
+  hint.style.cssText = "font-size:9.5px;margin-top:3px;opacity:.75";
+  words.appendChild(top); words.appendChild(sub); words.appendChild(hint);
+  const shut = el("button", "", "\u2715");
+  shut.title = "Not now";
+  shut.style.cssText = "font-size:11px;padding:1px 7px;align-self:flex-start";
+  shut.onclick = (e) => { e.stopPropagation(); paperBellMark(id); };
+  card.appendChild(mark); card.appendChild(words); card.appendChild(shut);
+  card.onclick = () => {
+    paperBellMark(id);
+    try {
+      if (!paperBox) paperOpen();
+      setTimeout(() => { try { paperShow(id); } catch (e) {} }, 260);
+    } catch (e) { /* the shelf is one click away regardless */ }
+  };
+  document.body.appendChild(card);
+  paperBellCard = card;
+}
+
 function paperWatch(state) {
   try {
     const d = state && state.paper;
     if (!d) return;
+    /* #1051: ring for an issue this browser has not seen. */
+    if (d.latest && !d.running) {
+      const seen = paperBellRead();
+      if (!seen) paperBellMark(d.latest);        // first sight: record, silent
+      else if (d.latest !== seen
+               && (!paperBellCard || paperBellCard.dataset.id !== d.latest)) {
+        paperBellRing(d.latest, d.headline || "");
+        if (paperBellCard) paperBellCard.dataset.id = d.latest;
+      }
+    }
     const btn = document.getElementById("paperBarBtn");
     if (btn) {
       btn.style.outline = d.running ? "2px solid var(--accent)" : "";
@@ -145852,6 +146604,30 @@ async function paperOpen() {
   const newer = el("button", "", "▶");
   newer.title = "Newer edition (→)";
   newer.onclick = () => paperStep(-1);
+  /* #1051: the switch for the hourly press. Off stops the clock; every
+   * other road to a paper still works. */
+  const hourly = el("button", "", "\u23f1");
+  hourly.title = "Hourly press \u2014 loading\u2026";
+  hourly.onclick = async () => {
+    try {
+      const now = await api("/api/settings");
+      const on = !((now.dj || {}).paper_hourly !== false);
+      await api("/api/settings", {method: "POST",
+        body: JSON.stringify({dj: {paper_hourly: on}})});
+      paperHourlyPaint(on);
+      setStatus(on ? "the press runs every hour again"
+                   : "the hourly press is off \u2014 Print now still works");
+    } catch (e) { setStatus(e.message, true); }
+  };
+  function paperHourlyPaint(on) {
+    hourly.style.opacity = on ? "1" : ".45";
+    hourly.title = on
+      ? "Hourly press is ON \u2014 an issue every hour on the hour. Click to stop it."
+      : "Hourly press is OFF \u2014 nothing prints on the hour. Click to start it.";
+  }
+  api("/api/settings").then((now) => {
+    paperHourlyPaint((now.dj || {}).paper_hourly !== false);
+  }).catch(() => {});
   const print = el("button", "", "Print now");
   print.title = "Press an extra edition of the last sixty minutes, right now";
   print.onclick = async () => {
@@ -145878,7 +146654,7 @@ async function paperOpen() {
   };
   const x = el("button", "", "✕");
   x.onclick = paperClose;
-  [copy, pdf, image, older, newer, print, open, bin, x].forEach((b) => head.appendChild(b));
+  [copy, pdf, image, hourly, older, newer, print, open, bin, x].forEach((b) => head.appendChild(b));
   box.appendChild(head);
 
   paperShelf = el("div", "", "");
