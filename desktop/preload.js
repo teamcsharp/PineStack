@@ -16,6 +16,21 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   put: (route, body) => ipcRenderer.invoke("agent:put", route, body),
   del: (route, body) => ipcRenderer.invoke("agent:del", route, body),
   openExternal: (url) => ipcRenderer.invoke("open:external", url),
+  lcdState: () => ipcRenderer.invoke("lcd:state"),
+  lcdConfigure: (cfg) => ipcRenderer.invoke("lcd:configure", cfg),
+  lcdDiscover: () => ipcRenderer.invoke("lcd:discover"),
+  lcdConnect: (host) => ipcRenderer.invoke("lcd:connect", {host}),
+  lcdStart: (automatic = false) => ipcRenderer.invoke("lcd:start", {automatic}),
+  lcdStop: () => ipcRenderer.invoke("lcd:stop"),
+  lcdDisconnect: () => ipcRenderer.invoke("lcd:disconnect"),
+  lcdFrame: (jpeg) => ipcRenderer.invoke("lcd:frame", {jpeg}),
+  lcdEvents: () => ipcRenderer.invoke("lcd:events"),
+  lcdControl: (action, value) => ipcRenderer.invoke("lcd:control", {action, value}),
+  lcdDisplayMode: (mode) => ipcRenderer.invoke("lcd:display-mode", {mode}),
+  lcdPaperImage: (url) => ipcRenderer.invoke("lcd:paper-image", {url}),
+  lcdFirmware: (body = {}) => ipcRenderer.invoke("lcd:firmware", body),
+  lcdSampleDirectory: () => ipcRenderer.invoke("lcd:sample-directory"),
+  lcdDownload: (id, at) => ipcRenderer.invoke("lcd:download", {id, at}),
   /* #990: THE COPY BUTTON DID NOTHING.
    *
    * The window is loaded from file://, which is not a secure context, so

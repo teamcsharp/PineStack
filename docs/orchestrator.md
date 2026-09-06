@@ -1,5 +1,9 @@
 # The orchestrator
 
+The [inbox #1057 execution audit](orchestrator-audit-1057.md) documents the
+current recording booths, complete-line reconciliation, durable ordered
+recovery, neural outcome memory and the regression evidence behind them.
+
 The general manager. Nobody reports to it and it cannot make anybody do
 anything — it decides **what gets made next**, and everything else follows from
 that one decision being made well.
@@ -194,3 +198,22 @@ or add a faster engine and pin the expensive seat to it. Only XTTS is running
 at the time of writing; F5 measured roughly five times faster, and pinning the
 caller's own turns to it would take the phone road from 0.35 to somewhere near
 1.7 — at which point the sheet fits inside the hour.
+
+## 6. The second pass and the air (#1063)
+
+The crystal tint is a second pass over finished dialogue. Every road still runs
+it, and a rewrite that passes the evaluator is the version that airs. What the
+pass may never do is silence the station.
+
+`crystal_tint_hold` (off by default) is the one dial. Off, a rewrite that fails
+or is deferred goes out as written and the pipeline log says so, and a stored
+round is READY on its audio alone. On, the #1057 contract stands: a selected
+line that fails the evaluator is held before recording, a stored round needs
+current tint proof to be READY, and the repair clock re-tints legacy stock.
+
+Why the default is off, measured on 6 September 2026 with the contract in
+force: 144 lines were offered to the tint and one passed; 324 of 325 stored
+rounds were marked `repair_required`; every phone call was lost before the
+speaker ("NEVER MADE AIR"); the emergency host read filler for three hours
+while `dialogue_flow.ready` sat at 0 of 12. The blocker list now names the
+hold when it is the reason, and `GET /api/tint` reports `hold`.

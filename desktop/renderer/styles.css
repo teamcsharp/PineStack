@@ -188,6 +188,12 @@ body.resizing-rail .rail-resizer::before {
   white-space: nowrap;
 }
 
+.route-panel p.route-summary {
+  white-space: pre-line;
+  overflow: visible;
+  line-height: 1.4;
+}
+
 /* #984 */
 .now-cell { cursor: pointer; min-width: 0; max-width: 30%; }
 .now-cell:hover { background: rgba(159, 216, 255, .06); }
@@ -847,6 +853,12 @@ body.rail-compact .route-panel p.err {
   display: block;
   color: var(--red);
   white-space: normal;
+}
+
+body.rail-compact .route-panel p.route-summary {
+  display: block;
+  font-size: 9px;
+  overflow-wrap: anywhere;
 }
 
 body.rail-compact .fm-row {

@@ -554,9 +554,12 @@ function initStreamRoutes() {
 function paintBoxVolumeOwner(routing) {
   const box = document.getElementById("boxVolOwn");
   if (!box) return;
+  const physicalNabu = !!(routing && routing.voice_device === "nabu");
+  box.disabled = physicalNabu;
   if (!box.dataset.wired) {
     box.dataset.wired = "1";
     box.onchange = () => {
+      if (box.disabled) { box.checked = false; return; }
       const on = !!box.checked;
       api.post("/api/dj/output", {music_control: on})
         .then(() => noteRouteOk(on
@@ -565,6 +568,14 @@ function paintBoxVolumeOwner(routing) {
             + "— the dial on the device owns it the rest of the time"))
         .catch((err) => { noteRouteError(err.message); box.checked = !on; });
     };
+  }
+  if (physicalNabu) {
+    box.checked = false;
+    if (box.parentElement) box.parentElement.title =
+      "Nabu keeps the volume set on its physical dial. The station never "
+      + "reapplies a saved level; moving the Music slider yourself still "
+      + "makes one deliberate adjustment.";
+    return;
   }
   if (document.activeElement === box) return;   // mid-click; leave it be
   box.checked = !!(routing && routing.music_control);
@@ -754,12 +765,29 @@ function wireFrame(frame) {
 
 function routeKeyFromState(status) {
   const routing = status && status.routing ? status.routing : {};
-  if (routing.voice_device === "nabu" && ["box", "both"].includes(routing.voice_to)) return "nabu";
-  if (!routing.voice_device && routing.voice_to === "box" && routing.music_to === "here") return "nabu";
-  if (routing.voice_to === "box" && routing.music_to === "box") return "box";
-  if (routing.voice_to === "here" && routing.music_to === "here") return "app";
-  if (routing.voice_to === "both" || routing.music_to === "both") return "app";
-  return routing.voice_to || routing.music_to || "box";
+  const destinations = [routing.music_to, routing.voice_to, routing.reply_to || routing.voice_to];
+  if (destinations.every((value) => value === "here")) return "app";
+  if (destinations.every((value) => value === "box")) return routing.voice_device === "nabu" ? "nabu" : "box";
+  return "custom";
+}
+
+function routeSummaryFromState(routing) {
+  if (!routing) return "Waiting for the station's routes.";
+  const device = routing.voice_device === "nabu" ? "Nabu" : "Pine Box";
+  const names = {here: "App", box: device, both: "App + " + device, off: "Off"};
+  const values = [routing.music_to, routing.voice_to, routing.reply_to];
+  const lines = ["Music", "DJs", "Replies"].map((label, index) => label + ": " + (names[values[index]] || "Unknown"));
+  const physical = values.some((value) => value === "box" || value === "both");
+  lines.push(device + ": " + (!physical ? "not routed" : routing.box_talk === false ? "output paused" : "output enabled"));
+  if (routing.on === false) lines.push("Station off");
+  return lines.join("\n");
+}
+
+function syncBroadcastFromServer(status) {
+  const key = routeKeyFromState(status);
+  if (!broadcastChanging && ROUTES[key] && desiredBroadcast !== key) setDesiredBroadcast(key);
+  setRouteUi(key, routeLabelFromState(status.routing));
+  setText("routeSummary", routeSummaryFromState(status.routing));
 }
 
 function routeLabelFromState(routing) {
@@ -777,8 +805,8 @@ function routeLabelFromState(routing) {
 
 function setRouteUi(key, note) {
   const select = $("broadcastTarget");
-  const next = ROUTES[key] ? key : desiredBroadcast;
-  if (select && ROUTES[next] && document.activeElement !== select && !broadcastChanging) {
+  const next = key === "custom" || ROUTES[key] ? key : desiredBroadcast;
+  if (select && (ROUTES[next] || next === "custom") && document.activeElement !== select && !broadcastChanging) {
     select.value = next;
   }
   setText("routeNote", note || (ROUTES[key] ? ROUTES[key].label : "routing unknown"));
@@ -1052,18 +1080,13 @@ async function refresh() {
     setText("routeState", routeLabelFromState(status.routing));
     setText("nowState", status.now_playing ? `${status.now_playing.artist || ""} ${status.now_playing.title || ""}`.trim() : "quiet");
     setText("spokenLine", status.spoken || status.cause || status.diag_error || "status loaded");
-    const serverKey = routeKeyFromState(status);
-    if (!broadcastChanging && serverKey === desiredBroadcast) {
-      setRouteUi(serverKey, routeLabelFromState(status.routing));
-    } else {
-      setRouteUi(desiredBroadcast, routeLabelFromState(status.routing));
-    }
+    lastRouting = status.routing || null;
+    syncBroadcastFromServer(status);
     setFmUi(status.routing && status.routing.on);
-    /* #980: remember what the server said and paint the three stream
-       pickers from it, then re-gate - a stream moved from anywhere
+    /* #980: paint the three stream pickers from the server, then
+       re-gate - a stream moved from anywhere
        (another client, the box, a spoken command) has to reach the
        app's audio, not just a change made in this window. */
-    lastRouting = status.routing || null;
     paintBoxVolumeOwner(status.routing);                    // #1007
     paintStreamRoutes(status.routing);
     initStreamRoutes();
@@ -1318,7 +1341,7 @@ async function panicRecover() {
   const button = $("panicBtn");
   const was = button.textContent;
   const key = $("broadcastTarget")?.value || "nabu";
-  const route = ROUTES[key] || ROUTES.nabu;
+  const route = ROUTES[key] || null;
   button.disabled = true;
   button.textContent = "...";
   setText("connLine", "deploying the latest Pine Box...");
@@ -1372,8 +1395,10 @@ async function panicRecover() {
   setText("connLine", "recovering Pine Box...");
   try {
     try {
-      await api.post("/api/dj/output", route);
-      setText("routeNote", `${route.label} selected`);
+      if (route) {
+        await api.post("/api/dj/output", route);
+        setText("routeNote", `${route.label} selected`);
+      }
     } catch (err) {
       appendLog(`[recover] route failed: ${err.message}\n`);
     }
@@ -1456,9 +1481,11 @@ async function applyDefaultBroadcast() {
   // Broadcast dropdown yourself (setBroadcastTarget).
   try {
     const status = await api.get("/api/pinebox/status");
+    lastRouting = status.routing || null;
     const key = routeKeyFromState(status);
     if (ROUTES[key]) setDesiredBroadcast(key);
-    noteRouteOk(`${(ROUTES[key] || ROUTES[desiredBroadcast] || ROUTES.nabu).label} — as the box has it`);
+    syncBroadcastFromServer(status);
+    noteRouteOk(`${key === "custom" ? "Custom routes" : ROUTES[key].label} — as the station has it`);
   } catch (err) {
     /* server quiet — keep showing the saved selection, write nothing */
   }

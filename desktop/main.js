@@ -2,6 +2,10 @@ const { app, BrowserWindow, ipcMain, session, shell } = require("electron");
 const { spawn } = require("node:child_process");
 const fs = require("node:fs");
 const path = require("node:path");
+const { LcdAgent, deviceRequest } = require("./lcd-agent.cjs");
+const { LcdSerial, usbDisplays } = require("./lcd-serial.cjs");
+const { LcdFirmware } = require("./lcd-firmware.cjs");
+const { saveLcdSample } = require("./lcd-samples.cjs");
 
 let win;
 let backend = null;
@@ -124,6 +128,26 @@ function writeConfig(next) {
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2));
   return cfg;
+}
+
+const lcdSerial = new LcdSerial();
+const lcdAgent = new LcdAgent({read: readConfig, write: writeConfig,
+  request: (host, ...args) => /^COM[0-9]+$/i.test(host) ? lcdSerial.request(host, ...args) : deviceRequest(host, ...args)});
+lcdAgent.releaseTransport = () => lcdSerial.close();
+const lcdFirmware = new LcdFirmware({root: path.join(PINE_USER_DATA, "lcd-firmware"),
+  config: () => lcdAgent.config(), agent: lcdAgent});
+function lcdState() { return {...lcdAgent.state(), firmware: lcdFirmware.state(), sampleDirectory: readConfig().saveDir || path.join(app.getPath("downloads"), "Pine Box Samples")}; }
+async function prepareLcdConnection(host) {
+  if (!/^COM[1-9][0-9]{0,3}$/i.test(String(host))) return;
+  const port = String(host).toUpperCase();
+  let identity = lcdAgent.config().host === port ? lcdAgent.config().identity : '';
+  if (!lcdSerial.child) {
+    lcdFirmware.launch('identify', {port});
+    while (lcdFirmware.job?.running) await new Promise((resolve) => setTimeout(resolve, 200));
+    if (lcdFirmware.job?.error) throw new Error(lcdFirmware.job.error);
+    identity = lcdFirmware.usb?.mac;
+  }
+  await lcdSerial.open(port, identity);
 }
 
 function agentRoot() {
@@ -659,6 +683,9 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      // The optional LCD producer must keep scrolling when Pine Box is
+      // minimised; its own loop sleeps while that producer is stopped.
+      backgroundThrottling: false,
       webviewTag: true,
       sandbox: false
     }
@@ -707,6 +734,72 @@ ipcMain.handle("agent:del", (_event, route, body) => fetchJson(`${readConfig().b
   body: JSON.stringify(body || {})
 }));
 ipcMain.handle("open:external", (_event, url) => shell.openExternal(url));
+
+// #1052: only the desktop chrome owns the physical LCD producer. Embedded
+// newspaper/article pages cannot obtain a device-control IPC surface.
+function lcdHandle(name, handler) {
+  ipcMain.handle("lcd:" + name, (event, payload) => {
+    if (!win || event.sender.id !== win.webContents.id) throw new Error("LCD control belongs to the Pine Box desktop.");
+    return handler(payload || {});
+  });
+}
+lcdHandle("state", () => lcdState());
+lcdHandle("configure", (cfg) => lcdAgent.configure(cfg));
+lcdHandle("discover", async () => {
+  const [network, usb] = await Promise.allSettled([lcdAgent.discover(), usbDisplays()]);
+  const devices = [...(network.value?.devices || []), ...(usb.value || [])];
+  return {devices, error: devices.length ? '' : network.value?.error || 'No LCD displays found.'};
+});
+lcdHandle("connect", async (body) => { await prepareLcdConnection(body.host); return lcdAgent.connect(body.host); });
+lcdHandle("start", async (body) => {
+  if (lcdFirmware.job?.running) throw new Error("Wait for the firmware operation to finish before streaming.");
+  await prepareLcdConnection(lcdAgent.config().host);
+  return lcdAgent.start({automatic: !!body.automatic});
+});
+lcdHandle("stop", () => lcdAgent.stop());
+lcdHandle("disconnect", async () => {
+  let releaseWarning = '';
+  try { if (lcdAgent.connected && lcdAgent.device?.hostTouch) await lcdAgent.displayMode('avatar'); }
+  catch (error) { releaseWarning = 'USB released. The display could not confirm avatar mode: ' + error.message; }
+  finally { lcdAgent.stop(); await lcdSerial.close(); lcdAgent.connected = false; }
+  return {...lcdState(), releaseWarning};
+});
+lcdHandle("frame", (body) => lcdAgent.frame(body.jpeg));
+lcdHandle("events", () => lcdAgent.events());
+lcdHandle("control", (body) => lcdAgent.control(body.action, body.value));
+lcdHandle("display-mode", (body) => lcdAgent.displayMode(body.mode));
+lcdHandle("paper-image", async (body) => {
+  const cfg = readConfig(), base = new URL(cfg.baseUrl), url = new URL(String(body.url || ''), base);
+  if (url.origin !== base.origin || !url.pathname.startsWith('/api/')) throw new Error("LCD paper images must come from the station.");
+  const response = await fetch(url, {headers: authHeaders(cfg), signal: AbortSignal.timeout(15000)});
+  const type = String(response.headers.get('content-type') || '').split(';')[0];
+  if (!response.ok || !/^image\/(jpeg|png|webp)$/.test(type)) throw new Error("Newspaper image unavailable.");
+  const chunks = []; let length = 0;
+  for await (const part of response.body) { length += part.length; if (length > 5 * 1024 * 1024) throw new Error("LCD paper image too large."); chunks.push(Buffer.from(part)); }
+  return 'data:' + type + ';base64,' + Buffer.concat(chunks).toString('base64');
+});
+lcdHandle("firmware", async (body) => {
+  if (body.action && body.action !== "tools") return lcdFirmware.launch(body.action, body);
+  const firmware = lcdAgent.state().firmware;
+  if (!firmware.available) return {ok: false, why: "Quanta is not installed at the configured path."};
+  // Open the existing interactive firmware manager. This does not select a
+  // serial port, install a toolchain, erase or flash any attached device.
+  const error = await shell.openPath(firmware.tool);
+  return {ok: !error, why: error || firmware.reason};
+});
+lcdHandle("download", async (body) => {
+  const result = await saveLcdSample({id: body.id, at: body.at, config: readConfig(),
+    defaultDirectory: path.join(app.getPath("downloads"), "Pine Box Samples")});
+  writeConfig({saveDir: result.directory});
+  return result;
+});
+lcdHandle("sample-directory", async () => {
+  const result = await require("electron").dialog.showOpenDialog(win, {title: "LCD sound samples", defaultPath: lcdState().sampleDirectory,
+    properties: ["openDirectory", "createDirectory"]});
+  if (!result.canceled && result.filePaths[0]) writeConfig({saveDir: result.filePaths[0]});
+  return lcdState();
+});
+app.on("before-quit", () => { lcdAgent.stop(); lcdSerial.close(); });
 
 // #809: F5 pressed while focus is INSIDE a panel webview never
 // reaches the chrome's keydown handler — the webview swallows it.
@@ -817,6 +910,11 @@ app.commandLine.appendSwitch(
 app.whenReady().then(async () => {
   selfSyncFromShare();
   createWindow();
+  if (process.env.PINE_DESKTOP_PLAYBACK_PROBE === "1") {
+    delete process.env.PINE_DESKTOP_PLAYBACK_PROBE;
+    require("./playback-probe.cjs").capture({lcdState, lcdFrame: () => lcdAgent.lastFrame})
+      .catch(error => rememberLog(`[playback observation] ${error.message}`));
+  }
   const cfg = readConfig();
   if (cfg.mode === "launch") {
     try {

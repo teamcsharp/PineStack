@@ -11,6 +11,9 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         app._INVENTORY_PLAN.update({"at": 0.0, "hours": 0.0, "plan": {}})
         app._COMMITS.update({"at": 0.0, "rows": []})
+        journal = mock.patch.object(app, "station_flow_event")
+        journal.start()
+        self.addCleanup(journal.stop)
 
     def test_ready_requires_current_tint_and_every_audio_take(self) -> None:
         entry = {
@@ -27,7 +30,9 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(app.dialogue_row_ready("banter", entry))
 
             entry.update({"script_tinted": "A: tinted words",
-                          "script": "A: tinted words", "use": "tinted"})
+                          "script": "A: tinted words", "use": "tinted",
+                          "tint": {"coverage": {"met": True, "target": 100,
+                                                "version": 2, "strength": 1.0}}})
             entry["made"] = 1
             self.assertFalse(app.dialogue_row_ready("banter", entry))
 
@@ -68,7 +73,7 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
         calls: list[str] = []
 
         async def partial(text, world, chunks, answering="", keep=None,
-                          seen=None, kind="", model=""):
+                          seen=None, kind="", model="", lesson=""):
             calls.append(text)
             return ("A changed first line with a chained internal rhyme."
                     if len(calls) == 1 else text)
@@ -93,6 +98,8 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
         with common[0], common[1], common[2], common[3], common[4], \
                 common[5], common[6], common[7], common[8], common[9], \
                 common[10], common[11], common[12], \
+                mock.patch.object(app, "tint_evaluate", side_effect=lambda source, output, *a, **k:
+                                  {"ok": source != output, "faults": []}), \
                 mock.patch.object(app, "crystal_turn", side_effect=partial):
             stopped = await app.crystal_tint(script, "banter", critical=True)
 
@@ -104,7 +111,7 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
         calls.clear()
 
         async def finish(text, world, chunks, answering="", keep=None,
-                         seen=None, kind="", model=""):
+                         seen=None, kind="", model="", lesson=""):
             calls.append(text)
             self.assertEqual(model, "fast-test")
             return "A changed second line with a nested rhythmic decision."
@@ -129,6 +136,8 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
         with common[0], common[1], common[2], common[3], common[4], \
                 common[5], common[6], common[7], common[8], common[9], \
                 common[10], common[11], common[12], \
+                mock.patch.object(app, "tint_evaluate", side_effect=lambda source, output, *a, **k:
+                                  {"ok": source != output, "faults": []}), \
                 mock.patch.object(app, "crystal_turn", side_effect=finish):
             finished = await app.crystal_tint(
                 script, "banter", progress=stopped["progress"], critical=True)
@@ -346,7 +355,7 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sheet["lines"], 1)
         self.assertEqual(sheet["obligations"]["selected_rows"], 1)
 
-    def test_retirement_removes_unassigned_rows_and_unshared_audio(self) -> None:
+    def test_retirement_preserves_unheard_unassigned_rows_and_audio(self) -> None:
         keep = {"sid": "keep", "text": "kept words", "key": "keep-key"}
         waste = {"sid": "waste", "text": "unused words", "key": "waste-key"}
         prior_shelf = dict(app._SHELF)
@@ -371,10 +380,10 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
                   mock.patch.object(app, "_larder_save"),
                   mock.patch.object(app, "pipeline_log")):
                 gone = app.coord_retire()
-            self.assertEqual(gone, 1)
-            self.assertEqual(app._SHELF["ad"], [keep])
+            self.assertEqual(gone, 0)
+            self.assertEqual(app._SHELF["ad"], [keep, waste])
             self.assertIn("keep-key", app._PANTRY)
-            self.assertNotIn("waste-key", app._PANTRY)
+            self.assertIn("waste-key", app._PANTRY)
         finally:
             app._SHELF.clear()
             app._SHELF.update(prior_shelf)
@@ -797,6 +806,7 @@ C: My red tomato plants were underneath it, and every leaf was perfectly dry.
 B: Those dry tomato leaves are strange. Who else saw the missing roof?
 C: My neighbor June saw it, brought a ladder, and found one blue hinge in the yard.
 B: June and the blue hinge make this feel real. We are sending the repair van.
+C: That resolves it for me. I will keep June close and wait for the repair van.
 A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
         with mock.patch.object(app, "_call_history_scripts", return_value=[]):
             report = app.call_flow_report(
@@ -806,6 +816,7 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
         self.assertGreaterEqual(report["answered_questions"], 2)
         self.assertTrue(report["topic"]["host"])
         self.assertTrue(report["topic"]["caller"])
+        self.assertTrue(report["resolved"])
 
     def test_complete_call_fallback_itself_passes_the_contract(self) -> None:
         with (mock.patch.object(app, "_call_history_scripts", return_value=[]),
@@ -822,6 +833,157 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
                 self.assertTrue(report["ok"], (name, report["faults"]))
                 self.assertGreaterEqual(report["answered_questions"], 2)
                 self.assertGreaterEqual(report["caller_share"], 0.35)
+                self.assertTrue(report["speakerbox"]["caller"])
+                self.assertTrue(report["speakerbox"]["hosts"])
+                self.assertTrue(report["resolved"])
+
+    def test_fallback_identity_is_driven_by_its_speakerbox_pivot(self) -> None:
+        first = app._fallback_call_script(
+            "Doreen", "heat",
+            "A brass telescope arrived under a wool blanket. Its cracked "
+            "lens projected a blue orchard across the garage wall.")
+        second = app._fallback_call_script(
+            "Marlowe", "heat",
+            "Three library cards fell from a locked violin case. A penciled "
+            "map on the last card ended beneath the courthouse stairs.")
+        with mock.patch.object(app, "_call_history_scripts", return_value=[{
+                "id": "first", "name": "Doreen", "script": first}]):
+            report = app.call_novelty(second)
+        self.assertTrue(report["ok"], report)
+
+    def test_caller_must_hand_speakerbox_pivot_to_a_host(self) -> None:
+        source = "the copper fan whistles under the greenhouse glass"
+        script = app._fallback_call_script(
+            "Doreen", "who should own the town greenhouse", source)
+        broken = script.replace(source, "another unrelated thought")
+        with mock.patch.object(app, "_call_history_scripts", return_value=[]):
+            report = app.call_flow_report(
+                broken, "Doreen", topic="who should own the town greenhouse",
+                speakerbox_text=source)
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["speakerbox"]["caller"])
+        self.assertTrue(any("Speakerbox" in fault
+                            for fault in report["faults"]))
+
+    def test_caller_must_resolve_immediately_before_signoff(self) -> None:
+        script = app._fallback_call_script(
+            "Doreen", "who should own the town greenhouse",
+            "the copper fan whistles under the greenhouse glass")
+        turns = app.banter_turns(script, "Doreen")
+        del turns[-2]
+        broken = "\n".join(f"{m}: {t}" for m, t in turns)
+        with mock.patch.object(app, "_call_history_scripts", return_value=[]):
+            report = app.call_flow_report(
+                broken, "Doreen", topic="who should own the town greenhouse",
+                speakerbox_text=(
+                    "the copper fan whistles under the greenhouse glass"))
+        self.assertFalse(report["ok"])
+        self.assertFalse(report["resolved"])
+        self.assertTrue(any("resolve" in fault for fault in report["faults"]))
+
+    async def test_scheduled_banter_call_uses_prepared_call_first(self) -> None:
+        dj = {"talk_radio_mode": True, "talk_radio": 100}
+        with (mock.patch.object(
+                  app, "dj_caller",
+                  new=mock.AsyncMock(return_value=["caller: ready"])
+              ) as shelf,
+              mock.patch.object(
+                  app, "dj_call_generated",
+                  new=mock.AsyncMock(return_value={"lines": ["live"]})
+              ) as live):
+            aired = await app.schedule_extra_round(
+                "banter_caller", {"id": "track"}, dj)
+        self.assertTrue(aired)
+        shelf.assert_awaited_once_with({"id": "track"}, shelf_only=True)
+        live.assert_not_awaited()
+
+    async def test_full_talk_never_waits_on_live_call_writing(self) -> None:
+        dj = {"talk_radio_mode": True, "talk_radio": 100}
+        with (mock.patch.object(
+                  app, "dj_caller", new=mock.AsyncMock(return_value=[])),
+              mock.patch.object(app, "dj_call_generated",
+                                new=mock.AsyncMock()) as live,
+              mock.patch.object(app, "prep_one", return_value=None) as prep,
+              mock.patch.object(app, "fire_and_forget",
+                                side_effect=lambda work: work.close()),
+              mock.patch.object(app, "pipeline_log")):
+            aired = await app.schedule_extra_round(
+                "banter_caller", {"id": "track"}, dj)
+        self.assertFalse(aired)
+        prep.assert_called_once_with("caller")
+        live.assert_not_awaited()
+
+    async def test_full_talk_ad_is_one_zero_work_break(self) -> None:
+        dj = {"talk_radio_mode": True, "talk_radio": 100}
+        old_first = app._RADIO.get("sched_first")
+        try:
+            with mock.patch.object(app, "dj_ad_break",
+                                   new=mock.AsyncMock(return_value="spot")) as ad:
+                app._RADIO["sched_first"] = True
+                self.assertTrue(await app.schedule_extra_round("ad", None, dj))
+                ad.assert_awaited_once_with(zero_work_only=True)
+                app._RADIO["sched_first"] = False
+                self.assertIsNone(
+                    await app.schedule_extra_round("ad", None, dj))
+                self.assertEqual(ad.await_count, 1)
+        finally:
+            if old_first is None:
+                app._RADIO.pop("sched_first", None)
+            else:
+                app._RADIO["sched_first"] = old_first
+
+    async def test_full_talk_banter_refuses_live_writing_when_shelf_empty(
+            self) -> None:
+        with (mock.patch.object(app, "dj_settings", return_value={
+                  "banter": True, "banter_min_lines": 2,
+                  "banter_max_lines": 3}),
+              mock.patch.object(app, "seat_away_who", return_value=""),
+              mock.patch.object(app, "_LARDER", []),
+              mock.patch.object(app, "banter_material") as live_material):
+            self.assertEqual(await app.dj_banter(shelf_only=True), [])
+        live_material.assert_not_called()
+
+    def test_full_talk_has_only_a_transport_seam_and_fast_watch(self) -> None:
+        dj = {"talk_radio_mode": True, "talk_radio": 100,
+              "talk_quiet_most": 95}
+        with mock.patch.object(app, "dj_settings", return_value=dj):
+            self.assertLess(app.torrent_breath(dj), 0.4)
+            self.assertEqual(app.talk_quiet_limit(), 12.0)
+            self.assertEqual(app.talk_watch_tick(), 2.0)
+
+    def test_full_talk_replaces_live_only_round_with_recorded_talk(self) -> None:
+        dj = {"talk_radio_mode": True, "talk_radio": 100}
+        with (mock.patch.object(app, "gap_stock_kind",
+                                return_value="banter")):
+            kind, why = app.gap_kind_policy("deep", dj, now=1234.0)
+            backed_kind, backed_why = app.gap_kind_policy(
+                "gallery", dj, now=1234.0)
+        self.assertEqual(kind, "banter")
+        self.assertIn("100% talk", why)
+        self.assertEqual(backed_kind, "banter")
+        self.assertIn("zero-work-to-air", backed_why)
+
+    async def test_background_prep_does_not_borrow_live_segment_prompt(
+            self) -> None:
+        old_prompt = app._RADIO.get("sched_prompt")
+        old_interject = app._RADIO.get("interject_prompt")
+        app._RADIO["sched_prompt"] = "ANGRY MANAGER SEGMENT"
+        app._RADIO.pop("interject_prompt", None)
+        try:
+            self.assertEqual(app._schedule_prompt_clause(),
+                             "ANGRY MANAGER SEGMENT")
+            app.prep_context_set("caller")
+            self.assertEqual(app._schedule_prompt_clause(), "")
+        finally:
+            app.prep_context_clear()
+            if old_prompt is None:
+                app._RADIO.pop("sched_prompt", None)
+            else:
+                app._RADIO["sched_prompt"] = old_prompt
+            if old_interject is None:
+                app._RADIO.pop("interject_prompt", None)
+            else:
+                app._RADIO["interject_prompt"] = old_interject
 
     def test_brief_location_may_share_one_generic_topic_word(self) -> None:
         topic = ("the heat coming off the DGX Spark, the machine this "
@@ -1009,7 +1171,10 @@ A: So Brak, how your man got a show that's whack?"""
                     "Mars collapsed into an unrelated statement.",
                     "Why did the purple submarine disappear?",
                     faithful])),
-              mock.patch.object(app, "tint_model_for", return_value="fast")):
+              mock.patch.object(app, "tint_model_for", return_value="fast"),
+              # This test isolates the semantic anchor retry. Rhyme and
+              # source-copy grading are exercised in test_tint_contract.
+              mock.patch.object(app, "tint_evaluate", return_value={"ok": True, "faults": []})):
             result = await app.crystal_turn(
                 source, "world", [{"text": "A compact style sample."}],
                 kind="caller")

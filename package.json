@@ -32,6 +32,33 @@
         "to": "agent/app.py"
       },
       {
+        "from": "station_flow.py",
+        "to": "agent/station_flow.py"
+      },
+        {
+          "from": "response_bank.py",
+          "to": "agent/response_bank.py"
+        },
+        {
+          "from": "tint_recovery.py",
+          "to": "agent/tint_recovery.py"
+        },
+      {
+        "from": "resource_guard.py",
+        "to": "agent/resource_guard.py"
+      },
+      {
+        "from": "newspaper_city.py",
+        "to": "agent/newspaper_city.py"
+      },
+      {
+        "from": "frontend",
+        "to": "agent/frontend",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
         "from": "requirements.txt",
         "to": "agent/requirements.txt"
       },
