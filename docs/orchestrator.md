@@ -217,3 +217,24 @@ rounds were marked `repair_required`; every phone call was lost before the
 speaker ("NEVER MADE AIR"); the emergency host read filler for three hours
 while `dialogue_flow.ready` sat at 0 of 12. The blocker list now names the
 hold when it is the reason, and `GET /api/tint` reports `hold`.
+
+## 7. Recorded means aired, and the sample pool (#1062, #1063)
+
+**#1063.** A frozen round whose every line has a finished take is recorded.
+At air time it is not freshened for repeats (the #901 scan still runs and the
+log says what it would have cut), and the editorial gates in the speaking loop
+(a record not on air, another language, a made-up running time, the repeat and
+phrase gates) write down their verdict instead of dropping the line. The cut is
+owed to the writing desk, before the studio. `air_gate()` is the one function;
+`speak_turns(..., recorded=True)` is the flag `_banter_air` sets. Two things
+still stop a recorded line: the operator burying it, and the writing profile
+(cast, crystal, plot act) having changed since it was written.
+
+**#1062.** First sightings of samples are written to `data/sfx_seen.json`, so an
+arrival is an arrival across restarts; a recent arrival is always in the pool
+even when a big folder is sampled to `SFX_MAX_FILES`; half the draws go to what
+is fresh (never played, or first seen inside 48 hours) through the same
+no-repeat memory; and `sfx_keeper` walks the folders once a minute while the
+show is on instead of only when a sting happened to be due.
+`GET /api/sfx/history` reports `fresh`, `arrivals_48h`, `fresh_share` and
+`walked_at`.

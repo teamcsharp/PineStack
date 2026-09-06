@@ -37677,6 +37677,7 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(needle_watch()))     # #689
     _RADIO_TASK.append(asyncio.create_task(_torrent_talk()))    # #700
     _RADIO_TASK.append(asyncio.create_task(larder_keeper()))
+    _RADIO_TASK.append(asyncio.create_task(sfx_keeper()))           # #1062
     _RADIO_TASK.append(asyncio.create_task(storage_keeper()))   # #836
     _RADIO_TASK.append(asyncio.create_task(switchboard_keeper()))   # #884
     _RADIO_TASK.append(asyncio.create_task(pantry_keeper()))        # #886
@@ -54690,11 +54691,21 @@ _SFX_PLAYS_LOCK = RLock()
 
 
 def sfx_plays() -> dict[str, Any]:
+    """The plays ledger, cached against the file's own mtime (#1062) -
+    sfx_fresh_paths reads it on every draw now."""
+    try:
+        stamp = SFX_PLAYS_PATH.stat().st_mtime_ns
+    except OSError:
+        stamp = 0
+    if stamp and _SFX_PLAYS_MEMO["at"] == stamp:
+        return _SFX_PLAYS_MEMO["rows"]
     try:
         rows = json.loads(SFX_PLAYS_PATH.read_text())
-        return rows if isinstance(rows, dict) else {}
+        rows = rows if isinstance(rows, dict) else {}
     except Exception:
-        return {}
+        rows = {}
+    _SFX_PLAYS_MEMO.update({"at": stamp, "rows": rows})
+    return rows
 
 
 def sfx_note_play(sid: str, name: str, who: str, ms: int = 0) -> None:
@@ -54914,6 +54925,110 @@ _SFX_POOL_FILLING = [False]
 # alone cannot tell a new arrival from the rotation shuffling - this
 # can, and it is what makes "3 new samples" in the feed mean something.
 _SFX_SEEN: set[str] = set()
+# #1062: "make sure that the station is always aware of new clips being
+# added to the SFX directory and is utilizing randomization to make sure
+# that new clips are constantly being played on the air randomly."
+#
+# Three things were true before this. The pool walk only ran when a sting
+# happened to be due, so a quiet hour never noticed a new file. The walk
+# announced arrivals against a set that died with the process, so a clip
+# dropped while the station was down was never "new". And a big folder is
+# SAMPLED to SFX_MAX_FILES per walk (#817), so a fresh file in the
+# 3,447-grab folder had about a one-in-nine chance of being in the draw
+# at all, and then one chance in four hundred of being drawn. Now: first
+# sightings are written down (sfx_seen.json), a recent arrival is always
+# in the pool, half the draws go to what is fresh, and the walk runs on
+# its own clock while the show is on.
+SFX_ARRIVALS_PATH = data_path("sfx_seen.json")
+SFX_FRESH_HOURS = 48.0              # how long an arrival stays "new"
+SFX_FRESH_SHARE = 0.5               # the share of draws that go to it
+_SFX_ARRIVALS: dict[str, Any] = {"loaded": False, "rows": {}}
+_SFX_PLAYS_MEMO: dict[str, Any] = {"at": -1, "rows": {}}
+
+
+def _sfx_arrivals_rows() -> dict[str, float]:
+    """path -> when the station first saw it (0 = before the ledger)."""
+    if not _SFX_ARRIVALS["loaded"]:
+        rows: dict[str, float] = {}
+        try:
+            got = json.loads(SFX_ARRIVALS_PATH.read_text())
+            if isinstance(got, dict):
+                rows = {str(k): float(v or 0) for k, v in got.items()}
+        except Exception:  # noqa: BLE001
+            rows = {}
+        _SFX_ARRIVALS.update({"loaded": True, "rows": rows})
+    return _SFX_ARRIVALS["rows"]
+
+
+def _sfx_arrivals_note(seen: set[str]) -> list[str]:
+    """Stamp first sightings; return the paths met for the first time.
+
+    The first walk with no ledger stamps everything present as old (0),
+    so a station that has had a folder of a thousand files for a month
+    does not treat all thousand as arrivals. Files that have gone are
+    dropped from the ledger so it cannot grow without bound."""
+    rows = _sfx_arrivals_rows()
+    fresh: list[str] = []
+    now = time.time()
+    first_walk = not rows and not SFX_ARRIVALS_PATH.is_file()
+    for one in seen:
+        if one not in rows:
+            rows[one] = 0.0 if first_walk else now
+            if not first_walk:
+                fresh.append(one)
+    for gone in [k for k in rows if k not in seen]:
+        rows.pop(gone, None)
+    try:
+        SFX_ARRIVALS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SFX_ARRIVALS_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows))
+        tmp.replace(SFX_ARRIVALS_PATH)
+    except OSError:
+        pass
+    return sorted(fresh)
+
+
+def sfx_arrivals_recent(hours: float = SFX_FRESH_HOURS) -> list[str]:
+    """Paths first seen inside the window, newest first."""
+    cut = time.time() - max(0.0, float(hours)) * 3600.0
+    rows = _sfx_arrivals_rows()
+    return sorted((k for k, v in rows.items() if v and v >= cut),
+                  key=lambda k: -rows[k])
+
+
+def sfx_fresh_paths(pool: list[Path]) -> list[Path]:
+    """The samples in the pool that are NEW: never played, or first seen
+    inside SFX_FRESH_HOURS. These get SFX_FRESH_SHARE of the draws."""
+    try:
+        plays = sfx_plays()
+        recent = set(sfx_arrivals_recent())
+        out: list[Path] = []
+        for path in pool:
+            sid = sfx_id(path)
+            if int((plays.get(sid) or {}).get("plays") or 0) <= 0 \
+                    or str(path) in recent:
+                out.append(path)
+        return out
+    except Exception:  # noqa: BLE001
+        return []
+
+
+async def sfx_keeper() -> None:
+    """#1062: the walk on its own clock. sting_due only asked for a
+    refresh when a sting happened to be due, so a quiet stretch never
+    noticed a new file; the show now looks once a minute while it is on
+    and samples are enabled."""
+    while True:
+        try:
+            await asyncio.sleep(60)
+            if not (_RADIO.get("on") and dj_settings().get("sfx")):
+                continue
+            if time.time() - _SFX_POOL_AT[0] >= 60:
+                await _sfx_pool_refresh()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            pass
 
 
 async def _sfx_pool_refresh() -> None:
@@ -54926,7 +55041,7 @@ async def _sfx_pool_refresh() -> None:
         return
     _SFX_POOL_FILLING[0] = True
     try:
-        def scan() -> tuple[list[Path], set[str]]:
+        def scan() -> tuple[list[Path], set[str], list[str]]:
             # #835: the raw INVENTORY as well as the playable pool, so
             # arrivals can be reported. It is the same directory read the
             # walk below already pays for, and it runs in the same worker
@@ -54940,21 +55055,31 @@ async def _sfx_pool_refresh() -> None:
                             seen.add(str(one))
                 except Exception:  # noqa: BLE001
                     continue        # that folder went away; carry on
-            return [p for p in sfx_all() if sfx_short(p)], seen
-        pool, seen = await asyncio.to_thread(scan)
+            pool = [p for p in sfx_all() if sfx_short(p)]
+            # #1062: first sightings go on the ledger in this same worker
+            # thread, and the arrivals it names are the ones this walk met
+            # for the first time - across restarts, not per session.
+            fresh_names = _sfx_arrivals_note(seen)
+            # ...and a recent arrival is IN the pool regardless of the
+            # SFX_MAX_FILES sample sfx_list draws from a big folder.
+            have = {str(p) for p in pool}
+            for one in sfx_arrivals_recent():
+                if one in seen and one not in have:
+                    path = Path(one)
+                    if sfx_short(path):
+                        pool.append(path)
+                        have.add(one)
+            return pool, seen, fresh_names
+        pool, seen, arrived = await asyncio.to_thread(scan)
         was = len(_SFX_POOL_CACHE)
-        # #835: what turned up since the last walk, by name. The first
-        # walk of a session has nothing to compare against, so it is not
-        # announced as a pile of arrivals.
-        arrived = sorted(seen - _SFX_SEEN) if _SFX_SEEN else []
         _SFX_SEEN.clear()
         _SFX_SEEN.update(seen)
         _SFX_POOL_CACHE[:] = pool
         _SFX_POOL_AT[0] = time.time()
         if arrived:
             pipeline_log("air", f"{len(arrived)} new sample(s) turned "
-                         "up on the share and are in the rotation now "
-                         "(#835)",
+                         "up on the share and are in the rotation now - "
+                         "half the draws go to what is fresh (#835/#1062)",
                          extra="\n".join(Path(one).name
                                          for one in arrived[:40]))
         # #862: say the size out loud when it MOVES. A pool that
@@ -55043,6 +55168,24 @@ def sting_due() -> Path | None:
         names_pool = weighted or [str(p) for p in pool]
     else:
         names_pool = [str(p) for p in pool]
+    # #1062: HALF THE DRAWS GO TO WHAT IS NEW. A never-played sample, or
+    # one first seen inside SFX_FRESH_HOURS, is drawn from its own short
+    # list on a coin flip - through the same unrepeated memory, so a
+    # single new file does not land three times in a row. The other half
+    # of the draws is the rotation exactly as it was.
+    try:
+        fresh = {str(p) for p in sfx_fresh_paths(pool)}
+    except Exception:  # noqa: BLE001
+        fresh = set()
+    if fresh and random.random() < SFX_FRESH_SHARE:
+        fresh_pool = [n for n in names_pool if n in fresh] or sorted(fresh)
+        names = unrepeated(fresh_pool, "sting",
+                           keep=min(12, max(1, len(set(fresh_pool)) - 1)))
+        if names:
+            pipeline_log("air", f"(#1062) a fresh sample drawn ahead of "
+                         f"the rotation: {Path(names).name} "
+                         f"({len(fresh)} fresh of {len(pool)} in the pool)")
+            return Path(names)
     names = unrepeated(names_pool, "sting",
                        keep=min(12, max(1, len(set(names_pool)) - 1)))
     return Path(names) if names else None
@@ -65934,6 +66077,23 @@ def names_only(line: str, allowed: list[str]) -> bool:
     return True
 
 
+def air_gate(recorded: bool, who: str, text: str, why: str) -> bool:
+    """#1063: may an air-time gate drop this line? True = drop it.
+
+    "If a statement is recorded and staged for the radio, then it is to
+    be played on the radio." A line with a finished take passes every
+    editorial gate at air time; the gate writes down what it would have
+    done, and the cut is owed to the writing desk, before the studio.
+    An unrecorded line is refused exactly as before."""
+    if not recorded:
+        note_drop(who, text, why)
+        return True
+    pipeline_log("air", f"(#1063) {who}: a recorded line airs as recorded "
+                        f"- the gate would have cut it: {why}",
+                 extra=str(text)[:400])
+    return False
+
+
 def note_drop(who: str, text: str, why: str) -> None:
     """A line the machinery rejected, and why. The sim shows these beside the
     lines that made it, which is the 'what got chosen or rejected' half of
@@ -66242,6 +66402,7 @@ async def speak_turns(turns: list[tuple[str, str]],
                       render_stream: bool = False,
                       feel: bool = False,
                       allow_repeat: bool = False,
+                      recorded: bool = False,   # #1063
                       tint_report: dict[str, Any] | None = None) -> list[str]:
     """#1146: the floor door. One round holds the air from its first line
     to its last; a second round queues behind it instead of interleaving
@@ -66258,7 +66419,8 @@ async def speak_turns(turns: list[tuple[str, str]],
             caller_voice=caller_voice, caller_fx=caller_fx,
             source_text=source_text, caller2_name=caller2_name,
             caller2_voice=caller2_voice, render_stream=render_stream,
-            feel=feel, allow_repeat=allow_repeat, tint_report=tint_report)
+            feel=feel, allow_repeat=allow_repeat, recorded=recorded,
+            tint_report=tint_report)
     _owned = await _floor_take(("a call from " + caller_name)
                                if caller_name else "a booth round")
     try:
@@ -66268,7 +66430,8 @@ async def speak_turns(turns: list[tuple[str, str]],
             caller_voice=caller_voice, caller_fx=caller_fx,
             source_text=source_text, caller2_name=caller2_name,
             caller2_voice=caller2_voice, render_stream=render_stream,
-            feel=feel, allow_repeat=allow_repeat, tint_report=tint_report)
+            feel=feel, allow_repeat=allow_repeat, recorded=recorded,
+            tint_report=tint_report)
     finally:
         _floor_drop(_owned)
 
@@ -66289,6 +66452,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                       render_stream: bool = False,
                       feel: bool = False,
                       allow_repeat: bool = False,
+                      recorded: bool = False,   # #1063
                       tint_report: dict[str, Any] | None = None) -> list[str]:
     """Put an exchange on air, turn by turn, in the two session voices.
 
@@ -66329,7 +66493,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     tint_eligible = [i for i, (_m, t) in enumerate(turns)
                      if len(str(t or "").strip()) >= TINT_TURN_FLOOR]
     tint_required = (len(tint_eligible) * crystal_coverage_target() + 99) // 100
-    tint_selected = set(tint_eligible[:tint_required]) if tint_needed else set()
+    tint_selected = (set(tint_eligible[:tint_required])
+                     if tint_needed and not recorded else set())
     tint_proofs = set((tint_report or {}).get("approved_lines") or []) \
         if tint_coverage_ready(tint_report) else set()
     tint_failed = False
@@ -66352,6 +66517,12 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
     # once the round's audio is built, so without this the pair can echo each
     # other inside one exchange with the gate none the wiser.
     _round_grams: set[str] = set()
+
+    def _refuse(who: str, text: str, why: str) -> bool:
+        """#1063: whether a gate may drop this line. On a recorded round
+        it may not - the take exists, the cut was due before the studio -
+        so the gate says what it would have done and the line airs."""
+        return air_gate(recorded, who, text, why)
 
     def _who_of(marker: str) -> str:
         """Which seat a script marker belongs to.
@@ -66379,9 +66550,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # (#247), which is true of the NEXT line and not of the six after
             # it. Drop the offending line and keep the show, exactly as the
             # buried-line gate immediately below already does.
-            note_drop(who, text, "named a record that is not on air — dropped "
-                                 "this line, kept the round (#777)")
-            continue
+            if _refuse(who, text, "named a record that is not on air — "
+                                  "dropped this line, kept the round (#777)"):
+                continue
         if is_binned(text):
             note_drop(who, text, "you buried this line")
             continue                    # skip THIS line, not the whole round
@@ -66389,9 +66560,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # a whole turn on air verbatim — any line that reads foreign is
         # dropped here, at the one choke point everything passes through.
         if not looks_english(text):
-            note_drop(who, text, "reads as another language — the show "
-                                 "is in English (#792)")
-            continue
+            if _refuse(who, text, "reads as another language — the show "
+                                  "is in English (#792)"):
+                continue
         # #752: THE anti-repeat gate, here rather than in dj_speak — this is
         # the one place banter, deep rounds, calls and bank replays all pass
         # through, and the coalesced stream (the default) never reaches
@@ -66412,7 +66583,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # dropped; it is never answered with something off the shelf.
         _rerun = rerun_check(text, who,
                              kind="call" if caller_name else "",
-                             allow_repeat=allow_repeat)
+                             # #1063: a recorded line is never swapped or
+                             # dropped as a repeat at air time.
+                             allow_repeat=allow_repeat or recorded)
         rerun_note(bool(_rerun["block"]))
         if _rerun["block"]:
             # #824: a repeat trades for MATERIAL first, silence last —
@@ -66459,7 +66632,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         # by nobody, and hung up having aired zero turns. A swapped line
         # mid-call answers the caller with unrelated shelf material, which
         # is worse than a familiar phrase.
-        if not allow_repeat and not caller_name \
+        if not allow_repeat and not recorded and not caller_name \
                 and who in ("dj", "cohost", "third"):
             _phrase = phrase_check(text, who, _round_grams)
             phrase_note(bool(_phrase["block"]))
@@ -66489,8 +66662,8 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                               "dropped — " + _phrase["why"] + " (#no-repeats)")
                     continue
         if not minutes_only(text, (track or {}).get("seconds")):
-            note_drop(who, text, "made up a running time")
-            continue                    # one bad turn shouldn't drop the rest (#520)
+            if _refuse(who, text, "made up a running time"):
+                continue                # one bad turn shouldn't drop the rest (#520)
         # Final clean text, including any Speakerbox repeat replacement,
         # must pass before either the coalesced or individual render path.
         text = await _recording_tint(text, who, turn_index in tint_selected)
@@ -69674,14 +69847,33 @@ async def _banter_air(entry: dict[str, Any],
     # no model call; only a round that really has gone stale pays for a
     # rewrite, and paying it is better than airing a rerun.
     _stale = False
+    # #1063: "If a statement is recorded and staged for the radio, then it
+    # is to be played on the radio. There's no circumstance in which lines
+    # are recorded and not played." A frozen round whose every line has a
+    # finished take is RECORDED: the cuts belong before the studio, and
+    # the #901 freshen below - which threw the prepared clips away for a
+    # repeat scan at air time - no longer applies to it. The scan still
+    # runs, so the log can say what would have been cut.
+    _recorded = False
     if entry.get("frozen"):
         try:
-            _stale = bool(_script_repeats(entry.get("script", ""),
-                                          entry.get("caller_name", ""),
-                                          entry.get("caller2_name", "")))
+            _recorded = dialogue_audio_ready(
+                str(entry.get("prep_kind") or "banter"), entry)
         except Exception:  # noqa: BLE001
-            _stale = False
-        if _stale:
+            _recorded = False
+        try:
+            _stale_lines = _script_repeats(entry.get("script", ""),
+                                           entry.get("caller_name", ""),
+                                           entry.get("caller2_name", ""))
+        except Exception:  # noqa: BLE001
+            _stale_lines = []
+        if _stale_lines and _recorded:
+            pipeline_log("air", f"(#1063) a recorded round airs as recorded "
+                         f"- {len(_stale_lines)} line(s) would now be "
+                         "refused as repeats, and that cut belongs before "
+                         "the studio, not after it")
+        elif _stale_lines:
+            _stale = True
             pipeline_log("air", "a prepared round has gone stale on the "
                          "shelf — lines in it have been on air since it "
                          "was frozen, so it is freshened before it airs "
@@ -69786,6 +69978,8 @@ async def _banter_air(entry: dict[str, Any],
                                    entry.get("render_stream")
                                    or dj_settings().get("stream_show")),
                                feel=entry.get("feel", False),
+                               # #1063: a recorded round airs as recorded.
+                               recorded=_recorded,
                                tint_report=dict(entry.get("tint") or {}))
     # #1050 (P1): the round's paperwork, written down before the entry is
     # dropped. The swaths, the tint with both scripts, the writing desk and
@@ -91652,6 +91846,11 @@ async def sfx_history_api(
     pool = len(_SFX_POOL_CACHE)
     return {"rows": out, "distinct": len(counts), "total": len(rows),
             "pool": pool, "folders": [str(f) for f in sfx_folders()],
+            # #1062: what is new, and how the draw favours it.
+            "fresh": len(sfx_fresh_paths(list(_SFX_POOL_CACHE))),
+            "arrivals_48h": len(sfx_arrivals_recent()),
+            "fresh_share": SFX_FRESH_SHARE,
+            "walked_at": _SFX_POOL_AT[0],
             "note": ("the pool is still filling — it primes a few "
                      "seconds after a restart" if not pool else "")}
 
