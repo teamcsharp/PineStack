@@ -22,3 +22,13 @@ numpy
 # nothing else in the file needs PIL. The wheel is prebuilt for cp312/aarch64
 # (6.0 MB, verified resolving in the running container), so no build tools.
 pillow==11.3.0
+# The Gazette's PDF writer and lane P1's screenplay PDF (#1048). Pure
+# python - no system libraries, no compiler, and no fonts: the built-in
+# PDF faces (Times, Helvetica, Courier) are part of every reader, which
+# matters on an image that has none. Verified resolving in the running
+# container (py3-none-any wheel, 0.4 MB, pulls fonttools + defusedxml).
+# Without this line every road is inert and honest: paper_pdf returns
+# None, GET /api/paper/<id>/pdf answers 501 naming this line, the
+# screenplay's .pdf answers 501, and the panel's PDF button falls back to
+# the browser's print dialogue - which is what it did before #1048.
+fpdf2==2.8.8

@@ -623,6 +623,11 @@ DEFAULT_DJ = {
     # #1040: how often a talk-radio round, or a record's talk slot, is
     # simply an advert - the pair doing an ad out of nowhere. Percent.
     "random_ad_pct": 8,
+    # #1157: while a plotline owns the air, what share of the calls
+    # are people INSIDE the story ringing in about the current act.
+    # The rest of the phone is left alone: a storyline that took every
+    # call would be a monologue with extra voices. Percent.
+    "plot_call_pct": 50,
     # #854: THE CASE BOOK. How often a caller rings about a written case
     # from data/caller_cases.json rather than about whatever the speakbox
     # coughed up; how often the case drawn is a HOT one (heated or
@@ -1029,6 +1034,14 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # writable from the container); see export_resolve for the forms
     # the operator may speak.
     "export_dir": "data/export/broadcasts",
+    # #1157: how many Gazette entries the gallery filmstrip may list at
+    # once. The press files a snapshot every hour AND one for every
+    # "Print now", so the newspapers were crowding the renders off the
+    # strip — thirteen of the newest forty rows. Papers past this number
+    # are not dropped, they fold into the pile and the pile counts them.
+    # A handful is the default; the Gazette window's own shelf ignores
+    # this entirely and still lists every edition ever printed.
+    "gallery_paper_cap": 4,
     # #788: the wake words the box listens for after the button, each
     # routing somewhere — "webui" (the LLM with its tools) or "dj" (the
     # booth: requests + phone-in topics). Manageable from the panel: turn
@@ -1433,6 +1446,11 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "random_ad_pct": max(0, min(100, int(
             raw_dj.get("random_ad_pct",
                        DEFAULT_DJ["random_ad_pct"]) or 0))),
+        # #1157: the storyline's share of the phone. Clamped here or
+        # it vanishes on the next save, like every other dial.
+        "plot_call_pct": max(0, min(100, int(
+            raw_dj.get("plot_call_pct",
+                       DEFAULT_DJ["plot_call_pct"]) or 0))),
         "caller_insanity": max(0, min(100, int(
             raw_dj.get("caller_insanity",
                        DEFAULT_DJ["caller_insanity"]) or 0))),
@@ -1725,6 +1743,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "long_term_memory": bool(data.get("long_term_memory", True)),
         "export_dir": str(data.get("export_dir")
                           or "data/export/broadcasts").strip()[:400],  # #1025
+        # #1157: one is the floor (a single pile is still an entry), forty
+        # the ceiling (past that the cap is not capping anything - the
+        # strip only draws twenty-four tiles).
+        "gallery_paper_cap": max(1, min(40, int(
+            data.get("gallery_paper_cap")
+            or DEFAULT_SETTINGS["gallery_paper_cap"]))),
         "openwebui_logging": bool(data.get("openwebui_logging", True)),
         "wake": validate_wake(data.get("wake")),
         # #894/#832: gemma4 carries 131072; clamping the SETTING to
@@ -25715,6 +25739,18 @@ async def track_talk_write(track: dict[str, Any], part: str) -> str:
         "labels, markdown, transcript, list, stage direction, preamble, or "
         "explanation. Return only the words the presenter says."
     )
+    # #1157: THE STORYLINE, on the one road that writes a record link
+    # without the host layer. Kept to a glancing half-clause because
+    # track_talk_text_report caps this at ninety words and demands the
+    # title or artist by name; and asked for ten minutes of story left
+    # before it is used at all, because this road BANKS - #855 threw a
+    # prepared bulletin away for exactly this reason.
+    _story = plotline_line_clause(200, min_left=600.0)
+    if _story:
+        prompt += (_story + " Let it show as ONE glancing half-clause "
+                   "inside your observation about the record - the "
+                   "record is still the subject, its title or artist is "
+                   "still named, and you never explain the story.")
     answer = ""
     try:
         answer = prep_air_text(await ask_model(prompt, limit=620, spice=0.15),
@@ -34411,6 +34447,14 @@ async def coordinator() -> None:
         await asyncio.sleep(COORD_TICK)
         try:
             coord_air_sample()
+            # #1157: the STORYLINE's clock, on the same fifteen-second
+            # tick and never awaited. It is arithmetic plus, at an act
+            # boundary only, one fire-and-forget model visit; the beats
+            # it flushes go to a worker thread.
+            try:
+                fire_and_forget(plotline_tick())
+            except Exception:  # noqa: BLE001
+                pass
             # Pause freezes this clock while all preparation work below keeps
             # moving. At 3,600 active seconds it closes an attributable
             # scorecard and feeds every miss into the next work order.
@@ -35726,6 +35770,10 @@ def dj_start(station: str) -> dict[str, Any]:
     _RADIO_TASK.append(asyncio.create_task(talk_watch()))
     # #1023 (G1): the durable air log - upsert-by-id off the ring.
     _RADIO_TASK.append(asyncio.create_task(airlog_keeper()))
+    # #1050 (P1): and beside it, how each of those lines was made - the
+    # model call and the render, lifted off the ring row's own trace
+    # before the ring turns over.
+    _RADIO_TASK.append(asyncio.create_task(screenplay_keeper()))
     # #1022: ...and the ledger of the silences it watches for.
     _RADIO_TASK.append(asyncio.create_task(gap_keeper()))
     # #1112: and something that notices when the box has stopped playing
@@ -43235,6 +43283,18 @@ def plot_advance() -> str:
         # five-act plot reaches its ending ten minutes in.
         if plot_owns_air():
             return ""
+        # #1157: ...and for a plot that carries a SPAN, whether or not
+        # it owns the air this instant. A span plot is `active` and not
+        # `done` in two ordinary states where plot_owns_air() is empty -
+        # armed for the top of the next hour, and the seconds between a
+        # restart and the first coordinator tick - and in both of them
+        # this road would spend the acts of a story that has not
+        # started or is running perfectly well elsewhere. Measured: a
+        # five-act plot armed at 22:41 for 23:00 reached act five and
+        # was marked played out before it went on the air. The span is
+        # the clock; nothing else may move the pointer.
+        if row and plotline_span_seconds(row) > 0:
+            return ""
         if not row or random.random() > 0.45:
             return ""
         acts = [str(a) for a in (row.get("acts") or []) if str(a).strip()]
@@ -43310,6 +43370,17 @@ def plot_owns_air() -> dict[str, Any]:
         for one in plot_read():
             if not (one.get("active") and not one.get("done")):
                 continue
+            # #1157: a plot with a real SPAN owns the air on its own
+            # clock - air seconds against the minutes the operator
+            # asked for, which is the only thing that can express
+            # "an hour or several hours". A plot without one keeps
+            # the half-hour road below, unchanged, exactly as #907
+            # left it.
+            if plotline_span_seconds(one) > 0:
+                if plotline_live(one):
+                    row = dict(one)
+                    break
+                continue
             held = str(one.get("half_hour") or "")
             if not held:
                 continue            # on air, but not claiming the half hour
@@ -43340,6 +43411,13 @@ def plot_act_now(row: dict[str, Any]) -> tuple[str, int, int]:
     acts = [str(a) for a in (row.get("acts") or []) if str(a).strip()]
     if not acts:
         return "", 0, 0
+    # #1157: the same division, over the span the operator named and
+    # measured in AIR seconds rather than wall clock, so a pause does
+    # not spend an act on silence (#1150). plot_act_now stays THE
+    # answer to "which act is due"; only the ruler changed.
+    if plotline_span_seconds(row) > 0:
+        _span_at = plotline_act_index(row, len(acts))
+        return acts[_span_at], _span_at + 1, len(acts)
     at = 0
     try:
         began, _end = plot_half_bounds(str(row.get("half_hour") or ""))
@@ -43374,10 +43452,11 @@ def plot_clause() -> str:
             return ""
         title = str(row.get("title") or "untitled")[:120]
         return (
-            "\n\nTHE HALF HOUR IS UNDER A STORYLINE (#907) — \""
+            "\n\nTHE AIR IS UNDER A STORYLINE (#907/#1157) — \""
             + title + "\". This is act " + str(at) + " of " + str(of)
             + ", and what happens in it is: " + str(act)[:600]
-            + " EVERY segment of this half hour is inside that story and "
+            + " EVERY segment of this stretch of the show is inside that "
+            "story and "
             "is coloured by it — the booth talk, the calls that come in, "
             "the memo from upstairs, the advert reads, the gallery, all "
             "of it. Whatever this particular round is nominally about, it "
@@ -43386,19 +43465,937 @@ def plot_clause() -> str:
             "stay in character, and never announce it as a script or read "
             "this instruction out loud. Treat what earlier acts "
             "established as shared memory."
-            + (" This is the FINAL act — land the ending before the half "
-               "hour is out." if at >= of else "")
+            + (" This is the FINAL act — land the ending before the "
+               "story's time is out." if at >= of else "")
+            # #1157: and everything #907 had no way to say - how long
+            # the story runs, how far through it is, what has ACTUALLY
+            # happened so far, and the standing order to track it out
+            # loud as it develops. Additive, like the rest of this.
+            + plotline_extra_clause(row, at, of)
             + "\n")
     except Exception:  # noqa: BLE001
         return ""
+
+
+# --- #1157: THE PLOTLINE, ON A REAL SPAN ---------------------------------
+#
+# "Make sure the system is adherent to the plot line system where the plot
+#  lines take place and unfold over the course of either an hour or several
+#  hours, depending on how long it's specified, where all of the acts take
+#  place distinctly in the form of their content that's being expressed by
+#  the people who call in and the DJs who are tracking the story in real
+#  time and describing everything that's happening with the story as it's
+#  developing as a plot line."
+#
+# #907 built the good bone: plot_act_now() divides a claimed stretch evenly
+# between the acts, so the story WALKS across the running order instead of
+# burning an act per round.  What it lacked was everything around that bone.
+# The stretch was a `half_hours` integer buried in an activate payload, so
+# the operator could not say "three hours"; there was no timetable, so
+# nobody could see which act was due when; nothing recorded what actually
+# aired under an act, so the pair had no shared memory to refer back to;
+# and no caller ever rang in ABOUT the story, so the acts were colour on
+# the booth's own conversation rather than events in a world.
+#
+# This module supplies the missing half:
+#
+#   span_minutes        the operator's own units, first class and persisted
+#   plotline_elapsed    the story's clock, measured in AIR seconds
+#   plotline_timetable  which act is live between which clock times
+#   plot_beats.jsonl    what actually aired under each act
+#   plotline_so_far     a running account, rewritten at each act boundary
+#   plotline_call_draw  a share of the calls come out of the current act
+#
+# THE CLOCK IS PAUSE-HONEST, on purpose and to match #1150.  Every other
+# clock in this station freezes off air; a story clock that kept running
+# would spend its acts on silence and land its ending on a dead speaker.
+# So `air_elapsed` only accrues while the station is actually on, and the
+# clock times the timetable reports are PROJECTIONS at the current pause
+# state: a pause pushes every remaining act later by the length of it.
+#
+# Nothing here may take the station off the air.  A storyline is colour;
+# a malformed one (no acts, one blank act, a span of zero) is inert.
+PLOT_BEATS_PATH = data_path("plot_beats.jsonl")
+PLOT_BEATS_KEPT = 4000                  # rows kept in the ledger
+PLOT_BEAT_FLOOR = 30                    # a beat has to be a sentence
+PLOT_SPAN_MOST = 2880                   # forty-eight hours, the old ceiling
+PLOT_TICK_WRITE = 30.0                  # seconds between ordinary saves
+PLOT_BANK_FLOOR = 900                   # story left before a call is banked
+PLOT_TIGHT_ACT = 240                    # an act shorter than this is a blur
+PLOT_SO_FAR_CAP = 900
+
+# What plotline_tick() published on its last pass.  Every hot path reads
+# THIS rather than the file: air_remember() runs on every aired line and
+# may not touch the disk (#1142/#1156).
+_PLOT_NOW: dict[str, Any] = {}
+_PLOT_BEATS: list[dict[str, Any]] = []          # waiting to be written
+_PLOT_BEATS_LOCK = RLock()
+_PLOT_TICK = {"at": 0.0, "wrote": 0.0, "compacted": 0.0}
+_PLOT_SO_FAR_BUSY = [False]
+
+
+def plotline_acts(row: Any) -> list[str]:
+    """The acts of a plot, blank ones dropped - the one place that decides
+    what counts as an act, so a malformed plot is short rather than fatal."""
+    try:
+        return [str(a).strip() for a in (row or {}).get("acts") or []
+                if str(a).strip()]
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def plotline_span_seconds(row: Any) -> float:
+    """The operator's span in seconds, or 0.0 when he never named one."""
+    try:
+        return max(0.0, min(float(PLOT_SPAN_MOST),
+                            float((row or {}).get("span_minutes") or 0))) * 60.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def plotline_frozen(row: Any = None) -> bool:
+    """Is the story's clock standing still? Off air, or held by hand."""
+    try:
+        if bool((row or {}).get("held")):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        return bool(radio_paused())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def plotline_elapsed(row: Any) -> float:
+    """How much AIR the story has had, in seconds.
+
+    Pure arithmetic off two stamps the tick maintains - `air_elapsed`
+    (banked) and `ticked_at` (when it was last banked) - so this may be
+    asked on any path, including a poll, without touching the disk."""
+    try:
+        began = float((row or {}).get("started_at") or 0)
+        if began <= 0:
+            return 0.0
+        base = max(0.0, float(row.get("air_elapsed") or 0.0))
+        tick = max(float(row.get("ticked_at") or began), began)
+        if not plotline_frozen(row):
+            # #1157: the same clamp the tick applies when it BANKS.
+            # `ticked_at` is refreshed every fifteen seconds while this
+            # process lives, so a gap far larger than that is the
+            # process having been away - and the outage is not air.
+            # Without this the reader and the tick disagreed for the
+            # seconds between a restart and the first tick: a story an
+            # hour into a three-hour span read as seven hours gone, so
+            # every road was told it was over, on its final act, off
+            # the air - and plot_advance was free to burn it.
+            ran = float(_PLOT_TICK.get("at") or 0)
+            room = max(120.0, (time.time() - ran) * 4.0) if ran else 0.0
+            base += min(max(0.0, time.time() - tick), room)
+        return base
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def plotline_remaining(row: Any) -> float:
+    """Air seconds left before the story lands."""
+    return max(0.0, plotline_span_seconds(row) - plotline_elapsed(row))
+
+
+def plotline_live(row: Any) -> bool:
+    """Is this plot COLOURING THE AIR right now?
+
+    A plot only owns the air once it has a span, an act, a start that has
+    arrived, and time left on the clock. Everything else is a draft."""
+    try:
+        if not (row and row.get("active") and not row.get("done")):
+            return False
+        span = plotline_span_seconds(row)
+        if span <= 0 or not plotline_acts(row):
+            return False
+        began = float(row.get("started_at") or 0)
+        if began <= 0 or time.time() < began:
+            return False               # armed for later, not on yet
+        return plotline_elapsed(row) < span
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def plotline_act_index(row: Any, count: int = 0) -> int:
+    """Which act is due by the clock - 0-based, clamped.
+
+    The mechanism is #907's: the claimed stretch divided evenly between
+    the acts. The only change is WHICH stretch - air seconds against the
+    operator's span, rather than wall-clock against a half-hour key."""
+    acts = count or len(plotline_acts(row))
+    if acts <= 0:
+        return 0
+    span = plotline_span_seconds(row)
+    if span <= 0:
+        return max(0, min(acts - 1, int((row or {}).get("act_idx") or 0)))
+    gone = min(span - 0.001, plotline_elapsed(row))
+    return max(0, min(acts - 1, int(gone / span * acts)))
+
+
+def plotline_act_marks(row: Any) -> dict[str, float]:
+    """When each act actually came up, as the tick saw it happen."""
+    try:
+        marks = (row or {}).get("act_marks") or {}
+        return {str(k): float(v or 0) for k, v in marks.items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def plotline_timetable(row: Any) -> list[dict[str, Any]]:
+    """WHICH ACT IS LIVE BETWEEN WHICH CLOCK TIMES.
+
+    Offsets are exact (air seconds off the span); the clock times are
+    projections at the current pause state, and an act that has already
+    come up reports the moment it really did. A story with no acts or no
+    span has no timetable, which is how a malformed plot stays inert."""
+    acts = plotline_acts(row)
+    span = plotline_span_seconds(row)
+    if not acts or span <= 0:
+        return []
+    each = span / len(acts)
+    gone = plotline_elapsed(row)
+    now = time.time()
+    marks = plotline_act_marks(row)
+    began = float((row or {}).get("started_at") or 0)
+    out: list[dict[str, Any]] = []
+    for i, text in enumerate(acts):
+        frm, to = each * i, each * (i + 1)
+        real = marks.get(str(i + 1)) or 0.0
+        out.append({
+            "act": i + 1, "of": len(acts), "text": text[:600],
+            "from_s": round(frm, 1), "to_s": round(to, 1),
+            "seconds": round(each, 1),
+            "from_at": round(real or (now + (frm - gone))) if began else 0,
+            "to_at": round(now + (to - gone)) if began else 0,
+            "started": bool(began and gone >= frm),
+            "live": bool(began and frm <= gone < to),
+            "done": bool(began and gone >= to),
+        })
+    return out
+
+
+def plotline_progress(row: Any) -> dict[str, Any]:
+    """Where the story stands: which act, how far through, how long left."""
+    acts = plotline_acts(row)
+    span = plotline_span_seconds(row)
+    gone = plotline_elapsed(row)
+    at = plotline_act_index(row, len(acts)) if acts else 0
+    each = (span / len(acts)) if (acts and span > 0) else 0.0
+    return {
+        "id": str((row or {}).get("id") or ""),
+        "title": str((row or {}).get("title") or "")[:120],
+        "live": plotline_live(row),
+        "held": bool((row or {}).get("held")),
+        "frozen": plotline_frozen(row),
+        "span_minutes": round(span / 60.0, 2),
+        "span_seconds": round(span, 1),
+        "started_at": float((row or {}).get("started_at") or 0),
+        "elapsed": round(gone, 1),
+        "remaining": round(max(0.0, span - gone), 1),
+        "through": round(min(1.0, gone / span), 4) if span > 0 else 0.0,
+        "act": at + 1 if acts else 0,
+        "of": len(acts),
+        "acts_left": max(0, len(acts) - (at + 1)) if acts else 0,
+        "act_seconds": round(each, 1),
+        # #1157: five acts over ten minutes is arithmetically perfect
+        # and inaudible - with a round landing every three minutes the
+        # show says acts 2, 4 and 5 and never mentions 1 or 3. The
+        # engine cannot refuse it (the operator may want a blur), so it
+        # says so on the desk instead.
+        "tight": bool(each and each < PLOT_TIGHT_ACT),
+        "act_left": round(max(0.0, each * (at + 1) - gone), 1) if each else 0.0,
+        "act_text": acts[at][:600] if acts else "",
+    }
+
+
+def plotline_meta(row: Any) -> dict[str, Any]:
+    """The small stamp a caller, a call ledger row or a beat carries."""
+    acts = plotline_acts(row)
+    at = plotline_act_index(row, len(acts)) if acts else 0
+    return {"id": str((row or {}).get("id") or ""),
+            "title": str((row or {}).get("title") or "")[:120],
+            "act": at + 1 if acts else 0, "of": len(acts)}
+
+
+def plotline_now() -> dict[str, Any]:
+    """What the tick last published - free to ask on any hot path."""
+    try:
+        return dict(_PLOT_NOW)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def plotline_start_at(start: str = "now") -> float:
+    """"Now", or the top of the next hour - the operator's two choices."""
+    now = time.time()
+    if str(start or "").strip().lower() in ("hour", "next_hour", "top"):
+        try:
+            local = time.localtime(now)
+            top = time.mktime((local.tm_year, local.tm_mon, local.tm_mday,
+                               local.tm_hour, 0, 0, 0, 0, local.tm_isdst))
+            return top + 3600.0
+        except Exception:  # noqa: BLE001
+            return now
+    return now
+
+
+def plotline_arm(row: dict[str, Any], span_minutes: float,
+                 start: str = "now", restart: bool = True) -> dict[str, Any]:
+    """Put a real span on a plot row and start its clock.
+
+    The half-hour keys #907 wrote are still filled in so every reader
+    written before this - plot_owns_air's old road, the panel's shelf
+    label - keeps saying something true; the span is the truth."""
+    span = max(1.0, min(float(PLOT_SPAN_MOST), float(span_minutes or 0)))
+    began = plotline_start_at(start)
+    row["span_minutes"] = round(span, 2)
+    row["started_at"] = began
+    row["ticked_at"] = began
+    row["held"] = False
+    row["done"] = False
+    if restart or not row.get("air_elapsed"):
+        row["air_elapsed"] = 0.0
+        row["act_idx"] = 0
+        row["act_live"] = 0
+        row["act_marks"] = {}
+        row["so_far"] = ""
+        row["so_far_act"] = 0
+        row["so_far_at"] = 0.0
+    # Back-compat (#907): the old half-hour claim, derived from the span.
+    try:
+        row["half_hour"] = _plot_half_key(began)
+        row["half_hour_until"] = began + span * 60.0
+    except Exception:  # noqa: BLE001
+        pass
+    return row
+
+
+# --- The beats ledger ------------------------------------------------------
+#
+# What ACTUALLY aired under each act. It is what the story so far is built
+# from, it is what lets the Gazette's serial section and the screenplay
+# cover a plot as it unfolds, and it is the operator's proof that an act
+# happened rather than merely being due.
+#
+# Bounded and off the loop: lines are buffered in memory by air_remember
+# (which runs on every aired line and must never touch the disk), and the
+# coordinator's tick appends the buffer in a worker thread.
+def plotline_beat_note(text: str, who: str = "", kind: str = "") -> None:
+    """One aired line offered to the ledger. Cheap enough for air_remember:
+    a dict read and a length test, no disk, no lock contention worth the
+    name, and nothing at all unless a plot is on."""
+    try:
+        now = _PLOT_NOW
+        if not now.get("id"):
+            return
+        said = " ".join(str(text or "").split())
+        if len(said) < PLOT_BEAT_FLOOR:
+            return
+        seat = str(who or "")
+        if seat in ("host", "board", "") or str(kind or "") in ("chat",
+                                                                "marker"):
+            return
+        row = {"at": round(time.time(), 1), "plot": str(now.get("id") or ""),
+               "act": int(now.get("act") or 0), "of": int(now.get("of") or 0),
+               "title": str(now.get("title") or "")[:120],
+               "who": seat, "kind": str(kind or "")[:24],
+               "round": str(_RADIO.get("last_round_kind") or "")[:24],
+               "name": "", "call": "", "text": said[:400]}
+        try:
+            if seat in ("caller", "caller2"):
+                row["name"] = str(_CALL_LIVE.get("who") or "")[:60]
+                row["call"] = str(_CALL_LIVE.get("id") or "")[:24]
+        except Exception:  # noqa: BLE001
+            pass
+        with _PLOT_BEATS_LOCK:
+            if len(_PLOT_BEATS) < 400:
+                _PLOT_BEATS.append(row)
+    except Exception:  # noqa: BLE001
+        pass                    # a storyline never interrupts an aired line
+
+
+def _plotline_beats_append_blocking(rows: list[dict[str, Any]]) -> None:
+    """Append beats, and compact the ledger at most hourly (both in a
+    worker thread - never a whole-file rewrite per event, #1142)."""
+    try:
+        PLOT_BEATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(PLOT_BEATS_PATH, "a", encoding="utf-8", newline="\n") as fh:
+            for row in rows:
+                fh.write(json.dumps(row, separators=(",", ":")) + "\n")
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        if time.time() - float(_PLOT_TICK.get("compacted") or 0) < 3600:
+            return
+        _PLOT_TICK["compacted"] = time.time()
+        lines = PLOT_BEATS_PATH.read_text(encoding="utf-8").splitlines()
+        if len(lines) <= PLOT_BEATS_KEPT + 500:
+            return
+        tmp = PLOT_BEATS_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(lines[-PLOT_BEATS_KEPT:]) + "\n")
+        tmp.replace(PLOT_BEATS_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _plotline_beats_read_blocking(plot_id: str = "", act: int = 0,
+                                  most: int = 40) -> list[dict[str, Any]]:
+    """The tail of the ledger, filtered. Reads the file, so callers on the
+    event loop go through asyncio.to_thread."""
+    out: list[dict[str, Any]] = []
+    try:
+        lines = PLOT_BEATS_PATH.read_text(
+            encoding="utf-8").splitlines()[-PLOT_BEATS_KEPT:]
+    except Exception:  # noqa: BLE001
+        lines = []
+    for line in lines:
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(row, dict):
+            continue
+        if plot_id and str(row.get("plot") or "") != str(plot_id):
+            continue
+        if act and int(row.get("act") or 0) != int(act):
+            continue
+        out.append(row)
+    try:
+        with _PLOT_BEATS_LOCK:
+            for row in _PLOT_BEATS:
+                if plot_id and str(row.get("plot") or "") != str(plot_id):
+                    continue
+                if act and int(row.get("act") or 0) != int(act):
+                    continue
+                out.append(dict(row))
+    except Exception:  # noqa: BLE001
+        pass
+    return out[-max(1, int(most)):]
+
+
+async def plotline_beats(plot_id: str = "", act: int = 0,
+                         most: int = 40) -> list[dict[str, Any]]:
+    """The beats, off the loop."""
+    try:
+        return await asyncio.to_thread(
+            _plotline_beats_read_blocking, plot_id, act, most)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+# --- The story so far ------------------------------------------------------
+#
+# The half the operator says is missing: "the DJs who are tracking the story
+# in real time and describing everything that's happening with the story as
+# it's developing".  The static act text cannot do that - it is what is
+# SUPPOSED to happen, written before the show.  This is a running account of
+# what DID: what has happened, who is involved, where it stands, what is
+# expected next, built out of the beats that actually aired.
+#
+# One model visit at an ACT BOUNDARY, never per round, never on a poll.
+def plotline_so_far(row: Any) -> str:
+    """The running account, or "" - read freely, it is a stored string."""
+    try:
+        return str((row or {}).get("so_far") or "")[:PLOT_SO_FAR_CAP]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _plotline_so_far_parse(raw: str) -> str:
+    """Fold the labelled answer back into three or four plain sentences.
+
+    ask_model collapses whitespace, so the writer is asked for LABELS and
+    the labels are what is parsed - the same shape #1039's story writer
+    uses for the same reason."""
+    said = re.sub(r"<think>.*?</think>", " ", str(raw or ""),
+                  flags=re.S | re.I)
+    said = " ".join(said.split())
+    if not said:
+        return ""
+    parts: dict[str, str] = {}
+    keys = ("HAPPENED", "WHO", "STANDS", "NEXT")
+    for i, key in enumerate(keys):
+        rest = "|".join(keys[i + 1:])
+        tail = rf"(?=\s(?:{rest})\s*:|$)" if rest else r"(?=$)"
+        hit = re.search(rf"{key}\s*:\s*(.+?){tail}", said, flags=re.I)
+        if hit:
+            parts[key] = " ".join(hit.group(1).split())[:320]
+    if not parts:
+        return said[:PLOT_SO_FAR_CAP]
+    out = []
+    if parts.get("HAPPENED"):
+        out.append("What has happened: " + parts["HAPPENED"])
+    if parts.get("WHO"):
+        out.append("Who is in it: " + parts["WHO"])
+    if parts.get("STANDS"):
+        out.append("Where it stands: " + parts["STANDS"])
+    if parts.get("NEXT"):
+        out.append("What is expected next: " + parts["NEXT"])
+    return " ".join(out)[:PLOT_SO_FAR_CAP]
+
+
+async def plotline_so_far_write(plot_id: str) -> str:
+    """Rewrite the running account from what actually aired.
+
+    Called only at an act boundary and only through fire_and_forget, so a
+    slow model never delays the tick, the round or the air."""
+    if _PLOT_SO_FAR_BUSY[0]:
+        return ""
+    _PLOT_SO_FAR_BUSY[0] = True
+    try:
+        with _PLOT_LOCK:
+            found = next((r for r in plot_read()
+                          if r.get("id") == plot_id), None)
+            row = dict(found) if found else {}
+        if not row:
+            return ""
+        acts = plotline_acts(row)
+        if not acts:
+            return ""
+        at = plotline_act_index(row, len(acts))
+        beats = await plotline_beats(plot_id, 0, 60)
+        heard = [f"[act {int(b.get('act') or 0)}] "
+                 f"{b.get('name') or b.get('who')}: {str(b.get('text'))[:200]}"
+                 for b in beats[-24:]]
+        if not heard:
+            return ""
+        prompt = (
+            "You keep the continuity notes for a live radio serial. The "
+            f"story is \"{str(row.get('title') or 'untitled')[:120]}\". Its "
+            "acts, as they were written down beforehand, are:\n- "
+            + "\n- ".join(a[:220] for a in acts[:12])
+            + f"\n\nIt is now act {at + 1} of {len(acts)}.\n\nWhat has "
+            "ACTUALLY gone out on air so far, in order:\n- "
+            + "\n- ".join(heard)
+            + "\n\nWrite the running account of this story from what "
+            "actually aired - not from the plan. Go by these four labels, "
+            "on one line, in this order, each one or two plain sentences "
+            "and no more:\nHAPPENED: <the events so far, concretely>\n"
+            "WHO: <the people in it, by name, and what each of them did>\n"
+            "STANDS: <where the story stands at this moment>\n"
+            "NEXT: <what everybody is expecting to happen next>\n"
+            "No preamble, no markdown, no commentary about radio.")
+        raw = await ask_model(prompt, limit=900, spice=0.2,
+                              mark={"kind": "plot so far",
+                                    "for": "the running account of the "
+                                           "storyline on air"})
+        said = _plotline_so_far_parse(str(raw or ""))
+        if len(said) < 40:
+            return ""
+        with _PLOT_LOCK:
+            rows = plot_read()
+            live = next((r for r in rows if r.get("id") == plot_id), None)
+            if not live:
+                return ""
+            live["so_far"] = said
+            live["so_far_act"] = at + 1
+            live["so_far_at"] = time.time()
+            plot_write(rows)
+        _PLOT_AIR.update({"at": 0.0, "row": {}})
+        pipeline_log("model", "the storyline's running account was rewritten "
+                     f"off what aired - act {at + 1}/{len(acts)} of "
+                     f"\"{str(row.get('title') or '')[:40]}\" (#1157)")
+        return said
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "the storyline's running account failed",
+                     extra=f"{type(exc).__name__}: {exc}"[:300])
+        return ""
+    finally:
+        _PLOT_SO_FAR_BUSY[0] = False
+
+
+# --- The clause the writers get -------------------------------------------
+def _plotline_say_span(seconds: Any) -> str:
+    """"three hours", "forty minutes" - the operator's own units, spoken."""
+    try:
+        mins = int(round(max(0.0, float(seconds or 0)) / 60.0))
+    except Exception:  # noqa: BLE001
+        return "a while"
+    if mins <= 0:
+        return "less than a minute"
+    if mins < 90:
+        return f"{mins} minute" + ("s" if mins != 1 else "")
+    hours = mins / 60.0
+    if abs(hours - round(hours)) < 0.05:
+        whole = int(round(hours))
+        return f"{whole} hour" + ("s" if whole != 1 else "")
+    return f"{hours:.1f} hours"
+
+
+def plotline_extra_clause(row: Any, at: int = 0, of: int = 0) -> str:
+    """What plot_clause() could not say before: the SPAN, the position on
+    the clock, the running account, and the order to track it OUT LOUD.
+
+    Additive, like the rest of plot_clause and like crystal_clause: it
+    rides beside whatever the round was already about. Never raises."""
+    try:
+        span = plotline_span_seconds(row)
+        if span <= 0:
+            return ""
+        prog = plotline_progress(row)
+        at = at or int(prog.get("act") or 0)
+        said = (
+            " THE STORY'S OWN CLOCK: it runs for "
+            + _plotline_say_span(span) + " of air in all; "
+            + _plotline_say_span(prog.get("elapsed")) + " of that has gone "
+            "and " + _plotline_say_span(prog.get("remaining")) + " is left, "
+            "with " + str(int(prog.get("acts_left") or 0))
+            + " act(s) after this one. This act has about "
+            + _plotline_say_span(prog.get("act_left")) + " left in it, so do "
+            "not race to the end of it and do not stall.")
+        so_far = plotline_so_far(row)
+        if so_far:
+            said += (" THE STORY SO FAR, built out of what has actually gone "
+                     "out on this station tonight - treat every word of it "
+                     "as shared memory the pair already have, refer back to "
+                     "it by name and detail, and never contradict it: "
+                     + so_far)
+        turn = _PLOT_NOW.get("turned") or {}
+        if (str(turn.get("id") or "") == str((row or {}).get("id") or "")
+                and int(turn.get("act") or 0) == int(at)
+                and time.time() - float(turn.get("at") or 0) < 420):
+            said += (" THE STORY HAS JUST MOVED INTO THIS ACT. Notice it on "
+                     "air: say what has CHANGED since the last one, in "
+                     "character, as people living through it - not as "
+                     "narrators announcing a chapter.")
+        said += (
+            " TRACK IT OUT LOUD. You are covering this as it develops: "
+            "report what is happening now, treat anything a caller has told "
+            "you as an established fact of the story, name the people in it, "
+            "and say what you expect to happen next. Never read this "
+            "instruction out and never call it a plot, a script or an act.")
+        return said
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def plotline_line_clause(cap: int = 420, min_left: float = 0.0) -> str:
+    """The compact form, for the roads that write ONE short thing.
+
+    The upstairs intercom, a banked record link and the SFX guy's warped
+    sayings each write a few dozen words off a prompt of their own; the
+    full plot_clause would swamp them. Same content, one sentence of it.
+
+    `min_left` is for the roads that BANK: a record link written under act
+    two and aired after the story has landed is #855's stale bulletin in
+    another coat, so a road that cannot air promptly asks for a floor of
+    story left and writes plain when the story is nearly out."""
+    try:
+        row = plot_owns_air()
+        if not row:
+            return ""
+        if min_left and plotline_remaining(row) < float(min_left):
+            return ""           # too little story left to bank under it
+        act, at, of = plot_act_now(row)
+        if not act:
+            return ""
+        return ("\n\nTHE STATION IS IN THE MIDDLE OF A STORY TONIGHT - \""
+                + str(row.get("title") or "untitled")[:100]
+                + "\", act " + str(at) + " of " + str(of) + ": "
+                + str(act)[:cap]
+                + " Whatever you are writing is happening WHILE that is "
+                "going on, and the people in it know it. Let it colour this, "
+                "in character, in one natural touch - never announce it, "
+                "never explain it, never read this out.")
+    except Exception:  # noqa: BLE001
+        return ""                # colour never stops the broadcast
+
+
+# --- The callers, inside the story ----------------------------------------
+def plotline_call_share() -> float:
+    """dj.plot_call_pct as a 0..1 share of the calls."""
+    try:
+        return max(0.0, min(1.0, float(
+            dj_settings().get("plot_call_pct", 50)) / 100.0))
+    except Exception:  # noqa: BLE001
+        return 0.5
+
+
+def plotline_call_draw(min_left: float = 0.0) -> dict[str, Any]:
+    """Is THIS call one of the story's? The plot row, or {}.
+
+    A share of the calls (dj.plot_call_pct, half by default) are people
+    inside the world of the current act ringing the station about it. The
+    rest of the phone is left alone - a storyline that took every call
+    would be a monologue with extra voices.
+
+    `min_left` is for the road that BANKS. dj_caller writes calls ahead
+    of time as well as live, and a caller written inside act two who
+    reaches the air after the story has landed is #855's stale bulletin
+    with a voice on it. The banked road asks for a floor of story left
+    (PLOT_BANK_FLOOR) and rings an ordinary caller when there is less.
+    It BOUNDS the staleness rather than ending it: a shelved call may
+    still sit past the floor, and only an air-time check could catch
+    that - which would mean burning an unaired row, and #1151 settled
+    that argument."""
+    try:
+        row = plot_owns_air()
+        if not row or not plotline_acts(row):
+            return {}
+        if min_left and plotline_remaining(row) < float(min_left):
+            return {}
+        if random.random() >= plotline_call_share():
+            return {}
+        return row
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def plotline_call_want(row: Any) -> str:
+    """The premise the caller rings in with, out of the CURRENT act."""
+    try:
+        act, at, of = plot_act_now(row)
+        if not act:
+            return ""
+        return (f"what is going on out there right now - {str(act)[:400]}"
+                f" (act {at} of {of} of "
+                f"\"{str((row or {}).get('title') or '')[:80]}\")")[:600]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def plotline_call_reason(name: str, row: Any) -> str:
+    """The sentence that replaces "one of the listener's own past requests"
+    on the request line when the caller is somebody inside the story."""
+    try:
+        act, _at, _of = plot_act_now(row)
+        return (f"What got {name} on the air is what is happening out there "
+                f"tonight: {str(act)[:320]} They are ringing because it has "
+                "reached THEM.")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def plotline_caller_angle(row: Any) -> str:
+    """The caller's brief: an ordinary person inside the current act.
+
+    Additive, and deliberately NOT a repeat: successive callers carry the
+    story FORWARD - each brings a new piece of it - rather than each
+    restating the premise, which is the failure a serial dies of."""
+    try:
+        act, at, of = plot_act_now(row)
+        if not act:
+            return ""
+        title = str((row or {}).get("title") or "untitled")[:120]
+        said = (
+            "\n\nTHIS CALLER IS INSIDE THE STORY (#1157). The station is "
+            f"living through \"{title}\", and this is act {at} of {of}: "
+            f"{str(act)[:600]} The person on the line is an ORDINARY MEMBER "
+            "OF THE PUBLIC caught up in that - not a narrator, not a "
+            "reporter, not somebody who has merely heard about it. They ring "
+            "the station because it has happened TO them, or in front of "
+            "them, tonight. Their reason for calling, everything they "
+            "describe and everything they want is out of THIS act and "
+            "nowhere else. They give ONE concrete new development - "
+            "something specific they saw, lost, found, were told or did - "
+            "that nobody has reported yet, and they never merely restate "
+            "what is already known. The hosts take it as NEWS of the story: "
+            "they react to it, ask what happened next, and treat it as "
+            "established fact from here on.")
+        so_far = plotline_so_far(row)
+        if so_far:
+            said += (" What the station already knows, and must not be told "
+                     "again: " + so_far)
+        if at >= of:
+            said += (" This is the FINAL act - what this caller brings is "
+                     "part of how it ENDS.")
+        return said
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+# --- The tick --------------------------------------------------------------
+def plotline_publish(row: Any) -> None:
+    """Publish the hot-path view of the story (see _PLOT_NOW)."""
+    try:
+        keep = dict(_PLOT_NOW.get("turned") or {})
+        _PLOT_NOW.clear()
+        if row:
+            _PLOT_NOW.update(plotline_meta(row))
+            _PLOT_NOW["at"] = time.time()
+        if keep:
+            _PLOT_NOW["turned"] = keep
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def plotline_tick() -> None:
+    """The story's own clock, once every coordinator tick.
+
+    Everything expensive is off this path: the beats are appended in a
+    worker thread, the plot file is written at most every thirty seconds
+    (and at a boundary), and the running account is a fire-and-forget
+    model visit at an act boundary only. It never awaits the model and
+    never raises into the coordinator."""
+    now = time.time()
+    # `ran` is 0.0 on the FIRST pass of a process. A story that was on air
+    # when the box was restarted has a `ticked_at` from before the outage,
+    # and the outage is not air: the clamp below charges it one tick.
+    ran = float(_PLOT_TICK.get("at") or 0)
+    since = (now - ran) if ran else 0.0
+    _PLOT_TICK["at"] = now
+    dirty = False
+    save = False
+    rows: list[dict[str, Any]] = []
+    landed = ""
+    turned: dict[str, Any] = {}
+    live_row: dict[str, Any] = {}
+    try:
+        with _PLOT_LOCK:
+            rows = plot_read()
+            for row in rows:
+                if plotline_span_seconds(row) <= 0:
+                    continue
+                if not (row.get("active") and not row.get("done")):
+                    continue
+                began = float(row.get("started_at") or 0)
+                if began <= 0 or now < began:
+                    continue            # armed for the top of the hour
+                # Bank the air this pass bought. A gap far longer than the
+                # tick is the process having been away - the show was not
+                # on during it, so the story is not charged for it.
+                if not plotline_frozen(row):
+                    tick = max(float(row.get("ticked_at") or began), began)
+                    gap = max(0.0, now - tick)
+                    if not ran or gap > max(120.0, since * 4):
+                        gap = min(gap, max(15.0, since))
+                    row["air_elapsed"] = round(
+                        float(row.get("air_elapsed") or 0.0) + gap, 2)
+                row["ticked_at"] = now
+                dirty = True
+                acts = plotline_acts(row)
+                span = plotline_span_seconds(row)
+                gone = float(row.get("air_elapsed") or 0.0)
+                if not acts or gone >= span:
+                    row["done"], row["active"] = True, False
+                    row["act_idx"] = max(0, len(acts) - 1)
+                    landed = str(row.get("title") or "")[:60]
+                    continue
+                at = plotline_act_index(row, len(acts))
+                row["act_idx"] = at
+                if int(row.get("act_live") or 0) != at + 1:
+                    row["act_live"] = at + 1
+                    marks = dict(row.get("act_marks") or {})
+                    marks[str(at + 1)] = now
+                    row["act_marks"] = marks
+                    # #907's readers stay honest through a pause.
+                    row["half_hour_until"] = now + max(0.0, span - gone)
+                    turned = {"id": str(row.get("id") or ""),
+                              "act": at + 1, "of": len(acts), "at": now}
+                # #1157: the FIRST live row, which is the one
+                # plot_owns_air() returns. This took the last one, so
+                # with two plots switched on the air was coloured by
+                # one story while every beat was filed under the other.
+                if not live_row and plotline_live(row):
+                    live_row = dict(row)
+            save = bool(dirty and (turned or landed
+                                   or now - float(_PLOT_TICK.get("wrote") or 0)
+                                   >= PLOT_TICK_WRITE))
+            if save:
+                _PLOT_TICK["wrote"] = now
+                _PLOT_AIR.update({"at": 0.0, "row": {}})
+        if save:
+            # Off the loop, and outside the lock plot_write takes itself.
+            await asyncio.to_thread(plot_write, rows)
+    except Exception:  # noqa: BLE001
+        live_row = {}
+    try:
+        plotline_publish(live_row if plotline_live(live_row) else {})
+        if turned:
+            _PLOT_NOW["turned"] = turned
+    except Exception:  # noqa: BLE001
+        pass
+    # The beats, written in a thread.
+    try:
+        with _PLOT_BEATS_LOCK:
+            pending = list(_PLOT_BEATS)
+            del _PLOT_BEATS[:]
+        if pending:
+            await asyncio.to_thread(_plotline_beats_append_blocking, pending)
+    except Exception:  # noqa: BLE001
+        pass
+    if landed:
+        try:
+            pipeline_log("air", f"the storyline \"{landed}\" has played out "
+                                "- its span is spent (#1157)")
+        except Exception:  # noqa: BLE001
+            pass
+    if turned and int(turned.get("act") or 0) > 1:
+        # A few lines of model work at an act boundary is fine; per round
+        # is not. This is the only model call the storyline engine makes.
+        try:
+            fire_and_forget(plotline_so_far_write(str(turned.get("id") or "")))
+            pipeline_log("air", "the storyline has moved into act "
+                         f"{turned.get('act')}/{turned.get('of')} - the pair "
+                         "will notice it on air (#1157)")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def plotline_state(row: dict[str, Any],
+                         ledger: list[dict[str, Any]] | None = None
+                         ) -> dict[str, Any]:
+    """One plot, dressed for the desk: timetable, progress, beats.
+
+    `ledger` is the whole beats tail, read ONCE by a caller dressing several
+    plots — a desk listing sixty of them must not read the file sixty
+    times."""
+    out = dict(row)
+    try:
+        out["timetable"] = plotline_timetable(row)
+        out["progress"] = plotline_progress(row)
+        out["owns_air"] = plotline_live(row)
+        if ledger is None:
+            beats = await plotline_beats(str(row.get("id") or ""), 0, 120)
+        else:
+            beats = [b for b in ledger
+                     if str(b.get("plot") or "") == str(row.get("id") or "")
+                     ][-120:]
+        by_act: dict[str, list[dict[str, Any]]] = {}
+        for beat in beats:
+            by_act.setdefault(str(int(beat.get("act") or 0)), []).append(
+                {"at": beat.get("at"), "who": beat.get("who"),
+                 "name": beat.get("name"), "round": beat.get("round"),
+                 "text": str(beat.get("text") or "")[:240]})
+        out["beats"] = {k: v[-8:] for k, v in by_act.items()}
+        out["beats_count"] = len(beats)
+    except Exception:  # noqa: BLE001
+        out.setdefault("timetable", [])
+        out.setdefault("progress", {})
+        out.setdefault("beats", {})
+    return out
 
 
 @app.get("/api/dj/plots")
 async def dj_plots_list(
     authorization: str | None = Header(default=None),
 ) -> dict[str, Any]:
+    """The shelf, and for each plot what #1157 added: the TIMETABLE
+    (which act is live between which clock times), the live progress
+    and the beats that actually aired under each act.
+
+    The beats come off a JSONL tail read in a worker thread, so the
+    desk polling this never stalls the loop (#1142/#1156)."""
     require_read_auth(authorization)
-    return {"plots": plot_read()}
+    rows = plot_read()
+    try:
+        ledger = await plotline_beats("", 0, PLOT_BEATS_KEPT)
+    except Exception:  # noqa: BLE001
+        ledger = []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        try:
+            out.append(await plotline_state(row, ledger))
+        except Exception:  # noqa: BLE001
+            out.append(dict(row))   # a broken plot is still listed
+    return {"plots": out, "now": plotline_now(),
+            "call_share": plotline_call_share(),
+            "paused": bool(radio_paused())}
 
 
 @app.post("/api/dj/plots")
@@ -43423,13 +44420,27 @@ async def dj_plots_save(
         rows = plot_read()
         pid = str(payload.get("id") or "")
         row = next((r for r in rows if r.get("id") == pid), None)
+        # #1157: HOW LONG THE STORY RUNS, in the operator's own units
+        # and kept with the plot rather than buried in an activate
+        # payload. Minutes on the wire; the desk offers minutes or
+        # hours. Absent means "leave it as it was" for an edit, and
+        # one hour for a new plot, which is the commonest ask.
+        _span = payload.get("span_minutes", payload.get("span"))
+        try:
+            _span = (max(1.0, min(float(PLOT_SPAN_MOST), float(_span)))
+                     if _span not in (None, "") else 0.0)
+        except Exception:  # noqa: BLE001
+            _span = 0.0
         if row:
             row.update({"title": title, "acts": acts})
+            if _span:
+                row["span_minutes"] = round(_span, 2)
             if row.get("act_idx", 0) > len(acts):
                 row["act_idx"] = 0
         else:
             row = {"id": uuid.uuid4().hex[:12], "title": title, "acts": acts,
                    "act_idx": 0, "active": False, "done": False,
+                   "span_minutes": round(_span or 60.0, 2),
                    "ts": int(time.time())}
             rows.append(row)
         plot_write(rows)
@@ -43459,6 +44470,32 @@ async def dj_plots_activate(
             row["active"] = True
             if payload.get("restart") or row.get("done"):
                 row["act_idx"], row["done"] = 0, False
+            # #1157: THE SPAN, FIRST CLASS. `span_minutes` (or the
+            # plot's own stored span) starts a real clock: air
+            # seconds against the minutes asked for, divided evenly
+            # between the acts by plot_act_now. `start` is "now" or
+            # "hour" (the top of the next one). The half_hours road
+            # below is untouched for anything that still sends it.
+            _mins = payload.get("span_minutes", payload.get("span"))
+            try:
+                _mins = float(_mins) if _mins not in (None, "") else 0.0
+            except Exception:  # noqa: BLE001
+                _mins = 0.0
+            if not _mins and not payload.get("half_hour") \
+                    and not payload.get("half_hours"):
+                _mins = float(row.get("span_minutes") or 0)
+            if _mins:
+                plotline_arm(
+                    row, _mins, str(payload.get("start") or "now"),
+                    restart=bool(payload.get("restart", True)
+                                 or not row.get("started_at")))
+                plot_write(rows)
+                _PLOT_AIR.update({"at": 0.0, "row": {}})
+                note_action("📖 plotline ON AIR for "
+                            + _plotline_say_span(_mins * 60.0) + ": "
+                            + str(row.get("title") or "")[:50])
+                fire_and_forget(plotline_tick())
+                return row
             # #907: "have it color the entire half hour whenever a plot
             # line is active." A plot may now CLAIM the half hour it is
             # switched on in, and optionally the ones after it. While it
@@ -43486,6 +44523,70 @@ async def dj_plots_activate(
     if on:
         note_action(f"📖 plotline ON AIR: {row.get('title', '')[:50]}")
     return row
+
+
+@app.post("/api/dj/plots/{plot_id}/control")
+async def dj_plots_control(
+    plot_id: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """The four things an operator wants mid-story (#1157).
+
+    {do: "hold"}   stop the story's clock without losing its place
+    {do: "resume"} start it again from exactly where it stopped
+    {do: "next"}   jump to the next act now
+    {do: "end"}    land it early: the span is spent, the plot is done
+
+    A hold is the story's own pause and is honoured the same way the
+    station's is: the clock stops, so the acts are not spent while
+    nothing is happening (#1150)."""
+    require_auth(authorization)
+    payload = await request.json()
+    do = str(payload.get("do") or "").strip().lower()
+    if do not in ("hold", "resume", "next", "end"):
+        raise HTTPException(
+            status_code=400,
+            detail="do must be hold, resume, next or end")
+    with _PLOT_LOCK:
+        rows = plot_read()
+        row = next((r for r in rows if r.get("id") == plot_id), None)
+        if not row:
+            raise HTTPException(status_code=404, detail="No such plotline")
+        # Bank the air bought so far BEFORE changing anything, or a
+        # hold would keep the seconds it was holding against.
+        row["air_elapsed"] = round(plotline_elapsed(row), 2)
+        row["ticked_at"] = time.time()
+        acts = plotline_acts(row)
+        span = plotline_span_seconds(row)
+        if do == "hold":
+            row["held"] = True
+        elif do == "resume":
+            row["held"] = False
+            # #1157: and it takes the air off every other plot, exactly
+            # as the activate route does. This was the one door that
+            # could leave two storylines on at once, and two storylines
+            # on at once is two stories the pair are living in.
+            for _other in rows:
+                if _other is not row:
+                    _other["active"] = False
+            row["active"], row["done"] = True, False
+        elif do == "next" and acts and span > 0:
+            each = span / len(acts)
+            at = plotline_act_index(row, len(acts))
+            row["air_elapsed"] = round(min(span, each * (at + 1)) + 0.5, 2)
+            if row["air_elapsed"] >= span:
+                row["done"], row["active"] = True, False
+        elif do == "end":
+            row["air_elapsed"] = round(span, 2) if span > 0 else 0.0
+            row["done"], row["active"], row["held"] = True, False, False
+        plot_write(rows)
+        _PLOT_AIR.update({"at": 0.0, "row": {}})
+        out = dict(row)
+    note_action("📖 plotline " + do + ": "
+                + str(out.get("title") or "")[:50])
+    fire_and_forget(plotline_tick())
+    return await plotline_state(out)
 
 
 @app.delete("/api/dj/plots/{plot_id}")
@@ -44226,6 +45327,11 @@ async def dj_upstairs_write() -> dict[str, Any]:
         "threat that is out of all proportion — equipment being removed, "
         "somebody being replaced, a policy nobody has heard of. Four to "
         "seven sentences. No markdown, no emoji, no lists."
+        # #1157: ...and the STORYLINE. Upstairs is in the same town as
+        # everybody else: while a plot owns the air his grievance is
+        # about it, or lands in the middle of it. He writes his own
+        # prompt, so the host layer never reached him.
+        + plotline_line_clause(320)
         # #1027: the manager's MEMO road is tinted and his own voice was
         # not - the same man talking two different ways depending on
         # which road wrote him. Upstairs has fallen into it like the rest
@@ -50244,13 +51350,18 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
         # #804: when a line just aired, half his inventions REACT to it —
         # engaged with the conversation, not shouted past it.
         _react_words = sfx_words()                                # #1034
+        # #1157: he is in the story too. He shouts over the same show
+        # everybody else is making, and his shed brews off its own
+        # prompt, so nothing of the plot reached him before this.
+        _story = plotline_line_clause(220)
         if context and random.random() < 0.5:
             out = await ask_model(
                 "You are a thick-accented country boy in a radio booth. "
                 f"Someone on air just said: \"{context}\". Fire back ONE "
                 "short reaction that actually engages with what was said "
                 "— heckle it, one-up it, or agree way too hard — in your "
-                f"backcountry voice.{_tinted}{_shard} Under {_react_words} "
+                f"backcountry voice.{_tinted}{_shard}{_story} Under "
+                f"{_react_words} "
                 "words, no quotes.",                          # #1066
                 limit=max(200, _react_words * 9), spice=0.85,
                 # #1022: his own brew. It runs whenever there is room, so
@@ -50282,7 +51393,7 @@ async def _sfxguy_warp_fill(voice: str, context: str = "") -> None:
         out = await ask_model(
             "You are a thick-accented country boy in a radio booth. "
             f"Take these sayings: {' / '.join(picks)} — and {recipe}."
-            f"{_tinted}{_shard} Answer with the ONE new saying only, "
+            f"{_tinted}{_shard}{_story} Answer with the ONE new saying only, "
             f"under {_warp_words} words, no quotes, no explanation.",
             # #1066: the rhyme order is GONE from the first pass. A
             # small model obeys it with cheap monosyllabic couplets,
@@ -52388,6 +53499,14 @@ def air_remember(text: str, who: str = "", kind: str = "") -> None:
     # this is the one place every aired line passes through.
     try:
         talk_said_now()
+    except Exception:  # noqa: BLE001
+        pass
+    # #1157: ...and for the same reason, the storyline's BEATS LEDGER.
+    # What actually aired under each act is what the running account
+    # is written from and what lets the paper and the screenplay cover
+    # the story. A dict read and a length test - no disk here (#1142).
+    try:
+        plotline_beat_note(text, who, kind)
     except Exception:  # noqa: BLE001
         pass
     """ONE door for "this went out on air" (#901).
@@ -56955,6 +58074,8 @@ def _call_history_scripts(include_shelf: bool = True,
                         "speakerbox_extra": [
                             str(t) for t in (row.get("speakerbox_extra")
                                              or []) if t],            # #1033
+                        "plot": str((row.get("plot") or {}).get("id")
+                                    or ""),                     # #1157
                         "script": text})
     if include_shelf:
         try:
@@ -56978,6 +58099,9 @@ def _call_history_scripts(include_shelf: bool = True,
                                         str(t) for t in
                                         (meta.get("speakerbox_extra") or [])
                                         if t],                        # #1033
+                                    "plot": str(
+                                        (meta.get("plot") or {}).get(
+                                            "id") or ""),       # #1157
                                     "script": text})
         except Exception:  # noqa: BLE001
             pass
@@ -56986,7 +58110,8 @@ def _call_history_scripts(include_shelf: bool = True,
 
 def call_novelty(script: Any, include_shelf: bool = True,
                  exclude_entry: Any = None,
-                 exclude_ids: set[str] | None = None) -> dict[str, Any]:
+                 exclude_ids: set[str] | None = None,
+                 exclude_plot: str = "") -> dict[str, Any]:
     """Exact and structural comparison against calls the station remembers.
 
     #1039: `exclude_ids` are the calls a STORY may legitimately resemble
@@ -57000,9 +58125,12 @@ def call_novelty(script: Any, include_shelf: bool = True,
     matched: dict[str, Any] = {}
     exact = False
     _skip = {str(x) for x in (exclude_ids or ()) if x}
+    _skip_plot = str(exclude_plot or "")
     for row in _call_history_scripts(include_shelf, exclude_entry):
         if _skip and str(row.get("id") or "") in _skip:
             continue                        # #1039: the story's own parts
+        if _skip_plot and str(row.get("plot") or "") == _skip_plot:
+            continue                        # #1157: the same storyline
         other = str(row.get("script") or "")
         other_fp = call_fingerprint(other)
         if fingerprint and other_fp == fingerprint:
@@ -57179,7 +58307,8 @@ def call_flow_report(script: Any, caller_name: str = "",
                      topic: str = "", source_script: Any = "",
                      speakerbox_text: str = "",
                      exclude_entry: Any = None,
-                     story: dict[str, Any] | None = None) -> dict[str, Any]:
+                     story: dict[str, Any] | None = None,
+                     plot: dict[str, Any] | None = None) -> dict[str, Any]:
     """Machine-check conversation, theme, tint fidelity and novelty.
 
     #1039: `story` (the call meta's story dict: id, part, call_ids) makes
@@ -57230,9 +58359,15 @@ def call_flow_report(script: Any, caller_name: str = "",
         if left & right or ("?" in said and nxt in ("C", "E")):
             links += 1
     share = len(caller_at) / max(1, len(turns))
+    # #1157: an OPERATOR-AUTHORED storyline may resemble itself for the
+    # same reason a caller storyline may - three people ringing about
+    # one night in one town are not the station repeating itself.
+    _plot_id = str((plot or {}).get("id") or "") if isinstance(
+        plot, dict) else ""
     novelty = call_novelty(script, include_shelf=include_shelf,
                            exclude_entry=exclude_entry,
-                           exclude_ids=_story_ids or None)      # #1039
+                           exclude_ids=_story_ids or None,      # #1039
+                           exclude_plot=_plot_id)               # #1157
     topic_grade = call_topic_report(script, topic)
     speakerbox_grade = call_speakerbox_report(
         script, speakerbox_text, topic)
@@ -57333,6 +58468,7 @@ def call_flow_report(script: Any, caller_name: str = "",
         "speakerbox_novelty": speakerbox_novelty,
         "tint": tint_grade,
         "story": str(_story.get("id") or ""),                     # #1039
+        "plot": _plot_id,                                        # #1157
     }
 
 
@@ -57389,7 +58525,9 @@ def call_entry_regrade(entry: dict[str, Any],
         speakerbox_text=str(meta.get("speakerbox_text") or ""),
         exclude_entry=entry,
         story=(meta.get("story") if isinstance(meta.get("story"), dict)
-               else entry.get("story")))                          # #1039
+               else entry.get("story")),                          # #1039
+        plot=(meta.get("plot") if isinstance(meta.get("plot"), dict)
+              else entry.get("plot")))                            # #1157
     turns = banter_turns(active, caller_name, caller2_name)
     premise = next((said for marker, said in turns
                     if marker in ("C", "E")), "")
@@ -57403,9 +58541,19 @@ def call_entry_regrade(entry: dict[str, Any],
     return report
 
 
-def call_novelty_prompt() -> str:
-    """A compact memory of recent openings/topics for the writing prompt."""
-    rows = _call_history_scripts()[-12:]
+def call_novelty_prompt(exclude_plot: str = "") -> str:
+    """A compact memory of recent openings/topics for the writing prompt.
+
+    #1157: `exclude_plot` drops the calls that belong to the storyline
+    on air. This clause is the station's anti-memory - "do not revisit
+    any of these" - and pointed at a deliberate serial it is an
+    instruction to abandon the story between one caller and the next,
+    which is precisely what the operator says is missing. So the
+    storyline's own calls come out of the list, and the writer is told
+    in as many words that continuing THIS one is the job."""
+    _keep = str(exclude_plot or "")
+    rows = [r for r in _call_history_scripts()
+            if not (_keep and str(r.get("plot") or "") == _keep)][-12:]
     if not rows:
         return ""
     seen: list[str] = []
@@ -57422,7 +58570,11 @@ def call_novelty_prompt() -> str:
     return ("\n\nCALL MEMORY - these are recently used premises/opening moves. "
             "Do not paraphrase, reskin, or revisit any of them; choose a "
             "different concrete situation, conflict, questions and landing:\n- "
-            + "\n- ".join(seen[:10]))
+            + "\n- ".join(seen[:10])
+            + ("\n(The STORYLINE on air tonight is the exception and is "
+               "not in this list: carrying it forward is the job, and "
+               "this caller must ADD to it, never retell it.)"
+               if _keep else ""))
 
 
 def _hangup_seed() -> list[dict[str, Any]]:
@@ -58446,7 +59598,9 @@ def call_log_add(entry: dict[str, Any]) -> None:
             transcript, str(entry.get("name") or ""), include_shelf=False,
             topic=str(entry.get("topic") or ""),
             story=(entry.get("story")
-                   if isinstance(entry.get("story"), dict) else None)))
+                   if isinstance(entry.get("story"), dict) else None),
+            plot=(entry.get("plot")
+                  if isinstance(entry.get("plot"), dict) else None)))
     entry.setdefault("id", uuid.uuid4().hex[:12])
     with _HANGUP_LOCK:
         rows = call_log_read()
@@ -58570,7 +59724,9 @@ def call_line_transcript(turns: list[dict[str, Any]]) -> None:
                 include_shelf=False, topic=str(meta.get("topic") or ""),
                 speakerbox_text=str(meta.get("speakerbox_text") or ""),
                 story=(meta.get("story")
-                       if isinstance(meta.get("story"), dict) else None))
+                       if isinstance(meta.get("story"), dict) else None),
+                plot=(meta.get("plot")
+                      if isinstance(meta.get("plot"), dict) else None))
     except Exception:  # noqa: BLE001
         pass
 
@@ -59174,6 +60330,16 @@ def story_note_call(name: str, live: dict[str, Any], ran: float,
         if meta.get("repeat") or str(meta.get("mode") or "") == "rerun":
             fire_and_forget(story_save())
             return                  # a repeat cannot open a story
+        # #1157: A CALLER INSIDE THE OPERATOR'S PLOT BELONGS TO THE PLOT.
+        # This call's premise came out of an act, not out of the caller -
+        # opening an arc on it hands the same story to a second engine
+        # running to a different clock, which rings the caller back after
+        # the plot has landed and goes on escalating a story that already
+        # ended. The count above still ran, so #1039's pacing is unharmed.
+        if isinstance(meta.get("plot"), dict) and (meta["plot"] or {}).get(
+                "id"):
+            fire_and_forget(story_save())
+            return
         if str(meta.get("mode") or "") not in ("generated", "scheduled"):
             fire_and_forget(story_save())
             return
@@ -60710,6 +61876,19 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         else:
             caller = conjure_caller()
     topic, seed = await caller_topic()
+    # #1157: ...and the storyline outranks the roll, exactly as the
+    # caller story below outranks it - an operator-authored plot owns
+    # the air while it is on. Never both at once: a caller ringing back
+    # about their own arc is already carrying a structure.
+    _pline = {} if story else plotline_call_draw()
+    _pline_bit = ""
+    if _pline:
+        _pline_want = plotline_call_want(_pline)
+        if _pline_want:
+            topic, seed = _pline_want, {}
+            _pline_bit = plotline_caller_angle(_pline)
+        else:
+            _pline = {}
     if story:
         # #1039: the plot IS the topic. No seed: the chunks the story
         # carries are handed over in story_angle below.
@@ -60728,7 +61907,10 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     # The share slider was quietly diluted by its own freshness guard. Key
     # on the whole topic, which is what "the same thing" was meant to mean.
     _tkey = " ".join((topic or "").split()).lower()
-    if _tkey and _tkey in _recent_t:
+    # #1157: ...but NOT for a storyline. Successive callers about one
+    # story share a subject on purpose; #557's freshness guard would
+    # roll the second one straight back out of the plot.
+    if _tkey and _tkey in _recent_t and not _pline:
         topic, seed = await caller_topic()
         _tkey = " ".join((topic or "").split()).lower()
     if _tkey:
@@ -61372,11 +62554,17 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
     }
     if story:
         _call_meta["story"] = story_meta(story)                     # #1039
+    if _pline:
+        # The plot outranks the theme umbrella for THIS call: the
+        # topic above is the act, and the ledger has to say so or the
+        # contract grades the call against the wrong subject.
+        _call_meta["topic"] = str(topic)[:700]
+        _call_meta["plot"] = plotline_meta(_pline)                  # #1157
     angle = (
         f"The request line rings and {caller['name']} is on {line_say}, "
         f"{state}.{temper_bit}{behavior_bit}"
         f"{persona_bit}{goal_bit} {topic}{case_clause(call_case)} "
-        f"{story_bit}"
+        f"{story_bit}{_pline_bit}"
         # #544: the pair HEAR the phone ring and react to it before they pick
         # it up — the ring is a beat they play off of, not a silent cut.
         "It OPENS with the phone RINGING and the pair HEARING it: one of them "
@@ -64702,7 +65890,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                      "the conversation goes. Every turn reacts to a specific prior "
                      "detail. Never abandon C, discuss C in the third person while "
                      "they are present, or cut away before the goodbye.\n"
-                     + call_novelty_prompt()
+                     + call_novelty_prompt(str(                     # #1157
+                         ((call_meta or {}).get("plot") or {}).get("id")
+                         or ""))
                      if caller_name else "")
         if caller_name:
             call_flow += radio_prompt_instruction("caller")
@@ -64969,7 +66159,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
             script, caller_name, caller2_name,
             topic=str((call_meta or {}).get("topic") or ""),
             speakerbox_text=str(
-                (call_meta or {}).get("speakerbox_text") or ""))
+                (call_meta or {}).get("speakerbox_text") or ""),
+            story=((call_meta or {}).get("story")
+                   if isinstance((call_meta or {}).get("story"), dict)
+                   else None),
+            plot=((call_meta or {}).get("plot")
+                  if isinstance((call_meta or {}).get("plot"), dict)
+                  else None))                                     # #1157
         _needs_rewrite = not bool(_call_report.get("ok"))
     if _needs_rewrite:
         pipeline_log(
@@ -64994,7 +66190,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     "rapport callback, carry the database theme throughout, "
                     "and end with C finishing and a host clearly signing off. "
                     "Do not reuse any recent premise, conflict or landing."
-                    + call_novelty_prompt()
+                    + call_novelty_prompt(str(                      # #1157
+                        ((call_meta or {}).get("plot") or {}).get("id")
+                        or ""))
                     if caller_name else "") + "\n\n"
                 + script,
                 limit=min(int(dj.get("reply_max_chars") or 6000),
@@ -65015,7 +66213,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     rewritten, caller_name, caller2_name,
                     topic=str((call_meta or {}).get("topic") or ""),
                     speakerbox_text=str(
-                        (call_meta or {}).get("speakerbox_text") or ""))
+                        (call_meta or {}).get("speakerbox_text") or ""),
+                    story=((call_meta or {}).get("story")
+                           if isinstance((call_meta or {}).get("story"),
+                                         dict) else None),
+                    plot=((call_meta or {}).get("plot")
+                          if isinstance((call_meta or {}).get("plot"),
+                                        dict) else None))         # #1157
                 _rw_ok = bool(_rw_report.get("ok"))
             else:
                 _rw_ok = substantial_radio_script(rewritten, _judge_lines)
@@ -65833,6 +67037,9 @@ async def _banter_air(entry: dict[str, Any],
     shelf (#349), the airing is the same either way."""
     airlog_round_hint(str(entry.get("prep_kind") or ""),
                       caller=str(entry.get("caller_name") or ""))  # #1023 (G1)
+    # #1050 (P1): which lines were already in the ring, so the stamp at the
+    # bottom of this function can name the ones this round became.
+    _sp_mark = screenplay_round_open(entry)
     # #1005: THE PICTURES BELONG TO THE ROUND, NOT TO THE STATION.
     #
     # This is the one place every prepared round passes through on its way
@@ -65975,6 +67182,11 @@ async def _banter_air(entry: dict[str, Any],
                                    entry.get("render_stream")
                                    or dj_settings().get("stream_show")),
                                feel=entry.get("feel", False))       # #750
+    # #1050 (P1): the round's paperwork, written down before the entry is
+    # dropped. The swaths, the tint with both scripts, the writing desk and
+    # the line ids - everything the screenplay's provenance tree shows, and
+    # all of it lives only on this dict until now.
+    screenplay_round_stamp(entry, _sp_mark)
     if entry.get("seek_verdict") and spoken:
         asyncio.create_task(_sfx_verdict(spoken[-1]))
     if spoken:
@@ -66883,6 +68095,36 @@ async def dj_caller(track: dict[str, Any] | None = None,
         return heat_lines
     want = (random.choice(wants)[:160] if wants else
             str((_themed or {}).get("text") or "the active subject")[:160])
+    # #1157: THE CALLER OUT OF THE CURRENT ACT. While a storyline owns
+    # the air, a share of the calls are ordinary people inside it - the
+    # premise, the topic and the reason for ringing all come out of the
+    # act that is live right now, and the request-line framing steps
+    # aside for them. The rest of the phone is untouched.
+    # #1157: a call being BANKED asks for a floor of story left first,
+    # the way the banked record link does (#855) - it will not air for a
+    # while, and a caller out of act two landing after the ending is a
+    # stale bulletin with a voice on it.
+    _pline = plotline_call_draw(
+        PLOT_BANK_FLOOR if bank_to is not None else 0.0)
+    _pline_bit = ""
+    _want_say = (f"What got {_cname} on the air is one of the listener's "
+                 "own past requests, which they want read back to them: "
+                 f"\"{want}\".")
+    if _pline:
+        _pline_want = plotline_call_want(_pline)
+        if _pline_want:
+            want = _pline_want
+            _want_say = plotline_call_reason(_cname, _pline)
+            _pline_bit = plotline_caller_angle(_pline)
+            _call_meta["topic"] = str(want)[:700]
+            _call_meta["plot"] = plotline_meta(_pline)
+            if bank_to is None:
+                # call_line_take COPIED the meta, so the live call is
+                # told separately (the same door #913 uses below).
+                call_line_context(plot=_call_meta["plot"],
+                                  topic=_call_meta["topic"])
+        else:
+            _pline = {}
     # #913: the random plot out of the speakbox that the caller rings IN
     # with. dj_banter only draws its own box seed when there is nobody on
     # the line, so now that there is somebody the swath is drawn here and
@@ -66954,8 +68196,9 @@ async def dj_caller(track: dict[str, Any] | None = None,
         f"the word \"{_cname}\" has to be in it, along with a word about "
         "who they are or where they are ringing from, BEFORE they get "
         "anywhere near what they rang about. A host then greets them BY "
-        f"NAME. What got {_cname} on the air is one of the listener's own "
-        f"past requests, which they want read back to them: \"{want}\"."
+        f"NAME. "
+        + _want_say                                                # #1157
+        + _pline_bit                                               # #1157
         + _plot
         + _seed_bit                                                # #1033
         + _disp
@@ -90929,6 +92172,135 @@ async def generations_reconcile(
     return await reconcile_generations()
 
 
+# ---- #1157: THE GAZETTE ROWS, GROUPED BY THEIR HOUR ------------------
+# The press files one snapshot on the hour and one for every extra, so a
+# third of the newest gallery rows are newspapers. The panel stacks them
+# into one tile per hour; these are the same reads done here, where the
+# shelf is, so a stack can carry its headlines without the panel opening
+# the Gazette window first.
+
+_GAZ_EDITION_RE = re.compile(r"(\d{4}-\d{2}-\d{2}-\d{2}(?:x\d{4})?)")
+
+
+def gallery_paper_file(name: str) -> bool:
+    """#1157: is this the name of a snapshot the press filed? Every one of
+    them, since #1020, is gazette-<id>[-<style>].png
+    (paper_snapshot_write); a render is never called that."""
+    return str(name or "").rsplit("/", 1)[-1].startswith("gazette-")
+
+
+def gallery_paper_row(row: dict[str, Any]) -> bool:
+    """Is this ledger row a picture of an edition? Three ways to tell it,
+    and rows older than #1020 answer to only one of them."""
+    if str(row.get("kind") or "") == "paper":
+        return True
+    if str(row.get("model") or "") == "gazette":
+        return True
+    # Tags alone are not enough. The gallery's regenerate button posts the
+    # row's tag list back verbatim as the prompt, so a render made from a
+    # Gazette snapshot inherits "gazette <id> <style> ..." and would be
+    # filed as an issue it is not (seen live: PineBox_00195_.png, an
+    # ordinary z_image render, sitting in the 3 AM pile). Rows too old to
+    # carry kind or model still answer here - by their filename.
+    if not str(row.get("tags") or "").startswith("gazette "):
+        return False
+    return any(gallery_paper_file(f) for f in (row.get("files") or []))
+
+
+def gallery_paper_edition(row: dict[str, Any]) -> str:
+    """The edition id behind a gallery row: the field the snapshot writes
+    (#1020), else the tags ("gazette <id> <style> ..."), else the
+    filename ("gazette-<id>.png"). "" when the row is not a paper."""
+    direct = str(row.get("edition") or "").strip()
+    if direct:
+        return direct
+    tags = str(row.get("tags") or "")
+    if tags.startswith("gazette "):
+        hit = _GAZ_EDITION_RE.match(tags[8:].lstrip())
+        if hit:
+            return hit.group(1)
+    for name in (row.get("files") or []):
+        hit = _GAZ_EDITION_RE.search(str(name))
+        if hit:
+            return hit.group(1)
+    return ""
+
+
+def gallery_paper_hour(edition_id: str) -> str:
+    """The hour an edition belongs to - the id up to the "x" that marks an
+    extra printed inside it: 2026-09-05-08x0941 -> 2026-09-05-08."""
+    return str(edition_id or "").split("x", 1)[0]
+
+
+def gallery_paper_groups(limit: int = 400) -> list[dict[str, Any]]:
+    """#1157: every Gazette snapshot in the ledger, grouped by the hour it
+    belongs to, newest hour first; inside an hour the hourly issue first
+    and then the extras in the order they were pressed. Each edition
+    carries the headline, deck, kind and pause state off the shelf while
+    the edition is still on it. Reads the ledger and every edition.json -
+    call this from a thread, never on the loop."""
+    shelf: dict[str, dict[str, Any]] = {}
+    try:
+        for ed in paper_editions():
+            shelf[str(ed.get("id") or "")] = ed
+    except Exception:  # noqa: BLE001
+        shelf = {}
+    groups: dict[str, dict[str, Any]] = {}
+    order: list[str] = []
+    for row in read_generations(limit):
+        if not gallery_paper_row(row):
+            continue
+        edition_id = gallery_paper_edition(row)
+        if not edition_id:
+            continue
+        hour = gallery_paper_hour(edition_id)
+        group = groups.get(hour)
+        if group is None:
+            group = {"hour": hour, "at": 0.0, "count": 0, "editions": []}
+            groups[hour] = group
+            order.append(hour)   # newest-first, as the ledger hands them over
+        ed = shelf.get(edition_id) or {}
+        ts = float(row.get("ts") or 0)
+        group["at"] = max(float(group.get("at") or 0), ts)
+        group["editions"].append({
+            "id": edition_id,
+            "file": str((row.get("files") or [""])[0] or ""),
+            "ts": int(ts),
+            "at": float(ed.get("at") or ts),
+            "since": float(ed.get("since") or 0),
+            "extra": "x" in edition_id,
+            "kind": str(ed.get("kind") or ("extra" if "x" in edition_id else "hourly")),
+            "headline": str(ed.get("headline") or ""),
+            "deck": str(ed.get("deck") or ""),
+            "paused": bool(ed.get("paused")),
+            "pages": int(ed.get("pages") or 0),
+            "style": str(row.get("style") or ""),
+            "on_shelf": edition_id in shelf,
+        })
+    out: list[dict[str, Any]] = []
+    for hour in order:
+        group = groups[hour]
+        group["editions"].sort(key=lambda e: str(e.get("id") or ""))
+        group["count"] = len(group["editions"])
+        out.append(group)
+    return out
+
+
+@app.get("/api/gallery/papers")
+async def api_gallery_papers(
+    limit: int = 400,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1157: the gallery's Gazette snapshots, already stacked by the hour
+    they belong to, with the headlines. The panel groups the same rows
+    itself when this is missing - it only loses the headlines."""
+    require_read_auth(authorization)
+    limit = max(1, min(1000, limit))
+    hours = await asyncio.to_thread(gallery_paper_groups, limit)
+    return {"hours": hours,
+            "editions": sum(int(h.get("count") or 0) for h in hours)}
+
+
 @app.get("/api/comfy-outputs")
 async def comfy_outputs(
     limit: int = 60,
@@ -92162,6 +93534,1727 @@ async def api_dj_gaps_ledger(
 # --- G1 end ---------------------------------------------------------------
 
 
+# --- P1: THE SCREENPLAY (#1050) --------------------------------------------
+#
+# "in the newspaper screen, I also want a screenplay generated for the
+#  last hour with clickable dialogue to replay lines and a download icon
+#  for each line... I want the screenplay designed to look like a real
+#  screenplay with it serving as a history of each and every hour of
+#  broadcast."
+#
+# The Gazette tells the hour as prose a desk WROTE. This tells the same
+# hour as the script it actually was: scene headings for each stretch of
+# the running order, action lines for the records and the calls and the
+# adverts and the pauses, and one CHARACTER/dialogue block per line that
+# went out - straight off the ledgers, never invented. No model call runs
+# anywhere in this block. Every element carries a stable id so a note can
+# be pinned to it and still find its mark when the hour is rebuilt.
+#
+# What it reads (all of it written by somebody else):
+#   data/air_log.jsonl        G1's per-line record: who, when, text, audio
+#   radio_cache/music_log.jsonl  a row per record airing
+#   data/ad_airings.json      a row per advert
+#   data/call_log.json        a row per finished call
+#   data/manager_memos.json   the memos from upstairs
+#   data/pause_log.jsonl      G1's pause/resume ledger
+#   data/model_calls.jsonl    G1's per-Ollama-call ledger
+#   data/chunk_ledger.json    the speaker-box chunk ledger
+#   data/paper/<id>/edition.json  when the paper went to press
+#
+# ...and two ledgers of its own, because the live path did not record
+# enough to reconstruct a line an hour later. The booth's provenance card
+# (/api/dj/provenance) answers all of this ALREADY - off the 240-row ring,
+# which covers 57 minutes and dies on restart, so it answers 404 for
+# exactly the hour this window is about. These two write it down:
+#
+#   data/screenplay_lines.jsonl   one row per aired line: the model call
+#                                 that wrote it (prompt, model, ms) and the
+#                                 engine that spoke it (engine, voice, ms),
+#                                 lifted off the ring row's own trace by a
+#                                 keeper, appended off the loop, 48 h
+#   data/screenplay_rounds.jsonl  one row per ROUND, stamped in _banter_air:
+#                                 the speaker-box swaths behind it, the
+#                                 crystal that tinted it with both scripts,
+#                                 the writing desk's paperwork, and the ids
+#                                 of the lines it became
+#
+# Older hours - anything aired before this ships - reconstruct from the air
+# log alone: text, time, seat, round, audio and whether the round was
+# tinted are all there, but the prompt, the engine numbers and the chunk
+# behind a line are not, and the tree says so rather than guessing.
+
+SCREENPLAY_NOTES_PATH = data_path("screenplay_notes.json")
+SCREENPLAY_LINES_PATH = data_path("screenplay_lines.jsonl")
+SCREENPLAY_ROUNDS_PATH = data_path("screenplay_rounds.jsonl")
+SCREENPLAY_KEEP_S = 48 * 3600.0         # the air log's own horizon
+SCREENPLAY_TICK = 20.0                  # the keeper's look at the ring
+SCREENPLAY_TRIM_EVERY = 3600.0          # one rewrite an hour, off-loop
+SCREENPLAY_PROMPT_CAP = 600             # the prompt as sent, bounded
+SCREENPLAY_SCRIPT_CAP = 400
+SCREENPLAY_CHUNK_CAP = 600
+SCREENPLAY_SEEN_MOST = 4000
+# A hole longer than this ends the scene: the booth has moved on.
+SCREENPLAY_GAP_SCENE = 240.0
+# ...and a shorter one ends the SPEECH, so a block is one breath.
+SCREENPLAY_GAP_BLOCK = 25.0
+SCREENPLAY_NOTES_PER_HOUR = 400
+SCREENPLAY_NOTE_HOURS = 240
+SCREENPLAY_NOTE_CAP = 4000
+SCREENPLAY_CACHE_MOST = 8
+SCREENPLAY_LIVE_TTL = 20.0              # the hour still running
+SCREENPLAY_PAST_TTL = 900.0             # an hour that has closed
+_SCREENPLAY_LOCK = RLock()
+_SCREENPLAY_SEEN: dict[str, float] = {}         # line id -> when stamped
+_SCREENPLAY_STATE: dict[str, Any] = {"trimmed": 0.0, "loaded": False,
+                                     "lines": 0, "rounds": 0, "notes_rev": 0}
+_SCREENPLAY_CACHE: dict[str, dict[str, Any]] = {}
+_SCREENPLAY_NOTES_MEMO: dict[str, Any] = {"at": 0.0, "sig": None, "book": {}}
+
+# Seats that are not speech: the board's stings and the hang-up
+# bookkeeping become ACTION, the operator's own chat and the analysis desk
+# are not in the script at all.
+SCREENPLAY_BOARD = frozenset({"board"})
+SCREENPLAY_ACTION_KINDS = frozenset({"sfx", "marker"})
+SCREENPLAY_SKIP_KINDS = frozenset({"chat", "image_analysis", "song_analysis",
+                                   "hangup", "drop"})
+# The set piece each round kind is played on. A scene heading has to say
+# WHERE, and "the booth" for all eighteen would say nothing.
+SCREENPLAY_SET = {
+    "caller": "THE BOOTH - THE PHONE LINE",
+    "news": "THE BOOTH - THE WIRE DESK",
+    "ad": "THE BOOTH - THE SPONSOR'S COPY",
+    "gallery": "THE BOOTH - THE GALLERY WALL",
+    "manager": "THE BOOTH - THE MEMO FROM UPSTAIRS",
+    "track_talk": "THE BOOTH - THE TURNTABLE",
+    "station_id": "THE BOOTH - THE STATION IDENT",
+    "guest": "THE BOOTH - THE THIRD CHAIR",
+    "recap": "THE BOOTH - THE RECAP",
+    "deep": "THE BOOTH - THE DEEP DIG",
+    "bombshell": "THE BOOTH - THE RANT",
+    "sting": "THE BOARD",
+    "upstairs": "THE OFFICE UPSTAIRS",
+    "reply": "THE BOOTH - THE TALKBACK",
+    "request": "THE BOOTH - THE REQUEST LINE",
+    "prize": "THE BOOTH - THE PRIZE DESK",
+    "hawk": "THE BOOTH - THE SALES PITCH",
+}
+SCREENPLAY_ROUND_WORDS = {
+    "banter": "the pair talk", "caller": "a call", "news": "the news",
+    "ad": "an advert", "gallery": "the gallery", "manager": "a memo",
+    "track_talk": "the record", "station_id": "the ident",
+    "guest": "the guest", "recap": "the recap", "deep": "the deep dig",
+    "bombshell": "a rant", "sting": "a sting", "reply": "the talkback",
+    "request": "a request", "prize": "the prize", "hawk": "a pitch",
+    "upstairs": "upstairs", "intro": "the intro", "outro": "the outro",
+}
+
+
+def screenplay_clock(at: float) -> str:
+    """3:07 AM - what a scene heading puts after the last dash."""
+    try:
+        return time.strftime("%-I:%M %p", time.localtime(float(at or 0)))
+    except Exception:  # noqa: BLE001
+        try:
+            got = time.strftime("%I:%M %p", time.localtime(float(at or 0)))
+            return got.lstrip("0") or got
+        except Exception:  # noqa: BLE001
+            return ""
+
+
+def screenplay_mmss(seconds: float) -> str:
+    try:
+        got = max(0, int(round(float(seconds or 0))))
+        return f"{got // 60}:{got % 60:02d}"
+    except Exception:  # noqa: BLE001
+        return "0:00"
+
+
+def screenplay_hour_key(at: float) -> str:
+    return _sched_hour_key(float(at or 0))
+
+
+def screenplay_hour_span(hour_key: str) -> tuple[float, float]:
+    """[top of that hour, top of the next). (-1, -1) for a bad key."""
+    began = _sched_hour_epoch(str(hour_key or ""))
+    if began < 0:
+        return -1.0, -1.0
+    return began, _sched_hour_epoch(_sched_hour_shift(str(hour_key), 1))
+
+
+# --- the two stamps -------------------------------------------------------
+
+def screenplay_line_row(entry: dict[str, Any]) -> dict[str, Any]:
+    """One durable provenance row off a ring row.
+
+    The ring row already carries the whole answer in `trace` - #782 put it
+    there - and the air log deliberately does not keep it (a 600-character
+    prompt on every line would be most of the ledger). So this is the
+    second, narrower ledger: what wrote the line and what spoke it, keyed
+    on the same id, bounded hard, written once and never rewritten."""
+    trace = entry.get("trace") or {}
+    written = trace.get("written") or {}
+    render = trace.get("render") or {}
+    row: dict[str, Any] = {
+        "id": str(entry.get("id") or ""),
+        "at": round(float(entry.get("air_at") or entry.get("ts") or 0), 3),
+        "who": str(entry.get("who") or ""),
+        "kind": str(entry.get("kind") or ""),
+        "round": str(entry.get("round") or ""),
+        "source": str(entry.get("source") or ""),
+        "burst": int(float(trace.get("burst") or 0)),
+        "queued_at": round(float(trace.get("queued_at") or 0), 3),
+    }
+    if written:
+        row["wrote"] = {
+            "at": round(float(written.get("at") or 0), 3),
+            "model": str(written.get("model") or "")[:60],
+            "kind": str(written.get("kind") or "")[:60],
+            "for": str(written.get("for") or "")[:120],
+            "ms": int(float(written.get("ms") or 0)),
+            "chars": int(float(written.get("chars") or 0)),
+            "temp": written.get("temp"),
+            "num_ctx": written.get("num_ctx"),
+            "armed": str(written.get("armed") or "")[:120],
+            "sched": str(written.get("sched") or "")[:300],
+            "tinted": str(written.get("tinted") or "")[:80],
+            "prompt": str(written.get("prompt") or "")[:SCREENPLAY_PROMPT_CAP],
+            "script": str(written.get("script") or "")[:SCREENPLAY_SCRIPT_CAP],
+        }
+    if render:
+        row["voice"] = {
+            "engine": str(render.get("engine") or "")[:24],
+            "voice": str(render.get("voice") or "")[:48],
+            "ms": int(float(render.get("ms") or 0)),
+            "kb": int(float(render.get("kb") or 0)),
+            "seconds": round(float(render.get("seconds") or 0), 2),
+            "service": str(render.get("service") or "")[:160],
+            "tried": [str(t)[:24] for t in (render.get("tried") or [])][:4],
+            "fallback": str(render.get("fallback") or "")[:60],
+        }
+    if entry.get("macro"):
+        row["macro"] = str(entry.get("macro"))[:24]
+    if entry.get("fx"):
+        try:
+            row["fx"] = {str(k)[:16]: str(v)[:40]
+                         for k, v in (entry.get("fx") or {}).items()}
+        except Exception:  # noqa: BLE001
+            pass
+    if entry.get("perf"):
+        try:
+            row["perf"] = {k: v for k, v in (entry.get("perf") or {}).items()
+                           if k in ("pace", "energy", "pitch_var", "filler")}
+        except Exception:  # noqa: BLE001
+            pass
+    return row
+
+
+def screenplay_pick_lines(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Ring rows that have never been stamped and have something to say.
+    Pure dict work - safe on the loop, a few hundred rows a tick."""
+    out: list[dict[str, Any]] = []
+    for entry in entries or []:
+        try:
+            if not isinstance(entry, dict):
+                continue
+            line_id = str(entry.get("id") or "")
+            if not line_id or line_id in _SCREENPLAY_SEEN:
+                continue
+            trace = entry.get("trace") or {}
+            if not (trace.get("written") or trace.get("render")):
+                continue                # a sting has no provenance to keep
+            out.append(screenplay_line_row(entry))
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def screenplay_write_lines(rows: list[dict[str, Any]]) -> int:
+    """Append the new provenance rows. Sync; meant for a thread."""
+    if not rows:
+        return 0
+    wrote = 0
+    try:
+        SCREENPLAY_LINES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with _SCREENPLAY_LOCK:
+            with SCREENPLAY_LINES_PATH.open("a", encoding="utf-8") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row, default=str) + "\n")
+                    _SCREENPLAY_SEEN[str(row.get("id") or "")] = time.time()
+                    wrote += 1
+            _SCREENPLAY_STATE["lines"] = int(
+                _SCREENPLAY_STATE.get("lines") or 0) + wrote
+            if len(_SCREENPLAY_SEEN) > SCREENPLAY_SEEN_MOST:
+                old = sorted(_SCREENPLAY_SEEN,
+                             key=lambda k: _SCREENPLAY_SEEN.get(k) or 0)
+                for gone in old[:len(_SCREENPLAY_SEEN) - SCREENPLAY_SEEN_MOST]:
+                    _SCREENPLAY_SEEN.pop(gone, None)
+    except Exception:  # noqa: BLE001
+        pass                            # a forgetful ledger never stops air
+    return wrote
+
+
+def screenplay_lines_read(since: float = 0.0,
+                          until: float = 0.0) -> dict[str, dict[str, Any]]:
+    """id -> provenance row, for lines inside the window. Sync; thread it."""
+    out: dict[str, dict[str, Any]] = {}
+    try:
+        with SCREENPLAY_LINES_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(row, dict) or not row.get("id"):
+                    continue
+                at = float(row.get("at") or 0)
+                if until and not (since - 900.0) <= at < (until + 900.0):
+                    continue
+                out[str(row["id"])] = row
+    except FileNotFoundError:
+        return {}
+    except Exception:  # noqa: BLE001
+        return out
+    return out
+
+
+def screenplay_round_open(entry: dict[str, Any]) -> dict[str, Any]:
+    """Called at the top of _banter_air: which lines were in the ring
+    BEFORE this round spoke, so the stamp below can name the ones it
+    became. Ids, not an index - the ring is trimmed from the front."""
+    try:
+        _ensure_chat_ids()
+        return {"at": time.time(),
+                "had": {str(r.get("id") or "")
+                        for r in (_RADIO.get("chat") or [])}}
+    except Exception:  # noqa: BLE001
+        return {"at": time.time(), "had": set()}
+
+
+def screenplay_round_row(entry: dict[str, Any],
+                         mark: dict[str, Any],
+                         crystals: list[dict[str, Any]] | None = None
+                         ) -> dict[str, Any]:
+    """What made this round, in one bounded row.
+
+    Everything here is already on the larder entry by the time it airs -
+    the swaths the speaker box drew (#210), the tint pass with both
+    scripts kept (#1006/#1016), the writing desk's own paperwork (#987) -
+    and all of it dies with the entry. This is the only place it is
+    written down."""
+    now = time.time()
+    began = float((mark or {}).get("at") or now)
+    had = (mark or {}).get("had") or set()
+    ids: list[str] = []
+    try:
+        for row in (_RADIO.get("chat") or []):
+            got = str(row.get("id") or "")
+            if got and got not in had:
+                ids.append(got)
+    except Exception:  # noqa: BLE001
+        ids = []
+    chunks: list[dict[str, Any]] = []
+    try:
+        for swath in (entry.get("swaths") or [])[:6]:
+            if not isinstance(swath, dict):
+                continue
+            text = " ".join(str(swath.get("text") or "").split())
+            if not text:
+                continue
+            chunks.append({
+                "file": str(swath.get("file") or "")[:120],
+                "mind": str(swath.get("mind") or "")[:60],
+                "lines": int(len(swath.get("lines") or [])),
+                "chars": len(text),
+                "text": text[:SCREENPLAY_CHUNK_CAP],
+                "key": chunk_ledger_key(text)[:200],
+            })
+    except Exception:  # noqa: BLE001
+        chunks = []
+    tint: dict[str, Any] = {}
+    try:
+        got = entry.get("tint") or {}
+        plain = str(entry.get("script_plain") or "")
+        tinted = str(entry.get("script_tinted") or "")
+        if got or tinted:
+            tint = {
+                "ok": bool(got.get("ok")),
+                "used": str(entry.get("use") or ""),
+                "why": str(got.get("why") or "")[:240],
+                "world": str(got.get("world") or "")[:300],
+                "ms": int(float(got.get("ms") or 0)),
+                "plain_chars": len(plain), "tinted_chars": len(tinted),
+                "plain": plain[:2400], "tinted": tinted[:2400],
+                "stanzas": len(got.get("chunks") or []),
+            }
+    except Exception:  # noqa: BLE001
+        tint = {}
+    crystals = list(crystals or [])
+    desk: dict[str, Any] = {}
+    try:
+        got = entry.get("desk") or {}
+        if got:
+            desk = {
+                "matched": str(got.get("matched") or "")[:24],
+                "at": round(float(got.get("at") or 0), 3),
+                "model": str(got.get("model") or "")[:60],
+                "ms": int(float(got.get("ms") or 0)),
+                "temp": got.get("temp"), "num_ctx": got.get("num_ctx"),
+                "kind": str(got.get("kind") or "")[:60],
+                "armed": str(got.get("armed") or "")[:120],
+                "sched": str(got.get("sched") or "")[:300],
+                "prompt": str(got.get("prompt") or "")[:1200],
+            }
+    except Exception:  # noqa: BLE001
+        desk = {}
+    takes: list[dict[str, Any]] = []
+    try:
+        for take in (entry.get("takes") or [])[:24]:
+            takes.append({"who": str(take.get("who") or "")[:16],
+                          "voice": str(take.get("voice") or "")[:40],
+                          "seconds": round(float(take.get("seconds") or 0), 2),
+                          "text": " ".join(
+                              str(take.get("text") or "").split())[:160]})
+    except Exception:  # noqa: BLE001
+        takes = []
+    return {
+        "at": round(began, 3), "until": round(now, 3),
+        "kind": str(entry.get("prep_kind") or "")[:40],
+        "label": str(entry.get("label") or "")[:80],
+        "source": str(entry.get("source") or "")[:120],
+        "seed_text": " ".join(str(entry.get("seed_text") or "").split())[:400],
+        "caller": str(entry.get("caller_name") or "")[:60],
+        "banked_at": round(float(entry.get("at") or 0), 3),
+        "frozen": bool(entry.get("frozen")),
+        "whole": bool(entry.get("whole")),
+        "stream": bool(entry.get("render_stream")),
+        "feel": bool(entry.get("feel")),
+        "lines": ids[:60],
+        "chunks": chunks, "tint": tint, "crystals": crystals,
+        "desk": desk, "takes": takes,
+        "profile": str(entry.get("profile") or "")[:60],
+    }
+
+
+def screenplay_crystals_now() -> list[dict[str, Any]]:
+    """The crystals switched on, as the stamp records them. crystals_read()
+    is a file read, so this is only ever called in a thread."""
+    out: list[dict[str, Any]] = []
+    try:
+        for c in crystal_active()[:4]:
+            out.append({"name": str(c.get("name") or "")[:60],
+                        "strength": int(float(c.get("strength") or 0)),
+                        "tint": str(c.get("tint") or "")[:300],
+                        "source": str(c.get("source") or "speakbox")})
+    except Exception:  # noqa: BLE001
+        return []
+    return out
+
+
+def screenplay_round_write(row: dict[str, Any]) -> None:
+    """Sync, for a thread: name the crystals that were on, then append."""
+    try:
+        if not row.get("crystals"):
+            row["crystals"] = screenplay_crystals_now()
+        airlog_jsonl_append(SCREENPLAY_ROUNDS_PATH, row)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def screenplay_round_stamp(entry: dict[str, Any],
+                           mark: dict[str, Any]) -> None:
+    """One row per aired round, built on the loop out of the entry alone
+    (pure dict work) and written in a thread. Never raises: a paperwork
+    ledger may not be the thing that takes the show off air."""
+    try:
+        row = screenplay_round_row(entry, mark)
+        if not row.get("lines"):
+            return                      # nothing aired; nothing to explain
+        _SCREENPLAY_STATE["rounds"] = int(
+            _SCREENPLAY_STATE.get("rounds") or 0) + 1
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            screenplay_round_write(row)
+            return
+        fire_and_forget(asyncio.to_thread(screenplay_round_write, row))
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def screenplay_rounds_read(since: float = 0.0,
+                           until: float = 0.0) -> list[dict[str, Any]]:
+    """Round stamps overlapping the window, oldest first. Sync; thread it."""
+    out: list[dict[str, Any]] = []
+    try:
+        with SCREENPLAY_ROUNDS_PATH.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    row = json.loads(line)
+                except Exception:  # noqa: BLE001
+                    continue
+                if not isinstance(row, dict):
+                    continue
+                at = float(row.get("at") or 0)
+                ends = float(row.get("until") or at)
+                if until and (ends < since - 900.0 or at > until + 900.0):
+                    continue
+                out.append(row)
+    except FileNotFoundError:
+        return []
+    except Exception:  # noqa: BLE001
+        return out
+    out.sort(key=lambda r: float(r.get("at") or 0))
+    return out
+
+
+def screenplay_trim() -> dict[str, int]:
+    """Both ledgers back to SCREENPLAY_KEEP_S, rewritten off the loop."""
+    got = {"lines": 0, "rounds": 0}
+    try:
+        got["lines"] = airlog_jsonl_trim(SCREENPLAY_LINES_PATH,
+                                         SCREENPLAY_KEEP_S, key="at")
+        got["rounds"] = airlog_jsonl_trim(SCREENPLAY_ROUNDS_PATH,
+                                          SCREENPLAY_KEEP_S, key="at")
+    except Exception:  # noqa: BLE001
+        pass
+    return got
+
+
+def screenplay_warm() -> int:
+    """Which ids the ledger already holds, so a restart does not write the
+    whole ring again. One read, in a thread, once per process."""
+    try:
+        rows = screenplay_lines_read(0.0, 0.0)
+        with _SCREENPLAY_LOCK:
+            for line_id in rows:
+                _SCREENPLAY_SEEN.setdefault(str(line_id), time.time())
+            _SCREENPLAY_STATE["loaded"] = True
+        return len(rows)
+    except Exception:  # noqa: BLE001
+        _SCREENPLAY_STATE["loaded"] = True
+        return 0
+
+
+async def screenplay_keeper() -> None:
+    """#1050: the line-provenance keeper, beside G1's air-log keeper.
+
+    The air log records WHAT was said; this records HOW. Both read the
+    same ring, both write off the loop, and neither ever blocks the show:
+    the pick is pure dict work, the append is a thread, and a fault is
+    swallowed row by row."""
+    try:
+        await asyncio.to_thread(screenplay_warm)
+    except Exception:  # noqa: BLE001
+        _SCREENPLAY_STATE["loaded"] = True
+    while True:
+        try:
+            await asyncio.sleep(SCREENPLAY_TICK)
+            _ensure_chat_ids()
+            fresh = screenplay_pick_lines(list(_RADIO.get("chat") or []))
+            if fresh:
+                await asyncio.to_thread(screenplay_write_lines, fresh)
+            now = time.time()
+            if now - float(_SCREENPLAY_STATE.get("trimmed") or 0) \
+                    > SCREENPLAY_TRIM_EVERY:
+                _SCREENPLAY_STATE["trimmed"] = now
+                await asyncio.to_thread(screenplay_trim)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            await asyncio.sleep(SCREENPLAY_TICK)
+
+
+# --- the operator's notes, critiques and inserts ---------------------------
+
+def screenplay_notes_read() -> dict[str, list[dict[str, Any]]]:
+    """The whole book, memoised on (mtime, size). Sync; thread it."""
+    try:
+        st = SCREENPLAY_NOTES_PATH.stat()
+        sig = (st.st_mtime, st.st_size)
+    except Exception:  # noqa: BLE001
+        return {}
+    if _SCREENPLAY_NOTES_MEMO.get("sig") == sig:
+        return dict(_SCREENPLAY_NOTES_MEMO.get("book") or {})
+    book: dict[str, list[dict[str, Any]]] = {}
+    try:
+        raw = json.loads(SCREENPLAY_NOTES_PATH.read_text(encoding="utf-8"))
+        for hour, rows in (raw or {}).items():
+            if isinstance(rows, list):
+                book[str(hour)] = [r for r in rows if isinstance(r, dict)]
+    except Exception:  # noqa: BLE001
+        book = {}
+    _SCREENPLAY_NOTES_MEMO.update({"sig": sig, "book": book,
+                                   "at": time.time()})
+    return dict(book)
+
+
+def screenplay_notes_write(book: dict[str, list[dict[str, Any]]]) -> None:
+    """Atomically, and bounded both ways: notes per hour and hours kept.
+    Sync; meant for a thread (the whole book is one small JSON)."""
+    trimmed: dict[str, list[dict[str, Any]]] = {}
+    for hour in sorted(book, reverse=True)[:SCREENPLAY_NOTE_HOURS]:
+        rows = [r for r in (book.get(hour) or []) if isinstance(r, dict)]
+        if rows:
+            trimmed[hour] = rows[-SCREENPLAY_NOTES_PER_HOUR:]
+    with _SCREENPLAY_LOCK:
+        SCREENPLAY_NOTES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = SCREENPLAY_NOTES_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(trimmed, indent=1), encoding="utf-8")
+        tmp.replace(SCREENPLAY_NOTES_PATH)
+    _SCREENPLAY_NOTES_MEMO["sig"] = None
+    _SCREENPLAY_STATE["notes_rev"] = int(
+        _SCREENPLAY_STATE.get("notes_rev") or 0) + 1
+
+
+def screenplay_note_add(hour_key: str, kind: str, target_id: str,
+                        text: str, who: str = "") -> dict[str, Any]:
+    """A note, a critique, or a line of his own. Sync; thread it."""
+    kind = str(kind or "note").strip().lower()
+    if kind not in ("note", "critique", "insert"):
+        kind = "note"
+    row = {
+        "id": uuid.uuid4().hex[:8],
+        "at": time.time(),
+        "target_id": str(target_id or "")[:120],
+        "kind": kind,
+        "who": " ".join(str(who or "").split())[:60],
+        "text": str(text or "").strip()[:SCREENPLAY_NOTE_CAP],
+    }
+    book = screenplay_notes_read()
+    rows = list(book.get(str(hour_key)) or [])
+    rows.append(row)
+    book[str(hour_key)] = rows
+    screenplay_notes_write(book)
+    return row
+
+
+def screenplay_note_drop(hour_key: str, note_id: str) -> bool:
+    """Sync; thread it."""
+    book = screenplay_notes_read()
+    rows = list(book.get(str(hour_key)) or [])
+    kept = [r for r in rows if str(r.get("id") or "") != str(note_id)]
+    if len(kept) == len(rows):
+        return False
+    book[str(hour_key)] = kept
+    screenplay_notes_write(book)
+    return True
+
+
+# --- reading the hour off the ledgers --------------------------------------
+
+def _screenplay_disk(since: float, until: float) -> dict[str, Any]:
+    """Every ledger the script needs, read ONCE, in one thread (json holds
+    the GIL - #1156). Nothing here is invented and nothing is a model
+    call; this is the hour as five files remember it."""
+    d: dict[str, Any] = {}
+    try:
+        rows = airlog_rows(since, until, quiet=True)
+        for row in rows:
+            row["url"] = airlog_clip_url(row)
+        d["air"] = rows
+    except Exception:  # noqa: BLE001
+        d["air"] = []
+    try:
+        d["prov"] = screenplay_lines_read(since, until)
+    except Exception:  # noqa: BLE001
+        d["prov"] = {}
+    try:
+        d["rounds"] = screenplay_rounds_read(since, until)
+    except Exception:  # noqa: BLE001
+        d["rounds"] = []
+    records: list[dict[str, Any]] = []
+    try:
+        for r in _music_log_rows(since, until):
+            began = float(r.get("began") or r.get("at") or 0)
+            ends = float(r.get("ends") or began)
+            records.append({"at": began, "ends": ends,
+                            "title": str(r.get("title") or ""),
+                            "artist": str(r.get("artist") or ""),
+                            "seconds": round(max(0.0, ends - began), 1),
+                            "length": float(r.get("seconds") or 0),
+                            "id": str(r.get("id") or ""),
+                            "tape": bool(r.get("tape"))})
+    except Exception:  # noqa: BLE001
+        records = []
+    d["records"] = records
+    ads: list[dict[str, Any]] = []
+    try:
+        for row in ad_airings():
+            ts = float(row.get("ts") or 0)
+            if since <= ts < until:
+                ads.append({"at": ts,
+                            "product": str(row.get("product") or ""),
+                            "words": int(float(row.get("words") or 0)),
+                            "where": str(row.get("where") or ""),
+                            "id": str(row.get("id") or "")})
+    except Exception:  # noqa: BLE001
+        ads = []
+    d["ads"] = ads
+    calls: list[dict[str, Any]] = []
+    try:
+        for row in call_log_read():
+            ts = float(row.get("ts") or 0)
+            secs = float(row.get("seconds") or 0)
+            if ts < since - secs or ts >= until:
+                continue
+            calls.append({"at": max(since, ts - secs), "ends": ts,
+                          "name": str(row.get("name") or "a caller"),
+                          "line": str(row.get("line") or ""),
+                          "topic": str(row.get("theme") or
+                                       row.get("topic") or ""),
+                          "seconds": secs,
+                          "turns": int(float(row.get("turns") or 0)),
+                          "rule": str(row.get("rule") or ""),
+                          "hostile": bool(row.get("hostile")),
+                          "id": str(row.get("id") or "")})
+    except Exception:  # noqa: BLE001
+        calls = []
+    d["calls"] = calls
+    memos: list[dict[str, Any]] = []
+    try:
+        for row in (_manager_memos_read() or []):
+            ts = float(row.get("ts") or 0)
+            if since <= ts < until:
+                memos.append({"at": ts,
+                              "text": " ".join(
+                                  str(row.get("text") or "").split())[:400]})
+    except Exception:  # noqa: BLE001
+        memos = []
+    d["memos"] = memos
+    try:
+        d["pauses"] = pause_log_rows(since, until)
+    except Exception:  # noqa: BLE001
+        d["pauses"] = []
+    try:
+        d["model_calls"] = model_calls_rows(since, until)
+    except Exception:  # noqa: BLE001
+        d["model_calls"] = []
+    papers: list[dict[str, Any]] = []
+    try:
+        for ed in paper_editions():
+            at = float(ed.get("at") or 0)
+            if since <= at < until:
+                papers.append({"at": at, "id": str(ed.get("id") or ""),
+                               "headline": str(ed.get("headline") or ""),
+                               "stories": int(float(ed.get("stories") or 0))})
+    except Exception:  # noqa: BLE001
+        papers = []
+    d["papers"] = papers
+    try:
+        d["chunks"] = dict(_chunk_all())
+    except Exception:  # noqa: BLE001
+        d["chunks"] = {}
+    return d
+
+
+def screenplay_parenthetical(row: dict[str, Any],
+                             prov: dict[str, Any]) -> str:
+    """The direction in brackets above a speech - and only when the
+    station actually recorded one. An invented parenthetical would be the
+    one line in the script nobody said."""
+    who = str(row.get("who") or "")
+    macro = str((prov or {}).get("macro") or "")
+    if macro:
+        return macro
+    if who in ("caller", "caller2"):
+        return "on the line"
+    if who == "drop":
+        return "off mic"
+    fx = (prov or {}).get("fx") or {}
+    try:
+        named = [str(v) for k, v in fx.items()
+                 if k in ("name", "effect") and v]
+        if named:
+            return f"{named[0]} on the voice"
+    except Exception:  # noqa: BLE001
+        pass
+    if str(row.get("kind") or "") == "ad":
+        return "reading the copy"
+    return ""
+
+
+def screenplay_scene_slug(round_kind: str, at: float) -> str:
+    """INT. PINE BOX FM - THE BOOTH - 3:07 AM. The running order's own
+    label and the minutes it ran go on the SUBHEADER underneath, which is
+    where a screenplay puts them and what keeps this line under the
+    measure."""
+    where = SCREENPLAY_SET.get(str(round_kind or ""), "THE BOOTH")
+    return f"INT. PINE BOX FM - {where} - {screenplay_clock(at)}"
+
+
+def _screenplay_actions(d: dict[str, Any], since: float,
+                        until: float) -> list[dict[str, Any]]:
+    """Everything that HAPPENED between the speech, as action lines. One
+    tuple per event: (at, id, text, tag) - the tag is what the panel tints
+    the rail with, and what a reader skims for."""
+    out: list[dict[str, Any]] = []
+
+    def add(at: float, eid: str, text: str, tag: str,
+            **more: Any) -> None:
+        if not (since <= float(at or 0) < until):
+            return
+        out.append({"at": float(at), "id": eid, "text": text, "tag": tag,
+                    **more})
+
+    for r in d.get("records") or []:
+        title = r.get("title") or "an untitled record"
+        by = f" by {r['artist']}" if r.get("artist") else ""
+        add(r["at"], f"ac-{int(r['at'])}-rec-{r.get('id') or 'x'}",
+            f"A record drops: \"{title}\"{by} "
+            f"({screenplay_mmss(r.get('length') or r.get('seconds'))}"
+            + (f", cut to {screenplay_mmss(r['seconds'])}"
+               if float(r.get("seconds") or 0) + 6
+               < float(r.get("length") or 0) else "")
+            + ").", "record", seconds=r.get("seconds"))
+    for a in d.get("ads") or []:
+        add(a["at"], f"ac-{int(a['at'])}-ad-{a.get('id') or 'x'}",
+            "The advert airs" + (f" - {a['product']}" if a.get("product")
+                                 else "") + ".", "advert")
+    for c in d.get("calls") or []:
+        add(c["at"], f"ac-{int(c['at'])}-call-{c.get('id') or 'x'}",
+            f"The phone rings. {c['name']} is on "
+            + (c["line"] or "the line")
+            + (f", about {c['topic']}" if c.get("topic") else "") + ".",
+            "call")
+        add(c["ends"], f"ac-{int(c['ends'])}-hang-{c.get('id') or 'x'}",
+            f"{c['name']} hangs up after "
+            f"{screenplay_mmss(c.get('seconds'))} and "
+            f"{c.get('turns') or 0} turns"
+            + (f" - {c['rule']}" if c.get("rule") else "") + ".", "hangup")
+    for m in d.get("memos") or []:
+        add(m["at"], f"ac-{int(m['at'])}-memo",
+            f"A memo comes down from upstairs: {m['text']}", "memo")
+    for p in d.get("pauses") or []:
+        at = float(p.get("at") or 0)
+        if p.get("paused"):
+            add(at, f"ac-{int(at)}-pause",
+                "The station goes quiet - the operator has paused it"
+                + (f": {p['why']}" if p.get("why") else "") + ".", "pause")
+        else:
+            add(at, f"ac-{int(at)}-resume",
+                "The station comes back on"
+                + (f" after {screenplay_mmss(p.get('for_seconds'))}"
+                   if float(p.get("for_seconds") or 0) else "")
+                + (f" - {p['why']}" if p.get("why") else "") + ".", "resume")
+    for pg in d.get("papers") or []:
+        add(pg["at"], f"ac-{int(pg['at'])}-paper",
+            "The Gazette goes to press"
+            + (f" - \"{pg['headline']}\"" if pg.get("headline") else "")
+            + f" ({pg.get('stories') or 0} stories).", "paper")
+    for row in d.get("air") or []:
+        kind = str(row.get("kind") or "")
+        who = str(row.get("who") or "")
+        at = float(row.get("air_at") or row.get("ts") or 0)
+        if kind == "sfx" or who in SCREENPLAY_BOARD:
+            got = " ".join(str(row.get("text") or "").split())
+            add(at, f"ac-{int(at)}-sting-{row.get('id')}",
+                f"A sting off the board: {got or 'a cue'}"
+                + (f" ({screenplay_mmss(row.get('seconds'))})"
+                   if float(row.get("seconds") or 0) >= 1 else "") + ".",
+                "sting", line=str(row.get("id") or ""),
+                url=str(row.get("url") or ""))
+        elif kind == "marker":
+            got = " ".join(str(row.get("text") or "").split())
+            if got:
+                add(at, f"ac-{int(at)}-mark-{row.get('id')}",
+                    got if got[-1] in ".!?…" else got + ".", "marker")
+    out.sort(key=lambda e: (e["at"], e["id"]))
+    return out
+
+
+def screenplay_compose(since: float, until: float, d: dict[str, Any],
+                       notes: list[dict[str, Any]]) -> dict[str, Any]:
+    """The hour as a script. Pure - every fact comes off `d`.
+
+    The shape is the one a screenplay actually has: a scene heading when
+    the running order moves, action for what happened, a CHARACTER above
+    each speech with its parenthetical, and the dialogue in its own narrow
+    measure. Elements are flat and typed so the markdown, the clipboard
+    and P2's PDF writer can all walk the same list."""
+    prov = d.get("prov") or {}
+    rounds = d.get("rounds") or []
+    by_line: dict[str, dict[str, Any]] = {}
+    for rnd in rounds:
+        for line_id in (rnd.get("lines") or []):
+            by_line.setdefault(str(line_id), rnd)
+    speech: list[dict[str, Any]] = []
+    for row in (d.get("air") or []):
+        kind = str(row.get("kind") or "")
+        who = str(row.get("who") or "")
+        if kind in SCREENPLAY_SKIP_KINDS or kind in SCREENPLAY_ACTION_KINDS:
+            continue
+        if who in SCREENPLAY_BOARD or who == "analysis":
+            continue
+        if not str(row.get("text") or "").strip():
+            continue
+        speech.append(row)
+    actions = _screenplay_actions(d, since, until)
+    events = ([{"at": float(r.get("air_at") or r.get("ts") or 0),
+                "sort": 1, "row": r, "what": "line"} for r in speech]
+              + [{"at": e["at"], "sort": 0, "row": e, "what": "action"}
+                 for e in actions])
+    events.sort(key=lambda e: (e["at"], e["sort"]))
+
+    elements: list[dict[str, Any]] = []
+    scenes: list[tuple[int, float]] = []    # (subheader index, scene start)
+    scene_round = None
+    speaker = ""
+    spoke_at = 0.0
+    counts = {"lines": 0, "tinted": 0, "clips": 0, "scenes": 0,
+              "actions": 0, "seconds": 0.0}
+
+    def push(etype: str, text: str, eid: str, **more: Any) -> None:
+        elements.append({"id": eid, "type": etype, "text": text, **more})
+
+    for ev in events:
+        at = float(ev["at"])
+        if ev["what"] == "action":
+            row = ev["row"]
+            if elements and elements[-1]["type"] in ("dialogue",
+                                                     "parenthetical"):
+                speaker = ""
+            push("action", row["text"], row["id"], at=at, tag=row.get("tag"),
+                 **({"line": row["line"], "clip": row.get("url") or ""}
+                    if row.get("line") else {}))
+            counts["actions"] += 1
+            continue
+        row = ev["row"]
+        line_id = str(row.get("id") or "")
+        rnd = by_line.get(line_id) or {}
+        round_kind = str(row.get("round") or "") or str(rnd.get("kind") or "")
+        gap = at - spoke_at if spoke_at else 0.0
+        if (scene_round is None or round_kind != scene_round
+                or (gap and gap > SCREENPLAY_GAP_SCENE)):
+            scene_round = round_kind
+            push("scene", screenplay_scene_slug(round_kind, at),
+                 f"sc-{int(at)}-{round_kind or 'air'}", at=at,
+                 round=round_kind)
+            label = (" ".join(str(rnd.get("label") or "").split())
+                     or SCREENPLAY_ROUND_WORDS.get(round_kind,
+                                                   round_kind or "the air"))
+            push("subheader", label.upper(),
+                 f"sh-{int(at)}-{round_kind or 'air'}", at=at,
+                 round=round_kind)
+            scenes.append((len(elements) - 1, at))
+            counts["scenes"] += 1
+            speaker = ""
+        name = booth_actor_name(str(row.get("who") or ""),
+                                str(row.get("name") or ""))
+        one = prov.get(line_id) or {}
+        tinted = bool((rnd.get("tint") or {}).get("ok")
+                      and str((rnd.get("tint") or {}).get("used") or "")
+                      == "tinted")
+        clip = str(row.get("url") or "")
+        if (name != speaker
+                or (gap and gap > SCREENPLAY_GAP_BLOCK)
+                or (elements and elements[-1]["type"] == "action")):
+            speaker = name
+            push("character", name.upper(), f"ch-{line_id}", at=at,
+                 who=str(row.get("who") or ""))
+            note = screenplay_parenthetical(row, one)
+            if note:
+                push("parenthetical", f"({note})", f"pa-{line_id}", at=at)
+        push("dialogue", " ".join(str(row.get("text") or "").split()),
+             f"ln-{line_id}", at=at, line=line_id,
+             who=str(row.get("who") or ""), name=name,
+             round=round_kind, kind=str(row.get("kind") or ""),
+             seconds=round(float(row.get("seconds") or 0), 2),
+             aired=str(row.get("aired") or ""), clip=clip, tinted=tinted,
+             engine=str((one.get("voice") or {}).get("engine")
+                        or row.get("engine") or ""),
+             model=str((one.get("wrote") or {}).get("model") or ""),
+             recorded=bool(one), replay=bool(row.get("replay")))
+        counts["lines"] += 1
+        counts["seconds"] += float(row.get("seconds") or 0)
+        if tinted:
+            counts["tinted"] += 1
+        if clip:
+            counts["clips"] += 1
+        spoke_at = at + float(row.get("seconds") or 0)
+
+    for i, (ix, began) in enumerate(scenes):
+        ends = (scenes[i + 1][1] if i + 1 < len(scenes)
+                else min(until, spoke_at or until))
+        mins = max(1, int(round(max(0.0, ends - began) / 60.0)))
+        elements[ix]["minutes"] = mins
+        elements[ix]["text"] = f"{elements[ix]['text']} - {mins} MIN"
+    if elements:
+        push("transition", "FADE OUT.", f"tr-{int(until)}", at=until)
+    counts["seconds"] = round(counts["seconds"], 1)
+    return {"elements": elements, "counts": counts,
+            "notes": list(notes or [])}
+
+
+def screenplay_with_notes(elements: list[dict[str, Any]],
+                          notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The script with the operator's notes and inserts folded in at their
+    marks. An INSERT becomes real script elements, labelled his; a note or
+    a critique becomes a `note` element hanging off its target. Anything
+    whose target has gone (a line pruned out of the log) lands at the end
+    rather than vanishing."""
+    if not notes:
+        return list(elements)
+    by_target: dict[str, list[dict[str, Any]]] = {}
+    known = {str(e.get("id") or "") for e in elements}
+    orphans: list[dict[str, Any]] = []
+    for note in sorted(notes, key=lambda n: float(n.get("at") or 0)):
+        target = str(note.get("target_id") or "")
+        if target and target in known:
+            by_target.setdefault(target, []).append(note)
+        else:
+            orphans.append(note)
+
+    def spell(note: dict[str, Any]) -> list[dict[str, Any]]:
+        nid = str(note.get("id") or "")
+        kind = str(note.get("kind") or "note")
+        text = str(note.get("text") or "")
+        who = " ".join(str(note.get("who") or "").split())
+        when = screenplay_clock(float(note.get("at") or 0))
+        if kind == "insert":
+            if who:
+                return [
+                    {"id": f"ich-{nid}", "type": "character",
+                     "text": f"{who.upper()} (INSERT)", "note_id": nid,
+                     "insert": True, "at": float(note.get("at") or 0)},
+                    {"id": f"idl-{nid}", "type": "dialogue", "text": text,
+                     "note_id": nid, "insert": True, "clip": "",
+                     "at": float(note.get("at") or 0), "name": who,
+                     "tinted": False, "recorded": False},
+                ]
+            return [{"id": f"iac-{nid}", "type": "action",
+                     "text": f"INSERT (the operator): {text}",
+                     "note_id": nid, "insert": True, "tag": "insert",
+                     "at": float(note.get("at") or 0)}]
+        label = "CRITIQUE" if kind == "critique" else "NOTE"
+        return [{"id": f"nt-{nid}", "type": "note",
+                 "text": f"{label} - {when}"
+                         + (f" - {who}" if who else "") + f": {text}",
+                 "note_id": nid, "kind": kind, "body": text,
+                 "at": float(note.get("at") or 0)}]
+
+    out: list[dict[str, Any]] = []
+    for element in elements:
+        out.append(element)
+        for note in by_target.get(str(element.get("id") or "")) or []:
+            out.extend(spell(note))
+    for note in orphans:
+        out.extend(spell(note))
+    return out
+
+
+def _screenplay_cache_get(hour_key: str) -> dict[str, Any] | None:
+    got = _SCREENPLAY_CACHE.get(hour_key)
+    if not got:
+        return None
+    if int(got.get("notes_rev") or 0) != int(
+            _SCREENPLAY_STATE.get("notes_rev") or 0):
+        return None
+    ttl = SCREENPLAY_LIVE_TTL if got.get("live") else SCREENPLAY_PAST_TTL
+    if time.time() - float(got.get("at") or 0) > ttl:
+        return None
+    return got.get("script")
+
+
+def _screenplay_cache_put(hour_key: str, script: dict[str, Any],
+                          live: bool) -> None:
+    _SCREENPLAY_CACHE[hour_key] = {
+        "at": time.time(), "live": bool(live), "script": script,
+        "notes_rev": int(_SCREENPLAY_STATE.get("notes_rev") or 0)}
+    if len(_SCREENPLAY_CACHE) > SCREENPLAY_CACHE_MOST:
+        old = sorted(_SCREENPLAY_CACHE,
+                     key=lambda k: float(
+                         (_SCREENPLAY_CACHE.get(k) or {}).get("at") or 0))
+        for gone in old[:len(_SCREENPLAY_CACHE) - SCREENPLAY_CACHE_MOST]:
+            _SCREENPLAY_CACHE.pop(gone, None)
+
+
+async def screenplay_hour(since: float, until: float,
+                          hour_key: str = "",
+                          fresh: bool = False) -> dict[str, Any]:
+    """The hour as a screenplay. Every disk read runs in one thread and
+    the answer is cached, so the panel can poll this without ever being
+    the reason the station is late."""
+    since, until = float(since), float(until)
+    hour_key = str(hour_key or screenplay_hour_key(since))
+    live = until > time.time() - 90.0
+    if not fresh:
+        got = _screenplay_cache_get(hour_key)
+        if got is not None:
+            return got
+
+    def _work() -> dict[str, Any]:
+        d = _screenplay_disk(since, until)
+        notes = list((screenplay_notes_read().get(hour_key) or []))
+        script = screenplay_compose(since, until, d, notes)
+        script["provenance"] = {
+            str(e["line"]): screenplay_provenance(e, d)
+            for e in script["elements"]
+            if e.get("type") == "dialogue" and e.get("line")}
+        return script
+
+    script = await asyncio.to_thread(_work)
+    script.update({
+        "hour_key": hour_key, "since": since, "until": until,
+        "live": live, "at": time.time(),
+        "title": screenplay_title(hour_key, since),
+        "station": str(dj_settings().get("station_name") or "Pine Box FM"),
+    })
+    _screenplay_cache_put(hour_key, script, live)
+    return script
+
+
+def screenplay_title(hour_key: str, since: float) -> str:
+    try:
+        return time.strftime("%A %-d %B %Y - %-I %p",
+                             time.localtime(float(since or 0)))
+    except Exception:  # noqa: BLE001
+        try:
+            return time.strftime("%A %d %B %Y - %I %p",
+                                 time.localtime(float(since or 0)))
+        except Exception:  # noqa: BLE001
+            return str(hour_key or "")
+
+
+def screenplay_hours(most: int = 60) -> list[dict[str, Any]]:
+    """Every hour the air log still remembers, newest first. Sync; thread
+    it - it walks the log once."""
+    now = time.time()
+    rows = airlog_rows(now - SCREENPLAY_KEEP_S, now + 3600.0, quiet=True)
+    hours: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        at = float(row.get("air_at") or row.get("ts") or 0)
+        key = screenplay_hour_key(at)
+        got = hours.setdefault(key, {"key": key, "lines": 0, "seconds": 0.0,
+                                     "first": at, "last": at, "rounds": set(),
+                                     "clips": 0})
+        kind = str(row.get("kind") or "")
+        who = str(row.get("who") or "")
+        if kind in SCREENPLAY_SKIP_KINDS or kind in SCREENPLAY_ACTION_KINDS \
+                or who in SCREENPLAY_BOARD or who == "analysis":
+            continue
+        got["lines"] += 1
+        got["seconds"] += float(row.get("seconds") or 0)
+        got["last"] = max(got["last"], at)
+        got["first"] = min(got["first"], at)
+        if row.get("round"):
+            got["rounds"].add(str(row["round"]))
+    notes = screenplay_notes_read()
+    out: list[dict[str, Any]] = []
+    for key, got in hours.items():
+        began, ends = screenplay_hour_span(key)
+        out.append({"key": key, "since": began, "until": ends,
+                    "label": screenplay_title(key, began if began > 0
+                                              else got["first"]),
+                    "lines": got["lines"],
+                    "seconds": round(got["seconds"], 1),
+                    "rounds": sorted(got["rounds"])[:8],
+                    "notes": len(notes.get(key) or [])})
+    out.sort(key=lambda h: h["key"], reverse=True)
+    return out[:max(1, int(most))]
+
+
+# --- provenance: what made this line ---------------------------------------
+
+def screenplay_provenance(element: dict[str, Any],
+                          d: dict[str, Any]) -> dict[str, Any]:
+    """The two expandable trees, gathered.
+
+    Nothing here is inferred beyond what is written down: `recorded` says
+    plainly whether the durable stamp exists for this line, and a field
+    that was never written comes back empty rather than guessed."""
+    line_id = str(element.get("line") or "")
+    one = (d.get("prov") or {}).get(line_id) or {}
+    rnd: dict[str, Any] = {}
+    for row in (d.get("rounds") or []):
+        if line_id in (row.get("lines") or []):
+            rnd = row
+            break
+    wrote = dict(one.get("wrote") or {})
+    voice = dict(one.get("voice") or {})
+    tint = dict(rnd.get("tint") or {})
+    ledger = d.get("chunks") or {}
+    chunks: list[dict[str, Any]] = []
+    for chunk in (rnd.get("chunks") or []):
+        key = str(chunk.get("key") or "")
+        book = dict(ledger.get(key) or {})
+        chunks.append({
+            "file": chunk.get("file") or "", "mind": chunk.get("mind") or "",
+            "lines": chunk.get("lines") or 0, "chars": chunk.get("chars") or 0,
+            "text": chunk.get("text") or "", "key": key,
+            "shelf": str(book.get("shelf") or ""),
+            "used": int(float(book.get("used") or 0)),
+            "first": float(book.get("first") or 0),
+            "last": float(book.get("last") or 0),
+            "roads": list(book.get("roads") or [])[:4],
+            "liked": bool(book.get("liked")),
+            "in_ledger": bool(book),
+        })
+    at = float(element.get("at") or 0)
+    near = [c for c in (d.get("model_calls") or [])
+            if abs(float(c.get("at") or 0) - at) <= 420.0][:8]
+    took = int(wrote.get("ms") or 0)
+    working = int((near[0] or {}).get("working_ms") or 0) if near else 0
+    return {
+        "line": line_id,
+        "recorded": bool(one),
+        "at": at,
+        "round": {
+            "kind": str(rnd.get("kind") or element.get("round") or ""),
+            "label": str(rnd.get("label") or ""),
+            "source": str(rnd.get("source") or ""),
+            "seed_text": str(rnd.get("seed_text") or ""),
+            "caller": str(rnd.get("caller") or ""),
+            "banked_at": float(rnd.get("banked_at") or 0),
+            "aired_at": float(rnd.get("at") or 0),
+            "frozen": bool(rnd.get("frozen")),
+            "stream": bool(rnd.get("stream")),
+            "lines": len(rnd.get("lines") or []),
+            "stamped": bool(rnd),
+        },
+        "chunks": chunks,
+        "crystal": {
+            "tinted": bool(tint.get("ok")
+                           and str(tint.get("used") or "") == "tinted"),
+            "world": str(tint.get("world") or ""),
+            "why": str(tint.get("why") or ""),
+            "ms": int(float(tint.get("ms") or 0)),
+            "stanzas": int(float(tint.get("stanzas") or 0)),
+            "plain": str(tint.get("plain") or ""),
+            "tinted_script": str(tint.get("tinted") or ""),
+            "plain_chars": int(float(tint.get("plain_chars") or 0)),
+            "tinted_chars": int(float(tint.get("tinted_chars") or 0)),
+            "crystals": list(rnd.get("crystals") or []),
+        },
+        "model": {
+            "model": str(wrote.get("model") or
+                         (rnd.get("desk") or {}).get("model") or ""),
+            "kind": str(wrote.get("kind") or ""),
+            "for": str(wrote.get("for") or ""),
+            "ms": took,
+            "working_ms": working,
+            "waiting_ms": max(0, took - working) if (took and working) else 0,
+            "temp": wrote.get("temp"),
+            "num_ctx": wrote.get("num_ctx"),
+            "armed": str(wrote.get("armed") or ""),
+            "sched": str(wrote.get("sched") or ""),
+            "prompt": str(wrote.get("prompt") or ""),
+            "answered": str(wrote.get("script") or ""),
+            "at": float(wrote.get("at") or 0),
+            "desk": dict(rnd.get("desk") or {}),
+            "calls_near": [{"at": float(c.get("at") or 0),
+                            "model": str(c.get("model") or ""),
+                            "kind": str(c.get("kind") or ""),
+                            "ms": int(float(c.get("ms") or 0)),
+                            "tinted": bool(c.get("tinted"))} for c in near],
+        },
+        "voice": {
+            "engine": str(voice.get("engine") or element.get("engine") or ""),
+            "voice": str(voice.get("voice") or ""),
+            "ms": int(float(voice.get("ms") or 0)),
+            "seconds": float(voice.get("seconds") or
+                             element.get("seconds") or 0),
+            "kb": int(float(voice.get("kb") or 0)),
+            "service": str(voice.get("service") or ""),
+            "tried": list(voice.get("tried") or []),
+            "fallback": str(voice.get("fallback") or ""),
+            "shelf": bool(rnd.get("takes")) and int(
+                float(voice.get("ms") or 0)) == 0,
+            "macro": str(one.get("macro") or ""),
+            "fx": dict(one.get("fx") or {}),
+        },
+        "air": {
+            "aired": str(element.get("aired") or ""),
+            "clip": str(element.get("clip") or ""),
+            "seconds": float(element.get("seconds") or 0),
+            "burst": int(float(one.get("burst") or 0)),
+            "queued_at": float(one.get("queued_at") or 0),
+            "replay": bool(element.get("replay")),
+        },
+    }
+
+
+# --- the making-of flowchart (server-rendered SVG, no library) --------------
+
+SCREENPLAY_FLOW_W = 600
+SCREENPLAY_FLOW_H = 138
+SCREENPLAY_FLOW_CHARS = 17           # what fits across one node at this width
+
+
+def _screenplay_svg_text(text: str) -> str:
+    return (str(text or "").replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace('"', "&quot;"))
+
+
+def screenplay_flow_svg(prov: dict[str, Any]) -> str:
+    """One compact diagram of the systems that made this line, in the order
+    they ran. A stage that fired is drawn lit and carries its own number;
+    a stage that did not is dimmed and says why in a word. Server-rendered
+    so the panel loads no library and an export can embed it."""
+    p = prov or {}
+    rnd = p.get("round") or {}
+    chunks = p.get("chunks") or []
+    crystal = p.get("crystal") or {}
+    model = p.get("model") or {}
+    voice = p.get("voice") or {}
+    air = p.get("air") or {}
+    stages: list[tuple[str, bool, str, str]] = []
+    if chunks:
+        head = chunks[0]
+        stages.append(("SPEAKER BOX", True,
+                       str(head.get("file") or "a document"),
+                       f"{sum(int(c.get('lines') or 0) for c in chunks)}"
+                       f" lines / {len(chunks)}"))
+    else:
+        stages.append(("SPEAKER BOX", False, "no swath recorded",
+                       "unseeded" if rnd.get("stamped") else "not stamped"))
+    if model.get("model"):
+        stages.append(("THE WRITER", True, str(model.get("model")),
+                       f"{int(model.get('ms') or 0)} ms"))
+    else:
+        stages.append(("THE WRITER", False, "no call recorded",
+                       "older hour" if not p.get("recorded") else "unwritten"))
+    if crystal.get("tinted"):
+        stages.append(("THE CRYSTAL", True,
+                       str(crystal.get("world") or "the crystal")[:34],
+                       f"{int(crystal.get('ms') or 0)} ms"))
+    else:
+        stages.append(("THE CRYSTAL", False,
+                       str(crystal.get("why") or "no crystal on this round"),
+                       "plain"))
+    if voice.get("shelf"):
+        stages.append(("THE PANTRY", True, "served off the shelf",
+                       f"{float(voice.get('seconds') or 0):.1f}s"))
+    elif voice.get("engine"):
+        stages.append(("THE VOICE", True,
+                       f"{voice.get('engine')} {str(voice.get('voice') or '-')}",
+                       f"{int(voice.get('ms') or 0)} ms"))
+    else:
+        stages.append(("THE VOICE", False, "no render recorded",
+                       "older hour" if not p.get("recorded") else "silent"))
+    aired = str(air.get("aired") or "")
+    where = {"box": "THE BOX", "page": "THE PAGE", "stream": "THE STREAM",
+             "held": "THE SHELF"}.get(aired, "THE FLOOR")
+    stages.append((where, bool(aired), aired or "never aired",
+                   f"{float(air.get('seconds') or 0):.1f}s"
+                   + (" / clip" if air.get("clip") else "")))
+
+    wide = SCREENPLAY_FLOW_W
+    tall = SCREENPLAY_FLOW_H
+    n = len(stages)
+    pad = 10
+    gap = 12
+    box_w = (wide - pad * 2 - gap * (n - 1)) / n
+    parts = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {wide} {tall}" '
+        f'width="{wide}" height="{tall}" role="img" '
+        f'style="display:block;max-width:100%;height:auto" '
+        f'aria-label="how this line was made">',
+    ]
+
+    def two(text: str) -> list[str]:
+        """The node's detail on at most two short lines, never mid-word if
+        a space will do."""
+        got = " ".join(str(text or "").split())
+        cap = SCREENPLAY_FLOW_CHARS
+        if len(got) <= cap:
+            return [got]
+        cut = got.rfind(" ", 0, cap + 1)
+        head = got[:cut] if cut > cap // 2 else got[:cap]
+        rest = got[len(head):].strip()
+        return [head, rest[:cap - 1] + "…" if len(rest) > cap else rest]
+
+    for i, (title, lit, detail, number) in enumerate(stages):
+        x = pad + i * (box_w + gap)
+        fill = "#10321f" if lit else "#14161c"
+        edge = "#3fbf7a" if lit else "#2a3040"
+        ink = "#d8f5e4" if lit else "#5d6577"
+        sub = "#9ad6b4" if lit else "#4a5164"
+        num = "#ffd27d" if lit else "#3f4759"
+        cx = x + box_w / 2
+        parts.append(
+            f'<rect x="{x:.1f}" y="24" width="{box_w:.1f}" height="80" rx="7" '
+            f'fill="{fill}" stroke="{edge}" stroke-width="1.4"/>')
+        parts.append(
+            f'<text x="{cx:.1f}" y="18" text-anchor="middle" '
+            f'font-family="ui-monospace,Consolas,monospace" font-size="9" '
+            f'fill="#4c5568">{i + 1}</text>')
+        parts.append(
+            f'<text x="{cx:.1f}" y="43" text-anchor="middle" '
+            f'font-family="ui-monospace,Consolas,monospace" font-size="10.5" '
+            f'font-weight="700" fill="{ink}">'
+            f'{_screenplay_svg_text(title)}</text>')
+        for k, row in enumerate(two(detail)[:2]):
+            parts.append(
+                f'<text x="{cx:.1f}" y="{59 + k * 11}" text-anchor="middle" '
+                f'font-family="ui-monospace,Consolas,monospace" font-size="8.5" '
+                f'fill="{sub}">{_screenplay_svg_text(row)}</text>')
+        parts.append(
+            f'<text x="{cx:.1f}" y="92" text-anchor="middle" '
+            f'font-family="ui-monospace,Consolas,monospace" font-size="10" '
+            f'fill="{num}">{_screenplay_svg_text(number[:18])}</text>')
+        if i < n - 1:
+            ax = x + box_w + 1
+            bx = x + box_w + gap - 1
+            arrow = "#3fbf7a" if lit else "#2a3040"
+            parts.append(
+                f'<path d="M{ax:.1f} 64 L{bx:.1f} 64" stroke="{arrow}" '
+                f'stroke-width="1.4"/>'
+                f'<path d="M{bx - 4:.1f} 61 L{bx:.1f} 64 L{bx - 4:.1f} 67" '
+                f'fill="none" stroke="{arrow}" stroke-width="1.4"/>')
+    tail = ("the numbers are this line's own; a dimmed stage did not run"
+            if p.get("recorded") else
+            "this hour aired before the screenplay ledger - only the air "
+            "log survives for it")
+    parts.append(
+        f'<text x="{pad}" y="{tall - 8}" '
+        f'font-family="ui-monospace,Consolas,monospace" font-size="9" '
+        f'fill="#5d6577">{_screenplay_svg_text(tail)}</text>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+# --- the exports -----------------------------------------------------------
+
+SCREENPLAY_INDENT = {"scene": 0, "action": 0, "character": 22,
+                     "parenthetical": 16, "dialogue": 10, "note": 4,
+                     "transition": 0, "subheader": 0}
+SCREENPLAY_WIDTH = {"scene": 60, "action": 60, "character": 38,
+                    "parenthetical": 26, "dialogue": 34, "note": 56,
+                    "transition": 60, "subheader": 60}
+
+
+def _screenplay_wrap(text: str, width: int) -> list[str]:
+    words = str(text or "").split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    row = words[0]
+    for word in words[1:]:
+        if len(row) + 1 + len(word) <= width:
+            row += " " + word
+        else:
+            lines.append(row)
+            row = word
+    lines.append(row)
+    return lines
+
+
+def screenplay_text(script: dict[str, Any]) -> str:
+    """The clipboard sheet: the script laid out in a fixed-width measure,
+    the way it looks on paper. Notes and inserts ride along."""
+    out: list[str] = []
+    out.append(str(script.get("station") or "PINE BOX FM").upper())
+    out.append(str(script.get("title") or ""))
+    counts = script.get("counts") or {}
+    out.append(f"{counts.get('lines', 0)} lines - "
+               f"{counts.get('scenes', 0)} scenes - "
+               f"{screenplay_mmss(counts.get('seconds'))} of talk"
+               + (f" - {counts.get('tinted', 0)} tinted"
+                  if counts.get("tinted") else ""))
+    out.append("")
+    out.append("FADE IN:")
+    out.append("")
+    elements = screenplay_with_notes(script.get("elements") or [],
+                                    script.get("notes") or [])
+    for element in elements:
+        kind = str(element.get("type") or "action")
+        text = str(element.get("text") or "")
+        if kind == "transition":
+            for row in _screenplay_wrap(text, 60):
+                out.append(row.rjust(60))
+            out.append("")
+            continue
+        pad = " " * SCREENPLAY_INDENT.get(kind, 0)
+        for row in _screenplay_wrap(text, SCREENPLAY_WIDTH.get(kind, 60)):
+            out.append(pad + row)
+        if kind in ("scene", "action", "dialogue", "note", "subheader"):
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def screenplay_markdown(script: dict[str, Any]) -> str:
+    """Fountain - the screenplay's own markdown. A title page, scene
+    headings forced with a leading dot, CHARACTER in caps, parentheticals
+    in brackets, transitions with a leading `>`, and the operator's notes
+    in Fountain's own note brackets so any screenwriting tool that opens
+    this shows them where he put them."""
+    counts = script.get("counts") or {}
+    out: list[str] = [
+        f"Title: {script.get('title') or script.get('hour_key') or ''}",
+        "Credit: broadcast by",
+        f"Author: {script.get('station') or 'Pine Box FM'}",
+        "Source: the station's own ledgers - air log, music log, call log",
+        f"Draft date: {time.strftime('%d %B %Y', time.localtime(float(script.get('at') or time.time())))}",
+        f"Contact: hour {script.get('hour_key') or ''} - "
+        f"{counts.get('lines', 0)} lines, {counts.get('scenes', 0)} scenes, "
+        f"{screenplay_mmss(counts.get('seconds'))} of talk, "
+        f"{counts.get('tinted', 0)} tinted",
+        "",
+        "FADE IN:",
+        "",
+    ]
+    elements = screenplay_with_notes(script.get("elements") or [],
+                                     script.get("notes") or [])
+    for element in elements:
+        kind = str(element.get("type") or "action")
+        text = " ".join(str(element.get("text") or "").split())
+        if not text:
+            continue
+        if kind == "scene":
+            out.append("." + text)
+            out.append("")
+        elif kind == "character":
+            out.append("@" + text)
+        elif kind == "parenthetical":
+            out.append(text if text.startswith("(") else f"({text})")
+        elif kind == "dialogue":
+            out.append(text)
+            if element.get("tinted"):
+                out.append("[[tinted by the crystal]]")
+            out.append("")
+        elif kind == "transition":
+            out.append("> " + text)
+            out.append("")
+        elif kind == "note":
+            out.append("[[" + text + "]]")
+            out.append("")
+        elif kind == "subheader":
+            out.append("!" + text)
+            out.append("")
+        else:
+            out.append(text)
+            out.append("")
+    return "\n".join(out).rstrip() + "\n"
+
+
+def screenplay_pdf_elements(script: dict[str, Any]) -> list[dict[str, Any]]:
+    """The shape lane P2's PDF writer takes: a flat list of typed elements,
+    notes already folded in, nothing but `type` and `text` required.
+
+    Types: scene, action, character, parenthetical, dialogue, transition,
+    note, subheader. A writer that only knows those eight can set the
+    whole script; the extra keys (`tinted`, `line`, `at`) are there for one
+    that wants to mark a tinted line or number a page against the clock."""
+    out: list[dict[str, Any]] = []
+    for element in screenplay_with_notes(script.get("elements") or [],
+                                         script.get("notes") or []):
+        row = {"type": str(element.get("type") or "action"),
+               "text": " ".join(str(element.get("text") or "").split())}
+        for key in ("tinted", "line", "at", "insert", "note_id", "tag"):
+            if element.get(key):
+                row[key] = element[key]
+        if row["text"]:
+            out.append(row)
+    return out
+
+
+def screenplay_pdf_writer() -> Any:
+    """Lane P2 owns the PDF writer; this window only asks for it.
+
+    THE SEAM: if a callable by one of these names exists at merge time it
+    is handed screenplay_pdf_elements() and a meta dict and expected to
+    answer PDF bytes. Until then /api/screenplay/<hour>.pdf answers 501
+    and says so in as many words, and the panel's Export PDF falls back to
+    the browser's own print dialogue over the script sheet - which is a
+    real PDF of a real screenplay, just not a typeset one."""
+    for name in ("pdf_write_screenplay", "pdf_render_elements",
+                 "pdf_from_elements", "paper_pdf_bytes", "pdf_document"):
+        got = globals().get(name)
+        if callable(got):
+            return got
+    return None
+
+
+async def screenplay_pdf(script: dict[str, Any]) -> bytes | None:
+    writer = screenplay_pdf_writer()
+    if writer is None:
+        return None
+    meta = {"title": str(script.get("title") or ""),
+            "station": str(script.get("station") or ""),
+            "hour_key": str(script.get("hour_key") or ""),
+            "kind": "screenplay",
+            "counts": dict(script.get("counts") or {})}
+    elements = screenplay_pdf_elements(script)
+    got = writer(elements, meta)
+    if asyncio.iscoroutine(got):
+        got = await got
+    return got if isinstance(got, (bytes, bytearray)) else None
+
+
+# --- the routes ------------------------------------------------------------
+
+def _screenplay_span(hour_key: str) -> tuple[str, float, float]:
+    key = str(hour_key or "").strip()
+    if key.endswith(".md") or key.endswith(".txt"):
+        key = key.rsplit(".", 1)[0]
+    since, until = screenplay_hour_span(key)
+    if since < 0:
+        raise HTTPException(status_code=400,
+                            detail="Bad hour - want YYYY-MM-DDTHH")
+    return key, since, until
+
+
+@app.get("/api/screenplay")
+async def api_screenplay_hours(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1050: every hour the air log still holds, newest first."""
+    require_read_auth(authorization)
+    hours = await asyncio.to_thread(screenplay_hours, 60)
+    return {"hours": hours, "now": screenplay_hour_key(time.time()),
+            "recording": bool(_SCREENPLAY_STATE.get("loaded")),
+            "stamped": {"lines": int(_SCREENPLAY_STATE.get("lines") or 0),
+                        "rounds": int(_SCREENPLAY_STATE.get("rounds") or 0)}}
+
+
+@app.get("/api/screenplay/{hour_key}.md", response_class=PlainTextResponse)
+async def api_screenplay_md(
+    hour_key: str,
+    authorization: str | None = Header(default=None),
+) -> PlainTextResponse:
+    """#1050: the hour as Fountain, the screenplay's own markdown."""
+    require_read_auth(authorization)
+    key, since, until = _screenplay_span(hour_key)
+    script = await screenplay_hour(since, until, key)
+    return PlainTextResponse(
+        screenplay_markdown(script),
+        headers={"Content-Disposition":
+                 f'attachment; filename="pinebox-{key}.fountain.md"'})
+
+
+@app.get("/api/screenplay/{hour_key}.txt", response_class=PlainTextResponse)
+async def api_screenplay_txt(
+    hour_key: str,
+    authorization: str | None = Header(default=None),
+) -> PlainTextResponse:
+    """#1050: the clipboard sheet - the script, laid out, plain."""
+    require_read_auth(authorization)
+    key, since, until = _screenplay_span(hour_key)
+    script = await screenplay_hour(since, until, key)
+    return PlainTextResponse(screenplay_text(script))
+
+
+@app.get("/api/screenplay/{hour_key}.pdf")
+async def api_screenplay_pdf(
+    hour_key: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """#1050: the PDF, through lane P2's writer. See screenplay_pdf_writer
+    - until that lands this answers 501 and the panel prints the sheet."""
+    require_read_auth(authorization)
+    key, since, until = _screenplay_span(hour_key)
+    script = await screenplay_hour(since, until, key)
+    got = await screenplay_pdf(script)
+    if not got:
+        raise HTTPException(
+            status_code=501,
+            detail="The PDF writer is not installed on this build "
+                   "(lane P2). Use Export MD, or Print from the window.")
+    return Response(content=bytes(got), media_type="application/pdf",
+                    headers={"Content-Disposition":
+                             f'attachment; filename="pinebox-{key}.pdf"'})
+
+
+@app.get("/api/screenplay/{hour_key}/line/{line_id}")
+async def api_screenplay_line(
+    hour_key: str,
+    line_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1050: one line's provenance tree, off the cached hour."""
+    require_read_auth(authorization)
+    key, since, until = _screenplay_span(hour_key)
+    script = await screenplay_hour(since, until, key)
+    prov = (script.get("provenance") or {}).get(str(line_id))
+    if prov is None:
+        raise HTTPException(status_code=404,
+                            detail="No such line in that hour")
+    return {"line": str(line_id), "hour_key": key, "provenance": prov}
+
+
+@app.get("/api/screenplay/{hour_key}/flow/{line_id}")
+async def api_screenplay_flow(
+    hour_key: str,
+    line_id: str,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """#1050: the making-of diagram for one line, as SVG."""
+    require_read_auth(authorization)
+    key, since, until = _screenplay_span(hour_key)
+    script = await screenplay_hour(since, until, key)
+    prov = (script.get("provenance") or {}).get(str(line_id))
+    if prov is None:
+        raise HTTPException(status_code=404,
+                            detail="No such line in that hour")
+    return Response(content=screenplay_flow_svg(prov),
+                    media_type="image/svg+xml",
+                    headers={"Cache-Control": "no-store"})
+
+
+@app.post("/api/screenplay/{hour_key}/note")
+async def api_screenplay_note_add(
+    hour_key: str,
+    request: Request,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1050: a note, a critique, or a line of his own against any element."""
+    require_auth(authorization)
+    key, _since, _until = _screenplay_span(hour_key)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    text = str((payload or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Write something first")
+    row = await asyncio.to_thread(
+        screenplay_note_add, key,
+        str((payload or {}).get("kind") or "note"),
+        str((payload or {}).get("target_id") or ""),
+        text, str((payload or {}).get("who") or ""))
+    _SCREENPLAY_CACHE.pop(key, None)
+    return {"ok": True, "hour_key": key, "note": row}
+
+
+@app.delete("/api/screenplay/{hour_key}/note/{note_id}")
+async def api_screenplay_note_drop(
+    hour_key: str,
+    note_id: str,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    require_auth(authorization)
+    key, _since, _until = _screenplay_span(hour_key)
+    gone = await asyncio.to_thread(screenplay_note_drop, key, str(note_id))
+    if not gone:
+        raise HTTPException(status_code=404, detail="No such note")
+    _SCREENPLAY_CACHE.pop(key, None)
+    return {"ok": True, "hour_key": key, "deleted": str(note_id)}
+
+
+@app.get("/api/screenplay/{hour_key}")
+async def api_screenplay_hour(
+    hour_key: str,
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1050: the hour as a script, with the notes and the provenance."""
+    require_read_auth(authorization)
+    key, since, until = _screenplay_span(hour_key)
+    script = await screenplay_hour(since, until, key, fresh=bool(fresh))
+    return {
+        "hour_key": key, "since": since, "until": until,
+        "title": script.get("title"), "station": script.get("station"),
+        "live": script.get("live"), "at": script.get("at"),
+        "counts": script.get("counts"),
+        "elements": screenplay_with_notes(script.get("elements") or [],
+                                          script.get("notes") or []),
+        "notes": script.get("notes") or [],
+    }
+
+
+# --- P1 end ----------------------------------------------------------------
+
+
 # --- #1019: THE PINE BOX GAZETTE -------------------------------------------
 #
 # "Next to the Pine Box voice cloud, I want an icon that shows a live
@@ -92275,7 +95368,12 @@ def paper_press_reset() -> None:
     _PAPER_PRESS.update({"started": time.time(),
                          "deadline": time.time() + PAPER_PRESS_SECONDS,
                          "writer_calls": 0, "writer_refused": 0,
-                         "tinted_stories": 0, "tinted_paras": 0, "seeds": 0})
+                         "tinted_stories": 0, "tinted_paras": 0, "seeds": 0,
+                         # N1 #1046: every speaker-box chunk any desk drew
+                         # this press, kept so the filler pool is built out
+                         # of chunks already paid for rather than a second
+                         # round of draws.
+                         "seed_bag": []})
 
 
 def paper_press_left(reserve: bool = False) -> float:
@@ -92389,6 +95487,41 @@ def _fm_dump(meta: dict[str, Any]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _fm_split_list(inner: str) -> list[str]:
+    """N1 #1044: split `a, "b, c", d` on the commas OUTSIDE the quotes.
+
+    A regex alternation cannot do this by scanning: after it matches one
+    quoted item it stands on the comma, matches nothing there, steps onto
+    the space, and its last alternative then eats the next quoted item as
+    far as that item's first inner comma. The pause itinerary printed as
+    '"reel: cut' / '6 turns' / '88s"' because of it.
+    """
+    out: list[str] = []
+    buf: list[str] = []
+    quote = ""
+    esc = False
+    for ch in str(inner or ""):
+        if esc:
+            buf.append(ch)
+            esc = False
+        elif quote:
+            buf.append(ch)
+            if ch == "\\" and quote == '"':
+                esc = True
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+            buf.append(ch)
+        elif ch == ",":
+            out.append("".join(buf))
+            buf = []
+        else:
+            buf.append(ch)
+    out.append("".join(buf))
+    return [x for x in (p.strip() for p in out) if x]
+
+
 def _fm_unquote(raw: str) -> Any:
     s = raw.strip()
     if len(s) >= 2 and s[0] == s[-1] and s[0] in "\"'":
@@ -92401,8 +95534,8 @@ def _fm_unquote(raw: str) -> Any:
         if not inner:
             return []
         # G2: a quoted item may carry a comma (box items, chart labels).
-        parts = re.findall(r'"(?:\\.|[^"\\])*"|\'[^\']*\'|[^,]+', inner)
-        return [_fm_unquote(x) for x in parts if x.strip()]
+        # N1: and the split has to WALK the string - see _fm_split_list.
+        return [_fm_unquote(x) for x in _fm_split_list(inner)]
     if s.lower() in ("true", "yes"):
         return True
     if s.lower() in ("false", "no"):
@@ -92596,6 +95729,43 @@ def _paper_words(body: str) -> int:
     return len(re.findall(r"[A-Za-z0-9'’]+", prose))
 
 
+# --- N1 #1046: a headline over nothing ------------------------------------
+# The operator's screenshot of the tabloid showed a whole column left
+# blank under a section band. Two things fill it: the filler pool (built
+# further down), and this - a desk with nothing to say must return None
+# rather than a headline over an empty body, and the check must lint the
+# ones that forget.
+PAPER_STORY_EMPTY_WORDS = int(os.getenv("PAPER_STORY_EMPTY_WORDS", "25"))
+# The furniture that makes a short story worth setting anyway: a board of
+# figures, a chart, a ruled box, quotes with clips, small ads, the
+# interview, the serial, a plate. A story carrying any of these is not
+# empty however few words its prose runs to.
+_PAPER_STORY_FURNITURE = ("classifieds", "interview", "serial", "chart",
+                          "box", "quotes", "stats", "images", "image")
+
+
+def paper_story_empty(story: dict[str, Any]) -> str:
+    """#1046: is this a headline over nothing? The reason, or "".
+
+    Takes either a desk's {meta, body} or a checked article - the shape
+    is the same. A bare markdown table counts as a board and is kept.
+    """
+    if not isinstance(story, dict):
+        return "not a story"
+    meta = story.get("meta") or {}
+    body = str(story.get("body") or "")
+    words = _paper_words(body)
+    if words >= PAPER_STORY_EMPTY_WORDS:
+        return ""
+    for key in _PAPER_STORY_FURNITURE:
+        if meta.get(key):
+            return ""
+    for line in body.split("\n"):
+        if line.startswith("|"):
+            return ""
+    return f"{words} words, no board, no picture, no ads"
+
+
 def paper_check(articles: list[dict[str, Any]]) -> dict[str, Any]:
     """vael-paper-check, the report shape: marks stop the press, lint
     prints but flags. Each finding names the file and the code."""
@@ -92725,6 +95895,10 @@ def paper_check(articles: list[dict[str, Any]]) -> dict[str, Any]:
                         lint.append({"file": f, "code": "cell_truncated",
                                      "detail": c[:40]})
         words = _paper_words(body)
+        empty_why = paper_story_empty(art)              # N1 #1046
+        if empty_why:
+            lint.append({"file": f, "code": "empty_story",
+                         "detail": empty_why})
         if words < PAPER_STORY_MIN_WORDS:
             lint.append({"file": f, "code": "story_short",
                          "detail": f"{words} words"})
@@ -93450,7 +96624,20 @@ async def paper_material(since: float, until: float) -> dict[str, Any]:
         "manager": str(dj.get("manager_name") or "the manager upstairs"),
         "sfx": "The SFX Guy"}
     m["sponsors"] = [str(x) for x in (dj.get("sponsors") or []) if str(x).strip()]
+    # --- P2 additions (#1049): the whole wall, and what the last editions
+    # printed. Both are disk, both in one thread, like every other read here.
+    try:
+        wide = await asyncio.to_thread(_paper_material_p2_disk, since, until)
+    except Exception:  # noqa: BLE001
+        wide = {}
+    m["wall"] = list(wide.get("wall") or [])
+    m["plates_seen"] = dict(wide.get("plates_seen") or {})
+    m["_plates_seen"] = m["plates_seen"]
+    # Seeded on the edition, so one press is reproducible and no two
+    # editions reach for the same pictures.
+    m["_plate_rng"] = random.Random(f"{m.get('hour_key') or ''}:{until:.0f}")
     m["pictures"] = paper_picture_pool(m)
+    paper_plate_field(m)
     m["offline"] = not m["on"]
     m["now"] = dict(_RADIO.get("now") or {})
     return m
@@ -93838,6 +97025,286 @@ def _paper_lines(rows: list[dict[str, Any]], most: int = 18,
                      f"{str(r.get('text') or '')[:each]}" for r in rows[-most:])
 
 
+# --- P2 #1049: A DIFFERENT PAPER EVERY HOUR --------------------------------
+#
+# "Make sure that the images used for the newspaper are unique each and every
+#  issue... spanning the entire history of the whole gallery... randomized."
+#
+# MEASURED BEFORE, on six live editions of 2026-09-05: consecutive papers
+# shared eight to twelve of their fourteen plates, three of six opened on the
+# same lead picture, and a single edition printed the same painting in two
+# sections. Three reasons, all fixed here:
+#
+#  (a) the field was too small. The fillers came off gallery_files(), which
+#      keeps the newest 600 names - on this box that is 2026-05-07 forward,
+#      half the wall - and only when its 30-second cache happened to be warm.
+#      paper_wall_names() walks the whole mounted output once every fifteen
+#      minutes, in the press's own thread, and reaches the first picture the
+#      gallery ever made. The described paintings were capped at the first
+#      eighty shelf rows, three images each; they are not any more.
+#  (b) nothing remembered. data/paper_plates.json now keeps, per edition,
+#      the names that edition printed - PAPER_PLATES_KEEP editions of it -
+#      and a picture used inside the last PAPER_PLATES_AVOID editions is
+#      refused. When the pool is genuinely small the window stands down by
+#      halves rather than printing nothing.
+#  (c) the choice was `cands[0]`, the same first candidate every hour.
+#      paper_plate_rank sorts by kind (the desk's preference, unchanged),
+#      then by whether the picture has ever been printed, then at random.
+#      The random is seeded on the edition, so one press is reproducible and
+#      two presses never agree.
+#
+# Nothing here is a vision call and nothing here is on the event loop.
+
+PAPER_PLATES_PATH = data_path("paper_plates.json")
+PAPER_PLATES_KEEP = 160        # editions kept on the ledger (a week of hours)
+PAPER_PLATES_AVOID = 48        # editions a picture must sit out - two days
+PAPER_WALL_MOST = 4000         # the whole history, not the newest 600
+PAPER_WALL_MEMO = 900.0        # seconds between walks of the output folder
+
+_PAPER_WALL: dict[str, Any] = {"at": 0.0, "rows": []}
+_PAPER_PLATES_MEMO: dict[str, Any] = {"at": 0.0, "rows": []}
+
+
+def paper_wall_names(most: int = PAPER_WALL_MOST) -> list[str]:
+    """#1049: every picture on the wall, newest first, back to the first
+    one the gallery ever made.
+
+    gallery_files() is the wall's own list and stops at its newest six
+    hundred; a newspaper that draws from the newest six hundred prints
+    the same fortnight over and over. This is the same rules - the same
+    art suffixes, the same skipped folders, the same newest-wins on a
+    duplicate bare name - over the whole tree, memoised for fifteen
+    minutes. Disk: call it in a thread."""
+    now = time.time()
+    if _PAPER_WALL["rows"] and now - float(_PAPER_WALL["at"]) < PAPER_WALL_MEMO:
+        return list(_PAPER_WALL["rows"])
+    best: dict[str, float] = {}
+    try:
+        for folder, dirs, files in os.walk(COMFY_OUTPUT):
+            here = Path(folder)
+            if any(part in _FACE_SKIP_DIRS for part in here.parts):
+                dirs[:] = []
+                continue
+            dirs[:] = [d for d in dirs if d not in _FACE_SKIP_DIRS]
+            for name in files:
+                if not name.lower().endswith(GALLERY_TYPES):
+                    continue
+                try:
+                    at = (here / name).stat().st_mtime
+                except OSError:
+                    continue
+                if at > best.get(name, -1.0):
+                    best[name] = at
+    except OSError:
+        return list(_PAPER_WALL["rows"])
+    rows = [n for n, _ in sorted(best.items(), key=lambda kv: kv[1],
+                                 reverse=True)][:max(1, int(most))]
+    _PAPER_WALL["at"] = now
+    _PAPER_WALL["rows"] = rows
+    return list(rows)
+
+
+def paper_plates_load(fresh: bool = False) -> list[dict[str, Any]]:
+    """The plate ledger, newest edition first. Disk - thread."""
+    now = time.time()
+    if not fresh and _PAPER_PLATES_MEMO["rows"] and now - float(_PAPER_PLATES_MEMO["at"]) < 30:
+        return list(_PAPER_PLATES_MEMO["rows"])
+    rows: list[dict[str, Any]] = []
+    try:
+        got = json.loads(PAPER_PLATES_PATH.read_text(encoding="utf-8"))
+        raw = got.get("editions") if isinstance(got, dict) else got
+        for r in (raw or []):
+            if isinstance(r, dict) and r.get("id"):
+                rows.append({"id": str(r["id"]), "at": float(r.get("at") or 0),
+                             "names": [str(n) for n in (r.get("names") or [])]})
+    except Exception:  # noqa: BLE001
+        rows = []
+    rows.sort(key=lambda r: (float(r.get("at") or 0), str(r.get("id"))),
+              reverse=True)
+    _PAPER_PLATES_MEMO["at"] = now
+    _PAPER_PLATES_MEMO["rows"] = rows
+    return list(rows)
+
+
+def paper_plates_seen(rows: list[dict[str, Any]] | None = None,
+                      most: int = PAPER_PLATES_KEEP) -> dict[str, int]:
+    """name -> how many editions ago it was last printed (0 = the last
+    one). A name that is not in the book is simply absent, which is what
+    'never printed' means to the ranker."""
+    out: dict[str, int] = {}
+    for i, row in enumerate((rows if rows is not None else paper_plates_load())[:most]):
+        for name in row.get("names") or []:
+            if name not in out:
+                out[name] = i
+    return out
+
+
+def paper_plates_note(edition_id: str, articles: list[dict[str, Any]],
+                      faces: set[str] | None = None) -> dict[str, Any]:
+    """#1049: what this edition actually printed, onto the ledger.
+
+    Read off the finished articles rather than off the pool's used-set,
+    so the book records what went on the page - the lead's plate, every
+    story's plate and extra plates, the interview's portrait and the
+    display ads' pictures. Returns the count and any picture that got onto
+    the page twice, which after paper_plates_dedupe should always be none
+    (a caller's own face, which is allowed to illustrate her twice, is not
+    counted as a repeat)."""
+    names: list[str] = []
+    for a in (articles or []):
+        meta = (a.get("meta") if isinstance(a, dict) else {}) or {}
+        for url in [meta.get("image")] + [
+                (i.get("url") if isinstance(i, dict) else i)
+                for i in (meta.get("images") or [])]:
+            if url:
+                names.append(str(url).rsplit("/", 1)[-1])
+        iv = meta.get("interview")
+        if isinstance(iv, dict) and iv.get("portrait"):
+            names.append(str(iv["portrait"]).rsplit("/", 1)[-1])
+        for row in (meta.get("classifieds") or []):
+            if isinstance(row, dict) and row.get("image"):
+                names.append(str(row["image"]).rsplit("/", 1)[-1])
+    keep_twice = {str(n).rsplit("/", 1)[-1] for n in (faces or set()) if n}
+    twice = sorted({n for n in names if names.count(n) > 1 and n not in keep_twice})
+    unique = sorted(set(n for n in names if n))
+    rows = [r for r in paper_plates_load(fresh=True) if r.get("id") != str(edition_id)]
+    rows.insert(0, {"id": str(edition_id), "at": time.time(), "names": unique})
+    del rows[PAPER_PLATES_KEEP:]
+    try:
+        PAPER_PLATES_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = PAPER_PLATES_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"at": time.time(), "editions": rows},
+                                  indent=1), encoding="utf-8")
+        tmp.replace(PAPER_PLATES_PATH)
+    except OSError:
+        pass
+    _PAPER_PLATES_MEMO["at"] = time.time()
+    _PAPER_PLATES_MEMO["rows"] = rows
+    return {"plates": len(unique), "twice": twice}
+
+
+def _paper_material_p2_disk(since: float, until: float) -> dict[str, Any]:
+    """#1049's half of the disk reads, in the press's own thread: the
+    whole wall and the plate ledger."""
+    return {"wall": paper_wall_names(),
+            "plates_seen": paper_plates_seen()}
+
+
+def paper_plate_rank(m: dict[str, Any], plate: dict[str, Any],
+                     kinds: tuple[str, ...] = ()) -> tuple[int, int, float]:
+    """#1049: where a candidate sorts.
+
+    The desk's `kinds` preference stays first - a wanted poster still
+    wants a face before a filler. Inside a kind: a picture no recent
+    edition printed comes before one that a recent edition printed, and
+    inside each of those the order is random, seeded on this edition, so
+    the same press twice gives the same paper and two presses never give
+    the same pictures. The window stands down when the field is thin -
+    that is `_plates_window`, set by paper_plate_field."""
+    seen = m.get("_plates_seen") or {}
+    rng = m.get("_plate_rng")
+    window = int(m.get("_plates_window", PAPER_PLATES_AVOID))
+    rank = kinds.index(plate.get("kind") or "") if (kinds and plate.get("kind") in kinds) else 0
+    ago = seen.get(plate.get("name"), -1)
+    if ago < 0:
+        tier = 0                        # never printed: the front of the queue
+    elif ago >= window:
+        tier = 1                        # printed, but long enough ago
+    else:
+        tier = 2                        # inside the window - a stand-down only
+    jitter = (rng.random() if rng is not None else random.random())
+    if tier == 1:
+        jitter = -float(ago) + jitter   # the longest unprinted first
+    return (rank, tier, jitter)
+
+
+def paper_plate_field(m: dict[str, Any]) -> None:
+    """#1049: how wide the no-repeat window can be and still leave a
+    paper something to print. The full window is two days of editions;
+    when the wall is genuinely small it halves until enough pictures are
+    free, and says so on the press console rather than quietly repeating
+    itself."""
+    pool = list(m.get("pictures") or [])
+    seen = m.get("_plates_seen") or {}
+    want = max(12, len(pool) // 12)
+    window = PAPER_PLATES_AVOID
+    while window > 0:
+        free = sum(1 for p in pool if seen.get(p.get("name"), -1) < 0
+                   or seen.get(p.get("name"), 0) >= window)
+        if free >= want:
+            break
+        window //= 2
+    m["_plates_window"] = window
+    m["_plates_free"] = sum(1 for p in pool if seen.get(p.get("name"), -1) < 0)
+    if window < PAPER_PLATES_AVOID:
+        _paper_say(f"plates: the wall is thin - the no-repeat window stood "
+                   f"down to {window} editions ({len(pool)} pictures, "
+                   f"{m['_plates_free']} never printed)")
+
+
+def paper_plates_dedupe(articles: list[dict[str, Any]],
+                        faces: set[str] | None = None) -> list[str]:
+    """#1049(d): one picture, one place in the paper.
+
+    The pool already refuses to hand the same painting to two desks, but a
+    desk may print one picture twice by itself - the classifieds desk sets
+    its display ads both as plates and again on the ad rows, and the
+    interview sets its portrait as the story's picture as well as the
+    interview's. Measured on the live editions of 2026-09-05: four such
+    doubles in every issue. This is the last word before the articles are
+    written: walk them in print order and keep the FIRST place each picture
+    appears - the story's own plate before its extra plates, the interview's
+    portrait before an ad thumbnail.
+
+    ONE exception, and it is CONTRACT s4's standing rule, not an oversight:
+    a caller's licence photo may appear in more than one story, because it
+    is a portrait of the person that story is about - her minutes, her
+    wanted poster and her serial are the same face on purpose. Even a face
+    is only printed once inside a single story. Returns what it dropped."""
+    keep_twice = {str(n).rsplit("/", 1)[-1] for n in (faces or set()) if n}
+    seen: set[str] = set()
+    dropped: list[str] = []
+
+    for a in (articles or []):
+        meta = (a.get("meta") if isinstance(a, dict) else {}) or {}
+        here: set[str] = set()
+
+        def claim(url: Any) -> bool:
+            name = str(url or "").rsplit("/", 1)[-1]
+            if not name:
+                return False
+            if name in here or (name in seen and name not in keep_twice):
+                dropped.append(name)
+                return False
+            here.add(name)
+            seen.add(name)
+            return True
+
+        if meta.get("image") and not claim(meta["image"]):
+            meta.pop("image", None)
+            meta.pop("credit", None)
+            meta.pop("focus", None)
+            if not meta.get("chart"):
+                meta.pop("caption", None)
+        iv = meta.get("interview")
+        if isinstance(iv, dict) and iv.get("portrait") and not claim(iv["portrait"]):
+            iv.pop("portrait", None)
+        keep = []
+        for row in (meta.get("images") or []):
+            url = row.get("url") if isinstance(row, dict) else row
+            if claim(url):
+                keep.append(row)
+        if meta.get("images") is not None:
+            if keep:
+                meta["images"] = keep
+            else:
+                meta.pop("images", None)
+        for row in (meta.get("classifieds") or []):
+            if isinstance(row, dict) and row.get("image") and not claim(row["image"]):
+                row.pop("image", None)
+    return dropped
+
+
 # --- G2: the picture pool, the speaker box, the crystal, the hot lines ----
 #
 # Every desk below returns {slug, meta, body} or None. The meta is the
@@ -93907,20 +97374,32 @@ def paper_picture_pool(m: dict[str, Any]) -> list[dict[str, Any]]:
     except Exception:  # noqa: BLE001
         pass
     try:
-        for row in list(shelf_rows("gallery"))[:80]:
+        # P2 #1049: every described painting the shelf holds. The first
+        # eighty rows at three images each reached 203 of the 323 names
+        # banked on the live shelf, and the paper drew the same ones.
+        for row in list(shelf_rows("gallery"))[:600]:
             entry = row.get("entry") if isinstance(row, dict) else {}
-            for im in list((entry or {}).get("prep_gallery") or [])[:3]:
+            for im in list((entry or {}).get("prep_gallery") or [])[:12]:
                 if isinstance(im, dict):
                     add(im.get("name"), im.get("desc"), "described")
     except Exception:  # noqa: BLE001
         pass
     for who, face in (m.get("caller_faces") or {}).items():
         add(face, f"{who}'s licence photo", "face", who=str(who))
-    try:
-        for q in list(_GALLERY_CACHE.get("rows") or [])[:24]:
-            add(getattr(q, "name", q), "", "filler")
-    except Exception:  # noqa: BLE001
-        pass
+    # P2 #1049: the fillers are the WHOLE wall - m["wall"] is walked off
+    # the mounted output in paper_material's own thread and reaches the
+    # first picture the gallery ever made, where gallery_files() stops at
+    # its newest six hundred (on this box, four months of it). The warm
+    # cache stays as the fallback for a press with no material.
+    wall = [str(n) for n in (m.get("wall") or [])]
+    if not wall:
+        try:
+            wall = [str(getattr(q, "name", q))
+                    for q in list(_GALLERY_CACHE.get("rows") or [])[:24]]
+        except Exception:  # noqa: BLE001
+            wall = []
+    for name in wall:
+        add(name, "", "filler")
     return pool
 
 
@@ -93947,8 +97426,12 @@ def paper_picture_take(m: dict[str, Any], kinds: tuple[str, ...] = (),
             return dict(pick)
     cands = [p for p in pool if p["name"] not in used
              and (not kinds or p["kind"] in kinds)]
-    if kinds:                       # the order of `kinds` is a preference
-        cands.sort(key=lambda p: kinds.index(p["kind"]))
+    # P2 #1049: the desk's `kinds` is still the first preference; inside
+    # it the plate ledger decides - a picture no recent edition printed
+    # first, then the longest unprinted, then at random on this edition's
+    # own seed. cands[0] below is now a considered choice, not the top of
+    # whatever order the pool happened to be built in.
+    cands.sort(key=lambda p: paper_plate_rank(m, p, kinds))
     if person:
         persons = [p for p in cands if _PAPER_PERSON.search(p.get("desc") or "")]
         cands = persons or cands
@@ -93974,6 +97457,14 @@ async def paper_seeds(n: int = 2) -> list[dict[str, Any]]:
         if seed.get("text"):
             out.append(seed)
     _PAPER_PRESS["seeds"] = int(_PAPER_PRESS.get("seeds") or 0) + len(out)
+    # N1 #1046: the filler pool reads the bag rather than drawing again.
+    try:
+        bag = _PAPER_PRESS.setdefault("seed_bag", [])
+        if isinstance(bag, list):
+            bag.extend(out)
+            del bag[80:]
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -94747,6 +98238,125 @@ def paper_pause_itinerary(m: dict[str, Any]) -> list[str]:
     return items
 
 
+def paper_air_state(m: dict[str, Any]) -> dict[str, Any]:
+    """#1044: what the paper must say about the air itself.
+
+    The operator asked that an edition printed while the radio is paused
+    SAY so, and say for how long. `state` is paused | off | on; `for_words`
+    is the length out of _RADIO["paused_at"] - the same clock
+    radio_paused_for() reads - and `why` is the operator's own words, kept
+    by pause_log.jsonl (paused.json holds only the current state, and the
+    loader does not restore its `why`).
+
+    Nothing here is guessed. An off station keeps no stamp of its own, so
+    the paper says when the switch was last thrown (radio_on.json's own
+    mtime, the only record there is) and when the last line aired, rather
+    than inventing a duration.
+    """
+    paused = bool(m.get("paused"))
+    offline = bool(m.get("offline"))
+    pn = dict(m.get("pause_now") or {})
+    why = _paper_shorten(str(pn.get("why") or ""), 120)
+    out: dict[str, Any] = {"state": "on", "seconds": 0.0, "since": 0.0,
+                           "for_words": "", "why": why, "line": "",
+                           "strip": "", "last_aired": 0.0}
+    if paused:
+        secs = float(pn.get("seconds") or 0)
+        out.update({"state": "paused", "seconds": round(secs, 1),
+                    "since": float(pn.get("since") or 0),
+                    "for_words": _paper_ago(secs),
+                    "strip": f"Paused - {_paper_ago(secs)} off the air"})
+        out["line"] = ("The station is paused as this edition goes to press: "
+                       + _paper_ago(secs) + " off the air"
+                       + (f", asked for by {why}" if why else "")
+                       + ". Nothing is airing. Every room behind the glass "
+                         "is still working, and this edition reports what "
+                         "they are doing instead of an hour that did not "
+                         "happen.")
+        return out
+    if offline:
+        last = 0.0
+        for row in reversed(list(m.get("air") or [])):
+            last = float(row.get("air_at") or row.get("ts") or 0)
+            if last:
+                break
+        thrown = 0.0
+        try:
+            if RADIO_ON_PATH.exists():
+                thrown = float(RADIO_ON_PATH.stat().st_mtime)
+        except Exception:  # noqa: BLE001
+            thrown = 0.0
+        held = max(0.0, time.time() - thrown) if thrown else 0.0
+        out.update({"state": "off", "since": thrown or last,
+                    "seconds": round(held, 1),
+                    "last_aired": last,
+                    "for_words": _paper_ago(held) if thrown else "",
+                    "strip": ("Off the air - " + _paper_ago(held)
+                              if thrown else "Off the air")})
+        out["line"] = ("The station is off the air"
+                       + (f" - the switch was last thrown {_paper_ago(held)} ago"
+                          if thrown else "")
+                       + (f", and the last line aired at {_paper_clock(last)}"
+                          if last else ", and nothing aired in this window")
+                       + ". This edition prints the pages that do not need a "
+                         "broadcast to exist.")
+        return out
+    return out
+
+
+def _paper_ago_short(seconds: float) -> str:
+    """#1044: the same span as _paper_ago, short enough for a big-number
+    callout - the typesetter clips a stat value at nine characters, so
+    "14 minutes" printed as "14 minute" on the paused front page."""
+    seconds = max(0.0, float(seconds or 0))
+    if seconds < 90:
+        return f"{int(seconds)} sec"
+    if seconds < 5400:
+        return f"{int(round(seconds / 60))} min"
+    return f"{seconds / 3600:.1f} hr"
+
+
+def paper_pause_banked(m: dict[str, Any]) -> dict[str, Any]:
+    """#1044: what the pause put in the bank, and what will be waiting
+    when the air comes back. Counts only, every one out of a ledger the
+    station already keeps - the pantry rows rendered since the pause began
+    (paper_pause_words), prep_board's written/rendered/ready per road,
+    prepared_seconds(), hour_needs_now() for the roads still short, and
+    the reel. Memory only; safe to call on the loop."""
+    info = dict(m.get("pause_info") or {})
+    board = [r for r in (m.get("board") or []) if isinstance(r, dict)]
+    roads = [{"kind": str(r.get("kind") or ""),
+              "label": str(r.get("label") or r.get("kind") or ""),
+              "written": int(r.get("written") or 0),
+              "rendered": int(r.get("rendered") or 0),
+              "ready": int(r.get("ready") or 0),
+              "seconds": round(float(r.get("seconds") or 0), 1)}
+             for r in board]
+    try:
+        ready_seconds = round(float(prepared_seconds()), 1)
+    except Exception:  # noqa: BLE001
+        ready_seconds = 0.0
+    short: list[list[Any]] = []
+    for road, row in sorted((m.get("needs") or {}).items()):
+        gap = float((row or {}).get("owed") or 0) - float((row or {}).get("held") or 0)
+        if gap > 0:
+            short.append([str(road), round(gap, 1)])
+    short.sort(key=lambda r: -float(r[1]))
+    reel: dict[str, Any] = {}
+    try:
+        got = dict(_REEL)
+        reel = {"cut": bool(got.get("media")), "turns": int(got.get("turns") or 0),
+                "length": round(float(got.get("length") or 0), 1)}
+    except Exception:  # noqa: BLE001
+        reel = {}
+    return {"clips": int(info.get("clips") or 0),
+            "by_kind": dict(info.get("by_kind") or {}),
+            "roads": roads,
+            "ready_rounds": sum(r["ready"] for r in roads),
+            "ready_seconds": ready_seconds,
+            "short": short[:8], "reel": reel}
+
+
 def _desk_pause(m: dict[str, Any]) -> dict[str, Any] | None:
     """#1030: the itinerary story beside the paused lead - the box, bars
     of stock by road, and the pause history in the window."""
@@ -94782,7 +98392,8 @@ def _desk_pause(m: dict[str, Any]) -> dict[str, Any] | None:
         "byline": "The Orchestrator", "kicker": "PAUSED",
         "style_hint": "itinerary",
         "box": {"title": "The itinerary", "items": items[:16] or ["nothing running"]},
-        "stats": [{"value": _paper_ago(pause_now.get("seconds") or 0), "label": "paused for"},
+        "stats": [{"value": _paper_ago_short(pause_now.get("seconds") or 0),
+                   "label": "paused for"},
                   {"value": str(int(info.get("clips") or 0)), "label": "clips rendered"},
                   {"value": str(sum(int(r.get("ready") or 0) for r in board)), "label": "rounds ready"}],
     }
@@ -94794,6 +98405,146 @@ def _desk_pause(m: dict[str, Any]) -> dict[str, Any] | None:
                          "show_values": True, "min": 0}
         meta["caption"] = "Stock by road: seconds ready on the shelves."
     return {"slug": "the-pause", "meta": meta, "body": body}
+
+
+def _desk_banked(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1044: what the pause banked, and what is waiting when the air
+    comes back. A paused or off hour has no running order to review, so
+    this is the review it does have. Code only - every figure is
+    prep_board's, prepared_seconds()' or hour_needs_now()'s."""
+    paused = bool(m.get("paused"))
+    offline = bool(m.get("offline"))
+    if not (paused or offline):
+        return None
+    bank = paper_pause_banked(m)
+    roads = [r for r in bank["roads"] if r["written"] or r["ready"]]
+    if not roads and not bank["clips"]:
+        return None
+    roads.sort(key=lambda r: (-r["ready"], -r["written"]))
+    board = ["| Road | Written | Ready | Sec |", "| --- | --- | --- | --- |"]
+    for r in roads[:10]:
+        board.append(f"| {_paper_shorten(r['label'], 22)} | {r['written']} | "
+                     f"{r['ready']} | {int(r['seconds'])} |")
+    reel = bank.get("reel") or {}
+    kinds = sorted((bank.get("by_kind") or {}).items(), key=lambda kv: -kv[1])
+    since_words = ""
+    if paused:
+        since_words = (f"Since the pause began the rooms rendered "
+                       f"{bank['clips']} clip"
+                       + ("s" if bank["clips"] != 1 else "")
+                       + (" (" + ", ".join(f"{k} {v}" for k, v in kinds[:5]) + ")"
+                          if kinds else "") + ". ")
+    short = bank.get("short") or []
+    body = (
+        ("The air is stopped and the shelves are not. " if paused else
+         "The station is off, and the shelves keep what was made before the "
+         "switch was thrown. ")
+        + since_words
+        + f"The board holds {bank['ready_rounds']} round"
+        + ("s" if bank["ready_rounds"] != 1 else "")
+        + f" ready to air and {int(bank['ready_seconds'])} seconds of "
+          "finished audio standing by; the table is what each road has "
+          "written, rendered and holding.\n\n"
+        + "\n".join(board)
+        + "\n\n"
+        + ("The reel is cut - " + f"{reel.get('turns') or 0} turns, "
+           f"{int(float(reel.get('length') or 0))} seconds, welded - so the "
+           "first thing a listener hears when the air comes back is a whole "
+           "clip and not a desk warming up. "
+           if reel.get("cut") else
+           "The reel is not cut yet; the first round after the resume will "
+           "be whatever the shelves hand up. ")
+        + (("Behind that, the coming hours are still short of "
+            + ", ".join(f"{str(road).replace('_', ' ')} by "
+                        f"{_paper_ago(float(gap))}" for road, gap in short[:4])
+            + ", and those are the roads the keepers are working while "
+              "nothing airs.")
+           if short else
+           "No road is short of what the coming hours ask of it, which is "
+           "the whole point of stopping.")
+    )
+    bars = [(r["label"], r["seconds"]) for r in roads if r["seconds"] > 0][:8]
+    meta: dict[str, Any] = {
+        "headline": ("What the Pause Banked" if paused else
+                     "What the Shelves Hold With the Station Off"),
+        "deck": (f"{bank['ready_rounds']} rounds ready, "
+                 f"{int(bank['ready_seconds'])} seconds of finished audio "
+                 "waiting for the air to come back"),
+        "section": "report", "priority": 2, "page": 2,
+        "byline": "The Orchestrator", "style_hint": "report",
+        "kicker": "PAUSED" if paused else "OFF AIR",
+        "box": {"title": "Waiting when the air returns",
+                "items": [f"{bank['ready_rounds']} rounds ready to air",
+                          f"{int(bank['ready_seconds'])} seconds of finished audio",
+                          ("the reel: cut, " f"{reel.get('turns') or 0} turns, "
+                           f"{int(float(reel.get('length') or 0))}s"
+                           if reel.get("cut") else "the reel: not cut yet")]
+                         + ([f"rendered during the pause: {bank['clips']} clips"]
+                            if paused else [])
+                         + [f"still short: {str(road).replace('_', ' ')} by "
+                            f"{_paper_ago(float(gap))}" for road, gap in short[:5]]},
+        "stats": [{"value": str(bank["ready_rounds"]), "label": "rounds ready"},
+                  {"value": str(int(bank["ready_seconds"])), "label": "seconds banked"},
+                  {"value": str(bank["clips"]), "label": "clips rendered"},
+                  {"value": str(len(short)), "label": "roads short"}],
+    }
+    if len(bars) >= 2:
+        meta["chart"] = {"kind": "bars",
+                         "values": [int(round(v)) for _, v in bars],
+                         "labels": [_paper_shorten(k, 11) for k, _ in bars],
+                         "show_values": True, "min": 0}
+        meta["caption"] = "Seconds held on each road's shelf as we print."
+    return {"slug": "what-the-pause-banked", "meta": meta, "body": body}
+
+
+def _desk_cloud(m: dict[str, Any]) -> dict[str, Any] | None:
+    """#1044: the word-cloud data as a board. The cloud itself is drawn
+    beside the paused lead on page one; a picture of words with no figures
+    beside it is only half the coverage the operator asked for. Only
+    prints when the pause actually wrote something."""
+    if not m.get("paused"):
+        return None
+    words = [w for w in (m.get("cloud_words") or [])
+             if isinstance(w, (list, tuple)) and len(w) >= 2]
+    if len(words) < 5:
+        return None
+    info = dict(m.get("pause_info") or {})
+    kinds = sorted((info.get("by_kind") or {}).items(), key=lambda kv: -kv[1])
+    total = sum(int(c) for _w, c in words)
+    board = ["| Word | Said |", "| --- | --- |"]
+    for w, c in words[:14]:
+        board.append(f"| {_paper_shorten(str(w), 22)} | {int(c)} |")
+    body = (
+        "Nothing aired, and the rooms wrote anyway. These are the words the "
+        "pantry and the larder put on paper since the pause began, counted "
+        f"as they were written: {total} uses of the {len(words)} words that "
+        f"came up more than once, out of {int(info.get('clips') or 0)} "
+        "rendered clips"
+        + ((" - " + ", ".join(f"{k} {v}" for k, v in kinds[:5]))
+           if kinds else "")
+        + ".\n\n"
+        + "\n".join(board)
+        + "\n\nThe cloud on the front page is this same table, sized by "
+          "count. It is not what the station said; it is what the station "
+          "wrote while it was quiet, which is the only record a paused hour "
+          "leaves behind."
+    )
+    top = words[:10]
+    meta: dict[str, Any] = {
+        "headline": "The Words Written While the Air Was Still",
+        "deck": f"{total} uses of {len(words)} words, out of the rounds the "
+                "rooms wrote during the pause",
+        "section": "studio", "priority": 3, "page": 2,
+        "byline": "The Gazette", "style_hint": "report", "kicker": "PAUSED",
+        "chart": {"kind": "bars", "values": [int(c) for _w, c in top],
+                  "labels": [_paper_shorten(str(w), 11) for w, _c in top],
+                  "show_values": True, "min": 0},
+        "caption": "The ten words the pause wrote most.",
+        "stats": [{"value": str(total), "label": "words written"},
+                  {"value": str(int(info.get("clips") or 0)), "label": "clips rendered"}],
+    }
+    return {"slug": "the-quiet-words", "meta": meta, "body": body}
+
 
 # --- G2 prose desks (the writer, with a templated fallback each) ----------
 
@@ -95496,6 +99247,459 @@ async def _desk_classifieds(m: dict[str, Any]) -> dict[str, Any] | None:
     return {"slug": "classifieds", "meta": meta, "body": body}
 
 
+# --- N1 #1046: the fillers ------------------------------------------------
+# "Blank areas should be filled with classified ads, help wanted ads, ads
+# for lost pets, lost cats, data centers being open, randomized ads based
+# on the speaker box content should fill in all of these cracks looking
+# like a classified page in these blank areas."
+#
+# So: a POOL, far bigger than one edition needs (the typesetter takes what
+# it wants and throws the rest away), every body grown from a real passage
+# out of the operator's own library - never lorem, never a sentence the
+# station could not have written.
+
+PAPER_FILLER_MOST = int(os.getenv("PAPER_FILLER_MOST", "56"))
+PAPER_FILLER_SEEDS = int(os.getenv("PAPER_FILLER_SEEDS", "12"))
+PAPER_FILLER_KINDS = ("classified", "help wanted", "lost pet", "lost cat",
+                      "data centre", "for sale", "wanted", "personals",
+                      "services", "public notice", "lost and found",
+                      "missing record", "station notice")
+PAPER_FILLER_LABELS = {
+    "classified": "NOTICES", "help wanted": "HELP WANTED",
+    "lost pet": "LOST PET", "lost cat": "LOST CAT",
+    "data centre": "DATA CENTRE", "for sale": "FOR SALE",
+    "wanted": "WANTED", "personals": "PERSONALS", "services": "SERVICES",
+    "public notice": "PUBLIC NOTICE", "lost and found": "LOST & FOUND",
+    "missing record": "MISSING RECORD", "station notice": "STATION NOTICE",
+}
+_PAPER_FILLER_ROOMS = ("finishing room", "pantry", "larder", "recording room",
+                       "gallery wall", "switchboard", "record library",
+                       "engineering cupboard", "workshop", "reel bench",
+                       "news desk", "ad studio", "tape store")
+_PAPER_FILLER_JOBS = ("a night hand", "a tape splicer", "an extra pair of ears",
+                      "somebody who can solder", "a cataloguer",
+                      "a runner for the tape room", "a reader for the small hours",
+                      "a keeper of the shelves", "a driver with their own van")
+_PAPER_FILLER_CATS = ("Bishop", "Mackerel", "Tuppence", "Clementine", "Sundial",
+                      "Marmalade", "Ampersand", "Blot", "Domino", "Kestrel",
+                      "Nutmeg", "Pilot", "Sixpence", "Halfnote")
+_PAPER_FILLER_PETS = ("a tortoiseshell cat", "a black cat with one white foot",
+                      "a grey tom with a bent ear", "a lurcher, very tall",
+                      "a small dog with a bad ear", "a green budgerigar",
+                      "a house rabbit", "a ginger kitten", "a deaf white cat")
+_PAPER_FILLER_PLACES = ("the yard behind the station", "the car park by the mast",
+                        "the alley off the loading bay", "the stairs to the roof",
+                        "the bins behind the studio", "the bus stop on the corner",
+                        "the back of the record library", "the fire door")
+_PAPER_FILLER_HALLS = ("Hall B", "the cold aisle", "Suite 4", "the east row",
+                       "the second floor", "the annex", "the old switch room",
+                       "Row 9", "the basement hall")
+_PAPER_FILLER_PRICES: dict[str, tuple[str, ...]] = {
+    "for sale": ("$5", "$12", "$40", "$85", "$250 or nearest",
+                 "two records and a handshake", "best offer",
+                 "free to a good home"),
+    "wanted": ("cash waiting", "fair price paid", "name your figure",
+               "paid on collection"),
+    "services": ("by the hour", "$20 an hour", "a fair rate",
+                 "no fee if it does not work"),
+    "help wanted": ("pay on Fridays", "scale rates", "cash, weekly",
+                    "board and tea"),
+    "lost cat": ("reward", "a reward, honestly", "$40 reward"),
+    "lost pet": ("reward", "no questions asked"),
+    "data centre": ("per rack, monthly", "enquire for rates",
+                    "first month free"),
+    "missing record": ("no charge", "a drink for its return"),
+    "classified": ("$3", "best offer", "free", "enquire within"),
+    "lost and found": (),
+    "personals": (),
+    "public notice": (),
+    "station notice": (),
+}
+_PAPER_FILLER_CONTACTS = ("ring the request line", "ask for {host} after the news",
+                          "box 7, care of the station", "leave word with {cohost}",
+                          "the switchboard, evenings", "write to the manager upstairs",
+                          "call in during the small hours", "the front desk, any hour",
+                          "ask at the {room}")
+# (kind, head frame, body frame). Every body carries a {clause} - a real
+# passage out of the speaker box - so the ads read like the station's own
+# world. The frames are deliberately mundane; the strangeness comes from
+# the library.
+_PAPER_FILLER_FRAMES: tuple[tuple[str, str, str], ...] = (
+    ("help wanted", "{job} for the {room}",
+     "{station} wants {job_a} for the {room}, nights mostly. {clause} No "
+     "experience asked for, only a steady hand and the sense to wait until "
+     "the record ends."),
+    ("help wanted", "Reader wanted, small hours",
+     "The desk needs somebody to read continuity between two and five in the "
+     "morning. {clause} Tea is provided; glory is not."),
+    ("help wanted", "{room}: second pair of hands",
+     "The {room} has more work in it than it has people. {clause} Ask for "
+     "{host} and say the paper sent you."),
+    ("lost cat", "{cat} has gone",
+     "{pet_c}, answers to {cat}, last seen near {place}. {clause} Reward, and "
+     "no questions about where you found him."),
+    ("lost cat", "Missing since the news",
+     "Our cat walked out during the news and has not come back. {clause} She "
+     "is not fond of strangers and will pretend she is."),
+    ("lost cat", "Cat, one ear, strong views",
+     "{cat} is a cat with one good ear and firm opinions about doors. "
+     "{clause} Last seen heading for {place}."),
+    ("lost pet", "{pet_c}, missing",
+     "{pet_c}, missing from {place} since the small hours. {clause} Answers "
+     "to nothing in particular but comes for a tin."),
+    ("lost pet", "Have you seen this animal",
+     "Last seen crossing {place} at speed and in the wrong direction. "
+     "{clause} We are not proud about this; ring the line."),
+    ("data centre", "{hall} is open for business",
+     "{hall} is open for business: racks, power and a cold aisle, five "
+     "minutes from the mast. {clause} Tours on the hour, every hour."),
+    ("data centre", "Racks free in {hall}",
+     "Space in {hall} from this week, metered and quiet. {clause} Cooling is "
+     "included; the noise is your own affair."),
+    ("data centre", "Cold aisle, warm welcome",
+     "A new row is lit and taking tenants. {clause} Bring your own cable and "
+     "we will find you the rest."),
+    ("for sale", "{cap}, one owner",
+     "{clause} Sold as seen, off the back of the {room}, and it works when "
+     "it feels like it."),
+    ("for sale", "{cap}",
+     "{clause} Collection only - it will not go in the lift and we have "
+     "stopped trying."),
+    ("for sale", "Turntable, good arm",
+     "A turntable with a good arm and a tired lid. {clause} It has turned "
+     "more hours than anything else in the building."),
+    ("for sale", "{cap}, going cheap",
+     "{clause} No reasonable offer refused, and no unreasonable one either."),
+    ("wanted", "{cap}, wanted",
+     "Wanted, and paid for on the spot: {clause_l} Ring the line and describe "
+     "it to whoever answers."),
+    ("wanted", "Anything with a handle",
+     "The {room} will take anything with a handle on it. {clause} We are not "
+     "fussy and we do not ask where it came from."),
+    ("wanted", "Records, boxes of",
+     "Boxes of records wanted, unsorted preferred, condition no object. "
+     "{clause} We will carry them ourselves."),
+    ("personals", "To the voice at {clock}",
+     "To whoever was talking at {clock}: {clause_l} You know the number and "
+     "you know we are up."),
+    ("personals", "Nights free, taste unfashionable",
+     "Nights free, taste unfashionable, no interest in being talked out of "
+     "it. {clause} No time-wasters."),
+    ("personals", "Still listening",
+     "You said you would ring after the news and you did not. {clause} The "
+     "line is open until it is not."),
+    ("services", "{cap}, by arrangement",
+     "{clause} Rates by the hour or by the record, whichever comes out "
+     "kinder for you."),
+    ("services", "Repairs, quietly done",
+     "Amplifiers, lamps, anything that hums when it should not. {clause} "
+     "Collected and returned."),
+    ("services", "Cataloguing undertaken",
+     "Shelves put in order, boxes labelled, records filed by whatever system "
+     "you like. {clause}"),
+    ("public notice", "Notice to listeners",
+     "{clause} This notice is placed by the station, and it means exactly "
+     "what it says."),
+    ("public notice", "The mast, and you",
+     "Works are scheduled on the mast this week. {clause} Nothing will be "
+     "off the air that anybody notices."),
+    ("public notice", "Concerning the {room}",
+     "The {room} is not a thoroughfare and has never been one. {clause}"),
+    ("lost and found", "{cap}, found",
+     "Found in the {room}, where it should not have been: {clause_l} "
+     "Describe it and it is yours."),
+    ("lost and found", "One glove, left hand",
+     "One glove, left hand, found by the switchboard and hung on the hook "
+     "since. {clause}"),
+    ("missing record", "{record}, off the shelf",
+     "{record} has not been on the shelf since {clock}. {clause} No blame is "
+     "being apportioned; there is only a gap."),
+    ("missing record", "Sleeve without a record",
+     "A sleeve came back to the library empty. {clause} The record is "
+     "somewhere in this building and we would like it back."),
+    ("station notice", "From the desk of {manager}",
+     "{clause} Signed upstairs, posted downstairs, and not open to "
+     "discussion."),
+    ("station notice", "The line is open",
+     "The request line is open and answered by whoever is nearest to it. "
+     "{clause}"),
+    ("classified", "{cap}",
+     "{clause} Apply in the usual way and expect the usual delay."),
+    ("classified", "Small notice, large feeling",
+     "{clause} {clause2}"),
+    ("classified", "Notice, unclassifiable",
+     "The desk could not decide what this was, so it is here. {clause}"),
+)
+# The words that must never open or carry an ad's headline. The pause
+# desk's _PAPER_STOP_WORDS is about a word cloud and keeps the short
+# joins; a headline needs them gone as well.
+_PAPER_FILLER_SKIP = frozenset("""
+and the not but for was are its his her out all any one two who why how
+did has had may can will nor yet per off own too few had been onto upon
+that this with from into over under near past each both same than then
+during among within without across along around behind beside between
+though unless until whose whole came come went gone kept keep
+""".split())
+# A clause is cut at a full stop, a semicolon, a colon or a dash - the
+# places a passage can be broken without lying about what it said.
+_PAPER_FILLER_SPLIT = re.compile(r"(?<=[.!?])\s+|\s*[;:]\s+|\s+[–—-]\s+")
+_PAPER_FILLER_LINE = re.compile(
+    r"^\s*[-*•]?\s*\d{0,2}[.)]?\s*"
+    r"(HELP\s*WANTED|LOST\s*CAT|LOST\s*PET|DATA\s*CENTRE|DATA\s*CENTER|"
+    r"FOR\s*SALE|WANTED|PERSONALS?|SERVICES?|PUBLIC\s*NOTICE|"
+    r"LOST\s*(?:&|AND)\s*FOUND|MISSING\s*RECORD|STATION\s*NOTICE|NOTICES?)"
+    r"\s*[:\-–—]\s*(.+)$", re.I)
+_PAPER_FILLER_KIND_OF = {
+    "HELP WANTED": "help wanted", "LOST CAT": "lost cat",
+    "LOST PET": "lost pet", "DATA CENTRE": "data centre",
+    "DATA CENTER": "data centre", "FOR SALE": "for sale", "WANTED": "wanted",
+    "PERSONAL": "personals", "PERSONALS": "personals", "SERVICE": "services",
+    "SERVICES": "services", "PUBLIC NOTICE": "public notice",
+    "LOST & FOUND": "lost and found", "LOST AND FOUND": "lost and found",
+    "MISSING RECORD": "missing record", "STATION NOTICE": "station notice",
+    "NOTICE": "classified", "NOTICES": "classified",
+}
+
+
+def _paper_filler_clauses(seeds: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Every usable clause out of the drawn speaker-box chunks, in the
+    order they were drawn: four to twenty-six words, no markup, deduped.
+    A clause is what an ad's body is BUILT from (CONTRACT s5)."""
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for s in seeds or []:
+        if not isinstance(s, dict):
+            continue
+        text = " ".join(str(s.get("text") or "").split())
+        text = re.sub(r"[*_`#>\[\]]+", "", text)
+        src = str(s.get("file") or "")
+        for bit in _PAPER_FILLER_SPLIT.split(text):
+            bit = bit.strip().strip(" ,.;:-–—\"'()")
+            if not 18 <= len(bit) <= 190:
+                continue
+            words = bit.split()
+            if not 4 <= len(words) <= 26:
+                continue
+            if not re.search(r"[A-Za-z]{3}", bit):
+                continue
+            key = bit.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({"text": bit, "file": src})
+    return out
+
+
+def _paper_filler_cap(text: str, rng: random.Random) -> str:
+    """Two to four content words out of a clause, Title Cased - the head
+    of an ad that has no other name to go by.
+
+    The function words come out first, or the heads read "FOR SALE: NOT
+    STAY LIT" and "SERVICES: FLOOR THE HALL, BY ARRANGEMENT" - measured
+    on the first pool this lane printed.
+    """
+    pool = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]{2,}", str(text or ""))
+            if w.lower() not in _PAPER_STOP_WORDS
+            and w.lower() not in _PAPER_FILLER_SKIP]
+    if len(pool) < 2:
+        pool = [w for w in re.findall(r"[A-Za-z][A-Za-z'-]{3,}", str(text or ""))
+                if w.lower() not in _PAPER_FILLER_SKIP]
+    if not pool:
+        return "One Careful Owner"
+    start = rng.randrange(0, max(1, len(pool) - 1))
+    got = pool[start:start + rng.choice((2, 2, 3, 3, 4))]
+    if len(got) < 2:
+        got = pool[:2]
+    return " ".join(w.capitalize() for w in got)[:44] or "One Careful Owner"
+
+
+def paper_filler_parse(text: str) -> list[dict[str, Any]]:
+    """The writer's dressed fillers: one per line, 'KIND: head - body -
+    price - contact'. Anything that does not hold the shape is dropped;
+    the pool is filled by code either way, so a refusal costs nothing."""
+    # The lookbehinds matter: the bare WANTED and NOTICE alternatives are
+    # the tails of HELP WANTED, PUBLIC NOTICE and STATION NOTICE, and
+    # without them a folded "HELP WANTED: ..." is cut in half and files
+    # itself under WANTED.
+    text = re.sub(r"(?<!HELP)(?<!PUBLIC)(?<!STATION)\s+"
+                  r"(?=(?:HELP\s*WANTED|LOST\s*CAT|LOST\s*PET|DATA\s*CENT|"
+                  r"FOR\s*SALE|WANTED|PERSONALS?|SERVICES?|PUBLIC\s*NOTICE|"
+                  r"LOST\s*(?:&|AND)\s*FOUND|MISSING\s*RECORD|STATION\s*NOTICE|"
+                  r"NOTICES?)\s*[:\-–—])", "\n", str(text or ""))
+    out: list[dict[str, Any]] = []
+    for line in text.split("\n"):
+        got = _PAPER_FILLER_LINE.match(line.strip())
+        if not got:
+            continue
+        label = re.sub(r"\s+", " ", got.group(1).upper())
+        kind = _PAPER_FILLER_KIND_OF.get(label)
+        if not kind:
+            kind = _PAPER_FILLER_KIND_OF.get(label.replace(" ", ""), "classified")
+        bits = [b.strip(" .") for b in
+                re.split(r"\s+[-–—|]\s+", got.group(2))]
+        bits = [b for b in bits if b]
+        if len(bits) < 2 or len(bits[1]) < 12:
+            continue
+        out.append({"kind": kind,
+                    "head": f"{PAPER_FILLER_LABELS.get(kind, 'NOTICES')}: "
+                            + _paper_shorten(bits[0], 44),
+                    "body": _paper_shorten(bits[1], 240),
+                    "price": bits[2][:40] if len(bits) > 2 else "",
+                    "contact": bits[3][:60] if len(bits) > 3 else "",
+                    "seed": ""})
+    return out
+
+
+async def paper_fillers(m: dict[str, Any], most: int = 0) -> list[dict[str, Any]]:
+    """#1046: the pool of small ads, forty to seventy of them, deduped.
+
+    Order of work: the press's seed bag (chunks the desks already drew) ->
+    a few more draws only if the bag is thin -> ONE writer call to dress a
+    dozen -> the rest assembled by code from _PAPER_FILLER_FRAMES. Never
+    raises: the caller gets [] and the press carries on.
+    """
+    most = max(8, int(most or PAPER_FILLER_MOST))
+    rng = random.Random(f"{m.get('hour_key') or ''}|fillers|"
+                        f"{int(float(m.get('since') or 0))}")
+    bag = [s for s in (_PAPER_PRESS.get("seed_bag") or []) if isinstance(s, dict)]
+    mine: list[dict[str, Any]] = []
+    while len(bag) + len(mine) < PAPER_FILLER_SEEDS and paper_press_left() > 0:
+        got = await paper_seeds(1)
+        if not got:
+            break
+        mine.extend(got)
+    if mine:
+        paper_seeds_used(mine)          # CONTRACT s5: our own draws retire
+    clauses = _paper_filler_clauses(bag + mine)
+    if not clauses:
+        return []
+    rng.shuffle(clauses)
+    # The station's own nouns, so an ad can name a record or a room.
+    records = [str((r or {}).get("title") or "") for r in (m.get("records") or [])
+               if str((r or {}).get("title") or "").strip()]
+    pieces = [str((p or {}).get("desc") or "") for p in (m.get("pictures") or [])
+              if str((p or {}).get("desc") or "").strip()]
+    names = dict(m.get("names") or {})
+    since = float(m.get("since") or time.time())
+    until = float(m.get("until") or since + 3600)
+    fixed = {"station": str(m.get("station") or PINE_BOX_FM),
+             "host": str(m.get("host") or names.get("host") or "the host"),
+             "cohost": str(m.get("cohost") or names.get("cohost") or "the co-host"),
+             "manager": str(names.get("manager") or "the manager upstairs")}
+
+    def frame_bag(clause: dict[str, str], second: dict[str, str]) -> dict[str, str]:
+        text = clause["text"]
+        job = rng.choice(_PAPER_FILLER_JOBS)
+        pet = rng.choice(_PAPER_FILLER_PETS)
+        room = rng.choice(_PAPER_FILLER_ROOMS)
+        rec = rng.choice(records) if records else "the blue one with no sleeve"
+        piece = _paper_shorten(rng.choice(pieces), 70) if pieces else \
+            "a painting nobody has claimed"
+        return {**fixed,
+                "clause": (text[0].upper() + text[1:]).rstrip(".") + ".",
+                "clause_l": (text[0].lower() + text[1:]).rstrip(".") + ".",
+                "clause2": (second["text"][0].upper() + second["text"][1:]).rstrip(".") + ".",
+                "cap": _paper_filler_cap(text, rng),
+                "room": room,
+                # the head takes the job's first phrase only: "a reader for
+                # the small hours" in the head of "{job} for the {room}"
+                # printed "Reader for the small hours for the pantry"
+                "job": re.split(r"\s+(?:for|with|who|of)\s+",
+                                re.sub(r"^an?\s+", "", job))[0],
+                "job_a": job,
+                "cat": rng.choice(_PAPER_FILLER_CATS),
+                "pet": pet, "pet_c": pet[0].upper() + pet[1:],
+                "place": rng.choice(_PAPER_FILLER_PLACES),
+                "hall": rng.choice(_PAPER_FILLER_HALLS),
+                "record": _paper_shorten(rec, 40),
+                "piece": piece, "piece_c": piece[0].upper() + piece[1:],
+                "clock": _paper_clock(rng.uniform(since, until))}
+
+    # A thin library prints FEWER ads rather than the same sentence forty
+    # times over: no passage carries more than four of them.
+    most = min(most, max(6, len(clauses) * 4))
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def take(row: dict[str, Any]) -> None:
+        head = " ".join(str(row.get("head") or "").split())[:70]
+        body = " ".join(str(row.get("body") or "").split())[:240]
+        if len(body) < 20 or not head:
+            return
+        key = (head + "|" + body).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        row["head"], row["body"] = head, body
+        out.append(row)
+
+    # One writer call for the whole pool - and only if the ration has any
+    # left. paper_write refuses politely when it does not.
+    try:
+        sample = clauses[:12]
+        material = "THE CHUNKS, ONE SMALL AD EACH:\n" + "\n".join(
+            f"{i + 1}. {c['text']}" for i, c in enumerate(sample))
+        got = await paper_write(
+            "The Filler Desk",
+            "Dress each chunk as one small ad on a classified page of "
+            f"{fixed['station']}'s newspaper. Write BODY as one line per ad, "
+            "nothing else, in exactly this shape: KIND: head - body - price "
+            "- contact. KIND is one of HELP WANTED, LOST CAT, LOST PET, DATA "
+            "CENTRE, FOR SALE, WANTED, PERSONALS, SERVICES, PUBLIC NOTICE, "
+            "LOST AND FOUND, MISSING RECORD, STATION NOTICE. The head is "
+            "under six words; the body is one or two short sentences that "
+            "keep the chunk's own words and bend them into the ad, never "
+            "quoting it; the price is a small sum or a phrase like 'best "
+            "offer'; the contact is a station phrase such as 'ring the "
+            f"request line'. Write {len(sample)} lines.",
+            material, words=(90, 420))
+        for row in paper_filler_parse(got.get("body") or ""):
+            take(row)
+    except Exception as exc:  # noqa: BLE001
+        _paper_say(f"the filler desk's writer tripped: {type(exc).__name__}"[:120])
+
+    # ...and the rest by code, frames against clauses.
+    frames = list(_PAPER_FILLER_FRAMES)
+    rng.shuffle(frames)
+    tries = 0
+    i = 0
+    while len(out) < most and tries < most * 4:
+        tries += 1
+        kind, head_f, body_f = frames[i % len(frames)]
+        clause = clauses[i % len(clauses)]
+        second = clauses[(i * 7 + 3) % len(clauses)]
+        i += 1
+        try:
+            bag_v = frame_bag(clause, second)
+            head = head_f.format(**bag_v)
+            body = body_f.format(**bag_v)
+        except Exception:  # noqa: BLE001
+            continue
+        prices = _PAPER_FILLER_PRICES.get(kind) or ()
+        take({"kind": kind,
+              "head": f"{PAPER_FILLER_LABELS.get(kind, 'NOTICES')}: "
+                      + _paper_shorten(head[0].upper() + head[1:], 44),
+              "body": _paper_shorten(body, 240),
+              "price": rng.choice(prices) if prices else "",
+              "contact": rng.choice(_PAPER_FILLER_CONTACTS).format(**bag_v),
+              "seed": clause.get("file") or ""})
+    rng.shuffle(out)                    # so a page's slice mixes categories
+    return out[:most]
+
+
+def paper_fillers_by_page(fillers: list[dict[str, Any]],
+                          pages: int) -> dict[str, list[int]]:
+    """#1046: the pool dealt round the pages as INDEXES into fillers[], so
+    the typesetter has a slice per page and no ad is set twice in one
+    edition. A hint, not a rule - a page that needs more takes from the
+    pool and marks what it used."""
+    pages = max(1, min(PAPER_PAGES_MAX, int(pages or 1)))
+    out: dict[str, list[int]] = {str(n): [] for n in range(1, pages + 1)}
+    for i in range(len(fillers or [])):
+        out[str(i % pages + 1)].append(i)
+    return out
+
+
 _PAPER_QA_LINE = re.compile(r"^\s*(?:\*\*)?\s*(Q|A)\s*[:.]\s*(?:\*\*)?\s*(.+)$", re.I)
 
 
@@ -95992,8 +100196,11 @@ async def _desk_lead(m: dict[str, Any],
         info = dict(m.get("pause_info") or {})
         kinds = sorted((info.get("by_kind") or {}).items(), key=lambda kv: -kv[1])[:8]
         if len(kinds) >= 2:
+            # N1 #1044: twelve, the most paper_check allows - at eleven
+            # "banter round" was cut to "banter" and the paused front
+            # page carried two slices with the same name.
             meta["chart"] = {"kind": "pie", "values": [int(v) for _, v in kinds],
-                             "labels": [_paper_shorten(str(k), 11) for k, _ in kinds]}
+                             "labels": [_paper_shorten(str(k), 12) for k, _ in kinds]}
             meta["caption"] = "Work rendered during the pause, by kind."
         meta["box"] = {"title": "The itinerary", "items": paper_pause_itinerary(m)[:10]}
         meta["style_hint"] = "itinerary"
@@ -96121,6 +100328,7 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                                 or 0)
                 cloud_words, info = await asyncio.to_thread(paper_pause_words, started)
                 m["pause_info"] = info
+                m["cloud_words"] = cloud_words          # N1 #1044: the cloud desk
             except Exception as exc:  # noqa: BLE001
                 _paper_say(f"the pause words tripped: {exc}"[:160])
                 m["pause_info"] = {}
@@ -96137,11 +100345,35 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                 _paper_say(f"{name} desk tripped: {type(exc).__name__}: {exc}"[:160])
                 got = None
             if got:
+                # N1 #1046: a desk with nothing to say returns None. This
+                # is the backstop for the ones that forget - a headline
+                # over an empty body is the blank column the operator
+                # photographed.
+                why = paper_story_empty(got)
+                if why:
+                    _paper_say(f"{name} desk stood down - nothing to say ({why})")
+                    return
                 stories.append(got)
                 _paper_say(f"{name} desk: \"{got['meta']['headline']}\"")
 
+        # N1 #1044: the hour-review desks need an hour to review. When the
+        # station is OFF, or paused across a window in which nothing aired
+        # at all, they stand down and the non-broadcast run prints instead
+        # - the pages that exist whether or not anything is on the air. A
+        # pause that began part way through a full hour keeps them: there
+        # IS an hour to review, and the desks with nothing to say drop out
+        # on their own through paper_story_empty.
+        aired = bool(m.get("records") or m.get("calls")
+                     or any((m.get("said") or {}).values()))
+        broadcast = bool(aired and not offline)
+        m["broadcast"] = broadcast
+        if not broadcast:
+            _paper_say("the hour-review desks stand down - "
+                       + ("the station is off the air" if offline else
+                          "paused, and nothing aired in the window")
+                       + "; the non-broadcast run prints instead")
         # Data desks first - code, never a model.
-        if not offline:
+        if broadcast:
             for name, desk in (("records", _desk_records), ("adverts", _desk_adverts),
                                ("hour", _desk_hour), ("sports", _desk_sports)):
                 await _run(name, desk)
@@ -96153,11 +100385,18 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
         await _run("device", _desk_device)
         await _run("dgx", _desk_dgx)
         await _run("weather", _desk_weather)
+        # #1030 / N1 #1044: the special coverage of an hour with no radio
+        # in it - the itinerary, what the pause banked and what is waiting
+        # when the air comes back, and the words the rooms wrote while it
+        # was quiet.
         if paused:
             await _run("pause", _desk_pause)
+            await _run("cloud", _desk_cloud)
+        if paused or offline:
+            await _run("banked", _desk_banked)
         # Prose desks: the writer, with a templated fallback each; the
         # order is the order the writer's ration is spent in.
-        if not offline:
+        if broadcast:
             for name, desk in (("air", _desk_air), ("phones", _desk_phones),
                                ("gallery", _desk_gallery),
                                ("interview", _desk_interview),
@@ -96170,10 +100409,34 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                                ("upstairs", _desk_upstairs),
                                ("testimonials", _desk_testimonials)):
                 await _run(name, desk)
+        else:
+            # N1 #1044: the sections that do not need a broadcast to exist.
+            # The wire was read whether or not anybody said it out loud,
+            # the classifieds are grown from the speaker box, the report
+            # and the page from upstairs are about the orchestrator and
+            # not about the air.
+            for name, desk in (("wire", _desk_wire),
+                               ("classifieds", _desk_classifieds),
+                               ("report", _desk_report),
+                               ("upstairs", _desk_upstairs)):
+                await _run(name, desk)
         # The lead desk sees everything; the apology sees the lead too and
         # is always the LAST article (#1035).
         lead = await _desk_lead(m, stories)
         apology = await _desk_apology(m, [lead] + stories)
+        # N1 #1046: the filler pool - far more small ads than one edition
+        # needs, so the typesetter never leaves a column blank. Built last,
+        # when the seed bag is full of chunks the desks already paid for;
+        # a failure yields an empty pool and the press carries on.
+        fillers: list[dict[str, Any]] = []
+        try:
+            fillers = await paper_fillers(m)
+        except Exception as exc:  # noqa: BLE001
+            _paper_say(f"the filler desk tripped: {type(exc).__name__}: {exc}"[:160])
+            fillers = []
+        if fillers:
+            _paper_say(f"fillers: {len(fillers)} small ads in "
+                       f"{len({str(f.get('kind')) for f in fillers})} categories")
         # #1024: the crystal, on the bodies only, under the caps.
         tinted_by = paper_tinted_by()
         if tinted_by:
@@ -96242,6 +100505,15 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
             with _PAPER_LOCK:
                 _PAPER["verdict"] = "red - not published"
             return {"started": True, "ok": False, "report": report}
+        # P2 #1049(d): one picture, one place - the last word before the
+        # articles are written to disk.
+        _faces = {str(v) for v in (m.get("caller_faces") or {}).values() if v}
+        doubled = paper_plates_dedupe(articles, _faces)
+        if doubled:
+            _paper_say(f"plates: {len(doubled)} repeat"
+                       + ("" if len(doubled) == 1 else "s")
+                       + " dropped so no picture prints twice - "
+                       + ", ".join(doubled[:4]))
         where = paper_edition_dir(edition_id)
         art_dir = where / "articles"
         if where.exists():
@@ -96251,6 +100523,7 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
             (art_dir / art["file"]).write_text(
                 _fm_dump(art["meta"]) + "\n" + art["body"], encoding="utf-8")
         head = paper_masthead()
+        pages_n = len({int(a["meta"].get("page") or 6) for a in articles})
         edition = {
             "id": edition_id, "at": time.time(), "since": since, "until": until,
             "kind": kind, "reason": reason,
@@ -96264,8 +100537,15 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                     if k in ("title", "artist")},
             # G2 (CONTRACT s3): the typesetter's fields.
             "style_default": "broadsheet",
-            "pages": len({int(a["meta"].get("page") or 6) for a in articles}),
+            "pages": pages_n,
             "paused": paused, "offline": offline,
+            # N1 #1044: what the masthead strip and the front page say
+            # about the air itself, and #1046: the pool of small ads the
+            # typesetter fills its blank columns from.
+            "air_state": paper_air_state(m),
+            "broadcast": broadcast,
+            "fillers": fillers,
+            "fillers_by_page": paper_fillers_by_page(fillers, pages_n),
             # #1024: say it only when it happened. The crystal's name and
             # the refusal reason are in "press" either way.
             "tinted_by": (tinted_by
@@ -96300,6 +100580,16 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                    f"\"{edition['headline']}\"")
         note_action(f"📰 the Gazette printed the {_paper_hour_words(since)} hour"
                     + (" (extra)" if kind != "hourly" else ""))
+        # P2 #1048: the hour, filed as a PDF as well as a page -
+        # edition.broadsheet.pdf and edition.tabloid.pdf, off the loop.
+        fire_and_forget(paper_pdf_archive(edition_id))
+        # P2 #1049: what this edition printed goes on the plate ledger, so
+        # the next one refuses to reach for the same pictures.
+        _book = await asyncio.to_thread(paper_plates_note, edition_id, articles,
+                                        {str(v) for v in (m.get("caller_faces") or {}).values() if v})
+        _paper_say(f"plates: {_book['plates']} pictures filed on the ledger"
+                   + (" - REPEATED: " + ", ".join(_book["twice"][:3])
+                      if _book["twice"] else ""))
         fire_and_forget(paper_snapshot_clock(edition_id))   # G3 #1020: the gallery card, unless a panel sends one first
         _paper_prune()
         return {"started": True, "ok": True, "id": edition_id,
@@ -96634,11 +100924,90 @@ import math  # G3: the pie, the cloud and the plexus need it here
 # (server-side SVG) and a live plexus of the background work (three.js from
 # /vendor when it loads, the SVG when it does not).
 
-PAPER_RENDER_VERSION = 4          # #1037: bump when the typesetter changes; older cached pages re-set
+PAPER_RENDER_VERSION = 5          # #1047: the sheet has a format; re-set every cache
 PAPER_STYLES = ("broadsheet", "tabloid")
-PAPER_PAGES_MAX = 6
+PAPER_PAGES_MAX = 6               # the desks' page hint still runs 1..6
+PAPER_PAGES_CAP = int(os.getenv("PAPER_PAGES_CAP", "12"))  # what the packer aims at
+PAPER_PAGES_HARD = int(os.getenv("PAPER_PAGES_HARD", "40"))  # and never goes past
+PAPER_PAGES_MIN = 2               # a paper opens; it never is one sheet
 PAPER_SNAPSHOT_DIR = "_gazette"   # under /comfy-output, skipped by the face/art pools (#1020)
 PAPER_SNAPSHOT_WAIT = float(os.getenv("PAPER_SNAPSHOT_WAIT", "600"))   # the panel gets ten minutes first
+
+# #1047: THE SHEET. A page is a fixed box of newspaper proportion, the same
+# for every page of an edition; the broadsheet is portrait 1:1.32 in four
+# columns, the tabloid a smaller, denser 1:1.45 in three. Everything the
+# packer does is arithmetic on these numbers, so they are in one place and
+# every constant is named. The `char` factors are the average glyph width as
+# a fraction of the font size, measured against Chrome (see REPORT.md,
+# "calibration"): they are what turns a story's characters into column
+# inches, and they are the only numbers in here that were fitted rather
+# than chosen.
+PAPER_SHEET: dict[str, dict[str, Any]] = {
+    "broadsheet": {
+        "w": 1100.0, "ratio": 1.32,
+        "pad_x": 30.0, "pad_top": 16.0, "pad_bot": 12.0,
+        "cols": 5, "gap": 20.0,
+        "fs": 13.5, "lh": 1.40, "char": 0.452,
+        "head_fs": 19.0, "head_lh": 1.08, "head_char": 0.470,
+        "lead_fs": 46.0, "lead_lh": 0.98, "lead_char": 0.455,
+        "deck_fs": 13.0, "deck_lh": 1.30,
+        "side_w": 268.0,
+        "top1": 176.0, "topn": 44.0, "foot": 32.0, "colophon": 40.0,
+        "notice": 34.0, "splash": 0.0, "extras_h": 640.0, "front_share": 0.62,
+        "plate_ar": 0.75, "lead_plate_ar": 0.5625,
+        "plate_max": 330.0, "lead_plate_max": 320.0,
+        # LAY: fitted against Chrome, three editions, 37 stories a style
+        "est_scale": 1.055, "fill_scale": 1.05,
+    },
+    "tabloid": {
+        "w": 900.0, "ratio": 1.45,
+        "pad_x": 18.0, "pad_top": 12.0, "pad_bot": 10.0,
+        "cols": 3, "gap": 14.0,
+        "fs": 13.5, "lh": 1.36, "char": 0.442,
+        "head_fs": 26.0, "head_lh": 0.92, "head_char": 0.435,
+        "lead_fs": 40.0, "lead_lh": 0.90, "lead_char": 0.430,
+        "deck_fs": 13.0, "deck_lh": 1.25,
+        "side_w": 226.0,
+        "top1": 254.0, "topn": 34.0, "foot": 26.0, "colophon": 34.0,
+        "notice": 30.0, "splash": 300.0, "extras_h": 600.0, "front_share": 0.58,
+        "plate_ar": 0.75, "lead_plate_ar": 0.62,
+        "plate_max": 290.0, "lead_plate_max": 330.0,
+        "est_scale": 1.055, "fill_scale": 0.97,
+    },
+}
+
+# How full the packer sets a flow with JOURNALISM before it opens a new one,
+# and how full the filler pass then takes it. Stories stop at 0.90 of a
+# flow's capacity so an under-estimate of a paragraph cannot push a
+# paragraph off the sheet; the small ads take it to 0.985, and they are set
+# LAST in every flow, so the only thing an error can ever cost is an advert.
+PAPER_FLOW_EFF = float(os.getenv("PAPER_FLOW_EFF", "0.88"))
+# LAY: what the SERVER fills a flow to. The page's own fitter takes it the
+# rest of the way, measuring instead of estimating; the gap between the two
+# is the margin an estimate 4% short spends on an advert rather than on a
+# paragraph off the foot of the sheet.
+PAPER_FILL_TO = float(os.getenv("PAPER_FILL_TO", "0.92"))
+PAPER_SLACK_OK = 30.0             # LAY: the most blank a column foot may keep
+# The one-line notices that close the last inch of a column. All different,
+# because the fitter will not set the same card twice in one flow and a
+# column that runs out of closers keeps its blank (#1047 LAY).
+PAPER_CLOSERS = (
+    "Small ads", "The Gazette", "Notices", "Pine Box FM",
+    "Set by machine", "Printed on the hour", "End of column",
+    "More overleaf", "Trade only", "Terms on application",
+)
+PAPER_SPLIT_MIN = 170.0           # ~two column-inches either side of a jump
+# A full-measure story is set in a box of its own, and the box was the
+# estimate to the pixel: 3% short and the foot of the story was clipped.
+# The ease is filled with small ads by the page's own fitter when it turns
+# out not to have been needed (#1047 LAY).
+PAPER_WIDE_EASE = 1.04
+# ...and when a full-measure story has to be CUT to fit a sheet, it is cut
+# to 93% of the room, not to the edge: the last 7% is what an estimate that
+# runs short spends, and what the fitter fills with small ads when it does
+# not (#1047 LAY).
+PAPER_WIDE_FIT = 0.93
+PAPER_FILLERS_MAX = 60            # per flow, so a thin edition cannot run away
 
 
 def _paper_svg_pie(chart: dict[str, Any]) -> str:
@@ -96923,19 +101292,160 @@ _PAPER_AUDIO_JS = r"""
 """
 
 
+_PAPER_READER_JS = r"""
+(function(){
+  /* #1045: click a covered headline, read the whole story. The page hands
+     the click to the panel when it is sitting in the panel's iframe (the
+     overlay then covers the whole Gazette window); on its own - Open ↗, a
+     print preview, a saved page - it opens its own overlay instead. Both
+     roads ask the same door, /api/news/read. */
+  var wrap = null, seq = 0;
+  function esc(s){ var d = document.createElement('div'); d.appendChild(document.createTextNode(s == null ? '' : String(s))); return d.innerHTML; }
+  function host(u){ var m = /^https?:\/\/([^\/?#]+)/i.exec(String(u || '')); return m ? m[1] : ''; }
+  function when(s){
+    if(!s) return '';
+    var d = new Date(String(s));
+    if(isNaN(d.getTime())) return String(s).slice(0, 40);
+    return d.toLocaleDateString(undefined, {year: 'numeric', month: 'long', day: 'numeric'});
+  }
+  function keys(e){ if(e.key === 'Escape'){ e.preventDefault(); shut(); } }
+  function shut(){ if(!wrap) return; try{ wrap.remove(); }catch(err){} wrap = null; document.removeEventListener('keydown', keys); }
+  function shell(url, label){
+    shut();
+    wrap = document.createElement('div');
+    wrap.className = 'rdr';
+    wrap.setAttribute('role', 'dialog');
+    wrap.setAttribute('aria-label', 'The full story');
+    wrap.innerHTML = '<div class="card"><div class="top">'
+      + '<span class="host">' + esc(host(url) || 'The wire') + '</span>'
+      + '<span class="when">' + esc(label || url) + '</span>'
+      + '<a class="out" target="_blank" rel="noopener" href="' + esc(url) + '">The original &#8599;</a>'
+      + '<button type="button" class="shut" title="Close (Esc)">&#10005;</button>'
+      + '</div><div class="col"><div class="wait"><i></i><span>Fetching the story from '
+      + esc(host(url) || 'the wire') + '&hellip;</span></div></div></div>';
+    wrap.addEventListener('click', function(e){ if(e.target === wrap) shut(); });
+    wrap.querySelector('.shut').onclick = shut;
+    document.body.appendChild(wrap);
+    document.addEventListener('keydown', keys);
+    return wrap.querySelector('.card');
+  }
+  function paint(card, row, url){
+    var col = card.querySelector('.col'), top = card.querySelector('.top');
+    top.querySelector('.host').textContent = row.host || host(url) || 'The wire';
+    var line = [row.byline ? ('By ' + row.byline) : '', when(row.published)].filter(Boolean).join(' · ');
+    top.querySelector('.when').textContent = row.title || line || url;
+    var out = [];
+    if(!(row.paragraphs || []).length){
+      out.push('<div class="oops"><b>The story would not come.</b><p>'
+        + esc(row.error || 'The reader got nothing back.') + '</p>'
+        + '<p>The original is one click away, top right — some sites will only '
+        + 'open for a browser that carries their cookies.</p></div>');
+      col.innerHTML = out.join('');
+      col.scrollTop = 0;
+      return;
+    }
+    out.push('<h1>' + esc(row.title || 'Untitled') + '</h1>');
+    if(line) out.push('<p class="by">' + esc(line) + '</p>');
+    var pics = row.images || [];
+    if(pics.length) out.push('<img src="' + esc(pics[0]) + '" alt="" onerror="this.remove()">');
+    var blocks = (row.blocks && row.blocks.length)
+      ? row.blocks
+      : (row.paragraphs || []).map(function(t){ return {k: 'p', t: t}; });
+    var inList = false;
+    blocks.forEach(function(b){
+      var kind = b && b.k ? b.k : 'p', text = b && b.t ? b.t : '';
+      if(!text) return;
+      if(kind === 'li'){
+        if(!inList){ out.push('<ul>'); inList = true; }
+        out.push('<li>' + esc(text) + '</li>');
+        return;
+      }
+      if(inList){ out.push('</ul>'); inList = false; }
+      if(kind === 'h') out.push('<h4>' + esc(text) + '</h4>');
+      else if(kind === 'q') out.push('<p class="q">' + esc(text) + '</p>');
+      else out.push('<p>' + esc(text) + '</p>');
+    });
+    if(inList) out.push('</ul>');
+    if(pics.length > 1){
+      out.push('<div class="plates">');
+      pics.slice(1, 4).forEach(function(u){
+        out.push('<img src="' + esc(u) + '" alt="" loading="lazy" onerror="this.remove()">');
+      });
+      out.push('</div>');
+    }
+    out.push('<p class="foot">' + esc(row.host || host(url))
+      + (row.cached ? ' · read off the station’s shelf' : ' · fetched just now')
+      + ' · ' + (row.paragraphs || []).length + ' paragraphs</p>');
+    col.innerHTML = out.join('');
+    col.scrollTop = 0;
+  }
+  function read(url, label){
+    if(!url) return;
+    var mine = ++seq, card = shell(url, label);
+    fetch('/api/news/read?url=' + encodeURIComponent(url), {credentials: 'same-origin'})
+      .then(function(r){
+        return r.json().catch(function(){ return {error: 'The station answered ' + r.status + '.'}; });
+      })
+      .then(function(row){ if(mine === seq && wrap) paint(card, row || {}, url); })
+      .catch(function(err){
+        if(mine === seq && wrap) paint(card, {error: String((err && err.message) || err)}, url);
+      });
+  }
+  window.paperReadStory = read;
+  document.addEventListener('click', function(e){
+    var a = e.target && e.target.closest ? e.target.closest('a[data-read]') : null;
+    if(!a) return;
+    if(e.metaKey || e.ctrlKey || e.shiftKey || e.button === 1) return;   /* let it open the original */
+    e.preventDefault();
+    var u = a.getAttribute('data-read');
+    if(!u) return;
+    try{
+      if(window.parent && window.parent !== window && typeof window.parent.paperReadOpen === 'function'){
+        window.parent.paperReadOpen(u, (a.textContent || '').trim());
+        return;
+      }
+    }catch(err){ /* a cross-origin parent: read it here instead */ }
+    read(u, (a.textContent || '').trim());
+  });
+})();
+"""
+
+
 _PAPER_CSS_COMMON = r"""
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
-p{margin:0 0 9px;text-align:justify;hyphens:auto}
+p{margin:0 0 9px;text-align:justify;hyphens:auto;orphans:2;widows:2}
 ul{margin:0 0 10px;padding-left:18px}li{margin:0 0 3px}
 img{max-width:100%}
-.page{position:relative;margin:0 auto 22px;page-break-after:always;break-after:page}
-.page:last-child{margin-bottom:0}
+.sheetwrap{width:100%;overflow:hidden}
+.sheet{margin:0 auto;transform-origin:top center}
+/* #1047 THE SHEET: a page is a fixed box. Its width and height come from
+   the style's proportion (set per edition beside these rules); nothing may
+   leave it, and its furniture sits outside the measure. */
+.page{position:relative;display:flex;flex-direction:column;overflow:hidden;
+ margin:0 auto 22px;page-break-after:always;break-after:page}
+.page:last-of-type{margin-bottom:0}
+.pgtop{flex:0 0 auto}
+.pgbody{flex:1 1 auto;min-height:0;overflow:hidden;display:flex;flex-direction:column}
+.pgfoot{flex:0 0 auto;margin-top:auto}
+/* column-fill:auto, never balance: a column is filled to the foot and the
+   next one started, which is what a newspaper does and what makes the
+   height of a flow mean something. */
+.flow{column-fill:auto;overflow:hidden;flex:0 0 auto}
+.fitend{display:block;height:0;overflow:hidden;font-size:0;line-height:0}
+.wideblock{overflow:hidden;flex:0 0 auto}
+.front{display:grid;gap:0 26px;align-items:start;overflow:hidden;flex:0 0 auto}
+.front .main{min-width:0;overflow:hidden}
+.front .side{min-width:0}
+.lead-body{column-fill:auto;overflow:hidden}
 .kicker{display:inline-block;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:var(--red);margin:0 0 4px}
 .byline{font-size:10.5px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink2);margin:0 0 8px}
 .byline .sec{color:var(--red);font-weight:700}
+/* #1047: a plate has a declared aspect, so its height is known before it
+   loads and it can never grow past the column it sits in. */
 figure.plate{margin:0 0 8px;break-inside:avoid}
-figure.plate img{width:100%;display:block;object-fit:cover;background:#ddd6c4}
+figure.plate img{width:100%;display:block;object-fit:cover;background:#ddd6c4;aspect-ratio:4/3;max-height:330px}
+figure.plate.wide img{aspect-ratio:16/9}
 figure.plate.top img{object-position:center top}figure.plate.bottom img{object-position:center bottom}
 figure.plate figcaption,.caption{font-size:11px;color:var(--ink2);margin:4px 0 6px;line-height:1.3;text-align:left}
 figure.plate figcaption b{font-weight:700;color:var(--ink)}
@@ -96944,7 +101454,7 @@ figure.plate .credit{float:right;font-size:9px;text-transform:uppercase;letter-s
 .plates figure.plate{margin:0}.plates figure.plate img{aspect-ratio:4/3}
 .stats{display:flex;flex-wrap:wrap;gap:8px;margin:6px 0 10px;break-inside:avoid}
 .stat{flex:1 1 90px;max-width:230px;padding:6px 8px;border-top:3px solid var(--red)}
-.stat b{display:block;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:900;font-size:34px;line-height:1;letter-spacing:-.02em}
+.stat b{display:block;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:900;font-size:28px;line-height:1;letter-spacing:-.02em}
 .stat span{display:block;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2);margin-top:3px}
 .box{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);padding:6px 0 4px;margin:6px 0 12px;break-inside:avoid;font-size:12.5px}
 .box h4{margin:0 0 4px;font-size:11px;text-transform:uppercase;letter-spacing:.14em}
@@ -96954,19 +101464,23 @@ figure.plate .credit{float:right;font-size:9px;text-transform:uppercase;letter-s
 .serial h4{margin:0 0 2px;font-size:12px;text-transform:uppercase;letter-spacing:.12em}
 .serial .part{font-size:26px;font-weight:900;font-family:"Helvetica Neue",Arial,sans-serif;line-height:1;margin:2px 0 6px;color:var(--red)}
 .serial p{text-align:left;margin:0 0 5px}.serial p b{text-transform:uppercase;font-size:10.5px;letter-spacing:.1em}
-.quotes{margin:8px 0 12px;break-inside:avoid}
+.quotes{margin:8px 0 12px}
 .quotes h4{margin:0 0 6px;font-size:11px;text-transform:uppercase;letter-spacing:.14em}
-.quote{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:start;padding:5px 0;border-top:1px dotted var(--faint);font-size:12.5px;line-height:1.35}
+.quote{display:grid;grid-template-columns:1fr auto;gap:2px 8px;align-items:start;padding:5px 0;border-top:1px dotted var(--faint);font-size:12.5px;line-height:1.35;break-inside:avoid}
 .quote .who{grid-column:1/3;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--red)}
 .quote .text{font-style:italic}
 .quote .ctl{display:flex;gap:3px;white-space:nowrap}
 .quote button,.quote a{font:700 11px/1 "Helvetica Neue",Arial,sans-serif;border:1px solid var(--ink);background:var(--paper);color:var(--ink);border-radius:3px;padding:3px 6px;cursor:pointer;text-decoration:none}
 .quote button:hover,.quote a:hover{background:var(--ink);color:var(--paper)}
-table.agate{width:100%;border-collapse:collapse;font-size:11px;margin:6px 0 10px;font-family:"Helvetica Neue",Arial,sans-serif;break-inside:avoid}
+/* #1047: a table that is wider than its column shrinks into it and, at the
+   very worst, scrolls inside its own box - it never walks off the sheet. */
+.tblwrap{max-width:100%;margin:6px 0 10px}
+table.agate{width:100%;border-collapse:collapse;font-size:11px;margin:0;font-family:"Helvetica Neue",Arial,sans-serif;table-layout:fixed}
+table.agate tr{break-inside:avoid}table.agate thead{break-after:avoid}
 table.agate th{border-bottom:1px solid var(--ink);text-align:left;padding:3px 4px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:9.5px}
 table.agate td{padding:3px 4px;border-bottom:1px dotted #c8c0ad;vertical-align:top}
+table.agate td,table.agate th{overflow-wrap:anywhere;word-break:break-word}
 table.agate td:last-child,table.agate th:last-child{text-align:right}
-table.agate td:first-child,table.agate th:first-child{white-space:nowrap}
 svg.chart{width:100%;height:auto;display:block;margin:6px 0 2px;break-inside:avoid}
 svg.chart .grid{stroke:#d3cbb8;stroke-width:1}
 svg.chart .tick,svg.chart .lab,svg.chart .val,svg.chart .pct{font-family:"Helvetica Neue",Arial,sans-serif;font-size:21px;fill:var(--ink2)}
@@ -96977,17 +101491,19 @@ svg.chart .line{fill:none;stroke:var(--red);stroke-width:2.4}
 svg.chart .dot{fill:var(--paper);stroke:var(--red);stroke-width:2}
 svg.chart .slice.s0{fill:#1b1a17}svg.chart .slice.s1{fill:#c8102e}svg.chart .slice.s2{fill:#1d3a6e}svg.chart .slice.s3{fill:#b08a3e}
 svg.chart .slice.s4{fill:#3d6b4f}svg.chart .slice.s5{fill:#7a4a8b}svg.chart .slice.s6{fill:#8a7f6a}svg.chart .slice.s7{fill:#c85a2a}
-svg.cloud{width:100%;height:auto;display:block;margin:4px 0 8px;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800}
+svg.cloud{width:100%;height:auto;aspect-ratio:640/380;display:block;margin:4px 0 8px;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800}
 svg.cloud .w0{fill:var(--ink)}svg.cloud .w1{fill:var(--red)}svg.cloud .w2{fill:#1d3a6e}svg.cloud .w3{fill:var(--ink2)}
-.plexus{position:relative;min-height:360px;margin:4px 0 8px;background:#0b0f16;border:1px solid var(--ink)}
-svg.plexus{width:100%;height:auto;display:block}
+.plexus{position:relative;height:300px;overflow:hidden;margin:4px 0 8px;background:#0b0f16;border:1px solid var(--ink)}
+svg.plexus{width:100%;height:300px;display:block}
 svg.plexus .edge{stroke:#c8102e;stroke-opacity:.45;stroke-width:1.2}
 svg.plexus .node{fill:#e9e2d0}svg.plexus .node.g0{fill:#c8102e}svg.plexus .node.g2{fill:#7fa7e6}svg.plexus .node.g3{fill:#8a7f6a}
 svg.plexus .nlab{font-family:"Helvetica Neue",Arial,sans-serif;font-size:10px;fill:#e9e2d0}
-.plexus-canvas{display:block;width:100%;height:360px}
+.plexus-canvas{display:block;width:100%;height:300px}
 .plexus-labels span{position:absolute;transform:translate(-50%,0);font:10px/1.1 "Helvetica Neue",Arial,sans-serif;color:#e9e2d0;pointer-events:none;transition:opacity .4s;white-space:nowrap}
-.classifieds{display:grid;grid-template-columns:repeat(4,1fr);gap:0;border:1px solid var(--ink);margin:6px 0 12px;font-size:11px;line-height:1.3;font-family:"Helvetica Neue",Arial,sans-serif}
-.classifieds .ad{padding:6px 7px;border-right:1px dotted var(--faint);border-bottom:1px dotted var(--faint)}
+.pause-extras h3{margin:4px 0 3px}
+.pause-extras .caption{margin:2px 0 6px}
+.classifieds{column-count:4;column-gap:0;border:1px solid var(--ink);border-bottom:0;column-rule:1px dotted var(--faint);margin:6px 0 12px;font-size:11px;line-height:1.3;font-family:"Helvetica Neue",Arial,sans-serif}
+.classifieds .ad{padding:6px 7px;border-bottom:1px dotted var(--faint);break-inside:avoid}
 .classifieds .ad b{display:block;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
 .classifieds .ad .price{font-weight:900;color:var(--red)}.classifieds .ad .contact{color:var(--ink2);font-style:italic;display:block}
 .classifieds .ad.display{background:var(--tint)}.classifieds .ad.display img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;margin:0 0 4px}
@@ -97002,11 +101518,33 @@ svg.plexus .nlab{font-family:"Helvetica Neue",Arial,sans-serif;font-size:10px;fi
 .notice{background:var(--ink);color:var(--paper);text-align:center;font-family:"Helvetica Neue",Arial,sans-serif;font-weight:800;letter-spacing:.14em;text-transform:uppercase;font-size:12px;padding:6px 10px;margin:0 0 8px}
 .notice.paused{background:var(--red)}
 .pgtabs{display:none}
+/* #1047: the jump line and the continuation head. */
+.jump{margin:2px 0 0;text-align:right;font:italic 700 11.5px/1.3 Georgia,serif;color:var(--red);text-transform:none;break-before:avoid}
+.jump b{font-style:normal}
+.conthead{border-top:3px solid var(--ink);border-bottom:1px solid var(--ink);padding:3px 0;margin:0 0 7px;font:800 12px/1.25 "Helvetica Neue",Arial,sans-serif;text-transform:uppercase;letter-spacing:.08em;break-after:avoid}
+.conthead i{font-weight:400;text-transform:none;letter-spacing:0;color:var(--ink2)}
+article.cont .body p:first-of-type::first-letter{float:none;font-size:inherit;padding:0;font-weight:inherit;line-height:inherit;color:inherit}
+/* #1047: THE FILLERS - the small ads that take every crack, set in the
+   dense agate of a real classified page. */
+.fillrun{margin:6px 0 0}
+.fillhead{border-top:2px solid var(--ink);border-bottom:1px solid var(--ink);font:900 9.5px/1.5 "Helvetica Neue",Arial,sans-serif;text-transform:uppercase;letter-spacing:.22em;text-align:center;margin:0 0 5px;break-after:avoid}
+.filler{border:1px solid var(--ink);padding:4px 6px 3px;margin:0 0 6px;font:400 10.5px/1.28 "Helvetica Neue",Arial,sans-serif;break-inside:avoid;background:var(--paper);color:var(--ink)}
+.filler b{display:block;font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:.04em}
+.filler .fb{display:block;margin-top:2px;color:var(--ink2);text-align:justify;hyphens:auto}
+.filler .fp{font-weight:900;color:var(--red);margin-right:5px}
+.filler .fc{display:block;font-style:italic;color:var(--faint);font-size:9.5px}
+.filler img{width:100%;display:block;aspect-ratio:4/3;object-fit:cover;margin:0 0 3px;border:1px solid var(--ink)}
+.filler.poster{border:3px double var(--ink);text-align:center;padding:5px 6px 4px}
+.filler.poster img{aspect-ratio:1/1;filter:sepia(.35) contrast(1.15)}
+.filler.poster b{font-size:12px;letter-spacing:.12em}
+.filler.poster .fb{text-align:center;hyphens:none}
+.filler.rule{border:0;border-top:2px solid var(--ink);border-bottom:2px solid var(--ink);text-align:center;font-weight:900;text-transform:uppercase;letter-spacing:.18em;padding:2px 0;font-size:9.5px}
+.filler.k-crime,.filler.k-wanted{border-width:2px}
 article.hint-obituary{border-top:6px solid var(--ink)}.hint-obituary figure.plate img{filter:grayscale(1) contrast(1.1)}
 .hint-obituary h2::before{content:"In memoriam";display:block;font-family:Georgia,serif;font-style:italic;font-weight:400;font-size:12px;letter-spacing:.08em;color:var(--ink2)}
 article.hint-wanted,article.hint-crime{border:4px double var(--ink);padding:10px 12px 6px;background:var(--tint)}
-.hint-wanted .kicker,.hint-crime .kicker{display:block;text-align:center;font-size:34px;letter-spacing:.2em;color:var(--ink);margin:0 0 6px;line-height:1}
-.hint-crime .kicker{background:var(--red);color:#fff;font-size:20px;padding:6px 0}
+.hint-wanted .kicker,.hint-crime .kicker{display:block;text-align:center;font-size:26px;letter-spacing:.2em;color:var(--ink);margin:0 0 6px;line-height:1}
+.hint-crime .kicker{background:var(--red);color:#fff;font-size:18px;padding:5px 0}
 .hint-wanted h2,.hint-crime h2{text-align:center}
 .hint-wanted figure.plate img{border:3px solid var(--ink);aspect-ratio:1/1;filter:sepia(.35) contrast(1.15)}
 .hint-wanted blockquote.pull{border:0;font-family:"Helvetica Neue",Arial,sans-serif;font-style:normal;font-weight:900;text-transform:uppercase;font-size:15px}
@@ -97015,7 +101553,8 @@ article.hint-forsale{border:2px dashed var(--ink);padding:8px 10px 4px}
 .hint-business{border-top:4px solid #1d5a3a}.hint-business .kicker{color:#1d5a3a}.hint-business .stat{border-top-color:#1d5a3a}
 .hint-sports table.agate th{background:var(--ink);color:var(--paper);border-bottom:0}
 .hint-sports table.agate tr:first-child td{font-weight:900}
-.hint-minutes .body{font-family:"Courier New",Courier,monospace;font-size:12.5px}
+.hint-minutes .body{font-family:"Courier New",Courier,monospace;font-size:12px}
+.hint-minutes .body p{text-align:left;hyphens:none}
 .hint-minutes .body h4{font-family:"Courier New",Courier,monospace;text-decoration:underline}
 .hint-testimonial .quotes{border-top:3px solid var(--ink)}
 .hint-testimonial .quote .text{font-size:14px}
@@ -97027,64 +101566,85 @@ article.hint-apology{background:#fbf3d7;border:1px solid #d9c98a;padding:14px 16
 .hint-itinerary .box li{border-bottom:1px dotted var(--faint);padding:2px 0;list-style:none}
 .hint-itinerary .box ol,.hint-itinerary .box ul{padding-left:0}
 .hint-itinerary .box li::before{content:"\25B8";color:var(--red);margin-right:6px;font-weight:700}
-.hint-interview .interview,.hint-classified .classifieds{break-inside:avoid}
+/* #1045: a covered headline is a door. The link keeps the paper's colour;
+   the reader that opens behind it is the paper's own type in one column. */
+a.readable{color:var(--red);text-decoration:none;cursor:pointer;border-bottom:1px dotted var(--red)}
+a.readable:hover{background:var(--red);color:var(--paper);border-bottom-color:transparent}
+.sources a.readable{border-bottom:0}
+.sources a.readable::after{content:"\2009\25B8";font-size:.9em}
+.sources .read-note{color:var(--faint);font-style:italic}
+a.readable.head{color:inherit;border-bottom:1px solid var(--red)}
+a.readable.head:hover{background:var(--tint);color:inherit;border-bottom-color:var(--red)}
+.rdr{position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;background:rgba(14,11,7,.84);padding:16px}
+.rdr .card{width:min(780px,96vw);max-height:92vh;display:flex;flex-direction:column;background:var(--paper);border:1px solid var(--ink);box-shadow:0 26px 90px rgba(0,0,0,.55)}
+.rdr .top{display:flex;align-items:center;gap:10px;flex:none;padding:8px 14px;border-bottom:2px solid var(--ink);background:var(--tint);font-family:"Helvetica Neue",Arial,sans-serif}
+.rdr .top .host{font-weight:900;text-transform:uppercase;letter-spacing:.13em;font-size:11px;color:var(--red);white-space:nowrap}
+.rdr .top .when{font-size:11px;color:var(--ink2);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rdr .top a.out,.rdr .top button{font:700 11px/1 "Helvetica Neue",Arial,sans-serif;border:1px solid var(--ink);background:var(--paper);color:var(--ink);padding:4px 8px;border-radius:3px;cursor:pointer;text-decoration:none;white-space:nowrap}
+.rdr .top a.out:hover,.rdr .top button:hover{background:var(--ink);color:var(--paper)}
+.rdr .col{overflow:auto;padding:24px 34px 30px;font-family:Georgia,"Times New Roman","Liberation Serif",serif;font-size:15.5px;line-height:1.64;color:var(--ink)}
+.rdr .col h1{font-family:Georgia,"Times New Roman",serif;font-weight:700;font-size:32px;line-height:1.12;letter-spacing:-.01em;margin:0 0 8px;text-align:left}
+.rdr .col .by{font-family:"Helvetica Neue",Arial,sans-serif;font-size:11px;text-transform:uppercase;letter-spacing:.12em;color:var(--ink2);margin:0 0 16px;padding:0 0 10px;border-bottom:1px solid var(--faint);text-align:left}
+.rdr .col p{margin:0 0 15px;text-align:left;hyphens:none}
+.rdr .col p.q{border-left:3px solid var(--red);padding:2px 0 2px 14px;font-style:italic;color:var(--ink2)}
+.rdr .col h4{font-family:"Helvetica Neue",Arial,sans-serif;font-weight:900;font-size:13px;text-transform:uppercase;letter-spacing:.1em;margin:22px 0 8px}
+.rdr .col ul{margin:0 0 15px;padding-left:20px}.rdr .col li{margin:0 0 5px}
+.rdr .col img{width:100%;display:block;margin:0 0 6px;background:#ddd6c4}
+.rdr .col .plates{margin:18px 0 0;border-top:1px solid var(--faint);padding-top:14px}
+.rdr .col .foot{margin:18px 0 0;padding-top:10px;border-top:1px solid var(--faint);font-family:"Helvetica Neue",Arial,sans-serif;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint)}
+.rdr .wait{display:flex;align-items:center;gap:12px;padding:40px 0;color:var(--ink2);font-family:"Helvetica Neue",Arial,sans-serif;font-size:13px}
+.rdr .wait i{width:20px;height:20px;flex:none;border:2px solid var(--faint);border-top-color:var(--red);border-radius:50%;animation:rdrspin 0.8s linear infinite}
+@keyframes rdrspin{to{transform:rotate(360deg)}}
+.rdr .oops{padding:26px 0 10px}
+.rdr .oops b{display:block;font-family:"Helvetica Neue",Arial,sans-serif;font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--red);margin:0 0 10px}
+.rdr .oops p{margin:0 0 10px}
+@media print{.rdr{display:none!important}}
 """
 
 _PAPER_CSS = r"""
 :root{--ink:#1b1a17;--ink2:#4a4741;--rule:#1b1a17;--paper:#f6f1e6;--paper2:#d8d1c0;--red:#c8102e;--accent:#c8102e;--faint:#9c9686;--tint:#efe8d6}
-body{color:var(--ink);font-family:Georgia,"Times New Roman","Liberation Serif",serif;font-size:14.5px;line-height:1.42;background:var(--paper2)}
-.sheet{max-width:1240px;margin:0 auto;padding:18px 0}
-.page{max-width:1240px;background:var(--paper);padding:22px 30px 30px;box-shadow:0 8px 30px rgba(0,0,0,.28)}
+body{color:var(--ink);font-family:Georgia,"Times New Roman","Liberation Serif",serif;font-size:13.5px;line-height:1.40;background:var(--paper2)}
+.sheetwrap{padding:18px 0}
+.page{background:var(--paper);box-shadow:0 8px 30px rgba(0,0,0,.28)}
 .ears{display:flex;justify-content:space-between;gap:16px;font-size:11px;color:var(--ink2);border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);padding:4px 0;text-transform:uppercase;letter-spacing:.06em}
 .ears b{color:var(--ink)}.ears .tag{color:var(--red);font-weight:700}
-h1.masthead{font-family:"Old English Text MT","UnifrakturMaguntia","Cloister Black","Blackmoor LET","Lucida Blackletter","Textura",Georgia,serif;font-weight:400;text-align:center;font-size:66px;letter-spacing:.005em;margin:12px 0 2px;line-height:1}
+h1.masthead{font-family:"Old English Text MT","UnifrakturMaguntia","Cloister Black","Blackmoor LET","Lucida Blackletter","Textura",Georgia,serif;font-weight:400;text-align:center;font-size:62px;letter-spacing:.005em;margin:8px 0 2px;line-height:1}
 .motto{text-align:center;font-style:italic;color:var(--ink2);font-size:12.5px;margin:0 0 6px}
-.dateline{display:flex;justify-content:space-between;border-top:3px double var(--rule);border-bottom:1px solid var(--rule);padding:4px 0;font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;margin:0 0 14px}
-.front{display:grid;grid-template-columns:1fr 292px;gap:0 26px;align-items:start}
-.front .main{border-right:1px solid #d9d2c1;padding-right:26px;min-width:0}
-.front .side{min-width:0}
-.lead h2{font-size:52px;line-height:.98;margin:0 0 10px;font-weight:700;letter-spacing:-.02em}
+.dateline{display:flex;justify-content:space-between;border-top:3px double var(--rule);border-bottom:1px solid var(--rule);padding:4px 0;font-size:11.5px;text-transform:uppercase;letter-spacing:.08em;margin:0 0 10px}
+.front .main{border-right:1px solid #d9d2c1;padding-right:26px}
+.lead h2{font-size:46px;line-height:.98;margin:0 0 8px;font-weight:700;letter-spacing:-.02em}
 .lead .deck{font-size:19px;font-style:italic;color:var(--ink2);margin:0 0 8px;line-height:1.3}
-.lead figure.plate img{max-height:520px}
-.lead .body{column-count:3;column-gap:24px;column-rule:1px solid #d9d2c1;margin-top:6px}
-.lead .body p:first-of-type::first-letter{float:left;font-size:62px;line-height:.8;padding:6px 8px 0 0;font-weight:700}
+.lead figure.plate img{max-height:320px}
+.pgbody>article,.pgbody>.wideblock{flex:0 0 auto;overflow:hidden}
+.lead-body{column-rule:1px solid #d9d2c1;column-gap:22px;margin-top:6px}
+.lead-body p:first-of-type::first-letter{float:left;font-size:56px;line-height:.8;padding:6px 8px 0 0;font-weight:700}
 .side .story{border-top:3px solid var(--red);padding-top:6px}
 .side .story h2{font-size:19px}
-.side .story .body{font-size:13px}
-.side .story figure.plate img{max-height:180px}
-.side .story .stat b{font-size:40px}
 .hl{margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--red);font-weight:700}
-.pghead{display:grid;grid-template-columns:1fr auto 1fr;align-items:baseline;border-bottom:3px double var(--rule);padding:0 0 4px;margin:0 0 12px;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
-.pghead .mh{font-family:"Old English Text MT","UnifrakturMaguntia","Cloister Black","Blackmoor LET","Lucida Blackletter",Georgia,serif;font-size:26px;text-transform:none;letter-spacing:0;color:var(--ink)}
-.pghead .folio{text-align:right}.pghead .folio b{font-size:20px;color:var(--ink);font-family:"Helvetica Neue",Arial,sans-serif}
+.pghead{display:grid;grid-template-columns:1fr auto 1fr;align-items:baseline;border-bottom:3px double var(--rule);padding:0 0 4px;margin:0 0 10px;font-size:11px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
+.pghead .mh{font-family:"Old English Text MT","UnifrakturMaguntia","Cloister Black","Blackmoor LET","Lucida Blackletter",Georgia,serif;font-size:22px;text-transform:none;letter-spacing:0;color:var(--ink)}
+.pghead .folio{text-align:right}.pghead .folio b{font-size:18px;color:var(--ink);font-family:"Helvetica Neue",Arial,sans-serif}
 .section{border-top:1px solid var(--rule);margin:0 0 8px;padding-top:3px;font-size:11.5px;text-transform:uppercase;letter-spacing:.18em;font-weight:700;break-after:avoid}
 .section i{font-style:normal;color:var(--red)}
-.flow{column-count:4;column-gap:24px;column-rule:1px solid #d9d2c1}
-.p1flow{border-top:3px double var(--rule);padding-top:12px;margin-top:14px}
-.story{margin:0 0 16px;padding:0 0 10px;border-bottom:1px solid #d9d2c1}
-.story.short{break-inside:avoid-column}
-.flow.n1{column-count:3}.flow.n1 .story.short,.flow.n2 .story.short{break-inside:auto}
-.story h2{font-size:21px;line-height:1.1;margin:0 0 5px;font-weight:700;break-after:avoid;letter-spacing:-.01em}
-.story .deck{font-size:14px;font-style:italic;color:var(--ink2);margin:0 0 6px;line-height:1.3}
-.story.span{border-top:1px solid var(--rule);padding-top:10px;margin-top:6px}
+.flow{column-rule:1px solid #d9d2c1}
+.story{margin:0 0 14px;padding:0 0 9px;border-bottom:1px solid #d9d2c1}
+.story h2{font-size:19px;line-height:1.08;margin:0 0 5px;font-weight:700;break-after:avoid;letter-spacing:-.01em}
+.story .deck{font-size:13px;font-style:italic;color:var(--ink2);margin:0 0 6px;line-height:1.3}
+.story.span{border-top:1px solid var(--rule);padding-top:10px;margin:0 0 12px}
 .story.span .body{column-count:2;column-gap:24px}
-.story.span h2{font-size:30px}
-.story.wide .body{column-count:2;column-gap:24px}
+.story.span h2{font-size:28px}
 blockquote.pull{margin:10px 0;padding:8px 0;border-top:2px solid var(--rule);border-bottom:2px solid var(--rule);font-size:18px;line-height:1.25;font-style:italic;text-align:center;break-inside:avoid}
 blockquote.pull::before{content:"\201C";color:var(--red);font-size:30px;line-height:0;vertical-align:-10px;margin-right:4px}
 h3,h4{margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.08em}
 figure.plate img{filter:contrast(1.04) saturate(1.05);border:1px solid #cfc7b3}
-.colophon{border-top:3px double var(--rule);margin-top:20px;padding-top:6px;font-size:10.5px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.folio-foot{display:flex;justify-content:space-between;border-top:1px solid var(--rule);margin-top:18px;padding-top:4px;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
-@media (max-width:980px){.flow{column-count:2}.lead .body{column-count:2}.front{grid-template-columns:1fr}.front .main{border-right:0;padding-right:0}h1.masthead{font-size:46px}.lead h2{font-size:34px}.classifieds{grid-template-columns:1fr 1fr}}
-@media (max-width:640px){.flow,.lead .body,.story.span .body{column-count:1}.page{padding:14px}h1.masthead{font-size:36px}.lead h2{font-size:27px}.interview{grid-template-columns:1fr}}
+.colophon{border-top:3px double var(--rule);padding-top:5px;font-size:10.5px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.folio-foot{display:flex;justify-content:space-between;border-top:1px solid var(--rule);margin-top:4px;padding-top:4px;font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--ink2)}
 @media print{
- @page{size:A3 landscape;margin:9mm}
- body{background:#fff;font-size:12.5px}
- .sheet{max-width:none;padding:0}
- .page{box-shadow:none;max-width:none;margin:0;padding:6mm 8mm;page-break-after:always;break-after:page}
- .page:last-child{page-break-after:auto;break-after:auto}
- .flow{column-count:5}.lead .body{column-count:4}
+ body{background:#fff}
+ .sheetwrap{padding:0}
+ .sheet{transform:none !important}
+ .page{box-shadow:none;margin:0;page-break-after:always;break-after:page}
+ .page:last-of-type{page-break-after:auto;break-after:auto}
  .plexus-canvas,.plexus-labels{display:none}
  .quote .ctl{display:none}
  figure.plate img{filter:none}
@@ -97094,77 +101654,66 @@ figure.plate img{filter:contrast(1.04) saturate(1.05);border:1px solid #cfc7b3}
 _PAPER_CSS_TABLOID = r"""
 :root{--ink:#111;--ink2:#3a3a3a;--rule:#111;--paper:#fff;--paper2:#c9c9c9;--red:#e2001a;--accent:#e2001a;--navy:#0b2a5b;--yellow:#ffd200;--teal:#008c95;--faint:#8c8c8c;--tint:#fff3b8}
 body{color:var(--ink);font-family:"Helvetica Neue",Arial,"Liberation Sans",sans-serif;font-size:13.5px;line-height:1.36;background:var(--paper2)}
-.sheet{max-width:900px;margin:0 auto;padding:16px 0}
-.page{max-width:900px;background:var(--paper);padding:14px 18px 22px;box-shadow:0 8px 30px rgba(0,0,0,.3)}
-.cond,h1,h2,.splash-head,.kicker-bar,.flash,.band,.tbox h3,.pghead,.roundel,.teaser h3{font-family:"Arial Narrow","Roboto Condensed","Helvetica Neue Condensed","Franklin Gothic Medium",Impact,"Arial Black",sans-serif;font-stretch:condensed}
-.tmast{display:grid;grid-template-columns:1fr 150px;gap:10px;align-items:stretch;margin:0 0 8px}
-.tmast .red{background:var(--red);color:#fff;padding:8px 14px 8px;position:relative}
-.tmast .red h1{margin:0;font-size:78px;line-height:.9;letter-spacing:-.03em;font-weight:900;text-transform:none;font-style:italic}
-.tmast .red .sub{display:flex;gap:14px;font-size:11px;text-transform:uppercase;letter-spacing:.08em;margin-top:6px;font-weight:700}
-.tmast .red .sub span{background:#fff;color:var(--red);padding:2px 6px}
-.roundel{display:flex;flex-direction:column;align-items:center;justify-content:center;border:4px solid var(--ink);border-radius:50%;width:150px;height:150px;font-weight:900;text-align:center;line-height:.9;background:#fff;align-self:center}
-.roundel b{font-size:46px;letter-spacing:-.03em}.roundel.small b{font-size:27px}.roundel span{font-size:10px;text-transform:uppercase;letter-spacing:.1em;margin:0 0 3px}
-.teasers{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:0 0 8px}
-.teaser{display:grid;grid-template-columns:64px 1fr;gap:6px;align-items:center;padding:5px 7px;color:#fff;min-height:64px}
+.sheetwrap{padding:16px 0}
+.page{background:var(--paper);box-shadow:0 8px 30px rgba(0,0,0,.3)}
+.cond,h1,h2,.splash-head,.kicker-bar,.flash,.band,.tbox h3,.pghead,.roundel,.teaser h3,.fillhead,.conthead{font-family:"Arial Narrow","Roboto Condensed","Helvetica Neue Condensed","Franklin Gothic Medium",Impact,"Arial Black",sans-serif;font-stretch:condensed}
+.tmast{display:grid;grid-template-columns:1fr 118px;gap:10px;align-items:stretch;margin:0 0 6px}
+.tmast .red{background:var(--red);color:#fff;padding:6px 12px;position:relative}
+.tmast .red h1{margin:0;font-size:58px;line-height:.9;letter-spacing:-.03em;font-weight:900;text-transform:none;font-style:italic}
+.tmast .red .sub{display:flex;gap:8px;font-size:9.5px;text-transform:uppercase;letter-spacing:.05em;margin-top:5px;font-weight:700;flex-wrap:wrap}
+.tmast .red .sub span{background:#fff;color:var(--red);padding:2px 5px}
+.roundel{display:flex;flex-direction:column;align-items:center;justify-content:center;border:4px solid var(--ink);border-radius:50%;width:118px;height:118px;font-weight:900;text-align:center;line-height:.9;background:#fff;align-self:center}
+.roundel b{font-size:36px;letter-spacing:-.03em}.roundel.small b{font-size:22px}.roundel span{font-size:9px;text-transform:uppercase;letter-spacing:.1em;margin:0 0 3px}
+.teasers{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin:0 0 6px}
+.teaser{display:grid;grid-template-columns:56px 1fr;gap:6px;align-items:center;padding:4px 6px;color:#fff;height:60px;overflow:hidden}
 .teaser.c0{background:var(--navy)}.teaser.c1{background:var(--teal)}.teaser.c2{background:var(--ink)}.teaser.c3{background:#6b1a8b}
-.teaser img{width:64px;height:54px;object-fit:cover;display:block;border:1px solid #fff}
-.teaser h3{margin:0;font-size:17px;line-height:.98;font-weight:900;text-transform:uppercase}
-.teaser small{display:block;font-size:9px;letter-spacing:.1em;text-transform:uppercase;color:var(--yellow);margin-top:2px}
-.kicker-bar{background:#fff;color:var(--red);border:3px solid var(--red);text-align:center;font-size:30px;font-weight:900;text-transform:uppercase;letter-spacing:.02em;padding:2px 8px;margin:0 0 6px;line-height:1.05}
-.splash{position:relative;min-height:420px;background:var(--ink);overflow:hidden;margin:0 0 8px}
+.teaser img{width:56px;height:48px;object-fit:cover;display:block;border:1px solid #fff}
+.teaser h3{margin:0;font-size:15px;line-height:.98;font-weight:900;text-transform:uppercase}
+.teaser small{display:block;font-size:8.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--yellow);margin-top:2px}
+.kicker-bar{background:#fff;color:var(--red);border:3px solid var(--red);text-align:center;font-size:24px;font-weight:900;text-transform:uppercase;letter-spacing:.02em;padding:1px 8px;margin:0 0 5px;line-height:1.05}
+.splash{position:relative;background:var(--ink);overflow:hidden;margin:0 0 6px}
 .splash img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;object-position:center 30%}
 .splash.top img{object-position:center top}.splash.bottom img{object-position:center bottom}
-.splash .flash{position:absolute;right:14px;top:14px;background:var(--red);color:#fff;font-weight:900;font-size:22px;padding:3px 12px;text-transform:uppercase;letter-spacing:.02em;transform:rotate(-3deg);box-shadow:2px 2px 0 #000}
-.splash .head{position:absolute;left:0;bottom:0;right:0;padding:14px 16px 12px;background:linear-gradient(180deg,rgba(0,0,0,0),rgba(0,0,0,.72) 40%,rgba(0,0,0,.9))}
-.splash-head.long{font-size:66px}.splash-head.xl{font-size:52px}
-.splash-head{margin:0;color:#fff;font-size:84px;line-height:.86;font-weight:900;text-transform:uppercase;letter-spacing:-.03em;text-shadow:3px 3px 0 #000,0 0 18px rgba(0,0,0,.8);word-break:break-word}
-.splash .deck{color:#fff;font-size:17px;margin:8px 0 0;font-weight:700;text-align:left;text-shadow:1px 1px 0 #000}
-.splash .cap{position:absolute;left:12px;top:12px;background:rgba(255,255,255,.9);color:var(--ink);font-size:10px;padding:2px 6px;max-width:60%}
-.tfront{display:grid;grid-template-columns:1fr 250px;gap:14px;align-items:start}
-.tfront .main .body{column-count:2;column-gap:16px}
-.tfront .main .body p:first-of-type::first-letter{float:left;font-size:54px;line-height:.8;padding:4px 6px 0 0;font-weight:900;color:var(--red)}
-.tfront .main .byline{margin-top:4px}
-.tbox{padding:8px 10px;margin:0 0 8px;color:#fff;break-inside:avoid}
-.tbox.c0{background:var(--navy)}.tbox.c1{background:var(--teal)}.tbox.c2{background:var(--ink)}.tbox.c3{background:#6b1a8b}.tbox.c4{background:var(--red)}
-.tbox.y{background:var(--yellow);color:var(--ink)}
-.tbox h3{margin:0 0 4px;font-size:22px;line-height:.95;font-weight:900;text-transform:uppercase}
-.tbox p{text-align:left;margin:0 0 4px;font-size:12px}
-.tbox .stat{border-top-color:#fff;padding:4px 0}.tbox .stat b{color:#fff;font-size:30px}.tbox .stat span{color:#fff}
-.tbox.y .stat{border-top-color:var(--ink)}.tbox.y .stat b,.tbox.y .stat span{color:var(--ink)}
-.tbox .box{border-color:var(--ink);color:var(--ink)}.tbox.y .box{background:#fff;border-color:var(--ink);color:var(--ink)}
-.tbox .kicker{background:var(--yellow);color:var(--ink)}.tbox.y .kicker{background:var(--ink);color:var(--yellow)}
-.tbox .more{font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:900;color:var(--yellow)}
-.pghead{display:flex;justify-content:space-between;align-items:center;background:var(--red);color:#fff;padding:4px 10px;font-size:11px;text-transform:uppercase;letter-spacing:.12em;font-weight:900;margin:0 0 10px}
-.pghead .mh{font-size:20px;font-style:italic;letter-spacing:-.02em;text-transform:none;white-space:nowrap}.pghead>span:nth-child(2){flex:1;text-align:center;font-size:10px;padding:0 8px}.pghead .folio{white-space:nowrap}
-.pghead .folio b{font-size:22px;margin-left:6px}
-.band{background:var(--ink);color:#fff;font-size:15px;font-weight:900;text-transform:uppercase;letter-spacing:.14em;padding:3px 10px;margin:10px 0 8px}
+.splash .flash{position:absolute;right:12px;top:12px;background:var(--red);color:#fff;font-weight:900;font-size:18px;padding:3px 10px;text-transform:uppercase;letter-spacing:.02em;transform:rotate(-3deg);box-shadow:2px 2px 0 #000}
+.splash .head{position:absolute;left:0;bottom:0;right:0;padding:12px 14px 10px;background:linear-gradient(180deg,rgba(0,0,0,0),rgba(0,0,0,.72) 40%,rgba(0,0,0,.9))}
+.splash-head.long{font-size:52px}.splash-head.xl{font-size:40px}
+.splash-head{margin:0;color:#fff;font-size:64px;line-height:.86;font-weight:900;text-transform:uppercase;letter-spacing:-.03em;text-shadow:3px 3px 0 #000,0 0 18px rgba(0,0,0,.8);word-break:break-word}
+.splash .deck{color:#fff;font-size:15px;margin:6px 0 0;font-weight:700;text-align:left;text-shadow:1px 1px 0 #000}
+.splash .cap{position:absolute;left:10px;top:10px;background:rgba(255,255,255,.9);color:var(--ink);font-size:10px;padding:2px 6px;max-width:60%}
+.front{gap:0 14px}
+.front .main .lead-body{column-gap:14px}
+.front .main .lead-body p:first-of-type::first-letter{float:left;font-size:46px;line-height:.8;padding:4px 6px 0 0;font-weight:900;color:var(--red)}
+.lead h2{font-size:36px;line-height:.94;margin:0 0 6px;font-weight:900;text-transform:uppercase}
+.lead .deck{font-size:15px;font-weight:700;margin:0 0 6px}
+figure.plate img{max-height:290px}
+.lead figure.plate img{max-height:330px}
+.pgbody>article,.pgbody>.wideblock{flex:0 0 auto;overflow:hidden}
+.pghead{display:flex;justify-content:space-between;align-items:center;background:var(--red);color:#fff;padding:3px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:900;margin:0 0 8px}
+.pghead .mh{font-size:17px;font-style:italic;letter-spacing:-.02em;text-transform:none;white-space:nowrap}.pghead>span:nth-child(2){flex:1;text-align:center;font-size:9px;padding:0 8px}.pghead .folio{white-space:nowrap}
+.pghead .folio b{font-size:18px;margin-left:6px}
+.band{background:var(--ink);color:#fff;font-size:14px;font-weight:900;text-transform:uppercase;letter-spacing:.14em;padding:2px 8px;margin:0 0 6px;break-after:avoid}
 .band.c0{background:var(--navy)}.band.c1{background:var(--teal)}.band.c2{background:var(--red)}.band.c3{background:#6b1a8b}.band.c4{background:var(--ink)}
-.band i{font-style:normal;color:var(--yellow);margin-left:8px;font-weight:400;letter-spacing:.06em;font-size:11px}
-.flow{column-count:3;column-gap:14px;column-rule:1px solid #ddd}
-.story{margin:0 0 12px;padding:0 0 8px;border-bottom:2px solid var(--ink)}
-.story.short{break-inside:auto}
-.flow.n1{column-count:2}
-.story h2{font-size:30px;line-height:.92;margin:0 0 5px;font-weight:900;text-transform:uppercase;letter-spacing:-.02em;break-after:avoid}
-.story .deck{font-size:13px;font-weight:700;color:var(--ink);margin:0 0 6px;line-height:1.25;text-align:left}
-.story.span{border-top:4px solid var(--red);padding-top:8px;margin-top:6px}
-.story.span .body{column-count:3;column-gap:14px}
-.story.span h2{font-size:44px}
-.story.wide .body{column-count:2;column-gap:14px}
-.story:not(.span):not(.hint-classified) .body p:first-of-type::first-letter{float:left;font-size:44px;line-height:.82;padding:3px 5px 0 0;font-weight:900;color:var(--red)}
-.flash{display:inline-block;background:var(--red);color:#fff;font-weight:900;font-size:13px;padding:2px 8px;text-transform:uppercase;margin:0 0 4px 6px;transform:rotate(-2deg)}
-.kicker{font-size:12px;background:var(--yellow);color:var(--ink);padding:1px 6px}
-blockquote.pull{margin:8px 0;padding:8px 10px;background:var(--ink);color:#fff;font-size:20px;line-height:1.05;font-weight:900;text-transform:uppercase;text-align:left;break-inside:avoid;font-family:"Arial Narrow","Roboto Condensed",Impact,sans-serif}
+.story{margin:0 0 10px;padding:0 0 7px;border-bottom:2px solid var(--ink)}
+.story h2{font-size:26px;line-height:.92;margin:0 0 5px;font-weight:900;text-transform:uppercase;letter-spacing:-.02em;break-after:avoid}
+.story .deck{font-size:12.5px;font-weight:700;color:var(--ink);margin:0 0 6px;line-height:1.25;text-align:left}
+.story.span{border-top:4px solid var(--red);padding-top:8px;margin:0 0 10px}
+.story.span .body{column-count:2;column-gap:14px}
+.story.span h2{font-size:34px}
+.story:not(.span):not(.cont):not(.hint-classified) .body p:first-of-type::first-letter{float:left;font-size:38px;line-height:.82;padding:3px 5px 0 0;font-weight:900;color:var(--red)}
+.flash{display:inline-block;background:var(--red);color:#fff;font-weight:900;font-size:12px;padding:2px 7px;text-transform:uppercase;margin:0 0 4px 6px;transform:rotate(-2deg)}
+.kicker{font-size:11px;background:var(--yellow);color:var(--ink);padding:1px 6px}
+blockquote.pull{margin:8px 0;padding:7px 9px;background:var(--ink);color:#fff;font-size:18px;line-height:1.05;font-weight:900;text-transform:uppercase;text-align:left;break-inside:avoid;font-family:"Arial Narrow","Roboto Condensed",Impact,sans-serif}
 blockquote.pull::before{content:"\201C";color:var(--yellow);margin-right:3px}
-h3,h4{margin:8px 0 4px;font-size:13px;text-transform:uppercase;letter-spacing:.06em;font-weight:900}
-.stat{border-top:0;background:var(--red);color:#fff;padding:6px 8px}.stat b{color:#fff;font-size:32px}.stat span{color:#fff}
+h3,h4{margin:8px 0 4px;font-size:12px;text-transform:uppercase;letter-spacing:.06em;font-weight:900}
+.stat{border-top:0;background:var(--red);color:#fff;padding:6px 8px}.stat b{color:#fff;font-size:28px}.stat span{color:#fff}
 .stats .stat:nth-child(2){background:var(--navy)}.stats .stat:nth-child(3){background:var(--teal)}.stats .stat:nth-child(4){background:var(--ink)}
-.box{border:0;background:var(--yellow);padding:8px 10px}.box h4{font-size:12px}
+.box{border:0;background:var(--yellow);padding:7px 9px}.box h4{font-size:11px}
 .serial{border:0;background:var(--navy);color:#fff}.serial .part{color:var(--yellow)}
-.quotes{background:var(--ink);color:#fff;padding:8px 10px}
-.quotes h4{color:var(--yellow);font-size:14px;letter-spacing:.12em}
+.quotes{background:var(--ink);color:#fff;padding:7px 9px}
+.quotes h4{color:var(--yellow);font-size:13px;letter-spacing:.12em}
 .quote{border-top:1px dotted #666}.quote .who{color:var(--yellow)}.quote .text{font-style:normal;font-weight:700}
 .quote button,.quote a{background:#fff;color:var(--ink);border-color:#fff}.quote button:hover,.quote a:hover{background:var(--red);color:#fff;border-color:var(--red)}
-figure.plate img{border:2px solid var(--ink);aspect-ratio:4/3}
+figure.plate img{border:2px solid var(--ink)}
 figure.plate figcaption{background:var(--ink);color:#fff;padding:3px 6px;margin:0 0 6px;font-size:10.5px;font-weight:700}
 figure.plate figcaption b{color:var(--yellow)}figure.plate .credit{color:#bbb}
 .plates{gap:5px}.plates figure.plate img{aspect-ratio:1/1}
@@ -97172,31 +101721,35 @@ table.agate th{background:var(--ink);color:#fff;border-bottom:0}
 svg.chart .bar{fill:var(--red)}svg.chart .line{stroke:var(--navy)}svg.chart .dot{stroke:var(--navy)}
 svg.chart .slice.s0{fill:#e2001a}svg.chart .slice.s1{fill:#0b2a5b}svg.chart .slice.s2{fill:#ffd200}svg.chart .slice.s3{fill:#008c95}svg.chart .slice.s4{fill:#111}svg.chart .slice.s5{fill:#6b1a8b}
 svg.cloud .w1{fill:var(--red)}svg.cloud .w2{fill:var(--navy)}svg.cloud .w3{fill:var(--teal)}
-.classifieds{grid-template-columns:repeat(3,1fr);border:2px solid var(--ink)}
+.classifieds{column-count:3;border:2px solid var(--ink);border-bottom:0}
 .classifieds .ad b{color:var(--navy)}
 .interview{background:var(--navy);color:#fff;padding:10px;grid-template-columns:170px 1fr}
 .interview .qa .q{color:var(--yellow)}.interview .who small{color:#cfd8ea}
 .interview figure.plate img{border-color:#fff}
-.notice{background:var(--yellow);color:var(--ink);font-size:16px}
+.notice{background:var(--yellow);color:var(--ink);font-size:14px;padding:4px 10px}
 .notice.paused{background:var(--red);color:#fff}
+.jump{color:var(--red);font-family:"Helvetica Neue",Arial,sans-serif;font-style:normal;font-weight:900;text-transform:uppercase;font-size:10.5px;letter-spacing:.06em}
+.conthead{border-top:4px solid var(--red);border-bottom:0;background:var(--ink);color:#fff;padding:3px 6px}
+.conthead i{color:var(--yellow)}
+.fillhead{background:var(--ink);color:#fff;border:0;letter-spacing:.24em;padding:2px 0}
+.filler{border:2px solid var(--ink)}
+.filler b{color:var(--navy)}
+.filler.poster{border:3px solid var(--red)}
+.filler.rule{border-top:3px solid var(--ink);border-bottom:3px solid var(--ink)}
 article.hint-obituary{border-top:8px solid var(--ink)}
 article.hint-wanted,article.hint-crime{border-color:var(--red);background:var(--tint)}
 .hint-crime .kicker{background:var(--red);color:#fff}
 article.hint-report{background:#eef1f7;border-color:var(--navy)}
 article.hint-apology{background:#fffbe6}
 .hint-minutes .body{font-size:12px}
-.colophon{border-top:3px solid var(--ink);margin-top:16px;padding-top:6px;font-size:10px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
-.folio-foot{display:flex;justify-content:space-between;background:var(--ink);color:#fff;margin-top:14px;padding:3px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:900}
-@media (max-width:760px){.flow,.story.span .body,.tfront .main .body{column-count:1}.tfront{grid-template-columns:1fr}.tmast{grid-template-columns:1fr}.roundel{display:none}.splash-head{font-size:52px}.teasers{grid-template-columns:1fr}.classifieds{grid-template-columns:1fr 1fr}.interview{grid-template-columns:1fr}}
+.colophon{border-top:3px solid var(--ink);padding-top:5px;font-size:10px;color:var(--ink2);display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+.folio-foot{display:flex;justify-content:space-between;background:var(--ink);color:#fff;margin-top:4px;padding:3px 10px;font-size:10px;text-transform:uppercase;letter-spacing:.12em;font-weight:900}
 @media print{
- @page{size:A4 portrait;margin:7mm}
- body{background:#fff;font-size:11.5px}
- .sheet{max-width:none;padding:0}
- .page{box-shadow:none;max-width:none;margin:0;padding:0;page-break-after:always;break-after:page}
- .page:last-child{page-break-after:auto;break-after:auto}
- .flow{column-count:2}.story.span .body{column-count:2}
- .splash{min-height:300px}.splash-head{font-size:64px}
- .tmast .red h1{font-size:60px}
+ body{background:#fff}
+ .sheetwrap{padding:0}
+ .sheet{transform:none !important}
+ .page{box-shadow:none;margin:0;page-break-after:always;break-after:page}
+ .page:last-of-type{page-break-after:auto;break-after:auto}
  .plexus-canvas,.plexus-labels{display:none}
  .quote .ctl{display:none}
 }
@@ -97204,35 +101757,804 @@ article.hint-apology{background:#fffbe6}
 """
 
 
-def _paper_style(style: Any) -> str:
-    s = str(style or "").strip().lower()
-    return s if s in PAPER_STYLES else "broadsheet"
+def _paper_metrics(style: str) -> dict[str, Any]:
+    """#1047: the sheet's derived geometry. One declared width, a height
+    from the proportion, and the measure that follows - everything the
+    estimator and the packer read."""
+    S = dict(PAPER_SHEET.get(style) or PAPER_SHEET["broadsheet"])
+    w, h = float(S["w"]), round(float(S["w"]) * float(S["ratio"]))
+    inner = w - 2 * float(S["pad_x"])
+    cols = int(S["cols"])
+    gap = float(S["gap"])
+    S.update({
+        "paper_name": "small ads",
+        # #1047: the paused spread is the cloud at its own aspect (640x380
+        # of viewBox) over the plexus, with two heads and two captions.
+        # LAY: 470 was a guess and left 74px of blank under the plexus in
+        # both styles; 396 is what Chrome measures the furniture at.
+        "extras_h": inner * (380.0 / 640.0) + 396.0,
+        "h": float(h), "inner_w": inner,
+        "col_w": (inner - gap * (cols - 1)) / cols,
+        "line_h": float(S["fs"]) * float(S["lh"]),
+        "cpl_em": float(S["fs"]) * float(S["char"]),
+        "main_w": inner - float(S["side_w"]) - 26.0,
+        "style": style,
+    })
+    return S
 
 
-def _paper_pages(ed: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
-    """#1023: the lead and the pages. A story sits on meta.page (else its
-    section's page), pages hold stories in section order then priority,
-    empty pages are dropped and the rest renumbered so folios run 1..N.
-    A one-page paper with more than the lead and the hour on it is split
-    so it always opens to two."""
-    head = paper_masthead()
-    order = {s["id"]: i for i, s in enumerate(head["sections"])}
-    articles = [a for a in (ed.get("articles") or []) if not a.get("error")]
-    lead = next((a for a in articles
-                 if int((a.get("meta") or {}).get("priority") or 0) == 1), None)
-    if lead is None and articles:
-        lead = articles[0]
-    rest = [a for a in articles if a is not lead]
+def _paper_cpl(w: float, fs: float, char: float) -> float:
+    """Characters that fit on one line of `w` px at this size. Never less
+    than eight, so a narrow box cannot divide by nothing."""
+    return max(8.0, w / max(1.0, fs * char))
 
-    def page_of(a: dict[str, Any]) -> int:
+
+_PAPER_TAG = re.compile(r"<[^>]+>")
+_PAPER_ENT = re.compile(r"&[a-z]+;|&#\d+;")
+
+
+_PAPER_WORD = re.compile(r"\S+")
+# CJK, kana, hangul and the full-width forms: one em each, and a line may
+# break between any two of them (#1047 LAY).
+_PAPER_TOKEN = re.compile(
+    "(\\s+)|([\u1100-\u11ff\u2e80-\u303f\u3041-\u33ff\u3400-\u4dbf"
+    "\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7ff\uf900-\ufaff\ufe30-\ufe4f"
+    "\uff00-\uff60\uffe0-\uffe6])"
+    "|([^\\s\u1100-\u11ff\u2e80-\u303f\u3041-\u33ff\u3400-\u4dbf"
+    "\u4e00-\u9fff\ua960-\ua97f\uac00-\ud7ff\uf900-\ufaff\ufe30-\ufe4f"
+    "\uff00-\uff60\uffe0-\uffe6]+)")
+
+
+def _paper_plain_text(html: str) -> str:
+    """The words a reader sees in a scrap of our own HTML."""
+    return " ".join(_PAPER_ENT.sub("x", _PAPER_TAG.sub(" ", str(html or ""))).split())
+
+
+def _paper_plain_len(html: str) -> int:
+    """The characters a reader sees in a scrap of our own HTML."""
+    return len(_paper_plain_text(html))
+
+
+def _paper_wrap_lines(text: str, cpl: float, em: float = 2.2) -> int:
+    """#1047 (LAY): how many lines `text` runs to at `cpl` characters a
+    line, broken where a browser breaks it. (Named `wrap` because lane
+    G2's desks own `_paper_lines`, which folds said-lines into prompt
+    material - the clash killed five desks before it was caught.)
+
+    chars/cpl is only right when the words happen to fill every line. In a
+    narrow measure - a table cell 40px wide, a small ad, a list item - the
+    last word of each line is carried whole to the next and the real count
+    runs a third higher. This walks the tokens the way the line-breaker
+    does: an ordinary word is carried whole and breaks inside itself only
+    when it is longer than the measure (overflow-wrap:anywhere, which is
+    what the agate tables set), while a full-width glyph costs `em` units
+    and may start a line on its own."""
+    cpl = max(2.0, float(cpl))
+    lines, room, fresh, seen, gap = 1, cpl, True, False, False
+    for m in _PAPER_TOKEN.finditer(str(text or "")):
+        if m.group(1):
+            gap = True
+            continue
+        wide = m.group(2)
+        n = float(em) if wide else float(len(m.group(3)))
+        need = n + (1.0 if (gap and not fresh) else 0.0)
+        gap = False
+        seen = True
+        if need <= room:
+            room -= need
+            fresh = False
+            continue
+        lines += 1                       # this token opens a new line
+        room = cpl
+        while n > cpl:                   # ...and breaks inside itself
+            n -= cpl
+            lines += 1
+        room = cpl - n
+        fresh = False
+    return lines if seen else 0
+
+
+def _paper_est_text(chars: int, w: float, fs: float, char: float,
+                    lh: float, extra: float = 0.0, text: str = "") -> float:
+    """Text -> px: how many lines of this measure it runs to, times the
+    leading, plus the margin. Given the words (`text`) it breaks them the
+    way the browser will; given only a count it falls back to chars/cpl,
+    which is close enough on a wide justified measure (#1047 LAY)."""
+    cpl = _paper_cpl(w, fs, char)
+    lines = (_paper_wrap_lines(text, cpl, 1.0 / max(0.2, char)) if text
+             else math.ceil(chars / cpl))
+    return max(1.0, lines) * fs * lh + extra
+
+
+def _paper_est_block(block: str, w: float, M: dict[str, Any]) -> float:
+    """One block of _md_html's output (it writes one element per line) at
+    column width `w`. Tables and lists are counted row by row."""
+    b = block.strip()
+    if not b:
+        return 0.0
+    fs, lh, char = float(M["fs"]), float(M["lh"]), float(M["char"])
+    if b.startswith("<table") or b.startswith('<div class="tblwrap"'):
+        return _paper_est_table(b, w, M)
+    if b.startswith("<ul"):
+        items = re.findall(r"<li>(.*?)</li>", b, flags=re.S)
+        h = 10.0
+        for it in items:
+            t = _paper_plain_text(it)
+            h += _paper_est_text(len(t), w - 18.0, fs, char, lh, 3.0, t)
+        return h
+    if b.startswith("<blockquote"):
+        t = _paper_plain_text(b)
+        return _paper_est_text(len(t) + 2, w - 4.0, fs * 1.24,
+                               char * 1.06, 1.25, 34.0, t)
+    m = re.match(r"<h([234])", b)
+    if m:
+        t = _paper_plain_text(b)
+        return _paper_est_text(len(t), w, 12.0, 0.5, 1.3, 14.0, t)
+    t = _paper_plain_text(b)
+    return _paper_est_text(len(t), w, fs, char, lh, 9.0, t)
+
+
+_PAPER_TR = re.compile(r"<tr>(.*?)</tr>", re.S)
+_PAPER_TD = re.compile(r"<t[dh][^>]*>(.*?)</t[dh]>", re.S)
+
+
+PAPER_TABLE_FS = 11.0             # table.agate font-size
+PAPER_TABLE_HEAD_FS = 9.5         # its th, in letter-spaced capitals
+PAPER_TABLE_CHAR = 0.55           # measured: Helvetica at 11px in a 40px cell
+PAPER_TABLE_HEAD_CHAR = 0.66      # capitals plus .06em of letter-spacing
+PAPER_TABLE_PAD = 8.0             # td padding, 4px a side
+PAPER_TABLE_ROW = 7.5             # padding and the rule under the row
+PAPER_TABLE_CHROME = 16.0         # .tblwrap margins
+
+
+def _paper_est_table(block: str, w: float, M: Any = None) -> float:
+    """#1047: a table, row by row. table-layout is fixed, so every column
+    is w/n wide; a row is as tall as its tallest cell.
+
+    LAY refit: the cells inherit the sheet's leading (1.40), not a guessed
+    1.30, and their lines are counted word by word - a 40px cell carries
+    four or five characters a line, not the seven chars/cpl claimed. On the
+    records board (4 columns in a 192px column) that moved the estimate
+    from 698px to Chrome's measured 970px."""
+    rows = _PAPER_TR.findall(block)
+    if not rows:
+        return 24.0
+    lh = float((M or {}).get("lh") or 1.40)
+    ncols = max([len(_PAPER_TD.findall(r)) for r in rows] + [1])
+    cw = max(18.0, w / ncols - PAPER_TABLE_PAD)
+    h = 0.0
+    for i, row in enumerate(rows):
+        head = i == 0 and "<th" in row
+        fs = PAPER_TABLE_HEAD_FS if head else PAPER_TABLE_FS
+        ch = PAPER_TABLE_HEAD_CHAR if head else PAPER_TABLE_CHAR
+        cpl = _paper_cpl(cw, fs, ch)
+        cells = [_paper_wrap_lines(_paper_plain_text(c), cpl, 1.0 / ch)
+                 for c in _PAPER_TD.findall(row)] or [1]
+        h += max(1, max(cells)) * fs * lh + PAPER_TABLE_ROW
+    return h + PAPER_TABLE_CHROME
+
+
+def _paper_est_plate(w: float, ar: float, caption: str, M: dict[str, Any],
+                     cap: float = 0.0) -> float:
+    h = min(w * ar, cap or 1e9) + 8.0
+    if caption:
+        h += _paper_est_text(len(str(caption)), w, 11.0, 0.46, 1.3, 8.0)
+    return h
+
+
+def _paper_est_stats(n: int, w: float) -> float:
+    if n <= 0:
+        return 0.0
+    per_row = max(1, int((w + 8.0) // 98.0))
+    return math.ceil(min(n, PAPER_STATS_MOST) / per_row) * 70.0 + 6.0
+
+
+def _paper_est_box(box: Any, w: float, M: dict[str, Any]) -> float:
+    if not isinstance(box, dict):
+        return 0.0
+    items = [str(i) for i in (box.get("items") or []) if str(i).strip()][:24]
+    if not items and not box.get("title"):
+        return 0.0
+    h = 22.0 + (16.0 if box.get("title") else 0.0)
+    for it in items:
+        h += _paper_est_text(len(it), w - 16.0, 12.5, 0.46, 1.3, 3.0, it)
+    return h
+
+
+def _paper_est_serial(serial: Any, w: float) -> float:
+    if not isinstance(serial, dict) or not (serial.get("title") or serial.get("so_far")):
+        return 0.0
+    h = 26.0 + 16.0 + (36.0 if serial.get("part") else 0.0)
+    for k in ("so_far", "next"):
+        if serial.get(k):
+            h += _paper_est_text(len(str(serial[k])) + 16, w - 20.0, 12.5, 0.46, 1.35, 5.0)
+    return h + 12.0
+
+
+def _paper_est_quotes(quotes: Any, w: float) -> float:
+    rows = [q for q in (quotes or []) if isinstance(q, dict)
+            and str(q.get("text") or "").strip()][:10]
+    if not rows:
+        return 0.0
+    h = 8.0 + 22.0
+    for q in rows:
+        _t = str(q.get("text"))
+        h += 18.0 + _paper_est_text(len(_t) + 2, w - 52.0,
+                                    12.5, 0.47, 1.35, 12.0, _t)
+    return h + 12.0
+
+
+def _paper_est_interview(iv: Any, w: float, M: dict[str, Any], qa: Any = None) -> float:
+    if not isinstance(iv, dict):
+        return 0.0
+    rows = list(qa if qa is not None else (iv.get("qa") or []))
+    rows = [x for x in rows if isinstance(x, dict) and x.get("q")][:9]
+    # the portrait, the 16px grid gap and - in the tabloid, which sets the
+    # whole panel on navy - 10px of padding a side (#1047 LAY)
+    tab = str(M["style"]) != "broadsheet"
+    port = 170.0 if tab else 200.0
+    pad = 20.0 if tab else 0.0
+    qw = max(120.0, w - port - 16.0 - pad)
+    h = 28.0 + pad + 46.0        # ...and the sitter's name over the answers
+    for x in rows:
+        _q, _a = str(x.get("q")), str(x.get("a") or "")
+        h += _paper_est_text(len(_q) + 3, qw, 13.0, 0.46, 1.3, 3.0, _q + " xx")
+        h += _paper_est_text(len(_a), qw, 13.0, 0.46, 1.3, 10.0, _a)
+    return max(h, port * 1.34) + 20.0
+
+
+def _paper_est_classifieds(rows: Any, w: float, M: Any = None) -> float:
+    ads = [r for r in (rows or []) if isinstance(r, dict) and (r.get("head") or r.get("body"))][:40]
+    if not ads:
+        return 0.0
+    # the grid's columns are the STYLE's, not the measure's: the broadsheet
+    # sets four and the tabloid three, at any width (#1047 LAY - reading it
+    # off the width made every tabloid grid 15% short)
+    cols = 3 if (M and str(M.get("style") or "") != "broadsheet") else 4
+    if w <= 700 and not M:
+        cols = 3
+    cw = w / cols - 16.0
+    heights = []
+    for r in ads:
+        h = 14.0
+        _hd, _bd = str(r.get("head") or ""), str(r.get("body") or "")
+        h += _paper_est_text(len(_hd), cw, 11.0, 0.5, 1.25, 1.0, _hd)
+        h += _paper_est_text(len(_bd), cw, 11.0, 0.46, 1.3, 2.0, _bd)
+        if r.get("contact"):
+            h += 15.0
+        if r.get("image"):
+            h += cw * 0.75 + 4.0
+        heights.append(h)
+    total = 0.0
+    for i in range(0, len(heights), cols):
+        total += max(heights[i:i + cols])
+    return total + 18.0
+
+
+def _paper_est_chart(chart: Any, w: float) -> float:
+    if not isinstance(chart, dict):
+        return 0.0
+    kind = str(chart.get("kind") or "line")
+    if kind == "pie":
+        if not [v for v in (chart.get("values") or [])]:
+            return 0.0
+        return w * (260.0 / 600.0) + 8.0
+    if len(chart.get("values") or []) < 2:
+        return 0.0
+    return w * (240.0 / 600.0) + 8.0
+
+
+# --- one story, decomposed -------------------------------------------------
+
+def _paper_story_bits(a: dict[str, Any], ctx: dict[str, Any],
+                      mode: str = "story") -> dict[str, Any]:
+    """#1047: a story taken apart into the three things the packer needs -
+    the HEAD that must not be separated from its first paragraph, the BODY
+    as a list of blocks (the only place a jump may cut), and the TAIL that
+    rides with the last block. The renderer and the estimator both read
+    this, so what is measured is exactly what is set."""
+    meta = a.get("meta") or {}
+    style = ctx["style"]
+    section_name = ctx["section_name"]
+    sec = str(meta.get("section") or "front")
+    hint = str(meta.get("style_hint") or "")
+    headline = str(meta.get("headline") or meta.get("title")
+                   or a.get("headline_hint") or "")
+    kicker = str(meta.get("kicker") or "")
+    if hint == "crime" and not kicker:
+        kicker = "Crime stoppers"
+    if hint == "wanted" and not kicker:
+        kicker = "Wanted"
+    on_splash = style == "tabloid" and mode == "lead"
+
+    head: list[str] = []
+    if kicker and not on_splash:
+        head.append(f'<div class="kicker">{_paper_esc(kicker)}</div>')
+    if style == "tabloid" and meta.get("flash") and not on_splash:
+        head.append(f'<span class="flash">{_paper_esc(meta["flash"])}</span>')
+    if not on_splash:
+        head.append(f"<h2>{_paper_esc(headline)}</h2>")
+        if meta.get("deck"):
+            head.append(f'<p class="deck">{_paper_esc(meta["deck"])}</p>')
+    head.append('<p class="byline"><span class="sec">'
+                f'{_paper_esc(section_name.get(sec, sec))}</span>'
+                + (f' &middot; {_paper_esc(meta["byline"])}' if meta.get("byline") else "")
+                + "</p>")
+    image = str(meta.get("image") or meta.get("photo") or "")
+    plate_cls = " wide" if mode == "lead" else ""
+    if image and not (mode == "lead" and style == "tabloid"):
+        head.append(_paper_plate_html(
+            image, meta.get("caption") if not meta.get("chart") else "",
+            meta.get("credit"), meta.get("focus"), headline, plate_cls))
+    # #1047: on the front page the lead's figures - the callouts, the
+    # chart, the running-order box - go in the side column, not down the
+    # middle of the lead. They were 1,467px of furniture on a 1,182px page,
+    # so each is carried with the height it will come to in that column and
+    # the side takes only as many as fit.
+    aw = float(ctx["metrics"]["side_w"]) if mode == "lead" else 0.0
+    M = ctx["metrics"]
+    aside: list[tuple[str, float]] = []
+    # #1047 (LAY): the furniture is kept on its own as well as in the head,
+    # so a continuation MADE of it - the second half of an interview, the
+    # rest of a ruled box - can be set under a continuation head. A story
+    # cut at a paragraph never carries it: it was set with part one.
+    figures: list[str] = []
+
+    def figure(html: str, h: float) -> None:
+        if not html:
+            return
+        if mode == "lead":
+            aside.append((html, h))
+        else:
+            head.append(html)
+            figures.append(html)
+
+    figure(_paper_stats_html(meta.get("stats")),
+           _paper_est_stats(len([x for x in (meta.get("stats") or [])
+                                 if isinstance(x, dict)]), aw or 1.0))
+    chart = meta.get("chart")
+    if isinstance(chart, dict):
+        svg = _paper_svg_chart(chart)
+        if svg:
+            cap = (f'<p class="caption">{_paper_esc(meta["caption"])}</p>'
+                   if meta.get("caption") else "")
+            figure(svg + cap, _paper_est_chart(chart, aw or 1.0)
+                   + (_paper_est_text(len(str(meta.get("caption") or "")), aw or 1.0,
+                                      11.0, 0.46, 1.3, 8.0) if cap else 0.0))
+    figure(_paper_box_html(meta.get("box"), "itin" if hint == "itinerary" else ""),
+           _paper_est_box(meta.get("box"), aw or 1.0, M))
+    figure(_paper_serial_html(meta.get("serial")),
+           _paper_est_serial(meta.get("serial"), aw or 1.0))
+    if hint == "testimonial":
+        figure(_paper_quotes_html(meta.get("quotes"), style, "Testimonials"),
+               _paper_est_quotes(meta.get("quotes"), aw or 1.0))
+    figure(_paper_interview_html(meta.get("interview")),
+           _paper_est_interview(meta.get("interview"), aw or 1.0, M))
+
+    body_html = _md_html(str(a.get("body") or ""))
+    # #1047: a table wider than its column scrolls inside its own box
+    # instead of walking off the sheet.
+    body_html = body_html.replace('<table class="agate">',
+                                  '<div class="tblwrap"><table class="agate">')
+    body_html = body_html.replace("</table>", "</table></div>")
+    if mode != "brief":
+        # #1045: a headline set in bold at the head of a paragraph is the
+        # same story as the source of that name - link it to the reader.
+        body_html = _paper_link_bodies(
+            body_html, [s for s in (meta.get("sources") or [])
+                        if isinstance(s, dict)])
+    blocks = [b for b in body_html.split("\n") if b.strip()]
+    pull = str(meta.get("pull") or "")
+    if pull and mode not in ("lead", "brief"):
+        for i, b in enumerate(blocks):
+            if b.startswith("<p>"):
+                blocks.insert(i + 1, '<blockquote class="pull">'
+                              + _md_inline(pull) + "</blockquote>")
+                break
+        else:
+            blocks.append('<blockquote class="pull">' + _md_inline(pull) + "</blockquote>")
+    elif pull and mode == "lead":
+        head.append(f'<blockquote class="pull">{_md_inline(pull)}</blockquote>')
+    if mode == "brief":
+        first = next((b for b in blocks if b.startswith("<p>")), "")
+        blocks = [first[:280] + "&hellip;</p>"] if first else []
+
+    tail: list[str] = []
+    if mode != "brief":
+        if hint != "testimonial":
+            tail.append(_paper_quotes_html(meta.get("quotes"), style))
+        more = [i for i in (meta.get("images") or []) if isinstance(i, dict) and i.get("url")]
+        if more:
+            tail.append('<div class="plates">' + "".join(
+                _paper_plate_html(i.get("url"), i.get("caption"), i.get("credit"),
+                                  i.get("focus"), headline) for i in more[:6]) + "</div>")
+        tail.append(_paper_classifieds_html(meta.get("classifieds")))
+        srcs = [s for s in (meta.get("sources") or []) if isinstance(s, dict)]
+        if srcs:
+            # #1045: the covered list is the reader's index - each headline
+            # opens the whole story in the paper's own type.
+            linked = any(str(s.get("url") or "").startswith(
+                ("http://", "https://")) for s in srcs)
+            tail.append('<p class="sources">Sources: ' + "; ".join(
+                _paper_read_link(s.get("url"),
+                                 _paper_esc(s.get("name") or s.get("url") or ""))
+                for s in srcs)
+                + ('<span class="read-note"> &mdash; click a headline to read '
+                   'the whole story</span>' if linked else "") + "</p>")
+
+    cls = ["lead" if mode == "lead" else "story"]
+    if hint:
+        cls.append(f"hint-{hint}")
+    return {"head": [h for h in head if h], "blocks": blocks,
+            "tail": [t for t in tail if t], "aside": aside,
+            "figures": [f for f in figures if f],
+            "cls": cls, "meta": meta,
+            "headline": headline, "hint": hint, "mode": mode}
+
+
+# #1047: the style hints that set a story inside a ruled box. The box eats
+# measure and adds height, and both were missing from the estimate - the
+# apology came out a quarter short.
+# (horizontal padding, vertical padding, how much taller the body sets in
+# this treatment's own face). The apology is written out in a script face
+# the estimator has no metrics for and measured 7% short at 1.16 (#1047 LAY).
+_PAPER_BOXED = {"wanted": (24.0, 26.0, 1.0), "crime": (24.0, 26.0, 1.0),
+                "forsale": (20.0, 22.0, 1.0), "report": (24.0, 26.0, 1.0),
+                "apology": (32.0, 34.0, 1.26), "minutes": (0.0, 0.0, 1.0)}
+
+
+def _paper_est_bits(bits: dict[str, Any], w: float, M: dict[str, Any]) -> dict[str, Any]:
+    """The three parts of a story in px at measure `w`."""
+    meta = bits["meta"]
+    mode = bits["mode"]
+    pad_w, pad_h, stretch = _PAPER_BOXED.get(bits["hint"], (0.0, 0.0, 1.0))
+    w = max(80.0, w - pad_w)
+    head = 0.0
+    if bits["mode"] != "lead" or M["style"] != "tabloid":
+        if meta.get("kicker") or bits["hint"] in ("crime", "wanted"):
+            head += 20.0
+        hfs = float(M["lead_fs"] if mode == "lead" else M["head_fs"])
+        hlh = float(M["lead_lh"] if mode == "lead" else M["head_lh"])
+        hch = float(M["lead_char"] if mode == "lead" else M["head_char"])
+        head += _paper_est_text(len(bits["headline"]), w, hfs, hch, hlh, 6.0)
+        if meta.get("deck"):
+            head += _paper_est_text(len(str(meta["deck"])), w,
+                                    float(M["deck_fs"]) * (1.35 if mode == "lead" else 1.0),
+                                    0.46, float(M["deck_lh"]), 7.0)
+    head += 20.0                                    # the byline
+    image = str(meta.get("image") or meta.get("photo") or "")
+    if image and not (mode == "lead" and M["style"] == "tabloid"):
+        ar = float(M["lead_plate_ar"] if mode == "lead" else M["plate_ar"])
+        cap = float(M["lead_plate_max"] if mode == "lead" else M["plate_max"])
+        head += _paper_est_plate(w, ar,
+                                 "" if meta.get("chart") else str(meta.get("caption") or ""),
+                                 M, cap)
+    if mode == "lead":
+        aside = sum(h for _html, h in bits["aside"])
+    else:
+        # the figures are in the head for every story but the lead, and
+        # they are measured at THIS story's own measure
+        aside = 0.0
+        head += _paper_est_stats(len([x for x in (meta.get("stats") or [])
+                                      if isinstance(x, dict)]), w)
+        head += _paper_est_chart(meta.get("chart"), w)
+        if meta.get("chart") and meta.get("caption"):
+            head += _paper_est_text(len(str(meta["caption"])), w, 11.0, 0.46, 1.3, 8.0)
+        head += _paper_est_box(meta.get("box"), w, M)
+        head += _paper_est_serial(meta.get("serial"), w)
+        if bits["hint"] == "testimonial":
+            head += _paper_est_quotes(meta.get("quotes"), w)
+        head += _paper_est_interview(meta.get("interview"), w, M)
+
+    blocks = [_paper_est_block(b, w, M) * stretch for b in bits["blocks"]]
+    head += pad_h
+
+    tail = 0.0
+    if mode != "brief":
+        if bits["hint"] != "testimonial":
+            tail += _paper_est_quotes(meta.get("quotes"), w)
+        more = [i for i in (meta.get("images") or []) if isinstance(i, dict) and i.get("url")]
+        if more:
+            tail += math.ceil(min(len(more), 6) / 2.0) * (w / 2.0 * 0.75 + 10.0) + 10.0
+        tail += _paper_est_classifieds(meta.get("classifieds"), w, M)
+        if [s for s in (meta.get("sources") or []) if isinstance(s, dict)]:
+            tail += 26.0
+    k = float(M.get("est_scale") or 1.0)
+    head, tail = head * k, (tail + 26.0) * k
+    blocks = [b * k for b in blocks]
+    return {"head": head, "blocks": blocks, "tail": tail,
+            "aside": aside * k, "total": head + sum(blocks) + tail}
+
+
+# --- the filler pool -------------------------------------------------------
+
+PAPER_FILLER_LABELS = {
+    "classified": "CLASSIFIED", "help": "HELP WANTED", "lost": "LOST",
+    "cat": "LOST CAT", "datacentre": "DATA CENTRE", "forsale": "FOR SALE",
+    "wanted": "WANTED", "crime": "CRIME STOPPERS", "personals": "PERSONALS",
+    "notice": "PUBLIC NOTICE", "station": "STATION NOTICE",
+}
+
+
+def _paper_filler_rows(ed: dict[str, Any]) -> list[dict[str, Any]]:
+    """#1047: the small ads. Lane N1's press writes the pool into the
+    edition as `fillers[]`; when it is not there (an edition printed
+    before N1 landed, or a press that could not build one) the typesetter
+    makes its own out of what is already on the page - the classifieds
+    desk's rows, the running order, the records, the callers - so a
+    column foot is never left blank for want of an advert."""
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def take(kind: str, head: str, body: str, price: str = "",
+             contact: str = "", image: str = "") -> None:
+        head = " ".join(str(head or "").split())[:70]
+        body = " ".join(str(body or "").split())[:240]
+        if not head or len(body) < 12:
+            return
+        key = (head + "|" + body).lower()
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({"kind": kind, "head": head, "body": body,
+                     "price": str(price or "")[:40],
+                     "contact": str(contact or "")[:60], "image": str(image or "")})
+
+    for r in (ed.get("fillers") or []):
+        if isinstance(r, dict):
+            take(str(r.get("kind") or "classified"), r.get("head"), r.get("body"),
+                 r.get("price"), r.get("contact"), r.get("image"))
+    if rows:
+        return rows
+
+    # --- no pool: build one from the edition itself ------------------------
+    arts = [a for a in (ed.get("articles") or []) if not a.get("error")]
+    station = str(ed.get("station") or PINE_BOX_FM or "the station")
+    for a in arts:
         meta = a.get("meta") or {}
-        try:
-            p = int(meta.get("page") or 0)
-        except (TypeError, ValueError):
-            p = 0
-        if p < 1:
-            p = paper_page_for(str(meta.get("section") or ""))
-        return max(1, min(PAPER_PAGES_MAX, p))
+        for ad in (meta.get("classifieds") or []):
+            if isinstance(ad, dict):
+                take("classified", ad.get("head"), ad.get("body"),
+                     ad.get("price"), ad.get("contact"), ad.get("image"))
+        hint = str(meta.get("style_hint") or "")
+        if hint in ("wanted", "crime") and meta.get("image"):
+            take(hint, str(meta.get("headline") or "Wanted"),
+                 str(meta.get("deck") or meta.get("pull")
+                     or "Last heard on the request line. Do not approach; ring in."),
+                 "", "Ring the request line", str(meta.get("image")))
+        for q in (meta.get("quotes") or [])[:2]:
+            if isinstance(q, dict) and len(str(q.get("text") or "")) > 40:
+                take("personals", f"HEARD ON AIR: {str(q.get('who') or 'a voice')}",
+                     str(q.get("text"))[:200], "", "Tapes at the desk")
+        box = meta.get("box") if isinstance(meta.get("box"), dict) else {}
+        for it in (box.get("items") or [])[:3]:
+            take("notice", str(box.get("title") or "Notice"), str(it),
+                 "", "Posted at the studio door")
+    for n, sec, hl in [(0, "", str(ed.get("headline") or ""))]:
+        if hl:
+            take("station", "STATION NOTICE",
+                 f"{station} prints an edition every hour. Back numbers are kept "
+                 "on the shelf behind the glass; ask at the desk.",
+                 "free", "The Gazette, behind the glass")
+    take("station", "TO OUR READERS",
+         f"{station} sets this paper by machine on the hour, every hour. "
+         "Errors of fact are the orchestrator's; errors of taste are the hour's.",
+         "", "Corrections to the request line")
+    take("notice", "PUBLIC NOTICE",
+         "The transmitter room is not open to the public. The door at the top "
+         "of the stairs is not a door.", "", "By order of upstairs")
+    take("datacentre", "DATA CENTRE",
+         "Rack space going spare beside the warm one. Bring your own fans; "
+         "the board runs hot after midnight.", "best offer", "Ask for engineering")
+    take("help", "HELP WANTED",
+         "Night reader wanted for the small hours. Must not mind the hum, "
+         "or the coffee machine, or being talked over.", "cash nightly",
+         "Apply at the studio door")
+    take("cat", "LOST CAT",
+         "Grey, answers to nothing, was last seen asleep on the amplifier. "
+         "Reward offered in records.", "reward", "Ring the request line")
+    for head, body, price, kind in _PAPER_FILLER_STOCK:
+        take(kind, head, body.replace("{station}", station), price,
+             "Ring the request line")
+    return rows
+
+
+# The typesetter's own small ads, for an edition printed without lane N1's
+# pool. Written in the station's voice, dull on purpose: a classified page
+# is not where a newspaper is funny.
+_PAPER_FILLER_STOCK: tuple[tuple[str, str, str, str], ...] = (
+    ("Turntable, one", "Belt drive, runs a shade fast after midnight. Comes "
+     "with the mat and an argument about the mat.", "$40", "forsale"),
+    ("Headphones, a pair", "One ear louder than the other, which suits the "
+     "night shift. Cable mended twice, honestly.", "$12", "forsale"),
+    ("Night reader", "{station} wants a voice for the small hours. No "
+     "experience; a steady throat and no opinions about the coffee.",
+     "cash nightly", "help"),
+    ("Board operator", "Must be able to hear a fault before the meter shows "
+     "it. Nights, and the stairs are steep.", "ask", "help"),
+    ("Cat, tabby, deaf", "Sleeps on the warm rack and will not be moved. If "
+     "you have him, he is not ours, but ring anyway.", "reward", "cat"),
+    ("Dog, answers to nothing", "Last seen following the outside broadcast "
+     "van down the hill. Friendly, slow, enormous.", "reward", "lost"),
+    ("Rack space", "Two units beside the warm one. Bring fans. The board "
+     "runs hot after midnight and nobody has fixed it.", "best offer",
+     "datacentre"),
+    ("Spare fans", "Twelve of them, all noisy, all working. Would suit a "
+     "room nobody sits in.", "$5 each", "datacentre"),
+    ("Uninterruptible supply", "Interrupted once, in the spring. Otherwise "
+     "faultless and very heavy.", "free to collect", "datacentre"),
+    ("To the voice at 3 AM", "You know the one. We have kept the tape. Ring "
+     "in and it is yours.", "", "personals"),
+    ("Seeking the same record twice", "Blue sleeve, no label, the one that "
+     "skips in the same place. Will pay over the odds.", "over the odds",
+     "wanted"),
+    ("Missing: one hour", "Between four and five it went quiet and nobody "
+     "will say why. Information treated in confidence.", "", "wanted"),
+    ("Notice to listeners", "{station} keeps its back numbers on the shelf "
+     "behind the glass. Ask at the desk; do not go through the door.",
+     "", "notice"),
+    ("The transmitter room", "Is not open to the public and is not a "
+     "shortcut. The door at the top of the stairs is not a door.", "",
+     "notice"),
+    ("Corrections", "Errors of fact are the orchestrator's. Errors of taste "
+     "belong to the hour in which they were made.", "", "notice"),
+    ("Found: a set of keys", "On the studio floor, under the third chair. "
+     "Describe the fob and they are yours.", "", "lost"),
+    ("Found: one umbrella", "Black, broken, left in the booth during the "
+     "storm. It is not a good umbrella.", "free", "lost"),
+    ("Wanted, quietly", "Anyone who was listening at ten past two and heard "
+     "what we heard. No names taken.", "", "wanted"),
+    ("Amplifier, valve", "Hums in sympathy with the building. Sold as heard, "
+     "which is the only honest way to sell it.", "$85", "forsale"),
+    ("Filing cabinet", "Four drawers, three of them open. Contains nothing "
+     "and has always contained nothing.", "free to a good home", "forsale"),
+    ("Coffee machine", "Not for sale. Enquiries have been noted and will be "
+     "passed upstairs, where they will be ignored.", "", "station"),
+    ("Studio clock", "Runs eleven seconds fast, deliberately. Do not "
+     "correct it; the whole hour is built on it.", "", "station"),
+    ("The request line", "Is open every hour the station is on the air, and "
+     "for some hours it is not.", "free", "station"),
+    ("Engineer wanted", "Someone who can tell a fan from a fault by ear. "
+     "Nights, hot room, good company.", "ask", "help"),
+    ("Reader for the obituaries", "Steady, unhurried, no jokes. The pictures "
+     "are supplied; the tone is not.", "cash nightly", "help"),
+    ("Lost: a small grey cat", "Answers to a tin, not a name. Was on the "
+     "amplifier, is now not on the amplifier.", "reward", "cat"),
+    ("For sale: cables", "A box of them. Some work. Sold by weight, which is "
+     "the fairest way anybody has suggested.", "$12", "forsale"),
+    ("Public notice", "The lift has been out since the spring and the notice "
+     "about the lift has been out since the summer.", "", "notice"),
+    ("Public notice", "Nothing was broadcast between the hours in question. "
+     "The silence was intentional and has been logged.", "", "notice"),
+    ("Personal", "To whoever keeps ringing and saying nothing: we can hear "
+     "the room you are in, and it is our room.", "", "personals"),
+)
+
+
+def _paper_filler_html(row: dict[str, Any], w: float, M: dict[str, Any]) -> tuple[str, float]:
+    """One small ad in its own ruled box, agate. Returns the html and its
+    estimated height at measure `w`."""
+    kind = str(row.get("kind") or "classified")
+    label = PAPER_FILLER_LABELS.get(kind, "CLASSIFIED")
+    head = str(row.get("head") or "")
+    if ":" not in head[:22] and not head.upper().startswith(label[:6]):
+        head = f"{label}: {head}"
+    image = str(row.get("image") or "")
+    poster = kind in ("wanted", "crime") and bool(image)
+    cls = "filler" + (" poster" if poster else "") + f" k-{kind}"
+    parts = [f'<div class="{cls}">']
+    h = 12.0
+    if image:
+        parts.append(f'<img src="{_paper_esc(image)}" alt="" loading="lazy" '
+                     'onerror="this.remove()">')
+        h += (w - 14.0) * (1.0 if poster else 0.75) + 4.0
+    parts.append(f'<b>{_paper_esc(head)}</b>')
+    h += _paper_est_text(len(head), w - 14.0, 10.5, 0.5, 1.25, 1.0, head)
+    body = str(row.get("body") or "")
+    parts.append(f'<span class="fb">{_md_inline(body)}</span>')
+    h += _paper_est_text(len(body), w - 14.0, 10.5, 0.46, 1.28, 2.0, body)
+    if row.get("price"):
+        parts.append(f'<span class="fp">{_paper_esc(row["price"])}</span>')
+    if row.get("contact"):
+        parts.append(f'<span class="fc">{_paper_esc(row["contact"])}</span>')
+        h += 14.0
+    parts.append("</div>")
+    return "".join(parts), (h + 7.0) * float(M.get("fill_scale") or 1.0)
+
+
+def _paper_fill(hole: float, w: float, M: dict[str, Any],
+                pool: list[dict[str, Any]], used: set[int],
+                cap: float = 0.0) -> tuple[list[str], float]:
+    """#1047: fill a hole with small ads, each sized to what is left.
+
+    Greedy, biggest-that-fits first, so a deep hole takes a display ad and
+    the last inch takes a one-line notice; stops when less than half an
+    inch is left, which is the rule the operator gave: no wasted space."""
+    out: list[str] = []
+    filled = 0.0
+    if hole <= PAPER_SLACK_OK or not pool:
+        return out, 0.0
+    guard = 0
+    closers = 0        # at most two ruled one-liners in a row (#1047 LAY)
+    while hole - filled > PAPER_SLACK_OK and guard < PAPER_FILLERS_MAX:
+        guard += 1
+        room = hole - filled
+        best_i, best_html, best_h = -1, "", 0.0
+        for i, row in enumerate(pool):
+            if i in used:
+                continue
+            html, h = _paper_filler_html(row, w, M)
+            # `cap` is how deep one column is: an advert taller than that
+            # cannot be kept whole by break-inside:avoid and Chrome cuts it
+            # across two or three columns (#1047 LAY)
+            if h <= room and h > best_h and (not cap or h <= cap):
+                best_i, best_html, best_h = i, html, h
+            if best_h > room * 0.86:
+                break
+        if best_i < 0 and len(used) >= len(pool) and pool:
+            used.clear()                 # every ad has been set once: go round
+            continue
+        if best_i < 0:
+            # nothing in the pool fits what is left: ruled one-line notices
+            # close the column, as many as the gap takes (#1047 LAY - one
+            # was not enough, and every gap between 22px and 52px stayed
+            # open on a page whose script had not run)
+            if room < 22.0 or closers >= 2:
+                break
+            closers += 1
+            out.append('<div class="filler rule">&#9632; '
+                       + _paper_esc(PAPER_CLOSERS[len(out) % len(PAPER_CLOSERS)])
+                       + " &#9632;</div>")
+            filled += 22.0
+            continue
+        used.add(best_i)
+        out.append(best_html)
+        filled += best_h
+    return out, filled
+
+
+# --- the packer ------------------------------------------------------------
+
+def _paper_short_head(headline: str, most: int = 34) -> str:
+    """The few words a continuation head carries: "The 3 AM Hour"."""
+    s = " ".join(str(headline or "").split())
+    if len(s) <= most:
+        return s
+    cut = s[:most].rsplit(" ", 1)[0]
+    return (cut or s[:most]).rstrip(",;:-·")
+
+
+def _paper_wide(a: dict[str, Any]) -> bool:
+    """A story that wants the whole measure: span:full, the classifieds
+    grid, the interview."""
+    meta = a.get("meta") or {}
+    return (str(meta.get("span") or "") == "full" or bool(meta.get("classifieds"))
+            or bool(meta.get("interview")))
+
+
+def _paper_plan_pages(ctx: dict[str, Any]) -> list[dict[str, Any]]:
+    """#1047: SIZE-AWARE PACKING. Every element is measured, then the
+    stories are packed into sheets in section order until a sheet is full.
+    A story too long for what is left is split at a paragraph boundary
+    with a jump line; a story that will not take a jump moves whole. What
+    is left at the foot of the last flow on every page is filled from the
+    small-ad pool.
+
+    The desks' meta.page is no longer where a story goes - it cannot be,
+    because a page now has a fixed height and holds what fits. The ORDER
+    is unchanged: the lead, then section order, then priority (#1023)."""
+    ed = ctx["ed"]
+    M = ctx["metrics"]
+    style = ctx["style"]
+    cols = int(M["cols"])
+    W, H = float(M["w"]), float(M["h"])
+    body_top = float(M["pad_top"])
+    inner_h = H - body_top - float(M["pad_bot"])
+
+    lead = ctx["lead"]
+    order = {s["id"]: i for i, s in enumerate(ctx["head"]["sections"])}
+    articles = [a for a in (ed.get("articles") or []) if not a.get("error")]
+    rest = [a for a in articles if a is not lead]
 
     def sort_key(a: dict[str, Any]) -> tuple[int, int, str]:
         meta = a.get("meta") or {}
@@ -97242,31 +102564,815 @@ def _paper_pages(ed: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[s
             pr = 5
         return (order.get(str(meta.get("section") or ""), 99), pr, str(a.get("file") or ""))
 
-    buckets: dict[int, list[dict[str, Any]]] = {}
+    rest.sort(key=sort_key)
+
+    pool = _paper_filler_rows(ed)
+    used_fill: set[int] = set()
+
+    # ---- the queue: one entry per story, split as we go ------------------
+    queue: list[dict[str, Any]] = []
     for a in rest:
-        buckets.setdefault(page_of(a), []).append(a)
-    for rows in buckets.values():
-        rows.sort(key=sort_key)
-    if len(buckets) <= 1 and rest:
-        only = buckets.get(next(iter(buckets)), []) if buckets else []
-        stay = [a for a in only if str((a.get("meta") or {}).get("section") or "") in ("front", "hour")]
-        move = [a for a in only if a not in stay]
-        if move:
-            buckets = {1: stay, 2: move}
+        bits = _paper_story_bits(a, ctx, "story")
+        wide = _paper_wide(a)
+        w = float(M["inner_w"]) if wide else float(M["col_w"])
+        est = _paper_est_bits(bits, w, M)
+        queue.append({"a": a, "bits": bits, "est": est, "wide": wide,
+                      "first": 0, "part": 0, "w": w})
+
+    def _paper_pull_up(page: dict[str, Any], queue: list[dict[str, Any]],
+                       cols: int, M: dict[str, Any], open_flow: Any,
+                       flow_room: Any, close_flow: Any) -> bool:
+        """#1047: the head of the queue is a full-measure story that will
+        not fit what is left. Rather than leave the foot of the page to the
+        small ads, look down the queue for the next stories that DO fit and
+        set them here; the wide one keeps its place at the head and opens
+        the next sheet. At most six are looked at, so section order barely
+        moves."""
+        f = page["items"][-1] if (page["items"] and page["items"][-1]["kind"] == "flow") \
+            else open_flow()
+        took = False
+        for k in range(1, min(len(queue), 4)):
+            nxt = queue[k]
+            if nxt.get("wide"):
+                continue
+            est = nxt["est"]
+            first = nxt["first"]
+            need = ((est["head"] if first == 0 else 30.0)
+                    + sum(est["blocks"][first:]) + est["tail"])
+            if need <= flow_room(f):
+                f["cells"].append({"kind": "story", "bits": nxt["bits"], "a": nxt["a"],
+                                   "blocks": (first, len(est["blocks"])),
+                                   "part": nxt["part"], "tail": True, "h": need,
+                                   "jump_from": nxt.get("jump_from", 0)})
+                f["content"] += need
+                page["stories"].append(nxt["a"])
+                queue.pop(k)
+                took = True
+                break
+        if not took and not f["cells"]:
+            page["items"].remove(f)
+        return took
+
     pages: list[dict[str, Any]] = []
-    if lead is not None and 1 not in buckets:
-        buckets[1] = []
-    for n, key in enumerate(sorted(buckets), start=1):
-        stories = buckets[key]
-        secs: list[str] = []
-        for a in stories:
-            name = str((a.get("meta") or {}).get("section") or "")
-            if name and name not in secs:
-                secs.append(name)
-        pages.append({"n": n, "stories": stories, "sections": secs})
-    if not pages:
-        pages.append({"n": 1, "stories": [], "sections": []})
-    return lead, pages
+    page_no = 0
+
+    def new_page() -> dict[str, Any]:
+        nonlocal page_no
+        page_no += 1
+        top = float(M["topn"])
+        if page_no == 1:
+            top = float(M["top1"]) + float(M["splash"])
+            if ctx["paused"] or ctx["offline"]:
+                top += float(M["notice"])
+        return {"n": page_no, "items": [], "top": top,
+                "left": inner_h - top - float(M["foot"]), "stories": [],
+                "sections": []}
+
+    page = new_page()
+    pages.append(page)
+
+    def close_flow(items: list[dict[str, Any]], stretch: float = 0.0) -> None:
+        """Size the open flow: content / cols, with the headroom the
+        stories were packed to, plus anything the page wants it to absorb."""
+        if not items or items[-1]["kind"] != "flow":
+            return
+        f = items[-1]
+        need = f["content"] / cols / PAPER_FLOW_EFF if f["content"] else 0.0
+        f["h"] = max(need, stretch) if stretch else need
+
+    def open_flow(cls: str = "") -> dict[str, Any]:
+        f = {"kind": "flow", "cells": [], "content": 0.0, "h": 0.0, "cls": cls}
+        page["items"].append(f)
+        return f
+
+    def page_used() -> float:
+        return sum(float(i.get("h") or 0.0) for i in page["items"])
+
+    def flow_room(f: dict[str, Any]) -> float:
+        """Column-length still available to this flow on this page."""
+        others = sum(float(i.get("h") or 0.0) for i in page["items"] if i is not f)
+        room_h = page["left"] - others
+        return max(0.0, room_h * cols * PAPER_FLOW_EFF - f["content"])
+
+    def next_page() -> None:
+        nonlocal page
+        close_flow(page["items"])
+        page = new_page()
+        pages.append(page)
+
+    # ---- page one: the lead beside the index -----------------------------
+    if lead is not None:
+        lead_bits = _paper_story_bits(lead, ctx, "lead")
+        main_w = float(M["main_w"])
+        lead_cols = 3 if style == "broadsheet" else 2
+        lead_col_w = (main_w - 22.0 * (lead_cols - 1)) / lead_cols
+        head_est = _paper_est_bits(lead_bits, main_w, M)
+        body_est = _paper_est_bits(lead_bits, lead_col_w, M)
+        reserve = 0.0
+        front_room = max(220.0, page["left"] * float(M["front_share"]))
+        # the lead's furniture is full-measure; only its body runs in columns
+        body_h = max(80.0, front_room - head_est["head"])
+        cap = body_h * lead_cols * PAPER_FLOW_EFF
+        take, run = 0, 0.0
+        for h in body_est["blocks"]:
+            if run + h > cap and take:
+                break
+            run += h
+            take += 1
+        # #1047 (LAY): the tail - the quote column, the extra plates, the
+        # sources - is set under the body at full measure, so it has to be
+        # in the box. When it will not go, the lead gives up a paragraph and
+        # the tail rides with the continuation instead.
+        tail_h = float(head_est["tail"]) if take >= len(body_est["blocks"]) else 0.0
+        while tail_h and take and head_est["head"] + body_h + tail_h > page["left"]:
+            take -= 1
+            tail_h = 0.0
+        front_h = min(head_est["head"] + body_h + tail_h, page["left"] - reserve)
+        body_h = max(60.0, front_h - head_est["head"] - tail_h)
+        lead_fill, _got = _paper_fill(body_h * lead_cols * PAPER_FILL_TO - run,
+                                      lead_col_w, M, pool, used_fill, body_h)
+        page["items"].append({
+            "kind": "front", "h": front_h, "bits": lead_bits, "a": lead,
+            "blocks": (0, take), "body_h": body_h, "cols": lead_cols,
+            "tail": take >= len(body_est["blocks"]),
+            "tail_h": tail_h, "head_h": head_est["head"],
+            "side_h": front_h, "est": body_est, "aside_h": head_est["aside"],
+            "fill": lead_fill})
+        page["stories"].append(lead)
+        if take < len(body_est["blocks"]):
+            queue.insert(0, {"a": lead, "bits": lead_bits, "est": body_est,
+                             "wide": False, "first": take, "part": 1,
+                             "w": float(M["col_w"]), "jump_from": 1})
+        if ctx["paused"]:
+            # the word cloud and the plexus are a spread, not a footnote:
+            # they queue like a story and land where there is room
+            queue.insert(1 if len(queue) else 0,
+                         {"a": None, "extras": True, "wide": True, "first": 0,
+                          "part": 0, "w": float(M["inner_w"]), "bits": None,
+                          "est": {"total": float(M["extras_h"]), "head": 0.0,
+                                  "blocks": [], "tail": 0.0, "aside": 0.0}})
+
+    # ---- the rest, packed ------------------------------------------------
+    guard = 0
+    while queue and len(pages) <= PAPER_PAGES_HARD and guard < 600:
+        guard += 1
+        job = queue[0]
+        if job["wide"]:
+            close_flow(page["items"])
+            need = _paper_wide_need(job)
+            room = page["left"] - page_used()
+            if (need > room and not job.get("extras") and page_used() <= 0
+                    and not job.get("part")):
+                # alone on an empty sheet and still too big: the pictures go
+                # before the words do (#1047 LAY)
+                job = _paper_thin_plates(job, ctx, M, room)
+                queue[0] = job
+                need = _paper_wide_need(job)
+            if need > room and not job.get("extras"):
+                # split the list it is made of (the classifieds' ads, the
+                # interview's pairs) so it fills what is left of this page
+                if room >= inner_h * 0.30:
+                    job = _paper_shrink_wide(job, ctx, M, room, queue)
+                    # the shrunken job REPLACES the one in the queue: the
+                    # tail is already queued behind it, and cutting the
+                    # original a second time is how the classifieds ended
+                    # up on five pages
+                    queue[0] = job
+                    need = _paper_wide_need(job)
+            # the paused spread is a picture: squeezing it only cuts the
+            # cloud in half, so it waits for a sheet it fits on
+            if need > room:
+                if page_used() > 0:
+                    # made up the way a page is: the stories that DO fit
+                    # come up before a new sheet is opened
+                    if _paper_pull_up(page, queue, cols, M, open_flow,
+                                      flow_room, close_flow):
+                        continue
+                    next_page()
+                    continue
+                # #1047 (LAY): an empty sheet and it STILL does not fit -
+                # a span:full story with no list to shrink. It jumps like
+                # any other story: what fits is set at full measure with a
+                # jump line and the rest opens the next sheet.
+                est = job["est"]
+                first = job["first"]
+                head_h = est["head"] if first == 0 else 34.0
+                wblocks = est["blocks"][first:]
+                fits = room * PAPER_WIDE_FIT / PAPER_WIDE_EASE
+                take, run = 0, 0.0
+                for h in wblocks:
+                    if head_h + run + h > fits and take:
+                        break
+                    run += h
+                    take += 1
+                if (not job.get("extras") and take and take < len(wblocks)
+                        and len(pages) < PAPER_PAGES_HARD):
+                    page["items"].append({
+                        "kind": "wide", "h": (head_h + run) * PAPER_WIDE_EASE,
+                        "bits": job["bits"], "a": job["a"],
+                        "blocks": (first, first + take), "part": job["part"],
+                        "tail": False, "jump_to": 0,
+                        "jump_from": job.get("jump_from", 0)})
+                    page["stories"].append(job["a"])
+                    job["first"] = first + take
+                    job["part"] += 1
+                    job["jump_from"] = page["n"]
+                    next_page()
+                    continue
+                need = room
+            if job.get("extras"):
+                page["items"].append({"kind": "extras", "h": need})
+            else:
+                page["items"].append({"kind": "wide", "h": need,
+                                      "bits": job["bits"], "a": job["a"],
+                                      "blocks": (job["first"], len(job["bits"]["blocks"])),
+                                      "part": job["part"], "tail": True,
+                                      "carry": bool(job.get("carry")),
+                                      "jump_from": job.get("jump_from", 0)})
+                page["stories"].append(job["a"])
+            queue.pop(0)
+            continue
+
+        f = page["items"][-1] if (page["items"] and page["items"][-1]["kind"] == "flow") \
+            else open_flow()
+        room = flow_room(f)
+        est = job["est"]
+        first = job["first"]
+        head_h = est["head"] if first == 0 else 44.0        # the continuation head
+        blocks = est["blocks"][first:]
+        need = head_h + sum(blocks) + est["tail"]
+        if need <= room:
+            f["cells"].append({"kind": "story", "bits": job["bits"], "a": job["a"],
+                               "blocks": (first, len(est["blocks"])), "part": job["part"],
+                               "tail": True, "h": need,
+                               "jump_from": job.get("jump_from", 0)})
+            f["content"] += need
+            page["stories"].append(job["a"])
+            queue.pop(0)
+            continue
+        # will not fit: split it if both halves are worth a column inch
+        if room >= head_h + PAPER_SPLIT_MIN:
+            take, run = 0, 0.0
+            for h in blocks:
+                if head_h + run + h > room - 18.0:
+                    break
+                run += h
+                take += 1
+            left_over = sum(blocks[take:]) + est["tail"]
+            if take and take < len(blocks) \
+                    and run >= PAPER_SPLIT_MIN and left_over >= PAPER_SPLIT_MIN \
+                    and not _paper_no_split(job["bits"]["blocks"][first + take - 1],
+                                            job["bits"]["blocks"][first + take:]):
+                f["cells"].append({"kind": "story", "bits": job["bits"], "a": job["a"],
+                                   "blocks": (first, first + take), "part": job["part"],
+                                   "tail": False, "h": head_h + run,
+                                   "jump_from": job.get("jump_from", 0),
+                                   "jump_to": 0, "jump_key": id(job["a"])})
+                f["content"] += head_h + run
+                page["stories"].append(job["a"])
+                job["first"] = first + take
+                job["part"] += 1
+                job["jump_from"] = page["n"]
+                next_page()
+                continue
+        if (not f["cells"] and not any(i["kind"] != "flow" for i in page["items"])
+                and page["n"] > 1) or len(pages) >= PAPER_PAGES_HARD:
+            # an empty page and it STILL does not fit. Its pictures go
+            # first, and then it is cut at the last block that goes and the
+            # rest is queued with a jump line; only when not one block fits
+            # does the whole thing go down and take its chances (#1047 LAY:
+            # the old code set the lot and let the box clip whatever hung
+            # off the foot).
+            if not job.get("part"):
+                job = _paper_thin_plates(job, ctx, M, room)
+                queue[0] = job
+                est = job["est"]
+                head_h = est["head"] if first == 0 else 30.0
+                blocks = est["blocks"][first:]
+                need = head_h + sum(blocks) + est["tail"]
+            take, run = 0, 0.0
+            for h in blocks:
+                if head_h + run + h > room and take:
+                    break
+                run += h
+                take += 1
+            if take < len(blocks) and len(pages) < PAPER_PAGES_HARD:
+                f["cells"].append({"kind": "story", "bits": job["bits"], "a": job["a"],
+                                   "blocks": (first, first + take), "part": job["part"],
+                                   "tail": False, "h": head_h + run,
+                                   "jump_from": job.get("jump_from", 0),
+                                   "jump_to": 0, "jump_key": id(job["a"])})
+                f["content"] += head_h + run
+                page["stories"].append(job["a"])
+                job["first"] = first + take
+                job["part"] += 1
+                job["jump_from"] = page["n"]
+                next_page()
+                continue
+            f["cells"].append({"kind": "story", "bits": job["bits"], "a": job["a"],
+                               "blocks": (first, len(est["blocks"])), "part": job["part"],
+                               "tail": True, "h": need,
+                               "jump_from": job.get("jump_from", 0)})
+            f["content"] += need
+            page["stories"].append(job["a"])
+            queue.pop(0)
+            continue
+        next_page()
+
+    close_flow(page["items"])
+
+    # ---- a page nothing landed on is not printed -------------------------
+    pages = [p for p in pages
+             if p["stories"] or p is pages[0]
+             or any(i["kind"] == "extras" for i in p["items"])]
+    for n, p in enumerate(pages, start=1):
+        p["n"] = n
+    page_no = len(pages)
+
+    # ---- a paper opens: never one sheet ----------------------------------
+    if len(pages) < PAPER_PAGES_MIN:
+        pages.append(new_page())
+
+    # ---- the index, now that every story has a page ----------------------
+    seen_at: dict[int, int] = {}
+    for p in pages:
+        for a in p["stories"]:
+            seen_at.setdefault(id(a), p["n"])
+    ctx["index"] = [(seen_at.get(id(a), 1),
+                     ctx["section_name"].get(str((a.get("meta") or {}).get("section") or ""),
+                                             str((a.get("meta") or {}).get("section") or "")),
+                     str((a.get("meta") or {}).get("headline") or ""))
+                    for a in (ed.get("articles") or []) if not a.get("error")]
+
+    # ---- stretch the last flow of every page, then fill every crack -----
+    for p in pages:
+        p["body_h"] = p["left"] - (float(M["colophon"]) if p is pages[-1] else 0.0)
+        # #1047 (LAY): the clamp. Whatever the arithmetic above decided, the
+        # items on a page are cut back to the page before anything is
+        # filled - the last item first, because that is the one the packer
+        # was least sure of. A sheet is a fixed box and this is the one
+        # place that is guaranteed.
+        over = sum(float(i.get("h") or 0.0) for i in p["items"]) - p["body_h"]
+        for i in reversed(p["items"]):
+            if over <= 0.5:
+                break
+            cut = min(over, max(0.0, float(i.get("h") or 0.0) - 40.0))
+            i["h"] = float(i.get("h") or 0.0) - cut
+            if i["kind"] == "front":
+                i["side_h"] = i["h"]
+                i["body_h"] = max(60.0, i["h"] - float(i.get("head_h") or 0.0)
+                                  - float(i.get("tail_h") or 0.0))
+            over -= cut
+        flows = [i for i in p["items"] if i["kind"] == "flow"]
+        fixed = sum(float(i.get("h") or 0.0) for i in p["items"] if i["kind"] != "flow")
+        room = p["body_h"] - fixed
+        if flows:
+            others = sum(float(f["h"]) for f in flows[:-1])
+            flows[-1]["h"] = max(40.0, room - others)
+            for f in flows:
+                capacity = f["h"] * cols
+                hole = capacity * PAPER_FILL_TO - f["content"]
+                html, got = _paper_fill(hole, float(M["col_w"]), M, pool,
+                                        used_fill, float(f["h"]))
+                if html:
+                    f["cells"].append({"kind": "fill", "html": html, "h": got})
+                    f["content"] += got
+        elif room > PAPER_SLACK_OK * 2:
+            f = {"kind": "flow", "cells": [], "content": 0.0, "h": room, "cls": ""}
+            html, got = _paper_fill(room * cols * PAPER_FILL_TO, float(M["col_w"]),
+                                    M, pool, used_fill, room)
+            if html:
+                f["cells"].append({"kind": "fill", "html": html, "h": got})
+                f["content"] += got
+                p["items"].append(f)
+        # the front page's side column takes the same treatment
+        for i in p["items"]:
+            if i["kind"] == "front":
+                side_w = float(M["side_w"])
+                room = float(i["side_h"])
+                i["side"] = []
+                k = float(M.get("est_scale") or 1.0)
+                for html, h in (i["bits"].get("aside") or []):
+                    if h * k > room:
+                        continue        # it does not fit the front; it rides
+                    i["side"].append(html)   # with the story where it goes on
+                    room -= h * k
+                idx = _paper_index_html(ctx)
+                if idx:
+                    idx_h = _paper_est_text(len(_PAPER_TAG.sub("", idx)),
+                                            side_w - 16, 12.5, 0.46, 1.35, 34.0) * k
+                    if idx_h <= room:
+                        i["side"].append(idx)
+                        room -= idx_h
+                html, _got = _paper_fill(room, side_w, M, pool, used_fill)
+                i["side"].extend(html)
+        p["sections"] = []
+        for a in p["stories"]:
+            sec = str((a.get("meta") or {}).get("section") or "")
+            if sec and sec not in p["sections"]:
+                p["sections"].append(sec)
+
+    # ---- the jump numbers, now that every part has a page ----------------
+    where: dict[int, list[int]] = {}
+    for p in pages:
+        for a in p["stories"]:
+            where.setdefault(id(a), []).append(p["n"])
+
+    def cells_of(p: dict[str, Any]) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for i in p["items"]:
+            if i["kind"] == "flow":
+                rows.extend(i["cells"])
+            else:
+                rows.append(i)
+        return rows
+
+    for p in pages:
+        for c in cells_of(p):
+            a = c.get("a")
+            if a is None:
+                continue
+            seen = where.get(id(a)) or []
+            c["jump_to"] = next((n for n in seen if n > p["n"]), 0)
+            if c.get("part"):
+                back = [n for n in seen if n < p["n"]]
+                c["jump_from"] = back[-1] if back else c.get("jump_from", 0)
+    return pages
+
+
+_PAPER_NO_SPLIT = ("<table", '<div class="tblwrap"', "<blockquote")
+
+
+def _paper_no_split(before: str, after: list[str]) -> bool:
+    """#1047: never cut a story so a table, a chart or a quote block is
+    orphaned from the paragraph that introduces it."""
+    if before.strip().startswith(_PAPER_NO_SPLIT):
+        return True
+    return bool(after) and after[0].strip().startswith(_PAPER_NO_SPLIT)
+
+
+def _paper_wide_need(job: dict[str, Any]) -> float:
+    """What a full-measure job costs on a page: the whole story for part
+    one, the continuation head plus what is left for a later part."""
+    est = job["est"]
+    if not job.get("part") or job.get("whole"):
+        # `whole`: a continuation the shrink made out of a list, whose
+        # content is its furniture, not its blocks (#1047 LAY)
+        return float(est["total"]) * PAPER_WIDE_EASE
+    return (48.0 + sum(est["blocks"][job.get("first", 0):])
+            + float(est["tail"])) * PAPER_WIDE_EASE
+
+
+def _paper_thin_plates(job: dict[str, Any], ctx: dict[str, Any], M: dict[str, Any],
+                       room: float) -> dict[str, Any]:
+    """#1047 (LAY): a story whose PICTURES will not fit the sheet.
+
+    Some stories carry furniture - a plate, and a gallery of plates under
+    the text - that is taller than a page on its own, and no amount of
+    cutting the words saves them: the box clips whatever hangs off the
+    foot. So the gallery goes first, and if the story still will not fit,
+    its own plate goes too. Returns the job unchanged when the pictures
+    were never the problem."""
+    a = job.get("a")
+    if not isinstance(a, dict):
+        return job
+    meta = dict(a.get("meta") or {})
+    w = float(job.get("w") or M["col_w"])
+    for drop in (("images",), ("images", "image", "photo")):
+        if not any(meta.get(k) for k in drop):
+            continue
+        thin = {k: v for k, v in meta.items() if k not in drop}
+        b = dict(a)
+        b["meta"] = thin
+        bits = _paper_story_bits(b, ctx, "story")
+        est = _paper_est_bits(bits, w, M)
+        out = {**job, "a": b, "bits": bits, "est": est}
+        if _paper_wide_need(out) <= room:
+            return out
+        job = out
+        meta = thin
+    return job
+
+
+def _paper_shrink_wide(job: dict[str, Any], ctx: dict[str, Any], M: dict[str, Any],
+                       room: float, queue: list[dict[str, Any]]) -> dict[str, Any]:
+    """A full-measure story taller than the room it is given. The two that
+    can be are made of lists - the classifieds' small ads and the
+    interview's question-and-answer pairs - so the LIST is measured against
+    what the rest of the story leaves, and the rest of the list becomes a
+    continuation on the next page: no headline, no plates, no body text
+    again, only the ads that are left under "from page N"."""
+    a = job["a"]
+    meta = dict(a.get("meta") or {})
+    rows = list(meta.get("classifieds") or [])
+    key = "classifieds"
+    if not rows and isinstance(meta.get("interview"), dict):
+        rows = list((meta["interview"] or {}).get("qa") or [])
+        key = "interview"
+    if not rows and isinstance(meta.get("box"), dict):
+        # the running order, the itinerary, the index: a ruled list, and a
+        # ruled list continues overleaf as happily as a column of ads
+        rows = [x for x in ((meta["box"] or {}).get("items") or []) if str(x).strip()]
+        key = "box"
+    if len(rows) < 4:
+        return job
+    w = float(M["inner_w"])
+    listed = (_paper_est_classifieds(rows, w, M) if key == "classifieds"
+              else _paper_est_box(meta.get("box"), w, M) if key == "box"
+              else _paper_est_interview(meta.get("interview"), w, M))
+    listed *= float(M.get("est_scale") or 1.0)
+    # raw estimate units: _paper_wide_need already carries the ease, and
+    # subtracting it here counted it twice (#1047 LAY)
+    raw = _paper_wide_need(job) / PAPER_WIDE_EASE
+    fixed = max(0.0, raw - listed)
+    per = listed / max(1, len(rows))
+    keep = int(max(2.0, (room * PAPER_WIDE_FIT / PAPER_WIDE_EASE - fixed - 20.0)
+                   / max(1.0, per)))
+    if keep >= len(rows) or (len(rows) - keep) * per < 140.0:
+        return job          # a tail not worth a jump: move the whole thing
+    head = dict(a)
+    tail = dict(a)
+    tail["body"] = ""                       # the words stay with the head
+    thin = {k: v for k, v in meta.items()
+            if k not in ("image", "images", "quotes", "sources", "stats",
+                         "chart", "box", "serial", "pull", "deck", "caption")}
+    if key == "classifieds":
+        head["meta"] = {**meta, "classifieds": rows[:keep]}
+        tail["meta"] = {**thin, "classifieds": rows[keep:]}
+    elif key == "box":
+        head["meta"] = {**meta, "box": {**meta["box"], "items": rows[:keep]}}
+        tail["meta"] = {**thin, "box": {**meta["box"], "items": rows[keep:],
+                                        "title": str((meta["box"] or {}).get("title")
+                                                     or "") + " (continued)"}}
+    else:
+        head["meta"] = {**meta, "interview": {**meta["interview"], "qa": rows[:keep]}}
+        tail["meta"] = {**thin, "interview": {**meta["interview"], "qa": rows[keep:]}}
+    hb = _paper_story_bits(head, ctx, "story")
+    tb = _paper_story_bits(tail, ctx, "story")
+    queue.insert(1, {"a": tail, "bits": tb, "est": _paper_est_bits(tb, w, M),
+                     "wide": True, "first": 0, "part": job["part"] + 1,
+                     "w": w, "jump_from": 0, "carry": True, "whole": True})
+    return {**job, "a": head, "bits": hb, "est": _paper_est_bits(hb, w, M)}
+
+
+# --- the page's own script: fit, then finish -------------------------------
+
+_PAPER_FIT_JS = r"""
+(function(){
+  /* #1047: the page finishes itself.
+
+     It measures each column flow through a zero-height sentinel: which
+     column the content ended in and how far down. From that it knows the
+     crack that is left at the foot of the page, in column-inches, and it
+     either takes small ads out of a flow that overran or puts more in from
+     the reserve until the crack is under half an inch. It never moves a
+     story: the make-up is the server's, and a script that rearranges the
+     paper is worse than a page with an advert too few. */
+  var SLACK = __SLACK__;
+  function cols(f){ var cs=getComputedStyle(f); return parseInt(cs.columnCount)||1; }
+  function endInfo(f){
+    var end=f.querySelector(':scope > .fitend'); if(!end) return null;
+    var fr=f.getBoundingClientRect(), er=end.getBoundingClientRect();
+    var n=cols(f), gap=parseFloat(getComputedStyle(f).columnGap)||0;
+    var cw=(fr.width-gap*(n-1))/n;
+    var ci=Math.round((er.left-fr.left)/(cw+gap));
+    if(!isFinite(ci)||ci<0) ci=0;
+    var y=er.top-fr.top;
+    return {col:ci, y:y, cols:n, h:fr.height,
+            over: ci>n-1 || y>fr.height+1,
+            slack: (fr.height-y)+(n-1-ci)*fr.height};
+  }
+  function flows(){ return Array.prototype.slice.call(document.querySelectorAll('.flow')); }
+  /* which column of its flow an element landed in (#1047 LAY) */
+  function colOf(f, el){
+    var fr=f.getBoundingClientRect(), n=cols(f);
+    var gap=parseFloat(getComputedStyle(f).columnGap)||0;
+    var cw=(fr.width-gap*(n-1))/n;
+    var b=el.getBoundingClientRect();
+    var i=Math.round((b.left-fr.left)/(cw+gap));
+    return (isFinite(i)&&i>=0)?i:0;
+  }
+  /* Every column may take an ad, the lead's own included - what makes
+     that safe is that topUp is followed by a second trim: anything the
+     measurement got wrong comes straight back out, and only ads ever do. */
+  function open_(){ return flows(); }
+  function isAd(el){ return el && el.classList &&
+    (el.classList.contains('filler')||el.classList.contains('fillrun')); }
+  /* #1047 (LAY): where an advert goes in this flow. An ordinary column flow
+     takes it straight; a full-measure block is one column 1,040px wide, and
+     a 1,040px small ad is not a small ad - so the block gets a ruled
+     multi-column run and the ads go in there. */
+  function fillHost(f){
+    var end=f.querySelector(':scope > .fitend');
+    if(!f.classList.contains('wideblock')) return {box:f, before:end};
+    var host=f.querySelector(':scope > .wfill');
+    if(!host){
+      host=document.createElement('div');
+      host.className='fillrun wfill';
+      var wid=f.getBoundingClientRect().width;
+      host.style.columnCount=Math.max(2, Math.min(5, Math.round(wid/250)));
+      host.style.columnGap='16px';
+      f.insertBefore(host, end);
+    }
+    return {box:host, before:null};
+  }
+  function trim(){
+    flows().forEach(function(f){
+      var guard=0, info=endInfo(f);
+      while(info && info.over && guard++<80){
+        var kids=Array.prototype.slice.call(f.children).filter(function(k){
+          return !k.classList.contains('fitend'); });
+        var last=kids[kids.length-1];
+        if(!last) break;
+        if(last.classList.contains('wfill')){
+          if(last.lastElementChild){ last.removeChild(last.lastElementChild); }
+          else { f.removeChild(last); }
+        }
+        else if(isAd(last)){ f.removeChild(last); }
+        else if(last.lastElementChild && isAd(last.lastElementChild)){
+          last.removeChild(last.lastElementChild);
+        } else break;          /* only ads come out */
+        info=endInfo(f);
+      }
+      /* Every advert is out and it still will not go: the estimate was
+         short and what is left is journalism. A stone hand squeezes the
+         column rather than let a paragraph walk off the sheet, so we do
+         the same - up to 4% in 1% steps, which is invisible, and never
+         more, because past that the page stops matching its neighbours. */
+      if(info && info.over){
+        for(var pc=1; pc<=4 && info && info.over; pc++){
+          f.style.fontSize=(100-pc)+'%';
+          info=endInfo(f);
+        }
+        /* the type is as tight as it goes and the box still holds more
+           than it was sized for - a picture, an interview panel, a grid,
+           none of which reflow with the type. Reduce the whole box
+           photographically: zoom takes the furniture with it, and the
+           inline height is divided by the same factor so the BOX stays the
+           size the page gave it while its contents get smaller. */
+        var h0=parseFloat(f.style.height)||info.h;
+        for(var z=98; z>=88 && info && info.over; z-=2){
+          f.style.zoom=(z/100);
+          f.style.height=(h0/(z/100)).toFixed(1)+'px';
+          info=endInfo(f);
+        }
+        if(info && !info.over && f.style.zoom){
+          /* it went: keep the reduction, and remember it for the report */
+          f.setAttribute('data-squeezed', f.style.zoom);
+        } else if(info && info.over){
+          f.style.zoom=''; f.style.height=h0+'px';   /* no help: put it back */
+          info=endInfo(f);
+        }
+        if(info && info.over){ f.setAttribute('data-overrun','1'); }
+      }
+    });
+  }
+  /* #1047 (LAY): an advert wider than a column was broken across two by
+     the column-breaker, because it fits no column of this flow. Out it
+     comes - the top-up that runs next fills the hole with one that fits. */
+  function deFrag(){
+    flows().forEach(function(f){
+      var n=cols(f), fr=f.getBoundingClientRect();
+      var gap=parseFloat(getComputedStyle(f).columnGap)||0;
+      var cw=(fr.width-gap*(n-1))/n;
+      Array.prototype.forEach.call(f.querySelectorAll('.filler'), function(a){
+        var host=a.parentNode;
+        var hc=n, hw=fr.width, hg=gap;
+        if(host && host!==f && host.classList && host.classList.contains('wfill')){
+          var hs=getComputedStyle(host);
+          hc=parseInt(hs.columnCount)||1;
+          hg=parseFloat(hs.columnGap)||0;
+          hw=host.getBoundingClientRect().width;
+        }
+        var w1=(hw-hg*(hc-1))/hc;
+        if(a.getBoundingClientRect().width > w1+6){ a.parentNode.removeChild(a); }
+      });
+    });
+  }
+  function topUp(){
+    var res=document.getElementById('fillreserve');
+    if(!res) return;
+    var spare=Array.prototype.slice.call(res.content.children);
+    if(!spare.length) return;
+    var at=0;
+    open_().forEach(function(f){
+      var guard=0, misses=0, info=endInfo(f);
+      /* the same advert twice in one column reads as a misprint - twice in
+         one FLOW is a classified page doing what classified pages do */
+      var here={};
+      Array.prototype.forEach.call(f.querySelectorAll('.filler'), function(a){
+        here[colOf(f,a)+'|'+(a.textContent||'').slice(0,120)]=1; });
+      var budget=spare.length+8;   /* every card in the reserve gets a try */
+      while(info && !info.over && info.slack>SLACK && guard++<160 && misses<budget){
+        var pick=spare[at++ % spare.length];
+        var text=(pick.textContent||'').slice(0,120);
+        var node=pick.cloneNode(true);
+        var host=fillHost(f);
+        host.box.insertBefore(node, host.before);
+        var after=endInfo(f);
+        var key=colOf(f,node)+'|'+text;
+        /* an advert wider than a column has been broken ACROSS columns:
+           head in one, price in the next. Take it back out. */
+        var nr=node.getBoundingClientRect();
+        var hr=host.box.getBoundingClientRect();
+        var hc=parseInt(getComputedStyle(host.box).columnCount)||cols(f);
+        var cw=hr.width/Math.max(1,hc);
+        if(!after || after.over || here[key] || nr.width > cw+6){
+          node.parentNode.removeChild(node);
+          misses++;      /* too deep for the hole, or already in that column */
+          continue;
+        }
+        here[key]=1;
+        misses=0;
+        info=after;
+      }
+    });
+  }
+  /* #1047 (LAY): the last inch. A flow long enough to have taken every
+     card in the reserve has nothing left that is short enough and keeps
+     its blank; a one-line ruled closer is not an advertisement, and one
+     four columns below another is what a classified page looks like, so
+     these may repeat until the foot is under half an inch. */
+  var CLOSERS = __CLOSERS__;
+  function closeFeet(){
+    flows().forEach(function(f){
+      var info=endInfo(f), guard=0, k=0;
+      /* three is the foot of a column; more than that is a column of
+         nothing pretending to be a column of something (#1047 LAY) */
+      while(info && !info.over && info.slack>SLACK && guard++<3){
+        var node=document.createElement('div');
+        node.className='filler rule';
+        node.innerHTML='\u25a0 '+CLOSERS[k++ % CLOSERS.length]+' \u25a0';
+        var host=fillHost(f);
+        host.box.insertBefore(node, host.before);
+        var after=endInfo(f);
+        if(!after || after.over){ node.parentNode.removeChild(node); break; }
+        info=after;
+      }
+    });
+  }
+  function stamp(){
+    var ps=Array.prototype.slice.call(document.querySelectorAll('.page'));
+    document.body.setAttribute('data-pages', ps.length);
+    try{ if(window.parent&&window.parent!==window)
+      window.parent.postMessage({gazette:'fitted', pages:ps.length,
+        edition:document.body.getAttribute('data-edition')||''}, '*'); }catch(e){}
+  }
+  function fitWidth(){
+    var sheet=document.querySelector('.sheet'); if(!sheet) return;
+    var page=document.querySelector('.page'); if(!page) return;
+    sheet.style.transform='';
+    var w=page.getBoundingClientRect().width;
+    if(!w) return;
+    var avail=document.documentElement.clientWidth-14;
+    var s=Math.min(1, avail/w);
+    window.__paperScale=s;
+    sheet.style.width=w+'px';
+    if(s<0.999){ sheet.style.transform='scale('+s+')'; }
+    var wrap=document.querySelector('.sheetwrap');
+    if(wrap) wrap.style.height=(sheet.scrollHeight*s)+'px';
+  }
+  function run(){
+    var sheet=document.querySelector('.sheet');
+    if(sheet) sheet.style.transform='';
+    window.__paperScale=1;
+    trim();
+    deFrag();        /* an advert the column-breaker cut in two */
+    topUp();
+    trim();          /* whatever the top-up got wrong comes back out */
+    closeFeet();     /* and the last inch takes a ruled closer */
+    stamp();
+    fitWidth();
+  }
+  if(document.readyState==='complete') setTimeout(run,0);
+  else window.addEventListener('load', function(){ setTimeout(run,0); });
+  window.addEventListener('resize', function(){ fitWidth(); });
+})();
+"""
+
+def _paper_style(style: Any) -> str:
+    s = str(style or "").strip().lower()
+    return s if s in PAPER_STYLES else "broadsheet"
+
+
+def _paper_pages(ed: dict[str, Any]) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
+    """#1023/#1047: the lead and the pages the PACKER produced.
+
+    Kept as a door for anything that only wants "which stories are on which
+    sheet" (paper_render_text, the index). The pages come back with `n`,
+    `stories` and `sections` as they always did; the layout itself lives on
+    each page's `items`."""
+    ctx = _paper_ctx(ed, str(ed.get("style_default") or "broadsheet"))
+    return ctx["lead"], ctx["pages"]
+
+
+def _paper_lead_of(ed: dict[str, Any]) -> dict[str, Any] | None:
+    articles = [a for a in (ed.get("articles") or []) if not a.get("error")]
+    lead = next((a for a in articles
+                 if int((a.get("meta") or {}).get("priority") or 0) == 1), None)
+    if lead is None and articles:
+        lead = articles[0]
+    return lead
 
 
 def _paper_plate_html(url: Any, caption: Any = "", credit: Any = "", focus: Any = "",
@@ -97381,99 +103487,99 @@ def _paper_interview_html(iv: Any) -> str:
             + "</div></div>")
 
 
+def _paper_read_link(url: Any, inner: str, cls: str = "") -> str:
+    """#1045: a headline the desk covered, wrapped so a click opens the
+    reader. It stays a real link - href and target are still the original,
+    so ctrl-click, middle-click and "copy link" all do what they always
+    did; only a plain click is taken by the page's own script."""
+    u = str(url or "")
+    if not u.startswith(("http://", "https://")):
+        return inner
+    kind = f"readable {cls}" if cls else "readable"
+    return (f'<a class="{kind}" data-read="{_paper_esc(u)}" href="{_paper_esc(u)}" '
+            f'target="_blank" rel="noopener" title="Read the whole story">'
+            f"{inner}</a>")
+
+
+def _paper_read_key(text: Any) -> str:
+    """The first four words of a headline, flattened - what two versions of
+    the same headline still agree on after a writer has been at it."""
+    flat = html_unescape(re.sub(r"<[^>]+>", " ", str(text or "")))
+    return " ".join(re.findall(r"[a-z0-9']+", flat.lower())[:4])
+
+
+def _paper_link_bodies(body_html: str, sources: list[dict[str, Any]]) -> str:
+    """#1045: the Wire opens each paragraph with that story's headline in
+    bold. When the bold run is one of the desk's covered headlines, it
+    becomes the door to the reader as well. Matched on the first four words
+    because the writer shortens and repunctuates what it was handed; a run
+    that matches nothing is left exactly as it was set."""
+    keyed: dict[str, str] = {}
+    for row in sources:
+        url = str(row.get("url") or "")
+        key = _paper_read_key(row.get("name"))
+        if key and url.startswith(("http://", "https://")):
+            keyed.setdefault(key, url)
+    if not keyed:
+        return body_html
+
+    def swap(m: "re.Match[str]") -> str:
+        url = keyed.get(_paper_read_key(m.group(2)))
+        return _paper_read_link(url, m.group(0), "head") if url else m.group(0)
+
+    return re.sub(r"<(strong|b)>(.*?)</\1>", swap, body_html, flags=re.S)
+
+
 def _paper_story_html(a: dict[str, Any], ctx: dict[str, Any], mode: str = "story",
-                      kicker_html: str = "") -> str:
-    """One story, every meta field. mode: lead | story | side (the front's
-    sidebar) | brief (a tabloid teaser box)."""
-    meta = a.get("meta") or {}
-    style = ctx["style"]
-    section_name = ctx["section_name"]
-    sec = str(meta.get("section") or "front")
-    hint = str(meta.get("style_hint") or "")
-    headline = str(meta.get("headline") or meta.get("title") or a.get("headline_hint") or "")
-    bits: list[str] = [kicker_html] if kicker_html else []
-    kicker = str(meta.get("kicker") or "")
-    if hint == "crime" and not kicker:
-        kicker = "Crime stoppers"
-    if hint == "wanted" and not kicker:
-        kicker = "Wanted"
-    # the tabloid's splash already carries the lead's kicker, flash,
-    # headline and deck - the story below it starts at the byline
-    on_splash = style == "tabloid" and mode == "lead"
-    if kicker and not on_splash:
-        bits.append(f'<div class="kicker">{_paper_esc(kicker)}</div>')
-    if style == "tabloid" and meta.get("flash") and not on_splash:
-        bits.append(f'<span class="flash">{_paper_esc(meta["flash"])}</span>')
-    if not on_splash:
-        bits.append(f"<h2>{_paper_esc(headline)}</h2>")
-        if meta.get("deck"):
-            bits.append(f'<p class="deck">{_paper_esc(meta["deck"])}</p>')
-    bits.append('<p class="byline"><span class="sec">'
-                f'{_paper_esc(section_name.get(sec, sec))}</span>'
-                + (f' · {_paper_esc(meta["byline"])}' if meta.get("byline") else "")
-                + "</p>")
-    image = str(meta.get("image") or meta.get("photo") or "")
-    if image and not (mode == "lead" and style == "tabloid"):
-        bits.append(_paper_plate_html(image, meta.get("caption") if not meta.get("chart") else "",
-                                      meta.get("credit"), meta.get("focus"), headline))
-    bits.append(_paper_stats_html(meta.get("stats")))
-    chart = meta.get("chart")
-    if isinstance(chart, dict):
-        svg = _paper_svg_chart(chart)
-        if svg:
-            bits.append(svg)
-            if meta.get("caption"):
-                bits.append(f'<p class="caption">{_paper_esc(meta["caption"])}</p>')
-    bits.append(_paper_box_html(meta.get("box"), "itin" if hint == "itinerary" else ""))
-    bits.append(_paper_serial_html(meta.get("serial")))
-    if hint == "testimonial":
-        bits.append(_paper_quotes_html(meta.get("quotes"), style, "Testimonials"))
-    bits.append(_paper_interview_html(meta.get("interview")))
-    body_html = _md_html(str(a.get("body") or ""))
-    pull = str(meta.get("pull") or "")
-    if pull and mode not in ("lead", "brief"):
-        body_html = body_html.replace(
-            "</p>", "</p><blockquote class=\"pull\">" + _md_inline(pull) + "</blockquote>", 1)
-    elif pull and mode == "lead":
-        bits.append(f'<blockquote class="pull">{_md_inline(pull)}</blockquote>')
-    if mode == "brief":
-        first = re.search(r"<p>(.*?)</p>", body_html, flags=re.S)
-        body_html = f"<p>{first.group(1)[:260]}&hellip;</p>" if first else ""
-    bits.append(f'<div class="body">{body_html}</div>')
-    if mode != "brief":
-        if hint != "testimonial":
-            bits.append(_paper_quotes_html(meta.get("quotes"), style))
-        more = [i for i in (meta.get("images") or []) if isinstance(i, dict) and i.get("url")]
-        if more:
-            bits.append('<div class="plates">' + "".join(
-                _paper_plate_html(i.get("url"), i.get("caption"), i.get("credit"),
-                                  i.get("focus"), headline) for i in more[:6]) + "</div>")
-        bits.append(_paper_classifieds_html(meta.get("classifieds")))
-        srcs = [s for s in (meta.get("sources") or []) if isinstance(s, dict)]
-        if srcs:
-            bits.append('<p class="sources">Sources: ' + "; ".join(
-                (f'<a href="{_paper_esc(s["url"])}" target="_blank" rel="noopener">'
-                 f'{_paper_esc(s.get("name") or s["url"])}</a>')
-                if str(s.get("url") or "").startswith(("http://", "https://"))
-                else _paper_esc(s.get("name") or "") for s in srcs) + "</p>")
-    cls = ["lead" if mode == "lead" else "story"]
-    if hint:
-        cls.append(f"hint-{hint}")
-    span = str(meta.get("span") or "") == "full"
-    big = bool(meta.get("classifieds") or meta.get("interview"))
-    if mode == "story" and (span or big):
+                      kicker_html: str = "", bits: dict[str, Any] | None = None,
+                      blocks: tuple[int, int] | None = None, part: int = 0,
+                      tail: bool = True, jump_to: int = 0, jump_from: int = 0,
+                      est: float = 0.0, carry: bool = False) -> str:
+    """One story, every meta field (#1023) - and, since #1047, only the
+    slice of it that this page holds. `blocks` is the half-open range of
+    body blocks set here; `part` > 0 prints a continuation head instead of
+    the furniture, and `jump_to` prints the jump line."""
+    if bits is None:
+        bits = _paper_story_bits(a, ctx, mode)
+    lo, hi = blocks if blocks else (0, len(bits["blocks"]))
+    out: list[str] = [kicker_html] if kicker_html else []
+    key = _paper_esc(str(a.get("file") or bits["headline"])[:80])
+    if part:
+        out.append(f'<div class="conthead" data-cont="{key}">'
+                   f'{_paper_esc(_paper_short_head(bits["headline"]))}'
+                   f'<i>, from page <b>{jump_from or 1}</b></i></div>')
+        if carry:
+            # this continuation IS the furniture (#1047 LAY)
+            out.extend(bits.get("figures") or [])
+    else:
+        out.extend(bits["head"])
+    body = "".join(bits["blocks"][lo:hi])
+    out.append(f'<div class="body">{body}</div>')
+    if tail:
+        out.extend(bits["tail"])
+    if jump_to or not tail:
+        out.append(f'<p class="jump" data-jump="{key}">Continued on page '
+                   f'<b>{jump_to or 0}</b></p>')
+    cls = list(bits["cls"])
+    if mode == "side":
+        cls.append("side")
+    if part:
+        cls.append("cont")
+    if not tail:
+        cls.append("jumps")
+    if _paper_wide(a) or str((a.get("meta") or {}).get("span") or "") == "full":
         cls.append("span")
-    elif mode == "story" and (len(body_html) > 2600 or len(meta.get("quotes") or []) > 4):
-        cls.append("wide")
-    if mode in ("story", "side") and len(body_html) < 1100 and not big:
-        cls.append("short")
-    inner = "".join(b for b in bits if b)
-    return f'<article class="{" ".join(cls)}" data-file="{_paper_esc(a.get("file") or "")}">{inner}</article>'
+    src = f' data-jumpsrc="{key}"' if (jump_to or not tail) else ""
+    return (f'<article class="{" ".join(cls)}" data-file="{_paper_esc(a.get("file") or "")}"'
+            f' data-est="{int(est)}"{src}>' + "".join(b for b in out if b) + "</article>")
 
 
 def _paper_ctx(ed: dict[str, Any], style: str) -> dict[str, Any]:
+    """The edition, the masthead, the sheet's geometry and the packed
+    pages - everything both typesetters read (#1047)."""
     head = paper_masthead()
-    lead, pages = _paper_pages(ed)
+    style = _paper_style(style)
+    M = _paper_metrics(style)
     since = float(ed.get("since") or time.time())
     at = float(ed.get("at") or time.time())
     number = 1
@@ -97483,17 +103589,30 @@ def _paper_ctx(ed: dict[str, Any], style: str) -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         number = 1
     section_name = {s["id"]: s["name"] for s in head["sections"]}
-    index: list[tuple[int, str, str]] = []
-    for p in pages:
+    ctx: dict[str, Any] = {
+        "ed": ed, "head": head, "style": style, "metrics": M,
+        "lead": _paper_lead_of(ed),
+        "since": since, "at": at, "number": number, "section_name": section_name,
+        "paused": bool(ed.get("paused")), "offline": bool(ed.get("offline")),
+        "when": time.strftime("%A, %B %d, %Y", time.localtime(since)).replace(" 0", " "),
+        "hour": _paper_hour_words(since), "index": []}
+    # the index is set before the packer runs (the packer sets it in the
+    # side column) and needs the section names only
+    ctx["index"] = [(0, section_name.get(str((a.get("meta") or {}).get("section") or ""),
+                                         str((a.get("meta") or {}).get("section") or "")),
+                     str((a.get("meta") or {}).get("headline") or ""))
+                    for a in (ed.get("articles") or []) if not a.get("error")]
+    ctx["pages"] = _paper_plan_pages(ctx)
+    seen: dict[int, int] = {}
+    for p in ctx["pages"]:
         for a in p["stories"]:
-            meta = a.get("meta") or {}
-            index.append((p["n"], section_name.get(str(meta.get("section") or ""), str(meta.get("section") or "")),
-                          str(meta.get("headline") or "")))
-    return {"ed": ed, "head": head, "style": style, "lead": lead, "pages": pages,
-            "since": since, "at": at, "number": number, "section_name": section_name,
-            "index": index, "paused": bool(ed.get("paused")), "offline": bool(ed.get("offline")),
-            "when": time.strftime("%A, %B %d, %Y", time.localtime(since)).replace(" 0", " "),
-            "hour": _paper_hour_words(since)}
+            seen.setdefault(id(a), p["n"])
+    ctx["index"] = [(seen.get(id(a), 1),
+                     section_name.get(str((a.get("meta") or {}).get("section") or ""),
+                                      str((a.get("meta") or {}).get("section") or "")),
+                     str((a.get("meta") or {}).get("headline") or ""))
+                    for a in (ed.get("articles") or []) if not a.get("error")]
+    return ctx
 
 
 def _paper_index_html(ctx: dict[str, Any], most: int = 14) -> str:
@@ -97515,14 +103634,35 @@ def _paper_index_html(ctx: dict[str, Any], most: int = 14) -> str:
         + "</ul></div>")
 
 
+def _paper_air_strip(ctx: dict[str, Any]) -> str:
+    """N1 #1044: the masthead strip's few words about the air - "Paused -
+    14 minutes off the air", "Off the air - 2.1 hours". "" when the
+    station is on, and "" for an edition printed before air_state
+    existed."""
+    air = (ctx.get("ed") or {}).get("air_state")
+    return str((air or {}).get("strip") or "") if isinstance(air, dict) else ""
+
+
 def _paper_notice_html(ctx: dict[str, Any]) -> str:
-    """#1030: the paused edition says so in red; an offline hour in ink."""
+    """#1030: the paused edition says so in red; an offline hour in ink.
+
+    N1 #1044: the strip under the dateline now carries the whole sentence
+    paper_air_state wrote - which state the air is in, for how long, and
+    in whose words - because "is the radio paused?" was a question the
+    front page could not answer."""
     ed = ctx["ed"]
+    air = ed.get("air_state") if isinstance(ed.get("air_state"), dict) else {}
+    line = str((air or {}).get("line") or "")
     if ctx["paused"]:
-        return ('<div class="notice paused">The station is paused - this edition reports '
-                'the work behind the glass</div>')
+        return ('<div class="notice paused">'
+                + _paper_esc(line or "The station is paused - this edition "
+                                     "reports the work behind the glass")
+                + "</div>")
     if ctx["offline"] or (ed.get("on") is False):
-        return '<div class="notice">Printed with the station off the air - a quiet hour</div>'
+        return ('<div class="notice">'
+                + _paper_esc(line or "Printed with the station off the air - "
+                                     "a quiet hour")
+                + "</div>")
     return ""
 
 
@@ -97550,8 +103690,8 @@ def _paper_pause_extras(ctx: dict[str, Any]) -> str:
 def _paper_folio_html(ctx: dict[str, Any], n: int, total: int) -> str:
     head = ctx["head"]
     return (f'<div class="folio-foot"><span>{_paper_esc(head["masthead"])}</span>'
-            f'<span>{_paper_esc(ctx["when"])} · the {_paper_esc(ctx["hour"])} hour</span>'
-            f'<span>Page {n} of {total}</span></div>')
+            f'<span>{_paper_esc(ctx["when"])} &middot; the {_paper_esc(ctx["hour"])} hour</span>'
+            f'<span class="pn">Page {n} of {total}</span></div>')
 
 
 def _paper_colophon_html(ctx: dict[str, Any]) -> str:
@@ -97570,232 +103710,339 @@ def _paper_colophon_html(ctx: dict[str, Any]) -> str:
 
 
 def _paper_spans(a: dict[str, Any]) -> bool:
-    meta = a.get("meta") or {}
-    return (str(meta.get("span") or "") == "full" or bool(meta.get("classifieds"))
-            or bool(meta.get("interview")))
+    """Kept for anything outside the typesetter that asks; the packer uses
+    _paper_wide (#1047)."""
+    return _paper_wide(a)
 
 
-def _paper_flow_html(page: dict[str, Any], ctx: dict[str, Any], band_cls: str = "section") -> str:
-    """The stories of a page. Nothing spans inside a column flow: a story
-    that wants the whole width (span, the classifieds, the interview) is
-    set between two flows, and the tabloid's colour bands sit above each
-    section's own flow - Chrome's column balancer overflows the sheet when
-    a column-span:all element sits inside the columns (seen in the
-    screenshots of #1043's first cut)."""
+def _paper_item_html(item: dict[str, Any], ctx: dict[str, Any], page_n: int,
+                     band: bool = False, seen_secs: list[str] | None = None) -> str:
+    """One planned item - a column flow, a full-measure story, the paused
+    plexus - as HTML. Every flow carries its height inline and ends in a
+    sentinel so the page's own script can measure the crack that is left."""
+    M = ctx["metrics"]
+    if item["kind"] == "wide":
+        # #1047 (LAY): a wideblock carries the flow class and a sentinel, so
+        # the page's own fitter measures it like a column and fills the foot
+        # a full-measure story leaves. One column: no nN class.
+        return (f'<div class="wideblock flow" style="height:{item["h"]:.0f}px">'
+                + _paper_story_html(item["a"], ctx, "story", bits=item["bits"],
+                                    blocks=item["blocks"], part=item.get("part", 0),
+                                    tail=item.get("tail", True),
+                                    jump_to=item.get("jump_to", 0),
+                                    jump_from=item.get("jump_from", 0),
+                                    est=item.get("h", 0),
+                                    carry=bool(item.get("carry")))
+                + '<div class="fitend"></div></div>')
+    if item["kind"] == "extras":
+        return (f'<div class="wideblock" style="height:{item["h"]:.0f}px">'
+                + _paper_pause_extras(ctx) + "</div>")
+    if item["kind"] != "flow":
+        return ""
+    cols = int(M["cols"])
     out: list[str] = []
-    run: list[str] = []
-
-    def flush() -> None:
-        if run:
-            # n1/n2: a flow with one or two stories gets fewer columns and
-            # lets its stories break, so a lone story is not one tall strip
-            out.append(f'<div class="flow n{min(3, len(run))}">' + "".join(run) + "</div>")
-            run.clear()
-
-    if band_cls == "band":
-        groups: list[tuple[str, list[dict[str, Any]]]] = []
-        for a in page["stories"]:
-            sec = str((a.get("meta") or {}).get("section") or "")
-            if groups and groups[-1][0] == sec:
-                groups[-1][1].append(a)
-            else:
-                groups.append((sec, [a]))
-        for k, (sec, rows) in enumerate(groups):
-            name = ctx["section_name"].get(sec, sec)
-            out.append(f'<div class="band c{k % 5}">{_paper_esc(name)}<i>page {page["n"]}</i></div>')
-            for a in rows:
-                if _paper_spans(a):
-                    flush()
-                    out.append(_paper_story_html(a, ctx, "story"))
-                else:
-                    run.append(_paper_story_html(a, ctx, "story"))
-            flush()
-        return "".join(out)
-    current = ""
-    for a in page["stories"]:
+    secs = seen_secs if seen_secs is not None else []
+    for cell in item["cells"]:
+        if cell["kind"] == "fill":
+            out.append('<div class="fillrun"><div class="fillhead">'
+                       + ("Small ads" if ctx["style"] == "broadsheet" else "Classified")
+                       + "</div>" + "".join(cell["html"]) + "</div>")
+            continue
+        a = cell["a"]
         sec = str((a.get("meta") or {}).get("section") or "")
         kicker = ""
-        if sec != current:
+        if sec and sec not in secs and not cell.get("part"):
             name = ctx["section_name"].get(sec, sec)
-            kicker = f'<div class="section"><i>&#9632;</i> {_paper_esc(name)}</div>'
-            current = sec
-        if _paper_spans(a):
-            flush()
-            out.append(_paper_story_html(a, ctx, "story", kicker))
-        else:
-            run.append(_paper_story_html(a, ctx, "story", kicker))
-    flush()
-    return "".join(out)
+            secs.append(sec)
+            kicker = (f'<div class="band c{(len(secs) - 1) % 5}">{_paper_esc(name)}</div>'
+                      if band else
+                      f'<div class="section"><i>&#9632;</i> {_paper_esc(name)}</div>')
+        out.append(_paper_story_html(a, ctx, "story", kicker, bits=cell["bits"],
+                                     blocks=cell["blocks"], part=cell.get("part", 0),
+                                     tail=cell.get("tail", True),
+                                     jump_to=cell.get("jump_to", 0),
+                                     jump_from=cell.get("jump_from", 0),
+                                     est=cell.get("h", 0),
+                                     carry=bool(cell.get("carry"))))
+    if not out:
+        return ""
+    n = min(cols, max(1, len([c for c in item["cells"] if c["kind"] != "fill"]) or cols))
+    return (f'<div class="flow n{cols} c{n}" style="height:{item["h"]:.0f}px">'
+            + "".join(out) + '<div class="fitend"></div></div>')
+
+
+def _paper_flow_html(page: dict[str, Any], ctx: dict[str, Any],
+                     band_cls: str = "section") -> str:
+    """The stories of a page, in the flows the packer planned (#1047)."""
+    secs: list[str] = []
+    return "".join(_paper_item_html(i, ctx, page["n"], band_cls == "band", secs)
+                   for i in page["items"] if i["kind"] != "front")
+
+
+def _paper_air_line(ctx: dict[str, Any]) -> str:
+    """N1 #1044's masthead strip, read straight off the edition so the
+    typesetter does not depend on that lane having landed."""
+    air = (ctx.get("ed") or {}).get("air_state")
+    return str((air or {}).get("strip") or "") if isinstance(air, dict) else ""
+
+
+def _paper_front_html(item: dict[str, Any], ctx: dict[str, Any]) -> str:
+    """Page one's grid: the lead at full measure with its body in columns,
+    the index and the small ads beside it. Both halves are fixed boxes -
+    nothing in here can reach past the sheet."""
+    M = ctx["metrics"]
+    bits = item["bits"]
+    lo, hi = item["blocks"]
+    body = "".join(bits["blocks"][lo:hi])
+    if item.get("fill"):
+        body += ('<div class="fillrun"><div class="fillhead">Small ads</div>'
+                 + "".join(item["fill"]) + "</div>")
+    jump = ""
+    if not item.get("tail") or item.get("jump_to"):
+        key = _paper_esc(str(item["a"].get("file") or bits["headline"])[:80])
+        jump = (f'<p class="jump" data-jump="{key}">Continued on page '
+                f'<b>{item.get("jump_to") or 2}</b></p>')
+    art = (f'<article class="{" ".join(bits["cls"])}" data-jumpsrc="'
+           + _paper_esc(str(item["a"].get("file") or bits["headline"])[:80])
+           + f'" data-est="{int(item["h"])}">'
+           + "".join(bits["head"])
+           + f'<div class="body flow lead-body" style="height:{item["body_h"]:.0f}px;'
+             f'column-count:{item["cols"]}">{body}<div class="fitend"></div></div>'
+           + jump + "".join(bits["tail"] if item.get("tail") else []) + "</article>")
+    side = ("".join(item.get("side") or []))
+    return (f'<div class="front" style="height:{item["h"]:.0f}px">'
+            f'<div class="main">{art}</div>'
+            f'<div class="side flow n1" style="height:{item["side_h"]:.0f}px">'
+            f'{side}<div class="fitend"></div></div></div>')
+
+
+def _paper_page_open(ctx: dict[str, Any], p: dict[str, Any], total: int) -> str:
+    M = ctx["metrics"]
+    return (f'<div class="page p{p["n"]}" id="page-{p["n"]}" data-page="{p["n"]}" '
+            f'style="width:{M["w"]:.0f}px;height:{M["h"]:.0f}px;'
+            f'padding:{M["pad_top"]:.0f}px {M["pad_x"]:.0f}px {M["pad_bot"]:.0f}px">')
 
 
 def _paper_set_broadsheet(ctx: dict[str, Any]) -> str:
-    """#1042: the broadsheet - masthead, dateline, the lead in a wide main
-    column beside an index and the hour's sidebar, then pages of four
-    columns with a running head and a folio."""
-    ed, head, lead, pages = ctx["ed"], ctx["head"], ctx["lead"], ctx["pages"]
+    """#1042/#1047: the broadsheet - a fixed portrait sheet, the masthead
+    and dateline as page furniture that does not eat the measure, the lead
+    beside the index on page one, then four-column pages that hold exactly
+    what fits and fill the rest with small ads."""
+    ed, head, pages = ctx["ed"], ctx["head"], ctx["pages"]
+    M = ctx["metrics"]
     now = ed.get("now") or {}
     on_air = str(ed.get("on_air_now") or "")
+    strip = _paper_air_line(ctx)
     total = len(pages)
     out: list[str] = []
     for p in pages:
         n = p["n"]
-        out.append(f'<div class="page p{n}" id="page-{n}" data-page="{n}">')
+        out.append(_paper_page_open(ctx, p, total))
         if n == 1:
             out.append(
+                f'<div class="pgtop" data-est="{int(p["top"])}">'
                 '<div class="ears"><span>'
-                + (f"On air as we print: <b>{_paper_esc(on_air)}</b>" if on_air and not ctx["paused"] else
-                   f"<b>{_paper_esc(ed.get('station') or '')}</b>")
+                + (f"On air as we print: <b>{_paper_esc(on_air)}</b>"
+                   if on_air and not ctx["paused"] and not ctx["offline"] else
+                   f"<b>{_paper_esc(ed.get('station') or '')}</b>"
+                   + (f" &middot; <b>{_paper_esc(strip)}</b>" if strip else ""))
                 + "</span><span>"
-                + (f'<span class="tag">Tinted by {_paper_esc(ed.get("tinted_by"))}</span> · ' if ed.get("tinted_by") else "")
+                + (f'<span class="tag">Tinted by {_paper_esc(ed.get("tinted_by"))}</span> &middot; '
+                   if ed.get("tinted_by") else "")
                 + (f"Turning: <b>{_paper_esc(now.get('title') or '')}</b>"
-                   + (f" · {_paper_esc(now.get('artist'))}" if now.get("artist") else "")
-                   if now.get("title") else "Printed on the hour")
+                   + (f" &middot; {_paper_esc(now.get('artist'))}" if now.get("artist") else "")
+                   if now.get("title") and not ctx["paused"] and not ctx["offline"]
+                   else "Printed on the hour")
                 + "</span></div>"
                 f"<h1 class=\"masthead\">{_paper_esc(head['masthead'])}</h1>"
                 f"<p class=\"motto\">{_paper_esc(head['motto'])}</p>"
                 "<div class=\"dateline\">"
-                f"<span>Vol. 1 · No. {ctx['number']}</span>"
-                f"<span>{_paper_esc(ctx['when'])} · the {_paper_esc(ctx['hour'])} hour"
-                + (" · extra" if str(ed.get("kind")) != "hourly" else "")
-                + f" · {total} pages</span>"
+                f"<span>Vol. 1 &middot; No. {ctx['number']}</span>"
+                f"<span>{_paper_esc(ctx['when'])} &middot; the {_paper_esc(ctx['hour'])} hour"
+                + (" &middot; extra" if str(ed.get("kind")) != "hourly" else "")
+                + f" &middot; {total} pages</span>"
                 f"<span>Printed {_paper_clock(ctx['at'])}</span></div>"
-                + _paper_notice_html(ctx))
-            side_stories = p["stories"][:2]
-            flow_stories = p["stories"][2:]
-            out.append('<div class="front"><div class="main">')
-            if lead is not None:
-                out.append(_paper_story_html(lead, ctx, "lead"))
-                out.append(_paper_pause_extras(ctx))
-            out.append('</div><div class="side">')
-            out.append(_paper_index_html(ctx))
-            for a in side_stories:
-                out.append('<div class="hl">Highlight</div>')
-                out.append(_paper_story_html(a, ctx, "side"))
-            out.append("</div></div>")
-            if flow_stories:
-                out.append('<div class="p1flow">' + _paper_flow_html({"n": 1, "stories": flow_stories}, ctx) + "</div>")
+                + _paper_notice_html(ctx) + "</div>")
         else:
-            secs = " · ".join(ctx["section_name"].get(s, s) for s in p["sections"][:4])
-            out.append('<div class="pghead">'
+            secs = " &middot; ".join(_paper_esc(ctx["section_name"].get(s, s))
+                                     for s in p["sections"][:4])
+            out.append(f'<div class="pgtop" data-est="{int(p["top"])}"><div class="pghead">'
                        f'<span class="mh">{_paper_esc(head["masthead"])}</span>'
-                       f'<span>{_paper_esc(secs)}</span>'
-                       f'<span class="folio">{_paper_esc(ctx["when"])} · <b>{n}</b></span></div>')
-            out.append(_paper_flow_html(p, ctx))
-        if n == total:
-            out.append(_paper_colophon_html(ctx))
-        out.append(_paper_folio_html(ctx, n, total))
+                       f'<span>{secs}</span>'
+                       f'<span class="folio">{_paper_esc(ctx["when"])} &middot; '
+                       f'<b>{n}</b></span></div></div>')
+        out.append(f'<div class="pgbody" style="height:{p["body_h"]:.0f}px">')
+        secs_seen: list[str] = []
+        for item in p["items"]:
+            if item["kind"] == "front":
+                out.append(_paper_front_html(item, ctx))
+            else:
+                out.append(_paper_item_html(item, ctx, n, False, secs_seen))
+        out.append("</div>")
+        out.append(f'<div class="pgfoot" data-est="{int(M["foot"])}">'
+                   + (_paper_colophon_html(ctx) if n == total else "")
+                   + _paper_folio_html(ctx, n, total) + "</div>")
         out.append("</div>")
     return "".join(out)
 
 
 def _paper_set_tabloid(ctx: dict[str, Any]) -> str:
-    """#1043: the tabloid - the red masthead block, the price roundel,
-    three teasers, the lead's picture with the headline on it and a flash,
-    the story below in two columns with coloured side boxes; inside,
-    colour bands, boxed quotes and dense pages of three columns."""
+    """#1043/#1047: the tabloid - the same fixed sheet in a smaller, denser
+    proportion; the red masthead, the roundel and the splash are page-one
+    furniture, and inside, colour bands over three-column pages that are
+    packed and then filled to the foot."""
     ed, head, lead, pages = ctx["ed"], ctx["head"], ctx["lead"], ctx["pages"]
+    M = ctx["metrics"]
     total = len(pages)
-    # the roundel reads caption-then-word: "this paper costs / FREE",
-    # "the station is / PAUSED"
+    strip = _paper_air_line(ctx)
     price, price_cap = ("PAUSED", "the station is") if ctx["paused"] else ("FREE", "this paper costs")
     out: list[str] = []
-    # #1037: a teaser points INSIDE the paper. Built off every page, the
-    # strip led with page 1's own stories and said "page 1".
-    others = [a for pp in pages if pp["n"] > 1 for a in pp["stories"]]
+    others = [a for p in pages for a in p["stories"]]
     for p in pages:
         n = p["n"]
-        out.append(f'<div class="page p{n}" id="page-{n}" data-page="{n}">')
+        out.append(_paper_page_open(ctx, p, total))
         if n == 1:
             lead_meta = (lead or {}).get("meta") or {}
-            out.append('<div class="tmast"><div class="red">'
+            top = ['<div class="pgtop" data-est="%d">' % int(p["top"])]
+            top.append('<div class="tmast"><div class="red">'
                        f'<h1>{_paper_esc(head["masthead"])}</h1>'
                        f'<div class="sub"><span>{_paper_esc(ctx["when"])}</span>'
-                       f'<span>the {_paper_esc(ctx["hour"])} hour{" · extra" if str(ed.get("kind")) != "hourly" else ""}</span>'
+                       f'<span>the {_paper_esc(ctx["hour"])} hour'
+                       f'{" &middot; extra" if str(ed.get("kind")) != "hourly" else ""}</span>'
                        f'<span>No. {ctx["number"]}</span><span>{total} pages</span>'
-                       + (f'<span>Tinted by {_paper_esc(ed.get("tinted_by"))}</span>' if ed.get("tinted_by") else "")
+                       + (f'<span>{_paper_esc(strip)}</span>' if strip else "")
+                       + (f'<span>Tinted by {_paper_esc(ed.get("tinted_by"))}</span>'
+                          if ed.get("tinted_by") else "")
                        + "</div></div>"
                        f'<div class="roundel{" small" if len(price) > 4 else ""}">'
                        f'<span>{_paper_esc(price_cap)}</span><b>{price}</b></div></div>')
             teasers = [a for a in others if a is not lead][:3]
             if teasers:
-                out.append('<div class="teasers">' + "".join(
+                top.append('<div class="teasers">' + "".join(
                     f'<div class="teaser c{k}">'
-                    + (f'<img src="{_paper_esc((a.get("meta") or {}).get("image"))}" alt="" onerror="this.remove()">'
+                    + (f'<img src="{_paper_esc((a.get("meta") or {}).get("image"))}" alt="" '
+                       'onerror="this.remove()">'
                        if (a.get("meta") or {}).get("image") else "<span></span>")
-                    + f'<div><h3>{_paper_esc(str((a.get("meta") or {}).get("headline") or "")[:60])}</h3>'
+                    + f'<div><h3>{_paper_esc(_paper_short_head(str((a.get("meta") or {}).get("headline") or ""), 46))}</h3>'
                     f'<small>{_paper_esc(ctx["section_name"].get(str((a.get("meta") or {}).get("section") or ""), ""))}'
-                    f' · page {next((pp["n"] for pp in pages if a in pp["stories"]), 2)}</small></div></div>'
+                    f' &middot; page {next((pp["n"] for pp in pages if a in pp["stories"]), 2)}</small>'
+                    "</div></div>"
                     for k, a in enumerate(teasers)) + "</div>")
-            out.append(_paper_notice_html(ctx))
+            top.append(_paper_notice_html(ctx))
             if lead is not None:
                 kicker = str(lead_meta.get("kicker") or ("Paused" if ctx["paused"] else "The hour"))
-                out.append(f'<div class="kicker-bar">{_paper_esc(kicker)}</div>')
+                top.append(f'<div class="kicker-bar">{_paper_esc(kicker)}</div>')
                 img = str(lead_meta.get("image") or ed.get("lead_image") or "")
                 focus = str(lead_meta.get("focus") or "center")
                 flash = str(lead_meta.get("flash") or ("Station paused" if ctx["paused"] else "Exclusive"))
                 hl = str(lead_meta.get("headline") or "")
                 size = "xl" if len(hl) > 64 else "long" if len(hl) > 36 else ""
                 cap = "" if lead_meta.get("chart") else str(lead_meta.get("caption") or "")
-                out.append(f'<div class="splash {focus}">'
-                           + (f'<img src="{_paper_esc(img)}" alt="" onerror="this.remove()">' if img else "")
+                top.append(f'<div class="splash {focus}" style="height:{M["splash"]:.0f}px">'
+                           + (f'<img src="{_paper_esc(img)}" alt="" onerror="this.remove()">'
+                              if img else "")
                            + (f'<span class="cap">{_paper_esc(cap)}'
-                              + (f' <span class="credit">{_paper_esc(lead_meta.get("credit"))}</span>' if lead_meta.get("credit") else "")
+                              + (f' <span class="credit">{_paper_esc(lead_meta.get("credit"))}</span>'
+                                 if lead_meta.get("credit") else "")
                               + "</span>" if img and (cap or lead_meta.get("credit")) else "")
                            + f'<div class="flash">{_paper_esc(flash)}</div>'
                            '<div class="head">'
                            f'<h2 class="splash-head {size}">{_paper_esc(hl)}</h2>'
-                           + (f'<p class="deck">{_paper_esc(lead_meta.get("deck"))}</p>' if lead_meta.get("deck") else "")
+                           + (f'<p class="deck">{_paper_esc(lead_meta.get("deck"))}</p>'
+                              if lead_meta.get("deck") else "")
                            + "</div></div>")
-                out.append('<div class="tfront"><div class="main">')
-                out.append(_paper_story_html(lead, ctx, "lead").replace('class="lead', 'class="lead tlead', 1))
-                out.append(_paper_pause_extras(ctx))
-                out.append('</div><div class="side">')
-                for k, a in enumerate(p["stories"][:3]):
-                    meta = a.get("meta") or {}
-                    out.append(f'<div class="tbox {"y" if k == 1 else f"c{k % 5}"}">'
-                               + (f'<div class="kicker">{_paper_esc(meta.get("kicker"))}</div>' if meta.get("kicker") else "")
-                               + f'<h3>{_paper_esc(meta.get("headline") or "")}</h3>'
-                               + (f"<p>{_paper_esc(meta.get('deck'))}</p>" if meta.get("deck") else "")
-                               # #1037: a promo, not a second printing -
-                               # the stats and the ruled sidebar belong to
-                               # the story in the band flow below.
-                               + '<div class="more">Full story below</div></div>')
-                out.append("</div></div>")
-            rest = p["stories"]
-            if rest:
-                out.append(_paper_flow_html(p, ctx, "band"))
+            top.append("</div>")
+            out.append("".join(top))
         else:
-            secs = " · ".join(ctx["section_name"].get(s, s) for s in p["sections"][:2])
-            out.append('<div class="pghead">'
+            secs = " &middot; ".join(_paper_esc(ctx["section_name"].get(s, s))
+                                     for s in p["sections"][:2])
+            out.append(f'<div class="pgtop" data-est="{int(p["top"])}"><div class="pghead">'
                        f'<span class="mh">{_paper_esc(head["masthead"])}</span>'
-                       f'<span>{_paper_esc(secs)}</span>'
-                       f'<span class="folio">{_paper_esc(ctx["when"])}<b>{n}</b></span></div>')
-            out.append(_paper_flow_html(p, ctx, "band"))
-        if n == total:
-            out.append(_paper_colophon_html(ctx))
-        out.append(_paper_folio_html(ctx, n, total))
+                       f'<span>{secs}</span>'
+                       f'<span class="folio">{_paper_esc(ctx["when"])}<b>{n}</b></span>'
+                       "</div></div>")
+        out.append(f'<div class="pgbody" style="height:{p["body_h"]:.0f}px">')
+        secs_seen: list[str] = []
+        for item in p["items"]:
+            if item["kind"] == "front":
+                out.append(_paper_front_html(item, ctx))
+            else:
+                out.append(_paper_item_html(item, ctx, n, True, secs_seen))
+        out.append("</div>")
+        out.append(f'<div class="pgfoot" data-est="{int(M["foot"])}">'
+                   + (_paper_colophon_html(ctx) if n == total else "")
+                   + _paper_folio_html(ctx, n, total) + "</div>")
         out.append("</div>")
     return "".join(out)
 
 
+def _paper_reserve_html(ctx: dict[str, Any]) -> tuple[str, str]:
+    """#1047: the spare small ads the page's own script draws on when the
+    server's estimate left a column foot open, and the empty page it
+    clones when a story has to be re-homed. Both are <template>s: they
+    cost nothing until the script reaches for them."""
+    M = ctx["metrics"]
+    pool = _paper_filler_rows(ctx["ed"])
+    used: set[int] = set()
+    spare: list[str] = []
+    for i, row in enumerate(pool):
+        html, _h = _paper_filler_html(row, float(M["col_w"]), M)
+        spare.append(html)
+        used.add(i)
+        if len(spare) >= 48:
+            break
+    # NOT the one-line ruled closers: the top-up sets anything in here that
+    # fits, and a 22px notice always fits - eleven of them took a column of
+    # page one before this was found. `closeFeet` makes its own out of
+    # PAPER_CLOSERS, three to a column at most (#1047 LAY).
+    reserve = ('<template id="fillreserve">' + "".join(spare) + "</template>") if spare else ""
+    return reserve, ""
+
+
 def paper_render_html(ed: dict[str, Any], style: str = "broadsheet") -> str:
-    """One door, two typesetters (#1037). The stamp in the first line is
-    what the cache checks; the page carries its own audio script (#1023)."""
+    """One door, two typesetters (#1037), one sheet format (#1047). The
+    stamp in the first line is what the cache checks; the page carries its
+    own audio script (#1023) and its own fitter (#1047), which measures
+    the sheet it landed on, re-homes anything the server's estimate got
+    wrong, tops the columns up out of the reserve and scales the sheet to
+    the window."""
     style = _paper_style(style)
     ctx = _paper_ctx(ed, style)
     head = ctx["head"]
+    M = ctx["metrics"]
     body = _paper_set_tabloid(ctx) if style == "tabloid" else _paper_set_broadsheet(ctx)
-    css = _PAPER_CSS_COMMON + (_PAPER_CSS_TABLOID if style == "tabloid" else _PAPER_CSS)
+    reserve, pagetpl = _paper_reserve_html(ctx)
+    css = (_PAPER_CSS_COMMON + (_PAPER_CSS_TABLOID if style == "tabloid" else _PAPER_CSS)
+           + _paper_sheet_css(M))
+    fit = (_PAPER_FIT_JS.replace("__SLACK__", str(int(PAPER_SLACK_OK)))
+           .replace("__CLOSERS__", json.dumps(list(PAPER_CLOSERS))))
     title = f"{head['masthead']} · {ctx['hour']} hour" + (" · tabloid" if style == "tabloid" else "")
     return (f"<!doctype html><!--PAPER_RENDER_VERSION={PAPER_RENDER_VERSION} style={style}-->"
             "<html><head><meta charset=\"utf-8\">"
             f"<title>{_paper_esc(title)}</title>"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             f"<style>{css}</style></head>"
-            f"<body class=\"{style}{' paused' if ctx['paused'] else ''}\" data-pages=\"{len(ctx['pages'])}\" "
+            f"<body class=\"{style}{' paused' if ctx['paused'] else ''}\" "
+            f"data-pages=\"{len(ctx['pages'])}\" "
             f"data-style=\"{style}\" data-edition=\"{_paper_esc(ed.get('id') or '')}\">"
-            f"<div class=\"sheet {style}\">{body}</div>"
-            f"<script>{_PAPER_AUDIO_JS}</script></body></html>")
+            f"<div class=\"sheetwrap\"><div class=\"sheet {style}\">{body}</div></div>"
+            + reserve + pagetpl
+            + f"<script>{_PAPER_AUDIO_JS}</script>"
+            f"<script>{_PAPER_READER_JS}</script>"
+            f"<script>{fit}</script></body></html>")
+
+
+def _paper_sheet_css(M: dict[str, Any]) -> str:
+    """The few rules that carry the sheet's own numbers - written per
+    edition so the CSS blocks above stay constants."""
+    return (
+        f".sheet{{width:{M['w']:.0f}px}}"
+        f".page{{width:{M['w']:.0f}px;height:{M['h']:.0f}px}}"
+        f".flow{{column-gap:{M['gap']:.0f}px}}"
+        f".flow.n{int(M['cols'])}{{column-count:{int(M['cols'])}}}"
+        f".front{{grid-template-columns:1fr {M['side_w']:.0f}px}}"
+        f"@page{{size:{M['w'] / 96.0:.2f}in {M['h'] / 96.0:.2f}in;margin:0}}"
+    )
 
 
 def _paper_md_plain(body: str) -> str:
@@ -98212,6 +104459,1965 @@ def paper_html_for(edition_id: str, style: str) -> str | None:
     return html
 
 
+# --- #1045: the reader behind a headline ------------------------------------
+# "when i click a news story from the paper, pop up a page in a
+#  https://archive.ph/ format of the original news story showing me the full
+#  news story in a contained popup window."
+#
+# The Wire prints what the desk covered and hangs the source url on every
+# headline. drudge_story() already goes and gets an article, but it boils it
+# down to fourteen sentences for the pair to talk over - a reader wants the
+# whole thing. So: fetch once, off the loop; pull the title, the byline, the
+# date, every paragraph of the body and the plates; keep it on disk under
+# data/news_read/<sha1>.json so the second click is instant; hand the page one
+# clean column and nothing else. No model call and no vision call - it is the
+# original story, set in the paper's own type.
+NEWSREAD_DIR = data_path("news_read")
+NEWSREAD_KEEP = 400                  # readings on the shelf before the oldest go
+NEWSREAD_LIFE = 14 * 24 * 3600.0     # a reading this old is fetched again
+NEWSREAD_HTML_MAX = 3 * 1024 * 1024  # of markup; past that it is navigation
+NEWSREAD_PARAS = 400
+NEWSREAD_CHARS = 90000
+# The reader is a door into the outside world, never into this house: the
+# operator's browser asks the STATION to fetch a url, so the station refuses
+# its own network rather than become a probe for it.
+_NEWSREAD_LOCAL = re.compile(
+    r"^(?:localhost$|127\.|10\.|192\.168\.|169\.254\.|0\.|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.|\[?::1\]?$|.*\.local$|.*\.internal$)", re.I)
+_NEWSREAD_CUT = re.compile(
+    r"<(script|style|noscript|svg|form|nav|aside|footer|template|iframe|select)"
+    r"\b[^>]*>.*?</\1\s*>", re.I | re.S)
+_NEWSREAD_COMMENT = re.compile(r"<!--.*?-->", re.S)
+_NEWSREAD_TAG = re.compile(r"<[^>]+>")
+_NEWSREAD_BLOCK = re.compile(
+    r"<(p|h2|h3|h4|li|blockquote)\b[^>]*>(.*?)</\1\s*>", re.I | re.S)
+_NEWSREAD_JUNK = re.compile(
+    r"^(?:advertisement|sponsored|read more|related|share this|share on|"
+    r"sign up|subscribe|newsletter|follow us|most read|more from|comments|"
+    r"photo credit|copyright|all rights reserved|cookie|privacy policy|"
+    r"terms of|you may also like|trending|recommended|watch:|listen:|"
+    r"click here|skip to|by continuing|enable javascript)\b", re.I)
+_NEWSREAD_IMG = re.compile(
+    r'<img\b[^>]*?\s(?:data-src|data-lazy-src|src)\s*=\s*'
+    r'["\']([^"\']+)["\'][^>]*>', re.I)
+_NEWSREAD_META = re.compile(r"<meta\b[^>]*>", re.I)
+_NEWSREAD_ENDS = (".", "!", "?", "”", "’", '"', "'")
+
+
+def newsread_key(url: str) -> str:
+    """The shelf name of a reading - the url hashed, because urls carry
+    slashes and query strings and a file name may not."""
+    return hashlib.sha1(str(url or "").encode("utf-8", "ignore")).hexdigest()
+
+
+def newsread_allow(url: str) -> str:
+    """The url a reader may fetch, or "" when it may not (#1045)."""
+    u = str(url or "").strip()
+    if not u.lower().startswith(("http://", "https://")) or len(u) > 2000:
+        return ""
+    try:
+        host = (urlparse(u).hostname or "").strip().lower()
+    except ValueError:
+        return ""
+    if not host or _NEWSREAD_LOCAL.match(host):
+        return ""
+    return u
+
+
+def _newsread_flat(chunk: str) -> str:
+    """Markup to one line of readable text."""
+    txt = _NEWSREAD_TAG.sub(" ", chunk or "")
+    txt = html_unescape(txt).replace("\xa0", " ")
+    txt = re.sub(r"\s+", " ", txt)
+    # Stripping an inline <a> or <em> leaves the space it stood on, so a
+    # sentence comes out as "mostly fake ." - close those up again.
+    txt = re.sub(r"\s+([,.;:!?%)\]])", r"\1", txt)
+    return re.sub(r"([(\[“‘])\s+", r"\1", txt).strip()
+
+
+def _newsread_abs(base: str, src: str) -> str:
+    """A page-relative src made absolute (urljoin is not among the file's
+    imports and one import line is not worth the merge risk)."""
+    src = (src or "").strip().split(" ")[0]
+    if not src or src.startswith(("data:", "javascript:", "#")):
+        return ""
+    if src.startswith("//"):
+        return (urlparse(base).scheme or "https") + ":" + src
+    if src.startswith(("http://", "https://")):
+        return src
+    b = urlparse(base)
+    if not b.netloc:
+        return ""
+    root = f"{b.scheme or 'https'}://{b.netloc}"
+    if src.startswith("/"):
+        return root + src
+    return f"{root}{b.path.rsplit('/', 1)[0]}/{src}"
+
+
+def _newsread_meta(doc: str, names: tuple[str, ...]) -> str:
+    """The first <meta> whose property/name/itemprop matches one of `names`,
+    unescaped. Head only - the tail of a long page is comment threads."""
+    tags = _NEWSREAD_META.findall(doc[:400000])
+    for name in names:
+        want = re.compile(r'(?:property|name|itemprop)\s*=\s*["\']'
+                          + re.escape(name) + r'["\']', re.I)
+        for tag in tags:
+            if not want.search(tag):
+                continue
+            got = (re.search(r'content\s*=\s*"([^"]*)"', tag, re.I)
+                   or re.search(r"content\s*=\s*'([^']*)'", tag, re.I))
+            if got and got.group(1).strip():
+                return html_unescape(got.group(1).strip())[:400]
+    return ""
+
+
+def _newsread_blocks(chunk: str, title: str,
+                     tight: bool = True) -> list[dict[str, str]]:
+    """Paragraphs, subheads, list items and pull quotes in the order they
+    are written, with the navigation and the boilerplate left behind. A
+    block is {k, t}: k is p, h, li or q, so the reader can set a subhead as
+    a subhead instead of flattening the piece into one grey slab.
+
+    `tight` is True when the chunk IS the article element - then a list is
+    part of the piece and is kept. Over a whole page it is False and lists
+    are dropped, because off an article a <li> is almost always a menu."""
+    kinds = {"p": "p", "h2": "h", "h3": "h", "h4": "h", "li": "li",
+             "blockquote": "q"}
+    seen: set[str] = set()
+    out: list[dict[str, str]] = []
+    tnorm = re.sub(r"\W+", "", (title or "").lower())[:60]
+    for m in _NEWSREAD_BLOCK.finditer(chunk):
+        kind = kinds.get(m.group(1).lower(), "p")
+        text = _newsread_flat(m.group(2))
+        if not text or len(text) > 6000 or _NEWSREAD_JUNK.match(text):
+            continue
+        low = re.sub(r"\W+", "", text.lower())
+        if not low or low in seen:
+            continue
+        if kind == "h":
+            if len(text) > 200 or (tnorm and low[:60] == tnorm):
+                continue
+        elif kind == "li":
+            if not tight or len(text) < 12 or len(text) > 600:
+                continue
+        else:
+            # A real sentence, not a caption crumb or a word off a menu.
+            if len(text) < 45:
+                continue
+            if len(text) < 90 and not text.endswith(_NEWSREAD_ENDS):
+                continue
+        letters = [c for c in text if c.isalpha()]
+        if (kind != "h" and letters and len(text) < 160
+                and sum(c.isupper() for c in letters) / len(letters) > 0.6):
+            continue
+        seen.add(low)
+        out.append({"k": kind, "t": text})
+        if len(out) >= NEWSREAD_PARAS:
+            break
+    return out
+
+
+def newsread_extract(doc: str, url: str) -> dict[str, Any]:
+    """The story out of the markup: title, byline, date, the body in order
+    and the plates. Stdlib only. The container is the <article> when it
+    carries the prose and the whole page when it does not; either way what
+    survives is the blocks that read like writing rather than like a site."""
+    doc = doc[:NEWSREAD_HTML_MAX]
+    clean = _NEWSREAD_COMMENT.sub(" ", doc)
+    for _ in range(3):                       # <nav> inside <aside> inside …
+        cut = _NEWSREAD_CUT.sub(" ", clean)
+        if cut == clean:
+            break
+        clean = cut
+    title = _newsread_meta(doc, ("og:title", "twitter:title", "headline"))
+    if not title:
+        got = re.search(r"<title[^>]*>(.*?)</title>", doc, re.I | re.S)
+        title = _newsread_flat(got.group(1)) if got else ""
+    if not title:
+        got = re.search(r"<h1[^>]*>(.*?)</h1>", clean, re.I | re.S)
+        title = _newsread_flat(got.group(1)) if got else ""
+    if len(title) > 70:                      # "Story headline | The Paper"
+        title = re.sub(r"\s*[|–—·]\s*[^|–—·]{0,40}$",
+                       "", title)
+    byline = _newsread_meta(doc, ("author", "article:author", "byl",
+                                  "og:article:author", "dc.creator"))
+    if not byline:
+        got = re.search(r'<[^>]+(?:class|id|rel)\s*=\s*"[^"]*(?:byline|author)'
+                        r'[^"]*"[^>]*>(.{0,300}?)</', clean, re.I | re.S)
+        byline = _newsread_flat(got.group(1)) if got else ""
+    byline = re.sub(r"^by\s+", "", byline, flags=re.I).strip()[:160]
+    published = _newsread_meta(
+        doc, ("article:published_time", "og:article:published_time",
+              "datePublished", "date", "pubdate", "article:modified_time"))
+    if not published:
+        got = re.search(r'<time\b[^>]*datetime\s*=\s*"([^"]+)"', clean, re.I)
+        published = html_unescape(got.group(1)).strip()[:60] if got else ""
+    best = ""
+    for m in re.finditer(r"<article\b[^>]*>(.*?)</article\s*>", clean, re.I | re.S):
+        if len(m.group(1)) > len(best):
+            best = m.group(1)
+    blocks = _newsread_blocks(best, title) if len(best) > 500 else []
+    if len(blocks) < 3:
+        wide = _newsread_blocks(clean, title, tight=False)
+        if len(wide) > len(blocks):
+            blocks = wide
+            best = ""
+    kept: list[dict[str, str]] = []
+    total = 0
+    for b in blocks:
+        kept.append(b)
+        total += len(b["t"])
+        if total > NEWSREAD_CHARS:
+            break
+    images: list[str] = []
+    lead = _newsread_meta(doc, ("og:image", "twitter:image", "twitter:image:src"))
+    if lead:
+        got_url = _newsread_abs(url, lead)
+        if got_url:
+            images.append(got_url)
+    for m in _NEWSREAD_IMG.finditer(best or clean):
+        got_url = _newsread_abs(url, m.group(1))
+        if not got_url or got_url in images or _IMG_SKIP.search(got_url):
+            continue
+        images.append(got_url)
+        if len(images) >= 6:
+            break
+    return {"title": title[:300], "byline": byline, "published": published,
+            "paragraphs": [b["t"] for b in kept], "blocks": kept,
+            "images": images}
+
+
+def newsread_cached(url: str) -> dict[str, Any] | None:
+    """A reading off the shelf, or None. Disk - call it in a thread."""
+    path = NEWSREAD_DIR / f"{newsread_key(url)}.json"
+    try:
+        row = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(row, dict) or not row.get("ok"):
+        return None
+    if time.time() - float(row.get("fetched_at") or 0) > NEWSREAD_LIFE:
+        return None
+    return row
+
+
+def newsread_save(row: dict[str, Any]) -> None:
+    """One reading onto the shelf, the oldest off the end. Disk - thread."""
+    try:
+        NEWSREAD_DIR.mkdir(parents=True, exist_ok=True)
+        path = NEWSREAD_DIR / f"{newsread_key(row.get('url') or '')}.json"
+        path.write_text(json.dumps(row, ensure_ascii=False), encoding="utf-8")
+        files = sorted(NEWSREAD_DIR.glob("*.json"),
+                       key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in files[NEWSREAD_KEEP:]:
+            old.unlink(missing_ok=True)
+    except OSError:
+        pass                       # a forgetful shelf still reads the story
+
+
+async def newsread_get(url: str, refresh: bool = False) -> dict[str, Any]:
+    """The reading for a url (#1045): the shelf first, then the wire. Every
+    failure comes back as a row with `error` set and `ok` false, because the
+    popup has to say WHY the story is not there - a spinner that never stops
+    is the one answer the operator cannot use."""
+    good = newsread_allow(url)
+    host = (urlparse(good).hostname or "") if good else ""
+    base: dict[str, Any] = {
+        "ok": False, "url": str(url or "")[:2000], "host": host, "title": "",
+        "byline": "", "published": "", "paragraphs": [], "blocks": [],
+        "images": [], "fetched_at": 0.0, "cached": False, "error": ""}
+    if not good:
+        return {**base, "error": "That link is not a public web address."}
+    if not refresh:
+        hit = await asyncio.to_thread(newsread_cached, good)
+        if hit:
+            return {**hit, "cached": True, "error": ""}
+    try:
+        async with httpx.AsyncClient(
+                timeout=httpx.Timeout(18.0, connect=8.0),
+                follow_redirects=True, headers=FETCH_HEADERS) as client:
+            reply = await client.get(good)
+    except httpx.TimeoutException:
+        return {**base, "error": f"{host} did not answer in time."}
+    except Exception as exc:  # noqa: BLE001
+        return {**base,
+                "error": f"{host} could not be reached ({exc.__class__.__name__})."}
+    if reply.status_code >= 400:
+        why = ("refuses readers" if reply.status_code in (401, 403, 451)
+               else "has no such story" if reply.status_code == 404
+               else "answered with an error")
+        return {**base, "error": f"{host} {why} (HTTP {reply.status_code})."}
+    kind = str(reply.headers.get("content-type") or "").lower()
+    if kind and "html" not in kind and "xml" not in kind:
+        return {**base,
+                "error": f"That link is a {kind.split(';')[0]}, not an article."}
+    try:
+        got = await asyncio.to_thread(newsread_extract, reply.text, str(reply.url))
+    except Exception as exc:  # noqa: BLE001
+        return {**base,
+                "error": f"The reader could not set that page ({exc.__class__.__name__})."}
+    row: dict[str, Any] = {**base, **got, "url": str(reply.url)[:2000],
+                           "host": (urlparse(str(reply.url)).hostname or host),
+                           "fetched_at": time.time()}
+    if not row["paragraphs"]:
+        row["error"] = (f"{row['host']} sent a page with no readable story - "
+                        "it is behind a wall, or written by script.")
+        return row
+    row["ok"] = True
+    await asyncio.to_thread(newsread_save, row)
+    return row
+
+
+# --- P2 #1048: THE PDF WRITER ----------------------------------------------
+#
+# "when i click pdf, i want to save and export the newspaper as a pdf. add a
+#  pdf writer system to it that is agnostic of OS able to write PDFs to file."
+#
+# The PDF button used to call the browser's own print dialogue. That makes a
+# file on the operator's machine, in whatever the OS felt like, and the
+# station never sees it - nothing is archived, nothing can be handed on, and
+# a headless box has no dialogue to open at all. This sets the paper itself.
+#
+# Two guarded imports and nothing else: fpdf2 (pure python, no system
+# libraries and no fonts - the built-in PDF faces Times, Helvetica and
+# Courier are part of every reader) writes the file, and Pillow, already here
+# for the gallery card, prepares the plates. The pictures come off
+# /comfy-output by the same disk-first road the image route uses
+# (comfy_output_find), so a paper prints its plates whether or not ComfyUI is
+# up. Without the wheels every entry point answers None, the route answers
+# 501 and names the line of requirements.txt that is missing, and the panel
+# keeps the browser's print as a labelled fallback. Nothing here runs on the
+# event loop: the routes and the press call it through asyncio.to_thread.
+
+PAPER_PDF_VERSION = 1               # bump when the setter changes
+PDF_MM_PT = 25.4 / 72.0             # fpdf sizes type in points, pages in mm
+PAPER_PDF_PLATE_PX = 1100           # longest side a plate is downscaled to
+PAPER_PDF_PLATES_MAX = 48           # plates per edition - one paper cannot
+                                    # spend the whole box on pictures
+PAPER_PDF_SHEETS_MAX = 40           # a runaway edition still terminates
+
+# The built-in faces speak latin-1. The station's prose is full of
+# typographic punctuation and the panel's symbols; translate what has an
+# equivalent and drop the rest rather than stopping an edition over a dingbat.
+_PDF_TRANSLATE = {
+    0x2018: "'", 0x2019: "'", 0x201a: ",", 0x201b: "'",
+    0x201c: '"', 0x201d: '"', 0x201e: '"',
+    0x2010: "-", 0x2011: "-", 0x2012: "-", 0x2013: "-", 0x2014: "-",
+    0x2015: "-", 0x2212: "-", 0x00ad: "",
+    0x2026: "...", 0x2022: "-", 0x2027: "-",
+    0x2032: "'", 0x2033: '"', 0x2039: "<", 0x203a: ">",
+    0x2190: "<-", 0x2192: "->", 0x2191: "^", 0x2193: "v",
+    0x2264: "<=", 0x2265: ">=", 0x2260: "!=", 0x00d7: "x",
+    0x25a0: "-", 0x25aa: "-", 0x25b6: ">", 0x25c0: "<", 0x25b8: ">",
+    0x2b07: "v", 0x2b06: "^", 0x00a0: " ", 0x2009: " ", 0x202f: " ",
+    0x2044: "/", 0x2116: "No.", 0x2122: "(TM)", 0x00ae: "(R)",
+    0x2713: "y", 0x2717: "x", 0x2605: "*", 0x2606: "*",
+}
+
+
+def _pdf_latin(text: Any) -> str:
+    """What the built-in faces can actually set. Curly quotes, dashes and
+    the panel's arrows become their plain twins; an emoji is dropped."""
+    s = str(text if text is not None else "").translate(_PDF_TRANSLATE)
+    if s.isascii():
+        return s
+    return "".join(ch for ch in s if ord(ch) < 0x100)
+
+
+def pdf_engine() -> Any:
+    """fpdf2's FPDF, or None when the wheel is not installed. One import
+    attempt per call - the module cache makes that free after the first."""
+    try:
+        from fpdf import FPDF  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    return FPDF
+
+
+def pdf_missing() -> str:
+    """What the operator has to add, in as many words, or "" when the
+    writer is ready. This is what the 501 says out loud."""
+    if pdf_engine() is None:
+        return ("the PDF writer needs fpdf2 - add `fpdf2==2.8.8` to "
+                "requirements.txt and relaunch the app")
+    return ""
+
+
+def _pdf_pillow() -> Any:
+    """Pillow, or None. Plates are simply left out when it is missing;
+    the type is still set."""
+    try:
+        from PIL import Image  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    return Image
+
+
+def pdf_new(orientation: str, fmt: str, title: str = "",
+            subject: str = "") -> Any:
+    """A document with the station's own metadata on it. None when fpdf2
+    is missing, so every caller has one thing to check."""
+    FPDF = pdf_engine()
+    if FPDF is None:
+        return None
+    pdf = FPDF(orientation=orientation, unit="mm", format=fmt)
+    pdf.set_auto_page_break(False)      # the sheet turns its own pages
+    pdf.set_margins(0, 0, 0)
+    try:
+        pdf.set_title(_pdf_latin(title)[:180])
+        pdf.set_author(_pdf_latin(PINE_BOX_FM)[:120])
+        pdf.set_creator("Pine Box FM - the Gazette press")
+        if subject:
+            pdf.set_subject(_pdf_latin(subject)[:180])
+        pdf.set_compression(True)
+    except Exception:  # noqa: BLE001
+        pass
+    return pdf
+
+
+# --- the sheet: columns, and a cursor that walks them ----------------------
+
+class PaperPdfSheet:
+    """A page of a newspaper as a set of columns and one cursor.
+
+    Everything the setter draws asks the sheet for room first (`room`,
+    `need`); when a column fills the cursor steps to the next one, and
+    when the last column fills the sheet turns to a continuation sheet,
+    redraws the running head and the folio, and carries on. That is the
+    whole trick: one flow, six columns, real line breaking, and not a
+    scrap of HTML anywhere near it."""
+
+    def __init__(self, pdf: Any, width: float, height: float,
+                 margin: float, top: float, bottom: float,
+                 columns: int, gutter: float) -> None:
+        self.pdf = pdf
+        self.W, self.H = float(width), float(height)
+        self.margin = float(margin)
+        self.top, self.bottom = float(top), float(bottom)
+        self.gutter = float(gutter)
+        self.ncols = max(1, int(columns))
+        self.left = self.margin
+        self.measure = self.W - 2 * self.margin
+        self.ci = 0
+        self.y = self.top
+        self.col_top = self.top     # where a fresh column starts on THIS page
+        self.page_no = 0
+        self.head = ""
+        self.folio = ""
+        self.foot_left = ""
+        self.foot_right = ""
+        self.sheets = 0
+        self.plates = 0
+
+    # -- geometry ---------------------------------------------------------
+    @property
+    def col_w(self) -> float:
+        return (self.measure - self.gutter * (self.ncols - 1)) / self.ncols
+
+    def col_x(self, index: int | None = None) -> float:
+        i = self.ci if index is None else int(index)
+        return self.left + i * (self.col_w + self.gutter)
+
+    @property
+    def x(self) -> float:
+        return self.col_x()
+
+    def frame(self, columns: int, top: float | None = None,
+              left: float | None = None, measure: float | None = None) -> None:
+        """Re-cut the page into a different number of columns from `top`
+        down - what the front page does under its masthead."""
+        self.ncols = max(1, int(columns))
+        if left is not None:
+            self.left = float(left)
+        if measure is not None:
+            self.measure = float(measure)
+        self.ci = 0
+        self.col_top = float(self.top if top is None else top)
+        self.y = self.col_top
+
+    def room(self) -> float:
+        return self.bottom - self.y
+
+    def full_measure(self) -> float:
+        return self.measure
+
+    # -- turning -----------------------------------------------------------
+    def _open(self, cont: bool = False) -> None:
+        if self.sheets >= PAPER_PDF_SHEETS_MAX:
+            raise RuntimeError("the edition ran past its sheet ceiling")
+        self.pdf.add_page()
+        self.sheets += 1
+        self.left = self.margin
+        self.measure = self.W - 2 * self.margin
+        self.ci = 0
+        self.col_top = self.top
+        self.y = self.top
+        self._furniture(cont)
+
+    def new_page(self, head: str = "", folio: str = "",
+                 columns: int | None = None) -> None:
+        self.page_no += 1
+        self.head = head
+        self.folio = folio
+        if columns:
+            self.ncols = max(1, int(columns))
+        self._open(False)
+
+    def continued(self) -> None:
+        """The page's stories outran its columns: another sheet, the same
+        page number, and the running head says so."""
+        self._open(True)
+
+    def _furniture(self, cont: bool = False) -> None:
+        pdf = self.pdf
+        pdf.set_draw_color(30, 28, 25)
+        pdf.set_line_width(0.25)
+        pdf.line(self.margin, self.top - 4.6, self.W - self.margin, self.top - 4.6)
+        pdf.set_font("helvetica", "B", 6.6)
+        pdf.set_text_color(70, 66, 60)
+        pdf.text(self.margin, self.top - 6.2,
+                 _pdf_latin(self.head + (" - continued" if cont else "")).upper())
+        if self.folio:
+            label = _pdf_latin(self.folio)
+            pdf.set_font("helvetica", "", 6.6)
+            pdf.text(self.W - self.margin - pdf.get_string_width(label),
+                     self.top - 6.2, label)
+        pdf.set_line_width(0.2)
+        pdf.line(self.margin, self.bottom + 3.4, self.W - self.margin,
+                 self.bottom + 3.4)
+        pdf.set_font("helvetica", "", 6.2)
+        pdf.set_text_color(120, 115, 106)
+        pdf.text(self.margin, self.bottom + 6.4, _pdf_latin(self.foot_left))
+        right = _pdf_latin(self.foot_right)
+        pdf.text(self.W - self.margin - pdf.get_string_width(right),
+                 self.bottom + 6.4, right)
+        pdf.set_text_color(20, 19, 17)
+
+    def next_column(self) -> None:
+        if self.ci + 1 < self.ncols:
+            self.ci += 1
+            self.y = self.col_top
+        else:
+            self.continued()
+
+    def need(self, height: float, keep: bool = False) -> bool:
+        """Room for `height` mm in this column, or step to the next one.
+        A block taller than a whole column is let through rather than
+        turning pages for ever; it will simply run to the foot."""
+        h = float(height)
+        if self.room() >= h:
+            return False
+        if h > (self.bottom - self.col_top) and self.y <= self.col_top + 0.01:
+            return False
+        self.next_column()
+        return True
+
+    def space(self, mm: float) -> None:
+        if self.y > self.col_top:
+            self.y = min(self.bottom, self.y + float(mm))
+
+    def rule(self, weight: float = 0.25, gap: float = 1.4,
+             colour: tuple[int, int, int] = (30, 28, 25),
+             width: float | None = None) -> None:
+        self.need(gap * 2 + weight)
+        self.y += gap
+        self.pdf.set_draw_color(*colour)
+        self.pdf.set_line_width(weight)
+        w = self.col_w if width is None else float(width)
+        self.pdf.line(self.x, self.y, self.x + w, self.y)
+        self.y += gap
+
+
+# --- inline runs: bold, italic, links --------------------------------------
+
+_PDF_LINK = re.compile(r"\[([^\]]+)\]\((https?://[^)\s]+)\)")
+_PDF_BOLD = re.compile(r"\*\*(.+?)\*\*")
+_PDF_ITAL = re.compile(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])")
+
+
+def _pdf_runs(text: Any) -> list[tuple[str, str, str]]:
+    """A markdown line as (word, style, href) tokens - the same subset
+    `_md_html` sets: **bold**, *italic*, [text](url). Word by word,
+    because the justifier places every word itself."""
+    s = _pdf_latin(text)
+    out: list[tuple[str, str, str]] = []
+    pieces: list[tuple[str, str]] = []
+    at = 0
+    for m in _PDF_LINK.finditer(s):
+        if m.start() > at:
+            pieces.append((s[at:m.start()], ""))
+        pieces.append((m.group(1), m.group(2)))
+        at = m.end()
+    pieces.append((s[at:], ""))
+    for chunk, href in pieces:
+        spans: list[tuple[int, int, str]] = []
+        for m in _PDF_BOLD.finditer(chunk):
+            spans.append((m.start(), m.end(), "B"))
+        for m in _PDF_ITAL.finditer(chunk):
+            if not any(a <= m.start() < b for a, b, _ in spans):
+                spans.append((m.start(), m.end(), "I"))
+        spans.sort()
+        cursor = 0
+        flat: list[tuple[str, str]] = []
+        for a, b, mark in spans:
+            if a < cursor:
+                continue
+            if a > cursor:
+                flat.append((chunk[cursor:a], ""))
+            inner = chunk[a:b]
+            flat.append((inner[2:-2] if mark == "B" else inner[1:-1], mark))
+            cursor = b
+        flat.append((chunk[cursor:], ""))
+        for run, mark in flat:
+            for word in run.split():
+                out.append((word, mark, href))
+    return out
+
+
+def _pdf_word_w(pdf: Any, word: str, family: str, size: float,
+                style: str) -> float:
+    pdf.set_font(family, style, size)
+    return float(pdf.get_string_width(word))
+
+
+def pdf_para(sheet: PaperPdfSheet, text: Any, family: str = "times",
+             size: float = 8.4, style: str = "", leading: float = 1.16,
+             colour: tuple[int, int, int] = (20, 19, 17), justify: bool = True,
+             indent: float = 0.0, width: float | None = None,
+             x: float | None = None, after: float = 0.0,
+             most: int = 4000) -> None:
+    """One paragraph, wrapped to the column and flowing across columns and
+    sheets as it fills them. Justified by hand - every word placed at its
+    own x, the slack shared between the gaps - because that is what a
+    newspaper column looks like, and fpdf's own justification cannot
+    break across a column boundary."""
+    pdf = sheet.pdf
+    runs = _pdf_runs(text)[:most]
+    if not runs:
+        return
+    lh = size * PDF_MM_PT * leading
+    space_w = _pdf_word_w(pdf, " ", family, size, style)
+    fixed = width
+    full = (fixed if fixed is not None else sheet.col_w)
+    lines: list[list[tuple[str, str, str, float]]] = []
+    line: list[tuple[str, str, str, float]] = []
+    used = 0.0
+    avail = full - indent
+    for word, run_style, href in runs:
+        st = "B" if "B" in (style + run_style) else ("I" if "I" in (style + run_style) else "")
+        if "B" in style and "I" in run_style:
+            st = "BI"
+        w = _pdf_word_w(pdf, word, family, size, st)
+        add = w if not line else w + space_w
+        if line and used + add > avail:
+            lines.append(line)
+            line, used, avail = [], 0.0, full
+            add = w
+        line.append((word, st, href, w))
+        used += add
+    if line:
+        lines.append(line)
+    first = True
+    for i, row in enumerate(lines):
+        if sheet.need(lh):
+            first = False
+        cx = (sheet.x if x is None else float(x)) + (indent if first else 0.0)
+        cw = full - (indent if first else 0.0)
+        baseline = sheet.y + size * PDF_MM_PT * 0.79
+        words_w = sum(t[3] for t in row)
+        gaps = len(row) - 1
+        gap = space_w
+        if justify and gaps > 0 and i != len(lines) - 1:
+            gap = max(space_w * 0.7, min(space_w * 3.2, (cw - words_w) / gaps))
+        pdf.set_text_color(*colour)
+        pen = cx
+        for word, st, href, w in row:
+            pdf.set_font(family, st, size)
+            pdf.text(pen, baseline, word)
+            if href:
+                pdf.link(pen, baseline - size * PDF_MM_PT * 0.8, w,
+                         size * PDF_MM_PT, href)
+            pen += w + gap
+        sheet.y += lh
+        first = False
+    if after:
+        sheet.y += after
+    pdf.set_text_color(20, 19, 17)
+
+
+def pdf_heading(sheet: PaperPdfSheet, text: Any, size: float,
+                family: str = "times", style: str = "B",
+                colour: tuple[int, int, int] = (17, 16, 14),
+                leading: float = 1.05, caps: bool = False,
+                width: float | None = None, x: float | None = None,
+                align: str = "left", after: float = 0.0) -> None:
+    """A headline, a deck or a section label: wrapped, never justified,
+    never split across a column - a headline broken in half is not a
+    headline."""
+    pdf = sheet.pdf
+    s = _pdf_latin(text)
+    if caps:
+        s = s.upper()
+    if not s.strip():
+        return
+    w = (sheet.col_w if width is None else float(width))
+    pdf.set_font(family, style, size)
+    lines: list[str] = []
+    cur = ""
+    for word in s.split():
+        trial = (cur + " " + word).strip()
+        if pdf.get_string_width(trial) <= w or not cur:
+            cur = trial
+        else:
+            lines.append(cur)
+            cur = word
+    if cur:
+        lines.append(cur)
+    lh = size * PDF_MM_PT * leading
+    sheet.need(lh * len(lines), keep=True)
+    pdf.set_text_color(*colour)
+    for row in lines:
+        cx = (sheet.x if x is None else float(x))
+        if align == "center":
+            cx += (w - pdf.get_string_width(row)) / 2
+        elif align == "right":
+            cx += w - pdf.get_string_width(row)
+        pdf.text(cx, sheet.y + size * PDF_MM_PT * 0.80, row)
+        sheet.y += lh
+    if after:
+        sheet.y += after
+    pdf.set_text_color(20, 19, 17)
+
+
+def pdf_lines_high(pdf: Any, text: Any, family: str, size: float,
+                   style: str, width: float, leading: float = 1.16) -> float:
+    """How tall a run of text would set at that measure - what a block
+    asks before it decides whether it fits."""
+    pdf.set_font(family, style, size)
+    n, cur = 1, ""
+    for word in _pdf_latin(text).split():
+        trial = (cur + " " + word).strip()
+        if pdf.get_string_width(trial) <= width or not cur:
+            cur = trial
+        else:
+            n += 1
+            cur = word
+    return n * size * PDF_MM_PT * leading
+
+
+# --- plates ----------------------------------------------------------------
+
+def pdf_plate_image(url: Any, cache: dict[str, Any] | None = None) -> Any:
+    """The picture behind a plate URL, downscaled, as a PIL image.
+
+    The same disk-first road the image route uses: a bare gallery name is
+    resolved by comfy_output_find off the mounted output folder, so the
+    paper prints its pictures whether or not ComfyUI is running. An http
+    URL is not fetched - the press must never wait on the network."""
+    raw = str(url or "").strip()
+    name = raw.rsplit("/", 1)[-1].split("?", 1)[0]
+    if not name or raw.startswith(("http://", "https://")):
+        return None
+    if cache is not None and name in cache:
+        return cache[name]
+    Image = _pdf_pillow()
+    out = None
+    if Image is not None:
+        try:
+            path = comfy_output_find(name)
+            if path is not None:
+                img = Image.open(path)
+                img = img.convert("RGB")
+                img.thumbnail((PAPER_PDF_PLATE_PX, PAPER_PDF_PLATE_PX))
+                out = img
+        except Exception:  # noqa: BLE001
+            out = None
+    if cache is not None:
+        cache[name] = out
+    return out
+
+
+def pdf_plate(sheet: PaperPdfSheet, url: Any, caption: Any = "",
+              credit: Any = "", focus: Any = "center",
+              width: float | None = None, ratio: float = 0.68,
+              cache: dict[str, Any] | None = None) -> bool:
+    """One plate: cropped to the measure at `ratio`, honouring the focus
+    the desk asked for, with its cutline under a hairline. False when the
+    picture is not on disk - and then the caption goes with it, so a page
+    never carries an orphan cutline."""
+    if sheet.plates >= PAPER_PDF_PLATES_MAX:
+        return False
+    img = pdf_plate_image(url, cache)
+    if img is None:
+        return False
+    pdf = sheet.pdf
+    w = (sheet.col_w if width is None else float(width))
+    h = w * float(ratio)
+    cap_h = 0.0
+    if caption or credit:
+        cap_h = 1.6 + pdf_lines_high(
+            pdf, (str(credit or "") + " " + str(caption or "")),
+            "helvetica", 5.9, "", w, 1.22)
+    sheet.need(h + 1.4 + cap_h, keep=True)
+    bw, bh = int(img.width), int(img.height)
+    want, have = w / h, bw / max(1, bh)
+    if have > want:                     # too wide: trim the sides
+        new_w = max(1, int(bh * want))
+        left = (bw - new_w) // 2
+        crop = (left, 0, left + new_w, bh)
+    else:                               # too tall: trim to the focus
+        new_h = max(1, int(bw / want))
+        spare = bh - new_h
+        f = str(focus or "center")
+        top = 0 if f == "top" else spare if f == "bottom" else spare // 2
+        crop = (0, top, bw, top + new_h)
+    try:
+        buf = io.BytesIO()
+        img.crop(crop).save(buf, format="JPEG", quality=76, optimize=True)
+        buf.seek(0)
+        pdf.image(buf, x=sheet.x, y=sheet.y, w=w, h=h)
+    except Exception:  # noqa: BLE001
+        return False
+    sheet.plates += 1
+    pdf.set_draw_color(30, 28, 25)
+    pdf.set_line_width(0.2)
+    pdf.rect(sheet.x, sheet.y, w, h)
+    sheet.y += h + 1.0
+    if caption or credit:
+        pdf.set_draw_color(160, 154, 143)
+        pdf.set_line_width(0.15)
+        pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+        sheet.y += 0.9
+        pdf_para(sheet, (f"**{credit}** " if credit else "") + str(caption or ""),
+                 "helvetica", 5.9, leading=1.22, colour=(84, 80, 73),
+                 justify=False, width=w, after=1.6)
+    return True
+
+
+# --- the furniture of a story: charts, tables, boxes, quotes ---------------
+
+_PDF_INK = (24, 22, 20)
+_PDF_GREY = (96, 92, 85)
+_PDF_RULE = (168, 162, 150)
+_PDF_WEDGES = ((176, 26, 42), (40, 62, 96), (150, 128, 62), (72, 104, 84),
+               (120, 92, 130), (96, 92, 85), (196, 122, 60), (60, 60, 60))
+
+
+def _pdf_fit(pdf: Any, text: str, room: float) -> str:
+    """As much of a label as the slot will hold. A chart with seven bars in
+    a 60 mm column had its tick labels running into each other; a label
+    that does not fit is cut, not overprinted."""
+    out = _pdf_latin(text)
+    while out and pdf.get_string_width(out) > room:
+        out = out[:-1]
+    return out
+
+
+def pdf_chart(sheet: PaperPdfSheet, chart: Any, width: float | None = None,
+              height: float | None = None) -> bool:
+    """The desk's numbers again, drawn as vector - the same series the
+    sheet's SVG draws, set with fpdf's own lines and arcs so the file has
+    no bitmap in it and stays sharp at any size."""
+    if not isinstance(chart, dict):
+        return False
+    kind = str(chart.get("kind") or "line")
+    try:
+        values = [float(v) for v in (chart.get("values") or [])]
+    except (TypeError, ValueError):
+        return False
+    if not values:
+        return False
+    labels = [_pdf_latin(x) for x in (chart.get("labels") or [])]
+    w = (sheet.col_w if width is None else float(width))
+    if kind == "pie":
+        return _pdf_chart_pie(sheet, values, labels, w)
+    if len(values) < 2:
+        return False
+    h = (w * 0.56 if height is None else float(height))
+    sheet.need(h + 3.0, keep=True)
+    pdf = sheet.pdf
+    x0, y0 = sheet.x, sheet.y
+    pad_l, pad_b, pad_t = 9.0, 5.4, 2.4
+    iw, ih = w - pad_l - 1.5, h - pad_t - pad_b
+    lo = float(chart["min"]) if chart.get("min") is not None else min(values)
+    hi = float(chart["max"]) if chart.get("max") is not None else max(values)
+    if hi <= lo:
+        hi = lo + 1.0
+
+    def yy(v: float) -> float:
+        return y0 + pad_t + ih - (max(lo, min(hi, v)) - lo) / (hi - lo) * ih
+    pdf.set_line_width(0.12)
+    pdf.set_font("helvetica", "", 4.6)
+    for k in range(5):
+        gy = y0 + pad_t + ih * k / 4
+        pdf.set_draw_color(198, 192, 180)
+        pdf.line(x0 + pad_l, gy, x0 + pad_l + iw, gy)
+        pdf.set_text_color(*_PDF_GREY)
+        tick = f"{hi - (hi - lo) * k / 4:.0f}"
+        pdf.text(x0 + pad_l - 1.0 - pdf.get_string_width(tick), gy + 1.5, tick)
+    n = len(values)
+    every = 1 if n <= 8 else (2 if n <= 18 else 4)
+    show = bool(chart.get("show_values"))
+    if kind == "bars":
+        slot = iw / n
+        bw = slot * 0.62
+        for i, v in enumerate(values):
+            bx = x0 + pad_l + slot * i + (slot - bw) / 2
+            top = yy(v)
+            pdf.set_fill_color(58, 74, 100)
+            pdf.rect(bx, top, bw, max(0.2, y0 + pad_t + ih - top), style="F")
+            if show:
+                pdf.set_font("helvetica", "B", 4.4)
+                pdf.set_text_color(*_PDF_INK)
+                lab = f"{v:.0f}"
+                pdf.text(bx + (bw - pdf.get_string_width(lab)) / 2, top - 0.8, lab)
+            if i < len(labels) and i % every == 0:
+                pdf.set_font("helvetica", "", 4.4)
+                pdf.set_text_color(*_PDF_GREY)
+                lab = _pdf_fit(pdf, labels[i][:14], slot * 0.96)
+                pdf.text(bx + (bw - pdf.get_string_width(lab)) / 2,
+                         y0 + h - 1.0, lab)
+    else:
+        step = iw / (n - 1)
+        pts = [(x0 + pad_l + step * i, yy(v)) for i, v in enumerate(values)]
+        pdf.set_draw_color(176, 26, 42)
+        pdf.set_line_width(0.4)
+        for i in range(len(pts) - 1):
+            pdf.line(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1])
+        pdf.set_fill_color(176, 26, 42)
+        for i, (px, py) in enumerate(pts):
+            if n <= 26:
+                pdf.ellipse(px - 0.5, py - 0.5, 1.0, 1.0, style="F")
+            if i < len(labels) and i % every == 0:
+                pdf.set_font("helvetica", "", 4.4)
+                pdf.set_text_color(*_PDF_GREY)
+                lab = _pdf_fit(pdf, labels[i][:14], step * every * 0.96)
+                pdf.text(px - pdf.get_string_width(lab) / 2, y0 + h - 1.0, lab)
+    pdf.set_draw_color(*_PDF_INK)
+    pdf.set_line_width(0.2)
+    pdf.line(x0 + pad_l, y0 + pad_t + ih, x0 + pad_l + iw, y0 + pad_t + ih)
+    pdf.set_text_color(*_PDF_INK)
+    sheet.y = y0 + h + 1.4
+    return True
+
+
+def _pdf_chart_pie(sheet: PaperPdfSheet, values: list[float],
+                   labels: list[str], w: float) -> bool:
+    """A pie and its key. fpdf's solid_arc draws the wedge; the key sits
+    under it so a narrow column never has to hold both side by side."""
+    mass = sum(v for v in values if v > 0)
+    if mass <= 0:
+        return False
+    pdf = sheet.pdf
+    rows = [(labels[i] if i < len(labels) else f"#{i + 1}", v)
+            for i, v in enumerate(values) if v > 0][:8]
+    d = min(w * 0.62, 34.0)
+    key_h = len(rows) * 3.2 + 1.0
+    sheet.need(d + key_h + 3.0, keep=True)
+    cx, cy, r = sheet.x + d / 2, sheet.y + d / 2, d / 2
+    start = -90.0
+    for i, (_name, v) in enumerate(rows):
+        sweep = 360.0 * v / mass
+        pdf.set_fill_color(*_PDF_WEDGES[i % len(_PDF_WEDGES)])
+        pdf.set_draw_color(255, 255, 255)
+        pdf.set_line_width(0.2)
+        try:
+            pdf.solid_arc(x=cx, y=cy, a=r, b=r, start_angle=start,
+                          end_angle=start + sweep, style="FD")
+        except Exception:  # noqa: BLE001
+            pass
+        start += sweep
+    sheet.y += d + 1.6
+    for i, (name, v) in enumerate(rows):
+        pdf.set_fill_color(*_PDF_WEDGES[i % len(_PDF_WEDGES)])
+        pdf.rect(sheet.x, sheet.y + 0.5, 2.0, 2.0, style="F")
+        pdf.set_font("helvetica", "", 5.4)
+        pdf.set_text_color(*_PDF_INK)
+        pct = f"{100.0 * v / mass:.0f}%"
+        pdf.text(sheet.x + 2.8, sheet.y + 2.2,
+                 _pdf_fit(pdf, name[:30], w - 4.0 - pdf.get_string_width(pct)))
+        pdf.text(sheet.x + w - pdf.get_string_width(pct), sheet.y + 2.2, pct)
+        sheet.y += 3.2
+    sheet.y += 1.2
+    return True
+
+
+def pdf_stats(sheet: PaperPdfSheet, stats: Any, width: float | None = None) -> bool:
+    """The big-number callouts, side by side in one ruled band."""
+    rows = [s for s in (stats or []) if isinstance(s, dict)
+            and s.get("value") is not None][:4]
+    if not rows:
+        return False
+    pdf = sheet.pdf
+    w = (sheet.col_w if width is None else float(width))
+    h = 11.0
+    sheet.need(h + 2.0, keep=True)
+    cell = w / len(rows)
+    pdf.set_draw_color(*_PDF_INK)
+    pdf.set_line_width(0.5)
+    pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    for i, s in enumerate(rows):
+        cx = sheet.x + cell * i
+        if i:
+            pdf.set_line_width(0.12)
+            pdf.set_draw_color(*_PDF_RULE)
+            pdf.line(cx - 0.6, sheet.y + 1.0, cx - 0.6, sheet.y + h - 1.0)
+        val = _pdf_latin(s.get("value"))[:9]
+        size = 12.0 if len(val) <= 4 else (9.5 if len(val) <= 6 else 7.5)
+        pdf.set_font("helvetica", "B", size)
+        pdf.set_text_color(176, 26, 42)
+        pdf.text(cx + 0.6, sheet.y + 6.6, val)
+        pdf.set_font("helvetica", "", 4.9)
+        pdf.set_text_color(*_PDF_GREY)
+        pdf.text(cx + 0.6, sheet.y + 9.6, _pdf_latin(s.get("label"))[:26].upper())
+    pdf.set_line_width(0.2)
+    pdf.set_draw_color(*_PDF_INK)
+    pdf.line(sheet.x, sheet.y + h, sheet.x + w, sheet.y + h)
+    pdf.set_text_color(*_PDF_INK)
+    sheet.y += h + 1.8
+    return True
+
+
+def pdf_table(sheet: PaperPdfSheet, rows: list[list[str]],
+              width: float | None = None, size: float = 5.6) -> None:
+    """An agate table: the head in small caps under a heavy rule, the
+    body on hairlines, every cell wrapped to its own share of the
+    measure. Column widths follow the longest cell, so a table of times
+    and a table of sentences both read."""
+    if not rows:
+        return
+    pdf = sheet.pdf
+    w = (sheet.col_w if width is None else float(width))
+    ncol = max(len(r) for r in rows)
+    pdf.set_font("helvetica", "", size)
+    wants = []
+    for c in range(ncol):
+        longest = max((pdf.get_string_width(_pdf_latin(r[c])[:60])
+                       for r in rows if c < len(r)), default=1.0)
+        wants.append(max(4.0, longest))
+    total = sum(wants) or 1.0
+    pad = 0.9
+    widths = [max(6.0, (w - pad * (ncol - 1)) * (x / total)) for x in wants]
+    over = sum(widths) + pad * (ncol - 1) - w
+    if over > 0:                       # squeeze the widest column back in
+        widest = widths.index(max(widths))
+        widths[widest] = max(6.0, widths[widest] - over)
+    lh = size * PDF_MM_PT * 1.22
+    for i, row in enumerate(rows):
+        cells: list[list[str]] = []
+        for c in range(ncol):
+            text = _pdf_latin(row[c] if c < len(row) else "")
+            text = _PDF_BOLD.sub(r"\1", text)
+            pdf.set_font("helvetica", "B" if i == 0 else "", size)
+            lines, cur = [], ""
+            for word in text.split():
+                trial = (cur + " " + word).strip()
+                if pdf.get_string_width(trial) <= widths[c] or not cur:
+                    cur = trial
+                else:
+                    lines.append(cur)
+                    cur = word
+            if cur:
+                lines.append(cur)
+            cells.append(lines or [""])
+        high = max(len(c) for c in cells) * lh + 0.7
+        sheet.need(high + 0.6)
+        if i == 0:
+            pdf.set_draw_color(*_PDF_INK)
+            pdf.set_line_width(0.35)
+            pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+            sheet.y += 0.7
+        pen = sheet.x
+        for c in range(ncol):
+            pdf.set_font("helvetica", "B" if i == 0 else "", size)
+            pdf.set_text_color(*(_PDF_INK if i == 0 else (46, 44, 40)))
+            for k, line in enumerate(cells[c]):
+                pdf.text(pen, sheet.y + lh * (k + 1) - 0.9,
+                         line.upper() if i == 0 else line)
+            pen += widths[c] + pad
+        sheet.y += high
+        pdf.set_draw_color(*(_PDF_INK if i == 0 else _PDF_RULE))
+        pdf.set_line_width(0.3 if i == 0 else 0.1)
+        pdf.line(sheet.x, sheet.y - 0.4, sheet.x + w, sheet.y - 0.4)
+    sheet.y += 1.6
+    pdf.set_text_color(*_PDF_INK)
+
+
+def pdf_box(sheet: PaperPdfSheet, title: Any, items: Any,
+            width: float | None = None) -> None:
+    """A ruled sidebar - the running order, the index, the itinerary."""
+    rows = [str(i) for i in (items or []) if str(i).strip()][:16]
+    if not rows:
+        return
+    pdf = sheet.pdf
+    w = (sheet.col_w if width is None else float(width))
+    high = 5.4 + sum(pdf_lines_high(pdf, r, "times", 6.6, "", w - 3.4, 1.2) + 0.5
+                     for r in rows) + 2.0
+    sheet.need(min(high, sheet.bottom - sheet.top - 2), keep=True)
+    top = sheet.y
+    pdf.set_fill_color(236, 231, 219)
+    pdf.rect(sheet.x, top, w, 4.6, style="F")
+    pdf.set_font("helvetica", "B", 5.8)
+    pdf.set_text_color(*_PDF_INK)
+    pdf.text(sheet.x + 1.4, top + 3.2, _pdf_latin(title or "").upper()[:52])
+    sheet.y = top + 5.6
+    for row in rows:
+        pdf.set_fill_color(176, 26, 42)
+        pdf.rect(sheet.x + 1.0, sheet.y + 1.0, 0.9, 0.9, style="F")
+        pdf_para(sheet, row, "times", 6.6, leading=1.2, justify=False,
+                 width=w - 3.4, x=sheet.x + 3.4, after=0.5)
+    sheet.y += 0.6
+    pdf.set_draw_color(*_PDF_INK)
+    pdf.set_line_width(0.25)
+    pdf.rect(sheet.x, top, w, sheet.y - top)
+    sheet.y += 2.2
+
+
+def pdf_pull(sheet: PaperPdfSheet, text: Any, width: float | None = None) -> None:
+    """The pull quote: two rules and a line of italic in a larger size."""
+    s = str(text or "").strip()
+    if not s:
+        return
+    w = (sheet.col_w if width is None else float(width))
+    sheet.need(pdf_lines_high(sheet.pdf, s, "times", 10.5, "I", w, 1.18) + 5.0,
+               keep=True)
+    sheet.pdf.set_draw_color(*_PDF_INK)
+    sheet.pdf.set_line_width(0.7)
+    sheet.pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    sheet.y += 2.0
+    pdf_para(sheet, '"' + s.strip('"') + '"', "times", 10.5, style="I",
+             leading=1.18, justify=False, width=w, after=1.6)
+    sheet.pdf.set_line_width(0.25)
+    sheet.pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    sheet.y += 2.4
+
+
+def pdf_quotes(sheet: PaperPdfSheet, quotes: Any, title: str = "",
+               width: float | None = None, base: str = "") -> None:
+    """#1023: the verbatim lines. The paper cannot play a clip, so where
+    the sheet shows a play button the PDF prints a link to the same
+    audio - clickable when the file knows the station's address, and
+    named as a line of the air log either way."""
+    rows = [q for q in (quotes or []) if isinstance(q, dict)
+            and str(q.get("text") or "").strip()][:10]
+    if not rows:
+        return
+    w = (sheet.col_w if width is None else float(width))
+    pdf_heading(sheet, title or "In their own words", 6.2, "helvetica", "B",
+                caps=True, width=w, after=0.6)
+    sheet.pdf.set_draw_color(*_PDF_INK)
+    sheet.pdf.set_line_width(0.3)
+    sheet.need(1.0)
+    sheet.pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    sheet.y += 1.4
+    for q in rows:
+        who = _pdf_latin(q.get("who") or "")
+        when = ""
+        try:
+            when = f" - {_paper_clock(float(q.get('at')))}" if q.get("at") else ""
+        except (TypeError, ValueError):
+            when = ""
+        pdf_para(sheet, (who + when).upper(), "helvetica", 5.2, style="B",
+                 colour=(176, 26, 42), justify=False, width=w, leading=1.2)
+        pdf_para(sheet, '"' + " ".join(str(q.get("text")).split()) + '"',
+                 "times", 7.0, style="I", leading=1.18, justify=False,
+                 width=w, after=0.4)
+        url = str(q.get("url") or "")
+        if url:
+            href = (base.rstrip("/") + url) if (base and url.startswith("/")) else url
+            pdf_para(sheet, f"[> listen to this line]({href})" if href.startswith("http")
+                     else "> " + url, "helvetica", 4.8,
+                     colour=(48, 72, 120), justify=False, width=w, after=1.2)
+        else:
+            sheet.y += 1.0
+    sheet.pdf.set_line_width(0.12)
+    sheet.pdf.set_draw_color(*_PDF_RULE)
+    sheet.need(1.0)
+    sheet.pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    sheet.y += 2.0
+
+
+def pdf_serial(sheet: PaperPdfSheet, serial: Any, width: float | None = None) -> None:
+    if not isinstance(serial, dict) or not (serial.get("title") or serial.get("so_far")):
+        return
+    w = (sheet.col_w if width is None else float(width))
+    top = sheet.y
+    sheet.need(14.0, keep=True)
+    top = sheet.y
+    sheet.y += 1.4
+    pdf_heading(sheet, serial.get("title") or "The Serial", 8.0, "times", "BI",
+                width=w - 3.0, x=sheet.x + 1.5)
+    if serial.get("part"):
+        pdf_para(sheet, f"Part {serial.get('part')}", "helvetica", 5.0,
+                 colour=(176, 26, 42), justify=False, width=w - 3.0,
+                 x=sheet.x + 1.5, after=0.6)
+    if serial.get("so_far"):
+        pdf_para(sheet, f"**The story so far** - {serial.get('so_far')}",
+                 "times", 6.8, leading=1.2, width=w - 3.0, x=sheet.x + 1.5,
+                 justify=False, after=0.6)
+    if serial.get("next"):
+        pdf_para(sheet, f"**Next** - {serial.get('next')}", "times", 6.8,
+                 leading=1.2, width=w - 3.0, x=sheet.x + 1.5, justify=False)
+    sheet.y += 1.4
+    sheet.pdf.set_draw_color(*_PDF_INK)
+    sheet.pdf.set_line_width(0.25)
+    sheet.pdf.set_dash_pattern(dash=1.2, gap=0.8)
+    sheet.pdf.rect(sheet.x, top, w, max(4.0, sheet.y - top))
+    sheet.pdf.set_dash_pattern()
+    sheet.y += 2.2
+
+
+def pdf_interview(sheet: PaperPdfSheet, iv: Any, width: float | None = None,
+                  cache: dict[str, Any] | None = None) -> None:
+    if not isinstance(iv, dict) or not (iv.get("qa") or iv.get("name")):
+        return
+    w = (sheet.col_w if width is None else float(width))
+    if iv.get("portrait"):
+        pdf_plate(sheet, iv.get("portrait"), "", "", "top", width=w,
+                  ratio=0.92, cache=cache)
+    pdf_heading(sheet, iv.get("name") or "", 9.0, "times", "B", width=w)
+    if iv.get("role"):
+        pdf_para(sheet, iv.get("role"), "helvetica", 5.2, colour=_PDF_GREY,
+                 justify=False, width=w, after=1.0)
+    for x in [q for q in (iv.get("qa") or []) if isinstance(q, dict) and q.get("q")][:9]:
+        pdf_para(sheet, "Q: " + str(x.get("q")), "times", 7.0, style="B",
+                 leading=1.2, justify=False, width=w)
+        pdf_para(sheet, str(x.get("a") or ""), "times", 7.0, leading=1.2,
+                 width=w, after=1.2)
+
+
+def pdf_classifieds(sheet: PaperPdfSheet, rows: Any, width: float | None = None,
+                    cache: dict[str, Any] | None = None) -> None:
+    """The small ads, agate, one under the other on hairlines - the
+    densest thing in the paper and the cheapest to set."""
+    ads = [r for r in (rows or []) if isinstance(r, dict)
+           and (r.get("head") or r.get("body"))][:40]
+    if not ads:
+        return
+    w = (sheet.col_w if width is None else float(width))
+    for r in ads:
+        if r.get("image"):
+            pdf_plate(sheet, r.get("image"), "", "", "center", width=w,
+                      ratio=0.6, cache=cache)
+        head = _pdf_latin(r.get("head") or "").upper()
+        body = str(r.get("body") or "")
+        tail = ""
+        if r.get("price"):
+            tail += f" **{r.get('price')}**"
+        if r.get("contact"):
+            tail += f" *{r.get('contact')}*"
+        pdf_para(sheet, f"**{head}** {body}{tail}", "helvetica", 5.4,
+                 leading=1.22, width=w, justify=True, after=0.8)
+        sheet.pdf.set_draw_color(*_PDF_RULE)
+        sheet.pdf.set_line_width(0.1)
+        sheet.need(0.8)
+        sheet.pdf.line(sheet.x, sheet.y - 0.4, sheet.x + w, sheet.y - 0.4)
+        sheet.y += 0.6
+    sheet.y += 1.2
+
+
+# --- a body, block by block ------------------------------------------------
+
+def pdf_blocks(body: Any) -> list[dict[str, Any]]:
+    """The markdown the desks are allowed to write, as blocks: the same
+    subset `_md_html` sets - paragraphs, ### heads, | tables |, - lists,
+    > quotes - so the PDF and the sheet carry the same words."""
+    out: list[dict[str, Any]] = []
+    para: list[str] = []
+    table: list[str] = []
+    bullets: list[str] = []
+    quote: list[str] = []
+
+    def flush() -> None:
+        if para:
+            out.append({"t": "p", "text": " ".join(para)})
+            para.clear()
+        if table:
+            rows = [r for r in table if not re.fullmatch(r"\|?[\s:|-]+\|?", r)]
+            cells = [[c.strip() for c in r.strip().strip("|").split("|")]
+                     for r in rows]
+            if cells:
+                out.append({"t": "table", "rows": cells})
+            table.clear()
+        if bullets:
+            out.append({"t": "ul", "items": list(bullets)})
+            bullets.clear()
+        if quote:
+            out.append({"t": "quote", "text": " ".join(quote)})
+            quote.clear()
+
+    for raw in str(body or "").split("\n"):
+        line = raw.rstrip()
+        if not line.strip():
+            flush()
+            continue
+        if line.startswith("|"):
+            if para or bullets or quote:
+                flush()
+            table.append(line)
+            continue
+        if table:
+            flush()
+        m = re.match(r"^(#{1,3})\s+(.*)$", line)
+        if m:
+            flush()
+            out.append({"t": "h", "level": len(m.group(1)), "text": m.group(2)})
+            continue
+        if line.lstrip().startswith(("- ", "* ")):
+            if para or quote:
+                flush()
+            bullets.append(line.lstrip()[2:])
+            continue
+        if line.startswith(">"):
+            if para or bullets:
+                flush()
+            quote.append(line.lstrip("> "))
+            continue
+        if bullets or quote:
+            flush()
+        para.append(line.strip())
+    flush()
+    return out
+
+
+def pdf_body(sheet: PaperPdfSheet, body: Any, size: float = 8.2,
+             width: float | None = None, pull: Any = "",
+             lead_in: bool = False) -> None:
+    """The story's prose. The pull quote goes in after the first
+    paragraph, where the sheet puts it."""
+    w = (sheet.col_w if width is None else float(width))
+    first = True
+    for block in pdf_blocks(body):
+        kind = block["t"]
+        if kind == "p":
+            pdf_para(sheet, block["text"], "times",
+                     size * (1.1 if (first and lead_in) else 1.0),
+                     leading=1.17, width=w, indent=0.0 if first else 2.6,
+                     after=0.4)
+            if first and pull:
+                pdf_pull(sheet, pull, width=w)
+            first = False
+        elif kind == "h":
+            sheet.space(1.2)
+            pdf_heading(sheet, block["text"],
+                        9.4 if block["level"] <= 2 else 7.8, "times", "B",
+                        width=w, after=0.8)
+        elif kind == "ul":
+            for item in block["items"][:24]:
+                sheet.pdf.set_fill_color(176, 26, 42)
+                sheet.need(size * PDF_MM_PT * 1.2)
+                sheet.pdf.rect(sheet.x + 0.4, sheet.y + 1.1, 0.8, 0.8, style="F")
+                pdf_para(sheet, item, "times", size - 0.5, leading=1.2,
+                         justify=False, width=w - 2.6, x=sheet.x + 2.6,
+                         after=0.35)
+            sheet.y += 0.6
+        elif kind == "quote":
+            pdf_pull(sheet, block["text"], width=w)
+        elif kind == "table":
+            pdf_table(sheet, block["rows"], width=w)
+
+
+# --- one story -------------------------------------------------------------
+
+def pdf_story(sheet: PaperPdfSheet, a: dict[str, Any], ctx: dict[str, Any],
+              mode: str = "story", cache: dict[str, Any] | None = None,
+              base: str = "", width: float | None = None) -> None:
+    """One article, in the order the sheet sets it (`_paper_story_html`):
+    kicker, headline, deck, byline, plate, stats, chart, box, serial,
+    interview, body with its pull quote, the quotes, the other plates,
+    the classifieds, the sources."""
+    meta = a.get("meta") or {}
+    style = str(ctx.get("style") or "broadsheet")
+    tabloid = style == "tabloid"
+    w = (sheet.col_w if width is None else float(width))
+    hint = str(meta.get("style_hint") or "")
+    headline = str(meta.get("headline") or meta.get("title") or
+                   a.get("headline_hint") or "")
+    lead = mode == "lead"
+    sheet.space(1.6)
+    if lead and ctx.get("_lead_banner"):
+        # the front page's banner set the top of this story already
+        pdf_stats(sheet, meta.get("stats"), width=w)
+        pdf_body(sheet, a.get("body"), 8.4 if not tabloid else 8.6, width=w,
+                 pull="" if not tabloid else meta.get("pull"), lead_in=True)
+        pdf_quotes(sheet, meta.get("quotes"), "", width=w, base=base)
+        sheet.space(2.4)
+        return
+    kicker = str(meta.get("kicker") or "")
+    if hint == "crime" and not kicker:
+        kicker = "Crime stoppers"
+    if hint == "wanted" and not kicker:
+        kicker = "Wanted"
+    if tabloid and meta.get("flash"):
+        kicker = (str(meta["flash"]) + (" - " + kicker if kicker else ""))
+    if kicker:
+        pdf_heading(sheet, kicker, 6.4, "helvetica", "B", (176, 26, 42),
+                    caps=True, width=w, after=0.6)
+    hsize = (26.0 if lead else 13.0) if not tabloid else (24.0 if lead else 13.5)
+    if len(headline) > 64:
+        hsize *= 0.78
+    elif len(headline) > 40:
+        hsize *= 0.88
+    pdf_heading(sheet, headline, hsize, "times", "B",
+                caps=bool(tabloid and lead), width=w, leading=1.02, after=1.0)
+    if meta.get("deck"):
+        pdf_heading(sheet, meta["deck"], 9.0 if lead else 7.6, "times", "I",
+                    (72, 68, 62), width=w, leading=1.14, after=1.0)
+    sec = str(meta.get("section") or "front")
+    byline = (ctx.get("section_name") or {}).get(sec, sec)
+    if meta.get("byline"):
+        byline += " - " + str(meta["byline"])
+    pdf_para(sheet, byline.upper(), "helvetica", 5.0, style="B",
+             colour=(120, 115, 106), justify=False, width=w, after=0.4)
+    sheet.pdf.set_draw_color(*_PDF_INK)
+    sheet.pdf.set_line_width(0.4)
+    sheet.need(1.4)
+    sheet.pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    sheet.y += 1.6
+    if meta.get("image"):
+        pdf_plate(sheet, meta.get("image"),
+                  "" if meta.get("chart") else meta.get("caption"),
+                  meta.get("credit"), meta.get("focus"), width=w,
+                  ratio=0.74 if lead else 0.68, cache=cache)
+    pdf_stats(sheet, meta.get("stats"), width=w)
+    if isinstance(meta.get("chart"), dict):
+        if pdf_chart(sheet, meta["chart"], width=w) and meta.get("caption"):
+            pdf_para(sheet, meta["caption"], "helvetica", 5.4,
+                     colour=_PDF_GREY, justify=False, width=w, after=1.4)
+    box = meta.get("box")
+    if isinstance(box, dict) and box.get("items"):
+        pdf_box(sheet, box.get("title"), box.get("items"), width=w)
+    pdf_serial(sheet, meta.get("serial"), width=w)
+    if hint == "testimonial":
+        pdf_quotes(sheet, meta.get("quotes"), "Testimonials", width=w, base=base)
+    pdf_interview(sheet, meta.get("interview"), width=w, cache=cache)
+    pdf_body(sheet, a.get("body"), 8.4 if not tabloid else 8.6, width=w,
+             pull=meta.get("pull") if not lead else "", lead_in=lead)
+    if lead and meta.get("pull"):
+        pdf_pull(sheet, meta["pull"], width=w)
+    if hint != "testimonial":
+        pdf_quotes(sheet, meta.get("quotes"), "", width=w, base=base)
+    for i in [x for x in (meta.get("images") or []) if isinstance(x, dict)
+              and x.get("url")][:6]:
+        pdf_plate(sheet, i.get("url"), i.get("caption"), i.get("credit"),
+                  i.get("focus"), width=w, ratio=0.68, cache=cache)
+    pdf_classifieds(sheet, meta.get("classifieds"), width=w, cache=cache)
+    srcs = [s for s in (meta.get("sources") or []) if isinstance(s, dict)]
+    if srcs:
+        pdf_para(sheet, "Sources: " + "; ".join(
+            (f"[{s.get('name') or s['url']}]({s['url']})"
+             if str(s.get("url") or "").startswith(("http://", "https://"))
+             else str(s.get("name") or "")) for s in srcs),
+            "helvetica", 5.0, colour=(48, 72, 120), justify=False, width=w,
+            after=1.0)
+    sheet.space(2.4)
+    sheet.pdf.set_draw_color(*_PDF_RULE)
+    sheet.pdf.set_line_width(0.15)
+    sheet.need(1.0)
+    sheet.pdf.line(sheet.x, sheet.y, sheet.x + w, sheet.y)
+    sheet.y += 2.2
+
+
+# --- the front page --------------------------------------------------------
+
+def pdf_front(sheet: PaperPdfSheet, ctx: dict[str, Any], cache: dict[str, Any],
+              base: str) -> None:
+    """The masthead, the dateline, the notice, and the lead across the
+    full measure - then the columns start under it."""
+    pdf, ed, head = sheet.pdf, ctx["ed"], ctx["head"]
+    tabloid = ctx["style"] == "tabloid"
+    W, m = sheet.W, sheet.margin
+    measure = W - 2 * m
+    y = m + 4.0
+    if tabloid:
+        pdf.set_fill_color(198, 12, 32)
+        pdf.rect(m, y, measure, 21.0, style="F")
+        pdf.set_font("times", "B", 44)
+        pdf.set_text_color(255, 255, 255)
+        name = _pdf_latin(head["masthead"]).upper()
+        while pdf.get_string_width(name) > measure - 8 and pdf.font_size_pt > 14:
+            pdf.set_font("times", "B", pdf.font_size_pt - 1)
+        pdf.text(m + (measure - pdf.get_string_width(name)) / 2, y + 15.0, name)
+        y += 23.0
+        pdf.set_font("helvetica", "B", 6.4)
+        pdf.set_text_color(*_PDF_INK)
+        line = _pdf_latin(f"{ctx['when']} - the {ctx['hour']} hour - "
+                          f"No. {ctx['number']} - edition {ed.get('id') or ''}")
+        pdf.text(m, y, line.upper())
+        y += 3.0
+    else:
+        pdf.set_draw_color(*_PDF_INK)
+        pdf.set_line_width(0.5)
+        pdf.line(m, y, W - m, y)
+        y += 1.2
+        pdf.set_font("times", "B", 46)
+        pdf.set_text_color(*_PDF_INK)
+        name = _pdf_latin(head["masthead"])
+        while pdf.get_string_width(name) > measure - 6 and pdf.font_size_pt > 14:
+            pdf.set_font("times", "B", pdf.font_size_pt - 1)
+        pdf.text(m + (measure - pdf.get_string_width(name)) / 2,
+                 y + pdf.font_size_pt * PDF_MM_PT * 0.82, name)
+        y += pdf.font_size_pt * PDF_MM_PT * 1.02
+        pdf.set_font("times", "I", 9)
+        pdf.set_text_color(*_PDF_GREY)
+        motto = _pdf_latin(head["motto"])
+        pdf.text(m + (measure - pdf.get_string_width(motto)) / 2, y + 2.6, motto)
+        y += 5.0
+        pdf.set_draw_color(*_PDF_INK)
+        pdf.set_line_width(0.9)
+        pdf.line(m, y, W - m, y)
+        pdf.set_line_width(0.2)
+        pdf.line(m, y + 1.2, W - m, y + 1.2)
+        y += 4.6
+        pdf.set_font("helvetica", "", 6.4)
+        pdf.set_text_color(*_PDF_INK)
+        left = _pdf_latin(f"{ctx['when']} - the {ctx['hour']} hour")
+        right = _pdf_latin(f"Vol. 1 No. {ctx['number']} - edition {ed.get('id') or ''}")
+        pdf.text(m, y, left.upper())
+        pdf.text(W - m - pdf.get_string_width(right.upper()), y, right.upper())
+        y += 1.4
+        pdf.set_line_width(0.2)
+        pdf.line(m, y, W - m, y)
+        y += 3.0
+    if ctx["paused"] or ctx["offline"]:
+        pdf.set_fill_color(*((198, 12, 32) if ctx["paused"] else (32, 30, 27)))
+        pdf.rect(m, y, measure, 6.4, style="F")
+        pdf.set_font("helvetica", "B", 7.2)
+        pdf.set_text_color(255, 255, 255)
+        words = ("The station is paused - this edition reports the work "
+                 "behind the glass" if ctx["paused"]
+                 else "Printed with the station off the air - a quiet hour")
+        pdf.text(m + 2.0, y + 4.4, _pdf_latin(words).upper())
+        y += 8.6
+    pdf.set_text_color(*_PDF_INK)
+    if ctx.get("lead") is not None:
+        y = pdf_lead_banner(sheet, ctx, cache, y)
+    # the columns of page one start under the masthead; sheet.top - the page's
+    # own furniture line - stays where it is, or every later page starts low.
+    sheet.frame(sheet.ncols, top=y)
+
+
+def pdf_lead_banner(sheet: PaperPdfSheet, ctx: dict[str, Any],
+                    cache: dict[str, Any], y: float) -> float:
+    """The lead ACROSS the front page, the way a front page is set: the
+    kicker, the headline in its own size and the deck on the left of the
+    measure, the lead plate on the right of it, a heavy rule under both -
+    and only then the columns, into which the lead's body flows.
+
+    Returns the y the columns start at. Without this the lead's headline
+    is one column wide like everything else, and the page has no front."""
+    pdf, meta = sheet.pdf, (ctx["lead"].get("meta") or {})
+    tabloid = ctx["style"] == "tabloid"
+    m, measure = sheet.margin, sheet.W - 2 * sheet.margin
+    gutter = sheet.gutter
+    headline = str(meta.get("headline") or "")
+    kicker = str(meta.get("kicker") or "")
+    if tabloid and meta.get("flash"):
+        kicker = str(meta["flash"]) + (" - " + kicker if kicker else "")
+    plate_w = (measure if tabloid
+               else (measure - gutter * 5) / 6 * 2 + gutter)
+    text_w = measure if tabloid else measure - plate_w - gutter * 2
+    band = PaperPdfSheet(pdf, sheet.W, sheet.H, m, y, sheet.bottom, 1, gutter)
+    band.plates = sheet.plates
+    if tabloid:
+        if meta.get("image"):
+            pdf_plate(band, meta["image"], "", meta.get("credit"),
+                      meta.get("focus"), width=plate_w, ratio=0.52, cache=cache)
+        y = band.y + 1.0
+        if kicker:
+            pdf.set_fill_color(198, 12, 32)
+            pdf.rect(m, y, measure, 5.6, style="F")
+            pdf.set_font("helvetica", "B", 9)
+            pdf.set_text_color(255, 255, 255)
+            pdf.text(m + 2.0, y + 4.0, _pdf_latin(kicker).upper()[:64])
+            y += 7.4
+        band.frame(1, top=y)
+        pdf_heading(band, headline, 30.0 if len(headline) < 46 else 22.0,
+                    "times", "B", caps=True, width=measure, leading=1.0,
+                    after=1.4)
+        if meta.get("deck"):
+            pdf_heading(band, meta["deck"], 10.5, "times", "I", (68, 64, 58),
+                        width=measure, leading=1.16, after=1.6)
+        y = band.y
+    else:
+        top = y
+        if kicker:
+            pdf_heading(band, kicker, 8.4, "helvetica", "B", (176, 26, 42),
+                        caps=True, width=text_w, after=1.4)
+        size = 40.0
+        if len(headline) > 42:
+            size = 30.0
+        if len(headline) > 74:
+            size = 23.0
+        pdf_heading(band, headline, size, "times", "B", width=text_w,
+                    leading=1.02, after=2.0)
+        if meta.get("deck"):
+            pdf_heading(band, meta["deck"], 12.0, "times", "I", (68, 64, 58),
+                        width=text_w, leading=1.16, after=1.6)
+        sec = (ctx.get("section_name") or {}).get(str(meta.get("section") or ""), "")
+        pdf_para(band, (sec + (" - " + str(meta["byline"]) if meta.get("byline") else "")).upper(),
+                 "helvetica", 5.4, style="B", colour=(120, 115, 106),
+                 justify=False, width=text_w)
+        if meta.get("pull"):
+            band.space(2.0)
+            pdf_pull(band, meta["pull"], width=text_w)
+        left_y = band.y
+        if meta.get("image"):
+            # the plate is cut to the height the words came to, so the
+            # banner squares off instead of leaving a hole beside a
+            # picture that happens to be taller than the headline
+            high = max(46.0, min(96.0, left_y - top))
+            band.frame(1, top=top, left=m + text_w + gutter * 2, measure=plate_w)
+            pdf_plate(band, meta["image"],
+                      "" if meta.get("chart") else meta.get("caption"),
+                      meta.get("credit"), meta.get("focus"), width=plate_w,
+                      ratio=high / plate_w, cache=cache)
+        y = max(left_y, band.y)
+    sheet.plates = band.plates
+    pdf.set_draw_color(*_PDF_INK)
+    pdf.set_line_width(0.8)
+    pdf.line(m, y + 1.4, sheet.W - m, y + 1.4)
+    pdf.set_line_width(0.2)
+    pdf.line(m, y + 2.6, sheet.W - m, y + 2.6)
+    ctx["_lead_banner"] = True
+    return y + 5.0
+
+
+def pdf_index(sheet: PaperPdfSheet, ctx: dict[str, Any], most: int = 16) -> None:
+    rows = ctx.get("index") or []
+    if not rows:
+        return
+    items = [f"{hl or sec} ... p. {n}" for n, sec, hl in rows[:most]]
+    pdf_box(sheet, "Inside this edition", items)
+
+
+# --- the edition -----------------------------------------------------------
+
+PAPER_PDF_GEOM = {
+    # style: (orientation, format, margin, top, bottom, columns, gutter)
+    "broadsheet": ("L", "A3", 13.0, 20.0, 283.0, 6, 5.0),
+    "tabloid":    ("P", "A4", 11.0, 18.0, 281.0, 3, 4.6),
+}
+
+
+def paper_pdf(ed: dict[str, Any], style: str = "broadsheet",
+              base: str = "") -> bytes | None:
+    """#1048: the edition as a real PDF - A3 landscape for the broadsheet,
+    A4 portrait for the tabloid, page by page in the same order the HTML
+    sets them.
+
+    `base` is the station's own address (http://host:port); when it is
+    given the play links in the quotes and the sources become clickable
+    annotations. Returns None when fpdf2 is not installed. CPU and disk -
+    call it from a thread."""
+    style = _paper_style(style)
+    orient, fmt, margin, top, bottom, cols, gutter = PAPER_PDF_GEOM[style]
+    ctx = _paper_ctx(ed, style)
+    head = ctx["head"]
+    title = f"{head['masthead']} - the {ctx['hour']} hour"
+    pdf = pdf_new(orient, fmt, title, str(ed.get("headline") or ""))
+    if pdf is None:
+        return None
+    W, H = (420.0, 297.0) if fmt == "A3" else (210.0, 297.0)
+    sheet = PaperPdfSheet(pdf, W, H, margin, top, bottom, cols, gutter)
+    sheet.foot_left = f"{head['masthead']} - edition {ed.get('id') or ''}"
+    cache: dict[str, Any] = {}
+    pages = ctx["pages"] or [{"n": 1, "stories": [], "sections": []}]
+    total = len(pages)
+    # INTEGRATION: the packer sets a story on every sheet it touches - the
+    # lead is in page one's own list, and a story cut across a sheet is in
+    # the list of both. The PDF has its own make-up and no jumps, so each
+    # story is set the FIRST time the plan names it and never again.
+    done_ids: set[int] = set()
+    if ctx["lead"] is not None:
+        done_ids.add(id(ctx["lead"]))
+    for page in pages:
+        n = int(page.get("n") or 1)
+        names = [ctx["section_name"].get(s, s) for s in (page.get("sections") or [])]
+        sheet.foot_right = f"Page {n} of {total}"
+        sheet.new_page(head=(f"{head['masthead']} - "
+                             + (", ".join(names) if names else "the front page")),
+                       folio=f"Page {n} of {total}", columns=cols)
+        if n == 1:
+            pdf_front(sheet, ctx, cache, base)
+            if ctx["lead"] is not None:
+                pdf_story(sheet, ctx["lead"], ctx, "lead", cache, base)
+            pdf_index(sheet, ctx)
+        for a in page.get("stories") or []:
+            if id(a) in done_ids:
+                continue
+            done_ids.add(id(a))
+            if _paper_spans(a) and sheet.ci > 0:
+                sheet.next_column()
+            pdf_story(sheet, a, ctx, "story", cache, base)
+    # the colophon, wherever the last column ended
+    sheet.space(2.0)
+    report = ed.get("report") or {}
+    checks = ("clean" if report.get("clean") else
+              (f"ok, {len(report.get('lint') or [])} lint" if report.get("ok")
+               else "red"))
+    pdf_para(sheet, f"{head['masthead']} - set by the desks of "
+                    f"{ed.get('station') or PINE_BOX_FM} - "
+                    f"{ed.get('stories') or len(ed.get('articles') or [])} stories"
+                    + (f" - tinted by {ed.get('tinted_by')}" if ed.get("tinted_by") else "")
+                    + f" - checks: {checks} - {style} - written by the press itself",
+             "helvetica", 5.0, colour=_PDF_GREY, justify=False)
+    out = pdf.output()
+    return bytes(out) if out is not None else None
+
+
+def paper_pdf_path(edition_id: str, style: str) -> Path:
+    style = _paper_style(style)
+    return paper_edition_dir(edition_id) / f"edition.{style}.pdf"
+
+
+def paper_pdf_for(edition_id: str, style: str, base: str = "",
+                  fresh: bool = False) -> bytes | None:
+    """#1048: the edition's PDF, written beside the edition as
+    edition.<style>.pdf so an hour's paper is archived as a PDF too, and
+    re-set when the cache predates the writer. Disk and CPU - thread."""
+    style = _paper_style(style)
+    where = paper_pdf_path(edition_id, style)
+    stamp = where.with_suffix(".pdf.v")
+    if not fresh and where.is_file():
+        try:
+            if stamp.is_file() and stamp.read_text().strip() == str(PAPER_PDF_VERSION):
+                return where.read_bytes()
+        except OSError:
+            pass
+    ed = paper_edition_read(edition_id)
+    if not ed:
+        return None
+    blob = paper_pdf(ed, style, base)
+    if not blob:
+        return None
+    try:
+        where.write_bytes(blob)
+        stamp.write_text(str(PAPER_PDF_VERSION))
+    except OSError:
+        pass
+    return blob
+
+
+async def paper_pdf_archive(edition_id: str) -> None:
+    """#1048: the hour's paper, filed as a PDF the moment it is printed -
+    both styles, off the loop, and never loud about a failure."""
+    if pdf_engine() is None:
+        return
+    for style in ("broadsheet", "tabloid"):
+        try:
+            got = await asyncio.to_thread(paper_pdf_for, edition_id, style, "", True)
+            if got:
+                _paper_say(f"pdf: edition.{style}.pdf filed "
+                           f"({len(got) // 1024} KB)")
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", f"gazette pdf ({style}): {exc}"[:200])
+
+
+# --- the screenplay (#1050 asked for the writer; this is it) ---------------
+#
+# Lane P1 left the seam: screenplay_pdf_writer() looks for a callable named
+# pdf_write_screenplay and hands it screenplay_pdf_elements() plus a meta
+# dict. US Letter, Courier 12, and the industry's own margins - 1.5" at the
+# left, 1" everywhere else, dialogue at 2.5", parentheticals at 3.1",
+# character cues at 3.7" - so the page count means what a page count means.
+
+SCRIPT_PDF_LINE = 25.4 / 6.0        # twelve-point Courier: six lines an inch
+SCRIPT_PDF_LEFT = 38.1              # 1.5in
+SCRIPT_PDF_RIGHT = 190.5            # the right text edge (8.5in - 1in)
+SCRIPT_PDF_TOP = 25.4
+SCRIPT_PDF_FOOT = 254.0
+SCRIPT_PDF_X = {                    # x, width per element, in mm
+    "scene": (38.1, 152.4),
+    "action": (38.1, 152.4),
+    "character": (93.98, 96.5),
+    "parenthetical": (78.74, 50.8),
+    "dialogue": (63.5, 88.9),
+    "transition": (38.1, 152.4),
+    "note": (38.1, 152.4),
+    "subheader": (38.1, 152.4),
+}
+
+
+def _pdf_courier_wrap(pdf: Any, text: str, width: float) -> list[str]:
+    pdf.set_font("courier", "", 12)
+    out: list[str] = []
+    cur = ""
+    for word in _pdf_latin(text).split():
+        trial = (cur + " " + word).strip()
+        if pdf.get_string_width(trial) <= width or not cur:
+            cur = trial
+        else:
+            out.append(cur)
+            cur = word
+    if cur:
+        out.append(cur)
+    return out or [""]
+
+
+def screenplay_pdf_bytes(elements: list[dict[str, Any]],
+                         meta: dict[str, Any] | None = None) -> bytes | None:
+    """The script as a PDF. Blocking - call it from a thread."""
+    meta = dict(meta or {})
+    pdf = pdf_new("P", "Letter", str(meta.get("title") or "Pine Box FM"),
+                  "a screenplay of one hour of the station")
+    if pdf is None:
+        return None
+    counts = dict(meta.get("counts") or {})
+    state = {"page": 0, "y": SCRIPT_PDF_TOP}
+
+    def turn() -> None:
+        pdf.add_page()
+        state["page"] += 1
+        state["y"] = SCRIPT_PDF_TOP
+        if state["page"] > 1:
+            label = f"{state['page']}."
+            pdf.set_font("courier", "", 12)
+            pdf.set_text_color(20, 20, 20)
+            pdf.text(SCRIPT_PDF_RIGHT - pdf.get_string_width(label), 12.7, label)
+
+    def room(lines: int) -> None:
+        if state["y"] + lines * SCRIPT_PDF_LINE > SCRIPT_PDF_FOOT:
+            turn()
+
+    def put(text: str, kind: str, style: str = "", caps: bool = False,
+            align: str = "left") -> None:
+        x, w = SCRIPT_PDF_X.get(kind, SCRIPT_PDF_X["action"])
+        body = text.upper() if caps else text
+        lines = _pdf_courier_wrap(pdf, body, w)
+        room(min(len(lines), 4))
+        pdf.set_font("courier", style, 12)
+        pdf.set_text_color(20, 20, 20)
+        for line in lines:
+            if state["y"] + SCRIPT_PDF_LINE > SCRIPT_PDF_FOOT:
+                turn()
+                pdf.set_font("courier", style, 12)
+            cx = x
+            if align == "right":
+                cx = SCRIPT_PDF_RIGHT - pdf.get_string_width(line)
+            pdf.text(cx, state["y"] + SCRIPT_PDF_LINE * 0.78, line)
+            state["y"] += SCRIPT_PDF_LINE
+
+    def blank(n: int = 1) -> None:
+        if state["y"] > SCRIPT_PDF_TOP:
+            state["y"] = min(SCRIPT_PDF_FOOT, state["y"] + SCRIPT_PDF_LINE * n)
+
+    # the title page - centred, a third of the way down, as they come
+    turn()
+    state["y"] = 88.0
+    pdf.set_font("courier", "B", 12)
+    for line in _pdf_courier_wrap(pdf, str(meta.get("title") or "AN HOUR"), 152.4):
+        text = line.upper()
+        pdf.set_font("courier", "B", 12)
+        pdf.text(SCRIPT_PDF_LEFT + (152.4 - pdf.get_string_width(text)) / 2,
+                 state["y"], text)
+        state["y"] += SCRIPT_PDF_LINE
+    state["y"] += SCRIPT_PDF_LINE * 2
+    for line in ["broadcast by", str(meta.get("station") or PINE_BOX_FM)]:
+        pdf.set_font("courier", "", 12)
+        text = _pdf_latin(line)
+        pdf.text(SCRIPT_PDF_LEFT + (152.4 - pdf.get_string_width(text)) / 2,
+                 state["y"], text)
+        state["y"] += SCRIPT_PDF_LINE * 2
+    pdf.set_font("courier", "", 10)
+    pdf.set_text_color(80, 80, 80)
+    foot = [f"hour {meta.get('hour_key') or ''}",
+            f"{counts.get('lines', 0)} lines - {counts.get('scenes', 0)} scenes"
+            + (f" - {counts.get('tinted', 0)} tinted" if counts.get("tinted") else ""),
+            "set from the station's own ledgers - air log, music log, call log"]
+    yy = 236.0
+    for line in foot:
+        pdf.text(SCRIPT_PDF_LEFT, yy, _pdf_latin(line))
+        yy += SCRIPT_PDF_LINE
+    turn()
+    put("FADE IN:", "action", caps=True)
+    blank()
+    for element in (elements or []):
+        kind = str(element.get("type") or "action")
+        text = " ".join(str(element.get("text") or "").split())
+        if not text:
+            continue
+        if kind == "scene":
+            blank()
+            put(text, "scene", "B", caps=True)
+            blank()
+        elif kind == "character":
+            room(3)                     # never a cue orphaned at the foot
+            put(text, "character", caps=True)
+        elif kind == "parenthetical":
+            put(text if text.startswith("(") else f"({text})", "parenthetical")
+        elif kind == "dialogue":
+            put(text, "dialogue")
+            if element.get("tinted"):
+                put("(tinted by the crystal)", "parenthetical", "I")
+            blank()
+        elif kind == "transition":
+            blank()
+            put(text, "transition", caps=True, align="right")
+            blank()
+        elif kind == "note":
+            put("[[ " + text + " ]]", "note", "I")
+            blank()
+        elif kind == "subheader":
+            put(text, "subheader", "B", caps=True)
+            blank()
+        else:
+            put(text, "action")
+            blank()
+    blank()
+    put("FADE OUT.", "transition", caps=True, align="right")
+    out = pdf.output()
+    return bytes(out) if out is not None else None
+
+
+async def pdf_write_screenplay(elements: list[dict[str, Any]],
+                               meta: dict[str, Any] | None = None) -> bytes | None:
+    """#1050's seam, filled: lane P1's screenplay_pdf_writer() finds this
+    by name and hands it the elements. Off the loop, like everything else
+    the writer does."""
+    return await asyncio.to_thread(screenplay_pdf_bytes, elements, meta)
+
+
+# --- the door --------------------------------------------------------------
+
+@app.get("/api/paper/{edition_id}/pdf")
+async def api_paper_pdf(
+    edition_id: str,
+    request: Request,
+    style: str = "",
+    fresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> Response:
+    """#1048: the edition as a real PDF - A3 landscape for the broadsheet,
+    A4 portrait for the tabloid. The file is written beside the edition on
+    the way out, so the hour is archived whether or not anyone downloads
+    it. 501, in as many words, when the wheel is not installed yet."""
+    require_read_auth(authorization)
+    try:
+        paper_edition_dir(edition_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Bad edition id") from None
+    want = _paper_style(style)
+    missing = pdf_missing()
+    if missing:
+        raise HTTPException(status_code=501, detail=missing)
+    base = str(request.base_url).rstrip("/")
+    try:
+        blob = await asyncio.to_thread(paper_pdf_for, edition_id, want, base,
+                                       bool(fresh))
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500,
+                            detail=f"the PDF writer jammed: "
+                                   f"{type(exc).__name__}: {exc}"[:200]) from None
+    if blob is None:
+        raise HTTPException(status_code=404, detail="No such edition")
+    name = f"pine-box-gazette-{edition_id}-{want}.pdf"
+    return Response(content=blob, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename="{name}"',
+                             "Content-Length": str(len(blob)),
+                             "Cache-Control": "no-store"})
+
+
 # --- the doors -------------------------------------------------------------
 
 @app.get("/api/paper")
@@ -98249,6 +106455,683 @@ async def api_paper_print(
             reason=str((payload or {}).get("reason") or "the operator pressed the button"),
             kind=kind))
     return {"started": not already, "already": already}
+
+
+# --- #1043b THE ENDLESS PRESS -------------------------------------------
+#
+# "an endless newspaper slideshow that I can enable on the fly ... showing
+# each and every page first in newspaper format ... and then I want to see
+# the tabloid version of that issue, and then I want to see the next
+# issue, and it just does the same thing over and over."
+#
+# One self-contained page that reads the shelf (GET /api/paper) and every
+# edition's typeset HTML (GET /api/paper/<id>/html?style=...) and lays the
+# whole archive out as ONE continuous vertical tape: every page of an
+# issue's broadsheet, every page of the same issue's tabloid, a slim
+# divider naming the next issue, and round again forever. It holds nothing
+# but the two or three pages either side of the viewport, measures each
+# page once before it can join the tape (so no boundary can ever jump),
+# gives every page its own shadow root (so one edition's stylesheet cannot
+# reach another's), moves on requestAnimationFrame with transforms, and
+# re-reads the shelf every minute so a paper printed while it is running
+# splices itself in at the next issue boundary.
+#
+# Newest first, because the freshest paper is the one the operator turned
+# this on to see, and because a new edition then arrives at the head of
+# the ring rather than a lap away.
+
+PAPER_SLIDESHOW_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>The Pine Box Gazette — the endless press</title>
+<style>
+*{box-sizing:border-box}
+html,body{height:100%;margin:0;padding:0;overflow:hidden;background:#15130f;
+  color:#e9e3d5;font:13px/1.4 "Helvetica Neue",Arial,system-ui,sans-serif}
+#stage{position:absolute;inset:0;overflow:hidden;contain:strict;
+  background:#15130f;cursor:ns-resize}
+#gauge{position:absolute;left:-30000px;top:0;width:1400px;height:10px;
+  visibility:hidden;pointer-events:none;contain:size layout style}
+.slide{position:absolute;left:0;top:0;width:100%;will-change:transform}
+.slide .host{display:block;transform-origin:0 0}
+
+/* The seam between two papers: a slim ruled bar that says whose issue is
+   about to come up. Slim on purpose — it is a join, not a title card. */
+.divider{display:flex;align-items:center;gap:14px;height:100%;padding:0 20px;
+  background:linear-gradient(90deg,#191712 0%,#2b2720 50%,#191712 100%);
+  border-top:1px solid #4a4235;border-bottom:1px solid #4a4235;overflow:hidden}
+.divider .rule{flex:0 0 40px;height:3px;background:#c8102e;border-radius:2px}
+.divider .rule:last-child{flex:1 1 auto}
+.divider .when{flex:0 0 auto;font:800 11.5px/1 "Helvetica Neue",Arial,sans-serif;
+  letter-spacing:.18em;text-transform:uppercase;color:#e3b06c;white-space:nowrap}
+.divider .head{flex:0 1 auto;min-width:0;font:600 16px/1.2 Georgia,"Times New Roman",serif;
+  color:#f4efe2;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* Two readouts, both out of the way: where we are, bottom left; what the
+   wheel just did, bottom right, and only for a moment. */
+#badge{position:absolute;left:10px;bottom:10px;z-index:5;pointer-events:none;
+  padding:4px 9px;border-radius:999px;background:rgba(12,10,8,.62);
+  border:1px solid rgba(233,227,213,.16);color:#cfc6b2;
+  font:600 11px/1 "Helvetica Neue",Arial,sans-serif;letter-spacing:.06em}
+#pill{position:absolute;right:10px;bottom:10px;z-index:5;pointer-events:none;
+  padding:5px 11px;border-radius:999px;background:rgba(12,10,8,.78);
+  border:1px solid rgba(233,227,213,.22);color:#f2ece0;
+  font:700 12px/1 "Helvetica Neue",Arial,sans-serif;letter-spacing:.05em;
+  opacity:0;transition:opacity .28s ease}
+#pill.on{opacity:1}
+#notice{position:absolute;inset:0;z-index:6;display:none;
+  flex-direction:column;align-items:center;justify-content:center;gap:8px;
+  text-align:center;padding:24px;background:#15130f}
+#notice b{font:700 17px/1.3 Georgia,serif;color:#f0e9da}
+#notice span{color:#8d8677;max-width:32em}
+</style>
+</head>
+<body>
+<div id="stage"></div>
+<div id="gauge"></div>
+<div id="badge">the press is warming up</div>
+<div id="pill"></div>
+<div id="notice"><b>Nothing on the shelf yet</b>
+  <span>The Gazette prints on the hour. The first edition will splice
+  itself into this scroll on its own — nothing to press here.</span></div>
+<script type="application/json" id="slideshow-config">__CONFIG__</script>
+<script>
+/* #1043b THE ENDLESS PRESS - the slideshow's whole engine.
+ *
+ * One continuous vertical tape of newspaper pages: every page of an
+ * edition's broadsheet, then every page of the same edition's tabloid,
+ * then a slim divider naming the next issue, then that issue, round and
+ * round forever. The wheel changes the SPEED, never the position.
+ *
+ * Three rules keep it alive for hours:
+ *   1. Nothing is held in the DOM but the two or three pages around the
+ *      viewport. Everything else is a descriptor - an id, a page number,
+ *      a y and a height - a few dozen bytes.
+ *   2. Every page's height is MEASURED before it can ever join the tape
+ *      (offscreen, at the edition's own design width, with image boxes
+ *      pinned by aspect-ratio so an unloaded picture measures the same as
+ *      a loaded one). The tape's arithmetic is therefore exact and no
+ *      page boundary can ever jump.
+ *   3. Each page lives in its own shadow root with its own edition's
+ *      stylesheet adopted into it, so the 5 AM paper's CSS cannot reach
+ *      the 4 AM paper sitting above it on the tape.
+ */
+
+const CFG = JSON.parse(document.getElementById("slideshow-config").textContent);
+const STYLES = CFG.styles;
+const POLL_MS = CFG.poll_ms;
+
+const SPEED_MIN = -420;
+const SPEED_MAX = 420;
+const SPEED_DEFAULT = 55;
+const DEAD_ZONE = 3;          // |speed| under this reads as "held"
+const DIVIDER_H = 68;         // the slim bar between issues, in tape pixels
+const PAGE_GAP = 14;          // breathing room under each page
+const DOC_CACHE_MAX = 8;      // edition+style HTML kept in memory
+const ZOOM_MIN = 0.4;
+const ZOOM_MAX = 2.4;
+
+const stage = document.getElementById("stage");
+const gauge = document.getElementById("gauge");
+const pill = document.getElementById("pill");
+const badge = document.getElementById("badge");
+const notice = document.getElementById("notice");
+
+/* The extra rules that make a page's height DETERMINISTIC and make the
+ * edition's own body/root rules land inside a shadow root. Injected first
+ * so the edition's stylesheet (rewritten below) still wins where they
+ * disagree - except the aspect-ratio, which is ours on purpose. */
+const SCOPE_HEAD = ":host{display:block;box-sizing:border-box;"
+  + "color:#1b1a17;background:#f6f1e6;"
+  + "font:14.5px/1.42 Georgia,'Times New Roman','Liberation Serif',serif}";
+const SCOPE_TAIL = "\n.page{margin:0 !important;box-shadow:none !important}"
+  + "\nfigure.plate img{aspect-ratio:4/3}"
+  + "\n.plexus{min-height:0 !important;height:180px}";
+
+let order = [];               // editions, newest first
+const meta = new Map();       // id -> shelf row
+const docs = new Map();       // "id|style" -> {css, sheet, pages:[{html,w,h}], bad}
+const lru = [];               // doc keys, most recent last
+const inflight = new Set();
+let queued = [];              // newly printed editions, shown at the next boundary
+
+let tape = [];                // materialised span of the endless tape
+let pos = 0;                  // tape coordinate at the top of the viewport
+let speed = readNum("pineSlideshowSpeed", SPEED_DEFAULT, SPEED_MIN, SPEED_MAX);
+let zoom = readNum("pineSlideshowZoom", 1, ZOOM_MIN, ZOOM_MAX);
+let vw = 0;
+let vh = 0;
+let lastTs = 0;
+let pillTimer = 0;
+let lastBadge = "";
+
+function readNum(key, dflt, lo, hi) {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null || raw === "") return dflt;   // Number(null) is 0, not "unset"
+    const v = Number(raw);
+    if (Number.isFinite(v) && v >= lo && v <= hi) return v;
+  } catch (err) { /* private mode: the default is fine */ }
+  return dflt;
+}
+
+function save(key, v) {
+  try { localStorage.setItem(key, String(v)); } catch (err) { /* fine */ }
+}
+
+function clamp(v, lo, hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+/* ---------- the shelf ---------------------------------------------- */
+
+function hourWords(row) {
+  const at = Number(row.since || row.at || 0) * 1000;
+  if (!at) return String(row.id || "");
+  const d = new Date(at);
+  let h = d.getHours();
+  const ampm = h < 12 ? "AM" : "PM";
+  h = h % 12; if (!h) h = 12;
+  const day = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric" });
+  // Two extras pressed in the same hour read identically without the
+  // minute, and the badge is the only thing naming the issue while the
+  // pages roll. The hourly papers stay on the round hour.
+  const extra = row.kind === "extra";
+  const mm = d.getMinutes();
+  const clock = h + (extra ? ":" + (mm < 10 ? "0" : "") + mm : "") + " " + ampm;
+  return day + " · " + clock + (extra ? " extra" : "");
+}
+
+async function shelf() {
+  let data;
+  try {
+    const r = await fetch("/api/paper", { headers: { Accept: "application/json" } });
+    if (!r.ok) throw new Error("http " + r.status);
+    data = await r.json();
+  } catch (err) { return; }
+  const eds = (data && data.editions) || [];
+  const fresh = [];
+  for (const e of eds) {
+    if (!meta.has(e.id)) fresh.push(e.id);
+    meta.set(e.id, e);
+  }
+  const had = order.length;
+  order = eds.map((e) => e.id);
+  if (had && fresh.length) {
+    // A new paper: put it next in the queue so it is on screen within one
+    // issue instead of a lap. Nothing already on the tape is disturbed.
+    for (const id of fresh) if (queued.indexOf(id) < 0) queued.push(id);
+    const row = meta.get(fresh[0]) || {};
+    flash("new edition · " + (row.headline || fresh[0]), 3200);
+  }
+  notice.style.display = order.length ? "none" : "flex";
+}
+
+/* ---------- editions, fetched once and measured once ---------------- */
+
+function docKey(id, s) { return id + "|" + STYLES[s]; }
+
+/* Rewrite an edition's stylesheet so it works inside a shadow root: the
+ * document-level selectors (:root, html, body) have nothing to match in
+ * there, and every colour token in the paper hangs off :root. */
+function scopeCss(css) {
+  return css
+    .replace(/(^|[{},])\s*:root\b/g, "$1:host")
+    .replace(/(^|[{},])\s*html\s*,\s*body\b/g, "$1:host")
+    .replace(/(^|[{},])\s*body\b/g, "$1:host");
+}
+
+function parseDoc(text) {
+  const parsed = new DOMParser().parseFromString(text, "text/html");
+  const css = SCOPE_HEAD
+    + scopeCss(Array.from(parsed.querySelectorAll("style"))
+      .map((n) => n.textContent).join("\n"))
+    + SCOPE_TAIL;
+  const pages = [];
+  for (const el of parsed.querySelectorAll(".page")) {
+    // Scripts never run from innerHTML anyway; onerror does, and a plate
+    // that deletes itself half a second after it was measured would open
+    // a hole in the tape. Both go.
+    el.querySelectorAll("script").forEach((n) => n.remove());
+    el.querySelectorAll("[onerror]").forEach((n) => n.removeAttribute("onerror"));
+    el.querySelectorAll("img").forEach((n) => n.setAttribute("loading", "lazy"));
+    pages.push({ html: el.outerHTML, w: 0, h: 0 });
+  }
+  let sheet = null;
+  try {
+    sheet = new CSSStyleSheet();
+    sheet.replaceSync(css);
+  } catch (err) { sheet = null; }   // old engine: fall back to <style>
+  const doc = { css: css, sheet: sheet, pages: pages, bad: false };
+  measure(doc);
+  return doc;
+}
+
+/* Measure every page of an edition ONCE, offscreen, in the same document
+ * (so the same media queries apply as when it is shown), with the images'
+ * src removed - their boxes are pinned by aspect-ratio, so the height is
+ * the same whether the picture has arrived or not. */
+function measure(doc) {
+  const holder = document.createElement("div");
+  const sr = holder.attachShadow({ mode: "open" });
+  if (doc.sheet) sr.adoptedStyleSheets = [doc.sheet];
+  else sr.innerHTML = "<style>" + doc.css + "</style>";
+  const slot = document.createElement("div");
+  sr.appendChild(slot);
+  gauge.appendChild(holder);
+  for (const pg of doc.pages) {
+    slot.innerHTML = pg.html;
+    slot.querySelectorAll("img").forEach((n) => n.removeAttribute("src"));
+    const el = slot.firstElementChild;
+    const rect = el ? el.getBoundingClientRect() : null;
+    pg.w = Math.max(320, Math.round((rect && rect.width) || 1240));
+    pg.h = Math.max(200, Math.round((rect && rect.height) || 900));
+  }
+  slot.innerHTML = "";
+  holder.remove();
+}
+
+function touch(key) {
+  const at = lru.indexOf(key);
+  if (at >= 0) lru.splice(at, 1);
+  lru.push(key);
+  while (lru.length > DOC_CACHE_MAX) {
+    const live = new Set(tape.map((s) => (s.cur.div ? "" : docKey(s.cur.id, s.cur.s))));
+    let dropped = false;
+    for (let i = 0; i < lru.length; i++) {
+      if (!live.has(lru[i])) { docs.delete(lru[i]); lru.splice(i, 1); dropped = true; break; }
+    }
+    if (!dropped) break;      // everything cached is on screen: keep it
+  }
+}
+
+/* The one door to an edition's pages. Returns the parsed document or
+ * null, kicking off the fetch when it is not here yet - callers treat
+ * null as "not ready", never as "empty". */
+function docFor(id, s) {
+  const key = docKey(id, s);
+  const hit = docs.get(key);
+  if (hit) { touch(key); return hit; }
+  if (inflight.has(key)) return null;
+  inflight.add(key);
+  fetch("/api/paper/" + encodeURIComponent(id) + "/html?style=" + encodeURIComponent(STYLES[s]))
+    .then((r) => { if (!r.ok) throw new Error("http " + r.status); return r.text(); })
+    .then((text) => { docs.set(key, parseDoc(text)); touch(key); })
+    .catch(() => { docs.set(key, { css: "", sheet: null, pages: [], bad: true }); touch(key); })
+    .then(() => { inflight.delete(key); });
+  return null;
+}
+
+/* ---------- the cycle ------------------------------------------------ */
+/* A cursor is either {id, div:true} - the divider that announces an issue
+ * - or {id, s, p}: page p of style s of that issue. */
+
+function idxOf(id) {
+  const k = order.indexOf(id);
+  return k < 0 ? 0 : k;
+}
+
+/* Where the ring was headed when a freshly printed paper cut in. Without
+ * it the tape resumes from the NEW issue's place in the shelf - and a new
+ * issue is always order[0], so every press sent the scroll back to the top
+ * and the older half of the archive was never reached. */
+let resumeAt = "";
+
+function afterIssue(id) {
+  while (queued.length) {
+    const nid = queued.shift();
+    if (!meta.has(nid)) continue;
+    if (!resumeAt && order.length) resumeAt = order[(idxOf(id) + 1) % order.length];
+    return { id: nid, div: true };
+  }
+  if (resumeAt) {
+    const back = resumeAt;
+    resumeAt = "";
+    if (meta.has(back) && back !== id) return { id: back, div: true };
+  }
+  if (!order.length) return null;
+  return { id: order[(idxOf(id) + 1) % order.length], div: true };
+}
+
+function firstPage(id) {
+  for (let s = 0; s < STYLES.length; s++) {
+    const d = docFor(id, s);
+    if (!d) return null;                    // not here yet: wait, do not skip
+    if (d.pages.length) return { id: id, s: s, p: 0 };
+  }
+  return afterIssue(id);                    // an issue with nothing in it
+}
+
+function nextCursor(c) {
+  if (!order.length) return null;
+  if (c.div) return firstPage(c.id);
+  const d = docFor(c.id, c.s);
+  if (!d) return null;
+  if (c.p + 1 < d.pages.length) return { id: c.id, s: c.s, p: c.p + 1 };
+  for (let s = c.s + 1; s < STYLES.length; s++) {
+    const dd = docFor(c.id, s);
+    if (!dd) return null;
+    if (dd.pages.length) return { id: c.id, s: s, p: 0 };
+  }
+  return afterIssue(c.id);
+}
+
+function prevCursor(c) {
+  if (!order.length) return null;
+  if (c.div) {
+    const pv = order[(idxOf(c.id) - 1 + order.length) % order.length];
+    for (let s = STYLES.length - 1; s >= 0; s--) {
+      const d = docFor(pv, s);
+      if (!d) return null;
+      if (d.pages.length) return { id: pv, s: s, p: d.pages.length - 1 };
+    }
+    return { id: pv, div: true };
+  }
+  if (c.p > 0) return { id: c.id, s: c.s, p: c.p - 1 };
+  for (let s = c.s - 1; s >= 0; s--) {
+    const d = docFor(c.id, s);
+    if (!d) return null;
+    if (d.pages.length) return { id: c.id, s: s, p: d.pages.length - 1 };
+  }
+  return { id: c.id, div: true };
+}
+
+/* ---------- the tape ------------------------------------------------- */
+
+function scaleFor(pg) { return (vw / pg.w) * zoom; }
+
+function heightOf(cur) {
+  if (cur.div) return DIVIDER_H;
+  const d = docs.get(docKey(cur.id, cur.s));
+  if (!d || !d.pages[cur.p]) return DIVIDER_H;
+  const pg = d.pages[cur.p];
+  return Math.round(pg.h * scaleFor(pg)) + PAGE_GAP;
+}
+
+function slideOf(cur, y) {
+  return { cur: cur, y: y, h: heightOf(cur), node: null };
+}
+
+function seed() {
+  if (tape.length || !order.length) return;
+  tape = [slideOf({ id: order[0], div: true }, 0)];
+  pos = 0;
+}
+
+function ensure() {
+  seed();
+  if (!tape.length) return;
+  let guard = 0;
+  while (guard++ < 24) {
+    const last = tape[tape.length - 1];
+    if (last.y + last.h >= pos + vh * 2) break;
+    const c = nextCursor(last.cur);
+    if (!c) break;
+    tape.push(slideOf(c, last.y + last.h));
+  }
+  guard = 0;
+  while (guard++ < 24) {
+    const first = tape[0];
+    if (first.y <= pos - vh * 0.5) break;
+    const c = prevCursor(first.cur);
+    if (!c) break;
+    const s = slideOf(c, 0);
+    s.y = first.y - s.h;
+    tape.unshift(s);
+  }
+  while (tape.length > 2 && tape[0].y + tape[0].h < pos - vh * 1.6) release(tape.shift());
+  while (tape.length > 2 && tape[tape.length - 1].y > pos + vh * 3.2) release(tape.pop());
+  // The tape coordinate grows forever; rebase it long before a double
+  // starts losing sub-pixel resolution.
+  if (pos > 1e7 || pos < -1e7) {
+    const base = pos;
+    for (const s of tape) s.y -= base;
+    pos = 0;
+  }
+}
+
+function release(s) {
+  if (s && s.node) { s.node.remove(); s.node = null; }
+}
+
+function mount(s) {
+  if (s.node) return;
+  const node = document.createElement("div");
+  node.className = "slide";
+  node.style.height = s.h + "px";
+  if (s.cur.div) {
+    node.appendChild(dividerNode(s.cur.id));
+  } else {
+    const d = docs.get(docKey(s.cur.id, s.cur.s));
+    const pg = d && d.pages[s.cur.p];
+    if (pg) {
+      const host = document.createElement("div");
+      host.className = "host";
+      host.style.width = pg.w + "px";
+      host.style.transform = "scale(" + scaleFor(pg).toFixed(5) + ")";
+      const sr = host.attachShadow({ mode: "open" });
+      if (d.sheet) sr.adoptedStyleSheets = [d.sheet];
+      else sr.innerHTML = "<style>" + d.css + "</style>";
+      const slot = document.createElement("div");
+      slot.innerHTML = pg.html;
+      sr.appendChild(slot);
+      node.appendChild(host);
+    }
+  }
+  s.node = node;
+  stage.appendChild(node);
+}
+
+function dividerNode(id) {
+  const row = meta.get(id) || {};
+  const box = document.createElement("div");
+  box.className = "divider";
+  const rule = document.createElement("i");
+  rule.className = "rule";
+  const when = document.createElement("span");
+  when.className = "when";
+  when.textContent = hourWords(row);
+  const head = document.createElement("span");
+  head.className = "head";
+  head.textContent = row.headline || id;
+  const tail = document.createElement("i");
+  tail.className = "rule";
+  box.appendChild(rule);
+  box.appendChild(when);
+  box.appendChild(head);
+  box.appendChild(tail);
+  return box;
+}
+
+function paint() {
+  const top = pos - vh * 0.6;
+  const bottom = pos + vh * 1.6;
+  const eye = pos + vh * 0.35;      // what the operator is actually looking at
+  let onTop = null;
+  for (const s of tape) {
+    if (s.y + s.h > top && s.y < bottom) mount(s); else release(s);
+    if (s.node) s.node.style.transform = "translate3d(0," + (s.y - pos).toFixed(2) + "px,0)";
+    if (!onTop && s.y + s.h > eye) onTop = s;
+  }
+  if (onTop) {
+    const row = meta.get(onTop.cur.id) || {};
+    let text;
+    if (onTop.cur.div) {
+      text = hourWords(row) + " · next issue";
+    } else {
+      const d = docs.get(docKey(onTop.cur.id, onTop.cur.s));
+      const n = d ? d.pages.length : 0;
+      text = hourWords(row) + " · " + STYLES[onTop.cur.s]
+        + " · " + (onTop.cur.p + 1) + "/" + n;
+    }
+    if (text !== lastBadge) { badge.textContent = text; lastBadge = text; }
+  }
+}
+
+function relayout() {
+  vw = stage.clientWidth || 800;
+  vh = stage.clientHeight || 600;
+  if (!tape.length) return;
+  // Keep whatever is under the top edge exactly where it is while every
+  // height changes underneath it.
+  let anchor = 0;
+  for (let i = 0; i < tape.length; i++) { if (tape[i].y + tape[i].h > pos) { anchor = i; break; } }
+  const frac = tape[anchor].h ? (pos - tape[anchor].y) / tape[anchor].h : 0;
+  for (const s of tape) { release(s); s.h = heightOf(s.cur); }
+  for (let i = 1; i < tape.length; i++) tape[i].y = tape[i - 1].y + tape[i - 1].h;
+  pos = tape[anchor].y + frac * tape[anchor].h;
+}
+
+/* ---------- the wheel: speed, not position --------------------------- */
+
+function speakSpeed() {
+  if (!speed) return "held";
+  const n = Math.round(Math.abs(speed));
+  return (speed > 0 ? "▼ " : "▲ ") + n + " px/s" + (speed < 0 ? " back" : "");
+}
+
+function flash(text, ms) {
+  pill.textContent = text;
+  pill.classList.add("on");
+  clearTimeout(pillTimer);
+  pillTimer = setTimeout(() => pill.classList.remove("on"), ms || 1500);
+}
+
+function onWheel(ev) {
+  ev.preventDefault();
+  const raw = ev.deltaMode === 1 ? ev.deltaY * 16
+    : (ev.deltaMode === 2 ? ev.deltaY * 400 : ev.deltaY);
+  if (ev.ctrlKey || ev.metaKey || ev.shiftKey) {
+    zoom = clamp(zoom * (raw < 0 ? 1.1 : 1 / 1.1), ZOOM_MIN, ZOOM_MAX);
+    save("pineSlideshowZoom", zoom.toFixed(3));
+    relayout();
+    flash(Math.round(zoom * 100) + "% size");
+    return;
+  }
+  // Up is faster, down is slower. There is a DETENT at zero: a notch that
+  // would cross it stops there instead, so winding down always holds the
+  // paper still for one notch before it starts running backwards.
+  const step = Math.sign(-raw) * Math.min(60, Math.max(6, Math.abs(raw) * 0.4));
+  const was = speed;
+  let want = clamp(was + step, SPEED_MIN, SPEED_MAX);
+  if ((was > 0 && want < 0) || (was < 0 && want > 0)) want = 0;
+  if (Math.abs(want) < DEAD_ZONE) want = 0;
+  speed = want;
+  save("pineSlideshowSpeed", Math.round(speed));
+  flash(speakSpeed());
+}
+
+function onKey(ev) {
+  if (ev.key === " ") {
+    ev.preventDefault();
+    if (speed) { window.pineHeld = speed; speed = 0; } else { speed = window.pineHeld || SPEED_DEFAULT; }
+    save("pineSlideshowSpeed", Math.round(speed));
+    flash(speakSpeed());
+  } else if (ev.key === "0") {
+    zoom = 1; save("pineSlideshowZoom", 1); relayout(); flash("100% size");
+  }
+}
+
+/* ---------- the loop -------------------------------------------------- */
+
+function frame(ts) {
+  requestAnimationFrame(frame);
+  const dt = lastTs ? Math.min(0.1, (ts - lastTs) / 1000) : 0;
+  lastTs = ts;
+  if (speed && !document.hidden) pos += speed * dt;
+  ensure();
+  paint();
+}
+
+/* Elements inside the shadow roots are invisible to document-level
+ * counting, and they are exactly the ones that would grow without bound
+ * if the recycler leaked - so count them explicitly. */
+function deepNodes() {
+  let n = document.getElementsByTagName("*").length;
+  for (const s of tape) {
+    if (!s.node) continue;
+    const host = s.node.querySelector(".host");
+    if (host && host.shadowRoot) n += host.shadowRoot.querySelectorAll("*").length;
+  }
+  return n;
+}
+
+/* A small window onto the engine: what it is holding, and one way in for
+ * a host that wants to pin the speed (the panel's split, a harness). It
+ * reads state and sets one number - nothing here reaches into the tape. */
+window.pineSlideshow = {
+  stats: function () {
+    return {
+      pos: Math.round(pos), speed: speed, zoom: zoom,
+      tape: tape.length, mounted: tape.filter(function (s) { return !!s.node; }).length,
+      docs: docs.size, order: order.length, queued: queued.length,
+      nodes: document.getElementsByTagName("*").length,
+      deep: deepNodes(),
+      at: lastBadge
+    };
+  },
+  setSpeed: function (v) {
+    speed = clamp(Number(v) || 0, SPEED_MIN, SPEED_MAX);
+    save("pineSlideshowSpeed", Math.round(speed));
+    flash(speakSpeed());
+    return speed;
+  }
+};
+
+function start() {
+  relayout();
+  window.addEventListener("resize", () => { relayout(); });
+  stage.addEventListener("wheel", onWheel, { passive: false });
+  window.addEventListener("keydown", onKey);
+  shelf().then(() => { flash(speakSpeed(), 2200); });
+  setInterval(() => { shelf(); }, POLL_MS);
+  requestAnimationFrame(frame);
+}
+
+start();
+
+</script>
+</body>
+</html>
+"""
+
+
+def paper_slideshow_page(style: str = "") -> str:
+    """#1043b: the scroller, with its running order chosen.
+
+    `style` names which typeset styles ride the tape and in which order.
+    The default "both" is the operator's ask - the traditional newspaper
+    first, then the tabloid of the SAME issue - and "broadsheet" or
+    "tabloid" alone are there for a narrow pane that only wants one.
+    """
+    want = (style or "both").strip().lower()
+    if want in ("broadsheet", "paper", "newspaper", "news"):
+        styles = ["broadsheet"]
+    elif want in ("tabloid", "tab", "red-top"):
+        styles = ["tabloid"]
+    elif want in ("tabloid-first", "tabloid,broadsheet"):
+        styles = ["tabloid", "broadsheet"]
+    else:
+        styles = ["broadsheet", "tabloid"]
+    cfg = json.dumps({"styles": styles, "poll_ms": 60000})
+    return PAPER_SLIDESHOW_HTML.replace("__CONFIG__", cfg)
+
+
+@app.get("/api/paper/slideshow")
+async def api_paper_slideshow(
+    style: str = "both",
+    authorization: str | None = Header(default=None),
+) -> HTMLResponse:
+    """#1043b: the endless newspaper, as a page anything can point at -
+    the panel's right half, the desktop shell's second webview, or a
+    browser on the LAN.
+
+    Registered ABOVE /api/paper/{edition_id} on purpose: FastAPI matches
+    routes in registration order and "slideshow" is not a legal edition
+    id, so the other order would 400 here forever.
+    """
+    require_read_auth(authorization)
+    return HTMLResponse(paper_slideshow_page(style))
 
 
 @app.get("/api/paper/{edition_id}")
@@ -98302,6 +107185,19 @@ async def api_paper_text(
     text, markdown = await asyncio.to_thread(paper_render_text, ed)
     return {"id": edition_id, "headline": str(ed.get("headline") or ""),
             "text": text, "markdown": markdown}
+
+
+@app.get("/api/news/read")
+async def api_news_read(
+    url: str,
+    refresh: int = 0,
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1045: the full story behind a headline the Gazette covered, set as
+    one clean column. A read, so it opens on the LAN like the rest of the
+    dashboard; the fetch and the disk both run off the event loop."""
+    require_read_auth(authorization)
+    return await newsread_get(url, refresh=bool(refresh))
 
 
 @app.post("/api/paper/{edition_id}/snapshot")
@@ -100328,6 +109224,93 @@ button.danger {
   0%, 100% { transform: scale(1); }
   50% { transform: scale(1.12); }
 }
+/* #1157: the Gazette pile — every newspaper in the strip folded into ONE
+   tile. It keeps a normal .film-item footprint (so the size slider, the
+   marquee timing and the hover lift all still work); the stack is drawn
+   INSIDE that square as a front page at the top-left with two pale sheets
+   showing behind it. The count on the face is the honest number of issues
+   in the pile, not the number of tiles saved. */
+.film-item.gz-pile {
+  background: transparent; border-color: transparent;
+}
+.film-item.gz-pile:hover { border-color: transparent; }
+.gz-sheet {
+  position: absolute; border-radius: 7px; background: #cbc5b6;
+  border: 1px solid #6b7688; box-shadow: 0 2px 9px rgba(0,0,0,.5);
+}
+.gz-sheet.gz-s3 { inset: 15px 0 0 15px; }
+.gz-sheet.gz-s2 { inset: 8px 7px 7px 8px; background: #e7e1d3; }
+.gz-face {
+  position: absolute; inset: 0 15px 15px 0; border-radius: 8px;
+  overflow: hidden; border: 1px solid var(--border); background: #0e1117;
+}
+/* A front page is far taller than it is wide, and the half worth seeing
+   in a square is the masthead end. */
+.gz-face img, .gz-face video { object-position: top center; }
+.gz-count {
+  position: absolute; left: 6px; bottom: 6px; z-index: 3;
+  background: rgba(3,6,11,.9); color: #eef4ff;
+  border: 1px solid var(--accent); border-radius: 999px;
+  font-size: 10px; font-weight: 800; letter-spacing: .04em;
+  padding: 2px 8px; box-shadow: 0 2px 10px rgba(0,0,0,.55);
+}
+.gz-tag {
+  position: absolute; left: 0; right: 0; top: 0; z-index: 3;
+  padding: 4px 6px 12px; font-size: 10px; font-weight: 700;
+  color: #e7eefb; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis;
+  background: linear-gradient(180deg, rgba(3,6,11,.9), rgba(3,6,11,0));
+}
+/* The 🗞 toolbar icon: the state it is in has to be readable at a glance,
+   not only in the tooltip. */
+#gzPileBtn { display: inline-flex; align-items: center; gap: 5px; }
+#gzPileBtn .gz-state {
+  font-size: 9px; font-weight: 800; letter-spacing: .06em;
+  padding: 1px 5px; border-radius: 5px;
+  background: #1b2735; color: #9ba6b7;
+}
+#gzPileBtn.gz-on { border-color: var(--accent); }
+#gzPileBtn.gz-on .gz-state { background: var(--accent); color: #001018; }
+.gz-cap {
+  display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+  color: var(--muted); font-size: 11px; white-space: nowrap;
+}
+.gz-cap input {
+  width: 48px; padding: 2px 4px; font-size: 11px; text-align: center;
+}
+/* The issue browser: the pile opened up, newest first, one row an issue. */
+.gz-browser { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.gz-browser-head {
+  padding: 14px 18px 10px; border-bottom: 1px solid var(--border);
+}
+.gz-browser-list { flex: 1; min-height: 0; overflow-y: auto; padding: 8px 12px; }
+.gz-row {
+  display: flex; gap: 12px; align-items: flex-start; padding: 9px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.gz-row:hover { background: rgba(32,185,232,.06); }
+.gz-row .gz-thumb {
+  flex: 0 0 auto; width: 62px; height: 82px; border-radius: 5px;
+  border: 1px solid var(--border); background: #0b1016; overflow: hidden;
+  cursor: pointer;
+}
+.gz-row .gz-thumb img {
+  width: 100%; height: 100%; object-fit: cover;
+  object-position: top center; display: block;
+}
+.gz-row .gz-body { flex: 1; min-width: 0; }
+.gz-row .gz-when { font-size: 11px; color: var(--muted); letter-spacing: .03em; }
+.gz-row .gz-head { font-size: 14px; font-weight: 700; line-height: 1.35; }
+.gz-row .gz-deck { font-size: 12px; color: var(--muted); line-height: 1.4; }
+.gz-kind {
+  display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 4px;
+  font-size: 9px; font-weight: 800; letter-spacing: .07em;
+  background: #1b2735; color: #9ba6b7;
+}
+.gz-kind.gz-extra { background: rgba(32,185,232,.18); color: var(--accent); }
+.gz-row .gz-acts { flex: 0 0 auto; display: flex; gap: 6px; align-items: center; }
+.gz-row .gz-acts button { padding: 3px 10px; font-size: 11px; }
+
 /* Lightbox */
 .lb-card { max-width: 900px; margin: 0 auto; }
 .lb-imgwrap {
@@ -100877,6 +109860,100 @@ button.danger {
 .day-tick[open] summary::before { transform: rotate(90deg); }
 .day-tick summary small { color: var(--muted); font-weight: 400; }
 .day-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(110px, 1fr)); gap: 8px; }
+
+/* #1157: the Gazette stacked by the hour, and the hour laid out to read.
+   The pile keeps its whole footprint inside the tile - the two sheets
+   behind fill the 11px the top sheet gives up - so a stack never leans
+   over the render next to it. */
+.gaz-stack { position: relative; aspect-ratio: 1; cursor: pointer; transition: transform .18s ease; }
+.gaz-stack:hover { transform: translateY(-3px); }
+.gaz-sheet {
+  position: absolute; left: 0; top: 0; right: 11px; bottom: 11px; border-radius: 6px;
+  background: #e7e0cf; border: 1px solid #b9ae93; box-shadow: 0 2px 7px rgba(0,0,0,.5);
+}
+.gaz-sheet.s3 { transform: translate(11px, 11px) rotate(2.4deg); filter: brightness(.66); }
+.gaz-sheet.s2 { transform: translate(5.5px, 5.5px) rotate(-1.5deg); filter: brightness(.84); }
+.gaz-sheet.top { overflow: hidden; background: #0b1016; border-color: #2c3a4f; }
+.gaz-sheet.top img, .gaz-sheet.top video {
+  width: 100%; height: 100%; object-fit: cover; object-position: top center;
+}
+.gaz-stack:hover .gaz-sheet.top { border-color: var(--accent); }
+.gaz-blank {
+  position: absolute; inset: 0; display: flex; align-items: center;
+  justify-content: center; color: #6f7a8b; font-size: 20px;
+}
+.gaz-count {
+  position: absolute; top: 4px; right: 15px; z-index: 4; color: #05080d;
+  font: 700 11px/1 ui-monospace, Consolas, monospace; padding: 3px 7px;
+  border-radius: 999px; background: var(--accent); box-shadow: 0 1px 5px rgba(0,0,0,.6);
+}
+.gaz-lab {
+  position: absolute; left: 0; right: 11px; bottom: 11px; z-index: 4; padding: 6px 6px 4px;
+  font: 700 10px/1.3 system-ui, sans-serif; color: #f4efe2; display: flex;
+  justify-content: space-between; align-items: flex-end; gap: 4px;
+  border-radius: 0 0 6px 6px;
+  background: linear-gradient(transparent, rgba(3,5,9,.94) 62%);
+}
+.gaz-lab small { font-weight: 400; color: #c3cddc; }
+/* #1157: an hour with a single issue is not a pile - it takes the
+   whole tile the grid gave it, the way the render beside it does,
+   instead of giving up the 11px the sheets behind would have used. */
+.gaz-stack.one .gaz-sheet.top, .gaz-stack.one .gaz-lab { right: 0; bottom: 0; }
+
+/* The hour, scrolled: one page per issue, sideways with the wheel or a drag. */
+.gaz-shade {
+  position: fixed; inset: 0; z-index: 300; background: rgba(2,4,9,.975);
+  display: flex; flex-direction: column;
+}
+.gaz-head {
+  flex: none; display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 9px 14px; background: #05080d; border-bottom: 1px solid #1b2735;
+}
+.gaz-head b { font-size: 14px; }
+.gaz-strip {
+  flex: 1; min-height: 0; display: flex; gap: 20px; align-items: stretch;
+  overflow: auto; padding: 14px 22px 20px; cursor: grab; scroll-snap-type: x proximity;
+}
+.gaz-strip.drag { cursor: grabbing; }
+/* Without this a press on a page starts the browser's own image drag and
+   swallows every pointermove after it - the hour would move 20px and
+   stop. */
+.gaz-strip, .gaz-strip img { user-select: none; -webkit-user-drag: none; }
+/* The card takes its width from the page, not from its caption: without
+   this the caption row sets the column and every sheet carries a band of
+   empty newsprint down its right-hand side. */
+.gaz-page {
+  flex: none; display: flex; flex-direction: column; gap: 5px;
+  scroll-snap-align: center; width: min(52vh, 44vw);
+}
+.gaz-page.zoom { width: min(1040px, 90vw); }
+.gaz-cap {
+  flex: none; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
+  color: #e8eef7; font: 12px/1.45 system-ui, sans-serif;
+}
+.gaz-cap b { font-size: 13px; font-variant-numeric: tabular-nums; }
+.gaz-kick {
+  text-transform: uppercase; letter-spacing: .08em; color: #05080d;
+  font: 700 9px/1.7 system-ui, sans-serif; background: #c9b071;
+  padding: 1px 6px; border-radius: 3px;
+}
+.gaz-kick.hourly { background: var(--accent); }
+.gaz-pause { color: #ffd479; font-size: 11px; }
+.gaz-headline { color: #cfd8e6; }
+.gaz-deck {
+  flex: none; color: #8e99aa; font: 11px/1.4 system-ui, sans-serif; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* #1157: the sheet is as tall as the page it holds, no taller - flex:1
+   stretched it to the strip and left 138px (16%) of blank newsprint
+   under the folio of every issue. It still SHRINKS (flex-shrink 1,
+   min-height 0), so a zoomed page fills the room and scrolls. */
+.gaz-sheetbox {
+  flex: 0 1 auto; min-height: 0; overflow: auto; background: #ece5d4;
+  border: 1px solid #3a4a63; border-radius: 6px; box-shadow: 0 18px 60px rgba(0,0,0,.65);
+}
+.gaz-page img { display: block; width: 100%; height: auto; }
+.gaz-empty { color: #9ba6b7; font: 13px system-ui, sans-serif; padding: 30px; }
 
 .conv-wrap {
   display: flex; gap: 10px; margin-top: 10px;
@@ -101529,6 +110606,60 @@ main > aside > section:first-child { margin-top: 0 !important; }
   }
   .studio-nav .studio-tab { flex: 0 0 auto; }
 }
+
+/* ---------- #1043b THE ENDLESS PRESS, HALF THE PANEL -----------------------
+   Slideshow mode is ONE class on <body> plus these rules. The panel's own
+   markup is never rewritten, so switching it off restores the page exactly
+   as it was: the document simply gets a right padding the width of the
+   pane, and everything in normal flow - the deck, the header, the two
+   columns of <main> - reflows into the left half on its own.
+
+   The pane sits at z-index 120: above the page and the sticky deck (60),
+   below the floating windows (150) and the modals (350), so the Gazette
+   window, the word cloud dock and the 3D views open and close over it
+   exactly as they always did. */
+body.pine-slides { padding-right: var(--pine-slides-w, 50vw); }
+body.pine-slides #toasts { right: calc(var(--pine-slides-w, 50vw) + 14px); }
+/* The rest of the right-hand furniture, which otherwise paints on the
+   newspaper: the orchestrator bell, its question card and the voicing
+   chip are all pinned to the right edge with an inline style, so they
+   need the !important to be moved at all. */
+body.pine-slides #orchBell { right: calc(var(--pine-slides-w, 50vw) + 14px) !important; }
+body.pine-slides #mpxProc { right: calc(var(--pine-slides-w, 50vw) + 16px) !important; }
+body.pine-slides [data-ask] { right: calc(var(--pine-slides-w, 50vw) + 18px) !important; }
+#pineSlidesPane {
+  position: fixed; top: 0; right: 0; bottom: 0; z-index: 120;
+  width: var(--pine-slides-w, 50vw);
+  background: #15130f;
+  border-left: 1px solid var(--border);
+  box-shadow: -18px 0 44px rgba(0,0,0,.5);
+}
+#pineSlidesFrame { width: 100%; height: 100%; border: 0; display: block; }
+/* The grip straddles the edge so it can be grabbed from either side. */
+#pineSlidesGrip {
+  position: absolute; left: -5px; top: 0; bottom: 0; width: 11px; z-index: 2;
+  cursor: col-resize; background: transparent;
+}
+#pineSlidesGrip:hover,
+body.pine-slides-drag #pineSlidesGrip { background: var(--accent); opacity: .5; }
+/* A drag over an iframe is swallowed by the iframe; take it out of the
+   way for the length of the drag and the pointer keeps reporting. */
+body.pine-slides-drag { user-select: none; }
+body.pine-slides-drag #pineSlidesFrame { pointer-events: none; }
+#pineSlidesShut {
+  position: absolute; right: 10px; top: 8px; z-index: 3;
+  opacity: .2; transition: opacity .2s ease;
+  background: rgba(12,10,8,.8); color: #e9e3d5;
+  border: 1px solid rgba(233,227,213,.25); border-radius: var(--radius-sm);
+  font-size: 12px; line-height: 1; padding: 5px 8px; cursor: pointer;
+}
+#pineSlidesPane:hover #pineSlidesShut { opacity: .95; }
+#slidesBarBtn.on { color: #e3b06c; }
+@media (max-width: 900px) {
+  /* Half of a narrow window is no newspaper and no panel: stand down. */
+  body.pine-slides { padding-right: 0; }
+  body.pine-slides #pineSlidesPane { display: none; }
+}
 </style>
 </head>
 <body>
@@ -101833,9 +110964,26 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
     <button id="paperBarBtn" class="act-refresh"
             title="The Pine Box Gazette — the hour's newspaper, printed on the hour"
             onclick="paperOpen()">📰</button>
+    <button id="slidesBarBtn" class="act-refresh"
+            title="The endless press — every Gazette issue, the newspaper
+then the tabloid, scrolling down the right half of the screen"
+            onclick="pineSlidesToggle()">🗞</button>
+    <button id="scriptBarBtn" class="act-refresh"
+            title="The Screenplay — the hour as a script, line by line, with the audio"
+            onclick="screenplayOpen()">📝</button>
     <button id="cloudBarBtn" class="act-refresh"
             title="Word cloud — half the gallery, live"
             onclick="cloudDockToggle()">☁</button>
+    <button id="gzPileBtn" class="act-refresh"
+            title="Stack the Gazette renders in the strip"
+            onclick="gzModeCycle()"
+            oncontextmenu="return gzCapFocus(event)">🗞<span
+            class="gz-state">hr</span></button>
+    <label class="gz-cap" for="gzCapInput"
+           title="How many Gazette entries the strip lists at all. The rest fold into the pile — nothing is thrown away, and the Gazette window still shelves every edition.">max
+      <input id="gzCapInput" type="number" min="1" max="40" step="1"
+             onchange="gzCapSet(this.value)">
+    </label>
     <button id="djIcon" class="act-refresh"
             title="Start a Pine Box FM session"
             onclick="djToggleSession()">🎧</button>
@@ -103486,6 +112634,8 @@ const PINE_3JS = [
   {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen()},
+  {key: "slides",   label: "🗞 Endless press",   open: () => pineSlidesSet(true)},
+  {key: "script",   label: "📝 The Screenplay",  open: () => screenplayOpen()},
   {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
   {key: "vectors",  label: "🌳 Vector Tree",     open: () => rhetVecToggle()},
   {key: "stage",    label: "💿 Album Stage",     open: () => stageStart()},
@@ -103528,6 +112678,122 @@ async function pineCloudWin() {
   await cloudMount(host);
 }
 
+
+/* ---------- #1043b THE ENDLESS PRESS, FROM THE PANEL -----------------------
+   "whenever I enable it, basically half of the screen is an endless
+   scrolling newspaper slideshow."
+
+   The toggle beside the Gazette's 📰 adds one class to <body> and hangs a
+   fixed pane on the right holding an iframe pointed at the slideshow
+   route. Everything else - the reflow, the divider, the split - is CSS.
+   The state and the split are remembered; pine3JSAllOff sweeps it off
+   with everything else. */
+
+let pineSlidesOn = false;
+
+function pineSlidesWidth() {
+  const w = Number(localStorage.getItem("pineSlidesW"));
+  return (Number.isFinite(w) && w >= 18 && w <= 82) ? w : 50;
+}
+
+function pineSlidesApplyWidth(pct) {
+  document.documentElement.style.setProperty("--pine-slides-w", pct + "vw");
+}
+
+function pineSlidesBuild() {
+  let pane = document.getElementById("pineSlidesPane");
+  if (pane) return pane;
+  pane = el("div", "", "");
+  pane.id = "pineSlidesPane";
+  const grip = el("div", "", "");
+  grip.id = "pineSlidesGrip";
+  grip.title = "Drag to change the split";
+  grip.onmousedown = pineSlidesDrag;
+  const shut = el("button", "", "✕");
+  shut.id = "pineSlidesShut";
+  shut.title = "Close the endless press";
+  shut.onclick = () => pineSlidesSet(false);
+  const frame = document.createElement("iframe");
+  frame.id = "pineSlidesFrame";
+  frame.title = "The Pine Box Gazette — the endless press";
+  pane.appendChild(grip);
+  pane.appendChild(shut);
+  pane.appendChild(frame);
+  document.body.appendChild(pane);
+  return pane;
+}
+
+function pineSlidesSet(on) {
+  const want = !!on;
+  pineSlidesOn = want;
+  document.body.classList.toggle("pine-slides", want);
+  try { localStorage.setItem("pineSlides", want ? "1" : "0"); } catch (e) {}
+  const button = document.getElementById("slidesBarBtn");
+  if (button) button.classList.toggle("on", want);
+  if (want) {
+    pineSlidesApplyWidth(pineSlidesWidth());
+    const frame = pineSlidesBuild().querySelector("#pineSlidesFrame");
+    if (frame && !frame.getAttribute("src")) frame.src = "/api/paper/slideshow";
+    pineSlidesClearBooth();
+    setTimeout(pineSlidesClearBooth, 1500);
+    setTimeout(pineSlidesClearBooth, 6000);
+  } else {
+    // Take the frame down rather than hide it: a hidden iframe keeps its
+    // animation frames and its images for as long as the panel is open.
+    const pane = document.getElementById("pineSlidesPane");
+    if (pane) pane.remove();
+  }
+  window.dispatchEvent(new Event("resize"));
+}
+
+function pineSlidesToggle() { pineSlidesSet(!pineSlidesOn); }
+
+/* The booth window is a box the operator can drag and the panel remembers
+   where he left it, so it cannot be moved by a rule. Nudge it clear of the
+   pane ONCE, and only while it is still standing where the panel first put
+   it - a window he placed himself is his, and stays where he put it. The
+   retries are for the boot road, where the split is restored before the
+   booth has built itself. */
+function pineSlidesClearBooth() {
+  const pane = document.getElementById("pineSlidesPane");
+  const box = document.getElementById("djTalkPopup");
+  if (!pane || !box) return;
+  try {
+    const saved = JSON.parse(localStorage.getItem("djTalkBox") || "{}") || {};
+    if (Number.isFinite(Number(saved.left))) return;   // his placement, not ours
+  } catch (e) { /* unreadable storage: treat it as untouched */ }
+  const edge = pane.getBoundingClientRect().left;
+  const r = box.getBoundingClientRect();
+  if (r.right <= edge || r.width >= edge) return;
+  box.style.left = Math.max(8, Math.round(edge - r.width - 10)) + "px";
+}
+
+function pineSlidesDrag(ev) {
+  ev.preventDefault();
+  document.body.classList.add("pine-slides-drag");
+  const move = (e) => {
+    const pct = Math.min(82, Math.max(18,
+      ((window.innerWidth - e.clientX) / Math.max(1, window.innerWidth)) * 100));
+    pineSlidesApplyWidth(pct.toFixed(1));
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    document.body.classList.remove("pine-slides-drag");
+    const now = parseFloat(document.documentElement.style
+      .getPropertyValue("--pine-slides-w")) || 50;
+    try { localStorage.setItem("pineSlidesW", now.toFixed(1)); } catch (e) {}
+    window.dispatchEvent(new Event("resize"));
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+}
+
+function pineSlidesRestore() {
+  pineSlidesApplyWidth(pineSlidesWidth());
+  if (localStorage.getItem("pineSlides") === "1") pineSlidesSet(true);
+}
+
 function pine3JSAllOff() {
   const cloudWin = document.getElementById("cloudWin");
   if (cloudWin) cloudWin.remove();
@@ -103549,6 +112815,10 @@ function pine3JSAllOff() {
   try { if (window.rhetVec) rhetVecStop(); } catch (e) {}
   try { skinStop(); } catch (e) {}
   try { paperClose(); } catch (e) {}
+  try { gzBrowserClose(); } catch (e) {}
+  try { gazHourClose(); } catch (e) {}   // #1157
+  try { pineSlidesSet(false); } catch (e) {}
+  try { scriptClose(); } catch (e) {}
   const rm = document.getElementById("remoteModal");
   if (rm) rm.remove();
   const dock = document.getElementById("cloudDock");
@@ -103745,7 +113015,9 @@ async function loadGallery() {
     byDay.get(day).push(item);
   });
 
-  (byDay.get(todayKey) || []).forEach((item) => grid.appendChild(makeTile(item)));
+  // #1157: papers of one hour arrive as a single pile; every other
+  // render is still its own tile in its own place in time.
+  galleryStackInto(grid, byDay.get(todayKey) || [], makeTile);
 
   const days = el("div");
   days.style.cssText = "grid-column:1/-1";
@@ -103756,13 +113028,11 @@ async function loadGallery() {
     const sum = document.createElement("summary");
     sum.appendChild(document.createTextNode(day));
     const small = document.createElement("small");
-    const vids = items.filter((i) => isVideoFile((i.files || [])[0])).length;
-    small.textContent = items.length + " renders" +
-      (vids ? " · " + vids + " video" + (vids > 1 ? "s" : "") : "");
+    small.textContent = galleryDayCountText(items);   // #1157
     sum.appendChild(small);
     tick.appendChild(sum);
     const dayGrid = el("div", "day-grid");
-    items.forEach((item) => dayGrid.appendChild(makeTile(item)));
+    galleryStackInto(dayGrid, items, makeTile);   // #1157
     tick.appendChild(dayGrid);
     days.appendChild(tick);
   });
@@ -103784,7 +113054,7 @@ async function loadGallery() {
     }
     const span = mini.querySelector("span");
     span.textContent = "";
-    galleryItems.slice(0, 20).forEach((item) => {
+    galleryStackedFirst(20).forEach((item) => {   // #1157: one per hour
       const file = (item.files || [])[0];
       if (!file || isVideoFile(file)) return;
       const img = document.createElement("img");
@@ -103792,6 +113062,520 @@ async function loadGallery() {
       span.appendChild(img);
     });
   }
+
+  // #1157: the strip grew under an open hour viewer - a new snapshot for
+  // that hour joins its pages in place; nothing closes, nothing jumps.
+  gazHourSync();
+}
+
+/* #1157: called at the end of every gallery load. */
+function gazHourSync() {
+  if (!gazHour) return;
+  gazHourPaint(false);
+}
+
+/* ---- #1157: THE GAZETTE, STACKED BY THE HOUR ------------------------
+ * The press files a snapshot on the hour and another for every extra, so
+ * a third of the newest gallery rows were newspapers and the listing was
+ * mostly Gazette. Every snapshot of one hour now collapses into a single
+ * tile drawn as a pile of papers - the newest face up, the ones behind it
+ * peeking, a count and the hour on it. Clicking the pile scrolls that
+ * hour's issues at reading size; one control on any of them opens the
+ * real edition in the 📰 window (paperOpen/paperShow reused, not forked).
+ * Nothing else in the gallery moves: a render is still its own tile in
+ * its own place in time, and a pile sits at the time of its newest issue
+ * so the listing stays chronological. */
+
+let gazHour = null;      // the open hour viewer {hour, sig, shade, strip, ...}
+let gazMeta = {};        // edition id -> the shelf's row for it
+let gazMetaAt = 0;
+
+// Three ways to know a Gazette row, because rows older than #1020 answer
+// to only one of them.
+function galleryIsPaper(item) {
+  if (!item) return false;
+  if (item.kind === "paper" || item.model === "gazette") return true;
+  // Tags alone are not enough: the gallery's regenerate button posts a
+  // row's tag list back verbatim, so a render made from a snapshot
+  // inherits "gazette <id> ..." and would be swallowed into that hour's
+  // pile. Every snapshot the press files is named gazette-<id>[-style],
+  // and no render is - so the old rows are still recognised and the new
+  // render stays the render it is.
+  if (String(item.tags || "").indexOf("gazette ") !== 0) return false;
+  return (item.files || []).some(
+    (f) => String(f || "").split("/").pop().indexOf("gazette-") === 0);
+}
+
+// The edition id behind a row: the field the snapshot writes, else the
+// tags ("gazette <id> <style> ..."), else the file ("gazette-<id>.png").
+function galleryPaperId(item) {
+  if (!item) return "";
+  const direct = String(item.edition || "").trim();
+  if (direct) return direct;
+  const re = /(\d{4}-\d{2}-\d{2}-\d{2}(?:x\d{4})?)/;
+  const tags = String(item.tags || "");
+  if (tags.indexOf("gazette ") === 0) {
+    const hit = re.exec(tags.slice(8));
+    if (hit) return hit[1];
+  }
+  const hit2 = re.exec(String((item.files || [])[0] || ""));
+  return hit2 ? hit2[1] : "";
+}
+
+// The hour an edition belongs to - the id up to the "x" of an extra.
+function galleryPaperHour(id) { return String(id || "").split("x")[0]; }
+
+function galleryHourDate(hour) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})$/.exec(String(hour || ""));
+  if (!m) return null;
+  return new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), 0, 0);
+}
+
+function galleryHourClock(hour) {
+  const d = galleryHourDate(hour);
+  if (!d) return String(hour || "");
+  const h = d.getHours();
+  return ((h % 12) || 12) + (h < 12 ? " AM" : " PM");
+}
+
+function galleryHourLabel(hour) {
+  const d = galleryHourDate(hour);
+  if (!d) return String(hour || "");
+  return d.toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric"})
+    + " · " + galleryHourClock(hour);
+}
+
+// An extra carries the minute it was pressed in its id; the hourly issue
+// is the hour itself.
+function galleryEditionClock(id) {
+  const m = /x(\d{2})(\d{2})$/.exec(String(id || ""));
+  if (m) return m[1] + ":" + m[2];
+  const d = galleryHourDate(galleryPaperHour(id));
+  return d ? (String(d.getHours()).padStart(2, "0") + ":00") : String(id || "");
+}
+
+/* One entry per tile, in the order the ledger hands the rows over (newest
+ * first): every other generation on its own, every hour's papers as one
+ * pile that keeps the place of its newest issue. */
+function galleryStackEntries(items) {
+  const out = [];
+  const stacks = new Map();
+  (items || []).forEach((item) => {
+    const id = galleryIsPaper(item) ? galleryPaperId(item) : "";
+    if (!id) { out.push({paper: false, item: item}); return; }
+    const hour = galleryPaperHour(id);
+    let stack = stacks.get(hour);
+    if (!stack) {
+      stack = {paper: true, hour: hour, rows: []};
+      stacks.set(hour, stack);
+      out.push(stack);
+    }
+    stack.rows.push({id: id, item: item});
+  });
+  // Inside a pile: the hourly issue first, then the extras in press order
+  // - the ids sort that way on their own.
+  stacks.forEach((stack) => {
+    stack.rows.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+  });
+  return out;
+}
+
+function galleryHourRows(hour) {
+  const hit = galleryStackEntries(galleryItems).find(
+    (e) => e.paper && e.hour === hour);
+  return hit ? hit.rows : [];
+}
+
+/* `makeTile` is loadGallery's own tile maker, handed in so a render is
+ * still drawn exactly the way it always was. */
+function galleryStackInto(host, items, makeTile) {
+  galleryStackEntries(items).forEach((entry) => {
+    host.appendChild(entry.paper ? galleryStackTile(entry) : makeTile(entry.item));
+  });
+}
+
+function galleryStackTile(stack) {
+  const rows = stack.rows || [];
+  const top = rows[rows.length - 1] || {};      // the newest issue faces up
+  const tile = el("div", "gaz-stack", "");
+  const behind = Math.min(2, Math.max(0, rows.length - 1));
+  if (behind >= 2) tile.appendChild(el("div", "gaz-sheet s3", ""));
+  if (behind >= 1) tile.appendChild(el("div", "gaz-sheet s2", ""));
+  const face = el("div", "gaz-sheet top", "");
+  const file = ((top.item || {}).files || [])[0];
+  if (file) {
+    const img = mediaElement(file);
+    fetchImageInto(img, file);
+    face.appendChild(img);
+  } else {
+    face.appendChild(el("div", "gaz-blank", "📰"));
+  }
+  tile.appendChild(face);
+  // #1157: the badge and the "N issues" are what a pile is FOR. One issue
+  // has neither - it is simply the hour's paper, and it fills its tile.
+  if (rows.length > 1) {
+    tile.appendChild(el("div", "gaz-count", String(rows.length)));
+  } else {
+    tile.classList.add("one");
+  }
+  const lab = el("div", "gaz-lab", "");
+  lab.appendChild(el("span", "", galleryHourClock(stack.hour)));
+  if (rows.length > 1) {
+    lab.appendChild(el("small", "", rows.length + " issues"));
+  }
+  tile.appendChild(lab);
+  tile.title = "The Gazette — " + galleryHourLabel(stack.hour) + "\n"
+    + rows.length + " issue" + (rows.length === 1 ? "" : "s")
+    + " — click to scroll the hour";
+  tile.onclick = () => gazHourOpen(stack.hour);
+  return tile;
+}
+
+/* A day's tick used to call every Gazette snapshot a render. */
+function galleryDayCountText(items) {
+  const rows = items || [];
+  const papers = rows.filter((i) => galleryIsPaper(i)).length;
+  const vids = rows.filter((i) => isVideoFile((i.files || [])[0])).length;
+  const rest = rows.length - papers;
+  const bits = [rest + " render" + (rest === 1 ? "" : "s")];
+  if (vids) bits.push(vids + " video" + (vids === 1 ? "" : "s"));
+  if (papers) bits.push(papers + " paper" + (papers === 1 ? "" : "s"));
+  return bits.join(" · ");
+}
+
+/* The folded gallery's marquee: one picture per hour of papers, so the
+ * little strip is not a row of identical front pages either. */
+function galleryStackedFirst(most) {
+  const out = [];
+  galleryStackEntries(galleryItems).forEach((entry) => {
+    if (out.length >= most) return;
+    out.push(entry.paper ? (entry.rows[entry.rows.length - 1] || {}).item : entry.item);
+  });
+  return out.filter(Boolean);
+}
+
+/* The same collapse for the scrolling filmstrip's rows: the newest issue
+ * of an hour stands for the hour and says how many it stands for. */
+function galleryFilmRows(rows) {
+  const out = [];
+  const seen = new Map();
+  (rows || []).forEach((row) => {
+    const id = galleryIsPaper(row) ? galleryPaperId(row) : "";
+    if (!id) { out.push(row); return; }
+    const hour = galleryPaperHour(id);
+    let mark = seen.get(hour);
+    if (!mark) {
+      mark = Object.assign({}, row, {paperHour: hour, paperCount: 0});
+      seen.set(hour, mark);
+      out.push(mark);
+    }
+    mark.paperCount += 1;
+    mark.tags = "The Gazette — " + galleryHourLabel(hour) + " · "
+      + mark.paperCount + " issue" + (mark.paperCount === 1 ? "" : "s");
+  });
+  return out;
+}
+
+/* The headlines. /api/gallery/papers hands them over already grouped;
+ * /api/paper is the fallback shelf; with neither we still have the hour,
+ * the time and the deck out of the row's own tags. */
+async function gazLoadMeta(force) {
+  const now = Date.now();
+  if (!force && gazMetaAt && now - gazMetaAt < 20000) return gazMeta;
+  let map = null;
+  try {
+    const d = await api("/api/gallery/papers?limit=400");
+    map = {};
+    (d.hours || []).forEach((h) => (h.editions || []).forEach((e) => { map[e.id] = e; }));
+  } catch (err) { map = null; }
+  if (!map) {
+    try {
+      const d = await api("/api/paper");
+      map = {};
+      (d.editions || []).forEach((e) => {
+        map[e.id] = {id: e.id, headline: e.headline || "", deck: e.deck || "",
+          kind: e.kind || "", paused: !!e.paused, pages: e.pages || 0,
+          at: e.at || 0, on_shelf: true};
+      });
+    } catch (err) { map = null; }
+  }
+  if (map) { gazMeta = map; gazMetaAt = now; }
+  return gazMeta;
+}
+
+/* What we know about one issue. The shelf when it answers; otherwise the
+ * row's own request line ("The Gazette - <headline>") and tags ("gazette
+ * <id> <style> the 8 AM hour [paused ]<deck>") - so an edition pruned off
+ * the shelf still shows its headline, its deck, and whether it went to
+ * press while the station was paused. */
+function gazMetaFor(id, item) {
+  const m = gazMeta[id] || {};
+  const tags = String((item || {}).tags || "");
+  const slot = /\bthe \d{1,2} [AP]M hour (paused )?/.exec(tags);
+  const fromTags = slot ? tags.slice(slot.index + slot[0].length) : "";
+  const said = /^The Gazette\s*[—–-]\s*(.+)$/.exec(
+    String((item || {}).request || ""));
+  return {
+    id: id,
+    known: !!m.id,
+    headline: m.headline || (said ? said[1] : ""),
+    deck: m.deck || fromTags,
+    kind: m.kind || (id.indexOf("x") >= 0 ? "extra" : "hourly"),
+    paused: m.id ? !!m.paused : !!(slot && slot[1]),
+    pages: m.pages || 0,
+    onShelf: m.id ? m.on_shelf !== false : true,
+  };
+}
+
+/* ---- #1157: the hour, scrolled ------------------------------------- */
+
+async function gazHourOpen(hour) {
+  if (!hour) return;
+  if (gazHour && gazHour.hour === hour) { gazHourClose(); return; }
+  gazHourClose();
+  const shade = el("div", "gaz-shade", "");
+  const head = el("div", "gaz-head", "");
+  head.appendChild(el("b", "", "📰 The Gazette"));
+  const when = el("span", "", galleryHourLabel(hour));
+  when.style.cssText = "font-size:13px;color:#cfd8e6";
+  head.appendChild(when);
+  const count = el("span", "muted", "");
+  count.style.cssText = "font-size:11px;flex:1;min-width:90px";
+  head.appendChild(count);
+  const hint = el("span", "muted",
+    "wheel or drag to scroll the hour · click a page to zoom it · Esc closes");
+  hint.style.cssText = "font-size:11px";
+  head.appendChild(hint);
+  const issue = el("button", "", "Open the hour's issue ↗");
+  issue.title = "Open the 📰 window at the first edition of this hour";
+  issue.onclick = () => {
+    const rows = galleryHourRows(hour);
+    if (rows.length) gazLoadIssue(rows[0].id);
+  };
+  head.appendChild(issue);
+  const x = el("button", "", "✕");
+  x.title = "Close the hour (Esc)";
+  x.onclick = gazHourClose;
+  head.appendChild(x);
+  const strip = el("div", "gaz-strip", "");
+  shade.appendChild(head);
+  shade.appendChild(strip);
+  shade.onclick = (ev) => { if (ev.target === shade) gazHourClose(); };
+  document.body.appendChild(shade);
+  gazHour = {hour: hour, sig: "", asked: "", shade: shade, strip: strip, count: count};
+  gazStripScroll(strip);
+  document.addEventListener("keydown", gazHourKeys);
+  gazHourPaint(true);
+}
+
+function gazHourClose() {
+  if (!gazHour) return;
+  try { gazHour.shade.remove(); } catch (e) { /* already gone */ }
+  gazHour = null;
+  document.removeEventListener("keydown", gazHourKeys);
+}
+
+function gazHourKeys(ev) {
+  if (!gazHour) return;
+  if (typeof paperBox !== "undefined" && paperBox) return;   // the paper has the keys
+  if (ev.key === "Escape") { gazHourClose(); return; }
+  if (ev.key === "ArrowLeft" || ev.key === "ArrowRight") {
+    gazHourStep(ev.key === "ArrowRight" ? 1 : -1);
+    ev.preventDefault();
+  }
+}
+
+function gazHourStep(delta) {
+  const strip = gazHour && gazHour.strip;
+  if (!strip) return;
+  const pages = Array.from(strip.querySelectorAll(".gaz-page"));
+  if (!pages.length) return;
+  const mid = strip.scrollLeft + strip.clientWidth / 2;
+  let at = 0;
+  pages.forEach((p, i) => {
+    if (p.offsetLeft + p.offsetWidth / 2 <= mid + 4) at = i;
+  });
+  const next = pages[Math.max(0, Math.min(pages.length - 1, at + delta))];
+  if (next) next.scrollIntoView({behavior: "smooth", inline: "center", block: "nearest"});
+}
+
+/* Wheel and drag both walk the hour sideways. A zoomed page keeps its own
+ * up-and-down reading: the wheel only turns into sideways travel once
+ * that page has nothing left to scroll. */
+function gazStripScroll(strip) {
+  strip.addEventListener("wheel", (ev) => {
+    if (ev.ctrlKey) return;
+    const page = ev.target && ev.target.closest ? ev.target.closest(".gaz-page") : null;
+    if (page && page.classList.contains("zoom")) {
+      const box = page.querySelector(".gaz-sheetbox");
+      if (box) {
+        const room = box.scrollHeight - box.clientHeight - box.scrollTop;
+        if ((ev.deltaY > 0 && room > 1) || (ev.deltaY < 0 && box.scrollTop > 1)) return;
+      }
+    }
+    const step = Math.abs(ev.deltaX) > Math.abs(ev.deltaY) ? ev.deltaX : ev.deltaY;
+    if (!step) return;
+    strip.scrollLeft += step;
+    ev.preventDefault();
+  }, {passive: false});
+  let from = 0, at = 0, down = false;
+  strip._gazDragged = false;
+  strip.addEventListener("pointerdown", (ev) => {
+    if (ev.button) return;
+    down = true;
+    from = ev.clientX;
+    at = strip.scrollLeft;
+    strip._gazDragged = false;
+  });
+  strip.addEventListener("pointermove", (ev) => {
+    if (!down) return;
+    const moved = ev.clientX - from;
+    if (Math.abs(moved) > 3) {
+      strip._gazDragged = true;
+      strip.classList.add("drag");
+      strip.scrollLeft = at - moved;
+      ev.preventDefault();
+    }
+  });
+  const up = () => { down = false; strip.classList.remove("drag"); };
+  strip.addEventListener("pointerup", up);
+  strip.addEventListener("pointerleave", up);
+  strip.addEventListener("pointercancel", up);
+}
+
+/* Repaints only when the hour's issues actually changed, so a strip that
+ * reloads under an open viewer neither closes it nor loses its place. */
+function gazHourPaint(force) {
+  if (!gazHour) return;
+  const rows = galleryHourRows(gazHour.hour);
+  if (!rows.length) { gazHourClose(); return; }
+  const sig = rows.map((r) => r.id).join(",");
+  if (!force && sig === gazHour.sig) return;
+  const strip = gazHour.strip;
+  const keep = strip.scrollLeft;
+  strip.innerHTML = "";
+  rows.forEach((row) => strip.appendChild(gazPage(row)));
+  gazHour.sig = sig;
+  strip.scrollLeft = keep;
+  const extras = rows.filter((r) => r.id.indexOf("x") >= 0).length;
+  if (gazHour.count) {
+    gazHour.count.textContent = rows.length + " issue" + (rows.length === 1 ? "" : "s")
+      + (extras ? " · " + extras + " extra" + (extras === 1 ? "" : "s") : "");
+  }
+  // An issue we have no headline for: ask the shelf, once per issue set.
+  if (rows.some((r) => !gazMetaFor(r.id, r.item).known) && gazHour.asked !== sig) {
+    gazHour.asked = sig;
+    gazLoadMeta(true)
+      .then(() => { if (gazHour) gazHourPaint(true); })
+      .catch(() => { /* the tags carry the rest */ });
+  }
+}
+
+function gazPage(row) {
+  const id = row.id;
+  const item = row.item || {};
+  const meta = gazMetaFor(id, item);
+  const page = el("div", "gaz-page", "");
+  const cap = el("div", "gaz-cap", "");
+  cap.appendChild(el("b", "", galleryEditionClock(id)));
+  cap.appendChild(el("span", "gaz-kick" + (meta.kind === "extra" ? "" : " hourly"),
+    meta.kind === "extra" ? "extra" : "the hourly issue"));
+  if (meta.paused) cap.appendChild(el("span", "gaz-pause", "⏸ printed while paused"));
+  cap.appendChild(el("span", "gaz-headline",
+    meta.headline || (meta.known ? "(untitled)" : "…")));
+  const open = el("button", "", "Load the full issue ↗");
+  open.title = "Open the Gazette window at edition " + id
+    + " — the real thing, with its style tabs and page tabs";
+  if (meta.known && !meta.onShelf) {
+    open.disabled = true;
+    open.title = "This edition has aged off the shelf — only its picture is left";
+  }
+  open.onclick = (ev) => { ev.stopPropagation(); gazLoadIssue(id); };
+  cap.appendChild(open);
+  const bin = el("button", "", "🗑");
+  bin.title = "Take this issue's picture out of the gallery — the edition stays on the shelf";
+  bin.onclick = (ev) => { ev.stopPropagation(); gazDropIssue(row); };
+  cap.appendChild(bin);
+  page.appendChild(cap);
+  if (meta.deck) {
+    const deck = el("div", "gaz-deck", meta.deck);
+    deck.title = meta.deck;
+    page.appendChild(deck);
+  }
+  const box = el("div", "gaz-sheetbox", "");
+  const file = (item.files || [])[0];
+  if (file) {
+    const img = mediaElement(file);
+    img.draggable = false;   // else the press becomes a native image drag
+    fetchImageInto(img, file);
+    box.appendChild(img);
+  } else {
+    box.appendChild(el("div", "gaz-empty", "No picture was filed for this issue."));
+  }
+  page.appendChild(box);
+  page.onclick = () => {
+    const strip = gazHour && gazHour.strip;
+    if (strip && strip._gazDragged) { strip._gazDragged = false; return; }
+    page.classList.toggle("zoom");
+  };
+  return page;
+}
+
+/* From the picture to the paper. paperOpen TOGGLES the window shut when
+ * one is already up, so an open Gazette is moved to the edition instead
+ * of a second window being stacked on top of it. */
+async function gazLoadIssue(id) {
+  if (!id) return;
+  try {
+    if (typeof paperBox === "undefined" || !paperBox) {
+      // paperWatch pulls a window it has not "seen" onto the NEWEST
+      // edition the moment the on-air poll ticks - and that poll fires
+      // while the window is still opening, so the refresh it starts lands
+      // after ours and snatches the operator off the issue he asked for.
+      // Marking the newest seen before the window exists never arms it.
+      try {
+        const d = await api("/api/paper");
+        if (d && d.latest) paperSeen = d.latest;
+      } catch (err) { /* the window still opens */ }
+      await paperOpen();
+    }
+    await paperShow(id);
+    setStatus("The Gazette is open at " + id + ".");
+  } catch (err) {
+    setStatus("Could not open edition " + id + ": "
+      + ((err && err.message) || err), true);
+  }
+}
+
+/* The bin on one issue takes that ledger row out and leaves the rest of
+ * the hour where it was: the pile re-forms one shorter. The edition
+ * itself stays on the Gazette's shelf. */
+async function gazDropIssue(row) {
+  const item = row.item || {};
+  const file = (item.files || [])[0];
+  if (!file) return;
+  if (!confirm("Remove the picture of edition " + row.id + " from the gallery?\n"
+      + "The edition itself stays on the Gazette's shelf.")) return;
+  try {
+    await api("/api/generations/image/" + encodeURIComponent(file), {method: "DELETE"});
+  } catch (err) {
+    setStatus((err && err.message) || String(err), true);
+    return;
+  }
+  if (galleryURLs[file]) {
+    try { URL.revokeObjectURL(galleryURLs[file]); } catch (e) { /* already revoked */ }
+    delete galleryURLs[file];
+  }
+  const without = (rows) => (rows || []).filter((g) => (g.files || [])[0] !== file);
+  galleryItems = without(galleryItems);
+  lastGenerations = without(lastGenerations);
+  lastComfyFiles = (lastComfyFiles || []).filter((x) => x !== file);
+  filmSignature = "";
+  prevFilmFiles.delete(file);
+  gazHourPaint(true);
+  buildFilmstrip();
+  loadGallery();
+  setStatus("Took " + file + " out of the gallery.");
 }
 
 function metaRow(label, value) {
@@ -125819,8 +135603,132 @@ function djTailPanel(anchor) {
   paintTray();
 }
 
-/* The plotline desk (📖): write a storyline in acts; activate it and the
- * pair live it out on air one act at a time until the story lands. */
+/* The plotline desk (📖): write a storyline in acts, say HOW LONG it runs,
+ * and watch it play out. #1157 added the span in plain units, the timetable
+ * (which act is live between which clock times), the live progress, the
+ * beats that actually aired under each act, the running story-so-far, and
+ * hold / resume / jump to the next act / end early.
+ *
+ * The story's clock is AIR time: it stops while the station is paused, the
+ * same way every other clock here does (#1150), so the times below are
+ * projections at the current pause state and a pause pushes every remaining
+ * act later by the length of it. */
+function plotSpanSay(seconds) {
+  const whole = Math.max(0, Math.round(Number(seconds) || 0));
+  const hours = Math.floor(whole / 3600);
+  const mins = Math.round((whole % 3600) / 60);
+  if (hours && mins) return hours + "h " + mins + "m";
+  if (hours) return hours + "h";
+  return mins + "m";
+}
+
+function plotClockSay(at) {
+  const when = Number(at) || 0;
+  if (!when) return "—";
+  const date = new Date(when * 1000);
+  const mins = date.getMinutes();
+  let hour = date.getHours();
+  const half = hour >= 12 ? "pm" : "am";
+  hour = hour % 12 || 12;
+  return hour + ":" + (mins < 10 ? "0" + mins : mins) + " " + half;
+}
+
+/* One plot's detail: progress, the timetable, what has aired, the controls. */
+function plotDetail(p, refresh) {
+  const box = el("div", "", "");
+  box.style.cssText = "margin:2px 0 10px 6px;padding:6px 8px;"
+    + "border-left:2px solid #2b3a52";
+  const prog = p.progress || {};
+  const acts = (p.acts || []).length;
+  const head = el("div", "", "");
+  head.style.cssText = "font-size:12px;margin-bottom:4px";
+  if (prog.span_seconds) {
+    head.textContent = "Act " + (prog.act || 0) + " of " + (prog.of || acts)
+      + " · " + Math.round((prog.through || 0) * 100) + "% through · "
+      + plotSpanSay(prog.remaining) + " of story left · "
+      + (prog.acts_left || 0) + " act(s) to go · this act has "
+      + plotSpanSay(prog.act_left) + " left"
+      + (prog.held ? " · ⏸ HELD" : prog.frozen ? " · ⏸ station paused" : "")
+      + (prog.tight ? " · ⚠ each act is under four minutes — rounds do "
+        + "not land that often, so some acts will never be said" : "");
+  } else {
+    head.textContent = "No span set — save one, then put it on the air.";
+  }
+  box.appendChild(head);
+
+  if (p.so_far) {
+    const soFar = el("div", "muted", "The story so far: " + p.so_far);
+    soFar.style.cssText = "font-size:11px;margin:0 0 6px";
+    box.appendChild(soFar);
+  }
+
+  const table = p.timetable || [];
+  if (table.length) {
+    const grid = el("div", "", "");
+    grid.style.cssText = "font-size:11px";
+    table.forEach((slot) => {
+      const line = el("div", "", "");
+      line.style.cssText = "margin:3px 0;padding:3px 5px;border-radius:3px;"
+        + (slot.live ? "background:#16304a" : slot.done
+          ? "opacity:.55" : "");
+      const when = el("div", "", (slot.live ? "▶ " : slot.done ? "✓ " : "· ")
+        + "Act " + slot.act + "/" + slot.of + "  "
+        + plotClockSay(slot.from_at) + " – " + plotClockSay(slot.to_at)
+        + "  (" + plotSpanSay(slot.seconds) + ")");
+      when.style.cssText = "font-weight:600";
+      line.appendChild(when);
+      const what = el("div", "muted", slot.text || "");
+      what.style.cssText = "margin:1px 0 0 14px";
+      line.appendChild(what);
+      const beats = ((p.beats || {})[String(slot.act)] || []);
+      beats.forEach((b) => {
+        const beat = el("div", "muted",
+          "· " + (b.name || b.who || "") + (b.round ? " [" + b.round + "]" : "")
+          + ": " + (b.text || ""));
+        beat.style.cssText = "margin:1px 0 0 26px;font-size:10px;opacity:.8";
+        line.appendChild(beat);
+      });
+      if (!beats.length && slot.started) {
+        const none = el("div", "muted", "· nothing recorded under this act yet");
+        none.style.cssText = "margin:1px 0 0 26px;font-size:10px;opacity:.55";
+        line.appendChild(none);
+      }
+      grid.appendChild(line);
+    });
+    box.appendChild(grid);
+  }
+
+  const controls = el("div", "row", "");
+  controls.style.cssText = "gap:6px;margin-top:6px;flex-wrap:wrap";
+  const send = async (todo) => {
+    try {
+      await api("/api/dj/plots/" + p.id + "/control", {
+        method: "POST", body: JSON.stringify({do: todo})});
+      refresh();
+    } catch (e) {}
+  };
+  const hold = el("button", "", prog.held ? "▶ Resume the story"
+    : "⏸ Hold the story");
+  hold.title = prog.held
+    ? "Start the story's clock again from exactly where it stopped"
+    : "Stop the story's clock without losing its place";
+  hold.onclick = () => send(prog.held ? "resume" : "hold");
+  const next = el("button", "", "⏭ Next act");
+  next.title = "Jump to the next act now";
+  next.onclick = () => send("next");
+  const end = el("button", "", "⏹ End early");
+  end.title = "Land it now: the span is spent and the plot is done";
+  end.onclick = () => send("end");
+  controls.appendChild(hold);
+  controls.appendChild(next);
+  controls.appendChild(end);
+  const count = el("span", "muted", (p.beats_count || 0) + " beats recorded");
+  count.style.cssText = "font-size:11px;align-self:center";
+  controls.appendChild(count);
+  box.appendChild(controls);
+  return box;
+}
+
 async function plotOpen() {
   const gone = document.getElementById("plotModal");
   if (gone) { gone.remove(); return; }
@@ -125830,29 +135738,65 @@ async function plotOpen() {
     + "z-index:180;display:flex;align-items:center;justify-content:center";
   shade.onclick = (e) => { if (e.target === shade) shade.remove(); };
   const card = el("div", "panel", "");
-  card.style.cssText = "max-width:640px;width:94%;max-height:88vh;margin:0;"
+  card.style.cssText = "max-width:720px;width:96%;max-height:90vh;margin:0;"
     + "overflow-y:auto";
   card.onclick = (e) => e.stopPropagation();
   card.appendChild(el("h2", "", "📖 The plotline desk"));
   card.lastChild.style.margin = "0 0 4px";
   card.appendChild(el("div", "muted",
     "Structure a storyline for the booth in acts — one act per line (or "
-    + "blank-line separated). Activate it and the pair weave the current "
-    + "act into their rounds, in character, until the story lands. One "
-    + "plot on air at a time."));
+    + "blank-line separated) — and say how long it runs. The acts are "
+    + "spread evenly across that span, so a five-act story over three "
+    + "hours opens on act one and lands act five at the end. While it is "
+    + "on, every segment is written under it, a share of the callers ring "
+    + "in from inside it, and the pair track it out loud. The clock is AIR "
+    + "time: it stops while the station is paused."));
   card.lastChild.style.cssText = "font-size:12px;margin-bottom:10px";
 
   card.appendChild(el("label", "", "Title"));
   const title = el("input", "", "");
-  title.placeholder = "e.g. The night the transmitter fell in love";
+  title.placeholder = "e.g. Wanted Dead Or Alive: Bla The HandPan Maniac";
   card.appendChild(title);
   card.appendChild(el("label", "", "The acts — one per line"));
   const acts = el("textarea", "", "");
   acts.style.minHeight = "110px";
-  acts.placeholder = "Act 1: a strange hum starts under the desk…\n"
-    + "Act 2: the hum answers to one of their names…\n"
-    + "Act 3: the confession, live on air.";
+  acts.placeholder = "Act 1: a handpanner is loose in the city…\n"
+    + "Act 2: the police are sent in and are seduced by the handpan…\n"
+    + "Act 3: the whole world collapses into handpanners.";
   card.appendChild(acts);
+
+  /* #1157: HOW LONG IT RUNS, in plain units. */
+  card.appendChild(el("label", "", "How long the story runs"));
+  const spanRow = el("div", "row", "");
+  spanRow.style.cssText = "gap:6px;align-items:center;margin-bottom:6px";
+  const span = el("input", "", "");
+  span.type = "number";
+  span.min = "1";
+  span.step = "1";
+  span.value = "1";
+  span.style.cssText = "width:80px";
+  const unit = el("select", "", "");
+  [["60", "hours"], ["1", "minutes"]].forEach((pair) => {
+    const opt = el("option", "", pair[1]);
+    opt.value = pair[0];
+    unit.appendChild(opt);
+  });
+  unit.style.cssText = "width:110px";
+  const startAt = el("select", "", "");
+  [["now", "starting now"], ["hour", "at the top of the next hour"]]
+    .forEach((pair) => {
+      const opt = el("option", "", pair[1]);
+      opt.value = pair[0];
+      startAt.appendChild(opt);
+    });
+  startAt.style.cssText = "flex:1";
+  spanRow.appendChild(span);
+  spanRow.appendChild(unit);
+  spanRow.appendChild(startAt);
+  card.appendChild(spanRow);
+  const minutesNow = () => Math.max(
+    1, Math.round((Number(span.value) || 1) * (Number(unit.value) || 1)));
+
   const status = el("div", "muted", "");
   status.style.cssText = "font-size:12px;margin:6px 0";
   const save = el("button", "primary", "💾 Save the plotline");
@@ -125860,7 +135804,8 @@ async function plotOpen() {
   save.onclick = async () => {
     try {
       await api("/api/dj/plots", {method: "POST", body: JSON.stringify({
-        id: editing, title: title.value.trim(), text: acts.value})});
+        id: editing, title: title.value.trim(), text: acts.value,
+        span_minutes: minutesNow()})});
       status.textContent = "saved ✓";
       editing = ""; title.value = ""; acts.value = "";
       plotList();
@@ -125872,6 +135817,7 @@ async function plotOpen() {
   card.appendChild(el("h3", "", "The shelf"));
   const wrap = el("div", "", "");
   card.appendChild(wrap);
+  const open = {};
   async function plotList() {
     try {
       const got = await api("/api/dj/plots");
@@ -125881,58 +135827,70 @@ async function plotOpen() {
         wrap.appendChild(el("div", "muted", "No plotlines written yet."));
         return;
       }
+      if (got.paused) {
+        const note = el("div", "muted",
+          "The station is paused — every story clock is stopped.");
+        note.style.cssText = "font-size:11px;margin:2px 0 6px";
+        wrap.appendChild(note);
+      }
       rows.forEach((p) => {
         const row = el("div", "row", "");
         row.style.cssText = "align-items:center;gap:6px;margin:3px 0";
         const n = (p.acts || []).length;
-        const state = (p.active ? "🔴 act " + Math.min(p.act_idx + 1, n)
-          + "/" + n : p.done ? "✅ played out" : "· " + n + " acts")
-          + (p.half_hour ? " · 🕧 colouring the half hour" : "");   // #907
-        const label = el("span", "", (p.title || "untitled").slice(0, 38)
+        const prog = p.progress || {};
+        const state = (p.owns_air
+          ? "🔴 act " + (prog.act || 1) + "/" + (prog.of || n) + " · "
+            + plotSpanSay(prog.remaining) + " left"
+          : p.done ? "✅ played out"
+            : p.active ? "· armed" : "· " + n + " acts")
+          + (prog.span_seconds
+            ? " · " + plotSpanSay(prog.span_seconds) + " span" : "")
+          + (prog.held ? " · ⏸ held" : "");
+        const label = el("span", "", (p.title || "untitled").slice(0, 34)
           + "  " + state);
         label.style.cssText = "flex:1;font-size:12px;cursor:pointer";
         label.title = (p.acts || []).join("\n");
         label.onclick = () => {
           editing = p.id; title.value = p.title || "";
           acts.value = (p.acts || []).join("\n");
+          const mins = Number(prog.span_minutes || p.span_minutes || 60);
+          if (mins && mins % 60 === 0) {
+            unit.value = "60"; span.value = String(mins / 60);
+          } else {
+            unit.value = "1"; span.value = String(mins || 60);
+          }
           status.textContent = "editing “" + (p.title || "") + "”";
         };
         const act = el("button", "", p.active ? "⏸" : "▶");
         act.title = p.active ? "Take it off the air"
-          : "Put it on the air" + (p.done ? " (restarts it)" : "");
+          : "Put it on the air for " + plotSpanSay(minutesNow() * 60)
+            + (p.done ? " (restarts it)" : "");
         act.onclick = async () => {
           try {
             await api("/api/dj/plots/" + p.id + "/activate", {
-              method: "POST", body: JSON.stringify({on: !p.active})});
+              method: "POST", body: JSON.stringify(
+                p.active ? {on: false}
+                  : {on: true, span_minutes: minutesNow(),
+                     start: startAt.value})});
             plotList();
           } catch (e) {}
         };
         const redo = el("button", "", "🔄");
-        redo.title = "Restart from act one, on the air";
+        redo.title = "Restart from act one, on the air, for the span above";
         redo.onclick = async () => {
           try {
             await api("/api/dj/plots/" + p.id + "/activate", {
               method: "POST",
-              body: JSON.stringify({on: true, restart: true})});
+              body: JSON.stringify({on: true, restart: true,
+                                    span_minutes: minutesNow(),
+                                    start: startAt.value})});
             plotList();
           } catch (e) {}
         };
-        const del = el("button", "", "🗑");
-        del.onclick = async () => {
-          try {
-            await api("/api/dj/plots/" + p.id, {method: "DELETE"});
-            plotList();
-          } catch (e) {}
-        };
-        // #907: the half hour, coloured end to end. Every segment in
-        // it — banter, calls, the memo, the ad reads, the gallery — is
-        // written under the plot, and the acts walk across the half
-        // hour on the clock rather than burning one per round.
+        /* #907's half-hour claim, kept working for anything already set up
+         * that way; the span above is the road everything new takes. */
         const half = el("button", "", "🕧");
-        half.title = "Run it across THIS HALF HOUR: every segment's "
-          + "dialogue is written under the plot, and the acts walk "
-          + "across the half hour on the clock. Prepared material for "
-          + "the window is thrown away and written again under it.";
+        half.title = "The old #907 button: claim THIS half hour only";
         half.onclick = async () => {
           try {
             await api("/api/dj/plots/" + p.id + "/activate", {
@@ -125942,9 +135900,20 @@ async function plotOpen() {
             plotList();
           } catch (e) {}
         };
-        row.appendChild(label); row.appendChild(act);
+        const more = el("button", "", open[p.id] ? "▾" : "▸");
+        more.title = "The timetable, what has aired, and the controls";
+        more.onclick = () => { open[p.id] = !open[p.id]; plotList(); };
+        const del = el("button", "", "🗑");
+        del.onclick = async () => {
+          try {
+            await api("/api/dj/plots/" + p.id, {method: "DELETE"});
+            plotList();
+          } catch (e) {}
+        };
+        row.appendChild(label); row.appendChild(more); row.appendChild(act);
         row.appendChild(redo); row.appendChild(half); row.appendChild(del);
         wrap.appendChild(row);
+        if (open[p.id]) wrap.appendChild(plotDetail(p, plotList));
       });
     } catch (e) { wrap.textContent = e.message; }
   }
@@ -135086,6 +145055,12 @@ let paperPageCur = 1;
 let paperText = null;
 let paperStyleBtns = {};
 let paperSnapBusy = false;
+/* N2 #1047 #1045: the two export buttons (disabled while the paper is
+ * being stitched) and the reader popup opened from a headline. */
+let paperCopyBtn = null;
+let paperImageBtn = null;
+let paperReadBox = null;
+let paperReadSeq = 0;
 try { paperStyle = localStorage.getItem("paperStyle") === "tabloid" ? "tabloid" : "broadsheet"; } catch (e) {}
 
 function paperSnapDone() {
@@ -135106,7 +145081,9 @@ function paperSnapMark(id) {
 function paperClose() {
   if (paperTimer) { clearInterval(paperTimer); paperTimer = null; }
   if (paperBox) { try { paperBox.remove(); } catch (e) {} paperBox = null; }
+  paperReadClose();                                   // N2 #1045
   paperFrame = paperShelf = paperConsole = paperTitle = paperPagesBar = null;
+  paperCopyBtn = paperImageBtn = null;                // N2 #1047
   paperStyleBtns = {};
   paperText = null;
   document.removeEventListener("keydown", paperKeys);
@@ -135114,6 +145091,7 @@ function paperClose() {
 
 function paperKeys(ev) {
   if (!paperBox) return;
+  if (paperReadBox) return;      // N2 #1045: the reader is on top and owns Esc
   if (ev.key === "Escape") { paperClose(); return; }
   if (ev.key === "ArrowLeft") paperStep(1);      // older
   if (ev.key === "ArrowRight") paperStep(-1);    // newer
@@ -135165,7 +145143,10 @@ function paperStyleSet(style) {
   if (paperCur) paperShow(paperCur);
 }
 
-/* #1023: page tabs 1 … N read off the edition's .page sheets. */
+/* #1047: the tabs are the sheets the packer produced - their number varies
+ * with the hour's content and with the style, so they are read off the
+ * edition every time it loads and again when the page says it has finished
+ * fitting its columns. The label carries the sheet's real format. */
 function paperPaintPages() {
   if (!paperPagesBar) return;
   paperPagesBar.innerHTML = "";
@@ -135174,7 +145155,14 @@ function paperPaintPages() {
   const pages = doc ? doc.querySelectorAll(".page") : [];
   if (!pages.length) { paperPagesBar.style.display = "none"; return; }
   paperPagesBar.style.display = "";
-  const lab = el("span", "muted", pages.length + (pages.length === 1 ? " page" : " pages") + " · " + (paperStyle === "tabloid" ? "tabloid" : "broadsheet"));
+  let format = "";
+  try {
+    const box = pages[0].getBoundingClientRect();
+    const scale = (paperFrame.contentWindow && paperFrame.contentWindow.__paperScale) || 1;
+    const w = Math.round(box.width / scale), h = Math.round(box.height / scale);
+    if (w > 0 && h > 0) format = " · " + w + "×" + h + " (1:" + (h / w).toFixed(2) + ")";
+  } catch (e) { format = ""; }
+  const lab = el("span", "muted", pages.length + (pages.length === 1 ? " page" : " pages") + " · " + (paperStyle === "tabloid" ? "tabloid" : "broadsheet") + format);
   lab.style.cssText = "font-size:11px;margin-right:6px";
   paperPagesBar.appendChild(lab);
   pages.forEach((pg, i) => {
@@ -135217,46 +145205,50 @@ function paperTrackScroll() {
   } catch (e) { /* cosmetic */ }
 }
 
-/* #1029: Copy — rich HTML plus plain text/markdown in one synchronous
- * copy-event handler (the panel is plain http; navigator.clipboard.write is
- * not available, execCommand('copy') is). The text was prefetched when the
- * edition loaded so nothing awaits inside the gesture. */
-function paperCopy(btn) {
-  let doc = null;
-  try { doc = paperFrame && paperFrame.contentDocument; } catch (e) { doc = null; }
-  const html = doc ? ("<!doctype html>" + doc.documentElement.outerHTML) : "";
-  const text = (paperText && paperText.id === paperCur && paperText.markdown)
-    ? paperText.markdown : (doc ? doc.body.innerText : "");
-  if (!html && !text) { setStatus("Nothing to copy yet", true); return; }
-  const handler = (e) => {
-    try {
-      e.clipboardData.setData("text/html", html);
-      e.clipboardData.setData("text/plain", text);
-      e.preventDefault();
-    } catch (err) { /* the textarea's own text is the fallback */ }
-  };
-  let ok = false;
-  const ta = document.createElement("textarea");
-  ta.value = text;
-  ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
-  document.body.appendChild(ta);
-  ta.select();
-  document.addEventListener("copy", handler);
-  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
-  document.removeEventListener("copy", handler);
-  ta.remove();
-  if (!ok) { pineCopy(text).then(() => { ok = true; }).catch(() => {}); }
-  if (btn) {
-    const was = btn.textContent;
-    btn.textContent = ok ? "✓ Copied" : "Copy";
-    setTimeout(() => { btn.textContent = was; }, 1400);
+/* #1048: PDF — the station writes it. GET /api/paper/<id>/pdf?style=
+ * streams a real application/pdf set by the press itself (A3 landscape for
+ * the newspaper, A4 portrait for the tabloid) and files a copy beside the
+ * edition on the way out, so the paper is archived even when nobody saves
+ * it. The browser's print dialogue is still here, below, as the labelled
+ * fallback for a build where the fpdf2 wheel has not landed yet. */
+let paperPdfBusy = false;
+async function paperPdf(btn) {
+  if (!paperCur || paperPdfBusy) return;
+  paperPdfBusy = true;
+  const was = btn ? btn.textContent : "";
+  if (btn) { btn.textContent = "Setting…"; btn.disabled = true; }
+  try {
+    const r = await fetch("/api/paper/" + encodeURIComponent(paperCur)
+      + "/pdf?style=" + paperStyle, {headers: {"Authorization": "Bearer " + key()}});
+    if (r.status === 501) {
+      let why = "This build has no PDF writer.";
+      try { why = (await r.json()).detail || why; } catch (e) { /* plain body */ }
+      setStatus(why + " — printing the page instead.", true);
+      paperPrintFallback();
+      return;
+    }
+    if (!r.ok) throw new Error("the PDF writer answered " + r.status);
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "pine-box-gazette-" + paperCur + "-" + paperStyle + ".pdf";
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+    setStatus("The Gazette is saved as a PDF ("
+      + Math.round(blob.size / 1024) + " KB) — and filed beside the edition.");
+  } catch (e) {
+    setStatus(String(e.message || e) + " — printing the page instead.", true);
+    paperPrintFallback();
+  } finally {
+    paperPdfBusy = false;
+    if (btn) { btn.textContent = was; btn.disabled = false; }
   }
-  setStatus(ok ? "The Gazette is on the clipboard (rich text + markdown)" : "Copy failed", !ok);
 }
 
-/* #1029: PDF — the browser's own print of the iframe; the sheet carries a
- * real @media print / @page rule per style (A3 landscape, A4 portrait). */
-function paperPdf() {
+/* #1029, kept as the fallback: the browser's own print of the iframe. The
+ * sheet carries a real @media print / @page rule per style. */
+function paperPrintFallback() {
   try {
     const win = paperFrame.contentWindow;
     win.focus();
@@ -135293,46 +145285,512 @@ function paperImagesSettled(doc, ms) {
   });
 }
 
-/* #1029 #1020: Image — the page in view as a PNG (2x), downloaded AND
- * posted to /snapshot so the gallery filmstrip shows the paper. `auto`
- * is the once-per-edition snapshot of page 1 while the window is open. */
+/* #1047: "when i click copy, I want to copy all the pages of the paper as
+ * an image to clipboard allowing me to paste it anywhere."
+ *
+ * Copy used to put rich text and markdown on the clipboard and Image saved
+ * the ONE page in view. The operator clicked Copy expecting a picture of
+ * the paper, so that is what Copy now does: every page of the edition
+ * stitched into one tall PNG and written to the clipboard. Shift-click
+ * still copies the words (the old road, kept because it is genuinely the
+ * better paste into a document).
+ *
+ * The clipboard road, in order:
+ *   1. navigator.clipboard.write with a ClipboardItem — needs a SECURE
+ *      context, which plain http is not. In the desktop app that is one
+ *      switch in desktop/main.js (see the lane's report); in a browser it
+ *      means opening the panel over https or from localhost.
+ *   2. no clipboard: the PNG comes down as a file and the status line says
+ *      exactly why, and the words go on the clipboard so the click is not
+ *      wasted.
+ * The ClipboardItem is built from the PROMISE of the blob, inside the
+ * click, so the browser still counts the write as user-driven while the
+ * stitching takes its several seconds.
+ */
+function paperSetBusy(on, label) {
+  [paperCopyBtn, paperImageBtn].forEach((b) => {
+    if (!b) return;
+    b.disabled = !!on;
+    b.style.opacity = on ? ".55" : "";
+    b.style.cursor = on ? "progress" : "";
+  });
+  if (label && paperCopyBtn) paperCopyBtn.textContent = label;
+}
+
+/* html-to-image clones the node and inlines the styles it computes for HTML
+ * elements, but the paper's charts are inline SVG whose paint lives in class
+ * rules (svg.chart .slice.s1{fill:#c8102e}) — in the clone those rules are
+ * gone and every slice comes out solid black. Copy the computed paint onto
+ * each SVG node before the shot. The value written is the one already in
+ * force, so the page on screen does not change. */
+function paperInlineSvg(doc) {
+  const win = doc.defaultView;
+  if (!win) return;
+  const keep = ["fill", "stroke", "stroke-width", "stroke-opacity", "fill-opacity",
+    "stroke-linecap", "stroke-linejoin", "font-family", "font-size", "font-weight",
+    "text-anchor", "dominant-baseline"];
+  Array.from(doc.querySelectorAll("svg")).forEach((svg) => {
+    if (svg.getAttribute("data-inlined") === "1") return;
+    svg.setAttribute("data-inlined", "1");
+    [svg].concat(Array.from(svg.querySelectorAll("*"))).forEach((node) => {
+      let cs = null;
+      try { cs = win.getComputedStyle(node); } catch (e) { return; }
+      if (!cs) return;
+      keep.forEach((prop) => {
+        const v = cs.getPropertyValue(prop);
+        if (v) node.style.setProperty(prop, v);
+      });
+    });
+  });
+}
+
+/* Every .page sheet of the edition drawn one after another onto a single
+ * canvas. Pages the page tabs have hidden are un-hidden for the shot and
+ * put back exactly as they were; the scale steps down until the canvas is
+ * one a browser will actually hand back. */
+async function paperEditionCanvas(say) {
+  const h2i = await paperH2I();
+  const doc = paperFrame && paperFrame.contentDocument;
+  const win = paperFrame && paperFrame.contentWindow;
+  if (!doc || !win) throw new Error("no edition loaded");
+  await paperImagesSettled(doc, 6000);
+  paperInlineSvg(doc);
+  const pages = Array.from(doc.querySelectorAll(".page"));
+  if (!pages.length) throw new Error("this edition has no pages to shoot");
+  const undo = [];
+  pages.forEach((pg) => {
+    const cs = win.getComputedStyle(pg);
+    if (pg.hidden || cs.display === "none" || cs.visibility === "hidden") {
+      undo.push([pg, pg.style.display, pg.style.visibility, pg.hidden]);
+      pg.hidden = false;
+      pg.style.display = "block";
+      pg.style.visibility = "visible";
+    }
+  });
+  try {
+    const GAP = 16;
+    const wide = Math.max.apply(null, pages.map((p) => p.offsetWidth || 1240));
+    const highs = pages.map((p) => p.offsetHeight || 1);
+    const tall = highs.reduce((a, b) => a + b, 0) + GAP * (pages.length - 1);
+    let ratio = 2;
+    while (ratio > 0.4
+      && (tall * ratio > 30000 || wide * ratio > 6000 || wide * ratio * tall * ratio > 5e7)) {
+      ratio -= 0.25;
+    }
+    const bg = win.getComputedStyle(doc.body).backgroundColor || "#ece5d4";
+    const out = document.createElement("canvas");
+    out.width = Math.ceil(wide * ratio);
+    out.height = Math.ceil(tall * ratio) + 4 * pages.length;
+    const cx = out.getContext("2d");
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, out.width, out.height);
+    let y = 0;
+    for (let i = 0; i < pages.length; i++) {
+      if (say) say(i + 1, pages.length);
+      const pageBg = win.getComputedStyle(pages[i]).backgroundColor || bg;
+      const one = await h2i.toCanvas(pages[i], {
+        pixelRatio: ratio, backgroundColor: pageBg, cacheBust: false,
+        style: {margin: "0", boxShadow: "none"}
+      });
+      cx.drawImage(one, Math.round((out.width - one.width) / 2), Math.round(y));
+      y += one.height + GAP * ratio;
+      one.width = one.height = 0;             // let the page go before the next
+    }
+    y = Math.min(out.height, Math.ceil(y - GAP * ratio));
+    if (y > 8 && out.height - y > 8) {
+      const trim = document.createElement("canvas");
+      trim.width = out.width;
+      trim.height = y;
+      trim.getContext("2d").drawImage(out, 0, 0);
+      out.width = out.height = 0;
+      return {canvas: trim, pages: pages.length, ratio: ratio};
+    }
+    return {canvas: out, pages: pages.length, ratio: ratio};
+  } finally {
+    undo.forEach((row) => {
+      row[0].style.display = row[1];
+      row[0].style.visibility = row[2];
+      row[0].hidden = row[3];
+    });
+  }
+}
+
+function paperShrink(canvas, maxW, maxH) {
+  const k = Math.min(1, maxW / canvas.width, maxH / canvas.height);
+  if (k >= 1) return canvas;
+  const small = document.createElement("canvas");
+  small.width = Math.max(1, Math.round(canvas.width * k));
+  small.height = Math.max(1, Math.round(canvas.height * k));
+  const cx = small.getContext("2d");
+  cx.imageSmoothingQuality = "high";
+  cx.drawImage(canvas, 0, 0, small.width, small.height);
+  return small;
+}
+
+function paperSaveBlob(blob, name) {
+  try {
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(href), 30000);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+/* The whole edition as a PNG blob, with the button counting the pages off.
+ * Returns {blob, canvas, pages} — the canvas is kept so the caller can
+ * post a smaller copy to the gallery without stitching twice. */
+async function paperEditionPng(what) {
+  paperSnapBusy = true;
+  paperSetBusy(true, "…");
+  const label = what || "Setting the paper as one image";
+  try {
+    const got = await paperEditionCanvas((i, n) => {
+      if (paperCopyBtn) paperCopyBtn.textContent = "…" + i + "/" + n;
+      setStatus(label + " — page " + i + " of " + n + "…");
+    });
+    setStatus(label + " — encoding " + got.pages + " pages…");
+    const blob = await new Promise((resolve, reject) => {
+      got.canvas.toBlob((b) => (b ? resolve(b) : reject(new Error("the browser would not encode the PNG"))), "image/png");
+    });
+    return {blob: blob, canvas: got.canvas, pages: got.pages};
+  } finally {
+    paperSnapBusy = false;
+    paperSetBusy(false, "Copy");
+  }
+}
+
+/* #1029: the old Copy — rich HTML plus plain text/markdown in one
+ * synchronous copy-event handler. Still here on Shift-click, and still the
+ * fallback when the clipboard will not take a picture. */
+function paperCopyText(btn, quiet) {
+  let doc = null;
+  try { doc = paperFrame && paperFrame.contentDocument; } catch (e) { doc = null; }
+  const html = doc ? ("<!doctype html>" + doc.documentElement.outerHTML) : "";
+  const text = (paperText && paperText.id === paperCur && paperText.markdown)
+    ? paperText.markdown : (doc ? doc.body.innerText : "");
+  if (!html && !text) { if (!quiet) setStatus("Nothing to copy yet", true); return false; }
+  const handler = (e) => {
+    try {
+      e.clipboardData.setData("text/html", html);
+      e.clipboardData.setData("text/plain", text);
+      e.preventDefault();
+    } catch (err) { /* the textarea's own text is the fallback */ }
+  };
+  let ok = false;
+  const ta = document.createElement("textarea");
+  ta.value = text;
+  ta.style.cssText = "position:fixed;top:-1000px;opacity:0";
+  document.body.appendChild(ta);
+  ta.select();
+  document.addEventListener("copy", handler);
+  try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
+  document.removeEventListener("copy", handler);
+  ta.remove();
+  if (!ok) { pineCopy(text).then(() => { ok = true; }).catch(() => {}); }
+  if (btn) {
+    const was = btn.textContent;
+    btn.textContent = ok ? "✓ Copied" : "Copy";
+    setTimeout(() => { btn.textContent = was; }, 1400);
+  }
+  if (!quiet) setStatus(ok ? "The Gazette is on the clipboard (rich text + markdown)" : "Copy failed", !ok);
+  return ok;
+}
+
+function paperBlobUrl(blob) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result || ""));
+    fr.onerror = () => reject(new Error("the PNG could not be read back"));
+    fr.readAsDataURL(blob);
+  });
+}
+
+/* #1047: Copy = every page of the paper, as one image, on the clipboard. */
+function paperCopy(btn, ev) {
+  if (ev && (ev.shiftKey || ev.altKey)) { paperCopyText(btn); return; }
+  if (!paperCur || !paperFrame) { setStatus("Nothing to copy yet", true); return; }
+  if (paperSnapBusy) { setStatus("The paper is still being set — one moment", true); return; }
+  const name = "gazette-" + paperCur + "-" + paperStyle + "-all-pages.png";
+  const done = (n) => {
+    setStatus("All " + n + " pages of the Gazette are on the clipboard as one image"
+      + " — paste it anywhere");
+    if (btn) {
+      btn.textContent = "✓ Copied";
+      setTimeout(() => { btn.textContent = "Copy"; }, 1600);
+    }
+  };
+  const beaten = (why, blob) => {
+    const words = paperCopyText(null, true);
+    const saved = blob ? paperSaveBlob(blob, name) : false;
+    setStatus(why + " " + (saved ? "The PNG of all pages downloaded instead"
+                                 : "The PNG could not be saved either")
+      + (words ? "; the words ARE on the clipboard." : "."), true);
+  };
+  const broke = (err) => setStatus("The paper would not set: " + (err.message || err), true);
+  // 1. the desktop shell's own clipboard. The Pine Box window is a file://
+  //    page, where the browser clipboard is refused outright (#990) —
+  //    Electron's is not, and it takes a picture as happily as text.
+  const desk = (window.pineDesktop && typeof window.pineDesktop.copyImage === "function")
+    ? window.pineDesktop : null;
+  // 2. the browser's async clipboard — a SECURE context only, which plain
+  //    http is not until the launcher says otherwise (see the lane report).
+  const canWrite = !!(window.isSecureContext && navigator.clipboard
+    && navigator.clipboard.write && window.ClipboardItem);
+  if (desk) {
+    paperEditionPng("Copying the paper").then((got) => paperBlobUrl(got.blob)
+      .then((data) => {
+        if (desk.copyImage(data) === false) throw new Error("the desktop clipboard refused it");
+        done(got.pages);
+      })
+      .catch((err) => beaten("The desktop clipboard refused the image ("
+        + (err.message || err) + ").", got.blob))).catch(broke);
+    return;
+  }
+  if (!canWrite) {
+    paperEditionPng("Copying the paper")
+      .then((got) => beaten("This panel is served over plain http, so the browser"
+        + " will not let a picture onto the clipboard.", got.blob))
+      .catch(broke);
+    return;
+  }
+  // The async clipboard wants the write to begin inside the click, so it is
+  // handed the PROMISE of the blob and stitches on its own time.
+  let pages = 0;
+  const blobJob = paperEditionPng("Copying the paper").then((got) => {
+    pages = got.pages;
+    return got.blob;
+  });
+  let item = null;
+  try { item = new ClipboardItem({"image/png": blobJob}); } catch (e) { item = null; }
+  const road = item
+    ? navigator.clipboard.write([item])
+    : blobJob.then((blob) => navigator.clipboard.write([new ClipboardItem({"image/png": blob})]));
+  road.then(() => done(pages)).catch((err) => {
+    blobJob.then((blob) => beaten("The clipboard refused the image ("
+      + (err.message || err) + ").", blob)).catch(broke);
+  });
+}
+
+/* #1029 #1020 #1047: Image — the WHOLE edition as a PNG, downloaded and
+ * posted to /snapshot so the gallery filmstrip shows the paper. `auto` is
+ * the once-per-edition snapshot of page 1 while the window is open, which
+ * stays cheap on purpose: it fires by itself. */
 async function paperImage(auto, btn) {
   if (!paperCur || !paperFrame || paperSnapBusy) return;
   const id = paperCur;
   const style = paperStyle;
-  paperSnapBusy = true;
-  const was = btn ? btn.textContent : "";
-  if (btn) btn.textContent = "…";
-  try {
-    const h2i = await paperH2I();
-    const doc = paperFrame.contentDocument;
-    await paperImagesSettled(doc, 4000);
-    const node = doc.getElementById("page-" + (auto ? 1 : paperPageCur)) || doc.body;
-    const bg = getComputedStyle(node).backgroundColor || "#fff";
-    const dataUrl = await h2i.toPng(node, {pixelRatio: auto ? 1.5 : 2, backgroundColor: bg, cacheBust: false,
-      style: {margin: "0", boxShadow: "none"}});
-    if (!auto) {
-      try {
-        const a = document.createElement("a");
-        a.href = dataUrl;
-        a.download = "gazette-" + id + "-" + style + "-p" + paperPageCur + ".png";
-        document.body.appendChild(a);
-        a.click();
-        a.remove();
-      } catch (e) { /* the desktop launcher may refuse downloads; the snapshot still lands */ }
-    }
-    const r = await api("/api/paper/" + encodeURIComponent(id) + "/snapshot",
-      {method: "POST", body: JSON.stringify({png: dataUrl, style: style})});
-    paperSnapMark(id);
-    const row = paperList.find((e) => e.id === id);
-    if (row && r && r.file && !row.snapshot) row.snapshot = r.file;
-    if (!auto) setStatus("Saved " + (r && r.file ? r.file : "the page") + " — it is in the gallery too");
-  } catch (e) {
-    if (!auto) setStatus("Image export failed: " + (e.message || e), true);
-  } finally {
-    paperSnapBusy = false;
-    if (btn) btn.textContent = was;
+  if (auto) {
+    paperSnapBusy = true;
+    try {
+      const h2i = await paperH2I();
+      const doc = paperFrame.contentDocument;
+      await paperImagesSettled(doc, 4000);
+      paperInlineSvg(doc);
+      const node = doc.getElementById("page-1") || doc.body;
+      const bg = getComputedStyle(node).backgroundColor || "#fff";
+      const dataUrl = await h2i.toPng(node, {pixelRatio: 1.5, backgroundColor: bg,
+        cacheBust: false, style: {margin: "0", boxShadow: "none"}});
+      const r = await api("/api/paper/" + encodeURIComponent(id) + "/snapshot",
+        {method: "POST", body: JSON.stringify({png: dataUrl, style: style})});
+      paperSnapMark(id);
+      const row = paperList.find((e) => e.id === id);
+      if (row && r && r.file && !row.snapshot) row.snapshot = r.file;
+    } catch (e) { /* the auto snapshot never shouts */ }
+    finally { paperSnapBusy = false; }
+    return;
   }
+  try {
+    const got = await paperEditionPng("Saving the paper");
+    const saved = paperSaveBlob(got.blob,
+      "gazette-" + id + "-" + style + "-all-pages.png");
+    // The gallery wants a plate, not a ten-thousand-pixel column, and the
+    // snapshot door takes a data URL under 24 MB — so it gets a smaller one.
+    let posted = null;
+    try {
+      const small = paperShrink(got.canvas, 1600, 9000);
+      posted = await api("/api/paper/" + encodeURIComponent(id) + "/snapshot",
+        {method: "POST", body: JSON.stringify({png: small.toDataURL("image/png"), style: style})});
+      paperSnapMark(id);
+      const row = paperList.find((e) => e.id === id);
+      if (row && posted && posted.file) row.snapshot = posted.file;
+    } catch (e) { /* the download is the point; the gallery row is a bonus */ }
+    setStatus("All " + got.pages + " pages saved as one PNG"
+      + (saved ? "" : " (the download was refused — try Copy instead)")
+      + (posted && posted.file ? " — " + posted.file + " is in the gallery too" : ""),
+      !saved);
+  } catch (e) {
+    setStatus("Image export failed: " + (e.message || e), true);
+  }
+}
+
+/* #1045: the reader, opened from a headline inside the edition.
+ *
+ * The edition page is same-origin with the panel, so its click handler
+ * calls straight through to this; it keeps its own copy for when the page
+ * is opened on its own (Open ↗). Here the overlay covers the whole Gazette
+ * window rather than only the iframe, which is what the operator's
+ * "contained popup window" wants. */
+function paperReadKeys(ev) {
+  if (!paperReadBox) return;
+  if (ev.key === "Escape") { ev.preventDefault(); ev.stopPropagation(); paperReadClose(); }
+}
+
+function paperReadClose() {
+  if (!paperReadBox) return;
+  try { paperReadBox.remove(); } catch (e) {}
+  paperReadBox = null;
+  document.removeEventListener("keydown", paperReadKeys, true);
+}
+
+function paperReadWhen(s) {
+  if (!s) return "";
+  const d = new Date(String(s));
+  if (isNaN(d.getTime())) return String(s).slice(0, 40);
+  return d.toLocaleDateString(undefined, {year: "numeric", month: "long", day: "numeric"});
+}
+
+function paperReadHost(u) {
+  const m = /^https?:\/\/([^\/?#]+)/i.exec(String(u || ""));
+  return m ? m[1] : "";
+}
+
+function paperReadPaint(col, top, row, url) {
+  const esc = callerDossierEsc;
+  const line = [row.byline ? "By " + row.byline : "", paperReadWhen(row.published)]
+    .filter(Boolean).join(" · ");
+  top.querySelector(".rdrhost").textContent = row.host || paperReadHost(url) || "the wire";
+  top.querySelector(".rdrwhen").textContent = row.title || line || url;
+  if (!(row.paragraphs || []).length) {
+    col.innerHTML = '<div class="rdroops"><b>The story would not come.</b><p>'
+      + esc(row.error || "The reader got nothing back.") + "</p>"
+      + "<p>The original is one click away, top right — some sites only open "
+      + "for a browser that carries their cookies.</p></div>";
+    return;
+  }
+  const out = ['<h1>' + esc(row.title || "Untitled") + "</h1>"];
+  if (line) out.push('<p class="rdrby">' + esc(line) + "</p>");
+  const pics = row.images || [];
+  if (pics.length) out.push('<img src="' + esc(pics[0]) + '" alt="" onerror="this.remove()">');
+  const blocks = (row.blocks && row.blocks.length)
+    ? row.blocks
+    : (row.paragraphs || []).map((t) => ({k: "p", t: t}));
+  let inList = false;
+  blocks.forEach((b) => {
+    const kind = (b && b.k) || "p";
+    const text = (b && b.t) || "";
+    if (!text) return;
+    if (kind === "li") {
+      if (!inList) { out.push("<ul>"); inList = true; }
+      out.push("<li>" + esc(text) + "</li>");
+      return;
+    }
+    if (inList) { out.push("</ul>"); inList = false; }
+    if (kind === "h") out.push("<h4>" + esc(text) + "</h4>");
+    else if (kind === "q") out.push('<p class="rdrq">' + esc(text) + "</p>");
+    else out.push("<p>" + esc(text) + "</p>");
+  });
+  if (inList) out.push("</ul>");
+  if (pics.length > 1) {
+    out.push('<div class="rdrplates">');
+    pics.slice(1, 4).forEach((u) => {
+      out.push('<img src="' + esc(u) + '" alt="" loading="lazy" onerror="this.remove()">');
+    });
+    out.push("</div>");
+  }
+  out.push('<p class="rdrfoot">' + esc(row.host || paperReadHost(url))
+    + (row.cached ? " · read off the station’s shelf" : " · fetched just now")
+    + " · " + (row.paragraphs || []).length + " paragraphs</p>");
+  col.innerHTML = out.join("");
+  col.scrollTop = 0;
+}
+
+function paperReadOpen(url, label) {
+  if (!url) return;
+  paperReadClose();
+  const esc = callerDossierEsc;
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:420;display:flex;align-items:center;"
+    + "justify-content:center;background:rgba(2,4,9,.86);padding:18px";
+  const card = el("div", "", "");
+  card.style.cssText = "width:min(800px,96vw);max-height:92vh;display:flex;flex-direction:column;"
+    + "background:#f6f1e6;color:#1b1a17;border:1px solid #1b1a17;border-radius:4px;"
+    + "box-shadow:0 26px 90px rgba(0,0,0,.6);overflow:hidden";
+  const top = el("div", "", "");
+  top.style.cssText = "display:flex;align-items:center;gap:10px;flex:none;padding:8px 14px;"
+    + "border-bottom:2px solid #1b1a17;background:#efe8d6;"
+    + "font:11px/1.4 'Helvetica Neue',Arial,sans-serif";
+  top.innerHTML = '<span class="rdrhost" style="font-weight:900;text-transform:uppercase;'
+    + 'letter-spacing:.13em;color:#c8102e;white-space:nowrap">' + esc(paperReadHost(url) || "the wire")
+    + '</span><span class="rdrwhen" style="flex:1;color:#4a4741;overflow:hidden;'
+    + 'text-overflow:ellipsis;white-space:nowrap">' + esc(label || url) + "</span>";
+  const out = el("a", "", "The original ↗");
+  out.href = url;
+  out.target = "_blank";
+  out.rel = "noopener";
+  out.style.cssText = "font:700 11px/1 'Helvetica Neue',Arial,sans-serif;border:1px solid #1b1a17;"
+    + "background:#f6f1e6;color:#1b1a17;padding:4px 8px;border-radius:3px;text-decoration:none;white-space:nowrap";
+  const shut = el("button", "", "✕");
+  shut.title = "Close (Esc)";
+  shut.style.cssText = "font:700 11px/1 'Helvetica Neue',Arial,sans-serif;border:1px solid #1b1a17;"
+    + "background:#f6f1e6;color:#1b1a17;padding:4px 8px;border-radius:3px;cursor:pointer";
+  shut.onclick = paperReadClose;
+  top.appendChild(out);
+  top.appendChild(shut);
+  const col = el("div", "", "");
+  col.style.cssText = "overflow:auto;padding:24px 34px 30px;"
+    + "font:15.5px/1.64 Georgia,'Times New Roman',serif;color:#1b1a17";
+  col.innerHTML = '<div style="display:flex;align-items:center;gap:12px;padding:36px 0;'
+    + "color:#4a4741;font:13px/1.4 'Helvetica Neue',Arial,sans-serif\">"
+    + '<span class="spin" style="width:20px;height:20px;border:2px solid #9c9686;'
+    + 'border-top-color:#c8102e;border-radius:50%;display:inline-block;'
+    + 'animation:pinespin 0.8s linear infinite"></span><span>Fetching the story from '
+    + esc(paperReadHost(url) || "the wire") + "…</span></div>";
+  card.appendChild(top);
+  card.appendChild(col);
+  shade.appendChild(card);
+  shade.onclick = (ev) => { if (ev.target === shade) paperReadClose(); };
+  document.body.appendChild(shade);
+  paperReadBox = shade;
+  document.addEventListener("keydown", paperReadKeys, true);
+  if (!document.getElementById("paperReadCss")) {
+    const st = document.createElement("style");
+    st.id = "paperReadCss";
+    st.textContent = "@keyframes pinespin{to{transform:rotate(360deg)}}"
+      + ".rdrcol h1{font:700 32px/1.12 Georgia,serif;margin:0 0 8px;letter-spacing:-.01em}"
+      + ".rdrcol .rdrby{font:11px/1.4 'Helvetica Neue',Arial,sans-serif;text-transform:uppercase;"
+      + "letter-spacing:.12em;color:#4a4741;margin:0 0 16px;padding:0 0 10px;border-bottom:1px solid #9c9686}"
+      + ".rdrcol p{margin:0 0 15px}"
+      + ".rdrcol p.rdrq{border-left:3px solid #c8102e;padding:2px 0 2px 14px;font-style:italic;color:#4a4741}"
+      + ".rdrcol h4{font:900 13px/1.3 'Helvetica Neue',Arial,sans-serif;text-transform:uppercase;"
+      + "letter-spacing:.1em;margin:22px 0 8px}"
+      + ".rdrcol ul{margin:0 0 15px;padding-left:20px}.rdrcol li{margin:0 0 5px}"
+      + ".rdrcol img{width:100%;display:block;margin:0 0 6px;background:#ddd6c4}"
+      + ".rdrcol .rdrplates{margin:18px 0 0;border-top:1px solid #9c9686;padding-top:14px}"
+      + ".rdrcol .rdrfoot{margin:18px 0 0;padding-top:10px;border-top:1px solid #9c9686;"
+      + "font:10.5px/1.4 'Helvetica Neue',Arial,sans-serif;text-transform:uppercase;letter-spacing:.1em;color:#9c9686}"
+      + ".rdrcol .rdroops{padding:26px 0 10px}"
+      + ".rdrcol .rdroops b{display:block;font:900 15px/1.3 'Helvetica Neue',Arial,sans-serif;"
+      + "text-transform:uppercase;letter-spacing:.08em;color:#c8102e;margin:0 0 10px}";
+    document.head.appendChild(st);
+  }
+  col.className = "rdrcol";
+  const mine = ++paperReadSeq;
+  fetch("/api/news/read?url=" + encodeURIComponent(url),
+    {headers: {"Authorization": "Bearer " + key()}})
+    .then((r) => r.json().catch(() => ({error: "The station answered " + r.status + "."})))
+    .then((row) => { if (mine === paperReadSeq && paperReadBox === shade) paperReadPaint(col, top, row || {}, url); })
+    .catch((err) => {
+      if (mine === paperReadSeq && paperReadBox === shade) {
+        paperReadPaint(col, top, {error: String((err && err.message) || err)}, url);
+      }
+    });
 }
 
 /* #1020: every new edition gets one snapshot while a window is open. */
@@ -135376,14 +145834,18 @@ async function paperOpen() {
   head.appendChild(tabs);
   // #1029: the three exports, in the slots left of ◀ ▶
   const copy = el("button", "", "Copy");
-  copy.title = "Copy the edition to the clipboard — rich text where it pastes, markdown elsewhere";
-  copy.onclick = () => paperCopy(copy);
+  copy.title = "Copy EVERY page of the paper to the clipboard as one image (#1047)"
+    + "\nShift-click to copy the words instead — rich text and markdown";
+  copy.onclick = (ev) => paperCopy(copy, ev);
+  paperCopyBtn = copy;
   const pdf = el("button", "", "PDF");
-  pdf.title = "Print / save as PDF (A3 landscape for the newspaper, A4 for the tabloid)";
-  pdf.onclick = paperPdf;
+  pdf.title = "Save the edition as a PDF the station sets itself — A3 landscape "
+    + "for the newspaper, A4 portrait for the tabloid; a copy is filed beside the edition";
+  pdf.onclick = () => paperPdf(pdf);
   const image = el("button", "", "Image");
-  image.title = "Save the page in view as a PNG — it also goes into the gallery";
+  image.title = "Save every page of the paper as one tall PNG — it also goes into the gallery";
   image.onclick = () => paperImage(false, image);
+  paperImageBtn = image;
   const older = el("button", "", "◀");
   older.title = "Older edition (←)";
   older.onclick = () => paperStep(1);
@@ -135446,6 +145908,15 @@ async function paperOpen() {
   document.body.appendChild(shade);
   paperBox = shade;
   paperStyleSet(paperStyle);
+  if (!window.__paperFitListener) {
+    window.__paperFitListener = true;
+    window.addEventListener("message", (ev) => {
+      const d = ev && ev.data;
+      if (!d || d.gazette !== "fitted" || !paperPagesBar) return;
+      if (paperPageCur > d.pages) paperPageCur = 1;
+      paperPaintPages();
+    });
+  }
   document.addEventListener("keydown", paperKeys);
   await paperRefresh(true);
   paperTimer = setInterval(paperPoll, 2500);
@@ -135573,6 +146044,661 @@ async function paperPoll() {
       await paperShow(paperList[0].id);
     }
   }
+}
+
+/* ---- #1050: THE SCREENPLAY ------------------------------------------
+ * The 📝 beside the Gazette's 📰. The same hour, told as the script it
+ * actually was: scene headings where the running order moved, action for
+ * the records and the calls and the pauses, and a CHARACTER block per
+ * line that went out - each one playable, downloadable, and openable
+ * into the two trees the operator asked for (what made it, and how).
+ *
+ * A sibling of the Gazette window on purpose: same shade, same frame,
+ * same shelf-of-hours across the top, same Copy/Export row. What is
+ * different is the sheet itself, which is set as a real screenplay -
+ * Courier, US-Letter measure, the standard indents. */
+let scriptBox = null;
+let scriptHour = "";
+let scriptHours = [];
+let scriptData = null;
+let scriptSheet = null;
+let scriptTitle = null;
+let scriptShelf = null;
+let scriptLineCache = {};     /* "hour|line" -> the provenance payload */
+let scriptBusy = false;
+
+function scriptClose() {
+  if (scriptBox) { try { scriptBox.remove(); } catch (e) {} scriptBox = null; }
+  scriptSheet = scriptTitle = scriptShelf = null;
+  scriptData = null;
+  document.removeEventListener("keydown", scriptKeys);
+}
+
+function scriptKeys(ev) {
+  if (!scriptBox) return;
+  if (ev.key === "Escape") {
+    const composer = document.querySelector(".sp-compose");
+    if (composer) { composer.remove(); return; }
+    scriptClose();
+  }
+}
+
+function scriptWhen(at) {
+  try {
+    const d = new Date(Number(at || 0) * 1000);
+    const h = d.getHours();
+    return (((h % 12) || 12) + ":" + String(d.getMinutes()).padStart(2, "0")
+      + " " + (h < 12 ? "AM" : "PM"));
+  } catch (e) { return ""; }
+}
+
+function scriptMmss(seconds) {
+  const n = Math.max(0, Math.round(Number(seconds || 0)));
+  return Math.floor(n / 60) + ":" + String(n % 60).padStart(2, "0");
+}
+
+/* The sheet's own type. A screenplay is a fixed measure in a fixed font;
+ * everything here is in `ch` so the indents land where they do on paper. */
+const SCRIPT_CSS = ""
+  + ".sp-sheet{background:#f4f0e4;color:#14140f;padding:44px 34px 90px;"
+  + "font:13px/1.5 'Courier New',Courier,ui-monospace,monospace;"
+  + "min-height:100%;box-sizing:border-box}"
+  + ".sp-page{max-width:64ch;margin:0 auto}"
+  + ".sp-scene{font-weight:700;text-transform:uppercase;margin:26px 0 4px;"
+  + "letter-spacing:.02em;cursor:pointer}"
+  + ".sp-sub{text-transform:uppercase;margin:0 0 14px;font-size:11px;"
+  + "letter-spacing:.09em;color:#7d7663;cursor:pointer}"
+  + ".sp-action{margin:0 0 12px;white-space:pre-wrap}"
+  + ".sp-block{margin:0 0 12px}"
+  + ".sp-char{margin:12px 0 0 22ch;font-weight:700;text-transform:uppercase}"
+  + ".sp-paren{margin:0 0 0 16ch;max-width:26ch;color:#3f3c33}"
+  + ".sp-dia{margin:0 0 0 10ch;max-width:34ch;white-space:pre-wrap}"
+  + ".sp-trans{margin:18px 0 12px;text-align:right;text-transform:uppercase;"
+  + "font-weight:700}"
+  + ".sp-note{margin:8px 0 12px 4ch;padding:6px 9px;border-left:3px solid #b5892f;"
+  + "background:#efe6cd;max-width:56ch;white-space:pre-wrap}"
+  + ".sp-note.crit{border-left-color:#a33b2c;background:#f0dfd8}"
+  + ".sp-ins{border-left:3px solid #2f6fb5;padding-left:8px;background:#e6ecf3}"
+  + ".sp-char.sp-ins{background:none;color:#1d4a7d}"
+  + ".sp-drop{font:10px ui-monospace,Consolas,monospace;padding:1px 7px;"
+  + "border:1px solid #a08243;background:#e3d3ab;color:#3a2f14;"
+  + "border-radius:3px;cursor:pointer;margin-top:5px}"
+  + ".sp-ctl{margin:2px 0 0 4ch;display:flex;gap:4px;align-items:center;"
+  + "flex-wrap:wrap;font:10px/1.4 ui-monospace,Consolas,monospace;color:#6a675c}"
+  + ".sp-ctl button,.sp-ctl a{font:10px/1 ui-monospace,Consolas,monospace;"
+  + "padding:2px 5px;border:1px solid #c3bba4;background:#e9e3d2;color:#2c2a22;"
+  + "border-radius:4px;cursor:pointer;text-decoration:none}"
+  + ".sp-ctl button:hover,.sp-ctl a:hover{background:#dcd4bd}"
+  + ".sp-tint{color:#7a4a12;border:1px solid #c9a35f;background:#f3e6c8;"
+  + "border-radius:3px;padding:1px 5px;font-weight:700}"
+  + ".sp-tree{margin:6px 0 12px 4ch;max-width:58ch;background:#ece6d6;"
+  + "border:1px solid #cdc4ab;border-radius:5px;padding:8px 10px;"
+  + "font:11px/1.5 ui-monospace,Consolas,monospace;color:#2b2920;"
+  + "white-space:pre-wrap;word-break:break-word}"
+  + ".sp-tree b{color:#101008}"
+  + ".sp-tree .k{color:#6d6552}"
+  + ".sp-tree pre{margin:3px 0 8px;padding:6px;background:#e2dbc7;"
+  + "border-radius:4px;white-space:pre-wrap;max-height:190px;overflow:auto}"
+  + ".sp-flow{margin:6px 0 12px 0;background:#0b1018;overflow-x:auto;"
+  + "border:1px solid #22304a;border-radius:6px;padding:6px}"
+  + ".sp-head{font-size:11px;color:#6a675c;margin:0 0 18px;text-align:center;"
+  + "text-transform:uppercase;letter-spacing:.08em}"
+  + ".sp-compose{margin:6px 0 12px 4ch;max-width:56ch;background:#e9e3d2;"
+  + "border:1px solid #c3bba4;border-radius:5px;padding:8px}"
+  + ".sp-compose textarea{width:100%;min-height:64px;font:12px/1.4 "
+  + "'Courier New',monospace;background:#f7f4ea;color:#14140f;"
+  + "border:1px solid #c3bba4;border-radius:4px;padding:6px;box-sizing:border-box}"
+  + ".sp-compose .row{display:flex;gap:6px;margin-top:6px;align-items:center;"
+  + "font:11px ui-monospace,monospace;color:#4a4638}"
+  + ".sp-compose select,.sp-compose input{font:11px ui-monospace,monospace;"
+  + "background:#f7f4ea;color:#14140f;border:1px solid #c3bba4;"
+  + "border-radius:4px;padding:3px 5px}"
+  + ".sp-compose button{font:11px ui-monospace,monospace;padding:3px 9px;"
+  + "border:1px solid #c3bba4;background:#dcd4bd;color:#2c2a22;"
+  + "border-radius:4px;cursor:pointer}";
+
+async function screenplayOpen() {
+  if (scriptBox) { scriptClose(); return; }
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:350;display:flex;"
+    + "align-items:center;justify-content:center;background:rgba(2,4,9,.82)";
+  const box = el("div", "", "");
+  box.style.cssText = "width:min(1080px,97vw);height:min(920px,94vh);display:flex;"
+    + "flex-direction:column;background:#05080d;border:1px solid #22304a;"
+    + "border-radius:12px;box-shadow:0 24px 80px rgba(0,0,0,.6);overflow:hidden";
+  const head = el("div", "", "");
+  head.style.cssText = "display:flex;align-items:center;gap:8px;"
+    + "padding:9px 12px;border-bottom:1px solid #1b2735;flex-wrap:wrap";
+  head.appendChild(el("b", "", "📝 The Screenplay"));
+  scriptTitle = el("span", "muted", "");
+  scriptTitle.style.cssText = "font-size:11px;flex:1;min-width:120px;"
+    + "overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+  head.appendChild(scriptTitle);
+
+  const copy = el("button", "", "Copy");
+  copy.title = "Copy the whole sheet to the clipboard, laid out as a script";
+  copy.onclick = () => scriptCopy(copy);
+  const md = el("button", "", "Export MD");
+  md.title = "Download the hour as Fountain — the screenplay's own markdown";
+  md.onclick = () => scriptExport("md");
+  const pdf = el("button", "", "Export PDF");
+  pdf.title = "The typeset PDF (falls back to this window's print dialogue)";
+  pdf.onclick = () => scriptExport("pdf");
+  const note = el("button", "", "＋ Note");
+  note.title = "A note on the hour as a whole";
+  note.onclick = () => scriptCompose("", "note", null);
+  const again = el("button", "", "↻");
+  again.title = "Rebuild this hour from the ledgers";
+  again.onclick = () => scriptShow(scriptHour, true);
+  const x = el("button", "", "✕");
+  x.onclick = scriptClose;
+  [copy, md, pdf, note, again, x].forEach((b) => head.appendChild(b));
+  box.appendChild(head);
+
+  scriptShelf = el("div", "", "");
+  scriptShelf.style.cssText = "display:flex;gap:6px;padding:6px 10px;"
+    + "overflow-x:auto;border-bottom:1px solid #1b2735;background:#070b12;"
+    + "flex:none;scrollbar-width:thin";
+  box.appendChild(scriptShelf);
+
+  const scroll = el("div", "", "");
+  scroll.style.cssText = "flex:1;min-height:0;overflow:auto;background:#2a271f";
+  scriptSheet = el("div", "sp-sheet", "");
+  const style = document.createElement("style");
+  style.textContent = SCRIPT_CSS;
+  scroll.appendChild(style);
+  scroll.appendChild(scriptSheet);
+  box.appendChild(scroll);
+
+  shade.appendChild(box);
+  shade.onclick = (ev) => { if (ev.target === shade) scriptClose(); };
+  document.body.appendChild(shade);
+  scriptBox = shade;
+  document.addEventListener("keydown", scriptKeys);
+  await scriptRefresh();
+}
+
+async function scriptRefresh() {
+  let d;
+  try { d = await api("/api/screenplay"); }
+  catch (e) { if (scriptTitle) scriptTitle.textContent = e.message; return; }
+  scriptHours = d.hours || [];
+  scriptPaintShelf();
+  const want = scriptHours.find((h) => h.key === scriptHour) ? scriptHour
+    : ((scriptHours[0] || {}).key || "");
+  if (want) await scriptShow(want);
+  else if (scriptSheet) {
+    scriptSheet.innerHTML = "";
+    const page = el("div", "sp-page", "");
+    page.appendChild(el("div", "sp-scene", "NOTHING ON THE SHELF YET"));
+    page.appendChild(el("p", "sp-action",
+      "The air log fills as the station talks. Give it an hour and this "
+      + "window will have a script to show you."));
+    scriptSheet.appendChild(page);
+  }
+}
+
+function scriptPaintShelf() {
+  if (!scriptShelf) return;
+  scriptShelf.innerHTML = "";
+  if (!scriptHours.length) {
+    const none = el("span", "muted", "No hours in the air log yet.");
+    none.style.fontSize = "12px";
+    scriptShelf.appendChild(none);
+    return;
+  }
+  scriptHours.forEach((h) => {
+    const chip = el("button", "", "");
+    chip.style.cssText = "flex:none;display:flex;flex-direction:column;"
+      + "align-items:flex-start;gap:1px;padding:4px 9px;font-size:11px;"
+      + "line-height:1.25;max-width:210px;border:1px solid "
+      + (h.key === scriptHour ? "var(--accent)" : "#22304a") + ";background:"
+      + (h.key === scriptHour ? "rgba(32,185,232,.12)" : "#0b1018") + ";";
+    chip.appendChild(el("b", "", h.label || h.key));
+    const sub = el("span", "muted", h.lines + " lines · "
+      + scriptMmss(h.seconds) + (h.notes ? " · " + h.notes + " notes" : ""));
+    sub.style.cssText = "overflow:hidden;text-overflow:ellipsis;"
+      + "white-space:nowrap;max-width:194px";
+    chip.appendChild(sub);
+    chip.title = (h.rounds || []).join(" · ");
+    chip.onclick = () => scriptShow(h.key);
+    scriptShelf.appendChild(chip);
+  });
+}
+
+async function scriptShow(hourKey, fresh) {
+  if (!scriptSheet || !hourKey) return;
+  scriptHour = hourKey;
+  scriptPaintShelf();
+  scriptSheet.innerHTML = "";
+  const wait = el("div", "sp-page", "");
+  wait.appendChild(el("div", "sp-head", "reading the ledgers…"));
+  scriptSheet.appendChild(wait);
+  try {
+    scriptData = await api("/api/screenplay/" + encodeURIComponent(hourKey)
+      + (fresh ? "?fresh=1" : ""));
+  } catch (e) {
+    scriptSheet.innerHTML = "";
+    const bad = el("div", "sp-page", "");
+    bad.appendChild(el("p", "sp-action", String(e.message || e)));
+    scriptSheet.appendChild(bad);
+    return;
+  }
+  scriptPaint();
+}
+
+function scriptPaint() {
+  if (!scriptSheet || !scriptData) return;
+  const d = scriptData;
+  const c = d.counts || {};
+  if (scriptTitle) {
+    scriptTitle.textContent = (d.title || d.hour_key) + " — " + (c.lines || 0)
+      + " lines, " + (c.scenes || 0) + " scenes"
+      + (c.tinted ? ", " + c.tinted + " tinted" : "")
+      + (d.live ? " · still on air" : "");
+  }
+  scriptSheet.innerHTML = "";
+  const page = el("div", "sp-page", "");
+  const head = el("div", "sp-head",
+    (d.station || "Pine Box FM") + " · " + (d.title || d.hour_key));
+  page.appendChild(head);
+  page.appendChild(el("div", "sp-scene", "FADE IN:"));
+  (d.elements || []).forEach((e) => scriptPaintElement(page, e));
+  scriptSheet.appendChild(page);
+}
+
+function scriptPaintElement(page, e) {
+  const kind = String(e.type || "action");
+  if (kind === "scene") {
+    const row = el("div", "sp-scene", e.text || "");
+    row.id = "sp-" + e.id;
+    row.onclick = () => scriptCompose(e.id, "note", row);
+    row.title = "Click to leave a note on this scene";
+    page.appendChild(row);
+    return;
+  }
+  if (kind === "transition") {
+    page.appendChild(el("div", "sp-trans", e.text || ""));
+    return;
+  }
+  if (kind === "note") {
+    const row = el("div", "sp-note" + (e.kind === "critique" ? " crit" : ""),
+      e.text || "");
+    const bar = el("div", "", "");
+    bar.style.cssText = "margin-top:4px";
+    const drop = el("button", "sp-drop", "remove");
+    drop.onclick = () => scriptNoteDrop(e.note_id);
+    bar.appendChild(drop);
+    row.appendChild(bar);
+    page.appendChild(row);
+    return;
+  }
+  if (kind === "subheader") {
+    const row = el("div", "sp-sub", e.text || "");
+    row.id = "sp-" + e.id;
+    row.title = "Click to leave a note on this stretch of the running order";
+    row.onclick = () => scriptCompose(e.id, "note", row);
+    page.appendChild(row);
+    return;
+  }
+  if (kind === "action" || kind !== "dialogue" && kind !== "character"
+      && kind !== "parenthetical") {
+    const row = el("p", "sp-action" + (e.insert ? " sp-ins" : ""),
+      e.text || "");
+    row.id = "sp-" + e.id;
+    row.title = e.insert ? "The operator's own line — this never aired"
+      : "Click to leave a note here";
+    if (!e.insert) row.onclick = () => scriptCompose(e.id, "note", row);
+    page.appendChild(row);
+    if (e.clip) {
+      const ctl = el("div", "sp-ctl", "");
+      ctl.style.marginLeft = "0";
+      scriptClipControls(ctl, e);
+      page.appendChild(ctl);
+    }
+    return;
+  }
+  if (kind === "character") {
+    const row = el("div", "sp-char" + (e.insert ? " sp-ins" : ""), e.text || "");
+    page.appendChild(row);
+    return;
+  }
+  if (kind === "parenthetical") {
+    page.appendChild(el("div", "sp-paren", e.text || ""));
+    return;
+  }
+  /* dialogue */
+  const row = el("div", "sp-dia" + (e.insert ? " sp-ins" : ""), e.text || "");
+  row.id = "sp-" + e.id;
+  page.appendChild(row);
+  const ctl = el("div", "sp-ctl", "");
+  if (e.insert) {
+    ctl.appendChild(el("span", "", "the operator's own line — never aired"));
+    page.appendChild(ctl);
+    return;
+  }
+  ctl.appendChild(el("span", "", scriptWhen(e.at)
+    + (e.seconds ? " · " + Number(e.seconds).toFixed(1) + "s" : "")));
+  scriptClipControls(ctl, e);
+  if (e.tinted) {
+    const mark = el("span", "sp-tint", "◆ TINTED");
+    mark.title = "The crystal rewrote this round before it aired";
+    ctl.appendChild(mark);
+  }
+  const tree = el("button", "", "▸ provenance");
+  tree.onclick = () => scriptToggleTree(e, page, ctl, tree, "tree");
+  ctl.appendChild(tree);
+  const flow = el("button", "", "▸ the making of");
+  flow.onclick = () => scriptToggleTree(e, page, ctl, flow, "flow");
+  ctl.appendChild(flow);
+  const add = el("button", "", "＋ note");
+  add.onclick = () => scriptCompose(e.id, "note", ctl);
+  ctl.appendChild(add);
+  page.appendChild(ctl);
+}
+
+function scriptClipControls(ctl, e) {
+  if (!e.clip) {
+    const gone = el("span", "", "no audio");
+    gone.title = "The clip has been pruned — the words survive, the take did not";
+    ctl.appendChild(gone);
+    return;
+  }
+  const play = el("button", "", "▶");
+  play.title = "Play this line";
+  play.onclick = () => clipToggle(e.clip, play, "▶");
+  ctl.appendChild(play);
+  const down = el("a", "", "⬇");
+  down.title = "Download this line";
+  down.href = e.clip;
+  down.setAttribute("download",
+    "pinebox-" + String(e.line || e.id || "line") + ".mp3");
+  ctl.appendChild(down);
+}
+
+async function scriptToggleTree(e, page, after, btn, which) {
+  const holder = "sp" + which + "-" + e.id;
+  const open = document.getElementById(holder);
+  if (open) {
+    open.remove();
+    btn.textContent = btn.textContent.replace("▾", "▸");
+    return;
+  }
+  btn.textContent = btn.textContent.replace("▸", "▾");
+  const host = el("div", which === "flow" ? "sp-flow" : "sp-tree", "loading…");
+  host.id = holder;
+  after.parentNode.insertBefore(host, after.nextSibling);
+  try {
+    if (which === "flow") {
+      const r = await fetch("/api/screenplay/" + encodeURIComponent(scriptHour)
+        + "/flow/" + encodeURIComponent(e.line),
+        {headers: {"Authorization": "Bearer " + key()}});
+      if (!r.ok) throw new Error("the diagram did not load (" + r.status + ")");
+      host.innerHTML = await r.text();
+    } else {
+      const got = await scriptLine(e.line);
+      host.innerHTML = scriptTreeHtml(got.provenance || {});
+    }
+  } catch (err) {
+    host.textContent = String(err.message || err);
+  }
+}
+
+async function scriptLine(lineId) {
+  const memo = scriptHour + "|" + lineId;
+  if (scriptLineCache[memo]) return scriptLineCache[memo];
+  const got = await api("/api/screenplay/" + encodeURIComponent(scriptHour)
+    + "/line/" + encodeURIComponent(lineId));
+  scriptLineCache[memo] = got;
+  return got;
+}
+
+function scriptTreeRow(label, value, mono) {
+  if (value === undefined || value === null || value === "") return "";
+  return "<div><span class='k'>" + callerDossierEsc(label) + "</span> "
+    + (mono ? "<pre>" + callerDossierEsc(String(value)) + "</pre>"
+      : callerDossierEsc(String(value))) + "</div>";
+}
+
+/* A section of the tree, and what it says when the station never wrote
+ * that part down: silence would read as "nothing happened". */
+function scriptTreeSection(title, rows) {
+  const body = rows.filter((x) => x).join("");
+  return "<div><b>" + callerDossierEsc(title) + "</b></div>"
+    + (body || "<div class='k'>not recorded for this line</div>") + "<br>";
+}
+
+function scriptTreeHtml(p) {
+  const r = p.round || {};
+  const c = p.crystal || {};
+  const m = p.model || {};
+  const v = p.voice || {};
+  const a = p.air || {};
+  let out = "";
+  if (!p.recorded) {
+    out += "<div><b>This line aired before the screenplay ledger</b> — the "
+      + "air log kept its words, its time, its seat and its audio; the "
+      + "prompt, the engine numbers and the chunk behind it were never "
+      + "written down for this hour.</div><br>";
+  }
+  out += scriptTreeSection("THE ROUND", [
+    scriptTreeRow("kind", r.kind),
+    scriptTreeRow("label", r.label),
+    scriptTreeRow("seed document", r.source),
+    scriptTreeRow("caller", r.caller),
+    scriptTreeRow("lines in the round", r.lines),
+    scriptTreeRow("written", r.banked_at ? scriptWhen(r.banked_at)
+      + (r.frozen ? " (prepared, frozen)" : "") : ""),
+    scriptTreeRow("aired", r.aired_at ? scriptWhen(r.aired_at) : ""),
+    scriptTreeRow("road", r.stream ? "streamed as one round"
+      : (r.stamped ? "turn by turn" : "")),
+    scriptTreeRow("seed text", r.seed_text, true)]);
+
+  out += scriptTreeSection("THE SPEAKER BOX", (p.chunks || []).map((k, i) =>
+    "<div><b>chunk " + (i + 1) + "</b> \u2014 "
+    + callerDossierEsc(k.file || "?")
+    + (k.mind ? " \u00b7 mind: " + callerDossierEsc(k.mind) : "")
+    + " \u00b7 " + (k.lines || 0) + " lines, " + (k.chars || 0)
+    + " chars</div>"
+    + scriptTreeRow("ledger key", k.key)
+    + scriptTreeRow("served", k.in_ledger
+      ? (k.used || 0) + " times, last " + scriptWhen(k.last)
+        + (k.roads && k.roads.length
+           ? " \u00b7 roads: " + k.roads.join(", ") : "")
+        + (k.liked ? " \u00b7 a favourite" : "")
+      : "not in the chunk ledger")
+    + scriptTreeRow("the chunk, word for word", k.text, true)));
+
+  out += scriptTreeSection("THE CRYSTAL", [
+    scriptTreeRow("tinted", c.tinted
+      ? "yes \u2014 this round was rewritten"
+      : (c.world || c.why ? "no" : "")),
+    scriptTreeRow("world", c.world),
+    scriptTreeRow("why", c.why),
+    scriptTreeRow("cost", c.ms ? c.ms + " ms, " + (c.stanzas || 0)
+      + " stanzas of its own material" : "")]
+    .concat((c.crystals || []).map((one) =>
+      scriptTreeRow("crystal on air", (one.name || "") + " at "
+        + (one.strength || 0) + "% \u00b7 " + (one.source === "crystal"
+          ? "lends its words too" : "tint only"))))
+    .concat([scriptTreeRow("the plain script", c.plain, true),
+             scriptTreeRow("the tinted script", c.tinted_script, true)]));
+
+  out += scriptTreeSection("THE WRITER", [
+    scriptTreeRow("model", m.model),
+    scriptTreeRow("what it was asked for", m["for"] || m.kind),
+    scriptTreeRow("time", m.ms ? m.ms + " ms"
+      + (m.working_ms ? " (" + m.working_ms + " ms working, "
+        + m.waiting_ms + " ms waiting)" : "") : ""),
+    scriptTreeRow("temperature", m.temp),
+    scriptTreeRow("context", m.num_ctx),
+    scriptTreeRow("system prompt armed", m.armed),
+    scriptTreeRow("the schedule's instruction", m.sched, true),
+    scriptTreeRow("the prompt as sent", m.prompt, true),
+    scriptTreeRow("what came back", m.answered, true),
+    scriptTreeRow("model calls around this line",
+      (m.calls_near || []).map((one) => scriptWhen(one.at) + " " + one.model
+        + " " + one.kind + " " + one.ms + "ms"
+        + (one.tinted ? " (tint)" : "")).join("\n"), true)]);
+
+  out += scriptTreeSection("THE VOICE", [
+    scriptTreeRow("engine", v.engine),
+    scriptTreeRow("voice", v.voice),
+    scriptTreeRow("render", v.shelf
+      ? "off the pantry shelf \u2014 no engine was spent"
+      : (v.ms ? v.ms + " ms for " + (v.seconds || 0) + "s"
+         + (v.kb ? ", " + v.kb + " KB" : "") : "")),
+    scriptTreeRow("service", v.service),
+    scriptTreeRow("fallbacks tried", (v.tried || []).join(", ")),
+    scriptTreeRow("fell back to", v.fallback),
+    scriptTreeRow("direction", v.macro)]);
+
+  out += scriptTreeSection("THE AIR", [
+    scriptTreeRow("went out on", a.aired),
+    scriptTreeRow("length", a.seconds ? Number(a.seconds).toFixed(2)
+      + "s" : ""),
+    scriptTreeRow("in burst", a.burst || ""),
+    scriptTreeRow("clip", a.clip || "pruned"),
+    scriptTreeRow("a replay", a.replay ? "yes \u2014 the resume reel" : "")]);
+  return out;
+}
+
+/* The note / critique / insert composer. Lands under whatever it is
+ * pinned to, so the mark is never in doubt. */
+function scriptCompose(targetId, kind, after) {
+  const gone = document.querySelector(".sp-compose");
+  if (gone) gone.remove();
+  const host = el("div", "sp-compose", "");
+  const area = document.createElement("textarea");
+  area.placeholder = targetId
+    ? "A note on this element — or a line of your own to insert here."
+    : "A note on the hour.";
+  host.appendChild(area);
+  const row = el("div", "row", "");
+  const pick = document.createElement("select");
+  [["note", "Note"], ["critique", "Critique"], ["insert", "Insert a line"]]
+    .forEach(([v, label]) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = label;
+      pick.appendChild(o);
+    });
+  pick.value = kind || "note";
+  row.appendChild(pick);
+  const who = document.createElement("input");
+  who.placeholder = "character (insert)";
+  who.size = 22;
+  row.appendChild(who);
+  const save = el("button", "", "Save");
+  const cancel = el("button", "", "Cancel");
+  cancel.onclick = () => host.remove();
+  save.onclick = async () => {
+    const text = area.value.trim();
+    if (!text) { area.focus(); return; }
+    save.disabled = true;
+    try {
+      await api("/api/screenplay/" + encodeURIComponent(scriptHour) + "/note",
+        {method: "POST", body: JSON.stringify({
+          target_id: targetId || "", kind: pick.value, text: text,
+          who: who.value.trim()})});
+      host.remove();
+      await scriptShow(scriptHour, true);
+      setStatus("Noted on the script.");
+    } catch (e) {
+      save.disabled = false;
+      setStatus(e.message, true);
+    }
+  };
+  row.appendChild(save);
+  row.appendChild(cancel);
+  host.appendChild(row);
+  if (after && after.parentNode) {
+    after.parentNode.insertBefore(host, after.nextSibling);
+  } else if (scriptSheet) {
+    scriptSheet.appendChild(host);
+  }
+  area.focus();
+}
+
+async function scriptNoteDrop(noteId) {
+  if (!noteId) return;
+  try {
+    await api("/api/screenplay/" + encodeURIComponent(scriptHour)
+      + "/note/" + encodeURIComponent(noteId), {method: "DELETE"});
+    await scriptShow(scriptHour, true);
+  } catch (e) { setStatus(e.message, true); }
+}
+
+async function scriptCopy(btn) {
+  if (scriptBusy) return;
+  scriptBusy = true;
+  const was = btn ? btn.textContent : "";
+  if (btn) btn.textContent = "…";
+  try {
+    const r = await fetch("/api/screenplay/" + encodeURIComponent(scriptHour)
+      + ".txt", {headers: {"Authorization": "Bearer " + key()}});
+    if (!r.ok) throw new Error("the sheet did not load (" + r.status + ")");
+    const text = await r.text();
+    let done = false;
+    try {
+      await navigator.clipboard.writeText(text);
+      done = true;
+    } catch (e) { done = false; }
+    if (!done) {
+      const pad = document.createElement("textarea");
+      pad.value = text;
+      pad.style.cssText = "position:fixed;left:-9999px;top:0";
+      document.body.appendChild(pad);
+      pad.select();
+      try { document.execCommand("copy"); done = true; } catch (e) {}
+      pad.remove();
+    }
+    setStatus(done ? "The sheet is on the clipboard."
+      : "Could not reach the clipboard.", !done);
+  } catch (e) {
+    setStatus(e.message, true);
+  } finally {
+    scriptBusy = false;
+    if (btn) btn.textContent = was;
+  }
+}
+
+async function scriptExport(what) {
+  if (!scriptHour) return;
+  const url = "/api/screenplay/" + encodeURIComponent(scriptHour)
+    + (what === "pdf" ? ".pdf" : ".md");
+  try {
+    const r = await fetch(url, {headers: {"Authorization": "Bearer " + key()}});
+    if (r.status === 501 && what === "pdf") {
+      scriptPrint();
+      return;
+    }
+    if (!r.ok) throw new Error("the export failed (" + r.status + ")");
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "pinebox-" + scriptHour + (what === "pdf" ? ".pdf"
+      : ".fountain.md");
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 4000);
+  } catch (e) { setStatus(e.message, true); }
+}
+
+/* No PDF writer on this build: print the sheet itself, which is already
+ * a real screenplay on a US-Letter measure. */
+function scriptPrint() {
+  if (!scriptSheet) return;
+  const win = window.open("", "_blank");
+  if (!win) { setStatus("The browser blocked the print window.", true); return; }
+  win.document.write("<!doctype html><html><head><title>"
+    + callerDossierEsc((scriptData && scriptData.title) || scriptHour)
+    + "</title><style>" + SCRIPT_CSS
+    + "@page{size:letter;margin:1in 1in 1in 1.5in}"
+    + ".sp-ctl,.sp-tree,.sp-flow,.sp-compose{display:none!important}"
+    + "body{margin:0;background:#fff}.sp-sheet{background:#fff;padding:0}"
+    + "</style></head><body>" + scriptSheet.innerHTML + "</body></html>");
+  win.document.close();
+  setTimeout(() => { try { win.print(); } catch (e) {} }, 350);
 }
 
 /* ---- #1153: THE STEWARD'S CONSOLE -----------------------------------
@@ -140567,6 +151693,474 @@ let historyBaselineTs = null;
 const seenTurnKeys = new Set();
 let lastToastAt = 0;
 
+/* ---- #1157: THE GAZETTE PILE AND THE CAP ---------------------------
+ * The press files a snapshot of every edition into the gallery ledger
+ * (#1020), and it prints one on every hour PLUS one for every "Print
+ * now". Thirteen of the newest forty rows were newspapers: the Live
+ * filmstrip had stopped being a strip of renders and become a wall of
+ * front pages.
+ *
+ * Two controls answer that, both in the Live toolbar beside 📰 and ☁.
+ *
+ *   🗞  cycles three views of the papers in the strip —
+ *         all   each paper on its own tile (what the strip always did)
+ *         hr    one tile per HOUR, every issue of that hour underneath
+ *         1     every paper in the strip folded into a single pile
+ *       The button's chip and its tooltip both name the state that is
+ *       on and the one the next click brings.
+ *
+ *   max the number of Gazette ENTRIES the strip lists at all. Papers
+ *       past it are not dropped and not hidden: they fold into one more
+ *       pile, and the count on that pile is the true number of issues
+ *       underneath it. It is a settings key, so it follows the operator
+ *       between devices; the view is a localStorage choice, because it
+ *       is about this screen.
+ *
+ * The fold runs BEFORE the twenty-four-tile slice, which is the point of
+ * the exercise: the places the newspapers give up go to renders. Nothing
+ * else in the strip changes — non-paper renders are never folded, never
+ * capped and never hidden, the size slider still drives the tiles, and
+ * the Gazette window's own shelf still lists every edition ever printed.
+ */
+const GZ_MODES = ["all", "hour", "one"];
+const GZ_MODE_TAG = {all: "all", hour: "hr", one: "1"};
+const GZ_MODE_SAID = {
+  all: "each paper on its own",
+  hour: "papers stacked by the hour",
+  one: "every paper in one pile",
+};
+/* "2026-09-05-08" for an hourly, "2026-09-05-08x0941" for an extra. */
+const GZ_ID_RE = /(\d{4}-\d{2}-\d{2}-\d{2}(?:x\d{4})?)/;
+
+let gzMode = "hour";
+let gzCap = 4;
+let gzEntries = {};        /* key -> the pile the tile on screen stands for */
+let gzCapSaveTimer = null;
+let gzBrowserKey = "";
+let gzPaperMeta = null;    /* edition id -> the /api/paper row, fetched once */
+
+function gzIsPaper(it) {
+  if (!it) return false;
+  if (it.kind === "paper" || it.model === "gazette") return true;
+  // INTEGRATION: tags alone are not enough here either (lane STACK's fix,
+  // which cleared the same fault out of the listing). The regenerate
+  // button posts a row's tag list back verbatim as the prompt, so a render
+  // made from a snapshot inherits "gazette <id> ..." and would be folded
+  // into that hour's pile. Every snapshot the press files is named
+  // gazette-<id>[-<style>].png and no render is, so a row too old to carry
+  // kind or model still answers - by its filename.
+  return /^gazette-/i.test(String(it.f || "").split("/").pop());
+}
+
+/* Which edition a gallery row is a picture of. The snapshot writes the id
+ * onto the ledger row (#1020); rows from before that answer through their
+ * tags ("gazette <id> <style> …") or their filename. */
+function gzEditionId(it) {
+  if (!it) return "";
+  if (it.edition) return String(it.edition);
+  let m = GZ_ID_RE.exec(String(it.cap || ""));
+  if (m) return m[1];
+  m = GZ_ID_RE.exec(String(it.f || ""));
+  return m ? m[1] : "";
+}
+
+function gzGroupKey(it) {
+  if (gzMode === "one") return "all";
+  const id = gzEditionId(it);
+  if (!id) return "f:" + (it.f || "");
+  if (gzMode === "hour") return id.split("x")[0];
+  return "e:" + (it.f || id);
+}
+
+function gzHourDate(key) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})-(\d{2})$/.exec(String(key || ""));
+  if (!m) return null;
+  return new Date(+m[1], +m[2] - 1, +m[3], +m[4], 0, 0);
+}
+
+function gzClock12(h, mins) {
+  return ((h % 12) || 12) + (mins === undefined ? "" : ":" + mins)
+    + (h < 12 ? " AM" : " PM");
+}
+
+function gzHourLabel(key) {
+  const d = gzHourDate(key);
+  if (!d) return "The Gazette";
+  return d.toLocaleDateString(undefined,
+    {weekday: "short", month: "short", day: "numeric"})
+    + " · " + gzClock12(d.getHours());
+}
+
+/* The hour a paper covers, and whether it was the hourly or an extra
+ * somebody pressed for. The extra's id carries the minute it was asked
+ * for, which is the only thing that tells two of them apart. */
+function gzIssueLabel(it) {
+  const id = gzEditionId(it);
+  if (!id) return "The Gazette";
+  const bits = id.split("x");
+  let out = gzHourLabel(bits[0]);
+  if (bits[1] && bits[1].length === 4) {
+    out += " · extra " + gzClock12(parseInt(bits[1].slice(0, 2), 10),
+                                   bits[1].slice(2));
+  } else {
+    out += " · hourly";
+  }
+  return out;
+}
+
+function gzHeadline(it) {
+  const row = gzPaperMeta && gzPaperMeta[gzEditionId(it)];
+  if (row && row.headline) return row.headline;
+  const said = String((it && it.request) || (it && it.cap) || "");
+  const cut = said.indexOf("—");
+  const out = (cut >= 0 ? said.slice(cut + 1) : said).trim();
+  return out || "(untitled edition)";
+}
+
+/* THE FOLD. items in, entries out, same order: a render is one entry, and
+ * the papers collapse by gzGroupKey into piles that sit exactly where
+ * their newest issue sat. Then the cap: when there are more Gazette
+ * entries than the operator allows, the newest cap-1 keep their places
+ * and EVERYTHING else joins one overflow pile at the first place it
+ * would have taken. Nothing is thrown away, and no non-paper is touched. */
+function gzFold(items) {
+  const cap = Math.max(1, Math.min(40, gzCap || 4));
+  const groups = new Map();
+  (items || []).forEach((it) => {
+    if (!gzIsPaper(it)) return;
+    const k = gzGroupKey(it);
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(it);
+  });
+  const keys = [...groups.keys()];
+  const own = new Set(keys.length > cap ? keys.slice(0, cap - 1) : keys);
+  const spill = [];
+  keys.forEach((k) => {
+    if (!own.has(k)) groups.get(k).forEach((it) => spill.push(it));
+  });
+  const out = [];
+  const drawn = new Set();
+  (items || []).forEach((it) => {
+    if (!gzIsPaper(it)) {
+      out.push({key: it.f, kind: "one", face: it, count: 1,
+                papers: [], label: ""});
+      return;
+    }
+    const k = gzGroupKey(it);
+    if (own.has(k)) {
+      if (drawn.has(k)) return;
+      drawn.add(k);
+      out.push(gzEntry("gz:" + k, groups.get(k),
+        gzMode === "hour" ? gzHourLabel(k) : "The Gazette"));
+    } else {
+      if (drawn.has("gz:more")) return;
+      drawn.add("gz:more");
+      out.push(gzEntry("gz:more", spill, "The Gazette"));
+    }
+  });
+  return out;
+}
+
+/* One paper is not a pile — it stays an ordinary tile with an ordinary
+ * lightbox, so a strip with two editions on it does not sprout stacks. */
+function gzEntry(key, papers, label) {
+  const many = papers.length > 1;
+  return {
+    key: many ? key : papers[0].f,
+    kind: many ? "pile" : "one",
+    face: papers[0],
+    count: papers.length,
+    papers: papers,
+    label: label,
+  };
+}
+
+function gzPileTitle(e) {
+  const lines = [e.count + " Gazette issues"
+    + (e.label && e.label !== "The Gazette" ? " · " + e.label : "")];
+  e.papers.slice(0, 6).forEach((it) => {
+    lines.push("  " + gzIssueLabel(it) + " — " + gzHeadline(it));
+  });
+  if (e.papers.length > 6) {
+    lines.push("  …and " + (e.papers.length - 6) + " more");
+  }
+  lines.push("Click to browse them.");
+  return lines.join("\n");
+}
+
+/* The tile: a front page at the top-left with two sheets showing behind
+ * it, the count on the face. One .film-item footprint, so the size
+ * slider and the marquee treat it like any other render. */
+function gzPileCell(e) {
+  const cell = document.createElement("div");
+  cell.className = "film-item gz-pile";
+  cell.dataset.gzKey = e.key;
+  cell.dataset.gzFace = e.face.f || "";
+  cell.appendChild(el("div", "gz-sheet gz-s3", ""));
+  cell.appendChild(el("div", "gz-sheet gz-s2", ""));
+  const face = el("div", "gz-face", "");
+  const img = mediaElement(e.face.f);
+  fetchImageInto(img, e.face.f);
+  face.appendChild(img);
+  face.appendChild(el("div", "gz-tag", "🗞 " + (e.label || "The Gazette")));
+  face.appendChild(el("div", "gz-count", e.count + " issues"));
+  cell.appendChild(face);
+  cell.title = gzPileTitle(e);
+  cell.onclick = () => gzBrowserOpen(e.key);
+  return cell;
+}
+
+/* A paper printed while the strip is open must join its pile IN PLACE.
+ * The strip is only rebuilt when the list of entries changes, so a new
+ * extra in an hour that already has a pile just moves the count on and
+ * swaps the face — no rebuild, no restarted marquee, no jump. */
+function gzSyncCells() {
+  const track = document.getElementById("filmTrack");
+  if (!track) return;
+  track.querySelectorAll("[data-gz-key]").forEach((cell) => {
+    const e = gzEntries[cell.dataset.gzKey];
+    if (!e) return;
+    const badge = cell.querySelector(".gz-count");
+    if (badge) badge.textContent = e.count + " issues";
+    const tag = cell.querySelector(".gz-tag");
+    if (tag) tag.textContent = "🗞 " + (e.label || "The Gazette");
+    cell.title = gzPileTitle(e);
+    if (cell.dataset.gzFace !== (e.face.f || "")) {
+      cell.dataset.gzFace = e.face.f || "";
+      const img = cell.querySelector("img, video");
+      if (img) fetchImageInto(img, e.face.f);
+    }
+  });
+}
+
+function gzModeCycle() {
+  gzMode = GZ_MODES[(GZ_MODES.indexOf(gzMode) + 1) % GZ_MODES.length];
+  try { localStorage.setItem("gzPaperMode", gzMode); } catch (e) { /* private */ }
+  filmSignature = "";
+  buildFilmstrip();
+}
+
+function gzPaint() {
+  const btn = document.getElementById("gzPileBtn");
+  if (btn) {
+    const chip = btn.querySelector(".gz-state");
+    if (chip) chip.textContent = GZ_MODE_TAG[gzMode] || "all";
+    btn.classList.toggle("gz-on", gzMode !== "all");
+    const next = GZ_MODES[(GZ_MODES.indexOf(gzMode) + 1) % GZ_MODES.length];
+    btn.title = "Gazette renders in the strip: " + GZ_MODE_SAID[gzMode]
+      + ". Click for " + GZ_MODE_SAID[next] + "."
+      + " At most " + gzCap + " Gazette "
+      + (gzCap === 1 ? "entry is" : "entries are")
+      + " listed; the rest fold into the pile, which counts them."
+      + " Right-click for the number.";
+  }
+  const box = document.getElementById("gzCapInput");
+  if (box && document.activeElement !== box) box.value = String(gzCap);
+}
+
+function gzCapFocus(ev) {
+  const box = document.getElementById("gzCapInput");
+  if (!box) return true;
+  if (ev && ev.preventDefault) ev.preventDefault();
+  box.focus();
+  box.select();
+  return false;
+}
+
+function gzCapSet(value) {
+  let n = parseInt(value, 10);
+  if (!(n >= 1)) n = 1;
+  if (n > 40) n = 40;
+  gzCap = n;
+  try { localStorage.setItem("gzPaperCap", String(n)); } catch (e) { /* private */ }
+  filmSignature = "";
+  buildFilmstrip();
+  clearTimeout(gzCapSaveTimer);
+  gzCapSaveTimer = setTimeout(gzCapSave, 700);
+}
+
+/* The cap follows the operator between devices, so it is a settings key
+ * and not a localStorage note. localStorage still mirrors it, so the
+ * strip obeys the right number before /api/settings has answered. */
+async function gzCapSave() {
+  try {
+    const s = await api("/api/settings");
+    if (s.voice_out) delete s.voice_out.ha_token;
+    s.gallery_paper_cap = gzCap;
+    await api("/api/settings", {method: "PUT", body: JSON.stringify(s)});
+    if (settings) settings.gallery_paper_cap = gzCap;
+  } catch (e) {
+    /* This screen still obeys it; the key is simply not saved. */
+  }
+}
+
+function gzInit() {
+  try {
+    const m = localStorage.getItem("gzPaperMode");
+    if (GZ_MODES.indexOf(m) >= 0) gzMode = m;
+    const c = parseInt(localStorage.getItem("gzPaperCap"), 10);
+    if (c >= 1 && c <= 40) gzCap = c;
+  } catch (e) { /* private window: the defaults stand */ }
+  gzPaint();
+  api("/api/settings").then((s) => {
+    const n = parseInt(s && s.gallery_paper_cap, 10);
+    if (!(n >= 1 && n <= 40) || n === gzCap) return;
+    gzCap = n;
+    try { localStorage.setItem("gzPaperCap", String(n)); } catch (e) {}
+    filmSignature = "";
+    buildFilmstrip();
+  }).catch(() => { /* reads may be locked; the mirror stands */ });
+}
+
+/* ---- the issue browser: the pile opened up ---- */
+
+async function gzBrowserOpen(key) {
+  const e = gzEntries[key];
+  if (!e) return;
+  gzBrowserKey = key;
+  const body = openModal();
+  body.style.flexDirection = "column";
+  const wrap = el("div", "gz-browser", "");
+  const head = el("div", "gz-browser-head", "");
+  head.appendChild(el("h2", "", "🗞 The Gazette — " + e.count + " issues"));
+  const sub = el("div", "muted", "");
+  sub.style.cssText = "font-size:12px;margin-top:2px";
+  sub.textContent = (e.label && e.label !== "The Gazette"
+    ? e.label + " · " : "")
+    + "newest first. Open one to read the whole paper; the bin removes that"
+    + " issue's picture from the gallery only — the Gazette keeps every"
+    + " edition on its own shelf.";
+  head.appendChild(sub);
+  wrap.appendChild(head);
+  const list = el("div", "gz-browser-list", "");
+  list.id = "gzBrowserList";
+  wrap.appendChild(list);
+  body.appendChild(wrap);
+  gzBrowserPaint();
+  /* The headlines live with the editions, not with the pictures. One
+   * read, cached for the session, and the rows repaint when it lands. */
+  if (!gzPaperMeta) {
+    let rows = [];
+    try { rows = (await api("/api/paper")).editions || []; }
+    catch (err) { rows = []; }
+    gzPaperMeta = {};
+    rows.forEach((r) => { if (r && r.id) gzPaperMeta[r.id] = r; });
+    if (gzBrowserKey === key) gzBrowserPaint();
+  }
+}
+
+function gzBrowserClose() {
+  if (!gzBrowserKey) return;
+  gzBrowserKey = "";
+  closeModal();
+}
+
+function gzBrowserPaint() {
+  const list = document.getElementById("gzBrowserList");
+  if (!list) return;
+  const e = gzEntries[gzBrowserKey];
+  list.textContent = "";
+  if (!e || !e.papers.length) {
+    list.innerHTML = '<div class="muted" style="padding:18px">'
+      + callerDossierEsc("Nothing left in this pile.") + "</div>";
+    return;
+  }
+  e.papers.forEach((it) => list.appendChild(gzBrowserRow(it)));
+}
+
+function gzBrowserRow(it) {
+  const id = gzEditionId(it);
+  const meta = (gzPaperMeta && gzPaperMeta[id]) || {};
+  const row = el("div", "gz-row", "");
+  const thumb = el("div", "gz-thumb", "");
+  const img = mediaElement(it.f);
+  fetchImageInto(img, it.f);
+  thumb.appendChild(img);
+  thumb.title = "Look at the front page";
+  thumb.onclick = () => { closeModal(); gzBrowserKey = ""; showLightbox(it.f, it); };
+  row.appendChild(thumb);
+
+  const bodyCol = el("div", "gz-body", "");
+  const when = el("div", "gz-when", gzIssueLabel(it));
+  const extra = String(id).includes("x");
+  const tag = el("span", "gz-kind" + (extra ? " gz-extra" : ""),
+    extra ? "EXTRA" : "HOURLY");
+  when.appendChild(tag);
+  if (it.style && it.style !== "broadsheet") {
+    when.appendChild(el("span", "gz-kind", String(it.style).toUpperCase()));
+  }
+  bodyCol.appendChild(when);
+  bodyCol.appendChild(el("div", "gz-head", gzHeadline(it)));
+  if (meta.deck) bodyCol.appendChild(el("div", "gz-deck", meta.deck));
+  row.appendChild(bodyCol);
+
+  const acts = el("div", "gz-acts", "");
+  const openBtn = el("button", "primary", "Open");
+  openBtn.title = "Open this edition in the Gazette window";
+  openBtn.onclick = () => gzOpenEdition(id);
+  if (!id) openBtn.disabled = true;
+  acts.appendChild(openBtn);
+  const bin = el("button", "", "🗑");
+  bin.title = "Delete this one issue's picture from the gallery";
+  bin.onclick = () => gzDeleteIssue(it);
+  acts.appendChild(bin);
+  row.appendChild(acts);
+  return row;
+}
+
+/* Open the Gazette window AT this edition. paperOpen() lands on the
+ * newest, so the jump has to happen after it has settled — and the DJ
+ * poll's paper watcher pulls the window to the newest edition the first
+ * time it meets one it has not marked (#1019), which would snatch the
+ * screen back off the operator a second after he picked an issue. Mark
+ * that edition seen on his behalf; the watcher still does its job for
+ * every paper printed after this one. */
+function gzOpenEdition(id) {
+  gzBrowserKey = "";
+  closeModal();
+  if (!id) return;
+  const go = () => {
+    try {
+      if (paperList && paperList[0] && paperList[0].id) {
+        paperSeen = paperList[0].id;
+      }
+      paperShow(id);
+    } catch (e) { /* the window went away under us */ }
+  };
+  if (paperBox) { go(); return; }
+  Promise.resolve(paperOpen()).then(go).catch(go);
+}
+
+/* The bin on a row deletes THAT issue, never the pile: one file, the one
+ * ledger row that carries it, and then the strip is refolded so the pile
+ * counts what is actually left. */
+async function gzDeleteIssue(it) {
+  const file = it && it.f;
+  if (!file) return;
+  try {
+    await api("/api/generations/image/" + encodeURIComponent(file),
+      {method: "DELETE"});
+  } catch (err) {
+    setStatus(err.message, true);
+    return;
+  }
+  if (galleryURLs[file]) {
+    try { URL.revokeObjectURL(galleryURLs[file]); } catch (e) {}
+    delete galleryURLs[file];
+  }
+  lastComfyFiles = (lastComfyFiles || []).filter((x) => x !== file);
+  lastGenerations = (lastGenerations || []).map((g) => {
+    g.files = (g.files || []).filter((x) => x !== file);
+    return g;
+  });
+  prevFilmFiles.delete(file);
+  filmSignature = "";
+  buildFilmstrip();
+  loadGallery();
+  if (!gzEntries[gzBrowserKey]) { gzBrowserClose(); return; }
+  gzBrowserPaint();
+}
+
 function activityImages() {
   // Merge PineBox generations (with prompt captions) and raw ComfyUI
   // outputs, newest first, de-duped by filename. Generations win so their
@@ -140580,15 +152174,27 @@ function activityImages() {
         cap: g.tags || g.request || "",
         model: g.model || "",
         ts: g.ts || 0,
+        // #1157: the strip has to be able to tell a newspaper from a
+        // painting, and which edition the newspaper is, before it can
+        // stack them. The snapshot row already says both (#1020).
+        kind: g.kind || "",
+        edition: g.edition || "",
+        style: g.style || "",
+        request: g.request || "",
       });
     }
   });
   (lastComfyFiles || []).forEach((f) => {
-    if (f && !byFile.has(f)) byFile.set(f, { f: f, cap: "", model: "", ts: 0 });
+    if (f && !byFile.has(f)) {
+      byFile.set(f, {f: f, cap: "", model: "", ts: 0,
+                     kind: "", edition: "", style: "", request: ""});
+    }
   });
-  return [...byFile.values()].slice(0, 24);
+  // #1157: no slice here any more. The fold runs first, in buildFilmstrip,
+  // so the places the newspapers give up go to renders instead of the
+  // papers taking twenty-four seats and leaving four.
+  return [...byFile.values()];
 }
-
 function currentFilmScale() {
   const v = parseFloat(localStorage.getItem("filmScale"));
   return v > 0 ? v : 4;   // default: 4× bigger
@@ -140609,14 +152215,20 @@ function applyFilmScale(scale) {
 }
 
 function buildFilmstrip() {
-  const items = activityImages();
-  const sig = items.map((i) => i.f).join(",");
-  if (sig === filmSignature) return;
-  filmSignature = sig;
+  // #1157: entries, not images. A render is one entry; the Gazette
+  // snapshots fold into piles, and the cap holds how many Gazette entries
+  // the strip lists at all. Only then is the list cut to twenty-four.
+  const entries = gzFold(activityImages()).slice(0, 24);
+  const sig = entries.map((e) => e.key).join(",");
+  gzEntries = {};
+  entries.forEach((e) => { if (e.kind === "pile") gzEntries[e.key] = e; });
+  gzPaint();
 
   const track = document.getElementById("filmTrack");
   const count = document.getElementById("actCount");
-  if (!items.length) {
+  if (!entries.length) {
+    if (sig === filmSignature) return;
+    filmSignature = sig;
     filmItemCount = 0;
     track.style.animation = "none";
     track.innerHTML =
@@ -140624,13 +152236,22 @@ function buildFilmstrip() {
     count.textContent = "";
     return;
   }
-  count.textContent = items.length + " images";
+  const folded = entries.reduce(
+    (n, e) => n + (e.kind === "pile" ? e.count : 0), 0);
+  count.textContent = entries.length + " images"
+    + (folded ? " · " + folded + " Gazette issues stacked" : "");
+  // A new issue joining a pile that is already on screen changes no entry,
+  // so the strip is left alone and only the pile's count and face move.
+  if (sig === filmSignature) { gzSyncCells(); return; }
+  filmSignature = sig;
   // Animate ONLY genuinely-new images (not every image on first load).
   const firstBuild = prevFilmFiles.size === 0;
   // Duplicate the sequence so the marquee loops seamlessly (0 → -50%).
   track.innerHTML = "";
   const addCells = () =>
-    items.forEach((it, idx) => {
+    entries.forEach((e, idx) => {
+      if (e.kind === "pile") { track.appendChild(gzPileCell(e)); return; }
+      const it = e.face;
       const cell = document.createElement("div");
       cell.className = "film-item";
       if (!firstBuild && !prevFilmFiles.has(it.f)) cell.classList.add("enter");
@@ -140639,7 +152260,7 @@ function buildFilmstrip() {
       fetchImageInto(img, it.f);
       cell.appendChild(img);
       if (idx === 0) {
-        // items[0] is the newest render — always badge it "NEW".
+        // entries[0] is the newest render — always badge it "NEW".
         const badge = document.createElement("div");
         badge.className = "newbadge";
         badge.textContent = "NEW";
@@ -140650,8 +152271,8 @@ function buildFilmstrip() {
     });
   addCells();
   addCells();
-  prevFilmFiles = new Set(items.map((i) => i.f));
-  filmItemCount = items.length;
+  prevFilmFiles = new Set(entries.map((e) => e.face.f));
+  filmItemCount = entries.length;
   track.style.animation = "scroll-film 60s linear infinite";
   applyFilmScale(currentFilmScale());
 }
@@ -143139,6 +154760,7 @@ function startLiveActivity() {
   initThemes();
   initPanelDots();
   initFontPicker();
+  gzInit();
   refreshActivityImages();
   pollActivityFeed();
   loadPineInbox();
@@ -143176,6 +154798,7 @@ function startLiveActivity() {
   // four WebGL contexts inside the same tick as the 1.2MB script parse was
   // the sluggish, unresponsive page load.
   setTimeout(() => cloudDockStart(), 2600);
+  setTimeout(() => { try { pineSlidesRestore(); } catch (e) {} }, 900);
   setTimeout(() => stageStart().catch(() => {}), 1400);
   scopeLoop();
   // #786: the station comes FIRST in the stack — Pine Box FM · the DJ at

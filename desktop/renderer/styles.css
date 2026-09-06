@@ -1723,3 +1723,38 @@ body.rail-compact .stream-routes { display: none; }
     box-shadow: 0 0 0 1px rgba(124, 232, 169, .45);
   }
 }
+
+
+/* ---------- #1043b THE ENDLESS PRESS, BESIDE THE PANEL ---------------------
+   <main> is a three-row grid (marquee, status strip, views). Split, it
+   becomes a three-COLUMN grid as well: the views keep column 1, the grip
+   takes column 2 and the slideshow webview column 3. Every child is given
+   its cell explicitly, because auto-placement in a suddenly wider grid
+   would scatter the marquee and the strip across the top row. Nothing but
+   these rules changes, so dropping the class restores the old layout. */
+.slides-pane {
+  display: none; min-width: 0; min-height: 0; overflow: hidden;
+  background: #15130f; border-left: 1px solid var(--line);
+}
+/* webview in the shell; iframe when the same page is opened in a plain
+   browser for testing - both fill the pane. */
+.slides-pane webview,
+.slides-pane iframe { width: 100%; height: 100%; border: 0; background: #15130f; }
+.slides-grip {
+  display: none; cursor: col-resize; background: var(--rail);
+  border-left: 1px solid var(--line); border-right: 1px solid var(--line);
+}
+.slides-grip:hover, body.slides-dragging .slides-grip { background: var(--cyan); }
+body.slides-split main {
+  grid-template-columns: minmax(220px, 1fr) 6px minmax(200px, var(--slides-w, 50%));
+}
+body.slides-split main > .dx-marquee { grid-column: 1 / -1; grid-row: 1; }
+body.slides-split main > .top { grid-column: 1 / -1; grid-row: 2; }
+body.slides-split main > .view { grid-column: 1; grid-row: 3; }
+body.slides-split .slides-grip { display: block; grid-column: 2; grid-row: 3; }
+body.slides-split .slides-pane { display: block; grid-column: 3; grid-row: 3; }
+/* A drag across a webview is swallowed by the webview; lift them out of
+   the way for the length of the drag and the pointer keeps reporting. */
+body.slides-dragging { user-select: none; }
+body.slides-dragging webview { pointer-events: none; }
+#slidesSplitBtn.on { color: #e3b06c; border-color: #e3b06c; }

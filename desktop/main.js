@@ -782,6 +782,38 @@ app.on("web-contents-created", (event, contents) => {
   });
 });
 
+// #1047 — A PICTURE ON THE CLIPBOARD NEEDS A SECURE ORIGIN.
+//
+// "when i click copy, I want to copy all the pages of the paper as an image
+//  to clipboard allowing me to paste it anywhere."
+//
+// navigator.clipboard.write() — the only road that puts an IMAGE on the
+// clipboard — is gated behind window.isSecureContext, and the panel is
+// served over plain http on the LAN. Chromium will treat named origins as
+// secure anyway when it is told to; this is that telling, scoped to the
+// origins this launcher actually loads (the configured base url and the
+// loopback pair a launch-local run uses) so nothing else gains anything.
+//
+// It is a belt for the braces: inside the Pine Box window the panel is a
+// file:// page and Copy goes through pineDesktop.copyImage in preload.js,
+// which needs no flag. This is what makes the same click work when the
+// panel is opened over http instead.
+app.commandLine.appendSwitch(
+  "unsafely-treat-insecure-origin-as-secure",
+  (() => {
+    const origins = new Set(["http://10.89.1.246:8096", "http://127.0.0.1:8096",
+      "http://localhost:8096"]);
+    try {
+      const cfg = readConfig();
+      for (const u of [cfg.baseUrl, `http://127.0.0.1:${cfg.port}`,
+        `http://localhost:${cfg.port}`]) {
+        try { origins.add(new URL(u).origin); } catch {}
+      }
+    } catch {}
+    return Array.from(origins).join(",");
+  })()
+);
+
 app.whenReady().then(async () => {
   selfSyncFromShare();
   createWindow();

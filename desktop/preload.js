@@ -1,4 +1,4 @@
-const { contextBridge, ipcRenderer, clipboard } = require("electron");
+const { contextBridge, ipcRenderer, clipboard, nativeImage } = require("electron");
 
 contextBridge.exposeInMainWorld("pineDesktop", {
   readConfig: () => ipcRenderer.invoke("config:read"),
@@ -26,6 +26,25 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   copyText: (text) => {
     try {
       clipboard.writeText(String(text == null ? "" : text));
+      return true;
+    } catch (err) {
+      return false;
+    }
+  },
+  /* #1047: THE COPY BUTTON HAS TO COPY A PICTURE.
+   *
+   * "when i click copy, I want to copy all the pages of the paper as an
+   *  image to clipboard allowing me to paste it anywhere."
+   *
+   * The Gazette window stitches every page into one tall PNG and hands it
+   * here as a data URL. navigator.clipboard.write is refused on a file://
+   * page exactly as writeText was in #990; Electron's clipboard is not,
+   * and nativeImage reads a PNG data URL directly. */
+  copyImage: (dataUrl) => {
+    try {
+      const png = nativeImage.createFromDataURL(String(dataUrl || ""));
+      if (!png || png.isEmpty()) return false;
+      clipboard.writeImage(png);
       return true;
     } catch (err) {
       return false;

@@ -243,6 +243,11 @@
         <button id="fullscreenBtn" title="Hide desktop chrome">[]</button>
         <button id="openBrowserBtn" title="Open in browser">^</button>
         <button id="refreshBtn" title="Refresh status">!</button>
+        <!-- #1043b: the endless press - split the main area and run
+             every Gazette issue, newspaper then tabloid, down the
+             right half. The same page the web panel opens. -->
+        <button id="slidesSplitBtn"
+                title="The endless press - every Gazette issue scrolling down the right half">&#128478;</button>
       </div>
     </header>
 
@@ -344,6 +349,14 @@
           <button id="stopBtn">Stop Agent</button>
         </div>
       </section>
+    </section>
+    <!-- #1043b: the endless press. The webview is left without a src
+         until the split is opened, and pointed back at about:blank
+         when it closes, so nothing scrolls in the dark. -->
+    <div id="slidesGrip" class="slides-grip" title="Drag to change the split"></div>
+    <section id="slidesPane" class="slides-pane">
+      <webview id="slidesFrame" allowpopups
+               webpreferences="backgroundThrottling=no"></webview>
     </section>
   </main>
   <!-- The Station drawer: public broadcast, DJ handling and troubleshooting

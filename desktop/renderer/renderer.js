@@ -10589,6 +10589,87 @@ $("reloadFrameBtn").onclick = () => {
   const frame = activeFrame();
   if (frame) frame.reload();
 };
+
+/* #1043b THE ENDLESS PRESS, FROM THE SHELL.
+ *
+ * "I want to add an icon for newspaper slideshow to be a display in Pine
+ * Box FM, when active take over half of the screen."
+ *
+ * The button adds one class to <body> and points the second webview at
+ * the station's own /api/paper/slideshow - the same page the web panel
+ * puts in its right half, so both roads reach the same scroller and
+ * either can be used alone. The split and the state are remembered. */
+
+let slidesSplit = false;
+
+function slidesWidth() {
+  const v = Number(localStorage.getItem("pineDesktopSlidesW"));
+  return (Number.isFinite(v) && v >= 18 && v <= 82) ? v : 50;
+}
+
+function slidesApplyWidth(pct) {
+  const main = document.querySelector("main");
+  if (main) main.style.setProperty("--slides-w", pct + "%");
+}
+
+function slidesUrl() {
+  const base = (config && config.baseUrl) || "http://127.0.0.1:8096";
+  return String(base).replace(/\/+$/, "") + "/api/paper/slideshow";
+}
+
+function slidesSet(on) {
+  slidesSplit = !!on;
+  document.body.classList.toggle("slides-split", slidesSplit);
+  localStorage.setItem("pineDesktopSlides", slidesSplit ? "1" : "0");
+  const button = $("slidesSplitBtn");
+  if (button) button.classList.toggle("on", slidesSplit);
+  const frame = $("slidesFrame");
+  if (frame) {
+    if (slidesSplit) {
+      slidesApplyWidth(slidesWidth());
+      const want = slidesUrl();
+      if (!frame.src || frame.src === "about:blank") frame.src = want;
+    } else {
+      // Point it at nothing rather than leave it hidden: a hidden webview
+      // keeps its timers and its images for as long as the app is open.
+      try { frame.src = "about:blank"; } catch (err) { /* not attached yet */ }
+    }
+  }
+}
+
+function slidesToggle() { slidesSet(!slidesSplit); }
+
+function slidesDrag(ev) {
+  ev.preventDefault();
+  const main = document.querySelector("main");
+  if (!main) return;
+  document.body.classList.add("slides-dragging");
+  const move = (e) => {
+    const box = main.getBoundingClientRect();
+    const pct = Math.min(82, Math.max(18,
+      ((box.right - e.clientX) / Math.max(1, box.width)) * 100));
+    slidesApplyWidth(pct.toFixed(1));
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", move);
+    document.removeEventListener("mouseup", up);
+    document.body.classList.remove("slides-dragging");
+    const now = parseFloat(main.style.getPropertyValue("--slides-w")) || 50;
+    localStorage.setItem("pineDesktopSlidesW", now.toFixed(1));
+  };
+  document.addEventListener("mousemove", move);
+  document.addEventListener("mouseup", up);
+}
+
+function initSlidesSplit() {
+  slidesApplyWidth(slidesWidth());
+  const grip = $("slidesGrip");
+  if (grip) grip.addEventListener("mousedown", slidesDrag);
+  const button = $("slidesSplitBtn");
+  if (button) button.onclick = slidesToggle;
+  if (localStorage.getItem("pineDesktopSlides") === "1") slidesSet(true);
+}
+
 $("fullscreenBtn").onclick = () => {
   document.body.classList.toggle("immersive");
 };
@@ -11607,6 +11688,7 @@ if (typeof api.onSupportProgress === "function") {
   initRailResizer();
   initAppVolume();
   await loadConfig();
+  initSlidesSplit();
   (await api.backendLog()).forEach(appendLog);
   if (config.mode === "launch") {
     try { await api.startBackend(); } catch (err) { appendLog(`[desktop] ${err.message}\n`); }
