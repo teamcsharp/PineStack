@@ -63448,6 +63448,60 @@ async def story_call_seed_clause(most: int = 2
             texts)
 
 
+async def call_pivots_contextualize(texts: list[str], theme_text: str = "",
+                                    story: str = "") -> list[str]:
+    """#1066: the caller's mid-call pivots, reworked INTO the situation.
+
+    story_call_seed_clause draws two RANDOM Speakerbox scraps for the
+    caller to pivot on. With a caller theme ("stolen garbage") and a
+    plotline on the air, the operator expects each scrap to be adjusted
+    to the realm of the plot and the theme before the writer sees it -
+    and then rapped by the crystal. A transcript about a political
+    debate was pivoting calls about stolen garbage. One ask, fails
+    closed: any doubt and the originals stand."""
+    texts = [" ".join(str(t or "").split()) for t in (texts or [])]
+    texts = [t for t in texts if t]
+    theme_text = " ".join(str(theme_text or "").split())
+    story = " ".join(str(story or "").split())
+    if not texts or not (theme_text or story):
+        return texts
+    frame: list[str] = []
+    if theme_text:
+        frame.append("THE SITUATION the callers ring in about: " + theme_text[:400])
+    if story:
+        frame.append("THE STORY on the air right now: " + story[:500])
+    prompt = (
+        "Below are short passages lifted from the station's own documents. "
+        "Rewrite EACH one so it is plainly about the situation and the story "
+        "below - the same voice, the same imagery and attitude, about the "
+        "same length - but now it happens inside this world and concerns "
+        "this situation, as something a caller would say on the phone. Add "
+        "no names. Return ONLY a JSON array of strings, one per passage, in "
+        "the same order.\n\n" + "\n".join(frame)
+        + "\n\nPASSAGES:\n" + json.dumps(texts, ensure_ascii=False))
+    try:
+        got = await ask_model(
+            prompt, limit=sum(len(t) for t in texts) + 300, spice=0.4,
+            mark={"kind": "call pivots",
+                  "for": "the caller's Speakerbox pivots reworked into the "
+                         "situation and the story (#1066)"})
+        raw = str(got or "")
+        start, end = raw.find("["), raw.rfind("]")
+        parsed = json.loads(raw[start:end + 1]) if start >= 0 and end > start else []
+        if (not isinstance(parsed, list) or len(parsed) != len(texts)
+                or not all(isinstance(x, str) for x in parsed)):
+            return texts
+        out = [" ".join(x.split())[:300] for x in parsed]
+        if any(len(x) < 12 or _looks_meta(x) for x in out):
+            return texts
+        pipeline_log("call", f"(#1066) {len(out)} caller pivot(s) reworked "
+                     "into the situation and the story",
+                     extra="\n".join(f"{a}\n  -> {b}" for a, b in zip(texts, out)))
+        return out
+    except Exception:  # noqa: BLE001
+        return texts
+
+
 # --- the random ad ------------------------------------------------------------
 def story_ad_roll(dj: dict[str, Any] | None = None) -> str:
     """#1040 (station side): 'ad' when the pair should just do an advert
@@ -71088,6 +71142,19 @@ async def dj_caller(track: dict[str, Any] | None = None,
             trace_id=_pivot_trace, parent_id=(_pivot_start or {}).get("id"),
             details={"error_type": type(exc).__name__, "caller": _cname})
         _seed_bit, _seed_extra = "", []
+    # #1066: reworked into the situation and the story before the writer
+    # sees them; the clause quotes them, so it is retold with the new words.
+    if _seed_extra and ((_themed or {}).get("text") or _pline):
+        try:
+            _story = plotline_caller_angle(_pline) if _pline else ""
+        except Exception:  # noqa: BLE001
+            _story = ""
+        _adjusted = await call_pivots_contextualize(
+            _seed_extra, str((_themed or {}).get("text") or ""), _story)
+        if _adjusted and _adjusted != _seed_extra:
+            for _o, _a in zip(_seed_extra, _adjusted):
+                _seed_bit = _seed_bit.replace(f'"{_o}"', f'"{_a}"')
+            _seed_extra = list(_adjusted)
     station_flow_event(
         "pivots", "ok" if _seed_extra else "held",
         "Selected caller follow-up material" if _seed_extra else "No random caller follow-up material was selected",
@@ -99545,17 +99612,49 @@ def paper_masthead() -> dict[str, Any]:
         "motto": "Printed on the hour, for whoever is listening",
         "founded": "2026-09-04",
         "sections": list(PAPER_SECTIONS),
+        # #1065: the station name this masthead was derived from.
+        "station": station,
+        "custom": False,
+        "note": "set custom to true to keep this masthead when the station is renamed",
     }
     try:
         if PAPER_MASTHEAD_PATH.exists():
             got = json.loads(PAPER_MASTHEAD_PATH.read_text())
             if isinstance(got, dict):
-                for k in ("masthead", "motto", "founded"):
+                for k in ("motto", "founded"):
                     if got.get(k):
                         base[k] = str(got[k])
+                # #1065: "anytime the station is renamed, update the next
+                # paper to reflect the name of the station." The seed file
+                # was written under the old name and won over the new one
+                # for good - the masthead read "The Big Apple's ... Gazette"
+                # above a "Chicken Tendo ..." headline. The file's masthead
+                # wins only when the owner marked it custom, or it was
+                # derived under this same station name; otherwise the file
+                # is refreshed so it stays there to be edited.
+                if got.get("masthead") and (
+                        got.get("custom")
+                        or str(got.get("station") or "") == station):
+                    base["masthead"] = str(got["masthead"])
+                    base["custom"] = bool(got.get("custom"))
+                elif str(got.get("station") or "") != station:
+                    _paper_masthead_write(base)
     except Exception:  # noqa: BLE001
         pass
     return base
+
+
+def _paper_masthead_write(head: dict[str, Any]) -> None:
+    """#1065: the owner's paper.json, rewritten under the current name."""
+    try:
+        PAPER_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = PAPER_MASTHEAD_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(head, indent=2) + "\n")
+        tmp.replace(PAPER_MASTHEAD_PATH)
+        pipeline_log("paper", "(#1065) the masthead follows the station's "
+                     f"new name: {head.get('masthead')}")
+    except OSError:
+        pass
 
 
 def _paper_masthead_seed() -> None:

@@ -340,3 +340,19 @@ emergency host. #1063 already says where a cut belongs. A line that will not rap
 after its three asks is cut before the recording room; the round is whole when
 every line that remains is a bar and at least half of the required lines made
 it. `coverage.cut` counts the cuts, and the pipeline log names each one.
+
+## 12. The masthead follows the name, and a caller's pivots enter the story (#1065, #1066)
+
+**#1065.** The paper's identity file (`editions/paper.json`) was seeded under the
+station's old name and won over the current one, so the masthead read one name
+above a headline that carried another. The file's masthead now wins only when
+the owner marks it `custom`, or it was derived under the same `station` name;
+otherwise it is rewritten under the current name and stays there to be edited.
+
+**#1066.** A caller's two mid-call pivots are random Speakerbox scraps. With a
+caller theme and a plotline on the air, `call_pivots_contextualize` reworks each
+scrap into the situation and the current act before the writer sees it (one
+ask, fails closed to the originals), the seed clause is retold with the new
+words, and the crystal then raps the round as usual. With the crystal off, the
+second pass does not run, rows written under it fall out of the writing
+profile, and the plain repertoires serve again.
