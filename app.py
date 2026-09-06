@@ -77679,6 +77679,13 @@ _META_TELLS = (
     "the setup you gave", "you gave me for", "here is the rewritten",
     "here's the rewritten", "rewritten line:", "sure, here",
     "i'm ready when you", "im ready when you", "let me know the line",
+    # #1064: a cohost line aired as "Actually, dimming this line through
+    # the style sample. Keep every anchor word below exactly as written"
+    # - the model recited the phone-call retry prompt and nothing caught
+    # it. These are the prompts' own words; dialogue never says them.
+    "anchor word", "style sample", "exactly as written", "speaker label",
+    "original line", "rewritten line", "rewrite this", "the line below",
+    "question or statement", "tint this", "this line through",
 )
 
 
@@ -78652,7 +78659,8 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                 for c in chunks[:2] if str(c.get("text") or "").strip())
             try:
                 retry = await ask_model(
-                    "Conservatively tint this ONE phone-call line. Keep its "
+                    "Rewrite this ONE phone-call line as a BAR - rhymed, in "
+                    "the voice of the style sample. Keep its "
                     "exact meaning, question-or-statement role, every proper "
                     "name, product, place, number and concrete object. Do not "
                     "answer it, add a person, copy the prior speaker, or add a "
@@ -78682,12 +78690,12 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                     # every coordinator pass and is still judged by _faithful.
                     anchors = sorted(_call_topic_terms(said))[:20]
                     minimal = await ask_model(
-                        "Minimally tint this one phone-call line through the "
-                        "style sample. Keep every anchor word below exactly "
-                        "as written and keep the same meaning and question "
-                        "or statement role. Change at least two other words "
-                        "or the sentence cadence, add no fact or name, and "
-                        "return only the line with no speaker label.\n\n"
+                        "Rewrite this one phone-call line as a bar in the "
+                        "voice of the style sample. Keep every anchor word "
+                        "below exactly as written and keep the same meaning "
+                        "and question or statement role. Rhyme inside the "
+                        "line, add no fact or name, and return only the "
+                        "line with no speaker label.\n\n"
                         + ("STYLE SAMPLE:\n" + sample + "\n\n"
                            if sample else "")
                         + "ANCHOR WORDS (all mandatory): "
@@ -78703,6 +78711,8 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
                     for lead in ("A:", "B:", "C:", "D:", "E:"):
                         if minimal.startswith(lead):
                             minimal = minimal[len(lead):].strip()
+                    if _looks_meta(minimal):                        # #1064
+                        minimal = ""
                     if (minimal and _faithful(minimal)
                             and " ".join(minimal.split()).lower()
                             != " ".join(said.split()).lower()):
