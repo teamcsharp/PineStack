@@ -142,19 +142,20 @@ class TintRapTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(lines[2], "A: " + self.TINTED)
         self.assertEqual(len(report["approved_lines"]), 2)
 
-    async def test_the_hold_still_stops_the_round_at_a_refused_line(self):
+    async def test_the_hold_cuts_the_refused_line_before_the_studio(self):
         units = [("A", self.SOURCE), ("B", self.SOURCE), ("A", self.SOURCE)]
         source = "\n".join(f"{m}: {t}" for m, t in units)
-        # under the hold a line is asked three times before the round stops
-        patches = self.tint_patches(True, [self.TINTED, self.BAD, self.BAD, self.BAD])
+        # under the hold a line is asked three times, then cut; the bars air
+        patches = self.tint_patches(True, [self.TINTED, self.BAD, self.BAD, self.BAD, self.TINTED])
         with ExitStack() as stack:
             stack.enter_context(mock.patch.object(app, "banter_turns", return_value=units))
             for patch in patches:
                 stack.enter_context(patch)
             report = await app.crystal_tint(source, "banter", [], critical=True)
-        self.assertFalse(report["ok"])
-        self.assertIn("turn 2 failed tint evaluation", report["why"])
-        self.assertEqual(report["partial_turns"], 1)
+        self.assertTrue(report["ok"], report.get("why"))
+        self.assertEqual(report["coverage"]["cut"], 1)
+        self.assertEqual(report["script"].split("\n"),
+                         ["A: " + self.TINTED, "A: " + self.TINTED])
 
     async def test_the_heat_clause_never_rides_a_tint_prompt(self):
         seen = []

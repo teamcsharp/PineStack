@@ -105,10 +105,13 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
                 mock.patch.object(app, "crystal_turn", side_effect=partial):
             stopped = await app.crystal_tint(script, "banter", critical=True)
 
-        self.assertFalse(stopped["ok"])
-        self.assertEqual(stopped["partial_turns"], 1)
+        # #1064: the line that would not rap is cut before the studio; the
+        # round is whole on its first bar and the cut is on the paperwork.
+        self.assertTrue(stopped["ok"], stopped.get("why"))
+        self.assertEqual(stopped["coverage"]["cut"], 1)
         self.assertEqual(stopped["progress"]["source"], source)
-        self.assertEqual(len(stopped["progress"]["turns"]), 1)
+        self.assertEqual(len(stopped["progress"]["turns"]), 2)
+        self.assertTrue(stopped["progress"]["turns"][1].get("cut"))
 
         calls.clear()
 

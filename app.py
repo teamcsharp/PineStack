@@ -79253,6 +79253,7 @@ async def crystal_tint(script: str, kind: str = "",
             _evaluations: list[dict[str, Any]] = []
             _attempted = 0
             _changed = 0
+            _cut = 0                                                # #1064
             for _turn_at, (marker, said) in enumerate(turns):
                 _said = str(said or "")
                 _said_hash = hashlib.sha1(
@@ -79357,10 +79358,25 @@ async def crystal_tint(script: str, kind: str = "",
                 if not _report.get("ok"):
                     tint_seen("refused")
                     if crystal_tint_holds():
-                        _gave_up = (f"turn {_turn_at + 1} failed tint "
-                                    "evaluation: "
-                                    + "; ".join(_report.get("faults") or []))
-                        break
+                        # #1064: CUT BEFORE THE STUDIO. One refused line
+                        # used to hold the whole round - measured: not one
+                        # row on the shelf carried a complete tint, and
+                        # rounds that were nine bars and one plain line
+                        # sat unairable behind the emergency host. #1063
+                        # says the cut belongs before the recording room;
+                        # the line that would not rap after its asks is
+                        # cut, the bars that passed are the round.
+                        _cut += 1
+                        _evaluations[-1]["cut"] = True
+                        pipeline_log("crystal", f"(#1064) turn {_turn_at + 1} "
+                                     "is cut before the studio - the bar was "
+                                     f"refused after {_tries} asks: "
+                                     + "; ".join(_report.get("faults") or [])[:200])
+                        _progress_turns.append({
+                            "marker": marker, "source": _said_hash,
+                            "text": "", "selected": True, "cut": True,
+                            "evaluation": _report})
+                        continue
                     # #1064: THE TINT YIELDS LINE BY LINE. One refused
                     # line used to end the pass and throw away every bar
                     # that had passed before it - at 100% coverage that
@@ -79395,12 +79411,19 @@ async def crystal_tint(script: str, kind: str = "",
                                          _resume_turns[len(_progress_turns):]
                                          if _gave_up else _progress_turns)}
             out["coverage"].update({
-                "attempted": _attempted, "changed": _changed,
-                "met": bool(_attempted >= required and _changed >= required),
+                "attempted": _attempted, "changed": _changed, "cut": _cut,
+                # #1064: under the hold a refused line is cut, so the round
+                # is whole when every line that REMAINS is a bar and at
+                # least half of the required lines made it.
+                "met": bool(_attempted >= required
+                            and (_changed >= required
+                                 or (_cut and _changed + _cut >= required
+                                     and _changed >= max(1, (required + 1) // 2)))),
             })
             out["evaluation"] = {
                 "ok": bool(out["coverage"]["met"]
-                           and all(r.get("ok") for r in _evaluations)),
+                           and all(r.get("ok") or r.get("cut")
+                                   for r in _evaluations)),
                 "turns": _evaluations,
             }
             if _gave_up:

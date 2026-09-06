@@ -183,8 +183,12 @@ class LegacyTintRecoveryTests(unittest.IsolatedAsyncioTestCase):
             stack.enter_context(mock.patch.object(app, "crystal_tint_holds", return_value=True))
             stack.enter_context(mock.patch.object(app, "crystal_turn", return_value=""))
             got = await app.crystal_tint(source, "banter", progress=progress, critical=True)
-        self.assertFalse(got["ok"])
+        # #1064: the refused line is cut before the studio; the good tail
+        # candidate is kept and the round is whole on its remaining bar.
+        self.assertTrue(got["ok"], got.get("why"))
+        self.assertEqual(got["coverage"]["cut"], 1)
         self.assertEqual(len(got["progress"]["turns"]), 2)
+        self.assertTrue(got["progress"]["turns"][0].get("cut"))
         self.assertEqual(got["progress"]["turns"][1]["text"], self.TINTED)
 
 

@@ -332,3 +332,11 @@ strength a bar may keep a third of the content words rather than half (a real
 bar scored 0.47; recited lyrics score 0.02 and still fail). The emergency
 continuity pair airs plain, labelled as a stopgap, only while its rapped version
 is still being recorded, so the hold can never leave dead air with no net.
+
+**The cut before the studio (#1064, last).** Under the hold, one refused line
+held the whole round; a census of the shelf found not one row with a complete
+tint, and rounds that were nine bars and one plain line sat unairable behind the
+emergency host. #1063 already says where a cut belongs. A line that will not rap
+after its three asks is cut before the recording room; the round is whole when
+every line that remains is a bar and at least half of the required lines made
+it. `coverage.cut` counts the cuts, and the pipeline log names each one.
