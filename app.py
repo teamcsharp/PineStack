@@ -934,7 +934,23 @@ DEFAULT_DJ = {
     # 144 lines offered to the tint, 1 passed; 324 of 325 stored rounds
     # "repair_required"; every phone call "NEVER MADE AIR"; the
     # emergency host read filler for three hours. Silence is no show.
-    "crystal_tint_hold": False,
+    # #1064: ...AND THEN THE OPERATOR RULED. "The crystal system has
+    # always been intended to be a hard rewrite of the material prior to
+    # being sent into the recording room. I NEED the entire universe to
+    # rhyme and rap like the crystal when I enable it." So the hold is
+    # ON by default: while a crystal is on, nothing is recorded or aired
+    # until it has passed the crystal. What makes that survivable is the
+    # grade beneath - meaning, not spelling - and the tint's own lane.
+    "crystal_tint_hold": True,
+    # #1064: how a bar is GRADED. False (the default): the bar must keep
+    # its meaning (names, numbers, a question stays a question, half the
+    # content words), must actually transform the line, and must not
+    # recite the crystal's own lyrics; the spelling-level rhyme and
+    # lexicon proofs are reported beside it, not enforced. True: the
+    # #1057 proofs block - a bar the signature cannot prove rhymes is
+    # refused. Measured on the live station: strict refused 68% of real
+    # bars, including "we live and clear - spit it, dear".
+    "crystal_grade_rhyme": False,
     # Strength answers HOW FAR a selected rewrite should bend. Coverage
     # answers HOW MANY eligible lines must be rewritten. They are separate
     # contracts: a 100% strength tint at 40% coverage is four hard bars and
@@ -1625,6 +1641,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
             "crystal_tint_pass", DEFAULT_DJ["crystal_tint_pass"])),
         "crystal_tint_hold": bool(raw_dj.get(                       # #1063
             "crystal_tint_hold", DEFAULT_DJ["crystal_tint_hold"])),
+        "crystal_grade_rhyme": bool(raw_dj.get(                     # #1064
+            "crystal_grade_rhyme", DEFAULT_DJ["crystal_grade_rhyme"])),
         "crystal_coverage": max(0, min(100, int(float(
             raw_dj.get("crystal_coverage",
                        DEFAULT_DJ["crystal_coverage"]) or 0)))),
@@ -11651,15 +11669,27 @@ def dialogue_entry(row: Any) -> dict[str, Any] | None:
 
 
 def crystal_tint_holds() -> bool:
-    """#1063: may an unproved tint hold dialogue off the air?
+    """#1063/#1064: may an unproved tint hold dialogue off the air?
 
-    Off by default. The tint is a second pass over finished dialogue;
-    what it protects is style, and dead air is not a style. With the
-    hold off, every road still runs the pass and uses a rewrite that
-    passes, but a rewrite that fails or is deferred goes out as
-    written, and a recorded round is READY on its audio alone."""
+    ON by default since #1064 - the operator's rule is that the crystal
+    is a hard rewrite BEFORE the recording room, and that while it is on
+    the whole station raps. Off, every road still runs the pass and uses
+    a rewrite that passes, but a rewrite that fails goes out as written
+    and a recorded round is READY on its audio alone."""
     try:
-        return bool(dj_settings().get("crystal_tint_hold", False))
+        return bool(dj_settings().get("crystal_tint_hold",
+                                      DEFAULT_DJ["crystal_tint_hold"]))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def crystal_grade_strict() -> bool:
+    """#1064: do the spelling-level rhyme and lexicon proofs BLOCK a bar?
+    Off by default: the grade is meaning, transformation and no recited
+    lyrics; the proofs are reported beside it."""
+    try:
+        return bool(dj_settings().get("crystal_grade_rhyme",
+                                      DEFAULT_DJ["crystal_grade_rhyme"]))
     except Exception:  # noqa: BLE001
         return False
 
@@ -24534,6 +24564,16 @@ async def recast_sweep() -> dict[str, int]:
 # again. Measured attempts run eight to sixteen minutes, so retrying one
 # immediately is the most expensive loop on the station.
 TINT_RETRY_REST = 1800.0
+
+
+def tint_retry_rest() -> float:
+    """#1064: a refused round rests half an hour while the tint yields to
+    the air, and two minutes when the hold is on - then the round cannot
+    air until it passes, so it is asked again soon, behind the untried."""
+    try:
+        return 120.0 if crystal_tint_holds() else TINT_RETRY_REST
+    except Exception:  # noqa: BLE001
+        return TINT_RETRY_REST
 # #1123: how many half-made shelf rounds one pass may finish before the
 # booth's own rounds get a turn. Renders run thirty to eighty seconds
 # and there are routinely forty rows waiting, so an unbounded loop here
@@ -24772,7 +24812,7 @@ async def tint_recovery_step() -> bool:
                 or not dialogue_row_viable(kind, row)):
             continue
         tried = max(float(audit.get("last_attempt") or 0), float(entry.get("tint_tried") or 0))
-        if tried and time.time() - tried < (6.0 if audit.get("state") == "waiting" else TINT_RETRY_REST):
+        if tried and time.time() - tried < (6.0 if audit.get("state") == "waiting" else tint_retry_rest()):
             continue
         choices.append((alt_sid(kind, row) not in wanted, tried,
                         -int(audit.get("reusable_lines") or 0), kind, row))
@@ -25742,7 +25782,12 @@ async def response_bank_draft(force: bool = False) -> int:
     """One spare-time model visit writes a batch shared by both voice casts."""
     from response_bank import PHRASES, source_response
 
-    catalog = _RESPONSES.catalog()
+    # #1064: while a crystal is on the repertoire is the crystal's own -
+    # drafts are rapped through it and tagged, and only tagged rows are
+    # served, so "I'm listening" never airs plain under the hold.
+    crystal = continuity_crystal()
+    catalog = [r for r in _RESPONSES.catalog()
+               if str(r.get("crystal") or "") == crystal]
     needed = _RESPONSES.target - len(PHRASES) - len(catalog)
     if needed <= 0:
         _RESPONSE_DRAFT_STATE["why"] = "The source response catalogue is ready"
@@ -25812,6 +25857,18 @@ async def response_bank_draft(force: bool = False) -> int:
             if not isinstance(index, int) or not 0 <= index < len(seeds):
                 continue
             clean = source_response(row, seeds[index])
+            if clean and crystal:
+                # #1064: the bar it will be said as; the plain text stays
+                # the validated, routable record.
+                try:
+                    bar = await crystal_line(clean["text"], "a listening response",
+                                             1, kind="banter")
+                except Exception:  # noqa: BLE001
+                    bar = ""
+                if tint_output_ready(bar):
+                    clean = {**clean, "said": bar, "crystal": crystal}
+                elif crystal_tint_holds():
+                    clean = None
             if clean:
                 accepted.append(clean)
             elif len(_RESPONSE_DRAFT_STATE["rejected_examples"]) < 3:
@@ -25858,8 +25915,9 @@ async def response_bank_prepare(limit: int = 2, force_draft: bool = False,
             if not voice:
                 continue
             engine = voice_engine_for(voice)
-            missing = _RESPONSES.missing_entries(voice, engine, available_only=True)
-            ready_count = len(_RESPONSES.ready(voice, engine))
+            missing = _RESPONSES.missing_entries(voice, engine, available_only=True,
+                                                 crystal=continuity_crystal())
+            ready_count = len(_RESPONSES.ready(voice, engine, continuity_crystal()))
             for index, entry in enumerate(missing):
                 identity = (voice, engine, entry["text"])
                 if identity in candidate_keys:
@@ -25885,7 +25943,8 @@ async def response_bank_prepare(limit: int = 2, force_draft: bool = False,
                 # restart restored an older asynchronously saved pantry file.
                 response_bank_invalidate_take(str(retry.get("pantry_key") or ""), retry)
             try:
-                rendered = await prep_render_line(text, who, voice, kind="response")
+                rendered = await prep_render_line(
+                    str(entry.get("said") or text), who, voice, kind="response")
                 clip = pantry_get(str((rendered or {}).get("key") or ""))
             except Exception:
                 clip = None
@@ -25911,7 +25970,8 @@ async def response_bank_prepare(limit: int = 2, force_draft: bool = False,
         # Draft after the cheapest existing takes so model availability never
         # prevents either presenter from acquiring basic listening responses.
         await response_bank_draft(force=force_draft)
-        remaining = sum(len(_RESPONSES.missing(voice, voice_engine_for(voice)))
+        remaining = sum(len(_RESPONSES.missing(voice, voice_engine_for(voice),
+                                               continuity_crystal()))
                         for who, voice in voices.items()
                         if who in ("dj", "cohost", "third") and voice)
         if remaining and why == "The current cast's response repertoire is ready":
@@ -32309,7 +32369,7 @@ def retint_row_pick() -> tuple[str, dict[str, Any] | None, bool]:
                     # turn back after the rest, behind everything that
                     # has not been tried.
                     if (time.time() - float(target.get("tint_tried") or 0)
-                            < TINT_RETRY_REST):
+                            < tint_retry_rest()):
                         continue
                     text = str(target.get("script") or target.get("text")
                                or "").strip()
@@ -32467,7 +32527,7 @@ async def retint_one() -> str:
             # retried for ever at that price.
             if isinstance(got, dict) and (
                     time.time() - float(entry.get("tint_tried") or 0)
-                    < TINT_RETRY_REST):
+                    < tint_retry_rest()):
                 continue
             want = entry
             break                       # oldest first: _LARDER is in order
@@ -57768,8 +57828,21 @@ _CONTINUITY_STATE: dict[str, Any] = {"made": 0, "last_air": 0.0, "next_pair": 0,
                                     "why": "Building a recorded host reserve"}
 
 
-def continuity_key(who: str, voice: str, engine: str, text: str) -> str:
-    return hashlib.sha256(f"{who}\0{voice}\0{engine}\0{text}".encode()).hexdigest()[:24]
+def continuity_key(who: str, voice: str, engine: str, text: str,
+                   crystal: str = "") -> str:
+    # #1064: a crystal's version of a line is its own recording.
+    return hashlib.sha256(
+        (f"{who}\0{voice}\0{engine}\0{text}"
+        + (f"\0{crystal}" if crystal else "")).encode()).hexdigest()[:24]
+
+
+def continuity_crystal() -> str:
+    """#1064: which crystal the continuity lines must be rapped through;
+    empty when the second pass is off."""
+    try:
+        return _crystal_vocab_key() if dialogue_tint_wanted() else ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def continuity_load() -> None:
@@ -57787,10 +57860,13 @@ def continuity_load() -> None:
 def continuity_pick(who: str, voice: str, text: str) -> dict[str, Any] | None:
     continuity_load()
     engine = voice_engine_for(voice)
-    row = _CONTINUITY_BANK.get(continuity_key(who, voice, engine, text)) or {}
+    crystal = continuity_crystal()                                  # #1064
+    row = _CONTINUITY_BANK.get(continuity_key(who, voice, engine, text, crystal)) or {}
     clip = row.get("clip") or {}
     name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
-    if (row.get("voice") == voice and row.get("engine") == engine and row.get("text") == text
+    if (row.get("voice") == voice and row.get("engine") == engine
+            and str(row.get("plain") or row.get("text")) == text
+            and str(row.get("crystal") or "") == crystal
             and name and (VOICE_MEDIA_DIR / name).is_file() and float(clip.get("seconds") or 0) > 0):
         return {**row, "who": who}
     return None
@@ -57810,15 +57886,28 @@ async def continuity_prepare(limit: int = 2) -> int:
                 if not voice or continuity_pick(who, voice, text):
                     continue
                 _CONTINUITY_STATE["why"] = f"Recording emergency continuity for {who}"
-                take = await prep_render_line(text, who, voice, kind="emergency_host")
+                # #1064: rapped through the crystal first, when one is on.
+                # Under the hold a line that did not rap is not recorded.
+                said, crystal = text, continuity_crystal()
+                if crystal:
+                    got = await crystal_line(text, "emergency continuity", 1,
+                                             kind="banter")
+                    if tint_output_ready(got):
+                        said = got
+                    elif crystal_tint_holds():
+                        _CONTINUITY_STATE["why"] = ("Emergency continuity waits "
+                                                    "for the crystal (#1064)")
+                        return made
+                take = await prep_render_line(said, who, voice, kind="emergency_host")
                 clip = (_PANTRY.get(str((take or {}).get("key") or "")) or {}).get("clip") or {}
                 engine = voice_engine_for(voice)
                 if (not clip.get("path") or clip.get("engine", engine) != engine
                         or clip.get("voice", voice) != voice
                         or not 0 < float(clip.get("seconds") or 0) <= 20):
                     return made
-                _CONTINUITY_BANK[continuity_key(who, voice, engine, text)] = {
-                    "who": who, "voice": voice, "engine": engine, "text": text, "clip": dict(clip),
+                _CONTINUITY_BANK[continuity_key(who, voice, engine, text, crystal)] = {
+                    "who": who, "voice": voice, "engine": engine, "text": said,
+                    "plain": text, "crystal": crystal, "clip": dict(clip),
                     "emergency": True, "coverage_credit": False, "at": time.time()}
                 try:
                     CONTINUITY_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -66796,7 +66885,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             playlist, voices,
             lambda who, context, used: _RESPONSES.take(
                 voices.get(who, ""), voice_engine_for(voices.get(who, "")),
-                context, used), away=seat_away_who())
+                context, used, crystal=continuity_crystal()), away=seat_away_who())
 
     def _turn_voice(item: dict[str, Any]) -> str | None:
         return ((caller_voice or None) if item["who"] == "caller"
@@ -67185,6 +67274,19 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                                       "the SFX guy's line did not pass the "
                                       "English door - the station is "
                                       "English (#889)")
+                        # #1064: "every single thing needs to be tinted
+                        # and spitting bars" - his mouth included. Under
+                        # the hold a quip that did not rap stays in.
+                        if _quip and dialogue_tint_wanted():
+                            _qt = await crystal_line(
+                                _quip, "the SFX guy's quip", 1, kind="banter")
+                            if tint_output_ready(_qt):
+                                _quip = _qt
+                            elif crystal_tint_holds():
+                                note_drop("drop", _quip,
+                                          "(#1064) the SFX guy's quip did "
+                                          "not rap - held under the crystal")
+                                _quip = ""
                         try:
                             _qc = await voice_render_any(
                                 _quip, _gv, who="drop") if _quip else None
@@ -72810,7 +72912,11 @@ async def ask_model(prompt: str, limit: int = 300,
     # writes ahead gets it — the caller, the memo, the painting round —
     # rather than each having to remember. Only rounds a preparer has
     # marked carry any heat at all, so nothing on the live path changes.
-    if _heat > 0.34:
+    # #1064: NEVER ON A TINT PROMPT. The clause was appended AFTER "Return
+    # ONLY the rewritten line", so the model rewrote the clause - eight of
+    # the last forty bars on the trail read "THE DIAL (#941) - there is a
+    # deep shelf of finished audio standing behind this one".
+    if _heat > 0.34 and not str((mark or {}).get("kind") or "").startswith("tint"):
         try:
             prompt = str(prompt) + heat_clause(_heat, str(
                 (_ROUND_MARK.get(_mark_key()) or {}).get("heat_road")
@@ -72983,6 +73089,26 @@ async def ask_model(prompt: str, limit: int = 300,
     return kept
 
 
+def _ollama_category(purpose: str) -> tuple[str, int]:
+    """#1064: which admission lane an ask belongs to, and its cap.
+
+    A cap of 0 means the ask is never turned away: it waits its turn on
+    the model's own lane. The TINT is such an ask. Measured with the tint
+    in the station lane: 51 deferrals in five minutes, and every deferred
+    tint ask came back as an empty answer that the grader then refused as
+    "rhetoric was not materially transformed" - the round went to air
+    plain not because the model failed to rap but because it was never
+    asked. While a crystal is on, the rewrite is the show; it queues."""
+    purpose = str(purpose or "")
+    if purpose == "interactive":
+        return "interactive", 0
+    if purpose == "response_bank":
+        return "repertoire", 1
+    if "tint" in purpose:
+        return "tint", 0
+    return "station", 2
+
+
 async def call_ollama(
     *,
     model: str,
@@ -73016,11 +73142,10 @@ async def call_ollama(
     # calls at once measured 35.24s span against 31.5s of summed
     # compute, the second spending 18.35s purely queued. Overlap
     # across DIFFERENT models is free and is what this preserves.
-    category = "interactive" if purpose == "interactive" else (
-        "repertoire" if purpose == "response_bank" else "station")
+    category, _cap = _ollama_category(purpose)
     admitted = sum(row["model"] == model and row["category"] == category
                    for row in _OLLAMA_JOBS.values())
-    if category != "interactive" and admitted >= (1 if category == "repertoire" else 2):
+    if _cap and admitted >= _cap:
         _OLLAMA_DEFERRED[model] = _OLLAMA_DEFERRED.get(model, 0) + 1
         _WRITING_DEFERRED.set(_WRITING_DEFERRED.get() + 1)
         return {"message": {"content": ""}, "deferred": True,
@@ -77619,6 +77744,14 @@ def tint_budget() -> float:
     # #1053: coverage is the other half of "every line". A crystal
     # turned up asks for more of the hour, so a hard setting does not
     # quietly run out halfway through and air the rest plain.
+    # #1064: with the hold on the rewrite IS the show - nothing airs
+    # until it is rapped - so it may spend the hour. The desk's own
+    # writing is useless plain, and it still gets the lane in turn.
+    try:
+        if crystal_tint_holds():
+            share = max(share, 0.9)
+    except Exception:  # noqa: BLE001
+        pass
     _force = crystal_force()
     _lift = 1.0 + 0.6 * _force
     return _lift * 2.0 * 3600.0 * share
@@ -77654,7 +77787,7 @@ def tint_spent() -> float:
 # number: how many lines the tint actually rewrote against how many were
 # offered to it in this hour, published on /api/tint.
 _TINT_SEEN: dict[str, float] = {"hour": 0.0, "offered": 0.0, "tinted": 0.0,
-                                "refused": 0.0}
+                                "refused": 0.0, "rounds": 0.0}
 
 
 def tint_seen(kind: str) -> None:
@@ -77663,12 +77796,18 @@ def tint_seen(kind: str) -> None:
         hour = float(int(time.time() // 3600))
         if hour != _TINT_SEEN["hour"]:
             _TINT_SEEN.update({"hour": hour, "offered": 0.0, "tinted": 0.0,
-                               "refused": 0.0})
-        _TINT_SEEN["offered"] += 1.0
-        if kind == "tinted":
+                               "refused": 0.0, "rounds": 0.0})
+        # #1064: "offered" is a model ask; "tinted"/"refused" is a LINE's
+        # verdict; "rounds" is a whole round installed. Before this the
+        # share read rounds over asks - 1 in 144 - which is not a number.
+        if kind == "offered":
+            _TINT_SEEN["offered"] += 1.0
+        elif kind == "tinted":
             _TINT_SEEN["tinted"] += 1.0
         elif kind == "refused":
             _TINT_SEEN["refused"] += 1.0
+        elif kind == "round":
+            _TINT_SEEN["rounds"] += 1.0
     except Exception:  # noqa: BLE001
         pass
 
@@ -77677,9 +77816,12 @@ def tint_coverage() -> dict[str, Any]:
     """What share of the lines offered this hour came back rewritten."""
     offered = float(_TINT_SEEN.get("offered") or 0)
     tinted = float(_TINT_SEEN.get("tinted") or 0)
+    verdicts = tinted + float(_TINT_SEEN.get("refused") or 0)
     return {"offered": int(offered), "tinted": int(tinted),
             "refused": int(_TINT_SEEN.get("refused") or 0),
-            "share": round(tinted / offered, 3) if offered else 0.0,
+            "rounds": int(_TINT_SEEN.get("rounds") or 0),
+            # #1064: lines that passed over lines graded.
+            "share": round(tinted / verdicts, 3) if verdicts else 0.0,
             "force": round(crystal_force(), 2)}
 
 
@@ -77933,6 +78075,72 @@ _TINT_EVAL_STOP = frozenset({
     "when", "where", "which", "who", "why", "with", "you", "your",
 })
 _TINT_OUTPUT_READY: dict[str, dict[str, Any]] = {}
+_CRYSTAL_VOCAB: dict[str, Any] = {"at": -1.0, "words": frozenset()}
+_CRYSTAL_VOCAB_FULL: dict[str, Any] = {"key": "", "words": frozenset(),
+                                       "building": False}
+
+
+def _crystal_vocab_key() -> str:
+    try:
+        return "|".join(sorted(
+            str(c.get("name") or "") + ":"
+            + ",".join(str(m) for m in (c.get("minds") or []))
+            for c in crystal_active()))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _crystal_vocab_build() -> frozenset:
+    """Every content word in every chunk of the crystal's minds. Runs in a
+    worker thread; the stores are already in memory."""
+    words: set[str] = set()
+    for c in crystal_active():
+        for mind in (c.get("minds") or []):
+            try:
+                chunks = _load_vectors(mind_id(str(mind))).get("chunks") or []
+            except Exception:  # noqa: BLE001
+                continue
+            for ch in chunks:
+                words.update(_tint_content(str((ch or {}).get("text") or "")))
+    return frozenset(words)
+
+
+async def crystal_vocab_warm() -> None:
+    """#1064: the lexicon check reads the writer's WHOLE vocabulary, not
+    the two passages a line was shown - "no new lexicon word drawn from
+    the crystal passage" was the commonest refusal of a real bar that
+    plainly used the writer's words. Built once per crystal, off the loop."""
+    key = _crystal_vocab_key()
+    if (not key or _CRYSTAL_VOCAB_FULL["key"] == key
+            or _CRYSTAL_VOCAB_FULL["building"]):
+        return
+    _CRYSTAL_VOCAB_FULL["building"] = True
+    try:
+        words = await asyncio.to_thread(_crystal_vocab_build)
+        _CRYSTAL_VOCAB_FULL.update({"key": key, "words": words})
+        pipeline_log("crystal", f"(#1064) the crystal's vocabulary is "
+                     f"{len(words)} words, read for the lexicon check")
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _CRYSTAL_VOCAB_FULL["building"] = False
+
+
+def _crystal_vocab() -> frozenset:
+    """#1064: the words of the crystal's sampled pool (crystal_lines), so
+    the lexicon check reads the writer's vocabulary rather than the two
+    passages a line was shown. Rebuilt when the pool is."""
+    try:
+        stamp = float(_CRYSTAL_POOL.get("at") or 0)
+        if _CRYSTAL_VOCAB["at"] == stamp:
+            return _CRYSTAL_VOCAB["words"] | _CRYSTAL_VOCAB_FULL["words"]
+        words: set[str] = set()
+        for row in (_CRYSTAL_POOL.get("rows") or []):
+            words.update(_tint_content(str((row or {}).get("text") or "")))
+        _CRYSTAL_VOCAB.update({"at": stamp, "words": frozenset(words)})
+        return _CRYSTAL_VOCAB["words"] | _CRYSTAL_VOCAB_FULL["words"]
+    except Exception:  # noqa: BLE001
+        return frozenset()
 
 
 def _tint_words(text: Any) -> list[str]:
@@ -77966,6 +78174,27 @@ def _rhyme_key(word: str, nuclei: int = 1) -> str:
     if len(groups) < nuclei:
         return ""
     return "".join(groups[-nuclei:])
+
+
+def _bar_end_pairs(text: Any) -> list[list[str]]:
+    """#1064: the last content word of each bar, paired where they rhyme.
+    Bars are split on '/', line breaks and sentence ends."""
+    bars = [b for b in re.split(r"\s*/\s*|\n+|(?<=[.!?;:])\s+", str(text or ""))
+            if b.strip()]
+    ends: list[str] = []
+    for bar in bars:
+        words = _tint_content(bar)
+        if words:
+            ends.append(words[-1])
+    out: list[list[str]] = []
+    for i in range(len(ends)):
+        for j in range(i + 1, len(ends)):
+            if ends[i] == ends[j]:
+                continue
+            k1, k2 = _rhyme_key(ends[i]), _rhyme_key(ends[j])
+            if k1 and k1 == k2:
+                out.append([ends[i], ends[j]])
+    return out[:8]
 
 
 def _rhyme_pairs(words: list[str], answering: str = "") -> dict[str, Any]:
@@ -78014,7 +78243,7 @@ def _tint_ngrams(text: Any, n: int = 6) -> set[str]:
 def tint_evaluate(source: Any, candidate: Any,
                   chunks: list[dict[str, Any]] | None = None,
                   answering: str = "", force: float | None = None,
-                  kind: str = "") -> dict[str, Any]:
+                  kind: str = "", strict: bool | None = None) -> dict[str, Any]:
     """Grade a tint on meaning, rhyme, transformation and source copying.
 
     'Different text' is not a pass. At high strength a line must preserve its
@@ -78063,8 +78292,19 @@ def tint_evaluate(source: Any, candidate: Any,
             semantic_ok = False
 
     rhyme = _rhyme_pairs(dst, answering)
+    # #1064: a bar that lands its END rhymes across its own lines - "we
+    # live and clear / spit it, dear" - is rhyming, whatever the spelling
+    # signature makes of its insides.
+    try:
+        rhyme["end_pairs"] = _bar_end_pairs(made)
+    except Exception:  # noqa: BLE001
+        rhyme["end_pairs"] = []
+    if rhyme["end_pairs"]:
+        rhyme["ok"] = True
     chunk_text = [str((c or {}).get("text") or "") for c in (chunks or [])]
-    lyric_words = set(_tint_content(" ".join(chunk_text)))
+    # #1064: the crystal's own vocabulary counts as lexicon, not only the
+    # two stanzas this line happened to be shown.
+    lyric_words = set(_tint_content(" ".join(chunk_text))) | _crystal_vocab()
     borrowed_words = sorted((dst_set - src_set) & lyric_words)
     copied: list[str] = []
     made_six = _tint_ngrams(made, 6)
@@ -78089,16 +78329,27 @@ def tint_evaluate(source: Any, candidate: Any,
                             or abs(len(made) - len(plain)) >= 8))
     rhyme_required = force >= 0.45
     lexicon_required = force >= 0.75 and bool(lyric_words)
+    # #1064: the proofs are REPORTED always and ENFORCED only under the
+    # strict grade. The default grade is meaning: the bar keeps what was
+    # said, changes how, and recites nothing.
+    strict = crystal_grade_strict() if strict is None else bool(strict)
     faults: list[str] = []
+    advisory: list[str] = []
     if not semantic_ok:
         faults.append("semantic preservation failed")
-    if force >= 0.75:
-        rhyme["ok"] = bool(rhyme["internal_pairs"]
-                           and rhyme["multisyllabic_pairs"])
+    # #1064: at full strength the bar still has to PROVE rhyme - two
+    # internal answers, a multisyllabic answer, or an answer to the prior
+    # bar (_rhyme_pairs) - but it no longer has to prove BOTH an internal
+    # and a multisyllabic pair inside every line. Measured on forty real
+    # rewrites: that double demand refused "we live and clear - spit it,
+    # dear" and every short line, and at 100% coverage one refusal threw
+    # away the whole round's bars.
     if rhyme_required and not rhyme["ok"]:
-        faults.append("no proven internal, multisyllabic or chained rhyme")
+        (faults if strict else advisory).append(
+            "no proven internal, multisyllabic or chained rhyme")
     if lexicon_required and not borrowed_words:
-        faults.append("no new lexicon word drawn from the crystal passage")
+        (faults if strict else advisory).append(
+            "no new lexicon word drawn from the crystal passage")
     if not transformed:
         faults.append("rhetoric was not materially transformed")
     if copied:
@@ -78106,6 +78357,8 @@ def tint_evaluate(source: Any, candidate: Any,
     report = {
         "ok": not faults,
         "version": 2, "strength": round(force, 3),
+        "grade": "strict" if strict else "meaning",             # #1064
+        "advisory": advisory,
         "method": "deterministic content, entity and spelling-rhyme checks",
         "limitations": "Content overlap and spelling rhyme are conservative screening signals, not a phonetic or semantic proof.",
         "semantic": {"ok": semantic_ok,
@@ -78205,9 +78458,21 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     prompt = (
         _call_fidelity
         + crystal_demand(_force)          # #1053: the dial, doing something
+        # #1064: "convert every single line into an MF Doom style rap ...
+        # utilizing his style and lexicon". The world the crystal
+        # describes was in the whole-round prompt and NOT in this one,
+        # which every banked round actually takes; and the job was
+        # phrased as colouring ("as though the writer had written it")
+        # rather than as conversion into a bar.
+        + (f"THE WORLD THIS LINE IS BEING MOVED INTO: {world}\n\n"
+           if str(world or "").strip() else "")
         + "This person says what they have to say. Keep WHAT they say and "
-        "change HOW they say it, so the line reads as though the writer "
-        "of the lyrics below had written it.\n\n"
+        "change HOW they say it: CONVERT the line into a bar of a battle "
+        "rap in that world, as if the writer of the lyrics below were "
+        "spitting it - a simile or a metaphor where the original had a "
+        "plain statement, their imagery, their bravado, their lexicon. "
+        "It must still be a line of THIS conversation: never a verse "
+        "about the writer, never their name, never their lyrics.\n\n"
         + ("HOW THAT WRITER WRITES - a passage of it, in order, as "
            "written. Study the rhymes and where they fall:\n\n"
            + "\n\n---\n\n".join(str(c.get("text") or "").strip()
@@ -78459,7 +78724,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
         except Exception:  # noqa: BLE001
             return said
     _tint_output_note(out, evaluation)
-    tint_seen("tinted")                   # #1053
+    tint_seen("round")                    # #1053/#1064: a whole round
     return out
 
 
@@ -78545,6 +78810,7 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
             return _tint_quiet(why, "the crystal has no passage long "
                                     "enough to work from", said)
         world = crystal_world_prompt()
+        await crystal_vocab_warm()                                  # #1064
         started = time.monotonic()
         # #1045: IT NO LONGER TOUCHES _PREP_DEADLINE. #1038 pushed the
         # preparer's deadline out by up to three hundred seconds so the
@@ -78598,7 +78864,9 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         evaluation = tint_evaluate(said, out, chunks, force=crystal_force(),
                                    kind=kind)
         if not evaluation.get("ok"):
+            tint_seen("refused")                                    # #1064
             return said
+        tint_seen("tinted")                                         # #1064
         _tint_output_note(out, evaluation)
         # #1042: the answer, filed against the passage that caused it.
         for _c in chunks:
@@ -78681,6 +78949,7 @@ async def crystal_tint(script: str, kind: str = "",
         if not chunks:
             out["why"] = "the active crystal has no source passages"
             return out
+        await crystal_vocab_warm()                                  # #1064
         _tint_flow("crystal", "completed", "Selected crystal passages", {
             "kind": kind, "source": text, "chunks": chunks,
             "strength": crystal_force(),
@@ -78946,12 +79215,59 @@ async def crystal_tint(script: str, kind: str = "",
                     pass
                 _report = tint_evaluate(
                     _said, fresh, chunks, answering, crystal_force(), kind)
+                # #1064: ASKED AGAIN, TOLD WHAT WAS WRONG. The graded faults
+                # of this very line ride the retry, the way a rejected
+                # round's faults already rode the next pass. Two asks when
+                # the tint yields to the air; three when the hold is on,
+                # because then the round cannot air until the line passes.
+                _tries = 3 if crystal_tint_holds() else 2
+                for _again_at in range(1, _tries):
+                    if (_report.get("ok") or tint_should_stop(critical)
+                            or time.monotonic() > _tint_due):
+                        break
+                    _faults = "; ".join(_report.get("faults") or [])
+                    try:
+                        _again = await crystal_turn(
+                            _said, world, chunks, answering, keep,
+                            _first_prompt, kind, _tint_model,
+                            lesson=(_faults + (" " + str(lesson)
+                                               if str(lesson or "").strip()
+                                               else "")))
+                    except Exception:  # noqa: BLE001
+                        _again = ""
+                    if _again:
+                        _again_report = tint_evaluate(
+                            _said, _again, chunks, answering,
+                            crystal_force(), kind)
+                        if _again_report.get("ok"):
+                            fresh, _report = _again, _again_report
                 _attempted += 1
                 _evaluations.append({"turn": _turn_at + 1, **_report})
                 if not _report.get("ok"):
-                    _gave_up = (f"turn {_turn_at + 1} failed tint evaluation: "
-                                + "; ".join(_report.get("faults") or []))
-                    break
+                    tint_seen("refused")
+                    if crystal_tint_holds():
+                        _gave_up = (f"turn {_turn_at + 1} failed tint "
+                                    "evaluation: "
+                                    + "; ".join(_report.get("faults") or []))
+                        break
+                    # #1064: THE TINT YIELDS LINE BY LINE. One refused
+                    # line used to end the pass and throw away every bar
+                    # that had passed before it - at 100% coverage that
+                    # was nearly every round. The refused line keeps its
+                    # own words, the pass carries on, and the bars that
+                    # passed are the ones that air.
+                    pipeline_log("crystal", f"(#1064) turn {_turn_at + 1} "
+                                 "airs as written - the bar was refused "
+                                 "twice: "
+                                 + "; ".join(_report.get("faults") or [])[:200])
+                    done.append(f"{marker}: {_said}")
+                    answering = _said
+                    _progress_turns.append({
+                        "marker": marker, "source": _said_hash,
+                        "text": _said, "selected": True,
+                        "evaluation": _report})
+                    continue
+                tint_seen("tinted")
                 _changed += int(" ".join(str(fresh or "").split()).lower()
                                 != " ".join(_said.split()).lower())
                 done.append(f"{marker}: {fresh}")
@@ -79051,7 +79367,13 @@ async def crystal_tint(script: str, kind: str = "",
                     f"coverage missed: {out['coverage'].get('changed', 0)} "
                     f"of {out['coverage'].get('required', 0)} required "
                     "eligible turns passed")
-                return out
+                if crystal_tint_holds() or not _changed:
+                    return out
+                # #1064: with the hold off the bars that passed are used
+                # and only the refused lines air as written. The coverage
+                # paperwork stays honest: met is False.
+                out["why"] += (" - the bars that passed are used, the "
+                               "refused lines air as written (#1064)")
             if not _moved and required:
                 out["why"] = ("every turn came back word for word - "
                               "nothing was tinted, so there is one "
@@ -79062,7 +79384,9 @@ async def crystal_tint(script: str, kind: str = "",
                 out["script"] = tinted
                 out["approved_lines"] = [hashlib.sha1(" ".join(
                     str(r.get("text") or "").split()).lower().encode("utf-8", "ignore")).hexdigest()
-                    for r in _progress_turns if r.get("selected")]
+                    for r in _progress_turns
+                    if r.get("selected")
+                    and (r.get("evaluation") or {}).get("ok")]   # #1064
                 pipeline_log(
                     "speakbox",
                     f"a round was tinted through {world or 'the crystal'} "
@@ -85281,6 +85605,8 @@ async def api_tint_state(
         "two_pass": two,
         # #1063: whether an unproved tint holds dialogue off the air.
         "hold": crystal_tint_holds(),
+        # #1064: how a bar is graded - meaning (default) or strict.
+        "grade": "strict" if crystal_grade_strict() else "meaning",
         # #1053: the dial, and what share of the hour's lines it reached.
         "force": round(crystal_force(), 2),
         "coverage": tint_coverage(),
@@ -85291,8 +85617,10 @@ async def api_tint_state(
             if crystal_tint_holds() else
             "share of eligible dialogue the tint tries to rewrite; a "
             "rewrite that fails airs as written (crystal_tint_hold is off)"),
-        "evaluator": {"checks": ["semantic preservation", "internal and multisyllabic rhyme",
-                                   "rhetorical transformation", "source phrase copying"],
+        "evaluator": {"checks": ["semantic preservation",
+                                   "internal, multisyllabic or chained rhyme",
+                                   "rhetorical transformation", "source phrase copying",
+                                   "crystal lexicon (shown passages or the pool)"],
                       "source_phrase_limit_words": 6,
                       "method": "deterministic content, entity and spelling-rhyme checks"},
         "crystals_on": [{"name": str(c.get("name") or ""),
@@ -85488,6 +85816,8 @@ async def api_tint_prefs(
         seat["crystal_tint_pass"] = bool(body.get("two_pass"))
     if body.get("hold") is not None:                                # #1063
         seat["crystal_tint_hold"] = bool(body.get("hold"))
+    if body.get("grade_rhyme") is not None:                         # #1064
+        seat["crystal_grade_rhyme"] = bool(body.get("grade_rhyme"))
     if body.get("coverage") is not None or body.get("crystal_coverage") is not None:
         try:
             requested = body.get("crystal_coverage", body.get("coverage"))
@@ -85513,6 +85843,7 @@ async def api_tint_prefs(
     dj = dj_settings()
     return {"two_pass": bool(dj.get("crystal_tint_pass")),
             "hold": bool(dj.get("crystal_tint_hold")),              # #1063
+            "grade": "strict" if dj.get("crystal_grade_rhyme") else "meaning",
             "coverage": crystal_coverage_target(),
             "crystal_coverage": crystal_coverage_target(),
             "chunks": int(dj.get("crystal_tint_chunks") or 0),
@@ -152837,6 +153168,26 @@ async function crystalTintControls(box) {
     holdRow.append(holdBox, document.createTextNode(
       " Hold untinted dialogue off the air (silence rather than a plain line)"));
     controls.insertBefore(holdRow, note);
+    // #1064: the grade. Off, a bar is judged on meaning; on, the spelling
+    // rhyme and lexicon proofs must pass too.
+    const gradeRow = el("label", "", "");
+    gradeRow.style.cssText = "display:flex;align-items:center;gap:8px;margin:4px 0";
+    const gradeBox = document.createElement("input");
+    gradeBox.type = "checkbox"; gradeBox.checked = state.grade === "strict";
+    gradeBox.setAttribute("aria-label", "Strict grade: prove rhyme by spelling");
+    gradeBox.onchange = async () => {
+      gradeBox.disabled = true;
+      try {
+        await api("/api/prefs/tint", {method:"POST", body:JSON.stringify({grade_rhyme: gradeBox.checked})});
+        note.textContent = gradeBox.checked
+          ? "Strict grade: a bar the spelling proof cannot rhyme is refused."
+          : "Meaning grade: a bar keeps its meaning and transforms the line; rhyme proofs are advisory.";
+      } catch (error) { gradeBox.checked = !gradeBox.checked; note.textContent = error.message; }
+      finally { gradeBox.disabled = false; }
+    };
+    gradeRow.append(gradeBox, document.createTextNode(
+      " Strict grade (refuse a bar the spelling proof cannot rhyme)"));
+    controls.insertBefore(gradeRow, note);
     (book.crystals || []).filter(c => c.on).forEach(c => {
       slider((c.name || c.id) + " strength", Number(c.strength || 0),
         (strength) => api("/api/crystals", {method:"POST", body:JSON.stringify({id:c.id, strength})}));

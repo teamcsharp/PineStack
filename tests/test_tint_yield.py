@@ -34,13 +34,17 @@ class TintYieldTests(unittest.IsolatedAsyncioTestCase):
                 "use": "plain", "chunks": 2, "made": 2, "keys": ["one", "two"],
                 "tint_revalidation": {"state": "repair_required"}}
 
-    def test_default_is_no_hold(self):
-        self.assertFalse(app.DEFAULT_DJ["crystal_tint_hold"])
+    def test_default_is_the_hold_and_the_meaning_grade(self):
+        # #1064: "a hard rewrite prior to being sent into the recording room"
+        self.assertTrue(app.DEFAULT_DJ["crystal_tint_hold"])
+        self.assertFalse(app.DEFAULT_DJ["crystal_grade_rhyme"])
         base = copy.deepcopy(app.DEFAULT_SETTINGS)
         base["dj"] = {"crystal_tint_pass": True}
-        self.assertFalse(app.validate_settings(base)["dj"]["crystal_tint_hold"])
-        base["dj"] = {"crystal_tint_hold": 1}
         self.assertTrue(app.validate_settings(base)["dj"]["crystal_tint_hold"])
+        base["dj"] = {"crystal_tint_hold": 0, "crystal_grade_rhyme": 1}
+        seat = app.validate_settings(base)["dj"]
+        self.assertFalse(seat["crystal_tint_hold"])
+        self.assertTrue(seat["crystal_grade_rhyme"])
 
     def test_pass_is_wanted_but_not_required_without_the_hold(self):
         a, b = self.crystal_on(False)

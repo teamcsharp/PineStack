@@ -25,9 +25,20 @@ class TintContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("screening", report["limitations"])
 
     def test_different_text_without_rhyme_does_not_pass(self):
-        report = self.grade(self.SOURCE + " That apparatus hums beside the tall window.")
+        # #1064: the spelling rhyme proof blocks under the strict grade and
+        # is advisory under the meaning grade.
+        candidate = self.SOURCE + " That apparatus hums beside the tall window."
+        report = app.tint_evaluate(self.SOURCE, candidate, self.CHUNKS,
+                                   force=1.0, strict=True)
         self.assertFalse(report["ok"])
         self.assertFalse(report["rhyme"]["ok"])
+        self.assertEqual(report["grade"], "strict")
+        lenient = app.tint_evaluate(self.SOURCE, candidate, self.CHUNKS,
+                                    force=1.0, strict=False)
+        self.assertFalse(lenient["rhyme"]["ok"])
+        self.assertIn("no proven internal, multisyllabic or chained rhyme",
+                      lenient["advisory"])
+        self.assertEqual(lenient["grade"], "meaning")
 
     def test_appending_rhyme_to_untouched_proposition_is_not_transformation(self):
         report = self.grade(self.SOURCE + " Operation meets calibration.")

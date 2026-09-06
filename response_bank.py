@@ -114,8 +114,11 @@ class ResponseBank:
         return self.rows
 
     @staticmethod
-    def key(voice, engine, text):
-        return hashlib.sha256(f"{voice}\0{engine}\0{text}".encode()).hexdigest()[:24]
+    def key(voice, engine, text, crystal=""):
+        # #1064: a crystal's version of a response is its own recording.
+        return hashlib.sha256(
+            (f"{voice}\0{engine}\0{text}" + (f"\0{crystal}" if crystal else ""))
+            .encode()).hexdigest()[:24]
 
     def _exists(self, row):
         name = str((row.get("clip") or {}).get("path") or "").rsplit("/", 1)[-1].split("?")[0]
@@ -169,11 +172,14 @@ class ResponseBank:
             self.retirements = decisions
             return True
 
-    def ready(self, voice, engine):
+    def ready(self, voice, engine, crystal=""):
+        """#1064: with a crystal named, only rows rapped through it; with
+        none, only plain rows. A plain take never serves under a crystal."""
         with self.lock:
             ready = []
             for row in self._load().values():
                 if (row.get("voice") != voice or row.get("engine") != engine
+                        or str(row.get("crystal") or "") != str(crystal or "")
                         or self._is_retired(row.get("text"))
                         or not self._exists(row)):
                     continue
@@ -184,9 +190,9 @@ class ResponseBank:
                     ready.append(usable)
             return ready
 
-    def missing(self, voice, engine):
+    def missing(self, voice, engine, crystal=""):
         return [(row["text"], row["intent"])
-                for row in self.missing_entries(voice, engine)]
+                for row in self.missing_entries(voice, engine, crystal=crystal)]
 
     def catalog(self):
         with self.lock:
@@ -212,8 +218,12 @@ class ResponseBank:
                 row = _validated_source_row(row)
                 if row is None or self._is_retired(row.get("text")):
                     continue
-                if len(drafts) >= self.target - len(PHRASES):
-                    break
+                # #1064: the cap is per crystal - a full plain catalogue
+                # does not stop the crystal's own from being drafted.
+                same = [r for r in drafts
+                        if str(r.get("crystal") or "") == str(row.get("crystal") or "")]
+                if len(same) >= self.target - len(PHRASES):
+                    continue
                 if row["text"].casefold() in present:
                     continue
                 drafts.append(dict(row))
@@ -248,9 +258,9 @@ class ResponseBank:
         temporary.write_text(json.dumps(retries, ensure_ascii=False, indent=1), encoding="utf-8")
         temporary.replace(self.retry_path)
 
-    def retry_state(self, voice, engine, text):
+    def retry_state(self, voice, engine, text, crystal=""):
         with self.lock:
-            return dict(self._retry_load().get(self.key(voice, engine, text)) or {})
+            return dict(self._retry_load().get(self.key(voice, engine, text, crystal)) or {})
 
     def reject(self, voice, engine, text, clip, pantry_key=""):
         """At most three unsuitable takes, then an explicit operator reset."""
@@ -280,15 +290,21 @@ class ResponseBank:
                 self._retry_save()
             return reset
 
-    def missing_entries(self, voice, engine, available_only=False):
-        present = {row["text"] for row in self.ready(voice, engine)}
-        candidates = [{"text": text, "intent": intent} for text, intent in PHRASES]
-        candidates.extend(self.catalog()[:max(0, self.target - len(PHRASES))])
+    def missing_entries(self, voice, engine, available_only=False, crystal=""):
+        crystal = str(crystal or "")
+        present = {row["text"] for row in self.ready(voice, engine, crystal)}
+        # #1064: the fixed acknowledgments are plain by nature; under a
+        # crystal only rows rapped through it are candidates.
+        candidates = ([] if crystal else
+                      [{"text": text, "intent": intent} for text, intent in PHRASES])
+        candidates.extend([r for r in self.catalog()
+                           if str(r.get("crystal") or "") == crystal
+                           ][:max(0, self.target - len(PHRASES))])
         missing = [row for row in candidates if row["text"] not in present
                    and not self._is_retired(row["text"])]
         if available_only:
             missing = [row for row in missing if not (
-                (retry := self.retry_state(voice, engine, row["text"])).get("suspended")
+                (retry := self.retry_state(voice, engine, row["text"], crystal)).get("suspended")
                 or float(retry.get("retry_after") or 0) > time.time())]
         return missing
 
@@ -299,7 +315,8 @@ class ResponseBank:
             metadata = next((entry for entry in self.catalog()
                              if entry["text"] == text), {})
         if metadata:
-            row.update({key: metadata[key] for key in ("source", "keywords", "anchors")
+            row.update({key: metadata[key]
+                        for key in ("source", "keywords", "anchors", "said", "crystal")
                         if key in metadata})
         if row.get("source") or row.get("intent") == "topic":
             row = _validated_source_row(row)
@@ -311,7 +328,7 @@ class ResponseBank:
             if self._is_retired(text):
                 return False
             rows = self._load()
-            rows[self.key(voice, engine, text)] = row
+            rows[self.key(voice, engine, text, str(row.get("crystal") or ""))] = row
             # Multiple casts can each retain a substantial recorded repertoire.
             for key in sorted(rows, key=lambda k: rows[k].get("recorded_at", 0))[:-4096]:
                 del rows[key]
@@ -319,15 +336,15 @@ class ResponseBank:
             temporary = self.path.with_suffix(".tmp")
             temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
             temporary.replace(self.path)
-            if self._retry_load().pop(self.key(voice, engine, text), None):
+            if self._retry_load().pop(self.key(voice, engine, text, str(row.get("crystal") or "")), None):
                 self._retry_save()
         return True
 
-    def take(self, voice, engine, context="", excluded=()):
+    def take(self, voice, engine, context="", excluded=(), crystal=""):
         with self.lock:
             surprise = bool(re.search(r"\b(?:unbelievable|surprised|amazing|incredible)\b", context, re.I))
             terms = response_terms(context)
-            available = [r for r in self.ready(voice, engine) if r["text"] not in excluded]
+            available = [r for r in self.ready(voice, engine, crystal) if r["text"] not in excluded]
             topical = []
             for row in available:
                 keywords = set(row.get("keywords") or [])
@@ -396,11 +413,11 @@ def add_listening_responses(playlist, voices, choose, away="", max_responses=3):
             response = None
         if not response:
             continue
-        text = response["text"]
+        text = str(response.get("said") or response["text"])
         result.append({"who": listener, "chunk": text, "turn_text": text,
                        "turn_end": True, "big": False, "vec": {},
                        "response_clip": dict(response["clip"]), "listening_response": True,
                        "continuation_response": continues and not item.get("turn_end")})
-        used.add(text)
+        used.add(response["text"])
         chars, inserted = 0, inserted + 1
     return result

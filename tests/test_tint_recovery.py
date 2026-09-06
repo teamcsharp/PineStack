@@ -179,6 +179,8 @@ class LegacyTintRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 stack.enter_context(mock.patch.object(app, name, return_value=value))
             for name in ("task_note", "_tint_flow", "tint_spend_note", "trail_note", "chunk_answer"):
                 stack.enter_context(mock.patch.object(app, name))
+            # #1064: the resume contract is the HOLD contract.
+            stack.enter_context(mock.patch.object(app, "crystal_tint_holds", return_value=True))
             stack.enter_context(mock.patch.object(app, "crystal_turn", return_value=""))
             got = await app.crystal_tint(source, "banter", progress=progress, critical=True)
         self.assertFalse(got["ok"])

@@ -94,10 +94,12 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app, "pipeline_log"),
             mock.patch.object(app, "banter_turns",
                               return_value=[("A", first), ("B", second)]),
+            # #1064: the resume contract is the HOLD contract.
+            mock.patch.object(app, "crystal_tint_holds", return_value=True),
         )
         with common[0], common[1], common[2], common[3], common[4], \
                 common[5], common[6], common[7], common[8], common[9], \
-                common[10], common[11], common[12], \
+                common[10], common[11], common[12], common[13], \
                 mock.patch.object(app, "tint_evaluate", side_effect=lambda source, output, *a, **k:
                                   {"ok": source != output, "faults": []}), \
                 mock.patch.object(app, "crystal_turn", side_effect=partial):

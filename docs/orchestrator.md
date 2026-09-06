@@ -238,3 +238,86 @@ no-repeat memory; and `sfx_keeper` walks the folders once a minute while the
 show is on instead of only when a sting happened to be due.
 `GET /api/sfx/history` reports `fresh`, `arrivals_48h`, `fresh_share` and
 `walked_at`.
+
+## 8. Every line a bar (#1064)
+
+Tinting, by the operator's definition: while a crystal is on, every line is
+converted into a battle rap in that crystal's lexicon, rhetoric, simile and
+metaphor, until the crystal is switched off. Three things stood in the way,
+all measured on the station's own trail. The whole-round pass stopped at the
+first line the grader refused and threw away every bar that had passed, so at
+100% coverage a single refusal cost the round. The grader demanded both an
+internal and a multisyllabic rhyme inside every line, short ones included.
+And the writer's heat clause was appended after "return only the rewritten
+line", so the model rewrote the clause: eight of forty bars read "THE DIAL
+(#941)".
+
+Now a refused line is asked once more with its own graded faults, and if it is
+refused again it keeps its words while the pass carries on; the bars that passed
+are the ones that air, and the coverage paperwork stays honest (`met` is false).
+The per-line prompt names the crystal's world and the job as conversion into a
+bar. The grader accepts proven rhyme of any of its three kinds and reads the
+crystal's sampled vocabulary as lexicon, not only the two passages shown. The
+heat clause never rides a tint prompt. `GET /api/tint` `coverage.share` is now
+lines that passed over lines graded, with `rounds` counted separately. With
+`crystal_tint_hold` on, the #1057 contract still stops a round at a refused line.
+
+## 9. The universe rhymes (#1064, continued)
+
+The operator's rule, restated: the crystal is a hard rewrite of the material
+before it reaches the recording room, and while a crystal is on, everything on
+the station raps in its style. Four more things made that impossible, all
+measured on the live station after section 8 shipped.
+
+- **The tint was being turned away, not refused.** Tint asks sat in the
+  station's writer lane (two admitted per model, the rest deferred with an
+  empty answer), so a deferred ask came back unchanged and the grader refused
+  it as "not transformed". 51 deferrals in five minutes. Tint asks now have
+  their own lane and wait their turn; they are never deferred.
+- **Refusals that were rhymes.** A couplet that lands its end rhymes ("we live
+  and clear / spit it, dear") now counts. The lexicon check reads the crystal's
+  whole vocabulary, built once per crystal in a worker thread, instead of the
+  two passages a line was shown.
+- **One ask per line.** Under the hold a refused line is asked three times
+  with its own graded faults; without it, twice.
+- **The rewrite starved itself.** The tint's share of the hour is 90% while the
+  hold is on (nothing airs until it is rapped, so the desk's plain writing is
+  not the product), and a refused round rests two minutes instead of thirty.
+
+The dial that makes the rule binding is `crystal_tint_hold`: on, nothing is
+recorded or aired until it has passed the crystal. `GET /api/tint` reports the
+line-level pass rate; watch `coverage.share` after switching a crystal on.
+
+## 10. The hold is the rule, and the grade is meaning (#1064, final)
+
+Two dials now govern the crystal, both under `dj` in settings and on the tint
+panel. `crystal_tint_hold` is ON by default: while a crystal is on, nothing is
+recorded or aired until it has passed the crystal, which is the operator's
+definition of tinting. `crystal_grade_rhyme` is OFF by default: a bar is
+accepted when it keeps what was said (names, numbers, a question stays a
+question, half the content words), actually transforms the line, and recites
+none of the crystal's own lyrics; the spelling-level rhyme and lexicon proofs
+are reported as advisory beside it. Turn `crystal_grade_rhyme` on to make those
+proofs block again, as they did under #1057. Measured on the live station, the
+strict grade refused 68% of real bars, including couplets that plainly rhyme,
+and at 100% coverage a single refusal held the whole round; that is why the
+default is meaning.
+
+What the hold costs: rounds recorded before the rule under the old grade are
+held until the repair clock re-tints them, and the reserve runs only as fast as
+the tint lane can rap. The emergency continuity lines stay plain by design.
+
+## 11. Every road, including the small ones (#1064, roads)
+
+"Every dialogue, phone call, upstairs message, orchestrator request, newspaper
+post, every single thing needs to be tinted and spitting bars." Three roads
+still spoke plain after the hold went on, and each now goes through the crystal:
+the SFX guy's quips (rendered directly, never through the pre-record door; under
+the hold a quip that did not rap is dropped rather than aired plain), the
+emergency continuity lines (recorded plain by design; now rapped at recording
+time, keyed by crystal, and re-recorded when the crystal changes), and the
+listening responses (the response bank keeps a crystal-tagged repertoire: drafts
+are rapped and tagged, only tagged takes serve while that crystal is on, and the
+eight fixed acknowledgments belong to the plain repertoire only). The newspaper
+already tints through `paper_tint_story`, and the meaning grade applies there
+too.
