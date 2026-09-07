@@ -6862,6 +6862,15 @@ async def box_hold_drain_one() -> dict[str, Any] | None:
     """Serialize head selection, verified playback and exact-row retirement."""
     if radio_paused():
         return None
+    # 2026-09-07: a box whose firmware is provably not running (every
+    # port refuses) cannot take a held line; trying takes the air floor
+    # for the length of a verified-playout wait, six rows deep, over and
+    # over. The shelf keeps its rows until the wire answers again.
+    try:
+        if _WIRE_LAST.get("at") and nabu_firmware_down(_WIRE_LAST):
+            return None
+    except Exception:  # noqa: BLE001
+        pass
     owned = await _floor_take("the ordered held-dialogue queue")
     try:
         async with _HOLD_DRAIN_LOCK:
@@ -22111,6 +22120,11 @@ def dj_state() -> dict[str, Any]:
                 or (len(_BOX_HOLD) >= 2
                     and time.time() - _BOX_LAST_OK[0] > 120)),
             "held": len(_BOX_HOLD),
+            # 2026-09-07: WHO HOLDS THE AIR FLOOR, and for how long - the
+            # one fact the starvation hunt could not read from outside.
+            "floor": str(_FLOOR_OWNER.get("label") or ""),
+            "floor_for": (round(time.time() - float(_FLOOR_OWNER.get("at") or 0))
+                          if _FLOOR_OWNER.get("task") is not None else 0),
             "silent_for": round(time.time() - _BOX_LAST_OK[0]),
             "last_ratio": _LAST_PLAYOUT.get("ratio"),
             "why": (_SPEAK_LAST.get("why") or ""),
