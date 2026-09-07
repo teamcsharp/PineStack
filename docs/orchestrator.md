@@ -375,3 +375,20 @@ with no rhyme by either reading is refused ("no rhyme evidence"). The prompt
 asks for bars split by " / " with end rhymes; the spoken form turns the marks
 into commas and strips markdown. The evaluator is version 3, so every round
 graded before this re-grades and a plain line in it is cut or re-asked.
+
+## 14. The crystal audit (#1064, closing)
+
+A road-by-road check that everything the station says or prints goes through
+the crystal, in its world and lexicon, and lands a rhyme. Found and fixed: the
+whole-round prompt never named the world or how hard to push (only the per-line
+prompt did); the paper's tint was capped at six stories, ten paragraphs and
+ninety seconds, so 20 of 23 stories were deferred; 13 of 38 crystal-tagged
+listening responses had been drafted under the old grade and did not rhyme (they
+are retagged and never serve); the empty-reserve rule had dropped the pair to
+the fast model (the pair keeps the deep one); and the round's tint deadline was
+sized for one fast ask per line, so on the deep model every caller round expired
+before its first bar (it is sized per model and per ask now). Verified live
+through `POST /api/tint/try`: a three-turn phone call came back with every turn
+rhymed and borrowing DOOM lexicon in 47 seconds. The LCD's paused-state
+cupboard view is a renderer change; the display firmware shows whatever the app
+draws and needs no update, the app needs a relaunch.
