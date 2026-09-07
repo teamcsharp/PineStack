@@ -21021,8 +21021,13 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         # `note` rides the same channel (#689): a standing instruction about
         # the SITUATION — "the record is already turning under you" — which
         # belongs with the delivery directive, not with the task.
-        spoken = spoken_text(await dj_line(
-            kind, track, extra, seed, direct=perf_directive(vec) + note))
+        # 2026-09-07: the WRITE runs with the floor lent out too - an
+        # intro held the air for 152s while its draft waited on the
+        # model lane (the floor is for the render and the play).
+        spoken = spoken_text(await _floor_lend(
+            f"a {kind} line from {who} (back from its write)",
+            dj_line(kind, track, extra, seed,
+                    direct=perf_directive(vec) + note)))
         if not by_hand:
             spoken = inject_disfluencies(spoken, vec, seed=who)
     # A line with no letters in it is not a line. An interruption written as
