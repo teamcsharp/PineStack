@@ -25919,6 +25919,21 @@ async def response_bank_prepare(limit: int = 2, force_draft: bool = False,
     why = "The current cast's response repertoire is ready"
     async with _RESPONSE_WARM_LOCK:
         voices = await session_voices()
+        # #1064 audit: 13 of 38 crystal-tagged responses were drafted under
+        # the old grade and do not rhyme. They are retagged so they never
+        # serve under the crystal (audio kept), and the draft fills anew.
+        _ck = continuity_crystal()
+        if _ck:
+            try:
+                _retagged = await asyncio.to_thread(
+                    _RESPONSES.regrade, _ck,
+                    lambda t: bool(rap_rhyme_evidence(t).get("ok")))
+                if _retagged:
+                    pipeline_log("crystal", f"(#1064) {_retagged} listening "
+                                 "response(s) retagged - they do not rhyme "
+                                 "under the crystal")
+            except Exception:  # noqa: BLE001
+                pass
         # A persisted source catalogue is shared; the actual performances are
         # always keyed to each presenter's current voice and recording engine.
         _RESPONSES.target = max(16, min(256, int(
@@ -77974,7 +77989,10 @@ def tint_model_for(kind: str = "") -> str:
     until it is rapped, and the fast model rapping every road beats the
     deep one rapping the pair while the emergency host reads filler."""
     try:
-        if crystal_tint_holds() and prepared_seconds() < TINT_FAMINE_SECONDS:
+        # #1064 audit: the pair (banter, the phone) keeps the deep model -
+        # "dope bars" outrank a fuller reserve; the other roads go fast.
+        if (crystal_tint_holds() and prepared_seconds() < TINT_FAMINE_SECONDS
+                and str(kind or "") not in TINT_DEEP_ROADS):
             return tint_fast_model() or tint_model_now()
     except Exception:  # noqa: BLE001
         pass
@@ -79453,7 +79471,12 @@ async def crystal_tint(script: str, kind: str = "",
         _tint_model = (tint_fast_model() if critical
                        else tint_model_for(kind))
         armed = (
-            "The people below say what they have to say. Keep every word "
+            # #1064 audit: the whole-round ask showed the writer's stanzas
+            # but never named the WORLD (supervillain logic, food as
+            # metaphor...) or how hard to push; only the per-line ask did.
+            crystal_demand(crystal_force())
+            + "THE WORLD THIS DIALOGUE IS BEING MOVED INTO: " + world + "\n\n"
+            + "The people below say what they have to say. Keep every word "
             "of WHAT they say, and change HOW they say it so that it "
             "reads as though the writer of the lyrics below had written "
             "it.\n\n"
@@ -99877,6 +99900,21 @@ PAPER_TINT_PARAS = int(os.getenv("PAPER_TINT_PARAS", "10"))
 # printable, so it keeps its own clock rather than the writing budget's
 # leftovers (which are negative by then - the desks spend the lot).
 PAPER_TINT_SECONDS = float(os.getenv("PAPER_TINT_SECONDS", "90"))
+
+
+def paper_tint_caps() -> tuple[int, int, float]:
+    """(stories, paragraphs, seconds) the paper's tint may spend.
+
+    #1064: "every newspaper post" is a bar while a crystal is on, so under
+    the hold the caps open to every story, sixty paragraphs and ten
+    minutes; measured before this, 20 of 23 stories were "deferred: press
+    cap" at six stories, ten paragraphs and ninety seconds."""
+    try:
+        if crystal_tint_holds():
+            return 999, max(PAPER_TINT_PARAS, 60), max(PAPER_TINT_SECONDS, 600.0)
+    except Exception:  # noqa: BLE001
+        pass
+    return PAPER_TINT_STORIES, PAPER_TINT_PARAS, PAPER_TINT_SECONDS
 _PAPER_PRESS: dict[str, Any] = {"started": 0.0, "deadline": 0.0,
                                 "writer_calls": 0, "writer_refused": 0,
                                 "tinted_stories": 0, "tinted_paras": 0,
@@ -102234,7 +102272,7 @@ def paper_tint_left() -> float:
     """#1024: seconds left in the tint's OWN window. Armed by paper_print
     the moment the desks are done; unarmed means the full window."""
     at = float(_PAPER_PRESS.get("tint_deadline") or 0)
-    return PAPER_TINT_SECONDS if not at else at - time.time()
+    return paper_tint_caps()[2] if not at else at - time.time()
 
 
 def _paper_tint_why(reason: str) -> None:
@@ -102314,8 +102352,9 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
         report = paper_tint_plan(story)
     if not report["required"]:
         return False
-    if (int(_PAPER_PRESS.get("attempted_stories") or 0) >= PAPER_TINT_STORIES
-            or int(_PAPER_PRESS.get("attempted_paras") or 0) >= PAPER_TINT_PARAS):
+    _cap_stories, _cap_paras, _ = paper_tint_caps()                   # #1064
+    if (int(_PAPER_PRESS.get("attempted_stories") or 0) >= _cap_stories
+            or int(_PAPER_PRESS.get("attempted_paras") or 0) >= _cap_paras):
         report["status"] = "deferred: press cap"
         _paper_tint_why("the newspaper tint attempt cap was reached")
         return False
@@ -102332,7 +102371,7 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
     for unit in paper_tint_units(story):
         if report["changed"] >= report["required"]:
             break
-        if (int(_PAPER_PRESS.get("attempted_paras") or 0) >= PAPER_TINT_PARAS
+        if (int(_PAPER_PRESS.get("attempted_paras") or 0) >= _cap_paras
                 or paper_tint_left() <= 0):
             _paper_tint_why("the newspaper tint cap or deadline was reached")
             break
@@ -105354,7 +105393,7 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
         tinted_by = paper_tinted_by()
         if tinted_by:
             # #1024: the tint's own clock starts here, once every desk is in.
-            _PAPER_PRESS["tint_deadline"] = time.time() + PAPER_TINT_SECONDS
+            _PAPER_PRESS["tint_deadline"] = time.time() + paper_tint_caps()[2]
             _PAPER_PRESS["tint_why"] = ""
             # The prose first, the boards last: the cap is for the writing.
             _prose = ("on-air", "the-phones", "the-interview", "the-wire",

@@ -146,6 +146,53 @@ class ResponseBank:
         with self.lock:
             return [dict(row) for row in self._retired_load().values()]
 
+    def regrade(self, crystal, judge):
+        """#1064: rows and drafts tagged with `crystal` whose spoken bar
+        fails `judge` are retagged "<crystal>:unrhymed" - never served
+        under that crystal, never served plain, audio kept. Returns how
+        many were retagged."""
+        crystal = str(crystal or "")
+        if not crystal:
+            return 0
+        moved = 0
+        with self.lock:
+            rows = self._load()
+            for row in rows.values():
+                if str(row.get("crystal") or "") != crystal:
+                    continue
+                said = str(row.get("said") or row.get("text") or "")
+                try:
+                    good = bool(judge(said))
+                except Exception:
+                    good = True
+                if not good:
+                    row["crystal"] = crystal + ":unrhymed"
+                    moved += 1
+            drafts = self.catalog()
+            changed = 0
+            for row in drafts:
+                if str(row.get("crystal") or "") != crystal:
+                    continue
+                said = str(row.get("said") or row.get("text") or "")
+                try:
+                    good = bool(judge(said))
+                except Exception:
+                    good = True
+                if not good:
+                    row["crystal"] = crystal + ":unrhymed"
+                    changed += 1
+            if moved:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = self.path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(rows, ensure_ascii=False, indent=1), encoding="utf-8")
+                temporary.replace(self.path)
+            if changed:
+                temporary = self.catalog_path.with_suffix(".tmp")
+                temporary.write_text(json.dumps(drafts, ensure_ascii=False, indent=1), encoding="utf-8")
+                temporary.replace(self.catalog_path)
+                self.drafts = drafts
+        return moved + changed
+
     def _is_retired(self, text):
         return self._retirement_key(text) in self._retired_load()
 
