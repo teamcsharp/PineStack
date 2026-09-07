@@ -16548,6 +16548,16 @@ async def _floor_take(label: str = "") -> bool:
     return True
 
 
+def _floor_stage(label: str) -> None:
+    """2026-09-07: rename the floor hold as a line moves through its
+    stages, so the state can say WHERE a long hold is."""
+    try:
+        if _FLOOR_OWNER.get("task") is asyncio.current_task():
+            _FLOOR_OWNER["label"] = str(label)[:120]
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _floor_drop(owned: bool) -> None:
     if not owned:
         return
@@ -16909,6 +16919,31 @@ async def _deaf_box_restart() -> None:
         pass
 
 
+def box_firmware_down_now() -> bool:
+    """2026-09-07: the wire's own verdict - every port refuses, the
+    firmware is not running. A box in that state cannot take a line, so
+    no road knocks on it: the line goes to the page, the floor is not
+    held for a verified-playout wait that can never verify."""
+    try:
+        return bool(_WIRE_LAST.get("at") and nabu_firmware_down(_WIRE_LAST))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+_ROUTE_AROUND_SAID = [0.0]
+
+
+def _route_around_note(what: str) -> None:
+    try:
+        if time.time() - _ROUTE_AROUND_SAID[0] > 240:
+            _ROUTE_AROUND_SAID[0] = time.time()
+            pipeline_log("air", f"(#1156) the box firmware is down - {what} "
+                                "goes to the page; pull the box's power for "
+                                "ten seconds to bring it back")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def page_carries_live(voice_to: str, to_box: bool = False,
                       box_down: bool = False) -> bool:
     """#1118: does the PAGE get this clip live, as well as the box?
@@ -16937,6 +16972,8 @@ def page_carries_live(voice_to: str, to_box: bool = False,
             return True                 # rescue: the box cannot take it
         if not box_talk_ok():
             return True                 # rescue: the switch is off
+        if str(voice_to or "box") in ("box", "both") and box_firmware_down_now():
+            return True                 # rescue: routed around a dead box
     except Exception:  # noqa: BLE001
         return True                     # any doubt: do not lose the line
     return False
@@ -20986,6 +21023,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # holding the speaker. Six of those today and none before (#206).
     if not spoken or not re.search(r"[^\W_]", spoken):
         return ""
+    _floor_stage(f"a {kind} line from {who} (written)")
     # Never say the same thing twice in a row (#494): the model sometimes
     # re-emits a line it just aired — especially when a round is seeded from
     # the same swath. A near-duplicate of a recent line is dropped, not aired.
@@ -21120,6 +21158,9 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
         return ""
 
     to_box = voice_to in ("box", "both")
+    if to_box and box_firmware_down_now():
+        to_box = False                  # #1156: route around a dead box
+        _route_around_note(f"a {kind} line")
     line_id = uuid.uuid4().hex[:6]
     page_delivery = ""
     # A person outranks the show. The box is one speaker and an announce cuts
@@ -21358,6 +21399,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             # then letting Home Assistant synthesise the same words again
             # was the double-synthesis bug wearing a new hat (#206, #270).
             if clip:
+                _floor_stage(f"a {kind} line from {who} (playing on the box)")
                 played = await _play_on_box(clip["path"], clip["sig"])
                 # The show WAITS for its speaker (#318): a declined
                 # announce means pause and knock again — the pair talking
@@ -55501,7 +55543,8 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
             return
         vto = _RADIO.get("voice_to") or "box"
         try:
-            to_box = vto in ("box", "both") and box_talk_ok()
+            to_box = (vto in ("box", "both") and box_talk_ok()
+                      and not box_firmware_down_now())
         except Exception:  # noqa: BLE001
             to_box = vto in ("box", "both")
         got = await dj_sting(to_box, who="record")
@@ -67968,6 +68011,9 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 if not box_talk_ok() and vto in ("box", "both"):
                     vto = "here"                       # the switch is off (#638)
                 to_box = vto in ("box", "both")
+                if to_box and box_firmware_down_now():
+                    to_box = False                  # #1156: route around a dead box
+                    _route_around_note("a round")
                 box_down = (time.time() < float(_BOX_DOWN.get("until") or 0)
                             or len(_BOX_HOLD) >= 6)
                 stream_label = ("☎ " + caller_name if caller_name

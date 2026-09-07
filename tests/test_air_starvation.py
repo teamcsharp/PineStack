@@ -185,6 +185,23 @@ class FloorLendTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(app._FLOOR_LOCK.locked())
 
 
+class DeadBoxTests(unittest.TestCase):
+    def test_a_firmware_down_box_is_routed_around_and_the_page_carries(self):
+        with (mock.patch.object(app, "_WIRE_LAST", {"at": 1.0, "state": "refused"}),
+              mock.patch.object(app, "nabu_firmware_down", return_value=True),
+              mock.patch.object(app, "box_talk_ok", return_value=True),
+              mock.patch.dict(app._RADIO, {"monitor": False})):
+            self.assertTrue(app.box_firmware_down_now())
+            self.assertTrue(app.page_carries_live("both", to_box=False, box_down=False))
+            self.assertTrue(app.page_carries_live("box", to_box=False, box_down=False))
+        with (mock.patch.object(app, "_WIRE_LAST", {"at": 1.0, "state": "ok"}),
+              mock.patch.object(app, "nabu_firmware_down", return_value=False),
+              mock.patch.object(app, "box_talk_ok", return_value=True),
+              mock.patch.dict(app._RADIO, {"monitor": False})):
+            self.assertFalse(app.box_firmware_down_now())
+            self.assertFalse(app.page_carries_live("both", to_box=True, box_down=False))
+
+
 class StarvationTests(unittest.TestCase):
     def test_four_quiet_minutes_open_the_live_writer_once_per_rest(self):
         import time as _t
