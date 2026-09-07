@@ -14932,6 +14932,11 @@ def _protected_media_keys() -> set[str]:
             keys.add(key)
     # #1056: reusable listening responses are a small permanent repertoire.
     keys.update(_RESPONSES.protected_files())
+    # Gold bars: rhymed lines kept to be fired again.
+    try:
+        keys.update(gold_protected_files())
+    except Exception:  # noqa: BLE001
+        pass
     keys.update(str(row.get("url") or "").split("?", 1)[0].rsplit("/", 1)[-1]
                 for row in page_recovery_read())
     # The emergency reserve is durable even after its original pantry row
@@ -55651,6 +55656,95 @@ def is_binned(text: str) -> bool:
 # can mean never, and so a line that WORKED can come back on a real rotation
 # instead of at random.
 LINE_PRINTS_PATH = data_path("line_prints.json")
+# "If lines are cooked up to the point that they are rhyming, I want those
+# stored for double the amount of time so they can be reused... those are
+# the lines I want to hear fired repeatedly and strategically with SFX
+# clips at the end." A rhymed line that aired with a finished take is GOLD:
+# its take is protected from the media sweep, its print row lives twice as
+# long and may come round twice as often, and at a sting moment a gold bar
+# from the other seat fires first, the sting after it.
+GOLD_PATH = data_path("gold_bars.json")
+GOLD_MAX = 400
+GOLD_FIRE_RATE = 0.5                 # share of sting moments that fire a bar
+GOLD_REST = 1200.0                   # the same bar rests twenty minutes
+_GOLD: dict[str, Any] = {"loaded": False, "rows": []}
+
+
+def _gold_rows() -> list[dict[str, Any]]:
+    if not _GOLD["loaded"]:
+        rows: list[dict[str, Any]] = []
+        try:
+            got = json.loads(GOLD_PATH.read_text())
+            rows = [r for r in got if isinstance(r, dict)] if isinstance(got, list) else []
+        except Exception:  # noqa: BLE001
+            rows = []
+        _GOLD.update({"loaded": True, "rows": rows})
+    return _GOLD["rows"]
+
+
+def _gold_save() -> None:
+    try:
+        GOLD_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = GOLD_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(_gold_rows()[-GOLD_MAX:], ensure_ascii=False))
+        tmp.replace(GOLD_PATH)
+    except OSError:
+        pass
+
+
+def gold_note(who: str, text: str, path: str, seconds: float) -> bool:
+    """A rhymed line that just aired with its take - kept as gold."""
+    try:
+        text = " ".join(str(text or "").split())
+        name = str(path or "").rsplit("/", 1)[-1].split("?")[0]
+        if not text or not name or not rap_rhyme_evidence(text).get("ok"):
+            return False
+        key = hashlib.sha1(text.lower().encode("utf-8", "ignore")).hexdigest()[:16]
+        rows = _gold_rows()
+        for row in rows:
+            if row.get("key") == key:
+                row.update({"path": name, "seconds": float(seconds or 0), "who": who,
+                            "at": time.time()})
+                _gold_save()
+                return True
+        rows.append({"key": key, "who": str(who or "dj"), "text": text[:400], "path": name,
+                     "seconds": float(seconds or 0), "at": time.time(), "fired": 0,
+                     "last": 0.0})
+        del rows[:-GOLD_MAX]
+        _gold_save()
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def gold_pick(exclude_who: str = "") -> dict[str, Any] | None:
+    """The bar to fire: another seat's, rested, least fired, take on disk."""
+    try:
+        now = time.time()
+        pool = [r for r in _gold_rows()
+                if str(r.get("who") or "") != str(exclude_who or "")
+                and now - float(r.get("last") or 0) >= GOLD_REST
+                and (VOICE_MEDIA_DIR / str(r.get("path") or "")).is_file()]
+        if not pool:
+            return None
+        least = min(int(r.get("fired") or 0) for r in pool)
+        pool = [r for r in pool if int(r.get("fired") or 0) == least]
+        return random.choice(pool)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def gold_fired(row: dict[str, Any]) -> None:
+    try:
+        row["fired"] = int(row.get("fired") or 0) + 1
+        row["last"] = time.time()
+        _gold_save()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def gold_protected_files() -> set[str]:
+    return {str(r.get("path") or "") for r in _gold_rows() if r.get("path")}
 _PRINTS_LOCK = RLock()
 PRINTS_MAX = 8000     # #824: a disk bound — the WINDOW is 24h by age
 # How long a KEPT line waits before it may air again: an hour the first time,
@@ -55747,7 +55841,8 @@ def _prints_write(rows: list[dict[str, Any]]) -> None:
         tmp = LINE_PRINTS_PATH.with_suffix(".tmp")
         _now = time.time()
         _kept = [r for r in rows
-                 if _now - float(r.get("last") or r.get("at") or 0) < 86400]
+                 if _now - float(r.get("last") or r.get("at") or 0)
+                 < (172800 if r.get("gold") else 86400)]        # gold lives twice as long
         # #901: PRINTS_MAX trims from the FRONT, so on a busy night the
         # disk bound could retire a line that is still inside the
         # rejection window — the one thing this ledger exists to
@@ -55798,7 +55893,11 @@ def print_remember(text: str, who: str = "", kind: str = "") -> None:
                 rows.append(rows.pop(at))
                 _prints_write(rows)
                 return
-        rows.append({"key": key, "who": who, "kind": kind,
+        try:
+            _gold = bool(rap_rhyme_evidence(text).get("ok"))
+        except Exception:  # noqa: BLE001
+            _gold = False
+        rows.append({"key": key, "who": who, "kind": kind, "gold": _gold,
                      "first": now, "last": now, "said": 1, "blocked": 0,
                      # #no-repeats: 60 was a SORTED prefix, so the kept 60 were an
                      # arbitrary alphabetical slice and a long line compared
@@ -55931,7 +56030,8 @@ def air_repeat_check(text: str, who: str = "",
             if row.get("key") != key:
                 continue
             age = now - float(row.get("last") or row.get("at") or 0)
-            if age >= window:
+            # a gold bar may come round twice as often
+            if age >= (window / 2.0 if row.get("gold") else window):
                 return _repeat_flow_verdict(text, who, kind, verdict, "exact", "outside window")
             verdict.update({"block": True, "age": age,
                             "why": f"word for word {int(age / 60)} min ago"})
@@ -55997,6 +56097,10 @@ def rerun_check(text: str, who: str = "", kind: str = "",
         if row.get("key") == key:
             if window and now - float(row.get("last") or 0) >= window:
                 return _repeat_flow_verdict(text, who, kind, verdict, "exact and fuzzy", "outside window")
+            # a gold bar (rhymed) is the gold standard: it may come round
+            # again after half the rejection window, at any length.
+            if row.get("gold") and now - float(row.get("last") or 0) >= repeat_window() / 2.0:
+                return _repeat_flow_verdict(text, who, kind, verdict, "exact and fuzzy", "gold bar outside its window")
             verdict.update({"block": True,
                             "why": ("said word for word inside the hour"
                                     if window else
@@ -67322,6 +67426,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
                     aired_items.append(item)                          # #no-repeats
+                    # Gold: a rhymed turn with its take is kept to fire again.
+                    if item.get("turn_end") and item["who"] in ("dj", "cohost", "third"):
+                        try:
+                            gold_note(item["who"], str(item.get("turn_text") or item["chunk"]),
+                                      str(clip.get("path") or key), _clip_seconds(clip["path"]))
+                        except Exception:  # noqa: BLE001
+                            pass
                     # #833: sting_due() existed, had a dial, had TESTS —
                     # and no live path ever called it. The samples now
                     # punch into the stream between lines, at the dial's
@@ -67334,6 +67445,20 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     _keep_mic = bool(caller_name or talk_is_incessant())
                     _sting = "" if _keep_mic else sting_due()
                     if _sting:
+                        # Gold: a rhymed bar that already aired comes back
+                        # from the other seat, the sting lands after it.
+                        _gold = (gold_pick(exclude_who=item["who"])
+                                 if random.random() < GOLD_FIRE_RATE else None)
+                        if _gold:
+                            seg.append(str(VOICE_MEDIA_DIR / str(_gold.get("path") or "")))
+                            transcript.append((str(_gold.get("who") or "dj"),
+                                               str(_gold.get("text") or ""),
+                                               float(_gold.get("seconds") or 0)))
+                            seg_ix.append(len(seg) - 1)
+                            turn_ix.append(-1)
+                            gold_fired(_gold)
+                            pipeline_log("air", "a gold bar fires again, sting to "
+                                         f"follow: {str(_gold.get('text') or '')[:70]}")
                         seg.append(str(_sting))
                         _STING_AT[0] = time.time()
                         # #830: the sting is IN the timeline — a board
@@ -78684,7 +78809,19 @@ def tint_evaluate(source: Any, candidate: Any,
         r"\b(?:no|not|never|without|cannot|can't|won't)\b", made, re.I))
     # #1064: a rapper drops the g - "bleedin'" keeps the name "Bleeding".
     _made_names = re.sub(r"in'(?=\W|$)", "ing", made)
-    entity_ok = numbers == set(re.findall(r"\b\d+(?:\.\d+)?\b", made)) \
+    # ...and spells the numbers out: "nine-fifty-nine" answers "9:59". A bar
+    # with no digits keeps the numbers when it carries at least as many
+    # number words as the source had numbers.
+    _made_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", made))
+    _number_words = len(re.findall(
+        r"\b(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+        r"thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|twenty|"
+        r"thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred|thousand|million|"
+        r"o'clock|noon|midnight)\b", made, re.I))
+    numbers_ok = (numbers == _made_numbers
+                  or (bool(numbers) and not _made_numbers
+                      and _number_words >= len(numbers)))
+    entity_ok = numbers_ok \
         and all(re.search(rf"\b{re.escape(n)}\b", _made_names, re.I) for n in names)
     # #1064: at full strength a bar that keeps every name, number,
     # question and negation may keep a third of the content words rather
@@ -96192,11 +96329,13 @@ SERVICE_LABELS = {
 _BROADCAST_DESTS = (
     # pattern -> (route, voice_device, spoken name). Order matters: the
     # specific names go before the generic ones.
-    (r"\bnabu\b", ("nabu", "", "the Nabu")),
+    (r"\bnabu\b|\bthe device\b|\bnabu device\b|\bvoice pe\b|\bthe speaker\b",
+     ("nabu", "", "the Nabu")),
     (r"\bpine ?box\b|\bthe box\b|\bbox speaker\b",
      ("box", "pine", "the Pine Box speaker")),
     (r"\bboth\b", ("both", "", "the box and the page together")),
-    (r"\b(the )?app(lication)?\b|\blocal(ly)?\b|\bhere\b",
+    (r"\b(the )?app(lication)?\b|\blocal(ly)?\b|\bhere\b|\bdesktop\b|"
+     r"\bcomputer\b|\blaptop\b|\bmy pc\b",
      ("here", "", "the app")),
     (r"\bweb ?page\b|\bbrowser\b|\bthis page\b|\bthe page\b|\bpanel\b",
      ("here", "", "the page")),

@@ -392,3 +392,24 @@ through `POST /api/tint/try`: a three-turn phone call came back with every turn
 rhymed and borrowing DOOM lexicon in 47 seconds. The LCD's paused-state
 cupboard view is a renderer change; the display firmware shows whatever the app
 draws and needs no update, the app needs a relaunch.
+
+## 15. Gold bars, the fresh samples, and the spoken destinations
+
+**Gold bars.** A rhymed line that aired with its finished take is gold: its take
+is protected from the media sweep (`data/gold_bars.json`), its print row lives
+twice as long, it may come round after half the rejection window, and at a
+sting moment (half of them) a gold bar from the other seat fires first with the
+sting after it. Rested twenty minutes, least-fired first.
+
+**Samples.** The sting rate and the SFX guy's rate were doubled by the operator
+(1.0 and 80), and three quarters of sting draws go to fresh samples, which the
+drop folder under samples_grabbed feeds through the minute-by-minute walk.
+
+**Spoken destinations.** "Broadcast to the Nabu device", "the speaker",
+"the application", "my computer" and "the desktop" all route through
+`parse_broadcast_command`, the same door as the panel's selectors.
+
+**Grader.** A bar that spells its numbers out ("nine-fifty-nine") keeps the
+source's numbers; a hard bar keeps a fifth of the content words at full
+strength; a leading speaker label is not part of a bar; and under the hold the
+tint budget does not apply, since the rewrite runs on its own model lane.
