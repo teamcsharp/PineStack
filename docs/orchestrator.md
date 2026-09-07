@@ -430,3 +430,7 @@ What changed:
 - **The cupboard lists bars first**: ready rhymed rounds, then rounds rapping or recording, then rhymed, then old, then plain.
 
 Evidence rolls fast: the pipeline ring and the flow journal hold about two minutes and 300 events; the container log carries none of it. Read them within minutes of an incident.
+
+### 16.1 Later the same night: the floor, the dead box, rounds first
+
+Sampling `box.floor` in `/api/dj/state` every ten seconds found the second cause: `dj_speak` took the air floor before a single line was written and tinted, so one intro or advert held the air for 150 seconds while its draft and its rewrite waited on the model lane. `_floor_lend` now releases the floor around the write and the tint; the floor is for the render and the play. The Pine Box itself was firmware-down (every port refused), and every road still knocked on it with the floor held; `box_firmware_down_now` makes `_play_on_box` decline at once, routes `to_box` around it on every road, and the page carries the line. Single-line tint asks yield to a waiting whole-round ask (`_tint_turn_yields`), the legacy repair stands down while the lane is deep, and after four minutes without a page or box line the 100%-talk shelf-only refusal lets one live round be written (`dialogue_starved`). The batched re-ask names the content words a bar dropped (`semantic.missing`) and reads run-on answers.
