@@ -11749,7 +11749,7 @@ def tint_coverage_ready(report: Any) -> bool:
         return False                    # old 'changed text' stamps are stale
     return bool(cov.get("met")
                 and int(cov.get("target") or 0) >= crystal_coverage_target()
-                and int(cov.get("version") or 0) >= 2
+                and int(cov.get("version") or 0) >= 3            # #1064
                 and float(cov.get("strength") or 0) >= crystal_force())
 
 
@@ -24751,7 +24751,7 @@ async def legacy_tint_revalidate(kind: str, row: dict[str, Any],
     try:
         if (dialogue_entry(row) is not None and not _larder_current(entry)):
             audit["why"] = "the writing profile changed; the current contract needs a new pass"
-        elif (paper.get("coverage") or {}).get("version", 0) >= 2:
+        elif (paper.get("coverage") or {}).get("version", 0) >= 3:
             # The newer writer has already recorded a failure. Its passages
             # cannot be used to certify a different historical rewrite.
             audit["why"] = str(paper.get("why") or "the current evaluator refused this rewrite")
@@ -78289,6 +78289,145 @@ def _bar_end_pairs(text: Any) -> list[list[str]]:
     return out[:8]
 
 
+# #1064: THE RAP-AWARE RHYME DETECTOR. _rhyme_pairs above is a spelling
+# signature that refused "we live and clear / spit it, dear"; this one
+# reads assonance on the last stressed nucleus, slant codas, bar ends
+# ("/", line breaks, sentence ends, comma clauses of a single
+# sentence), a chain with the previous bar, nearby internal pairs and
+# two-nucleus pairs. Measured on the station's own material: 11 of 12
+# real bars pass, plain paraphrase fails, shared endings ("-ing",
+# "-ed", "garbage"/"back") do not count.
+_RAP_STOP = frozenset("a an and are as at be been but by do for from had has have he her hers him his i if in into is it its me my of on or our she so that the their them they this to us was we were what when where which who why with you your yeah yes no oh ok okay".split())
+_RAP_VOWELS = [
+    ("eigh", "a"), ("igh", "i"), ("ough", "o"), ("augh", "o"),
+    ("ee", "e"), ("ea", "e"), ("ie", "e"), ("ei", "a"), ("ey", "a"), ("ay", "a"), ("ai", "a"),
+    ("oo", "u"), ("ew", "u"), ("ue", "u"), ("ui", "u"),
+    ("ow", "o"), ("ou", "o"), ("oa", "o"), ("oe", "o"), ("au", "o"), ("aw", "o"),
+    ("oi", "oi"), ("oy", "oi"),
+]
+# Grammatical and unstressed endings are not where a rhyme lands: a word
+# wearing one is compared two nuclei deep, so "-ing"/"-ing", "-ed"/"-ed",
+# "garbage"/"back" and "dramatic"/"specific" do not count on the ending alone.
+_RAP_SUFFIX = ("ing", "ed", "ly", "tion", "sion", "ness", "ment", "ful", "ous",
+           "age", "ent", "ant", "ence", "ance", "ive", "ic", "al", "er", "est", "es", "s")
+
+
+def _rap_words(text):
+    return [w.strip("'") for w in re.findall(r"[a-z][a-z']*", str(text or "").lower()) if w.strip("'")]
+
+
+def _rap_content(text):
+    return [w for w in _rap_words(text) if w not in _RAP_STOP and len(w) > 2]
+
+
+def _rap_norm(w):
+    w = re.sub(r"[^a-z]", "", w.lower())
+    w = (w.replace("ph", "f").replace("ck", "k").replace("qu", "kw").replace("x", "ks")
+         .replace("wh", "w").replace("tch", "ch"))
+    w = re.sub(r"([^aeiouy])\1", r"\1", w)     # doubled consonants only
+    if w.endswith("e") and len(w) > 3 and not w.endswith(("ee", "ye", "le", "oe")):
+        w = w[:-1]
+    return w
+
+
+def _rap_nuclei(w):
+    """(vowel-class, coda) units, last first. A leading y is a consonant."""
+    body = w[1:] if w.startswith("y") else w
+    out = []
+    for m in re.finditer(r"([aeiouy]+)([^aeiouy]*)", body):
+        v, c = m.group(1), m.group(2)
+        for pat, cls in _RAP_VOWELS:
+            if v.startswith(pat):
+                v = cls
+                break
+        else:
+            v = "i" if v[0] == "y" else v[0]
+        c = (c.replace("d", "t").replace("z", "s").replace("v", "f")
+             .replace("g", "k").replace("b", "p"))
+        out.append((v, c[:2]))
+    return out[::-1]
+
+
+def _rap_depth(w):
+    raw = re.sub(r"[^a-z]", "", str(w).lower())     # the raw spelling, silent e kept
+    for suf in _RAP_SUFFIX:
+        if raw.endswith(suf) and len(raw) > len(suf) + 2:
+            if suf in ("s", "es") and len(_rap_nuclei(_rap_norm(raw))) < 2:
+                return 1                  # "sticks" still answers "trick"
+            return 2
+    return 1
+
+
+def _rap_key(w, depth=1):
+    n = _rap_nuclei(_rap_norm(w))
+    if len(n) < depth:
+        return ""
+    return "|".join(f"{v}{c}" for v, c in n[:depth])
+
+
+def _rap_slant(a, b):
+    """Same vowel class on the last nucleus (two nuclei when either word
+    wears an ending), and codas equal, both open, or sharing a first
+    consonant. One open and one closed syllable do not rhyme."""
+    if a in _RAP_STOP or b in _RAP_STOP:
+        return False
+    na, nb = _rap_norm(a), _rap_norm(b)
+    if len(na) < 3 or len(nb) < 3 or na == nb:
+        return False
+    xa, xb = _rap_nuclei(na), _rap_nuclei(nb)
+    depth = max(_rap_depth(a), _rap_depth(b))
+    if len(xa) < depth or len(xb) < depth:
+        return False
+    for i in range(depth):
+        if xa[i][0] != xb[i][0]:
+            return False
+        if i and xa[i][1] != xb[i][1] and not (xa[i][1] and xb[i][1] and xa[i][1][0] == xb[i][1][0]):
+            return False
+    ca, cb = xa[0][1], xb[0][1]
+    if ca == cb:
+        return True
+    return bool(ca and cb and ca[0] == cb[0])
+
+
+def _rap_bars(text):
+    text = str(text or "")
+    parts = [p for p in re.split(r"\s*/\s*|\n+|(?<=[.!?;:])\s+", text) if p.strip()]
+    if "/" in text or len(parts) >= 2:
+        return parts
+    # No bar marks and one sentence: clauses of four words or more may be
+    # the bars ("...can't create it, too weak to take it").
+    clauses = [c for c in re.split(r",\s+", text) if len(_rap_words(c)) >= 4]
+    return clauses if len(clauses) >= 2 else parts
+
+
+def _rap_end(bar):
+    ws = [w for w in _rap_words(bar) if w not in _RAP_STOP]
+    return ws[-1] if ws else ""
+
+
+def rap_rhyme_evidence(text, answering=""):
+    """What the bar proves: end rhymes across its own bars, a chain with the
+    previous bar's end, nearby internal pairs, or a two-nucleus pair."""
+    words = _rap_content(text)
+    ends = [e for e in (_rap_end(b) for b in _rap_bars(text)) if e]
+    end_pairs = [(a, b) for i, a in enumerate(ends) for b in ends[i + 1:] if _rap_slant(a, b)]
+    prev_end = _rap_end(answering) if answering else ""
+    chain = [(prev_end, e) for e in ends if prev_end and _rap_slant(prev_end, e)]
+    internal = []
+    for i, a in enumerate(words):
+        for b in words[i + 1:i + 7]:              # rhymes land near each other
+            if len(a) >= 4 and len(b) >= 4 and _rap_slant(a, b):
+                internal.append((a, b))
+    multi = [(a, b) for i, a in enumerate(words) for b in words[i + 1:i + 9]
+             if len(a) >= 5 and len(b) >= 5 and _rap_norm(a) != _rap_norm(b)
+             and _rap_key(a, 2) and _rap_key(a, 2) == _rap_key(b, 2)]
+    # A long transcript rhymes by accident somewhere; a bar rhymes on purpose.
+    long = len(words) > 30
+    ok = bool(len(end_pairs) >= (2 if long else 1) or (chain and not long)
+              or multi or len(internal) >= (3 if long else 2))
+    return {"ok": ok, "end": end_pairs[:4], "chain": chain[:2], "internal": internal[:4], "multi": multi[:3]}
+
+
 def _rhyme_pairs(words: list[str], answering: str = "") -> dict[str, Any]:
     internal: list[list[str]] = []
     multis: list[list[str]] = []
@@ -78411,6 +78550,14 @@ def tint_evaluate(source: Any, candidate: Any,
         rhyme["end_pairs"] = []
     if rhyme["end_pairs"]:
         rhyme["ok"] = True
+    # #1064: the rap-aware reading. The spelling proof stays reported; a
+    # bar is RHYMED when either the proof or this reading says so.
+    try:
+        rap = rap_rhyme_evidence(made, answering)
+    except Exception:  # noqa: BLE001
+        rap = {"ok": False}
+    rhyme["rap"] = rap
+    rhyme_proved = bool(rhyme["ok"] or rap.get("ok"))
     chunk_text = [str((c or {}).get("text") or "") for c in (chunks or [])]
     # #1064: the crystal's own vocabulary counts as lexicon, not only the
     # two stanzas this line happened to be shown.
@@ -78457,6 +78604,12 @@ def tint_evaluate(source: Any, candidate: Any,
     if rhyme_required and not rhyme["ok"]:
         (faults if strict else advisory).append(
             "no proven internal, multisyllabic or chained rhyme")
+    # #1064: "I need every line to be rhyming." Under the meaning grade a
+    # bar that lands no rhyme by either reading is refused - measured
+    # before this, the meaning grade alone let DOOM-flavoured paraphrase
+    # through and only one aired line in twelve rhymed.
+    if rhyme_required and not strict and not rhyme_proved:
+        faults.append("no rhyme evidence - the bar does not land a rhyme")
     if lexicon_required and not borrowed_words:
         (faults if strict else advisory).append(
             "no new lexicon word drawn from the crystal passage")
@@ -78466,7 +78619,7 @@ def tint_evaluate(source: Any, candidate: Any,
         faults.append("copied a prohibited six-word source phrase")
     report = {
         "ok": not faults,
-        "version": 2, "strength": round(force, 3),
+        "version": 3, "strength": round(force, 3),              # #1064: rhyme
         "grade": "strict" if strict else "meaning",             # #1064
         "advisory": advisory,
         "method": "deterministic content, entity and spelling-rhyme checks",
@@ -78499,12 +78652,23 @@ def _tint_flow(node: str, status: str, summary: str,
         pass
 
 
+def _tint_out_clean(text: Any) -> str:
+    """#1064: the spoken form of a bar. The bar marks the prompt asks for
+    become commas (the detector reads comma clauses), and the markdown a
+    model bolts on ("**noticed** the **dimming**" aired) is stripped."""
+    out = str(text or "")
+    out = out.replace(" / ", ", ").replace("/", ", ")
+    out = out.replace("*", "").replace("_", " ")
+    out = re.sub(r"\s+,", ",", out)
+    return " ".join(out.split()).strip().strip('"')
+
+
 def tint_output_ready(text: Any) -> bool:
     """Was this exact output recently accepted by the evaluator?"""
     key = hashlib.sha1(" ".join(str(text or "").split()).lower().encode(
         "utf-8", "ignore")).hexdigest()
     row = _TINT_OUTPUT_READY.get(key) or {}
-    return bool(row.get("ok") and int(row.get("version") or 0) >= 2
+    return bool(row.get("ok") and int(row.get("version") or 0) >= 3
                 and float(row.get("strength") or 0) >= crystal_force()
                 and time.time() - float(row.get("at") or 0) < 900)
 
@@ -78609,7 +78773,11 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
           "  Matching a word ENDING is not rhyming. -ing with -ing, "
           "-tion with -tion, -ly with -ly are all refused: the vowel "
           "before the ending has to answer too.\n"
-          "  Say a thing sideways as often as they do.\n\n"
+          "  Say a thing sideways as often as they do.\n"
+          "SHAPE: write it as two or more short bars separated by ' / '. "
+          "The LAST word of each bar rhymes with the last word of the bar "
+          "before it - a slant rhyme is fine - and no bar runs past about "
+          "twelve words. A line that is one bar rhymes inside itself.\n\n"
         + (f"THE LINE BEFORE THIS ONE, already rewritten - answer its "
            f"rhyme:\n{answering}\n\n"
            if answering and str(kind or "") != "caller" else "")
@@ -78698,6 +78866,7 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
             pass
     # A model that answered instead of rewriting, or that returned the
     # label with it, is corrected rather than trusted.
+    out = _tint_out_clean(out)                                       # #1064
     for lead in ("A:", "B:", "C:", "D:", "E:"):
         if out.startswith(lead):
             out = out[len(lead):].strip()
@@ -79193,7 +79362,9 @@ async def crystal_tint(script: str, kind: str = "",
               "answering each other. Matching a word ENDING is NOT "
               "rhyming: -ing with -ing is refused, the vowel before it "
               "has to answer too. It "
-              "says a thing sideways as often as they do.\n\n"
+              "says a thing sideways as often as they do. Write each turn "
+              "as short bars separated by ' / ', the last word of each bar "
+              "rhyming with the bar before it.\n\n"
               "Keep: the speaker markers and their order, the number of "
               "turns, who says what, and every fact, name, number and "
               "decision. Do not quote the lyrics and do not lift their "
@@ -79232,7 +79403,7 @@ async def crystal_tint(script: str, kind: str = "",
         out["coverage"] = {
             "target": coverage_target, "eligible": len(eligible_ix),
             "required": required, "attempted": 0, "changed": 0,
-            "met": required == 0, "version": 2,
+            "met": required == 0, "version": 3,
             "strength": round(crystal_force(), 3),
         }
         if not required:

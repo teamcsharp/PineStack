@@ -68,7 +68,7 @@ class TintContractTests(unittest.IsolatedAsyncioTestCase):
 
     def test_readiness_invalidates_old_strength_or_coverage(self):
         report = {"coverage": {"met": True, "target": 100,
-                                "version": 2, "strength": 1.0}}
+                                "version": 3, "strength": 1.0}}
         with (mock.patch.object(app, "dialogue_tint_required", return_value=True),
               mock.patch.object(app, "crystal_coverage_target", return_value=100),
               mock.patch.object(app, "crystal_force", return_value=1.0)):

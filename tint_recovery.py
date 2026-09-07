@@ -44,7 +44,7 @@ def evaluate_legacy(source: str, tinted: str, chunks: list[dict[str, Any]],
     selected = set(eligible[:required])
     coverage = {"target": target, "eligible": len(eligible), "required": required,
                 "attempted": 0, "changed": 0, "met": False,
-                "version": 2, "strength": round(force, 3)}
+                "version": 3, "strength": round(force, 3)}
     result["coverage"] = coverage
     candidates, reports, approved, answering = [], [], [], ""
     unchanged_outside_selection = True

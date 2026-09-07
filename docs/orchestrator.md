@@ -356,3 +356,22 @@ ask, fails closed to the originals), the seed clause is retold with the new
 words, and the crystal then raps the round as usual. With the crystal off, the
 second pass does not run, rows written under it fall out of the writing
 profile, and the plain repertoires serve again.
+
+## 13. Every line rhymes (#1064, the rhyme reading)
+
+A deep scan after the hold went on found the changes live and the reserve full,
+but not every line a bar: the meaning grade accepted a rewrite that kept its
+meaning and changed its words without landing a rhyme, and only one aired line
+in twelve rhymed. The spelling proof could not be made mandatory because it
+refused real bars ("we live and clear / spit it, dear").
+
+`rap_rhyme_evidence` is the reading that can: assonance on the last stressed
+nucleus with slant codas, bar ends (bar marks, line breaks, sentence ends, or
+the comma clauses of a single sentence), a chain with the previous bar, nearby
+internal pairs and two-nucleus pairs; shared endings ("-ing", "-ed",
+"garbage"/"back") never count. Measured on the station's own material: eleven
+of twelve real bars pass, plain paraphrase fails. Under the meaning grade a bar
+with no rhyme by either reading is refused ("no rhyme evidence"). The prompt
+asks for bars split by " / " with end rhymes; the spoken form turns the marks
+into commas and strips markdown. The evaluator is version 3, so every round
+graded before this re-grades and a plain line in it is cut or re-asked.
