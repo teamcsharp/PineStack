@@ -7106,6 +7106,29 @@ _SAT_BUSY_FRESH = 1.5
 # own announce puts the satellite in "responding" too, so without both of
 # these the show reads its own voice as a stranger and gags itself.
 _SPEAKING = [0]                    # depth, not a flag: announces can nest
+# 2026-09-07: WHEN DID DIALOGUE LAST AIR. Stamped by every road that puts
+# a spoken line out (the single-line door and the round stream), read by
+# dj_banter's shelf-only refusal: at 100% talk the live writer is refused
+# while the reserve catches up, and with the deep lane serial the reserve
+# never caught up - the operator heard records and nothing else for an
+# hour. Past this many seconds of no dialogue, one live round is written
+# anyway (it is still tinted before it airs), at most one every rest.
+_DIALOGUE_AT = [time.time()]
+_STARVED_WRITE_AT = [0.0]
+DIALOGUE_STARVED_AFTER = 240.0
+DIALOGUE_STARVED_REST = 150.0
+
+
+def dialogue_starved() -> tuple[bool, int]:
+    """(is the air starved of dialogue, seconds since the last line)."""
+    try:
+        quiet = int(time.time() - float(_DIALOGUE_AT[0] or 0))
+        starved = (quiet >= DIALOGUE_STARVED_AFTER
+                   and time.time() - float(_STARVED_WRITE_AT[0] or 0)
+                   >= DIALOGUE_STARVED_REST)
+        return starved, quiet
+    except Exception:  # noqa: BLE001
+        return False, 0
 _SPOKE_AT = [0.0]
 # WHICH line is going out right now (#742). `speaking` was a bare boolean and
 # the entry was only written to chat once the line had FINISHED airing — so
@@ -21683,6 +21706,7 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     page_delivery_apply(entry, page_delivery)
     _RADIO["chat"].append(entry)
     _RADIO["last_said"] = {**entry, "voice": forced or ""}
+    _DIALOGUE_AT[0] = time.time()                                # 2026-09-07
     # Capture the line into the rolling episode recording (#548).
     if clip and clip.get("path"):
         _episode_stage(clip["path"], f"{entry.get('name') or who}: {spoken}")
@@ -67514,6 +67538,7 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                     seg_ix.append(len(seg) - 1)
                     turn_ix.append(len(aired_items))
                     aired_items.append(item)                          # #no-repeats
+                    _DIALOGUE_AT[0] = time.time()                     # 2026-09-07
                     # Gold: a rhymed turn with its take is kept to fire again.
                     if item.get("turn_end") and item["who"] in ("dj", "cohost", "third"):
                         try:
@@ -68496,9 +68521,20 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # A stale or differently-configured round falls to the floor; write
         # fresh below rather than replaying the short style it was born with.
     if shelf_only:
-        pipeline_log("air", "100% talk found no zero-work larder round; "
-                     "live writing is refused while the reserve catches up")
-        return []
+        _starved, _quiet = dialogue_starved()
+        if _starved:
+            # 2026-09-07: the reserve is not catching up - the deep lane is
+            # serial and every finished round is minutes away. Past four
+            # minutes of no dialogue one live round is written anyway; it
+            # is still tinted before it airs.
+            _STARVED_WRITE_AT[0] = time.time()
+            pipeline_log("air", "100% talk found no zero-work larder round "
+                         f"and nothing has talked for {_quiet}s - a live "
+                         "round is written anyway, tinted before it airs")
+        else:
+            pipeline_log("air", "100% talk found no zero-work larder round; "
+                         "live writing is refused while the reserve catches up")
+            return []
     # The pair have weather of their own now (#321): a mood rolls in at
     # the top of a round — one of them arrives bratty, petulant, worked
     # up — colours their pace, pauses and stumbles, and cools off with
@@ -79041,7 +79077,11 @@ def tint_evaluate(source: Any, candidate: Any,
         "semantic": {"ok": semantic_ok,
                      "anchor_recall": round(anchor_overlap, 3),
                      "entities": entity_ok, "question": question_ok,
-                     "negation": neg_ok},
+                     "negation": neg_ok,
+                     # 2026-09-07: the words the bar dropped, so a re-ask
+                     # can be told what to keep instead of merely "failed"
+                     "missing": sorted(src_set - dst_set)[:14],
+                     "anchors": sorted(src_set)[:20]},
         "rhyme": {**rhyme, "required": rhyme_required},
         "transformation": {"ok": transformed,
                            "lexical_distance": round(lexical_distance, 3),
@@ -79703,10 +79743,18 @@ async def _crystal_round_repass(turns: list[tuple[str, str]],
                 break
             asked = "\n".join(f"{i + 1}: {str(turns[i][1] or '').strip()}"
                               for i in refused)
-            faults = "\n".join(
-                f"{i + 1}: " + "; ".join(
-                    (rows[i].get("evaluation") or {}).get("faults") or [])[:200]
-                for i in refused)
+            def _why(i: int) -> str:
+                ev = rows[i].get("evaluation") or {}
+                bits = "; ".join(ev.get("faults") or [])[:200]
+                sem = ev.get("semantic") or {}
+                miss = [str(w) for w in (sem.get("missing") or []) if w][:10]
+                if miss:
+                    bits += (" - KEEP these words of the original: "
+                             + ", ".join(miss))
+                if sem and not sem.get("entities", True):
+                    bits += " - keep every name and number exactly"
+                return f"{i + 1}: {bits}"
+            faults = "\n".join(_why(i) for i in refused)
             prompt = (
                 armed
                 + "\n\nTHESE LINES OF THE CONVERSATION WERE REFUSED BY THE "
@@ -79736,10 +79784,12 @@ async def _crystal_round_repass(turns: list[tuple[str, str]],
             if not text or _looks_meta(text):
                 continue
             back: dict[int, str] = {}
-            for line in text.split("\n"):
-                m = re.match(r"^\s*\**\s*(\d+)\s*[:.)\-]\s*(.+?)\s*$", line)
-                if not m:
-                    continue
+            # Measured: the model answered "2: ... 3: ..." on ONE line and
+            # the line parser handed bar 2 the whole of bar 3 as a tail.
+            for m in re.finditer(
+                    r"(?:^|\n|\s)\**\s*(\d{1,2})\s*[:.)\-]\s+(.+?)"
+                    r"(?=(?:\s+\**\s*\d{1,2}\s*[:.)\-]\s+)|\Z)",
+                    text, re.S):
                 n = int(m.group(1)) - 1
                 if 0 <= n < len(rows) and n in refused:
                     back[n] = _tint_out_clean(" ".join(m.group(2).split()))

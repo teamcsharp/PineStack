@@ -72,6 +72,57 @@ class RepassTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(rows[1]["evaluation"]["ok"])
 
 
+class RepassFormatTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_run_on_answer_is_read_and_the_kept_words_are_named(self):
+        turns = [("A", "one plain line here"), ("B", "the copper plate is late"), ("A", "three plain line here")]
+        first = [{"marker": "A", "text": "bar one / done", "selected": True, "evaluation": {}},
+                 {"marker": "B", "text": "the copper plate is late", "selected": True,
+                  "evaluation": {"ok": False, "faults": ["semantic preservation failed"],
+                                 "semantic": {"ok": False, "missing": ["copper", "plate"], "entities": False}}},
+                 {"marker": "A", "text": "three plain line here", "selected": True, "evaluation": {}}]
+        asks = []
+
+        async def _ask(prompt, **kw):
+            asks.append(prompt)
+            return "2: copper plate / running late 3: bar three / a tree"
+
+        with (mock.patch.object(app, "tint_evaluate", side_effect=_bar_grader),
+              mock.patch.object(app, "ask_model", side_effect=_ask),
+              mock.patch.object(app, "tint_should_stop", return_value=""),
+              mock.patch.object(app, "crystal_force", return_value=0.88),
+              mock.patch.object(app, "tint_seen"),
+              mock.patch.object(app, "pipeline_log")):
+            rows, batched = await app._crystal_round_repass(
+                turns, first, "ARMED", "DOOM", [], [], "deep", "banter")
+        self.assertIn("KEEP these words of the original: copper, plate", asks[0])
+        self.assertIn("keep every name and number exactly", asks[0])
+        self.assertEqual(rows[1]["text"], "copper plate, running late")
+        self.assertEqual(rows[2]["text"], "bar three, a tree")
+
+    def test_the_evaluator_names_the_dropped_words(self):
+        with mock.patch.object(app, "_crystal_vocab", return_value=frozenset()):
+            got = app.tint_evaluate("The station needs a copper plate before midnight.",
+                                    "Something else entirely, no rhyme here.", [], force=0.88, strict=False)
+        self.assertIn("copper", got["semantic"]["missing"])
+        self.assertIn("station", got["semantic"]["anchors"])
+
+
+class StarvationTests(unittest.TestCase):
+    def test_four_quiet_minutes_open_the_live_writer_once_per_rest(self):
+        import time as _t
+        with (mock.patch.object(app, "_DIALOGUE_AT", [_t.time() - 10]),
+              mock.patch.object(app, "_STARVED_WRITE_AT", [0.0])):
+            self.assertFalse(app.dialogue_starved()[0])
+        with (mock.patch.object(app, "_DIALOGUE_AT", [_t.time() - 300]),
+              mock.patch.object(app, "_STARVED_WRITE_AT", [0.0])):
+            starved, quiet = app.dialogue_starved()
+            self.assertTrue(starved)
+            self.assertGreaterEqual(quiet, 299)
+        with (mock.patch.object(app, "_DIALOGUE_AT", [_t.time() - 300]),
+              mock.patch.object(app, "_STARVED_WRITE_AT", [_t.time() - 20])):
+            self.assertFalse(app.dialogue_starved()[0])   # one live round per rest
+
+
 class LeakTests(unittest.TestCase):
     def test_a_rerun_must_rap_under_the_hold(self):
         raps = {"transcript": [{"text": BAR}, {"text": BAR}, {"text": PLAIN}]}
