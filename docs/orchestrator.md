@@ -413,3 +413,20 @@ drop folder under samples_grabbed feeds through the minute-by-minute walk.
 source's numbers; a hard bar keeps a fifth of the content words at full
 strength; a leading speaker label is not part of a bar; and under the hold the
 tint budget does not apply, since the rewrite runs on its own model lane.
+
+## 16. 2026-09-07: when the hold starves the air
+
+Measured with the operator hearing records and nothing else: the deep tint lane is serial (one permit per model; the runners are launched `-np 1`), every ask waited 170-235 seconds in the queue, the reserve held zero ready rounds, sixteen finished rounds (audio already cut) sat "waiting for tint" behind the legacy audit's speaker-order refusal, a plain recorded call re-aired through no gate, and no sound effect could play because every sting rolled inside a dialogue round.
+
+What changed:
+
+- **The refused bars are re-asked together.** After the whole-round ask is graded, `_crystal_round_repass` sends every refused line with its faults in ONE ask, twice at most; only the stubborn lines reach the line-by-line pass, which then gets two tries under the hold instead of three.
+- **Old rounds are aligned, not refused.** `tint_recovery.align_turns` matches each original turn to the unused rewritten turn that shares the most content words (same speaker preferred). Passing lines are reused with their audio; an unanswered original is left empty for the resumable writer; an extra rewritten turn that answers nothing keeps the round owed.
+- **A re-aired call must already rap** (`_rerun_rhymes`): the take plays as recorded and passes no gate on its way out.
+- **A struck call is untinted** under the hold: the tinted pass's coverage stamp no longer survives the strike.
+- **The pre-record door** also fires for a cached clip that arrives unchecked under the hold.
+- **A spoken "resume the radio" is held to the #1154 residue rule** like pause and off: a command wrapped in a recording is refused and logged.
+- **A sting rides the record** (`_sting_over_record`): 8-25 seconds after the needle drops, if nobody is speaking and the station is not paused, the dice roll at the same dial and gap.
+- **The cupboard lists bars first**: ready rhymed rounds, then rounds rapping or recording, then rhymed, then old, then plain.
+
+Evidence rolls fast: the pipeline ring and the flow journal hold about two minutes and 300 events; the container log carries none of it. Read them within minutes of an incident.
