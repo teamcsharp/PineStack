@@ -24857,6 +24857,19 @@ async def tint_recovery_step() -> bool:
     if hold:
         _TINT_RECOVERY_STATE["why"] = hold
         return False
+    # 2026-09-07: and while the tint lane is deep, old stock waits. The
+    # repair's line-by-line asks were the bulk of the queue in front of
+    # the rounds being written now.
+    try:
+        _deep = sum(1 for j in (writing_room_state().get("jobs") or [])
+                    if j.get("state") == "waiting"
+                    and "tint" in str(j.get("purpose") or ""))
+        if _deep >= 2:
+            _TINT_RECOVERY_STATE["why"] = (f"the tint lane is {_deep} deep - "
+                                           "fresh rounds first")
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     wanted = committed_stock_ids(ready=False)
     choices = []
     for kind, row in tint_recovery_rows():
@@ -73468,6 +73481,34 @@ def _ollama_category(purpose: str) -> tuple[str, int]:
     return "station", 2
 
 
+async def _tint_turn_yields(model: str, purpose: str,
+                            most: float = 180.0, beat: float = 1.5) -> float:
+    """2026-09-07: ROUNDS FIRST ON THE TINT LANE.
+
+    The lane is one FIFO permit per model. Measured with the operator
+    hearing records only: five single-line asks (an advert, a gallery
+    line, a memo, the SFX guy, a station ID) sat in front of the one ask
+    that would have put a whole round on air, and the round waited 163s
+    before the model saw it. A single-line ask now waits while a
+    whole-round ask for the same model is waiting or active, up to
+    `most` seconds, then goes. Returns the seconds it yielded."""
+    purpose = str(purpose or "")
+    if "tint" not in purpose or "tint round" in purpose:
+        return 0.0
+    began = time.monotonic()
+    try:
+        while time.monotonic() - began < most:
+            if not any(str(row.get("model")) == str(model)
+                       and "tint round" in str(row.get("purpose") or "")
+                       and row.get("state") in ("waiting", "active")
+                       for row in list(_OLLAMA_JOBS.values())):
+                break
+            await asyncio.sleep(beat)
+    except Exception:  # noqa: BLE001
+        pass
+    return time.monotonic() - began
+
+
 async def call_ollama(
     *,
     model: str,
@@ -73509,6 +73550,8 @@ async def call_ollama(
         _WRITING_DEFERRED.set(_WRITING_DEFERRED.get() + 1)
         return {"message": {"content": ""}, "deferred": True,
                 "reason": f"{model} already has its admitted {category} writers; this job remains owed"}
+    if category == "tint":
+        await _tint_turn_yields(model, purpose)             # rounds first
     identity = uuid.uuid4().hex[:12]
     _OLLAMA_JOBS[identity] = {"model": model, "purpose": str(purpose)[:100],
                             "category": category, "state": "waiting", "at": time.time()}
@@ -79727,13 +79770,15 @@ async def _crystal_round_repass(turns: list[tuple[str, str]],
             refused: list[int] = []
             for i, ((marker, said), row) in enumerate(zip(turns, rows)):
                 cand = str(row.get("text") or "")
-                ev = row.get("evaluation") or {}
-                if not ev:
-                    ev = (tint_evaluate(str(said or ""), cand, chunks,
-                                        answering, force, kind)
-                          if cand else {"ok": False,
-                                        "faults": ["no bar came back"]})
-                    row["evaluation"] = ev
+                # graded afresh every pass: a stored verdict may be an
+                # older grader's, and a bar that equals its source is
+                # not a bar
+                ev = (tint_evaluate(str(said or ""), cand, chunks,
+                                    answering, force, kind)
+                      if cand and " ".join(cand.split()).lower()
+                      != " ".join(str(said or "").split()).lower()
+                      else {"ok": False, "faults": ["no bar came back"]})
+                row["evaluation"] = ev
                 if ev.get("ok"):
                     answering = cand
                 else:
@@ -80055,10 +80100,13 @@ async def crystal_tint(script: str, kind: str = "",
             if not _resume_turns and not tint_should_stop(critical):
                 _resume_turns = await _crystal_round_first_pass(
                     text, turns, armed, world, chunks, keep, _tint_model)
-                if _resume_turns:
-                    _resume_turns, _batched = await _crystal_round_repass(
-                        turns, _resume_turns, armed, world, chunks, keep,
-                        _tint_model, kind, critical, lesson)
+            # 2026-09-07: resumed progress is re-asked together as well -
+            # the legacy repair used to walk its refused lines one ask at
+            # a time, which was most of the queue.
+            if _resume_turns and not tint_should_stop(critical):
+                _resume_turns, _batched = await _crystal_round_repass(
+                    turns, _resume_turns, armed, world, chunks, keep,
+                    _tint_model, kind, critical, lesson)
             _progress_turns: list[dict[str, Any]] = []
             # #1018: A DEADLINE OF ITS OWN. Left to the preparer's slice
             # this had 45 seconds for a round that takes three to five a

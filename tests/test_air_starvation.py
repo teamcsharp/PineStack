@@ -76,9 +76,8 @@ class RepassFormatTests(unittest.IsolatedAsyncioTestCase):
     async def test_a_run_on_answer_is_read_and_the_kept_words_are_named(self):
         turns = [("A", "one plain line here"), ("B", "the copper plate is late"), ("A", "three plain line here")]
         first = [{"marker": "A", "text": "bar one / done", "selected": True, "evaluation": {}},
-                 {"marker": "B", "text": "the copper plate is late", "selected": True,
-                  "evaluation": {"ok": False, "faults": ["semantic preservation failed"],
-                                 "semantic": {"ok": False, "missing": ["copper", "plate"], "entities": False}}},
+                 {"marker": "B", "text": "the plate of copper came late", "selected": True,
+                  "evaluation": {}},
                  {"marker": "A", "text": "three plain line here", "selected": True, "evaluation": {}}]
         asks = []
 
@@ -86,7 +85,13 @@ class RepassFormatTests(unittest.IsolatedAsyncioTestCase):
             asks.append(prompt)
             return "2: copper plate / running late 3: bar three / a tree"
 
-        with (mock.patch.object(app, "tint_evaluate", side_effect=_bar_grader),
+        def _semantic_grader(source, candidate, chunks, answering="", force=0.0, kind="", **kw):
+            got = _bar_grader(source, candidate, chunks, answering, force, kind)
+            if not got["ok"]:
+                got["semantic"] = {"ok": False, "missing": ["copper", "plate"], "entities": False}
+            return got
+
+        with (mock.patch.object(app, "tint_evaluate", side_effect=_semantic_grader),
               mock.patch.object(app, "ask_model", side_effect=_ask),
               mock.patch.object(app, "tint_should_stop", return_value=""),
               mock.patch.object(app, "crystal_force", return_value=0.88),
@@ -105,6 +110,51 @@ class RepassFormatTests(unittest.IsolatedAsyncioTestCase):
                                     "Something else entirely, no rhyme here.", [], force=0.88, strict=False)
         self.assertIn("copper", got["semantic"]["missing"])
         self.assertIn("station", got["semantic"]["anchors"])
+
+
+class LaneTests(unittest.IsolatedAsyncioTestCase):
+    async def test_a_single_line_ask_yields_to_a_waiting_round(self):
+        jobs = {"r1": {"model": "deep", "purpose": "station:tint round", "state": "waiting"}}
+        ticks = []
+
+        async def _sleep(s):
+            ticks.append(s)
+            if len(ticks) >= 2:
+                jobs.clear()                       # the round went through
+        with (mock.patch.object(app, "_OLLAMA_JOBS", jobs),
+              mock.patch.object(app.asyncio, "sleep", side_effect=_sleep)):
+            waited = await app._tint_turn_yields("deep", "station:tint turn", most=30.0, beat=0.01)
+            self.assertEqual(len(ticks), 2)
+            # a round never yields, nor does a line for another model
+            jobs["r2"] = {"model": "deep", "purpose": "station:tint round", "state": "active"}
+            ticks.clear()
+            await app._tint_turn_yields("deep", "station:tint round", most=30.0, beat=0.01)
+            await app._tint_turn_yields("fast", "station:tint turn", most=30.0, beat=0.01)
+            self.assertEqual(ticks, [])
+
+    async def test_a_stale_pass_on_resumed_progress_is_re_graded(self):
+        turns = [("A", "one plain line here"), ("B", "two plain line here")]
+        resumed = [{"marker": "A", "text": "one plain line here", "selected": True, "evaluation": {"ok": True}},
+                   {"marker": "B", "text": "bar two / a shoe", "selected": True, "evaluation": {"ok": False}}]
+        asks = []
+
+        async def _ask(prompt, **kw):
+            asks.append(prompt)
+            return "1: bar one / done"
+
+        with (mock.patch.object(app, "tint_evaluate", side_effect=_bar_grader),
+              mock.patch.object(app, "ask_model", side_effect=_ask),
+              mock.patch.object(app, "tint_should_stop", return_value=""),
+              mock.patch.object(app, "crystal_force", return_value=0.88),
+              mock.patch.object(app, "tint_seen"),
+              mock.patch.object(app, "pipeline_log")):
+            rows, batched = await app._crystal_round_repass(
+                turns, resumed, "ARMED", "DOOM", [], [], "deep", "banter")
+        self.assertEqual(len(asks), 1)
+        self.assertIn("1: one plain line here", asks[0])       # the stale ok was not trusted
+        self.assertNotIn("2: two plain line here", asks[0])    # the stale refusal was re-graded as a bar
+        self.assertEqual(rows[0]["text"], "bar one, done")
+        self.assertTrue(rows[1]["evaluation"]["ok"])
 
 
 class StarvationTests(unittest.TestCase):

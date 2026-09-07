@@ -187,6 +187,8 @@ class LegacyTintRecoveryTests(unittest.IsolatedAsyncioTestCase):
             # #1064: the resume contract is the HOLD contract.
             stack.enter_context(mock.patch.object(app, "crystal_tint_holds", return_value=True))
             stack.enter_context(mock.patch.object(app, "crystal_turn", return_value=""))
+            # 2026-09-07: the batched re-ask must not reach a real model here
+            stack.enter_context(mock.patch.object(app, "ask_model", mock.AsyncMock(return_value="")))
             got = await app.crystal_tint(source, "banter", progress=progress, critical=True)
         # #1064: the refused line is cut before the studio; the good tail
         # candidate is kept and the round is whole on its remaining bar.
