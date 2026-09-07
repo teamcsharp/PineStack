@@ -271,6 +271,7 @@ class RecordStingTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(app, "radio_paused", return_value=False),
               mock.patch.dict(app._RADIO, {"on": True, "voice_to": "here"}),
               mock.patch.object(app, "_SPEAKING", [0]),
+              mock.patch.object(app, "_SPOKE_AT", [0.0]),
               mock.patch.object(app, "_floor_busy", return_value=False),
               mock.patch.object(app, "dj_sting", stung),
               mock.patch.object(app, "pipeline_log")):
