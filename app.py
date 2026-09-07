@@ -24940,9 +24940,15 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                     for row in protected):
                 protected.append(["phone-call Speakerbox source", speakerbox])
         deferred_before = _WRITING_DEFERRED.get()
+        # #1064: progress graded under an older evaluator is stale - every
+        # candidate in it was accepted by a grade that no longer applies,
+        # and resuming it costs three asks a line. Start the round whole.
+        _stale_progress = int(((entry.get("tint") or {}).get("coverage")
+                               or {}).get("version") or 0) < 3
         got = await crystal_tint(
             plain, str(kind or entry.get("prep_kind") or "banter"),
-            protected, progress=entry.get("tint_progress"),
+            protected,
+            progress=None if _stale_progress else entry.get("tint_progress"),
             critical=critical,
             # #1146: a struck attempt's graded faults ride the retry.
             lesson=str(entry.get("tint_lesson") or ""))
@@ -25025,9 +25031,12 @@ async def ensure_shelf_row_tinted(kind: str, row: dict[str, Any],
     row["tinting"] = True
     try:
         deferred_before = _WRITING_DEFERRED.get()
+        _stale_progress = int(((row.get("tint") or {}).get("coverage")
+                               or {}).get("version") or 0) < 3      # #1064
         got = await crystal_tint(
             text, str(kind), row.get("verbatim"), whole_only=True,
-            progress=row.get("tint_progress"), critical=critical)
+            progress=None if _stale_progress else row.get("tint_progress"),
+            critical=critical)
         if _WRITING_DEFERRED.get() != deferred_before:
             if got.get("progress"):
                 row["tint_progress"] = dict(got["progress"])
