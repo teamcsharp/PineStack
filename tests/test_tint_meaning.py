@@ -45,32 +45,6 @@ class TintMeaningTests(unittest.TestCase):
                                     [], force=0.9)
         self.assertFalse(garbage["semantic"]["ok"])
 
-    def test_continuity_falls_back_to_the_plain_pair_as_a_stopgap(self):
-        with (mock.patch.object(app, "_CONTINUITY_BANK", {}),
-              mock.patch.object(app, "_CONTINUITY_LOADED", [True]),
-              mock.patch.object(app, "_CONTINUITY_STATE", {}),
-              mock.patch.object(app, "voice_engine_for", return_value="xtts"),
-              mock.patch.object(app, "continuity_crystal", return_value="DOOM:doom"),
-              tempfile.TemporaryDirectory() as tmp):
-            (Path(tmp) / "c.wav").write_bytes(b"x")
-            with mock.patch.object(app, "VOICE_MEDIA_DIR", Path(tmp)):
-                plain_key = app.continuity_key("dj", "v", "xtts", "Stay with us.")
-                app._CONTINUITY_BANK[plain_key] = {
-                    "who": "dj", "voice": "v", "engine": "xtts", "text": "Stay with us.",
-                    "clip": {"path": "/voice/c.wav", "seconds": 2.0}}
-                row = app.continuity_pick("dj", "v", "Stay with us.")
-                self.assertIsNotNone(row)
-                self.assertTrue(row["stopgap"])
-                self.assertIn("stopgap", app._CONTINUITY_STATE)
-                rap_key = app.continuity_key("dj", "v", "xtts", "Stay with us.", "DOOM:doom")
-                app._CONTINUITY_BANK[rap_key] = {
-                    "who": "dj", "voice": "v", "engine": "xtts",
-                    "text": "Stay in the mix.", "plain": "Stay with us.", "crystal": "DOOM:doom",
-                    "clip": {"path": "/voice/c.wav", "seconds": 2.0}}
-                row = app.continuity_pick("dj", "v", "Stay with us.")
-                self.assertFalse(row["stopgap"])
-                self.assertEqual(row["text"], "Stay in the mix.")
-
 
 if __name__ == "__main__":
     unittest.main()

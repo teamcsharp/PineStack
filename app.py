@@ -24798,6 +24798,16 @@ async def tint_recovery_step() -> bool:
                 "the tint yields to the air (crystal_tint_hold is off); "
                 "no recorded round is held for proof")
         return False
+    # #1064: FRESH ROUNDS FIRST. Legacy repair and fresh writing share one
+    # lane; while the finished reserve is empty the lane belongs to the
+    # rounds the desk is writing now, not to re-grading old stock.
+    try:
+        if prepared_seconds() < TINT_FAMINE_SECONDS and _LARDER_WRITING[0]:
+            _TINT_RECOVERY_STATE["why"] = ("fresh rounds first - the reserve "
+                                           "is empty and the desk is writing")
+            return False
+    except Exception:  # noqa: BLE001
+        pass
     hold = tint_should_stop(critical=True)
     if hold:
         _TINT_RECOVERY_STATE["why"] = hold
@@ -57870,7 +57880,10 @@ def continuity_pick(who: str, voice: str, text: str) -> dict[str, Any] | None:
     continuity_load()
     engine = voice_engine_for(voice)
     crystal = continuity_crystal()                                  # #1064
-    for want in ((crystal, "") if crystal else ("",)):
+    # "Because the crystal is active, there should be no lines that are
+    # not rhyming." The plain pair does not serve while a crystal is on;
+    # the rapped pair is recorded within minutes and covers from then.
+    for want in ((crystal,) if crystal else ("",)):
         row = _CONTINUITY_BANK.get(continuity_key(who, voice, engine, text, want)) or {}
         clip = row.get("clip") or {}
         name = str(clip.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
@@ -78177,6 +78190,95 @@ _TINT_EVAL_STOP = frozenset({
 })
 _TINT_OUTPUT_READY: dict[str, dict[str, Any]] = {}
 _CRYSTAL_VOCAB: dict[str, Any] = {"at": -1.0, "words": frozenset()}
+_TINT_JUDGE_RING: list[dict[str, Any]] = []      # #1064: the last 40 verdicts
+_CUPBOARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+
+
+def cupboard_state(most: int = 24) -> dict[str, Any]:
+    """#1064 (the LCD cupboard view): what the orchestrator is doing behind
+    the scenes - every stored round with its lines and whether each rhymes,
+    what is being written, tinted and recorded right now, and the last
+    verdicts of the grader. Memoised for two seconds: the LCD polls it
+    every second while the station is paused."""
+    now = time.time()
+    if _CUPBOARD_MEMO["value"] is not None and now - _CUPBOARD_MEMO["at"] < 2.0:
+        return _CUPBOARD_MEMO["value"]
+    rounds: list[dict[str, Any]] = []
+    try:
+        seen: list[tuple[str, dict[str, Any]]] = []
+        for kind, held in list(_SHELF.items()):
+            for row in list(held or []):
+                entry = dialogue_entry(row)
+                if entry is not None:
+                    seen.append((str(kind), entry))
+        for entry in list(_LARDER):
+            seen.append(("banter", entry))
+        seen.sort(key=lambda kv: -float(kv[1].get("at") or 0))
+        for kind, entry in seen[:most]:
+            script = str(entry.get("script") or "")
+            if not script.strip():
+                continue
+            tint = entry.get("tint") or {}
+            cov = tint.get("coverage") or {}
+            made, chunks = int(entry.get("made") or 0), int(entry.get("chunks") or 0)
+            if entry.get("tinting"):
+                state = "tinting"
+            elif entry.get("preparing"):
+                state = "recording"
+            elif dialogue_row_ready(kind, entry):
+                state = "ready"
+            elif tint.get("ok") and cov.get("met"):
+                state = "tinted, waiting to record"
+            else:
+                state = "written, waiting for tint"
+            lines = []
+            prev = ""
+            for marker, said in banter_turns(script, str(entry.get("caller_name") or ""),
+                                             str(entry.get("caller2_name") or "")):
+                text = " ".join(str(said or "").split())
+                try:
+                    rhymes = bool(rap_rhyme_evidence(text, prev).get("ok"))
+                except Exception:  # noqa: BLE001
+                    rhymes = False
+                lines.append({"who": {"A": "HOST", "B": "SKIP", "C": "CALLER", "D": "THIRD",
+                                      "E": "CALLER2"}.get(marker, marker),
+                              "text": text[:400], "rhyme": rhymes})
+                prev = text
+            rounds.append({"kind": kind, "label": str(entry.get("label") or entry.get("caller_name") or "")[:60],
+                           "state": state, "audio": f"{made}/{chunks}",
+                           "cut": int(cov.get("cut") or 0),
+                           "grade": "rhyme" if int(cov.get("version") or 0) >= 3 else
+                                    ("old" if tint else "untinted"),
+                           "lines": lines})
+    except Exception:  # noqa: BLE001
+        pass
+    feed: list[dict[str, Any]] = []
+    try:
+        for row in list(_RADIO.get("pipeline") or [])[-60:]:
+            if str(row.get("kind") or "") in ("crystal", "model", "lookahead", "call", "drop", "air", "speakbox"):
+                feed.append({"at": row.get("ts") or row.get("at"), "kind": row.get("kind"),
+                             "text": str(row.get("text") or "")[:220]})
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        writers = writing_room_state()
+    except Exception:  # noqa: BLE001
+        writers = {}
+    try:
+        preparing = dict(_PREP_NOW) if isinstance(_PREP_NOW, dict) else {}
+    except Exception:  # noqa: BLE001
+        preparing = {}
+    value = {
+        "at": now, "paused": bool(radio_paused()),
+        "tint": {"hold": crystal_tint_holds(), "grade": "strict" if crystal_grade_strict() else "meaning",
+                 "coverage": tint_coverage(), "crystals": [str(c.get("name") or "") for c in crystal_active()]},
+        "writers": writers, "preparing": preparing,
+        "recovery": {k: _TINT_RECOVERY_STATE.get(k) for k in ("why", "running", "attempts")},
+        "rounds": rounds, "feed": feed[-40:],
+        "judgements": list(_TINT_JUDGE_RING[-16:]),
+    }
+    _CUPBOARD_MEMO.update({"at": now, "value": value})
+    return value
 _CRYSTAL_VOCAB_FULL: dict[str, Any] = {"key": "", "words": frozenset(),
                                        "building": False}
 
@@ -78626,6 +78728,15 @@ def tint_evaluate(source: Any, candidate: Any,
         faults.append("rhetoric was not materially transformed")
     if copied:
         faults.append("copied a prohibited six-word source phrase")
+    try:                                                        # #1064 cupboard
+        _TINT_JUDGE_RING.append({
+            "at": time.time(), "ok": not faults, "kind": str(kind or ""),
+            "source": plain[:220], "candidate": made[:260],
+            "faults": list(faults), "advisory": list(advisory),
+            "rhyme": bool(rhyme_proved)})
+        del _TINT_JUDGE_RING[:-40]
+    except Exception:  # noqa: BLE001
+        pass
     report = {
         "ok": not faults,
         "version": 3, "strength": round(force, 3),              # #1064: rhyme
@@ -85979,6 +86090,16 @@ async def api_glyphy(
     the coordinator and the rooms are carrying out."""
     require_read_auth(authorization)
     return glyphy_state()
+
+
+@app.get("/api/cupboard")
+async def api_cupboard(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1064: the LCD's paused-state view - the cupboard, the desk and the
+    grader's verdicts, line by line."""
+    require_read_auth(authorization)
+    return cupboard_state()
 
 
 @app.get("/api/tint")

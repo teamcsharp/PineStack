@@ -7,6 +7,8 @@
   let state = null, panel = null, timer = null, autoRetry = null, looping = false, running = false;
   let station = {}, editions = [], edition = null, latestPaper = '', manualEdition = false;
   let paperLines = [], paperHeight = 1, scroll = 0, lastFrame = 0, lastPoll = 0, lastEvents = 0;
+  // The cupboard view (paused): every stored round, the desk and the grader.
+  let cupboard = null, cupboardLines = [], cupboardHeight = 1, cupboardScroll = 0, lastCupboard = 0;
   let selected = null, hitRows = [], localMessage = '', messageUntil = 0;
   let editionRequest = 0, actionBusy = false, polling = false;
   let stationSkew = 0;
@@ -63,6 +65,64 @@
     paperHeight = Math.max(canvas.height, y + canvas.height * 0.3); scroll = 0;
   }
 
+  function layoutCupboard() {
+    cupboardLines = []; let y = 0; const size = fontSize();
+    const add = (text, kind = 'body', tone = '') => {
+      const font = (kind === 'title' ? 'bold ' : '') + (kind === 'title' ? size * 1.15 : kind === 'small' ? size * 0.85 : size) + 'px sans-serif';
+      const height = size * (kind === 'title' ? 1.55 : kind === 'small' ? 1.2 : 1.35);
+      for (const line of wrap(plain(text), canvas.width - 24, font)) {
+        cupboardLines.push({text: line, y, font, height, kind, tone}); y += height;
+      }
+    };
+    const c = cupboard || {};
+    const t = c.tint || {}, cov = t.coverage || {}, w = c.writers || {}, prep = c.preparing || {};
+    add('PAUSED · THE CUPBOARD', 'title', 'head');
+    add('Crystal ' + ((t.crystals || []).join(', ') || 'off') + ' · hold ' + (t.hold ? 'on' : 'off') + ' · grade ' + (t.grade || '?')
+      + ' · this hour ' + (cov.tinted || 0) + ' bars passed, ' + (cov.refused || 0) + ' refused, ' + (cov.rounds || 0) + ' rounds', 'small', 'dim');
+    const jobs = (w.jobs || []).map((j) => (j.purpose || '').replace('station:', '') + ' ' + Math.round(j.seconds || 0) + 's').join(' · ');
+    add('Desk: ' + (w.active || 0) + ' writing, ' + (w.waiting || 0) + ' waiting' + (jobs ? ' · ' + jobs : ''), 'small', 'dim');
+    if (prep.kind) add('Recording room: ' + prep.kind + ' · ' + (prep.stage || '') + (prep.made != null ? ' · ' + prep.made + '/' + (prep.lines || '?') + ' lines' : ''), 'small', 'dim');
+    if (c.recovery?.why) add('Repair: ' + c.recovery.why, 'small', 'dim');
+    y += size * 0.6;
+    add('THE GRADER · last verdicts', 'title', 'head');
+    for (const j of (c.judgements || []).slice().reverse().slice(0, 8)) {
+      add((j.ok ? '✓ ' : '✗ ') + (j.candidate || ''), 'body', j.ok ? 'ok' : 'no');
+      if (!j.ok && (j.faults || []).length) add('   ' + j.faults.join('; '), 'small', 'dim');
+    }
+    y += size * 0.6;
+    add('THE CUPBOARD · ' + (c.rounds || []).length + ' rounds', 'title', 'head');
+    for (const r of (c.rounds || [])) {
+      add((r.kind || '').toUpperCase() + (r.label ? ' · ' + r.label : '') + ' · ' + (r.state || '') + ' · audio ' + (r.audio || '') + (r.cut ? ' · cut ' + r.cut : '') + ' · ' + (r.grade || ''), 'body', 'head');
+      for (const l of (r.lines || [])) add((l.rhyme ? '♪ ' : '· ') + (l.who || '') + ': ' + (l.text || ''), 'body', l.rhyme ? 'ok' : 'dim');
+      y += size * 0.4;
+    }
+    y += size * 0.6;
+    add('THE DESK · what just happened', 'title', 'head');
+    for (const f of (c.feed || []).slice().reverse().slice(0, 20)) add('[' + (f.kind || '') + '] ' + (f.text || ''), 'small', 'dim');
+    cupboardHeight = Math.max(canvas.height, y + canvas.height * 0.3);
+    if (cupboardScroll > cupboardHeight) cupboardScroll = 0;
+  }
+
+  function drawCupboard(dt, width, height, size) {
+    cupboardScroll = (cupboardScroll + dt * (state?.config?.speed || 12)) % cupboardHeight;
+    ctx.save(); ctx.beginPath(); ctx.rect(0, 24, width, height - 24); ctx.clip();
+    for (const base of [-cupboardScroll + 30, cupboardHeight - cupboardScroll + 30]) {
+      for (const row of cupboardLines) {
+        const y = base + row.y;
+        if (y < -row.height || y > height + row.height) continue;
+        ctx.font = row.font;
+        ctx.fillStyle = row.tone === 'head' ? '#9de3ef' : row.tone === 'ok' ? '#d9f7c8' : row.tone === 'no' ? '#ffb3a7' : '#8ea6b3';
+        ctx.fillText(row.text, 12, y);
+      }
+    }
+    ctx.restore();
+    ctx.fillStyle = '#102636'; ctx.fillRect(0, 0, width, 24);
+    ctx.font = 'bold ' + Math.max(11, size - 1) + 'px sans-serif'; ctx.fillStyle = '#f4e5ab';
+    ctx.fillText('PAUSED · THE CUPBOARD · behind the scenes', 9, 16, width - 18);
+    ctx.fillStyle = '#87a2b2'; ctx.font = Math.max(9, size - 2) + 'px sans-serif';
+    ctx.fillText(running ? 'Pine Box LCD · unpause to return to the show' : 'Preview · LCD not streaming', 10, height - 5);
+  }
+
   async function showEdition(id) {
     if (!id || edition?.id === id) return;
     const request = ++editionRequest;
@@ -97,6 +157,10 @@
     if (djResult.status === 'fulfilled') {
       station = djResult.value || {};
       stationSkew = Number(station.server_ms || Date.now()) - Date.now();
+      if (station.paused && Date.now() - lastCupboard > 2500) {
+        lastCupboard = Date.now();
+        bridge.get('/api/cupboard').then((got) => { cupboard = got || null; layoutCupboard(); }).catch(() => {});
+      }
     }
     if (deviceResult.status === 'fulfilled') {
       state = deviceResult.value; running = state.running;
@@ -159,6 +223,9 @@
     const width = canvas.width, height = canvas.height, size = fontSize();
     const dt = lastFrame ? Math.min(0.6, (timestamp - lastFrame) / 1000) : 0; lastFrame = timestamp;
     ctx.fillStyle = '#07121b'; ctx.fillRect(0, 0, width, height);
+    // Paused: the cupboard takes the screen - every stored line, what is
+    // being tinted and generated, and the grader's verdicts.
+    if (station?.paused && cupboardLines.length && !selected) { drawCupboard(dt, width, height, size); return; }
     const mode = state?.config?.mode || 'paper';
     if (mode === 'paper') {
       scroll = (scroll + dt * (state?.config?.speed || 12)) % paperHeight;
