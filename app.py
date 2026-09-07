@@ -7116,7 +7116,7 @@ _SPEAKING = [0]                    # depth, not a flag: announces can nest
 _DIALOGUE_AT = [time.time()]
 _STARVED_WRITE_AT = [0.0]
 DIALOGUE_STARVED_AFTER = 240.0
-DIALOGUE_STARVED_REST = 150.0
+DIALOGUE_STARVED_REST = 300.0          # one starved round at a time
 
 
 def dialogue_starved() -> tuple[bool, int]:
@@ -55440,9 +55440,23 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
     voice and never while paused."""
     try:
         await asyncio.sleep(random.uniform(8.0, 25.0))
-        if radio_paused() or not _RADIO.get("on"):
-            return
-        if _SPEAKING[0] or _floor_busy():
+        why = ""
+        for _try in range(5):
+            if radio_paused() or not _RADIO.get("on"):
+                return
+            if _SPEAKING[0]:
+                why = "a voice is on the air"
+            elif _floor_busy():
+                why = "the floor is held"
+            elif time.time() - _SPOKE_AT[0] < 2.5:
+                why = "a line just ended"
+            else:
+                why = ""
+                break
+            await asyncio.sleep(random.uniform(9.0, 14.0))
+        if why:
+            pipeline_log("air", "sting over the record skipped - "
+                         f"{why} (#1062)")
             return
         vto = _RADIO.get("voice_to") or "box"
         try:
@@ -55454,8 +55468,12 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
             pipeline_log("air", "sting: a sample dropped over "
                          f"{(track or {}).get('title') or 'the record'} - "
                          "no line needed (#1062)")
-    except Exception:  # noqa: BLE001
-        pass
+        else:
+            pipeline_log("air", "sting over the record: the dice said no "
+                         "or the gap is not up (#1062)")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("air", "sting over the record failed: "
+                     f"{type(exc).__name__}: {exc}"[:160])
 
 
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
