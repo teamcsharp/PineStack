@@ -55035,7 +55035,7 @@ _SFX_SEEN: set[str] = set()
 # its own clock while the show is on.
 SFX_ARRIVALS_PATH = data_path("sfx_seen.json")
 SFX_FRESH_HOURS = 48.0              # how long an arrival stays "new"
-SFX_FRESH_SHARE = 0.5               # the share of draws that go to it
+SFX_FRESH_SHARE = 0.75              # the share of draws that go to it ("always using new entries")
 _SFX_ARRIVALS: dict[str, Any] = {"loaded": False, "rows": {}}
 _SFX_PLAYS_MEMO: dict[str, Any] = {"at": -1, "rows": {}}
 
@@ -78112,6 +78112,12 @@ def tint_pressure() -> str:
     # cannot starve the desk because its ceiling is fixed, and it cannot
     # be starved because that ceiling is also its floor.
     try:
+        # #1064 (reading the LCD): under the hold the rewrite IS the show
+        # and runs on its own model's lane, apart from the writer's. The
+        # budget stood it down six times in nine minutes; it does not
+        # apply while the hold is on.
+        if crystal_tint_holds():
+            return ""
         left = tint_budget_left()
         if left <= 0:
             # #1105: counted, so tint_autotune can see that this is the
@@ -78684,7 +78690,12 @@ def tint_evaluate(source: Any, candidate: Any,
     # question and negation may keep a third of the content words rather
     # than half - a real bar measured 0.47 and was refused; the recited
     # lyrics and prompt echoes measure 0.02 and still fail.
-    _anchor_floor = 0.35 if force >= 0.75 else 0.5
+    # #1064 (reading the LCD): at full strength a real DOOM bar replaces
+    # most content words with imagery ("You yank the plug / tug the rug /
+    # you die in a shrug" scored 0.18 and was refused). A fifth keeps the
+    # topic; names, numbers, question and negation still bind, and the
+    # recited-lyrics and prompt-echo cases score under 0.05.
+    _anchor_floor = 0.2 if force >= 0.75 else (0.35 if force >= 0.45 else 0.5)
     semantic_ok = bool(made and question_ok and neg_ok and entity_ok
                        and (anchor_overlap >= _anchor_floor or not src_set))
     if str(kind or "") == "caller":
@@ -78824,6 +78835,10 @@ def _tint_out_clean(text: Any) -> str:
     become commas (the detector reads comma clauses), and the markdown a
     model bolts on ("**noticed** the **dimming**" aired) is stripped."""
     out = str(text or "")
+    # A leading speaker label ("HOST:", "SKIP:", "CALLER:", "A:") is the
+    # model echoing the round's cast; it counted as content and failed the
+    # meaning gate.
+    out = re.sub(r"^\s*(?:[A-E]|HOST|SKIP|CALLER2?|THIRD|DJ|COHOST)\s*:\s*", "", out, flags=re.I)
     out = out.replace(" / ", ", ").replace("/", ", ")
     out = out.replace("*", "").replace("_", " ")
     out = re.sub(r"\s+,", ",", out)

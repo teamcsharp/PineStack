@@ -36,7 +36,7 @@ class TintMeaningTests(unittest.TestCase):
         bar = "Copper plate by midnight or the lights go dark, that's the spark."
         with mock.patch.object(app, "_crystal_vocab", return_value=frozenset()):
             hard = app.tint_evaluate(plain, bar, [], force=0.9)
-            soft = app.tint_evaluate(plain, bar, [], force=0.6)
+            soft = app.tint_evaluate(plain, bar, [], force=0.3)   # the floor is 0.5 below 0.45
         self.assertGreaterEqual(hard["semantic"]["anchor_recall"], 0.35)
         self.assertLess(hard["semantic"]["anchor_recall"], 0.5)
         self.assertTrue(hard["semantic"]["ok"])
