@@ -16565,6 +16565,31 @@ def _floor_drop(owned: bool) -> None:
 FLOOR_STALE_SECONDS = 1500.0
 
 
+async def _floor_lend(label: str, work: Any) -> Any:
+    """2026-09-07: RUN `work` WITH THE FLOOR LENT OUT.
+
+    dj_speak takes the air floor before _dj_speak_floorless writes,
+    tints, renders and plays a single line - so under the hold an
+    advert or a record intro held the floor for the whole of its wait
+    on the serial tint lane (minutes), every round queued behind it and
+    every sting over the record was skipped with "the floor is held".
+    While the tint is asked the floor is released; it is taken again
+    before the line renders. A task that does not own the floor runs
+    `work` unchanged."""
+    cur = asyncio.current_task()
+    lent = _FLOOR_OWNER.get("task") is cur and _FLOOR_LOCK.locked()
+    if lent:
+        _FLOOR_OWNER.update({"task": None, "at": 0.0, "label": ""})
+        _FLOOR_LOCK.release()
+    try:
+        return await work
+    finally:
+        if lent:
+            await _FLOOR_LOCK.acquire()
+            _FLOOR_OWNER.update({"task": cur, "at": time.time(),
+                                 "label": str(label)[:120]})
+
+
 def _floor_busy() -> bool:
     """Somebody is mid-conversation on the air - and provably alive."""
     if not _FLOOR_LOCK.locked():
@@ -20985,10 +21010,12 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
             and not tint_output_ready(spoken)):
         before_tint = spoken
         clip = None                     # a take for the plain words is not a bar
-        spoken = await crystal_line(
-            before_tint, f"pre-record {kind} line for {who}", 1,
-            kind="caller" if kind == "call" or who.startswith("caller")
-            else kind)
+        spoken = await _floor_lend(
+            f"a {kind} line from {who} (back from its tint)",
+            crystal_line(
+                before_tint, f"pre-record {kind} line for {who}", 1,
+                kind="caller" if kind == "call" or who.startswith("caller")
+                else kind))
         if " ".join(spoken.split()).lower() == " ".join(before_tint.split()).lower():
             if dialogue_tint_required():
                 note_drop(who, before_tint,
@@ -66939,8 +66966,10 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
         key = hashlib.sha1(" ".join(text.split()).lower().encode("utf-8", "ignore")).hexdigest()
         if key in tint_proofs or tint_output_ready(text):
             return text
-        candidate = await crystal_line(text, "last pass before dialogue recording", 1,
-                                       kind="caller" if caller_name else "banter")
+        candidate = await _floor_lend(
+            "a round back from a line's tint",
+            crystal_line(text, "last pass before dialogue recording", 1,
+                         kind="caller" if caller_name else "banter"))
         if not tint_output_ready(candidate):
             tint_failed = True
             note_drop(who, text, "recording held: selected line failed the crystal tint contract")

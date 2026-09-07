@@ -157,6 +157,34 @@ class LaneTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(rows[1]["evaluation"]["ok"])
 
 
+class FloorLendTests(unittest.IsolatedAsyncioTestCase):
+    async def test_the_floor_is_lent_during_the_tint_and_taken_back(self):
+        import asyncio as _a
+        seen = {}
+
+        async def _tint():
+            seen["free_during"] = not app._FLOOR_LOCK.locked()
+            return "a bar"
+
+        owned = await app._floor_take("a test line")
+        try:
+            got = await app._floor_lend("a test line (back)", _tint())
+            self.assertEqual(got, "a bar")
+            self.assertTrue(seen["free_during"])
+            self.assertTrue(app._FLOOR_LOCK.locked())
+            self.assertIs(app._FLOOR_OWNER.get("task"), _a.current_task())
+            self.assertIn("back", app._FLOOR_OWNER.get("label"))
+        finally:
+            app._floor_drop(owned)
+        self.assertFalse(app._FLOOR_LOCK.locked())
+
+    async def test_a_task_without_the_floor_runs_the_work_unchanged(self):
+        async def _tint():
+            return "still a bar"
+        self.assertEqual(await app._floor_lend("x", _tint()), "still a bar")
+        self.assertFalse(app._FLOOR_LOCK.locked())
+
+
 class StarvationTests(unittest.TestCase):
     def test_four_quiet_minutes_open_the_live_writer_once_per_rest(self):
         import time as _t
