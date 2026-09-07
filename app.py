@@ -79631,8 +79631,19 @@ async def crystal_tint(script: str, kind: str = "",
             _remaining = max(1, len(turns) - sum(
                 bool((r.get("evaluation") or {}).get("ok"))
                 for r in _resume_turns))
+            # #1064 audit: the deep model measures three to five times the
+            # fast one, and under the hold each line may be asked three
+            # times. A deadline sized for one fast ask per line expired on
+            # every caller round before the first bar landed (measured:
+            # "ran past its 108s deadline", 0 turns kept, after 159s).
+            try:
+                if _tint_model and _tint_model != tint_fast_model():
+                    _per = max(_per, 75.0)
+            except Exception:  # noqa: BLE001
+                pass
+            _asks = 3 if crystal_tint_holds() else 2
             _tint_due = time.monotonic() + max(
-                90.0, _per * _remaining + 45.0)
+                90.0, _per * _remaining * _asks + 45.0)
             # #1018: AND THE ROOM'S OWN CLOCK IS EXTENDED TO MATCH.
             #
             # prep_should_stop() reads _PREP_DEADLINE, which the preparer
@@ -79651,7 +79662,7 @@ async def crystal_tint(script: str, kind: str = "",
             _first_prompt: list[str] = []
             _room_was = _PREP_DEADLINE[0]
             _PREP_DEADLINE[0] = time.time() + max(
-                90.0, _per * _remaining + 45.0)
+                90.0, _per * _remaining * _asks + 45.0)
             _gave_up = ""
             _evaluations: list[dict[str, Any]] = []
             _attempted = 0
