@@ -98,6 +98,21 @@ class LeakTests(unittest.TestCase):
             self.assertEqual(app.station_intent(
                 "Okay, the resume radio what it's very noble of you to try and cover for Tim but the reali"), "")
 
+    def test_a_real_pause_with_a_tail_is_a_command(self):
+        with mock.patch.object(app, "pipeline_log"):
+            self.assertEqual(app.station_intent("Pause the radio playback."), "pause")
+            self.assertEqual(app.station_intent("pause the radio station please"), "pause")
+            self.assertEqual(app.station_intent("Pause the radio. Not really. Donald Trump's books."), "")
+
+    def test_a_stale_speaker_order_verdict_is_superseded(self):
+        stale = {"tint_revalidation": {"state": "repair_required",
+                                       "why": "the old rewrite changed the speaker order or turn count"}}
+        self.assertTrue(app._audit_superseded(stale))
+        self.assertFalse(app._audit_superseded({**stale, "tint_progress": {"turns": [1]}}))
+        self.assertFalse(app._audit_superseded({"tint_revalidation": {"state": "repair_required",
+                                                                      "why": "no rhyme evidence"}}))
+        self.assertFalse(app._audit_superseded({}))
+
     def test_a_reordered_rewrite_is_aligned_not_refused(self):
         source = "A: The station needs a copper plate before midnight.\nB: Skip found a bin of records in the store room."
         tinted = ("B: Skip found a bin of records / stacked in the store room, spectres.\n"

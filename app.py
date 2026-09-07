@@ -24878,6 +24878,24 @@ async def tint_recovery_step() -> bool:
         _TINT_RECOVERY_STATE.update(running=False, last_at=time.time())
 
 
+def _audit_superseded(entry: dict[str, Any]) -> bool:
+    """2026-09-07: a stored verdict the aligner now answers.
+
+    legacy_tint_revalidate returns early for any row that already carries
+    an audit, so the sixteen rounds refused for "the old rewrite changed
+    the speaker order or turn count" would have kept that verdict for
+    ever and paid a whole fresh pass each. The verdict is dropped and the
+    row is audited again, this time aligned line by line."""
+    try:
+        audit = entry.get("tint_revalidation") or {}
+        return bool(audit
+                    and "speaker order or turn count" in str(audit.get("why") or "")
+                    and not entry.get("tint_progress")
+                    and str(audit.get("state") or "") != "repairing")
+    except Exception:  # noqa: BLE001
+        return False
+
+
 async def tint_recovery_clock() -> None:
     """Revalidate persisted evidence off the event loop, then pay repair debt."""
     for kind, row in tint_recovery_rows():
@@ -24885,6 +24903,8 @@ async def tint_recovery_clock() -> None:
         if entry.get("preparing"):
             continue
         try:
+            if _audit_superseded(entry):
+                entry.pop("tint_revalidation", None)
             await legacy_tint_revalidate(kind, row, persist=False)
         except Exception as exc:  # noqa: BLE001
             _TINT_RECOVERY_STATE["why"] = f"revalidation failed: {type(exc).__name__}: {exc}"[:300]
@@ -85025,10 +85045,17 @@ def station_intent(text: str) -> str:
             if name in ("pause", "off", "unpause"):
                 _residue = (low[:got.start()] + " " + low[got.end():])
                 _residue = re.sub(r"[^a-z ]+", " ", _residue)
+                # 2026-09-07: "Pause the radio playback." was refused as
+                # a recording over the one word "playback". The tails a
+                # person puts on the order are not a broadcast.
                 _filler = {"please", "now", "ok", "okay", "yeah", "yes",
                            "thanks", "thank", "you", "for", "me", "a",
                            "the", "moment", "bit", "would", "could",
-                           "can", "will", "just", "hey", "pine", "box"}
+                           "can", "will", "just", "hey", "pine", "box",
+                           "pinebox", "playback", "play", "again", "right",
+                           "away", "immediately", "station", "radio",
+                           "broadcast", "show", "music", "fm", "it", "up",
+                           "this", "that", "and", "to"}
                 _left = [w for w in _residue.split() if w not in _filler]
                 if _left:
                     pipeline_log(
