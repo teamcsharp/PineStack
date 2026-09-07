@@ -78660,6 +78660,7 @@ def _tint_out_clean(text: Any) -> str:
     out = out.replace(" / ", ", ").replace("/", ", ")
     out = out.replace("*", "").replace("_", " ")
     out = re.sub(r"\s+,", ",", out)
+    out = re.sub(r"([.!?;:])\s*,", r"\1", out)
     return " ".join(out.split()).strip().strip('"')
 
 
@@ -79438,6 +79439,27 @@ async def crystal_tint(script: str, kind: str = "",
                              if isinstance(r, dict)]
             # #1064: a fresh round is asked for WHOLE first; the pass
             # beneath grades every bar and re-asks only the refused ones.
+            # Saved progress is resumed only when some of it still passes
+            # the grade in force - a round graded under an older evaluator
+            # (every round re-grades after a version bump) would otherwise
+            # cost three asks a line instead of one ask a round.
+            if _resume_turns:
+                try:
+                    _still = 0
+                    _ans = ""
+                    for _r, (_m, _s) in zip(_resume_turns, turns):
+                        _c = str(_r.get("text") or "")
+                        if _c and tint_evaluate(str(_s or ""), _c, chunks, _ans,
+                                                crystal_force(), kind).get("ok"):
+                            _still += 1
+                        _ans = _c or str(_s or "")
+                    if not _still:
+                        pipeline_log("crystal", "(#1064) none of the saved "
+                                     "progress passes the grade in force - "
+                                     "the round is asked for whole again")
+                        _resume_turns = []
+                except Exception:  # noqa: BLE001
+                    pass
             if not _resume_turns and not tint_should_stop(critical):
                 _resume_turns = await _crystal_round_first_pass(
                     text, turns, armed, world, chunks, keep, _tint_model)
