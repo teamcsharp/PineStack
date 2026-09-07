@@ -8,6 +8,48 @@ def text_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8", "ignore")).hexdigest()
 
 
+def _content_words(text: str) -> set[str]:
+    return {w for w in re.findall(r"[a-z']+", str(text or "").lower())
+            if len(w) >= 4}
+
+
+def align_turns(before: list[tuple[str, str]],
+                after: list[tuple[str, str]]
+                ) -> tuple[list[tuple[str, str]], int]:
+    """2026-09-07: a stored rewrite whose turn order or count differs from
+    its original is aligned line by line instead of refused whole.
+
+    Measured: sixteen finished rounds - audio cut, bars on the shelf -
+    sat "waiting for tint" behind this one refusal while the operator
+    heard records and nothing else; each then cost a whole fresh pass
+    on the deep lane. Every original turn takes the unused rewritten
+    turn that shares the most content words with it (same speaker
+    preferred); an original nothing answers is left empty for the
+    resumable writer. Returns the aligned rewrite, in the ORIGINAL order
+    and length, and how many rewritten turns answered no original."""
+    used: set[int] = set()
+    out: list[tuple[str, str]] = []
+    for marker, original in before:
+        want = _content_words(original)
+        best, pick = 0.0, -1
+        for j, (m2, cand) in enumerate(after):
+            if j in used or not str(cand or "").strip():
+                continue
+            score = float(len(want & _content_words(cand)))
+            if m2 == marker:
+                score += 0.5
+            if score > best:
+                best, pick = score, j
+        if pick >= 0 and best >= 1.0:
+            used.add(pick)
+            out.append((marker, after[pick][1]))
+        else:
+            out.append((marker, ""))
+    unmatched = sum(1 for j, (_m, c) in enumerate(after)
+                    if j not in used and str(c or "").strip())
+    return out, unmatched
+
+
 def evaluate_legacy(source: str, tinted: str, chunks: list[dict[str, Any]],
                     parse: Callable, evaluate: Callable, *, target: int,
                     force: float, kind: str, world: str = "", floor: int = 2) -> dict:
@@ -30,14 +72,14 @@ def evaluate_legacy(source: str, tinted: str, chunks: list[dict[str, Any]],
     # Such normalization is not evidence that a rewrite preserved its source.
     raw_before = re.findall(r"(?:^|\s)([ABCDE])\s*:\s*", source, re.I)
     raw_after = re.findall(r"(?:^|\s)([ABCDE])\s*:\s*", tinted, re.I)
-    if [m.upper() for m in raw_before] != [m.upper() for m in raw_after]:
-        result["why"] = "the old rewrite changed the speaker order or turn count"
-        return result
     before = list(parse(source) or []) or [("", source)]
     after = list(parse(tinted) or []) or [("", tinted)]
-    if [m for m, _ in before] != [m for m, _ in after]:
-        result["why"] = "the old rewrite changed the speaker order or turn count"
-        return result
+    unmatched = 0
+    if ([m.upper() for m in raw_before] != [m.upper() for m in raw_after]
+            or [m for m, _ in before] != [m for m, _ in after]):
+        # The old rewrite changed the speaker order or turn count: align
+        # it to the original line by line and grade what answers what.
+        after, unmatched = align_turns(before, after)
     eligible = [i for i, (_, text) in enumerate(before)
                 if len(str(text).strip()) >= floor and re.search(r"[^\W_]", str(text))]
     required = (len(eligible) * target + 99) // 100
@@ -51,7 +93,10 @@ def evaluate_legacy(source: str, tinted: str, chunks: list[dict[str, Any]],
     for index, ((marker, original), (_, candidate)) in enumerate(zip(before, after)):
         chosen = index in selected
         if chosen:
-            grade = evaluate(original, candidate, chunks, answering, force, kind)
+            if str(candidate or "").strip():
+                grade = evaluate(original, candidate, chunks, answering, force, kind)
+            else:
+                grade = {"ok": False, "faults": ["no rewritten line answers this original"]}
             changed = " ".join(original.split()).lower() != " ".join(candidate.split()).lower()
             passed = bool(grade.get("ok") and changed)
             coverage["attempted"] += 1
@@ -70,7 +115,8 @@ def evaluate_legacy(source: str, tinted: str, chunks: list[dict[str, Any]],
         answering = candidate
     coverage["met"] = bool(coverage["changed"] >= required
                             and all(g.get("ok") for g in reports)
-                            and unchanged_outside_selection)
+                            and unchanged_outside_selection
+                            and not unmatched)
     result["evaluation"] = {"ok": coverage["met"], "turns": reports}
     result["approved_lines"] = approved if coverage["met"] else []
     result["progress"] = {"source": text_hash(source), "world": world,
@@ -81,5 +127,8 @@ def evaluate_legacy(source: str, tinted: str, chunks: list[dict[str, Any]],
         faults = list(dict.fromkeys(f for g in reports for f in g.get("faults") or []))
         if not unchanged_outside_selection:
             faults.append("unselected words changed")
+        if unmatched:
+            faults.append(f"{unmatched} rewritten turn(s) answer no original line "
+                          "(the old rewrite changed the speaker order or turn count)")
         result["why"] = "; ".join(faults)[:600] or "selected lines remain unproved"
     return result

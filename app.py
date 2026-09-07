@@ -20952,11 +20952,16 @@ async def _dj_speak_floorless(kind: str, track: dict[str, Any] | None = None,
     # road arrives without one and is tinted here, after all ordinary text
     # generation/modification and immediately before pantry lookup or TTS.
     # This is also what brings raw Speakerbox cover lines under the crystal.
-    if (clip is None and dialogue_tint_wanted()
+    # 2026-09-07: under the hold a take that arrives UNCHECKED (cut for
+    # the plain words by some earlier road) does not skip the door either;
+    # only a prepared round's coverage-graded clip (checked=True) may.
+    if ((clip is None or (crystal_tint_holds() and not checked))
+            and dialogue_tint_wanted()
             and who in ("dj", "cohost", "third", "caller", "caller2", "drop")
             and crystal_line_selected(spoken, f"{kind}:{who}")
             and not tint_output_ready(spoken)):
         before_tint = spoken
+        clip = None                     # a take for the plain words is not a bar
         spoken = await crystal_line(
             before_tint, f"pre-record {kind} line for {who}", 1,
             kind="caller" if kind == "call" or who.startswith("caller")
@@ -22784,6 +22789,7 @@ async def _dj_loop() -> None:
                     "air", "needle down first — "
                     f"{track.get('title') or 'the record'} is turning while "
                     "the pair work up the intro (#689)")
+                fire_and_forget(_sting_over_record(track))      # #1062
 
             # #1108/#1127: PAUSE THE BOOTH, NOT THE MUSIC. The old path
             # continued below and spawned _record_talk, web research, calls,
@@ -24665,6 +24671,16 @@ def _call_tint_strike(entry: dict[str, Any],
     entry.pop("script_tinted", None)
     entry.pop("tint_progress", None)
     entry.pop("brief", None)            # it graded the struck version
+    # #1064 (2026-09-07): under the hold the struck row is UNTINTED. The
+    # tinted pass's own "met" coverage stamp survived the strike, so the
+    # plain call carried tint paper it had not earned.
+    try:
+        if crystal_tint_holds():
+            entry["tint"] = {"ok": False, "coverage": {},
+                             "why": "the tint was struck; the plain call "
+                                    "waits for a new pass"}
+    except Exception:  # noqa: BLE001
+        pass
     entry["tint_fails"] = int(entry.get("tint_fails") or 0) + 1
     # Review: a struck row must REST like any other failed rewrite. The
     # #1119/#1122 TINT_RETRY_REST gates read tint_tried; without this
@@ -55357,6 +55373,34 @@ def _sfx_any() -> Path | None:
     return Path(names) if names else None
 
 
+async def _sting_over_record(track: dict[str, Any] | None) -> None:
+    """#1062 (2026-09-07): a sound effect does not need a line to ride on.
+
+    Every sting rolled inside speak_turns, so an hour with no finished
+    dialogue was an hour with no sound effects either - the operator
+    heard records and nothing else. Once the needle is down the dice
+    roll on the record itself, at the same dial and gap, never over a
+    voice and never while paused."""
+    try:
+        await asyncio.sleep(random.uniform(8.0, 25.0))
+        if radio_paused() or not _RADIO.get("on"):
+            return
+        if _SPEAKING[0] or _floor_busy():
+            return
+        vto = _RADIO.get("voice_to") or "box"
+        try:
+            to_box = vto in ("box", "both") and box_talk_ok()
+        except Exception:  # noqa: BLE001
+            to_box = vto in ("box", "both")
+        got = await dj_sting(to_box, who="record")
+        if got:
+            pipeline_log("air", "sting: a sample dropped over "
+                         f"{(track or {}).get('title') or 'the record'} - "
+                         "no line needed (#1062)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
                    force: bool = False,
                    sample: Path | None = None) -> str:
@@ -63281,6 +63325,24 @@ def _rerun_md_transcript(path: Path, name: str) -> list[dict[str, str]]:
     return out
 
 
+def _rerun_rhymes(row: dict[str, Any]) -> bool:
+    """#1064 (2026-09-07): a re-aired call plays AS RECORDED and passes no
+    gate on its way out, so under the hold it must already rap. Measured:
+    a thirteen-line call of plain case-book template lines went to air
+    while every live road was holding for bars - it was a re-air."""
+    try:
+        lines = [str(t.get("text") or "")
+                 for t in (row.get("transcript") or [])
+                 if isinstance(t, dict)
+                 and len(str(t.get("text") or "").strip()) >= 12]
+        if len(lines) < 3:
+            return False
+        ok = sum(1 for t in lines if rap_rhyme_evidence(t).get("ok"))
+        return ok * 2 >= len(lines)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _call_rerun_pick_blocking(low: float, high: float) -> dict[str, Any]:
     """#1033: a finished call worth hearing again - by the call_log row
     (name, ts, premise) inside the window, with its mp3 still on the
@@ -63294,6 +63356,10 @@ def _call_rerun_pick_blocking(low: float, high: float) -> dict[str, Any]:
     ledger = _rerun_ledger_rows()
     calls = RADIO_CACHE / "calls"
     cands: list[dict[str, Any]] = []
+    try:
+        _hold_rerun = bool(dialogue_tint_required())
+    except Exception:  # noqa: BLE001
+        _hold_rerun = False
     for r in reversed(rows[-400:]):
         try:
             ts = float(r.get("ts") or 0)
@@ -63308,6 +63374,8 @@ def _call_rerun_pick_blocking(low: float, high: float) -> dict[str, Any]:
                 continue
             if float(r.get("seconds") or 0) < CALL_RERUN_MIN_SECONDS:
                 continue
+            if _hold_rerun and not _rerun_rhymes(r):
+                continue                # a plain take may not re-air (#1064)
             cid = str(r.get("id") or "")
             led = ledger.get(cid) or {}
             if int(led.get("uses") or 0) >= CALL_RERUN_MOST:
@@ -78419,9 +78487,20 @@ def cupboard_state(most: int = 24) -> dict[str, Any]:
             rounds.append({"kind": kind, "label": str(entry.get("label") or entry.get("caller_name") or "")[:60],
                            "state": state, "audio": f"{made}/{chunks}",
                            "cut": int(cov.get("cut") or 0), "grade": grade, "lines": lines})
-        rank = {"ready": 0, "tinted, waiting to record": 1, "recording": 1, "tinting": 2}
-        rounds.sort(key=lambda r: (rank.get(r["state"], 2 if r["state"].startswith("rapping") else 3),
-                                   0 if r["grade"] == "rhyme" else 1))
+        # Bars first: ready rounds on the rhyme grade, then rounds being
+        # rapped now (the bars land as the LCD scrolls), then old-grade
+        # rounds waiting to be re-rapped, then plain writing.
+        def _rank(r: dict[str, Any]) -> tuple[int, int]:
+            if r["state"] == "ready" and r["grade"] == "rhyme":
+                return (0, 0)
+            if r["state"].startswith("rapping") or r["state"] in ("tinting", "recording"):
+                return (1, 0)
+            if r["grade"] == "rhyme":
+                return (2, 0)
+            if r["grade"] == "old":
+                return (3, 0)
+            return (4, 0)
+        rounds.sort(key=_rank)
     except Exception:  # noqa: BLE001
         pass
     feed: list[dict[str, Any]] = []
@@ -79547,7 +79626,8 @@ async def _crystal_round_first_pass(text: str, turns: list[tuple[str, str]],
             out.append({"marker": marker,
                         "source": hashlib.sha1(
                             str(said or "").encode("utf-8", "ignore")).hexdigest(),
-                        "text": " ".join(str(candidate or "").split()),
+                        "text": _tint_out_clean(
+                            " ".join(str(candidate or "").split())),
                         "selected": True, "evaluation": {}})
         pipeline_log("crystal", "(#1064) the whole round came back in one ask "
                      f"({int((time.monotonic() - began) * 1000)}ms, "
@@ -79555,6 +79635,118 @@ async def _crystal_round_first_pass(text: str, turns: list[tuple[str, str]],
         return out
     except Exception:  # noqa: BLE001
         return []
+
+
+async def _crystal_round_repass(turns: list[tuple[str, str]],
+                                first: list[dict[str, Any]],
+                                armed: str, world: str,
+                                chunks: list[dict[str, Any]],
+                                keep: list[str] | None, model: str,
+                                kind: str = "", critical: bool = False,
+                                lesson: str = "", passes: int = 2
+                                ) -> tuple[list[dict[str, Any]], bool]:
+    """The refused bars of the whole-round ask, re-asked TOGETHER.
+
+    Measured 2026-09-07 with the operator hearing records and nothing
+    else: the deep lane is serial and every ask waited 170-235s in the
+    queue behind the others. A twelve-turn round whose one ask left six
+    bars refused then cost up to eighteen further asks, one line at a
+    time, and the reserve sat at zero for the whole of it. One ask now
+    carries every refused line with its faults; two such passes leave
+    only the stubborn lines for the line-by-line pass beneath.
+
+    Returns (progress rows, whether a batched ask was made)."""
+    batched = False
+    rows = [dict(r) for r in (first or [])]
+    try:
+        if len(rows) != len(turns):
+            return rows, False
+        force = crystal_force()
+        for _pass in range(max(0, int(passes))):
+            answering = ""
+            refused: list[int] = []
+            for i, ((marker, said), row) in enumerate(zip(turns, rows)):
+                cand = str(row.get("text") or "")
+                ev = row.get("evaluation") or {}
+                if not ev:
+                    ev = (tint_evaluate(str(said or ""), cand, chunks,
+                                        answering, force, kind)
+                          if cand else {"ok": False,
+                                        "faults": ["no bar came back"]})
+                    row["evaluation"] = ev
+                if ev.get("ok"):
+                    answering = cand
+                else:
+                    refused.append(i)
+                    answering = cand or str(said or "")
+            if not refused or tint_should_stop(critical):
+                break
+            asked = "\n".join(f"{i + 1}: {str(turns[i][1] or '').strip()}"
+                              for i in refused)
+            faults = "\n".join(
+                f"{i + 1}: " + "; ".join(
+                    (rows[i].get("evaluation") or {}).get("faults") or [])[:200]
+                for i in refused)
+            prompt = (
+                armed
+                + "\n\nTHESE LINES OF THE CONVERSATION WERE REFUSED BY THE "
+                  "EVALUATOR. Rewrite ONLY these lines, each as a hard bar "
+                  "in that writer's lexicon and rhyme, ONE PER LINE, each "
+                  "prefixed with the SAME NUMBER and a colon. Keep every "
+                  "name, number, question and negation; keep at least a "
+                  "fifth of the concrete content words; make the rhyme land "
+                  "INSIDE the line and at the ends of its short bars "
+                  "separated by ' / '. No speaker labels, no notes.\n\n"
+                  "WHY EACH WAS REFUSED:\n" + faults
+                + (("\n\nA PREVIOUS REWRITE OF THIS CONVERSATION WAS "
+                    "REJECTED - do not repeat its faults: "
+                    + str(lesson)[:400])
+                   if str(lesson or "").strip() else "")
+                + "\n\nTHE LINES:\n" + asked)
+            got = await ask_model(
+                prompt, limit=max(400, len(asked) * 3 + 200), spice=0.7,
+                model=model,
+                mark={"purpose": "tint", "kind": "tint round",
+                      "for": "the refused bars of a round, re-asked "
+                             "together (#1064)",
+                      "tint_world": world, "tint_before": asked[:6000],
+                      "tint_keep": list(keep or [])})
+            batched = True
+            text = str(got or "").strip()
+            if not text or _looks_meta(text):
+                continue
+            back: dict[int, str] = {}
+            for line in text.split("\n"):
+                m = re.match(r"^\s*\**\s*(\d+)\s*[:.)\-]\s*(.+?)\s*$", line)
+                if not m:
+                    continue
+                n = int(m.group(1)) - 1
+                if 0 <= n < len(rows) and n in refused:
+                    back[n] = _tint_out_clean(" ".join(m.group(2).split()))
+            if not back:
+                continue
+            answering = ""
+            landed = 0
+            for i, ((marker, said), row) in enumerate(zip(turns, rows)):
+                if back.get(i):
+                    ev = tint_evaluate(str(said or ""), back[i], chunks,
+                                       answering, force, kind)
+                    row["evaluation"] = ev
+                    if ev.get("ok"):
+                        row["text"] = back[i]
+                        landed += 1
+                        tint_seen("tinted")
+                    else:
+                        tint_seen("refused")
+                cand = str(row.get("text") or "")
+                answering = (cand if (row.get("evaluation") or {}).get("ok")
+                             else (cand or str(said or "")))
+            pipeline_log("crystal", f"(#1064) {len(refused)} refused bar(s) "
+                         f"re-asked together, pass {_pass + 1}: {landed} "
+                         "landed")
+        return rows, batched
+    except Exception:  # noqa: BLE001
+        return rows, batched
 
 
 async def crystal_tint(script: str, kind: str = "",
@@ -79766,6 +79958,7 @@ async def crystal_tint(script: str, kind: str = "",
             answering = ""
             _resume_turns = [r for r in (resume.get("turns") or [])
                              if isinstance(r, dict)]
+            _batched = False
             # #1064: a fresh round is asked for WHOLE first; the pass
             # beneath grades every bar and re-asks only the refused ones.
             # Saved progress is resumed only when some of it still passes
@@ -79792,6 +79985,10 @@ async def crystal_tint(script: str, kind: str = "",
             if not _resume_turns and not tint_should_stop(critical):
                 _resume_turns = await _crystal_round_first_pass(
                     text, turns, armed, world, chunks, keep, _tint_model)
+                if _resume_turns:
+                    _resume_turns, _batched = await _crystal_round_repass(
+                        turns, _resume_turns, armed, world, chunks, keep,
+                        _tint_model, kind, critical, lesson)
             _progress_turns: list[dict[str, Any]] = []
             # #1018: A DEADLINE OF ITS OWN. Left to the preparer's slice
             # this had 45 seconds for a round that takes three to five a
@@ -79932,7 +80129,11 @@ async def crystal_tint(script: str, kind: str = "",
                 # round's faults already rode the next pass. Two asks when
                 # the tint yields to the air; three when the hold is on,
                 # because then the round cannot air until the line passes.
-                _tries = 3 if crystal_tint_holds() else 2
+                # 2026-09-07: two batched passes already carried this
+                # line's faults, so the line-by-line pass gets one more
+                # ask under the hold, not three.
+                _tries = ((2 if _batched else 3)
+                          if crystal_tint_holds() else 2)
                 for _again_at in range(1, _tries):
                     if (_report.get("ok") or tint_should_stop(critical)
                             or time.monotonic() > _tint_due):
@@ -84816,7 +85017,12 @@ def station_intent(text: str) -> str:
             # has nothing left to say; a recording does. Only the
             # silencing intents are held to this - a spurious START is
             # the direction the operator wants ("music plays 24/7").
-            if name in ("pause", "off"):
+            # 2026-09-07: ...and the START is held to it as well. "Okay,
+            # the resume radio what it's very noble of you to try and
+            # cover for Tim but the reali..." unpaused a deliberate
+            # pause - the mic hearing the show again. A real "resume the
+            # radio" has nothing left once the order is taken out.
+            if name in ("pause", "off", "unpause"):
                 _residue = (low[:got.start()] + " " + low[got.end():])
                 _residue = re.sub(r"[^a-z ]+", " ", _residue)
                 _filler = {"please", "now", "ok", "okay", "yeah", "yes",

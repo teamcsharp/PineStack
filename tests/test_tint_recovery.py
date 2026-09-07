@@ -118,13 +118,18 @@ class LegacyTintRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["progress"]["turns"][1]["text"], self.TINTED)
         self.assertFalse(result["approved_lines"])
 
-    def test_changed_turn_count_is_not_accepted(self):
+    def test_changed_turn_count_is_aligned_and_the_extra_turn_is_not_accepted(self):
+        # 2026-09-07: the rewrite is aligned to the original line by line;
+        # the matched line is kept for the resumable writer, the extra
+        # rewritten turn that answers no original keeps the round owed.
         result = evaluate_legacy("A: " + self.SOURCE,
             "A: " + self.TINTED + "\nB: extra turn", self.CHUNKS,
             app.banter_turns, app.tint_evaluate, target=100, force=1.0, kind="banter")
+        self.assertEqual(result["state"], "repair_required")
         self.assertIn("turn count", result["why"])
-        self.assertFalse(result["progress"])
-
+        self.assertEqual([t["marker"] for t in result["progress"]["turns"]], ["A"])
+        self.assertEqual(result["progress"]["turns"][0]["text"], self.TINTED)
+        self.assertFalse(result["approved_lines"])
     def test_restart_clears_stranded_tint_owner_without_removing_audio(self):
         entry = self.entry()
         entry["tinting"] = True
