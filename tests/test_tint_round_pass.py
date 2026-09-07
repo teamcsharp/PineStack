@@ -83,8 +83,8 @@ class TintRoundPassTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(app, "tint_fast_model", return_value="fast"),
               mock.patch.object(app, "tint_model_now", return_value="deep")):
             with mock.patch.object(app, "prepared_seconds", return_value=0.0):
-                self.assertEqual(app.tint_model_for("ad"), "fast")
-                self.assertEqual(app.tint_model_for("banter"), "deep")   # the pair stays deep
+                self.assertEqual(app.tint_model_for("ad"), "deep")       # every road deep under the hold
+                self.assertEqual(app.tint_model_for("banter"), "deep")
             with mock.patch.object(app, "prepared_seconds", return_value=3600.0):
                 self.assertEqual(app.tint_model_for("banter"), "deep")
 

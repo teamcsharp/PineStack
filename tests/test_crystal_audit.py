@@ -65,7 +65,7 @@ class CrystalAuditTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(app, "tint_model_now", return_value="deep")):
             self.assertEqual(app.tint_model_for("banter"), "deep")
             self.assertEqual(app.tint_model_for("caller"), "deep")
-            self.assertEqual(app.tint_model_for("ad"), "fast")
+            self.assertEqual(app.tint_model_for("ad"), "deep")
 
     def test_tagged_responses_that_do_not_rhyme_are_retagged(self):
         with tempfile.TemporaryDirectory() as tmp:

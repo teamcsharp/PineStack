@@ -47,18 +47,18 @@ class TintRhymeTests(unittest.TestCase):
             report = app.tint_evaluate(source, paraphrase, [], force=0.9, strict=False)
             self.assertFalse(report["ok"])
             self.assertIn("no rhyme evidence - the bar does not land a rhyme", report["faults"])
-            self.assertEqual(report["version"], 3)
+            self.assertEqual(report["version"], 4)
             good = app.tint_evaluate(source, BARS[4], [], force=0.9, strict=False)
             self.assertTrue(good["ok"], good["faults"])
             self.assertTrue(good["rhyme"]["rap"]["ok"])
 
     def test_stored_tints_from_the_old_grade_are_not_current(self):
-        report = {"coverage": {"met": True, "target": 100, "version": 2, "strength": 1.0}}
+        report = {"coverage": {"met": True, "target": 100, "version": 3, "strength": 1.0}}
         with (mock.patch.object(app, "dialogue_tint_required", return_value=True),
               mock.patch.object(app, "crystal_coverage_target", return_value=100),
               mock.patch.object(app, "crystal_force", return_value=1.0)):
             self.assertFalse(app.tint_coverage_ready(report))
-            report["coverage"]["version"] = 3
+            report["coverage"]["version"] = 4
             self.assertTrue(app.tint_coverage_ready(report))
 
     def test_the_spoken_form_has_no_bar_marks_or_markdown(self):

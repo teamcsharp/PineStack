@@ -15,7 +15,7 @@ class CupboardTests(unittest.TestCase):
                  "script": "A: " + bar + "\nB: The plain second line has no rhyme at all.",
                  "script_tinted": "A: " + bar + "\nB: The plain second line has no rhyme at all.",
                  "use": "tinted", "made": 2, "chunks": 2, "keys": ["k1", "k2"],
-                 "tint": {"ok": True, "coverage": {"met": True, "version": 3, "cut": 1,
+                 "tint": {"ok": True, "coverage": {"met": True, "version": 4, "cut": 1,
                                                     "target": 100, "strength": 1.0}}}
         with (mock.patch.object(app, "_SHELF", {"manager": [{"entry": dict(entry, prep_kind="manager", label="memos")}]}),
               mock.patch.object(app, "_LARDER", [entry]),

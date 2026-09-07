@@ -83,7 +83,7 @@ class LegacyTintRecoveryTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_failed_new_proof_is_not_certified_against_different_passages(self):
         entry = self.entry()
-        entry["tint"]["coverage"] = {"version": 3, "met": False}
+        entry["tint"]["coverage"] = {"version": 4, "met": False}
         self.assertFalse(await app.legacy_tint_revalidate("banter", entry))
         self.assertFalse(entry.get("tint_progress"))
 

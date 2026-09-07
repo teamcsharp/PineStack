@@ -11749,7 +11749,7 @@ def tint_coverage_ready(report: Any) -> bool:
         return False                    # old 'changed text' stamps are stale
     return bool(cov.get("met")
                 and int(cov.get("target") or 0) >= crystal_coverage_target()
-                and int(cov.get("version") or 0) >= 3            # #1064
+                and int(cov.get("version") or 0) >= 4            # #1064
                 and float(cov.get("strength") or 0) >= crystal_force())
 
 
@@ -24751,7 +24751,7 @@ async def legacy_tint_revalidate(kind: str, row: dict[str, Any],
     try:
         if (dialogue_entry(row) is not None and not _larder_current(entry)):
             audit["why"] = "the writing profile changed; the current contract needs a new pass"
-        elif (paper.get("coverage") or {}).get("version", 0) >= 3:
+        elif (paper.get("coverage") or {}).get("version", 0) >= 4:
             # The newer writer has already recorded a failure. Its passages
             # cannot be used to certify a different historical rewrite.
             audit["why"] = str(paper.get("why") or "the current evaluator refused this rewrite")
@@ -24954,7 +24954,7 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
         # candidate in it was accepted by a grade that no longer applies,
         # and resuming it costs three asks a line. Start the round whole.
         _stale_progress = int(((entry.get("tint") or {}).get("coverage")
-                               or {}).get("version") or 0) < 3
+                               or {}).get("version") or 0) < 4
         got = await crystal_tint(
             plain, str(kind or entry.get("prep_kind") or "banter"),
             protected,
@@ -25042,7 +25042,7 @@ async def ensure_shelf_row_tinted(kind: str, row: dict[str, Any],
     try:
         deferred_before = _WRITING_DEFERRED.get()
         _stale_progress = int(((row.get("tint") or {}).get("coverage")
-                               or {}).get("version") or 0) < 3      # #1064
+                               or {}).get("version") or 0) < 4      # #1064
         got = await crystal_tint(
             text, str(kind), row.get("verbatim"), whole_only=True,
             progress=None if _stale_progress else row.get("tint_progress"),
@@ -77989,11 +77989,12 @@ def tint_model_for(kind: str = "") -> str:
     until it is rapped, and the fast model rapping every road beats the
     deep one rapping the pair while the emergency host reads filler."""
     try:
-        # #1064 audit: the pair (banter, the phone) keeps the deep model -
-        # "dope bars" outrank a fuller reserve; the other roads go fast.
-        if (crystal_tint_holds() and prepared_seconds() < TINT_FAMINE_SECONDS
-                and str(kind or "") not in TINT_DEEP_ROADS):
-            return tint_fast_model() or tint_model_now()
+        # #1064 (reading the LCD): under the hold every road deserves the
+        # deep model - the operator reads the bars and wants DOOM, not the
+        # 5B's paraphrase. tint_model_now falls back to the fast model
+        # when the budget runs low, which paces the lane.
+        if crystal_tint_holds():
+            return tint_model_now() or tint_fast_model()
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -78249,25 +78250,47 @@ def cupboard_state(most: int = 24) -> dict[str, Any]:
                 state = "tinted, waiting to record"
             else:
                 state = "written, waiting for tint"
+            names = {"A": "HOST", "B": "SKIP", "C": "CALLER", "D": "THIRD", "E": "CALLER2"}
+            whole = bool(tint.get("ok") and cov.get("met"))
             lines = []
             prev = ""
-            for marker, said in banter_turns(script, str(entry.get("caller_name") or ""),
-                                             str(entry.get("caller2_name") or "")):
-                text = " ".join(str(said or "").split())
-                try:
-                    rhymes = bool(rap_rhyme_evidence(text, prev).get("ok"))
-                except Exception:  # noqa: BLE001
-                    rhymes = False
-                lines.append({"who": {"A": "HOST", "B": "SKIP", "C": "CALLER", "D": "THIRD",
-                                      "E": "CALLER2"}.get(marker, marker),
-                              "text": text[:400], "rhyme": rhymes})
-                prev = text
+            # A round still being rapped shows the bars as they land - the
+            # candidate for each turn, marked passed, cut or pending - not
+            # the plain script, which read on the LCD as failure.
+            progress = [r for r in ((entry.get("tint_progress") or {}).get("turns") or [])
+                        if isinstance(r, dict)] if not whole else []
+            if progress:
+                for r in progress:
+                    text = " ".join(str(r.get("text") or "").split())
+                    ok = bool((r.get("evaluation") or {}).get("ok"))
+                    mark = "cut" if r.get("cut") else ("bar" if ok and text else
+                                                        "pending" if not text else "refused")
+                    lines.append({"who": names.get(str(r.get("marker") or ""), str(r.get("marker") or "")),
+                                  "text": (text or "(cut before the studio)" if r.get("cut") else text or "...")[:400],
+                                  "rhyme": ok and bool(text), "mark": mark})
+            else:
+                for marker, said in banter_turns(script, str(entry.get("caller_name") or ""),
+                                                 str(entry.get("caller2_name") or "")):
+                    text = " ".join(str(said or "").split())
+                    try:
+                        rhymes = bool(rap_rhyme_evidence(text, prev).get("ok"))
+                    except Exception:  # noqa: BLE001
+                        rhymes = False
+                    lines.append({"who": names.get(marker, marker), "text": text[:400],
+                                  "rhyme": rhymes, "mark": "bar" if rhymes else ("plain" if not whole else "refused")})
+                    prev = text
+            version = int(cov.get("version") or 0)
+            grade = ("rhyme" if whole and version >= 4 else
+                     "old" if whole else
+                     "rapping" if progress or entry.get("tinting") else "untinted")
+            if state == "written, waiting for tint" and progress:
+                state = "rapping " + str(sum(1 for r in progress if (r.get("evaluation") or {}).get("ok"))) + "/" + str(len(progress))
             rounds.append({"kind": kind, "label": str(entry.get("label") or entry.get("caller_name") or "")[:60],
                            "state": state, "audio": f"{made}/{chunks}",
-                           "cut": int(cov.get("cut") or 0),
-                           "grade": "rhyme" if int(cov.get("version") or 0) >= 3 else
-                                    ("old" if tint else "untinted"),
-                           "lines": lines})
+                           "cut": int(cov.get("cut") or 0), "grade": grade, "lines": lines})
+        rank = {"ready": 0, "tinted, waiting to record": 1, "recording": 1, "tinting": 2}
+        rounds.sort(key=lambda r: (rank.get(r["state"], 2 if r["state"].startswith("rapping") else 3),
+                                   0 if r["grade"] == "rhyme" else 1))
     except Exception:  # noqa: BLE001
         pass
     feed: list[dict[str, Any]] = []
@@ -78653,8 +78676,10 @@ def tint_evaluate(source: Any, candidate: Any,
                          plain, re.I))
     neg_ok = neg == bool(re.search(
         r"\b(?:no|not|never|without|cannot|can't|won't)\b", made, re.I))
+    # #1064: a rapper drops the g - "bleedin'" keeps the name "Bleeding".
+    _made_names = re.sub(r"in'(?=\W|$)", "ing", made)
     entity_ok = numbers == set(re.findall(r"\b\d+(?:\.\d+)?\b", made)) \
-        and all(re.search(rf"\b{re.escape(n)}\b", made, re.I) for n in names)
+        and all(re.search(rf"\b{re.escape(n)}\b", _made_names, re.I) for n in names)
     # #1064: at full strength a bar that keeps every name, number,
     # question and negation may keep a third of the content words rather
     # than half - a real bar measured 0.47 and was refused; the recited
@@ -78686,7 +78711,11 @@ def tint_evaluate(source: Any, candidate: Any,
     except Exception:  # noqa: BLE001
         rap = {"ok": False}
     rhyme["rap"] = rap
-    rhyme_proved = bool(rhyme["ok"] or rap.get("ok"))
+    # #1064 (reading the LCD): the spelling proof accepted prose with a
+    # chance suffix match, so a transcript with " / " inserted became a
+    # READY round. The calibrated rap reading is the only rhyme evidence
+    # under the meaning grade; the spelling proof stays reported.
+    rhyme_proved = bool(rap.get("ok"))
     chunk_text = [str((c or {}).get("text") or "") for c in (chunks or [])]
     # #1064: the crystal's own vocabulary counts as lexicon, not only the
     # two stanzas this line happened to be shown.
@@ -78757,7 +78786,7 @@ def tint_evaluate(source: Any, candidate: Any,
         pass
     report = {
         "ok": not faults,
-        "version": 3, "strength": round(force, 3),              # #1064: rhyme
+        "version": 4, "strength": round(force, 3),              # #1064: rap-only
         "grade": "strict" if strict else "meaning",             # #1064
         "advisory": advisory,
         "method": "deterministic content, entity and spelling-rhyme checks",
@@ -78807,7 +78836,7 @@ def tint_output_ready(text: Any) -> bool:
     key = hashlib.sha1(" ".join(str(text or "").split()).lower().encode(
         "utf-8", "ignore")).hexdigest()
     row = _TINT_OUTPUT_READY.get(key) or {}
-    return bool(row.get("ok") and int(row.get("version") or 0) >= 3
+    return bool(row.get("ok") and int(row.get("version") or 0) >= 4
                 and float(row.get("strength") or 0) >= crystal_force()
                 and time.time() - float(row.get("at") or 0) < 900)
 
@@ -79468,7 +79497,12 @@ async def crystal_tint(script: str, kind: str = "",
         world = str(resume.get("world") or crystal_world_prompt())
         out["world"] = world
         out["chunks"] = chunks
-        _tint_model = (tint_fast_model() if critical
+        # #1064 (reading the LCD): "critical" sent every banked round to
+        # the fast model, so the bars the reserve holds were the 5B's
+        # paraphrase. Under the hold the road's model applies to banked
+        # rounds too; tint_model_now still falls back to the fast one when
+        # the budget runs low.
+        _tint_model = (tint_fast_model() if (critical and not crystal_tint_holds())
                        else tint_model_for(kind))
         armed = (
             # #1064 audit: the whole-round ask showed the writer's stanzas
@@ -79547,7 +79581,7 @@ async def crystal_tint(script: str, kind: str = "",
         out["coverage"] = {
             "target": coverage_target, "eligible": len(eligible_ix),
             "required": required, "attempted": 0, "changed": 0,
-            "met": required == 0, "version": 3,
+            "met": required == 0, "version": 4,
             "strength": round(crystal_force(), 3),
         }
         if not required:

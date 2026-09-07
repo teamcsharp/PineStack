@@ -32,7 +32,7 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
             entry.update({"script_tinted": "A: tinted words",
                           "script": "A: tinted words", "use": "tinted",
                           "tint": {"coverage": {"met": True, "target": 100,
-                                                "version": 3, "strength": 1.0}}})
+                                                "version": 4, "strength": 1.0}}})
             entry["made"] = 1
             self.assertFalse(app.dialogue_row_ready("banter", entry))
 
