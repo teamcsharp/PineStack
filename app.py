@@ -17018,6 +17018,13 @@ async def _play_on_box(path: str, sig: str, reply: bool = False,
     if not box_talk_ok(reply=reply):
         note_activity("held", "Pine Box switched off — kept for the page")
         return ""                    # the existing "box declined" contract
+    # 2026-09-07 (#1156): a box whose firmware is provably not running
+    # declines at once - no announce, no verified-playout wait, no 90s of
+    # knocking with the air floor held. Every caller already has a
+    # "box declined" road (page copy, hold shelf).
+    if box_firmware_down_now():
+        note_activity("held", "Pine Box firmware down - kept for the page")
+        return ""
     token, player = _ha_creds(reply=reply)
     if not (token and player):
         # No box wired: do not claim to be speaking on it (#539).
@@ -18531,6 +18538,8 @@ def page_feed_append(clip: dict[str, Any]) -> str:
         delivery_id = str(clip.get("delivery_id") or uuid.uuid4().hex[:16])
         clip["delivery_id"] = delivery_id
         clip.setdefault("delivery_state", "published")
+        if str(clip.get("text") or "").strip():
+            _DIALOGUE_AT[0] = time.time()       # 2026-09-07: the page counts as air
         clip.setdefault("ts", int(time.time() * 1000))
         if not clip.get("broadcast_ms"):
             clip["broadcast_ms"] = int(max(
