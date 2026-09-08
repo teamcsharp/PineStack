@@ -854,14 +854,19 @@ app.on("web-contents-created", (event, contents) => {
     try {
       const base = new URL(readConfig().baseUrl || "");
       const target = new URL(u);
-      if (target.origin === base.origin
-          && target.pathname === "/export/kit") {
+      // 2026-09-08: ...and the retirement desk (/cupboard/retire), the
+      // page where rounds about to leave the cupboard wait for a decision.
+      // It plays no broadcast either.
+      const own = {
+        "/export/kit": {width: 940, height: 640, title: "Pine Box - packing the kit"},
+        "/cupboard/retire": {width: 1160, height: 840, title: "Pine Box - the retirement desk"},
+      };
+      if (target.origin === base.origin && own[target.pathname]) {
         return {
           action: "allow",
           overrideBrowserWindowOptions: {
-            width: 940, height: 640, autoHideMenuBar: true,
+            ...own[target.pathname], autoHideMenuBar: true,
             backgroundColor: "#04060b",
-            title: "Pine Box - packing the kit",
           },
         };
       }

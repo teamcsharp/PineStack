@@ -33,6 +33,12 @@ class KeepTests(unittest.TestCase):
             app, "dialogue_tint_ready", lambda kind, row: bool((row or {}).get("script_tinted"))))
         self.stack.enter_context(mock.patch.object(app, "orch_policy", lambda *a, **k: None))
         self.stack.enter_context(mock.patch.object(app, "TINTED_KEEP_SECONDS", 345600.0))
+        # The retirement desk (later on 2026-09-08) asks before a rhymed round
+        # is dropped; these tests pin the trim itself, so the rule is "never".
+        self.stack.enter_context(mock.patch.object(app, "_RETIRE", {
+            "rules": {"banter": {"ask": "never"}}, "ledger": {}, "seq": 0,
+            "noted_at": 0.0, "noted": 0, "saved_at": 0.0}))
+        self.stack.enter_context(mock.patch.object(app, "_retire_write", mock.Mock()))
 
     def test_a_rhymed_round_is_stamped_96_hours_and_a_plain_one_is_not(self):
         row = _entry()

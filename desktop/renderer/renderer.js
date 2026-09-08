@@ -934,6 +934,65 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
 }
 // REJECTION NOTICE CONTROLLER END
 
+// RETIREMENT DESK NOTICE (2026-09-08) — "whenever rhyming rhetoric ... is
+// pending deletion ... I want Pinebox to show me a notification so I can go
+// in and approve it." Polls the desk's cheap summary; a new arrival raises
+// the card; the badge stays while anything waits.
+function createDesktopRetireNotices({request, openDesk, storage = localStorage, key = '', interval = 6000}) {
+  let stopped = false, timer = null, running = null, seen = 0, count = 0, fresh = false;
+  const storageKey = 'pine-desktop-retire-seq:' + key;
+  try { seen = Number(storage.getItem(storageKey)) || 0; } catch (_) { /* storage unavailable */ }
+  const root = document.createElement('div'); root.id = 'desktopRetireNotices';
+  const style = document.createElement('style'); style.textContent = `
+    #desktopRetireNotices{position:fixed;left:18px;bottom:16px;z-index:2147483000;color:#f3ecdc;font:13px/1.45 system-ui}
+    #desktopRetireNotices button{font:inherit;color:inherit;background:#3a2e14;border:1px solid #b08a3e;border-radius:7px;padding:8px 12px;cursor:pointer}
+    #desktopRetireNotices button:focus-visible{outline:3px solid #ffd479;outline-offset:3px}
+    #desktopRetireNotices aside{width:min(380px,calc(100vw - 36px));padding:18px;margin-bottom:10px;background:#241c0c;border:1px solid #b08a3e;border-radius:12px;box-shadow:0 8px 40px #0008}
+    #desktopRetireNotices aside[hidden]{display:none}#desktopRetireNotices strong{font-size:18px}
+    #desktopRetireNotices p{color:#d8ccb4;margin:9px 0 14px}#desktopRetireNotices .actions{display:flex;gap:8px;flex-wrap:wrap}
+    #desktopRetireNotices>.badge{font-size:12px}#desktopRetireNotices>.badge[hidden]{display:none}
+  `;
+  const card = document.createElement('aside'); card.hidden = true; card.setAttribute('aria-label', 'The retirement desk');
+  const title = document.createElement('strong'); title.setAttribute('role', 'status');
+  const text = document.createElement('p');
+  const actions = document.createElement('div'); actions.className = 'actions';
+  const open = document.createElement('button'); open.type = 'button'; open.textContent = 'Open the desk';
+  const later = document.createElement('button'); later.type = 'button'; later.textContent = 'Later';
+  const badge = document.createElement('button'); badge.type = 'button'; badge.className = 'badge'; badge.hidden = true;
+  function dismiss() { fresh = false; card.hidden = true; try { storage.setItem(storageKey, String(seen)); } catch (_) { /* storage unavailable */ } }
+  open.onclick = () => { try { openDesk(); } catch (_) { /* the page opens in the app or the browser */ } dismiss(); };
+  badge.onclick = () => { try { openDesk(); } catch (_) { /* as above */ } };
+  later.onclick = dismiss;
+  actions.append(open, later); card.append(title, text, actions); root.append(style, card, badge); document.body.append(root);
+  function paint() {
+    badge.hidden = !count; badge.textContent = '⏳ Retirement desk (' + count + ')';
+    if (fresh && count) {
+      title.textContent = count === 1 ? 'A round waits for your decision before leaving the cupboard'
+        : count + ' rounds wait for your decision before leaving the cupboard';
+      text.textContent = 'The station would have deleted them - rhymed rounds by your rule. Remove them, or keep them and extend their life. The desk shows the rules by type and a life timer on every item.';
+      card.hidden = false;
+    }
+  }
+  async function poll() {
+    if (stopped || running) return running;
+    running = (async () => {
+      try {
+        const data = await request('/api/retire?summary=1');
+        if (stopped) return;
+        count = Number(data.pending) || 0;
+        const seq = Number(data.seq) || 0;
+        if (count && seq > seen) { fresh = true; seen = seq; }
+        if (!count) { fresh = false; card.hidden = true; }
+        paint();
+      } catch (_) { /* the desk is still there; a temporary outage is retried */ }
+      finally { running = null; clearTimeout(timer); if (!stopped) timer = setTimeout(poll, interval); }
+    })();
+    return running;
+  }
+  timer = setTimeout(poll, 1500);
+  return {poll, destroy() { stopped = true; clearTimeout(timer); root.remove(); }};
+}
+
 let desktopRejectionOpenToken = 0;
 async function openDesktopRejectionReview(id) {
   const token = ++desktopRejectionOpenToken;
@@ -12316,6 +12375,14 @@ if (typeof api.onSupportProgress === "function") {
   await loadConfig();
   const rejectionNotices = createDesktopRejectionNotices({request: path => api.get(path), openReview: openDesktopRejectionReview, key: config.baseUrl});
   window.addEventListener('beforeunload', () => rejectionNotices.destroy(), {once: true});
+  // 2026-09-08: the retirement desk's notice. The desk page authenticates
+  // itself (the server embeds the key when autofill is on), so it opens
+  // as the app's own window through main.js's same-origin carve-out.
+  const retireNotices = createDesktopRetireNotices({
+    request: path => api.get(path), key: config.baseUrl,
+    openDesk: () => window.open(String(config.baseUrl || '').replace(/\/$/, '') + '/cupboard/retire', '_blank', 'popup,width=1160,height=840'),
+  });
+  window.addEventListener('beforeunload', () => retireNotices.destroy(), {once: true});
   initSlidesSplit();
   (await api.backendLog()).forEach(appendLog);
   if (config.mode === "launch") {

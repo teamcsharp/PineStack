@@ -151,9 +151,17 @@
       if (!j.ok && (j.faults || []).length) add('   ' + j.faults.join('; '), 'small', 'dim');
     }
     y += size * 0.6;
-    add('THE CUPBOARD · ' + (c.rounds || []).length + ' rounds', 'title', 'head');
+    // 2026-09-08: a life timer on every round, its airings, and whether it
+    // waits on the retirement desk.
+    const lifeText = (sec) => { sec = Math.max(0, Math.round(Number(sec) || 0));
+      return sec >= 172800 ? Math.floor(sec / 86400) + 'd ' + Math.floor((sec % 86400) / 3600) + 'h'
+        : sec >= 3600 ? Math.floor(sec / 3600) + 'h ' + Math.floor((sec % 3600) / 60) + 'm' : Math.floor(sec / 60) + 'm'; };
+    const waiting = (c.rounds || []).filter((r) => r.retire === 'pending').length;
+    add('THE CUPBOARD · ' + (c.rounds || []).length + ' rounds' + (waiting ? ' · ' + waiting + ' WAIT FOR YOUR DECISION' : ''), 'title', 'head');
     for (const r of (c.rounds || [])) {
-      add((r.kind || '').toUpperCase() + (r.label ? ' · ' + r.label : '') + ' · ' + (r.state || '') + ' · audio ' + (r.audio || '') + (r.cut ? ' · cut ' + r.cut : '') + ' · ' + (r.grade || ''), 'body', 'head');
+      add((r.kind || '').toUpperCase() + (r.label ? ' · ' + r.label : '') + ' · ' + (r.state || '') + ' · audio ' + (r.audio || '') + (r.cut ? ' · cut ' + r.cut : '') + ' · ' + (r.grade || '')
+        + (r.life_left != null ? ' · ⏳ ' + lifeText(r.life_left) : '') + (r.innings > 1 ? ' · ' + (r.aired || 0) + '/' + r.innings + ' airings' : ''), 'body', 'head');
+      if (r.retire === 'pending') add('   ⏳ waits on the retirement desk - decide on the panel (⏳) or /cupboard/retire', 'small', 'no');
       for (const l of (r.lines || [])) add((l.mark === 'cut' ? 'CUT · ' : l.rhyme ? '♪ ' : '· ') + (l.who || '') + ': ' + (l.text || ''),
         'body', l.mark === 'cut' ? 'no' : l.rhyme ? 'ok' : 'dim', l.mark === 'cut' ? l : null);
       y += size * 0.4;
@@ -391,9 +399,11 @@
     if (!blocks.length) {
       ctx.font = size + 'px sans-serif'; ctx.fillStyle = '#c3d4df';
       const spinning = station?.now && (station.now.title || station.now.artist);
-      const idle = station?.paused ? 'Paused · nothing is being said'
+      const waits = Number(station?.dialogue_flow?.retire?.pending || 0);
+      const idle = (station?.paused ? 'Paused · nothing is being said'
         : spinning ? '♪ ' + [station.now.artist, station.now.title].filter(Boolean).join(' - ')
-        : station?.on === false ? 'Off the air' : 'On the air · nothing is being said';
+        : station?.on === false ? 'Off the air' : 'On the air · nothing is being said')
+        + (waits ? ' · ⏳ ' + waits + ' round' + (waits === 1 ? '' : 's') + ' wait for your decision at the retirement desk' : '');
       wrap(idle, width - 32, ctx.font).forEach((line) => {
         ctx.fillText(line, 16, y); y += size * 1.5;
       });

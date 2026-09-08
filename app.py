@@ -12562,6 +12562,20 @@ def pantry_spoken_for() -> set[str]:
         for entry in list(_LARDER):
             if dialogue_row_viable("banter", entry):
                 held.update(_row_clip_keys(entry))
+        # 2026-09-08: a row waiting on the retirement desk holds its clips
+        # too - the operator may keep it.
+        try:
+            _pend = retire_pending_ids()
+            if _pend:
+                for kind, rows in _SHELF.items():
+                    for row in (rows or []):
+                        if str(row.get("sid") or "") in _pend:
+                            held.update(_row_clip_keys(row))
+                for entry in list(_LARDER):
+                    if str(entry.get("sid") or "") in _pend:
+                        held.update(_row_clip_keys(entry))
+        except Exception:  # noqa: BLE001
+            pass
         # Track links live beside the exact records they introduce rather
         # than on _SHELF. Omitting them here made every successfully cut
         # intro/send-off look like a loose render: horizon cleanup could
@@ -13178,17 +13192,22 @@ def tinted_keep_until(kind: str, row: Any, stamp: bool = True) -> float:
     keep_until reads the same one; a stamp survives the crystal being
     turned off later, because the round WAS rhymed."""
     try:
-        if not isinstance(row, dict) or str(kind) == "news":
+        if not isinstance(row, dict):
             return 0.0
         entry = row.get("entry") if isinstance(row.get("entry"), dict) else None
         got = float(row.get("keep_until") or (entry or {}).get("keep_until") or 0)
         if got:
             return got
-        if TINTED_KEEP_SECONDS <= 0 or not dialogue_tint_required():
+        if not dialogue_tint_required():
+            return 0.0
+        # The kind's rule on the retirement desk (news keeps nothing by
+        # default: a bulletin dies with its stories).
+        span = float(retire_rule(kind)["keep_hours"] or 0) * 3600.0
+        if span <= 0:
             return 0.0
         if not dialogue_tint_ready(kind, row):
             return 0.0
-        until = time.time() + TINTED_KEEP_SECONDS
+        until = time.time() + span
         if stamp:
             row["keep_until"] = until
             row["tinted_seen_at"] = time.time()
@@ -13213,13 +13232,19 @@ def row_innings(kind: str, row: Any) -> int:
     and played and added to the repertoire" - three innings against a
     three-hour rest is a souvenir, not a repertoire)."""
     base = shelf_innings(kind)
+    extra = 0
+    try:
+        # The desk's "keep" on an item past its innings hands it a fresh set.
+        extra = int((row or {}).get("innings_extra") or 0) if isinstance(row, dict) else 0
+    except Exception:  # noqa: BLE001
+        extra = 0
     try:
         if tinted_kept(kind, row):
             bonus = int(orch_policy("innings_bonus") or 0)
-            return max(base, max(1, min(60, SHELF_REUSE_MOST_EVERGREEN + bonus)))
+            return max(base, max(1, min(60, int(retire_rule(kind)["innings"]) + bonus))) + extra
     except Exception:  # noqa: BLE001
         pass
-    return base
+    return base + extra
 
 
 def larder_stock_count() -> int:
@@ -13246,16 +13271,51 @@ def larder_trim() -> None:
         rep = [e for e in _LARDER if tinted_kept("banter", e)]
         rep_ids = {id(e) for e in rep}
         stock = [e for e in _LARDER if id(e) not in rep_ids]
+        drop: list[dict[str, Any]] = []
         if len(rep) > TINTED_KEEP_ROWS:
             rep.sort(key=lambda e: (1 if row_unaired(e) else 0,
                                     float(e.get("aired_at") or 0)))
-            rep = rep[len(rep) - TINTED_KEEP_ROWS:]
+            for e in rep[:len(rep) - TINTED_KEEP_ROWS]:
+                if retire_may("banter", e, f"the repertoire is over its {TINTED_KEEP_ROWS}-row ceiling"):
+                    drop.append(e)
         if len(stock) > cap:
-            stock = stock[-cap:]
-        keep = {id(e) for e in rep} | {id(e) for e in stock}
-        _LARDER[:] = [e for e in _LARDER if id(e) in keep]
+            for e in stock[:len(stock) - cap]:
+                if retire_may("banter", e, f"the larder is over its cap of {cap}"):
+                    drop.append(e)
+        drop_ids = {id(e) for e in drop}
+        _LARDER[:] = [e for e in _LARDER if id(e) not in drop_ids]
+        # The hard ceiling - twice the two allowances - so an unanswered
+        # desk cannot grow the larder without end. Oldest first, written down.
+        ceiling = (cap + TINTED_KEEP_ROWS) * 2
+        if len(_LARDER) > ceiling:
+            oldest = sorted(_LARDER, key=lambda e: float(e.get("at") or 0))[:len(_LARDER) - ceiling]
+            for e in oldest:
+                retire_forced("banter", e, "the larder's hard ceiling")
+            old_ids = {id(e) for e in oldest}
+            _LARDER[:] = [e for e in _LARDER if id(e) not in old_ids]
     except Exception:  # noqa: BLE001
         del _LARDER[:-larder_cap()]
+
+
+def larder_prune_why(e: dict[str, Any], paused: bool) -> str:
+    """Why the keeper would let this round go - "" while it stays. The
+    #1150/#1151 shields (paused and unheard) and the 2026-09-08 keep ride
+    here so every larder road reads one rule."""
+    try:
+        now = time.time()
+        age = now - float(e.get("at") or 0)
+        fresh = (age < larder_fresh()
+                 or (shelf_is_repeat("banter", e) and age <= REPEAT_KEEP_SECONDS)
+                 or tinted_kept("banter", e)
+                 or (paused and row_unaired(e)))
+        if not fresh:
+            return (f"past the larder's freshness ({int(larder_fresh() // 60)} min) "
+                    f"at {int(age // 60)} min")
+        if not (_larder_current(e) or (paused and row_unaired(e))):
+            return "the contract moved (cast, crystal or plot act)"
+        return ""
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 def repertoire_status() -> dict[str, Any]:
@@ -13290,6 +13350,613 @@ def repertoire_status() -> dict[str, Any]:
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+# --- THE RETIREMENT DESK (2026-09-08) --------------------------------------
+# "Whenever rhyming rhetoric as a result of our tinting is pending deletion
+# or is being set up for deletion, I want Pinebox to show me a notification
+# so I can go in and approve it ... all the files that we are deleting from
+# the cupboard, I want approval to choose whether or not they are getting
+# removed ... set the rules for objects of that type and how they are
+# handled and how long they remain along with seeing timers for each and
+# every item indicating how long its life is."
+#
+# Every road that lets go of a cupboard item - the larder prune, the disk
+# restore, the cap trims, the burn on take, the shelf burn sweep, the
+# failed-take rebind, alt_shelf_trim - asks retire_may() first. For an item
+# its kind's rule says to ASK about (rhymed rounds by default) the desk
+# records a pending retirement, notifies the operator and answers NO until
+# the operator answers: remove (it goes at once) or keep (its life and its
+# innings are extended). A kind whose rule says "never" goes as it always
+# did. Each store keeps a hard ceiling so an unanswered desk cannot grow a
+# store without end; a removal the ceiling forced is written down as such.
+RETIRE_RULES_PATH = data_path("retire_rules.json")
+RETIRE_LEDGER_PATH = data_path("retire_ledger.json")
+RETIRE_ASK_KINDS = ("tinted", "all", "never")
+RETIRE_KEEP_DECIDED = 240
+RETIRE_NOTE_EVERY = 300.0
+_RETIRE: dict[str, Any] = {"rules": None, "ledger": None, "seq": 0,
+                           "noted_at": 0.0, "noted": 0, "saved_at": 0.0}
+_RETIRE_LOCK = RLock()
+
+
+def retire_kinds() -> list[str]:
+    """Every kind of item the cupboard holds, the larder's banter first."""
+    kinds = ["banter"]
+    try:
+        kinds += [str(k) for k in SHELF_CAPS if str(k) not in kinds]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        kinds += [str(k) for k in _SHELF if str(k) not in kinds]
+    except Exception:  # noqa: BLE001
+        pass
+    return kinds
+
+
+def retire_kind_label(kind: str) -> str:
+    try:
+        return {"banter": "a booth round"}.get(str(kind)) or SHELF_LABEL.get(str(kind)) or str(kind)
+    except Exception:  # noqa: BLE001
+        return str(kind)
+
+
+def retire_rule_default(kind: str) -> dict[str, Any]:
+    kind = str(kind)
+    keep = 0.0 if kind == "news" else TINTED_KEEP_SECONDS / 3600.0
+    return {"ask": "never" if kind in ("news", "station_id") else "tinted",
+            "keep_hours": round(keep, 1),
+            "innings": int(SHELF_REUSE_MOST_EVERGREEN)}
+
+
+def _retire_load() -> None:
+    with _RETIRE_LOCK:
+        if _RETIRE["rules"] is None:
+            rules: dict[str, Any] = {}
+            try:
+                got = json.loads(RETIRE_RULES_PATH.read_text())
+                if isinstance(got, dict):
+                    rules = {str(k): v for k, v in got.items() if isinstance(v, dict)}
+            except Exception:  # noqa: BLE001
+                rules = {}
+            _RETIRE["rules"] = rules
+        if _RETIRE["ledger"] is None:
+            ledger: dict[str, Any] = {}
+            try:
+                got = json.loads(RETIRE_LEDGER_PATH.read_text())
+                if isinstance(got, dict):
+                    ledger = {str(k): v for k, v in got.items() if isinstance(v, dict)}
+            except Exception:  # noqa: BLE001
+                ledger = {}
+            _RETIRE["ledger"] = ledger
+            _RETIRE["seq"] = max([int(v.get("seq") or 0) for v in ledger.values()] + [int(_RETIRE.get("seq") or 0)])
+
+
+def _retire_write(path: Path, body: Any) -> None:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(body, default=str))
+        tmp.replace(path)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _retire_save(force: bool = False) -> None:
+    """The ledger is small; it is written at most every few seconds and at
+    once on a decision."""
+    now = time.time()
+    if not force and now - float(_RETIRE.get("saved_at") or 0) < 3.0:
+        return
+    _RETIRE["saved_at"] = now
+    with _RETIRE_LOCK:
+        body = dict(_RETIRE.get("ledger") or {})
+    _retire_write(RETIRE_LEDGER_PATH, body)
+
+
+def retire_rule(kind: str) -> dict[str, Any]:
+    """The operator's rule for this kind, over the default."""
+    _retire_load()
+    out = retire_rule_default(kind)
+    got = (_RETIRE.get("rules") or {}).get(str(kind)) or {}
+    if got.get("ask") in RETIRE_ASK_KINDS:
+        out["ask"] = got["ask"]
+    try:
+        if got.get("keep_hours") is not None:
+            out["keep_hours"] = round(max(0.0, min(24.0 * 30, float(got["keep_hours"]))), 1)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if got.get("innings") is not None:
+            out["innings"] = max(1, min(60, int(got["innings"])))
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def retire_rules_set(kind: str, ask: Any = None, keep_hours: Any = None,
+                     innings: Any = None) -> dict[str, Any]:
+    _retire_load()
+    kind = str(kind)
+    with _RETIRE_LOCK:
+        row = dict((_RETIRE["rules"] or {}).get(kind) or {})
+        if ask in RETIRE_ASK_KINDS:
+            row["ask"] = ask
+        if keep_hours is not None and str(keep_hours) != "":
+            row["keep_hours"] = max(0.0, min(24.0 * 30, float(keep_hours)))
+        if innings is not None and str(innings) != "":
+            row["innings"] = max(1, min(60, int(innings)))
+        _RETIRE["rules"][kind] = row
+        _retire_write(RETIRE_RULES_PATH, dict(_RETIRE["rules"]))
+    return retire_rule(kind)
+
+
+def retire_rules_all() -> list[dict[str, Any]]:
+    """Every kind with its rule and the fixed clocks the rule sits over."""
+    out = []
+    for kind in retire_kinds():
+        rule = retire_rule(kind)
+        try:
+            base_innings = shelf_innings(kind)
+        except Exception:  # noqa: BLE001
+            base_innings = SHELF_REUSE_MOST
+        if kind == "banter":
+            clocks = (f"plain: {int(larder_fresh() // 60)} min unaired in the larder, "
+                      f"{int(REPEAT_KEEP_SECONDS // 3600)} h as an aired repeat; "
+                      f"{base_innings} airings; rest {round(shelf_rest_now() / 3600.0, 1)} h")
+        elif kind == "news":
+            clocks = f"a bulletin lives {int(NEWS_PREP_LIFE // 3600)} h with its stories"
+        elif kind == "caller":
+            clocks = ("single-use: aired once, then its re-air window "
+                      f"({int(float(dj_settings().get('caller_repeat_hours') or 6))} h); unheard rows are never dropped")
+        else:
+            reusable = kind in SHELF_REUSABLE
+            clocks = (f"plain: {int(PANTRY_BURN_SECONDS // 3600)} h unaired on the shelf"
+                      + (f", {int(REPEAT_KEEP_SECONDS // 3600)} h as an aired repeat; {base_innings} airings; "
+                         f"rest {round(shelf_rest_now() / 3600.0, 1)} h" if reusable else "; aired once"))
+        out.append({"kind": kind, "label": retire_kind_label(kind), **rule,
+                    "default": retire_rule_default(kind), "clocks": clocks,
+                    "reusable": kind in SHELF_REUSABLE or kind == "banter"})
+    return out
+
+
+def row_is_rhymed(kind: str, row: Any) -> bool:
+    """Did this item go through the crystal and pass - whatever the crystal
+    is set to now? A stamped keep, a tinted script that is the active
+    script, or a single-line row marked tint_ok."""
+    try:
+        if not isinstance(row, dict):
+            return False
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else None
+        if float(row.get("keep_until") or (entry or {}).get("keep_until") or 0):
+            return True
+        e = entry if entry is not None else row
+        tinted = str(e.get("script_tinted") or "").strip()
+        if tinted and str(e.get("script") or "").strip() == tinted:
+            return True
+        return bool(row.get("tint_ok")) and bool(str(row.get("text") or "").strip())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def retire_id(kind: str, row: Any) -> str:
+    """The item's stable id, written onto the row."""
+    try:
+        got = alt_sid(str(kind), row)
+        if got:
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        e = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        raw = f"{kind}|{row.get('at') or ''}|{str(e.get('script') or row.get('text') or '')[:400]}"
+        got = f"{str(kind)[:12]}-{hashlib.sha1(raw.encode('utf-8', 'ignore')).hexdigest()[:16]}"
+        row["sid"] = got
+        return got
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def retire_text(kind: str, row: Any) -> str:
+    try:
+        e = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        script = str(e.get("script") or e.get("script_plain") or row.get("text") or "")
+        return " ".join(script.split())[:240]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def retire_label(kind: str, row: Any) -> str:
+    try:
+        e = row.get("entry") if isinstance(row.get("entry"), dict) else row
+        return str(e.get("label") or e.get("caller_name") or row.get("label")
+                   or row.get("who") or "")[:60]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def retire_life_left(kind: str, row: Any) -> float:
+    """Seconds until this item stops being offered - its keep if rhymed,
+    else its stock clock. 0 when it is already past."""
+    try:
+        exp = stock_expires_at(str(kind), row)
+        return max(0.0, exp - time.time()) if exp else 0.0
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _retire_notify() -> None:
+    """The panel and the Pine Box learn from /api/dj; the action log gets a
+    line at most every five minutes while something waits."""
+    try:
+        now = time.time()
+        pending = retire_pending_count()
+        if not pending:
+            return
+        if now - float(_RETIRE.get("noted_at") or 0) < RETIRE_NOTE_EVERY and pending <= int(_RETIRE.get("noted") or 0):
+            return
+        _RETIRE["noted_at"] = now
+        _RETIRE["noted"] = pending
+        note_action(f"🗄⏳ {pending} round(s) wait for your decision before leaving the cupboard "
+                    "- open the retirement desk (/cupboard/retire)")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def retire_pending_count() -> int:
+    _retire_load()
+    with _RETIRE_LOCK:
+        return sum(1 for v in (_RETIRE.get("ledger") or {}).values() if v.get("state") == "pending")
+
+
+def retire_pending_ids() -> set[str]:
+    _retire_load()
+    with _RETIRE_LOCK:
+        return {str(k) for k, v in (_RETIRE.get("ledger") or {}).items() if v.get("state") == "pending"}
+
+
+def retire_may(kind: str, row: Any, why: str = "") -> bool:
+    """May this cupboard item be deleted now? The desk's answer.
+
+    True: go ahead (the kind's rule does not ask, or the operator said
+    remove). False: keep it - the operator has not answered yet, or said
+    keep and its extended life is still running."""
+    rhymed = False
+    try:
+        if not isinstance(row, dict):
+            return True
+        rule = retire_rule(kind)
+        rhymed = row_is_rhymed(kind, row)
+        if rule["ask"] == "never" or (rule["ask"] == "tinted" and not rhymed):
+            return True
+        rid = retire_id(kind, row)
+        if not rid:
+            return True
+        now = time.time()
+        _retire_load()
+        fresh = False
+        with _RETIRE_LOCK:
+            led = _RETIRE["ledger"]
+            entry = led.get(rid)
+            if entry is not None:
+                state = str(entry.get("state") or "")
+                if state == "remove":
+                    return True
+                if state == "keep":
+                    if float(row.get("keep_until") or 0) > now:
+                        return False        # the keep is doing its job
+                    # The extended life is over: ask again, as a new arrival.
+                    _RETIRE["seq"] += 1
+                    entry.update(state="pending", asks=int(entry.get("asks") or 0) + 1,
+                                 why=str(why or entry.get("why") or "")[:200], last_asked=now,
+                                 seq=_RETIRE["seq"], aired=int(row.get("aired") or 0))
+                    fresh = True
+                elif state == "pending":
+                    entry["last_asked"] = now
+                    if why:
+                        entry["why"] = str(why)[:200]
+                    entry["aired"] = int(row.get("aired") or 0)
+                    return False
+                else:                       # gone / forced: the row is back somehow
+                    _RETIRE["seq"] += 1
+                    entry.update(state="pending", asks=int(entry.get("asks") or 0) + 1,
+                                 why=str(why)[:200], last_asked=now, seq=_RETIRE["seq"])
+                    fresh = True
+            else:
+                _RETIRE["seq"] += 1
+                led[rid] = {"id": rid, "seq": _RETIRE["seq"], "kind": str(kind),
+                            "label": retire_label(kind, row), "text": retire_text(kind, row),
+                            "rhymed": rhymed, "why": str(why)[:200],
+                            "first_asked": now, "last_asked": now, "asks": 1,
+                            "state": "pending", "aired": int(row.get("aired") or 0),
+                            "at": float(row.get("at") or 0)}
+                fresh = True
+            _retire_prune_ledger()
+        _retire_save(force=fresh)
+        if fresh:
+            _retire_notify()
+        return False
+    except Exception:  # noqa: BLE001
+        return not rhymed                   # a fault never deletes rhymed work
+
+
+def retire_forced(kind: str, row: Any, why: str) -> None:
+    """A store's hard ceiling removed this item without the operator's
+    answer. Written down so the desk shows it."""
+    try:
+        if not isinstance(row, dict):
+            return
+        rid = retire_id(kind, row)
+        if not rid:
+            return
+        _retire_load()
+        with _RETIRE_LOCK:
+            led = _RETIRE["ledger"]
+            entry = led.get(rid) or {"id": rid, "kind": str(kind), "label": retire_label(kind, row),
+                                     "text": retire_text(kind, row), "rhymed": row_is_rhymed(kind, row),
+                                     "first_asked": time.time(), "asks": 0, "at": float(row.get("at") or 0)}
+            _RETIRE["seq"] += 1
+            entry.update(state="forced", why=str(why)[:200], decided_at=time.time(),
+                         seq=_RETIRE["seq"], aired=int(row.get("aired") or 0))
+            led[rid] = entry
+            _retire_prune_ledger()
+        _retire_save(force=True)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _retire_prune_ledger() -> None:
+    """Pending rows stay; decided rows keep the newest RETIRE_KEEP_DECIDED."""
+    led = _RETIRE.get("ledger") or {}
+    done = [k for k, v in led.items() if v.get("state") != "pending"]
+    if len(done) > RETIRE_KEEP_DECIDED:
+        done.sort(key=lambda k: float(led[k].get("decided_at") or led[k].get("last_asked") or 0))
+        for k in done[:len(done) - RETIRE_KEEP_DECIDED]:
+            led.pop(k, None)
+
+
+def _retire_find(rid: str) -> tuple[str, dict[str, Any] | None]:
+    """The live row behind an id, and its store ("banter" = the larder)."""
+    rid = str(rid or "")
+    if not rid:
+        return "", None
+    try:
+        for e in list(_LARDER):
+            if isinstance(e, dict) and str(e.get("sid") or "") == rid:
+                return "banter", e
+        for kind, rows in list(_SHELF.items()):
+            for r in list(rows or []):
+                if isinstance(r, dict) and str(r.get("sid") or "") == rid:
+                    return str(kind), r
+    except Exception:  # noqa: BLE001
+        pass
+    return "", None
+
+
+def retire_remove_now(kind: str, row: dict[str, Any]) -> bool:
+    """Take the item out of its store this instant."""
+    try:
+        if str(kind) == "banter":
+            before = len(_LARDER)
+            _LARDER[:] = [e for e in _LARDER if e is not row]
+            if len(_LARDER) != before:
+                try:
+                    _radio_entry_rejected(row, "retired_by_operator")
+                except Exception:  # noqa: BLE001
+                    pass
+                _larder_save()
+                return True
+            return False
+        rows = _SHELF.get(str(kind)) or []
+        before = len(rows)
+        _SHELF[str(kind)] = [r for r in rows if r is not row]
+        if len(_SHELF[str(kind)]) != before:
+            try:
+                _pantry_save()
+            except Exception:  # noqa: BLE001
+                pass
+            return True
+        return False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def retire_decide(ids: list[str], action: str, extend_hours: Any = None) -> dict[str, Any]:
+    """The operator's answer for one or many items: remove (they go now)
+    or keep (their life and their innings are extended)."""
+    action = str(action or "")
+    if action not in ("remove", "keep"):
+        raise ValueError("action must be remove or keep")
+    _retire_load()
+    now = time.time()
+    removed, kept, gone = [], [], []
+    for rid in [str(x) for x in (ids or []) if str(x)][:500]:
+        kind, row = _retire_find(rid)
+        with _RETIRE_LOCK:
+            led = _RETIRE["ledger"]
+            entry = led.get(rid)
+            if entry is None and row is not None:
+                entry = {"id": rid, "kind": kind, "label": retire_label(kind, row),
+                         "text": retire_text(kind, row), "rhymed": row_is_rhymed(kind, row),
+                         "first_asked": now, "asks": 0, "at": float(row.get("at") or 0),
+                         "why": "the operator chose it from the cupboard listing"}
+                led[rid] = entry
+            if entry is None:
+                gone.append(rid)
+                continue
+            if action == "remove":
+                entry.update(state="remove", decided_at=now, aired=int((row or {}).get("aired") or 0))
+                if row is not None and retire_remove_now(kind, row):
+                    removed.append(rid)
+                else:
+                    entry["state"] = "gone" if row is None else "remove"
+                    gone.append(rid)
+            else:
+                hours = None
+                try:
+                    hours = float(extend_hours) if extend_hours not in (None, "") else None
+                except Exception:  # noqa: BLE001
+                    hours = None
+                if hours is None:
+                    hours = float(retire_rule(kind or entry.get("kind") or "banter")["keep_hours"] or 0) or 24.0
+                hours = max(0.5, min(24.0 * 30, hours))
+                entry.update(state="keep", decided_at=now, keep_hours=hours,
+                             keeps=int(entry.get("keeps") or 0) + 1)
+                if row is not None:
+                    # A keep re-binds a moved contract: the operator has
+                    # said this round is fine under today's world. Judged
+                    # BEFORE the keep is stamped (a kept round is current
+                    # by the keep alone, and that would lapse with it).
+                    _stale = False
+                    try:
+                        _e = row.get("entry") if isinstance(row.get("entry"), dict) else row
+                        _stale = bool(_e.get("script")) and not _larder_current(_e)
+                    except Exception:  # noqa: BLE001
+                        _stale = False
+                    until = now + hours * 3600.0
+                    row["keep_until"] = until
+                    row["retire_kept"] = int(row.get("retire_kept") or 0) + 1
+                    if isinstance(row.get("entry"), dict):
+                        row["entry"]["keep_until"] = until
+                    if _stale:
+                        try:
+                            _e["profile"] = _larder_profile_signature()
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # An item kept past its innings gets a fresh set.
+                    try:
+                        if int(row.get("aired") or 0) >= row_innings(kind, row):
+                            row["innings_extra"] = int(row.get("innings_extra") or 0) + int(
+                                retire_rule(kind)["innings"])
+                    except Exception:  # noqa: BLE001
+                        pass
+                    kept.append(rid)
+                    entry["keep_until"] = until
+                else:
+                    entry["state"] = "gone"
+                    gone.append(rid)
+            _retire_prune_ledger()
+    _retire_save(force=True)
+    try:
+        if removed or kept:
+            note_action(f"🗄⏳ retirement desk: {len(removed)} removed, {len(kept)} kept"
+                        + (f" for {hours:g} h" if kept and action == "keep" else ""))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        _INVENTORY_PLAN["at"] = 0.0
+        _COMMITS["at"] = 0.0
+    except Exception:  # noqa: BLE001
+        pass
+    return {"ok": True, "removed": removed, "kept": kept, "gone": gone,
+            "pending": retire_pending_count()}
+
+
+def retire_summary() -> dict[str, Any]:
+    """The cheap answer for /api/dj, the panel badge and the Pine Box card."""
+    _retire_load()
+    with _RETIRE_LOCK:
+        pend = [v for v in (_RETIRE.get("ledger") or {}).values() if v.get("state") == "pending"]
+    return {"pending": len(pend), "seq": int(_RETIRE.get("seq") or 0),
+            "newest_at": max([float(v.get("last_asked") or 0) for v in pend] + [0.0]),
+            "rhymed": sum(1 for v in pend if v.get("rhymed"))}
+
+
+def _retire_item(kind: str, row: dict[str, Any], entry_state: dict[str, Any] | None) -> dict[str, Any]:
+    now = time.time()
+    e = row.get("entry") if isinstance(row.get("entry"), dict) else row
+    try:
+        if e.get("tinting"):
+            stage = "tinting"
+        elif e.get("preparing"):
+            stage = "recording"
+        elif dialogue_row_ready(kind, row):
+            stage = "ready"
+        elif row_is_rhymed(kind, row):
+            stage = "rhymed, waiting to record"
+        else:
+            stage = "written, waiting for tint"
+        if e.get("script") and not _larder_current(e):
+            stage += " · the contract moved"
+    except Exception:  # noqa: BLE001
+        stage = ""
+    try:
+        innings = row_innings(kind, row) if (kind in SHELF_REUSABLE or kind == "banter") else 1
+    except Exception:  # noqa: BLE001
+        innings = 1
+    aired_at = float(row.get("aired_at") or 0)
+    try:
+        rest_left = max(0.0, shelf_rest_now() - (now - aired_at)) if aired_at else 0.0
+    except Exception:  # noqa: BLE001
+        rest_left = 0.0
+    keep_until = float(row.get("keep_until") or (e.get("keep_until") if e is not row else 0) or 0)
+    return {
+        "id": retire_id(kind, row), "kind": kind, "label": retire_kind_label(kind),
+        "name": retire_label(kind, row), "text": retire_text(kind, row),
+        "rhymed": row_is_rhymed(kind, row), "stage": stage,
+        "aired": int(row.get("aired") or 0), "innings": innings,
+        "aired_at": aired_at, "rest_left": round(rest_left),
+        "at": float(row.get("at") or 0), "age": round(max(0.0, now - float(row.get("at") or 0))),
+        "life_left": round(retire_life_left(kind, row)), "keep_until": keep_until,
+        "expires_at": float(stock_expires_at(kind, row) or 0),
+        "kept_times": int(row.get("retire_kept") or 0),
+        "pending": bool(entry_state and entry_state.get("state") == "pending"),
+        "decision": str((entry_state or {}).get("state") or ""),
+        "why": str((entry_state or {}).get("why") or ""),
+        "asks": int((entry_state or {}).get("asks") or 0),
+    }
+
+
+def retire_state() -> dict[str, Any]:
+    """Everything the desk shows: what waits, what was decided, the rules,
+    and every item in the cupboard with its timers."""
+    _retire_load()
+    now = time.time()
+    with _RETIRE_LOCK:
+        ledger = {k: dict(v) for k, v in (_RETIRE.get("ledger") or {}).items()}
+    inventory: list[dict[str, Any]] = []
+    live: dict[str, dict[str, Any]] = {}
+    try:
+        for e in list(_LARDER):
+            if isinstance(e, dict):
+                item = _retire_item("banter", e, ledger.get(retire_id("banter", e)))
+                inventory.append(item)
+                live[item["id"]] = item
+        for kind, rows in list(_SHELF.items()):
+            for r in list(rows or []):
+                if isinstance(r, dict):
+                    item = _retire_item(str(kind), r, ledger.get(retire_id(str(kind), r)))
+                    inventory.append(item)
+                    live[item["id"]] = item
+    except Exception:  # noqa: BLE001
+        pass
+    inventory.sort(key=lambda i: (0 if i["pending"] else 1, i["life_left"]))
+    pending, decided = [], []
+    for rid, v in ledger.items():
+        row = dict(v)
+        row["live"] = rid in live
+        if rid in live:
+            row.update({k: live[rid][k] for k in ("life_left", "stage", "innings", "aired", "rest_left",
+                                                  "keep_until", "kept_times")})
+        if v.get("state") == "pending":
+            if rid not in live:
+                # The row left by another road (aired out, purged, replaced): nothing to decide.
+                with _RETIRE_LOCK:
+                    led = _RETIRE.get("ledger") or {}
+                    if rid in led:
+                        led[rid].update(state="gone", decided_at=now)
+                continue
+            pending.append(row)
+        else:
+            decided.append(row)
+    pending.sort(key=lambda r: -float(r.get("seq") or 0))
+    decided.sort(key=lambda r: -float(r.get("decided_at") or r.get("last_asked") or 0))
+    return {"at": now, "pending": pending, "decided": decided[:60],
+            "rules": retire_rules_all(), "inventory": inventory,
+            "counts": {"pending": len(pending), "inventory": len(inventory),
+                       "rhymed": sum(1 for i in inventory if i["rhymed"]),
+                       "larder_cap": larder_cap(), "repertoire_rows": TINTED_KEEP_ROWS},
+            "summary": retire_summary()}
 
 
 def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
@@ -13939,9 +14606,10 @@ def shelf_take(kind: str, voice: str = "",
             # function is for.
             _old = time.time() - float(row.get("at") or 0)
             if (_old > PANTRY_BURN_SECONDS
-                    and resort_may_drop(str(kind), row, _rk)
                     and not (shelf_is_repeat(kind, row)
-                             and _old <= REPEAT_KEEP_SECONDS)):
+                             and _old <= REPEAT_KEEP_SECONDS)
+                    and resort_may_drop(str(kind), row, _rk,
+                                        "past the 24-hour burn horizon on the shelf")):
                 _why.append("burnt")
                 continue
             # #977: it has been out; has it rested long enough?
@@ -14057,23 +14725,28 @@ def shelf_take(kind: str, voice: str = "",
         # ignored #1075's rule ("any segment that is stored needs to be
         # played and ran on the air before it's deleted"), and it is the
         # line that erased the caller shelf after a long pause.
+        def _plainly_alive(r: dict[str, Any]) -> bool:
+            return (time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
+                    # #977: and an item that has had all its airings is done,
+                    # even if the burn would still keep it.
+                    and int(r.get("aired") or 0) < row_innings(str(kind), r)
+                    # A completed phone call is history, never stock. Once-
+                    # aired non-reusable rows left behind by an older build
+                    # cannot occupy the queue or be offered as a "new" call
+                    # after restart.
+                    and (not float(r.get("aired_at") or 0)
+                         or str(kind) in SHELF_REUSABLE
+                         # #1033: an aired call is stock until its window
+                         # closes or its airings are spent.
+                         or (str(kind) == "caller"
+                             and story_rerun_keep_row(r))))
+        # The alive test first, so the desk is only asked about a row that
+        # would actually go.
         _SHELF[str(kind)] = [
             r for r in rows
-            if not resort_may_drop(str(kind), r, _rk)
-            or (time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
-                # #977: and an item that has had all its airings is done,
-                # even if the burn would still keep it.
-                and int(r.get("aired") or 0) < row_innings(str(kind), r)
-                # A completed phone call is history, never stock. Once-
-                # aired non-reusable rows left behind by an older build
-                # cannot occupy the queue or be offered as a "new" call
-                # after restart.
-                and (not float(r.get("aired_at") or 0)
-                     or str(kind) in SHELF_REUSABLE
-                     # #1033: an aired call is stock until its window
-                     # closes or its airings are spent.
-                     or (str(kind) == "caller"
-                         and story_rerun_keep_row(r))))]
+            if _plainly_alive(r)
+            or not resort_may_drop(str(kind), r, _rk,
+                                   "shed after a failed take: past the burn horizon or its innings")]
     except Exception:  # noqa: BLE001
         return None
     return None
@@ -15756,7 +16429,8 @@ def pantry_burn() -> int:
                         or (shelf_is_repeat(kind, r)
                             and now - float(r.get("at") or 0)
                             <= REPEAT_KEEP_SECONDS)
-                        or not resort_may_drop(kind, r, _rk))]
+                        or not resort_may_drop(kind, r, _rk,
+                                               "the shelf burn sweep: past the 24-hour horizon"))]
             if len(keep) != len(rows):
                 burned[str(kind)] = len(rows) - len(keep)
                 _SHELF[kind] = keep
@@ -25343,8 +26017,74 @@ def _larder_profile_signature() -> str:
 
 
 def _larder_current(entry: dict[str, Any]) -> bool:
-    """A cached script must match today's writing contract before it airs."""
+    """A cached script must match today's writing contract before it airs.
+
+    2026-09-08: ...unless it is a RHYMED round inside its keep. The
+    contract carries the crystal and the plot's act (#862, #907) so that
+    a plain round written under an old world is rewritten - but a rhymed
+    round has that world in its words already, and the act rolling over
+    was deleting the whole repertoire every time it did (22 kept rounds
+    gone in one tick, 13:54 CST). The retirement desk decides when a
+    rhymed round goes; the contract decides only about plain ones."""
+    try:
+        if tinted_kept(str(entry.get("prep_kind") or "banter"), entry):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
     return str(entry.get("profile") or "") == _larder_profile_signature()
+
+
+def larder_unviable_why(e: dict[str, Any]) -> str:
+    """Why a larder row is no longer viable - "" when it is."""
+    try:
+        if e.get("off_brief"):
+            return "off brief: the round failed its segment brief"
+        if not _larder_current(e):
+            return "the contract moved (cast, crystal or plot act)"
+        try:
+            if tint_exhausted(e) and not dialogue_tint_ready("banter", e):
+                return "struck out: twelve refused answers and no bar"
+        except Exception:  # noqa: BLE001
+            pass
+        if not str(e.get("script_plain") or e.get("script") or "").strip():
+            return "no script"
+    except Exception:  # noqa: BLE001
+        return ""
+    return ""
+
+
+def larder_rebind_viable() -> int:
+    """2026-09-08: the larder keeps its viable rows; a row that is not asks
+    the retirement desk before it goes (retire_may). Before this both
+    append sites rebound to `[e for e in _LARDER if dialogue_row_viable]`
+    and a moved contract emptied the larder without a word. Returns how
+    many rows went."""
+    staying: list[dict[str, Any]] = []
+    gone: list[str] = []
+    for e in list(_LARDER):
+        if not isinstance(e, dict):
+            continue
+        if dialogue_row_viable("banter", e):
+            staying.append(e)
+            continue
+        why = larder_unviable_why(e) or "not viable"
+        if retire_may("banter", e, why):
+            gone.append(why)
+            try:
+                _radio_entry_rejected(e, "reserve_row_removed")
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            staying.append(e)
+    _LARDER[:] = staying
+    if gone:
+        try:
+            from collections import Counter as _C
+            pipeline_log("lookahead", f"{len(gone)} larder round(s) let go at the rebind: "
+                         + "; ".join(f"{n}× {w}" for w, n in _C(gone).most_common(4)))
+        except Exception:  # noqa: BLE001
+            pass
+    return len(gone)
 
 
 # #915: the finished audio outlives the process. The clips are already
@@ -25688,15 +26428,23 @@ def _larder_load() -> None:
     if isinstance(rows, list):
         _stranded = sum(1 for r in rows
                         if isinstance(r, dict) and r.get("preparing"))
-        _LARDER[:] = [_unstrand(r) for r in rows if isinstance(r, dict)
-                      and (time.time() - float(r.get("at") or 0)
-                           < larder_fresh()
-                           or (shelf_is_repeat("banter", r)
-                               and time.time() - float(r.get("at") or 0)
-                               <= REPEAT_KEEP_SECONDS)
-                           or tinted_kept("banter", r))          # 2026-09-08
-                      and _larder_current(r)]
+        _back: list[dict[str, Any]] = []
+        _gone: list[str] = []
+        for r in rows:
+            if not isinstance(r, dict):
+                continue
+            _w = larder_prune_why(r, False)
+            if not _w or not retire_may("banter", r, _w):     # 2026-09-08: the desk
+                _back.append(_unstrand(r))
+            else:
+                _gone.append(_w)
+        _LARDER[:] = _back
         larder_trim()
+        try:
+            pipeline_log("lookahead", f"larder restore: {len(_back)} round(s) back on the board"
+                         + (f", {len(_gone)} let go ({'; '.join(sorted(set(_gone))[:3])})" if _gone else ""))
+        except Exception:  # noqa: BLE001
+            pass
         if _stranded:
             pipeline_log("lookahead",
                          f"{_stranded} round(s) were left mid-recording by "
@@ -31119,15 +31867,14 @@ async def larder_keeper() -> None:
             # left _larder_current unconditional - so a dial moved, a
             # crystal flipped or a plot act rolling over mid-pause still
             # deleted every unheard round on the next 3s tick.
-            _LARDER[:] = [e for e in _LARDER
-                          if (time.time() - e["at"] < larder_fresh()
-                              or (shelf_is_repeat("banter", e)
-                                  and time.time() - float(e.get("at") or 0)
-                                  <= REPEAT_KEEP_SECONDS)
-                              or tinted_kept("banter", e)         # 2026-09-08
-                              or (_paused_hold and row_unaired(e)))
-                          and (_larder_current(e)
-                               or (_paused_hold and row_unaired(e)))]
+            # 2026-09-08: ...and the retirement desk has the last word on
+            # a round that would go (retire_may).
+            _staying: list[dict[str, Any]] = []
+            for e in list(_LARDER):
+                _w = larder_prune_why(e, _paused_hold)
+                if not _w or not retire_may("banter", e, _w):
+                    _staying.append(e)
+            _LARDER[:] = _staying
             # A backlog to stream on recovery: while the box is stalling
             # (breaker open, or lines piling on the hold shelf), stock far
             # more rounds than the idle default.
@@ -35414,12 +36161,14 @@ def resort_keys(kind: str) -> set[int]:
 
 
 def resort_may_drop(kind: str, row: dict[str, Any],
-                    keep: set[int] | None = None) -> bool:
+                    keep: set[int] | None = None, why: str = "") -> bool:
     """May this row be let go of at all?
 
     Three rules, and any one alone is enough to save it: it has never
     aired, it is one of the road's last-resort fallbacks, or (2026-09-08)
-    it is a rhymed round inside its 96-hour keep."""
+    it is a rhymed round inside its 96-hour keep. Past those, the
+    retirement desk has the last word (retire_may): a kind whose rule
+    asks waits for the operator."""
     try:
         if row_unaired(row):
             return False
@@ -35429,7 +36178,7 @@ def resort_may_drop(kind: str, row: dict[str, Any],
             return False
     except Exception:  # noqa: BLE001
         return False
-    return True
+    return retire_may(kind, row, why or "aged past its life on the shelf")
 
 
 def resort_state() -> dict[str, Any]:
@@ -38982,6 +39731,7 @@ def _dialogue_flow_state_fresh() -> dict[str, Any]:
         "delivery_waiting": len(_BOX_HOLD), "synth_age": synth_age,
         "prefill": bool(dj.get("dialogue_prefill", True)),
         "tint_hold": crystal_tint_holds(),                          # #1063
+        "retire": retire_summary(),                                # 2026-09-08: the desk
         "blockers": blockers,
         # #886/#887: depth in ROUNDS says nothing about whether the
         # station can keep talking. These say it in seconds of finished
@@ -45750,8 +46500,9 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
             try:
                 if ids and alt_sid(kind, row) in ids:
                     continue            # spoken for; skip it
-                if _rk is not None and not resort_may_drop(kind, row, _rk):
-                    continue            # never aired, or a last resort
+                if _rk is not None and not resort_may_drop(kind, row, _rk,
+                                                            f"the {kind} shelf is over its cap of {cap}"):
+                    continue            # never aired, a last resort, or the desk's
             except Exception:  # noqa: BLE001
                 pass
             drop.append(row)
@@ -45759,8 +46510,10 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
             rows[:] = [r for r in rows if all(r is not d for d in drop)]
         # If what must be kept still busts the cap, run over rather than
         # destroy something nobody has heard - bounded at double, so a
-        # protected shelf can never grow without end.
+        # protected shelf can never grow without end. The desk is told.
         if len(rows) > cap * 2:
+            for r in rows[:len(rows) - cap * 2]:
+                retire_forced(kind, r, f"the {kind} shelf's hard ceiling (twice its cap)")
             del rows[:len(rows) - cap * 2]
     except Exception:  # noqa: BLE001
         try:
@@ -46880,8 +47633,7 @@ async def recast_job(job: str, kind: str, sid: str, script: str,
         if str(kind) == "banter":
             entry["priority"] = lift
             if dialogue_row_viable("banter", entry):
-                _LARDER[:] = [e for e in _LARDER
-                              if dialogue_row_viable("banter", e)]
+                larder_rebind_viable()                                  # 2026-09-08: the desk
                 entry["expires_at"] = stock_expires_at("banter", entry)   # #1068
                 _LARDER.append(entry)
                 larder_trim()                                           # 2026-09-08
@@ -72250,13 +73002,25 @@ async def dj_banter(track: dict[str, Any] | None = None,
             entry["aired"] = int(entry.get("aired") or 0) + 1
             entry["used_by"] = stock_used_by()                            # #1068
             entry["expires_at"] = stock_expires_at("banter", entry)
-            if int(entry["aired"]) < row_innings("banter", entry):   # 2026-09-08
+            if (int(entry["aired"]) < row_innings("banter", entry)   # 2026-09-08
+                    or not retire_may("banter", entry,
+                                      f"its innings are used ({int(entry['aired'])} airings)")):
                 _LARDER[:] = (_LARDER[:_take_at]
                               + _LARDER[_take_at + 1:] + [entry])
             else:
                 _LARDER.pop(_take_at)
         else:
-            _LARDER.pop(_take_at)
+            # Aired, and it may not come back (#1055) - unless the desk
+            # keeps it: then it rests at the end, never offered again
+            # while it names the hour, until the operator answers.
+            entry["aired_at"] = time.time()
+            entry["aired"] = int(entry.get("aired") or 0) + 1
+            entry["used_by"] = stock_used_by()
+            if retire_may("banter", entry, "not safe to repeat: it names the hour it was made"):
+                _LARDER.pop(_take_at)
+            else:
+                _LARDER[:] = (_LARDER[:_take_at]
+                              + _LARDER[_take_at + 1:] + [entry])
         try:
             _INVENTORY_PLAN["at"] = 0.0
             _COMMITS["at"] = 0.0
@@ -73674,11 +74438,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             return []
         _stored = dialogue_row_viable("banter", entry)
         if _stored:
-            for _old_entry in list(_LARDER):
-                if not dialogue_row_viable("banter", _old_entry):
-                    _radio_entry_rejected(_old_entry, "reserve_row_removed")
-            _LARDER[:] = [e for e in _LARDER
-                          if dialogue_row_viable("banter", e)]
+            larder_rebind_viable()                                      # 2026-09-08: the desk
             entry["expires_at"] = stock_expires_at("banter", entry)       # #1068
             _LARDER.append(entry)
             larder_trim()                                               # 2026-09-08
@@ -82572,16 +83332,21 @@ def cupboard_state(most: int = 24) -> dict[str, Any]:
         return _CUPBOARD_MEMO["value"]
     rounds: list[dict[str, Any]] = []
     try:
-        seen: list[tuple[str, dict[str, Any]]] = []
+        seen: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
         for kind, held in list(_SHELF.items()):
             for row in list(held or []):
                 entry = dialogue_entry(row)
                 if entry is not None:
-                    seen.append((str(kind), entry))
+                    seen.append((str(kind), entry, row))
         for entry in list(_LARDER):
-            seen.append(("banter", entry))
+            seen.append(("banter", entry, entry))
         seen.sort(key=lambda kv: -float(kv[1].get("at") or 0))
-        for kind, entry in seen[:most]:
+        try:
+            _retire_load()
+            _ledger = dict(_RETIRE.get("ledger") or {})
+        except Exception:  # noqa: BLE001
+            _ledger = {}
+        for kind, entry, row in seen[:most]:
             script = str(entry.get("script") or "")
             if not script.strip():
                 continue
@@ -82634,9 +83399,21 @@ def cupboard_state(most: int = 24) -> dict[str, Any]:
                      "rapping" if progress or entry.get("tinting") else "untinted")
             if state == "written, waiting for tint" and progress:
                 state = "rapping " + str(sum(1 for r in progress if (r.get("evaluation") or {}).get("ok"))) + "/" + str(len(progress))
+            # 2026-09-08: the timers - how long this item has to live, its
+            # airings, and whether it waits on the retirement desk.
+            try:
+                _sid = retire_id(kind, row)
+                _life = {"sid": _sid, "life_left": round(retire_life_left(kind, row)),
+                         "aired": int(row.get("aired") or 0),
+                         "innings": (row_innings(kind, row)
+                                     if (kind in SHELF_REUSABLE or kind == "banter") else 1),
+                         "rhymed": row_is_rhymed(kind, row),
+                         "retire": str((_ledger.get(_sid) or {}).get("state") or "")}
+            except Exception:  # noqa: BLE001
+                _life = {}
             rounds.append({"kind": kind, "label": str(entry.get("label") or entry.get("caller_name") or "")[:60],
                            "state": state, "audio": f"{made}/{chunks}",
-                           "cut": int(cov.get("cut") or 0), "grade": grade, "lines": lines})
+                           "cut": int(cov.get("cut") or 0), "grade": grade, "lines": lines, **_life})
         # Bars first: ready rounds on the rhyme grade, then rounds being
         # rapped now (the bars land as the LCD scrolls), then old-grade
         # rounds waiting to be re-rapped, then plain writing.
@@ -120647,6 +121424,271 @@ async def journal_page() -> str:
     return JOURNAL_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
 
 
+# --- The retirement desk on its own URL (2026-09-08) -----------------------
+RETIRE_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The retirement desk · Pine Box</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #04060b; color: #dbe7f5;
+         font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { position: sticky; top: 0; z-index: 3; background: #0b1220; border-bottom: 1px solid #1e2a3a;
+           padding: 8px 14px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  button, select, input { font: inherit; font-size: 13px; padding: 4px 9px; background: #101a2a; color: #dbe7f5;
+           border: 1px solid #27354a; border-radius: 6px; cursor: pointer; }
+  input { cursor: text; width: 76px; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.rm { border-color: #7a3a3a; } button.rm:hover { background: #3a1616; }
+  button.kp { border-color: #3a6a3a; } button.kp:hover { background: #163a16; }
+  main { max-width: 1180px; margin: 0 auto; padding: 14px 18px 60px; }
+  .meta { color: #9fb3c8; font-size: 12px; }
+  .h { font-weight: 700; color: #8fd3ff; margin: 20px 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid #16202e; vertical-align: top; }
+  th { color: #9fb3c8; font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  tr.pending td { background: #1a1408; }
+  tr.rhymed td:first-child { border-left: 3px solid #d1e8a2; }
+  .text { color: #c9d6e3; max-width: 520px; }
+  .why { color: #ffb347; font-size: 12px; }
+  .life { font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .life.near { color: #ffd479; } .life.soon { color: #ff8a80; font-weight: 700; }
+  .badge { display: inline-block; padding: 0 6px; border-radius: 9px; font-size: 11px; background: #1b2a3c; color: #9fd3ff; margin-right: 4px; }
+  .badge.r { background: #24361c; color: #d1e8a2; }
+  .row-actions { white-space: nowrap; }
+  .row-actions button { margin: 1px 2px; padding: 3px 7px; }
+  .empty { color: #7f93a8; padding: 10px 0; }
+  .filters label { margin-right: 14px; font-size: 12px; color: #9fb3c8; }
+  .note { color: #7f93a8; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <b>🗄⏳ The retirement desk</b>
+  <span id="counts" class="meta"></span>
+  <span style="flex:1"></span>
+  <button id="refresh">Refresh</button>
+  <button id="removeAll" class="rm">Remove all waiting</button>
+  <button id="keepAll" class="kp">Keep all waiting</button>
+</header>
+<main>
+  <div class="note">Every item the station would have deleted from the cupboard waits here when its type's rule says
+  to ask. Nothing waiting is deleted until you say so; <b>Keep</b> extends its life (and its airings when they were
+  used up). Timers count down live. Rules are per type: whether to ask (rhymed only, everything, never), how many
+  hours a rhymed item keeps, and how many airings it gets.</div>
+  <div class="h">Waiting for your decision</div>
+  <div id="pending"></div>
+  <div class="h">Rules by type</div>
+  <div id="rules"></div>
+  <div class="h">Everything in the cupboard</div>
+  <div class="filters">
+    <label><input type="checkbox" id="fRhymed"> rhymed only</label>
+    <label><input type="checkbox" id="fPending"> waiting only</label>
+    <label><input type="checkbox" id="fAired"> aired only</label>
+    <span id="invCount" class="meta"></span>
+  </div>
+  <div id="inventory"></div>
+  <div class="h">Decided</div>
+  <div id="decided"></div>
+</main>
+<script>
+const SERVER_KEY = __SERVER_KEY__;
+const params = new URLSearchParams(location.search);
+const KEY = params.get("key") || SERVER_KEY || "";
+if (params.get("key")) {
+  params.delete("key");
+  history.replaceState(null, "", location.pathname + (params.toString() ? "?" + params.toString() : ""));
+}
+async function api(path, body) {
+  const headers = {};
+  if (KEY) headers["Authorization"] = "Bearer " + KEY;
+  if (body) headers["Content-Type"] = "application/json";
+  const r = await fetch(path, {method: body ? "POST" : "GET", headers, body: body ? JSON.stringify(body) : undefined});
+  if (!r.ok) throw new Error(r.status + " " + (await r.text()).slice(0, 300));
+  return r.json();
+}
+const esc = (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+function fmt(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec >= 172800) return Math.floor(sec / 86400) + "d " + Math.floor((sec % 86400) / 3600) + "h";
+  if (sec >= 3600) return Math.floor(sec / 3600) + "h " + Math.floor((sec % 3600) / 60) + "m";
+  if (sec >= 60) return Math.floor(sec / 60) + "m " + (sec % 60) + "s";
+  return sec + "s";
+}
+function when(t) { return t ? new Date(t * 1000).toLocaleString() : ""; }
+let state = null, fetchedAt = 0, busy = false;
+function lifeCell(sec, keepUntil) {
+  const title = keepUntil ? "kept until " + when(keepUntil) : "";
+  return '<span class="life" data-life="' + Number(sec || 0) + '" title="' + esc(title) + '">' + fmt(sec || 0) + '</span>';
+}
+function actions(id, kind, pending) {
+  const rule = (state.rules || []).find((r) => r.kind === kind) || {};
+  const hours = Number(rule.keep_hours || 0) || 24;
+  return '<span class="row-actions">'
+    + '<button class="rm" data-act="remove" data-id="' + esc(id) + '">Remove' + (pending ? "" : " now") + '</button>'
+    + '<button class="kp" data-act="keep" data-h="24" data-id="' + esc(id) + '">Keep +24h</button>'
+    + '<button class="kp" data-act="keep" data-h="' + hours + '" data-id="' + esc(id) + '">Keep +' + hours + 'h</button>'
+    + '<button class="kp" data-act="keep" data-h="168" data-id="' + esc(id) + '">Keep +7d</button></span>';
+}
+function itemCells(it) {
+  return '<td><span class="badge">' + esc(it.label || it.kind) + '</span>' + (it.rhymed ? '<span class="badge r">♪ rhymed</span>' : '')
+    + (it.name ? '<div class="meta">' + esc(it.name) + '</div>' : '') + '</td>'
+    + '<td class="text">' + esc(it.text || "") + (it.why ? '<div class="why">' + esc(it.why) + '</div>' : '') + '</td>';
+}
+function render() {
+  if (!state) return;
+  const c = state.counts || {};
+  document.getElementById("counts").textContent = (state.pending || []).length + " waiting · " + (c.inventory || 0)
+    + " in the cupboard (" + (c.rhymed || 0) + " rhymed) · larder cap " + (c.larder_cap || "?") + " + repertoire " + (c.repertoire_rows || "?");
+  document.getElementById("removeAll").disabled = document.getElementById("keepAll").disabled = !(state.pending || []).length;
+  const pend = state.pending || [];
+  document.getElementById("pending").innerHTML = pend.length ? '<table><tr><th>type</th><th>round</th><th>airings</th><th>life</th><th>asked</th><th></th></tr>'
+    + pend.map((p) => '<tr class="pending' + (p.rhymed ? ' rhymed' : '') + '">' + itemCells(p)
+      + '<td>' + (p.aired || 0) + '/' + (p.innings || 1) + (p.rest_left ? '<div class="meta">rests ' + fmt(p.rest_left) + '</div>' : '') + '</td>'
+      + '<td>' + lifeCell(p.life_left, p.keep_until) + '<div class="meta">' + esc(p.stage || "") + '</div></td>'
+      + '<td>' + (p.asks || 1) + '× · since ' + esc(when(p.first_asked)) + (p.kept_times ? '<div class="meta">kept ' + p.kept_times + '×</div>' : '') + '</td>'
+      + '<td>' + actions(p.id, p.kind, true) + '</td></tr>').join("") + '</table>'
+    : '<div class="empty">Nothing waits. The station deletes nothing your rules ask about without you.</div>';
+  document.getElementById("rules").innerHTML = '<table><tr><th>type</th><th>ask before deleting</th><th>rhymed keep (hours)</th><th>airings when kept</th><th>the fixed clocks underneath</th><th></th></tr>'
+    + (state.rules || []).map((r) => '<tr><td><b>' + esc(r.label) + '</b><div class="meta">' + esc(r.kind) + '</div></td>'
+      + '<td><select data-rule="ask" data-kind="' + esc(r.kind) + '">'
+      + ['tinted', 'all', 'never'].map((a) => '<option value="' + a + '"' + (r.ask === a ? ' selected' : '') + '>' + ({tinted: 'rhymed items only', all: 'everything', never: 'never (delete as before)'}[a]) + '</option>').join("") + '</select></td>'
+      + '<td><input type="number" min="0" max="720" step="1" data-rule="keep_hours" data-kind="' + esc(r.kind) + '" value="' + esc(r.keep_hours) + '"> <span class="meta">default ' + esc(r.default.keep_hours) + '</span></td>'
+      + '<td><input type="number" min="1" max="60" step="1" data-rule="innings" data-kind="' + esc(r.kind) + '" value="' + esc(r.innings) + '"' + (r.reusable ? '' : ' disabled title="this type does not repeat"') + '> <span class="meta">default ' + esc(r.default.innings) + '</span></td>'
+      + '<td class="meta">' + esc(r.clocks) + '</td>'
+      + '<td><button data-save="' + esc(r.kind) + '">Save</button></td></tr>').join("") + '</table>';
+  const fR = document.getElementById("fRhymed").checked, fP = document.getElementById("fPending").checked, fA = document.getElementById("fAired").checked;
+  const inv = (state.inventory || []).filter((i) => (!fR || i.rhymed) && (!fP || i.pending) && (!fA || i.aired));
+  document.getElementById("invCount").textContent = inv.length + " shown";
+  document.getElementById("inventory").innerHTML = inv.length ? '<table><tr><th>type</th><th>round</th><th>stage</th><th>airings</th><th>age</th><th>life</th><th>decision</th><th></th></tr>'
+    + inv.map((i) => '<tr class="' + (i.pending ? 'pending' : '') + (i.rhymed ? ' rhymed' : '') + '">' + itemCells(i)
+      + '<td>' + esc(i.stage) + '</td>'
+      + '<td>' + (i.aired || 0) + '/' + (i.innings || 1) + (i.rest_left ? '<div class="meta">rests ' + fmt(i.rest_left) + '</div>' : '') + '</td>'
+      + '<td class="meta">' + fmt(i.age || 0) + '</td>'
+      + '<td>' + lifeCell(i.life_left, i.keep_until) + '</td>'
+      + '<td class="meta">' + esc(i.pending ? "waiting for you" : i.decision || "") + (i.kept_times ? ' · kept ' + i.kept_times + '×' : '') + '</td>'
+      + '<td>' + actions(i.id, i.kind, i.pending) + '</td></tr>').join("") + '</table>'
+    : '<div class="empty">Nothing matches.</div>';
+  const dec = state.decided || [];
+  document.getElementById("decided").innerHTML = dec.length ? '<table><tr><th>when</th><th>type</th><th>round</th><th>what</th></tr>'
+    + dec.map((d) => '<tr>' + '<td class="meta">' + esc(when(d.decided_at || d.last_asked)) + '</td>' + itemCells(d).replace('<td class="text">', '<td class="text">')
+      + '<td class="meta">' + esc({remove: 'removed', keep: 'kept ' + (d.keep_hours ? '+' + d.keep_hours + 'h' : ''), forced: 'REMOVED BY A CEILING', gone: 'left by another road'}[d.state] || d.state) + '</td></tr>').join("") + '</table>'
+    : '<div class="empty">No decisions yet.</div>';
+  tick();
+}
+function tick() {
+  const dt = (Date.now() - fetchedAt) / 1000;
+  document.querySelectorAll("[data-life]").forEach((el) => {
+    const left = Math.max(0, Number(el.dataset.life) - dt);
+    el.textContent = fmt(left);
+    el.className = "life" + (left < 3600 ? " soon" : left < 6 * 3600 ? " near" : "");
+  });
+}
+setInterval(tick, 1000);
+async function load() {
+  try { state = await api("/api/retire"); fetchedAt = Date.now(); render(); }
+  catch (e) { document.getElementById("pending").innerHTML = '<div class="empty">The desk could not be read: ' + esc(e.message) + (KEY ? '' : ' - open this page with ?key=YOUR_KEY') + '</div>'; }
+}
+async function decide(ids, action, hours) {
+  if (busy || !ids.length) return; busy = true;
+  try { await api("/api/retire/decide", {ids, action, extend_hours: hours || null}); await load(); }
+  catch (e) { alert("The desk refused: " + e.message); }
+  finally { busy = false; }
+}
+document.addEventListener("click", async (ev) => {
+  const b = ev.target.closest("button"); if (!b) return;
+  if (b.dataset.act) { await decide([b.dataset.id], b.dataset.act, b.dataset.h ? Number(b.dataset.h) : null); return; }
+  if (b.dataset.save) {
+    const kind = b.dataset.save;
+    const get = (name) => document.querySelector('[data-rule="' + name + '"][data-kind="' + kind + '"]');
+    try { await api("/api/retire/rules", {kind, ask: get("ask").value, keep_hours: get("keep_hours").value, innings: get("innings").disabled ? null : get("innings").value}); await load(); }
+    catch (e) { alert("The rule was refused: " + e.message); }
+  }
+});
+document.getElementById("refresh").onclick = load;
+document.getElementById("removeAll").onclick = () => { if (confirm("Remove every waiting item from the cupboard?")) decide((state.pending || []).map((p) => p.id), "remove", null); };
+document.getElementById("keepAll").onclick = () => decide((state.pending || []).map((p) => p.id), "keep", null);
+["fRhymed", "fPending", "fAired"].forEach((id) => document.getElementById(id).onchange = render);
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/api/retire")
+async def api_retire(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+    summary: int = 0,
+) -> dict[str, Any]:
+    """The retirement desk: what waits, the rules, every item with its timer."""
+    _journal_auth(authorization, key)
+    if summary:
+        return retire_summary()
+    return retire_state()
+
+
+@app.post("/api/retire/decide")
+async def api_retire_decide(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    ids = payload.get("ids")
+    if not isinstance(ids, list):
+        ids = [payload.get("id")] if payload.get("id") else []
+    try:
+        return retire_decide([str(x) for x in ids], str(payload.get("action") or ""),
+                             payload.get("extend_hours"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+
+@app.post("/api/retire/rules")
+async def api_retire_rules(
+    request: Request,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_auth(authorization)
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001
+        payload = {}
+    payload = payload if isinstance(payload, dict) else {}
+    kind = str(payload.get("kind") or "")
+    if kind not in retire_kinds():
+        raise HTTPException(status_code=400, detail="No such kind of cupboard item")
+    try:
+        rule = retire_rules_set(kind, payload.get("ask"), payload.get("keep_hours"), payload.get("innings"))
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=f"Bad rule: {exc}")
+    note_action(f"🗄⏳ rule for {retire_kind_label(kind)}: ask {rule['ask']}, keep {rule['keep_hours']:g} h, "
+                f"{rule['innings']} airings")
+    return {"ok": True, "rule": rule, "rules": retire_rules_all()}
+
+
+@app.get("/cupboard/retire", response_class=HTMLResponse)
+async def retire_page() -> str:
+    """The retirement desk on its own URL (2026-09-08)."""
+    embedded = SPARK_AGENT_API_KEY if AUTOFILL_KEY else ""
+    return RETIRE_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
+
+
 @app.get("/v1/models")
 async def models(
     authorization: str | None = Header(default=None),
@@ -123281,6 +124323,10 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
     </select>
     <button id="journalBtn" class="tray-btn" title="The request book — every request and its reply, page by page (#1079)"
             onclick="journalOpen()" style="font-size:18px;line-height:1">📖</button>
+    <!-- 2026-09-08: the retirement desk - every round about to leave the
+         cupboard waits for a decision; rules by type; a life timer on each. -->
+    <button id="retireBtn" class="tray-btn" title="The retirement desk — every round about to leave the cupboard waits here for your decision; the rules by type; a life timer on every item"
+            onclick="retireDeskOpen()" style="font-size:18px;line-height:1;position:relative">⏳<span id="retireCount" class="tray-count"></span></button>
     <button id="trayBtn" class="tray-btn" title="Everything that popped up"
             onclick="toggleTray()">
       <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor"
@@ -128122,6 +129168,13 @@ function journalStyle() {
     ".jr-note{color:#7f93a8;font-size:11px;margin-top:6px}",
   ].join("");
   document.head.appendChild(css);
+}
+
+/* 2026-09-08: the retirement desk on its own tab. */
+function retireDeskOpen() {
+  let k = "";
+  try { k = (typeof key === "function") ? (key() || "") : ""; } catch (e) { k = ""; }
+  window.open("/cupboard/retire" + (k ? "?key=" + encodeURIComponent(k) : ""), "_blank");
 }
 
 async function journalOpen(id) {
@@ -150922,6 +151975,15 @@ async function djRepairDialogueFlow() {
 }
 
 function djDialogueFlowPaint(flow) {
+  // 2026-09-08: the retirement desk's count on the tray button.
+  try {
+    const n = Number(((flow || {}).retire || {}).pending || 0);
+    const rc = document.getElementById("retireCount");
+    if (rc) rc.textContent = n ? String(n) : "";
+    const rb = document.getElementById("retireBtn");
+    if (rb) rb.title = (n ? n + " round(s) wait for your decision before leaving the cupboard. " : "")
+      + "The retirement desk — every round about to leave the cupboard waits here for your decision; the rules by type; a life timer on every item";
+  } catch (e) { /* the tray may not be drawn yet */ }
   const badge = document.getElementById("djFlowBadge");
   const explain = document.getElementById("djFlowExplain");
   if (!badge || !explain) return;
