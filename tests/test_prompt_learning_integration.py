@@ -185,7 +185,8 @@ class LearningIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(resumed.json()['status']['hints'])
         self.assertEqual(PromptLearningStore(self.learning.path).settings(), self.learning.settings())
         for row in rows:
-            self.assertEqual(self.reviews.get(row['id'])['review_status'], 'pending')
+            # #1088: an intermediate refusal is a note, a cut is pending; neither is approved.
+            self.assertIn(self.reviews.get(row['id'])['review_status'], ('pending', 'noted'))
         station.line_review_recover.assert_not_called()
 
     async def test_recent_refresh_seeds_actual_pinned_rows_without_votes_or_models(self):

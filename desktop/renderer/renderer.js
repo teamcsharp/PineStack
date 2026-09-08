@@ -888,8 +888,11 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
   function paint() {
     badge.textContent = count ? 'Rejected lines (' + count + ')' : 'Rejected lines';
     if (fresh) {
-      title.textContent = fresh === 1 ? 'A rejection needs review' : fresh + ' rejection updates';
-      text.textContent = 'Includes unsuccessful rewrites and retries. Discuss the failed checks and prompts with the orchestrator, or test revised wording.';
+      // #1088: only a line that actually left the work reaches this card;
+      // rewrites the station re-asked and repaired are the orchestrator's
+      // notes (status "noted") and never wake the operator.
+      title.textContent = fresh === 1 ? 'A cut line waits for your decision' : fresh + ' cut lines wait for your decision';
+      text.textContent = 'Each one was refused after its asks and cut before the studio. Allow it, keep the cut, or discuss the failed checks with the orchestrator.';
       text.classList.remove('error'); card.hidden = false;
     }
   }

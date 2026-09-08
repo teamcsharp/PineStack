@@ -66,6 +66,23 @@ def _integer(value, name, low, high):
     return value
 
 
+# #1088: a refusal the machine already handled is a NOTE, not a request for
+# the operator. A rewrite refused on one pass and asked again, a draft the
+# trimmer shortened, and a technical failure (no audio, an engine down) are
+# recorded for the learner and the evidence trail but never sit in the
+# operator's queue; only a line that actually left the work (a cut, a hold
+# before the recording) is pending. Measured before this: 4,852 pending rows,
+# 175 of the latest 200 were rewrite_rejected intermediates.
+INFORMATIONAL_DISPOSITIONS = ("rewrite_rejected", "trim", "trimmed")
+TRIAGE_VERSION = 1
+
+
+def _initial_status(disposition, technical):
+    if technical or str(disposition or "") in INFORMATIONAL_DISPOSITIONS:
+        return "noted"
+    return "pending"
+
+
 class LineReviewStore:
     def __init__(self, path):
         self.path = Path(path)
@@ -88,6 +105,7 @@ class LineReviewStore:
                 CREATE INDEX IF NOT EXISTS reviews_cursor ON line_reviews(latest_seq DESC);
                 CREATE INDEX IF NOT EXISTS reviews_status ON line_reviews(review_status, latest_seq DESC);
                 CREATE INDEX IF NOT EXISTS reviews_gate ON line_reviews(gate, review_status, latest_seq DESC);
+                CREATE INDEX IF NOT EXISTS reviews_triage ON line_reviews(review_status, technical, disposition, latest_seq DESC);
                 CREATE TABLE IF NOT EXISTS review_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, review_id TEXT NOT NULL,
                     at REAL NOT NULL, body TEXT NOT NULL,
@@ -108,6 +126,17 @@ class LineReviewStore:
                        "revision": 1, "version": 1, "updated_at": time.time()}
             db.execute("INSERT OR IGNORE INTO review_policy VALUES (1,?)", (_json(default),))
             self._policy = json.loads(db.execute("SELECT body FROM review_policy WHERE singleton=1").fetchone()[0])
+            # #1088: once, the backlog of machine-handled refusals leaves the
+            # operator's queue (the triage index above makes this a scan of
+            # the pending rows only).
+            if int(self._policy.get("triage_version") or 0) < TRIAGE_VERSION:
+                placeholders = ",".join("?" for _ in INFORMATIONAL_DISPOSITIONS)
+                db.execute("UPDATE line_reviews SET review_status='noted' WHERE review_status='pending' "
+                           "AND (technical=1 OR disposition IN (" + placeholders + "))",
+                           tuple(INFORMATIONAL_DISPOSITIONS))
+                self._policy["triage_version"] = TRIAGE_VERSION
+                db.execute("UPDATE review_policy SET body=? WHERE singleton=1", (_json(self._policy),))
+                db.commit()
             self._approved = {row['fingerprint'] for row in db.execute(
                 "SELECT fingerprint,decision FROM line_reviews WHERE review_status='allowed' AND technical=0")
                 if json.loads(row['decision']).get('scope') != 'instance'}
@@ -516,13 +545,17 @@ class LineReviewStore:
                     review_id = uuid.uuid4().hex
                     db.execute("INSERT INTO line_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                         review_id, fingerprint, gate, source, candidate, _json(reasons), _json(snapshot["context"]),
-                        _json(snapshot["evaluation"]), int(technical), disposition, "pending", 1, 1,
+                        _json(snapshot["evaluation"]), int(technical), disposition,
+                        _initial_status(disposition, technical), 1, 1,
                         stamp, stamp, 0, "{}", "{}"))
                 else:
                     review_id = old["id"]
                     technical = technical or bool(old["technical"])
                     once = json.loads(old['decision']).get('scope') == 'instance'
                     status = "pending" if once or (technical and old["review_status"] == "allowed") else old["review_status"]
+                    # #1088: a note becomes a request only when the line actually leaves the work.
+                    if old["review_status"] == "noted" and _initial_status(disposition, technical) == "pending":
+                        status = "pending"
                     if once:
                         db.execute("UPDATE line_reviews SET decision='{}',effect='{}' WHERE id=?", (review_id,))
                     db.execute("""UPDATE line_reviews SET source=?,candidate=?,reasons=?,context=?,evaluation=?,
@@ -577,8 +610,8 @@ class LineReviewStore:
     def summaries(self, after=0, before=0, limit=50, status='pending', gate=''):
         _integer(after, "after", 0, 2**63-1); _integer(before, "before", 0, 2**63-1)
         _integer(limit, "limit", 1, 200)
-        if status not in ("", "all", "pending", "allowed", "kept"):
-            raise ValueError("status must be pending, allowed, kept, or all")
+        if status not in ("", "all", "pending", "allowed", "kept", "noted"):
+            raise ValueError("status must be pending, allowed, kept, noted, or all")
         if gate:
             gate = _gate(gate)
         clauses, params = [], []
@@ -590,6 +623,10 @@ class LineReviewStore:
         with self._lock, closing(self._connect()) as db:
             total = db.execute("SELECT count(*) FROM line_reviews WHERE " + base, params).fetchone()[0]
             unreviewed = db.execute("SELECT count(*) FROM line_reviews WHERE review_status='pending'").fetchone()[0]
+            # #1088: what the operator's attention is actually owed - pending
+            # cuts that are not technical - beside the machine's own notes.
+            attention = db.execute("SELECT count(*) FROM line_reviews WHERE review_status='pending' AND technical=0").fetchone()[0]
+            noted = db.execute("SELECT count(*) FROM line_reviews WHERE review_status='noted'").fetchone()[0]
             rows = db.execute("SELECT " + self.SUMMARY_COLUMNS + " FROM line_reviews WHERE " + base +
                 " AND latest_seq>? AND (?=0 OR latest_seq<?) ORDER BY latest_seq DESC LIMIT ?",
                 params + [after, before, before, limit + 1]).fetchall()
@@ -599,13 +636,16 @@ class LineReviewStore:
             # first cut. Bootstrap suppression belongs to the UI, not the feed.
             # #1070: the occurrence body is the complete evidence document;
             # only its previews and a few fields are needed here.
+            # #1088: the feed follows the status asked for, so a client
+            # watching the pending queue is not woken by the machine's notes.
+            status_filter = "" if status in ("", "all") else status
             event_rows = db.execute("SELECT e.seq AS occurrence_seq,e.at AS occurrence_at,"
                 "json_extract(e.body,'$.source','$.candidate','$.reasons','$.disposition','$.technical',"
                 "'$.context.kind','$.context.who','$.context.speaker','$.context.marker') AS occurrence_fields,"
                 + self.SUMMARY_COLUMNS_R +
                 """ FROM review_events e JOIN line_reviews r ON r.id=e.review_id
-                WHERE e.seq>? AND (?='' OR r.gate=?) ORDER BY e.seq LIMIT ?""",
-                (after, gate, gate, limit + 1)).fetchall()
+                WHERE e.seq>? AND (?='' OR r.gate=?) AND (?='' OR r.review_status=?) ORDER BY e.seq LIMIT ?""",
+                (after, gate, gate, status_filter, status_filter, limit + 1)).fetchall()
             for row in event_rows[:limit]:
                 summary = self._summary_slim(row)
                 fields = json.loads(row["occurrence_fields"]) if row["occurrence_fields"] else [None] * 9
@@ -623,6 +663,7 @@ class LineReviewStore:
             return {"items": [self._summary_slim(row) for row in rows[:limit]], "events": events,
                     "latest_cursor": latest, "next_after": events[-1]["seq"] if events else after,
                     "events_has_more": len(event_rows) > limit, "unreviewed": unreviewed, "total": total,
+                    "attention": attention, "noted": noted,
                     "has_more": len(rows) > limit,
                     "next_before": rows[limit-1]["latest_seq"] if len(rows) > limit else None,
                     "policy": copy.deepcopy(self._policy)}

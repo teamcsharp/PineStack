@@ -279,12 +279,15 @@ class LineReviewTests(unittest.TestCase):
 
         batch = self.store.approve_current("all-pages-snapshot")
 
-        self.assertEqual(batch["snapshot_count"], 115)
+        # #1088: a technical failure is the machine's note, never pending, so
+        # the snapshot holds the 113 complete lines and the empty one.
+        self.assertEqual(self.store.get(technical["id"])["review_status"], "noted")
+        self.assertEqual(batch["snapshot_count"], 114)
         self.assertEqual(batch["approved"], 113)
         self.assertEqual(batch["awaiting_recovery"], 113)
         self.assertEqual(batch["queued"], 0, "Approval only requests normal recovery")
-        self.assertEqual(batch["skip_reasons"], {"technical": 1, "missing_text": 1})
-        self.assertEqual(batch["remaining_pending"], 2)
+        self.assertEqual(batch["skip_reasons"], {"missing_text": 1})
+        self.assertEqual(batch["remaining_pending"], 1)
         self.assertEqual(batch["through_cursor"], cursor)
         accepted_ids = {item["id"] for item in batch["items"] if item["status"] == "approved_once"}
         self.assertEqual(accepted_ids, {row["id"] for row in pending})
@@ -292,8 +295,8 @@ class LineReviewTests(unittest.TestCase):
         self.assertEqual(self.store.policy(), policy)
         self.assertEqual(self.store.get(kept["id"])["review_status"], "kept")
         self.assertTrue(self.evaluate(source=permanent["source"])["operator_approved"])
+        self.assertEqual(self.store.get(empty["id"])["review_status"], "pending")
         for row in (technical, empty):
-            self.assertEqual(self.store.get(row["id"])["review_status"], "pending")
             self.assertEqual(self.store.instances_for(row["id"]), [])
 
     def test_bulk_request_retry_is_durable_and_does_not_capture_later_rejections(self):
