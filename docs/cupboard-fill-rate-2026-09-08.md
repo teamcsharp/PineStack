@@ -108,7 +108,25 @@ two seconds and the LCD polls every second while paused: 12 stalls and 92 s in t
 5. Wire in or delete `_tint_turn_yields` and `TINT_TURNS_MOST` (dead); raise the cupboard view's cap
    or show the pipeline's stage counts beside it. **[V]**
 
-## 5. How to see whether it worked
+## 5. The first reading after the change (10:49–10:58, station still paused)
+
+| measure | before (09:09–09:36, per 10 min) | after (9 min) |
+|---|---|---|
+| lane occupancy | 1.35 of 2 slots, thrashed | 1 active + 3 waiting, packed **[V]** |
+| tint admissions refused | 26.3 | 20 in 9 min — the fifth and sixth drivers still bounce, now resting 30 s **[V]** |
+| lines accepted / refused | 81 / 11 | 46 / 7 (13 %) **[V]** |
+| whole rounds fully tinted | 1.3 | 2 in 9 min **[V]** |
+| pipeline ready | +8 in 22 min | +1 in 9 min **[V]** |
+| cupboard stalls on the loop | 12 in 10 min, worst 10.6 s | none; worst stall 1.8 s **[V]** |
+
+The gate no longer thrashes and the loop no longer stalls, but the visible fill did not jump: with one
+slot the deep lane answers about one ask every 25–30 s, an eight-turn round costs five to eight of
+them, and every round still goes through it. That is the physical ceiling of "the deep model on every
+line" — roughly a dozen rounds an hour for the whole station — and the seven rounds that sat at
+"rapping 0/N" are now moving through the recovery loop one at a time, several minutes each. Raising
+the rate further is one of the rule-touching levers in §4, not another gate.
+
+## 6. How to see whether it worked
 
 `/api/orchestrator/logic` → `pipeline.writers.deferred_by_category` (the refusal count; it was 94 in
 30 minutes and 70 in 26), `pipeline.stages` (awaiting_tint vs ready), `/api/tint` →
