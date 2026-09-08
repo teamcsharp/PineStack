@@ -185,7 +185,11 @@ class RejectionWorkbench:
 
     async def start(self, review_id, kind, body, authorization):
         allowed = {'request_id', 'event_seq', 'expected_revision'} | {
-            'discuss': {'message'}, 'try': {'candidate', 'instruction', 'reasoning'}, 'apply': {'trial_id'}}[kind]
+            'discuss': {'message'}, 'try': {'candidate', 'instruction', 'reasoning'}, 'apply': {'trial_id'},
+            # 2026-09-08: the operator's own wording, applied with the
+            # operator's authority - the machine report is recorded, never
+            # a gate; the instruction becomes a lesson for lines of this kind.
+            'accept': {'candidate', 'instruction'}}[kind]
         if not isinstance(body, dict) or set(body) - allowed:
             raise ValueError('Unexpected diagnostic request fields.')
         if kind == 'try' and 'reasoning' in body and not isinstance(body['reasoning'], bool):
@@ -197,6 +201,9 @@ class RejectionWorkbench:
             wording(body.get('message'), 'message', 6000, True)
         if kind == 'try':
             wording(body.get('candidate', ''), 'candidate', 12000)
+            wording(body.get('instruction', ''), 'instruction', 4000)
+        if kind == 'accept':
+            wording(body.get('candidate', ''), 'candidate', 12000, True)
             wording(body.get('instruction', ''), 'instruction', 4000)
         if kind == 'apply':
             wording(body.get('trial_id'), 'trial_id', 160, True)
@@ -214,6 +221,8 @@ class RejectionWorkbench:
                     row = self.row(review_id, seq, revision, current=True)
                     if not self.capabilities(row)['try_wording']:
                         raise ValueError(self.capabilities(row)['reason'] or 'This occurrence cannot be rewritten.')
+                    if kind == 'accept' and not self.capabilities(row)['apply_wording']:
+                        raise ValueError(self.capabilities(row)['apply_reason'] or 'This occurrence cannot take a wording.')
                 task = asyncio.create_task(self._run(claim, row, authorization))
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
@@ -303,6 +312,53 @@ class RejectionWorkbench:
                            'metadata': {'trace_id': trace_id, 'evidence_clipped': clipped}}])
             return
         self.row(row['id'], row['event_seq'], body['expected_revision'], current=True)
+        if kind == 'accept':
+            # 2026-09-08: "I want a button to accept what I type and send it
+            # through auto approved ... to correct the lines and assist the
+            # algorithm with how to behave." The machine grades the wording
+            # for the record; the operator's authority applies it; the
+            # instruction (and the wording itself) become a standing lesson
+            # for lines of this kind, and the pair is approved outright so
+            # the gate never refuses it again.
+            candidate = self.h['_tint_out_clean'](body.get('candidate', '').strip())
+            candidate = wording(candidate, 'candidate', 12000, True)
+            instruction = body.get('instruction', '').strip()
+            machine = self.grade(row, candidate)
+            self.h['_LAB_RUNTIME'].record('operator_acceptance', {
+                'source': row['source'], 'candidate': candidate, 'machine': machine, 'instruction': instruction})
+            evaluation = {'ok': True, 'technical': False, 'by': 'operator', 'basis': 'accepted_as_written',
+                          'machine_ok': bool(machine.get('ok')), 'machine_faults': list(machine.get('faults') or []),
+                          'tint': machine.get('tint'), 'call_contract': machine.get('call_contract'),
+                          'instruction': instruction}
+            baseline = self.baseline(row)
+            trial = {'baseline': baseline, 'candidate': candidate, 'evaluation': evaluation,
+                     'provenance': {'trace_id': trace_id, 'instruction': instruction, 'prompt_version': PROMPT_VERSION,
+                                    'learning_revision': baseline['learning_revision'],
+                                    'acceptance_mode': baseline['acceptance_mode'],
+                                    'origin': 'operator_accept', 'production_changed': True}}
+            receipt = self.h['_LINE_REVIEW'].approve_replacement(
+                row['id'], row['event_seq'], row['revision'], body['request_id'], op['id'], candidate, evaluation,
+                note=instruction or 'Approved as written by the operator.')
+            instance = receipt['instance']
+            if receipt['changed']:
+                effect = self.h['line_review_recover'](instance)
+                self.h['_LINE_REVIEW'].track_effect(instance['id'], effect)
+            else:
+                current_instance = self.h['_LINE_REVIEW'].get(instance['id']) or instance
+                effect = current_instance.get('effect') or {'status': 'saved', 'say': 'The original acceptance receipt is retained.'}
+            learner = self.h.get('_PROMPT_LEARNING')
+            if learner is not None and hasattr(learner, 'operator_wording'):
+                try:
+                    learner.operator_wording(row, candidate, instruction, machine)
+                except Exception:  # noqa: BLE001 - a learning note never blocks the acceptance
+                    pass
+            self.store.finish(op['id'], owner, result={
+                'trial_id': op['id'], 'instance_id': instance['id'], 'effect': effect,
+                'machine_ok': bool(machine.get('ok')), 'machine_faults': list(machine.get('faults') or []),
+                'say': 'Approved as written. ' + (effect.get('say') if isinstance(effect, dict) and effect.get('say') else '')
+                       + (' Your instruction is now a standing lesson for ' + str((row.get('context') or {}).get('kind') or 'this kind') + ' lines.' if instruction else '')},
+                trial=trial)
+            return
         if kind == 'try':
             baseline = self.baseline(row)
             candidate = body.get('candidate', '').strip()
@@ -387,7 +443,7 @@ def install(app, host):
         except (ValueError, HTTPException) as error:
             raise failure(error) from error
 
-    for kind in ('discuss', 'try', 'apply'):
+    for kind in ('discuss', 'try', 'apply', 'accept'):
         def endpoint(action):
             async def post(review_id: str, request: Request, authorization: str | None = Header(default=None)):
                 host['require_auth'](authorization)

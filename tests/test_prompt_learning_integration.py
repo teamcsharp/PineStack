@@ -18,8 +18,14 @@ from rejection_workbench import install
 
 
 class LearningIntegrationTests(unittest.IsolatedAsyncioTestCase):
-    SOURCE = 'The signal stays bright as we hold the line at night.'
-    CANDIDATE = 'We hold the line at night, while the signal stays bright.'
+    # A faithful rhyme: the source's own words, reordered, landing the very
+    # rhyme the source already landed. 2026-09-08: a proved END rhyme the
+    # source LACKED now counts as the transformation (the operator's own
+    # edits were refused for it), so the source here rhymes already - the
+    # raw grade still calls the reorder untransformed, and fluid acceptance
+    # still waives that.
+    SOURCE = 'The signal stays bright / as we hold the line at night.'
+    CANDIDATE = 'We hold the line at night / while the signal stays bright.'
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

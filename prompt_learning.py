@@ -639,6 +639,27 @@ class PromptLearningStore:
         with self._lock:
             return copy.deepcopy(self._status)
 
+    def recent_outcomes(self, kind="", since=0.0, limit=800):
+        """2026-09-08: the measured attempts of a window, for the
+        orchestrator's reflection - counts and fault families only."""
+        out = []
+        with self._lock, closing(self._connect()) as db:
+            rows = db.execute("SELECT at, body FROM prompt_outcomes WHERE at >= ? ORDER BY seq DESC LIMIT ?",
+                              (float(since or 0), int(limit))).fetchall()
+        for at, body in rows:
+            try:
+                row = json.loads(body)
+            except Exception:  # noqa: BLE001
+                continue
+            if kind and str(row.get("kind") or "") != str(kind):
+                continue
+            out.append({"at": float(at or 0), "kind": str(row.get("kind") or ""),
+                        "stage": str(row.get("stage") or "first"),
+                        "machine_ok": bool(row.get("machine_ok")),
+                        "effective_ok": bool(row.get("effective_ok")),
+                        "faults": list(row.get("faults") or [])})
+        return out
+
     def selection(self, kind=""):
         with self._lock:
             if not self._state["enabled"]:

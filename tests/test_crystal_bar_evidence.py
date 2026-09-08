@@ -88,18 +88,25 @@ class CrystalBarEvidenceTests(unittest.TestCase):
                 report = app.rap_rhyme_evidence(text)
                 self.assertFalse(report["ok"], report)
 
-    def test_rhyme_repair_does_not_waive_the_actual_candidate_transformation_failure(self):
+    def test_a_proved_end_rhyme_the_source_lacked_is_the_transformation(self):
+        # 2026-09-08 (the operator's own edit refused): under the meaning
+        # grade a candidate that lands end rhymes the prose never had IS
+        # transformed rhetoric, however much of the source's wording it
+        # keeps. The strict grade still demands the full lexical change.
         token = app._REJECTION_LAB_PREVIEW.set(True)
         try:
             with mock.patch.object(app, "_crystal_vocab", return_value=frozenset()):
                 report = app.tint_evaluate(self.SOURCE, self.CLEAN, [], force=.88, strict=False)
+                strict = app.tint_evaluate(self.SOURCE, self.CLEAN, [], force=.88, strict=True)
         finally:
             app._REJECTION_LAB_PREVIEW.reset(token)
         self.assertTrue(report["rhyme"]["rap"]["ok"])
         self.assertNotIn("no rhyme evidence - the bar does not land a rhyme", report["machine_faults"])
-        self.assertIn("rhetoric was not materially transformed", report["machine_faults"])
-        self.assertFalse(report["machine_ok"])
-        self.assertFalse(report["ok"])
+        self.assertTrue(report["transformation"]["rhyme_added"])
+        self.assertNotIn("rhetoric was not materially transformed", report["machine_faults"])
+        self.assertTrue(report["machine_ok"])
+        self.assertTrue(report["ok"])
+        self.assertIn("rhetoric was not materially transformed", strict["machine_faults"])
 
 
 if __name__ == "__main__":

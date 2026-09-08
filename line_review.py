@@ -81,8 +81,13 @@ INFORMATIONAL_DISPOSITIONS = ("rewrite_rejected", "trim", "trimmed")
 # rows were "no finished sentence"; nobody can allow a fragment onto the
 # air, so they are notes.
 INFORMATIONAL_GATES = ("draft_fragment", "draft_trimming", "repetition", "language",
-                       "line_quality", "ad_length", "tint_output")
-TRIAGE_VERSION = 2
+                       "line_quality", "ad_length", "tint_output",
+                       # 2026-09-08 (evening): the recording room's hold on a
+                       # line that has not passed the tint yet carries no
+                       # candidate and no evidence - nothing to allow. The
+                       # line goes back to the tint by itself.
+                       "recording_tint")
+TRIAGE_VERSION = 3
 
 
 def _initial_status(disposition, technical, gate=""):
@@ -160,9 +165,12 @@ class LineReviewStore:
     def _refresh_preferences(self):
         """Small, literal examples; no inferred rule or acceptance-policy edit."""
         with closing(self._connect()) as db:
+            # 2026-09-08: ...and the operator's own wordings, accepted as
+            # written - the strongest example a writer can be shown.
             rows = db.execute("""SELECT * FROM line_reviews WHERE technical=0
                 AND review_status IN ('allowed','kept')
-                AND COALESCE(json_extract(decision,'$.scope'),'') != 'instance'
+                AND (COALESCE(json_extract(decision,'$.scope'),'') != 'instance'
+                     OR json_extract(decision,'$.basis') = 'accepted_as_written')
                 ORDER BY json_extract(decision,'$.at') DESC LIMIT 24""").fetchall()
         self._preferences = []
         for raw in rows:
@@ -170,14 +178,17 @@ class LineReviewStore:
             decision = row['decision']
             if decision.get('action') not in ('allow', 'keep'):
                 continue
+            as_written = str(decision.get('basis') or '') == 'accepted_as_written'
+            candidate = str(decision.get('wording') or row['candidate']) if as_written else row['candidate']
             self._preferences.append({
                 'review_id': row['id'], 'gate': row['gate'],
                 'kind': str(row['context'].get('kind') or ''),
                 'action': decision['action'], 'at': decision.get('at'),
-                'source': row['source'][:320], 'candidate': row['candidate'][:320],
-                'excerpted': len(row['source']) > 320 or len(row['candidate']) > 320,
+                'source': row['source'][:320], 'candidate': candidate[:320],
+                'excerpted': len(row['source']) > 320 or len(candidate) > 320,
                 'reasons': [reason[:160] for reason in row['reasons'][:4]],
-                'note': str(decision.get('note') or '')[:320]})
+                'note': str(decision.get('note') or '')[:320],
+                'by_operator': as_written})
 
     def preference_examples(self, kind='', gate='', limit=3):
         _integer(limit, 'limit', 1, 6)
@@ -375,13 +386,13 @@ class LineReviewStore:
             return self._approve_current_locked(request_id)
 
     def approve_replacement(self, review_id, event_seq, expected_revision,
-                            request_id, trial_id, candidate, evaluation):
+                            request_id, trial_id, candidate, evaluation, note=''):
         with self._lock:
             return self._approve_replacement_locked(review_id, event_seq, expected_revision,
-                request_id, trial_id, candidate, evaluation)
+                request_id, trial_id, candidate, evaluation, note=note)
 
     def _approve_replacement_locked(self, review_id, event_seq, expected_revision,
-                                    request_id, trial_id, candidate, evaluation):
+                                    request_id, trial_id, candidate, evaluation, note=''):
         """Grant only the tested wording for one retained occurrence.
 
         The app validates the trial against the current settings. This store
@@ -427,12 +438,19 @@ class LineReviewStore:
                 raise ValueError('A technical rejection or missing original cannot receive a wording replacement')
             stamp = time.time()
             instance_id = 'once-' + uuid.uuid4().hex
+            # 2026-09-08: an acceptance AS WRITTEN carries the operator's
+            # wording and instruction on the decision, where the writer's
+            # preference examples read them (_refresh_preferences).
+            as_written = str(evaluation.get('basis') or '') == 'accepted_as_written'
             decision = {'action': 'allow', 'scope': 'instance', 'mode': 'replacement',
                         'instance_id': instance_id, 'request_id': request_id,
                         'trial_id': trial_id, 'event_seq': event_seq, 'at': stamp, 'by': 'operator',
-                        'note': 'Apply this tested replacement wording to this occurrence only.'}
+                        'note': str(note or '')[:2000] or 'Apply this tested replacement wording to this occurrence only.'}
+            if as_written:
+                decision.update(basis='accepted_as_written', wording=candidate[:2000])
             effect = {'action': 'allow', 'status': 'awaiting_recovery',
-                      'say': 'Tested replacement accepted for this occurrence only; writing and recording recovery is pending.'}
+                      'say': ('Your wording is accepted as written; writing and recording recovery is pending.' if as_written else
+                              'Tested replacement accepted for this occurrence only; writing and recording recovery is pending.')}
             instance = {**copy.deepcopy(row), 'id': instance_id, 'original_review_id': review_id,
                         'candidate': candidate, 'evaluation': payload['evaluation'],
                         'fingerprint': _fingerprint(row['gate'], row['source'], candidate, row['context']),
@@ -450,6 +468,10 @@ class LineReviewStore:
         with self._lock:
             self._instances[instance_id] = copy.deepcopy(instance)
             self._approved.discard(row['fingerprint'])
+            if as_written:
+                # "send it through auto approved": the operator's pair is
+                # approved outright, so the gate never refuses it again.
+                self._approved.add(instance['fingerprint'])
             self._refresh_preferences()
         return copy.deepcopy(result)
 

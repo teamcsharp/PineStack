@@ -676,7 +676,7 @@ export function create(options = {}) {
         if (mutation === 'lab' && labMutationKey === state.key && !state.posting) mutation = '';
       } else if (active && workbenchPending(active)) {
         mutation = 'lab'; labMutationKey = state.key;
-        if (!state.posting) state.feedback = 'The orchestrator is working on a saved ' + ({discuss:'discussion',try:'wording trial',apply:'wording application'}[active.kind] || 'diagnostic') + ' request. You can close this panel and return.';
+        if (!state.posting) state.feedback = 'The orchestrator is working on a saved ' + ({discuss:'discussion',try:'wording trial',apply:'wording application',accept:'operator acceptance'}[active.kind] || 'diagnostic') + ' request. You can close this panel and return.';
       }
     } catch (error) {
       if (error.name !== 'AbortError') state.error = 'Workbench unavailable: ' + error.message;
@@ -728,7 +728,7 @@ export function create(options = {}) {
     }
     const locked = state.stale || !state.loaded || !!state.request;
     function action(text, kind, fn, unavailable = false) {
-      const node = button(text, fn, kind === 'apply' ? 'prr-primary' : ''); node.dataset.lab = kind; node.dataset.labMutation = kind;
+      const node = button(text, fn, (kind === 'apply' || kind === 'accept') ? 'prr-primary' : ''); node.dataset.lab = kind; node.dataset.labMutation = kind;
       const historical = labHistorical(state) && !(kind === 'discuss' && state.data?.capabilities?.discuss === true) && kind !== 'settings';
       node.dataset.unavailable = String(locked || historical || unavailable); node.disabled = !!mutation || locked || historical || unavailable; return node;
     }
@@ -807,6 +807,11 @@ export function create(options = {}) {
       field('Candidate wording · leave blank to request a rewrite', 'candidate', state.candidate, value => {state.candidate=value;}, 6);
       field('Instruction for this trial (optional)', 'instruction', state.instruction, value => {state.instruction=value;}, 3);
       target.append(action('Preview trial','try',()=>sendLab(state,'try',{candidate:state.candidate,instruction:state.instruction}),capabilities.try_wording !== true));
+      // 2026-09-08: the operator's wording goes through with the operator's
+      // authority. The machine report is recorded, never a gate; the
+      // instruction becomes a standing lesson for lines of this kind.
+      target.append(action('Approve as written','accept',()=>sendLab(state,'accept',{candidate:state.candidate,instruction:state.instruction}),capabilities.apply_wording !== true || !String(state.candidate || '').trim()));
+      target.append(el('p','Approve as written applies YOUR wording to this line and records it for recovery, whatever the machine checks say. The instruction above is kept as a standing lesson for lines of this kind, and this source/wording pair is approved outright from now on.','prr-muted'));
       const trials = workbenchItems(state.data?.trials);
       for (const trial of trials) {
         const card = el('article',null,'prr-trial'); card.dataset.trialId = trial.id;
@@ -822,6 +827,7 @@ export function create(options = {}) {
         const actions = el('div',null,'prr-actions');
         actions.append(button('Edit this trial',()=>{state.candidate=trial.candidate || '';state.selectedTrial=trial.id;paintWorkbench(state);}));
         actions.append(action('Apply wording to recording','apply',()=>sendLab(state,'apply',{trial_id:trial.id}),capabilities.apply_wording !== true || !passed || trial.applyable === false || trial.applicable === false));
+        if (!passed) actions.append(action('Approve as written','accept',()=>sendLab(state,'accept',{candidate:trial.candidate || '',instruction:trial.provenance?.instruction || state.instruction || ''}),capabilities.apply_wording !== true || !String(trial.candidate || '').trim()));
         card.append(actions,el('p','Apply queues only this tested wording through normal recovery. It does not play audio.','prr-muted')); target.append(card);
       }
       if (state.loaded && !trials.length) target.append(el('p','No saved trials for this occurrence.','prr-muted'));

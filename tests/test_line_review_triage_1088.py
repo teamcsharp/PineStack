@@ -92,6 +92,15 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(page["unreviewed"], 1)
         self.assertEqual(page["noted"], len(INFORMATIONAL_GATES))
 
+    def test_the_recording_rooms_hold_is_a_note(self):
+        # 2026-09-08 (evening): 27 pending rows were "recording held: selected line failed the
+        # crystal tint contract" with no candidate and no evidence - nothing to allow.
+        row = self.store.record("recording_tint", "It feels like a gradual wearing away.", "",
+                                ["recording held: selected line failed the crystal tint contract"],
+                                {"who": "dj", "stage": "recording_or_air_admission"}, disposition="cut")
+        self.assertEqual(row["review_status"], "noted")
+        self.assertIn("recording_tint", INFORMATIONAL_GATES)
+
     def test_a_passed_rewrite_supersedes_the_pending_cuts_of_its_line(self):
         ctx = {"kind": "caller", "who": "B"}
         cut = self.store.record("tint", "Hold on,  line seven.", "Line seven, hold the phone.",
