@@ -83087,7 +83087,7 @@ def _tint_quiet(road: str, why: str, said: str) -> str:
 
 async def crystal_line(text: str, why: str = "", room: int = 6,
                        keep: list[str] | None = None,
-                       kind: str = "") -> str:
+                       kind: str = "", model: str = "") -> str:
     """#1038: THE SECOND PASS, on one piece of speech, for every road.
 
     The banked round has had this since #1006. Nothing else did - not
@@ -83167,7 +83167,7 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         # until the next pass clears it.
         if room < 2:
             out = await crystal_turn(said, world, chunks, keep=keep,
-                                     kind=kind)
+                                     kind=kind, model=model)
         else:
             # Sentence by sentence, each one written knowing the last.
             bits = [b.strip() for b in
@@ -83178,7 +83178,7 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
                 bits = bits[:room - 1] + [" ".join(bits[room - 1:])]
             if len(bits) < 2:
                 out = await crystal_turn(said, world, chunks, keep=keep,
-                                         kind=kind)
+                                         kind=kind, model=model)
             else:
                 done: list[str] = []
                 for bit_index, bit in enumerate(bits):
@@ -83189,7 +83189,7 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
                     got = await crystal_turn(
                         bit, world, chunks,
                         answering=(done[-1] if done else ""),
-                        keep=keep, kind=kind)
+                        keep=keep, kind=kind, model=model)
                     if not tint_output_ready(got):
                         rejected = tint_evaluate(bit, got, chunks,
                             done[-1] if done else "", crystal_force(), kind)
@@ -107734,12 +107734,38 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
             _paper_tint_why("the station's tint budget says stop: " + str(stop)[:80])
             break
         source = unit["text"]
+        # #1071: the paper asked on the deep model's tint lane - two permits,
+        # both the dialogue's, forty items waiting - so nearly every
+        # paragraph came back "deferred", was charged as an attempt and was
+        # recorded as "rewrite not accepted" (60 attempts, 8 accepted in
+        # 575 s). The paper now asks on the fast model's own lane, waits
+        # out a deferral a few times inside its window without spending an
+        # attempt on it, and the record says why a paragraph stayed plain.
+        out, deferred = source, ""
+        for _try in range(4):
+            try:
+                out = await crystal_line(source, why, 1, kind="paper",
+                                         model=tint_fast_model() or "")
+                deferred = ""
+                break
+            except WritingDeferred as exc:
+                deferred = str(exc)[:120]
+                if _try < 3 and paper_tint_left() > 12:
+                    await asyncio.sleep(4)
+                    continue
+                break
+            except Exception:  # noqa: BLE001
+                out = source
+                break
+        if deferred:
+            report["paragraphs"].append({"key": unit["key"], "ok": False,
+                "source_hash": hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest(),
+                "output_hash": "", "faults": "deferred: " + deferred})
+            report["deferred"] = int(report.get("deferred") or 0) + 1
+            _paper_tint_why("the tint lane deferred the paper: " + deferred)
+            continue
         report["attempted"] += 1
         _PAPER_PRESS["attempted_paras"] = int(_PAPER_PRESS.get("attempted_paras") or 0) + 1
-        try:
-            out = await crystal_line(source, why, 1)
-        except Exception:  # noqa: BLE001
-            out = source
         out = " ".join(str(out or "").split())
         accepted = bool(out and out != " ".join(source.split())
                         and tint_output_ready(out))
@@ -107754,7 +107780,8 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
         report["paragraphs"].append({"key": unit["key"], "ok": accepted,
             "source_hash": hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest(),
             "output_hash": hashlib.sha1(out.encode("utf-8", "ignore")).hexdigest() if accepted else "",
-            "faults": "; ".join(evaluation.get("faults") or []) if accepted else "rewrite not accepted"})
+            "faults": ("; ".join(evaluation.get("faults") or []) if accepted
+                       else "the crystal refused the rewrite or stood down (#1071)")})
         if accepted:
             _paper_tint_store(story, unit["key"], out)
             if city_image:
@@ -107810,10 +107837,12 @@ def paper_tint_status(meta: dict[str, Any]) -> str:
     report = meta.get("tint")
     if not isinstance(report, dict):
         return ""
+    deferred = int(report.get("deferred") or 0)
     return (f"Crystal tint: {int(report.get('changed') or 0)}/"
             f"{int(report.get('eligible') or 0)} eligible paragraphs; "
-            f"{int(report.get('attempted') or 0)} attempted; "
-            f"{report.get('status') or 'pending'} "
+            f"{int(report.get('attempted') or 0)} attempted"
+            + (f"; {deferred} deferred by the tint lane" if deferred else "")
+            + f"; {report.get('status') or 'pending'} "
             f"(target {int(report.get('target') or 0)}%)")
 
 
