@@ -224,6 +224,69 @@ def line_review_guidance(kind: str = "", gate: str = "") -> str:
             + json.dumps(examples, ensure_ascii=False))
 
 
+# #1082: THE SAME MISTAKE IS NOT DENIED TWICE. Every refused tint leaves
+# its faults here, keyed on the exact source line, and the FIRST ask for
+# that line next time carries them - the retry already carried them, but
+# a line re-prepared from the same transcript, or the same memo written
+# again tomorrow, started from nothing and drew the same refusal.
+_TINT_FAULT_MEMO: dict[str, dict[str, Any]] = {}
+_TINT_FAULT_MEMO_MOST = 4096
+
+
+def _tint_fault_key(source: str) -> str:
+    return " ".join(str(source or "").split()).lower()[:400]
+
+
+def tint_fault_remember(source: str, reasons: Any, candidate: str = "") -> None:
+    try:
+        key = _tint_fault_key(source)
+        if not key:
+            return
+        faults = [" ".join(str(r).split())[:160] for r in (reasons or [])
+                  if str(r or "").strip()][:6]
+        if not faults:
+            return
+        if len(_TINT_FAULT_MEMO) >= _TINT_FAULT_MEMO_MOST:
+            for old in sorted(_TINT_FAULT_MEMO, key=lambda k: _TINT_FAULT_MEMO[k]["at"])[:256]:
+                _TINT_FAULT_MEMO.pop(old, None)
+        row = _TINT_FAULT_MEMO.setdefault(key, {"faults": [], "count": 0, "at": 0.0,
+                                                "candidates": []})
+        row["count"] += 1
+        row["at"] = time.time()
+        for fault in faults:
+            if fault not in row["faults"]:
+                row["faults"].append(fault)
+        row["faults"] = row["faults"][-6:]
+        clean = " ".join(str(candidate or "").split())[:200]
+        if clean and clean not in row["candidates"]:
+            row["candidates"] = (row["candidates"] + [clean])[-3:]
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def tint_prior_lesson(source: str, lesson: str = "") -> str:
+    """The lesson for a first ask: what this exact line was refused for
+    before, ahead of whatever lesson the road already carries."""
+    try:
+        row = _TINT_FAULT_MEMO.get(_tint_fault_key(source))
+    except Exception:  # noqa: BLE001
+        row = None
+    if not row or not row.get("faults"):
+        return str(lesson or "")
+    prior = (f"This exact line was refused {row['count']} time(s) before for: "
+             + "; ".join(row["faults"][-4:]) + ". Do not repeat those faults.")
+    if row.get("candidates"):
+        prior += " Refused wording, not to be reused: " + " | ".join(
+            f"\"{c[:120]}\"" for c in row["candidates"][-2:])
+    return (prior + " " + str(lesson)).strip() if str(lesson or "").strip() else prior
+
+
+def tint_fault_memo_status() -> dict[str, Any]:
+    rows = list(_TINT_FAULT_MEMO.values())
+    return {"lines": len(rows), "refusals": sum(int(r.get("count") or 0) for r in rows),
+            "repeat_lines": sum(int(r.get("count") or 0) > 1 for r in rows)}
+
+
 def line_review_capture(gate: str, source: str, candidate: str = "",
                         reasons: Any = None, context: Any = None,
                         evaluation: Any = None, technical: bool = False,
@@ -244,6 +307,8 @@ def line_review_capture(gate: str, source: str, candidate: str = "",
         gate, str(source or ""), str(candidate or ""), reasons,
         context=context, evaluation=evaluation, technical=technical,
         disposition=disposition)
+    if gate == "tint" and not technical:
+        tint_fault_remember(str(source or ""), reasons, str(candidate or ""))
     prompt_learning_observe(row)
     _LAB_RUNTIME.record("rejection", {"review_id": row["id"], "event_seq": row["event_seq"],
         "gate": gate, "source": source, "candidate": candidate,
@@ -5942,6 +6007,240 @@ async def pine_complete(req_id: int, reply: str) -> dict[str, Any] | None:
         return item
 
 
+# --- #1079: THE REQUEST BOOK -------------------------------------------------
+# "For every request that I make and you reply to it, I want you to store
+#  that in a markdown that's able to be scrolled through through a page
+#  viewer ... along with the token costs in and out for it."
+#
+# One markdown page per resolved request under data/pine_journal/<id>.md,
+# with a sidecar <id>.json the viewer reads (the request, the reply, the
+# costs and a flow chart drawn from the reply's own sections and steps).
+# The book is backfilled once from pine_completed.md, so every request the
+# archive remembers has a page, and the resolve door writes the next one.
+#
+# Costs, honestly: the request and the reply are counted at four characters
+# per token (no tokenizer for the resolver's model exists here). The
+# station's own model calls inside the request's window ride along from
+# model_calls.jsonl, labelled as what they are - the writers and tints the
+# station ran while the request was open - not the resolver's spend.
+PINE_JOURNAL_DIR = data_path("pine_journal")
+_PINE_JOURNAL_BACKFILLED = [False]
+_PINE_COMPLETED_BLOCK_RE = re.compile(
+    r"(?ms)^## #(\d+) — (.+?) — resolved\nSubmitted: (.*?)\n\n(.*?)\n\n"
+    r"Resolution: (.*?)(?=\n## #\d+ — |\Z)")
+
+
+def _pine_when_epoch(when: str) -> float:
+    text = str(when or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            return float(time.mktime(time.strptime(text[:19] if "S" in fmt else text[:16], fmt)))
+        except Exception:  # noqa: BLE001
+            continue
+    return 0.0
+
+
+def _pine_tokens(text: str) -> int:
+    return (len(str(text or "")) + 3) // 4
+
+
+def _pine_request_images(text: str) -> list[str]:
+    seen: list[str] = []
+    for url in re.findall(r"/api/pine-uploads/[A-Za-z0-9._\-]+", str(text or "")):
+        if url not in seen:
+            seen.append(url)
+    return seen
+
+
+def pine_journal_graph(req_id: int, request: str, reply: str) -> dict[str, Any]:
+    """The reply as a flow: the request at the root, its headings as
+    sections, its bullets and numbered steps under the section they sit in.
+    A reply with no headings gets its paragraphs as the sections."""
+    request = str(request or "")
+    nodes: list[dict[str, Any]] = [{"id": "n0", "label": f"Request #{req_id}",
+                                    "kind": "request",
+                                    "detail": " ".join(request.split())[:400]}]
+    edges: list[dict[str, str]] = []
+    section = "n0"
+    headed = False
+    in_code = False
+    for raw in str(reply or "").splitlines():
+        line = raw.strip()
+        if line.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code or not line or len(nodes) >= 90:
+            continue
+        head = re.match(r"^(#{1,6})\s+(.*)", line)
+        if head:
+            nid = f"n{len(nodes)}"
+            title = head.group(2).strip().strip("#").strip()
+            nodes.append({"id": nid, "label": title[:64], "kind": "section",
+                          "detail": title[:300]})
+            edges.append({"from": "n0", "to": nid})
+            section = nid
+            headed = True
+            continue
+        step = re.match(r"^(?:[-*•]|\d+[.)])\s+(.*)", line)
+        if step:
+            nid = f"n{len(nodes)}"
+            body = step.group(1).strip()
+            nodes.append({"id": nid, "label": re.sub(r"[*_`]", "", body)[:56],
+                          "kind": "step", "detail": body[:500]})
+            edges.append({"from": section, "to": nid})
+            continue
+        if not headed and len(line) > 24:
+            nid = f"n{len(nodes)}"
+            nodes.append({"id": nid, "label": re.sub(r"[*_`]", "", line)[:56],
+                          "kind": "section", "detail": line[:500]})
+            edges.append({"from": "n0", "to": nid})
+            section = nid
+    return {"nodes": nodes, "edges": edges}
+
+
+def pine_journal_costs(request: str, reply: str, submitted: float,
+                       resolved: float, rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    costs: dict[str, Any] = {"tokens_in": _pine_tokens(request), "tokens_out": _pine_tokens(reply),
+                             "elapsed_s": int(max(0.0, resolved - submitted)) if submitted and resolved else 0,
+                             "model_calls": 0, "model_seconds": 0.0, "model_tokens_out": 0,
+                             "model_tokens_in": 0,
+                             "note": ("token counts are estimated at four characters per token for the "
+                                      "request and the reply; model calls and seconds are the station's "
+                                      "own writers and tints during the request's window")}
+    try:
+        if submitted and resolved and 0 < resolved - submitted <= 24 * 3600:
+            if rows is None:
+                rows = model_calls_rows(submitted, resolved)
+            window = [r for r in rows if submitted <= float(r.get("at") or 0) < resolved]
+            costs["model_calls"] = len(window)
+            costs["model_seconds"] = round(sum(int(r.get("working_ms") or r.get("ms") or 0)
+                                               for r in window) / 1000.0, 1)
+            costs["model_tokens_out"] = sum(int(r.get("eval_count") or 0) for r in window)
+            costs["model_tokens_in"] = sum(int(r.get("prompt_eval_count") or 0) for r in window)
+    except Exception:  # noqa: BLE001
+        pass
+    return costs
+
+
+def pine_journal_write(req_id: int, when: str, request: str, reply: str,
+                       resolved_at: float | None = None, kind: str = "inbox",
+                       rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Write <id>.md and <id>.json for one resolved request. Sync (files);
+    call it in a thread from the loop."""
+    req_id = int(req_id)
+    request = str(request or "").strip()
+    reply = str(reply or "").strip() or "(resolved)"
+    submitted = _pine_when_epoch(when)
+    resolved = float(resolved_at or time.time())
+    costs = pine_journal_costs(request, reply, submitted, resolved, rows)
+    images = _pine_request_images(request)
+    title = " ".join(re.sub(r"\n\nAttached (?:images|files):.*\Z", "", request, flags=re.S).split())[:80]
+    meta = {"id": req_id, "kind": kind, "when": str(when or ""), "submitted_at": submitted,
+            "resolved_at": resolved,
+            "resolved": time.strftime("%Y-%m-%d %H:%M", time.localtime(resolved)),
+            "title": title or f"Request #{req_id}", "request": request, "reply": reply,
+            "images": images, "costs": costs,
+            "graph": pine_journal_graph(req_id, request, reply),
+            "markdown_path": f"data/pine_journal/{req_id}.md", "version": 1}
+    quoted = "\n".join("> " + line for line in request.splitlines()) or "> (no text)"
+    pictures = "".join(f"\n![attachment]({url})\n" for url in images)
+    md = (f"# Request #{req_id}\n\n- Submitted: {when}\n- Resolved: {meta['resolved']}\n"
+          f"- Tokens in (estimated): {costs['tokens_in']}\n- Tokens out (estimated): {costs['tokens_out']}\n"
+          f"- Open for: {costs['elapsed_s']} s\n- Station model calls inside the window: "
+          f"{costs['model_calls']} ({costs['model_seconds']} s working)\n\n"
+          f"## The request\n\n{quoted}\n{pictures}\n## The reply\n\n{reply}\n\n"
+          f"## Costs\n\n| measure | value |\n|---|---|\n| tokens in | {costs['tokens_in']} |\n"
+          f"| tokens out | {costs['tokens_out']} |\n| open for | {costs['elapsed_s']} s |\n"
+          f"| station model calls | {costs['model_calls']} |\n| station model seconds | {costs['model_seconds']} |\n\n"
+          f"_{costs['note']}_\n")
+    PINE_JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    for name, body in ((f"{req_id}.md", md),
+                       (f"{req_id}.json", json.dumps(meta, ensure_ascii=False, indent=1))):
+        temp = PINE_JOURNAL_DIR / (name + ".tmp")
+        temp.write_text(body, encoding="utf-8")
+        temp.replace(PINE_JOURNAL_DIR / name)
+    return meta
+
+
+def pine_journal_backfill() -> int:
+    """Every archived resolution without a page gets one. Sync; once."""
+    if _PINE_JOURNAL_BACKFILLED[0]:
+        return 0
+    _PINE_JOURNAL_BACKFILLED[0] = True
+    try:
+        history = PINE_COMPLETED_PATH.read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        return 0
+    PINE_JOURNAL_DIR.mkdir(parents=True, exist_ok=True)
+    blocks = _PINE_COMPLETED_BLOCK_RE.findall(history)
+    missing = [(int(i), r, s, t, p) for i, r, s, t, p in blocks
+               if not (PINE_JOURNAL_DIR / f"{int(i)}.json").exists()]
+    if not missing:
+        return 0
+    earliest = min((_pine_when_epoch(s) for _, _, s, _, _ in missing if _pine_when_epoch(s)), default=0.0)
+    rows: list[dict[str, Any]] = []
+    try:
+        if earliest and time.time() - earliest <= 14 * 86400:
+            rows = model_calls_rows(earliest, time.time())
+    except Exception:  # noqa: BLE001
+        rows = []
+    written = 0
+    for req_id, resolved_when, submitted, text, reply in missing:
+        try:
+            pine_journal_write(req_id, submitted.strip(), text.strip(), reply.strip(),
+                               resolved_at=_pine_when_epoch(resolved_when) or None, rows=rows)
+            written += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return written
+
+
+def _pine_journal_ids() -> list[int]:
+    try:
+        return sorted((int(p.stem) for p in PINE_JOURNAL_DIR.glob("*.json") if p.stem.isdigit()),
+                      reverse=True)
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def pine_journal_index() -> list[dict[str, Any]]:
+    """Newest first; one light row per page. Sync."""
+    pine_journal_backfill()
+    out: list[dict[str, Any]] = []
+    for req_id in _pine_journal_ids():
+        try:
+            meta = json.loads((PINE_JOURNAL_DIR / f"{req_id}.json").read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            continue
+        costs = meta.get("costs") or {}
+        out.append({"id": req_id, "when": meta.get("when"), "resolved_at": meta.get("resolved_at"),
+                    "resolved": meta.get("resolved"), "title": meta.get("title"),
+                    "kind": meta.get("kind") or "inbox", "images": len(meta.get("images") or []),
+                    "tokens_in": costs.get("tokens_in", 0), "tokens_out": costs.get("tokens_out", 0),
+                    "elapsed_s": costs.get("elapsed_s", 0), "model_calls": costs.get("model_calls", 0),
+                    "model_seconds": costs.get("model_seconds", 0.0)})
+    return out
+
+
+def pine_journal_page(req_id: int) -> dict[str, Any] | None:
+    pine_journal_backfill()
+    ids = _pine_journal_ids()
+    if int(req_id) not in ids:
+        return None
+    try:
+        meta = json.loads((PINE_JOURNAL_DIR / f"{int(req_id)}.json").read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    older = [i for i in ids if i < int(req_id)]
+    newer = [i for i in ids if i > int(req_id)]
+    # Page one is the newest request; the next page is the older one.
+    meta["previous_id"] = newer[-1] if newer else None
+    meta["next_id"] = older[0] if older else None
+    meta["page"] = ids.index(int(req_id)) + 1
+    meta["pages"] = len(ids)
+    return meta
+
+
 def _comfy_output_files(history: dict[str, Any]) -> list[str]:
     """Flatten a ComfyUI /history response into a newest-first list of output
     image filenames. History is insertion-ordered oldest→newest, so a reversed
@@ -7411,7 +7710,19 @@ _SYNTH_TRIED = [0.0]              # #852: attempted, as distinct from done
 # One writer plus one long looker, never a pile: every chat call to ollama
 # goes through this gate, because the show's clocks stacking unbounded
 # concurrent calls is exactly what wedged the chat queue server-side.
-_OLLAMA_GATE = asyncio.Semaphore(2)
+#
+# #1080: OLLAMA_LANES is how many asks one model may hold at once. It
+# must match the host's OLLAMA_NUM_PARALLEL (a runner launched `-np 1`
+# serialises a second ask, see the measurement below); with two slots on
+# the host the second ask decodes beside the first instead of behind it.
+# Set in compose beside OLLAMA_URL; the code default stays one lane.
+def _ollama_lanes_env() -> int:
+    try:
+        return max(1, min(4, int(str(os.getenv("OLLAMA_LANES", "1") or "1").strip())))
+    except Exception:  # noqa: BLE001
+        return 1
+OLLAMA_LANES = _ollama_lanes_env()
+_OLLAMA_GATE = asyncio.Semaphore(2 * OLLAMA_LANES)
 # #1079: ...AND ONE PERMIT PER MODEL BEHIND IT.
 #
 # Every llama-server runner on this box is launched `-np 1`, so ollama
@@ -7445,9 +7756,13 @@ def writing_room_state() -> dict[str, Any]:
              "category": row.get("category") or _ollama_category(row["purpose"])[0],
              "state": row["state"], "seconds": round(now - row["at"], 2)}
             for identity, row in list(_OLLAMA_JOBS.items())]
-    return {"station_limit_per_model": 2, "tint_limit_per_model": 2,
+    _station_cap = _ollama_category_cap("station")
+    _tint_cap = _ollama_category_cap("tint")
+    return {"station_limit_per_model": _station_cap, "tint_limit_per_model": _tint_cap,
             "repertoire_limit_per_model": 1, "sfx_reserve_limit_per_model": 1,
-            "category_limits_per_model": {"station": 2, "tint": 2, "repertoire": 1,
+            "lanes_per_model": OLLAMA_LANES,                       # #1080
+            "category_limits_per_model": {"station": _station_cap, "tint": _tint_cap,
+                                          "repertoire": 1,
                                           "sfx_reserve": 1, "interactive": None},
             "active": sum(row["state"] == "active" for row in jobs),
             "waiting": sum(row["state"] == "waiting" for row in jobs),
@@ -7456,13 +7771,39 @@ def writing_room_state() -> dict[str, Any]:
 
 
 def _ollama_lane(model: str) -> asyncio.Semaphore:
-    """One permit for each model, made on first use."""
+    """One permit for each model, made on first use (OLLAMA_LANES of them, #1080)."""
     key = str(model or "")
     lane = _OLLAMA_ONE.get(key)
     if lane is None:
-        lane = asyncio.Semaphore(1)
+        lane = asyncio.Semaphore(OLLAMA_LANES)
         _OLLAMA_ONE[key] = lane
     return lane
+
+
+def _system2_critical_work() -> bool:
+    """#1080: whether the current task is preparing a System2 job whose slot
+    has started or starts within twenty minutes. That work rides one more
+    tint permit than the background roads, so the hour's own due segment
+    is not queued behind a memo for the day after tomorrow."""
+    try:
+        getter = globals().get("system2_current_work")
+        work = getter() if callable(getter) else None
+        if not work:
+            return False
+        start = float((work.get("template") or {}).get("start") or 0)
+        return bool(start) and start - time.time() < 1200.0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ollama_category_cap(category: str, purpose: str = "") -> int:
+    """The admission cap for a category, lanes and the schedule's own work
+    counted (#1080)."""
+    base = {"station": max(2, OLLAMA_LANES + 1), "tint": max(2, OLLAMA_LANES + 1),
+            "repertoire": 1, "sfx_reserve": 1}.get(category, 0)
+    if base and category == "tint" and _system2_critical_work():
+        base += 1
+    return base
 _OUR_VOICE_FOR = 4.0
 
 
@@ -12173,8 +12514,15 @@ def dialogue_row_viable(kind: str, row: Any) -> bool:
             if (str(kind) == "caller" and callable(_call_gate)
                     and not _call_gate(entry)):
                 return False
+            # #1082: a struck-out tint retires the row. It stays visible
+            # for diagnosis but no longer holds a stocking slot, so the
+            # scheduler writes its replacement instead of asking again.
+            if tint_exhausted(entry) and not dialogue_tint_ready(kind, row):
+                return False
             return bool(str(entry.get("script_plain")
                             or entry.get("script") or "").strip())
+        if tint_exhausted(row) and not dialogue_tint_ready(kind, row):
+            return False
         return bool(str(row.get("text_plain") or row.get("text") or "").strip())
     except Exception:  # noqa: BLE001
         return False
@@ -23389,6 +23737,25 @@ def dj_on_air(track: dict[str, Any]) -> None:
 async def _record_talk(track: dict[str, Any], dj: dict[str, Any],
                        played: int, tape_slot: bool,
                        spin_first: bool, intro_only: bool = False) -> None:
+    """#1082: the record's talk runs as its own task; a writer that was
+    fully admitted raises WritingDeferred out of it, and an exception that
+    escapes a fire-and-forget task is only ever a traceback in the log. The
+    yield is a fact of the hour, not a fault - it is logged once and the
+    record plays."""
+    try:
+        await _record_talk_body(track, dj, played, tape_slot, spin_first,
+                                intro_only=intro_only)
+    except WritingDeferred as exc:
+        try:
+            pipeline_log("drop", "the record's talk yielded - "
+                         f"{str(exc)[:160]} (#1082)")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def _record_talk_body(track: dict[str, Any], dj: dict[str, Any],
+                            played: int, tape_slot: bool,
+                            spin_first: bool, intro_only: bool = False) -> None:
     """Everything the pair do for one record (#689, second cut).
 
     Split out of the show loop so it can run BESIDE the record rather
@@ -25675,8 +26042,29 @@ def tint_retry_status(entry: dict[str, Any], kind: str) -> dict[str, Any]:
     changed = state.get("context") != _tint_retry_context(entry, kind)
     remaining = max(0.0, float(state.get("retry_at") or 0) - time.time())
     waiting = bool(remaining and not explicit and not changed)
+    if state.get("exhausted") and not explicit:
+        # #1082: a struck-out line is not released by a new lesson, a
+        # prompt revision or the ladder's clock running out - twelve
+        # answers did not move it. Only the operator's own recovery reopens it.
+        waiting = True
+        changed = False
     return {**state, "waiting": waiting, "remaining_seconds": round(remaining if waiting else 0, 2),
             "release_reason": "operator_recovery" if explicit else "context_changed" if changed else ""}
+
+
+# #1082: how many completed model answers a line may burn without one more
+# accepted bar before it is struck out. Measured over six hours: six lines
+# of one caller script drew 202 refusals (30 % of every tint event) because
+# each cooldown ended in the same asks; twelve answers is three cooldown
+# rounds, and after them the line is cut from a round or the call retired.
+TINT_STRIKES_MOST = 12
+
+
+def tint_exhausted(entry: Any) -> bool:
+    try:
+        return bool((entry.get("tint_retry_budget") or {}).get("exhausted"))
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def tint_retry_due(entry: dict[str, Any], kind: str) -> bool:
@@ -25710,13 +26098,31 @@ def _tint_retry_note(entry: dict[str, Any], context: str, before: int,
     state["last_observed_at"] = now
     if got.get("ok") or after > best:
         state.update(accepted_highwater=max(best, after), stagnant_model_responses=0,
-                     cooldown_rounds=0, retry_at=0.0, last_progress_at=now, reason="accepted coverage advanced")
+                     cooldown_rounds=0, retry_at=0.0, last_progress_at=now, strikes=0,
+                     reason="accepted coverage advanced")
     else:
         state["stagnant_model_responses"] += responses
+        # #1082: the strikes never reset with a cooldown - only with progress.
+        state["strikes"] = int(state.get("strikes") or 0) + int(responses)
         if state["stagnant_model_responses"] >= 4:
             delay = min(1800.0, 300.0 * (2 ** min(3, int(state["cooldown_rounds"]))))
             state.update(retry_at=now + delay, cooldown_rounds=state["cooldown_rounds"] + 1,
                 reason="Completed model responses did not increase accepted turns; yielding to other retained work")
+        if state["strikes"] >= TINT_STRIKES_MOST and not state.get("exhausted"):
+            # The ladder above keeps its clock for the record; the strike is
+            # what tint_retry_status reads, and nothing but the operator's
+            # own recovery releases it.
+            state.update(exhausted=True, exhausted_at=now,
+                         reason=(f"(#1082) struck out: {state['strikes']} model answers did not "
+                                 "advance one accepted bar; the line is cut from its round "
+                                 "or the call retired, and the same asks are not sent again"))
+            try:
+                tint_seen("exhausted")
+                pipeline_log("crystal", f"(#1082) a {str(entry.get('prep_kind') or entry.get('kind') or 'dialogue')} "
+                             f"line is struck out after {state['strikes']} answers: "
+                             + "; ".join(str(f) for f in (state.get("blocking_faults") or [])[:3])[:220])
+            except Exception:  # noqa: BLE001
+                pass
     state["last_accepted"] = after
     rows = (got.get("progress") or {}).get("turns") or []
     state["blocking_faults"] = sorted({str(fault) for row in rows if isinstance(row, dict)
@@ -76660,8 +77066,8 @@ def _ollama_category(purpose: str) -> tuple[str, int]:
     if purpose == "sfx_tint_reserve":
         return "sfx_reserve", 1
     if "tint" in purpose:
-        return "tint", 2
-    return "station", 2
+        return "tint", _ollama_category_cap("tint", purpose)
+    return "station", _ollama_category_cap("station", purpose)
 
 
 async def _tint_turn_yields(model: str, purpose: str,
@@ -80930,8 +81336,46 @@ def crystal_tint_two_pass() -> bool:
         return False
 
 
+# #1081: THE SAME PASSAGES FOR A WHILE. The runner reuses its KV cache only
+# for an identical prompt prefix, and the tint's prefix (rules, world,
+# passages) was resampled on every ask - so a 31b ask reprocessed all of
+# it, every time. A sample held for this window makes every ask in the
+# window share the prefix; the road and the line still follow it.
+CRYSTAL_MATERIAL_WINDOW = 1200.0
+_CRYSTAL_MATERIAL_MEMO: dict[str, Any] = {}
+
+
 def crystal_material(most: int = 3, cap: int = 700,
-                     ceiling: int = 12) -> list[dict[str, Any]]:
+                     ceiling: int = 12, stable: bool = False) -> list[dict[str, Any]]:
+    """#1006 passages for the second system prompt; `stable=True` keeps
+    one sample for CRYSTAL_MATERIAL_WINDOW seconds (#1081)."""
+    if not stable:
+        return _crystal_material_sample(most, cap, ceiling)
+    try:
+        key = json.dumps([int(most), int(cap), int(ceiling),
+                          sorted((str(c.get("name") or ""), sorted(str(m) for m in (c.get("minds") or [])))
+                                 for c in crystal_active())], default=str)
+    except Exception:  # noqa: BLE001
+        key = ""
+    memo = _CRYSTAL_MATERIAL_MEMO
+    if (key and memo.get("key") == key and memo.get("rows")
+            and time.time() - float(memo.get("at") or 0) < CRYSTAL_MATERIAL_WINDOW):
+        return copy.deepcopy(memo["rows"])
+    rows = _crystal_material_sample(most, cap, ceiling)
+    if key and rows:
+        memo.update(key=key, at=time.time(), rows=copy.deepcopy(rows))
+    return rows
+
+
+def crystal_material_status() -> dict[str, Any]:
+    memo = _CRYSTAL_MATERIAL_MEMO
+    age = time.time() - float(memo.get("at") or 0) if memo.get("at") else None
+    return {"window_seconds": CRYSTAL_MATERIAL_WINDOW, "passages": len(memo.get("rows") or []),
+            "age_seconds": round(age, 1) if age is not None else None}
+
+
+def _crystal_material_sample(most: int = 3, cap: int = 700,
+                             ceiling: int = 12) -> list[dict[str, Any]]:
     """#1006: passages out of the crystal's own minds, for the SECOND
     system prompt.
 
@@ -83727,7 +84171,8 @@ async def crystal_tint(script: str, kind: str = "",
             # of; fall back to the old scatter rather than tinting with
             # nothing at all.
             chunks = crystal_material(int(dj.get("crystal_tint_chunks") or 5),
-                                      int(dj.get("crystal_tint_chars") or 900))
+                                      int(dj.get("crystal_tint_chars") or 900),
+                                      stable=True)                     # #1081
         if not chunks:
             out["why"] = "the active crystal has no source passages"
             return out
@@ -84021,7 +84466,8 @@ async def crystal_tint(script: str, kind: str = "",
                     fresh = await _line_review_scoped(crystal_turn(
                         _said, world, chunks, answering, keep,
                         _first_prompt, kind, _tint_model,          # #1119
-                        lesson=lesson), _turn_review_context)        # #1146
+                        lesson=tint_prior_lesson(_said, lesson)),   # #1082
+                        _turn_review_context)                       # #1146
                 except TypeError as exc:
                     # Third-party/test turn writers written against the
                     # previous signature still resume safely. Do not swallow
@@ -90858,6 +91304,10 @@ async def api_tint_state(
         # neural layer has been embedded. Before this the status function
         # had no route at all.
         "rhyme_assistance": crystal_rhyme_status(),
+        "fault_memo": tint_fault_memo_status(),                # #1082
+        "strikes_most": TINT_STRIKES_MOST,                     # #1082
+        "lanes_per_model": OLLAMA_LANES,                       # #1080
+        "material": crystal_material_status(),                 # #1081
         # #1018: what every OTHER tint site is now sending - the crystal's
         # own lines, not just its description. Shown here because the
         # operator's complaint was that the tint had a label in it and
@@ -119475,6 +119925,12 @@ async def pine_resolve(
         reply or "(resolved)",
         {"active_prompt": "Pine Chat", "model": "resolver", "pine_chat": True},
     )
+    # #1079: the request book gets its page as the request is settled.
+    try:
+        await asyncio.to_thread(pine_journal_write, req_id, item.get("when") or "",
+                                item.get("text") or "", reply or "(resolved)")
+    except Exception:  # noqa: BLE001
+        pass
     try:
         pc = load_settings()["pine_chat"]
         phrase = random.choice(
@@ -119485,6 +119941,61 @@ async def pine_resolve(
     except Exception:
         pass
     return {"resolved": item, "reply": reply}
+
+
+# --- #1079: the request book, served -----------------------------------------
+
+def _journal_auth(authorization: str | None, key: str = "") -> None:
+    """A page opened in its own tab carries the key as ?key= (no header)."""
+    if key and not authorization:
+        authorization = "Bearer " + str(key)
+    require_read_auth(authorization)
+
+
+@app.get("/api/pine-journal")
+async def pine_journal_list(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    _journal_auth(authorization, key)
+    pages = await asyncio.to_thread(pine_journal_index)
+    return {"pages": pages, "count": len(pages)}
+
+
+@app.get("/api/pine-journal/{req_id}")
+async def pine_journal_read(
+    req_id: int,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    _journal_auth(authorization, key)
+    page = await asyncio.to_thread(pine_journal_page, int(req_id))
+    if page is None:
+        raise HTTPException(status_code=404, detail="No such page in the request book")
+    return page
+
+
+@app.get("/api/pine-journal/{req_id}/md")
+async def pine_journal_markdown(
+    req_id: int,
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> Response:
+    _journal_auth(authorization, key)
+    path = PINE_JOURNAL_DIR / f"{int(req_id)}.md"
+    try:
+        body = await asyncio.to_thread(path.read_text, "utf-8")
+    except Exception:
+        raise HTTPException(status_code=404, detail="No such page in the request book")
+    return Response(content=body, media_type="text/markdown; charset=utf-8")
+
+
+@app.get("/journal", response_class=HTMLResponse)
+async def journal_page() -> str:
+    """The request book on its own URL (#1079): every request and its
+    reply, page by page, with the costs and the flow of the work."""
+    embedded = SPARK_AGENT_API_KEY if AUTOFILL_KEY else ""
+    return JOURNAL_PAGE_HTML.replace("__SERVER_KEY__", json.dumps(embedded))
 
 
 @app.get("/v1/models")
@@ -122119,6 +122630,8 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
             style="width:auto;max-width:150px;flex:0 1 auto;min-width:0;
                    padding:6px 10px;font-size:13px">
     </select>
+    <button id="journalBtn" class="tray-btn" title="The request book — every request and its reply, page by page (#1079)"
+            onclick="journalOpen()" style="font-size:18px;line-height:1">📖</button>
     <button id="trayBtn" class="tray-btn" title="Everything that popped up"
             onclick="toggleTray()">
       <svg viewBox="0 0 24 24" width="20" height="20"><path fill="currentColor"
@@ -124274,6 +124787,7 @@ const PINE_3JS = [
            close: () => boothClose(), width: 760, height: 560}},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "rhymecloud", label: "🎤 Rhyme Cloud",  open: () => rhymeCloudWin()},
+  {key: "journal",  label: "📖 Request book",   open: () => journalOpen()},
   {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen(),
    frame: {shade: () => paperBox, close: () => paperClose(),
            width: 1240, height: 920}},
@@ -126922,6 +127436,385 @@ async function exportConversationPdf(g) {
   win.document.write("</body></html>");
   win.document.close();
   setTimeout(() => win.print(), 700);
+}
+
+/* ---- #1079: the request book ---- */
+// One page per resolved request, newest first: the request, the reply as
+// it was written, the token costs in and out, and the work as a flow chart
+// drawn from the reply's own sections and steps. Lives in the shared
+// pop-up frame; the same book is on its own URL at /journal.
+let journalBook = null;
+let journalFlow = null;
+
+function journalStyle() {
+  if (document.getElementById("journalStyle")) return;
+  const css = document.createElement("style");
+  css.id = "journalStyle";
+  css.textContent = [
+    ".jr-bar{display:flex;gap:6px;align-items:center;flex-wrap:wrap;padding:6px 8px;",
+    "border-bottom:1px solid #1e2a3a;background:#0b1220;flex:0 0 auto}",
+    ".jr-bar button,.jr-bar select{font-size:12px;padding:4px 8px}",
+    ".jr-body{flex:1 1 auto;min-height:0;overflow:auto;padding:10px 14px;font-size:13px;line-height:1.55}",
+    ".jr-meta{color:#9fb3c8;font-size:12px;margin-bottom:8px}",
+    ".jr-req{border-left:3px solid #3aa3ff;background:#0e1626;padding:8px 12px;",
+    "border-radius:0 8px 8px 0;margin-bottom:10px;white-space:pre-wrap}",
+    ".jr-req img{max-width:100%;border-radius:8px;margin:6px 0;display:block}",
+    ".jr-h{font-weight:700;color:#8fd3ff;margin:12px 0 4px;font-size:12px;",
+    "text-transform:uppercase;letter-spacing:.06em}",
+    ".jr-costs{display:flex;gap:16px;align-items:flex-end;flex-wrap:wrap}",
+    ".jr-costs canvas{width:100%;max-width:520px;height:110px;display:block;flex:1 1 300px}",
+    ".jr-nums{display:grid;grid-template-columns:auto auto;gap:2px 12px;font-size:12px;color:#cfe6ff}",
+    ".jr-flow{position:relative;height:280px;border-radius:10px;overflow:hidden;",
+    "background:#04060b;border:1px solid #1e2a3a}",
+    ".jr-flow canvas{display:block}",
+    ".jr-reply{margin-top:6px}.jr-reply h1,.jr-reply h2,.jr-reply h3{margin:14px 0 6px}",
+    ".jr-reply pre{background:#0e1626;padding:8px 10px;border-radius:7px;overflow-x:auto}",
+    ".jr-reply .jr-hit{outline:2px solid #ffb347;outline-offset:3px;border-radius:4px}",
+    ".jr-note{color:#7f93a8;font-size:11px;margin-top:6px}",
+  ].join("");
+  document.head.appendChild(css);
+}
+
+async function journalOpen(id) {
+  journalStyle();
+  const win = pineWin("journal", "📖 The request book", {
+    minWidth: 520, minHeight: 420, width: 920, height: 740,
+    onClose: () => { journalFlowStop(); journalBook = null; },
+  });
+  const host = win.host;
+  host.style.display = "flex";
+  host.style.flexDirection = "column";
+  host.style.overflow = "hidden";
+  const bar = el("div", "jr-bar", "");
+  const prev = el("button", "", "◀ Previous");
+  const pos = el("span", "muted", "");
+  const next = el("button", "", "Next ▶");
+  const jump = document.createElement("select");
+  jump.style.maxWidth = "300px";
+  const gap = el("span", "", "");
+  gap.style.flex = "1";
+  const md = el("button", "", "Markdown");
+  md.title = "The page as a markdown file";
+  const page = el("button", "", "Open as page");
+  page.title = "The book on its own URL (/journal)";
+  [prev, pos, next, jump, gap, md, page].forEach((n) => bar.appendChild(n));
+  host.appendChild(bar);
+  const body = el("div", "jr-body", "");
+  host.appendChild(body);
+  journalBook = {win, bar, body, pos, jump, prev, next, ids: [], index: [], id: null};
+  body.textContent = "Reading the book…";
+  let list;
+  try { list = await api("/api/pine-journal"); }
+  catch (e) { body.textContent = "The book could not be read: " + e; return; }
+  if (!journalBook || journalBook.win !== win) return;
+  journalBook.index = list.pages || [];
+  journalBook.ids = journalBook.index.map((p) => p.id);
+  journalBook.index.forEach((p, i) => {
+    const o = document.createElement("option");
+    o.value = String(p.id);
+    o.textContent = (i + 1) + ". #" + p.id + " · " + (p.when || "") + " · " + (p.title || "");
+    jump.appendChild(o);
+  });
+  jump.onchange = () => journalShow(parseInt(jump.value, 10));
+  prev.onclick = () => journalStep(-1);
+  next.onclick = () => journalStep(1);
+  const withKey = (url) => url + (key() ? "&key=" + encodeURIComponent(key()) : "");
+  md.onclick = () => {
+    if (journalBook && journalBook.id) {
+      window.open(withKey("/api/pine-journal/" + journalBook.id + "/md?v=1"), "_blank");
+    }
+  };
+  page.onclick = () => {
+    if (journalBook && journalBook.id) {
+      window.open(withKey("/journal?id=" + journalBook.id), "_blank");
+    }
+  };
+  if (!journalBook.ids.length) {
+    body.textContent = "No resolved request has a page yet.";
+    return;
+  }
+  journalShow(id && journalBook.ids.indexOf(id) >= 0 ? id : journalBook.ids[0]);
+}
+
+function journalStep(delta) {
+  if (!journalBook || !journalBook.ids.length) return;
+  const at = journalBook.ids.indexOf(journalBook.id);
+  const to = Math.min(journalBook.ids.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta));
+  journalShow(journalBook.ids[to]);
+}
+
+function journalSpan(s) {
+  s = Math.max(0, Math.round(s || 0));
+  if (s < 90) return s + " s";
+  if (s < 5400) return Math.round(s / 60) + " min";
+  return (s / 3600).toFixed(1) + " h";
+}
+
+async function journalShow(id) {
+  if (!journalBook) return;
+  const book = journalBook;
+  book.id = id;
+  book.jump.value = String(id);
+  const at = book.ids.indexOf(id);
+  book.pos.textContent = "page " + (at + 1) + " of " + book.ids.length;
+  book.prev.disabled = at <= 0;
+  book.next.disabled = at >= book.ids.length - 1;
+  journalFlowStop();
+  book.body.textContent = "Turning the page…";
+  let p;
+  try { p = await api("/api/pine-journal/" + id); }
+  catch (e) { book.body.textContent = "That page could not be read: " + e; return; }
+  if (journalBook !== book || book.id !== id) return;
+  const c = p.costs || {};
+  book.body.innerHTML = "";
+  const meta = el("div", "jr-meta", "");
+  meta.textContent = "#" + p.id + " · submitted " + (p.when || "?") + " · resolved "
+    + (p.resolved || "?") + (c.elapsed_s ? " · open " + journalSpan(c.elapsed_s) : "");
+  book.body.appendChild(meta);
+  book.body.appendChild(el("div", "jr-h", "The request"));
+  const req = el("div", "jr-req", "");
+  req.textContent = p.request || "(no text)";
+  (p.images || []).forEach((src) => {
+    const img = document.createElement("img");
+    img.src = src;
+    img.loading = "lazy";
+    req.appendChild(img);
+  });
+  book.body.appendChild(req);
+  book.body.appendChild(el("div", "jr-h", "Costs"));
+  const costs = el("div", "jr-costs", "");
+  const canvas = document.createElement("canvas");
+  costs.appendChild(canvas);
+  const nums = el("div", "jr-nums", "");
+  [["tokens in", c.tokens_in], ["tokens out", c.tokens_out],
+   ["open for", journalSpan(c.elapsed_s || 0)],
+   ["station model calls", c.model_calls], ["station model seconds", c.model_seconds]]
+    .forEach(([k, v]) => {
+      nums.appendChild(el("span", "muted", k));
+      nums.appendChild(el("b", "", String(v == null ? "–" : v)));
+    });
+  costs.appendChild(nums);
+  book.body.appendChild(costs);
+  book.body.appendChild(el("div", "jr-note",
+    (c.note || "") + " Bars are relative to the largest page in the book."));
+  book.body.appendChild(el("div", "jr-h", "The flow of the work — drag to turn, wheel to zoom, click a node to jump"));
+  const flow = el("div", "jr-flow", "");
+  book.body.appendChild(flow);
+  book.body.appendChild(el("div", "jr-h", "The reply"));
+  const reply = el("div", "jr-reply", "");
+  reply.innerHTML = mdToHtml(p.reply || "");
+  book.body.appendChild(reply);
+  journalCostChart(canvas, c, book.index);
+  const heads = Array.from(reply.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+  const items = Array.from(reply.querySelectorAll("li"));
+  const paras = Array.from(reply.querySelectorAll("p"));
+  const g = p.graph || {nodes: [], edges: []};
+  let s = 0, t = 0;
+  const targets = {};
+  (g.nodes || []).forEach((n) => {
+    if (n.kind === "section") targets[n.id] = heads.length ? heads[s++] : paras[s++];
+    else if (n.kind === "step") targets[n.id] = items[t++];
+    else targets[n.id] = req;
+  });
+  journalFlowStart(flow, g, (node) => {
+    const target = targets[node.id];
+    if (!target) return;
+    reply.querySelectorAll(".jr-hit").forEach((n) => n.classList.remove("jr-hit"));
+    target.classList.add("jr-hit");
+    target.scrollIntoView({behavior: "smooth", block: "center"});
+  });
+}
+
+function journalCostChart(canvas, c, index) {
+  const ratio = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth || 480, h = 110;
+  canvas.width = Math.round(w * ratio);
+  canvas.height = Math.round(h * ratio);
+  const ctx = canvas.getContext("2d");
+  ctx.scale(ratio, ratio);
+  const bars = [["tokens in", c.tokens_in || 0, "tokens_in", "#3aa3ff"],
+                ["tokens out", c.tokens_out || 0, "tokens_out", "#8fd3ff"],
+                ["model calls", c.model_calls || 0, "model_calls", "#ffb347"],
+                ["model s", c.model_seconds || 0, "model_seconds", "#ff7a59"]];
+  const maxOf = (k) => Math.max(1, ...(index || []).map((p) => Number(p[k]) || 0));
+  const slot = w / bars.length;
+  ctx.clearRect(0, 0, w, h);
+  bars.forEach(([label, value, k, color], i) => {
+    const frac = Math.min(1, value / maxOf(k));
+    const bh = Math.max(2, frac * (h - 34));
+    const x = i * slot + slot * 0.2, bw = slot * 0.6;
+    ctx.fillStyle = "#101a2a";
+    ctx.fillRect(x, 8, bw, h - 34);
+    ctx.fillStyle = color;
+    ctx.fillRect(x, 8 + (h - 34) - bh, bw, bh);
+    ctx.fillStyle = "#cfe6ff";
+    ctx.font = "11px system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText(label, x + bw / 2, h - 14);
+    ctx.fillStyle = "#9fb3c8";
+    ctx.fillText(String(value), x + bw / 2, h - 2);
+  });
+}
+
+function journalFlowStop() {
+  const f = journalFlow;
+  journalFlow = null;
+  if (!f) return;
+  try { cancelAnimationFrame(f.raf); } catch (e) {}
+  try { f.ro.disconnect(); } catch (e) {}
+  try {
+    f.group.children.forEach((o) => {
+      if (o.material) {
+        if (o.material.map) o.material.map.dispose();
+        o.material.dispose();
+      }
+      if (o.geometry) o.geometry.dispose();
+    });
+    f.renderer.dispose();
+    f.renderer.domElement.remove();
+  } catch (e) {}
+}
+
+async function journalFlowStart(host, graph, onPick) {
+  journalFlowStop();
+  const nodes = graph.nodes || [], edges = graph.edges || [];
+  if (!nodes.length) { host.textContent = "No flow to draw."; return; }
+  const THREE = await import("/vendor/three.module.js");
+  await new Promise((done) => requestAnimationFrame(() => done()));
+  if (!host.isConnected || journalFlow) return;
+  const size = () => [Math.max(240, host.clientWidth || 480),
+                      Math.max(160, host.clientHeight || 280)];
+  let [width, height] = size();
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x04060b, 0.018);
+  const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 400);
+  const renderer = new THREE.WebGLRenderer({antialias: true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(width, height);
+  renderer.setClearColor(0x04060b, 1);
+  host.appendChild(renderer.domElement);
+  const label = document.createElement("div");
+  label.style.cssText = "position:absolute;pointer-events:none;padding:4px 8px;"
+    + "border-radius:6px;background:#0b1220e6;color:#cfe6ff;font-size:12px;"
+    + "display:none;z-index:2;max-width:60%";
+  host.appendChild(label);
+  const group = new THREE.Group();
+  scene.add(group);
+
+  // A tree laid out by leaf count: every section is as wide as its steps.
+  const kids = {};
+  edges.forEach((e) => { (kids[e.from] = kids[e.from] || []).push(e.to); });
+  const leaf = 2.6;
+  const widthOf = (id) => {
+    const k = kids[id] || [];
+    return k.length ? k.reduce((s, c) => s + widthOf(c), 0) : leaf;
+  };
+  const pos = {};
+  const place = (id, x0, depth) => {
+    const w = widthOf(id);
+    pos[id] = new THREE.Vector3(x0 + w / 2, 9 - depth * 8, (depth % 2) * 1.5);
+    let x = x0;
+    (kids[id] || []).forEach((c) => { place(c, x, depth + 1); x += widthOf(c); });
+  };
+  const root = nodes[0].id;
+  place(root, -widthOf(root) / 2, 0);
+  nodes.forEach((n) => { if (!pos[n.id]) pos[n.id] = new THREE.Vector3(0, -16, 0); });
+
+  const weight = {request: 1.0, section: 0.55, step: 0.22};
+  const heat = {request: 0.95, section: 0.6, step: 0.25};
+  const sprites = [];
+  nodes.forEach((n) => {
+    const sprite = cloudSprite(THREE, n.label || n.id, weight[n.kind] || 0.3, heat[n.kind] || 0.3);
+    sprite.position.copy(pos[n.id]);
+    sprite.userData.node = n;
+    group.add(sprite);
+    sprites.push(sprite);
+  });
+  const lineMat = new THREE.LineBasicMaterial({color: 0x3aa3ff, transparent: true, opacity: 0.5});
+  edges.forEach((e) => {
+    if (!pos[e.from] || !pos[e.to]) return;
+    const geo = new THREE.BufferGeometry().setFromPoints([pos[e.from], pos[e.to]]);
+    group.add(new THREE.Line(geo, lineMat));
+  });
+  camera.position.set(0, 0, Math.min(90, Math.max(12, widthOf(root)) * 1.1 + 12));
+
+  const ray = new THREE.Raycaster();
+  const mouse = new THREE.Vector2(-2, -2);
+  let dragging = false, moved = 0, last = null, idle = true;
+  const canvas = renderer.domElement;
+  canvas.style.cursor = "grab";
+  canvas.addEventListener("pointerdown", (e) => {
+    dragging = true; moved = 0; last = [e.clientX, e.clientY]; idle = false;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    if (dragging && last) {
+      const dx = e.clientX - last[0], dy = e.clientY - last[1];
+      moved += Math.abs(dx) + Math.abs(dy);
+      group.rotation.y += dx * 0.006;
+      group.rotation.x = Math.max(-1.2, Math.min(1.2, group.rotation.x + dy * 0.004));
+      last = [e.clientX, e.clientY];
+    }
+  });
+  const pick = () => {
+    ray.setFromCamera(mouse, camera);
+    const hit = ray.intersectObjects(sprites, false)[0];
+    return hit ? hit.object : null;
+  };
+  canvas.addEventListener("pointerup", () => {
+    dragging = false;
+    if (moved < 6) {
+      const s = pick();
+      if (s && onPick) onPick(s.userData.node);
+    }
+  });
+  canvas.addEventListener("pointerleave", () => {
+    dragging = false; mouse.set(-2, -2); label.style.display = "none";
+  });
+  canvas.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    camera.position.z = Math.max(8, Math.min(120, camera.position.z * (e.deltaY > 0 ? 1.1 : 0.9)));
+  }, {passive: false});
+  canvas.addEventListener("dblclick", () => { idle = true; group.rotation.set(0, 0, 0); });
+
+  const ro = new ResizeObserver(() => {
+    if (!journalFlow || journalFlow.renderer !== renderer) return;
+    [width, height] = size();
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+    renderer.setSize(width, height);
+  });
+  ro.observe(host);
+  const flow = {renderer, group, ro, raf: 0};
+  journalFlow = flow;
+  let hovered = null;
+  const tick = () => {
+    if (journalFlow !== flow) return;
+    if (idle && !dragging) group.rotation.y += 0.0025;
+    const s = dragging ? null : pick();
+    if (s !== hovered) {
+      if (hovered) hovered.scale.copy(hovered.userData.baseScale);
+      hovered = s;
+      if (s) s.scale.copy(s.userData.baseScale).multiplyScalar(1.25);
+    }
+    if (s) {
+      const n = s.userData.node;
+      label.textContent = (n.kind === "step" ? "• " : "") + (n.detail || n.label || "");
+      label.style.display = "block";
+      const r = canvas.getBoundingClientRect();
+      label.style.left = Math.min(r.width - 220, Math.max(4, ((mouse.x + 1) / 2) * r.width + 12)) + "px";
+      label.style.top = Math.max(4, ((1 - mouse.y) / 2) * r.height - 30) + "px";
+      canvas.style.cursor = "pointer";
+    } else {
+      label.style.display = "none";
+      canvas.style.cursor = dragging ? "grabbing" : "grab";
+    }
+    renderer.render(scene, camera);
+    flow.raf = requestAnimationFrame(tick);
+  };
+  tick();
 }
 
 /* ---- 3D word cloud (#83) ---- */
@@ -167936,6 +168829,391 @@ startLiveActivity();
 """
 
 
+
+# #1079: the request book on its own URL. The same pages the panel's 📖
+# frame turns, with room to read: the request, the costs, the flow of the
+# work and the reply.
+JOURNAL_PAGE_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>The request book · Pine Box</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #04060b; color: #dbe7f5;
+         font: 14px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { position: sticky; top: 0; z-index: 3; background: #0b1220;
+           border-bottom: 1px solid #1e2a3a; padding: 8px 14px; display: flex;
+           gap: 8px; align-items: center; flex-wrap: wrap; }
+  header button, header select, header a.btn { font-size: 13px; padding: 5px 10px;
+           background: #101a2a; color: #dbe7f5; border: 1px solid #27354a;
+           border-radius: 6px; text-decoration: none; cursor: pointer; }
+  header button:disabled { opacity: .4; cursor: default; }
+  header select { max-width: 340px; }
+  main { max-width: 980px; margin: 0 auto; padding: 16px 18px 60px; }
+  .meta { color: #9fb3c8; font-size: 12px; margin-bottom: 10px; }
+  .h { font-weight: 700; color: #8fd3ff; margin: 18px 0 6px; font-size: 12px;
+       text-transform: uppercase; letter-spacing: .06em; }
+  .req { border-left: 3px solid #3aa3ff; background: #0e1626; padding: 10px 14px;
+         border-radius: 0 8px 8px 0; white-space: pre-wrap; }
+  .req img { max-width: 100%; border-radius: 8px; margin: 8px 0; display: block; }
+  .costs { display: flex; gap: 18px; align-items: flex-end; flex-wrap: wrap; }
+  canvas.cost { width: 100%; max-width: 560px; height: 120px; display: block; flex: 1 1 320px; }
+  .nums { display: grid; grid-template-columns: auto auto; gap: 2px 14px; font-size: 13px; }
+  .nums span { color: #9fb3c8; }
+  .note { color: #7f93a8; font-size: 11px; margin-top: 6px; }
+  .flow { position: relative; height: 360px; border-radius: 10px; overflow: hidden;
+          background: #04060b; border: 1px solid #1e2a3a; }
+  .flow canvas { display: block; }
+  .reply h1, .reply h2, .reply h3 { margin: 16px 0 6px; }
+  .reply pre { background: #0e1626; padding: 9px 11px; border-radius: 7px; overflow-x: auto; }
+  .reply code { background: #0e1626; padding: 1px 5px; border-radius: 4px; }
+  .reply table { border-collapse: collapse; margin: 8px 0; }
+  .reply td, .reply th { border: 1px solid #27354a; padding: 3px 8px; }
+  .reply blockquote { border-left: 3px solid #27354a; margin: 6px 0; padding: 2px 10px; color: #b9c8d8; }
+  .reply .hit { outline: 2px solid #ffb347; outline-offset: 3px; border-radius: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <b>📖 The request book</b>
+  <button id="prev">◀ Previous</button>
+  <span id="pos" class="meta" style="margin:0"></span>
+  <button id="next">Next ▶</button>
+  <select id="jump"></select>
+  <span style="flex:1"></span>
+  <a id="md" class="btn" target="_blank" rel="noopener">Markdown</a>
+</header>
+<main id="main">Reading the book…</main>
+<script>
+const SERVER_KEY = __SERVER_KEY__;
+const params = new URLSearchParams(location.search);
+const KEY = params.get("key") || SERVER_KEY || "";
+if (params.get("key")) {
+  params.delete("key");
+  history.replaceState(null, "", location.pathname + (params.toString() ? "?" + params.toString() : ""));
+}
+async function api(path) {
+  const r = await fetch(path, {headers: KEY ? {Authorization: "Bearer " + KEY} : {}});
+  if (!r.ok) throw new Error(r.status + " " + r.statusText);
+  return r.json();
+}
+function esc(t) {
+  return String(t || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+function inline(t) {
+  return t.replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/!\[([^\]]*)\]\(([^)\s]+)\)/g, "<img alt=\"$1\" src=\"$2\">")
+    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, "<a href=\"$2\" target=\"_blank\" rel=\"noopener\">$1</a>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/(^|[\s(])\*([^*\n]+)\*/g, "$1<i>$2</i>")
+    .replace(/(^|[\s(])_([^_\n]+)_/g, "$1<i>$2</i>");
+}
+function mdToHtml(src) {
+  const lines = esc(src).split("\n");
+  const out = [];
+  let list = null, para = [], code = null, quote = [], table = [];
+  const flush = () => {
+    if (para.length) { out.push("<p>" + inline(para.join(" ")) + "</p>"); para = []; }
+    if (list) { out.push("</" + list + ">"); list = null; }
+    if (quote.length) { out.push("<blockquote>" + inline(quote.join("<br>")) + "</blockquote>"); quote = []; }
+    if (table.length) {
+      const rows = table.filter((r) => !/^\|?\s*:?-{2,}/.test(r));
+      out.push("<table>" + rows.map((r, i) => "<tr>" + r.replace(/^\||\|$/g, "").split("|")
+        .map((c) => "<" + (i ? "td" : "th") + ">" + inline(c.trim()) + "</" + (i ? "td" : "th") + ">").join("")
+        + "</tr>").join("") + "</table>");
+      table = [];
+    }
+  };
+  lines.forEach((raw) => {
+    const line = raw.replace(/\s+$/, "");
+    if (code !== null) {
+      if (/^```/.test(line)) { out.push("<pre><code>" + code.join("\n") + "</code></pre>"); code = null; }
+      else code.push(line);
+      return;
+    }
+    if (/^```/.test(line)) { flush(); code = []; return; }
+    if (!line.trim()) { flush(); return; }
+    let m;
+    if ((m = line.match(/^(#{1,6})\s+(.*)/))) {
+      flush(); out.push("<h" + m[1].length + ">" + inline(m[2]) + "</h" + m[1].length + ">"); return;
+    }
+    if (/^(-{3,}|\*{3,})$/.test(line.trim())) { flush(); out.push("<hr>"); return; }
+    if (/^\|/.test(line)) { if (para.length || list || quote.length) flush(); table.push(line); return; }
+    if ((m = line.match(/^\s*&gt;\s?(.*)/))) { if (para.length || list) flush(); quote.push(m[1]); return; }
+    if ((m = line.match(/^\s*(?:[-*•])\s+(.*)/))) {
+      if (para.length || quote.length || table.length) flush();
+      if (list !== "ul") { if (list) out.push("</" + list + ">"); list = "ul"; out.push("<ul>"); }
+      out.push("<li>" + inline(m[1]) + "</li>"); return;
+    }
+    if ((m = line.match(/^\s*\d+[.)]\s+(.*)/))) {
+      if (para.length || quote.length || table.length) flush();
+      if (list !== "ol") { if (list) out.push("</" + list + ">"); list = "ol"; out.push("<ol>"); }
+      out.push("<li>" + inline(m[1]) + "</li>"); return;
+    }
+    if (list && /^\s{2,}/.test(raw)) { out[out.length - 1] = out[out.length - 1].replace(/<\/li>$/, " " + inline(line.trim()) + "</li>"); return; }
+    if (list || quote.length || table.length) flush();
+    para.push(line.trim());
+  });
+  if (code !== null) out.push("<pre><code>" + code.join("\n") + "</code></pre>");
+  flush();
+  return out.join("\n");
+}
+function span(s) {
+  s = Math.max(0, Math.round(s || 0));
+  if (s < 90) return s + " s";
+  if (s < 5400) return Math.round(s / 60) + " min";
+  return (s / 3600).toFixed(1) + " h";
+}
+function spriteOf(THREE, word, weight, heat) {
+  const size = 64;
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d");
+  const font = "600 " + size + "px system-ui, -apple-system, sans-serif";
+  ctx.font = font;
+  canvas.width = Math.ceil(ctx.measureText(word).width) + 28;
+  canvas.height = Math.ceil(size * 1.5);
+  ctx.font = font;
+  ctx.textBaseline = "middle";
+  const hue = 196 - heat * 196, sat = 30 + heat * 62;
+  ctx.shadowColor = "hsla(" + hue + ",100%,62%," + (0.35 + heat * 0.5) + ")";
+  ctx.shadowBlur = 10 + heat * 24;
+  ctx.fillStyle = "hsl(" + hue + "," + sat + "%," + (62 + heat * 22) + "%)";
+  ctx.fillText(word, 14, canvas.height / 2);
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.colorSpace = THREE.SRGBColorSpace;
+  texture.minFilter = THREE.LinearFilter;
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({map: texture, transparent: true, depthWrite: false}));
+  const scale = 1.1 + weight * 4.2;
+  sprite.scale.set(scale * canvas.width / canvas.height, scale, 1);
+  sprite.userData.baseScale = sprite.scale.clone();
+  return sprite;
+}
+let flow = null;
+function flowStop() {
+  const f = flow; flow = null;
+  if (!f) return;
+  try { cancelAnimationFrame(f.raf); } catch (e) {}
+  try { f.ro.disconnect(); } catch (e) {}
+  try {
+    f.group.children.forEach((o) => {
+      if (o.material) { if (o.material.map) o.material.map.dispose(); o.material.dispose(); }
+      if (o.geometry) o.geometry.dispose();
+    });
+    f.renderer.dispose(); f.renderer.domElement.remove();
+  } catch (e) {}
+}
+async function flowStart(host, graph, onPick) {
+  flowStop();
+  const nodes = graph.nodes || [], edges = graph.edges || [];
+  if (!nodes.length) { host.textContent = "No flow to draw."; return; }
+  let THREE;
+  try { THREE = await import("/vendor/three.module.js"); }
+  catch (e) { host.textContent = "three.js did not load: " + e; return; }
+  await new Promise((done) => requestAnimationFrame(() => done()));
+  if (!host.isConnected || flow) return;
+  const size = () => [Math.max(240, host.clientWidth || 480), Math.max(160, host.clientHeight || 360)];
+  let [width, height] = size();
+  const scene = new THREE.Scene();
+  scene.fog = new THREE.FogExp2(0x04060b, 0.018);
+  const camera = new THREE.PerspectiveCamera(50, width / height, 0.1, 400);
+  const renderer = new THREE.WebGLRenderer({antialias: true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setSize(width, height);
+  renderer.setClearColor(0x04060b, 1);
+  host.appendChild(renderer.domElement);
+  const label = document.createElement("div");
+  label.style.cssText = "position:absolute;pointer-events:none;padding:4px 8px;border-radius:6px;"
+    + "background:#0b1220e6;color:#cfe6ff;font-size:12px;display:none;z-index:2;max-width:60%";
+  host.appendChild(label);
+  const group = new THREE.Group();
+  scene.add(group);
+  const kids = {};
+  edges.forEach((e) => { (kids[e.from] = kids[e.from] || []).push(e.to); });
+  const widthOf = (id) => { const k = kids[id] || []; return k.length ? k.reduce((s, c) => s + widthOf(c), 0) : 2.6; };
+  const pos = {};
+  const place = (id, x0, depth) => {
+    const w = widthOf(id);
+    pos[id] = new THREE.Vector3(x0 + w / 2, 9 - depth * 8, (depth % 2) * 1.5);
+    let x = x0;
+    (kids[id] || []).forEach((c) => { place(c, x, depth + 1); x += widthOf(c); });
+  };
+  const root = nodes[0].id;
+  place(root, -widthOf(root) / 2, 0);
+  nodes.forEach((n) => { if (!pos[n.id]) pos[n.id] = new THREE.Vector3(0, -16, 0); });
+  const weight = {request: 1.0, section: 0.55, step: 0.22}, heat = {request: 0.95, section: 0.6, step: 0.25};
+  const sprites = [];
+  nodes.forEach((n) => {
+    const s = spriteOf(THREE, n.label || n.id, weight[n.kind] || 0.3, heat[n.kind] || 0.3);
+    s.position.copy(pos[n.id]); s.userData.node = n; group.add(s); sprites.push(s);
+  });
+  const lineMat = new THREE.LineBasicMaterial({color: 0x3aa3ff, transparent: true, opacity: 0.5});
+  edges.forEach((e) => {
+    if (!pos[e.from] || !pos[e.to]) return;
+    group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints([pos[e.from], pos[e.to]]), lineMat));
+  });
+  camera.position.set(0, 0, Math.min(90, Math.max(12, widthOf(root)) * 1.1 + 12));
+  const ray = new THREE.Raycaster(), mouse = new THREE.Vector2(-2, -2);
+  let dragging = false, moved = 0, last = null, idle = true;
+  const canvas = renderer.domElement;
+  canvas.style.cursor = "grab";
+  canvas.addEventListener("pointerdown", (e) => {
+    dragging = true; moved = 0; last = [e.clientX, e.clientY]; idle = false;
+    try { canvas.setPointerCapture(e.pointerId); } catch (err) {}
+  });
+  canvas.addEventListener("pointermove", (e) => {
+    const r = canvas.getBoundingClientRect();
+    mouse.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    if (dragging && last) {
+      const dx = e.clientX - last[0], dy = e.clientY - last[1];
+      moved += Math.abs(dx) + Math.abs(dy);
+      group.rotation.y += dx * 0.006;
+      group.rotation.x = Math.max(-1.2, Math.min(1.2, group.rotation.x + dy * 0.004));
+      last = [e.clientX, e.clientY];
+    }
+  });
+  const pick = () => { ray.setFromCamera(mouse, camera); const hit = ray.intersectObjects(sprites, false)[0]; return hit ? hit.object : null; };
+  canvas.addEventListener("pointerup", () => { dragging = false; if (moved < 6) { const s = pick(); if (s && onPick) onPick(s.userData.node); } });
+  canvas.addEventListener("pointerleave", () => { dragging = false; mouse.set(-2, -2); label.style.display = "none"; });
+  canvas.addEventListener("wheel", (e) => { e.preventDefault(); camera.position.z = Math.max(8, Math.min(120, camera.position.z * (e.deltaY > 0 ? 1.1 : 0.9))); }, {passive: false});
+  canvas.addEventListener("dblclick", () => { idle = true; group.rotation.set(0, 0, 0); });
+  const ro = new ResizeObserver(() => {
+    if (!flow || flow.renderer !== renderer) return;
+    [width, height] = size(); camera.aspect = width / height; camera.updateProjectionMatrix(); renderer.setSize(width, height);
+  });
+  ro.observe(host);
+  const me = {renderer, group, ro, raf: 0};
+  flow = me;
+  let hovered = null;
+  const tick = () => {
+    if (flow !== me) return;
+    if (idle && !dragging) group.rotation.y += 0.0025;
+    const s = dragging ? null : pick();
+    if (s !== hovered) {
+      if (hovered) hovered.scale.copy(hovered.userData.baseScale);
+      hovered = s;
+      if (s) s.scale.copy(s.userData.baseScale).multiplyScalar(1.25);
+    }
+    if (s) {
+      const n = s.userData.node;
+      label.textContent = (n.kind === "step" ? "• " : "") + (n.detail || n.label || "");
+      label.style.display = "block";
+      const r = canvas.getBoundingClientRect();
+      label.style.left = Math.min(r.width - 220, Math.max(4, ((mouse.x + 1) / 2) * r.width + 12)) + "px";
+      label.style.top = Math.max(4, ((1 - mouse.y) / 2) * r.height - 30) + "px";
+      canvas.style.cursor = "pointer";
+    } else { label.style.display = "none"; canvas.style.cursor = dragging ? "grabbing" : "grab"; }
+    renderer.render(scene, camera);
+    me.raf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+function chart(canvas, c, index) {
+  const ratio = window.devicePixelRatio || 1, w = canvas.clientWidth || 480, h = 120;
+  canvas.width = Math.round(w * ratio); canvas.height = Math.round(h * ratio);
+  const ctx = canvas.getContext("2d"); ctx.scale(ratio, ratio);
+  const bars = [["tokens in", c.tokens_in || 0, "tokens_in", "#3aa3ff"], ["tokens out", c.tokens_out || 0, "tokens_out", "#8fd3ff"],
+                ["model calls", c.model_calls || 0, "model_calls", "#ffb347"], ["model s", c.model_seconds || 0, "model_seconds", "#ff7a59"]];
+  const maxOf = (k) => Math.max(1, ...(index || []).map((p) => Number(p[k]) || 0));
+  const slot = w / bars.length;
+  ctx.clearRect(0, 0, w, h);
+  bars.forEach(([name, value, k, color], i) => {
+    const bh = Math.max(2, Math.min(1, value / maxOf(k)) * (h - 36));
+    const x = i * slot + slot * 0.2, bw = slot * 0.6;
+    ctx.fillStyle = "#101a2a"; ctx.fillRect(x, 8, bw, h - 36);
+    ctx.fillStyle = color; ctx.fillRect(x, 8 + (h - 36) - bh, bw, bh);
+    ctx.fillStyle = "#cfe6ff"; ctx.font = "11px system-ui, sans-serif"; ctx.textAlign = "center";
+    ctx.fillText(name, x + bw / 2, h - 16);
+    ctx.fillStyle = "#9fb3c8"; ctx.fillText(String(value), x + bw / 2, h - 3);
+  });
+}
+const book = {ids: [], index: [], id: null};
+const $ = (id) => document.getElementById(id);
+function step(delta) {
+  const at = book.ids.indexOf(book.id);
+  const to = Math.min(book.ids.length - 1, Math.max(0, (at < 0 ? 0 : at) + delta));
+  show(book.ids[to]);
+}
+async function show(id) {
+  book.id = id;
+  $("jump").value = String(id);
+  const at = book.ids.indexOf(id);
+  $("pos").textContent = "page " + (at + 1) + " of " + book.ids.length;
+  $("prev").disabled = at <= 0;
+  $("next").disabled = at >= book.ids.length - 1;
+  $("md").href = "/api/pine-journal/" + id + "/md" + (KEY ? "?key=" + encodeURIComponent(KEY) : "");
+  const q = new URLSearchParams(location.search); q.set("id", String(id));
+  history.replaceState(null, "", location.pathname + "?" + q.toString());
+  flowStop();
+  const main = $("main");
+  main.textContent = "Turning the page…";
+  let p;
+  try { p = await api("/api/pine-journal/" + id); }
+  catch (e) { main.textContent = "That page could not be read: " + e; return; }
+  if (book.id !== id) return;
+  const c = p.costs || {};
+  const images = (p.images || []).map((s) => "<img src=\"" + esc(s) + "\" loading=\"lazy\">").join("");
+  main.innerHTML = "<div class=\"meta\">#" + p.id + " · submitted " + esc(p.when || "?") + " · resolved "
+    + esc(p.resolved || "?") + (c.elapsed_s ? " · open " + span(c.elapsed_s) : "") + "</div>"
+    + "<div class=\"h\">The request</div><div class=\"req\" id=\"req\">" + esc(p.request || "(no text)") + images + "</div>"
+    + "<div class=\"h\">Costs</div><div class=\"costs\"><canvas class=\"cost\" id=\"cost\"></canvas><div class=\"nums\">"
+    + [["tokens in", c.tokens_in], ["tokens out", c.tokens_out], ["open for", span(c.elapsed_s || 0)],
+       ["station model calls", c.model_calls], ["station model seconds", c.model_seconds]]
+      .map(([k, v]) => "<span>" + k + "</span><b>" + esc(v == null ? "–" : v) + "</b>").join("") + "</div></div>"
+    + "<div class=\"note\">" + esc(c.note || "") + " Bars are relative to the largest page in the book.</div>"
+    + "<div class=\"h\">The flow of the work — drag to turn, wheel to zoom, click a node to jump</div><div class=\"flow\" id=\"flow\"></div>"
+    + "<div class=\"h\">The reply</div><div class=\"reply\" id=\"reply\">" + mdToHtml(p.reply || "") + "</div>";
+  chart($("cost"), c, book.index);
+  const reply = $("reply");
+  const heads = Array.from(reply.querySelectorAll("h1,h2,h3,h4,h5,h6"));
+  const items = Array.from(reply.querySelectorAll("li"));
+  const paras = Array.from(reply.querySelectorAll("p"));
+  const targets = {};
+  let s = 0, t = 0;
+  ((p.graph || {}).nodes || []).forEach((n) => {
+    if (n.kind === "section") targets[n.id] = heads.length ? heads[s++] : paras[s++];
+    else if (n.kind === "step") targets[n.id] = items[t++];
+    else targets[n.id] = $("req");
+  });
+  flowStart($("flow"), p.graph || {nodes: [], edges: []}, (node) => {
+    const target = targets[node.id];
+    if (!target) return;
+    reply.querySelectorAll(".hit").forEach((n) => n.classList.remove("hit"));
+    target.classList.add("hit");
+    target.scrollIntoView({behavior: "smooth", block: "center"});
+  });
+}
+(async () => {
+  let list;
+  try { list = await api("/api/pine-journal"); }
+  catch (e) { $("main").textContent = "The book could not be read: " + e; return; }
+  book.index = list.pages || [];
+  book.ids = book.index.map((p) => p.id);
+  const jump = $("jump");
+  book.index.forEach((p, i) => {
+    const o = document.createElement("option");
+    o.value = String(p.id);
+    o.textContent = (i + 1) + ". #" + p.id + " · " + (p.when || "") + " · " + (p.title || "");
+    jump.appendChild(o);
+  });
+  jump.onchange = () => show(parseInt(jump.value, 10));
+  $("prev").onclick = () => step(-1);
+  $("next").onclick = () => step(1);
+  document.addEventListener("keydown", (e) => {
+    if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+    if (e.key === "ArrowLeft") step(-1);
+    if (e.key === "ArrowRight") step(1);
+  });
+  if (!book.ids.length) { $("main").textContent = "No resolved request has a page yet."; return; }
+  const wanted = parseInt(params.get("id") || "", 10);
+  show(book.ids.indexOf(wanted) >= 0 ? wanted : book.ids[0]);
+})();
+</script>
+</body>
+</html>
+"""
 
 RADIO_PAGE_HTML = r"""<!doctype html>
 <html lang="en">

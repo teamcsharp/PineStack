@@ -11,10 +11,20 @@ def main():
     parser.add_argument('--restart', action='store_true', required=True)
     parser.add_argument('--seconds', type=int, default=900)
     parser.add_argument('--output', default='docs/prompt-learning-restart.json')
+    # #1080: a compose environment change (OLLAMA_LANES) only reaches the
+    # container when it is recreated; `docker restart` keeps the old env.
+    parser.add_argument('--recreate', action='store_true',
+                        help='docker compose up -d --force-recreate spark-agent instead of docker restart')
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     output = root / args.output
+    if args.recreate:
+        restart_command = ['docker', 'compose', '-f', str(root.parent / 'compose.yaml'),
+                           'up', '-d', '--force-recreate', 'spark-agent']
+    else:
+        restart_command = ['docker', 'restart', '--timeout', '30', 'spark-agent']
     report = {'started_at': time.time(), 'method': 'Observe existing audio state; restart once after a quiet handoff.',
+              'command': ' '.join(restart_command),
               'playback_controls': 0, 'samples': [], 'restart_requested': False}
     check = ['docker', 'exec', 'spark-agent', 'python',
              'tools/rejection-review-live-check.py', '--before', '--require-quiet']
@@ -35,8 +45,8 @@ def main():
             report['quiet_before_restart'] = state
             report['restart_requested'] = True
             output.write_text(json.dumps(report, indent=2), encoding='utf-8')
-            result = subprocess.run(['docker', 'restart', '--timeout', '30', 'spark-agent'],
-                                    capture_output=True, text=True, timeout=100)
+            result = subprocess.run(restart_command,
+                                    capture_output=True, text=True, timeout=240)
             report['restart_exit_code'] = result.returncode
             report['restart_finished_at'] = time.time()
             output.write_text(json.dumps(report, indent=2), encoding='utf-8')

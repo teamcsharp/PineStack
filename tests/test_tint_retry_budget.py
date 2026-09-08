@@ -70,7 +70,13 @@ class TintRetryBudgetTests(unittest.IsolatedAsyncioTestCase):
         for _ in range(5):
             self.now+=1801
             await app.ensure_entry_tinted(self.entry,'caller')
-        self.assertEqual(app.tint_retry_status(self.entry,'caller')['remaining_seconds'],1800)
+        # #1082: twelve answers without one more accepted bar strike the line
+        # out. The ladder's clock runs out, the strike holds, and nothing is
+        # asked again - the writer saw three passes, not seven.
+        status=app.tint_retry_status(self.entry,'caller')
+        self.assertEqual(self.writer.await_count,3)
+        self.assertTrue(status['exhausted']);self.assertTrue(status['waiting'])
+        self.assertEqual(status['strikes'],12);self.assertEqual(status['release_reason'],'')
 
     async def test_more_accepted_turns_clear_stagnation_and_wait(self):
         await app.ensure_entry_tinted(self.entry,'caller')
