@@ -82618,6 +82618,15 @@ def _bar_end_pairs(text: Any) -> list[list[str]]:
 # real bars pass, plain paraphrase fails, shared endings ("-ing",
 # "-ed", "garbage"/"back") do not count.
 _RAP_STOP = frozenset("a an and are as at be been but by do for from had has have he her hers him his i if in into is it its me my of on or our she so that the their them they this to us was we were what when where which who why with you your yeah yes no oh ok okay".split())
+# #1076/#1082: the words that cannot LAND a bar. Pronouns and short
+# function words land rhymes all the time - "imagine that", "way through /
+# for you", "by and by", "let it be / do we agree" - and every one of those
+# was refused because its landing word sat in _RAP_STOP: measured on 307
+# refused bars from six hours of the journal, 31 were rhymes the
+# dictionary itself proves. Articles, conjunctions and "to/of/as/if" still
+# cannot land; a bar that ends on "the" has not landed. Internal pairs keep
+# the full stop list, or prose would rhyme on its pronouns.
+_RAP_END_EXCL = frozenset("a an the and or but of to as if nor".split())
 _RAP_VOWELS = [
     ("eigh", "a"), ("igh", "i"), ("ough", "o"), ("augh", "o"),
     ("ee", "e"), ("ea", "e"), ("ie", "e"), ("ei", "a"), ("ey", "a"), ("ay", "a"), ("ai", "a"),
@@ -82647,7 +82656,30 @@ def _rap_norm(w):
     w = re.sub(r"([^aeiouy])\1", r"\1", w)     # doubled consonants only
     if w.endswith("e") and len(w) > 3 and not w.endswith(("ee", "ye", "le", "oe")):
         w = w[:-1]
+    # #1076: the silent e survives a plural or past-tense ending and was
+    # read as a syllable - "seems / schemes" refused because "schemes"
+    # counted two nuclei. Endings that ARE a syllable (-ses, -xes, -zes,
+    # -ches, -shes, -ges, -ted, -ded) keep their vowel.
+    elif len(w) >= 5 and w.endswith("es") and w[-3] not in "aeiousxzcgh":
+        w = w[:-2] + "s"
+    elif len(w) >= 5 and w.endswith("ed") and w[-3] not in "aeioutd":
+        w = w[:-2] + "d"
     return w
+
+
+def _rap_nuclei_end(w):
+    """#1076: a bar may land on an unstressed final -y ("century", "city",
+    "treasury"). That vowel is the vowel of "see"/"be"/"me", and the
+    station's own bars land it constantly ("plain to see / a century");
+    the spelling class read it as the "i" of "sky". Landings only: a
+    one-nucleus "fly"/"sky"/"why" keeps its sound."""
+    out = _rap_nuclei(w)
+    if len(out) >= 2:
+        body = w[1:] if w.startswith("y") else w
+        groups = re.findall(r"[aeiouy]+", body)
+        if groups and groups[-1] in ("y", "ey", "ie") and not body.endswith(("ay", "oy", "uy")):
+            out[0] = ("e", out[0][1])
+    return out
 
 
 def _rap_nuclei(w):
@@ -82677,8 +82709,8 @@ def _rap_depth(w):
     raw = re.sub(r"[^a-z]", "", str(w).lower())     # the raw spelling, silent e kept
     for suf in _RAP_SUFFIX:
         if raw.endswith(suf) and len(raw) > len(suf) + 2:
-            if suf in ("s", "es") and len(_rap_nuclei(_rap_norm(raw))) < 2:
-                return 1                  # "sticks" still answers "trick"
+            if suf in ("s", "es", "ed") and len(_rap_nuclei(_rap_norm(raw))) < 2:
+                return 1                  # "sticks" still answers "trick"; "named" answers "game"
             return 2
     return 1
 
@@ -82690,16 +82722,24 @@ def _rap_key(w, depth=1):
     return "|".join(f"{v}{c}" for v, c in n[:depth])
 
 
-def _rap_slant(a, b):
+def _rap_slant(a, b, end=False):
     """Same vowel class on the last nucleus (two nuclei when either word
     wears an ending), and codas equal, both open, or sharing a first
-    consonant. One open and one closed syllable do not rhyme."""
-    if a in _RAP_STOP or b in _RAP_STOP:
+    consonant. One open and one closed syllable do not rhyme.
+
+    #1076: `end` compares two bar LANDINGS: function words may land (only
+    _RAP_END_EXCL cannot), a two-letter landing such as "be"/"me"/"by"
+    counts, and an unstressed final -y answers "see". Internal pairs keep
+    the stricter reading, or prose would rhyme on its pronouns."""
+    stop = _RAP_END_EXCL if end else _RAP_STOP
+    if a in stop or b in stop:
         return False
     na, nb = _rap_norm(a), _rap_norm(b)
-    if len(na) < 3 or len(nb) < 3 or na == nb:
+    least = 2 if end else 3
+    if len(na) < least or len(nb) < least or na == nb:
         return False
-    xa, xb = _rap_nuclei(na), _rap_nuclei(nb)
+    nuclei = _rap_nuclei_end if end else _rap_nuclei
+    xa, xb = nuclei(na), nuclei(nb)
     depth = max(_rap_depth(a), _rap_depth(b))
     if len(xa) < depth or len(xb) < depth:
         return False
@@ -82758,8 +82798,20 @@ def _rap_bars(text):
 
 
 def _rap_end(bar):
-    ws = [w for w in _rap_words(bar) if w not in _RAP_STOP]
+    # #1076: the landing word is the last word that can land (see
+    # _RAP_END_EXCL), not the last content word - "imagine that" lands on
+    # "that", and "by and by" on "by".
+    ws = [w for w in _rap_words(bar) if w not in _RAP_END_EXCL]
     return ws[-1] if ws else ""
+
+
+def _rap_coda_equal(a, b):
+    """Two landings whose last codas match exactly ("chat"/"that"), as
+    distinct from a slant pair ("gate"/"plates")."""
+    try:
+        return _rap_nuclei_end(_rap_norm(a))[0][1] == _rap_nuclei_end(_rap_norm(b))[0][1]
+    except (IndexError, TypeError):
+        return False
 
 
 def rap_rhyme_evidence(text, answering=""):
@@ -82767,11 +82819,22 @@ def rap_rhyme_evidence(text, answering=""):
     previous bar's end, nearby internal pairs, or a two-nucleus pair."""
     words = _rap_content(text)
     bars = _rap_bars(text)
-    ends = [e for e in (_rap_end(b) for b in bars) if e]
-    end_pairs = [(a, b) for i, a in enumerate(ends) for b in ends[i + 1:] if _rap_slant(a, b)]
+    landings = [(e, n) for e, n in ((_rap_end(b), len(_rap_words(b))) for b in bars) if e]
+    ends = [e for e, _ in landings]
+    end_pairs = []
+    for i, (a, na) in enumerate(landings):
+        for b, nb in landings[i + 1:]:
+            # #1076: bar landings may sit on function words. Two fragments
+            # of three words or fewer ("The red gate / Seven copper plates")
+            # need a full coda to count as bars; a slant pair between them is
+            # prose that happened to end alike.
+            if _rap_slant(a, b, end=True) and (na >= 4 or nb >= 4 or _rap_coda_equal(a, b)):
+                end_pairs.append((a, b))
     from crystal_rhyme import terminal_rhymes
+    # #1076: the dictionary may prove a landing on "you"/"that"/"by" too;
+    # only _RAP_END_EXCL is withheld from it.
     pronunciation = terminal_rhymes(bars, normalize=_rap_norm,
-        excluded=_RAP_STOP, required_depth=_rap_depth)
+        excluded=_RAP_END_EXCL, required_depth=_rap_depth)
     existing_pairs = {frozenset(pair) for pair in end_pairs}
     for match in pronunciation["pairs"]:
         pair = frozenset(match["words"])
@@ -82779,11 +82842,13 @@ def rap_rhyme_evidence(text, answering=""):
             end_pairs.append(tuple(match["words"]))
             existing_pairs.add(pair)
     prev_end = _rap_end(answering) if answering else ""
-    chain = [(prev_end, e) for e in ends if prev_end and _rap_slant(prev_end, e)]
+    chain = [(prev_end, e) for e in ends if prev_end and _rap_slant(prev_end, e, end=True)]
     internal = []
     for i, a in enumerate(words):
         for b in words[i + 1:i + 7]:              # rhymes land near each other
-            if len(a) >= 4 and len(b) >= 4 and _rap_slant(a, b):
+            # #1076: "called / call" is one stem, not a pair.
+            if (len(a) >= 4 and len(b) >= 4 and not a.startswith(b)
+                    and not b.startswith(a) and _rap_slant(a, b)):
                 internal.append((a, b))
     multi = [(a, b) for i, a in enumerate(words) for b in words[i + 1:i + 9]
              if len(a) >= 5 and len(b) >= 5 and _rap_norm(a) != _rap_norm(b)
@@ -83870,23 +83935,74 @@ def crystal_numbered_rewrite(text: str, indices: list[int]) -> dict[int, str]:
     return output
 
 
+# #1076: the refusals this process has already journaled, by the parent
+# line, the words and the grader that refused them. The digest used to
+# include the semantic/rhyme/transformation reports - which change with the
+# previous bar (the rhyme chain) and the crystal vocabulary - and it lived
+# on a row dict that every pass rebuilt, so the same words were journaled
+# again on every visit: measured over six hours, 112 of 191 batch_rewrite
+# events re-journaled a source/candidate pair already on file, with no new
+# model response behind them. The memo is keyed on the parent script and
+# turn as well as the words, so the same line refused in two different
+# rounds is two records, and it is honoured only while the review it names
+# still exists in the store (a fresh store, as in the tests, starts clean).
+_TINT_REFUSAL_JOURNAL: dict[str, dict[str, Any]] = {}
+TINT_REFUSAL_JOURNAL_HOURS = 6.0
+
+
+def _tint_refusal_known(digest: str) -> dict[str, Any] | None:
+    known = _TINT_REFUSAL_JOURNAL.get(digest)
+    if not known:
+        return None
+    if time.time() - float(known.get("at") or 0) > TINT_REFUSAL_JOURNAL_HOURS * 3600:
+        _TINT_REFUSAL_JOURNAL.pop(digest, None)
+        return None
+    try:
+        still = _LINE_REVIEW.get(str(known.get("review_id") or ""), limit=1)
+    except Exception:  # noqa: BLE001 - a different store, or the row is gone
+        still = None
+    if still is None:
+        _TINT_REFUSAL_JOURNAL.pop(digest, None)
+        return None
+    return known
+
+
 def crystal_record_refusal(row: dict[str, Any], source: str, candidate: str,
                            evaluation: dict[str, Any], context: dict[str, Any]) -> None:
-    """Journal a changed, real candidate once while its repair remains owed."""
+    """Journal a changed, real candidate once while its repair remains owed.
+
+    The same words under the same grader in the same parent are the same
+    refusal, whichever pass or row dict holds them; a regrade with a
+    different neighbour is not a new model response and does not create a
+    new occurrence."""
     candidate = " ".join(str(candidate or "").split())
     if not candidate:
         return  # Empty saved progress is missing work, not another model refusal.
-    evidence = {key: evaluation.get(key) for key in
-                ("version", "strength", "grade", "machine_faults", "faults", "semantic", "rhyme", "transformation", "copying")}
-    digest = hashlib.sha256(json.dumps([source, candidate, evidence], sort_keys=True,
-        ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
+    plain = " ".join(str(source or "").split())
+    context = context or {}
+    parent = " ".join(str(context.get("script_plain") or context.get("script") or "").split())
+    digest = hashlib.sha256(json.dumps(
+        [parent, str(context.get("marker") or row.get("marker") or ""), plain, candidate,
+         evaluation.get("version"), CRYSTAL_GRADER_VERSION],
+        sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")).hexdigest()
     if row.get("review_candidate_digest") == digest:
         return
-    captured = line_review_capture("tint", " ".join(str(source or "").split()), candidate,
+    known = _tint_refusal_known(digest)
+    if known:
+        row.update(review_candidate_digest=digest, review_id=known.get("review_id"),
+                   review_seq=known.get("review_seq"))
+        return
+    captured = line_review_capture("tint", plain, candidate,
         reasons=list(evaluation.get("machine_faults", evaluation.get("faults") or [])),
         context=context, evaluation=evaluation, technical=False, disposition="rewrite_rejected")
     if captured:
         row.update(review_candidate_digest=digest, review_id=captured.get("id"), review_seq=captured.get("event_seq"))
+        _TINT_REFUSAL_JOURNAL[digest] = {"at": time.time(), "review_id": captured.get("id"),
+                                         "review_seq": captured.get("event_seq")}
+        if len(_TINT_REFUSAL_JOURNAL) > 4000:
+            for old in sorted(_TINT_REFUSAL_JOURNAL,
+                              key=lambda k: float(_TINT_REFUSAL_JOURNAL[k].get("at") or 0))[:1000]:
+                _TINT_REFUSAL_JOURNAL.pop(old, None)
 
 
 async def _crystal_round_repass(turns: list[tuple[str, str]],

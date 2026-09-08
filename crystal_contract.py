@@ -15,11 +15,36 @@ import unicodedata
 
 
 VERSION = 3
+# #1076: an em/en dash separates words; folded to a hyphen it glued
+# "Freshing—animal" into one token and the name was "missing".
 _APOSTROPHES = str.maketrans({'’': "'", '‘': "'", 'ʼ': "'", '＇': "'",
-                            '‐': '-', '‑': '-', '–': '-', '—': '-'})
+                            '‐': '-', '‑': '-', '–': ' - ', '—': ' - '})
 _WORDS = re.compile(r"[^\W_]+(?:['-][^\W_]+)*", re.UNICODE)
 _DEFAULT_STOP = frozenset('a an and are as at be been but by do does did for from had has have he her hers him his i if in into is it its me my of on or our she so that the their them they this to us was we were what when where which who why with you your yes no not can could will would should may might must am than then'.split())
-_OPENERS = frozenset('yes thanks thank hello listen well right okay keep please look then now today tomorrow tonight there here really remember tell let'.split())
+# #1076: a capitalized sentence opener is a name unless it is an ordinary
+# way to start a spoken sentence. "Yeah", "Grab", "Cuz" and "Just" were
+# required as names in six hours of refusals (66 of 138 missing-name
+# findings were openers like these); a real name at a sentence start -
+# "Mara", "Dale", "Ious" - still binds, and so does an unknown word.
+_OPENERS = frozenset(('yes thanks thank hello listen well right okay keep please look then now today '
+                      'tomorrow tonight there here really remember tell let '
+                      'yeah yep yup nah nope cuz cause hey hi wow whoa yo man dude alright anyway '
+                      'anyways honestly seriously basically literally actually obviously exactly maybe '
+                      'sure sorry great fine good nice damn dang huh hmm um uh oh ah ooh aw ha haha ok '
+                      'just still only even also because meanwhile anyhow plus except unless whatever '
+                      'grab take hold wait check watch stop come go get give make put pick turn call say '
+                      'think feel see hear try run hit drop bring hang stay play spin sit stand move walk '
+                      'talk imagine picture guess bet trust believe forget').split())
+# #1076: added negations that are rhetorical fillers, not a fact the
+# source lacked - "no time to waste" beside "returned immediately" is the
+# bar's cadence. Any other added negation still attaches to a claim the
+# source never made ("no brakes on that route") and stays refused.
+_FILLER_NEGATIONS = ('no time to waste', 'no time to lose', 'no delay', 'no doubt', 'no lie',
+                     'no cap', 'no joke', 'no question', 'no worries', 'no sweat', 'no problem',
+                     'no denying', 'no mistake', 'make no mistake', 'no more no less',
+                     'no matter what', 'no holds barred', 'no stranger to', 'no wonder', 'never fear',
+                     'not to mention', 'nothing less', 'nothing but the truth', 'no need to say',
+                     'without a doubt', 'without fail', 'no two ways about it', 'no ifs', 'no buts')
 _CONTRACTIONS = {"can't": 'can not', 'cannot': 'can not', "won't": 'will not',
     "shan't": 'shall not', "ain't": 'am not', "i'm": 'i am', "it's": 'it is',
     "that's": 'that is', "there's": 'there is', "here's": 'here is',
@@ -50,10 +75,18 @@ def _pronominal_one(tokens, index, end):
         return True
     if after in {'can', 'could', 'may', 'might', 'must', 'should', 'would', 'ought', 'another', 'of', 'more'}:
         return True
-    return before in {'the', 'this', 'that', 'another', 'each', 'every', 'only'} and (
-        not after or after in {'i', 'you', 'we', 'they', 'he', 'she', 'it', 'who', 'which', 'that',
-                              'is', 'was', 'were', 'with', 'without', 'from', 'in', 'on',
-                              'right', 'next', 'beside', 'near', '.', ':'})
+    if before in {'the', 'this', 'that', 'another', 'each', 'every', 'only'} and (
+            not after or after in {'i', 'you', 'we', 'they', 'he', 'she', 'it', 'who', 'which', 'that',
+                                   'is', 'was', 'were', 'with', 'without', 'from', 'in', 'on',
+                                   'right', 'next', 'beside', 'near', '.', ':'}):
+        return True
+    # #1076: "a deep one", "the quiet one" - an article, an adjective and
+    # "one" at the end of its clause is a pronoun, not a count; ten of 41
+    # quantity refusals in six hours were this "one" going missing. "One"
+    # before a noun ("one copper plate") keeps its obligation.
+    earlier = tokens[index - 2].group() if index >= 2 else ''
+    return (earlier in {'a', 'an', 'the', 'this', 'that'} and before not in _NUMBER_WORDS
+            and before not in _DEFAULT_STOP and (not after or after in {'.', ',', ';', ':', '!', '?'}))
 
 
 def normalize_text(text):
@@ -215,12 +248,17 @@ def _numbers(text):
                     separators = normalized[tokens[index].end():tokens[finish - 1].start()]
                     if not re.search(r'[,;:/]', separators):
                         value, kind, end = f'{_SMALL[token]:02d}:{minute:02d}', 'time', finish
-        elif (token == 'only' and index > 0 and tokens[index - 1].group() == 'the'
-              and end < len(tokens) and tokens[end].group() == 'thing'):
+        idiom = False
+        if (token == 'only' and index > 0 and tokens[index - 1].group() == 'the'
+                and end < len(tokens) and tokens[end].group() == 'thing'):
             # "The one thing" and "the only thing" both assert uniqueness.
             # This exact idiom does not excuse a missing counted object or
-            # turn arbitrary "only" wording into an item count.
-            value = '1'
+            # turn arbitrary "only" wording into an item count. #1076: as a
+            # source fact it binds (the rewrite must keep the uniqueness); as
+            # a rewrite's own wording it satisfies a source "one thing" but is
+            # never an ADDED count ("the only thing that can rescue me" for a
+            # source with no number in it is emphasis, not a quantity).
+            value, idiom = '1', True
         elif token in {'noon', 'midnight'}:
             value, kind = ('12:00' if token == 'noon' else '00:00'), 'time'
         if value is None:
@@ -249,6 +287,8 @@ def _numbers(text):
             end += 1
         record = {'value': value, 'kind': kind,
                   'surface': normalized[tokens[start].start():tokens[end - 1].end()]}
+        if idiom:
+            record['idiom'] = True
         if kind == 'number' and _pronominal_one(tokens, index, end):
             record['ambiguous'] = True
             record['reason'] = 'Pronominal or indefinite one is not an explicit item count.'
@@ -306,6 +346,11 @@ def extract_contract(text, stopwords=(), vocabulary=()):
     stops = _DEFAULT_STOP | {_canonical_word(word) for word in stopwords}
     vocab = {_canonical_word(word) for word in vocabulary}
     names, seen = [], set()
+    # #1076: a source written as 'Name: "quote"' carries the speaker in its
+    # label; the rewrite speaks the quote and need not say the name. The
+    # label's words stay listed as possible names, marked heuristic.
+    label = re.match(r'\s*([A-Z][^\W\d_]*(?:\s+[A-Z][^\W\d_]*){0,3}):\s*["“]', normalized)
+    label_words = {_canonical_word(w) for w in _WORDS.findall(label.group(1))} if label else set()
     for match in _WORDS.finditer(normalized):
         original = match.group()
         word = _canonical_word(original)
@@ -325,8 +370,18 @@ def extract_contract(text, stopwords=(), vocabulary=()):
                   and word not in vocab and word not in _OPENERS
                   and not _grammatical_ing_opener(normalized,match) else '')
         if reason and word not in seen:
-            names.append({'text': original, 'normalized': word, 'reason': reason})
+            row = {'text': original, 'normalized': word, 'reason': reason}
+            if word in label_words and match.start() < (label.end() if label else 0):
+                row['heuristic'] = True
+                row['reason'] = 'speaker label'
+            names.append(row)
             seen.add(word)
+        elif reason and word in label_words and match.start() >= (label.end() if label else 0):
+            # The label's name spoken inside the quote is a name after all.
+            for row in names:
+                if row['normalized'] == word and row.get('heuristic'):
+                    row.pop('heuristic', None)
+                    row['reason'] = reason
     negations = ['not' if word in {'no', 'not'} else word for index, word in enumerate(tokens)
                  if word in {'no', 'not', 'never', 'without', 'neither', 'nor', 'nothing', 'nobody', 'none'}
                  and not (word == 'no' and index + 1 < len(tokens) and tokens[index + 1] in {'doubt', 'doubts'})]
@@ -457,6 +512,77 @@ def _reconcile_clock_hours(missing, added):
             [row for row in added if row['count'] > 0])
 
 
+_NEGATION_WORDS = frozenset({'no', 'not', 'never', 'without', 'neither', 'nor', 'nothing', 'nobody', 'none'})
+_NEGATIVE_PREFIXES = ('non', 'dis', 'un', 'in', 'im')
+_QUESTION_WORDS = (r"(?:what|why|where|when|who|whose|which|how|(?:was|were|is|are)\s+there|"
+                   r"(?:do|does|did|can|could|will|would|should|is|are|was|were|have|has|had)"
+                   r"(?:\s+not)?\s+(?:you|we|i|he|she|it|they))\b")
+_QUESTION_CUE = re.compile(r"(?:^|[,.;:!]\s*|\b(?:and|but|so|well|like|oh|yeah|now)\s+)" + _QUESTION_WORDS)
+_QUESTION_ANYWHERE = re.compile(r"\b" + _QUESTION_WORDS)
+
+
+def _lexical_negation_kept(source_anchors, candidate_tokens):
+    """#1076: a dropped negation token survives as a negative prefix on a
+    source word. "I don't know the specifics" -> "specifics unknown" keeps
+    the polarity; 15 of 172 negation refusals in six hours were this. Only
+    a source content word under the prefix counts: "into", "instead" and
+    "important" carry none."""
+    anchors = {anchor for anchor in source_anchors if len(anchor) >= 4}
+    for token in candidate_tokens:
+        for prefix in _NEGATIVE_PREFIXES:
+            stem = token[len(prefix):]
+            if (token.startswith(prefix) and len(stem) >= 4
+                    and any(stem.startswith(anchor[:4]) and anchor.startswith(stem[:4]) for anchor in anchors)):
+                return True
+    return False
+
+
+def _filler_negations_only(candidate):
+    """#1076: every negation the rewrite added is one of the fillers in
+    _FILLER_NEGATIONS. Any other added negation is a claim the source never
+    made and keeps the refusal ("no brakes on that route")."""
+    text = ' '.join(_expanded(candidate).casefold().split())
+    words = re.sub(r"[^a-z' ]", ' ', text)
+    words = ' ' + ' '.join(words.split()) + ' '
+    for filler in _FILLER_NEGATIONS:
+        words = words.replace(' ' + filler + ' ', ' ')
+    remaining = [word for word in words.split() if word in _NEGATION_WORDS]
+    return not remaining
+
+
+def _interrogative_cue(source):
+    """#1076: a retained transcript can be a question without its question
+    mark. "saying listen to what I'm saying was there more junk food than
+    real food no yes" reached the grader as a statement; a rewrite that
+    punctuates it as the question it is has not invented one. A source with
+    sentence punctuation needs the cue at a sentence start ("Can't you feel
+    it."); a source with a question mark, or with punctuation and no cue,
+    keeps the strict comparison, so "You keep the plate." never becomes
+    "Can you keep the plate?"."""
+    text = _expanded(source).casefold()
+    if '?' in text:
+        return False
+    if not re.search(r'[.!?]', text):
+        return bool(_QUESTION_ANYWHERE.search(text))
+    return bool(_QUESTION_CUE.search(text))
+
+
+def _bare_one_waived(source, candidate):
+    """#1076: "a single breath" -> "one breath" is the same count. Each
+    added spoken "one" before a noun the source introduced with a/an/single
+    is waived; a bare "one" the source never had stays an added quantity."""
+    made = ' '.join(_expanded(candidate).casefold().split())
+    text = ' '.join(_expanded(source).casefold().split())
+    waived = 0
+    for match in re.finditer(r"\bone\s+([^\W\d_]+)\b", made):
+        noun = _canonical_word(match.group(1))
+        if noun in _NUMBER_WORDS or noun in _DEFAULT_STOP:
+            continue
+        if re.search(r"\b(?:a|an|single|one)\s+(?:[^\W\d_]+\s+){0,2}" + re.escape(noun) + r"s?\b", text):
+            waived += 1
+    return waived
+
+
 def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floor=.5):
     if not 0 <= anchor_floor <= 1:
         raise ValueError('anchor_floor must be between zero and one')
@@ -469,27 +595,51 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
     # comparison. It never turns an unrelated or changed name into a match.
     tokens.update(match.group(1) + 'g' for match in
                   re.finditer(r"\b([^\W\d_]+in)'(?=\W|$)", normalize_text(candidate).casefold()))
-    missing_names = [name for name in original['names'] if name['normalized'] not in tokens]
+    missing_names = [name for name in original['names']
+                     if name['normalized'] not in tokens and not name.get('heuristic')]
+    possible_names_missing = [name for name in original['names']
+                              if name['normalized'] not in tokens and name.get('heuristic')]
     def counts(rows):
         return Counter((row['kind'], row['value']) for row in rows)
     required_numbers, candidate_numbers = counts(original['numbers']), counts(made['numbers'])
+    # #1076: the rewrite's own "the only thing" satisfies a source count of
+    # one but is never an added quantity (see _numbers).
+    candidate_firm = counts(row for row in made['numbers'] if not row.get('idiom'))
     missing_numbers = [{'kind': kind, 'value': value, 'count': count}
                        for (kind, value), count in sorted((required_numbers - candidate_numbers).items())]
     added_numbers = [{'kind': kind, 'value': value, 'count': count}
-                     for (kind, value), count in sorted((candidate_numbers - required_numbers).items())]
+                     for (kind, value), count in sorted((candidate_firm - required_numbers).items())]
+    waived_ones = _bare_one_waived(source, candidate)
+    if waived_ones:
+        for row in added_numbers:
+            if row['kind'] == 'number' and row['value'] == '1':
+                row['count'] = max(0, row['count'] - waived_ones)
+        added_numbers = [row for row in added_numbers if row['count'] > 0]
     missing_numbers, added_numbers = _reconcile_clock_hours(missing_numbers, added_numbers)
     entities = not missing_names and not missing_numbers and not added_numbers
     question = original['question'] == made['question']
+    question_basis = 'same'
+    if not question and made['question'] and not original['question'] and _interrogative_cue(source):
+        question, question_basis = True, 'transcript question punctuated'    # #1076
     # Preserve the existing polarity gate; repeated "No, I won't" need not
     # become two negations in a rewrite. Counts and terms remain visible as
     # advisory evidence, not an additional policy threshold.
     negation = bool(original['negations']) == bool(made['negations'])
+    negation_basis = 'polarity'
+    if not negation and original['negations']:
+        negation = _lexical_negation_kept(original['anchors'], made['tokens'])       # #1076
+        negation_basis = 'negative prefix on a source word' if negation else 'negation dropped'
+    elif not negation:
+        negation = _filler_negations_only(candidate)                                 # #1076
+        negation_basis = 'filler negation' if negation else 'negation added'
     contrasts = unsupported_positive_contrasts(source, candidate)
     return {'ok': bool(str(candidate or '').strip() and entities and question and negation
                        and not contrasts and (recall >= anchor_floor or not source_words)),
             'anchor_recall': round(recall, 3), 'entities': entities, 'question': question, 'negation': negation,
             'anchors': original['anchors'], 'missing': sorted(source_words - candidate_words),
-            'missing_names': missing_names, 'missing_numbers': missing_numbers, 'added_numbers': added_numbers,
+            'missing_names': missing_names, 'possible_names_missing': possible_names_missing,
+            'question_basis': question_basis, 'negation_basis': negation_basis,
+            'missing_numbers': missing_numbers, 'added_numbers': added_numbers,
             'name_candidates': original['names'], 'source_numbers': original['numbers'],
             'candidate_numbers': made['numbers'], 'source_negations': original['negations'],
             'candidate_negations': made['negations'],
