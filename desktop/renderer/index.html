@@ -123,6 +123,12 @@
       <button class="tab active" data-view="control" title="Full Pine Box Agent">#<span>Agent</span></button>
       <button class="tab" data-view="radio" title="Radio player">&gt;<span>Radio</span></button>
       <button class="tab" data-view="system2" title="Hourly plans, scripts and line diagnostics">2<span>System2</span></button>
+      <!-- #1073: the scheduler's controls, dropped under the rail - which
+           engine writes the hour and its dials. Compact rail: the same
+           controls open in the strip cell's popup instead. -->
+      <button class="tab" id="schedBtn"
+              title="Scheduler - which engine writes the hour (the original chain or System2) and its dials">⧗<span>Scheduler</span></button>
+      <div id="schedList" class="sched-list" style="display:none"></div>
       <button class="tab" data-view="overview" title="Desktop command deck">=<span>Deck</span></button>
       <button class="tab" data-view="guide" title="Recovery guide">+<span>Recover</span></button>
       <button class="tab" data-view="logs" title="Agent logs">~<span>Logs</span></button>
@@ -245,6 +251,16 @@
         <div id="nowCell" class="now-cell"
              title="What is playing - click for the artist, the album, and the request desk">
           <span>Now</span><b id="nowState">quiet</b>
+        </div>
+        <!-- #1073: "add sections for managing the active scheduler
+             algorithm." The engine writing the hour - the original chain
+             or System2 - with the occurrence on air and what it still
+             owes; click for the switch, the two coexistence dials, the
+             horizon and the turns, and the doors into System2. -->
+        <div id="schedCell" class="sched-cell"
+             title="The scheduler writing the hour - click to switch between the original chain and System2, and to set its dials">
+          <span>Scheduler</span><b id="schedState">unknown</b>
+          <em id="schedSub"></em>
         </div>
       </div>
       <div class="top-actions">

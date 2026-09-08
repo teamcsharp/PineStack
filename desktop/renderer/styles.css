@@ -247,6 +247,62 @@ body.resizing-rail .rail-resizer::before {
 }
 .seg-cell.moving > i > u { background: #9fd8ff; }
 
+/* #1073: the scheduler cell - the engine writing the hour, the occurrence
+   on air and what it still owes. Sized like the segment cell. */
+.sched-cell {
+  position: relative;
+  cursor: pointer;
+  min-width: 0;
+  max-width: 30%;
+}
+.sched-cell:hover { background: rgba(159, 216, 255, .06); }
+.sched-cell > b {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: block;
+}
+.sched-cell.system2 > b { color: #9fd8ff; }
+.sched-cell > em {
+  display: block;
+  font-style: normal;
+  font-size: 9px;
+  opacity: .62;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sched-cell.owing > em { color: #e0a35c; opacity: 1; }
+.sched-cell.errors > em { color: #e07070; opacity: 1; }
+
+/* The scheduler's controls: the same block under the rail's Scheduler
+   entry and inside the cell's popup. */
+.sched-list { display: grid; gap: 7px; padding: 6px 4px 8px 10px; font-size: 11px; }
+.sched-engine { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.sched-engine button {
+  height: 28px; padding: 0 6px; font-size: 11px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.sched-engine button.on { border-color: var(--cyan); color: var(--cyan); }
+.sched-list label.sched-dial, .sched-pop label.sched-dial {
+  display: flex; align-items: center; gap: 6px; font-size: 11px;
+  cursor: pointer; line-height: 1.3;
+}
+.sched-dial input[type=checkbox] { margin: 0; flex: none; }
+.sched-num { display: flex; align-items: center; gap: 6px; font-size: 11px; }
+.sched-num input { width: 46px; }
+.sched-note { font-size: 10px; color: var(--muted); line-height: 1.4; min-height: 12px; }
+.sched-note.err { color: #e07070; }
+.sched-doors { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; }
+.sched-doors button { height: 28px; padding: 0 6px; font-size: 11px; }
+body.rail-compact .sched-list { display: none !important; }
+.sched-pop .sched-list { padding: 0; }
+.sched-chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 6px 0 4px; }
+.sched-chips span {
+  background: #0e1826; border: 1px solid #24435f; border-radius: 12px;
+  padding: 2px 9px; font-size: 10px; color: #c8dcef;
+}
+
 /* #1007 */
 .stream-owner {
   display: flex;

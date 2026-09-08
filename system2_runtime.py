@@ -11,11 +11,12 @@ import copy
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import time
 import uuid
 
-from system2 import System2Store, System2Conflict, text_hash
+from system2 import System2Store, System2Conflict, text_hash, _candidate as validate_candidate
 from system2_media import System2Media
 
 
@@ -112,6 +113,7 @@ class System2Runtime:
         self._dispatched = {}
         self._record_slots = set()
         self._event_plans = []
+        self._refused = {}
 
     @property
     def enabled(self):
@@ -188,6 +190,22 @@ class System2Runtime:
         self._errors = self._errors[-30:]
         self.host.pipeline_log("system2", stage + ": " + row["message"])
 
+    def refuse(self, slot, candidate, why):
+        """#1074: say why an allocation was not delivered - once a minute per
+        allocation and reason. The release reason on the reservation was the
+        only record and it named no stage: twenty-two releases tonight, all
+        "Transport refused the recording". A transient refusal is still
+        offered again on the next dispatch, as the store's contract says."""
+        key = (slot["id"], candidate["id"])
+        last = self._refused.get(key) or {}
+        if time.time() - float(last.get("said") or 0) >= 60 or last.get("why") != why:
+            self.host.pipeline_log("system2", "%s for %s waits: %s"
+                                   % (candidate["id"], slot.get("label") or slot["id"], why))
+            self._refused[key] = {"said": time.time(), "why": why}
+        if len(self._refused) > 500:
+            for old in sorted(self._refused, key=lambda k: self._refused[k]["said"])[:250]:
+                self._refused.pop(old, None)
+
     def media_proof(self, clip):
         """Hash actual bytes once per file revision; never use a filename as proof."""
         try:
@@ -213,6 +231,14 @@ class System2Runtime:
                           "who": str(take.get("who") or ""), "voice": str(take.get("voice") or ""),
                           "key": str(take.get("key") or ""), "audio": copy.deepcopy(clip),
                           **(proof or {}), "trace_id": str(entry.get("system2_trace_id") or "")})
+        # #1074: a round mid-sitting can carry two takes with the same script
+        # index (a re-cut, or a line larder_prepare could not place, stamped
+        # 999). The store refuses duplicate line IDs, and one such row took the
+        # whole refresh down with it - eight times in five minutes tonight.
+        # The recorded position stays on the line; the ID becomes its order.
+        if len({x["id"] for x in lines}) != len(lines):
+            for position, line in enumerate(lines):
+                line["take_index"], line["id"] = line["id"], str(position)
         if not lines:
             for i, (who, text) in enumerate(h.banter_turns(str(entry.get("script") or ""),
                     str(entry.get("caller_name") or ""), str(entry.get("caller2_name") or ""))):
@@ -231,6 +257,11 @@ class System2Runtime:
             expires = float(h.stock_expires_at(kind, row) or expires)
         except Exception:
             pass
+        if expires and expires < time.time():
+            # #1074: the store refuses an expired row silently (candidate_expired);
+            # the status page showed it as ready. Say it, and say it here.
+            reason.append("Past its expiry; the planner no longer offers it")
+            viable = False
         result = {"id": identity, "kind": kind, "seconds": sum(float(x.get("seconds") or 0) for x in lines),
                   "ready": complete,
                   "eligible": viable, "expires_at": expires,
@@ -252,17 +283,33 @@ class System2Runtime:
     def inventory(self):
         self._rows = {}
         candidates = []
+        seen = set()
         for kind in tuple(self.host.ALT_PREP_KINDS) + ("recap", "deep"):
             if kind == "track_talk":
                 for identity, row in self.media.inventory_track_talk():
-                    candidates.append(self.candidate(kind, row, identity))
+                    self._offer(candidates, seen, kind, row, identity)
                 continue
             for row in self.host.alt_candidates(kind):
-                try:
-                    candidates.append(self.candidate(kind, row))
-                except Exception as exc:
-                    self.error("inventory:" + kind, exc)
+                self._offer(candidates, seen, kind, row)
         return candidates
+
+    def _offer(self, candidates, seen, kind, row, identity=None):
+        """#1074: one malformed row is named and skipped, never allowed to veto
+        the plan. sync_candidates validates the batch as a whole, so a single
+        ValueError there left the planner without a refresh, the preparer
+        without a claim and the dispatcher without a slot until the row
+        happened to change. A skipped row reads as absent from the inventory,
+        which is what it is until it can be described."""
+        try:
+            offered = self.candidate(kind, row, identity)
+            validate_candidate(offered)
+            if offered["id"] in seen:
+                raise ValueError("duplicate candidate id " + offered["id"])
+        except Exception as exc:
+            self.error("inventory:" + kind, exc)
+            return
+        seen.add(offered["id"])
+        candidates.append(offered)
 
     def templates(self, hour):
         h = self.host
@@ -302,7 +349,13 @@ class System2Runtime:
             if not force and time.time() - self._last_refresh < self.REFRESH_SECONDS:
                 return await asyncio.to_thread(self.status) if want_status else None
             candidates = await asyncio.to_thread(self.inventory)
-            self.store.sync_candidates(candidates, replace=True)
+            # #1074: the sync normalises and re-serialises every candidate
+            # (220 tonight, twelve megabytes of JSON) and rewrites the table in
+            # one fsynced transaction; on the air loop that is a multi-second
+            # stall of the class the host watchdog restarts the station for.
+            # The store is lock-protected; every other store call in this
+            # refresh already runs in a worker thread.
+            await asyncio.to_thread(self.store.sync_candidates, candidates, replace=True)
             self._candidates = candidates
             first = self.host._sched_hour_epoch(self.host._sched_hour_key())
             plans = []
@@ -421,9 +474,13 @@ class System2Runtime:
         h = self.host
         async with self._prepare_lock:
             await self.refresh()
+            # #1074: a 900 s lease renewed every 300 s (was 1800/600). The
+            # renewer keeps a long sitting alive either way; what the shorter
+            # lease bounds is the time a slot stays unclaimable when an
+            # attempt dies without completing (see reclaim_jobs for restarts).
             job = self.store.claim_job("system2-preparer", kinds=["ad", "manager", "caller", "gallery",
                                                                  "news", "banter", "track_talk", "recap", "deep"],
-                                       lease_seconds=1800)
+                                       lease_seconds=900)
             if not job:
                 return
             kind = job["kind"]
@@ -433,7 +490,6 @@ class System2Runtime:
                     "generation_turns": int(self.config["generation_turns"])}
             self._work = work
             token = WORK.set(work)
-            before = {h.alt_sid(kind, row) for row in h.alt_candidates(kind)}
             changed = False
 
             async def renew():
@@ -442,9 +498,9 @@ class System2Runtime:
                 # stale when it finally arrived. Renew every ten minutes
                 # while the work is live; a lost lease ends the renewer.
                 while True:
-                    await asyncio.sleep(600)
+                    await asyncio.sleep(300)
                     try:
-                        self.store.renew_job(job["id"], "system2-preparer", job["token"], lease_seconds=1800)
+                        self.store.renew_job(job["id"], "system2-preparer", job["token"], lease_seconds=900)
                     except System2Conflict:
                         return
             renewer = asyncio.create_task(renew())
@@ -575,8 +631,13 @@ class System2Runtime:
                     entry = h.dialogue_entry(row) or row
                     if entry.get("system2_trace_id") == work["trace_id"] or identity == work.get("candidate_id"):
                         fresh.append(await asyncio.to_thread(self.candidate, kind, row))
+                # #1074: an attempt that made no model call (the tint lane
+                # refused every ask) rests two minutes, not thirty seconds -
+                # the same row was re-claimed twice a minute with a full
+                # refresh each time and nothing to show for it.
                 self.store.complete_job(job["id"], "system2-preparer", job["token"], candidates=fresh,
-                                        success=changed, retry_after=30)
+                                        success=changed,
+                                        retry_after=(120 if not changed and not work.get("calls") else 30))
                 work.update(state="ready" if any(x["ready"] for x in fresh) else "retained" if fresh else "waiting",
                             candidate_ids=[x["id"] for x in fresh], changed=changed)
                 h._pantry_save(True)
@@ -724,7 +785,28 @@ class System2Runtime:
                 resolved = await asyncio.to_thread(self.media.resolve, kind, row)
                 takes = resolved["takes"]
                 if not resolved["ready"]:
+                    self.refuse(slot, candidate, "; ".join(resolved.get("why") or ["the recording is not ready"]))
                     continue
+                # #1074: the air road's own fit test, asked BEFORE a reservation
+                # is written rather than discovered after one. Same arithmetic
+                # as the assembled stream pays: every clip, the beat between
+                # clips, the box tail, the broadcast lead and the page's air.
+                # Not for an event slot: current_clock() publishes an event
+                # occurrence only once its reservation is owned, which is
+                # after this point, so the road's window would not match yet.
+                if kind != "track_talk" and not slot.get("event_id"):
+                    try:
+                        beat = max(h.CONCAT_BEAT) if getattr(h, "CONCAT_BEAT", None) else 0.0
+                        tail = max(0.0, float(os.getenv("BOX_TAIL_MS", "900"))) / 1000.0
+                        length = float(resolved.get("seconds") or 0) + max(0, len(takes) - 1) * beat + tail
+                        fits = h._ready_round_fits(kind, takes, {"occurrence": slot["id"], "slot_id": slot["template_id"],
+                                                                "kind": kind, "deadline": slot["deadline"]}, seconds=length)
+                    except Exception:
+                        fits = True
+                    if not fits:
+                        self.refuse(slot, candidate, "the complete recording (%.0fs) no longer fits the running occurrence before %s"
+                                    % (length, time.strftime("%H:%M:%S", time.localtime(slot["deadline"]))))
+                        continue
                 # Admission is checked again after assembly and immediately
                 # before publication by can_handoff below.
                 try:
@@ -781,7 +863,9 @@ class System2Runtime:
                 finally:
                     h._READY_SHELF_BUSY.discard(id(row))
                     if not handed or failed:
-                        self.store.release(proof["reservation_id"], proof["owner"], token=proof["token"], reason="Transport refused the recording")
+                        self.refuse(slot, candidate, self.media.last_refusal or "the transport refused the recording")
+                        self.store.release(proof["reservation_id"], proof["owner"], token=proof["token"],
+                                           reason="Transport refused the recording: " + str(self.media.last_refusal or "")[:160])
                         self._dispatched.pop((slot["id"], candidate["id"]), None)
                         if proof.get("event_id"):
                             self.store.release_event(proof["event_id"], proof["owner"], proof["event_token"],
@@ -922,6 +1006,16 @@ def install(app, namespace):
 
     @app.on_event("startup")
     async def start_system2():
+        # #1074: whatever the last run was preparing when it stopped is this
+        # run's to finish, not a 30-minute hole in the plan.
+        try:
+            lost = runtime().store.reclaim_jobs("system2-preparer")
+            if lost:
+                host.pipeline_log("system2", "(#1074) %d preparation job(s) the last run left working are pending again: %s"
+                                  % (len(lost), ", ".join(lost)[:400]))
+        except Exception as exc:
+            runtime().error("startup", exc)
+
         async def plan_loop():
             await asyncio.sleep(8)
             while True:

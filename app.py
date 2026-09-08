@@ -12814,7 +12814,12 @@ def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
             return float(entry.get("prep_news_at") or at) + NEWS_PREP_LIFE
         if row.get("aired_at") and shelf_is_repeat(kind, row):
             return at + REPEAT_KEEP_SECONDS
-        return at + PANTRY_BURN_SECONDS
+        # #1074: a verified round nobody has heard yet is the station's best
+        # stock, not its oldest rubbish - the 24-hour burn made 6,400 s of
+        # recorded gallery and manager rounds invisible to the planner on
+        # the first night. An unheard row lives the keep window (three days);
+        # the burn horizon still governs the pantry's clips.
+        return at + max(PANTRY_BURN_SECONDS, REPEAT_KEEP_SECONDS)
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -121518,6 +121523,54 @@ details[open] > .pine-summary::before { transform: rotate(90deg); }
 }
 .toast .badge { color: var(--muted); font-size: 11px; margin-top: 8px; }
 
+/* ---- #1072 The pop-up frame every 3JS scene in the gallery lands in ----
+   One window: a title bar you drag, ⤢ to fill the screen and back, ✕, a
+   grip in the corner (with the browser's own resize handle underneath as
+   the fallback), and a host the scene mounts into. */
+.pine-win {
+  position: fixed; z-index: 380; display: flex; flex-direction: column;
+  padding: 0; overflow: hidden; resize: both;
+  background: var(--panel); border: 1px solid var(--border);
+  border-radius: var(--radius); box-shadow: 0 24px 70px rgba(0,0,0,.6);
+  max-width: calc(100vw - 8px); max-height: calc(100dvh - 8px);
+}
+.pine-win.max { border-radius: 0; }
+.pine-win-head {
+  display: flex; align-items: center; gap: 8px; flex: none;
+  padding: 8px 10px 8px 12px; border-bottom: 1px solid var(--border);
+  background: var(--panel2); font-weight: 700; font-size: 13px;
+  cursor: grab; user-select: none; touch-action: none;
+}
+.pine-win-head:active { cursor: grabbing; }
+.pine-win-head > b {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.pine-win-head button { font-size: 12px; padding: 3px 8px; flex: none; }
+.pine-win-tools {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  font-weight: 400; font-size: 12px; min-width: 0;
+}
+.pine-win-tools select, .pine-win-tools input { font-size: 12px; }
+.pine-win-host {
+  position: relative; flex: 1; min-height: 0; min-width: 0;
+  overflow: hidden; background: #02040a;
+}
+.pine-win-grip {
+  position: absolute; right: 0; bottom: 0; width: 18px; height: 18px;
+  cursor: nwse-resize; z-index: 6; touch-action: none;
+  background: linear-gradient(135deg, transparent 50%,
+    rgba(159,216,255,.55) 50%, rgba(159,216,255,.55) 60%, transparent 60%,
+    transparent 74%, rgba(159,216,255,.55) 74%, rgba(159,216,255,.55) 84%,
+    transparent 84%);
+}
+/* A scene's own floating box, adopted by the gallery: same grip, same
+   memory, same clamp. */
+.pine-win-adopted {
+  max-width: calc(100vw - 8px) !important;
+  max-height: calc(100dvh - 8px) !important;
+}
+
 /* ---- Voice Studio ---- */
 #studioWin {
   position: fixed; z-index: 168; display: flex; flex-direction: column;
@@ -123737,70 +123790,514 @@ function clampBoxToViewport(box, minVisible = 120) {
   };
 }
 
+/* ---- #1072 THE POP-UP FRAME -------------------------------------------
+   "every three JS simulation ... pops it up in a pop up window that is
+   self-contained, that I'm able to move around and rescale and
+   dynamically adjust."
+
+   One frame for every scene in the gallery. pineWin(key, title) builds a
+   fixed box - a title bar you drag (pointer events, capture, clamped so a
+   corner always stays on screen), a ⤢ that fills the viewport and comes
+   back, a ✕, a grip in the corner driven by pointer events with the
+   browser's own resize:both handle underneath as the fallback - and hands
+   back the HOST the scene mounts into. Geometry is remembered per key in
+   localStorage (pineWin:<key>) and clamped with clampBoxToViewport at
+   every open. The host carries a ResizeObserver: on every size change it
+   rings the scene's own resize hook when the opener gave one, and always
+   dispatches a window resize event, so a WebGL renderer follows the frame
+   whether it observes its stage or listens to the window.
+
+   Three roads into a frame, one per kind of scene:
+     pineWin        - the scene is opened straight into the host
+     pineWinAdopt   - the scene builds its own floating box; it gets the
+                      grip, the memory and the clamp (drag stays its own)
+     pineWinHostShade - the scene builds a full-viewport shade or a modal
+                      dialog; the shade is moved INTO a frame and its card
+                      told to fill it. The scene's own close still removes
+                      the shade, and the frame follows it out. */
+const PINE_WINS = {};
+let pineWinZ = 380;
+
+function pineWinStdBox() {
+  const w = Math.min(1100, Math.round(window.innerWidth * 0.9));
+  const h = Math.min(760, Math.round(window.innerHeight * 0.86));
+  return {width: w, height: h,
+          left: Math.max(8, Math.round((window.innerWidth - w) / 2)),
+          top: Math.max(8, Math.round((window.innerHeight - h) / 2))};
+}
+
+// The frame's opening geometry: what the operator left it at last time,
+// else the opener's preferred size centred, else the standard frame.
+function pineWinGeo(key, want) {
+  const std = pineWinStdBox();
+  let base = std;
+  if (want && (want.width || want.height)) {
+    const w = Math.min(want.width || std.width, window.innerWidth - 16);
+    const h = Math.min(want.height || std.height, window.innerHeight - 16);
+    base = {width: w, height: h,
+            left: Math.max(8, Math.round((window.innerWidth - w) / 2)),
+            top: Math.max(8, Math.round((window.innerHeight - h) / 2))};
+  }
+  let saved = null;
+  try { saved = JSON.parse(localStorage.getItem("pineWin:" + key) || "null"); }
+  catch (e) { saved = null; }
+  const ok = saved && Number(saved.width) >= 120 && Number(saved.height) >= 80;
+  return clampBoxToViewport(ok ? {...base, ...saved} : base);
+}
+
+function pineWinRemember(key, box) {
+  if (!box || !box.isConnected || box.dataset.pineWinMax) return;
+  const r = {left: box.offsetLeft, top: box.offsetTop,
+             width: box.offsetWidth, height: box.offsetHeight};
+  if (r.width < 120 || r.height < 80) return;
+  try { localStorage.setItem("pineWin:" + key, JSON.stringify(r)); } catch (e) {}
+}
+
+function pineWinApply(box, geo) {
+  box.style.left = Math.round(geo.left) + "px";
+  box.style.top = Math.round(geo.top) + "px";
+  if (geo.width) box.style.width = Math.round(geo.width) + "px";
+  if (geo.height) box.style.height = Math.round(geo.height) + "px";
+}
+
+function pineWinRaise(box) {
+  pineWinZ += 1;
+  box.style.zIndex = String(pineWinZ);
+}
+
+// Drag by a handle. Buttons and fields on the handle keep their clicks.
+function pineWinDrag(box, handle, done) {
+  handle.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    if (event.target.closest("button,input,select,textarea,a,label")) return;
+    const from = {x: event.clientX, y: event.clientY,
+                  left: box.offsetLeft, top: box.offsetTop};
+    try { handle.setPointerCapture(event.pointerId); } catch (e) {}
+    const move = (e) => {
+      box.style.left = Math.max(0, Math.min(window.innerWidth - 120,
+        from.left + e.clientX - from.x)) + "px";
+      box.style.top = Math.max(0, Math.min(window.innerHeight - 40,
+        from.top + e.clientY - from.y)) + "px";
+    };
+    const drop = () => {
+      handle.removeEventListener("pointermove", move);
+      handle.removeEventListener("pointerup", drop);
+      handle.removeEventListener("pointercancel", drop);
+      if (done) done();
+    };
+    handle.addEventListener("pointermove", move);
+    handle.addEventListener("pointerup", drop);
+    handle.addEventListener("pointercancel", drop);
+    event.preventDefault();
+  });
+}
+
+// The corner grip: pointer-driven, clamped to the viewport and the frame's
+// minimums; the CSS resize handle stays under it as the fallback.
+function pineWinGrip(box, done, min) {
+  const grip = el("div", "pine-win-grip", "");
+  grip.title = "Drag to resize";
+  grip.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    const from = {x: event.clientX, y: event.clientY,
+                  w: box.offsetWidth, h: box.offsetHeight};
+    try { grip.setPointerCapture(event.pointerId); } catch (e) {}
+    const move = (e) => {
+      const w = Math.max(min.w, Math.min(window.innerWidth - box.offsetLeft - 4,
+        from.w + e.clientX - from.x));
+      const h = Math.max(min.h, Math.min(window.innerHeight - box.offsetTop - 4,
+        from.h + e.clientY - from.y));
+      box.style.width = Math.round(w) + "px";
+      box.style.height = Math.round(h) + "px";
+    };
+    const drop = () => {
+      grip.removeEventListener("pointermove", move);
+      grip.removeEventListener("pointerup", drop);
+      grip.removeEventListener("pointercancel", drop);
+      if (done) done();
+    };
+    grip.addEventListener("pointermove", move);
+    grip.addEventListener("pointerup", drop);
+    grip.addEventListener("pointercancel", drop);
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  box.appendChild(grip);
+  return grip;
+}
+
+// A size change on a host, rung once per frame: the scene's own hook if
+// the opener gave one, and always a window resize for the scenes that
+// listen to the window.
+function pineWinObserve(node, onResize, skipFirst) {
+  let raf = 0;
+  let first = !!skipFirst;
+  const ro = new ResizeObserver(() => {
+    if (first) { first = false; return; }
+    if (raf) return;
+    raf = requestAnimationFrame(() => {
+      raf = 0;
+      try { if (onResize) onResize(node); } catch (e) {}
+      try { window.dispatchEvent(new Event("resize")); } catch (e) {}
+    });
+  });
+  ro.observe(node);
+  return ro;
+}
+
+function pineWin(key, title, opts) {
+  opts = opts || {};
+  pineWinClose(key, false);                        // one frame per key
+  const min = {w: opts.minWidth || 320, h: opts.minHeight || 220};
+  const box = el("div", "pine-win", "");
+  box.id = "pineWin-" + key;
+  box.dataset.pineWin = key;
+  box.style.minWidth = min.w + "px";
+  box.style.minHeight = min.h + "px";
+  pineWinApply(box, pineWinGeo(key, opts));
+  pineWinRaise(box);
+
+  const head = el("div", "pine-win-head", "");
+  const name = el("b", "", title || key);
+  head.appendChild(name);
+  const tools = el("span", "pine-win-tools", "");   // a scene's own controls
+  head.appendChild(tools);
+  const max = el("button", "", "⤢");
+  max.title = "Fill the screen (again to come back)";
+  const shut = el("button", "", "✕");
+  shut.title = "Close";
+  head.appendChild(max);
+  head.appendChild(shut);
+  box.appendChild(head);
+  const host = el("div", "pine-win-host", "");
+  box.appendChild(host);
+  document.body.appendChild(box);
+
+  const remember = () => pineWinRemember(key, box);
+  pineWinDrag(box, head, remember);
+  pineWinGrip(box, remember, min);
+  box.addEventListener("pointerdown", () => pineWinRaise(box), true);
+  // The CSS resize handle changes the size with no pointer event of ours:
+  // the box's own observer keeps the memory honest either way.
+  const boxRo = pineWinObserve(box, remember, true);
+  const hostRo = pineWinObserve(host, opts.onResize, true);
+
+  let before = null;
+  const maximize = () => {
+    if (box.dataset.pineWinMax) {
+      delete box.dataset.pineWinMax;
+      box.classList.remove("max");
+      if (before) pineWinApply(box, clampBoxToViewport(before));
+      max.textContent = "⤢";
+    } else {
+      before = {left: box.offsetLeft, top: box.offsetTop,
+                width: box.offsetWidth, height: box.offsetHeight};
+      remember();
+      box.dataset.pineWinMax = "1";
+      box.classList.add("max");
+      pineWinApply(box, {left: 4, top: 4, width: window.innerWidth - 8,
+                         height: window.innerHeight - 8});
+      max.textContent = "⤡";
+    }
+  };
+  max.onclick = maximize;
+  head.ondblclick = (e) => {
+    if (!e.target.closest("button,input,select,textarea,a,label")) maximize();
+  };
+
+  let closed = false;
+  const entry = {
+    key, box, host, head, tools, title: name,
+    close(callScene) {
+      if (closed) return;
+      closed = true;
+      try { boxRo.disconnect(); } catch (e) {}
+      try { hostRo.disconnect(); } catch (e) {}
+      if (callScene !== false && opts.onClose) {
+        try { opts.onClose(); } catch (e) {}
+      }
+      box.remove();
+      if (PINE_WINS[key] === entry) delete PINE_WINS[key];
+    },
+  };
+  shut.onclick = () => entry.close(true);
+  PINE_WINS[key] = entry;
+  return entry;
+}
+
+function pineWinClose(key, callScene) {
+  const w = PINE_WINS[key];
+  if (w) w.close(callScene);
+}
+
+function pineWinCloseAll() {
+  Object.keys(PINE_WINS).forEach((k) => pineWinClose(k, true));
+}
+
+// Wait for a scene that builds its DOM after a lazy script or a fetch.
+async function pineWinWait(find, ms) {
+  const until = Date.now() + (ms || 6000);
+  for (;;) {
+    let node = null;
+    try { node = find(); } catch (e) { node = null; }
+    if (node && node.isConnected) return node;
+    if (Date.now() > until) return null;
+    await new Promise((r) => setTimeout(r, 80));
+  }
+}
+
+// A scene's own floating box (the crystal, the booth, the shelf...) taken
+// into the gallery's care: geometry memory, the grip, the clamp, a raise
+// on click. It keeps its own title-bar drag; opts.handle adds one to a box
+// that has none.
+function pineWinAdopt(key, box, opts) {
+  opts = opts || {};
+  if (!box || !box.isConnected) return null;
+  if (box.dataset.pineWin) return PINE_WINS[key] || null;
+  pineWinClose(key, false);
+  box.dataset.pineWin = key;
+  box.classList.add("pine-win-adopted");
+  const min = {w: opts.minWidth || 320, h: opts.minHeight || 220};
+  box.style.position = "fixed";
+  box.style.resize = "both";
+  box.style.overflow = "hidden";
+  pineWinApply(box, pineWinGeo(key, opts));
+  pineWinRaise(box);
+  const remember = () => pineWinRemember(key, box);
+  if (opts.handle) pineWinDrag(box, opts.handle, remember);
+  pineWinGrip(box, remember, min);
+  box.addEventListener("pointerup", remember, true);   // its own drag ends here
+  box.addEventListener("pointerdown", () => pineWinRaise(box), true);
+  const ro = pineWinObserve(box, () => { remember(); if (opts.onResize) opts.onResize(box); }, true);
+  let closed = false;
+  const entry = {
+    key, box, host: box,
+    close(callScene) {
+      if (closed) return;
+      closed = true;
+      try { ro.disconnect(); } catch (e) {}
+      try { mo.disconnect(); } catch (e) {}
+      if (callScene !== false && opts.onClose) {
+        try { opts.onClose(); } catch (e) {}
+      }
+      if (box.isConnected) box.remove();
+      delete box.dataset.pineWin;
+      if (PINE_WINS[key] === entry) delete PINE_WINS[key];
+    },
+  };
+  // The scene's own ✕ removes the box; the entry follows it out.
+  const mo = new MutationObserver(() => {
+    if (!box.isConnected) entry.close(false);
+  });
+  mo.observe(box.parentNode || document.body, {childList: true});
+  PINE_WINS[key] = entry;
+  return entry;
+}
+
+// A full-viewport shade (or a modal <dialog>) moved into a frame. The
+// shade fills the host; its card - the first element child unless the
+// opener names one, or null for a shade that IS the scene - is told to
+// fill the shade. A <dialog> loses its top layer when it moves and shows
+// in place inside the host instead.
+function pineWinHostShade(key, title, shade, opts) {
+  opts = opts || {};
+  if (!shade || !shade.isConnected) return null;
+  const win = pineWin(key, title, {onClose: opts.close, onResize: opts.onResize,
+                                    width: opts.width, height: opts.height});
+  const fill = (node) => {
+    node.style.width = "100%"; node.style.height = "100%";
+    node.style.maxWidth = "none"; node.style.maxHeight = "none";
+    node.style.minWidth = "0"; node.style.minHeight = "0";
+    node.style.margin = "0"; node.style.borderRadius = "0";
+    node.style.border = "0"; node.style.boxShadow = "none";
+  };
+  shade.style.position = "absolute";
+  shade.style.inset = "0";
+  shade.style.zIndex = "auto";
+  shade.style.padding = "0";
+  shade.style.transform = "none";
+  if (opts.dialog) {
+    fill(shade);
+    shade.style.overflow = "auto";
+  } else if (opts.card !== null) {
+    const card = opts.card ? shade.querySelector(opts.card) : shade.firstElementChild;
+    if (card) fill(card);
+  }
+  win.host.appendChild(shade);
+  if (opts.dialog && typeof shade.show === "function" && !shade.open) {
+    try { shade.show(); } catch (e) {}
+  }
+  // The scene's own close removes its shade; the frame follows it out.
+  const mo = new MutationObserver(() => {
+    if (!shade.isConnected) { mo.disconnect(); win.close(false); }
+  });
+  mo.observe(win.host, {childList: true});
+  return win;
+}
+
 // ---- The 3JS gallery (#786): every three.js experience on the page, one
 // registry, jumpable from anywhere (the desktop rail drives this over the
 // webview bridge). Jumping first runs the all-off sweep — the one-context
 // rule made each opener close only SOME siblings, and the auto-reopeners
 // (inline Mind on air, cloud dock at boot) fight a bare close.
+//
+// #1072: every entry carries how the gallery FRAMES it once it is up, so
+// each one lands in a pop-up of its own (see pineWin above):
+//   (no frame)  the open() puts the scene straight into a pineWin host
+//   frame.box   the scene builds its own floating box; adopt it
+//   frame.shade the scene builds a full-viewport shade; re-host it
+//   frame.dialog the scene builds a modal <dialog>; re-host it
+// A find() may come back empty for a moment - lazy three.min.js, a fetch
+// before the DOM - so pineShow3JS waits for it.
 const PINE_3JS = [
-  {key: "flow",     label: "Station flow",      open: () => stationFlowOpen()},
-  {key: "mind",     label: "🧠 Dialogue Mind",   open: () => mindOpen()},
-  {key: "topology", label: "🪐 Mind Topology",   open: () => mindTopologyOpen()},
-  {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel()},
-  {key: "orchlogic", label: "🕸 Orchestrator",   open: () => orchLogicPanel()},
-  {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel()},
-  {key: "steward",  label: "🏥 Services",        open: () => stewardPanel()},
-  {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen()},
-  {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen()},
-  {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen()},
-  {key: "asks",     label: "🎛️ The orchestrator asks", open: () => orchOpen()},
-  {key: "rejected", label: "Rejected lines", open: () => lineReviewOpen()},
-  {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen()},
+  {key: "flow",     label: "Station flow",      open: () => stationFlowOpen(),
+   frame: {shade: () => stationFlowView && stationFlowView.element,
+           card: ".sf-dialog", close: () => stationFlowClose()}},
+  {key: "mind",     label: "🧠 Dialogue Mind",   open: () => mindWin()},
+  {key: "topology", label: "🪐 Mind Topology",   open: () => mindTopologyOpen(),
+   frame: {shade: () => document.getElementById("mindTopologyModal"),
+           close: () => { if (mindTopology) mindTopology.close(); }}},
+  {key: "graph",    label: "⚙ DJ Plexus",       open: () => djGraphPanel(),
+   frame: {shade: () => djGraph && djGraph.shade, card: null,
+           close: () => djGraphClose()}},
+  {key: "orchlogic", label: "🕸 Orchestrator",   open: () => orchLogicPanel(),
+   frame: {shade: () => orchLogic && orchLogic.host, card: null,
+           close: () => orchLogicClose(),
+           onResize: () => { if (orchLogic && orchLogic.resize) orchLogic.resize(); }}},
+  {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel(),
+   frame: {shade: () => comfyDoc, close: () => comfyDoctorClose(),
+           width: 820, height: 600}},
+  {key: "steward",  label: "🏥 Services",        open: () => stewardPanel(),
+   frame: {shade: () => stewardBox, close: () => stewardClose(),
+           width: 840, height: 620}},
+  {key: "crystal",  label: "💠 Data Crystal",    open: () => crystalOpen(),
+   frame: {box: () => document.getElementById("crystalBox"),
+           close: () => crystalClose()}},
+  {key: "shelf",    label: "❄️ The shelf",       open: () => chunkOpen(),
+   frame: {box: () => chunkBox, close: () => chunkClose(),
+           width: 700, height: 600}},
+  {key: "slots",    label: "⏱️ The half hours", open: () => slotOpen(),
+   frame: {box: () => slotBox, close: () => slotClose(),
+           width: 660, height: 640}},
+  {key: "asks",     label: "🎛️ The orchestrator asks", open: () => orchOpen(),
+   frame: {box: () => orchBox, close: () => orchClose(),
+           width: 620, height: 680}},
+  {key: "rejected", label: "Rejected lines", open: () => lineReviewOpen(),
+   frame: {dialog: () => document.querySelector('dialog[data-rejection-review="dialog"]'),
+           close: () => { if (window.PineRejectionReview) window.PineRejectionReview.close(); }}},
+  {key: "booth",    label: "🎛 DJ Booth",        open: () => boothOpen(),
+   frame: {box: () => document.getElementById("boothModal"),
+           close: () => boothClose(), width: 760, height: 560}},
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "rhymecloud", label: "🎤 Rhyme Cloud",  open: () => rhymeCloudWin()},
-  {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen()},
-  {key: "slides",   label: "🗞 Endless press",   open: () => pineSlidesSet(true)},
-  {key: "script",   label: "📝 The Screenplay",  open: () => screenplayOpen()},
-  {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereToggle()},
-  {key: "vectors",  label: "🌳 Vector Tree",     open: () => rhetVecToggle()},
-  {key: "stage",    label: "💿 Album Stage",     open: () => stageStart()},
-  {key: "remote",   label: "🌐 Remote Plexus",   open: () => remotePanel()},
+  {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen(),
+   frame: {shade: () => paperBox, close: () => paperClose(),
+           width: 1240, height: 920}},
+  {key: "slides",   label: "🗞 Endless press",   open: () => pineSlidesWin()},
+  {key: "script",   label: "📝 The Screenplay",  open: () => screenplayOpen(),
+   frame: {shade: () => scriptBox, close: () => scriptClose(),
+           width: 1080, height: 920}},
+  {key: "sphere",   label: "🔮 Rhetoric Sphere", open: () => rhetSphereWin()},
+  {key: "vectors",  label: "🌳 Vector Tree",     open: () => rhetVecWin()},
+  {key: "stage",    label: "💿 Album Stage",     open: () => stageWin()},
+  {key: "remote",   label: "🌐 Remote Plexus",   open: () => remotePanel(),
+   frame: {shade: () => document.getElementById("remoteModal"),
+           close: () => { const m = document.getElementById("remoteModal"); if (m) m.remove(); },
+           width: 700, height: 640}},
   {key: "skin",     label: "📼 Device Skin",
-   open: () => deviceSkinWindow(["tp7", "op1", "ko2", "pocketoperator"]
-     .includes(localStorage.getItem("pineTheme"))
+   open: () => deviceSkinWin(SKINS.includes(localStorage.getItem("pineTheme"))
      ? localStorage.getItem("pineTheme") : "tp7")},
   {key: "off",      label: "⬛ All off",         open: () => {}},
 ];
 
 // #786: the word cloud in the gallery opens as a FORMAL window like its
 // siblings — the standard frame with a title bar and a close — rather than
-// the ragged half-gallery overlay dock.
+// the ragged half-gallery overlay dock. #1072: that frame is pineWin.
 async function pineCloudWin() {
-  const w = Math.min(1100, window.innerWidth * 0.9);
-  const h = Math.min(760, window.innerHeight * 0.86);
-  const box = el("div", "panel", "");
-  box.id = "cloudWin";
-  box.style.cssText = "position:fixed;z-index:150;display:flex;"
-    + "flex-direction:column;padding:0;overflow:hidden;"
-    + "left:" + Math.max(8, (window.innerWidth - w) / 2) + "px;"
-    + "top:" + Math.max(8, (window.innerHeight - h) / 2) + "px;"
-    + "width:" + w + "px;height:" + h + "px;"
-    + "box-shadow:0 24px 70px rgba(0,0,0,.6)";
-  const head = el("div", "", "");
-  head.style.cssText = "display:flex;align-items:center;gap:8px;"
-    + "padding:9px 12px;border-bottom:1px solid var(--border);"
-    + "font-weight:700;font-size:13px";
-  head.appendChild(el("b", "", "☁ Word Cloud"));
-  const shut = el("button", "", "✕");
-  shut.style.marginLeft = "auto";
-  shut.onclick = () => { try { destroyCloud(); } catch (e) {} box.remove(); };
-  head.appendChild(shut);
-  box.appendChild(head);
-  const host = el("div", "", "");
-  host.style.cssText = "flex:1;min-height:0";
-  box.appendChild(host);
-  document.body.appendChild(box);
-  await cloudMount(host);
+  const win = pineWin("cloud", "☁ Word Cloud",
+    {onClose: () => { try { destroyCloud(); } catch (e) {} }});
+  await cloudMount(win.host);
+}
+
+/* ---- #1072 The inline scenes, each in a pop-up of its own -------------
+   The sphere, the vector tree, the album stage, the device skin and the
+   Dialogue Mind live in the page's columns (and their toggles there stay);
+   from the gallery they open into a pineWin host instead. Each scene's
+   builder already takes a host or has grown a host option, and each one
+   observes its host for size, so the frame's grip drives the renderer. */
+async function rhetSphereWin() {
+  const win = pineWin("sphere", "🔮 Rhetoric Sphere",
+    {onClose: () => rhetSphereStop()});
+  try { if (window.rhetSphere) rhetSphereStop(); } catch (e) {}
+  try { if (window.rhetVec) rhetVecStop(); } catch (e) {}
+  try { if (typeof rhetWords !== "undefined") rhetWords.clear(); } catch (e) {}
+  try { await rhetSphereBuild(win.host); }
+  catch (e) {
+    win.host.textContent = "sphere failed — " + (e && e.message || e);
+    rhetSphereStop();
+  }
+}
+
+async function rhetVecWin() {
+  const win = pineWin("vectors", "🌳 Vector Tree",
+    {onClose: () => rhetVecStop()});
+  try { if (window.rhetSphere) rhetSphereStop(); } catch (e) {}
+  try { if (window.rhetVec) rhetVecStop(); } catch (e) {}
+  try { if (typeof rhetWords !== "undefined") rhetWords.clear(); } catch (e) {}
+  try { await rhetVecBuild(win.host); }
+  catch (e) {
+    win.host.textContent = "3D view failed — " + (e && e.message || e);
+    rhetVecStop();
+  }
+}
+
+async function stageWin() {
+  const win = pineWin("stage", "💿 Album Stage",
+    {onClose: () => { try { if (stage) { stage.stop(); stage = null; } } catch (e) {} },
+     width: 720, height: 620});
+  if (stage) { try { stage.stop(); } catch (e) {} stage = null; }
+  await stageStart(win.host);
+  // The record on air, now - the polls only call show() on a change.
+  try {
+    const now = (typeof djNowTrack !== "undefined" && djNowTrack && djNowTrack.id)
+      ? djNowTrack : (typeof musicLastTrack !== "undefined" ? musicLastTrack : null);
+    if (stage && now && now.id) stage.show(now);
+  } catch (e) {}
+}
+
+function mindWin() {
+  const win = pineWin("mind", "🧠 Dialogue Mind", {onClose: () => mindClose()});
+  mindOpen({host: win.host});
+}
+
+async function deviceSkinWin(theme) {
+  const win = pineWin("skin", "📼 Device Skin", {onClose: () => skinStop()});
+  // The four machines, from the title bar.
+  const pick = document.createElement("select");
+  pick.title = "Which machine";
+  [["tp7", "TP-7 reel-to-reel"], ["op1", "OP-1 keyboard"],
+   ["ko2", "KO II pad slab"], ["pocketoperator", "Pocket Operator"]]
+    .forEach(([k, face]) => {
+      const o = document.createElement("option");
+      o.value = k; o.textContent = face;
+      if (k === theme) o.selected = true;
+      pick.appendChild(o);
+    });
+  pick.onchange = () => deviceSkin(pick.value, {host: win.host}).catch(() => {});
+  win.tools.appendChild(pick);
+  await deviceSkin(theme, {host: win.host});
+}
+
+// The endless press as a window: the same slideshow page, in a frame
+// instead of the right half of the screen (pineSlidesSet keeps the split).
+function pineSlidesWin() {
+  const win = pineWin("slides", "🗞 Endless press", {width: 720, height: 900});
+  const frame = document.createElement("iframe");
+  frame.title = "The Pine Box Gazette — the endless press";
+  frame.style.cssText = "position:absolute;inset:0;width:100%;height:100%;"
+    + "border:0;background:#111";
+  frame.src = "/api/paper/slideshow";
+  win.host.appendChild(frame);
 }
 
 // #1068: THE RHYME CLOUD. The crystal read as a rhyming dictionary, in the
@@ -123815,21 +124312,19 @@ let rhymeCloudState = {cid: "", mind: "", file: "", start: -1, span: 40};
 async function rhymeCloudWin() {
   let crystals = [];
   try { crystals = (await api("/api/crystals")).crystals || []; } catch (e) { crystals = []; }
-  const w = Math.min(1100, window.innerWidth * 0.9);
-  const h = Math.min(760, window.innerHeight * 0.86);
-  const box = el("div", "panel", "");
-  box.id = "rhymeCloudWin";
-  box.style.cssText = "position:fixed;z-index:150;display:flex;"
-    + "flex-direction:column;padding:0;overflow:hidden;"
-    + "left:" + Math.max(8, (window.innerWidth - w) / 2) + "px;"
-    + "top:" + Math.max(8, (window.innerHeight - h) / 2) + "px;"
-    + "width:" + w + "px;height:" + h + "px;"
-    + "box-shadow:0 24px 70px rgba(0,0,0,.6)";
+  // #1072: the standard pop-up frame. The pickers ride a toolbar row of
+  // their own under the title, so the frame can go narrow and keep them.
+  const win = pineWin("rhymecloud", "🎤 Rhyme Cloud", {onClose: () => {
+    rhymeCloudSource = null;
+    try { destroyCloud(); } catch (e) {}
+  }});
+  const wrap = el("div", "", "");
+  wrap.style.cssText = "position:absolute;inset:0;display:flex;flex-direction:column";
+  win.host.appendChild(wrap);
   const head = el("div", "", "");
   head.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap;"
-    + "padding:9px 12px;border-bottom:1px solid var(--border);"
-    + "font-weight:700;font-size:13px";
-  head.appendChild(el("b", "", "🎤 Rhyme Cloud"));
+    + "flex:none;padding:7px 10px;border-bottom:1px solid var(--border);"
+    + "font-size:12px;background:var(--panel)";
   const pick = (title) => {
     const s = document.createElement("select");
     s.title = title; s.style.cssText = "font-size:12px;max-width:220px";
@@ -123853,27 +124348,18 @@ async function rhymeCloudWin() {
   prev.title = "Previous passage"; next.title = "Next passage";
   const status = el("span", "", "");
   status.style.cssText = "font-weight:400;font-size:12px;opacity:.85";
-  const shut = el("button", "", "✕");
-  shut.style.marginLeft = "auto";
-  [crystalSel, mindSel, fileSel, el("span", "", "passage"), startIn, spanIn, prev, next, status, shut]
+  [crystalSel, mindSel, fileSel, el("span", "", "passage"), startIn, spanIn, prev, next, status]
     .forEach((n) => head.appendChild(n));
-  box.appendChild(head);
+  wrap.appendChild(head);
   const body = el("div", "", "");
   body.style.cssText = "flex:1;min-height:0;display:flex";
   const host = el("div", "", "");
-  host.style.cssText = "flex:1;min-height:0;min-width:0";
+  host.style.cssText = "flex:1;min-height:0;min-width:0;position:relative";
   const side = el("div", "", "");
   side.style.cssText = "width:280px;overflow:auto;border-left:1px solid var(--border);"
-    + "padding:8px 10px;font-size:12px;line-height:1.5";
+    + "padding:8px 10px;font-size:12px;line-height:1.5;flex:none";
   body.appendChild(host); body.appendChild(side);
-  box.appendChild(body);
-  const close = () => {
-    rhymeCloudSource = null;
-    try { destroyCloud(); } catch (e) {}
-    box.remove();
-  };
-  shut.onclick = close;
-  document.body.appendChild(box);
+  wrap.appendChild(body);
 
   const fillMinds = () => {
     const c = crystals.find((x) => x.id === crystalSel.value) || {};
@@ -124080,10 +124566,7 @@ function pineSlidesRestore() {
 
 function pine3JSAllOff() {
   try { stationFlowClose(); } catch (e) {}
-  const cloudWin = document.getElementById("cloudWin");
-  if (cloudWin) cloudWin.remove();
-  const rhymeWin = document.getElementById("rhymeCloudWin");   // #1068
-  if (rhymeWin) { rhymeCloudSource = null; rhymeWin.remove(); }
+  rhymeCloudSource = null;                                     // #1068
   // Disarm the auto-reopeners FIRST (the on-air poll re-opens the inline
   // Mind within seconds otherwise), and stop the studio spiral BEFORE the
   // stage (its stop restarts the stage it displaced).
@@ -124110,6 +124593,26 @@ function pine3JSAllOff() {
   if (rm) rm.remove();
   const dock = document.getElementById("cloudDock");
   if (dock) dock.style.display = "none";
+  // #1072: every pop-up the gallery opened - the frames close through the
+  // scenes' own closers (each one is safe to call twice), then come down.
+  try { pineWinCloseAll(); } catch (e) {}
+}
+
+// #1072: put the scene the gallery just opened into its pop-up frame.
+async function pineWinFrame(hit) {
+  const f = hit.frame;
+  if (!f) return null;
+  if (f.box) {
+    const box = await pineWinWait(f.box);
+    return box ? pineWinAdopt(hit.key, box, {onClose: f.close, onResize: f.onResize,
+                                              width: f.width, height: f.height})
+               : null;
+  }
+  const node = await pineWinWait(f.shade || f.dialog);
+  if (!node) return null;
+  return pineWinHostShade(hit.key, hit.label, node,
+    {close: f.close, card: f.card, dialog: !!f.dialog, onResize: f.onResize,
+     width: f.width, height: f.height});
 }
 
 async function pineShow3JS(key) {
@@ -124119,28 +124622,12 @@ async function pineShow3JS(key) {
   if (key === "off") return "off";
   await new Promise((r) => setTimeout(r, 120));   // let disposals settle
   try { await hit.open(); } catch (e) { return String(e && e.message || e); }
-  // One consistent working size for every gallery jump: the floating
-  // windows land centred in the same standard frame instead of wherever
-  // they were last dragged, and host-embedded scenes scroll into view.
-  await new Promise((r) => setTimeout(r, 350));
-  const w = Math.min(1100, window.innerWidth * 0.9);
-  const h = Math.min(760, window.innerHeight * 0.86);
-  ["crystalBox", "boothModal"].forEach((id) => {
-    const box = document.getElementById(id);
-    if (!box) return;
-    box.style.width = w + "px";
-    box.style.height = h + "px";
-    box.style.left = Math.max(8, (window.innerWidth - w) / 2) + "px";
-    box.style.top = Math.max(8, (window.innerHeight - h) / 2) + "px";
-  });
-  const hosts = {cloud: "cloudDock", sphere: "djRhetoricCloud",
-                 vectors: "djRhetoricCloud", stage: "nowStage"};
-  if (hosts[key]) {
-    const hostEl = document.getElementById(hosts[key]);
-    if (hostEl && hostEl.scrollIntoView) {
-      hostEl.scrollIntoView({behavior: "smooth", block: "center"});
-    }
-  }
+  // #1072: every scene lands in a pop-up frame of its own - the ones that
+  // build a floating box are adopted (grip, memory, clamp), the ones that
+  // take the whole viewport are re-hosted, and the inline ones were opened
+  // straight into a frame by their open() above. The frame remembers where
+  // the operator left it; a first visit gets the standard frame, centred.
+  try { await pineWinFrame(hit); } catch (e) { /* the scene is up either way */ }
   return key;
 }
 
@@ -129218,25 +129705,37 @@ async function deviceSkinWindow(theme) {
   }
 }
 
-async function deviceSkin(theme) {
+// #1072: opts.host - render inside a pop-up frame's host, sized to it,
+// instead of behind the whole page (the page keeps its own look then).
+async function deviceSkin(theme, opts) {
   skinStop();
   if (SKINS.indexOf(theme) < 0) return;
 
   const THREE = await import("/vendor/three.module.js");
+  const framed = opts && opts.host && opts.host.isConnected ? opts.host : null;
   const host = document.createElement("div");
   host.id = "deviceSkin";
-  document.body.appendChild(host);
-  document.documentElement.setAttribute("data-skin", theme);
+  if (framed) {
+    host.style.cssText = "position:absolute;inset:0;z-index:auto;"
+      + "pointer-events:auto;opacity:1;background:#04080e";
+    framed.appendChild(host);
+  } else {
+    document.body.appendChild(host);
+    document.documentElement.setAttribute("data-skin", theme);
+  }
+  const size = () => framed
+    ? [Math.max(1, host.clientWidth), Math.max(1, host.clientHeight)]
+    : [window.innerWidth, window.innerHeight];
 
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera(
-    40, window.innerWidth / window.innerHeight, 0.1, 200);
+    40, size()[0] / size()[1], 0.1, 200);
   camera.position.set(0, 2.2, 14);
   camera.lookAt(0, 0, 0);
 
   const renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
   renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
-  renderer.setSize(window.innerWidth, window.innerHeight);
+  renderer.setSize(size()[0], size()[1]);
   host.appendChild(renderer.domElement);
 
   const style = getComputedStyle(document.documentElement);
@@ -129416,17 +129915,25 @@ async function deviceSkin(theme) {
   frame = requestAnimationFrame(tick);
 
   function onResize() {
-    camera.aspect = window.innerWidth / window.innerHeight;
+    const [w, h] = size();
+    camera.aspect = w / h;
     camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.setSize(w, h);
   }
   window.addEventListener("resize", onResize);
+  // In a frame the host is what changes size, not the window (#1072).
+  let hostRo = null;
+  if (framed && window.ResizeObserver) {
+    hostRo = new ResizeObserver(onResize);
+    hostRo.observe(host);
+  }
 
   skin = {
     theme,
     stop() {
       cancelAnimationFrame(frame);
       window.removeEventListener("resize", onResize);
+      if (hostRo) { try { hostRo.disconnect(); } catch (e) {} }
       scene.traverse((node) => {
         if (node.geometry) node.geometry.dispose();
         if (node.material) node.material.dispose();
@@ -129705,8 +130212,9 @@ let djPinned = "";
 
 let stage = null;
 
-async function stageStart() {
-  const host = document.getElementById("nowStage");
+// #1072: hostEl - a pop-up frame's host instead of the page's #nowStage.
+async function stageStart(hostEl) {
+  const host = hostEl || document.getElementById("nowStage");
   if (!host || stage) return;
   const THREE = await import("/vendor/three.module.js");
 
@@ -141422,7 +141930,7 @@ function djRender(state) {
   if (host && localStorage.mindInline !== "0") {
     const haveMind = (typeof djMind !== "undefined" && djMind);
     if (djOn && (!haveMind || (djMind.mode !== "inline" && djMind.mode
-        !== "full")) && !host.querySelector("canvas")) {
+        !== "full" && djMind.mode !== "window")) && !host.querySelector("canvas")) {
       try { mindOpen({inline: true}); } catch (e) {}
     } else if (!djOn && haveMind && djMind.mode === "inline") {
       try { mindClose(); } catch (e) {}
@@ -152494,6 +153002,7 @@ async function mindTopologyOpen() {
   if (typeof djMind !== "undefined" && djMind) mindClose();
   const THREE = await import("/vendor/three.module.js");
   const shade = el("div", "", "");
+  shade.id = "mindTopologyModal";    // #1072: the gallery finds it to frame it
   shade.style.cssText = "position:fixed;inset:0;z-index:185;background:#02060beF;display:flex;align-items:center;justify-content:center";
   const card = el("div", "", "");
   card.style.cssText = "position:relative;width:96vw;height:92vh;background:#050b12;border:1px solid #24536a;border-radius:8px;overflow:hidden;box-shadow:0 28px 90px #000";
@@ -152557,10 +153066,14 @@ function mindOpen(opts) {
   opts = (typeof opts === "string") ? {theme: opts} : (opts || {});
   const wantDock = !!opts.dock;
   const wantInline = !!opts.inline;
+  // #1072: opts.host - a pop-up frame's host; the stage fills it the way
+  // the inline mode fills its column, with no overlay shade.
+  const wantWindow = !wantInline && !wantDock && !!(opts.host && opts.host.isConnected);
   const inlineHost = wantInline
-    ? document.getElementById("mindInlineHost") : null;
+    ? document.getElementById("mindInlineHost") : wantWindow ? opts.host : null;
   if (wantInline && !inlineHost) return;    // panel not on the page
-  const modeName = wantInline ? "inline" : wantDock ? "dock" : "full";
+  const modeName = wantInline ? "inline" : wantDock ? "dock"
+    : wantWindow ? "window" : "full";
   const theme = opts.theme;
   if (djMind) {
     // Same mode + no explicit theme = toggle it closed; otherwise switch.
@@ -152587,9 +153100,10 @@ function mindOpen(opts) {
   shade.id = "djMindModal";
   const stage = el("div", "", "");
   let card = null;
-  if (wantInline) {
-    // Embedded in the left-column panel (#508): no overlay, fills the host.
-    stage.style.cssText = "position:absolute;inset:0";
+  if (wantInline || wantWindow) {
+    // Embedded in the left-column panel (#508), or in a pop-up frame's
+    // host (#1072): no overlay, fills the host.
+    stage.style.cssText = "position:absolute;inset:0;background:#000";
     inlineHost.innerHTML = "";
     inlineHost.appendChild(stage);
   } else if (wantDock) {
@@ -152764,9 +153278,9 @@ function mindOpen(opts) {
       });
     }).catch(() => {});
   }
-  // Inline mode already lives inside its left-panel host; the overlay modes
-  // attach to the body.
-  if (!wantInline) document.body.appendChild(shade);
+  // Inline and window modes already live inside their host; the overlay
+  // modes attach to the body.
+  if (!wantInline && !wantWindow) document.body.appendChild(shade);
 
   // --- scene ---------------------------------------------------------------
   const W = () => stage.clientWidth, H = () => stage.clientHeight;
@@ -154220,8 +154734,10 @@ function mindClose() {
     });
   } catch (e) {}
   djMind.renderer.dispose();
-  if (djMind.mode === "inline") {
+  if (djMind.mode === "inline" || djMind.mode === "window") {
     if (djMind.stage) djMind.stage.remove();     // lives inside the host
+    // #1072: the Mind's own ✕ takes its pop-up frame down with it.
+    if (djMind.mode === "window") { try { pineWinClose("mind", false); } catch (e) {} }
   } else {
     djMind.shade.remove();
   }
@@ -158951,6 +159467,13 @@ async function orchLogicPanel() {
     alive = false;
     document.removeEventListener("keydown", onKey);
     try { renderer.dispose(); } catch (e) {}
+  }, resize: () => {
+    // #1072: the gallery frame changes the stage's size; the drawing
+    // buffer follows or the CSS-stretched canvas would distort.
+    if (!alive) return;
+    renderer.setSize(W(), H(), false);
+    camera.aspect = W() / H();
+    camera.updateProjectionMatrix();
   }};
 }
 

@@ -1758,9 +1758,16 @@ async function setFm(on) {
 }
 
 // ---- The 3JS gallery: jump the panel between its three.js experiences.
-// Keys mirror the panel's PINE_3JS registry; the click rides the webview
-// bridge (pineShow3JS closes whatever scene is up first).
+// Keys mirror the panel's PINE_3JS registry, in its order and in full
+// (#1072: every entry the panel lists is here, and every one opens in a
+// pop-up frame of its own over there - movable, resizable, remembered);
+// the click rides the webview bridge (pineShow3JS closes whatever scene is
+// up first).
 const THREEJS_VIEWS = [
+  { key: "flow", icon: "🗺", name: "Station flow", since: "the content observatory",
+    systems: "three.module.js · /api/dj/flow journal",
+    what: "The station in motion, every step with its evidence",
+    desc: "Every source, decision, rewrite and audible delivery as a live process map - packets travel the handoffs as events land; select a step or an event for the exact text, judgments, retries and playback acknowledgments the station recorded." },
   { key: "mind", icon: "🧠", name: "Dialogue Mind", since: "#472 · #465 · #508",
     systems: "three.min.js · /api/dj/pipeline · /api/speakbox/minds",
     what: "How a line of banter is MADE, live",
@@ -1773,10 +1780,38 @@ const THREEJS_VIEWS = [
     systems: "three.min.js · /api/dj/graph",
     what: "The machine behind the pair",
     desc: "The DJ as the central node with every powering system in orbit; documents light up and fire pulses down their edges each time one drives a line. Lines are votable and replayable from the rail." },
+  { key: "orchlogic", icon: "🕸", name: "Orchestrator", since: "#1150",
+    systems: "three.min.js · /api/orchestrator/logic · /api/orchestrator/judgment",
+    what: "The judgment book, drawn as a logic graph",
+    desc: "Every road the orchestrator runs - demand, stock, judgment, learning, plan - as columns of a live graph: what each road owes, what it holds, the factors and lessons that set its asks, with a dial per road." },
+  { key: "comfydoc", icon: "🩺", name: "Comfy Doctor", since: "#1152",
+    systems: "/api/comfy/doctor · systemd bridge",
+    what: "The image renderer's troubleshooter, as a console",
+    desc: "Knocks on ComfyUI, reads its vitals and restarts it when it is down; Deep proves the whole road with a real test render. Every step lands in the console as it happens." },
+  { key: "steward", icon: "🏥", name: "Services", since: "#1153",
+    systems: "/api/steward · the services census",
+    what: "Every service in the stack, checked and repaired",
+    desc: "A census of the whole stack - ollama, the voice engines, the vector guides and the rest. Check probes everything and repairs nothing; Fix restarts whatever is sick and takes the census again." },
   { key: "crystal", icon: "💠", name: "Data Crystal", since: "#350 · #484",
     systems: "three.module.js · /api/dj/crystal",
     what: "Everything they have ever said, crystallised",
     desc: "The whole spoken history as a growing point cloud, one cluster per speaker, placed by phrase embedding so reruns crystallise together. Hover reads a phrase; right-click deletes it from the DJ's memory." },
+  { key: "shelf", icon: "❄️", name: "The shelf", since: "the chunk ledger",
+    systems: "/api/chunks",
+    what: "What the crystal and the speakbox hold, chunk by chunk",
+    desc: "Both shelves - the crystal's and the speakbox's - every chunk with how often it has been used and how long it has been resting; filter to one shelf or to the chunks that are resting." },
+  { key: "slots", icon: "⏱️", name: "The half hours", since: "the slot ledger",
+    systems: "/api/slots",
+    what: "The hour in half-hour slots, and what each is owed",
+    desc: "Every half hour the running order owns: what it asks for, what has been staged against it and what is still missing, refreshed as the desks work." },
+  { key: "asks", icon: "🎛️", name: "The orchestrator asks", since: "#1058",
+    systems: "/api/orchestrator/asks",
+    what: "The questions the orchestrator has for you",
+    desc: "Nothing until it has a question; then the evidence behind each ask and a way to answer it, with the rejected-lines review one click away." },
+  { key: "rejected", icon: "✂", name: "Rejected lines", since: "the rejection review",
+    systems: "/api/orchestrator/rejection-policy · rejection lab",
+    what: "Every line the gates turned away, and why",
+    desc: "The queue of rejected lines with the original, the candidate and the complete decision; the rejection system's master switch, the editorial-flag allowance and the gates; approve a batch or learn from the pattern." },
   { key: "booth", icon: "🎛", name: "DJ Booth", since: "#132",
     systems: "three.module.js · DJ state endpoints",
     what: "The studio itself, as a room",
@@ -1789,6 +1824,18 @@ const THREEJS_VIEWS = [
     systems: "three.module.js · /api/crystals/{id}/rhymes · CMUdict",
     what: "The crystal as a rhyming dictionary",
     desc: "Every word the crystal's writer lands a line on, on the word-cloud sphere — size is how often, colour is how many other words share that sound. Per crystal, per mind, per song, or one passage of chunks at a time, with the rhyme families listed beside it." },
+  { key: "paper", icon: "📰", name: "The Gazette", since: "#1019",
+    systems: "/api/paper · hermes-paper-agent",
+    what: "The hourly newspaper, off the station's log",
+    desc: "Newspaper and tabloid editions of what the station did this hour - older and newer editions, Copy, PDF and Image exports, and the hourly press switch." },
+  { key: "slides", icon: "🗞", name: "Endless press", since: "#1043b",
+    systems: "/api/paper/slideshow",
+    what: "Every Gazette issue, scrolling",
+    desc: "The slideshow of every edition, newspaper then tabloid, running endlessly - from the gallery it gets a window of its own instead of the right half of the screen." },
+  { key: "script", icon: "📝", name: "The Screenplay", since: "the screenplay desk",
+    systems: "/api/screenplay",
+    what: "The hour, typeset as a script",
+    desc: "Every line of the hour laid out as a screenplay - copy the sheet, export Fountain or PDF, add a note on the hour, rebuild it from the ledgers." },
   { key: "sphere", icon: "🔮", name: "Rhetoric Sphere", since: "#610",
     systems: "three.module.js · live chat feed",
     what: "What is being said on air right now, in 3D",
@@ -1812,7 +1859,7 @@ const THREEJS_VIEWS = [
   { key: "off", icon: "⬛", name: "All off", since: "the sweep",
     systems: "every scene above",
     what: "Take every 3D scene down",
-    desc: "Closes every experience in the right order, disarms the auto-reopeners, and leaves the page flat and quiet." },
+    desc: "Closes every experience in the right order, disarms the auto-reopeners, closes every pop-up the gallery opened, and leaves the page flat and quiet." },
 ];
 
 function threejsTip(item, anchor) {
@@ -1881,6 +1928,364 @@ function initThreejsRail() {
   });
 }
 initThreejsRail();
+
+/* ---- #1073 THE SCHEDULER: which engine writes the hour, and its dials.
+ *
+ * "add sections for managing the active scheduler algorithm."
+ *
+ * One strip cell - the engine (the original chain or System2), the
+ * occurrence on air and what it still owes - and the same controls in two
+ * places: a block dropped under the rail's Scheduler entry, and the cell's
+ * popup, which also carries the occurrence, the inventory and the last
+ * error. The controls are the engine switch, the two coexistence dials
+ * (#1070: fallback - the original chain covers an entry System2 has
+ * nothing verified for; legacy_keepers - the original writers keep filling
+ * the inventory System2 plans over), the planning horizon and the turns
+ * per scene, and doors into the panel's System2 window (over the webview
+ * bridge) and the System2 tab. GET /api/system2/status every 15 s like the
+ * other strip polls; POST /api/system2/settings on a change, then a fresh
+ * read so every copy of the controls agrees with the server. */
+let schedTileStatus = null;
+let schedTileTimer = null;
+let schedTileBusy = false;
+let schedTilePolled = false;     // the first read has come back (or failed)
+const schedTileViews = [];
+
+function schedRunningSlot(status) {
+  const at = Number(status && status.at) || Date.now() / 1000;
+  for (const hour of ((status && status.hours) || [])) {
+    for (const slot of (hour.slots || [])) {
+      if (Number(slot.start) <= at && at < Number(slot.deadline)) return slot;
+    }
+  }
+  return null;
+}
+
+function schedSeconds(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  return s >= 90 ? Math.round(s / 60) + " min" : s + "s";
+}
+
+function schedTilePaint(status, note) {
+  schedTileStatus = status || null;
+  const cfg = (status && status.config) || {};
+  const system2 = !!status && cfg.engine === "system2";
+  const slot = status ? schedRunningSlot(status) : null;
+  const errors = (status && status.errors) || [];
+  const work = (status && status.work) || {};
+  const owing = !!slot && !slot.non_dialogue && Number(slot.debt_seconds) > 0;
+  const cell = $("schedCell");
+  if (cell) {
+    cell.classList.toggle("system2", system2);
+    cell.classList.toggle("owing", system2 && owing);
+    cell.classList.toggle("errors", system2 && !owing && errors.length > 0);
+  }
+  const sub = $("schedSub");
+  if (!status) {
+    setText("schedState", "unknown");
+    if (sub) sub.textContent = note || "";
+  } else {
+    setText("schedState", system2 ? "System2" : "Original");
+    const bits = [];
+    if (system2) {
+      if (slot) {
+        bits.push(slot.label || slot.kind || "segment");
+        if (slot.non_dialogue) bits.push("music owns it");
+        else if (owing) bits.push(schedSeconds(slot.debt_seconds) + " owed");
+        else bits.push("covered");
+      } else if (work && work.kind) {
+        bits.push("writing " + work.kind);
+      } else {
+        bits.push("no occurrence on air");
+      }
+      if (errors.length) bits.push(errors.length + " error" + (errors.length > 1 ? "s" : ""));
+    } else {
+      bits.push("the original chain");
+      bits.push("System2 standing by");
+    }
+    if (sub) sub.textContent = bits.join(" · ");
+  }
+  schedTileViews.forEach((view) => {
+    try { view.paint(status); } catch (e) { /* one stale copy is not the end */ }
+  });
+}
+
+async function schedTilePoll(force) {
+  if (schedTileBusy && !force) return;
+  schedTileBusy = true;
+  try {
+    schedTilePaint(await api.get("/api/system2/status"));
+  } catch (err) {
+    schedTilePolled = true;
+    schedTilePaint(null, err && err.message ? err.message : "not answering");
+  } finally {
+    schedTilePolled = true;
+    schedTileBusy = false;
+  }
+}
+
+/* Save one or more settings, then read back so every copy of the controls
+ * shows what the server actually kept (a refused value snaps back). */
+async function schedTileSet(patch) {
+  schedTileViews.forEach((v) => v.say("saving…", false));
+  try {
+    await api.post("/api/system2/settings", patch);
+    const what = Object.keys(patch)
+      .map((k) => k.replace(/_/g, " ") + " → " + String(patch[k])).join(", ");
+    schedTileViews.forEach((v) => v.say("saved: " + what, false));
+  } catch (err) {
+    schedTileViews.forEach((v) => v.say(err && err.message ? err.message : "could not save", true));
+  }
+  await schedTilePoll(true);
+}
+
+/* The panel's own System2 window, over the webview bridge - the hourly
+ * plan, its scripts and the work still owed, inside the Agent view. */
+function schedOpenSystem2Window() {
+  selectView("control");
+  const frame = $("controlFrame");
+  if (frame && frame.src && typeof frame.executeJavaScript === "function") {
+    frame.executeJavaScript('typeof system2Open === "function" && system2Open()')
+      .catch(() => {});
+  }
+  const pop = $("schedDetail");
+  if (pop) pop.remove();
+}
+
+/* The controls, built into any container; every copy paints from the same
+ * status and says the same result line. */
+function schedTileControls(root) {
+  root.textContent = "";
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const engine = mk("div", "sched-engine");
+  const original = mk("button", "", "Original");
+  original.title = "The original chain writes the hour - the pantry and larder "
+    + "keepers and the coordinator's desks, round by round";
+  const system2 = mk("button", "", "System2");
+  system2.title = "System2 plans the hours ahead and stages a verified recording "
+    + "for every occurrence before it is due";
+  original.onclick = () => schedTileSet({engine: "legacy"});
+  system2.onclick = () => schedTileSet({engine: "system2"});
+  engine.append(original, system2);
+
+  const dial = (label, key, tip) => {
+    const row = mk("label", "sched-dial");
+    row.title = tip;
+    const input = mk("input");
+    input.type = "checkbox";
+    input.onchange = () => {
+      input.disabled = true;
+      schedTileSet({[key]: input.checked}).finally(() => { input.disabled = false; });
+    };
+    row.append(input, mk("span", "", label));
+    return {row, input};
+  };
+  const fallback = dial("Original chain covers an empty entry", "fallback",
+    "fallback: when System2 has nothing verified for the entry on air, the "
+    + "original chain serves it instead of the slot going silent");
+  const keepers = dial("Original writers keep filling the inventory", "legacy_keepers",
+    "legacy_keepers: the pantry and larder keepers keep writing while System2 "
+    + "is on, and System2 plans over the common inventory");
+
+  const num = (label, key, min, max, tip) => {
+    const row = mk("div", "sched-num");
+    row.title = tip;
+    const input = mk("input");
+    input.type = "number"; input.min = String(min); input.max = String(max); input.step = "1";
+    input.onchange = () => {
+      const v = Math.round(Number(input.value));
+      if (!Number.isFinite(v) || v < min || v > max) {
+        schedTileViews.forEach((x) => x.say(label + " must be " + min + " to " + max, true));
+        schedTilePaint(schedTileStatus);
+        return;
+      }
+      schedTileSet({[key]: v});
+    };
+    row.append(mk("span", "", label), input);
+    return {row, input};
+  };
+  const horizon = num("hours planned ahead", "horizon_hours", 1, 6,
+    "horizon_hours: how many hours ahead System2 plans and prepares (1 to 6)");
+  const turns = num("turns per scene", "generation_turns", 4, 12,
+    "generation_turns: how many turns a System2 scene is written to (4 to 12)");
+
+  const note = mk("div", "sched-note", "reading the scheduler…");
+  const doors = mk("div", "sched-doors");
+  const openWin = mk("button", "", "Open System2");
+  openWin.title = "The panel's System2 window - the hourly plan, its scripts and the work still owed";
+  openWin.onclick = () => schedOpenSystem2Window();
+  const openTab = mk("button", "", "System2 tab");
+  openTab.title = "The System2 page as a tab of this app";
+  openTab.onclick = () => { selectView("system2"); const p = $("schedDetail"); if (p) p.remove(); };
+  doors.append(openWin, openTab);
+  root.append(engine, fallback.row, keepers.row, horizon.row, turns.row, note, doors);
+
+  const view = {
+    root, note, saidAt: 0,
+    paint(status) {
+      const cfg = (status && status.config) || {};
+      const on = !!status && cfg.engine === "system2";
+      original.classList.toggle("on", !!status && !on);
+      system2.classList.toggle("on", on);
+      const idle = (input) => document.activeElement !== input;
+      if (idle(fallback.input)) fallback.input.checked = cfg.fallback !== false;
+      if (idle(keepers.input)) keepers.input.checked = cfg.legacy_keepers !== false;
+      if (idle(horizon.input)) horizon.input.value = String(cfg.horizon_hours || 2);
+      if (idle(turns.input)) turns.input.value = String(cfg.generation_turns || 6);
+      [original, system2, fallback.input, keepers.input, horizon.input, turns.input]
+        .forEach((i) => { i.disabled = !status; });
+      if (view.paintDetail) view.paintDetail(status);
+      if (Date.now() - view.saidAt < 8000) return;   // a result line stays readable
+      note.classList.remove("err");
+      if (!status) {
+        note.textContent = schedTilePolled ? "the scheduler did not answer"
+                                           : "reading the scheduler…";
+      } else if (on) {
+        note.textContent = "System2 is writing the hour; "
+          + (cfg.fallback === false ? "an entry it has nothing for goes silent"
+                                    : "the original chain covers an entry it has nothing for")
+          + (cfg.legacy_keepers === false ? "; the original writers stand down" : "");
+      } else {
+        note.textContent = "The original chain is writing the hour; System2 is standing by";
+      }
+    },
+    say(text, err) {
+      note.textContent = text;
+      note.classList.toggle("err", !!err);
+      view.saidAt = Date.now();
+    },
+  };
+  schedTileViews.push(view);
+  view.paint(schedTileStatus);
+  return view;
+}
+
+/* The occurrence on air, the inventory and the last error - the popup's
+ * reading of the status above the controls. */
+function schedTileDetail(target, status) {
+  target.textContent = "";
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  if (!status) {
+    target.appendChild(mk("div", "sched-note", "The scheduler has not answered yet."));
+    return;
+  }
+  const cfg = status.config || {};
+  const on = cfg.engine === "system2";
+  const slot = schedRunningSlot(status);
+  const chips = mk("div", "sched-chips");
+  const chip = (k, v) => chips.appendChild(mk("span", "", k + ": "
+    + (v == null || v === "" ? "—" : v)));
+  chip("engine", on ? "System2" : "original chain");
+  if (slot) {
+    chip("on air", slot.label || slot.kind);
+    const at = Number(status.at) || Date.now() / 1000;
+    chip("through", schedSeconds(at - Number(slot.start)));
+    chip("owns", schedSeconds(Number(slot.deadline) - Number(slot.start)));
+    if (slot.non_dialogue) chip("music", "owns the slot");
+    else {
+      chip("staged", schedSeconds(slot.ready_seconds));
+      chip("owed", schedSeconds(slot.debt_seconds));
+    }
+    if (slot.status) chip("status", slot.status);
+  } else {
+    chip("on air", on ? "no occurrence" : "the original chain's round");
+  }
+  const inv = status.inventory || {};
+  chip("inventory", (inv.ready || 0) + " ready of " + (inv.candidates || 0));
+  const work = status.work || {};
+  if (work.kind) chip("writing", work.kind + (work.state ? " · " + work.state : ""));
+  if (status.paused) chip("air", "paused");
+  if (status.on === false) chip("station", "off");
+  target.appendChild(chips);
+  const errors = status.errors || [];
+  if (errors.length) {
+    const last = errors[errors.length - 1] || {};
+    target.appendChild(mk("div", "sched-note err", "last error · "
+      + (last.stage || "") + ": " + (last.message || last.error || String(last))));
+  }
+}
+
+function schedTilePopup() {
+  const gone = $("schedDetail");
+  if (gone) { gone.remove(); return; }
+  const mk = (tag, cls, text) => {
+    const n = document.createElement(tag);
+    if (cls) n.className = cls;
+    if (text != null) n.textContent = String(text);
+    return n;
+  };
+  const d = mk("div", "sched-pop");
+  d.id = "schedDetail";
+  d.style.cssText = "position:fixed;left:50%;top:64px;"
+    + "transform:translateX(-50%);width:min(560px,94vw);max-height:80vh;"
+    + "overflow:auto;z-index:300;background:#070c12;border:1px solid "
+    + "#24384a;border-radius:10px;padding:12px 14px;box-shadow:0 20px "
+    + "60px #000c";
+  const head = mk("div");
+  head.style.cssText = "display:flex;gap:8px;align-items:baseline;margin-bottom:8px";
+  const title = mk("b", "", "⧗ The scheduler");
+  title.style.cssText = "flex:1;font-size:13px;color:#9fd8ff";
+  const again = mk("button", "", "↻");
+  again.title = "Read the scheduler again";
+  again.style.cssText = "font-size:11px;padding:2px 8px;cursor:pointer";
+  again.onclick = () => schedTilePoll(true);
+  const x = mk("button", "", "✕");
+  x.style.cssText = "font-size:11px;padding:2px 8px;cursor:pointer";
+  x.onclick = () => d.remove();
+  head.append(title, again, x);
+  d.appendChild(head);
+  const detail = mk("div");
+  d.appendChild(detail);
+  const controls = mk("div", "sched-list");
+  d.appendChild(controls);
+  const view = schedTileControls(controls);
+  view.paintDetail = (status) => schedTileDetail(detail, status);
+  view.paintDetail(schedTileStatus);
+  document.body.appendChild(d);
+  try { pvFloatDesk(d); } catch (e) {}
+  // The popup's copy of the controls leaves the roster with the popup.
+  const mo = new MutationObserver(() => {
+    if (d.isConnected) return;
+    mo.disconnect();
+    const i = schedTileViews.indexOf(view);
+    if (i >= 0) schedTileViews.splice(i, 1);
+  });
+  mo.observe(document.body, {childList: true});
+  schedTilePoll(true);
+}
+
+function initSchedTile() {
+  const cell = $("schedCell");
+  if (cell && !cell.dataset.wired) {
+    cell.dataset.wired = "1";
+    cell.onclick = () => schedTilePopup();
+  }
+  const btn = $("schedBtn");
+  const list = $("schedList");
+  if (btn && list && !btn.dataset.wired) {
+    btn.dataset.wired = "1";
+    schedTileControls(list);
+    btn.addEventListener("click", () => {
+      // The compact rail has no room for dials: the popup carries them.
+      if (document.body.classList.contains("rail-compact")) { schedTilePopup(); return; }
+      const open = list.style.display !== "none";
+      list.style.display = open ? "none" : "grid";
+      btn.classList.toggle("active", !open);
+      if (!open) schedTilePoll(true);
+    });
+  }
+}
+initSchedTile();
 
 // ---- The heartbeat (Box cell): the DJs' rhetoric reaching the server as
 // EKG spikes on a scrolling trace — writing blue, voicing violet, on-air
@@ -11915,6 +12320,9 @@ if (typeof api.onSupportProgress === "function") {
   await pollDesktopRadio();
   setInterval(refresh, 6000);
   setInterval(pollDesktopRadio, 1500);
+  // #1073: the scheduler cell, on the same cadence as the other strip polls.
+  schedTilePoll();
+  schedTileTimer = setInterval(schedTilePoll, 15000);
   // #802: the first real click is the autoplay permission — use it.
   document.addEventListener("click", (event) => {
     if (event.target.closest?.('[data-rejection-review]')) return;

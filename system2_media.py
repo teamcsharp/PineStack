@@ -22,6 +22,9 @@ class System2Media:
         self.host = host
         self._proofs = {}
         self._lock = threading.RLock()
+        # #1074: the stage at which the last delivery was refused, for the
+        # runtime's note; a bare False said nothing about which door shut.
+        self.last_refusal = ""
 
     def _path(self, clip):
         raw = str((clip or {}).get("path") or "")
@@ -214,10 +217,14 @@ class System2Media:
     async def deliver(self, resolved, on_handoff, can_handoff, entry_overrides=None):
         """Accepted handoff is distinct from the host's subsequent heard ACK."""
         h = self.host
+        self.last_refusal = ""
         if not resolved.get("ready"):
+            self.last_refusal = "the staged recording is not ready"
             return False
         fresh = await asyncio.to_thread(self._current, resolved)
         if not fresh.get("ready") or self.signature(fresh) != self.signature(resolved):
+            self.last_refusal = ("the recording changed between staging and delivery" if fresh.get("ready")
+                                 else "; ".join(fresh.get("why") or ["the recording is no longer ready"]))
             return False
         entry = copy.deepcopy(fresh["entry"])
         entry.update(copy.deepcopy(entry_overrides or {}))
@@ -233,11 +240,19 @@ class System2Media:
             return True
 
         if not allowed():
+            self.last_refusal = ("the station is off or paused" if not h._RADIO.get("on") or h.radio_paused()
+                                 else "the reservation is no longer valid for this occurrence")
             return False
         if fresh["media_kind"] != "produced":
-            return bool(await h._banter_air(entry, h._RADIO.get("now"),
+            said = bool(await h._banter_air(entry, h._RADIO.get("now"),
                         ready_takes=fresh["takes"], on_handoff=on_handoff, can_handoff=allowed))
-        return await self._deliver_produced(fresh, entry, on_handoff, allowed)
+            if not said:
+                self.last_refusal = "the air road declined the assembled round (deadline fit, repeat guard or handoff)"
+            return said
+        said = await self._deliver_produced(fresh, entry, on_handoff, allowed)
+        if not said:
+            self.last_refusal = "the produced spot was not published (floor, deadline or the box declined it)"
+        return said
 
     async def _deliver_produced(self, resolved, entry, on_handoff, allowed):
         h = self.host

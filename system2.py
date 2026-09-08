@@ -593,6 +593,29 @@ class System2Store:
             self._save(db, 's2_jobs', row, ('slot_id', 'state', 'deadline'))
             return row
 
+    def reclaim_jobs(self, owner):
+        """#1074: hand a restarted owner its own unfinished jobs back.
+
+        A restart leaves the job it was working on 'working' under a lease
+        nobody will renew, and claim_job skips that slot for the rest of the
+        lease. Tonight five restarts in seventy minutes (deploys and the host
+        watchdog) left four slots' jobs orphaned for 1800 s each - one of
+        them for the whole of its occurrence. The owner is one process per
+        store, so on its start every job it still holds is its own lost work:
+        it is pending again at once, attempts and last result kept."""
+        _name(owner, 'owner')
+        reclaimed = []
+        with self._tx() as db:
+            for raw in db.execute("SELECT body FROM s2_jobs WHERE state='working'").fetchall():
+                job = json.loads(raw[0])
+                if job.get('owner') != owner:
+                    continue
+                job.update(state='pending', lease_until=0, retry_at=0, reclaimed_at=self.now(),
+                           reclaim_reason='the owner restarted before this attempt completed')
+                self._save(db, 's2_jobs', job, ('slot_id', 'state', 'deadline'))
+                reclaimed.append(job['id'])
+        return reclaimed
+
     def reserve(self, slot_id, candidate_id, owner, *, expected_revision=None, lease_seconds=120, request_id=None):
         _name(owner, 'owner'); _number(lease_seconds, 'lease_seconds', 1, 3600)
         if request_id is not None: _name(request_id, 'request_id')
