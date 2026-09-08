@@ -105265,11 +105265,12 @@ def paper_tint_caps() -> tuple[int, int, float]:
     cap" at six stories, ten paragraphs and ninety seconds."""
     try:
         if crystal_tint_holds():
-            # #1071: an edition has about eighty eligible paragraphs and the
-            # press runs once an hour; twenty minutes and 120 paragraphs
-            # instead of ten and sixty, so the window no longer closes on
-            # the first third of the paper.
-            return 999, max(PAPER_TINT_PARAS, 120), max(PAPER_TINT_SECONDS, 1200.0)
+            # #1071/#1077: an edition has about eighty eligible paragraphs,
+            # one ask at a time on the fast model runs fifteen to fifty
+            # seconds, and the operator's rule is that no edition goes out
+            # untinted: forty-five minutes and no paragraph cap under the
+            # hold, so the window closes on the paper, not on its first third.
+            return 999, 999, max(PAPER_TINT_SECONDS, 2700.0)
     except Exception:  # noqa: BLE001
         pass
     return PAPER_TINT_STORIES, PAPER_TINT_PARAS, PAPER_TINT_SECONDS
@@ -107726,9 +107727,13 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
     _PAPER_PRESS["attempted_stories"] = int(_PAPER_PRESS.get("attempted_stories") or 0) + 1
     trace_id = "paper:" + str(story.get("slug") or "story") + ":" + str(
         int(float(_PAPER_PRESS.get("started") or time.time())))
+    # #1077: a later pass over the same story asks only what is still plain.
+    done_keys = {r.get("key") for r in (report.get("paragraphs") or []) if r.get("ok")}
     for unit in paper_tint_units(story):
         if report["changed"] >= report["required"]:
             break
+        if unit["key"] in done_keys:
+            continue
         if (int(_PAPER_PRESS.get("attempted_paras") or 0) >= _cap_paras
                 or paper_tint_left() <= 0):
             _paper_tint_why("the newspaper tint cap or deadline was reached")
@@ -107745,22 +107750,38 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
         # 575 s). The paper now asks on the fast model's own lane, waits
         # out a deferral a few times inside its window without spending an
         # attempt on it, and the record says why a paragraph stayed plain.
-        out, deferred = source, ""
-        for _try in range(4):
-            try:
-                out = await crystal_line(source, why, 1, kind="paper",
-                                         model=tint_fast_model() or "")
-                deferred = ""
+        # #1077: a paragraph refused whole is asked again sentence by
+        # sentence, each bar written knowing the last (crystal_line room 3),
+        # which is how the dialogue gets long turns through the grade.
+        rooms = [1]
+        if len([b for b in re.split(r"(?<=[.!?])\s+", source.strip()) if b.strip()]) >= 2:
+            rooms.append(3)
+        out, deferred, accepted = source, "", False
+        for _room in rooms:
+            out, deferred = source, ""
+            for _try in range(4):
+                try:
+                    out = await crystal_line(source, why, _room, kind="paper",
+                                             model=tint_fast_model() or "")
+                    deferred = ""
+                    break
+                except WritingDeferred as exc:
+                    deferred = str(exc)[:120]
+                    if _try < 3 and paper_tint_left() > 12:
+                        await asyncio.sleep(4)
+                        continue
+                    break
+                except Exception:  # noqa: BLE001
+                    out = source
+                    break
+            if deferred:
                 break
-            except WritingDeferred as exc:
-                deferred = str(exc)[:120]
-                if _try < 3 and paper_tint_left() > 12:
-                    await asyncio.sleep(4)
-                    continue
+            out = " ".join(str(out or "").split())
+            accepted = bool(out and out != " ".join(source.split())
+                            and tint_output_ready(out))
+            if accepted or paper_tint_left() <= 60 or tint_should_stop():
                 break
-            except Exception:  # noqa: BLE001
-                out = source
-                break
+        report["paragraphs"] = [r for r in report["paragraphs"] if r.get("key") != unit["key"]]
         if deferred:
             report["paragraphs"].append({"key": unit["key"], "ok": False,
                 "source_hash": hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest(),
@@ -107770,9 +107791,6 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
             continue
         report["attempted"] += 1
         _PAPER_PRESS["attempted_paras"] = int(_PAPER_PRESS.get("attempted_paras") or 0) + 1
-        out = " ".join(str(out or "").split())
-        accepted = bool(out and out != " ".join(source.split())
-                        and tint_output_ready(out))
         city_image, _ = _paper_city_tint_target(story, unit["key"])
         if accepted and city_image:
             from newspaper_city import sentences
@@ -107805,6 +107823,71 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
     if report["changed"]:
         _PAPER_PRESS["tinted_stories"] = int(_PAPER_PRESS.get("tinted_stories") or 0) + 1
     return bool(report["changed"])
+
+
+def paper_tint_cut(story: dict[str, Any]) -> int:
+    """#1077: under the crystal a paragraph that would not rap does not go
+    to print - the operator's rule for the paper is the dialogue's rule,
+    rhyme or silence. Body paragraphs and classified notices that stayed
+    plain are cut; a story keeps its first paragraph so no article prints
+    empty, and interview answers stay (a question without its answer is
+    worse than a plain answer). The records are re-keyed to the paragraphs
+    that remain so the summary's hashes still match, and the report says
+    how many were cut."""
+    report = (story.get("meta") or {}).get("tint")
+    if not isinstance(report, dict) or report.get("met") or not report.get("required"):
+        return 0
+    records = list(report.get("paragraphs") or [])
+    ok_keys = {r.get("key") for r in records if r.get("ok")}
+    eligible = {u["key"] for u in paper_tint_units(story)}
+    cut = 0
+    # The body: keep index 0 and every accepted paragraph; drop the rest of
+    # the eligible ones; ineligible short lines and tables stay as they are.
+    paragraphs = str(story.get("body") or "").split("\n\n")
+    kept: list[str] = []
+    new_index: dict[int, int] = {}
+    for i, text in enumerate(paragraphs):
+        key = f"body:{i}"
+        if key in eligible and key not in ok_keys and i > 0:
+            cut += 1
+            continue
+        new_index[i] = len(kept)
+        kept.append(text)
+    story["body"] = "\n\n".join(kept)
+    # Classified notices: keep the accepted ones.
+    meta = story.setdefault("meta", {})
+    rows = meta.get("classifieds") or []
+    kept_rows: list[Any] = []
+    new_row: dict[int, int] = {}
+    for j, row in enumerate(rows):
+        key = f"classified:{j}"
+        if key in eligible and key not in ok_keys:
+            cut += 1
+            continue
+        new_row[j] = len(kept_rows)
+        kept_rows.append(row)
+    if rows:
+        meta["classifieds"] = kept_rows
+    # Re-key the records that survive.
+    survivors = []
+    for row in records:
+        key = str(row.get("key") or "")
+        parts = key.split(":")
+        if parts[0] == "body" and len(parts) == 2 and parts[1].isdigit():
+            if int(parts[1]) not in new_index:
+                continue
+            row = {**row, "key": f"body:{new_index[int(parts[1])]}"}
+        elif parts[0] == "classified" and len(parts) == 2 and parts[1].isdigit():
+            if int(parts[1]) not in new_row:
+                continue
+            row = {**row, "key": f"classified:{new_row[int(parts[1])]}"}
+        survivors.append(row)
+    report["paragraphs"] = survivors
+    report["cut"] = int(report.get("cut") or 0) + cut
+    remaining = len(paper_tint_units(story))
+    report["eligible"] = remaining
+    report["required"] = (remaining * int(report.get("target") or 0) + 99) // 100
+    return cut
 
 
 def paper_tint_summary(stories: list[dict[str, Any]]) -> dict[str, Any]:
@@ -107842,10 +107925,12 @@ def paper_tint_status(meta: dict[str, Any]) -> str:
     if not isinstance(report, dict):
         return ""
     deferred = int(report.get("deferred") or 0)
+    cut = int(report.get("cut") or 0)
     return (f"Crystal tint: {int(report.get('changed') or 0)}/"
             f"{int(report.get('eligible') or 0)} eligible paragraphs; "
             f"{int(report.get('attempted') or 0)} attempted"
             + (f"; {deferred} deferred by the tint lane" if deferred else "")
+            + (f"; {cut} cut for want of a rhyme" if cut else "")
             + f"; {report.get('status') or 'pending'} "
             f"(target {int(report.get('target') or 0)}%)")
 
@@ -110801,6 +110886,27 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                     except Exception:  # noqa: BLE001
                         pass
             await asyncio.gather(*(_tint_one(story) for story in _tint_order))
+            # #1077: under the hold the edition does not go out until every
+            # eligible paragraph is a bar or the window is spent. Refused
+            # paragraphs are asked again while there is time (sentence by
+            # sentence from the second ask), and what never passes is cut
+            # before print, the way a dialogue line that will not rap is
+            # cut before the studio.
+            _passes = 0
+            while (crystal_tint_holds() and paper_tint_left() > 45 and _passes < 8
+                   and not paper_tint_summary([lead] + stories + [apology])["met"]):
+                _passes += 1
+                _again = [s for s in _tint_order
+                          if not ((s.get("meta") or {}).get("tint") or {}).get("met")]
+                if not _again:
+                    break
+                _paper_say(f"crystal: pass {_passes + 1} over {len(_again)} stories still "
+                           f"owed a rhyme, {int(paper_tint_left())}s left in the window")
+                await asyncio.gather(*(_tint_one(story) for story in _again))
+            if crystal_tint_holds() and crystal_coverage_target() >= 100:
+                _cut = sum(paper_tint_cut(s) for s in [lead] + stories + [apology])
+                if _cut:
+                    _paper_say(f"crystal: {_cut} paragraph(s) cut for want of a rhyme (#1077)")
             _paper_say(f"crystal: {tinted_by} tinted "
                        f"{int(_PAPER_PRESS.get('tinted_stories') or 0)} stories, "
                        f"{int(_PAPER_PRESS.get('tinted_paras') or 0)} paragraphs "
