@@ -137,7 +137,11 @@ class SfxReserveAdmissionTests(unittest.IsolatedAsyncioTestCase):
                 return await app.call_ollama(model="same-model", messages=[{"role": "user", "content": label}],
                     temperature=.4, max_tokens=128, purpose=purpose)
             first = asyncio.create_task(call("first")); await entered.wait()
+            # The tint cap is a waiting depth of three behind the lane (the
+            # cupboard audit): three visible waiters, then the excess is refused.
             second = asyncio.create_task(call("second")); await asyncio.sleep(0)
+            third = asyncio.create_task(call("third")); await asyncio.sleep(0)
+            fourth = asyncio.create_task(call("fourth")); await asyncio.sleep(0)
             self.assertTrue((await call("excess tint"))["deferred"])
             reserve = asyncio.create_task(call("cancelled reserve", "sfx_tint_reserve")); await asyncio.sleep(0)
             self.assertTrue((await call("excess reserve", "sfx_tint_reserve"))["deferred"])
@@ -148,8 +152,8 @@ class SfxReserveAdmissionTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(any(row["category"] == "sfx_reserve" for row in app._OLLAMA_JOBS.values()))
             replacement = asyncio.create_task(call("replacement reserve", "sfx_tint_reserve"))
             await asyncio.sleep(0); release.set()
-            await asyncio.gather(first, second, replacement)
-            self.assertEqual(heard, ["first", "second", "replacement reserve"])
+            await asyncio.gather(first, second, third, fourth, replacement)
+            self.assertEqual(heard, ["first", "second", "third", "fourth", "replacement reserve"])
             self.assertEqual(app._OLLAMA_JOBS, {})
 
     async def test_actual_crystal_selection_with_hold_off_keeps_the_original_road_model(self):

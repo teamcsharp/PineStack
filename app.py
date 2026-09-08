@@ -7799,7 +7799,14 @@ def _system2_critical_work() -> bool:
 def _ollama_category_cap(category: str, purpose: str = "") -> int:
     """The admission cap for a category, lanes and the schedule's own work
     counted (#1080)."""
-    base = {"station": max(2, OLLAMA_LANES + 1), "tint": max(2, OLLAMA_LANES + 1),
+    # 2026-09-08 (the cupboard audit): the tint cap is a WAITING depth,
+    # not a refusal rate. At lanes + 1 the fourth tint caller was refused
+    # at once and came back in six seconds: 70 of 148 asks in 26 minutes
+    # bounced, the whole-round shelf requests nine times in ten, and seven
+    # written rounds sat untouched for half an hour while the lane ran at
+    # 1.35 of 2. Three waiters behind the lanes keep the runner packed and
+    # the callers in one FIFO instead of a retry loop.
+    base = {"station": max(2, OLLAMA_LANES + 1), "tint": max(2, OLLAMA_LANES + 3),
             "repertoire": 1, "sfx_reserve": 1}.get(category, 0)
     if base and category == "tint" and _system2_critical_work():
         base += 1
@@ -26071,6 +26078,14 @@ def tint_retry_due(entry: dict[str, Any], kind: str) -> bool:
     return not tint_retry_status(entry, kind)["waiting"]
 
 
+# 2026-09-08 (the cupboard audit): how long a round rests after the lane
+# refused its tint admission ("remains owed"). Six seconds made a refusal
+# loop - every bounce re-ran the stanzas, the contracts and the regrade
+# and asked for two whole-file saves, ~1 a minute per stuck round - while
+# the admission depth is now a real queue (see _ollama_category_cap).
+TINT_DEFERRED_REST = 30.0
+
+
 def _tint_retry_accepted(value: dict[str, Any], default: int = 0) -> int:
     coverage = value.get("coverage") or (value.get("tint") or {}).get("coverage") or {}
     if "accepted" in coverage:
@@ -26456,7 +26471,7 @@ async def tint_recovery_step() -> bool:
                 or not dialogue_row_viable(kind, row) or not tint_retry_due(entry, kind)):
             continue
         tried = max(float(audit.get("last_attempt") or 0), float(entry.get("tint_tried") or 0))
-        if tried and time.time() - tried < (6.0 if audit.get("state") == "waiting" else tint_retry_rest()):
+        if tried and time.time() - tried < (TINT_DEFERRED_REST if audit.get("state") == "waiting" else tint_retry_rest()):
             continue
         choices.append((alt_sid(kind, row) not in wanted, tried,
                         -int(audit.get("reusable_lines") or 0), kind, row))
@@ -26638,7 +26653,7 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                 entry["tint_progress"] = dict(got["progress"])
             entry.setdefault("tint_revalidation", {}).update(
                 state="waiting", why="the model's admitted writers are full; this rewrite remains owed")
-            _pantry_save(True)
+            _pantry_save()          # a deferral is not a take; the throttled flush is enough
             _larder_save()
             return False
         entry["tint"] = _tint_paper(got, later=bool(entry.get("at")))
@@ -26745,7 +26760,7 @@ async def ensure_shelf_row_tinted(kind: str, row: dict[str, Any],
                 row["tint_progress"] = dict(got["progress"])
             row.setdefault("tint_revalidation", {}).update(
                 state="waiting", why="the model's admitted writers are full; this rewrite remains owed")
-            _pantry_save(True)
+            _pantry_save()          # a deferral is not a take; the throttled flush is enough
             return False
         row["tint"] = _tint_paper(got, later=bool(row.get("at")))
         progress = dict(got.get("progress") or {})
@@ -29561,7 +29576,7 @@ async def prep_voice_pending(kind: str) -> bool:
                 audit = row.get("tint_revalidation") or {}
                 tried = max(float(row.get("tint_tried") or 0),
                             float(audit.get("last_attempt") or 0))
-                rest = 6.0 if audit.get("state") == "waiting" else tint_retry_rest()
+                rest = TINT_DEFERRED_REST if audit.get("state") == "waiting" else tint_retry_rest()
                 if tried and time.time() - tried < rest:
                     continue
                 if tint_attempts >= 1:
@@ -34437,9 +34452,15 @@ async def retint_one() -> str:
         if not crystal_active():
             return _say("no crystal is on")
         try:
-            urgent = [r for r in coord_upcoming(1800.0)
-                      if not r.get("cannot")
-                      and float(r.get("short_seconds") or 0) > 0]
+            # 2026-09-08 (the cupboard audit): while paused nothing is due
+            # in the next thirty minutes - the clock is stopped (#1150) -
+            # and this stand-down fired 25 times in 26 minutes of a pause,
+            # keeping the plain rounds plain. The pause is exactly when
+            # the later pass has the room.
+            urgent = [] if radio_paused() else [
+                r for r in coord_upcoming(1800.0)
+                if not r.get("cannot")
+                and float(r.get("short_seconds") or 0) > 0]
         except Exception:  # noqa: BLE001
             urgent = []
         if urgent:
@@ -82167,10 +82188,49 @@ _TINT_OUTPUT_READY: dict[str, dict[str, Any]] = {}
 _CRYSTAL_VOCAB: dict[str, Any] = {"at": -1.0, "words": frozenset()}
 _TINT_JUDGE_RING: list[dict[str, Any]] = []      # #1064: the last 40 verdicts
 _CUPBOARD_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+# 2026-09-08 (the cupboard audit): every cupboard poll re-ran the review
+# store lookups for every cut line on the loop - 12 stalls and 92 s in ten
+# minutes, worst 10.6 s, past the watchdog's 8 s probe - because the state
+# memo lasted two seconds and the LCD polls every second while paused. A
+# cut's review identity does not change; it is kept for five minutes.
+_CUPBOARD_CUT_MEMO: dict[str, dict[str, Any]] = {}
+CUPBOARD_CUT_MEMO_SECONDS = 300.0
+CUPBOARD_MEMO_SECONDS = 5.0
 
 
 def cupboard_cut_review(kind: str, entry: dict[str, Any], turn: dict[str, Any], index: int) -> dict[str, Any]:
     """A cut's retained occurrence identity, never a search by preview words."""
+    # The key is the same identity find_occurrence binds on: the parent
+    # script, the entry's own identity fields, the turn and its words.
+    identity = [str(kind), str(index), str(turn.get("marker") or ""),
+                str(turn.get("review_id") or ""), str(turn.get("review_seq") or "")]
+    identity += [str(entry.get(k) or "") for k in
+                 ("sid", "at", "caller_voice", "caller_name", "caller2_voice", "caller2_name")]
+    identity.append(hashlib.sha1(" ".join(str(entry.get("script_plain") or entry.get("script") or "").split())
+                                 .encode("utf-8", "ignore")).hexdigest()[:16])
+    identity.append(hashlib.sha1((str(turn.get("rejected_source") or "") + "\n"
+                                  + str(turn.get("rejected_candidate") or turn.get("text") or "")
+                                  ).encode("utf-8", "ignore")).hexdigest()[:16])
+    # A new occurrence anywhere in the store can change which occurrence a
+    # cut resolves to (two identical cuts in one parent resolve to none),
+    # so the newest event's sequence is part of the key.
+    try:
+        identity.append(str(_LINE_REVIEW.latest_seq()))
+    except Exception:  # noqa: BLE001
+        identity.append("?")
+    memo_key = "|".join(identity)
+    held = _CUPBOARD_CUT_MEMO.get(memo_key)
+    if held and time.time() - float(held.get("at") or 0) < CUPBOARD_CUT_MEMO_SECONDS:
+        return dict(held["value"])
+    out = _cupboard_cut_review(kind, entry, turn, index)
+    if len(_CUPBOARD_CUT_MEMO) > 2000:
+        for old in sorted(_CUPBOARD_CUT_MEMO, key=lambda k: float(_CUPBOARD_CUT_MEMO[k].get("at") or 0))[:500]:
+            _CUPBOARD_CUT_MEMO.pop(old, None)
+    _CUPBOARD_CUT_MEMO[memo_key] = {"at": time.time(), "value": dict(out)}
+    return out
+
+
+def _cupboard_cut_review(kind: str, entry: dict[str, Any], turn: dict[str, Any], index: int) -> dict[str, Any]:
     source = str(turn.get("rejected_source") or "")
     candidate = str(turn.get("rejected_candidate") or turn.get("text") or "")
     ref = {"review_id": str(turn.get("review_id") or ""), "review_seq": int(turn.get("review_seq") or 0)}
@@ -82202,7 +82262,7 @@ def cupboard_state(most: int = 24) -> dict[str, Any]:
     verdicts of the grader. Memoised for two seconds: the LCD polls it
     every second while the station is paused."""
     now = time.time()
-    if _CUPBOARD_MEMO["value"] is not None and now - _CUPBOARD_MEMO["at"] < 2.0:
+    if _CUPBOARD_MEMO["value"] is not None and now - _CUPBOARD_MEMO["at"] < CUPBOARD_MEMO_SECONDS:
         return _CUPBOARD_MEMO["value"]
     rounds: list[dict[str, Any]] = []
     try:
@@ -83855,6 +83915,12 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         return said
 
 
+# 2026-09-08 (the cupboard audit): at 1800 an eight-turn round's "whole
+# round" first pass is four to eight group asks, each paying the ~7.6 s
+# fixed prompt cost (26 % of the lane). Raising it is pinned against by
+# tests/test_crystal_batch_fairness.py (the group ceiling is part of the
+# fairness contract), so it stays; the cheaper first pass is a decision
+# for the operator, noted in docs/cupboard-fill-rate-2026-09-08.md.
 CRYSTAL_GROUP_OUTPUT_CHARS = 1800
 
 

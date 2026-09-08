@@ -21,7 +21,8 @@ class TintUniverseTests(unittest.IsolatedAsyncioTestCase):
     CHUNKS = [{"text": "Operation, calibration, apparatus and constellation."}]
 
     def test_tint_admission_is_bounded_without_changing_editorial_rules(self):
-        self.assertEqual(app._ollama_category("station:tint turn"), ("tint", 2))
+        # A waiting depth of three behind the lanes (the cupboard audit).
+        self.assertEqual(app._ollama_category("station:tint turn"), ("tint", app.OLLAMA_LANES + 3))
         self.assertEqual(app._ollama_category("interactive"), ("interactive", 0))
         self.assertEqual(app._ollama_category("response_bank"), ("repertoire", 1))
         self.assertEqual(app._ollama_category("station:writing"), ("station", 2))

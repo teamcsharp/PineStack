@@ -43,17 +43,20 @@ class WritingCoordinationTests(unittest.IsolatedAsyncioTestCase):
             async def write():
                 return await app.call_ollama(model="model", messages=[], temperature=.5,
                                               max_tokens=30, purpose="station:tint round")
+            # The tint cap is a waiting depth of three behind the lane (the
+            # cupboard audit): one active, three visible waiters, and only
+            # the fifth caller onward is refused.
             first = asyncio.create_task(write()); await entered.wait()
-            second = asyncio.create_task(write()); await asyncio.sleep(0)
+            waiters = [asyncio.create_task(write()) for _ in range(3)]; await asyncio.sleep(0)
             refused = await asyncio.gather(write(), write(), write())
             self.assertTrue(all(row.get("deferred") for row in refused))
             state = app.writing_room_state()
-            self.assertEqual((state["active"], state["waiting"]), (1, 1))
-            self.assertEqual(state["tint_limit_per_model"], 2)
+            self.assertEqual((state["active"], state["waiting"]), (1, 3))
+            self.assertEqual(state["tint_limit_per_model"], 4)
             self.assertEqual({row["category"] for row in state["jobs"]}, {"tint"})
             self.assertEqual(state["deferred_by_category"]["model:tint"], 3)
             self.assertEqual(client.post.await_count, 1)
-            release.set(); await asyncio.gather(first, second)
+            release.set(); await asyncio.gather(first, *waiters)
             self.assertEqual(app._OLLAMA_JOBS, {})
 
     async def test_deferred_first_batch_does_not_record_an_empty_output_rejection(self):

@@ -121,23 +121,25 @@ class FaultMemoTests(unittest.TestCase):
 class LanesTests(unittest.TestCase):
     def test_caps_follow_the_lanes_and_the_schedule_gets_its_permit(self):
         with mock.patch.dict(app.__dict__, {"system2_current_work": lambda: None}):
+            # The tint cap is a waiting depth of three behind the lanes
+            # (the cupboard audit); the station cap stays one behind.
             with mock.patch.object(app, "OLLAMA_LANES", 1):
-                self.assertEqual(app._ollama_category("tint round"), ("tint", 2))
+                self.assertEqual(app._ollama_category("tint round"), ("tint", 4))
                 self.assertEqual(app._ollama_category("banter"), ("station", 2))
             with mock.patch.object(app, "OLLAMA_LANES", 2):
-                self.assertEqual(app._ollama_category("tint round"), ("tint", 3))
+                self.assertEqual(app._ollama_category("tint round"), ("tint", 5))
                 self.assertEqual(app._ollama_category("banter"), ("station", 3))
             self.assertEqual(app._ollama_category("interactive"), ("interactive", 0))
             self.assertEqual(app._ollama_category("response_bank"), ("repertoire", 1))
         soon = {"template": {"start": time.time() + 600}}
         with mock.patch.dict(app.__dict__, {"system2_current_work": lambda: soon}), \
                 mock.patch.object(app, "OLLAMA_LANES", 1):
-            self.assertEqual(app._ollama_category("tint round"), ("tint", 3))
+            self.assertEqual(app._ollama_category("tint round"), ("tint", 5))
             self.assertEqual(app._ollama_category("banter"), ("station", 2))
         later = {"template": {"start": time.time() + 7200}}
         with mock.patch.dict(app.__dict__, {"system2_current_work": lambda: later}), \
                 mock.patch.object(app, "OLLAMA_LANES", 1):
-            self.assertEqual(app._ollama_category("tint round"), ("tint", 2))
+            self.assertEqual(app._ollama_category("tint round"), ("tint", 4))
         room = app.writing_room_state()
         self.assertEqual(room["lanes_per_model"], app.OLLAMA_LANES)
         self.assertEqual(room["category_limits_per_model"]["tint"], room["tint_limit_per_model"])

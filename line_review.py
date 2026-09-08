@@ -175,6 +175,13 @@ class LineReviewStore:
                         if (not kind or row['kind'] == kind) and (not gate or row['gate'] == gate)]
             return copy.deepcopy(examples[:limit])
 
+    def latest_seq(self):
+        """The newest occurrence's sequence - one cheap max() on the events
+        key - so a caller can tell whether anything was journaled since it
+        last looked (the cupboard's cut memo keys on it)."""
+        with self._lock, closing(self._connect()) as db:
+            return int(db.execute("SELECT COALESCE(max(seq),0) FROM review_events").fetchone()[0])
+
     def find_occurrence(self, gate, source, candidate, context):
         """Backfill only a unique exact parent/turn, never a nearby text match."""
         fingerprint = _fingerprint(gate, source, candidate, context)
