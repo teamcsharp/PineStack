@@ -105265,7 +105265,11 @@ def paper_tint_caps() -> tuple[int, int, float]:
     cap" at six stories, ten paragraphs and ninety seconds."""
     try:
         if crystal_tint_holds():
-            return 999, max(PAPER_TINT_PARAS, 60), max(PAPER_TINT_SECONDS, 600.0)
+            # #1071: an edition has about eighty eligible paragraphs and the
+            # press runs once an hour; twenty minutes and 120 paragraphs
+            # instead of ten and sixty, so the window no longer closes on
+            # the first third of the paper.
+            return 999, max(PAPER_TINT_PARAS, 120), max(PAPER_TINT_SECONDS, 1200.0)
     except Exception:  # noqa: BLE001
         pass
     return PAPER_TINT_STORIES, PAPER_TINT_PARAS, PAPER_TINT_SECONDS
@@ -110784,11 +110788,19 @@ async def paper_print(reason: str = "", kind: str = "extra") -> dict[str, Any]:
                       "for-sale", "wanted", "classifieds", "from-upstairs",
                       "in-the-studio", "testimonials", "orchestrator-report")
             _tint_order = [lead] + [s for s in stories if s["slug"] in _prose]                 + [apology] + [s for s in stories if s["slug"] not in _prose]
-            for story in _tint_order:
-                try:
-                    await paper_tint_story(story, f"the {story['slug']} desk of the gazette")
-                except Exception:  # noqa: BLE001
-                    pass
+            # #1071: two stories at a time - the fast model's tint admission
+            # is two per model, and one story at a time reached eleven of
+            # eighty-four paragraphs inside the window. The prose-first
+            # order is the launch order; the lane admits waiters in it.
+            _press_lane = asyncio.Semaphore(2)
+
+            async def _tint_one(story: dict[str, Any]) -> None:
+                async with _press_lane:
+                    try:
+                        await paper_tint_story(story, f"the {story['slug']} desk of the gazette")
+                    except Exception:  # noqa: BLE001
+                        pass
+            await asyncio.gather(*(_tint_one(story) for story in _tint_order))
             _paper_say(f"crystal: {tinted_by} tinted "
                        f"{int(_PAPER_PRESS.get('tinted_stories') or 0)} stories, "
                        f"{int(_PAPER_PRESS.get('tinted_paras') or 0)} paragraphs "
