@@ -81608,6 +81608,18 @@ def crystal_stanzas(most: int = 2, lines: int = 0) -> list[dict[str, Any]]:
         now = time.time()
         key = "|".join(sorted(str(c.get("name") or "")
                               for c in crystal_active()))
+        # #1081: THE SAME STANZAS FOR A WHILE. These passages are the bulk
+        # of every tint prompt's prefix, and the runner reuses its KV cache
+        # only for an identical prefix. A fresh draw on every ask (the rest
+        # ordering below rotates them on purpose) meant no two asks shared
+        # one, so the deep model re-read the stanzas every time. One draw
+        # is held for CRYSTAL_MATERIAL_WINDOW; the rotation still turns
+        # when the window does.
+        held = _CRYSTAL_STANZA.get("served") or {}
+        if (held.get("key") == key and int(held.get("lines") or 0) == lines
+                and len(held.get("rows") or []) >= most
+                and now - float(held.get("at") or 0) < CRYSTAL_MATERIAL_WINDOW):
+            return [dict(row) for row in held["rows"][:most]]
         if (str(_CRYSTAL_STANZA.get("key") or "") != key
                 or now - float(_CRYSTAL_STANZA.get("at") or 0)
                 > CRYSTAL_STANZA_LIFE):
@@ -81670,9 +81682,20 @@ def crystal_stanzas(most: int = 2, lines: int = 0) -> list[dict[str, Any]]:
                         crystal=pick["crystal"])
             out.append({k: pick[k] for k in
                         ("crystal", "mind", "file", "text")})
+        if out:
+            _CRYSTAL_STANZA["served"] = {"key": key, "lines": lines, "at": now,
+                                         "rows": [dict(row) for row in out]}
     except Exception:  # noqa: BLE001
         pass
     return out
+
+
+def crystal_stanza_status() -> dict[str, Any]:
+    held = _CRYSTAL_STANZA.get("served") or {}
+    return {"window_seconds": CRYSTAL_MATERIAL_WINDOW,
+            "stanzas": len(held.get("rows") or []),
+            "age_seconds": round(time.time() - float(held["at"]), 1) if held.get("at") else None,
+            "files": sorted({str(r.get("file") or "")[-40:] for r in (held.get("rows") or [])})}
 
 
 def crystal_world_prompt() -> str:
@@ -91308,6 +91331,7 @@ async def api_tint_state(
         "strikes_most": TINT_STRIKES_MOST,                     # #1082
         "lanes_per_model": OLLAMA_LANES,                       # #1080
         "material": crystal_material_status(),                 # #1081
+        "stanzas": crystal_stanza_status(),                    # #1081
         # #1018: what every OTHER tint site is now sending - the crystal's
         # own lines, not just its description. Shown here because the
         # operator's complaint was that the tint had a label in it and

@@ -105,11 +105,17 @@ class System2Runtime:
         self._candidates = []
         self._plans = []
         self._refresh_lock = asyncio.Lock()
-        self._prepare_lock = asyncio.Lock()
+        # #1084: one preparation per model lane. With OLLAMA_LANES=2 a
+        # second job on a DIFFERENT road runs beside the first; the brief
+        # and the prep context are task-local (host._ALT_BRIEF/_PREP_CONTEXT
+        # by task id), so two sittings do not read each other's segment.
+        self._lanes = max(1, min(4, int(getattr(host, "OLLAMA_LANES", 1) or 1)))
+        self._prepare_lock = asyncio.Semaphore(self._lanes)
         self._dispatch_lock = asyncio.Lock()
         self._last_refresh = 0.0
         self._errors = []
         self._work = {}
+        self._works = {}
         self._dispatched = {}
         self._record_slots = set()
         self._event_plans = []
@@ -416,6 +422,10 @@ class System2Runtime:
                 "at": time.time(), "refreshed_at": self._last_refresh,
                 "hours": plans,
                 "work": {k: copy.deepcopy(v) for k, v in self._work.items() if k not in ("calls", "template")},
+                # #1084: every sitting in progress, one per free lane.
+                "works": [{k: copy.deepcopy(v) for k, v in w.items() if k not in ("calls", "template")}
+                          for w in self._works.values()],
+                "lanes": self._lanes,
                 "errors": list(self._errors[-10:]),
                 "inventory": {"candidates": len(self._candidates),
                               "ready": sum(x["ready"] for x in self._candidates)},
@@ -474,13 +484,18 @@ class System2Runtime:
         h = self.host
         async with self._prepare_lock:
             await self.refresh()
+            # #1084: a second sitting takes a road nobody is already on.
+            busy = {str(w.get("kind") or "") for w in self._works.values()
+                    if w.get("state") == "preparing"}
+            kinds = [k for k in ("ad", "manager", "caller", "gallery", "news", "banter",
+                                 "track_talk", "recap", "deep") if k not in busy]
+            if not kinds:
+                return
             # #1074: a 900 s lease renewed every 300 s (was 1800/600). The
             # renewer keeps a long sitting alive either way; what the shorter
             # lease bounds is the time a slot stays unclaimable when an
             # attempt dies without completing (see reclaim_jobs for restarts).
-            job = self.store.claim_job("system2-preparer", kinds=["ad", "manager", "caller", "gallery",
-                                                                 "news", "banter", "track_talk", "recap", "deep"],
-                                       lease_seconds=900)
+            job = self.store.claim_job("system2-preparer", kinds=kinds, lease_seconds=900)
             if not job:
                 return
             kind = job["kind"]
@@ -489,6 +504,7 @@ class System2Runtime:
                     "template": copy.deepcopy(job["template"]),
                     "generation_turns": int(self.config["generation_turns"])}
             self._work = work
+            self._works[work["trace_id"]] = work
             token = WORK.set(work)
             changed = False
 
@@ -661,10 +677,19 @@ class System2Runtime:
                 renewer.cancel()
                 work["finished"] = time.time()
                 self.save_trace(work)
+                self._works.pop(work["trace_id"], None)
                 WORK.reset(token)
                 h.alt_brief_clear()
                 h.prep_context_clear()
                 self._last_refresh = 0
+
+    def prepare_spawn(self):
+        """#1084: start one more sitting when a lane is free. The prepare
+        loop used to await one job at a time, so the second lane was left
+        to the legacy keepers; now each sitting is its own task."""
+        if not self.enabled or self._prepare_lock.locked():
+            return None
+        return asyncio.create_task(self.prepare())
 
     def _publish_clock(self, slot):
         """Publish one System2 occurrence without touching legacy persistence."""
@@ -1029,9 +1054,18 @@ def install(app, namespace):
 
         async def prepare_loop():
             await asyncio.sleep(10)
+            sittings = set()
             while True:
                 try:
-                    await runtime().prepare()
+                    # #1084: one sitting per free lane, each its own task;
+                    # a sitting's own exception is recorded by the task.
+                    task = runtime().prepare_spawn()
+                    if task is not None:
+                        sittings.add(task)
+                        task.add_done_callback(sittings.discard)
+                        task.add_done_callback(lambda t: (
+                            runtime().error("worker", t.exception())
+                            if not t.cancelled() and t.exception() else None))
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
