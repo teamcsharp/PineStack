@@ -122250,6 +122250,170 @@ async def api_retire_rules(
     return {"ok": True, "rule": rule, "rules": retire_rules_all()}
 
 
+# --- RapAssembly (2026-09-08): the assembly line as one live state ---------
+# The 🎛 RapAssembly 3js view draws the whole line - ideation, the writing
+# room, the crystal, the tint, the grader, the recording room, the stores,
+# the schedule, the air, the covers, the learning - as stations with
+# packets travelling the hand-offs off the pipeline diary. One endpoint,
+# memoised two seconds, every part guarded: a status view never takes the
+# station down.
+_RAP_ASSEMBLY_MEMO: dict[str, Any] = {"at": 0.0, "value": None}
+RAP_ASSEMBLY_MEMO_SECONDS = 2.0
+
+
+def _rap_part(fn: Any, fallback: Any = None) -> Any:
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001
+        return fallback
+
+
+def rap_assembly_state() -> dict[str, Any]:
+    now = time.time()
+    memo = _RAP_ASSEMBLY_MEMO
+    if memo["value"] is not None and now - float(memo["at"] or 0) < RAP_ASSEMBLY_MEMO_SECONDS:
+        return memo["value"]
+    out: dict[str, Any] = {"at": now, "stages": {}, "events": []}
+    st = out["stages"]
+    # Ideation: the subjects and the material on offer.
+    st["ideation"] = _rap_part(lambda: {
+        "minds": len(speakbox_minds() or []),
+        "plot": (lambda p: {"id": str(p.get("id") or ""), "act": int(plot_act_now(p)[1])} if p else {})(plot_owns_air()),
+        "now": {k: str((_RADIO.get("now") or {}).get(k) or "")[:80] for k in ("artist", "title")},
+        "segment": str(_RADIO.get("segment") or _RADIO.get("segment_kind") or "")[:40],
+    }, {})
+    # The writing room: who is writing and who is waiting on the lane.
+    def _writing() -> dict[str, Any]:
+        w = writing_room_state() or {}
+        pipe = orchestrator_pipeline_state() or {}
+        writers = pipe.get("writers") or {}
+        s2 = {}
+        try:
+            s2 = (_system2().status() or {}) if globals().get("_system2") else {}
+        except Exception:  # noqa: BLE001
+            s2 = {}
+        return {"active": int(w.get("active") or 0), "waiting": int(w.get("waiting") or 0),
+                "jobs": [{"purpose": str(j.get("purpose") or "")[:40], "seconds": round(float(j.get("seconds") or 0))}
+                         for j in (w.get("jobs") or [])[:6]],
+                "lanes": int(OLLAMA_LANES), "deferred": writers.get("deferred_by_category") or {},
+                "system2": {"works": len(s2.get("works") or []), "lanes": s2.get("lanes"),
+                            "engine": str(s2.get("engine") or s2.get("mode") or "")[:24]},
+                "larder_writing": bool(_LARDER_WRITING[0])}
+    st["writing"] = _rap_part(_writing, {})
+    # The crystal: the world and the material drawn from it.
+    def _crystal() -> dict[str, Any]:
+        active = crystal_active() or []
+        try:
+            vocab = len(_crystal_vocab())
+        except Exception:  # noqa: BLE001
+            vocab = 0
+        return {"crystals": [{"name": str(c.get("name") or "")[:40], "strength": int(c.get("strength") or 0),
+                              "minds": len(c.get("minds") or [])} for c in active][:4],
+                "force": round(float(crystal_force()), 2), "coverage": int(crystal_coverage_target()),
+                "hold": bool(crystal_tint_holds()), "grade": "strict" if crystal_grade_strict() else "meaning",
+                "vocabulary": vocab, "stanzas": _rap_part(crystal_stanza_status, {}),
+                "material": _rap_part(crystal_material_status, {}),
+                "model": str(tint_model_for("banter") or "")[:40], "fast": str(tint_fast_model() or "")[:40]}
+    st["crystal"] = _rap_part(_crystal, {})
+    # The tint: the passes, the coverage, the strikes.
+    def _tint() -> dict[str, Any]:
+        pipe = orchestrator_pipeline_state() or {}
+        return {"coverage": tint_coverage() or {}, "fault_memo": _rap_part(tint_fault_memo_status, {}),
+                "strikes_most": int(TINT_STRIKES_MOST), "stages": pipe.get("stages") or {},
+                "tinting": [{"kind": str(e.get("prep_kind") or "banter"), "label": str(e.get("label") or "")[:40]}
+                            for e in list(_LARDER) if e.get("tinting")][:4]}
+    st["tint"] = _rap_part(_tint, {})
+    # The grader: the last verdicts.
+    def _grader() -> dict[str, Any]:
+        ring = list(_TINT_JUDGE_RING)[-40:]
+        hour = [v for v in ring if now - float(v.get("at") or 0) < 3600]
+        return {"passed": sum(1 for v in hour if v.get("ok")), "refused": sum(1 for v in hour if not v.get("ok")),
+                "recent": [{"at": float(v.get("at") or 0), "ok": bool(v.get("ok")), "kind": str(v.get("kind") or ""),
+                            "faults": [str(f)[:60] for f in (v.get("faults") or [])][:2],
+                            "candidate": str(v.get("candidate") or "")[:100]} for v in ring[-10:]]}
+    st["grader"] = _rap_part(_grader, {})
+    # The recording room.
+    def _recording() -> dict[str, Any]:
+        booths = recording_booths() or {}
+        prep = dict(_PREP_NOW) if isinstance(_PREP_NOW, dict) else {}
+        return {"capacity": booths.get("capacity"), "live": booths.get("live"), "preparing": booths.get("preparing"),
+                "engines": booths.get("engines") or {}, "paused": booths.get("paused"),
+                "now": {k: prep.get(k) for k in ("kind", "stage", "made", "lines") if k in prep},
+                "backlog": len(_RENDER_BACKLOG), "hold": len(_BOX_HOLD)}
+    st["recording"] = _rap_part(_recording, {})
+    # The stores.
+    def _stores() -> dict[str, Any]:
+        larder = list(_LARDER)
+        shelf = {str(k): len(v or []) for k, v in _SHELF.items()}
+        return {"larder": len(larder), "larder_ready": sum(1 for e in larder if dialogue_row_ready("banter", e)),
+                "shelf": shelf, "shelf_ready": sum(1 for k, rows in _SHELF.items() for r in (rows or [])
+                                                   if dialogue_row_ready(str(k), r)),
+                "pantry": len(_PANTRY), "pantry_mb": round(pantry_bytes() / 1048576, 1),
+                "gold": len(_gold_rows()), "continuity": len(_CONTINUITY_BANK or {}),
+                "repertoire": _rap_part(repertoire_status, {}), "retire": _rap_part(retire_summary, {})}
+    st["stores"] = _rap_part(_stores, {})
+    # The schedule.
+    def _schedule() -> dict[str, Any]:
+        short = hour_shortfall() or {}
+        return {"entries": short.get("entries"), "ready": len(short.get("ready") or []),
+                "short": [str(s.get("label") or s.get("kind") or "")[:30] for s in (short.get("short") or [])][:6],
+                "named": [{"kind": str(r.get("kind") or ""), "label": str(r.get("label") or "")[:40], "aired": r.get("aired")}
+                          for r in list(_SCHED_LOG)[-4:]]}
+    st["schedule"] = _rap_part(_schedule, {})
+    # The air.
+    def _air() -> dict[str, Any]:
+        live = speaking_now() or {}
+        floor = dict(_FLOOR_OWNER) if _floor_busy() else {}
+        return {"on": bool(_RADIO.get("on")), "paused": bool(radio_paused()), "playing": bool(now_really_playing()),
+                "speaking": int(_SPEAKING[0] or 0),
+                "line": {"who": str(live.get("who") or ""), "text": str(live.get("text") or "")[:120]} if live else {},
+                "floor": {"label": str(floor.get("label") or ""), "held": round(now - float(floor.get("at") or now))} if floor else {},
+                "quiet": round(max(0.0, now - float(_SPOKE_AT[0] or now))),
+                "gap_filler": _rap_part(sfx_gap_status, {})}
+    st["air"] = _rap_part(_air, {})
+    # The learning.
+    def _learning() -> dict[str, Any]:
+        refl = reflection_status() or {}
+        learner = {}
+        try:
+            learner = _PROMPT_LEARNING.settings() if _PROMPT_LEARNING is not None else {}
+        except Exception:  # noqa: BLE001
+            learner = {}
+        try:
+            prefs = len(line_review_preferences()["examples"])
+        except Exception:  # noqa: BLE001
+            prefs = 0
+        return {"reflection": {k: {"version": v.get("current"), "effect": v.get("effect")} for k, v in (refl.get("roads") or {}).items()},
+                "reflecting": refl.get("running") or "", "learner_revision": learner.get("revision"),
+                "learner_mode": learner.get("mode"), "preferences": prefs,
+                "fault_memo_lines": int((_rap_part(tint_fault_memo_status, {}) or {}).get("lines") or 0)}
+    st["learning"] = _rap_part(_learning, {})
+    # The diary: the packets.
+    def _events() -> list[dict[str, Any]]:
+        rows = list(_RADIO.get("pipeline") or [])[-60:]
+        out_rows = []
+        for i, row in enumerate(rows):
+            kind = str(row.get("kind") or "")
+            if kind not in ("crystal", "model", "lookahead", "call", "drop", "air", "speakbox", "action", "repair"):
+                continue
+            out_rows.append({"ts": float(row.get("ts") or row.get("at") or 0), "kind": kind,
+                             "text": str(row.get("text") or "")[:150]})
+        return out_rows[-40:]
+    out["events"] = _rap_part(_events, [])
+    memo.update({"at": now, "value": out})
+    return out
+
+
+@app.get("/api/rapassembly")
+async def api_rap_assembly(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """The assembly line as one live state, for the 🎛 RapAssembly view."""
+    _journal_auth(authorization, key)
+    return rap_assembly_state()
+
+
 @app.get("/api/orchestrator/reflection")
 async def api_reflection(
     authorization: str | None = Header(default=None),
@@ -127062,6 +127226,10 @@ const PINE_3JS = [
    frame: {shade: () => orchLogic && orchLogic.host, card: null,
            close: () => orchLogicClose(),
            onResize: () => { if (orchLogic && orchLogic.resize) orchLogic.resize(); }}},
+  {key: "rapassembly", label: "🎛 RapAssembly",  open: () => rapAssemblyPanel(),
+   frame: {shade: () => rapAssembly && rapAssembly.shade, card: null,
+           close: () => rapAssemblyClose(),
+           onResize: () => { if (rapAssembly && rapAssembly.resize) rapAssembly.resize(); }}},
   {key: "comfydoc", label: "🩺 Comfy Doctor",    open: () => comfyDoctorPanel(),
    frame: {shade: () => comfyDoc, close: () => comfyDoctorClose(),
            width: 820, height: 600}},
@@ -162413,6 +162581,295 @@ function orchLogicClose() {
   try { orchLogic.stop(); } catch (e) {}
   try { orchLogic.host.remove(); } catch (e) {}
   orchLogic = null;
+}
+
+/* --- 🎛 RapAssembly (2026-09-08): the assembly line, live ----------------
+   Ten stations in a line - ideation, the writing room, the crystal, the
+   tint, the grader, the recording room, the stores, the schedule, the air,
+   the learning - with the covers under the air. Each station is a lit block
+   whose glow and height follow its live number; packets travel the
+   hand-offs as diary events land (an ask, a verdict, a render, a line on
+   the air, a cover, a reflection); the rail carries the numbers and the
+   last events. Reads /api/rapassembly every 2.5 s. */
+let rapAssembly = null;
+function rapAssemblyClose() {
+  if (!rapAssembly) return;
+  const r = rapAssembly; rapAssembly = null;
+  try { cancelAnimationFrame(r.frame); } catch (e) {}
+  try { clearInterval(r.timer); } catch (e) {}
+  try { r.renderer.dispose(); } catch (e) {}
+  try { r.shade.remove(); } catch (e) {}
+}
+async function rapAssemblyPanel() {
+  if (rapAssembly) { rapAssemblyClose(); return; }
+  try { orchLogicClose(); } catch (e) {}
+  try { crystalClose(); } catch (e) {}
+  try { djGraphClose(); } catch (e) {}
+  try { mindClose(); } catch (e) {}
+  if (!window.THREE) {
+    const tag = document.createElement("script");
+    tag.src = "/vendor/three.min.js";
+    tag.onload = () => rapAssemblyPanel();
+    document.head.appendChild(tag);
+    return;
+  }
+  let data = null;
+  try { data = await api("/api/rapassembly"); }
+  catch (e) { setStatus("the assembly line did not answer: " + e.message, true); return; }
+
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:340;display:flex;background:rgba(2,4,9,.95)";
+  const stage = el("div", "", "");
+  stage.style.cssText = "flex:1;min-width:0;position:relative";
+  const rail = el("div", "", "");
+  rail.style.cssText = "flex:0 0 380px;overflow:auto;padding:14px 16px;background:#0a0f16;"
+    + "border-left:1px solid #22304a;font-size:12px;line-height:1.5;color:#c9d6e3";
+  shade.appendChild(stage); shade.appendChild(rail);
+  document.body.appendChild(shade);
+  const close = el("button", "", "✕");
+  close.style.cssText = "position:absolute;top:10px;right:10px;z-index:2";
+  close.onclick = rapAssemblyClose;
+  stage.appendChild(close);
+  const title = el("div", "", "🎛 RapAssembly · from a thought to a rhymed line on the air");
+  title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;color:#9de3ef;font-weight:700;font-size:14px;letter-spacing:.04em";
+  stage.appendChild(title);
+  const legend = el("div", "", "packets · blue ask · violet crystal pass · green verdict passed · red refused · amber render · white on the air · gold bar · teal reflection");
+  legend.style.cssText = "position:absolute;bottom:10px;left:16px;z-index:2;color:#7f93a8;font-size:11px";
+  stage.appendChild(legend);
+
+  const canvas = document.createElement("canvas");
+  canvas.style.cssText = "position:absolute;inset:0;width:100%;height:100%";
+  stage.appendChild(canvas);
+  const W = () => stage.clientWidth || 800, H = () => stage.clientHeight || 600;
+  const renderer = new THREE.WebGLRenderer({canvas, antialias: true});
+  renderer.setSize(W(), H(), false);
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x03060b);
+  scene.fog = new THREE.Fog(0x03060b, 60, 140);
+  const camera = new THREE.PerspectiveCamera(42, W() / H(), 1, 400);
+  camera.position.set(0, 9, 62);
+  camera.lookAt(0, 0, 0);
+  scene.add(new THREE.AmbientLight(0xffffff, .55));
+  const sun = new THREE.DirectionalLight(0xffffff, .9);
+  sun.position.set(10, 22, 30);
+  scene.add(sun);
+
+  const label = (text, size, color) => {
+    const c = document.createElement("canvas"), x = c.getContext("2d"), px = 44;
+    x.font = "700 " + px + "px system-ui, sans-serif";
+    c.width = Math.ceil(x.measureText(text).width) + 20; c.height = px + 20;
+    x.font = "700 " + px + "px system-ui, sans-serif";
+    x.fillStyle = color || "rgba(214,232,255,.95)"; x.textBaseline = "middle";
+    x.fillText(text, 10, c.height / 2);
+    const sp = new THREE.Sprite(new THREE.SpriteMaterial({map: new THREE.CanvasTexture(c), transparent: true, depthTest: false}));
+    sp.scale.set((size || 3) * (c.width / c.height), size || 3, 1);
+    sp.userData.redraw = (t2, col2) => {
+      const cc = sp.material.map.image, xx = cc.getContext("2d");
+      xx.clearRect(0, 0, cc.width, cc.height);
+      xx.font = "700 " + px + "px system-ui, sans-serif";
+      const w = Math.ceil(xx.measureText(t2).width) + 20;
+      if (w !== cc.width) { cc.width = w; xx.font = "700 " + px + "px system-ui, sans-serif"; }
+      xx.fillStyle = col2 || color || "rgba(214,232,255,.95)"; xx.textBaseline = "middle";
+      xx.fillText(t2, 10, cc.height / 2);
+      sp.material.map.needsUpdate = true;
+      sp.scale.set((size || 3) * (cc.width / cc.height), size || 3, 1);
+    };
+    return sp;
+  };
+
+  const STATIONS = [
+    {key: "ideation",  face: "IDEATION",   color: 0x4bb3ff},
+    {key: "writing",   face: "WRITING",    color: 0x5fa8ff},
+    {key: "crystal",   face: "CRYSTAL",    color: 0xb48cff},
+    {key: "tint",      face: "TINT",       color: 0xc79bff},
+    {key: "grader",    face: "GRADER",     color: 0x2ee08a},
+    {key: "recording", face: "RECORDING",  color: 0xffb35e},
+    {key: "stores",    face: "STORES",     color: 0xffd479},
+    {key: "schedule",  face: "SCHEDULE",   color: 0x9de3ef},
+    {key: "air",       face: "ON THE AIR", color: 0xffffff},
+    {key: "learning",  face: "LEARNING",   color: 0x3fd0c0},
+  ];
+  const X0 = -40.5, XSTEP = 9;
+  const group = new THREE.Group(); scene.add(group);
+  const blocks = {};
+  STATIONS.forEach((s, i) => {
+    const x = X0 + i * XSTEP;
+    const mat = new THREE.MeshStandardMaterial({color: 0x1a2438, emissive: new THREE.Color(s.color), emissiveIntensity: .12, roughness: .5, metalness: .2});
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(5.4, 2, 5.4), mat);
+    mesh.position.set(x, 0, 0);
+    group.add(mesh);
+    const head = label(s.face, 1.35, "rgba(214,232,255,.95)");
+    head.position.set(x, -3.1, 0); group.add(head);
+    const num = label("·", 1.9, "#" + s.color.toString(16).padStart(6, "0"));
+    num.position.set(x, 3.4, 0); group.add(num);
+    const sub = label(" ", 1.0, "rgba(160,180,200,.9)");
+    sub.position.set(x, -4.6, 0); group.add(sub);
+    blocks[s.key] = {mesh, mat, head, num, sub, x, color: new THREE.Color(s.color), level: 0, target: 0};
+    if (i) {
+      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x - XSTEP + 2.7, 0, 0), new THREE.Vector3(x - 2.7, 0, 0)]);
+      group.add(new THREE.Line(geo, new THREE.LineBasicMaterial({color: 0x22304a, transparent: true, opacity: .8})));
+    }
+  });
+  // The covers sit under the air; the learning feeds back to the tint.
+  const covers = (() => {
+    const mat = new THREE.MeshStandardMaterial({color: 0x1a2438, emissive: new THREE.Color(0xffd479), emissiveIntensity: .12, roughness: .5});
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(4.2, 1.4, 4.2), mat);
+    mesh.position.set(blocks.air.x, -8.5, 0); group.add(mesh);
+    const head = label("COVERS", 1.1); head.position.set(blocks.air.x, -10.8, 0); group.add(head);
+    const num = label("·", 1.4, "#ffd479"); num.position.set(blocks.air.x + 4.6, -8.5, 0); group.add(num);
+    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(blocks.air.x, -7.7, 0), new THREE.Vector3(blocks.air.x, -1.1, 0)]);
+    group.add(new THREE.Line(geo, new THREE.LineBasicMaterial({color: 0x3a3a22, transparent: true, opacity: .8})));
+    return {mesh, mat, num, level: 0, target: 0, color: new THREE.Color(0xffd479)};
+  })();
+  const feedback = new THREE.BufferGeometry().setFromPoints([
+    new THREE.Vector3(blocks.learning.x, 1.2, 0), new THREE.Vector3(blocks.learning.x, 8.5, 0),
+    new THREE.Vector3(blocks.tint.x, 8.5, 0), new THREE.Vector3(blocks.tint.x, 1.2, 0)]);
+  group.add(new THREE.Line(feedback, new THREE.LineBasicMaterial({color: 0x1f4a44, transparent: true, opacity: .8})));
+
+  // Packets: a sphere that travels from one station to the next.
+  const packets = [];
+  const pmat = {};
+  const packetColor = (name, hex) => pmat[name] || (pmat[name] = new THREE.MeshBasicMaterial({color: hex}));
+  const spawn = (from, to, hex, viaTop) => {
+    const a = blocks[from], b = blocks[to];
+    if (!a || !b) return;
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(.42, 12, 10), packetColor(String(hex), hex));
+    mesh.position.set(a.x, 0.6, 1.2);
+    group.add(mesh);
+    packets.push({mesh, ax: a.x, bx: b.x, t: 0, speed: .55 + Math.random() * .35, viaTop, target: b});
+  };
+  const spawnCover = (hex) => {
+    const mesh = new THREE.Mesh(new THREE.SphereGeometry(.42, 12, 10), packetColor(String(hex), hex));
+    mesh.position.set(blocks.air.x, -7.5, 1.2); group.add(mesh);
+    packets.push({mesh, ax: blocks.air.x, bx: blocks.air.x, t: 0, speed: .8, up: true, target: blocks.air});
+  };
+  const route = (ev) => {
+    const k = ev.kind, t = (ev.text || "").toLowerCase();
+    if (k === "crystal") {
+      if (/refus|cut|struck|strike/.test(t)) return spawn("grader", "tint", 0xff6a5e);
+      if (/accept|passed|rhym|bar/.test(t)) return spawn("grader", "recording", 0x2ee08a);
+      return spawn("crystal", "tint", 0xb48cff);
+    }
+    if (k === "model") {
+      if (/reflect/.test(t)) return spawn("learning", "tint", 0x3fd0c0, true);
+      if (/answered/.test(t)) return spawn("writing", "crystal", 0x5fa8ff);
+      return spawn("ideation", "writing", 0x4bb3ff);
+    }
+    if (k === "speakbox") return spawn("ideation", "writing", 0x4bb3ff);
+    if (k === "lookahead") {
+      if (/render|take|booth|record/.test(t)) return spawn("recording", "stores", 0xffb35e);
+      if (/larder|shelf|pantry|restore|kept|gold/.test(t)) return spawn("stores", "schedule", 0xffd479);
+      return spawn("tint", "recording", 0xffb35e);
+    }
+    if (k === "air") {
+      if (/gold bar|punctuated|cover|continuity|sting/.test(t)) return spawnCover(/gold/.test(t) ? 0xffd479 : 0xffb35e);
+      return spawn("schedule", "air", 0xffffff);
+    }
+    if (k === "call") return spawn("ideation", "writing", 0x4bb3ff);
+    if (k === "drop") return spawnCover(0xffb35e);
+    if (k === "repair") return spawn("grader", "tint", 0xff6a5e);
+    if (k === "action") return spawn("learning", "tint", 0x3fd0c0, true);
+  };
+
+  let seenTs = 0;
+  const fmtN = (n) => (n == null ? "·" : String(n));
+  const paint = (d) => {
+    const s = d.stages || {};
+    const id = s.ideation || {}, wr = s.writing || {}, cr = s.crystal || {}, ti = s.tint || {}, gr = s.grader || {};
+    const re = s.recording || {}, so = s.stores || {}, sc = s.schedule || {}, ai = s.air || {}, le = s.learning || {};
+    const set = (key, level, num, sub) => {
+      const b = blocks[key]; if (!b) return;
+      b.target = Math.max(0, Math.min(1, level));
+      b.num.userData.redraw(fmtN(num));
+      b.sub.userData.redraw(sub || " ");
+    };
+    set("ideation", id.plot && id.plot.id ? .6 : .3, id.minds, id.plot && id.plot.id ? "plot act " + id.plot.act : "minds");
+    set("writing", Math.min(1, ((wr.active || 0) + (wr.waiting || 0)) / 4), (wr.active || 0) + "+" + (wr.waiting || 0), "active + waiting · lanes " + (wr.lanes || 1));
+    set("crystal", cr.crystals && cr.crystals.length ? .35 + .65 * (cr.force || 0) : .05, (cr.crystals || []).map((c) => c.name).join(", ") || "off", "strength " + (cr.force || 0) + " · vocab " + (cr.vocabulary || 0));
+    const stg = ti.stages || {};
+    set("tint", Math.min(1, ((stg.awaiting_tint || 0) + (stg.rewriting || 0)) / 8), (stg.awaiting_tint || 0) + "→" + (stg.rewriting || 0), "waiting → rewriting · " + ((ti.coverage || {}).tinted || 0) + " bars this hour");
+    const gp = gr.passed || 0, gf = gr.refused || 0;
+    set("grader", gp + gf ? gp / (gp + gf) : 0, gp + "/" + (gp + gf), "passed of graded (last 40)");
+    set("recording", Math.min(1, ((re.live || 0) + (re.preparing || 0)) / Math.max(1, re.capacity || 2)), (re.live || 0) + "+" + (re.preparing || 0), (re.now && re.now.kind ? re.now.kind + " " + (re.now.made || 0) + "/" + (re.now.lines || "?") : "idle") + " · backlog " + (re.backlog || 0));
+    set("stores", Math.min(1, (so.larder_ready || 0) / 8), (so.larder_ready || 0) + "+" + (so.shelf_ready || 0), "ready rounds · gold " + (so.gold || 0) + " · kept " + (((so.repertoire || {}).larder || {}).kept || 0));
+    set("schedule", sc.entries ? (sc.ready || 0) / sc.entries : 0, (sc.ready || 0) + "/" + (sc.entries || 0), (sc.short || []).length ? "short: " + sc.short.slice(0, 3).join(", ") : "every entry has material");
+    set("air", ai.paused ? .1 : ai.speaking ? 1 : ai.playing ? .6 : .2, ai.paused ? "paused" : ai.speaking ? "speaking" : ai.playing ? "record" : "quiet " + (ai.quiet || 0) + "s", ai.line && ai.line.text ? ai.line.who + ": " + ai.line.text.slice(0, 60) : (ai.floor && ai.floor.label ? "floor: " + ai.floor.label.slice(0, 40) : " "));
+    const refl = le.reflection || {};
+    const roads = Object.keys(refl).filter((k) => refl[k].version);
+    set("learning", roads.length ? .8 : .25, roads.length, "reflections · learner rev " + (le.learner_revision || 0) + " · " + (le.preferences || 0) + " prefs");
+    const gf2 = ai.gap_filler || {};
+    covers.target = gf2.at && (Date.now() / 1000 - gf2.at) < 60 ? 1 : .2;
+    covers.num.userData.redraw(String(gf2.count || 0) + (gf2.went ? " · " + gf2.went : ""));
+    // the rail
+    const rows = [];
+    const h = (t) => rows.push('<div style="color:#9de3ef;font-weight:700;margin:10px 0 3px;letter-spacing:.05em">' + t + "</div>");
+    const p = (t) => rows.push('<div>' + t + "</div>");
+    h("IDEATION"); p((id.minds || 0) + " minds in the speakbox" + (id.plot && id.plot.id ? " · plot " + id.plot.id + " act " + id.plot.act : "") + (id.now && id.now.title ? " · record: " + id.now.artist + " - " + id.now.title : ""));
+    h("WRITING ROOM"); p((wr.active || 0) + " writing, " + (wr.waiting || 0) + " waiting · " + (wr.lanes || 1) + " lane" + (wr.system2 && wr.system2.works != null ? " · System2 works " + wr.system2.works : "") + (wr.larder_writing ? " · the larder is writing" : ""));
+    (wr.jobs || []).forEach((j) => p("· " + j.purpose + " " + j.seconds + "s"));
+    h("CRYSTAL"); p((cr.crystals || []).map((c) => c.name + " (" + c.strength + ", " + c.minds + " minds)").join("; ") || "no crystal on");
+    p("strength " + cr.force + " · coverage " + cr.coverage + "% · hold " + (cr.hold ? "on" : "off") + " · grade " + cr.grade + " · vocabulary " + (cr.vocabulary || 0) + " words");
+    p("model " + (cr.model || "?") + " · fast " + (cr.fast || "?"));
+    h("TINT"); const cov = ti.coverage || {}; p("this hour: " + (cov.offered || 0) + " offered, " + (cov.tinted || 0) + " passed, " + (cov.refused || 0) + " refused, " + (cov.rounds || 0) + " rounds");
+    p("stages: " + Object.keys(stg).map((k) => k + " " + stg[k]).join(" · "));
+    p("fault memo " + ((ti.fault_memo || {}).lines || 0) + " lines · strike cap " + (ti.strikes_most || 12));
+    h("GRADER"); (gr.recent || []).slice(-6).reverse().forEach((v) => p((v.ok ? '<span style="color:#2ee08a">✓</span> ' : '<span style="color:#ff6a5e">✗</span> ') + (v.kind || "") + " · " + (v.candidate || "") + (v.ok ? "" : ' <span style="color:#7f93a8">' + (v.faults || []).join("; ") + "</span>")));
+    h("RECORDING ROOM"); p((re.live || 0) + " live + " + (re.preparing || 0) + " preparing of " + (re.capacity || "?") + " · engines " + JSON.stringify(re.engines || {}) + " · backlog " + (re.backlog || 0) + " · hold " + (re.hold || 0));
+    h("STORES"); p("larder " + (so.larder || 0) + " (" + (so.larder_ready || 0) + " ready) · shelf " + Object.keys(so.shelf || {}).map((k) => k + " " + so.shelf[k]).join(", ") + " (" + (so.shelf_ready || 0) + " ready)");
+    p("pantry " + (so.pantry || 0) + " clips, " + (so.pantry_mb || 0) + " MB · gold " + (so.gold || 0) + " · continuity " + (so.continuity || 0) + " · repertoire kept " + (((so.repertoire || {}).larder || {}).kept || 0) + " · desk " + ((so.retire || {}).pending || 0) + " waiting");
+    h("SCHEDULE"); p((sc.ready || 0) + " of " + (sc.entries || 0) + " entries have material" + ((sc.short || []).length ? " · short: " + sc.short.join(", ") : ""));
+    (sc.named || []).forEach((n) => p("· " + n.kind + " " + (n.label || "") + " " + (n.aired === true ? "aired" : n.aired === false ? "missed" : "")));
+    h("ON THE AIR"); p((ai.paused ? "paused" : ai.on ? "on" : "off") + " · " + (ai.playing ? "a record is playing" : "no record") + " · " + (ai.speaking ? "a voice is out" : "quiet " + (ai.quiet || 0) + "s") + (ai.floor && ai.floor.label ? " · floor: " + ai.floor.label + " (" + ai.floor.held + "s)" : ""));
+    if (ai.line && ai.line.text) p("<i>" + ai.line.who + ": " + ai.line.text + "</i>");
+    p("covers: " + (gf2.count || 0) + " this run" + (gf2.went ? " · last " + gf2.went + " (" + (gf2.why || "") + ")" : ""));
+    h("LEARNING"); p("learner rev " + (le.learner_revision || 0) + " " + (le.learner_mode || "") + " · " + (le.preferences || 0) + " operator wordings · fault memo " + (le.fault_memo_lines || 0));
+    roads.forEach((k) => p("· reflection " + k + " v" + refl[k].version + " — " + (refl[k].effect || "unmeasured")));
+    h("THE DIARY"); (d.events || []).slice(-8).reverse().forEach((ev) => p('<span style="color:#7f93a8">' + ev.kind + "</span> " + ev.text));
+    rail.innerHTML = rows.join("");
+    // packets for new events
+    (d.events || []).forEach((ev) => { if (ev.ts > seenTs) route(ev); });
+    seenTs = Math.max(seenTs, ...(d.events || []).map((e) => e.ts || 0), seenTs);
+  };
+  seenTs = Math.max(0, ...((data.events || []).map((e) => e.ts || 0)), 0);
+  paint(data);
+
+  const t0 = performance.now();
+  let last = t0;
+  const tick = (now) => {
+    if (!rapAssembly) return;
+    const dt = Math.min(.1, (now - last) / 1000); last = now;
+    STATIONS.forEach((s, i) => {
+      const b = blocks[s.key];
+      b.level += (b.target - b.level) * Math.min(1, dt * 3);
+      b.mat.emissiveIntensity = .1 + b.level * .9 + Math.sin(now / 900 + i) * .04 * b.level;
+      b.mesh.scale.y = .6 + b.level * 1.6;
+      b.mesh.position.y = (b.mesh.scale.y * 2 - 2) / 2;
+    });
+    covers.level += (covers.target - covers.level) * Math.min(1, dt * 3);
+    covers.mat.emissiveIntensity = .1 + covers.level * .9;
+    for (let i = packets.length - 1; i >= 0; i--) {
+      const p = packets[i];
+      p.t += dt * p.speed;
+      if (p.up) { p.mesh.position.y = -7.5 + p.t * 8; }
+      else if (p.viaTop) { const u = p.t; p.mesh.position.x = p.ax + (p.bx - p.ax) * u; p.mesh.position.y = 0.6 + Math.sin(u * Math.PI) * 8; }
+      else { p.mesh.position.x = p.ax + (p.bx - p.ax) * p.t; p.mesh.position.y = 0.6 + Math.sin(p.t * Math.PI) * 1.6; }
+      if (p.t >= 1) { group.remove(p.mesh); packets.splice(i, 1); if (p.target) p.target.level = Math.min(1, p.target.level + .15); }
+    }
+    group.rotation.y = Math.sin(now / 9000) * .06;
+    camera.position.x = Math.sin(now / 14000) * 4;
+    camera.lookAt(0, -1, 0);
+    renderer.render(scene, camera);
+    rapAssembly.frame = requestAnimationFrame(tick);
+  };
+  rapAssembly = {shade, renderer, frame: 0, timer: 0,
+    resize: () => { renderer.setSize(W(), H(), false); camera.aspect = W() / H(); camera.updateProjectionMatrix(); }};
+  rapAssembly.frame = requestAnimationFrame(tick);
+  rapAssembly.timer = setInterval(async () => {
+    if (!rapAssembly) return;
+    try { paint(await api("/api/rapassembly")); } catch (e) { /* the next poll tries again */ }
+  }, 2500);
+  window.addEventListener("resize", () => { if (rapAssembly) rapAssembly.resize(); });
 }
 
 async function orchLogicPanel() {
