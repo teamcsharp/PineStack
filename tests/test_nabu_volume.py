@@ -1,5 +1,6 @@
 import asyncio
 import copy
+from pathlib import Path
 import unittest
 from contextlib import ExitStack
 from unittest import mock
@@ -14,7 +15,9 @@ class NabuVolumeTests(unittest.IsolatedAsyncioTestCase):
         self.settings = {"dj": {"box_volume_control": True, "music_box_level": .64},
                          "voice_out": {"media_player": app.NABU_SATELLITE}}
         self.radio = {"voice_device": "nabu", "music_to": "box", "voice_to": "box",
-                      "reply_to": "box", "voice_clips": [], "box_talk": True}
+                      "reply_to": "box", "voice_clips": [], "box_talk": True,
+                      "on": True, "now": {"id": "record", "path": "/fixture/record.wav"},
+                      "started": 100.0}
         replacements = {
             "_RADIO": self.radio, "_MUSIC_LEVEL_SET": {}, "_BOX_HOLD": [],
             "_BOX_DOWN": {"until": 0.0, "fails": 0}, "_ANNOUNCE_LOCK": asyncio.Lock(),
@@ -29,14 +32,24 @@ class NabuVolumeTests(unittest.IsolatedAsyncioTestCase):
             "box_talk_ok": mock.Mock(return_value=True),
             "satellite_ready": mock.AsyncMock(return_value=True),
             "music_url": mock.Mock(return_value="http://station/music/record"),
+            "music_hot_file": mock.Mock(return_value=Path("/fixture/record.wav")),
+            "_nabu_spoken_source": mock.Mock(return_value=Path("/fixture/voice.wav")),
+            "_nabu_audio_url": mock.AsyncMock(return_value="http://station/nabu-audio/fixture.flac?t=fixture"),
+            "_NABU_MUSIC_CONTROL": asyncio.Lock(), "_NABU_MUSIC_EPOCH": [0],
+            "_NABU_MUTE_CONTROL": asyncio.Lock(), "_NABU_MUTE_STATE": {"muted": None},
+            "_NABU_SPEECH_CONTROL": asyncio.Lock(), "_NABU_SPEECH_ACTIVE": {},
+            "_NABU_SPEECH_EPOCH": {"voice": 0, "reply": 0},
             "_routing_save": mock.Mock(), "_operator_routing_stamp": mock.Mock(),
             "dj_state": mock.Mock(return_value={"ok": True}),
+            "nabu_mix_changed": mock.AsyncMock(return_value={"ok": True, "applies": "music only"}),
         }
         for name, value in replacements.items():
-            self.stack.enter_context(mock.patch.object(app, name, value))
+            self.stack.enter_context(mock.patch.object(app, name, value, create=True))
         self.client = mock.AsyncMock()
         self.client.__aenter__.return_value = self.client
         self.client.post.return_value = mock.Mock(status_code=200)
+        self.client.get.return_value = mock.Mock(status_code=200)
+        self.client.get.return_value.json.return_value = {"attributes": {"is_volume_muted": False}}
         self.stack.enter_context(mock.patch.object(app.httpx, "AsyncClient", return_value=self.client))
 
     async def test_music_never_sets_nabu_volume_even_with_legacy_opt_in_or_restart(self):
@@ -61,7 +74,7 @@ class NabuVolumeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(call.args[0].endswith("/media_player/play_media"))
         self.assertTrue(call.kwargs["json"]["announce"])
         self.assertNotIn("volume_level", call.kwargs["json"])
-        self.assertNotIn("extra", call.kwargs["json"])
+        self.assertEqual(call.kwargs["json"]["extra"], {"bypass_proxy": True})
 
     async def test_only_deliberate_volume_control_can_send_one_adjustment(self):
         denied = await app.box_level_send(.22)
@@ -81,13 +94,14 @@ class NabuVolumeTests(unittest.IsolatedAsyncioTestCase):
         self.client.post.assert_not_awaited()
         app.save_settings.assert_not_called()
 
-    async def test_explicit_slider_remains_a_deliberate_one_time_adjustment(self):
+    async def test_music_slider_changes_only_nabu_music_mix_not_the_shared_dial(self):
         request = mock.Mock()
         request.json = mock.AsyncMock(return_value={"music_level": .84})
         request.headers = {}
         await app.dj_output_api(request, "test")
-        self.client.post.assert_awaited_once()
-        self.assertEqual(self.client.post.call_args.kwargs["json"]["volume_level"], .84)
+        self.client.post.assert_not_awaited()
+        app.nabu_mix_changed.assert_awaited_once_with("music")
+        self.assertEqual(app.save_settings.call_args.args[0]["dj"]["nabu_music_level"], .84)
 
     async def test_startup_and_old_checkbox_cannot_reenable_automatic_nabu_control(self):
         app._routing_voice_device_set("nabu")

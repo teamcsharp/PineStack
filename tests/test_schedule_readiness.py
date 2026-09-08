@@ -66,6 +66,15 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(app.news_want_seconds(), 1440.0)
 
     async def test_tint_progress_resumes_at_first_unfinished_turn(self) -> None:
+        # Exercise the individual fallback/resume contract without issuing a
+        # real batch request. Batch deferral has its own integration tests.
+        first_pass = mock.patch.object(app, "_crystal_round_first_pass", return_value=[])
+        repass = mock.patch.object(app, "_crystal_round_repass",
+                                  side_effect=lambda turns, rows, *a, **k: (rows, False))
+        first_pass.start()
+        repass.start()
+        self.addCleanup(first_pass.stop)
+        self.addCleanup(repass.stop)
         first = "The first sufficiently long line carries the actual fact."
         second = "The second sufficiently long line lands the decision."
         script = f"A: {first}\nB: {second}"
@@ -491,7 +500,9 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
             app._HOUR_LEARNING.update(prior_learning)
 
     def test_half_hour_adherence_is_not_the_cumulative_session(self) -> None:
-        now = app.time.time()
+        # Keep the recent receipt inside this half regardless of when the
+        # suite runs; wall time within ten seconds of :00/:30 crossed it.
+        now = app.time.mktime((2026, 9, 7, 12, 15, 0, 0, 0, -1))
         half = app._half_key(now)
         prior_log = list(app._SCHED_LOG)
         prior_halves = list(app._HALVES)
@@ -926,7 +937,7 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
                                    new=mock.AsyncMock(return_value="spot")) as ad:
                 app._RADIO["sched_first"] = True
                 self.assertTrue(await app.schedule_extra_round("ad", None, dj))
-                ad.assert_awaited_once_with(zero_work_only=True)
+                ad.assert_awaited_once_with(zero_work_only=True, on_handoff=mock.ANY)
                 app._RADIO["sched_first"] = False
                 self.assertIsNone(
                     await app.schedule_extra_round("ad", None, dj))

@@ -4,6 +4,7 @@ The deep lane was serial and every refused bar cost a further ask; sixteen
 finished rounds sat behind an alignment refusal; a plain re-aired call passed
 no gate; a stray "resume radio" off the mic unpaused a deliberate pause; and
 no sound effect could play without a line to ride on."""
+import json
 import unittest
 from unittest import mock
 
@@ -15,8 +16,23 @@ PLAIN = "That explains my call, I thought the station should have a report from 
 
 
 def _bar_grader(source, candidate, chunks, answering="", force=0.0, kind="", **kw):
-    ok = " / " in str(candidate) or ", " in str(candidate)
+    ok = " / " in str(candidate) or ", " in str(candidate) or "; " in str(candidate)
     return {"ok": bool(ok), "faults": [] if ok else ["no rhyme evidence - the bar does not land a rhyme"]}
+
+
+def _prompt_turns(prompt):
+    """Read the builder's evidence records, independent of its prose headings."""
+    for line in prompt.splitlines():
+        if not line.startswith("["):
+            continue
+        try:
+            rows = json.loads(line)
+        except ValueError:
+            continue
+        if rows and all(isinstance(row, dict) and "source" in row and "requested" in row
+                        for row in rows):
+            return rows
+    raise AssertionError("The repair prompt lost its original turn/evidence records")
 
 
 class RepassTests(unittest.IsolatedAsyncioTestCase):
@@ -41,9 +57,11 @@ class RepassTests(unittest.IsolatedAsyncioTestCase):
                 turns, first, "ARMED", "DOOM", [], [], "deep", "banter")
         self.assertTrue(batched)
         self.assertEqual(len(asks), 1)                       # nothing left after one pass
-        self.assertIn("2: two plain line here", asks[0])
-        self.assertNotIn("1: one plain line here", asks[0])  # the bar that passed is not re-asked
-        self.assertEqual(rows[1]["text"], "bar two, a shoe")  # cleaned like a single bar
+        evidence = _prompt_turns(asks[0])
+        self.assertEqual([row["id"] for row in evidence if row["requested"]], [2, 3])
+        self.assertEqual(evidence[1]["source"], "two plain line here")
+        self.assertFalse(evidence[0]["requested"])  # retained as context, never re-asked
+        self.assertEqual(rows[1]["text"], "bar two; a shoe")  # explicit bar pause retained
         self.assertTrue(rows[1]["evaluation"]["ok"])
         self.assertTrue(rows[2]["evaluation"]["ok"])
         self.assertEqual(rows[0]["text"], "bar one / done")
@@ -68,7 +86,9 @@ class RepassTests(unittest.IsolatedAsyncioTestCase):
                 turns, first, "ARMED", "DOOM", [], [], "deep", "banter")
         self.assertTrue(batched)
         self.assertEqual(len(asks), 2)
-        self.assertEqual(rows[1]["text"], "two plain line here")
+        self.assertEqual(rows[1]["text"], "")
+        self.assertEqual(rows[1]["rejected_candidate"], "still plain")
+        self.assertEqual(_prompt_turns(asks[1])[1]["rejected_attempt"]["candidate"], "still plain")
         self.assertFalse(rows[1]["evaluation"]["ok"])
 
 
@@ -99,10 +119,15 @@ class RepassFormatTests(unittest.IsolatedAsyncioTestCase):
               mock.patch.object(app, "pipeline_log")):
             rows, batched = await app._crystal_round_repass(
                 turns, first, "ARMED", "DOOM", [], [], "deep", "banter")
-        self.assertIn("KEEP these words of the original: copper, plate", asks[0])
-        self.assertIn("keep every name and number exactly", asks[0])
-        self.assertEqual(rows[1]["text"], "copper plate, running late")
-        self.assertEqual(rows[2]["text"], "bar three, a tree")
+        evidence = _prompt_turns(asks[0])
+        self.assertEqual([row["id"] for row in evidence if row["requested"]], [2, 3])
+        self.assertEqual(evidence[1]["source"], "the copper plate is late")
+        semantic = evidence[1]["rejected_attempt"]["evaluation"]["semantic"]
+        self.assertEqual(semantic["missing"], ["copper", "plate"])
+        self.assertFalse(semantic["entities"])
+        self.assertEqual(evidence[1]["rejected_attempt"]["candidate"], "the plate of copper came late")
+        self.assertEqual(rows[1]["text"], "copper plate; running late")
+        self.assertEqual(rows[2]["text"], "bar three; a tree")
 
     def test_the_evaluator_names_the_dropped_words(self):
         with mock.patch.object(app, "_crystal_vocab", return_value=frozenset()):
@@ -151,9 +176,11 @@ class LaneTests(unittest.IsolatedAsyncioTestCase):
             rows, batched = await app._crystal_round_repass(
                 turns, resumed, "ARMED", "DOOM", [], [], "deep", "banter")
         self.assertEqual(len(asks), 1)
-        self.assertIn("1: one plain line here", asks[0])       # the stale ok was not trusted
-        self.assertNotIn("2: two plain line here", asks[0])    # the stale refusal was re-graded as a bar
-        self.assertEqual(rows[0]["text"], "bar one, done")
+        evidence = _prompt_turns(asks[0])
+        self.assertEqual([row["id"] for row in evidence if row["requested"]], [1])
+        self.assertEqual(evidence[0]["source"], "one plain line here")  # stale ok was not trusted
+        self.assertFalse(evidence[1]["requested"])  # stale refusal was re-graded as a bar
+        self.assertEqual(rows[0]["text"], "bar one; done")
         self.assertTrue(rows[1]["evaluation"]["ok"])
 
 

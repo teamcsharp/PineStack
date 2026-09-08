@@ -25,7 +25,7 @@ class HardBarTests(unittest.TestCase):
 
     def test_a_speaker_label_is_stripped_from_a_bar(self):
         self.assertEqual(app._tint_out_clean("HOST: Gather 'round suckas / got a piece here"),
-                         "Gather 'round suckas, got a piece here")
+                         "Gather 'round suckas; got a piece here")
         self.assertEqual(app._tint_out_clean("Skip: the bins gone"), "the bins gone")
         self.assertEqual(app._tint_out_clean("Warning: the bins gone"), "Warning: the bins gone")
 

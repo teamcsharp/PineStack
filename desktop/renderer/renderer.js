@@ -375,6 +375,7 @@ function setStreamVolume(stream, fraction, persist = true) {
   // on the media player entity before each record; the DJs go to the
   // satellite by announce and are not touched by it.
   if (stream === "music" && persist) sendBoxMusicLevel(v);
+  if ((stream === "voice" || stream === "reply") && persist) sendBoxSpeechLevel(stream, v);
 }
 
 /* Debounced: this rides an oninput, so a drag would otherwise post on
@@ -383,8 +384,14 @@ let boxLevelTimer = null;
 let boxLevelSent = null;
 
 function sendBoxMusicLevel(v) {
+  if (boxLevelTimer) clearTimeout(boxLevelTimer);
+  boxLevelTimer = null;
   const route = streamRoute("music");
-  if (route !== "box" && route !== "both") return;
+  const device = lastRouting?.voice_device;
+  const level = Math.max(0, Math.min(1, Number(v) || 0));
+  // A deliberate zero also clears audio left on Nabu after moving to App.
+  const stopNabu = device === "nabu" && level === 0;
+  if (route !== "box" && route !== "both" && !stopNabu) return;
   /* #1014: the level goes to the device the MOMENT you move this,
    * whether or not the station has standing permission to set that
    * number on its own. #1007 refused the station ASSERTING a level
@@ -392,18 +399,69 @@ function sendBoxMusicLevel(v) {
    * restart, undoing the dial on the device. Moving the control IS
    * asking, and a control that visibly does nothing is worse than
    * either. */
-  if (boxLevelTimer) clearTimeout(boxLevelTimer);
   boxLevelTimer = setTimeout(() => {
     boxLevelTimer = null;
-    const level = Math.max(0, Math.min(1, Number(v) || 0));
-    if (boxLevelSent !== null && Math.abs(boxLevelSent - level) < 0.005) return;
-    boxLevelSent = level;
+    if (lastRouting?.voice_device !== device) return;
+    if (!["box", "both"].includes(streamRoute("music")) && !stopNabu) return;
+    // Another client can change the confirmed mix; a deliberate input always sends.
     api.post("/api/dj/output", {music_level: level})
-      .then(() => noteRouteOk("record level on the "
-        + (lastRouting && lastRouting.voice_device === "nabu"
-           ? "Nabu" : "Pine Box") + " \u2192 " + Math.round(level * 100) + "%"))
-      .catch((err) => noteRouteError(err.message));
-  }, 400);
+      .then((state) => {
+        if (state?.mix_applied?.music?.ok === false) throw new Error(
+          state.mix_applied.music.why || "The music level could not be applied.");
+        boxLevelSent = level;
+        acceptRoutingResponse(state);
+        noteRouteOk("record level on the "
+         + (lastRouting && lastRouting.voice_device === "nabu"
+            ? "Nabu" : "Pine Box") + " \u2192 " + Math.round(level * 100) + "%");
+      })
+      .catch((err) => { boxLevelSent = null; noteRouteError(err.message); });
+  }, stopNabu ? 0 : 400);
+}
+
+const boxSpeechTimers = {};
+const boxSpeechSent = {};
+function sendBoxSpeechLevel(stream, value) {
+  if (boxSpeechTimers[stream]) clearTimeout(boxSpeechTimers[stream]);
+  boxSpeechTimers[stream] = null;
+  const device = lastRouting?.voice_device;
+  const level = Math.max(0, Math.min(1, Number(value) || 0));
+  const stopNabu = device === "nabu" && level === 0;
+  if (!["box", "both"].includes(streamRoute(stream)) && !stopNabu) return;
+  if (stream === "reply" && device !== "nabu") return;
+  boxSpeechTimers[stream] = setTimeout(() => {
+    boxSpeechTimers[stream] = null;
+    if (lastRouting?.voice_device !== device) return;
+    if (!["box", "both"].includes(streamRoute(stream)) && !stopNabu) return;
+    // Debouncing limits drags without suppressing a renewed operator choice.
+    api.post("/api/dj/output", {[stream + "_level"]: level})
+      .then((state) => {
+        if (state?.mix_applied?.[stream]?.ok === false) throw new Error(
+          state.mix_applied[stream].why || "The speech level could not be applied.");
+        boxSpeechSent[stream] = level;
+        acceptRoutingResponse(state);
+        const applied = state?.mix_applied?.[stream];
+        noteRouteOk((stream === "voice" ? "DJ" : "Reply") + " level \u2192 "
+          + Math.round(level * 100) + "% · " + (applied?.applies === "active spoken clip"
+            ? "active clip silenced" : (applied?.why || "applies to the next spoken clip")));
+      })
+      .catch((err) => { delete boxSpeechSent[stream]; noteRouteError(err.message); });
+  }, stopNabu ? 0 : 250);
+}
+
+function paintNabuMix(routing) {
+  if (routing?.voice_device !== "nabu") return;
+  for (const stream of ["music", "voice", "reply"]) {
+    if (!["box", "both"].includes(routing[stream + "_to"])) continue;
+    const field = "nabu_" + stream + "_level";
+    const level = Number(routing[field]);
+    const slider = $(STREAM_VOL_IDS[stream]);
+    if (!slider || document.activeElement === slider || routing[field] === undefined
+        || !Number.isFinite(level) || level < 0 || level > 1) continue;
+    if (Math.abs((streamVolumes[stream] ?? 1) - level) > .001) setStreamVolume(stream, level, false);
+    slider.title = stream === "music"
+      ? "Music on Nabu. Zero gives you DJs only."
+      : "Nabu speech: 50% is the recorded level, 100% boosts it. Zero silences the active app-owned clip; other changes apply next clip.";
+  }
 }
 
 /* #988/#984: the two new cells in the strip are buttons in everything
@@ -518,9 +576,11 @@ async function setStreamRoute(stream, value) {
   const body = {};
   body[stream] = value;
   try {
-    await api.post("/api/dj/output", body);
+    const state = await api.post("/api/dj/output", body);
+    acceptRoutingResponse(state);
     noteRouteOk(stream + " \u2192 "
-      + (value === "here" ? "the app" : value === "box" ? "the Pine Box"
+      + (value === "here" ? "the app" : value === "box"
+         ? (lastRouting?.voice_device === "nabu" ? "Nabu" : "the Pine Box")
          : value === "both" ? "both" : "off"));
     // The preset picker no longer describes what is going on; say so by
     // re-reading the server rather than guessing a label.
@@ -529,6 +589,22 @@ async function setStreamRoute(stream, value) {
   } catch (err) {
     noteRouteError(err.message);
   }
+}
+
+function acceptRoutingResponse(state) {
+  // The route POST already returns the confirmed state. Waiting for the
+  // slower speaker diagnosis kept local audio on its old route meanwhile.
+  const routing = state?.routing || state;
+  if (!routing || !routing.voice_to) return;
+  lastRouting = {...(lastRouting || {})};
+  for (const key of ["on", "music_to", "voice_to", "reply_to", "voice_device", "box_talk",
+    "nabu_music_level", "nabu_voice_level", "nabu_reply_level"]) {
+    if (routing[key] !== undefined) lastRouting[key] = routing[key];
+  }
+  paintStreamRoutes(lastRouting);
+  paintNabuMix(lastRouting);
+  syncBroadcastFromServer({routing: lastRouting});
+  rerouteAudioNow();
 }
 
 function initStreamRoutes() {
@@ -573,8 +649,8 @@ function paintBoxVolumeOwner(routing) {
     box.checked = false;
     if (box.parentElement) box.parentElement.title =
       "Nabu keeps the volume set on its physical dial. The station never "
-      + "reapplies a saved level; moving the Music slider yourself still "
-      + "makes one deliberate adjustment.";
+      + "reapplies a saved level. Music and speech sliders adjust their "
+      + "separate audio streams; the physical dial remains the master.";
     return;
   }
   if (document.activeElement === box) return;   // mid-click; leave it be
@@ -736,6 +812,7 @@ function loadFrames() {
   const routeByView = {
     control: ["controlFrame", "/"],
     radio: ["radioFrame", "/radio"],
+    system2: ["system2Frame", "/system2"],
     guide: ["guideFrame", "/guide/pinebox"]
   };
   const active = routeByView[currentView] || routeByView.control;
@@ -749,6 +826,7 @@ function loadFrames() {
 function activeFrame() {
   if (currentView === "control") return $("controlFrame");
   if (currentView === "radio") return $("radioFrame");
+  if (currentView === "system2") return $("system2Frame");
   if (currentView === "guide") return $("guideFrame");
   return null;
 }
@@ -761,6 +839,110 @@ function wireFrame(frame) {
   frame.addEventListener("did-fail-load", (event) => {
     if (event.errorCode !== -3) setText("agentState", event.errorDescription || "load failed");
   });
+}
+
+for (const [id, muted] of [["nabuMuteBtn", true], ["nabuUnmuteBtn", false]]) {
+  $(id)?.addEventListener("click", async () => {
+    const control = $(id); control.disabled = true;
+    try {
+      const state = await api.post("/api/dj/output", {nabu_mute: muted});
+      const result = state.nabu_mute;
+      if (!result?.ok) throw new Error(result?.why || "Nabu did not accept the mute command.");
+      noteRouteOk(result.confirmed ? (muted ? "Nabu is muted" : "Nabu is unmuted") :
+        (muted ? "Nabu mute requested" : "Nabu unmute requested"));
+    } catch (error) { noteRouteError(error.message); }
+    finally { control.disabled = false; }
+  });
+}
+
+// REJECTION NOTICE CONTROLLER START — one owner outside all guest webviews.
+function createDesktopRejectionNotices({request, openReview, storage = localStorage, key = '', interval = 4000}) {
+  let stopped = false, timer = null, running = null, cursor = 0, initialized = false;
+  let bootstrapHead = 0, count = 0, fresh = 0, newest = null;
+  const storageKey = 'pine-desktop-rejection-cursor:' + key;
+  try { cursor = Number(storage.getItem(storageKey)) || 0; } catch (_) { /* storage unavailable */ }
+  const root = document.createElement('div'); root.dataset.rejectionReview = 'desktop'; root.id = 'desktopRejectionNotices';
+  const style = document.createElement('style'); style.textContent = `
+    #desktopRejectionNotices{position:fixed;right:18px;bottom:16px;z-index:2147483000;color:#eaf0eb;font:13px/1.45 system-ui}
+    #desktopRejectionNotices button{font:inherit;color:inherit;background:#263a2e;border:1px solid #799066;border-radius:7px;padding:8px 12px;cursor:pointer}
+    #desktopRejectionNotices button:focus-visible{outline:3px solid #d1e8a2;outline-offset:3px}
+    #desktopRejectionNotices aside{width:min(360px,calc(100vw - 36px));padding:18px;margin-bottom:10px;background:#18241d;border:1px solid #799066;border-radius:12px;box-shadow:0 8px 40px #0008}
+    #desktopRejectionNotices aside[hidden]{display:none}#desktopRejectionNotices strong{font-size:18px}
+    #desktopRejectionNotices p{color:#c0cec5;margin:9px 0 14px}#desktopRejectionNotices .actions{display:flex;gap:8px;flex-wrap:wrap}
+    #desktopRejectionNotices .error{color:#ffb7a2}#desktopRejectionNotices>.badge{float:right;font-size:12px}
+  `;
+  const card = document.createElement('aside'); card.hidden = true; card.setAttribute('aria-label', 'Rejected lines');
+  const title = document.createElement('strong'); title.setAttribute('role', 'status');
+  const text = document.createElement('p'); text.textContent = 'Discuss this rejection with the orchestrator, inspect the prompts and workflow, or test revised wording.';
+  const actions = document.createElement('div'); actions.className = 'actions';
+  const review = document.createElement('button'); review.type = 'button'; review.textContent = 'Review lines';
+  const later = document.createElement('button'); later.type = 'button'; later.textContent = 'Later';
+  const badge = document.createElement('button'); badge.type = 'button'; badge.className = 'badge'; badge.textContent = 'Rejected lines';
+  function dismiss() { fresh = 0; card.hidden = true; }
+  async function open(id) {
+    try { await openReview(id); dismiss(); }
+    catch (error) { card.hidden = false; title.textContent = 'Review could not open'; text.textContent = error.message; text.classList.add('error'); }
+  }
+  review.onclick = () => open(newest); badge.onclick = () => open(null); later.onclick = dismiss;
+  actions.append(review, later); card.append(title, text, actions); root.append(style, card, badge); document.body.append(root);
+  function paint() {
+    badge.textContent = count ? 'Rejected lines (' + count + ')' : 'Rejected lines';
+    if (fresh) {
+      title.textContent = fresh === 1 ? 'A rejection needs review' : fresh + ' rejection updates';
+      text.textContent = 'Includes unsuccessful rewrites and retries. Discuss the failed checks and prompts with the orchestrator, or test revised wording.';
+      text.classList.remove('error'); card.hidden = false;
+    }
+  }
+  async function poll() {
+    if (stopped || running) return running;
+    running = (async () => {
+      let more = false;
+      try {
+        for (let page = 0; page < 3; page++) {
+          const previous = cursor;
+          const data = await request('/api/orchestrator/rejections?limit=50&status=pending&after=' + encodeURIComponent(cursor));
+          if (stopped) return;
+          const events = (data.events || []).filter(row => Number(row.seq) > previous);
+          const snapshot = !previous && !events.length && !data.events_has_more;
+          const next = snapshot ? Number(data.latest_cursor) || 0 : data.next_after != null ? Number(data.next_after) : events.length ? Math.max(...events.map(row => Number(row.seq) || 0)) : data.events_has_more ? previous : Number(data.latest_cursor) || 0;
+          cursor = Math.max(previous, Number.isFinite(next) ? next : previous);
+          count = Number(data.unreviewed) || 0;
+          if (!initialized && !previous) {
+            fresh = count; bootstrapHead = Number(data.latest_cursor) || 0;
+            const latest = data.items?.[0] || events.at(-1);
+            newest = latest ? {id: latest.id, event_seq: Number(latest.event_seq || latest.seq) || 0} : null;
+          } else {
+            const unseen = events.filter(row => Number(row.seq) > bootstrapHead);
+            fresh += unseen.length;
+            if (unseen.length) newest = {id: unseen.at(-1).id, event_seq: Number(unseen.at(-1).event_seq || unseen.at(-1).seq) || 0};
+          }
+          initialized = true;
+          try { storage.setItem(storageKey, String(cursor)); } catch (_) { /* storage unavailable */ }
+          paint(); more = !!data.events_has_more && cursor > previous;
+          if (!more) break;
+        }
+      } catch (_) { /* retained queue remains available; temporary outage is retried */ }
+      finally { running = null; clearTimeout(timer); if (!stopped) timer = setTimeout(poll, more ? 250 : interval); }
+    })();
+    return running;
+  }
+  timer = setTimeout(poll, 0);
+  return {poll, destroy() { stopped = true; clearTimeout(timer); root.remove(); }};
+}
+// REJECTION NOTICE CONTROLLER END
+
+let desktopRejectionOpenToken = 0;
+async function openDesktopRejectionReview(id) {
+  const token = ++desktopRejectionOpenToken;
+  selectView('radio');
+  const frame = $('radioFrame');
+  if (!frame) throw new Error('The Radio view is unavailable.');
+  const code = '(async()=>{if(!window.PineRejectionReview)return false;await window.PineRejectionReview.open(' + JSON.stringify(id || null) + ');return true;})()';
+  for (let attempt = 0; attempt < 40 && token === desktopRejectionOpenToken; attempt++) {
+    try { if (await frame.executeJavaScript(code, false)) return; } catch (_) { /* module or webview still loading */ }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  if (token === desktopRejectionOpenToken) throw new Error('The Radio review is still loading. Select Review lines to retry.');
 }
 
 function routeKeyFromState(status) {
@@ -1091,6 +1273,7 @@ async function refresh() {
     paintStreamRoutes(status.routing);
     initStreamRoutes();
     initStreamVolumes();
+    paintNabuMix(status.routing);
     initSegCell();                                          // #988
     pineTipsInstall();                                      // #1011
     pineTipSetDelay(Number(status.tip_delay_ms));            // #1012
@@ -1451,17 +1634,17 @@ async function setBroadcastTarget(key) {
   setDesiredBroadcast(key);
   setText("routeNote", `switching to ${route.label}...`);
   try {
-    await api.post("/api/dj/output", route);
+    const state = await api.post("/api/dj/output", route);
+    acceptRoutingResponse(state);
     syncEmbeddedBroadcast(key);
     // #979: "immediately" - the frame's audio gate is derived from the
     // route, so re-apply it now rather than leaving it until the next
     // volume change or reload. Without this, choosing Application was
     // silent until something else happened to nudge it.
     try { applyAppVolume(); } catch (err) { /* the route still changed */ }
-    if (key === "box" || key === "nabu") {
-      await api.post("/api/pinebox/initialize", { speak: key === "box" });
-    }
-    noteRouteOk(`${route.label} active`);
+    // The output endpoint wakes queued dialogue and probes a newly selected
+    // speaker. A selector no longer runs the full initialization procedure.
+    noteRouteOk(`${route.label} selected`);
     await pollDesktopRadio();
     await refresh();
   } catch (err) {
@@ -1602,6 +1785,10 @@ const THREEJS_VIEWS = [
     systems: "three.module.js · /api/wordcloud",
     what: "Every word ever said to the Pine Box",
     desc: "Glowing text sprites on a Fibonacci sphere — size is frequency, colour blends frequency with recency, and the whole thing throbs when something new lands." },
+  { key: "rhymecloud", icon: "🎤", name: "Rhyme Cloud", since: "#1068",
+    systems: "three.module.js · /api/crystals/{id}/rhymes · CMUdict",
+    what: "The crystal as a rhyming dictionary",
+    desc: "Every word the crystal's writer lands a line on, on the word-cloud sphere — size is how often, colour is how many other words share that sound. Per crystal, per mind, per song, or one passage of chunks at a time, with the rhyme families listed beside it." },
   { key: "sphere", icon: "🔮", name: "Rhetoric Sphere", since: "#610",
     systems: "three.module.js · live chat feed",
     what: "What is being said on air right now, in 3D",
@@ -11715,6 +11902,8 @@ if (typeof api.onSupportProgress === "function") {
   initRailResizer();
   initAppVolume();
   await loadConfig();
+  const rejectionNotices = createDesktopRejectionNotices({request: path => api.get(path), openReview: openDesktopRejectionReview, key: config.baseUrl});
+  window.addEventListener('beforeunload', () => rejectionNotices.destroy(), {once: true});
   initSlidesSplit();
   (await api.backendLog()).forEach(appendLog);
   if (config.mode === "launch") {
@@ -11727,7 +11916,8 @@ if (typeof api.onSupportProgress === "function") {
   setInterval(refresh, 6000);
   setInterval(pollDesktopRadio, 1500);
   // #802: the first real click is the autoplay permission — use it.
-  document.addEventListener("click", () => {
+  document.addEventListener("click", (event) => {
+    if (event.target.closest?.('[data-rejection-review]')) return;
     if (!pendingPlayGesture) return;
     const player = $("desktopRadioPlayer");
     if (player && player.paused) {

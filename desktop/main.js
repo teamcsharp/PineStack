@@ -744,7 +744,11 @@ function lcdHandle(name, handler) {
   });
 }
 lcdHandle("state", () => lcdState());
-lcdHandle("configure", (cfg) => lcdAgent.configure(cfg));
+lcdHandle("configure", async (cfg) => {
+  lcdAgent.configure(cfg);
+  await lcdAgent.syncSettings();
+  return lcdState();
+});
 lcdHandle("discover", async () => {
   const [network, usb] = await Promise.allSettled([lcdAgent.discover(), usbDisplays()]);
   const devices = [...(network.value?.devices || []), ...(usb.value || [])];

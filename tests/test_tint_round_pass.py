@@ -55,6 +55,10 @@ class TintRoundPassTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app, "_crystal_vocab", return_value=frozenset()),
             mock.patch.object(app, "_crystal_round_first_pass",
                               new_callable=mock.AsyncMock, return_value=first_pass),
+            # This fixture exercises the per-line fallback after batching.
+            # The real repass is covered separately in test_air_starvation.
+            mock.patch.object(app, "_crystal_round_repass",
+                              new_callable=mock.AsyncMock, return_value=(first_pass, False)),
             mock.patch.object(app, "crystal_turn", side_effect=results),
         )
 
@@ -67,6 +71,9 @@ class TintRoundPassTests(unittest.IsolatedAsyncioTestCase):
                   "text": self.BAD, "selected": True, "evaluation": {}}]
         patches = self.tint_patches(True, first, [self.TINTED])
         with ExitStack() as stack:
+            batch_model = stack.enter_context(mock.patch.object(
+                app, "ask_model", new_callable=mock.AsyncMock,
+                side_effect=AssertionError("Unexpected model call in per-line fallback test")))
             stack.enter_context(mock.patch.object(app, "banter_turns", return_value=units))
             for patch in patches:
                 stack.enter_context(patch)
@@ -77,6 +84,7 @@ class TintRoundPassTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["script"].split("\n"),
                          ["A: " + self.TINTED, "B: " + self.TINTED])
         self.assertEqual(report["coverage"]["attempted"], 2)
+        batch_model.assert_not_awaited()
 
     def test_the_fast_model_raps_every_road_while_the_reserve_is_empty(self):
         with (mock.patch.object(app, "crystal_tint_holds", return_value=True),

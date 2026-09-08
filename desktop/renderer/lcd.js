@@ -6,7 +6,9 @@
   if (!entry || !bridge?.lcdState) return;
   let state = null, panel = null, timer = null, autoRetry = null, looping = false, running = false;
   let station = {}, editions = [], edition = null, latestPaper = '', manualEdition = false;
-  let paperLines = [], paperHeight = 1, scroll = 0, lastFrame = 0, lastPoll = 0, lastEvents = 0;
+  let paperLines = [], paperHeight = 1, scroll = 0, lastFrame = 0, lastPoll = 0;
+  let drawer = false, inputTimer = null, inputPolling = false;
+  let pointerStart = null, suppressClickUntil = 0;
   // The cupboard view (paused): every stored round, the desk and the grader.
   let cupboard = null, cupboardLines = [], cupboardHeight = 1, cupboardScroll = 0, lastCupboard = 0;
   let selected = null, hitRows = [], localMessage = '', messageUntil = 0;
@@ -15,18 +17,32 @@
   let currentId = '', currentBegan = 0;
   const rows = new Map(), liked = new Set();
   const paperImages = new Map();
+  const wrapCache = new Map(), paperTiles = new Map();
+  const controls = window.PineLcdControls;
+  const gallery = window.PineLcdGallery?.create({get: route => bridge.get(route), loadImage: url => bridge.lcdPaperImage(url)});
+  let galleryFrame = null, lastGalleryAckKey = '', lastGalleryAckAt = 0;
   const canvas = document.createElement('canvas');
   canvas.width = 320; canvas.height = 240;
   canvas.style.cssText = 'width:100%;height:auto;max-height:55vh;object-fit:contain;background:#07121b;image-rendering:auto';
-  const ctx = canvas.getContext('2d', {alpha: false});
+  // Every delivered frame is read back for JPEG encoding. Prefer a CPU canvas
+  // to avoid waiting for GPU synchronization on each export in the normal app.
+  const ctx = canvas.getContext('2d', {alpha: false, willReadFrequently: true});
   const node = (tag, text = '') => { const el = document.createElement(tag); el.textContent = text; return el; };
   const note = (text) => { localMessage = String(text); messageUntil = Date.now() + 6500; paintStatus(); };
+  const review = window.PineLcdReview?.create({get: route => bridge.get(route),post: (route,body) => bridge.post(route,body),
+    onChange: () => { lastGalleryAckKey = ''; paintStatus(); },
+    onClose: () => { selected = null; lastFrame = 0; paintStatus(); }});
+  window.PineLcdReviewController = review;
+  window.PineLcdReviewHits = [];
   const fontSize = () => Math.max(12, Math.round(canvas.width / 30));
+  const headerHeight = () => controls.corner(canvas.width, canvas.height).h;
   const plain = (text) => String(text || '').replace(/!\[[^\]]*\]\([^)]*\)/g, '')
     .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1').replace(/[*_`#]/g, '').trim();
   const color = (who) => ({dj: '#9de3ef', cohost: '#ffcf8a', third: '#d4b7ff', caller: '#aceda8', caller2: '#fad0e7'}[who] || '#cbe1ee');
 
   function wrap(text, width, font) {
+    const key = width + '\n' + font + '\n' + text;
+    if (wrapCache.has(key)) return wrapCache.get(key);
     ctx.font = font;
     const out = []; let line = '';
     for (const word of String(text || '').split(/\s+/)) {
@@ -36,22 +52,27 @@
       else line = next;
     }
     if (line) out.push(line);
+    wrapCache.set(key, out);
+    while (wrapCache.size > 800) wrapCache.delete(wrapCache.keys().next().value);
     return out;
   }
 
-  function layoutPaper() {
-    paperLines = []; let y = 0; const size = fontSize();
+  function layoutPaper(reset = false) {
+    paperTiles.clear();
+    paperLines = []; const size = fontSize(); let y = size * 2;
+    const tabloid = state?.config?.paperStyle === 'tabloid';
     const add = (text, title = false) => {
-      const font = (title ? 'bold ' : '') + (title ? size * 1.25 : size) + 'px Georgia';
-      const height = size * (title ? 1.6 : 1.4);
+      const font = (title ? 'bold ' : '') + (title ? size * (tabloid ? 1.6 : 1.25) : size) + (tabloid && title ? 'px sans-serif' : 'px Georgia');
+      const height = size * (title ? (tabloid ? 1.9 : 1.6) : 1.4);
       for (const line of wrap(plain(text), canvas.width - 24, font)) {
         paperLines.push({text: line, y, font, height, title}); y += height;
       }
       y += size;
     };
-    add(edition?.masthead || 'The Pine Box Gazette', true);
+    add(tabloid ? 'THE PINE BOX TABLOID' : edition?.masthead || 'The Pine Box Gazette', true);
     if (!edition) add('The next newspaper will appear here when it is published.');
     for (const article of (edition?.articles || [])) {
+      if (tabloid && (article.meta?.flash || article.meta?.kicker)) add(String(article.meta.flash || article.meta.kicker).toUpperCase(), true);
       add(article.meta?.headline || article.headline || '', true);
       if (article.meta?.deck) add(article.meta.deck);
       for (const url of [...new Set([article.meta?.image, ...(article.meta?.images || []).map((row) => row.url)])].filter(Boolean).slice(0, 2)) {
@@ -62,16 +83,52 @@
         if (paragraph.trim()) add(paragraph);
       }
     }
-    paperHeight = Math.max(canvas.height, y + canvas.height * 0.3); scroll = 0;
+    paperHeight = Math.max(canvas.height, y + canvas.height * 0.3);
+    scroll = reset ? 0 : scroll % paperHeight;
+  }
+
+  // Cache short paper segments. Scrolling copies tiles instead of rasterizing
+  // every visible glyph; eight tiles bound host memory even for long editions.
+  function paperTile(index, overlay) {
+    const tileHeight = 384, key = index + ':' + overlay;
+    if (paperTiles.has(key)) return paperTiles.get(key);
+    const tile = document.createElement('canvas'); tile.width = canvas.width; tile.height = tileHeight;
+    const ink = tile.getContext('2d', {alpha: false, willReadFrequently: true});
+    const tabloid = state?.config?.paperStyle === 'tabloid';
+    ink.fillStyle = overlay ? '#07121b' : '#efe6cf'; ink.fillRect(0, 0, tile.width, tile.height);
+    for (const row of paperLines) {
+      const y = row.y - index * tileHeight;
+      if (y < -row.height || y > tileHeight + row.height) continue;
+      if (row.image) { ink.globalAlpha = overlay ? .35 : 1; ink.drawImage(row.image, 12, y, tile.width - 24, row.height); ink.globalAlpha = 1; }
+      else { ink.font = row.font; ink.fillStyle = overlay ? row.title ? '#82969d' : '#4f6672' : tabloid && row.title ? '#a22222' : '#211e19'; ink.fillText(row.text, 12, y); }
+    }
+    paperTiles.set(key, tile);
+    while (paperTiles.size > 8) paperTiles.delete(paperTiles.keys().next().value);
+    return tile;
+  }
+
+  function drawPaper(dt, width, height, overlay) {
+    if (state?.config?.scrollEnabled !== false && !drawer && !selected) scroll = (scroll + dt * (state?.config?.speed || 12)) % paperHeight;
+    const header = headerHeight();
+    ctx.save(); ctx.beginPath(); ctx.rect(0, header, width, height - header); ctx.clip();
+    for (const base of [header + 6 - scroll, paperHeight + header + 6 - scroll]) {
+      const first = Math.max(0, Math.floor((header - base) / 384));
+      const last = Math.min(Math.ceil(paperHeight / 384) - 1, Math.floor((height - base) / 384));
+      for (let index = first; index <= last; index++) {
+        const tile = paperTile(index, overlay), count = Math.min(384, paperHeight - index * 384);
+        ctx.drawImage(tile, 0, 0, width, count, 0, base + index * 384, width, count);
+      }
+    }
+    ctx.restore();
   }
 
   function layoutCupboard() {
     cupboardLines = []; let y = 0; const size = fontSize();
-    const add = (text, kind = 'body', tone = '') => {
+    const add = (text, kind = 'body', tone = '', reviewRef = null) => {
       const font = (kind === 'title' ? 'bold ' : '') + (kind === 'title' ? size * 1.15 : kind === 'small' ? size * 0.85 : size) + 'px sans-serif';
       const height = size * (kind === 'title' ? 1.55 : kind === 'small' ? 1.2 : 1.35);
       for (const line of wrap(plain(text), canvas.width - 24, font)) {
-        cupboardLines.push({text: line, y, font, height, kind, tone}); y += height;
+        cupboardLines.push({text: line, y, font, height, kind, tone, reviewRef}); y += height;
       }
     };
     const c = cupboard || {};
@@ -93,7 +150,8 @@
     add('THE CUPBOARD · ' + (c.rounds || []).length + ' rounds', 'title', 'head');
     for (const r of (c.rounds || [])) {
       add((r.kind || '').toUpperCase() + (r.label ? ' · ' + r.label : '') + ' · ' + (r.state || '') + ' · audio ' + (r.audio || '') + (r.cut ? ' · cut ' + r.cut : '') + ' · ' + (r.grade || ''), 'body', 'head');
-      for (const l of (r.lines || [])) add((l.rhyme ? '♪ ' : '· ') + (l.who || '') + ': ' + (l.text || ''), 'body', l.rhyme ? 'ok' : 'dim');
+      for (const l of (r.lines || [])) add((l.mark === 'cut' ? 'CUT · ' : l.rhyme ? '♪ ' : '· ') + (l.who || '') + ': ' + (l.text || ''),
+        'body', l.mark === 'cut' ? 'no' : l.rhyme ? 'ok' : 'dim', l.mark === 'cut' ? l : null);
       y += size * 0.4;
     }
     y += size * 0.6;
@@ -104,21 +162,27 @@
   }
 
   function drawCupboard(dt, width, height, size) {
-    cupboardScroll = (cupboardScroll + dt * (state?.config?.speed || 12)) % cupboardHeight;
-    ctx.save(); ctx.beginPath(); ctx.rect(0, 24, width, height - 24); ctx.clip();
-    for (const base of [-cupboardScroll + 30, cupboardHeight - cupboardScroll + 30]) {
+    ctx.fillStyle = '#07121b'; ctx.fillRect(0, 0, width, height);
+    if (state?.config?.scrollEnabled !== false && !drawer) cupboardScroll = (cupboardScroll + dt * (state?.config?.speed || 12)) % cupboardHeight;
+    const header = headerHeight();
+    ctx.save(); ctx.beginPath(); ctx.rect(0, header, width, height - header); ctx.clip();
+    for (const base of [-cupboardScroll + header + size + 4, cupboardHeight - cupboardScroll + header + size + 4]) {
       for (const row of cupboardLines) {
         const y = base + row.y;
         if (y < -row.height || y > height + row.height) continue;
         ctx.font = row.font;
         ctx.fillStyle = row.tone === 'head' ? '#9de3ef' : row.tone === 'ok' ? '#d9f7c8' : row.tone === 'no' ? '#ffb3a7' : '#8ea6b3';
         ctx.fillText(row.text, 12, y);
+        if (row.reviewRef && y > header && y-row.height < height-16) {
+          const hit = {row:row.reviewRef,x1:8,x2:width-8,y1:Math.max(header,y-row.height+2),y2:Math.min(height-16,y+3),review:true};
+          hitRows.push(hit);
+          window.PineLcdReviewHits.push({review_id:row.reviewRef.review_id || '',review_seq:row.reviewRef.review_seq || 0,
+            x1:hit.x1,x2:hit.x2,y1:hit.y1,y2:hit.y2});
+        }
       }
     }
     ctx.restore();
-    ctx.fillStyle = '#102636'; ctx.fillRect(0, 0, width, 24);
-    ctx.font = 'bold ' + Math.max(11, size - 1) + 'px sans-serif'; ctx.fillStyle = '#f4e5ab';
-    ctx.fillText('PAUSED · THE CUPBOARD · behind the scenes', 9, 16, width - 18);
+    drawHeader('PAUSED · THE CUPBOARD', 'Behind the scenes');
     ctx.fillStyle = '#87a2b2'; ctx.font = Math.max(9, size - 2) + 'px sans-serif';
     ctx.fillText(running ? 'Pine Box LCD · unpause to return to the show' : 'Preview · LCD not streaming', 10, height - 5);
   }
@@ -128,7 +192,7 @@
     const request = ++editionRequest;
     const loaded = await bridge.get('/api/paper/' + encodeURIComponent(id));
     if (request !== editionRequest) return;
-    edition = {...loaded, id}; layoutPaper();
+    edition = {...loaded, id}; layoutPaper(true);
     note('Newspaper ' + id);
     if (bridge.lcdPaperImage) {
       const urls = [...new Set((edition.articles || []).flatMap((article) => [article.meta?.image, ...(article.meta?.images || []).map((row) => row.url)]))].filter(Boolean).slice(0, 24);
@@ -157,7 +221,7 @@
     if (djResult.status === 'fulfilled') {
       station = djResult.value || {};
       stationSkew = Number(station.server_ms || Date.now()) - Date.now();
-      if (station.paused && Date.now() - lastCupboard > 2500) {
+      if ((station.paused || state?.config?.mode === 'cupboard') && Date.now() - lastCupboard > 2500) {
         lastCupboard = Date.now();
         bridge.get('/api/cupboard').then((got) => { cupboard = got || null; layoutCupboard(); }).catch(() => {});
       }
@@ -165,7 +229,7 @@
     if (deviceResult.status === 'fulfilled') {
       state = deviceResult.value; running = state.running;
       if (state.device && (canvas.width !== state.device.width || canvas.height !== state.device.height)) {
-        canvas.width = state.device.width; canvas.height = state.device.height; layoutPaper();
+        canvas.width = state.device.width; canvas.height = state.device.height; layoutPaper(); layoutCupboard();
       }
     }
     if (shelfResult.status === 'fulfilled') {
@@ -178,7 +242,7 @@
       }
     }
     if (djResult.status === 'rejected') note('Station connection unavailable: ' + djResult.reason.message);
-    paintStatus();
+    syncOptions(); paintStatus();
   }
 
   function paintStatus() {
@@ -187,7 +251,8 @@
     const dev = state?.device;
     link.textContent = localMessage && Date.now() < messageUntil ? localMessage
       : state?.error ? state.error
-      : running && state?.device?.displayMode === 'avatar' ? 'Quanta avatar slideshow · tap the top-left corner for Pine Box'
+      : running && state?.device?.screensaver ? 'Avatar screensaver · tap anywhere on the LCD to wake'
+      : running && state?.device?.displayMode === 'avatar' ? 'Quanta avatar slideshow · tap top-left or swipe down for Pine Box'
       : running && state?.lastAck ? 'Streaming · ' + state.frames + ' drawn frames · last acknowledgment '
         + Math.max(0, Math.round((Date.now() - state.lastAck) / 1000)) + 's ago'
       : state?.connected ? 'Connected · ready to stream' : 'Disconnected · enter a display address or discover Quanta';
@@ -197,8 +262,14 @@
     log.textContent = (state?.log || []).slice(-18).map((row) => new Date(row.at).toLocaleTimeString()
       + ' ' + row.kind + ': ' + row.detail).join('\n');
     const detail = panel.querySelector('[data-lcd-detail]');
-    detail.textContent = selected ? (selected.name || selected.who || 'Booth') + ': ' + selected.text
+    detail.textContent = state?.config?.mode === 'gallery' ? 'Pine Box gallery pictures only, with shuffled images and randomized transitions. Tap the right side for the next image, or swipe down to change the view.'
+      : selected ? (selected.name || selected.who || 'Booth') + ': ' + selected.text
       : 'Tap a visible dialogue bubble to select it. Tap the left/right screen edges for older/newer issues.';
+    for (const button of panel.querySelectorAll('[data-lcd-paper-action]')) button.hidden = state?.config?.mode === 'gallery';
+    const hint = panel.querySelector('[data-lcd-hint]');
+    if (hint) hint.textContent = state?.config?.mode === 'gallery'
+      ? 'Swipe down for Newspaper only or Pine gallery. AV / PB switches to Quanta avatars and back. Close this panel to keep the slideshow running.'
+      : 'Tap the AV / PB button in the top-left header to switch between Quanta avatars and Pine Box. Swipe down for Quick settings. Tap the middle left/right edges for issues and dialogue bubbles for actions. Close this panel to keep streaming.';
     panel.querySelector('[data-lcd-stop]').disabled = !running;
     const fw = state?.firmware;
     panel.querySelector('[data-lcd-firmware-note]').textContent = (fw?.expectedVersion
@@ -221,26 +292,59 @@
 
   function draw(timestamp) {
     const width = canvas.width, height = canvas.height, size = fontSize();
-    const dt = lastFrame ? Math.min(0.6, (timestamp - lastFrame) / 1000) : 0; lastFrame = timestamp;
-    ctx.fillStyle = '#07121b'; ctx.fillRect(0, 0, width, height);
+    hitRows = [];
+    window.PineLcdReviewHits = [];
+    galleryFrame = null;
+    const reviewState = review?.snapshot();
+    canvas.dataset.lcdReviewOpen = String(!!reviewState?.open);
+    canvas.dataset.lcdReviewId = reviewState?.selectedId || '';
+    canvas.dataset.lcdReviewPage = String(reviewState?.page || 0);
+    canvas.dataset.lcdView = controls.view(state?.config);
+    const dt = lastFrame ? Math.min(0.15, Math.max(0, (timestamp - lastFrame) / 1000)) : 0; lastFrame = timestamp;
+    if (reviewState?.open) { review.draw(ctx,width,height); drawModeButton(); return; }
+    const overlay = state?.config?.chatOverlay !== false || !!selected || state?.config?.mode === 'dialogue';
+    ctx.fillStyle = overlay ? '#07121b' : '#efe6cf'; ctx.fillRect(0, 0, width, height);
+    if (state?.device?.displayMode === 'avatar' && !drawer) {
+      ctx.fillStyle = '#07121b'; ctx.fillRect(0, 0, width, height);
+      ctx.fillStyle = '#a1dec0'; ctx.font = 'bold ' + size * 1.5 + 'px sans-serif';
+      ctx.fillText(state.device.screensaver ? 'Avatar screensaver' : 'Quanta avatars', 18, height * .4, width - 36);
+      ctx.font = size + 'px sans-serif'; ctx.fillStyle = '#d7e3e3';
+      ctx.fillText('Slideshow playing on the LCD', 18, height * .55, width - 36);
+      ctx.fillText(state.device.screensaver ? 'Tap anywhere to wake' : 'Top-left tap or swipe down for Pine Box', 18, height * .7, width - 36);
+      drawHeader(state.device.screensaver ? 'Avatar screensaver' : 'Quanta avatars', state.device.screensaver ? 'Tap anywhere to wake' : 'Tap PB to return to Pine Box');
+      drawModeButton();
+      return;
+    }
+    if (state?.config?.mode === 'gallery') {
+      ctx.fillStyle = '#000'; ctx.fillRect(0, 0, width, height);
+      galleryFrame = gallery?.draw(ctx, width, height, timestamp, {
+        intervalSeconds: Number(state.config.galleryIntervalSeconds) || 8, paused: drawer,
+      }) || {state: 'error', paintKey: 'unavailable'};
+      canvas.dataset.lcdGalleryState = galleryFrame.state;
+      canvas.dataset.lcdGalleryImage = galleryFrame.imageId || '';
+      canvas.dataset.lcdGalleryTransition = galleryFrame.transition || '';
+      if (galleryFrame.state !== 'ready') {
+        const message = galleryFrame.state === 'empty' ? 'No gallery pictures yet'
+          : galleryFrame.state === 'error' ? 'Gallery unavailable · retrying' : 'Loading Pine Box gallery…';
+        ctx.fillStyle = '#d7e3e3'; ctx.font = size + 'px sans-serif'; ctx.textAlign = 'center';
+        ctx.fillText(message, width / 2, height * .6, width - 24); ctx.textAlign = 'left';
+      }
+      if (drawer) drawDrawer();
+      drawModeButton();
+      return;
+    }
     // Paused: the cupboard takes the screen - every stored line, what is
     // being tinted and generated, and the grader's verdicts.
-    if (station?.paused && cupboardLines.length && !selected) { drawCupboard(dt, width, height, size); return; }
+    if ((state?.config?.mode === 'cupboard' || station?.paused && state?.config?.pausedCupboard !== false) && cupboardLines.length && !selected) {
+      drawCupboard(dt, width, height, size); if (drawer) drawDrawer(); drawModeButton(); return;
+    }
     const mode = state?.config?.mode || 'paper';
     if (mode === 'paper') {
-      scroll = (scroll + dt * (state?.config?.speed || 12)) % paperHeight;
-      ctx.save(); ctx.beginPath(); ctx.rect(0, 24, width, height - 24); ctx.clip();
-      for (const base of [-scroll + 30, paperHeight - scroll + 30]) {
-        for (const row of paperLines) {
-          const y = base + row.y;
-          if (y < -row.height || y > height + row.height) continue;
-          if (row.image) { ctx.globalAlpha = 0.35; ctx.drawImage(row.image, 12, y, width - 24, row.height); ctx.globalAlpha = 1; continue; }
-          ctx.font = row.font; ctx.fillStyle = row.title ? '#82969d' : '#4f6672'; ctx.fillText(row.text, 12, y);
-        }
-      }
-      ctx.restore();
+      drawPaper(dt, width, height, overlay);
     }
-    const top = mode === 'paper' ? Math.round(height * 0.36) : 28;
+    const top = mode === 'paper' ? Math.max(headerHeight() + 6, Math.round(height * 0.36)) : headerHeight() + 4;
+    hitRows = [];
+    if (overlay) {
     ctx.fillStyle = 'rgba(4,12,20,.89)'; ctx.fillRect(5, top, width - 10, height - top);
     hitRows = [];
     for (const row of rows.values()) if (row.lcdStatus === 'Playing') row.lcdStatus = 'Recently playing';
@@ -282,27 +386,141 @@
       if (y > top && start < top + available) hitRows.push({row: block.row, y1: Math.max(top, start), y2: Math.min(top + available, y)});
     }
     ctx.restore();
-    ctx.fillStyle = '#102636'; ctx.fillRect(0, 0, width, 24);
-    ctx.font = 'bold ' + Math.max(11, size - 1) + 'px sans-serif'; ctx.fillStyle = '#9de3ef';
-    const title = selected ? '× Close dialogue' : mode === 'paper' ? '‹ Gazette · ' + (edition?.id || 'waiting') + ' ›' : 'PINE BOX · LIVE BOOTH';
-    ctx.fillText(title, 9, 16, width - 18);
+    }
+    const title = selected ? '× Close dialogue' : mode === 'paper' ? state?.config?.paperStyle === 'tabloid' ? 'Tabloid' : 'Gazette' : 'PINE BOX · LIVE BOOTH';
+    drawHeader(title, selected ? 'Tap here to close' : mode === 'paper' ? '‹ ' + (edition?.id || 'Waiting for the paper') + ' ›' : 'Swipe down for controls');
     if (selected) {
       ctx.fillStyle = '#1d3a48'; ctx.fillRect(0, height - 30, width, 30);
       ctx.fillStyle = '#f4e5ab'; ctx.font = 'bold ' + size + 'px sans-serif';
       ctx.fillText(selected.lcdAudio ? '★ Favorite' : selected.lcdStatus, width * 0.21, height - 11, width * 0.55);
       if (selected.lcdAudio) ctx.fillText('↓ Download', width * 0.53, height - 11, width * 0.27);
     } else {
-      ctx.fillStyle = '#87a2b2'; ctx.font = Math.max(9, size - 2) + 'px sans-serif';
-      ctx.fillText(running ? 'Pine Box LCD · tap a line' : 'Preview · LCD not streaming', 10, height - 5);
+      ctx.fillStyle = overlay ? '#07121b' : '#efe6cf'; ctx.fillRect(0, height - 16, width, 16);
+      ctx.fillStyle = overlay ? '#87a2b2' : '#4f493e'; ctx.font = Math.max(9, size - 2) + 'px sans-serif';
+      ctx.fillText(running ? 'Swipe down for controls' : 'Preview · swipe down for controls', 10, height - 5);
     }
     if (localMessage && Date.now() < messageUntil) {
       ctx.fillStyle = '#244039'; ctx.fillRect(4, height - 49, width - 8, 18);
       ctx.fillStyle = '#edfff2'; ctx.font = Math.max(10, size - 2) + 'px sans-serif';
       ctx.fillText(localMessage, 10, height - 36, width - 20);
     }
+    if (drawer) drawDrawer();
+    drawModeButton();
+  }
+
+  function drawHeader(title, subtitle) {
+    const region = controls.corner(canvas.width, canvas.height), x = region.w + 10, available = canvas.width - x - 8;
+    ctx.fillStyle = '#102636'; ctx.fillRect(0, 0, canvas.width, region.h);
+    ctx.fillStyle = '#ecf7ef'; ctx.font = 'bold ' + fontSize() + 'px sans-serif';
+    ctx.fillText(title, x, region.h * .43, available);
+    ctx.fillStyle = '#9bb6b7'; ctx.font = Math.max(10, fontSize() - 1) + 'px sans-serif';
+    ctx.fillText(subtitle, x, region.h * .76, available);
+  }
+
+  // The mode switch owns this space in every view, including the quick drawer.
+  // Native firmware reserves the same rectangle against incoming image writes.
+  function drawModeButton() {
+    const region = controls.corner(canvas.width, canvas.height), b = region.badge;
+    const label = state?.device?.displayMode === 'avatar' ? 'PB' : 'AV';
+    ctx.save();
+    ctx.fillStyle = '#102636'; ctx.fillRect(0, 0, region.w, region.h);
+    ctx.fillStyle = '#102632'; ctx.strokeStyle = '#a1dec0'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.roundRect(b.x, b.y, b.w, b.h, 6); ctx.fill(); ctx.stroke();
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillStyle = '#edfff2'; ctx.font = 'bold ' + Math.min(24, Math.max(16, b.w * .38)) + 'px monospace';
+    ctx.fillText(label, b.x + b.w / 2, b.y + b.h * .39, b.w - 6);
+    ctx.fillStyle = '#a1dec0'; ctx.font = '9px monospace';
+    ctx.fillText('SWAP', b.x + b.w / 2, b.y + b.h * .78, b.w - 6);
+    ctx.restore();
+    canvas.dataset.lcdSwap = label;
+  }
+
+  function icon(kind, x, y, active) {
+    ctx.save(); ctx.translate(x, y); ctx.strokeStyle = active ? '#153b32' : '#b9d2cf';
+    ctx.fillStyle = ctx.strokeStyle; ctx.lineWidth = 1.8; ctx.lineCap = 'round'; ctx.lineJoin = 'round';
+    ctx.beginPath();
+    if (kind === 'chat') { ctx.roundRect(1, 2, 21, 15, 4); ctx.moveTo(6, 17); ctx.lineTo(6, 22); ctx.lineTo(12, 17); }
+    else if (kind === 'paper' || kind === 'tabloid') {
+      ctx.roundRect(2, 1, 19, 22, 2); ctx.moveTo(6, 6); ctx.lineTo(17, 6);
+      ctx.moveTo(6, 11); ctx.lineTo(11, 11); ctx.moveTo(6, 15); ctx.lineTo(11, 15);
+      ctx.moveTo(6, 19); ctx.lineTo(17, 19); ctx.rect(14, 10, 3, 5);
+    } else if (kind === 'avatar') { ctx.arc(12, 7, 5, 0, Math.PI * 2); ctx.moveTo(2, 23); ctx.bezierCurveTo(2, 11, 22, 11, 22, 23); }
+    else if (kind === 'gallery') { ctx.roundRect(1, 2, 22, 20, 3); ctx.moveTo(3, 18); ctx.lineTo(9, 11); ctx.lineTo(14, 16); ctx.lineTo(18, 12); ctx.lineTo(22, 17); ctx.moveTo(18, 7); ctx.arc(16, 7, 2, 0, Math.PI * 2); }
+    else if (kind === 'moon') { ctx.arc(12, 12, 10, -.6, 4.5); ctx.bezierCurveTo(3, 15, 14, 23, 20, 6); }
+    else { ctx.moveTo(7, 3); ctx.lineTo(7, 21); ctx.moveTo(3, 7); ctx.lineTo(7, 3); ctx.lineTo(11, 7); ctx.moveTo(17, 3); ctx.lineTo(17, 21); ctx.lineTo(13, 17); ctx.moveTo(17, 21); ctx.lineTo(21, 17); }
+    ctx.stroke(); ctx.restore();
+  }
+
+  function drawDrawer() {
+    const width = canvas.width, height = canvas.height, config = state?.config || {};
+    ctx.save(); ctx.scale(width / 320, height / 240);
+    ctx.fillStyle = '#101d22'; ctx.fillRect(0, 0, 320, 240);
+    ctx.fillStyle = '#536e73'; ctx.beginPath(); ctx.roundRect(137, 6, 46, 4, 2); ctx.fill();
+    ctx.fillStyle = '#ecf7ef'; ctx.font = 'bold 18px sans-serif'; ctx.fillText('Quick settings', 76, 30, 206);
+    ctx.fillStyle = '#9bb6b7'; ctx.font = '10px sans-serif'; ctx.fillText('Swipe up to close', 76, 49);
+    ctx.font = '22px sans-serif'; ctx.fillText('×', 289, 35);
+    for (const tile of controls.tiles(config)) {
+      ctx.fillStyle = tile.active ? '#a1dec0' : '#293c44'; ctx.beginPath(); ctx.roundRect(tile.x, tile.y, tile.w, tile.h, 14); ctx.fill();
+      icon(tile.icon, tile.x + 9, tile.y + 4, tile.active);
+      ctx.fillStyle = tile.active ? '#102e29' : '#e3eded'; ctx.font = 'bold 12px sans-serif';
+      ctx.fillText(tile.label, tile.x + 39, tile.y + 21, tile.w - 44);
+    }
+    ctx.fillStyle = '#293c44'; ctx.beginPath(); ctx.roundRect(8, 210, 197, 26, 12); ctx.fill();
+    ctx.fillStyle = '#cee7dd'; ctx.font = '11px sans-serif';
+    ctx.fillText('Avatar timer: ' + controls.timerLabel(Number(config.screensaverSeconds) || 300) + '  ›', 20, 228);
+    ctx.fillText('Done  ↑', 248, 228);
+    ctx.restore();
+    canvas.dataset.lcdDrawer = 'open';
+  }
+
+  async function configure(change) {
+    review?.close();
+    state = await bridge.lcdConfigure(change);
+    if ('paperStyle' in change || 'mode' in change) layoutPaper();
+    lastGalleryAckKey = ''; lastGalleryAckAt = 0;
+    if (change.mode && state?.device?.displayMode === 'avatar' && state?.connected) state = await bridge.lcdDisplayMode('pine');
+    selected = null; syncOptions(); paintStatus();
+  }
+
+  function syncOptions() {
+    if (!panel) return;
+    const config = state?.config || {};
+    for (const input of panel.querySelectorAll('[data-lcd-setting]')) {
+      const key = input.dataset.lcdSetting;
+      if (document.activeElement === input) continue;
+      if (input.type === 'checkbox') input.checked = key === 'chatOverlay' && config.mode === 'gallery' ? false : config[key] !== false && (key !== 'screensaverEnabled' || !!config[key]);
+      else if (key === 'view') input.value = controls.view(config);
+      else {
+        const value = String(config[key] ?? (key === 'galleryIntervalSeconds' ? 8 : 300));
+        if (key === 'galleryIntervalSeconds' && !Array.from(input.options).some(option => option.value === value)) {
+          const option = node('option', 'Each picture: ' + value + ' sec'); option.value = value; input.appendChild(option);
+        }
+        input.value = value;
+      }
+    }
+  }
+
+  async function quickAction(id) {
+    if (id === 'close') { drawer = false; canvas.dataset.lcdDrawer = 'closed'; return; }
+    if (id === 'avatar') {
+      state = await bridge.lcdDisplayMode('avatar'); drawer = false; selected = null;
+      note('Quanta avatars · tap top-left or swipe down for Pine Box'); return;
+    }
+    const patch = controls.change(id, state?.config);
+    if (patch) await configure(patch);
+  }
+
+  async function swipe(direction, physical = false) {
+    if (review?.snapshot().open) { review.swipe(direction); return; }
+    if (direction === 'down') {
+      if (!physical && state?.device?.displayMode === 'avatar') state = await bridge.lcdDisplayMode('pine');
+      drawer = true; selected = null;
+    }
+    else if (direction === 'up') { drawer = false; canvas.dataset.lcdDrawer = 'closed'; }
   }
 
   async function favorite() {
+    if (review?.snapshot().open) return;
     if (!selected) { note('Select a dialogue bubble first.'); return; }
     if (!selected.lcdAudio) { note('This booth entry has no aired audio yet.'); return; }
     if (liked.has(selected.id)) { note('This dialogue is already favorited.'); return; }
@@ -311,20 +529,43 @@
     liked.add(row.id); note('Dialogue saved to the station’s favorites.');
   }
   async function download() {
+    if (review?.snapshot().open) return;
     if (!selected) { note('Select a dialogue bubble first.'); return; }
     if (!selected.lcdAudio) { note('This booth entry has no aired audio yet.'); return; }
     const result = await bridge.lcdDownload(String(selected.id), Number(selected.air_at || selected.ts || 0));
     note(result.ok ? (result.exact ? 'Sample saved' : 'Surrounding audio saved') + (result.directory ? ' · ' + result.directory : '') : result.why);
   }
   async function touch(x, y, physical = false) {
+    if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return;
+    if (state?.device?.screensaver) {
+      review?.close();
+      if (!physical) state = await bridge.lcdControl('screensaver', false);
+      drawer = false; selected = null; lastFrame = 0; note('Pine Box resumed'); return;
+    }
+    // Firmware consumes physical corner contacts. The preview sends exactly one
+    // mode command, ahead of drawer/content handling, even during a slow action.
+    if (controls.cornerHit(x, y, canvas.width, canvas.height)) {
+      review?.close();
+      if (!physical) state = await bridge.lcdDisplayMode(state?.device?.displayMode === 'avatar' ? 'pine' : 'avatar');
+      drawer = false; canvas.dataset.lcdDrawer = 'closed'; selected = null; lastFrame = 0; paintStatus(); return;
+    }
+    if (review?.snapshot().open) { review.tap(x,y,canvas.width,canvas.height); return; }
     if (actionBusy) return;
-    if (state?.device?.hostTouch && x < canvas.width * 0.2 && y < canvas.height * 0.25) {
-      if (!physical) state = await bridge.lcdDisplayMode(state.device.displayMode === 'avatar' ? 'pine' : 'avatar');
-      selected = null; paintStatus(); return;
+    if (drawer) {
+      actionBusy = true;
+      try { await quickAction(controls.hit(x, y, canvas.width, canvas.height, state?.config)); }
+      finally { actionBusy = false; }
+      return;
     }
     if (physical && state?.device?.displayMode === 'avatar') return;
+    if (state?.config?.mode === 'gallery') {
+      if (x > canvas.width * .65 && y > headerHeight()) gallery?.next();
+      return;
+    }
+    const cut = hitRows.find(row => row.review && x >= row.x1 && x <= row.x2 && y >= row.y1 && y <= row.y2);
+    if (cut && review) { selected = null; drawer = false; void review.open(cut.row); return; }
     if (selected) {
-      if (y < 28) { selected = null; paintStatus(); return; }
+      if (y < headerHeight()) { selected = null; paintStatus(); return; }
       if (y > canvas.height - 32 && x > canvas.width * 0.2 && x < canvas.width * 0.8) {
         actionBusy = true;
         try { await (x < canvas.width / 2 ? favorite() : download()); }
@@ -340,37 +581,85 @@
     if (hit) { selected = hit.row; paintStatus(); }
   }
   canvas.onclick = (event) => {
+    if (Date.now() < suppressClickUntil) return;
     const box = canvas.getBoundingClientRect();
     touch((event.clientX - box.left) / box.width * canvas.width,
       (event.clientY - box.top) / box.height * canvas.height).catch((error) => note(error.message));
   };
+  const point = event => { const box = canvas.getBoundingClientRect(); return {x: (event.clientX - box.left) / box.width * canvas.width, y: (event.clientY - box.top) / box.height * canvas.height}; };
+  canvas.style.touchAction = 'none';
+  canvas.onpointerdown = event => { pointerStart = point(event); try { canvas.setPointerCapture?.(event.pointerId); } catch {} };
+  canvas.onpointercancel = () => { pointerStart = null; };
+  canvas.onpointerup = event => {
+    if (!pointerStart) return;
+    const end = point(event), kind = controls.gesture(pointerStart, end, canvas.width, canvas.height);
+    pointerStart = null; suppressClickUntil = Date.now() + 500;
+    if (state?.device?.screensaver || kind === 'tap') touch(end.x, end.y).catch(error => note(error.message));
+    else if (kind) swipe(kind).catch(error => note(error.message));
+  };
+  canvas.onwheel = event => {
+    if (review?.snapshot().open) { event.preventDefault(); review.scroll(event.deltaY > 0 ? 1 : -1); }
+  };
+
+  // Input has its own bounded poll. A slow image ACK never holds a gesture
+  // behind the frame loop, and there is never more than one input request.
+  async function pollInput() {
+    inputTimer = null;
+    if (!running || inputPolling) return;
+    inputPolling = true;
+    try {
+      const result = await bridge.lcdEvents();
+      for (const event of result.events || []) {
+        if (event.kind === 'touch') await touch(event.x, event.y, true);
+        else if (event.kind === 'swipe') await swipe(event.direction, true);
+        else if (event.kind === 'wake') { if (state?.device) { state.device.displayMode = 'pine'; state.device.screensaver = false; } drawer = false; selected = null; lastFrame = 0; note('Pine Box resumed'); }
+        else if (event.kind === 'screensaver') { review?.close(); if (state?.device) { state.device.displayMode = 'avatar'; state.device.screensaver = true; } drawer = false; selected = null; }
+        else if (event.kind === 'nav' && review?.snapshot().open) review.scroll(event.direction === 'next' ? 1 : -1);
+        else if (event.kind === 'nav' && !drawer && state?.device?.displayMode !== 'avatar') await stepEdition(event.direction === 'next' ? 1 : -1);
+        else if (event.kind === 'mode') { review?.close(); if (state?.device) state.device.displayMode = event.mode; selected = null; if (event.mode === 'avatar') drawer = false; lastFrame = 0; paintStatus(); }
+      }
+      if (result.device && state) state.device = result.device;
+    } catch (error) { note('LCD input: ' + error.message); }
+    finally { inputPolling = false; if (running) inputTimer = setTimeout(pollInput, state?.device?.pineProtocol >= 2 ? 80 : 250); }
+  }
 
   async function tick() {
     if (looping || (!running && !panel)) return;
     looping = true;
+    const began = performance.now();
+    let failed = false;
     try {
       const now = Date.now();
       if (now - lastPoll > 1000 && !polling) {
         lastPoll = now; polling = true;
         pollStation().catch((error) => note(error.message)).finally(() => { polling = false; });
       }
+      const renderAt = performance.now();
       draw(Date.now());
-      if (running) {
-        const sent = await bridge.lcdFrame(window.PineLcdFrame.encode(canvas, state?.device).jpeg);
-        if (!sent.ok && !sent.busy) note(sent.why);
-        if (Date.now() - lastEvents > 800) {
-          lastEvents = Date.now();
-          try {
-            for (const event of (await bridge.lcdEvents()).events || []) {
-              if (event.kind === 'touch') touch(event.x, event.y, true).catch((error) => note(error.message));
-              else if (event.kind === 'nav' && state?.device?.displayMode !== 'avatar') stepEdition(event.direction === 'next' ? 1 : -1).catch((error) => note(error.message));
-              else if (event.kind === 'mode') { if (state?.device) state.device.displayMode = event.mode; selected = null; note(event.mode === 'avatar' ? 'Quanta avatars · tap top-left for Pine Box' : 'Pine Box · tap top-left for avatars'); }
-            }
-          } catch (error) { note('LCD input: ' + error.message); }
-        }
+      const renderMs = performance.now() - renderAt;
+      if (running && !inputTimer && !inputPolling) pollInput();
+      // Held gallery pictures need only a one-second heartbeat to retain the
+      // native host view. Transitions still use the full acknowledged cadence.
+      const galleryKey = galleryFrame && !drawer ? galleryFrame.paintKey : '';
+      const sendFrame = !galleryKey || galleryKey !== lastGalleryAckKey || Date.now() - lastGalleryAckAt >= 1000;
+      if (running && state?.device?.displayMode !== 'avatar' && sendFrame) {
+        const device = state?.transport === 'usb' ? {...state.device, streamPort: 0} : state?.device;
+        const encodeAt = performance.now(), frame = window.PineLcdFrame.encode(canvas, device);
+        const encodeMs = performance.now() - encodeAt, sendAt = performance.now();
+        const sent = await bridge.lcdFrame(frame.jpeg);
+        window.PineLcdMetrics = {at: Date.now(), renderMs, encodeMs, ackMs: performance.now() - sendAt,
+          jpegBytes: frame.bytes, encodes: frame.encodes, drawn: !!sent.ok && !sent.skipped && !sent.avatar,
+          view: state?.config?.mode, paperStyle: state?.config?.paperStyle, chatOverlay: state?.config?.mode !== 'gallery' && state?.config?.chatOverlay !== false,
+          gallery: galleryFrame ? {imageId: galleryFrame.imageId, transition: galleryFrame.transition, transitioning: galleryFrame.transitioning, state: galleryFrame.state} : undefined};
+        if (sent.ok && !sent.skipped && !sent.avatar && !sent.busy) { lastGalleryAckKey = galleryKey; lastGalleryAckAt = Date.now(); }
+        if (!sent.ok && !sent.busy) { failed = true; note(sent.why); }
       }
-    } catch (error) { note(error.message); }
-    finally { looping = false; clearTimeout(timer); if (running || panel) timer = setTimeout(tick, 200); }
+    } catch (error) { failed = true; note(error.message); }
+    finally {
+      looping = false; clearTimeout(timer);
+      const interval = failed ? 500 : state?.device?.displayMode === 'avatar' ? 160 : galleryFrame && !galleryFrame.transitioning && !drawer ? 100 : 1000 / 30;
+      if (running || panel) timer = setTimeout(tick, Math.max(1, interval - (performance.now() - began)));
+    }
   }
   async function start(automatic = false) {
     clearTimeout(autoRetry);
@@ -428,16 +717,38 @@
     card.appendChild(form);
     const options = node('div'); options.style.cssText = 'display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-bottom:10px';
     const mode = node('select'); mode.setAttribute('aria-label', 'LCD content');
-    for (const [value, label] of [['paper', 'Newspaper + live dialogue'], ['dialogue', 'Live dialogue only']]) {
+    mode.dataset.lcdSetting = 'view';
+    for (const [value, label] of [['newspaper', 'Newspaper only'], ['paper', 'Newspaper + live dialogue'], ['tabloid', 'Tabloid'], ['gallery', 'Pine Box gallery · images only'], ['dialogue', 'Live dialogue only'], ['cupboard', 'Behind the scenes']]) {
       const option = node('option', label); option.value = value; mode.appendChild(option);
     }
-    mode.value = state.config.mode; mode.onchange = async () => { state = await bridge.lcdConfigure({mode: mode.value}); selected = null; };
+    mode.value = controls.view(state.config);
+    mode.onchange = () => configure(controls.change(mode.value, state.config) || {mode: mode.value, pausedCupboard: false}).catch(error => note(error.message));
     options.appendChild(mode);
+    const cycle = node('button', 'Cycle newspaper / gallery');
+    cycle.onclick = () => configure(controls.cycle(state.config)).catch(error => note(error.message)); options.appendChild(cycle);
+    const galleryDuration = node('select'); galleryDuration.dataset.lcdSetting = 'galleryIntervalSeconds'; galleryDuration.setAttribute('aria-label', 'Gallery image duration');
+    for (const seconds of [3, 5, 8, 15, 30, 60]) { const option = node('option', 'Each picture: ' + seconds + ' sec'); option.value = String(seconds); galleryDuration.appendChild(option); }
+    galleryDuration.onchange = () => configure({galleryIntervalSeconds: Number(galleryDuration.value)}).catch(error => note(error.message)); options.appendChild(galleryDuration);
+    const nextPicture = node('button', 'Next gallery image'); nextPicture.onclick = async () => {
+      try { if (state?.config?.mode !== 'gallery') await configure(controls.change('gallery', state.config)); else gallery?.next(); }
+      catch (error) { note(error.message); }
+    }; options.appendChild(nextPicture);
     const autoLabel = node('label', 'Resume on app launch '); const auto = node('input'); auto.type = 'checkbox'; auto.checked = state.config.autoStart;
     auto.onchange = async () => { state = await bridge.lcdConfigure({autoStart: auto.checked}); }; autoLabel.appendChild(auto); options.appendChild(autoLabel);
     const speedLabel = node('label', 'Scroll '); const speed = node('input'); speed.type = 'range'; speed.min = '2'; speed.max = '50'; speed.value = state.config.speed;
     speed.onchange = async () => { state = await bridge.lcdConfigure({speed: Number(speed.value)}); }; speedLabel.appendChild(speed); options.appendChild(speedLabel);
     card.appendChild(options);
+    const quick = node('div'); quick.style.cssText = 'display:flex;gap:12px;flex-wrap:wrap;align-items:center;margin-bottom:12px';
+    const showControls = node('button', 'Quick settings ▾'); showControls.onclick = () => swipe(drawer ? 'up' : 'down').catch(error => note(error.message)); quick.appendChild(showControls);
+    for (const [key, label] of [['chatOverlay', 'Chat overlay'], ['scrollEnabled', 'Auto-scroll'], ['screensaverEnabled', 'Avatar screensaver'], ['pausedCupboard', 'Behind the scenes when paused']]) {
+      const item = node('label', label + ' '), input = node('input'); input.type = 'checkbox'; input.dataset.lcdSetting = key; input.setAttribute('aria-label', label);
+      input.onchange = () => configure(key === 'chatOverlay' ? controls.change('chat', state.config) : {[key]: input.checked}).catch(error => note(error.message)); item.appendChild(input); quick.appendChild(item);
+    }
+    const timeout = node('select'); timeout.dataset.lcdSetting = 'screensaverSeconds'; timeout.setAttribute('aria-label', 'Avatar screensaver timer');
+    for (const seconds of [15, 30, 60, 300, 900, 1800, 3600]) { const option = node('option', 'After ' + controls.timerLabel(seconds)); option.value = String(seconds); timeout.appendChild(option); }
+    timeout.onchange = () => configure({screensaverSeconds: Number(timeout.value)}).catch(error => note(error.message)); quick.appendChild(timeout);
+    const saverNow = node('button', 'Preview screensaver'); saverNow.onclick = () => bridge.lcdControl('screensaver', true).then(got => { state = got; drawer = false; note('Avatar screensaver · tap anywhere on the LCD to wake'); }).catch(error => note(error.message)); quick.appendChild(saverNow);
+    card.appendChild(quick);
     const status = node('p'); status.dataset.lcdStatus = ''; status.setAttribute('role', 'status'); card.appendChild(status);
     const board = node('p'); board.dataset.lcdBoard = ''; board.style.color = '#9bb5c5'; card.appendChild(board);
     const grid = node('div'); grid.style.cssText = 'display:grid;grid-template-columns:minmax(160px,1.25fr) minmax(160px,1fr);gap:16px';
@@ -446,9 +757,10 @@
     const detail = node('p'); detail.dataset.lcdDetail = ''; detail.style.cssText = 'max-height:200px;overflow:auto;white-space:pre-wrap'; details.appendChild(detail);
     for (const [label, run] of [['‹ Older issue', () => stepEdition(-1)], ['Newer issue ›', () => stepEdition(1)],
       ['Follow newest', async () => { manualEdition = false; await showEdition(latestPaper); }], ['★ Favorite', favorite], ['↓ Download', download]]) {
-      const button = node('button', label); button.style.margin = '3px'; button.onclick = () => Promise.resolve(run()).catch((error) => note(error.message)); details.appendChild(button);
+      const button = node('button', label); button.dataset.lcdPaperAction = ''; button.style.margin = '3px'; button.onclick = () => Promise.resolve(run()).catch((error) => note(error.message)); details.appendChild(button);
     }
-    const hint = node('p', 'Tap the top-left corner to switch between Quanta avatars and Pine Box. Tap the middle left/right edges for issues and dialogue bubbles for actions. Pine-compatible firmware preserves Quanta and its stored slideshow. Close this panel to keep streaming.');
+    const hint = node('p', 'Tap the AV / PB button in the top-left header to switch between Quanta avatars and Pine Box. Swipe down for Quick settings. Tap the middle left/right edges for issues and dialogue bubbles for actions. Close this panel to keep streaming.');
+    hint.dataset.lcdHint = '';
     hint.style.cssText = 'font-size:11px;color:#9bb5c5'; details.appendChild(hint); grid.appendChild(details); card.appendChild(grid);
     const ownership = node('p', 'For both apps at once, connect Pine Box over Wi-Fi and Quanta over USB. With Pine on USB, “Release USB to Quanta” hands that exclusive port back; Start reconnects Pine afterward.');
     ownership.style.cssText = 'font-size:11px;color:#9bb5c5'; card.appendChild(ownership);
@@ -486,21 +798,21 @@
     firmware.appendChild(fwForm);
     firmware.appendChild(node('p', 'Choose the exact board, build, then install. USB identification briefly reboots the selected display; USB installation backs up its current flash first. Wi-Fi installation requires an OTA partition. Saved galleries are preserved. Keep the display powered during installation.'));
     const firmwareLog = node('pre'); firmwareLog.dataset.lcdFirmwareLog = ''; firmwareLog.style.cssText = 'max-height:170px;overflow:auto;white-space:pre-wrap;font-size:11px'; firmware.appendChild(firmwareLog);
-    const controls = node('div'); controls.style.cssText = 'display:flex;gap:10px;align-items:center;flex-wrap:wrap';
+    const hardwareControls = node('div'); hardwareControls.style.cssText = 'display:flex;gap:10px;align-items:center;flex-wrap:wrap';
     const brightnessLabel = node('label', 'Brightness '); const brightness = node('input'); brightness.type = 'range'; brightness.min = '1'; brightness.max = '255'; brightness.value = '200';
     brightness.onchange = () => bridge.lcdControl('brightness', Number(brightness.value)).then((got) => { state = got; note('Brightness updated.'); }).catch((error) => note(error.message));
-    brightnessLabel.appendChild(brightness); controls.appendChild(brightnessLabel);
+    brightnessLabel.appendChild(brightness); hardwareControls.appendChild(brightnessLabel);
     const rotation = node('select'); rotation.setAttribute('aria-label', 'Display rotation');
     for (let n = 0; n < 4; n++) { const option = node('option', 'Rotation ' + (n * 90) + '°'); option.value = String(n); rotation.appendChild(option); }
-    rotation.onchange = () => bridge.lcdControl('rotation', Number(rotation.value)).then((got) => { state = got; lastPoll = 0; note('Rotation updated.'); }).catch((error) => note(error.message)); controls.appendChild(rotation);
-    firmware.appendChild(controls); card.appendChild(firmware);
+    rotation.onchange = () => bridge.lcdControl('rotation', Number(rotation.value)).then((got) => { state = got; lastPoll = 0; note('Rotation updated.'); }).catch((error) => note(error.message)); hardwareControls.appendChild(rotation);
+    firmware.appendChild(hardwareControls); card.appendChild(firmware);
     const samples = node('p'); samples.dataset.lcdSampleDir = ''; card.appendChild(samples);
     const chooseSamples = node('button', 'Choose sound sample folder'); chooseSamples.onclick = async () => {
       try { state = await bridge.lcdSampleDirectory(); paintStatus(); } catch (error) { note(error.message); }
     }; card.appendChild(chooseSamples);
     shade.appendChild(card); shade.onclick = (event) => { if (event.target === shade) close.click(); };
     shade.onkeydown = (event) => { if (event.key === 'Escape') close.click(); };
-    document.body.appendChild(shade); panel = shade; card.focus(); layoutPaper(); paintStatus(); lastPoll = 0; tick();
+    document.body.appendChild(shade); panel = shade; card.focus(); layoutPaper(); syncOptions(); paintStatus(); lastPoll = 0; tick();
   }
   entry.onclick = () => open().catch((error) => { entry.title = 'LCD: ' + error.message; });
   bridge.lcdState().then(async (got) => {

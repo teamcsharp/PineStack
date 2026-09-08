@@ -47,7 +47,7 @@ class TintRhymeTests(unittest.TestCase):
             report = app.tint_evaluate(source, paraphrase, [], force=0.9, strict=False)
             self.assertFalse(report["ok"])
             self.assertIn("no rhyme evidence - the bar does not land a rhyme", report["faults"])
-            self.assertEqual(report["version"], 4)
+            self.assertEqual(report["version"], 9)
             good = app.tint_evaluate(source, BARS[4], [], force=0.9, strict=False)
             self.assertTrue(good["ok"], good["faults"])
             self.assertTrue(good["rhyme"]["rap"]["ok"])
@@ -58,12 +58,14 @@ class TintRhymeTests(unittest.TestCase):
               mock.patch.object(app, "crystal_coverage_target", return_value=100),
               mock.patch.object(app, "crystal_force", return_value=1.0)):
             self.assertFalse(app.tint_coverage_ready(report))
+            # Coverage-format version is separate from the semantic grader's
+            # version 5; its structural contract still begins at version 4.
             report["coverage"]["version"] = 4
             self.assertTrue(app.tint_coverage_ready(report))
 
     def test_the_spoken_form_has_no_bar_marks_or_markdown(self):
         self.assertEqual(app._tint_out_clean("**Pick** a gate / see the reward / it's gone"),
-                         "Pick a gate, see the reward, it's gone")
+                         "Pick a gate; see the reward; it's gone")
         self.assertTrue(app.rap_rhyme_evidence(app._tint_out_clean(BARS[0]))["ok"])
 
 

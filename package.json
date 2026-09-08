@@ -35,6 +35,34 @@
         "from": "station_flow.py",
         "to": "agent/station_flow.py"
       },
+      {
+        "from": "line_review.py",
+        "to": "agent/line_review.py"
+      },
+      {
+        "from": "line_review_runtime.py",
+        "to": "agent/line_review_runtime.py"
+      },
+      { "from": "rejection_workbench.py", "to": "agent/rejection_workbench.py" },
+      { "from": "system2.py", "to": "agent/system2.py" },
+      { "from": "system2_runtime.py", "to": "agent/system2_runtime.py" },
+      { "from": "system2_media.py", "to": "agent/system2_media.py" },
+      { "from": "system2_writing.py", "to": "agent/system2_writing.py" },
+      { "from": "rejection_lab.py", "to": "agent/rejection_lab.py" },
+      { "from": "rejection_lab_runtime.py", "to": "agent/rejection_lab_runtime.py" },
+      { "from": "crystal_contract.py", "to": "agent/crystal_contract.py" },
+      { "from": "crystal_prompts.py", "to": "agent/crystal_prompts.py" },
+      { "from": "crystal_rhyme.py", "to": "agent/crystal_rhyme.py" },
+      { "from": "rhyme_assistance.py", "to": "agent/rhyme_assistance.py" },
+      { "from": "vendor/wordnet", "to": "agent/vendor/wordnet", "filter": ["**/*"] },
+      { "from": "vendor/cmudict", "to": "agent/vendor/cmudict", "filter": ["**/*"] },
+      { "from": "crystal_source.py", "to": "agent/crystal_source.py" },
+      { "from": "segment_contract.py", "to": "agent/segment_contract.py" },
+      { "from": "crystal_acceptance.py", "to": "agent/crystal_acceptance.py" },
+      { "from": "prompt_learning.py", "to": "agent/prompt_learning.py" },
+      { "from": "nabu_audio.py", "to": "agent/nabu_audio.py" },
+        { "from": "sfx_speech_bank.py", "to": "agent/sfx_speech_bank.py" },
+        { "from": "sfx_cadence.py", "to": "agent/sfx_cadence.py" },
         {
           "from": "response_bank.py",
           "to": "agent/response_bank.py"

@@ -83,6 +83,13 @@ class TintContractTests(unittest.IsolatedAsyncioTestCase):
         units = [("A", "Yes."), ("B", self.SOURCE)]
         results = ["Yes, request expressed; operation meets calibration.", self.TINTED]
         with (mock.patch.object(app, "crystal_active", return_value=[{"name": "test"}]),
+              # Exercise the per-line fallback after an empty batch result.
+              # Batch writing has its own tests and must not reach a real
+              # model while this test checks short-line coverage and sources.
+              mock.patch.object(app, "_crystal_round_first_pass", return_value=[]),
+              mock.patch.object(app, "crystal_vocab_warm", return_value=None),
+              mock.patch.object(app, "ask_model", side_effect=AssertionError(
+                  "Unexpected model call in the per-line coverage test")) as batch_model,
               mock.patch.object(app, "crystal_stanzas", return_value=self.CHUNKS),
               mock.patch.object(app, "crystal_world_prompt", return_value="test"),
               mock.patch.object(app, "crystal_coverage_target", return_value=100),
@@ -102,7 +109,9 @@ class TintContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(report["coverage"]["eligible"], 2)
         self.assertEqual(report["coverage"]["changed"], 2)
         self.assertEqual(len(report["approved_lines"]), 2)
+        self.assertEqual(rewrite.await_count, 2)
         self.assertEqual(rewrite.call_args_list[1].args[4], [])
+        batch_model.assert_not_awaited()
         self.assertEqual(report["speakerbox_sources"], [self.SOURCE])
 
     def test_paper_counts_untouched_stories_in_coverage(self):

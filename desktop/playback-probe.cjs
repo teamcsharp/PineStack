@@ -10,6 +10,9 @@ const expression = `(() => {
   const audio = [...new Set([...document.querySelectorAll('audio'),
     ...(typeof djVoiceEls === 'undefined' ? [] : djVoiceEls)])];
   return {title: document.title, preset: document.getElementById('broadcastTarget')?.value,
+    lcdRenderer: window.PineLcdMetrics || null,
+    lcdReviewAvailable: !!window.PineLcdReviewController,
+    rejectionReviewAvailable: typeof window.PineRejectionReview?.open === 'function',
     routeSummary: document.getElementById('routeSummary')?.textContent,
     retimingLoaded: typeof djVoiceRetime === 'function',
     voiceBusy: typeof djVoiceBusy === 'undefined' ? null : djVoiceBusy,
@@ -53,7 +56,8 @@ async function capture({lcdState, lcdFrame, durationMs = 180000} = {}) {
       lcd: {running: state.running, connected: state.connected, host: state.host,
         frames: state.frames, failed: state.failed, lastAck: state.lastAck, error: state.error,
         lastFrameBytes: state.lastFrameBytes, frameBudget: state.frameBudget,
-        identity: state.device?.identity, mode: state.device?.displayMode}});
+        timing: state.timing, transport: state.transport, protocol: state.device?.pineProtocol,
+        identity: state.device?.identity, mode: state.device?.displayMode, screensaver: state.device?.screensaver}});
     report.finished = Date.now() - started >= duration;
     const drawn = lcdFrame?.();
     if (drawn) await fs.writeFile(path.join(output, 'lcd-last-acknowledged.jpg'), Buffer.from(drawn, 'base64'));

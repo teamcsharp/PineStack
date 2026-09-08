@@ -110,6 +110,16 @@ class TintRapTests(unittest.IsolatedAsyncioTestCase):
             mock.patch.object(app, "crystal_coverage_target", return_value=100),
             mock.patch.object(app, "crystal_force", return_value=1.0),
             mock.patch.object(app, "crystal_tint_holds", return_value=hold),
+            mock.patch.object(app, "crystal_vocab_warm", new_callable=mock.AsyncMock),
+            # These cases exercise per-line fallback. A real first-pass or
+            # batch model response can otherwise replace all fixture turns
+            # before crystal_turn sees the deliberately refused candidate.
+            mock.patch.object(app, "_crystal_round_first_pass",
+                              new_callable=mock.AsyncMock, return_value=[]),
+            mock.patch.object(app, "ask_model", new_callable=mock.AsyncMock,
+                              side_effect=AssertionError("Unexpected batch model call in per-line tint fixture")),
+            mock.patch.object(app, "line_review_permits", return_value=False),
+            mock.patch.object(app, "line_review_capture"),
             mock.patch.object(app, "tint_should_stop", return_value=""),
             mock.patch.object(app, "task_cost", return_value=0.1),
             mock.patch.object(app, "task_note"),

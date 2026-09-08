@@ -19,7 +19,7 @@ class RapOnlyTests(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertIn("no rhyme evidence - the bar does not land a rhyme", report["faults"])
         self.assertTrue(report["rhyme"]["ok"])            # still reported
-        self.assertEqual(report["version"], 4)
+        self.assertEqual(report["version"], 9)
 
     def test_a_dropped_g_keeps_the_name(self):
         source = "It should have been called Bleeding Sky, honestly."

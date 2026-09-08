@@ -6,9 +6,18 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const {jpegBudget} = require('./renderer/lcd-frame.js');
+const {LcdStream} = require('./lcd-stream.cjs');
 
 const LCD_DEFAULTS = {host: '', mode: 'paper', autoStart: false, speed: 12,
-  quantaRoot: 'C:\\_tools\\Quanta', identity: ''};
+  quantaRoot: 'C:\\_tools\\Quanta', identity: '', paperStyle: 'broadsheet', chatOverlay: true,
+  scrollEnabled: true, pausedCupboard: true, screensaverEnabled: false, screensaverSeconds: 300,
+  galleryIntervalSeconds: 8};
+const LCD_MODES = ['paper', 'dialogue', 'cupboard', 'gallery'];
+function galleryIntervalSeconds(value) {
+  const seconds = Number(value);
+  return value !== null && value !== '' && Number.isFinite(seconds)
+    ? Math.max(3, Math.min(60, Math.round(seconds))) : LCD_DEFAULTS.galleryIntervalSeconds;
+}
 
 function privateAddress(host) {
   const parts = String(host).split('.').map(Number);
@@ -51,6 +60,10 @@ function parseStatus(body) {
     uptime: Number(fields.up || 0), hostTouch: Number(fields.pine || 0) === 1,
     ota: fields.ota === undefined ? null : Number(fields.ota) === 1,
     displayMode: fields.display === 'avatar' ? 'avatar' : 'pine',
+    pineProtocol: Number(fields.pineproto || 1), streamPort: Number(fields.stream) === 3233 ? 3233 : 0,
+    maxJpeg: Math.max(0, Math.min(24576, Number(fields.maxjpg) || 0)),
+    gestures: fields.gesture === '1', screensaver: fields.saver === '1', idleSeconds: Number(fields.idle || 0),
+    cpuMHz: Number(fields.cpu || 0), wifiPowerSave: fields.sleep === undefined ? null : Number(fields.sleep),
     raw: text.slice(0, 1500)};
 }
 
@@ -173,33 +186,48 @@ function firmwareReadiness(root, device) {
 }
 
 class LcdAgent {
-  constructor({request = deviceRequest, discover = mdnsCandidates, candidates = lanCandidates, read = () => ({}), write = () => {}} = {}) {
+  constructor({request = deviceRequest, discover = mdnsCandidates, candidates = lanCandidates, read = () => ({}), write = () => {}, streamFactory = (options) => new LcdStream(options)} = {}) {
     this.request = request; this.discoverAddresses = discover; this.read = read; this.write = write;
     this.candidates = candidates;
     this.device = null; this.host = ''; this.running = false; this.connected = false;
     this.busy = false; this.frameJob = null; this.sequence = 0; this.nextRetry = 0;
     this.frames = 0; this.failed = 0; this.lastAck = 0; this.error = ''; this.lastFrameBytes = 0;
     this.seen = new Set(); this.eventsPrimed = false; this.log = []; this.leaseUntil = 0;
+    this.streamFactory = streamFactory; this.stream = null; this.timings = []; this.settingsKey = '';
+    this.nextStatusPoll = 0;
   }
   note(kind, detail) { this.log.push({at: Date.now(), kind, detail: String(detail).slice(0, 500)});
     if (this.log.length > 100) this.log.splice(0, this.log.length - 100); }
-  config() { return {...LCD_DEFAULTS, ...(this.read().lcd || {})}; }
+  config() {
+    const config = {...LCD_DEFAULTS, ...(this.read().lcd || {})};
+    if (!LCD_MODES.includes(config.mode)) config.mode = LCD_DEFAULTS.mode;
+    config.galleryIntervalSeconds = galleryIntervalSeconds(config.galleryIntervalSeconds);
+    if (typeof config.chatOverlay !== 'boolean') config.chatOverlay = LCD_DEFAULTS.chatOverlay;
+    return config;
+  }
   configure(input = {}) {
     const next = this.config();
     if (input.host !== undefined) next.host = input.host ? endpoint(input.host) : '';
-    if (input.mode !== undefined) next.mode = input.mode === 'dialogue' ? 'dialogue' : 'paper';
+    if (input.mode !== undefined) next.mode = LCD_MODES.includes(input.mode) ? input.mode : 'paper';
     if (input.autoStart !== undefined) next.autoStart = !!input.autoStart;
     if (input.speed !== undefined) next.speed = Math.max(2, Math.min(50, Number(input.speed) || 12));
     if (input.quantaRoot !== undefined) next.quantaRoot = String(input.quantaRoot).slice(0, 1000);
+    if (input.paperStyle !== undefined) next.paperStyle = input.paperStyle === 'tabloid' ? 'tabloid' : 'broadsheet';
+    for (const key of ['chatOverlay','scrollEnabled','pausedCupboard','screensaverEnabled']) if (input[key] !== undefined) next[key] = !!input[key];
+    if (input.screensaverSeconds !== undefined) next.screensaverSeconds = Math.max(15, Math.min(3600, Math.round(Number(input.screensaverSeconds) || 300)));
+    if (input.galleryIntervalSeconds !== undefined) next.galleryIntervalSeconds = galleryIntervalSeconds(input.galleryIntervalSeconds);
     this.write({lcd: next}); return this.state();
   }
   state() { return {config: this.config(), connected: this.connected, running: this.running,
     device: this.device, host: this.host, busy: this.busy, frames: this.frames, failed: this.failed,
     lastAck: this.lastAck, error: this.error, lastFrameBytes: this.lastFrameBytes,
-    frameBudget: jpegBudget(this.device), log: this.log.slice(-40),
+    frameBudget: this.frameBudget(), transport: this.binaryEnabled() ? 'binary-tcp' : /^COM/i.test(this.host) ? 'usb' : 'http-base64',
+    timing: this.timings.at(-1) || null, timings: this.timings.slice(-60), log: this.log.slice(-40),
     firmware: firmwareReadiness(this.config().quantaRoot, this.device)}; }
   async probe(host, timeout = 4000) { const target = endpoint(host); const row = parseStatus(await this.request(target, '/status', null, timeout));
     return {...row, host: target}; }
+  binaryEnabled() { return !/^COM/i.test(this.host) && this.device?.pineProtocol >= 2 && this.device?.streamPort === 3233; }
+  frameBudget() { return this.binaryEnabled() ? this.device.maxJpeg || 24576 : jpegBudget({...this.device, streamPort: 0}); }
   async discover({scan = true} = {}) {
     const addresses = new Set(await this.discoverAddresses());
     const configured = this.config().host;
@@ -228,6 +256,8 @@ class LcdAgent {
       if (expectedIdentity && device.identity !== expectedIdentity) throw new Error('The display identity changed; reconnect it manually before sending frames.');
       this.device = device; this.host = device.host; this.connected = true; this.error = '';
       this.seen.clear(); this.eventsPrimed = false;
+      this.settingsKey = '';
+      this.nextStatusPoll = Date.now() + 5000;
       this.write({lcd: {...this.config(), host: this.host, identity: device.identity}});
       this.note('connected', device.board + ' / ' + device.identity);
       return this.state();
@@ -241,10 +271,11 @@ class LcdAgent {
     // screen tap accidentally favouriting/downloading today's dialogue.
     await this.events();
     if (this.device.hostTouch) { await this.renewLease(); if (!automatic || this.device.displayMode !== 'avatar') await this.displayMode('pine'); }
+    await this.syncSettings();
     this.running = true; this.note('started', 'Pine Box owns this frame producer');
     return this.state();
   }
-  stop() { this.running = false; this.sequence++;
+  stop() { this.running = false; this.sequence++; this.stream?.close(); this.stream = null;
     this.note('stopped', 'Pine Box frame producer stopped'); return {running: false}; }
   async renewLease() {
     const response = await this.request(this.host, '/cmd', 'QCMD PINELEASE 15');
@@ -256,7 +287,26 @@ class LcdAgent {
     const target = mode === 'avatar' ? 'avatar' : 'pine';
     const response = await this.request(this.host, '/cmd', 'QCMD PINEMODE ' + (target === 'pine' ? 1 : 0));
     if (!String(response).startsWith('QACK pinemode ' + target)) throw new Error('LCD did not acknowledge its display mode.');
-    this.device.displayMode = target; this.note('mode', target); return this.state();
+    this.device.displayMode = target; this.device.screensaver = false;
+    if (target === 'avatar') {this.stream?.close();this.stream = null;}
+    this.note('mode', target); return this.state();
+  }
+  async syncSettings() {
+    if (!this.connected || this.device?.pineProtocol < 2) return this.state();
+    const config = this.config(), seconds = config.screensaverEnabled ? config.screensaverSeconds : 0;
+    const disabling = !seconds && this.device.idleSeconds > 0;
+    const key = this.host + ':' + seconds;
+    if (this.settingsKey !== key || this.device.idleSeconds !== seconds) {
+      const response = await this.request(this.host, '/cmd', 'QCMD PINEIDLE ' + seconds);
+      if (!String(response).startsWith('QACK pineidle ' + seconds)) throw new Error('LCD idle timer was not acknowledged.');
+      this.settingsKey = key; this.device.idleSeconds = seconds;
+    }
+    if (disabling && this.device.screensaver) {
+      const response = await this.request(this.host, '/cmd', 'QCMD PINESAVER 0');
+      if (!String(response).startsWith('QACK pinesaver 0')) throw new Error('LCD screensaver wake was not acknowledged.');
+      this.device.screensaver = false; this.device.displayMode = 'pine';
+    }
+    return this.state();
   }
   async control(action, value) {
     if (!this.connected) throw new Error('Connect a Quanta LCD first.');
@@ -265,6 +315,8 @@ class LcdAgent {
     let command, ack;
     if (action === 'brightness') { command = 'QCMD BL ' + Math.max(0, Math.min(255, Math.round(Number(value) || 0))); ack = /^QACK bl /; }
     else if (action === 'rotation' && [0, 1, 2, 3].includes(Number(value))) { command = 'QCMD ROT ' + Number(value); ack = /^QACK rot /; }
+    else if (action === 'screensaver' && device.pineProtocol >= 2) { command = 'QCMD PINESAVER ' + (value ? 1 : 0); ack = /^QACK pinesaver [01]\b/; }
+    else if (action === 'idle' && device.pineProtocol >= 2) { const seconds = Number(value) ? Math.max(15, Math.min(3600, Math.round(Number(value)))) : 0; command = 'QCMD PINEIDLE ' + seconds; ack = new RegExp('^QACK pineidle ' + seconds + '\\b'); }
     else throw new Error('Unsupported LCD control.');
     const result = await this.request(this.host, '/cmd', command);
     if (!ack.test(String(result))) throw new Error('LCD control was not acknowledged.');
@@ -274,7 +326,7 @@ class LcdAgent {
   async frame(data) {
     if (!this.running) return {ok: false, why: 'LCD streaming is stopped.'};
     if (this.busy) return {ok: false, busy: true, why: 'Previous frame has not acknowledged yet.'};
-    this.busy = true; const sequence = this.sequence;
+    this.busy = true; const sequence = this.sequence, started = Date.now();
     try {
       if (!this.connected) {
         if (Date.now() < this.nextRetry) return {ok: false, why: this.error};
@@ -288,48 +340,86 @@ class LcdAgent {
           this.write({lcd: {...this.config(), host: this.host}});
         }
         if (found.identity !== this.device?.identity) throw new Error('Display identity changed; reconnect manually.');
-        this.device = found; this.connected = true;
+        this.device = found; this.connected = true; this.settingsKey = ''; this.leaseUntil = 0;
+        await this.syncSettings();
       }
       const encoded = String(data || '').replace(/^data:image\/jpeg;base64,/, '');
       if (!encoded || encoded.length > 1400000 || !/^[A-Za-z0-9+/=]+$/.test(encoded)) throw new Error('Invalid or oversized LCD JPEG.');
       const jpeg = Buffer.from(encoded, 'base64');
       this.lastFrameBytes = jpeg.length;
-      if (jpeg.length > jpegBudget(this.device)) throw new Error('LCD JPEG is ' + jpeg.length
-        + ' bytes; this display accepts at most ' + jpegBudget(this.device) + ' bytes per frame.');
+      if (jpeg.length > this.frameBudget()) throw new Error('LCD JPEG is ' + jpeg.length
+        + ' bytes; this display accepts at most ' + this.frameBudget() + ' bytes per frame.');
       if (jpeg.length < 4 || jpeg[0] !== 255 || jpeg[1] !== 216 || jpeg.at(-2) !== 255 || jpeg.at(-1) !== 217) throw new Error('Frame is not a complete JPEG.');
       if (!this.running || sequence !== this.sequence) return {ok: false, why: 'Producer was stopped.'};
       if (this.device.hostTouch && Date.now() >= this.leaseUntil) await this.renewLease();
       if (this.device.displayMode === 'avatar') return {ok: true, avatar: true};
-      const response = await this.request(this.host, '/image', encoded);
+      const wireAt = Date.now();
+      if (this.binaryEnabled() && !this.stream) this.stream = this.streamFactory({host: this.host, identity: this.device.identity, port: this.device.streamPort});
+      const response = this.binaryEnabled() ? await this.stream.frame(jpeg) : await this.request(this.host, '/image', encoded);
+      if (/^QSKIP mode\b/.test(String(response))) return {ok: true, skipped: true};
       if (!/^QACK img [1-9]\d*x[1-9]\d*\b/.test(String(response).trim())) throw new Error('Display did not acknowledge a drawn image: ' + String(response).slice(0, 120));
       if (sequence !== this.sequence) return {ok: false, why: 'Producer stopped while the frame was in flight.'};
       this.frames++; this.lastAck = Date.now(); this.error = ''; this.lastFrame = encoded;
+      const field = (name) => Number(String(response).match(new RegExp('\\b' + name + '=(\\d+)'))?.[1]) || 0;
+      this.timings.push({at: this.lastAck, totalMs: this.lastAck - started, wireMs: this.lastAck - wireAt,
+        decodeAndDrawMs: field('dec'), flushMs: field('draw'), receiveMs: field('rx'), jpegBytes: jpeg.length});
+      if (this.timings.length > 60) this.timings.shift();
       if (this.frames === 1 || this.frames % 100 === 0) this.note('drawn', response);
       return {ok: true, acknowledgment: String(response), frames: this.frames, at: this.lastAck};
     } catch (error) {
+      this.stream?.close(); this.stream = null;
+      if (sequence !== this.sequence) return {ok: false, why: 'Producer stopped while the frame was in flight.'};
+      if (this.device?.displayMode === 'avatar' && /LCD (?:frame|binary) connection (?:closed|ended)/.test(error.message)) return {ok: true, avatar: true};
       this.failed++; this.connected = false; this.error = error.message
         + (this.lastFrameBytes ? ' (JPEG ' + this.lastFrameBytes + ' bytes)' : '');
       this.note('error', error.message); return {ok: false, why: error.message};
     } finally { this.busy = false; }
   }
   async events() {
-    if (!this.connected) return {events: []};
-    const text = await this.request(this.host, '/events', null, 2500);
-    const lines = String(text).trim().split(/\r?\n/).filter(Boolean).slice(-100);
     const events = [];
+    // Avatar mode produces no host JPEGs. Maintain identity, mode and the touch
+    // lease here as well, so a reboot cannot strand the renderer in cached avatar.
+    if (this.running && this.device && Date.now() >= this.nextStatusPoll && !this.busy) {
+      this.nextStatusPoll = Date.now() + 5000;
+      const previous = this.device, wasConnected = this.connected;
+      try {
+        const found = await this.probe(this.host, 2500);
+        if (found.identity !== previous.identity) throw new Error('LCD identity changed; reconnect manually.');
+        this.device = found; this.connected = true;
+        if (!wasConnected || found.uptime < previous.uptime) {
+          this.leaseUntil = 0; this.settingsKey = ''; this.eventsPrimed = false; this.seen.clear();
+          this.stream?.close();this.stream = null;
+        }
+        await this.syncSettings();
+        if (previous.displayMode !== this.device.displayMode) events.push({kind: 'mode', mode: this.device.displayMode});
+        if (previous.screensaver && !this.device.screensaver) events.push({kind: 'wake'});
+        this.error = '';
+      } catch (error) {this.connected = false;this.error = error.message;throw error;}
+    }
+    if (!this.connected) return {events, device: this.device};
+    if (this.running && this.device.hostTouch && Date.now() >= this.leaseUntil) await this.renewLease();
+    let text;
+    try {text = await this.request(this.host, '/events', null, 2500);}
+    catch (error) {this.connected = false;this.error = error.message;this.nextStatusPoll = Date.now() + 1000;throw error;}
+    const lines = String(text).trim().split(/\r?\n/).filter(Boolean).slice(-100);
     for (const line of lines) {
       if (this.eventsPrimed && !this.seen.has(line)) {
-        const touch = line.match(/^(\d+) TOUCH down (\d+) (\d+)/);
+        const touch = line.match(this.device?.pineProtocol >= 2 ? /^(\d+) TOUCH tap (\d+) (\d+)/ : /^(\d+) TOUCH down (\d+) (\d+)/);
         const nav = line.match(/^(\d+) NAV (next|prev)/);
         const mode = line.match(/^(\d+) PINEMODE (pine|avatar)/);
+        const swipe = line.match(/^(\d+) SWIPE (down|up) (\d+) (\d+)/);
+        const wake = line.match(/^(\d+) PINEWAKE\b/), saver = line.match(/^(\d+) PINESAVER 1\b/);
         if (touch) events.push({kind: 'touch', at: Number(touch[1]), x: Number(touch[2]), y: Number(touch[3])});
         else if (nav) events.push({kind: 'nav', at: Number(nav[1]), direction: nav[2]});
-        else if (mode) { this.device.displayMode = mode[2]; events.push({kind: 'mode', mode: mode[2]}); }
+        else if (mode) { this.device.displayMode = mode[2]; if (mode[2] === 'avatar') {this.stream?.close();this.stream = null;} events.push({kind: 'mode', mode: mode[2]}); }
+        else if (swipe) events.push({kind: 'swipe', direction: swipe[2], at: Number(swipe[1]), x: Number(swipe[3]), y: Number(swipe[4])});
+        else if (wake) {this.device.screensaver = false; events.push({kind: 'wake', at: Number(wake[1])});}
+        else if (saver) {this.device.screensaver = true; events.push({kind: 'screensaver', active: true, at: Number(saver[1])});}
       }
     }
     this.seen = new Set(lines); this.eventsPrimed = true;
     for (const event of events) this.note('input', JSON.stringify(event));
-    return {events};
+    return {events, device: this.device};
   }
 }
 

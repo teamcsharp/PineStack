@@ -1,7 +1,7 @@
 """#1064: the universe rhymes.
 
 "I NEED the entire universe to rhyme and rap like the crystal when I
-enable it." The tint queues instead of being turned away, a couplet's end
+enable it." Deferred tint retains its writing instead of becoming a failed output, a couplet's end
 rhymes count, the crystal's whole vocabulary is its lexicon, a refused
 line is asked three times under the hold, and the hold gives the rewrite
 the hour and a two-minute rest instead of thirty.
@@ -20,8 +20,8 @@ class TintUniverseTests(unittest.IsolatedAsyncioTestCase):
     BAD = SOURCE + " That apparatus hums beside the tall window."
     CHUNKS = [{"text": "Operation, calibration, apparatus and constellation."}]
 
-    def test_tint_asks_queue_and_are_never_turned_away(self):
-        self.assertEqual(app._ollama_category("station:tint turn"), ("tint", 0))
+    def test_tint_admission_is_bounded_without_changing_editorial_rules(self):
+        self.assertEqual(app._ollama_category("station:tint turn"), ("tint", 2))
         self.assertEqual(app._ollama_category("interactive"), ("interactive", 0))
         self.assertEqual(app._ollama_category("response_bank"), ("repertoire", 1))
         self.assertEqual(app._ollama_category("station:writing"), ("station", 2))

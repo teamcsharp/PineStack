@@ -44,6 +44,10 @@
       </select>
       <p id="routeNote">routing unknown</p>
       <p id="routeSummary" class="route-summary" role="status">Waiting for the station's routes.</p>
+      <div class="stream-routes">
+        <button id="nabuMuteBtn" type="button" title="Mute every sound on Nabu without changing its physical volume or routes">Mute Nabu</button>
+        <button id="nabuUnmuteBtn" type="button" title="Restore Nabu at its existing physical volume and channel settings">Unmute Nabu</button>
+      </div>
       <!-- #980: the three streams, each redirectable on its own, on the
            fly. The Broadcast picker above is a preset that moves all
            three at once; these say where each one is actually going and
@@ -118,6 +122,7 @@
     <nav class="tabs" aria-label="Desktop views">
       <button class="tab active" data-view="control" title="Full Pine Box Agent">#<span>Agent</span></button>
       <button class="tab" data-view="radio" title="Radio player">&gt;<span>Radio</span></button>
+      <button class="tab" data-view="system2" title="Hourly plans, scripts and line diagnostics">2<span>System2</span></button>
       <button class="tab" data-view="overview" title="Desktop command deck">=<span>Deck</span></button>
       <button class="tab" data-view="guide" title="Recovery guide">+<span>Recover</span></button>
       <button class="tab" data-view="logs" title="Agent logs">~<span>Logs</span></button>
@@ -267,6 +272,9 @@
 
     <section id="radio" class="view frame-view">
       <webview id="radioFrame" allowpopups webpreferences="backgroundThrottling=no"></webview>
+    </section>
+    <section id="system2" class="view frame-view">
+      <webview id="system2Frame" webpreferences="backgroundThrottling=no"></webview>
     </section>
 
     <section id="overview" class="view">
@@ -475,6 +483,9 @@
   <script src="./renderer.js"></script>
   <script src="./lcd-dialogue.js"></script>
   <script src="./lcd-frame.js"></script>
+  <script src="./lcd-controls.js"></script>
+  <script src="./lcd-gallery.js"></script>
+  <script src="./lcd-review.js"></script>
   <script src="./lcd.js"></script>
 </body>
 </html>

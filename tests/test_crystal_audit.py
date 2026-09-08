@@ -43,8 +43,11 @@ class CrystalAuditTests(unittest.IsolatedAsyncioTestCase):
             report = await app.crystal_tint("A: " + self.SOURCE, "banter", [], critical=True)
         self.assertTrue(report["ok"], report.get("why"))
         armed = report["armed"]
-        self.assertIn("HOW HARD: ALL THE WAY", armed)
-        self.assertIn("THE WORLD THIS DIALOGUE IS BEING MOVED INTO: DOOM (88%)", armed)
+        self.assertIn("Style strength: 0.88", armed)
+        self.assertIn("DOOM (88%): supervillain logic, food-as-metaphor", armed)
+        self.assertIn("Preserve the original proposition", armed)
+        self.assertIn("facts above style", armed)
+        self.assertIn(self.SOURCE, armed)
         self.assertIn("food-as-metaphor", armed)
         self.assertIn("bars separated by ' / '", armed)
 

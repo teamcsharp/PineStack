@@ -1,5 +1,10 @@
 # Nabu physical volume ownership — inbox #1059
 
+The later [independent stream controls](nabu-independent-mix-2026-09-07.md)
+supersede this document's explicit Music-slider exception. Nabu's Music slider
+now adjusts the music audio itself and sends no shared-volume command.
+The investigation below records the earlier implementation and measurements.
+
 The physical Nabu dial is authoritative. Automatic playback, a new track,
 startup, reconnection and replay cannot reapply the application's stored level,
 even if an older configuration enabled “Keep the record level applied on the

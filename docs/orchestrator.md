@@ -1,5 +1,9 @@
 # The orchestrator
 
+The LCD's Behind the scenes view now links newly cut turns to their retained rejection event. Its Words, Why and System popup shows complete evidence, accepts individual Accept/Reject feedback, and dismisses on an outside tap. Event and revision checks prevent a decision against a different or superseded occurrence. Legacy cuts without an exact retained link cannot be voted on from that row.
+
+Individual editorial approvals and confirmed rejections are also saved as literal preference examples. The writing/tint model receives at most three relevant examples in a separate system message; the current rewrite material is kept separate. The coordinator brief exposes the same guidance. Examples are bounded, cached and restored from durable decisions, and exclude technical failures and one-time batch approvals. They guide comparable wording choices without automatically changing acceptance thresholds, replacing source facts or bypassing recording checks.
+
 The [inbox #1057 execution audit](orchestrator-audit-1057.md) documents the
 current recording booths, complete-line reconciliation, durable ordered
 recovery, neural outcome memory and the regression evidence behind them.
@@ -434,3 +438,247 @@ Evidence rolls fast: the pipeline ring and the flow journal hold about two minut
 ### 16.1 Later the same night: the floor, the dead box, rounds first
 
 Sampling `box.floor` in `/api/dj/state` every ten seconds found the second cause: `dj_speak` took the air floor before a single line was written and tinted, so one intro or advert held the air for 150 seconds while its draft and its rewrite waited on the model lane. `_floor_lend` now releases the floor around the write and the tint; the floor is for the render and the play. The Pine Box itself was firmware-down (every port refused), and every road still knocked on it with the floor held; `box_firmware_down_now` makes `_play_on_box` decline at once, routes `to_box` around it on every road, and the page carries the line. Single-line tint asks yield to a waiting whole-round ask (`_tint_turn_yields`), the legacy repair stands down while the lane is deep, and after four minutes without a page or box line the 100%-talk shelf-only refusal lets one live round be written (`dialogue_starved`). The batched re-ask names the content words a bar dropped (`semantic.missing`) and reads run-on answers.
+
+## 17. Review rejected lines and control editorial acceptance
+
+The **Rejected lines** entry in the Orchestrator opens a retained review queue. A new cut produces one clickable popup; additional cuts update that popup. **Later** dismisses the current notice, while a subsequent cut can notify again. In the desktop app the shell owns notifications across tabs and opens the selected record in Radio. Browser pages show their own in-page notice. Neither opening a review nor submitting a decision requests playback.
+
+Select a line to read its complete rejected candidate, original source, machine reasons and evaluation, original speaker/script context, and occurrence history. **Machine decision** and **Operator decision** remain separate: approving a line does not rewrite its raw machine grade. **Should not reject** records an exact approval and attempts to restore retained words through the ordinary writing and recording rooms. **Rejection is correct** retains the rejection and removes that exact approval. The result says whether recovery was queued, recorded, retained, or needs context; an approval is not proof that a recording exists or aired. An optional note is saved with the decision. A concurrent change produces a revision conflict, preserving the unfinished note for inspection and retry.
+
+The header's **Rejection system** switch turns editorial rejection on or off. **Approve all** approves the current pending editorial queue once, across every page and gate regardless of the active filter. It does not change the future policy or give later identical occurrences permanent approval. Technical failures and empty records remain for repair. Each accepted occurrence retains its original evidence and queues through the normal writing and recording rooms; the result distinguishes approval from completed recording. Retrying an unconfirmed request uses the same request ID to avoid applying a committed batch twice.
+
+**Rejection controls** offers **Allow up to N editorial flags** (0–10; higher accepts more) and individual editorial gate switches. These affect editorial acceptance, while missing voices/audio, invalid or empty content and other technical requirements still need repair. A technical rejection remains inspectable, with **Should not reject** disabled and an explanation. The room overview shows the writing-to-air stages and current writing, recording and tint state; **Decision graph** and **Station flow** open their existing inspectors. These acceptance controls are separate from the Orchestrator's scheduling-priority judgment dial.
+
+The authenticated API is:
+
+- `POST /api/orchestrator/rejections/approve-current` with `{request_id}`: atomically snapshots every pending record, persists eligible one-time grants, and returns counts and skipped reasons. Reusing a request ID returns its original result. The background worker restores those exact occurrences after restart; a later cut cannot overwrite their evidence. Grants and their short-lived tint proofs apply only while processing the associated stored entry.
+- `GET /api/orchestrator/rejections`: summary queue with `status`, `gate`, `before`, `after` and `limit`; events include the first cut after an empty database (`after=0`). `latest_cursor` reports the server head; clients advance only through the delivered `next_after`, draining more pages while `events_has_more` is true.
+- `GET /api/orchestrator/rejections/{id}`: full evidence and paginated occurrence history (`before`, `limit`); `POST` accepts `{action: "allow" | "keep", note, expected_revision}` and returns the actual recovery effect.
+- `GET/POST /api/orchestrator/rejection-policy`: persisted `enabled`, `max_faults`, `disabled_gates` and revision; updates may include `expected_revision`.
+- `GET /api/orchestrator/rejections/context`: current room summaries and stage explanations.
+
+New records preserve full source, candidate and context in `data/line_review.sqlite3`, with repeated occurrences retained separately. This cannot reconstruct words or speaker identity already missing from older truncated logs. Recovery never invents a missing caller identity or substitutes an unrelated track position, and existing media files are retained. Previously completed audio is not replayed simply because a review was opened or approved.
+
+Single-voice shelf items, including older adverts, retain their explicit stored voice and shelf position. Recovery matches the original text and kind uniquely, grades the exact reviewed wording, then records it through the normal voice engine. Withdrawing approval before or during that recording restores the previous shelf text and take. If a different editorial check still refuses the wording, that refusal is retained for its own review; approving one gate does not falsify another gate's machine report.
+
+One-time bulk recovery merges sibling cuts from the same original programme and retains compatible approvals for the same track position. Original shelf rollback snapshots survive multiple approvals. Withdrawing one approval holds the other unfinished recoveries for that item, preventing them from restarting cancelled work. Restart restoration clears process ownership while retaining each occurrence's approval scope.
+
+The header controls were deployed and checked on both live Control and Radio pages on 2026-09-07. Validation passed 572 Python tests, 16 Node tests, and 146 isolated Electron assertions, including network retries, selection/note preservation, narrow layouts, grouped recovery, withdrawal during recording, and restart. The live checker sent zero review writes and started zero media; the station's paused state was preserved. See the [deployment evidence](rejected-lines-master-deployment.json), [live page check](rejected-lines-master-live-check.json), and [deployed controls](rejected-lines-master-live.png).
+
+Validation includes isolated Node tests for initial snapshots, burst cursor boundaries and desktop record routing, plus `tools/rejection-review-smoke.cjs`, a hidden Electron fixture covering full text/escaping, queue and history pagination, policy controls, review conflicts, technical exclusions, keyboard/focus behavior, desktop notification ownership, and a 125-event burst. It makes no real station requests or playback calls. Screenshots and the assertion result are written to `%TEMP%/pine-rejection-review-smoke`; fixture success alone does not establish live deployment or successful recording recovery.
+
+Live verification on 2026-09-07 used `tools/rejection-review-live-smoke.cjs` against the deployed Control and Radio pages. Both automatically loaded the module, exposed a working Rejected lines button, showed the real room overview and policy controls, and opened the same naturally occurring tint rejection with its full evidence. Final review and room screenshots were inspected in `%TEMP%/pine-rejection-review-live-smoke`. The checker sent zero writes and started zero media; it blocked the Control page's automatic reconciliation POST and media requests. No live approval, rejection verdict or policy change was submitted, so this read-only check does not claim a completed recovery recording. The isolated browser/desktop fixture separately passed 86 assertions, including the first notification after an initially empty database.
+
+## 18. Writing, recording and slot coordination
+
+The [7 September pipeline audit](pipeline-audit-2026-09-07.md) records reproduced
+handoff failures, their corrections, isolated regressions and live evidence.
+The decision graph now shows **Work moving through the rooms**, using current
+editorial and audio readiness rather than old prepared flags. It reports the
+blocking stage and opens the retained rejection queue for inspection.
+
+Schedule occurrences own their first actions, tint work uses bounded admission,
+and recording workers finish eligible assigned work without queuing every
+engine behind one owned script. At 100% talk, finished gallery, news and manager
+rounds use their exact saved takes, including through independent clock calls.
+Handoff refusal retains stock; verified playback credits the actual programme
+type. Fallback cover does not fulfill the original scheduled requirement.
+
+## 19. Discuss a rejection and test a repair
+
+The rejection notification opens the exact occurrence it describes. Select
+**Discuss** in the Rejected lines popup to talk with the orchestrator about its
+source, rejected wording, failed checks, workflow and current room status.
+Messages and replies stay with that occurrence, including after reopening the
+app. Sending a message does not approve wording or change station settings.
+The orchestrator receives measured queue and model information, with an
+explicitly bounded evidence window; the inspector retains the full records.
+
+**Trace** shows the actual model messages, final HTTP request options, raw
+replies, elapsed time, crystal settings, grades and observed steps captured
+during a crystal rewrite. Each model call has a unique ID. The original view
+stops at this rejection's decision; it does not quietly include later turns
+from the shared round. Separate discussion and trial runs can be selected,
+including failed runs. Earlier records and checks outside the captured crystal
+path explain when an exact prompt was not retained. A stored previous prompt
+is not presented as proof of what caused a later cut.
+
+**Try wording** accepts edited text or generates a rhyming alternative for a
+retained, nontechnical crystal turn. It grades the cleaned wording with the
+current machine checks, without editorial overrides or production rejection
+writes. Each result keeps its original baseline, candidate, detailed grade,
+instruction and model trace. A failed trial stays inspectable. A passing trial
+offers **Apply wording to recording**: the server checks the occurrence, settings
+and grade again before giving the ordinary recovery worker the exact tested
+words. This does not claim that recording or playback has completed. Existing
+approved recovery must be withdrawn before a different replacement is applied.
+
+The future crystal instruction in Trace changes only through its explicit
+save control. When enabled, that instruction reaches whole-round rewrites,
+batched repairs and individual turns. It does not lower the evaluator's
+thresholds or retroactively alter saved grades. Existing rejection controls
+remain available for deliberate acceptance-policy changes.
+
+Diagnostic conversations, trials, requests and complete traces are persisted
+in `data/rejection_lab.sqlite3`. Exact request IDs have durable scoped receipts;
+a lost response can be retried without duplicating the model call or apply.
+One diagnostic model operation runs at a time. Failed or expired operations
+require an explicit new attempt. Opening the inspector never restarts work.
+
+API additions, all authenticated:
+
+- `GET /api/orchestrator/rejections/{id}/workbench?event_seq=N`, with paged
+  `messages_before`, `trials_before`, `trace_before`, and a scoped `trace_id`.
+- `POST /api/orchestrator/rejections/{id}/discuss`, `/try`, or `/apply`, each
+  carrying `event_seq`, `expected_revision` and `request_id`. Discussion adds
+  `message`; a trial adds optional `candidate` and `instruction`; apply adds
+  `trial_id`. Responses expose a durable operation polled through workbench.
+- `POST /api/orchestrator/rejection-lab/settings` with `expected_revision`,
+  `crystal_instruction` and `enabled`.
+
+The [recording investigation](rejection-bottleneck-investigation.md) found a
+specific scheduling delay: the pantry recording worker could await costly
+untinted adverts before reaching accepted dialogue. It now leaves unfinished
+rewrites to the existing writing worker and visits accepted recording work.
+Tests exercise the actual keeper with a blocked writer, accepted pool,
+fallback, banter, off-brief rows and exact voice/wording handoff. This is a
+priority correction, not proof that all prior preparation was stopped: fresh
+XTTS files also existed before deployment. Playback take counts exclude some
+preparation renders, so production evidence uses media files and render
+receipts as well as current booth state.
+
+Deployment on 7 September passed **634 Python tests, 13 Node tests and 223
+isolated Electron assertions**. Both delivered browser pages opened all four
+tabs using authenticated reads with zero review writes or media starts. The
+normal desktop app was reloaded and its three-minute observation confirmed
+the review module loaded and audio stayed paused. The station's enabled,
+paused state and acceptance settings were preserved. See the
+[deployment record](rejection-workbench-deployment.json),
+[validation and source hashes](rejection-workbench-validation.json),
+[live UI check](rejection-workbench-live-ui-check.json) and
+[discussion view](rejection-workbench-discuss.png).
+
+A labelled live discussion completed in 58.4 seconds. A separate generated
+trial completed in 36.8 seconds: rhyme passed, but the deterministic meaning
+check failed. Both the exact candidate and detailed faults remain saved in
+the popup; nothing was applied. This verifies the diagnostic path, not that
+the model's explanation is authoritative or that every rejected line is now
+fixed. The [model check](rejection-workbench-model-check.json) retains the
+occurrence and trial IDs. The first live call also exposed a purpose-label
+error that wrongly applied background admission limits to the discussion;
+the corrected call uses the existing interactive FIFO, tested with two
+background jobs already admitted.
+
+The [recording check](rejection-workbench-recording-check.json) observed ten
+new gallery clips, 99.2 seconds of audio, each with a matching positive XTTS
+synthesis receipt. Accepted items waiting for recording fell from four to
+zero while another item recorded. Fresh preparation also occurred before
+the update; these observations establish continued completion, not a
+controlled speed comparison. Physical LCD verification was unavailable:
+the correct `10.89.1.10/status` endpoint could not connect, Windows reported
+the neighbor unreachable, and no LCD USB bridge was present. The existing
+LCD review controller loaded in the app.
+
+## 20. Rejection-driven crystal repair
+
+The [7 September backend refinement](crystal-refinement-2026-09-07.md)
+audited all 3,065 retained rejection occurrences at a fixed snapshot. It
+separates actual failed wording from empty output, repeated deferred work,
+format conflicts and imperfect language checks. Four old source families
+alone accounted for 1,162 repeated entries; repair progress now keeps the
+latest candidate and a persisted evaluation digest rather than recapturing
+the same failure each time model admission defers it.
+
+All crystal paths use shared source facts and repair instructions. Accepted
+turns survive retries; failed turns carry their actual candidate, missing
+facts and specific grade back to the writer. Original speaker positions and
+complete caller structure remain required. Output planning gives rhyming
+bars room within the configured cap, while finished bars bypass the generic
+prose-fragment filter. Speech cleanup and rhyme segmentation now agree about
+bar boundaries. Exact known transcript-repair instruction echoes are removed
+before source injection, with original files retained.
+
+The [measured prompt reconstruction](crystal-prompt-size-check.json) reduced
+one real request from 63,690 to 15,966 characters while preserving all original
+turns, style passages, world, feedback and factual contracts. Repeated
+instructions and synthetic reports for nonexistent candidates caused most
+of that excess. This is a measured character reduction; latency also depends
+on model admission and decoding. A retained trace separately shows 140.8
+seconds of admission wait followed by 9.2 seconds of inference.
+
+Workbench trials use this same repair builder and retain exact evidence.
+Individual operator decisions still supply literal preference examples;
+explicit future instructions remain reviewable settings. Neither a lower
+rejection count nor a passing lexical screen proves faithful meaning. The
+[integrated replay review](crystal-integrated-replay-review.md) and
+[live trial review](crystal-rewrite-benchmark-review.json) identify remaining
+predicate, location, uncertainty and filler errors. Full reports stay in the
+inspector even where the model receives a compact version of the relevant
+feedback. No historical rejection was bulk-approved by this investigation.
+
+Ordinary first-pass and repair groups plan at most 1,800 output characters,
+respecting a lower configured cap. Original context and turn IDs remain
+available to each group; accepted progress survives admission deferral.
+Oversized individual repairs retain the configured full-cap fallback. This
+lets queued work run between groups without clipping a long turn. It is
+not a wall-clock guarantee: observed GPU-resident decoding still dominated
+one compact production request.
+
+An explicit boolean `reasoning` field on workbench `/try` requests enables
+model thinking for that diagnostic only. It defaults to false and does not
+change station settings or normal production behavior. The two paired
+[reasoning trials](crystal-reasoning-benchmark-review.json) exhausted a
+768-token combined budget before producing final wording, so that setting
+is not a validated production fix. The [targeted rewrite review](crystal-rewrite-second-pass-review.json)
+also distinguishes machine passes from remaining meaning and filler errors.
+Final backend validation passed **733 tests**; see the
+[deployment evidence](crystal-refinement-final-validation.json).
+
+## 21. Flexible style acceptance and learned prompt reminders
+
+**Rejected lines > Learn and improve** now separates learning from acceptance
+mode. Fluid treats insufficient transformation and missing new crystal vocabulary
+as style advisories when meaning, required rhyme, structure, copying and technical
+checks pass. Strict preserves the raw grading behavior. Raw verdicts remain visible;
+neither mode sets a blanket allowance for factual faults.
+
+Automatic learning activates fixed, bounded reminders after the same fault appears
+in three distinct source lines across two known original conversations. Supporting
+occurrences and immutable revisions are inspectable. Changed individual votes can
+retract or confirm support; one-time bulk approval does not train preferences.
+Save explicitly applies drafted controls. Restore rolls back a revision and pauses
+adaptation until Resume; switching learning off does not change acceptance mode.
+
+Authenticated `GET /api/orchestrator/prompt-learning` returns status and history.
+`POST` to that path accepts `expected_revision` with `enabled`, `mode` or `resume`;
+`/refresh` reads recent decline evidence, and `/rollback` additionally takes the
+saved `revision`. These actions do not install trial wording or request playback.
+
+The [7 September deployment](orchestrator-prompt-learning-2026-09-07.md) enabled
+learning and Fluid at revision 2 with 12 reminders. Validation passed 787 Python
+tests, 20 Node tests and 294 isolated Electron assertions. Both delivered pages
+were inspected with writes and media blocked. A replay accepted 13 of 47 retained
+failure occurrences across seven wording pairs, including ten style advisories;
+this is not a production success rate. Two live trials passed raw checks but retained
+meaning/filler problems. Production traces verify actual reminder delivery and one
+fresh synthesis receipt, without proving improved acceptance or sustained throughput.
+See [validation](prompt-learning-validation.json), [live UI](prompt-learning-live-ui-check.json),
+[wording trials](prompt-learning-rewrite-trials.md) and [production evidence](prompt-learning-production.json).
+
+## 22. Nabu stream levels and regular sound effects
+
+Nabu's physical dial is a shared master. Pine Box now adjusts music, DJs and replies
+in their own delivered audio files. Music zero stops only the music pipeline; speech
+50% preserves original gain and 100% gives a limited 2x boost. A speech change applies
+at the next dispatch, including an existing recording. It does not alter audio already
+buffered by the device. Changing music resumes the current record at its current offset.
+See [the implementation and device evidence](nabu-independent-mix-2026-09-07.md).
+
+SFX cadence counts completed recorded host units, with durable deduplication across
+page and hardware delivery. The setting can insert a random sample after every second
+unit and a prepared SFX-character turn every fourth. Original dialogue stays intact;
+optional additions yield to the programme's remaining time. Character turns come from
+an off-air bank checked against the active Crystal and recorded in the selected voice,
+so the playout path does not wait for generation. Muted hardware transport can complete
+without claiming the audio was heard. See [cadence behavior and checks](sfx-cadence-repair.md)
+and [the sample library inventory](sfx-library-and-nabu-2026-09-07.md).

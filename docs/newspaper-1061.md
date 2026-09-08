@@ -60,8 +60,14 @@ plural grammar, and a tint rewrite trying to copy another image's sentence.
 Rejected duplicate tint retains the original copy and receives no tint credit.
 An independent review confirmed these fixes and reran all 22 newspaper tests.
 
-Final live publication verification is pending the last backend restart. A new
-edition will use current material through the normal authenticated print API;
-the fixture is never substituted for live output. If the selected mind has no
-usable source documents, image subjects still receive local copy but cannot
-honestly carry source provenance. The writer's exact phrasing remains variable.
+Final live verification completed after the 6 September restart through the
+normal print API. Extra `2026-09-06-13x1441` published 23 stories and 22 plates.
+Its twelve image stories used twelve distinct images and twelve source files,
+with 39 unique sentences, no repeated sentences and no presenter patter. All
+twelve source hashes matched; nine passages matched the verifier's exact-text
+check. Eleven stories used the seeded fallback while the writer was busy.
+Evidence is in `data/paper_verification/1061/2026-09-06-13x1441`; request #1061
+was archived through the normal resolver with that evidence. No fixture was
+substituted for live output. If the selected mind has no usable documents,
+future image subjects cannot honestly carry source provenance; writer phrasing
+also remains variable.
