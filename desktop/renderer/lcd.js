@@ -15,6 +15,10 @@
   let editionRequest = 0, actionBusy = false, polling = false;
   let stationSkew = 0;
   let currentId = '', currentBegan = 0;
+  // 2026-09-08: the last spoken line is held this long after it ends, then
+  // the screen goes idle - it never falls back to the feed.
+  const LCD_HOLD_MS = 6000;
+  let heldRow = null, heldUntil = 0, heldPan = 0, selectedBegan = 0, selectedId = '';
   const rows = new Map(), liked = new Set();
   const paperImages = new Map();
   const wrapCache = new Map(), paperTiles = new Map();
@@ -356,8 +360,18 @@
     if (selected && rows.has(selected.id)) selected = rows.get(selected.id);
     const recent = [...rows.values()].slice(-5);
     const current = recent.findLast((row) => row.lcdStatus === 'Playing');
-    if ((current?.id || '') !== currentId) { currentId = current?.id || ''; currentBegan = timestamp; }
-    const visible = selected ? [selected] : current ? [current] : recent;
+    // 2026-09-08: the screen shows what is being SAID. A new line
+    // re-baselines the pan; with nothing on the air the last line is held
+    // a beat (the clip's tail is still in the room), then the screen goes
+    // idle and says so. Before this the idle screen was the newest five
+    // feed rows - booth activity, recorded/waiting - panning on the wall
+    // clock, so the text scrolled and jumped while nothing was being said.
+    if (current && current.id !== currentId) { currentId = current.id; currentBegan = timestamp; }
+    if (!current) currentId = '';
+    if (current) { heldRow = current; heldUntil = timestamp + LCD_HOLD_MS; heldPan = timestamp - currentBegan; }
+    const held = !current && heldRow && timestamp < heldUntil ? heldRow : null;
+    if (!current && !held) heldRow = null;
+    const visible = selected ? [selected] : current ? [current] : held ? [held] : [];
     const blocks = visible.map((row) => {
       const text = wrap(row.text, width - 38, size + 'px sans-serif');
       return {row, text, height: size * 1.35 * (text.length + 1) + 12};
@@ -365,14 +379,22 @@
     const available = height - top - (selected ? 36 : 20);
     const full = blocks.reduce((sum, b) => sum + b.height, 0);
     // Slowly reveal every part of long messages; pin the selected message
-    // until the operator closes it or chooses an action.
+    // until the operator closes it or chooses an action. The pan runs on
+    // the spoken line's own clock and freezes when nothing is spoken.
     const overflow = Math.max(0, full - available);
-    const pan = overflow ? ((current ? timestamp - currentBegan : timestamp) / 70) % (overflow + available * 0.5) : 0;
+    if (selected && selected.id !== selectedId) { selectedId = selected.id; selectedBegan = timestamp; }
+    if (!selected) selectedId = '';
+    const panMs = selected ? timestamp - selectedBegan : current ? timestamp - currentBegan : held ? heldPan : 0;
+    const pan = overflow ? (panMs / 70) % (overflow + available * 0.5) : 0;
     let y = top + size + 4 - Math.min(overflow, pan);
     ctx.save(); ctx.beginPath(); ctx.rect(8, top + 1, width - 16, available); ctx.clip();
     if (!blocks.length) {
       ctx.font = size + 'px sans-serif'; ctx.fillStyle = '#c3d4df';
-      wrap('Waiting for booth activity.', width - 32, ctx.font).forEach((line) => {
+      const spinning = station?.now && (station.now.title || station.now.artist);
+      const idle = station?.paused ? 'Paused · nothing is being said'
+        : spinning ? '♪ ' + [station.now.artist, station.now.title].filter(Boolean).join(' - ')
+        : station?.on === false ? 'Off the air' : 'On the air · nothing is being said';
+      wrap(idle, width - 32, ctx.font).forEach((line) => {
         ctx.fillText(line, 16, y); y += size * 1.5;
       });
     }

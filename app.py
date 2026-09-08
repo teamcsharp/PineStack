@@ -12156,10 +12156,15 @@ def pantry_put(key: str, clip: dict[str, Any],
             _held = pantry_spoken_for()
         except Exception:  # noqa: BLE001
             _held = set()
+        # 2026-09-08: the repertoire's clips are material the ceiling makes
+        # room ABOVE - a 96-hour keep of rhymed rounds must not be evicted
+        # by a row count written for a ninety-minute cache.
+        _ceiling = max(_ceiling, len(_held) + PANTRY_MAX_FLOOR // 2)
+    if len(_PANTRY) > _ceiling:
         _loose = sorted((k for k in _PANTRY if k not in _held),
                         key=lambda k: float(_PANTRY[k].get("at") or 0))
         _over = len(_PANTRY) - _ceiling
-        for old in _loose[:_over]:
+        for old in _loose[:max(0, _over)]:
             _PANTRY.pop(old, None)
         # If every last row is spoken for, the ceiling still has to hold -
         # an unbounded pantry is its own outage. Oldest first, and the
@@ -12818,6 +12823,16 @@ PANTRY_BURN_SECONDS = float(os.getenv("PANTRY_BURN_SECONDS", "86400"))
 # apart needs to survive thirty-six hours of resting to do it, and an
 # advert does not go off.
 REPEAT_KEEP_SECONDS = float(os.getenv("REPEAT_KEEP_SECONDS", "259200"))
+# 2026-09-08: "tinted rhetoric should not expire for 96 hours. Once it is
+# rhyming, I need that stored and played and added to the repertoire."
+# A round that went through the crystal and passed is the most expensive
+# thing the station makes (the deep model on every line, minutes of the
+# one lane); measured before this an UNAIRED tinted round died in the
+# larder at ninety minutes and its clips at ninety minutes, and no expiry
+# rule anywhere knew the round was tinted. See tinted_keep_until.
+TINTED_KEEP_SECONDS = float(os.getenv("TINTED_KEEP_SECONDS", "345600"))
+# ...and how many rhymed rounds the larder may hold beside its stock.
+TINTED_KEEP_ROWS = int(os.getenv("TINTED_KEEP_ROWS", "80"))
 _SHELF: dict[str, list[dict[str, Any]]] = {}
 # How many of each to hold. The real governor is prepare_hours (TIME on
 # the shelf); these only stop one content type eating the whole
@@ -13152,6 +13167,131 @@ def shelf_rest_now() -> float:
         return SHELF_REUSE_REST_FLOOR
 
 
+def tinted_keep_until(kind: str, row: Any, stamp: bool = True) -> float:
+    """2026-09-08: when a RHYMED round stops being offered - TINTED_KEEP_SECONDS
+    (96 h) from the moment it was first seen through the crystal.
+
+    0.0 for a plain round, for a bulletin (news dies with its stories), for
+    anything not yet through, and when the crystal is off (nothing rhymes).
+    The stamp is written on the row - and its entry - the first time an
+    expiry question is asked of a tinted row, so every clock that reads
+    keep_until reads the same one; a stamp survives the crystal being
+    turned off later, because the round WAS rhymed."""
+    try:
+        if not isinstance(row, dict) or str(kind) == "news":
+            return 0.0
+        entry = row.get("entry") if isinstance(row.get("entry"), dict) else None
+        got = float(row.get("keep_until") or (entry or {}).get("keep_until") or 0)
+        if got:
+            return got
+        if TINTED_KEEP_SECONDS <= 0 or not dialogue_tint_required():
+            return 0.0
+        if not dialogue_tint_ready(kind, row):
+            return 0.0
+        until = time.time() + TINTED_KEEP_SECONDS
+        if stamp:
+            row["keep_until"] = until
+            row["tinted_seen_at"] = time.time()
+            if entry is not None:
+                entry["keep_until"] = until
+        return until
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def tinted_kept(kind: str, row: Any) -> bool:
+    """Is this a rhymed round inside its keep?"""
+    try:
+        return tinted_keep_until(kind, row) > time.time()
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def row_innings(kind: str, row: Any) -> int:
+    """How many times THIS item may go out: the kind's innings, or the
+    evergreen count for a rhymed round inside its keep (2026-09-08: "stored
+    and played and added to the repertoire" - three innings against a
+    three-hour rest is a souvenir, not a repertoire)."""
+    base = shelf_innings(kind)
+    try:
+        if tinted_kept(kind, row):
+            bonus = int(orch_policy("innings_bonus") or 0)
+            return max(base, max(1, min(60, SHELF_REUSE_MOST_EVERGREEN + bonus)))
+    except Exception:  # noqa: BLE001
+        pass
+    return base
+
+
+def larder_stock_count() -> int:
+    """The larder rows that count against the WRITING cap: viable rounds
+    that are not resting repertoire. A rhymed round that has aired and
+    is resting inside its keep is the repertoire, not the stock - it must
+    not stop a fresh round being written beside it."""
+    try:
+        return sum(1 for e in _LARDER
+                   if dialogue_row_viable("banter", e)
+                   and not (float(e.get("aired_at") or 0) and tinted_kept("banter", e)))
+    except Exception:  # noqa: BLE001
+        return len(_LARDER)
+
+
+def larder_trim() -> None:
+    """2026-09-08: the larder holds larder_cap() rounds of stock PLUS the
+    repertoire - rhymed rounds inside their keep - bounded at
+    TINTED_KEEP_ROWS, oldest-aired first beyond it and never an unheard
+    one. Before this `del _LARDER[:-larder_cap()]` cut the repertoire
+    with the stock on every append."""
+    try:
+        cap = max(1, larder_cap())
+        rep = [e for e in _LARDER if tinted_kept("banter", e)]
+        rep_ids = {id(e) for e in rep}
+        stock = [e for e in _LARDER if id(e) not in rep_ids]
+        if len(rep) > TINTED_KEEP_ROWS:
+            rep.sort(key=lambda e: (1 if row_unaired(e) else 0,
+                                    float(e.get("aired_at") or 0)))
+            rep = rep[len(rep) - TINTED_KEEP_ROWS:]
+        if len(stock) > cap:
+            stock = stock[-cap:]
+        keep = {id(e) for e in rep} | {id(e) for e in stock}
+        _LARDER[:] = [e for e in _LARDER if id(e) in keep]
+    except Exception:  # noqa: BLE001
+        del _LARDER[:-larder_cap()]
+
+
+def repertoire_status() -> dict[str, Any]:
+    """The rhymed rounds being kept, per store, and how much of their keep
+    is left - for the glass and the cupboard."""
+    now = time.time()
+    out: dict[str, Any] = {"keep_hours": round(TINTED_KEEP_SECONDS / 3600.0, 1),
+                           "rows_most": TINTED_KEEP_ROWS, "larder": {}, "shelf": {}}
+    try:
+        kept = [e for e in _LARDER if tinted_kept("banter", e)]
+        out["larder"] = {
+            "kept": len(kept),
+            "aired": sum(1 for e in kept if float(e.get("aired_at") or 0)),
+            "unaired": sum(1 for e in kept if not float(e.get("aired_at") or 0)),
+            "resting": sum(1 for e in kept if float(e.get("aired_at") or 0)
+                           and now - float(e.get("aired_at") or 0) < shelf_rest_now()),
+            "soonest_free_hours": round(min(
+                [max(0.0, shelf_rest_now() - (now - float(e.get("aired_at") or 0))) / 3600.0
+                 for e in kept if float(e.get("aired_at") or 0)] or [0.0]), 2),
+            "keep_left_hours": round(min(
+                [max(0.0, tinted_keep_until("banter", e, stamp=False) - now) / 3600.0
+                 for e in kept] or [0.0]), 1),
+        }
+        for kind, rows in _SHELF.items():
+            k = [r for r in (rows or []) if tinted_kept(str(kind), r)]
+            if k:
+                out["shelf"][str(kind)] = {
+                    "kept": len(k),
+                    "aired": sum(1 for r in k if float(r.get("aired_at") or 0)),
+                    "innings": row_innings(str(kind), k[0]),
+                }
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
     """#1068: when a prepared item stops being offered as stock. An
     unheard row is offered until the burn horizon - old unheard work is an
@@ -13167,14 +13307,17 @@ def stock_expires_at(kind: str, row: dict[str, Any]) -> float:
             return 0.0
         if str(kind) == "news":
             return float(entry.get("prep_news_at") or at) + NEWS_PREP_LIFE
+        # 2026-09-08: a rhymed round lives its keep (96 h) whatever else
+        # the clocks below say.
+        kept_until = tinted_keep_until(kind, row)
         if row.get("aired_at") and shelf_is_repeat(kind, row):
-            return at + REPEAT_KEEP_SECONDS
+            return max(at + REPEAT_KEEP_SECONDS, kept_until)
         # #1074: a verified round nobody has heard yet is the station's best
         # stock, not its oldest rubbish - the 24-hour burn made 6,400 s of
         # recorded gallery and manager rounds invisible to the planner on
         # the first night. An unheard row lives the keep window (three days);
         # the burn horizon still governs the pantry's clips.
-        return at + max(PANTRY_BURN_SECONDS, REPEAT_KEEP_SECONDS)
+        return max(at + max(PANTRY_BURN_SECONDS, REPEAT_KEEP_SECONDS), kept_until)
     except Exception:  # noqa: BLE001
         return 0.0
 
@@ -13209,7 +13352,7 @@ def shelf_is_repeat(kind: str, row: dict[str, Any]) -> bool:
             return False
         if not repeat_safe(kind, row):                            # #1055
             return False
-        return int(row.get("aired") or 0) < shelf_innings(kind)
+        return int(row.get("aired") or 0) < row_innings(kind, row)
     except Exception:  # noqa: BLE001
         return False
 
@@ -13248,9 +13391,10 @@ def shelf_repeats(kind: str = "") -> list[dict[str, Any]]:
                     "kind": one,
                     "label": SHELF_LABEL.get(one, one),
                     "aired": int(row.get("aired") or 0),
-                    "of": shelf_innings(one),
-                    "left": max(0, shelf_innings(one)
+                    "of": row_innings(one, row),
+                    "left": max(0, row_innings(one, row)
                                 - int(row.get("aired") or 0)),
+                    "kept": tinted_kept(one, row),                # 2026-09-08
                     "rest": round(rest, 1),
                     "ready": shelf_repeat_ready(one, row),
                     "at": float(row.get("at") or 0),
@@ -13813,7 +13957,7 @@ def shelf_take(kind: str, voice: str = "",
                 elif str(kind) not in SHELF_REUSABLE:
                     _why.append("already aired")
                     continue        # should not be here at all
-                if int(row.get("aired") or 0) >= shelf_innings(kind):
+                if int(row.get("aired") or 0) >= row_innings(kind, row):
                     _why.append("innings used")   # #1052
                     continue        # it has had its innings
                 # #1059: ...unless the operator has said to raid the
@@ -13919,7 +14063,7 @@ def shelf_take(kind: str, voice: str = "",
             or (time.time() - float(r.get("at") or 0) <= PANTRY_BURN_SECONDS
                 # #977: and an item that has had all its airings is done,
                 # even if the burn would still keep it.
-                and int(r.get("aired") or 0) < SHELF_REUSE_MOST
+                and int(r.get("aired") or 0) < row_innings(str(kind), r)
                 # A completed phone call is history, never stock. Once-
                 # aired non-reusable rows left behind by an older build
                 # cannot occupy the queue or be offered as a "new" call
@@ -25549,8 +25693,10 @@ def _larder_load() -> None:
                            < larder_fresh()
                            or (shelf_is_repeat("banter", r)
                                and time.time() - float(r.get("at") or 0)
-                               <= REPEAT_KEEP_SECONDS))
-                      and _larder_current(r)][:larder_cap()]
+                               <= REPEAT_KEEP_SECONDS)
+                           or tinted_kept("banter", r))          # 2026-09-08
+                      and _larder_current(r)]
+        larder_trim()
         if _stranded:
             pipeline_log("lookahead",
                          f"{_stranded} round(s) were left mid-recording by "
@@ -30978,6 +31124,7 @@ async def larder_keeper() -> None:
                               or (shelf_is_repeat("banter", e)
                                   and time.time() - float(e.get("at") or 0)
                                   <= REPEAT_KEEP_SECONDS)
+                              or tinted_kept("banter", e)         # 2026-09-08
                               or (_paused_hold and row_unaired(e)))
                           and (_larder_current(e)
                                or (_paused_hold and row_unaired(e)))]
@@ -31028,8 +31175,9 @@ async def larder_keeper() -> None:
             cap = min(larder_cap(),
                       (12 if box_down and not radio_paused() else _want)
                       if not radio_paused() else larder_cap())
-            _stocked = sum(1 for e in _LARDER
-                           if dialogue_row_viable("banter", e))
+            # 2026-09-08: the resting repertoire is not stock - it must
+            # not stop a fresh round being written beside it.
+            _stocked = larder_stock_count()
             if _stocked >= cap or _LARDER_WRITING[0]:
                 continue
             if prep_has_assigned_work("banter"):
@@ -31654,7 +31802,7 @@ def dialogue_stock_items(kind: str, include_unready: bool = True,
                 "ready": ready, "seconds": round(actual, 3),
                 "projected_seconds": round(max(actual, projected), 3),
                 "available": round(available, 3),
-                "remaining_airings": (max(1, shelf_innings(road)
+                "remaining_airings": (max(1, row_innings(road, row)
                                            - int(row.get("aired") or 0))
                                        if road in SHELF_REUSABLE
                                        and repeat_safe(road, row) else 1),
@@ -35269,12 +35417,15 @@ def resort_may_drop(kind: str, row: dict[str, Any],
                     keep: set[int] | None = None) -> bool:
     """May this row be let go of at all?
 
-    Two rules, and either one alone is enough to save it: it has never
-    aired, or it is one of the road's last-resort fallbacks."""
+    Three rules, and any one alone is enough to save it: it has never
+    aired, it is one of the road's last-resort fallbacks, or (2026-09-08)
+    it is a rhymed round inside its 96-hour keep."""
     try:
         if row_unaired(row):
             return False
         if id(row) in (keep if keep is not None else resort_keys(kind)):
+            return False
+        if tinted_kept(kind, row):
             return False
     except Exception:  # noqa: BLE001
         return False
@@ -35309,6 +35460,7 @@ def resort_state() -> dict[str, Any]:
     waiting = sum(r["unaired"] for r in out)
     return {
         "at": time.time(), "rows": out,
+        "repertoire": repertoire_status(),                       # 2026-09-08
         "min": RESORT_MIN, "want": resort_want(),
         "say": ((f"{len(thin)} road(s) hold fewer than "
                  f"{resort_want()} fallbacks: "
@@ -38628,7 +38780,7 @@ def hour_needs() -> dict[str, dict[str, float]]:
                     if not r.get("aired_at"):
                         rows.append(r)           # never been out
                         continue
-                    if (int(r.get("aired") or 0) < shelf_innings(road)
+                    if (int(r.get("aired") or 0) < row_innings(road, r)
                             and time.time() - float(r.get("aired_at") or 0)
                             >= shelf_reuse_rest()):
                         rows.append(r)           # rested and has innings
@@ -38841,6 +38993,10 @@ def _dialogue_flow_state_fresh() -> dict[str, Any]:
         "pantry_clips": len(_PANTRY),
         "pantry_mb": round(pantry_bytes() / 1048576, 1),
         "pantry_cap_mb": round(PANTRY_MAX_BYTES / 1048576),
+        # 2026-09-08: the rhymed rounds being kept, and what punctuated
+        # the last silence.
+        "repertoire": repertoire_status(),
+        "gap_filler": sfx_gap_status(),
         "window": pantry_window(),
         # #946: the one entry, if any, that is arriving bare soon enough
         # to be worth a second engine slot.
@@ -39797,6 +39953,14 @@ async def dead_air_watch() -> None:
                 strikes = 0
                 continue
             quiet = time.time() - max(_SPOKE_AT[0], heard)
+            # 2026-09-08: silence is PUNCTUATED long before it is a strike
+            # - a clip that exists, every tick the room stays quiet.
+            if quiet > min(float(limit), 12.0):
+                try:
+                    await sfx_fill_gap(f"the room has been silent {int(quiet)}s",
+                                       under_floor=True)
+                except Exception:  # noqa: BLE001
+                    pass
             if quiet <= limit:
                 continue
             strikes += 1
@@ -43658,7 +43822,8 @@ async def dj_recap_round(track: dict[str, Any] | None = None) -> list[str]:
         + paper_recap_clause())
     return await dj_banter(track, angle=angle, lines=6,
                            render_stream=bool(
-                               dj_settings().get("stream_show", True)))
+                               dj_settings().get("stream_show", True)),
+                           own_material=True)            # the hour's log is the material
 
 
 def _schedule_pin_record() -> dict[str, Any] | None:
@@ -45532,7 +45697,8 @@ def alt_larder_index() -> int:
             # floor and write live. All of them bad answers 0, which is
             # exactly what this road did before any of this shipped.
             if ((time.time() - at >= larder_fresh()
-                 and not shelf_is_repeat("banter", entry))
+                 and not shelf_is_repeat("banter", entry)
+                 and not tinted_kept("banter", entry))            # 2026-09-08
                     or not _larder_current(entry)):
                 continue
             return i
@@ -46718,7 +46884,7 @@ async def recast_job(job: str, kind: str, sid: str, script: str,
                               if dialogue_row_viable("banter", e)]
                 entry["expires_at"] = stock_expires_at("banter", entry)   # #1068
                 _LARDER.append(entry)
-                del _LARDER[:-larder_cap()]
+                larder_trim()                                           # 2026-09-08
             try:
                 _larder_save()
             except Exception:  # noqa: BLE001
@@ -51941,7 +52107,8 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
     began = time.time()
     lines = await dj_banter(None, angle=angle, lines=12,
                             source=(seed or {}).get("file", ""),
-                            bank=bank_to is not None, bank_to=bank_to)
+                            bank=bank_to is not None, bank_to=bank_to,
+                            own_material=True)           # the painting is the material
     if bank_to is not None:
         # #855: THE PICTURES GO WITH THE ROUND. Everything the airing
         # needs in order to know what this round is ABOUT - which
@@ -52063,7 +52230,8 @@ async def dj_reanalysis_round(name: str, desc: str) -> list[str]:
     angle += radio_prompt_instruction("gallery")
     began = time.time()
     lines = await dj_banter(None, angle=angle, lines=8,
-                            source=(seed or {}).get("file", ""))
+                            source=(seed or {}).get("file", ""),
+                            own_material=True)
     gallery_line_mark([name], began)
     if lines and seed:
         speakbox_remember(seed)
@@ -52225,7 +52393,8 @@ async def dj_hawk_round(names: list[str], moods: list[str],
     lines = await dj_banter(None, angle=angle, lines=12,
                             source=(seed or {}).get("file", ""),
                             caller_name=_buyer,
-                            caller_voice=_buyer_voice)
+                            caller_voice=_buyer_voice,
+                            own_material=True)
     gallery_line_mark([n for n, _ in pieces], began,
                       [d for _, d in pieces])                 # #991
     if lines and seed:
@@ -58221,6 +58390,100 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
                      f"{type(exc).__name__}: {exc}"[:160])
 
 
+# 2026-09-08: "I want dead air always being punctuated with SFX clips. If
+# there is a period of dead air, let the sfx attempt to fill it with clips
+# and keep the momentum going." Measured before this: silence was answered
+# only by dropping the needle on the next record (dead_air_watch), the talk
+# gap's last resort was a LIVE render (cover_the_gap), and a floor held for
+# a slow render left the air empty for neither watchdog to touch - the
+# ~23,000 pre-rendered samples and the SFX Guy's recorded liners were never
+# drawn from a silence path.
+_SFX_GAP: dict[str, Any] = {"at": 0.0, "turn": 0, "count": 0, "why": "", "went": ""}
+SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "9"))
+
+
+async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
+    """Punctuate dead air with a clip that already exists - the SFX Guy's
+    prepared station liner off its shelf when he has one (the pantry
+    serves it; nothing renders), else a short sample off the pool - and
+    never a render: the point is to buy the render its time. Returns what
+    went out ("liner" / "sample") or "".
+
+    Never over a voice, never while paused, and it rests SFX_GAP_REST
+    between clips (or the operator's sfx_gap dial, if longer). With
+    `under_floor` it may fire while a writer holds the floor for a render
+    that has not started playing - the one silence #1146's hold used to
+    leave unpunctuated; under the floor only a sample goes out, because
+    a liner takes the floor and would queue behind the round."""
+    try:
+        if radio_paused() or not _RADIO.get("on"):
+            return ""
+        if _SPEAKING[0]:
+            return ""
+        floor_held = _floor_busy()
+        if floor_held and not under_floor:
+            return ""
+        if time.time() - _SPOKE_AT[0] < 2.5:
+            return ""
+        rest = SFX_GAP_REST
+        try:
+            rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
+        except Exception:  # noqa: BLE001
+            pass
+        if time.time() - float(_SFX_GAP.get("at") or 0) < rest:
+            return ""
+        _SFX_GAP["at"] = time.time()
+        _SFX_GAP["turn"] = int(_SFX_GAP.get("turn") or 0) + 1
+        vto = _RADIO.get("voice_to") or "box"
+        try:
+            to_box = (vto in ("box", "both") and box_talk_ok()
+                      and not box_firmware_down_now())
+        except Exception:  # noqa: BLE001
+            to_box = vto in ("box", "both")
+        went = ""
+        drop_voice = ""
+        try:
+            drop_voice = str(dj_settings().get("drop_voice") or "")
+        except Exception:  # noqa: BLE001
+            drop_voice = ""
+        if drop_voice and not floor_held and _SFX_GAP["turn"] % 2 == 0:
+            # A liner written and recorded for this voice earlier (#842):
+            # the same road dj_sting's drop branch takes.
+            _prep = None
+            try:
+                _prep = shelf_take("station_id", voice=drop_voice)
+            except Exception:  # noqa: BLE001
+                _prep = None
+            if _prep and str(_prep.get("text") or "").strip():
+                try:
+                    out = await dj_speak("station_id", None, line=str(_prep["text"]),
+                                         who="drop", voice=drop_voice, name="The SFX Guy")
+                    went = "liner" if out else ""
+                except Exception:  # noqa: BLE001
+                    went = ""
+        if not went:
+            try:
+                went = "sample" if await dj_sting(to_box, who="gap", force=True) else ""
+            except Exception:  # noqa: BLE001
+                went = ""
+        if went:
+            _SFX_GAP["count"] = int(_SFX_GAP.get("count") or 0) + 1
+            _SFX_GAP["why"] = str(why)[:120]
+            _SFX_GAP["went"] = went
+            pipeline_log("air", f"dead air punctuated with a {went}"
+                                + (f" - {why}" if why else "")
+                                + (" (under the floor)" if floor_held else ""))
+        return went
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("air", "the gap filler failed: "
+                     f"{type(exc).__name__}: {exc}"[:160])
+        return ""
+
+
+def sfx_gap_status() -> dict[str, Any]:
+    return {**_SFX_GAP, "rest": SFX_GAP_REST}
+
+
 async def dj_sting(to_box: bool, after: str = "", who: str = "",
                    force: bool = False,
                    sample: Path | None = None) -> str:
@@ -61578,6 +61841,19 @@ async def talk_watch() -> None:
                          "floor_busy": _floor_busy(), "last_speech": dict(_TALK_ACK)},
                         from_node="playing")
             if _SPEAKING[0] or _floor_busy():
+                # 2026-09-08: a floor held for a render that has not
+                # started playing is the one silence neither cover could
+                # touch. It is punctuated with a sample, never a liner.
+                if (not _SPEAKING[0] and _floor_busy()
+                        and quiet >= talk_quiet_limit()):
+                    try:
+                        await sfx_fill_gap(
+                            "the floor is held for "
+                            f"{_FLOOR_OWNER.get('label') or 'a render'} and "
+                            f"nobody has spoken for {int(quiet)}s",
+                            under_floor=True)
+                    except Exception:  # noqa: BLE001
+                        pass
                 continue
             # #1034: the per-seat watch rides the same tick - a due
             # return, or a seat that has sat silent behind the other
@@ -61634,10 +61910,14 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
     # A measured host-speech outage is a playback problem at every talk
     # setting. Spend the separately labelled ready reserve before asking
     # an ordinary cover to synthesize a new line and extend the outage.
+    punctuated = ""
     if not talk_is_incessant() and talk_quiet_for() >= talk_quiet_limit():
         if await continuity_air(why or "the hosts exceeded the speech-gap target"):
             _COVER_AT[0] = time.time()
             return True
+        # 2026-09-08: before the live render below - which extends the hole
+        # - a clip that exists goes out, and the render still follows.
+        punctuated = await sfx_fill_gap(why or "the hosts exceeded the speech-gap target")
     if talk_is_incessant():
         # At the top stop the watchdog spends finished audio. A model call
         # and a new voice render cannot meet the constant-talk gap target.
@@ -61647,11 +61927,13 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
                 return True
         except Exception:
             pass
-        return await continuity_air(why or "the prepared conversation shelf is empty")
+        if await continuity_air(why or "the prepared conversation shelf is empty"):
+            return True
+        return bool(await sfx_fill_gap(why or "the prepared conversation shelf is empty"))
     line = fresh_pool_take()
     text = str(line.get("text") or "").strip()
     if len(text) < 30:
-        return False
+        return bool(punctuated)
     who, voice = cover_speaker(blocked)
     _COVER_AT[0] = time.time()
     pipeline_log("air", f"{who} covers while {blocked}'s line is still "
@@ -61661,11 +61943,11 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
         out = await dj_speak("interject", _RADIO.get("now"), line=text,
                              who=who, voice=voice or None)
     except Exception:
-        return False
+        return bool(punctuated)
     if out and line.get("file"):
         speakbox_remember({"file": line.get("file", ""), "text": text,
                            "lines": [text], "mind": line.get("mind", "")})
-    return bool(out)
+    return bool(out) or bool(punctuated)
 
 
 def fresh_pool_take() -> dict[str, str]:
@@ -62928,7 +63210,8 @@ async def _news_once(hourly: bool = False,
     try:
         _said = await dj_banter(_RADIO.get("now"), angle=angle,
                                 lines=7 if hourly else 6,
-                                bank=bank_to is not None, bank_to=bank_to)
+                                bank=bank_to is not None, bank_to=bank_to,
+                                own_material=True)       # the wire is the material
     finally:
         if bank_to is None:
             airlog_round_clear()                            # #1036 (G1)
@@ -71829,8 +72112,17 @@ async def dj_banter(track: dict[str, Any] | None = None,
                                                    # a conversation
                     call_meta: dict[str, Any] | None = None,
                     shelf_only: bool = False,
+                    own_material: bool = False,    # 2026-09-08: the angle IS the material
                     ) -> list[str]:
     """A short exchange between the two, spoken in their own voices.
+
+    `own_material` (2026-09-08, the rejections census): the round's facts
+    arrive in `angle` - a wire story, the manager's memo, the hour's log, a
+    painting - so no speakbox seed is drawn for it and no verbatim swath is
+    stapled to its head or tail. Measured before this: 113 news rounds held
+    off the air as "never gets to the story the wire carried" because a
+    3,000-character passage of a film transcript opened the bulletin and the
+    model followed it instead of the headlines it was handed.
 
     `angle` overrides the usual random pick — that is how one particular
     topic gets sprung on them on demand. `force_seed` makes this round come
@@ -71958,7 +72250,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             entry["aired"] = int(entry.get("aired") or 0) + 1
             entry["used_by"] = stock_used_by()                            # #1068
             entry["expires_at"] = stock_expires_at("banter", entry)
-            if int(entry["aired"]) < shelf_innings("banter"):
+            if int(entry["aired"]) < row_innings("banter", entry):   # 2026-09-08
                 _LARDER[:] = (_LARDER[:_take_at]
                               + _LARDER[_take_at + 1:] + [entry])
             else:
@@ -72209,9 +72501,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # storyline and every caller road, which between them are most
     # rounds. The slider decides how often a seed is drawn; nothing else
     # should.
-    if not caller_name and not seed and (force_seed
-                                         or random.random() < box_rate_now(
-                                             dj["speakbox_rate"])):
+    if not caller_name and not seed and not own_material and (
+            force_seed or random.random() < box_rate_now(dj["speakbox_rate"])):
         # Best-of-two off the shelf (#418): the rounds open with the
         # more intriguing swath, same scoring the callers use (#359).
         # Pull fuller swaths so they quote entire phrases at each other, not
@@ -72466,8 +72757,13 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # a memo from upstairs — gets one of his lines worked into it anyway.
     # Incessantly is the word he used (#207): the only way to have none is to
     # turn the speakbox down to zero, which is what that slider is for.
+    # 2026-09-08 (the rejections census): ...unless the round's facts ARE
+    # its material (own_material: the wire, the memo, the hour's log, a
+    # painting). Those rounds keep the speakbox's colour (speakbox_flavor
+    # rides every line) but are not handed a second subject to work in:
+    # measured, that second subject is what the news audit cut them for.
     aside = ""
-    if not caller_name and not seed and random.random() < box_rate_now(
+    if not caller_name and not seed and not own_material and random.random() < box_rate_now(
             dj["speakbox_rate"]):
         seed = _source_for_scene(await speakbox_quote())
         if seed:
@@ -73006,7 +73302,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     if _seed_forced and str(seed.get("text") or "").strip():
         _verbatim.append(["head", str(seed["text"]).strip()])
     full_swath: dict[str, Any] = {}
-    if (not _system2_job and not caller_name and random.random() < float(
+    if (not _system2_job and not caller_name and not own_material and random.random() < float(
             _sb.get("speakbox_full_swath_rate") or 0)):
         full_swath = await speakbox_quote(
             # #1078: was 30, and THIRTY LINES is what capped this, not
@@ -73045,7 +73341,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # cancelled by a third. "If the sliders are up for the speaker box
     # rhetoric, there is nothing that can stop it." The budget is what
     # gets expanded to fit, not the material that gets dropped.
-    if not _system2_job and not caller_name and random.random() < min(1.0, float(
+    if not _system2_job and not caller_name and not own_material and random.random() < min(1.0, float(
             _sb.get("speakbox_prepend_rate") or 0) + _lift):
         head = await _fresh_swath()
         if head.get("text"):
@@ -73054,7 +73350,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             speakbox_remember(head)
             _verbatim.append(["head", str(head["text"])])        # #838
     tail: dict[str, Any] = {}
-    if not _system2_job and not caller_name and random.random() < min(1.0, float(   # #867
+    if not _system2_job and not caller_name and not own_material and random.random() < min(1.0, float(   # #867
             _sb.get("speakbox_append_rate") or 0) + _lift):
         tail = await _fresh_swath()
         if tail.get("text"):
@@ -73078,7 +73374,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         _sb_rate = float(_sb.get("speakbox_rate") or 0)
         _seed_text = str((seed or {}).get("text") or "").strip()
         if (not _system2_job and _sb_rate >= 0.95 and _seed_text and not caller_name
-                and not full_swath):
+                and not full_swath and not own_material):
             _flat = re.sub(r"[^a-z0-9 ]+", " ", script.lower())
             _flat = re.sub(r"\s+", " ", _flat)
             _probe = re.sub(r"[^a-z0-9 ]+", " ", _seed_text.lower())
@@ -73385,7 +73681,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
                           if dialogue_row_viable("banter", e)]
             entry["expires_at"] = stock_expires_at("banter", entry)       # #1068
             _LARDER.append(entry)
-            del _LARDER[:-larder_cap()]
+            larder_trim()                                               # 2026-09-08
             try:
                 _INVENTORY_PLAN["at"] = 0.0
                 _COMMITS["at"] = 0.0
@@ -74225,7 +74521,7 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     if _hot_memo:
         _hot_said = await dj_banter(track, lines=3, whole=True,   # #859
                                     bank=bank_to is not None,
-                                    bank_to=bank_to, angle=(
+                                    bank_to=bank_to, own_material=True, angle=(
             "an urgent memo has just come down from the manager upstairs: "
             f"it is VERY hot in the building — {hot:.0f} degrees Celsius, "
             f"{hot * 9 / 5 + 32:.0f} Fahrenheit, straight off the "
@@ -74246,7 +74542,7 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
     # material draw (#841).
     _said = await dj_banter(track, lines=3, whole=True,           # #859
                             bank=bank_to is not None,
-                            bank_to=bank_to, angle=(
+                            bank_to=bank_to, own_material=True, angle=(
         "a memo has just come down from the manager upstairs. One of you "
         "reads it out to the other and to the listeners, and you both react "
         "on air — agree with it, wince at it, push back on it, whatever it "
@@ -74285,7 +74581,7 @@ async def dj_manager_call(text: str, doc: str = "") -> list[str]:
         voice = ""
     host = dj.get("host_name") or "the host"
     return await dj_banter(
-        _RADIO.get("now"), lines=4, source=doc,
+        _RADIO.get("now"), lines=4, source=doc, own_material=True,
         caller_name=boss, caller_voice=voice,
         # One floor up, down an internal line: a little phone crush and no
         # character at all — the calm is the threat.
@@ -74304,7 +74600,7 @@ async def dj_manager_call(text: str, doc: str = "") -> list[str]:
 async def dj_fan_mail(text: str, doc: str = "") -> list[str]:
     """A listener's letter, opened on air and argued over (#636)."""
     return await dj_banter(
-        _RADIO.get("now"), lines=5, source=doc,
+        _RADIO.get("now"), lines=5, source=doc, own_material=True,
         angle=("A letter has arrived at the station addressed to the two of "
                "you. One of you OPENS it on air — the envelope, the paper, "
                "the handwriting, all of it described — and reads it out a "
@@ -76974,7 +77270,17 @@ async def ask_model(prompt: str, limit: int = 300,
     # whole sentences. A clipped line does not beat silence when silence
     # is never what actually airs.
     took = int((time.monotonic() - started) * 1000)
-    if kept and not _is_tint and not control_answer and not _SENTENCE_END.search(kept):
+    # 2026-09-08 (the rejections census): a transcript repair has no sentence
+    # punctuation by nature - the operator's documents are spoken transcripts
+    # - and a JSON-shaped contract reply has none either. 302 of 974 pending
+    # cuts were whole transcript repairs binned as "no finished sentence",
+    # each a 5,000-character ask thrown away. A long repair with no full stop
+    # is the repair; a short one that stops mid-word is still a fragment.
+    _unpunctuated_by_nature = bool(kept) and not _is_tint and (
+        (result_contract == "transcript_repair" and len(kept) >= 400)
+        or kept.lstrip().startswith(("{", "[")))
+    if (kept and not _is_tint and not control_answer and not _unpunctuated_by_nature
+            and not _SENTENCE_END.search(kept)):
         if not line_review_permits("draft_fragment", kept,
                                    reasons=["no finished sentence"],
                                    context={"kind": "model_draft", "who": "",
@@ -83082,6 +83388,11 @@ def tint_evaluate(source: Any, candidate: Any,
         "version": CRYSTAL_GRADER_VERSION, "strength": round(force, 3),
         "grade": "strict" if strict else "meaning",             # #1064
         "advisory": advisory,
+        # 2026-09-08 (the rejections census): what the writer should DO
+        # about the fault, in words - the landing words that did not rhyme
+        # with the crystal's own words that would, the source words the bars
+        # dropped. Rides the REPAIR EVIDENCE and the per-line lesson.
+        "repair_hint": tint_repair_hint(plain, made, faults, _semantic) if faults else "",
         "method": "deterministic content, entity and spelling-rhyme checks",
         "limitations": "Content overlap and spelling rhyme are conservative screening signals, not a phonetic or semantic proof.",
         "semantic": _semantic,
@@ -83119,6 +83430,117 @@ def tint_evaluate(source: Any, candidate: Any,
             "editorial": editorial, "rhyme": bool(rhyme_proved)})
         del _TINT_JUDGE_RING[:-40]
     return report
+
+
+_RHYME_OPTIONS_MEMO: dict[str, Any] = {"vocab": None, "words": {}}
+
+
+def rhyme_options_for(word: str, limit: int = 8) -> list[str]:
+    """Words of the crystal's own vocabulary that land a rhyme on `word`
+    by the very reading the grader uses (_rap_slant, end=True) - so a
+    suggestion the writer takes is one the grader accepts."""
+    word = str(word or "").lower().strip()
+    if len(word) < 2:
+        return []
+    try:
+        vocab = _crystal_vocab()
+    except Exception:  # noqa: BLE001
+        vocab = frozenset()
+    memo = _RHYME_OPTIONS_MEMO
+    if memo["vocab"] is not vocab:
+        memo["vocab"], memo["words"] = vocab, {}
+    if word in memo["words"]:
+        return list(memo["words"][word][:limit])
+    norm = _rap_norm(word)
+    found: list[str] = []
+    for cand in sorted(vocab):
+        if len(cand) < 3 or cand == word or cand in _RAP_STOP or not cand.isalpha():
+            continue
+        if _rap_norm(cand) == norm or cand.startswith(word) or word.startswith(cand):
+            continue
+        try:
+            if _rap_slant(word, cand, end=True):
+                found.append(cand)
+        except Exception:  # noqa: BLE001
+            continue
+        if len(found) >= 40:
+            break
+    # Spread the picks across the alphabet rather than the first eight a-words.
+    step = max(1, len(found) // max(1, limit))
+    picked = found[::step][:limit]
+    if len(memo["words"]) > 2000:
+        memo["words"] = {}
+    memo["words"][word] = picked
+    return list(picked)
+
+
+def tint_repair_hint(plain: str, made: str, faults: list[str], semantic: Any) -> str:
+    """What the writer should do about the grader's faults, in plain words:
+    the landing words that did not rhyme and crystal words that would; the
+    source words, names and numbers the bars dropped; a line returned
+    unchanged. Measured before this: the repair ask carried the fault
+    names and the evaluation JSON, and half the re-asks passed nothing."""
+    bits: list[str] = []
+    faults = [str(f) for f in (faults or [])]
+    try:
+        if any("rhyme" in f for f in faults):
+            ends = [e for e in (_rap_end(b) for b in _rap_bars(str(made or ""))) if e]
+            if len(ends) >= 2:
+                first, last = ends[0], ends[-1]
+                for_first = rhyme_options_for(first, 6)
+                for_last = rhyme_options_for(last, 6)
+                bits.append(f"RHYME: your bars land on '{first}' and '{last}', which do not rhyme. "
+                            f"Land the last bar on a word that rhymes with '{first}'"
+                            + (f" - for example {', '.join(for_first)}" if for_first else "")
+                            + f" - or the first bar on one that rhymes with '{last}'"
+                            + (f" - for example {', '.join(for_last)}" if for_last else "") + ".")
+            elif ends:
+                options = rhyme_options_for(ends[0], 6)
+                bits.append(f"RHYME: only one bar landed, on '{ends[0]}'. Write two short bars "
+                            "separated by ' / ' whose final words rhyme"
+                            + (f" - for example land the second on {', '.join(options)}" if options else "")
+                            + ".")
+            else:
+                bits.append("RHYME: write two short bars separated by ' / ' whose final words rhyme.")
+        if any("semantic" in f or "preservation" in f for f in faults) and isinstance(semantic, dict):
+            parts: list[str] = []
+            names = [str(n.get("text") or n.get("normalized") or "") for n in (semantic.get("missing_names") or [])
+                     if isinstance(n, dict)]
+            names = [n for n in names if n]
+            nums = [str(n.get("value") or "") for n in (semantic.get("missing_numbers") or []) if isinstance(n, dict)]
+            added = [str(n.get("value") or "") for n in (semantic.get("added_numbers") or []) if isinstance(n, dict)]
+            missing = [str(m) for m in (semantic.get("missing") or []) if len(str(m)) > 2][:8]
+            if names:
+                parts.append("say the name " + ", ".join(names))
+            if nums:
+                parts.append("keep the number " + ", ".join(n for n in nums if n))
+            if added:
+                parts.append("drop the number you added: " + ", ".join(a for a in added if a))
+            if semantic.get("question") is False:
+                parts.append("keep the source's question a question, and a statement a statement")
+            if semantic.get("negation") is False:
+                parts.append("keep the source's negation exactly where it stands")
+            if missing:
+                parts.append("put back these source words: " + ", ".join(missing))
+            if parts:
+                bits.append("MEANING: " + "; ".join(parts) + ".")
+        if any("transformed" in f for f in faults):
+            bits.append("STYLE: the bars repeat the source's own wording - recast the syntax and the "
+                        "images in the writer's voice while keeping every fact.")
+        if any("six-word" in f or "copied" in f for f in faults):
+            bits.append("COPYING: do not lift a phrase of six words from the style passages; say it your own way.")
+    except Exception:  # noqa: BLE001
+        return " ".join(bits)
+    return " ".join(bits)
+
+
+def line_review_supersede(gate: str, source: str) -> int:
+    """2026-09-08: a later bar for this exact line passed, so its pending
+    cuts leave the operator's queue as notes."""
+    try:
+        return int(_LINE_REVIEW.supersede(gate, " ".join(str(source or "").split())))
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _tint_flow(node: str, status: str, summary: str,
@@ -84232,6 +84654,8 @@ async def _crystal_whole_resume(turns, resume, world, chunks, kind, model,
             row["text"] = candidate
             row.pop("cut", None)
             answering = candidate
+            if row.get("rejected_candidate") or row.get("review_id"):
+                line_review_supersede("tint", original)
         else:
             row.update(text="", rejected_candidate=candidate)
             refused.append(i)
@@ -84710,6 +85134,8 @@ async def crystal_tint(script: str, kind: str = "",
                             or time.monotonic() > _tint_due):
                         break
                     _faults = "; ".join(_report.get("faults") or [])
+                    if str(_report.get("repair_hint") or "").strip():
+                        _faults = (_faults + " " + str(_report["repair_hint"])).strip()
                     _turn_review_context.update(last_rejected_candidate=str(fresh or ""),
                                                 last_rejected_evaluation=_report,
                                                 last_attempt_id=_attempt_id)
@@ -84822,6 +85248,8 @@ async def crystal_tint(script: str, kind: str = "",
                                 != " ".join(_said.split()).lower())
                 done.append(f"{marker}: {fresh}")
                 answering = fresh
+                if _report.get("ok") and str(fresh or "").strip():
+                    line_review_supersede("tint", _said)    # an earlier cut of this line is moot
                 _progress_turns.append({
                     "marker": marker, "source": _said_hash,
                     "text": str(fresh or _said), "selected": True,
@@ -90867,13 +91295,28 @@ async def cache_purge_api(
             _pantry_save(True)
         except Exception:  # noqa: BLE001
             pass
+    # 2026-09-08: the repertoire - rhymed rounds inside their 96-hour keep
+    # - survives a purge unless the operator says {"force": true}.
+    _force = bool((payload or {}).get("force"))
     if "shelf" in want:
-        gone = sum(len(v or []) for v in _SHELF.values())
-        _SHELF.clear()
+        gone = 0
+        spared = 0
+        for kind in list(_SHELF):
+            rows = list(_SHELF.get(kind) or [])
+            keep_rows = ([] if _force else
+                         [r for r in rows if tinted_kept(str(kind), r)])
+            spared += len(keep_rows)
+            gone += len(rows) - len(keep_rows)
+            _SHELF[kind] = keep_rows
         dropped["shelf"] = gone
+        if spared:
+            dropped["shelf_kept"] = spared
     if "larder" in want:
-        dropped["larder"] = len(_LARDER)
-        del _LARDER[:]
+        keep_rows = [] if _force else [e for e in _LARDER if tinted_kept("banter", e)]
+        dropped["larder"] = len(_LARDER) - len(keep_rows)
+        if keep_rows:
+            dropped["larder_kept"] = len(keep_rows)
+        _LARDER[:] = keep_rows
     if "takes" in want:
         dropped["takes"] = len(_TAKES)
         del _TAKES[:]

@@ -74,11 +74,20 @@ def _integer(value, name, low, high):
 # before the recording) is pending. Measured before this: 4,852 pending rows,
 # 175 of the latest 200 were rewrite_rejected intermediates.
 INFORMATIONAL_DISPOSITIONS = ("rewrite_rejected", "trim", "trimmed")
-TRIAGE_VERSION = 1
+# 2026-09-08 (the rejections census): whole drafts the desk binned and asked
+# for again - a reply with no finished sentence, a trimmed draft, a line the
+# repetition or language gate dropped, an over-long advert, a tint the model
+# ran out of tokens on - are the machine's own retries. 302 of 974 pending
+# rows were "no finished sentence"; nobody can allow a fragment onto the
+# air, so they are notes.
+INFORMATIONAL_GATES = ("draft_fragment", "draft_trimming", "repetition", "language",
+                       "line_quality", "ad_length", "tint_output")
+TRIAGE_VERSION = 2
 
 
-def _initial_status(disposition, technical):
-    if technical or str(disposition or "") in INFORMATIONAL_DISPOSITIONS:
+def _initial_status(disposition, technical, gate=""):
+    if (technical or str(disposition or "") in INFORMATIONAL_DISPOSITIONS
+            or str(gate or "") in INFORMATIONAL_GATES):
         return "noted"
     return "pending"
 
@@ -106,6 +115,7 @@ class LineReviewStore:
                 CREATE INDEX IF NOT EXISTS reviews_status ON line_reviews(review_status, latest_seq DESC);
                 CREATE INDEX IF NOT EXISTS reviews_gate ON line_reviews(gate, review_status, latest_seq DESC);
                 CREATE INDEX IF NOT EXISTS reviews_triage ON line_reviews(review_status, technical, disposition, latest_seq DESC);
+                CREATE INDEX IF NOT EXISTS reviews_supersede ON line_reviews(gate, review_status, source);
                 CREATE TABLE IF NOT EXISTS review_events (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, review_id TEXT NOT NULL,
                     at REAL NOT NULL, body TEXT NOT NULL,
@@ -131,9 +141,10 @@ class LineReviewStore:
             # the pending rows only).
             if int(self._policy.get("triage_version") or 0) < TRIAGE_VERSION:
                 placeholders = ",".join("?" for _ in INFORMATIONAL_DISPOSITIONS)
+                gates = ",".join("?" for _ in INFORMATIONAL_GATES)
                 db.execute("UPDATE line_reviews SET review_status='noted' WHERE review_status='pending' "
-                           "AND (technical=1 OR disposition IN (" + placeholders + "))",
-                           tuple(INFORMATIONAL_DISPOSITIONS))
+                           "AND (technical=1 OR disposition IN (" + placeholders + ") OR gate IN (" + gates + "))",
+                           tuple(INFORMATIONAL_DISPOSITIONS) + tuple(INFORMATIONAL_GATES))
                 self._policy["triage_version"] = TRIAGE_VERSION
                 db.execute("UPDATE review_policy SET body=? WHERE singleton=1", (_json(self._policy),))
                 db.commit()
@@ -174,6 +185,26 @@ class LineReviewStore:
             examples = [row for row in self._preferences
                         if (not kind or row['kind'] == kind) and (not gate or row['gate'] == gate)]
             return copy.deepcopy(examples[:limit])
+
+    def supersede(self, gate, source, note='a later rewrite of this line was accepted'):
+        """A pending cut of a line that has since passed is moot: it leaves
+        the operator's queue as a note that says why. Returns how many."""
+        gate = _gate(gate)
+        source = ' '.join(str(source or '').split())
+        if not source:
+            return 0
+        with self._lock, self._write() as db:
+            # The stored source keeps its own whitespace; the fingerprint does
+            # not. Compare the way the fingerprint does.
+            rows = [row for row in db.execute(
+                        "SELECT id, source FROM line_reviews WHERE gate=? AND review_status='pending'",
+                        (gate,)).fetchall()
+                    if ' '.join(str(row['source'] or '').split()) == source]
+            for row in rows:
+                effect = {"status": "superseded", "say": str(note)[:200], "at": time.time()}
+                db.execute("UPDATE line_reviews SET review_status='noted',effect=?,revision=revision+1 WHERE id=?",
+                           (_json(effect), row['id']))
+            return len(rows)
 
     def latest_seq(self):
         """The newest occurrence's sequence - one cheap max() on the events
@@ -553,7 +584,7 @@ class LineReviewStore:
                     db.execute("INSERT INTO line_reviews VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
                         review_id, fingerprint, gate, source, candidate, _json(reasons), _json(snapshot["context"]),
                         _json(snapshot["evaluation"]), int(technical), disposition,
-                        _initial_status(disposition, technical), 1, 1,
+                        _initial_status(disposition, technical, gate), 1, 1,
                         stamp, stamp, 0, "{}", "{}"))
                 else:
                     review_id = old["id"]
@@ -561,7 +592,7 @@ class LineReviewStore:
                     once = json.loads(old['decision']).get('scope') == 'instance'
                     status = "pending" if once or (technical and old["review_status"] == "allowed") else old["review_status"]
                     # #1088: a note becomes a request only when the line actually leaves the work.
-                    if old["review_status"] == "noted" and _initial_status(disposition, technical) == "pending":
+                    if old["review_status"] == "noted" and _initial_status(disposition, technical, gate) == "pending":
                         status = "pending"
                     if once:
                         db.execute("UPDATE line_reviews SET decision='{}',effect='{}' WHERE id=?", (review_id,))
