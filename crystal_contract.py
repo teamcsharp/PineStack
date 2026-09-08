@@ -78,7 +78,16 @@ def _pronominal_one(tokens, index, end):
     if before in {'the', 'this', 'that', 'another', 'each', 'every', 'only'} and (
             not after or after in {'i', 'you', 'we', 'they', 'he', 'she', 'it', 'who', 'which', 'that',
                                    'is', 'was', 'were', 'with', 'without', 'from', 'in', 'on',
-                                   'right', 'next', 'beside', 'near', '.', ':'}):
+                                   'right', 'next', 'beside', 'near', '.', ':',
+                                   # 2026-09-08 (the rejections census): "this one looks
+                                   # like", "that one sounds" - a demonstrative and "one"
+                                   # before a verb is the pronoun, not a count of one.
+                                   'looks', 'looked', 'seems', 'seemed', 'feels', 'felt', 'has',
+                                   'had', 'does', 'did', 'will', 'would', 'can', 'could', 'goes',
+                                   'went', 'gets', 'got', 'makes', 'made', 'sounds', 'sounded',
+                                   'hits', 'hit', 'works', 'worked', 'stands', 'stood', 'sits',
+                                   'sat', 'comes', 'came', 'says', 'said', 'needs', 'wants',
+                                   'really', 'just', 'actually', 'also', 'still', 'even'}):
         return True
     # #1076: "a deep one", "the quiet one" - an article, an adjective and
     # "one" at the end of its clause is a pronoun, not a count; ten of 41

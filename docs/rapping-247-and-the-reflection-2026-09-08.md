@@ -45,6 +45,21 @@ Changed from the census: the recording room's evidence-less holds are notes, not
 (`recording_tint` joins `INFORMATIONAL_GATES`, triage version 3: the 27 rows leave the queue), and
 the repair hint names an **echo** as an echo, with the shape to write instead.
 
+The analyst's full reading (`docs`-adjacent: the scratch report `rej/analysis/report.md`) added five
+more, all measured **[V]** and all shipped in the second deploy of the evening:
+
+| finding | rows / occurrences | change |
+|---|---|---|
+| 380 of 584 pending rows (65%) were graded by a superseded grader (v4–v8) or on a road changed at 14:33 – not reviewable against today's rules | 380 | triage version 4: they leave the queue as notes marked *stale_grader*, evidence kept |
+| the pronunciation dictionary proved a pair on **1 of 133** refused v9 bars: it was handed the spelling reading's suffix depth, which demands two syllables of match on a word ending in -s/-ed/-age and threw away garage/mirage, steer/near, live/arrive | ≥58 rows / ≥159 occ | `terminal_rhymes` runs without that depth; its own final-stressed-vowel rule still keeps -ness/-ing alone from rhyming (pinned) |
+| the phone road's formula lines – the spoken line number, the greeting by name, the sign-off – cut on every call ("seven five six three eight" cannot rhyme and keep every number) | 31 / 110, 9 of the 14 newest | `_tint_formula_turn`: those turns are read plain and never asked of the deep model |
+| every "too similar to a stored call" matched the queued call on the same scheduled theme, whose sentence sits inside the host's templated question | 26 / 69 | `call_novelty` compares the **caller's** turns only (`_call_caller_text`) |
+| news briefs: `found=[]` on all 122 – a rhymed bulletin paraphrases the headline and never says "news" | 122 | `segment_audit(titles=…)`: the wire's own title words in the script are evidence, passed from `prep_news_titles` at every audit site |
+
+Not changed, on purpose: the semantic gate's negation and question rules (a dropped *not* is a
+real loss more often than not), and the writer's frame already asks for two-to-four bars of twelve
+words – the reflection is the tool that will keep repeating it per road.
+
 ## 1. The operator's own edit, refused - and the rule that refused it
 
 The typed wording (*"Hold on to line seven five six three eight; Hello now, what you see there this

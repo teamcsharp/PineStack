@@ -14271,8 +14271,19 @@ SEGMENT_BRIEF: dict[str, dict[str, Any]] = {
 BRIEF_MIN_CHARS = 120
 
 
-def segment_audit(kind: str, script: str, *, product: str = "") -> dict[str, Any]:
+_BRIEF_TITLE_STOP = frozenset(
+    "about after again against their there these those where which while would could should other "
+    "under until because before being during every first great large little never often since still "
+    "story three today world years after says said".split())
+
+
+def segment_audit(kind: str, script: str, *, product: str = "", titles: str = "") -> dict[str, Any]:
     """#968: does this script do the thing its entry is for?
+
+    2026-09-08 (evening): `titles` are the wire headlines a bulletin was
+    written from; their own words in the script are evidence the story
+    was told. A rhymed bulletin paraphrases the headline and never says
+    "news" - the census found found=[] on all 122 news briefs.
 
     Returns checked=False rather than a verdict for kinds with no brief
     that can be read off the words alone - banter is two people talking
@@ -14295,6 +14306,14 @@ def segment_audit(kind: str, script: str, *, product: str = "") -> dict[str, Any
         out["checked"] = True
         low = " " + " ".join(text.lower().split()) + " "
         found = [w for w in brief.get("any") or () if w in low]
+        if titles:
+            try:
+                wire = {w for w in re.findall(r"[a-z]{5,}", str(titles).lower())
+                        if w not in _BRIEF_TITLE_STOP}
+                hits = sorted(w for w in wire if " " + w in low)
+                found.extend("wire:" + w for w in hits[:6])
+            except Exception:  # noqa: BLE001
+                pass
         if str(kind or "") == "ad" and product:
             sale = ad_sale_evidence(text, str(product))
             out["sale_evidence"] = sale
@@ -14333,9 +14352,9 @@ BRIEF_LOG_KEEP = 60
 
 
 def brief_note(kind: str, label: str, script: str,
-               where: str = "banked", *, product: str = "") -> dict[str, Any]:
+               where: str = "banked", *, product: str = "", titles: str = "") -> dict[str, Any]:
     """#968: audit one round and write the verdict down."""
-    got = segment_audit(kind, script, product=product)
+    got = segment_audit(kind, script, product=product, titles=titles)
     try:
         got["at"] = time.time()
         got["label"] = str(label or "")[:60]
@@ -14480,7 +14499,8 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
             _brief = brief_note(str(kind), str(row.get("label")
                                                or (_entry or {}).get("label")
                                                or kind), _script,
-                                product=str(row.get("product") or (_entry or {}).get("product") or ""))
+                                product=str(row.get("product") or (_entry or {}).get("product") or ""),
+                                titles=str((_entry or {}).get("prep_news_titles") or row.get("prep_news_titles") or ""))
             row["brief"] = _brief
             row["off_brief"] = bool(_brief.get("checked")
                                     and not _brief.get("ok"))
@@ -26250,7 +26270,8 @@ def _pantry_load() -> None:
                                             or (_e or {}).get("label")
                                             or _kind),
                                         _sc, where="restored",
-                                        product=str(_row.get("product") or (_e or {}).get("product") or ""))
+                                        product=str(_row.get("product") or (_e or {}).get("product") or ""),
+                                        titles=str((_e or {}).get("prep_news_titles") or _row.get("prep_news_titles") or ""))
                         _row["brief"] = _b
                         _row["off_brief"] = bool(_b.get("checked")
                                                  and not _b.get("ok"))
@@ -27479,7 +27500,8 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                 try:
                     verdict = brief_note(str(kind),
                                          str(entry.get("label") or kind),
-                                         tinted, where="tinted", product=str(entry.get("product") or ""))
+                                         tinted, where="tinted", product=str(entry.get("product") or ""),
+                                         titles=str(entry.get("prep_news_titles") or ""))
                     entry["brief"] = verdict
                     entry["off_brief"] = bool(verdict.get("checked")
                                               and not verdict.get("ok"))
@@ -27576,7 +27598,8 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
         entry.pop("tint_progress", None)
         try:
             verdict = brief_note(str(kind), str(entry.get("label") or kind),
-                                 fresh, where="tinted", product=str(entry.get("product") or ""))
+                                 fresh, where="tinted", product=str(entry.get("product") or ""),
+                                 titles=str(entry.get("prep_news_titles") or ""))
             entry["brief"] = verdict
             entry["off_brief"] = bool(verdict.get("checked")
                                       and not verdict.get("ok"))
@@ -27676,7 +27699,8 @@ async def ensure_shelf_row_tinted(kind: str, row: dict[str, Any],
         try:
             verdict = brief_note(str(kind), str(row.get("label") or kind),
                                  str(row.get("text") or ""), where="tinted",
-                                 product=str(row.get("product") or ""))
+                                 product=str(row.get("product") or ""),
+                                 titles=str(row.get("prep_news_titles") or ""))
             row["brief"] = verdict
             row["off_brief"] = bool(verdict.get("checked")
                                     and not verdict.get("ok"))
@@ -65253,6 +65277,17 @@ def _call_novelty_terms(script: Any) -> list[str]:
     return list(made)
 
 
+def _call_caller_text(text: str) -> str:
+    """The caller's own turns (C and E) of a labelled transcript, or ""
+    when the transcript carries no labels."""
+    try:
+        rows = [ln for ln in str(text or "").splitlines()
+                if re.match(r"\s*[CE]\s*:", ln, flags=re.I)]
+        return "\n".join(rows)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _call_novelty_grams(script: Any, width: int = 3) -> set[str]:
     words = _call_novelty_terms(script)
     if not words:
@@ -65326,7 +65361,12 @@ def call_novelty(script: Any, include_shelf: bool = True,
     is compared against every call OTHER than its own now."""
     text = call_script_text(script)
     fingerprint = call_fingerprint(text)
-    grams = _call_novelty_grams(text)
+    # 2026-09-08 (evening): the structural comparison reads the CALLER's
+    # turns only. The census found every "too similar to a stored call"
+    # (26 rows, 69 occurrences) matching the queued call on the same
+    # scheduled theme, whose sentence sits verbatim inside the host's own
+    # templated question - the hosts' formula lines were the similarity.
+    grams = _call_novelty_grams(_call_caller_text(text) or text)
     best = 0.0
     matched: dict[str, Any] = {}
     exact = False
@@ -65342,7 +65382,7 @@ def call_novelty(script: Any, include_shelf: bool = True,
         if fingerprint and other_fp == fingerprint:
             exact, best, matched = True, 1.0, row
             break
-        theirs = _call_novelty_grams(other)
+        theirs = _call_novelty_grams(_call_caller_text(other) or other)
         if not grams or not theirs:
             continue
         score = len(grams & theirs) / max(1, len(grams | theirs))
@@ -84073,8 +84113,17 @@ def rap_rhyme_evidence(text, answering=""):
     from crystal_rhyme import terminal_rhymes
     # #1076: the dictionary may prove a landing on "you"/"that"/"by" too;
     # only _RAP_END_EXCL is withheld from it.
+    # 2026-09-08 (evening): ...and it is not handed the SPELLING reading's
+    # suffix depth. _rap_depth demands two syllables of match for a word
+    # that ends in -s, -ed or -age so a shared suffix alone cannot pass
+    # the spelling test; applied to the dictionary it threw away every
+    # perfect one-syllable rhyme on such a word - garage/mirage (AA ZH),
+    # steer/near (IH R), live/arrive (AY V): the census found dictionary
+    # pairs on 1 of 133 refused bars. The dictionary already matches from
+    # the final STRESSED vowel, which is what keeps -ness/-ing alone from
+    # rhyming; that is its guard.
     pronunciation = terminal_rhymes(bars, normalize=_rap_norm,
-        excluded=_RAP_END_EXCL, required_depth=_rap_depth)
+        excluded=_RAP_END_EXCL)
     existing_pairs = {frozenset(pair) for pair in end_pairs}
     for match in pronunciation["pairs"]:
         pair = frozenset(match["words"])
@@ -86009,6 +86058,30 @@ async def _crystal_whole_resume(turns, resume, world, chunks, kind, model,
     return result(prompt, group["limit"])
 
 
+_NUMBER_WORD = r"(?:zero|oh|one|two|three|four|five|six|seven|eight|nine)"
+_TINT_FORMULA = (
+    re.compile(r"\bline\b.{0,12}\b" + _NUMBER_WORD + r"(?:[\s-]+" + _NUMBER_WORD + r"){2,}", re.I),
+    re.compile(r"\b(?:thank you|thanks) for calling\b", re.I),
+    re.compile(r"\bstay with\b.{0,40}\b(?:fm|radio|station)\b", re.I),
+    re.compile(r"^\s*[A-Z][\w' .-]{0,40}, (?:good|great|glad) to have you\b", re.I),
+    re.compile(r"^\s*(?:hold on|hang on|one moment)\b.{0,30}\bline\b", re.I),
+)
+
+
+def _tint_formula_turn(kind: str, said: str) -> bool:
+    """A phone-road formula line the crystal reads plain: the spoken line
+    number, the greeting by name, the sign-off."""
+    try:
+        if str(kind or "") != "caller":
+            return False
+        text = " ".join(str(said or "").split())
+        if not text or len(text) > 240:
+            return False
+        return any(p.search(text) for p in _TINT_FORMULA)
+    except Exception:  # noqa: BLE001
+        return False
+
+
 @_LAB_RUNTIME.scoped("crystal_tint")
 async def crystal_tint(script: str, kind: str = "",
                        verbatim: Any = None,
@@ -86141,9 +86214,16 @@ async def crystal_tint(script: str, kind: str = "",
             turns = []
         coverage_target = crystal_coverage_target()
         coverage_units = (turns if turns else [("", text)])
+        # 2026-09-08 (evening): the phone road's FORMULA lines - the spoken
+        # line number, the greeting, the sign-off - are read plain. The
+        # census found them cut on every call (31 rows, 110 occurrences,
+        # nine of the fourteen newest): a string of digits cannot be
+        # rhymed while every number is kept, and the same five words were
+        # being asked of the deep model three times a call.
         eligible_ix = [i for i, (_m, s) in enumerate(coverage_units)
                        if len(str(s or "").strip()) >= TINT_TURN_FLOOR
-                       and bool(re.search(r"[^\W_]", str(s or "")))]
+                       and bool(re.search(r"[^\W_]", str(s or "")))
+                       and not _tint_formula_turn(kind, str(s or ""))]
         required = ((len(eligible_ix) * coverage_target + 99) // 100
                     if eligible_ix and coverage_target else 0)
         # Coverage is exact and deterministic for a given script. Strength
@@ -93964,7 +94044,8 @@ def line_review_refresh_waiting() -> None:
         entry.pop("tint_tried", None)
         entry.pop("tint_failed_at", None)
         grade = segment_audit(kind, str(entry.get("script") or ""),
-                              product=str(entry.get("product") or row.get("product") or ""))
+                              product=str(entry.get("product") or row.get("product") or ""),
+                              titles=str(entry.get("prep_news_titles") or ""))
         entry["off_brief"] = bool(grade.get("checked") and not grade.get("ok"))
         row["off_brief"] = entry["off_brief"]
         if kind == "caller":
@@ -94040,7 +94121,8 @@ async def line_review_prepare_shelf(kind: str, row: dict[str, Any]) -> bool:
         evidence = row.get("review_tint") or row.get("tint_progress") or {}
         chunks = list(evidence.get("chunks") or [])
         grade = tint_evaluate(source, candidate, chunks, kind=kind)
-        brief = segment_audit(kind, candidate, product=str(row.get("product") or ""))
+        brief = segment_audit(kind, candidate, product=str(row.get("product") or ""),
+                              titles=str(row.get("prep_news_titles") or ""))
         gate = "tint" if not grade.get("ok") and dialogue_tint_required() else "segment_brief"
         failed = (gate == "tint" or (brief.get("checked") and not brief.get("ok")))
         if failed:

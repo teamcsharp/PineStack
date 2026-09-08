@@ -101,6 +101,28 @@ class TriageTests(unittest.TestCase):
         self.assertEqual(row["review_status"], "noted")
         self.assertIn("recording_tint", INFORMATIONAL_GATES)
 
+    def test_cuts_graded_by_a_superseded_grader_leave_the_queue_as_notes(self):
+        ctx = {"kind": "gallery", "who": ""}
+        old = self.store.record("tint", "The plate is copper.", "Copper, the plate, mate.", ["x"], ctx,
+                                evaluation={"version": 4, "faults": ["x"]}, disposition="cut")
+        new = self.store.record("tint", "The plate is silver.", "Silver, the plate, mate.", ["x"], ctx,
+                                evaluation={"version": 9, "faults": ["x"]}, disposition="cut")
+        brief = self.store.record("segment_brief", "A: an old bulletin", "", ["never gets to the story"],
+                                  {"kind": "news", "who": ""}, disposition="cut")
+        with sqlite3.connect(self.path) as db:
+            db.execute("UPDATE line_reviews SET first_at=1788800000 WHERE id=?", (brief["id"],))
+            body = json.loads(db.execute("SELECT body FROM review_policy WHERE singleton=1").fetchone()[0])
+            body["triage_version"] = 3
+            db.execute("UPDATE review_policy SET body=? WHERE singleton=1", (json.dumps(body),))
+            db.commit()
+        reopened = LineReviewStore(self.path)
+        page = reopened.summaries(status="pending", limit=10)
+        self.assertEqual([row["id"] for row in page["items"]], [new["id"]])
+        stale = reopened.get(old["id"])
+        self.assertEqual(stale["review_status"], "noted")
+        self.assertEqual(stale["effect"]["status"], "stale_grader")
+        self.assertEqual(reopened.get(brief["id"])["review_status"], "noted")
+
     def test_a_passed_rewrite_supersedes_the_pending_cuts_of_its_line(self):
         ctx = {"kind": "caller", "who": "B"}
         cut = self.store.record("tint", "Hold on,  line seven.", "Line seven, hold the phone.",

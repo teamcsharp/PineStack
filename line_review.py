@@ -87,7 +87,12 @@ INFORMATIONAL_GATES = ("draft_fragment", "draft_trimming", "repetition", "langua
                        # candidate and no evidence - nothing to allow. The
                        # line goes back to the tint by itself.
                        "recording_tint")
-TRIAGE_VERSION = 3
+TRIAGE_VERSION = 4
+# 2026-09-08 (evening): the grader whose verdicts are reviewable today, and
+# the moment the news, recap, gallery, manager and call roads changed
+# (14:33 CST - own_material). Rows graded before either are notes.
+STALE_GRADER_VERSION = 9
+STALE_ROADS_BEFORE = 1788895980.0
 
 
 def _initial_status(disposition, technical, gate=""):
@@ -150,6 +155,18 @@ class LineReviewStore:
                 db.execute("UPDATE line_reviews SET review_status='noted' WHERE review_status='pending' "
                            "AND (technical=1 OR disposition IN (" + placeholders + ") OR gate IN (" + gates + "))",
                            tuple(INFORMATIONAL_DISPOSITIONS) + tuple(INFORMATIONAL_GATES))
+                # 2026-09-08 (evening): a cut graded by a superseded grader,
+                # or on a road changed since, is not reviewable against
+                # today's rules - 380 of 584 pending rows were. They keep
+                # their evidence as notes that say so.
+                stale = _json({"status": "stale_grader",
+                               "say": "graded by a superseded grader or a road changed since; "
+                                      "not reviewable against today's rules"})
+                db.execute("UPDATE line_reviews SET review_status='noted', effect=? "
+                           "WHERE review_status='pending' AND ("
+                           "(gate IN ('tint','recording_tint') AND COALESCE(json_extract(evaluation,'$.version'),0) < ?)"
+                           " OR (gate IN ('segment_brief','call_contract') AND first_at < ?))",
+                           (stale, STALE_GRADER_VERSION, STALE_ROADS_BEFORE))
                 self._policy["triage_version"] = TRIAGE_VERSION
                 db.execute("UPDATE review_policy SET body=? WHERE singleton=1", (_json(self._policy),))
                 db.commit()
