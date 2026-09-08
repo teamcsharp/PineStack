@@ -194,6 +194,27 @@ def _numbers(text):
                 separators = normalized[tokens[index].end():tokens[finish - 1].start()]
                 if minute is not None and minute <= 59 and not re.search(r'[,;:/]', separators):
                     value, kind, end = f'{_SMALL[token]:02d}:{minute:02d}', 'time', finish
+            # #1075: the same clock, spoken the other two ways the air says
+            # it - "three eighteen" (a teen minute) and "three oh four" (a
+            # single-digit minute). Only a whole hour word followed directly
+            # by its minute is read as a clock; "twenty, four" and "three
+            # plates" remain counts. Measured on the Gazette: "3:18 AM"
+            # spoken as "three eighteen" was refused as a lost time plus two
+            # invented counts (3 and 18).
+            if (value is not None and end == index + 1 and token in _SMALL
+                    and 1 <= _SMALL[token] <= 12 and index + 1 < len(tokens)):
+                following = tokens[index + 1].group()
+                minute, finish = None, index + 2
+                if following in _SMALL and 10 <= _SMALL[following] <= 19:
+                    minute = _SMALL[following]
+                elif (following in {'oh', 'o'} and index + 2 < len(tokens)
+                      and tokens[index + 2].group() in _SMALL
+                      and 1 <= _SMALL[tokens[index + 2].group()] <= 9):
+                    minute, finish = _SMALL[tokens[index + 2].group()], index + 3
+                if minute is not None:
+                    separators = normalized[tokens[index].end():tokens[finish - 1].start()]
+                    if not re.search(r'[,;:/]', separators):
+                        value, kind, end = f'{_SMALL[token]:02d}:{minute:02d}', 'time', finish
         elif (token == 'only' and index > 0 and tokens[index - 1].group() == 'the'
               and end < len(tokens) and tokens[end].group() == 'thing'):
             # "The one thing" and "the only thing" both assert uniqueness.
@@ -289,7 +310,10 @@ def extract_contract(text, stopwords=(), vocabulary=()):
         original = match.group()
         word = _canonical_word(original)
         base = original[:-2] if original.casefold().endswith("'s") else original
-        if (word in stops or word in _NUMBER_WORDS or word in {'noon', 'midnight'}
+        # #1075: "PM" is a meridiem, not a person - "am" was already a stop
+        # word, so "3:49 AM" spoken without its AM passed while "3:49 PM"
+        # spoken without its PM was refused for a missing name.
+        if (word in stops or word in _NUMBER_WORDS or word in {'noon', 'midnight', 'am', 'pm'}
                 or word.split("'")[0] in stops or not any(char.isalpha() for char in base)
                 or ("'" in word and all(part in stops for part in _expanded(original).split()))):
             continue
@@ -395,6 +419,44 @@ def unsupported_positive_contrasts(source, candidate):
     return missing
 
 
+def _clock_hour_forms(value):
+    """'04:00' -> {'4', '16'}: the bare hour a bar may say for a whole-hour clock."""
+    match = re.fullmatch(r'(\d{2}):00', str(value))
+    if not match:
+        return set()
+    hour = int(match.group(1))
+    return {str(hour), str(hour % 12 or 12)}
+
+
+def _reconcile_clock_hours(missing, added):
+    """#1075: "4:00 AM" spoken as "four AM", or "4 AM" written as "4:00 AM",
+    is the same clock - not a lost time plus an invented count. Each
+    whole-hour time on one side is paired, one for one, with a bare
+    matching hour number on the other; every other quantity keeps its
+    exact obligation. Measured on the Gazette: every phones paragraph
+    carries a clock time and the bar that said "four AM" for "4:00 AM"
+    was refused for semantics."""
+    missing = [dict(row) for row in missing]
+    added = [dict(row) for row in added]
+
+    def pair(times, numbers):
+        for row in times:
+            if row['kind'] != 'time':
+                continue
+            forms = _clock_hour_forms(row['value'])
+            for other in numbers:
+                if row['count'] <= 0:
+                    break
+                if other['kind'] == 'number' and other['count'] > 0 and other['value'] in forms:
+                    take = min(row['count'], other['count'])
+                    row['count'] -= take
+                    other['count'] -= take
+    pair(missing, added)
+    pair(added, missing)
+    return ([row for row in missing if row['count'] > 0],
+            [row for row in added if row['count'] > 0])
+
+
 def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floor=.5):
     if not 0 <= anchor_floor <= 1:
         raise ValueError('anchor_floor must be between zero and one')
@@ -415,6 +477,7 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
                        for (kind, value), count in sorted((required_numbers - candidate_numbers).items())]
     added_numbers = [{'kind': kind, 'value': value, 'count': count}
                      for (kind, value), count in sorted((candidate_numbers - required_numbers).items())]
+    missing_numbers, added_numbers = _reconcile_clock_hours(missing_numbers, added_numbers)
     entities = not missing_names and not missing_numbers and not added_numbers
     question = original['question'] == made['question']
     # Preserve the existing polarity gate; repeated "No, I won't" need not

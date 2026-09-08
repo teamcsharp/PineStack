@@ -82931,6 +82931,18 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
             raise
         except Exception:  # noqa: BLE001
             pass
+        # #1075: handed back a SECOND time is the verdict. The unchanged
+        # source used to fall through to the grader, where fluid acceptance
+        # waives "not transformed" and plain prose rhymes by accident often
+        # enough (34% of one Gazette edition's paragraphs, measured with the
+        # station's own detector) to be filed as a bar: the paper logged
+        # "tinted (280->280 chars)" on paragraphs it then refused, and a
+        # single-line road would have recorded its plain words as tinted.
+        if " ".join(out.split()).lower() == " ".join(said.split()).lower():
+            _last_rejected.update(candidate=out, evaluation={
+                "ok": False, "technical": True,
+                "faults": ["the rewrite returned the line unchanged after a second ask"]})
+            return failed()
     # A model that answered instead of rewriting, or that returned the
     # label with it, is corrected rather than trusted.
     out = _tint_out_clean(out)                                       # #1064
@@ -83090,9 +83102,42 @@ def _tint_quiet(road: str, why: str, said: str) -> str:
     return said
 
 
+def _crystal_line_refused(failure: Any, said: str, why: str, started: float,
+                          report: dict[str, Any] | None = None,
+                          part: int = 0, parts: int = 0) -> str:
+    """#1075: a refused turn hands the SOURCE back (CrystalTurnFailure is a
+    str equal to it), and crystal_line used to grade that source against
+    itself. Two consequences, both measured on the Gazette press: a second
+    rejection row per refusal with the plain words as the "candidate" (half
+    of the paper's 49 ledger rows), and - because fluid acceptance waives
+    "not transformed" and plain prose rhymes by accident (34% of an
+    edition's paragraphs) - a PASS on the plain words often enough that the
+    pipeline logged "tinted (280->280 chars)" and a single-line road could
+    file its plain line as a bar. crystal_turn has already put the real
+    refusal in the ledger; this counts it, names it, fills the caller's
+    report, and returns the source unchanged and unproved."""
+    evaluation = dict(getattr(failure, "evaluation", None) or {})
+    faults = [str(f) for f in (evaluation.get("faults") or [])] or ["the rewrite was refused"]
+    candidate = " ".join(str(getattr(failure, "rejected_candidate", "") or "").split())
+    try:
+        tint_spend_note(time.monotonic() - started)
+    except Exception:  # noqa: BLE001
+        pass
+    tint_seen("refused")
+    if report is not None:
+        report.update(ok=False, faults=faults, candidate=candidate,
+                      evaluation=evaluation, part=part, parts=parts)
+    pipeline_log("crystal", f"(#1075) {why or 'a line'} stays as written - "
+                 "the crystal refused it"
+                 + (f" at sentence {part} of {parts}" if part else "")
+                 + ": " + "; ".join(faults)[:200])
+    return said
+
+
 async def crystal_line(text: str, why: str = "", room: int = 6,
                        keep: list[str] | None = None,
-                       kind: str = "", model: str = "") -> str:
+                       kind: str = "", model: str = "",
+                       report: dict[str, Any] | None = None) -> str:
     """#1038: THE SECOND PASS, on one piece of speech, for every road.
 
     The banked round has had this since #1006. Nothing else did - not
@@ -83173,6 +83218,8 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         if room < 2:
             out = await crystal_turn(said, world, chunks, keep=keep,
                                      kind=kind, model=model)
+            if isinstance(out, CrystalTurnFailure):                # #1075
+                return _crystal_line_refused(out, said, why, started, report)
         else:
             # Sentence by sentence, each one written knowing the last.
             bits = [b.strip() for b in
@@ -83184,6 +83231,8 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
             if len(bits) < 2:
                 out = await crystal_turn(said, world, chunks, keep=keep,
                                          kind=kind, model=model)
+                if isinstance(out, CrystalTurnFailure):            # #1075
+                    return _crystal_line_refused(out, said, why, started, report)
             else:
                 done: list[str] = []
                 for bit_index, bit in enumerate(bits):
@@ -83195,6 +83244,9 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
                         bit, world, chunks,
                         answering=(done[-1] if done else ""),
                         keep=keep, kind=kind, model=model)
+                    if isinstance(got, CrystalTurnFailure):        # #1075
+                        return _crystal_line_refused(got, said, why, started, report,
+                                                     part=bit_index + 1, parts=len(bits))
                     if not tint_output_ready(got):
                         rejected = tint_evaluate(bit, got, chunks,
                             done[-1] if done else "", crystal_force(), kind)
@@ -83214,6 +83266,14 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
         out = " ".join(str(out or "").split()).strip()
         if len(out) < TINT_TURN_FLOOR // 2:
             return said
+        if out.lower() == " ".join(said.split()).lower():
+            # #1075: never grade the source against itself - an unchanged
+            # line is unproved, whatever it rhymes with by accident.
+            tint_seen("refused")
+            if report is not None:
+                report.update(ok=False, candidate=out, evaluation={},
+                              faults=["the rewrite came back unchanged"])
+            return _tint_quiet(why, "the rewrite came back unchanged", said)
         evaluation = tint_evaluate(said, out, chunks, force=crystal_force(),
                                    kind=kind)
         if not evaluation.get("ok"):
@@ -83223,8 +83283,13 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
                          "road": why, "chunks": chunks, "crystal": world},
                 evaluation=evaluation, disposition="rewrite_rejected")
             tint_seen("refused")                                    # #1064
+            if report is not None:                                  # #1075
+                report.update(ok=False, candidate=out, evaluation=evaluation,
+                              faults=list(evaluation.get("faults") or []))
             return said
         tint_seen("tinted")                                         # #1064
+        if report is not None:                                      # #1075
+            report.update(ok=True, candidate=out, evaluation=evaluation, faults=[])
         _tint_output_note(out, evaluation)
         # #1042: the answer, filed against the passage that caused it.
         for _c in chunks:
@@ -107665,8 +107730,17 @@ def paper_tint_units(story: dict[str, Any]) -> list[dict[str, Any]]:
             continue
         for field in ("q", "a"):
             text = str(row.get(field) or "").strip()
-            if len(text) >= TINT_TURN_FLOOR:
-                units.append({"key": f"qa:{i}:{field}", "text": text})
+            if len(text) < TINT_TURN_FLOOR:
+                continue
+            # #1075: an answer in quotation marks is what the log says
+            # they said, verbatim - the intro of every interview promises
+            # exactly that. Rewriting it is a misquote, and under the hold
+            # the line was a bar when it aired (5 of 6 quoted answers in
+            # the 04:01 edition already carry rhyme evidence unchanged).
+            if (field == "a" and len(text) >= 2 and text[0] in "\"“"
+                    and text[-1] in "\"”"):
+                continue
+            units.append({"key": f"qa:{i}:{field}", "text": text})
     for i, row in enumerate(meta.get("classifieds") or []):
         if isinstance(row, dict) and len(str(row.get("body") or "").strip()) >= 24:
             units.append({"key": f"classified:{i}", "text": str(row["body"]).strip()})
@@ -107762,12 +107836,14 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
         if len([b for b in re.split(r"(?<=[.!?])\s+", source.strip()) if b.strip()]) >= 2:
             rooms.append(3)
         out, deferred, accepted = source, "", False
+        _verdict: dict[str, Any] = {}                                     # #1075
         for _room in rooms:
             out, deferred = source, ""
             for _try in range(4):
                 try:
                     out = await crystal_line(source, why, _room, kind="paper",
-                                             model=tint_fast_model() or "")
+                                             model=tint_fast_model() or "",
+                                             report=_verdict)
                     deferred = ""
                     break
                 except WritingDeferred as exc:
@@ -107804,11 +107880,16 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
             accepted = not bool(sentences(out) & others)
         key = hashlib.sha1(out.lower().encode("utf-8", "ignore")).hexdigest()
         evaluation = dict(_TINT_OUTPUT_READY.get(key) or {}) if accepted else {}
+        if not accepted and not evaluation:
+            # #1075: the refusal's own grade, not a generic sentence - the
+            # operator reads this line on the page's status.
+            evaluation = dict(_verdict.get("evaluation") or {})
+        _why_not = "; ".join(str(f) for f in (_verdict.get("faults") or []))[:300]
         report["paragraphs"].append({"key": unit["key"], "ok": accepted,
             "source_hash": hashlib.sha1(source.encode("utf-8", "ignore")).hexdigest(),
             "output_hash": hashlib.sha1(out.encode("utf-8", "ignore")).hexdigest() if accepted else "",
             "faults": ("; ".join(evaluation.get("faults") or []) if accepted
-                       else "the crystal refused the rewrite or stood down (#1071)")})
+                       else (_why_not or "the crystal refused the rewrite or stood down (#1071)"))})
         if accepted:
             _paper_tint_store(story, unit["key"], out)
             if city_image:
@@ -107818,7 +107899,10 @@ async def paper_tint_story(story: dict[str, Any], why: str) -> bool:
         _tint_flow("paper_tint", "passed" if accepted else "failed",
                    "Newspaper paragraph tint evaluated", {
                    "story": story.get("slug"), "paragraph": unit["key"],
-                   "source": source, "candidate": out, "evaluation": evaluation,
+                   "source": source,
+                   # #1075: the refused CANDIDATE, not the source echoed back.
+                   "candidate": out if accepted else str(_verdict.get("candidate") or out),
+                   "evaluation": evaluation,
                    "coverage": {k: v for k, v in report.items() if k != "paragraphs"}},
                    trace_id, "tint_judge")
     report["met"] = bool(report["required"] and report["changed"] >= report["required"])

@@ -69,6 +69,43 @@ RECIPES = {
 }
 OUTCOME_WINDOW = 4000
 MIN_OUTCOME_SOURCES = 8
+# #1076: the exploration trigger. A recipe was explored only when three in
+# four exposures in one exact cohort failed on its family; measured on the
+# live ledger (1,349 attempts, 240 cohorts) the highest family rate was
+# 0.39 and the typical one 0.05-0.15, so every recipe stayed "baseline"
+# through 23 revisions. A family that still carries a sixth of a road's
+# refusals after the reminder is a reason to try the next procedure: a
+# tenth of a road's model responses failing on one family (the live
+# caller rhyme family measured 0.118 over 314 responses).
+EXPLORE_TARGET_RATE = 0.10
+# The status page reports this many cohorts; the recipe decision reads all
+# of them (a truncated list hid whole roads from their own hints).
+COHORT_REPORT_LIMIT = 240
+# ...and "supported" needs the family rate to fall by this fraction (was an
+# absolute 0.15, which a 0.15 baseline could only meet by vanishing).
+EXPLORE_IMPROVEMENT = 0.6
+
+
+def _pool(rows):
+    """One baseline recipe's exposures summed across cohorts that differ only
+    by prompt/grader/contract version. Three version bumps in a day restart
+    every exact cohort; the question "is this family still failing on this
+    road under this model" does not restart with them. Parents take the
+    largest cohort's count so repeated sources cannot inflate support."""
+    rows = [r for r in rows if r]
+    if not rows:
+        return None
+    sources = sum(r["sources"] for r in rows)
+    counts = {key: sum(r[key] for r in rows) for key in
+              ("raw_passes", "effective_passes", "semantic_failures", "rhyme_failures", "target_failures")}
+    attempts = sum(int((r.get("attempt_counts") or {}).get("attempts") or 0) for r in rows)
+    attempt_counts = {key: sum(int((r.get("attempt_counts") or {}).get(key) or 0) for r in rows) for key in
+                      ("effective_passes", "semantic_failures", "rhyme_failures", "target_failures")}
+    return {"sources": sources, "parents": max(r["parents"] for r in rows),
+            "cohort": "pooled:" + ",".join(sorted({str(r["cohort"]) for r in rows}))[:600],
+            "rates": {key: round(value / sources, 4) for key, value in counts.items()},
+            "attempt_counts": {"attempts": attempts, **attempt_counts},
+            "attempt_rates": {key: round(value / max(1, attempts), 4) for key, value in attempt_counts.items()}}
 
 
 def _outcome(row):
@@ -422,7 +459,7 @@ class PromptLearningStore:
             exposure = {**row, "linked": is_linked, "prior_comparable": prior_comparable,
                         "prior_faults": list(prior["faults"]) if is_linked else []}
             for strategy in row["strategy_ids"]:
-                group = groups.setdefault((cohort, strategy), {"rows": {}, "cohort": cohort,
+                group = groups.setdefault((cohort, strategy), {"rows": {}, "attempts": [], "cohort": cohort,
                     "strategy_id": strategy, "comparable": comparable, "kind": row["kind"],
                     "model": row["model"], "profile": row["profile"], "prompt_version": row["prompt_version"],
                     "grader_version": row["grader_version"], "contract_version": row["contract_version"],
@@ -430,11 +467,23 @@ class PromptLearningStore:
                 # Latest observed exposure per distinct source in this cohort;
                 # retry volume cannot disguise repeated failures as new data.
                 group["rows"].setdefault(row["source_hash"], exposure)
+                # #1076: ...but retry volume IS the cost. A line that passes
+                # on its twelfth attempt counted as a clean success here, so
+                # no family ever looked persistent (measured: the caller
+                # rhyme family read 0.0 while the journal held 292 caller
+                # rhyme refusals in six hours). Every attempt is counted too.
+                group["attempts"].append(exposure)
         cohorts = []
         for group in groups.values():
             exposure = list(group.pop("rows").values())
+            attempts = group.pop("attempts")
             n = len(exposure)
             family = group["strategy_id"].rsplit(":", 2)[-2]
+            attempt_counts = {"attempts": len(attempts),
+                "effective_passes": sum(r["effective_ok"] for r in attempts),
+                "semantic_failures": sum(not r["semantic_ok"] for r in attempts),
+                "rhyme_failures": sum(not r["rhyme_ok"] for r in attempts),
+                "target_failures": sum(family in r["faults"] for r in attempts)}
             counts = {"raw_passes": sum(r["machine_ok"] for r in exposure),
                 "effective_passes": sum(r["effective_ok"] for r in exposure),
                 "semantic_failures": sum(not r["semantic_ok"] for r in exposure),
@@ -448,6 +497,8 @@ class PromptLearningStore:
             resolved = sum(family not in r["faults"] for r in pairs)
             cohorts.append({**group, "sources": n, "parents": len({r["parent_hash"] for r in exposure}),
                 **counts, "rates": {k: round(v / n, 4) for k, v in counts.items() if k.endswith(("passes", "failures"))},
+                "attempt_counts": attempt_counts,
+                "attempt_rates": {k: round(v / max(1, len(attempts)), 4) for k, v in attempt_counts.items() if k != "attempts"},
                 "same_family_repairs": {"pairs": len(pairs), "resolved": resolved,
                     "rate": round(resolved / len(pairs), 4) if pairs else None},
                 "attempt_ids": [r["attempt_id"] for r in exposure[:MAX_EVIDENCE]]})
@@ -458,7 +509,7 @@ class PromptLearningStore:
                 "measured_attempts": {"all": totals(rows),
                     "first": totals([r for r in rows if r["stage"] == "first"]),
                     "repair": totals([r for r in rows if r["stage"] == "repair"])},
-                "excluded": ignored, "cohorts": cohorts[:240],
+                "excluded": ignored, "cohorts": cohorts,
                 "basis": "Distinct-source measured attempts in matched model/profile/version/length cohorts. Observational rates are not causal proof or acoustic proof."}
 
     def _recipe(self, hint, incumbent=None):
@@ -483,28 +534,42 @@ class PromptLearningStore:
             # evidence that an old failed recipe should start again.
             return {k: copy.deepcopy(incumbent[k]) for k in (
                 "strategy_id", "recipe_version", "phase", "recipe_reason", "text", "outcome_cohort")}
-        if enough(baseline) and baseline["rates"]["target_failures"] >= .75:
+        # #1076: exploration may start on the baseline pooled across versions
+        # (same road, model, length band and stage); the v1-versus-v2
+        # comparison still runs inside one exact cohort when it has enough,
+        # and against the pooled baseline when only the pool does.
+        pooled = None if pinned else _pool([r for r in relevant if r["strategy_id"] == base_id + ":v1"])
+        reference = baseline if enough(baseline) else (pooled if enough(pooled) else None)
+        # Attempt-level rates: the share of model responses that failed on
+        # this family, not the share of sources whose latest response did.
+        rates_of = lambda r: r.get("attempt_rates") or r["rates"]
+        if reference is not None and rates_of(reference)["target_failures"] >= EXPLORE_TARGET_RATE:
+            basis = ("Persistent matched-cohort failures" if reference is baseline
+                     else "Persistent failures pooled across prompt/grader versions")
             for trial in (2, 3):
-                version, phase, reason = trial, "exploring", "Persistent matched-cohort failures justify testing this recipe; improvement is unproven."
+                version, phase, reason = trial, "exploring", basis + " justify testing this recipe; improvement is unproven."
                 measured = matched.get(base_id + ":v" + str(trial))
                 if not enough(measured):
                     break
-                rates, before = measured["rates"], baseline["rates"]
-                improved = (rates["target_failures"] <= before["target_failures"] - .15
+                rates, before = rates_of(measured), rates_of(reference)
+                improved = (rates["target_failures"] <= before["target_failures"] * EXPLORE_IMPROVEMENT
                     and rates["effective_passes"] > before["effective_passes"]
                     and rates["semantic_failures"] <= before["semantic_failures"]
                     and rates["rhyme_failures"] <= before["rhyme_failures"])
                 if improved:
                     phase, reason = "supported", "Matched observations improved without a higher factual or rhyme failure rate; not causal proof."
                     break
-                if measured["sources"] < 16 and rates["target_failures"] < .75:
+                if measured["sources"] < 16 and rates["target_failures"] < EXPLORE_TARGET_RATE:
                     break
                 if trial == 3:
                     phase, reason = "exhausted", "All bounded recipes failed to establish improvement. Base factual and rhyme requirements remain active."
         text = CATALOG[hint["pattern"]] if version == 1 else RECIPES[hint["pattern"]][version - 2]
         return {"strategy_id": base_id + ":v" + str(version), "recipe_version": version,
                 "phase": phase, "recipe_reason": reason, "text": "" if phase == "exhausted" else text,
-                "outcome_cohort": latest}
+                "outcome_cohort": latest,
+                **({"reference_rates": copy.deepcopy(rates_of(reference)), "reference_sources": reference["sources"],
+                    "reference_attempts": int((reference.get("attempt_counts") or {}).get("attempts") or 0),
+                    "reference_pooled": reference is not baseline} if reference is not None else {})}
 
     def _revise(self, db, state, reason, *, after=None, patterns=None, trigger=None, aggregates=None):
         self._outcome_status = self._outcomes(db)
@@ -554,7 +619,9 @@ class PromptLearningStore:
                        "classification": {"version": CLASSIFIER_VERSION,
                            "pending": db.execute("SELECT COUNT(*) FROM prompt_evidence WHERE COALESCE(json_extract(body,'$.classifier_version'),1) < ?", (CLASSIFIER_VERSION,)).fetchone()[0],
                            "migrations": db.execute("SELECT COUNT(*) FROM prompt_classifications").fetchone()[0]},
-                       "outcomes": copy.deepcopy(self._outcome_status),
+                       "outcomes": {**copy.deepcopy(self._outcome_status),
+                                    "cohorts": copy.deepcopy(self._outcome_status.get("cohorts", [])[:COHORT_REPORT_LIMIT]),
+                                    "cohort_count": len(self._outcome_status.get("cohorts", []))},
                        "recipe_history": [{k: copy.deepcopy(r.get(k)) for k in (
                            "id", "strategy_id", "recipe_version", "phase", "recipe_reason", "outcome_cohort")}
                            for r in self._recipe_history.values()],
