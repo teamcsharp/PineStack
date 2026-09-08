@@ -467,6 +467,28 @@ class System2Store:
             rows = [json.loads(raw[0]) for raw in db.execute('SELECT body FROM s2_candidates WHERE kind=?', (slot['kind'],))]
             return [row for row in rows if row.get('slot_id') == slot_id and self._slot_matches(row, slot)]
 
+    def candidates_by_slot(self, slot_ids):
+        """#1070: the bound drafts of a whole hour in one decode of the candidate
+        table. candidates_for_slot asked per slot decoded every body of the kind
+        forty times a refresh; the C decoder holds the GIL, and the air clock on
+        the main thread lost most of those contests."""
+        ids = [str(s) for s in slot_ids]
+        out = {sid: [] for sid in ids}
+        with self._lock, closing(self._connect()) as db:
+            slots = {}
+            for sid in ids:
+                slot = self._get(db, 's2_slots', sid)
+                if slot: slots[sid] = slot
+            kinds = sorted({slot['kind'] for slot in slots.values()})
+            if not kinds: return out
+            marks = ','.join('?' * len(kinds))
+            for raw in db.execute('SELECT body FROM s2_candidates WHERE kind IN (%s)' % marks, tuple(kinds)):
+                row = json.loads(raw[0])
+                slot = slots.get(row.get('slot_id'))
+                if slot and self._slot_matches(row, slot):
+                    out[slot['id']].append(row)
+        return out
+
     def allocate_current(self, slot_id, candidate_id, *, expected_revision=None):
         """Bind actual current media without stealing owned or future planned work."""
         with self._tx() as db:

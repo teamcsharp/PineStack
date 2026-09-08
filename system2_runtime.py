@@ -289,15 +289,18 @@ class System2Runtime:
                                target_seconds=min(15.0, seconds), allocation_mode="current")
         return out
 
-    async def refresh(self, force=False):
+    REFRESH_SECONDS = 60.0   # #1070: was 15; each refresh decodes every candidate body twice
+
+    async def refresh(self, force=False, want_status=True):
         # #1070: status() deep-copies every plan (about a megabyte) and the
-        # UI polls it every 15 seconds; build it in a worker thread so the
-        # air clock is not the one paying for the copy.
-        if not force and time.time() - self._last_refresh < 15:
-            return await asyncio.to_thread(self.status)
+        # UI polls it; build it in a worker thread so the air clock is not
+        # the one paying for the copy, and skip it when the caller only
+        # wants the refresh itself.
+        if not force and time.time() - self._last_refresh < self.REFRESH_SECONDS:
+            return await asyncio.to_thread(self.status) if want_status else None
         async with self._refresh_lock:
-            if not force and time.time() - self._last_refresh < 15:
-                return await asyncio.to_thread(self.status)
+            if not force and time.time() - self._last_refresh < self.REFRESH_SECONDS:
+                return await asyncio.to_thread(self.status) if want_status else None
             candidates = await asyncio.to_thread(self.inventory)
             self.store.sync_candidates(candidates, replace=True)
             self._candidates = candidates
@@ -330,12 +333,15 @@ class System2Runtime:
             self._plans = plans
             self._event_plans = event_plans
             self._last_refresh = time.time()
-        return await asyncio.to_thread(self.status)
+        return await asyncio.to_thread(self.status) if want_status else None
 
     def include_drafts(self, hour):
-        for slot in hour.get("slots", []):
+        slots = hour.get("slots", [])
+        # #1070: one decode of the candidate table for the hour, not one per slot.
+        by_slot = self.store.candidates_by_slot([slot["id"] for slot in slots])
+        for slot in slots:
             staged = {item["candidate"]["id"] for item in slot.get("allocations", [])}
-            slot["drafts"] = [row for row in self.store.candidates_for_slot(slot["id"]) if row["id"] not in staged]
+            slot["drafts"] = [row for row in by_slot.get(slot["id"], []) if row["id"] not in staged]
         return hour
 
     def scripts(self, hour_id):
@@ -346,10 +352,16 @@ class System2Runtime:
                 slot["drafts"] = [row for row in self.store.candidates_for_slot(slot["slot_id"]) if row["id"] not in staged]
         return result
 
-    def status(self):
+    def status(self, copy_plans=True):
+        # #1070: copy_plans=False hands the live plan lists to a caller that
+        # only serialises them at once (json.dumps holds the GIL for its whole
+        # run, so no other thread can change a plan underneath it); every
+        # other caller gets its own copy as before.
+        plans = copy.deepcopy(self._plans) if copy_plans else self._plans
+        event_plans = copy.deepcopy(self._event_plans) if copy_plans else self._event_plans
         return {"version": 1, "config": dict(self.config), "enabled": self.enabled,
                 "at": time.time(), "refreshed_at": self._last_refresh,
-                "hours": copy.deepcopy(self._plans),
+                "hours": plans,
                 "work": {k: copy.deepcopy(v) for k, v in self._work.items() if k not in ("calls", "template")},
                 "errors": list(self._errors[-10:]),
                 "inventory": {"candidates": len(self._candidates),
@@ -357,7 +369,7 @@ class System2Runtime:
                 "paused": self.host.radio_paused(), "on": bool(self.host._RADIO.get("on")),
                 "repeat_seconds": 3600, "events": self.store.events(limit=100),
                 "jobs": self.store.jobs(states=["pending", "working"], limit=100),
-                "event_plans": copy.deepcopy(self._event_plans)}
+                "event_plans": event_plans}
 
     def trace(self, candidate_id, line_id=""):
         candidate = next((x for x in self._candidates if x["id"] == candidate_id), None)
@@ -954,10 +966,11 @@ def install(app, namespace):
     @app.get("/api/system2/status")
     async def status(authorization: str | None = Header(default=None)):
         host.require_read_auth(authorization)
-        payload = await runtime().refresh()
+        await runtime().refresh(want_status=False)
         # #1070: a megabyte of nested plans is serialised in one C call in a
-        # worker thread rather than walked field by field on the event loop.
-        body = await asyncio.to_thread(json.dumps, payload, default=str)
+        # worker thread rather than walked field by field on the event loop,
+        # straight from the live plans (no copy first).
+        body = await asyncio.to_thread(lambda: json.dumps(runtime().status(copy_plans=False), default=str))
         return Response(content=body, media_type="application/json")
 
     @app.post("/api/system2/settings")
