@@ -10,6 +10,7 @@ from __future__ import annotations
 from collections import Counter
 from decimal import Decimal, InvalidOperation
 import json
+from pathlib import Path
 import re
 import unicodedata
 
@@ -383,6 +384,11 @@ def extract_contract(text, stopwords=(), vocabulary=()):
             if word in label_words and match.start() < (label.end() if label else 0):
                 row['heuristic'] = True
                 row['reason'] = 'speaker label'
+            elif reason == 'unknown sentence opener' and _descriptive_opener(normalized, match):
+                # 2026-09-08: "Taut wire is too mechanical" - a description
+                # that opens the sentence, reported but not bound.
+                row['heuristic'] = True
+                row['reason'] = 'descriptive opener'
             names.append(row)
             seen.add(word)
         elif reason and word in label_words and match.start() >= (label.end() if label else 0):
@@ -592,7 +598,105 @@ def _bare_one_waived(source, candidate):
     return waived
 
 
-def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floor=.5):
+_DESCRIPTIVE = None
+_FINITE = re.compile(r"\s+(?:is|are|was|were|has|have|had|can|could|will|would|should|must|do|does|did|am)\b")
+
+
+def _descriptive_lemmas():
+    """The adjectives and adverbs of WordNet (vendor/wordnet/index.adj and
+    index.adv), read once. Empty when the vendor files are absent."""
+    global _DESCRIPTIVE
+    if _DESCRIPTIVE is None:
+        words = set()
+        base = Path(__file__).resolve().parent / 'vendor' / 'wordnet'
+        for name in ('index.adj', 'index.adv'):
+            try:
+                with open(base / name, encoding='utf-8', errors='ignore') as handle:
+                    for line in handle:
+                        if line.startswith(' ') or not line.strip():
+                            continue
+                        word = line.split(' ', 1)[0]
+                        if word.isalpha():
+                            words.add(word.casefold())
+            except OSError:
+                pass
+        _DESCRIPTIVE = words
+    return _DESCRIPTIVE
+
+
+def _descriptive_opener(text, match):
+    """2026-09-08: "Taut wire is too mechanical", "Shimmering light hits
+    the wall", "Suspended moment?" - a capitalized opener that is an
+    adjective or adverb in the dictionary, or an -ed/-ing participle, and
+    is followed by a lowercase word of its own sentence that is not a
+    finite verb, is a description, not a name. "Dale woulda" (a noun),
+    "Ious." (nothing follows), "Reading is fun" (a finite verb follows) and
+    "Dreamscape" (no such word) still bind."""
+    word = match.group().casefold()
+    if not re.fullmatch(r"[a-z]{3,}", word):
+        return False
+    tail = text[match.end():]
+    if not re.match(r"\s+[a-z]", tail) or _FINITE.match(tail):
+        return False
+    if word in _descriptive_lemmas():
+        return True
+    return bool(re.fullmatch(r"[a-z]{3,}(?:ed|ing)", word))
+
+
+_RHETORICAL_NEGATION = (
+    # "not just structural", "not only the surface"
+    re.compile(r"\bnot\s+(?:just|only|merely|simply|even|necessarily|entirely|quite)\b"),
+    # the discourse opener: "No, it should have been called..."
+    re.compile(r"(?:^|[.!?;:]\s*)[\"']?(?:no|nah|nope|not that|not really)\s*[,.!]"),
+    # the tag question: "isn't it?", "doesn't it?", "ain't it?"
+    re.compile(r",\s*(?:is|are|was|were|do|does|did|can|could|will|would|should|has|have|had|am|ai)"
+               r"(?:n't|\s+not)\s+(?:it|they|you|we|he|she|there|i)\s*\?"),
+    # the idiom: "can't shake the feeling", "can't help but"
+    re.compile(r"\b(?:can(?:n't|\s+not)|cannot)\s+(?:shake|help|even|wait|believe|stand|stress|deny|tell)\b"),
+    # the contrast: "not X but Y", "not X; it is Y", "isn't about X, it is about Y"
+    re.compile(r"\b(?:\w+n't|not|no)\b[^.!?;]{1,90}?\b(?:but|rather|instead)\b"),
+    re.compile(r"\b(?:\w+n't|not)\b[^.!?;]{1,80}?[;,]\s*(?:it|they|that|this|he|she|we|you|there|which|what)"
+               r"\s+(?:is|are|was|were|has|have|means|feels|'s)\b"),
+)
+_NEGATION_TOKEN = re.compile(r"\b(?:not|no|never|nothing|nobody|none|without|neither|nor)\b|n't\b")
+
+
+def _rhetorical_negations_only(source):
+    """2026-09-08: every negation the source carries sits in a rhetorical
+    frame - "not just structural", the opener "No,", the tag "isn't it?",
+    "can't shake the feeling", "not X but Y" / "not X; it is Y" - so a
+    rewrite that folds it has kept the claim. A negation on a fact ("he did
+    not win", "your son is not safe") sits in no frame and stays refused."""
+    text = ' '.join(_expanded(normalize_text(source)).casefold().split())
+    hits = [m for m in _NEGATION_TOKEN.finditer(text)
+            if not (m.group() == 'no' and re.match(r"\s+doubts?\b", text[m.end():]))]
+    if not hits:
+        return False
+    spans = [(m.start(), m.end()) for pattern in _RHETORICAL_NEGATION for m in pattern.finditer(text)]
+    # ...and the fillers of #1076 read the other way: "no matter what kind of
+    # water you are in" is cadence in the source as much as in a rewrite.
+    for filler in _FILLER_NEGATIONS:
+        start = text.find(filler)
+        while start >= 0:
+            spans.append((start, start + len(filler)))
+            start = text.find(filler, start + 1)
+    return all(any(a <= hit.start() < b for a, b in spans) for hit in hits)
+
+
+def _question_is_inner(source):
+    """2026-09-08: the source asks something on the way and ends on a
+    statement ("You think so? I mean, look at the colors...") - the question
+    is a beat inside the turn, not the turn's hand-off, so a rewrite that
+    folds it has not changed what the line does. A turn that ENDS on its
+    question still binds."""
+    text = ' '.join(normalize_text(source).split())
+    if '?' not in text:
+        return False
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    return len(sentences) >= 2 and not sentences[-1].rstrip().endswith('?')
+
+
+def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floor=.5, boilerplate=()):
     if not 0 <= anchor_floor <= 1:
         raise ValueError('anchor_floor must be between zero and one')
     original = extract_contract(source, stopwords, vocabulary)
@@ -604,6 +708,14 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
     # comparison. It never turns an unrelated or changed name into a match.
     tokens.update(match.group(1) + 'g' for match in
                   re.finditer(r"\b([^\W\d_]+in)'(?=\W|$)", normalize_text(candidate).casefold()))
+    # 2026-09-08: the station's own name is written into a source by the
+    # prompt ("...right here at Chicken Tendo Little Pine Box FM Station");
+    # its words are reported as names and never bound.
+    plate = {_canonical_word(str(word)) for word in (boilerplate or ())}
+    for name in original['names']:
+        if plate and name['normalized'] in plate and not name.get('heuristic'):
+            name['heuristic'] = True
+            name['reason'] = 'station boilerplate'
     missing_names = [name for name in original['names']
                      if name['normalized'] not in tokens and not name.get('heuristic')]
     possible_names_missing = [name for name in original['names']
@@ -633,11 +745,21 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
     # Preserve the existing polarity gate; repeated "No, I won't" need not
     # become two negations in a rewrite. Counts and terms remain visible as
     # advisory evidence, not an additional policy threshold.
+    # 2026-09-08: a question asked on the way to a statement is reported
+    # as such; the grader may fold it under the meaning grade. The flag
+    # never makes the strict comparison pass.
+    question_inner = False
+    if not question and original['question'] and not made['question'] and _question_is_inner(source):
+        question_inner, question_basis = True, 'inner question folded'
     negation = bool(original['negations']) == bool(made['negations'])
     negation_basis = 'polarity'
+    negation_rhetorical = False
     if not negation and original['negations']:
         negation = _lexical_negation_kept(original['anchors'], made['tokens'])       # #1076
         negation_basis = 'negative prefix on a source word' if negation else 'negation dropped'
+        if not negation and _rhetorical_negations_only(source):
+            # 2026-09-08: reported, foldable under the meaning grade.
+            negation_rhetorical, negation_basis = True, 'rhetorical negation dropped'
     elif not negation:
         negation = _filler_negations_only(candidate)                                 # #1076
         negation_basis = 'filler negation' if negation else 'negation added'
@@ -648,6 +770,7 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
             'anchors': original['anchors'], 'missing': sorted(source_words - candidate_words),
             'missing_names': missing_names, 'possible_names_missing': possible_names_missing,
             'question_basis': question_basis, 'negation_basis': negation_basis,
+            'question_inner': question_inner, 'negation_rhetorical': negation_rhetorical,
             'missing_numbers': missing_numbers, 'added_numbers': added_numbers,
             'name_candidates': original['names'], 'source_numbers': original['numbers'],
             'candidate_numbers': made['numbers'], 'source_negations': original['negations'],

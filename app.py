@@ -40833,6 +40833,8 @@ def dj_start(station: str) -> dict[str, Any]:
     # 2026-09-08 (evening): the orchestrator's own reflection on each road's
     # accepted and refused bars, hourly per road.
     _RADIO_TASK.append(asyncio.create_task(reflection_clock()))
+    # 2026-09-08 (evening): the review queue against today's grader, once.
+    _RADIO_TASK.append(asyncio.create_task(regrade_once()))
     # #1023 (G1): the durable air log - upsert-by-id off the ring.
     _RADIO_TASK.append(asyncio.create_task(airlog_keeper()))
     # #1050 (P1): and beside it, how each of those lines was made - the
@@ -74246,10 +74248,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             _sb.get("speakbox_prepend_rate") or 0) + _lift):
         head = await _fresh_swath()
         if head.get("text"):
-            script = f"A: {head['text']}\n" + script.lstrip()
+            _head_text = _verbatim_turn_text(head["text"])      # 2026-09-08: bounded when raw
+            script = f"A: {_head_text}\n" + script.lstrip()
             lines += 1
             speakbox_remember(head)
-            _verbatim.append(["head", str(head["text"])])        # #838
+            _verbatim.append(["head", _head_text])              # #838
     tail: dict[str, Any] = {}
     if not _system2_job and not caller_name and not own_material and random.random() < min(1.0, float(   # #867
             _sb.get("speakbox_append_rate") or 0) + _lift):
@@ -74258,7 +74261,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # #786: terminal punctuation, or the #168 truncation gate reads
             # a verbatim un-punctuated swath as token exhaustion and deletes
             # the operator's own material off the end of the round.
-            _tail_text = str(tail["text"]).rstrip()
+            _tail_text = _verbatim_turn_text(tail["text"]).rstrip()   # 2026-09-08: bounded when raw
             if not re.search(r"[.!?…—»\"')\]]$", _tail_text):
                 _tail_text += "."
             script = script.rstrip() + f"\nA: {_tail_text}"
@@ -74284,7 +74287,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # pair are allowed to break a long line across a turn.
             _probe = " ".join(_probe.split()[:9])
             if _probe and _probe not in _flat:
-                _put = _seed_text.rstrip()
+                _put = _verbatim_turn_text(_seed_text).rstrip()    # 2026-09-08: bounded when raw
                 if not re.search(r"[.!?\u2026\u2014\u00bb\"')\]]$", _put):
                     _put += "."
                 script = script.rstrip() + f"\nB: {_put}"
@@ -84193,6 +84196,46 @@ def _tint_ngrams(text: Any, n: int = 6) -> set[str]:
     return {" ".join(words[i:i + n]) for i in range(len(words) - n + 1)}
 
 
+def _tint_boilerplate() -> set[str]:
+    """2026-09-08: the station's own name ("Chicken Tendo Little Pine Box FM
+    Station") is written into a source by the prompt, not said by anyone; a
+    bar that drops or shortens it has lost no fact. Its words are names the
+    contract reports and does not bind - 54 of 71 missing-name findings in
+    the evening's queue were these."""
+    words: set[str] = set()
+    try:
+        for name in (str(dj_settings().get("station_name") or ""),
+                     str(DEFAULT_DJ.get("station_name") or "")):
+            for w in re.findall(r"[^\W_]+(?:['-][^\W_]+)*", name):
+                words.add(w.casefold())
+    except Exception:  # noqa: BLE001
+        pass
+    words.update({"fm", "station"})
+    return words
+
+
+_TRANSCRIPT_TURN_MOST = 240
+
+
+def _verbatim_turn_text(text: Any, most: int = _TRANSCRIPT_TURN_MOST) -> str:
+    """2026-09-08: a verbatim swath pasted in as a spoken turn is bounded
+    when it is raw transcript - forty words or more with fewer than two
+    sentence ends per hundred. A thousand unpunctuated characters became one
+    turn the crystal could never rhyme while keeping sixty anchors, three
+    deep asks at a time; a spoken length of it is the operator's words
+    still. Punctuated passages are untouched."""
+    said = " ".join(str(text or "").split())
+    if len(said) <= most:
+        return said
+    words = said.split()
+    ends = len(re.findall(r"[.!?]", said))
+    if len(words) < 40 or ends / max(1, len(words)) * 100 >= 2.0:
+        return said
+    cut = said[:most]
+    cut = cut[:cut.rfind(" ")] if " " in cut else cut
+    return cut.rstrip(" ,;:-") + "."
+
+
 def tint_evaluate(source: Any, candidate: Any,
                   chunks: list[dict[str, Any]] | None = None,
                   answering: str = "", force: float | None = None,
@@ -84212,9 +84255,33 @@ def tint_evaluate(source: Any, candidate: Any,
     src_set, dst_set = set(src), set(dst)
     anchor_overlap = len(src_set & dst_set) / max(1, len(src_set))
     _anchor_floor = 0.2 if force >= 0.75 else (0.35 if force >= 0.45 else 0.5)
+    # #1064: the proofs are REPORTED always and ENFORCED only under the
+    # strict grade (below); the meaning block needs the grade here too.
+    strict = crystal_grade_strict() if strict is None else bool(strict)
     _semantic = crystal_compare_contract(plain, made, _TINT_EVAL_STOP, _crystal_vocab(),
-                                        anchor_floor=_anchor_floor)
+                                        anchor_floor=_anchor_floor,
+                                        boilerplate=_tint_boilerplate())
     semantic_ok = bool(_semantic["ok"])
+    # 2026-09-08 (the evening's rejections): under the MEANING grade a
+    # rhetorical negation the rewrite folded ("not just structural" ->
+    # "visceral, structural too") and a question asked on the way to a
+    # statement ("You think so? Look at the colors...") are advisory: the
+    # claim, the names, the numbers and the anchors still have to hold.
+    # Measured on the queue: 62 of 108 meaning cuts were the negation
+    # check and 22 the question check. The strict grade refuses both.
+    _folded: list[str] = []
+    if not semantic_ok and not strict:
+        _core = (bool(made) and bool(_semantic["entities"]) and bool(_semantic.get("contrast", True))
+                 and (float(_semantic["anchor_recall"] or 0) >= _anchor_floor or not _semantic.get("anchors")))
+        _neg_ok = bool(_semantic["negation"]) or bool(_semantic.get("negation_rhetorical"))
+        _q_ok = bool(_semantic["question"]) or bool(_semantic.get("question_inner"))
+        if _core and _neg_ok and _q_ok:
+            semantic_ok = True
+            if not _semantic["negation"]:
+                _folded.append("a rhetorical negation was folded into the bar")
+            if not _semantic["question"]:
+                _folded.append("an inner question was folded into a statement")
+            _semantic["folded"] = list(_folded)
     question_ok, neg_ok, entity_ok = (_semantic["question"], _semantic["negation"], _semantic["entities"])
     anchor_overlap = _semantic["anchor_recall"]
     if str(kind or "") == "caller":
@@ -84291,11 +84358,10 @@ def tint_evaluate(source: Any, candidate: Any,
     # #1064: the proofs are REPORTED always and ENFORCED only under the
     # strict grade. The default grade is meaning: the bar keeps what was
     # said, changes how, and recites nothing.
-    strict = crystal_grade_strict() if strict is None else bool(strict)
     if not strict and changed and rhyme_added:
         transformed = True                  # 2026-09-08: it rhymes now
     faults: list[str] = []
-    advisory: list[str] = []
+    advisory: list[str] = list(_folded)
     if not semantic_ok:
         faults.append("semantic preservation failed")
     # #1064: at full strength the bar still has to PROVE rhyme - two
@@ -94371,6 +94437,110 @@ async def api_line_review_policy_update(
     station_flow_event("repair", "operator", "Editorial acceptance policy updated",
                        {"policy": policy})
     return policy
+
+
+def line_review_regrade_pending(limit: int = 400) -> dict[str, Any]:
+    """2026-09-08 (evening): the operator's queue re-read against TODAY's
+    grader and roads. 180 of 188 pending tint cuts had been graded before
+    the afternoon's changes (the dictionary depth, the formula lines, the
+    rhetorical-negation and inner-question folds, the station name as
+    boilerplate) - grader v9 was already current, so the #1088 triage could
+    not tell them apart. A stored wording that passes now is not a decision
+    the operator needs to make: it leaves the queue as a note that says so.
+    A phone-road formula line the crystal reads plain leaves as read_plain.
+    Anything today's grader still refuses stays. Deterministic, no model."""
+    out = {"seen": 0, "passes_now": 0, "read_plain": 0, "kept": 0, "errors": 0}
+    store = _LINE_REVIEW
+    seen: set[str] = set()
+    for gate in ("tint", "recording_tint"):
+        before = 0
+        for _page in range(4):
+            try:
+                page = store.summaries(before=before, limit=min(200, max(1, int(limit))),
+                                       status="pending", gate=gate)
+            except Exception:  # noqa: BLE001
+                out["errors"] += 1
+                break
+            items = list((page or {}).get("items") or [])
+            if not items:
+                break
+            for item in items:
+                rid = str(item.get("id") or "")
+                if not rid or rid in seen or out["seen"] >= limit:
+                    continue
+                seen.add(rid)
+                out["seen"] += 1
+                try:
+                    row = store.get(rid, limit=1) or {}
+                    ctx = row.get("context") or {}
+                    kind = str(ctx.get("kind") or "")
+                    source = str(row.get("source") or "")
+                    candidate = str(row.get("candidate") or "")
+                    if _tint_formula_turn(kind, source):
+                        if store.note_stale(rid, "read_plain",
+                                            "a phone-road formula line; the crystal reads it plain since 2026-09-08"):
+                            out["read_plain"] += 1
+                        continue
+                    if not candidate.strip():
+                        out["kept"] += 1
+                        continue
+                    evaluation = row.get("evaluation") or {}
+                    force = evaluation.get("strength")
+                    report = tint_evaluate(source, candidate, ctx.get("chunks") or [],
+                                           answering=str(ctx.get("answering") or ""),
+                                           force=float(force) if force is not None else None,
+                                           kind=kind)
+                    if report.get("ok"):
+                        note = "the stored wording passes today's grader"
+                        if report.get("advisory"):
+                            note += " (" + "; ".join(str(a) for a in report["advisory"])[:120] + ")"
+                        if store.note_stale(rid, "stale_grader", note):
+                            out["passes_now"] += 1
+                    else:
+                        out["kept"] += 1
+                except Exception:  # noqa: BLE001
+                    out["errors"] += 1
+            if not (page or {}).get("has_more"):
+                break
+            try:
+                before = int(items[-1].get("latest_seq") or 0)
+            except Exception:  # noqa: BLE001
+                break
+            if not before:
+                break
+    return out
+
+
+def _regrade_say(got: dict[str, Any]) -> None:
+    try:
+        if got.get("passes_now") or got.get("read_plain"):
+            pipeline_log("crystal", "the review queue was re-read against today's grader: "
+                         f"{got.get('passes_now', 0)} cut line(s) pass now and "
+                         f"{got.get('read_plain', 0)} read plain; {got.get('kept', 0)} stay for the "
+                         f"operator (of {got.get('seen', 0)})")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def regrade_once() -> None:
+    """Ninety seconds after boot, in a thread: the queue against today's grader."""
+    try:
+        await asyncio.sleep(90)
+        got = await asyncio.to_thread(line_review_regrade_pending)
+        _regrade_say(got)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001
+        pass
+
+
+@app.post("/api/orchestrator/rejections/regrade")
+async def api_line_reviews_regrade(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    """Re-read the pending cuts against today's grader now."""
+    require_auth(authorization)
+    got = await asyncio.to_thread(line_review_regrade_pending)
+    _regrade_say(got)
+    return got
 
 
 @app.get("/api/orchestrator/rejections")
@@ -162622,7 +162792,7 @@ async function rapAssemblyPanel() {
   const stage = el("div", "", "");
   stage.style.cssText = "flex:1;min-width:0;position:relative";
   const rail = el("div", "", "");
-  rail.style.cssText = "flex:0 0 380px;overflow:auto;padding:14px 16px;background:#0a0f16;"
+  rail.style.cssText = "flex:0 0 clamp(280px, 30%, 380px);overflow:auto;padding:14px 16px;background:#0a0f16;"
     + "border-left:1px solid #22304a;font-size:12px;line-height:1.5;color:#c9d6e3";
   shade.appendChild(stage); shade.appendChild(rail);
   document.body.appendChild(shade);
@@ -162647,9 +162817,22 @@ async function rapAssemblyPanel() {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x03060b);
   scene.fog = new THREE.Fog(0x03060b, 60, 140);
-  const camera = new THREE.PerspectiveCamera(42, W() / H(), 1, 400);
-  camera.position.set(0, 9, 62);
-  camera.lookAt(0, 0, 0);
+  const camera = new THREE.PerspectiveCamera(42, W() / H(), 1, 600);
+  // The whole line must fit the stage whatever its shape: the ten stations
+  // span ±43 units (plus the sway), so the camera backs off until that
+  // half-width fits the horizontal field, never nearer than the height needs.
+  let rows = 0, centerY = -1;
+  const fit = () => {
+    camera.aspect = W() / H();
+    layout();
+    const half = Math.tan(camera.fov * Math.PI / 360);
+    const need = rows === 1 ? {w: 50, h: 14} : {w: 29, h: 19};
+    const dist = Math.max(36, need.w / camera.aspect / half, need.h / half);
+    camera.position.set(0, dist * .15, dist);
+    camera.lookAt(0, centerY, 0);
+    camera.updateProjectionMatrix();
+    scene.fog.near = dist + 10; scene.fog.far = dist + 90;
+  };
   scene.add(new THREE.AmbientLight(0xffffff, .55));
   const sun = new THREE.DirectionalLight(0xffffff, .9);
   sun.position.set(10, 22, 30);
@@ -162690,42 +162873,66 @@ async function rapAssemblyPanel() {
     {key: "air",       face: "ON THE AIR", color: 0xffffff},
     {key: "learning",  face: "LEARNING",   color: 0x3fd0c0},
   ];
-  const X0 = -40.5, XSTEP = 9;
+  // One row on a wide stage; on a squarer one the line wraps like a
+  // conveyor - five stations across the top, five back along the bottom -
+  // so the boxes stay large enough to read inside the standard frame.
+  const posOf = (i, mode) => mode === 1
+    ? {x: -40.5 + i * 9, y: 0}
+    : (i < 5 ? {x: -18 + i * 9, y: 7.5} : {x: 18 - (i - 5) * 9, y: -7.5});
   const group = new THREE.Group(); scene.add(group);
   const blocks = {};
+  const lineOf = (color) => {
+    const ln = new THREE.Line(new THREE.BufferGeometry(), new THREE.LineBasicMaterial({color, transparent: true, opacity: .8}));
+    group.add(ln); return ln;
+  };
+  const setPts = (ln, pts) => {
+    ln.geometry.dispose();
+    ln.geometry = new THREE.BufferGeometry().setFromPoints(pts.map((p) => new THREE.Vector3(p[0], p[1], 0)));
+  };
+  const links = [];
   STATIONS.forEach((s, i) => {
-    const x = X0 + i * XSTEP;
     const mat = new THREE.MeshStandardMaterial({color: 0x1a2438, emissive: new THREE.Color(s.color), emissiveIntensity: .12, roughness: .5, metalness: .2});
     const mesh = new THREE.Mesh(new THREE.BoxGeometry(5.4, 2, 5.4), mat);
-    mesh.position.set(x, 0, 0);
     group.add(mesh);
-    const head = label(s.face, 1.35, "rgba(214,232,255,.95)");
-    head.position.set(x, -3.1, 0); group.add(head);
-    const num = label("·", 1.9, "#" + s.color.toString(16).padStart(6, "0"));
-    num.position.set(x, 3.4, 0); group.add(num);
-    const sub = label(" ", 1.0, "rgba(160,180,200,.9)");
-    sub.position.set(x, -4.6, 0); group.add(sub);
-    blocks[s.key] = {mesh, mat, head, num, sub, x, color: new THREE.Color(s.color), level: 0, target: 0};
-    if (i) {
-      const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(x - XSTEP + 2.7, 0, 0), new THREE.Vector3(x - 2.7, 0, 0)]);
-      group.add(new THREE.Line(geo, new THREE.LineBasicMaterial({color: 0x22304a, transparent: true, opacity: .8})));
-    }
+    const head = label(s.face, 1.35, "rgba(214,232,255,.95)"); group.add(head);
+    const num = label("·", 1.9, "#" + s.color.toString(16).padStart(6, "0")); group.add(num);
+    const sub = label(" ", .9, "rgba(160,180,200,.9)"); group.add(sub);
+    blocks[s.key] = {mesh, mat, head, num, sub, x: 0, y: 0, color: new THREE.Color(s.color), level: 0, target: 0};
+    if (i) links.push(lineOf(0x22304a));
   });
   // The covers sit under the air; the learning feeds back to the tint.
   const covers = (() => {
     const mat = new THREE.MeshStandardMaterial({color: 0x1a2438, emissive: new THREE.Color(0xffd479), emissiveIntensity: .12, roughness: .5});
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(4.2, 1.4, 4.2), mat);
-    mesh.position.set(blocks.air.x, -8.5, 0); group.add(mesh);
-    const head = label("COVERS", 1.1); head.position.set(blocks.air.x, -10.8, 0); group.add(head);
-    const num = label("·", 1.4, "#ffd479"); num.position.set(blocks.air.x + 4.6, -8.5, 0); group.add(num);
-    const geo = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(blocks.air.x, -7.7, 0), new THREE.Vector3(blocks.air.x, -1.1, 0)]);
-    group.add(new THREE.Line(geo, new THREE.LineBasicMaterial({color: 0x3a3a22, transparent: true, opacity: .8})));
-    return {mesh, mat, num, level: 0, target: 0, color: new THREE.Color(0xffd479)};
+    const mesh = new THREE.Mesh(new THREE.BoxGeometry(4.2, 1.4, 4.2), mat); group.add(mesh);
+    const head = label("COVERS", 1.1); group.add(head);
+    const num = label("·", 1.4, "#ffd479"); group.add(num);
+    return {mesh, mat, head, num, link: lineOf(0x3a3a22), level: 0, target: 0, color: new THREE.Color(0xffd479)};
   })();
-  const feedback = new THREE.BufferGeometry().setFromPoints([
-    new THREE.Vector3(blocks.learning.x, 1.2, 0), new THREE.Vector3(blocks.learning.x, 8.5, 0),
-    new THREE.Vector3(blocks.tint.x, 8.5, 0), new THREE.Vector3(blocks.tint.x, 1.2, 0)]);
-  group.add(new THREE.Line(feedback, new THREE.LineBasicMaterial({color: 0x1f4a44, transparent: true, opacity: .8})));
+  const feedback = lineOf(0x1f4a44);
+  const layout = () => {
+    const mode = W() / H() < 1.45 ? 2 : 1;
+    if (mode === rows) return;
+    rows = mode;
+    STATIONS.forEach((s, i) => {
+      const b = blocks[s.key], p = posOf(i, mode);
+      b.x = p.x; b.y = p.y;
+      b.mesh.position.set(p.x, p.y, 0); b.head.position.set(p.x, p.y - 3.1, 0);
+      b.num.position.set(p.x, p.y + 3.4, 0); b.sub.position.set(p.x, p.y - 4.5, 0);
+    });
+    links.forEach((ln, i) => {
+      const a = blocks[STATIONS[i].key], b = blocks[STATIONS[i + 1].key];
+      if (a.y === b.y) setPts(ln, [[a.x + (b.x > a.x ? 2.7 : -2.7), a.y], [b.x + (b.x > a.x ? -2.7 : 2.7), b.y]]);
+      else setPts(ln, [[a.x + 2.7, a.y], [a.x + 6, a.y], [b.x + 6, b.y], [b.x + 2.7, b.y]]);  // the turn at the end of the top row
+    });
+    const air = blocks.air, cy = air.y - 7;
+    covers.mesh.position.set(air.x, cy, 0); covers.head.position.set(air.x, cy - 2.3, 0); covers.num.position.set(air.x + 4.6, cy, 0);
+    setPts(covers.link, [[air.x, cy + .8], [air.x, air.y - 1.1]]);
+    const le = blocks.learning, ti = blocks.tint;
+    if (mode === 1) setPts(feedback, [[le.x, 1.2], [le.x, 8.5], [ti.x, 8.5], [ti.x, 1.2]]);
+    else setPts(feedback, [[le.x - 2.7, le.y], [le.x - 6, le.y], [le.x - 6, ti.y + 5.2], [ti.x, ti.y + 5.2], [ti.x, ti.y + 1.2]]);
+    centerY = mode === 1 ? -1 : -2;
+  };
+  fit();
 
   // Packets: a sphere that travels from one station to the next.
   const packets = [];
@@ -162735,14 +162942,15 @@ async function rapAssemblyPanel() {
     const a = blocks[from], b = blocks[to];
     if (!a || !b) return;
     const mesh = new THREE.Mesh(new THREE.SphereGeometry(.42, 12, 10), packetColor(String(hex), hex));
-    mesh.position.set(a.x, 0.6, 1.2);
+    mesh.position.set(a.x, a.y + 0.6, 1.2);
     group.add(mesh);
-    packets.push({mesh, ax: a.x, bx: b.x, t: 0, speed: .55 + Math.random() * .35, viaTop, target: b});
+    packets.push({mesh, ax: a.x, ay: a.y, bx: b.x, by: b.y, t: 0, speed: .55 + Math.random() * .35, viaTop, target: b});
   };
   const spawnCover = (hex) => {
     const mesh = new THREE.Mesh(new THREE.SphereGeometry(.42, 12, 10), packetColor(String(hex), hex));
-    mesh.position.set(blocks.air.x, -7.5, 1.2); group.add(mesh);
-    packets.push({mesh, ax: blocks.air.x, bx: blocks.air.x, t: 0, speed: .8, up: true, target: blocks.air});
+    const air = blocks.air;
+    mesh.position.set(air.x, air.y - 6, 1.2); group.add(mesh);
+    packets.push({mesh, ax: air.x, ay: air.y - 6, bx: air.x, by: air.y, t: 0, speed: .8, up: true, target: air});
   };
   const route = (ev) => {
     const k = ev.kind, t = (ev.text || "").toLowerCase();
@@ -162778,26 +162986,30 @@ async function rapAssemblyPanel() {
     const s = d.stages || {};
     const id = s.ideation || {}, wr = s.writing || {}, cr = s.crystal || {}, ti = s.tint || {}, gr = s.grader || {};
     const re = s.recording || {}, so = s.stores || {}, sc = s.schedule || {}, ai = s.air || {}, le = s.learning || {};
+    // The sub-line under a station is a caption, not a report: the stations
+    // stand nine units apart, so it is kept to a couple of dozen characters
+    // and the rail carries the whole story.
+    const short = (t, n) => { t = String(t || " "); return t.length > n ? t.slice(0, n - 1) + "…" : t; };
     const set = (key, level, num, sub) => {
       const b = blocks[key]; if (!b) return;
       b.target = Math.max(0, Math.min(1, level));
       b.num.userData.redraw(fmtN(num));
-      b.sub.userData.redraw(sub || " ");
+      b.sub.userData.redraw(short(sub, 24));
     };
-    set("ideation", id.plot && id.plot.id ? .6 : .3, id.minds, id.plot && id.plot.id ? "plot act " + id.plot.act : "minds");
-    set("writing", Math.min(1, ((wr.active || 0) + (wr.waiting || 0)) / 4), (wr.active || 0) + "+" + (wr.waiting || 0), "active + waiting · lanes " + (wr.lanes || 1));
-    set("crystal", cr.crystals && cr.crystals.length ? .35 + .65 * (cr.force || 0) : .05, (cr.crystals || []).map((c) => c.name).join(", ") || "off", "strength " + (cr.force || 0) + " · vocab " + (cr.vocabulary || 0));
+    set("ideation", id.plot && id.plot.id ? .6 : .3, id.minds, id.plot && id.plot.id ? "minds · plot act " + id.plot.act : "minds");
+    set("writing", Math.min(1, ((wr.active || 0) + (wr.waiting || 0)) / 4), (wr.active || 0) + "+" + (wr.waiting || 0), "writing+waiting · " + (wr.lanes || 1) + " lane" + ((wr.lanes || 1) === 1 ? "" : "s"));
+    set("crystal", cr.crystals && cr.crystals.length ? .35 + .65 * (cr.force || 0) : .05, (cr.crystals || []).map((c) => c.name).join(", ") || "off", "strength " + (cr.force || 0));
     const stg = ti.stages || {};
-    set("tint", Math.min(1, ((stg.awaiting_tint || 0) + (stg.rewriting || 0)) / 8), (stg.awaiting_tint || 0) + "→" + (stg.rewriting || 0), "waiting → rewriting · " + ((ti.coverage || {}).tinted || 0) + " bars this hour");
+    set("tint", Math.min(1, ((stg.awaiting_tint || 0) + (stg.rewriting || 0)) / 8), (stg.awaiting_tint || 0) + "→" + (stg.rewriting || 0), ((ti.coverage || {}).tinted || 0) + " bars this hour");
     const gp = gr.passed || 0, gf = gr.refused || 0;
-    set("grader", gp + gf ? gp / (gp + gf) : 0, gp + "/" + (gp + gf), "passed of graded (last 40)");
-    set("recording", Math.min(1, ((re.live || 0) + (re.preparing || 0)) / Math.max(1, re.capacity || 2)), (re.live || 0) + "+" + (re.preparing || 0), (re.now && re.now.kind ? re.now.kind + " " + (re.now.made || 0) + "/" + (re.now.lines || "?") : "idle") + " · backlog " + (re.backlog || 0));
-    set("stores", Math.min(1, (so.larder_ready || 0) / 8), (so.larder_ready || 0) + "+" + (so.shelf_ready || 0), "ready rounds · gold " + (so.gold || 0) + " · kept " + (((so.repertoire || {}).larder || {}).kept || 0));
-    set("schedule", sc.entries ? (sc.ready || 0) / sc.entries : 0, (sc.ready || 0) + "/" + (sc.entries || 0), (sc.short || []).length ? "short: " + sc.short.slice(0, 3).join(", ") : "every entry has material");
-    set("air", ai.paused ? .1 : ai.speaking ? 1 : ai.playing ? .6 : .2, ai.paused ? "paused" : ai.speaking ? "speaking" : ai.playing ? "record" : "quiet " + (ai.quiet || 0) + "s", ai.line && ai.line.text ? ai.line.who + ": " + ai.line.text.slice(0, 60) : (ai.floor && ai.floor.label ? "floor: " + ai.floor.label.slice(0, 40) : " "));
+    set("grader", gp + gf ? gp / (gp + gf) : 0, gp + "/" + (gp + gf), "passed of the last 40");
+    set("recording", Math.min(1, ((re.live || 0) + (re.preparing || 0)) / Math.max(1, re.capacity || 2)), (re.live || 0) + "+" + (re.preparing || 0), (re.now && re.now.kind ? re.now.kind + " " + (re.now.made || 0) + "/" + (re.now.lines || "?") : "idle") + (re.backlog ? " · backlog " + re.backlog : ""));
+    set("stores", Math.min(1, (so.larder_ready || 0) / 8), (so.larder_ready || 0) + "+" + (so.shelf_ready || 0), "gold " + (so.gold || 0) + " · kept " + (((so.repertoire || {}).larder || {}).kept || 0));
+    set("schedule", sc.entries ? (sc.ready || 0) / sc.entries : 0, (sc.ready || 0) + "/" + (sc.entries || 0), (sc.short || []).length ? sc.short.length + " short" : "all covered");
+    set("air", ai.paused ? .1 : ai.speaking ? 1 : ai.playing ? .6 : .2, ai.paused ? "paused" : ai.speaking ? "speaking" : ai.playing ? "record" : "quiet " + (ai.quiet || 0) + "s", ai.line && ai.line.text ? ai.line.who + ": " + ai.line.text : (ai.floor && ai.floor.label ? "floor: " + ai.floor.label : " "));
     const refl = le.reflection || {};
     const roads = Object.keys(refl).filter((k) => refl[k].version);
-    set("learning", roads.length ? .8 : .25, roads.length, "reflections · learner rev " + (le.learner_revision || 0) + " · " + (le.preferences || 0) + " prefs");
+    set("learning", roads.length ? .8 : .25, roads.length, "rev " + (le.learner_revision || 0) + " · " + (le.preferences || 0) + " prefs");
     const gf2 = ai.gap_filler || {};
     covers.target = gf2.at && (Date.now() / 1000 - gf2.at) < 60 ? 1 : .2;
     covers.num.userData.redraw(String(gf2.count || 0) + (gf2.went ? " · " + gf2.went : ""));
@@ -162844,26 +163056,28 @@ async function rapAssemblyPanel() {
       b.level += (b.target - b.level) * Math.min(1, dt * 3);
       b.mat.emissiveIntensity = .1 + b.level * .9 + Math.sin(now / 900 + i) * .04 * b.level;
       b.mesh.scale.y = .6 + b.level * 1.6;
-      b.mesh.position.y = (b.mesh.scale.y * 2 - 2) / 2;
+      b.mesh.position.y = b.y + (b.mesh.scale.y * 2 - 2) / 2;    // grows upward from its row
     });
     covers.level += (covers.target - covers.level) * Math.min(1, dt * 3);
     covers.mat.emissiveIntensity = .1 + covers.level * .9;
     for (let i = packets.length - 1; i >= 0; i--) {
       const p = packets[i];
       p.t += dt * p.speed;
-      if (p.up) { p.mesh.position.y = -7.5 + p.t * 8; }
-      else if (p.viaTop) { const u = p.t; p.mesh.position.x = p.ax + (p.bx - p.ax) * u; p.mesh.position.y = 0.6 + Math.sin(u * Math.PI) * 8; }
-      else { p.mesh.position.x = p.ax + (p.bx - p.ax) * p.t; p.mesh.position.y = 0.6 + Math.sin(p.t * Math.PI) * 1.6; }
+      const u = Math.min(1, p.t), bump = Math.sin(u * Math.PI);
+      if (p.up) { p.mesh.position.y = p.ay + (p.by - p.ay) * u; }
+      else if (p.viaTop) { p.mesh.position.x = p.ax + (p.bx - p.ax) * u; p.mesh.position.y = p.ay + 0.6 + (p.by - p.ay) * u + bump * (rows === 1 ? 8 : 6); }
+      else if (p.ay !== p.by) { p.mesh.position.x = p.ax + (p.bx - p.ax) * u + bump * 6; p.mesh.position.y = p.ay + (p.by - p.ay) * u; }   // round the turn
+      else { p.mesh.position.x = p.ax + (p.bx - p.ax) * u; p.mesh.position.y = p.ay + 0.6 + bump * 1.6; }
       if (p.t >= 1) { group.remove(p.mesh); packets.splice(i, 1); if (p.target) p.target.level = Math.min(1, p.target.level + .15); }
     }
     group.rotation.y = Math.sin(now / 9000) * .06;
-    camera.position.x = Math.sin(now / 14000) * 4;
+    camera.position.x = Math.sin(now / 14000) * 2.5;
     camera.lookAt(0, -1, 0);
     renderer.render(scene, camera);
     rapAssembly.frame = requestAnimationFrame(tick);
   };
   rapAssembly = {shade, renderer, frame: 0, timer: 0,
-    resize: () => { renderer.setSize(W(), H(), false); camera.aspect = W() / H(); camera.updateProjectionMatrix(); }};
+    resize: () => { renderer.setSize(W(), H(), false); fit(); }};
   rapAssembly.frame = requestAnimationFrame(tick);
   rapAssembly.timer = setInterval(async () => {
     if (!rapAssembly) return;

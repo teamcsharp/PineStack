@@ -234,6 +234,22 @@ class LineReviewStore:
                            (_json(effect), row['id']))
             return len(rows)
 
+    def note_stale(self, review_id, status='stale_grader', say=''):
+        """2026-09-08: a pending row re-read against today's grader leaves
+        the queue as a note whose effect says why - stale_grader (the stored
+        wording passes now) or read_plain (the road reads the line plain).
+        Returns whether a pending row was changed."""
+        status = str(status or 'stale_grader')[:40]
+        with self._lock, self._write() as db:
+            row = db.execute("SELECT id FROM line_reviews WHERE id=? AND review_status='pending'",
+                             (str(review_id),)).fetchone()
+            if row is None:
+                return False
+            effect = {"status": status, "say": str(say or '')[:200], "at": time.time()}
+            db.execute("UPDATE line_reviews SET review_status='noted',effect=?,revision=revision+1 WHERE id=?",
+                       (_json(effect), row['id']))
+            return True
+
     def latest_seq(self):
         """The newest occurrence's sequence - one cheap max() on the events
         key - so a caller can tell whether anything was journaled since it

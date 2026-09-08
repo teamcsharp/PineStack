@@ -242,7 +242,7 @@ recovery, or the operator's own hand. In order:
 
 | check | what it measures | refusal (blocking) |
 |---|---|---|
-| **meaning** (`crystal_compare_contract`, crystal_contract.py, contract VERSION 3) | content anchors recalled above a floor that falls with strength (0.5 below 0.45, 0.35 from 0.45, 0.2 from 0.75 — the harder the tint, the more paraphrase is allowed), names kept (heuristic names advisory), numbers kept and none added (idioms and pronominal "one" waived), a question stays a question, a negation stays where it was, no unsupported positive contrast | *semantic preservation failed* |
+| **meaning** (`crystal_compare_contract`, crystal_contract.py, contract VERSION 3) | content anchors recalled above a floor that falls with strength (0.5 below 0.45, 0.35 from 0.45, 0.2 from 0.75 — the harder the tint, the more paraphrase is allowed), names kept (heuristic names advisory: a speaker label, a descriptive opener such as "Taut wire…", the station's own name), numbers kept and none added (idioms and pronominal "one" waived), a question stays a question, a negation stays where it was, no unsupported positive contrast. Under the meaning grade a **rhetorical** negation folded ("not just structural", "No, …", "isn't it?", "not X; it is Y") and an **inner** question folded (the turn ends on a statement) are advisory; the strict grade refuses both | *semantic preservation failed* |
 | **caller contract** (callers only, `call_tint_report`) | the call's structure survives the rewrite: the line answered, the introduction, the greeting, the sign-off | *caller structure did not pass* |
 | **rhyme** (`rap_rhyme_evidence`) | end pairs across bars (the spelling reading `_rap_slant` on landings, plus the pronunciation dictionary `terminal_rhymes`, CMUdict, matching every phone from the final stressed vowel), a chain with the previous bar's end, internal pairs, multisyllabic pairs; a long transcript needs two end pairs | *no rhyme evidence — the bar does not land a rhyme* (required at strength ≥ 0.45) |
 | **transformation** | lexical distance ≥ 0.18, no five-word run of the source kept verbatim, cadence or lexicon or length changed — **or**, since this evening, a proved end rhyme the source did not have (`rhyme_added`) | *rhetoric was not materially transformed* |
@@ -466,8 +466,10 @@ cover line rendered on the spot. Every silent tick past 12 s is punctuated with 
 - **What counts as a rhyme.** The dictionary now proves perfect pairs; slant pairs (calm/harm,
   next/test) are still refused. Accepting slant as advisory would rescue more bars at the cost of
   looser rhymes.
-- **The meaning gate's strictness.** A dropped negation or an added question is refused outright;
-  the census counted 60 and 20 such cuts. Relaxing either is a taste decision, not a technical one.
+- **The meaning gate's strictness.** A negation on a fact dropped, or a question added, is
+  refused outright. Since this evening a *rhetorical* negation and an *inner* question fold under
+  the meaning grade (62 and 22 of the day's 108 meaning cuts were these); going further — folding
+  any negation when the anchors hold — is a taste decision, not a technical one.
 - **The repertoire's share of the air.** Rhymed rounds keep 96 h with 12 airings at a 3-hour rest;
   raising airings or shortening the rest makes the station repeat itself more and write less.
 - **Who is asked before a deletion.** The desk asks about rhymed items by default; "everything" makes
