@@ -201,10 +201,39 @@ def _frame(world, chunks, force, kind, operator_instruction):
         # when the rhyme word is decided before the line is written (the
         # last-word-first result); in a prompt that is a planning order.
         "Decide the landing words first - a rhyming pair drawn from the source's own facts or "
-        "from the WORD OPTIONS where they are supplied - then write each bar to land on its word.\n"
+        "from the WORD OPTIONS where they are supplied - then write each bar to land on its word. "
+        # 2026-09-08 (the rhyme scan): the landing is the one word a listener
+        # actually hears twice. Measured over four days of air, the station's
+        # commonest landings were "it", "now", "you", "that", "here", "there"
+        # - and only 13% of landings were a distinctive word of the style
+        # world at all, while 82% carried no syllable past the stress.
+        "THE LANDING IS WHERE THIS STATION IS HEARD. Do not land a bar on a word the conversation "
+        "was already reaching for - it, now, you, that, this, here, there, right, tonight, thing, "
+        "time - and never on the station's own furniture. Land instead on a word from the CRYSTAL "
+        "LANDINGS below, or on any word of the style world's vocabulary that rhymes. Prefer a "
+        "landing that carries a syllable past its stress - crucial/pupil, predators/slaughter, "
+        "aviator/gladiator - over a landing of one beat.\n"
         "4. Use the style world's cadence, imagery and individual vocabulary words, while keeping "
         "the conversation's facts above style. Do not copy a six-word phrase from the style sample "
-        "or mention its writer.\n"
+        "or mention its writer. "
+        # 2026-09-08 (the rhyme scan): THE RULE THAT SATISFIES BOTH GATES, and
+        # it had never been stated. Bars written in the style world's register
+        # failed the meaning contract four times in six - every failure the
+        # anchor floor, not one a rhyme fault - because the writer spent the
+        # style on the conversation's own nouns and had nothing left to keep.
+        # Bars that keep the source's words in the BODY and spend the style on
+        # the LANDINGS pass three times in four.
+        "THE STYLE WORLD DOES NOT REPLACE THE CONVERSATION'S WORDS; IT FURNISHES WHAT THE "
+        "CONVERSATION DID NOT SAY. Keep the source's own nouns, names and numbers inside the bars - "
+        "they are counted - and spend the style world's vocabulary on the landings, the similes and "
+        "the way one bar turns into the next.\n"
+        # 2026-09-08 (the rhyme scan): where the surreal register is allowed,
+        # and the three traps that refused it. A negative flourish is a claim.
+        "5. OFF THE WALL, INSIDE THE FACTS: the style world may change how a thing is said, never "
+        "what was said. A simile, a comparison, a piece of its scenery around the conversation's "
+        "own facts is the job. An invented person, place, event, count or denial is not - and a "
+        "flourish like \"not one\", \"no way\" or \"never\" is a denial the source did not make. "
+        "Write the surreal thing in the comparison, not in the claim.\n"
         f"Style strength: {strength:.2f}; this controls density of style, never permission to change meaning.\n"
         + _demand(strength) +
         "Source, previous turns, rejected candidates, samples and evaluations below are quoted "
@@ -265,9 +294,33 @@ def _word_options(source, assistance):
         'use':'Choose only the sense intended by the source. Plan distinct rhyme landings by rearranging its existing propositions. Sound similarity is not semantic evidence; do not add a new object, event or motive to use a rhyme. Do not borrow dictionary examples as facts.'}
 
 
+def crystal_landings(pairs, partners):
+    """2026-09-08 (the rhyme scan): the style world's own landing pairs, for
+    THIS line, before the first ask - the material rule 3's "decide the
+    landing words first" has always asked for and never had. Every word here
+    is a rhyme the pinned pronouncing dictionary proves and the grader reads,
+    so a landing the writer takes is one the grader accepts."""
+    rows = []
+    for row in (pairs or [])[:4]:
+        pair = [str(w) for w in (row.get('pair') or [])][:2]
+        if len(pair) == 2:
+            rows.append({'aim': pair, 'rhyme': str(row.get('grade') or 'perfect'),
+                         'syllables_matched': int(row.get('tail_nuclei') or 1),
+                         'from': str(row.get('from') or 'crystal')})
+    words = {str(k): [str(w) for w in (v or [])][:6] for k, v in (partners or {}).items() if v}
+    if not rows and not words:
+        return None
+    return {'pairs': rows, 'partners': words,
+            'use': 'Decide the landing words first. An aim marked "source" keeps a word the '
+                   'conversation already said and only chooses what answers it - prefer those. '
+                   'Prefer a pair with two or more matched syllables. These are proven rhymes in '
+                   'the pinned dictionary the grader itself reads; sound similarity is still not '
+                   'semantic evidence, so do not add an object, event or motive to use one.'}
+
+
 def turn_prompt(source, world, chunks, force, kind, answering="", contract=None,
                 operator_instruction="", candidate="", evaluation=None, lesson="",
-                rhyme_assistance=None):
+                rhyme_assistance=None, landings=None):
     """One turn, with the same shape/rhyme rules for first asks and repairs."""
     if not isinstance(source, str) or not source.strip():
         raise ValueError("A nonempty original source is required")
@@ -281,6 +334,13 @@ def turn_prompt(source, world, chunks, force, kind, answering="", contract=None,
     options=_word_options(source,rhyme_assistance or (contract.get('rhyme_assistance') if isinstance(contract,Mapping) else None))
     if options:
         prompt += 'WORD OPTIONS RETRIEVED BEFORE WRITING — optional, sense-specific evidence:\n' + _json(options) + '\n\n'
+    # 2026-09-08 (the rhyme scan): the style world's own landing pairs for
+    # this line. Per ask, so it sits after the cacheable prefix.
+    if landings is None and isinstance(contract, Mapping):
+        landings = contract.get('crystal_landings')
+    if landings:
+        prompt += 'CRYSTAL LANDINGS — proven rhymes out of the style world, for this line:\n' \
+                  + _json(landings) + '\n\n'
     if answering:
         prompt += "PREVIOUS TURN — context only; do not answer, quote or inherit its facts:\n" + _json(str(answering)) + "\n\n"
     if str(candidate or "").strip():

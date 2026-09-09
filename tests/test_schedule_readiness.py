@@ -964,7 +964,12 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
               "talk_quiet_most": 95}
         with mock.patch.object(app, "dj_settings", return_value=dj):
             self.assertLess(app.torrent_breath(dj), 0.4)
-            self.assertEqual(app.talk_quiet_limit(), 12.0)
+            # 2026-09-08: the operator's rule is "at longest a 10 second
+            # intermission", and detection at twelve plus the two-second
+            # tick plus the announce cannot meet it by arithmetic. Eight
+            # leaves a ten-to-eleven-second worst case. Measured before the
+            # change: 56% of intermissions ran over ten seconds.
+            self.assertEqual(app.talk_quiet_limit(), 8.0)
             self.assertEqual(app.talk_watch_tick(), 2.0)
 
     def test_full_talk_replaces_live_only_round_with_recorded_talk(self) -> None:

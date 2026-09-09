@@ -59256,7 +59256,12 @@ async def _sting_over_record(track: dict[str, Any] | None) -> None:
 # ~23,000 pre-rendered samples and the SFX Guy's recorded liners were never
 # drawn from a silence path.
 _SFX_GAP: dict[str, Any] = {"at": 0.0, "turn": 0, "count": 0, "why": "", "went": ""}
-SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "9"))
+# 2026-09-08 (the flow scan): six, not nine. The operator's rule is a
+# ten-second maximum intermission; with a nine-second rest plus detection
+# and the announce the first filler cannot land inside ten. The bank can
+# afford it - 400 gold bars at a five-minute rest serve 300 an hour
+# against the 174 the rule needs.
+SFX_GAP_REST = float(os.getenv("SFX_GAP_REST", "6"))
 
 
 async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
@@ -59264,14 +59269,16 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
     prepared station liner off its shelf when he has one (the pantry
     serves it; nothing renders), else a short sample off the pool - and
     never a render: the point is to buy the render its time. Returns what
-    went out ("liner" / "sample") or "".
+    went out ("bar" / "liner" / "sample") or "".
 
     Never over a voice, never while paused, and it rests SFX_GAP_REST
     between clips (or the operator's sfx_gap dial, if longer). With
     `under_floor` it may fire while a writer holds the floor for a render
     that has not started playing - the one silence #1146's hold used to
-    leave unpunctuated; under the floor only a sample goes out, because
-    a liner takes the floor and would queue behind the round."""
+    leave unpunctuated. Under the floor a GOLD BAR and a sample go out
+    (both are clips that already exist, on the floorless road); only the
+    liner waits, because a liner is written and would queue behind the
+    round it is covering for."""
     try:
         if radio_paused() or not _RADIO.get("on"):
             return ""
@@ -59306,8 +59313,11 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
         # 2026-09-08 (evening): "keep the station rapping 24/7" - a rhymed
         # bar that already aired, with its own take, goes out FIRST; the
         # liner and the sample are what is left while the gold rests.
-        if not floor_held:
-            went = await gold_fill_gap(why)
+        # 2026-09-08 (the flow scan): AND IT GOES OUT UNDER THE FLOOR TOO,
+        # on the floorless road, because it is a clip that already exists.
+        # Only the liner still waits for the floor - a liner is written and
+        # rendered, and would queue behind the round it is covering for.
+        went = await gold_fill_gap(why, floorless=floor_held)
         if not went and drop_voice and not floor_held and _SFX_GAP["turn"] % 2 == 0:
             # A liner written and recorded for this voice earlier (#842):
             # the same road dj_sting's drop branch takes.
@@ -59653,7 +59663,13 @@ LINE_PRINTS_PATH = data_path("line_prints.json")
 # long and may come round twice as often, and at a sting moment a gold bar
 # from the other seat fires first, the sting after it.
 GOLD_PATH = data_path("gold_bars.json")
-GOLD_MAX = 400
+# 2026-09-08 (the flow scan): two thousand, not four hundred. Every
+# accepted rendered bar is already harvested before its round is let go
+# and its take is already shielded from the media sweep; the cap was the
+# only thing throwing them away. 400 bars is 52 minutes of finished
+# rhymed audio; 2,000 is about four hours, which makes "the same line
+# aired a hundred times" arithmetically impossible.
+GOLD_MAX = int(os.getenv("GOLD_MAX", "2000"))
 GOLD_FIRE_RATE = 0.5                 # share of sting moments that fire a bar
 GOLD_REST = 1200.0                   # the same bar rests twenty minutes
 _GOLD: dict[str, Any] = {"loaded": False, "rows": []}
@@ -59793,9 +59809,17 @@ def gold_harvest_entry(entry: Any, why: str = "") -> int:
         return 0
 
 
-async def gold_fill_gap(why: str = "") -> str:
+async def gold_fill_gap(why: str = "", floorless: bool = False) -> str:
     """A rhymed bar that already aired, with its own take, fills the air -
-    no model, no render. Returns "bar" when one went out."""
+    no model, no render. Returns "bar" when one went out.
+
+    2026-09-08 (the flow scan): with `floorless` the bar goes out on the
+    same road a sting takes, without claiming the air floor. Under the
+    hold a bar used to be skipped entirely - `dj_speak` would take the
+    floor and queue behind the very round it was covering for - so while a
+    round rendered (measured 6 to 78 seconds a line) the station had
+    fifty-two minutes of finished rhymed audio on disk and was forbidden
+    to play any of it. That silence is 20% of all on-air time."""
     try:
         bar = gold_pick(min_rest=GOLD_GAP_REST)
     except Exception:  # noqa: BLE001
@@ -59808,9 +59832,10 @@ async def gold_fill_gap(why: str = "") -> str:
     clip = {"path": f"/media/{name}", "sig": media_sign(name),
             "seconds": float(bar.get("seconds") or 0)}
     text = str(bar.get("text") or "")
+    _door = _dj_speak_floorless if floorless else dj_speak
     try:
-        out = await dj_speak("interject", None, line=text, who=str(bar.get("who") or "dj"),
-                             checked=True, sting=False, clip=clip)
+        out = await _door("interject", None, line=text, who=str(bar.get("who") or "dj"),
+                          checked=True, sting=False, clip=clip)
     except Exception as exc:  # noqa: BLE001
         pipeline_log("air", f"a gold bar could not fill the air: {type(exc).__name__}: {exc}"[:160])
         return ""
@@ -61298,7 +61323,10 @@ _LAST_SAID = [0.0]
 # leads or the floor lock (#1146/#1151 invariants).
 GAP_LOG_PATH = data_path("gap_log.jsonl")
 GAP_MIN_SECONDS = 10.0            # under this a silence is a beat, not a gap
-GAP_STOCK_FIRST_AFTER = 40.0      # a hole this long arms the stock-first rule
+# 2026-09-08 (the flow scan): twelve, not forty. At forty the stock-first
+# rule only ever armed AFTER the operator's ten-second rule had already
+# been broken four times over.
+GAP_STOCK_FIRST_AFTER = 12.0      # a hole this long arms the stock-first rule
 GAP_STOCK_FIRST_ROUNDS = 2        # ...for this many rounds
 GAP_STOCK_FIRST_DEPTH = 0.3       # ...or a pantry this shallow does
 GAP_STOCK_FIRST_EVERY = 900.0     # ...but depth may only re-arm this often
@@ -62699,7 +62727,11 @@ async def continuity_prepare_api(authorization: str | None = Header(default=None
 
 TALK_QUIET_MOST = 95.0
 TALK_WATCH_TICK = 15.0
-TALK_INCESSANT_QUIET_MOST = 12.0
+# 2026-09-08 (the flow scan): eight, not twelve. The operator's rule is a
+# ten-second maximum intermission; detection at eight plus the two-second
+# tick plus the announce is a ten-to-eleven-second worst case, and at
+# twelve the first filler CANNOT land inside ten by arithmetic.
+TALK_INCESSANT_QUIET_MOST = 8.0
 TALK_INCESSANT_WATCH_TICK = 2.0
 
 
@@ -62850,7 +62882,9 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
     which is already stocked, already cooled down against the hour, and needs
     no model call, so this can never itself become the thing being waited on.
     Returns whether anything went out."""
-    if time.time() - _COVER_AT[0] < (4 if talk_is_incessant() else 20):
+    # 2026-09-08 (the flow scan): three at the top stop, not four - the
+    # cover's own rest must sit below the quiet limit or it self-blocks.
+    if time.time() - _COVER_AT[0] < (3 if talk_is_incessant() else 20):
         return False                    # a cover, not a filibuster
     if _SPEAKING[0] or _floor_busy():   # #1146
         return False                    # somebody already has the floor
@@ -62868,15 +62902,26 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
     if talk_is_incessant():
         # At the top stop the watchdog spends finished audio. A model call
         # and a new voice render cannot meet the constant-talk gap target.
+        #
+        # 2026-09-08 (the flow scan): THE DEEP BANK GOES FIRST. Measured over
+        # four days, the 400 gold bars - 52 minutes of finished, rhymed,
+        # rendered audio - carried 1.2% of the air while the 28 continuity
+        # lines carried 19.8%, because continuity was tried first and wins
+        # whenever its 60-second lockout has passed. That is why eight lines
+        # aired a hundred times each. And it is why the rule is missed: a run
+        # of gold holds a 6-second median gap (86% inside ten seconds); a run
+        # of continuity holds a 32-second mean (46%), because it is
+        # rate-limited by construction. Gold first, continuity last - the
+        # emergency reserve its own docstring calls it.
         _COVER_AT[0] = time.time()
         try:
             if await dj_banter(_RADIO.get("now"), shelf_only=True):
                 return True
         except Exception:
             pass
-        if await continuity_air(why or "the prepared conversation shelf is empty"):
+        if await sfx_fill_gap(why or "the prepared conversation shelf is empty"):
             return True
-        return bool(await sfx_fill_gap(why or "the prepared conversation shelf is empty"))
+        return bool(await continuity_air(why or "the prepared conversation shelf is empty"))
     line = fresh_pool_take()
     text = str(line.get("text") or "").strip()
     if len(text) < 30:
@@ -71929,6 +71974,24 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             elif _all_hit:
                 spans = [(_i, min(len(playlist), _i + 8))
                          for _i in range(0, len(playlist), 8)]
+            # 2026-09-08 (the calls scan): A PHONE CALL IS NEVER PAGED.
+            #
+            # "I dont like hearing the customers just vaporized." Measured
+            # over four days: 18 of 62 calls that rang on air (29%) never
+            # said goodbye, and every one of them has a hole of 36 seconds
+            # or more INSIDE the call while the clean ones are all under
+            # twenty. The ladder is why. An eleven-turn call pages 2/4/5, and
+            # the air stops at each boundary to wait for the next page's TTS;
+            # if a render fails or a repeat check refuses at that boundary,
+            # the tail goes to the render backlog, which airs ONE LINE PER
+            # DRAIN behind the floor - so the caller is abandoned mid-arc and
+            # the rest arrives, out of context, minutes later.
+            #
+            # A call therefore waits for all of its audio and then airs as
+            # one piece. The wait is paid OFF AIR, where the gap roads cover
+            # it; the alternative is paying it mid-conversation.
+            elif caller_name:
+                spans = [(0, len(playlist))]
         except Exception:  # noqa: BLE001
             pass
         if ready_takes is not None:
@@ -71974,6 +72037,13 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                             _FLOOR_OWNER["at"] = time.time()
                         await asyncio.sleep(1.0)
                     if not _RADIO.get("on"):
+                        # 2026-09-08 (the calls scan): the station going off
+                        # mid-round is not a finished round. Without this the
+                        # break fell through to `played_any and not missed`
+                        # and call_ended wrote a normal hang-up for a caller
+                        # who never resolved - a completion the station
+                        # forged for itself.
+                        missed.extend(range(_lo, len(playlist)))
                         break
                 else:
                     try:
@@ -72555,14 +72625,20 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                         await asyncio.sleep(min(_pwait, 5.0))
                         _pwait = (_pstart - _plead - PAGED_ANNOUNCE_EARLY
                                   - time.time())
-                    if ready_takes is not None and (radio_paused() or not _RADIO.get("on")
+                    # 2026-09-08 (the calls scan): THESE ARE START-OF-ROUND
+                    # CHECKS. A slot that no longer fits, or a repeat check,
+                    # may refuse a round that has not begun; it may not
+                    # abandon a conversation the listener is already hearing -
+                    # that is a caller cut off mid-sentence with no sign-off.
+                    if (not played_any) and ready_takes is not None and (
+                            radio_paused() or not _RADIO.get("on")
                             or not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
                                 ready_takes, ready_meta.get("_ready_slot"),
                                 seconds=length, start_at=_pstart)
                             or (callable(can_handoff) and not can_handoff())):
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
-                    if not _system2_repeat_rows(rows, ready_meta):
+                    if not played_any and not _system2_repeat_rows(rows, ready_meta):
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
                     page_delivery = page_feed_append({
@@ -72604,10 +72680,14 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 # dead air in its place, which is the worse of the two on a
                 # stream.
                 if to_box:
-                    if not page_delivery and not _system2_repeat_rows(rows, ready_meta):
+                    # 2026-09-08 (the calls scan): as above - a check that
+                    # belongs to the start of a round may not abandon one the
+                    # listener is already hearing.
+                    if (not played_any and not page_delivery
+                            and not _system2_repeat_rows(rows, ready_meta)):
                         _sfx_cadence_release(_sfx_meta.values())
                         return []
-                    if (ready_takes is not None and not page_delivery
+                    if (not played_any and ready_takes is not None and not page_delivery
                             and (radio_paused() or not _RADIO.get("on")
                                  or not _ready_round_fits(str(ready_meta.get("prep_kind") or ""),
                                      ready_takes, ready_meta.get("_ready_slot"), seconds=length)
@@ -83738,6 +83818,39 @@ def _crystal_vocab_build() -> frozenset:
     return frozenset(words)
 
 
+RHYME_FAMILIES_PATH = data_path("rhyme_families.json")
+
+
+def _crystal_vocab_counts() -> dict[str, int]:
+    """2026-09-08 (the rhyme scan): the same walk, COUNTED. How often the
+    crystal uses each word is what makes a rhyme suggestion distinctive
+    rather than alphabetical - the set alone cannot tell "mic" (772 uses in
+    the DOOM mind) from "achoo" (one)."""
+    counts: dict[str, int] = {}
+    for c in crystal_active():
+        for mind in (c.get("minds") or []):
+            try:
+                chunks = _load_vectors(mind_id(str(mind))).get("chunks") or []
+            except Exception:  # noqa: BLE001
+                continue
+            for ch in chunks:
+                for word in _tint_words(str((ch or {}).get("text") or "")):
+                    if len(word) > 2 and word.isalpha():
+                        counts[word] = counts.get(word, 0) + 1
+    return counts
+
+
+def _crystal_families_build() -> dict[str, Any]:
+    """Build the crystal's rhyme-family index (pine_rhyme). In the worker
+    thread beside the vocabulary, once per crystal; no model, no network."""
+    import pine_rhyme
+    counts = _crystal_vocab_counts()
+    if not counts:
+        return {}
+    return pine_rhyme.build(counts, str(RHYME_FAMILIES_PATH),
+                            vendor=str(Path(__file__).resolve().parent / "vendor"))
+
+
 async def crystal_vocab_warm() -> None:
     """#1064: the lexicon check reads the writer's WHOLE vocabulary, not
     the two passages a line was shown - "no new lexicon word drawn from
@@ -83757,6 +83870,20 @@ async def crystal_vocab_warm() -> None:
         pass
     finally:
         _CRYSTAL_VOCAB_FULL["building"] = False
+    # 2026-09-08 (the rhyme scan): and the RHYME FAMILIES beside it - every
+    # crystal word grouped by its pronunciation tail, so the writer can be
+    # offered a distinctive partner instead of an alphabetical one. Same
+    # trigger, same worker thread, no model.
+    try:
+        totals = await asyncio.to_thread(_crystal_families_build)
+        if totals:
+            pipeline_log("crystal", "the crystal's rhyme dictionary is "
+                         f"{totals.get('families')} rhyme families over "
+                         f"{totals.get('cmu_known')} words "
+                         f"({totals.get('multisyllabic_families')} of them multisyllabic)")
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("crystal", f"the rhyme dictionary could not be built: "
+                     f"{type(exc).__name__}: {exc}"[:160])
 
 
 def _crystal_vocab() -> frozenset:
@@ -83940,9 +84067,34 @@ def crystal_source_contract(text: str) -> dict[str, Any]:
     return crystal_extract_contract(text, _TINT_EVAL_STOP, _crystal_vocab())
 
 
+def crystal_landing_pairs(text: str, answering: str = "", want: int = 4) -> Any:
+    """2026-09-08 (the rhyme scan): the style world's own landing pairs for
+    this line, off the rhyme dictionary - anchored pairs first, so the bar
+    keeps a word the source already said and only chooses what answers it.
+    No model; the artifact is memoised. Empty when it has not been built."""
+    try:
+        import crystal_prompts
+        import pine_rhyme
+        book = pine_rhyme.load(str(RHYME_FAMILIES_PATH))
+        vocab = _crystal_vocab()
+        pairs = book.landing_pairs(str(text or ""), want=want,
+                                   answering=str(answering or ""), vocab=vocab)
+        partners: dict[str, list[str]] = {}
+        for row in pairs:
+            aim = (row.get("pair") or [""])[0]
+            if aim and aim not in partners:
+                got = book.options_for(aim, 6, vocab=vocab)
+                if got:
+                    partners[aim] = got
+        return crystal_prompts.crystal_landings(pairs, partners)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def crystal_prompt_contract(text: str) -> dict[str, Any]:
     contract = crystal_source_contract(text)
     contract["rhyme_assistance"] = crystal_rhyme_assistance(text, contract)
+    contract["crystal_landings"] = crystal_landing_pairs(text)
     return contract
 
 
@@ -84588,9 +84740,32 @@ _RHYME_OPTIONS_MEMO: dict[str, Any] = {"vocab": None, "words": {}}
 
 
 def rhyme_options_for(word: str, limit: int = 8) -> list[str]:
-    """Words of the crystal's own vocabulary that land a rhyme on `word`
-    by the very reading the grader uses (_rap_slant, end=True) - so a
-    suggestion the writer takes is one the grader accepts."""
+    """Words of the crystal's own vocabulary that land a rhyme on `word`.
+
+    2026-09-08 (the rhyme scan): the RHYME DICTIONARY answers first - the
+    crystal's own families, ranked so a distinctive word leads and the
+    station's furniture never does. The scan below is the fallback, and it
+    is not optional: without the artifact (a fresh station, a crystal that
+    has just changed) the writer must still be offered something.
+    Measured: the scan alone offered words that were 70% a/b/c, because it
+    walked a sorted vocabulary and stopped at forty hits."""
+    word = str(word or "").lower().strip()
+    if len(word) < 2:
+        return []
+    try:
+        import pine_rhyme
+        got = pine_rhyme.load(str(RHYME_FAMILIES_PATH)).options_for(
+            word, limit, vocab=_crystal_vocab())
+        if got:
+            return got
+    except Exception:  # noqa: BLE001
+        pass
+    return _rhyme_options_scan(word, limit)
+
+
+def _rhyme_options_scan(word: str, limit: int = 8) -> list[str]:
+    """The fallback: a scan of the crystal's vocabulary by the grader's own
+    readings. Used when the rhyme dictionary has not been built yet."""
     word = str(word or "").lower().strip()
     if len(word) < 2:
         return []
@@ -85317,11 +85492,20 @@ def crystal_operator_refinement(force: float, kind: str = "") -> str:
              + str(settings["revision"]) + "):\n" + instruction + "\n\n")
             if instruction else "")
     if learning["mode"] == "fluid":
+        # 2026-09-08 (the rhyme scan): this block used to read "do not add
+        # filler, a new claim or an UNUSUAL STYLE WORD just to increase
+        # lexical difference" and "a concise restatement is preferable" -
+        # forty lines after the strength demand says "all the way", and the
+        # exact opposite of what the operator asks for. The two real rules it
+        # was reaching for are kept: no invented CLAIM, and no padding. An
+        # unusual word at the landing is the job, not the padding.
         manual += ("ORCHESTRATOR FLUID ACCEPTANCE: meaning and audible rhyme come first. "
-                   "A faithful rhyming line can keep the original vocabulary. Do not add filler, "
-                   "a new claim or an unusual style word just to increase lexical difference. "
-                   "For a short source, rearrange its own intent into a clear rhyming pair; "
-                   "a concise restatement is preferable to invented scenery or motives.\n\n")
+                   "A faithful rhyming line may keep the original vocabulary in its body, and "
+                   "SHOULD reach for the style world's own vocabulary at its landings. Do not add "
+                   "filler or a new claim to increase lexical difference - an invented person, "
+                   "event, count or denial is a different fact, and that is the one thing style "
+                   "may not buy. For a short source, rearrange its own intent into a clear "
+                   "rhyming pair rather than inventing scenery or motives.\n\n")
     # 2026-09-08 (evening): the orchestrator's own reflection on this road
     # rides beside the learner's hints - the station's lessons from its own
     # accepted and refused bars, with two of the accepted ones as the shape.
@@ -86715,6 +86899,7 @@ async def crystal_tint(script: str, kind: str = "",
             _accepted = 0
             _cut = 0                                                # #1064
             _cut_caller = 0                                         # 2026-09-08
+            _cut_closing = 0                                        # 2026-09-08
             for _turn_at, (marker, said) in enumerate(turns):
                 _said = str(said or "")
                 _said_hash = hashlib.sha1(
@@ -86907,6 +87092,15 @@ async def crystal_tint(script: str, kind: str = "",
                         _cut += 1
                         if marker in ("C", "E"):
                             _cut_caller += 1        # 2026-09-08: a caller answer, not a host line
+                        if _turn_at >= len(turns) - 2:
+                            # 2026-09-08 (the calls scan): THE CLOSING PAIR.
+                            # The caller's resolving turn and the host's
+                            # sign-off are the two the listener needs to hear
+                            # a call END. The sign-off is a host line, so the
+                            # caller guard above did not protect it, and a
+                            # cut there produced a call that failed its
+                            # contract at activation and never aired at all.
+                            _cut_closing += 1
                         _evaluations[-1]["cut"] = True
                         pipeline_log("crystal", f"(#1064) turn {_turn_at + 1} "
                                      "is cut before the studio - the bar was "
@@ -86977,10 +87171,11 @@ async def crystal_tint(script: str, kind: str = "",
                 # a cut host turn; the caller's own turns are untouchable.
                 "met": bool(_attempted >= required
                             and (kind != "caller" or not _cut_caller)
+                            and (kind != "caller" or not _cut_closing)
                             and (_accepted >= required
                                  or (_cut and _accepted + _cut >= required
                                      and _accepted >= max(1, (required + 1) // 2)))),
-                "cut_caller": _cut_caller,
+                "cut_caller": _cut_caller, "cut_closing": _cut_closing,
             })
             out["evaluation"] = {
                 "ok": bool(out["coverage"]["met"]
