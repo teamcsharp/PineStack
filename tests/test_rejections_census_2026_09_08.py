@@ -8,6 +8,7 @@ from unittest import mock
 import system2_runtime as runtime
 
 import app
+import crystal_rhyme
 import test_crystal_model_output as adapter_fixture
 import test_system2_writing as writer_fixture
 
@@ -59,7 +60,14 @@ class RepairHintTests(unittest.TestCase):
         for word in options:
             with self.subTest(word=word):
                 self.assertIn(word, self.VOCAB)
-                self.assertTrue(app._rap_slant("late", word, end=True))
+                # 2026-09-08 (the deep scan): the grader's reading is the
+                # spelling proof OR the pronouncing dictionary, and the
+                # suggestions are now picked by the dictionary first - late/
+                # weight and late/freight are perfect rhymes the spelling
+                # reader refuses over their digraph. Measured before this,
+                # 64% of the words the hint offered were not rhymes at all.
+                self.assertTrue(app._rap_slant("late", word, end=True)
+                                or crystal_rhyme.rhymes_with("late", word), word)
         self.assertNotIn("late", options)
         self.assertEqual(app.rhyme_options_for("x"), [])
         self.assertEqual(app.rhyme_options_for(""), [])

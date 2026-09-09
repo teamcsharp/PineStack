@@ -255,7 +255,12 @@ def build_recovery(row, parse_turns, profile=''):
             text = _text(prior.get("text"), prior.get("rejected_candidate"))
         # Every candidate will be graded again by crystal_tint. No old approval,
         # coverage, cut or recording state is manufactured or carried forward.
-        resumed.append({"marker": marker, "source": _hash(said), "text": text, "selected": True})
+        # 2026-09-08 (the scan): except that a NEIGHBOUR whose bar had already
+        # passed is carried as prior_ok - the fact that it passed, not a new
+        # grade - so a recovery re-asks the approved turn, not the round.
+        prior_ok = bool(text) and bool(prior.get("text")) and bool((prior.get("evaluation") or {}).get("ok"))
+        resumed.append({"marker": marker, "source": _hash(said), "text": text, "selected": True,
+                        "prior_ok": prior_ok})
     if gate in _WHOLE_GATES:
         # Leave unmatched turns for normal writing/tint validation. No retained
         # subset, new quality proof or recording state replaces the full draft.

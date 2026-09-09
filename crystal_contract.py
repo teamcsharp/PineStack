@@ -35,7 +35,12 @@ _OPENERS = frozenset(('yes thanks thank hello listen well right okay keep please
                       'just still only even also because meanwhile anyhow plus except unless whatever '
                       'grab take hold wait check watch stop come go get give make put pick turn call say '
                       'think feel see hear try run hit drop bring hang stay play spin sit stand move walk '
-                      'talk imagine picture guess bet trust believe forget').split())
+                      'talk imagine picture guess bet trust believe forget '
+                      # 2026-09-08 (the scan): common words at a sentence start that only a
+                      # loaded crystal vocabulary used to excuse - independent of it now.
+                      'anyone religion justice business correct agreed despite like how eventually '
+                      'nobody god parents people everybody these everyone being again nothing without '
+                      'somebody whenever').split())
 # #1076: added negations that are rhetorical fillers, not a fact the
 # source lacked - "no time to waste" beside "returned immediately" is the
 # bar's cadence. Any other added negation still attaches to a claim the
@@ -59,11 +64,35 @@ _CURRENCIES = {'$': 'USD', 'dollar': 'USD', 'dollars': 'USD', '€': 'EUR',
                'euro': 'EUR', 'euros': 'EUR', '£': 'GBP', 'pound': 'GBP', 'pounds': 'GBP'}
 
 
+_CLAUSE_END = frozenset({'.', ',', ';', ':', '!', '?', 'i', 'you', 'we', 'they', 'he', 'she', 'it', 'who',
+                         'which', 'that', 'is', 'was', 'were', 'has', 'had', 'does', 'did', 'will', 'would',
+                         'can', 'could', 'should', 'looks', 'looked', 'seems', 'seemed', 'feels', 'felt',
+                         'sounds', 'sounded', 'with', 'without', 'from', 'in', 'on', 'right', 'next',
+                         'beside', 'near', 'and', 'but', 'or', 'so'})
+
+
 def _pronominal_one(tokens, index, end):
     if end != index + 1 or tokens[index].group() != 'one':
         return False
     before = tokens[index - 1].group() if index else ''
     after = tokens[end].group() if end < len(tokens) else ''
+    # 2026-09-08 (the scan): "makes one think", the transcript stutter "one
+    # one more", and an article + up to four modifiers + "one" at a clause
+    # end ("the stark white and black one, it should be called") are the
+    # pronoun, not a count of one.
+    if before in {'make', 'makes', 'made', 'let', 'lets'} and after in {
+            'think', 'feel', 'pause', 'wonder', 'laugh', 'cry', 'believe', 'question', 'consider',
+            'realize', 'realise', 'see', 'imagine', 'ponder', 'sick', 'shiver'}:
+        return True
+    if before == 'one' or after == 'one':
+        return True
+    if (not after or after in _CLAUSE_END) and before not in _NUMBER_WORDS and before not in _DEFAULT_STOP:
+        back = [tokens[i].group() for i in range(max(0, index - 5), index)]
+        for k in range(len(back) - 2, -1, -1):
+            if back[k] in {'a', 'an', 'the', 'this', 'that'}:
+                return True
+            if (back[k] in _NUMBER_WORDS and back[k] != 'and') or back[k] in {'.', ',', ';', ':', '!', '?'}:
+                break
     if before in {'make', 'makes', 'made'} and after == 'wonder':
         following = tokens[end + 1].group() if end + 1 < len(tokens) else ''
         if following in {'', '.', ':', 'where', 'why', 'whether', 'how', 'what',
@@ -299,7 +328,14 @@ def _numbers(text):
                   'surface': normalized[tokens[start].start():tokens[end - 1].end()]}
         if idiom:
             record['idiom'] = True
-        if kind == 'number' and _pronominal_one(tokens, index, end):
+        if (kind == 'number' and end == index + 1 and index >= 1
+                and tokens[index - 1].group() in {'the', 'both', 'all'}
+                and end + 1 < len(tokens) and tokens[end].group() == 'of'
+                and tokens[end + 1].group() in {'them', 'us', 'you', 'those', 'these'}):
+            # 2026-09-08 (the scan): "the two of them heard you" -> "they heard you".
+            record['ambiguous'] = True
+            record['reason'] = 'A counted pronoun group (the two of them) is a pronoun.'
+        elif kind == 'number' and _pronominal_one(tokens, index, end):
             record['ambiguous'] = True
             record['reason'] = 'Pronominal or indefinite one is not an explicit item count.'
         output.append(record)
@@ -379,6 +415,9 @@ def extract_contract(text, stopwords=(), vocabulary=()):
                   'unknown sentence opener' if opener and base[:1].isupper() and len(base) > 2
                   and word not in vocab and word not in _OPENERS
                   and not _grammatical_ing_opener(normalized,match) else '')
+        if reason and word == 'earth' and re.search(r"\b(?:what|how|why|who|where|when)\s+(?:in|on)\s*$",
+                                                    normalized[:match.start()].casefold()):
+            reason = ''                                     # 2026-09-08: "what on Earth" is an idiom
         if reason and word not in seen:
             row = {'text': original, 'normalized': word, 'reason': reason}
             if word in label_words and match.start() < (label.end() if label else 0):
@@ -397,8 +436,10 @@ def extract_contract(text, stopwords=(), vocabulary=()):
                 if row['normalized'] == word and row.get('heuristic'):
                     row.pop('heuristic', None)
                     row['reason'] = reason
-    negations = ['not' if word in {'no', 'not'} else word for index, word in enumerate(tokens)
-                 if word in {'no', 'not', 'never', 'without', 'neither', 'nor', 'nothing', 'nobody', 'none'}
+    negations = ['not' if word in {'no', 'not'} else ('nothing' if word in {'nothin', 'nuthin'} else word)
+                 for index, word in enumerate(tokens)
+                 if word in {'no', 'not', 'never', 'without', 'neither', 'nor', 'nothing', 'nobody', 'none',
+                             'nothin', 'nuthin'}                       # 2026-09-08: the rap spelling
                  and not (word == 'no' and index + 1 < len(tokens) and tokens[index + 1] in {'doubt', 'doubts'})]
     inversions = re.finditer(r"(?:^|[.!?;]\s*|\s/\s)\s*[\"']?(can|could|will|would|should|shall|may|might|must|do|does|did|is|are|was|were|has|have|had)\s+(you|we|i|he|she|it|they|the|this|that)\b(?:\s+(\w+))?", expanded)
     # A malformed retained fragment such as "Is we're getting closer"
@@ -561,6 +602,19 @@ def _filler_negations_only(candidate):
     words = ' ' + ' '.join(words.split()) + ' '
     for filler in _FILLER_NEGATIONS:
         words = words.replace(' ' + filler + ' ', ' ')
+    # 2026-09-08 (the scan): a two-word "no X" / "nothing but (a) X" tag that
+    # CLOSES a bar after a comma or semicolon ("...garbage was stolen, no
+    # dice", "First caller gets it, no collars") is the bar's cadence, not a
+    # claim: 24 of 55 live negation refusals were added tags, 14 of them two
+    # words. A five-word claim in tag position ("no brakes on that route")
+    # is still a claim.
+    raw = ' '.join(_expanded(candidate).casefold().split())
+    for tag in re.findall(r"[,;]\s*(?:no|nothing but(?: a| the)?)\s+[a-z'-]+\s*(?=$|[;/.!?]|\s/)", raw):
+        for w in re.sub(r"[^a-z' ]", ' ', tag).split():
+            if w in _NEGATION_WORDS:
+                words = words.replace(' ' + w + ' ', ' ', 1)
+    for filler in ('if you do not mind', 'no longer', 'no lack', 'no dice'):
+        words = words.replace(' ' + filler + ' ', ' ')
     remaining = [word for word in words.split() if word in _NEGATION_WORDS]
     return not remaining
 
@@ -578,6 +632,11 @@ def _interrogative_cue(source):
     if '?' in text:
         return False
     if not re.search(r'[.!?]', text):
+        return bool(_QUESTION_ANYWHERE.search(text))
+    # 2026-09-08 (the scan): a transcript swath with one full stop in a
+    # hundred and sixty words is unpunctuated too ("why so serious" ×3).
+    nwords = len(text.split()); ends = len(re.findall(r'[.!?]', text))
+    if nwords >= 40 and ends / nwords * 100 < 2.0:
         return bool(_QUESTION_ANYWHERE.search(text))
     return bool(_QUESTION_CUE.search(text))
 
@@ -657,8 +716,55 @@ _RHETORICAL_NEGATION = (
     re.compile(r"\b(?:\w+n't|not|no)\b[^.!?;]{1,90}?\b(?:but|rather|instead)\b"),
     re.compile(r"\b(?:\w+n't|not)\b[^.!?;]{1,80}?[;,]\s*(?:it|they|that|this|he|she|we|you|there|which|what)"
                r"\s+(?:is|are|was|were|has|have|means|feels|'s)\b"),
+    # 2026-09-08 (the scan): six more frames read off the queue.
+    # a negated clause closed by a POSITIVE tag: "He does not snap out of it, does he?"
+    re.compile(r"\bnot\b[^.!?;]{0,80}?,\s*(?:do|does|did|is|are|was|were|can|could|will|would|should|has|have|had|am)"
+               r"\s+(?:it|they|you|we|he|she|there|i)\s*(?:[?.,!]|$)"),
+    # "raw exposure, nothing more" / "nothing more than" / "nothing but"
+    re.compile(r"\bnothing\s+(?:more|but|less)\b"),
+    # the tag closed by a comma or a period: "isn't it, trying to..."
+    re.compile(r",\s*(?:is|are|was|were|do|does|did|can|could|will|would|should|has|have|had|am|ai)\s+not\s+"
+               r"(?:it|they|you|we|he|she|there|i)\s*(?:[,.]|$)"),
+    # transcript answer tokens: "was there more junk food than real food no yes"
+    re.compile(r"\b(?:no\s+yes|yes\s+no)\b"),
+    # the negative rhetorical question opener: "aren't you sick of being told..."
+    re.compile(r"(?:^|[.!?;]\s*)(?:is|are|do|does|did|can|could|will|would|should|has|have|had|am|ai)\s+not\s+"
+               r"(?:it|they|you|we|he|she|there|i)\b"),
+    # "no matter how/where/who" beside the #1076 "no matter what"
+    re.compile(r"\bno\s+matter\s+(?:how|where|who|when|which|the)\b"),
 )
-_NEGATION_TOKEN = re.compile(r"\b(?:not|no|never|nothing|nobody|none|without|neither|nor)\b|n't\b")
+_NEGATION_TOKEN = re.compile(r"\b(?:not|no|never|nothing|nothin|nuthin|nobody|none|without|neither|nor)\b|n't\b")
+_LEXICAL_NEG_SKIP = frozenset('under until unless unique union unit units united universe universal uniform unite '
+                              'university unusual uncle understand understood underneath undermine undertake undergo '
+                              'underground instead into interest inside insane index indeed'.split())
+
+
+def _lexical_negation_unpacked(source_anchors, candidate):
+    """2026-09-08 (the scan): "the endless cycle... needs go unmet" ->
+    "demands that never end... it won't lend": a negation the rewrite added
+    within four words of the word that carries the source's own negative
+    prefix or suffix is that negation unpacked, not a new claim."""
+    stems = []
+    for w in source_anchors:
+        if w in _LEXICAL_NEG_SKIP:
+            continue
+        if w.endswith('less') and len(w) >= 7:
+            stems.append(w[:-4])
+        elif (w.startswith('un') and not w.startswith(('under', 'uni', 'unt')) and len(w) >= 6
+              and w[2:] not in _DEFAULT_STOP):
+            stems.append(w[2:])
+    if not stems:
+        return False
+    tokens = re.sub(r"[^a-z' ]", ' ', ' '.join(_expanded(candidate).casefold().split())).split()
+    for at, token in enumerate(tokens):
+        if token not in _NEGATION_WORDS:
+            continue
+        near = tokens[max(0, at - 4):at + 5]
+        for stem in stems:
+            head = stem[:4] if len(stem) >= 4 else stem
+            if any(t.startswith(head) or (len(t) >= 3 and stem.startswith(t[:4])) for t in near if t != token):
+                return True
+    return False
 
 
 def _rhetorical_negations_only(source):
@@ -742,6 +848,11 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
     question_basis = 'same'
     if not question and made['question'] and not original['question'] and _interrogative_cue(source):
         question, question_basis = True, 'transcript question punctuated'    # #1076
+    if (not question and made['question'] and not original['question']
+            and original.get('discourse_question_tags')):
+        # 2026-09-08 (the scan): the source's ", you know?" tag was folded to
+        # a full stop; a rewrite that ends on the question mark kept it.
+        question, question_basis = True, 'discourse tag kept as a question'
     # Preserve the existing polarity gate; repeated "No, I won't" need not
     # become two negations in a rewrite. Counts and terms remain visible as
     # advisory evidence, not an additional policy threshold.
@@ -763,6 +874,8 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
     elif not negation:
         negation = _filler_negations_only(candidate)                                 # #1076
         negation_basis = 'filler negation' if negation else 'negation added'
+        if not negation and _lexical_negation_unpacked(original['anchors'], candidate):
+            negation, negation_basis = True, 'lexical negation in the source unpacked'   # 2026-09-08
     contrasts = unsupported_positive_contrasts(source, candidate)
     return {'ok': bool(str(candidate or '').strip() and entities and question and negation
                        and not contrasts and (recall >= anchor_floor or not source_words)),

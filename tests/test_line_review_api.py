@@ -93,9 +93,12 @@ class ReviewApiTests(unittest.IsolatedAsyncioTestCase):
             result = await self.request("POST", endpoint, body)
         self.assertEqual(result.status_code, 200, result.text)
         self.assertEqual(result.json()["approved"], 1)
-        self.assertEqual(result.json()["skipped"], 1)
+        # #1088 (2026-09-08): a row the machine handled itself never reaches
+        # the operator's queue at all, so the batch has nothing to skip - it
+        # used to arrive pending and be skipped here for being technical.
+        self.assertEqual(result.json()["skipped"], 0)
         self.assertEqual(result.json()["awaiting_recovery"], 1)
-        self.assertEqual(self.store.get(technical["id"])["review_status"], "pending")
+        self.assertEqual(self.store.get(technical["id"])["review_status"], "noted")
         late = self.store.record("tint", "A later source.", "A later candidate.", ["meaning"])
         retry = await self.request("POST", endpoint, body)
         self.assertEqual(result.json(), retry.json())

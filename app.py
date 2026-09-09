@@ -303,6 +303,14 @@ def line_review_capture(gate: str, source: str, candidate: str = "",
             "turn": context.get("turn"), "marker": context.get("marker")})
         if step:
             context["lab_cut_step"] = step["seq"]
+    if gate == "tint" and not technical and str(disposition or "") == "cut":
+        # 2026-09-08 (the scan): one pending row per line - a newer cut of
+        # the same line replaces the older one (22 of 199 rows were older
+        # duplicates; a gallery round held 22 rows for 15 lines).
+        try:
+            _LINE_REVIEW.supersede("tint", str(source or ""), note="a newer cut of this line replaces it")
+        except Exception:  # noqa: BLE001
+            pass
     row = _LINE_REVIEW.record(
         gate, str(source or ""), str(candidate or ""), reasons,
         context=context, evaluation=evaluation, technical=technical,
@@ -27529,6 +27537,26 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
         plain = str(entry.get("script_plain") or active).strip()
         if not plain:
             return False
+        # 2026-09-08 (the scan): THE BRIEF COMES BEFORE THE TINT. A round
+        # that never gets to the thing its entry is for cannot air however
+        # well it raps - six recaps were written, rapped (25 minutes of the
+        # one deep lane) and recorded tonight, then held off brief. The
+        # audit is deterministic and files nothing; the entry is marked and
+        # the scheduler writes its replacement.
+        try:
+            _pre = segment_audit(str(kind), plain,
+                                 product=str(entry.get("product") or ""),
+                                 titles=str(entry.get("prep_news_titles") or ""))
+            if _pre.get("checked") and not _pre.get("ok"):
+                entry["brief"] = {**_pre, "at": time.time(), "where": "plain"}
+                entry["off_brief"] = True
+                _larder_save()
+                pipeline_log("lookahead", f"the {kind} round is off brief before the tint - "
+                             f"{_pre.get('why') or 'off brief'}. The deep lane is not spent on it; "
+                             "the scheduler writes its replacement (2026-09-08)")
+                return False
+        except Exception:  # noqa: BLE001
+            pass
         if not tint_retry_due(entry, kind):
             return False
         protected = list(entry.get("verbatim") or [])
@@ -32035,7 +32063,11 @@ async def larder_keeper() -> None:
             # shelf queues its write anyway: it runs the moment the
             # live write finishes, which is the back-to-back cadence
             # the operator expects.
-            if _OLLAMA_GATE.locked() and _stocked >= 2:
+            # 2026-09-08 (the scan): while PAUSED the pause is for banking -
+            # the bank wants seventy-two rounds and this gate let it write
+            # only when fewer than two existed (measured: 261 s of air
+            # banked per hour of pause). The lane still bounds the tint.
+            if _OLLAMA_GATE.locked() and _stocked >= 2 and not radio_paused():
                 continue
             _LARDER_WRITING[0] = True
             try:
@@ -54244,6 +54276,44 @@ def speakbox_body(doc: Path) -> str:
     return " ".join(keep)
 
 
+def _harvest_window_start(body: str, at: int) -> int:
+    """2026-09-08 (the scan): the harvest window opens on a sentence when
+    the text has one within four hundred characters, else on a word - never
+    inside a word. A window opened at a random CHARACTER handed the repair
+    model "mfortable" and "sgard", it capitalised them, and the shelf served
+    "Mfortable. Must feel good." and "Sgard." (bound as a name) as gems:
+    sixteen of the evening's 199 cut lines were such stubs."""
+    try:
+        text = str(body or "")
+        if at <= 0 or not text:
+            return 0
+        last = max(0, len(text) - 200)
+        m = re.search(r"[.!?]\s+", text[at:at + 400])
+        if m:
+            return min(at + m.end(), last)
+        space = text.find(" ", at)
+        return at if space < 0 else min(space + 1, last)
+    except Exception:  # noqa: BLE001
+        return max(0, int(at or 0))
+
+
+def _gem_is_stub(line: Any) -> bool:
+    """A gem cut mid-word or mid-sentence by the harvest window - "Mfortable.
+    Must feel good.", "Sgard. And i am burdened...", a lowercase opening - is
+    not fresh material: the pair would read the stub aloud and the crystal
+    would bind half a word as a name."""
+    text = " ".join(str(line or "").split())
+    if not text:
+        return True
+    if text[:1].islower():
+        return True
+    head = re.split(r"(?<=[.!?])\s", text, 1)[0]
+    words = re.findall(r"[^\W\d_]+", head)
+    if not words or len(words) > 2:
+        return False
+    return not _cmu_knows(words[0])
+
+
 async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
     """Read a passage of the document and pull the sayable lines out of it.
 
@@ -54258,6 +54328,7 @@ async def speakbox_harvest(doc: Path, rid: str = "") -> list[str]:
         return []
     if len(body) > SPEAKBOX_GEM_WINDOW:
         at = random.randrange(0, len(body) - SPEAKBOX_GEM_WINDOW)
+        at = _harvest_window_start(body, at)          # 2026-09-08: never mid-word
         body = body[at:at + SPEAKBOX_GEM_WINDOW]
     # Asked for "the eight best lines" it repairs the passage and hands back
     # one unbroken paragraph, which is nothing this can use. Asking for the
@@ -55903,8 +55974,10 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # rather than the whole draw.
     for doc in order[:6]:               # a doc of pure headings is not fatal
         gems = speakbox_gems(doc, key)
+        # 2026-09-08 (the scan): a stub the old window cut mid-word is not
+        # fresh material (_gem_is_stub); the shelf re-harvests sooner instead.
         fresh = [line for line in gems
-                     if line not in said and looks_english(line)]
+                     if line not in said and looks_english(line) and not _gem_is_stub(line)]
         if not fresh:
             # Nothing left they have not used: read the document again at a
             # different point rather than repeat themselves.
@@ -55912,7 +55985,7 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
             if not gems:                # the model is down; the show is not
                 gems = speakbox_lines(speakbox_body(doc))
             fresh = [line for line in gems
-                     if line not in said and looks_english(line)]
+                     if line not in said and looks_english(line) and not _gem_is_stub(line)]
         if fresh:
             # #1042: among lines that have never aired, the ones resting
             # longest lead. The no-repeat set above answers "has this
@@ -65555,8 +65628,11 @@ def call_tint_report(plain: Any, tinted: Any,
         intro = re.search(r"\b(?:i am|i'm|im|this is|it is|it's|its)\s+([a-z0-9'_-]+)\b", _source_intro)
         if intro and intro.group(1) in (_required_names | _inferred_names):
             _name = re.escape(intro.group(1))
+            # 2026-09-08 (the scan): "Tacoma on the line, courthouse bus
+            # shelter" and "Salem, I am calling from" are introductions too.
             if not re.search(rf"\b(?:i am|i'm|im|this is|it is|it's|its)\s+{_name}\b"
-                             rf"|\b{_name}\s+(?:here|calling|from)\b", _result_intro):
+                             rf"|\b{_name}\b(?:\W+\w+){{0,2}}?\W+(?:here|calling|from|on the line|speaking|checking in)\b",
+                             _result_intro):
                 faults.append(f"tint turn {at + 1} lost the self-introduction")
         if at:
             prior = " ".join(after[at - 1][1].lower().split())
@@ -65578,7 +65654,8 @@ def call_flow_report(script: Any, caller_name: str = "",
                      speakerbox_text: str = "",
                      exclude_entry: Any = None,
                      story: dict[str, Any] | None = None,
-                     plot: dict[str, Any] | None = None) -> dict[str, Any]:
+                     plot: dict[str, Any] | None = None,
+                     soft_quality: bool = False) -> dict[str, Any]:
     """Machine-check conversation, theme, tint fidelity and novelty.
 
     #1039: `story` (the call meta's story dict: id, part, call_ids) makes
@@ -65598,9 +65675,13 @@ def call_flow_report(script: Any, caller_name: str = "",
     first_name = str(caller_name or "").split()[0].lower() if caller_name else ""
     first_clean = re.sub(r"[^a-z0-9' ]+", " ", first_text.lower())
     first_clean = " ".join(first_clean.split())
+    # 2026-09-08 (the scan): "Salem, I am calling from a dimly lit corner",
+    # "Howlin' Wolf here" - the name may sit two words before its "calling
+    # from", and a trailing apostrophe is not a word boundary.
+    _first_name = re.escape(first_name.rstrip("'"))
     introduced = bool(not first_name or re.search(
-        rf"\b(?:i am|i'm|im|this is|it is|it's|its)\s+{re.escape(first_name)}\b"
-        rf"|\b{re.escape(first_name)}\s+(?:here|calling|from)\b",
+        rf"\b(?:i am|i'm|im|this is|it is|it's|its)\s+{_first_name}"
+        rf"|\b{_first_name}\b(?:\W+\w+){{0,2}}?\W+(?:here|calling|from|on the line|speaking|checking in)\b",
         first_clean))
     questions = 0
     answered = 0
@@ -65611,7 +65692,11 @@ def call_flow_report(script: Any, caller_name: str = "",
         nxt, answer = turns[i + 1]
         if marker in ("A", "B", "D") and "?" in said:
             questions += 1
-            if nxt in ("C", "E"):
+            # 2026-09-08 (the scan): in a three-voice call the co-host
+            # speaks between the question and the caller's answer - the
+            # answer within the next two turns counts.
+            if nxt in ("C", "E") or (i + 2 < len(turns) and nxt in ("A", "B", "D")
+                                     and turns[i + 2][0] in ("C", "E")):
                 answered += 1
             if i and turns[i - 1][0] in ("C", "E"):
                 ignore = (_call_topic_terms(topic)
@@ -65681,18 +65766,24 @@ def call_flow_report(script: Any, caller_name: str = "",
                       and len(first_topic) <= 1)
     greeted = False
     if first_caller >= 0 and first_caller + 1 < len(turns):
-        greet_marker, greet_text = turns[first_caller + 1]
-        greeted = bool(
-            greet_marker in ("A", "B", "D")
-            and first_name
-            and re.search(rf"\b{re.escape(first_name)}\b",
-                          greet_text.lower()))
+        # 2026-09-08 (the scan): the greeting is in the FIRST TWO host turns
+        # after the introduction. The live road can put two caller turns
+        # together, and on a three-voice call the co-host says something
+        # before the host greets - both read as "never greeted by name".
+        _hosts = [t for t in turns[first_caller + 1:first_caller + 4]
+                  if t[0] in ("A", "B", "D")][:2]
+        greeted = bool(first_name and any(
+            re.search(rf"\b{_first_name}", text.lower()) for _m, text in _hosts))
     faults: list[str] = []
     if len(turns) < 6:
         faults.append("fewer than six complete turns")
     if len(caller_at) < 3:
         faults.append("the caller has fewer than three turns")
-    if caller_at and not 0.35 <= share <= 0.72:
+    # 2026-09-08 (the scan): with a third voice on the call the caller's
+    # share of ALL turns runs a third at best (7 of 21 = 0.333); the floor
+    # is 0.30 there.
+    _share_floor = 0.30 if any(m in ("B", "D") for m, _t in turns) and any(m == "A" for m, _t in turns) else 0.35
+    if caller_at and not _share_floor <= share <= 0.72:
         faults.append("the caller/host turn share is out of balance")
     if first_caller < 0 or first_caller > 1:
         faults.append("the caller is not heard immediately after the host answers")
@@ -65716,23 +65807,31 @@ def call_flow_report(script: Any, caller_name: str = "",
     if questions < 2 or answered < 2:
         faults.append("fewer than two natural host questions are answered by "
                       "the caller")
+    # 2026-09-08 (the scan): the three RICHNESS legs. On a call that has
+    # already been rapped they are advisory: the tint is allowed to
+    # paraphrase the topic words and the speakbox passage, and re-refusing
+    # the call at activation threw away six fully rapped calls (66 accepted
+    # bars, 23 deep asks) tonight. Every PROTOCOL leg above and every tint
+    # fidelity fault below stays binding.
+    soft: list[str] = []
+    _soft = soft.append if soft_quality else faults.append
     if grounded_questions < 2:
-        faults.append("fewer than two host questions pick up a concrete "
-                      "detail from the caller's prior answer")
+        _soft("fewer than two host questions pick up a concrete "
+              "detail from the caller's prior answer")
     if len(turns) >= 6 and links / max(1, len(turns) - 1) < 0.2:
         faults.append("too few adjacent turns visibly connect")
     if not novelty["ok"]:
         faults.append("the premise or dialogue is too similar to a stored call")
     if not topic_grade["ok"]:
-        faults.append("the database topic is not carried by both caller and hosts")
+        _soft("the database topic is not carried by both caller and hosts")
     if not speakerbox_grade["ok"]:
-        faults.append("the selected Speakerbox source never enters the dialogue")
+        _soft("the selected Speakerbox source never enters the dialogue")
     if not speakerbox_novelty["ok"]:
         faults.append("the selected Speakerbox source is already assigned "
                       "to another call")
     faults.extend(tint_grade.get("faults") or [])
     return {
-        "ok": not faults, "turns": len(turns),
+        "ok": not faults, "turns": len(turns), "soft_faults": soft,
         "caller_turns": len(caller_at), "host_turns": len(host_at),
         "caller_share": round(share, 3), "first_caller": first_caller,
         "answered_line": answered_line, "host_knew_name": host_knew_name,
@@ -65807,7 +65906,13 @@ def call_entry_regrade(entry: dict[str, Any],
         story=(meta.get("story") if isinstance(meta.get("story"), dict)
                else entry.get("story")),                          # #1039
         plot=(meta.get("plot") if isinstance(meta.get("plot"), dict)
-              else entry.get("plot")))                            # #1157
+              else entry.get("plot")),                            # #1157
+        # 2026-09-08 (the scan): this call has been rapped - the richness
+        # legs are advisory here, the protocol and the tint's fidelity are not.
+        soft_quality=bool(str(entry.get("use") or "") == "tinted"))
+    if report.get("soft_faults"):
+        pipeline_log("call", "the rapped call keeps the air with advisories: "
+                     + "; ".join(str(f) for f in report["soft_faults"])[:220])
     turns = banter_turns(active, caller_name, caller2_name)
     report.update(machine_ok=bool(report.get("ok")),
                   machine_faults=list(report.get("faults") or []))
@@ -74160,6 +74265,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
             pass                    # the draft stands; bank it as written
 
     _seed_forced = False                                    # #862
+    _seed_put = ""
     if not _system2_job and not caller_name and seed.get("text"):
         # Mined means SAID (#404): a swath the model paraphrased away is
         # put back as the round's opening line, verbatim.
@@ -74168,8 +74274,11 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # #862: and being put back word for word is what makes it a
             # VERBATIM passage, with the same protection as the ones
             # below. Registered where `_verbatim` is declared.
+            # 2026-09-08 (the scan): bounded when raw, like the other doors
+            # - this door put a thousand-character run-on in as one turn.
             _seed_forced = True
-            script = f"A: {seed['text']}\n" + script
+            _seed_put = _verbatim_turn_text(seed["text"])
+            script = f"A: {_seed_put}\n" + script
     _sb = dj_settings()
 
     async def _fresh_swath() -> dict[str, Any]:
@@ -74202,8 +74311,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # so leaving it off this list meant the ONE passage the rewrite could
     # paraphrase away was the crystal's. It goes in at the head, which is
     # where #404 put it, so _restore() puts it back in the same place.
-    if _seed_forced and str(seed.get("text") or "").strip():
-        _verbatim.append(["head", str(seed["text"]).strip()])
+    if _seed_forced and _seed_put.strip():
+        _verbatim.append(["head", _seed_put.strip()])
     full_swath: dict[str, Any] = {}
     if (not _system2_job and not caller_name and not own_material and random.random() < float(
             _sb.get("speakbox_full_swath_rate") or 0)):
@@ -74218,12 +74327,15 @@ async def dj_banter(track: dict[str, Any] | None = None,
             cap=int(_sb.get("speakbox_full_swath_chars") or 2600),
         )
         if full_swath.get("text"):
-            script = f"A: {full_swath['text']}\n" + script.lstrip()
+            # 2026-09-08 (the scan): a punctuated reading stays whole; a raw
+            # run-on (no sentence in it) is bounded like the other doors.
+            _full_text = _verbatim_turn_text(full_swath["text"])
+            script = f"A: {_full_text}\n" + script.lstrip()
             lines += 1
             speakbox_remember(full_swath)
-            _verbatim.append(["head", str(full_swath["text"])])  # #838
+            _verbatim.append(["head", _full_text])  # #838
             pipeline_log("speakbox", "full uninterrupted swath scheduled "
-                         f"({len(str(full_swath['text']))} chars)")
+                         f"({len(_full_text)} chars)")
     # #609/#612: PRE-PEND a fresh verbatim swath to the FRONT of the round (an
     # extra opening quote, on top of any seed) and APPEND one to the END, each
     # on its own slider so the pair trade the operator's documents verbatim more
@@ -84037,7 +84149,26 @@ def _rap_slant(a, b, end=False):
     return bool(ca and cb and ca[0] == cb[0])
 
 
+_RAP_TAG = re.compile(r",\s*(?:[A-Z][a-z]+|man|huh|yo|folks|dear|though|skip|bro|dude)\s*[.!?;:]*$")
+
+
+def _rap_untag(bars):
+    """2026-09-08 (the scan): a vocative tag after the bar's last comma
+    ("...against decay, man", "...a serious mess, Salem") hid the landing the
+    writer chose - nine of the evening's refused bars rhymed on the word
+    before the tag. The spoken line is never changed, only the reading."""
+    out = []
+    for bar in bars:
+        cut = _RAP_TAG.sub("", bar)
+        out.append(cut if _rap_words(cut) else bar)
+    return out
+
+
 def _rap_bars(text):
+    return _rap_untag(_rap_bars_raw(text))
+
+
+def _rap_bars_raw(text):
     text = str(text or "")
     parts = [p for p in re.split(r"\s*/\s*|\n+|(?<=[.!?;:])\s+", text) if p.strip()]
     if "/" in text or "\n" in text:
@@ -84129,6 +84260,22 @@ def rap_rhyme_evidence(text, answering=""):
         excluded=_RAP_END_EXCL)
     existing_pairs = {frozenset(pair) for pair in end_pairs}
     for match in pronunciation["pairs"]:
+        pair = frozenset(match["words"])
+        if pair not in existing_pairs:
+            end_pairs.append(tuple(match["words"]))
+            existing_pairs.add(pair)
+    # 2026-09-08 (the scan): the NEAR reading. A slant the ear accepts that
+    # neither the spelling reading nor the perfect dictionary reading proved
+    # (proof/move, down/found, lit/shift, stay/ways) was the largest
+    # reader-side refusal class in the evening's queue - 31 of 267 refused
+    # bars - and on 229 plain prose turns it adds five false reads.
+    from crystal_rhyme import terminal_near_rhymes
+    near = terminal_near_rhymes(bars, normalize=_rap_norm, excluded=_RAP_END_EXCL)
+    pronunciation["near"] = near["pairs"]
+    for match in near["pairs"]:
+        _i, _j = match["bars"]
+        if len(_rap_words(bars[_i])) < 4 and len(_rap_words(bars[_j])) < 4:
+            continue        # two fragments of three words or fewer end alike by accident (#1076)
         pair = frozenset(match["words"])
         if pair not in existing_pairs:
             end_pairs.append(tuple(match["words"]))
@@ -84457,6 +84604,20 @@ def rhyme_options_for(word: str, limit: int = 8) -> list[str]:
     if word in memo["words"]:
         return list(memo["words"][word][:limit])
     norm = _rap_norm(word)
+    # 2026-09-08 (the scan): the DICTIONARY decides which suggestions are
+    # rhymes. Measured on the evening's stored hints, 1,205 of 1,884 "for
+    # example" words were not rhymes at all (rhymes with 'heat' - basket,
+    # bed, bread) because the spelling reader merges vowel classes and its
+    # digraph rules are unreachable; a writer that obeyed such a hint aired
+    # a non-rhyme the grader then passed. Perfect pairs lead, near pairs
+    # follow, and the spelling reader is the fallback only for a word the
+    # dictionary does not carry.
+    try:
+        from crystal_rhyme import rhymes_with
+    except Exception:  # noqa: BLE001
+        rhymes_with = None                                        # noqa: N806
+    perfect: list[str] = []
+    near: list[str] = []
     found: list[str] = []
     for cand in sorted(vocab):
         if len(cand) < 3 or cand == word or cand in _RAP_STOP or not cand.isalpha():
@@ -84464,15 +84625,43 @@ def rhyme_options_for(word: str, limit: int = 8) -> list[str]:
         if _rap_norm(cand) == norm or cand.startswith(word) or word.startswith(cand):
             continue
         try:
-            if _rap_slant(word, cand, end=True):
+            grade = rhymes_with(word, cand) if rhymes_with else ""
+            if grade == "perfect":
+                perfect.append(cand)
+            elif grade == "near":
+                near.append(cand)
+            elif not grade and not rhymes_with and _rap_slant(word, cand, end=True):
                 found.append(cand)
         except Exception:  # noqa: BLE001
             continue
-        if len(found) >= 40:
+        if len(perfect) + len(near) >= 40 or len(found) >= 40:
             break
-    # Spread the picks across the alphabet rather than the first eight a-words.
-    step = max(1, len(found) // max(1, limit))
-    picked = found[::step][:limit]
+    if not perfect and not near and not found and rhymes_with is not None:
+        # the dictionary does not carry this landing: the spelling reader stands in
+        for cand in sorted(vocab):
+            if len(cand) < 3 or cand == word or cand in _RAP_STOP or not cand.isalpha():
+                continue
+            if _rap_norm(cand) == norm or cand.startswith(word) or word.startswith(cand):
+                continue
+            try:
+                if _rap_slant(word, cand, end=True):
+                    found.append(cand)
+            except Exception:  # noqa: BLE001
+                continue
+            if len(found) >= 40:
+                break
+    if perfect or near:
+        # Spread each grade's picks across the alphabet, perfect first.
+        def _spread(rows: list[str], want: int) -> list[str]:
+            if not rows or want <= 0:
+                return []
+            step = max(1, len(rows) // max(1, want))
+            return rows[::step][:want]
+        picked = _spread(perfect, limit)
+        picked += _spread([c for c in near if c not in picked], limit - len(picked))
+    else:
+        step = max(1, len(found) // max(1, limit))
+        picked = found[::step][:limit]
     if len(memo["words"]) > 2000:
         memo["words"] = {}
     memo["words"][word] = picked
@@ -84489,8 +84678,21 @@ def tint_repair_hint(plain: str, made: str, faults: list[str], semantic: Any) ->
     faults = [str(f) for f in (faults or [])]
     try:
         if any("rhyme" in f for f in faults):
-            ends = [e for e in (_rap_end(b) for b in _rap_bars(str(made or ""))) if e]
-            if len(ends) >= 2:
+            # 2026-09-08 (the scan): the model's OWN bars, split the way it
+            # wrote them (on " / ", a semicolon or a sentence end), not on
+            # every comma - 26 of 163 stored hints named a comma clause that
+            # was not the end of any bar.
+            _own = [b for b in re.split(r"\s*/\s*|\n+|\s*;\s*|(?<=[.!?])\s+", str(made or "")) if b.strip()]
+            ends = [e for e in (_rap_end(b) for b in (_own or _rap_bars(str(made or "")))) if e]
+            if len(ends) >= 2 and ends[0] == ends[-1]:
+                # the same word twice is not a rhyme, and saying "rhymes with
+                # 'worse'" about 'worse' is not a repair (20 rows in the queue)
+                options = rhyme_options_for(ends[0], 6)
+                bits.append(f"RHYME: both bars land on the same word, '{ends[0]}' - that is a repetition, "
+                            f"not a rhyme. Keep the first bar and land the last one on a different word "
+                            f"that rhymes with '{ends[0]}'"
+                            + (f" - for example {', '.join(options)}" if options else "") + ".")
+            elif len(ends) >= 2:
                 first, last = ends[0], ends[-1]
                 for_first = rhyme_options_for(first, 6)
                 for_last = rhyme_options_for(last, 6)
@@ -84987,7 +85189,10 @@ async def reflection_run(kind: str, force: bool = False) -> dict[str, Any]:
     if _REFLECTION.get("running"):
         return {"ok": False, "why": f"a reflection on {_REFLECTION['running']} is running"}
     now = time.time()
-    gathered = reflection_gather(kind, now - REFLECTION_EVERY)
+    # 2026-09-08 (the scan): off the loop - the gather reads the review
+    # store and the learner's outcome table; on the loop it stalled the
+    # station 23 s once and the host watchdog restarted it.
+    gathered = await asyncio.to_thread(reflection_gather, kind, now - REFLECTION_EVERY)
     if not force and (int(gathered["attempts"]) < REFLECTION_MIN_ATTEMPTS
                       or int(gathered["refusals"]) < REFLECTION_MIN_REFUSALS):
         return {"ok": False, "why": "not enough bars in the hour", "gathered": {
@@ -85956,11 +86161,19 @@ async def _crystal_round_repass(turns: list[tuple[str, str]],
                         if complete:
                             crystal_learning_note(got.learning_ticket(i), str(said), back[i], evaluation, row=row)
                         if evaluation.get("ok"):
+                            _was_cut = bool(row.get("cut") or row.get("review_id") or row.get("rejected_candidate"))
                             row["text"] = back[i]
                             row.pop("rejected_candidate", None)
                             row.pop("cut", None)
                             landed += 1
                             tint_seen("tinted")
+                            if _was_cut:
+                                # 2026-09-08 (the scan): the bar landed in the
+                                # batch - an earlier cut of this line is moot.
+                                try:
+                                    line_review_supersede("tint", str(said))
+                                except Exception:  # noqa: BLE001
+                                    pass
                         else:
                             row["text"] = ""
                             row["rejected_candidate"] = back[i]
@@ -86148,6 +86361,56 @@ def _tint_formula_turn(kind: str, said: str) -> bool:
         return False
 
 
+def _cmu_knows(word: str) -> bool:
+    """Is the word in the pronouncing dictionary? True on any failure, so a
+    missing dictionary never turns ordinary words into stubs."""
+    try:
+        from crystal_rhyme import _pronunciations
+        return bool(_pronunciations(str(word or "").lower()))
+    except Exception:  # noqa: BLE001
+        return True
+
+
+_PLAIN_PASSAGE_CHARS = 300
+
+
+def _tint_plain_passage(said: Any, verbatim: Any) -> bool:
+    """2026-09-08 (the scan): a verbatim passage - the operator's own document
+    stapled into the round as a turn (#838) - is read PLAIN when no set of
+    bars can carry it: 300 characters or more (a 5,300-character reading
+    holds three hundred anchors and nineteen numbers), a raw transcript
+    run-on (forty words with under two sentence ends per hundred), or a
+    stub the harvest window cut mid-word or mid-sentence ("Sgard. And i am
+    burdened...", "Mfortable. Must feel good.", a lowercase opening). A short
+    punctuated passage is still tinted - the pinned 49-character speakerbox
+    line gets its bars. Measured on the evening's queue: 29 of 199 cut lines
+    were these, every one still refused by today's grader after three deep
+    asks; read plain they cost nothing and the listener hears the document."""
+    flat = " ".join(str(said or "").split())
+    if not flat:
+        return False
+    passages: list[str] = []
+    for row in (verbatim or []):
+        one = row[1] if isinstance(row, (list, tuple)) and len(row) > 1 else row
+        one = " ".join(str(one or "").split())
+        if len(one) >= 12:
+            passages.append(one)
+    if not any(flat == p or flat.rstrip(".") == p.rstrip(".") for p in passages):
+        return False
+    if len(flat) >= _PLAIN_PASSAGE_CHARS:
+        return True
+    words = flat.split()
+    ends = len(re.findall(r"[.!?]", flat))
+    if len(words) >= 40 and ends / len(words) * 100 < 2.0:
+        return True                                   # a raw transcript run-on
+    if flat[:1].islower():
+        return True                                   # the window opened mid-sentence
+    first = re.match(r"[\"'(]*([^\W\d_]+)", flat)
+    head = re.split(r"(?<=[.!?])\s", flat, 1)[0]
+    return bool(first and len(re.findall(r"[^\W\d_]+", head)) <= 2
+                and not _cmu_knows(first.group(1)))    # "Sgard." / "Mfortable."
+
+
 @_LAB_RUNTIME.scoped("crystal_tint")
 async def crystal_tint(script: str, kind: str = "",
                        verbatim: Any = None,
@@ -86286,10 +86549,14 @@ async def crystal_tint(script: str, kind: str = "",
         # nine of the fourteen newest): a string of digits cannot be
         # rhymed while every number is kept, and the same five words were
         # being asked of the deep model three times a call.
+        # 2026-09-08 (the scan): and a verbatim passage no bar-set can
+        # carry - 300+ characters, a raw run-on, a mid-word stub - is read
+        # plain too (_tint_plain_passage); short passages keep their bars.
         eligible_ix = [i for i, (_m, s) in enumerate(coverage_units)
                        if len(str(s or "").strip()) >= TINT_TURN_FLOOR
                        and bool(re.search(r"[^\W_]", str(s or "")))
-                       and not _tint_formula_turn(kind, str(s or ""))]
+                       and not _tint_formula_turn(kind, str(s or ""))
+                       and not _tint_plain_passage(str(s or ""), verbatim)]
         required = ((len(eligible_ix) * coverage_target + 99) // 100
                     if eligible_ix and coverage_target else 0)
         # Coverage is exact and deterministic for a given script. Strength
@@ -86345,11 +86612,21 @@ async def crystal_tint(script: str, kind: str = "",
                     _ans = ""
                     for _r, (_m, _s) in zip(_resume_turns, turns):
                         _c = str(_r.get("text") or _r.get("rejected_candidate") or "")
-                        if _c and tint_evaluate(str(_s or ""), _c, chunks, _ans,
-                                                crystal_force(), kind).get("ok"):
+                        # 2026-09-08 (the scan): a neighbour that already
+                        # holds an accepted bar (prior_ok, from the captured
+                        # progress of a recovery) is not graded again.
+                        if _c and ((_r.get("prior_ok") and not _r.get("review_id"))
+                                   or tint_evaluate(str(_s or ""), _c, chunks, _ans,
+                                                    crystal_force(), kind).get("ok")):
                             _still += 1
                             _r["text"] = _c
-                            _r.pop("cut", None)
+                            _was_cut = bool(_r.pop("cut", None) or _r.get("review_id")
+                                            or _r.get("rejected_candidate"))
+                            if _was_cut:
+                                try:
+                                    line_review_supersede("tint", str(_s or ""))   # 2026-09-08: the bar stands
+                                except Exception:  # noqa: BLE001
+                                    pass
                         _ans = _c or str(_s or "")
                     if len(_resume_turns) != len(turns):
                         _resume_turns = []  # Shape changed; old turn positions cannot be reused.
@@ -86437,6 +86714,7 @@ async def crystal_tint(script: str, kind: str = "",
             _changed = 0
             _accepted = 0
             _cut = 0                                                # #1064
+            _cut_caller = 0                                         # 2026-09-08
             for _turn_at, (marker, said) in enumerate(turns):
                 _said = str(said or "")
                 _said_hash = hashlib.sha1(
@@ -86449,10 +86727,24 @@ async def crystal_tint(script: str, kind: str = "",
                 if (_prior and str(_prior.get("marker") or "") == marker
                         and str(_prior.get("source") or "") == _said_hash):
                     fresh = str(_prior.get("text") or _prior.get("rejected_candidate") or "")
-                    _prior_eval = tint_evaluate(
-                        _said, fresh, chunks, answering,
-                        crystal_force(), kind) if _selected else {"ok": True}
+                    # 2026-09-08 (the scan): a neighbour that already holds an
+                    # accepted bar (prior_ok, set by build_recovery from the
+                    # captured progress) is read as tinted; only the approved
+                    # turn and the empty turns are asked again. Two recoveries
+                    # in flight had made twelve new cuts on their neighbours.
+                    if _selected and fresh and _prior.get("prior_ok") and not _prior.get("review_id"):
+                        _prior_eval = dict(_prior.get("evaluation") or {})
+                        _prior_eval.update({"ok": True, "prior_ok": True})
+                    else:
+                        _prior_eval = tint_evaluate(
+                            _said, fresh, chunks, answering,
+                            crystal_force(), kind) if _selected else {"ok": True}
                     if fresh and (not _selected or _prior_eval.get("ok")):
+                        if _prior.get("cut") or _prior.get("review_id") or _prior.get("rejected_candidate"):
+                            try:
+                                line_review_supersede("tint", _said)      # 2026-09-08: the bar landed
+                            except Exception:  # noqa: BLE001
+                                pass
                         done.append(f"{marker}: {fresh}")
                         answering = fresh
                         _saved = dict(_prior)
@@ -86613,6 +86905,8 @@ async def crystal_tint(script: str, kind: str = "",
                                 and re.search(r"[^\W_]", str(fresh))),
                             disposition="cut")
                         _cut += 1
+                        if marker in ("C", "E"):
+                            _cut_caller += 1        # 2026-09-08: a caller answer, not a host line
                         _evaluations[-1]["cut"] = True
                         pipeline_log("crystal", f"(#1064) turn {_turn_at + 1} "
                                      "is cut before the studio - the bar was "
@@ -86676,10 +86970,17 @@ async def crystal_tint(script: str, kind: str = "",
                 # #1064: under the hold a refused line is cut, so the round
                 # is whole when every line that REMAINS is a bar and at
                 # least half of the required lines made it.
-                "met": bool(_attempted >= required and (kind != "caller" or not _cut)
+                # 2026-09-08 (the scan): a call may not lose a CALLER's
+                # answer - that orphans the host's question (#1146) - but a
+                # cut HOST line is a line the pair simply do not say. Two
+                # calls of nine accepted bars each sat dead on the shelf for
+                # a cut host turn; the caller's own turns are untouchable.
+                "met": bool(_attempted >= required
+                            and (kind != "caller" or not _cut_caller)
                             and (_accepted >= required
                                  or (_cut and _accepted + _cut >= required
                                      and _accepted >= max(1, (required + 1) // 2)))),
+                "cut_caller": _cut_caller,
             })
             out["evaluation"] = {
                 "ok": bool(out["coverage"]["met"]
@@ -94439,7 +94740,26 @@ async def api_line_review_policy_update(
     return policy
 
 
-def line_review_regrade_pending(limit: int = 400) -> dict[str, Any]:
+def _entry_has_bar_for(entry: dict[str, Any], source: str) -> bool:
+    """Does the stored round carry an accepted bar for this very line? The
+    plain and tinted scripts align turn by turn when nothing was cut."""
+    try:
+        plain = str(entry.get("script_plain") or "")
+        tinted = str(entry.get("script_tinted") or "")
+        if not plain or not tinted:
+            return False
+        p = [s for _m, s in banter_turns(plain)]
+        t = [s for _m, s in banter_turns(tinted)]
+        if not p or len(p) != len(t):
+            return False
+        norm = lambda x: " ".join(str(x or "").split()).lower()   # noqa: E731
+        want = norm(source)
+        return any(norm(a) == want and norm(b) != want for a, b in zip(p, t))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def line_review_regrade_pending(limit: int = 400, gone_after: float = 1800.0) -> dict[str, Any]:
     """2026-09-08 (evening): the operator's queue re-read against TODAY's
     grader and roads. 180 of 188 pending tint cuts had been graded before
     the afternoon's changes (the dictionary depth, the formula lines, the
@@ -94449,8 +94769,11 @@ def line_review_regrade_pending(limit: int = 400) -> dict[str, Any]:
     the operator needs to make: it leaves the queue as a note that says so.
     A phone-road formula line the crystal reads plain leaves as read_plain.
     Anything today's grader still refuses stays. Deterministic, no model."""
-    out = {"seen": 0, "passes_now": 0, "read_plain": 0, "kept": 0, "errors": 0}
+    out = {"seen": 0, "passes_now": 0, "read_plain": 0, "round_gone": 0, "superseded": 0,
+           "kept": 0, "errors": 0}
     store = _LINE_REVIEW
+    now = time.time()
+    rows: list[dict[str, Any]] = []
     seen: set[str] = set()
     for gate in ("tint", "recording_tint"):
         before = 0
@@ -94466,40 +94789,16 @@ def line_review_regrade_pending(limit: int = 400) -> dict[str, Any]:
                 break
             for item in items:
                 rid = str(item.get("id") or "")
-                if not rid or rid in seen or out["seen"] >= limit:
+                if not rid or rid in seen or len(rows) >= limit:
                     continue
                 seen.add(rid)
-                out["seen"] += 1
                 try:
                     row = store.get(rid, limit=1) or {}
-                    ctx = row.get("context") or {}
-                    kind = str(ctx.get("kind") or "")
-                    source = str(row.get("source") or "")
-                    candidate = str(row.get("candidate") or "")
-                    if _tint_formula_turn(kind, source):
-                        if store.note_stale(rid, "read_plain",
-                                            "a phone-road formula line; the crystal reads it plain since 2026-09-08"):
-                            out["read_plain"] += 1
-                        continue
-                    if not candidate.strip():
-                        out["kept"] += 1
-                        continue
-                    evaluation = row.get("evaluation") or {}
-                    force = evaluation.get("strength")
-                    report = tint_evaluate(source, candidate, ctx.get("chunks") or [],
-                                           answering=str(ctx.get("answering") or ""),
-                                           force=float(force) if force is not None else None,
-                                           kind=kind)
-                    if report.get("ok"):
-                        note = "the stored wording passes today's grader"
-                        if report.get("advisory"):
-                            note += " (" + "; ".join(str(a) for a in report["advisory"])[:120] + ")"
-                        if store.note_stale(rid, "stale_grader", note):
-                            out["passes_now"] += 1
-                    else:
-                        out["kept"] += 1
                 except Exception:  # noqa: BLE001
                     out["errors"] += 1
+                    continue
+                if row:
+                    rows.append(row)
             if not (page or {}).get("has_more"):
                 break
             try:
@@ -94508,26 +94807,113 @@ def line_review_regrade_pending(limit: int = 400) -> dict[str, Any]:
                 break
             if not before:
                 break
+    out["seen"] = len(rows)
+    # 2026-09-08 (the scan): one pending row per line - the newest cut of a
+    # line is the one to decide on (22 of 199 rows were older duplicates).
+    newest: dict[str, tuple[float, str]] = {}
+    for row in rows:
+        key = " ".join(str(row.get("source") or "").split()).lower()
+        stamp = float(row.get("last_at") or 0)
+        if key and (key not in newest or stamp > newest[key][0]):
+            newest[key] = (stamp, str(row.get("id")))
+    for row in rows:
+        rid = str(row.get("id") or "")
+        time.sleep(0.003)          # a thread: hand the interpreter back to the loop between rows
+        try:
+            ctx = row.get("context") or {}
+            kind = str(ctx.get("kind") or "")
+            source = str(row.get("source") or "")
+            candidate = str(row.get("candidate") or "")
+            key = " ".join(source.split()).lower()
+            if key and newest.get(key, (0.0, rid))[1] != rid:
+                if store.note_stale(rid, "superseded", "a newer cut of this line replaces it"):
+                    out["superseded"] += 1
+                continue
+            _verb = (ctx.get("entry") or {}).get("verbatim") if isinstance(ctx.get("entry"), dict) else None
+            if _tint_formula_turn(kind, source):
+                if store.note_stale(rid, "read_plain",
+                                    "a phone-road formula line; the crystal reads it plain since 2026-09-08"):
+                    out["read_plain"] += 1
+                continue
+            if _tint_plain_passage(source, _verb):
+                if store.note_stale(rid, "read_plain",
+                                    "a verbatim passage no bar-set can carry; the crystal reads it plain since 2026-09-08"):
+                    out["read_plain"] += 1
+                continue
+            # 2026-09-08 (the scan): the round this line belonged to is gone
+            # (114 of 199 rows - aired, expired or replaced; an allow would
+            # rebuild the whole round from the capture), or it already carries
+            # an accepted bar for this very line (19 rows).
+            try:
+                match = line_review_matching(row)
+            except Exception:  # noqa: BLE001
+                match = None
+            if not match:
+                if now - float(row.get("first_at") or now) >= float(gone_after):
+                    if store.note_stale(rid, "round_gone",
+                                        "the round this line belonged to has aired, expired or been replaced; "
+                                        "allowing it now would rebuild the whole round from the capture"):
+                        out["round_gone"] += 1
+                    continue
+            else:
+                _entry = match[2] if isinstance(match, tuple) and len(match) > 2 else None
+                if isinstance(_entry, dict) and _entry_has_bar_for(_entry, source):
+                    if store.note_stale(rid, "superseded", "the round now carries an accepted bar for this line"):
+                        out["superseded"] += 1
+                    continue
+            if not candidate.strip():
+                out["kept"] += 1
+                continue
+            evaluation = row.get("evaluation") or {}
+            force = evaluation.get("strength")
+            report = tint_evaluate(source, candidate, ctx.get("chunks") or [],
+                                   answering=str(ctx.get("answering") or ""),
+                                   force=float(force) if force is not None else None,
+                                   kind=kind)
+            if report.get("ok"):
+                note = "the stored wording passes today's grader"
+                if report.get("advisory"):
+                    note += " (" + "; ".join(str(a) for a in report["advisory"])[:120] + ")"
+                if store.note_stale(rid, "stale_grader", note):
+                    out["passes_now"] += 1
+            else:
+                out["kept"] += 1
+        except Exception:  # noqa: BLE001
+            out["errors"] += 1
     return out
 
 
 def _regrade_say(got: dict[str, Any]) -> None:
     try:
-        if got.get("passes_now") or got.get("read_plain"):
-            pipeline_log("crystal", "the review queue was re-read against today's grader: "
-                         f"{got.get('passes_now', 0)} cut line(s) pass now and "
-                         f"{got.get('read_plain', 0)} read plain; {got.get('kept', 0)} stay for the "
+        moved = sum(int(got.get(k) or 0) for k in ("passes_now", "read_plain", "round_gone", "superseded"))
+        if moved:
+            pipeline_log("crystal", "the review queue was re-read against today's grader and stores: "
+                         f"{got.get('passes_now', 0)} cut line(s) pass now, {got.get('read_plain', 0)} read plain, "
+                         f"{got.get('round_gone', 0)} belong to rounds that are gone, "
+                         f"{got.get('superseded', 0)} superseded; {got.get('kept', 0)} stay for the "
                          f"operator (of {got.get('seen', 0)})")
     except Exception:  # noqa: BLE001
         pass
 
 
+REGRADE_EVERY = float(os.getenv("REGRADE_EVERY", "600"))
+
+
 async def regrade_once() -> None:
-    """Ninety seconds after boot, in a thread: the queue against today's grader."""
+    """Ninety seconds after boot and every ten minutes after, in a thread:
+    the queue against today's grader and the stores (deterministic, no
+    model) - the one clearing road that reaches old rows."""
     try:
         await asyncio.sleep(90)
-        got = await asyncio.to_thread(line_review_regrade_pending)
-        _regrade_say(got)
+        while True:
+            try:
+                got = await asyncio.to_thread(line_review_regrade_pending)
+                _regrade_say(got)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(max(60.0, REGRADE_EVERY))
     except asyncio.CancelledError:
         raise
     except Exception:  # noqa: BLE001
