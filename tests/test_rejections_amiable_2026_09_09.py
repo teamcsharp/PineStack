@@ -163,6 +163,44 @@ class TheBroadFrameStoppedShadowingTheCarefulOne(unittest.TestCase):
             self.assertEqual(crystal_contract.extract_contract(source)["numbers"], [], source)
 
 
+class AHeldLineTellsTheTruthAboutWhy(unittest.TestCase):
+    """The re-grade sweep computed today's verdict for every pending row,
+    released the ones that now pass, and threw the report away for the rest -
+    so the queue explained cuts against a contract that had since moved."""
+
+    def setUp(self):
+        import tempfile
+        from line_review import LineReviewStore
+        self.dir = tempfile.mkdtemp()
+        self.store = LineReviewStore(self.dir + "/r.sqlite3")
+        self.row = self.store.record(
+            "tint", "It should have been called The Furnace of Creation.",
+            "something coming near; creation domination clear",
+            ["the bar lost the name Furnace"],
+            context={"kind": "banter", "turn": 1, "marker": "HOST"},
+            evaluation={"ok": False, "semantic": {"missing_names": [{"text": "Furnace"}]}},
+            disposition="cut")
+
+    def test_a_kept_row_gets_todays_reasons(self):
+        self.assertTrue(self.store.refresh_verdict(
+            self.row["id"], ["the anchor floor was not met"],
+            {"ok": False, "semantic": {"anchor_recall": 0.1, "missing_names": []}}))
+        got = self.store.get(self.row["id"])
+        self.assertEqual(got["reasons"], ["the anchor floor was not met"])
+        self.assertEqual(got["evaluation"]["semantic"]["missing_names"], [])
+        self.assertEqual(got["review_status"], "pending", "it keeps its place in the queue")
+
+    def test_an_unchanged_verdict_is_not_rewritten(self):
+        """No churn: the sweep runs every ten minutes over the whole queue."""
+        self.assertFalse(self.store.refresh_verdict(
+            self.row["id"], ["the bar lost the name Furnace"],
+            {"ok": False, "semantic": {"missing_names": [{"text": "Furnace"}]}}))
+
+    def test_a_decided_row_is_never_touched(self):
+        self.store.note_stale(self.row["id"], "stale_grader", "passes now")
+        self.assertFalse(self.store.refresh_verdict(self.row["id"], ["anything"], {"ok": False}))
+
+
 class TheRhymeBarDoesNotMove(unittest.TestCase):
     """The measurement that decided to leave it alone: over the 30 pending
     rows that named a pair, the near reading rescues none."""

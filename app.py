@@ -95216,7 +95216,7 @@ def line_review_regrade_pending(limit: int = 400, gone_after: float = 1800.0) ->
     A phone-road formula line the crystal reads plain leaves as read_plain.
     Anything today's grader still refuses stays. Deterministic, no model."""
     out = {"seen": 0, "passes_now": 0, "read_plain": 0, "round_gone": 0, "superseded": 0,
-           "kept": 0, "errors": 0}
+           "kept": 0, "refreshed": 0, "errors": 0}
     store = _LINE_REVIEW
     now = time.time()
     rows: list[dict[str, Any]] = []
@@ -95323,6 +95323,17 @@ def line_review_regrade_pending(limit: int = 400, gone_after: float = 1800.0) ->
                 if store.note_stale(rid, "stale_grader", note):
                     out["passes_now"] += 1
             else:
+                # 2026-09-09: it stays - and the verdict the operator will
+                # READ is replaced with the one just computed. Today's report
+                # used to be discarded here, so the queue explained cuts
+                # against a contract that had since moved: 9 of 13 rows whose
+                # stored reason named a lost title word were by then held by
+                # the anchor floor instead.
+                try:
+                    if store.refresh_verdict(rid, report.get("faults"), report):
+                        out["refreshed"] += 1
+                except Exception:  # noqa: BLE001
+                    pass
                 out["kept"] += 1
         except Exception:  # noqa: BLE001
             out["errors"] += 1

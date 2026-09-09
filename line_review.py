@@ -250,6 +250,38 @@ class LineReviewStore:
                        (_json(effect), row['id']))
             return True
 
+    def refresh_verdict(self, review_id, reasons=None, evaluation=None):
+        """2026-09-09: a pending row re-read and STILL refused keeps its place
+        in the queue, and its stored verdict is brought up to date.
+
+        The queue is what the operator reads before deciding, so a reason in
+        it has to be today's reason. Measured when this was added: of 13 rows
+        whose stored verdict named a lost title word, 9 were no longer
+        refused for a name at all. Returns whether a pending row changed."""
+        with self._lock, self._write() as db:
+            row = db.execute("SELECT id,reasons,evaluation FROM line_reviews "
+                             "WHERE id=? AND review_status='pending'",
+                             (str(review_id),)).fetchone()
+            if row is None:
+                return False
+            sets, args = [], []
+            if reasons is not None:
+                fresh = _json([str(one) for one in reasons])
+                if fresh != row['reasons']:
+                    sets.append('reasons=?')
+                    args.append(fresh)
+            if evaluation is not None:
+                fresh = _json(evaluation)
+                if fresh != row['evaluation']:
+                    sets.append('evaluation=?')
+                    args.append(fresh)
+            if not sets:
+                return False                  # nothing moved; no write, no churn
+            args.append(row['id'])
+            db.execute('UPDATE line_reviews SET %s,revision=revision+1 WHERE id=?'
+                       % ','.join(sets), args)
+            return True
+
     def latest_seq(self):
         """The newest occurrence's sequence - one cheap max() on the events
         key - so a caller can tell whether anything was journaled since it
