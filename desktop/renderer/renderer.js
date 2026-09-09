@@ -891,7 +891,13 @@ function createDesktopRejectionNotices({request, openReview, storage = localStor
       // #1088: only a line that actually left the work reaches this card;
       // rewrites the station re-asked and repaired are the orchestrator's
       // notes (status "noted") and never wake the operator.
-      title.textContent = fresh === 1 ? 'A cut line waits for your decision' : fresh + ' cut lines wait for your decision';
+      // 2026-09-09: `fresh` counts rejection EVENTS seen since this window
+      // opened and is only ever reset by dismiss(), so it climbed past six
+      // hundred while the badge beside it read the real queue of 165. A line
+      // the station later repaired, superseded or re-graded leaves the queue
+      // and was still being counted here. The headline is the queue.
+      const waiting = count || fresh;
+      title.textContent = waiting === 1 ? 'A cut line waits for your decision' : waiting + ' cut lines wait for your decision';
       text.textContent = 'Each one was refused after its asks and cut before the studio. Allow it, keep the cut, or discuss the failed checks with the orchestrator.';
       text.classList.remove('error'); card.hidden = false;
     }

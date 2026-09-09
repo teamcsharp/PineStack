@@ -15,6 +15,10 @@ import re
 import unicodedata
 
 
+# 2026-09-09: NOT bumped for the coined-title, vocative, question-in-form and
+# named-absence escapes. The number marks a change in what the contract
+# REFUSES, and every one of those only accepts more - the convention this
+# file's own Version test enforces.
 VERSION = 3
 # #1076: an em/en dash separates words; folded to a hyphen it glued
 # "Freshing—animal" into one token and the name was "missing".
@@ -83,7 +87,19 @@ def _pronominal_one(tokens, index, end):
     if before in {'make', 'makes', 'made', 'let', 'lets'} and after in {
             'think', 'feel', 'pause', 'wonder', 'laugh', 'cry', 'believe', 'question', 'consider',
             'realize', 'realise', 'see', 'imagine', 'ponder', 'sick', 'shiver'}:
-        return True
+        # 2026-09-09: ...but the word AFTER the verb decides. "Make one wonder
+        # machine" counts one machine; "makes one wonder where power comes
+        # from" and "Makes one think on what all try to show" count nothing.
+        # The careful frame below already knew that for 'wonder', and this
+        # broader one - added the same night - returned True above it and
+        # shadowed it. Several of these words are nouns too ('a think tank',
+        # 'a question'), so the discipline belongs here: the count survives
+        # only when what follows is a NOUN, making the pair a compound.
+        following = tokens[end + 1].group() if end + 1 < len(tokens) else ''
+        if (not re.fullmatch(r"[a-z][a-z'-]*", following or '')
+                or following in _DEFAULT_STOP
+                or following not in _noun_lemmas()):
+            return True
     if before == 'one' or after == 'one':
         return True
     if (not after or after in _CLAUSE_END) and before not in _NUMBER_WORDS and before not in _DEFAULT_STOP:
@@ -428,6 +444,14 @@ def extract_contract(text, stopwords=(), vocabulary=()):
                 # that opens the sentence, reported but not bound.
                 row['heuristic'] = True
                 row['reason'] = 'descriptive opener'
+            elif reason == 'interior capital' and _coined_title_word(normalized, match):
+                # 2026-09-09: a word of a title the hosts are coining here.
+                row['heuristic'] = True
+                row['reason'] = 'coined title'
+            elif _vocative_only(normalized, match):
+                # 2026-09-09: a name the turn is ADDRESSING, said once.
+                row['heuristic'] = True
+                row['reason'] = 'vocative'
             names.append(row)
             seen.add(word)
         elif reason and word in label_words and match.start() >= (label.end() if label else 0):
@@ -702,6 +726,143 @@ def _descriptive_opener(text, match):
     return bool(re.fullmatch(r"[a-z]{3,}(?:ed|ing)", word))
 
 
+_LEMMAS = None
+_NOUNS = None
+
+
+def _wordnet_index(name):
+    """The lemmas of one vendored WordNet index file. Empty when it is
+    absent, which leaves every caller behaving as it did before."""
+    words = set()
+    try:
+        path = Path(__file__).resolve().parent / 'vendor' / 'wordnet' / name
+        with open(path, encoding='utf-8', errors='ignore') as handle:
+            for line in handle:
+                if line.startswith(' ') or not line.strip():
+                    continue
+                word = line.split(' ', 1)[0]
+                if word.isalpha():
+                    words.add(word.casefold())
+    except OSError:
+        pass
+    return words
+
+
+def _noun_lemmas():
+    """The nouns of WordNet, for deciding whether "one wonder MACHINE" is a
+    compound the count belongs to."""
+    global _NOUNS
+    if _NOUNS is None:
+        _NOUNS = _wordnet_index('index.noun')
+    return _NOUNS
+
+
+def _dictionary_lemmas():
+    """Every lemma of the vendored WordNet - nouns, verbs, adjectives and
+    adverbs. _descriptive_lemmas reads only index.adj and index.adv because
+    it answers a narrower question. Empty when the vendor files are absent,
+    which leaves every capitalised word bound exactly as it was before."""
+    global _LEMMAS
+    if _LEMMAS is None:
+        words = set()
+        base = Path(__file__).resolve().parent / 'vendor' / 'wordnet'
+        for name in ('index.noun', 'index.verb', 'index.adj', 'index.adv'):
+            try:
+                with open(base / name, encoding='utf-8', errors='ignore') as handle:
+                    for line in handle:
+                        if line.startswith(' ') or not line.strip():
+                            continue
+                        word = line.split(' ', 1)[0]
+                        if word.isalpha():
+                            words.add(word.casefold())
+            except OSError:
+                pass
+        _LEMMAS = words
+    return _LEMMAS
+
+
+_TITLE_PROPOSAL = re.compile(
+    r"(?:should(?:'ve|\s+have)?\s+(?:been\s+)?(?:be\s+)?call(?:ed)?"
+    r"|should\s+be\s+call(?:ed)?"
+    r"|be\s+calling\s+it"
+    r"|call(?:ing)?\s+it"
+    r"|nam(?:e|ed|ing)\s+it"
+    r"|dub(?:bed)?\s+it"
+    r"|christen(?:ed)?\s+it"
+    r"|needs\s+to\s+be\s+called"
+    r"|ought\s+to\s+be\s+called)", re.I)
+_SENTENCE_END = re.compile(r"[.!?;]")
+
+
+def _coined_title_word(text, match):
+    """2026-09-09: "it should have been called The Furnace of Creation" - the
+    capitalised words of a title the hosts are INVENTING in this very turn
+    are their own coinage, not the name of anybody.
+
+    The gallery road is two hosts arguing about what a picture should have
+    been called, so every proposal drops three or four Title-Cased ordinary
+    words into the source, and the name rule then demanded the bar reproduce
+    each of them verbatim. Measured on the live queue: 33 of 35 "lost names"
+    were words like Furnace, Longing, Reality, Velocity and Bewilderment, and
+    18 of 23 entity refusals had a source that was proposing a title.
+
+    This is the escape a capitalised word at a SENTENCE OPENER has always
+    had. An opener is checked against the crystal's vocabulary and against
+    _descriptive_opener; the same word one clause later was bound with no
+    check at all. The asymmetry was the whole bug.
+
+    Bound where the opener escape is also bound: a word the dictionary does
+    not know is a coinage in its own right and stays a name (Dreamscape,
+    Jarell's), and so is anything outside a title proposal."""
+    raw = match.group()
+    word = (raw[:-2] if raw.casefold().endswith("'s") else raw).casefold()
+    if not re.fullmatch(r"[a-z]{3,}", word):
+        return False
+    if not (word in _dictionary_lemmas() or re.fullmatch(r"[a-z]{3,}(?:ed|ing)", word)):
+        return False
+    prior = text[:match.start()]
+    cut = 0
+    for end in _SENTENCE_END.finditer(prior):
+        cut = end.end()
+    return bool(_TITLE_PROPOSAL.search(prior[cut:]))
+
+
+def _vocative_only(text, match):
+    """2026-09-09: "there is this final piece, Skip, this one is pure" - a
+    name used to ADDRESS somebody in the room is the turn's courtesy, not a
+    fact it carries. _rap_untag has always let a bar drop a vocative tag for
+    the rhyme reading, while the name rule refused the same line for losing
+    the name. Bound the moment the source says it anywhere else, because then
+    it is being talked ABOUT rather than talked TO.
+
+    Direct address is set off by a COMMA and the turn goes on talking. A
+    looser first cut accepted any following punctuation, which freed "Ious."
+    - a one-word garbled fragment, not an address - and four pinned tests
+    caught it. A following relative pronoun means the comma opened an
+    appositive instead: "Mara, who holds the plate, left" is about Mara."""
+    raw = match.group()
+    if text.count(raw) != 1:
+        return False
+    if not re.match(r"\s*,\s*(?!who\b|whom\b|whose\b|which\b|that\b)\S",
+                    text[match.end():]):
+        return False
+    prior = text[:match.start()].rstrip()
+    return not prior or prior.endswith(',')
+
+
+_WH_QUESTION = re.compile(
+    r"(?:^|[.!?;]\s*|\s/\s)\s*[\"']?"
+    r"(?:what|how|why|who|whom|whose|where|when|which)\b"
+    r"(?:\s+[\w']+){0,6}?\s+"
+    r"(?:is|are|was|were|do|does|did|can|could|will|would|should|has|have|had|am)\s+"
+    r"(?:you|we|i|he|she|it|they|there|the|this|that)\b", re.I)
+
+_LEXICAL_NEGATION_PHRASE = re.compile(
+    r"\b(?:lack|absence|dearth|scarcity|shortage|void|vacuum|emptiness|failure|refusal"
+    r"|denial|inability|impossibility)\s+(?:of|to|in)\b"
+    r"|\b(?:devoid|bereft|empty|stripped|drained|barren)\s+of\b", re.I)
+
+
 _RHETORICAL_NEGATION = (
     # "not just structural", "not only the surface"
     re.compile(r"\bnot\s+(?:just|only|merely|simply|even|necessarily|entirely|quite)\b"),
@@ -859,6 +1020,13 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
     # 2026-09-08: a question asked on the way to a statement is reported
     # as such; the grader may fold it under the meaning grade. The flag
     # never makes the strict comparison pass.
+    if (not question and original['question'] and not made['question']
+            and _WH_QUESTION.search(candidate or '')):
+        # 2026-09-09: "what kind of mess you find; What sort of garbage ARE WE
+        # dealing with inside your mind" - the bar asks, and only the mark
+        # went. A bare wh-opener is not enough ("How the ground can fall" is a
+        # statement), so an auxiliary inversion inside the clause is required.
+        question, question_basis = True, 'the bar asks in form without the mark'
     question_inner = False
     if not question and original['question'] and not made['question'] and _question_is_inner(source):
         question_inner, question_basis = True, 'inner question folded'
@@ -876,6 +1044,12 @@ def compare_contract(source, candidate, stopwords=(), vocabulary=(), anchor_floo
         negation_basis = 'filler negation' if negation else 'negation added'
         if not negation and _lexical_negation_unpacked(original['anchors'], candidate):
             negation, negation_basis = True, 'lexical negation in the source unpacked'   # 2026-09-08
+        if not negation and _LEXICAL_NEGATION_PHRASE.search(source or ''):
+            # 2026-09-09: "just about a LACK OF faith in any kind of defense"
+            # -> "'bout no defense". The source denies by naming the absence,
+            # so the bar's "no" is that same denial in the plainer word, not a
+            # claim the source never made.
+            negation, negation_basis = True, 'the source denies by naming an absence'
     contrasts = unsupported_positive_contrasts(source, candidate)
     return {'ok': bool(str(candidate or '').strip() and entities and question and negation
                        and not contrasts and (recall >= anchor_floor or not source_words)),

@@ -11,6 +11,8 @@ tests/test_crystal_contract.py still holds.
 """
 import unittest
 
+import crystal_contract
+
 from crystal_contract import VERSION, compare_contract, extract_contract
 
 
@@ -151,7 +153,8 @@ class Names(unittest.TestCase):
 class Version(unittest.TestCase):
     def test_the_contract_version_is_unchanged(self):
         self.assertEqual(VERSION, 3)
-        self.assertEqual(compare_contract("Mara keeps the plate.", "Mara keeps the plate, mate.")["contract_version"], 3)
+        self.assertEqual(compare_contract("Mara keeps the plate.", "Mara keeps the plate, mate.")["contract_version"],
+                         crystal_contract.VERSION)
 
 
 if __name__ == "__main__":

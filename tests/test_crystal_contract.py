@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import unittest
 
+import crystal_contract
 from crystal_contract import compare_contract, content_words, contract_prompt, extract_contract
 
 
@@ -217,7 +218,9 @@ class CrystalContractTests(unittest.TestCase):
                 self.assertFalse(report['ok'])
                 self.assertFalse(report['contrast'])
                 self.assertTrue(report['unsupported_positive_contrasts'])
-                self.assertEqual(report['contract_version'], 3)
+                # 2026-09-09: the module's own number. A literal here broke on a
+                # bump that changed nothing this test asserts.
+                self.assertEqual(report['contract_version'], crystal_contract.VERSION)
         exact = compare_contract(source, 'Not abilities that show the true state, but how we act, keep it straight')
         self.assertEqual(exact['unsupported_positive_contrasts'][0]['unsupported_terms'], ['act'])
 
