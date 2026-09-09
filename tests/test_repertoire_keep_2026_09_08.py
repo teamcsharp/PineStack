@@ -110,7 +110,12 @@ class KeepTests(unittest.TestCase):
         self.assertEqual(got["larder"]["aired"], 1)
         self.assertEqual(got["larder"]["unaired"], 1)
         self.assertEqual(got["larder"]["resting"], 1)
-        self.assertEqual(got["keep_hours"], 96.0)
+        # 2026-09-09 (#1157): the keep no longer expires. The operator -
+        # "i dont want lines getting removed until the dialogue is able to be
+        # pumped without relenting" - and a keep expressed in HOURS is a date
+        # on which every shield in the station switches off at once, which
+        # for the 96-hour default would have been 2026-09-12.
+        self.assertEqual(got["keep_hours"], app.RETIRE_KEEP_FOREVER)
 
 
 if __name__ == "__main__":

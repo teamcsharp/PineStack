@@ -11904,7 +11904,14 @@ PANTRY_MAX_BYTES = int(os.getenv("PANTRY_MAX_BYTES", str(6 * 1024 ** 3)))
 # render NEVER waits on a prepared one. The third exists only so the
 # room is not standing empty while the show renders — which is the
 # whole point of having a room.
-ENGINE_BUDGET = 3                       # renders in flight, both roads
+# 2026-09-09 (#1157): five, not three. prep_limit is capacity - 2, so at
+# three the whole station banked audio on ONE slot and 76 of 87 prepared
+# rounds held no audio at all - about fifty minutes of radio sitting on the
+# shelf as text that still had to be rendered live, in the hole, at 1.05x
+# realtime. Live still keeps its two slots (_PREMAKE_GATE is unchanged), so
+# no live render waits on a prepared one; the GPU was measured idle 46
+# minutes an hour while the station was silent 50.
+ENGINE_BUDGET = int(os.getenv("ENGINE_BUDGET", "5"))    # renders in flight, both roads
 _ENGINE_LIVE = [0]                      # air renders in flight
 _ENGINE_PREP = [0]                      # preparation renders in flight
 _ENGINE_PREP_BY: dict[str, int] = {}     # one recording booth per engine
@@ -12854,7 +12861,20 @@ REPEAT_KEEP_SECONDS = float(os.getenv("REPEAT_KEEP_SECONDS", "259200"))
 # rule anywhere knew the round was tinted. See tinted_keep_until.
 TINTED_KEEP_SECONDS = float(os.getenv("TINTED_KEEP_SECONDS", "345600"))
 # ...and how many rhymed rounds the larder may hold beside its stock.
-TINTED_KEEP_ROWS = int(os.getenv("TINTED_KEEP_ROWS", "80"))
+# 2026-09-09 (#1157): 160, not 80. Rhymed rounds are the repertoire the
+# operator asked for and they are now kept until released, so the ceiling on
+# how many may WAIT IN THE LARDER had to move with them - at 80 and 28
+# rhymed rounds an hour it was three hours from forcing deletions.
+#
+# And it is 160 rather than the 400 the repertoire would like, because the
+# larder is NOT free: measured on the live station, a round costs 69 kB of
+# JSON (the tint audit rides with the script), so 20 rounds is a 1.4 MB file
+# that _larder_save writes synchronously. 400 rounds would be an 28 MB write
+# on the event loop, which is #1156's outage rebuilt on purpose - json holds
+# the GIL. The BARS are kept for good in the gold bank, which costs ~250 kB
+# a thousand; the larder keeps whole ROUNDS for re-airing, and that is what
+# this number bounds. Raise it only with the file size measured again.
+TINTED_KEEP_ROWS = int(os.getenv("TINTED_KEEP_ROWS", "160"))
 _SHELF: dict[str, list[dict[str, Any]]] = {}
 # How many of each to hold. The real governor is prepare_hours (TIME on
 # the shelf); these only stop one content type eating the whole
@@ -13189,6 +13209,23 @@ def shelf_rest_now() -> float:
         return SHELF_REUSE_REST_FLOOR
 
 
+RETIRE_KEEP_FOREVER = -1.0           # a keep_hours rule meaning "never expires"
+KEEP_FOREVER_AT = 4102444800.0       # 2100-01-01: the stamp a forever keep writes
+
+
+def retire_keeps_forever(kind: str) -> bool:
+    """2026-09-09 (#1157): does this kind's rule keep rhymed work for good?
+
+    A keep expressed in HOURS is a date on which every shield in the station
+    switches off at once - the 96-hour default would have released four days
+    of backlog in one minute on 2026-09-12. Forever is a rule instead of a
+    date, and the operator's own answer is the only thing that ends it."""
+    try:
+        return float(retire_rule(kind).get("keep_hours") or 0) < 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def tinted_keep_until(kind: str, row: Any, stamp: bool = True) -> float:
     """2026-09-08: when a RHYMED round stops being offered - TINTED_KEEP_SECONDS
     (96 h) from the moment it was first seen through the crystal.
@@ -13204,6 +13241,22 @@ def tinted_keep_until(kind: str, row: Any, stamp: bool = True) -> float:
             return 0.0
         entry = row.get("entry") if isinstance(row.get("entry"), dict) else None
         got = float(row.get("keep_until") or (entry or {}).get("keep_until") or 0)
+        # 2026-09-09 (#1157): the operator's freeze. A forever rule overrides
+        # an hours-stamp already written on the row, so the four days of
+        # rounds stamped before the freeze are covered by it too.
+        # ...but never over an answer the operator gave for THIS item.
+        # retire_kept is only ever set by retire_decide, so a hand-set
+        # "keep +48h" stays 48 hours while an inherited default stamp does
+        # not. Without this the desk's own extend button was a no-op.
+        if (retire_keeps_forever(kind) and not row.get("retire_kept")
+                and (got or (dialogue_tint_required()
+                             and dialogue_tint_ready(kind, row)))):
+            if stamp:
+                row["keep_until"] = KEEP_FOREVER_AT
+                row.setdefault("tinted_seen_at", time.time())
+                if entry is not None:
+                    entry["keep_until"] = KEEP_FOREVER_AT
+            return KEEP_FOREVER_AT
         if got:
             return got
         if not dialogue_tint_required():
@@ -13290,6 +13343,11 @@ def larder_trim() -> None:
             for e in stock[:len(stock) - cap]:
                 if retire_may("banter", e, f"the larder is over its cap of {cap}"):
                     drop.append(e)
+        for e in drop:                                     # #1157
+            try:
+                gold_harvest_entry(e, "let go of by the larder's allowances")
+            except Exception:  # noqa: BLE001
+                pass
         drop_ids = {id(e) for e in drop}
         _LARDER[:] = [e for e in _LARDER if id(e) not in drop_ids]
         # The hard ceiling - twice the two allowances - so an unanswered
@@ -13302,7 +13360,16 @@ def larder_trim() -> None:
             old_ids = {id(e) for e in oldest}
             _LARDER[:] = [e for e in _LARDER if id(e) not in old_ids]
     except Exception:  # noqa: BLE001
-        del _LARDER[:-larder_cap()]
+        # 2026-09-09 (#1157): even the fault path lifts rhymed work out of
+        # the cut rather than counting it against the cap.
+        try:
+            _safe = [e for e in _LARDER if gold_locked("banter", e)]
+            _safe_ids = {id(e) for e in _safe}
+            _rest = [e for e in _LARDER if id(e) not in _safe_ids]
+            del _rest[:-max(1, larder_cap())]
+            _LARDER[:] = _safe + _rest
+        except Exception:  # noqa: BLE001
+            del _LARDER[:-larder_cap()]
 
 
 def larder_prune_why(e: dict[str, Any], paused: bool) -> str:
@@ -13330,7 +13397,14 @@ def repertoire_status() -> dict[str, Any]:
     """The rhymed rounds being kept, per store, and how much of their keep
     is left - for the glass and the cupboard."""
     now = time.time()
-    out: dict[str, Any] = {"keep_hours": round(TINTED_KEEP_SECONDS / 3600.0, 1),
+    # #1157: the RULE, not the constant. This read 96 hours off
+    # TINTED_KEEP_SECONDS whatever the operator had actually set, so the one
+    # panel that answers "how long is rhymed work kept" was decorative.
+    try:
+        _keep_h = round(float(retire_rule("banter")["keep_hours"] or 0), 1)
+    except Exception:  # noqa: BLE001
+        _keep_h = round(TINTED_KEEP_SECONDS / 3600.0, 1)
+    out: dict[str, Any] = {"keep_hours": _keep_h, "keep_forever": _keep_h < 0,
                            "rows_most": TINTED_KEEP_ROWS, "larder": {}, "shelf": {}}
     try:
         kept = [e for e in _LARDER if tinted_kept("banter", e)]
@@ -13411,7 +13485,9 @@ def retire_kind_label(kind: str) -> str:
 
 def retire_rule_default(kind: str) -> dict[str, Any]:
     kind = str(kind)
-    keep = 0.0 if kind == "news" else TINTED_KEEP_SECONDS / 3600.0
+    # 2026-09-09 (#1157): rhymed work is kept until the operator releases it.
+    # News still dies with its stories.
+    keep = 0.0 if kind == "news" else RETIRE_KEEP_FOREVER
     return {"ask": "never" if kind in ("news", "station_id") else "tinted",
             "keep_hours": round(keep, 1),
             "innings": int(SHELF_REUSE_MOST_EVERGREEN)}
@@ -13462,6 +13538,22 @@ def _retire_save(force: bool = False) -> None:
     _retire_write(RETIRE_LEDGER_PATH, body)
 
 
+def retire_keep_clamp(hours: Any) -> float:
+    """2026-09-09 (#1157): a keep in hours, or forever.
+
+    Both roads used to clamp at max(0.0, ...), so the sentinel the freeze is
+    built on could not be written by the operator's own endpoint - only by
+    the code default. Anything negative means forever; the thirty-day ceiling
+    still bounds a real number."""
+    try:
+        got = float(hours)
+    except Exception:  # noqa: BLE001
+        return 0.0
+    if got < 0:
+        return RETIRE_KEEP_FOREVER
+    return min(24.0 * 30, got)
+
+
 def retire_rule(kind: str) -> dict[str, Any]:
     """The operator's rule for this kind, over the default."""
     _retire_load()
@@ -13471,7 +13563,7 @@ def retire_rule(kind: str) -> dict[str, Any]:
         out["ask"] = got["ask"]
     try:
         if got.get("keep_hours") is not None:
-            out["keep_hours"] = round(max(0.0, min(24.0 * 30, float(got["keep_hours"]))), 1)
+            out["keep_hours"] = round(retire_keep_clamp(got["keep_hours"]), 1)
     except Exception:  # noqa: BLE001
         pass
     try:
@@ -13491,7 +13583,7 @@ def retire_rules_set(kind: str, ask: Any = None, keep_hours: Any = None,
         if ask in RETIRE_ASK_KINDS:
             row["ask"] = ask
         if keep_hours is not None and str(keep_hours) != "":
-            row["keep_hours"] = max(0.0, min(24.0 * 30, float(keep_hours)))
+            row["keep_hours"] = retire_keep_clamp(keep_hours)
         if innings is not None and str(innings) != "":
             row["innings"] = max(1, min(60, int(innings)))
         _RETIRE["rules"][kind] = row
@@ -13688,12 +13780,50 @@ def retire_may(kind: str, row: Any, why: str = "") -> bool:
         return not rhymed                   # a fault never deletes rhymed work
 
 
+_GOLD_LOCK: dict[str, Any] = {"held": 0, "at": 0.0}
+
+
+def gold_locked(kind: str, row: Any) -> bool:
+    """2026-09-09 (#1157): is this rhymed work the operator has not released?
+
+    "i dont want lines getting removed until the dialogue is able to be
+    pumped without relenting and the dead air is minimal." Every automatic
+    deletion road asks this before it destroys anything. True means the row
+    stays where it is. Only an explicit "remove" on the retirement desk
+    answers False for a rhymed row - a fault answers True, because a fault
+    must never be the thing that deletes the operator's gold."""
+    try:
+        if not row_is_rhymed(kind, row):
+            return False
+        rid = retire_id(kind, row)
+        if not rid:
+            return True
+        _retire_load()
+        with _RETIRE_LOCK:
+            entry = (_RETIRE.get("ledger") or {}).get(rid)
+        held = str((entry or {}).get("state") or "") != "remove"
+        if held:
+            _GOLD_LOCK["held"] = int(_GOLD_LOCK.get("held") or 0) + 1
+            _GOLD_LOCK["at"] = time.time()
+        return held
+    except Exception:  # noqa: BLE001
+        return True                         # a fault never deletes rhymed work
+
+
 def retire_forced(kind: str, row: Any, why: str) -> None:
     """A store's hard ceiling removed this item without the operator's
     answer. Written down so the desk shows it."""
     try:
         if not isinstance(row, dict):
             return
+        # 2026-09-09 (#1157): a ceiling may take the ROW; it does not take
+        # the BARS. Every accepted rhymed line with a rendered take goes to
+        # the gold bank first, so a store running out of space costs the
+        # station a container and never a line.
+        try:
+            gold_harvest_entry(dialogue_entry(row) or row, why)
+        except Exception:  # noqa: BLE001
+            pass
         rid = retire_id(kind, row)
         if not rid:
             return
@@ -13808,8 +13938,14 @@ def retire_decide(ids: list[str], action: str, extend_hours: Any = None) -> dict
                 except Exception:  # noqa: BLE001
                     hours = None
                 if hours is None:
-                    hours = float(retire_rule(kind or entry.get("kind") or "banter")["keep_hours"] or 0) or 24.0
-                hours = max(0.5, min(24.0 * 30, hours))
+                    _rule_h = float(retire_rule(
+                        kind or entry.get("kind") or "banter")["keep_hours"] or 0)
+                    # #1157: a negative rule is the forever sentinel. Passed
+                    # through the clamp below it became 0.5 hours - a keep
+                    # that expired half an hour after the operator granted it.
+                    hours = RETIRE_KEEP_FOREVER if _rule_h < 0 else (_rule_h or 24.0)
+                if hours >= 0:
+                    hours = max(0.5, min(24.0 * 30, hours))
                 entry.update(state="keep", decided_at=now, keep_hours=hours,
                              keeps=int(entry.get("keeps") or 0) + 1)
                 if row is not None:
@@ -13823,7 +13959,8 @@ def retire_decide(ids: list[str], action: str, extend_hours: Any = None) -> dict
                         _stale = bool(_e.get("script")) and not _larder_current(_e)
                     except Exception:  # noqa: BLE001
                         _stale = False
-                    until = now + hours * 3600.0
+                    until = (KEEP_FOREVER_AT if hours < 0
+                             else now + hours * 3600.0)      # #1157
                     row["keep_until"] = until
                     row["retire_kept"] = int(row.get("retire_kept") or 0) + 1
                     if isinstance(row.get("entry"), dict):
@@ -14549,7 +14686,8 @@ def shelf_put(kind: str, row: dict[str, Any]) -> None:
             try:
                 _rk = resort_keys(kind)
                 _safe = [r for r in rows
-                         if not resort_may_drop(kind, r, _rk)]
+                         if gold_locked(kind, r)                    # #1157
+                         or not resort_may_drop(kind, r, _rk)]
                 _rest = [r for r in rows if r not in _safe]
                 del _rest[:-max(1, shelf_cap(kind) - len(_safe))]
                 rows[:] = _safe + _rest
@@ -14693,7 +14831,21 @@ def shelf_take(kind: str, voice: str = "",
                     # Keeping the selected row here forged an airing and
                     # left consumed work advertised as fresh shelf stock.
                     row["taken_at"] = time.time()
-                    rows[:] = [r for r in rows if r is not row]
+                    if gold_locked(str(kind), row):
+                        # 2026-09-09 (#1157): ...but a RHYMED call is not
+                        # destroyed on dispatch. Every rhymed call this
+                        # station has ever aired left the shelf by this
+                        # line, and the re-air queue built for it (#1033)
+                        # was dead code in consequence - no caller row could
+                        # ever carry aired_at. Stamped and sent to the BACK
+                        # it is never offered as fresh stock again; it comes
+                        # back only through story_rerun_ok_row's window.
+                        row["aired_at"] = time.time()
+                        row["aired"] = int(row.get("aired") or 0) + 1
+                        row["expires_at"] = stock_expires_at(str(kind), row)
+                        rows[:] = ([r for r in rows if r is not row] + [row])
+                    else:
+                        rows[:] = [r for r in rows if r is not row]
                 elif (str(kind) in SHELF_REUSABLE
                         and repeat_safe(str(kind), row)):
                     # #977: KEPT, not consumed. It goes to the back of the
@@ -14716,6 +14868,14 @@ def shelf_take(kind: str, voice: str = "",
                     # copy, and list.remove() would match the first row
                     # that merely COMPARES equal rather than the one being
                     # aired.
+                    # 2026-09-09 (#1157): a rhymed row does not leave without
+                    # its bars being banked first. The words survive the row.
+                    if row_is_rhymed(str(kind), row):
+                        try:
+                            gold_harvest_entry(dialogue_entry(row) or row,
+                                               "taken off the %s shelf" % kind)
+                        except Exception:  # noqa: BLE001
+                            pass
                     rows[:] = [r for r in rows if r is not row]
             except Exception:  # noqa: BLE001
                 pass
@@ -16651,7 +16811,15 @@ def _media_prune_now() -> None:
             keep = (at < VOICE_KEEP_FILES
                     and kept_bytes + size <= VOICE_KEEP_BYTES)
             if keep or clip.name in protected:
-                kept_bytes += size          # protected clips count too
+                # 2026-09-09 (#1157): a protected clip is kept and NOT
+                # charged to the rolling buffer. Charging it meant a growing
+                # gold bank ate the buffer every other road plays out of -
+                # 12.7 days to 3 GiB, after which every unprotected clip is
+                # unlinked on every write and the station re-renders live
+                # (#1004 at station scale). Both stores are separately
+                # bounded: GOLD_MAX takes and PANTRY_MAX_BYTES.
+                if keep:
+                    kept_bytes += size
                 continue
             clip.unlink(missing_ok=True)     # oldest, over budget → cycle out
     except Exception:
@@ -34607,8 +34775,19 @@ async def reel_open() -> None:
             talk_said_now("box", str(sig), 1.0)
         sid = str(_REEL.get("sid") or "")
         if sid:
-            _LARDER[:] = [e for e in _LARDER
-                          if alt_sid("banter", e) != sid]
+            # 2026-09-09 (#1157): the reel used to delete the round it had
+            # just aired. A rhymed one is stamped and kept instead, so it
+            # rejoins the repertoire under its rest and innings.
+            _keep: list[dict[str, Any]] = []
+            for e in _LARDER:
+                if alt_sid("banter", e) != sid:
+                    _keep.append(e)
+                    continue
+                if gold_locked("banter", e):
+                    e["aired_at"] = time.time()
+                    e["aired"] = int(e.get("aired") or 0) + 1
+                    _keep.append(e)
+            _LARDER[:] = _keep
             _larder_save()
         try:
             _episode_stage(path, "🎙 the resume reel")
@@ -36234,7 +36413,13 @@ def resort_may_drop(kind: str, row: dict[str, Any],
         if id(row) in (keep if keep is not None else resort_keys(kind)):
             return False
         if tinted_kept(kind, row):
-            return False
+            # 2026-09-09 (#1157): the shield stands, and it now reads the
+            # operator's answer. Before this it returned False flat, so an
+            # explicit "remove" on the desk was ignored while the keep ran -
+            # and retire_may below was unreachable for every rhymed row,
+            # which is why the ledger was never written and the desk read
+            # zero while other roads destroyed rhymed work without asking.
+            return not gold_locked(kind, row)
     except Exception:  # noqa: BLE001
         return False
     return retire_may(kind, row, why or "aged past its life on the shelf")
@@ -38972,6 +39157,11 @@ def coord_retire() -> int:
                         or not resort_may_drop(str(kind), row, _rk)):
                     kept.append(row)
                     continue
+                try:                                       # #1157
+                    gold_harvest_entry(dialogue_entry(row) or row,
+                                       "swept by the coordinator")
+                except Exception:  # noqa: BLE001
+                    pass
                 removed_keys.update(_row_clip_keys(row))
                 per_kind[str(kind)] = per_kind.get(str(kind), 0) + 1
                 gone += 1
@@ -38981,9 +39171,14 @@ def coord_retire() -> int:
             sid = alt_sid("banter", entry)
             if (sid in keep_ids or entry.get("preparing")
                     or entry.get("tinting")
-                    or row_unaired(entry)):        # #1141: never unheard
+                    or row_unaired(entry)          # #1141: never unheard
+                    or gold_locked("banter", entry)):   # #1157: never rhymed
                 larder.append(entry)
                 continue
+            try:                                           # #1157
+                gold_harvest_entry(entry, "swept by the coordinator")
+            except Exception:  # noqa: BLE001
+                pass
             removed_keys.update(_row_clip_keys(entry))
             per_kind["banter"] = per_kind.get("banter", 0) + 1
             gone += 1
@@ -46537,8 +46732,13 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
         # never aired: dialogue_row_ready deliberately refuses it, so
         # protecting it here would let an unusable row permanently block a
         # replacement that can satisfy the hour.
+        # 2026-09-09 (#1157): ...but not a rhymed one. A rhymed row whose
+        # contract moved, whose tint was struck or whose clip was pruned was
+        # deleted HERE, ahead of every plain row, without the desk being told
+        # - this branch runs above the #1091 pin sweep and returns before it.
         rejected = [r for r in rows
-                    if not dialogue_row_viable(str(kind), r)]
+                    if not dialogue_row_viable(str(kind), r)
+                    and not gold_locked(str(kind), r)]
         if rejected:
             gone = rejected[:over]
             rows[:] = [r for r in rows if all(r is not d for d in gone)]
@@ -46588,7 +46788,8 @@ def alt_shelf_trim(kind: str, rows: list[dict[str, Any]]) -> None:
             try:
                 _rk = resort_keys(kind)
                 _safe = [r for r in rows
-                         if not resort_may_drop(kind, r, _rk)]
+                         if gold_locked(kind, r)                    # #1157
+                         or not resort_may_drop(kind, r, _rk)]
                 _rest = [r for r in rows if r not in _safe]
                 del _rest[:-max(1, shelf_cap(kind) - len(_safe))]
                 rows[:] = _safe + _rest
@@ -59670,6 +59871,9 @@ GOLD_PATH = data_path("gold_bars.json")
 # rhymed audio; 2,000 is about four hours, which makes "the same line
 # aired a hundred times" arithmetically impossible.
 GOLD_MAX = int(os.getenv("GOLD_MAX", "2000"))
+# 2026-09-09 (#1157): the bank's bound spends the TAKE, never the line. Words
+# cost ~250 kB a thousand; audio costs 48 kB a second.
+GOLD_TEXT_MAX = int(os.getenv("GOLD_TEXT_MAX", "20000"))
 GOLD_FIRE_RATE = 0.5                 # share of sting moments that fire a bar
 GOLD_REST = 1200.0                   # the same bar rests twenty minutes
 _GOLD: dict[str, Any] = {"loaded": False, "rows": []}
@@ -59691,7 +59895,7 @@ def _gold_save() -> None:
     try:
         GOLD_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = GOLD_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(_gold_rows()[-GOLD_MAX:], ensure_ascii=False))
+        tmp.write_text(json.dumps(_gold_rows()[-GOLD_TEXT_MAX:], ensure_ascii=False))
         tmp.replace(GOLD_PATH)
     except OSError:
         pass
@@ -59715,11 +59919,34 @@ def gold_note(who: str, text: str, path: str, seconds: float) -> bool:
         rows.append({"key": key, "who": str(who or "dj"), "text": text[:400], "path": name,
                      "seconds": float(seconds or 0), "at": time.time(), "fired": 0,
                      "last": 0.0})
-        del rows[:-GOLD_MAX]
+        gold_trim()
         _gold_save()
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def gold_trim() -> None:
+    """2026-09-09 (#1157): hold the bank's bound by releasing TAKES, not bars.
+
+    `del rows[:-GOLD_MAX]` was a silent FIFO on rhymed lines - the one thing
+    the operator asked never to lose - and at 28 bars an hour it reached its
+    cap in under three days. The bound now falls on the audio, most-fired
+    first, so a bar nobody has heard keeps its take while one that has been
+    out ten times gives its seconds back and keeps its words."""
+    try:
+        rows = _gold_rows()
+        with_take = [r for r in rows if r.get("path")]
+        over = len(with_take) - GOLD_MAX
+        if over > 0:
+            with_take.sort(key=lambda r: (-int(r.get("fired") or 0),
+                                          float(r.get("at") or 0)))
+            for r in with_take[:over]:
+                r["path"] = ""              # the take goes; the line stays
+        if len(rows) > GOLD_TEXT_MAX:
+            del rows[:len(rows) - GOLD_TEXT_MAX]
+    except Exception:  # noqa: BLE001
+        pass
 
 
 GOLD_GAP_REST = 300.0                # ...five minutes when it is filling dead air
@@ -62731,7 +62958,14 @@ TALK_WATCH_TICK = 15.0
 # ten-second maximum intermission; detection at eight plus the two-second
 # tick plus the announce is a ten-to-eleven-second worst case, and at
 # twelve the first filler CANNOT land inside ten by arithmetic.
-TALK_INCESSANT_QUIET_MOST = 8.0
+# 2026-09-09 (#1157): four, not eight. Detection at four plus the
+# two-second tick plus the announce is a six-to-seven-second worst case
+# against the operator's ten-second rule, which leaves room for the
+# announce to be late rather than spending the whole allowance on noticing.
+TALK_INCESSANT_QUIET_MOST = 4.0
+# How long the air may be silent under a HELD floor before the bank speaks
+# into it. Three seconds is a beat between phrases; four is a hole.
+FLOOR_QUIET_SECONDS = float(os.getenv("FLOOR_QUIET_SECONDS", "3"))
 TALK_INCESSANT_WATCH_TICK = 2.0
 
 
@@ -62886,8 +63120,25 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
     # cover's own rest must sit below the quiet limit or it self-blocks.
     if time.time() - _COVER_AT[0] < (3 if talk_is_incessant() else 20):
         return False                    # a cover, not a filibuster
-    if _SPEAKING[0] or _floor_busy():   # #1146
-        return False                    # somebody already has the floor
+    if _SPEAKING[0]:
+        return False                    # somebody is actually talking
+    if _floor_busy():                   # #1146
+        # 2026-09-09 (#1157): a HELD floor is not a talking mouth. Measured:
+        # the floor is held across a round's render for ~44 seconds of wall
+        # clock, and this line is why nothing could speak into that hole -
+        # the gap chain returned here before it ever reached the bank. The
+        # render cannot be made faster than the hole: fitted over 600
+        # renders, render = 2.97 + 1.05 x audio, a marginal cost above one,
+        # so live rendering can never fill its own gap. Finished audio can,
+        # and gold_fill_gap(floorless=True) already speaks under a held
+        # floor without taking it.
+        if talk_quiet_for() < FLOOR_QUIET_SECONDS:
+            return False
+        if await gold_fill_gap(why or "the floor is held for a render and "
+                                      "nobody has spoken", floorless=True):
+            _COVER_AT[0] = time.time()
+            return True
+        return False
     # A measured host-speech outage is a playback problem at every talk
     # setting. Spend the separately labelled ready reserve before asking
     # an ordinary cover to synthesize a new line and extend the outage.
@@ -122909,11 +123160,15 @@ function lifeCell(sec, keepUntil) {
 }
 function actions(id, kind, pending) {
   const rule = (state.rules || []).find((r) => r.kind === kind) || {};
-  const hours = Number(rule.keep_hours || 0) || 24;
+  const raw = Number(rule.keep_hours);
+  const forever = raw < 0;                       /* #1157 */
+  const hours = forever ? 24 : (raw || 24);
   return '<span class="row-actions">'
     + '<button class="rm" data-act="remove" data-id="' + esc(id) + '">Remove' + (pending ? "" : " now") + '</button>'
     + '<button class="kp" data-act="keep" data-h="24" data-id="' + esc(id) + '">Keep +24h</button>'
-    + '<button class="kp" data-act="keep" data-h="' + hours + '" data-id="' + esc(id) + '">Keep +' + hours + 'h</button>'
+    + (forever
+        ? '<button class="kp" data-act="keep" data-h="-1" data-id="' + esc(id) + '">Keep for good</button>'
+        : '<button class="kp" data-act="keep" data-h="' + hours + '" data-id="' + esc(id) + '">Keep +' + hours + 'h</button>')
     + '<button class="kp" data-act="keep" data-h="168" data-id="' + esc(id) + '">Keep +7d</button></span>';
 }
 function itemCells(it) {
@@ -122939,7 +123194,7 @@ function render() {
     + (state.rules || []).map((r) => '<tr><td><b>' + esc(r.label) + '</b><div class="meta">' + esc(r.kind) + '</div></td>'
       + '<td><select data-rule="ask" data-kind="' + esc(r.kind) + '">'
       + ['tinted', 'all', 'never'].map((a) => '<option value="' + a + '"' + (r.ask === a ? ' selected' : '') + '>' + ({tinted: 'rhymed items only', all: 'everything', never: 'never (delete as before)'}[a]) + '</option>').join("") + '</select></td>'
-      + '<td><input type="number" min="0" max="720" step="1" data-rule="keep_hours" data-kind="' + esc(r.kind) + '" value="' + esc(r.keep_hours) + '"> <span class="meta">default ' + esc(r.default.keep_hours) + '</span></td>'
+      + '<td><input type="number" min="-1" max="720" step="1" data-rule="keep_hours" data-kind="' + esc(r.kind) + '" value="' + esc(r.keep_hours) + '"> <span class="meta">' + (Number(r.keep_hours) < 0 ? 'kept for good' : (Number(r.keep_hours) ? '' : 'no keep')) + ' &middot; -1 = for good, 0 = none</span></td>'
       + '<td><input type="number" min="1" max="60" step="1" data-rule="innings" data-kind="' + esc(r.kind) + '" value="' + esc(r.innings) + '"' + (r.reusable ? '' : ' disabled title="this type does not repeat"') + '> <span class="meta">default ' + esc(r.default.innings) + '</span></td>'
       + '<td class="meta">' + esc(r.clocks) + '</td>'
       + '<td><button data-save="' + esc(r.kind) + '">Save</button></td></tr>').join("") + '</table>';
@@ -123060,7 +123315,9 @@ async def api_retire_rules(
         rule = retire_rules_set(kind, payload.get("ask"), payload.get("keep_hours"), payload.get("innings"))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=f"Bad rule: {exc}")
-    note_action(f"🗄⏳ rule for {retire_kind_label(kind)}: ask {rule['ask']}, keep {rule['keep_hours']:g} h, "
+    _keep_says = ("for good" if float(rule['keep_hours']) < 0
+                  else f"{rule['keep_hours']:g}")                      # #1157
+    note_action(f"🗄⏳ rule for {retire_kind_label(kind)}: ask {rule['ask']}, keep {_keep_says} h, "
                 f"{rule['innings']} airings")
     return {"ok": True, "rule": rule, "rules": retire_rules_all()}
 

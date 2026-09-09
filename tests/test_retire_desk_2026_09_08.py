@@ -47,7 +47,11 @@ class DeskTests(unittest.TestCase):
     def test_the_rules_default_to_asking_about_rhymed_items(self):
         banter = app.retire_rule("banter")
         self.assertEqual(banter["ask"], "tinted")
-        self.assertEqual(banter["keep_hours"], 96.0)
+        # 2026-09-09 (#1157): forever, not 96 hours. See the note in
+        # test_gold_freeze_2026_09_09.py - the desk had never recorded
+        # anything because the shield returned above retire_may, and the
+        # keep would have released four days of backlog in one minute.
+        self.assertEqual(banter["keep_hours"], app.RETIRE_KEEP_FOREVER)
         self.assertEqual(banter["innings"], app.SHELF_REUSE_MOST_EVERGREEN)
         self.assertEqual(app.retire_rule("news")["ask"], "never")
         self.assertEqual(app.retire_rule("news")["keep_hours"], 0.0)
@@ -95,7 +99,11 @@ class DeskTests(unittest.TestCase):
         self.assertEqual(app._SHELF["gallery"], [])
         app._pantry_save.assert_called()
 
-    def test_keep_extends_the_life_and_the_innings_then_asks_again_when_it_lapses(self):
+    def test_an_explicit_keep_is_the_operators_and_the_kinds_rule_does_not_stomp_it(self):
+        """2026-09-09 (#1157): the kind now keeps rhymed work for good, but a
+        hand-set extension is a decision about THIS item and outranks the
+        default. Found by this test: without the retire_kept guard in
+        tinted_keep_until, the desk's own extend button was a no-op."""
         row = _round(aired_at=time.time() - 4 * 3600, aired=app.SHELF_REUSE_MOST_EVERGREEN)
         app._LARDER.append(row)
         self.assertFalse(app.retire_may("banter", row, "its innings are used"))
@@ -122,7 +130,18 @@ class DeskTests(unittest.TestCase):
         app._LARDER.append(row)
         app.retire_may("banter", row, "over the cap")
         app.retire_decide([row["sid"]], "keep")
-        self.assertAlmostEqual(row["keep_until"], time.time() + 96 * 3600, delta=30)
+        # 2026-09-09 (#1157): the kind's rule is now "for good". Before the
+        # fix this computed now + (-1 * 3600) and then clamped to 0.5 h - a
+        # keep that expired half an hour after the operator granted it.
+        self.assertEqual(row["keep_until"], app.KEEP_FOREVER_AT)
+
+    def test_a_keep_from_an_hours_rule_still_expires(self):
+        app.retire_rules_set("banter", keep_hours=48)
+        row = _round()
+        app._LARDER.append(row)
+        app.retire_may("banter", row, "over the cap")
+        app.retire_decide([row["sid"]], "keep")
+        self.assertAlmostEqual(row["keep_until"], time.time() + 48 * 3600, delta=30)
 
     def test_the_rules_change_who_is_asked_and_how_long_a_keep_is(self):
         app.retire_rules_set("banter", ask="all")

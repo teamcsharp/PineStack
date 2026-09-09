@@ -153,6 +153,26 @@ when the station has room), falling back to `crystal_tint_chunks` = 5 passages o
 (`frame_prefix`), identical for every road and every ask inside the window; the road, the register
 and the per-line evidence follow it.
 
+**The rhyme dictionary (`pine_rhyme.py`, `data/rhyme_families.json`).** The crystal's own words
+grouped into **rhyme families**: every word by its pronunciation tail from the final stressed vowel,
+so a family is a set that perfectly rhymes *by the grader's own reading*. Live on the DOOM crystal:
+**6,721 families over 16,698 words, 5,936 of them multisyllabic**. Built in about ten seconds inside
+`crystal_vocab_warm`'s worker thread (`_crystal_vocab_counts` walks the same chunks and counts them),
+2.6 MB on disk, memoised; a warm lookup is 0.01 ms.
+
+A partner is ranked by how **distinctive** it is: frequent in the crystal (saturating, so one common
+slang word cannot own every list), rare in ordinary English (the WordNet tagged counts drag it down),
+more syllables after the stress (the crystal's signature), and never a function word or the station's
+own furniture — a list derived from four days of air as the words the microphone over-uses against
+the crystal's own frequency. `rhyme_options_for(word)` answers from it, falling back to the old scan
+when the artifact is missing; `crystal_landing_pairs(text)` offers **anchored** pairs — a word the
+source already said plus the crystal's best answer — which reach the writer on the *first* ask.
+
+Before this the suggestions were an alphabetical slice: the old scan walked a sorted vocabulary and
+stopped at forty hits, so 70% of every word it offered began with a, b or c, and it happily told the
+writer to rhyme *heat* with *bed*. `station` now answers *domination, intoxication, inspiration,
+meditation, reincarnation*; `must` answers *bust, lust, trust, cussed, rust, crust*.
+
 **Rhyme assistance (the Rhyme Cloud).** `rhyme_assistance.py` keeps its own store
 (`data/rhyme_assistance.sqlite3`): CMUdict pronunciations keyed by the tail from the final stressed
 vowel, WordNet 3.0 senses and usage counts, and sense embeddings made by `nomic-embed-text` (the
@@ -225,6 +245,27 @@ repertoire and the SFX reserve) and the lane semaphore (`OLLAMA_LANES` = 1 since
 decode slots measured 0.96× the throughput of one). A refused admission is a *deferral*
 (`WritingDeferred`), not a failure: the caller rests and returns.
 
+**What the writer is told about the landing** (2026-09-08 night, all inside the cacheable prefix, so
+none of it costs anything per ask). Three rules that were missing:
+
+1. **The style world does not replace the conversation's words; it furnishes what the conversation
+   did not say.** Keep the source's own nouns, names and numbers inside the bars — they are counted —
+   and spend the crystal's vocabulary on the landings, the similes and the way one bar turns into the
+   next. This is the rule that satisfies the meaning gate and the crystal at once. Measured before
+   it: bars written in the crystal's register failed the grader four times in six, and *every*
+   failure was the anchor floor, not one a rhyme fault. Written to the rule, three in four pass.
+2. **The landing is where this station is heard.** Never `it, now, you, that, this, here, there,
+   right, tonight, thing, time` or the station's own furniture; prefer a landing carrying a syllable
+   past its stress. Before it, only 13% of landings were a distinctive crystal word and a proven
+   multisyllabic pair appeared in 0.0% of accepted turns.
+3. **Off the wall, inside the facts.** The style world may change *how* a thing is said, never
+   *what* was said — and a flourish like "not one" or "never" is a denial the source did not make.
+
+And per line, after the road line: **CRYSTAL LANDINGS**, the proven rhyme pairs for this source out
+of the rhyme dictionary. The fluid-acceptance block used to tell the writer *not* to reach for an
+unusual style word; it now asks for one at the landing and keeps the two rules it was aiming at (no
+invented claim, no padding).
+
 **What rides the prompt** (in `crystal_operator_refinement`, one funnel for every rewrite): the
 operator's crystal instruction (the rejection lab's *future crystal instruction*), the learner's
 observed-lesson bullets (≤ 4 per road, ≤ 1,000 characters), and since this evening **THE
@@ -244,7 +285,7 @@ recovery, or the operator's own hand. In order:
 |---|---|---|
 | **meaning** (`crystal_compare_contract`, crystal_contract.py, contract VERSION 3) | content anchors recalled above a floor that falls with strength (0.5 below 0.45, 0.35 from 0.45, 0.2 from 0.75 — the harder the tint, the more paraphrase is allowed), names kept (heuristic names advisory: a speaker label, a descriptive opener such as "Taut wire…", the station's own name), numbers kept and none added (idioms and pronominal "one" waived), a question stays a question, a negation stays where it was, no unsupported positive contrast. Under the meaning grade a **rhetorical** negation folded ("not just structural", "No, …", "isn't it?", "not X; it is Y") and an **inner** question folded (the turn ends on a statement) are advisory; the strict grade refuses both | *semantic preservation failed* |
 | **caller contract** (callers only, `call_tint_report`) | the call's structure survives the rewrite: the line answered, the introduction, the greeting, the sign-off | *caller structure did not pass* |
-| **rhyme** (`rap_rhyme_evidence`) | end pairs across bars (the spelling reading `_rap_slant` on landings, plus the pronunciation dictionary `terminal_rhymes`, CMUdict, matching every phone from the final stressed vowel), a chain with the previous bar's end, internal pairs, multisyllabic pairs; a long transcript needs two end pairs | *no rhyme evidence — the bar does not land a rhyme* (required at strength ≥ 0.45) |
+| **rhyme** (`rap_rhyme_evidence`) | end pairs across bars — the spelling reading (`_rap_slant`), the perfect pronunciation dictionary (`terminal_rhymes`, CMUdict, every phone from the final stressed vowel), and since 2026-09-08 the **near reading** (`terminal_near_rhymes`: the same final stressed vowel with codas equal once voicing and manner fold, or differing by one non-liquid insertion — *proof/move*, *down/found*, *lit/shift*, *stay/ways*) — plus a chain with the previous bar's end, internal pairs, multisyllabic pairs; a long transcript needs two end pairs. A **vocative tag** after the bar's last comma no longer hides the landing (`_rap_untag`). Two fragments of three words or fewer still need a full coda, *calm/harm* and *being/feeling* stay refused, and identical landings are never a rhyme | *no rhyme evidence — the bar does not land a rhyme* (required at strength ≥ 0.45) |
 | **transformation** | lexical distance ≥ 0.18, no five-word run of the source kept verbatim, cadence or lexicon or length changed — **or**, since this evening, a proved end rhyme the source did not have (`rhyme_added`) | *rhetoric was not materially transformed* |
 | **copying** | no six-word phrase lifted from the style passages | *copied a prohibited six-word source phrase* |
 | **lexicon** (strength ≥ 0.75) | a word borrowed from the crystal's vocabulary | strict grade only; advisory under meaning |
@@ -337,10 +378,10 @@ A tinted round is voiced one turn at a time into **takes**, each a clip in the p
 
 | store | what | file | life |
 |---|---|---|---|
-| **larder** `_LARDER` | banked booth rounds (banter), each an entry with `script_plain`, `script`/`script_tinted`, `tint`, `tint_progress`, `keys`/`takes`, `at`, `aired`, `profile` | `data/larder.json` | plain: 90 min unaired (`larder_fresh`), 72 h as an aired repeat; **rhymed: 96 h** (`keep_until`); cap `larder_cap()` (14 × hours dial) for stock **plus** up to 80 rhymed rows of repertoire (`larder_trim`) |
-| **shelf** `_SHELF[kind]` | prepared rows per kind: ad, station_id, manager, caller, gallery, news, track_talk, recap… (`SHELF_CAPS`) | `data/prep_shelf.json` | unheard 72 h, aired repeat 72 h, news 3 h (`stock_expires_at`); rhymed 96 h; reusable kinds rest 3 h between airings (`SHELF_REUSE_REST`, floor 1 h) with 3 innings, 12 for evergreen kinds and for any rhymed row |
+| **larder** `_LARDER` | banked booth rounds (banter), each an entry with `script_plain`, `script`/`script_tinted`, `tint`, `tint_progress`, `keys`/`takes`, `at`, `aired`, `profile` | `data/larder.json` | plain: 90 min unaired (`larder_fresh`), 72 h as an aired repeat; **rhymed: kept until the operator releases it** (`keep_until` = 2100-01-01; 96 h before 2026-09-09); cap `larder_cap()` (14 × hours dial) for stock **plus** up to 160 rhymed rows of repertoire (`larder_trim`) - 160 and not more because a round costs **69 kB of JSON** measured live, and `_larder_save` writes the whole file on the event loop |
+| **shelf** `_SHELF[kind]` | prepared rows per kind: ad, station_id, manager, caller, gallery, news, track_talk, recap… (`SHELF_CAPS`) | `data/prep_shelf.json` | unheard 72 h, aired repeat 72 h, news 3 h (`stock_expires_at`); **rhymed: kept until released**; reusable kinds rest 3 h between airings (`SHELF_REUSE_REST`, floor 1 h) with 3 innings, 12 for evergreen kinds and for any rhymed row |
 | **pantry** `_PANTRY` | rendered clips keyed by (text, voice, engine) — `pantry_key` | `data/pantry.json` + `media/` | `pantry_life()` = 90 min floor to 24 h, unless something viable or waiting on the desk holds the clip; 600–4,000 rows, 6 GiB |
-| **gold bars** `_GOLD` | a rhymed line that aired, with its exact take | `data/gold_bars.json` | 400 rows, each rests 20 min (5 min on the dead-air road); the audio is protected from the media sweep |
+| **gold bars** `_GOLD` | a rhymed line that aired, with its exact take | `data/gold_bars.json` | **the bound spends the TAKE, never the line** (2026-09-09). Past `GOLD_MAX` (2,000) the most-fired bars give their audio back and keep their words; a bar nobody has heard keeps its take. `GOLD_TEXT_MAX` 20,000 lines. Each rests 20 min (5 min on the dead-air road) and its audio is protected from the media sweep - and since #1157 that protection is **not** charged against `VOICE_KEEP_BYTES`, which is what would otherwise have let a growing bank eat the rolling buffer every other road plays out of, in 12.7 days |
 | **continuity reserve** | 14 fixed two-host pairs, rapped through the crystal | `data/continuity.json` | each line rests an hour |
 | **hold shelf** `_BOX_HOLD` | clips waiting for the box | `data/box_hold.json` | drained six at a time |
 | **resume reel** `_REEL` | one welded clip for the unpause | — | rebuilt when consumed |
@@ -355,8 +396,44 @@ rewrite" that counts against stocking caps and holds clips.
 
 **Why things used to vanish.** Every expiry rule was written for a ninety-minute cache and none knew a
 round was rhymed; the writing contract carries the plot's act, and an act rolling over rebound the
-larder to viable rows — 22 rhymed rounds went in one tick at 13:54 today. Both are closed: the
-96-hour keep, the desk on every deletion road, the contract yielding to the keep.
+larder to viable rows — 22 rhymed rounds went in one tick at 13:54 today. The 96-hour keep, the desk on the deletion roads and the contract yielding to the keep were
+built that night to close it.
+
+**Why that fix did not hold, audited 2026-09-09 (#1157).** This document claimed "the desk on every
+deletion road". It was not true. The retirement desk had never recorded one row in its life - no
+`data/retire_ledger.json`, zeros on `/api/retire` - while the caller shelf fell 16 -> 13 -> 10 -> 9.
+Both facts were true at once for one reason: `resort_may_drop` returned `False` for a rhymed row
+**above** its own call to `retire_may`, so the only shelf-side road to the desk was unreachable for
+exactly the work the desk exists to protect. The silence was not the desk working. It was the desk
+never being asked.
+
+Six other roads destroyed rhymed work without consulting either function. Four were reproduced
+against the real module before being closed:
+
+| road | what it took | now |
+|---|---|---|
+| `shelf_take` caller burn-on-take | the whole prepared call, on dispatch | a rhymed call is stamped and sent to the **back**. The #1033 re-air queue was dead code until this, because no caller row could ever carry `aired_at` |
+| `alt_shelf_trim` "rejected" branch | any row `dialogue_row_viable` refused - rhymed ones **first**, above the #1091 pin sweep | skips a `gold_locked` row |
+| `coord_retire` larder branch | an aired rhymed round inside its keep | skips a `gold_locked` entry |
+| `gold_note` `del rows[:-GOLD_MAX]` | the oldest gold bars, silently, reaching its cap in under three days | releases the **take** of the most-fired bar; no line is deleted |
+| `reel_open` | the larder round the resume reel had just aired | stamps and keeps it |
+| four `except` fault paths | everything past the cap | lift rhymed work out of the cut first |
+
+**And the keep itself was a date.** 96 hours from first sight meant that on 2026-09-12 every shield
+in the station would switch off inside one minute and four days of backlog would be released at
+once. A keep is now a **rule** instead: `RETIRE_KEEP_FOREVER` (-1) on every kind but news, and
+`retire_keeps_forever` overrides an hours-stamp already written on a row - except one the operator
+set by hand on the desk, which outranks the default because it is a decision about that item.
+
+Two rules deliberately survive all of this. A **plain** row is still swept: the writer needs
+stocking slots, and `larder_prune_why` exists because a stale round's contract has moved and airing
+it is worse than silence. And a round that has **never aired** is still untouchable (`row_unaired`,
+#1075) - if it is old, that is an argument for airing it.
+
+**Nothing rhymed is lost when a container is.** `gold_harvest_entry` now runs before every
+ceiling-forced removal, every larder trim and every coordinator sweep, so a store running out of
+room costs the station a *round* and never a *bar*. Words cost about 250 kB a thousand; audio costs
+48 kB a second.
 
 ---
 
@@ -398,10 +475,43 @@ shingles) stands down while more than 35% of recent candidates are being blocked
 **Silence, and what fills it.** Two watchdogs: `dead_air_watch` (nothing playing, nobody
 speaking, nothing rendering for longer than the dead-air dial → kick the next record; a third
 strike restarts the show) and `talk_watch` (no cast line for `talk_quiet_limit()` → `cover_the_gap`).
-The cover order since this evening: the continuity reserve (a rapped two-host pair) → **a gold
-bar** (a rhymed line's own take, no render) → the SFX Guy's prepared liner → a sample → a live
-cover line rendered on the spot. Every silent tick past 12 s is punctuated with a clip that exists
-(`sfx_fill_gap`), even under a floor held for a render (samples only there).
+The cover order, corrected on 2026-09-08 night: a banked round → **a gold bar** (a rhymed line's own
+take, no render, 2,000 of them) → the SFX Guy's prepared liner → a sample → **the continuity
+reserve last**, as the emergency it is. It used to be tried second, and that is why eight lines aired
+more than a hundred times each in four days: a bank of 28 was being spent ahead of a bank of 400. A
+run of gold holds a **6-second median gap (86% inside ten seconds)**; a run of continuity holds a
+**32-second mean (46%)**, because it is rate-limited to one airing a minute.
+
+A gold bar may now also fill a gap **under the floor**, on the floorless announce road a sting uses —
+it is a clip that already exists. That case was 20% of all on-air time in which the station had 52
+minutes of finished rhymed audio on disk and was forbidden to play any of it. Only the *written*
+liner still waits for the floor.
+
+The rests that implement the operator's ten-second rule: detection at **4 s**
+(`TALK_INCESSANT_QUIET_MOST`, 8 before 2026-09-09) on a 2-second tick, the cover's own rest 3 s, `SFX_GAP_REST` 6 s, and
+the stock-first rule arming at 12 s. Measured before them: 56% of intermissions ran over ten seconds,
+and between rounds the rule was met zero times in 1,601 gaps.
+
+**The arithmetic that decides what can ever fill a hole.** Fitted over the last 600 renders,
+`render = 2.97 + 1.05 x audio` seconds. The marginal term is **above one**: the engine is slower
+than speech, so continuously live-rendered talk is impossible at any budget - a ceiling of about 41
+minutes an hour at 100% duty. Measured against it, the station *speaks* 9.6 minutes an hour and
+*makes* 9.7 minutes an hour of audio, and `render_replay.json` reports `uses: 1` for all 600 of the
+last renders: every second of speech is synthesised fresh for exactly one airing. There is no
+buffer. The GPU is idle 46 minutes an hour and the station is silent 50, at the same time.
+
+Only **banked** audio has no such ceiling, which is why #1157 spends its effort on the bank rather
+than on the engine: gold speaks under a held floor, `ENGINE_BUDGET` went 3 -> 5 so preparation has
+three booths instead of one (76 of 87 prepared rounds held no audio at all), and rhymed work stopped
+being deleted. `cover_the_gap` also used to return `False` whenever `_floor_busy()` - which is
+precisely when the holes are, because the floor is held across a render for about 44 seconds of wall
+clock. A held floor is not a talking mouth: after `FLOOR_QUIET_SECONDS` (3 s) of real silence the
+bank now speaks into it without taking the floor.
+
+**How much of that is real silence.** Inside a round, four phrases in five are already back to back:
+over 2,231 seams the median true silence (the gap minus how long the first phrase takes to say, at a
+measured 15.0 characters a second) is **−0.6 s**, and 1,475 seams have none at all. The audible
+holes are the other fifth — 447 seams over two seconds, 90 of them over ten.
 
 ---
 
@@ -433,12 +543,13 @@ cover line rendered on the spot. Every silent tick past 12 s is punctuated with 
 | per-line asks under the hold | 3 | asks per line per pass | code (#1064) |
 | `OLLAMA_LANES` / `OLLAMA_NUM_PARALLEL` | 1 / 1 | decode slots; the tint cap is lanes + 3 waiting | compose / systemd |
 | `SHELF_REUSE_REST` | 3 h (floor 1 h) | rest between airings of a repeat | settings |
-| `TINTED_KEEP_SECONDS` / `TINTED_KEEP_ROWS` | 96 h / 80 | the rhymed keep and the repertoire's room | env, retirement desk rules |
-| retirement rules per kind | ask rhymed / 96 h / 12 airings; news never | who is asked before a deletion | `/cupboard/retire` |
-| `GOLD_REST` / `GOLD_GAP_REST` / `GOLD_MAX` | 20 min / 5 min / 400 | how often a bar comes back, how many are kept | code |
+| `RETIRE_KEEP_FOREVER` / `TINTED_KEEP_ROWS` | **for good** / 160 | the rhymed keep and the repertoire's room | env, retirement desk rules |
+| retirement rules per kind | ask rhymed / **for good** / 12 airings; news never | who is asked before a deletion | `/cupboard/retire` (-1 h = for good, 0 = no keep) |
+| `GOLD_REST` / `GOLD_GAP_REST` / `GOLD_MAX` / `GOLD_TEXT_MAX` | 20 min / 5 min / 2,000 takes / 20,000 lines | how often a bar comes back; the cap falls on the audio, never on the words | code |
 | `SFX_GAP_REST`, `sfx_gap` | 9 s / dial | rest between gap clips | env / settings |
 | `REFLECTION_EVERY` | 1 h per road | how often the orchestrator reflects | env |
-| `dead_air_seconds`, `talk_quiet_limit` | dial / 95 s (12 s at full talk) | when silence becomes a fault | settings |
+| `dead_air_seconds`, `talk_quiet_limit` | dial / 95 s (**4 s** at full talk) | when silence becomes a fault | settings |
+| `ENGINE_BUDGET` / `FLOOR_QUIET_SECONDS` | 5 / 3 s | renders in flight (live keeps 2, preparation gets the rest); how long a held floor may be silent before the bank speaks | env |
 
 ---
 
@@ -447,6 +558,7 @@ cover line rendered on the spot. Every silent tick past 12 s is punctuated with 
 | surface | what it shows |
 |---|---|
 | **🎛 RapAssembly** (the 3js rail, `/api/rapassembly`) | this whole line as ten lit stations with packets travelling the hand-offs off the pipeline diary — asks, verdicts, renders, lines, covers, reflections — and a rail with every number below |
+| `data/rhyme_families.json` (via `pine_rhyme.load`) | the crystal's rhyme families and what each landing's distinctive partners are; `/api/tint` reports whether it is built |
 | `/api/tint` | coverage this hour, the fault memo, strikes, lanes, the material window |
 | `/api/dj` → `dialogue_flow` | ready/target, blockers, `repertoire`, `gap_filler`, `retire` |
 | `/api/orchestrator/logic` | the pipeline stages (ready / awaiting tint / rewriting / recording / needs replacement), writers, deferrals |

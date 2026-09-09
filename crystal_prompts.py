@@ -160,7 +160,24 @@ def _register(kind):
     fifth of its content words. The register names what a printed paragraph
     must keep; priority 1 above still governs meaning."""
     if str(kind or "") != "paper":
-        return ""
+        # 2026-09-09 (#1157): the operator - "have them cuss more and use
+        # swears and language like the crystal." Measured across 199 tint
+        # turns, the deep model proposed a swear ZERO times: not refused
+        # anywhere (no stop list in the station holds one), never written,
+        # because nothing ever asked for the register. The style world runs
+        # 14.8 profane and 13.6 slang words per thousand; the air runs 0.96
+        # and 3.6, and the RHYMED material is the cleanest thing on the
+        # station at 0.69. Ten bars written in the crystal's register passed
+        # the real grader 7/10 - exactly the same as their clean twins - so
+        # this costs nothing at the meaning gate.
+        return ("Register: this is a spoken bar on a late-night radio station, not a press "
+                "release. Write it in the style world's own mouth - its slang, its "
+                "contractions, its dropped g's, and its profanity where the line earns one. "
+                "A swear is ordinary vocabulary here and may carry the landing. What is not "
+                "the register, and is never written: cruelty aimed at a real person, or at "
+                "anyone's race, sex or religion. Aim the heat at the situation - the memo, "
+                "the gear, the hour, each other. The facts above still govern: coarse words "
+                "change how a thing is said, never what was said.\n")
     return ("Register: this is a PRINTED newspaper paragraph, not a spoken turn. Third person, "
             "no vocatives, no 'you', no greetings, no radio sign-offs, no speaker labels. Keep the "
             "sentence count: write each source sentence as its own bar or couplet, in the same "

@@ -20,25 +20,42 @@ class RecordingExecutionTests(unittest.IsolatedAsyncioTestCase):
         self.stack.enter_context(mock.patch.object(app, "station_flow_event"))
         self.stack.enter_context(mock.patch.object(app, "pipeline_log"))
 
+    # 2026-09-09 (#1157): these two pinned the ARITHMETIC of ENGINE_BUDGET 3
+    # rather than the two rules underneath it, so raising the budget - the
+    # change that lets preparation bank audio at all - read as a break. The
+    # rules are: live always keeps two slots, and one engine renders one
+    # thing at a time. Both are now pinned against the dial, not the number.
+    ENGINES = ("xtts", "f5", "piper", "vox", "tone", "reed", "brass", "hush")
+
     def test_live_reserves_two_slots_and_never_exceeds_capacity(self):
         with mock.patch.object(app, "radio_paused", return_value=False):
-            self.assertTrue(app.engine_prep_take("xtts"))
-            self.assertFalse(app.engine_prep_take("f5"))
+            limit = app.recording_booths()["prep_limit"]
+            self.assertEqual(limit, max(1, app.ENGINE_BUDGET - 2),
+                             "live keeps two slots whatever the budget is")
+            taken = list(self.ENGINES[:limit])
+            for name in taken:
+                self.assertTrue(app.engine_prep_take(name), name)
+            self.assertFalse(app.engine_prep_take("one-too-many"))
             app.engine_live_enter()
             app.engine_live_enter()
-            self.assertEqual(app.engine_inflight(), 3)
-            self.assertFalse(app.engine_prep_take("piper"))
-            app.engine_prep_give("xtts")
+            self.assertEqual(app.engine_inflight(), limit + 2)
+            self.assertFalse(app.engine_prep_take("still-no"))
+            for name in taken:
+                app.engine_prep_give(name)
             self.assertEqual(app._ENGINE_PREP_BY, {})
 
     def test_paused_engines_are_independent_but_same_engine_is_serial(self):
         with mock.patch.object(app, "radio_paused", return_value=True):
+            limit = app.recording_booths()["prep_limit"]
+            self.assertEqual(limit, app.ENGINE_BUDGET,
+                             "off air there is no live road to reserve for")
             self.assertTrue(app.engine_prep_take("xtts"))
-            self.assertFalse(app.engine_prep_take("xtts"))
-            self.assertTrue(app.engine_prep_take("f5"))
-            self.assertTrue(app.engine_prep_take("piper"))
-            self.assertFalse(app.engine_prep_take("other"))
-            self.assertEqual(app.engine_inflight(), 3)
+            self.assertFalse(app.engine_prep_take("xtts"),
+                             "one engine renders one thing at a time")
+            for name in self.ENGINES[1:limit]:
+                self.assertTrue(app.engine_prep_take(name), name)
+            self.assertFalse(app.engine_prep_take("one-too-many"))
+            self.assertEqual(app.engine_inflight(), limit)
 
     def test_generic_production_booth_is_exclusive_with_named_prep_lanes(self):
         with mock.patch.object(app, "radio_paused", return_value=True):

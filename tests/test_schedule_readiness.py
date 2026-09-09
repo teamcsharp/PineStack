@@ -969,7 +969,11 @@ A: Doreen, thank you for calling. Keep June close and stay with Pine Box FM."""
             # tick plus the announce cannot meet it by arithmetic. Eight
             # leaves a ten-to-eleven-second worst case. Measured before the
             # change: 56% of intermissions ran over ten seconds.
-            self.assertEqual(app.talk_quiet_limit(), 8.0)
+            # 2026-09-09 (#1157): four, not eight. At eight, detection plus
+            # the two-second tick plus the announce spends the whole
+            # ten-second allowance on NOTICING and leaves nothing for the
+            # announce itself to be late in.
+            self.assertEqual(app.talk_quiet_limit(), 4.0)
             self.assertEqual(app.talk_watch_tick(), 2.0)
 
     def test_full_talk_replaces_live_only_round_with_recorded_talk(self) -> None:

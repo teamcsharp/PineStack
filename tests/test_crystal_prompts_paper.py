@@ -19,11 +19,22 @@ class PaperRegisterTests(unittest.TestCase):
                                'world', [{'text': 'sample'}], 0.88, 'paper')
         self.assertIn('PRINTED newspaper paragraph', grouped)
 
-    def test_spoken_roads_are_unchanged(self):
+    def test_spoken_roads_never_get_the_PRINT_register(self):
+        """2026-09-09 (#1157): a spoken road now carries a register too - the
+        operator asked for the style world's own mouth, swearing included,
+        and measured across 199 tint turns the model had proposed a swear
+        zero times because nothing ever asked. What must stay true is that
+        the two registers are never confused: print is third-person with no
+        vocatives, and that must never reach a spoken bar."""
         for kind in ('', 'banter', 'caller', 'ad', 'news', 'sfxguy'):
             prompt = turn_prompt(self.SOURCE, 'world', [{'text': 'sample'}], 0.88, kind)
             self.assertNotIn('PRINTED newspaper paragraph', prompt, kind)
-            self.assertNotIn('Register:', prompt, kind)
+            self.assertNotIn('no radio sign-offs', prompt, kind)
+            self.assertIn('spoken bar on a late-night radio station', prompt, kind)
+
+    def test_the_print_register_never_carries_the_spoken_one(self):
+        prompt = turn_prompt(self.SOURCE, 'world', [{'text': 'sample'}], 0.88, 'paper')
+        self.assertNotIn('spoken bar on a late-night radio station', prompt)
 
 
 if __name__ == '__main__':
