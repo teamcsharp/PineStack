@@ -136,6 +136,59 @@ Dials the operator can turn now, in order of what they return:
 | `paper_hourly` (the Gazette) | on | off while the stack is short | +2-4 rounds/h |
 | `generation_turns` (System2) | 6 | 8-10 | ~15% more bars per lane-hour |
 
+## The dials, set on the operator's word at 20:25 CST
+
+| dial | was | now | where it lives |
+|---|---|---|---|
+| judgment factor, the phone road | 2.0 | 1.0 | `POST /api/orchestrator/judgment {"road":"caller","move":"drop"}` |
+| judgment factor, the wire | 2.0 | 1.0 | the same, `"road":"news"` |
+| `prefer_road` (protected first) | caller | none | `data/orchestrator_policy.json` |
+| `drive_road` (built first until covered) | caller | none | the same file |
+| `reuse_rest` (a repeat's rest, and the cover pool's gate) | 3 h | 1 h | the same file |
+| System2 `generation_turns` | 6 | 9 | `POST /api/system2/settings` |
+| `paper_hourly` (the Gazette) | on | off | `data/settings.json`, `dj.paper_hourly` |
+
+The phone road was pinned twice over — as the protected road and as the road built first — and its
+judgment factor was doubled, while its measured return was 0.02 seconds of air per second of room
+and 174 deep asks for no ready call. The operator's standing words ("from now on I want more
+callers on the show") stay in the judgment book; only the factor is level.
+
+`reuse_rest` matters in a place the repeat rest itself does not: the **cover pool** at the
+`shelf_reuse_rest()` gate, which decides which rested repeats may cover a bare running-order entry.
+At three hours it held the 59 kept rhymed rounds out of the pool for most of the hour, which is why
+thirteen of fourteen recent misses read "no cover aired". The rest at the take door was already an
+hour, because `repeats_hard` is on.
+
+Nothing here is in the writing contract (`_larder_profile_signature` is the reply budget, the turn
+range, the swath dials, the crystal and the plot act), so no stored round was invalidated.
+
+**To revert:** the two judgment factors with `"move":"drop"` again after setting them back with
+`"more"`, and `cp /tmp/dials/settings-before.json data/settings.json`,
+`cp /tmp/dials/policy-before.json data/orchestrator_policy.json`, then a restart. The Gazette comes
+back with `dj.paper_hourly = true` alone.
+
+### What the test found that the dials could not reach
+
+With the dials in force the five fully rapped calls were still non-viable, and nothing was going to
+change that: **a call's verdict lives in its own meta**, and the only road that re-grades it runs
+inside `ensure_entry_tinted` — which is only reached when the row is prepared, and a non-viable row
+is not prepared. The verdict made before the richness legs became advisory would have stood until
+the row expired.
+
+`call_entry_recheck()` closes it: a call that is rapped (`use == "tinted"`, coverage met) and
+carries a failing verdict is re-read against today's contract. Deterministic, no model, no audio,
+six rows a pass, on the same ten-minute clock as the queue sweep and on
+`POST /api/orchestrator/rejections/regrade`. Live on the first run:
+
+| | |
+|---|---|
+| rapped calls re-read | 6 |
+| now ready | **5** (Nagoya, Loleatta, Milan, Tunis, Ferret — 55 accepted bars) |
+| still held | 1 (Crazy Pete: *tint turn 3 lost a name* — a fidelity fault, correctly refused) |
+
+The lesson is general: **any verdict a round stores about itself needs a road that re-reads it when
+the rule changes.** The cut lines had one since this evening (the re-grade sweep); the calls did not.
+
 ## What must not change
 
 The hold and 100% coverage; the 96-hour keep and the retirement desk on every deletion road; the

@@ -94883,6 +94883,55 @@ def line_review_regrade_pending(limit: int = 400, gone_after: float = 1800.0) ->
     return out
 
 
+def call_entry_recheck(most: int = 6) -> dict[str, Any]:
+    """2026-09-08 (the scan): re-read a RAPPED call against today's phone
+    contract. A call's verdict is stored in its own meta, and nothing
+    re-grades a call that is already non-viable - the row is not prepared,
+    so `ensure_entry_tinted` never runs, so the verdict never moves. Five
+    calls of eleven accepted bars each sat on the shelf tonight behind a
+    verdict made before the richness legs became advisory. Deterministic:
+    no model, no audio, bounded per pass."""
+    out = {"seen": 0, "now_ready": 0, "still": 0}
+    try:
+        rows = list((_SHELF.get("caller") or []))
+    except Exception:  # noqa: BLE001
+        return out
+    changed = False
+    for row in rows:
+        if out["seen"] >= max(1, int(most)):
+            break
+        try:
+            entry = dialogue_entry(row) or row
+            if not isinstance(entry, dict) or not entry.get("caller_name"):
+                continue
+            meta = entry.get("call") or {}
+            if (meta.get("quality") or {}).get("ok"):
+                continue                        # already good
+            if str(entry.get("use") or "") != "tinted":
+                continue                        # not rapped yet; the tint owns it
+            if not (entry.get("tint") or {}).get("coverage", {}).get("met"):
+                continue
+            out["seen"] += 1
+            report = call_entry_regrade(entry, include_shelf=True)
+            changed = True
+            if report.get("ok"):
+                out["now_ready"] += 1
+                pipeline_log("call", f"the rapped call from {entry.get('caller_name')} passes today's "
+                             "phone contract and goes back on the shelf ready"
+                             + (" (advisories: " + "; ".join(report.get("soft_faults") or [])[:120] + ")"
+                                if report.get("soft_faults") else ""))
+            else:
+                out["still"] += 1
+        except Exception:  # noqa: BLE001
+            continue
+    if changed:
+        try:
+            _pantry_save(True)
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 def _regrade_say(got: dict[str, Any]) -> None:
     try:
         moved = sum(int(got.get(k) or 0) for k in ("passes_now", "read_plain", "round_gone", "superseded"))
@@ -94913,6 +94962,17 @@ async def regrade_once() -> None:
                 raise
             except Exception:  # noqa: BLE001
                 pass
+            try:
+                # 2026-09-08: and the rapped calls held behind a stored
+                # verdict older than today's contract.
+                calls = call_entry_recheck()
+                if calls.get("now_ready"):
+                    pipeline_log("call", f"{calls['now_ready']} rapped call(s) were re-read against "
+                                 f"today's phone contract and stand ready ({calls.get('still', 0)} still held)")
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                pass
             await asyncio.sleep(max(60.0, REGRADE_EVERY))
     except asyncio.CancelledError:
         raise
@@ -94926,6 +94986,10 @@ async def api_line_reviews_regrade(authorization: str | None = Header(default=No
     require_auth(authorization)
     got = await asyncio.to_thread(line_review_regrade_pending)
     _regrade_say(got)
+    try:
+        got["calls"] = call_entry_recheck(most=16)      # 2026-09-08: the rapped calls too
+    except Exception:  # noqa: BLE001
+        pass
     return got
 
 

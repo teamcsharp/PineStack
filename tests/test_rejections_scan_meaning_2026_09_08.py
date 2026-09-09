@@ -200,5 +200,46 @@ class CallContract(unittest.TestCase):
         self.assertIn("the caller does not introduce themselves", bare["faults"])
 
 
+class RappedCallRecheck(unittest.TestCase):
+    def test_a_rapped_call_held_by_a_stale_verdict_is_re_read(self):
+        entry = {"caller_name": "Salem", "use": "tinted", "sid": "caller-test",
+                 "script": "A: line\nC: line", "script_plain": "A: line\nC: line",
+                 "tint": {"coverage": {"met": True, "accepted": 11, "cut": 0}},
+                 "call": {"quality": {"ok": False, "faults": [
+                     "fewer than two host questions pick up a concrete detail from the caller's prior answer"]}}}
+        held = {"caller_name": "Nagoya", "use": "tinted", "sid": "caller-held",
+                "script": "A: line\nC: line", "script_plain": "A: line\nC: line",
+                "tint": {"coverage": {"met": True}},
+                "call": {"quality": {"ok": False, "faults": ["tint turn 3 lost a name"]}}}
+        plain = {"caller_name": "Temple", "use": "plain", "sid": "caller-plain",
+                 "call": {"quality": {"ok": False, "faults": ["x"]}}}
+
+        def regrade(e, include_shelf=True):
+            ok = e is entry
+            e.setdefault("call", {})["quality"] = {"ok": ok, "faults": [] if ok else ["tint turn 3 lost a name"],
+                                                   "soft_faults": ["the topic is thin"] if ok else []}
+            return e["call"]["quality"]
+
+        with mock.patch.object(app, "_SHELF", {"caller": [{"entry": entry}, {"entry": held}, {"entry": plain}]}), \
+                mock.patch.object(app, "call_entry_regrade", regrade), \
+                mock.patch.object(app, "_pantry_save", mock.Mock()), \
+                mock.patch.object(app, "pipeline_log", mock.Mock()):
+            got = app.call_entry_recheck()
+        self.assertEqual((got["seen"], got["now_ready"], got["still"]), (2, 1, 1), got)
+        self.assertTrue(entry["call"]["quality"]["ok"])
+        self.assertFalse(held["call"]["quality"]["ok"])
+        # a call that has not been rapped yet belongs to the tint, not to this pass
+        self.assertEqual(plain["call"]["quality"]["faults"], ["x"])
+
+    def test_a_call_that_already_passes_is_left_alone(self):
+        good = {"caller_name": "Dizzy", "use": "tinted", "call": {"quality": {"ok": True}},
+                "tint": {"coverage": {"met": True}}}
+        with mock.patch.object(app, "_SHELF", {"caller": [{"entry": good}]}), \
+                mock.patch.object(app, "call_entry_regrade", mock.Mock(side_effect=AssertionError("must not re-grade"))), \
+                mock.patch.object(app, "_pantry_save", mock.Mock()):
+            got = app.call_entry_recheck()
+        self.assertEqual(got["seen"], 0, got)
+
+
 if __name__ == "__main__":
     unittest.main()
