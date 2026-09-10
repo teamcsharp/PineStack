@@ -99147,6 +99147,229 @@ async def api_director_script_rhyme_accept(sid: str, payload: dict[str, Any]
                       if failed else "")}
 
 
+def _director_seat_key(marker: str) -> str:
+    """The same mapping speak_turns uses (`_who_of`), for take matching."""
+    one = str(marker or "").strip().upper()[:1]
+    return ("caller" if one == "C" else "caller2" if one == "E"
+            else "dj" if one == "A" else "third" if one == "D" else "cohost")
+
+
+def director_seat_voice(entry: dict[str, Any], marker: str) -> tuple[str, str]:
+    """The voice and engine this seat is already recorded in.
+
+    Taken from the round's OWN takes rather than from settings: a round cut
+    in one cast must stay in that cast, or half of it comes back in a
+    different mouth. Falls back to any voice the round has, because a round
+    in one voice is still a round."""
+    who = _director_seat_key(marker)
+    takes = [t for t in (entry.get("takes") or []) if isinstance(t, dict)]
+    mine = [t for t in takes if str(t.get("who") or "") == who]
+    for take in (mine + takes):
+        voice = str(take.get("voice") or "")
+        if not voice:
+            continue
+        engine = next((e for e in DIRECTOR_ENGINES
+                       if pantry_key(str(take.get("text") or ""), voice, e)
+                       == str(take.get("key") or "")), "xtts")
+        return voice, engine
+    return "", "xtts"
+
+
+def director_rewrite_script(kind: str, row: dict[str, Any],
+                            entry: dict[str, Any], turns: list[Any],
+                            why: str) -> dict[str, Any]:
+    """Replace a round's whole script and rebuild its takes to match.
+
+    THE POINT OF DOING IT THIS WAY. Takes are content-addressed on
+    `pantry_key(text, voice, engine)`, so a rebuilt take list re-keys every
+    turn - and a turn whose words did not change gets back the SAME key it
+    had, which is still in the pantry. The round therefore keeps every
+    recording it can and pays the engine only for lines that actually
+    changed or are new. That is what makes sending a script back to the
+    writing room affordable: a rewrite touching three turns of eleven costs
+    three lines, not a round.
+
+    `made` is set to what is genuinely recorded, so a round now short of
+    audio is honestly not ready and goes back through the recording room
+    rather than airing with holes in it."""
+    rows: list[dict[str, Any]] = []
+    lines: list[str] = []
+    have = 0
+    for marker, said in turns:
+        text = " ".join(str(said or "").split())
+        if not text:
+            continue
+        mark = str(marker or "A").strip().upper()[:1] or "A"
+        lines.append("%s: %s" % (mark, text))
+        voice, engine = director_seat_voice(entry, mark)
+        spoken = " ".join(spoken_text(text).split())
+        key = pantry_key(spoken, voice, engine) if voice else ""
+        if key and key in _PANTRY:
+            have += 1
+        rows.append({"i": len(rows), "text": spoken, "voice": voice,
+                     "who": _director_seat_key(mark), "key": key})
+    if not rows:
+        raise HTTPException(409, "the rewrite came back with nothing in it")
+    entry["script"] = "\n".join(lines)
+    entry["takes"] = rows
+    entry["chunks"] = len(rows)
+    entry["made"] = have
+    entry["keys"] = [r["key"] for r in rows if r["key"]]
+    entry["partial"] = have < len(rows)
+    # These are the operator's words now: nothing may hand them back to be
+    # reworded, and the tinted twin no longer describes them.
+    entry["freshened"] = True
+    entry.pop("script_tinted", None)
+    entry["use"] = "tinted"
+    for saver in (_larder_save, _pantry_save):
+        try:
+            saver()
+        except Exception:                          # noqa: BLE001
+            pass
+    pipeline_log("action", "a %s script went back through the writing room - "
+                 "%d of %d lines already have audio (%s)"
+                 % (kind, have, len(rows), why))
+    return {"turns": len(rows), "recorded": have,
+            "to_record": len(rows) - have}
+
+
+@app.post("/api/director/script/{sid}/revise")
+async def api_director_script_revise(sid: str, payload: dict[str, Any]
+                                     ) -> dict[str, Any]:
+    """Send a script back to the writing room with a note.
+
+    The note does BOTH jobs at once: it rewrites this script now, and it is
+    kept as a standing note on the road so the next one of these is written
+    knowing it. Having to tell the station the same thing twice is the
+    thing this room exists to stop."""
+    note = " ".join(str((payload or {}).get("note") or "").split())
+    if not note:
+        raise HTTPException(400, "a revision needs a note saying what to change")
+    keep_note = bool((payload or {}).get("standing", True))
+    kind, row, _c = await asyncio.to_thread(director_resolve, "", sid)
+    entry = dialogue_entry(row) or {}
+    if entry.get("frozen") or row.get("aired") or row.get("aired_at"):
+        row, entry = await asyncio.to_thread(director_fork_kept, kind, row,
+                                             entry)
+    caller_name = str(entry.get("caller_name") or "")
+    was = str(entry.get("script") or "")
+    turns = banter_turns(was, caller_name)
+    if not turns:
+        raise HTTPException(409, "that script has no turns to revise")
+    seats = sorted({str(m or "A").upper()[:1] for m, _t in turns})
+    prompt = (
+        "Rewrite this radio script. The person who runs the station has "
+        "read it and asked for this:\n\n    " + note[:600] + "\n\n"
+        "RULES:\n"
+        "1. Do what they asked. That instruction outranks anything the "
+        "script is currently doing.\n"
+        "2. Keep the SAME speakers in the same order, using the same "
+        "labels (" + ", ".join(seats) + "), and the same number of turns.\n"
+        "3. Keep every name, number and question the script owes, unless "
+        "the note is telling you to change them.\n"
+        "4. It is read aloud on a radio show. No stage directions, no "
+        "markdown, no commentary, no speaker names other than the "
+        "labels.\n\n"
+        "OUTPUT: the whole script, one turn per line, each line starting "
+        "with its speaker label and a colon. Nothing else.\n\n"
+        "THE SCRIPT AS IT STANDS:\n" + was[:6000])
+    try:
+        said = await ask_model(prompt, limit=max(900, len(was) + 400),
+                               mark={"kind": "writers room",
+                                     "why": note[:80]})
+    except Exception as exc:                       # noqa: BLE001
+        raise HTTPException(502, "the writing room could not be reached: %s"
+                            % type(exc).__name__)
+    fresh = banter_turns(str(said or ""), caller_name)
+    if len(fresh) < max(2, len(turns) // 2):
+        raise HTTPException(
+            502, "the writing room answered with %d turns against the %d it "
+                 "was given, so the script is left alone rather than half "
+                 "replaced" % (len(fresh), len(turns)))
+    got = await asyncio.to_thread(director_rewrite_script, kind, row, entry,
+                                  fresh, "note: " + note[:60])
+    if keep_note:
+        try:
+            await asyncio.to_thread(director_add, kind, note, "standing")
+        except Exception:                          # noqa: BLE001
+            pass
+    try:
+        await asyncio.to_thread(script_note_edit, script_key(sid), kind, -1,
+                                was[:1800],
+                                str(entry.get("script") or "")[:1800],
+                                seat="*")
+    except Exception:                              # noqa: BLE001
+        pass
+    return {"ok": True, "sid": sid, "kind": kind, **got,
+            "standing_note": keep_note,
+            "say": ("back from the writing room - %d turns, %d already have "
+                    "audio, %d to record%s"
+                    % (got["turns"], got["recorded"], got["to_record"],
+                       "; the note now governs every future " + kind
+                       if keep_note else ""))}
+
+
+@app.post("/api/director/script/{sid}/reseed")
+async def api_director_script_reseed(sid: str,
+                                     payload: dict[str, Any] | None = None
+                                     ) -> dict[str, Any]:
+    """Deal fresh speakerbox passages into a script that has gone flat.
+
+    Drawn the way the writing room draws them and DEALT the way it deals
+    them - cut into spoken-length pieces and passed round the seats
+    (_swath_deal), never one long turn in one mouth, which is the mistake
+    that put 82% of a measured six hours of airtime in the host's. Spread
+    through the round rather than stapled to the front, so the documents
+    arrive as interruptions rather than as a reading."""
+    how_many = max(1, min(4, int((payload or {}).get("passages") or 2)))
+    kind, row, _c = await asyncio.to_thread(director_resolve, "", sid)
+    entry = dialogue_entry(row) or {}
+    if entry.get("frozen") or row.get("aired") or row.get("aired_at"):
+        row, entry = await asyncio.to_thread(director_fork_kept, kind, row,
+                                             entry)
+    caller_name = str(entry.get("caller_name") or "")
+    was = str(entry.get("script") or "")
+    turns = [[str(m or "A").upper()[:1], str(t or "")]
+             for m, t in banter_turns(was, caller_name)]
+    if not turns:
+        raise HTTPException(409, "that script has no turns to seed into")
+    seats = _swath_seats(was, caller_name)
+    added, files = 0, []
+    for _ in range(how_many):
+        try:
+            drawn = await speakbox_quote(most=6, cap=420)
+        except Exception:                          # noqa: BLE001
+            drawn = {}
+        text = " ".join(str((drawn or {}).get("text") or "").split())
+        if not text:
+            continue
+        dealt = _swath_deal(text, seats)
+        if not dealt:
+            continue
+        # Somewhere inside the round, never before the first turn or after
+        # the last: the open and the close are the round's own job.
+        at = random.randint(1, max(1, len(turns) - 1))
+        turns[at:at] = [[m, p] for m, p in dealt]
+        added += len(dealt)
+        files.append(str(drawn.get("file") or ""))
+        try:
+            speakbox_remember(drawn)
+        except Exception:                          # noqa: BLE001
+            pass
+    if not added:
+        raise HTTPException(502, "the speakerbox had nothing to give - the "
+                                 "shelf may be empty, or every line on it is "
+                                 "inside its repeat window")
+    got = await asyncio.to_thread(director_rewrite_script, kind, row, entry,
+                                  turns, "reseeded from the speakerbox")
+    return {"ok": True, "sid": sid, "kind": kind, "added": added,
+            "documents": [f for f in files if f], **got,
+            "say": ("%d passage turn(s) dealt in from %s - %d of %d lines "
+                    "already have audio, %d to record"
+                    % (added, ", ".join(f for f in files if f) or "the shelf",
+                       got["recorded"], got["turns"], got["to_record"]))}
+
+
 @app.post("/api/director/script/{sid}/record")
 async def api_director_script_record(sid: str,
                                      payload: dict[str, Any] | None = None
@@ -135261,6 +135484,13 @@ async function scriptsOpen() {
 }
 
 function dirQueuePaint(got) {
+  /* 2026-09-10: "put an icon representing which round it's representing in
+   * the timeline, and also have them section out according to which section
+   * of the hour that they correlate to." Grouped by segment kind, each
+   * section headed with the SAME icon the running order uses for it
+   * (schedIcon), so a script and the entry it is for are recognisable as
+   * the same thing at a glance. Roads the hour asks for most come first. */
+  dirScreenplayCss();
   const {body, caption} = dirQueue;
   body.textContent = "";
   caption.textContent = got.say || "";
@@ -135269,35 +135499,56 @@ function dirQueuePaint(got) {
     body.appendChild(el("div", "muted", "No scripts on the shelf."));
     return;
   }
+  const groups = new Map();
   rows.forEach((r) => {
-    const card = el("div", "dir-row", "");
-    const waiting = !r.review.seen && !r.kept && !r.aired;
-    if (waiting) card.classList.add("bare");
-    card.style.cursor = "pointer";
-    const head = el("div", "dir-head", "");
-    if (waiting) head.appendChild(el("span", "dir-chip warn", "● new"));
-    head.appendChild(el("span", "dir-name", r.kind));
-    head.appendChild(el("span", "dir-when",
-      r.turns + " turns · " + Math.round(r.seconds) + "s"));
-    if (r.is_tinted) head.appendChild(el("span", "dir-chip ok", "◆ tinted"));
-    else head.appendChild(el("span", "dir-chip", "◇ plain"));
-    if (r.kept) head.appendChild(el("span", "dir-chip", "kept"));
-    if (r.aired) head.appendChild(el("span", "dir-chip", r.aired + "x aired"));
-    if (r.review.approved) head.appendChild(el("span", "dir-chip ok", "✓ approved"));
-    if (r.review.bypass_tint) {
-      head.appendChild(el("span", "dir-chip warn", "past the tint"));
-    }
-    if (r.review.edits) {
-      head.appendChild(el("span", "dir-chip", r.review.edits + " edit"
-        + (r.review.edits === 1 ? "" : "s")));
-    }
-    card.appendChild(head);
-    const line = el("div", "dir-turn", r.head);
-    line.style.color = "#8fa6bd";
-    card.appendChild(line);
-    card.onclick = () => dirScriptOpen(r.sid);
-    body.appendChild(card);
+    if (!groups.has(r.kind)) groups.set(r.kind, []);
+    groups.get(r.kind).push(r);
   });
+  const order = Array.from(groups.keys()).sort(
+    (x, y) => groups.get(y).length - groups.get(x).length);
+  order.forEach((kind) => {
+    const mine = groups.get(kind);
+    const waiting = mine.filter(
+      (r) => !r.review.seen && !r.kept && !r.aired).length;
+    const head = el("div", "sp-group", "");
+    const icon = el("span", "", (typeof schedIcon === "function")
+      ? schedIcon(kind) : "🎚");
+    icon.style.fontSize = "15px";
+    head.appendChild(icon);
+    head.appendChild(el("b", "", kind));
+    head.appendChild(el("span", "", mine.length + " script"
+      + (mine.length === 1 ? "" : "s")
+      + (waiting ? " · " + waiting + " unread" : "")));
+    body.appendChild(head);
+    mine.forEach((r) => body.appendChild(dirQueueRow(r)));
+  });
+}
+
+function dirQueueRow(r) {
+  const card = el("div", "dir-row", "");
+  const waiting = !r.review.seen && !r.kept && !r.aired;
+  if (waiting) card.classList.add("bare");
+  card.style.cursor = "pointer";
+  const head = el("div", "dir-head", "");
+  if (waiting) head.appendChild(el("span", "dir-chip warn", "● new"));
+  head.appendChild(el("span", "dir-when",
+    r.turns + " turns · " + Math.round(r.seconds) + "s"));
+  head.appendChild(el("span", "dir-chip",
+    r.is_tinted ? "◆ tinted" : "◇ plain"));
+  if (r.kept) head.appendChild(el("span", "dir-chip", "kept"));
+  if (r.aired) head.appendChild(el("span", "dir-chip", r.aired + "x aired"));
+  if (r.review.approved) head.appendChild(el("span", "dir-chip ok", "✓ approved"));
+  if (r.review.bypass_tint) head.appendChild(el("span", "dir-chip warn", "past the tint"));
+  if (r.review.edits) {
+    head.appendChild(el("span", "dir-chip", r.review.edits + " edit"
+      + (r.review.edits === 1 ? "" : "s")));
+  }
+  card.appendChild(head);
+  const line = el("div", "dir-turn", r.head);
+  line.style.color = "#8fa6bd";
+  card.appendChild(line);
+  card.onclick = () => dirScriptOpen(r.sid);
+  return card;
 }
 
 async function dirScriptOpen(sid) {
@@ -135317,10 +135568,54 @@ async function dirScriptOpen(sid) {
       {method: "POST", body: JSON.stringify({kind: got.kind})});
     dirQueueTick();
   } catch (e) { /* the badge can lag */ }
+  dirScreenplayCss();
   body.textContent = "";
   caption.textContent = got.kind + " · " + (got.turns || []).length
     + " turns · " + Math.round(got.seconds || 0) + "s"
     + (got.kept ? " · kept material — edits fork it" : "");
+
+  /* THE NOTE THAT GOES BACK TO THE WRITING ROOM.
+   * "this script is talking about magnets, which doesn't make any sense.
+   *  And I would like it to have more speaker box text insertions."
+   * It does two jobs from one sentence: rewrites THIS script now, and is
+   * kept as a standing note on the road so the next one is written knowing
+   * it. Having to say the same thing twice is what this room is for. */
+  const noteBar = el("div", "sp-note", "");
+  const note = document.createElement("input");
+  note.type = "text";
+  note.placeholder = "Tell the writing room what is wrong with this script…";
+  const keep = document.createElement("label");
+  keep.style.cssText = "font-size:11px;display:flex;gap:4px;align-items:center";
+  const keepBox = document.createElement("input");
+  keepBox.type = "checkbox";
+  keepBox.checked = true;
+  keepBox.title = "Also keep this as a standing note on every future "
+    + got.kind;
+  keep.appendChild(keepBox);
+  keep.appendChild(document.createTextNode("keep for every " + got.kind));
+  const backToRoom = el("button", "", "Back to the writing room");
+  const postNote = async () => {
+    const text = note.value.trim();
+    if (!text) { note.focus(); return; }
+    backToRoom.disabled = true;
+    const said = backToRoom.textContent;
+    backToRoom.textContent = "rewriting…";
+    try {
+      const out = await api("/api/director/script/"
+        + encodeURIComponent(sid) + "/revise",
+        {method: "POST", body: JSON.stringify(
+          {note: text, standing: keepBox.checked})});
+      alert(out.say || "rewritten");
+      await dirScriptOpen(sid);
+    } catch (e) {
+      backToRoom.disabled = false; backToRoom.textContent = said;
+      alert("The writing room did not take it: " + e);
+    }
+  };
+  backToRoom.onclick = postNote;
+  note.onkeydown = (ev) => { if (ev.key === "Enter") postNote(); };
+  [note, keep, backToRoom].forEach((n) => noteBar.appendChild(n));
+  body.appendChild(noteBar);
 
   if ((got.notes || []).length) {
     const box = el("details", "", "");
@@ -135331,13 +135626,21 @@ async function dirScriptOpen(sid) {
       el("div", "dir-turn", (i + 1) + ". " + n.text)));
     body.appendChild(box);
   }
-  if ((got.beats || []).length) {
-    const shape = el("div", "dir-sub", "shape: "
-      + got.beats.map((b) => b.type).join(" → "));
-    body.appendChild(shape);
-  }
 
-  (got.turns || []).forEach((t) => body.appendChild(dirTurnRow(got, t)));
+  /* The page itself. */
+  const page = el("div", "sp-page", "");
+  const slug = el("div", "sp-slug", "");
+  const where = el("span", "", "INT. PINE BOX FM — "
+    + String(got.kind || "studio").replace(/_/g, " "));
+  const meta = el("small", "", (got.turns || []).length + " turns · "
+    + Math.round(got.seconds || 0) + "s"
+    + ((got.beats || []).length
+       ? " · " + got.beats.map((b) => b.type).join(" → ") : ""));
+  slug.appendChild(where);
+  slug.appendChild(meta);
+  page.appendChild(slug);
+  (got.turns || []).forEach((t) => page.appendChild(dirTurnRow(got, t)));
+  body.appendChild(page);
 
   /* WHAT CAN BE DONE TO THE WHOLE SCRIPT. */
   const foot = el("div", "dir-add", "");
@@ -135348,6 +135651,27 @@ async function dirScriptOpen(sid) {
    * second the station spent talking to a model. This is the same work in
    * a single call, so the cached preamble is read once and the queue is
    * waited on once. Nothing is applied until you take it. */
+  /* "Offer an option to have the script reseeded with random speaker box
+   * chunks inserted in the raw script to make it more randomized." Dealt
+   * across the seats and spread through the round, never stapled to the
+   * front in one mouth. */
+  const seed = el("button", "", "⟳ Re-seed from the speakerbox");
+  seed.title = "Draw fresh passages from the documents and deal them into "
+    + "this script. Lines that do not change keep their recordings.";
+  seed.onclick = async () => {
+    seed.disabled = true;
+    const said = seed.textContent;
+    seed.textContent = "drawing…";
+    try {
+      const out = await api("/api/director/script/" + encodeURIComponent(sid)
+        + "/reseed", {method: "POST", body: JSON.stringify({passages: 2})});
+      alert(out.say || "re-seeded");
+      await dirScriptOpen(sid);
+    } catch (e) {
+      seed.disabled = false; seed.textContent = said;
+      alert("Nothing was seeded: " + e);
+    }
+  };
   const rhyme = el("button", "", "◆ Rhyme the whole script");
   rhyme.title = "One pass through the rhyme lane. You see every line "
     + "before anything changes.";
@@ -135390,7 +135714,7 @@ async function dirScriptOpen(sid) {
       + "It goes to the recording room exactly as it reads on screen.")) return;
     dirSend(sid, true, raw);
   };
-  [rhyme, ok, send, raw].forEach((b) => foot.appendChild(b));
+  [seed, rhyme, ok, send, raw].forEach((b) => foot.appendChild(b));
   body.appendChild(foot);
   if (got.review.sent_to_record) {
     const said = el("div", "dir-sub", "already released to the recording room"
@@ -135484,26 +135808,94 @@ async function dirSend(sid, bypass, btn) {
   } catch (e) { btn.disabled = false; alert("Not released: " + e); }
 }
 
-function dirTurnRow(got, t) {
-  const wrap = el("div", "dir-turn", "");
-  wrap.style.cssText = "margin:3px 0;padding:3px 5px;border-radius:5px;"
-    + "border:1px solid rgba(255,255,255,.07)";
-  const line = el("div", "", "");
-  const seat = el("span", "dir-seat", t.who + ": ");
-  if (t.seat === "C" || t.seat === "E") seat.classList.add("c");
-  if (t.seat === "B") seat.classList.add("b");
-  line.appendChild(seat);
-  const words = el("span", "", t.text);
-  line.appendChild(words);
-  wrap.appendChild(line);
+/* --- 2026-09-10: THE SCRIPT LOOKS LIKE A SCRIPT -------------------------
+ *
+ * "present the scripts with a Script view that mirrors the style we use for
+ *  showing the hollywood style scripts. I want to see it looking like an
+ *  actual script"
+ *
+ * Screenplay format, because that is what this is: a slug line naming the
+ * scene, character cues centred over their dialogue, dialogue in a narrow
+ * measure. It is not decoration - a script laid out this way is read at a
+ * glance for who is carrying the scene and where a speaker runs long, which
+ * is exactly the judgement the operator is here to make. Courier because
+ * every page-count instinct anybody has is calibrated to it.
+ */
+function dirScreenplayCss() {
+  if (document.getElementById("dirPlayCss")) return;
+  const css = document.createElement("style");
+  css.id = "dirPlayCss";
+  css.textContent = [
+    ".sp-page{background:#f6f3ea;color:#141210;padding:26px 30px 34px;",
+    "border-radius:3px;font-family:'Courier New',Courier,monospace;",
+    "font-size:13px;line-height:1.45;max-width:760px;margin:0 auto;",
+    "box-shadow:0 2px 18px rgba(0,0,0,.45)}",
+    ".sp-slug{font-weight:700;letter-spacing:.06em;text-transform:uppercase;",
+    "border-bottom:1px solid rgba(0,0,0,.25);padding-bottom:6px;",
+    "margin:0 0 18px;display:flex;justify-content:space-between;gap:12px}",
+    ".sp-slug small{font-weight:400;letter-spacing:.02em;opacity:.65;",
+    "text-transform:none}",
+    ".sp-turn{margin:0 0 13px}",
+    ".sp-cue{text-transform:uppercase;letter-spacing:.09em;font-weight:700;",
+    "margin-left:34%;margin-bottom:1px}",
+    ".sp-para{margin-left:17%;margin-right:12%;white-space:pre-wrap}",
+    ".sp-paren{margin-left:26%;margin-right:20%;font-style:italic;",
+    "opacity:.7}",
+    ".sp-turn.sp-seed .sp-para{border-left:2px solid #7a9a4a;padding-left:8px}",
+    ".sp-tools{margin-left:17%;margin-top:2px;display:flex;gap:5px;",
+    "opacity:0;transition:opacity .12s}",
+    ".sp-turn:hover .sp-tools{opacity:1}",
+    ".sp-tools button{font-size:10px;padding:0 6px;line-height:1.6;",
+    "font-family:inherit;background:rgba(0,0,0,.06);color:#141210;",
+    "border:1px solid rgba(0,0,0,.25);border-radius:3px;cursor:pointer}",
+    ".sp-tools button:hover{background:rgba(0,0,0,.14)}",
+    ".sp-note{display:flex;gap:6px;margin:0 0 10px;align-items:center}",
+    ".sp-note input{flex:1;min-width:220px;font-size:12px;padding:5px 8px}",
+    ".sp-group{font-size:11px;letter-spacing:.06em;text-transform:uppercase;",
+    "color:#8fa6bd;margin:12px 0 5px;padding-bottom:3px;",
+    "border-bottom:1px solid rgba(255,255,255,.10);display:flex;gap:7px;",
+    "align-items:center}",
+    ".sp-group b{color:#d6e2ee;font-weight:600;letter-spacing:.02em;",
+    "text-transform:none}",
+    ".sp-when{font-variant-numeric:tabular-nums;opacity:.75}",
+  ].join("");
+  document.head.appendChild(css);
+}
 
-  const tools = el("div", "", "");
-  tools.style.cssText = "display:flex;gap:5px;margin-top:3px";
-  const rewrite = el("button", "", "✎ rewrite");
-  const tint = el("button", "", "◆ tint this line");
-  [rewrite, tint].forEach((b) => {
-    b.style.cssText = "font-size:10px;padding:0 6px;line-height:1.6";
+/* Wrap dialogue the way a page does: a narrow measure, broken on words. */
+function dirWrap(text, width) {
+  const words = String(text || "").split(/\s+/).filter(Boolean);
+  const lines = [];
+  let line = "";
+  words.forEach((w) => {
+    if (line && (line.length + 1 + w.length) > width) { lines.push(line); line = w; }
+    else line = line ? line + " " + w : w;
   });
+  if (line) lines.push(line);
+  return lines.join("\n");
+}
+
+/* The screenplay cue for a seat: the name the listener hears, in caps. */
+function dirCue(t) {
+  return String(t.who || t.seat || "").toUpperCase();
+}
+
+function dirTurnRow(got, t) {
+  const wrap = el("div", "sp-turn", "");
+  /* A turn that came straight out of the speakerbox is marked in the
+   * margin - it is the operator's own document rather than the room's
+   * invention, and it reads differently for that reason. */
+  if (t.from_speakbox) wrap.classList.add("sp-seed");
+  wrap.appendChild(el("div", "sp-cue", dirCue(t)));
+  const para = el("div", "sp-para", dirWrap(t.text, 58));
+  wrap.appendChild(para);
+  if (t.tinted) {
+    wrap.appendChild(el("div", "sp-paren", "(a tinted version is stored: "
+      + t.tinted.slice(0, 90) + ")"));
+  }
+  const tools = el("div", "sp-tools", "");
+  const rewrite = el("button", "", "rewrite");
+  const tint = el("button", "", "tint this line");
   tools.appendChild(rewrite);
   tools.appendChild(tint);
   wrap.appendChild(tools);
@@ -135512,18 +135904,17 @@ function dirTurnRow(got, t) {
     if (wrap.querySelector("textarea")) return;
     const area = document.createElement("textarea");
     area.value = t.text;
-    area.style.cssText = "width:100%;min-height:54px;font-size:12px;"
-      + "font-family:inherit;padding:3px 5px;margin-top:4px";
-    const save = el("button", "", "Save");
-    const stop = el("button", "", "Cancel");
-    [save, stop].forEach((b) => {
-      b.style.cssText = "font-size:10px;padding:0 6px;margin:3px 4px 0 0";
-    });
-    const bar = el("div", "", "");
+    area.style.cssText = "width:66%;margin-left:17%;min-height:64px;"
+      + "font-family:inherit;font-size:13px;padding:4px 6px;display:block";
+    const save = el("button", "", "save");
+    const stop = el("button", "", "cancel");
+    const bar = el("div", "sp-tools", "");
+    bar.style.opacity = "1";
     bar.appendChild(save); bar.appendChild(stop);
+    para.style.display = "none";
     wrap.appendChild(area); wrap.appendChild(bar);
     area.focus();
-    const shut = () => { area.remove(); bar.remove(); };
+    const shut = () => { area.remove(); bar.remove(); para.style.display = ""; };
     stop.onclick = shut;
     save.onclick = async () => {
       const text = area.value.trim();
@@ -135541,50 +135932,43 @@ function dirTurnRow(got, t) {
   tint.onclick = async () => {
     if (wrap.querySelector("[data-tint]")) return;
     tint.disabled = true;
-    tint.textContent = "◆ asking the crystal…";
+    const wasLabel = tint.textContent;
+    tint.textContent = "asking the crystal…";
     let out;
     try {
       out = await api("/api/director/script/" + encodeURIComponent(got.sid)
         + "/tint", {method: "POST", body: JSON.stringify({index: t.index})});
     } catch (e) {
-      tint.disabled = false; tint.textContent = "◆ tint this line";
+      tint.disabled = false; tint.textContent = wasLabel;
       alert("The crystal could not be reached: " + e);
       return;
     }
-    tint.textContent = "◆ tint this line";
+    tint.textContent = wasLabel;
     tint.disabled = false;
     const box = el("div", "", "");
     box.setAttribute("data-tint", "1");
-    box.style.cssText = "margin-top:5px;padding:4px 6px;border-radius:5px;"
-      + "border:1px solid rgba(168,224,124,.35);background:rgba(168,224,124,.06)";
+    box.style.cssText = "margin-left:17%;margin-right:12%;margin-top:6px;"
+      + "padding:6px 8px;border-left:3px solid #6a8a3a;background:rgba(0,0,0,.05)";
     if (!out.changed) {
-      box.appendChild(el("div", "dir-sub", out.say));
-      if ((out.faults || []).length) {
-        box.appendChild(el("div", "dir-sub", "— " + out.faults.join("; ")));
-      }
-      const shut = el("button", "", "Close");
-      shut.style.cssText = "font-size:10px;padding:0 6px;margin-top:3px";
+      box.appendChild(el("div", "", out.say));
+      const shut = el("button", "", "close");
+      shut.style.cssText = "font-size:10px;margin-top:4px;font-family:inherit";
       shut.onclick = () => box.remove();
       box.appendChild(shut);
       wrap.appendChild(box);
       return;
     }
-    const tinted = el("div", "", "");
-    tinted.style.color = "#a8e07c";
-    tinted.textContent = out.tinted;
-    box.appendChild(el("div", "dir-sub", "the crystal would make it:"));
-    box.appendChild(tinted);
+    box.appendChild(el("div", "sp-paren", "(the crystal would make it)"));
+    box.appendChild(el("div", "", dirWrap(out.tinted, 58)));
     if ((out.faults || []).length) {
-      const f = el("div", "dir-sub", "its own grader objects: "
-        + out.faults.join("; "));
-      f.style.color = "#e0a35c";
-      box.appendChild(f);
+      box.appendChild(el("div", "sp-paren",
+        "(its own grader objects: " + out.faults.join("; ") + ")"));
     }
-    const take = el("button", "", "Take it");
-    const no = el("button", "", "Leave it plain");
-    [take, no].forEach((b) => {
-      b.style.cssText = "font-size:10px;padding:0 7px;margin:5px 5px 0 0";
-    });
+    const take = el("button", "", "take it");
+    const no = el("button", "", "leave it plain");
+    const bar = el("div", "sp-tools", "");
+    bar.style.cssText = "opacity:1;margin-left:0;margin-top:5px";
+    bar.appendChild(take); bar.appendChild(no);
     take.onclick = async () => {
       take.disabled = true;
       try {
@@ -135600,18 +135984,12 @@ function dirTurnRow(got, t) {
           + "/tint/refuse", {method: "POST", body: JSON.stringify(
             {index: t.index, text: out.tinted, was: t.text,
              faults: out.faults || []})});
-      } catch (e) { /* the refusal is a record, not a gate */ }
+      } catch (e) { /* a refusal is a record, not a gate */ }
       box.remove();
     };
-    box.appendChild(take);
-    box.appendChild(no);
+    box.appendChild(bar);
     wrap.appendChild(box);
   };
-  if (t.tinted) {
-    const alt = el("div", "dir-sub", "a tinted version is stored: " + t.tinted);
-    alt.style.color = "#a8e07c";
-    wrap.appendChild(alt);
-  }
   return wrap;
 }
 
