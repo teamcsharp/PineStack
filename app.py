@@ -23561,7 +23561,7 @@ async def dj_line(kind: str, track: dict[str, Any] | None = None,
     unreadable = bool(track) and title_unreadable(
         str((track or {}).get("title") or ""))
     if unreadable and bank:
-        fallback = random.choice(UNREADABLE_LINES)
+        fallback = unrepeated(list(UNREADABLE_LINES), "unreadable")
     context = ""
     if track:
         if unreadable:
@@ -57963,6 +57963,7 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                              len(files) - 1))
     said = {r.get("text") for r in speakbox_heard(key)}
     exhausted: tuple[str, list[str]] | None = None
+    _spent: list[tuple[str, list[str]]] = []      # #1177: every used-up doc
     # #1039: was order[:3] - and since the first document holding a
     # single unused line ends the search, "three were mined" was almost
     # always "one was mined". Six, so an exhausted document costs a look
@@ -58014,8 +58015,13 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                        seed_most=int(most), seed_cap=int(cap))
             return {"file": doc.name, "text": " ".join(lines),
                     "lines": lines, "mind": key}
-        if exhausted is None and gems:
-            exhausted = (doc.name, gems)
+        if gems:
+            # #1177: collect them ALL. Keeping only the first one tripped
+            # over made the repeat road a near-constant, which is how one
+            # line reached 289 airings.
+            _spent.append((doc.name, gems))
+            if exhausted is None:
+                exhausted = (doc.name, gems)
     # Every document tried is used up (#268). The least recently aired
     # lines come back rather than the show going quiet — but repetition is
     # now the LAST resort, after three documents were mined for anything
@@ -58023,9 +58029,21 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
     # even the repeats are the oldest material on the shelf; the swath
     # loses strict adjacency here, which a re-run can afford.
     if exhausted:
-        name, gems = exhausted
         last = {r.get("text"): int(r.get("last") or 0)
                 for r in speakbox_heard(key)}
+        # #1177: of the documents that are used up, the one whose material
+        # has been left alone longest goes first - "least recently aired"
+        # applied to the document as well as to the line. A tie is broken
+        # at random rather than by loop order.
+        if len(_spent) > 1:
+            def _age(row: tuple) -> float:
+                _lines = row[1] or []
+                return (min(int(last.get(ln) or 0) for ln in _lines)
+                        if _lines else 0)
+            _oldest = min(_age(r) for r in _spent)
+            exhausted = random.choice(
+                [r for r in _spent if _age(r) <= _oldest + 1.0]) or exhausted
+        name, gems = exhausted
         pool = sorted(gems, key=lambda line: last.get(line, 0))
         # #no-repeats: this branch deliberately serves lines they HAVE used, which is
         # a verbatim repeat injected upstream of every gate — the swath goes
@@ -58071,6 +58089,29 @@ SPEAKBOX_SWATH_MAX = 1100
 # speakbox_quote. speakbox_search hands back one swath per document, so
 # this is a count of documents, and the band is re-rolled every draw.
 SPEAKBOX_THEME_BAND = 12
+
+
+def swath_best(picks: list[dict[str, Any]]) -> dict[str, Any]:
+    """#1177: the more intriguing swath LEADS; it does not own.
+
+    `max(picks, key=swath_intrigue)` is a rank filter, not a draw:
+    swath_intrigue is a pure function of the text and knows nothing about
+    what has aired, so the same long question-bearing passages win their
+    heat every time they are drawn and the air concentrates on a
+    persistent top slice of the corpus. Weighted by score, the better one
+    is likelier and the other is still possible - the same correction the
+    theme band was given."""
+    rows = [p for p in (picks or []) if p and str(p.get("text") or "").strip()]
+    if not rows:
+        return {}
+    if len(rows) == 1:
+        return rows[0]
+    try:
+        scores = [max(0.01, float(swath_intrigue(str(p.get("text") or ""))))
+                  for p in rows]
+        return random.choices(rows, weights=scores, k=1)[0]
+    except Exception:  # noqa: BLE001
+        return max(rows, key=lambda p: swath_intrigue(str(p.get("text") or "")))
 
 
 def speakbox_swath_lines(pool: list[str], most: int = 9,
@@ -61219,7 +61260,7 @@ async def _sting_react(who: str) -> None:
     try:
         await asyncio.sleep(0.7)
         await dj_speak("reply", None,
-                       line=random.choice(STING_REACTIONS),
+                       line=unrepeated(list(STING_REACTIONS), "sting-react"),
                        who=who, by_hand=True)
     except Exception:
         pass
@@ -70705,7 +70746,7 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                 "source": str(row.get("source") or ""),
                 "voice": str(row.get("voice") or ""),
             })
-            intro = random.choice(CALL_RERUN_INTROS).format(
+            intro = unrepeated(list(CALL_RERUN_INTROS), "rerun-intro").format(
                 name=name, premise=premise or "something")
             try:
                 # #1033: the crystal tints the phones - the recording was
@@ -71812,8 +71853,9 @@ async def caller_topic() -> tuple[str, dict[str, Any]]:
         # Armed with the BEST material, not the first (#359): three draws
         # off different documents, the most intriguing one dialled.
         picks = [s for s in [await speakbox_quote() for _ in range(3)] if s]
-        seed = max(picks, key=lambda s: swath_intrigue(s.get("text", ""))) \
-            if picks else {}
+        # #1177: weighted rather than strict - see swath_best. Best-of-3
+        # against a fixed score picks the same passages every time.
+        seed = swath_best(picks) if picks else {}
         if seed:
             return (
                 "The caller has come armed with the most intriguing lines "
@@ -76277,8 +76319,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
         picks = [s for s in [await speakbox_quote(most=6, cap=700),
                              await speakbox_quote(most=6, cap=700)] if s]
         if picks:
-            seed = max(picks,
-                       key=lambda s: swath_intrigue(s.get("text", "")))
+            seed = swath_best(picks)
             # #1174: the one that lost the intrigue contest is still a
             # swath from another document that the station has already
             # paid to draw. It joins the spread instead of being dropped.
@@ -105521,7 +105562,8 @@ async def dj_guest_send_home(
         "obvious relief, whichever is true of how it actually went. THEN "
         f"{name} says goodbye in their OWN words, in character, with one last "
         "remark that is unmistakably theirs. THEN they go — "
-        f"{random.choice(GUEST_EXITS)} — and the pair react to the empty "
+        f"{unrepeated(list(GUEST_EXITS), 'guest-exit')} — and the pair "
+        "react to the empty "
         f"chair. FINALLY the two of them talk ABOUT {name} now that they are "
         "gone: what they made of them, what was said that they are still "
         "chewing on, whether they would have them back. Be honest and funny "
@@ -119969,12 +120011,12 @@ async def _desk_apology(m: dict[str, Any],
                 + (", short on " + ", ".join(k.replace("_", " ") for _, k in short[:3]) if short else "")
                 + ". No greeting, no markdown, no more than forty words. "
                 "One of your standing gripes: "
-                + random.choice(list(UPSTAIRS_GRIPES)) + ".", limit=140) or "").split())[:300]
+                + unrepeated(list(UPSTAIRS_GRIPES), "gripe") + ".", limit=140) or "").split())[:300]
             _PAPER_PRESS["writer_calls"] = int(_PAPER_PRESS.get("writer_calls") or 0) + 1
         except Exception:  # noqa: BLE001
             upstairs = ""
     if not upstairs:
-        gripe = random.choice(list(UPSTAIRS_GRIPES))
+        gripe = unrepeated(list(UPSTAIRS_GRIPES), "gripe")
         upstairs = (f"Noted. {delivery} percent is what I will be telling the "
                     f"building, and I will not be softening it. Also, {gripe}.")
     body += "\n\n### A word from upstairs\n\n" + upstairs
