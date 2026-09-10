@@ -15606,12 +15606,12 @@ def prepared_by_kind() -> dict[str, int]:
             # the rest as ready supply is a board planning around
             # material the shelf will refuse - the round is drawn, the
             # take fails and the call is written and rendered live.
-            out[kind] = sum(1 for row in (_SHELF.get(kind) or [])
+            out[kind] = sum(1 for row in road_source(kind)
                             if dialogue_row_ready("caller", row)
                             and (not row.get("aired_at")
                                  or story_rerun_ok_row(row)))
             continue
-        out[kind] = sum(1 for row in (_SHELF.get(kind) or [])
+        out[kind] = sum(1 for row in road_source(kind)   # #1169
                         if dialogue_row_ready(str(kind), row))
     # Track-talk is record-bound rather than shelf-bound. Leaving it out made
     # every control surface call the road bare even while its exact upcoming
@@ -33461,7 +33461,7 @@ def slot_supply() -> dict[str, list[float]]:
     try:
         for kind in list(_SHELF):
             when: list[float] = []
-            for row in (_SHELF.get(kind) or []):
+            for row in road_source(kind):            # #1169
                 try:
                     if now - float(row.get("at") or 0) > PANTRY_BURN_SECONDS \
                             and not shelf_is_repeat(kind, row):
@@ -36144,7 +36144,11 @@ def cupboard_short() -> list[dict[str, Any]]:
         now = time.time()
         for kind in SHELF_REUSABLE:
             good = 0
-            for row in (_SHELF.get(kind) or []):
+            # #1169: banter is banked in the LARDER. Read off the shelf it
+            # is permanently empty, so the road with the deepest reserve
+            # on the station reported "have 0, short 8" and the pause was
+            # spent building more of it.
+            for row in road_source(kind):
                 if shelf_cast_stale(row):
                     continue
                 # 2026-09-10: AGE NO LONGER DISQUALIFIES STOCK, and the
@@ -39995,7 +39999,7 @@ def coord_road_report(road: str) -> dict[str, Any]:
             "rows": int(needs.get("rows") or 0),
             "cap": int(needs.get("cap") or 0),
         }
-        rows = list(_SHELF.get(road) or [])
+        rows = road_source(road)                 # #1169
         out["shelf"] = {
             "rows": len(rows), "cap": shelf_cap(road),
             "ceiling": shelf_cap(road) * SHELF_ROW_CEILING,
@@ -40909,7 +40913,7 @@ def hour_needs() -> dict[str, dict[str, float]]:
             # same row is usable. Aligned to the take: a board that
             # counts supply the shelf will refuse is what #1089 was.
             rows = []
-            for r in (_SHELF.get(road) or []):
+            for r in road_source(road):        # #1169: banter is the larder
                 try:
                     if road == "news" and not _news_row_alive(r):
                         continue        # #1155: a dead bulletin is not cover
