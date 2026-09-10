@@ -57,6 +57,7 @@ from director import (director_add, director_beats, director_beats_clause,
                       director_spend, director_touch, script_approve,
                       script_candidate, script_key, script_lessons,
                       script_mark_aired, script_note_edit, script_queue_state,
+                      script_record,
                       script_seen_clear, script_seen_mark,
                       script_send_to_record, script_state, script_tint_history,
                       script_tint_note)
@@ -98911,6 +98912,253 @@ async def api_director_scripts(kind: str, most: int = 40) -> dict[str, Any]:
                 "why": director_why(str(kind)).get("say") or "",
                 "say": "%d script(s) on the %s road" % (len(rows), kind)}
     return await asyncio.to_thread(work)
+
+
+def _trace_flat(text: Any) -> str:
+    """The comparison form for 'is this the same line' - words only."""
+    return " ".join(re.sub(r"[^a-z0-9' ]+", " ",
+                           str(text or "").lower()).split())
+
+
+def director_find_script(text: str) -> tuple[str, Any, Any]:
+    """The shelf row whose script contains this line. ('', None, None) if none.
+
+    Matched on the WORDS, because what aired went through spoken_text and
+    may have lost punctuation the script still has."""
+    want = _trace_flat(text)
+    if len(want) < 12:
+        return "", None, None
+    for kind in list(DIRECTOR_QUEUE_KINDS) + ["ad", "station_id"]:
+        for row in list(_SHELF.get(kind) or []):
+            entry = dialogue_entry(row)
+            if entry is None:
+                continue
+            if want in _trace_flat(entry.get("script")):
+                return str(kind), row, entry
+    for entry in list(_LARDER):
+        if isinstance(entry, dict) and want in _trace_flat(entry.get("script")):
+            return str(entry.get("prep_kind") or "banter"), entry, entry
+    return "", None, None
+
+
+def director_line_trace(line_id: str = "", text: str = "") -> dict[str, Any]:
+    """Everything the station knows about why one line is on the air.
+
+        "I want to be able to trace it back to a script. I want to trace
+         that script back to the system that created it and have an
+         understanding of how that script came to be, why this line is
+         playing, why this line is playing for the X amount of times that
+         it has been played and has it been replaced with anything newer."
+
+    None of this is new bookkeeping - the station has recorded all of it
+    all along and never put it in one place. `desk` holds the whole
+    writing exchange (which model, at what temperature, wearing which
+    persona, and the prompt it was given, schedule clause and all);
+    `system2_trace_id` ties it to the orchestrator's own job; `tint` says
+    what the crystal did and why; `verbatim` names the speakerbox document
+    each stapled passage came out of; the air log counts the airings. This
+    joins them."""
+    out: dict[str, Any] = {"at": time.time(), "line": str(line_id or ""),
+                           "found": False}
+    row = None
+    try:
+        with _AIRLOG_LOCK:
+            if line_id:
+                row = _AIRLOG_INDEX.get(str(line_id))
+            if row is None and text:
+                want = _trace_flat(text)
+                row = next((r for r in _AIRLOG_INDEX.values()
+                            if _trace_flat(r.get("text")) == want), None)
+    except Exception:                              # noqa: BLE001
+        row = None
+    said = str((row or {}).get("text") or text or "")
+    if not said.strip():
+        out["why"] = "no line of that id is in the air log's window"
+        return out
+    out["found"] = True
+    out["said"] = said[:1200]
+    if row:
+        out["airing"] = {
+            "at": row.get("air_at"), "seconds": row.get("seconds"),
+            "who": row.get("who"), "name": row.get("name"),
+            "kind": row.get("kind"), "round": row.get("round"),
+            "voice": row.get("voice"), "engine": row.get("engine"),
+            "aired": row.get("aired"), "clip": row.get("clip_media"),
+            "speakbox_document": row.get("source") or "",
+            "download": ("/api/booth/clip?line=" + str(row.get("id") or ""))
+                        if row.get("id") else "",
+        }
+    # HOW OFTEN, and when. The air log is the only honest count - a line
+    # can be re-aired from the cupboard, and each airing is its own row.
+    plays: list[float] = []
+    try:
+        want = _trace_flat(said)
+        with _AIRLOG_LOCK:
+            for other in _AIRLOG_INDEX.values():
+                if str(other.get("aired") or "") not in AIRLOG_AIRED:
+                    continue
+                if _trace_flat(other.get("text")) == want:
+                    plays.append(float(other.get("air_at") or 0))
+    except Exception:                              # noqa: BLE001
+        pass
+    plays = sorted(p for p in plays if p)
+    out["plays"] = {
+        "in_the_window": len(plays),
+        "first": plays[0] if plays else None,
+        "last": plays[-1] if plays else None,
+        "window_hours": round(AIRLOG_KEEP_S / 3600.0, 1),
+    }
+    kind, shelf_row, entry = director_find_script(said)
+    if entry is None:
+        out["script"] = {}
+        # Not every line comes from a round. The emergency host's fillers,
+        # station IDs and the SFX guy's stings are written elsewhere and
+        # have no script to trace - saying THAT is the answer, not a
+        # blank. Worth naming loudly: the first line this endpoint was
+        # ever pointed at was an emergency_host filler that had aired 44
+        # times in 48 hours, which is the dead-air symptom wearing a
+        # rhyme.
+        heard = out["plays"]["in_the_window"]
+        why = ("this is the emergency host covering a hole, not a written "
+               "round" if str((row or {}).get("kind") or "") == "emergency_host"
+               else "no script on the shelf still holds this line - the round "
+                    "it came from has been retired")
+        out["why"] = why
+        out["say"] = ("%s; heard %d time(s) in the last %.0f hours"
+                      % (why, heard, AIRLOG_KEEP_S / 3600.0))
+        return out
+    sid = ""
+    try:
+        sid = alt_sid_of(kind, shelf_row) if shelf_row is not None else ""
+    except Exception:                              # noqa: BLE001
+        sid = ""
+    turns = banter_turns(str(entry.get("script") or ""),
+                         str(entry.get("caller_name") or ""))
+    at = next((i for i, (_m, t) in enumerate(turns)
+               if _trace_flat(t) and _trace_flat(t) in _trace_flat(said)
+               or _trace_flat(said) in _trace_flat(t)), None)
+    desk = entry.get("desk") if isinstance(entry.get("desk"), dict) else {}
+    tint = entry.get("tint") if isinstance(entry.get("tint"), dict) else {}
+    out["script"] = {
+        "sid": sid, "kind": kind, "turns": len(turns), "turn_index": at,
+        "aired_times": int((shelf_row or {}).get("aired") or 0),
+        "kept": bool(entry.get("frozen")),
+        "caller": str(entry.get("caller_name") or ""),
+        "written_at": entry.get("at"),
+        "seconds": (shelf_row or {}).get("seconds"),
+    }
+    # THE SYSTEM THAT MADE IT.
+    out["written_by"] = {
+        "model": str(desk.get("model") or ""),
+        "temperature": desk.get("temp"),
+        "context": desk.get("num_ctx"),
+        "took_ms": desk.get("ms"),
+        "persona": str(desk.get("armed") or ""),
+        "asked_as": str(desk.get("kind") or kind),
+        "matched": str(desk.get("matched") or ""),
+        "at": desk.get("at"),
+        "schedule_clause": str(desk.get("sched") or "")[:4000],
+        "prompt": str(desk.get("prompt") or "")[:12000],
+        "answered": str(desk.get("script") or "")[:6000],
+    }
+    out["orchestrator"] = {
+        "job": str(entry.get("system2_job") or ""),
+        "slot": str(entry.get("system2_slot") or ""),
+        "trace_id": str(entry.get("system2_trace_id") or ""),
+        "rule": entry.get("prep_rule") if isinstance(
+            entry.get("prep_rule"), dict) else {},
+        "brief": entry.get("brief") if isinstance(
+            entry.get("brief"), dict) else {},
+        "profile": str(entry.get("profile") or "")[:300],
+    }
+    out["crystal"] = {
+        "ok": tint.get("ok"), "why": str(tint.get("why") or "")[:400],
+        "world": str(tint.get("world") or "")[:300],
+        "coverage": tint.get("coverage"),
+        "tried_at": entry.get("tint_tried"),
+        "is_tinted": bool(str(entry.get("script_tinted") or "").strip()
+                          == str(entry.get("script") or "").strip()
+                          and str(entry.get("script_tinted") or "").strip()),
+    }
+    # THE OPERATOR'S OWN DOCUMENTS, and which file each came out of.
+    passages = []
+    for one in (entry.get("verbatim") or []):
+        try:
+            passages.append({"where": str(one[0]), "text": str(one[1])[:400]})
+        except Exception:                          # noqa: BLE001
+            continue
+    for one in (entry.get("dealt") or []):
+        try:
+            passages.append({"where": str(one[0]), "seat": str(one[1]),
+                             "text": str(one[2])[:400]})
+        except Exception:                          # noqa: BLE001
+            continue
+    out["speakerbox"] = {"passages": passages[:12],
+                         "document": str(entry.get("source") or "")}
+    # WHAT HAS HAPPENED TO IT SINCE - the operator's own hand.
+    review = script_queue_state(sid) if sid else {}
+    record = script_record(script_key(sid)) if sid else {}
+    out["reviewed"] = {
+        **review,
+        "edits": [{"index": e.get("index"), "seat": e.get("seat"),
+                   "at": e.get("at"), "was": str(e.get("was") or "")[:200],
+                   "now": str(e.get("now") or "")[:200]}
+                  for e in (record or {}).get("edits") or []][-8:],
+        "tints": [{"index": t.get("index"), "taken": t.get("taken"),
+                   "at": t.get("at")}
+                  for t in (record or {}).get("tints") or []][-8:],
+    }
+    # HAS ANYTHING NEWER REPLACED IT.
+    newer = []
+    try:
+        parent = alt_sid_of(kind, shelf_row) if shelf_row is not None else ""
+        for other in list(_SHELF.get(kind) or []):
+            oentry = dialogue_entry(other)
+            if oentry is None or oentry is entry:
+                continue
+            if str(oentry.get("director_fork_of") or "") == parent:
+                newer.append({"sid": alt_sid_of(kind, other),
+                              "forked_at": oentry.get("director_forked_at"),
+                              "aired": int(other.get("aired") or 0),
+                              "head": " ".join(
+                                  str(oentry.get("script") or "").split())[:140]})
+    except Exception:                              # noqa: BLE001
+        pass
+    out["replaced_by"] = newer
+    bits = []
+    if out["plays"]["in_the_window"] > 1:
+        bits.append("heard %d times in the last %.0f hours"
+                    % (out["plays"]["in_the_window"], AIRLOG_KEEP_S / 3600.0))
+    else:
+        bits.append("heard once in the log's window")
+    if out["script"]["kept"]:
+        bits.append("its round is KEPT material, so it may come round again")
+    if out["written_by"]["model"]:
+        bits.append("written by %s at temp %s wearing %s"
+                    % (out["written_by"]["model"],
+                       out["written_by"]["temperature"],
+                       out["written_by"]["persona"] or "no persona"))
+    if out["crystal"]["is_tinted"]:
+        bits.append("the crystal reached it")
+    elif out["crystal"].get("why"):
+        bits.append("untinted: " + str(out["crystal"]["why"])[:80])
+    if passages:
+        bits.append("%d passage(s) of your own documents are in this round"
+                    % len(passages))
+    if newer:
+        bits.append("%d newer version(s) of this round exist" % len(newer))
+    if (review or {}).get("edits"):
+        bits.append("you have rewritten %d line(s) of it" % review["edits"])
+    out["say"] = "; ".join(bits)
+    return out
+
+
+@app.get("/api/director/trace")
+async def api_director_trace(line: str = "", text: str = "") -> dict[str, Any]:
+    """Why is this line on the air, and where did it come from?"""
+    if not line and not text:
+        raise HTTPException(400, "give a line id or the words to trace")
+    return await asyncio.to_thread(director_line_trace, line, text)
 
 
 @app.get("/api/director/pending")

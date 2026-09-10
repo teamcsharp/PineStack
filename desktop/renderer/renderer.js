@@ -5744,6 +5744,150 @@ function worksSchedule(anchorPop) {
   const segBody = {};          // ...and their drawers, kept across paints
   const segAt = {};            // when each was last filled
 
+  /* 2026-09-10: the scripts written for one entry's road, in screenplay
+   * form, with the note box that sends one back to the writing room and
+   * the buttons that send it on to the recording room. Same endpoints the
+   * panel's script window uses - one set of behaviour, two ways in. */
+  const scriptOpen = {};
+  const scriptBody = {};
+  const scriptAt = {};
+
+  function scriptWrap(text, width) {
+    const words = String(text || "").split(/\s+/).filter(Boolean);
+    const out = [];
+    let line = "";
+    words.forEach((w) => {
+      if (line && (line.length + 1 + w.length) > width) { out.push(line); line = w; }
+      else line = line ? line + " " + w : w;
+    });
+    if (line) out.push(line);
+    return out.join("\n");
+  }
+
+  async function scriptLoad(slot, drw, skey, force) {
+    if (!force && Date.now() - (scriptAt[skey] || 0) < 3000
+        && drw.childNodes.length) return;
+    scriptAt[skey] = Date.now();
+    if (!drw.childNodes.length) drw.textContent = "reading the scripts…";
+    let list = null;
+    try {
+      list = await api.get("/api/director/scripts/"
+                           + encodeURIComponent(slot.kind) + "?most=12");
+    } catch (e) {
+      drw.textContent = "could not read the scripts for this road";
+      return;
+    }
+    drw.textContent = "";
+    const why = mk("div", "", String((list && list.why) || ""));
+    why.style.cssText = "font-size:9.5px;opacity:.7;margin:0 0 5px";
+    drw.appendChild(why);
+    const rows = (list && list.rows) || [];
+    if (!rows.length) {
+      drw.appendChild(mk("div", "", "nothing written for this road yet"));
+      return;
+    }
+    rows.slice(0, 8).forEach((r) => {
+      const card = mk("div", "");
+      card.style.cssText = "border:1px solid rgba(255,255,255,.12);"
+        + "border-radius:5px;padding:4px 6px;margin:0 0 5px";
+      const head = mk("div", "");
+      head.style.cssText = "font-size:9.5px;opacity:.85;cursor:pointer;"
+        + "display:flex;gap:7px;flex-wrap:wrap";
+      head.textContent = (r.review && !r.review.seen && !r.kept && !r.aired
+                          ? "● new · " : "")
+        + r.turns + " turns · " + Math.round(r.seconds) + "s · "
+        + (r.recorded === r.takes ? "recorded"
+           : r.recorded + "/" + r.takes + " lines cut")
+        + (r.is_tinted ? " · tinted" : " · plain")
+        + (r.aired ? " · aired " + r.aired + "x" : "")
+        + (r.kept ? " · kept" : "");
+      card.appendChild(head);
+      const body = mk("div", "");
+      body.style.display = "none";
+      card.appendChild(body);
+      head.onclick = async () => {
+        if (body.style.display === "block") { body.style.display = "none"; return; }
+        body.style.display = "block";
+        body.textContent = "opening…";
+        let got = null;
+        try {
+          got = await api.get("/api/director/script/"
+                              + encodeURIComponent(r.sid));
+        } catch (e) { body.textContent = "could not open it"; return; }
+        body.textContent = "";
+        const page = mk("div", "");
+        page.style.cssText = "background:#f6f3ea;color:#141210;padding:12px 14px;"
+          + "border-radius:3px;font-family:'Courier New',Courier,monospace;"
+          + "font-size:11px;line-height:1.4;margin:5px 0";
+        const slug = mk("div", "", "INT. PINE BOX FM — "
+                        + String(got.kind || "").toUpperCase());
+        slug.style.cssText = "font-weight:700;letter-spacing:.05em;"
+          + "border-bottom:1px solid rgba(0,0,0,.25);padding-bottom:4px;"
+          + "margin-bottom:10px";
+        page.appendChild(slug);
+        (got.turns || []).forEach((t) => {
+          const cue = mk("div", "", String(t.who || "").toUpperCase());
+          cue.style.cssText = "margin-left:32%;letter-spacing:.08em;"
+            + "font-weight:700";
+          const para = mk("div", "", scriptWrap(t.text, 54));
+          para.style.cssText = "margin-left:15%;margin-right:10%;"
+            + "white-space:pre-wrap;margin-bottom:9px";
+          page.appendChild(cue);
+          page.appendChild(para);
+        });
+        body.appendChild(page);
+        const bar = mk("div", "");
+        bar.style.cssText = "display:flex;gap:5px;flex-wrap:wrap;margin-top:5px";
+        const note = document.createElement("input");
+        note.type = "text";
+        note.placeholder = "what is wrong with this script…";
+        note.style.cssText = "flex:1;min-width:170px;font-size:10px;padding:3px 5px";
+        const back = mk("button", "", "back to the writing room");
+        const rec = mk("button", "", "to the recording room");
+        const raw = mk("button", "", "record as written");
+        [back, rec, raw].forEach((b) => {
+          b.style.cssText = "font-size:9.5px;padding:1px 6px";
+        });
+        back.onclick = async () => {
+          const text = note.value.trim();
+          if (!text) { note.focus(); return; }
+          back.disabled = true; back.textContent = "rewriting…";
+          try {
+            const out = await api.post("/api/director/script/"
+              + encodeURIComponent(r.sid) + "/revise",
+              {note: text, standing: true});
+            alert((out && out.say) || "rewritten");
+            body.style.display = "none";
+            scriptLoad(slot, drw, skey, true);
+          } catch (e) {
+            back.disabled = false; back.textContent = "back to the writing room";
+            alert("not taken: " + e);
+          }
+        };
+        rec.onclick = async () => {
+          try {
+            const out = await api.post("/api/director/script/"
+              + encodeURIComponent(r.sid) + "/record", {bypass: false});
+            alert((out && out.say) || "released");
+          } catch (e) { alert("not released: " + e); }
+        };
+        raw.onclick = async () => {
+          try {
+            const out = await api.post("/api/director/script/"
+              + encodeURIComponent(r.sid) + "/record", {bypass: true});
+            alert((out && out.say) || "released past the tint");
+          } catch (e) { alert("not released: " + e); }
+        };
+        bar.appendChild(note);
+        bar.appendChild(back);
+        bar.appendChild(rec);
+        bar.appendChild(raw);
+        body.appendChild(bar);
+      };
+      drw.appendChild(card);
+    });
+  }
+
   /* #927: fill one entry with what is stacked for it. Throttled, and it
    * only rebuilds when the shelf actually changed — a drawer being read
    * must hold still. */
@@ -6258,6 +6402,38 @@ function worksSchedule(anchorPop) {
       row.appendChild(tri);
       row.appendChild(drw);
       if (segOpen[okey]) segLoad(s, drw, okey);
+
+      /* 2026-09-10: THE SCRIPT FOR THIS ENTRY, on the entry.
+       *
+       * "I want an icon for every script for every segment. So I want to be
+       *  able to click an icon and be able to load the script for that
+       *  segment and be able to review that script, make notes on it, and
+       *  even send it to the writing room or the recording room again."
+       *
+       * The scripts for a road already exist behind /api/director/scripts;
+       * what was missing was a way in from the thing the operator is
+       * actually looking at, which is the running order. So the entry opens
+       * onto its own scripts, in screenplay form, with the note box and both
+       * despatch buttons right there. */
+      const skey = "script:" + hour.key + ":" + s.id;
+      const sbtn = mk("button", "", "📄 script");
+      sbtn.title = "The scripts written for this entry - read them, note "
+        + "them, send them back to the writing room or on to the recording "
+        + "room";
+      sbtn.style.cssText = "font-size:9.5px;margin:3px 0 0 6px;padding:1px 6px";
+      const sdrw = scriptBody[skey] || mk("div", "");
+      scriptBody[skey] = sdrw;
+      sdrw.style.display = scriptOpen[skey] ? "block" : "none";
+      sdrw.style.marginTop = "4px";
+      sbtn.onclick = (ev) => {
+        if (ev) ev.stopPropagation();
+        scriptOpen[skey] = !scriptOpen[skey];
+        sdrw.style.display = scriptOpen[skey] ? "block" : "none";
+        if (scriptOpen[skey]) scriptLoad(s, sdrw, skey);
+      };
+      row.appendChild(sbtn);
+      row.appendChild(sdrw);
+      if (scriptOpen[skey]) scriptLoad(s, sdrw, skey);
 
       /* #928 (#891): a Spin record entry gets a play icon — pick the
        * track that fills it. Pinning QUEUES the track; it never cuts a
