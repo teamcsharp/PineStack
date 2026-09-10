@@ -64645,6 +64645,12 @@ def continuity_load() -> None:
             _CONTINUITY_BANK.update({k: v for k, v in rows.items() if isinstance(v, dict)})
     except (OSError, ValueError):
         pass
+    # #1175: the clips have always come back; what went out recently now
+    # comes back with them.
+    try:
+        continuity_said_load()
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def continuity_pick(who: str, voice: str, text: str) -> dict[str, Any] | None:
@@ -64777,6 +64783,52 @@ def _continuity_sfx_build(audio: bytes, lengths: list[float], chosen: list[dict]
     return output.getvalue(), items, spans
 
 
+# #1175: the said-map, on disk. The recorded clips have always persisted;
+# the memory of having PLAYED them did not, so every restart handed the
+# reserve its whole rotation back and the one-hour rule became a
+# one-process rule. Measured: 31 seconds between two airings of the same
+# line, against a rule that says 3,600.
+CONTINUITY_SAID_PATH = data_path("continuity_said.json")
+
+
+def continuity_said_load() -> None:
+    """Bring back what went out recently, once, at startup."""
+    try:
+        if not CONTINUITY_SAID_PATH.exists():
+            return
+        got = json.loads(CONTINUITY_SAID_PATH.read_text(encoding="utf-8"))
+        if not isinstance(got, dict):
+            return
+        now = time.time()
+        said = _CONTINUITY_STATE.setdefault("said", {})
+        for text, at in got.items():
+            try:
+                when = float(at or 0)
+            except Exception:  # noqa: BLE001
+                continue
+            # Anything already past its rest is not worth carrying.
+            if when and now - when < CONTINUITY_REST_SECONDS:
+                said[str(text)] = when
+    except Exception:  # noqa: BLE001
+        pass                # a lost map costs variety, never the air
+
+
+def continuity_said_save() -> None:
+    """Keep it, pruned to the window it governs. Small and cheap - the
+    map is at most one entry per recorded line."""
+    try:
+        now = time.time()
+        said = {str(k): float(v) for k, v in
+                (_CONTINUITY_STATE.get("said") or {}).items()
+                if v and now - float(v) < CONTINUITY_REST_SECONDS}
+        CONTINUITY_SAID_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CONTINUITY_SAID_PATH.with_suffix(".tmp")
+        tmp.write_text(json.dumps(said), encoding="utf-8")
+        tmp.replace(CONTINUITY_SAID_PATH)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def continuity_air(reason: str = "") -> bool:
     """Spend a ready two-host reserve on the selected output; never synthesize on air."""
     if (not _RADIO.get("on") or radio_paused() or _SPEAKING[0] or _floor_busy()
@@ -64785,6 +64837,28 @@ async def continuity_air(reason: str = "") -> bool:
             or talk_quiet_for() < talk_quiet_limit()
             or time.time() - float(_CONTINUITY_STATE.get("last_air") or 0) < 60):
         return False
+    # #1175: THE GOLD GOES FIRST. There are twenty-eight continuity lines
+    # and 1,416 gold bars, of which 138 have never fired and not one has
+    # fired twice. Measured over 48 hours, this road put 919 airings
+    # through those 28 lines - 97% of them repeats, one line ninety-one
+    # times. #1064 already taught sfx_fill_gap to reach for gold first
+    # and measured the difference (a run of gold holds a 6-second median
+    # gap; a run of continuity a 32-second mean, being rate-limited by
+    # construction). The emergency host never learned it.
+    #
+    # At the top, so every caller gets it at once. A bar is finished,
+    # rhymed, recorded audio the station wrote for itself; the reserve is
+    # the stopgap underneath it, which is what its own docstring calls it.
+    try:
+        if await gold_fill_gap(reason or "the emergency host was reached",
+                               floorless=True):
+            _CONTINUITY_STATE.update(
+                last_air=time.time(),
+                why="a gold bar covered it - the 28-line reserve was not "
+                    "spent (#1175)")
+            return True
+    except Exception:  # noqa: BLE001
+        pass            # the reserve below is exactly the fallback for this
     voices = dict(await session_voices())
     chosen = []
     first = int(_CONTINUITY_STATE.get("next_pair") or 0) % len(CONTINUITY_PAIRS)
@@ -64911,6 +64985,10 @@ async def continuity_air(reason: str = "") -> bool:
             for pick in chosen:
                 if pick.get("who") in ("dj", "cohost"):
                     said_at[str(pick.get("plain") or pick.get("text") or "")] = time.time()
+            # #1175: ...and it is written down, so the hour survives the
+            # next restart. Stamped first, saved second - the other way
+            # round persists the map without the line that just aired.
+            continuity_said_save()
         station_flow_event("watchdog", "published" if went else "fail", "Emergency host continuity",
             {"reason": reason, "seconds": offset,
              "route": "both" if box_went and page_went else
