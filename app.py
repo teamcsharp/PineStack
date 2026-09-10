@@ -55556,7 +55556,13 @@ def unrepeated(pool: list[str], key: str, keep: int = 8) -> str:
     until the pool runs short."""
     if not pool:
         return ""
-    keep = min(keep, len(pool) - 1)
+    # #1176: LEAVE TWO. Clamping to len(pool) - 1 lets the ring hold every
+    # item but one, and `random.choice` on a list of one is not a choice -
+    # it is a fixed cycle whose order was frozen by the first few draws.
+    # Measured across the call sites, a dozen small pools were in that
+    # state, most of them verbatim spoken copy. Two candidates costs
+    # nothing: a pool of three still never repeats back to back.
+    keep = min(keep, max(0, len(pool) - 2))
     recent = _RADIO.setdefault("recent", {}).setdefault(key, [])
     pick = random.choice([p for p in pool if p not in recent] or pool)
     recent.append(pick)
@@ -57769,9 +57775,23 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
             _plt = plot_owns_air()
             if _plt and random.random() < 0.45:
                 _pact, _pat, _pof = plot_act_now(_plt)
+                # #1176: A BAND, NOT A PIN - the same correction the theme
+                # branch above was given this morning. k=1 against a static
+                # index is a constant, and this branch owns 45% of every
+                # draw while a story is on, so it undid that fix the moment
+                # a storyline was switched on. speakbox_search returns one
+                # swath per document, so k documents really are k different
+                # documents; rank r weighs (n - r), which lets the closest
+                # match lead the band without owning it.
                 _phits = await speakbox_search(
-                    str(_pact or _plt.get("title") or ""), k=1)
-                _pdoc = str((_phits or [{}])[0].get("file") or "")
+                    str(_pact or _plt.get("title") or ""),
+                    k=SPEAKBOX_THEME_BAND)
+                _ppool = [str(h.get("file") or "")
+                          for h in (_phits or []) if h.get("file")]
+                _pn = len(_ppool)
+                _pdoc = (random.choices(
+                    _ppool, weights=[_pn - i for i in range(_pn)],
+                    k=1)[0] if _ppool else "")
                 if _pdoc:
                     only = _pdoc
                     pipeline_log("speakbox", "the swath serves the "
@@ -64806,6 +64826,9 @@ def continuity_said_load() -> None:
                 when = float(at or 0)
             except Exception:  # noqa: BLE001
                 continue
+            if text == "__next_pair__":            # #1176
+                _CONTINUITY_STATE["next_pair"] = int(when)
+                continue
             # Anything already past its rest is not worth carrying.
             if when and now - when < CONTINUITY_REST_SECONDS:
                 said[str(text)] = when
@@ -64821,6 +64844,11 @@ def continuity_said_save() -> None:
         said = {str(k): float(v) for k, v in
                 (_CONTINUITY_STATE.get("said") or {}).items()
                 if v and now - float(v) < CONTINUITY_REST_SECONDS}
+        # #1176: ...and where the rotation had got to. Without it every
+        # restart sends pair zero out first, on a road with no randomness
+        # in it at all.
+        said["__next_pair__"] = float(
+            int(_CONTINUITY_STATE.get("next_pair") or 0))
         CONTINUITY_SAID_PATH.parent.mkdir(parents=True, exist_ok=True)
         tmp = CONTINUITY_SAID_PATH.with_suffix(".tmp")
         tmp.write_text(json.dumps(said), encoding="utf-8")
