@@ -21812,14 +21812,33 @@ _BANNED_LOCK = RLock()
 _BANNED_MEMO: dict[str, Any] = {}
 
 
+# 2026-09-10: how long the banned list is trusted without re-checking the
+# file. #1156 stopped RE-READING it every call but still stat()s it every
+# call, and strip_banned runs per line: dj_pending alone scrubs every
+# pending row on the panel's poll, so one screen refresh was tens of stat
+# syscalls. The pulse named `banned_words` as a stall frame on the live
+# station (3 samples, 7s) beneath `spoken_text` beneath `dj_pending`. A
+# word list the operator edits by hand does not need checking sixty times
+# a second; two seconds is still immediate to a person typing.
+BANNED_WORDS_TTL = 2.0
+
+
 def banned_words(active: bool = True) -> list[dict[str, Any]]:
     # #1156: read the file only when it changes (strip_banned runs this
     # per line written).
-    try:
-        _st = BANNED_WORDS_PATH.stat()
-        _stamp = (_st.st_mtime_ns, _st.st_size)
-    except OSError:
-        return []
+    _now = time.time()
+    if _now - float(_BANNED_MEMO.get("looked") or 0) < BANNED_WORDS_TTL:
+        _stamp = _BANNED_MEMO.get("stamp")
+        if _stamp is None:
+            return []
+    else:
+        try:
+            _st = BANNED_WORDS_PATH.stat()
+            _stamp = (_st.st_mtime_ns, _st.st_size)
+        except OSError:
+            _BANNED_MEMO.update({"looked": _now, "stamp": None})
+            return []
+        _BANNED_MEMO["looked"] = _now
     if _BANNED_MEMO.get("stamp") == _stamp:
         rows = _BANNED_MEMO.get("rows") or []
     else:
