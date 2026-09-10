@@ -599,9 +599,30 @@ class ScheduleReadinessTests(unittest.IsolatedAsyncioTestCase):
             app._HOUR_LEARNING.clear()
             app._HOUR_LEARNING.update(prior["learning"])
 
-    def test_phone_calls_are_single_use_not_replay_stock(self) -> None:
-        self.assertNotIn("caller", app.SHELF_REUSABLE)
+    def test_phone_calls_repeat_on_the_shortest_leash_of_any_road(self) -> None:
+        """2026-09-10: calls were single-use, and that rule bought a silent
+        phone.
+
+        The objection this test was written for - replaying a caller is not
+        honest - is real, and it is the same objection #1106 raised about
+        banter and #1126 about news. Both were answered the same way: a
+        round that WORKED is worth hearing twice far more than a round that
+        failed is worth attempting again. Measured on the day the operator
+        asked why the phone segments keep coming up empty: 72 caller scripts
+        on the shelf, 64 fully recorded, 63 of them SPENT after one airing,
+        99 seconds free to bind against a 180-second entry, and 86% of fresh
+        attempts failing. Every call slot in the hour was being handed to
+        music while sixty-four finished calls sat unusable.
+
+        So a call may repeat - and gets the shortest leash of any road that
+        can: two hearings where the others allow three, and never evergreen.
+        shelf_take still sorts unaired rows first, so a repeat is reached
+        only when there is nothing fresher."""
+        self.assertIn("caller", app.SHELF_REUSABLE)
         self.assertNotIn("caller", app.SHELF_REUSE_EVERGREEN)
+        self.assertLess(app.shelf_innings("caller"),
+                        app.shelf_innings("manager"))
+        self.assertLessEqual(app.shelf_innings("caller"), 2)
 
     def test_phone_calls_leave_the_shelf_in_acceptance_order(self) -> None:
         now = app.time.time()
