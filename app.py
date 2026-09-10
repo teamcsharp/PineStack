@@ -41882,6 +41882,18 @@ async def _torrent_talk() -> None:
             # fallbacks also keep the station audible without fulfilling the
             # original gallery/news/manager/caller requirement.
             _requirement_met = bool(aired and not _fallback_cover and not _sched_miss_reason)
+            # #1166: THE ENTRY IS NOT ONE ROUND LONG. A News entry owns
+            # three minutes and one bulletin is sixty-nine seconds of it;
+            # the rest used to belong to whatever clock ticked next. If
+            # the entry's own road served it, and the entry still owns
+            # meaningful time, it keeps taking rounds of that road off
+            # the shelf - a different memo, a different painting, a
+            # different story - until its minutes are used.
+            if aired and not _fallback_cover:
+                try:
+                    await entry_fill_out(str(kind or ""), track)
+                except Exception:  # noqa: BLE001
+                    pass        # a short segment is not a broken station
             if not aired:
                 _cover_outcome: dict[str, Any] = {}
                 aired = await torrent_force_banter(
@@ -63894,6 +63906,31 @@ def _ready_slot_window(kind: str) -> dict[str, Any] | None:
             "kind": road, "deadline": deadline}
 
 
+# #1166: how far past its entry a finished round may run rather than not
+# run at all. See the note in the patch that added this: at zero, a memo
+# longer than what is left of its own entry is refused and a canned filler
+# of the same length covers the slot instead.
+SEGMENT_OVERRUN_MOST = float(os.getenv("PINE_SEGMENT_OVERRUN", "45"))
+
+
+def segment_overrun(deadline: float, road: str = "") -> float:
+    """Seconds of grace past `deadline` for one round of `road`.
+
+    Half of what the entry owns, capped - so a thirty-second entry gets
+    fifteen seconds of grace and a four-minute one still gets no more
+    than the cap. A round that needs more than half an entry's length of
+    overrun is the wrong length for the entry, and that is a writing
+    problem rather than a scheduling one."""
+    try:
+        if SEGMENT_OVERRUN_MOST <= 0:
+            return 0.0
+        slot = _RADIO.get("sched_slot") or {}
+        owns = max(0.25, float(slot.get("minutes") or 2)) * 60.0
+        return max(0.0, min(SEGMENT_OVERRUN_MOST, owns / 2.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
                       window: dict[str, Any] | None = None, *,
                       seconds: float | None = None,
@@ -63947,7 +63984,13 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
             begins = max(begins, float(_PAGE_AIR_UNTIL[0] or 0))
         if start_at is not None:
             begins = max(begins, float(start_at))
-        return math.isfinite(begins) and begins + duration + 1.0 <= deadline
+        # #1166: a finished segment may run past the fold rather than not
+        # run at all. The round still has to START inside its own entry -
+        # this is a sentence finished over the top of the next thing, not
+        # a licence to begin one late.
+        grace = segment_overrun(deadline, kind) if begins < deadline else 0.0
+        return (math.isfinite(begins)
+                and begins + duration + 1.0 <= deadline + grace)
     except (TypeError, ValueError, OSError):
         return False
 
@@ -66373,6 +66416,112 @@ NEWS_FILL_FLOOR = 40.0                  # too little left to start another
 NEWS_FILL_MOST = 8                      # and never more than this many
 
 
+# #1166: how much of the entry is left before it is not worth starting
+# another round of it - a little under the shortest thing on any shelf, so
+# the last slot is offered rather than written off.
+SEGMENT_FILL_FLOOR = 35.0
+# A ceiling, so one entry cannot walk the whole shelf. Six two-minute
+# rounds is longer than any entry the running order writes.
+SEGMENT_FILL_MOST = 6
+# The roads where a second helping is the same segment rather than a
+# different one. Adverts and station IDs are quota'd elsewhere and a
+# record is a record; these five are the ones the operator means by
+# "multiple stories" and "multiple versions of that thing".
+SEGMENT_FILL_ROADS = ("gallery", "manager", "news", "caller", "banter")
+
+
+def slot_left(road: str) -> float:
+    """#1166: seconds left in the entry on air, when the entry belongs to
+    `road`; 0.0 otherwise.
+
+    Generalised from news_slot_left, whose careful reasoning applies to
+    every road and not only to the news: it reads `_RADIO` rather than
+    calling schedule_take(), because that walk MUTATES the saved position
+    - and a segment asking how long it has got must not move the clock it
+    is asking about. The two keys are only trusted while they still agree
+    about which entry is on air."""
+    try:
+        pos = _RADIO.get("sched_pos") or {}
+        slot = _RADIO.get("sched_slot") or {}
+        if not slot or str(slot.get("id") or "") != str(
+                pos.get("slot_id") or ""):
+            return 0.0
+        if str(SCHED_PREP_KIND.get(str(slot.get("kind") or "")) or "")                 != str(road or ""):
+            return 0.0
+        started = float(pos.get("started") or 0)
+        if started <= 0:
+            return 0.0
+        owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+        return max(0.0, started + owns - time.time())
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+async def entry_fill_out(road: str, track: dict[str, Any] | None) -> int:
+    """#1166: keep running THIS entry's road until its minutes are used.
+
+    Called after the entry's first round has aired. Every helping comes
+    off the shelf - see the note in the patch: a fresh render costs more
+    seconds than it produces, so live writing cannot close the tail it is
+    asked to close, and a shelf of finished variants can.
+
+    Returns how many extra rounds went out. Never raises: an entry that
+    could not be filled out is the entry it was before this existed."""
+    kind = str(road or "")
+    if kind not in SEGMENT_FILL_ROADS:
+        return 0
+    more = 0
+    cut_at = _TALK_CUT[0]
+    try:
+        while more < SEGMENT_FILL_MOST:
+            if not _RADIO.get("on") or radio_paused():
+                break
+            if _TALK_CUT[0] != cut_at:
+                break                   # somebody cut the round; obey it
+            left = slot_left(kind)
+            if left <= SEGMENT_FILL_FLOOR:
+                break
+            said = await segment_one_more(kind, track)
+            if not said:
+                # The shelf has nothing else for this road. Say so once -
+                # this is the number that tells the operator whether the
+                # answer is "write more variants" or "the loop is broken".
+                if more == 0:
+                    pipeline_log(
+                        "air", "the %s entry still owns %ds and the shelf "
+                        "has no second helping for it - one round is all "
+                        "this segment can be today (#1166)"
+                        % (kind, int(left)))
+                break
+            more += 1
+            await asyncio.sleep(0.8)    # a breath between rounds, not a gap
+        if more:
+            pipeline_log(
+                "air", "the %s entry ran %d round(s) rather than one - "
+                "%ds of it left (#1166)"
+                % (kind, more + 1, int(slot_left(kind))))
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "filling out the %s entry stopped early" % kind,
+                     extra=f"{type(exc).__name__}: {exc}"[:300])
+    return more
+
+
+async def segment_one_more(road: str, track: dict[str, Any] | None
+                           ) -> list[str]:
+    """One more round of `road`, off the shelf, or [] when there is none."""
+    if road == "gallery":
+        return await dj_gallery_round(shelf_only=True)
+    if road == "manager":
+        return await dj_manager_note(track, shelf_only=True)
+    if road == "news":
+        return await dj_news(shelf_only=True)
+    if road == "caller":
+        return await dj_caller(track, shelf_only=True)
+    if road == "banter":
+        return await dj_banter(track, shelf_only=True)
+    return []
+
+
 def news_slot_left() -> float:
     """Seconds left in the News entry that owns the air; 0.0 when news
     does not own it (#921).
@@ -66385,6 +66534,12 @@ def news_slot_left() -> float:
     the same guard _schedule_pin_record() uses, and for the same reason:
     with the schedule switched off sched_pos is dropped and a stale slot
     could otherwise claim minutes nobody scheduled."""
+    return slot_left("news")            # #1166: one implementation
+
+
+def _news_slot_left_old() -> float:
+    """Kept for the record: what news_slot_left did before #1166
+    generalised it. Not called."""
     try:
         pos = _RADIO.get("sched_pos") or {}
         slot = _RADIO.get("sched_slot") or {}
