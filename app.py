@@ -99157,6 +99157,136 @@ def _director_direction(kind: str, slot_id: str,
         return {"standing": [], "next": [], "clause": ""}
 
 
+# #1167: the most of the ledger's tail that is ever read, and how long an
+# answer is kept. Both exist to make this cost the same on a log of any
+# size - see the note in the patch that added them.
+AIRED_TAIL_BYTES = 4 * 1024 * 1024
+_AIRED_MEMO: dict[str, Any] = {"key": "", "at": 0.0, "value": []}
+
+
+def airlog_tail_rows(path: Any, since: float) -> list[dict[str, Any]]:
+    """Rows at or after `since`, read backwards from the end of a ledger.
+
+    The file is append-ordered by time, so a window ending at now is
+    always at the end of it: this reads a bounded tail and parses only
+    that. The first line of the tail is dropped - a byte offset lands
+    mid-line and half a row is not a row."""
+    out: list[dict[str, Any]] = []
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > AIRED_TAIL_BYTES:
+                handle.seek(size - AIRED_TAIL_BYTES)
+                handle.readline()          # the partial line at the seam
+            blob = handle.read()
+    except Exception:  # noqa: BLE001
+        return out
+    for line in blob.decode("utf-8", "ignore").splitlines():
+        if not line.startswith("{"):
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(row, dict):
+            continue
+        if float(row.get("air_at") or row.get("at") or 0) >= since:
+            out.append(row)
+    return out
+
+
+def director_aired_hours(back: int = 4, most: int = 1400
+                         ) -> list[dict[str, Any]]:
+    """#1167: what actually went out, as far back as `back` hours, grouped
+    into hours and ordered as spoken.
+
+    The live index is the tail and the file is the rest; rows are keyed by
+    line id so a line that is in both is counted once. Disk - call from a
+    thread."""
+    horizon = max(0.0, float(back)) * 3600.0
+    now = time.time()
+    since = now - horizon
+    rows: dict[str, dict[str, Any]] = {}
+
+    def take(row: Any) -> None:
+        if not isinstance(row, dict):
+            return
+        at = float(row.get("air_at") or row.get("at") or 0)
+        if not at or at < since or at > now + 60:
+            return
+        # See the note in the patch: a plan is not an airing.
+        if str(row.get("aired") or "") not in AIRLOG_AIRED:
+            return
+        text = str(row.get("text") or "").strip()
+        if not text:
+            return
+        key = str(row.get("id") or "") or ("%.3f|%s" % (at, text[:40]))
+        rows[key] = {
+            "at": at, "who": str(row.get("who") or ""),
+            "name": str(row.get("name") or ""),
+            "kind": str(row.get("kind") or ""),
+            "round": str(row.get("round") or ""),
+            "seconds": round(float(row.get("seconds") or 0), 2),
+            "line": str(row.get("id") or ""),
+            "text": text[:700],
+        }
+
+    try:
+        # #1167: the tail, not the whole ledger. `airlog_jsonl_read` walks
+        # every line and json.loads holds the GIL; measured on this log it
+        # cost 18.8 seconds and a 9-second stall on a poll that repeats
+        # every twelve. The ledger's own time key is `air_at`.
+        for row in airlog_tail_rows(AIR_LOG_PATH, since):
+            take(row)
+    except Exception:  # noqa: BLE001
+        pass                    # the live tail alone is still a script
+    try:
+        with _AIRLOG_LOCK:
+            live = list(_AIRLOG_INDEX.values())
+        for row in live:
+            take(row)
+    except Exception:  # noqa: BLE001
+        pass
+    ordered = sorted(rows.values(), key=lambda r: r["at"])[-int(most or 1400):]
+    del rows
+    hours: list[dict[str, Any]] = []
+    for row in ordered:
+        stamp = time.strftime("%Y-%m-%d %H:00", time.localtime(row["at"]))
+        if not hours or hours[-1]["hour"] != stamp:
+            hours.append({"hour": stamp,
+                          "at": row["at"] - (row["at"] % 3600),
+                          "lines": []})
+        hours[-1]["lines"].append(row)
+    for hour in hours:
+        hour["seconds"] = round(
+            sum(float(r.get("seconds") or 0) for r in hour["lines"]), 1)
+        hour["count"] = len(hour["lines"])
+    return hours
+
+
+@app.get("/api/director/aired")
+async def api_director_aired(back: int = 4, most: int = 1400
+                             ) -> dict[str, Any]:
+    """#1167: the broadcast as a script - what actually sounded, in order,
+    grouped by hour, as far back as the air log goes.
+
+    Off the loop: the file read and the index fold both hold the GIL."""
+    span = max(1, min(72, int(back or 4)))
+    cap = max(50, min(6000, int(most or 1400)))
+    key = "%d|%d" % (span, cap)
+    now = time.time()
+    if _AIRED_MEMO["key"] == key and now - float(_AIRED_MEMO["at"]) < 10.0:
+        hours = _AIRED_MEMO["value"]
+    else:
+        hours = await asyncio.to_thread(director_aired_hours, span, cap)
+        _AIRED_MEMO.update({"key": key, "at": now, "value": hours})
+    return {"at": time.time(), "hours": hours,
+            "back_hours": span,
+            "say": ("%d hour(s) of broadcast, %d line(s) that actually "
+                    "sounded" % (len(hours),
+                                 sum(h["count"] for h in hours)))}
+
+
 @app.get("/api/director")
 async def api_director(hour: int = 0) -> dict[str, Any]:
     """The hourly script. Off the loop: it folds the air-log index and
@@ -169004,6 +169134,11 @@ function paperClose() {
   paperReadClose();                                   // N2 #1045
   paperFrame = paperShelf = paperConsole = paperTitle = paperPagesBar = null;
   paperCopyBtn = paperImageBtn = null;                // N2 #1047
+  if (paperScriptTimer) {                            // #1167
+    clearInterval(paperScriptTimer);
+    paperScriptTimer = 0;
+  }
+  paperScriptPane = null;
   paperStyleBtns = {};
   paperText = null;
   document.removeEventListener("keydown", paperKeys);
@@ -169142,7 +169277,330 @@ function paperWatch(state) {
   } catch (e) { /* the panel works without it */ }
 }
 
-/* #1037: Newspaper | Tabloid. Remembered; the iframe reloads with ?style=. */
+/* #1167: THE SAME WINDOW, SHOWING THE SHOW INSTEAD OF THE PAPER.
+ *
+ * "I want the ability to view it as a newspaper, but also be able to
+ *  toggle it into a script view where it shows a live script of what is
+ *  scripted to show for the show, and I'm able to look at the live script
+ *  of the actual broadcast taking place in real time and be able to scrub
+ *  through its history and see what has happened previously and be able
+ *  to give notes and send requests that inform the orchestrator."
+ *
+ * The Gazette window already had Newspaper | Tabloid. This is the third
+ * tab, and it is deliberately the SAME window rather than a new one: the
+ * paper and the script are two readings of one hour, and the operator is
+ * comparing them - the paper says the hour had twenty-two stories, the
+ * script says which words actually left the building.
+ *
+ * WHAT IT SHOWS, top to bottom:
+ *   - the hours the air log holds, as a scrubber. Not a date picker: the
+ *     hours that exist, with their line counts, because "what happened at
+ *     two" is a question about a thing that happened.
+ *   - ON AIR NOW and what is scripted after it, off the running order.
+ *   - the broadcast itself in screenplay form, in the order it sounded.
+ *   - a note, which goes to the orchestrator's book against a segment
+ *     kind and changes how the next one of those is written.
+ *
+ * `aired` is the station's own answer to "did this sound", and only lines
+ * that sounded are here. A script of the broadcast that included the
+ * lines the broadcast did not reach would be the two-clocks mistake in a
+ * new place.
+ */
+let paperView = "broadsheet";        /* broadsheet | tabloid | script */
+let paperScriptPane = null;
+let paperScriptHour = "";            /* "" = live */
+let paperScriptTimer = 0;
+let paperScriptData = null;
+let paperScriptRoom = null;   /* the running order, when it catches up */
+
+function paperViewSet(view) {
+  const want = (view === "script" || view === "tabloid") ? view : "broadsheet";
+  paperView = want;
+  Object.keys(paperStyleBtns).forEach((k) => {
+    const b = paperStyleBtns[k];
+    const on = k === want;
+    b.style.borderColor = on ? "var(--accent)" : "#22304a";
+    b.style.background = on ? "rgba(32,185,232,.14)" : "";
+    b.style.fontWeight = on ? "700" : "";
+  });
+  if (want === "script") {
+    if (paperFrame) paperFrame.style.display = "none";
+    if (paperPagesBar) paperPagesBar.style.display = "none";
+    if (paperScriptPane) paperScriptPane.style.display = "flex";
+    paperScriptLoad();
+    /* Live means live: while this tab is up it re-reads on a slow clock,
+     * and it stops the moment the tab is not. */
+    if (!paperScriptTimer) {
+      paperScriptTimer = setInterval(() => {
+        if (paperView === "script" && !paperScriptHour) paperScriptLoad(true);
+      }, 12000);
+    }
+    return;
+  }
+  if (paperScriptTimer) { clearInterval(paperScriptTimer); paperScriptTimer = 0; }
+  if (paperScriptPane) paperScriptPane.style.display = "none";
+  if (paperFrame) paperFrame.style.display = "";
+  paperStyleSet(want);
+}
+
+/* One speaker's name, the way a script prints it. */
+function paperScriptWho(row) {
+  const name = String(row.name || "").trim();
+  const who = String(row.who || "").trim();
+  if (name) return name.toUpperCase();
+  const book = {dj: "HOST", cohost: "CO-HOST", caller: "CALLER",
+                board: "SFX", drop: "SFX GUY", third: "GUEST"};
+  return (book[who] || who || "VOICE").toUpperCase();
+}
+
+/* The slug line that opens a round - INT. PINE BOX FM - <what this is>. */
+const PAPER_SCRIPT_SLUG = {
+  banter: "THE BOOTH", caller: "THE PHONES", manager: "UPSTAIRS",
+  gallery: "THE GALLERY", news: "THE NEWS DESK", ad: "THE BREAK",
+  recap: "THE RECAP", track_talk: "OVER THE RECORD", intro: "THE RECORD",
+  station_id: "STATION IDENT", emergency_host: "CONTINUITY",
+  sfx: "THE BOARD", sfxguy: "THE BOARD", interject: "THE BOOTH",
+};
+
+function paperScriptRow(row, live) {
+  const wrap = el("div", "", "");
+  wrap.style.cssText = "margin:0 0 10px";
+  const head = el("div", "", paperScriptWho(row));
+  head.style.cssText = "font:700 11px/1.4 'Courier New',monospace;"
+    + "letter-spacing:.12em;color:" + (live ? "var(--accent)" : "#8fb7e8")
+    + ";margin-left:22%";
+  const say = el("div", "", String(row.text || ""));
+  say.style.cssText = "font:13px/1.55 'Courier New',monospace;color:#d9e3f0;"
+    + "margin:1px 12% 0 12%;white-space:pre-wrap";
+  const when = el("span", "muted", "");
+  const t = new Date((row.at || 0) * 1000);
+  when.textContent = ("0" + t.getHours()).slice(-2) + ":"
+    + ("0" + t.getMinutes()).slice(-2) + ":" + ("0" + t.getSeconds()).slice(-2)
+    + (row.seconds ? "  " + Number(row.seconds).toFixed(1) + "s" : "");
+  when.style.cssText = "float:left;font:10px/1.4 'Courier New',monospace;"
+    + "color:#5b7089";
+  wrap.appendChild(when);
+  wrap.appendChild(head);
+  wrap.appendChild(say);
+  if (live) {
+    wrap.style.borderLeft = "2px solid var(--accent)";
+    wrap.style.paddingLeft = "8px";
+    wrap.style.marginLeft = "-10px";
+  }
+  return wrap;
+}
+
+function paperScriptSlug(text, note) {
+  const bar = el("div", "", text);
+  bar.style.cssText = "font:700 11px/1.6 'Courier New',monospace;"
+    + "letter-spacing:.14em;color:#7ce8a9;border-top:1px solid #1b2735;"
+    + "border-bottom:1px solid #1b2735;padding:4px 0;margin:16px 0 10px";
+  if (note) {
+    const sub = el("span", "muted", "  " + note);
+    sub.style.cssText = "font-weight:400;letter-spacing:.04em;color:#6f8399";
+    bar.appendChild(sub);
+  }
+  return bar;
+}
+
+async function paperScriptLoad(quiet) {
+  if (!paperScriptPane) return;
+  const body = paperScriptPane.querySelector(".scr-body");
+  const strip = paperScriptPane.querySelector(".scr-hours");
+  if (!body) return;
+  if (!quiet) body.innerHTML = "<div class='muted' style='padding:20px'>reading the air log…</div>";
+  let got = null;
+  const roomJob = api("/api/director?most=24").catch(() => null);
+  try {
+    got = await api("/api/director/aired?back=12");
+  } catch (e) {
+    body.innerHTML = "";
+    body.appendChild(el("div", "muted", "The air log would not open: " + (e.message || e)));
+    return;
+  }
+  /* The running order is a second opinion and a slower one - about six
+   * seconds to serialise a System2 plan. The broadcast is drawn the
+   * moment it arrives and the running order is folded in when it does,
+   * so the live view is never waiting on the slower of two calls. */
+  const room = await Promise.race([
+    roomJob, new Promise((r) => setTimeout(() => r(null), 1200))]);
+  if (!room) roomJob.then((late) => {
+    if (late && paperView === "script" && paperScriptData === got) {
+      paperScriptRoom = late;
+      paperScriptLoad(true);
+    }
+  });
+  paperScriptData = got;
+
+  /* The scrubber: the hours that exist, newest last, live on the right. */
+  if (strip) {
+    strip.innerHTML = "";
+    const hours = got.hours || [];
+    hours.forEach((h, i) => {
+      const last = i === hours.length - 1;
+      const b = el("button", "", h.hour.slice(11) + " ");
+      const n = el("span", "muted", String(h.count));
+      n.style.cssText = "font-size:10px;margin-left:4px";
+      b.appendChild(n);
+      const on = paperScriptHour ? (paperScriptHour === h.hour) : last;
+      b.style.cssText = "padding:2px 8px;font-size:11px;border:1px solid "
+        + (on ? "var(--accent)" : "#22304a") + ";background:"
+        + (on ? "rgba(32,185,232,.14)" : "#0b1018");
+      b.title = h.hour + " — " + h.count + " lines that sounded, "
+        + Math.round(h.seconds) + "s of air";
+      b.onclick = () => {
+        paperScriptHour = last ? "" : h.hour;
+        paperScriptLoad();
+      };
+      strip.appendChild(b);
+    });
+    const live = el("button", "", "● LIVE");
+    live.style.cssText = "padding:2px 9px;font-size:11px;margin-left:8px;border:1px solid "
+      + (paperScriptHour ? "#22304a" : "var(--accent)") + ";background:"
+      + (paperScriptHour ? "#0b1018" : "rgba(124,232,169,.14)")
+      + ";color:" + (paperScriptHour ? "" : "#7ce8a9");
+    live.title = "Follow the broadcast as it happens";
+    live.onclick = () => { paperScriptHour = ""; paperScriptLoad(); };
+    strip.appendChild(live);
+  }
+
+  const hours = got.hours || [];
+  const showing = paperScriptHour
+    ? hours.find((h) => h.hour === paperScriptHour)
+    : hours[hours.length - 1];
+  body.innerHTML = "";
+  if (!showing) {
+    body.appendChild(el("div", "muted", "Nothing has aired in this window."));
+    return;
+  }
+
+  const title = el("div", "", "PINE BOX FM — " + showing.hour);
+  title.style.cssText = "font:700 14px/1.5 'Courier New',monospace;"
+    + "letter-spacing:.1em;text-align:center;margin:4px 0 2px;color:#e6eefc";
+  body.appendChild(title);
+  const sub = el("div", "muted", showing.count + " lines that sounded · "
+    + Math.round(showing.seconds) + "s of air"
+    + (paperScriptHour ? "" : " · following the broadcast"));
+  sub.style.cssText = "text-align:center;font-size:11px;margin:0 0 6px";
+  body.appendChild(sub);
+
+  /* WHAT IS SCRIPTED NEXT, off the running order - the half of this the
+   * air log cannot answer, because it has not happened yet. */
+  const sheet = room || paperScriptRoom;
+  if (!paperScriptHour && sheet && (sheet.entries || []).length) {
+    const now = Date.now() / 1000;
+    const coming = (sheet.entries || [])
+      .filter((e) => Number(e.start || 0) + 0 > now - 120)
+      .slice(0, 5);
+    if (coming.length) {
+      body.appendChild(paperScriptSlug("SCRIPTED NEXT", "off the running order"));
+      coming.forEach((e) => {
+        const on = Number(e.start || 0) <= now;
+        const line = el("div", "", "");
+        line.style.cssText = "font:12px/1.5 'Courier New',monospace;margin:0 0 4px;color:"
+          + (on ? "var(--accent)" : "#93a8c2");
+        const t = new Date(Number(e.start || 0) * 1000);
+        const clock = ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2);
+        const beats = ((e.beats || []).map((b) => b.note).filter(Boolean).join(" → "));
+        line.textContent = clock + "  " + (on ? "▶ " : "  ")
+          + String(e.label || e.kind) + "  (" + (e.minutes || 0) + "m)"
+          + (beats ? " — " + beats : "");
+        line.title = String(e.notes || "") + (e.script && e.script.state
+          ? "\nscript: " + e.script.state : "");
+        body.appendChild(line);
+      });
+    }
+  }
+
+  /* THE BROADCAST, as it sounded. */
+  body.appendChild(paperScriptSlug("AS BROADCAST", "every line that left the building"));
+  let round = "";
+  const lines = showing.lines || [];
+  lines.forEach((row, i) => {
+    const key = String(row.round || row.kind || "");
+    if (key && key !== round) {
+      round = key;
+      body.appendChild(paperScriptSlug(
+        "INT. PINE BOX FM — " + (PAPER_SCRIPT_SLUG[key] || key.toUpperCase())));
+    }
+    body.appendChild(paperScriptRow(row, !paperScriptHour && i === lines.length - 1));
+  });
+  if (!paperScriptHour) body.scrollTop = body.scrollHeight;
+}
+
+/* The note. It goes to the orchestrator's book against a SEGMENT KIND,
+ * which is what makes it change the next one of those rather than being
+ * a comment on one that has already gone out. */
+function paperScriptNoteBar() {
+  const bar = el("div", "", "");
+  bar.style.cssText = "display:flex;gap:6px;align-items:flex-start;"
+    + "padding:8px 12px;border-top:1px solid #1b2735;background:#070b12";
+  const kind = el("select", "", "");
+  [["banter", "the booth"], ["caller", "the phones"], ["manager", "upstairs"],
+   ["gallery", "the gallery"], ["news", "the news"], ["ad", "the breaks"],
+   ["recap", "the recap"], ["track_talk", "over the record"]]
+    .forEach(([v, label]) => {
+      const o = el("option", "", label);
+      o.value = v;
+      kind.appendChild(o);
+    });
+  kind.style.cssText = "flex:0 0 130px;font-size:12px";
+  kind.title = "Which segment this note is about. Every one of these from "
+    + "now on is written under it.";
+  const text = el("textarea", "", "");
+  text.placeholder = "Tell the orchestrator how this should go — "
+    + "\"the memo should land mid-sentence and they should argue about it\", "
+    + "\"stop opening every call the same way\"…";
+  text.style.cssText = "flex:1;min-height:44px;font-size:12px;resize:vertical";
+  const scope = el("select", "", "");
+  [["standing", "from now on"], ["next", "just the next one"]]
+    .forEach(([v, label]) => {
+      const o = el("option", "", label);
+      o.value = v;
+      scope.appendChild(o);
+    });
+  scope.style.cssText = "flex:0 0 120px;font-size:12px";
+  const send = el("button", "primary", "Send to the orchestrator");
+  send.style.cssText = "flex:0 0 auto;font-size:12px";
+  send.onclick = async () => {
+    const words = text.value.trim();
+    if (!words) { setStatus("A note with no words in it is not direction", true); return; }
+    send.disabled = true;
+    try {
+      const r = await api("/api/director/note", {method: "POST",
+        body: JSON.stringify({kind: kind.value, text: words,
+                              scope: scope.value, who: "operator"})});
+      text.value = "";
+      setStatus(r.say || "noted");
+    } catch (e) { setStatus(e.message || String(e), true); }
+    finally { send.disabled = false; }
+  };
+  bar.appendChild(kind);
+  bar.appendChild(text);
+  bar.appendChild(scope);
+  bar.appendChild(send);
+  return bar;
+}
+
+function paperScriptBuild() {
+  const pane = el("div", "", "");
+  pane.style.cssText = "flex:1;min-height:0;display:none;flex-direction:column;"
+    + "background:#05080d";
+  const hours = el("div", "scr-hours", "");
+  hours.style.cssText = "display:flex;gap:4px;flex-wrap:wrap;align-items:center;"
+    + "padding:7px 12px;border-bottom:1px solid #1b2735;overflow-x:auto";
+  const body = el("div", "scr-body", "");
+  body.style.cssText = "flex:1;min-height:0;overflow:auto;padding:14px 26px 26px;"
+    + "background:#080c13";
+  pane.appendChild(hours);
+  pane.appendChild(body);
+  pane.appendChild(paperScriptNoteBar());
+  return pane;
+}
+
+/* #1037: Newspaper | Tabloid. Remembered; the iframe reloads with ?style=.
+ * #1167: the button that calls this is now one of THREE, and the tab
+ * highlighting moved to paperViewSet - this keeps the style itself. */
 function paperStyleSet(style) {
   paperStyle = style === "tabloid" ? "tabloid" : "broadsheet";
   try { localStorage.setItem("paperStyle", paperStyle); } catch (e) {}
@@ -170060,13 +170518,17 @@ async function paperOpen() {
   tabs.style.cssText = "display:inline-flex;gap:0;border-radius:6px;overflow:hidden";
   paperStyleBtns = {};
   [["broadsheet", "Newspaper", "The newspaper: cream portrait pages, blackletter masthead, photographs and five columns"],
-   ["tabloid", "Tabloid", "The tabloid: the picture, the headline, the boxes, A4 when printed"]].forEach(([k, label, tip]) => {
-    const b = el("button", "", label);
-    b.title = tip;
-    b.onclick = () => paperStyleSet(k);
-    paperStyleBtns[k] = b;
-    tabs.appendChild(b);
-  });
+   ["tabloid", "Tabloid", "The tabloid: the picture, the headline, the boxes, A4 when printed"],
+   ["script", "Script", "The SHOW rather than the paper: every line that actually "
+    + "left the building, in screenplay form, live — with the hours behind "
+    + "it to scrub through and a note box that goes to the orchestrator"]]
+    .forEach(([k, label, tip]) => {
+      const b = el("button", "", label);
+      b.title = tip;
+      b.onclick = () => paperViewSet(k);      // #1167
+      paperStyleBtns[k] = b;
+      tabs.appendChild(b);
+    });
   head.appendChild(tabs);
   // #1029: the three exports, in the slots left of ◀ ▶
   const copy = el("button", "", "Copy");
@@ -170168,7 +170630,12 @@ async function paperOpen() {
   shade.onclick = (ev) => { if (ev.target === shade) paperClose(); };
   document.body.appendChild(shade);
   paperBox = shade;
-  paperStyleSet(paperStyle);
+  /* #1167: the script pane lives in the same box as the paper. */
+  try {
+    paperScriptPane = paperScriptBuild();
+    box.insertBefore(paperScriptPane, paperFrame.nextSibling);
+  } catch (e) { paperScriptPane = null; }
+  paperViewSet(paperStyle);
   if (!window.__paperFitListener) {
     window.__paperFitListener = true;
     window.addEventListener("message", (ev) => {
