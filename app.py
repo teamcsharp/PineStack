@@ -41291,6 +41291,22 @@ async def torrent_force_banter(track: dict[str, Any] | None,
     except Exception as exc:
         pipeline_log("drop", "torrent fallback banter failed",
                      extra=f"{type(exc).__name__}: {exc}"[:500])
+    # #1164: THE CUPBOARD, BEFORE THE CANNED LINE. This ladder had two
+    # rungs - the banter larder, then the emergency host - so an empty
+    # larder reached the emergency host in ONE step past a shelf holding
+    # seventy-four finished, tinted, recorded segments. Measured over the
+    # 3 PM hour: 38 emergency lines against 74 ready rounds and a rescue
+    # that had never once fired. The rescue's own 45-second rest still
+    # applies, so this cannot drain the shelf into a hole.
+    try:
+        _road = await dead_air_rescue(0.0)
+        if _road:
+            if isinstance(outcome, dict):
+                outcome["served_kind"] = _road
+            return True
+    except Exception as exc:  # noqa: BLE001
+        pipeline_log("drop", "the cupboard refused the torrent floor",
+                     extra=f"{type(exc).__name__}: {exc}"[:200])
     aired = await continuity_air(reason or "the next conversation is not ready")
     if aired and isinstance(outcome, dict):
         outcome["served_kind"] = "emergency_host"
@@ -42076,7 +42092,12 @@ async def dead_air_rescue(quiet: float) -> str:
 
     Returns the road that answered, or "" when the cupboard had nothing -
     in which case the caller's ordinary sting still happens and the room is
-    no worse off than before this existed."""
+    no worse off than before this existed.
+
+    #1164: `quiet` of 0 means the TORRENT FLOOR asked rather than the
+    silence watchdog - the show has run out of things to say and is about
+    to reach for the emergency host. There is no measured hole yet, which
+    is the point: the cupboard answers before one opens."""
     now = time.time()
     if now - _RESCUE_AT[0] < DEAD_AIR_RESCUE_REST:
         return ""
@@ -42111,9 +42132,11 @@ async def dead_air_rescue(quiet: float) -> str:
                          % (kind, type(exc).__name__))
             continue
         if said:
-            repair_note("dead air %ds - a finished %s round was taken out of "
-                        "the cupboard and put on the air (%d line(s))"
-                        % (int(quiet), kind, len(said)))
+            repair_note("%s - a finished %s round was taken out of the "
+                        "cupboard and put on the air (%d line(s))"
+                        % ("the show ran out of things to say" if quiet <= 0
+                           else "dead air %ds" % int(quiet),
+                           kind, len(said)))
             pipeline_log("air", "SILENCE FILLED: %d line(s) of a ready %s "
                                 "round, off the shelf, out of turn - the "
                                 "cupboard is for exactly this"
@@ -42164,13 +42187,20 @@ async def dead_air_watch() -> None:
                 "box", "both")
             _voice_boxed = (_RADIO.get("voice_to") or "box") in (
                 "box", "both")
+            # #1164: `_LAST_SYNTH` says "something rendered recently", and
+            # the thing rendering recently is very often the emergency
+            # host itself - so this guard was satisfied by exactly the
+            # filler the rescue below exists to replace. The room looked
+            # busy because it was full of the sound of it being covered.
+            # A render still means the room is not dead, so it still holds
+            # off a STRIKE; it no longer holds off the cupboard.
+            _rendering = time.time() - _LAST_SYNTH[0] < 45.0
             if ((now_really_playing() and (_room_gets_music
                                            or not _voice_boxed))
-                    or _SPEAKING[0] or _floor_busy()            # #1146
-                    or time.time() - _LAST_SYNTH[0] < 45.0):
+                    or _SPEAKING[0] or _floor_busy()):          # #1146
                 strikes = 0
                 heard = time.time()
-                continue                # airing, speaking, or rendering
+                continue                # airing or speaking
             if _voice_boxed and _BOX_LAST_OK[0] > 0:
                 # The VERIFIED stamp is the room's truth (#822): sound
                 # proven out of the device counts as heard.
@@ -42180,8 +42210,8 @@ async def dead_air_watch() -> None:
             # rather than counting it as a strike toward restarting the
             # whole show. Only genuine silence with nothing to play
             # escalates.
-            if _RADIO.get("now") and (_RADIO.get("queue")
-                                      or _RADIO.get("requests")):
+            if (not _rendering and _RADIO.get("now")
+                    and (_RADIO.get("queue") or _RADIO.get("requests"))):
                 pipeline_log("air", "the record ran out — dropping the needle "
                                     "on the next one")
                 _RADIO["now"] = None      # unpin, so the kick starts clean
@@ -42190,6 +42220,10 @@ async def dead_air_watch() -> None:
                 strikes = 0
                 continue
             quiet = time.time() - max(_SPOKE_AT[0], heard)
+            if _rendering and quiet <= DEAD_AIR_RESCUE_AFTER:
+                strikes = 0
+                heard = time.time()
+                continue                # a render is on its way out
             # 2026-09-10: THE CUPBOARD FIRST. A finished, tinted, recorded
             # segment beats a sting at filling a hole, and the shelf is
             # usually full of them - it just could not be reached, because
@@ -42212,7 +42246,9 @@ async def dead_air_watch() -> None:
                                        under_floor=True)
                 except Exception:  # noqa: BLE001
                     pass
-            if quiet <= limit:
+            if quiet <= limit or _rendering:
+                if _rendering:
+                    strikes = 0
                 continue
             strikes += 1
             # Repair mode is LOUD now (#382, #385): the ledger gets the
@@ -64842,6 +64878,15 @@ async def cover_the_gap(blocked: str = "dj", why: str = "") -> bool:
     # an ordinary cover to synthesize a new line and extend the outage.
     punctuated = ""
     if not talk_is_incessant() and talk_quiet_for() >= talk_quiet_limit():
+        # #1164: the cupboard first here too. Same ladder, same reason -
+        # and a finished round is the only one of the two answers that
+        # also gets the hour's work done.
+        try:
+            if await dead_air_rescue(talk_quiet_for()):
+                _COVER_AT[0] = time.time()
+                return True
+        except Exception:  # noqa: BLE001
+            pass
         if await continuity_air(why or "the hosts exceeded the speech-gap target"):
             _COVER_AT[0] = time.time()
             return True
