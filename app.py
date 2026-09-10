@@ -27002,6 +27002,24 @@ def profile_compatible(stored: Any, current: Any) -> bool:
         return False
     one.pop("turns", None)
     two.pop("turns", None)
+    # #1160: and the STORYLINE, for the same reason and on much harder
+    # evidence. The plot term is [id, act number], so it moves every time
+    # an act turns - three times an hour on a three-act hour - and each
+    # move made every finished round on every road non-viable at once.
+    # Measured: 167 recorded rounds across manager, gallery and caller
+    # dropped to a pool of zero the moment a storyline was switched on,
+    # and the hour that followed aired 58 phone calls and 41 emergency
+    # fillers against 0 manager and 0 gallery on a sheet that asked for
+    # five of them.
+    #
+    # A round banked before the story genuinely does not execute the
+    # story. It is still a finished, tinted, recorded round of the right
+    # road, and it is better radio than the filler that replaces it. The
+    # preference is kept where a preference belongs - _ready_shelf_row
+    # takes an in-plot round FIRST - rather than as a veto that empties
+    # the cupboard.
+    one.pop("plot", None)
+    two.pop("plot", None)
     return one == two
 
 
@@ -33511,6 +33529,114 @@ def dialogue_stock_seconds(kind: str, row: Any,
         return round(max(actual, min(900.0, estimate)), 3)
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def dialogue_stock_census(kind: str) -> dict[str, Any]:
+    """#1160: for one road, the FIRST test each held row fails.
+
+    Deliberately a second walk rather than instrumentation inside
+    `dialogue_stock_items`: that function runs on every five-second
+    planning pass for every road and must stay as cheap as it is. This
+    runs when a person asks a question, and answers it exactly.
+
+    The order of the tests is the order the binder applies them, so the
+    reason named here is the reason the binder stopped."""
+    road = str(kind or "")
+    now = time.time()
+    out: dict[str, Any] = {"kind": road, "rows": 0, "in_pool": 0,
+                           "why": {}, "sample": {}}
+    try:
+        profile = _larder_profile_signature()
+        tint_required = dialogue_tint_required()
+        source = list(_LARDER) if road == "banter" else list(
+            _SHELF.get(road) or [])
+        out["rows"] = len(source)
+        out["profile_wanted"] = str(profile)[:400]
+
+        def note(why: str, row: Any, entry: Any = None) -> None:
+            out["why"][why] = int(out["why"].get(why, 0)) + 1
+            if why not in out["sample"]:
+                bit = {"script": str((entry or row or {}).get("script")
+                                     or (row or {}).get("text") or "")[:110]}
+                if why == "profile":
+                    bit["profile_held"] = str(
+                        (entry or {}).get("profile"))[:400]
+                out["sample"][why] = bit
+
+        for row in source:
+            if not isinstance(row, dict):
+                note("not a row", row)
+                continue
+            if row.get("off_brief"):
+                note("off brief", row)
+                continue
+            try:
+                expiry = stock_expires_at(road, row)
+            except Exception:  # noqa: BLE001
+                expiry = 0
+            if expiry and expiry < now:
+                note("expired", row)
+                continue
+            entry = dialogue_entry(row)
+            if entry is None:
+                if not str(row.get("text_plain") or row.get("text")
+                           or "").strip():
+                    note("no words", row)
+                    continue
+            else:
+                if entry.get("off_brief"):
+                    note("off brief", row, entry)
+                    continue
+                if not profile_compatible(entry.get("profile"), profile):
+                    note("profile", row, entry)
+                    continue
+                if not str(entry.get("script_plain")
+                           or entry.get("script") or "").strip():
+                    note("no words", row, entry)
+                    continue
+                gate = globals().get("call_entry_contract")
+                if road == "caller" and callable(gate) and not gate(entry):
+                    note("phone contract", row, entry)
+                    continue
+            out["in_pool"] += 1
+            # Past viability the row IS in the pool; these say whether it
+            # could go out today rather than whether the binder can see it.
+            try:
+                tinted = True
+                if tint_required and entry is not None:
+                    t = str(entry.get("script_tinted") or "").strip()
+                    tinted = bool(
+                        t and str(entry.get("script") or "").strip() == t
+                        and str(entry.get("use") or "tinted") == "tinted")
+                if not tinted:
+                    note("in pool, waiting on the tint", row, entry)
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                if entry is not None:
+                    want = int(entry.get("chunks") or 0)
+                    made = int(entry.get("made") or 0)
+                    if want <= 0 or made < want or entry.get("partial"):
+                        note("in pool, part recorded", row, entry)
+                        continue
+                    keys = [str(k) for k in (entry.get("keys") or []) if str(k)]
+                    keys += [str(t.get("key") or "")
+                             for t in (entry.get("takes") or [])
+                             if isinstance(t, dict) and str(t.get("key") or "")]
+                    if not (keys and all(k in _PANTRY for k in set(keys))):
+                        note("in pool, audio missing from the pantry",
+                             row, entry)
+                        continue
+            except Exception:  # noqa: BLE001
+                pass
+            if row.get("aired_at") and not shelf_is_repeat(road, row):
+                note("in pool, aired and out of innings", row, entry)
+                continue
+            note("READY", row, entry)
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = "%s: %s" % (type(exc).__name__, exc)
+    return out
 
 
 def dialogue_stock_items(kind: str, include_unready: bool = True,
@@ -50102,6 +50228,7 @@ def plot_clause() -> str:
             "established as shared memory."
             + (" This is the FINAL act — land the ending before the "
                "story's time is out." if at >= of else "")
+            + plotline_run_clause(row)
             # #1157: and everything #907 had no way to say - how long
             # the story runs, how far through it is, what has ACTUALLY
             # happened so far, and the standing order to track it out
@@ -50169,6 +50296,11 @@ _PLOT_TICK = {"at": 0.0, "wrote": 0.0, "compacted": 0.0}
 _PLOT_SO_FAR_BUSY = [False]
 
 
+# #1159: the most runs a number may ask for. Saying "forever" takes -1,
+# which is a decision rather than a slip of the keyboard.
+PLOT_LOOPS_MOST = 999
+
+
 def plotline_acts(row: Any) -> list[str]:
     """The acts of a plot, blank ones dropped - the one place that decides
     what counts as an act, so a malformed plot is short rather than fatal."""
@@ -50186,6 +50318,29 @@ def plotline_span_seconds(row: Any) -> float:
                             float((row or {}).get("span_minutes") or 0))) * 60.0
     except Exception:  # noqa: BLE001
         return 0.0
+
+
+def plotline_loops(row: Any) -> int:
+    """How many MORE times this story runs after the one it is on.
+
+    0 is what every plot written before this does and keeps doing: play
+    once and land. A positive number is that many more runs. -1 is the
+    operator saying "until I stop it", which is the one this was asked
+    for - a serial that holds the world open for as long as he wants it
+    open."""
+    try:
+        got = int((row or {}).get("loops") or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+    return -1 if got < 0 else min(got, PLOT_LOOPS_MOST)
+
+
+def plotline_run(row: Any) -> int:
+    """Which time round this is, counting from one."""
+    try:
+        return max(1, int((row or {}).get("run") or 1))
+    except Exception:  # noqa: BLE001
+        return 1
 
 
 def plotline_frozen(row: Any = None) -> bool:
@@ -50393,6 +50548,7 @@ def plotline_arm(row: dict[str, Any], span_minutes: float,
     row["held"] = False
     row["done"] = False
     if restart or not row.get("air_elapsed"):
+        row["run"] = 1                       # #1159: a fresh serial
         row["air_elapsed"] = 0.0
         row["act_idx"] = 0
         row["act_live"] = 0
@@ -50662,6 +50818,64 @@ def _plotline_say_span(seconds: Any) -> str:
     return f"{hours:.1f} hours"
 
 
+def plotline_tint_clause(cap: int = 340) -> str:
+    """#1159: the live act, said short, for a road that is TREATING a line
+    rather than writing a round.
+
+    The full plot clause is six hundred words of standing orders about
+    staying in character and tracking the story out loud, which is
+    exactly right for a writer and swamps a rhymer whose whole job is one
+    line. This is the same fact in one sentence: here is the world, put
+    the line inside it."""
+    try:
+        row = plot_owns_air()
+        if not row:
+            return ""
+        act, at, of = plot_act_now(row)
+        if not act:
+            return ""
+        title = str(row.get("title") or "untitled")[:70]
+        say = ("AND THIS IS HAPPENING IN THE WORLD RIGHT NOW: \"" + title
+               + "\", act " + str(at) + " of " + str(of) + " - "
+               + str(act)[:cap]
+               + " The line you are treating is being said BY someone "
+               "inside that, so let it know: an image, a name, a turn of "
+               "phrase out of the story is worth more than a general one. "
+               "Never explain the story and never announce it.")
+        return say
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def plotline_run_clause(row: Any) -> str:
+    """#1159: what to say when the same story is running again.
+
+    Never pretend a repeat is a first time. The acts are the same shape
+    and the world is the same world, but this is a NEW pass through it
+    with different people, different calls and a different ending, and
+    saying so out loud is what makes a serial a serial rather than a
+    tape loop."""
+    try:
+        run = plotline_run(row)
+        if run <= 1:
+            return ""
+        left = plotline_loops(row)
+        return (
+            " THIS STORY HAS COME ROUND AGAIN — it is pass number "
+            + str(run) + " through the same acts"
+            + (", and it keeps going until the operator stops it"
+               if left < 0 else
+               (" with " + str(left) + " more to come" if left > 0
+                else ", and this is the last pass"))
+            + ". The world and the acts are the same; WHAT HAPPENS IN THEM "
+            "IS NOT. Different people, different calls, a different turn "
+            "and a different ending. The booth may say the thing is "
+            "happening AGAIN — that is the joke and it is allowed — but "
+            "never repeat a line, a name or a gag from an earlier pass.")
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def plotline_extra_clause(row: Any, at: int = 0, of: int = 0) -> str:
     """What plot_clause() could not say before: the SPAN, the position on
     the clock, the running account, and the order to track it OUT LOUD.
@@ -50907,6 +51121,45 @@ async def plotline_tick() -> None:
                 span = plotline_span_seconds(row)
                 gone = float(row.get("air_elapsed") or 0.0)
                 if not acts or gone >= span:
+                    # #1159: another run on it? Then this is not an ending,
+                    # it is a curtain. The act marks and the story-so-far
+                    # are cleared so act one opens on a clean clock; the
+                    # BEATS ledger is left alone, because what aired
+                    # actually aired and the serial column reads from it.
+                    _left = plotline_loops(row) if acts else 0
+                    if _left:
+                        if _left > 0:
+                            row["loops"] = _left - 1
+                        row["run"] = plotline_run(row) + 1
+                        row["air_elapsed"] = 0.0
+                        row["started_at"] = now
+                        row["ticked_at"] = now
+                        row["act_idx"] = 0
+                        row["act_live"] = 0
+                        row["act_marks"] = {}
+                        row["so_far"] = ""
+                        row["so_far_act"] = 0
+                        row["so_far_at"] = 0.0
+                        row["half_hour_until"] = now + span
+                        try:
+                            row["half_hour"] = _plot_half_key(now)
+                        except Exception:  # noqa: BLE001
+                            pass
+                        turned = {"id": str(row.get("id") or ""),
+                                  "act": 1, "of": len(acts), "at": now,
+                                  "run": row["run"]}
+                        pipeline_log(
+                            "air", "the storyline \"%s\" has come round "
+                            "again - run %d, act 1 of %d, %s"
+                            % (str(row.get("title") or "")[:50],
+                               row["run"], len(acts),
+                               "until it is stopped"
+                               if plotline_loops(row) < 0
+                               else "%d more run(s) after this"
+                                    % plotline_loops(row)))
+                        if not live_row and plotline_live(row):
+                            live_row = dict(row)
+                        continue
                     row["done"], row["active"] = True, False
                     row["act_idx"] = max(0, len(acts) - 1)
                     landed = str(row.get("title") or "")[:60]
@@ -51066,16 +51319,27 @@ async def dj_plots_save(
                      if _span not in (None, "") else 0.0)
         except Exception:  # noqa: BLE001
             _span = 0.0
+        # #1159: and HOW MANY TIMES. -1 is "until I stop it"; absent
+        # leaves an edited plot as it was and a new one playing once.
+        _loops = payload.get("loops", None)
+        try:
+            _loops = (max(-1, min(PLOT_LOOPS_MOST, int(_loops)))
+                      if _loops not in (None, "") else None)
+        except Exception:  # noqa: BLE001
+            _loops = None
         if row:
             row.update({"title": title, "acts": acts})
             if _span:
                 row["span_minutes"] = round(_span, 2)
+            if _loops is not None:
+                row["loops"] = _loops
             if row.get("act_idx", 0) > len(acts):
                 row["act_idx"] = 0
         else:
             row = {"id": uuid.uuid4().hex[:12], "title": title, "acts": acts,
                    "act_idx": 0, "active": False, "done": False,
                    "span_minutes": round(_span or 60.0, 2),
+                   "loops": int(_loops or 0), "run": 1,
                    "ts": int(time.time())}
             rows.append(row)
         plot_write(rows)
@@ -63458,6 +63722,30 @@ def _ready_shelf_row(kind: str) -> dict[str, Any] | None:
             return False
         takes = _ready_round_takes(kind, row)
         return bool(takes) and _ready_round_fits(kind, takes, window)
+
+    # #1160: a round written INSIDE the live act goes first. This used to
+    # be enforced by profile_compatible refusing everything else, which
+    # emptied the cupboard every time an act turned; as a preference it
+    # costs one extra pass over the shelf and nothing else, and the
+    # fallback is a finished round rather than an emergency filler.
+    try:
+        want = str(json.loads(_larder_profile_signature()).get("plot") or [])
+    except Exception:  # noqa: BLE001
+        want = ""
+    if want and want != "[]":
+        def in_plot(row: Any) -> bool:
+            if not eligible(row):
+                return False
+            try:
+                entry = dialogue_entry(row) or {}
+                held = json.loads(str(entry.get("profile") or "{}"))
+                return str(held.get("plot") or []) == want
+            except Exception:  # noqa: BLE001
+                return False
+
+        got = shelf_take(kind, peek=True, predicate=in_plot)
+        if got is not None:
+            return got
 
     return shelf_take(kind, peek=True, predicate=eligible)
 
@@ -84457,6 +84745,16 @@ def crystal_clause(bank: bool = False) -> str:
                 "mouths, segues and station business get reframed "
                 "through its world, and even the complaints sound like "
                 "its verses (#809).")
+    # #1159: and WHAT IS GOING ON while it talks that way. The crystal is
+    # the voice; the plot is the world. A rhyme written with no idea a
+    # manhunt is on is a rhyme about nothing, which is what the deep lane
+    # has been producing whenever a story was live.
+    try:
+        _plot = plotline_tint_clause()
+        if _plot:
+            parts.append(_plot)
+    except Exception:  # noqa: BLE001
+        pass                # a broken plotline never silences the crystal
     return "\n" + " ".join(parts) + "\n"
 
 
@@ -98939,6 +99237,13 @@ def director_why(kind: str) -> dict[str, Any]:
         }
     except Exception as exc:                       # noqa: BLE001
         out["pool"] = {"error": type(exc).__name__}
+    # #1160: and when the pool is EMPTY while the shelf is full, which of
+    # the binder's tests is saying no. One number that meant eight things
+    # now says which one.
+    try:
+        out["census"] = dialogue_stock_census(kind)
+    except Exception as exc:                       # noqa: BLE001
+        out["census"] = {"error": type(exc).__name__}
     try:
         board = commit_board(ahead=24)
     except Exception:                              # noqa: BLE001
@@ -114834,6 +115139,13 @@ async def _paper_write_inner(desk: str, brief: str, material: str,
         "BODY:\n<" + f"{words[0]} to {words[1]}" + " words in two to four "
         "paragraphs separated by blank lines>")
     user = f"DESK: {desk}\n\nBRIEF: {brief}\n\nMATERIAL:\n{material}"
+    # #1159: the paper is published inside the story, not beside it.
+    try:
+        _plot = plotline_paper_clause()
+        if _plot:
+            user += _plot
+    except Exception:  # noqa: BLE001
+        pass                    # a broken plotline never stops the press
     if desk == "City Correspondents":
         system = (
             "Write fictional neighbourhood news around the named radio station. "
@@ -115681,6 +115993,40 @@ def _paper_seed_draw(n: int) -> list[dict[str, Any]]:
         if len(out) >= n:
             break
     return out
+
+
+def plotline_paper_clause() -> str:
+    """#1159: what the Gazette's desks are told about the live storyline.
+
+    Held apart from the booth's clause because a NEWSPAPER stands in a
+    different relation to a story than the people living through it: it
+    reports, it takes small ads about it, it runs notices - it does not
+    perform it. And the standing rule of every desk still holds over the
+    top of this: what the paper REPORTS is what actually aired, and this
+    clause may not be read as licence to invent a bulletin."""
+    try:
+        row = plot_owns_air()
+        if not row:
+            return ""
+        act, at, of = plot_act_now(row)
+        if not act:
+            return ""
+        title = str(row.get("title") or "untitled")[:90]
+        return (
+            "\n\nTHE CITY IS IN THE MIDDLE OF A STORY, and this edition is "
+            "published inside it: \"" + title + "\" - act " + str(at)
+            + " of " + str(of) + ", in which " + str(act)[:400]
+            + "\nWrite this desk's copy as a paper in that city would: the "
+            "notices, the small ads, the obituaries, the for-sale column "
+            "and the city page all have people living through it. Let it "
+            "show in the details rather than the headline - a lost-and-"
+            "found notice that only makes sense if you know, a price that "
+            "has moved because of it, a neighbour who will not come out. "
+            "This does NOT license you to invent anything the station is "
+            "reported to have aired: what the ledgers say happened is "
+            "still the only thing that happened.")
+    except Exception:  # noqa: BLE001
+        return ""
 
 
 async def paper_seeds(n: int = 2) -> list[dict[str, Any]]:
@@ -158735,6 +159081,28 @@ async function plotOpen() {
   spanRow.appendChild(unit);
   spanRow.appendChild(startAt);
   card.appendChild(spanRow);
+
+  /* #1159: and how many times it runs. A span says how long ONE pass
+     takes; this says whether the world closes at the end of it. */
+  const loopRow = el("div", "row", "");
+  loopRow.style.cssText = "gap:6px;align-items:center;margin-bottom:6px";
+  const loops = el("select", "", "");
+  [["0", "plays once, then it is over"],
+   ["1", "plays twice"],
+   ["2", "plays three times"],
+   ["5", "plays six times"],
+   ["-1", "keeps running until I stop it"]].forEach((pair) => {
+    const opt = el("option", "", pair[1]);
+    opt.value = pair[0];
+    loops.appendChild(opt);
+  });
+  loops.style.cssText = "flex:1";
+  loops.title = "Each pass runs the whole span again from act one. The acts "
+    + "are the same; who is in them, what they call about and how it ends "
+    + "are not — the booth is told which time round it is and told not to "
+    + "repeat a line from an earlier pass.";
+  loopRow.appendChild(loops);
+  card.appendChild(loopRow);
   const minutesNow = () => Math.max(
     1, Math.round((Number(span.value) || 1) * (Number(unit.value) || 1)));
 
@@ -158746,9 +159114,14 @@ async function plotOpen() {
     try {
       await api("/api/dj/plots", {method: "POST", body: JSON.stringify({
         id: editing, title: title.value.trim(), text: acts.value,
-        span_minutes: minutesNow()})});
-      status.textContent = "saved ✓";
+        span_minutes: minutesNow(), loops: Number(loops.value)})});
+      status.textContent = "saved ✓" + (Number(loops.value)
+        ? (Number(loops.value) < 0
+            ? " — it will keep coming round until you stop it"
+            : " — it will run " + (Number(loops.value) + 1) + " times")
+        : "");
       editing = ""; title.value = ""; acts.value = "";
+      loops.value = "0";
       plotList();
     } catch (e) { status.textContent = e.message; }
   };
@@ -158779,9 +159152,14 @@ async function plotOpen() {
         row.style.cssText = "align-items:center;gap:6px;margin:3px 0";
         const n = (p.acts || []).length;
         const prog = p.progress || {};
+        const runs = Number(p.loops || 0);
+        const pass = Number(p.run || 1);
+        const round_ = pass > 1 ? " · pass " + pass : "";
+        const loopSay = runs < 0 ? " · ♾ looping"
+          : (runs > 0 ? " · " + runs + " more run(s)" : "");
         const state = (p.owns_air
-          ? "🔴 act " + (prog.act || 1) + "/" + (prog.of || n) + " · "
-            + plotSpanSay(prog.remaining) + " left"
+          ? "🔴 act " + (prog.act || 1) + "/" + (prog.of || n) + round_ + loopSay
+            + " · " + plotSpanSay(prog.remaining) + " left"
           : p.done ? "✅ played out"
             : p.active ? "· armed" : "· " + n + " acts")
           + (prog.span_seconds
@@ -158794,6 +159172,9 @@ async function plotOpen() {
         label.onclick = () => {
           editing = p.id; title.value = p.title || "";
           acts.value = (p.acts || []).join("\n");
+          const lp = Number(p.loops || 0);
+          loops.value = [0, 1, 2, 5, -1].indexOf(lp) >= 0
+            ? String(lp) : (lp < 0 ? "-1" : "5");
           const mins = Number(prog.span_minutes || p.span_minutes || 60);
           if (mins && mins % 60 === 0) {
             unit.value = "60"; span.value = String(mins / 60);
