@@ -285,3 +285,189 @@ def director_sheet() -> dict[str, Any]:
             cell[key].sort(key=lambda r: float(r.get("at") or 0))
             del cell[key][:-40]
     return {"kinds": by_kind, "at": book.get("at")}
+
+
+# --- 2026-09-10: THE SCRIPT DESK -----------------------------------------
+#
+#    "But every segment that happens on the show should be submitting to me a
+#     script that I'm capable of making interjections and edits for that feeds
+#     the main system that tells it how to react and behave... So I want to
+#     perfect the script before we even get to the tinting phase."
+#
+# APPROVAL UPGRADES A SEGMENT, IT NEVER BLOCKS ONE. The station runs at an
+# engine load of 0.997 - it cannot voice its own hour with any margin - so a
+# gate that HELD segments for a human would not produce better radio, it would
+# produce silence, and the first rule of this station is that the air is never
+# dead. So a segment that reaches its slot unapproved airs exactly as it does
+# today and is stamped as having gone out unreviewed. The room shows what
+# escaped; nothing ever waits on a person.
+#
+# WHY THE EDIT IS THE TRAINING DATA. A note says what you wanted. An edit
+# shows it. `was` and `now` on the same turn, in the same context, is the
+# highest-signal pair the station can be given about how the operator actually
+# wants a seat to sound, and it costs nothing to collect because it is a
+# by-product of the work. Every edit is kept with both halves.
+#
+# WHAT AN EDIT COSTS. The takes are content-addressed - `pantry_key(text,
+# voice, engine)` - and _ready_round_takes refuses a round whose script and
+# takes disagree. So rewriting a turn re-keys THAT TAKE and no other: the
+# round leaves the ready set until one line is re-recorded, then comes back.
+# One line of engine, not a round. That is why editing is affordable here at
+# all, and it is why the edit must rewrite the take beside the script rather
+# than the script alone - the script alone would silently make the whole
+# round unusable and the segment would simply stop appearing.
+
+DIRECTOR_SCRIPTS = "director_scripts.json"
+_SCRIPT_MEM: dict[str, Any] | None = None
+_SCRIPT_LOCK = RLock()
+# Records kept. One per occurrence; an hour is twenty, so this is a fortnight.
+DIRECTOR_SCRIPT_KEEP = 600
+
+
+def _scripts_path() -> Path:
+    return director_path().parent / DIRECTOR_SCRIPTS
+
+
+def scripts_read() -> dict[str, Any]:
+    global _SCRIPT_MEM
+    with _SCRIPT_LOCK:
+        if _SCRIPT_MEM is None:
+            try:
+                _SCRIPT_MEM = json.loads(
+                    _scripts_path().read_text(encoding="utf-8")) or {}
+            except Exception:                      # noqa: BLE001
+                _SCRIPT_MEM = {}
+            if not isinstance(_SCRIPT_MEM.get("segments"), dict):
+                _SCRIPT_MEM = {"version": 1, "segments": {}}
+        return _SCRIPT_MEM
+
+
+def scripts_write(rows: dict[str, Any]) -> None:
+    global _SCRIPT_MEM
+    with _SCRIPT_LOCK:
+        _SCRIPT_MEM = rows
+        rows["at"] = time.time()
+        segments = rows.get("segments") or {}
+        if len(segments) > DIRECTOR_SCRIPT_KEEP:
+            order = sorted(segments.items(),
+                           key=lambda kv: float((kv[1] or {}).get("at") or 0))
+            for key, _row in order[:len(segments) - DIRECTOR_SCRIPT_KEEP]:
+                segments.pop(key, None)
+        try:
+            path = _scripts_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rows, indent=1, ensure_ascii=False),
+                           encoding="utf-8")
+            os.replace(str(tmp), str(path))
+        except Exception:                          # noqa: BLE001
+            pass
+
+
+def script_record(occurrence: str, make: bool = False) -> dict[str, Any]:
+    """The desk's record for one occurrence of one segment."""
+    book = scripts_read()
+    segments = book.setdefault("segments", {})
+    row = segments.get(str(occurrence))
+    if row is None:
+        if not make:
+            return {}
+        row = {"occurrence": str(occurrence), "at": time.time(),
+               "edits": [], "approved_at": 0.0, "approved_by": "",
+               "tint_approved_at": 0.0, "aired_unapproved_at": 0.0,
+               "kind": "", "candidate": ""}
+        segments[str(occurrence)] = row
+    return row
+
+
+def script_state(occurrence: str) -> dict[str, Any]:
+    """What the room needs to colour one segment: approved, edited, escaped."""
+    row = script_record(occurrence)
+    if not row:
+        return {"approved": False, "edits": 0, "tint_approved": False,
+                "aired_unapproved": False, "state": "unreviewed"}
+    approved = bool(row.get("approved_at"))
+    escaped = bool(row.get("aired_unapproved_at"))
+    return {"approved": approved,
+            "approved_at": float(row.get("approved_at") or 0),
+            "approved_by": str(row.get("approved_by") or ""),
+            "edits": len(row.get("edits") or []),
+            "tint_approved": bool(row.get("tint_approved_at")),
+            "aired_unapproved": escaped,
+            "state": ("aired unapproved" if escaped and not approved
+                      else "approved" if approved
+                      else "edited" if row.get("edits") else "unreviewed")}
+
+
+def script_note_edit(occurrence: str, kind: str, index: int,
+                     was: str, now: str, seat: str = "",
+                     candidate: str = "") -> dict[str, Any]:
+    """Keep both halves of one rewrite - this is the training pair."""
+    row = script_record(occurrence, make=True)
+    row["kind"] = str(kind or row.get("kind") or "")
+    if candidate:
+        row["candidate"] = str(candidate)
+    edit = {"index": int(index), "seat": str(seat or ""),
+            "was": str(was or "")[:2000], "now": str(now or "")[:2000],
+            "at": time.time()}
+    row.setdefault("edits", []).append(edit)
+    del row["edits"][:-60]
+    # An edit un-approves: the thing that was approved is not the thing that
+    # would now air. Re-approving after editing is the operator saying yes to
+    # what they just wrote.
+    row["approved_at"] = 0.0
+    scripts_write(scripts_read())
+    return edit
+
+
+def script_approve(occurrence: str, who: str = "operator",
+                   tint: bool = False) -> dict[str, Any]:
+    row = script_record(occurrence, make=True)
+    if tint:
+        row["tint_approved_at"] = time.time()
+    else:
+        row["approved_at"] = time.time()
+        row["approved_by"] = str(who or "operator")[:40]
+    scripts_write(scripts_read())
+    return script_state(occurrence)
+
+
+def script_mark_aired(occurrence: str) -> None:
+    """Stamp a segment that went out without having been approved.
+
+    Only ever a record. Nothing here can stop or delay an airing."""
+    try:
+        row = script_record(occurrence)
+        if not row or row.get("approved_at") or row.get("aired_unapproved_at"):
+            return
+        row["aired_unapproved_at"] = time.time()
+        scripts_write(scripts_read())
+    except Exception:                              # noqa: BLE001
+        pass
+
+
+def script_lessons(kind: str = "", most: int = 40) -> list[dict[str, Any]]:
+    """Every rewrite the operator has made, newest first.
+
+    This is what the learning side reads: `was` is what the station wrote
+    unprompted, `now` is what the person who owns the station wanted it to
+    say, and the pair are in the same seat of the same kind of segment."""
+    out: list[dict[str, Any]] = []
+    for occurrence, row in (scripts_read().get("segments") or {}).items():
+        if kind and str((row or {}).get("kind") or "") != str(kind):
+            continue
+        for edit in (row or {}).get("edits") or []:
+            out.append({**edit, "occurrence": occurrence,
+                        "kind": str((row or {}).get("kind") or "")})
+    out.sort(key=lambda r: float(r.get("at") or 0), reverse=True)
+    return out[:max(1, int(most))]
+
+
+def script_candidate(occurrence: str) -> str:
+    """The candidate this occurrence was last bound to.
+
+    Remembered so a segment the operator has edited can still be FOUND
+    while it is out of the ready set re-recording the line they changed -
+    otherwise the room loses sight of the segment at exactly the moment
+    they are working on it, which reads as the edit having deleted it."""
+    return str((script_record(occurrence) or {}).get("candidate") or "")

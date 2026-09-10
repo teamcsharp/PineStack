@@ -51,7 +51,9 @@ from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
 from director import (director_add, director_clause, director_notes,
                       director_path, director_restore, director_retire,
-                      director_sheet, director_spend, director_touch)
+                      director_sheet, director_spend, director_touch,
+                      script_approve, script_candidate, script_lessons,
+                      script_mark_aired, script_note_edit, script_state)
 from crystal_acceptance import evaluate_acceptance as crystal_editorial_acceptance
 from prompt_learning import PromptLearningStore, _patterns as crystal_learning_patterns
 from response_bank import ResponseBank, add_listening_responses
@@ -44988,6 +44990,10 @@ def _schedule_action_complete(kind: str, occurrence: str) -> None:
     try:
         director_spend(kind, occurrence=occurrence)
         director_touch(kind)
+        # 2026-09-10: and if it went out without having been approved, that
+        # is recorded here too. A RECORD, never a gate - see the note on
+        # api_director_approve. The room shows what escaped.
+        script_mark_aired(occurrence)
     except Exception:  # noqa: BLE001
         pass                    # the book is direction, not the show
     if not occurrence:
@@ -97062,6 +97068,26 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
             head = str((drafts[0] or {}).get("script") or "")
             out["draft_head"] = " ".join(head.split())[:240]
         if not allocations:
+            # An edited segment is still THIS segment while it re-records
+            # the line that was changed. Show its words and say why it is
+            # not bound rather than reporting it as empty.
+            try:
+                kept = director_segment_row(str(slot.get("id") or ""))
+                if kept:
+                    kept_entry = dialogue_entry(kept[1]) or {}
+                    said = str(kept_entry.get("script") or "")
+                    if said.strip():
+                        out["state"] = "re-recording an edited line"
+                        out["live"] = True
+                        out["candidate"] = kept[2]
+                        for marker, turn in banter_turns(said):
+                            out["turns"].append(
+                                {"seat": str(marker or ""),
+                                 "who": _director_seat(str(marker or "")),
+                                 "text": str(turn or "")[:900]})
+                        return out
+            except Exception:  # noqa: BLE001
+                pass
             out["state"] = "drafts waiting" if drafts else "nothing"
             return out
         picked = (allocations[0] or {}).get("candidate") or {}
@@ -97072,7 +97098,28 @@ def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
         if isinstance(src, dict):
             out["source"] = str(src.get("caller_name")
                                 or src.get("prep_name") or "")
-        for marker, said in banter_turns(str(picked.get("script") or "")):
+        # 2026-09-10: THE LIVE ENTRY, NOT THE CANDIDATE'S SNAPSHOT.
+        #
+        # A candidate carries the script as it stood when the candidate was
+        # written; the row on the shelf is what actually gets rendered and
+        # dispatched. Normally identical - but the moment the operator
+        # rewrites a turn they diverge, and reading the snapshot here meant
+        # the room showed the OLD words back to the person who had just
+        # changed them, and then refused their next edit on that turn
+        # because the `was` it handed back no longer matched. Measured on
+        # the first live edit. The room is meant to be one-to-one with what
+        # is going to air, so it reads what is going to air.
+        script = str(picked.get("script") or "")
+        try:
+            live_row = director_segment_row(str(slot.get("id") or ""))
+            if live_row:
+                live_entry = dialogue_entry(live_row[1]) or {}
+                if str(live_entry.get("script") or "").strip():
+                    script = str(live_entry["script"])
+                    out["live"] = True
+        except Exception:  # noqa: BLE001
+            pass
+        for marker, said in banter_turns(script):
             out["turns"].append({"seat": str(marker or ""),
                                  "who": _director_seat(str(marker or "")),
                                  "text": str(said or "")[:900]})
@@ -97148,6 +97195,12 @@ def director_room(which: int = 0) -> dict[str, Any]:
                     "aired": [], "aired_seconds": 0.0,
                     "direction": _director_direction(
                         kind, str(slot.get("id") or ""), ""),
+                    # Same shape as the planned path, so the room never has
+                    # to ask which branch built a row.
+                    "review": {"approved": False, "edits": 0,
+                               "tint_approved": False,
+                               "aired_unapproved": False,
+                               "state": "unplanned"},
                 })
                 at += owns
         except Exception as exc:  # noqa: BLE001
@@ -97170,6 +97223,10 @@ def director_room(which: int = 0) -> dict[str, Any]:
             state = "aired" if heard > 1.0 else "went by with nothing"
         elif script["state"] == "bound":
             state = "planned"
+        elif script["state"] == "re-recording an edited line":
+            # Not "nothing behind it": there IS something behind it, it is
+            # the operator's own rewrite, and it is being recorded.
+            state = "re-recording your edit"
         elif script["drafts"]:
             state = "drafts waiting"
         else:
@@ -97193,6 +97250,7 @@ def director_room(which: int = 0) -> dict[str, Any]:
             "direction": _director_direction(
                 kind, str(slot.get("template_id") or ""),
                 str(slot.get("id") or "")),
+            "review": script_state(str(slot.get("id") or "")),
         })
     # WHAT THE HOUR COSTS TO VOICE. The room says this out loud because it
     # is the reason the long-round roads starve: the marginal render term
@@ -97237,6 +97295,232 @@ async def api_director(hour: int = 0) -> dict[str, Any]:
     """The hourly script. Off the loop: it folds the air-log index and
     serialises a whole System2 plan, both of which hold the GIL."""
     return await asyncio.to_thread(director_room, int(hour or 0))
+
+
+DIRECTOR_ENGINES = ("piper", "xtts", "f5", "voxtral")
+
+
+def director_segment_row(occurrence: str) -> tuple[str, Any, str] | None:
+    """The (kind, shelf row, candidate id) a System2 occurrence is bound to."""
+    try:
+        runtime = globals().get("_system2")
+        if not runtime:
+            return None
+        live = runtime()
+        for hour in list(live._plans) + list(live._event_plans):
+            for slot in hour.get("slots") or []:
+                if str(slot.get("id") or "") != str(occurrence):
+                    continue
+                for allocation in slot.get("allocations") or []:
+                    picked = (allocation or {}).get("candidate") or {}
+                    row = live._rows.get(str(picked.get("id") or ""))
+                    if row:
+                        return (row[0], row[1], str(picked.get("id") or ""))
+                break
+        # No allocation standing. An EDITED segment is the ordinary reason:
+        # re-keying a take makes the round a pantry miss, so it leaves the
+        # ready set until that one line is recorded and System2 drops the
+        # allocation meanwhile. The desk remembers which candidate the
+        # occurrence was bound to, so the segment can still be found - and
+        # edited again - while it is away being finished. Without this the
+        # room goes blank on the segment the moment you change it, which
+        # reads as the edit having destroyed it.
+        remembered = script_candidate(str(occurrence))
+        if remembered:
+            row = live._rows.get(remembered)
+            if row:
+                return (row[0], row[1], remembered)
+    except Exception:                              # noqa: BLE001
+        return None
+    return None
+
+
+def director_edit_turn(occurrence: str, index: int, said: str,
+                       expect: str = "") -> dict[str, Any]:
+    """Rewrite one turn of a bound segment, and its take with it.
+
+    THE TAKE IS THE HARD PART. `_ready_round_takes` refuses a round whose
+    saved performances do not agree with its script, word for word - so
+    rewriting `entry["script"]` alone does not edit a segment, it DELETES
+    one: the round silently leaves the ready set and never comes back,
+    and the operator would see their edit accepted and the segment quietly
+    stop appearing. The take has to be re-keyed beside it.
+
+    Takes are content-addressed on `pantry_key(text, voice, engine)`, so
+    the new key is a pantry MISS and the round leaves the ready set until
+    the keeper's finishing pass re-records that one line - which it already
+    does for half-rendered rounds. One line of engine, not a round.
+
+    Matched on TEXT rather than position: `entry["chunks"]` counts padded
+    speech chunks and the turn list is not one-to-one with it, so trusting
+    an index here would re-key the wrong line's audio. If no take matches,
+    the edit is REFUSED and says why - a corrupted round is a worse answer
+    than a rejected edit."""
+    said = " ".join(str(said or "").split())
+    if not said:
+        raise HTTPException(400, "an empty turn is a deletion, not an edit")
+    got = director_segment_row(occurrence)
+    if not got:
+        raise HTTPException(404, "nothing is bound to that occurrence yet - "
+                                 "a segment can be edited once the hour has "
+                                 "chosen what fills it")
+    kind, row, candidate = got
+    entry = dialogue_entry(row)
+    if not entry or not str(entry.get("script") or "").strip():
+        raise HTTPException(409, "that segment has no script to edit")
+    # 2026-09-10: DO NOT WRITE INTO KEPT MATERIAL.
+    #
+    # Measured the first time this ran against the live station: the edit
+    # was applied, persisted, read back off the shelf - and an hour later
+    # the row held its ORIGINAL words again and the rewrite had never
+    # aired. The round was `frozen` and had already gone out at 20:51 the
+    # night before; it was a KEPT round on its second innings, and a
+    # frozen row is restored from the kept copy. So the operator's rewrite
+    # was accepted, acknowledged, and silently thrown away - the worst
+    # possible outcome, and exactly what an edit surface must never do.
+    #
+    # A frozen or already-aired round is shared material - the retirement
+    # desk's whole rule is that a finished round is not destroyed - so it
+    # is refused here rather than mutated. Fresh unaired rows exist on
+    # every dialogue road (measured: gallery 8, manager 6, caller 9,
+    # news 2 of the shelf at the time of writing) and those edit properly.
+    if entry.get("frozen"):
+        raise HTTPException(
+            409, "that round is kept material - it has aired before and is "
+                 "held for reuse, so an edit to it would be restored from "
+                 "the kept copy and lost. Edit a segment that has not gone "
+                 "out yet.")
+    if row.get("aired") or row.get("aired_at") or entry.get("aired_at"):
+        raise HTTPException(
+            409, "that round has already aired. Rewriting it now would "
+                 "change a recording of something the station has already "
+                 "said; direct the next one instead - a standing note on "
+                 "this segment kind is the way to do that.")
+    caller_name = str(entry.get("caller_name") or "")
+    turns = banter_turns(str(entry["script"]), caller_name)
+    index = int(index)
+    if not 0 <= index < len(turns):
+        raise HTTPException(400, "there is no turn %d in a %d turn script"
+                            % (index, len(turns)))
+    marker, was = turns[index]
+    was = " ".join(str(was or "").split())
+    # The room draws its turns from the CANDIDATE's script, which is a
+    # snapshot taken when the candidate was written; this edits the LIVE
+    # entry. Normally the same string, but they are two objects and an
+    # index that has drifted would re-key a turn the operator never looked
+    # at. `expect` is the text the operator actually had in front of them,
+    # so a drifted index is refused instead of silently rewriting the
+    # wrong line.
+    expect = " ".join(str(expect or "").split())
+    if expect and expect != was:
+        raise HTTPException(
+            409, "that segment has changed since you opened it - the turn "
+                 "there now reads differently. Re-read the hour and edit "
+                 "it again.")
+    if was == said:
+        return {"ok": True, "changed": False,
+                "say": "that is what it already said"}
+    spoken_was = " ".join(spoken_text(was).split())
+    takes = list(entry.get("takes") or [])
+    hit = None
+    for take in takes:
+        text = " ".join(str(take.get("text") or "").split())
+        if text and (text == spoken_was or text == was):
+            hit = take
+            break
+    if hit is None:
+        raise HTTPException(
+            409, "that turn has no matching recording, so editing it would "
+                 "leave the round unusable rather than changed. It can be "
+                 "edited once the segment has been recorded.")
+    voice = str(hit.get("voice") or "")
+    engine = next((e for e in DIRECTOR_ENGINES
+                   if pantry_key(str(hit.get("text") or ""), voice, e)
+                   == str(hit.get("key") or "")), "")
+    if not engine:
+        raise HTTPException(409, "that recording's engine cannot be "
+                                 "identified, so its replacement could not "
+                                 "be keyed")
+    spoken_now = " ".join(spoken_text(said).split())
+    # The script, rebuilt with this one turn replaced and every other turn
+    # exactly as it was.
+    rebuilt = []
+    for at, (mark, text) in enumerate(turns):
+        rebuilt.append("%s: %s" % (mark, said if at == index
+                                   else " ".join(str(text).split())))
+    entry["script"] = "\n".join(rebuilt)
+    hit["text"] = spoken_now
+    hit["key"] = pantry_key(spoken_now, voice, engine)
+    # `freshened` is a FLAG - "the model visit has been paid for" - not a
+    # stamp. Set truthy so nothing hands this rewritten round back to the
+    # writing room to be reworded; a float would have worked by accident.
+    entry["freshened"] = True
+    # Both stores keep this entry by reference, so the mutation above is
+    # already live; these only ask for it to be written down. The shelf is
+    # a 13.5 MB dump (#1156) - _pantry_save asks the flusher THREAD rather
+    # than serialising it here, which is the whole point of that change and
+    # must not be undone by a panel action doing it inline.
+    try:
+        _larder_save()
+    except Exception:                              # noqa: BLE001
+        pass
+    try:
+        _pantry_save()
+    except Exception:                              # noqa: BLE001
+        pass
+    edit = script_note_edit(occurrence, kind, index, was, said,
+                            seat=str(marker or ""), candidate=candidate)
+    pipeline_log("action", "the director rewrote a %s turn - that line "
+                           "re-records, the rest of the round stands" % kind,
+                 extra="was: %s\nnow: %s" % (was[:300], said[:300]))
+    return {"ok": True, "changed": True, "edit": edit,
+            "kind": kind, "seat": marker,
+            "state": script_state(occurrence),
+            "say": "rewritten - that one line re-records, the round comes "
+                   "back as soon as it has"}
+
+
+@app.post("/api/director/segment/{occurrence}/turn")
+async def api_director_edit(occurrence: str,
+                            payload: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite one turn of a bound segment."""
+    return await asyncio.to_thread(
+        director_edit_turn, occurrence,
+        int((payload or {}).get("index") or 0),
+        str((payload or {}).get("text") or ""),
+        str((payload or {}).get("was") or ""))
+
+
+@app.post("/api/director/segment/{occurrence}/approve")
+async def api_director_approve(occurrence: str,
+                               payload: dict[str, Any] | None = None
+                               ) -> dict[str, Any]:
+    """Approve the script, or the tint, for one segment.
+
+    Approval UPGRADES a segment; it never holds one. At an engine load of
+    0.997 a gate that made segments wait for a person would produce silence
+    rather than better radio, so an unapproved segment airs exactly as it
+    does now and is stamped as having gone out unreviewed."""
+    tint = bool((payload or {}).get("tint"))
+    state = script_approve(occurrence, str((payload or {}).get("who")
+                                           or "operator"), tint=tint)
+    return {"ok": True, "state": state,
+            "say": "tint approved" if tint else "script approved"}
+
+
+@app.get("/api/director/lessons")
+async def api_director_lessons(kind: str = "", most: int = 40
+                               ) -> dict[str, Any]:
+    """Every rewrite the operator has made, newest first.
+
+    `was` is what the station wrote unprompted and `now` is what the person
+    who owns it wanted said, in the same seat of the same kind of segment.
+    That pair is the highest-signal thing the station can be told about how
+    it is meant to sound, and it is a by-product of the work rather than a
+    thing anybody has to sit down and author."""
+    rows = await asyncio.to_thread(script_lessons, kind, int(most or 40))
+    return {"at": time.time(), "kind": kind, "rows": rows,
+            "say": "%d rewrite(s) on the book" % len(rows)}
 
 
 @app.get("/api/director/sheet")
@@ -132817,6 +133101,39 @@ function directorRow(row) {
   if (row.aired_seconds) {
     head.appendChild(el("span", "dir-chip", Math.round(row.aired_seconds) + "s heard"));
   }
+  /* 2026-09-10: where this segment stands with you. Approval UPGRADES a
+   * segment and never holds one - at an engine load near 1.0 a gate that
+   * made segments wait for a person would produce silence, so anything
+   * unapproved airs as it always did and is stamped as having escaped. */
+  const rev = row.review || {};
+  if (rev.edits) {
+    head.appendChild(el("span", "dir-chip", rev.edits + " edit"
+      + (rev.edits === 1 ? "" : "s")));
+  }
+  if (rev.approved) {
+    const ok = el("span", "dir-chip ok", "✓ approved");
+    ok.title = "Approved " + (rev.approved_at ? when(rev.approved_at) : "");
+    head.appendChild(ok);
+  } else if (rev.aired_unapproved) {
+    const esc = el("span", "dir-chip warn", "⚠ aired unapproved");
+    esc.title = "This went out without being reviewed. Nothing waits on "
+      + "approval — the air is never held.";
+    head.appendChild(esc);
+  }
+  if ((row.script && (row.script.turns || []).length) && !rev.approved) {
+    const ap = el("button", "", "Approve script");
+    ap.style.cssText = "font-size:10px;padding:1px 7px;margin-left:auto";
+    ap.onclick = async () => {
+      ap.disabled = true;
+      try {
+        await api("/api/director/segment/"
+          + encodeURIComponent(row.occurrence) + "/approve",
+          {method: "POST", body: JSON.stringify({})});
+        await directorPaint();
+      } catch (e) { ap.disabled = false; alert("Not approved: " + e); }
+    };
+    head.appendChild(ap);
+  }
   card.appendChild(head);
 
   /* WHAT IT IS GOING TO BE — the bound script, turn by turn, with the seat
@@ -132829,13 +133146,56 @@ function directorRow(row) {
       + (script.seconds ? ", " + Math.round(script.seconds) + "s" : "")
       + (script.source ? " · " + script.source : ""));
     box.appendChild(sum);
-    turns.forEach((t) => {
+    /* Every turn is editable in place. The edit is the training pair: a
+     * note says what you wanted, `was`/`now` on the same turn of the same
+     * seat SHOWS it. Editing re-keys that one take, so exactly one line
+     * re-records and the rest of the round stands. */
+    turns.forEach((t, at) => {
       const line = el("div", "dir-turn", "");
       const seat = el("span", "dir-seat", t.who + ": ");
       if (t.seat === "C" || t.seat === "E") seat.classList.add("c");
       if (t.seat === "B") seat.classList.add("b");
       line.appendChild(seat);
-      line.appendChild(document.createTextNode(t.text));
+      const words = el("span", "", t.text);
+      words.style.cursor = "text";
+      words.title = "Click to rewrite this turn — only this line re-records";
+      words.onclick = () => {
+        if (line.querySelector("textarea")) return;
+        const area = document.createElement("textarea");
+        area.value = t.text;
+        area.style.cssText = "width:100%;min-height:52px;font-size:12px;"
+          + "font-family:inherit;padding:3px 5px";
+        const save = el("button", "", "Save");
+        const stop = el("button", "", "Cancel");
+        [save, stop].forEach((b) => {
+          b.style.cssText = "font-size:10px;padding:1px 7px;margin:3px 4px 0 0";
+        });
+        const bar = el("div", "", "");
+        bar.appendChild(save);
+        bar.appendChild(stop);
+        words.style.display = "none";
+        line.appendChild(area);
+        line.appendChild(bar);
+        area.focus();
+        const shut = () => { area.remove(); bar.remove(); words.style.display = ""; };
+        stop.onclick = shut;
+        save.onclick = async () => {
+          const text = area.value.trim();
+          if (!text || text === t.text) { shut(); return; }
+          save.disabled = true;
+          try {
+            await api("/api/director/segment/"
+              + encodeURIComponent(row.occurrence) + "/turn",
+              {method: "POST", body: JSON.stringify({
+                index: at, text, was: t.text})});
+            await directorPaint();
+          } catch (e) {
+            save.disabled = false;
+            alert("The rewrite was not accepted: " + e);
+          }
+        };
+      };
+      line.appendChild(words);
       box.appendChild(line);
     });
     card.appendChild(box);
