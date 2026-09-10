@@ -1068,6 +1068,9 @@ DEFAULT_DJ = {
     "upstairs_per_hour": 3.0,
     # #1162: what share of rounds are interrupted by a memo from upstairs.
     "manager_cut_in_pct": 20,
+    # #1173: what share of the MEMO ENTRY is a personal gripe out of the
+    # upstairs book rather than a note about the show.
+    "manager_gripe_pct": 65,
     # A tape from the mysterious Ehm Eckx after every Nth song (#239).
     # 0 = the mail has stopped. The folder is named relative to the share.
     # #828/#829: EIGHT, not three. A tape is not just another record — it
@@ -1974,6 +1977,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "manager_cut_in_pct": max(0, min(100, int(
             raw_dj.get("manager_cut_in_pct",
                        DEFAULT_DJ["manager_cut_in_pct"]) or 0))),
+        "manager_gripe_pct": max(0, min(100, int(
+            raw_dj.get("manager_gripe_pct",
+                       DEFAULT_DJ["manager_gripe_pct"]) or 0))),
         # #828/#829: the ceiling was 10, so a slider past "every tenth
         # song" silently snapped back and the owner could not make the
         # mail rare. 40 is the new top; 0 still stops it altogether.
@@ -23057,6 +23063,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
         "manager": [("upstairs_per_hour", "Manager interruptions per hour", "range", 0, 12, 0.5),
                     ("manager_cut_in_pct",
                      "Rounds the manager cuts into (%)", "range", 0, 60, 5),
+                    ("manager_gripe_pct",
+                     "Memos that are about the DJs (%)", "range", 0, 100, 5),
                     # #841: "I want him doing 3-5 messages an hour, and
                     # I want him on a slider I can adjust."
                     ("manager_per_hour", "Memos from upstairs an hour (quota)",
@@ -52249,6 +52257,8 @@ UPSTAIRS_GRIPES = (
 # enough to be a running feature of the station and rare enough that it is
 # still an interruption when it happens - at one in two it stops being one.
 MANAGER_CUT_IN_PCT = 20
+# #1173: and how often the memo entry itself is a personal gripe.
+MANAGER_GRIPE_PCT = 65
 
 # The ways it arrives. Rolled per interruption, because a memo slid under
 # the door and a phone light blinking are different scenes even when the
@@ -54839,8 +54849,15 @@ async def dj_gallery_round(bank_to: list[dict[str, Any]] | None = None,
     angle = (
         f"The pair go through the station gallery ON AIR — {len(pieces)} "
         f"paintings, one after another, none skipped. {listing} Describe "
-        "and react to EACH in turn — argue about what it means, price it "
-        "absurdly, hawk it to the listeners: first caller gets each one. "
+        "and react to EACH in turn — argue about what it means. "
+        # #1173: THE SALE, as plainly as the title. Measured on the shelf:
+        # 31 of 53 rounds proposed a better title and only 11 named a
+        # price, because the title had three sentences of exact
+        # instruction and the sale had four words inside a list.
+        "FOR EACH PAINTING one of you must NAME A PRICE OUT LOUD, in "
+        "dollars, and hawk it - say the number, say what it is worth and "
+        "why, and tell the listeners the first caller takes it. The prices "
+        "are absurd and they are said as figures, not as 'a fortune'. "
         "For EACH painting, one host must propose a better title based on "
         "what they can actually see, naturally phrased as 'it should have "
         "been called ...' or 'this painting looks like ...'. Make the titles "
@@ -58076,6 +58093,72 @@ def speakbox_swath_lines(pool: list[str], most: int = 9,
 
 def speakbox_swath(pool: list[str], most: int = 9) -> str:
     return " ".join(speakbox_swath_lines(pool, most))
+
+
+# #1174: how many DIFFERENT documents a round is seeded from, beyond its
+# primary swath. Three is a conversation; one is a recital.
+SPEAKBOX_SPREAD = int(os.getenv("PINE_SPEAKBOX_SPREAD", "3"))
+
+
+async def speakbox_spread(seen: Any = None, want: int = 0,
+                          most: int = 5, cap: int = 520
+                          ) -> list[dict[str, Any]]:
+    """#1174: several swaths, each from a DIFFERENT document.
+
+    `speakbox_quote` draws one document at a time and honours `exclude`,
+    so asking it repeatedly while feeding back everything already drawn
+    gives distinct files without touching the picker. A draw that lands
+    on a file already held is simply dropped - the shelf has three
+    hundred documents on it and the next ask will find another."""
+    held = {str(f) for f in (seen or []) if f}
+    out: list[dict[str, Any]] = []
+    want = max(0, int(want or SPEAKBOX_SPREAD))
+    for _ in range(want * 3):
+        if len(out) >= want:
+            break
+        try:
+            got = await speakbox_quote(
+                exclude=",".join(sorted(held)) if held else "",
+                most=most, cap=cap)
+        except Exception:  # noqa: BLE001
+            break
+        name = str((got or {}).get("file") or "")
+        text = str((got or {}).get("text") or "").strip()
+        if not text or (name and name in held):
+            continue
+        if name:
+            held.add(name)
+        out.append(got)
+    return out
+
+
+def speakbox_spread_clause(spread: list[dict[str, Any]]) -> str:
+    """#1174: the spread, handed over as separate things to talk about.
+
+    Deliberately NOT phrased like `speakbox_aside`. That clause says
+    "deliver these word for word and soak everything else in them", which
+    is right for ONE passage and wrong for four - four passages delivered
+    verbatim is a recital, not a round. These are offered as things the
+    pair have each run into, to be argued with, connected, contradicted
+    and used."""
+    rows = [r for r in (spread or []) if str((r or {}).get("text") or "").strip()]
+    if not rows:
+        return ""
+    body = "".join(
+        "\n  (%d) \"%s\"" % (i + 1, str(r.get("text") or "")[:520])
+        for i, r in enumerate(rows))
+    return (
+        "\n\nAND YOU HAVE EACH RUN INTO SOMETHING ELSE. These came from "
+        "%d different places and they are not connected to each other:"
+        % len(rows) + body +
+        "\nBring them into the conversation as your OWN thoughts and your "
+        "own words - a thing you read, a thing you heard, a thing you have "
+        "been chewing on. You may quote a phrase from one if it is worth "
+        "quoting, but do not recite them and never say where any of it came "
+        "from. Set them AGAINST each other: let one of you raise one, the "
+        "other answer with a different one, and find the argument between "
+        "them. Two people who have read the same one thing can only agree; "
+        "the point of these is that you have read different things.")
 
 
 def speakbox_aside(quote: dict[str, str], pair: bool = True) -> str:
@@ -76077,6 +76160,7 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # storyline and every caller road, which between them are most
     # rounds. The slider decides how often a seed is drawn; nothing else
     # should.
+    spread: list[dict[str, Any]] = []          # #1174: the other documents
     if not caller_name and not seed and not own_material and (
             force_seed or random.random() < box_rate_now(dj["speakbox_rate"])):
         # Best-of-two off the shelf (#418): the rounds open with the
@@ -76089,6 +76173,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
         if picks:
             seed = max(picks,
                        key=lambda s: swath_intrigue(s.get("text", "")))
+            # #1174: the one that lost the intrigue contest is still a
+            # swath from another document that the station has already
+            # paid to draw. It joins the spread instead of being dropped.
+            for _lost in picks:
+                if _lost is not seed and str(_lost.get("text") or "").strip():
+                    spread.append(_lost)
     dropped = {} if (angle or seed) else (
         drop_bombshell() if random.random() < 0.6 else {})
     seed = _source_for_scene(seed)
@@ -76327,6 +76417,30 @@ async def dj_banter(track: dict[str, Any] | None = None,
                       if "gallery" not in a and "pictures" not in a
                       and "painting" not in a]
         angle = angle or unrepeated(_stock, "angle")
+    # #1174: ...AND SEVERAL DOCUMENTS TO DISCUSS. Every road arrives here
+    # with its angle settled, which makes this the one place the gallery,
+    # the memo, the news and the callers can be handed the spread as well
+    # as plain banter. They were taking an `elif` above the comeback and
+    # the jab and getting a single document between them.
+    if not caller_name and SPEAKBOX_SPREAD > 0:
+        try:
+            _used = [str((x or {}).get("file") or "")
+                     for x in (seed, comeback, jab) if x]
+            _used += [str((x or {}).get("file") or "") for x in spread]
+            _more = max(0, SPEAKBOX_SPREAD - len(spread))
+            if _more:
+                spread += await speakbox_spread(
+                    seen=[f for f in _used if f], want=_more)
+            _spread_clause = speakbox_spread_clause(spread)
+            if _spread_clause:
+                angle = str(angle) + _spread_clause
+                for _sw in spread:
+                    try:
+                        speakbox_remember(_sw)
+                    except Exception:  # noqa: BLE001
+                        pass
+        except Exception:  # noqa: BLE001
+            pass            # a round with one document is still a round
         if any(w in angle for w in ("gallery", "pictures", "painting")):
             art_sell_mark()
 
@@ -78231,18 +78345,53 @@ async def dj_manager_note(track: dict[str, Any] | None = None,
         return _hot_said
     # `note` and its guard now live at the top of the function, above the
     # material draw (#841).
+    # #1173: MOST MEMOS ARE ABOUT THEM. See the note in the patch - three
+    # of thirty-four memos on the shelf carried a grievance, because the
+    # memo was made of the station's system prompt. The gripe book has
+    # three hundred that are personal and this road had never read one.
+    _gripe = ""
+    try:
+        if random.random() < float(dj_settings().get(
+                "manager_gripe_pct", MANAGER_GRIPE_PCT)) / 100.0:
+            _rows = [r for r in upstairs_list()
+                     if str(r.get("gripe") or "").strip()]
+            if _rows:
+                _fewest = min(int(r.get("uses") or 0) for r in _rows)
+                _pick = random.choice([r for r in _rows
+                                       if int(r.get("uses") or 0) == _fewest])
+                _gripe = str(_pick.get("gripe") or "").strip()[:200]
+                upstairs_update(str(_pick.get("id") or ""),
+                                uses=int(_pick.get("uses") or 0) + 1,
+                                last=int(time.time()))
+    except Exception:  # noqa: BLE001
+        _gripe = ""            # a broken book never silences the booth
+    if _gripe:
+        _angle = (
+            "a memo has just come down from the manager upstairs, and it is "
+            "about THE TWO OF YOU. One of you reads it out to the other and "
+            "to the listeners. What management wants you to know is this:\n"
+            f"\"{_gripe}\"\n"
+            "Do not read that back word for word - it is a memo, so say it "
+            "the way a memo says it, and then deal with it on air. Take it "
+            "personally, because it is personal: defend yourself, blame each "
+            "other, agree with it in a way that is worse than arguing, or "
+            "quietly do what it says while complaining. The manager is never "
+            "in the room and never speaks in his own voice." + flavour)
+    else:
+        _angle = (
+            "a memo has just come down from the manager upstairs. One of you "
+            "reads it out to the other and to the listeners, and you both "
+            "react on air — agree with it, wince at it, push back on it, "
+            "whatever it deserves. Management's instructions, in their own "
+            "words, are:\n"
+            f"\"{note}\"\n"
+            "Do not read that back word for word. Say what it means for the "
+            "show tonight, and mention any product or sponsorship it asks "
+            "you to push." + flavour)
     _said = await dj_banter(track, lines=3, whole=True,           # #859
                             bank=bank_to is not None,
-                            bank_to=bank_to, own_material=True, angle=(
-        "a memo has just come down from the manager upstairs. One of you "
-        "reads it out to the other and to the listeners, and you both react "
-        "on air — agree with it, wince at it, push back on it, whatever it "
-        "deserves. Management's instructions, in their own words, are:\n"
-        f"\"{note}\"\n"
-        "Do not read that back word for word. Say what it means for the show "
-        "tonight, and mention any product or sponsorship it asks you to push."
-        + flavour
-    ))
+                            bank_to=bank_to, own_material=True,
+                            angle=_angle)
     if _said:
         quota_stamp("manager")             # #841: the hour counts it
         try:                               # #1146: the book keeps it
