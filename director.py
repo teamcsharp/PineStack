@@ -650,3 +650,127 @@ def director_graph() -> dict[str, Any]:
     return {"kinds": kinds, "occurrences": occurrences,
             "types": dict(DIRECTOR_BEAT_TYPES),
             "most": DIRECTOR_BEATS_MOST}
+
+
+# --- 2026-09-10: THE SCRIPT COMES TO YOU ---------------------------------
+#
+#    "Every time a script is prepared for a segment, I want a notification
+#     button to pop up for it notifying me that it's available for me to
+#     review."
+#
+# A script exists before it is bound to a slot: it is written, recorded and
+# put on the shelf, and only later does an hour choose it. So the review
+# queue is keyed by the SCRIPT - its shelf id - and not by the occurrence,
+# which is the whole point: the operator gets at it while there is still
+# time to change it, rather than when it is already on its way out.
+#
+# Two stamps, and they mean different things. `seen` is "this has been put
+# in front of me" - it clears the notification and nothing more. A review
+# record (approved, edited, sent to record) is a JUDGEMENT. Conflating them
+# would mean glancing at the queue silently approved everything in it.
+#
+# Records for a script are kept under the same book as the occurrence ones,
+# namespaced `sid:` - same lifecycle, same approve/edit/lessons machinery,
+# addressed by whichever name the caller has.
+
+def script_key(sid: str) -> str:
+    """The review record's name for a script addressed by its shelf id."""
+    return "sid:" + str(sid or "")
+
+
+def _seen_book() -> dict[str, Any]:
+    book = scripts_read()
+    seen = book.get("seen")
+    if not isinstance(seen, dict):
+        seen = {}
+        book["seen"] = seen
+    return seen
+
+
+def script_seen_at(sid: str) -> float:
+    try:
+        return float((_seen_book().get(str(sid)) or {}).get("at") or 0)
+    except Exception:                              # noqa: BLE001
+        return 0.0
+
+
+def script_seen_mark(sid: str, kind: str = "") -> None:
+    """This script has been put in front of the operator."""
+    seen = _seen_book()
+    row = seen.setdefault(str(sid), {})
+    row["at"] = time.time()
+    if kind:
+        row["kind"] = str(kind)
+    # Bounded the same way the records are - the queue is a working set,
+    # not a ledger. The JUDGEMENTS live in `segments` and are not trimmed
+    # by this.
+    if len(seen) > DIRECTOR_SCRIPT_KEEP * 2:
+        order = sorted(seen.items(),
+                       key=lambda kv: float((kv[1] or {}).get("at") or 0))
+        for key, _row in order[:len(seen) - DIRECTOR_SCRIPT_KEEP]:
+            seen.pop(key, None)
+    scripts_write(scripts_read())
+
+
+def script_seen_clear(sid: str) -> None:
+    """Put a script back in the queue - "I have not really looked at it"."""
+    seen = _seen_book()
+    if str(sid) in seen:
+        seen.pop(str(sid), None)
+        scripts_write(scripts_read())
+
+
+def script_queue_state(sid: str) -> dict[str, Any]:
+    """Everything the notification needs about one script."""
+    state = script_state(script_key(sid))
+    state["seen_at"] = script_seen_at(sid)
+    state["seen"] = bool(state["seen_at"])
+    record = script_record(script_key(sid))
+    state["bypass_tint"] = bool((record or {}).get("bypass_tint_at"))
+    state["sent_to_record"] = bool((record or {}).get("sent_at"))
+    return state
+
+
+def script_send_to_record(sid: str, bypass_tint: bool = False,
+                          who: str = "operator") -> dict[str, Any]:
+    """Mark a script as released to the recording room.
+
+    `bypass_tint` is the operator saying this one goes as written - the
+    crystal is not asked and is not waited for. It is recorded here as a
+    DECISION with a name and a time on it, because "why did that go out
+    plain" is a question that gets asked later and the honest answer has
+    to be findable."""
+    row = script_record(script_key(sid), make=True)
+    row["sent_at"] = time.time()
+    row["sent_by"] = str(who or "operator")[:40]
+    if bypass_tint:
+        row["bypass_tint_at"] = time.time()
+        row["bypass_tint_by"] = str(who or "operator")[:40]
+    # Releasing it is also approving it: the operator has looked at the
+    # words and said "record that". Re-approving separately would be
+    # asking the same question twice.
+    row["approved_at"] = row.get("approved_at") or time.time()
+    row["approved_by"] = row.get("approved_by") or str(who or "operator")[:40]
+    scripts_write(scripts_read())
+    return script_queue_state(sid)
+
+
+def script_tint_note(sid: str, index: int, was: str, tinted: str,
+                     taken: bool, faults: Any = None) -> None:
+    """Keep what the crystal offered on one line and whether it was taken.
+
+    A refused tint is as much a statement of taste as an accepted one -
+    more, arguably - so both halves are kept against the script."""
+    row = script_record(script_key(sid), make=True)
+    rows = row.setdefault("tints", [])
+    rows.append({"index": int(index), "at": time.time(),
+                 "was": str(was or "")[:1200],
+                 "tinted": str(tinted or "")[:1200],
+                 "taken": bool(taken),
+                 "faults": [str(f)[:120] for f in (faults or [])][:6]})
+    del rows[:-60]
+    scripts_write(scripts_read())
+
+
+def script_tint_history(sid: str) -> list[dict[str, Any]]:
+    return list((script_record(script_key(sid)) or {}).get("tints") or [])

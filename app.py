@@ -54,8 +54,11 @@ from director import (director_add, director_beats, director_beats_clause,
                       director_lessons_clause, director_notes, director_path,
                       director_restore, director_retire, director_sheet,
                       director_spend, director_touch, script_approve,
-                      script_candidate, script_lessons, script_mark_aired,
-                      script_note_edit, script_state)
+                      script_candidate, script_key, script_lessons,
+                      script_mark_aired, script_note_edit, script_queue_state,
+                      script_seen_clear, script_seen_mark,
+                      script_send_to_record, script_state, script_tint_history,
+                      script_tint_note)
 from crystal_acceptance import evaluate_acceptance as crystal_editorial_acceptance
 from prompt_learning import PromptLearningStore, _patterns as crystal_learning_patterns
 from response_bank import ResponseBank, add_listening_responses
@@ -110,6 +113,13 @@ def data_path(*parts: str) -> Path:
 # DJs' speakbox is bound at /app/data/speakbox. Nothing new to mount.
 LIBRARY_FOLDERS_DEFAULT = ["/samples/Manuals", "/app/data/speakbox"]
 
+# ...and which of them are DOCUMENTATION. A document from one of these may
+# decide that a question was a question for the shelf; anything else on the
+# shelf can support an answer and be searched directly, but never triggers
+# one. The speakbox is hundreds of hours of people talking, and a shelf like
+# that is plausibly "about" any conversational question you can ask it.
+LIBRARY_REFERENCE_DEFAULT = ["/samples/Manuals"]
+
 
 def validate_library_folders(raw: Any) -> list[str]:
     """Folder list off the panel. Absolute paths only, deduped and bounded:
@@ -123,6 +133,15 @@ def validate_library_folders(raw: Any) -> list[str]:
         if row.startswith("/") and row not in out:
             out.append(row[:400])
     return out or list(LIBRARY_FOLDERS_DEFAULT)
+
+
+def validate_library_reference(raw: Any) -> list[str]:
+    """The documentation shelves. May be empty - that means every watched
+    folder counts as documentation."""
+    if not isinstance(raw, list):
+        return list(LIBRARY_REFERENCE_DEFAULT)
+    return [str(r or "").strip().rstrip("/")[:400] for r in raw[:24]
+            if str(r or "").strip().startswith("/")]
 
 
 _STATION_FLOW = FlowJournal(data_path("station_flow.sqlite3"))
@@ -1470,6 +1489,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     # background service and answerable in ordinary conversation.
     "library": True,
     "library_folders": list(LIBRARY_FOLDERS_DEFAULT),
+    "library_reference_folders": list(LIBRARY_REFERENCE_DEFAULT),
     "read_back_prompts": True,
     "conversation_memory": True,
     "long_term_memory": True,
@@ -2229,6 +2249,8 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "library": bool(data.get("library", True)),
         "library_folders": validate_library_folders(
             data.get("library_folders")),
+        "library_reference_folders": validate_library_reference(
+            data.get("library_reference_folders")),
         "read_back_prompts": bool(data.get("read_back_prompts", True)),
         "conversation_memory": bool(data.get("conversation_memory", True)),
         "long_term_memory": bool(data.get("long_term_memory", True)),
@@ -2311,6 +2333,9 @@ def save_settings(data: Any) -> dict[str, Any]:
         temporary.replace(SETTINGS_PATH)
         _SETTINGS_CACHE.update({"key": None, "value": None, "at": 0.0})
 
+    # #1158: a changed shelf list takes effect now, not at the next restart.
+    if globals().get("library_settings_changed"):
+        library_settings_changed()
     return normalized
 
 
@@ -4135,6 +4160,11 @@ def library_folders() -> list[str]:
     return validate_library_folders(load_settings().get("library_folders"))
 
 
+def library_reference_folders() -> list[str]:
+    return validate_library_reference(
+        load_settings().get("library_reference_folders"))
+
+
 def library_busy() -> bool:
     """True while the show is actually making something.
 
@@ -4150,6 +4180,15 @@ def library_busy() -> bool:
         return False
 
 
+def library_settings_changed() -> None:
+    """A saved settings change re-wires the shelf without a restart."""
+    try:
+        library_boot()
+        library.wake()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def library_boot() -> None:
     """Hand the engine the app's own hands. Safe to call again after a
     settings save, so a changed folder list lands without a restart."""
@@ -4159,6 +4198,7 @@ def library_boot() -> None:
         busy=library_busy,
         page_score=_te_page_score,   # and the gear corpus' own page ranker
         topic_words=te_topic_words,
+        reference=library_reference_folders(),
         log=lambda line: print(f"[library] {line}", flush=True),
     )
 
@@ -12921,6 +12961,12 @@ def dialogue_tint_ready(kind: str, row: Any) -> bool:
     if not isinstance(row, dict):
         return False
     entry = dialogue_entry(row)
+    # ...and one script the operator has released past the crystal by hand.
+    # Same shape as the road-level exemption above, for one round rather
+    # than a whole road, stamped with who decided it and when - see
+    # api_director_script_record.
+    if entry is not None and entry.get("director_bypass_tint"):
+        return True
     if entry is not None:
         tinted = str(entry.get("script_tinted") or "").strip()
         active = str(entry.get("script") or "").strip()
@@ -97718,7 +97764,7 @@ def director_fork_kept(kind: str, row: dict[str, Any],
 
 
 def director_edit_turn(occurrence: str, index: int, said: str,
-                       expect: str = "") -> dict[str, Any]:
+                       expect: str = "", sid: str = "") -> dict[str, Any]:
     """Rewrite one turn of a bound segment, and its take with it.
 
     THE TAKE IS THE HARD PART. `_ready_round_takes` refuses a round whose
@@ -97741,12 +97787,7 @@ def director_edit_turn(occurrence: str, index: int, said: str,
     said = " ".join(str(said or "").split())
     if not said:
         raise HTTPException(400, "an empty turn is a deletion, not an edit")
-    got = director_segment_row(occurrence)
-    if not got:
-        raise HTTPException(404, "nothing is bound to that occurrence yet - "
-                                 "a segment can be edited once the hour has "
-                                 "chosen what fills it")
-    kind, row, candidate = got
+    kind, row, candidate = director_resolve(occurrence, sid)
     entry = dialogue_entry(row)
     if not entry or not str(entry.get("script") or "").strip():
         raise HTTPException(409, "that segment has no script to edit")
@@ -97849,14 +97890,15 @@ def director_edit_turn(occurrence: str, index: int, said: str,
         _pantry_save()
     except Exception:                              # noqa: BLE001
         pass
-    edit = script_note_edit(occurrence, kind, index, was, said,
+    edit = script_note_edit(script_key(sid) if sid else occurrence,
+                            kind, index, was, said,
                             seat=str(marker or ""), candidate=candidate)
     pipeline_log("action", "the director rewrote a %s turn - that line "
                            "re-records, the rest of the round stands" % kind,
                  extra="was: %s\nnow: %s" % (was[:300], said[:300]))
     return {"ok": True, "changed": True, "edit": edit,
             "kind": kind, "seat": marker, "forked": forked,
-            "state": script_state(occurrence),
+            "state": script_state(script_key(sid) if sid else occurrence),
             "say": ("that round had already aired, so your rewrite is a NEW "
                     "take standing beside it - the kept one is untouched. "
                     "One line records and it joins the rotation."
@@ -98011,6 +98053,294 @@ def headroom_plan(slots: list[dict[str, Any]],
                   % (reclaimed, was / 60.0, now / 60.0,
                      was / 3600.0, now / 3600.0))
     return out
+
+
+DIRECTOR_QUEUE_KINDS = ("caller", "manager", "gallery", "news", "banter",
+                        "recap", "track_talk")
+DIRECTOR_QUEUE_MOST = 60
+
+
+def director_resolve(occurrence: str = "",
+                     sid: str = "") -> tuple[str, Any, str]:
+    """(road, row, candidate) for a segment named either way.
+
+    A script has two names and they are not the same thing. Its SHELF ID
+    exists from the moment it is written; its OCCURRENCE only exists once
+    an hour has chosen it. Reviewing before the hour chooses is the whole
+    point of the queue, so both names reach the same machinery."""
+    want = str(sid or "").strip()
+    if want:
+        kind, row = alt_find(want)
+        if row is None:
+            raise HTTPException(404, "no script answers to that id - it may "
+                                     "have aired and been retired since the "
+                                     "list was drawn")
+        return str(kind), row, ""
+    got = director_segment_row(occurrence)
+    if not got:
+        raise HTTPException(404, "nothing is bound to that occurrence yet - "
+                                 "a segment can be edited once the hour has "
+                                 "chosen what fills it")
+    return got
+
+
+def _director_turns(entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """One script's turns, with the seat the listener will actually hear
+    and whether the crystal has been through each of them."""
+    out: list[dict[str, Any]] = []
+    caller_name = str(entry.get("caller_name") or "")
+    tinted = str(entry.get("script_tinted") or "")
+    tinted_turns = {}
+    if tinted:
+        for at, (mark, said) in enumerate(banter_turns(tinted, caller_name)):
+            tinted_turns[at] = " ".join(str(said or "").split())
+    for at, (marker, said) in enumerate(
+            banter_turns(str(entry.get("script") or ""), caller_name)):
+        plain = " ".join(str(said or "").split())
+        alt = tinted_turns.get(at, "")
+        out.append({"index": at, "seat": str(marker or ""),
+                    "who": _director_seat(str(marker or "")),
+                    "text": plain,
+                    "tinted": alt if alt and alt != plain else "",
+                    "is_tinted": bool(alt and alt == plain)})
+    return out
+
+
+def director_prepared(most: int = DIRECTOR_QUEUE_MOST) -> dict[str, Any]:
+    """Every script standing on the shelf, newest first, with its state.
+
+    This is what the notification counts. A script is offered for review
+    the moment it EXISTS - written and on the shelf - rather than when an
+    hour picks it, because the point of reviewing is to change it while
+    changing it is still cheap."""
+    rows: list[dict[str, Any]] = []
+    now = time.time()
+    for kind in DIRECTOR_QUEUE_KINDS:
+        for row in list(_SHELF.get(kind) or []):
+            entry = dialogue_entry(row)
+            if not entry or not str(entry.get("script") or "").strip():
+                continue
+            try:
+                sid = alt_sid_of(kind, row)
+            except Exception:  # noqa: BLE001
+                continue
+            if not sid:
+                continue
+            state = script_queue_state(sid)
+            turns = banter_turns(str(entry.get("script") or ""),
+                                 str(entry.get("caller_name") or ""))
+            tinted = str(entry.get("script_tinted") or "").strip()
+            rows.append({
+                "sid": sid, "kind": kind,
+                "at": float(row.get("at") or entry.get("at") or 0),
+                "age": round(now - float(row.get("at")
+                                         or entry.get("at") or now), 1),
+                "turns": len(turns),
+                "seconds": round(float(row.get("seconds") or 0), 1),
+                "chars": len(str(entry.get("script") or "")),
+                "head": " ".join(str(entry.get("script") or "").split())[:150],
+                "is_tinted": bool(tinted
+                                  and tinted == str(entry["script"]).strip()),
+                "kept": bool(entry.get("frozen")),
+                "aired": int(row.get("aired") or 0),
+                "review": state,
+            })
+    rows.sort(key=lambda r: -float(r.get("at") or 0))
+    rows = rows[:max(1, int(most))]
+    waiting = [r for r in rows
+               if not r["review"]["seen"] and not r["kept"] and not r["aired"]]
+    return {"at": now, "rows": rows, "waiting": len(waiting),
+            "waiting_ids": [r["sid"] for r in waiting],
+            "say": ("%d script(s) written and never looked at" % len(waiting)
+                    if waiting else "every script on the shelf has been seen")}
+
+
+@app.get("/api/director/pending")
+async def api_director_pending(most: int = DIRECTOR_QUEUE_MOST
+                               ) -> dict[str, Any]:
+    """The notification: scripts prepared and not yet put in front of you."""
+    return await asyncio.to_thread(director_prepared, int(most or 60))
+
+
+@app.get("/api/director/script/{sid}")
+async def api_director_script(sid: str) -> dict[str, Any]:
+    """One script, turn by turn, as it stands right now."""
+    def work() -> dict[str, Any]:
+        kind, row, _c = director_resolve(sid=sid)
+        entry = dialogue_entry(row) or {}
+        return {"sid": sid, "kind": kind,
+                "turns": _director_turns(entry),
+                "kept": bool(entry.get("frozen")),
+                "aired": int(row.get("aired") or 0),
+                "seconds": round(float(row.get("seconds") or 0), 1),
+                "review": script_queue_state(sid),
+                "tints": script_tint_history(sid),
+                "beats": director_beats(kind),
+                "notes": [{"id": n["id"], "text": n["text"]}
+                          for n in director_notes(kind, "standing")]}
+    return await asyncio.to_thread(work)
+
+
+@app.post("/api/director/script/{sid}/seen")
+async def api_director_script_seen(sid: str,
+                                   payload: dict[str, Any] | None = None
+                                   ) -> dict[str, Any]:
+    """Clear this script's notification. Seeing is not approving."""
+    if (payload or {}).get("undo"):
+        await asyncio.to_thread(script_seen_clear, sid)
+        return {"ok": True, "say": "back in the queue"}
+    await asyncio.to_thread(script_seen_mark, sid,
+                            str((payload or {}).get("kind") or ""))
+    return {"ok": True, "say": "cleared from the queue"}
+
+
+@app.post("/api/director/script/{sid}/turn")
+async def api_director_script_turn(sid: str,
+                                   payload: dict[str, Any]) -> dict[str, Any]:
+    """Rewrite one turn of a script addressed by its shelf id."""
+    return await asyncio.to_thread(
+        director_edit_turn, "", int((payload or {}).get("index") or 0),
+        str((payload or {}).get("text") or ""),
+        str((payload or {}).get("was") or ""), sid)
+
+
+@app.post("/api/director/script/{sid}/tint")
+async def api_director_script_tint(sid: str,
+                                   payload: dict[str, Any]) -> dict[str, Any]:
+    """Tint ONE line, on demand, and hand back both versions.
+
+    Nothing is applied. The operator asked to "select lines in the script
+    and have them tinted and view them in a tinted format" - so this is a
+    view, and taking it is a second, separate decision. The crystal's own
+    grader runs and its refusals come back with the offer, because a bar
+    the station would have refused is worth seeing before it is accepted.
+    """
+    index = int((payload or {}).get("index") or 0)
+    kind, row, _c = await asyncio.to_thread(director_resolve, "", sid)
+    entry = dialogue_entry(row) or {}
+    turns = _director_turns(entry)
+    if not 0 <= index < len(turns):
+        raise HTTPException(400, "there is no turn %d in a %d turn script"
+                            % (index, len(turns)))
+    plain = str(turns[index]["text"])
+    if not plain.strip():
+        raise HTTPException(400, "there is nothing in that turn to tint")
+    report: dict[str, Any] = {}
+    try:
+        # 2026-09-10: THE TREATMENT IS FAST, ON THE SMALL MODEL, ONE ASK.
+        #
+        # This shipped at room=3 on whichever model the road deserves, and
+        # the first live press of the button TIMED OUT AT TWO MINUTES.
+        # Measured on the station's own model ledger for that hour:
+        # gemma4:31b, 58 calls, mean 109s, max 224s - so room=3 is up to
+        # five and a half minutes to rhyme ONE line, while the whole hour
+        # holds 3,600s of lane. The same ledger shows ~9,000s of model
+        # demand asked of a 3,600s hour, which is why the tint reads as a
+        # queue of refusals rather than a treatment: the work is deferred,
+        # timed out, and then charged as a fault.
+        #
+        # A line the operator has picked out and is watching does not need
+        # the contest. They are the grader - both versions go on screen and
+        # they choose - so this asks ONCE, on the throughput model
+        # (e2b, mean 22.5s), and hands back whatever comes. The deep lane
+        # is left for the bulk road that has no one watching it.
+        tinted = await crystal_line(plain, why="the director asked for this "
+                                    "line", room=1, kind=str(kind),
+                                    model=tint_fast_model(), report=report)
+    except Exception as exc:                       # noqa: BLE001
+        raise HTTPException(502, "the crystal could not be reached: %s"
+                            % type(exc).__name__)
+    tinted = " ".join(str(tinted or "").split())
+    same = (not tinted) or tinted == plain
+    # The grader's objections are ADVISORY on this road. It refuses lines
+    # for the bulk lane, where nobody is watching; here the operator sees
+    # both versions and is the one deciding, so a fault is shown as an
+    # opinion rather than acted on as a veto. That is the whole difference
+    # between a treatment and a contest.
+    faults = list((report or {}).get("faults") or [])
+    return {"ok": True, "sid": sid, "index": index, "kind": kind,
+            "was": plain, "tinted": "" if same else tinted,
+            "changed": not same,
+            "faults": [str(f)[:200] for f in faults][:6],
+            "evaluation": {k: v for k, v in (report or {}).items()
+                           if k in ("ok", "grade", "meaning", "rhyme",
+                                    "transformation", "technical")},
+            "say": ("the crystal returned the line unchanged - it could not "
+                    "carry a set of bars while keeping what it says"
+                    if same else "here is the tinted version; taking it is "
+                                 "a separate decision")}
+
+
+@app.post("/api/director/script/{sid}/tint/accept")
+async def api_director_script_tint_accept(sid: str, payload: dict[str, Any]
+                                          ) -> dict[str, Any]:
+    """Take a tinted line into the script.
+
+    Applied through the ordinary turn edit, so it re-keys that one take
+    and re-records one line, exactly as a hand-written rewrite does. A
+    tint accepted here is the operator's wording as much as a typed one
+    is - the station has no reason to treat them differently."""
+    index = int((payload or {}).get("index") or 0)
+    tinted = " ".join(str((payload or {}).get("text") or "").split())
+    was = " ".join(str((payload or {}).get("was") or "").split())
+    if not tinted:
+        raise HTTPException(400, "there is no tinted line to take")
+    got = await asyncio.to_thread(director_edit_turn, "", index, tinted,
+                                  was, sid)
+    await asyncio.to_thread(script_tint_note, sid, index, was, tinted, True)
+    got["say"] = "taken - that line records in its tinted form"
+    return got
+
+
+@app.post("/api/director/script/{sid}/tint/refuse")
+async def api_director_script_tint_refuse(sid: str, payload: dict[str, Any]
+                                          ) -> dict[str, Any]:
+    """Turn down a tinted line, and keep the fact that it was turned down."""
+    await asyncio.to_thread(
+        script_tint_note, sid, int((payload or {}).get("index") or 0),
+        str((payload or {}).get("was") or ""),
+        str((payload or {}).get("text") or ""), False,
+        (payload or {}).get("faults"))
+    return {"ok": True, "say": "left as it was, and the refusal is on the "
+                               "record"}
+
+
+@app.post("/api/director/script/{sid}/record")
+async def api_director_script_record(sid: str,
+                                     payload: dict[str, Any] | None = None
+                                     ) -> dict[str, Any]:
+    """Send a script to the recording room, optionally straight past the tint.
+
+    "be able to choose to have a script sent directly to the recording room
+    to be turned into something that goes on the air bypassing the whole
+    tinting process". `bypass` writes a per-round exemption that
+    dialogue_tint_ready honours - the same shape as crystal_tint_must_flow,
+    but for one script rather than a whole road, and stamped with who
+    decided it and when."""
+    bypass = bool((payload or {}).get("bypass"))
+    who = str((payload or {}).get("who") or "operator")
+
+    def work() -> dict[str, Any]:
+        kind, row, _c = director_resolve(sid=sid)
+        entry = dialogue_entry(row) or {}
+        if bypass:
+            entry["director_bypass_tint"] = True
+            entry["director_bypass_at"] = time.time()
+            try:
+                _pantry_save()
+            except Exception:  # noqa: BLE001
+                pass
+        state = script_send_to_record(sid, bypass_tint=bypass, who=who)
+        script_seen_mark(sid, kind)
+        return {"kind": kind, "state": state}
+    got = await asyncio.to_thread(work)
+    pipeline_log("action", "the director released a %s script to the "
+                 "recording room%s" % (got["kind"],
+                                       " - past the tint" if bypass else ""))
+    return {"ok": True, "sid": sid, "bypass": bypass, **got,
+            "say": ("released - it records as written and the crystal is "
+                    "not waited for" if bypass else
+                    "released to the recording room")}
 
 
 @app.get("/api/director/headroom")
@@ -106493,8 +106823,12 @@ async def manuals_index(
 ) -> dict[str, Any]:
     """The whole shelf and what the assimilator is doing this second."""
     require_read_auth(authorization)
-    return {"documents": library.docs(), "stats": library.stats(),
+    rows = library.docs()
+    for row in rows:                    # #1158: which may open the shelf
+        row["reference"] = library.is_reference(row.get("slug", ""))
+    return {"documents": rows, "stats": library.stats(),
             "folders": library_folders(), "on": library_on(),
+            "reference_folders": library_reference_folders(),
             "kinds": sorted(set(library_extract.KINDS.values()))}
 
 
@@ -128877,6 +129211,11 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
          that govern how the next segment of that kind gets written. -->
     <button id="directorBtn" class="tray-btn" title="The director's room — the hour segment by segment: what each one is planned to be, what it turned out to be, and your notes on how the next one of that kind gets written"
             onclick="directorOpen()" style="font-size:18px;line-height:1">🎬</button>
+    <!-- 2026-09-10: every script written for the show waits here to be read,
+         rewritten, tinted line by line, or sent straight to the recording
+         room as it stands. The count is scripts nobody has looked at. -->
+    <button id="scriptsBtn" class="tray-btn" title="Scripts prepared for the show"
+            onclick="scriptsOpen()" style="font-size:18px;line-height:1;position:relative">📝<span id="scriptsCount" class="tray-count"></span></button>
     <!-- 2026-09-08: the retirement desk - every round about to leave the
          cupboard waits for a decision; rules by type; a life timer on each. -->
     <button id="retireBtn" class="tray-btn" title="The retirement desk — every round about to leave the cupboard waits here for your decision; the rules by type; a life timer on every item"
@@ -133964,6 +134303,338 @@ async function dirBeatsSave(row, beats, thisOne) {
   }
 }
 
+/* --- 2026-09-10: THE SCRIPT COMES TO YOU --------------------------------
+ *
+ * "Every time a script is prepared for a segment, I want a notification
+ *  button to pop up for it notifying me that it's available for me to
+ *  review where I'm able to click on it, bring it up in a pop up and begin
+ *  reviewing, revising, and making modifications."
+ *
+ * The badge counts scripts that have been WRITTEN and never put in front of
+ * anybody. Clicking opens the queue; clicking a row opens the script, turn
+ * by turn, with the three things that can be done to a line - rewrite it,
+ * ask the crystal what it would make of it, take or refuse that - and the
+ * two things that can be done to a script: approve it, or send it to the
+ * recording room past the tint entirely.
+ *
+ * Seeing is not approving. Opening a script clears its notification and
+ * records nothing else; approving is a separate, deliberate click.
+ */
+let dirQueue = null;
+let dirQueueSeen = 0;
+
+function dirBadge(n) {
+  const btn = document.getElementById("scriptsBtn");
+  if (!btn) return;
+  const tag = document.getElementById("scriptsCount");
+  if (!tag) return;
+  tag.textContent = n > 99 ? "99+" : (n || "");
+  tag.style.display = n ? "" : "none";
+  btn.classList.toggle("waiting", !!n);
+  btn.title = n
+    ? n + " script" + (n === 1 ? "" : "s") + " written and waiting for you"
+    : "Scripts prepared for the show — none waiting";
+}
+
+let dirQueueAt = 0;
+async function dirQueueTick(force) {
+  try { dirStyle(); } catch (e) { /* styles are cosmetic */ }
+  const now = Date.now();
+  if (!force && now - dirQueueAt < 15000) return;
+  dirQueueAt = now;
+  try {
+    const got = await api("/api/director/pending?most=60");
+    dirQueueSeen = Number(got.waiting || 0);
+    dirBadge(dirQueueSeen);
+    if (dirQueue && dirQueue.win && !dirQueue.script) dirQueuePaint(got);
+  } catch (e) { /* the badge is not worth an error */ }
+}
+
+async function scriptsOpen() {
+  dirStyle();
+  const win = pineWin("scripts", "📝 Scripts waiting for you", {
+    minWidth: 520, minHeight: 420, width: 980, height: 780,
+    onClose: () => { dirQueue = null; },
+  });
+  const host = win.host;
+  host.style.display = "flex";
+  host.style.flexDirection = "column";
+  host.style.overflow = "hidden";
+  const bar = el("div", "dir-bar", "");
+  const back = el("button", "", "◀ All scripts");
+  back.style.display = "none";
+  const caption = el("span", "dir-load", "");
+  const refresh = el("button", "", "↻");
+  const gap = el("span", "", "");
+  gap.style.flex = "1";
+  [back, refresh, gap, caption].forEach((n) => bar.appendChild(n));
+  host.appendChild(bar);
+  const body = el("div", "dir-body", "");
+  host.appendChild(body);
+  dirQueue = {win, body, caption, back, script: null};
+  back.onclick = () => { dirQueue.script = null; back.style.display = "none"; dirQueueTick(); };
+  refresh.onclick = () => {
+    if (dirQueue.script) dirScriptOpen(dirQueue.script);
+    else dirQueueTick();
+  };
+  await dirQueueTick();
+}
+
+function dirQueuePaint(got) {
+  const {body, caption} = dirQueue;
+  body.textContent = "";
+  caption.textContent = got.say || "";
+  const rows = got.rows || [];
+  if (!rows.length) {
+    body.appendChild(el("div", "muted", "No scripts on the shelf."));
+    return;
+  }
+  rows.forEach((r) => {
+    const card = el("div", "dir-row", "");
+    const waiting = !r.review.seen && !r.kept && !r.aired;
+    if (waiting) card.classList.add("bare");
+    card.style.cursor = "pointer";
+    const head = el("div", "dir-head", "");
+    if (waiting) head.appendChild(el("span", "dir-chip warn", "● new"));
+    head.appendChild(el("span", "dir-name", r.kind));
+    head.appendChild(el("span", "dir-when",
+      r.turns + " turns · " + Math.round(r.seconds) + "s"));
+    if (r.is_tinted) head.appendChild(el("span", "dir-chip ok", "◆ tinted"));
+    else head.appendChild(el("span", "dir-chip", "◇ plain"));
+    if (r.kept) head.appendChild(el("span", "dir-chip", "kept"));
+    if (r.aired) head.appendChild(el("span", "dir-chip", r.aired + "x aired"));
+    if (r.review.approved) head.appendChild(el("span", "dir-chip ok", "✓ approved"));
+    if (r.review.bypass_tint) {
+      head.appendChild(el("span", "dir-chip warn", "past the tint"));
+    }
+    if (r.review.edits) {
+      head.appendChild(el("span", "dir-chip", r.review.edits + " edit"
+        + (r.review.edits === 1 ? "" : "s")));
+    }
+    card.appendChild(head);
+    const line = el("div", "dir-turn", r.head);
+    line.style.color = "#8fa6bd";
+    card.appendChild(line);
+    card.onclick = () => dirScriptOpen(r.sid);
+    body.appendChild(card);
+  });
+}
+
+async function dirScriptOpen(sid) {
+  if (!dirQueue) { await scriptsOpen(); }
+  if (!dirQueue) return;
+  dirQueue.script = sid;
+  dirQueue.back.style.display = "";
+  const {body, caption} = dirQueue;
+  body.textContent = "Reading the script…";
+  let got;
+  try { got = await api("/api/director/script/" + encodeURIComponent(sid)); }
+  catch (e) { body.textContent = "That script could not be read: " + e; return; }
+  if (!dirQueue || dirQueue.script !== sid) return;
+  /* Opening it is what clears the notification — and ONLY that. */
+  try {
+    await api("/api/director/script/" + encodeURIComponent(sid) + "/seen",
+      {method: "POST", body: JSON.stringify({kind: got.kind})});
+    dirQueueTick();
+  } catch (e) { /* the badge can lag */ }
+  body.textContent = "";
+  caption.textContent = got.kind + " · " + (got.turns || []).length
+    + " turns · " + Math.round(got.seconds || 0) + "s"
+    + (got.kept ? " · kept material — edits fork it" : "");
+
+  if ((got.notes || []).length) {
+    const box = el("details", "", "");
+    box.appendChild(el("summary", "dir-sub",
+      "your standing notes on every " + got.kind
+      + " (" + got.notes.length + ")"));
+    got.notes.forEach((n, i) => box.appendChild(
+      el("div", "dir-turn", (i + 1) + ". " + n.text)));
+    body.appendChild(box);
+  }
+  if ((got.beats || []).length) {
+    const shape = el("div", "dir-sub", "shape: "
+      + got.beats.map((b) => b.type).join(" → "));
+    body.appendChild(shape);
+  }
+
+  (got.turns || []).forEach((t) => body.appendChild(dirTurnRow(got, t)));
+
+  /* WHAT CAN BE DONE TO THE WHOLE SCRIPT. */
+  const foot = el("div", "dir-add", "");
+  foot.style.marginTop = "10px";
+  const ok = el("button", "", got.review.approved ? "✓ approved" : "Approve script");
+  ok.disabled = !!got.review.approved;
+  ok.onclick = async () => {
+    ok.disabled = true;
+    try {
+      await api("/api/director/segment/" + encodeURIComponent("sid:" + sid)
+        + "/approve", {method: "POST", body: JSON.stringify({})});
+      await dirScriptOpen(sid);
+    } catch (e) { ok.disabled = false; alert("Not approved: " + e); }
+  };
+  const send = el("button", "", "Send to the recording room");
+  send.title = "Release it as it stands. The crystal still gets its go.";
+  send.onclick = () => dirSend(sid, false, send);
+  const raw = el("button", "", "Record it as written — skip the tint");
+  raw.title = "This script records exactly as it reads. The crystal is not "
+    + "asked and is not waited for. Recorded as your decision.";
+  raw.style.borderColor = "#e0a35c";
+  raw.onclick = () => {
+    if (!confirm("Record this script as written, with no tint?\n\n"
+      + "It goes to the recording room exactly as it reads on screen.")) return;
+    dirSend(sid, true, raw);
+  };
+  [ok, send, raw].forEach((b) => foot.appendChild(b));
+  body.appendChild(foot);
+  if (got.review.sent_to_record) {
+    const said = el("div", "dir-sub", "already released to the recording room"
+      + (got.review.bypass_tint ? ", past the tint" : ""));
+    said.style.color = "#7ce8a9";
+    body.appendChild(said);
+  }
+}
+
+async function dirSend(sid, bypass, btn) {
+  btn.disabled = true;
+  try {
+    const got = await api("/api/director/script/" + encodeURIComponent(sid)
+      + "/record", {method: "POST", body: JSON.stringify({bypass})});
+    alert(got.say || "released");
+    await dirScriptOpen(sid);
+  } catch (e) { btn.disabled = false; alert("Not released: " + e); }
+}
+
+function dirTurnRow(got, t) {
+  const wrap = el("div", "dir-turn", "");
+  wrap.style.cssText = "margin:3px 0;padding:3px 5px;border-radius:5px;"
+    + "border:1px solid rgba(255,255,255,.07)";
+  const line = el("div", "", "");
+  const seat = el("span", "dir-seat", t.who + ": ");
+  if (t.seat === "C" || t.seat === "E") seat.classList.add("c");
+  if (t.seat === "B") seat.classList.add("b");
+  line.appendChild(seat);
+  const words = el("span", "", t.text);
+  line.appendChild(words);
+  wrap.appendChild(line);
+
+  const tools = el("div", "", "");
+  tools.style.cssText = "display:flex;gap:5px;margin-top:3px";
+  const rewrite = el("button", "", "✎ rewrite");
+  const tint = el("button", "", "◆ tint this line");
+  [rewrite, tint].forEach((b) => {
+    b.style.cssText = "font-size:10px;padding:0 6px;line-height:1.6";
+  });
+  tools.appendChild(rewrite);
+  tools.appendChild(tint);
+  wrap.appendChild(tools);
+
+  rewrite.onclick = () => {
+    if (wrap.querySelector("textarea")) return;
+    const area = document.createElement("textarea");
+    area.value = t.text;
+    area.style.cssText = "width:100%;min-height:54px;font-size:12px;"
+      + "font-family:inherit;padding:3px 5px;margin-top:4px";
+    const save = el("button", "", "Save");
+    const stop = el("button", "", "Cancel");
+    [save, stop].forEach((b) => {
+      b.style.cssText = "font-size:10px;padding:0 6px;margin:3px 4px 0 0";
+    });
+    const bar = el("div", "", "");
+    bar.appendChild(save); bar.appendChild(stop);
+    wrap.appendChild(area); wrap.appendChild(bar);
+    area.focus();
+    const shut = () => { area.remove(); bar.remove(); };
+    stop.onclick = shut;
+    save.onclick = async () => {
+      const text = area.value.trim();
+      if (!text || text === t.text) { shut(); return; }
+      save.disabled = true;
+      try {
+        await api("/api/director/script/" + encodeURIComponent(got.sid)
+          + "/turn", {method: "POST", body: JSON.stringify(
+            {index: t.index, text, was: t.text})});
+        await dirScriptOpen(got.sid);
+      } catch (e) { save.disabled = false; alert("Not accepted: " + e); }
+    };
+  };
+
+  tint.onclick = async () => {
+    if (wrap.querySelector("[data-tint]")) return;
+    tint.disabled = true;
+    tint.textContent = "◆ asking the crystal…";
+    let out;
+    try {
+      out = await api("/api/director/script/" + encodeURIComponent(got.sid)
+        + "/tint", {method: "POST", body: JSON.stringify({index: t.index})});
+    } catch (e) {
+      tint.disabled = false; tint.textContent = "◆ tint this line";
+      alert("The crystal could not be reached: " + e);
+      return;
+    }
+    tint.textContent = "◆ tint this line";
+    tint.disabled = false;
+    const box = el("div", "", "");
+    box.setAttribute("data-tint", "1");
+    box.style.cssText = "margin-top:5px;padding:4px 6px;border-radius:5px;"
+      + "border:1px solid rgba(168,224,124,.35);background:rgba(168,224,124,.06)";
+    if (!out.changed) {
+      box.appendChild(el("div", "dir-sub", out.say));
+      if ((out.faults || []).length) {
+        box.appendChild(el("div", "dir-sub", "— " + out.faults.join("; ")));
+      }
+      const shut = el("button", "", "Close");
+      shut.style.cssText = "font-size:10px;padding:0 6px;margin-top:3px";
+      shut.onclick = () => box.remove();
+      box.appendChild(shut);
+      wrap.appendChild(box);
+      return;
+    }
+    const tinted = el("div", "", "");
+    tinted.style.color = "#a8e07c";
+    tinted.textContent = out.tinted;
+    box.appendChild(el("div", "dir-sub", "the crystal would make it:"));
+    box.appendChild(tinted);
+    if ((out.faults || []).length) {
+      const f = el("div", "dir-sub", "its own grader objects: "
+        + out.faults.join("; "));
+      f.style.color = "#e0a35c";
+      box.appendChild(f);
+    }
+    const take = el("button", "", "Take it");
+    const no = el("button", "", "Leave it plain");
+    [take, no].forEach((b) => {
+      b.style.cssText = "font-size:10px;padding:0 7px;margin:5px 5px 0 0";
+    });
+    take.onclick = async () => {
+      take.disabled = true;
+      try {
+        await api("/api/director/script/" + encodeURIComponent(got.sid)
+          + "/tint/accept", {method: "POST", body: JSON.stringify(
+            {index: t.index, text: out.tinted, was: t.text})});
+        await dirScriptOpen(got.sid);
+      } catch (e) { take.disabled = false; alert("Not taken: " + e); }
+    };
+    no.onclick = async () => {
+      try {
+        await api("/api/director/script/" + encodeURIComponent(got.sid)
+          + "/tint/refuse", {method: "POST", body: JSON.stringify(
+            {index: t.index, text: out.tinted, was: t.text,
+             faults: out.faults || []})});
+      } catch (e) { /* the refusal is a record, not a gate */ }
+      box.remove();
+    };
+    box.appendChild(take);
+    box.appendChild(no);
+    wrap.appendChild(box);
+  };
+  if (t.tinted) {
+    const alt = el("div", "dir-sub", "a tinted version is stored: " + t.tinted);
+    alt.style.color = "#a8e07c";
+    wrap.appendChild(alt);
+  }
+  return wrap;
+}
+
 let dirBook = null;
 let dirHour = 0;
 
@@ -134013,6 +134684,13 @@ function dirStyle() {
     ".dir-node.n-seed{border-color:#a8e07c;color:#a8e07c}",
     ".dir-node.n-sfx{border-color:#c79ae8;color:#c79ae8}",
     ".dir-node-note{opacity:.7}",
+    /* 2026-09-10: the script button PULSES while anything is unread, so a
+     * script that has been written announces itself instead of waiting to
+     * be noticed. Stops the moment the queue is empty. */
+    "@keyframes pineScriptPulse{0%,100%{box-shadow:0 0 0 0 rgba(224,163,92,.55)}",
+    "50%{box-shadow:0 0 0 7px rgba(224,163,92,0)}}",
+    "#scriptsBtn.waiting{animation:pineScriptPulse 1.9s ease-out infinite;",
+    "border-radius:8px;color:#e8c07c}",
   ].join("");
   document.head.appendChild(css);
 }
@@ -157227,6 +157905,9 @@ async function djRepairDialogueFlow() {
 }
 
 function djDialogueFlowPaint(flow) {
+  // 2026-09-10: and the scripts waiting to be read. Throttled inside
+  // dirQueueTick - this paint runs often and the queue walks the shelf.
+  try { dirQueueTick(); } catch (e) { /* the badge is not worth an error */ }
   // 2026-09-08: the retirement desk's count on the tray button.
   try {
     const n = Number(((flow || {}).retire || {}).pending || 0);
