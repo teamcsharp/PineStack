@@ -113672,6 +113672,54 @@ def _fm_load(text: str) -> tuple[dict[str, Any], str, str]:
 
 # --- markdown, the small subset the desks write ---------------------------
 
+# --- #1158: no filename is ever printed as a name ------------------------
+
+# Anything that looks like the file an image lives in. The station's wall
+# draws from several models and each stamps its own prefix, so this matches
+# the SHAPE - a bare name with an extension - rather than a list of them.
+_PAPER_FILENAME = re.compile(
+    # As stored: one token, then the extension.
+    r"\"?\b[A-Za-z][\w.-]*\.(?:png|jpe?g|webp|gif|bmp)\b\"?"
+    # Or spaced out by a hand that meant well - the name, its number
+    # and the extension standing apart.
+    r"|\"?\b[A-Za-z][\w-]*(?:\s+\d{2,6})+\s*_?\s*\.\s?"
+    r"(?:png|jpe?g|webp|gif|bmp)\b\"?",
+    re.I)
+
+
+def _paper_art_title(name: Any) -> str:
+    """A catalogue title for a canvas nobody named.
+
+    The number is the one the file carries, so the same painting keeps the
+    same title every hour it is offered - which is what makes the ledger
+    readable across editions."""
+    raw = str(name or "").strip().strip('"')
+    if not raw:
+        return "an untitled work"
+    hit = re.search(r"(\d{2,6})", raw)
+    if hit:
+        return "Untitled No. %d" % int(hit.group(1))
+    stem = re.sub(r"\.[A-Za-z0-9]+$", "", raw)
+    stem = re.sub(r"[_-]+", " ", stem).strip()
+    return stem.title() if stem else "an untitled work"
+
+
+def _paper_subedit(s: Any) -> str:
+    """Copy on its way to the page, read once for the things a sub-editor
+    would catch: a filename standing in for a name, a currency mark with no
+    figure behind it, and the spacing around them."""
+    out = str(s if s is not None else "")
+    if not out:
+        return out
+    if _PAPER_FILENAME.search(out):
+        out = _PAPER_FILENAME.sub(
+            lambda m: "\u201c%s\u201d" % _paper_art_title(m.group(0)), out)
+    # A price the ledger never had is not a price. '$' with no figure after
+    # it printed as a bare mark, and '$-' as a mark and a rule.
+    out = re.sub(r"\$(?![\d(])\s*(?=[^\d]|$)", "", out)
+    return re.sub(r"[ \t]{2,}", " ", out)
+
+
 def _paper_esc(s: Any) -> str:
     return (str(s if s is not None else "").replace("&", "&amp;")
             .replace("<", "&lt;").replace(">", "&gt;")
@@ -113679,7 +113727,14 @@ def _paper_esc(s: Any) -> str:
 
 
 def _md_inline(s: str) -> str:
-    out = _paper_esc(s)
+    # #1158: read the copy before it is set, but never the inside of a
+    # link's target - a filename in a URL is a filename doing its job.
+    raw = str(s if s is not None else "")
+    if raw:
+        parts = re.split(r"(\]\([^)\s]+\))", raw)
+        raw = "".join(p if p.startswith("](") else _paper_subedit(p)
+                      for p in parts)
+    out = _paper_esc(raw)
     out = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", out)
     out = re.sub(r"(?<![\w*])\*(?!\s)(.+?)(?<!\s)\*(?![\w*])", r"<i>\1</i>", out)
     out = re.sub(
@@ -114912,12 +114967,37 @@ def _desk_records(m: dict[str, Any]) -> dict[str, Any] | None:
     return {"slug": "the-records", "meta": meta, "body": body}
 
 
+def _paper_sponsor(product: Any, most: int) -> str:
+    """The NAME of what was advertised, off a stored product line.
+
+    #1158: these lines are written for a copywriter to read, not for a
+    column - 'the original painting "x" - in it: <everything the vision
+    model saw> - from the Pine Box gallery, 900 dollars, first caller takes
+    it'. Cutting that to fit a column lands in the middle of the
+    description; what belongs in the column is the first clause, which is
+    always the thing itself."""
+    text = _paper_subedit(product)
+    # The description, the price and the terms are all set off by an em
+    # dash or a comma; the name is what stands before the first of them.
+    name = re.split(r"\s+[\u2014\u2013-]\s+|,\s+", text, maxsplit=1)[0]
+    name = name.strip().strip(".;:")
+    # A named work: four words of preamble and one name. In a column this
+    # narrow the preamble is the only thing that would survive, and every
+    # painting read would print under the same heading. The title is what
+    # identifies it, so when the whole will not fit the title goes in.
+    if len(name) > most:
+        title = re.search("[“\"]([^”\"]{2,})[”\"]", name)
+        if title:
+            name = title.group(1).strip()
+    return _paper_shorten(name or text, most)
+
+
 def _desk_adverts(m: dict[str, Any]) -> dict[str, Any] | None:
     ads = list(m.get("ads") or [])
     if not ads:
         return None
     rows = "\n".join(
-        f"| {_paper_clock(a['ts'])} | {_paper_shorten(a['product'].split(',')[0], 26)} | "
+        f"| {_paper_clock(a['ts'])} | {_paper_sponsor(a['product'], 26)} | "
         f"{a['words']} | {a['where'] or '-'} |" for a in ads[:20])
     words = sum(a["words"] for a in ads)
     body = (
@@ -114925,12 +115005,13 @@ def _desk_adverts(m: dict[str, Any]) -> dict[str, Any] | None:
         f"hour, {words} words of copy in all"
         + (f", the first at {_paper_clock(ads[0]['ts'])}" if ads else "")
         + ". The sponsors, in the order they aired: "
-        + "; ".join(_paper_shorten(a["product"], 70) for a in ads[:8])
+        + "; ".join(dict.fromkeys(_paper_sponsor(a["product"], 58)
+                                  for a in ads[:8]))
         + ". A spot marked box went out over the Pine Box itself; page means "
         "it reached the listener page only. The ledger this is read from is "
         "written at the moment a read finishes, so an advert that was "
         "prepared and never aired is not counted here.\n\n"
-        "### The log\n\n| Time | Sponsor | Words | Where |\n|:---|:---|---:|:---|\n"
+        "### The log\n\n| Time | Spot | Wds | Where |\n|:---|:---|---:|:---|\n"
         + rows)
     meta = {"headline": f"{len(ads)} Spot{'s' if len(ads) != 1 else ''} Read, {words} Words of Copy",
             "deck": "The hour's commercial breaks, off the airing ledger",
@@ -117516,7 +117597,7 @@ async def _desk_forsale(m: dict[str, Any]) -> dict[str, Any] | None:
         "offers are invited wherever no asking price is given.")
     paper_seeds_used(seeds)
     body += ("\n\n### The lots\n\n| Piece | Price | Where |\n|:---|---:|:---|\n"
-             + "\n".join(f"| {_paper_shorten(str(l['name']), 26)} | "
+             + "\n".join(f"| {_paper_sponsor(str(l['name']), 24)} | "
                          f"{('$' + str(l['price'])) if l['price'] else '-'} | "
                          f"{_paper_shorten(l['where'], 20)} |" for l in lots))
     meta: dict[str, Any] = {
@@ -119567,7 +119648,7 @@ import math  # G3: the pie, the cloud and the plexus need it here
 # (server-side SVG) and a live plexus of the background work (three.js from
 # /vendor when it loads, the SVG when it does not).
 
-PAPER_RENDER_VERSION = 7          # #1067: reference-inspired portrait broadsheet
+PAPER_RENDER_VERSION = 12          # #1158: set to publishing rules - see _paper_words
 PAPER_STYLES = ("broadsheet", "tabloid")
 PAPER_PAGES_MAX = 6               # the desks' page hint still runs 1..6
 PAPER_PAGES_CAP = int(os.getenv("PAPER_PAGES_CAP", "12"))  # what the packer aims at
@@ -120120,11 +120201,28 @@ figure.plate .credit{float:right;font-size:9px;text-transform:uppercase;letter-s
 /* #1047: a table that is wider than its column shrinks into it and, at the
    very worst, scrolls inside its own box - it never walks off the sheet. */
 .tblwrap{max-width:100%;margin:6px 0 10px}
-table.agate{width:100%;border-collapse:collapse;font-size:11px;margin:0;font-family:"Helvetica Neue",Arial,sans-serif;table-layout:fixed}
+table.agate{width:100%;max-width:100%;border-collapse:collapse;font-size:11px;margin:0;font-family:"Helvetica Neue",Arial,sans-serif;table-layout:auto}
+/* A figure column is as wide as its figures and no wider, so the room
+   goes where the words are. */
+table.agate td:last-child,table.agate th:last-child{width:1%;white-space:nowrap}
 table.agate tr{break-inside:avoid}table.agate thead{break-after:avoid}
 table.agate th{border-bottom:1px solid var(--ink);text-align:left;padding:3px 4px;font-weight:700;text-transform:uppercase;letter-spacing:.06em;font-size:9.5px}
 table.agate td{padding:3px 4px;border-bottom:1px dotted #c8c0ad;vertical-align:top}
-table.agate td,table.agate th{overflow-wrap:anywhere;word-break:break-word}
+table.agate td{hyphens:auto;-webkit-hyphens:auto;overflow-wrap:break-word;word-break:normal}
+table.agate th{white-space:nowrap;hyphens:none;-webkit-hyphens:none;overflow-wrap:normal;word-break:normal;font-size:9px;letter-spacing:.02em}
+/* #1158: DISPLAY TYPE IS NEVER GUILLOTINED. Everything set to be read at a
+   glance - the furniture of the page - breaks on spaces or not at all. */
+h1,h2,h3,h4,.kicker,.deck,.byline,.flash,.head,.conthead,.fillhead,.jump,
+.filler b,.filler .fp,.classifieds .ad b,.classifieds .ad .price,.stat b,
+.stat span,.serial h4,.serial .part,.quote .who,.interview .who,.notice,
+.teaser,.ears,.pghead,.tmast,figure.plate .credit{
+ hyphens:none;-webkit-hyphens:none;overflow-wrap:normal;word-break:normal}
+/* A headline too long for its measure is set smaller, not sawn through -
+   except the splash, where a single word at 64px has nowhere else to go. */
+.splash-head{overflow-wrap:break-word}
+/* #1158: the box the containment pass shrinks when a page would otherwise
+   cut a paragraph in half. It is a plain block until it is needed. */
+.pgfit{width:100%}
 table.agate td:last-child,table.agate th:last-child{text-align:right}
 svg.chart{width:100%;height:auto;display:block;margin:6px 0 2px;break-inside:avoid}
 svg.chart .grid{stroke:#d3cbb8;stroke-width:1}
@@ -120319,7 +120417,8 @@ body{color:var(--ink);font-family:"Helvetica Neue",Arial,"Liberation Sans",sans-
 .teaser{display:grid;grid-template-columns:56px 1fr;gap:6px;align-items:center;padding:4px 6px;color:#fff;height:60px;overflow:hidden}
 .teaser.c0{background:var(--navy)}.teaser.c1{background:var(--teal)}.teaser.c2{background:var(--ink)}.teaser.c3{background:#6b1a8b}
 .teaser img{width:56px;height:48px;object-fit:cover;display:block;border:1px solid #fff}
-.teaser h3{margin:0;font-size:15px;line-height:.98;font-weight:900;text-transform:uppercase}
+.teaser h3{margin:0;font-size:15px;line-height:1.0;font-weight:900;text-transform:uppercase;
+ display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .teaser small{display:block;font-size:8.5px;letter-spacing:.1em;text-transform:uppercase;color:var(--yellow);margin-top:2px}
 .kicker-bar{background:#fff;color:var(--red);border:3px solid var(--red);text-align:center;font-size:24px;font-weight:900;text-transform:uppercase;letter-spacing:.02em;padding:1px 8px;margin:0 0 5px;line-height:1.05}
 .splash{position:relative;background:var(--ink);overflow:hidden;margin:0 0 6px}
@@ -120724,9 +120823,10 @@ def _paper_story_bits(a: dict[str, Any], ctx: dict[str, Any],
     if style == "tabloid" and meta.get("flash") and not on_splash:
         head.append(f'<span class="flash">{_paper_esc(meta["flash"])}</span>')
     if not on_splash:
-        head.append(f"<h2>{_paper_esc(headline)}</h2>")
+        head.append(f"<h2>{_paper_esc(_paper_subedit(headline))}</h2>")
         if meta.get("deck"):
-            head.append(f'<p class="deck">{_paper_esc(meta["deck"])}</p>')
+            head.append('<p class="deck">'
+                        f'{_paper_esc(_paper_subedit(meta["deck"]))}</p>')
     head.append('<p class="byline"><span class="sec">'
                 f'{_paper_esc(section_name.get(sec, sec))}</span>'
                 + (f' &middot; {_paper_esc(meta["byline"])}' if meta.get("byline") else "")
@@ -121976,6 +122076,76 @@ _PAPER_FIT_JS = r"""
       }
     });
   }
+  /* #1158: THE CONTAINMENT PASS - see the note in the patch. Every box on
+     the page that clips is asked whether it is clipping anything, and the
+     answer has to be no. */
+  function boxOver(b){ return b.scrollHeight - b.clientHeight; }
+  function pullAds(b){
+    var guard=0;
+    while(boxOver(b)>2 && guard++<80){
+      var ads=b.querySelectorAll('.filler, .fillrun > *');
+      if(!ads.length) break;
+      var last=ads[ads.length-1];
+      if(!last.parentNode) break;
+      last.parentNode.removeChild(last);
+    }
+  }
+  /* The children go into one wrapper so the wrapper can be reduced while
+     the BOX keeps the height the page gave it - zooming the box itself
+     would move the box, and the box is the page's, not ours. */
+  function fitHost(b){
+    var host=b.querySelector(':scope > .pgfit');
+    if(!host){
+      host=document.createElement('div');
+      host.className='pgfit';
+      while(b.firstChild) host.appendChild(b.firstChild);
+      b.appendChild(host);
+    }
+    return host;
+  }
+  /* A box the packer gave a height to: reduce the box, and divide the
+     height by the same factor so the box keeps the size it was given.
+     Nothing inside is moved, so a grid stays a grid. */
+  function squeezeSelf(b){
+    var h0=parseFloat(b.style.height)||b.clientHeight;
+    for(var z=98; z>=84 && boxOver(b)>2; z-=2){
+      b.style.zoom=(z/100);
+      b.style.height=(h0/(z/100)).toFixed(1)+'px';
+    }
+    if(boxOver(b)>2){ b.style.zoom=''; b.style.height=h0?h0+'px':''; }
+  }
+  /* A box whose height comes from the flex it sits in has nothing to
+     divide, so its CONTENTS go into one wrapper and the wrapper is
+     reduced. Only ever used where the children are a plain column. */
+  function squeezeInner(b){
+    var host=fitHost(b);
+    for(var pc=1; pc<=4 && boxOver(b)>2; pc++) host.style.fontSize=(100-pc)+'%';
+    for(var z=98; z>=84 && boxOver(b)>2; z-=2) host.style.zoom=(z/100);
+  }
+  function containBox(b, inner){
+    if(!b || !b.clientHeight || boxOver(b)<=2) return 0;
+    pullAds(b);                       /* the page's own adverts come first */
+    if(boxOver(b)>2){ (inner?squeezeInner:squeezeSelf)(b); }
+    var left=boxOver(b);
+    if(left>2) b.setAttribute('data-clipped', String(Math.round(left)));
+    else if(b.style.zoom) b.setAttribute('data-contained', b.style.zoom);
+    return left>2 ? left : 0;
+  }
+  function contain(){
+    Array.prototype.forEach.call(document.querySelectorAll('.page'), function(pg){
+      /* The blocks the packer sized, first: a front grid that fits stops
+         its page body from overrunning, and squeezing the smaller box is
+         the lighter touch of the two. */
+      Array.prototype.forEach.call(pg.querySelectorAll('.front,.wideblock'),
+        function(b){ containBox(b, false); });
+      /* Then the body, which is the one box here with no height of its
+         own - the page's flex decides it - so it takes the wrapper. The
+         page itself is never touched: its foot is held by margin-top:auto
+         and its body by flex, and both are lost the moment anything comes
+         between them and the page. */
+      containBox(pg.querySelector('.pgbody'), true);
+    });
+  }
   function stamp(){
     var ps=Array.prototype.slice.call(document.querySelectorAll('.page'));
     document.body.setAttribute('data-pages', ps.length);
@@ -122011,6 +122181,7 @@ _PAPER_FIT_JS = r"""
     topUp();
     trim();          /* whatever the top-up got wrong comes back out */
     closeFeet();     /* and the last inch takes a ruled closer */
+    contain();       /* #1158: and nothing is cut off the bottom of a page */
     stamp();
     fitWidth();
   }
@@ -122052,6 +122223,12 @@ def _paper_lead_of(ed: dict[str, Any]) -> dict[str, Any] | None:
 
 def _paper_plate_html(url: Any, caption: Any = "", credit: Any = "", focus: Any = "",
                       alt: Any = "", extra: str = "") -> str:
+    # #1158: the caption and the credit are copy. The url is not.
+    caption, credit = _paper_subedit(caption), _paper_subedit(credit)
+    # A credit that is only the file it came from credits nobody: the
+    # station drew it, and that is what a credit line should say.
+    if credit and not re.search(r"[a-z]{3}\s+[a-z]{3}", str(credit), re.I):
+        credit = "Pine Box FM"
     url = str(url or "")
     if not url:
         return ""
@@ -122643,7 +122820,7 @@ def _paper_set_tabloid(ctx: dict[str, Any]) -> str:
                     + (f'<img src="{_paper_esc((a.get("meta") or {}).get("image"))}" alt="" '
                        'onerror="this.remove()">'
                        if (a.get("meta") or {}).get("image") else "<span></span>")
-                    + f'<div><h3>{_paper_esc(_paper_short_head(str((a.get("meta") or {}).get("headline") or ""), 46))}</h3>'
+                    + f'<div><h3>{_paper_esc(_paper_short_head(str((a.get("meta") or {}).get("headline") or ""), 30))}</h3>'
                     f'<small>{_paper_esc(ctx["section_name"].get(str((a.get("meta") or {}).get("section") or ""), ""))}'
                     f' &middot; page {next((pp["n"] for pp in pages if a in pp["stories"]), 2)}</small>'
                     "</div></div>"
@@ -122661,8 +122838,10 @@ def _paper_set_tabloid(ctx: dict[str, Any]) -> str:
                 top.append(f'<div class="splash {focus}" style="height:{M["splash"]:.0f}px">'
                            + (f'<img src="{_paper_esc(img)}" alt="" onerror="this.remove()">'
                               if img else "")
-                           + (f'<span class="cap">{_paper_esc(cap)}'
-                              + (f' <span class="credit">{_paper_esc(lead_meta.get("credit"))}</span>'
+                           + (f'<span class="cap">{_paper_esc(_paper_subedit(cap))}'
+                              + (' <span class="credit">'
+                                 f'{_paper_esc(_paper_subedit(lead_meta.get("credit")))}'
+                                 '</span>'
                                  if lead_meta.get("credit") else "")
                               + "</span>" if img and (cap or lead_meta.get("credit")) else "")
                            + f'<div class="flash">{_paper_esc(flash)}</div>'
@@ -122738,7 +122917,7 @@ def paper_render_html(ed: dict[str, Any], style: str = "broadsheet") -> str:
            .replace("__CLOSERS__", json.dumps(list(PAPER_CLOSERS))))
     title = f"{head['masthead']} · {ctx['hour']} hour" + (" · tabloid" if style == "tabloid" else "")
     return (f"<!doctype html><!--PAPER_RENDER_VERSION={PAPER_RENDER_VERSION} style={style}-->"
-            "<html><head><meta charset=\"utf-8\">"
+            "<html lang=\"en\"><head><meta charset=\"utf-8\">"
             f"<title>{_paper_esc(title)}</title>"
             "<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">"
             f"<style>{css}</style></head>"
@@ -135993,6 +136172,79 @@ function dirQueueRow(r) {
   return card;
 }
 
+/* 2026-09-10: "When I approve a script, go to the next script that needs
+ * approval."
+ *
+ * Approving used to reopen the script that had just been approved, which
+ * is the one page in the queue that no longer needs a person. Reviewing is
+ * a pass through a pile, not a visit to one item, so the sign-off carries
+ * you to the next thing actually waiting.
+ *
+ * WHAT COUNTS AS WAITING is deliberately narrow: not approved, not kept
+ * material, and never aired. A kept round is shared material an edit would
+ * fork rather than change, and a round that has already gone out cannot be
+ * improved before the fact - putting either in front of the operator
+ * during a review pass is asking them to spend attention on a decision
+ * that no longer exists.
+ *
+ * The order is the queue's own, and it resumes AFTER the one just signed
+ * off rather than at the top, so a pass moves forward instead of circling
+ * back over what was already dealt with. It wraps once, so a script skipped
+ * earlier in the pass is still reached before the queue is called done.
+ */
+async function dirNextWaiting(afterSid) {
+  let got = null;
+  try { got = await api("/api/director/pending?most=60"); }
+  catch (e) { return null; }
+  const rows = (got.rows || []).filter((r) =>
+    r && r.sid && !r.kept && !r.aired
+    && !(r.review && r.review.approved));
+  if (!rows.length) return null;
+  const at = rows.findIndex((r) => r.sid === afterSid);
+  /* Resume after the current one; wrap once. When the one just approved
+   * has already dropped out of the list (it will have - it is approved
+   * now), findIndex returns -1 and the first waiting row is the answer. */
+  const next = at >= 0 ? rows[(at + 1) % rows.length] : rows[0];
+  return (next && next.sid !== afterSid) ? next : null;
+}
+
+async function dirApproveAndMoveOn(sid, btn) {
+  btn.disabled = true;
+  const was = btn.textContent;
+  btn.textContent = "approving…";
+  try {
+    await api("/api/director/segment/" + encodeURIComponent("sid:" + sid)
+      + "/approve", {method: "POST", body: JSON.stringify({})});
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = was;
+    alert("Not approved: " + e);
+    return;
+  }
+  const next = await dirNextWaiting(sid);
+  if (next) {
+    await dirScriptOpen(next.sid);
+    if (dirQueue && dirQueue.caption) {
+      /* Say what just happened, because the page changed underneath them. */
+      const note = " · approved the last one";
+      if (dirQueue.caption.textContent.indexOf(note) < 0) {
+        dirQueue.caption.textContent += note;
+      }
+    }
+    return;
+  }
+  /* Nothing left waiting: back to the pile, which now says so. */
+  if (dirQueue) {
+    dirQueue.script = null;
+    if (dirQueue.back) dirQueue.back.style.display = "none";
+  }
+  await dirQueueTick(true);
+  if (dirQueue && dirQueue.caption) {
+    dirQueue.caption.textContent =
+      "approved — nothing else is waiting on you";
+  }
+}
+
 async function dirScriptOpen(sid) {
   if (!dirQueue) { await scriptsOpen(); }
   if (!dirQueue) return;
@@ -136136,14 +136388,10 @@ async function dirScriptOpen(sid) {
   };
   const ok = el("button", "", got.review.approved ? "✓ approved" : "Approve script");
   ok.disabled = !!got.review.approved;
-  ok.onclick = async () => {
-    ok.disabled = true;
-    try {
-      await api("/api/director/segment/" + encodeURIComponent("sid:" + sid)
-        + "/approve", {method: "POST", body: JSON.stringify({})});
-      await dirScriptOpen(sid);
-    } catch (e) { ok.disabled = false; alert("Not approved: " + e); }
-  };
+  ok.title = got.review.approved
+    ? "Already approved"
+    : "Approve this script and open the next one still waiting on you";
+  ok.onclick = () => dirApproveAndMoveOn(sid, ok);
   const send = el("button", "", "Send to the recording room");
   send.title = "Release it as it stands. The crystal still gets its go.";
   send.onclick = () => dirSend(sid, false, send);
@@ -168276,6 +168524,212 @@ async function paperEditionCanvas(say) {
   }
 }
 
+/* 2026-09-10 (#1158): THE WHOLE PAPER AS ONE SQUARE PLATE.
+ *
+ * "when i collect all the images, I want to collect them as a square grid
+ *  where they are all made to fit a square formation and be res'd down to
+ *  be 1mb or under in filesize. I need the image able to be copied to
+ *  clipboard from that button."
+ *
+ * It used to stitch the pages into ONE TALL COLUMN - twelve tabloid sheets
+ * end to end is 900 x 15,700 pixels, an aspect of 1:17. Nothing shows that
+ * to you: a chat window scales it to a grey thread, a paste into a document
+ * runs it off the bottom of the page, and the gallery filmstrip gets a
+ * hairline. It was also 8 to 14 MB, which is above what most places will
+ * take at all.
+ *
+ * A contact sheet is the printer's answer and it is the right one: lay the
+ * pages out in the grid closest to square, and the whole edition is one
+ * plate you can take in at a glance and paste anywhere.
+ */
+
+/* Which grid comes closest to a square for n pages of w x h.
+ * The empty-cell term is small on purpose - a slightly less square grid
+ * with no holes in it looks more like a contact sheet than a squarer one
+ * with three blanks in the bottom row. */
+function paperGridPlan(n, w, h) {
+  let best = null;
+  for (let c = 1; c <= n; c++) {
+    const r = Math.ceil(n / c);
+    const score = Math.abs(Math.log((c * w) / (r * h))) + 0.05 * (c * r - n);
+    if (!best || score < best.score) best = {cols: c, rows: r, score: score};
+  }
+  return best || {cols: 1, rows: n};
+}
+
+/* Encode to at most `cap` bytes.
+ *
+ * A newspaper page is mostly flat paper and black type, which PNG likes, so
+ * PNG is tried first and kept while it can reach the cap at a scale that is
+ * still readable. Past that the choice is between a small unreadable
+ * lossless plate and a legible lossy one, and for something you paste into
+ * a message the legible one wins - so below the floor it switches to JPEG
+ * and spends the budget on resolution instead. The PNG is always what goes
+ * on the CLIPBOARD, whatever the file turns out to be: image/jpeg is not
+ * something every paste target will take, and the clipboard has no cap. */
+async function paperFitBytes(canvas, cap) {
+  const enc = (cv, type, q) => new Promise((res) => cv.toBlob(res, type, q));
+  /* Start from a plate no bigger than about 2.4 megapixels: past that the
+   * type is finer than a screen shows and every byte of it is waste. */
+  let scale = Math.min(1, Math.sqrt(2.4e6 / (canvas.width * canvas.height)));
+  let out = null;
+  for (let i = 0; i < 7; i++) {
+    const cv = scale >= 0.999 ? canvas
+      : paperShrink(canvas, Math.round(canvas.width * scale),
+                    Math.round(canvas.height * scale));
+    const blob = await enc(cv, "image/png");
+    out = {blob: blob, canvas: cv, type: "png", scale: scale};
+    if (blob && blob.size <= cap) return out;
+    if (scale <= 0.34) break;                 /* the readability floor */
+    scale *= 0.78;
+  }
+  /* Lossless will not reach it at a size worth reading: spend the budget on
+   * resolution and take the loss, walking the quality down first and only
+   * then the scale. */
+  let jscale = Math.min(1, Math.sqrt(2.4e6 / (canvas.width * canvas.height)));
+  for (let i = 0; i < 8; i++) {
+    const cv = jscale >= 0.999 ? canvas
+      : paperShrink(canvas, Math.round(canvas.width * jscale),
+                    Math.round(canvas.height * jscale));
+    for (const q of [0.86, 0.74, 0.62]) {
+      const blob = await enc(cv, "image/jpeg", q);
+      if (blob && blob.size <= cap) {
+        return {blob: blob, canvas: cv, type: "jpg", scale: jscale, quality: q};
+      }
+      out = {blob: blob, canvas: cv, type: "jpg", scale: jscale, quality: q};
+    }
+    if (jscale <= 0.3) break;
+    jscale *= 0.8;
+  }
+  return out;      /* the smallest we could make it; the caller says so */
+}
+
+/* Every page of the edition drawn into the grid closest to square. The
+ * measuring, the un-hiding and the per-page shot are the column stitcher's,
+ * unchanged - only the placing is different. */
+async function paperEditionPlate(say) {
+  const h2i = await paperH2I();
+  const doc = paperFrame && paperFrame.contentDocument;
+  const win = paperFrame && paperFrame.contentWindow;
+  if (!doc || !win) throw new Error("no edition loaded");
+  if (doc.fonts && doc.fonts.ready) await doc.fonts.ready;
+  await paperImagesSettled(doc, 6000);
+  paperInlineSvg(doc);
+  const pages = Array.from(doc.querySelectorAll(".page"));
+  if (!pages.length) throw new Error("this edition has no pages to shoot");
+  const undo = [];
+  pages.forEach((pg) => {
+    const cs = win.getComputedStyle(pg);
+    if (pg.hidden || cs.display === "none" || cs.visibility === "hidden") {
+      undo.push([pg, pg.style.display, pg.style.visibility, pg.hidden]);
+      pg.hidden = false;
+      pg.style.display = "block";
+      pg.style.visibility = "visible";
+    }
+  });
+  try {
+    const wide = Math.max.apply(null, pages.map((p) => p.offsetWidth || 1240));
+    const tall = Math.max.apply(null, pages.map((p) => p.offsetHeight || 1));
+    const plan = paperGridPlan(pages.length, wide, tall);
+    const GAP = 18;
+    const boardW = plan.cols * wide + GAP * (plan.cols + 1);
+    const boardH = plan.rows * tall + GAP * (plan.rows + 1);
+    /* Shoot each page at a ratio the canvas can actually hold. The plate is
+     * re-sized to its byte budget afterwards, so this only has to be enough
+     * to read, not enough to print. */
+    const ratio = Math.min(1.6, 8000 / boardW, 8000 / boardH,
+                           Math.sqrt(6.0e7 / (boardW * boardH)));
+    if (!(ratio > 0)) throw new Error("This edition is too large for one plate");
+    const bg = win.getComputedStyle(doc.body).backgroundColor || "#ece5d4";
+    const out = document.createElement("canvas");
+    out.width = Math.ceil(boardW * ratio);
+    out.height = Math.ceil(boardH * ratio);
+    const cx = out.getContext("2d");
+    if (!cx) throw new Error("The browser could not allocate the plate");
+    cx.fillStyle = bg;
+    cx.fillRect(0, 0, out.width, out.height);
+    for (let i = 0; i < pages.length; i++) {
+      if (say) say(i + 1, pages.length);
+      const pageBg = win.getComputedStyle(pages[i]).backgroundColor || bg;
+      const one = await h2i.toCanvas(pages[i], {
+        pixelRatio: ratio, backgroundColor: pageBg, cacheBust: false,
+        style: {margin: "0", boxShadow: "none"}
+      });
+      const col = i % plan.cols;
+      const row = Math.floor(i / plan.cols);
+      /* Centred in its cell, so a short last page sits square with the rest
+       * instead of hugging the top of its box. */
+      const cellX = (GAP + col * (wide + GAP)) * ratio;
+      const cellY = (GAP + row * (tall + GAP)) * ratio;
+      cx.drawImage(one,
+        Math.round(cellX + (wide * ratio - one.width) / 2),
+        Math.round(cellY + (tall * ratio - one.height) / 2));
+      one.width = one.height = 0;         /* let the page go before the next */
+    }
+    return {canvas: out, pages: pages.length, cols: plan.cols, rows: plan.rows};
+  } finally {
+    undo.forEach((row) => {
+      row[0].style.display = row[1];
+      row[0].style.visibility = row[2];
+      row[0].hidden = row[3];
+    });
+  }
+}
+
+/* The plate, inside its byte budget, with the button counting the pages
+ * off. `png` is kept beside it because the clipboard only reliably takes
+ * that, whatever the file on disk ends up being. */
+const PAPER_PLATE_CAP = 1024 * 1024;        // "1mb or under", as asked
+
+async function paperEditionPlatePng(what) {
+  paperSnapBusy = true;
+  paperSetBusy(true, "…");
+  const label = what || "Setting the paper as one plate";
+  try {
+    const got = await paperEditionPlate((i, n) => {
+      if (paperCopyBtn) paperCopyBtn.textContent = "…" + i + "/" + n;
+      setStatus(label + " — page " + i + " of " + n + "…");
+    });
+    setStatus(label + " — fitting " + got.pages + " pages into "
+      + got.cols + "×" + got.rows + " under 1 MB…");
+    const fit = await paperFitBytes(got.canvas, PAPER_PLATE_CAP);
+    if (!fit || !fit.blob) throw new Error("the browser would not encode the plate");
+    /* The clipboard's copy is always lossless and always PNG. */
+    const png = fit.type === "png" ? fit.blob
+      : await new Promise((res) => fit.canvas.toBlob(res, "image/png"));
+    return {blob: fit.blob, png: png || fit.blob, canvas: fit.canvas,
+            pages: got.pages, cols: got.cols, rows: got.rows,
+            type: fit.type, bytes: fit.blob.size};
+  } finally {
+    paperSnapBusy = false;
+    paperSetBusy(false, "Copy");
+  }
+}
+
+/* Put a PNG on the clipboard by whichever road this window has. Returns
+ * the reason it could not, or "" when it went. */
+async function paperClipPng(png) {
+  const desk = (window.pineDesktop && typeof window.pineDesktop.copyImage === "function")
+    ? window.pineDesktop : null;
+  if (desk) {
+    try {
+      const data = await paperBlobUrl(png);
+      if (desk.copyImage(data) === false) return "the desktop clipboard refused it";
+      return "";
+    } catch (err) { return String(err.message || err); }
+  }
+  if (!(window.isSecureContext && navigator.clipboard
+        && navigator.clipboard.write && window.ClipboardItem)) {
+    return "this panel is served over plain http, so the browser will not "
+      + "let a picture onto the clipboard (open the Gazette in the Pine Box "
+      + "app, where it can)";
+  }
+  try {
+    await navigator.clipboard.write([new ClipboardItem({"image/png": png})]);
+    return "";
+  } catch (err) { return String(err.message || err); }
+}
+
 function paperShrink(canvas, maxW, maxH) {
   const k = Math.min(1, maxW / canvas.width, maxH / canvas.height);
   if (k >= 1) return canvas;
@@ -168378,7 +168832,7 @@ function paperCopy(btn, ev) {
   if (ev && (ev.shiftKey || ev.altKey)) { paperCopyText(btn); return; }
   if (!paperCur || !paperFrame) { setStatus("Nothing to copy yet", true); return; }
   if (paperSnapBusy) { setStatus("The paper is still being set — one moment", true); return; }
-  const name = "gazette-" + paperCur + "-" + paperStyle + "-all-pages.png";
+  const name = "gazette-" + paperCur + "-" + paperStyle + "-plate.png";
   const done = (n) => {
     setStatus("All " + n + " pages of the Gazette are on the clipboard as one image"
       + " — paste it anywhere");
@@ -168405,7 +168859,7 @@ function paperCopy(btn, ev) {
   const canWrite = !!(window.isSecureContext && navigator.clipboard
     && navigator.clipboard.write && window.ClipboardItem);
   if (desk) {
-    paperEditionPng("Copying the paper").then((got) => paperBlobUrl(got.blob)
+    paperEditionPlatePng("Copying the paper").then((got) => paperBlobUrl(got.png)
       .then((data) => {
         if (desk.copyImage(data) === false) throw new Error("the desktop clipboard refused it");
         done(got.pages);
@@ -168415,7 +168869,7 @@ function paperCopy(btn, ev) {
     return;
   }
   if (!canWrite) {
-    paperEditionPng("Copying the paper")
+    paperEditionPlatePng("Copying the paper")
       .then((got) => beaten("This panel is served over plain http, so the browser"
         + " will not let a picture onto the clipboard.", got.blob))
       .catch(broke);
@@ -168424,9 +168878,9 @@ function paperCopy(btn, ev) {
   // The async clipboard wants the write to begin inside the click, so it is
   // handed the PROMISE of the blob and stitches on its own time.
   let pages = 0;
-  const blobJob = paperEditionPng("Copying the paper").then((got) => {
+  const blobJob = paperEditionPlatePng("Copying the paper").then((got) => {
     pages = got.pages;
-    return got.blob;
+    return got.png;
   });
   let item = null;
   try { item = new ClipboardItem({"image/png": blobJob}); } catch (e) { item = null; }
@@ -168468,24 +168922,36 @@ async function paperImage(auto, btn) {
     return;
   }
   try {
-    const got = await paperEditionPng("Saving the paper");
+    const got = await paperEditionPlatePng("Collecting the paper");
     const saved = paperSaveBlob(got.blob,
-      "gazette-" + id + "-" + style + "-all-pages.png");
-    // The gallery wants a plate, not a ten-thousand-pixel column, and the
-    // snapshot door takes a data URL under 24 MB — so it gets a smaller one.
+      "gazette-" + id + "-" + style + "-" + got.cols + "x" + got.rows
+      + "." + got.type);
+    // The clipboard is the half of this button that never worked. It gets
+    // the lossless copy whatever the file on disk turned out to be.
+    const clipWhy = await paperClipPng(got.png);
     let posted = null;
     try {
-      const small = paperShrink(got.canvas, 1600, 9000);
       posted = await api("/api/paper/" + encodeURIComponent(id) + "/snapshot",
-        {method: "POST", body: JSON.stringify({png: small.toDataURL("image/png"), style: style})});
+        {method: "POST", body: JSON.stringify(
+          {png: got.canvas.toDataURL("image/png"), style: style})});
       paperSnapMark(id);
       const row = paperList.find((e) => e.id === id);
       if (row && posted && posted.file) row.snapshot = posted.file;
-    } catch (e) { /* the download is the point; the gallery row is a bonus */ }
-    setStatus("All " + got.pages + " pages saved as one PNG"
-      + (saved ? "" : " (the download was refused — try Copy instead)")
-      + (posted && posted.file ? " — " + posted.file + " is in the gallery too" : ""),
-      !saved);
+    } catch (e) { /* the plate is the point; the gallery row is a bonus */ }
+    const mb = (got.bytes / 1048576).toFixed(2);
+    const size = got.canvas.width + "×" + got.canvas.height;
+    setStatus("All " + got.pages + " pages collected as one "
+      + got.cols + "×" + got.rows + " plate — " + size + ", " + mb + " MB"
+      + (clipWhy ? "" : ", on the clipboard")
+      + (saved ? "" : " (the download was refused)")
+      + (posted && posted.file ? " — and in the gallery" : "")
+      + (clipWhy ? ". It is NOT on the clipboard: " + clipWhy : ""),
+      !saved || !!clipWhy);
+    if (btn && !clipWhy) {
+      const was = btn.textContent;
+      btn.textContent = "✓";
+      setTimeout(() => { btn.textContent = was; }, 1600);
+    }
   } catch (e) {
     setStatus("Image export failed: " + (e.message || e), true);
   }
@@ -168709,7 +169175,8 @@ async function paperOpen() {
     + "for the newspaper, A4 portrait for the tabloid; a copy is filed beside the edition";
   pdf.onclick = () => paperPdf(pdf);
   const image = el("button", "", "Image");
-  image.title = "Save every page of the paper as one tall PNG — it also goes into the gallery";
+  image.title = "Collect every page as one SQUARE plate, kept under 1 MB — "
+    + "it is saved, put on your clipboard, and added to the gallery";
   image.onclick = () => paperImage(false, image);
   paperImageBtn = image;
   const older = el("button", "", "◀");
