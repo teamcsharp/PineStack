@@ -49,6 +49,7 @@ from crystal_prompts import (turn_prompt as crystal_prompt_turn,
                              PROMPT_VERSION as CRYSTAL_PROMPT_VERSION)
 from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
+from store_retention import retention_sweep, store_sizes
 from director import (director_add, director_beats, director_beats_clause,
                       director_beats_set, director_clause, director_graph,
                       director_lessons_clause, director_notes, director_path,
@@ -5356,6 +5357,68 @@ async def _startup_name_clash() -> None:
         name_clash_warn()
     except Exception:  # noqa: BLE001
         pass
+
+
+# --- 2026-09-10: KEEPING THE STORES OFF THE LOOP'S BACK ------------------
+#
+# Three stores had no retention of any kind and had grown to 7.5 GB in
+# three days - the whole of their history, because nothing has ever deleted
+# a row. Measured while the station was silent: the event loop frozen 153s
+# in every 600, and every named stall frame was a read or a write against
+# one of them. See store_retention.py for the table-by-table numbers.
+#
+# The sweep runs OFTEN and does a LITTLE. A single delete over three
+# hundred thousand rows would hold the write lock for as long as it takes,
+# which is the same stall it exists to prevent; batches with a wall-clock
+# budget mean the first catch-up takes an hour of quiet nibbling instead of
+# one long freeze, and after that each pass finds almost nothing.
+RETENTION_EVERY = float(os.getenv("PINE_RETENTION_EVERY", "60"))
+_RETENTION_LAST: dict[str, Any] = {}
+
+
+async def retention_clock() -> None:
+    """Trim the unbounded stores, a little at a time, forever."""
+    await asyncio.sleep(20)          # let the boot settle first
+    while True:
+        try:
+            got = await asyncio.to_thread(retention_sweep, str(DATA_DIR))
+            _RETENTION_LAST.clear()
+            _RETENTION_LAST.update(got)
+            if int(got.get("total") or 0):
+                pipeline_log("action", "store retention: " + str(got.get("say")))
+        except Exception as exc:                   # noqa: BLE001
+            try:
+                pipeline_log("drop", "the retention sweep failed: %s"
+                             % type(exc).__name__)
+            except Exception:  # noqa: BLE001
+                pass
+        await asyncio.sleep(max(10.0, RETENTION_EVERY))
+
+
+@app.get("/api/maintenance/stores")
+async def api_maintenance_stores() -> dict[str, Any]:
+    """How big the stores are, and what the last sweep cleared."""
+    sizes = await asyncio.to_thread(store_sizes, str(DATA_DIR))
+    return {"at": time.time(), "megabytes": sizes,
+            "total_mb": round(sum(sizes.values()), 1),
+            "last_sweep": dict(_RETENTION_LAST),
+            "every_seconds": RETENTION_EVERY,
+            "say": "%.0f MB across %d store(s)"
+                   % (sum(sizes.values()), len(sizes))}
+
+
+@app.post("/api/maintenance/retention")
+async def api_maintenance_retention() -> dict[str, Any]:
+    """Run a sweep now. Bounded exactly as the clock's own passes are."""
+    got = await asyncio.to_thread(retention_sweep, str(DATA_DIR))
+    _RETENTION_LAST.clear()
+    _RETENTION_LAST.update(got)
+    return got
+
+
+@app.on_event("startup")
+async def _startup_retention() -> None:
+    fire_and_forget(retention_clock())
 
 
 @app.on_event("startup")

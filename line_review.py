@@ -189,7 +189,12 @@ class LineReviewStore:
                 AND (COALESCE(json_extract(decision,'$.scope'),'') != 'instance'
                      OR json_extract(decision,'$.basis') = 'accepted_as_written')
                 ORDER BY json_extract(decision,'$.at') DESC LIMIT 24""").fetchall()
-        self._preferences = []
+        # 2026-09-10: BUILT LOCALLY, THEN REBOUND ONCE. This appended into
+        # self._preferences in place, so a lock-free reader could see a
+        # half-built list. Assigning the finished list in one statement is
+        # what makes preference_examples safe to read without the lock -
+        # the same trick policy() uses (#1070).
+        built = []
         for raw in rows:
             row = self._row(raw)
             decision = row['decision']
@@ -197,7 +202,7 @@ class LineReviewStore:
                 continue
             as_written = str(decision.get('basis') or '') == 'accepted_as_written'
             candidate = str(decision.get('wording') or row['candidate']) if as_written else row['candidate']
-            self._preferences.append({
+            built.append({
                 'review_id': row['id'], 'gate': row['gate'],
                 'kind': str(row['context'].get('kind') or ''),
                 'action': decision['action'], 'at': decision.get('at'),
@@ -206,13 +211,27 @@ class LineReviewStore:
                 'reasons': [reason[:160] for reason in row['reasons'][:4]],
                 'note': str(decision.get('note') or '')[:320],
                 'by_operator': as_written})
+        self._preferences = built
 
     def preference_examples(self, kind='', gate='', limit=3):
+        """The operator's own accepted wordings, as examples.
+
+        2026-09-10: NO LOCK. This is on the WRITING hot path -
+        line_review_guidance builds it into a prompt for every round - and
+        it was taking the store lock, which a worker thread holds while it
+        writes to a 2.9 GB database. Measured on the live station: 18.5
+        seconds of event-loop stall in one sample, the single worst frame
+        of a run where the loop was frozen 153s in every 600. The list is
+        in memory and is REBOUND whole (never mutated in place, see
+        _refresh_preferences), so reading the current object without the
+        lock is consistent - exactly the argument policy() makes at #1070.
+        Only the handful of rows actually returned are copied; deep-copying
+        the whole twenty-four to hand back three was its own small waste."""
         _integer(limit, 'limit', 1, 6)
-        with self._lock:
-            examples = [row for row in self._preferences
-                        if (not kind or row['kind'] == kind) and (not gate or row['gate'] == gate)]
-            return copy.deepcopy(examples[:limit])
+        rows = self._preferences          # one read of the current list
+        examples = [row for row in rows
+                    if (not kind or row['kind'] == kind) and (not gate or row['gate'] == gate)]
+        return [copy.deepcopy(row) for row in examples[:limit]]
 
     def supersede(self, gate, source, note='a later rewrite of this line was accepted'):
         """A pending cut of a line that has since passed is moot: it leaves
