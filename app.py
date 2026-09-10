@@ -25283,6 +25283,24 @@ _SEGMENT_TASK: list[Any] = []
 # This is now only the race margin between "the record is ending" and
 # "the record has ended", not a licence to fade one out early.
 CUT_TAIL_SECONDS = 2.0
+# 2026-09-10: ...and how much air ONE record may own before an automatic
+# cut is allowed to reach it at all.
+#
+# #840 says a record plays fully and only a hand on the desk moves it, and
+# that is right for a record. It is not right for a 4,799-second ambient
+# piece: found on air with sixty-three minutes still to run, holding the
+# whole running order behind it while every scheduled entry waited its
+# turn. The operator heard an hour of one drone and called it dead air,
+# correctly.
+#
+# The library says this is rare and says how rare. Measured over 348
+# records in twenty-four hours: median 232s, ninetieth percentile 392s,
+# and just FIVE longer than ten minutes - one of them the marathon above.
+# So a ten-minute ceiling lets essentially every real track finish exactly
+# as #840 promises and reaches only the outlier that was never a song so
+# much as an occupation. PINE_RECORD_AIR_MOST tunes it; 0 restores the old
+# rule of "never".
+RECORD_AIR_MOST = float(os.getenv("PINE_RECORD_AIR_MOST", "600"))
 
 
 def track_may_cut(reason: str) -> bool:
@@ -25304,9 +25322,18 @@ def track_may_cut(reason: str) -> bool:
         length = float(track.get("seconds") or 0)
         if started <= 0 or length <= 0:
             return True                  # no clock to judge by
-        left = (started + length) - time.time()
+        now = time.time()
+        left = (started + length) - now
         if left <= CUT_TAIL_SECONDS:
             return True                  # it was ending anyway
+        played = now - started
+        if RECORD_AIR_MOST > 0 and played >= RECORD_AIR_MOST:
+            pipeline_log(
+                "air", "%s has had %d minutes of the hour and the running "
+                       "order is waiting behind it - the needle may move "
+                       "(%s)" % (track.get("title") or "the record",
+                                 int(played // 60), reason))
+            return True
         pipeline_log(
             "air", "refused to cut "
                    f"{track.get('title') or 'the record'} with "
