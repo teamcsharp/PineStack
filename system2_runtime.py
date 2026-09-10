@@ -1040,6 +1040,20 @@ def install(app, namespace):
                                   % (len(lost), ", ".join(lost)[:400]))
         except Exception as exc:
             runtime().error("startup", exc)
+        # 2026-09-10: and the RESERVATIONS the last run left on air. One of
+        # those, stuck in 'playing' under a dead lease, forbids its hour
+        # from ever being planned again - thirteen had accumulated over two
+        # days and the hour on air had one, so plan_hour raised on every
+        # refresh and the whole running order read "unplanned" while the
+        # shelf held hundreds of finished rounds.
+        try:
+            freed = runtime().store.reclaim_reservations("system2-air")
+            if freed:
+                host.pipeline_log("system2", "%d reservation(s) the last run left playing under a dead lease "
+                                  "were released - their hours can be planned again: %s"
+                                  % (len(freed), ", ".join(freed)[:400]))
+        except Exception as exc:
+            runtime().error("startup", exc)
 
         async def plan_loop():
             await asyncio.sleep(8)

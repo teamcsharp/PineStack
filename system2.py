@@ -308,7 +308,30 @@ class System2Store:
                 raise System2Conflict('Hour changed; inspect its current revision.')
             changed = not old or old['config'] != config or old['start'] != hour_start
             if changed and old:
-                occupied = db.execute("SELECT r.id FROM s2_reservations r JOIN s2_slots s ON s.id=r.slot_id WHERE s.hour_id=? AND r.state IN ('playing','suspended') LIMIT 1", (hour_id,)).fetchone()
+                # 2026-09-10: ...AND WHOSE LEASE IS STILL ALIVE. A
+                # reservation stuck in 'playing' is not an active
+                # performance, it is a corpse, and this guard let one block
+                # its hour from ever being planned again.
+                #
+                # Found on a station the operator reported as full of dead
+                # air: THIRTEEN reservations in 'playing', every one of them
+                # past its lease, the oldest from two days earlier. The hour
+                # on air had one. So plan_hour raised on every refresh,
+                # /api/system2/status answered 500, the director's room
+                # showed all twenty entries "unplanned", and nothing was
+                # allocated to anything - while the shelf held hundreds of
+                # finished rounds. The station played music and waited.
+                #
+                # #1074 fixed exactly this shape for JOBS ("a restart leaves
+                # the job it was working on 'working' under a lease nobody
+                # will renew") and reservations were left with the same
+                # wound. A live lease still blocks - that is the rule this
+                # guard is for, and it is right.
+                occupied = db.execute(
+                    "SELECT r.id FROM s2_reservations r JOIN s2_slots s ON s.id=r.slot_id"
+                    " WHERE s.hour_id=? AND r.state IN ('playing','suspended')"
+                    " AND COALESCE(json_extract(r.body,'$.lease_until'), 0) > ?"
+                    " LIMIT 1", (hour_id, self.now())).fetchone()
                 if occupied: raise System2Conflict('An active performance must finish or remain on its original plan.')
             if changed: revision += 1
             self._sync(db, normalized)
@@ -592,6 +615,39 @@ class System2Store:
             row['lease_until'] = self.now() + lease_seconds
             self._save(db, 's2_jobs', row, ('slot_id', 'state', 'deadline'))
             return row
+
+    def reclaim_reservations(self, owner):
+        """#1074's cure, applied to reservations as well as jobs.
+
+        A round that was on air when the process died leaves its
+        reservation in 'playing' under a lease nobody will renew. Nothing
+        ever cleared those, so they accumulated - thirteen of them over two
+        days on the station this was written for - and each one silently
+        forbade its hour from ever being re-planned. Released on start,
+        with the reason recorded, because an owner is one process per store
+        and on its start every reservation it still holds is its own lost
+        work."""
+        _name(owner, 'owner')
+        freed = []
+        with self._tx() as db:
+            rows = db.execute(
+                "SELECT id, body FROM s2_reservations WHERE state IN ('playing','suspended')"
+            ).fetchall()
+            for row in rows:
+                try:
+                    body = json.loads(row[1])
+                except Exception:
+                    body = {}
+                if float(body.get('lease_until') or 0) > self.now():
+                    continue            # still live; leave it alone
+                body['state'] = 'released'
+                body['released_at'] = self.now()
+                body['release_reason'] = (
+                    'the process that was airing this did not finish; its lease expired')
+                db.execute("UPDATE s2_reservations SET state='released', body=? WHERE id=?",
+                           (_json(body), row[0]))
+                freed.append(row[0])
+        return freed
 
     def reclaim_jobs(self, owner):
         """#1074: hand a restarted owner its own unfinished jobs back.
