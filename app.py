@@ -25320,6 +25320,31 @@ def remember_played(track: dict[str, Any]) -> None:
             pass                      # a lost list must never stop the show
 
 
+# 2026-09-10: how long the loop waits for a record's own intro before it
+# drops the needle anyway. Long enough for a cached round or a quick
+# render, far short of a saturated engine - the measured bad case was a
+# 63s clip, and waiting that out stops the music for every listener.
+RECORD_TALK_BUDGET = float(os.getenv("PINE_RECORD_TALK_BUDGET", "40"))
+
+
+def _talk_late(task: Any) -> None:
+    """A record's intro that finished after the needle dropped.
+
+    Retrieves the exception so a slow round is not also a traceback, and
+    says so once - a yield is a fact of the hour, not a fault (#1082)."""
+    try:
+        exc = task.exception()
+    except Exception:  # noqa: BLE001
+        return
+    if exc is None:
+        return
+    try:
+        pipeline_log("drop", "the record's talk finished late and was not "
+                     f"used: {type(exc).__name__}"[:160])
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def dj_on_air(track: dict[str, Any]) -> None:
     """The audio is starting: this is the moment the track is on air, and the
     moment `elapsed` starts counting from."""
@@ -25945,7 +25970,46 @@ async def _dj_loop() -> None:
                             pass
                     _SEGMENT_TASK[0].add_done_callback(_late_round)
             else:
-                await _record_talk(track, dj, played, tape_slot, spin_first)
+                # 2026-09-10: THE TALK YIELDS TO THE RECORD.
+                #
+                # This await was unbounded, and it is the step the whole
+                # radio loop passes through before the next record goes on
+                # air - so anything that blocks the record's own intro
+                # stops the MUSIC, not just the intro. Found live: the
+                # needle pinned on a 218.9s track with `remaining 0.0` for
+                # twenty-one minutes while dialogue tasks, which run on
+                # their own, still aired in sparse bursts. The listener
+                # hears that as a dead station, and every diagnostic says
+                # "playing: true" because as far as the loop is concerned
+                # it never finished starting the record.
+                #
+                # _record_talk already swallows WritingDeferred (#1082) -
+                # the yield it was written for. What it cannot swallow is
+                # a SLOW one: an engine that takes 63s for a 275-character
+                # clip (measured, xtts, the same hour) or a render queued
+                # behind a saturated lane. So the talk gets a budget and
+                # the record starts when it runs out. The talk is NOT
+                # cancelled - it finishes into the shelf behind the music,
+                # which is where the rest of the station's work already
+                # goes - because throwing away a nearly-finished round
+                # costs the engine time twice.
+                #
+                # Same rule the crystal already obeys: the air outranks
+                # the treatment. A record spinning with no intro is radio;
+                # a silent transmitter is not.
+                _talk_task = asyncio.create_task(
+                    _record_talk(track, dj, played, tape_slot, spin_first))
+                try:
+                    await asyncio.wait_for(asyncio.shield(_talk_task),
+                                           RECORD_TALK_BUDGET)
+                except asyncio.TimeoutError:
+                    pipeline_log(
+                        "air", "the record's intro is still being made "
+                        f"after {RECORD_TALK_BUDGET:.0f}s - dropping the "
+                        "needle and letting it finish behind the music")
+                    _talk_task.add_done_callback(_talk_late)
+                except Exception:  # noqa: BLE001
+                    pass            # _record_talk logs its own yields
                 if ad_due:
                     await _run_ad()
 
