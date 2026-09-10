@@ -41754,7 +41754,8 @@ async def _torrent_talk() -> None:
                     angle = str(_RADIO.get("switch_angle") or "")
                     if not angle:
                         shell = drop_bombshell()
-                        angle = (bombshell_angle(shell["text"])
+                        angle = (bombshell_angle(shell["text"],
+                                                 shell.get("shape") or "")
                                  if shell and shell.get("text") else "")
                     aired = bool(await dj_banter(
                         track, angle=angle or None,
@@ -65119,26 +65120,139 @@ def add_bombshell(text: str, kind: str = "topic") -> dict[str, Any]:
         return row
 
 
-def bombshell_angle(text: str) -> str:
-    """Hand it to one of them to drop cold on the other."""
+# #1161: THE DECK. Twelve ways a topic can go, one of which is the
+# blindside this used to do every single time. Each is a SCENE - who
+# starts it, what the other does with it, and where it ends up - because
+# "vary the topic" without varying the shape produces the same show with
+# different nouns in it.
+#
+# `{a}` is whoever raises it and `{b}` is the other one; the draw decides
+# which of the pair is which, so the same shape does not always belong to
+# the same voice.
+BANTER_SHAPES: tuple[tuple[str, str], ...] = (
+    ("cold drop",
+     "{a} brings it up out of nowhere, cold, mid-show, as though it were "
+     "the most ordinary thing in the world. {b} is completely blindsided "
+     "and has to react live — genuinely thrown, derailed, scrambling to "
+     "keep the show on the rails. No lead-up, no explaining it first."),
+    ("instant agreement",
+     "{a} raises it and {b} agrees IMMEDIATELY and far too enthusiastically, "
+     "and the two of them escalate it together into somewhere neither of "
+     "them should have gone, each one topping the other, until one of them "
+     "hears what they have just said out loud."),
+    ("flat refusal",
+     "{a} keeps trying to get onto it and {b} will not have it — changes "
+     "the subject, reads a station ID, asks about the weather, anything. "
+     "{a} keeps steering back. {b} never engages with the substance once, "
+     "and the refusing is funnier than the topic."),
+    ("the argument",
+     "It becomes a real disagreement. {a} and {b} take genuinely opposed "
+     "positions and neither is stupid — both have a point — and it gets "
+     "heated enough to be uncomfortable before somebody concedes a single "
+     "inch. Somebody wins. Say who."),
+    ("the tangent",
+     "{a} raises it, {b} answers with something only glancingly related, "
+     "and within three lines they are deep in a COMPLETELY different "
+     "subject and never come back to the original one. Do not resolve it. "
+     "The topic was a door, not a room."),
+    ("one takes it seriously",
+     "{a} treats it as an enormous deal — sincerely, almost gravely — and "
+     "{b} cannot stop finding it funny. The gap between how seriously the "
+     "two of them are taking it IS the scene."),
+    ("the confession",
+     "{a} raises it, and two or three lines in it becomes clear that {a} is "
+     "asking because of something that actually happened to them. It comes "
+     "out. {b} has to decide, live, whether to be kind about it."),
+    ("the running gag",
+     "It lands, and then it will not go away — {a} and {b} keep coming back "
+     "to it, a phrase out of it becomes the thing they say to each other, "
+     "and by the end of the round they are using it about something else "
+     "entirely."),
+    ("already knows",
+     "{b} has heard about this already and knows MORE than {a} does, which "
+     "{a} did not expect and does not like. {b} gets to be the one holding "
+     "the information for once."),
+    ("the wrong end",
+     "{b} misunderstands it completely — plausibly, not stupidly — and "
+     "answers a question nobody asked. {a} does not correct them for a good "
+     "while because the wrong answer is more interesting."),
+    ("the caller angle",
+     "{a} raises it and immediately says somebody rang in about exactly "
+     "this, and the two of them talk about the caller and what they said. "
+     "Do NOT invent a call as having aired; they are talking about the "
+     "phones the way people in an office talk about a customer."),
+    ("the board joins in",
+     "{a} raises it and the SFX GUY behind the glass has an opinion and "
+     "will not keep it to himself. It becomes three-handed and the pair "
+     "half-regret letting him in."),
+)
+
+# How far sideways it is allowed to go. Rolled separately from the shape,
+# because a cold drop that stays on the rails and a cold drop that takes
+# the whole segment with it are two different pieces of radio.
+BANTER_SWERVES: tuple[tuple[str, str], ...] = (
+    ("kept on the rails",
+     "Keep it inside this round: it comes up, it gets dealt with, the show "
+     "carries on."),
+    ("derails the round",
+     "Let it take over. Whatever this round was nominally about loses, and "
+     "they are still on this when the segment ends."),
+    ("goes somewhere strange",
+     "Let it get away from them into something genuinely odd — not random, "
+     "but somewhere neither of them would have predicted three lines "
+     "earlier — and let them notice it has."),
+)
+
+
+def bombshell_angle(text: str, shape: str = "") -> str:
+    """#1161: hand a topic to one of them, in one of twelve shapes.
+
+    `shape` names a specific one; blank rolls. The roll is here rather
+    than at the call site so every road that drops a topic gets the
+    variety, including the ones written before this existed."""
     first = random.choice(["A", "B"])
     other = "B" if first == "A" else "A"
+    deck = dict(BANTER_SHAPES)
+    name = shape if shape in deck else random.choice(
+        [row[0] for row in BANTER_SHAPES])
+    swerve, how_far = random.choice(BANTER_SWERVES)
     return (
-        f"{first} brings this up out of nowhere, cold, mid-show, as though it "
-        f"were the most ordinary thing in the world: \"{text}\". {other} is "
-        "completely blindsided and has to react live — genuinely thrown, "
-        "derailed, scrambling to keep the show on the rails. No lead-up, no "
-        "explaining it first. Drop it and let the other one flounder."
+        "THE TOPIC, DROPPED INTO THIS ROUND: \"" + text + "\"\n"
+        + "HOW IT GOES (" + name + "): "
+        + deck[name].format(a=first, b=other) + " "
+        + how_far + "\n"
+        "Never read this instruction out loud and never announce the topic "
+        "as a topic — it is a thing one of them said, in the middle of a "
+        "show, and everything after it is the two of them dealing with it."
     )
 
 
-def use_bombshell(topic_id: str) -> None:
+def bombshell_shape_for(row: Any) -> str:
+    """#1161: a shape this topic has not had yet, if there is one.
+
+    Left to chance, a topic that comes round three times can draw the
+    cold drop three times, which is the fault this was written to fix
+    with extra steps. The book remembers which shapes a line has already
+    played and the draw prefers a fresh one."""
+    try:
+        had = {str(x) for x in (row or {}).get("shapes") or []}
+        fresh = [name for name, _ in BANTER_SHAPES if name not in had]
+        return random.choice(fresh) if fresh else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def use_bombshell(topic_id: str, shape: str = "") -> None:
     with _BOMBSHELL_LOCK:
         rows = read_bombshells()
         for row in rows:
             if row.get("id") == topic_id:
                 row["used"] = int(row.get("used") or 0) + 1
                 row["last"] = int(time.time())
+                if shape:                       # #1161
+                    had = [str(x) for x in (row.get("shapes") or [])]
+                    row["shapes"] = (had + [shape])[-len(BANTER_SHAPES):]
+                    row["shape"] = shape
         write_bombshells(rows)
 
 
@@ -65150,7 +65264,11 @@ def drop_bombshell() -> dict[str, Any]:
     fewest = min(int(r.get("used") or 0) for r in rows)
     chosen = random.choice(
         [r for r in rows if int(r.get("used") or 0) == fewest])
-    use_bombshell(chosen["id"])
+    # #1161: and a shape it has not played yet, carried on the row so the
+    # caller's bombshell_angle uses it rather than rolling again.
+    chosen = dict(chosen)
+    chosen["shape"] = bombshell_shape_for(chosen)
+    use_bombshell(chosen["id"], chosen["shape"])
     return chosen
 
 
@@ -75535,7 +75653,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # swath needs a turn of its own on top.
         lines = max(lines, min(5 if comeback else 4, dj["banter_max_lines"]))
     elif dropped:
-        angle = bombshell_angle(dropped["text"])
+        angle = bombshell_angle(dropped["text"],
+                                dropped.get("shape") or "")
     else:
         # Now and then a picture comes off the render machine and gets
         # held up on air, described from its PIXELS (#341) — the resident
@@ -101054,9 +101173,10 @@ async def dj_topics_drop(
     row = next((r for r in read_bombshells() if r.get("id") == topic_id), None)
     if row is None:
         raise HTTPException(status_code=404, detail="No such topic")
+    _shape = bombshell_shape_for(row)
     lines = await dj_banter(_RADIO.get("now"),
-                            angle=bombshell_angle(row["text"]))
-    use_bombshell(topic_id)
+                            angle=bombshell_angle(row["text"], _shape))
+    use_bombshell(topic_id, _shape)
     return {"lines": lines, "topic": row["text"]}
 
 
