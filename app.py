@@ -13715,6 +13715,29 @@ SHELF_REUSE_EVERGREEN = ("ad", "gallery", "station_id", "manager")
 # Deliberately blunt and deliberately over-broad: keeping a re-airable
 # call OUT of the cupboard costs a little room, and letting a
 # time-bound one back IN costs the illusion, which is the whole product.
+# #1170: WHAT ACTUALLY DATES A RECORDING - three different things that
+# were one list. See the note in the patch that split them.
+#
+# DEAD: a thing that happened once. A day name, a date word, a clock
+# time, a reference to the record that just played, a live report. These
+# never come back.
+_REPEAT_DEAD = re.compile(
+    r"\b(just played|just heard|just went out|coming up next|up next|"
+    r"o.?clock|minutes? past|half past|quarter (to|past)|"
+    r"monday|tuesday|wednesday|thursday|friday|saturday|sunday|"
+    r"yesterday|tomorrow|breaking)\b"
+    r"|\blive (from|at|outside|on the scene)\b", re.I)
+
+# THE PART OF THE DAY it claims to be. Not a veto - a clock check. Each
+# word maps to the hours in which saying it is still true.
+_REPEAT_DAYPART = (
+    ("this morning", (5, 11)),
+    ("this afternoon", (12, 16)),
+    ("this evening", (17, 23)),
+    ("tonight", (17, 4)),          # wraps midnight, as a night show does
+)
+
+# Kept only as the name the old comment refers to; nothing reads it.
 _REPEAT_STALE = re.compile(
     r"\b(tonight|today|this morning|this afternoon|this evening|"
     r"right now|just now|a moment ago|earlier|last hour|this hour|"
@@ -13793,7 +13816,21 @@ def repeat_safe(kind: str, row: dict[str, Any]) -> bool:
                            or entry.get("script_plain") or "")
         if not said:
             return True             # nothing to judge; the row is short
-        return not _REPEAT_STALE.search(said[:4000])
+        said = said[:4000]
+        if _REPEAT_DEAD.search(said):
+            return False            # it names a thing that happened once
+        # #1170: a part-of-the-day word is checked against the clock
+        # rather than treated as a veto. A call that says "tonight" may
+        # go out tonight; it may not go out at ten in the morning.
+        hour = time.localtime().tm_hour
+        for word, (opens, shuts) in _REPEAT_DAYPART:
+            if word not in said.lower():
+                continue
+            ok = (opens <= hour <= shuts if opens <= shuts
+                  else (hour >= opens or hour <= shuts))
+            if not ok:
+                return False
+        return True
     except Exception:  # noqa: BLE001
         return True
 SHELF_REUSE_MOST_EVERGREEN = 12
