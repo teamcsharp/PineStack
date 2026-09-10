@@ -41789,6 +41789,103 @@ async def box_delivery_watch() -> None:
             continue                    # a watchdog may never take the show
 
 
+# --- 2026-09-10: THE CUPBOARD IS FOR EXACTLY THIS -----------------------
+#
+#    "The orchestrator needs the ability to interpret dead air and to panic
+#     and to realize that dead air is bad and to fill the dead air with
+#     things that are stacked in the cupboard stored just for these cases...
+#     Whether it's a phone call, whether it's a message from the manager, we
+#     have more than enough interruptions to be able to fill in dead air."
+#
+# WHAT THE STATION USED TO DO ABOUT SILENCE. dead_air_watch reached for a
+# STING (sfx_fill_gap) at twelve seconds, then kicked the needle, then
+# restarted the whole show. Three answers, none of which is a segment - so
+# the station's reply to a hole was a noise, and the emergency host's canned
+# rhymes filled the rest. Measured with /api/director/trace the day this was
+# written: one emergency_host filler had aired FORTY-FOUR TIMES IN
+# FORTY-EIGHT HOURS. Meanwhile the shelf held 74 finished phone calls, 34
+# memos from upstairs and 50 painting rounds, every one written, tinted and
+# recorded, and the reason none of them could be reached is that a road may
+# only air inside its own entry.
+#
+# So this opens the cupboard. Roads are tried in the order that makes the
+# best radio out of a hole - a memo from upstairs BARGES IN by design and
+# needs no setting up, a painting round is self-contained, a call carries
+# itself - and the first one with something finished on it wins. It is
+# strictly better than the sting: if nothing is ready the sting still
+# happens, exactly as before.
+
+# Silence this long and the cupboard opens. Under the sting's twelve
+# seconds is too eager - a breath between turns is not a hole - and much
+# over half a minute is a listener reaching for the dial.
+DEAD_AIR_RESCUE_AFTER = float(os.getenv("PINE_RESCUE_AFTER", "22"))
+# In the order they are tried. Upstairs first because an intercom cutting
+# in is the one thing on this station that never needs a reason.
+DEAD_AIR_RESCUE_ROADS = ("manager", "gallery", "caller", "news", "banter",
+                         "recap")
+_RESCUE_AT = [0.0]
+# Two rescues inside this and the second is a symptom, not a cure.
+DEAD_AIR_RESCUE_REST = 45.0
+
+
+def dead_air_stock() -> dict[str, int]:
+    """What the cupboard could put on the air this second, per road."""
+    out: dict[str, int] = {}
+    for kind in DEAD_AIR_RESCUE_ROADS:
+        try:
+            rows = [r for r in list(_SHELF.get(kind) or [])
+                    if _ready_round_takes(kind, r)]
+            if rows:
+                out[kind] = len(rows)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+async def dead_air_rescue(quiet: float) -> str:
+    """Put a finished SEGMENT on the air rather than a noise.
+
+    Returns the road that answered, or "" when the cupboard had nothing -
+    in which case the caller's ordinary sting still happens and the room is
+    no worse off than before this existed."""
+    now = time.time()
+    if now - _RESCUE_AT[0] < DEAD_AIR_RESCUE_REST:
+        return ""
+    if radio_paused() or not _RADIO.get("on"):
+        return ""
+    stock = dead_air_stock()
+    if not stock:
+        pipeline_log("air", "the room has been quiet %ds and the cupboard is "
+                            "empty on every road - the sting is all there is"
+                     % int(quiet))
+        return ""
+    _RESCUE_AT[0] = now
+    for kind in DEAD_AIR_RESCUE_ROADS:
+        if kind not in stock:
+            continue
+        try:
+            said = await _ready_shelf_air(kind, _RADIO.get("now"),
+                                          rescue=True)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("drop", "the %s cupboard refused the rescue: %s"
+                         % (kind, type(exc).__name__))
+            continue
+        if said:
+            repair_note("dead air %ds - a finished %s round was taken out of "
+                        "the cupboard and put on the air (%d line(s))"
+                        % (int(quiet), kind, len(said)))
+            pipeline_log("air", "SILENCE FILLED: %d line(s) of a ready %s "
+                                "round, off the shelf, out of turn - the "
+                                "cupboard is for exactly this"
+                         % (len(said), kind))
+            return kind
+    pipeline_log("air", "the room has been quiet %ds; the cupboard holds %s "
+                        "but nothing would go out - falling back to the sting"
+                 % (int(quiet), ", ".join("%s %d" % (k, v)
+                                          for k, v in stock.items())))
+    return ""
+
+
 async def dead_air_watch() -> None:
     """The silence ceiling (#338, #340). Nothing playing and nobody
     talking for longer than the slider allows → kick the show forward.
@@ -41853,6 +41950,20 @@ async def dead_air_watch() -> None:
                 strikes = 0
                 continue
             quiet = time.time() - max(_SPOKE_AT[0], heard)
+            # 2026-09-10: THE CUPBOARD FIRST. A finished, tinted, recorded
+            # segment beats a sting at filling a hole, and the shelf is
+            # usually full of them - it just could not be reached, because
+            # a road may only air inside its own entry. See
+            # dead_air_rescue. Strictly additive: when the cupboard has
+            # nothing the sting below still happens.
+            if quiet > DEAD_AIR_RESCUE_AFTER:
+                try:
+                    if await dead_air_rescue(quiet):
+                        heard = time.time()
+                        strikes = 0
+                        continue
+                except Exception:  # noqa: BLE001
+                    pass        # the watchdog never dies of its own cure
             # 2026-09-08: silence is PUNCTUATED long before it is a strike
             # - a clip that exists, every tick the room stays quiet.
             if quiet > min(float(limit), 12.0):
@@ -63318,14 +63429,26 @@ def _ready_shelf_row(kind: str) -> dict[str, Any] | None:
     return shelf_take(kind, peek=True, predicate=eligible)
 
 
-async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None) -> list[str]:
-    """Reserve one exact finished round; only its transport can commit it."""
-    window = _ready_slot_window(kind)
+async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
+                           rescue: bool = False) -> list[str]:
+    """Reserve one exact finished round; only its transport can commit it.
+
+    2026-09-10: `rescue` is DEAD AIR, and it is the one caller allowed to
+    ignore the running order. Normally a road may only air inside its own
+    entry - _ready_slot_window hands back a deadline of 0.0 when the slot
+    on air is somebody else's, and _ready_round_fits refuses on that. That
+    is right nearly always and exactly wrong when the room has gone quiet:
+    a finished, tinted, recorded memo from upstairs is worth more than
+    silence whatever the sheet says it is time for. Same exemption #840
+    already grants the needle ("the station must never be silent, and that
+    outranks every other rule here"), extended to the cupboard."""
+    window = None if rescue else _ready_slot_window(kind)
     row = _ready_shelf_row(kind)
     if row is None:
         return []
     takes = _ready_round_takes(kind, row)
-    if not takes or not _ready_round_fits(kind, takes, window):
+    if not takes or (not rescue
+                     and not _ready_round_fits(kind, takes, window)):
         return []
     _READY_SHELF_BUSY.add(id(row))
     owned = False
@@ -63336,6 +63459,14 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None) -> li
     def can_handoff() -> bool:
         if not any(held is row for held in shelf_rows(kind)):
             return False
+        if rescue:
+            # The round still has to be intact; it simply no longer has to
+            # belong to whatever entry the clock is standing on.
+            current = _ready_round_takes(kind, row)
+            fields = ("i", "key", "text", "voice", "who")
+            return bool(current
+                        and [[t.get(f) for f in fields] for t in current]
+                        == [[t.get(f) for f in fields] for t in takes])
         current_window = _ready_slot_window(kind)
         if window is not None and (not current_window or any(
                 current_window.get(field) != window.get(field)
@@ -63378,7 +63509,8 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None) -> li
         if not any(held is row for held in shelf_rows(kind)):
             return []
         takes = _ready_round_takes(kind, row)
-        if not takes or not _ready_round_fits(kind, takes, window):
+        if not takes or (not rescue
+                         and not _ready_round_fits(kind, takes, window)):
             return []
         entry = dict(dialogue_entry(row) or {})
         entry["prep_kind"] = kind
@@ -99159,6 +99291,35 @@ async def api_director_trace(line: str = "", text: str = "") -> dict[str, Any]:
     if not line and not text:
         raise HTTPException(400, "give a line id or the words to trace")
     return await asyncio.to_thread(director_line_trace, line, text)
+
+
+@app.get("/api/director/deadair")
+async def api_director_deadair() -> dict[str, Any]:
+    """What the station could put on the air right now if it went quiet.
+
+    The point of the cupboard is that this question always has an answer.
+    When it does not, that is the thing to fix - and it is now visible
+    without waiting for a hole to prove it."""
+    def work() -> dict[str, Any]:
+        stock = dead_air_stock()
+        total = sum(stock.values())
+        since = time.time() - float(_RESCUE_AT[0] or 0)
+        return {
+            "at": time.time(),
+            "ready_by_road": stock,
+            "rounds_ready": total,
+            "opens_after_seconds": DEAD_AIR_RESCUE_AFTER,
+            "order": list(DEAD_AIR_RESCUE_ROADS),
+            "last_rescue_seconds_ago": round(since, 1)
+                                       if _RESCUE_AT[0] else None,
+            "say": ("%d finished round(s) could cover a hole right now - %s"
+                    % (total, ", ".join("%s %d" % (k, v)
+                                        for k, v in stock.items()))
+                    if total else
+                    "NOTHING is ready on any road - a hole would have to be "
+                    "covered by a sting"),
+        }
+    return await asyncio.to_thread(work)
 
 
 @app.get("/api/director/pending")
