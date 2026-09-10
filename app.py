@@ -35988,11 +35988,44 @@ def cupboard_short() -> list[dict[str, Any]]:
             for row in (_SHELF.get(kind) or []):
                 if shelf_cast_stale(row):
                     continue
-                if now - float(row.get("at") or 0) > horizon:
-                    continue
+                # 2026-09-10: AGE NO LONGER DISQUALIFIES STOCK, and the
+                # loop it was caught in is why.
+                #
+                # cupboard_horizon shortens as the reserve deepens -
+                # "deep reserve, short horizon: be fresh" - so a FULL
+                # shelf drove the horizon to its six-hour floor, and at
+                # six hours the count discarded almost everything the
+                # station owned. Measured the day the operator asked why
+                # the cupboard is always reported empty: box_depth 1.0,
+                # horizon collapsed to 6h, and the cupboard reported
+                # manager "2 of 8" while holding THIRTY-FOUR manager
+                # rounds, gallery "2 of 8" while holding FIFTY. So the
+                # fuller the shelf, the less of it counted, the emptier
+                # the cupboard declared itself, and the harder it asked
+                # for more - a loop that fought itself, and the answer to
+                # "I stock it to eight and it always says it is empty".
+                #
+                # Meanwhile /api/director/deadair, asking the honest
+                # question - what could cover a hole right now - answered
+                # 75. Two subsystems ten times apart on the same shelf.
+                #
+                # The floor is about whether the station can COVER
+                # ITSELF. A round that is in-cast, recorded and still
+                # allowed to air is stock whatever hour it was written
+                # in; the retirement desk has said as much since #1075
+                # ("old footage beats silence"). Age still orders what is
+                # reached first - shelf_take sorts unaired rows ahead of
+                # repeats - and cupboard_rotate still uses the horizon to
+                # decide what to THROW OUT, which is the decision the
+                # horizon was actually built for.
                 key = str(row.get("key") or "")
                 if key and not pantry_get(key):
                     continue
+                entry = dialogue_entry(row)
+                if entry is not None and not _ready_round_takes(kind, row):
+                    continue          # written but not recorded is not stock
+                if int(row.get("aired") or 0) >= row_innings(kind, row):
+                    continue          # spent: it may never air again
                 good += 1
             if good < floor:
                 out.append({"kind": kind,
@@ -152738,115 +152771,276 @@ function pineTipsInstall() {
  * coordinator's own measurements and he says which one put him in it. A
  * face that pulls a worried expression at random is worse than no face.
  */
-const GLYPHY_W = 24;
+/* 2026-09-10: HE GETS A STAGE, AND THINGS HAPPEN ON IT.
+ *
+ * "I want to see this person panicking. I want to see him animated, I want
+ *  to see him running off of the screen. I want to see him shuffling
+ *  papers... receiving scripts, reading scripts, throwing scripts out. I
+ *  want to see papers fluttering in the air."
+ *
+ * He was six rows of twenty-four columns with one row swapped per mood - a
+ * face and nothing else, so the only thing he could do was pull an
+ * expression. The face is unchanged (it is his, from monk) but it is now a
+ * SPRITE on a wider stage with a desk under it, which is what lets him
+ * cross the room, carry a sheet, drop one, and leave.
+ *
+ * The rule from the original still holds and matters more now that there is
+ * more to look at: NOTHING HERE IS DECORATIVE. Every state is chosen on the
+ * server from the coordinator's own measurements, and he says which one put
+ * him in it. A face that panics at random is worse than no face - and a
+ * face that panics when the air is genuinely dead is the fastest way to
+ * know it from across the room.
+ */
+const GLY_W = 36;
+const GLY_H = 9;
 
-function glyRow(s) {
-  const t = String(s === undefined ? "" : s);
-  return (t + "                        ").slice(0, GLYPHY_W);
-}
-
-/* His face, from monk_3's sampleAvatar.ts, unchanged. */
-const GLY_FACE = [
-  "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584         ",
-  "    \u2588\u2588        \u2588\u2588       ",
-  "    \u2588  \u25cf    \u25cf  \u2588       ",
-  "    \u2588     v     \u2588      ",
-  "    \u2588\u2588   ___   \u2588\u2588      ",
-  "      \u2580\u2580\u2588\u2588\u2588\u2588\u2580\u2580         ",
+/* His face, from monk_3's sampleAvatar.ts, lifted off the old fixed grid
+ * so it can stand anywhere on the stage. */
+const GLY_SPRITE = [
+  "  \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584  ",
+  "\u2588\u2588        \u2588\u2588",
+  "\u2588  {L}    {R}  \u2588",
+  "\u2588     {N}     \u2588",
+  "\u2588\u2588   {M}   \u2588\u2588",
+  "  \u2580\u2580\u2588\u2588\u2588\u2588\u2580\u2580  ",
 ];
 
-function glyWith(rows) {
-  const out = GLY_FACE.map(glyRow);
-  Object.keys(rows || {}).forEach((k) => {
-    out[Number(k)] = glyRow(rows[k]);
+function glyBlank() {
+  const rows = [];
+  for (let i = 0; i < GLY_H; i++) rows.push(" ".repeat(GLY_W));
+  return rows;
+}
+
+/* Draw `text` at (x, y). Spaces are transparent, so a sheet of paper can
+ * pass in front of him without punching a hole in his head. */
+function glyDraw(rows, x, y, text) {
+  if (y < 0 || y >= GLY_H) return;
+  const line = rows[y].split("");
+  const str = String(text || "");
+  for (let i = 0; i < str.length; i++) {
+    const at = x + i;
+    if (at < 0 || at >= GLY_W) continue;
+    if (str[i] === " ") continue;
+    line[at] = str[i];
+  }
+  rows[y] = line.join("");
+}
+
+/* The face at column x, with whatever eyes, nose and mouth this frame
+ * wants. `{L}`/`{R}` are the eyes, `{N}` the nose, `{M}` the mouth. */
+function glyFaceAt(rows, x, y, look) {
+  const o = look || {};
+  const L = o.L || "\u25cf", R = o.R || "\u25cf";
+  const N = o.N || "v", M = o.M || "___";
+  GLY_SPRITE.forEach((row, i) => {
+    glyDraw(rows, x, y + i, row
+      .replace("{L}", L).replace("{R}", R)
+      .replace("{N}", N).replace("{M}", (M + "   ").slice(0, 3)));
   });
+}
+
+/* The desk he works at, and the floor he drops things on. */
+function glyDesk(rows) {
+  glyDraw(rows, 0, GLY_H - 1, "\u2500".repeat(GLY_W));
+}
+
+/* One sheet of paper. Flat, on edge, or tumbling. */
+const GLY_PAPER = ["\u2583", "\u2584", "\u2580", "\u2581", "\u2582"];
+
+function glyScene(build) {
+  const rows = glyBlank();
+  build(rows);
+  return rows;
+}
+
+/* Frames for a state, built by a function of frame index. */
+function glyReel(count, fn) {
+  const out = [];
+  for (let i = 0; i < count; i++) out.push(glyScene((rows) => fn(rows, i)));
   return out;
 }
 
-/* Eyes on row 2, mouth on row 4, and a row 0 for anything above his
- * head - which is how the original did its tool-calling spinner. */
 const GLY_STATES = {
-  /* Watching: his idle. Open for twenty-two frames, a blink for two. */
+  /* WATCHING - his idle. He stands at the desk and blinks. */
   watching: {
-    fps: 12,
-    frames: (function () {
-      const f = [];
-      for (let i = 0; i < 24; i++) {
-        f.push(i === 11 || i === 12
-          ? glyWith({2: "    \u2588  \u2500    \u2500  \u2588       "})
-          : glyWith({}));
-      }
-      return f;
-    }()),
+    fps: 10,
+    frames: glyReel(26, (rows, i) => {
+      glyDesk(rows);
+      const blink = (i === 12 || i === 13);
+      glyFaceAt(rows, 11, 2, blink ? {L: "\u2500", R: "\u2500"} : {});
+    }),
   },
-  /* Thinking: the dot cycle beside the face, exactly as monk had it. */
-  thinking: {
-    fps: 6,
-    frames: [".", "..", "...", "....", "...", "..", ".", ""].map((d) =>
-      glyWith({3: "    \u2588     v     \u2588   " + (d + "   ").slice(0, 3)})),
-  },
-  /* Pleased: the eyes close upward and the mouth turns up. */
+
+  /* PLEASED - eyes up, a smile, and the night's paperwork squared off. */
   pleased: {
     fps: 5,
-    frames: [
-      glyWith({2: "    \u2588  ^    ^  \u2588       ",
-               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
-      glyWith({2: "    \u2588  ^    ^  \u2588       ",
-               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
-      glyWith({2: "    \u2588  \u25cf    \u25cf  \u2588       ",
-               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
-      glyWith({2: "    \u2588  ^    ^  \u2588       ",
-               4: "    \u2588\u2588   \\_/   \u2588\u2588      "}),
-    ],
+    frames: glyReel(8, (rows, i) => {
+      glyDesk(rows);
+      glyFaceAt(rows, 11, 2, {L: "^", R: "^", M: "\\_/"});
+      "\u2583\u2583\u2583".split("").forEach((c, n) =>
+        glyDraw(rows, 4 + n, GLY_H - 2, c));
+      if (i % 4 < 2) glyDraw(rows, 29, 2, "\u02da");
+    }),
   },
-  /* Anxious: the eyes dart, and a bead of sweat comes off the temple. */
-  anxious: {
-    fps: 7,
-    frames: [
-      glyWith({0: "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584  \u02da      ",
-               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
-               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
-      glyWith({0: "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584   \u02da     ",
-               2: "    \u2588   \u25cf    \u25cf \u2588       ",
-               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
-      glyWith({0: "      \u2584\u2584\u2588\u2588\u2588\u2588\u2584\u2584    \u02da    ",
-               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
-               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
-      glyWith({2: "    \u2588 \u25cf    \u25cf   \u2588       ",
-               4: "    \u2588\u2588   \u2500\u2500\u2500   \u2588\u2588      "}),
-    ],
+
+  /* THINKING - the dot cycle, and a sheet held up to be read. */
+  thinking: {
+    fps: 6,
+    frames: glyReel(8, (rows, i) => {
+      glyDesk(rows);
+      glyFaceAt(rows, 11, 2, {N: "v"});
+      glyDraw(rows, 27, 3, ".".repeat(1 + (i % 4)));
+    }),
   },
-  /* Angry: brows down, mouth set, and the whole face shifts a column. */
-  angry: {
+
+  /* READING - a script has arrived. It comes in from the right, he holds
+   * it up in front of his face, and his eyes track across it. */
+  reading: {
     fps: 8,
-    frames: [
-      glyWith({1: "    \u2588\u2588\u2572      \u2571\u2588\u2588       ",
-               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
-               4: "    \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588      "}),
-      glyWith({1: "     \u2588\u2588\u2572      \u2571\u2588\u2588      ",
-               2: "     \u2588  \u25cf    \u25cf  \u2588      ",
-               4: "     \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588     "}),
-      glyWith({1: "    \u2588\u2588\u2572      \u2571\u2588\u2588       ",
-               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
-               4: "    \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588      "}),
-      glyWith({1: "   \u2588\u2588\u2572      \u2571\u2588\u2588        ",
-               2: "   \u2588  \u25cf    \u25cf  \u2588        ",
-               4: "   \u2588\u2588   \u2580\u2580\u2580   \u2588\u2588       "}),
-    ],
+    frames: glyReel(14, (rows, i) => {
+      glyDesk(rows);
+      const eyes = i < 4 ? {} : (i % 4 < 2
+        ? {L: "\u25c0", R: "\u25c0"} : {L: "\u25b6", R: "\u25b6"});
+      glyFaceAt(rows, 11, 2, eyes);
+      const x = i < 5 ? 33 - i * 3 : 18;
+      glyDraw(rows, x, 4, "\u2583\u2583\u2583\u2583");
+      if (i >= 5) {
+        glyDraw(rows, 18, 3, "\u2581\u2581\u2581\u2581");
+        glyDraw(rows, 18, 5, "\u2582\u2582\u2582\u2582");
+      }
+    }),
   },
-  /* Rushing: the spinner over his head, from monk's tool_calling. */
+
+  /* FILING - a finished round goes onto the pile. The sheet travels down
+   * and the stack under his desk grows a line. */
+  filing: {
+    fps: 9,
+    frames: glyReel(10, (rows, i) => {
+      glyDesk(rows);
+      glyFaceAt(rows, 11, 2, {L: "\u25cf", R: "\u25cf", M: "\u2500\u2500\u2500"});
+      const drop = Math.min(GLY_H - 2, 3 + Math.floor(i / 2));
+      glyDraw(rows, 6, drop, "\u2583\u2583\u2583");
+      const stack = Math.min(4, Math.floor(i / 2));
+      for (let s = 0; s < stack; s++) glyDraw(rows, 6, GLY_H - 2 - s, "\u2583\u2583\u2583");
+    }),
+  },
+
+  /* BINNING - a refusal. He crumples it and throws it, and it tumbles off
+   * the stage end over end. */
+  binning: {
+    fps: 11,
+    frames: glyReel(12, (rows, i) => {
+      glyDesk(rows);
+      glyFaceAt(rows, 11, 2, {L: "\u2573", R: "\u2573", M: "\u2500\u2500\u2500"});
+      const x = 26 + i;
+      const y = 3 + Math.floor(Math.sin(i / 2) * 2);
+      glyDraw(rows, x, Math.max(0, Math.min(GLY_H - 2, y)),
+              GLY_PAPER[i % GLY_PAPER.length]);
+      if (i < 3) glyDraw(rows, 24, 4, "\u2573");
+    }),
+  },
+
+  /* RUSHING - head down, working. The spinner over his head and the desk
+   * stacked either side of him. */
   rushing: {
-    fps: 10,
-    frames: ["|", "/", "\u2500", "\\"].map((c) =>
-      glyWith({0: "             " + c + "          ",
-               2: "    \u2588  \u25cf    \u25cf  \u2588       ",
-               4: "    \u2588\u2588   \u2500o\u2500   \u2588\u2588      "})),
+    fps: 12,
+    frames: glyReel(16, (rows, i) => {
+      glyDesk(rows);
+      const bob = i % 4 < 2 ? 2 : 3;
+      glyFaceAt(rows, 11, bob, {L: "\u25cf", R: "\u25cf", M: "\u2500o\u2500"});
+      glyDraw(rows, 17, bob - 1, "|/\u2500\\"[i % 4]);
+      glyDraw(rows, 4, GLY_H - 2, "\u2583\u2583\u2583");
+      glyDraw(rows, 29, GLY_H - 2, "\u2583\u2583\u2583");
+    }),
+  },
+
+  /* ANXIOUS - a coming entry has nothing behind it. The eyes dart, sweat
+   * comes off the temple, and one sheet slips off the desk. */
+  anxious: {
+    fps: 8,
+    frames: glyReel(12, (rows, i) => {
+      glyDesk(rows);
+      const dart = i % 4;
+      glyFaceAt(rows, 11, 2, {
+        L: dart < 2 ? "\u25cf" : "\u25cb",
+        R: dart < 2 ? "\u25cb" : "\u25cf",
+        M: "\u2500\u2500\u2500"});
+      glyDraw(rows, 26, 2 + (i % 3), "\u02da");
+      const fall = 4 + Math.floor(i / 3);
+      glyDraw(rows, 6, Math.min(GLY_H - 2, fall), GLY_PAPER[i % 3]);
+    }),
+  },
+
+  /* PANIC - DEAD AIR. He is not at the desk. He runs the width of the
+   * stage with his arms up, the whole night's paperwork comes off the
+   * table behind him, and on two frames he is GONE - off the side of the
+   * stage entirely - before he tears back in.
+   *
+   * This is the one state the operator asked for by name, and it is only
+   * ever reached when the room has genuinely been quiet. */
+  panic: {
+    fps: 14,
+    frames: glyReel(22, (rows, i) => {
+      glyDesk(rows);
+      /* Papers everywhere, tumbling on their own clocks. */
+      for (let p = 0; p < 6; p++) {
+        const px = (p * 7 + i * 2) % GLY_W;
+        const py = 1 + ((p * 3 + i) % (GLY_H - 3));
+        glyDraw(rows, px, py, GLY_PAPER[(p + i) % GLY_PAPER.length]);
+      }
+      /* He crosses left, vanishes, and comes back the other way. */
+      const gone = (i >= 9 && i <= 11);
+      if (gone) {
+        glyDraw(rows, 1, 3, "\u2500\u2500\u2500\u2500");     /* the door swinging */
+        glyDraw(rows, 1, 4, "  \u2571\u2571");
+        return;
+      }
+      const x = i < 9 ? 22 - i * 3 : 34 - (i - 12) * 3;
+      glyFaceAt(rows, x, 2, {
+        L: "\u2573", R: "\u2573", N: "\u25b3",
+        M: i % 2 ? "\u25a1\u25a1\u25a1" : "\u2500\u25a1\u2500"});
+      /* Arms up. */
+      glyDraw(rows, x - 1, 1, "\\");
+      glyDraw(rows, x + 13, 1, "/");
+    }),
+  },
+
+  /* RESCUING - the cupboard has been opened and a finished round is being
+   * carried to the air. He comes in from the left holding it over his
+   * head, and sets it down. */
+  rescuing: {
+    fps: 11,
+    frames: glyReel(14, (rows, i) => {
+      glyDesk(rows);
+      const x = Math.min(11, -8 + i * 3);
+      glyFaceAt(rows, x, 3, {L: "\u25cf", R: "\u25cf", M: "\u2500\u2500\u2500"});
+      glyDraw(rows, x + 3, 1, "\u2583\u2583\u2583\u2583\u2583\u2583");
+      glyDraw(rows, x + 3, 2, "\u2580\u2580\u2580\u2580\u2580\u2580");
+      if (i > 10) glyDraw(rows, 30, GLY_H - 2, "\u2583\u2583\u2583");
+    }),
+  },
+
+  /* ANGRY - something is wrong with the AIR, not with the work. Brows
+   * down, and he thumps the desk hard enough to jump the paper. */
+  angry: {
+    fps: 9,
+    frames: glyReel(10, (rows, i) => {
+      glyDesk(rows);
+      const hit = i % 5 === 0;
+      glyFaceAt(rows, 11, hit ? 3 : 2, {
+        L: "\u2500", R: "\u2500", M: "\u2500\u2500\u2500"});
+      glyDraw(rows, 11, (hit ? 3 : 2) - 1, "\u2588\u2588\u2572      \u2571\u2588\u2588");
+      glyDraw(rows, 5, hit ? GLY_H - 3 : GLY_H - 2, "\u2583\u2583\u2583");
+      glyDraw(rows, 27, hit ? GLY_H - 3 : GLY_H - 2, "\u2583\u2583");
+    }),
   },
 };
 
 const GLY_COLOUR = {
   angry: "#e07070", anxious: "#e0a35c", rushing: "#9fd8ff",
   thinking: "#c8a6ff", watching: "#8ba0b5", pleased: "#7ce8a9",
+  panic: "#ff5f5f", rescuing: "#7ce8a9", reading: "#8fb7e8",
+  filing: "#a8e07c", binning: "#e0a35c",
 };
 
 let glyMood = "watching";
