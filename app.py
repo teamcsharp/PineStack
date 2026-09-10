@@ -99820,30 +99820,49 @@ def director_road_stock(kind: str) -> dict[str, Any]:
         allowed = int(shelf_innings(str(kind)))
         now = time.time()
         soonest: float | None = None
+        def _on_disk(key: Any) -> bool:
+            """#1169: is this pantry key's clip really there?"""
+            saved = _PANTRY.get(str(key or "")) or {}
+            clip = saved.get("clip") or {}
+            name = str(clip.get("path") or "").rsplit("/", 1)[-1]
+            name = name.split("?", 1)[0]
+            return bool(name and (VOICE_MEDIA_DIR / name).is_file())
+
         for row in road_source(kind):          # #1165: banter is the larder
             entry = dialogue_entry(row)
+            # #1169: AN ADVERT READ AND A STATION ID ARE ONE LINE. Neither
+            # keeps a dialogue entry - there is no cast and no turns, just
+            # words, a voice and a pantry key - so `if entry is None:
+            # continue` skipped every row on both roads and the desk
+            # reported them empty. Measured on the same shelf in the same
+            # breath: this reader said the advert road had 0 rows while
+            # the census counted 37 finished ones.
             if entry is None:
-                continue
-            script = str(entry.get("script") or "")
-            if not script.strip():
-                continue
-            out["rows"] += 1
-            out["written"] += 1
-            takes = list(entry.get("takes") or [])
-            want = int(entry.get("chunks") or 0) or len(takes)
-            have = 0
-            for take in takes:
-                saved = _PANTRY.get(str(take.get("key") or "")) or {}
-                clip = saved.get("clip") or {}
-                name = str(clip.get("path") or "").rsplit("/", 1)[-1]
-                name = name.split("?", 1)[0]
-                if name and (VOICE_MEDIA_DIR / name).is_file():
-                    have += 1
-            whole = bool(want) and have >= want
-            if whole:
-                out["recorded"] += 1
-            elif have:
-                out["part"] += 1
+                words = str(row.get("text_plain") or row.get("text") or "")
+                if not words.strip():
+                    continue
+                out["rows"] += 1
+                out["written"] += 1
+                if _on_disk(row.get("key")) or row.get("produced"):
+                    out["recorded"] += 1
+                    whole = True
+                else:
+                    whole = False
+            else:
+                script = str(entry.get("script") or "")
+                if not script.strip():
+                    continue
+                out["rows"] += 1
+                out["written"] += 1
+                takes = list(entry.get("takes") or [])
+                want = int(entry.get("chunks") or 0) or len(takes)
+                have = sum(1 for take in takes if _on_disk(take.get("key")))
+                whole = bool(want) and have >= want
+            if entry is not None:
+                if whole:
+                    out["recorded"] += 1
+                elif have:
+                    out["part"] += 1
             aired = int(row.get("aired") or 0)
             since = (now - float(row.get("aired_at") or 0)
                      if row.get("aired_at") else None)
