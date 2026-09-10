@@ -42122,8 +42122,13 @@ def dead_air_stock() -> dict[str, int]:
     out: dict[str, int] = {}
     for kind in RESCUE_ROADS_OPEN:
         try:
+            # #1168: in RESCUE mode, which is the mode a hole is filled
+            # in. Counted any other way this reports rounds the door
+            # would refuse, which is how "74 could cover a hole" and
+            # "nothing would go out" were both true at once.
             rows = [r for r in road_source(kind)
-                    if _ready_round_takes(kind, r)]
+                    if id(r) not in _READY_SHELF_BUSY
+                    and _ready_round_takes(kind, r)]
             if rows:
                 out[kind] = len(rows)
         except Exception:  # noqa: BLE001
@@ -63995,16 +64000,30 @@ def _ready_round_fits(kind: str, takes: list[dict[str, Any]],
         return False
 
 
-def _ready_shelf_row(kind: str) -> dict[str, Any] | None:
+def _ready_shelf_row(kind: str, rescue: bool = False
+                     ) -> dict[str, Any] | None:
+    """#1168: `rescue` is DEAD AIR, and it selects out of turn.
+
+    Without it this computed its own window and refused every row that
+    would not fit inside the entry on air - which outside the road's own
+    entry is a deadline of 0.0 and therefore every row there is. So
+    `_ready_shelf_air(rescue=True)` honoured the flag in two places,
+    found no row here, and returned empty before reaching either of them.
+    The rescue never once selected a round.
+
+    A rescue may air a FINISHED round out of turn. It may not air an
+    unfinished one, so the takes test stands either way."""
     if kind not in ("gallery", "news", "manager"):
         return None
-    window = _ready_slot_window(kind)
+    window = None if rescue else _ready_slot_window(kind)
 
     def eligible(row: Any) -> bool:
         if id(row) in _READY_SHELF_BUSY:
             return False
         takes = _ready_round_takes(kind, row)
-        return bool(takes) and _ready_round_fits(kind, takes, window)
+        if not takes:
+            return False
+        return rescue or _ready_round_fits(kind, takes, window)
 
     # #1160: a round written INSIDE the live act goes first. This used to
     # be enforced by profile_compatible refusing everything else, which
@@ -64047,7 +64066,7 @@ async def _ready_shelf_air(kind: str, track: dict[str, Any] | None = None,
     already grants the needle ("the station must never be silent, and that
     outranks every other rule here"), extended to the cupboard."""
     window = None if rescue else _ready_slot_window(kind)
-    row = _ready_shelf_row(kind)
+    row = _ready_shelf_row(kind, rescue)            # #1168: out of turn
     if row is None:
         return []
     takes = _ready_round_takes(kind, row)
