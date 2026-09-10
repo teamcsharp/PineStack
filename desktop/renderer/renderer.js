@@ -807,8 +807,28 @@ function selectView(name) {
   applyAppVolume();
 }
 
+/* 2026-09-10: every panel webview gets the clipboard bridge BEFORE it
+ * navigates. A <webview> does not inherit the chrome's preload - it takes
+ * its own or none - and none of them declared one, which is why the
+ * Gazette's Copy button could never reach a clipboard. The attribute has
+ * to be an absolute file:// URL and has to be set before `src`, or the
+ * document that needs it is already loading. */
+function frameBridge(frame) {
+  if (!frame || frame.getAttribute("preload")) return;
+  try {
+    frame.setAttribute("preload",
+                       new URL("webview-preload.js", location.href).href);
+  } catch (e) { /* without it Copy falls back exactly as it did before */ }
+}
+
 function loadFrames() {
   if (!config) return;
+  /* Every webview, not just the one being shown: slidesFrame and the rest
+   * take their src from their own roads, and a bridge attached after the
+   * document has begun loading is a bridge that arrived too late. */
+  try {
+    document.querySelectorAll("webview").forEach(frameBridge);
+  } catch (e) { /* the guard below still covers the active frame */ }
   const routeByView = {
     control: ["controlFrame", "/"],
     radio: ["radioFrame", "/radio"],
@@ -818,6 +838,7 @@ function loadFrames() {
   const active = routeByView[currentView] || routeByView.control;
   const frame = $(active[0]);
   if (frame && !frame.src) {
+    frameBridge(frame);              /* before src, or it is too late */
     frame.src = viewUrl(active[1]);
     wireFrame(frame);
   }
