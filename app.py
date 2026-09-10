@@ -1066,6 +1066,8 @@ DEFAULT_DJ = {
     # #749: pages from the manager upstairs, per hour. 0 = the intercom
     # stays quiet.
     "upstairs_per_hour": 3.0,
+    # #1162: what share of rounds are interrupted by a memo from upstairs.
+    "manager_cut_in_pct": 20,
     # A tape from the mysterious Ehm Eckx after every Nth song (#239).
     # 0 = the mail has stopped. The folder is named relative to the share.
     # #828/#829: EIGHT, not three. A tape is not just another record — it
@@ -1969,6 +1971,9 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "upstairs_per_hour": max(0.0, min(12.0, float(
             raw_dj.get("upstairs_per_hour",
                        DEFAULT_DJ["upstairs_per_hour"]) or 0))),
+        "manager_cut_in_pct": max(0, min(100, int(
+            raw_dj.get("manager_cut_in_pct",
+                       DEFAULT_DJ["manager_cut_in_pct"]) or 0))),
         # #828/#829: the ceiling was 10, so a slider past "every tenth
         # song" silently snapped back and the owner could not make the
         # mail rare. 40 is the new top; 0 still stops it altogether.
@@ -22933,6 +22938,16 @@ def radio_prompt_instruction(slot: str) -> str:
             lead += plot_clause()
         except Exception:  # noqa: BLE001
             pass            # a broken plotline never silences the booth
+        # #1162: and, one round in five, the manager cutting into it. On
+        # this layer for the reason above - "every round the station
+        # writes assembles that one" - so a memo may land in the booth
+        # talk, a phone call, the gallery press or an advert read without
+        # being wired into each of them. Not on the manager's own layer:
+        # the memo entry is not interrupted by a memo.
+        try:
+            lead += manager_cut_in_clause()
+        except Exception:  # noqa: BLE001
+            pass            # a broken memo book never silences the booth
     # #1027: and the operator's STANDING ORDERS, in his own words - on the
     # same layer and for the same reason: every round the station writes
     # assembles the host layer, and the caller, gallery and manager
@@ -23003,6 +23018,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                    ("caller_plain", "Deck · ordinary folk", "range", 0, 100, 1),
                    ("caller_carefree", "Deck · could not care less", "range", 0, 100, 1)],
         "manager": [("upstairs_per_hour", "Manager interruptions per hour", "range", 0, 12, 0.5),
+                    ("manager_cut_in_pct",
+                     "Rounds the manager cuts into (%)", "range", 0, 60, 5),
                     # #841: "I want him doing 3-5 messages an hour, and
                     # I want him on a slider I can adjust."
                     ("manager_per_hour", "Memos from upstairs an hour (quota)",
@@ -38207,6 +38224,36 @@ CLOCK_HOME = {
     "manager": ("manager",),
 }
 CLOCK_QUIET_FLOOR = 25.0                # silence that outranks the sheet
+# #1163: which clock belongs to an entry, read the other way round. The
+# quiet hatch needs to ask "whose entry is this?" and CLOCK_HOME answers
+# the opposite question.
+CLOCK_OWNER = {slot: clock for clock, slots in CLOCK_HOME.items()
+               for slot in slots}
+_ENTRY_READY_MEMO: dict[str, tuple[float, bool]] = {}
+
+
+def entry_road_ready(kind: str) -> bool:
+    """#1163: has the road this entry belongs to got a finished round
+    standing by, right now, that would go out if it were asked?
+
+    Memoised for four seconds: this is read by every independent clock on
+    every tick, and `_ready_shelf_row` walks the shelf. Only the roads
+    that keep finished rounds on a shelf can answer - for anything else
+    the honest answer is "cannot say", which reads as no and leaves the
+    old behaviour exactly as it was."""
+    road = str(kind or "")
+    if road not in ("manager", "gallery", "news"):
+        return False
+    now = time.time()
+    at, was = _ENTRY_READY_MEMO.get(road) or (0.0, False)
+    if now - at < 4.0:
+        return was
+    try:
+        got = _ready_shelf_row(road) is not None
+    except Exception:  # noqa: BLE001
+        got = False
+    _ENTRY_READY_MEMO[road] = (now, got)
+    return got
 _CLOCK_HELD: dict[str, float] = {}      # kind -> when it first deferred
 CLOCK_HOLD_MOST = 900.0                 # never defer longer than this
 
@@ -38256,14 +38303,36 @@ def clock_may_air(kind: str) -> str:
                 and ((listener == "box" and voice_to in ("box", "both"))
                      or (listener and listener != "box" and page_route))):
             heard = max(heard, float(ack.get("at") or 0))
-        if time.time() - heard > CLOCK_QUIET_FLOOR:
-            _CLOCK_HELD.pop(kind, None)
-            return "the air is quiet"
+        quiet = time.time() - heard > CLOCK_QUIET_FLOOR
         slot = schedule_take()
         if not slot:
             _CLOCK_HELD.pop(kind, None)
             return "no running order"      # nothing to obey
         on = str(slot.get("kind") or "")
+        if quiet:
+            # #1163: silence still outranks the sheet - but only when the
+            # sheet has nothing to answer it with. While the entry on air
+            # has a finished round standing by, that round IS the answer
+            # to the silence, and every other clock waits for it rather
+            # than spending the entry on itself. See the note in the patch
+            # that added this: the 15:19 memo entry aired an intro, two
+            # fillers, an advert and a station ID over a recorded memo the
+            # binder had already committed to it.
+            _owner = CLOCK_OWNER.get(on) or ""
+            if _owner and _owner != kind and entry_road_ready(on):
+                _since = float(_CLOCK_HELD.get(kind) or 0)
+                if not _since or time.time() - _since <= CLOCK_HOLD_MOST:
+                    if not _since:
+                        _CLOCK_HELD[kind] = time.time()
+                        pipeline_log(
+                            "air", "the %s clock is standing down - the "
+                            "sheet is on %s and that road has a finished "
+                            "round standing by, so the silence is ITS to "
+                            "fill (#1163)"
+                            % (kind, slot.get("label") or on))
+                    return ""
+            _CLOCK_HELD.pop(kind, None)
+            return "the air is quiet"
         if on in (CLOCK_HOME.get(kind) or ()):
             _CLOCK_HELD.pop(kind, None)
             return "the sheet is on " + str(slot.get("label") or on)
@@ -42020,7 +42089,18 @@ async def dead_air_rescue(quiet: float) -> str:
                      % int(quiet))
         return ""
     _RESCUE_AT[0] = now
-    for kind in DEAD_AIR_RESCUE_ROADS:
+    # #1163: the entry on air goes first. The fixed order below is the
+    # right one when nothing in particular is due; when something IS due,
+    # the thing that is due is the best answer to a hole in it.
+    order = list(DEAD_AIR_RESCUE_ROADS)
+    try:
+        _on = str((schedule_take() or {}).get("kind") or "")
+        if _on in order:
+            order.remove(_on)
+            order.insert(0, _on)
+    except Exception:  # noqa: BLE001
+        pass
+    for kind in order:
         if kind not in stock:
             continue
         try:
@@ -51985,6 +52065,97 @@ UPSTAIRS_GRIPES = (
     "the coffee order has been cancelled, permanently, as a lesson",
     "a consultant is coming in and neither of you will enjoy it",
 )
+
+
+# #1162: how often a round gets interrupted from upstairs. One in five is
+# enough to be a running feature of the station and rare enough that it is
+# still an interruption when it happens - at one in two it stops being one.
+MANAGER_CUT_IN_PCT = 20
+
+# The ways it arrives. Rolled per interruption, because a memo slid under
+# the door and a phone light blinking are different scenes even when the
+# complaint is identical - the same lesson as #1161's deck.
+MANAGER_CUT_INS: tuple[str, ...] = (
+    "the intercom crackles and the manager's voice comes through the wall",
+    "a memo comes down and is slid under the booth door",
+    "the studio phone light starts blinking and will not stop",
+    "a runner puts a folded note on the desk without a word and leaves",
+    "the manager knocks on the glass and mouths it, and it has to be "
+    "guessed at",
+    "an email lands and the screen is right there in front of them",
+)
+
+# What the pair do about it. Also rolled: a memo that is always read out
+# in the same tone is a jingle.
+MANAGER_CUT_REACTS: tuple[str, ...] = (
+    "One of them reads it out loud, flatly, and the other has an opinion "
+    "about it immediately.",
+    "Neither of them wants to be the one to read it, and they argue about "
+    "that first.",
+    "They read it, agree it is outrageous, and then quietly do what it "
+    "says anyway.",
+    "One of them takes it personally - it is clearly about them - and the "
+    "other enjoys that far too much.",
+    "They pretend they have not seen it, keep going, and it eats at them "
+    "until one of them cracks.",
+    "They read it out and go straight back to what they were saying as "
+    "though nothing happened, and the subject creeps back in a line later.",
+)
+
+_MANAGER_CUT_MEMO: dict[str, Any] = {"at": 0.0, "clause": ""}
+
+
+def manager_cut_in_clause() -> str:
+    """#1162: sometimes, a memo from upstairs lands in THIS round.
+
+    Memoised for forty seconds because `radio_prompt_instruction` is
+    assembled more than once while a single round is being written, and a
+    fresh roll each time would put two different interruptions into one
+    scene - or one into the host's half and none into the co-host's.
+
+    Never raises, and never fires while the station is paused: an
+    interruption to nothing is not an interruption."""
+    now = time.time()
+    if now - float(_MANAGER_CUT_MEMO["at"]) < 40.0:
+        return str(_MANAGER_CUT_MEMO["clause"])
+    clause = ""
+    try:
+        pct = int(dj_settings().get("manager_cut_in_pct",
+                                    MANAGER_CUT_IN_PCT) or 0)
+        if pct > 0 and not radio_paused() and random.randint(1, 100) <= pct:
+            rows = [r for r in upstairs_list()
+                    if str(r.get("gripe") or "").strip()]
+            if rows:
+                # Least-aired first, like the topic book: three hundred
+                # pages and a plain random draw would still play the same
+                # dozen.
+                fewest = min(int(r.get("uses") or 0) for r in rows)
+                row = random.choice(
+                    [r for r in rows if int(r.get("uses") or 0) == fewest])
+                try:
+                    upstairs_update(str(row.get("id") or ""),
+                                    uses=int(row.get("uses") or 0) + 1,
+                                    last=int(now))
+                except Exception:  # noqa: BLE001
+                    pass
+                clause = (
+                    "\n\nUPSTAIRS CUTS IN, PART-WAY THROUGH THIS ROUND. "
+                    "Not at the top and not at the end - somewhere in the "
+                    "middle, while they are in the middle of something "
+                    "else. " + random.choice(MANAGER_CUT_INS).capitalize()
+                    + ", and what management wants them to know is this: "
+                    + str(row.get("gripe") or "").strip()[:200]
+                    + ". " + random.choice(MANAGER_CUT_REACTS)
+                    + " Whatever this round was about, it does NOT stop "
+                    "being about that - the interruption happens, they "
+                    "deal with it on air, and they get back to it. The "
+                    "manager is never in the room and never speaks in his "
+                    "own voice here; the pair are reacting to a message. "
+                    "Never read this instruction out loud.\n")
+    except Exception:  # noqa: BLE001
+        clause = ""       # a broken book never silences the booth
+    _MANAGER_CUT_MEMO.update({"at": now, "clause": clause})
+    return clause
 
 
 def upstairs_list() -> list[dict[str, Any]]:
