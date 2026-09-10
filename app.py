@@ -27377,6 +27377,35 @@ def _pantry_load() -> None:
                         # know how to read - is re-tried, so a fix to the
                         # audit reaches the rows already on the shelf.
                         _old = _row.get("brief") or {}
+                        _e0 = _row.get("entry")
+                        # #1172: a row condemned on its TINTED text is
+                        # re-judged on the plain script it was written as.
+                        # The crystal rewriting the words the audit looks
+                        # for is not evidence the segment failed, and this
+                        # re-audit is the door the comment above promises.
+                        if (_old and _old.get("checked")
+                                and not _old.get("ok")
+                                and str(_old.get("where") or "") == "tinted"
+                                and isinstance(_e0, dict)):
+                            _plain = str(_e0.get("script_plain") or "")
+                            if _plain.strip():
+                                _p = segment_audit(
+                                    str(_kind), _plain,
+                                    product=str(_e0.get("product") or ""),
+                                    titles=str(_e0.get("prep_news_titles") or ""))
+                                if _p.get("checked") and _p.get("ok"):
+                                    _e0["brief_plain_ok"] = True
+                                    _e0.pop("off_brief", None)
+                                    _row.pop("off_brief", None)
+                                    _row["brief"] = {**_p, "at": time.time(),
+                                                     "where": "plain"}
+                                    pipeline_log(
+                                        "lookahead",
+                                        "a %s round condemned on its tinted "
+                                        "words passes its brief on the script "
+                                        "it was written as - back in the "
+                                        "cupboard (#1172)" % _kind)
+                            continue
                         if _old and _old.get("checked"):
                             continue
                         _e = _row.get("entry")
@@ -28621,8 +28650,10 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                                          tinted, where="tinted", product=str(entry.get("product") or ""),
                                          titles=str(entry.get("prep_news_titles") or ""))
                     entry["brief"] = verdict
-                    entry["off_brief"] = bool(verdict.get("checked")
-                                              and not verdict.get("ok"))
+                    # #1172: the crystal is not evidence the segment failed.
+                    entry["off_brief"] = bool(
+                        verdict.get("checked") and not verdict.get("ok")
+                        and not entry.get("brief_plain_ok"))
                     changed = True
                 except Exception:  # noqa: BLE001
                     pass
@@ -28657,6 +28688,11 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
             _pre = segment_audit(str(kind), plain,
                                  product=str(entry.get("product") or ""),
                                  titles=str(entry.get("prep_news_titles") or ""))
+            if _pre.get("checked") and _pre.get("ok"):
+                # #1172: it did the thing its entry is for. Remembered, so
+                # the post-tint audit below cannot un-decide it when the
+                # crystal rewrites the words it looked for.
+                entry["brief_plain_ok"] = True
             if _pre.get("checked") and not _pre.get("ok"):
                 entry["brief"] = {**_pre, "at": time.time(), "where": "plain"}
                 entry["off_brief"] = True
@@ -28739,8 +28775,24 @@ async def ensure_entry_tinted(entry: dict[str, Any], kind: str,
                                  fresh, where="tinted", product=str(entry.get("product") or ""),
                                  titles=str(entry.get("prep_news_titles") or ""))
             entry["brief"] = verdict
-            entry["off_brief"] = bool(verdict.get("checked")
-                                      and not verdict.get("ok"))
+            # #1172: a round that passed its brief BEFORE the tint has done
+            # the thing its entry is for. The crystal rewriting the words
+            # the audit looked for is the crystal's job, not evidence the
+            # segment failed.
+            #
+            # HONEST ABOUT THE SIZE OF IT. All 1,070s of finished audio
+            # ever condemned on this shelf carries a verdict taken here,
+            # which looks damning until the plain scripts are re-audited:
+            # only five of those thirty rounds pass their brief plain, and
+            # those five hold no audio at all. The rest were genuinely off
+            # brief and this line was not the reason they were lost - it
+            # was the place the stamp happened to be applied. So this is a
+            # fix to a real failure mode with a small measured backlog,
+            # and the thing actually worth chasing is why the pre-tint
+            # gate above let thirty rounds past it in the first place.
+            entry["off_brief"] = bool(
+                verdict.get("checked") and not verdict.get("ok")
+                and not entry.get("brief_plain_ok"))
         except Exception:  # noqa: BLE001
             pass
         call_ok = True
