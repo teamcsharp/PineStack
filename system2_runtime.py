@@ -290,7 +290,12 @@ class System2Runtime:
         self._rows = {}
         candidates = []
         seen = set()
-        for kind in tuple(self.host.ALT_PREP_KINDS) + ("recap", "deep"):
+        # #1171: ...and NOT the roads the host says cannot be prepared.
+        # `recap` and `deep` were appended here by hand; both read the
+        # stretch of show that just happened, both are named in
+        # CANNOT_PREPARE with that reason, and nothing anywhere takes
+        # either of them off a shelf. See the note in the patch.
+        for kind in tuple(self.host.ALT_PREP_KINDS):
             if kind == "track_talk":
                 for identity, row in self.media.inventory_track_talk():
                     self._offer(candidates, seen, kind, row, identity)
@@ -487,8 +492,14 @@ class System2Runtime:
             # #1084: a second sitting takes a road nobody is already on.
             busy = {str(w.get("kind") or "") for w in self._works.values()
                     if w.get("state") == "preparing"}
-            kinds = [k for k in ("ad", "manager", "caller", "gallery", "news", "banter",
-                                 "track_talk", "recap", "deep") if k not in busy]
+            # #1171: recap and deep are in the host's CANNOT_PREPARE - a
+            # recap reads the hour that just happened - and no consumer
+            # exists for either shelf. Preparing them cost the deep tint
+            # lane one round an hour and produced nothing that could air.
+            _cannot = set(getattr(self.host, "CANNOT_PREPARE", {}) or {})
+            kinds = [k for k in ("ad", "manager", "caller", "gallery", "news",
+                                 "banter", "track_talk")
+                     if k not in busy and k not in _cannot]
             if not kinds:
                 return
             # #1074: a 900 s lease renewed every 300 s (was 1800/600). The
