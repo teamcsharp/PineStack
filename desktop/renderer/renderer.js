@@ -1609,6 +1609,56 @@ async function waitForAgent(ms = 30000) {
   return false;
 }
 
+/* 2026-09-10: the mark tells you whether it needs pressing.
+ *
+ * "Make sure that this is always rebuilding and loading the latest version
+ *  of the app... This is the only button I ever click."
+ *
+ * The rebuild has always refreshed everything unconditionally - the agent
+ * first, then a /MIR mirror of the whole desktop tree, then a relaunch.
+ * What it could never do was SHOW that it had. From inside the running app
+ * there was no way to tell a build made from today's source from one made
+ * last week, so the mark had to be taken on faith - and when a fix failed
+ * to appear there was no way to know whether the fix was wrong or the app
+ * was old. That is the trap #1148 was: an old main.js quietly serving an
+ * old bridge until somebody happened to relaunch.
+ *
+ * This asks the main process to compare the running tree against the
+ * share's, file by file and by bytes as well as times, and puts the answer
+ * under the name. A stale app now announces itself.
+ */
+async function checkBuild() {
+  if (!api || typeof api.buildInfo !== "function") return null;
+  let got = null;
+  try { got = await api.buildInfo(); } catch (e) { return null; }
+  const mark = $("panicBtn");
+  const line = $("buildLine");
+  if (line) {
+    line.textContent = got.stale
+      ? "⚠ older than the share — press the mark"
+      : (got.reachable ? "newest source" : "share unreachable");
+    line.style.color = got.stale ? "#e0a35c"
+      : (got.reachable ? "#7ce8a9" : "#8ba0b5");
+  }
+  if (mark) {
+    mark.classList.toggle("stale", !!got.stale);
+    const bits = [
+      String(got.say || ""),
+      "",
+      "running from: " + (got.running_from || "?"),
+      "source: " + (got.source || "?"),
+    ];
+    if ((got.missing || []).length) {
+      bits.push("missing from this build: " + got.missing.join(", "));
+    }
+    bits.push("");
+    bits.push("Deploy the newest app.py to the box, then collapse, rebuild"
+              + " and relaunch this app on the newest source (#1044)");
+    mark.title = bits.join("\n");
+  }
+  return got;
+}
+
 async function panicRecover() {
   const button = $("panicBtn");
   const was = button.textContent;
@@ -12600,6 +12650,11 @@ if (typeof api.onSupportProgress === "function") {
   await refresh();
   await pollDesktopRadio();
   setInterval(refresh, 6000);
+  /* 2026-09-10: is this app the newest? Asked once at boot and then
+   * rarely - the answer only changes when somebody writes to the share,
+   * and it costs six stat calls. */
+  checkBuild();
+  setInterval(checkBuild, 60000);
   setInterval(pollDesktopRadio, 1500);
   // #1073: the scheduler cell, on the same cadence as the other strip polls.
   schedTilePoll();

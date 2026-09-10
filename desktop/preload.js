@@ -7,6 +7,9 @@ contextBridge.exposeInMainWorld("pineDesktop", {
   stopBackend: () => ipcRenderer.invoke("backend:stop"),
   setupBackend: () => ipcRenderer.invoke("backend:setup"),
   reconstituteDesktop: () => ipcRenderer.invoke("desktop:reconstitute"),
+  /* 2026-09-10: what this app was built from, against what the share
+   * holds now - so "am I on the latest?" has an answer. */
+  buildInfo: () => ipcRenderer.invoke("desktop:build"),
   backendLog: () => ipcRenderer.invoke("backend:log"),
   onBackendLog: (callback) => ipcRenderer.on("backend-log", (_event, line) => callback(line)),
   onSupportProgress: (callback) => ipcRenderer.on("support-progress", (_event, data) => callback(data)),

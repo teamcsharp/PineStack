@@ -336,6 +336,12 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
   // beyond the share, nothing deleted that the relaunch needs.
   const scriptPath = path.join(app.getPath("userData"), "pinebox-rebuild.cmd");
   const logPath = path.join(app.getPath("userData"), "pinebox-rebuild.log");
+  // 2026-09-10: the caches Electron keeps of the code being replaced.
+  // Built here, where the real userData path is known - the app is
+  // named "Pine Box", so guessing %APPDATA%\\pine-box would have
+  // cleared nothing at all.
+  const codeCache = cmdEscape(path.join(app.getPath("userData"), "Code Cache"));
+  const gpuCache = cmdEscape(path.join(app.getPath("userData"), "GPUCache"));
   const lines = [
     "@echo off",
     "setlocal EnableExtensions",
@@ -357,6 +363,14 @@ function writeWindowsRebuildScript(runnerRoot, sourceRoot, cfg) {
     "if exist \"%SOURCE_DIR%\\package-lock.json\" copy /Y \"%SOURCE_DIR%\\package-lock.json\" \"%RUN_DIR%\\package-lock.json\" >> \"%LOG%\" 2>&1",
     "robocopy \"%SOURCE_DIR%\\desktop\" \"%RUN_DIR%\\desktop\" /MIR /NFL /NDL /NJH /NJS /NP >> \"%LOG%\" 2>&1",
     "if errorlevel 8 goto fail",
+    // 2026-09-10: and the caches Electron keeps of the code it just
+    // replaced. The non-Windows path has cleared these since #827
+    // (removeInside); this one mirrored the source and then relaunched
+    // straight into a compiled copy of the OLD renderer. Best effort -
+    // a cache that will not delete is not worth failing a rebuild over.
+    ">> \"%LOG%\" echo [rebuild] clearing the runtime code caches",
+    `if exist "${codeCache}" rmdir /s /q "${codeCache}" >> \"%LOG%\" 2>&1`,
+    `if exist "${gpuCache}" rmdir /s /q "${gpuCache}" >> \"%LOG%\" 2>&1`,
     "if not exist \"%RUN_DIR%\\node_modules\\electron\\dist\\electron.exe\" (",
     ">> \"%LOG%\" echo [rebuild] unpacking the prebuilt Electron runtime from the share",
     "  powershell -NoProfile -ExecutionPolicy Bypass -Command \"Expand-Archive -Force '%SOURCE_DIR%\\..\\desktop-runtime\\electron-win64.zip' '%RUN_DIR%\\node_modules\\electron'\" >> \"%LOG%\" 2>&1",
@@ -717,6 +731,71 @@ ipcMain.handle("backend:stop", () => {
   return { ok: true };
 });
 ipcMain.handle("backend:setup", () => createVenvAndInstall());
+/* 2026-09-10: IS THIS APP ACTUALLY THE LATEST? ANSWER IT, DO NOT ASSUME IT.
+ *
+ * "Make sure that this is always rebuilding and loading the latest version
+ *  of the app... This is the only button I ever click."
+ *
+ * The rebuild already refreshes everything unconditionally - the agent
+ * first, then a /MIR mirror of the whole desktop tree, then a relaunch.
+ * What it never did was PROVE it: from inside the running app there was no
+ * way to tell a build made from today's source from one made last week.
+ * So the mark had to be taken on faith, and when a fix failed to appear
+ * there was no way to know whether the fix was wrong or the app was old.
+ *
+ * This compares what the runner is RUNNING against what the share HOLDS,
+ * file by file, and hands back both stamps. A stale runner becomes visible
+ * instead of inferred - which is exactly the trap #1148 was, an old main.js
+ * quietly serving an old bridge until somebody happened to relaunch.
+ */
+function treeStamp(root) {
+  const wanted = ["main.js", "preload.js", "renderer/renderer.js",
+                  "renderer/index.html", "renderer/webview-preload.js",
+                  "renderer/styles.css"];
+  let newest = 0;
+  let bytes = 0;
+  const missing = [];
+  for (const name of wanted) {
+    try {
+      const info = fs.statSync(path.join(root, name));
+      newest = Math.max(newest, info.mtimeMs);
+      bytes += info.size;
+    } catch {
+      missing.push(name);
+    }
+  }
+  return { newest, bytes, missing };
+}
+
+ipcMain.handle("desktop:build", () => {
+  const source = path.join(process.env.PINE_AGENT_ROOT || agentRoot(),
+                           "desktop");
+  const mine = treeStamp(path.resolve(__dirname));
+  let theirs = { newest: 0, bytes: 0, missing: [] };
+  let reachable = true;
+  try {
+    theirs = treeStamp(source);
+    if (!theirs.newest) reachable = false;
+  } catch {
+    reachable = false;
+  }
+  /* Bytes as well as times: /MIR preserves mtimes, so two trees differing
+   * in content but not in clock would otherwise compare equal. */
+  const stale = reachable
+    && (theirs.bytes !== mine.bytes || theirs.newest > mine.newest + 1500);
+  return {
+    running_from: path.resolve(__dirname), source, reachable, stale,
+    running_stamp: mine.newest, running_bytes: mine.bytes,
+    source_stamp: theirs.newest, source_bytes: theirs.bytes,
+    missing: mine.missing,
+    say: !reachable
+      ? "the share could not be read, so the app cannot check itself"
+      : stale
+        ? "THIS APP IS OLDER THAN THE SHARE - press the mark to rebuild"
+        : "running the newest source on the share",
+  };
+});
+
 ipcMain.handle("desktop:reconstitute", () => reconstituteDesktop());
 ipcMain.handle("backend:log", () => backendLog);
 ipcMain.handle("agent:discover-key", () => discoverAgentKey());
