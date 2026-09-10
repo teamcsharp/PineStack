@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
 import copy
 import hashlib
 import hmac
@@ -43,13 +44,19 @@ from crystal_contract import (compare_contract as crystal_compare_contract,
                               normalize_text as crystal_normalize_text)
 from crystal_prompts import (turn_prompt as crystal_prompt_turn,
                              round_prompt as crystal_prompt_round,
+                             revision_prompt as crystal_prompt_revision,
                              budget_plan as crystal_budget_plan,
                              PROMPT_VERSION as CRYSTAL_PROMPT_VERSION)
 from crystal_source import clean_repair_prompt_echo, strip_repair_prompt_echo
 from segment_contract import ad_sale_evidence
+from director import (director_add, director_clause, director_notes,
+                      director_path, director_restore, director_retire,
+                      director_sheet, director_spend, director_touch)
 from crystal_acceptance import evaluate_acceptance as crystal_editorial_acceptance
 from prompt_learning import PromptLearningStore, _patterns as crystal_learning_patterns
 from response_bank import ResponseBank, add_listening_responses
+from rap_battle import (COMBATANTS as RAP_COMBATANTS, RapBattle,
+                        SEAT_NAMES as RAP_SEAT_NAMES)
 from sfx_cadence import SfxCadence, due_after as sfx_due_after
 from resource_guard import ResourceHistory, assess as assess_resources, available_gb, engine_busy, memory_snapshot, gpu_snapshot
 from fastapi import FastAPI, Header, HTTPException, Query, Request
@@ -96,6 +103,7 @@ _LINE_REVIEW = LineReviewStore(data_path("line_review.sqlite3"))
 _REJECTION_LAB = RejectionLabStore(data_path("rejection_lab.sqlite3"))
 _PROMPT_LEARNING = PromptLearningStore(data_path("prompt_learning.sqlite3"))
 _SFX_CADENCE = SfxCadence(data_path("sfx_cadence.sqlite3"))
+director_path(DATA_DIR)                 # the director's book lives here too
 _SFX_CADENCE_STATUS = {"sample_due": 0, "sample_omitted": 0,
                        "guy_due": 0, "guy_omitted": 0, "last_sample": ""}
 _PROMPT_LEARNING_ERRORS = {"count": 0, "last_error": ""}
@@ -579,6 +587,10 @@ VOICE_PUBLIC_URL = os.getenv(
 
 VOICE_MEDIA_DIR = data_path("voice_media")
 _RESPONSES = ResponseBank(data_path("response_bank.json"), VOICE_MEDIA_DIR)
+# #1090: the thread of the night. Every road that writes dialogue reads
+# the same battle out of this, which is what makes the day one argument
+# instead of a series of unrelated errands.
+_BATTLE = RapBattle(data_path("rap_battle.json"))
 VOICE_LEDGER_PATH = data_path("voice_ledger.json")
 # Two caps, both hard, both server-side: one alone is not enough. Piper is
 # local and free, so these are sized as a runaway guard, not a bill.
@@ -886,6 +898,23 @@ DEFAULT_DJ = {
     # substantial consecutive Speakerbox swath.
     "speakbox_full_swath_rate": 0.35,
     "speakbox_full_swath_chars": 2600,
+    # 2026-09-10: HOW A DRAWN PASSAGE IS DEALT, once the sliders above have
+    # decided how much of it airs.
+    #
+    # `speakbox_seat_spread` - deal each passage across the seats of the
+    # round in spoken-length turns instead of one long turn labelled "A:".
+    # All three swath doors wrote "A:", and _who_of("A") is the DJ, which
+    # put 81.9% of six hours of measured airtime in one mouth against the
+    # co-host's 4.4%. Off restores the single-turn staple exactly.
+    #
+    # `speakbox_tint_passages` - let the crystal reach the passages. A
+    # passage registered in `_verbatim` is exempt from the tint by
+    # _tint_plain_passage (300+ characters, or a raw run-on, cannot carry
+    # a set of bars) - true of a 3,000-character reading, false of the
+    # 260-character turns it is now dealt into. Off restores #838's rule
+    # that the operator's own documents are never reworded.
+    "speakbox_seat_spread": True,
+    "speakbox_tint_passages": True,
     # Which documents they may lift from. Empty means the whole folder, so a
     # file dropped in is in play without anyone ticking a box (#202).
     # How much each document is drawn on, by file name, 0 to 100. Anything
@@ -1266,6 +1295,23 @@ DEFAULT_DJ = {
     # contracts: a 100% strength tint at 40% coverage is four hard bars and
     # six plain lines, not a fully tinted conversation.
     "crystal_coverage": 100,
+    # 2026-09-09 (the operator's ask): "give it a revision loop. Tell it to
+    # rewrite once to replace any simple or predictable rhymes with more
+    # unexpected phrasing." One extra visit to the model, on a bar that has
+    # already passed the grader, asking only for better wording.
+    #
+    # "deep" (the default) runs it on the roads that already earn the deep
+    # model and nothing else, because the second visit lands on the same
+    # one-permit tint lane, and that lane is the constraint the whole show
+    # sits behind: render costs 2.97 + 1.05x the audio it makes, so a line
+    # that arrives late is a hole in the air, and the deep lane manages
+    # 8-12 rounds an hour against about 44 asked. "all" spends it on every
+    # road; "off" is the switch. Whatever this says, crystal_revision_skip
+    # below stands the pass down while the reserve is empty, the share is
+    # spent, the operator is forcing something through, or anything at all
+    # is waiting on the tint lane - the bar it would improve is already
+    # good enough to broadcast.
+    "crystal_revision": "deep",
     # The schedule-critical second pass uses this smaller writer so the
     # coming horizon can be completed before optional cupboard polish uses
     # the expensive model below. Empty falls back to the station writer.
@@ -1719,7 +1765,15 @@ def validate_settings(data: Any) -> dict[str, Any]:
         # dragged past its partner, not an instruction to never talk.
         **_dj_range(raw_dj, "banter_min_minutes", "banter_max_minutes", 0, 60,
                     whole=False),
-        **_dj_range(raw_dj, "banter_min_lines", "banter_max_lines", 2, 20),
+        # 2026-09-09: the ceiling was 20, and the operator asked for the
+        # round length doubled from 8-11 to 16-22 - so 22 came back as 20
+        # and the dial lied about what it had been set to. 24 now. The
+        # PRACTICAL ceiling is lower than the dial: a fully banked round
+        # over 150 estimated seconds leaves the one-piece road and is
+        # paged in eights, which is the join road the gap log blames for
+        # 136 holes of median 20.7s. At roughly five seconds a line that
+        # is about thirty lines.
+        **_dj_range(raw_dj, "banter_min_lines", "banter_max_lines", 2, 24),
         "dialogue_prefill": bool(raw_dj.get(
             "dialogue_prefill", DEFAULT_DJ["dialogue_prefill"])),
         "track_talk_ahead": max(1, min(40, int(                  # #1096
@@ -1748,6 +1802,12 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "speakbox_full_swath_chars": max(300, min(6000, int(
             raw_dj.get("speakbox_full_swath_chars",
                        DEFAULT_DJ["speakbox_full_swath_chars"]) or 2600))),
+        "speakbox_seat_spread": bool(raw_dj.get(
+            "speakbox_seat_spread",
+            DEFAULT_DJ["speakbox_seat_spread"])),
+        "speakbox_tint_passages": bool(raw_dj.get(
+            "speakbox_tint_passages",
+            DEFAULT_DJ["speakbox_tint_passages"])),
         "speakbox_files": [
             str(name)[:120] for name in (raw_dj.get("speakbox_files") or [])
             if str(name or "").strip()
@@ -1964,6 +2024,10 @@ def validate_settings(data: Any) -> dict[str, Any]:
         "crystal_coverage": max(0, min(100, int(float(
             raw_dj.get("crystal_coverage",
                        DEFAULT_DJ["crystal_coverage"]) or 0)))),
+        "crystal_revision": (str(raw_dj.get("crystal_revision") or "deep").lower()
+                             if str(raw_dj.get("crystal_revision") or "deep").lower()
+                             in CRYSTAL_REVISION_MODES
+                             else DEFAULT_DJ["crystal_revision"]),   # 2026-09-09
         "model_fast": str(raw_dj.get(
             "model_fast", DEFAULT_DJ["model_fast"]) or "")[:80],
         "crystal_tint_model": str(raw_dj.get(                       # #1036
@@ -2147,15 +2211,33 @@ def validate_settings(data: Any) -> dict[str, Any]:
 
 
 # (mtime, size, parsed) — re-read only when the file actually changes.
-_SETTINGS_CACHE: dict[str, Any] = {"key": None, "value": None}
+_SETTINGS_CACHE: dict[str, Any] = {"key": None, "value": None, "at": 0.0}
+# 2026-09-09: how long a settings read may trust its last stat().
+#
+# The parse was already cached on (mtime, size); the STAT was not, and
+# dj_settings() -> load_settings() sits under the torrent, both watchdogs,
+# every render decision and every /api/dj poll. On this box data/ is a CIFS
+# share, so that stat is a network round trip - and it showed up in the
+# stall hunter's own record as the second most frequent thing blocking the
+# event loop (57 of the 190 stall-attributed holes over eighteen hours,
+# 54s of measured block in the sampled window alone). A settings edit is
+# now seen up to a second late; save_settings still clears the cache in
+# process, so an edit made HERE is instant, and the second only ever
+# applies to a file changed by something else.
+SETTINGS_STAT_REST = 1.0
 
 
 def load_settings() -> dict[str, Any]:
     with SETTINGS_LOCK:
+        now = time.time()
+        if (_SETTINGS_CACHE["value"] is not None
+                and now - float(_SETTINGS_CACHE["at"] or 0) < SETTINGS_STAT_REST):
+            return _SETTINGS_CACHE["value"]
         try:
             stat = SETTINGS_PATH.stat()
             key = (stat.st_mtime_ns, stat.st_size)
             if _SETTINGS_CACHE["key"] == key:
+                _SETTINGS_CACHE["at"] = now
                 return _SETTINGS_CACHE["value"]
         except Exception:
             key = None
@@ -2164,7 +2246,8 @@ def load_settings() -> dict[str, Any]:
             raw = json.loads(SETTINGS_PATH.read_text())
             parsed = validate_settings(raw)
             if key is not None:
-                _SETTINGS_CACHE.update({"key": key, "value": parsed})
+                _SETTINGS_CACHE.update({"key": key, "value": parsed,
+                                        "at": time.time()})
             return parsed
         except Exception:
             SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -2182,7 +2265,7 @@ def save_settings(data: Any) -> dict[str, Any]:
             json.dumps(normalized, indent=2) + "\n"
         )
         temporary.replace(SETTINGS_PATH)
-        _SETTINGS_CACHE.update({"key": None, "value": None})
+        _SETTINGS_CACHE.update({"key": None, "value": None, "at": 0.0})
 
     return normalized
 
@@ -5061,6 +5144,160 @@ async def _startup_music() -> None:
         music_index()
     except Exception:
         pass
+
+
+# How often the keeper looks, and the least time between two attempts at
+# handing the device the same record. Short enough that a reboot is audible
+# in seconds; long enough that a device refusing everything is not hammered.
+NABU_KEEP_TICK = 15.0
+NABU_KEEP_REST = 25.0
+_NABU_KEEP: dict[str, Any] = {"at": 0.0, "tries": 0, "was_down": False,
+                              "why": "not started"}
+
+
+async def nabu_is_playing() -> bool | None:
+    """Does Home Assistant say the device is playing? None when unknown.
+
+    One state read, and the keeper is the only caller - the panel has its
+    own road. Unknown is deliberately not False: a keeper must not act on
+    a question it could not ask."""
+    token, _player = _ha_creds()
+    if not token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=6) as client:
+            got = await client.get(
+                f"{HA_URL}/api/states/{NABU_MEDIA_PLAYER}",
+                headers={"Authorization": f"Bearer {token}"})
+        if got.status_code >= 400:
+            return None
+        return str(got.json().get("state") or "") == "playing"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def nabu_music_keeper() -> None:
+    """Keep the record ON the device the operator actually listens to.
+
+    2026-09-09: "when i set this to nabu, i mean the nabu device. And i mean
+    it." The station had no road back: _nabu_music_dispatch fires on a route
+    change or a track change and hands over one whole file, so when the
+    firmware crashed mid-record - every port refused, both entities
+    unavailable - the Nabu stayed silent until the next track, and a power
+    cycle restored nothing by itself. The receipt (_NABU_MUSIC_ON) says what
+    the device was actually given; when that does not match the record on
+    air, it is handed over again.
+
+    It never speaks, renders or writes: the worst it can do is ask Home
+    Assistant to play the record that is already playing here."""
+    await asyncio.sleep(12)
+    while True:
+        await asyncio.sleep(NABU_KEEP_TICK)
+        try:
+            if not _RADIO.get("on") or radio_paused():
+                continue
+            if (_RADIO.get("music_to") or "here") not in ("box", "both"):
+                _NABU_KEEP["why"] = "the records are not routed to the box"
+                continue
+            if not box_talk_ok() or _RADIO.get("voice_device") != "nabu":
+                _NABU_KEEP["why"] = "the box switch is off"
+                continue
+            # 2026-09-09: a muted record is not a missing one. With
+            # nabu_music_level at 0 the dispatcher STOPS the device rather
+            # than playing it, so a keeper that treats "no receipt" as "hand
+            # it over" re-sends a stop every tick and reports it as a
+            # success. Nothing to keep here - and the operator hearing no
+            # music on the device is a dial, not a fault.
+            from nabu_audio import gain as _nabu_gain
+            if _nabu_gain(dj_settings(), "music") <= 0:
+                _NABU_KEEP.update(tries=0, why="the records are muted for this "
+                                  "device (nabu_music_level is 0) - it carries "
+                                  "the voices only")
+                continue
+            down = box_firmware_down_now()
+            if down:
+                _NABU_KEEP.update(was_down=True, why="the firmware is not "
+                                  "running - only a power cycle fixes that")
+                continue
+            track = dict(_RADIO.get("now") or {})
+            tid = str(track.get("id") or "")
+            if not tid:
+                _NABU_KEEP["why"] = "no record is on"
+                continue
+            if (_NABU_MUSIC_ON.get("ok")
+                    and str(_NABU_MUSIC_ON.get("track") or "") == tid):
+                _NABU_KEEP.update(tries=0, why="the device has this record")
+                continue
+            # A record whose own length has already run out cannot be
+            # resumed: the offset lands past the end and the device is
+            # handed the silence after it.
+            length = float(track.get("seconds") or 0)
+            started = float(_RADIO.get("started") or 0)
+            spent = max(0.0, time.time() - started) if started else 0.0
+            if length and spent >= length - 5.0:
+                _NABU_KEEP["why"] = ("the record on air has run past its own length; "
+                                     "there is nothing left to hand over")
+                continue
+            # And ask the device before acting. A keeper that dispatches
+            # without looking is indistinguishable from a loop.
+            playing = await nabu_is_playing()
+            if playing:
+                _NABU_KEEP.update(tries=0, why="the device is already playing")
+                continue
+            if time.time() - float(_NABU_KEEP.get("at") or 0) < NABU_KEEP_REST:
+                continue
+            _NABU_KEEP["at"] = time.time()
+            _NABU_KEEP["tries"] = int(_NABU_KEEP.get("tries") or 0) + 1
+            came_back = bool(_NABU_KEEP.get("was_down"))
+            _NABU_KEEP["was_down"] = False
+            _NABU_MUSIC_EPOCH[0] += 1
+            got = await _nabu_music_dispatch(
+                track, _NABU_MUSIC_EPOCH[0], resume=True,
+                expected_started=float(_RADIO.get("started") or 0))
+            ok = bool((got or {}).get("ok"))
+            _NABU_KEEP["why"] = ("the record was handed back to the device"
+                                 if ok else str((got or {}).get("why") or ""))
+            if ok:
+                pipeline_log("air", ("the Pine Box came back - the record is "
+                                     "on it again from where the show is"
+                                     if came_back else
+                                     "the record was not on the box - handed "
+                                     "it over from where the show is"))
+        except Exception:  # noqa: BLE001
+            continue        # a keeper may never take the show
+
+
+@app.on_event("startup")
+async def _startup_nabu_keeper() -> None:
+    fire_and_forget(nabu_music_keeper())
+
+
+@app.on_event("startup")
+async def _startup_one_destination() -> None:
+    """2026-09-09: a restart may not leave a speaker playing a stale show.
+
+    _nabu_music_dispatch hands the device a whole FLAC and lets it run
+    alone; only a deliberate route change ever stopped it. So a station
+    that restarted - a deploy, the watchdog, a crash - came back with the
+    record routed HERE and the Nabu still grinding through a copy of
+    whatever had been playing before, against a page that had by then
+    moved on. The route survives the restart; the audio on the far end
+    must be made to agree with it."""
+    async def run() -> None:
+        # 2026-09-09: THIRTY, and re-read. Six seconds was not enough: the
+        # route is restored after _RADIO is built, so this woke while
+        # music_to still held its "here" default, decided the box was not
+        # the destination, and stopped a device that was about to be handed
+        # the record. Caught on air - the receipt was cleared seconds after
+        # every restart. A guard that fires before the thing it guards has
+        # loaded is not a guard.
+        await asyncio.sleep(30)
+        try:
+            if (_RADIO.get("music_to") or "here") not in ("box", "both"):
+                await music_box_stop_now()
+        except Exception:  # noqa: BLE001
+            pass
+    fire_and_forget(run())
 
 
 @app.on_event("startup")
@@ -18748,6 +18985,59 @@ def page_carries_live(voice_to: str, to_box: bool = False,
     return False
 
 
+# 2026-09-09: what the box was actually GIVEN, and when. The page yields
+# the record only against this - see page_carries_music.
+_NABU_MUSIC_ON: dict[str, Any] = {"track": "", "at": 0.0, "ok": False}
+
+
+def page_carries_music() -> bool:
+    """2026-09-09: does the PAGE play the record, or is the box carrying it?
+
+    The twin of page_carries_live, and it did not exist - which is why the
+    music was the worse half of the fault that function documents. The
+    page's follower plays whatever the radio clock names, with no route
+    test anywhere in it, so `music_to: box` never MOVED the record to the
+    box: it COPIED it. The page seeked its own /music/<id> to its own
+    computed position while _nabu_music_dispatch handed the device a FLAC
+    cut from an offset and left it to run alone, unsynchronised, to the end
+    of the track. Two players, one record, two clocks - the operator hears
+    one show out of the app and a different one out of the Nabu.
+
+    The rescues are the same rescues, for the same reason: a record is
+    never lost to a box that cannot play it."""
+    try:
+        if _RADIO.get("monitor"):
+            return True                 # deliberately hearing both
+        if str(_RADIO.get("music_to") or "here") not in ("box", "both"):
+            return True                 # the page IS the destination
+        if not box_talk_ok():
+            return True                 # rescue: the switch is off
+        if box_firmware_down_now():
+            return True                 # rescue: routed around a dead box
+        if time.time() < float(_BOX_DOWN.get("until") or 0):
+            return True                 # rescue: the box is marked down
+        # 2026-09-09: AND THE PAGE KEEPS THE RECORD UNTIL THE BOX HAS IT.
+        #
+        # Coupling the music to the voice took away the safety net this road
+        # used to have by accident: the music stayed on the page whatever
+        # the voice did, so a box that was pointed at but not playing cost
+        # the listener nothing. Measured live within the hour: the route
+        # moved to the box, the page dutifully stopped the record, the
+        # Nabu's media_player sat idle - and the station was silent with a
+        # full bank and a healthy page feed. _nabu_music_dispatch hands the
+        # device one whole file and there is no retry, so "pointed at the
+        # box" is not evidence of a note coming out of it. The station's own
+        # receipt for THIS record is.
+        now_id = str((_RADIO.get("now") or {}).get("id") or "")
+        if not (_NABU_MUSIC_ON.get("ok")
+                and str(_NABU_MUSIC_ON.get("track") or "") == now_id
+                and now_id):
+            return True                 # rescue: the box never took this one
+    except Exception:  # noqa: BLE001
+        return True                     # any doubt: do not lose the record
+    return False
+
+
 _NABU_SPEECH_ACTIVE: dict[str, Any] = {}
 _NABU_SPEECH_CONTROL = asyncio.Lock()
 _NABU_SPEECH_EPOCH = {"voice": 0, "reply": 0}
@@ -20220,6 +20510,11 @@ async def _nabu_music_dispatch(track: dict[str, Any], epoch: int,
                 response = await client.post(f"{HA_URL}/api/services/media_player/{service}",
                     headers={"Authorization": f"Bearer {token}"}, json=payload)
         ok = response.status_code < 400
+        # 2026-09-09: the receipt page_carries_music yields the record to.
+        _NABU_MUSIC_ON.update(
+            ok=bool(ok and wanted > 0),
+            track=str(track.get("id") or "") if wanted > 0 else "",
+            at=time.time())
         return {"ok": ok, "applies": "music now", "offset": round(offset, 3),
                 "gain": wanted, "why": "" if ok else f"HTTP {response.status_code}"}
     except Exception as exc:
@@ -22295,8 +22590,8 @@ def radio_prompt_desk_state() -> dict[str, Any]:
                     ("manager_per_hour", "Memos from upstairs an hour (quota)",
                      "range", 0, 12, 1),
                     ("manager_name", "Manager name", "text", 0, 0, 0)],
-        "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 20, 1),
-                        ("banter_max_lines", "Maximum exchange lines", "number", 2, 20, 1),
+        "interaction": [("banter_min_lines", "Minimum exchange lines", "number", 2, 24, 1),
+                        ("banter_max_lines", "Maximum exchange lines", "number", 2, 24, 1),
                         # #842: how deep the pre-recorded shelf runs, in
                         # HOURS of finished audio rather than in items.
                         ("prepare_hours", "Hours prepared ahead", "number",
@@ -28817,6 +29112,31 @@ async def response_bank_prepare(limit: int = 2, force_draft: bool = False,
             if (voice, engine) in attempted_voices:
                 continue                # one unavailable actor cannot starve the other
             text, intent = entry["text"], entry["intent"]
+            # 2026-09-09: RAP IT BEFORE YOU RECORD IT. A fixed acknowledgment
+            # is plain by nature and #1064 rightly refuses to serve a plain
+            # take under a crystal - but the answer to that is to rap it, not
+            # to stop recording it. Without this the crystal's listening
+            # repertoire was frozen at whatever had been tinted before that
+            # rule, and the same seven bars carried every seam in the show.
+            # The bar belongs to the crystal rather than the seat, so the
+            # second presenter reuses the first one's and pays no model visit.
+            if entry.get("rap") and _ck:
+                said = _RESPONSES.rapped_said(text, _ck)
+                if not said:
+                    try:
+                        said = " ".join(str(await crystal_line(
+                            text, "a listening response", 1) or "").split())
+                    except WritingDeferred:
+                        why = ("the model's admitted writers are full; the "
+                               "rapped acknowledgments remain owed")
+                        break
+                    except Exception:  # noqa: BLE001
+                        said = ""
+                if not said or said.casefold() == text.casefold():
+                    why = ("waiting for the crystal to rap the fixed "
+                           "acknowledgments")
+                    continue
+                entry = {**entry, "said": said, "crystal": _ck}
             attempts += 1
             retry = _RESPONSES.retry_state(voice, engine, text)
             if retry.get("path"):
@@ -44392,7 +44712,53 @@ def _schedule_clause(preset: str, slot: dict[str, Any], text: str,
             "the show out loud, call it that and nothing else. Do not "
             "announce it as a schedule entry or read this instruction "
             "aloud; just use the name the way a presenter would."
-            + "\n")
+            # #1090: and the battle rides with it. Appended here rather
+            # than inside one writer, because every road that takes a
+            # scheduled round comes through this clause - System2 builds
+            # its per-slot prompt from it, and the legacy chain reads the
+            # same string back off sched_prompt.
+            + "\n" + rap_battle_clause()
+            # 2026-09-10: AND THE DIRECTOR'S NOTES, for the same reason
+            # and in the same place. This clause is the one choke point
+            # every scheduled round already passes through, so a note
+            # written in the director's room governs the System2 road and
+            # the legacy road without either of them knowing the book
+            # exists. It speaks LAST: the sheet says what this segment is,
+            # the battle says what register it is in, and the director
+            # says how the operator wants it done after hearing the last
+            # one go out.
+            + director_clause(
+                str(slot.get("kind") or ""),
+                slot_id=str(slot.get("id") or ""),
+                occurrence=str(slot.get("occurrence")
+                               or (_RADIO.get("sched_pos") or {}).get(
+                                   "occurrence") or "")))
+
+
+def rap_battle_clause(up_next: str = "") -> str:
+    """#1090: the battle paragraph, or nothing if it cannot be built.
+
+    A failure here must never cost a round its prompt - the segment still
+    has a job to do whether or not the thread is readable."""
+    try:
+        return _BATTLE.clause(up_next)
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def rap_battle_note(who: str, text: str, kind: str = "") -> int:
+    """A combatant line went out; it is the bar the next one answers."""
+    try:
+        return int(_BATTLE.note(who, text, kind) or 0)
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def rap_battle_state() -> dict[str, Any]:
+    try:
+        return _BATTLE.read()
+    except Exception:  # noqa: BLE001
+        return {"round": 0, "thread": [], "standing": {}, "motif": ""}
 
 
 def _schedule_prompt_clause() -> str:
@@ -44612,6 +44978,18 @@ def _schedule_action_pending(kind: str, occurrence: str) -> bool:
 
 def _schedule_action_complete(kind: str, occurrence: str) -> None:
     """Commit successful work to the occurrence that actually requested it."""
+    # 2026-09-10: and the director's book is told the same thing. This is
+    # the one call in the file whose whole meaning is "a segment of this
+    # kind actually happened for this occurrence", which is exactly when a
+    # one-shot note is spent and a standing note has governed one more
+    # segment. Never on a poll: schedule_take() is read by the panel and
+    # the coordinator as well as by the show, and direction spent by
+    # whoever happened to be looking is direction lost.
+    try:
+        director_spend(kind, occurrence=occurrence)
+        director_touch(kind)
+    except Exception:  # noqa: BLE001
+        pass                    # the book is direction, not the show
     if not occurrence:
         _RADIO["sched_first"] = False
         return
@@ -55968,14 +56346,43 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
                                       or 70))) / 100.0
             _troll = random.random() < _tp
             if _troll and not _tdoc:
-                # No report chosen: the shelf document most ABOUT the
-                # theme stands in, so the theme owns its material
-                # either way.
+                # No report chosen: the shelf documents most ABOUT the
+                # theme stand in, so the theme owns its material either
+                # way.
+                #
+                # 2026-09-10: k=1 IS NOT A DRAW, IT IS A CONSTANT. The
+                # index does not move between rounds, so the same query
+                # returned the same single document every time - and this
+                # branch fires on `strength`% of ALL draws (84% here), so
+                # it pinned the whole night to one file. Measured live:
+                # 94.7% of the last hour's swaths came out of vil1.md,
+                # 70.0% of the last six hours, out of 317 documents on
+                # the shelf. The operator heard that as "no randomness
+                # with the chunks chosen from the speakerbox", and every
+                # anti-domination gate below - the weighted draw, the
+                # six-document rotation, the oldest/newest band dives -
+                # was being walked straight past by this one assignment.
+                #
+                # speakbox_search returns ONE swath per document (#566),
+                # so k documents really are k different documents. Take a
+                # BAND of them and re-roll per draw: the theme still owns
+                # the subject, it no longer owns a single file.
                 try:
                     _hits = await speakbox_search(
                         str(_thm.get("text") or _thm.get("name") or ""),
-                        k=1)
-                    _tdoc = str((_hits or [{}])[0].get("file") or "")
+                        k=SPEAKBOX_THEME_BAND)
+                    _pool = [str(h.get("file") or "")
+                             for h in (_hits or []) if h.get("file")]
+                    if _pool:
+                        # Nearer the subject is likelier, but nothing is
+                        # certain: rank r weighs (n - r), so the best
+                        # match leads the band without owning it.
+                        _n = len(_pool)
+                        _tdoc = random.choices(
+                            _pool, weights=[_n - i for i in range(_n)],
+                            k=1)[0]
+                    else:
+                        _tdoc = ""
                 except Exception:  # noqa: BLE001
                     _tdoc = ""
             if _tdoc and _troll:
@@ -56271,6 +56678,12 @@ async def speakbox_quote(exclude: str = "", most: int = 9, cap: int = 0,
 # remark; he asked for the whole swath (#210), so a run of consecutive lines
 # goes in together and comes out across as many turns as it takes.
 SPEAKBOX_SWATH_MAX = 1100
+
+# 2026-09-10: how many DIFFERENT documents a theme with no chosen report
+# may draw from. One is a pin, not a draw - see the note in
+# speakbox_quote. speakbox_search hands back one swath per document, so
+# this is a count of documents, and the band is re-rolled every draw.
+SPEAKBOX_THEME_BAND = 12
 
 
 def speakbox_swath_lines(pool: list[str], most: int = 9,
@@ -59490,6 +59903,18 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
             return ""
         if time.time() - _SPOKE_AT[0] < 2.5:
             return ""
+        # 2026-09-09: AIR ALREADY SOLD IS NOT DEAD AIR. The run below sells
+        # up to forty-five seconds ahead on the page road, and a listener
+        # whose client has not acknowledged playout yet leaves
+        # talk_quiet_for() climbing the whole time - so the watchdog would
+        # come back every two seconds and lay another run on top of the one
+        # already sounding. The cursor is the truth: while it is in the
+        # future, somebody is talking.
+        try:
+            if float(_PAGE_AIR_UNTIL[0] or 0) - time.time() > 1.5:
+                return ""
+        except Exception:  # noqa: BLE001
+            pass
         rest = SFX_GAP_REST
         try:
             rest = max(rest, float(dj_settings().get("sfx_gap") or 0))
@@ -59518,7 +59943,9 @@ async def sfx_fill_gap(why: str = "", under_floor: bool = False) -> str:
         # on the floorless road, because it is a clip that already exists.
         # Only the liner still waits for the floor - a liner is written and
         # rendered, and would queue behind the round it is covering for.
-        went = await gold_fill_gap(why, floorless=floor_held)
+        went = await gold_fill_gap(
+            why, floorless=floor_held,
+            ahead=GOLD_RUN_AHEAD_HELD if floor_held else GOLD_RUN_AHEAD)
         if not went and drop_voice and not floor_held and _SFX_GAP["turn"] % 2 == 0:
             # A liner written and recorded for this voice earlier (#842):
             # the same road dj_sting's drop branch takes.
@@ -59950,6 +60377,25 @@ def gold_trim() -> None:
 
 
 GOLD_GAP_REST = 300.0                # ...five minutes when it is filling dead air
+# 2026-09-09: THE RUN. "I want the gold tinted material filling in the
+# dead air constantly, ensuring that there is never dead air." Measured
+# over 18 hours of the air log: the bank held 514 bars with their takes
+# on disk (67 minutes of finished rhymed audio, 282 of them never fired
+# once) and the filler still put out ONE bar per hole - 116 of its 134
+# fills were a single 6.8s median bar against holes of median 20.7s,
+# and 58 holes of ten seconds or more ended WITH an interject, which is
+# the filler arriving late and then stopping. A hole is now filled
+# until it is closed, not punctuated once.
+GOLD_RUN_MOST = 12                   # bars one run may lay
+GOLD_RUN_SECONDS = 180.0             # ...and the airtime it may sell
+GOLD_RUN_AHEAD = 45.0                # how far ahead a run keeps the air sold
+# ...but a shorter runway UNDER THE FLOOR. There the hole is a seam in a
+# round that is still coming, and every bar the run sells pushes that
+# round's next page further out - the air is never dead either way, and
+# twenty seconds is enough to cover a page join (median 20.7s) without
+# standing a conversation up for the better part of a minute. The run
+# simply fires again if the hole outlasts it.
+GOLD_RUN_AHEAD_HELD = 20.0
 
 
 def gold_pick(exclude_who: str = "", min_rest: float | None = None) -> dict[str, Any] | None:
@@ -60036,41 +60482,76 @@ def gold_harvest_entry(entry: Any, why: str = "") -> int:
         return 0
 
 
-async def gold_fill_gap(why: str = "", floorless: bool = False) -> str:
-    """A rhymed bar that already aired, with its own take, fills the air -
-    no model, no render. Returns "bar" when one went out.
+async def gold_fill_gap(why: str = "", floorless: bool = False,
+                        ahead: float = 0.0) -> str:
+    """Rhymed bars that already aired, with their own takes, fill the air -
+    no model, no render - and they keep coming until the hole is closed.
+    Returns "bar" when at least one went out.
 
-    2026-09-08 (the flow scan): with `floorless` the bar goes out on the
+    2026-09-08 (the flow scan): with `floorless` the bars go out on the
     same road a sting takes, without claiming the air floor. Under the
     hold a bar used to be skipped entirely - `dj_speak` would take the
     floor and queue behind the very round it was covering for - so while a
     round rendered (measured 6 to 78 seconds a line) the station had
     fifty-two minutes of finished rhymed audio on disk and was forbidden
-    to play any of it. That silence is 20% of all on-air time."""
-    try:
-        bar = gold_pick(min_rest=GOLD_GAP_REST)
-    except Exception:  # noqa: BLE001
-        bar = None
-    if not bar:
-        return ""
-    name = str(bar.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
-    if not name:
-        return ""
-    clip = {"path": f"/media/{name}", "sig": media_sign(name),
-            "seconds": float(bar.get("seconds") or 0)}
-    text = str(bar.get("text") or "")
-    _door = _dj_speak_floorless if floorless else dj_speak
-    try:
-        out = await _door("interject", None, line=text, who=str(bar.get("who") or "dj"),
-                          checked=True, sting=False, clip=clip)
-    except Exception as exc:  # noqa: BLE001
-        pipeline_log("air", f"a gold bar could not fill the air: {type(exc).__name__}: {exc}"[:160])
-        return ""
-    if not out:
-        return ""
-    gold_fired(bar)
-    pipeline_log("air", f"a gold bar fills the air ({why or 'dead air'}): {text[:70]}")
-    return "bar"
+    to play any of it. That silence is 20% of all on-air time.
+
+    2026-09-09: it lays a RUN. `ahead` is how many seconds of air the run
+    must leave sold in front of it (GOLD_RUN_AHEAD by default), bounded by
+    GOLD_RUN_MOST bars and GOLD_RUN_SECONDS of airtime so a wedged round
+    cannot hand the whole hour to the bank. Each bar butts against the
+    last - the seat alternates so a run does not read as one presenter
+    talking to himself - and the loop stands down the moment the station
+    pauses or goes off air. Nothing here renders or calls a model, so a
+    run costs the preparer nothing it needed."""
+    want = float(ahead) if ahead else GOLD_RUN_AHEAD
+    want = max(0.0, min(want, GOLD_RUN_SECONDS))
+    laid = 0.0
+    bars = 0
+    went = ""
+    last_who = ""
+    while bars < GOLD_RUN_MOST and laid < want:
+        # The FIRST bar is the caller's decision - sfx_fill_gap has already
+        # tested the air, and the sting road hands this the same permission.
+        # What is guarded here is the RUN: a pause landing mid-run must not
+        # keep selling bars into a room nobody is listening to (#1155's
+        # class - stock burned unheard).
+        if bars and (radio_paused() or not _RADIO.get("on")):
+            break
+        try:
+            bar = gold_pick(exclude_who=last_who, min_rest=GOLD_GAP_REST)
+        except Exception:  # noqa: BLE001
+            bar = None
+        if not bar:
+            break
+        name = str(bar.get("path") or "").rsplit("/", 1)[-1].split("?")[0]
+        if not name:
+            break
+        clip = {"path": f"/media/{name}", "sig": media_sign(name),
+                "seconds": float(bar.get("seconds") or 0)}
+        text = str(bar.get("text") or "")
+        _door = _dj_speak_floorless if floorless else dj_speak
+        try:
+            out = await _door("interject", None, line=text,
+                              who=str(bar.get("who") or "dj"),
+                              checked=True, sting=False, clip=clip)
+        except Exception as exc:  # noqa: BLE001
+            pipeline_log("air", "a gold bar could not fill the air: "
+                         f"{type(exc).__name__}: {exc}"[:160])
+            break
+        if not out:
+            break
+        gold_fired(bar)
+        went = "bar"
+        bars += 1
+        last_who = str(bar.get("who") or "")
+        laid += max(1.0, float(bar.get("seconds") or 0))
+        pipeline_log("air", f"a gold bar fills the air ({why or 'dead air'}"
+                            f"; bar {bars} of the run): {text[:70]}")
+    if bars > 1:
+        pipeline_log("air", f"the bank held the air for {laid:.0f}s across "
+                            f"{bars} rhymed bars - {why or 'dead air'}")
+    return went
 _PRINTS_LOCK = RLock()
 PRINTS_MAX = 8000     # #824: a disk bound — the WINDOW is 24h by age
 # How long a KEPT line waits before it may air again: an hour the first time,
@@ -65291,6 +65772,23 @@ def _fallback_call_script(caller_name: str, topic: str = "",
         "we're taking that detail back to the music.")
 
 
+# 2026-09-09: the deck draws were invisible. The operator asked to SEE the
+# scenario and rapport/disagreement roll, and nothing recorded it - the card
+# was drawn, spent on a prompt and forgotten, so the only evidence the deck
+# was weighted at all was the callers themselves.
+_PHONE_DRAWS: list[dict[str, Any]] = []
+
+
+def phone_draw_note(card: str, deck: list[tuple[str, int]], roll: float) -> None:
+    try:
+        _PHONE_DRAWS.append({"at": time.time(), "card": str(card or ""),
+                             "roll": round(float(roll), 3),
+                             "deck": [{"card": k, "weight": w} for k, w in deck]})
+        del _PHONE_DRAWS[:-40]
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def caller_behavior_draw() -> tuple[str, str]:
     """One card off the deck, by the operator's weights."""
     dj = dj_settings()
@@ -65301,10 +65799,13 @@ def caller_behavior_draw() -> tuple[str, str]:
     if total <= 0:
         return "plain", ""
     roll = random.uniform(0, total)
+    remaining = roll
     for key, weight in deck:
         roll -= weight
         if roll <= 0:
+            phone_draw_note(key, deck, remaining)
             return key, CALLER_BEHAVIORS[key]
+    phone_draw_note("plain", deck, remaining)
     return "plain", ""
 
 
@@ -66122,9 +66623,19 @@ def call_flow_report(script: Any, caller_name: str = "",
         _soft("the database topic is not carried by both caller and hosts")
     if not speakerbox_grade["ok"]:
         _soft("the selected Speakerbox source never enters the dialogue")
+    # 2026-09-10: ADVISORY ON A CALL THAT IS ALREADY RAPPED, for exactly the
+    # reason the richness legs above were softened - re-refusing a finished
+    # call at activation throws the whole thing away. A seed collision is a
+    # VARIETY concern, not a protocol violation: the caller still introduced
+    # themselves, was greeted, answered questions, resolved and was signed
+    # off. Measured in the review queue: 27 of 301 pending decisions were a
+    # fully written call refused because its Speakerbox passage had been used
+    # inside the 240-call lookback - about a day at the current quota - while
+    # the caller road was already failing 86% of its attempts and the
+    # schedule was missing 75 of 76 entries for want of one.
     if not speakerbox_novelty["ok"]:
-        faults.append("the selected Speakerbox source is already assigned "
-                      "to another call")
+        _soft("the selected Speakerbox source is already assigned "
+              "to another call")
     faults.extend(tint_grade.get("faults") or [])
     return {
         "ok": not faults, "turns": len(turns), "soft_faults": soft,
@@ -68327,12 +68838,6 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                 "source": str(row.get("source") or ""),
                 "voice": str(row.get("voice") or ""),
             })
-            _RADIO["chat"].append({
-                "ts": int(time.time()), "who": "host", "kind": "call",
-                "round": "caller", "repeat": True,
-                "text": f"On {line_say}: {name} - back on the line from "
-                        "earlier tonight (a re-air)"})
-            del _RADIO["chat"][:-240]
             intro = random.choice(CALL_RERUN_INTROS).format(
                 name=name, premise=premise or "something")
             try:
@@ -68384,6 +68889,25 @@ async def call_rerun_take(track: dict[str, Any] | None = None) -> list[str]:
                                  rows=rows, length=length)
                     except Exception:  # noqa: BLE001
                         pass
+            # 2026-09-09: THE ANNOUNCE GOES OUT WITH THE CALL, not before
+            # it. This block used to run immediately after the floor was
+            # taken, so every re-air that then failed to reach the page or
+            # the box left a booth row promising a caller who never spoke -
+            # measured at 29 of 66 reconstructed calls being exactly that
+            # one orphan line. The room hears about a re-air when the re-air
+            # is provably on its way, and a failure is written down as a
+            # failure instead of as a call.
+            if not (page_delivery or box_played):
+                pipeline_log("drop", f"{name}'s re-air was not delivered - "
+                             "the room is not told about a call that is not "
+                             "coming")
+            else:
+                _RADIO["chat"].append({
+                    "ts": int(time.time()), "who": "host", "kind": "call",
+                    "round": "caller", "repeat": True,
+                    "text": f"On {line_say}: {name} - back on the line from "
+                            "earlier tonight (a re-air)"})
+                del _RADIO["chat"][:-240]
             for r in rows:
                 try:
                     _entry = {
@@ -70335,6 +70859,24 @@ async def dj_call_generated(caller: dict[str, Any] | None = None,
         "case_id": str(call_case.get("id") or ""),
         "case": str(call_case.get("title") or ""),
         "source": str((seed or {}).get("file") or ""),
+        # 2026-09-09: WHICH PASSAGES ACTUALLY SEEDED THIS CALL. Every call is
+        # drawn off the speakbox - a fresh semantic swath (#584) for all of
+        # them, a second passage on the insanity dial for about half, a third
+        # when the call turns hostile - and none of that was written down, so
+        # a review of the scripts could only see the calls that happened to
+        # stamp `source` on a row. Reading a call back should show what it
+        # was made of.
+        "seeds": [row for row in (
+            {"as": "the caller's fresh angle",
+             "file": str((diverse or {}).get("file") or ""),
+             "text": str((diverse or {}).get("text") or "")[:300]},
+            {"as": "the speakbox as their operating logic",
+             "file": str((madness or {}).get("file") or ""),
+             "text": str((madness or {}).get("text") or "")[:300]},
+            {"as": "what defuses it when it turns",
+             "file": str((defuse or {}).get("file") or ""),
+             "text": str((defuse or {}).get("text") or "")[:300]},
+        ) if row["text"]],
         # The contract grader follows this exact source from the caller's
         # turn into the hosts' response. Keep it separate from the semantic
         # opening seed above.
@@ -71034,7 +71576,13 @@ def make_hangup() -> Path | None:
 # them. They did: the booth measured each clip on disk, tail and all.
 CONCAT_TAIL = 0.9                     # the welded tail every clip carries in
 CONCAT_KEEP = 0.06                    # what survives the trim
-CONCAT_BEAT = (0.14, 0.33)            # the varied beat glued on instead
+# 2026-09-09: "voices coming out like a rap song streaming back to back."
+# The beat was 140-330 ms; with the 60 ms of surviving tail that is 200-390
+# ms of silence after every single utterance, which at the measured eight to
+# eleven turns a round is three to four seconds of nothing inside every
+# round. Halved. It is still VARIED - a room, not a metronome (#769) - and
+# still non-zero, so two speakers cannot clip each other's last syllable.
+CONCAT_BEAT = (0.07, 0.18)            # the varied beat glued on instead
 
 
 def concat_beats(count: int) -> list[float]:
@@ -72220,11 +72768,6 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
                 _est_secs += float(_pc.get("seconds")
                                    or (len(str(_item.get("chunk") or ""))
                                        / 14.0))
-            if _all_hit and _est_secs <= 150.0:
-                spans = [(0, len(playlist))]
-            elif _all_hit:
-                spans = [(_i, min(len(playlist), _i + 8))
-                         for _i in range(0, len(playlist), 8)]
             # 2026-09-08 (the calls scan): A PHONE CALL IS NEVER PAGED.
             #
             # "I dont like hearing the customers just vaporized." Measured
@@ -72241,8 +72784,24 @@ async def _speak_turns_floorless(turns: list[tuple[str, str]],
             # A call therefore waits for all of its audio and then airs as
             # one piece. The wait is paid OFF AIR, where the gap roads cover
             # it; the alternative is paying it mid-conversation.
-            elif caller_name:
+            #
+            # 2026-09-09: AND THE TEST GOES FIRST. It was written as the
+            # last `elif` of a chain whose first two arms fire on
+            # `_all_hit`, so it was unreachable for exactly the call it
+            # was written for: a FULLY BANKED one longer than 150s took
+            # the `elif _all_hit` arm and was paged in eights - the road
+            # the paragraph above forbids. Measured over 18 hours of the
+            # gap log: 136 page-join holes, median 20.7s, with ZERO live
+            # takes inside them (every clip was already on the shelf), and
+            # 111 of the 136 were caller rounds. The joins were not TTS;
+            # they were the ladder itself.
+            if caller_name:
                 spans = [(0, len(playlist))]
+            elif _all_hit and _est_secs <= 150.0:
+                spans = [(0, len(playlist))]
+            elif _all_hit:
+                spans = [(_i, min(len(playlist), _i + 8))
+                         for _i in range(0, len(playlist), 8)]
         except Exception:  # noqa: BLE001
             pass
         if ready_takes is not None:
@@ -74637,13 +75196,52 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # themselves, and rewording them is exactly "not hearing enough
     # speakerbox rhetoric".
     _verbatim: list[list[str]] = []
+    # 2026-09-10: the passages as DEALT - [where, marker, said] - so the
+    # booth, the director's room and the blend all see which seat each
+    # piece of a drawn passage actually went to. See _swath_deal.
+    _dealt: list[list[str]] = []
+    _spread_on = bool(_sb.get("speakbox_seat_spread", True))
+    _tint_passages = bool(_sb.get("speakbox_tint_passages", True))
+
+    def _place(text: str, where: str, lead: str = "") -> str:
+        """Put one drawn passage into the script as TURNS, not a turn.
+
+        Returns the block of script to splice. Registers each piece in
+        `_dealt` always, and in `_verbatim` only while the operator has
+        the tint held OFF the passages - `_verbatim` is what exempts a
+        passage from the crystal (_tint_plain_passage) and from the
+        blend's rewrite, and "tint all of it per the crystal" is the
+        instruction that retires that exemption by default."""
+        said = str(text or "").strip()
+        if not said:
+            return ""
+        if not _spread_on:
+            rows = [["A", said]]
+        else:
+            rows = _swath_deal(said, _swath_seats(script, caller_name),
+                               lead=lead)
+        if not rows:
+            return ""
+        for marker, piece in rows:
+            _dealt.append([where, marker, piece])
+            if not _tint_passages:
+                _verbatim.append([where, piece])
+        return "".join("%s: %s\n" % (m, p) for m, p in rows)
     # #862: the seed the model dropped and #404 put back is the operator's
     # own document too - and under a crystal it is the tinted draw (#834),
     # so leaving it off this list meant the ONE passage the rewrite could
     # paraphrase away was the crystal's. It goes in at the head, which is
     # where #404 put it, so _restore() puts it back in the same place.
     if _seed_forced and _seed_put.strip():
-        _verbatim.append(["head", _seed_put.strip()])
+        # 2026-09-10: `_verbatim` is the TINT EXEMPTION as much as it is
+        # the rewrite guard (_tint_plain_passage), so registering a
+        # passage here is what stops the crystal reaching it. Under
+        # "tint all of it per the crystal" the passage is still
+        # protected from being reworded away by freshen_script - that is
+        # `_dealt` - but it is no longer held out of the tint.
+        _dealt.append(["head", "A", _seed_put.strip()])
+        if not _tint_passages:
+            _verbatim.append(["head", _seed_put.strip()])
     full_swath: dict[str, Any] = {}
     if (not _system2_job and not caller_name and not own_material and random.random() < float(
             _sb.get("speakbox_full_swath_rate") or 0)):
@@ -74660,13 +75258,20 @@ async def dj_banter(track: dict[str, Any] | None = None,
         if full_swath.get("text"):
             # 2026-09-08 (the scan): a punctuated reading stays whole; a raw
             # run-on (no sentence in it) is bounded like the other doors.
-            _full_text = _verbatim_turn_text(full_swath["text"])
-            script = f"A: {_full_text}\n" + script.lstrip()
-            lines += 1
-            speakbox_remember(full_swath)
-            _verbatim.append(["head", _full_text])  # #838
-            pipeline_log("speakbox", "full uninterrupted swath scheduled "
-                         f"({len(_full_text)} chars)")
+            # 2026-09-10: NOT bounded to 240 characters and thrown away
+            # any more - _verbatim_turn_text TRUNCATED a raw run-on, so a
+            # 3,000-character draw aired as 240 characters of itself and
+            # the rest of the operator's document was discarded. It is
+            # dealt across the seats instead, whole.
+            _full_text = " ".join(str(full_swath["text"]).split())
+            _block = _place(_full_text, "head")
+            if _block:
+                script = _block + script.lstrip()
+                _turns = _block.count("\n")
+                lines += _turns
+                speakbox_remember(full_swath)
+                pipeline_log("speakbox", "full swath dealt across the room "
+                             f"({len(_full_text)} chars, {_turns} turns)")
     # #609/#612: PRE-PEND a fresh verbatim swath to the FRONT of the round (an
     # extra opening quote, on top of any seed) and APPEND one to the END, each
     # on its own slider so the pair trade the operator's documents verbatim more
@@ -74691,11 +75296,12 @@ async def dj_banter(track: dict[str, Any] | None = None,
             _sb.get("speakbox_prepend_rate") or 0) + _lift):
         head = await _fresh_swath()
         if head.get("text"):
-            _head_text = _verbatim_turn_text(head["text"])      # 2026-09-08: bounded when raw
-            script = f"A: {_head_text}\n" + script.lstrip()
-            lines += 1
-            speakbox_remember(head)
-            _verbatim.append(["head", _head_text])              # #838
+            _head_text = " ".join(str(head["text"]).split())
+            _block = _place(_head_text, "head")
+            if _block:
+                script = _block + script.lstrip()
+                lines += _block.count("\n")
+                speakbox_remember(head)
     tail: dict[str, Any] = {}
     if not _system2_job and not caller_name and not own_material and random.random() < min(1.0, float(   # #867
             _sb.get("speakbox_append_rate") or 0) + _lift):
@@ -74704,13 +75310,14 @@ async def dj_banter(track: dict[str, Any] | None = None,
             # #786: terminal punctuation, or the #168 truncation gate reads
             # a verbatim un-punctuated swath as token exhaustion and deletes
             # the operator's own material off the end of the round.
-            _tail_text = _verbatim_turn_text(tail["text"]).rstrip()   # 2026-09-08: bounded when raw
+            _tail_text = " ".join(str(tail["text"]).split()).rstrip()
             if not re.search(r"[.!?…—»\"')\]]$", _tail_text):
                 _tail_text += "."
-            script = script.rstrip() + f"\nA: {_tail_text}"
-            lines += 1                       # room for the appended quote
-            speakbox_remember(tail)
-            _verbatim.append(["tail", _tail_text])               # #838
+            _block = _place(_tail_text, "tail")
+            if _block:
+                script = script.rstrip() + "\n" + _block.rstrip()
+                lines += _block.count("\n")
+                speakbox_remember(tail)
     # #844: THE SLIDER IS A GUARANTEE AT THE TOP OF ITS RANGE. Every
     # speakbox control was a probability on the DRAW, and nothing ever
     # checked that the model used what it was handed — so at 100% the
@@ -74735,7 +75342,9 @@ async def dj_banter(track: dict[str, Any] | None = None,
                     _put += "."
                 script = script.rstrip() + f"\nB: {_put}"
                 lines += 1
-                _verbatim.append(["enforced", _put])            # #838
+                _dealt.append(["enforced", "B", _put])
+                if not _tint_passages:
+                    _verbatim.append(["enforced", _put])        # #838
                 speakbox_remember(seed)
                 pipeline_log("speakbox", "grounding is at the top of the "
                              "slider and the round came back without the "
@@ -74754,7 +75363,8 @@ async def dj_banter(track: dict[str, Any] | None = None,
         for _one in ([str((seed or {}).get("text") or ""),
                       str((comeback or {}).get("text") or ""),
                       str((jab or {}).get("text") or "")]
-                     + [str(_row[1]) for _row in _verbatim]):
+                     + [str(_row[1]) for _row in _verbatim]
+                     + [str(_row[2]) for _row in _dealt]):
             for _quoted in _QUOTED_TITLE.findall(_one):
                 _quoted = str(_quoted).strip()
                 if _quoted and _quoted not in vouched:
@@ -74771,10 +75381,28 @@ async def dj_banter(track: dict[str, Any] | None = None,
     # #842 says a pre-recorded round has no clock on it, so the air path
     # never waits on this, and blend_script returns the round untouched on
     # any doubt at all.
-    if bank and not _system2_job and not caller_name and _verbatim:
+    # 2026-09-10: THE PASS THAT MAKES THE ROOM ANSWER, ACTUALLY REACHED.
+    #
+    # This gate read `bank and not _system2_job and not caller_name`, and
+    # System2 became the DEFAULT engine at #1070 - so from that day the one
+    # stage that exists to make the pair react to a stapled passage was
+    # unreachable on the station's main road, and callers never had it at
+    # all. That is the "I am not hearing the hosts conversate" report: not
+    # a missing feature, a feature nothing could call. (The same shape as
+    # the orchestrator's dead wiring - ask whether a desk is REACHED
+    # before reading its logic.)
+    #
+    # A System2 job is prepared ahead of its slot exactly as a banked round
+    # is, so it has no clock on it either and #842's argument covers it
+    # unchanged. The LIVE path is still never blended: `_prepared` below is
+    # the whole test, and a round being written against the air keeps going
+    # straight out.
+    _prepared = bool(bank) or bool(_system2_job)
+    if _prepared and _dealt:
         try:
-            _blended = await blend_script(script, _verbatim, caller_name,
-                                          bank)                   # #1027
+            _blended = await blend_script(script,
+                                          [[r[0], r[2]] for r in _dealt],
+                                          caller_name, _prepared)  # #1027
             if _blended and _blended != script:
                 script = _blended
                 # The blend may answer a passage with a turn of its own,
@@ -74784,6 +75412,43 @@ async def dj_banter(track: dict[str, Any] | None = None,
                 _bt = len(banter_turns(script, caller_name))
                 if _bt > lines:
                     lines = min(_bt, lines + 6)
+        except Exception:  # noqa: BLE001
+            pass                        # the assembled round stands
+    # 2026-09-10: RE-SEED IF THEY LOSE THE PATH.
+    #
+    # "...while seeding more speakerbox if they lose the path". A long
+    # round wanders: the blend answers the passage at the top and by the
+    # last few turns the pair are talking about the studio furniture
+    # again. So ask the cheap question - do the closing turns still carry
+    # a specific word out of anything that was placed? - and when they do
+    # not, put fresh material in their mouths rather than letting the
+    # round run out on nothing. One extra draw at most, prepared roads
+    # only, and any fault at all leaves the round exactly as it was.
+    if _prepared and _dealt and not own_material:
+        try:
+            _now_turns = banter_turns(script, caller_name)
+            if len(_now_turns) >= 6:
+                _placed_words: set[str] = set()
+                for _row in _dealt:
+                    _placed_words |= _swath_words(_row[2])
+                _closing = _swath_words(
+                    " ".join(str(t) for _m, t in _now_turns[-3:]))
+                if _placed_words and not (_placed_words & _closing):
+                    _again = await _fresh_swath()
+                    if _again.get("text"):
+                        _again_text = " ".join(
+                            str(_again["text"]).split())
+                        _block = _place(_again_text, "reseed")
+                        if _block:
+                            script = script.rstrip() + "\n" + _block.rstrip()
+                            lines += _block.count("\n")
+                            speakbox_remember(_again)
+                            pipeline_log(
+                                "speakbox",
+                                "the round drifted off the material it was "
+                                "seeded with - fresh documents put in "
+                                f"before the end ({_again.get('file')}, "
+                                f"{_block.count(chr(10))} turns)")
         except Exception:  # noqa: BLE001
             pass                        # the assembled round stands
     entry = {
@@ -74799,6 +75464,10 @@ async def dj_banter(track: dict[str, Any] | None = None,
         # #838: the passages the rewrite may not touch, carried with the
         # round so the larder road protects them too.
         "verbatim": _verbatim,
+        # 2026-09-10: every piece of every drawn passage and the seat it
+        # went to, so the booth and the director's room can show the
+        # material as it was actually dealt rather than as it was drawn.
+        "dealt": _dealt,
         "swaths": [s for s in (seed, comeback, jab, tail) if s],
         "seek_verdict": seek_verdict,
         "caller_name": caller_name, "caller_voice": caller_voice,
@@ -83780,6 +84449,71 @@ def tint_should_stop(critical: bool = False) -> str:
     return tint_pressure()                                       # #1045
 
 
+CRYSTAL_REVISION_MODES = ("off", "deep", "all")
+
+
+def crystal_revision_mode() -> str:
+    """2026-09-09: where the operator's one revision pass is allowed to run.
+
+    "deep" (the default) is the banked roads only - the ones tint_model_for
+    already spends the deep model on. "all" is every road; "off" is nothing.
+    An unreadable setting reads as the default rather than as "all", because
+    the expensive answer must never be the one a broken settings file gives."""
+    try:
+        want = str(dj_settings().get("crystal_revision",
+                                     DEFAULT_DJ["crystal_revision"]) or "").strip().lower()
+        return want if want in CRYSTAL_REVISION_MODES else DEFAULT_DJ["crystal_revision"]
+    except Exception:  # noqa: BLE001
+        return DEFAULT_DJ["crystal_revision"]
+
+
+def crystal_revision_skip(kind: str = "") -> str:
+    """Why the one revision pass stands down, in words, or "" to run it.
+
+    #1063/#1064's standing rule is that the tint yields to the air. A
+    revision yields harder than the tint does, and the reason is that it is
+    the only ask on this lane whose refusal costs the show NOTHING: the bar
+    it would improve has already passed the grader and is ready to record.
+    So it takes the same three tests tint_recovery_step takes - fresh rounds
+    first, the operator's interjection, the depth of the tint lane - and it
+    defers to a single waiter where legacy repair waits for two.
+
+    The budget is asked here directly rather than through tint_pressure(),
+    which exempts the hold on the #1064 grounds that "under the hold the
+    rewrite IS the show". A polish of an accepted bar is never the show, so
+    it pays for its own model time whether the hold is on or not."""
+    mode = crystal_revision_mode()
+    if mode == "off":
+        return "the revision pass is off (crystal_revision)"
+    if mode != "all" and str(kind or "") not in TINT_DEEP_ROADS:
+        return ("the revision pass runs on the deep roads only; "
+                + (str(kind) or "this road") + " is not one")
+    try:
+        if tint_budget_left() <= 0:
+            return (f"the rewrite has spent its {int(tint_budget())}s share "
+                    "of the hour, and a polish does not get the reserve")
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if prepared_seconds() < TINT_FAMINE_SECONDS and _LARDER_WRITING[0]:
+            return "fresh rounds first - the reserve is empty and the desk is writing"
+    except Exception:  # noqa: BLE001
+        pass
+    stopped = tint_should_stop()
+    if stopped:
+        return stopped
+    try:
+        waiting = sum(1 for job in (writing_room_state().get("jobs") or [])
+                      if job.get("state") == "waiting"
+                      and "tint" in str(job.get("purpose") or ""))
+        if waiting:
+            return (f"the tint lane has {waiting} waiting - the accepted bar "
+                    "goes out as it is")
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def crystal_force() -> float:
     """#1053: how hard the tint should push, 0..1, from the STRENGTH of the
     strongest crystal on air.
@@ -84784,6 +85518,159 @@ def _verbatim_turn_text(text: Any, most: int = _TRANSCRIPT_TURN_MOST) -> str:
     cut = said[:most]
     cut = cut[:cut.rfind(" ")] if " " in cut else cut
     return cut.rstrip(" ,;:-") + "."
+
+
+# --- 2026-09-10: THE SEED IS THE FOUNDATION, NOT THE WHOLE SEGMENT -------
+#
+# "So speakerbox seeding (to me) is seeding the foundation of the
+#  conversation and then generating the responses based on that while
+#  seeding more speakerbox if they lose the path and then tint all of it
+#  per the crystal."
+#
+# WHAT WAS ACTUALLY WRONG, measured on the live station before this:
+#
+#   * EVERY PASSAGE WENT INTO ONE MOUTH. The three swath doors - the full
+#     reading (45%), the opening passage (86%) and the closing one (68%) -
+#     each wrote their draw into the script as a single turn labelled
+#     "A:", and _who_of("A") is the DJ. Three doors, one seat. Measured
+#     over six hours of air: the Host held 81.9% of the airtime (106.6 of
+#     130.2 minutes) against the co-host's 4.4%, in 247 turns averaging
+#     twenty-six seconds each. That is the "the hosts don't conversate"
+#     and the "host is just monologuing" report, and it is arithmetic,
+#     not temperament.
+#   * A PASSAGE NOBODY COULD ANSWER. Each draw went in as ONE turn of up
+#     to 3,000 characters (speakbox_full_swath_chars), placed AFTER the
+#     model had written its exchange, so no turn in the round had ever
+#     seen it. blend_script (#862) exists to fix exactly this and was
+#     gated `bank and not _system2_job and not caller_name` - and System2
+#     has been the default engine since #1070, so the one pass that made
+#     the room react had been unreachable on the main road ever since.
+#   * AND IT COULD NOT BE TINTED. _tint_plain_passage reads a verbatim
+#     passage of 300+ characters, or a raw transcript run-on, as unrhymable
+#     and exempts it from the crystal - correctly, for a 3,000-character
+#     block. So the longer the passage the more certainly it aired plain.
+#
+# Splitting the draw answers all three at once: a passage dealt across the
+# seats in spoken-length turns is a conversation rather than a reading, it
+# is short enough per turn for the crystal to carry, and the room can
+# answer it because it arrives as turns like any other.
+#
+# The operator's sliders are untouched: they still govern HOW MUCH of the
+# documents airs. This governs how it is DEALT once drawn.
+
+# Below _PLAIN_PASSAGE_CHARS (300), so a dealt turn is tintable by
+# construction rather than by luck.
+SPEAKBOX_TURN_CHARS = 260
+# A drawn passage is never dealt into more than this many turns - a 3,000
+# character reading is a segment, not a round, and the rest of the hour
+# still has to happen.
+SPEAKBOX_TURN_MOST = 8
+_SPEAKBOX_SENTENCE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _swath_pieces(text: Any, most: int = SPEAKBOX_TURN_CHARS) -> list[str]:
+    """One drawn passage, cut into spoken-length pieces.
+
+    Sentence boundaries where the document has them; word boundaries where
+    it does not, because a machine transcript arrives as one run and
+    cutting it mid-word is how the shelf filled with stubs (_gem_is_stub).
+    Nothing is discarded - _verbatim_turn_text used to TRUNCATE a run-on
+    to 240 characters and throw the remainder away, so a 3,000-character
+    draw aired as 240 characters of itself."""
+    said = " ".join(str(text or "").split())
+    if not said:
+        return []
+    if len(said) <= most:
+        return [said]
+    out: list[str] = []
+    buf = ""
+    for part in _SPEAKBOX_SENTENCE.split(said):
+        part = part.strip()
+        if not part:
+            continue
+        if len(part) > most:
+            # A run-on with no sentence end in it. Break on words.
+            if buf:
+                out.append(buf)
+                buf = ""
+            words = part.split()
+            line = ""
+            for word in words:
+                if line and len(line) + 1 + len(word) > most:
+                    out.append(line)
+                    line = word
+                else:
+                    line = f"{line} {word}".strip()
+            if line:
+                buf = line
+            continue
+        if buf and len(buf) + 1 + len(part) > most:
+            out.append(buf)
+            buf = part
+        else:
+            buf = f"{buf} {part}".strip()
+    if buf:
+        out.append(buf)
+    return [p for p in out if p]
+
+
+_SWATH_STOP = frozenset((
+    "about", "after", "again", "another", "because", "before", "being",
+    "could", "every", "first", "going", "gonna", "ković", "might", "never",
+    "other", "right", "should", "something", "still", "their", "there",
+    "these", "thing", "think", "those", "through", "under", "until",
+    "where", "which", "while", "would", "years", "yeah"))
+
+
+def _swath_words(text: Any) -> set[str]:
+    """The content words of a passage, for asking whether a turn picked it
+    up. Five letters or more and not a common connective - a proxy for
+    'a specific word or image out of it' that costs no model call, which
+    is the point: this runs on every prepared round."""
+    flat = re.sub(r"[^a-z0-9 ]+", " ", str(text or "").lower())
+    return {w for w in flat.split()
+            if len(w) >= 5 and w not in _SWATH_STOP}
+
+
+def _swath_seats(script: str, caller_name: str = "") -> list[str]:
+    """Which seats this round can actually deal a passage into.
+
+    Read off the script that was just written rather than assumed, so a
+    passage is never put in a chair the round has no voice for - #1034's
+    lesson (`seat_reseat`, never the empty chair) applied at the door
+    instead of after it. A and B always exist; C only on a call."""
+    seats = ["A", "B"]
+    try:
+        for marker, _said in banter_turns(str(script or ""), caller_name):
+            one = str(marker or "").strip().upper()[:1]
+            if one in ("C", "D", "E") and one not in seats:
+                seats.append(one)
+    except Exception:  # noqa: BLE001
+        pass
+    return seats
+
+
+def _swath_deal(text: Any, seats: list[str] | None = None,
+                lead: str = "") -> list[list[str]]:
+    """Deal one passage across the seats as [marker, said] rows.
+
+    The lead seat is rotated per draw rather than fixed, because three
+    doors all opening on "A:" is what put 82% of the airtime in one
+    mouth. Consecutive pieces never share a seat: the point is that the
+    room is heard passing the material round."""
+    pieces = _swath_pieces(text)[:SPEAKBOX_TURN_MOST]
+    if not pieces:
+        return []
+    pool = [s for s in (seats or ["A", "B"]) if s] or ["A", "B"]
+    if lead and lead in pool:
+        at = pool.index(lead)
+    else:
+        at = random.randrange(len(pool))
+    rows: list[list[str]] = []
+    for piece in pieces:
+        rows.append([pool[at % len(pool)], piece])
+        at += 1
+    return rows
 
 
 def tint_evaluate(source: Any, candidate: Any,
@@ -85813,8 +86700,19 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
     tint_seen("offered")                  # #1053
     _force = crystal_force()
     try:
-        _lo = 1.5 + 0.5 * _force
-        _hi = 2.5 + 0.9 * _force
+        # 2026-09-09: "they are permitted to have the sentences and rhymes be
+        # as long as they need to in order to say the speaker box content and
+        # the rhymes that we are constructing from the crystal tinting." This
+        # pair is the only place a LENGTH is ever stated to the writer - it
+        # becomes "Output budget: at most N characters" in the prompt and, at
+        # limit // 2 + 64, the token budget behind it. At 2.0-3.4x a bar had
+        # to choose between carrying every fact of its source and building the
+        # chain priority 6 asks for; it cannot do both in that room. Now
+        # 3.5-6.0x at full strength. It stays a range, and it stays bounded:
+        # an unbounded budget is not permission, it is a rambling turn nobody
+        # asked for, and every second of it is rendered at 2.97 + 1.05x.
+        _lo = 2.5 + 1.0 * _force
+        _hi = 4.0 + 2.0 * _force
         _room = random.uniform(_lo, _hi)
     except WritingDeferred:
         raise
@@ -86110,6 +87008,104 @@ async def crystal_turn(text: str, world: str, chunks: list[dict[str, Any]],
             raise
         except Exception:  # noqa: BLE001
             return failed()
+    # 2026-09-09 (the operator's ask): ONE self-edit of the accepted bar,
+    # asking for unexpected phrasing where the rhyme came out predictable
+    # and for the specific word where a generic one is standing in. Hard
+    # capped at one ask - there is no loop here and there is no second try -
+    # and skipped entirely whenever the air has anything better to do with
+    # the lane.
+    _revision = {"ran": False, "kept": False, "why": crystal_revision_skip(kind),
+                 "mode": crystal_revision_mode()}
+    if _revision["why"]:
+        _tint_flow("revision", "skipped", "The one revision pass stood down",
+                   {"source": said, "candidate": out,
+                    "why": _revision["why"]}, trace_id, "tint_judge")
+    else:
+        _accepted, _accepted_report = out, evaluation
+        # The learning ledger measures whether a prompt gets a line PASSED,
+        # and this ask starts from a line that already passed, so its
+        # outcome is not comparable with a first attempt or a repair and is
+        # deliberately never noted. That also settles the identity the turn
+        # carries out: the attempt the ledger knows is the accepted bar's.
+        _accepted_generation = _learning_generation
+        try:
+            _tint_flow("revision", "started",
+                       "Revising an accepted bar once for unexpected phrasing",
+                       {"source": said, "candidate": out,
+                        "advisory": evaluation.get("advisory")}, trace_id, "tint_judge")
+            # #1082's strike ladder counts the model answers that did not
+            # advance a round's accepted coverage, and strikes the round out
+            # at twelve. A revision cannot advance coverage - the turn it
+            # edits is already counted - so charging it there would strike
+            # rounds out for having been polished. It still pays for its own
+            # wall clock out of the crystal's share of the hour.
+            _retry_token = _TINT_REPAIR_RESPONSES.set(None)
+            try:
+                revised = await write(
+                    crystal_prompt_revision(
+                        said, out, world, chunks, _force, kind, answering=answering,
+                        contract=_contract, operator_instruction=_lab_refinement,
+                        evaluation=evaluation, lesson=lesson)
+                    + f"\nOutput budget: at most {_may + 120} characters.",
+                    learning_stage="revision", limit=_may + 120, spice=0.55,
+                    model=(model or tint_model_for(kind)),
+                    mark={"kind": "tint turn", "for": "one revision of a bar the "
+                          "evaluator has already accepted"})
+            finally:
+                _TINT_REPAIR_RESPONSES.reset(_retry_token)
+            revised = _tint_out_clean(revised)
+            for lead in ("A:", "B:", "C:", "D:", "E:"):
+                if revised.startswith(lead):
+                    revised = revised[len(lead):].strip()
+            if _looks_meta(revised) or len(revised) > _cap:
+                revised = ""
+            _revised_report = (
+                tint_evaluate(said, revised, chunks, answering, _force, kind)
+                if revised else
+                {"ok": False, "technical": True,
+                 "faults": ["the revision returned no usable text"]})
+            # THE ACCEPTED BAR WINS EVERY TIE. A revision that fails the same
+            # grade, hands the bar straight back, or comes back unusable is
+            # dropped in silence - no review cut is filed for it, because a
+            # cut would put a fault in the operator's queue against a turn
+            # that never had one and is about to air.
+            _kept = bool(revised and _revised_report.get("ok")
+                         and " ".join(revised.split()).lower()
+                         != " ".join(_accepted.split()).lower())
+            if _kept:
+                out, evaluation = revised, _revised_report
+            _learning_generation = _accepted_generation
+            _revision.update(ran=True, kept=_kept, accepted=_accepted[:400],
+                revised=revised[:400],
+                why=("" if _kept else "; ".join(_revised_report.get("faults")
+                     or ["the revision did not change the bar"])[:220]))
+            _tint_flow("revision", "passed" if _kept else "failed",
+                       "Revision kept" if _kept else
+                       "Revision discarded; the accepted bar stands",
+                       {"source": said, "accepted": _accepted, "revision": revised,
+                        "evaluation": _revised_report}, trace_id, "revision")
+            if _kept:
+                pipeline_log("crystal", "a bar was revised once for unexpected "
+                             "phrasing and kept: " + revised[:180])
+        except WritingDeferred:
+            # The lane filled while this was queued. This one ask does NOT
+            # propagate the deferral the way the first pass does: the bar in
+            # hand is already broadcastable, so it goes out rather than
+            # sending the whole turn back to be written again later.
+            out, evaluation, _learning_generation = (
+                _accepted, _accepted_report, _accepted_generation)
+            _revision.update(ran=False, why="the tint writer is fully admitted")
+            _tint_flow("revision", "skipped",
+                       "The revision was deferred at the lane; the accepted bar stands",
+                       {"source": said, "candidate": out}, trace_id, "tint_judge")
+        except Exception:  # noqa: BLE001
+            out, evaluation, _learning_generation = (
+                _accepted, _accepted_report, _accepted_generation)
+            _revision.update(ran=False, why="the revision ask failed")
+            _tint_flow("revision", "failed",
+                       "The revision ask failed; the accepted bar stands",
+                       {"source": said, "candidate": out}, trace_id, "tint_judge")
+    evaluation = {**evaluation, "revision": _revision}
     _tint_output_note(out, evaluation)
     tint_seen("round")                    # #1053/#1064: a whole round
     return CrystalTurnText(out, _learning_generation.learning_ticket().get("attempt_id")
@@ -86361,7 +87357,29 @@ async def crystal_line(text: str, why: str = "", room: int = 6,
 # tests/test_crystal_batch_fairness.py (the group ceiling is part of the
 # fairness contract), so it stays; the cheaper first pass is a decision
 # for the operator, noted in docs/cupboard-fill-rate-2026-09-08.md.
-CRYSTAL_GROUP_OUTPUT_CHARS = 1800
+# 2026-09-09: 1800 bought TWO BARS per model visit, and that is the volume
+# ceiling on the whole station. Measured over six hours of the call log:
+# 962 "tint round" visits carried a median 7,026-token brief and emitted a
+# median 100 tokens; 938 "tint turn" visits carried 4,731 tokens and emitted
+# 26 - one bar, at a hundred and eighty-two to one. Together 1,900 visits
+# burned 13.3 MILLION prompt tokens to produce 131,000 tokens of rhyme, and
+# the pipeline ran at 144% of one slot with 288% of it QUEUEING. The queue
+# is the dead air.
+#
+# The brief is the cost and it is the same brief every time, so the fix is
+# to spend it over more bars: against the measured ~609-char estimate per
+# turn this carries SIX turns a visit instead of two - three times fewer
+# visits for the same round. The operator's reply_max_chars (6500) still
+# bounds it - min(ceiling, this) - so a tighter reply budget still wins,
+# and budget_plan's own expansion estimate still decides when a turn is too
+# big to batch at all.
+#
+# 4200 rather than the 5400 the arithmetic alone would pick: past about
+# 5000 a twenty-turn round of short turns fits a SINGLE visit, and the
+# batch-fairness and deferred-resume contracts are all written on a round
+# that spans more than one group. The last 20% of the win is not worth
+# retiring the scenario that proves later turns are never starved.
+CRYSTAL_GROUP_OUTPUT_CHARS = 4200
 
 
 async def _crystal_round_first_pass(text: str, turns: list[tuple[str, str]],
@@ -89815,6 +90833,10 @@ async def radio_clock_api(
         "playing": bool(track) and not radio_paused(),
         "paused": radio_paused(),
         "id": tid,
+        # 2026-09-09: ONE DESTINATION, and the clock is where every player
+        # in the house learns it. False means the box is carrying the
+        # record and this page must not play it as well.
+        "music_here": page_carries_music(),
         "title": str(track.get("title") or ""),
         "seconds": float(track.get("seconds") or 0),
         "url": f"{root}/{tid}?t={media_sign(tid)}" if tid else "",
@@ -90070,6 +91092,7 @@ async def music_box_stop_now() -> None:
                 f"{HA_URL}/api/services/media_player/media_stop",
                 headers={"Authorization": f"Bearer {token}"},
                 json={"entity_id": NABU_MEDIA_PLAYER})
+        _NABU_MUSIC_ON.update(ok=False, track="", at=time.time())
         pipeline_log("air", "music routed off the box — box media "
                      "stopped immediately (#818)")
     except Exception:  # noqa: BLE001
@@ -90230,6 +91253,29 @@ async def dj_output_api(
         music = "box" if music == "nabu" else music
         voice = "box" if voice == "nabu" else voice
         reply = "box" if reply == "nabu" else reply
+
+    # 2026-09-09: ONE BROADCAST, ONE DESTINATION.
+    #
+    # #1118 gave the VOICE this rule and said exactly why: "'both' used to
+    # mean SIMULTANEOUSLY, and that is two broadcasts... Two clocks, one
+    # source... an operator hearing two different voices talking about two
+    # different things in the same room." The music was never given it, and
+    # a split route is not a split show - it is two of them. The voice
+    # picker names the destination; the music follows it there.
+    #
+    # "off" is a mute, not a place, so it is left alone on either road: an
+    # operator silencing the DJs is not asking to be sent the records
+    # somewhere else.
+    _dest = str(voice or was or "box")
+    if _dest in ("box", "here", "both") and music != "off":
+        _had = str(music or _RADIO.get("music_to") or "here")
+        if _had != _dest and _had != "off":
+            pipeline_log("air", "the broadcast has ONE destination: music "
+                         f"{_had} against voice {_dest} would be two of "
+                         f"them - the music follows the voice to {_dest}")
+            music = _dest
+        elif not music and _had == _dest:
+            pass                        # already agreed; nothing to move
 
     _was_music = str(_RADIO.get("music_to") or "here")
     if music:
@@ -94050,6 +95096,28 @@ async def api_cupboard(
     return cupboard_state()
 
 
+@app.get("/api/battle")
+async def api_battle(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """#1090: the night as one continuous rap battle - the running thread,
+    who has thrown what, and the paragraph every writer is acting on."""
+    require_read_auth(authorization)
+    state = rap_battle_state()
+    thread = list(state.get("thread") or [])
+    return {
+        **state,
+        "combatants": list(RAP_COMBATANTS),
+        "seat_names": dict(RAP_SEAT_NAMES),
+        "answering": thread[-1] if thread else None,
+        "clause": rap_battle_clause(),
+        "say": ("every segment on this station is a round in one battle: "
+                "the clause below rides every scheduled round, so a caller, "
+                "a memo and a news read are three exchanges in one argument "
+                "rather than three errands"),
+    }
+
+
 @app.get("/api/tint")
 async def api_tint_state(
     authorization: str | None = Header(default=None),
@@ -94079,6 +95147,18 @@ async def api_tint_state(
         "hold": crystal_tint_holds(),
         # #1064: how a bar is graded - meaning (default) or strict.
         "grade": "strict" if crystal_grade_strict() else "meaning",
+        # 2026-09-09: the one revision pass - the dial, and, for each road it
+        # is allowed on, whether it would run right now or the words it would
+        # stand down with. A reader asking "is the crystal polishing bars, and
+        # if not why not" is answered here rather than from the log.
+        "revision": {"mode": crystal_revision_mode(),
+                     "deep_roads": list(TINT_DEEP_ROADS),
+                     "standing_down": {road: crystal_revision_skip(road)
+                                       for road in TINT_DEEP_ROADS},
+                     "asks": "exactly one self-edit of a bar the evaluator has "
+                             "already accepted, for unexpected phrasing and "
+                             "specific words; a revision that fails the same "
+                             "grade is discarded and the accepted bar stands"},
         # #1053: the dial, and what share of the hour's lines it reached.
         "force": round(crystal_force(), 2),
         "coverage": tint_coverage(),
@@ -95895,6 +96975,317 @@ async def api_hour_owes() -> dict[str, Any]:
     }
 
 
+# --- 2026-09-10: THE DIRECTOR'S ROOM ------------------------------------
+#
+# "I need an hourly script of each segment able to be reviewed where I can
+#  give notes and pointers that dictate how the next segment is generated of
+#  that type. I want full directorial capabilities with assisting the
+#  scripting process and see how a segment is planned in advance."
+#
+# One read that answers, for every entry of an hour, the four questions a
+# director actually asks:
+#
+#   WHAT IS THIS SEGMENT   - the entry, its minutes, its standing prompt
+#   WHAT IS IT GOING TO BE - the script System2 has bound to it, if any,
+#                            or the drafts standing behind it, or nothing
+#   WHAT DID IT TURN OUT   - what actually aired inside its window
+#   WHAT HAVE I SAID ABOUT IT - the direction in force, standing and one-shot
+#
+# The hour is read from System2's own plan when System2 owns the clock, so
+# the room shows the plan the station is actually going to run rather than
+# the sheet it was configured from - those two have been different all night
+# and the difference is the thing worth seeing.
+#
+# Every read is defensive: an hour that cannot be built comes back as an
+# empty running order with the reason in `why`, because a director's room
+# that 500s is a director's room nobody opens.
+
+# The measured cost of turning text into audio on this box, from the
+# station's own render ledger: seconds_of_engine = 2.97 + 1.05 * seconds
+# of finished audio. The marginal term is ABOVE ONE, which is why an hour
+# scheduled at 56 minutes of talk cannot be voiced inside the hour and why
+# the longest-round road starves first.
+DIRECTOR_RENDER_FIXED = 2.97
+DIRECTOR_RENDER_RATE = 1.05
+
+
+def _director_aired(start: float, deadline: float) -> list[dict[str, Any]]:
+    """What actually went out inside one entry's window."""
+    rows: list[dict[str, Any]] = []
+    try:
+        with _AIRLOG_LOCK:
+            live = list(_AIRLOG_INDEX.values())
+    except Exception:  # noqa: BLE001
+        live = []
+    for row in live:
+        at = float(row.get("air_at") or 0)
+        if not at or not start <= at < deadline:
+            continue
+        # 2026-09-10: AN AIR TIME IS NOT AN AIRING. A staged burst writes an
+        # ESTIMATED air_at for every turn the moment it is prepared, so a
+        # window read on air_at alone counts rows that never sounded -
+        # measured here on the first read of this endpoint: 359 rows and
+        # 2,442 seconds of "air" inside a 240-second entry, five different
+        # speakers stamped inside the same second. That is the same two-
+        # clocks mistake the booth feed was making, in a room built to
+        # explain the booth feed. `aired` is the station's own answer to
+        # "did this sound": box, stream or both. Anything else is a plan.
+        if str(row.get("aired") or "") not in AIRLOG_AIRED:
+            continue
+        rows.append({"at": at, "who": str(row.get("who") or ""),
+                     "name": str(row.get("name") or ""),
+                     "kind": str(row.get("kind") or ""),
+                     "round": str(row.get("round") or ""),
+                     "seconds": float(row.get("seconds") or 0),
+                     "source": str(row.get("source") or ""),
+                     "line": str(row.get("id") or ""),
+                     "text": str(row.get("text") or "")[:600]})
+    rows.sort(key=lambda r: r["at"])
+    return rows
+
+
+def _director_script(slot: dict[str, Any]) -> dict[str, Any]:
+    """The words this entry is going to say, and where they came from.
+
+    An ALLOCATION is a decision - this candidate, in this slot - so it is
+    the script the room shows. A DRAFT is only a thing that exists and
+    might be chosen, so it is counted and its opening quoted, never
+    presented as the plan."""
+    out: dict[str, Any] = {"turns": [], "seconds": 0.0, "state": "nothing",
+                           "candidate": "", "source": "", "drafts": 0,
+                           "draft_head": ""}
+    try:
+        allocations = list(slot.get("allocations") or [])
+        drafts = list(slot.get("drafts") or [])
+        out["drafts"] = len(drafts)
+        if drafts and not allocations:
+            head = str((drafts[0] or {}).get("script") or "")
+            out["draft_head"] = " ".join(head.split())[:240]
+        if not allocations:
+            out["state"] = "drafts waiting" if drafts else "nothing"
+            return out
+        picked = (allocations[0] or {}).get("candidate") or {}
+        out["candidate"] = str(picked.get("id") or "")
+        out["seconds"] = float(picked.get("seconds") or 0)
+        out["state"] = "bound"
+        src = picked.get("source") or {}
+        if isinstance(src, dict):
+            out["source"] = str(src.get("caller_name")
+                                or src.get("prep_name") or "")
+        for marker, said in banter_turns(str(picked.get("script") or "")):
+            out["turns"].append({"seat": str(marker or ""),
+                                 "who": _director_seat(str(marker or "")),
+                                 "text": str(said or "")[:900]})
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _director_seat(marker: str) -> str:
+    """The same mapping speak_turns uses, so the room names the seat the
+    listener is going to hear rather than the letter the model wrote."""
+    one = str(marker or "").strip().upper()[:1]
+    try:
+        if one == "C":
+            return "the caller"
+        if one == "E":
+            return "the second caller"
+        if one == "D":
+            return str(dj_settings().get("third_name") or "the third chair")
+        if one == "B":
+            return booth_actor_name("cohost") or "the co-host"
+        return booth_actor_name("dj") or "the host"
+    except Exception:  # noqa: BLE001
+        return one or "?"
+
+
+def director_room(which: int = 0) -> dict[str, Any]:
+    """The hourly script, entry by entry. `which` is 0 for the hour on air
+    and 1 for the one after it."""
+    now = time.time()
+    out: dict[str, Any] = {"at": now, "hour": "", "entries": [],
+                           "sheet": {}, "why": "", "engine": {},
+                           "hours_available": 0}
+    try:
+        out["sheet"] = director_sheet()
+    except Exception:  # noqa: BLE001
+        out["sheet"] = {"kinds": {}}
+    plan_hours: list[dict[str, Any]] = []
+    try:
+        runtime = globals().get("_system2")
+        if runtime and runtime().enabled:
+            plan_hours = list(runtime().status().get("hours") or [])
+    except Exception:  # noqa: BLE001
+        plan_hours = []
+    out["hours_available"] = len(plan_hours)
+    if not plan_hours:
+        # System2 is off, or has not planned yet. Fall back to the sheet
+        # itself so the room still shows the running order and its notes -
+        # it simply cannot say what is bound to each entry, because with
+        # System2 off nothing is bound in advance.
+        try:
+            store = schedule_read()
+            name = schedule_preset_now(store)
+            rows = [s for s in ((store.get("presets") or {}).get(name) or [])
+                    if s.get("enabled", True)]
+            out["hour"] = _sched_hour_key()
+            out["why"] = ("System2 has not planned an hour, so this is the "
+                          "configured running order rather than the plan "
+                          "the station is going to run")
+            at = 0.0
+            for ordinal, slot in enumerate(rows):
+                owns = max(0.25, float(slot.get("minutes") or 3)) * 60.0
+                kind = str(slot.get("kind") or "")
+                out["entries"].append({
+                    "ordinal": ordinal, "kind": kind,
+                    "label": str(slot.get("label") or kind),
+                    "slot_id": str(slot.get("id") or ""),
+                    "occurrence": "", "minutes": owns / 60.0,
+                    "start": 0.0, "deadline": 0.0, "state": "unplanned",
+                    "notes": str(slot.get("notes") or ""),
+                    "prompt": str(schedule_prompt_for(store, slot) or "")[:1200],
+                    "script": {"turns": [], "state": "nothing", "drafts": 0},
+                    "aired": [], "aired_seconds": 0.0,
+                    "direction": _director_direction(
+                        kind, str(slot.get("id") or ""), ""),
+                })
+                at += owns
+        except Exception as exc:  # noqa: BLE001
+            out["why"] = f"the running order could not be read: {exc}"[:200]
+        return out
+    which = max(0, min(len(plan_hours) - 1, int(which or 0)))
+    plan = plan_hours[which]
+    out["hour"] = str(plan.get("id") or "")
+    talk_seconds = 0.0
+    for slot in list(plan.get("slots") or []):
+        kind = str(slot.get("kind") or "")
+        start = float(slot.get("start") or 0)
+        deadline = float(slot.get("deadline") or 0)
+        aired = _director_aired(start, deadline)
+        heard = sum(r["seconds"] for r in aired)
+        script = _director_script(slot)
+        if start <= now < deadline:
+            state = "on air"
+        elif deadline <= now:
+            state = "aired" if heard > 1.0 else "went by with nothing"
+        elif script["state"] == "bound":
+            state = "planned"
+        elif script["drafts"]:
+            state = "drafts waiting"
+        else:
+            state = "nothing behind it"
+        if kind != "record":
+            talk_seconds += max(0.0, deadline - start)
+        out["entries"].append({
+            "ordinal": int(slot.get("ordinal") or 0),
+            "kind": kind,
+            "label": str(slot.get("label") or kind),
+            "slot_id": str(slot.get("template_id") or slot.get("id") or ""),
+            "occurrence": str(slot.get("id") or ""),
+            "minutes": max(0.0, deadline - start) / 60.0,
+            "start": start, "deadline": deadline,
+            "state": state,
+            "notes": str(slot.get("notes") or ""),
+            "prompt": str(slot.get("prompt") or "")[:1600],
+            "script": script,
+            "aired": aired,
+            "aired_seconds": round(heard, 1),
+            "direction": _director_direction(
+                kind, str(slot.get("template_id") or ""),
+                str(slot.get("id") or "")),
+        })
+    # WHAT THE HOUR COSTS TO VOICE. The room says this out loud because it
+    # is the reason the long-round roads starve: the marginal render term
+    # is above one, so an hour scheduled wall-to-wall with talk cannot be
+    # rendered inside the hour however the work is ordered.
+    entries = len(out["entries"]) or 1
+    engine = DIRECTOR_RENDER_FIXED * entries + DIRECTOR_RENDER_RATE * talk_seconds
+    out["engine"] = {
+        "talk_seconds": round(talk_seconds, 1),
+        "engine_seconds": round(engine, 1),
+        "hour_seconds": 3600.0,
+        "load": round(engine / 3600.0, 3),
+        "say": ("this hour asks for %.0f min of voiced talk, which costs "
+                "about %.0f min of engine on one lane against 60 min of "
+                "clock" % (talk_seconds / 60.0, engine / 60.0)),
+    }
+    return out
+
+
+def _director_direction(kind: str, slot_id: str,
+                        occurrence: str) -> dict[str, Any]:
+    """The direction in force on one entry, and what it will look like."""
+    try:
+        standing = director_notes(kind, "standing")
+        one_shot = [r for r in director_notes(kind, "next")
+                    if not r.get("occurrence")
+                    or str(r.get("occurrence")) == str(occurrence)]
+        return {"standing": [{"id": r["id"], "text": r["text"],
+                              "used": int(r.get("used") or 0),
+                              "at": r.get("at")} for r in standing],
+                "next": [{"id": r["id"], "text": r["text"],
+                          "slot_id": r.get("slot_id"),
+                          "occurrence": r.get("occurrence"),
+                          "at": r.get("at")} for r in one_shot],
+                "clause": director_clause(kind, slot_id, occurrence)}
+    except Exception:  # noqa: BLE001
+        return {"standing": [], "next": [], "clause": ""}
+
+
+@app.get("/api/director")
+async def api_director(hour: int = 0) -> dict[str, Any]:
+    """The hourly script. Off the loop: it folds the air-log index and
+    serialises a whole System2 plan, both of which hold the GIL."""
+    return await asyncio.to_thread(director_room, int(hour or 0))
+
+
+@app.get("/api/director/sheet")
+async def api_director_sheet() -> dict[str, Any]:
+    """Every note in the book, by segment kind."""
+    return await asyncio.to_thread(director_sheet)
+
+
+@app.post("/api/director/note")
+async def api_director_note(payload: dict[str, Any]) -> dict[str, Any]:
+    """Write one note. `scope` is "standing" or "next"."""
+    kind = str((payload or {}).get("kind") or "").strip()
+    text = str((payload or {}).get("text") or "").strip()
+    if not kind:
+        raise HTTPException(400, "a note has to be about a segment kind")
+    if not text:
+        raise HTTPException(400, "a note with no words in it is not direction")
+    try:
+        row = director_add(
+            kind, text,
+            scope=str((payload or {}).get("scope") or "standing"),
+            slot_id=str((payload or {}).get("slot_id") or ""),
+            occurrence=str((payload or {}).get("occurrence") or ""),
+            who=str((payload or {}).get("who") or "operator"))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    pipeline_log("action", "the director left a note on "
+                 f"{kind}: {text[:120]}")
+    return {"ok": True, "note": row,
+            "say": ("noted - every %s from now on carries it" % kind
+                    if row["scope"] == "standing"
+                    else "noted for the next %s only" % kind)}
+
+
+@app.post("/api/director/note/{note_id}/retire")
+async def api_director_note_retire(note_id: str) -> dict[str, Any]:
+    got = director_retire(note_id)
+    return {"ok": bool(got), "id": note_id,
+            "say": "retired - it governs nothing from here"
+                   if got else "that note was not standing"}
+
+
+@app.post("/api/director/note/{note_id}/restore")
+async def api_director_note_restore(note_id: str) -> dict[str, Any]:
+    got = director_restore(note_id)
+    return {"ok": bool(got), "id": note_id,
+            "say": "back in force" if got else "that note was not retired"}
+
+
 @app.get("/api/fallbacks")
 async def api_fallbacks() -> dict[str, Any]:
     """#1075: the reserve of last resort.
@@ -96173,11 +97564,24 @@ async def api_recording_room_rows(
     rows: list[dict[str, Any]] = []
     engines_seen: set[str] = set()
     for _i, row in enumerate(list(_SHELF.get(kind) or [])):
+        # 2026-09-10: A DIALOGUE ROUND KEEPS ITS WORDS SOMEWHERE ELSE.
+        # This read `row["text"]`, which only the single-line roads (ad,
+        # station_id) ever set - a conversational round carries its script
+        # at `row["entry"]["script"]`. So this endpoint, whose whole job is
+        # to say WHY a row has no audio, answered "no words to say" about
+        # every caller, manager, gallery and news round on the shelf.
+        # Measured on the live station while chasing exactly that: 55
+        # caller rows of a median 1,716 characters, every one reported as
+        # empty, while the ad road - the one road with a `text` - read
+        # correctly. A diagnostic that lies sends the next person after
+        # the wrong bug, which is worse than having no diagnostic.
         text = str(row.get("text") or "")
+        if not text.strip():
+            text = str((row.get("entry") or {}).get("script") or "")
         out: dict[str, Any] = {
             "i": _i,
             "chars": len(text),
-            "head": text[:90],
+            "head": " ".join(text.split())[:90],
             "voice_asked": str(row.get("voice") or ""),
             "key": str(row.get("key") or ""),
             "produced": bool(row.get("produced")),
@@ -106272,6 +107676,15 @@ def airlog_write_rows(rows: list[dict[str, Any]]) -> int:
                             float(_AIRLOG_SEAT_LAST.get(row["who"]) or 0),
                             float(row.get("air_at") or 0)
                             + float(row.get("seconds") or 0))
+                        # #1090: and it becomes the bar the next
+                        # combatant answers. Taken HERE because this
+                        # test - a cast seat, actually aired, not a
+                        # quiet kind - is already the station's own
+                        # definition of a line that went out, and
+                        # this runs off the event loop.
+                        rap_battle_note(str(row.get("who") or ""),
+                                        str(row.get("text") or ""),
+                                        str(row.get("kind") or ""))
             _AIRLOG_STATE["written"] = int(_AIRLOG_STATE.get("written") or 0) + wrote
             _AIRLOG_STATE["last_write"] = time.time()
             if len(_AIRLOG_SEEN) > 40000:
@@ -123487,6 +124900,107 @@ def rap_assembly_state() -> dict[str, Any]:
     return out
 
 
+def phone_system_state() -> dict[str, Any]:
+    """#1090/the phone window: the whole call road as one live state.
+
+    Every number here is read from something the station already keeps -
+    the deck weights off the operator's dials, the draws off the ring
+    above, the writing off System2's current work, the recording room off
+    the pantry, and the air off the booth ring. Nothing is computed for
+    the picture's benefit."""
+    dj = dj_settings()
+    cards = ("prize", "mad", "agree", "disagree", "offwall", "plain",
+             "carefree")
+    deck = [{"card": k, "weight": max(0, int(dj.get("caller_" + k, 15) or 0)),
+             "says": " ".join(str(CALLER_BEHAVIORS.get(k) or "").split())[:200]}
+            for k in cards]
+    total = sum(row["weight"] for row in deck) or 1
+    for row in deck:
+        row["share"] = round(row["weight"] / total, 3)
+    draws = list(_PHONE_DRAWS)[-12:]
+    recent = collections.Counter(str(d.get("card") or "") for d in _PHONE_DRAWS)
+    live = dict(_CALL_LIVE or {})
+    work = {}
+    try:
+        got = system2_current_work() or {}
+        if str(got.get("kind") or "") in ("caller", "banter_caller"):
+            work = {k: got.get(k) for k in
+                    ("kind", "state", "action", "slot_id", "started",
+                     "generation_turns")}
+    except Exception:  # noqa: BLE001
+        work = {}
+    now = time.time()
+    aired, last_at = 0, 0.0
+    try:
+        for row in list(_RADIO.get("chat") or []):
+            if str(row.get("kind") or "") != "call":
+                continue
+            at = float(row.get("air_at") or row.get("ts") or 0)
+            if now - at < 3600:
+                aired += 1
+                last_at = max(last_at, at)
+    except Exception:  # noqa: BLE001
+        pass
+    room = {"pantry_clips": len(_PANTRY), "render_waiting": len(_RENDER_BACKLOG),
+            "delivery_waiting": len(_BOX_HOLD)}
+    try:
+        room["voices"] = len(json.loads(
+            (DATA_DIR / "caller_voices.json").read_text(encoding="utf-8")))
+    except Exception:  # noqa: BLE001
+        room["voices"] = 0
+    return {
+        "at": now,
+        "on": bool(dj.get("caller_every") or quota_target("caller", dj)),
+        "deck": deck,
+        "draws": draws,
+        "draw_counts": dict(recent),
+        "live": {"who": str(live.get("who") or ""),
+                 "at": float(live.get("at") or 0),
+                 "for_seconds": round(now - float(live.get("at") or 0), 1)
+                 if live.get("at") else 0.0,
+                 # what this call was actually made of, for review
+                 "seeds": list((live.get("meta") or {}).get("seeds") or []),
+                 "behavior": str((live.get("meta") or {}).get("behavior") or "")},
+        "writing": work,
+        "room": room,
+        "air": {"calls_this_hour": aired,
+                "since_last_s": round(now - last_at, 1) if last_at else None},
+        "quota": {"target": quota_target("caller", dj)},
+        "battle": {"round": int((rap_battle_state() or {}).get("round") or 0)},
+        "stages": [
+            {"n": 1, "name": "the deck", "what": "a scenario card is drawn on the operator's weights - prize, mad, agree, disagree, off-the-wall, plain, carefree"},
+            {"n": 2, "name": "the caller", "what": "a name, a voice and a grievance are drawn, and the rapport road decides whether this one goes wrong"},
+            {"n": 3, "name": "the writing", "what": "System2 writes the scene for the slot, in bars, answering whoever held the floor last"},
+            {"n": 4, "name": "the crystal", "what": "every turn is rewritten through the crystal and graded; a refused bar is repaired or struck"},
+            {"n": 5, "name": "the recording room", "what": "each turn is rendered to a take and shelved in the pantry; nothing already recorded is recorded again"},
+            {"n": 6, "name": "the air", "what": "the call is welded into one clip and aired whole - a call is never paged"},
+        ],
+        "say": ("the phone is a pipeline, not a button: a card off the deck, a caller built around it, a scene written as bars, every bar rapped and graded, every turn recorded once, and the whole call aired in one piece"),
+    }
+
+
+@app.get("/api/nabu/keeper")
+async def api_nabu_keeper(
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    """What the keeper last decided, and the receipt it decided against."""
+    require_read_auth(authorization)
+    return {"keeper": dict(_NABU_KEEP), "receipt": dict(_NABU_MUSIC_ON),
+            "tick": NABU_KEEP_TICK, "rest": NABU_KEEP_REST,
+            "now": str((_RADIO.get("now") or {}).get("id") or ""),
+            "firmware_down": box_firmware_down_now()}
+
+
+@app.get("/api/phone")
+async def api_phone(
+    authorization: str | None = Header(default=None),
+    key: str = "",
+) -> dict[str, Any]:
+    """The phone system as one live state, for the *** Phone view."""
+    _journal_auth(authorization, key)
+    return phone_system_state()
+
+
 @app.get("/api/rapassembly")
 async def api_rap_assembly(
     authorization: str | None = Header(default=None),
@@ -126176,6 +127690,11 @@ its system prompt. Pull back to 6 hours, 12, a day, or a month."
     </select>
     <button id="journalBtn" class="tray-btn" title="The request book — every request and its reply, page by page (#1079)"
             onclick="journalOpen()" style="font-size:18px;line-height:1">📖</button>
+    <!-- 2026-09-10: the director's room - the hour entry by entry, the script
+         bound to each one, what actually aired in its window, and the notes
+         that govern how the next segment of that kind gets written. -->
+    <button id="directorBtn" class="tray-btn" title="The director's room — the hour segment by segment: what each one is planned to be, what it turned out to be, and your notes on how the next one of that kind gets written"
+            onclick="directorOpen()" style="font-size:18px;line-height:1">🎬</button>
     <!-- 2026-09-08: the retirement desk - every round about to leave the
          cupboard waits for a decision; rules by type; a life timer on each. -->
     <button id="retireBtn" class="tray-btn" title="The retirement desk — every round about to leave the cupboard waits here for your decision; the rules by type; a life timer on every item"
@@ -128309,6 +129828,10 @@ const PINE_3JS = [
    frame: {shade: () => orchLogic && orchLogic.host, card: null,
            close: () => orchLogicClose(),
            onResize: () => { if (orchLogic && orchLogic.resize) orchLogic.resize(); }}},
+  {key: "phone",    label: "☎ Phone",           open: () => phonePanel(),
+   frame: {shade: () => phoneView && phoneView.shade, card: null,
+           close: () => phoneClose(),
+           onResize: () => { if (phoneView && phoneView.resize) phoneView.resize(); }}},
   {key: "rapassembly", label: "🎛 RapAssembly",  open: () => rapAssemblyPanel(),
    frame: {shade: () => rapAssembly && rapAssembly.shade, card: null,
            close: () => rapAssemblyClose(),
@@ -128340,6 +129863,7 @@ const PINE_3JS = [
   {key: "cloud",    label: "☁ Word Cloud",      open: () => pineCloudWin()},
   {key: "rhymecloud", label: "🎤 Rhyme Cloud",  open: () => rhymeCloudWin()},
   {key: "journal",  label: "📖 Request book",   open: () => journalOpen()},
+  {key: "director", label: "🎬 Director",        open: () => directorOpen()},
   {key: "paper",    label: "📰 The Gazette",     open: () => paperOpen(),
    frame: {shade: () => paperBox, close: () => paperClose(),
            width: 1240, height: 920}},
@@ -128764,6 +130288,114 @@ async function pineWinFrame(hit) {
     {close: f.close, card: f.card, dialog: !!f.dialog, onResize: f.onResize,
      width: f.width, height: f.height});
 }
+
+
+/* --- #1091: the 3JS launcher -------------------------------------------
+   "Make sure that I have a three JS option in the web client, allowing me to
+   load up all of the experiences that we have powered by three JS and view
+   them in a pop up window, even through the web client."
+
+   Everything under it already existed - PINE_3JS registers each scene,
+   pineShow3JS disposes the last one and adopts the next into a frame - and
+   none of it had an entry point outside a console. This is the option. */
+const PINE_3JS_BLURB = {
+  flow: "the station's own flow graph, live",
+  mind: "the Dialogue Mind - what the room is thinking about",
+  topology: "the mind as a body in space",
+  graph: "the DJ plexus - every seat and what connects them",
+  orchlogic: "the orchestrator's logic, drawn",
+  phone: "the call road: deck, RNG, writing, recording room, air",
+  rapassembly: "a thought becoming a rhymed line on the air",
+  crystal: "the data crystal itself",
+  cloud: "the words the station is using",
+  rhymecloud: "the rhymes it is landing on",
+  sphere: "rhetoric as a sphere",
+  vectors: "the vector tree",
+  stage: "the album stage",
+  remote: "the remote plexus",
+  skin: "the device skin",
+};
+
+function pine3JSPop(k) {
+  /* A real window, so it can live on another monitor. Same page, told which
+     scene to open - which is why it works in the browser as well as the app. */
+  try {
+    const u = new URL(window.location.href);
+    u.searchParams.set("view", k);
+    const w = Math.min(1280, Math.round(screen.availWidth * 0.8));
+    const h = Math.min(860, Math.round(screen.availHeight * 0.85));
+    const win = window.open(u.toString(), "pine3js-" + k,
+      "width=" + w + ",height=" + h + ",menubar=no,toolbar=no");
+    if (!win) setStatus("the browser blocked the pop-up - allow pop-ups for "
+                        + "this site, or open it here instead", true);
+  } catch (e) { setStatus(String(e && e.message || e), true); }
+}
+
+async function pine3JSMenu() {
+  const win = pineWin("three3d", "\u{1F9CA} 3JS experiences",
+                      {width: 640, height: 560});
+  const host = win.host;
+  host.style.cssText = "overflow:auto;padding:14px 16px;background:#080c12";
+  const say = el("div", "muted",
+    "Every three.js scene the station has. Open one here, or pop it out into "
+    + "a window of its own - the pop-out works through the web client too.");
+  say.style.cssText = "font-size:11.5px;line-height:1.5;margin-bottom:12px";
+  host.appendChild(say);
+  PINE_3JS.filter((x) => x.key !== "off").forEach((entry) => {
+    const row = el("div", "", "");
+    row.style.cssText = "display:flex;align-items:center;gap:10px;padding:7px 0;"
+      + "border-bottom:1px solid #16202c";
+    const name = el("div", "", "");
+    name.style.cssText = "flex:1;min-width:0";
+    const t = el("div", "", entry.label);
+    t.style.cssText = "font:600 12.5px system-ui;color:#dff6ff";
+    const b = el("div", "muted", PINE_3JS_BLURB[entry.key] || "");
+    b.style.cssText = "font-size:11px;color:#7f92a6";
+    name.appendChild(t); name.appendChild(b);
+    const here = el("button", "", "open");
+    here.onclick = async () => {
+      setStatus("opening " + entry.label + "\u2026");
+      const got = await pineShow3JS(entry.key);
+      setStatus(got === entry.key ? entry.label + " is up" : String(got),
+                got !== entry.key);
+    };
+    const out = el("button", "", "\u2197 window");
+    out.title = "open this scene in a window of its own";
+    out.onclick = () => pine3JSPop(entry.key);
+    row.appendChild(name); row.appendChild(here); row.appendChild(out);
+    host.appendChild(row);
+  });
+  const off = el("button", "", "\u2b1b turn every scene off");
+  off.style.cssText = "margin-top:12px";
+  off.onclick = () => { try { pine3JSAllOff(); setStatus("all scenes off"); }
+                        catch (e) { setStatus(String(e), true); } };
+  host.appendChild(off);
+}
+
+/* The entry point itself: a button that is always there, in the app and in
+   the browser alike, plus ?view= so a pop-out lands on its scene. */
+function pine3JSInstall() {
+  try {
+    if (document.getElementById("pine3jsBtn")) return;
+    const b = document.createElement("button");
+    b.id = "pine3jsBtn";
+    b.textContent = "\u{1F9CA} 3JS";
+    b.title = "every three.js experience the station has";
+    b.style.cssText = "position:fixed;left:12px;bottom:12px;z-index:300;"
+      + "padding:7px 12px;border-radius:9px;border:1px solid #22304a;"
+      + "background:#0b1420;color:#9fd0e3;font:600 12px system-ui;cursor:pointer";
+    b.onclick = () => pine3JSMenu();
+    document.body.appendChild(b);
+    const want = new URLSearchParams(location.search).get("view");
+    if (want) {
+      // A pop-out: land on the scene rather than making the operator find it.
+      setTimeout(() => { try { pineShow3JS(want); } catch (e) {} }, 400);
+    }
+  } catch (e) { /* the panel works without the launcher */ }
+}
+if (document.readyState === "loading") {
+  document.addEventListener("DOMContentLoaded", pine3JSInstall);
+} else { pine3JSInstall(); }
 
 async function pineShow3JS(key) {
   const hit = PINE_3JS.find((x) => x.key === key);
@@ -131032,6 +132664,308 @@ function retireDeskOpen() {
   let k = "";
   try { k = (typeof key === "function") ? (key() || "") : ""; } catch (e) { k = ""; }
   window.open("/cupboard/retire" + (k ? "?key=" + encodeURIComponent(k) : ""), "_blank");
+}
+
+/* --- 2026-09-10: THE DIRECTOR'S ROOM ------------------------------------
+ *
+ * "I need an hourly script of each segment able to be reviewed where I can
+ *  give notes and pointers that dictate how the next segment is generated
+ *  of that type... and see how a segment is planned in advance."
+ *
+ * One entry per row, in the order the hour runs them, and each row answers
+ * the four questions in the same order every time: what is this segment,
+ * what is it going to BE, what did it turn out to be, and what have I said
+ * about it. The script under an entry is the one System2 has actually bound
+ * to that slot, so this is the plan the station is going to run rather than
+ * the sheet it was configured from - and where the two differ, the row says
+ * so rather than showing the sheet and letting it look fine.
+ *
+ * A note written here goes into `director_clause`, which rides inside the
+ * schedule clause every scheduled round already passes through. Standing
+ * notes govern every future segment of that kind; a "just this one" note is
+ * pinned to the occurrence and is spent when that occurrence completes.
+ */
+let dirBook = null;
+let dirHour = 0;
+
+function dirStyle() {
+  if (document.getElementById("dirCss")) return;
+  const css = document.createElement("style");
+  css.id = "dirCss";
+  css.textContent = [
+    ".dir-bar{display:flex;gap:6px;align-items:center;padding:6px;",
+    "border-bottom:1px solid rgba(255,255,255,.10);flex-wrap:wrap}",
+    ".dir-body{flex:1;overflow:auto;padding:6px 8px}",
+    ".dir-row{border:1px solid rgba(255,255,255,.10);border-radius:8px;",
+    "margin:0 0 8px;padding:7px 9px;background:rgba(255,255,255,.025)}",
+    ".dir-row.on{border-color:#7ce8a9;background:rgba(124,232,169,.07)}",
+    ".dir-row.bare{border-color:#e0a35c}",
+    ".dir-head{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}",
+    ".dir-when{font-variant-numeric:tabular-nums;color:#8fa6bd;font-size:12px}",
+    ".dir-name{font-weight:600}",
+    ".dir-kind{font-size:10px;letter-spacing:.05em;text-transform:uppercase;",
+    "color:#7f93a8}",
+    ".dir-chip{font-size:10px;padding:1px 6px;border-radius:99px;",
+    "border:1px solid rgba(255,255,255,.18);color:#9db3c8}",
+    ".dir-chip.ok{color:#7ce8a9;border-color:rgba(124,232,169,.45)}",
+    ".dir-chip.warn{color:#e0a35c;border-color:rgba(224,163,92,.45)}",
+    ".dir-chip.live{color:#7ce8a9;border-color:#7ce8a9}",
+    ".dir-turn{margin:2px 0;font-size:12px;line-height:1.35}",
+    ".dir-seat{color:#8fb7e8;font-weight:600}",
+    ".dir-seat.c{color:#e8c07c}.dir-seat.b{color:#a8e07c}",
+    ".dir-note{font-size:12px;margin:2px 0;display:flex;gap:6px;",
+    "align-items:flex-start}",
+    ".dir-note button{font-size:10px;padding:0 5px;line-height:1.5}",
+    ".dir-sub{font-size:11px;color:#7f93a8;margin:4px 0 2px}",
+    ".dir-add{display:flex;gap:5px;margin-top:5px;flex-wrap:wrap}",
+    ".dir-add input{flex:1;min-width:200px;font-size:12px;padding:3px 6px}",
+    ".dir-load{font-size:11px;color:#8fa6bd}",
+    ".dir-load.hot{color:#e0a35c}",
+  ].join("");
+  document.head.appendChild(css);
+}
+
+function dirClock(t) {
+  if (!t) return "--:--";
+  const d = new Date(t * 1000);
+  return String(d.getHours()).padStart(2, "0") + ":"
+       + String(d.getMinutes()).padStart(2, "0");
+}
+
+async function directorOpen() {
+  dirStyle();
+  const win = pineWin("director", "🎬 The director's room", {
+    minWidth: 560, minHeight: 460, width: 1020, height: 800,
+    onClose: () => { dirBook = null; },
+  });
+  const host = win.host;
+  host.style.display = "flex";
+  host.style.flexDirection = "column";
+  host.style.overflow = "hidden";
+  const bar = el("div", "dir-bar", "");
+  const thisHour = el("button", "", "This hour");
+  const nextHour = el("button", "", "Next hour");
+  const refresh = el("button", "", "↻");
+  refresh.title = "Read the plan again";
+  const load = el("span", "dir-load", "");
+  const gap = el("span", "", "");
+  gap.style.flex = "1";
+  [thisHour, nextHour, refresh, gap, load].forEach((n) => bar.appendChild(n));
+  host.appendChild(bar);
+  const body = el("div", "dir-body", "");
+  host.appendChild(body);
+  dirBook = {win, body, load, thisHour, nextHour};
+  thisHour.onclick = () => { dirHour = 0; directorPaint(); };
+  nextHour.onclick = () => { dirHour = 1; directorPaint(); };
+  refresh.onclick = () => directorPaint();
+  await directorPaint();
+}
+
+async function directorPaint() {
+  if (!dirBook) return;
+  const {body, load, thisHour, nextHour} = dirBook;
+  thisHour.disabled = dirHour === 0;
+  nextHour.disabled = dirHour === 1;
+  body.textContent = "Reading the plan…";
+  let got;
+  try {
+    got = await api("/api/director?hour=" + dirHour);
+  } catch (e) {
+    body.textContent = "The plan could not be read: " + e;
+    return;
+  }
+  if (!dirBook) return;
+  body.textContent = "";
+  const eng = got.engine || {};
+  load.textContent = eng.say || "";
+  load.className = "dir-load" + (Number(eng.load || 0) > 0.9 ? " hot" : "");
+  load.title = "The measured cost of turning this hour's text into audio: "
+    + "2.97s fixed per round plus 1.05x the finished audio, on one engine "
+    + "lane. Above 1.0 the hour cannot be voiced inside the hour, and the "
+    + "roads with the longest rounds are the ones that starve.";
+  if (got.why) {
+    const note = el("div", "dir-sub", "⚠ " + got.why);
+    note.style.color = "#e0a35c";
+    body.appendChild(note);
+  }
+  const rows = got.entries || [];
+  if (!rows.length) { body.appendChild(el("div", "muted", "No running order.")); return; }
+  rows.forEach((row) => body.appendChild(directorRow(row)));
+}
+
+function directorRow(row) {
+  const card = el("div", "dir-row", "");
+  if (row.state === "on air") card.classList.add("on");
+  if (row.state === "nothing behind it" || row.state === "went by with nothing") {
+    card.classList.add("bare");
+  }
+  const head = el("div", "dir-head", "");
+  head.appendChild(el("span", "dir-when",
+    dirClock(row.start) + (row.deadline ? "–" + dirClock(row.deadline) : "")));
+  head.appendChild(el("span", "dir-name", row.label || row.kind));
+  head.appendChild(el("span", "dir-kind", row.kind));
+  const chip = el("span", "dir-chip", row.state);
+  if (row.state === "on air") chip.classList.add("live");
+  else if (row.state === "aired" || row.state === "planned") chip.classList.add("ok");
+  else if (row.state.indexOf("nothing") >= 0) chip.classList.add("warn");
+  head.appendChild(chip);
+  const script = row.script || {};
+  if (script.drafts) {
+    head.appendChild(el("span", "dir-chip", script.drafts + " draft"
+      + (script.drafts === 1 ? "" : "s")));
+  }
+  if (row.aired_seconds) {
+    head.appendChild(el("span", "dir-chip", Math.round(row.aired_seconds) + "s heard"));
+  }
+  card.appendChild(head);
+
+  /* WHAT IT IS GOING TO BE — the bound script, turn by turn, with the seat
+   * the listener will actually hear rather than the letter the model wrote. */
+  const turns = script.turns || [];
+  if (turns.length) {
+    const box = el("details", "", "");
+    const sum = el("summary", "dir-sub",
+      "the script bound to this entry — " + turns.length + " turns"
+      + (script.seconds ? ", " + Math.round(script.seconds) + "s" : "")
+      + (script.source ? " · " + script.source : ""));
+    box.appendChild(sum);
+    turns.forEach((t) => {
+      const line = el("div", "dir-turn", "");
+      const seat = el("span", "dir-seat", t.who + ": ");
+      if (t.seat === "C" || t.seat === "E") seat.classList.add("c");
+      if (t.seat === "B") seat.classList.add("b");
+      line.appendChild(seat);
+      line.appendChild(document.createTextNode(t.text));
+      box.appendChild(line);
+    });
+    card.appendChild(box);
+  } else if (script.draft_head) {
+    card.appendChild(el("div", "dir-sub",
+      "nothing bound yet · a draft opens: " + script.draft_head));
+  } else if (row.state.indexOf("nothing") >= 0) {
+    card.appendChild(el("div", "dir-sub",
+      "nothing has been written for this entry"));
+  }
+
+  /* WHAT IT TURNED OUT TO BE — what actually went out in its window. */
+  const aired = row.aired || [];
+  if (aired.length) {
+    const box = el("details", "", "");
+    box.appendChild(el("summary", "dir-sub",
+      "what actually aired here — " + aired.length + " lines, "
+      + Math.round(row.aired_seconds) + "s"));
+    aired.forEach((a) => {
+      const line = el("div", "dir-turn", "");
+      const seat = el("span", "dir-seat", (a.name || a.who) + ": ");
+      line.appendChild(seat);
+      line.appendChild(document.createTextNode(a.text));
+      if (a.source) {
+        const src = el("span", "dir-chip", a.source);
+        src.style.marginLeft = "5px";
+        line.appendChild(src);
+      }
+      if (a.line) {
+        const dl = el("a", "", " ⤓");
+        dl.href = "/api/booth/clip?line=" + encodeURIComponent(a.line);
+        dl.target = "_blank";
+        dl.title = "This line's audio";
+        line.appendChild(dl);
+      }
+      box.appendChild(line);
+    });
+    card.appendChild(box);
+  }
+
+  /* WHAT I HAVE SAID ABOUT IT — the direction in force, and the box to
+   * add to it. Standing notes govern every future segment of this kind. */
+  const dir = row.direction || {};
+  const standing = dir.standing || [];
+  const oneShot = dir.next || [];
+  const sheet = el("div", "", "");
+  sheet.appendChild(el("div", "dir-sub", "direction on every " + row.kind
+    + " (" + standing.length + " standing"
+    + (oneShot.length ? ", " + oneShot.length + " for this one" : "") + ")"));
+  standing.forEach((n, i) => {
+    const line = el("div", "dir-note", "");
+    const drop = el("button", "", "✕");
+    drop.title = "Retire this note — it governs nothing from here";
+    drop.onclick = async () => {
+      drop.disabled = true;
+      try {
+        await api("/api/director/note/" + n.id + "/retire", {method: "POST"});
+        await directorPaint();
+      } catch (e) { drop.disabled = false; alert("Could not retire: " + e); }
+    };
+    line.appendChild(drop);
+    const txt = el("span", "", (i + 1) + ". " + n.text
+      + (n.used ? "  (" + n.used + " segments since)" : ""));
+    line.appendChild(txt);
+    sheet.appendChild(line);
+  });
+  oneShot.forEach((n) => {
+    const line = el("div", "dir-note", "");
+    const drop = el("button", "", "✕");
+    drop.onclick = async () => {
+      drop.disabled = true;
+      try {
+        await api("/api/director/note/" + n.id + "/retire", {method: "POST"});
+        await directorPaint();
+      } catch (e) { drop.disabled = false; }
+    };
+    line.appendChild(drop);
+    const txt = el("span", "", "just this one: " + n.text);
+    txt.style.color = "#e8c07c";
+    line.appendChild(txt);
+    sheet.appendChild(line);
+  });
+  const add = el("div", "dir-add", "");
+  const box = document.createElement("input");
+  box.type = "text";
+  box.placeholder = "a note for every " + row.kind + " from now on…";
+  const scope = document.createElement("select");
+  [["standing", "every " + row.kind], ["next", "just this one"]]
+    .forEach(([v, label]) => {
+      const o = document.createElement("option");
+      o.value = v; o.textContent = label;
+      scope.appendChild(o);
+    });
+  const send = el("button", "", "Note it");
+  const post = async () => {
+    const text = box.value.trim();
+    if (!text) return;
+    send.disabled = true;
+    try {
+      await api("/api/director/note", {method: "POST", body: JSON.stringify({
+        kind: row.kind, text, scope: scope.value,
+        slot_id: row.slot_id || "",
+        occurrence: scope.value === "next" ? (row.occurrence || "") : "",
+      })});
+      box.value = "";
+      await directorPaint();
+    } catch (e) {
+      alert("The note was not written: " + e);
+    } finally { send.disabled = false; }
+  };
+  send.onclick = post;
+  box.onkeydown = (ev) => { if (ev.key === "Enter") post(); };
+  [box, scope, send].forEach((n) => add.appendChild(n));
+  sheet.appendChild(add);
+  card.appendChild(sheet);
+
+  /* HOW IT IS BEING ASKED FOR — the prompt this entry actually carries,
+   * the director's notes included, so "why did it come out like that" has
+   * an answer that does not need a log. */
+  if (row.prompt || dir.clause) {
+    const box2 = el("details", "", "");
+    box2.appendChild(el("summary", "dir-sub",
+      "the instruction this segment is written under"));
+    const pre = el("div", "dir-turn", (row.prompt || "") + (dir.clause || ""));
+    pre.style.whiteSpace = "pre-wrap";
+    pre.style.color = "#8fa6bd";
+    box2.appendChild(pre);
+    card.appendChild(box2);
+  }
+  return card;
 }
 
 async function journalOpen(id) {
@@ -137709,6 +139643,35 @@ function djTalkAirAt(line) {
   if (!line) return 0;
   return Number(line.air_at || line.ts || 0);
 }
+/* 2026-09-10: THE BOOTH IS ONE-TO-ONE WITH THE BROADCAST, OR IT IS NOTHING.
+ *
+ * #770 put the feed in `air_at` order, which is right. But a row the
+ * station has WRITTEN and never aired has no `air_at` at all, and the
+ * fallback above then sorts it by `ts` - the moment it was WRITTEN - so
+ * prepared-but-unaired rows were being dealt into the middle of the
+ * broadcast timeline on a completely different clock. That is the
+ * "everything's out of order and it's showing things that haven't been
+ * said yet" report: two clocks in one list, and the rows that had never
+ * been heard were the ones jumping the queue, because they are written
+ * minutes before the air they were written for.
+ *
+ * A row with a real air time - past OR future, the round's own stream plan
+ * gives coming-up rows a genuine one - keeps its place. A row with no air
+ * time at all is not part of the broadcast yet, so it sorts BELOW every
+ * row that is, in the order it was written. The feed above the band is
+ * then exactly what went out, in the order it went out, which is what
+ * makes a section locatable and downloadable.
+ */
+var DJ_TALK_UNAIRED = 1e12;          /* far above any epoch-seconds stamp */
+function djTalkOrderKey(line) {
+  if (!line) return 0;
+  var air = Number((line && line.air_at) || 0);
+  if (air > 0) return air;
+  return DJ_TALK_UNAIRED + Number((line && line.ts) || 0);
+}
+function djTalkAired(line) {
+  return Number((line && line.air_at) || 0) > 0;
+}
 /* #772: the round that is playing, its per-turn windows, and how far this
  * machine's clock is from the station's. */
 let djStreamNow = null;
@@ -137842,7 +139805,7 @@ function djTalkAbsorb(lines) {
         // #770: an air time that MOVED can reorder the feed — the estimate
         // written when a burst was staged is corrected the moment the clip
         // is actually handed over.
-        if (djTalkAirAt(merged) !== djTalkAirAt(was)) djTalkNeedsSort = true;
+        if (djTalkOrderKey(merged) !== djTalkOrderKey(was)) djTalkNeedsSort = true;
         // #748: the finished entry can arrive with NO `aired` key at all
         // (page-only routing where the clip failed, and the hold-shelf
         // drain which pops the key rather than reassigning it). A plain
@@ -137865,7 +139828,7 @@ function djTalkAbsorb(lines) {
     if (eid) djTalkById.set(eid, djTalkAll.length);
     djTalkAll.push(line);
     // #770: does this one belong before something already here?
-    const when = djTalkAirAt(line);
+    const when = djTalkOrderKey(line);
     if (when < djTalkMaxAir - 0.001) djTalkNeedsSort = true;
     if (when > djTalkMaxAir) djTalkMaxAir = when;
     added += 1;
@@ -137885,7 +139848,8 @@ function djTalkSort() {
   djTalkNeedsSort = false;
   const was = djTalkAll;
   const ix = was.map((unused, i) => i);
-  ix.sort((a, b) => (djTalkAirAt(was[a]) - djTalkAirAt(was[b])) || (a - b));
+  ix.sort((a, b) => (djTalkOrderKey(was[a]) - djTalkOrderKey(was[b]))
+                    || (a - b));
   let moved = false;
   for (let i = 0; i < ix.length; i += 1) {
     if (ix[i] !== i) { moved = true; break; }
@@ -138096,6 +140060,18 @@ function djTalkRender(state) {
   }
   const _nowS = Date.now() / 1000;
   for (let at = djTalkPainted; at < lines.length; at += 1) {
+    /* 2026-09-10: the line where the BROADCAST stops and the written-but-
+     * never-aired band begins, marked once so the feed above it can be
+     * read as the broadcast and nothing below it mistaken for air. */
+    if (at > 0 && djTalkAired(lines[at - 1]) && !djTalkAired(lines[at])) {
+      const mark = el("div", "muted", "── nothing below here has "
+        + "aired ── written and recorded, waiting for a slot");
+      mark.style.cssText = "font-size:10px;letter-spacing:.03em;opacity:.6;"
+        + "margin:8px 0 4px;padding:2px 4px;border-top:1px dashed "
+        + "rgba(255,255,255,.18);text-align:center";
+      mark.setAttribute("data-booth-divider", "1");
+      log.appendChild(mark);
+    }
     const built = djTalkRow(lines[at]);
     if (!built) continue;
     // #830: a genuinely-new row SLIDES IN with a glow — but only a
@@ -146687,6 +148663,18 @@ function djResync(clock) {
    * omission is precisely how the state poll restarted the record. */
   if (clock.paused === undefined && pineAirPaused) return;
   if (pineAirPaused) pineAirPause(false);   // the pause lifted (#1144)
+  /* 2026-09-09: ONE DESTINATION. The box is carrying the record, so this
+   * page does not play it as well. Two players of one track, started at
+   * different moments and never resynchronised, is the divergence the
+   * operator heard between the app and the Nabu. The CLOCK decides, so
+   * every player in the house agrees about it at the same moment; the
+   * track is forgotten so the record re-joins cleanly when it comes
+   * back here. */
+  if (clock.music_here === false) {
+    if (!player.paused) { try { player.pause(); } catch (e) {} }
+    djLastTrack = "";
+    return;
+  }
   const age = djStateAt ? (Date.now() - djStateAt) / 1000 : 0;
   let target = (clock.server_ms - clock.started_ms) / 1000 + age;
   if (!isFinite(target) || target < 0) target = 0;
@@ -159568,9 +161556,9 @@ async function djBanterPanel() {
     const len = el("div", "", "");
     len.style.marginTop = "14px";
     len.appendChild(el("div", "", "How long a round runs"));
-    len.appendChild(slider("at least", "banter_min_lines", 2, 20,
+    len.appendChild(slider("at least", "banter_min_lines", 2, 24,
       dj.banter_min_lines ?? 2, (v) => v + " lines").wrap);
-    len.appendChild(slider("at most", "banter_max_lines", 2, 20,
+    len.appendChild(slider("at most", "banter_max_lines", 2, 24,
       dj.banter_max_lines ?? 5, (v) => v + " lines").wrap);
     body.appendChild(len);
 
@@ -163674,6 +165662,293 @@ function orchLogicClose() {
    hand-offs as diary events land (an ask, a verdict, a render, a line on
    the air, a cover, a reflection); the rail carries the numbers and the
    last events. Reads /api/rapassembly every 2.5 s. */
+
+/* --- 2026-09-09: the Phone window -----------------------------------------
+   "a 3js window called phone that shows the phone system, scenario
+   generation, rapor / disagreement RNG generation, conversation generation,
+   recording room breakdown and final broadcasting in an infographic ladden
+   flowchart designed presentation."
+
+   Six plates on a path, drawn as canvas textures so the type is crisp, with
+   the deck's weights as a stacked bar on plate one and light travelling the
+   connectors at the rate the road is actually moving. Reads /api/phone every
+   2.5 s; every number on it is the station's own. */
+let phoneView = null;
+function phoneClose() {
+  if (!phoneView) return;
+  const p = phoneView; phoneView = null;
+  try { cancelAnimationFrame(p.frame); } catch (e) {}
+  try { clearInterval(p.timer); } catch (e) {}
+  try { p.renderer.dispose(); } catch (e) {}
+  try { p.shade.remove(); } catch (e) {}
+}
+
+const PHONE_CARD_TINT = {
+  prize: "#f2c14e", mad: "#e8674f", agree: "#6fd08c", disagree: "#7aa2f7",
+  offwall: "#c08cf0", plain: "#8aa0b4", carefree: "#4ec9c9",
+};
+
+function phonePlate(title, lines, opts) {
+  const o = opts || {};
+  const w = 512, h = 288;
+  const c = document.createElement("canvas");
+  c.width = w; c.height = h;
+  const g = c.getContext("2d");
+  const r = 22;
+  g.clearRect(0, 0, w, h);
+  g.fillStyle = o.live ? "#0d1a24" : "#0a1017";
+  g.strokeStyle = o.live ? "#4ec9c9" : "#22304a";
+  g.lineWidth = o.live ? 5 : 3;
+  g.beginPath();
+  g.moveTo(r, 2); g.lineTo(w - r, 2); g.quadraticCurveTo(w - 2, 2, w - 2, r);
+  g.lineTo(w - 2, h - r); g.quadraticCurveTo(w - 2, h - 2, w - r, h - 2);
+  g.lineTo(r, h - 2); g.quadraticCurveTo(2, h - 2, 2, h - r);
+  g.lineTo(2, r); g.quadraticCurveTo(2, 2, r, 2);
+  g.closePath(); g.fill(); g.stroke();
+  if (o.step) {
+    g.fillStyle = o.live ? "#4ec9c9" : "#3d5a7a";
+    g.beginPath(); g.arc(44, 46, 22, 0, Math.PI * 2); g.fill();
+    g.fillStyle = "#04070b";
+    g.font = "bold 24px ui-monospace,Consolas,monospace";
+    g.textAlign = "center"; g.fillText(String(o.step), 44, 55);
+  }
+  g.textAlign = "left";
+  g.fillStyle = o.live ? "#dff6ff" : "#c9d6e3";
+  g.font = "bold 27px system-ui,Segoe UI,sans-serif";
+  g.fillText(String(title).slice(0, 26), o.step ? 78 : 26, 56);
+  g.font = "20px system-ui,Segoe UI,sans-serif";
+  let y = 104;
+  (lines || []).slice(0, 6).forEach((row) => {
+    g.fillStyle = row.dim ? "#7f92a6" : (row.tint || "#a9c4dc");
+    g.fillText(String(row.text).slice(0, 44), 26, y);
+    y += 30;
+  });
+  if (o.bars && o.bars.length) {
+    const total = o.bars.reduce((s, b) => s + Math.max(0, b.value), 0) || 1;
+    let x = 26;
+    const bw = w - 52;
+    o.bars.forEach((b) => {
+      const seg = Math.max(0, b.value) / total * bw;
+      g.fillStyle = b.tint || "#3d5a7a";
+      g.fillRect(x, h - 62, seg, 22);
+      x += seg;
+    });
+    g.fillStyle = "#7f92a6";
+    g.font = "17px system-ui,Segoe UI,sans-serif";
+    g.fillText(o.barNote || "", 26, h - 24);
+  }
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 4;
+  return tex;
+}
+
+async function phonePanel() {
+  if (phoneView) { phoneClose(); return; }
+  try { rapAssemblyClose(); } catch (e) {}
+  try { orchLogicClose(); } catch (e) {}
+  if (!window.THREE) {
+    const tag = document.createElement("script");
+    tag.src = "/vendor/three.min.js";
+    tag.onload = () => phonePanel();
+    document.head.appendChild(tag);
+    return;
+  }
+  let data = null;
+  try { data = await api("/api/phone"); }
+  catch (e) { setStatus("the phone did not answer: " + e.message, true); return; }
+
+  const shade = el("div", "", "");
+  shade.style.cssText = "position:fixed;inset:0;z-index:340;display:flex;"
+    + "background:rgba(2,4,9,.96)";
+  const stage = el("div", "", "");
+  stage.style.cssText = "flex:1;min-width:0;position:relative";
+  const rail = el("div", "", "");
+  rail.style.cssText = "flex:0 0 clamp(280px,30%,380px);overflow:auto;"
+    + "padding:14px 16px;background:#0a0f16;border-left:1px solid #22304a;"
+    + "font-size:12px;line-height:1.55;color:#c9d6e3";
+  shade.appendChild(stage); shade.appendChild(rail);
+  document.body.appendChild(shade);
+  const close = el("button", "", "✕");
+  close.style.cssText = "position:absolute;top:10px;right:10px;z-index:2";
+  close.onclick = phoneClose;
+  stage.appendChild(close);
+  const title = el("div", "", "☎ Phone · a card off the deck to a call on the air");
+  title.style.cssText = "position:absolute;top:12px;left:16px;z-index:2;"
+    + "font:600 13px system-ui;color:#9fd0e3";
+  stage.appendChild(title);
+
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x04070b);
+  const camera = new THREE.PerspectiveCamera(46, 1, 0.1, 200);
+  camera.position.set(0, 0.6, 15.5);
+  const renderer = new THREE.WebGLRenderer({antialias: true});
+  renderer.setPixelRatio(Math.min(devicePixelRatio || 1, 2));
+  stage.appendChild(renderer.domElement);
+  scene.add(new THREE.AmbientLight(0xffffff, 1));
+
+  /* Six plates on a gentle S, so the eye is walked through the road rather
+     than shown a row of boxes. */
+  const SPOTS = [
+    [-8.4, 2.5], [-4.2, 3.4], [0, 2.2], [4.2, 3.0], [8.4, 1.8], [4.6, -2.6],
+  ];
+  const plates = SPOTS.map(([x, y]) => {
+    const m = new THREE.Mesh(
+      new THREE.PlaneGeometry(3.5, 1.97),
+      new THREE.MeshBasicMaterial({transparent: true}));
+    m.position.set(x, y, 0);
+    scene.add(m);
+    return m;
+  });
+  /* The connectors, and the light that travels them. */
+  const links = [];
+  for (let i = 0; i < SPOTS.length - 1; i += 1) {
+    const a = new THREE.Vector3(SPOTS[i][0], SPOTS[i][1], 0);
+    const b = new THREE.Vector3(SPOTS[i + 1][0], SPOTS[i + 1][1], 0);
+    const line = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([a, b]),
+      new THREE.LineBasicMaterial({color: 0x22304a}));
+    scene.add(line);
+    const spark = new THREE.Mesh(
+      new THREE.SphereGeometry(0.11, 12, 12),
+      new THREE.MeshBasicMaterial({color: 0x4ec9c9}));
+    scene.add(spark);
+    links.push({a, b, spark, at: i * 0.16});
+  }
+
+  const fit = () => {
+    const w = stage.clientWidth || 900, h = stage.clientHeight || 600;
+    renderer.setSize(w, h, false);
+    camera.aspect = w / h; camera.updateProjectionMatrix();
+  };
+  fit();
+
+  const paint = (d) => {
+    if (!d) return;
+    const deck = d.deck || [];
+    const draws = d.draws || [];
+    const last = draws.length ? draws[draws.length - 1] : null;
+    const room = d.room || {};
+    const air = d.air || {};
+    const writing = d.writing || {};
+    const live = d.live || {};
+    const stages = d.stages || [];
+    const nameOf = (n) => (stages[n] && stages[n].name) || "";
+    const busy = String(writing.state || "");
+
+    plates[0].material.map = phonePlate("The deck", [
+      {text: last ? ("last card drawn: " + last.card) : "no card drawn yet"},
+      {text: "rolled " + (last ? last.roll : "-") + " on the weights", dim: true},
+      {text: "the operator's odds, stacked below", dim: true},
+    ], {
+      step: 1, live: !!last,
+      bars: deck.map((c) => ({value: c.weight, tint: PHONE_CARD_TINT[c.card]})),
+      barNote: deck.map((c) => c.card + " " + Math.round(c.share * 100) + "%")
+        .join("  ").slice(0, 44),
+    });
+
+    const counts = d.draw_counts || {};
+    plates[1].material.map = phonePlate("The caller", [
+      {text: live.who ? ("on the line: " + live.who) : "nobody on the line"},
+      {text: live.who ? ("for " + live.for_seconds + "s") : "the deck decides who rings",
+       dim: true},
+      {text: "rapport / argue split, last 40 draws:", dim: true},
+      {text: "agree " + (counts.agree || 0) + "  ·  disagree "
+             + (counts.disagree || 0) + "  ·  off-wall " + (counts.offwall || 0),
+       tint: "#7aa2f7"},
+    ], {step: 2, live: !!live.who});
+
+    plates[2].material.map = phonePlate("The writing", [
+      {text: busy ? ("System2 is " + busy) : "no scene in flight"},
+      {text: String(writing.action || "the scene is written as bars").slice(0, 42),
+       dim: true},
+      {text: writing.generation_turns
+             ? (writing.generation_turns + " turns asked for") : "", dim: true},
+      {text: "battle round " + ((d.battle || {}).round || 0), tint: "#c08cf0"},
+    ], {step: 3, live: !!busy});
+
+    plates[3].material.map = phonePlate("The crystal", [
+      {text: "every turn rapped and graded"},
+      {text: "a refused bar is repaired or struck", dim: true},
+      {text: "nothing airs that did not pass", dim: true},
+    ], {step: 4, live: !!busy});
+
+    plates[4].material.map = phonePlate("Recording room", [
+      {text: room.pantry_clips + " takes on the shelf"},
+      {text: room.render_waiting + " waiting to record",
+       tint: room.render_waiting ? "#f2c14e" : null},
+      {text: room.delivery_waiting + " waiting for the speaker",
+       tint: room.delivery_waiting ? "#e8674f" : null},
+      {text: "a line already recorded is never recorded again", dim: true},
+    ], {step: 5, live: (room.render_waiting || 0) > 0});
+
+    plates[5].material.map = phonePlate("On the air", [
+      {text: (air.calls_this_hour || 0) + " call lines this hour"},
+      {text: air.since_last_s === null || air.since_last_s === undefined
+             ? "none yet this hour"
+             : ("last one " + Math.round(air.since_last_s) + "s ago"), dim: true},
+      {text: "a call is never paged - it airs whole", dim: true},
+      {text: "target " + ((d.quota || {}).target || 0) + " an hour", dim: true},
+    ], {step: 6, live: (air.since_last_s || 9999) < 120});
+
+    plates.forEach((p) => { p.material.needsUpdate = true; });
+
+    rail.innerHTML = "";
+    const h = el("div", "", "☎ The phone system");
+    h.style.cssText = "font:600 14px system-ui;color:#dff6ff;margin-bottom:8px";
+    rail.appendChild(h);
+    const say = el("div", "muted", String(d.say || ""));
+    say.style.cssText = "font-size:11.5px;line-height:1.5;margin-bottom:12px";
+    rail.appendChild(say);
+    stages.forEach((s) => {
+      const row = el("div", "", "");
+      row.style.cssText = "margin:0 0 9px 0;padding-left:10px;"
+        + "border-left:2px solid #22304a";
+      const t = el("div", "", s.n + ". " + s.name);
+      t.style.cssText = "font:600 12px system-ui;color:#9fd0e3";
+      const w2 = el("div", "muted", s.what);
+      w2.style.cssText = "font-size:11px;line-height:1.45";
+      row.appendChild(t); row.appendChild(w2);
+      rail.appendChild(row);
+    });
+    const dh = el("div", "", "The last cards off the deck");
+    dh.style.cssText = "font:600 12px system-ui;color:#dff6ff;margin:14px 0 6px";
+    rail.appendChild(dh);
+    (draws.slice().reverse()).forEach((row) => {
+      const r2 = el("div", "", "");
+      r2.style.cssText = "display:flex;gap:8px;font-size:11px;margin-bottom:3px";
+      const dot = el("span", "", "●");
+      dot.style.color = PHONE_CARD_TINT[row.card] || "#8aa0b4";
+      const txt = el("span", "", row.card + "  (rolled " + row.roll + ")");
+      r2.appendChild(dot); r2.appendChild(txt);
+      rail.appendChild(r2);
+    });
+  };
+  paint(data);
+
+  let t = 0;
+  const tick = () => {
+    if (!phoneView) return;
+    t += 0.016;
+    links.forEach((k, i) => {
+      k.at = (k.at + 0.0042) % 1;
+      k.spark.position.lerpVectors(k.a, k.b, k.at);
+      k.spark.material.color.setHex(i === 2 ? 0xc08cf0 : 0x4ec9c9);
+    });
+    plates.forEach((p, i) => {
+      p.position.z = Math.sin(t * 0.8 + i) * 0.06;
+    });
+    renderer.render(scene, camera);
+    phoneView.frame = requestAnimationFrame(tick);
+  };
+  phoneView = {shade, renderer, resize: fit, frame: 0, timer: 0};
+  phoneView.frame = requestAnimationFrame(tick);
+  phoneView.timer = setInterval(async () => {
+    try { paint(await api("/api/phone")); }
+    catch (e) { /* the next poll tries again */ }
+  }, 2500);
+  shade.onclick = (ev) => { if (ev.target === shade) phoneClose(); };
+}
+
 let rapAssembly = null;
 function rapAssemblyClose() {
   if (!rapAssembly) return;
@@ -173745,6 +176020,13 @@ async function clockPoll() {
         voiceNowTs = 0;
         if (ducking) { ducking = false; applyLevels(); }
       }
+    } else if (c.music_here === false) {
+      /* 2026-09-09: ONE DESTINATION - the box has the record, this
+       * listener does not play a second copy of it. The VOICE is left
+       * alone: it is routed separately and reaches this page through
+       * its own feed. */
+      if (audio && !audio.paused) { try { audio.pause(); } catch (e) {} }
+      if (!stationPaused) { try { voiceNext(); } catch (e) {} }
     } else if (c.playing && c.url) {
       if (!stationPaused) { try { voiceNext(); } catch (e) {} }
       retime({id: c.id, url: c.url}, c.server_ms, c.started_ms, c.seconds);
