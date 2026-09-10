@@ -33548,6 +33548,23 @@ def dialogue_stock_seconds(kind: str, row: Any,
         return 0.0
 
 
+def road_source(kind: str) -> list[Any]:
+    """#1165: the pile one road's finished rounds are actually kept on.
+
+    Banter is banked in the larder and everything else on the shelf. That
+    is not new - `dialogue_stock_items` has always known it - but it was
+    known in one function and guessed at in two others, and both guessed
+    wrong, so the road that carries most of the show read as the emptiest
+    thing on the board. One door, so a reader cannot hold its own opinion
+    about where the station's work lives."""
+    road = str(kind or "")
+    try:
+        return list(_LARDER) if road == "banter" else list(
+            _SHELF.get(road) or [])
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def dialogue_stock_census(kind: str) -> dict[str, Any]:
     """#1160: for one road, the FIRST test each held row fails.
 
@@ -33565,8 +33582,7 @@ def dialogue_stock_census(kind: str) -> dict[str, Any]:
     try:
         profile = _larder_profile_signature()
         tint_required = dialogue_tint_required()
-        source = list(_LARDER) if road == "banter" else list(
-            _SHELF.get(road) or [])
+        source = road_source(road)             # #1165
         out["rows"] = len(source)
         out["profile_wanted"] = str(profile)[:400]
 
@@ -42073,12 +42089,28 @@ _RESCUE_AT = [0.0]
 DEAD_AIR_RESCUE_REST = 45.0
 
 
+# #1165: the roads the cupboard can actually OPEN, which is not the same
+# list as the roads it would like to. `_ready_shelf_row` - the door every
+# rescue goes through - serves these three and returns None for anything
+# else, so a phone call, a banter round or a recap counted here would be
+# asked for and never arrive. Caller is the one worth having next: it has
+# the deepest shelf on the station and needs a transport of its own,
+# because a call is an intro, a conversation and a sign-off rather than
+# one round that can be handed to _banter_air.
+RESCUE_ROADS_OPEN = ("manager", "gallery", "news")
+
+
 def dead_air_stock() -> dict[str, int]:
-    """What the cupboard could put on the air this second, per road."""
+    """What the cupboard could put on the air this second, per road.
+
+    #1165: counted through the same door the rescue uses, so this is what
+    WOULD go out rather than what is merely finished. It read the shelf
+    for six roads and reported seventy-four rounds when the machinery
+    could reach fewer than seventy of them, and none of the calls."""
     out: dict[str, int] = {}
-    for kind in DEAD_AIR_RESCUE_ROADS:
+    for kind in RESCUE_ROADS_OPEN:
         try:
-            rows = [r for r in list(_SHELF.get(kind) or [])
+            rows = [r for r in road_source(kind)
                     if _ready_round_takes(kind, r)]
             if rows:
                 out[kind] = len(rows)
@@ -42113,7 +42145,7 @@ async def dead_air_rescue(quiet: float) -> str:
     # #1163: the entry on air goes first. The fixed order below is the
     # right one when nothing in particular is due; when something IS due,
     # the thing that is due is the best answer to a hole in it.
-    order = list(DEAD_AIR_RESCUE_ROADS)
+    order = [k for k in DEAD_AIR_RESCUE_ROADS if k in RESCUE_ROADS_OPEN]
     try:
         _on = str((schedule_take() or {}).get("kind") or "")
         if _on in order:
@@ -99480,7 +99512,7 @@ def director_road_stock(kind: str) -> dict[str, Any]:
         allowed = int(shelf_innings(str(kind)))
         now = time.time()
         soonest: float | None = None
-        for row in list(_SHELF.get(str(kind)) or []):
+        for row in road_source(kind):          # #1165: banter is the larder
             entry = dialogue_entry(row)
             if entry is None:
                 continue
@@ -99982,7 +100014,7 @@ async def api_director_deadair() -> dict[str, Any]:
             "ready_by_road": stock,
             "rounds_ready": total,
             "opens_after_seconds": DEAD_AIR_RESCUE_AFTER,
-            "order": list(DEAD_AIR_RESCUE_ROADS),
+            "order": list(RESCUE_ROADS_OPEN),   # #1165: what can actually open
             "last_rescue_seconds_ago": round(since, 1)
                                        if _RESCUE_AT[0] else None,
             "say": ("%d finished round(s) could cover a hole right now - %s"
